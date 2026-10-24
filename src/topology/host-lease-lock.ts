@@ -10,6 +10,40 @@ export interface HostLeaseMesh {
   readonly root: string;
   leaseCustody<T>(file: string, operation: () => T | Promise<T>, timeoutMs?: number, options?: { ownIncarnation?: string | undefined }): Promise<T>;
 }
+
+export const hostLeaseAdditionsGatePath = (root: string): string => path.join(root, "host-leases", ".additions");
+
+/** Lease namespace custody blocks new filenames while a mirror brackets its directory snapshot.
+ * Existing renewals need only their per-host gate. A creator takes additions before its host gate;
+ * if a prior removal races the initial existence check, retry in that same stable order. */
+/** Namespace custody blocks new lease filenames. Existing renewals use only their per-host gate. */
+export const withHostLeaseDirectoryCustody = <T>(mesh: HostLeaseMesh,
+  operation: () => T | Promise<T>, timeoutMs = 0, options: { ownIncarnation?: string | undefined } = {}): Promise<T> =>
+  mesh.leaseCustody(hostLeaseAdditionsGatePath(mesh.root), operation, timeoutMs, options);
+
+/**
+ * smarty-dev#13645: how long a NATIVE lease creator waits for the shared additions gate. That gate is one
+ * per mesh, so with zero wait two hosts that create their first lease together (concurrent starts,
+ * first-time registrations) refused each other, which main's per-host gates never did. Other creators,
+ * the reaper and a mirror's first-install effect hold it for one short synchronous commit; a mirror's
+ * custody pass holds it longer, and a creator that outwaits this bound still gets the one-attempt busy
+ * refusal its caller already retries. The waiter holds no lease gate (additions -> host order), so the
+ * wait cannot close a cycle. Bridge effects keep zero wait (re-audit P2-1: busy is surfaced and retried).
+ */
+export const HOST_LEASE_ADDITIONS_WAIT_MS = 2_000;
+
+export const withHostLeaseFileCustody = async <T>(mesh: HostLeaseMesh, file: string,
+  operation: () => T | Promise<T>, timeoutMs = 0, options: { ownIncarnation?: string | undefined } = {},
+  additionsTimeoutMs = timeoutMs): Promise<T> => {
+  const target = () => mesh.leaseCustody(file, operation, timeoutMs, options);
+  if (!fs.existsSync(file)) return withHostLeaseDirectoryCustody(mesh, target, additionsTimeoutMs, options);
+  let missing = false;
+  const current = await mesh.leaseCustody(file, () => {
+    if (!fs.existsSync(file)) { missing = true; return undefined; }
+    return operation();
+  }, timeoutMs, options);
+  return missing ? withHostLeaseDirectoryCustody(mesh, target, additionsTimeoutMs, options) : current as T;
+};
 export interface HostLeaseLockOptions {
   signal?: AbortSignal;
   ownIncarnation?: string | undefined;
@@ -101,7 +135,7 @@ export const withHostLeaseLock = async <T>(mesh: HostLeaseMesh, file: string,
     let acquired = false, enteredCustody = false, seen: string | undefined;
     let value!: T;
     try {
-      await mesh.leaseCustody(file, () => {
+      await withHostLeaseFileCustody(mesh, file, () => {
         enteredCustody = true;
         options.signal?.throwIfAborted();
         const staging = fs.mkdtempSync(`${lock}.pending-`);
@@ -136,8 +170,13 @@ export const withHostLeaseLock = async <T>(mesh: HostLeaseMesh, file: string,
             fs.rmSync(aside, { recursive: true, force: true });
           }
         }
-      }, 0, Object.hasOwn(options, "ownIncarnation") ? { ownIncarnation: options.ownIncarnation } : {});
+      }, 0, Object.hasOwn(options, "ownIncarnation") ? { ownIncarnation: options.ownIncarnation } : {},
+      // The additions wait never outlasts what is left of the caller's own budget (audit P2-3, N1 note 1).
+      // That wait takes no signal; an abort during it is observed as soon as it ends, below (N1 note 2).
+      options.timeoutMs !== undefined && Number.isFinite(options.timeoutMs)
+        ? Math.max(0, Math.min(HOST_LEASE_ADDITIONS_WAIT_MS, deadline - performance.now())) : HOST_LEASE_ADDITIONS_WAIT_MS);
     } catch (error) {
+      options.signal?.throwIfAborted();
       if (enteredCustody || !isMeshLockTimeout(error)) throw error;
     }
     if (acquired) return value;

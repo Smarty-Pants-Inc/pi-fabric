@@ -87,12 +87,43 @@ export const createCommitStats = (file = process.env.PI_FABRIC_COMMIT_STATS): Co
 export type MeshLockClass = "publish" | "put/delete" | "writeBatch" | "heartbeat/confirm" | "custody" | "bridge" | "other";
 const LOCK_CLASSES: ReadonlySet<string> = new Set<MeshLockClass>(["publish", "put/delete", "writeBatch", "heartbeat/confirm", "custody", "bridge", "other"]);
 
+export interface LockTimingContext {
+  /** Stable, low-cardinality source operation (never inferred from user data). */
+  operation: string;
+  /** Optional whole-acquisition phase, used by mesh/event locks and write fences. */
+  phase?: string;
+  /** Optional synchronous phases measured inside a SQLite writer transaction. */
+  preparePhase?: string;
+  commitPhase?: string;
+  afterCommitPhase?: string;
+}
+export interface LockStatsFenceRefusalHolder {
+  pid: number | null;
+  comm: string | null;
+  n: number;
+}
+export interface LockStatsTimingBucket {
+  n: number;
+  holdMs: number;
+  holdMaxMs: number;
+  holdHist: number[];
+  /** Zero-wait SQLite writer-fence refusals, independent of successful hold samples. */
+  fenceRefusals?: number;
+  /** Distinct WAL writer identities observed at refusal; null means unavailable or capped. */
+  fenceRefusalHolders?: LockStatsFenceRefusalHolder[];
+  /** Refusals whose distinct holder identity exceeded the bounded per-bucket list. */
+  unattributedFenceRefusals?: number;
+}
 export interface LockStats {
   /** One acquisition: wait runs from the request to custody, hold from custody to release (ms). */
-  acquired(root: string, lockClass: MeshLockClass, waitMs: number, holdMs: number): void;
+  acquired(root: string, lockClass: MeshLockClass, waitMs: number, holdMs: number, timing?: LockTimingContext): void;
   /** One acquisition that ended in the typed lock timeout. `tried` marks a bounded try (a
    * registry-fenced or zero-wait caller), which fails by design while the lock is busy. */
-  failed(root: string, lockClass: MeshLockClass, waitMs: number, tried: boolean): void;
+  failed(root: string, lockClass: MeshLockClass, waitMs: number, tried: boolean, timing?: LockTimingContext): void;
+  /** One measured phase segment inside a writer hold; accumulated without I/O, flushed after release. */
+  phase(root: string, lockClass: MeshLockClass, operation: string, phase: string, holdMs: number): void;
+  /** A refused single-attempt SQLite writer fence, counted by class, operation and phase. */
+  fenceRefused(root: string, lockClass: MeshLockClass, timing: LockTimingContext | undefined, holderPid: number | undefined): void;
 }
 
 /** Histogram upper bounds in ms; one more bucket counts everything above the last bound. */
@@ -106,6 +137,7 @@ const LOCK_STATS_PRUNE_EVERY_MS = 60 * 60_000;
 /** Reader caps: a stats file is a few KiB; anything near these is not ours. */
 export const LOCK_STATS_MAX_FILE_BYTES = 1024 * 1024;
 export const LOCK_STATS_MAX_FILES = 4096;
+const LOCK_STATS_MAX_FENCE_REFUSAL_HOLDERS = 128;
 
 export interface LockStatsBucket {
   /** Successful acquisitions. */
@@ -123,7 +155,14 @@ export interface LockStatsBucket {
   waitHist: number[];
   holdHist: number[];
 }
-export interface LockStatsMinute { minute: number; classes: Partial<Record<MeshLockClass, LockStatsBucket>> }
+export interface LockStatsMinute {
+  minute: number;
+  classes: Partial<Record<MeshLockClass, LockStatsBucket>>;
+  /** Optional for compatibility with files written before operation timing was added. */
+  operations?: Record<string, LockStatsTimingBucket>;
+  /** Timing split by operation, then synchronous phase. */
+  phases?: Record<string, Record<string, LockStatsTimingBucket>>;
+}
 /**
  * What kind of process wrote a stats file (smarty-dev#8305), captured once at the recorder's first
  * acquisition and never re-derived: an exited writer stays attributable from its file alone. Each
@@ -169,7 +208,7 @@ interface ProcessLockStats {
 }
 interface RootLockStats {
   root: string;
-  minutes: Map<number, Partial<Record<MeshLockClass, LockStatsBucket>>>;
+  minutes: Map<number, LockStatsMinute>;
   dirty: boolean;
   prunedAt: number;
   /** The lock-stats directory is unsafe to write: nothing more is recorded for this root. */
@@ -188,6 +227,24 @@ const emptyBucket = (): LockStatsBucket => ({
   waitHist: new Array<number>(LOCK_STATS_BOUNDS_MS.length + 1).fill(0),
   holdHist: new Array<number>(LOCK_STATS_BOUNDS_MS.length + 1).fill(0),
 });
+const emptyTimingBucket = (): LockStatsTimingBucket => ({
+  n: 0, holdMs: 0, holdMaxMs: 0, holdHist: new Array<number>(LOCK_STATS_BOUNDS_MS.length + 1).fill(0),
+});
+const validTimingLabel = (value: string): boolean => /^[a-z][a-z0-9-]{0,63}$/.test(value);
+const recordTiming = (bucket: LockStatsTimingBucket, holdMs: number): void => {
+  bucket.n++;
+  bucket.holdMs += holdMs;
+  bucket.holdMaxMs = Math.max(bucket.holdMaxMs, holdMs);
+  bucket.holdHist[histogramIndex(holdMs)]!++;
+};
+const recordFenceRefusal = (bucket: LockStatsTimingBucket, holder: LockStatsFenceRefusalHolder): void => {
+  bucket.fenceRefusals = (bucket.fenceRefusals ?? 0) + 1;
+  const holders = bucket.fenceRefusalHolders ??= [];
+  const existing = holders.find(candidate => candidate.pid === holder.pid && candidate.comm === holder.comm);
+  if (existing) existing.n++;
+  else if (holders.length < LOCK_STATS_MAX_FENCE_REFUSAL_HOLDERS) holders.push({ ...holder });
+  else bucket.unattributedFenceRefusals = (bucket.unattributedFenceRefusals ?? 0) + 1;
+};
 const errorCodeOf = (error: unknown): unknown => (error as { code?: unknown } | undefined)?.code;
 const roundMs = (_key: string, value: unknown): unknown =>
   typeof value === "number" && !Number.isInteger(value) ? Math.round(value * 1000) / 1000 : value;
@@ -326,7 +383,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
     const body: LockStatsFile = {
       version: 1, host, pid: process.pid, root: entry.root, startedAt, updatedAt: now,
       ...writer ? { writer } : {},
-      minutes: [...entry.minutes].sort(([a], [b]) => a - b).map(([minute, classes]) => ({ minute, classes })),
+      minutes: [...entry.minutes].sort(([a], [b]) => a - b).map(([, minute]) => minute),
     };
     // Atomic for readers; deliberately not durable (diagnostics, no fsync). A unique temporary,
     // created exclusively and never through a symlink, then renamed over the name (rename
@@ -395,7 +452,7 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
     }
     return known;
   };
-  const bucketOf = (spelling: string, lockClass: MeshLockClass): LockStatsBucket | undefined => {
+  const minuteOf = (spelling: string): LockStatsMinute | undefined => {
     const { key, root } = canonicalOf(spelling);
     let entry = roots.get(key);
     if (!entry) {
@@ -409,20 +466,38 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       }
     }
     if (entry.disabled) return undefined;
-    const minute = Math.floor(Date.now() / 60_000);
-    let classes = entry.minutes.get(minute);
-    if (!classes) {
-      classes = Object.create(null) as Partial<Record<MeshLockClass, LockStatsBucket>>;
-      entry.minutes.set(minute, classes);
-      trimMinutes(entry.minutes, minute);
+    const at = Math.floor(Date.now() / 60_000);
+    let minute = entry.minutes.get(at);
+    if (!minute) {
+      minute = { minute: at, classes: Object.create(null) as Partial<Record<MeshLockClass, LockStatsBucket>> };
+      entry.minutes.set(at, minute);
+      trimMinutes(entry.minutes, at);
     }
     entry.dirty = true;
-    return classes[lockClass] ??= emptyBucket();
+    return minute;
+  };
+  const bucketOf = (spelling: string, lockClass: MeshLockClass): LockStatsBucket | undefined => {
+    const minute = minuteOf(spelling);
+    if (!minute) return undefined;
+    return minute.classes[lockClass] ??= emptyBucket();
+  };
+  const timingBucketOf = (spelling: string, operation: string, phase?: string): LockStatsTimingBucket | undefined => {
+    if (!validTimingLabel(operation) || (phase !== undefined && !validTimingLabel(phase))) return undefined;
+    const minute = minuteOf(spelling);
+    if (!minute) return undefined;
+    if (phase === undefined) {
+      minute.operations ??= Object.create(null) as Record<string, LockStatsTimingBucket>;
+      return minute.operations[operation] ??= emptyTimingBucket();
+    }
+    minute.phases ??= Object.create(null) as Record<string, Record<string, LockStatsTimingBucket>>;
+    const phases = minute.phases[operation] ??= Object.create(null) as Record<string, LockStatsTimingBucket>;
+    return phases[phase] ??= emptyTimingBucket();
   };
   const stats: LockStats = {
-    acquired(root, lockClass, waitMs, holdMs) {
-      const bucket = bucketOf(root, lockClass);
-      if (!bucket) return;
+    acquired(root, lockClass, waitMs, holdMs, timing) {
+      const minute = minuteOf(root);
+      if (!minute) return;
+      const bucket = minute.classes[lockClass] ??= emptyBucket();
       bucket.n++;
       bucket.waitMs += waitMs;
       bucket.holdMs += holdMs;
@@ -430,6 +505,33 @@ export const createLockStats = (setting = process.env.PI_FABRIC_LOCK_STATS,
       if (holdMs > bucket.holdMaxMs) bucket.holdMaxMs = holdMs;
       bucket.waitHist[histogramIndex(waitMs)]!++;
       bucket.holdHist[histogramIndex(holdMs)]!++;
+      if (timing) {
+        const operation = timingBucketOf(root, timing.operation);
+        if (operation) recordTiming(operation, holdMs);
+        if (timing.phase) {
+          const phase = timingBucketOf(root, timing.operation, timing.phase);
+          if (phase) recordTiming(phase, holdMs);
+        }
+      }
+      flushIfDue();
+    },
+    phase(root, _lockClass, operationName, phaseName, holdMs) {
+      const bucket = timingBucketOf(root, operationName, phaseName);
+      if (bucket) recordTiming(bucket, holdMs);
+    },
+    fenceRefused(root, lockClass, timing, holderPid) {
+      const minute = minuteOf(root);
+      if (!minute) return;
+      const classBucket = minute.classes[lockClass] ??= emptyBucket();
+      classBucket.tries++;
+      if (timing) {
+        const pid = holderPid !== undefined && Number.isSafeInteger(holderPid) && holderPid > 0 ? holderPid : null;
+        const holder: LockStatsFenceRefusalHolder = { pid, comm: pid === null ? null : lockEventProcessName(pid) ?? null, n: 1 };
+        const operation = timingBucketOf(root, timing.operation);
+        if (operation) recordFenceRefusal(operation, holder);
+        const phase = timingBucketOf(root, timing.operation, timing.phase ?? "state-fence");
+        if (phase) recordFenceRefusal(phase, holder);
+      }
       flushIfDue();
     },
     failed(root, lockClass, waitMs, tried) {
@@ -768,7 +870,7 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
 // ---------------------------------------------------------------------------------------------
 // Reading and summarizing (fabric-mesh-lock-stats).
 
-const isCount = (value: unknown): boolean => Number.isSafeInteger(value) && (value as number) >= 0;
+const isCount = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 const isDuration = (value: unknown): boolean => typeof value === "number" && Number.isFinite(value) && value >= 0;
 const isHistogram = (value: unknown): boolean =>
   Array.isArray(value) && value.length === LOCK_STATS_BOUNDS_MS.length + 1 && value.every(isCount);
@@ -778,6 +880,30 @@ const isBucket = (value: unknown): value is LockStatsBucket => {
     [bucket.n, bucket.timeouts, bucket.tries].every(isCount) &&
     [bucket.waitMs, bucket.waitMaxMs, bucket.holdMs, bucket.holdMaxMs, bucket.failedWaitMs].every(isDuration) &&
     isHistogram(bucket.waitHist) && isHistogram(bucket.holdHist);
+};
+const isTimingBucket = (value: unknown): value is LockStatsTimingBucket => {
+  const bucket = value as Record<string, unknown> | null;
+  if (!bucket || typeof bucket !== "object" || Array.isArray(bucket) ||
+    !isCount(bucket.n) || !isDuration(bucket.holdMs) || !isDuration(bucket.holdMaxMs) || !isHistogram(bucket.holdHist)) return false;
+  const refusalCount = bucket.fenceRefusals;
+  const unattributed = bucket.unattributedFenceRefusals;
+  const holders = bucket.fenceRefusalHolders;
+  if (refusalCount !== undefined && !isCount(refusalCount)) return false;
+  if (unattributed !== undefined && !isCount(unattributed)) return false;
+  if (holders !== undefined && (!Array.isArray(holders) || holders.length > LOCK_STATS_MAX_FENCE_REFUSAL_HOLDERS ||
+    !holders.every((holder) => {
+      if (!holder || typeof holder !== "object" || Array.isArray(holder)) return false;
+      const item = holder as Record<string, unknown>;
+      return (item.pid === null || (Number.isSafeInteger(item.pid) && (item.pid as number) > 0)) &&
+        (item.comm === null || (typeof item.comm === "string" && item.comm.length <= LOCK_STATS_WRITER_MAX_CHARS)) &&
+        (item.pid !== null || item.comm === null) && isCount(item.n) && (item.n as number) > 0;
+    }))) return false;
+  if (refusalCount !== undefined || unattributed !== undefined || holders !== undefined) {
+    const identified = Array.isArray(holders)
+      ? holders.reduce((total, holder) => total + (holder as { n: number }).n, 0) : 0;
+    if (!Number.isSafeInteger(identified + (unattributed ?? 0)) || identified + (unattributed ?? 0) !== (refusalCount ?? 0)) return false;
+  }
+  return true;
 };
 /** A present writer must be an object of bounded strings and a pid; unknown keys are ignored. */
 const invalidWriter = (value: unknown): boolean => {
@@ -809,6 +935,25 @@ const invalidLockStats = (value: unknown): string | undefined => {
     for (const [lockClass, bucket] of Object.entries(classes)) {
       if (!LOCK_CLASSES.has(lockClass)) return "unknown lock class";
       if (!isBucket(bucket)) return `invalid ${lockClass} counters`;
+    }
+    const operations = (minute as Partial<LockStatsMinute>).operations;
+    if (operations !== undefined) {
+      if (!operations || typeof operations !== "object" || Array.isArray(operations) || Object.keys(operations).length > 128) return "bad operation timings";
+      for (const [operation, bucket] of Object.entries(operations)) {
+        if (!validTimingLabel(operation)) return "bad operation label";
+        if (!isTimingBucket(bucket)) return `invalid ${operation} timing`;
+      }
+    }
+    const phases = (minute as Partial<LockStatsMinute>).phases;
+    if (phases !== undefined) {
+      if (!phases || typeof phases !== "object" || Array.isArray(phases) || Object.keys(phases).length > 128) return "bad phase timings";
+      for (const [operation, entries] of Object.entries(phases)) {
+        if (!validTimingLabel(operation) || !entries || typeof entries !== "object" || Array.isArray(entries) || Object.keys(entries).length > 128) return "bad phase labels";
+        for (const [phase, bucket] of Object.entries(entries)) {
+          if (!validTimingLabel(phase)) return "bad phase label";
+          if (!isTimingBucket(bucket)) return `invalid ${operation}/${phase} timing`;
+        }
+      }
     }
   }
   return undefined;
@@ -929,6 +1074,16 @@ export interface LockStatsTotals {
   timeouts: number;
   tries: number;
 }
+export interface LockStatsTimingTotals {
+  n: number;
+  totalHeldMs: number;
+  p50HoldMs: number;
+  p95HoldMs: number;
+  maxHoldMs: number;
+  fenceRefusals?: number;
+  fenceRefusalHolders?: LockStatsFenceRefusalHolder[];
+  unattributedFenceRefusals?: number;
+}
 export interface LockStatsSummary extends LockStatsTotals {
   root: string;
   /** Inclusive epoch minutes of the window (complete minutes only). */
@@ -938,6 +1093,8 @@ export interface LockStatsSummary extends LockStatsTotals {
   processes: number;
   peakMinuteBusyPct: number;
   classes: Array<LockStatsTotals & { lockClass: MeshLockClass; holdSharePct: number }>;
+  operations: Array<LockStatsTimingTotals & { operation: string }>;
+  phases: Array<LockStatsTimingTotals & { operation: string; phase: string }>;
   pids: Array<LockStatsTotals & { host: string; pid: number; topClass: MeshLockClass | undefined; writer?: LockStatsWriter }>;
 }
 
@@ -955,6 +1112,31 @@ const mergeBucket = (into: LockStatsBucket, from: LockStatsBucket): void => {
     into.holdHist[index]! += from.holdHist[index] ?? 0;
   }
 };
+const mergeTimingBucket = (into: LockStatsTimingBucket, from: LockStatsTimingBucket): void => {
+  into.n += from.n;
+  into.holdMs += from.holdMs;
+  into.holdMaxMs = Math.max(into.holdMaxMs, from.holdMaxMs);
+  for (let index = 0; index < into.holdHist.length; index++) into.holdHist[index]! += from.holdHist[index] ?? 0;
+  into.fenceRefusals = (into.fenceRefusals ?? 0) + (from.fenceRefusals ?? 0);
+  into.unattributedFenceRefusals = (into.unattributedFenceRefusals ?? 0) + (from.unattributedFenceRefusals ?? 0);
+  for (const holder of from.fenceRefusalHolders ?? []) {
+    const holders = into.fenceRefusalHolders ??= [];
+    const existing = holders.find(candidate => candidate.pid === holder.pid && candidate.comm === holder.comm);
+    if (existing) existing.n += holder.n;
+    else if (holders.length < LOCK_STATS_MAX_FENCE_REFUSAL_HOLDERS) holders.push({ ...holder });
+    else into.unattributedFenceRefusals = (into.unattributedFenceRefusals ?? 0) + holder.n;
+  }
+};
+const timingTotalsOf = (bucket: LockStatsTimingBucket): LockStatsTimingTotals => ({
+  n: bucket.n,
+  totalHeldMs: bucket.holdMs,
+  p50HoldMs: percentileBound(bucket.holdHist, 0.5),
+  p95HoldMs: percentileBound(bucket.holdHist, 0.95),
+  maxHoldMs: bucket.holdMaxMs,
+  ...(bucket.fenceRefusals ? { fenceRefusals: bucket.fenceRefusals,
+    ...(bucket.fenceRefusalHolders ? { fenceRefusalHolders: bucket.fenceRefusalHolders.map(holder => ({ ...holder })) } : {}),
+    ...(bucket.unattributedFenceRefusals ? { unattributedFenceRefusals: bucket.unattributedFenceRefusals } : {}) } : {}),
+});
 const percentileBound = (histogram: readonly number[], fraction: number): number => {
   const total = histogram.reduce((sum, count) => sum + count, 0);
   if (!total) return 0;
@@ -989,11 +1171,14 @@ export const summarizeLockStats = (root: string, files: readonly LockStatsFile[]
   const top = Math.max(1, Math.floor(options.top ?? 5));
   const all = emptyBucket();
   const byClass = new Map<MeshLockClass, LockStatsBucket>();
+  const byOperation = new Map<string, LockStatsTimingBucket>();
+  const byPhase = new Map<string, { operation: string; phase: string; bucket: LockStatsTimingBucket }>();
   const perMinuteHold = new Map<number, number>();
   const byPid: Array<{ host: string; pid: number; writer: LockStatsWriter | undefined; bucket: LockStatsBucket; classes: Map<MeshLockClass, number> }> = [];
   for (const file of files) {
     const own = { host: file.host, pid: file.pid, writer: knownWriter(file.writer), bucket: emptyBucket(), classes: new Map<MeshLockClass, number>() };
-    for (const { minute, classes } of file.minutes) {
+    for (const item of file.minutes) {
+      const { minute, classes } = item;
       if (minute < fromMinute || minute > toMinute) continue;
       for (const [lockClass, bucket] of Object.entries(classes) as Array<[MeshLockClass, LockStatsBucket]>) {
         mergeBucket(all, bucket);
@@ -1004,12 +1189,27 @@ export const summarizeLockStats = (root: string, files: readonly LockStatsFile[]
         own.classes.set(lockClass, (own.classes.get(lockClass) ?? 0) + bucket.holdMs);
         perMinuteHold.set(minute, (perMinuteHold.get(minute) ?? 0) + bucket.holdMs);
       }
+      for (const [operation, bucket] of Object.entries(item.operations ?? {})) {
+        let aggregate = byOperation.get(operation);
+        if (!aggregate) byOperation.set(operation, aggregate = emptyTimingBucket());
+        mergeTimingBucket(aggregate, bucket);
+      }
+      for (const [operation, phases] of Object.entries(item.phases ?? {})) for (const [phase, bucket] of Object.entries(phases)) {
+        const key = `${operation}/${phase}`;
+        let aggregate = byPhase.get(key);
+        if (!aggregate) byPhase.set(key, aggregate = { operation, phase, bucket: emptyTimingBucket() });
+        mergeTimingBucket(aggregate.bucket, bucket);
+      }
     }
     if (own.bucket.n || own.bucket.timeouts || own.bucket.tries) byPid.push(own);
   }
   const classes = [...byClass].map(([lockClass, bucket]) => ({
     lockClass, ...totalsOf(bucket, windowMs), holdSharePct: all.holdMs > 0 ? bucket.holdMs / all.holdMs * 100 : 0,
   })).sort((a, b) => b.holdMs - a.holdMs || b.n - a.n || a.lockClass.localeCompare(b.lockClass));
+  const operations = [...byOperation].map(([operation, bucket]) => ({ operation, ...timingTotalsOf(bucket) }))
+    .sort((a, b) => b.totalHeldMs - a.totalHeldMs || a.operation.localeCompare(b.operation));
+  const phases = [...byPhase.values()].map(({ operation, phase, bucket }) => ({ operation, phase, ...timingTotalsOf(bucket) }))
+    .sort((a, b) => b.totalHeldMs - a.totalHeldMs || a.operation.localeCompare(b.operation) || a.phase.localeCompare(b.phase));
   const pids = byPid.map(({ host, pid, writer, bucket, classes: held }) => ({
     host, pid, ...totalsOf(bucket, windowMs),
     topClass: [...held].sort((a, b) => b[1] - a[1])[0]?.[0],
@@ -1018,6 +1218,6 @@ export const summarizeLockStats = (root: string, files: readonly LockStatsFile[]
   return {
     root, fromMinute, toMinute, minutes: span, processes: byPid.length, ...totalsOf(all, windowMs),
     peakMinuteBusyPct: Math.max(0, ...perMinuteHold.values()) / 60_000 * 100,
-    classes, pids,
+    classes, operations, phases, pids,
   };
 };

@@ -7,6 +7,7 @@ import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { hostLeasePath, readHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+import { participantFromEntry } from "../src/topology/participant-directory.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 // smarty-dev#10391: a bridge catch-up must never hold state.db's SQLite write lock above 100 ms.
@@ -141,24 +142,26 @@ const native = async (mesh: MeshStore, id: string) => {
 // A hub's presence at fleet scale (intel1's mesh, 10-13: ~800 host and ~1,500 participant rows,
 // ~200 lease files, ~170 participant files). The bridge's ownership check reads all of it.
 const HOSTS = 800, PARTICIPANTS = 1500, LEASES = 200, FILES = 170;
-const populate = async (mesh: MeshStore) => {
+const populate = async (mesh: MeshStore, hosts = HOSTS, firstHost = 0) => {
   const now = Date.now();
   const ops: Array<{ kind: "put"; key: string; value: unknown; identity: MeshIdentity }> = [];
-  for (let n = 0; n < Math.max(HOSTS, PARTICIPANTS); n++) {
-    const id = `session:fleet-${n}`;
+  for (let n = 0; n < Math.max(hosts, PARTICIPANTS); n++) {
+    const id = `session:fleet-${n + firstHost}`;
     const identity: MeshIdentity = { id, name: `agent-${n}`, kind: "main" };
     const hash = createHash("sha256").update(id).digest("hex");
-    if (n < HOSTS) ops.push({ kind: "put", key: `topology/hosts/${hash}`, identity,
+    if (n < hosts) ops.push({ kind: "put", key: `topology/hosts/${hash}`, identity,
       value: { format: 1, id, rootId: id, identity, startedAt: now, updatedAt: now, expiresAt: now + 120000, host: `host-${n % 9}` } });
     if (n < PARTICIPANTS) ops.push({ kind: "put", key: `topology/participants/${hash}`, identity,
       value: { format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id, name: `agent-${n}`,
         label: `lane agent ${n} on host ${n % 9}`, status: "idle", runner: "pi", transport: "host",
-        capabilities: ["steer", "followUp", "status"], startedAt: now, updatedAt: now, controlProtocol: "v1",
+        // Valid capabilities only (pi-fabric#1562 review P2): "status" is not one, so participantFromEntry refused
+        // these rows and the mirror filter skipped them, and the hold numbers compared unlike passes.
+        capabilities: ["steer", "followUp", "fabric"], startedAt: now, updatedAt: now, controlProtocol: "v1",
         cwd: `/home/paul/lanes/lane-${n}`, model: "opus-5.5", effort: "high" } });
   }
   for (let at = 0; at < ops.length; at += 200) await mesh.writeBatch({ identity: ops[at]!.identity, ops: ops.slice(at, at + 200) });
   for (let n = 0; n < LEASES; n++) {
-    const id = `session:fleet-${n}`;
+    const id = `session:fleet-${n + firstHost}`;
     writeHostLease(mesh.root, { id, rootId: id, identityId: id, updatedAt: now, expiresAt: now + 120000, startedAt: now });
   }
   for (let n = 0; n < FILES; n++) {
@@ -172,14 +175,23 @@ const populate = async (mesh: MeshStore) => {
 };
 
 describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real stores and state.db", () => {
-  it.each(["toLocal", "toRemote"] as const)(`${EVENTS} events %s: no topology scan inside a write transaction, batches of ${BATCH_MAX_EVENTS} at most`, async direction => {
+  const catchUp = async (direction: "toLocal" | "toRemote", hosts = HOSTS, firstHost = 0) => {
     const hub = store(), far = store();
     const localId = await native(hub, "session:hold-local"), remoteId = await native(far, "session:hold-remote");
-    await populate(hub);
+    await populate(hub, hosts, firstHost);
+    // Like for like: every fleet row is one this host's participant reader (the mirror's filter) accepts.
+    const rows = hub.listAll("topology/participants/");
+    expect(rows.filter(entry => participantFromEntry(entry) !== undefined)).toHaveLength(PARTICIPANTS + 1);
     // The default presence period: a drain this long runs presence passes, as a fleet catch-up does.
     const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local: new StoreBridgeSide(hub, "far"),
       remote: new StoreBridgeSide(far, "hub"), cursorPath: path.join(scratch(), "cursor.json") });
     await bridge.start();
+    // The production case uses canonical ids (fleet-10 onward); fleet-0..9 in the original
+    // stress fixture are too short. Prove all requested fleet hosts really acquired mirror leases.
+    if (firstHost > 0) for (let n = 0; n < hosts; n++) {
+      expect(readHostLease(far.root, `session:fleet-${n + firstHost}`))
+        .toMatchObject({ mirrorLease: 1, mirror: { remoteHost: "hub" } });
+    }
     const source = direction === "toRemote" ? hub : far;
     const target = direction === "toRemote" ? far : hub;
     const from = direction === "toRemote" ? localId : remoteId;
@@ -207,7 +219,7 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
       entry.maxMs = +Math.max(entry.maxMs, ms).toFixed(1);
       entry.totalMs = +(entry.totalMs + ms).toFixed(1);
     }
-    console.log(JSON.stringify({ direction, events: EVENTS, transactions: measured.length,
+    console.log(JSON.stringify({ direction, hosts, events: EVENTS, transactions: measured.length,
       maxHoldMs: +maxHoldMs.toFixed(2), totalHoldMs: +totalHoldMs.toFixed(1), drainMs: +drainMs.toFixed(1),
       over100: measured.filter(hold => hold.ms > MAX_HOLD_MS).length, inFenceScans: scans,
       maxBatchEvents: Math.max(0, ...batches), bySite }));
@@ -219,6 +231,26 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     expect(scans).toBe(0);
     expect(Math.max(0, ...batches)).toBeLessThanOrEqual(BATCH_MAX_EVENTS);
     expect(maxHoldMs).toBeLessThanOrEqual(CEILING_HOLD_MS);
+    return drainMs;
+  };
+
+  // The 800-host stress fixture renews 791 distinct hosts per presence pass, one lock each.
+  // Round 3 measured 320-420 ms per pass on Linux versus 133-176 ms on main. Windows's
+  // file-operation cost model is about 2x main (~50 s versus ~25 s for this drain).
+  // Batching gains nothing: each distinct host has only one renewal per pass.
+  // Keep Linux/macOS at 60 s; Windows alone gets 120 s until smarty-dev#16547's cheaper
+  // Windows lock removes this 120 s bound. Production is guarded separately below.
+  it.each(["toLocal", "toRemote"] as const)(`${EVENTS} events %s: no topology scan inside a write transaction, batches of ${BATCH_MAX_EVENTS} at most`,
+    async direction => { await catchUp(direction); }, process.platform === "win32" ? 120000 : 60000);
+
+  // Production scale: fabric-v2 reported 317 mirror leases fleet-wide, 282 renewed in 60 s,
+  // measured on Ryzen 1's fleet mesh at 18:2xZ on 10-24. Round 3's Windows model predicts
+  // ~50 s for 791 hosts, so 320 hosts predict ~20 s (50 * 320 / 791). Assert <40 s on ALL
+  // platforms: 2x model headroom while retaining 20 s of margin inside the old 60 s bound.
+  // Same 500-event toLocal drain, topology/participant load, real stores and default presence
+  // period as the stress case; no hosted-only veto or Windows skip.
+  it(`${EVENTS} events toLocal with 320 fleet hosts: drains inside 40 s`, async () => {
+    expect(await catchUp("toLocal", 320, 10)).toBeLessThan(40000);
   }, 60000);
 
   // The pre-check runs outside the fence; a file the check reads can change before the fence. Each case changes
@@ -345,6 +377,7 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
   // judge every lease the same, or the plan runs again. Both directions; the clock is the side's own.
   it.each([
     ["expires", 0, 20_000, true],
+    ["is exactly at the deadline", 10_000, 10_001, true],
     ["becomes live (clock back)", 20_000, 0, false],
   ] as const)("mirror plan: a native lease that %s before the transaction re-plans", async (_name, planAt, txAt, kept) => {
     const hub = store();
@@ -391,6 +424,15 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
       expect(mesh.stateUnchangedSince(at, prefixes)).toBe(false);
       expect(mesh.stateUnchangedSince(at, ["probe/"])).toBe(true);
     }
+    const ownKey = `${prefixes[0]}${"b".repeat(64)}`;
+    const ownRevision = mesh.stateRevision()!;
+    const own = await mesh.put({ key: ownKey, value: { id: "own" }, identity });
+    expect(mesh.stateUnchangedSince(ownRevision, prefixes)).toBe(false);
+    expect(mesh.stateUnchangedSince(ownRevision, prefixes, new Set([ownKey]))).toBe(true);
+    expect(mesh.stateUnchangedSince(ownRevision, prefixes, new Map([[ownKey, own.version]]))).toBe(true);
+    await other.put({ key: ownKey, value: { id: "external" }, identity });
+    expect(mesh.stateUnchangedSince(ownRevision, prefixes, new Set([ownKey]))).toBe(true);
+    expect(mesh.stateUnchangedSince(ownRevision, prefixes, new Map([[ownKey, own.version]]))).toBe(false);
     // A revision of another lineage (a re-epoched or another database) proves nothing.
     expect(mesh.stateUnchangedSince(`other:${revision}`, prefixes)).toBe(false);
     // The file backend has no change feed: never proven.

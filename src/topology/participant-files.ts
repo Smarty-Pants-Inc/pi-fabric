@@ -1,23 +1,18 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, renameAtomic, AtomicFileWriter, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, renameAtomic, AtomicFileWriter, MeshLockTimeoutError,
+  namespaceBarrierAvailable } from "../core/atomic-write.js";
 import type { MeshStateEntry } from "../mesh/store.js";
 
 // Participant records outside the shared state (smarty-dev#2004). Each record lived in the one
 // shared state.json, so every participant change rewrote the whole file under the mesh lock, and
-// every process re-read and parsed all of it. Each record now also lives in a file of its own
-// under participants/, replaced by an atomic rename without the lock; only its owner host writes
-// it (a reaper removes the files of hosts gone for hours). A reader re-reads only the files whose
-// metadata changed, and none while the directory is unchanged.
+// every process re-read and parsed all of it. Native records now live in per-record files.
 
 /**
  * Under the liveness policy (LIVENESS_POLICY_KEY) with `participants: "files"`, set by the fleet
- * owner once every runtime reads these files, records are written only here and hosts remove
- * their records from the shared state. Before that, hosts write both (older runtimes read only
- * the shared state).
- * ponytail: until that switch every committed record is written twice, and the lock and state
- * size are unchanged; the gain comes with the switch, as for host leases (#68).
+ * owner once every runtime reads these files, records are written only here and hosts remove their
+ * records from the shared state. Before that, hosts write both (older runtimes read only shared state).
  */
 export const participantFilesOnly = (policy: unknown): boolean =>
   typeof policy === "object" && policy !== null &&
@@ -36,29 +31,50 @@ const fileOf = (meshRoot: string, key: string): string | undefined => {
 
 /**
  * Replaces a record's file if `decide`, given the file's current entry (read fresh), returns the
- * entry to write. Decisions on one key are serialized by a per-key lock, so a takeover or removal
- * judged on an earlier read cannot overwrite a newer owner (review/astra F1 on #142). The lock is
- * per record, not the mesh lock: routine owner updates never wait on other keys.
+ * entry to write. Decisions on one key are serialized by a per-key lock. Additions also take the
+ * namespace gate; updates release it before waiting on the key so one contended file cannot stall
+ * healthy heartbeats or unrelated participant writers.
  */
 /** The store whose file custody lock serializes the rare recovery of a dead holder's per-key
  * lock and the sweep (smarty-dev#6477 L5: MeshStore.custody, not the shared mesh lock alone). */
 export interface ParticipantFileMesh {
   readonly root: string;
-  custody<T>(operation: () => T): Promise<T>;
+  custody<T>(operation: () => T, lockTimeoutMs?: number): Promise<T>;
 }
 
 /** Prepared unknown is distinct from an absent (lazy) identity. */
 export interface ParticipantFileLockOptions {
   ownIncarnation?: string | undefined;
-  /** No native holder read or ordinary key wait: registry custody and the
-   * independent zero-wait renewal lane both require this prepared mode. */
+  /** No native holder read or ordinary key wait: registry custody and the independent zero-wait
+   * renewal lane both require this prepared mode. */
   registryFenced?: boolean;
-  /** Runs the actual synchronous decision/write under the publisher's lease custody. */
-  withCommitFence?: <T>(operation: () => T) => Promise<T>;
+  /** One-shot acquisition used while the namespace gate is held; contention releases the gate. */
+  tryOnly?: boolean;
+  /** Runs the actual decision/write under the publisher's lease custody. */
+  withCommitFence?: <T>(operation: () => T | Promise<T>) => Promise<T>;
 }
 
 export class ParticipantFileLockBusyError extends MeshLockTimeoutError {
   constructor(lock: string) { super(` participant file lock ${lock}`, 1, 0); }
+}
+
+/** A bounded (LOCK_WAIT_MS) key or namespace wait that ran out. A plain Error, so participant
+ * writers keep their existing handling; directory custody converts it (below). */
+class ParticipantFileLockWaitTimeout extends Error {
+  constructor(readonly lock: string, readonly attempts: number, readonly maxGapMs: number) {
+    super(`Timed out waiting for the participant file lock ${lock}`);
+  }
+}
+
+/** smarty-dev#13645 (re-audit P1-1): a mirror's directory custody that waited out LOCK_WAIT_MS behind
+ * another holder (another link's state-changing pass holds the namespace across its batches). That
+ * is contention, not a permanent refusal: a MeshLockTimeoutError, so the bridge backs off and retries
+ * instead of stopping the link. */
+export class ParticipantFileCustodyTimeoutError extends MeshLockTimeoutError {
+  constructor(readonly lock: string, attempts: number, maxGapMs: number) {
+    super(` participant file lock ${lock}`, attempts, maxGapMs);
+    this.name = "ParticipantFileCustodyTimeoutError";
+  }
 }
 
 export const writeParticipantFileIf = async (
@@ -69,11 +85,16 @@ export const writeParticipantFileIf = async (
 ): Promise<boolean> => {
   const file = fileOf(mesh.root, key);
   if (!file) throw new Error(`Not a participant key: ${key}`);
-  return withKeyLock(mesh, file, () => {
-    const entry = decide(readFresh(file));
+  // Every write decides under the hold that writes it. `decide` reads authority outside the file
+  // (publication fences, registry lineage, lease liveness) that must be judged in the same atomic step
+  // as the write (#7817), so a decision made under an earlier, released hold is never reused, even
+  // when the file's bytes are unchanged.
+  const write = (requireSameIdentity = false): boolean | typeof RETRY_ADDITION => {
+    const current = readFresh(file);
+    const entry = decide(current);
     if (!entry) return false;
     if (entry.key !== key) throw new Error(`Participant entry key mismatch: ${entry.key}`);
-    // Presence lapses/rebuilds after a crash; migration callers still request barriers.
+    if (requireSameIdentity && (identityOf(current) === undefined || identityOf(current) !== identityOf(entry))) return RETRY_ADDITION;
     new AtomicFileWriter(file).write(JSON.stringify({ format: 1, ...entry }),
       options.durable === undefined ? {} : { durable: options.durable });
     if (options.durable && JSON.stringify(readFresh(file)) !== JSON.stringify(entry)) {
@@ -81,10 +102,45 @@ export const writeParticipantFileIf = async (
     }
     rescan(path.dirname(file));
     return true;
-  }, options);
+  };
+  // smarty-dev#13645: an update of an existing record whose identity fields stay the same needs
+  // only its own key receipt. A directory-custody holder (the mesh bridge) holds the receipts of
+  // every record that can alias its incoming ids, and additions and identity changes still take
+  // the namespace gate below, so unrelated heartbeats never queue behind a mirror's custody.
+  if (fs.existsSync(file)) {
+    const result = await withKeyLock(mesh, file, () => fs.existsSync(file) ? write(true) : RETRY_ADDITION, options);
+    if (result !== RETRY_ADDITION) return result;
+  }
+  for (;;) {
+    // Additions and identity changes take the namespace gate before their per-key receipt. Existing
+    // entries release that short check before waiting on their key.
+    const { withCommitFence: _withCommitFence, ...namespaceOptions } = options;
+    const namespace = await withParticipantNamespaceLock(mesh, async () => {
+      if (fs.existsSync(file)) return { present: true as const };
+      try {
+        return { present: false as const, result: await withKeyLock(mesh, file, () => write() as boolean, { ...options, tryOnly: true }) };
+      } catch (error) {
+        if (!(error instanceof ParticipantFileLockBusyError)) throw error;
+        return { present: false as const, contended: true as const };
+      }
+    }, namespaceOptions);
+    if (!namespace.present && !("contended" in namespace)) return namespace.result;
+    const result = await withKeyLock(mesh, file, () => fs.existsSync(file) ? write() : RETRY_ADDITION, options);
+    if (result !== RETRY_ADDITION) return result;
+  }
 };
 
-/** Removes a record's file if `decide` accepts its current entry; under the same per-key lock. */
+const RETRY_ADDITION = Symbol("participant-file-addition-raced-removal");
+
+/** The identity fields a mirror's participant snapshot keys admission and collisions on. */
+const identityOf = (entry: MeshStateEntry | undefined): string | undefined => {
+  const value = entry?.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  return JSON.stringify([record.id, record.rootId, record.ownerHostId, record.ownerIdentityId, record.name, record.sessionId]);
+};
+
+/** Removes a record under its per-key receipt; the namespace gate is only for additions. */
 export const removeParticipantFileIf = async (
   mesh: ParticipantFileMesh,
   key: string,
@@ -102,8 +158,15 @@ export const removeParticipantFileIf = async (
   }, options);
 };
 
-/** Writes a changed record (tests and tools; runtimes use writeParticipantFileIf). */
+/** Writes a changed record (tests and tools; runtimes use writeParticipantFileIf, which takes the
+ * key receipt, and the namespace gate for additions, that a mirror's directory custody holds). As on
+ * main this has no receipt of its own: one atomic replacement, none for byte-identical bytes. */
 export const writeParticipantFile = (meshRoot: string, entry: MeshStateEntry): void => {
+  writeParticipantFileUnderCustody(meshRoot, entry);
+};
+
+/** Synchronous file replacement for a caller already holding the namespace and key receipts. */
+export const writeParticipantFileUnderCustody = (meshRoot: string, entry: MeshStateEntry): void => {
   const file = fileOf(meshRoot, entry.key);
   if (!file) throw new Error(`Not a participant key: ${entry.key}`);
   new AtomicFileWriter(file).write(JSON.stringify({ format: 1, ...entry }));
@@ -129,6 +192,12 @@ const readFresh = (file: string): MeshStateEntry | undefined => {
 
 const LOCK_WAIT_MS = 5_000;
 
+// A per-key lock: participants/.locks/<hash>, a directory created with its owner record inside by
+// one rename, so a lock never exists without its owner. A live holder is never taken over, however
+// long it holds the lock (a resumed holder would write on an earlier decision); a waiter then times
+// out and its refresh retries. A dead holder's lock is removed under the mesh lock, after reading
+// its owner again, so concurrent recoveries cannot remove a successor's lock (review/astra round 3
+// on #142). Recovery is rare; routine writes never take the mesh lock.
 const holderAlive = async (owner: string, lock: string, registryFenced = false): Promise<boolean> => {
   const [pidText, startTime, token] = owner.split("\n");
   const pid = Number(pidText);
@@ -146,44 +215,59 @@ const holderAlive = async (owner: string, lock: string, registryFenced = false):
   return actual === undefined || actual === startTime;
 };
 
-// A per-key lock: participants/.locks/<hash>, a directory created with its owner record inside by
-// one rename, so a lock never exists without its owner. A live holder is never taken over, however
-// long it holds the lock (a resumed holder would write on an earlier decision); a waiter then times
-// out and its refresh retries. A dead holder's lock is removed under the mesh lock, after reading
-// its owner again, so concurrent recoveries cannot remove a successor's lock (review/astra round 3
-// on #142). Recovery is rare; routine writes never take the mesh lock.
+/** One directory fsync, no chain walk: the lock directories already exist. Skipped where there is no directory fsync
+ * (namespaceBarrierAvailable: Windows; NTFS journals the names). */
+const syncDirectoryEntries = (directory: string): void => {
+  if (!namespaceBarrierAvailable()) return;
+  const fd = fs.openSync(directory, fs.constants.O_RDONLY);
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+};
+
+// A per-key lock receipt is atomically renamed into place with its owner record.
 const keyReceipt = (mesh: ParticipantFileMesh, file: string, incarnation: string | undefined) => {
-  const locks = path.join(mesh.root, DIR, ".locks");
+  const locks = file === namespaceReceiptFile(mesh) ? namespaceLockDirectory(mesh) : path.join(mesh.root, DIR, ".locks");
   const lock = path.join(locks, path.basename(file, ".json"));
   fs.mkdirSync(locks, { recursive: true, mode: 0o700 });
   const token = `${process.pid}\n${incarnation ?? ""}\n${randomUUID()}\n`;
+  const release = (): void => {
+    const tombstone = `${lock}.${randomUUID()}.dead`;
+    renameAtomic(lock, tombstone);
+    fs.rmSync(tombstone, { recursive: true, force: true });
+  };
   return {
     lock,
     acquire: (): void => {
+      // A held lock is refused before any staging or fsync, as its rename would be: waiters retry every 5 ms (withKeyLock),
+      // and three fsyncs per refused attempt made contention cost real disk time (pi-fabric#1562: 5 s waits under fake
+      // timers ran ~1,000 attempts and timed out on ZFS). Only a fast path: the rename below still decides.
+      if (fs.existsSync(lock)) throw Object.assign(new Error(`Participant lock is held: ${lock}`), { code: "EEXIST" });
       const staging = `${lock}.${process.pid}.${randomUUID()}.tmp`;
       fs.mkdirSync(staging, { mode: 0o700 });
       try {
-        fs.writeFileSync(path.join(staging, "owner"), token, { mode: 0o600 });
+        // Durable before it becomes visible (pi-fabric#1562, fabric-store P2): a host crash must never leave a published lock
+        // with an empty or torn owner, which recovery cannot judge and so never clears. The owner's bytes, then its name in
+        // the staging directory, reach the disk before the rename publishes them.
+        const fd = fs.openSync(path.join(staging, "owner"), "wx", 0o600);
+        try { fs.writeFileSync(fd, token); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        syncDirectoryEntries(staging);
         fs.renameSync(staging, lock);
       } catch (error) {
         fs.rmSync(staging, { recursive: true, force: true });
         throw error;
       }
+      // Then the published name. If that sync fails, give the lock back rather than hold it while reporting an error.
+      try { syncDirectoryEntries(locks); }
+      catch (error) {
+        try { release(); } catch { /* left to recovery: our pid ends, and a dead holder is cleared */ }
+        throw error;
+      }
     },
-    release: (): void => {
-      // Detach our complete receipt before deleting. Never delete canonical,
-      // including when Windows readers briefly deny the directory rename.
-      const tombstone = `${lock}.${randomUUID()}.dead`;
-      renameAtomic(lock, tombstone);
-      fs.rmSync(tombstone, { recursive: true, force: true });
-    },
+    release,
   };
 };
 
-/** Synchronous zero-wait key custody for registry lineage commits. Adoption
- * shares this receipt with independent renewal, closing the token-check/rename
- * race. Native identity and dead-holder recovery MUST be prepared before taking
- * registry/mesh custody; a busy key unwinds both fences, never waits under them. */
+/** Synchronous zero-wait key custody for registry lineage commits. Adoption shares this receipt
+ * with independent renewal, closing the token-check/rename race. */
 export const withParticipantFileTryLock = <T>(
   mesh: ParticipantFileMesh, key: string, ownIncarnation: string | undefined, operation: () => T,
 ): T => {
@@ -200,10 +284,90 @@ export const withParticipantFileTryLock = <T>(
   finally { receipt.release(); }
 };
 
+const namespaceReceiptFile = (mesh: ParticipantFileMesh): string => path.join(mesh.root, DIR, ".namespace.json");
+/** smarty-dev#13645: the namespace receipt lives OUTSIDE participants/. A mirror takes it on every
+ * state-changing pass, and keeping it under participants/.locks created participants/ on a mesh that
+ * has no participant file yet, so readers watching for that directory's creation never saw it. The
+ * per-key receipts stay in participants/.locks, which only exists once a participant file does. */
+const NAMESPACE_LOCK_DIR = "participant-namespace";
+const namespaceLockDirectory = (mesh: ParticipantFileMesh): string => path.join(mesh.root, NAMESPACE_LOCK_DIR);
+
+/** Additions take the namespace receipt before per-key custody. */
+const withParticipantNamespaceLock = <T>(mesh: ParticipantFileMesh, operation: () => T | Promise<T>,
+  options: ParticipantFileLockOptions = {}): Promise<T> => withKeyLock(mesh, namespaceReceiptFile(mesh), operation, options);
+
+/** Stabilize additions and the selected existing records in key order. The ID filter excludes
+ * unrelated native heartbeat files while still locking every entry that can alias this mirror. */
+export const withParticipantFileDirectoryCustody = async <T>(mesh: ParticipantFileMesh,
+  operation: () => T | Promise<T>, relevantIds?: ReadonlySet<string>): Promise<T> => {
+  // Only this custody's own acquisitions are converted; the operation's errors pass through unchanged.
+  let entered = false;
+  try {
+    return await participantFileDirectoryCustody(mesh, () => { entered = true; return operation(); }, relevantIds);
+  } catch (error) {
+    if (!entered && error instanceof ParticipantFileLockWaitTimeout) {
+      throw new ParticipantFileCustodyTimeoutError(error.lock, error.attempts, error.maxGapMs);
+    }
+    throw error;
+  }
+};
+
+const participantFileDirectoryCustody = <T>(mesh: ParticipantFileMesh,
+  operation: () => T | Promise<T>, relevantIds?: ReadonlySet<string>): Promise<T> => withParticipantNamespaceLock(mesh, async () => {
+    const directory = path.join(mesh.root, DIR);
+    let names: string[];
+    try { names = fs.readdirSync(directory).filter(name => NAME.test(name)).sort(); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") names = []; else throw error; }
+    const relevantFiles = relevantIds === undefined ? undefined : new Set<string>();
+    if (relevantFiles && relevantIds) {
+      for (const id of relevantIds) {
+        const key = `${PREFIX}${createHash("sha256").update(id).digest("hex")}`;
+        const file = fileOf(mesh.root, key);
+        if (file) relevantFiles.add(path.basename(file));
+      }
+      for (const name of names) {
+        const entry = readFresh(path.join(directory, name));
+        if (entry && typeof entry.value === "object" && entry.value !== null) {
+          const value = entry.value as Record<string, unknown>;
+          if ([value.id, value.rootId, value.ownerHostId, value.ownerIdentityId].some(id => typeof id === "string" && relevantIds.has(id))) {
+            relevantFiles.add(name);
+          }
+        }
+      }
+    }
+    const files = names.filter(name => relevantFiles === undefined || relevantFiles.has(name)).map(name => path.join(directory, name));
+    const acquire = (index: number): Promise<T> => index === files.length
+      ? Promise.resolve().then(operation)
+      : withKeyLock(mesh, files[index]!, () => acquire(index + 1));
+    return acquire(0);
+  });
+
+/** Synchronous form for already-prepared publication fences; namespace first, then sorted keys. */
+export const withParticipantFilesTryLock = <T>(mesh: ParticipantFileMesh, keys: readonly string[],
+  ownIncarnation: string | undefined, operation: () => T): T => {
+  const files = [...new Set(keys.map(key => fileOf(mesh.root, key)))];
+  if (files.some(file => !file)) throw new Error("Not a participant key");
+  const receipts = [keyReceipt(mesh, namespaceReceiptFile(mesh), ownIncarnation),
+    ...files.map(file => keyReceipt(mesh, file!, ownIncarnation)).sort((a, b) => a.lock.localeCompare(b.lock))];
+  const acquired: ReturnType<typeof keyReceipt>[] = [];
+  try {
+    for (const receipt of receipts) {
+      try { receipt.acquire(); }
+      catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (["EEXIST", "ENOTEMPTY", "EPERM", "EACCES"].includes(code ?? "")) throw new ParticipantFileLockBusyError(receipt.lock);
+        throw error;
+      }
+      acquired.push(receipt);
+    }
+    return operation();
+  } finally { for (const receipt of acquired.reverse()) receipt.release(); }
+};
+
 const withKeyLock = async <T>(
   mesh: ParticipantFileMesh,
   file: string,
-  operation: () => T,
+  operation: () => T | Promise<T>,
   options: ParticipantFileLockOptions = {},
 ): Promise<T> => {
   const prepared = Object.prototype.hasOwnProperty.call(options, "ownIncarnation");
@@ -211,43 +375,54 @@ const withKeyLock = async <T>(
   const incarnation = prepared ? options.ownIncarnation : await ownProcessIncarnation();
   const receipt = keyReceipt(mesh, file, incarnation);
   const deadline = Date.now() + LOCK_WAIT_MS;
+  let attempts = 0;
+  let maxGapMs = 0;
+  let lastAttemptAt = Date.now();
   for (;;) {
+    const attemptAt = Date.now();
+    maxGapMs = Math.max(maxGapMs, attemptAt - lastAttemptAt);
+    lastAttemptAt = attemptAt;
+    attempts += 1;
     try { receipt.acquire(); break; }
     catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "EEXIST" && code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES") throw error;
+      if (options.tryOnly) throw new ParticipantFileLockBusyError(receipt.lock);
       await recoverDeadKeyLock(mesh, receipt.lock, options.registryFenced);
       if (options.registryFenced && fs.existsSync(receipt.lock)) throw new ParticipantFileLockBusyError(receipt.lock);
-      if (Date.now() >= deadline) throw new Error(`Timed out waiting for the participant file lock ${receipt.lock}`);
+      if (Date.now() >= deadline) throw new ParticipantFileLockWaitTimeout(receipt.lock, attempts, maxGapMs);
       await new Promise(resolve => setTimeout(resolve, 5));
     }
   }
-  try { return options.withCommitFence ? await options.withCommitFence(operation) : operation(); }
+  try { return options.withCommitFence ? await options.withCommitFence(operation) : await operation(); }
   finally { receipt.release(); }
 };
 
 const readOwner = (lock: string): string | undefined => {
   try {
-    return fs.readFileSync(path.join(lock, "owner"), "utf8");
-  } catch {
-    return undefined;
-  }
+    const value = fs.readFileSync(path.join(lock, "owner"), "utf8");
+    return value.endsWith("\n") && value.split("\n").length === 4 ? value : undefined;
+  } catch { return undefined; }
 };
 
+/** An owner that cannot be read (empty or torn: only a host crash on a build without the owner fsync can leave one) is
+ * never judged dead here. The operator step (docs/participants-cli.md): confirm no process holds the lock, then rename
+ * the lock directory aside to `<lock>.<UTC stamp>.operator-dead` (never delete it). */
 const recoverDeadKeyLock = async (mesh: ParticipantFileMesh, lock: string, registryFenced = false): Promise<void> => {
-  const seen = readOwner(lock);
-  if (seen === undefined || await holderAlive(seen, lock, registryFenced)) return;
-  await mesh.custody(() => {
-    // Compare, then delete by a rename to a unique name and a second compare: a lock that is not
-    // the one judged dead goes back (it cannot be, while recoveries share the custody lock).
-    if (readOwner(lock) !== seen) return;
+  let owner = readOwner(lock);
+  if (!owner || await holderAlive(owner, lock, registryFenced)) return;
+  await mesh.custody(async () => {
+    const current = readOwner(lock);
+    if (current !== owner || await holderAlive(current, lock, registryFenced)) return;
     const tombstone = `${lock}.${randomUUID()}.dead`;
-    // A sibling read/scanner can briefly deny a Windows directory rename. Keep
-    // the unique target and bounded retry; never fall back to deleting the lock.
-    renameAtomic(lock, tombstone);
-    if (readOwner(tombstone) === seen) fs.rmSync(tombstone, { recursive: true, force: true });
-    else renameAtomic(tombstone, lock);
-  }); // A custody/mesh timeout unwinds the publication fence; retry on the next refresh.
+    try {
+      renameAtomic(lock, tombstone);
+      fs.rmSync(tombstone, { recursive: true, force: true });
+    } catch (error) {
+      // Windows can briefly deny the directory rename; leave it for the next retry.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }, 0);
 };
 
 /** Recover only this adoption key before taking registry/mesh custody. */
@@ -257,10 +432,22 @@ export const prepareParticipantFileLock = async (mesh: ParticipantFileMesh, key:
   await recoverDeadKeyLock(mesh, path.join(mesh.root, DIR, ".locks", path.basename(file, ".json")));
 };
 
+/** Recover a dead holder's namespace receipt (participant-namespace/.namespace) before taking
+ * registry/mesh custody. Every fenced addition and every withParticipantFilesTryLock takes this receipt
+ * first, and a fenced holder probe reports any holder whose PID is live or unprobeable (reused PID,
+ * EPERM) as busy, so only an unfenced native check like this one can clear it (fabric-store review of
+ * pi-fabric#1562, P1). Same receipt comparison under file custody as the per-key recovery. */
+export const prepareParticipantNamespaceLock = (mesh: ParticipantFileMesh): Promise<void> =>
+  // keyReceipt's own lock path, without its mkdir: preparation creates nothing.
+  recoverDeadKeyLock(mesh, path.join(namespaceLockDirectory(mesh), path.basename(namespaceReceiptFile(mesh), ".json")));
+
 /** Retry preparation only: fresh native key-holder evidence/recovery occurs outside
  * registry custody. Recovery compares the exact receipt under file custody;
- * no participant/source selection crosses this wait. */
+ * no participant/source selection crosses this wait. The namespace receipt comes first, in
+ * acquisition order; it lives outside participants/, so it is recovered even when no
+ * participant file (and so no participants/.locks) exists yet. */
 export const prepareParticipantFileLocks = async (mesh: ParticipantFileMesh): Promise<void> => {
+  await prepareParticipantNamespaceLock(mesh);
   const locks = path.join(mesh.root, DIR, ".locks");
   let names: fs.Dirent[];
   try { names = fs.readdirSync(locks, { withFileTypes: true }); }
@@ -277,6 +464,32 @@ const deepFreeze = <T>(value: T): T => {
   }
   return value;
 };
+
+/**
+ * Removes staging and tombstone directories of the per-key locks older than `olderThanMs`: a
+ * process that died between creating one and renaming or removing it leaves it (security pass S5).
+ */
+export const sweepParticipantLockLeftovers = (
+  mesh: ParticipantFileMesh, olderThanMs: number, now = Date.now(),
+): Promise<void> => mesh.custody(() => {
+  // Share recovery's lock for the entire scan/removal: never unlink the owner of
+  // a detached lock between recovery's rename and its compare/restore decision.
+  for (const locks of [path.join(mesh.root, DIR, ".locks"), namespaceLockDirectory(mesh)]) {
+    let names: string[];
+    try { names = fs.readdirSync(locks); }
+    catch { continue; }
+    for (const name of names) {
+      if (!name.endsWith(".tmp") && !name.endsWith(".dead")) continue;
+      try {
+        if (now - fs.statSync(path.join(locks, name)).mtimeMs > olderThanMs) {
+          fs.rmSync(path.join(locks, name), { recursive: true, force: true });
+        }
+      } catch {
+        // Removed meanwhile.
+      }
+    }
+  }
+});
 
 const entryOf = (text: string, name: string): MeshStateEntry | undefined => {
   try {
@@ -381,7 +594,6 @@ export const readParticipantFiles = (
   return listed;
 };
 
-/** One record's file entry, from the same cache; for a single-participant lookup. */
 export const readParticipantFile = (meshRoot: string, key: string): MeshStateEntry | undefined => {
   const file = fileOf(meshRoot, key);
   if (!file) return undefined;
@@ -416,34 +628,6 @@ export const participantFilePresent = (meshRoot: string, key: string): boolean =
   }
 };
 
-/**
- * Removes staging and tombstone directories of the per-key locks older than `olderThanMs`: a
- * process that died between creating one and renaming or removing it leaves it (security pass S5).
- */
-export const sweepParticipantLockLeftovers = (
-  mesh: ParticipantFileMesh, olderThanMs: number, now = Date.now(),
-): Promise<void> => mesh.custody(() => {
-  // Share recovery's lock for the entire scan/removal: never unlink the owner of
-  // a detached lock between recovery's rename and its compare/restore decision.
-  const locks = path.join(mesh.root, DIR, ".locks");
-  let names: string[];
-  try {
-    names = fs.readdirSync(locks);
-  } catch {
-    return;
-  }
-  for (const name of names) {
-    if (!name.endsWith(".tmp") && !name.endsWith(".dead")) continue;
-    try {
-      if (now - fs.statSync(path.join(locks, name)).mtimeMs > olderThanMs) {
-        fs.rmSync(path.join(locks, name), { recursive: true, force: true });
-      }
-    } catch {
-      // Removed meanwhile.
-    }
-  }
-});
-
 /** Changes whenever a participant file is added, replaced or removed (not on Windows: see above). */
 export const participantFilesStamp = (meshRoot: string): string | undefined => {
   try {
@@ -463,4 +647,10 @@ export const participantFilesCachedStamp = (meshRoot: string): string | undefine
   // A scan within the directory's timestamp tick may have missed a change in that same tick, which
   // would not move the stamp: report no stamp, so the reader's gate stays open until a later scan.
   return known?.complete && known.scannedAt - known.mtimeMs >= DIR_TICK_MS ? `${known.ino}:${known.mtimeMs}` : undefined;
+};
+
+/** Stable directory/file metadata used by external snapshot revalidation. */
+export const participantFileSnapshot = (meshRoot: string): { stamp: string; entries: readonly MeshStateEntry[] } => {
+  const entries = readParticipantFiles(meshRoot, { maxAgeMs: 0 });
+  return { stamp: participantFilesStamp(meshRoot) ?? "missing", entries };
 };

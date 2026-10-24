@@ -1,4 +1,4 @@
-import { createLockEvents, createLockStats, lockHeldEventThreshold, type LockEventStore, type MeshLockClass } from "./commit-stats.js";
+import { createLockEvents, createLockStats, lockHeldEventThreshold, type LockEventStore, type LockTimingContext, type MeshLockClass } from "./commit-stats.js";
 import { meshLockQueueDirectory, MeshLockTicket } from "./lock-queue.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { retryDelayMs } from "../core/retry-backoff.js";
@@ -346,8 +346,8 @@ export class MeshLock {
   // `bounded` marks an explicit try (preparation refusal and lock stats); a scoped withTryLock is one too. A
   // reduced remaining budget from an ordinary caller is never a try.
   withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs, lockClass: MeshLockClass = "other",
-    bounded = false): Promise<T> {
-    return this.#withLock(operation, lockTimeoutMs, lockClass, bounded, false);
+    bounded = false, timing?: LockTimingContext): Promise<T> {
+    return this.#withLock(operation, lockTimeoutMs, lockClass, bounded, false, timing);
   }
 
   /**
@@ -356,12 +356,12 @@ export class MeshLock {
    * whose mesh critical sections stay synchronous.
    */
   withLockAcrossAwait<T>(operation: () => Promise<T>, lockTimeoutMs = this.#lockTimeoutMs,
-    lockClass: MeshLockClass = "other"): Promise<T> {
-    return this.#withLock(operation, lockTimeoutMs, lockClass, false, true);
+    lockClass: MeshLockClass = "other", timing?: LockTimingContext): Promise<T> {
+    return this.#withLock(operation, lockTimeoutMs, lockClass, false, true, timing);
   }
 
   async #withLock<T>(operation: () => T | Promise<T>, lockTimeoutMs: number, lockClass: MeshLockClass,
-    bounded: boolean, acrossAwait: boolean): Promise<T> {
+    bounded: boolean, acrossAwait: boolean, timing?: LockTimingContext): Promise<T> {
     const lockWaitStart = timed ? performance.now() : 0;
     let lockHeldAt = -1;
     let holdMs = -1;
@@ -434,20 +434,21 @@ export class MeshLock {
       ? candidate : undefined;
     if (candidate && !initial) candidate.consumed = true;
     const lifetime = initialAdmissionScope.getStore();
-    const timing = lifetime?.active && lifetime.root === this.root ? lifetime.timing : undefined;
+    // `retainedTiming` (the held-ingress diagnostic) is distinct from the `timing` lock-stats context.
+    const retainedTiming = lifetime?.active && lifetime.root === this.root ? lifetime.timing : undefined;
     let canonicalRelease: FenceLockRelease | undefined;
     let canonicalReleasedAt: number | undefined;
     const acquiredCanonical = (): void => {
-      if (timing) finishRetainedOffLock(timing);
+      if (retainedTiming) finishRetainedOffLock(retainedTiming);
       canonicalRelease = { released: false };
       canonicalReleasedAt = undefined;
     };
     const releaseOwned = (): void => {
       try { canonicalRelease = releaseCanonical(); }
       catch (cause) { canonicalRelease = { released: false, cause }; throw cause; }
-      if (canonicalRelease.released && timing && !lifetime?.consumed && lifetime?.admission?.ticket.queued) {
+      if (canonicalRelease.released && retainedTiming && !lifetime?.consumed && lifetime?.admission?.ticket.queued) {
         canonicalReleasedAt = performance.now();
-        if (timing.fenceRefusals > 0) timing.offLockSince ??= canonicalReleasedAt;
+        if (retainedTiming.fenceRefusals > 0) retainedTiming.offLockSince ??= canonicalReleasedAt;
       }
     };
     const signal = initial?.signal && this.#writeAbortSignal
@@ -505,7 +506,7 @@ export class MeshLock {
       while (true) {
         signal?.throwIfAborted();
         const mayContend = ticket.mayContend();
-        if (timing && !lifetime?.admission?.ticket.queued) finishRetainedOffLock(timing);
+        if (retainedTiming && !lifetime?.admission?.ticket.queued) finishRetainedOffLock(retainedTiming);
         if (initial && (performance.now() > initial.expiresAt! || Date.now() > deadline)) {
           if (!mayContend || (attempts === 0 && ticket.queued)) throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
           throw timeout();
@@ -632,7 +633,7 @@ export class MeshLock {
         // A native release throw must not mask the certified fence refusal or its count.
         const fenceRefusal = operationFailure ? operationFailure.error : error;
         const preAppendRefusal = initial.isPreAppendRefusal(fenceRefusal);
-        if (timing && preAppendRefusal) timing.fenceRefusals += 1;
+        if (retainedTiming && preAppendRefusal) retainedTiming.fenceRefusals += 1;
         if (!initial.consumed && preAppendRefusal && canonicalRelease?.released === false) {
           initial.consumed = true;
           throw new MeshLockReleaseUnconfirmedError(fenceRefusal, canonicalRelease.cause);
@@ -645,7 +646,7 @@ export class MeshLock {
           initial.retryError = error;
           // Start at actual canonical release, not at the requested retry sleep. A pre-busy
           // initial queue wait has no release timestamp and contributes nothing.
-          if (timing && canonicalReleasedAt !== undefined) timing.offLockSince ??= canonicalReleasedAt;
+          if (retainedTiming && canonicalReleasedAt !== undefined) retainedTiming.offLockSince ??= canonicalReleasedAt;
         } else initial.consumed = true;
       }
       if (timed && lockHeldAt < 0 && error instanceof MeshLockTimeoutError && !(error instanceof MeshLockQueueExpiredError)) {
@@ -657,15 +658,15 @@ export class MeshLock {
       if (!retain) {
         if (initial) initial.consumed = true;
         ticket.close();
-        if (initial && timing) finishRetainedOffLock(timing);
+        if (initial && retainedTiming) finishRetainedOffLock(retainedTiming);
       }
       // Recorded after the release attempt; only a confirmed release may retain advisory admission.
       if (holdMs >= 0) {
-        lockStats?.acquired(this.root, lockClass, lockHeldAt - lockWaitStart, holdMs);
+        lockStats?.acquired(this.root, lockClass, lockHeldAt - lockWaitStart, holdMs, timing);
         if (this.#lockHeldEventMs > 0 && holdMs > this.#lockHeldEventMs) lockEvents?.held(this.root, "mesh-lock", lockClass, holdMs);
       } else if (failedWaitMs >= 0) {
         const tried = Boolean(scope?.active) || bounded;
-        lockStats?.failed(this.root, lockClass, failedWaitMs, tried);
+        lockStats?.failed(this.root, lockClass, failedWaitMs, tried, timing);
         // The holder as its owner record names it now (it may have released since the timeout).
         if (!tried) lockEvents?.waitTimeout(this.root, "mesh-lock", lockClass, failedWaitMs, lockOwnerPid(ownerPath));
       }

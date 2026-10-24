@@ -1,5 +1,5 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
-import { createCommitStats, type MeshLockClass } from "./commit-stats.js";
+import { createCommitStats, type LockTimingContext, type MeshLockClass } from "./commit-stats.js";
 import { appendStateJournal, prepareStateJournal, journalBase, journalCursorOf, replayStateJournal, stateReadIdentity, verifyStateJournalEndpoint,
   readStateWitness, sameWitnessTuple, stateWitnessOf, type JournalBase, type JournalCursor, type JournalEndpoint, type StateWitness } from "./read-journal.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -969,7 +969,7 @@ export class StateFile implements StateBackend {
 
   async #withWriteSnapshot<T, P>(prepare: (snapshot: WriteStateSnapshot) => P,
     commit: (prepared: P, checkDeadline?: () => void) => T, cleanup?: (prepared: P) => void,
-    lockClass: MeshLockClass = "other", maxAttempts = Infinity, lockedFallback = false): Promise<T> {
+    lockClass: MeshLockClass = "other", maxAttempts = Infinity, lockedFallback = false, timing?: LockTimingContext): Promise<T> {
     // Only bridge batches with a prepare callback opt into this progress fallback.
     // Static/CAS batches and put/delete retain their existing exhaustion policy.
     // Reserve part of the ORIGINAL budget for one authoritative locked preparation.
@@ -992,7 +992,7 @@ export class StateFile implements StateBackend {
         return this.#lock.withLock(() => {
           const prepared = prepare(this.#readStateForWrite());
           try { return commit(prepared); } finally { cleanup?.(prepared); }
-        }, undefined, lockClass);
+        }, undefined, lockClass, false, timing);
       }
       let admitted = false;
       let prepared: P | undefined;
@@ -1003,7 +1003,7 @@ export class StateFile implements StateBackend {
           if (this.#stateWriteIdentity() !== identity) throw WRITE_SNAPSHOT_CHANGED;
           admitted = true;
           return commit(prepared!);
-        }, Math.max(0, deadline - Date.now()), lockClass);
+        }, Math.max(0, deadline - Date.now()), lockClass, false, timing);
       } catch (error) {
         // Acquisition refusals retain their origin, even if the snapshot changed while waiting.
         if (error instanceof MeshLockTimeoutError || isMeshIncarnationPending(error)) {
@@ -1045,14 +1045,14 @@ export class StateFile implements StateBackend {
         checkDeadline();
         return commit(prepared, checkDeadline);
       } finally { cleanup?.(prepared); }
-    }, remaining, lockClass);
+    }, remaining, lockClass, false, timing);
   }
 
   // Pure transitions stage optimistically; lockedKeys keeps callback batches authoritative.
   async #writeState<T>(change: (state: MeshStateFile) => { result: T; keys?: string[] | undefined }, caller?: string[], options: {
     lockedKeys?: string[] | undefined; validate?: () => void; beforeCommit?: (() => void) | undefined;
     afterCommit?: (result: T, keys?: string[]) => void; lockClass?: MeshLockClass; maxAttempts?: number | undefined;
-    lockedFallback?: boolean;
+    lockedFallback?: boolean; lockTiming?: LockTimingContext;
   } = {}): Promise<T> {
     return this.#withWriteSnapshot(({ state, reuse, base }) => {
       let namespaces: Record<string, string> | undefined;
@@ -1109,7 +1109,7 @@ export class StateFile implements StateBackend {
         try { fs.rmSync(prepared.temporary, { force: true }); } catch { /* Best-effort private staging cleanup. */ }
         prepared.releaseTemporary?.();
       }
-    }, options.lockClass ?? "put/delete", options.maxAttempts, options.lockedFallback);
+    }, options.lockClass ?? "put/delete", options.maxAttempts, options.lockedFallback, options.lockTiming);
   }
 
   #prepareStateCommit(state: MeshStateFile, reuse: Map<string, EncodedStateEntry> | undefined,
@@ -1273,7 +1273,7 @@ export class StateFile implements StateBackend {
    * new fixed idle window; ordinary cache hits never slide that deadline.
    */
   /** R20 write fence: every state.json writer takes `.lock`, which the caller holds. */
-  withWriteFence<T>(operation: () => T): T {
+  withWriteFence<T>(operation: () => T, _timing?: LockTimingContext): T {
     return operation();
   }
 
@@ -1392,7 +1392,7 @@ export class StateFile implements StateBackend {
         if (fileRead && !bracket) throw FILE_READ_CHANGED;
         outcome = await this.#writeBatchOnce(callerOps, batchIdentity, prepare, afterCommit, beforeCommit,
           commitOutbox, fileRead, captured, caller, lockClass, bracket?.value,
-          fileRead && bracket ? () => fileRead.stamp() === bracket.stamp : undefined, committed);
+          fileRead && bracket ? () => fileRead.stamp() === bracket.stamp : undefined, committed, input.lockTiming);
       } catch (error) {
         if (error !== FILE_READ_CHANGED) throw error;
         if (attempt >= retries) throw new MeshStateFileReadChangedError(attempt + 1);
@@ -1414,7 +1414,7 @@ export class StateFile implements StateBackend {
     beforeCommit: StateBackendBatchInput["beforeCommit"], commitOutbox: StateBackendBatchInput["commitOutbox"],
     fileRead: StateBackendBatchInput["fileRead"], captured: CapturedBatchPuts, caller: string[] | undefined,
     lockClass: MeshLockClass, fileValue: unknown, stampHolds: (() => boolean) | undefined,
-    committed?: (changed: readonly string[]) => void): Promise<{ results: MeshBatchResult[]; state: MeshStateFile | undefined; stamp: string | undefined }> {
+    committed?: (changed: readonly string[]) => void, lockTiming?: LockTimingContext): Promise<{ results: MeshBatchResult[]; state: MeshStateFile | undefined; stamp: string | undefined }> {
     const locked = prepare || fileRead || callerOps.some(op => op.ifVersion !== undefined || typeof op.onConflict === "function" ||
       (op.kind === "put" ? typeof op.value === "function" : op.condition !== undefined));
     return this.#writeState<{ results: MeshBatchResult[]; view: MeshBatchView; state: MeshStateFile | undefined; stamp: string | undefined }>(state => {
@@ -1493,6 +1493,7 @@ export class StateFile implements StateBackend {
       lockedKeys: locked ? callerOps.map(op => op.key) : undefined,
       maxAttempts: locked ? undefined : 2,
       lockedFallback: lockClass === "bridge" && prepare !== undefined,
+      ...(lockTiming ? { lockTiming } : {}),
       validate: () => { if (stampHolds && !stampHolds()) throw FILE_READ_CHANGED; },
       beforeCommit,
       afterCommit: (result, keys) => {

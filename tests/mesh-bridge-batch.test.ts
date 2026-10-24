@@ -115,7 +115,12 @@ describe("one presence transaction (smarty-dev#3752)", () => {
       expect([...readHostLeases(hub.root)]).toEqual([...readHostLeases(reference.root)]);
     };
     await side.mirror(presence);
-    expect(probe.counts()).toEqual({ reads: 1, commits: 1, locks: 1 });
+    // smarty-dev#13645 (WIP 5 delta audit F2): every pass decides stale incarnation lock-free BEFORE its
+    // participant and lease custody; on the file backend that is one fresh parse of state.json (audit:
+    // "File/shadow: use a fresh read of state.json"). On this store's cold first pass that parse cannot
+    // be the locked write's own (the write path always reads authoritative bytes); every later pass
+    // revalidates the cached parse by its identity, so it stays at one read.
+    expect(probe.counts()).toEqual({ reads: 2, commits: 1, locks: 1 });
     await perRecord(reference, presence, now);
     compare();
     // Not vacuous: every lease carries the marker and this link's fresh source observation.

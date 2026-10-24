@@ -74,30 +74,44 @@ describe("bridge mirror plan ordering", () => {
     const writeBatch = hub.writeBatch.bind(hub);
     vi.spyOn(hub, "writeBatch").mockImplementation(input => {
       batches += 1;
-      // Another bridge's post-commit lease effect runs after this plan, before it
-      // acquires the shared hub's writer. Two such effects exhaust the old early path.
-      if (change !== "none" && change !== "empty" && batches <= 2) {
-        const id = change === "renewal" ? identity.id : `session:other-link-${batches}`;
+      return writeBatch(input);
+    });
+    // smarty-dev#13645 (option B, WIP 4 lease-only probe): a pass that writes no state row opens NO
+    // state transaction; it renews each lease under that host's own gate, where #applyLease rereads
+    // the row and the file. So the window between this plan and its lease effect is the renewal's
+    // host gate, not the writer: another bridge's lease effect lands there.
+    const leaseCustody = hub.leaseCustody.bind(hub);
+    const consulted = hostLeases.hostLeasePath(root, identity.id);
+    let gates = 0;
+    vi.spyOn(hub, "leaseCustody").mockImplementation((file, operation, timeoutMs, options) => {
+      if (file === consulted) gates += 1;
+      if (file === consulted && gates === 1 && change !== "none" && change !== "empty") {
+        const id = change === "renewal" ? identity.id : "session:other-link-1";
         writeHostLease(root, { id, rootId: change === "same-root-history" || change === "renewal" ? identity.id : id,
-          identityId: id, startedAt: now, updatedAt: now + batches, expiresAt: now + 120000 + batches,
+          identityId: id, startedAt: now, updatedAt: now + 1, expiresAt: now + 120000 + 1,
           ...(change === "same-root-history" ? { incarnationToken: "source-B", bridgeSupersededTokens: ["source-A"] }
             : change === "renewal" ? { incarnationToken: "source-A" } : {}) });
         // Make the dependency change deterministic even on a coarse directory clock.
-        fs.utimesSync(path.join(root, "host-leases"), now / 1000 + batches, now / 1000 + batches);
+        fs.utimesSync(path.join(root, "host-leases"), now / 1000 + 1, now / 1000 + 1);
       }
-      return writeBatch(input);
+      return leaseCustody(file, operation, timeoutMs, options);
     });
     if (change === "same-root-history") {
       await expect(side.mirror(presence)).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE_INCARNATION" });
       expect(hub.listAll("", { fresh: true })).toEqual(before);
+      // The successor's lease (another host id of the same root) is untouched by the superseded pass.
+      expect(hostLeases.readHostLease(root, "session:other-link-1")).toMatchObject({ incarnationToken: "source-B",
+        bridgeSupersededTokens: ["source-A"] });
     } else {
       await side.mirror(presence);
       expect(side.holds(identity.id, identity)).toBe(change !== "empty");
     }
-    console.log(JSON.stringify({ change, run, batches, inFenceTopologyScans: scans, consultedLeaseScans: leaseScans,
-      leaseScanMs: +leaseScanMs.toFixed(3), holdMs: +holdMs.toFixed(3) }));
+    console.log(JSON.stringify({ change, run, batches, consultedLeaseGates: gates, inFenceTopologyScans: scans,
+      consultedLeaseScans: leaseScans, leaseScanMs: +leaseScanMs.toFixed(3), holdMs: +holdMs.toFixed(3) }));
     expect(scans).toBe(0);
-    expect(leaseScans).toBe(change === "empty" ? 0 : 1);
-    expect(batches).toBe(1);
+    // Validate only the consulted lease: exactly its own host gate, and no lease scan inside a writer.
+    expect(gates).toBe(change === "empty" ? 0 : 1);
+    expect(leaseScans).toBe(0);
+    expect(batches).toBe(0);
   });
 });

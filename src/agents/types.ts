@@ -115,6 +115,10 @@ export interface AgentRunRequest {
   task: string;
   /** Caller classification passed to the optional external spawn router. */
   complexity?: "simple" | "normal" | "complex" | "delicate";
+  /** Optional sandbox import intent. Validated before any Placement request. */
+  profile?: "lead" | "lane" | "task" | "org" | "actor";
+  branch?: string;
+  sessionImport?: { session: string; manifestSha256: string };
   /** Required target capabilities. Reserved local always pins to Main; unknown needs stay local. */
   needs?: string[];
   /** Absolute inputs that must exist on the selected execution host before starting. */
@@ -579,6 +583,9 @@ export interface AgentTransportLaunch {
   /** Trusted spawn facts needed by the island broker intent. */
   parentSession?: string;
   complexity?: AgentRunRequest["complexity"];
+  profile?: AgentRunRequest["profile"];
+  branch?: AgentRunRequest["branch"];
+  sessionImport?: AgentRunRequest["sessionImport"];
   /** Host-only carrier inheritance, after the worker environment is assembled. */
   childEnvironment?: (environment: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
   /** Manager close or explicit run/actor revocation, never a returned queued receipt's guest deadline. */

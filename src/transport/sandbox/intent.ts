@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { AgentTransportLaunch } from "../../agents/types.js";
-import type { SandboxComplexity, SandboxProfile, SandboxSpawnIntent } from "./types.js";
+import type { SandboxComplexity, SandboxProfile, SandboxSessionImport, SandboxSpawnIntent } from "./types.js";
 
 const RUN_ID = /^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$/;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,255}$/;
@@ -21,6 +21,8 @@ export interface SandboxIntentInput {
   needs: readonly string[];
   complexity?: SandboxComplexity;
   profile?: SandboxProfile;
+  branch?: string;
+  sessionImport?: SandboxSessionImport;
   parentSession: string;
   org: string;
   timeoutMs: number;
@@ -87,7 +89,7 @@ export const buildSandboxIntent = (input: SandboxIntentInput): SandboxSpawnInten
   if (!THINKING.has(thinking)) throw new Error("Invalid sandbox intent thinking");
   const complexity = input.complexity ?? "normal";
   if (!COMPLEXITIES.has(complexity)) throw new Error("Invalid sandbox intent complexity");
-  const profile = input.profile ?? "task";
+  const profile = input.profile ?? (input.sessionImport !== undefined ? "lane" : "task");
   if (!PROFILES.has(profile)) throw new Error("Invalid sandbox intent profile");
   if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1 || input.timeoutMs > 604_800_000 ||
     !Number.isSafeInteger(input.now) || !Number.isSafeInteger(input.now + input.timeoutMs)) {
@@ -99,7 +101,34 @@ export const buildSandboxIntent = (input: SandboxIntentInput): SandboxSpawnInten
   const needs = [...new Set(input.needs.map(need => name(need, "needs")))].sort();
   if (needs.length > 64) throw new Error("Sandbox intent has too many needs");
   const repository = (input.resolveRepository ?? resolveSandboxRepository)(input.cwd);
-  return {
+  let branch: string | undefined;
+  if (input.branch !== undefined) {
+    if (typeof input.branch !== "string" || input.branch.length < 1 || input.branch.length > 255 ||
+      !/^[A-Za-z0-9]/u.test(input.branch) || /[^A-Za-z0-9._/-]/u.test(input.branch) ||
+      input.branch.startsWith("refs/heads/") || input.branch.endsWith("/") || input.branch.endsWith(".") ||
+      input.branch.includes("//") || input.branch.includes("..") || input.branch.includes("/.") ||
+      input.branch.split("/").some(component => component.endsWith(".lock")) ||
+      execFileSync("git", ["check-ref-format", "--branch", input.branch], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() !== input.branch) {
+      throw new Error("Invalid sandbox intent branch");
+    }
+    branch = input.branch;
+  }
+  let sessionImport: SandboxSessionImport | undefined;
+  if (input.sessionImport !== undefined) {
+    const candidate = input.sessionImport as unknown;
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) ||
+      Object.keys(candidate).length !== 2 || !Object.hasOwn(candidate, "session") || !Object.hasOwn(candidate, "manifestSha256")) {
+      throw new Error("Invalid sandbox intent sessionImport");
+    }
+    const imported = candidate as Record<string, unknown>;
+    if (typeof imported.session !== "string" || imported.session.length !== 36 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(imported.session) ||
+      typeof imported.manifestSha256 !== "string" || imported.manifestSha256.length !== 64 || !/^[0-9a-f]{64}$/u.test(imported.manifestSha256) ||
+      profile !== "lead" && profile !== "lane" || !branch) {
+      throw new Error("Invalid sandbox intent sessionImport");
+    }
+    sessionImport = { session: imported.session, manifestSha256: imported.manifestSha256 };
+  }
+  const intent: SandboxSpawnIntent = {
     v: 1,
     runId: input.runId,
     kind: "sandbox",
@@ -116,5 +145,9 @@ export const buildSandboxIntent = (input: SandboxIntentInput): SandboxSpawnInten
     expectedSeconds: timeoutSeconds,
     timeoutSeconds,
     deadline,
+    ...(branch !== undefined ? { branch } : {}),
+    ...(sessionImport !== undefined ? { sessionImport } : {}),
   };
+  if (Buffer.byteLength(JSON.stringify(intent), "utf8") > 4_096) throw new Error("Sandbox intent exceeds 4096 bytes");
+  return intent;
 };

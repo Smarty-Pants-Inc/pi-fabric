@@ -213,6 +213,9 @@ const spawnSchema = {
   properties: {
     ...runProperties, residency: residencySchema,
     complexity: { type: "string", enum: ["simple", "normal", "complex", "delicate"], description: "Caller complexity hint for the optional host spawn router; delicate is a distinct delicate-code class, never mapped to complex or inferred from task text." },
+    profile: { type: "string", enum: ["lead", "lane", "task", "org", "actor"], description: "Optional sandbox placement profile." },
+    branch: { type: "string", minLength: 1, maxLength: 255, pattern: "^[A-Za-z0-9][A-Za-z0-9._/-]*$", description: "Optional sandbox ASCII Git branch name (without refs/heads/); omit when unused, never null." },
+    sessionImport: { type: "object", properties: { session: { type: "string", minLength: 36, maxLength: 36, pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" }, manifestSha256: { type: "string", minLength: 64, maxLength: 64, pattern: "^[0-9a-f]{64}$" } }, required: ["session", "manifestSha256"], additionalProperties: false, description: "Optional session capsule import pin; requires sandbox transport, branch and a lead/lane profile (defaults to lane for an import). Omit when unused, never null." },
     idempotencyKey: residentIdempotencyKeySchema,
     model: { ...runProperties.model, description: `${strictModelProperty.description} \"auto\" records a finite Choice; trusted liveClasses can launch it, otherwise the child runs pinModel/pinThinking.` },
     pinModel: { type: "string", description: "Role's required Pi model pin; overrides agents.modelRouting.pinModel." },

@@ -74,6 +74,12 @@ export const normalizeAgentRunRequest = (
   if (args.complexity !== undefined && args.complexity !== "simple" && args.complexity !== "normal" && args.complexity !== "complex" && args.complexity !== "delicate") {
     throw new Error("Invalid agent complexity: expected simple, normal, complex or delicate");
   }
+  if (args.profile !== undefined && !["lead", "lane", "task", "org", "actor"].includes(String(args.profile))) throw new Error("Invalid sandbox profile");
+  if (args.branch !== undefined && typeof args.branch !== "string") throw new Error("Invalid sandbox branch");
+  if (args.sessionImport !== undefined && (typeof args.sessionImport !== "object" || args.sessionImport === null || Array.isArray(args.sessionImport))) throw new Error("Invalid sandbox sessionImport");
+  if (args.sessionImport !== undefined && (transport !== "sandbox" || args.profile !== undefined && args.profile !== "lead" && args.profile !== "lane" || typeof args.branch !== "string" || !args.branch)) {
+    throw new Error("Sandbox sessionImport requires sandbox transport, a lead/lane profile, and branch");
+  }
   const requires = normalizeAgentRequires(args.requires);
   const needs = normalizeAgentCapabilityTokens(args.needs);
   // Preserve explicit bounds, including ignored tiny values, for the manager's
@@ -95,6 +101,9 @@ export const normalizeAgentRunRequest = (
   return {
     task: String(args.task),
     ...(args.complexity !== undefined ? { complexity: args.complexity as NonNullable<AgentRunRequest["complexity"]> } : {}),
+    ...(args.profile !== undefined ? { profile: args.profile as NonNullable<AgentRunRequest["profile"]> } : {}),
+    ...(args.branch !== undefined ? { branch: args.branch as string } : {}),
+    ...(args.sessionImport !== undefined ? { sessionImport: args.sessionImport as NonNullable<AgentRunRequest["sessionImport"]> } : {}),
     runner,
     ...(typeof args.routeClass === "string" ? { routeClass: args.routeClass } : {}),
     ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),

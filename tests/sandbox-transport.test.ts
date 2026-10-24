@@ -4,13 +4,16 @@ import type { AddressInfo } from "node:net";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
 import { diagnostics } from "../src/core/diagnostics.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { normalizeAgentRunRequest } from "../src/agents/request.js";
+import { SandboxPlacementHttpError } from "../src/transport/sandbox/placement-http.js";
 import { placementRunIdForParticipant } from "../src/topology/placement-run-id.js";
 import { captureSandboxFinalAnswer, waitForSandboxFinalAnswer } from "../src/agents/completion-inbox.js";
 import { createSandboxFabricMesh } from "../src/transport/sandbox/fabric-mesh.js";
-import { buildSandboxIntent, DEFAULT_SANDBOX_PLACEMENT_URL, SandboxPlacementHttp, SandboxPodPendingTimeoutError, SandboxReadyTimeoutError, SandboxSpawnTimeoutError, SandboxTransport, SandboxUnsupportedError, type SandboxBinding, type SandboxMesh, type SandboxPlacement, type SandboxSpawnIntent, type SandboxSpawnResult, type SandboxTaskResult, type SandboxTerminalRecord, type SandboxTransportConfig } from "../src/transport/sandbox/index.js";
+import { buildSandboxIntent, DEFAULT_SANDBOX_PLACEMENT_URL, SandboxPlacementHttp, SandboxSessionImportUnsupportedError, SandboxPodPendingTimeoutError, SandboxReadyTimeoutError, SandboxSpawnTimeoutError, SandboxTransport, SandboxUnsupportedError, type SandboxBinding, type SandboxMesh, type SandboxPlacement, type SandboxSpawnIntent, type SandboxSpawnResult, type SandboxTaskResult, type SandboxTerminalRecord, type SandboxTransportConfig } from "../src/transport/sandbox/index.js";
 
 const BASE_NOW = Date.parse("2026-02-01T00:00:00Z");
 const RUN_ID = "sandbox-run-1";
@@ -84,6 +87,7 @@ interface FakePlacementOptions {
   binding?: (intent: SandboxSpawnIntent, index: number) => SandboxBinding;
   rejectProfile?: boolean;
   profileErrorDetail?: string;
+  spawnError?: { code: string; detail: string };
   allowAnyRunId?: boolean;
 }
 
@@ -111,7 +115,7 @@ const fakePlacementServer = async (options: FakePlacementOptions): Promise<{ pla
       const body: unknown = JSON.parse(raw);
       if (!isObject(body)) { respond(res, 400, { code: "INVALID_INTENT", detail: "request does not match SpawnIntent" }); return; }
       requestBodies.push(body);
-      const expectedKeys = Object.hasOwn(body, "profile") ? intentKeys : intentKeys.filter(key => key !== "profile");
+      const expectedKeys = [...(Object.hasOwn(body, "profile") ? intentKeys : intentKeys.filter(key => key !== "profile")), ...(Object.hasOwn(body, "branch") ? ["branch"] : []), ...(Object.hasOwn(body, "sessionImport") ? ["sessionImport"] : [])];
       if (Object.keys(body).length !== expectedKeys.length || expectedKeys.some(key => !Object.hasOwn(body, key)) ||
         body.v !== 1 || body.kind !== "sandbox" || typeof body.runId !== "string" ||
         !/^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$/u.test(body.runId) ||
@@ -120,6 +124,7 @@ const fakePlacementServer = async (options: FakePlacementOptions): Promise<{ pla
         Object.hasOwn(body, "labels") || !Array.isArray(body.needs) || new Set(body.needs).size !== body.needs.length) {
         respond(res, 400, { code: "INVALID_INTENT", detail: "request does not match frozen SpawnIntent" }); return;
       }
+      if (options.spawnError) { respond(res, 400, options.spawnError); return; }
       if (options.rejectProfile && body.profile !== undefined) {
         respond(res, 400, { code: "INVALID_INTENT", detail: options.profileErrorDetail ?? "Unknown field profile" }); return;
       }
@@ -593,10 +598,11 @@ describe("sandbox agent transport", () => {
     });
     managers.push(manager);
 
-    const handle = await manager.spawn({ task: "Return the exact marker from a real manager spawn.", model: MODEL, thinking: "high", transport: "sandbox", extensions: false });
+    const imported = { session: "01234567-89ab-cdef-0123-456789abcdef", manifestSha256: "c".repeat(64) };
+    const handle = await manager.spawn({ task: "Return the exact marker from a real manager spawn.", model: MODEL, thinking: "high", transport: "sandbox", profile: "lead", branch: "feature/manager-import", sessionImport: imported, extensions: false });
     const final = await manager.wait(handle.id);
     expect(final).toMatchObject({ id: handle.id, status: "completed", text: "manager round-trip result", transport: "sandbox" });
-    expect(api.intents[0]).toMatchObject({ runId: handle.id, profile: "task" });
+    expect(api.intents[0]).toMatchObject({ runId: handle.id, profile: "lead", branch: "feature/manager-import", sessionImport: imported });
     expect(mesh.presenceRunIds).toEqual([handle.id]);
     expect(mesh.delivered[0]?.text).toContain(`FABRIC-RESULT ${handle.id}\\n`);
     expect(terminal.records.get(handle.id)).toMatchObject({ placementRunId: handle.id, state: "finished", exitCode: 0 });
@@ -718,6 +724,156 @@ describe("sandbox agent transport", () => {
       workerArguments: request.workerArguments,
       resolveRepository: () => ({ repository: "https://user:secret-token@github.com/Smarty-Pants-Inc/smarty-dev", cwd: "." }),
     })).toThrow(/credential-free HTTPS/);
+  });
+
+  it("keeps legacy canonical intent bytes and hash unchanged, validates optional import fields, and counts them toward the byte cap", () => {
+    const request = launchRequest(scratch());
+    const base = { runId: RUN_ID, cwd: process.cwd(), needs: [], parentSession: PARENT, org: "smarty-dev", timeoutMs: 60_000, now: BASE_NOW, workerArguments: request.workerArguments, resolveRepository: () => ({ repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "src/agents" }) };
+    const intent = buildSandboxIntent(base);
+    const bytes = JSON.stringify(intent);
+    expect(Object.hasOwn(intent, "branch")).toBe(false);
+    expect(Object.hasOwn(intent, "sessionImport")).toBe(false);
+    expect(bytes).toBe("{\"v\":1,\"runId\":\"sandbox-run-1\",\"kind\":\"sandbox\",\"org\":\"smarty-dev\",\"parentSession\":\"session:parent-1\",\"role\":\"task-agent\",\"profile\":\"task\",\"complexity\":\"normal\",\"model\":\"cliproxyapi/gpt-6.1-sol\",\"thinking\":\"high\",\"needs\":[],\"repository\":\"https://github.com/Smarty-Pants-Inc/smarty-dev\",\"cwd\":\"src/agents\",\"expectedSeconds\":60,\"timeoutSeconds\":60,\"deadline\":\"2026-02-01T00:01:00Z\"}");
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe("3cbe7003f426813b11abf6d1ef1ab0a48492e19bf5af8ba72d03b0f0f622f013");
+
+    const imported = { session: "01234567-89ab-cdef-0123-456789abcdef", manifestSha256: "a".repeat(64) };
+    const withFields = buildSandboxIntent({ ...base, profile: "lead", branch: "feature/session-import", sessionImport: imported });
+    expect(withFields).toMatchObject({ branch: "feature/session-import", sessionImport: imported });
+    expect(() => buildSandboxIntent({ ...base, branch: "refs/heads/main" })).toThrow();
+    expect(() => buildSandboxIntent({ ...base, branch: "a..b" })).toThrow();
+    expect(() => buildSandboxIntent({ ...base, branch: "has space" })).toThrow();
+    expect(() => buildSandboxIntent({ ...base, branch: "a".repeat(256) })).toThrow();
+    expect(buildSandboxIntent({ ...base, branch: "ghp_" + "A".repeat(40) }).branch).toBe("ghp_" + "A".repeat(40));
+    expect(() => buildSandboxIntent({ ...base, branch: "https://example.test/branch" })).toThrow();
+    expect(() => buildSandboxIntent({ ...base, branch: "name@example.test" })).toThrow();
+    expect(buildSandboxIntent({ ...base, branch: "encoded-" + "A".repeat(90) }).branch).toBe("encoded-" + "A".repeat(90));
+    expect(() => buildSandboxIntent({ ...base, profile: "lead", branch: "main", sessionImport: { ...imported, extra: true } as never })).toThrow();
+    expect(() => buildSandboxIntent({ ...base, profile: "lead", branch: "main", sessionImport: { session: imported.session } as never })).toThrow();
+    expect(() => buildSandboxIntent({ ...base, profile: "lead", branch: "main", sessionImport: { ...imported, manifestSha256: "A".repeat(64) } })).toThrow();
+    expect(() => buildSandboxIntent({ ...base, profile: "lead", sessionImport: imported })).toThrow();
+    expect(() => buildSandboxIntent({ ...base, profile: "task", branch: "main", sessionImport: imported })).toThrow();
+    expect(() => buildSandboxIntent({ ...base, profile: "org", branch: "main", sessionImport: imported })).toThrow();
+    expect(() => buildSandboxIntent({ ...base, profile: "lane", branch: "main", sessionImport: imported, needs: Array.from({ length: 64 }, (_, index) => "n".repeat(250) + index) })).toThrow();
+  });
+
+  // Keep: Placement trust-boundary checks prevent a malformed move from becoming a fresh session.
+  const importPin = { session: "01234567-89ab-cdef-0123-456789abcdef", manifestSha256: "a".repeat(64) };
+  const wireIntent = (overrides: Partial<Parameters<typeof buildSandboxIntent>[0]> = {}) => buildSandboxIntent({
+    runId: RUN_ID, cwd: process.cwd(), needs: [], parentSession: PARENT, org: "smarty-dev", timeoutMs: 60_000, now: BASE_NOW,
+    workerArguments: ["--model", MODEL, "--thinking", "high"],
+    resolveRepository: () => ({ repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "." }), ...overrides,
+  });
+
+  it.each([
+    "01234567-89AB-CDEF-0123-456789ABCDEF", "not-a-uuid", "session:01234567-89ab-cdef-0123-456789abcdef",
+    "0123456789abcdef0123456789abcdef", "01234567-89ab-cdef-0123-456789abcdeg", "01234567-89ab-cdef-0123-456789abcdef\n",
+  ])("refuses non-lowercase-UUID import session %j", session => {
+    expect(() => wireIntent({ profile: "lane", branch: "main", sessionImport: { ...importPin, session } })).toThrow(/sessionImport/);
+  });
+
+  it.each(["branch", "sessionImport"] as const)("refuses explicit null %s", field => {
+    const values = { [field]: null };
+    expect(() => normalizeAgentRunRequest({ task: "test", transport: "sandbox", profile: "lane", branch: "main", ...values }, { runner: "pi", timeoutMs: 60_000 })).toThrow();
+    expect(() => wireIntent({ profile: "lane", branch: "main", ...values } as never)).toThrow();
+  });
+
+  it.each([
+    "", "a".repeat(256), "éclair", "feature/éclair", "-main", "_main", ".main", "/main", "refs/heads/main",
+    "a//b", "a..b", "a/.b", "a.lock", "a.lock/b", "a/b.lock", "a/", "a.", "a b", "a@b", "a:b", "a+b", "a\\b", "a\nb", "main\n",
+  ])("refuses invalid wire branch %j", branch => {
+    expect(() => wireIntent({ branch })).toThrow(/branch/);
+  });
+
+  it.each(["A_1/topic.v2-fix", "a".repeat(255), "a.locked/topic", "0", "a./b"])("accepts valid ASCII wire branch %j", branch => {
+    expect(wireIntent({ branch }).branch).toBe(branch);
+  });
+
+  it("defaults an explicitly requested import to lane without changing the legacy task default", () => {
+    const normalized = normalizeAgentRunRequest({ task: "test", transport: "sandbox", branch: "main", sessionImport: importPin }, { runner: "pi", timeoutMs: 60_000 });
+    expect(wireIntent({
+      ...(normalized.branch !== undefined ? { branch: normalized.branch } : {}),
+      ...(normalized.sessionImport !== undefined ? { sessionImport: normalized.sessionImport } : {}),
+    })).toMatchObject({ profile: "lane", sessionImport: importPin });
+    expect(wireIntent().profile).toBe("task");
+  });
+
+  it.each(["branch", "sessionImport"] as const)("reports old-broker INTENT_INVALID with %s after exactly one POST", async field => {
+    // Also exercise a detail that would trigger legacy profile fallback.
+    for (const detail of ["request must contain only documented v1 fields", "Unknown field profile"]) {
+      const api = await fakePlacementServer({ spawnError: { code: "INTENT_INVALID", detail }, post: intent => result(intent.runId, "admitted"), watch: () => [] });
+      const intent = wireIntent({ profile: "lane", branch: "main", ...(field === "sessionImport" ? { sessionImport: importPin } : {}) });
+      const fallbackLog: string[] = [];
+      const error = await new SandboxPlacementHttp(api.base, runId => fallbackLog.push(runId)).requestSpawn(intent).catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(SandboxSessionImportUnsupportedError);
+      expect(error).toMatchObject({ name: "SandboxSessionImportUnsupportedError", code: "PLACEMENT_SESSION_IMPORT_UNSUPPORTED", status: 400,
+        cause: { code: "INTENT_INVALID", status: 400 } });
+      expect(api.requestBodies).toEqual([intent]);
+      expect(fallbackLog).toEqual([]);
+    }
+  });
+
+  it.each([
+    ["request must contain only documented v1 fields", 1], ["Unknown field profile", 2],
+  ] as const)("keeps legacy INTENT_INVALID behaviour without fields: %s", async (detail, posts) => {
+    const api = await fakePlacementServer({ spawnError: { code: "INTENT_INVALID", detail }, post: intent => result(intent.runId, "admitted"), watch: () => [] });
+    const intent = wireIntent();
+    const pending = api.placement.requestSpawn(intent);
+    await expect(pending).rejects.toBeInstanceOf(SandboxPlacementHttpError);
+    await expect(pending).rejects.toMatchObject({ code: "INTENT_INVALID", status: 400, body: { code: "INTENT_INVALID", detail } });
+    expect(api.requestBodies).toHaveLength(posts);
+    expect(api.requestBodies[0]).toEqual(intent);
+    if (posts === 2) expect(api.requestBodies[1]).not.toHaveProperty("profile");
+  });
+
+  it.each(["branch", "sessionImport"] as const)("does not retry or start a child when transport receives old-broker refusal with %s", async field => {
+    const directory = scratch();
+    const api = await fakePlacementServer({ spawnError: { code: "INTENT_INVALID", detail: "request must contain only documented v1 fields" }, post: intent => result(intent.runId, "admitted"), watch: () => [] });
+    const terminal = new FakeTerminal();
+    const mesh = meshFor();
+    let slept = 0;
+    const transport = new SandboxTransport(config(), { placement: api.placement, mesh, terminal, meshTransport: "nats", org: "smarty-dev", now: () => BASE_NOW,
+      sleep: async () => { slept += 1; throw new Error("must not retry a refused move"); },
+      resolveRepository: () => ({ repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "." }) });
+    await expect(transport.launch(launchRequest(directory, { profile: "lane", branch: "main", ...(field === "sessionImport" ? { sessionImport: importPin } : {}) })))
+      .rejects.toBeInstanceOf(SandboxSessionImportUnsupportedError);
+    expect(api.requestBodies).toHaveLength(1);
+    expect(api.requestBodies[0]).toMatchObject({ profile: "lane", branch: "main", ...(field === "sessionImport" ? { sessionImport: importPin } : {}) });
+    expect(slept).toBe(0);
+    expect(api.gets).toBe(0);
+    expect(mesh.presenceRunIds).toEqual([]);
+    expect(mesh.delivered).toEqual([]);
+    expect(terminal.records.get(RUN_ID)?.state).toBe("never-started");
+  });
+
+  it("bypasses cached legacy profile fallback when move fields are later supplied", async () => {
+    const api = await fakePlacementServer({ rejectProfile: true, post: intent => result(intent.runId, "admitted"), watch: () => [] });
+    const fallbackLog: string[] = [];
+    const client = new SandboxPlacementHttp(api.base, runId => fallbackLog.push(runId));
+    await client.requestSpawn(wireIntent());
+    expect(api.requestBodies).toHaveLength(2);
+    const intent = wireIntent({ profile: "lane", branch: "main", sessionImport: importPin });
+    await expect(client.requestSpawn(intent)).rejects.toMatchObject({ code: "INVALID_INTENT", status: 400 });
+    expect(api.requestBodies).toHaveLength(3);
+    expect(api.requestBodies[2]).toEqual(intent);
+    expect(fallbackLog).toEqual([RUN_ID]);
+  });
+
+  it.each(["A".repeat(64), "a".repeat(63), "a".repeat(65), "g".repeat(64), "a".repeat(64) + "\n"])("refuses malformed manifest SHA-256 %j", manifestSha256 => {
+    expect(() => wireIntent({ profile: "lane", branch: "main", sessionImport: { ...importPin, manifestSha256 } })).toThrow(/sessionImport/);
+  });
+
+  it("refuses sessionImport outside sandbox transport before any placement request", () => {
+    expect(() => normalizeAgentRunRequest({ task: "test", transport: "process", profile: "lead", branch: "main", sessionImport: { session: "01234567-89ab-cdef-0123-456789abcdef", manifestSha256: "d".repeat(64) } }, { runner: "pi", timeoutMs: 60_000 })).toThrow(/requires sandbox transport/);
+  });
+
+  it("passes explicitly requested branch and sessionImport unchanged to the Placement POST", async () => {
+    const directory = scratch();
+    const api = await fakePlacementServer({ post: intent => result(intent.runId, "admitted"), watch: () => [] });
+    const transport = new SandboxTransport(config(), { placement: api.placement, mesh: meshFor(), terminal: new FakeTerminal(), meshTransport: "nats", org: "smarty-dev", now: () => BASE_NOW, resolveRepository: () => ({ repository: "https://github.com/Smarty-Pants-Inc/smarty-dev", cwd: "." }) });
+    const sessionImport = { session: "01234567-89ab-cdef-0123-456789abcdef", manifestSha256: "b".repeat(64) };
+    const handle = await transport.launch(launchRequest(directory, { profile: "lane", branch: "feature/import", sessionImport }));
+    await handle.closed;
+    expect(api.requestBodies[0]).toMatchObject({ branch: "feature/import", sessionImport });
   });
 
   it("keeps sandbox disabled by default and validates its host-only placement URL", () => {

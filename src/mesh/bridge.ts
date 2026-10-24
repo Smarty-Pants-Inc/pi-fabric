@@ -3377,6 +3377,8 @@ export class MeshBridge {
   #ready = false;
   readonly #relayDeliveries = new Set<Promise<void>>();
   #wake: (() => void) | undefined;
+  /** Ends a startWithBackoff() wait at once on stop(). */
+  #startBackoffWake: (() => void) | undefined;
   #notificationMode = false;
   #changesPending = false;
   #notificationError: Error | undefined;
@@ -3711,6 +3713,44 @@ export class MeshBridge {
       this.#ready = true;
       this.#lastRoundTripAt = monotonicClock.now();
       this.#clearStallReason();
+    }
+  }
+
+  /**
+   * start() for the CLI's readiness barrier (smarty-dev#13645). A first pass that meets busy custody rejects
+   * with a retryable MeshLockTimeoutError, so readiness never passes with a lease missing (re-audit P2-1).
+   * For example, another link's mirror pass or lease effect may hold the zero-wait host-lease additions gate.
+   * That is contention, not a refusal: this backs off and starts again on run()'s own lock and WAL-cap
+   * schedule, as run() does when it restarts a link, instead of ending the link. A permanent refusal (a stale
+   * incarnation, a transport failure) or stop() still ends it.
+   */
+  async startWithBackoff(): Promise<void> {
+    let retryMs = LOCK_RETRY_MIN_MS;
+    let walCapDelay: number | undefined;
+    let reported = false;
+    for (;;) {
+      try { return await this.start(); }
+      catch (error) {
+        if (this.#stopped || !isBridgeRetryable(error)) throw error;
+        let delay = retryMs;
+        retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
+        if (error instanceof BridgeMirrorDeferredError || isMeshStateWalCap(error)) {
+          delay = walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
+        }
+        if (!reported) {
+          this.#log(`start: ${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error)}; retrying in ${delay} ms: ${meshDeferredSummary(error)}`);
+          reported = true;
+        }
+        await new Promise<void>((resolve) => {
+          const wake = (): void => {
+            clearTimeout(timer);
+            if (this.#startBackoffWake === wake) this.#startBackoffWake = undefined;
+            resolve();
+          };
+          const timer = setTimeout(wake, delay);
+          this.#startBackoffWake = wake;
+        });
+      }
     }
   }
 
@@ -4933,6 +4973,7 @@ export class MeshBridge {
     this.#stopped = true;
     this.#ready = false;
     this.#wake?.();
+    this.#startBackoffWake?.();
     this.#watchdogWake?.();
     for (const direction of ["toRemote", "toLocal"] as const) this.#directionWake[direction]?.();
     const localFence = this.options.local.fence?.() ?? Promise.resolve();

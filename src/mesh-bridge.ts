@@ -302,7 +302,9 @@ export const runBridge = async (
     starting = (async () => {
       await linked.hello();
       if (signal.aborted) return;
-      await running.start();
+      // A retryable first-pass refusal (busy custody: another link's pass holds a lease gate) backs off and
+      // starts again; only a permanent refusal or the transport ends the link (smarty-dev#13645).
+      await running.startWithBackoff();
       if (signal.aborted) return;
       if (process.platform === "linux") {
         try {

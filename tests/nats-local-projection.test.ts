@@ -241,6 +241,33 @@ describe("NATS local presence projection", () => {
     expect(f.projection.metrics()).toMatchObject({ machine: MACHINE, participantWrites: 1, hostLeaseWrites: 1 });
   });
 
+  it("counts a participant write only when one happened: a rename refused in its second hold is not a write (audit N1 note 4)", async () => {
+    let live = true;
+    const f = fixture({ leaseLive: () => live });
+    await start(f);
+    expect(f.projection.metrics().participantWrites).toBe(1);
+    const write = participantFiles.writeParticipantFileIf;
+    const localKey = localParticipantKey(f.id);
+    let decisions = 0;
+    const settled = deferred<boolean>();
+    vi.spyOn(participantFiles, "writeParticipantFileIf").mockImplementation(async (mesh, key, decide, options) => {
+      if (key !== localKey) return write(mesh, key, decide, options);
+      // The lease is lost between the first hold's decision and the namespace hold that would write the rename.
+      const wrote = await write(mesh, key, current => { if (++decisions === 2) live = false; return decide(current); }, options);
+      settled.resolve(wrote);
+      return wrote;
+    });
+    await f.presence.put(participantKvKey(f.id), owner, participant(f.id, INCARNATION, "Renamed", f.record.updatedAt + 1_000),
+      f.presenceEntry!.revision);
+    expect(await settled.promise).toBe(false);
+    // Precondition: an identity change decides in two holds; the second one refused.
+    expect(decisions).toBe(2);
+    expect(readParticipantFile(f.mesh.root, localKey)).toMatchObject({ value: { name: "Main" } });
+    await new Promise(resolve => setTimeout(resolve, 20)); // let #writeParticipant finish its own bookkeeping
+    // 347f75c30: participantWrites 2 (the first hold's decision set the stale `wrote` flag).
+    expect(f.projection.metrics().participantWrites).toBe(1);
+  });
+
   it("reprojects a current snapshot after local participant and lease files disappear", async () => {
     const f = fixture();
     await start(f);

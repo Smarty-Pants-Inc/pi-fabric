@@ -2,14 +2,15 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
-import { BridgeStaleIncarnationError, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { runBridge } from "../src/mesh-bridge.js";
+import { BRIDGE_PROTOCOL_VERSION, BridgeStaleIncarnationError, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { COMMIT_OUTBOX_PREFIX, CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { isMeshRetryableBusy } from "../src/mesh/state-backend.js";
 import { MeshStore, type MeshBatchView, type MeshIdentity } from "../src/mesh/store.js";
 import { hostEntryLiveness, hostLeasePath, readHostLeaseCurrent, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
-import { withParticipantFileDirectoryCustody } from "../src/topology/participant-files.js";
+import { withParticipantFileDirectoryCustody, writeParticipantFile } from "../src/topology/participant-files.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
 
 // smarty-dev#13645, independent re-audit of WIP 4 (AUDIT-mirror-wip4-RESULT.md): regression tests for
@@ -299,4 +300,126 @@ describe("mirror custody delta-audit regressions (smarty-dev#13645 WIP 5 audit)"
     expect(hub.get(hostKey(identity.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "opaque-a-successor" });
     expect(fs.readFileSync(hostLeasePath(hub.root, identity.id))).toEqual(leaseB);
   });
+});
+
+// The hosted mesh-bridge-relay-cli failure: two link CLIs start together on one hub. Link A's first pass writes its
+// lease right after it releases its directory custody, which is the moment link B takes the hub's shared host-lease
+// additions gate for B's own pass (or the reverse). The zero-wait effect gate is busy and the pass rejects retryably
+// (P2-1 above). The CLI's readiness barrier stopped the link on that rejection:
+// "mesh-bridge: stopped: FABRIC_MESH_LOCK_TIMEOUT: ... host-lease-commits/5f43c55dca0091e6/custody.lock ... after 1 attempts".
+describe("the CLI's readiness barrier backs off a retryable first pass (hosted mesh-bridge-relay-cli, smarty-dev#13645)", () => {
+  /** runBridge (the CLI's code, in process) against a scripted far peer whose presence is one native root. The hub's
+   * first pass meets a busy additions gate in its effect phase; the gate is released on the retry log line if asked. */
+  const cliWithBusyFirstPass = async (releaseOnRetry: boolean) => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "reaudit-cli-"));
+    roots.push(base);
+    const hubRoot = path.join(base, "hub");
+    const runtime = path.join(base, "x");
+    fs.mkdirSync(runtime, { mode: 0o700 });
+    const far = new MeshStore(path.join(base, "far"), 64 * 1024, 100, { stateBackend: "file" });
+    stores.push(far);
+    const farIdentity: MeshIdentity = { id: "session:far-00000000", name: "main", kind: "main", sessionId: "far" };
+    const id = farIdentity.id;
+    const now = Date.now();
+    await far.put({ key: hostKey(id), identity: farIdentity, value: { format: 1, id, rootId: id, identity: farIdentity,
+      startedAt: now, updatedAt: now, expiresAt: now + 120_000 } });
+    writeHostLease(far.root, { id, rootId: id, identityId: id, startedAt: now, updatedAt: now, expiresAt: now + 120_000 });
+    writeParticipantFile(far.root, { key: key("topology/participants/", id), version: 1, updatedAt: now, updatedBy: farIdentity, value: {
+      ...participant, id, rootId: id, ownerHostId: id, ownerIdentityId: id, ownerIncarnation: `fixture:${id}`, name: "far",
+      label: "FAR", sessionId: "far", startedAt: now, updatedAt: now } });
+    const farPresence = { ...await new StoreBridgeSide(far, "hub", Date.now, true).presence(), reserved: [] };
+    expect(farPresence.hosts).toHaveLength(1);
+    const peer = `
+      const presence = ${JSON.stringify(farPresence)};
+      require("node:readline").createInterface({ input: process.stdin }).on("line", line => {
+        const request = JSON.parse(line);
+        const result = request.op === "hello" ? { version: ${BRIDGE_PROTOCOL_VERSION}, changes: true, independentRpc: true, partialPresence: true, nonRootHosts: true }
+          : request.op === "presence" ? presence
+          : request.op === "latestSequence" ? 0
+          : request.op === "latestCursor" ? { through: 0 }
+          : request.op === "bridgedIds" ? { ids: [], through: 0, done: true }
+          : request.op === "read" ? { events: [], through: 0, done: true } : {};
+        process.stdout.write(JSON.stringify({ id: request.id, ok: true, result }) + "\\n");
+      });
+    `;
+    // The effect phase of the hub's first pass (its host row committed, its lease not yet written, directory
+    // custody released): another link's pass takes the hub's additions gate at this instant.
+    const additions = path.join(hubRoot, "host-leases", ".additions");
+    const leaseCustody = MeshStore.prototype.leaseCustody;
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    let holder: Promise<unknown> | undefined;
+    vi.spyOn(MeshStore.prototype, "leaseCustody").mockImplementation((async function (this: MeshStore, file: string,
+      operation: () => unknown, timeoutMs?: number, options?: { ownIncarnation?: string | undefined }) {
+      if (!holder && file === additions && this.get(hostKey(id), { fresh: true }) && !readHostLeaseCurrent(hubRoot, id)) {
+        let entered!: () => void;
+        const inGate = new Promise<void>(resolve => { entered = resolve; });
+        holder = leaseCustody.call(this, additions, async () => { entered(); await released; });
+        await inGate;
+      }
+      return leaseCustody.call(this, file, operation, timeoutMs, options);
+    }) as never);
+    const logs: string[] = [];
+    let linked!: () => void, retrying!: () => void;
+    const isLinked = new Promise<void>(resolve => { linked = resolve; });
+    const isRetrying = new Promise<void>(resolve => { retrying = resolve; });
+    vi.spyOn(process.stderr, "write").mockImplementation(chunk => {
+      const line = String(chunk);
+      logs.push(line);
+      if (line.includes("retrying in")) { retrying(); if (releaseOnRetry) release(); }
+      if (line.includes("linked hub <-> far")) linked();
+      return true;
+    });
+    // The relay's socket stays in this test's own runtime directory, never the real user's.
+    const runtimeBefore = process.env.XDG_RUNTIME_DIR;
+    process.env.XDG_RUNTIME_DIR = runtime;
+    const controller = new AbortController();
+    const running = runBridge(new Map([["mesh", hubRoot], ["name", "hub"], ["remote", "far"],
+      ["cursor", path.join(base, "far.json")], ["call-timeout-ms", "5000"]]), [process.execPath, "-e", peer], controller.signal);
+    const cleanup = async (): Promise<void> => {
+      controller.abort();
+      release();
+      await holder;
+      await running.catch(() => undefined);
+      vi.restoreAllMocks();
+      if (runtimeBefore === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = runtimeBefore;
+    };
+    return { id, hubRoot, logs, running, controller, isLinked, isRetrying, cleanup, held: () => holder !== undefined };
+  };
+  const stoppedLines = (logs: string[]) => logs.filter(line => line.includes("stopped:"));
+  const RETRY_LINE = /start: mesh lock timeout; retrying in 100 ms: FABRIC_MESH_LOCK_TIMEOUT: .*host-lease-commits\/5f43c55dca0091e6\/custody\.lock.* after 1 attempts/;
+
+  it("a first pass whose lease effect meets a busy additions gate backs off and links, instead of stopping the link", async () => {
+    const cli = await cliWithBusyFirstPass(true);
+    try {
+      const outcome = await Promise.race([cli.isLinked.then(() => "linked"), cli.running.then(code => `exited ${code}`)]);
+      // 347f75c30: { outcome: "exited 1", stopped: ["mesh-bridge: stopped: FABRIC_MESH_LOCK_TIMEOUT: ...custody lock
+      // <hub>/host-lease-commits/5f43c55dca0091e6/custody.lock, held by pid <self>) after 1 attempts, ..."] }.
+      expect({ outcome, stopped: stoppedLines(cli.logs) }).toEqual({ outcome: "linked", stopped: [] });
+      // Not vacuous: the first pass did meet the busy gate, and was refused with the hosted failure's error.
+      expect(cli.held()).toBe(true);
+      expect(cli.logs.join("")).toMatch(RETRY_LINE);
+      // The backed-off start installed the lease the refused pass could not write.
+      expect(readHostLeaseCurrent(cli.hubRoot, cli.id)).toMatchObject({ id: cli.id, rootId: cli.id });
+      cli.controller.abort();
+      await expect(cli.running).resolves.toBe(0);
+    } finally { await cli.cleanup(); }
+  }, 30_000);
+
+  it("a stop during that backoff ends the link at once, without a stop error or a lease", async () => {
+    const cli = await cliWithBusyFirstPass(false);
+    try {
+      await Promise.race([cli.isRetrying, cli.running]);
+      expect(cli.logs.join("")).toMatch(RETRY_LINE);
+      const stoppedAt = Date.now();
+      cli.controller.abort();
+      await expect(cli.running).resolves.toBe(0);
+      // The backoff wait is woken by stop(); the CLI's own stop bound is 5 s.
+      expect(Date.now() - stoppedAt).toBeLessThan(4_000);
+      expect(stoppedLines(cli.logs)).toEqual([]);
+      expect(cli.logs.join("")).not.toContain("linked hub <-> far");
+      expect(readHostLeaseCurrent(cli.hubRoot, cli.id)).toBeUndefined();
+    } finally { await cli.cleanup(); }
+  }, 30_000);
 });

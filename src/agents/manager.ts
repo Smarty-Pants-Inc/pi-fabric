@@ -2949,8 +2949,11 @@ export class AgentManager {
         const placementKind = this.config.placement?.default === "remote" ? "remote" : "process";
         const legacyPlacementLocalReason = this.#meshTransport?.transport === "nats" && (!placementApiConfig || placementKind !== "process")
           ? "NATS task custody and host credentials require the owning host's native worker"
-          : !placementApiConfig && writePolicy !== undefined
-            ? "write-policy-not-transportable"
+          // Contract (#1423): the default task write policy keeps remote placement and the transport logs
+          // write_policy.remote_unconfined; an explicit or inherited policy stays on the local worker.
+          // With a Placement API a local binding keeps its confinement; a remote binding is refused below.
+          : !placementApiConfig && writePolicy && !applyTaskWriteDefault
+          ? "explicit or inherited write policy requires the local worker; one-shot placement cannot forward confinement"
           : isClaudeModel(model, runner, this.config.veda.backend) && request.modelReason
             ? "Claude exception reason requires the local worker"
           : this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
@@ -3011,10 +3014,11 @@ export class AgentManager {
           if (!Number.isSafeInteger(executionDeadline) || executionDeadline <= Date.now()) {
             throw new PlacementAdmissionError({ status: "refused", code: "LOCAL_BINDING_NOT_ADMITTED" });
           }
-          // A write policy cannot be forwarded to another host. "Local" uses the same names the process
-          // transport accepts for a local binding: the full hostname or its first label.
+          // An explicit or inherited write policy cannot be forwarded to another host. The default task policy
+          // follows the one-shot contract: it may run remotely and is logged as write_policy.remote_unconfined.
+          // "Local" uses the same names the process transport accepts for a local binding: the full hostname or its first label.
           const localHostname = os.hostname().toLowerCase().replace(/\.$/u, "");
-          if (writePolicy !== undefined && remoteKindOrHost(placementKind, binding.host, localHostname)) {
+          if (writePolicy !== undefined && !applyTaskWriteDefault && remoteKindOrHost(placementKind, binding.host, localHostname)) {
             throw new PlacementAdmissionError({ status: "refused", code: "LOCAL_TRANSPORT_UNSUPPORTED" });
           }
           placementAdmission = {

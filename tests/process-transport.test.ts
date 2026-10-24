@@ -924,39 +924,56 @@ console.log('RYZEN2_TASK_ACCEPTED '+id+' on remote-host');\n`);
     return { directory, cwd, launcherCalls, manager };
   };
 
-  it.each([["default", {}], ["explicit read-only", { readOnly: true }]] as const)(
-    "keeps an active %s write policy local despite remote placement",
-    async (_kind, policy) => {
-      const f = setup();
-      const selector = vi.spyOn(placementModule, "selectFleetPlacement").mockResolvedValue(undefined);
-      const remote = vi.spyOn(placementModule, "launchPlacedTask");
-      const requests: AgentTransportLaunch[] = [];
-      const nativeLaunch = ProcessTransport.prototype.launch;
-      vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function(this: ProcessTransport, request) {
-        requests.push(request);
-        return nativeLaunch.call(this, request);
-      });
+  const captureLaunches = () => {
+    const selector = vi.spyOn(placementModule, "selectFleetPlacement").mockResolvedValue(undefined);
+    const remote = vi.spyOn(placementModule, "launchPlacedTask");
+    const requests: AgentTransportLaunch[] = [];
+    const nativeLaunch = ProcessTransport.prototype.launch;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function(this: ProcessTransport, request) {
+      requests.push(request);
+      return nativeLaunch.call(this, request);
+    });
+    return { selector, remote, requests };
+  };
+  const writePolicyEvents = (manager: AgentManager, id: string) =>
+    fs.readFileSync(path.join(manager.runDirectory(id)!, "events.jsonl"), "utf8").trim().split("\n")
+      .map(line => JSON.parse(line) as { type: string }).filter(event => event.type.startsWith("write_policy."));
 
-      const result = await f.manager.run({ task: "policy route probe", transport: "process", ...policy });
-      expect(result.status, result.error).toBe("completed");
-      expect(requests).toHaveLength(1);
-      expect(requests[0]).toMatchObject({ placementLocalReason: "write-policy-not-transportable" });
-      const workerArguments = requests[0]!.workerArguments;
-      const policyIndex = workerArguments.indexOf("--write-policy");
-      expect(policyIndex).toBeGreaterThanOrEqual(0);
-      const activePolicy = JSON.parse(workerArguments[policyIndex + 1]!);
-      if ("readOnly" in policy) {
-        expect(activePolicy).toMatchObject({ readOnly: true, writableRoots: [] });
-      } else {
-        expect(activePolicy.writableRoots).toContain(f.cwd);
-        expect(activePolicy.writableRoots.some((root: string) => root.startsWith(path.join(f.directory, "runs")))).toBe(true);
-        expect(workerArguments).toContain("--tmpdir");
-      }
-      expect(selector).not.toHaveBeenCalled();
-      expect(remote).not.toHaveBeenCalled();
-      expect(fs.existsSync(f.launcherCalls)).toBe(false);
-    },
-  );
+  // #1423 contract: the default task write policy keeps remote placement and is logged as
+  // unconfined (no confinement is claimed); an explicit or inherited policy stays local.
+  it("keeps the default write policy eligible for remote placement and logs it as unconfined", async () => {
+    const f = setup();
+    const { selector, remote, requests } = captureLaunches();
+
+    const result = await f.manager.run({ task: "default policy route probe", transport: "process" });
+    expect(result.status, result.error).toBe("completed");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.placementLocalReason).toBeUndefined();
+    expect(requests[0]!.workerArguments).toContain("--write-policy");
+    expect(selector).toHaveBeenCalledOnce();
+    expect(remote).toHaveBeenCalledOnce();
+    expect(fs.existsSync(f.launcherCalls)).toBe(true);
+    expect(writePolicyEvents(f.manager, result.id)).toEqual([expect.objectContaining({ type: "write_policy.remote_unconfined" })]);
+  });
+
+  it("keeps an explicit read-only write policy local despite remote placement", async () => {
+    const f = setup();
+    const { selector, remote, requests } = captureLaunches();
+
+    const result = await f.manager.run({ task: "policy route probe", transport: "process", readOnly: true });
+    expect(result.status, result.error).toBe("completed");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      placementLocalReason: "explicit or inherited write policy requires the local worker; one-shot placement cannot forward confinement",
+    });
+    const workerArguments = requests[0]!.workerArguments;
+    const policyIndex = workerArguments.indexOf("--write-policy");
+    expect(policyIndex).toBeGreaterThanOrEqual(0);
+    expect(JSON.parse(workerArguments[policyIndex + 1]!)).toMatchObject({ readOnly: true, writableRoots: [] });
+    expect(selector).not.toHaveBeenCalled();
+    expect(remote).not.toHaveBeenCalled();
+    expect(fs.existsSync(f.launcherCalls)).toBe(false);
+  });
 
   it("keeps the no-active-policy counterexample eligible for remote placement", async () => {
     const f = setup();

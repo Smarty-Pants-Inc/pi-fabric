@@ -437,7 +437,10 @@ describe.skipIf(process.platform === "win32" || typeof process.getuid !== "funct
     }
   }, 10_000);
 
-  it("routes a remote admission through its bound-host launcher without local fallback", async () => {
+  // #1423 contract: the default task write policy keeps remote placement (logged as write_policy.remote_unconfined);
+  // only an explicit or inherited policy refuses a remote binding (above).
+  it.each([["no", { writePolicy: "unrestricted" as const }], ["the default", {}]] as const)(
+    "routes a remote admission with %s write policy through its bound-host launcher without local fallback", async (_kind, policy) => {
     const restoreKeys = isolatePlacementEnvironment();
     const previousPath = process.env.PATH;
     const restoreEnvironment = () => {
@@ -474,7 +477,7 @@ describe.skipIf(process.platform === "win32" || typeof process.getuid !== "funct
 
     try {
       manager = makeManager(fixture, undefined, async record => { terminalStarted.resolve(record); }, placement, false);
-      const result = await manager.run({ task: "Placement must launch on the admitted remote host", model: MODEL, complexity: "simple", transport: "process", writePolicy: "unrestricted" });
+      const result = await manager.run({ task: "Placement must launch on the admitted remote host", model: MODEL, complexity: "simple", transport: "process", ...policy });
       expect(result).toMatchObject({ status: "completed", model: MODEL, text: "remote worker complete", exitCode: 0 });
       expect(result.text).not.toBe("fake worker complete");
       expect(fixture.intents[0]).toMatchObject({ kind: "remote", model: MODEL, complexity: "simple" });

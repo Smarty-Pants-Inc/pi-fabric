@@ -691,10 +691,23 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     grant(root, EVERYONE, "(OI)(CI)(M)", MODIFY);
     expect(icaclsShow(root)).toMatch(/Everyone:\(OI\)\(CI\)\(M\)/);
     const sddl = readAcl(root).sddl;
-    const warnings = vi.spyOn(process, "emitWarning"); // call-through: the finding is still printed
-    const advisories = () => warnings.mock.calls
-      .filter(([, options]) => (options as { code?: string } | undefined)?.code === ADVISORY)
-      .map(([message]) => String(message));
+    // Call-through: the finding is still printed. The advisory uses console/stderr, which Pi's setupCli() leaves on
+    // (it silences process.emitWarning); its code is in the text. A console line reaching stderr counts once.
+    const advisoryLines: string[] = [];
+    let viaConsole = false;
+    const consoleWarn = console.warn.bind(console);
+    const warnings = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      const text = args.map(String).join(" ");
+      if (text.includes(ADVISORY)) advisoryLines.push(text);
+      viaConsole = true;
+      try { consoleWarn(...args); } finally { viaConsole = false; }
+    });
+    const stderrWrite = process.stderr.write.bind(process.stderr) as (...args: unknown[]) => boolean;
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown, ...rest: unknown[]) => {
+      if (!viaConsole && String(chunk).includes(ADVISORY)) advisoryLines.push(String(chunk));
+      return stderrWrite(chunk, ...rest);
+    }) as typeof process.stderr.write);
+    const advisories = () => [...advisoryLines];
     const proofs = countNativeAclProofs();
     const steps: { step: string; outcome: unknown; nativeProofs: number; advisories: number }[] = [];
     const record = (step: string, outcome: unknown) =>
@@ -738,11 +751,18 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
       expect(icaclsShow(root)).toMatch(/Everyone:\(OI\)\(CI\)\(M\)/);
       expect(advisories()).toHaveLength(1);
       proofs.assertRealReads();
-      expect(steps.find(step => step.step === "enforced-openSync")!.nativeProofs)
-        .toBeGreaterThan(steps.find(step => step.step === "explicit-0")!.nativeProofs);
+      // Advisory caching (P2): the first parent read warns and is remembered; default/0 repeats take no native read,
+      // every enforced open reads afresh and refuses, and off again returns to the remembered advisory. The fresh
+      // child seed above is what makes that first parent read see the real Everyone:(M) grant.
+      const proofsAt = (step: string) => steps.find(entry => entry.step === step)!.nativeProofs;
+      expect(proofsAt("default-unset")).toBe(1);
+      expect(proofsAt("explicit-0")).toBe(proofsAt("default-unset"));
+      expect(proofsAt("enforced-openSync")).toBe(proofsAt("explicit-0") + 1);
+      expect(proofsAt("enforced-open")).toBe(proofsAt("enforced-openSync") + 1);
+      expect(proofsAt("rollback-unset")).toBe(proofsAt("enforced-open"));
     } finally {
       try { console.log(JSON.stringify({ event: "native-rollback", root, steps, nativeProofs: proofs.count() })); }
-      finally { proofs.restore(); warnings.mockRestore(); }
+      finally { proofs.restore(); warnings.mockRestore(); stderr.mockRestore(); }
     }
   }, 240_000);
 });

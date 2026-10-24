@@ -1,5 +1,6 @@
 // smarty-dev#8920: the Windows ACL policy of the mesh state gate. The native read is a pinned PowerShell child that
 // Linux cannot run, so these feed recorded snapshots through the runner seam; windows-latest CI covers the real read.
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -54,6 +55,64 @@ const defaultEntries = (): Entry[] => [
   { path: "C:\\Users\\me\\.pi\\mesh\\state-checkpoint.flags", missing: true },
   { path: "C:\\Users\\me\\.pi\\mesh\\state.db", attributes: 0x20, owner: USER, control: 0x8404, dacl: profileDacl() },
 ];
+
+// P1 Pi-host child: the pinned setupCli() first, then the REAL store -> gate -> reader. Only the reader's PowerShell
+// execFileSync is replaced: a recorded snapshot whose root carries Everyone:(M) (host paths on non-Windows runners).
+// Step markers go to the child's real stderr, so the parent sees which step printed which advisory.
+const PI_HOST_ADVISORY = String.raw`
+import childProcess from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { createJiti } from "jiti";
+const [base] = process.argv.slice(1);
+const ENFORCE = "PI_FABRIC_MESH_STATE_ACL_ENFORCE";
+const setup = await import(pathToFileURL(path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli/setup.js")).href);
+const emitWarning = process.emitWarning;
+setup.setupCli();
+const roots = { first: path.join(base, "first", "mesh"), second: path.join(base, "second", "mesh") };
+const report = { emitWarningSilenced: process.emitWarning !== emitWarning, title: process.title, roots, reads: {}, outcomes: {} };
+const hostWindows = process.platform === "win32";
+Object.defineProperty(process, "platform", { ...Object.getOwnPropertyDescriptor(process, "platform"), value: "win32" });
+if (!process.env.SystemRoot) process.env.SystemRoot = "C:\\Windows";
+const USER = "S-1-5-21-1-2-3-1001";
+const trusted = [{ type: 0, flags: 3, sid: USER, mask: 0x1f01ff }, { type: 0, flags: 3, sid: "S-1-5-18", mask: 0x1f01ff }];
+let reads = 0;
+childProcess.execFileSync = (_file, _args, options) => {
+  const wire = JSON.parse(options.env.PI_FABRIC_STATE_ACL);
+  reads += 1;
+  const entries = wire.paths.map((target, index) => {
+    const stat = fs.lstatSync(hostWindows ? target : target.replace(/\\/g, "/"), { throwIfNoEntry: false });
+    if (!stat) return { path: target, missing: true };
+    const dacl = index === 0 ? [...trusted, { type: 0, flags: 3, sid: "S-1-1-0", mask: 0x1301bf }] : trusted;
+    return { path: target, attributes: stat.isDirectory() ? 0x10 : 0x20, owner: USER, control: 0x8004, dacl };
+  });
+  return JSON.stringify({ userSid: USER, ownerSid: USER, protect: wire.protect ? "ok" : null, entries });
+};
+const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+const { SqliteStateStore } = await jiti.import("./src/mesh/state-sqlite.ts");
+const open = async (step, root, mode, enforce) => {
+  process.stderr.write("STEP " + step + "\n");
+  if (enforce === undefined) delete process.env[ENFORCE]; else process.env[ENFORCE] = enforce;
+  const before = reads;
+  try {
+    const store = mode === "sync" ? SqliteStateStore.openSync(root, 65_536, 1_000, { initialize: "create" })
+      : await SqliteStateStore.open(root, 65_536, 1_000, { initialize: "create" });
+    store.close();
+    report.outcomes[step] = { ok: true };
+  } catch (error) { report.outcomes[step] = { ok: false, code: error?.code, message: String(error?.message ?? error) }; }
+  report.reads[step] = reads - before;
+};
+await open("default-first-async", roots.first, "async", undefined);
+await open("default-first-sync", roots.first, "sync", undefined);
+await open("enforced-first-sync", roots.first, "sync", "1");
+await open("enforced-first-async", roots.first, "async", "1");
+await open("off-first-async", roots.first, "async", undefined);
+await open("zero-first-sync", roots.first, "sync", "0");
+await open("default-second-sync", roots.second, "sync", undefined);
+process.stderr.write("STEP end\n");
+process.stdout.write(JSON.stringify(report) + "\n");
+`;
 
 const runner = (entries: Entry[], extra: Entry = {}) => {
   const calls: unknown[] = [];
@@ -982,10 +1041,32 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
 
   // Warn-by-default, exact opt-in, tested switch back. One gate module instance per test: the setting is read at
   // each call, never captured at import. The recorded reader verdicts stay unsafe throughout; only the setting moves.
-  const advisoriesOf = (warn: { mock: { calls: unknown[][] } }) => warn.mock.calls
-    .filter(([, options]) => (options as { code?: string } | undefined)?.code === ADVISORY)
-    .map(([message]) => String(message));
-  const quietWarnings = () => vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+  // Pi's setupCli() makes process.emitWarning a no-op, so the advisory travels through console/stderr, carrying its
+  // code in the text. Collect console.warn/error and direct stderr writes (a console write that reaches stderr is not
+  // counted twice); `quiet` swallows only advisory lines, everything else calls through. vi.restoreAllMocks undoes it.
+  const captureAdvisories = (quiet = true): (() => string[]) => {
+    const seen: string[] = [];
+    let viaConsole = false;
+    const write = process.stderr.write.bind(process.stderr) as (...args: unknown[]) => boolean;
+    vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown, ...rest: unknown[]) => {
+      const text = String(chunk);
+      if (!viaConsole && text.includes(ADVISORY)) seen.push(text);
+      if (quiet && text.includes(ADVISORY)) return true;
+      return write(chunk, ...rest);
+    }) as typeof process.stderr.write);
+    for (const level of ["warn", "error"] as const) {
+      const original = console[level].bind(console);
+      vi.spyOn(console, level).mockImplementation((...args: unknown[]) => {
+        const text = args.map(String).join(" ");
+        if (text.includes(ADVISORY)) { seen.push(text); if (quiet) return; }
+        viaConsole = true;
+        try { original(...args); } finally { viaConsole = false; }
+      });
+    }
+    return () => [...seen];
+  };
+  const advisoriesOf = (capture: () => string[]) => capture();
+  const quietWarnings = () => captureAdvisories();
   const loadGateBy = async (judge: (input: WindowsStateAclRequest) => string | undefined) => {
     const calls: WindowsStateAclRequest[] = [];
     vi.resetModules();
@@ -1189,12 +1270,210 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     });
   });
 
-  it.each([undefined, "0"])("POSIX privacy refusal is unchanged with the setting %s", async value => {
-    const { gate, calls } = await loadGate(undefined);
+  // P3: the POSIX policy is modeled, not borrowed from the host. Windows has no process.getuid and fs.chmod does not
+  // set POSIX mode bits there, so the old real-chmod fixture could not refuse on a Windows runner. Explicit platform
+  // (linux), uid, mode, mountinfo and lstat model on EVERY host OS; nothing reaches a real mode or uid.
+  const asModeledPosix = async <T>(rootMode: number, run: (root: string) => T | Promise<T>): Promise<T> => {
+    const UID = 4242;
+    const root = tmp(); // real directory: realpath works on every host; its stat is modeled below
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const getuid = Object.getOwnPropertyDescriptor(process, "getuid");
+    const modeled = (mode: number) => ({ uid: UID, mode, isSymbolicLink: () => false, isDirectory: () => true,
+      isFile: () => false }) as fs.Stats;
+    const lstat = fs.lstatSync.bind(fs);
+    const modeledPaths = new Set<string>();
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: fs.StatSyncOptions) => {
+      const name = path.resolve(String(file));
+      if (name === path.resolve(root)) { modeledPaths.add(name); return modeled(0o040000 | rootMode); }
+      if (path.resolve(root).startsWith(name) || fs.realpathSync(root).startsWith(name)) {
+        modeledPaths.add(name);
+        return modeled(0o040755); // every ancestor: owned by the modeled uid, not group/other writable
+      }
+      return lstat(file, options);
+    }) as typeof fs.lstatSync);
+    const readFile = fs.readFileSync.bind(fs) as (...args: unknown[]) => unknown;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) =>
+      String(file) === "/proc/self/mountinfo" ? "21 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+        : readFile(file, ...rest)) as typeof fs.readFileSync);
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    Object.defineProperty(process, "getuid", { configurable: true, writable: true, enumerable: true, value: () => UID });
+    try {
+      const result = await run(root);
+      expect(modeledPaths.has(path.resolve(root))).toBe(true); // the modeled stat, not the host's, was judged
+      return result;
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+      if (getuid) Object.defineProperty(process, "getuid", getuid);
+      else Reflect.deleteProperty(process, "getuid");
+    }
+  };
+
+  it.each([undefined, "0", "1"])("modeled POSIX privacy refusal is mandatory with the setting %s, with no native ACL read", async value => {
+    const { gate, calls } = await loadGate("C:\\x grants S-1-1-0 write");
+    const advisories = captureAdvisories();
     vi.stubEnv(ENFORCE, value);
-    const root = tmp();
-    fs.chmodSync(root, 0o777);
-    expect(() => gate.assertPrivateStateRoot(root)).toThrow(/group or other writable/);
+    await asModeledPosix(0o777, root => {
+      expect(() => gate.assertPrivateStateRoot(root)).toThrow(expect.objectContaining({ code: "FABRIC_MESH_STATE_UNSUPPORTED",
+        message: expect.stringContaining(`refuses ${root}: it is group or other writable (mode 777)`) }));
+    });
+    expect(calls).toEqual([]);
+    expect(advisories()).toEqual([]);
+  });
+
+  it.each([undefined, "0", "1"])("counterexample: a modeled private POSIX root (0700) passes with the setting %s, no native ACL read", async value => {
+    const { gate, calls } = await loadGate("C:\\x grants S-1-1-0 write");
+    vi.stubEnv(ENFORCE, value);
+    await asModeledPosix(0o700, root => { expect(() => gate.assertPrivateStateRoot(root)).not.toThrow(); });
     expect(calls).toEqual([]);
   });
+
+  // P2: an unsafe default finding is never cached by the reader, so every lifecycle step used to start a fresh native
+  // child (four per store open, three of them under the fence for a new root; one per fence and per flag). After a
+  // root's first advisory the default makes no further reads for it, even under the fence. Exact ENFORCE=1 consults the
+  // reader at every call and refuses; unset/0/other values return to the remembered advisory; a new root reads anew.
+  it("advisory lifecycle: one native read per unsafe root across store opens, file-mode constructor/fence and flags; enforced calls stay fresh", async () => {
+    const finding = "C:\\x grants S-1-1-0 write, delete or permission rights (mask 0x1301bf)";
+    const base = tmp();
+    const first = path.join(base, "first", "mesh");
+    const second = path.join(base, "second", "mesh");
+    const fenced: boolean[] = [];
+    const { calls } = await loadGateBy(input => {
+      fenced.push(["custody.lock", ".lock"].some(lock => fs.existsSync(path.join(input.root, lock))));
+      return finding;
+    });
+    const sqlite = await import("../src/mesh/state-sqlite.js");
+    const { assertFileStateWritable } = await import("../src/mesh/backend-fence.js");
+    const { createStateBackend } = await import("../src/mesh/state-backend.js");
+    const advisories = captureAdvisories();
+    const delta = async (run: () => unknown): Promise<number> => { const before = calls.length; await run(); return calls.length - before; };
+    const lifecycle = (root: string) => async () => {
+      (await sqlite.SqliteStateStore.open(root, 1024, 16, { initialize: "create" })).close();
+      sqlite.SqliteStateStore.openSync(root, 1024, 16, { initialize: "create" }).close();
+      createStateBackend({ root, maxEventBytes: 1024, maxReadEvents: 16, lock: {} as never }, { stateBackend: "file" }).close();
+      // The SQLite event-store backend's constructor admits an existing root before its first open.
+      createStateBackend({ root, maxEventBytes: 1024, maxReadEvents: 16, lock: {} as never }, { stateBackend: "sqlite" }).close();
+      for (let commit = 0; commit < 3; commit += 1) {
+        // The file-mode commit fence passes the gate, then refuses on backend=sqlite (authority, not ACL).
+        expect(() => assertFileStateWritable(root)).toThrow(/backend=sqlite/);
+      }
+      for (let raise = 0; raise < 3; raise += 1) {
+        const flag = sqlite.raiseCheckpointFlag(root, sqlite.ownerToken());
+        expect(flag).not.toBe("");
+        sqlite.lowerCheckpointFlag(flag);
+      }
+    };
+    await asWindows(async () => {
+      vi.stubEnv(ENFORCE, undefined);
+      expect(await delta(async () => (await sqlite.SqliteStateStore.open(first, 1024, 16, { initialize: "create" })).close())).toBe(1);
+      expect(fenced).toEqual([false]); // the one read precedes the fence; none is taken while it is held
+      expect(advisories()).toEqual([expect.stringContaining(first)]);
+      expect(advisories()[0]).toContain(finding);
+      expect(await delta(lifecycle(first))).toBe(0);
+      expect(fenced).toHaveLength(1);
+
+      enforceAcl(); // every enforced call consults the reader again and refuses; no advisory authorizes it
+      for (let round = 0; round < 2; round += 1) {
+        for (const [name, run] of [
+          ["openSync", () => sqlite.SqliteStateStore.openSync(first, 1024, 16, { initialize: "create" })],
+          ["open", () => sqlite.SqliteStateStore.open(first, 1024, 16, { initialize: "create" })],
+          ["file constructor", () => createStateBackend({ root: first, maxEventBytes: 1024, maxReadEvents: 16, lock: {} as never }, { stateBackend: "file" })],
+          ["file fence", () => assertFileStateWritable(first)],
+          ["sqlite event-store constructor", () => createStateBackend({ root: first, maxEventBytes: 1024, maxReadEvents: 16, lock: {} as never }, { stateBackend: "sqlite" })],
+          ["flag", () => sqlite.raiseCheckpointFlag(first, sqlite.ownerToken())],
+        ] as const) {
+          const before = calls.length;
+          await expect(Promise.resolve().then((): unknown => run()), name).rejects.toThrow(finding);
+          expect(calls.length - before, name).toBe(1);
+        }
+      }
+      expect(fs.readdirSync(path.join(first, "state-checkpoint.flags"))).toEqual([]);
+
+      for (const off of [undefined, "0", "true"]) {
+        vi.stubEnv(ENFORCE, off);
+        expect(await delta(lifecycle(first)), String(off)).toBe(0);
+      }
+      expect(advisories()).toHaveLength(1); // deduped; refusals spent no warning
+
+      vi.stubEnv(ENFORCE, undefined);
+      expect(await delta(lifecycle(second))).toBe(1); // a new root gets its own read and its own warning
+      expect(advisories()).toHaveLength(2);
+      expect(advisories()[1]).toContain(second);
+    });
+  });
+
+  // After an advisory cache hit the mandatory type, link and inode checks still run on every call.
+  it("an advisory cache hit keeps the mandatory type, link and inode refusals", async () => {
+    const { gate, calls } = await loadGate("C:\\x grants S-1-1-0 write");
+    const advisories = captureAdvisories();
+    const root = tmp();
+    const db = path.join(root, "state.db");
+    fs.writeFileSync(db, "");
+    const opened: string[] = [];
+    await asWindows(async () => {
+      vi.stubEnv(ENFORCE, undefined);
+      gate.openPrivateStateDb(db, opener(opened)).close();
+      expect(calls).toHaveLength(1);
+      expect(advisories()).toHaveLength(1);
+      let closed = 0;
+      expect(() => gate.openPrivateStateDb(db, file => {
+        opened.push(file);
+        fs.renameSync(db, path.join(root, "original.db"));
+        fs.writeFileSync(db, "replacement");
+        return { close: () => { closed += 1; } } as never;
+      })).toThrow(/replaced while opening/);
+      expect(closed).toBe(1);
+      fs.rmSync(db);
+      fs.symlinkSync(path.join(root, "original.db"), db);
+      expect(() => gate.openPrivateStateDb(db, opener(opened))).toThrow(/is a symbolic link/);
+      fs.rmSync(db);
+      fs.mkdirSync(db);
+      expect(() => gate.openPrivateStateDb(db, opener(opened))).toThrow(/is not a regular file/);
+      expect(() => gate.assertPrivateStateRoot(path.join(root, "original.db"))).toThrow(/is not a directory/);
+      expect(opened).toEqual([db, db]);
+      expect(calls).toHaveLength(1); // the cache skipped only the ACL read
+    });
+  });
+
+  // P1: Pi's own setupCli() (the pinned pi-coding-agent's, as its CLI and RPC entries run before loading extensions)
+  // replaces process.emitWarning with a no-op. A plain child runs it FIRST, then loads the real store/gate/reader
+  // (only the PowerShell child is replaced by a recorded unsafe snapshot), so its actual stderr is Pi's.
+  it("Pi host: after the real setupCli() the default advisory reaches actual stderr once per root; ENFORCE=1 refuses silently; off opens again", () => {
+    const result = childProcess.spawnSync(process.execPath,
+      ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", PI_HOST_ADVISORY, path.join(tmp(), "pi")],
+      { cwd: process.cwd(), encoding: "utf8", windowsHide: true, timeout: 120_000, maxBuffer: 4 * 1024 * 1024,
+        env: Object.fromEntries(Object.entries(process.env).filter(([name]) => name !== ENFORCE)) });
+    expect(result.error?.message ?? "").toBe("");
+    expect(result.status, result.stderr).toBe(0);
+    const report = JSON.parse(result.stdout.trim().split("\n").at(-1)!) as {
+      emitWarningSilenced: boolean; title: string; roots: Record<string, string>; reads: Record<string, number>;
+      outcomes: Record<string, { ok: boolean; code?: string; message?: string }> };
+    expect(report.emitWarningSilenced).toBe(true); // Pi's no-op really is installed before the gate runs
+    // Split the child's real stderr by its own step markers: which step printed which advisory.
+    const byStep = new Map<string, string[]>();
+    let current = "";
+    for (const line of result.stderr.split(/\r?\n/)) {
+      if (line.startsWith("STEP ")) { current = line.slice(5); byStep.set(current, []); }
+      else if (line.trim() !== "") byStep.get(current)?.push(line);
+    }
+    const advisoryLines = (step: string) => (byStep.get(step) ?? []).filter(line => line.includes(ADVISORY));
+    const { first, second } = report.roots;
+    expect(advisoryLines("default-first-async")).toEqual([expect.stringContaining(first!)]);
+    expect(advisoryLines("default-first-async")[0]).toContain("grants S-1-1-0");
+    expect(advisoryLines("default-first-async")[0]).toContain(ENFORCE);
+    for (const step of ["default-first-sync", "enforced-first-sync", "enforced-first-async", "off-first-async", "zero-first-sync"]) {
+      expect(advisoryLines(step), step).toEqual([]);
+    }
+    expect(advisoryLines("default-second-sync")).toEqual([expect.stringContaining(second!)]);
+    expect(result.stderr.split(ADVISORY).length - 1).toBe(2); // once per root, in total
+    expect(report.outcomes).toMatchObject({
+      "default-first-async": { ok: true }, "default-first-sync": { ok: true },
+      "enforced-first-sync": { ok: false, code: "FABRIC_MESH_STATE_UNSUPPORTED" },
+      "enforced-first-async": { ok: false, code: "FABRIC_MESH_STATE_UNSUPPORTED" },
+      "off-first-async": { ok: true }, "zero-first-sync": { ok: true }, "default-second-sync": { ok: true },
+    });
+    expect(report.outcomes["enforced-first-sync"]!.message).toContain("grants S-1-1-0");
+    // The real reader ran: one recorded read per new root by default, one per enforced call, none once warned.
+    expect(report.reads).toEqual({ "default-first-async": 1, "default-first-sync": 0, "enforced-first-sync": 1,
+      "enforced-first-async": 1, "off-first-async": 0, "zero-first-sync": 0, "default-second-sync": 1 });
+  }, 150_000);
 });

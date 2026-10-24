@@ -90,7 +90,25 @@ const fixture = async (owner = USER, withGate = false) => {
   }
   Object.defineProperty(process, "platform", { ...platform, value: "win32" });
   vi.stubEnv("SystemRoot", "C:\\Windows");
+  // The reader's own UNVERIFIED notice still uses emitWarning; the gate's advisory uses console/stderr (Pi's setupCli
+  // silences emitWarning). Advisory lines are captured and swallowed; everything else calls through.
   const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+  const advisoryLines: string[] = [];
+  let viaConsole = false;
+  const write = process.stderr.write.bind(process.stderr) as (...args: unknown[]) => boolean;
+  vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown, ...rest: unknown[]) => {
+    if (String(chunk).includes(ADVISORY)) { if (!viaConsole) advisoryLines.push(String(chunk)); return true; }
+    return write(chunk, ...rest);
+  }) as typeof process.stderr.write);
+  for (const level of ["warn", "error"] as const) {
+    const original = console[level].bind(console);
+    vi.spyOn(console, level).mockImplementation((...args: unknown[]) => {
+      const text = args.map(String).join(" ");
+      if (text.includes(ADVISORY)) { advisoryLines.push(text); return; }
+      viaConsole = true;
+      try { original(...args); } finally { viaConsole = false; }
+    });
+  }
   const stats = new Map<string, fs.BigIntStats>();
   const entries = new Map<string, Entry>();
   const unreadable = new Set<string>();
@@ -147,7 +165,8 @@ const fixture = async (owner = USER, withGate = false) => {
     expect(judge(input)).toBeUndefined(); // synchronous: no await/microtask/timer between requests
     expect(native).toHaveBeenCalledTimes(1);
   };
-  return { judge, warm, gate, native, warning, stat, entry, unsafe, present, absent, unreadable, rawUnreadable, state };
+  const advisories = () => [...advisoryLines];
+  return { judge, warm, gate, native, warning, advisories, stat, entry, unsafe, present, absent, unreadable, rawUnreadable, state };
 };
 
 describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", () => {
@@ -460,6 +479,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
     expect(sqliteOpen).toHaveBeenCalledTimes(2);
     expect(f.native).toHaveBeenCalledTimes(1);
     expect(f.warning).not.toHaveBeenCalled();
+    expect(f.advisories()).toEqual([]); // a safe root never advises
   });
 
   // Decision C: REAL gate -> REAL reader -> DEFAULT runner; recorded observations, not NTFS/deletion proof.
@@ -548,6 +568,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
       expect(sqliteOpen).toHaveBeenNthCalledWith(2, DB);
       expect(f.native).toHaveBeenCalledTimes(row.cacheable ? 1 : 2);
       expect(f.warning).not.toHaveBeenCalled();
+      expect(f.advisories()).toEqual([]); // safe evidence: no advisory, so no advisory read-skip either
     });
 
   it.each([ROOT, DB].flatMap(target => observations.flatMap(before =>
@@ -782,10 +803,9 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
 
   // Warn-by-default with an explicit, reversible opt-in. REAL gate -> REAL default reader (recorded snapshot); one
   // module instance across every switch, so the setting must be read at each call. The unsafe snapshot never changes:
-  // only the setting does, and an unsafe proof is never cached, so every open below takes a fresh native read.
-  const advisories = (f: GateFixture) => f.warning.mock.calls
-    .filter(([, options]) => (options as { code?: string } | undefined)?.code === ADVISORY)
-    .map(([message]) => String(message));
+  // only the setting does. The reader never caches an unsafe proof; the gate remembers a root's advisory, so default
+  // opens after the first finding take no native read, while every enforced open takes a fresh one and refuses.
+  const advisories = (f: GateFixture) => f.advisories();
   const unsetEnforce = () => vi.stubEnv(ENFORCE, undefined);
 
   it("ADVISORY-01 unsafe state.db ACE: default warns and reaches the opener; ENFORCE=1 refuses before it; unset/0 reach it again", async () => {
@@ -815,12 +835,13 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
     expect(openOutcome(f, sqliteOpen)).toBeUndefined();
     expect(sqliteOpen).toHaveBeenCalledTimes(3);
     for (const call of [1, 2, 3]) expect(sqliteOpen).toHaveBeenNthCalledWith(call, DB);
-    expect(f.native).toHaveBeenCalledTimes(4);
+    expect(f.native).toHaveBeenCalledTimes(2); // off again: the remembered advisory, no native read
 
-    // Advisory opens repaired nothing: switching back on still refuses the same unchanged finding.
+    // Advisory opens repaired nothing: switching back on still refuses the same unchanged finding, from a fresh read.
     enforceAcl();
     expect(openOutcome(f, sqliteOpen)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
     expect(sqliteOpen).toHaveBeenCalledTimes(3);
+    expect(f.native).toHaveBeenCalledTimes(3);
     expect(f.entry(DB).dacl).toContainEqual(allow(OTHER, FULL));
     expect(advisories(f)).toHaveLength(1); // one warning per checked root; refusals add none
   });
@@ -839,7 +860,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
     expect(openOutcome(f, sqliteOpen)).toMatchObject({
       code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringContaining(`grants ${OTHER}`) });
     expect(sqliteOpen).toHaveBeenCalledTimes(advisoryValues.length);
-    expect(f.native).toHaveBeenCalledTimes(advisoryValues.length + 1);
+    expect(f.native).toHaveBeenCalledTimes(2); // the first advisory read, then the fresh enforced read
     expect(advisories(f)).toEqual([expect.stringContaining(`grants ${OTHER}`)]);
   });
 
@@ -864,7 +885,8 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
     unsetEnforce();
     expect(openOutcome(f, sqliteOpen)).toBeUndefined();
     expect(sqliteOpen).toHaveBeenCalledTimes(3);
-    expect(f.native).toHaveBeenCalledTimes(5);
+    // refuse, warn, (remembered), refuse, (remembered): each enforced open read afresh, advisory repeats did not.
+    expect(f.native).toHaveBeenCalledTimes(3);
   });
 
   // The advisory default covers ACL evidence only: lstat type/link and the post-open inode check still refuse.
@@ -886,5 +908,37 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
         expect(sqliteOpen).toHaveBeenCalledTimes(1);
         expect(close).toHaveBeenCalledTimes(1);
       } else expect(sqliteOpen).not.toHaveBeenCalled();
+    });
+
+  // P2: the gate's remembered advisory skips only the repeat ACL read, never the mandatory lstat/type/inode checks.
+  it.each(["link", "wrong type", "replaced while opening"] as const)(
+    "ADVISORY-05 after a remembered advisory (no native read) the state.db %s integrity refusal still runs", async kind => {
+      const f = await fixture(USER, true);
+      unsetEnforce();
+      f.unsafe(DB);
+      let armed = false;
+      const close = vi.fn();
+      const sqliteOpen = vi.fn(() => {
+        if (armed && kind === "replaced while opening") f.stat(DB).ino += 1n;
+        return { close } as never;
+      });
+      expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+      expect(f.native).toHaveBeenCalledTimes(1);
+      expect(f.advisories()).toEqual([expect.stringContaining(`state.db grants ${OTHER}`)]);
+      armed = true;
+      if (kind === "link") f.stat(DB).isSymbolicLink = () => true;
+      if (kind === "wrong type") { f.stat(DB).isDirectory = () => true; f.stat(DB).isFile = () => false; }
+      const refusal = openOutcome(f, sqliteOpen);
+      expect(refusal).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringContaining(DB) });
+      expect(f.native).toHaveBeenCalledTimes(1); // the advisory hit skipped only the ACL read
+      expect(f.advisories()).toHaveLength(1);
+      if (kind === "replaced while opening") {
+        expect((refusal as Error).message).toMatch(/replaced while opening/);
+        expect(sqliteOpen).toHaveBeenCalledTimes(2);
+        expect(close).toHaveBeenCalledTimes(2);
+      } else expect(sqliteOpen).toHaveBeenCalledTimes(1);
+      enforceAcl(); // and the remembered advisory never authorizes enforcement: a fresh read refuses
+      expect(openOutcome(f, sqliteOpen)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+      expect(f.native).toHaveBeenCalledTimes(2);
     });
 });

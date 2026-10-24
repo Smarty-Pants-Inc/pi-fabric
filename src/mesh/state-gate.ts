@@ -93,8 +93,8 @@ export const filesystemRefusal = (root: string,
  * (FABRIC_MESH_STATE_UNSUPPORTED). A missing path passes. Windows retains the type/symlink checks, but has no uid
  * or mode bits: an existing path gets an advisory native ACL read, enforced only with
  * PI_FABRIC_MESH_STATE_ACL_ENFORCE=1: the path itself as a strict directory or file target (the elevated
- * Administrators owner exception included), every parent as an ancestor. Standalone requests always get a fresh
- * native proof. State-root callers instead use the full root plan, whose successful Windows proof is process-cached
+ * Administrators owner exception included), every parent as an ancestor. Standalone enforced requests always get a
+ * fresh native proof. State-root callers instead use the full root plan, whose successful Windows proof is process-cached
  * by root/DB identity in the ACL reader; checkpoint flag writers reuse that same plan plus cheap directory checks.
  * The read-only flag scan uses assertGatedFlagDirectory instead.
  */
@@ -269,10 +269,10 @@ const fdSnapshot = (): Map<string, string> | undefined => {
  * `create` (smarty-dev#8920, Windows creation paths only): the exclusive create of a missing state.db, run AFTER the
  * root half (filesystem, ancestors, root, state files and flag directory: the normal root plan) and BEFORE the
  * state files' lstat and the pinned open, so a refused root still gets no file (#846 SEC P2). When state.db was missing
- * for that first proof, a second full native proof follows the callback before the open. Existing state.db reuses
- * the reader's successful admission proof only for the same root/DB identities and target plan.
- * It skips nothing: every check below runs as without it. A state.db it creates
- * inherits the root's DACL, whose inheritable grants the read just judged (advisory unless enforcement is enabled).
+ * for that first proof, enforcement requires a second full native proof after the callback before the open. Existing
+ * state.db reuses the reader's successful admission proof only for the same root/DB identities and target plan.
+ * Advisory mode skips repeat ACL reads for a previously warned path, never the mandatory checks below.
+ * A state.db it creates inherits the root's DACL, whose inheritable grants the read judged (advisory unless enforced).
  * POSIX callers keep their own sequence
  * (assertPrivateStateRoot, the create, then this gate without `create`).
  */
@@ -282,16 +282,18 @@ export const openPrivateStateDb = (file: string, open: SqliteOpener, create?: ()
   const requireDatabase = process.platform === "win32" && create === undefined;
   assertPrivateStateRoot(path.dirname(file), path.basename(file), requireDatabase);
   create?.();
-  // Always rerun the normal Windows root gate after the callback. Stable known IDs hit the complete cached proof;
-  // unknown IDs and newly created DBs take a fresh native proof, so an EEXIST/planted winner is never lstat-only.
+  // Always rerun the normal Windows root gate after the callback. With enforcement, stable known IDs hit the complete
+  // cached proof; unknown IDs and newly created DBs take a fresh native proof, so an EEXIST/planted winner is never
+  // lstat-only.
   if (process.platform === "win32" && create !== undefined) assertPrivateStateRoot(path.dirname(file), path.basename(file), true);
   return openPinned(file, open, assertPrivateStateFiles(file));
 };
 
 /**
  * Prime an EXISTING Windows state.db's normal root proof before any bounded lock/busy operation. No SQLite open,
- * schema work or creation: a missing DB returns after one lstat and retains the gate's fresh pre/post-create proofs.
- * Successful identity-keyed caching (and cheap lexical ancestor/reparse guards on hits) belongs to the ACL reader.
+ * schema work or creation: a missing DB returns after one lstat and retains fresh pre/post-create proofs under enforcement.
+ * Successful identity-keyed caching (and cheap lexical ancestor/reparse guards on hits) belongs to the ACL reader;
+ * advisory findings are separately memoized by this gate without establishing trust.
  */
 export const admitExistingStateRoot = (root: string): void => {
   if (process.platform !== "win32") return;
@@ -311,7 +313,8 @@ export const assertPrivateStateRoot = (root: string, db = "state.db", requireDat
 
 /**
  * smarty-dev#8920: creates a missing state root (mode 0700). POSIX: the same recursive mkdir as before, nothing
- * else. Windows defaults to recursive mkdir plus an advisory root snapshot, without ACL preflights or mutation.
+ * else. Windows defaults to recursive mkdir plus an advisory root snapshot unless already warned, without ACL
+ * preflights or mutation.
  * Only PI_FABRIC_MESH_STATE_ACL_ENFORCE=1 enables the volume-down lexical checks and ancestor ACL preflights BEFORE
  * each non-recursive mkdir, followed by an explicit owner and protected private DACL on the root we just created.
  * In enforcement mode an EEXIST winner is refused, never repaired or adopted; existing roots are gated at admission/open.
@@ -367,9 +370,10 @@ const stateTargets = (root: string, db: string) => {
 };
 // The normal root plan must match at early admission, open and checkpoint flag writes. The ACL reader alone caches
 // verified successful root-role proofs for stable root+DB identities (volume and lossless file IDs, never ctime).
-// Missing/unknown DB identity and unverified tooling fallbacks never cache; standalone target, creation-parent and
-// protect requests stay fresh. A missing DB still gets full pre/post-create snapshots. Only enforcement creates N
-// missing directories with N creation-parent preflights plus protect/readback; those cannot satisfy the open's plan.
+// Missing/unknown DB identity and unverified tooling fallbacks never cache there; enforced standalone target,
+// creation-parent and protect requests stay fresh. Enforcement gives a missing DB full pre/post-create snapshots.
+// The gate separately memoizes advisory findings, not admissions. Only enforcement creates N missing directories
+// with N creation-parent preflights plus protect/readback; those cannot satisfy the open's plan.
 type AclTargets = { role?: "root" | "directory" | "file" | "ancestor" | "creation-parent"; files: string[]; directories: string[]; requireDatabase?: boolean };
 // Read on every call: removing the setting restores advisory startup without changing any ACL.
 const windowsAclEnforced = (): boolean => process.env.PI_FABRIC_MESH_STATE_ACL_ENFORCE === "1";
@@ -384,12 +388,14 @@ const windowsAclFinding = (root: string, why: string, cause?: unknown): void => 
   const key = path.resolve(root).toLowerCase();
   if (warnedWindowsAclRoots.has(key) || warnedWindowsAclRoots.size >= MAX_WINDOWS_ACL_WARNINGS) return;
   warnedWindowsAclRoots.add(key);
-  process.emitWarning(`[pi-fabric] Fabric mesh SQLite state Windows ACL privacy finding for ${root}: ${why}. `
+  console.warn(`[pi-fabric] FABRIC_MESH_STATE_ACL_ADVISORY: Fabric mesh SQLite state Windows ACL privacy finding for ${root}: ${why}. `
     + "Continuing with advisory ACL checks. Set PI_FABRIC_MESH_STATE_ACL_ENFORCE=1 to enforce refusal; "
-    + "remove/unset PI_FABRIC_MESH_STATE_ACL_ENFORCE to restore warning-only startup (no ACL changes needed).",
-    { code: "FABRIC_MESH_STATE_ACL_ADVISORY" });
+    + "remove/unset PI_FABRIC_MESH_STATE_ACL_ENFORCE to restore warning-only startup (no ACL changes needed).");
 };
 const assertWindowsAcl = (root: string, targets: AclTargets, protect: boolean): void => {
+  // This advisory cache is not a trust or security proof: skip only repeat ACL reads after a finding.
+  // Exact opt-in always consults the original reader, including its verified successful identity cache.
+  if (!windowsAclEnforced() && warnedWindowsAclRoots.has(path.resolve(root).toLowerCase())) return;
   let real: string;
   // The real chain is the parent's: the target itself is never followed; its reparse finding uses the same policy.
   try { real = path.join(fs.realpathSync.native(path.dirname(path.resolve(root))), path.basename(path.resolve(root))); }

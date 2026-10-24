@@ -336,8 +336,8 @@ export interface FabricActorRequest extends FabricActorBatching {
   coalesce?: boolean;
   /**
    * A dotted path into a mesh event's data, such as "payload.number". Queued events of the
-   * same topic and scalar value share one run: newest primary payload plus every collapsed
-   * event in sequence-ordered coalesced history (bounded full data, metadata for every event).
+   * same topic and scalar value share one run: newest primary payload plus sequence-ordered
+   * coalesced history (bounded full data and metadata, explicit older-omission summary).
    */
   coalesceKey?: string;
   /** Opt-in occurrence path into the full mesh event (e.g. data.key). Persistent durable

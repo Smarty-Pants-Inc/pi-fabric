@@ -41,6 +41,7 @@ import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 import { readJsonlPage } from "../log-tail.js";
 import { ActorChildCompletionStore, ActorChildCompletionWatch, ChildCompletionClaimLostError } from "./child-completions.js";
 import { pruneActorSessionBackups, recordMeshRetentionSweeper, startLockedMeshRetentionSweep } from "../storage/retention.js";
+import { archiveRootSessionTraces, archiveSessionTracesBeforeRemoval, fleetSessionArchive, sessionTracesUnder, sha256File } from "../storage/session-archive.js";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -2783,7 +2784,9 @@ export class ActorManager {
     );
   }
 
-  // Moves session.jsonl to session.jsonl.<UTC stamp>.bak, keeps the newest backup and logs it.
+  // Moves session.jsonl to session.jsonl.<UTC stamp>.bak (the newest backup, kept in place) and logs it with its sha256.
+  // smarty-dev#16444 (R-keep-all-traces): older backups are never deleted; they move into <actor dir>/session-archive/
+  // (pruneActorSessionBackups), and the reset record names each move (archivedTo, and a MOVED-TO line in its reason).
   #archiveSession(actor: ManagedActor, trigger: "requested" | "size" | "context", overflow = false, overflowRetry = false): void {
     const running = this.#runningActor(actor.id);
     if (this.#inFlight.has(actor.id) || running?.abortController || running?.inFlightRun) {
@@ -2803,6 +2806,7 @@ export class ActorManager {
       .filter((name) => name.startsWith(prefix) && name.endsWith(".bak") && !name.includes(".orphan-noheader"));
     let bytes = 0;
     let archived: string | null = null;
+    let sha256: string | null = null;
     try {
       bytes = fs.statSync(file).size;
       const stamp = new Date().toISOString().replace(/[-:.]/g, "");
@@ -2815,7 +2819,14 @@ export class ActorManager {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       archived = null;
     }
-    pruneActorSessionBackups(file);
+    // The displaced trace's full sha256: the integrity record of the backup until it moves into session-archive/.
+    if (archived) {
+      try { sha256 = sha256File(archived).sha256; }
+      catch (error) { diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor ${actor.name} session backup ${archived} not hashed: ${errorText(error)}`); }
+    }
+    const archivedTo = (pruneActorSessionBackups(file) ?? [])
+      .map(({ from, to, sha256: digest, bytes: size }) => ({ from, to, sha256: digest, bytes: size }));
+    const movedTo = archivedTo.map(({ to, sha256: digest }) => `\nMOVED-TO ${to} (sha256 ${digest})`).join("");
     // Publish a complete header by temp + rename before a future writer can append.
     this.#ensurePiSession(actor);
     // A Claude-runner actor resumes by runner session id: drop it, too.
@@ -2830,16 +2841,39 @@ export class ActorManager {
       direction: "out",
       source: "fabric-host",
       createdAt: Date.now(),
-      reason: trigger === "size"
+      reason: (trigger === "size"
         ? `session reset (size limit): ${bytes} bytes > ${this.#maxSessionBytes}`
         : trigger === "context"
         ? overflow ? overflowRetry ? "session reset (context overflow): retrying the event once on a fresh session"
             : "session reset (context overflow): failed item will not be replayed; next work starts on a fresh session"
           : `session reset (context window): last run used ${usage?.tokens} of ${usage?.contextWindow} tokens`
-        : "session reset (requested)",
-      data: { sessionReset: { trigger, bytes, archived, ...(trigger === "context" ? { overflow,
+        : "session reset (requested)") + movedTo,
+      data: { sessionReset: { trigger, bytes, archived, sha256, archivedTo, ...(trigger === "context" ? { overflow,
         ...(overflow ? { retry: overflowRetry } : {}), ...(usage ? { contextUsage: { tokens: usage.tokens, contextWindow: usage.contextWindow } } : {}) } : {}) } },
     });
+  }
+
+  /** smarty-dev#16444: before an actor tree is removed, its session traces move into
+   * `<meshRoot>/session-archive/<rootId>/<actorId>/` with a MANIFEST.jsonl. A failure is logged and thrown: the caller
+   * keeps the tree (fail closed) and the removal stays pending for a later attempt. */
+  #archiveTreeSessionTraces(tree: string, judgedAt: string, judged: fs.Stats, rootId: string, actorId: string): fs.Stats {
+    try {
+      const moved = archiveSessionTracesBeforeRemoval(tree, fleetSessionArchive(this.mesh.root, rootId, actorId),
+        { rootId, actorId, reason: "actor removal" });
+      if (moved.files.length + moved.directories.length === 0) return judged; // nothing moved: the judgment stands
+      // Only our own moves changed the tree since the judgment: the same inode, owner and type, and no trace left.
+      // ponytail: a trace created between this walk and verifiedRemove's own tree walk is the residual window; the
+      // actor is revoked and its runs joined, and verifiedRemove still refuses a changed top-level directory.
+      const again = fs.lstatSync(judgedAt, { throwIfNoEntry: false });
+      if (!again || again.dev !== judged.dev || again.ino !== judged.ino || again.uid !== judged.uid ||
+          (again.mode & 0o170000) !== (judged.mode & 0o170000)) throw new Error("the tree changed while its session traces were archived");
+      const left = sessionTracesUnder(tree);
+      if (left.files.length + left.archives.length > 0) throw new Error(`a session trace appeared while archiving: ${[...left.files, ...left.archives][0]}`);
+      return again;
+    } catch (error) {
+      diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor ${actorId} tree ${tree} kept: session traces not archived: ${errorText(error)}`);
+      throw new Error(`session traces not archived; tree kept: ${errorText(error)}`);
+    }
   }
 
   // A native Pi header is tiny; never read the multi-megabyte transcript just to validate it.
@@ -4079,6 +4113,7 @@ export class ActorManager {
       // A refusal keeps cleanup pending for a later remove or host start.
       let judged: fs.Stats | undefined;
       let location = cleanup.sessionDir;
+      let judgedAt = location;
       let parent: number | undefined;
       try {
         await deleteRootActorTree(this.mesh.root, rootId, async () => {
@@ -4094,6 +4129,10 @@ export class ActorManager {
           }
           if (tree?.status === "complete") return;
           if (!judged) return; // Only an untouched legacy obligation may be already gone.
+          // smarty-dev#16444 (R-keep-all-traces): after every final check (a kept tree keeps its traces in place) and
+          // right before the delete, each session trace in the tree moves into the fleet archive. A failed move throws:
+          // the tree is kept and the cleanup stays pending. The move changes the tree's mtime, so the same inode is judged again.
+          judged = this.#archiveTreeSessionTraces(location, judgedAt, judged, rootId, id);
           const result = verifiedRemove(location, judged, { deleter: "actor-tree",
             fallback: () => { fs.rmSync(cleanup.sessionDir, { recursive: true, force: true }); return true; } });
           if (!result.removed) {
@@ -4147,6 +4186,7 @@ export class ActorManager {
             judgmentPath = `/proc/self/fd/${parent}/./${path.basename(location)}`;
           }
           judged = fs.lstatSync(judgmentPath, { throwIfNoEntry: false });
+          judgedAt = judgmentPath;
           if (tree) {
             if (!judged) throw new Error("outstanding tree location is missing; manual recovery required");
             if (judged.dev !== tree.dev || judged.ino !== tree.ino || judged.uid !== tree.uid ||
@@ -4558,7 +4598,13 @@ export class ActorManager {
     );
     this.#registry.releaseReadCache();
     // Fenced like every whole-tree delete (smarty-dev#8090); without the fence the tree is kept, shutdown goes on.
-    await deleteRootActorTree(this.mesh.root, this.#rootId, () => fs.rmSync(this.#actorRoot, { recursive: true, force: true }))
+    // smarty-dev#16444 (R-keep-all-traces): the session traces move into the fleet archive first; a failed move keeps
+    // the whole tree (logged below), so no trace is ever deleted with it.
+    await deleteRootActorTree(this.mesh.root, this.#rootId, () => {
+      archiveRootSessionTraces(this.#actorRoot, fleetSessionArchive(this.mesh.root, this.#rootId),
+        { rootId: this.#rootId, reason: "root actor tree reset" });
+      fs.rmSync(this.#actorRoot, { recursive: true, force: true });
+    })
       .catch(error => diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor root ${this.#actorRoot} kept: ${errorText(error)}`));
   }
 

@@ -8,6 +8,7 @@ import * as offlineRemoval from "../src/actors/remove-offline.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import * as treeRemoval from "../src/storage/verified-remove.js";
+import { fleetSessionArchive } from "../src/storage/session-archive.js";
 import { actorTreeDeletionHooks, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { fixture, mainDirectory, type DeadRootFixture } from "./helpers/dead-root-fixture.js";
 
@@ -103,6 +104,15 @@ const bin = async (f: DeadRootFixture, action: "remove" | "stop", actor: string,
 };
 
 const ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"; // a 32-hex actor id never present in any registry
+
+/** smarty-dev#16444 (R-keep-all-traces): a removal moves the session trace into the fleet archive BEFORE its tree delete
+ * (here recorded, never performed); the moved bytes, read back from there. */
+const archivedSession = (meshRoot: string, rootId: string, actorId: string): string => {
+  const directory = fleetSessionArchive(meshRoot, rootId, actorId);
+  const name = fs.readdirSync(directory).find(entry => entry.endsWith(".jsonl") && entry !== "MANIFEST.jsonl")!;
+  return fs.readFileSync(path.join(directory, name), "utf8");
+};
+
 const NAME = "legacy-worker";
 
 /** The legacy shape: an empty session registry (row revoked), the actor tree with history and an unflagged
@@ -121,7 +131,8 @@ const seedLegacy = (f: DeadRootFixture, options: { rootId?: string } = {}) => {
   f.mainParticipant(Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS); // default record: pid 2147483647 never exists
   const registered = () => new ActorRegistryStore(sessionRoot).records().some(record => record.id === ID);
   const history = () => fs.readFileSync(path.join(tree, "session.jsonl"), "utf8");
-  return { sessionRoot, tree, marker, registered, history };
+  const archived = () => archivedSession(f.config.meshRoot, options.rootId ?? f.config.rootId, ID);
+  return { sessionRoot, tree, marker, registered, history, archived };
 };
 
 // Linux-only: the Main publication fence (real flock) is the availability requirement.
@@ -160,7 +171,8 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
       // The one tree delete was handed the judged inode of this exact tree, under the held fence, as a real apply.
       expect(judged).toEqual([{ target: path.resolve(s.tree), deleter: "actor-tree", dryRun: false, fenced: true,
         dev: tree.dev, ino: tree.ino, directory: true }]);
-      expect(s.history()).toBe("history\n"); // recorded, never performed
+      // smarty-dev#16444: the session moved into the fleet archive before the delete, which is recorded, never performed.
+      expect(s.archived()).toBe("history\n");
       expect(fs.readFileSync(path.join(s.tree, "history", "run.jsonl"), "utf8")).toBe("run\n");
       expect(fenced()).toBe(false);
     } finally { await f.close(); vi.restoreAllMocks(); } // guard kept through teardown
@@ -238,7 +250,8 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
       // The retry's one delete was handed this tree's judged inode under the held fence.
       expect(judged).toEqual([{ target: path.resolve(s.tree), deleter: "actor-tree", dryRun: false, fenced: true,
         dev: tree.dev, ino: tree.ino, directory: true }]);
-      expect(s.history()).toBe("history\n"); // recorded, never performed
+      // smarty-dev#16444: the session moved into the fleet archive before the delete, which is recorded, never performed.
+      expect(s.archived()).toBe("history\n");
       expect(fs.readFileSync(path.join(s.tree, "history", "run.jsonl"), "utf8")).toBe("run\n");
       expect(fenced()).toBe(false);
     } finally { if (mainOpen) await main.close(); await f.close(); vi.restoreAllMocks(); }

@@ -1076,7 +1076,8 @@ export class MeshStore {
    * settled; recovery requires matching machine identity and death/current-boot evidence.
    * Without boot identity, only ESRCH plus the custody staleness bound permits recovery. Without a
    * machine id (Windows, macOS, a Linux without one), a record naming this host whose PID is gone
-   * or now another process (another native incarnation) permits it (pi-fabric#1562; custody-lock.ts
+   * or now another process (another native incarnation) permits it; one with no or an invalid
+   * incarnation (a failed or not yet settled native read) only when its PID is gone (pi-fabric#1562; custody-lock.ts
    * clearDeadCustodyLock);
    * a missing owner pid is an alarmed typed refusal, never an ordinary busy timeout. */
   async leaseCustody<T>(file: string, operation: () => T | Promise<T>, lockTimeoutMs = 0,

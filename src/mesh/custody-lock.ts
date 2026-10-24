@@ -92,8 +92,9 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     : await ownProcessIncarnation().catch(() => undefined);
   const physical = options.hostQualified ? readPhysicalHostIdentity() : undefined;
   const machineId = physical?.machineId ?? (options.hostQualified ? readPhysicalMachineId() : undefined);
-  // Without a machine id, the host label (ownHostLabel): with the incarnation above, the proof a later process on this host
-  // needs to recover the gate after this one dies (clearDeadCustodyLock). Linux with a machine id writes what it always did.
+  // Without a machine id, the host label (ownHostLabel): the proof a later process on this host needs to recover the gate after
+  // this one dies (clearDeadCustodyLock), on ESRCH or, with the incarnation above, a reused PID. Without a valid incarnation
+  // (none passed, or the native read failed) only ESRCH recovers it. Linux with a machine id writes what it always did.
   const machineSlot = machineId ?? (options.hostQualified ? ownHostLabel() : undefined);
   // Protocol 3 (smarty-dev#9569): the holder's PID namespace on one more line (plain: 6 fields, hostQualified: 8),
   // so readers from before protocol 3, which accept only 4/5 or 7 fields, never reclaim it.
@@ -236,13 +237,17 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     // pi-fabric#1562 (review/astra P1): with no machine id here (Windows, macOS, a Linux without /etc/machine-id), the
     // mesh-wide host-lease additions gate (and every host-qualified gate) is recovered on the participant locks' process
     // proof instead (participant-files.ts holderAlive): the record names THIS host (ownHostLabel, so its holder had no
-    // machine id either) and carries a native incarnation of this platform; then its PID must be gone here (ESRCH) or now
-    // be another process (a different native incarnation), below. Unsure keeps the gate: another host, a machine id in the
-    // record, no or a foreign incarnation, a record from an older build (no label), a denied, unknown or timed-out native
-    // read, an equal one. Protocol 3 still refuses first (a Windows namespace never proves a holder dead).
+    // machine id either); then its PID must be gone here (ESRCH) or, with a native incarnation of this platform, now be
+    // another process (a different native incarnation), below. review-fleet-lead P1 on pi-fabric#1562: a record with no
+    // (or an invalid) incarnation was kept busy BEFORE the ESRCH probe, so its dead holder's gate was never recovered. An
+    // unfenced session runtime writes none until its own native read has settled (participant-directory.ts
+    // #leaseLockIncarnation), nor does a failed read. Like holderAlive (participant-files.ts), ESRCH recovers it; a live
+    // or EPERM PID has nothing to compare with and keeps it. Unsure keeps the gate: another host, a machine id in the
+    // record, a record from an older build (no label), a denied, unknown or timed-out native read, an equal one.
+    // Protocol 3 still refuses first (a Windows namespace never proves a holder dead).
     const hostLabel = hostQualified && !machineId ? ownHostLabel() : undefined;
     if (hostQualified && ((fields.length !== 7 && fields.length !== 8) || (machineId ? fields[4] !== machineId
-      : !hostLabel || fields[4] !== hostLabel || !validProcessIncarnation(recordedStart)))) return false;
+      : !hostLabel || fields[4] !== hostLabel))) return false;
     const bootKnown = hostQualified && physical !== undefined && validBootId(fields[5]);
     let previousBoot = bootKnown && fields[5] !== physical!.bootId;
     if (!token || !Number.isSafeInteger(pid) || pid <= 0 || !Number.isFinite(Number(createdText)) ||

@@ -82,7 +82,7 @@ import { ActorSessionResetCancelledError } from "../actors/session-reset-error.j
 import type { FabricActorInfo } from "../actors/types.js";
 import type { AgentRunRecord } from "../agents/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
-import { AgentManager } from "../agents/manager.js";
+import { AgentManager, rootRecordLastSeenMs } from "../agents/manager.js";
 import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 import { FabricTargetTerminalError, terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
 import { launchScope } from "../scope.js";
@@ -97,6 +97,7 @@ import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import { FabricControlPlane, controlOwnerIncarnation, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
+import { boundRootSessionCwd } from "../topology/root-session-cwd.js";
 import type { FabricTransport } from "../transport/types.js";
 import { hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
 import { RESIDENT_IDLE_EXIT_MS, FabricMeshTransportConfigError, normalizeFabricConfig, validateFabricNatsOperatorMachine } from "../config.js";
@@ -682,12 +683,10 @@ export class ResidentHost {
       kernel: () => currentConfig().kernel ?? config.kernel ?? "typescript",
       pythonRuntime: () => currentConfig().pythonRuntime ?? config.pythonRuntime ?? "monty",
       mainAgentId: config.rootId,
-      rootSessionCwd: () => {
-        const root = this.participants.get(config.rootId, undefined, { fresh: true });
-        return root?.kind === "root" && root.id === config.rootId && typeof root.cwd === "string" && root.cwd.trim().length > 0
-          ? root.cwd
-          : undefined;
-      },
+      // A short lapse of the root's lease falls back to its own last-known record (smarty-dev#16357).
+      rootSessionCwd: () => boundRootSessionCwd(this.participants, config.rootId),
+      // #16357: bounds an actor's stored exception lane to a root seen recently (or proven ended).
+      rootSessionLastSeenMs: () => rootRecordLastSeenMs(this.participants, config.rootId),
       fabricSessionId: config.sessionId,
       meshRoot: config.meshRoot,
       projectRoot: config.projectRoot,

@@ -966,21 +966,26 @@ export class SqliteStateStore {
     // ponytail: a nonempty db without its marker may be a concurrent creator between schema commit and
     // marker publication. Wait on its fence, then re-check; never adopt an unmarked db as a fresh one.
     if (initialize !== "create" && (requested === "detached" || readMeshStateMovedMarker(root))) {
-      return SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, initialize, initTimeoutMs);
+      return SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, initialize, false, initTimeoutMs);
     }
     // smarty-dev#6477 review round 2: "create" on a fresh root runs under the import's fence (custody.lock, then
     // .lock) from the re-checked guard through the db init to the marker, so a file-mode writer either commits
     // first (the guard below sees its state.json and refuses) or its fence check sees this state.db and refuses.
     // smarty-dev#8920: on Windows the root is created (and made private) before the fence, which would create it
-    // untracked. POSIX keeps the fence's own mkdir: nothing runs before it.
-    if (process.platform === "win32") createStateRoot(root);
+    // untracked. POSIX keeps the fence's own mkdir: nothing runs before it. Its advisory root snapshot is left to the
+    // gate's pre-create proof in #openAsync (gateFollows), and #openAsync does not create the root a second time.
+    const windows = process.platform === "win32";
+    if (windows) createStateRoot(root, { gateFollows: true });
     return holdMeshFence(root, { lockTimeoutMs: options.lockTimeoutMs ?? LOCK_TIMEOUT_MS }, () =>
-      SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested), initTimeoutMs));
+      SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested), windows, initTimeoutMs));
   }
 
+  // `rootCreated`: this caller already ran createStateRoot for this root (Windows, before the fence). A second call
+  // would add nothing: the gate's pre-create proof below re-checks the root's type and, natively, the whole plan.
   static async #openAsync(root: string, maxEventBytes: number, maxReadEvents: number, options: SqliteStateStoreOptions,
-    initialize: SqliteStateStoreOptions["initialize"], initTimeoutMs?: number): Promise<SqliteStateStore> {
-    createStateRoot(root);
+    initialize: SqliteStateStoreOptions["initialize"], rootCreated: boolean, initTimeoutMs?: number): Promise<SqliteStateStore> {
+    // smarty-dev#8920: openCreatingStateDb's gate takes this root's pre-create proof, so no advisory read here.
+    if (!rootCreated) createStateRoot(root, { gateFollows: true });
     const file = path.join(root, "state.db");
     const db = openCreatingStateDb(root, file, options.open ?? openNodeSqlite); // the one gate (smarty-dev#7548, pi-fabric#694 P2-E)
     const deadline = Date.now() + Math.max(0, initTimeoutMs ?? options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
@@ -1021,18 +1026,20 @@ export class SqliteStateStore {
     const initialize = guardBeforeOpen(root, requested);
     // As in open(), an unmarked db must wait for a creator's marker before it can be judged imported.
     if (initialize !== "create" && (requested === "detached" || readMeshStateMovedMarker(root))) {
-      return SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, initialize);
+      return SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, initialize, false);
     }
     // The same fence as open(), one synchronous attempt at the same two locks: a busy fence throws an
     // SQLITE_BUSY-coded MeshFenceBusyError, which callers retry like a busy database (see the contract above).
-    if (process.platform === "win32") createStateRoot(root); // smarty-dev#8920: before the fence, as in open()
+    const windows = process.platform === "win32";
+    if (windows) createStateRoot(root, { gateFollows: true }); // smarty-dev#8920: before the fence, as in open()
     return holdMeshFenceSync(root, 0, () =>
-      SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested)));
+      SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested), windows));
   }
 
+  // `rootCreated`: as in #openAsync.
   static #openSync(root: string, maxEventBytes: number, maxReadEvents: number, options: SqliteStateStoreOptions,
-    initialize: SqliteStateStoreOptions["initialize"]): SqliteStateStore {
-    createStateRoot(root);
+    initialize: SqliteStateStoreOptions["initialize"], rootCreated: boolean): SqliteStateStore {
+    if (!rootCreated) createStateRoot(root, { gateFollows: true }); // the gate's pre-create proof follows (#8920)
     const file = path.join(root, "state.db");
     const db = openCreatingStateDb(root, file, options.open ?? openNodeSqlite);
     try {
@@ -1380,7 +1387,10 @@ export class SqliteStateStore {
    * connection commits while it runs, and it writes nothing. It never waits asynchronously, so a
    * caller that holds `.lock` (lock order: `.lock`, then this) never waits for a SQLite writer while
    * holding `.lock`: a busy write lock throws `MeshLockTimeoutError` before `operation` runs, and
-   * the caller retries with `.lock` released. `operation` must be synchronous and must not call writers.
+   * the caller retries with `.lock` released. Held bridge ingress retains only its advisory initial
+   * event admission across proven pre-append refusals, bounded by twice the ordinary acquisition
+   * budget; all retry waits happen outside `.lock`. This fence remains synchronous and zero-wait.
+   * `operation` must be synchronous and must not call writers.
    */
   fenceSync<T>(operation: () => T, timing?: LockTimingContext): T {
     this.#assertOpen();

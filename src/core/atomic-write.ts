@@ -74,6 +74,7 @@ export const createProcessIncarnationReader = (options: {
 }) => {
   const { platform, systemRoot, run = runIncarnationCommand, timeoutMs = 2_000 } = options;
   let own: Promise<string | undefined> | undefined;
+  let ownKnown: string | undefined;
   const read = async (pid: number, remainingMs = timeoutMs): Promise<string | undefined> => {
     const budgetMs = Math.max(0, Math.min(timeoutMs, remainingMs));
     if (!Number.isSafeInteger(pid) || pid <= 0 || budgetMs <= 0) return undefined;
@@ -115,7 +116,9 @@ export const createProcessIncarnationReader = (options: {
     read,
     // This PID's creation identity cannot change during our lifetime. UNKNOWN is safe
     // for publication too: it can never justify recovering a live holder.
-    own: (): Promise<string | undefined> => own ??= read(process.pid),
+    own: (): Promise<string | undefined> => own ??= read(process.pid).then(value => (ownKnown = value)),
+    /** own()'s settled value, if a read already settled. Never starts or awaits one. */
+    known: (): string | undefined => ownKnown,
   };
 };
 
@@ -135,6 +138,9 @@ const nativeReader = () => {
 export const processIncarnation = (pid: number, timeoutMs?: number): Promise<string | undefined> => nativeReader().read(pid, timeoutMs);
 /** Memoized lazily, not at import/registration/session start. */
 export const ownProcessIncarnation = (): Promise<string | undefined> => nativeReader().own();
+/** This process's own identity if an ownProcessIncarnation() read has already settled; undefined otherwise. Never starts or
+ * awaits a native read, so a path that must not wait on one (an unfenced host-lease renewal) can still record it. */
+export const knownOwnProcessIncarnation = (): string | undefined => nativeReader().known();
 
 /** Why the last stale check left a holder alone (smarty-dev#9569): its namespace is foreign or unprovable. */
 export interface StaleLockNote { verdict?: "foreign" | "unproven"; namespace?: string; token?: string }

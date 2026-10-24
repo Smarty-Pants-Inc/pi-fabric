@@ -1,5 +1,6 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout, MeshSnapshotRetriesExhaustedError,
   MESH_INCARNATION_PENDING_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE, MESH_LOCK_TIMEOUT_CODE, meshDeferredSummary } from "../core/atomic-write.js";
 import { performance as monotonicClock } from "node:perf_hooks";
@@ -16,7 +17,8 @@ import { participantFilePresent, readParticipantFiles, withParticipantFileDirect
 import { participantFromEntry } from "../topology/participant-directory.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshStateEntry, type MeshStore } from "./store.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
-import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateWalCap } from "./state-backend.js";
+import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
+import { MeshLockQueueExpiredError, withInitialMeshLockAdmission, type InitialMeshLockDiagnostics } from "./mesh-lock.js";
 import { BridgeDeliveryAgeMonitor, type BridgeDeliveryAgeAlarm } from "./bridge-delivery-age.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
@@ -136,10 +138,25 @@ export class BridgeStartDeadlineError extends Error {
     this.name = "BridgeStartDeadlineError";
   }
 }
+// Legacy RPC keeps the timeout code and adds exactly one wrapper to the constructor's message.
+// Require that whole envelope, never a marker embedded in arbitrary timeout, path or WAL text.
+const isMeshQueueExpiry = (error: unknown): boolean => {
+  try {
+    if (error instanceof MeshLockQueueExpiredError) return true;
+    if (!isMeshLockTimeout(error)) return false;
+    const message = error.message;
+    return typeof message === "string" &&
+      /^Bridge agent: FABRIC_MESH_LOCK_QUEUE_EXPIRED \(code FABRIC_MESH_LOCK_TIMEOUT\): Fabric mesh lock [\s\S]+ expired in the FIFO queue before its turn, (?:(?:0|[1-9]\d*) waiters ahead|waiter count unavailable), waited (?:0|[1-9]\d*)(?:\.\d+)?(?:e[+-]?\d+)? ms(?![\s\S])/.test(message);
+  } catch { return false; }
+};
 const meshBusyLabel = (error: unknown): string =>
-  isMeshIncarnationPending(error) ? "mesh incarnation pending"
+  isMeshQueueExpiry(error) ? "mesh pre-lock queue expiry"
+    : isMeshIncarnationPending(error) ? "mesh incarnation pending"
     : isMeshSnapshotRetriesExhausted(error) ? "mesh snapshot retries exhausted"
       : isMeshStateWalCap(error) ? "mesh state WAL cap" : "mesh lock timeout";
+// Diagnostic context belongs to one live local-target direction pass, never a wire/global observer.
+const bridgeIngressDiagnostics = new AsyncLocalStorage<{ target: BridgeSide; active: boolean;
+  report: (diagnostics: InitialMeshLockDiagnostics) => void }>();
 const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 /** A read page's event bytes stay under this, well inside one frame with its JSON envelope. */
 export const BRIDGE_PAGE_BYTES = 8 * 1024 * 1024;
@@ -1022,9 +1039,9 @@ export class StoreBridgeSide implements BridgeSide {
     let eventsNext = false;
     let retryMs = LOCK_RETRY_MIN_MS;
     let baseline: ReturnType<typeof snapshot> | undefined;
-    // File snapshots are private, copy-on-write parses. Observe their read-only entries once,
-    // instead of cloning the whole topology for each projection on every catch-up notification.
-    // Cache content by object, never by version: legacy writers can reuse revision labels.
+    // File snapshots are private, copy-on-write parses: reuse their read-only entries.
+    // Other backends use detached prefix reads, reused only within one snapshot.
+    // Cache file content by object, never by version: legacy writers can reuse revision labels.
     const fileState = this.store.stateBackend === "file";
     const digests = new WeakMap<object, string>();
     const fingerprint = (value: object): string => {
@@ -1034,13 +1051,14 @@ export class StoreBridgeSide implements BridgeSide {
     };
     const snapshot = () => {
       const leases = readHostLeases(this.store.root);
-      const hostEntries = fileState ? this.store.listAllShared(HOST_PREFIX, { fresh: true }) : undefined;
-      const participantEntries = fileState ? this.store.listAllShared(PARTICIPANT_PREFIX, { fresh: true }) : undefined;
+      const hostEntries = fileState ? this.store.listAllShared(HOST_PREFIX, { fresh: true })
+        : this.store.listAll(HOST_PREFIX, { fresh: true });
+      const participantEntries = fileState ? this.store.listAllShared(PARTICIPANT_PREFIX, { fresh: true })
+        : this.store.listAll(PARTICIPANT_PREFIX, { fresh: true });
       // Include held projection existence/content, so an external prune/lease removal repairs
       // without waiting for traffic. Exclude our renewal fields: our own mirror writes then
       // cause at most one settling pass, never a self-sustaining lease-write feedback loop.
-      const mirrored = [...(hostEntries ?? this.store.listAll(HOST_PREFIX, { fresh: true })),
-        ...(participantEntries ?? this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }))]
+      const mirrored = [...hostEntries, ...participantEntries]
         .filter(entry => mirrorLinkOf(entry.value) === this.peer)
         .map(entry => {
           const host = hostOf(entry.key, entry.value);
@@ -1051,12 +1069,12 @@ export class StoreBridgeSide implements BridgeSide {
             ...(host ? { lease: lease ? { id: lease.id, rootId: lease.rootId, identityId: lease.identityId,
               startedAt: lease.startedAt, incarnationToken: lease.incarnationToken } : null } : {}) };
         }).sort((a, b) => a.key.localeCompare(b.key));
-      const native = hostEntries && participantEntries ? this.#presence(hostEntries,
+      const native = this.#presence(hostEntries,
         [...participantEntries, ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })],
-        this.store.listAllShared(BRIDGE_HANDOFF_PREFIX, { fresh: true })) : this.#presenceSnapshot();
+        fileState ? this.store.listAllShared(BRIDGE_HANDOFF_PREFIX, { fresh: true })
+          : this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true }), leases);
       // Other links' mirror additions/removals must wake the hub's exporting links.
-      const relays = [...(hostEntries ?? this.store.listAll(HOST_PREFIX, { fresh: true })),
-        ...(participantEntries ?? this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }))]
+      const relays = [...hostEntries, ...participantEntries]
         .filter(entry => remoteHostOf(entry.value) !== undefined && mirrorLinkOf(entry.value) !== this.peer)
         .map(entry => ({ key: entry.key, value: entry.key.startsWith(HOST_PREFIX) && isObject(entry.value)
           ? settled(entry.value) : fileState && isObject(entry.value) ? fingerprint(entry.value) : entry.value, updatedBy: entry.updatedBy }));
@@ -1146,15 +1164,19 @@ export class StoreBridgeSide implements BridgeSide {
     };
   }
 
-  #presence(hostEntries: readonly MeshStateEntry[], participantEntries: readonly MeshStateEntry[], handoffEntries: readonly MeshStateEntry[]): BridgePresence {
-    return this.#scan(hostEntries, participantEntries, handoffEntries).presence;
+  #presence(
+    hostEntries: readonly MeshStateEntry[], participantEntries: readonly MeshStateEntry[], handoffEntries: readonly MeshStateEntry[],
+    leases?: ReadonlyMap<string, FabricHostLease>,
+  ): BridgePresence {
+    return this.#scan(hostEntries, participantEntries, handoffEntries, leases).presence;
   }
 
   #scan(
     hostEntries: readonly MeshStateEntry[], participantEntries: readonly MeshStateEntry[], handoffEntries: readonly MeshStateEntry[],
+    capturedLeases?: ReadonlyMap<string, FabricHostLease>,
   ): { presence: BridgePresence; voided: MeshStateEntry[]; leases: ReadonlyMap<string, FabricHostLease>; now: number } {
     const now = this.now();
-    const leases = readHostLeases(this.store.root);
+    const leases = capturedLeases ?? readHostLeases(this.store.root);
     const handoffs = bridgeHandoffScope(handoffEntries, hostEntries, participantEntries, () => leases, now, this.peer);
     const reserved = new Set<string>(handoffs.reserved);
     // Only a handoff in force to this link waives a (dead) native's own ids (smarty-dev#9074).
@@ -1244,11 +1266,34 @@ export class StoreBridgeSide implements BridgeSide {
     return [...this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }), ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })];
   }
 
-  // Do not retry a busy SQLite ownership fence inside bridge publication: failure guarantees no append.
-  // Let the per-direction loop back off with .lock released instead of reacquiring ahead of queued writers.
-  async publish(event: BridgePublish, held: string[] = [], fromHub = false): Promise<{ sequence: number }> {
+  readonly #ingressAbort = new AbortController();
+  readonly #preAppendRefusals = new WeakSet<Error>();
+
+  // Retain advisory admission only for a held publication's designated initial event lock.
+  // EventLog irrevocably consumes it before recovery/append; receipt locks keep ordinary bounds.
+  async #publishHeld<T>(operation: () => Promise<T>, held: boolean): Promise<T> {
     await this.store.prepareLock();
-    const published = await this.store.publish(this.#publication(event, held, fromHub));
+    if (!held || this.store.tryLockBudgetMs !== undefined) return operation();
+    const diagnostics = bridgeIngressDiagnostics.getStore();
+    return withInitialMeshLockAdmission(this.store.root, operation, {
+      signal: this.#ingressAbort.signal,
+      isPreAppendRefusal: error => {
+        if (!(error instanceof Error)) return false;
+        const refused = this.#preAppendRefusals.has(error);
+        this.#preAppendRefusals.delete(error);
+        return refused;
+      },
+      ...(diagnostics?.active && diagnostics.target === this ? {
+        onDiagnostics: (summary: InitialMeshLockDiagnostics) => {
+          if (diagnostics.active) diagnostics.report(summary);
+        },
+      } : {}),
+    });
+  }
+
+  async publish(event: BridgePublish, held: string[] = [], fromHub = false): Promise<{ sequence: number }> {
+    const input = this.#publication(event, held, fromHub);
+    const published = await this.#publishHeld(() => this.store.publish(input), held.length > 0);
     return { sequence: published.sequence };
   }
 
@@ -1266,22 +1311,21 @@ export class StoreBridgeSide implements BridgeSide {
     }
     // The dedupe receipt stores this envelope too: NEVER pass the command body to store.publish.
     const key = `${RELAY_RECEIPT_PREFIX}${encodeURIComponent(this.peer)}:${encodeURIComponent(stamp.id)}`;
-    await this.store.prepareLock();
-    const published = await this.store.publish({
+    const input: MeshPublishInput = {
       id: key, dedupeKey: key, topic: checked.topic, kind: checked.kind,
       from: { ...checked.from, verified: "bridge" }, to: checked.to, durable: true,
       ...this.#heldFence([...new Set([checked.from.id, ...held])], checked.from),
       // createdAt is stamped by the host store at commit; no data/text/message/principal.
-    });
+    };
+    const published = await this.#publishHeld(() => this.store.publish(input), true);
     return { sequence: published.sequence };
   }
 
   async publishBatch(events: Array<{ event: BridgePublish; held?: string[] }>, fromHub = false): Promise<Array<{ sequence: number }>> {
-    await this.store.prepareLock();
-    const published = await this.store.publishBatch(
-      events.map(({ event, held }) => this.#publication(event, held ?? [], fromHub)),
-      { operation: "bridge-event-batch", phase: "event-batch" },
-    );
+    const inputs = events.map(({ event, held }) => this.#publication(event, held ?? [], fromHub));
+    const published = await this.#publishHeld(
+      () => this.store.publishBatch(inputs, { operation: "bridge-event-batch", phase: "event-batch" }),
+      inputs.some(input => input.fence !== undefined));
     return published.map(({ sequence }) => ({ sequence }));
   }
 
@@ -1305,8 +1349,9 @@ export class StoreBridgeSide implements BridgeSide {
     if (this.#staleAdmission) throw this.#staleAdmission;
     const checked = checkBridgePublish(event);
     const stamp = checked.data.bridge;
-    const data = { ...checked.data, bridge: fromHub && stamp.via === this.peer
-      ? stamp : { from: this.peer, id: stamp.id } };
+    // Capture caller-owned bytes once, before any admission/retry wait.
+    const data = JSON.parse(JSON.stringify({ ...checked.data, bridge: fromHub && stamp.via === this.peer
+      ? stamp : { from: this.peer, id: stamp.id } })) as BridgePublish["data"];
     return {
       ...checked,
       // The cursor advances only after the destination confirms its append durably.
@@ -1378,22 +1423,33 @@ export class StoreBridgeSide implements BridgeSide {
    * taking the fence (refusing is fail-closed; the caller's one refresh-and-retry still applies). The file
    * backend (no state revision) keeps the full check in its `.lock` passthrough fence, unchanged.
    */
-  #heldFence(held: readonly string[], from: MeshIdentity): Pick<MeshPublishInput, "fence" | "admit"> {
+  #heldFence(held: readonly string[], from: MeshIdentity): Pick<MeshPublishInput, "fence" | "admit" | "signal"> {
+    held = [...held];
     const identityOf = (id: string): MeshIdentity | undefined => id === from.id ? from : undefined;
     return {
+      signal: this.#ingressAbort.signal,
       fence: <R>(commit: () => R): R => {
-        for (let attempt = 0; ; attempt += 1) {
-          const observed = attempt < HELD_FENCE_ATTEMPTS - 1 ? this.#heldObservation(held, from) : undefined;
-          const outcome = this.store.withStateWriteFence(() => {
-            if (observed !== undefined) {
-              if (!(observed.until > this.now() && this.store.stateUnchangedSince(observed.revision, HELD_STATE_PREFIXES) &&
-                this.#heldFiles(held, observed.leasesAll) === observed.files)) return HELD_FENCE_STALE;
-              for (const id of held) this.#proven.set(id, identityOf(id));
-            }
-            try { return { value: commit() }; }
-            finally { this.#proven.clear(); }
-          }, { operation: "bridge-notification-fence", phase: "notification-fence" });
-          if (outcome !== HELD_FENCE_STALE) return outcome.value;
+        let entered = false;
+        try {
+          for (let attempt = 0; ; attempt += 1) {
+            this.#ingressAbort.signal.throwIfAborted();
+            if (this.#staleAdmission) throw this.#staleAdmission;
+            const observed = attempt < HELD_FENCE_ATTEMPTS - 1 ? this.#heldObservation(held, from) : undefined;
+            const outcome = this.store.withStateWriteFence(() => {
+              if (observed !== undefined) {
+                if (!(observed.until > this.now() && this.store.stateUnchangedSince(observed.revision, HELD_STATE_PREFIXES) &&
+                  this.#heldFiles(held, observed.leasesAll) === observed.files)) return HELD_FENCE_STALE;
+                for (const id of held) this.#proven.set(id, identityOf(id));
+              }
+              entered = true;
+              try { return { value: commit() }; }
+              finally { this.#proven.clear(); }
+            }, { operation: "bridge-notification-fence", phase: "notification-fence" });
+            if (outcome !== HELD_FENCE_STALE) return outcome.value;
+          }
+        } catch (error) {
+          if (!entered && isMeshStateBusy(error)) this.#preAppendRefusals.add(error);
+          throw error;
         }
       },
       admit: () => {
@@ -1523,6 +1579,7 @@ export class StoreBridgeSide implements BridgeSide {
 
   async fence(): Promise<void> {
     this.#fenced = true;
+    this.#ingressAbort.abort(new BridgeOwnershipError(`Bridge link ${this.peer} is fenced`));
     await this.#inflight;
   }
 
@@ -4229,7 +4286,33 @@ export class MeshBridge {
   async #directionLoop(direction: Direction, running: () => boolean): Promise<void> {
     let retryMs = LOCK_RETRY_MIN_MS;
     let walCapDelay: number | undefined;
-    let reported = false; // one log line per busy streak, as run() logs its own
+    let busy: { count: number; started: number; reportedAt: number; first: string; last: string;
+      retainedOffLockMs: number } | undefined;
+    let recoveredIngress = { fenceRefusals: 0, retainedOffLockMs: 0 };
+    let ingressReportedAt = -Infinity;
+    const logBusy = (message: string): void => {
+      try { this.#log(message); } catch { /* diagnostics cannot change direction policy */ }
+    };
+    const reportRecoveredIngress = (final = false): void => {
+      if (!recoveredIngress.fenceRefusals) return;
+      const now = monotonicClock.now();
+      if (!final && now - ingressReportedAt < 10_000) return;
+      logBusy(`bridge ingress busy streak recovered (toLocal); ${recoveredIngress.fenceRefusals} fence refusals; ` +
+        `retainedOffLockMs=${Math.max(0, Math.round(recoveredIngress.retainedOffLockMs))}`);
+      recoveredIngress = { fenceRefusals: 0, retainedOffLockMs: 0 };
+      ingressReportedAt = now;
+    };
+    const finishBusy = (outcome: "recovered" | "terminal" | "stopped", failedIngress?: InitialMeshLockDiagnostics): void => {
+      if (!busy) {
+        if (failedIngress?.fenceRefusals) logBusy(`bridge ingress busy streak ${outcome} (toLocal); ` +
+          `${failedIngress.fenceRefusals} fence refusals; retainedOffLockMs=${Math.max(0, Math.round(failedIngress.retainedOffLockMs))}`);
+        return;
+      }
+      logBusy(`bridge busy streak ${outcome} (${direction}); ${busy.count} failed direction attempts, ` +
+        `elapsed ${Math.max(0, Math.round(monotonicClock.now() - busy.started))} ms; first=${busy.first}; last=${busy.last}; ` +
+        `retainedOffLockMs=${Math.max(0, Math.round(busy.retainedOffLockMs))}`);
+      busy = undefined;
+    };
     while (running()) {
       const wakeReason = this.#directionWakeReason[direction];
       delete this.#directionWakeReason[direction];
@@ -4247,8 +4330,21 @@ export class MeshBridge {
       const presenceVersion = this.#presenceVersion;
       let delay: number | undefined;
       let delayReason: DirectionWakeReason = "other";
+      const ingress = { retainedOffLockMs: 0, fenceRefusals: 0, recovered: false };
+      const diagnostics = { target: this.options.local, active: true, report: (summary: InitialMeshLockDiagnostics): void => {
+        ingress.retainedOffLockMs += summary.retainedOffLockMs;
+        if (summary.recovered) {
+          recoveredIngress.fenceRefusals += summary.fenceRefusals;
+          recoveredIngress.retainedOffLockMs += summary.retainedOffLockMs;
+        } else ingress.fenceRefusals += summary.fenceRefusals;
+      } };
       try {
-        await this.#direction(direction);
+        try {
+          if (direction === "toLocal") await bridgeIngressDiagnostics.run(diagnostics, () => this.#direction(direction));
+          else await this.#direction(direction);
+        } finally { diagnostics.active = false; }
+        reportRecoveredIngress();
+        if (busy) busy.retainedOffLockMs += ingress.retainedOffLockMs;
         if (wakeReason === "safety" && retainedBefore !== undefined && retainedBefore > cursorBefore &&
             (this.#cursor?.[direction].after ?? cursorBefore) >= retainedBefore) {
           this.#unaddressed.safety += 1;
@@ -4256,7 +4352,7 @@ export class MeshBridge {
         }
         retryMs = LOCK_RETRY_MIN_MS;
         walCapDelay = undefined;
-        reported = false;
+        finishBusy("recovered");
         // ponytail: back off only retained work to recover a missed notification without idle polling.
         const membershipRetryAt = this.#membershipRetryAt[direction];
         if (membershipRetryAt !== undefined) {
@@ -4272,8 +4368,12 @@ export class MeshBridge {
           if (delay === undefined || pollDelay < delay) { delay = pollDelay; delayReason = "other"; }
         }
       } catch (error) {
-        if (!running()) return;
+        reportRecoveredIngress();
+        if (busy) busy.retainedOffLockMs += ingress.retainedOffLockMs;
+        if (!running()) { reportRecoveredIngress(true); finishBusy("stopped", ingress); return; }
         if (isIdempotencyKeyReused(error) || !isBridgeRetryable(error)) {
+          reportRecoveredIngress(true);
+          finishBusy("terminal", ingress);
           this.#notificationError ??= error instanceof Error ? error : new Error(String(error));
           this.#wake?.();
           return;
@@ -4284,20 +4384,46 @@ export class MeshBridge {
         this.#directionBackoff[direction] = !(this.#directionMirrorBackoff[direction] && this.#presenceVersion !== presenceVersion);
         if (error instanceof BridgeMirrorDeferredError || isMeshStateWalCap(error))
           delay = walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
+        else if (isMeshQueueExpiry(error)) delay = 0; // yield, but never penalize pre-lock queue expiry
         else {
           // Equal jitter over the upper half of a capped exponential delay spreads independent bridges
           // without retrying sooner than the original deterministic backoff.
           const cap = Math.min(retryMs * 4, LOCK_RETRY_MAX_MS);
           delay = Math.floor(cap / 2 + Math.random() * cap / 2);
         }
-        retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
-        if (!reported) {
-          this.#log(`${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error)} (${direction}); retrying in ${delay} ms: ${meshDeferredSummary(error)}`);
-          reported = true;
+        if (!isMeshQueueExpiry(error)) retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
+        const now = monotonicClock.now();
+        const label = error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error);
+        busy ??= { count: 0, started: now, reportedAt: -Infinity, first: label, last: label,
+          retainedOffLockMs: ingress.retainedOffLockMs };
+        busy.count += 1;
+        busy.last = label;
+        if (now - busy.reportedAt >= (isMeshStateWalCap(error) ? WAL_CAP_LOG_MS : 10_000)) {
+          // The shared helper projects typed WAL facts, but passes other errors' free text through.
+          // Never retain owner, fence, recovery or path text in this streak's diagnostics.
+          let detail = label;
+          try {
+            if (isMeshStateWalCap(error)) detail = meshDeferredSummary(error);
+            else if (isMeshLockTimeout(error)) {
+              // Legacy RPC remaps WAL refusals to timeout, retaining only the projected message.
+              // Accept one exact optional RemoteBridgeSide wrapper around the entire numeric/count-only
+              // shape, then re-project parsed numbers; never copy text or affect retry/wire decisions.
+              const message = error.message;
+              const wal = typeof message === "string" && message.length <= 512
+                ? /^(?:Bridge agent: )?FABRIC_MESH_STATE_WAL_CAP(?:: the SQLite WAL is (\d+(?:\.\d+)?(?:e[+-]?\d+)?) bytes, above the (\d+(?:\.\d+)?(?:e[+-]?\d+)?)-byte cap| \(sizes not available\)); (\d+|unknown) WAL reader\(s\)(?![\s\S])/.exec(message)
+                : null;
+              if (wal) detail = meshDeferredSummary(Object.assign(new Error(), { code: "FABRIC_MESH_STATE_WAL_CAP",
+                walBytes: Number(wal[1]), capBytes: Number(wal[2]), readerCount: Number(wal[3]) }));
+            }
+          } catch { /* projection is diagnostic-only; retain the fixed label on failure */ }
+          logBusy(`${label} (${direction}); retrying in ${delay} ms; ${busy.count} failed direction attempts, ` +
+            `elapsed ${Math.max(0, Math.round(now - busy.started))} ms; first=${busy.first}; last=${busy.last}; ` +
+            `retainedOffLockMs=${Math.max(0, Math.round(busy.retainedOffLockMs))}: ${detail}`);
+          busy.reportedAt = now;
         }
       }
       delete this.#membershipAttempt[direction];
-      if (!running()) return;
+      if (!running()) { reportRecoveredIngress(true); finishBusy("stopped"); return; }
       if (this.#directionPending[direction] && !this.#directionBackoff[direction]) continue;
       await new Promise<void>((resolve) => {
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -4317,6 +4443,8 @@ export class MeshBridge {
         if (graceAt !== undefined) graceTimer = setTimeout(() => wake("grace"), Math.min(Math.max(0, graceAt - Date.now()), 2_147_483_647));
       });
     }
+    reportRecoveredIngress(true);
+    finishBusy("stopped");
   }
 
   async #forward(

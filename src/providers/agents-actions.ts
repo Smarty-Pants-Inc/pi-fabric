@@ -83,7 +83,7 @@ const runProperties = {
   timeoutMs: {
     type: "number",
     description:
-      "Optional longer wall-clock limit in milliseconds. Omit to use agents.timeoutMs (60 minutes by default); values below the configured default are ignored.",
+      "Optional hard wall-clock limit in milliseconds for lane/audit timeboxes, capped at 86400000 (24 hours). One-shot tasks may shorten agents.timeoutMs only with values >=300000 (5 minutes); smaller shortenings are ignored with a typed timeoutNote to protect real work from tiny model-chosen budgets. Omit to keep agents.timeoutMs (24 hours by default). Persistent actor overrides only extend their default.",
   },
   extensions: { type: "boolean" },
   recursive: { type: "boolean" },

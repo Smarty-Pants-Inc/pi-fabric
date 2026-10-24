@@ -13,7 +13,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
-import { AgentManager } from "../src/agents/manager.js";
+import { AgentManager, rootRecordLastSeenMs } from "../src/agents/manager.js";
 import { admitModelException, type ModelExceptionEntry } from "../src/agents/model-policy-log.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
@@ -36,6 +36,10 @@ type RootRecord = { kind: "root" | "agent"; id: string; cwd: string };
 class FakeParticipantDirectory {
   readonly records = new Map<string, RootRecord>();
   readonly stale = new Set<string>();
+  /** #16357: how long ago a stale record's owner lease lapsed (lastKnown); 1 min unless set. */
+  readonly lapsedMs = new Map<string, number>();
+  /** #16357: roots with a clean lineage-close receipt (lineageAlive false once their record is gone). */
+  readonly closed = new Set<string>();
   failure: Error | undefined;
   /** Fails exactly one later fresh read (1 = the next one), then reads normally again. */
   failReadIn: number | undefined;
@@ -49,6 +53,15 @@ class FakeParticipantDirectory {
     }
     if (options.fresh && this.stale.has(id)) return undefined;
     return this.records.get(id);
+  }
+  lastKnown(id: string): { participant: RootRecord; lapsedMs: number } | undefined {
+    if (this.failure) throw this.failure;
+    const participant = this.records.get(id);
+    return participant && this.stale.has(id) ? { participant, lapsedMs: this.lapsedMs.get(id) ?? 60_000 } : undefined;
+  }
+  lineageAlive(id: string): boolean {
+    if (this.failure) throw this.failure;
+    return this.records.has(id) || !this.closed.has(id);
   }
 }
 
@@ -104,7 +117,9 @@ function fixture(grants: (rootCwd: string) => ModelExceptionEntry[] = rootCwd =>
         const record = participants.get(ROOT_ID, undefined, { fresh: true });
         return record?.kind === "root" && record.id === ROOT_ID && typeof record.cwd === "string" && record.cwd.trim().length > 0
           ? record.cwd : undefined;
-      } }),
+      },
+      // #16357: the same host wiring (src/residency/host.ts), so the stored lane is bounded by the root's age.
+      rootSessionLastSeenMs: () => rootRecordLastSeenMs(participants as unknown as Parameters<typeof rootRecordLastSeenMs>[0], ROOT_ID) }),
     });
     const runs: Array<{ actorName: string | undefined; status: string; model: string | undefined }> = [];
     const realRun = agents.run.bind(agents);
@@ -137,9 +152,10 @@ function fixture(grants: (rootCwd: string) => ModelExceptionEntry[] = rootCwd =>
 const denialOf = (error: unknown): string | undefined => (error as { denial?: string } | undefined)?.denial;
 
 describe.runIf(hasPosixTrustMetadata)("actor exception lane captured at creation (smarty-dev#16357)", () => {
+  // #16357 (P2-2): a missing record is no longer "unavailable but present"; it never uses the stored
+  // lane (tests/actor-exception-lane-bounds.test.ts). A stale record seen within the limit still does.
   it.each([
     ["stale", (f: ReturnType<typeof fixture>) => { f.participants.stale.add(ROOT_ID); }],
-    ["missing", (f: ReturnType<typeof fixture>) => { f.participants.records.delete(ROOT_ID); }],
   ] as const)("prepares with the lane persisted at creation when the root record is %s at preparation", async (_label, makeUnavailable) => {
     const f = fixture();
     const first = f.start();
@@ -319,13 +335,16 @@ describe.runIf(hasPosixTrustMetadata)("exception lane decision table (smarty-dev
 
   it("turns an unresolvable lane only into this root's persisted lane or a lane-unresolved refusal", () => {
     const { f, ours, mainOracle } = tableFixture();
-    const unresolvable: Array<[string, () => void]> = [
-      ["stale record", () => { f.participants.stale.add(ROOT_ID); }],
-      ["missing record", () => { f.participants.records.delete(ROOT_ID); }],
-      ["lookup error", () => { f.participants.failure = new MeshReadError(); }],
-      ["relative cwd", () => { f.participants.records.set(ROOT_ID, { kind: "root", id: ROOT_ID, cwd: "lanes/lane-a" }); }],
+    // #16357 (P2-2): `stands` says whether the root is proven present and seen within the limit, the only
+    // case where the persisted lane may stand in. A missing record (no close receipt) or a failed lookup
+    // proves nothing about the root: no stored lane, still the retryable lane-unresolved refusal.
+    const unresolvable: Array<[string, () => void, boolean]> = [
+      ["stale record", () => { f.participants.stale.add(ROOT_ID); }, true],
+      ["missing record", () => { f.participants.records.delete(ROOT_ID); }, false],
+      ["lookup error", () => { f.participants.failure = new MeshReadError(); }, false],
+      ["relative cwd", () => { f.participants.records.set(ROOT_ID, { kind: "root", id: ROOT_ID, cwd: "lanes/lane-a" }); }, true],
     ];
-    for (const [label, makeUnresolvable] of unresolvable) {
+    for (const [label, makeUnresolvable, stands] of unresolvable) {
       f.participants.records.set(ROOT_ID, { kind: "root", id: ROOT_ID, cwd: f.rootCwd });
       f.participants.stale.clear();
       f.participants.failure = undefined;
@@ -336,7 +355,7 @@ describe.runIf(hasPosixTrustMetadata)("exception lane decision table (smarty-dev
         const result = ours(persisted);
         const sameRoot = persisted?.rootId === ROOT_ID;
         // Never wider: exactly the outcome a fresh read of the persisted lane would give, and only for this root.
-        const expected = sameRoot ? mainOracle(path.join(f.root, "lanes", persisted.lane)) : { allowed: false, denial: "lane-unresolved" };
+        const expected = sameRoot && stands ? mainOracle(path.join(f.root, "lanes", persisted.lane)) : { allowed: false, denial: "lane-unresolved" };
         expect(result, `${label} persisted=${JSON.stringify(persisted)}`).toEqual(expected);
       }
     }

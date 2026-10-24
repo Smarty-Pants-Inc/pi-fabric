@@ -9,16 +9,14 @@ import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { openPrivateStateDb } from "../src/mesh/state-gate.js";
 import { openNodeSqlite, raiseCheckpointFlag, SqliteStateStore } from "../src/mesh/state-sqlite.js";
-import { defaultProfileDirectory } from "./helpers/default-profile.js";
 import { aclOwner, icaclsGrant, icaclsShow, readAcl, setOwner, tokenSids } from "./helpers/windows-acl.js";
 
 // smarty-dev#8920: Windows ACL privacy of the SQLite mesh state root, its state files, its flag directory and its
 // ancestors, proved on real NTFS ACLs (icacls grants, Get-Acl/icacls read-back) with the real node:sqlite opener.
 // No ACL mocks: the native-cache tests use only a call-through process-count spy. Hosted-only: fixtures live in a
-// private directory below the runner's DEFAULT USERPROFILE (not TMPDIR, whose RUNNER_TEMP ancestors are not a
-// profile), so local runs never create or delete them. That profile is the OS's (os.userInfo().homedir), not the
-// fleet USERPROFILE that test isolation points inside TMPDIR (pi-fabric#1562; tests/helpers/default-profile.ts).
-// The profile and its system ancestors are never modified; every grant is on a fixture directory created by this suite.
+// private directory below the runner's DEFAULT profile as the OS reports it (os.userInfo().homedir), not TMPDIR, whose
+// RUNNER_TEMP ancestors are not a profile, so local runs never create or delete them. The profile and its
+// system ancestors are never modified; every grant is on a fixture directory created by this suite.
 //
 // Policy (fabric-store ruling): root, state.db/-wal/-shm and the flag directory refuse any foreign
 // write/modify/full/delete/WRITE_DAC/WRITE_OWNER ACE; owner must be the current user, or Administrators only when
@@ -56,9 +54,29 @@ afterEach(() => {
   vi.unstubAllEnvs();
   for (const dir of created.splice(0).reverse()) fs.rmSync(dir, { recursive: true, force: true });
 });
+const within = (parent: string, child: string): boolean => {
+  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+};
+/** The OS-provided profile of this token's user, NOT os.homedir()/USERPROFILE. On Windows os.homedir() reads USERPROFILE
+ * first, and fleet isolation (scripts/test-temp.ts isolateTestFleetEnvironment, asserted by tests/test-temp.test.ts)
+ * points USERPROFILE at <TMPDIR>/pi-fabric-test-fleet-<id>/home. That puts fixtures below RUNNER_TEMP, whose volume
+ * ancestors are not a profile: in the hosted run of 2026-10-24, D:\, D:\a, D:\a\_temp and the job root all granted
+ * Authenticated Users 0x1301bf on themselves, so every enforced open refused at an ancestor before any state file.
+ * tests/test-deletion-guard.mjs isShared uses the same OS-provided rule. A profile under test temp fails loudly: a
+ * refusal row must never pass because of an unsafe fixture ancestor. */
+const defaultProfile = (): string => {
+  const profile = os.userInfo().homedir;
+  if (!profile || !path.isAbsolute(profile)) throw new Error(`OS profile ${String(profile)} is not an absolute path`);
+  for (const temp of [os.tmpdir(), process.env.RUNNER_TEMP]) {
+    if (temp && within(temp, profile)) throw new Error(`OS profile ${profile} is inside test temp ${temp}; ACL fixtures need the private profile chain`);
+  }
+  return path.resolve(profile);
+};
 /** A fresh private fixture directory directly below the default profile (inherits only the profile ACL). */
 const profileDir = (): string => {
-  const dir = fs.mkdtempSync(path.join(defaultProfileDirectory(), "fabric-mesh-acl-"));
+  const profile = defaultProfile();
+  const dir = fs.mkdtempSync(path.join(profile, "fabric-mesh-acl-"));
   created.push(dir);
   ownFixture(dir);
   return dir;
@@ -182,6 +200,17 @@ const seedCacheFixture = async (root: string): Promise<SqliteStateStore> => {
 };
 
 describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "win32")("Windows mesh state ACL privacy (smarty-dev#8920)", () => {
+  // Fixture precondition, enforced: advisory positive controls still pass on an unsafe ancestor (they only warn), and
+  // refusal rows that check just the code or the root path would then pass for the wrong reason. Names any offender.
+  it("fixture precondition: a clean root below the OS profile is admitted under enforcement, async and sync", async () => {
+    enforceAcl();
+    const root = profileDir();
+    for (const name of Object.keys(opens) as (keyof typeof opens)[]) {
+      const error = await refusal(() => opens[name](root));
+      expect(error === undefined ? undefined : String((error as Error).message ?? error), name).toBeUndefined();
+    }
+  }, 120_000);
+
   // Native integration: C1 proves admitted identity reuse; C2 documents same-process trusted ACL mutation and
   // fresh-process refusal; C3 preserves the first-proof ancestor boundary. No ACL evidence is mocked.
   it("native-cache-C1: unchanged existing root and state.db reuse the admitted native proof across sync and async opens", async () => {
@@ -313,7 +342,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   }, 120_000);
 
   it("opens real node:sqlite in a clean root below the default USERPROFILE without touching its ancestors", async () => {
-    const profile = defaultProfileDirectory();
+    const profile = defaultProfile();
     const before = readAcl(profile).sddl;
     const root = profileDir();
     await roundTrip(await openAsync(root));

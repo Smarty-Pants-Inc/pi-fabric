@@ -8,7 +8,7 @@ import { BridgeOwnershipError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, S
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
-import { BRIDGE_BATCH_MAX_EVENTS } from "../src/mesh/event-log.js";
+import { BRIDGE_BATCH_MAX_EVENTS, BRIDGE_BATCH_MAX_MS } from "../src/mesh/event-log.js";
 
 const roots: string[] = [];
 const closes: Array<() => Promise<unknown>> = [];
@@ -91,13 +91,20 @@ describe("bounded durable bridge event batches", () => {
 
   it("returns a durable prefix at the 50 ms work bound and rechecks ownership per event", async () => {
     const mesh = store(), side = new StoreBridgeSide(mesh, "forge");
-    const now = vi.spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(50);
+    let elapsedMs = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsedMs);
     const two = [{ event: event("a"), held: [identity.id] }, { event: event("b"), held: [identity.id] }];
-    const holds = vi.spyOn(side, "holds").mockReturnValue(true);
+    // Elapse the literal 50 ms contract at actual ownership admission, independent of the implementation constant.
+    const holds = vi.spyOn(side, "holds").mockImplementation(() => {
+      elapsedMs = 50;
+      return true;
+    });
     expect(await side.publishBatch(two)).toHaveLength(1);
     expect(holds).toHaveBeenCalledOnce();
+    expect(elapsedMs).toBe(50);
+    expect(BRIDGE_BATCH_MAX_MS).toBe(50);
     expect(mesh.read()).toHaveLength(1);
-    now.mockReturnValue(0);
+    elapsedMs = 0;
     holds.mockReset().mockReturnValueOnce(true).mockReturnValue(false);
     // A fresh prefix succeeds; its refused suffix cannot erase it or run out of order.
     const next = [{ event: event("c"), held: [identity.id] }, { event: event("d"), held: [identity.id] }];

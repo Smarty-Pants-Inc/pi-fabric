@@ -29,7 +29,8 @@ const READ_RETRY_DELAY_MS = 100;
 // The official JetStream API request timeout remains 5s. Read exhaustion is ~15.2s; stream creation is bounded to
 // three identical add requests plus INFO reconciliation (~30.6s worst case). Placement faults instead share one
 // wall-clock budget from CREATE's start, including backoff, pending requests, leader readiness and first consumer.
-// Only that initial ordered-consumer get is raced at 1s per attempt: a timed-out name is abandoned, not resent.
+// Only that initial ordered-consumer get is raced at 1s per attempt: a timed-out name is abandoned, and its late
+// successful reply is deleted rather than consumed or left as a second ephemeral placement.
 const STREAM_LEADER_TIMEOUT_MS = 10_000;
 const STREAM_LEADER_POLL_MS = 100;
 const CONSUMER_CREATE_ATTEMPT_TIMEOUT_MS = 1_000;
@@ -195,7 +196,12 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
       // deadline (including a placement budget shorter than 1s), and never use a late abandoned get's consumer.
       const outcome = bounded.kind === "deadline" && Date.now() < deadline
         ? { kind: "attempt-timeout" as const } : bounded;
-      if (outcome.kind === "deadline" || Date.now() >= deadline) throw unavailable();
+      if (outcome.kind === "deadline" || Date.now() >= deadline) {
+        // The request may still create a server-side consumer after its client-side race expires.
+        // Retire that exact name too; otherwise an open that ultimately fails can leak a consumer.
+        rotateName();
+        throw unavailable();
+      }
       if (outcome.kind === "value") return outcome.value;
       if (outcome.kind === "attempt-timeout") rotateName();
       else {
@@ -399,13 +405,38 @@ export const connectJetStream = async (servers: string[], options: ConnectJetStr
           ? { deliver_policy: DeliverPolicy.All }
           : { deliver_policy: DeliverPolicy.StartSequence, opt_start_seq: afterSeq + 1 }),
       };
-      const request = () => js.consumers.get(stream, consumerOptions);
+      type PendingConsumerGet = { abandoned: boolean; deleteStarted: boolean; consumer?: Awaited<ReturnType<typeof js.consumers.get>> };
+      let pendingGet: PendingConsumerGet | undefined;
+      const abandonPendingGet = () => {
+        const attempt = pendingGet;
+        if (!attempt) return;
+        attempt.abandoned = true;
+        if (!attempt.consumer || attempt.deleteStarted) return;
+        attempt.deleteStarted = true;
+        // A timed-out get can ACK after a later name has already become the active consumer.
+        // Delete only the handle returned for the exact abandoned request, never a LIST result.
+        void Promise.resolve().then(() => attempt.consumer!.delete()).catch(() => undefined);
+      };
+      const request = () => {
+        const attempt: PendingConsumerGet = { abandoned: false, deleteStarted: false };
+        pendingGet = attempt;
+        const pending = js.consumers.get(stream, consumerOptions);
+        void pending.then(consumer => {
+          attempt.consumer = consumer;
+          if (attempt.abandoned) {
+            attempt.deleteStarted = true;
+            void Promise.resolve().then(() => consumer.delete()).catch(() => undefined);
+          }
+        }, () => undefined);
+        return pending;
+      };
       // Keep the SDK client's default 5s API timeout: its API persists into the running consumer. The race only
-      // caps initial get. Each Timeout abandons our own ephemeral assignment; do not delete it or consume it later.
-      // Replace, rather than mutate, its options so an in-flight SDK get retains only its abandoned name.
+      // caps initial get. Each timed-out request may still create its own ephemeral assignment: if it resolves late,
+      // delete that exact abandoned handle, never consume it or leave a second placement beside the accepted one.
+      // Replace, rather than mutate, its options so an in-flight SDK get retains only its original name.
       const consumer = readiness === undefined ? await retryTransientRead(request, READ_RETRY_ATTEMPTS)
         : await bootstrapConsumer(stream, request, readiness.deadline, readiness.fresh,
-          () => { consumerOptions = { ...consumerOptions, name_prefix: randomUUID() }; });
+          () => { abandonPendingGet(); consumerOptions = { ...consumerOptions, name_prefix: randomUUID() }; });
       const messages = await consumer.consume({ idle_heartbeat: CONSUMER_IDLE_HEARTBEAT_MS });
       void (async () => { for await (const message of messages) onMessage({ seq: message.seq, data: message.data }); })()
         .catch(error => onError?.(error));

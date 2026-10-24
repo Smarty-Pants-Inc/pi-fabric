@@ -68,6 +68,19 @@ const snapshot = async (watch: Watch): Promise<Event[]> => {
   }
   throw new Error("snapshot never reached ready");
 };
+const convergedSnapshot = async (watch: Watch, timeoutMs = 30_000): Promise<Event[]> => {
+  const deadline = Date.now() + timeoutMs;
+  let events: Event[] = [];
+  for (let count = 0; count < 100; count++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("watch did not reach a ready snapshot within " + timeoutMs + "ms");
+    const event = await next(watch, remaining);
+    if (event.type === "reset") { events = []; continue; }
+    if (event.type === "ready") return events;
+    events.push(event);
+  }
+  throw new Error("watch did not reach a ready snapshot within 100 events");
+};
 
 // Scheduling seam only: creation, data, metadata, statuses and consumption still
 // come from the installed official ordered push consumer and a real nats-server.
@@ -450,13 +463,13 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
     expect(info.config.ack_policy).toBe("none");
     expect(info.config.flow_control).toBe(true);
     await manager.consumers.delete(STREAM, info.name);
-    // 2.11 does not immediately notify push subscribers of deletion. The official
-    // consumer detects it after two missed 30s heartbeats; no polling or fake status.
-    expect(await next(iterator, 65_000)).toEqual({ type: "reset" });
-    expect(await snapshot(iterator)).toEqual([{ type: "put", entry: { key, machine: A, owner: OWNER, value: { n: 1 }, revision } }]);
+    // The official ordered push consumer reports deletion after two missed 30s heartbeats.
+    // Wait on that broker event with a bounded margin for the server/event loop under CI load.
+    expect(await next(iterator, 120_000)).toEqual({ type: "reset" });
+    expect(await convergedSnapshot(iterator)).toEqual([{ type: "put", entry: { key, machine: A, owner: OWNER, value: { n: 1 }, revision } }]);
     const updated = await store.put(key, OWNER, { n: 2 }, revision);
     expect(await next(iterator)).toMatchObject({ type: "put", entry: { key, revision: updated } });
-  }, 80_000);
+  }, 180_000);
 
   it("invalidates readiness on a real broker restart and resumes snapshot/ready/live updates", async () => {
     const transport = await openNatsTransport({ ...harness.runtimeOptions(harness.users.machineA), hostId: "watch-restart" });

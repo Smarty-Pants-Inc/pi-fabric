@@ -993,6 +993,21 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "agent",
   },
   {
+    name: "abandonStuckRun",
+    description:
+      "Owner-only repair for an actor-run-stuck alarm (remedy \"abandonStuckRun\") that persists: end the actor's wait on its stuck in-flight run runId (it stops no process) and keep the queue. First check that no process of the run remains: on Linux, pgrep -a -g <sessionId> (the worker's process group; sessionId is in the run's unresolved-worker.json) and grep -lzx PI_FABRIC_PARENT_RUN=<runId> /proc/[0-9]*/environ 2>/dev/null (the run's detached pi runner and its children) must print nothing (docs/agents.md, Stuck actor runs). The run's genuine terminal result is delivered when it has one; otherwise the run fails operator-abandoned. Queued messages are kept and run next. Refused, changing nothing, unless runId is exactly the actor's in-flight run on its owning host and the actor-run-stuck alarm's condition holds: past its stuck threshold, and the host cannot show it running. A second call is refused.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        runId: { type: "string", description: "The actor's in-flight run id, as in the alarm's runId or actorStatus inFlightRun.id" },
+      },
+      required: ["id", "runId"],
+      additionalProperties: false,
+    },
+    risk: "agent",
+  },
+  {
     name: "remove",
     description:
       'Stop and remove a persistent actor. Default scope "project" removes a live project actor; scope "global" removes a project-independent template from the global registry.',

@@ -2300,6 +2300,71 @@ export class AgentManager {
     return { pid: identity.pid, startTime: identity.startTime, open };
   }
 
+  /**
+   * smarty-dev#16333 round 4: whether this manager can prove a run's WHOLE execution is over, for the actor stuck-run
+   * check, which may otherwise end a drain's wait on a run whose launched worker pid is gone. A dead pid is not that
+   * proof: descendants may still own the actor's native session, so #settle holds an actor result until
+   * executionExited. This is the proof that sets it (#noteUnconfirmedExit): the current attempt's own transport, with
+   * contact intact, reports isAlive() false (no worker, scope member or retained descendant group) and its native
+   * close was observed. It changes nothing on the run. Any doubt is "not proven": a settled run (its own wait
+   * delivers it), a pending relaunch or stop, lost contact, a hosted or unchecked transport, a failing or slow probe.
+   * A run this manager does not hold (never launched here, or already archived) has no execution here.
+   * When proven, `result` is the run's genuine terminal verdict, if it has one: the record #settleGoneActorWorker
+   * preserves instead of a loss, so a finished run's real answer is never replaced by a worker-gone failure.
+   */
+  async executionExit(runId: string): Promise<{ exited: false } | { exited: true; result?: AgentRunResult }> {
+    const unproven = { exited: false } as const;
+    if (this.#queued.has(runId)) return unproven;
+    const managed = this.#runs.get(runId);
+    if (!managed) {
+      let previous: AgentRunResult | undefined;
+      try { previous = this.#previousRun(runId); } catch { return unproven; }
+      return previous && terminalWorkerResult(previous) ? { exited: true, result: previous } : { exited: true };
+    }
+    const open = (): boolean => !managed.settled && !managed.relaunchPending && !managed.hosted;
+    if (!open()) return unproven;
+    if (!managed.executionExited) {
+      const transport = managed.transport;
+      // The manager's own exit proof applies only to this exact attempt, with no stop helper outstanding.
+      const intact = (): boolean => managed.transport === transport && !managed.processStopPending &&
+        transport.kind === "process" && !uncheckedExternalExit(transport) && transport.lostContact?.() === undefined;
+      if (!intact()) return unproven;
+      const deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 5;
+      try {
+        if (await this.#transportAliveUntil(transport, deadline)) return unproven;
+        if (!await this.#transportClosedUntil(transport, deadline)) return unproven;
+      } catch { return unproven; }
+      if (!managed.executionExited && !intact()) return unproven;
+    }
+    if (!open()) return unproven;
+    const result = this.#terminalRecord(managed);
+    return result ? { exited: true, result } : { exited: true };
+  }
+
+  /**
+   * smarty-dev#16333 round 5: a run's genuine terminal verdict, if it has one, with NO claim that its execution is
+   * over. It is executionExit's record branch: the relaunch failure, else the worker's own status.json with the same
+   * id, or, for a run this manager no longer holds, its archived result. Only for the owner's explicit abandon of a
+   * stuck actor run (ActorManager.abandonStuckRun), whose operator checked that no process of the run remains, so a
+   * finished run's real answer is still delivered instead of a failure. Undefined: no record, a queued run, an
+   * unreadable or forged archive, or a record that is not a genuine verdict (a transport loss, a recoverable stop).
+   */
+  terminalResult(runId: string): AgentRunResult | undefined {
+    if (this.#queued.has(runId)) return undefined;
+    const managed = this.#runs.get(runId);
+    if (managed) return this.#terminalRecord(managed);
+    let previous: AgentRunResult | undefined;
+    try { previous = this.#previousRun(runId); } catch { return undefined; }
+    return previous && terminalWorkerResult(previous) ? previous : undefined;
+  }
+
+  /** The run's genuine terminal record for executionExit and terminalResult (same id, terminalWorkerResult). */
+  #terminalRecord(managed: ManagedAgent): AgentRunResult | undefined {
+    const record = managed.relaunchFailure ?? readRecord(managed.statusFile);
+    return record && record.id === managed.id && terminalWorkerResult(record)
+      ? this.#withTransportMetadata(record, managed) as AgentRunResult : undefined;
+  }
+
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch, probe = false): Promise<AgentTransportHandle> {
     while (this.#releasePaused && !probe) await this.#waitForRelease(request.signal);
     if (this.#closing) throw new Error("Fabric agent manager is closing");

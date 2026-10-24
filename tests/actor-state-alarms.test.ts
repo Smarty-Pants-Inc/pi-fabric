@@ -28,6 +28,16 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 15_000): Promise<vo
   }
 };
 const settle = () => new Promise(resolve => setTimeout(resolve, 250)); // about a dozen 20 ms sweeps
+/**
+ * smarty-dev#16333 round 6 (P2): whether the owner's abandonStuckRun admits the run, without committing it: its commit
+ * fence throws, so nothing changes. "admitted", or the refusal. The call takes the actor-run-stuck alarm's own condition.
+ */
+const admits = (actors: ActorManager, actorId: string, runId: string): string => {
+  try {
+    actors.abandonStuckRun(actorId, runId, { beforeCommit: () => { throw new Error("admitted"); } });
+    return "committed";
+  } catch (error) { return error instanceof Error ? error.message : String(error); }
+};
 
 const setup = (persistent = false) => {
   const realNow = Date.now.bind(Date);
@@ -202,7 +212,11 @@ describe("actor state alarms (smarty-dev#9332)", () => {
       fs.existsSync(path.join(s.agents.runDirectory(s.actors.status(live.id).inFlightRun!.id)!, "status.json")));
     const owned = s.agents.workerIdentity(runId)!;
     expect(owned).toMatchObject({ pid: expect.any(Number), open: true });
+    const liveRunId = s.actors.status(live.id).inFlightRun!.id;
     const stuckAlarms = () => s.alarms("actor-run-stuck", stuck.id);
+    /** Round 6 (P2): the owner's call admits the stuck run exactly when the alarm reports it, and never the healthy one. */
+    const admitsStuck = () => admits(s.actors, stuck.id, runId);
+    const admitsLive = () => admits(s.actors, live.id, liveRunId);
     const teardown = async () => {
       // A run that did work detaches on an actor stop (fake-worker HANG_WITH_PROGRESS): end the runs themselves.
       for (const id of [stuck.id, live.id]) {
@@ -216,16 +230,21 @@ describe("actor state alarms (smarty-dev#9332)", () => {
       s.clock.skew = 29 * MINUTE;
       await settle();
       expect(stuckAlarms()).toHaveLength(0);
+      expect(admitsStuck()).toContain("it is not stuck: it is not past its stuck threshold");
       s.clock.skew = 31 * MINUTE;
       await waitFor(() => stuckAlarms().length === 1);
       const data = stuckAlarms()[0]!.data as Record<string, unknown>;
-      expect(data).toMatchObject({ runId, reason, ownerRoot: "session:test", thresholdMs: 30 * MINUTE });
+      // smarty-dev#16333 round 5: every stuck-run alarm names the owner's fixed remedy.
+      expect(data).toMatchObject({ runId, reason, ownerRoot: "session:test", thresholdMs: 30 * MINUTE, remedy: "abandonStuckRun" });
+      // Round 6: the remedy is open for every run the alarm reports, and closed for the healthy run of the same age.
+      expect(admitsStuck()).toBe("admitted");
+      expect(admitsLive()).toContain("it is not stuck: this host shows it running");
       await settle();
       expect(stuckAlarms()).toHaveLength(1);
       expect(s.alarms("actor-run-stuck", live.id)).toHaveLength(0);
       return data;
     };
-    return { s, runId, directory, owned, teardown, expectAlarm, stuckAlarms };
+    return { s, runId, directory, owned, teardown, expectAlarm, stuckAlarms, admitsStuck, admitsLive };
   };
   // The dead worker of (a), and (c)'s live process with a different start time: real processes, not invented pids.
   const deadPid = async (): Promise<number> => {
@@ -293,6 +312,7 @@ describe("actor state alarms (smarty-dev#9332)", () => {
       f.s.clock.skew = 31 * MINUTE;
       await settle();
       expect(f.stuckAlarms()).toHaveLength(0); // the live worker of an open owned handle
+      expect(f.admitsStuck()).toContain("it is not stuck: this host shows it running");
       const real = f.s.agents.workerIdentity.bind(f.s.agents);
       vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => {
         const identity = real(id);
@@ -300,6 +320,8 @@ describe("actor state alarms (smarty-dev#9332)", () => {
       });
       await waitFor(() => f.stuckAlarms().length === 1);
       expect(f.stuckAlarms()[0]!.data).toMatchObject({ reason: "worker-unverified", runId: f.runId });
+      expect(f.admitsStuck()).toBe("admitted");
+      expect(f.admitsLive()).toContain("it is not stuck: this host shows it running");
       vi.mocked(f.s.agents.workerIdentity).mockRestore();
     } finally { await f.teardown(); }
   }, 60_000);
@@ -385,6 +407,7 @@ describe("actor state alarms (smarty-dev#9332)", () => {
       s.clock.skew = 31 * MINUTE;
       await waitFor(() => s.alarms("actor-run-stuck", actor.id).length === 1);
       expect(s.alarms("actor-run-stuck", actor.id)[0]!.data).toMatchObject({ reason: "worker-unverified", runId });
+      expect(admits(s.actors, actor.id, runId)).toBe("admitted"); // round 6: abandonable, as every reported run
     } finally {
       vi.mocked(s.agents.workerIdentity).mockRestore();
       await s.agents.stop(runId).catch(() => undefined);

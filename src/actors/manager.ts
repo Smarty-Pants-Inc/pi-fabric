@@ -5206,7 +5206,7 @@ export class ActorManager {
         this.#assertSlotCurrent(actor);
         if (!valid.valid) {
           items.splice(items.indexOf(event), 1);
-          this.#recordStale(actor, event, valid.reason);
+          if (!valid.staleRecorded) this.#recordStale(actor, event, valid.reason);
         }
       }
       this.#persistQueue(actor.id);
@@ -5247,7 +5247,7 @@ export class ActorManager {
       this.#assertSlotCurrent(actor);
       if (!valid.valid) {
         items.pop();
-        this.#recordStale(actor, next, valid.reason);
+        if (!valid.staleRecorded) this.#recordStale(actor, next, valid.reason);
       } else {
         if (this.#batchInputBytes(actor, items) > maxBytes) {
           items.pop();
@@ -5529,7 +5529,7 @@ export class ActorManager {
           const beforeRun = await this.#prepare(actor, "validity", () => this.#validity(actor, item));
           this.#assertSlotCurrent(actor);
           if (!beforeRun.valid) {
-            this.#recordStale(actor, item, beforeRun.reason);
+            if (!beforeRun.staleRecorded) this.#recordStale(actor, item, beforeRun.reason);
             continue;
           }
           // The current activation is fresh; retained outcomes are labelled context,
@@ -6675,19 +6675,21 @@ export class ActorManager {
       catch { return undefined; }
     }
     if (!matches(payload)) return undefined;
-    const primary = refRecord(item.payload)?.id === record.id && refRecord(item.payload)?.sequence === record.sequence;
-    const facts = record.activation && !record.metadataTruncated ? record.activation
-      : primary && item.activation.kind === "mesh" ? item.activation : undefined;
-    const activation = facts && (primary || !record.metadataTruncated) && facts.kind === "mesh" && facts.source === `mesh:${payload.topic}` &&
-      facts.topic === payload.topic && typeof facts.id === "string" && facts.id.length > 0 &&
-      Number.isSafeInteger(facts.sequence) && facts.sequence >= 0 && Number.isFinite(facts.createdAt) && facts.createdAt >= 0
-      ? { ...facts, ...(payload.data === undefined ? {} : { data: structuredClone(payload.data) }) } : undefined;
+    // Freshness belongs to the merged activation, while topic/data belong only
+    // to this verified original. Truncation strips authority, not kept facts.
+    const facts = item.activation;
+    const activation = facts.kind === "mesh" && facts.source === item.source && facts.topic === item.source.slice(5) &&
+      typeof facts.id === "string" && facts.id.length > 0 && Number.isSafeInteger(facts.sequence) && facts.sequence >= 0 &&
+      Number.isFinite(facts.createdAt) && facts.createdAt >= 0
+      ? { kind: "mesh" as const, id: facts.id, source: `mesh:${payload.topic}`, topic: payload.topic,
+        sequence: facts.sequence, createdAt: facts.createdAt,
+        ...(payload.data === undefined ? {} : { data: structuredClone(payload.data) }) } : undefined;
     const provenance = payload.verification === "mesh" || payload.verification === "bridge"
       ? fabricTurnProvenance(payload.from, "actor", payload.verification,
         record.untrusted || record.metadataTruncated || record.omittedBefore || !item.provenance?.principal
           ? undefined : record.principal) : undefined;
     const input: ActorQueueItem = { ...item, id: record.id, source: `mesh:${payload.topic}`, payload, recordDecision: true,
-      // Missing facts are explicitly unknown. No mesh-sequence/newest-facts substitution.
+      // Genuinely missing merged facts remain unknown; mesh sequence is never a substitute.
       activation: activation ?? { kind: "mesh", id: record.id, source: `mesh:${payload.topic}`, topic: payload.topic,
         sequence: -1, createdAt: -1 }, provenance };
     delete input.coalesced;
@@ -6723,15 +6725,19 @@ export class ActorManager {
       if (replacement?.sender) item.sender = replacement.sender;
       else delete item.sender;
       item.provenance = replacement?.provenance;
-      item.activation = replacement?.activation ?? { kind: "mesh", id: item.id, source: item.source,
-        topic: item.source.slice(5), sequence: -1, createdAt: -1 };
+      // Promotion changes the selected event, not when this merged work was
+      // accepted. Keep those facts even when the survivor's data is unavailable,
+      // but never carry the rejected primary's data into its replacement.
+      const activation = item.activation;
+      item.source = replacement?.source ?? (newest ? `mesh:${newest.topic}` : item.source);
+      item.activation = replacement?.activation ?? { kind: "mesh", id: activation.id, source: item.source,
+        topic: item.source.slice(5), sequence: activation.kind === "mesh" ? activation.sequence : -1,
+        createdAt: activation.kind === "mesh" ? activation.createdAt : -1 };
       delete item.images;
       delete item.wakeText;
       delete item.outcomeSend;
       if (replacement) {
         const event = replacement.payload as MeshEvent;
-        item.source = replacement.source;
-        item.createdAt = replacement.activation.createdAt;
         const outcomeSend = this.#meshEnqueueOptions(actor, event).outcomeSend;
         if (outcomeSend) item.outcomeSend = outcomeSend;
       }
@@ -6816,7 +6822,7 @@ export class ActorManager {
     actor: ManagedActor,
     item: ActorQueueItem,
     prune = true,
-  ): Promise<{ valid: boolean; reason?: string }> {
+  ): Promise<{ valid: boolean; reason?: string; staleRecorded?: true }> {
     if (!actor.validWhile) return { valid: true };
     if (item.coalesced?.length) {
       const survivors: CoalescedMeshEvent[] = [];
@@ -6842,7 +6848,10 @@ export class ActorManager {
         else this.#recordStale(actor, rejection.input, rejection.reason);
       }
       if (prune && rejected.length) this.#retainMeshRecords(actor, item, survivors);
-      return { valid, ...(reason ? { reason } : {}) };
+      // Every rejected original already has its pre-launch receipt. Only those
+      // callers may skip their aggregate receipt; post-inference delivery still
+      // owes the final runId/usage-bearing stale outcome.
+      return { valid, ...(reason ? { reason } : {}), ...(prune && !valid ? { staleRecorded: true as const } : {}) };
     }
     if (item.omittedBefore) {
       if (!this.#knownMeshPrimary(item) || item.activation.sequence < 0) return { valid: true };

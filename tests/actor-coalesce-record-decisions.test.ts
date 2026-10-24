@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,11 +7,13 @@ import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRequest, AgentRunResult } from "../src/agents/types.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
-import type { FabricActorRequest } from "../src/actors/types.js";
+import type { FabricActorRequest, FabricActorValidityFacts } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { hasDeliveryOutcome } from "../src/mesh/delivery-outcomes.js";
 import { normalizeScope, senderStamp } from "../src/scope.js";
+import { ExecutionDeadline } from "../src/runtime/execution-deadline.js";
+import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 
 // Keep reason: #4605 ADV-1/data safety. Exercise the real monitor receiver, queue,
 // checkpoint and AgentManager.run boundary, not private decision helper stand-ins.
@@ -88,6 +91,52 @@ const world = () => {
   };
 };
 
+// Keep reason: #4605 P3-3/data safety. Run the real predicate and deadline
+// comparison, but advance only its deadline clock, never the actor/mesh clock.
+// Async-local state keeps overlapping evaluations separate. The Date.now spy is
+// synchronous and restored before returning from the real deadline getter.
+type PredicateObservation = {
+  facts: FabricActorValidityFacts | undefined;
+  terminationReason: string;
+  value: unknown;
+  error: string | undefined;
+};
+const withPredicateClock = async (
+  run: (observed: PredicateObservation[]) => Promise<void>,
+  expireAfterEvaluation: (facts: FabricActorValidityFacts) => boolean = () => false,
+) => {
+  const clock = new AsyncLocalStorage<{ expire: boolean; elapsedMs: number }>();
+  const observed: PredicateObservation[] = [];
+  const realExecute = QuickJsRuntime.prototype.execute;
+  const realReached = Object.getOwnPropertyDescriptor(ExecutionDeadline.prototype, "reached")!.get!;
+  const realSchedule = ExecutionDeadline.prototype.scheduleDeadline;
+  const reached = vi.spyOn(ExecutionDeadline.prototype, "reached", "get").mockImplementation(function (this: ExecutionDeadline) {
+    const active = clock.getStore();
+    if (!active) return realReached.call(this) as boolean;
+    const now = vi.spyOn(Date, "now").mockReturnValue(this.startedAt + active.elapsedMs);
+    try { return realReached.call(this) as boolean; }
+    finally { now.mockRestore(); }
+  });
+  const schedule = vi.spyOn(ExecutionDeadline.prototype, "scheduleDeadline").mockImplementation(function (this: ExecutionDeadline, ...args) {
+    const active = clock.getStore();
+    // QuickJS first schedules this timer after evalCode/pumpJobs. Expiring here
+    // models descheduling at the result boundary, without delaying or bypassing
+    // the guest, changing its verdict, or raising the production 100ms budget.
+    if (active?.expire) active.elapsedMs = this.timeoutMs;
+    return realSchedule.apply(this, args);
+  });
+  const execute = vi.spyOn(QuickJsRuntime.prototype, "execute").mockImplementation(function (this: QuickJsRuntime, code, hostCall, options) {
+    const facts = options.strings?.facts ? JSON.parse(options.strings.facts) as FabricActorValidityFacts : undefined;
+    return clock.run({ expire: facts !== undefined && expireAfterEvaluation(facts), elapsedMs: 0 }, async () => {
+      const result = await realExecute.call(this, code, hostCall, options);
+      observed.push({ facts, terminationReason: result.terminationReason, value: result.value, error: result.error });
+      return result;
+    });
+  });
+  try { await run(observed); }
+  finally { execute.mockRestore(); schedule.mockRestore(); reached.mockRestore(); clock.disable(); }
+};
+
 describe("coalesced record decisions use each original input (#4605 round 2)", () => {
   it("ADV-1 newest fails / older survives: retroactive filter promotes the comment and receipts name the dropped check", async () => {
     const w = world();
@@ -141,10 +190,10 @@ describe("coalesced record decisions use each original input (#4605 round 2)", (
       .toMatchObject({ filteredEventId: check.id });
   });
 
-  it("validWhile uses genuine per-record actor acceptance sequences, not mesh or newest sequences", async () => {
+  it("validWhile uses the merged actor acceptance sequence with each original record's data", async () => {
     const w = world();
     const actor = await w.create({ validWhile: { version: 1,
-      source: '({ activation }) => activation.kind !== "mesh" || activation.sequence === 2' } });
+      source: '({ activation }) => activation.kind !== "mesh" || (activation.sequence === 3 && activation.data.event === "issue_comment")' } });
     await w.block(actor.id); // actor acceptance 1
     for (let n = 0; n < 6; n++) await w.mesh.publish({ topic: "unrelated", kind: "padding", from });
     const comment = await w.publish("issue_comment"); // actor acceptance 2; mesh sequence deliberately different
@@ -287,7 +336,7 @@ describe("coalesced record decisions use each original input (#4605 round 2)", (
     expect(hasDeliveryOutcome(w.mesh.root, send(newest), "delivered")).toBe(false);
   });
 
-  it("validWhile drops only the older failing input and names both records when all inputs fail", async () => {
+  it("validWhile drops only the older failing input and names both records when all inputs fail", async () => withPredicateClock(async () => {
     const w = world();
     const actor = await w.create({ validWhile: { version: 1,
       source: '({ activation }) => activation.kind !== "mesh" || activation.data.event === "check_run"' } });
@@ -302,6 +351,46 @@ describe("coalesced record decisions use each original input (#4605 round 2)", (
     const invalidated = w.actors.messages(actor.id).filter(message => message.stale)
       .flatMap(message => (message.data as { invalidatedEventId?: string } | undefined)?.invalidatedEventId ?? []);
     expect(new Set(invalidated)).toEqual(new Set([older.id, all1.id, all2.id]));
+  }));
+
+  it("a post-run predicate deadline fails closed and adds the otherwise-valid newer record to stale receipts", async () => {
+    const originalNow = Date.now;
+    const originalExecute = QuickJsRuntime.prototype.execute;
+    const originalReached = Object.getOwnPropertyDescriptor(ExecutionDeadline.prototype, "reached")!.get;
+    const originalSchedule = ExecutionDeadline.prototype.scheduleDeadline;
+    const w = world();
+    let inferenceFinished = false;
+    await withPredicateClock(async (observed) => {
+      const actor = await w.create({ validWhile: { version: 1,
+        source: '({ activation }) => activation.kind !== "mesh" || activation.data.event === "check_run"' } });
+      await w.block(actor.id);
+      const older = await w.publish("issue_comment");
+      const newer = await w.publish("check_run");
+      const all1 = await w.publish("issue_comment", "all-1", 8);
+      const all2 = await w.publish("pull_request_review", "all-2", 8);
+      w.admit(older, newer, all1, all2);
+      w.release(0);
+      await waitFor(() => w.runs.length === 2);
+      expect(ids(w.runs[1]!.task)).toEqual([newer.id]);
+      inferenceFinished = true;
+      await w.idle(actor.id, 2);
+      const stale = w.actors.messages(actor.id).filter(message => message.stale);
+      const invalidated = stale.flatMap(message =>
+        (message.data as { invalidatedEventId?: string } | undefined)?.invalidatedEventId ?? []);
+      expect(new Set(invalidated)).toEqual(new Set([older.id, newer.id, all1.id, all2.id]));
+      expect(stale.find(message => (message.data as { invalidatedEventId?: string } | undefined)?.invalidatedEventId === newer.id))
+        .toMatchObject({ reason: "validWhile: Execution timed out after 100ms", action: "silent" });
+      expect(w.actors.messages(actor.id).some(message => message.text === "answer-2")).toBe(false);
+      const newerEvaluations = observed.filter(entry => entry.facts?.activation.kind === "mesh" &&
+        (entry.facts.activation.data as { event?: unknown } | undefined)?.event === "check_run");
+      expect(newerEvaluations.some(entry => entry.terminationReason === "completed" && entry.value === true)).toBe(true);
+      expect(newerEvaluations.at(-1)).toMatchObject({ terminationReason: "timed_out", error: "Execution timed out after 100ms" });
+    }, facts => inferenceFinished && facts.activation.kind === "mesh" &&
+      (facts.activation.data as { event?: unknown } | undefined)?.event === "check_run");
+    expect(Date.now).toBe(originalNow);
+    expect(QuickJsRuntime.prototype.execute).toBe(originalExecute);
+    expect(Object.getOwnPropertyDescriptor(ExecutionDeadline.prototype, "reached")!.get).toBe(originalReached);
+    expect(ExecutionDeadline.prototype.scheduleDeadline).toBe(originalSchedule);
   });
 
   it("pruning an omittedBefore carrier preserves the exact summary on the surviving primary", async () => {

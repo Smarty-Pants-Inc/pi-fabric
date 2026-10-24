@@ -192,15 +192,15 @@ describe("settlement releases richer deferred coalesced dead letters (#4605 roun
     expect(skipped).toEqual([duplicate.id, allCompleted.id]);
   });
 
-  it("legacy history without original activation facts is unknown, not judged with the newest record's facts", async () => {
+  it("legacy history without per-record facts uses merged current facts and the comment's own data", async () => {
     const w = world();
-    const actor = await w.create('({ activation }) => activation.kind !== "mesh" || activation.sequence < 0');
+    const actor = await w.create('({ activation, current }) => activation.kind !== "mesh" || (activation.sequence === current.latestActivationSequence && activation.data.event === "issue_comment")');
     w.actors.tell(actor.id, "hold while legacy history is restored");
     await waitFor(() => w.runs.length === 1);
     const older = await w.publish("issue_comment");
     const primary = await w.publish("check_run");
-    // This old checkpoint has no original actor acceptance facts for its historical
-    // comment. The replay must not manufacture them from the mesh sequence.
+    // This old checkpoint has no per-record activation facts. Replay admission
+    // provides the merged actor facts; each record still supplies its own data.
     await w.primeBacklog();
     w.write(actor.id, [w.entry(primary, [history(older), history(primary)])]);
     await w.actors.setActivationFilter(actor.id, [skipPadding]);

@@ -5069,6 +5069,16 @@ export class ActorManager {
       (item.source.startsWith("mesh:") && refRecord(event?.from)?.kind === "main");
   }
 
+  #batchExcluded(actor: ManagedActor, item: ActorQueueItem): boolean {
+    if (!item.source.startsWith("mesh:") && !item.source.startsWith("host:")) return true;
+    if (item.resolve || item.reject || item.source === "host:input" || item.source === "host:user_bash") return true;
+    const event = refRecord(item.payload);
+    // Main direct messages are urgent; topic broadcasts remain eligible for batching.
+    const directToActor = [actor.id, "actor:" + actor.id, actor.name].includes(String(event?.to ?? ""));
+    return event?.kind === "steer" || event?.kind === "ask" ||
+      (item.source.startsWith("mesh:") && refRecord(event?.from)?.kind === "main" && directToActor);
+  }
+
   #batchEnvelope(actor: ManagedActor, event: ActorQueueItem) {
     return { source: event.source,
       ...(refRecord(event.payload)?.untrusted === true || !senderTrusted(actor.principalScope, event.sender) ? { untrusted: true } : {}),
@@ -5122,7 +5132,7 @@ export class ActorManager {
     const held = [...actor.queue, ...(this.#overflow.get(actor.id) ?? [])];
     const existing = this.#batchTimers.get(actor.id);
     const at = head ? Math.min(head.createdAt + actor.batchWindowMs!, existing?.at ?? Infinity) : 0;
-    if (!head || head.batchIds || head.overflowRetried || held.length >= (actor.batchMax ?? 50) || held.some(item => this.#batchBypass(item)) || this.#batchBytesReady(actor, held) || Date.now() >= at) {
+    if (!head || head.batchIds || head.overflowRetried || held.length >= (actor.batchMax ?? 50) || held.some(item => this.#batchExcluded(actor, item)) || this.#batchBytesReady(actor, held) || Date.now() >= at) {
       this.#clearBatchTimer(actor.id);
       return true;
     }
@@ -5198,7 +5208,7 @@ export class ActorManager {
       this.#persistQueue(actor.id);
       return;
     }
-    if (!(actor.batchWindowMs! > 0) || this.#batchBypass(first)) return;
+    if (!(actor.batchWindowMs! > 0) || this.#batchExcluded(actor, first)) return;
     // A singleton that is already on its one no-tool overflow retry must not
     // absorb newer observations merely because batching was enabled mid-run.
     // Existing batch manifests above still restore their complete membership.
@@ -5212,8 +5222,11 @@ export class ActorManager {
     while (items.length < (actor.batchMax ?? 50) && actor.queue.length && !this.#closing && !this.#releaseStrict &&
         !actor.abortController?.signal.aborted && actor.status !== "stopped" && this.#slotCurrent(actor) && this.#canManageCached(actor.id)) {
       const next = actor.queue[0]!;
-      if (next.batchIds || next.overflowRetried || this.#batchBypass(next) || next.bindingMode !== first.bindingMode ||
-          JSON.stringify(next.binding) !== JSON.stringify(first.binding)) break;
+      // Batching must not merge sender identities or discard an input's output principal.
+      if (next.batchIds || next.overflowRetried || this.#batchExcluded(actor, next) || next.bindingMode !== first.bindingMode ||
+          JSON.stringify(next.binding) !== JSON.stringify(first.binding) ||
+          refRecord(refRecord(next.payload)?.from)?.id !== refRecord(refRecord(first.payload)?.from)?.id ||
+          JSON.stringify(next.provenance?.principal) !== JSON.stringify(first.provenance?.principal)) break;
       const key = this.#processedMeshKey(actor, next.source, next.payload);
       // A repeated occurrence is only suppressible AFTER successful completion. Keep
       // the later original item pending, including its receipt, if this batch fails.
@@ -6401,7 +6414,7 @@ export class ActorManager {
     const provenance = item.provenance ? structuredClone(item.provenance) : undefined;
     if (items.length > 1 && provenance && (external || foreign || items.some(event =>
         JSON.stringify(event.provenance?.principal) !== JSON.stringify(item.provenance?.principal)))) delete provenance.principal;
-    const batched = items.length > 1 || (actor.batchWindowMs! > 0 && !this.#batchBypass(item));
+    const batched = items.length > 1 || (actor.batchWindowMs! > 0 && !this.#batchExcluded(actor, item));
     const roleStamp = actorRoleStamp(actor.instructions, (actor as ManagedActor & { roleStamp?: unknown }).roleStamp);
     const actorSelf = normalizeFabricActorActivationIdentity({
       actorId: actor.id,

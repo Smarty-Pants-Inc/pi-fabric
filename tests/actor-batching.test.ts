@@ -127,6 +127,74 @@ const inputs = (run: AgentRunRequest): Input[] => {
 };
 
 describe("actor window batching on the durable receiver path", () => {
+  it("batches Main topic broadcasts inside the window", async () => {
+    const f = await fixture();
+    const actor = await create(f.actors);
+    fakeClock();
+    for (let index = 0; index < 3; index++) f.send({ ref: `main-topic-${index}` }, "work", identity);
+    expect(f.runs).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(W);
+    await settled(f.actors, actor.id);
+    expect(f.runs).toHaveLength(1);
+    expect(inputs(f.runs[0]!)).toHaveLength(3);
+    expect(JSON.parse(f.runs[0]!.task.slice(f.runs[0]!.task.indexOf(ACTOR_ACTIVATION_HEADER) + ACTOR_ACTIVATION_HEADER.length, f.runs[0]!.task.indexOf("\n"))).batchIds).toHaveLength(3);
+  });
+
+  it.each(["sender", "principal", "sender and principal"])(
+    "keeps Main topic publishers separate when their %s differs, preserving each principal", async difference => {
+    const f = await fixture();
+    const actor = await create(f.actors);
+    fakeClock();
+    const first = { ...f.event({ ref: "publisher-one" }, "work", identity), principal: { id: "paul", binding: "voice-call" as const } };
+    const second = {
+      ...f.event({ ref: "publisher-two" }, "work", difference.includes("sender")
+        ? { ...identity, id: "session:publisher-two", sessionId: "publisher-two" } : identity),
+      principal: { id: difference.includes("principal") ? "kate" : "paul", binding: "voice-call" as const },
+    };
+    for (const event of [first, second]) expect(f.monitor.callbacks.onEvent(event)).toBe(true);
+    expect(f.runs).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(W);
+    await settled(f.actors, actor.id);
+    expect(f.runs).toHaveLength(2);
+    for (const [index, event] of [first, second].entries()) {
+      const run = f.runs[index]!;
+      expect(inputs(run)).toEqual([{ source: "mesh:fleet.work.batch", payload: event, id: expect.any(String) }]);
+      expect(run.provenance).toEqual({
+        v: 1, channel: "fabric", via: "actor", principal: event.principal,
+        sender: { id: event.from.id, kind: "main", name: event.from.name, verified: "mesh" },
+      });
+    }
+  });
+
+  it("runs a direct Main message to the actor alone", async () => {
+    const f = await fixture();
+    const actor = await create(f.actors);
+    fakeClock();
+    f.send({ ref: "main-before-direct-1" }, "work", identity);
+    f.send({ ref: "main-before-direct-2" }, "work", identity);
+    const event = { ...f.event({ ref: "main-direct" }, "work", identity), to: actor.id };
+    expect(f.monitor.callbacks.onEvent(event)).toBe(true);
+    await settled(f.actors, actor.id);
+    expect(f.runs).toHaveLength(2);
+    expect(inputs(f.runs[0]!)).toHaveLength(2);
+    expect(f.runs[1]!.task).toContain("main-direct");
+    expect(f.runs[1]!.task).not.toContain("Pending events in FIFO order");
+  });
+
+  it.each(["steer", "ask"] as const)("keeps Main %s events outside a batch", async kind => {
+    const f = await fixture();
+    const actor = await create(f.actors);
+    fakeClock();
+    f.send({ ref: `main-before-${kind}-1` }, "work", identity);
+    f.send({ ref: `main-before-${kind}-2` }, "work", identity);
+    f.send({ ref: `main-${kind}` }, kind, identity);
+    await settled(f.actors, actor.id);
+    expect(f.runs).toHaveLength(2);
+    expect(inputs(f.runs[0]!)).toHaveLength(2);
+    expect(f.runs[1]!.task).toContain(`main-${kind}`);
+    expect(f.runs[1]!.task).not.toContain("Pending events in FIFO order");
+  });
+
   it("strict release drain holds an expired window until resume without changing its original IDs", async () => {
     const f = await fixture();
     const actor = await create(f.actors);
@@ -234,7 +302,10 @@ describe("actor window batching on the durable receiver path", () => {
     fakeClock();
     f.send({ ref: "ordinary-1" });
     f.send({ ref: "ordinary-2" });
-    const urgent = f.send({ ref: "urgent" }, bypass === "main" ? "message" : bypass, bypass === "main" ? identity : factory);
+    const urgent = bypass === "main"
+      ? { ...f.event({ ref: "urgent" }, "message", identity), to: actor.id }
+      : f.event({ ref: "urgent" }, bypass, factory);
+    expect(f.monitor.callbacks.onEvent(urgent)).toBe(true);
     await settled(f.actors, actor.id);
     expect(f.runs).toHaveLength(2);
     expect(inputs(f.runs[0]!).map(input => input.payload.data)).toEqual([{ ref: "ordinary-1" }, { ref: "ordinary-2" }]);
@@ -318,7 +389,7 @@ describe("actor window batching on the durable receiver path", () => {
     expect(f.runs).toHaveLength(1);
   });
 
-  it("mixed-trust batches mark each input and cannot borrow the first event's output principal", async () => {
+  it("different-principal inputs run separately, retaining each input's trust and output principal", async () => {
     const f = await fixture();
     const actor = await create(f.actors, { batchMax: 2 });
     fakeClock();
@@ -326,12 +397,15 @@ describe("actor window batching on the durable receiver path", () => {
     const foreign = { ...f.event({ ref: "foreign" }), sender: { authority: "scope" as const, principalId: "other", digest: "other" } };
     expect(f.monitor.callbacks.onEvent(trusted)).toBe(true);
     expect(f.monitor.callbacks.onEvent(foreign)).toBe(true);
+    await vi.advanceTimersByTimeAsync(W);
     await settled(f.actors, actor.id);
-    expect(f.runs).toHaveLength(1);
-    expect(inputs(f.runs[0]!)[0]).not.toHaveProperty("untrusted");
-    expect(inputs(f.runs[0]!)[1]).toMatchObject({ untrusted: true });
-    expect(f.runs[0]!.provenance).not.toHaveProperty("principal");
-    expect(f.runs[0]!.task).toContain("UNTRUSTED");
+    expect(f.runs).toHaveLength(2);
+    expect(inputs(f.runs[0]!)).toEqual([{ source: "mesh:fleet.work.batch", payload: trusted, id: expect.any(String) }]);
+    expect(inputs(f.runs[1]!)).toEqual([{ source: "mesh:fleet.work.batch", payload: foreign, id: expect.any(String), untrusted: true }]);
+    expect(f.runs[0]!.provenance?.principal).toEqual(trusted.principal);
+    expect(f.runs[1]!.provenance).not.toHaveProperty("principal");
+    expect(f.runs[0]!.task).not.toContain("UNTRUSTED");
+    expect(f.runs[1]!.task).toContain("UNTRUSTED");
   });
 
   it("a batch settles a separate addressed delivery receipt for every original event", async () => {
@@ -1062,6 +1136,37 @@ describe("round 2 batch failure and recovery interleavings", () => {
     } else {
       expect(f.runs.map(run => run.task.match(/"ref": "([^"]+)"/)?.[1])).toEqual(["older-2", "urgent", "older-1"]);
     }
+  });
+
+  it("preparation retry keeps the older batch ahead of a Main topic broadcast", async () => {
+    let preparing!: () => void;
+    let fail!: (error: Error) => void;
+    const entered = new Promise<void>(resolve => { preparing = resolve; });
+    const gate = new Promise<never>((_resolve, reject) => { fail = reject; });
+    let calls = 0;
+    const f = await fixture(undefined, 32, true, { preparationRetryMs: 20, acquireCapabilityView: async () => {
+      if (++calls === 1) { preparing(); await gate; }
+      return { satisfied: true, missing: [], optionalMissing: [], view: { id: "test", digest: "test", semanticDigest: "test", bindings: {} }, release: async () => {} };
+    } });
+    const actor = await create(f.actors, { batchMax: 2, requires: ["demo.echo"] });
+    fakeClock();
+    f.send({ ref: "older-1" });
+    f.send({ ref: "older-2" });
+    await entered;
+    f.send({ ref: "main-topic-during-preparation" }, "work", identity);
+    fail(new Error("recorded preparation failure"));
+    for (let turn = 0; turn < 100 && f.actors.inFlightCount(); turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    expect(f.runs).toHaveLength(0);
+    expect(f.snapshot(actor.id).items.map(item => (item.payload.data as { ref: string }).ref))
+      .toEqual(["older-1", "older-2", "main-topic-during-preparation"]);
+    await vi.advanceTimersByTimeAsync(20);
+    // The retry retains its original manifest and still precedes the Main topic item.
+    for (let turn = 0; turn < 100 && (f.runs.length === 0 || f.actors.inFlightCount()); turn++) await new Promise<void>(resolve => setImmediate(resolve));
+    expect(inputs(f.runs[0]!).map(input => input.payload.data)).toEqual([{ ref: "older-1" }, { ref: "older-2" }]);
+    await vi.advanceTimersByTimeAsync(W);
+    await settled(f.actors, actor.id);
+    expect(f.runs).toHaveLength(2);
+    expect(inputs(f.runs[1]!).map(input => input.payload.data)).toEqual([{ ref: "main-topic-during-preparation" }]);
   });
 
   it("a failed durable manifest checkpoint launches nothing and retries the same originals", async () => {

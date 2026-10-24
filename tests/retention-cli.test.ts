@@ -268,7 +268,8 @@ createJiti(pathToFileURL(process.cwd() + "/index.js").href).import(${JSON.string
     const report = path.join(root, "report.json");
     const dry = spawnSync(process.execPath, ["-e", runner, root, "--dry-run", "--report", report], { encoding: "utf8", timeout: 60_000 });
     expect(dry.status, dry.stderr).toBe(0);
-    expect(dry.stderr).toMatch(/^pruneActorSessionBackups: would delete 1 \(3 bytes\), refused 0$/m);
+    // smarty-dev#16444: session backups are archived (moved into session-archive/), never deleted.
+    expect(dry.stderr).toMatch(/^pruneActorSessionBackups: would archive 1 \(3 bytes\), refused 0$/m);
     expect(dry.stderr).toMatch(/^WOULD_FREE_GIB=\d+\.\d{3}$/m);
     expect(fs.existsSync(old)).toBe(true);
     const prior = fs.readFileSync(report, "utf8");

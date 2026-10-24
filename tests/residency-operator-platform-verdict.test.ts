@@ -14,6 +14,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import * as verifiedRemoval from "../src/storage/verified-remove.js";
+import { fleetSessionArchive } from "../src/storage/session-archive.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import {
   readResidentRequestDecision, residentRemovalsPath, residentRoot,
@@ -256,7 +257,17 @@ const probe = async (f: Fixture, platform: "darwin" | "win32" | "linux", operato
   // response is the settled cleanup refusal, and the real saved obligation proves pending custody.
   expect(f.host.actors.removalSettled(actor.id)).toBeUndefined();
   expect(process.platform).toBe(nativePlatform.value);
-  expect(treeSnapshot(tree)).toEqual(snapshot); // every byte and inode (including root/nested dirs)
+  // smarty-dev#16444 (R-keep-all-traces): a removal that reaches the (recorded) tree delete first moved the session trace
+  // into the fleet archive by rename (same inode, same bytes); a refused removal keeps every entry in place.
+  const reached = f.calls.some(call => call.tree);
+  const isTrace = (entry: { name: string }) => /^session\.jsonl/.test(entry.name);
+  expect(treeSnapshot(tree)).toEqual(reached ? snapshot.filter(entry => !isTrace(entry)) : snapshot); // every byte and inode (including root/nested dirs)
+  if (reached) {
+    const archived = treeSnapshot(fleetSessionArchive(f.config.meshRoot, f.config.rootId, actor.id))
+      .filter(entry => entry.name.endsWith(".jsonl") && entry.name !== "MANIFEST.jsonl");
+    expect(archived.map(({ dev, ino, bytes }) => ({ dev, ino, bytes })))
+      .toEqual(snapshot.filter(isTrace).map(({ dev, ino, bytes }) => ({ dev, ino, bytes })));
+  }
   expect(fenced()).toBe(false);
   expect(readResidentRequestDecision(f.config.residencyRoot, result.requestId)).toMatchObject({
     state: "committed", id: actor.id, operation: operator ? "operatorActor" : "removeActor",

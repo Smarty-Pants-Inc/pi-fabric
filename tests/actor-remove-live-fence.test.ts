@@ -10,6 +10,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MeshStore } from "../src/mesh/store.js";
 import * as verifier from "../src/storage/verified-remove.js";
+import { fleetSessionArchive } from "../src/storage/session-archive.js";
 import { actorTreeDeletionHooks, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { fixture, mainDirectory } from "./helpers/dead-root-fixture.js";
 import { RESIDENT_HOST_FORMAT } from "../src/residency/protocol.js";
@@ -28,6 +29,13 @@ type Call = { at: string; fenced: boolean; path?: string };
 // whole actor root) and directories under them. Permitted: metadata lock directories (`<file>.lock` and its
 // `.lock.dead.<hash>` takeover fence), which the registry and binding stores create and release beside the trees.
 const METADATA_LOCK = /\.lock(\.dead\.[0-9a-f]+)?$/;
+/** smarty-dev#16444 (R-keep-all-traces): a removal moves the session trace into the fleet archive BEFORE its tree delete
+ * (here recorded, never performed); the moved bytes, read back from there. */
+const archivedSession = (meshRoot: string, rootId: string, actorId: string): string => {
+  const directory = fleetSessionArchive(meshRoot, rootId, actorId);
+  const name = fs.readdirSync(directory).find(entry => entry.endsWith(".jsonl") && entry !== "MANIFEST.jsonl")!;
+  return fs.readFileSync(path.join(directory, name), "utf8");
+};
 const guardActorTrees = (roots: string[], fenced: () => boolean, calls: Call[]) => {
   const inTree = (file: unknown) => {
     const resolved = path.resolve(String(file));
@@ -154,7 +162,8 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
       expect(calls).toEqual([
         { at: "beforeCheck", fenced: true }, { at: "beforeDelete", fenced: true }, { at: "rm", path: path.resolve(dir), fenced: true }]);
       expect(refused).toMatchObject({ code: "FABRIC_MAIN_PUBLICATION_FENCED" });
-      expect(fs.readFileSync(path.join(dir, "session.jsonl"), "utf8")).toBe("history\n"); // recorded, never performed
+      // smarty-dev#16444: the session moved into the fleet archive before the delete, which is recorded, never performed.
+      expect(archivedSession(f.config.meshRoot, f.config.rootId, actor.id)).toBe("history\n");
       expect(fenced()).toBe(false);
       await expect(main.refresh()).resolves.toBeUndefined();
     } finally { vi.restoreAllMocks(); await main.close(); await f.close(); }
@@ -258,7 +267,8 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
       expect(result).not.toMatchObject({ cleaned: false });
       expect(calls).toEqual([
         { at: "beforeCheck", fenced: true }, { at: "beforeDelete", fenced: true }, { at: "rm", path: path.resolve(dir), fenced: true }]);
-      expect(fs.readFileSync(path.join(dir, "session.jsonl"), "utf8")).toBe("history\n"); // recorded, never performed
+      // smarty-dev#16444: the session moved into the fleet archive before the delete, which is recorded, never performed.
+      expect(archivedSession(f.config.meshRoot, f.config.rootId, actor.id)).toBe("history\n");
       expect(fenced()).toBe(false);
     } finally { vi.restoreAllMocks(); await main.close(); await f.close(); }
   }, 60_000);
@@ -615,11 +625,13 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
         { kind: "hook", name: "beforeCheck", fenced: true }, { kind: "hook", name: "beforeDelete", fenced: true }]);
       expect(calls.filter(call => call.kind === "rm" && call.path === path.resolve(dir))).toEqual([
         { kind: "rm", path: path.resolve(dir), fenced: true }]);
-      expect(fs.readFileSync(path.join(dir, "session.jsonl"), "utf8")).toBe("history\n"); // recorded, never performed
+      // smarty-dev#16444: the session moved into the fleet archive before the delete, which is recorded, never performed.
+      expect(archivedSession(f.config.meshRoot, f.config.rootId, actor.id)).toBe("history\n");
       expect(fenced()).toBe(false);
       expect(await main.publish()).toMatchObject({ ok: true });
       await resident.stop();
-      expect(fs.readFileSync(path.join(dir, "session.jsonl"), "utf8")).toBe("history\n");
+      // smarty-dev#16444: still in the fleet archive after the resident stops (it was moved there, never deleted).
+      expect(archivedSession(f.config.meshRoot, f.config.rootId, actor.id)).toBe("history\n");
     } finally { await h.close(); await f.close(); vi.restoreAllMocks(); } // guard kept through every close and the temp-root teardown
   }, 120_000);
 
@@ -642,7 +654,8 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
       const rm = calls.filter(call => call.at === "rm");
       expect(rm).toEqual([{ at: "rm", path: path.resolve(actorRoot), fenced: true }]);
       expect(calls.findIndex(call => call.at === "beforeDelete")).toBeLessThan(calls.indexOf(rm[0]!));
-      expect(fs.readFileSync(path.join(actorRoot, "a1", "session.jsonl"), "utf8")).toBe("history\n");
+      // smarty-dev#16444: the close moved the session into the fleet archive before the (recorded) root-tree delete.
+      expect(archivedSession(mesh.root, rootId, "a1")).toBe("history\n");
       expect(fenced()).toBe(false);
     } finally {
       vi.restoreAllMocks();

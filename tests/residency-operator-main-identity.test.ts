@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../src/mesh/store.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import * as verifiedRemoval from "../src/storage/verified-remove.js";
+import { fleetSessionArchive } from "../src/storage/session-archive.js";
 import { readResidentOperatorEvidence, ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import { actorTreeDeletionHooks, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
@@ -73,7 +74,13 @@ const operatorRemove = async (f: DeadRootFixture, seed: () => void, underFence?:
   const cli = await f.cli(actor.id, ["--confirm-dead-root", f.config.rootId]);
   await f.host.actors.removalSettled(actor.id)?.catch(() => undefined);
   const removal = cli.out + cli.err;
-  expect(fs.readFileSync(path.join(dir, "session.jsonl"), "utf8")).toBe("history\n"); // recorded, never performed
+  // smarty-dev#16444 (R-keep-all-traces): a removal that reaches the delete (recorded, never performed) first moved the
+  // session into the fleet archive; a refused one keeps it in place. Either way its bytes are intact.
+  const deleted = calls.some(call => call.at === "verifiedRemove" || call.at === "rm");
+  const archive = fleetSessionArchive(f.config.meshRoot, f.config.rootId, actor.id);
+  const archived = deleted ? fs.readdirSync(archive).find(name => name.endsWith(".jsonl") && name !== "MANIFEST.jsonl") : undefined;
+  expect(fs.readFileSync(archived ? path.join(archive, archived) : path.join(dir, "session.jsonl"), "utf8")).toBe("history\n");
+  expect(fs.existsSync(path.join(dir, "session.jsonl"))).toBe(!deleted);
   expect(mainPublicationFenced(f.config.meshRoot, f.config.rootId)).toBe(false);
   return { calls, removal, dir, cli };
 };

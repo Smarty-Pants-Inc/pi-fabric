@@ -8,7 +8,7 @@ export type PlacementDiagnostic = (kind: string, id: string, missingFields?: str
 /** Optional admission orchestration stays outside the eager AgentManager startup graph. */
 export async function runPlacementPreflight(
   config: FabricPlacementDeciderConfig,
-  request: Pick<AgentRunRequest, "actorId" | "capabilityRequirements" | "placement">,
+  request: Pick<AgentRunRequest, "actorId" | "capabilityRequirements"> & { placement: AgentRunRequest["placement"] },
   runner: FabricAgentRunner,
   model: string | undefined,
   thinking: FabricThinking | undefined,
@@ -29,7 +29,7 @@ export async function runPlacementPreflight(
     diagnostic("actor-root-ownership-refused", id);
     throw new PlacementAdmissionError("invalid-request");
   }
-  const launchId = binding?.launchId ?? request.activationId ?? id;
+  const launchId = binding?.launchId ?? id;
   const generation = binding?.generation ?? 1;
   if (!Number.isSafeInteger(generation) || generation < 1) throw new PlacementAdmissionError("invalid-request");
   const context = await contextModule.resolvePlacementCallerContext(config, deadline);

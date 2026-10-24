@@ -335,8 +335,9 @@ export interface FabricActorRequest extends FabricActorBatching {
   triggerTurn?: boolean;
   coalesce?: boolean;
   /**
-   * A dotted path into a mesh event's data, such as "payload.number". A queued event of the
-   * same topic with the same value there is replaced by the newer one, in its queue place.
+   * A dotted path into a mesh event's data, such as "payload.number". Queued events of the
+   * same topic and scalar value share one run: newest primary payload plus sequence-ordered
+   * coalesced history (bounded full data and metadata, explicit older-omission summary).
    */
   coalesceKey?: string;
   /** Opt-in occurrence path into the full mesh event (e.g. data.key). Persistent durable

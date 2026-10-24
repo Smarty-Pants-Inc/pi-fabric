@@ -554,7 +554,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         responseMode: { type: "string", enum: ["text", "directive"] },
         triggerTurn: { type: "boolean" },
         coalesce: { type: "boolean" },
-        coalesceKey: { type: "string", description: "Dotted path into a mesh event's data (such as payload.number). A queued event of the same topic with the same value there is replaced by the newer one." },
+        coalesceKey: { type: "string", description: "Dotted path into a mesh event's data (such as payload.number). Queued events of the same topic and scalar value share one run: newest primary payload plus sequence-ordered coalesced history (bounded full data and metadata; explicit older-omission count/range and read-back hint)." },
         dedupeKey: { type: "string", maxLength: 200, pattern: "^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$", description: "Opt-in occurrence path into the full mesh event (such as data.key). Persistent durable actors skip the last 256 successfully completed keys across restart. Never inferred from coalesceKey." },
         activation: {
           type: "object",
@@ -849,7 +849,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "setCoalesceKey",
-    description: "Set (a dotted path into a mesh event's data, such as payload.number) or clear (null) the actor's queue coalesce key: a queued event of the same topic with the same value is replaced by the newer one. A running activation is never replaced.",
+    description: "Set (a dotted path into a mesh event's data, such as payload.number) or clear (null) the actor's queue coalesce key. Matching queued events share one run with the newest primary payload and sequence-ordered coalesced history (bounded full data and metadata; explicit older-omission count/range and read-back hint). A running activation is never replaced.",
     inputSchema: {
       type: "object",
       properties: {

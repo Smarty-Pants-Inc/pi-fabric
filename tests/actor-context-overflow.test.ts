@@ -610,7 +610,8 @@ describe("actor context overflow (smarty-dev#3238, offline Pi child)", () => {
     await waitFor(() => s.prompts().length === 4 && restarted.inFlightCount() === 0);
     expect(s.prompts().map(({ history, marker }) => ({ history, marker }))).toEqual([
       { history: false, marker: "FIRST_REVIEW" }, { history: true, marker: "OVERFLOW_ON_HISTORY" },
-      { history: false, marker: "OVERFLOW_ON_HISTORY" }, { history: true, marker: "LAST_REVIEW" },
+      // The fixture scans the entire prompt: newest primary, then both collapsed originals.
+      { history: false, marker: "OVERFLOW_ON_HISTORY" }, { history: true, marker: "LAST_REVIEW,NEXT_REVIEW,LAST_REVIEW" },
     ]);
     expect(resets(restarted, actor.id)).toHaveLength(1);
     expect(s.overflowEvents()).toEqual([]);

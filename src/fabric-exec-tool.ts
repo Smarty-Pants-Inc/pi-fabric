@@ -28,7 +28,6 @@ import {
 import { DEFAULT_FABRIC_CONFIG } from "./config.js";
 import { hostGlobalsGuidance, MISSING_HOST_GLOBALS, PAYLOADS_LITERAL_GUIDANCE } from "./core/system-guidance.js";
 import type { FabricState } from "./fabric-state.js";
-import { formatFailureProgress } from "./failure-progress.js";
 import {
   prepareFabricExecArguments,
   resolveFabricExecPayloads,
@@ -991,7 +990,9 @@ export const createFabricExecTool = (
         ? `Runtime error: ${result.error}${runtimeRecoveryHint ? `\n\n${runtimeRecoveryHint}` : ""}`
         : undefined;
       const fullFormattedValue = formatFabricValue(result.value, selectedResultFormat);
-      const failureProgress = formatFailureProgress(result.trace);
+      const failureProgress = result.trace.outcome === "succeeded"
+        ? undefined
+        : (await import("./failure-progress.js")).formatFailureProgress(result.trace);
       const residentPriority = result.residentOutcomes?.length
         ? formatResidentOutcomePriority(result.residentOutcomes)
         : undefined;

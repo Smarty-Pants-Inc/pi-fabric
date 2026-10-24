@@ -1,7 +1,6 @@
 import { createMainExecutionCeilingError, isMainExecutionCeilingError, mainExecutionCeilingAbortReason, preserveCancellationOutcome, shareCancellationEffects } from "./async-settlement.js";
 import { ResultConsumption } from "./result-consumption.js";
 import { ExecutionDeadline } from "./runtime/execution-deadline.js";
-import { withMeshInvocationContext } from "./mesh/invocation-context.js";
 import { NativeCodemodeProvider } from "./native-codemode.js";
 import { nativeMcpIdentity } from "./core/native-mcp-identity.js";
 import { nativeToolRef, nativeToolIdentifier } from "./core/native-tool-names.js";
@@ -698,6 +697,7 @@ export class FabricExecutionService {
       const participants = this.#participants;
       const separator = ref.indexOf(".");
       let invocationSucceeded = false;
+      const { withMeshInvocationContext } = await import("./mesh/invocation-context.js");
       return withMeshInvocationContext(
         { signal: callContext.signal, deadlineAt: () => runtimeDeadline.at },
         () => this.registry.invoke(ref, args, {

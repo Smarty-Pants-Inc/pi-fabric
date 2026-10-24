@@ -96,7 +96,22 @@ export interface AgentSpawner {
   runId?: string;
 }
 
+export interface AgentPlacementBinding {
+  /** Host-derived child role/profile inputs; never copied from public spawn arguments. */
+  role?: string;
+  complexity?: "simple" | "normal" | "complex" | "delicate";
+  profile?: string;
+  memoryProfileRef?: string;
+  /** Host-verified activation binding, present only for an actor row owned by this root. */
+  actorActivation?: { actorId: string; rootId: string };
+  /** Stable writer launch identity for a durable queue retry; host-generated otherwise. */
+  launchId?: string;
+  generation?: number;
+}
+
 export interface AgentRunRequest {
+  /** Host-only placement role/profile binding; normalizeAgentRunRequest never reads this from public args. */
+  placement?: AgentPlacementBinding;
   /** Host-only: the actor queue item this run serves (smarty-dev#8935 recovery of an ENODEV-unconfirmed run). */
   activationId?: string;
   /** Explicit history class; routing still requires a separately prepared decision. */

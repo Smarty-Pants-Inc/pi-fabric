@@ -112,6 +112,13 @@ export class ActorDirectory extends ActorManager {
   }
 
   override retryCapabilityWaiters(): void { super.retryCapabilityWaiters(); this.#secondary.retryCapabilityWaiters(); }
+  override placementWake(...args: Parameters<ActorManager["placementWake"]>): ReturnType<ActorManager["placementWake"]> {
+    const actor = this.#localActors().find(candidate => candidate.id === args[0]);
+    if (!actor) return false;
+    return actor.scope === this.#defaultScope
+      ? super.placementWake(...args)
+      : this.#secondary.placementWake(...args);
+  }
   override resumeQueued(): void { super.resumeQueued(); this.#secondary.resumeQueued(); }
   override hasDormantIdleActor(protectedIds: ReadonlySet<string> = new Set()): boolean {
     return super.hasDormantIdleActor(protectedIds) || this.#secondary.hasDormantIdleActor(protectedIds);

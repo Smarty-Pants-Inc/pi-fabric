@@ -568,6 +568,8 @@ export class ResidentHost {
       controlIncarnationFence: transport ? "enforce" : config.mesh.controlIncarnationFence,
       enabled: true,
       hostId: this.hostId,
+      placementWakeSourceMachine: config.agents.placementDecider?.wakeSourceMachine,
+      onPlacementWake: (targetId, wake) => this.actors?.placementWake(targetId, wake) ?? false,
       pollMs: config.mesh.actorPollMs,
       bridgeTimeoutMs: config.mesh.bridgeControlTimeoutMs,
       ...(transport ? { inboxLanes: config.mesh.nats.inboxLanes ?? 8,

@@ -4,7 +4,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat } from "../storage/scratch.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { boundedRunTree } from "../storage/reference-scan.js";
-import { actorRunReferencedNow, canRemoveTerminalRun, removeUnreferencedRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type RegistryReferences, type TerminalRunEventsRetention } from "../storage/retention.js";
+import { actorRunReferencedNow, canRemoveTerminalRun, removeRunTreeAndShortTmpdir, removeUnreferencedRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type RegistryReferences, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
@@ -260,8 +260,9 @@ export class ResidentRequestRetention {
               hasPreservedResidentResult(directory, entry.name) &&
               boundedRunTree(file, unitExpired) && !unitExpired() &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            // smarty-dev#7916: only the judged run inode, verified; a failure retries next scan.
-            verifiedRemove(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
+            // smarty-dev#7916: only the judged run inode, verified; a failure retries next scan. Then its recorded short
+            // TMPDIR outside the run tree (pi-fabric#1554 P2-2), as every other run deleter does.
+            removeRunTreeAndShortTmpdir(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
             continue;
           }
           const compacted = compactTerminalRunEvents(file, { ...this.retention, now, expired: unitExpired,
@@ -366,8 +367,9 @@ export class ResidentRequestRetention {
               !runTreeExitVeto(file, 0, undefined, true) && canRemoveTerminalRun(file) &&
               hasPreservedResidentResult(directory, entry.name) &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
-            // Windows main sweep: verifiedRemove runs main's removal unchanged off Linux (smarty-dev#7858).
-            verifiedRemove(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
+            // Windows main sweep: verifiedRemove runs main's removal unchanged off Linux (smarty-dev#7858); then the
+            // run's recorded short TMPDIR (pi-fabric#1554 P2-2).
+            removeRunTreeAndShortTmpdir(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
             continue;
           }
           compactTerminalRunEvents(file, { ...this.retention, now,

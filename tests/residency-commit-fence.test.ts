@@ -1,4 +1,5 @@
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
+import { failActorTreeRemoval } from "./helpers/actor-tree-removal.js";
 import * as childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -1495,15 +1496,11 @@ describe("round 4 public cleanup-obligation retry cancellation", { timeout: 25_0
         vi.stubEnv("PI_FABRIC_MESH_ROOT", state.config.meshRoot);
       }
       const controller = new AbortController();
-      let failing: ReturnType<typeof vi.spyOn> | undefined;
+      let failing: { mockRestore(): void } | undefined;
       try {
         const actor = await state.client.createActor({ ...requestArgs(state, "create"), name: "cleanup-retry", instructions: "Work.", residency: "durable" });
         const directory = path.join(state.config.actorRoot, actor.id);
-        const rm = fs.rmSync.bind(fs);
-        failing = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-          if (target === directory) throw new Error("accepted cleanup remains unavailable");
-          return rm(target, options);
-        });
+        failing = failActorTreeRemoval(directory, () => { throw new Error("accepted cleanup remains unavailable"); });
         await expect(state.client.removeActor(actor.id)).resolves.toMatchObject({ removed: true, cleaned: false });
         const accepted = decisionsFor(state).find(d => d.operation === "removeActor")!;
         expect(accepted.state).toBe("committed");

@@ -31,7 +31,11 @@ export const MODEL_EXCEPTION_DENIED_CODE = "FABRIC_MODEL_EXCEPTION_DENIED" as co
 export type ModelExceptionDenial =
   | "invalid-reason" | "missing-reference" | "file-unavailable" | "untrusted-source" | "malformed"
   | "unlisted" | "expired" | "revoked" | "expiry-too-long" | "model-mismatch" | "role-mismatch"
-  | "lane-mismatch" | "host-mismatch" | "thinking-exceeds";
+  | "lane-mismatch" | "host-mismatch" | "thinking-exceeds"
+  /** The bound ROOT lane could not be read (stale/missing record or lookup error): fail closed, retryable (#16331). */
+  | "lane-unresolved"
+  /** The bound ROOT session is gone or was last seen beyond the host's limit: terminal, never retried (#16357). */
+  | "root-ended";
 
 /** Version 1 grant from the fixed root-owned host source. */
 export interface ModelExceptionEntry {
@@ -279,6 +283,10 @@ export function readModelExceptions(file: string): ModelExceptionEntry[] {
 export function admitModelException(input: {
   path: string | undefined; reason: unknown; model: string; role: string;
   lane?: string | undefined; host: string; thinking: FabricThinking; now?: number;
+  /** Why a bound ROOT lane is absent: a distinct, retryable denial instead of lane-mismatch (#16331). */
+  laneUnresolved?: string | undefined;
+  /** Why the bound ROOT session counts as ended (gone, or last seen beyond the limit): terminal (#16357). */
+  rootEnded?: string | undefined;
 }): { ref: string; entry: Readonly<ModelExceptionEntry> } {
   const model = input.model;
   const refs = canonicalIssueReferences(input.reason);
@@ -294,17 +302,25 @@ export function admitModelException(input: {
       error instanceof SyntaxError ? "malformed" : "file-unavailable", refs[0]);
   }
   const now = input.now ?? Date.now();
-  if (!input.lane) deny("lane-mismatch", refs[0], "no bound ROOT session worktree");
+  // #16357: a lane that is unavailable (not merely absent) is decided only AFTER the lane-independent
+  // grant fields. A revoked, expired, over-long or unlisted grant (or one for another host, role, model
+  // or effort) is its own terminal denial; only a grant that would admit but for the lane gets
+  // lane-unresolved (retryable) or root-ended (terminal). A host with no root binding is unchanged.
+  const laneUnavailable: { denial: ModelExceptionDenial; detail: string } | undefined = input.lane ? undefined
+    : input.rootEnded ? { denial: "root-ended", detail: input.rootEnded }
+    : input.laneUnresolved ? { denial: "lane-unresolved", detail: input.laneUnresolved } : undefined;
+  if (!input.lane && !laneUnavailable) deny("lane-mismatch", refs[0], "no bound ROOT session worktree");
   if (!isFabricThinking(input.thinking)) deny("thinking-exceeds", refs[0], "effective thinking is unknown");
   if (!Number.isFinite(now)) deny("expired", refs[0], "current time is unknown");
   const rank: ModelExceptionDenial[] = ["unlisted", "lane-mismatch", "host-mismatch", "role-mismatch",
     "model-mismatch", "thinking-exceeds", "expired", "revoked", "expiry-too-long"];
   let best: { denial: ModelExceptionDenial; ref: string } | undefined;
+  let laneIndependentRef: string | undefined;
   for (const ref of refs) {
     for (const entry of entries) {
       if (entry.issue !== ref) continue;
       let denial: ModelExceptionDenial | undefined;
-      if (entry.lane !== input.lane) denial = "lane-mismatch";
+      if (!laneUnavailable && entry.lane !== input.lane) denial = "lane-mismatch";
       else if (entry.host !== input.host) denial = "host-mismatch";
       else if (entry.role !== input.role) denial = "role-mismatch";
       else if (entry.model !== model) denial = "model-mismatch";
@@ -312,10 +328,15 @@ export function admitModelException(input: {
       else if (Date.parse(entry.expires_at) - Date.parse(entry.granted_at) > MAX_GRANT_TTL_MS) denial = "expiry-too-long";
       else if (entry.status === "revoked") denial = "revoked";
       else if (Date.parse(entry.expires_at) <= now) denial = "expired";
-      if (!denial) return { ref, entry: Object.freeze({ ...entry }) };
+      if (!denial) {
+        if (!laneUnavailable) return { ref, entry: Object.freeze({ ...entry }) };
+        laneIndependentRef ??= ref;
+        continue;
+      }
       if (!best || rank.indexOf(denial) > rank.indexOf(best.denial)) best = { denial, ref };
     }
   }
+  if (laneUnavailable && laneIndependentRef) deny(laneUnavailable.denial, laneIndependentRef, laneUnavailable.detail);
   return deny(best?.denial ?? "unlisted", best?.ref ?? refs[0]);
 }
 
@@ -323,6 +344,8 @@ export function admitModelException(input: {
 export function appendOpusPolicyLog(input: {
   role: string; model: string; ref: string | null; reason: string;
   grant?: Readonly<ModelExceptionEntry> | undefined; thinking?: FabricThinking | undefined; runId?: string | undefined;
+  /** #16357: where the admitted lane came from: the bound root's fresh record, or the actor's stored copy. */
+  laneSource?: "root" | "persisted" | undefined;
 }): string | undefined {
   let fd: number | undefined;
   let warning: string | undefined;
@@ -339,6 +362,7 @@ export function appendOpusPolicyLog(input: {
         grant_id: input.grant.id, issue: input.grant.issue, lane: input.grant.lane,
         host: input.grant.host, role: input.grant.role, model: input.grant.model,
         thinking: input.thinking, run_id: input.runId, time,
+        ...(input.laneSource === "root" || input.laneSource === "persisted" ? { lane_source: input.laneSource } : {}),
       } : {}),
     })}\n`, "utf8");
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });

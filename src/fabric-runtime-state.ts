@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { diagnostics, notifyDiagnostic } from "./core/diagnostics.js";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { RootInboxWatch } from "./topology/root-inbox-wake.js";
-import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmRecipient } from "./topology/stall-alarms.js";
+import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmEnvelope, admissionAlarmRecipient } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
 import { recordsInboxMessage, RecordsInboxCursor, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
 import type { SessionEntryCursorManager } from "./core/preview.js";
@@ -160,7 +160,7 @@ import {
   type FabricProviderDiscovery,
 } from "./protocol.js";
 import { participantProject, ParticipantRoleGrant } from "./topology/project-identity.js";
-import { AgentManager } from "./agents/manager.js";
+import { AgentManager, rootRecordLastSeenMs } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
 import { ActorChildCompletionStore } from "./actors/child-completions.js";
 import { boundAgentSpawner, resolveAgentSpawner } from "./agents/spawner.js";
@@ -1349,6 +1349,10 @@ export class FabricRuntimeState {
           ? root.cwd
           : undefined;
       },
+      // #16357: the root Main itself is alive while this runtime runs (last seen now), whatever its
+      // record says; a nested runtime reads its lineage root's record like the resident host does.
+      rootSessionLastSeenMs: () => identity.kind === "main" && identity.id === mainAgentId ? 0
+        : this.#participants ? rootRecordLastSeenMs(this.#participants, mainAgentId) : undefined,
       fabricSessionId,
       meshRoot,
       projectRoot,
@@ -1461,10 +1465,11 @@ export class FabricRuntimeState {
           diagnostics.warn("src/fabric-runtime-state.ts", "[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
           return;
         }
-        // A named run's failed recovery save is an ops.owner alarm (pi-fabric#939 round 4); the held count stays a fabric.alarm.
-        const owner = alarm.kind === "recovered-answer-save-failed";
-        void this.#backgroundMesh.enqueue(() => mesh.publish({ topic: owner ? "ops.owner" : "fabric.alarm.agent-admission",
-          kind: owner ? "actor.alarm" : "agent-admission-held", from, to, text: alarm.message, data: { ...alarm } })).catch(() => undefined);
+        // A named run's failed recovery save is an ops.owner alarm (pi-fabric#939 round 4); the held count and a child
+        // launched without a fitting short TMPDIR (pi-fabric#1554) are fabric.alarm.agent-admission events.
+        const envelope = admissionAlarmEnvelope(alarm);
+        void this.#backgroundMesh.enqueue(() => mesh.publish({ topic: envelope.topic,
+          kind: envelope.kind, from, to, text: alarm.message, data: { ...alarm } })).catch(() => undefined);
       },
       onFollowUpAlarm: (alarm) => {
         this.pi.sendMessage({ customType: "pi-fabric-follow-up-alarm", content: alarm.message, display: true, details: alarm },

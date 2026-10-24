@@ -821,7 +821,7 @@ Other agent settings:
 - `maxConcurrent`: child concurrency semaphore. A session spawn beyond this limit returns a `queued` handle immediately. Queued children start in FIFO order as slots become free; `queuePosition` in list/status is one-based. Queued receipts are session-only for now: saturated durable spawns cancel their queue entry, safely reject, and return no queued handle.
 - `maxPerExecution`: hard cap on accepted child launches per `fabric_exec` invocation, including queued spawns. Cancelling a queued child does not refund that invocation's launch count.
 - `maxDepth`: nesting bound for child agent calls, including `rlm.query()`. It accepts any non-negative safe integer. A value of `0` disables child spawning. `/fabric settings` provides free-form numeric entry.
-- `timeoutMs`: default wall-clock budget per child and the floor for per-call overrides (24 hours by default, which is also the policy ceiling). Fabric ignores lower per-call values. The default matches the ceiling on purpose: an orchestration program inherits this value as its own whole-program deadline floor, so a lower default would cut a long participant short well inside the allowed maximum. Lower it to bound a class of runs, and raise a single run with a per-call value.
+- `timeoutMs`: default wall-clock budget per child (24 hours by default, also the policy ceiling). An explicit one-shot task timeout can shorten that default when it is at least `300000` ms (5 minutes), for lane and audit timeboxes. Smaller shortenings are ignored to protect real work from tiny model-chosen budgets; the handle and terminal result carry `timeoutNote` with code `AGENT_TIMEOUT_BELOW_SHORTENING_FLOOR`, the requested/effective values and the minimum. The event log records `run.timeout_ignored`. Longer overrides remain capped at 24 hours. Unset values keep the configured default; persistent actor overrides still only extend it. The default also remains the whole-program deadline floor for orchestration outside interactive Main. A run deadline stops the owned native process tree and returns `timed_out`, preserving partial text and the write receipt; it does not delete completed work.
 - `extensions`: whether children load the user's normal extensions (Pi) or Claude Code customizations (Claude). Pi children with `false` use only built-in or `models.json` model definitions, not extension-registered providers; see [third-party model providers](#third-party-model-providers).
 - `defaultTools`: the default tool allowlist for children.
 - `budgetUsd`: shared append-only cost ledger across a recursion tree (0 disables).
@@ -933,6 +933,8 @@ variable `PI_FABRIC_MESH_STATE_BACKEND` overrides it. A root on a network filesy
 `node:sqlite` uses `"file"`. Switching an existing mesh to `"sqlite"` needs the migration of smarty-dev#6477 (L4); `fabric-mesh-backend cutover` is
 fenced only on the mesh `.lock` plus `custody.lock`; its writer census is advisory only (printed as
 `advisory: N writers, M unknown`) and never a cutover gate (smarty-dev#6982). Do not set it by hand on a shared mesh.
+
+Windows mesh-state ACL findings warn and startup continues by default; only exact `PI_FABRIC_MESH_STATE_ACL_ENFORCE=1` enables enforcement; unset the variable or set it to `0` to restore advisory startup without ACL mutation.
 
 `mesh.lockProtocol` accepts only numeric `1`, `2` or `3` and defaults to `1`. It is captured
 when each mesh store is constructed; editing configuration does not switch an existing

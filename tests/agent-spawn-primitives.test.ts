@@ -388,10 +388,12 @@ describe("agent manager spawning primitives", () => {
       runId: first.id, depth: 1, childIndex: 0, worker: true,
     });
     const secondArgs = launchArgs(runRoot, second.id);
+    // smarty-dev#15878: a short private TMPDIR when one fits the host's temp path, else the run's own tmp.
+    const secondTmp = second.temporaryDirectory ?? path.join(runRoot, second.id, "tmp");
     expect(JSON.parse(secondArgs["write-policy"]!)).toEqual({
-      readOnly: false, writableRoots: [cwd, path.join(runRoot, second.id, "tmp")].sort(), shell: "unconfined",
+      readOnly: false, writableRoots: [cwd, secondTmp].sort(), shell: "unconfined",
     });
-    expect(secondArgs.tmpdir).toBe(path.join(runRoot, second.id, "tmp"));
+    expect(secondArgs.tmpdir).toBe(secondTmp);
     expect(readAgentLineage(secondArgs.lineage)).toMatchObject({ runId: second.id, childIndex: 1 });
   });
 

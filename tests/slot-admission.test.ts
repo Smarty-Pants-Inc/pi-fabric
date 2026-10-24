@@ -479,6 +479,16 @@ describe.runIf(process.platform === "linux")("same-transaction permanent actor-b
     expect(f.coordinator.withCurrent("actor:review-1", [routes[0]!.topic], f.binding.registryRoots[1]!, () => "enabled")).toBe("enabled");
   });
 
+  it("treats the host-captured exception lane as attempt state, never a different birth (smarty-dev#16357)", async () => {
+    const f = await fresh();
+    const captured = f.input();
+    Object.assign(captured.spec, { exceptionLane: { rootId: caller.id, lane: "lane-a" } });
+    const born = await f.coordinator.admit(captured);
+    expect(born).toMatchObject({ actorId: "actor:review-1", reused: false, spec: { exceptionLane: { rootId: caller.id, lane: "lane-a" } } });
+    // An exact retry whose root record was briefly unavailable captured no lane: the same original ID.
+    expect(await f.coordinator.admit(f.input("actor:discarded-preallocation"))).toEqual({ actorId: "actor:review-1", spec: born!.spec, reused: true });
+  });
+
   it("uses distinct stores on the same physical database and requires each observer's own sync before enable", async () => {
     const f = await fresh();
     await f.coordinator.admit(f.input());

@@ -334,12 +334,15 @@ describe.runIf(hasPosixTrustMetadata)("fresh root-metadata v1 host model-excepti
 
 // Keep reason: callers cannot manufacture the host's bound ROOT lane or actual hostname.
 describe.runIf(hasPosixTrustMetadata)("root-record lane and host binding", () => {
+  // #16331: an unreadable bound root (missing/stale record, relative cwd, lookup error) is its own
+  // fail-closed denial; only a host with no root binding, or a different resolved lane, is a mismatch.
   it.each([
-    ["absent callback", { bindRoot: false }],
-    ["undefined root record", { rootSessionCwd: (): string | undefined => undefined }],
-    ["relative root cwd", { rootSessionCwd: (): string => "project" }],
-    ["different bound root", { rootSessionCwd: (): string => path.resolve("different-root") }],
-  ] as const)("refuses %s despite matching manager/request cwd and hostile context", async (_label, options) => {
+    ["absent callback", { bindRoot: false }, "lane-mismatch"],
+    ["undefined root record", { rootSessionCwd: (): string | undefined => undefined }, "lane-unresolved"],
+    ["relative root cwd", { rootSessionCwd: (): string => "project" }, "lane-unresolved"],
+    ["throwing root lookup", { rootSessionCwd: (): string => { throw new TypeError("/private/root/path"); } }, "lane-unresolved"],
+    ["different bound root", { rootSessionCwd: (): string => path.resolve("different-root") }, "lane-mismatch"],
+  ] as const)("refuses %s despite matching manager/request cwd and hostile context", async (_label, options, denial) => {
     const state = fixture(options);
     writeGrant(state.exceptionPath);
     rootMetadataFixture(state.exceptionPath);
@@ -352,7 +355,8 @@ describe.runIf(hasPosixTrustMetadata)("root-record lane and host binding", () =>
       transport: "process", cwd: state.cwd, lane: "project", host,
       rootSessionCwd: state.cwd,
     } as Parameters<AgentManager["spawn"]>[0]))
-      .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "lane-mismatch" });
+      .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial,
+        message: expect.not.stringContaining("/private/root/path") });
     expectNoRun(state, launch);
   });
 

@@ -91,14 +91,25 @@ describe("same-user resident actor operator", () => {
       const dry = await f.cli("stop", victim.name, ["--dry-run", ...f.confirm], path.basename(f.config.residencyRoot).slice(0, 12));
       expect(dry).toMatchObject({ code: 0, err: "" });
       expect(f.host.actors.status(victim.id).status).toBe("running");
-      const stopped = await f.cli("stop", victim.name, f.confirm);
+      // pi-fabric#1572 round 3 (astra F3): the CLI stop is an explicit operator stop; over an activation in flight it is
+      // refused, and nothing changes, unless --drop-queued archives that activation's item.
+      const refused = await f.cli("stop", victim.name, f.confirm);
+      expect(refused.code).not.toBe(0);
+      expect(refused.err).toMatch(/in-flight 1.*stop refused and nothing changed.*dropQueued/);
+      expect(f.host.actors.status(victim.id).status).toBe("running");
+      const stopped = await f.cli("stop", victim.name, ["--drop-queued", ...f.confirm]);
       expect(stopped).toMatchObject({ code: 0, err: "" });
+      expect(JSON.parse(stopped.out).actor.stoppedQueue).toMatchObject({ counts: { inFlight: 1 } });
       expect(JSON.parse(stopped.out).actor.status).toBe("stopped");
       expect(f.host.actors.status(victim.id).inFlightRun).toBeUndefined();
       expect(residentProcessAlive(runPid)).toBe(false);
       expect(f.host.actors.status(survivor.id).status).toBe("running");
       f.deadMain();
-      const removed = await f.cli("remove", victim.id, f.confirm);
+      // The stop archive is kept work: a plain remove is refused; --drop-queued removes and keeps it (pi-fabric#1572 round 3).
+      const kept = await f.cli("remove", victim.id, f.confirm);
+      expect(kept.code).not.toBe(0);
+      expect(kept.err).toMatch(/stop archives 1.*remove refused and nothing changed/);
+      const removed = await f.cli("remove", victim.id, ["--drop-queued", ...f.confirm]);
       expect(removed).toMatchObject({ code: 0, err: "" });
       if (operatorCleanupUnknownOnThisPlatform()) expectPendingOperatorRemoval(f, victim.id, JSON.parse(removed.out));
       else await waitFor(() => !new ActorRegistryStore(f.config.actorRoot).records().some(actor => actor.id === victim.id));

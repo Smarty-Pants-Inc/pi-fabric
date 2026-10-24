@@ -494,7 +494,8 @@ export async function runFabricCommand(
       .find((candidate) => candidate.id.startsWith(id) || candidate.name === id);
     if (actor) {
       try {
-        const stopped = await state.actors.stop(actor.id, undefined, false, "actors.stop", dropQueued ? { dropQueued: true } : {});
+        // pi-fabric#1572 round 3: /fabric stop is an explicit operator stop: it refuses work unless --drop-queued.
+        const stopped = await state.actors.stop(actor.id, undefined, false, "actors.stop", { explicit: true, ...(dropQueued ? { dropQueued: true } : {}) });
         context.ui.notify(`Stopped Fabric actor ${actor.id.slice(0, 8)}${stopped.stoppedQueue ? `; queued work archived to ${stopped.stoppedQueue.archive}` : ""}`, "info");
       } catch (error) {
         context.ui.notify(error instanceof Error ? error.message : String(error), "error");

@@ -1124,8 +1124,9 @@ export class AgentMessageRouter {
           return { accepted: false, error: `Participant ${actor.id} is owned by ${ownership.ownerHostId}` };
         }
         // smarty-dev#16416: a remote stop opts in to archiving queued work with data.dropQueued.
+        // pi-fabric#1572 round 3: a routed agents.stop is an explicit operator stop.
         await this.actorManager.stop(actor.id, undefined, false, "actors.stop",
-          (command.data as { dropQueued?: unknown } | undefined)?.dropQueued === true ? { dropQueued: true } : {});
+          { explicit: true, ...((command.data as { dropQueued?: unknown } | undefined)?.dropQueued === true ? { dropQueued: true } : {}) });
         this.participants.scheduleRefresh();
         return { accepted: true, messageId: command.commandId };
       } catch (error) {

@@ -290,22 +290,33 @@ export class FabricActorBatchPolicyError extends Error {
   }
 }
 
-/** Queued work an actor holds outside its in-flight run (smarty-dev#16416). */
+/** Work a stop would otherwise discard (smarty-dev#16416). */
 export interface FabricActorQueueCounts {
   queued: number;
   parked: number;
   overflow: number;
   deadLetter: number;
+  /** The item(s) of the activation in flight when the stop came (pi-fabric#1572 round 3). */
+  inFlight: number;
+  /** Pending agent_settled interval windows, not yet admitted to the queue (pi-fabric#1572 round 3). */
+  settled: number;
 }
 
 /** agents.stop options (smarty-dev#16416). */
 export interface FabricActorStopOptions {
   /**
-   * Stop even though the actor holds queued, parked, overflow or dead-letter work. That work
-   * is moved to `<actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl`, never deleted;
+   * Stop even though the actor holds work (an activation in flight, queued, parked, overflow,
+   * pending settled-window or dead-letter work). That work is moved to
+   * `<actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl`, never deleted;
    * agents.requeueArchived feeds it to a recreated actor.
    */
   dropQueued?: boolean;
+  /**
+   * pi-fabric#1572 round 3: an explicit operator stop (the agents.stop API and tool, /fabric stop, the
+   * operator CLI). Only these refuse while the actor holds work and no dropQueued was given. Internal
+   * stops (removal, session reset, Main close, host shutdown) never set it and stop as they always did.
+   */
+  explicit?: true;
 }
 
 /** The archive a stop with dropQueued wrote, returned on its result (smarty-dev#16416). */

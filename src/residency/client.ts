@@ -48,6 +48,7 @@ import {
   type ResidentTaskCaller,
   ResidentCommandUnsupportedError,
   assertResidentCommandSupported,
+  assertResidentDropQueuedSupported,
   prepareResidentCreationCommand,
   assertResidentActorMain,
   assertResidentActorToolCeiling,
@@ -823,7 +824,7 @@ export class ResidencyClient {
     };
   }
 
-  async removeActor(id: string, signal?: AbortSignal): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }> {
+  async removeActor(id: string, signal?: AbortSignal, options: { dropQueued?: true } = {}): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }> {
     await this.ensureHost();
     const response = await this.#command({
       format: RESIDENT_HOST_FORMAT,
@@ -831,6 +832,7 @@ export class ResidencyClient {
       requestId: randomUUID(),
       rootId: this.options.config.rootId,
       id,
+      ...(options.dropQueued === true ? { dropQueued: true as const } : {}),
       createdAt: Date.now(),
     }, signal);
     return { removed: true, ...(response.pending === undefined ? {} : { pending: response.pending }),
@@ -944,6 +946,7 @@ export class ResidencyClient {
     const owner = this.#liveOwner();
     if (!owner) throw new Error("Root resident host is not live");
     assertResidentCommandSupported(owner, command.operation);
+    assertResidentDropQueuedSupported(owner, command);
     if (owner.requestFence !== 1) {
       throw new Error("Fabric resident host lacks the abandonment fence; restart the resident host before retrying. No request was dispatched.");
     }

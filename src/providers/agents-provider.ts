@@ -1866,7 +1866,8 @@ export class AgentsProvider implements FabricProvider {
         if (actor && this.actorManager.owns(actor.id)) return this.actorManager.remove(actor.id, args.dropQueued === true ? { dropQueued: true } : {});
         const resident = await this.#residentActorOwner(actor?.id ?? participant!.id, context.signal);
         if (!resident) throw new Error("Only the owning root can remove this actor");
-        return resident.client.removeActor(resident.id, context.signal);
+        // pi-fabric#1572 round 3: forward dropQueued to the owning resident (refused before dispatch by an older owner).
+        return resident.client.removeActor(resident.id, context.signal, args.dropQueued === true ? { dropQueued: true } : {});
       }
       case "setInstructions": {
         const id = String(args.id);
@@ -2469,7 +2470,8 @@ export class AgentsProvider implements FabricProvider {
       const actor = this.actorManager.status(id);
       const ownership = this.#router.resolveStopParticipant(actor.id);
       if (!ownership || ownership.local) {
-        const result = await this.actorManager.stop(actor.id, undefined, false, "actors.stop", options);
+        // pi-fabric#1572 round 3: the agents.stop API and tool is an explicit operator stop: it refuses work unless dropQueued.
+        const result = await this.actorManager.stop(actor.id, undefined, false, "actors.stop", { ...options, explicit: true });
         this.participants.scheduleRefresh();
         return result;
       }

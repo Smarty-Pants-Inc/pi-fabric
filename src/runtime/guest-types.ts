@@ -889,7 +889,7 @@ interface FabricActorActivationIdentity {
   instructionsDigest: string;
   roleStamp?: string;
 }
-interface FabricActorQueueCounts { queued: number; parked: number; overflow: number; deadLetter: number }
+interface FabricActorQueueCounts { queued: number; parked: number; overflow: number; deadLetter: number; inFlight: number; settled: number }
 /** Returned by agents.requeueArchived. */
 interface FabricActorRequeueResult {
   id: string;
@@ -1196,8 +1196,9 @@ interface FabricAgentsApi {
   unsubscribe(args: FabricAgentTargetArgs): Promise<{ removed: boolean }>;
   models(args?: { runner?: FabricAgentRunner; refresh?: boolean }): Promise<FabricModelInfo[]>;
   /**
-   * An actor holding queued, parked, overflow or dead-letter work is refused (FABRIC_ACTOR_QUEUED_WORK, with the
-   * counts) unless dropQueued: true, which moves that work to <actor dir>/stopped-queues/ (stoppedQueue on the result).
+   * An actor with an activation in flight, or holding queued, parked, overflow, settled-window or dead-letter work, is refused
+   * (FABRIC_ACTOR_QUEUED_WORK, with the counts) unless dropQueued: true, which moves that work to <actor dir>/stopped-queues/
+   * (stoppedQueue on the result).
    */
   stop(args: FabricAgentTargetArgs & { dropQueued?: boolean }): Promise<FabricAgentResult | FabricActorInfo | FabricRemoteControlResult>;
   /** Feed a stop archive to a live (recreated) actor through its normal activation filter, once per item; idempotent. */

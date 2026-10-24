@@ -1063,6 +1063,7 @@ export class ResidentHost {
         callerBoundSpawn: 1,
         requestExpiry: 1,
         creationIdempotency: 1,
+        queuedWork: 1,
         ...(this.launch ? { releaseRoot: this.launch.spec.releaseRoot, configDigest: this.launch.spec.digest,
           handover: { abi: RESIDENT_HANDOVER_ABI, launcher: this.launch.launcher },
           ...(this.#drainSupported() ? { drain: { abi: RESIDENT_DRAIN_ABI } } : {}),
@@ -1346,8 +1347,9 @@ export class ResidentHost {
           this.#authorizeResidentSetter({ identity: from, hostId: caller?.ownerHostId ?? "" });
         }
         // smarty-dev#16416: a remote stop opts in to archiving queued work with data.dropQueued.
+        // pi-fabric#1572 round 3: a routed agents.stop is an explicit operator stop.
         await this.actors.stop(command.targetId, undefined, false, "actors.stop",
-          (command.data as { dropQueued?: unknown } | undefined)?.dropQueued === true ? { dropQueued: true } : {});
+          { explicit: true, ...((command.data as { dropQueued?: unknown } | undefined)?.dropQueued === true ? { dropQueued: true } : {}) });
         this.participants.scheduleRefresh();
         return { accepted: true, messageId: command.commandId };
       } catch (error) {
@@ -2840,7 +2842,7 @@ export class ResidentHost {
             typeof command.id !== "string" || !command.id.trim() ||
             (command.confirmDeadRoot !== undefined && typeof command.confirmDeadRoot !== "string") ||
             (command.dryRun !== undefined && typeof command.dryRun !== "boolean") ||
-            (command.dropQueued !== undefined && (typeof command.dropQueued !== "boolean" || command.action !== "stop"))) {
+            (command.dropQueued !== undefined && typeof command.dropQueued !== "boolean")) {
           throw new Error("Invalid resident operator actor request");
         }
         const evidence = readResidentOperatorEvidence(this.config, this.mesh);
@@ -2877,14 +2879,17 @@ export class ResidentHost {
           // This is a lease veto, not a proof that no Main exists or can restart.
           const actor = candidates[0]!;
           // smarty-dev#16416: operator stop refuses queued work unless dropQueued (archived); a remove keeps removal semantics.
+          // pi-fabric#1572 round 3: a remove with dropQueued archives its remaining work and keeps its archives (no lock-out
+          // after a stop --drop-queued, whose archive the removal guard otherwise refuses to take).
+          const dropQueued = command.dropQueued === true ? { dropQueued: true } : {};
           const pending = command.action === "stop"
-            ? this.actors.stop(actor.id, id => { check(); commit(id); }, true, "actors.stop", command.dropQueued === true ? { dropQueued: true } : {})
-            : this.actors.stop(actor.id, id => { check(); commit(id); }, true, "actors.remove");
+            ? this.actors.stop(actor.id, id => { check(); commit(id); }, true, "actors.stop", { explicit: true, ...dropQueued })
+            : this.actors.stop(actor.id, id => { check(); commit(id); }, true, "actors.remove", dropQueued);
           boundaryAdmitted?.();
           const stopped = await pending;
           response = command.action === "stop"
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
-            : await this.#removeResidentActor(actor.id, requestId, () => check(), true);
+            : await this.#removeResidentActor(actor.id, requestId, () => check(), true, command.dropQueued === true);
         }
       } else if (command.operation === "slotStatus") {
         response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true,
@@ -2925,7 +2930,9 @@ export class ResidentHost {
             break;
           }
           case "stop": {
-            const pending = this.actors.stop(actor.id, commit, true, "actors.stop", command.dropQueued === true ? { dropQueued: true } : {});
+            if (command.dropQueued !== undefined && command.dropQueued !== true) throw new Error("Invalid resident stop request: dropQueued must be true or absent");
+            // The agents.stop API forwarded to its owning resident: an explicit operator stop (pi-fabric#1572 round 3).
+            const pending = this.actors.stop(actor.id, commit, true, "actors.stop", { explicit: true, ...(command.dropQueued === true ? { dropQueued: true } : {}) });
             boundaryAdmitted?.();
             updated = await pending;
             break;
@@ -2946,7 +2953,9 @@ export class ResidentHost {
         }
         response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: updated, ...(requeued ? { requeued } : {}), completedAt: Date.now() };
       } else {
-        const pending = this.#removeResidentActor(command.id, requestId, commit);
+        // pi-fabric#1572 round 3: the removal forwards dropQueued; anything but true is refused, never ignored.
+        if (command.dropQueued !== undefined && command.dropQueued !== true) throw new Error("Invalid resident removeActor request: dropQueued must be true or absent");
+        const pending = this.#removeResidentActor(command.id, requestId, commit, false, command.dropQueued === true);
         boundaryAdmitted?.();
         response = await pending;
       }
@@ -3012,7 +3021,7 @@ export class ResidentHost {
         ? error.code : "DRAIN_REFUSED", reason: errorMessage(error), at: Date.now(), deadlineAt: Date.now(), admissionHeld: false, terminal: true });
   }
 
-  async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void, operator = false): Promise<ResidentCommandResponse> {
+  async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void, operator = false, dropQueued = false): Promise<ResidentCommandResponse> {
     const cleanup = this.actors.cleanupObligation(id);
     // Only an explicit operator request can waive durable ownership for this root's cleanup (#10189).
     // The manager rechecks eligibility and requires the host's fenced final check.
@@ -3022,7 +3031,7 @@ export class ResidentHost {
     }
     // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
     commit(id);
-    const removed = await this.actors.remove(id, { wait: false, ...(operator ? { operator: true as const } : {}) });
+    const removed = await this.actors.remove(id, { wait: false, ...(operator ? { operator: true as const } : {}), ...(dropQueued ? { dropQueued: true } : {}) });
     this.#writeRemovals();
     if (removed.pending) {
       void this.actors.removalSettled(id)?.finally(() => {

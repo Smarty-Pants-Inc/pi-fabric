@@ -14,6 +14,13 @@ import { ResidentHost } from "../src/residency/host.js";
 import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
+import { GlobalActorRegistry } from "../src/actors/global-registry.js";
+import { AgentsProvider } from "../src/providers/agents-provider.js";
+import type { FabricInvocationContext } from "../src/protocol.js";
+import type { FabricMainAgentTarget } from "../src/main-agent.js";
+import type { FabricParticipantSource } from "../src/topology/types.js";
+import { LifecycleBroker } from "../src/lifecycle/broker.js";
+import { runFabricCommand } from "../src/commands/fabric-handler.js";
 
 // smarty-dev#16416: stop and setActivationFilter never silently drop queued work. Real manager,
 // mesh store, queue checkpoint and dead-letter file; the fake worker holds the active run.
@@ -101,7 +108,8 @@ describe("agents.stop with queued work (smarty-dev#16416)", () => {
   it("refuses a non-empty queue, naming the counts, and changes nothing", async () => {
     const { root, actors, actor } = await saturated();
     const before = meshRecords(root, actor.id);
-    const refusal = await actors.stop(actor.id).then(info => info, (error: unknown) => error);
+    // Round 3 (pi-fabric#1572): only an explicit operator stop is guarded (astra F1).
+    const refusal = await actors.stop(actor.id, undefined, false, "actors.stop", { explicit: true }).then(info => info, (error: unknown) => error);
     expect(refusal).toBeInstanceOf(Error);
     expect(refusal).toBeInstanceOf(queuedWorkError() ?? class Missing {});
     expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "stop", actorId: actor.id,
@@ -121,7 +129,8 @@ describe("agents.stop with queued work (smarty-dev#16416)", () => {
     const stopped = await actors.stop(actor.id, undefined, false, "actors.stop", { dropQueued: true });
     const { archive, sha256, counts } = stopArchive(stopped);
     expect(stopped.status).toBe("stopped");
-    expect(counts).toEqual({ queued: 2, parked: 0, overflow: 16, deadLetter: 1 });
+    // Round 3: the activation in flight (the held worker's item) is archived too (astra F3).
+    expect(counts).toEqual({ queued: 2, parked: 0, overflow: 16, deadLetter: 1, inFlight: 1, settled: 0 });
     expect(path.dirname(archive)).toBe(path.join(root, "actors", actor.id, "stopped-queues"));
     expect(path.basename(archive)).toMatch(new RegExp(`^\\d{8}T\\d{9}Z-${sha256.slice(0, 12)}\\.jsonl$`));
     const bytes = fs.readFileSync(archive);
@@ -129,10 +138,11 @@ describe("agents.stop with queued work (smarty-dev#16416)", () => {
     const lines = bytes.toString("utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as { kind: string; item?: unknown; entry?: unknown; counts?: unknown });
     expect(lines[0]).toMatchObject({ kind: "header", actorId: actor.id, actorName: actor.name, counts });
     // Each queued record is the queue checkpoint's own record, byte for byte; each dead letter its own line.
-    expect(lines.slice(1, 19).map(line => line.kind)).toEqual([...Array(2).fill("queued"), ...Array(16).fill("overflow")]);
-    expect(lines.slice(1, 19).map(line => JSON.stringify(line.item))).toEqual(queued.map(record => JSON.stringify(record)));
-    expect(lines.slice(19).map(line => line.kind)).toEqual(["dead-letter"]);
-    expect(lines.slice(19).map(line => JSON.stringify(line.entry))).toEqual(deadLetters);
+    expect(lines[1]).toMatchObject({ kind: "in-flight", item: { source: "direct", payload: { message: "LIVE_WITH_PROGRESS" } } });
+    expect(lines.slice(2, 20).map(line => line.kind)).toEqual([...Array(2).fill("queued"), ...Array(16).fill("overflow")]);
+    expect(lines.slice(2, 20).map(line => JSON.stringify(line.item))).toEqual(queued.map(record => JSON.stringify(record)));
+    expect(lines.slice(20).map(line => line.kind)).toEqual(["dead-letter"]);
+    expect(lines.slice(20).map(line => JSON.stringify(line.entry))).toEqual(deadLetters);
     // The pointer, and the work moved: nothing left in the queue or dead-letter file, nothing recorded as dropped.
     expect(actors.messages(actor.id)).toContainEqual(expect.objectContaining({ text: `MOVED-TO ${archive}\nsha256 ${sha256}` }));
     expect(actors.messages(actor.id).filter(message => message.source.startsWith("mesh:") && message.error?.startsWith("Dropped a queued event"))).toEqual([]);
@@ -144,27 +154,37 @@ describe("agents.stop with queued work (smarty-dev#16416)", () => {
     expect(fs.readFileSync(archive).equals(bytes)).toBe(true);
   }, 30_000);
 
-  it("requeueArchived delivers each archived item once through the new actor's filter, and a second call adds nothing", async () => {
+  // Round 3 (astra P1 c6385171802): the same flow with the SAME name, where create removes the stopped predecessor.
+  it.each(["new-supervisor", "old-supervisor"])("requeueArchived delivers each archived item once through the new actor's filter, and a second call adds nothing (recreated as %s)", async (name) => {
     const { root, mesh, actors } = setup(10);
     const old = await actors.create({ name: "old-supervisor", instructions: "Supervise.", topics: [TOPIC], coalesce: false });
-    await holdWorker(actors, root, old.id);
+    const releaseOld = await holdWorker(actors, root, old.id);
     for (let index = 0; index < 4; index++) await publish(mesh, index, index % 2 === 1);
     await waitFor(() => actors.status(old.id).queued === 4);
     const { archive } = stopArchive(await actors.stop(old.id, undefined, false, "actors.stop", { dropQueued: true }));
+    releaseOld();
+    await waitFor(() => actors.inFlightCount() === 0);
     // The recreated actor listens elsewhere, so only requeueArchived can feed it these events.
-    const fresh = await actors.create({ name: "new-supervisor", instructions: "Supervise.", topics: ["queued-work.other"],
+    const fresh = await actors.create({ name, instructions: "Supervise.", topics: ["queued-work.other"],
       coalesce: false, activationFilter: WAIT_FILTER });
+    // A same-name create removes the predecessor; its tree goes, its archive moves to session-archive/.
+    if (name === "old-supervisor") await waitFor(() => !fs.existsSync(path.join(root, "actors", old.id)));
+    expect(fs.existsSync(archive)).toBe(name !== "old-supervisor");
     const release = await holdWorker(actors, root, fresh.id);
     const first = await actors.requeueArchived(fresh.id, archive);
-    expect(first).toMatchObject({ id: fresh.id, archive, requeued: 2, filtered: 2, alreadyRequeued: 0, skipped: [] });
-    expect(actors.status(fresh.id).queued).toBe(2);
+    // The old activation in flight (its released worker item) is requeued too (round 3, astra F3).
+    expect(first).toMatchObject({ id: fresh.id, requeued: 3, filtered: 2, alreadyRequeued: 0, skipped: [] });
+    expect(first.archive).toEqual(name === "old-supervisor"
+      ? expect.stringMatching(new RegExp(`session-archive.*${old.id}\\.recoverable-[0-9TZ]+/stopped-queues/${path.basename(archive)}$`)) : archive);
+    expect(actors.status(fresh.id).queued).toBe(3);
     expect(markers(meshRecords(root, fresh.id))).toEqual(["event-0", "event-2"]);
     expect(filtered(actors, fresh.id).map(message => message.reason)).toEqual(["filtered: wait", "filtered: wait"]);
     const second = await actors.requeueArchived(fresh.id, archive);
-    expect(second).toMatchObject({ requeued: 0, filtered: 0, alreadyRequeued: 4, skipped: [] });
-    expect(actors.status(fresh.id).queued).toBe(2);
+    expect(second).toMatchObject({ requeued: 0, filtered: 0, alreadyRequeued: 5, skipped: [] });
+    expect(actors.status(fresh.id).queued).toBe(3);
     expect(filtered(actors, fresh.id)).toHaveLength(2);
-    expect(fs.readFileSync(path.join(root, "actors", fresh.id, "requeued-archives.jsonl"), "utf8").split("\n").filter(Boolean)).toHaveLength(4);
+    // Round 3: the ledger is per archive, next to it.
+    expect(fs.readFileSync(first.archive.replace(/\.jsonl$/, ".requeued.jsonl"), "utf8").split("\n").filter(Boolean)).toHaveLength(5);
     release();
     await waitFor(() => actors.status(fresh.id).status === "idle" &&
       actors.messages(fresh.id).filter(message => message.direction === "out" && message.source === `mesh:${TOPIC}`).length === 2);
@@ -296,9 +316,9 @@ describe("resident stop forwarding (smarty-dev#16416)", () => {
     const stopped = await client.setActor({ operation: "stop", id: actor.id, dropQueued: true } as Parameters<ResidentActorClient["setActor"]>[0], undefined, caller);
     expect(stopped.status).toBe("stopped");
     const { archive, counts } = stopArchive(stopped);
-    expect(counts).toEqual({ queued: 3, parked: 0, overflow: 0, deadLetter: 0 });
+    expect(counts).toEqual({ queued: 3, parked: 0, overflow: 0, deadLetter: 0, inFlight: 1, settled: 0 });
     expect(path.dirname(archive)).toBe(path.join(root, "actors", actor.id, "stopped-queues"));
-    expect(fs.readFileSync(archive, "utf8").split("\n").filter(Boolean)).toHaveLength(4);
+    expect(fs.readFileSync(archive, "utf8").split("\n").filter(Boolean)).toHaveLength(5);
   }, 30_000);
 });
 
@@ -350,10 +370,10 @@ describe("queued-work guard, round 2 (pi-fabric#1572)", () => {
     fs.copyFileSync(archive, copy);
     expect(await refusedFor(copy)).toMatch(/requeueArchived refused/);
     expect(actors.status(fresh.id).queued).toBe(0);
-    expect(fs.existsSync(path.join(root, "actors", fresh.id, "requeued-archives.jsonl"))).toBe(false);
-    // The archive the stop recorded is fed, callerless, with the provenance the stop archived.
+    expect(fs.existsSync(archive.replace(/\.jsonl$/, ".requeued.jsonl"))).toBe(false);
+    // The archive the stop recorded is fed, callerless, with the provenance the stop archived (and, round 3, its in-flight item).
     const fed = await actors.requeueArchived(fresh.id, archive);
-    expect(fed).toMatchObject({ id: fresh.id, archive, sha256, requeued: 2, filtered: 0, alreadyRequeued: 0, skipped: [] });
+    expect(fed).toMatchObject({ id: fresh.id, archive, sha256, requeued: 3, filtered: 0, alreadyRequeued: 0, skipped: [] });
     expect(markers(meshRecords(root, fresh.id))).toEqual(["event-0", "event-1"]);
     expect(meshRecords(root, fresh.id).map(record => record.payload.from.id)).toEqual([from.id, from.id]);
   }, 30_000);
@@ -374,7 +394,8 @@ describe("queued-work guard, round 2 (pi-fabric#1572)", () => {
     expect(markers(meshRecords(root, fresh.id))).toEqual(["NEW-STATE"]);
     const fed = await actors.requeueArchived(fresh.id, archive);
     expect(markers(meshRecords(root, fresh.id))).toEqual(["NEW-STATE", "B-OLD"]);
-    expect(fed).toMatchObject({ requeued: 1, superseded: 1, filtered: 0, alreadyRequeued: 0 });
+    // requeued: B-OLD and (round 3) the old activation's in-flight item.
+    expect(fed).toMatchObject({ requeued: 2, superseded: 1, filtered: 0, alreadyRequeued: 0 });
   }, 30_000);
 
   it("P3: remove refuses while stop archives or held dead letters exist; with dropQueued it keeps them", async () => {
@@ -455,4 +476,263 @@ describe("queued-work guard, round 2 (pi-fabric#1572)", () => {
     expect(deadLetterLines(root, actor.id).map(line => (JSON.parse(line) as { event: MeshEvent }).event.id)).toEqual(waiting.map(event => event.id));
     expect(filtered(actors, actor.id)).toEqual([]);
   }, 90_000);
+});
+
+// pi-fabric#1572 round 3: astra F1/F3, the same-name restore (astra P1 c6385171802), fabric-store P2 a-e and the resident removal.
+describe("queued-work guard, round 3 (pi-fabric#1572)", () => {
+  const archiveLines = (archive: string) => fs.readFileSync(archive, "utf8").split("\n").filter(Boolean)
+    .map(line => JSON.parse(line) as { kind: string; item?: { source?: string; payload?: unknown; settledWindow?: unknown }; counts?: unknown });
+  const providerFor = (fixture: ReturnType<typeof setup>) => {
+    const participants = { scheduleRefresh() {}, list: () => [], get: () => undefined } as unknown as FabricParticipantSource;
+    const main = { id: identity.id, local: true, matches: (id: string) => id === identity.id } as FabricMainAgentTarget;
+    const lifecycle = new LifecycleBroker(fixture.mesh, identity, participants, { enabled: false, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    const provider = new AgentsProvider(fixture.agents, fixture.actors, new GlobalActorRegistry(fixture.root, 64 * 1024), main, participants, undefined, lifecycle);
+    const context: FabricInvocationContext = {
+      cwd: process.cwd(), signal: undefined, parentToolCallId: "test-parent", nestedToolCallId: "test-nested",
+      extensionContext: {} as FabricInvocationContext["extensionContext"], activity() {}, update() {},
+    };
+    return { provider, context };
+  };
+  const settledPayload = (marker: string) => ({ event: "agent_settled", session: { id: "observed-a", cwd: process.cwd() }, digest: {}, transcript: [],
+    signal: { payload: { type: "agent_settled", source: "extension" }, idle: true, observedAt: 123 }, marker });
+
+  it("F1: an internal stop and a non-persistent close with queued work are never refused and settle the waiting asks", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-queued-work-ephemeral-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
+      actorRoot: path.join(root, "actors"), persistent: false,
+    });
+    closers.push(async () => { await agents.close(); });
+    // An internal (non-explicit) stop of an actor holding a queued ask stops as on e50db08f.
+    const first = await actors.create({ name: "internal-stop", instructions: "Work.", responseMode: "text" });
+    const hanging = actors.ask(first.id, "HANG").catch((error: unknown) => error);
+    await waitFor(() => actors.status(first.id).status === "running");
+    const waiting = actors.ask(first.id, "queued behind the hanging run").catch((error: unknown) => error);
+    await expect(actors.stop(first.id)).resolves.toMatchObject({ status: "stopped", queued: 0 });
+    expect(await waiting).toMatchObject({ message: expect.stringContaining("was stopped while messages were queued") });
+    await hanging;
+    // The non-persistent close stops every actor (session-reset) despite its queued work, and does not hang.
+    const second = await actors.create({ name: "ephemeral", instructions: "Work.", responseMode: "text" });
+    const inFlight = actors.ask(second.id, "HANG").catch((error: unknown) => error);
+    await waitFor(() => actors.status(second.id).status === "running");
+    const queued = actors.ask(second.id, "queued behind the hanging run").catch((error: unknown) => error);
+    expect(actors.status(second.id).queued).toBe(1);
+    const closed = actors.close().then(() => "closed");
+    expect(await Promise.race([closed, new Promise(resolve => setTimeout(() => resolve("close hung"), 15_000))])).toBe("closed");
+    expect(await queued).toMatchObject({ message: expect.stringContaining("was stopped while messages were queued") });
+    await inFlight;
+  }, 60_000);
+
+  it("F3: an explicit stop refuses an activation in flight; with dropQueued the in-flight item is archived", async () => {
+    const { root, actors } = setup();
+    const actor = await actors.create({ name: "busy-supervisor", instructions: "Supervise.", topics: [TOPIC] });
+    const release = await holdWorker(actors, root, actor.id);
+    expect(actors.status(actor.id)).toMatchObject({ status: "running", queued: 0 });
+    const refusal = await actors.stop(actor.id, undefined, false, "actors.stop", { explicit: true }).then(info => info, (error: unknown) => error);
+    expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "stop", actorId: actor.id,
+      counts: { queued: 0, parked: 0, overflow: 0, deadLetter: 0, inFlight: 1, settled: 0 } });
+    expect((refusal as Error).message).toMatch(/in-flight 1.*Wait until it is idle, or pass dropQueued: true/);
+    expect(actors.status(actor.id).status).toBe("running");
+    const stopped = await actors.stop(actor.id, undefined, false, "actors.stop", { explicit: true, dropQueued: true });
+    const { archive, counts } = stopArchive(stopped);
+    expect(stopped.status).toBe("stopped");
+    expect(counts).toEqual({ queued: 0, parked: 0, overflow: 0, deadLetter: 0, inFlight: 1, settled: 0 });
+    const lines = archiveLines(archive);
+    expect(lines.map(line => line.kind)).toEqual(["header", "in-flight"]);
+    expect(lines[1]!.item).toMatchObject({ source: "direct", payload: { message: "LIVE_WITH_PROGRESS" } });
+    release();
+    // A second explicit stop of the stopped actor has nothing in flight of its own left to refuse for.
+    await expect(actors.stop(actor.id, undefined, false, "actors.stop", { explicit: true })).resolves.toMatchObject({ status: "stopped" });
+  }, 30_000);
+
+  it("same-name restore: stop with dropQueued, create the same name, requeueArchived queues every archived item; forgeries stay refused", async () => {
+    const fixture = setup(10);
+    const { root, mesh, actors } = fixture;
+    const { provider, context } = providerFor(fixture);
+    const old = await actors.create({ name: "restored-supervisor", instructions: "Supervise.", topics: [TOPIC], coalesce: false });
+    const releaseOld = await holdWorker(actors, root, old.id);
+    for (let index = 0; index < 3; index++) await publish(mesh, index);
+    await waitFor(() => actors.status(old.id).queued === 3);
+    // The documented flow, on the agents tool: stop with dropQueued, create the same name, requeueArchived.
+    const stopped = await provider.invoke("stop", { id: old.id, dropQueued: true }, context) as FabricActorInfo;
+    const { archive, sha256 } = stopArchive(stopped);
+    releaseOld();
+    await waitFor(() => actors.inFlightCount() === 0);
+    const fresh = await provider.invoke("create", { name: "restored-supervisor", instructions: "Supervise.", topics: ["queued-work.other"], coalesce: false },
+      context) as FabricActorInfo;
+    expect(fresh.id).not.toBe(old.id);
+    await waitFor(() => !fs.existsSync(path.join(root, "actors", old.id)));
+    const releaseFresh = await holdWorker(actors, root, fresh.id);
+    const fed = await provider.invoke("requeueArchived", { id: fresh.id, archive }, context) as actorTypes.FabricActorRequeueResult;
+    expect(fed).toMatchObject({ id: fresh.id, sha256, requeued: 4, filtered: 0, superseded: 0, alreadyRequeued: 0, skipped: [] });
+    const moved = fed.archive;
+    expect(moved).toMatch(new RegExp(`session-archive.*${old.id}\\.recoverable-[0-9TZ]+/stopped-queues/${path.basename(archive)}$`));
+    expect(markers(meshRecords(root, fresh.id))).toEqual(["event-0", "event-1", "event-2"]);
+    expect(actors.status(fresh.id).queued).toBe(4);
+    // Each archive is requeued once, through either path.
+    await expect(actors.requeueArchived(fresh.id, moved)).resolves.toMatchObject({ requeued: 0, alreadyRequeued: 4 });
+    // Another name in the same root and project is refused, as are an edited copy and a forged archive in a recoverable dir.
+    const other = await actors.create({ name: "another-supervisor", instructions: "Supervise.", topics: ["queued-work.other"], coalesce: false });
+    await expect(actors.requeueArchived(other.id, moved)).rejects.toThrow(/only a successor named restored-supervisor takes it/);
+    const edited = fs.readFileSync(moved, "utf8").replace("event-0", "event-X");
+    const tampered = path.join(path.dirname(moved), `20261024T000000001Z-${createHash("sha256").update(edited).digest("hex").slice(0, 12)}.jsonl`);
+    fs.writeFileSync(tampered, edited);
+    await expect(actors.requeueArchived(fresh.id, tampered)).rejects.toThrow(/no stop record carried with it/);
+    const forgedDir = path.join(path.dirname(path.dirname(path.dirname(moved))), `${old.id}.recoverable-20261024T000000000Z`, "stopped-queues");
+    fs.mkdirSync(forgedDir, { recursive: true });
+    const forgedFile = path.join(forgedDir, path.basename(moved));
+    fs.copyFileSync(moved, forgedFile);
+    await expect(actors.requeueArchived(fresh.id, forgedFile)).rejects.toThrow(/no stop record carried with it/);
+    expect(actors.status(fresh.id).queued).toBe(4);
+    releaseFresh();
+  }, 60_000);
+
+  it("P2 a/e: setActivationFilter counts and holds a queued interval agent_settled item; the same filter again is a no-op; a changed one names dropQueued", async () => {
+    const { root, actors } = setup();
+    const actor = await actors.create({ name: "settled-observer", instructions: "Observe.", events: ["agent_settled"], activation: { minIntervalMs: 60_000 } });
+    const release = await holdWorker(actors, root, actor.id);
+    expect(actors.dispatchHostEvent("agent_settled", settledPayload("leading"))).toBe(1);
+    await waitFor(() => actors.status(actor.id).queued === 1);
+    const SETTLES: FabricActorActivationFilter = [{ id: "settles", source: ["host:agent_settled"] }];
+    const refusal = await actors.setActivationFilter(actor.id, SETTLES).then(info => info, (error: unknown) => error);
+    expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "setActivationFilter", counts: { skipped: 1, queued: 1 } });
+    expect((refusal as Error).message).toMatch(/Re-applying the current filter unchanged is a no-op.*pass dropQueued: true/);
+    expect(actors.status(actor.id).activationFilter).toBeUndefined();
+    const changed = await actors.setActivationFilter(actor.id, SETTLES, undefined, undefined, undefined, { dropQueued: true });
+    expect(changed).toMatchObject({ movedToDeadLetter: 1, queued: 0 });
+    // The identical filter again: a no-op, never refused.
+    await expect(actors.setActivationFilter(actor.id, SETTLES)).resolves.toMatchObject({ queued: 0 });
+    release();
+    await waitFor(() => actors.status(actor.id).status === "idle");
+    // Held, never filtered away, while the filter skips it; clearing the filter brings it back.
+    expect(deadLetterLines(root, actor.id).map(line => JSON.parse(line) as { source: string; heldBy?: unknown }))
+      .toEqual([expect.objectContaining({ source: "host:agent_settled", heldBy: expect.objectContaining({ ruleId: "settles", raw: true }) })]);
+    expect(filtered(actors, actor.id)).toEqual([]);
+    await actors.setActivationFilter(actor.id, null);
+    await waitFor(() => deadLetterLines(root, actor.id).length === 0);
+  }, 30_000);
+
+  it("P2 b: an explicit stop counts pending settled windows; dropQueued archives them", async () => {
+    const { root, actors } = setup();
+    const actor = await actors.create({ name: "window-observer", instructions: "Observe.", events: ["agent_settled"], activation: { minIntervalMs: 60_000 } });
+    const release = await holdWorker(actors, root, actor.id);
+    actors.dispatchHostEvent("agent_settled", settledPayload("leading"));
+    await waitFor(() => actors.status(actor.id).queued === 1);
+    actors.dispatchHostEvent("agent_settled", settledPayload("trailing"));       // inside the interval: a pending window
+    const refusal = await actors.stop(actor.id, undefined, false, "actors.stop", { explicit: true }).then(info => info, (error: unknown) => error);
+    expect(refusal).toMatchObject({ code: QUEUED_WORK, counts: { queued: 1, inFlight: 1, settled: 1 } });
+    const { archive, counts } = stopArchive(await actors.stop(actor.id, undefined, false, "actors.stop", { explicit: true, dropQueued: true }));
+    expect(counts).toMatchObject({ queued: 1, inFlight: 1, settled: 1 });
+    const settled = archiveLines(archive).filter(line => line.kind === "settled");
+    expect(settled).toEqual([expect.objectContaining({ item: expect.objectContaining({ source: "host:agent_settled",
+      payload: expect.objectContaining({ marker: "trailing" }), settledWindow: expect.objectContaining({ sourceId: "session:observed-a" }) }) })]);
+    release();
+  }, 30_000);
+
+  it("P2 c: the requeue ledger is per archive: a second actor gets nothing already requeued", async () => {
+    const { root, mesh, actors } = setup(10);
+    const old = await actors.create({ name: "ledger-old", instructions: "Supervise.", topics: [TOPIC], coalesce: false });
+    const releaseOld = await holdWorker(actors, root, old.id);
+    for (let index = 0; index < 2; index++) await publish(mesh, index);
+    await waitFor(() => actors.status(old.id).queued === 2);
+    const { archive } = stopArchive(await actors.stop(old.id, undefined, false, "actors.stop", { dropQueued: true }));
+    releaseOld();
+    const first = await actors.create({ name: "ledger-first", instructions: "Supervise.", topics: ["queued-work.other"], coalesce: false });
+    const second = await actors.create({ name: "ledger-second", instructions: "Supervise.", topics: ["queued-work.other"], coalesce: false });
+    await holdWorker(actors, root, first.id);
+    await holdWorker(actors, root, second.id);
+    await expect(actors.requeueArchived(first.id, archive)).resolves.toMatchObject({ requeued: 3, alreadyRequeued: 0 });
+    await expect(actors.requeueArchived(second.id, archive)).resolves.toMatchObject({ requeued: 0, alreadyRequeued: 3 });
+    expect(meshRecords(root, second.id)).toEqual([]);
+  }, 30_000);
+
+  it("P2 d: the agents.stop tool and /fabric stop refuse an actor holding work and stop it with dropQueued", async () => {
+    const fixture = setup();
+    const { root, actors, agents } = fixture;
+    const { provider, context } = providerFor(fixture);
+    const tool = await actors.create({ name: "tool-stopped", instructions: "Supervise.", topics: [TOPIC] });
+    const releaseTool = await holdWorker(actors, root, tool.id);
+    await expect(provider.invoke("stop", { id: tool.id }, context)).rejects.toMatchObject({ code: QUEUED_WORK, counts: { inFlight: 1 } });
+    expect(actors.status(tool.id).status).toBe("running");
+    await expect(provider.invoke("stop", { id: tool.id, dropQueued: true }, context)).resolves.toMatchObject({ status: "stopped", stoppedQueue: expect.anything() });
+    releaseTool();
+    const command = await actors.create({ name: "command-stopped", instructions: "Supervise.", topics: [TOPIC] });
+    const releaseCommand = await holdWorker(actors, root, command.id);
+    const notices: Array<[string, string]> = [];
+    const deps = { state: { ensure: async () => {}, actors, agents } } as unknown as Parameters<typeof runFabricCommand>[1];
+    const commandContext = { ui: { notify: (text: string, level: string) => { notices.push([text, level]); } } } as unknown as Parameters<typeof runFabricCommand>[3];
+    const run = (text: string) => runFabricCommand({} as Parameters<typeof runFabricCommand>[0], deps, text, commandContext, async () => undefined,
+      {} as Parameters<typeof runFabricCommand>[5]);
+    await run(`stop ${command.id}`);
+    expect(notices.at(-1)).toEqual([expect.stringMatching(/stop refused and nothing changed.*dropQueued/), "error"]);
+    expect(actors.status(command.id).status).toBe("running");
+    await run(`stop ${command.id} --drop-queued`);
+    expect(notices.at(-1)).toEqual([expect.stringMatching(/^Stopped Fabric actor .*queued work archived to /), "info"]);
+    expect(actors.status(command.id).status).toBe("stopped");
+    releaseCommand();
+  }, 30_000);
+});
+
+describe("resident removal forwarding (pi-fabric#1572 round 3)", () => {
+  it("removeActor forwards dropQueued to the owning resident, and an owner without queuedWork support is refused before dispatch", async () => {
+    installInProcessResidentFence();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-queued-work-remove-"));
+    roots.push(root);
+    const rootIdentity = { id: "session:queued-remove", name: "Main", kind: "main" as const, sessionId: "queued-remove" };
+    const config: ResidentHostConfig = {
+      format: RESIDENT_HOST_FORMAT, rootId: rootIdentity.id, sessionId: rootIdentity.sessionId,
+      cwd: root, projectRoot: root, meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"),
+      residencyRoot: residentRoot(path.join(root, "mesh"), rootIdentity.id), fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
+      mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fabricExtensionPath: path.resolve("dist/index.js"),
+      piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
+      piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
+    };
+    fs.mkdirSync(config.residencyRoot, { recursive: true });
+    fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
+    const mesh = new MeshStore(config.meshRoot, 65_536, 1_000);
+    const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: rootIdentity.id, rootId: rootIdentity.id, identity: rootIdentity });
+    participants.registerSource(() => [{
+      format: 1, id: rootIdentity.id, kind: "root", rootId: rootIdentity.id, ownerHostId: rootIdentity.id, ownerIdentityId: rootIdentity.id,
+      name: "Main", status: "idle", residency: "session", runner: "pi", transport: "host", capabilities: [],
+      sessionId: rootIdentity.sessionId, startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
+    }]);
+    const host = new ResidentHost(config);
+    closers.push(async () => { await host.close(); await participants.close(); });
+    await participants.start();
+    await host.start();
+    const client = new ResidentActorClient(config.meshRoot, config.rootId);
+    const caller = { identity: rootIdentity, hostId: rootIdentity.id };
+    const actor = await host.actors.create({ name: "resident-removed", instructions: "Supervise.", residency: "durable", topics: [TOPIC], coalesce: false });
+    const release = await holdWorker(host.actors, root, actor.id);
+    for (let index = 0; index < 2; index++) await publish(mesh, index);
+    await waitFor(() => host.actors.status(actor.id).queued === 2);
+    const { archive } = stopArchive(await client.setActor({ operation: "stop", id: actor.id, dropQueued: true }, undefined, caller));
+    release();
+    await waitFor(() => host.actors.inFlightCount() === 0);
+    const bytes = fs.readFileSync(archive);
+    // Without dropQueued the owner refuses (typed, over the wire); nothing changes.
+    await expect(client.removeActor(actor.id)).rejects.toMatchObject({ code: QUEUED_WORK, operation: "remove", counts: { archived: 1 } });
+    expect(host.actors.status(actor.id).status).toBe("stopped");
+    // An owner that does not publish queuedWork support would ignore dropQueued: refused before dispatch.
+    const ownerPath = path.join(config.residencyRoot, "owner.json");
+    const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8")) as Record<string, unknown>;
+    const { queuedWork, ...older } = owner;
+    expect(queuedWork).toBe(1);
+    fs.writeFileSync(ownerPath, JSON.stringify(older));
+    await expect(client.removeActor(actor.id, undefined, { dropQueued: true })).rejects.toThrow(/predates dropQueued.*No request was dispatched/);
+    expect(host.actors.status(actor.id).status).toBe("stopped");
+    fs.writeFileSync(ownerPath, JSON.stringify(owner));
+    // With dropQueued the removal goes through and keeps the archive under session-archive.
+    await expect(client.removeActor(actor.id, undefined, { dropQueued: true })).resolves.toMatchObject({ removed: true });
+    await waitFor(() => !fs.existsSync(path.join(root, "actors", actor.id)));
+    const base = path.join(config.meshRoot, "session-archive", encodeURIComponent(rootIdentity.id));
+    const kept = fs.readdirSync(base).filter(name => name.startsWith(`${actor.id}.recoverable-`));
+    expect(kept).toHaveLength(1);
+    expect(fs.readFileSync(path.join(base, kept[0]!, "stopped-queues", path.basename(archive))).equals(bytes)).toBe(true);
+  }, 60_000);
 });

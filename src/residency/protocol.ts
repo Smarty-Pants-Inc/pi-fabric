@@ -440,6 +440,11 @@ export interface ResidentHostOwner {
   requestExpiry?: 1;
   /** Operation-scoped retry keys implemented by this loaded host, not desired config. */
   creationIdempotency?: 1;
+  /**
+   * pi-fabric#1572 round 3: the loaded host honours dropQueued on stop, removeActor, setActivationFilter and
+   * operatorActor. A client never sends dropQueued to an owner without it: an older host would ignore the field.
+   */
+  queuedWork?: 1;
   /** Attestation from the loaded host, never desired config.json. */
   releaseRoot?: string;
   configDigest?: string;
@@ -527,6 +532,8 @@ interface ResidentRemoveActorCommand {
   requestId: string;
   rootId: string;
   id: string;
+  /** pi-fabric#1572 round 3: remove despite kept work (smarty-dev#16416); sent only to an owner publishing queuedWork: 1. */
+  dropQueued?: true;
   createdAt: number;
 }
 
@@ -612,7 +619,7 @@ export interface ResidentOperatorActorCommand {
   action: "stop" | "remove";
   id: string;
   dryRun?: boolean;
-  /** stop only (smarty-dev#16416): archive queued work instead of refusing. */
+  /** stop: archive queued work instead of refusing (smarty-dev#16416); remove: also take kept archives (pi-fabric#1572 round 3). */
   dropQueued?: boolean;
   confirmDeadRoot?: string;
   requestId: string;
@@ -679,6 +686,18 @@ export const assertResidentCommandSupported = (owner: ResidentHostOwner, operati
       !(supported as readonly string[]).includes(operation)) {
     throw new ResidentCommandUnsupportedError();
   }
+};
+
+/**
+ * pi-fabric#1572 round 3: a dropQueued request goes only to an owner that publishes queuedWork: 1. An older host
+ * would ignore the unknown field (a stop or removal without the archive it asked for): refuse before dispatch.
+ */
+export const assertResidentDropQueuedSupported = (owner: ResidentHostOwner, command: ResidentCommand): void => {
+  if ((command as { dropQueued?: unknown }).dropQueued === undefined || owner.queuedWork === 1) return;
+  throw new ResidentCommandUnsupportedError(
+    `The owning resident host ${owner.hostId} (pid ${owner.pid}) predates dropQueued and would ignore it; ` +
+    "complete the resident host handover to the current release before retrying. No request was dispatched.",
+  );
 };
 
 /** Fence explicit retry keys before publication; keep unkeyed calls compatible with older hosts. */

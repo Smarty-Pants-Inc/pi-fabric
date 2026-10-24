@@ -774,11 +774,21 @@ type ActorDeadLetter = { at: number; source: string; event: MeshEvent; batchQueu
   payload?: unknown; sender?: FabricMessageSender };
 /** A stop archive's file name in <actor dir>/stopped-queues/ (smarty-dev#16416). */
 const STOP_ARCHIVE_NAME = /^[0-9TZ]+-[0-9a-f]{12}\.jsonl$/;
-/** One line of a stop archive (smarty-dev#16416). */
+/** One line of a stop archive (smarty-dev#16416; in-flight and settled: pi-fabric#1572 round 3). */
 type StoppedQueueLine =
   | { format: 1; kind: "header"; actorId: string; actorName: string; rootId: string; stoppedAt: number; counts: FabricActorQueueCounts }
-  | { kind: "queued" | "overflow" | "parked"; item: Record<string, unknown> }
+  | { kind: "in-flight" | "queued" | "overflow" | "parked" | "settled"; item: Record<string, unknown> }
   | { kind: "dead-letter"; entry?: ActorDeadLetter; raw?: string };
+/**
+ * pi-fabric#1572 round 3: the stop records next to the archives, in <actor dir>/stopped-queues/. The manager appends
+ * one per archive, with the same path and sha256 as the MOVED-TO message; a removal moves it to session-archive/
+ * with the archives, where it authenticates a same-name successor's requeueArchived.
+ */
+const STOP_RECORDS_NAME = "moved-to.jsonl";
+type StopRecord = { format: 1; kind: "MOVED-TO"; archive: string; sha256: string; actorId: string; actorName: string; rootId: string;
+  project?: string; stoppedAt: number; counts: FabricActorQueueCounts };
+/** <meshRoot>/session-archive/<rootId>/<actorId>.recoverable-<stamp>/, where a removal keeps an actor's recoverable work. */
+const RECOVERABLE_DIR_NAME = /^(.+)\.recoverable-[0-9TZ]+$/;
 
 export class ActorPreparationError extends Error {
   readonly code: string = "FABRIC_ACTOR_PREPARATION_FAILED";
@@ -2584,8 +2594,9 @@ export class ActorManager {
         { skipped: total, queued: skipped.length - overflow, overflow, deadLetter: skippedDeadLetters.length },
         `Fabric actor ${actor.name} (${actor.id}): the new activationFilter would skip ${total} already queued item(s) ` +
         `(queued ${skipped.length - overflow}, overflow ${overflow}, dead-letter ${skippedDeadLetters.length}); ` +
-        `setActivationFilter refused and nothing changed. ` +
-        `Pass dropQueued: true to hold them in the actor's dead-letter queue instead.`);
+        `setActivationFilter refused and nothing changed. Re-applying the current filter unchanged is a no-op and never refused; ` +
+        `to change it over this backlog, pass dropQueued: true, which holds those items in the actor's dead-letter queue ` +
+        `(never deleted) until the filter no longer skips them.`);
     }
     beforeCommit?.(actor.id);
     // Durable in the dead-letter file before the filter or the queue changes; a failure changes nothing.
@@ -2623,21 +2634,24 @@ export class ActorManager {
   #newFilterSkips(actor: ManagedActor, candidate: FabricActorActivationFilter, maxAgeMs?: number): {
     items: Array<{ item: ActorQueueItem; ruleId: string; overflow: boolean }>; deadLetters: Array<{ entry: ActorDeadLetter; ruleId: string }> } {
     const skips: Array<{ item: ActorQueueItem; ruleId: string; overflow: boolean }> = [];
+    const now = Date.now();
+    // An item the current (unexpired) filter already skips is not counted: the new filter does not change its fate,
+    // so re-applying the current filter is a no-op, never refused (pi-fabric#1572 round 3, fabric-store P2 7).
+    // Judged without expiring anything.
+    const current = actor.activationFilter && !(actor.activationFilterExpiresAt !== undefined && now >= actor.activationFilterExpiresAt)
+      ? actor.activationFilter : undefined;
     for (const [items, overflow] of [[actor.queue, false], [this.#overflow.get(actor.id) ?? [], true]] as const) {
       for (const item of items) {
-        const ruleId = this.#queuedFilterRule(actor, item, candidate);
-        if (ruleId) skips.push({ item, ruleId, overflow });
+        // Round 3 (fabric-store P2 2): an admitted interval agent_settled item counts too. #queuedFilterRule leaves it to
+        // the head skip, which would drop it under the new filter at dequeue: the same silent loss as any queued item.
+        const ruleId = this.#filteredBy(actor, item, candidate);
+        if (ruleId && !(current && this.#filteredBy(actor, item, current))) skips.push({ item, ruleId, overflow });
       }
     }
     const deadLetters: Array<{ entry: ActorDeadLetter; ruleId: string }> = [];
     if (this.#persistent && this.#deadLetterCount(actor.id) > 0) {
       const age = maxAgeMs ?? DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS;
-      const now = Date.now();
       const cutoff = now - age;
-      // An entry the current (unexpired) filter already skips at replay is not counted: the new filter does
-      // not change its fate, so re-applying a filter is not refused. Judged without expiring anything.
-      const current = actor.activationFilter && !(actor.activationFilterExpiresAt !== undefined && now >= actor.activationFilterExpiresAt)
-        ? actor.activationFilter : undefined;
       for (const entry of this.#readDeadLetters(actor.id)) {
         if (entry.heldBy || (age > 0 && Number.isFinite(entry.at) && entry.at < cutoff)) continue;
         const ruleId = this.#filteredBy(actor, { source: entry.source, payload: entry.event }, candidate);
@@ -3680,39 +3694,59 @@ export class ActorManager {
     await running.drain?.catch(() => undefined);
   }
 
-  /** Work a stop would otherwise discard, on the live and the executing object (smarty-dev#16416). */
-  #queuedWorkCounts(actor: ManagedActor, running: ManagedActor): FabricActorQueueCounts {
+  /**
+   * Work a stop would otherwise discard, on the live and the executing object (smarty-dev#16416). Round 3
+   * (pi-fabric#1572): the activation in flight (astra F3) and pending settled windows (fabric-store P2) count
+   * too. An actor already stopped has no activation of its own in flight: its first stop dealt with it.
+   */
+  #queuedWorkCounts(actor: ManagedActor, running: ManagedActor, stopped: boolean): FabricActorQueueCounts {
     return {
       queued: actor.queue.length + (running !== actor ? running.queue.length : 0),
       parked: this.#parked.get(actor.id)?.length ?? 0,
       overflow: this.#overflow.get(actor.id)?.length ?? 0,
       deadLetter: this.#deadLetterCount(actor.id),
+      inFlight: stopped ? 0 : this.#stoppableInFlight(actor.id).length,
+      settled: this.#pendingSettledWindows(actor.id).length,
     };
   }
 
+  /** The in-flight activation's items a stop would abandon (a cancelled one is already accounted for). */
+  #stoppableInFlight(actorId: string): ActorQueueItem[] {
+    const cancelled = this.#cancelledInFlight.get(actorId);
+    return this.#inFlightItems(actorId).filter(item => !cancelled?.has(item.id));
+  }
+
+  /** Pending agent_settled interval windows: accepted host events a stop cancels before they reach the queue. */
+  #pendingSettledWindows(actorId: string): Array<{ sourceId: string; pending: NonNullable<SettledWindow["pending"]> }> {
+    return [...(this.#settledWindows.get(actorId)?.entries() ?? [])]
+      .flatMap(([sourceId, window]) => window.pending ? [{ sourceId, pending: window.pending }] : []);
+  }
+
   /**
-   * Terminal stop. smarty-dev#16416: an actor holding queued, parked, overflow or dead-letter work is
-   * refused (FabricActorQueuedWorkError, before any effect) unless options.dropQueued; then that work
-   * is moved to a stop archive, never deleted. An idle, empty actor stops exactly as before. The
-   * preliminary stop of a removal (path actors.remove) keeps its own semantics.
+   * Terminal stop. smarty-dev#16416, round 3 (pi-fabric#1572): only an EXPLICIT operator stop (options.explicit:
+   * the agents.stop API and tool, /fabric stop, the operator CLI) refuses an actor holding work (an activation in
+   * flight, queued, parked, overflow, pending settled-window or dead-letter work) with FabricActorQueuedWorkError,
+   * before any effect. With options.dropQueued that work is moved to a stop archive first, never deleted. Internal
+   * stops (removal, non-persistent close's session reset) are never refused and stop exactly as on e50db08f; a
+   * removal with dropQueued archives the same way, so its work is kept with the removed tree.
    */
   async stop(id: string, beforeCommit?: (id: string) => void, wait = false, path: AgentRunStopPath = "actors.stop", options: FabricActorStopOptions = {}): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const running = this.#runningActor(actor.id)!;
     const stopped = actor.status === "stopped";
-    const guarded = path !== "actors.remove";
-    // A removal with dropQueued (pi-fabric#1572) archives the same way, so its work travels with the actor tree.
-    const archiving = guarded || options.dropQueued === true;
-    const counts = this.#queuedWorkCounts(actor, running);
-    const held = counts.queued + counts.parked + counts.overflow + counts.deadLetter;
-    if (guarded && held > 0 && options.dropQueued !== true) {
+    const counts = this.#queuedWorkCounts(actor, running, stopped);
+    const held = counts.queued + counts.parked + counts.overflow + counts.deadLetter + counts.inFlight + counts.settled;
+    if (options.explicit === true && held > 0 && options.dropQueued !== true) {
       throw new FabricActorQueuedWorkError("stop", actor.id, { ...counts },
         `Fabric actor ${actor.name} (${actor.id}) holds queued work (queued ${counts.queued}, parked ${counts.parked}, ` +
-        `overflow ${counts.overflow}, dead-letter ${counts.deadLetter}); stop refused and nothing changed. ` +
-        `Pass dropQueued: true to move that work to ${this.#stoppedQueueDirectory(actor.id)} and stop; ` +
-        `agents.requeueArchived feeds the archive to a recreated actor.`);
+        `overflow ${counts.overflow}, dead-letter ${counts.deadLetter}, in-flight ${counts.inFlight}, settled ${counts.settled}); ` +
+        `stop refused and nothing changed. Wait until it is idle, or pass dropQueued: true to move that work to ` +
+        `${this.#stoppedQueueDirectory(actor.id)} and stop; agents.requeueArchived feeds the archive to a recreated actor.`);
     }
     beforeCommit?.(actor.id);
+    // Round 3: the archive is durable BEFORE anything changes (synchronously, so nothing is admitted in between);
+    // a failed write throws with the actor still running and its work intact.
+    const archive = options.dropQueued === true && held > 0 ? this.#writeStopArchive(actor, running, stopped) : undefined;
     // Terminal stop cancels an unperformed repair, never rotates its journal.
     const resets = this.#pendingResets.get(actor.id);
     this.#pendingResets.delete(actor.id);
@@ -3720,7 +3754,7 @@ export class ActorManager {
     this.#stopRun(running, path);
     if (running !== actor) this.#stopRun(actor, path);
     // Synchronously, before any await: the stopped actor admits nothing new meanwhile.
-    const stoppedQueue = archiving && held > 0 ? this.#archiveStoppedQueue(actor, running) : undefined;
+    const stoppedQueue = archive ? this.#forgetArchivedWork(actor, running, archive) : undefined;
     await this.#releaseChildCompletionStore(actor);
     if (stopped && running === actor) {
       if (wait) await this.#joinStoppedRun(actor.id, path);
@@ -3743,16 +3777,21 @@ export class ActorManager {
   }
 
   /**
-   * smarty-dev#16416: move the queue, overflow, parked list and dead-letter file into
-   * <actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl. The archive is durable before the queue
-   * checkpoint and the dead-letter file forget the work; a failed write throws with the work intact.
-   * A waiting caller is still rejected (its ask cannot outlive the stop); its item is archived too.
+   * smarty-dev#16416: write the work a stop would discard to
+   * <actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl, durably (file and directory synced), BEFORE anything
+   * changes. Round 3 (pi-fabric#1572): the activation in flight and pending settled windows are archived too,
+   * and the stop record (archive path, sha256, the actor's name, root and project) is appended to
+   * stopped-queues/moved-to.jsonl, so it travels with the archive when a removal moves stopped-queues/ to
+   * session-archive/. Nothing is forgotten here; a failed write throws with the actor and its work intact.
    */
-  #archiveStoppedQueue(actor: ManagedActor, running: ManagedActor): FabricActorStoppedQueue {
+  #writeStopArchive(actor: ManagedActor, running: ManagedActor, stopped: boolean): { stoppedQueue: FabricActorStoppedQueue; deadLetters: boolean; stoppedAt: number } {
+    const inFlight = stopped ? [] : this.#stoppableInFlight(actor.id);
     const queued = [...actor.queue, ...(running !== actor ? running.queue : [])];
     const overflow = [...(this.#overflow.get(actor.id) ?? [])];
     const parked = [...(this.#parked.get(actor.id) ?? [])];
-    const sections: Array<["queued" | "overflow" | "parked", ActorQueueItem[]]> = [["queued", queued], ["overflow", overflow], ["parked", parked]];
+    const settled = this.#pendingSettledWindows(actor.id);
+    const sections: Array<["in-flight" | "queued" | "overflow" | "parked", ActorQueueItem[]]> =
+      [["in-flight", inFlight], ["queued", queued], ["overflow", overflow], ["parked", parked]];
     let deadLetterText = "";
     try { deadLetterText = fs.readFileSync(this.#deadLetterFile(actor.id), "utf8"); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -3760,11 +3799,20 @@ export class ActorManager {
     const deadLetters: StoppedQueueLine[] = deadLetterText.split("\n").filter(Boolean).map((line) => {
       try { return { kind: "dead-letter", entry: JSON.parse(line) as ActorDeadLetter }; } catch { return { kind: "dead-letter", raw: line }; }
     });
-    const counts: FabricActorQueueCounts = { queued: queued.length, parked: parked.length, overflow: overflow.length, deadLetter: deadLetters.length };
+    const counts: FabricActorQueueCounts = { queued: queued.length, parked: parked.length, overflow: overflow.length, deadLetter: deadLetters.length,
+      inFlight: inFlight.length, settled: settled.length };
     const stoppedAt = Date.now();
     const lines: StoppedQueueLine[] = [
       { format: 1, kind: "header", actorId: actor.id, actorName: actor.name, rootId: actor.rootId, stoppedAt, counts },
       ...sections.flatMap(([kind, items]) => items.map((item): StoppedQueueLine => ({ kind, item: this.#archiveRecord(actor.id, item) }))),
+      // A pending settled window holds an accepted agent_settled event the stop would cancel before it is queued.
+      ...settled.map(({ sourceId, pending }): StoppedQueueLine => {
+        const item = { id: pending.deliveryId ?? randomUUID(), source: "host:agent_settled", payload: pending.payload, createdAt: pending.observedAt,
+          ...(pending.images.length ? { images: pending.images } : {}), settledWindow: { sourceId, sourceRootId: pending.sourceRootId } };
+        try { return { kind: "settled", item: JSON.parse(JSON.stringify(item)) as Record<string, unknown> }; } catch {
+          return { kind: "settled", item: { id: item.id, source: item.source, createdAt: item.createdAt, unserializable: true } };
+        }
+      }),
       ...deadLetters,
     ];
     const text = lines.map((line) => `${JSON.stringify(line)}\n`).join("");
@@ -3774,15 +3822,29 @@ export class ActorManager {
     const archive = path.join(directory, `${new Date(stoppedAt).toISOString().replace(/[-:.]/g, "")}-${sha256.slice(0, 12)}.jsonl`);
     const fd = fs.openSync(archive, "wx", 0o600);                 // never overwrite an earlier archive
     try { fs.writeFileSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    const stoppedQueue: FabricActorStoppedQueue = { archive, sha256, counts };
+    const record: StopRecord = { format: 1, kind: "MOVED-TO", archive, sha256, actorId: actor.id, actorName: actor.name, rootId: actor.rootId,
+      ...(actor.project !== undefined ? { project: actor.project } : {}), stoppedAt, counts };
+    const records = fs.openSync(path.join(directory, STOP_RECORDS_NAME), "a", 0o600);
+    try { fs.writeSync(records, `${JSON.stringify(record)}\n`); fs.fsyncSync(records); } finally { fs.closeSync(records); }
     syncDirectoryChain(directory);
-    // Only now forget the work: the dead-letter file, then the queue checkpoint.
-    if (deadLetters.length) this.#writeDeadLetters(actor.id, []);
-    const reason = `Fabric actor ${actor.name} (${actor.id}) was stopped; its queued work was archived to ${archive}`;
+    return { stoppedQueue, deadLetters: deadLetters.length > 0, stoppedAt };
+  }
+
+  /**
+   * After #writeStopArchive and #stopRun: forget the archived work (the dead-letter file, then the queue
+   * checkpoint), reject waiting callers (an ask cannot outlive the stop; its item is archived as a caller's)
+   * and log the MOVED-TO pointer. The in-flight caller hears its run's abort, as on any stop.
+   */
+  #forgetArchivedWork(actor: ManagedActor, running: ManagedActor,
+    { stoppedQueue, deadLetters, stoppedAt }: { stoppedQueue: FabricActorStoppedQueue; deadLetters: boolean; stoppedAt: number }): FabricActorStoppedQueue {
+    const { archive, sha256, counts } = stoppedQueue;
+    if (deadLetters) this.#writeDeadLetters(actor.id, []);
+    const reason = `Fabric actor ${actor.name} (${actor.id}) was stopped while messages were queued; its queued work was archived to ${archive}`;
     for (const item of [...this.#takeQueued(actor), ...(running !== actor ? this.#takeQueued(running) : []), ...this.#takeParked(actor.id)]) {
       if (item.resolve || item.reject) item.reject?.(new Error(reason));
     }
     this.#persistQueue(actor.id, true);
-    const stoppedQueue: FabricActorStoppedQueue = { archive, sha256, counts };
     this.#recordMessage(actor, {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host", createdAt: stoppedAt,
       text: `MOVED-TO ${archive}\nsha256 ${sha256}`, data: { stoppedQueue: { ...stoppedQueue, counts: { ...counts } } },
@@ -3792,6 +3854,45 @@ export class ActorManager {
 
   #stoppedQueueDirectory(actorId: string): string {
     return path.join(this.#actorRoot, actorId, "stopped-queues");
+  }
+
+  /** <meshRoot>/session-archive/<rootId>/: where a removal keeps an actor's recoverable work (round 2). */
+  #recoverableRoot(rootId: string): string {
+    return path.join(this.mesh.root, "session-archive", encodeURIComponent(rootId));
+  }
+
+  /**
+   * pi-fabric#1572 round 3: the archive path a stop returned, or, once a removal moved that actor's stopped-queues/
+   * away, the same file in its newest <actorId>.recoverable-<stamp>/ under the target's root. Anything else is returned
+   * unchanged (and judged as given).
+   */
+  #locateStopArchive(file: string, target: ManagedActor): string {
+    if (fs.existsSync(file)) return file;
+    const directory = path.dirname(file);
+    const actorDir = path.dirname(directory);
+    if (path.basename(directory) !== "stopped-queues" || path.dirname(actorDir) !== path.resolve(this.#actorRoot)) return file;
+    const actorId = path.basename(actorDir);
+    let entries: string[];
+    try { entries = fs.readdirSync(this.#recoverableRoot(target.rootId)); } catch { return file; }
+    for (const entry of entries.filter(name => RECOVERABLE_DIR_NAME.exec(name)?.[1] === actorId).sort().reverse()) {
+      const candidate = path.join(this.#recoverableRoot(target.rootId), entry, "stopped-queues", path.basename(file));
+      if (fs.existsSync(candidate)) return path.resolve(candidate);
+    }
+    return file;
+  }
+
+  /** The stop records the manager appended next to its archives (round 3); a torn or foreign line is ignored. */
+  #readStopRecords(directory: string): StopRecord[] {
+    let text: string;
+    try { text = fs.readFileSync(path.join(directory, STOP_RECORDS_NAME), "utf8"); } catch { return []; }
+    return text.split("\n").flatMap((line) => {
+      try {
+        const value = JSON.parse(line) as Partial<StopRecord>;
+        return value?.format === 1 && value.kind === "MOVED-TO" && typeof value.archive === "string" && typeof value.sha256 === "string" &&
+          typeof value.actorId === "string" && typeof value.actorName === "string" && typeof value.rootId === "string" &&
+          (value.project === undefined || typeof value.project === "string") ? [value as StopRecord] : [];
+      } catch { return []; }
+    });
   }
 
   /**
@@ -3805,7 +3906,8 @@ export class ActorManager {
     const names = ["stopped-queues", "dead-letter.jsonl"].filter(name => fs.lstatSync(path.join(tree, name), { throwIfNoEntry: false }));
     if (!names.length) return undefined;
     const stamp = new Date().toISOString().replace(/[-:.]/g, "");
-    const target = path.join(this.mesh.root, "session-archive", encodeURIComponent(rootId), `${actorId}.recoverable-${stamp}`);
+    // stopped-queues/ carries the stop records (moved-to.jsonl, round 3) that authenticate its archives for a same-name successor.
+    const target = path.join(this.#recoverableRoot(rootId), `${actorId}.recoverable-${stamp}`);
     fs.mkdirSync(target, { recursive: true, mode: 0o700 });
     for (const name of names) fs.renameSync(path.join(tree, name), path.join(target, name));
     syncDirectoryChain(target);
@@ -3829,7 +3931,8 @@ export class ActorManager {
   async requeueArchived(id: string, archive: string, beforeCommit?: (id: string) => void): Promise<FabricActorRequeueResult> {
     const actor = this.#requireOwnedActiveActor(id);
     if (typeof archive !== "string" || !archive.trim()) throw new Error("requeueArchived requires archive: a stop archive path");
-    const file = path.resolve(archive);
+    // Round 3 (pi-fabric#1572): the path the stop returned still finds the archive after a removal moved it to session-archive/.
+    const file = this.#locateStopArchive(path.resolve(archive), actor);
     const name = path.basename(file);
     if (path.basename(path.dirname(file)) !== "stopped-queues" || !STOP_ARCHIVE_NAME.test(name)) {
       throw new Error(`requeueArchived reads only a stop archive (<actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl): ${archive}`);
@@ -3842,8 +3945,10 @@ export class ActorManager {
     if (!header || header.kind !== "header" || !("format" in header) || header.format !== 1) throw new Error(`Not a stop archive: ${file}`);
     // Round 2 (pi-fabric#1572): the file proves nothing by itself (anyone can compute its name's sha256). Only the
     // stop record of the actor it belongs to does; then its items keep the provenance that stop archived.
-    this.#assertRecordedStopArchive(file, sha256, header);
-    const ledger = path.join(this.#actorRoot, actor.id, "requeued-archives.jsonl");
+    this.#assertRecordedStopArchive(file, sha256, header, actor);
+    // Round 3 (fabric-store P2): the ledger is per ARCHIVE and sits next to it (it moves with it), not per target:
+    // each archived item is offered once, to whichever actor took it first; another actor then gets nothing again.
+    const ledger = path.join(path.dirname(file), name.replace(/\.jsonl$/, ".requeued.jsonl"));
     const offered = new Set<string>();
     try {
       for (const line of fs.readFileSync(ledger, "utf8").split("\n")) {
@@ -3882,7 +3987,7 @@ export class ActorManager {
             result.requeued++;
           }
         }
-        fs.writeSync(fd, `${JSON.stringify({ itemId: offer.itemId, archive: file, sha256, outcome, at: Date.now() })}\n`);
+        fs.writeSync(fd, `${JSON.stringify({ itemId: offer.itemId, archive: file, sha256, target: actor.id, outcome, at: Date.now() })}\n`);
         offered.add(offer.itemId);
       }
       fs.fsyncSync(fd);
@@ -3904,12 +4009,30 @@ export class ActorManager {
    * message log must hold the MOVED-TO record its stop wrote for exactly this path and full sha256. Anything
    * else is refused, so a file cannot grant a sender, verification or principal the stopped queue did not hold.
    */
-  #assertRecordedStopArchive(file: string, sha256: string, header: StoppedQueueLine): void {
+  #assertRecordedStopArchive(file: string, sha256: string, header: StoppedQueueLine, target: ManagedActor): void {
     const actorId = header.kind === "header" && typeof header.actorId === "string" ? header.actorId : undefined;
     const refuse = (why: string) => new Error(`requeueArchived refused ${file}: ${why}. ` +
       `Only an archive recorded by a stop of the actor it names is fed again.`);
-    if (!actorId) throw refuse("its header names no actor");
+    if (!actorId || header.kind !== "header") throw refuse("its header names no actor");
     this.#syncActorsFromRegistry();
+    // Round 3 (pi-fabric#1572): a removal (same-name create included) moved the archive with its stop records to
+    // <meshRoot>/session-archive/<rootId>/<actorId>.recoverable-<stamp>/stopped-queues/. Only a successor with the
+    // predecessor's name, in its root and project, takes it, and only as the carried stop record names it.
+    const directory = path.dirname(file);
+    const recoverable = path.dirname(directory);
+    const moved = RECOVERABLE_DIR_NAME.exec(path.basename(recoverable));
+    if (moved && typeof header.rootId === "string" && path.dirname(recoverable) === path.resolve(this.#recoverableRoot(header.rootId))) {
+      if (moved[1] !== actorId) throw refuse(`its recoverable directory belongs to ${moved[1]}, not ${actorId}`);
+      if (this.#actors.has(actorId) || this.#draining.has(actorId)) throw refuse(`actor ${actorId} still exists; requeue from its stopped-queues directory`);
+      const record = this.#readStopRecords(directory).find((entry) => entry.actorId === actorId && entry.sha256 === sha256 &&
+        path.basename(entry.archive) === path.basename(file) && path.basename(path.dirname(path.dirname(entry.archive))) === actorId);
+      if (!record) throw refuse(`no stop record carried with it names this file with sha256 ${sha256}`);
+      if (record.actorName !== header.actorName || record.rootId !== header.rootId) throw refuse("its header does not match its stop record");
+      if (record.actorName !== target.name) throw refuse(`only a successor named ${record.actorName} takes it, not ${target.name}`);
+      if (record.rootId !== target.rootId) throw refuse(`only a successor in root ${record.rootId} takes it`);
+      if ((record.project ?? null) !== (target.project ?? null)) throw refuse(`only a successor in project ${record.project ?? "(none)"} takes it`);
+      return;
+    }
     const source = this.#actors.get(actorId) ?? this.#draining.get(actorId);
     if (!source) throw refuse(`actor ${actorId} is not known here`);
     if (path.resolve(this.#stoppedQueueDirectory(actorId)) !== path.dirname(file)) throw refuse(`it is not in ${actorId}'s stopped-queues directory`);
@@ -7595,7 +7718,8 @@ export class ActorManager {
     const retained: ActorDeadLetter[] = [];
     const liveEntries = this.#readDeadLetters(actor.id).filter((entry) => {
       if (entry.heldBy) {
-        if (this.#queuedFilterRule(actor, { source: entry.source, payload: entry.heldBy.raw ? entry.payload : entry.event })) {
+        // Round 3: the full filter verdict (an interval agent_settled item included), not the queue pass's rule.
+        if (this.#filteredBy(actor, { source: entry.source, payload: entry.heldBy.raw ? entry.payload : entry.event })) {
           retained.push(entry);
           return false;
         }

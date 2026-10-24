@@ -17,6 +17,7 @@ import {
   ResidentActorAuthorizationError,
   ResidentCommandUnsupportedError,
   assertResidentCommandSupported,
+  assertResidentDropQueuedSupported,
   prepareResidentCreationCommand,
   type ResidentHostOwner,
   assertResidentActorToolCeiling,
@@ -155,13 +156,14 @@ export class ResidentActorClient {
     return response.actor;
   }
 
-  async removeActor(id: string, signal?: AbortSignal): Promise<{ removed: true; pending?: string; cleaned?: boolean }> {
+  async removeActor(id: string, signal?: AbortSignal, options: { dropQueued?: true } = {}): Promise<{ removed: true; pending?: string; cleaned?: boolean }> {
     const response = await this.#send({
       format: RESIDENT_HOST_FORMAT,
       operation: "removeActor",
       requestId: randomUUID(),
       rootId: this.#rootId,
       id,
+      ...(options.dropQueued === true ? { dropQueued: true as const } : {}),
       createdAt: Date.now(),
     }, signal);
     return { removed: true, ...(response.pending === undefined ? {} : { pending: response.pending }),
@@ -188,6 +190,7 @@ export class ResidentActorClient {
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
     if (!owner) throw new Error("Root resident host is not live");
     assertResidentCommandSupported(owner, command.operation);
+    assertResidentDropQueuedSupported(owner, command);
     if (command.operation === "releaseDrain") {
       if (owner.drain?.abi !== drainProtocol!.RESIDENT_DRAIN_ABI) throw new ResidentCommandUnsupportedError("The loaded resident lacks cooperative drain support; no request was dispatched");
       const expected = command.expected;

@@ -107,12 +107,14 @@ describe("actor settled round 3 event-driven regressions", () => {
     vi.advanceTimersByTime(900); // The normal original deadline must run first.
     expect(markers()).toEqual(["leading"]);
     expect.soft(scheduled.mock.calls, "full admission must not create a retry timer").toHaveLength(0);
-    await actors.setActivationFilter(actor.id, [
+    // pi-fabric#1572 round 3 (fabric-store P2 2): the admitted interval settle counts at set time; dropQueued holds it in
+    // the dead-letter queue, which frees its slot as the dequeue skip did.
+    const changed = await actors.setActivationFilter(actor.id, [
       { id: "drain-leading", source: ["host:agent_settled"], where: [{ path: "marker", equals: "leading" }] },
       { id: "drain-fillers", source: ["direct"] },
-    ]);
+    ], undefined, undefined, undefined, { dropQueued: true });
+    expect(changed).toMatchObject({ movedToDeadLetter: 1 }); // The leading item actually left the full queue.
     actors.resumeAfterRelease(); // Real #drain shifts/refills the full FIFO, not a poll.
-    expect(actors.status(actor.id).filterSkipped.count).toBeGreaterThanOrEqual(1); // The leading item was actually dequeued.
     actors.pauseForRelease(); // Keep workers gated after that real slot-freeing step.
     await new Promise<void>(resolve => setImmediate(resolve));
     expect(markers()).toEqual(["leading", "latest"]);
@@ -1372,8 +1374,7 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     else if (cancel === "remove") await actors.remove(actor.id);
     else {
       const definition = actors.definition(actor.id);
-      // smarty-dev#16416: the queued leading item is archived; the pending window is still cancelled.
-      await actors.stop(actor.id, undefined, false, "actors.stop", { dropQueued: true });
+      await actors.stop(actor.id);
       if (cancel === "recreate") expect((await actors.create(definition)).id).not.toBe(actor.id);
     }
     await first.close();
@@ -1637,9 +1638,7 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     vi.advanceTimersByTime(100);
     actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "old" });
     const timer = scheduled.mock.results[scheduled.mock.calls.findIndex(([, delay]) => delay === 900)]!.value;
-    await expect(actors.stop(actor.id)).rejects.toMatchObject({ code: "FABRIC_ACTOR_QUEUED_WORK", counts: { queued: 1 } }); // smarty-dev#16416
-    expect(cancelled).not.toHaveBeenCalledWith(timer);
-    await actors.stop(actor.id, undefined, false, "actors.stop", { dropQueued: true });
+    await actors.stop(actor.id);
     expect(cancelled).toHaveBeenCalledWith(timer);
     const replacement = await actors.create({ ...actors.definition(actor.id), name: actor.name });
     expect(replacement.id).not.toBe(actor.id);
@@ -1725,11 +1724,14 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     expect(admitted().map((message) => (message.data as { marker: string }).marker)).toEqual(["leading", "keep"]);
     expect(actors.status(actor.id).filterSkipped.count).toBe(2);
     actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "now-filtered" });
-    const changed = await actors.setActivationFilter(actor.id, [{ id: "new-filter", source: ["host:agent_settled"] }]);
-    expect(changed).toMatchObject({ queued: 2, filterSkipped: { count: 0 } });
+    // pi-fabric#1572 round 3 (fabric-store P2 2): the two admitted interval settles count; dropQueued holds them.
+    const newFilter = [{ id: "new-filter", source: ["host:agent_settled"] }];
+    await expect(actors.setActivationFilter(actor.id, newFilter)).rejects.toMatchObject({ code: "FABRIC_ACTOR_QUEUED_WORK", counts: { skipped: 2 } });
+    const changed = await actors.setActivationFilter(actor.id, newFilter, undefined, undefined, undefined, { dropQueued: true });
+    expect(changed).toMatchObject({ queued: 0, movedToDeadLetter: 2, filterSkipped: { count: 0 } });
     vi.advanceTimersByTime(1_000);
     expect(admitted()).toHaveLength(2);
-    expect(actors.status(actor.id)).toMatchObject({ queued: 2, filterSkipped: { count: 1 } });
+    expect(actors.status(actor.id)).toMatchObject({ queued: 0, filterSkipped: { count: 1 } });
     vi.advanceTimersByTime(2_000);
     expect(actors.status(actor.id).filterSkipped.count).toBe(1); // The trailing slot was consumed once.
   });
@@ -1751,18 +1753,23 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
       { id: "settles", source: ["host:agent_settled"] },
       { id: "errors", source: ["host:tool_error"] },
     ];
-    // smarty-dev#16416: the interval-managed settle is not counted; only the ordinary item would be skipped.
-    await expect(actors.setActivationFilter(actor.id, filter)).rejects.toMatchObject({ code: "FABRIC_ACTOR_QUEUED_WORK", counts: { skipped: 1 } });
+    // smarty-dev#16416, round 3 (pi-fabric#1572, fabric-store P2 2): the admitted interval-managed settle counts and is held
+    // like the ordinary item; its dequeue head skip would otherwise drop it. The pending window is not admitted work yet:
+    // it keeps its custody and is rechecked at its trailing boundary, as before.
+    await expect(actors.setActivationFilter(actor.id, filter)).rejects.toMatchObject({ code: "FABRIC_ACTOR_QUEUED_WORK", counts: { skipped: 2 } });
     const changed = await actors.setActivationFilter(actor.id, filter, undefined, undefined, undefined, { dropQueued: true });
-    expect(changed).toMatchObject({ queued: 1, movedToDeadLetter: 1, filterSkipped: { count: 0 } });
-    expect(snapshot().items).toEqual(before.items.filter(item => item.source === "host:agent_settled"));
+    expect(changed).toMatchObject({ queued: 0, movedToDeadLetter: 2, filterSkipped: { count: 0 } });
+    expect(snapshot().items).toEqual([]);
     expect(snapshot().settledWindows).toEqual(before.settledWindows); // Preserve pending custody and receipt.
-    const held = fs.readFileSync(path.join(directory, "dead-letter.jsonl"), "utf8").split("\n").filter(Boolean)
+    const held = () => fs.readFileSync(path.join(directory, "dead-letter.jsonl"), "utf8").split("\n").filter(Boolean)
       .map(line => JSON.parse(line) as { source: string; payload?: { marker: string }; heldBy?: { raw?: boolean } });
-    expect(held).toEqual([expect.objectContaining({ source: "host:tool_error", payload: { marker: "ordinary" }, heldBy: expect.objectContaining({ raw: true }) })]);
+    expect(held()).toEqual([
+      expect.objectContaining({ source: "host:agent_settled", payload: expect.objectContaining({ marker: "leading" }), heldBy: expect.objectContaining({ raw: true }) }),
+      expect.objectContaining({ source: "host:tool_error", payload: { marker: "ordinary" }, heldBy: expect.objectContaining({ raw: true }) }),
+    ]);
     expect(actors.messages(actor.id).filter(message => message.reason?.startsWith("filtered: "))).toEqual([]);
     vi.advanceTimersByTime(1_000);
-    expect(actors.status(actor.id)).toMatchObject({ queued: 1, filterSkipped: { count: 1 } });
+    expect(actors.status(actor.id)).toMatchObject({ queued: 0, filterSkipped: { count: 1 } });
     expect(snapshot().settledWindows ?? []).toEqual([]);
     vi.advanceTimersByTime(2_000);
     expect(actors.status(actor.id).filterSkipped.count).toBe(1);
@@ -1770,8 +1777,8 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
       .toEqual(["filtered: settles"]);
     actors.resumeAfterRelease();
     await new Promise<void>(resolve => setImmediate(resolve));
-    expect(actors.status(actor.id)).toMatchObject({ queued: 0, filterSkipped: { count: 2 } }); // Leading skips once at dequeue.
-    expect(fs.readFileSync(path.join(directory, "dead-letter.jsonl"), "utf8").split("\n").filter(Boolean)).toHaveLength(1); // still held
+    expect(actors.status(actor.id)).toMatchObject({ queued: 0, filterSkipped: { count: 1 } });
+    expect(held()).toHaveLength(2); // still held
     expect(actors.messages(actor.id).filter(message => message.direction === "out")).toEqual([]); // No worker launched.
   });
 

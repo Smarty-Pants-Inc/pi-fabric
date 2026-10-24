@@ -91,7 +91,9 @@ it.each(["Main", "proxy"] as const)("public reset leaves status, other actors an
     // All use the public provider, which routes to this resident's command dispatcher.
     const status = observe(f.provider.invoke("actorStatus", { id: f.actor.id }, f.context));
     const unrelated = observe(f.provider.invoke("setInstructions", { id: other.id, instructions: "Still serviceable" }, f.context));
-    const stop = observe(f.provider.invoke("stop", { id: f.actor.id }, f.context));
+    // pi-fabric#1572 round 3 (astra F2/F3): the public agents.stop is an explicit operator stop; over an activation in
+    // flight and a queued ask it is refused unless dropQueued, which archives them (the ask is still rejected).
+    const stop = observe(f.provider.invoke("stop", { id: f.actor.id, dropQueued: true }, f.context));
     const results = await promptly(Promise.all([status, unrelated, stop]));
     expect(results[0]).toMatchObject({ value: { id: f.actor.id } });
     expect(results[1]).toMatchObject({ value: { id: other.id } });
@@ -143,7 +145,8 @@ it("public stop joins its activation without blocking resident status or another
     await f.client.options.participants.refresh();
     observe(f.host.actors.ask(f.actor.id, "held until stop join")); await started;
     let stopped = false;
-    const stop = observe(f.provider.invoke("stop", { id: f.actor.id }, f.context).then(value => { stopped = true; return value; }));
+    // pi-fabric#1572 round 3 (astra F3): an explicit stop over an activation in flight needs dropQueued (it archives it).
+    const stop = observe(f.provider.invoke("stop", { id: f.actor.id, dropQueued: true }, f.context).then(value => { stopped = true; return value; }));
     await cancelled;
     expect(stopped).toBe(false);
     const status = observe(f.provider.invoke("actorStatus", { id: f.actor.id }, f.context));
@@ -191,7 +194,8 @@ it.each(["Main", "proxy"] as const)("%s bounded reset wait preserves a committed
     abort.abort();
     expect(await promptly(reset)).toMatchObject({ name: "ResidentOutcomeUnknownError", id: f.actor.id, requestId: decision.requestId,
       residentOutcome: { state: "committed", operation: "resetSession", id: f.actor.id } });
-    expect(await promptly(f.provider.invoke("stop", { id: f.actor.id }, f.context))).toMatchObject({ status: "stopped" });
+    // pi-fabric#1572 round 3 (astra F3): an explicit stop over an activation in flight needs dropQueued (it archives it).
+    expect(await promptly(f.provider.invoke("stop", { id: f.actor.id, dropQueued: true }, f.context))).toMatchObject({ status: "stopped" });
     await run;
     await waitFor(() => fs.readdirSync(path.join(f.config.residencyRoot, "processing")).length === 0);
     // The original bounded caller left after commit: retain its eventual definitive reply.

@@ -377,6 +377,9 @@ export interface AgentRunResult extends AgentRunRecord {
   /** Failed admission only: model/auth timed out before any transport launch was attempted.
    * The receipt remains terminal; an actor may separately retry its unlaunched activation. */
   launchPreparationTimeoutMs?: number;
+  /** Failed admission only (smarty-dev#16357): the bound root lane was unresolved, so no worker started.
+   * The receipt remains terminal; an actor may separately retry its unlaunched activation. */
+  launchDenial?: "lane-unresolved";
   status: "completed" | "failed" | "stopped" | "timed_out";
 }
 

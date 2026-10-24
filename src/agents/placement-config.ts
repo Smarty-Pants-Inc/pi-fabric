@@ -3,6 +3,19 @@ import path from "node:path";
 import fs from "node:fs";
 import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
 
+export type PlacementDeciderMode = "off" | "shadow" | "enforce";
+export interface FabricPlacementDeciderConfig {
+  /** Host-owned literal argv. No shell, interpolation, executable search or timeout knob.
+   * Shadow requires an installed observer-only invocation; wire JSON cannot select it. */
+  command: string[];
+  /** Host-only smarty-launch-context argv; the caller PID is appended by Fabric, never accepted from a request. */
+  contextCommand?: string[];
+  mode: PlacementDeciderMode;
+  /** One exact NATS subject token for the original owner's wake source, never a request pin. */
+  wakeSourceMachine: string;
+}
+export type PlacementDeciderConfig = FabricPlacementDeciderConfig;
+
 export interface AgentPlacementConfig {
   /** Host-only shell-free argv templates. No placement is enabled when absent. */
   command: string[];

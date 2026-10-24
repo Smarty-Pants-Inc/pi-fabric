@@ -1,4 +1,6 @@
 import type { ModelRouteDecision } from "./model-route.js";
+import type { PlacementGrant } from "./placement-contract.js";
+import type { PlacementRestartRequest, PlacementRestartDecision } from "./worker-protocol.js";
 import type { FabricTurnProvenance } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type {
@@ -96,7 +98,22 @@ export interface AgentSpawner {
   runId?: string;
 }
 
+export interface AgentPlacementBinding {
+  /** Host-derived child role/profile inputs; never copied from public spawn arguments. */
+  role?: string;
+  complexity?: "simple" | "normal" | "complex" | "delicate";
+  profile?: string;
+  memoryProfileRef?: string;
+  /** Host-verified activation binding, present only for an actor row owned by this root. */
+  actorActivation?: { actorId: string; rootId: string };
+  /** Stable writer launch identity for a durable queue retry; host-generated otherwise. */
+  launchId?: string;
+  generation?: number;
+}
+
 export interface AgentRunRequest {
+  /** Host-only placement role/profile binding; normalizeAgentRunRequest never reads this from public args. */
+  placement?: AgentPlacementBinding;
   /** Host-only: the actor queue item this run serves (smarty-dev#8935 recovery of an ENODEV-unconfirmed run). */
   activationId?: string;
   /** Explicit history class; routing still requires a separately prepared decision. */
@@ -453,6 +470,8 @@ export interface AgentHandleInfo {
 }
 
 export interface AgentWorkerOptions {
+  /** Host-selected restart correlation, not a grant or a decider configuration. */
+  placementRestart?: { launchId: string; generation: number; enforcing: boolean };
   /** Host-issued policy notices retained in every worker status record. */
   modelPolicyWarnings?: string[];
   /** Spawn-selected Fabric package root, retained in the durable run record. */
@@ -562,7 +581,18 @@ export interface AgentRunCarryOver {
   usage: AgentUsage;
 }
 
+/** Full decision plus a host-owned authority recheck. Shape-valid CLI PLACE and
+ * shadow hypotheticals cannot construct this carrier. No current path issues it. */
+export interface AgentTransportPlacementGrant {
+  readonly decision: PlacementGrant;
+  readonly revalidate: () => void;
+}
+
 export interface AgentTransportLaunch {
+  /** Host-only; never a public spawn argument, serialized flag, or shadow answer. */
+  placementGrant?: AgentTransportPlacementGrant;
+  /** Existing worker IPC callback, bound only to run id and compact placement facts. */
+  onPlacementRestart?: (request: PlacementRestartRequest) => Promise<PlacementRestartDecision>;
   id: string;
   name: string;
   cwd: string;

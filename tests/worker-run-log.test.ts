@@ -473,6 +473,7 @@ describe("worker run log", () => {
     const text = write(events, true, false).text;
     const file = logFile(text);
     const original = fs.statSync(file);
+    const originalFileId = fs.statSync(file, { bigint: true }).ino;
     const open = fs.openSync;
     const fsync = fs.fsyncSync;
     let source: number | undefined;
@@ -512,7 +513,8 @@ describe("worker run log", () => {
       { ...end, result: { elided: true, bytes: Buffer.byteLength(JSON.stringify(end.result)) }, resultMetadata: { terminate: true } },
     ]);
     expect(records.filter((event) => event.type === "message_end")).toEqual([{ type: "message_end", message }]);
-    expect(fs.statSync(file).ino).not.toBe(original.ino);
+    // Windows file IDs exceed Number's exact integer range; compare their BigInt value.
+    expect(fs.statSync(file, { bigint: true }).ino).not.toBe(originalFileId);
     expect(fs.statSync(file).mode & 0o777).toBe(original.mode & 0o777);
     expect(readEntries(compacted)).toEqual(readEntries(text));
     expect(readTranscript(compacted).streaming).toEqual(readTranscript(text).streaming);

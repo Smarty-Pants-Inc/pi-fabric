@@ -10,7 +10,7 @@ import type {
 } from "../types.js";
 import { activeFabricRoot, loadedFabricRoot, resolveAgentDir } from "../../core/agent-dir.js";
 import { fabricResourceRoot } from "../../core/fabric-resource.js";
-import { WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
+import { isPlacementRestartRequest, WORKER_PROTOCOL_VERSION } from "../worker-protocol.js";
 import { executeFile, findExecutable, spawnDetached } from "./process-utils.js";
 import { taskAgentEnvironment, withoutTaskBoundary } from "../task-environment.js";
 import { configureTaskGitReadOnlyEnvironment } from "../task-git-credential.js";
@@ -330,6 +330,28 @@ export class ProcessTransport implements AgentTransportAdapter {
       }
     } else {
     const placement = this.#placement();
+    // A present full grant is a host decision, never a hint for the old picker.
+    // Any incompatibility refuses it rather than falling back to another host.
+    const grant = request.placementGrant !== undefined
+      ? await (await import("./placement.js")).validatedTransportPlacementGrant(request) : undefined;
+    const restartFlags = ["--placement-launch-id", "--placement-generation", "--placement-enforcing"];
+    const placementFlags = new Map<string, string>();
+    for (let index = 0; index < request.workerArguments.length; index += 2) {
+      placementFlags.set(request.workerArguments[index]!, request.workerArguments[index + 1]!);
+    }
+    const hasRestartBinding = restartFlags.some(flag => placementFlags.has(flag));
+    const enforcingRestart = placementFlags.get("--placement-enforcing");
+    if ((request.onPlacementRestart && !hasRestartBinding) || hasRestartBinding &&
+        (restartFlags.some(flag => !placementFlags.has(flag)) ||
+          !isPlacementRestartRequest({ type: "placement.restart", launchId: placementFlags.get("--placement-launch-id"),
+            generation: Number(placementFlags.get("--placement-generation")) }) ||
+          enforcingRestart !== "true" && enforcingRestart !== "false")) {
+      throw new Error("Malformed remote placement restart binding");
+    }
+    if (grant && (request.onPlacementRestart || hasRestartBinding)) {
+      throw new Error("Remote placement restart bridge unavailable; refusing grant without restart coverage");
+    }
+    if (grant && !placement) throw new Error("Placement grant requires a configured transport");
     if (placement) {
       const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 5_000);
       const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
@@ -370,10 +392,24 @@ export class ProcessTransport implements AgentTransportAdapter {
       }
       if (!reason) {
         const { launchPlacedTask, selectFleetPlacement } = await import("./placement.js");
+        if (grant) return launchPlacedTask(request, placement, preflightDeadline, grant.host);
         const selection = await selectFleetPlacement(placement, request.cwd, request.signal, preflightDeadline);
         if (selection && "localReason" in selection) reason = selection.localReason;
-        else return launchPlacedTask(request, placement, preflightDeadline, selection?.host);
+        else {
+          if (enforcingRestart === "true") {
+            throw new Error("Remote placement restart bridge unavailable; refusing enforced restart placement");
+          }
+          // This one-shot remote protocol has no return IPC. In shadow mode
+          // retain its baseline restart behavior, but do not send a local
+          // manager callback or worker restart identity. Named follow-up:
+          // bridge correlated remote restarts before enabling this binding.
+          const workerArguments = request.workerArguments.filter((_argument, index, args) =>
+            index % 2 === 0 ? !restartFlags.includes(args[index]!) : !restartFlags.includes(args[index - 1]!));
+          const { onPlacementRestart: _onPlacementRestart, ...remoteRequest } = request;
+          return launchPlacedTask({ ...remoteRequest, workerArguments }, placement, preflightDeadline, selection?.host);
+        }
       }
+      if (grant) throw new Error(`Placement grant transport incompatible: ${reason}`);
       const args = new Map<string, string>();
       for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
       const log = args.get("--log-file");
@@ -449,7 +485,11 @@ export class ProcessTransport implements AgentTransportAdapter {
       selected.workerPath,
       prepared.workerArguments,
       request.cwd,
-      request,
+      // Retain only worker lifecycle callbacks in the restart IPC closure.
+      { signal: request.signal,
+        ...(request.authorize ? { authorize: request.authorize } : {}),
+        ...(request.onUnconfirmedExit ? { onUnconfirmedExit: request.onUnconfirmedExit } : {}),
+        ...(request.onPlacementRestart ? { onPlacementRestart: request.onPlacementRestart } : {}) },
       childEnvironment,
       scope,
       7_000, // allow the worker's five-second execution-child cleanup

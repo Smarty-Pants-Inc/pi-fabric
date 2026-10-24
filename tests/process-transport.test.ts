@@ -8,9 +8,12 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
-import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { DEFAULT_FABRIC_CONFIG, normalizeFabricConfig } from "../src/config.js";
+import * as placementModule from "../src/agents/transports/placement.js";
+import { normalizeAgentRunRequest } from "../src/agents/request.js";
+import type { PlacementPlace } from "../src/agents/placement-contract.js";
 import { WORKER_PROTOCOL_VERSION } from "../src/agents/worker-protocol.js";
-import type { AgentHandleInfo } from "../src/agents/types.js";
+import type { AgentHandleInfo, AgentTransportLaunch } from "../src/agents/types.js";
 
 // Capture before any test spy. Re-spying the fixture mock must never delegate to itself.
 const nativeReadFileSync = fs.readFileSync;
@@ -201,8 +204,8 @@ const args = new Map();`));
     expect(warn.mock.calls[0]?.[0]).toMatch(/protocol/i);
   });
 
-  it.each([1, 2])("never auto-selects a v%s worker without the current terminal/task-scratch boundaries", async version => {
-    expect(WORKER_PROTOCOL_VERSION).toBe(3);
+  it.each([1, 2, 3])("never auto-selects a v%s worker without the current terminal/task-scratch/restart boundaries", async version => {
+    expect(WORKER_PROTOCOL_VERSION).toBe(4);
     const f = fixture();
     const legacy = f.release("legacy-terminal-protocol", version);
     f.select(legacy);
@@ -210,7 +213,7 @@ const args = new Map();`));
     await probe(f, f.parent);
     expect(warn).toHaveBeenCalledOnce();
     expect(warn.mock.calls[0]?.[0]).toContain(`worker protocol ${version}`);
-    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 3");
+    expect(warn.mock.calls[0]?.[0]).toContain("worker protocol 4");
   });
 
   it("pins the parent's extension on incompatible fallback outside full-code mode", async () => {
@@ -768,6 +771,229 @@ describe("taskAgentEnvironment capped-boundary evidence (smarty-dev#8257)", () =
     expect(taskAgentEnvironment({ ...parent }, true)).toMatchObject({ FABRIC_TASK_MEMORY_MAX: parent.FABRIC_TASK_MEMORY_MAX,
       FABRIC_TASK_CGROUP: parent.FABRIC_TASK_CGROUP, FABRIC_TASK_SYSTEMD_RUN_WRAPPER: parent.FABRIC_TASK_SYSTEMD_RUN_WRAPPER,
       SMARTY_GIT_READ_ONLY: "1" });
+  });
+});
+
+// Keep reason: host-only placement authority and target integrity. These fake
+// one-shot CLIs write local receipts only; no SSH/native-create authorization.
+describe("ProcessTransport manager grant triplet", () => {
+  const fullGrant = (): PlacementPlace => ({
+    schema: "smarty.placement.v1", decision: "PLACE", mode: "enforced", launch_id: "semantic-launch", generation: 7,
+    org_id: "org", decision_revision: 1, host: "granted-host", model: "granted/model", thinking: "xhigh",
+    route_id: "route", pool_id: "pool", gateway_policy_digest: `sha256:${"a".repeat(64)}`,
+    reason: "CHEAPEST_ELIGIBLE", evidence: [], reservation_id: "reservation", fence: 1,
+    create_before: new Date(Date.now() + 60_000).toISOString(),
+    provenance: { policy_digest: `sha256:${"a".repeat(64)}`, facts_digest: `sha256:${"b".repeat(64)}`, writer_epoch: 1 },
+    grant: { schemaVersion: 2, status: "CLAIMED", requestId: "request", allocationRequestId: "semantic-launch",
+      launchId: "native-launch", launchSpecId: "native-spec", configDigest: "a".repeat(64),
+      expiresAt: new Date(Date.now() + 120_000).toISOString(), reservationId: "reservation", fence: 1,
+      host: "granted-host", model: "granted/model", thinking: "xhigh", requesterRef: "requester", drainerSpawnerRef: "drainer", launchAllowed: true },
+  });
+  const setup = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-grant-triplet-")); roots.push(root);
+    const tmp = path.join(root, "tmp"); fs.mkdirSync(tmp); vi.stubEnv("TMPDIR", tmp);
+    const launcher = path.join(root, "launcher.mjs");
+    const argvFile = path.join(root, "argv.json");
+    fs.writeFileSync(launcher, `import fs from 'node:fs';
+const args=process.argv.slice(2);fs.writeFileSync(${JSON.stringify(argvFile)},JSON.stringify(args));
+const at=flag=>args[args.indexOf(flag)+1];const host=at('--host')==='auto'?'baseline-host':at('--host');
+fs.writeFileSync(${JSON.stringify(path.join(root, "rc"))},'0');
+fs.writeFileSync(${JSON.stringify(path.join(root, "result.md"))},'fake task on '+host);
+console.log('RYZEN2_TASK_ACCEPTED '+at('--id')+' on '+host);\n`);
+    const taskFile = path.join(root, "task.txt"); fs.writeFileSync(taskFile, "local fake task");
+    const statusFile = path.join(root, "status.json");
+    const config = normalizeFabricConfig({ agents: { placement: {
+      default: "remote", sharedMounts: [root], capabilities: [], command: [process.execPath, launcher, "--id", "{id}",
+        "--host", "auto", "--model", "{model}", "--thinking", "{thinking}", "--", "{task}"],
+      resultDirectory: root, cancelCommand: [process.execPath, launcher], pollIntervalMs: 10, commandTimeoutMs: 5_000,
+    } } }).agents.placement!;
+    const request: AgentTransportLaunch = { id: "transport-id", name: "fake task", cwd: root, workerPath: "unused",
+      workerArguments: ["--task-file", taskFile, "--status-file", statusFile, "--log-file", path.join(root, "events.jsonl"),
+        "--timeout-ms", "5000", "--model", "baseline/model", "--thinking", "high"] };
+    return { root, argvFile, statusFile, config, request };
+  };
+
+  it("uses the complete manager-supplied grant's host/model/thinking without calling the fleet selector", async () => {
+    const f = setup();
+    const picker = vi.spyOn(placementModule, "selectFleetPlacement").mockRejectedValue(new Error("must not repick"));
+    const revalidate = vi.fn();
+    const handle = await new ProcessTransport(undefined, f.config).launch({ ...f.request,
+      placementGrant: { decision: fullGrant(), revalidate } });
+    expect(picker).not.toHaveBeenCalled();
+    expect(revalidate).toHaveBeenCalled();
+    expect(JSON.parse(fs.readFileSync(f.argvFile, "utf8"))).toEqual([
+      "--id", "transport-id", "--host", "granted-host", "--model", "granted/model", "--thinking", "xhigh", "--", "local fake task",
+    ]);
+    expect(await handle.isAlive()).toBe(false);
+    expect(JSON.parse(fs.readFileSync(f.statusFile, "utf8"))).toMatchObject({ status: "completed", model: "granted/model", text: "fake task on granted-host" });
+  });
+
+  it("keeps remote shadow restarts baseline-only and strips the local manager IPC binding", async () => {
+    const f = setup();
+    vi.spyOn(placementModule, "selectFleetPlacement").mockResolvedValue(undefined);
+    const callback = vi.fn(async () => "BASELINE" as const);
+    const remoteLaunch = vi.spyOn(placementModule, "launchPlacedTask");
+    const workerArguments = [...f.request.workerArguments, "--placement-launch-id", "semantic-launch",
+      "--placement-generation", "7", "--placement-enforcing", "false"];
+    const handle = await new ProcessTransport(undefined, f.config).launch({ ...f.request, workerArguments,
+      onPlacementRestart: callback });
+    const remoteRequest = remoteLaunch.mock.calls[0]?.[0];
+    expect(remoteLaunch).toHaveBeenCalledOnce();
+    expect(remoteRequest).toBeDefined();
+    expect(remoteRequest).not.toHaveProperty("onPlacementRestart");
+    expect(remoteRequest!.workerArguments).not.toContain("--placement-launch-id");
+    expect(remoteRequest!.workerArguments).not.toContain("--placement-generation");
+    expect(remoteRequest!.workerArguments).not.toContain("--placement-enforcing");
+    expect(callback).not.toHaveBeenCalled();
+    expect(await handle.isAlive()).toBe(false);
+  });
+
+  it("refuses an enforced remote restart without a bridge before starting the remote task", async () => {
+    const f = setup();
+    vi.spyOn(placementModule, "selectFleetPlacement").mockResolvedValue(undefined);
+    const remoteLaunch = vi.spyOn(placementModule, "launchPlacedTask");
+    const workerArguments = [...f.request.workerArguments, "--placement-launch-id", "semantic-launch",
+      "--placement-generation", "7", "--placement-enforcing", "true"];
+    await expect(new ProcessTransport(undefined, f.config).launch({ ...f.request, workerArguments,
+      onPlacementRestart: async () => "BASELINE" })).rejects.toThrow(/restart bridge unavailable/u);
+    expect(remoteLaunch).not.toHaveBeenCalled();
+    expect(fs.existsSync(f.argvFile)).toBe(false);
+  });
+
+  it("with no grant uses today's selector and baseline triplet, never an attached shadow hypothetical", async () => {
+    const f = setup();
+    const picker = vi.spyOn(placementModule, "selectFleetPlacement").mockResolvedValue(undefined);
+    const handle = await new ProcessTransport(undefined, f.config).launch(Object.assign(f.request, {
+      placementObservation: { hypothetical: { decision: "PLACE", host: "never-route-shadow", model: "hypothetical/model", thinking: "max" } },
+    }));
+    expect(picker).toHaveBeenCalledOnce();
+    expect(JSON.parse(fs.readFileSync(f.argvFile, "utf8"))).toEqual([
+      "--id", "transport-id", "--host", "auto", "--model", "baseline/model", "--thinking", "high", "--", "local fake task",
+    ]);
+    expect(await handle.isAlive()).toBe(false);
+    expect(JSON.parse(fs.readFileSync(f.statusFile, "utf8"))).toMatchObject({ model: "baseline/model", text: "fake task on baseline-host" });
+  });
+
+  it.each(["bare", "null", "malformed", "expired", "revoked", "incompatible"])("refuses a %s grant without launching or repicking", async kind => {
+    const f = setup();
+    const decision = fullGrant();
+    const revalidate = vi.fn(() => { if (kind === "revoked") throw new Error("revoked"); });
+    if (kind === "malformed") decision.grant.host = "foreign";
+    if (kind === "expired") decision.create_before = new Date(Date.now() - 1_000).toISOString();
+    if (kind === "incompatible") f.request.needs = ["local"];
+    f.request.placementGrant = kind === "bare" || kind === "null"
+      ? (kind === "null" ? null : decision) as unknown as NonNullable<AgentTransportLaunch["placementGrant"]> : { decision, revalidate };
+    const picker = vi.spyOn(placementModule, "selectFleetPlacement");
+    await expect(new ProcessTransport(undefined, f.config).launch(f.request)).rejects.toThrow();
+    expect(picker).not.toHaveBeenCalled();
+    expect(fs.existsSync(f.argvFile)).toBe(false);
+  });
+
+  it("does not accept a grant or placement binding through public spawn normalization", () => {
+    const normalized = normalizeAgentRunRequest({ task: "public", placementGrant: { decision: fullGrant(), revalidate: () => {} },
+      placement: { launchId: "caller-forged", generation: 4 }, onPlacementRestart: () => "BASELINE",
+    }, { runner: "pi", timeoutMs: 5000 });
+    expect(normalized).not.toHaveProperty("placementGrant");
+    expect(normalized).not.toHaveProperty("placement");
+    expect(normalized).not.toHaveProperty("onPlacementRestart");
+  });
+});
+
+describe("AgentManager write-policy placement boundary", () => {
+  const setup = () => {
+    const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-write-policy-placement-")));
+    roots.push(directory);
+    const cwd = path.join(directory, "cwd"); fs.mkdirSync(cwd);
+    const tmp = path.join(directory, "tmp"); fs.mkdirSync(tmp); vi.stubEnv("TMPDIR", tmp);
+    const launcher = path.join(directory, "launcher.mjs");
+    const launcherCalls = path.join(directory, "launcher-calls.json");
+    fs.writeFileSync(launcher, `import fs from 'node:fs';
+const args=process.argv.slice(2);fs.writeFileSync(${JSON.stringify(launcherCalls)},JSON.stringify(args));
+const at=flag=>args[args.indexOf(flag)+1];const id=at('--id');
+fs.writeFileSync(${JSON.stringify(path.join(directory, "rc"))},'0');
+fs.writeFileSync(${JSON.stringify(path.join(directory, "result.md"))},'remote placement completed');
+console.log('RYZEN2_TASK_ACCEPTED '+id+' on remote-host');\n`);
+    const placement = normalizeFabricConfig({ agents: { placement: {
+      default: "remote", sharedMounts: [directory], capabilities: [], command: [process.execPath, launcher,
+        "--id", "{id}", "--host", "auto", "--model", "{model}", "--thinking", "{thinking}", "--", "{task}"],
+      resultDirectory: directory, cancelCommand: [process.execPath, launcher], pollIntervalMs: 10, commandTimeoutMs: 5_000,
+    } } }).agents.placement!;
+    const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [],
+      timeoutMs: 5_000, placement }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(directory, "runs") });
+    managers.push(manager);
+    return { directory, cwd, launcherCalls, manager };
+  };
+
+  const captureLaunches = () => {
+    const selector = vi.spyOn(placementModule, "selectFleetPlacement").mockResolvedValue(undefined);
+    const remote = vi.spyOn(placementModule, "launchPlacedTask");
+    const requests: AgentTransportLaunch[] = [];
+    const nativeLaunch = ProcessTransport.prototype.launch;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function(this: ProcessTransport, request) {
+      requests.push(request);
+      return nativeLaunch.call(this, request);
+    });
+    return { selector, remote, requests };
+  };
+  const writePolicyEvents = (manager: AgentManager, id: string) =>
+    fs.readFileSync(path.join(manager.runDirectory(id)!, "events.jsonl"), "utf8").trim().split("\n")
+      .map(line => JSON.parse(line) as { type: string }).filter(event => event.type.startsWith("write_policy."));
+
+  // #1423 contract: the default task write policy keeps remote placement and is logged as
+  // unconfined (no confinement is claimed); an explicit or inherited policy stays local.
+  it("keeps the default write policy eligible for remote placement and logs it as unconfined", async () => {
+    const f = setup();
+    const { selector, remote, requests } = captureLaunches();
+
+    const result = await f.manager.run({ task: "default policy route probe", transport: "process" });
+    expect(result.status, result.error).toBe("completed");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.placementLocalReason).toBeUndefined();
+    expect(requests[0]!.workerArguments).toContain("--write-policy");
+    expect(selector).toHaveBeenCalledOnce();
+    expect(remote).toHaveBeenCalledOnce();
+    expect(fs.existsSync(f.launcherCalls)).toBe(true);
+    expect(writePolicyEvents(f.manager, result.id)).toEqual([expect.objectContaining({ type: "write_policy.remote_unconfined" })]);
+  });
+
+  it("keeps an explicit read-only write policy local despite remote placement", async () => {
+    const f = setup();
+    const { selector, remote, requests } = captureLaunches();
+
+    const result = await f.manager.run({ task: "policy route probe", transport: "process", readOnly: true });
+    expect(result.status, result.error).toBe("completed");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      placementLocalReason: "explicit or inherited write policy requires the local worker; one-shot placement cannot forward confinement",
+    });
+    const workerArguments = requests[0]!.workerArguments;
+    const policyIndex = workerArguments.indexOf("--write-policy");
+    expect(policyIndex).toBeGreaterThanOrEqual(0);
+    expect(JSON.parse(workerArguments[policyIndex + 1]!)).toMatchObject({ readOnly: true, writableRoots: [] });
+    expect(selector).not.toHaveBeenCalled();
+    expect(remote).not.toHaveBeenCalled();
+    expect(fs.existsSync(f.launcherCalls)).toBe(false);
+  });
+
+  it("keeps the no-active-policy counterexample eligible for remote placement", async () => {
+    const f = setup();
+    const selector = vi.spyOn(placementModule, "selectFleetPlacement").mockResolvedValue(undefined);
+    const remote = vi.spyOn(placementModule, "launchPlacedTask");
+    const requests: AgentTransportLaunch[] = [];
+    const nativeLaunch = ProcessTransport.prototype.launch;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(function(this: ProcessTransport, request) {
+      requests.push(request);
+      return nativeLaunch.call(this, request);
+    });
+
+    const result = await f.manager.run({ task: "unrestricted route probe", transport: "process", writePolicy: "unrestricted" });
+    expect(result.status, result.error).toBe("completed");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]!.placementLocalReason).toBeUndefined();
+    expect(requests[0]!.workerArguments).not.toContain("--write-policy");
+    expect(selector).toHaveBeenCalledOnce();
+    expect(remote).toHaveBeenCalledOnce();
+    expect(fs.existsSync(f.launcherCalls)).toBe(true);
   });
 });
 

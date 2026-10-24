@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import childProcess, { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -508,8 +508,14 @@ describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
     expect(fs.readdirSync(path.dirname(lock))).toEqual(["state-wal-reset.lock"]);
   });
 
-  it("concurrent checkpoint requests each own a flag: one finishing never lowers another's", () => {
+  it("concurrent checkpoint requests each own a flag: one finishing never lowers another's", async () => {
     const root = lockRoot();
+    // Production raises these from an open store, so its root (state.db included) is already admitted; on Windows
+    // that admission is the native ACL proof. Without a DB every raise would be a fresh native read slower than the
+    // flag TTL. The TTL itself is unchanged, and raising must start no child once the root is admitted.
+    await openStore(root);
+    const children = (["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"] as const)
+      .map(api => vi.spyOn(childProcess, api));
     expect(checkpointFlagRaised(root)).toBe(false);
     const first = raiseCheckpointFlag(root, ownerToken());
     const second = raiseCheckpointFlag(root, ownerToken());
@@ -522,6 +528,7 @@ describe("the WAL-reset try-lock (pi-fabric#691 review P2)", () => {
     const crashed = raiseCheckpointFlag(root, ownerToken());
     age(crashed, 5_000);
     expect(checkpointFlagRaised(root)).toBe(false);
+    for (const spy of children) expect(spy).not.toHaveBeenCalled();
   });
 
   // smarty-dev#7421: a crashed holder's flag is removed by the next writer's scan; a live holder's flag stays.

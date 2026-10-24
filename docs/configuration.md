@@ -934,6 +934,8 @@ variable `PI_FABRIC_MESH_STATE_BACKEND` overrides it. A root on a network filesy
 fenced only on the mesh `.lock` plus `custody.lock`; its writer census is advisory only (printed as
 `advisory: N writers, M unknown`) and never a cutover gate (smarty-dev#6982). Do not set it by hand on a shared mesh.
 
+Windows mesh-state ACL findings warn and startup continues by default; only exact `PI_FABRIC_MESH_STATE_ACL_ENFORCE=1` enables enforcement; unset the variable or set it to `0` to restore advisory startup without ACL mutation.
+
 `mesh.lockProtocol` accepts only numeric `1`, `2` or `3` and defaults to `1`. It is captured
 when each mesh store is constructed; editing configuration does not switch an existing
 store. Protocol 1 keeps the B68 canonical-directory mkdir and three-line token/PID/time

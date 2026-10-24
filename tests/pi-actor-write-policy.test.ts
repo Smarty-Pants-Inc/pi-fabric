@@ -43,7 +43,7 @@ const now=Date.now();fs.writeFileSync(args.get('--status-file'),JSON.stringify({
 const report = async (f: ReturnType<typeof fixture>, request: Partial<AgentRunRequest>) => {
   const result = await f.manager.run({ task: "probe", transport: "process", ...request });
   expect(result.status, result.error).toBe("completed");
-  return { value: JSON.parse(result.text), run: f.manager.runDirectory(result.id)! };
+  return { value: JSON.parse(result.text), run: f.manager.runDirectory(result.id)!, temporaryDirectory: result.temporaryDirectory };
 };
 
 describe("Pi actor scratch-only write policy", () => {
@@ -52,8 +52,9 @@ describe("Pi actor scratch-only write policy", () => {
     { runner: "pi-durable", actorId: "actor" }, { runner: "pi-durable", actorName: "actor" },
   ])("confines $runner / $actorId / $actorName direct activations despite cwd/run-root overlap", async identity => {
     const f = fixture();
-    const { value, run } = await report(f, identity);
-    expect(value.tmpdir).toBe(path.join(run, "tmp"));
+    const { value, run, temporaryDirectory } = await report(f, identity);
+    // smarty-dev#15878: a short private TMPDIR when one fits the host's temp path, else the run's own tmp.
+    expect(value.tmpdir).toBe(temporaryDirectory ?? path.join(run, "tmp"));
     expect(value.policy).toEqual({ readOnly: false, writableRoots: [value.tmpdir], shell: "unconfined" });
     if (process.platform !== "win32") expect(fs.statSync(value.tmpdir).mode & 0o777).toBe(0o700);
     expect(value.probes.map((probe: { allowed: boolean }) => probe.allowed)).toEqual([false, true]);

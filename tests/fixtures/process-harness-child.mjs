@@ -10,8 +10,10 @@
 //     beforeCheck      actorTreeDeletionHooks.beforeCheck: fence held, final check not run
 //     beforeDelete     actorTreeDeletionHooks.beforeDelete: fence held, final check passed, tree not removed
 //     fence-temp, fence-link, none   as for the remover
-//     Hooks and actor-tree fs.rmSync calls record fence state. Optional `record-tree-deletes` mode skips
-//     only whole actor-tree removal for local probes; the default executes real deletion in hosted CI.
+//     Hooks, the live remove's verifiedRemove of a whole actor tree (Linux) and actor-tree
+//     fs.rmSync calls (fallback, whole-root close) record fence state; verifiedRemove also asserts the held fence.
+//     Optional `record-tree-deletes` mode skips only whole actor-tree removal for local probes; the default
+//     delegates to the real verifier/rmSync, so hosted CI deletes for real.
 //   resident <residencyRoot> <pauseAt> record-tree-deletes   the same, except that a whole actor-tree removal (the
 //     actor root itself, or an actor-id directory /^[a-f0-9]{32}$/ directly under it) is recorded and NOT performed
 //     (#4664: a local recorded run never deletes actor history). Every other fs.rmSync (registry and binding lock
@@ -112,6 +114,18 @@ if (role === "main") {
       if (recordTreeDeletes && isWholeTree(file)) return undefined; // recorded, not performed
     }
     return rm(file, ...rest);
+  };
+  // The live remove lazy-imports verifiedRemove; the cached jiti module is shared, so this export override is what it
+  // calls. Linux only: off Linux the verifier runs the fallback fs.rmSync above, which already records (no double).
+  const verifier = await jiti.import("./src/storage/verified-remove.ts");
+  const verifiedRemove = verifier.verifiedRemove;
+  verifier.verifiedRemove = (target, judged, options) => {
+    if (process.platform !== "linux" || !isWholeTree(target)) return verifiedRemove(target, judged, options);
+    const held = fenced();
+    calls.push({ kind: "rm", path: path.resolve(String(target)), fenced: held });
+    if (!held) throw new Error(`verifiedRemove(${target}) without the held Main publication fence`);
+    if (recordTreeDeletes) return { removed: true, bytes: 0 }; // recorded, not performed
+    return verifiedRemove(target, judged, options);
   };
   if (pauseAt === "fence-temp" || pauseAt === "fence-link") pauseAtLink(pauseAt, () => take(pauseAt));
   const host = new ResidentHost(config, () => {});

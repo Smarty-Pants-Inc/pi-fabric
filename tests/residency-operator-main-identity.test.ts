@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../src/mesh/store.js";
 import { processStartTime } from "../src/residency/process-identity.js";
+import * as verifiedRemoval from "../src/storage/verified-remove.js";
 import { readResidentOperatorEvidence, ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import { actorTreeDeletionHooks, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
@@ -19,6 +20,8 @@ type Call = { at: string; fenced: boolean; path?: string };
 const GUIDANCE = "stop the Main, or let a host start finish it";
 const STALE = () => Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS;
 const GONE = { pid: 2147483647, host: os.hostname(), startTime: "1" };
+const TREE_AT = process.platform === "linux" ? "verifiedRemove" : "rm";
+const realVerifiedRemove = verifiedRemoval.verifiedRemove;
 
 afterEach(() => {
   delete actorTreeDeletionHooks.beforeCheck;
@@ -41,6 +44,20 @@ const record = (f: DeadRootFixture, dir: string, calls: Call[], beforeCheck?: ()
   vi.spyOn(fs.promises, "rm").mockImplementation(async (file, options) => {
     if (inTree(file)) calls.push({ at: "rm", path: path.resolve(String(file)), fenced: fenced() }); else await rm(file, options);
   });
+  // Keep the real judgment/walk while recording the boundary without deleting; exact event assertions below
+  // expose fence/identity violations even though cleanup catches exceptions.
+  vi.spyOn(verifiedRemoval, "verifiedRemove").mockImplementation((target, judged, options) => {
+    if (process.platform !== "linux" || !inTree(target)) return realVerifiedRemove(target, judged, options);
+    const file = path.resolve(target);
+    calls.push({ at: "verifiedRemove", path: file, fenced: fenced() });
+    const now = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (!judged || !now || now.dev !== judged.dev || now.ino !== judged.ino) {
+      calls.push({ at: "violation: judged inode is not the current tree", path: file, fenced: fenced() });
+    }
+    const result = realVerifiedRemove(target, judged, { ...options, dryRun: true });
+    if (!result.removed) calls.push({ at: `refused: ${result.reason}`, path: file, fenced: fenced() });
+    return result;
+  });
   actorTreeDeletionHooks.beforeCheck = async () => { calls.push({ at: "beforeCheck", fenced: fenced() }); beforeCheck?.(); };
   actorTreeDeletionHooks.beforeDelete = async () => { calls.push({ at: "beforeDelete", fenced: fenced() }); };
 };
@@ -61,7 +78,7 @@ const operatorRemove = async (f: DeadRootFixture, seed: () => void, underFence?:
   return { calls, removal, dir, cli };
 };
 const refused = (result: Awaited<ReturnType<typeof operatorRemove>>, reason: RegExp) => {
-  expect(result.calls.filter(call => call.at === "rm")).toEqual([]);
+  expect(result.calls.filter(call => call.at !== "beforeCheck" && call.at !== "beforeDelete")).toEqual([]);
   expect(result.calls[0]).toEqual({ at: "beforeCheck", fenced: true });
   expect(result.removal).toContain(GUIDANCE);
   expect(result.removal).toMatch(reason);
@@ -69,7 +86,7 @@ const refused = (result: Awaited<ReturnType<typeof operatorRemove>>, reason: Reg
 const allowed = (result: Awaited<ReturnType<typeof operatorRemove>>) => {
   expect(result.cli).toMatchObject({ code: 0, err: "" });
   expect(result.calls).toEqual([{ at: "beforeCheck", fenced: true }, { at: "beforeDelete", fenced: true },
-    { at: "rm", path: path.resolve(result.dir), fenced: true }]);
+    { at: TREE_AT, path: path.resolve(result.dir), fenced: true }]);
 };
 const hostKey = (id: string) => "topology/hosts/" + createHash("sha256").update(id).digest("hex");
 /** A genuinely stale state.db host row (smarty-dev#7403: rows are 15-700 s old by design): seeded under a clock held at

@@ -12,6 +12,7 @@ import { appendSqliteHold, DEFAULT_SQLITE_HOLD_MS, recordSqliteHolds, SQLITE_HOL
   sqliteHoldContext, sqliteHoldsPath, type SqliteHoldLine } from "../src/mesh/sqlite-holds.js";
 import type { SqliteConnection, SqliteStatement } from "../src/mesh/state-sqlite.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { holdMeshFence, holdMeshFenceSync } from "../src/mesh/fence-lock.js";
 
 // Keep: data safety / failure paths. Diagnostics run beside the writer and must never alter
 // SQLite results, rollback behavior, the original exception, or the durable outbox protocol.
@@ -264,6 +265,36 @@ it.each(["run", "get", "all"] as const)("%s bookkeeping failures preserve driver
   expect(read(root)).toMatchObject([{ outcome: "rollback", phases: [] }]);
 });
 
+it.each(["prepare", "exec"] as const)("%s bookkeeping failures preserve driver successes and original exceptions", async method => {
+  const f = fake(), root = temp();
+  let failClock = false;
+  const original = new Error("original driver failure");
+  const prepare = f.db.prepare.bind(f.db), exec = f.db.exec.bind(f.db);
+  if (method === "prepare") {
+    vi.spyOn(f.db, "prepare").mockImplementation(sql => {
+      try { return prepare(sql); } finally { failClock = true; }
+    });
+  } else {
+    vi.spyOn(f.db, "exec").mockImplementation(sql => {
+      if (sql !== "CREATE TABLE kv(key)") return exec(sql);
+      try { if (f.state.stepError) throw f.state.stepError; return exec(sql); }
+      finally { failClock = true; }
+    });
+  }
+  const db = recordSqliteHolds(f.db, root, "bookkeeping", { thresholdMs: 1, now: () => {
+    if (failClock) { failClock = false; throw new Error("diagnostic clock failed"); }
+    return f.now();
+  } });
+  const call = () => method === "prepare" ? db.prepare("SELECT value FROM kv") : db.exec("CREATE TABLE kv(key)");
+  db.exec("BEGIN IMMEDIATE");
+  expect(call).not.toThrow();
+  f.state.prepareError = f.state.stepError = original;
+  expect(call).toThrow(original);
+  db.exec("ROLLBACK");
+  await Promise.resolve();
+  expect(read(root)).toMatchObject([{ outcome: "rollback", phases: [] }]);
+});
+
 it("a throwing changes getter cannot replace a successful run result or record a statement error", async () => {
   const f = fake(), root = temp();
   Object.defineProperty(f.result, "changes", { get() { throw new Error("diagnostic conversion failed"); } });
@@ -394,6 +425,47 @@ it("does not reclaim a fresh successor swapped in after observing a stale lock",
   appendSqliteHold(root, metricLine());
   expect(read(root)).toEqual([]);
   expect(fs.readFileSync(lock, "utf8")).toBe("successor");
+});
+
+// Keep: PR #1582 round 3 P3. ext4 can reuse dev/ino immediately; exercise the identity
+// tuple deterministically rather than relying on a particular filesystem's inode allocator.
+it.each(["release", "reclaim"] as const)("%s preserves a successor with reused dev/ino but a different ctime", mode => {
+  const root = temp(), file = sqliteHoldsPath(root), lock = file + ".lock";
+  fs.mkdirSync(path.dirname(file));
+  let judged: fs.BigIntStats | undefined;
+  const lstat = fs.lstatSync.bind(fs), write = fs.writeSync.bind(fs);
+  const replace = () => {
+    fs.renameSync(lock, lock + ".old");
+    fs.writeFileSync(lock, "successor");
+  };
+  if (mode === "reclaim") {
+    fs.writeFileSync(lock, "stale");
+    fs.utimesSync(lock, new Date(0), new Date(0));
+  } else {
+    vi.spyOn(fs, "writeSync").mockImplementation((...args: Parameters<typeof fs.writeSync>) => {
+      judged = fs.lstatSync(lock, { bigint: true });
+      replace();
+      return write(...args);
+    });
+  }
+  let checkedTuple = false;
+  vi.spyOn(fs, "lstatSync").mockImplementation((...args: Parameters<typeof fs.lstatSync>) => {
+    const current = lstat(...args);
+    if (args[0] !== lock) return current;
+    if (mode === "reclaim" && !judged) {
+      judged = current as fs.BigIntStats;
+      replace();
+      return current;
+    }
+    if (!judged) return current;
+    checkedTuple = true;
+    // Simulate immediate inode reuse, changing ONLY ctime in the judged identity tuple.
+    return { ...judged, ctimeNs: judged.ctimeNs + 1n };
+  });
+  appendSqliteHold(root, metricLine());
+  expect(checkedTuple).toBe(true);
+  expect(fs.readFileSync(lock, "utf8")).toBe("successor");
+  expect(read(root)).toHaveLength(mode === "release" ? 1 : 0);
 });
 
 it("four processes append complete bounded JSON lines through rotation without leaving lock or temporary files", async () => {
@@ -531,4 +603,100 @@ it("real import/rollback records FULL migration transactions without changing th
   await rollbackMeshState(root);
   expect(mesh.get("one", { fresh: true })?.value).toEqual({ original: true });
   expect(read(root).filter(line => line.tag === "migration:transaction").length).toBeGreaterThanOrEqual(4);
+});
+
+// Keep: PR #1582 round 3 P1. COMMIT's microtask used to write while an awaiting caller
+// still held .lock and custody.lock. Observe actual JSONL writes, not merely append scheduling.
+it.each(["fresh async", "fresh sync", "normal writes", "import/rollback"] as const)(
+  "%s writes every slow diagnostic with both fence locks free", async mode => {
+    vi.stubEnv("PI_FABRIC_SQLITE_HOLD_MS", "0.000001");
+    const root = temp();
+    const observations: Array<{ tag: string; mesh: boolean; custody: boolean }> = [];
+    const write = fs.writeSync.bind(fs);
+    vi.spyOn(fs, "writeSync").mockImplementation((...args: Parameters<typeof fs.writeSync>) => {
+      const data = args[1];
+      if (Buffer.isBuffer(data)) {
+        const text = data.toString();
+        if (text.startsWith('{"v":1,') && text.includes('"phases":')) {
+          const line = JSON.parse(text) as SqliteHoldLine;
+          observations.push({ tag: line.tag, mesh: fs.existsSync(path.join(root, ".lock")),
+            custody: fs.existsSync(path.join(root, "custody.lock")) });
+        }
+      }
+      return write(...args);
+    });
+    const identity = { id: "locks-free", name: "test", kind: "agent" as const };
+    if (mode === "fresh async") {
+      const store = await SqliteStateStore.open(root, 64 * 1024, 100, { initialize: "create" });
+      store.close();
+    } else if (mode === "fresh sync") {
+      const store = SqliteStateStore.openSync(root, 64 * 1024, 100, { initialize: "create" });
+      store.close();
+    } else {
+      const mesh = new MeshStore(root, 64 * 1024, 100, mode === "normal writes" ? { stateBackend: "sqlite" } : {});
+      meshes.push(mesh);
+      await mesh.put({ key: "one", value: 1, identity });
+      if (mode === "import/rollback") {
+        await importMeshState(root);
+        await rollbackMeshState(root);
+        expect(mesh.get("one", { fresh: true })?.value).toBe(1);
+      }
+    }
+    await Promise.resolve();
+    expect(observations.length).toBeGreaterThan(0);
+    if (mode === "import/rollback") expect(observations.filter(line => line.tag === "migration:transaction").length).toBeGreaterThanOrEqual(4);
+    else expect(observations.map(line => line.tag)).toContain("state:init");
+    expect(observations).toEqual(observations.map(line => ({ ...line, mesh: false, custody: false })));
+    expect(read(root)).toHaveLength(observations.length);
+  });
+
+it("holds pending lines across a real fence await and flushes only after the last fence releases on error", async () => {
+  const first = temp(), second = temp(), f = fake();
+  const observations: boolean[] = [];
+  const db = recordSqliteHolds(f.db, first, "awaited-fence", { thresholdMs: 1, now: f.now,
+    append: () => observations.push([first, second].some(root =>
+      fs.existsSync(path.join(root, ".lock")) || fs.existsSync(path.join(root, "custody.lock")))) });
+  const original = new Error("fenced body failed");
+  await expect(holdMeshFence(first, { lockTimeoutMs: 1_000 }, async () => {
+    db.exec("BEGIN IMMEDIATE"); db.exec("COMMIT");
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(observations).toEqual([]);
+    await holdMeshFence(second, { lockTimeoutMs: 1_000 }, async () => {
+      db.exec("BEGIN IMMEDIATE"); db.exec("COMMIT");
+      await Promise.resolve();
+      expect(observations).toEqual([]);
+    });
+    await Promise.resolve();
+    expect(observations).toEqual([]);
+    throw original;
+  })).rejects.toBe(original);
+  await Promise.resolve();
+  expect(observations).toEqual([false, false]);
+});
+
+it("a failed fence acquisition leaves future hold diagnostics enabled", async () => {
+  const root = temp(), f = fake(), append = vi.fn();
+  const db = recordSqliteHolds(f.db, root, "after-timeout", { thresholdMs: 1, now: f.now, append });
+  await holdMeshFence(root, { lockTimeoutMs: 1_000 }, async () => {
+    await expect(holdMeshFence(root, { lockTimeoutMs: 0 }, () => {})).rejects.toThrow();
+    expect(() => holdMeshFenceSync(root, 0, () => {})).toThrow();
+  });
+  db.exec("BEGIN IMMEDIATE"); db.exec("COMMIT");
+  await Promise.resolve();
+  expect(append).toHaveBeenCalledTimes(1);
+});
+
+it("bounds pending diagnostic lines while a fence spans awaits", async () => {
+  const root = temp(), f = fake(), append = vi.fn();
+  const db = recordSqliteHolds(f.db, root, "bounded-pending", { thresholdMs: 1, now: f.now, append });
+  await holdMeshFence(root, { lockTimeoutMs: 1_000 }, async () => {
+    for (let i = 0; i < 140; i++) { db.exec("BEGIN IMMEDIATE"); db.exec("COMMIT"); }
+    await Promise.resolve();
+    expect(append).not.toHaveBeenCalled();
+  });
+  await Promise.resolve();
+  expect(append).toHaveBeenCalledTimes(128);
+  db.exec("BEGIN IMMEDIATE"); db.exec("COMMIT");
+  await Promise.resolve();
+  expect(append).toHaveBeenCalledTimes(129);
 });

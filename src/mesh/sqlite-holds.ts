@@ -29,8 +29,9 @@ export const sqliteHoldsPath = (root: string): string => path.join(root, "metric
 
 /** As with lock events: one bounded current file and one previous generation, best effort only.
  * Serialize append AND rotation with a non-waiting metrics-only lock; a contending sampler drops
- * its line rather than growing an already full file. Reclaim a crashed sampler's exact old inode.
- * No database or mesh locks are acquired here. All this runs AFTER writer custody has ended.
+ * its line rather than growing an already full file. Reclaim a crashed sampler's unchanged lock.
+ * No database or mesh locks are acquired here. The recorder schedules this only after its SQLite
+ * transaction ends and all in-process migration/create fence scopes finish releasing their locks.
  */
 export function appendSqliteHold(root: string, line: SqliteHoldLine): void {
   let lockFd: number | undefined;
@@ -42,7 +43,8 @@ export function appendSqliteHold(root: string, line: SqliteHoldLine): void {
   // BigInt preserves the full file id on Windows as well as Unix.
   const removeLock = (seen: fs.BigIntStats): boolean => {
     const current = fs.lstatSync(lock, { bigint: true, throwIfNoEntry: false });
-    if (!current || current.dev !== seen.dev || current.ino !== seen.ino) return false;
+    if (!current || current.dev !== seen.dev || current.ino !== seen.ino
+      || current.ctimeNs !== seen.ctimeNs || current.mtimeNs !== seen.mtimeNs || current.size !== seen.size) return false;
     fs.unlinkSync(lock);
     return true;
   };
@@ -86,6 +88,40 @@ export function appendSqliteHold(root: string, line: SqliteHoldLine): void {
     }
   }
 }
+
+// A COMMIT microtask can precede an awaiting fence holder's finally. Keep slow lines pending
+// until the last fence scope has released BOTH locks, including scopes suspended across awaits.
+// Bound memory during a long fence; metrics may drop, but never wait, poll, or prolong custody.
+const MAX_PENDING_HOLDS = 128;
+let fenceScopes = 0;
+let flushQueued = false;
+const pendingHolds: Array<() => void> = [];
+const queueHoldFlush = (): void => {
+  if (flushQueued || fenceScopes > 0 || pendingHolds.length === 0) return;
+  flushQueued = true;
+  queueMicrotask(() => {
+    flushQueued = false;
+    if (fenceScopes > 0) return; // A fence may have started since the flush was queued.
+    const pending = pendingHolds.splice(0);
+    for (const append of pending) {
+      try { append(); } catch { /* diagnostics only */ }
+    }
+  });
+};
+
+/** Begin before fence acquisition; call the returned completion AFTER both release paths finish.
+ * Process-wide rather than root-local: no diagnostic filesystem work under any such fence.
+ */
+export const deferSqliteHoldWrites = (): (() => void) => {
+  fenceScopes++;
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    fenceScopes--;
+    queueHoldFlush();
+  };
+};
 
 const thresholdOf = (): number => {
   const raw = process.env.PI_FABRIC_SQLITE_HOLD_MS;
@@ -214,11 +250,12 @@ class HoldRecorder {
       const line: SqliteHoldLine = { v: 1, at: new Date().toISOString(), tag, pid: process.pid,
         release: "unknown", bridge: bridgeProcess, waitMs: this.waitMs, holdMs,
         commitMs: this.commitMs, rollbackMs: this.rollbackMs, outcome, phases };
-      // Let the caller finish its own COMMIT/hold accounting and synchronous release cleanup
-      // before filesystem work. This is event-driven, only on slow holds, not a timer/poller.
-      queueMicrotask(() => {
-        try { line.release = ownRelease(); this.append(this.root, line); } catch { /* best effort */ }
-      });
+      // The microtask follows synchronous cleanup; an enclosing async migration/create fence
+      // defers the flush until its release path completes. No timers or polling, even across awaits.
+      if (pendingHolds.length < MAX_PENDING_HOLDS) {
+        pendingHolds.push(() => { line.release = ownRelease(); this.append(this.root, line); });
+        queueHoldFlush();
+      }
     } catch { /* No metric failure can replace a transaction's result/error. */ }
   }
 }
@@ -259,12 +296,14 @@ export function recordSqliteHolds(db: SqliteConnection, root: string, defaultTag
       let failed = true;
       try { db.exec(sql); failed = false; }
       finally {
-        const at = r.now();
-        if (commit) r.commitMs += at - started;
-        else if (rollback) r.rollbackMs += at - started;
-        else r.note(id, at - started, 0, failed);
-        if (!failed && (commit || rollback)) r.end(commit ? "commit" : "rollback", at);
-        else if (failed) endedOnError();
+        try {
+          const at = r.now();
+          if (commit) r.commitMs += at - started;
+          else if (rollback) r.rollbackMs += at - started;
+          else r.note(id, at - started, 0, failed);
+          if (!failed && (commit || rollback)) r.end(commit ? "commit" : "rollback", at);
+        } catch { /* diagnostics only */ }
+        if (failed) endedOnError();
       }
     },
     prepare(sql) {
@@ -274,10 +313,15 @@ export function recordSqliteHolds(db: SqliteConnection, root: string, defaultTag
       let statement: SqliteStatement;
       try { statement = db.prepare(sql); }
       catch (error) {
-        if (r.active) { r.note(prepareId, r.now() - started, 0, true); endedOnError(); }
+        if (r.active) {
+          try { r.note(prepareId, r.now() - started, 0, true); } catch { /* diagnostics only */ }
+          endedOnError();
+        }
         throw error;
       }
-      if (r.active) r.note(prepareId, r.now() - started);
+      if (r.active) {
+        try { r.note(prepareId, r.now() - started); } catch { /* diagnostics only */ }
+      }
       const runId = r.phase(tag + ":run"), getId = r.phase(tag + ":get"), allId = r.phase(tag + ":all");
       return {
         run(...params: SqliteValue[]) {

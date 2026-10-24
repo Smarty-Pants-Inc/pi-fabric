@@ -89,7 +89,7 @@ vi.mock("@nats-io/jetstream", async importOriginal => {
       const delay = fake.consumerDelays.shift() ?? 0;
       if (delay > 0) await new Promise<void>(resolve => setTimeout(resolve, delay));
       if (error !== undefined) throw error;
-      return { consume: async () => {
+      return { delete: async () => { fake.log.push({ op: "consumerDelete", args: [options] }); return true; }, consume: async () => {
         fake.log.push({ op: "consumerConsume", args: [options] });
         return {
           async *[Symbol.asyncIterator]() { if (fake.consumeIteratorError !== undefined) throw fake.consumeIteratorError; },
@@ -757,6 +757,7 @@ describe("NATS initial ordered-consumer bootstrap budget (smarty-dev#12900)", ()
       expect(activePrefixes()).toEqual([]);
       await vi.advanceTimersByTimeAsync(60_000);
       expect(fake.consumerOptions).toHaveLength(10); // Neither late replies nor the deadline renew the budget.
+      expect(fake.log.filter(entry => entry.op === "consumerDelete")).toHaveLength(10); // All late CREATEs are retired.
       expect(activePrefixes()).toEqual([]);
     } finally { vi.useRealTimers(); }
   });
@@ -860,6 +861,8 @@ describe("NATS initial ordered-consumer bootstrap budget (smarty-dev#12900)", ()
       expect(activePrefixes()).toEqual([accepted]);
       await vi.advanceTimersByTimeAsync(400); // The abandoned get now resolves successfully.
       expect(fake.consumerOptions).toHaveLength(2);
+      expect(fake.log.filter(entry => entry.op === "consumerDelete").map(entry => (entry.args[0] as { name_prefix: string }).name_prefix))
+        .toEqual([abandoned]);
       expect(prefixes().filter(prefix => prefix === abandoned)).toHaveLength(1);
       expect(activePrefixes()).toEqual([accepted]);
       // The actual options objects held by the SDK must also retain their original, distinct names.

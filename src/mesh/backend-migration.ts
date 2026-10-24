@@ -425,7 +425,9 @@ class FenceDb {
       };
       if (exists) db = openPrivateStateDb(file, opener); // the one gate (smarty-dev#7548)
       else {
-        createStateRoot(root); // smarty-dev#8920: private on Windows when this call creates it
+        // smarty-dev#8920: private on Windows when this call creates it. The Windows gate below takes the root's
+        // pre-create proof (gateFollows); POSIX ignores the option and runs assertPrivateStateRoot itself.
+        createStateRoot(root, { gateFollows: true });
         // Windows: the create runs inside the gate, after its one native read (smarty-dev#8920); a refused root gets no state.db.
         if (process.platform === "win32") db = openPrivateStateDb(file, opener, create);
         else {

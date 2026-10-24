@@ -1,10 +1,14 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { COMMIT_OUTBOX_PREFIX, CommitOutbox, withStateFence } from "../src/mesh/commit-outbox.js";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshStore, type MeshBatchView, type MeshIdentity } from "../src/mesh/store.js";
+import { StoreBridgeSide } from "../src/mesh/bridge.js";
+import { readHostLease } from "../src/topology/host-leases.js";
+import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
 import { MeshStateWalCapError } from "../src/mesh/state-sqlite.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
 
@@ -252,6 +256,177 @@ describe("CommitOutbox", () => {
       expect(await outbox.recover()).toBe(1);
       expect(log.at(-1)).toBe("999:replay");
       expect(mesh.listAll(outbox.prefix, { fresh: true })).toEqual([]);
+    } finally { mesh.closeState(); }
+  });
+
+  // Keep: data safety and a dual-fault path (SA-03) that a normal delivery flow cannot reach cheaply.
+  describe.each(["file", "sqlite"] as const)("SA-03 completion proof (%s)", backend => {
+    const completed = async () => {
+      const mesh = new MeshStore(meshRoot(), 64 * 1024, 100, { stateBackend: backend });
+      const fault = { active: false };
+      const attempts: string[] = [];
+      const artifact = path.join(path.dirname(mesh.root), "effect-a");
+      const outbox = new CommitOutbox(mesh, "failed-replay", identity, {
+        touch: (payload: string) => {
+          attempts.push(`${payload}:${fault.active ? "fault" : "ok"}`);
+          if (payload === "a") {
+            if (fault.active) throw new Error("effect write refused");
+            fs.writeFileSync(artifact, "installed");
+          }
+        },
+      });
+      const plan = outbox.plan();
+      await mesh.writeBatch({ identity, ops: [], prepare: () => plan.stage([], [
+        { kind: "touch", key: "a", payload: "a" }, { kind: "touch", key: "b", payload: "b" },
+      ], { durable: true }), afterCommit: view => { plan.run(view); } });
+      expect(fs.readFileSync(artifact, "utf8")).toBe("installed");
+      const row = mesh.get(outbox.rowKey("a"), { fresh: true });
+      expect(row).toBeDefined();
+      expect(outbox.retiring).toBe(2);
+      const refusal = vi.spyOn(mesh, "writeBatch").mockRejectedValueOnce(new Error("retirement refused"));
+      await expect(outbox.retire()).rejects.toThrow("retirement refused");
+      refusal.mockRestore();
+      expect(mesh.get(outbox.rowKey("a"), { fresh: true })).toEqual(row);
+      fault.active = true;
+      return { mesh, outbox, fault, attempts, artifact, row };
+    };
+
+    it.each(["replay", "recover", "run retry"] as const)("retains the exact failed row through direct and next-stage retirement after %s", async route => {
+      const { mesh, outbox, fault, attempts, row } = await completed();
+      try {
+        if (route === "recover") expect(await outbox.recover()).toBe(1); // Only unrelated B succeeds.
+        else {
+          await mesh.writeBatch({ identity, ops: [], prepare: view => { outbox.plan().replay(view); return []; } });
+          if (route === "run retry") await mesh.writeBatch({ identity, ops: [], afterCommit: view => { outbox.plan().run(view); } });
+        }
+        expect(attempts).toContain("a:fault");
+        await outbox.retire();
+        expect(mesh.get(outbox.rowKey("a"), { fresh: true })).toEqual(row);
+        expect(mesh.get(outbox.rowKey("b"), { fresh: true })).toBeUndefined();
+        const next = outbox.plan();
+        await mesh.writeBatch({ identity, ops: [], prepare: () => next.stage([
+          { kind: "put", key: "subject/next", value: 1 },
+        ], []), afterCommit: view => { next.run(view); } });
+        expect(mesh.get(outbox.rowKey("a"), { fresh: true })).toEqual(row);
+        fault.active = false;
+        expect(await outbox.recover()).toBe(1);
+        expect(mesh.listAll(outbox.prefix, { fresh: true })).toEqual([]);
+        expect(attempts.at(-1)).toBe("a:ok");
+      } finally { mesh.closeState(); }
+    });
+
+    it.each(["retire", "stage"] as const)("rechecks %s eligibility captured before the failed replay", async route => {
+      const { mesh, outbox, fault, row } = await completed();
+      try {
+        if (route === "retire") {
+          const original = mesh.writeBatch.bind(mesh);
+          let release!: () => void;
+          const gate = new Promise<void>(resolve => { release = resolve; });
+          const queued = vi.spyOn(mesh, "writeBatch").mockImplementationOnce(async input => {
+            await gate;
+            return original(input);
+          });
+          const retiring = outbox.retire(); // Captures both old successful versions before replay.
+          try {
+            await original({ identity, ops: [], prepare: view => { outbox.plan().replay(view); return []; } });
+          } finally { release(); await retiring; queued.mockRestore(); }
+        } else {
+          await mesh.writeBatch({ identity, ops: [], prepare: view => {
+            const ops = outbox.plan().stage([], [], { durable: true });
+            expect(ops.filter(op => op.kind === "delete")).toHaveLength(2);
+            outbox.plan().replay(view); // Invalidates A after stage selected its deletion.
+            return ops;
+          } });
+        }
+        expect(mesh.get(outbox.rowKey("a"), { fresh: true })).toEqual(row);
+        expect(mesh.get(outbox.rowKey("b"), { fresh: true })).toBeUndefined();
+        fault.active = false;
+        expect(await outbox.recover()).toBe(1);
+        expect(mesh.listAll(outbox.prefix, { fresh: true })).toEqual([]);
+      } finally { mesh.closeState(); }
+    });
+
+    it.each([false, true])("does not erase a newer nested successful completion when the older execution fails=%s", async fails => {
+      const mesh = new MeshStore(meshRoot(), 64 * 1024, 100, { stateBackend: backend });
+      let nested: (() => void) | undefined;
+      const log: number[] = [];
+      const outbox = new CommitOutbox(mesh, "newer-completion", identity, {
+        touch: (n: number) => {
+          log.push(n);
+          if (n === 1 && nested) { const run = nested; nested = undefined; run(); if (fails) throw new Error("older failed"); }
+        },
+      });
+      const older = outbox.plan(), newer = outbox.plan();
+      let oldView!: MeshBatchView, newView!: MeshBatchView;
+      try {
+        await mesh.writeBatch({ identity, ops: [], prepare: () => older.stage([], [
+          { kind: "touch", key: "same", payload: 1 },
+        ], { durable: true }), afterCommit: view => { oldView = view; older.run(view); } });
+        // SQLite callback views are live; its public stateView pins a detached snapshot.
+        oldView = mesh.stateView()?.view ?? oldView;
+        await mesh.writeBatch({ identity, ops: [], prepare: () => newer.stage([], [
+          { kind: "touch", key: "same", payload: 2 },
+        ], { durable: true }), afterCommit: view => { newView = view; } });
+        newView = mesh.stateView()?.view ?? newView;
+        expect(newView.version(outbox.rowKey("same"))).toBeGreaterThan(oldView.version(outbox.rowKey("same")));
+        nested = () => { newer.run(newView); };
+        expect(outbox.plan().replay(oldView)).toBe(fails ? 0 : 1);
+        expect(log).toEqual([1, 1, 2]);
+        expect(outbox.retiring).toBe(1);
+        await outbox.retire();
+        expect(mesh.listAll(outbox.prefix, { fresh: true })).toEqual([]);
+      } finally { mesh.closeState(); }
+    });
+
+    it("keeps a newer proof across an old stamp mismatch and an older empty run view", async () => {
+      const mesh = new MeshStore(meshRoot(), 64 * 1024, 100, { stateBackend: backend });
+      const outbox = new CommitOutbox(mesh, "stale-views", identity, {
+        touch: (n: number) => { if (n === 1) throw new Error("old recording refused"); },
+      });
+      let absent!: MeshBatchView, current!: MeshBatchView;
+      const older = outbox.plan(), newer = outbox.plan();
+      try {
+        await mesh.writeBatch({ identity, ops: [], afterCommit: view => { absent = view; } });
+        absent = mesh.stateView()?.view ?? absent;
+        await mesh.writeBatch({ identity, ops: [], prepare: () => older.stage([], [
+          { kind: "touch", key: "same", payload: 1 },
+        ], { durable: true }) });
+        await mesh.writeBatch({ identity, ops: [], prepare: () => newer.stage([], [
+          { kind: "touch", key: "same", payload: 2 },
+        ], { durable: true }), afterCommit: view => { current = view; newer.run(view); } });
+        expect(older.run(current)).toBe(0); // Failed old stamp, then a successful current-row retry.
+        expect(outbox.retiring).toBe(1);
+        outbox.plan().run(absent); // The empty snapshot predates both recordings.
+        expect(outbox.retiring).toBe(1);
+        await outbox.retire();
+        expect(mesh.listAll(outbox.prefix, { fresh: true })).toEqual([]);
+      } finally { mesh.closeState(); }
+    });
+  });
+
+  it.each(["file", "sqlite"] as const)("SA-04 main immediate withdrawal removes the lease with a retained tombstone (%s)", async backend => {
+    const mesh = new MeshStore(meshRoot(), 64 * 1024, 100, { stateBackend: backend });
+    const now = Date.now();
+    const peer: MeshIdentity = { id: "session:withdrawal-00000000", name: "main", kind: "main", sessionId: "withdrawal" };
+    const host = { format: 1, id: peer.id, rootId: peer.id, identity: peer, startedAt: now, updatedAt: now, expiresAt: now + 60_000 } as FabricHostRecord;
+    const participant = { format: 1, id: peer.id, rootId: peer.id, kind: "root", ownerHostId: peer.id, ownerIdentityId: peer.id,
+      name: "withdrawal", label: "withdrawal", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp"],
+      sessionId: "withdrawal", startedAt: now, updatedAt: now, controlProtocol: "v1" } as FabricParticipantRecord;
+    const key = (prefix: string) => prefix + createHash("sha256").update(peer.id).digest("hex");
+    const side = new StoreBridgeSide(mesh, "ryzen2", () => now);
+    try {
+      await side.mirror({ hosts: [{ record: host, expiresAt: now + 60_000 }], participants: [participant] });
+      expect(readHostLease(mesh.root, peer.id)?.identityId).toBe(peer.id);
+      await side.mirror({ hosts: [], participants: [] });
+      expect(mesh.get(key("topology/hosts/"), { fresh: true })).toBeUndefined();
+      expect(mesh.get(key("topology/participants/"), { fresh: true })).toBeUndefined();
+      let tombstone = 0;
+      await mesh.writeBatch({ identity, ops: [], afterCommit: view => { tombstone = view.version(key("topology/hosts/")); } });
+      expect(tombstone).toBeGreaterThan(0);
+      expect(readHostLease(mesh.root, peer.id)).toBeUndefined();
+      // A restarted complete pass replays and retires the successful unlease recording.
+      await new StoreBridgeSide(mesh, "ryzen2", () => now).mirror({ hosts: [], participants: [] });
+      expect(mesh.listAll(COMMIT_OUTBOX_PREFIX, { fresh: true })).toEqual([]);
     } finally { mesh.closeState(); }
   });
 

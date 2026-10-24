@@ -247,7 +247,11 @@ describe("resident queued binding defaults", () => {
     await actors.setModel(actor.id, "provider/new", "project"); await actors.setThinking(actor.id, "max", "project");
     state.release(); await waitFor(() => state.launches.length === 3 && actors.status(actor.id).status === "idle");
     expect(state.launches[2]).toMatchObject({ model: "provider/new", thinking: "max" });
-    expect(state.launches[2]!.task).toContain("newer"); expect(state.launches[2]!.task).not.toContain("older");
+    expect(state.launches[2]!.task).toContain("newer");
+    const task = state.launches[2]!.task;
+    const frame = JSON.parse(task.slice(task.lastIndexOf("\n\n") + 2));
+    expect(frame.payload.data.value).toBe("newer");
+    expect(frame.coalesced.map((record: { payload: { data: { value: string } } }) => record.payload.data.value)).toEqual(["older", "newer"]);
   });
 
   it("persists project model/thinking through the existing publishPresence save path", async () => {

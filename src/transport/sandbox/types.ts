@@ -28,6 +28,15 @@ export interface SandboxSpawnIntent {
   expectedSeconds: number;
   timeoutSeconds: number;
   deadline: string | null;
+  branch?: string;
+  sessionImport?: SandboxSessionImport;
+}
+
+export interface SandboxSessionImport {
+  /** Lowercase UUID from the Pi session header (36 characters). */
+  session: string;
+  /** SHA-256 of manifest.json bytes: exactly 64 lowercase hexadecimal characters. */
+  manifestSha256: string;
 }
 
 export interface SandboxSpawnResult {

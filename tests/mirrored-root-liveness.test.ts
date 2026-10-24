@@ -157,7 +157,9 @@ describe("source-clock root liveness (#10068)", () => {
     const stateViews = vi.spyOn(f.store, "stateView");
     await f.local.mirror(f.presence, observedAt);
     expect(blocked).toHaveBeenCalledTimes(1);
-    expect(stateViews).toHaveBeenCalledTimes(path_ === "warm" ? 1 : 0);
+    // Both cold and warm passes snapshot before the writer; the cold first mirror must not
+    // regress into doing the fleet-sized plan inside its SQLite transaction.
+    expect(stateViews).toHaveBeenCalledTimes(1);
     blocked.mockRestore();
     stateViews.mockRestore();
     expect(f.lease().expiresAt).toBe(originalDeadline);
@@ -263,21 +265,25 @@ describe("source-clock root liveness (#10068)", () => {
     let checkpoint: { expiresAt: number; observedAt: number | undefined; rowExpiry: unknown;
       participant: unknown; routing: string; commands: number } | undefined;
     const write = f.store.writeBatch.bind(f.store);
-    vi.spyOn(f.store, "writeBatch").mockImplementation(input => write({ ...input, prepare: view => {
-      const ops = input.prepare!(view); // Original prepare replays the pending lease here.
-      if (checkpoint) return ops; // prepare may rerun; capture the first precommit replay only.
-      checkpoint = { expiresAt: f.lease().expiresAt, observedAt: f.lease().mirror?.observedAt,
-        rowExpiry: (view.get(key("topology/hosts/", rootId))!.value as { expiresAt: number }).expiresAt,
-        participant: f.directory.get(rootId, f.now()),
-        routing: mirroredOwnerRoutingStatus({ ...f.lease(), remoteHost: "ryzen4" }, f.now()),
-        commands: commands(f).length };
-      for (const operation of ["steer", "followUp"] as const) {
-        refusals.push(settle(f.control.request(rootId, rootId, operation, {
-          ownerIncarnation: "activation-1", message: "legacy replay checkpoint" }, rootId, { routedRemoteHost: "ryzen4" })));
-        refusals.push(settle(router.routeMessage(rootId, "legacy replay checkpoint", undefined, operation)));
-      }
-      return ops;
-    } }));
+    vi.spyOn(f.store, "writeBatch").mockImplementation(input => {
+      const prepare = input.prepare;
+      if (input.lockClass !== "bridge" || !prepare) return write(input);
+      return write({ ...input, prepare: view => {
+        const ops = prepare(view);
+        if (checkpoint) return ops; // Prepare may retry; capture only the first bridge commit.
+        checkpoint = { expiresAt: f.lease().expiresAt, observedAt: f.lease().mirror?.observedAt,
+          rowExpiry: (view.get(key("topology/hosts/", rootId))!.value as { expiresAt: number }).expiresAt,
+          participant: f.directory.get(rootId, f.now()),
+          routing: mirroredOwnerRoutingStatus({ ...f.lease(), remoteHost: "ryzen4" }, f.now()),
+          commands: commands(f).length };
+        for (const operation of ["steer", "followUp"] as const) {
+          refusals.push(settle(f.control.request(rootId, rootId, operation, {
+            ownerIncarnation: "activation-1", message: "legacy replay checkpoint" }, rootId, { routedRemoteHost: "ryzen4" })));
+          refusals.push(settle(router.routeMessage(rootId, "legacy replay checkpoint", undefined, operation)));
+        }
+        return ops;
+      } });
+    });
     await new StoreBridgeSide(f.store, "ryzen4", f.now).mirror(f.presence, t0);
     const recorded = await Promise.all(refusals);
     expect(checkpoint).toMatchObject({ expiresAt: t0 + 500, observedAt: t0, rowExpiry: t0 + 1_500,
@@ -314,17 +320,21 @@ describe("source-clock root liveness (#10068)", () => {
       f.advance(250);
       const snapshots: Array<{ expiresAt: number; observedAt: number | undefined; at: number; routing: string; participant: unknown }> = [];
       const write = f.store.writeBatch.bind(f.store);
-      vi.spyOn(f.store, "writeBatch").mockImplementation(input => write({ ...input, prepare: view => {
-        const ops = input.prepare!(view);
-        const capture = () => snapshots.push({ expiresAt: f.lease().expiresAt, observedAt: f.lease().mirror?.observedAt,
-          at: f.now(), routing: mirroredOwnerRoutingStatus({ ...f.lease(), remoteHost: "ryzen4" }, f.now()),
-          participant: f.directory.get(rootId, f.now()) });
-        capture();
-        f.advance(250); // Equality at the OLD deadline; a genuinely newer sample stays live.
-        capture();
-        if (newer) { f.advance(100); capture(); }
-        return ops;
-      } }));
+      vi.spyOn(f.store, "writeBatch").mockImplementation(input => {
+        const prepare = input.prepare;
+        if (input.lockClass !== "bridge" || !prepare) return write(input);
+        return write({ ...input, prepare: view => {
+          const ops = prepare(view);
+          const capture = () => snapshots.push({ expiresAt: f.lease().expiresAt, observedAt: f.lease().mirror?.observedAt,
+            at: f.now(), routing: mirroredOwnerRoutingStatus({ ...f.lease(), remoteHost: "ryzen4" }, f.now()),
+            participant: f.directory.get(rootId, f.now()) });
+          capture();
+          f.advance(250); // Equality at the OLD deadline; a genuinely newer sample stays live.
+          capture();
+          if (newer) { f.advance(100); capture(); }
+          return ops;
+        } });
+      });
       await new StoreBridgeSide(f.store, "ryzen4", f.now).mirror(f.presence, t0);
       expect(snapshots[0]).toMatchObject({ expiresAt: t0 + (newer ? 600 : 500), observedAt: t0 + (newer ? 100 : 0),
         at: t0 + 250, routing: "live", participant: { remoteHost: "ryzen4" } });

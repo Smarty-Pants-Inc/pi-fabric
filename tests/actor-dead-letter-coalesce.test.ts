@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 
 const roots: string[] = [];
 const closers: Array<() => Promise<void>> = [];
@@ -84,6 +84,9 @@ const event = (world: ReturnType<typeof setup>, actorId: string, number: number,
   world.mesh.publish({ topic: "team.events", to: actorId, from, data: revision(number, value) });
 const targetTasks = (world: ReturnType<typeof setup>, actors: ActorManager, actorId: string, number: number) =>
   world.runTasks(actors, actorId).filter((task) => task.includes(`"number": ${number}`));
+const frame = (task: string) => JSON.parse(task.slice(task.lastIndexOf("\n\n") + 2)) as {
+  payload: { data: { payload: { revision: string } } }; coalesced: Array<{ id: string; sequence: number; payload: MeshEvent }>;
+};
 
 describe("actor dead-letter coalescing", () => {
   it("coalesces three keyed dead-letter admissions to the newest mesh event", async () => {
@@ -141,8 +144,10 @@ describe("actor dead-letter coalescing", () => {
     await waitFor(() => second.status(actor.id).status === "idle" && targetTasks(w, second, actor.id, 99).length >= 1 && w.deadLetters(actor.id).length === 0, 30_000);
     const runs = targetTasks(w, second, actor.id, 99);
     expect(runs).toHaveLength(1);
-    expect(runs[0]).toContain(replayIsNewer ? replayRevision : queuedRevision);
-    expect(runs[0]).not.toContain(replayIsNewer ? queuedRevision : replayRevision);
+    const input = frame(runs[0]!);
+    expect(input.payload.data.payload.revision).toBe(replayIsNewer ? replayRevision : queuedRevision);
+    expect(input.coalesced.map(event => [event.id, event.sequence])).toEqual(
+      [queued, replayEvent].sort((a, b) => a.sequence - b.sequence).map(event => [event.id, event.sequence]));
   }, 30_000);
 
   it("normalizes legacy keyed backlog before a one-slot replay, keeping sequence order over file order", async () => {
@@ -163,8 +168,9 @@ describe("actor dead-letter coalescing", () => {
     await waitFor(() => second.status(actor.id).status === "idle" && w.deadLetters(actor.id).length === 0, 30_000);
     const runs = targetTasks(w, second, actor.id, 101);
     expect(runs).toHaveLength(1);
-    expect(runs[0]).toContain("legacy-newest");
-    expect(runs[0]).not.toMatch(/legacy-old|legacy-middle/);
+    const input = frame(runs[0]!);
+    expect(input.payload.data.payload.revision).toBe("legacy-newest");
+    expect(input.coalesced.map(event => [event.id, event.sequence])).toEqual([old, middle, newest].map(event => [event.id, event.sequence]));
   }, 30_000);
 
   it("retains every unkeyed dead letter for one replay apiece", async () => {

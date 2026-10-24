@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  captureLockStatsWriter, createLockStats, LOCK_STATS_MAX_FILE_BYTES, LOCK_STATS_WRITER_MAX_CHARS, LOCK_STATS_MAX_FILES, LOCK_STATS_RETAIN_MINUTES, lockStatsHost, readLockStats, summarizeLockStats,
+  captureLockStatsWriter, createLockStats, LOCK_STATS_MAX_FILE_BYTES, LOCK_STATS_WRITER_MAX_CHARS, LOCK_STATS_MAX_FILES, LOCK_STATS_RETAIN_MINUTES, lockEventProcessName, lockStatsHost, readLockStats, summarizeLockStats,
   type LockStatsBucket, type LockStatsFile,
 } from "../src/mesh/commit-stats.js";
 import { main } from "../src/mesh-lock-stats-cli.js";
@@ -76,8 +76,21 @@ describe("mesh lock stats recorder", () => {
         afterCommit: view => { expect(view.get("bridge/value")?.value).toBe(1); },
       }), 0), 0);
       expect(state.get("bridge/value")?.value).toBe(1);
+      await state.writeBatch({ identity, lockClass: "bridge", ops: [],
+        prepare: () => [{ kind: "put", key: "bridge/timed", value: 1 }], afterCommit: () => undefined,
+        lockTiming: { operation: "bridge-presence-mirror", preparePhase: "mirror-revalidate", commitPhase: "mirror-commit" } });
       const bridge = recorded().bridge!;
-      expect(bridge).toMatchObject({ n: 2, timeouts: 0, tries: 0 });
+      expect(bridge).toMatchObject({ n: 4, timeouts: 0, tries: 0 });
+      const timings = read(root).minutes.flatMap(minute => [
+        minute.operations?.["bridge-presence-mirror"],
+        minute.phases?.["bridge-presence-mirror"]?.["mirror-revalidate"],
+        minute.phases?.["bridge-presence-mirror"]?.["mirror-commit"],
+        minute.phases?.["bridge-presence-mirror"]?.["after-commit"],
+      ]);
+      expect(timings[0]).toMatchObject({ n: 2, holdMs: expect.any(Number) });
+      expect(timings[1]).toMatchObject({ n: 1, holdMs: expect.any(Number) });
+      expect(timings[2]).toMatchObject({ n: 1, holdMs: expect.any(Number) });
+      expect(timings[3]).toMatchObject({ n: 1, holdMs: expect.any(Number) });
       expect(bridge.holdMs).toBeGreaterThan(0);
       expect(bridge.holdMaxMs).toBeGreaterThan(0);
 
@@ -89,11 +102,53 @@ describe("mesh lock stats recorder", () => {
       await expect(state.withTryLock(() => state.withTryLock(write, 0), 0)).rejects.toBeInstanceOf(MeshLockTimeoutError);
       await expect(state.exclusive(() => undefined, 0)).rejects.toBeInstanceOf(MeshLockTimeoutError);
       const failed = recorded();
-      expect(failed.bridge).toMatchObject({ n: 2, timeouts: 1, tries: 1 });
+      expect(failed.bridge).toMatchObject({ n: 4, timeouts: 1, tries: 1 });
       expect(read(root).minutes.reduce((total, minute) => total + (minute.classes.bridge?.failedWaitMs ?? 0), 0)).toBeGreaterThan(0);
       expect(failed.custody).toMatchObject({ n: 0, timeouts: 0, tries: 1 });
       expect(state.get("bridge/value")?.value).toBe(1);
     } finally {
+      try { if (holder.isTransaction) holder.exec("ROLLBACK"); }
+      finally { holder.close(); state.close(); }
+    }
+  });
+
+  it("records zero-wait SQLite fence refusals by operation and phase with the validated holder identity", async () => {
+    vi.stubEnv("PI_FABRIC_LOCK_STATS", "1");
+    vi.resetModules();
+    const { SqliteStateStore, openNodeSqlite } = await import("../src/mesh/state-sqlite.js");
+    const { MeshLockTimeoutError } = await import("../src/core/atomic-write.js");
+    const { walWriterPid } = await import("../src/mesh/wal-readers.js");
+    const sqlite = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    const prototype = sqlite.DatabaseSync.prototype as unknown as { exec(this: object, sql: string): void };
+    const originalExec = prototype.exec;
+    const root = temp();
+    const state = await SqliteStateStore.open(root, 64 * 1024, 100, { lockTimeoutMs: 20 });
+    const holder = openNodeSqlite(path.join(root, "state.db"));
+    holder.exec("BEGIN IMMEDIATE");
+    let beginAttempts = 0;
+    prototype.exec = function (this: object, sql: string): void {
+      if (sql.trim().toUpperCase() === "BEGIN IMMEDIATE") beginAttempts++;
+      return originalExec.call(this, sql);
+    };
+    const timing = { operation: "bridge-notification-fence", phase: "notification-fence" };
+    const called = vi.fn();
+    try {
+      const holderPid = walWriterPid(path.join(root, "state.db"));
+      expect(() => state.fenceSync(() => called(), timing)).toThrow(MeshLockTimeoutError);
+      expect(beginAttempts).toBe(1);
+      expect(called).not.toHaveBeenCalled();
+      registry[lockKey]!.flush();
+      const minute = read(root).minutes.at(-1)!;
+      const comm = holderPid === undefined ? null : lockEventProcessName(holderPid) ?? null;
+      const refusal = { fenceRefusals: 1, fenceRefusalHolders: [{ pid: holderPid ?? null, comm, n: 1 }] };
+      expect(minute.operations?.[timing.operation]).toMatchObject(refusal);
+      expect(minute.phases?.[timing.operation]?.[timing.phase]).toMatchObject(refusal);
+      expect(minute.classes.bridge).toMatchObject({ tries: 1 });
+      expect(summarizeLockStats(root, readLockStats(root), { minutes: 3, now: Date.now() + 120_000 }).phases)
+        .toMatchObject([{ operation: timing.operation, phase: timing.phase, fenceRefusals: 1,
+          fenceRefusalHolders: [{ pid: holderPid ?? null, comm, n: 1 }] }]);
+    } finally {
+      prototype.exec = originalExec;
       try { if (holder.isTransaction) holder.exec("ROLLBACK"); }
       finally { holder.close(); state.close(); }
     }
@@ -146,6 +201,31 @@ describe("mesh lock stats recorder", () => {
     registry[lockKey]!.dispose();
     expect(vi.getTimerCount()).toBe(0);
     expect(process.listenerCount("exit")).toBe(exitListeners);
+  });
+
+  it("aggregates held time by operation and phase in the minute file and summary", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const root = temp();
+    const stats = createLockStats("1")!;
+    stats.acquired(root, "bridge", 2, 20, { operation: "bridge-presence-mirror" });
+    stats.phase(root, "bridge", "bridge-presence-mirror", "mirror-revalidate", 5);
+    stats.phase(root, "bridge", "bridge-presence-mirror", "mirror-commit", 15);
+    registry[lockKey]!.flush();
+    const minute = read(root).minutes[0]!;
+    expect(minute.operations?.["bridge-presence-mirror"]).toMatchObject({ n: 1, holdMs: 20, holdMaxMs: 20 });
+    expect(minute.phases?.["bridge-presence-mirror"]?.["mirror-revalidate"]).toMatchObject({ n: 1, holdMs: 5 });
+    expect(minute.phases?.["bridge-presence-mirror"]?.["mirror-commit"]).toMatchObject({ n: 1, holdMs: 15 });
+    const summary = summarizeLockStats(root, readLockStats(root, [], { minutes: 5, now: (MINUTE0 + 4) * 60_000 }),
+      { minutes: 5, now: (MINUTE0 + 4) * 60_000 });
+    expect(summary.operations).toEqual([{ operation: "bridge-presence-mirror", n: 1, totalHeldMs: 20, p50HoldMs: 20, p95HoldMs: 20, maxHoldMs: 20 }]);
+    expect(summary.phases).toMatchObject([
+      { operation: "bridge-presence-mirror", phase: "mirror-commit", n: 1, totalHeldMs: 15, p50HoldMs: 20, p95HoldMs: 20, maxHoldMs: 15 },
+      { operation: "bridge-presence-mirror", phase: "mirror-revalidate", n: 1, totalHeldMs: 5, p50HoldMs: 5, p95HoldMs: 5, maxHoldMs: 5 },
+    ]);
+    const problems: string[] = [];
+    expect(readLockStats(root, problems, { minutes: 3, now: (MINUTE0 + 4) * 60_000 })).toHaveLength(1);
+    expect(problems).toEqual([]);
   });
 
   it("stays bounded: one hour of minutes and at most 32 roots per process", () => {

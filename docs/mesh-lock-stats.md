@@ -23,6 +23,20 @@ For each class and wall-clock minute: acquisitions, wait time (request to custod
 `withTryLock` scopes or an explicit zero-wait `exclusive`, which fail by design while the lock is
 busy). An ordinary write whose remaining budget ran out before custody is a timeout, not a try.
 
+Minute records optionally include `operations` and nested `phases` maps (old version-1 files without
+these fields remain valid). Each timing sample records the operation label chosen at its source and
+its measured held milliseconds. A refused zero-wait SQLite writer fence adds `fenceRefusals` and its
+holder identities to both the operation and phase buckets, without counting a refusal as held time.
+The holder is the unique WAL writer PID from `/proc/locks` and its short `/proc/PID/comm` name; either
+may be null when the existing owner-diagnostics path cannot validate it. Holder lists are bounded;
+excess distinct holders remain counted as unattributed refusals. The CLI and JSON summary report total
+held time and histogram-bounded p50/p95 plus max by operation and by operation/phase, alongside fence
+refusal counts and holders. Current explicit phases include SQLite mirror revalidation and row commit,
+SQLite `after-commit`, the bridge event batch, and the notification fence.
+Mirror lease preparation and outbox file effects run outside SQLite writer custody; they are not
+misreported as held time. For quantiles, each histogram bucket reports its upper bound, just like
+class-level p99.
+
 Each process writes `<mesh>/lock-stats/<host>-<pid>.json` on the next acquisition after a minute
 boundary, at exit, or on an explicit flush. A quiet process keeps its final samples in memory
 until one of those events; recording never schedules an idle timer. The file holds at most the last 60 complete minutes (the longest

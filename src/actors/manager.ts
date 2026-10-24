@@ -31,7 +31,7 @@ import { MeshStore, meshOutageAlarmSink, type MeshBatchOperation, type MeshBatch
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantRecord, FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
-import { AgentLaunchPreparationTimeoutError, AgentManager, validAgentExceptionLane, type AgentExceptionLane } from "../agents/manager.js";
+import { AgentLaunchPreparationTimeoutError, AgentManager, validAgentExceptionLane, type AgentAdmittedExceptionLane, type AgentExceptionLane } from "../agents/manager.js";
 import { FabricModelExceptionDeniedError } from "../agents/model-policy-log.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult, AgentRunStopCaller, AgentRunStopPath } from "../agents/types.js";
 import { isRecoveredDurableStop } from "../agents/enodev-recovery.js";
@@ -2373,7 +2373,7 @@ export class ActorManager {
     const thinking = scope === "session" ? this.#runBinding(actor).thinking : actor.thinking;
     const resolved = next
       ? (await this.#resolvedRunBindingFor(actor.runner, { model: next, modelReason, thinking, modelSource: "explicit" }, actor.routeClass !== undefined, policyOnly,
-        `actor:${actor.name}`, undefined, actor.exceptionLane)).model
+        `actor:${actor.name}`, undefined, actor)).model
       : undefined;
     this.agents.assertModelAllowed(resolved);
     if (!resolved) {
@@ -2383,11 +2383,11 @@ export class ActorManager {
       if (fallback) await this.#resolvedRunBindingFor(actor.runner, {
         model: fallback, modelReason: reason, thinking,
         modelSource: inherited ? "explicit" : "default",
-      }, actor.routeClass !== undefined, false, `actor:${actor.name}`, undefined, actor.exceptionLane);
-      else await this.agents.prepareModelWithReason(undefined, reason, actor.runner, {
+      }, actor.routeClass !== undefined, false, `actor:${actor.name}`, undefined, actor);
+      else this.#backfillExceptionLane(actor, (await this.agents.prepareModelWithReason(undefined, reason, actor.runner, {
         modelSource: "default", thinking, requiredPin: actor.routeClass !== undefined, role: `actor:${actor.name}`,
         ...(actor.exceptionLane ? { persistedLane: actor.exceptionLane } : {}),
-      });
+      })).approvedLane);
     }
     // Validate both the effective view and duplicated binding/default metadata before commit.
     const preview = scope === "project"
@@ -4802,7 +4802,7 @@ export class ActorManager {
     // Foreign resolved bindings must not borrow the owner's private defaults.
     const ownerThinking = options.binding === undefined ? this.#runBinding(actor).thinking : undefined;
     const resolving = unresolved.model ? this.#resolvedRunBindingFor(
-      actor.runner, unresolved, actor.routeClass !== undefined, false, `actor:${actor.name}`, ownerThinking, actor.exceptionLane,
+      actor.runner, unresolved, actor.routeClass !== undefined, false, `actor:${actor.name}`, ownerThinking, actor,
     ) : unresolved;
     const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const sender = options.sender === null ? undefined : options.sender ?? processSender();
@@ -9440,9 +9440,11 @@ export class ActorManager {
     policyOnly = false,
     role?: string,
     ownerThinking?: FabricThinking,
-    /** smarty-dev#16357: the actor's creation-time lane; used only while its root record is unavailable. */
-    exceptionLane?: AgentExceptionLane,
+    /** smarty-dev#16357: the actor whose stored lane may stand in while its root record is not fresh,
+     * and which a fresh admission backfills when it has stored none. */
+    laneActor?: ManagedActor,
   ): FabricActorRunBinding | Promise<FabricActorRunBinding> {
+    const exceptionLane = laneActor?.exceptionLane;
     const reason = binding.modelReason ?? binding.opusReason;
     const source = binding.modelSource ?? (requiredPin ? "route" : binding.model ? "explicit" : "default");
     const selector = binding.model ?? this.agents.defaultModel(runner);
@@ -9454,7 +9456,9 @@ export class ActorManager {
         ...(role !== undefined ? { role } : {}),
         ...(exceptionLane ? { persistedLane: exceptionLane } : {}),
       });
-      const finish = (admitted: { model?: string | undefined; thinking?: FabricThinking | undefined; fallback: boolean }): FabricActorRunBinding => {
+      const finish = (admitted: { model?: string | undefined; thinking?: FabricThinking | undefined; fallback: boolean;
+        approvedLane?: Readonly<AgentAdmittedExceptionLane> | undefined }): FabricActorRunBinding => {
+        if (laneActor) this.#backfillExceptionLane(laneActor, admitted.approvedLane);
         const result: FabricActorRunBinding = { ...binding,
           // Validate dynamic defaults without turning an unbound mailbox item
           // into a model override. Only a policy substitution must freeze it.
@@ -9485,7 +9489,20 @@ export class ActorManager {
     binding: FabricActorRunBinding,
   ): FabricActorRunBinding | Promise<FabricActorRunBinding> {
     return this.#resolvedRunBindingFor(actor.runner, binding, actor.routeClass !== undefined, false, `actor:${actor.name}`,
-      undefined, actor.exceptionLane);
+      undefined, actor);
+  }
+
+  /**
+   * smarty-dev#16357: an actor with no stored lane (created before lanes were stored, or whose capture
+   * failed) takes the lane that its first admission read from the bound root's FRESH record, once, and
+   * persists it. A stored lane is never replaced, and a lane that was itself the stored copy is ignored.
+   */
+  #backfillExceptionLane(actor: ManagedActor, lane: Readonly<AgentAdmittedExceptionLane> | undefined): void {
+    if (actor.exceptionLane || lane?.source !== "root" || this.#actors.get(actor.id) !== actor || !this.#canManage(actor.id)) return;
+    const capture = { rootId: lane.rootId, lane: lane.lane };
+    if (!validAgentExceptionLane(capture)) return;
+    actor.exceptionLane = capture;
+    this.#scheduleRegistrySave();
   }
 
   #validatedRunBinding(binding: FabricActorRunBinding): FabricActorRunBinding {

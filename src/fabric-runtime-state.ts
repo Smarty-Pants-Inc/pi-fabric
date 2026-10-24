@@ -160,7 +160,7 @@ import {
   type FabricProviderDiscovery,
 } from "./protocol.js";
 import { participantProject, ParticipantRoleGrant } from "./topology/project-identity.js";
-import { AgentManager } from "./agents/manager.js";
+import { AgentManager, rootRecordLastSeenMs } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
 import { ActorChildCompletionStore } from "./actors/child-completions.js";
 import { boundAgentSpawner, resolveAgentSpawner } from "./agents/spawner.js";
@@ -1347,6 +1347,10 @@ export class FabricRuntimeState {
           ? root.cwd
           : undefined;
       },
+      // #16357: the root Main itself is alive while this runtime runs (last seen now), whatever its
+      // record says; a nested runtime reads its lineage root's record like the resident host does.
+      rootSessionLastSeenMs: () => identity.kind === "main" && identity.id === mainAgentId ? 0
+        : this.#participants ? rootRecordLastSeenMs(this.#participants, mainAgentId) : undefined,
       fabricSessionId,
       meshRoot,
       projectRoot,

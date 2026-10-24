@@ -10,8 +10,9 @@ import { windowsSecurityPowerShell } from "./storage/windows-powershell.js";
 const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--drop-queued] [--confirm-dead-root <rootId>] [--main-stopped --evidence <text> | --evidence-file <path>]";
 const help = `${usage}
 
-stop refuses an actor that holds work (an activation in flight, queued, parked, overflow, pending settled-window or
-dead-letter work) and names the counts. With stop, --drop-queued moves that work to
+stop refuses an actor that holds work (queued, parked, overflow, pending settled-window or dead-letter work) and
+names the counts; the activation in flight alone never refuses it (its callerless item is archived). With stop,
+--drop-queued moves that work to
 <actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl instead, never deleting it, and prints the archive;
 agents.requeueArchived feeds it to a recreated actor (smarty-dev#16416). A live remove refuses an actor that keeps such
 archives or held dead letters; with --drop-queued it removes it and keeps them under <mesh root>/session-archive/.

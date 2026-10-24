@@ -168,8 +168,12 @@ describe("strict cooperative resident actor admission boundary", () => {
     expect(actors.dispatchHostEvent("agent_settled", payload("leading"))).toBe(1);
     vi.advanceTimersByTime(100);
     actors.dispatchHostEvent("agent_settled", payload("original-pending"));
-    await actors.setActivationFilter(actor.id, [{ id: "skip-host", source: ["host:agent_settled"] }]);
+    // pi-fabric#1572: the new filter would skip the queued leading settle, which is admitted work. Before the guard it was
+    // dropped at the head after resume; setActivationFilter now refuses that unless dropQueued, which holds it instead.
+    await actors.setActivationFilter(actor.id, [{ id: "skip-host", source: ["host:agent_settled"] }], undefined, undefined, undefined, { dropQueued: true });
     const file = queueFile(dir, actor.id);
+    const deadLetters = () => fs.readFileSync(path.join(dir, "project", actor.id, "dead-letter.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+    expect(deadLetters()).toEqual([expect.objectContaining({ source: "host:agent_settled", heldBy: expect.objectContaining({ ruleId: "skip-host" }) })]);
     const before = json(file).settledWindows;
     actors.pauseForRelease({ strict: true });
     expect(actors.dispatchObservedHostEvent("agent_settled", payload("must-not-skip-or-replace"))).toBe(0);
@@ -177,7 +181,8 @@ describe("strict cooperative resident actor admission boundary", () => {
     vi.advanceTimersByTime(5_000);
     await actors.checkpointForRelease();
     expect(json(file).settledWindows).toEqual(before);
-    expect(json(file).items).toHaveLength(1);
+    expect(json(file).items).toHaveLength(0); // held ingress admitted nothing; the leading settle stays held, not queued
+    expect(deadLetters()).toHaveLength(1);
     expect(actors.status(actor.id).filterSkipped?.count ?? 0).toBe(0);
     actors.resumeAfterRelease();
     await flush();

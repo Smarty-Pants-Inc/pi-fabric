@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
@@ -11,7 +11,8 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { ResidentHost } from "../src/residency/host.js";
-import { RESIDENT_HOST_FORMAT, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { RESIDENT_HOST_FORMAT, residentHostId, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -86,6 +87,8 @@ const deadLetterFile = (root: string, id: string) => path.join(root, "actors", i
 const deadLetterLines = (root: string, id: string) => fs.existsSync(deadLetterFile(root, id))
   ? fs.readFileSync(deadLetterFile(root, id), "utf8").split("\n").filter(Boolean) : [];
 const filtered = (actors: ActorManager, id: string) => actors.messages(id).filter(message => message.reason?.startsWith("filtered: "));
+// A returned archive path is native: Windows joins it with backslashes (pi-fabric#1572 round 4; CI windows-latest).
+const SEP = "[\\\\/]";
 const stopArchive = (info: FabricActorInfo) => {
   const stopped = info.stoppedQueue;
   if (!stopped) throw new Error("stop returned no stoppedQueue archive");
@@ -175,7 +178,7 @@ describe("agents.stop with queued work (smarty-dev#16416)", () => {
     // The old activation in flight (its released worker item) is requeued too (round 3, astra F3).
     expect(first).toMatchObject({ id: fresh.id, requeued: 3, filtered: 2, alreadyRequeued: 0, skipped: [] });
     expect(first.archive).toEqual(name === "old-supervisor"
-      ? expect.stringMatching(new RegExp(`session-archive.*${old.id}\\.recoverable-[0-9TZ]+/stopped-queues/${path.basename(archive)}$`)) : archive);
+      ? expect.stringMatching(new RegExp(`session-archive.*${old.id}\\.recoverable-[0-9TZ]+${SEP}stopped-queues${SEP}${path.basename(archive)}$`)) : archive);
     expect(actors.status(fresh.id).queued).toBe(3);
     expect(markers(meshRecords(root, fresh.id))).toEqual(["event-0", "event-2"]);
     expect(filtered(actors, fresh.id).map(message => message.reason)).toEqual(["filtered: wait", "filtered: wait"]);
@@ -527,26 +530,44 @@ describe("queued-work guard, round 3 (pi-fabric#1572)", () => {
     await inFlight;
   }, 60_000);
 
-  it("F3: an explicit stop refuses an activation in flight; with dropQueued the in-flight item is archived", async () => {
+  it("F3 (round 4): an explicit stop over an activation in flight is not refused; it archives the callerless in-flight item", async () => {
     const { root, actors } = setup();
     const actor = await actors.create({ name: "busy-supervisor", instructions: "Supervise.", topics: [TOPIC] });
     const release = await holdWorker(actors, root, actor.id);
     expect(actors.status(actor.id)).toMatchObject({ status: "running", queued: 0 });
-    const refusal = await actors.stop(actor.id, undefined, false, "actors.stop", { explicit: true }).then(info => info, (error: unknown) => error);
-    expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "stop", actorId: actor.id,
-      counts: { queued: 0, parked: 0, overflow: 0, deadLetter: 0, inFlight: 1, settled: 0 } });
-    expect((refusal as Error).message).toMatch(/in-flight 1.*Wait until it is idle, or pass dropQueued: true/);
-    expect(actors.status(actor.id).status).toBe("running");
-    const stopped = await actors.stop(actor.id, undefined, false, "actors.stop", { explicit: true, dropQueued: true });
-    const { archive, counts } = stopArchive(stopped);
+    // Stopping a busy actor is the normal operator action: the run is stopped, and its item is archived, not dropped.
+    const stopped = await actors.stop(actor.id, undefined, false, "actors.stop", { explicit: true });
+    const { archive, sha256, counts } = stopArchive(stopped);
     expect(stopped.status).toBe("stopped");
     expect(counts).toEqual({ queued: 0, parked: 0, overflow: 0, deadLetter: 0, inFlight: 1, settled: 0 });
+    expect(path.dirname(archive)).toBe(path.join(root, "actors", actor.id, "stopped-queues"));
     const lines = archiveLines(archive);
     expect(lines.map(line => line.kind)).toEqual(["header", "in-flight"]);
     expect(lines[1]!.item).toMatchObject({ source: "direct", payload: { message: "LIVE_WITH_PROGRESS" } });
+    expect(actors.messages(actor.id)).toContainEqual(expect.objectContaining({ text: `MOVED-TO ${archive}\nsha256 ${sha256}` }));
     release();
-    // A second explicit stop of the stopped actor has nothing in flight of its own left to refuse for.
-    await expect(actors.stop(actor.id, undefined, false, "actors.stop", { explicit: true })).resolves.toMatchObject({ status: "stopped" });
+    await waitFor(() => !actors.status(actor.id).inFlightRun);
+    // A second explicit stop of the stopped actor has nothing in flight of its own left to archive.
+    await expect(actors.stop(actor.id, undefined, false, "actors.stop", { explicit: true })).resolves.not.toHaveProperty("stoppedQueue");
+    // The archived in-flight item is fed to a successor like a queued one.
+    const fresh = await actors.create({ name: "busy-successor", instructions: "Supervise.", topics: ["queued-work.other"] });
+    await holdWorker(actors, root, fresh.id);
+    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 1, skipped: [] });
+  }, 30_000);
+
+  it("F3 (round 4): an explicit stop over a caller's ask in flight stops it as before; the ask is rejected and nothing is archived", async () => {
+    const { root, actors } = setup();
+    const actor = await actors.create({ name: "asked-supervisor", instructions: "Supervise.", responseMode: "text" });
+    const asked = actors.ask(actor.id, "HANG").then(() => "answered", (error: unknown) => error);
+    await waitFor(() => Boolean(actors.status(actor.id).inFlightRun));
+    const stopped = await actors.stop(actor.id, undefined, false, "actors.stop", { explicit: true });
+    expect(stopped).toMatchObject({ status: "stopped" });
+    expect(stopped).not.toHaveProperty("stoppedQueue");
+    expect(await asked).toBeInstanceOf(Error);
+    expect(fs.existsSync(path.join(root, "actors", actor.id, "stopped-queues"))).toBe(false);
+    expect(actors.messages(actor.id).some(message => message.text?.startsWith("MOVED-TO"))).toBe(false);
+    // Nothing kept, so a plain remove is not refused.
+    await expect(actors.remove(actor.id)).resolves.toMatchObject({ removed: true });
   }, 30_000);
 
   it("same-name restore: stop with dropQueued, create the same name, requeueArchived queues every archived item; forgeries stay refused", async () => {
@@ -570,7 +591,7 @@ describe("queued-work guard, round 3 (pi-fabric#1572)", () => {
     const fed = await provider.invoke("requeueArchived", { id: fresh.id, archive }, context) as actorTypes.FabricActorRequeueResult;
     expect(fed).toMatchObject({ id: fresh.id, sha256, requeued: 4, filtered: 0, superseded: 0, alreadyRequeued: 0, skipped: [] });
     const moved = fed.archive;
-    expect(moved).toMatch(new RegExp(`session-archive.*${old.id}\\.recoverable-[0-9TZ]+/stopped-queues/${path.basename(archive)}$`));
+    expect(moved).toMatch(new RegExp(`session-archive.*${old.id}\\.recoverable-[0-9TZ]+${SEP}stopped-queues${SEP}${path.basename(archive)}$`));
     expect(markers(meshRecords(root, fresh.id))).toEqual(["event-0", "event-1", "event-2"]);
     expect(actors.status(fresh.id).queued).toBe(4);
     // Each archive is requeued once, through either path.
@@ -656,12 +677,15 @@ describe("queued-work guard, round 3 (pi-fabric#1572)", () => {
     const { provider, context } = providerFor(fixture);
     const tool = await actors.create({ name: "tool-stopped", instructions: "Supervise.", topics: [TOPIC] });
     const releaseTool = await holdWorker(actors, root, tool.id);
-    await expect(provider.invoke("stop", { id: tool.id }, context)).rejects.toMatchObject({ code: QUEUED_WORK, counts: { inFlight: 1 } });
+    // Round 4: the activation in flight alone never refuses a stop; a queued item does.
+    actors.tell(tool.id, "queued behind the held run");
+    await expect(provider.invoke("stop", { id: tool.id }, context)).rejects.toMatchObject({ code: QUEUED_WORK, counts: { queued: 1, inFlight: 1 } });
     expect(actors.status(tool.id).status).toBe("running");
     await expect(provider.invoke("stop", { id: tool.id, dropQueued: true }, context)).resolves.toMatchObject({ status: "stopped", stoppedQueue: expect.anything() });
     releaseTool();
     const command = await actors.create({ name: "command-stopped", instructions: "Supervise.", topics: [TOPIC] });
     const releaseCommand = await holdWorker(actors, root, command.id);
+    actors.tell(command.id, "queued behind the held run");
     const notices: Array<[string, string]> = [];
     const deps = { state: { ensure: async () => {}, actors, agents } } as unknown as Parameters<typeof runFabricCommand>[1];
     const commandContext = { ui: { notify: (text: string, level: string) => { notices.push([text, level]); } } } as unknown as Parameters<typeof runFabricCommand>[3];
@@ -736,3 +760,117 @@ describe("resident removal forwarding (pi-fabric#1572 round 3)", () => {
     expect(fs.readFileSync(path.join(base, kept[0]!, "stopped-queues", path.basename(archive))).equals(bytes)).toBe(true);
   }, 60_000);
 });
+
+// pi-fabric#1572 round 4: an explicit stop with a run in flight is not refused for the in-flight item. These reproduce, in a
+// fleet-runnable suite, the explicit stops of the hosted-only CI failures on 6600e802 (agents-provider, residency,
+// residency-stopped-writer-retention), which a fleet host does not collect (vitest.config.cts hostedOnlyDeletionSuites).
+describe("queued-work guard, round 4: explicit stop of a busy actor (pi-fabric#1572)", () => {
+  const providerFor = (fixture: ReturnType<typeof setup>) => {
+    const participants = { scheduleRefresh() {}, list: () => [], get: () => undefined } as unknown as FabricParticipantSource;
+    const main = { id: identity.id, local: true, matches: (id: string) => id === identity.id } as FabricMainAgentTarget;
+    const lifecycle = new LifecycleBroker(fixture.mesh, identity, participants, { enabled: false, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    const provider = new AgentsProvider(fixture.agents, fixture.actors, new GlobalActorRegistry(fixture.root, 64 * 1024), main, participants, undefined, lifecycle);
+    const context: FabricInvocationContext = {
+      cwd: process.cwd(), signal: undefined, parentToolCallId: "test-parent", nestedToolCallId: "test-nested",
+      extensionContext: {} as FabricInvocationContext["extensionContext"], activity() {}, update() {},
+    };
+    return { provider, context };
+  };
+
+  it("the agents.stop tool and a routed control-plane stop over an ask or a callerless item in flight stop it; only the callerless item is archived", async () => {
+    const fixture = setup();
+    const { root, actors } = fixture;
+    const { provider, context } = providerFor(fixture);
+    // agents-provider "still stops a zero-progress local actor ASK on explicit stop" / "keeps explicit stop effective after Main's ceiling detaches a local ASK".
+    const asked = await actors.create({ name: "tool-asked", instructions: "Advise.", responseMode: "text" });
+    const answer = actors.ask(asked.id, "HANG").then(() => "answered", (error: unknown) => error);
+    await waitFor(() => Boolean(actors.status(asked.id).inFlightRun));
+    const stopped = await provider.invoke("stop", { id: asked.id }, context) as FabricActorInfo;
+    expect(stopped).toMatchObject({ status: "stopped" });
+    expect(stopped).not.toHaveProperty("stoppedQueue");
+    expect(await answer).toBeInstanceOf(Error);
+    expect(actors.messages(asked.id).filter(message => message.direction === "out" && message.text)).toEqual([]);
+    // agents-provider "preserves accepted native/mesh owner work at the Main ceiling": the owner's side of a routed agents.stop.
+    const command = (targetId: string) => ({ version: 1 as const, commandId: randomUUID(), targetId, operation: "stop" as const, replyTo: from.id, requestedAt: Date.now() });
+    const remote = await actors.create({ name: "routed-asked", instructions: "Advise.", responseMode: "text" });
+    const remoteAnswer = actors.ask(remote.id, "HANG").then(() => "answered", (error: unknown) => error);
+    await waitFor(() => Boolean(actors.status(remote.id).inFlightRun));
+    await expect(provider.acceptControl(command(remote.id), from)).resolves.toMatchObject({ accepted: true });
+    expect(actors.status(remote.id).status).toBe("stopped");
+    expect(await remoteAnswer).toBeInstanceOf(Error);
+    expect(fs.existsSync(path.join(root, "actors", remote.id, "stopped-queues"))).toBe(false);
+    const busy = await actors.create({ name: "routed-busy", instructions: "Supervise.", topics: [TOPIC] });
+    const release = await holdWorker(actors, root, busy.id);
+    await expect(provider.acceptControl(command(busy.id), from)).resolves.toMatchObject({ accepted: true });
+    expect(actors.status(busy.id).status).toBe("stopped");
+    // The acknowledgement carries no archive path: the MOVED-TO record in the actor's log names it.
+    const moved = actors.messages(busy.id).find(message => message.text?.startsWith("MOVED-TO "));
+    expect(moved?.data).toMatchObject({ stoppedQueue: { counts: { queued: 0, inFlight: 1 } } });
+    release();
+    // A queued item still refuses a routed stop without dropQueued.
+    const queued = await actors.create({ name: "routed-queued", instructions: "Supervise.", topics: [TOPIC] });
+    const releaseQueued = await holdWorker(actors, root, queued.id);
+    actors.tell(queued.id, "queued behind the held run");
+    await expect(provider.acceptControl(command(queued.id), from)).resolves.toMatchObject({ accepted: false, error: expect.stringMatching(/stop refused and nothing changed/) });
+    expect(actors.status(queued.id).status).toBe("running");
+    releaseQueued();
+  }, 60_000);
+
+  it("a resident host's control-plane stop over a followUp or an ask in flight stops it; a plain removeActor then works for the ask", async () => {
+    installInProcessResidentFence();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-queued-work-r4-"));
+    roots.push(root);
+    const rootIdentity = { id: "session:queued-r4", name: "Main", kind: "main" as const, sessionId: "queued-r4" };
+    const config: ResidentHostConfig = {
+      format: RESIDENT_HOST_FORMAT, rootId: rootIdentity.id, sessionId: rootIdentity.sessionId,
+      cwd: root, projectRoot: root, meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"),
+      residencyRoot: residentRoot(path.join(root, "mesh"), rootIdentity.id), fullCodeMode: true, agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
+      mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, retention: DEFAULT_FABRIC_CONFIG.retention,
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fabricExtensionPath: path.resolve("dist/index.js"),
+      piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
+      piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
+    };
+    fs.mkdirSync(config.residencyRoot, { recursive: true });
+    fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
+    const mesh = new MeshStore(config.meshRoot, 65_536, 1_000);
+    const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: rootIdentity.id, rootId: rootIdentity.id, identity: rootIdentity });
+    participants.registerSource(() => [{
+      format: 1, id: rootIdentity.id, kind: "root", rootId: rootIdentity.id, ownerHostId: rootIdentity.id, ownerIdentityId: rootIdentity.id,
+      name: "Main", status: "idle", residency: "session", runner: "pi", transport: "host", capabilities: ["fabric"],
+      sessionId: rootIdentity.sessionId, startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
+    }]);
+    const host = new ResidentHost(config);
+    const control = new FabricControlPlane(mesh, rootIdentity, { enabled: true, hostId: rootIdentity.id, pollMs: 20, acknowledgementTimeoutMs: 5_000 });
+    closers.push(async () => {
+      for (const run of host.agents?.listForUi() ?? []) await host.agents.stop(run.id).catch(() => undefined);
+      await control.close(); await host.close(); await participants.close();
+    });
+    await participants.start();
+    await host.start();
+    control.start(() => ({ accepted: false }));
+    const hostId = residentHostId(rootIdentity.id);
+    // residency-stopped-writer-retention "public actor stop retains its live writer...": a callerless followUp in flight.
+    const followed = await host.actors.create({ name: "resident-followed", instructions: "Reply.", residency: "durable", responseMode: "text", delivery: "mailbox" });
+    await control.request(hostId, followed.id, "followUp", { message: "HANG_WITH_PROGRESS", ownerIncarnation: host.control.incarnation }, hostId);
+    await waitFor(() => Boolean(host.actors.status(followed.id).inFlightRun));
+    expect(await control.request(hostId, followed.id, "stop", { ownerIncarnation: host.control.incarnation }, hostId)).toMatchObject({ acknowledged: true });
+    expect(host.actors.status(followed.id).status).toBe("stopped");
+    const moved = host.actors.messages(followed.id).find(message => message.text?.startsWith("MOVED-TO "));
+    const archive = (moved?.data as { stoppedQueue?: { archive?: string } } | undefined)?.stoppedQueue?.archive;
+    expect(archive).toBeDefined();
+    expect(archiveLinesOf(archive!).map(line => line.kind)).toEqual(["header", "in-flight"]);
+    expect(archiveLinesOf(archive!)[1]!.item).toMatchObject({ payload: { message: "HANG_WITH_PROGRESS" } });
+    // residency "preserves a resident-host ASK activation at the Main ceiling": an ask in flight, then a plain removeActor.
+    const asked = await host.actors.create({ name: "resident-asked", instructions: "Reply.", residency: "durable", responseMode: "text", delivery: "followUp", triggerTurn: false });
+    const again = control.requestResult(hostId, asked.id, "ask", { message: "HANG", ownerIncarnation: host.control.incarnation }, hostId, { timeoutMs: 10_000 })
+      .then(() => "answered", (error: unknown) => error);
+    await waitFor(() => Boolean(host.actors.status(asked.id).inFlightRun));
+    expect(await control.request(hostId, asked.id, "stop", { ownerIncarnation: host.control.incarnation }, hostId)).toMatchObject({ acknowledged: true });
+    expect(await again).toBeInstanceOf(Error);
+    await waitFor(() => !host.actors.status(asked.id).inFlightRun);
+    expect(fs.existsSync(path.join(root, "actors", asked.id, "stopped-queues"))).toBe(false);
+    await expect(new ResidentActorClient(config.meshRoot, config.rootId).removeActor(asked.id)).resolves.toMatchObject({ removed: true });
+  }, 60_000);
+});
+const archiveLinesOf = (archive: string) => fs.readFileSync(archive, "utf8").split("\n").filter(Boolean)
+  .map(line => JSON.parse(line) as { kind: string; item?: { source?: string; payload?: unknown } });

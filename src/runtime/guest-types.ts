@@ -1196,9 +1196,9 @@ interface FabricAgentsApi {
   unsubscribe(args: FabricAgentTargetArgs): Promise<{ removed: boolean }>;
   models(args?: { runner?: FabricAgentRunner; refresh?: boolean }): Promise<FabricModelInfo[]>;
   /**
-   * An actor with an activation in flight, or holding queued, parked, overflow, settled-window or dead-letter work, is refused
-   * (FABRIC_ACTOR_QUEUED_WORK, with the counts) unless dropQueued: true, which moves that work to <actor dir>/stopped-queues/
-   * (stoppedQueue on the result).
+   * An actor holding queued, parked, overflow, settled-window or dead-letter work is refused (FABRIC_ACTOR_QUEUED_WORK, with
+   * the counts) unless dropQueued: true, which moves that work to <actor dir>/stopped-queues/ (stoppedQueue on the result).
+   * An activation in flight never refuses a stop: its callerless item is archived there (a caller's ask is rejected).
    */
   stop(args: FabricAgentTargetArgs & { dropQueued?: boolean }): Promise<FabricAgentResult | FabricActorInfo | FabricRemoteControlResult>;
   /** Feed a stop archive to a live (recreated) actor through its normal activation filter, once per item; idempotent. */

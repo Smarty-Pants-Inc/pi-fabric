@@ -305,15 +305,16 @@ export interface FabricActorQueueCounts {
 /** agents.stop options (smarty-dev#16416). */
 export interface FabricActorStopOptions {
   /**
-   * Stop even though the actor holds work (an activation in flight, queued, parked, overflow,
-   * pending settled-window or dead-letter work). That work is moved to
+   * Stop even though the actor holds work (queued, parked, overflow, pending settled-window or
+   * dead-letter work; the activation in flight is archived too). That work is moved to
    * `<actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl`, never deleted;
    * agents.requeueArchived feeds it to a recreated actor.
    */
   dropQueued?: boolean;
   /**
    * pi-fabric#1572 round 3: an explicit operator stop (the agents.stop API and tool, /fabric stop, the
-   * operator CLI). Only these refuse while the actor holds work and no dropQueued was given. Internal
+   * operator CLI). Only these refuse while the actor holds work and no dropQueued was given; round 4: the activation
+   * in flight never refuses, and its callerless item is archived before the run is stopped. Internal
    * stops (removal, session reset, Main close, host shutdown) never set it and stop as they always did.
    */
   explicit?: true;

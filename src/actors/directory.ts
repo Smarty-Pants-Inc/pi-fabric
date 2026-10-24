@@ -144,7 +144,8 @@ export class ActorDirectory extends ActorManager {
         for (const actor of sameName.filter((actor) => actor.scope !== scope)) {
           options.checkActive?.();
           // smarty-dev#16416 round 2: the replaced actor's archived and held work is kept with its tree, not refused.
-          await this.remove(actor.id, { wait: false, dropQueued: true });
+          // Round 4 (pi-fabric#1572): through replacingSameName, so this stays the plain remove(id, { wait: false }).
+          await this.replacingSameName(actor.id, () => this.remove(actor.id, { wait: false }));
         }
       },
     };
@@ -266,6 +267,7 @@ export class ActorDirectory extends ActorManager {
   override dispatchObservedHostEvent(...args: Parameters<ActorManager["dispatchObservedHostEvent"]>): number { return super.dispatchObservedHostEvent(...args) + this.#secondary.dispatchObservedHostEvent(...args); }
   override stop(...args: Parameters<ActorManager["stop"]>): ReturnType<ActorManager["stop"]> { return this.#isPrimary(args[0]) ? super.stop(...args) : this.#secondary.stop(...args); }
   override requeueArchived(...args: Parameters<ActorManager["requeueArchived"]>): ReturnType<ActorManager["requeueArchived"]> { return this.#isPrimary(args[0]) ? super.requeueArchived(...args) : this.#secondary.requeueArchived(...args); }
+  override replacingSameName<T>(id: string, run: () => Promise<T>): Promise<T> { return this.#isPrimary(id) ? super.replacingSameName(id, run) : this.#secondary.replacingSameName(id, run); }
   override get halted(): boolean { return super.halted && this.#secondary.halted; }
   /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
   override inFlightActorIds(): string[] { return [...super.inFlightActorIds(), ...this.#secondary.inFlightActorIds()]; }

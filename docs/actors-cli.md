@@ -12,8 +12,9 @@ fabric-actors remove --resident <directory-or-prefix> --actor <id-or-name> --con
 
 ## Stop never drops queued work silently (smarty-dev#16416)
 
-`stop` refuses an actor that still holds work: an activation in flight, or queued, parked, overflow, pending
-settled-window or dead-letter work. The error names each count, and nothing changes. To stop it anyway, add
+`stop` refuses an actor that still holds work: queued, parked, overflow, pending settled-window or dead-letter
+work. The error names each count, and nothing changes. An activation in flight alone never refuses a stop: the run is
+stopped, and its item, unless a caller's ask is waiting on it, is archived as below. To stop it anyway, add
 `--drop-queued`. The work is then **moved**, not deleted, into one archive file in the actor's directory,
 `<actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl`.
 The printed result carries `actor.stoppedQueue` with the archive path, its full sha256 and the counts. The actor's

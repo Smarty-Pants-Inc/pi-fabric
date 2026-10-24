@@ -897,6 +897,8 @@ export class ActorManager {
   readonly #removalCleanup = new Map<string, RemovalCleanup>();
   readonly #revoked = new Set<string>();
   readonly #removeCalls = new Map<string, Promise<RemovalResult>>();
+  /** pi-fabric#1572 round 4: same-name predecessors a create is removing now (replacingSameName). */
+  readonly #sameNameReplacements = new Set<string>();
   readonly #finishCalls = new Map<string, Promise<RemovalResult>>();
   readonly #operatorRemovals = new Set<string>();
   readonly #operatorEscalations = new Map<string, Promise<void>>();
@@ -1870,8 +1872,9 @@ export class ActorManager {
         await beforeMaterialize?.(id);
         checkActive?.();
         // smarty-dev#16416 round 2: an explicit same-name replacement keeps the predecessor's stop archives
-        // and held dead letters with its removed tree (dropQueued), never deletes them, and is not refused.
-        if (sameName?.status === "stopped") await this.remove(sameName.id, { wait: false, dropQueued: true });
+        // and held dead letters with its removed tree, never deletes them, and is not refused. Round 4: through
+        // replacingSameName, so the removal keeps the plain remove(id, { wait: false }) contract (#7991).
+        if (sameName?.status === "stopped") await this.replacingSameName(sameName.id, () => this.remove(sameName.id, { wait: false }));
       }
       checkActive?.();
       onCommit?.(id);
@@ -3724,18 +3727,22 @@ export class ActorManager {
 
   /**
    * Terminal stop. smarty-dev#16416, round 3 (pi-fabric#1572): only an EXPLICIT operator stop (options.explicit:
-   * the agents.stop API and tool, /fabric stop, the operator CLI) refuses an actor holding work (an activation in
-   * flight, queued, parked, overflow, pending settled-window or dead-letter work) with FabricActorQueuedWorkError,
-   * before any effect. With options.dropQueued that work is moved to a stop archive first, never deleted. Internal
-   * stops (removal, non-persistent close's session reset) are never refused and stop exactly as on e50db08f; a
-   * removal with dropQueued archives the same way, so its work is kept with the removed tree.
+   * the agents.stop API and tool, /fabric stop, the operator CLI) refuses an actor holding work (queued, parked,
+   * overflow, pending settled-window or dead-letter work) with FabricActorQueuedWorkError, before any effect. With
+   * options.dropQueued that work, and the activation in flight, is moved to a stop archive first, never deleted.
+   * Round 4: the activation in flight never refuses a stop: stopping a busy actor is the normal operator action. The
+   * run is stopped as on e50db08f, and an explicit stop first archives its callerless in-flight item(s) (#writeStopArchive
+   * "in-flight" mode), so that work is not dropped silently; a caller's ask in flight is answered by the run's abort.
+   * Internal stops (removal, non-persistent close's session reset) are never refused and stop exactly as on e50db08f;
+   * a removal with dropQueued archives like dropQueued, so its work is kept with the removed tree.
    */
   async stop(id: string, beforeCommit?: (id: string) => void, wait = false, path: AgentRunStopPath = "actors.stop", options: FabricActorStopOptions = {}): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
     const running = this.#runningActor(actor.id)!;
     const stopped = actor.status === "stopped";
     const counts = this.#queuedWorkCounts(actor, running, stopped);
-    const held = counts.queued + counts.parked + counts.overflow + counts.deadLetter + counts.inFlight + counts.settled;
+    // Round 4 (pi-fabric#1572): what refuses an explicit stop without dropQueued. The in-flight item does not.
+    const held = counts.queued + counts.parked + counts.overflow + counts.deadLetter + counts.settled;
     if (options.explicit === true && held > 0 && options.dropQueued !== true) {
       throw new FabricActorQueuedWorkError("stop", actor.id, { ...counts },
         `Fabric actor ${actor.name} (${actor.id}) holds queued work (queued ${counts.queued}, parked ${counts.parked}, ` +
@@ -3745,8 +3752,11 @@ export class ActorManager {
     }
     beforeCommit?.(actor.id);
     // Round 3: the archive is durable BEFORE anything changes (synchronously, so nothing is admitted in between);
-    // a failed write throws with the actor still running and its work intact.
-    const archive = options.dropQueued === true && held > 0 ? this.#writeStopArchive(actor, running, stopped) : undefined;
+    // a failed write throws with the actor still running and its work intact. Round 4: an explicit stop without
+    // dropQueued archives only its callerless in-flight item(s); nothing else is held (it was refused above).
+    const archive = options.dropQueued === true
+      ? (held + counts.inFlight > 0 ? this.#writeStopArchive(actor, running, stopped) : undefined)
+      : options.explicit === true && counts.inFlight > 0 ? this.#writeStopArchive(actor, running, stopped, true) : undefined;
     // Terminal stop cancels an unperformed repair, never rotates its journal.
     const resets = this.#pendingResets.get(actor.id);
     this.#pendingResets.delete(actor.id);
@@ -3784,16 +3794,20 @@ export class ActorManager {
    * stopped-queues/moved-to.jsonl, so it travels with the archive when a removal moves stopped-queues/ to
    * session-archive/. Nothing is forgotten here; a failed write throws with the actor and its work intact.
    */
-  #writeStopArchive(actor: ManagedActor, running: ManagedActor, stopped: boolean): { stoppedQueue: FabricActorStoppedQueue; deadLetters: boolean; stoppedAt: number } {
-    const inFlight = stopped ? [] : this.#stoppableInFlight(actor.id);
-    const queued = [...actor.queue, ...(running !== actor ? running.queue : [])];
-    const overflow = [...(this.#overflow.get(actor.id) ?? [])];
-    const parked = [...(this.#parked.get(actor.id) ?? [])];
-    const settled = this.#pendingSettledWindows(actor.id);
+  #writeStopArchive(actor: ManagedActor, running: ManagedActor, stopped: boolean, inFlightOnly = false): { stoppedQueue: FabricActorStoppedQueue; deadLetters: boolean; stoppedAt: number } | undefined {
+    // Round 4 (pi-fabric#1572): inFlightOnly, for an explicit stop without dropQueued, archives the callerless item(s) of
+    // the activation in flight and nothing else. A caller's ask is not archived: its caller hears the run's abort, as on
+    // e50db08f, and requeueArchived never feeds a caller's ask again. Nothing callerless in flight: no archive at all.
+    const inFlight = stopped ? [] : this.#stoppableInFlight(actor.id).filter(item => !inFlightOnly || !(item.resolve || item.reject));
+    if (inFlightOnly && inFlight.length === 0) return undefined;
+    const queued = inFlightOnly ? [] : [...actor.queue, ...(running !== actor ? running.queue : [])];
+    const overflow = inFlightOnly ? [] : [...(this.#overflow.get(actor.id) ?? [])];
+    const parked = inFlightOnly ? [] : [...(this.#parked.get(actor.id) ?? [])];
+    const settled = inFlightOnly ? [] : this.#pendingSettledWindows(actor.id);
     const sections: Array<["in-flight" | "queued" | "overflow" | "parked", ActorQueueItem[]]> =
       [["in-flight", inFlight], ["queued", queued], ["overflow", overflow], ["parked", parked]];
     let deadLetterText = "";
-    try { deadLetterText = fs.readFileSync(this.#deadLetterFile(actor.id), "utf8"); } catch (error) {
+    if (!inFlightOnly) try { deadLetterText = fs.readFileSync(this.#deadLetterFile(actor.id), "utf8"); } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
     const deadLetters: StoppedQueueLine[] = deadLetterText.split("\n").filter(Boolean).map((line) => {
@@ -4190,7 +4204,9 @@ export class ActorManager {
     const accepted = this.cleanupObligation(id) || this.#removeCalls.has(id) || this.finishingRemoval(id);
     const actorId = accepted ? id : this.#requireOwnedActor(id).id;
     // smarty-dev#16416 round 2: a new removal never takes stop archives or held dead letters with it unasked.
-    if (!accepted && !this.#actors.get(actorId)?.removal && dropQueued !== true) this.#assertRemovalKeepsNoWork(actorId);
+    // Round 4 (pi-fabric#1572): a same-name create's predecessor removal (replacingSameName) asks: it keeps them as dropQueued does.
+    const keep = dropQueued === true || this.#sameNameReplacements.has(actorId);
+    if (!accepted && !this.#actors.get(actorId)?.removal && !keep) this.#assertRemovalKeepsNoWork(actorId);
     // Capture the admitted commit before persistence yields: later progress must not lose this caller's join.
     const finishing = this.finishingRemoval(actorId) ? this.#finishCalls.get(actorId) : undefined;
     // Sticky before joining any call in progress; durable before an accepted removal reports it.
@@ -4198,7 +4214,7 @@ export class ActorManager {
     // Share acceptance, not the first caller's wait policy. Every caller joins the same finisher.
     // A commit in its map hole (smarty-dev#11105) is joined, never restarted: its result is the answer. Once
     // revoked, the existing cleanup-obligation path answers its pending state without waiting on the finisher.
-    const call = this.#removeCalls.get(actorId) ?? finishing ?? this.#remove(actorId, operator === true, dropQueued === true);
+    const call = this.#removeCalls.get(actorId) ?? finishing ?? this.#remove(actorId, operator === true, keep);
     this.#removeCalls.set(actorId, call);
     let result: RemovalResult;
     try { result = await call; } finally {
@@ -4269,6 +4285,17 @@ export class ActorManager {
     return this.#beforeOperatorCleanup !== undefined && !this.#ceded.has(cleanup.id) &&
       this.#revoked.has(cleanup.id) && !this.#actors.has(cleanup.id) &&
       cleanup.owner !== undefined && cleanup.owner.rootId === this.#rootId;
+  }
+
+  /**
+   * pi-fabric#1572 round 4: run a same-name create's predecessor cleanup. The create calls the plain
+   * remove(id, { wait: false }) it called on e50db08f (the #7991 cross-scope cleanup and exact-retry contract); the
+   * removal of `id` made inside `run` keeps the predecessor's work as dropQueued would (its stop archives, held dead
+   * letters and whatever its stop archives move with the tree to session-archive/) and is never refused for it.
+   */
+  async replacingSameName<T>(id: string, run: () => Promise<T>): Promise<T> {
+    this.#sameNameReplacements.add(id);
+    try { return await run(); } finally { this.#sameNameReplacements.delete(id); }
   }
 
   /**

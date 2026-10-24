@@ -36,7 +36,7 @@ beforeEach(() => {
   vi.stubEnv("PI_CODING_AGENT_DIR", root);
   vi.spyOn(FabricState.prototype, "bootstrap").mockResolvedValue(undefined);
   vi.spyOn(FabricState.prototype, "config", "get").mockReturnValue(DEFAULT_FABRIC_CONFIG);
-  vi.spyOn(FabricState.prototype, "shouldEagerlyActivate").mockReturnValue(false);
+  vi.spyOn(FabricState.prototype, "shouldEagerlyActivate").mockResolvedValue(false);
 });
 afterEach(async () => {
   gates.splice(0).forEach(resolve => resolve());

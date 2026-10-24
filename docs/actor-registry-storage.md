@@ -2,8 +2,10 @@
 
 `actors/<root>/actors.json` remains a format-1 metadata registry. Direct readers
 (residency, retention and ownership fences) still see current ids, custody,
-configuration and status. **Instructions always remain inline**, including large
-instructions. Only growing message histories move out. Each externalized row retains an empty
+configuration and status. Instructions longer than 1 KiB move to immutable
+`<actor-id>/registry/instructions-<sha256>.txt` files: the row names the digest in
+`instructionsFile` and carries **no `instructions` key, never a stub** (smarty-dev#8525).
+Shorter instructions stay inline. Growing message histories also move out. Each externalized row retains an empty
 inline `messages` array so old loaders can accept and save it safely. Bounded
 filter-skip-only journals remain inline soft telemetry until substantive history
 exists, preserving the existing no-fsync filter poll contract.
@@ -82,8 +84,16 @@ publication remains immediate; this window is not an authority/lease cache.
 Inline format-1 registries still load. The first save archives **all** embedded
 legacy messages, even when more than 100 exist, before replacing the registry
 with metadata. Foreign inline rows migrate without losing unknown fields.
-Instruction sidecars from the initial PR layout are supported for reading and
-hydrated back inline on the next save; no new instruction sidecars are created.
+A row moves its instructions to a sidecar when its owner next saves it; unchanged
+foreign rows stay byte-identical. The sidecar is durable before any row names it.
+
+Every live release since `8b22ce04` (`41a73f85`, `6c58c333`, `f4bf329b`) reads
+`instructionsFile`, keeps a foreign sidecar row verbatim, and re-inlines the full text
+when it saves a row it owns; this release then reads that row and re-addresses it to
+the same digest. `bun scripts/probe-actor-registry-mixed-release.ts <release-worktree>`
+proves this per release. `8b22ce04` re-inlined because pre-sidecar releases such as
+`6b15d905` read `instructions` directly and saved a stub back as the text. With no
+`instructions` key such a release fails closed: it skips the row, never runs or saves a stub.
 
 Release `6b15d905` accepts format 1, a string `instructions` and an array
 `messages`. Its store preserves unknown fields when directly saving raw records,

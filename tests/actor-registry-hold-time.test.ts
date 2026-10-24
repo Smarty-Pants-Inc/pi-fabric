@@ -15,7 +15,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
-const fixture = () => {
+const fixture = (legacyInline = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "registry-hold-time-")); roots.push(root);
   const actorRoot = path.join(root, "actors");
   const store = new ActorRegistryStore(actorRoot);
@@ -23,7 +23,9 @@ const fixture = () => {
     id: index.toString(16).padStart(32, "0"), name: `review-${index}`, rootId: "session:hold",
     residency: "session", instructions: "p".repeat(20_000), messages: [], createdAt: 1, updatedAt: 1, status: "idle",
   }));
-  store.write(rows, { durable: true });
+  // A legacy inline registry: long personas are moved to sidecars only as their rows change.
+  if (legacyInline) { fs.mkdirSync(actorRoot, { recursive: true }); fs.writeFileSync(path.join(actorRoot, "actors.json"), JSON.stringify({ format: 1, actors: rows })); }
+  else store.write(rows, { durable: true });
   return { root, actorRoot, store, rows, lock: path.join(actorRoot, "actors.json.lock") };
 };
 const burn = (ms: number) => { const end = performance.now() + ms; while (performance.now() < end) { /* CPU-starved codec */ } };
@@ -283,7 +285,7 @@ describe("#4383 bounded registry holds", () => {
   }, 15_000);
 
   it("keeps slow 1 MB parse/serialize and all 50 payload preparations outside every hold", async () => {
-    const { store, lock, actorRoot } = fixture();
+    const { store, lock, actorRoot } = fixture(true);
     expect(fs.statSync(path.join(actorRoot, "actors.json")).size).toBeGreaterThan(1_000_000);
     let holding = false;
     const cpu: number[] = [];
@@ -337,12 +339,14 @@ describe("#4383 bounded registry holds", () => {
     await store.update(current => ({ actors: current.map((row, index) => {
       // Model the manager's lazy history selection (no inline messages), with
       // different field order from a mixed-release writer. Neither is a change.
-      const { messages: _stub, ...selected } = row;
-      const serializedShape = Object.fromEntries(Object.entries(selected).reverse());
+      // smarty-dev#8525: the manager also carries its hydrated persona, not the sidecar digest.
+      const { messages: _stub, instructionsFile: _digest, ...selected } = row;
+      const serializedShape = Object.fromEntries([...Object.entries(selected).reverse(), ["instructions", "p".repeat(20_000)]]);
       return index === 17 ? { ...serializedShape, nice: 7 } : serializedShape;
     }), value: true }));
     expect(compact).toHaveBeenCalledTimes(1);
-    expect(personas).toEqual(["11".padStart(32, "0")]);
+    expect(personas).toEqual([]); // Only the changed row is encoded, and it carries a digest.
+    expect(store.records().every(row => row.instructions === undefined && typeof row.instructionsFile === "string")).toBe(true);
   });
 
   it("re-selects after a foreign generation wins and never publishes speculative history heads", async () => {

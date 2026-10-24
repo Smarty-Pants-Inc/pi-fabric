@@ -108,7 +108,10 @@ describe("published build artifact guards", () => {
     fs.rmSync(path.join(dir, "dist/ui/image-overlays.js"));
     rejected(dir, "ui/image-overlays.js");
   });
-  it.each(["native-discovery.js", "memory/extractive-history.js", "durable/worker.js", "durable/worker-host.js"])("requires stable optional entry %s", (entry) => {
+  it.each(["native-discovery.js", "memory/extractive-history.js", "durable/worker.js", "durable/worker-host.js", "actors/registry-payloads.js"])("requires stable optional entry %s", (entry) => {
+    // Decision C keep reason: installation/reload data safety.
+    // E2E plan/scenario: installed extension session_start reading a sidecar after a generation swap.
+    // Owner: fabric-store. Pass condition: stable reader artifact exists and startup reads the full persona.
     const dir = fixture();
     fs.rmSync(path.join(dir, "dist", entry));
     rejected(dir, entry);

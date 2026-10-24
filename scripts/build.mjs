@@ -53,6 +53,7 @@ const primaryEntryPoints = [
 // paths let a session that loaded the previous index resolve delayed modules after
 // the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  "src/actors/registry-payloads.ts",
   // Principal diagnostics load their private file sink only on the first diverted line.
   "src/core/diagnostics-log.ts",
   // Command registration is eager; the subcommand implementation loads on invocation.

@@ -313,7 +313,7 @@ export class FabricState {
     return lease;
   }
 
-  shouldEagerlyActivate(context: ExtensionContext): boolean {
+  shouldEagerlyActivate(context: ExtensionContext): boolean | Promise<boolean> {
     if (
       process.env.PI_FABRIC_CAPABILITY_REQUIREMENTS !== undefined &&
       Boolean(process.env.PI_FABRIC_CAPABILITY_DIGEST)
@@ -338,23 +338,52 @@ export class FabricState {
       path.join(meshRoot, "actors"),
       path.join(meshRoot, "actors", fabricSessionId),
     ];
-    return actorRoots.some((actorRoot) => {
+    const sidecarCandidates: Array<{ actorRoot: string; actor: Record<string, unknown> }> = [];
+    for (const actorRoot of actorRoots) {
       try {
         const registry = JSON.parse(fs.readFileSync(path.join(actorRoot, "actors.json"), "utf8")) as unknown;
-        if (typeof registry !== "object" || registry === null || Array.isArray(registry)) return false;
+        if (typeof registry !== "object" || registry === null || Array.isArray(registry)) continue;
         const actors = (registry as { actors?: unknown }).actors;
-        return Array.isArray(actors) && actors.some((value) => {
-          if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+        if (!Array.isArray(actors)) continue;
+        for (const value of actors) {
+          if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
           const actor = value as Record<string, unknown>;
-          return typeof actor.id === "string" && /^[a-f0-9]{32}$/.test(actor.id) &&
-            typeof actor.name === "string" && /^[a-zA-Z0-9][a-zA-Z0-9 _.-]{0,59}$/.test(actor.name) &&
-            typeof actor.instructions === "string" &&
-            Buffer.byteLength(actor.instructions, "utf8") <= this.config.mesh.maxEventBytes &&
-            typeof actor.createdAt === "number" && Number.isFinite(actor.createdAt);
-        });
+          if (typeof actor.id !== "string" || !/^[a-f0-9]{32}$/.test(actor.id) ||
+              typeof actor.name !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9 _.-]{0,59}$/.test(actor.name) ||
+              typeof actor.createdAt !== "number" || !Number.isFinite(actor.createdAt)) continue;
+          if (typeof actor.instructions === "string") {
+            if (Buffer.byteLength(actor.instructions, "utf8") <= this.config.mesh.maxEventBytes) return true;
+          } else if (actor.instructions === undefined && actor.instructionsFile !== undefined) {
+            sidecarCandidates.push({ actorRoot, actor });
+          }
+        }
       } catch {
-        return false;
+        // A damaged root must not suppress a valid candidate in the other root.
       }
+    }
+    if (sidecarCandidates.length === 0) return false;
+
+    const generation = this.#generation;
+    if (this.#shutDown || !extensionContextLive(context)) return false;
+    return import("./actors/registry-payloads.js").then(({ ActorRegistryPayloads }) => {
+      if (generation !== this.#generation || this.#shutDown || !extensionContextLive(context)) return false;
+      const readers = new Map<string, { instructions(row: Record<string, unknown>): unknown }>();
+      for (const { actorRoot, actor } of sidecarCandidates) {
+        if (generation !== this.#generation || this.#shutDown || !extensionContextLive(context)) return false;
+        try {
+          let reader = readers.get(actorRoot);
+          if (!reader) {
+            reader = new ActorRegistryPayloads(actorRoot);
+            readers.set(actorRoot, reader);
+          }
+          const instructions = reader.instructions(actor);
+          if (typeof instructions === "string" &&
+              Buffer.byteLength(instructions, "utf8") <= this.config.mesh.maxEventBytes) return true;
+        } catch {
+          // A corrupt or missing sidecar must not suppress a later valid actor.
+        }
+      }
+      return false;
     });
   }
 

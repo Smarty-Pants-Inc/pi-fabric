@@ -545,6 +545,18 @@ class ActorContextOverflowError extends Error {
   readonly code = "CONTEXT_OVERFLOW";
   readonly data = { code: ACTOR_CONTEXT_OVERFLOW_ITEM_CODE, errorCode: this.code } as const;
 }
+/** The stuck-run check's reasons that PROVE a launched worker is gone: its pid exited, or now names another process. */
+type ActorRunGoneReason = "worker-gone" | "worker-pid-reused";
+/**
+ * smarty-dev#16333: the stuck-run check proved an in-flight run's worker gone, so its drain stops waiting on a run
+ * handle that will never settle. It carries only the run id and a fixed reason code, never worker or mesh text.
+ */
+class ActorRunWorkerGoneError extends Error {
+  constructor(readonly runId: string, readonly reason: ActorRunGoneReason) {
+    super(`Fabric actor run ${runId} failed: its worker is gone (${reason}) and the run never settled`);
+    this.name = "ActorRunWorkerGoneError";
+  }
+}
 export const ACTOR_ACTIVATION_OVERFLOW_REASON = "no verdict (context overflow)";
 const refRecord = (value: unknown): Record<string, unknown> | undefined =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -833,6 +845,16 @@ export class ActorManager {
   readonly #cancelledPredecessors = new Map<string, Set<string>>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
   readonly #draining = new Map<string, ManagedActor>();
+  /**
+   * smarty-dev#16333: each launched run's drain wait, by run id. The stuck-run check ends the wait on a run whose worker
+   * it proved gone; the drain then records the run failed and continues through its normal cleanup and admission gates.
+   */
+  readonly #runWaits = new Map<string, (error: ActorRunWorkerGoneError) => void>();
+  /**
+   * smarty-dev#16333: per actor (one entry each), the in-flight run the stuck-run check last proved gone, and whether
+   * its drain wait was ended. A first proof is recorded; only the next consecutive proof ends the wait.
+   */
+  readonly #goneRuns = new Map<string, { runId: string; unwound: boolean }>();
   /**
    * smarty-dev#6337: the open stuck-preparing episode per actor, notified at most once. Preparation
    * time accrues across phase transitions of one activation; an admission-permit wait pauses it.
@@ -5206,6 +5228,33 @@ export class ActorManager {
         preparationFailureKind(error));
   }
 
+  /**
+   * smarty-dev#16333: the drain's wait on one launched run, which #unwindGoneRun can end. Registered by run id once
+   * the run is launched, and released as soon as the wait settles, so a late check never touches a later activation.
+   */
+  #runWait(): { launched: (runId: string) => void; wait: (run: Promise<AgentRunResult>) => Promise<AgentRunResult> } {
+    let runId: string | undefined;
+    let settled = false;
+    let end!: (error: ActorRunWorkerGoneError) => void;
+    const gone = new Promise<never>((_resolve, reject) => { end = reject; });
+    gone.catch(() => undefined); // The race below observes it; never an unhandled rejection.
+    const release = (): void => {
+      if (runId !== undefined && this.#runWaits.get(runId) === end) this.#runWaits.delete(runId);
+    };
+    return {
+      launched: (id) => {
+        if (settled) return;
+        release();
+        runId = id;
+        this.#runWaits.set(id, end);
+      },
+      wait: async (run) => {
+        try { return await Promise.race([run, gone]); }
+        finally { settled = true; release(); }
+      },
+    };
+  }
+
   async #drain(actor: ManagedActor): Promise<void> {
     let retryDrain = false;
     let retryDelay = this.#preparationRetryMs;
@@ -5421,7 +5470,9 @@ export class ActorManager {
           }
           preLaunch = false; // AgentManager bounds model/auth setup after (not during) permit waiting.
           if (this.#slotEnforced(actor.topics)) this.#slotLaunchUnknown.add(actor.id);
-          const result = await this.agents.run(
+          // smarty-dev#16333: once launched, the stuck-run check can end this wait if it proves the worker gone.
+          const runWait = this.#runWait();
+          const result = await runWait.wait(this.agents.run(
             { ...this.#runRequest(actor, item, launchBinding, inferenceContext, committedRefs, actor.capabilityDigest),
               ...(routeDecision ? { routeDecision } : {}) },
             abortController.signal,
@@ -5445,6 +5496,7 @@ export class ActorManager {
               this.#endPreparationClock(actor.id, item.id);
               actor.status = "running";
               actor.inFlightRun = { id: handle.id, startedAt: Date.now() };
+              runWait.launched(handle.id);
               void this.#publishPresence(actor).catch(() => undefined);
             },
             // The controller identity is this activation's generation token. A
@@ -5471,7 +5523,7 @@ export class ActorManager {
               actor.preparing = { phase: "launch", startedAt: admittedAt, attempts: item.preparationAttempts ?? 0 };
               void this.#publishPresence(actor).catch(() => undefined);
             } },
-          );
+          ));
           runId = result.id;
           this.#noteSlotRun(actor, result.id);
           runEvidence = result.warnings;
@@ -5700,6 +5752,13 @@ export class ActorManager {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const preparationKind = preparationFailureKind(error);
+          // smarty-dev#16333: a run the stuck-run check proved gone is this activation's failed run, archived and
+          // inspectable like any other. The same gates below decide its item and whether the queue continues.
+          const workerGone = error instanceof ActorRunWorkerGoneError ? error : undefined;
+          if (workerGone) {
+            runId = workerGone.runId;
+            actor.lastRunId = workerGone.runId;
+          }
           if (error instanceof AgentLaunchPreparationTimeoutError && error.launchOutcome === "unlaunched") {
             this.#slotLaunchUnknown.delete(actor.id);
           }
@@ -5719,7 +5778,7 @@ export class ActorManager {
           if (actor.cancelAbort === abortController) {
             delete actor.cancelAbort;
             if (!runCompleted && !item.resolve && !item.reject) {
-              this.#drop(actor, [item], `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
+              this.#drop(actor, [item], workerGone ? message : `Fabric actor ${actor.name} (${actor.id}) halted by user interrupt`);
               continue;
             }
           }
@@ -5800,6 +5859,7 @@ export class ActorManager {
             createdAt: Date.now(),
             error: message,
             ...(error instanceof ActorContextOverflowError ? { data: error.data } : {}),
+            ...(workerGone ? { runId: workerGone.runId, data: { runId: workerGone.runId, reason: workerGone.reason } } : {}),
           };
           this.#recordMessage(this.#liveActor(actor), failed);
           item.reject?.(error instanceof ActorContextOverflowError ? error : new Error(message));
@@ -7255,18 +7315,46 @@ export class ActorManager {
       }
     }
     const run = actor.inFlightRun;
+    const proven = this.#goneRuns.get(actor.id);
+    if (proven && !proven.unwound && proven.runId !== run?.id) this.#goneRuns.delete(actor.id);
     if (run && now - run.startedAt > ACTOR_RUN_STUCK_MIN_MS) {
       const threshold = Math.max(ACTOR_RUN_STUCK_MIN_MS, 2 * (this.#p95RunMs(actor) ?? 0));
       const gone = now - run.startedAt > threshold ? this.#runGone(run.id) : undefined;
+      // smarty-dev#16333: a worker proven gone (its pid exited, or names another process) never settles the drain's
+      // wait by itself, and that wait held every queued message. On a second consecutive proof, one sweep later, end
+      // it: the drain records the run failed and continues through its own cleanup and gates. The first proof only
+      // alarms, as before, so a manager still settling or resuming a just-exited worker (seconds) keeps its run.
+      // An unproven reason (no handle, no run directory, no status record) still only alarms.
+      if (gone === "worker-gone" || gone === "worker-pid-reused") {
+        if (proven?.runId !== run.id) this.#goneRuns.set(actor.id, { runId: run.id, unwound: false });
+        else if (!proven.unwound) proven.unwound = this.#unwindGoneRun(run.id, gone);
+      } else if (proven?.runId === run.id && !proven.unwound) this.#goneRuns.delete(actor.id);
       if (gone) {
         this.#alarmActorState(actor, "actor-run-stuck", run.startedAt, actorAlarmSlot(now, run.startedAt, threshold), now, () => ({
           actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: gone, runId: run.id,
           since: run.startedAt, runningForMs: now - run.startedAt, thresholdMs: threshold, ...this.#runStatusHint(run.id) }),
-          () => this.#actors.get(actor.id)?.inFlightRun?.id === run.id);
+          // A pending alarm for a run whose wait was ended still publishes after its drain cleared the marker.
+          () => this.#actors.get(actor.id)?.inFlightRun?.id === run.id ||
+            (this.#goneRuns.get(actor.id)?.runId === run.id && this.#goneRuns.get(actor.id)?.unwound === true));
       }
     }
     const dropped = actor.eventsDropped;
     if (dropped) this.#alarmDroppedEvents(actor, dropped, now);
+  }
+
+  /**
+   * smarty-dev#16333: end the drain's wait on a run whose worker the stuck-run check proved gone. In the incident the
+   * owner's drain awaited a run handle that never settled (no events, no worker), and agents.stop(runId) answered
+   * "Unknown Fabric participant", so this needs no AgentManager record: it ends only this host's own wait. The run is
+   * marked abandoned (a no-op for an unknown id) so it is never relaunched for this owner. Whether a pending wait ended.
+   */
+  #unwindGoneRun(runId: string, reason: ActorRunGoneReason): boolean {
+    const end = this.#runWaits.get(runId);
+    if (!end) return false;
+    this.#runWaits.delete(runId);
+    try { this.agents.abandon(runId); } catch { /* nothing to abandon */ }
+    end(new ActorRunWorkerGoneError(runId, reason));
+    return true;
   }
 
   /** Why an in-flight run's worker is gone, or undefined while it can still be running. */

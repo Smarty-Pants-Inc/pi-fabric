@@ -1366,7 +1366,10 @@ export class SqliteStateStore {
    * connection commits while it runs, and it writes nothing. It never waits asynchronously, so a
    * caller that holds `.lock` (lock order: `.lock`, then this) never waits for a SQLite writer while
    * holding `.lock`: a busy write lock throws `MeshLockTimeoutError` before `operation` runs, and
-   * the caller retries with `.lock` released. `operation` must be synchronous and must not call writers.
+   * the caller retries with `.lock` released. Held bridge ingress retains only its advisory initial
+   * event admission across proven pre-append refusals, bounded by twice the ordinary acquisition
+   * budget; all retry waits happen outside `.lock`. This fence remains synchronous and zero-wait.
+   * `operation` must be synchronous and must not call writers.
    */
   fenceSync<T>(operation: () => T): T {
     this.#assertOpen();

@@ -404,10 +404,22 @@ export const prepareParticipantFileLock = async (mesh: ParticipantFileMesh, key:
   await recoverDeadKeyLock(mesh, path.join(mesh.root, DIR, ".locks", path.basename(file, ".json")));
 };
 
+/** Recover a dead holder's namespace receipt (participant-namespace/.namespace) before taking
+ * registry/mesh custody. Every fenced addition and every withParticipantFilesTryLock takes this receipt
+ * first, and a fenced holder probe reports any holder whose PID is live or unprobeable (reused PID,
+ * EPERM) as busy, so only an unfenced native check like this one can clear it (fabric-store review of
+ * pi-fabric#1562, P1). Same receipt comparison under file custody as the per-key recovery. */
+export const prepareParticipantNamespaceLock = (mesh: ParticipantFileMesh): Promise<void> =>
+  // keyReceipt's own lock path, without its mkdir: preparation creates nothing.
+  recoverDeadKeyLock(mesh, path.join(namespaceLockDirectory(mesh), path.basename(namespaceReceiptFile(mesh), ".json")));
+
 /** Retry preparation only: fresh native key-holder evidence/recovery occurs outside
  * registry custody. Recovery compares the exact receipt under file custody;
- * no participant/source selection crosses this wait. */
+ * no participant/source selection crosses this wait. The namespace receipt comes first, in
+ * acquisition order; it lives outside participants/, so it is recovered even when no
+ * participant file (and so no participants/.locks) exists yet. */
 export const prepareParticipantFileLocks = async (mesh: ParticipantFileMesh): Promise<void> => {
+  await prepareParticipantNamespaceLock(mesh);
   const locks = path.join(mesh.root, DIR, ".locks");
   let names: fs.Dirent[];
   try { names = fs.readdirSync(locks, { withFileTypes: true }); }

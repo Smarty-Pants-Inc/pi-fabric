@@ -5,12 +5,13 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { runBridge } from "../src/mesh-bridge.js";
-import { BRIDGE_PROTOCOL_VERSION, BridgeStaleIncarnationError, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { BRIDGE_PROTOCOL_VERSION, BRIDGE_START_DEADLINE_MS, BridgeStaleIncarnationError, BridgeStartDeadlineError, bridgeStartDeadlineMs,
+  MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { COMMIT_OUTBOX_PREFIX, CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { isMeshRetryableBusy } from "../src/mesh/state-backend.js";
 import { MeshStore, type MeshBatchView, type MeshIdentity } from "../src/mesh/store.js";
 import { hostEntryLiveness, hostLeasePath, readHostLeaseCurrent, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
-import { withParticipantFileDirectoryCustody, writeParticipantFile } from "../src/topology/participant-files.js";
+import { ParticipantFileCustodyTimeoutError, withParticipantFileDirectoryCustody, writeParticipantFile } from "../src/topology/participant-files.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
 
 // smarty-dev#13645, independent re-audit of WIP 4 (AUDIT-mirror-wip4-RESULT.md): regression tests for
@@ -423,4 +424,78 @@ describe("the CLI's readiness barrier backs off a retryable first pass (hosted m
       expect(readHostLeaseCurrent(cli.hubRoot, cli.id)).toBeUndefined();
     } finally { await cli.cleanup(); }
   }, 30_000);
+
+  // fabric-store review of pi-fabric#1562, P2: the backoff had no overall deadline and nothing pings the watchdog
+  // before run() links, so under WatchdogSec=90 systemd killed a start that never linked, with no reason written.
+  it("a first pass still busy at the start deadline ends the link: exit 1 with a reason line, no lease", async () => {
+    // A 4.5 s watchdog bounds the start at 3 s (two thirds), from before hello; the documented 90 s one keeps
+    // the 60 s default.
+    const watchdogBefore = process.env.WATCHDOG_USEC;
+    process.env.WATCHDOG_USEC = "4500000";
+    const cli = await cliWithBusyFirstPass(false);
+    try {
+      const startedAt = Date.now();
+      // 2dde3878: { outcome: "still waiting", stopped: [] } (the start retried until the 10 s probe bound).
+      const outcome = await Promise.race([cli.running.then(code => `exited ${code}`),
+        new Promise<string>(resolve => setTimeout(() => resolve("still waiting"), 10_000))]);
+      const stopped = stoppedLines(cli.logs);
+      expect({ outcome, stopped: stopped.length }).toEqual({ outcome: "exited 1", stopped: 1 });
+      expect(stopped[0]).toMatch(/^mesh-bridge: stopped: Bridge start still refused after \d+ ms \(deadline \d+ ms, \d+ attempts\); last: mesh lock timeout: FABRIC_MESH_LOCK_TIMEOUT: .*host-lease-commits\/5f43c55dca0091e6\/custody\.lock/);
+      expect(Date.now() - startedAt).toBeLessThan(8_000);
+      expect(cli.logs.join("")).toMatch(RETRY_LINE);
+      expect(cli.logs.join("")).not.toContain("linked hub <-> far");
+      expect(readHostLeaseCurrent(cli.hubRoot, cli.id)).toBeUndefined();
+    } finally {
+      await cli.cleanup();
+      if (watchdogBefore === undefined) delete process.env.WATCHDOG_USEC;
+      else process.env.WATCHDOG_USEC = watchdogBefore;
+    }
+  }, 30_000);
+
+  it("the start deadline is two thirds of WATCHDOG_USEC, never above the 60 s default", () => {
+    expect(BRIDGE_START_DEADLINE_MS).toBe(60_000);
+    expect(bridgeStartDeadlineMs({})).toBe(60_000);
+    expect(bridgeStartDeadlineMs({ WATCHDOG_USEC: "90000000" })).toBe(60_000); // the documented WatchdogSec=90
+    expect(bridgeStartDeadlineMs({ WATCHDOG_USEC: "30000000" })).toBe(20_000);
+    expect(bridgeStartDeadlineMs({ WATCHDOG_USEC: "600000000" })).toBe(60_000);
+    expect(bridgeStartDeadlineMs({ WATCHDOG_USEC: "junk" })).toBe(60_000);
+  });
+
+  it("a waiting start logs its first refusal, each change of refusal type and once a minute, and makes its last attempt at the deadline", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const hub = store("file"), far = store("file");
+      const logs: Array<[number, string]> = [];
+      const t0 = Date.now();
+      const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local: new StoreBridgeSide(hub, "far"),
+        remote: new StoreBridgeSide(far, "hub"), cursorPath: path.join(path.dirname(hub.root), "cursor.json"),
+        log: line => logs.push([Date.now() - t0, line]) });
+      const attempts: number[] = [];
+      vi.spyOn(bridge, "start").mockImplementation(async () => {
+        const at = Date.now() - t0;
+        attempts.push(at);
+        // From 30 s on, a different refusal type: another link's custody outwaited, not a busy gate.
+        throw at < 30_000 ? new MeshLockTimeoutError(" host lease lock gate", 1, 0)
+          : new ParticipantFileCustodyTimeoutError("namespace", 3, 5);
+      });
+      const failure = bridge.startWithBackoff(150_000).catch(error => error);
+      await vi.advanceTimersByTimeAsync(151_000);
+      const error = await failure;
+      expect(error).toBeInstanceOf(BridgeStartDeadlineError);
+      expect(error).toMatchObject({ waitedMs: 150_000, deadlineMs: 150_000, attempts: attempts.length });
+      // 100 ms doubling to 2 s, and the last wait is clamped so the last attempt is made at the deadline.
+      expect(attempts.slice(0, 7)).toEqual([0, 100, 300, 700, 1_500, 3_100, 5_100]);
+      expect(attempts.at(-2)).toBe(149_100);
+      expect(attempts.at(-1)).toBe(150_000);
+      // First refusal; the type change at 31.1 s; a minute later, 91.1 s. Not one line per attempt.
+      expect(logs.map(([at]) => at)).toEqual([0, 31_100, 91_100]);
+      expect(logs[0]![1]).toMatch(/^start: mesh lock timeout; retrying in 100 ms: FABRIC_MESH_LOCK_TIMEOUT/);
+      expect(logs[1]![1]).toMatch(/^start: mesh lock timeout; retrying in 2000 ms \(waiting 31100 ms of 150000 ms, 20 attempts\): /);
+      expect(logs[2]![1]).toContain("(waiting 91100 ms of 150000 ms, 50 attempts)");
+      expect(attempts).toHaveLength(80);
+      expect(error.message).toMatch(/^Bridge start still refused after 150000 ms \(deadline 150000 ms, 80 attempts\); last: mesh lock timeout: /);
+      vi.useRealTimers();
+      await bridge.stop();
+    } finally { vi.useRealTimers(); }
+  });
 });

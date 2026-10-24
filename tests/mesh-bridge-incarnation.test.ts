@@ -704,7 +704,14 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
       // current recording may rewrite (and so clamp or repair) it, on its owner's next renewal.
       expect(checkpoint.liveness).toEqual({ updatedAt: NOW, expiresAt: sampled.expiresAt });
       expect(removals).toEqual([]);
-      return;
+      // pi-fabric#1562 review P3: that next renewal is the claimed repair, so run it. The current recording's
+      // pass clamps the deadline (an inflated image too) and merges the effect's and the disk's history, the
+      // same checkpoint the replay path reaches at once (asserted below for both paths).
+      await new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(incoming, NOW);
+      checkpoint = capture();
+      expect(hub.get(hostKey(identity.id), { fresh: true })?.value).toMatchObject({
+        bridgeSupersededTokens: ["effect-predecessor", "disk-predecessor"],
+        bridgeSupersededTokenSeen: { "effect-predecessor": 1, "disk-predecessor": 2 } });
     }
     expect(checkpoint).toBeDefined();
     expect(checkpoint!.lease).toMatchObject({ mirror: sample, updatedAt: NOW, expiresAt: deadline,

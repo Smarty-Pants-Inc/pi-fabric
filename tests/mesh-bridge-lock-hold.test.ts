@@ -7,6 +7,7 @@ import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { hostLeasePath, readHostLease, writeHostLease, type FabricHostLease } from "../src/topology/host-leases.js";
+import { participantFromEntry } from "../src/topology/participant-directory.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 // smarty-dev#10391: a bridge catch-up must never hold state.db's SQLite write lock above 100 ms.
@@ -153,7 +154,9 @@ const populate = async (mesh: MeshStore) => {
     if (n < PARTICIPANTS) ops.push({ kind: "put", key: `topology/participants/${hash}`, identity,
       value: { format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id, name: `agent-${n}`,
         label: `lane agent ${n} on host ${n % 9}`, status: "idle", runner: "pi", transport: "host",
-        capabilities: ["steer", "followUp", "status"], startedAt: now, updatedAt: now, controlProtocol: "v1",
+        // Valid capabilities only (pi-fabric#1562 review P2): "status" is not one, so participantFromEntry refused
+        // these rows and the mirror filter skipped them, and the hold numbers compared unlike passes.
+        capabilities: ["steer", "followUp", "fabric"], startedAt: now, updatedAt: now, controlProtocol: "v1",
         cwd: `/home/paul/lanes/lane-${n}`, model: "opus-5.5", effort: "high" } });
   }
   for (let at = 0; at < ops.length; at += 200) await mesh.writeBatch({ identity: ops[at]!.identity, ops: ops.slice(at, at + 200) });
@@ -176,6 +179,9 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
     const hub = store(), far = store();
     const localId = await native(hub, "session:hold-local"), remoteId = await native(far, "session:hold-remote");
     await populate(hub);
+    // Like for like: every fleet row is one this host's participant reader (the mirror's filter) accepts.
+    const rows = hub.listAll("topology/participants/");
+    expect(rows.filter(entry => participantFromEntry(entry) !== undefined)).toHaveLength(PARTICIPANTS + 1);
     // The default presence period: a drain this long runs presence passes, as a fleet catch-up does.
     const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local: new StoreBridgeSide(hub, "far"),
       remote: new StoreBridgeSide(far, "hub"), cursorPath: path.join(scratch(), "cursor.json") });

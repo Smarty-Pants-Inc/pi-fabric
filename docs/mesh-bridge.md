@@ -140,6 +140,12 @@ existing events and mirrors root presence. The additive publish-receipt hello ca
   (`toRemote`) or received/handled (`toLocal`) cursor progress for 180 s while the other direction
   remains current/progressing emits the same alarm once and exits with status 1. The event is
   addressed only to the configured mesh-alarm session recipient.
+- Nothing notifies systemd before the link is up. A first pass refused as busy (another link's
+  pass holds a shared custody gate) backs off and starts again. It logs the first refusal, each
+  change of refusal type, and once a minute. A start still refused 60 s after the bridge began
+  linking (two thirds of `WATCHDOG_USEC` when systemd sets a shorter watchdog) exits with
+  status 1. Its one `mesh-bridge: stopped: Bridge start still refused after ...` line on stderr
+  names the last refusal, before the watchdog would kill the bridge without a reason.
 
   The versioned alarm contract is `topic: "fabric.alarm.bridge-stall"`, `kind: "bridge-stall"`,
   with typed `data` exactly `{ v: 1, host: string, peer: string,

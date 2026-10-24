@@ -16,7 +16,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readMeshStateMovedMarker } from "./mesh/backend-fence.js";
-import { BRIDGE_STALL_ALARM_TOPIC, DEFAULT_CALL_TIMEOUT_MS, DEFAULT_FACTORY_RATE, MeshBridge, RemoteBridgeSide,
+import { BRIDGE_STALL_ALARM_TOPIC, bridgeStartDeadlineMs, DEFAULT_CALL_TIMEOUT_MS, DEFAULT_FACTORY_RATE, MeshBridge, RemoteBridgeSide,
   serveBridgeAgent, StoreBridgeSide, validBridgeName, type BridgeStallAlarm } from "./mesh/bridge.js";
 import { BridgeRelayUnavailableError, startBridgeRelay } from "./mesh/bridge-relay.js";
 import { BRIDGE_DELIVERY_AGE_ALERT_MS, type BridgeDeliveryAgeAlarm } from "./mesh/bridge-delivery-age.js";
@@ -299,12 +299,15 @@ export const runBridge = async (
     else signal.addEventListener("abort", onAbort, { once: true });
     // Start/sync the link before binding a delivery server. The registered script is the
     // exact canonical bin entry in THIS package generation, never argv[1] or a current link.
+    // The link must be up before this, measured from before hello: until run() links, nothing pings the
+    // systemd watchdog, so a start still refused at the bound exits 1 with a reason (pi-fabric#1562 review P2).
+    const startBy = Date.now() + bridgeStartDeadlineMs(process.env);
     starting = (async () => {
       await linked.hello();
       if (signal.aborted) return;
       // A retryable first-pass refusal (busy custody: another link's pass holds a lease gate) backs off and
-      // starts again; only a permanent refusal or the transport ends the link (smarty-dev#13645).
-      await running.startWithBackoff();
+      // starts again; only a permanent refusal, the transport or the start deadline ends the link (smarty-dev#13645).
+      await running.startWithBackoff(Math.max(0, startBy - Date.now()));
       if (signal.aborted) return;
       if (process.platform === "linux") {
         try {

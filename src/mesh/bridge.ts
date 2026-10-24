@@ -111,6 +111,31 @@ const WAL_CAP_RETRY_MAX_MS = 30_000;
 /** The next wait after a WAL-cap refusal: `min` first, then doubling, at most 30 s. */
 export const walCapRetryDelay = (previous: number | undefined, min = WAL_CAP_RETRY_MIN_MS): number =>
   previous === undefined ? min : Math.min(Math.max(previous * 2, min), WAL_CAP_RETRY_MAX_MS);
+/**
+ * startWithBackoff()'s overall bound (fabric-store review of pi-fabric#1562, P2). The documented unit sets
+ * WatchdogSec=90 (docs/mesh-bridge.md), and only run()'s probe pings the watchdog, after a peer round trip with
+ * a healthy direction; a start that has not linked must not claim that. So a start still refused as busy at
+ * this bound ends with a reason and the CLI exits 1, well before systemd would kill it without one.
+ */
+export const BRIDGE_START_DEADLINE_MS = 60_000;
+/** A waiting start logs again after this long, and whenever the refusal's type changes. */
+const START_WAIT_LOG_MS = 60_000;
+/** The start bound for this process: two thirds of systemd's WATCHDOG_USEC when that is set, never above
+ * BRIDGE_START_DEADLINE_MS (it only shortens), so a shorter watchdog still sees the exit and its reason. */
+export const bridgeStartDeadlineMs = (env: NodeJS.ProcessEnv = process.env): number => {
+  const usec = Number(env.WATCHDOG_USEC);
+  if (!Number.isSafeInteger(usec) || usec <= 0) return BRIDGE_START_DEADLINE_MS;
+  return Math.max(1, Math.min(BRIDGE_START_DEADLINE_MS, Math.floor(usec / 1_500)));
+};
+/** startWithBackoff() met only retryable refusals until its deadline. Not retryable: it ends the link. */
+export class BridgeStartDeadlineError extends Error {
+  readonly code = "FABRIC_BRIDGE_START_DEADLINE";
+  constructor(readonly waitedMs: number, readonly deadlineMs: number, readonly attempts: number, readonly lastError: unknown) {
+    super(`Bridge start still refused after ${waitedMs} ms (deadline ${deadlineMs} ms, ${attempts} attempts); last: ` +
+      `${lastError instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(lastError)}: ${meshDeferredSummary(lastError)}`);
+    this.name = "BridgeStartDeadlineError";
+  }
+}
 const meshBusyLabel = (error: unknown): string =>
   isMeshIncarnationPending(error) ? "mesh incarnation pending"
     : isMeshSnapshotRetriesExhausted(error) ? "mesh snapshot retries exhausted"
@@ -3094,6 +3119,8 @@ export interface MeshBridgeOptions {
   membershipRetryMs?: number;
   /** First wait after a WAL-cap refusal (then doubling to 30 s). Default 1 s; tests lower it. */
   walCapRetryMinMs?: number;
+  /** startWithBackoff()'s overall bound when its caller passes none (default BRIDGE_START_DEADLINE_MS). */
+  startDeadlineMs?: number;
   log?: (message: string) => void;
   /** Debug lines (each event not addressed across); off when absent. */
   debug?: (message: string) => void;
@@ -3723,23 +3750,39 @@ export class MeshBridge {
    * That is contention, not a refusal: this backs off and starts again on run()'s own lock and WAL-cap
    * schedule, as run() does when it restarts a link, instead of ending the link. A permanent refusal (a stale
    * incarnation, a transport failure) or stop() still ends it.
+   *
+   * The wait is bounded by `deadlineMs` (pi-fabric#1562 review P2): the last attempt is made at the deadline,
+   * and a refusal then throws BridgeStartDeadlineError, so the CLI exits 1 with a reason. It logs the first
+   * refusal, again whenever the refusal's type changes, and once a minute while it waits.
    */
-  async startWithBackoff(): Promise<void> {
+  async startWithBackoff(deadlineMs = this.options.startDeadlineMs ?? BRIDGE_START_DEADLINE_MS): Promise<void> {
     let retryMs = LOCK_RETRY_MIN_MS;
     let walCapDelay: number | undefined;
-    let reported = false;
+    const startedAt = this.#now();
+    let attempts = 0;
+    let loggedAt: number | undefined;
+    let loggedKind: string | undefined;
     for (;;) {
+      attempts += 1;
       try { return await this.start(); }
       catch (error) {
         if (this.#stopped || !isBridgeRetryable(error)) throw error;
+        const now = this.#now();
+        const waitedMs = Math.max(0, now - startedAt);
+        if (waitedMs >= deadlineMs) throw new BridgeStartDeadlineError(waitedMs, deadlineMs, attempts, error);
         let delay = retryMs;
         retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
         if (error instanceof BridgeMirrorDeferredError || isMeshStateWalCap(error)) {
           delay = walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
         }
-        if (!reported) {
-          this.#log(`start: ${error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error)}; retrying in ${delay} ms: ${meshDeferredSummary(error)}`);
-          reported = true;
+        delay = Math.min(delay, deadlineMs - waitedMs);
+        const label = error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error);
+        const kind = `${label}|${error instanceof Error ? error.name : typeof error}|${String((error as { code?: unknown }).code ?? "")}`;
+        if (loggedAt === undefined || kind !== loggedKind || now - loggedAt >= START_WAIT_LOG_MS) {
+          const waiting = loggedAt === undefined ? "" : ` (waiting ${waitedMs} ms of ${deadlineMs} ms, ${attempts} attempts)`;
+          this.#log(`start: ${label}; retrying in ${delay} ms${waiting}: ${meshDeferredSummary(error)}`);
+          loggedAt = now;
+          loggedKind = kind;
         }
         await new Promise<void>((resolve) => {
           const wake = (): void => {

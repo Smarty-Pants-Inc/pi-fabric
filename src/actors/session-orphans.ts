@@ -8,7 +8,8 @@ import { assertMeshStateReadable, censusRecordAlive, type MeshBatchOperation, ty
 import { residentProcessAlive } from "../residency/process-identity.js";
 import { hostLeasePath, readHostLeaseCurrent, type FabricHostLease } from "../topology/host-leases.js";
 import { isLiveLegacyRootEntry } from "../topology/legacy-root-liveness.js";
-import { prepareParticipantFileLock, withParticipantFileTryLock, withParticipantFilesTryLock, writeParticipantFileUnderCustody } from "../topology/participant-files.js";
+import { prepareParticipantFileLock, prepareParticipantNamespaceLock, withParticipantFileTryLock, withParticipantFilesTryLock,
+  writeParticipantFileUnderCustody } from "../topology/participant-files.js";
 import type { FabricParticipantRecord } from "../topology/types.js";
 import { assertNativeObserver } from "./launcher-lead.js";
 import { ActorRegistryStore } from "./registry-store.js";
@@ -426,6 +427,9 @@ export class SessionActorOrphans {
     const sessionId = rootId.slice(8), beforeReceipt = record(marker.directorySettlement);
     const incarnation = await ownProcessIncarnation();
     const keys = [participantKey(rootId), participantKey(row.id)].sort();
+    // underKeys (withParticipantFilesTryLock) takes the namespace receipt before these keys: prepare it
+    // too, in that order, or a dead namespace holder refuses every settlement (pi-fabric#1562 review P1).
+    await prepareParticipantNamespaceLock(this.mesh);
     for (const key of keys) await prepareParticipantFileLock(this.mesh, key);
     const snapshot = store.snapshot();
     const current = this.#rows(store).find(item => item.id === row.id && item.rootId === rootId && item.status === "stopped");

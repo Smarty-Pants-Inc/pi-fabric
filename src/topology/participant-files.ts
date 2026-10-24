@@ -84,18 +84,13 @@ export const writeParticipantFileIf = async (
 ): Promise<boolean> => {
   const file = fileOf(mesh.root, key);
   if (!file) throw new Error(`Not a participant key: ${key}`);
-  // One decision per observed file: an identity-changing update decided under its key receipt is
-  // retried under the namespace gate, and reuses that decision while the file still holds the bytes it
-  // was made on (callers count and log decisions, as on main, where the key lock decided once).
-  let decided: { seen: string; entry: MeshStateEntry | undefined } | undefined;
-  const decideOnce = (current: MeshStateEntry | undefined): MeshStateEntry | undefined => {
-    const seen = JSON.stringify(current ?? null);
-    if (decided?.seen !== seen) decided = { seen, entry: decide(current) };
-    return decided.entry;
-  };
+  // Every write decides under the hold that writes it. `decide` reads authority outside the file
+  // (publication fences, registry lineage, lease liveness) that must be judged in the same atomic step
+  // as the write (#7817), so a decision made under an earlier, released hold is never reused, even
+  // when the file's bytes are unchanged.
   const write = (requireSameIdentity = false): boolean | typeof RETRY_ADDITION => {
     const current = readFresh(file);
-    const entry = decideOnce(current);
+    const entry = decide(current);
     if (!entry) return false;
     if (entry.key !== key) throw new Error(`Participant entry key mismatch: ${entry.key}`);
     if (requireSameIdentity && (identityOf(current) === undefined || identityOf(current) !== identityOf(entry))) return RETRY_ADDITION;

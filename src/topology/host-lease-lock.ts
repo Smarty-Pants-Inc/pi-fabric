@@ -171,7 +171,9 @@ export const withHostLeaseLock = async <T>(mesh: HostLeaseMesh, file: string,
           }
         }
       }, 0, Object.hasOwn(options, "ownIncarnation") ? { ownIncarnation: options.ownIncarnation } : {},
-      HOST_LEASE_ADDITIONS_WAIT_MS);
+      // The additions wait never outlasts the caller's own budget (audit P2-3); an abort is checked at the loop head.
+      options.timeoutMs !== undefined && Number.isFinite(options.timeoutMs)
+        ? Math.max(0, Math.min(HOST_LEASE_ADDITIONS_WAIT_MS, options.timeoutMs)) : HOST_LEASE_ADDITIONS_WAIT_MS);
     } catch (error) {
       if (enteredCustody || !isMeshLockTimeout(error)) throw error;
     }

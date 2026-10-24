@@ -592,8 +592,8 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     // longer inside the transaction through plan().replay. Observe that recovery boundary.
     const replay = vi.fn();
     const originalRecover = CommitOutbox.prototype.recover;
-    vi.spyOn(CommitOutbox.prototype, "recover").mockImplementation(async function (this: CommitOutbox, halted?: () => boolean) {
-      const ran = await originalRecover.call(this, halted);
+    vi.spyOn(CommitOutbox.prototype, "recover").mockImplementation(async function (this: CommitOutbox, ...args: Parameters<CommitOutbox["recover"]>) {
+      const ran = await originalRecover.call(this, ...args);
       if (ran > 0) replay();
       return ran;
     });
@@ -659,8 +659,8 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
       // the transaction. Capture at that boundary: BEFORE recompute/current effects could conceal an
       // erased mirror.
       const originalRecover = CommitOutbox.prototype.recover;
-      vi.spyOn(CommitOutbox.prototype, "recover").mockImplementation(async function (this: CommitOutbox, halted?: () => boolean) {
-        const count = await originalRecover.call(this, halted);
+      vi.spyOn(CommitOutbox.prototype, "recover").mockImplementation(async function (this: CommitOutbox, ...args: Parameters<CommitOutbox["recover"]>) {
+        const count = await originalRecover.call(this, ...args);
         checkpoint = capture();
         expect(count).toBe(1);
         return count;
@@ -930,8 +930,8 @@ describe("bridge incarnation admission at persisted trust boundaries (smarty-dev
     // before the custody plan (WIP 4 audit lock order), no longer through plan().replay in the transaction.
     const originalRecover = CommitOutbox.prototype.recover;
     const replayed = vi.fn();
-    vi.spyOn(CommitOutbox.prototype, "recover").mockImplementation(async function (this: CommitOutbox, halted?: () => boolean) {
-      const count = await originalRecover.call(this, halted);
+    vi.spyOn(CommitOutbox.prototype, "recover").mockImplementation(async function (this: CommitOutbox, ...args: Parameters<CommitOutbox["recover"]>) {
+      const count = await originalRecover.call(this, ...args);
       expect(fs.readFileSync(hostLeasePath(hub.root, identity.id))).toEqual(before);
       replayed();
       return count;

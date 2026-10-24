@@ -364,8 +364,10 @@ export class NatsLocalProjection {
     this.#participantKeysByKv.set(entry.key, participantKey(record.id));
     const marker = markerFor(entry);
     let wrote = false;
+    // One reconciliation read per projected write, even when an identity-changing update re-decides
+    // under the namespace gate (writeParticipantFileIf decides under every hold that writes, #13645 N1).
+    this.#participantReconcileReads++;
     await writeParticipantFileIf(this.options.mesh, key, current => {
-      this.#participantReconcileReads++;
       if (!this.options.leaseLive()) return undefined;
       const currentMarker = markerOf(current);
       if (current && object(current.value) && current.value.remoteHost !== undefined) {

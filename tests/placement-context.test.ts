@@ -119,7 +119,8 @@ describe("trusted placement caller context", () => {
     });
     const dir = root(); const configured = resolverConfig(dir, { record: callerRecord(), delay: 10_000 }).config;
     const result = await resolvePlacementCallerContext(configured, performance.now() + 1);
-    expect(result.record).toEqual({ trust: "missing", reason: "timeout" });
+    // Windows has no POSIX process-group wait: the killed helper's teardown is unconfirmed (still missing trust).
+    expect(result.record).toEqual({ trust: "missing", reason: process.platform === "win32" ? "helper-teardown-unconfirmed" : "timeout" });
   }, 5_000);
 
   it.skipIf(process.platform === "win32")("waits for the whole POSIX process group before resolving timeout context", async () => {

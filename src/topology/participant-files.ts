@@ -57,6 +57,22 @@ export class ParticipantFileLockBusyError extends MeshLockTimeoutError {
   constructor(lock: string) { super(` participant file lock ${lock}`, 1, 0); }
 }
 
+const withNamespaceKeyWrite = async <T>(mesh: ParticipantFileMesh, file: string, operation: () => T,
+  options: ParticipantFileLockOptions = {}): Promise<T> => {
+  for (;;) {
+    const attempt = await withParticipantNamespaceLock(mesh, async () => {
+      try { return { acquired: true as const, value: await withKeyLock(mesh, file, operation, { ...options, tryOnly: true }) }; }
+      catch (error) {
+        if (error instanceof ParticipantFileLockBusyError) return { acquired: false as const };
+        throw error;
+      }
+    }, options);
+    if (attempt.acquired) return attempt.value;
+    const { withCommitFence: _withCommitFence, ...waitOptions } = options;
+    await withKeyLock(mesh, file, () => undefined, waitOptions);
+  }
+};
+
 export const writeParticipantFileIf = async (
   mesh: ParticipantFileMesh,
   key: string,
@@ -77,30 +93,10 @@ export const writeParticipantFileIf = async (
     rescan(path.dirname(file));
     return true;
   };
-  for (;;) {
-    // Only an absent filename needs namespace custody, retained until the atomic creation. For an
-    // existing entry, release this short check before waiting on its key receipt. If it disappears
-    // before that receipt is acquired, retry through the addition gate.
-    const { withCommitFence: _withCommitFence, ...namespaceOptions } = options;
-    const namespace = await withParticipantNamespaceLock(mesh, async () => {
-      if (fs.existsSync(file)) return { present: true as const };
-      try {
-        return { present: false as const, result: await withKeyLock(mesh, file, write, { ...options, tryOnly: true }) };
-      } catch (error) {
-        if (!(error instanceof ParticipantFileLockBusyError)) throw error;
-        return { present: false as const, contended: true as const };
-      }
-    }, namespaceOptions);
-    if (!namespace.present && !("contended" in namespace)) return namespace.result;
-    const result = await withKeyLock(mesh, file, () => fs.existsSync(file) ? write() : RETRY_ADDITION, options);
-    if (result !== RETRY_ADDITION) return result;
-  }
+  return withNamespaceKeyWrite(mesh, file, write, options);
 };
 
-const RETRY_ADDITION = Symbol("participant-file-addition-raced-removal");
-
-/** Removes a record's file if `decide` accepts its current entry; the per-key gate fences a
- * directory snapshot that enumerated the file. Removals do not add names and need no namespace wait. */
+/** Removes a record under shared namespace custody, then its per-key receipt. */
 export const removeParticipantFileIf = async (
   mesh: ParticipantFileMesh,
   key: string,
@@ -109,7 +105,7 @@ export const removeParticipantFileIf = async (
 ): Promise<boolean> => {
   const file = fileOf(mesh.root, key);
   if (!file) return false;
-  return withKeyLock(mesh, file, () => {
+  return withNamespaceKeyWrite(mesh, file, () => {
     const current = readFresh(file);
     if (!current || !decide(current)) return false;
     fs.rmSync(file, { force: true });
@@ -208,15 +204,7 @@ export const withParticipantFileTryLock = <T>(
 ): T => {
   const file = fileOf(mesh.root, key);
   if (!file) throw new Error(`Not a participant key: ${key}`);
-  const receipt = keyReceipt(mesh, file, ownIncarnation);
-  try { receipt.acquire(); }
-  catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (["EEXIST", "ENOTEMPTY", "EPERM", "EACCES"].includes(code ?? "")) throw new ParticipantFileLockBusyError(receipt.lock);
-    throw error;
-  }
-  try { return operation(); }
-  finally { receipt.release(); }
+  return withParticipantFilesTryLock(mesh, [key], ownIncarnation, operation);
 };
 
 const namespaceReceiptFile = (mesh: ParticipantFileMesh): string => path.join(mesh.root, DIR, ".namespace.json");
@@ -225,20 +213,10 @@ const namespaceReceiptFile = (mesh: ParticipantFileMesh): string => path.join(me
 const withParticipantNamespaceLock = <T>(mesh: ParticipantFileMesh, operation: () => T | Promise<T>,
   options: ParticipantFileLockOptions = {}): Promise<T> => withKeyLock(mesh, namespaceReceiptFile(mesh), operation, options);
 
-/** Capture under the namespace gate, then lock every extant key in stable order before invoking
- * the caller. An absent filename cannot be introduced while this custody is held. */
+/** Shared participant namespace custody. Every supported file writer takes this receipt before
+ * its per-key receipt, so the mirror stabilizes entries and additions with one short lock. */
 export const withParticipantFileDirectoryCustody = <T>(mesh: ParticipantFileMesh,
-  operation: () => T | Promise<T>): Promise<T> => withParticipantNamespaceLock(mesh, async () => {
-  const directory = path.join(mesh.root, DIR);
-  let names: string[];
-  try { names = fs.readdirSync(directory).filter(name => /^[0-9a-f]{64}\.json$/.test(name)).sort(); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") names = []; else throw error; }
-  const files = names.map(name => path.join(directory, name));
-  const acquire = (index: number): Promise<T> => index === files.length
-    ? Promise.resolve().then(operation)
-    : withKeyLock(mesh, files[index]!, () => acquire(index + 1));
-  return acquire(0);
-});
+  operation: () => T | Promise<T>): Promise<T> => withParticipantNamespaceLock(mesh, operation);
 
 /** Synchronous form for already-prepared publication fences; namespace first, then sorted keys. */
 export const withParticipantFilesTryLock = <T>(mesh: ParticipantFileMesh, keys: readonly string[],

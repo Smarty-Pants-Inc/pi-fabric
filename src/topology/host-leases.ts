@@ -8,7 +8,9 @@ import { watchBridgeStore } from "../mesh/change-notifier.js";
 import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../agents/peer-lease-stale.js";
 import type { MeshStateEntry } from "../mesh/store.js";
 import { TransportUnavailableError, type TransportKv, type TransportKvEntry, type TransportOwner } from "../transport/types.js";
-import { HostLeaseLockBusyError, HostLeaseLockLostError, hostLeaseAdditionsGatePath, withHostLeaseFileCustody, withHostLeaseLock, type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
+import { HostLeaseLockBusyError, HostLeaseLockLostError,
+  withHostLeaseDirectoryCustody as withHostLeaseNamespaceCustody, withHostLeaseFileCustody, withHostLeaseLock,
+  type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
 
 // Host lease renewals outside the shared state (smarty-dev#816). Every heartbeat rewrote the
 // whole shared state under the one mesh lock, and heartbeats were 78% of all locked writes. Each
@@ -270,18 +272,10 @@ export const hostLeasePath = (meshRoot: string, hostId: string): string =>
 /** Holds the additions namespace and every existing per-host lease gate in path order.
  * Call before reading lease JSON; additions are blocked by the namespace gate and replacements
  * are blocked by their target gate until the caller releases custody after COMMIT. */
-export const withHostLeaseDirectoryCustody = async <T>(mesh: HostLeaseMesh,
-  operation: () => T | Promise<T>): Promise<T> => mesh.leaseCustody(hostLeaseAdditionsGatePath(mesh.root), async () => {
-  const directory = path.join(mesh.root, LEASE_DIR);
-  let names: string[];
-  try { names = fs.readdirSync(directory).filter(name => /^[0-9a-f]{32}\.json$/.test(name)).sort(); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") names = []; else throw error; }
-  const files = names.map(name => path.join(directory, name));
-  const acquire = (index: number): Promise<T> => index === files.length
-    ? Promise.resolve().then(operation)
-    : mesh.leaseCustody(files[index]!, () => acquire(index + 1));
-  return acquire(0);
-});
+/** Holds the shared lease-writer gate through snapshot validation and COMMIT. All host-file
+ * writers take this gate before their target receipt, so directory custody is one lock. */
+export const withHostLeaseDirectoryCustody = <T>(mesh: HostLeaseMesh,
+  operation: () => T | Promise<T>): Promise<T> => withHostLeaseNamespaceCustody(mesh, operation);
 
 export const writeHostLease = (meshRoot: string, lease: FabricHostLease): void =>
   writeJsonAtomic(hostLeasePath(meshRoot, lease.id), { format: 1, ...lease });
@@ -340,13 +334,13 @@ export const withOwnedHostLease = async <T>(mesh: HostLeaseMesh, owner: FabricHo
   const file = hostLeasePath(mesh.root, owner.id);
   let entered = false;
   try {
-    return await mesh.leaseCustody(file, async () => {
+    return await withHostLeaseNamespaceCustody(mesh, () => mesh.leaseCustody(file, async () => {
       entered = true;
       assertHostLeaseOwner(mesh.root, owner);
       const result = await operation();
       assertHostLeaseOwner(mesh.root, options.ownerAfter?.() ?? owner);
       return result;
-    }, 0, options);
+    }, 0, options));
   } catch (error) {
     if (!entered && isMeshLockTimeout(error)) throw new HostLeaseLockBusyError(file);
     throw error;

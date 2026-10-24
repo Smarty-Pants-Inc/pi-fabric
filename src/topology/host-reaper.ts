@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
 import { type FabricHostLease, hostEntryLiveness, hostLeasePath, hostLeasePredecessor,
-  readHostLeases, removeHostLeaseVersionUnderCustody, sameHostLeaseVersion } from "./host-leases.js";
+  readHostLeases, removeHostLeaseVersionUnderCustody, sameHostLeaseVersion, withHostLeaseDirectoryCustody } from "./host-leases.js";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import { participantFilePresent, readParticipantFiles, removeParticipantFileIf, sweepParticipantLockLeftovers } from "./participant-files.js";
 import { isLiveLegacyRootEntry } from "./legacy-root-liveness.js";
@@ -226,9 +226,17 @@ export const reapDeadHostRecords = async (
       : Promise.resolve().then(operation);
   // Acquire target gates in a stable order, before the reaper's gate and shared state.
   // A renewal on ANY selected target aborts this pass before any record/file deletion.
-  const targetGates = <T>(operation: () => T | Promise<T>, index = 0): Promise<T> => index === targets.length
-    ? Promise.resolve().then(operation)
-    : targetGate(targets[index]!, () => { assertTarget(targets[index]!, selectedLeases.get(targets[index]!)); return targetGates(operation, index + 1); });
+  const targetGates = <T>(operation: () => T | Promise<T>, index = 0): Promise<T> => {
+    const acquire = (at: number): Promise<T> => at === targets.length
+      ? Promise.resolve().then(operation)
+      : targetGate(targets[at]!, () => {
+        assertTarget(targets[at]!, selectedLeases.get(targets[at]!));
+        return acquire(at + 1);
+      });
+    return typeof root === "string" && mesh.leaseCustody
+      ? withHostLeaseDirectoryCustody(mesh as MeshStore, () => acquire(index))
+      : acquire(index);
+  };
   const retired = new Set<string>();
   const reapable = new Set<string>();
   let results;

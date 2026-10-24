@@ -364,7 +364,7 @@ let unreadableStateRevisions = 0;
 
 /** The SQLite backend's revision views (SqliteStateBackend), reached without a value import. */
 interface SqliteStateViews {
-  unchangedSince(stamp: string, prefixes: readonly string[]): boolean;
+  unchangedSince(stamp: string, prefixes: readonly string[], exceptKeys?: ReadonlySet<string>): boolean;
   stateView(): { stamp: string; view: MeshBatchView };
 }
 
@@ -1011,9 +1011,9 @@ export class MeshStore {
    * smarty-dev#10391, sqlite only: whether no key under `prefixes` changed after `revision` (a `stateRevision()`),
    * from the change feed, cheap enough to run in `withStateWriteFence`. False on other backends or when unknown.
    */
-  stateUnchangedSince(revision: string, prefixes: readonly string[]): boolean {
+  stateUnchangedSince(revision: string, prefixes: readonly string[], exceptKeys?: ReadonlySet<string>): boolean {
     const state = this.#sqliteState();
-    return state !== undefined && state.unchangedSince(revision, prefixes);
+    return state !== undefined && state.unchangedSince(revision, prefixes, exceptKeys);
   }
 
   /** smarty-dev#10391, sqlite only: a read-only view of the committed state now and its `stateRevision()`. */

@@ -716,7 +716,7 @@ export class SqliteStateBackend implements StateBackend {
     return { stamp: snapshot.stamp, view: snapshotView(() => snapshot) };
   }
 
-  unchangedSince(stamp: string, prefixes: readonly string[]): boolean {
+  unchangedSince(stamp: string, prefixes: readonly string[], exceptKeys?: ReadonlySet<string>): boolean {
     const store = this.#read(() => this.#open());
     const current = store.stateStamp();
     if (current === stamp) return true;
@@ -724,7 +724,8 @@ export class SqliteStateBackend implements StateBackend {
     const after = Number(stamp.slice(lineage.length + 1));
     if (lineageOf(current) !== lineage || !Number.isSafeInteger(after)) return false;
     const feed = this.#read(() => store.changesSince(after));
-    return feed.complete && !feed.changes.some(change => prefixes.some(prefix => change.key.startsWith(prefix)));
+    return feed.complete && !feed.changes.some(change => !exceptKeys?.has(change.key) &&
+      prefixes.some(prefix => change.key.startsWith(prefix)));
   }
 
   // ------------------------------------------------------------ writes

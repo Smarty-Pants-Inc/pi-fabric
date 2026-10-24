@@ -10,6 +10,8 @@ import { ActorManager } from "../src/actors/manager.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
+import * as verifiedRemoval from "../src/storage/verified-remove.js";
+import { mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 
 const claimLocks = (mkdir: { mock: { calls: unknown[][] } }) =>
@@ -187,6 +189,29 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
     }
     return remove(target, options);
   });
+  // Check the verifier boundary on every fence platform: known actor, held fence and current judged inode. Linux records
+  // here and runs the real verifier's production dry run; elsewhere the real verifier runs the manager's rmSync
+  // fallback, which the recorder above records without deleting. The manager catches failures, so record violations
+  // separately instead of allowing an assertion to disappear into pending cleanup.
+  const realVerifiedRemove = verifiedRemoval.verifiedRemove;
+  const rootIds = new Map<string, string | undefined>();
+  const violations: string[] = [];
+  const treeRemoval = vi.spyOn(verifiedRemoval, "verifiedRemove").mockImplementation((target, judged, options) => {
+    const file = path.resolve(target);
+    if (path.dirname(file) !== actorRoot || !/^[a-f0-9]{32}$/.test(path.basename(file))) {
+      return realVerifiedRemove(target, judged, options);
+    }
+    const linux = process.platform === "linux";
+    if (linux) removals.push(file);
+    const rootId = rootIds.get(path.basename(file));
+    if (!rootId) violations.push(`${file}: unknown actor`);
+    else if (!mainPublicationFenced(mesh.root, rootId)) violations.push(`${file}: not under the Main publication fence`);
+    const now = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (!judged || !now || now.dev !== judged.dev || now.ino !== judged.ino) violations.push(`${file}: judged inode is not the current tree`);
+    const result = realVerifiedRemove(target, judged, linux ? { ...options, dryRun: true } : options);
+    if (!result.removed) violations.push(`${file}: refused (${result.reason})`);
+    return result;
+  });
   const owner = new ActorManager("watch-lifecycle", { id: "session:watch-lifecycle", name: "owner", kind: "main" },
     mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 600_000 }, agents, vi.fn(), {
       persistent: true, actorRoot, retentionSweepMs: 600_000, canManageActor: id => !lost.has(id),
@@ -194,6 +219,7 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
     });
   const create = async (name: string) => {
     const actor = await owner.create({ name, instructions: "Wait", triggerTurn: false });
+    rootIds.set(actor.id, actor.rootId);
     // A real monitor pass, not a direct store/watch call; its preflight arms the watch.
     await vi.waitFor(() => expect(live.size).toBe(1), { timeout: 5000, interval: 10 });
     return actor;
@@ -225,12 +251,16 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
     // Only unsupported platforms keep trees/cleanup markers (smarty-dev#8090, smarty-dev#11335).
     expect(removals.filter(file => /^[a-f0-9]{32}$/.test(path.basename(file))))
       .toHaveLength(portableFence ? 200 : 0);
+    expect(violations).toEqual([]);
+    expect(treeRemoval.mock.calls.filter(([target]) => path.dirname(path.resolve(target)) === actorRoot &&
+      /^[a-f0-9]{32}$/.test(path.basename(target)))).toHaveLength(portableFence ? 200 : 0);
     expect(owner.status(stopped.id).status).toBe("stopped"); // not manager shutdown
   } finally {
     await owner.close();
     await agents.close();
     watch.mockRestore();
     recorder.mockRestore();
+    treeRemoval.mockRestore();
     fs.rmSync(root, { recursive: true, force: true }); // own test fixture cleanup
   }
 }, 120_000);

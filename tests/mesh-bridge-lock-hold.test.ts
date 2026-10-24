@@ -345,6 +345,7 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
   // judge every lease the same, or the plan runs again. Both directions; the clock is the side's own.
   it.each([
     ["expires", 0, 20_000, true],
+    ["is exactly at the deadline", 10_000, 10_001, true],
     ["becomes live (clock back)", 20_000, 0, false],
   ] as const)("mirror plan: a native lease that %s before the transaction re-plans", async (_name, planAt, txAt, kept) => {
     const hub = store();
@@ -391,6 +392,15 @@ describe("bridge catch-up SQLite write-lock holds (smarty-dev#10391), real store
       expect(mesh.stateUnchangedSince(at, prefixes)).toBe(false);
       expect(mesh.stateUnchangedSince(at, ["probe/"])).toBe(true);
     }
+    const ownKey = `${prefixes[0]}${"b".repeat(64)}`;
+    const ownRevision = mesh.stateRevision()!;
+    const own = await mesh.put({ key: ownKey, value: { id: "own" }, identity });
+    expect(mesh.stateUnchangedSince(ownRevision, prefixes)).toBe(false);
+    expect(mesh.stateUnchangedSince(ownRevision, prefixes, new Set([ownKey]))).toBe(true);
+    expect(mesh.stateUnchangedSince(ownRevision, prefixes, new Map([[ownKey, own.version]]))).toBe(true);
+    await other.put({ key: ownKey, value: { id: "external" }, identity });
+    expect(mesh.stateUnchangedSince(ownRevision, prefixes, new Set([ownKey]))).toBe(true);
+    expect(mesh.stateUnchangedSince(ownRevision, prefixes, new Map([[ownKey, own.version]]))).toBe(false);
     // A revision of another lineage (a re-epoched or another database) proves nothing.
     expect(mesh.stateUnchangedSince(`other:${revision}`, prefixes)).toBe(false);
     // The file backend has no change feed: never proven.

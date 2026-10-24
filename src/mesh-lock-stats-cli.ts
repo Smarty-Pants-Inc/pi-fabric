@@ -50,6 +50,8 @@ const writerLabel = (writer: LockStatsWriter | undefined): string => {
     .filter(Boolean).join(" ") || "-";
   return label(text.length > 60 ? `${text.slice(0, 59)}…` : text);
 };
+const fenceRefusalHoldersLabel = (holders: readonly { pid: number | null; comm: string | null; n: number }[] | undefined): string =>
+  holders?.map(holder => `${holder.pid ?? "?"}:${holder.comm === null ? "?" : label(holder.comm)}×${holder.n}`).join(", ") || "-";
 const clock = (minute: number): string => new Date(minute * 60_000).toISOString().slice(11, 16);
 const table = (rows: string[][]): string => {
   const widths = rows[0]!.map((_, column) => Math.max(...rows.map(row => row[column]!.length)));
@@ -67,7 +69,16 @@ const formatLockStats = (summary: LockStatsSummary): string => {
       `hold mean ${ms(summary.holdMeanMs)}, p99 <= ${ms(summary.holdP99Ms)}, max ${ms(summary.holdMaxMs)}`,
   ];
   if (!summary.n && !summary.timeouts && !summary.tries) return [...lines, "no lock acquisitions recorded in this window"].join("\n");
-  lines.push("", "classes by hold time:", table([
+  lines.push("", "operations by held time:", table([
+    ["operation", "samples", "total held", "p50", "p95", "max", "fence refusals", "holder pid/comm × count"],
+    ...summary.operations.map(row => [label(row.operation), String(row.n), ms(row.totalHeldMs), ms(row.p50HoldMs), ms(row.p95HoldMs),
+      ms(row.maxHoldMs), String(row.fenceRefusals ?? 0), fenceRefusalHoldersLabel(row.fenceRefusalHolders)]),
+  ]), "", "phases by held time:", table([
+    ["operation", "phase", "samples", "total held", "p50", "p95", "max", "fence refusals", "holder pid/comm × count"],
+    ...summary.phases.map(row => [label(row.operation), label(row.phase), String(row.n), ms(row.totalHeldMs),
+      ms(row.p50HoldMs), ms(row.p95HoldMs), ms(row.maxHoldMs), String(row.fenceRefusals ?? 0),
+      fenceRefusalHoldersLabel(row.fenceRefusalHolders)]),
+  ]), "", "classes by hold time:", table([
     ["class", "acq", "hold", "share", "busy", "hold mean", "hold p99<=", "hold max", "wait mean", "wait p99<=", "wait max", "timeouts", "tries"],
     ...summary.classes.map(row => [label(row.lockClass), String(row.n), ms(row.holdMs), pct(row.holdSharePct), pct(row.busyPct),
       ms(row.holdMeanMs), ms(row.holdP99Ms), ms(row.holdMaxMs), ms(row.waitMeanMs), ms(row.waitP99Ms), ms(row.waitMaxMs),

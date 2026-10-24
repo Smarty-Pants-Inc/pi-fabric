@@ -73,6 +73,41 @@ const setPolicy = (root: string) => new MeshStore(root, 64 * 1024, 1_000).put({
 });
 
 describe("participant files", () => {
+  it("under a mirror's directory custody, an unrelated record's update proceeds; additions and identity changes wait (smarty-dev#13645)", async () => {
+    const root = meshRoot();
+    const mesh = new MeshStore(root, 64 * 1024, 1_000);
+    const entry = (value: FabricParticipantRecord, version: number) => ({
+      key: keyOf(value.id), value, version, updatedAt: Date.now(), updatedBy: identityOf(value.sessionId!) });
+    writeParticipantFile(root, entry(record("heartbeat"), 1));
+    writeParticipantFile(root, entry(record("alias"), 1));
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const inCustody = new Promise<void>(resolve => { entered = resolve; });
+    // A mirror whose incoming ids touch neither existing record holds the namespace for a while.
+    const custody = participantFiles.withParticipantFileDirectoryCustody(mesh, async () => { entered(); await held; },
+      new Set(["session:incoming"]));
+    await inCustody;
+    // A heartbeat of an unrelated, existing record: same identity fields, only its key receipt.
+    await expect(participantFiles.writeParticipantFileIf(mesh, keyOf("session:heartbeat"),
+      current => entry({ ...record("heartbeat"), status: "running", updatedAt: 3 }, (current?.version ?? 0) + 1))).resolves.toBe(true);
+    expect(participantFiles.readParticipantFile(root, keyOf("session:heartbeat"))?.value).toMatchObject({ status: "running" });
+    // A new record, and an existing record rewritten to alias the incoming id, both wait for the namespace.
+    let added = false, aliased = false;
+    const addition = participantFiles.writeParticipantFileIf(mesh, keyOf("session:incoming"),
+      () => entry(record("incoming"), 1)).then(result => { added = true; return result; });
+    const identityChange = participantFiles.writeParticipantFileIf(mesh, keyOf("session:alias"),
+      current => entry({ ...record("alias"), rootId: "session:incoming" }, (current?.version ?? 0) + 1))
+      .then(result => { aliased = true; return result; });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect([added, aliased]).toEqual([false, false]);
+    release();
+    await custody;
+    await expect(Promise.all([addition, identityChange])).resolves.toEqual([true, true]);
+    expect(participantFiles.readParticipantFile(root, keyOf("session:alias"))?.value).toMatchObject({ rootId: "session:incoming" });
+    mesh.closeState();
+  });
+
   it.each([false, true])("renews a live host through per-key contention (files-only=%s), retries and lets dead hosts expire", async (filesOnly) => {
     vi.useFakeTimers({ now: Date.now() });
     const root = meshRoot();

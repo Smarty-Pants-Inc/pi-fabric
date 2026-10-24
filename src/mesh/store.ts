@@ -6,11 +6,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { delay, MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import type { LockTimingContext } from "./commit-stats.js";
 import { isNamespaceRace } from "../core/atomic-write.js";
 import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } from "./state-file.js";
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
-  type StateBackendDiagnostics } from "./state-backend.js";
+  type StateBackendDiagnostics, type StateChangeExceptions } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
 import { closeResidentWakeRetryCursor, indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
 import { writeFileAtomic } from "../core/atomic-write.js";
@@ -363,7 +364,7 @@ let unreadableStateRevisions = 0;
 
 /** The SQLite backend's revision views (SqliteStateBackend), reached without a value import. */
 interface SqliteStateViews {
-  unchangedSince(stamp: string, prefixes: readonly string[]): boolean;
+  unchangedSince(stamp: string, prefixes: readonly string[], exceptKeys?: StateChangeExceptions): boolean;
   stateView(): { stamp: string; view: MeshBatchView };
 }
 
@@ -581,10 +582,10 @@ export class MeshStore {
     return event;
   }
 
-  async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
+  async publishBatch(inputs: MeshPublishInput[], lockTiming?: LockTimingContext): Promise<MeshEvent[]> {
     const stamped = inputs.map((input) => ({ ...input, sender: input.sender ?? processSender() }));
     if (this.#scheduleDue()) await this.releaseDueSchedules().catch(() => undefined);
-    const events = await this.#events.publishBatch(stamped);
+    const events = await this.#events.publishBatch(stamped, lockTiming);
     await this.#wakeAfterPublish(events);
     return events;
   }
@@ -994,8 +995,8 @@ export class MeshStore {
    * The R20 write fence (StateBackend.withWriteFence): `operation` runs synchronously while no state
    * commit can happen. Only with `.lock` held or no lock at all: never take `.lock` inside it.
    */
-  withStateWriteFence<T>(operation: () => T): T {
-    return this.#state.withWriteFence(operation);
+  withStateWriteFence<T>(operation: () => T, timing?: LockTimingContext): T {
+    return this.#state.withWriteFence(operation, timing);
   }
 
   stateStamp(): string | undefined {
@@ -1019,9 +1020,9 @@ export class MeshStore {
    * smarty-dev#10391, sqlite only: whether no key under `prefixes` changed after `revision` (a `stateRevision()`),
    * from the change feed, cheap enough to run in `withStateWriteFence`. False on other backends or when unknown.
    */
-  stateUnchangedSince(revision: string, prefixes: readonly string[]): boolean {
+  stateUnchangedSince(revision: string, prefixes: readonly string[], exceptKeys?: StateChangeExceptions): boolean {
     const state = this.#sqliteState();
-    return state !== undefined && state.unchangedSince(revision, prefixes);
+    return state !== undefined && state.unchangedSince(revision, prefixes, exceptKeys);
   }
 
   /** smarty-dev#10391, sqlite only: a read-only view of the committed state now and its `stateRevision()`. */

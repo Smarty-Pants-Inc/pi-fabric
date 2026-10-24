@@ -412,7 +412,9 @@ const sessionServicesValid = (value: unknown, kind: FabricParticipantKind): bool
   });
 };
 
-const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
+/** The participant record this directory reads from an entry, or undefined when it refuses the entry.
+ * Exported for the mesh bridge, which never writes a mirror row its own host's readers must refuse. */
+export const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
   if (!isObject(entry.value) || entry.value.format !== 1 || entry.value.stopReason === "owner-root-gone") return undefined;
   const value = entry.value as Partial<FabricParticipantRecord> & Record<string, unknown>;
   const kind = participantKind(value.kind);
@@ -1258,6 +1260,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // only when its withdrawal committed: otherwise the reload lease would keep stale child or
   // legacy entries alive after the process is gone (smarty-dev#6622, review round 2). A close()
   // still awaiting its withdrawal has not committed either (round 4).
+  // smarty-dev#13645: Node's synchronous `exit` event cannot await the per-host custody gate, but
+  // removeHostLeaseIf is itself a compare-and-remove: it renames the file aside, rechecks the moved
+  // bytes' owner and restores anything else, so a successor's or a mirror's lease is never removed.
   #installExitHook(): void {
     this.#withdrawn = false;
     this.#withdrawalFailed = false;

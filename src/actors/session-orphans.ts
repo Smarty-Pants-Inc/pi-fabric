@@ -8,7 +8,7 @@ import { assertMeshStateReadable, censusRecordAlive, type MeshBatchOperation, ty
 import { residentProcessAlive } from "../residency/process-identity.js";
 import { hostLeasePath, readHostLeaseCurrent, type FabricHostLease } from "../topology/host-leases.js";
 import { isLiveLegacyRootEntry } from "../topology/legacy-root-liveness.js";
-import { prepareParticipantFileLock, withParticipantFileTryLock, writeParticipantFile } from "../topology/participant-files.js";
+import { prepareParticipantFileLock, withParticipantFileTryLock, withParticipantFilesTryLock, writeParticipantFileUnderCustody } from "../topology/participant-files.js";
 import type { FabricParticipantRecord } from "../topology/types.js";
 import { assertNativeObserver } from "./launcher-lead.js";
 import { ActorRegistryStore } from "./registry-store.js";
@@ -465,8 +465,7 @@ export class SessionActorOrphans {
     const prepared = changed ? store.prepare(snapshot.actors.map(item => item.id === row.id
       ? { ...item, sessionOrphan: { ...marker, directorySettlement: receipt } } : item), { durable: true }, snapshot) : undefined;
     let expected = snapshot.bytes, intentCommitted = false, applied = false;
-    const underKeys = <T>(operation: () => T): T => withParticipantFileTryLock(this.mesh, keys[0]!, incarnation,
-      () => withParticipantFileTryLock(this.mesh, keys[1]!, incarnation, operation));
+    const underKeys = <T>(operation: () => T): T => withParticipantFilesTryLock(this.mesh, keys, incarnation, operation);
     const assertProof = () => {
       checkActive?.();
       if (this.#closed || store.snapshot().bytes !== expected || !sessionActorRootGone(this.mesh, rootId, this.lineageAlive) ||
@@ -512,7 +511,7 @@ export class SessionActorOrphans {
             catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
             if (entry.key !== participantKey(row.id) || record(entry.value)?.id !== row.id || record(entry.value)?.rootId !== rootId ||
                 (entry.updatedBy.id !== rootId && !this.validateTombstone(entry))) throw new Error("Native actor advertisement owner changed");
-            if (!same(entry)) writeParticipantFile(this.mesh.root, { ...entry, updatedBy: this.identity,
+            if (!same(entry)) writeParticipantFileUnderCustody(this.mesh.root, { ...entry, updatedBy: this.identity,
               updatedAt: Date.now(), version: entry.version + 1, value: terminal });
           }),
         }), 0), 0, { ownIncarnation: incarnation }), 0, { ownIncarnation: incarnation }), "session-orphans-directory");

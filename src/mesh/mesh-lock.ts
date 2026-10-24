@@ -1,4 +1,4 @@
-import { createLockEvents, createLockStats, lockHeldEventThreshold, type LockEventStore, type MeshLockClass } from "./commit-stats.js";
+import { createLockEvents, createLockStats, lockHeldEventThreshold, type LockEventStore, type LockTimingContext, type MeshLockClass } from "./commit-stats.js";
 import { meshLockQueueDirectory, MeshLockTicket } from "./lock-queue.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { retryDelayMs } from "../core/retry-backoff.js";
@@ -240,8 +240,8 @@ export class MeshLock {
   // `bounded` marks an explicit try (preparation refusal and lock stats); a scoped withTryLock is one too. A
   // reduced remaining budget from an ordinary caller is never a try.
   withLock<T>(operation: () => T, lockTimeoutMs = this.#lockTimeoutMs, lockClass: MeshLockClass = "other",
-    bounded = false): Promise<T> {
-    return this.#withLock(operation, lockTimeoutMs, lockClass, bounded, false);
+    bounded = false, timing?: LockTimingContext): Promise<T> {
+    return this.#withLock(operation, lockTimeoutMs, lockClass, bounded, false, timing);
   }
 
   /**
@@ -250,12 +250,12 @@ export class MeshLock {
    * whose mesh critical sections stay synchronous.
    */
   withLockAcrossAwait<T>(operation: () => Promise<T>, lockTimeoutMs = this.#lockTimeoutMs,
-    lockClass: MeshLockClass = "other"): Promise<T> {
-    return this.#withLock(operation, lockTimeoutMs, lockClass, false, true);
+    lockClass: MeshLockClass = "other", timing?: LockTimingContext): Promise<T> {
+    return this.#withLock(operation, lockTimeoutMs, lockClass, false, true, timing);
   }
 
   async #withLock<T>(operation: () => T | Promise<T>, lockTimeoutMs: number, lockClass: MeshLockClass,
-    bounded: boolean, acrossAwait: boolean): Promise<T> {
+    bounded: boolean, acrossAwait: boolean, timing?: LockTimingContext): Promise<T> {
     const lockWaitStart = timed ? performance.now() : 0;
     let lockHeldAt = -1;
     let holdMs = -1;
@@ -476,11 +476,11 @@ export class MeshLock {
       ticket.close();
       // Recorded after the ticket closes, so bookkeeping never delays a FIFO follower.
       if (holdMs >= 0) {
-        lockStats?.acquired(this.root, lockClass, lockHeldAt - lockWaitStart, holdMs);
+        lockStats?.acquired(this.root, lockClass, lockHeldAt - lockWaitStart, holdMs, timing);
         if (this.#lockHeldEventMs > 0 && holdMs > this.#lockHeldEventMs) lockEvents?.held(this.root, "mesh-lock", lockClass, holdMs);
       } else if (failedWaitMs >= 0) {
         const tried = Boolean(scope?.active) || bounded;
-        lockStats?.failed(this.root, lockClass, failedWaitMs, tried);
+        lockStats?.failed(this.root, lockClass, failedWaitMs, tried, timing);
         // The holder as its owner record names it now (it may have released since the timeout).
         if (!tried) lockEvents?.waitTimeout(this.root, "mesh-lock", lockClass, failedWaitMs, lockOwnerPid(ownerPath));
       }

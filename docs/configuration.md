@@ -131,8 +131,9 @@ From a **Ryzen 1 Main owner**, after a fresh build on the clean candidate:
 PROOF_MODELS_FROM_PROFILE=1 nice -n 19 node scripts/probe-native-process-placement.mjs \
   /absolute/installed/pi-coding-agent/package \
   /absolute/kept/evidence-directory \
-  /home/paul/.local/bin/smarty-task-ryzen2 ryzen2 \
-  /home/paul/.local/share/smarty-dev/factory/current/setup/factory/work-hosts.json ssh
+  /absolute/real-launcher work-host \
+  /absolute/work-hosts.json ssh \
+  /absolute/native/task-root
 ```
 
 `PROOF_MODELS_FROM_PROFILE=1` opts into the selected host profile's model providers: before replacing `PI_CODING_AGENT_DIR`, the probe resolves that directory (default `~/.pi/agent`) and symlinks its `models.json` into the private isolated profile. The installed SDK consumes the symlink with network/model refresh disabled and in-memory authentication; the probe never copies or prints the models file, passes it on argv, or includes it or its contents in the evidence directory. No authentication store is linked. The scratch profile and symlink are removed on completion without modifying the host file. A missing models file fails closed; private failure diagnostics are omitted from evidence/stdout/stderr when this option is enabled. Leave the option unset for the inert offline provider metadata instead. Only the real work task makes an inference call through the target profile.

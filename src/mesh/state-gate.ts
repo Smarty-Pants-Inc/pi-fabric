@@ -321,13 +321,18 @@ export const assertPrivateStateRoot = (root: string, db = "state.db", requireDat
  * In enforcement mode an EEXIST winner is refused, never repaired or adopted; existing roots are gated at admission/open.
  * Neither mode repairs an existing root. Windows callers run this BEFORE the fence
  * (custody-lock.ts and fence-lock.ts create the root too, untracked).
+ * `gateFollows` (smarty-dev#8920 perf): the caller opens this root's state.db through openPrivateStateDb WITH a
+ * create callback before it creates any state file, so that gate's pre-create root proof (the same request:
+ * root plan, state.db absent) is taken there. The advisory snapshot here would only repeat it, so it is skipped.
+ * The mkdir and the mandatory lstat type check still run, and the enforced branch is unchanged: its
+ * creation-parent preflights and protect/readback guard a mutation that only this function makes.
  */
-export const createStateRoot = (root: string): void => {
+export const createStateRoot = (root: string, options: { gateFollows?: boolean } = {}): void => {
   if (process.platform !== "win32") { fs.mkdirSync(root, { recursive: true, mode: 0o700 }); return; }
   if (!windowsAclEnforced()) {
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     checkPrivatePath(root, "directory");
-    assertWindowsAcl(root, stateTargets(root, "state.db"), false);
+    if (options.gateFollows !== true) assertWindowsAcl(root, stateTargets(root, "state.db"), false);
     return;
   }
   const chain = [path.resolve(root)];

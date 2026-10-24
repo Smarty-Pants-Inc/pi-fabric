@@ -1922,10 +1922,19 @@ export class StoreBridgeSide implements BridgeSide {
     // (replay and retirement commit) also take the transaction path below.
     const probe = this.#hasCommittedPass && !halted() && this.store.stateRevision() !== undefined &&
       !this.#outbox.hasUnconfirmed() ? this.store.stateView() : undefined;
+    // smarty-dev#13645 (re-audit P1-2): stale-incarnation discovery stays lock-free, as on main, where
+    // the early plan ran compute outside any lock. A stale instance must be fenced on its next pass
+    // even while its successor's custody pass or renewal sweep holds the gates this pass needs.
+    let preflighted = false;
     if (probe && probe.view.listAll(BRIDGE_HANDOFF_PREFIX).length === 0) {
       let probed: ReturnType<typeof compute> | undefined;
+      preflighted = true;
       try { probed = compute(probe.view, participantFileSnapshot(this.store.root), false); }
-      catch { probed = undefined; } // Refusals are decided again on the custody snapshot below.
+      catch (error) {
+        // A newer incarnation's committed evidence is final: fence now, not after winning custody.
+        if (error instanceof BridgeStaleIncarnationError) throw error;
+        probed = undefined; // Other refusals are decided again on the custody snapshot below.
+      }
       if (probed && probed.ops.length === 0 && probed.removed.length === 0 && !halted()) {
         const renewals = this.#outbox.plan();
         leases = capSampled(probed).leases;
@@ -1933,7 +1942,8 @@ export class StoreBridgeSide implements BridgeSide {
         this.#skippedRoots = skippedRoots;
         try {
           this.#outbox.pruneDone();
-          await renewals.runAsync(probe.view, halted);
+          // A renewal whose host gate is busy rejects this pass (retryable); the next pass renews it.
+          await renewals.runAsync(probe.view, halted, { surfaceBusyCustody: true });
         } finally { this.#skippedRoots = undefined; }
         if (!final) {
           this.#hasCommittedPass = true;
@@ -1957,7 +1967,31 @@ export class StoreBridgeSide implements BridgeSide {
       ownVersions: Map<string, number>;
       ignoredStateKeys: ReadonlySet<string>;
     };
+    // The probe did not plan (unconfirmed outbox rows, handoff rows, or no committed pass yet): run
+    // main's lock-free stale preflight on a committed snapshot, under main's early-plan condition,
+    // before waiting on any participant or lease gate. Only a stale refusal is used; the plan itself
+    // is made again under custody below.
+    // While no host, participant or handoff row (the only rows compute reads) changed since, the first
+    // custody plan reuses this snapshot (one snapshot per pass, as main). Its participant and lease
+    // inputs are still read under custody, and the change feed still validates those rows from this
+    // revision through COMMIT.
+    let preflightSnapshot: ReturnType<MeshStore["stateView"]> = undefined;
+    if (!preflighted && (this.#recovered || (partial && this.#hasCommittedPass)) && !halted()) {
+      // SQLite only, as main's early plan (the file backend has no revision view).
+      preflightSnapshot = this.store.stateRevision() !== undefined ? this.store.stateView() : undefined;
+      if (preflightSnapshot) {
+        try { compute(preflightSnapshot.view, participantFileSnapshot(this.store.root), false); }
+        catch (error) { if (error instanceof BridgeStaleIncarnationError) throw error; }
+      }
+    }
+    const custodySnapshot = (revision: string | undefined): ReturnType<MeshStore["stateView"]> => {
+      const reused = preflightSnapshot;
+      preflightSnapshot = undefined;
+      return reused && revision !== undefined && (reused.revision === revision ||
+        this.store.stateUnchangedSince(reused.revision, HELD_STATE_PREFIXES)) ? reused : this.store.stateView();
+    };
     let cachedPlan: CachedMirrorPlan | undefined;
+    let effectBusy: { error: unknown } | undefined;
     const custodyAuthorityIds = new Set(incomingAuthorityIds);
     for (const entry of this.store.listAll(BRIDGE_HANDOFF_PREFIX)) {
       const handoff = bridgeHandoffOf(entry);
@@ -1989,7 +2023,7 @@ export class StoreBridgeSide implements BridgeSide {
             let files = cachedPlan ? undefined : participantFileSnapshot(this.store.root);
             let participantAuthority = cachedPlan?.participantAuthorityStamp ?? (files ? participantAuthorityStamp(files) : undefined);
             const currentRevision = this.store.stateRevision();
-            let early = cachedPlan && currentRevision !== undefined ? undefined : this.store.stateView();
+            let early = cachedPlan && currentRevision !== undefined ? undefined : custodySnapshot(currentRevision);
             let handoffEntries = early?.view.listAll(BRIDGE_HANDOFF_PREFIX) ?? [];
             let judgesLeaseLiveness = cachedPlan?.handoffSensitive ?? (early !== undefined && handoffEntries.length > 0);
             const leaseAuthorityIds = new Set(custodyAuthorityIds);
@@ -2164,7 +2198,12 @@ export class StoreBridgeSide implements BridgeSide {
         this.#outbox.pruneDone();
         for (const pending of pendingEffects) {
           if (halted()) break;
-          await pending.plan.runAsync(pending.view, halted);
+          // re-audit P2-1: an effect whose zero-wait gate was busy (another link's pass, the reaper,
+          // a native addition) stays pending in the outbox. Attempt every batch's effects, then
+          // reject the pass with that retryable MeshLockTimeout so the caller's readiness barrier
+          // does not pass with a lease missing; the backed-off retry renews or replays it.
+          try { await pending.plan.runAsync(pending.view, halted, { surfaceBusyCustody: true }); }
+          catch (error) { if (!isMeshLockTimeout(error)) throw error; effectBusy ??= { error }; }
         }
       } finally { this.#skippedRoots = undefined; }
     }
@@ -2174,6 +2213,7 @@ export class StoreBridgeSide implements BridgeSide {
       if (!partial) this.#recovered = true;
     }
     reportUnreadable();
+    if (effectBusy && !halted()) throw effectBusy.error;
   }
 
   #applyLease(lease: BridgeLease, replay: boolean): void {
@@ -2196,6 +2236,13 @@ export class StoreBridgeSide implements BridgeSide {
       Math.min(BRIDGE_LEASE_MS, sample.sourceExpiresAt - sample.sourceObservedAt) : undefined;
     if (sourceDeadline !== undefined) lease = { ...lease, expiresAt: Math.min(lease.expiresAt, sourceDeadline) };
     const onDisk = readHostLeaseCurrent(this.store.root, lease.id);
+    // re-audit P2-3: a native may claim its lease file before it publishes its host row, so the row
+    // still reads mirror-owned here. Under this gate, never replace a live native lease (writer
+    // census or Main session; a mirror lease carries neither), nor a lease whose incarnation this
+    // plan neither renews nor supersedes: that file is newer authority than the plan saw.
+    if (onDisk && (nativeLeaseLive(onDisk, this.now()) || (onDisk.incarnationToken !== undefined &&
+      onDisk.incarnationToken !== lease.incarnationToken &&
+      !bridgeSupersededTokensOf(lease.bridgeSupersededTokens).includes(onDisk.incarnationToken)))) return;
     // Recovery must not erase newer file authority while its state row is still catching up.
     if (onDisk?.rootId === lease.rootId) {
       // Disk history is local proof that this outbox token was superseded. An old recovery

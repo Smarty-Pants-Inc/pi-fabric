@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { isMeshWriteDeferred } from "../core/atomic-write.js";
+import { isMeshLockTimeout, isMeshWriteDeferred } from "../core/atomic-write.js";
 import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStore } from "./store.js";
 
 // State-domain helpers for lock call sites (smarty-dev#6477 L2b, plan R3 and R11).
@@ -69,6 +69,8 @@ interface OutboxRow { format: 1; scope: string; kind: string; key: string; paylo
 
 const RETIRE_BATCH_SIZE = 64;
 const EFFECT_BATCH_SIZE = 64;
+/** Failed rows retried per run, however many effects the run staged (re-audit P2-1). */
+const FAILED_RETRY_FLOOR = 8;
 const digest = (text: string): string => createHash("sha256").update(text).digest("hex");
 
 const rowOf = (value: unknown): OutboxRow | undefined => {
@@ -108,7 +110,14 @@ export interface CommitOutboxPlan {
   /** Post-COMMIT effects with asynchronous custody; callers await this before declaring readiness.
    * It reads each staged row fresh but does not prune retired rows: call CommitOutbox.pruneDone()
    * once before a pass's runAsync calls (one listing, not one read per retired row per batch). */
-  runAsync(view: MeshBatchView, halted?: () => boolean): Promise<number>;
+  runAsync(view: MeshBatchView, halted?: () => boolean, options?: CommitOutboxRunOptions): Promise<number>;
+}
+
+export interface CommitOutboxRunOptions {
+  /** smarty-dev#13645 (re-audit P2-1): after every staged effect was attempted, reject with the first
+   * effect-custody MeshLockTimeout (a busy gate; the effect stays pending in #failed) instead of
+   * resolving, so a caller's readiness barrier does not pass with that effect missing. */
+  surfaceBusyCustody?: boolean;
 }
 
 type StagedEffect = { row: string; effect: CommitOutboxEffect; stamp: string; durable: boolean };
@@ -169,10 +178,10 @@ export class CommitOutbox {
         ran = true;
         return this.#run(staged, view, halted);
       },
-      runAsync: async (view, halted) => {
+      runAsync: async (view, halted, options) => {
         if (ran) return 0;
         ran = true;
-        return this.#runAsync(staged, view, halted);
+        return this.#runAsync(staged, view, halted, options);
       },
     };
   }
@@ -237,21 +246,27 @@ export class CommitOutbox {
     for (const row of [...this.#done.keys()]) if (!stored.has(row)) this.#done.delete(row);
   }
 
-  async #runAsync(staged: readonly StagedEffect[], view: MeshBatchView, halted?: () => boolean): Promise<number> {
+  async #runAsync(staged: readonly StagedEffect[], view: MeshBatchView, halted?: () => boolean,
+    options: CommitOutboxRunOptions = {}): Promise<number> {
     let ran = 0;
     let completed = 0;
+    let busy: { error: unknown } | undefined;
+    const onBusy = (error: unknown): void => { busy ??= { error }; };
     for (const { row, effect, stamp, durable } of staged) {
       if (halted?.()) return ran;
-      if (await this.#executeAsync(row, effect.kind, effect.payload, view, false, stamp, durable, halted)) ran += 1;
+      if (await this.#executeAsync(row, effect.kind, effect.payload, view, false, stamp, durable, halted, onBusy)) ran += 1;
       if (++completed % EFFECT_BATCH_SIZE === 0) await new Promise<void>(resolve => setImmediate(resolve));
     }
-    for (const row of [...this.#failed].slice(0, Math.max(0, EFFECT_BATCH_SIZE - staged.length))) {
+    // re-audit P2-1: failed rows keep a retry floor; a pass staging 64 or more effects (every steady
+    // pass of a large mirror) otherwise never retried or retired them until a restart's recover().
+    for (const row of [...this.#failed].slice(0, Math.max(FAILED_RETRY_FLOOR, EFFECT_BATCH_SIZE - staged.length))) {
       if (halted?.()) return ran;
       const entry = this.mesh.get(row, { fresh: true });
       const stored = rowOf(entry?.value);
       if (!stored) { this.#failed.delete(row); continue; }
       await this.#executeAsync(row, stored.kind, stored.payload, view, true, undefined, true, halted);
     }
+    if (busy && options.surfaceBusyCustody && !halted?.()) throw busy.error;
     return ran;
   }
 
@@ -328,14 +343,19 @@ export class CommitOutbox {
 
   async #executeAsync(
     row: string, kind: string, payload: unknown, view: MeshBatchView, replay: boolean, stamp?: string,
-    durable = true, halted?: () => boolean,
+    durable = true, halted?: () => boolean, onBusy?: (error: unknown) => void,
   ): Promise<boolean> {
     let result = false;
     const execute = (): void => { if (!halted?.()) result = this.#execute(row, kind, payload, view, replay, stamp, true, durable); };
     try {
       if (this.options.withEffectCustody) await this.options.withEffectCustody(kind, payload, execute);
       else execute();
-    } catch { this.#failed.add(row); return false; }
+    } catch (error) {
+      // #execute catches handler errors itself: a throw here is the effect custody (its gate was busy).
+      this.#failed.add(row);
+      if (isMeshLockTimeout(error)) onBusy?.(error);
+      return false;
+    }
     return result;
   }
 }

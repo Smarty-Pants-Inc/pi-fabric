@@ -99,6 +99,7 @@ import { extensionContextLive } from "./session-liveness.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
 import { ParticipantDirectory, type FabricPeerListOptions } from "./topology/participant-directory.js";
+import { boundRootSessionCwd } from "./topology/root-session-cwd.js";
 import type { FabricTransport } from "./transport/types.js";
 import type { SessionChannel, SessionChannelIdentity, SessionChannelOpenOptions } from "./transport/nats/session-channel.js";
 import { rootParticipantName, validName } from "./topology/participant-name.js";
@@ -1341,12 +1342,8 @@ export class FabricRuntimeState {
       kernel: () => this.#config?.executor.kernel ?? "typescript",
       pythonRuntime: () => this.#config?.executor.pythonRuntime ?? "monty",
       mainAgentId,
-      rootSessionCwd: () => {
-        const root = this.#participants?.get(mainAgentId, undefined, { fresh: true });
-        return root?.kind === "root" && root.id === mainAgentId && typeof root.cwd === "string" && root.cwd.trim().length > 0
-          ? root.cwd
-          : undefined;
-      },
+      // The Main's own lease lapses when it renews late: same last-known fallback (smarty-dev#16357).
+      rootSessionCwd: () => boundRootSessionCwd(this.#participants, mainAgentId),
       // #16357: the root Main itself is alive while this runtime runs (last seen now), whatever its
       // record says; a nested runtime reads its lineage root's record like the resident host does.
       rootSessionLastSeenMs: () => identity.kind === "main" && identity.id === mainAgentId ? 0

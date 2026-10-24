@@ -154,6 +154,26 @@ describe.each(["session", "durable"] as const)("%s actor process children", (res
       .rejects.toThrow(`Unknown Fabric actor: ${other.id}`);
   });
 
+  it("preserves legacy actorStatus lookup when an older launcher supplies no activation identity", async () => {
+    const h = await setup(residency);
+    // Pre-8d7033f2 managers select the current worker/extension at spawn time,
+    // but cannot supply the newer immutable activation tuple. This fixture has
+    // no owner directory/resident API: the old lookup reports unknown, not an
+    // activation-handoff error. Compatibility must not invent a self tuple.
+    vi.stubEnv("PI_FABRIC_ACTOR_SELF", undefined);
+    await expect(h.runtime.registry.invoke("agents.actorStatus", { id: h.actor.id }, h.invocation))
+      .rejects.toThrow(`Unknown Fabric actor: ${h.actor.id}`);
+  });
+
+  it("rejects a present but malformed actorStatus activation identity instead of using legacy reads", async () => {
+    const h = await setup(residency);
+    for (const malformed of ["not-json", "", "{}"]) {
+      vi.stubEnv("PI_FABRIC_ACTOR_SELF", malformed);
+      await expect(h.runtime.registry.invoke("agents.actorStatus", { id: h.actor.id }, h.invocation))
+        .rejects.toThrow("Fabric actor activation identity is unavailable");
+    }
+  });
+
   it("records the actor and activation run as spawner, never the root Main", async () => {
     const h = await setup(residency);
     const child = await h.spawn();

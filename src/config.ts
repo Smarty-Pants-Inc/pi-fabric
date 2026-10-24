@@ -565,6 +565,19 @@ const meshNatsEphemeralInactiveSeconds = (value: unknown): number => {
   throw new FabricMeshNatsConfigError("ephemeralInactiveSeconds", "must be an integer from 300 through 86400");
 };
 
+// Keep these eager scalar guards independent of the lazy NATS adapter graph.
+const DEFAULT_INBOX_CONSUMER_INACTIVE_MS = 7 * 24 * 60 * 60 * 1_000;
+const MIN_INBOX_CONSUMER_INACTIVE_MS = 60 * 1_000;
+const MAX_INBOX_CONSUMER_INACTIVE_MS = 90 * 24 * 60 * 60 * 1_000;
+const meshNatsInboxConsumerInactiveMs = (value: unknown): number => {
+  if (value === undefined) return DEFAULT_INBOX_CONSUMER_INACTIVE_MS;
+  if (typeof value === "number" && Number.isSafeInteger(value) &&
+    value >= MIN_INBOX_CONSUMER_INACTIVE_MS && value <= MAX_INBOX_CONSUMER_INACTIVE_MS &&
+    Number.isSafeInteger(value * 1_000_000)) return value;
+  throw new FabricMeshNatsConfigError("inboxConsumerInactiveMs",
+    `must be an integer from ${MIN_INBOX_CONSUMER_INACTIVE_MS} through ${MAX_INBOX_CONSUMER_INACTIVE_MS} milliseconds`);
+};
+
 const DEFAULT_INBOX_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
 const MIN_INBOX_MAX_AGE_MS = 60 * 1_000;
 const MAX_INBOX_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1_000;
@@ -582,7 +595,7 @@ const meshNatsInboxMaxAgeMs = (value: unknown): number => {
 /** Messaging/rollback settings fail visibly in the same typed config-error family as E9. */
 export class FabricMeshNatsConfigError extends Error {
   readonly code = "FABRIC_MESH_TRANSPORT_CONFIG";
-  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "org" | "allowInsecureLoopback" | "verifyMachine" | "ephemeralHost" | "ephemeralInactiveSeconds" | "events" | "provision" | "inboxMaxAgeMs", requirement: string) {
+  constructor(readonly field: "operatorMachine" | "rollbackHoldUntil" | "servers" | "custodyStream" | "livenessStream" | "pathBMachines" | "tls" | "org" | "allowInsecureLoopback" | "verifyMachine" | "ephemeralHost" | "ephemeralInactiveSeconds" | "events" | "provision" | "inboxMaxAgeMs" | "inboxConsumerInactiveMs", requirement: string) {
     super(`mesh.nats.${field} ${requirement}`);
     this.name = "FabricMeshNatsConfigError";
   }
@@ -616,12 +629,14 @@ export interface FabricMeshNatsConfig {
   rollbackHoldUntil?: string;
   /** Parallel inbox lanes; normalized configs supply 8, with a minimum of 1. */
   inboxLanes?: number;
-  /** Host-only: allow server-side expiration and clean-shutdown deletion of this host's inbox durable (default false). */
+  /** Host-only: shorten server-side expiration and delete this host's inbox durable on clean shutdown (default false). */
   ephemeralHost?: boolean;
   /** Server-side durable idle expiration in seconds when ephemeralHost is enabled (300..86400, default 3600). */
   ephemeralInactiveSeconds?: number;
   /** Inbox stream message age limit in milliseconds (60 s..90 d, default 7 d); existing max_age:0 streams remain compatible. */
   inboxMaxAgeMs?: number;
+  /** Host-only durable inactivity bound in milliseconds (60 s..90 d, default 7 d); also caps ephemeral expiration. */
+  inboxConsumerInactiveMs?: number;
 }
 
 const meshNatsFlag = (value: unknown, field: "events" | "provision"): boolean => {
@@ -747,6 +762,7 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
       ephemeralHost: meshNatsEphemeralHost(nats.ephemeralHost),
       ephemeralInactiveSeconds: meshNatsEphemeralInactiveSeconds(nats.ephemeralInactiveSeconds),
       inboxMaxAgeMs: DEFAULT_INBOX_MAX_AGE_MS,
+      inboxConsumerInactiveMs: DEFAULT_INBOX_CONSUMER_INACTIVE_MS,
       ...(machine !== undefined ? { machine } : {}),
       ...(rollbackHoldUntil !== undefined ? { rollbackHoldUntil } : {}),
     };
@@ -778,6 +794,7 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
   const ephemeralHost = meshNatsEphemeralHost(messaging.ephemeralHost);
   const ephemeralInactiveSeconds = meshNatsEphemeralInactiveSeconds(messaging.ephemeralInactiveSeconds);
   const inboxMaxAgeMs = meshNatsInboxMaxAgeMs(messaging.inboxMaxAgeMs);
+  const inboxConsumerInactiveMs = meshNatsInboxConsumerInactiveMs(messaging.inboxConsumerInactiveMs);
   const credentials = meshNatsString(messaging.credentials, "credentials");
   const machine = meshNatsString(messaging.machine, "machine");
   const operatorMachine = validateFabricNatsOperatorMachine(messaging.operatorMachine, machine);
@@ -795,6 +812,7 @@ const meshNatsConfig = (value: unknown, transport: FabricMeshTransport): FabricM
     ephemeralHost,
     ephemeralInactiveSeconds,
     inboxMaxAgeMs,
+    inboxConsumerInactiveMs,
   };
 };
 
@@ -1156,7 +1174,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     lockProtocol: 1,
     stateBackend: "file",
     transport: "file",
-    nats: { replicas: 1, inboxLanes: 8, events: false, provision: false, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: DEFAULT_INBOX_MAX_AGE_MS },
+    nats: { replicas: 1, inboxLanes: 8, events: false, provision: false, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: DEFAULT_INBOX_MAX_AGE_MS, inboxConsumerInactiveMs: DEFAULT_INBOX_CONSUMER_INACTIVE_MS },
     enabled: true,
     announce: false,
     actorScope: "project",
@@ -2605,6 +2623,7 @@ const resolveFabricConfig = (
       delete nats.ephemeralHost; // Host-only: a workspace cannot retain its own inbox durable.
       delete nats.ephemeralInactiveSeconds;
       delete nats.inboxMaxAgeMs; // Host-only: a workspace cannot alter shared inbox stream retention.
+      delete nats.inboxConsumerInactiveMs; // Host-only: a workspace cannot extend durable lifetime.
       mesh.nats = nats;
       document.mesh = mesh;
       const executor = { ...objectValue(document.executor) };

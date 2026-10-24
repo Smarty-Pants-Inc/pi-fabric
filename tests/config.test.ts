@@ -310,9 +310,13 @@ describe("host-only NATS inbox retention settings (smarty-dev#15310)", () => {
     return normalizeFabricConfig({}).mesh.nats;
   };
 
-  it("defaults to a persistent host and a one-hour idle threshold, and accepts configured bounds", () => {
-    expect(DEFAULT_FABRIC_CONFIG.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000 });
-    expect(normalizeNats()).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000 });
+  it("defaults to seven-day normal and one-hour ephemeral inactivity, and accepts configured bounds", () => {
+    expect(DEFAULT_FABRIC_CONFIG.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600,
+      inboxMaxAgeMs: 7 * 24 * 60 * 60_000, inboxConsumerInactiveMs: 604_800_000 });
+    expect(normalizeNats()).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 3_600,
+      inboxMaxAgeMs: 7 * 24 * 60 * 60_000, inboxConsumerInactiveMs: 604_800_000 });
+    expect(normalizeNats({ inboxConsumerInactiveMs: 60_000 })).toMatchObject({ inboxConsumerInactiveMs: 60_000 });
+    expect(normalizeNats({ inboxConsumerInactiveMs: 7_776_000_000 })).toMatchObject({ inboxConsumerInactiveMs: 7_776_000_000 });
     expect(normalizeNats({ ephemeralHost: true, ephemeralInactiveSeconds: 300 }))
       .toMatchObject({ ephemeralHost: true, ephemeralInactiveSeconds: 300 });
     expect(normalizeNats({ ephemeralHost: true, ephemeralInactiveSeconds: 86_400 }))
@@ -333,10 +337,12 @@ describe("host-only NATS inbox retention settings (smarty-dev#15310)", () => {
     for (const value of [0, 59_999, 90 * 24 * 60 * 60_000 + 1, 60_000.5, "604800000", null]) {
       expect(() => normalizeNats({ inboxMaxAgeMs: value }))
         .toThrow("mesh.nats.inboxMaxAgeMs must be an integer from 60000 through 7776000000 milliseconds");
+      expect(() => normalizeNats({ inboxConsumerInactiveMs: value }))
+        .toThrow("mesh.nats.inboxConsumerInactiveMs must be an integer from 60000 through 7776000000 milliseconds");
     }
   });
 
-  it("does not let a trusted project enable ephemeral retention or change the host threshold", () => {
+  it.each([true, false])("does not let a project change host inbox lifetime (trusted=%s)", projectTrusted => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory(); fs.mkdirSync(path.join(cwd, ".pi"));
     const originalNatsEnv = process.env.PI_FABRIC_MESH_NATS;
     const originalTransportEnv = process.env.PI_FABRIC_MESH_TRANSPORT;
@@ -346,13 +352,16 @@ describe("host-only NATS inbox retention settings (smarty-dev#15310)", () => {
     delete process.env.PI_FABRIC_MESH_HOST_TRANSPORT;
     try {
       fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: {
-        transport: "nats", hostTransport: "nats", nats: { ...nats, ephemeralHost: false, ephemeralInactiveSeconds: 600 },
+        transport: "nats", hostTransport: "nats", nats: { ...nats, ephemeralHost: false, ephemeralInactiveSeconds: 600, inboxConsumerInactiveMs: 120_000 },
       } }));
       fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ mesh: {
-        nats: { ephemeralHost: true, ephemeralInactiveSeconds: 900, inboxMaxAgeMs: 60_000 },
+        nats: { ephemeralHost: true, ephemeralInactiveSeconds: 900, inboxMaxAgeMs: 60_000, inboxConsumerInactiveMs: 7_776_000_000 },
       } }));
-      const config = loadFabricConfigForScope({ cwd, agentDir, projectTrusted: true }, "project");
-      expect(config.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 600, inboxMaxAgeMs: 7 * 24 * 60 * 60_000 });
+      for (const config of [loadFabricConfig({ cwd, agentDir, projectTrusted }),
+        loadFabricConfigForScope({ cwd, agentDir, projectTrusted }, projectTrusted ? "project" : "global")]) {
+        expect(config.mesh.nats).toMatchObject({ ephemeralHost: false, ephemeralInactiveSeconds: 600,
+          inboxMaxAgeMs: 7 * 24 * 60 * 60_000, inboxConsumerInactiveMs: 120_000 });
+      }
     } finally {
       if (originalNatsEnv === undefined) delete process.env.PI_FABRIC_MESH_NATS;
       else process.env.PI_FABRIC_MESH_NATS = originalNatsEnv;

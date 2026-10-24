@@ -23,7 +23,10 @@ import type {
 import { TransportInvalidError, TransportUncertainError, TransportUnavailableError } from "../types.js";
 import { fabricPathBProbeEpochNs, hasFabricPathBProbeObserver, recordFabricPathBProbe, transportProbeCommandId } from "../probe-hooks.js";
 import { publishFailure } from "./errors.js";
-import { DEFAULT_INBOX_MAX_AGE_MS, isValidInboxMaxAgeMs } from "./inbox-policy.js";
+import {
+  DEFAULT_INBOX_CONSUMER_INACTIVE_MS, DEFAULT_INBOX_MAX_AGE_MS,
+  isValidInboxConsumerInactiveMs, isValidInboxMaxAgeMs,
+} from "./inbox-policy.js";
 import {
   transportAdvisoryStreamSubject,
   transportDurableName,
@@ -82,17 +85,19 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly duplicateWindowMs?: number;
   readonly requestTimeoutMs?: number;
   readonly provision?: boolean;
-  /** Host-only opt-in to expiring this host's own inbox durable. */
+  /** Host-only opt-in to shorter expiration and clean-shutdown deletion of this host's inbox durable. */
   readonly ephemeralHost?: boolean;
   /** Idle expiration in seconds when ephemeralHost is enabled (300..86400). */
   readonly ephemeralInactiveSeconds?: number;
+  /** Durable inactivity bound in milliseconds (60000..7776000000, default 7 days); caps ephemeral expiration too. */
+  readonly inboxConsumerInactiveMs?: number;
   /** Mesh event publisher binding; only required when events is enabled. */
   readonly mesh?: MeshStore;
   readonly signal?: AbortSignal;
 }
 
 type OpenOptions = NatsTransportOptions | FabricTransportOptions;
-type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "inboxMaxAgeMs" | "replicas">> & {
+type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "inboxMaxAgeMs" | "inboxConsumerInactiveMs" | "replicas">> & {
   readonly org?: string;
   readonly name?: string;
   readonly tls?: TlsOptions;
@@ -134,6 +139,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
       ephemeralHost: options.ephemeralHost ?? false,
       ephemeralInactiveSeconds: options.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
       inboxMaxAgeMs: options.inboxMaxAgeMs ?? options.maxAgeMs ?? DEFAULT_INBOX_MAX_AGE_MS,
+      inboxConsumerInactiveMs: options.inboxConsumerInactiveMs === undefined ? DEFAULT_INBOX_CONSUMER_INACTIVE_MS : options.inboxConsumerInactiveMs,
       events: options.events ?? false,
       ...(options.mesh === undefined ? {} : { mesh: options.mesh }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -142,7 +148,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
   const config = options.config as unknown as { nats?: {
     servers?: string | readonly string[]; machine?: string; credentials?: string;
     custodyStream?: string; livenessStream?: string; pathBMachines?: readonly string[]; org?: string; tls?: TlsOptions;
-    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number; inboxMaxAgeMs?: number; events?: boolean; provision?: boolean; replicas?: number;
+    ephemeralHost?: boolean; ephemeralInactiveSeconds?: number; inboxMaxAgeMs?: number; inboxConsumerInactiveMs?: number; events?: boolean; provision?: boolean; replicas?: number;
   } };
   const nats = config.nats;
   // Production config never enables plaintext; the loopback opt-in is a direct test option only.
@@ -174,6 +180,7 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
     ephemeralHost: nats?.ephemeralHost ?? false,
     ephemeralInactiveSeconds: nats?.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
     inboxMaxAgeMs: nats?.inboxMaxAgeMs ?? DEFAULT_INBOX_MAX_AGE_MS,
+    inboxConsumerInactiveMs: nats?.inboxConsumerInactiveMs === undefined ? DEFAULT_INBOX_CONSUMER_INACTIVE_MS : nats.inboxConsumerInactiveMs,
     events: nats?.events ?? false,
     mesh: options.mesh,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -196,7 +203,9 @@ const transportConsumerPolicy = (options: ResolvedNatsOptions): TransportConsume
   filterSubject: transportInboxFilter(options.machine, options.hostId),
   description: JSON.stringify({ fabricHostId: options.hostId, machine: options.machine }),
   maxAckPending: 128,
-  ...(options.ephemeralHost ? { inactiveThresholdNs: options.ephemeralInactiveSeconds * 1_000_000_000 } : {}),
+  inactiveThresholdNs: (options.ephemeralHost
+    ? Math.min(options.ephemeralInactiveSeconds * 1_000, options.inboxConsumerInactiveMs)
+    : options.inboxConsumerInactiveMs) * 1_000_000,
 });
 
 const isTransportEnvelope = (value: unknown): value is TransportEnvelope => {
@@ -501,6 +510,9 @@ class NatsTransportImpl implements FabricTransport {
       throw new Error("ephemeralInactiveSeconds must be an integer from 300 through 86400");
     }
     if (!isValidInboxMaxAgeMs(options.inboxMaxAgeMs)) throw new Error("inboxMaxAgeMs must be a bounded positive number of milliseconds");
+    if (!isValidInboxConsumerInactiveMs(options.inboxConsumerInactiveMs)) {
+      throw new Error("inboxConsumerInactiveMs must be an integer from 60000 through 7776000000 milliseconds");
+    }
     const transport = new NatsTransportImpl(await openNatsSession(options, options.signal), options);
     try {
       if (options.events) {

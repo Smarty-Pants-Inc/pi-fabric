@@ -901,6 +901,8 @@ interface FabricActorRequeueResult {
   superseded: number;
   alreadyRequeued: number;
   skipped: Array<{ itemId: string; source: string; reason: string }>;
+  /** Archived items the actor did not take now (a full queue and overflow), and those behind them; a later call offers them again. */
+  notQueued: Array<{ itemId: string; source: string; reason: string }>;
 }
 interface FabricActorInfo extends FabricActorBatching {
   /** Only on agents.stop({ dropQueued: true }) when work was archived: the archive, its sha256 and what it holds. */

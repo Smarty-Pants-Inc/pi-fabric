@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
 import * as actorTypes from "../src/actors/types.js";
@@ -902,18 +902,20 @@ describe("queued-work guard, round 6: requeued stop archives (pi-fabric#1572)", 
     expect(actors.status(fresh.id).queued).toBe(2);
   }, 30_000);
 
-  it("a partially requeued archive still refuses remove with the requeue hint", async () => {
-    const { actors, old, fresh, archive, ledger } = await stoppedWithSuccessor(true);
-    // A queued caller's ask is skipped by requeueArchived: only the other two items reach the ledger.
-    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 2,
-      skipped: [expect.objectContaining({ reason: "a caller's ask, rejected when the actor stopped" })] });
-    expect(fs.readFileSync(ledger, "utf8").split("\n").filter(Boolean)).toHaveLength(2);
-    const bytes = fs.readFileSync(archive);
-    const refusal = await actors.remove(old.id).catch((error: unknown) => error);
-    expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "remove", counts: { archived: 1 } });
-    expect((refusal as Error).message).toContain("requeue it first (agents.requeueArchived");
-    expect(actors.status(old.id).status).toBe("stopped");
-    expect(fs.readFileSync(archive).equals(bytes)).toBe(true);
+  // Round 7 P3 (pi-fabric#1572): a queued caller's ask, which requeueArchived never feeds again, is recorded as skipped and no
+  // longer blocks remove for good. A partly requeued archive (an item a full target refused) still blocks: see round 7 below.
+  it("a skipped caller's ask is recorded as skipped and no longer blocks remove", async () => {
+    const { root, actors, old, fresh, archive, ledger } = await stoppedWithSuccessor(true);
+    const skipped = [expect.objectContaining({ reason: "a caller's ask, rejected when the actor stopped" })];
+    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 2, skipped, notQueued: [] });
+    const outcomes = () => fs.readFileSync(ledger, "utf8").split("\n").filter(Boolean).map(line => (JSON.parse(line) as { outcome: string }).outcome);
+    expect(outcomes()).toEqual(["requeued", "requeued", "skipped"]);
+    // Again: the ask is still reported skipped, nothing is offered twice and the ledger gains no line.
+    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 0, alreadyRequeued: 2, skipped });
+    expect(outcomes()).toEqual(["requeued", "requeued", "skipped"]);
+    await expect(actors.remove(old.id)).resolves.toMatchObject({ removed: true });
+    expect(fs.existsSync(path.join(root, "actors", old.id))).toBe(false);
+    expect(actors.status(fresh.id).queued).toBe(2);
   }, 30_000);
 
   it.each(["corrupt", "invalid item id", "unreadable"])("a %s ledger still blocks remove even after all items were requeued", async (failure) => {
@@ -930,6 +932,130 @@ describe("queued-work guard, round 6: requeued stop archives (pi-fabric#1572)", 
     expect((refusal as Error).message).toContain("requeue it first (agents.requeueArchived");
     expect(actors.status(old.id).status).toBe("stopped");
     expect(fs.existsSync(archive)).toBe(true);
+  }, 30_000);
+});
+
+// pi-fabric#1572 round 7 (fabric-store F1, P1): a ledger line must prove its item was queued. Queue limit 1, so overflow 8.
+describe("queued-work guard, round 7: the requeue ledger records only queued work (pi-fabric#1572)", () => {
+  // An archive of 4 (the old actor's callerless item in flight plus 3 queued), and a busy successor holding `load` items.
+  const archiveAndSuccessor = async (load: number, mesh = false) => {
+    const fixture = setup(1);
+    const { root, actors } = fixture;
+    const old = await actors.create({ name: "requeue-old", instructions: "Supervise.", ...(mesh ? { topics: [TOPIC], coalesce: false } : {}) });
+    const releaseOld = await holdWorker(actors, root, old.id);
+    for (let index = 0; index < 3; index++) {
+      if (mesh) await publish(fixture.mesh, index);
+      else actors.tell(old.id, `archived ${index}`);
+    }
+    await waitFor(() => actors.status(old.id).queued === 3);
+    const { archive, counts } = stopArchive(await actors.stop(old.id, undefined, false, "actors.stop", { dropQueued: true }));
+    expect(counts).toMatchObject({ inFlight: 1, queued: 1, overflow: 2 });
+    releaseOld();
+    await waitFor(() => actors.inFlightCount() === 0);
+    const fresh = await actors.create({ name: "requeue-successor", instructions: "Supervise." });
+    const release = await holdWorker(actors, root, fresh.id);
+    for (let index = 0; index < load; index++) actors.tell(fresh.id, `successor ${index}`);
+    expect(actors.status(fresh.id).queued).toBe(load);
+    return { ...fixture, old, fresh, archive, release, ledger: archive.replace(/\.jsonl$/, ".requeued.jsonl") };
+  };
+  const ledgerLines = (ledger: string) => fs.existsSync(ledger)
+    ? fs.readFileSync(ledger, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as { itemId: string; outcome: string }) : [];
+
+  it("F1 probe: a full successor takes none of 4; none is recorded, remove stays refused, and after it drains all 4 land once", async () => {
+    const { actors, old, fresh, archive, ledger, release } = await archiveAndSuccessor(9);
+    const first = await actors.requeueArchived(fresh.id, archive);
+    expect(first).toMatchObject({ requeued: 0, filtered: 0, superseded: 0, alreadyRequeued: 0, skipped: [] });
+    expect(first.notQueued?.map(item => item.reason)).toEqual([
+      expect.stringMatching(/queue limit reached for requeue-successor \(1 and overflow 8\)/),
+      ...Array(3).fill(expect.stringMatching(/^behind .+, which could not be queued$/)),
+    ]);
+    // Nothing was dropped or recorded: the successor holds its own 9, the ledger is empty, and the archive still blocks.
+    expect(actors.status(fresh.id).queued).toBe(9);
+    expect(actors.messages(fresh.id, 100).filter(message => message.error?.startsWith("Dropped a queued event"))).toEqual([]);
+    expect(ledgerLines(ledger)).toEqual([]);
+    const refusal = await actors.remove(old.id).catch((error: unknown) => error);
+    expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "remove", counts: { archived: 1 } });
+    expect((refusal as Error).message).toContain("requeue it first (agents.requeueArchived");
+    expect(actors.status(old.id).status).toBe("stopped");
+    // Once the successor drains, the same archive lands all 4, in order, exactly once, and the ledger is complete.
+    release();
+    await waitFor(() => actors.status(fresh.id).status === "idle" && actors.status(fresh.id).queued === 0, 150_000);
+    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 4, alreadyRequeued: 0, notQueued: [] });
+    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 0, alreadyRequeued: 4, notQueued: [] });
+    expect(ledgerLines(ledger).map(line => line.itemId)).toEqual(first.notQueued?.map(item => item.itemId));
+    expect(ledgerLines(ledger).map(line => line.outcome)).toEqual(Array(4).fill("requeued"));
+    await waitFor(() => actors.status(fresh.id).status === "idle" && actors.status(fresh.id).queued === 0, 150_000);
+    const fed = actors.messages(fresh.id, 100).filter(message => message.direction === "in" && message.source === "direct")
+      .map(message => message.data as { message: string; data?: { fakeWorkerReleasePath?: string } })
+      .filter(data => data.message.startsWith("archived ") || data.data?.fakeWorkerReleasePath?.includes(old.id.slice(0, 8)));
+    expect(fed.map(data => data.message)).toEqual(["LIVE_WITH_PROGRESS", "archived 0", "archived 1", "archived 2"]);
+    await expect(actors.remove(old.id)).resolves.toMatchObject({ removed: true });
+  }, 360_000);
+
+  // fabric-store P2: the queue checkpoint (and a routed event's dead-letter spill) is synced before any ledger line is written.
+  it.each([
+    ["queue checkpoint", 0, false],
+    ["dead-letter file", 8, true],
+  ] as const)("P2: the successor's %s is synced before the batch's ledger lines are written and synced", async (_target, load, mesh) => {
+    const { root, actors, fresh, archive, ledger } = await archiveAndSuccessor(load, mesh);
+    const directory = path.join(root, "actors", fresh.id);
+    const realOpen = fs.openSync as (...args: unknown[]) => number;
+    const realWrite = fs.writeSync as (...args: unknown[]) => number;
+    const realSync = fs.fsyncSync;
+    const opened = new Map<number, string>();
+    const events: Array<{ op: "write" | "fsync"; file: string; queued?: string[] }> = [];
+    const queuedOnDisk = () => (JSON.parse(fs.readFileSync(queueFile(root, fresh.id)!, "utf8")) as { items: Array<{ payload: { message?: string } }> })
+      .items.map(item => item.payload.message ?? "mesh");
+    vi.spyOn(fs, "openSync").mockImplementation(((...args: unknown[]) => {
+      const fd = realOpen(...args);
+      opened.set(fd, String(args[0]));
+      return fd;
+    }) as typeof fs.openSync);
+    vi.spyOn(fs, "writeSync").mockImplementation(((fd: number, ...rest: unknown[]) => {
+      const file = opened.get(fd) ?? "";
+      events.push({ op: "write", file, ...(file === ledger ? { queued: queuedOnDisk() } : {}) });
+      return realWrite(fd, ...rest);
+    }) as typeof fs.writeSync);
+    vi.spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
+      events.push({ op: "fsync", file: opened.get(fd) ?? "" });
+      realSync(fd);
+    });
+    let result: actorTypes.FabricActorRequeueResult;
+    try { result = await actors.requeueArchived(fresh.id, archive); } finally { vi.restoreAllMocks(); }
+    expect(result.requeued).toBe(4);
+    const synced = events.findIndex(({ op, file }) => op === "fsync" && path.dirname(file) === directory &&
+      (mesh ? path.basename(file) === "dead-letter.jsonl" : path.basename(file).startsWith("queue-")));
+    const written = events.findIndex(({ op, file }) => op === "write" && file === ledger);
+    expect(synced).toBeGreaterThanOrEqual(0);
+    expect(written).toBeGreaterThan(synced);
+    expect(events.findIndex(({ op, file }, index) => op === "fsync" && file === ledger && index > written)).toBeGreaterThan(written);
+    if (!mesh) {
+      // The queue file the ledger is about to name already holds the 4 archived items.
+      expect(events[written]!.queued).toEqual(["LIVE_WITH_PROGRESS", "LIVE_WITH_PROGRESS", "archived 0", "archived 1", "archived 2"]);
+    } else {
+      // Past the full queue and overflow, a durable host keeps the 3 routed events in the dead-letter file.
+      expect(deadLetterLines(root, fresh.id)).toHaveLength(3);
+    }
+    expect(ledgerLines(ledger).map(line => line.outcome)).toEqual(Array(4).fill("requeued"));
+    expect(result.notQueued).toEqual([]);
+  }, 60_000);
+
+  it("P3: a filtered line stays unresolved, so an archive the successor's filter skipped still blocks remove", async () => {
+    const { root, mesh, actors } = setup(10);
+    const old = await actors.create({ name: "filtered-old", instructions: "Supervise.", topics: [TOPIC], coalesce: false });
+    const releaseOld = await holdWorker(actors, root, old.id);
+    await publish(mesh, 0, true);
+    await waitFor(() => actors.status(old.id).queued === 1);
+    const { archive } = stopArchive(await actors.stop(old.id, undefined, false, "actors.stop", { dropQueued: true }));
+    releaseOld();
+    await waitFor(() => actors.inFlightCount() === 0);
+    const fresh = await actors.create({ name: "filtered-successor", instructions: "Supervise.", topics: ["queued-work.other"],
+      coalesce: false, activationFilter: WAIT_FILTER });
+    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 1, filtered: 1 });
+    const refusal = await actors.remove(old.id).catch((error: unknown) => error);
+    expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "remove", counts: { archived: 1 } });
+    expect(actors.status(old.id).status).toBe("stopped");
+    await expect(actors.remove(old.id, { dropQueued: true })).resolves.toMatchObject({ removed: true });
   }, 30_000);
 });
 

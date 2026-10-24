@@ -340,8 +340,17 @@ export interface FabricActorRequeueResult {
   superseded: number;
   /** Items an earlier call already offered; never offered twice. */
   alreadyRequeued: number;
-  /** Items that cannot be fed again (a rejected caller's ask, a non-mesh/host/direct source). */
+  /**
+   * Items that cannot be fed again (a rejected caller's ask, a non-mesh/host/direct source). A caller's ask is recorded
+   * as skipped in the archive's ledger, so it no longer blocks a plain remove (pi-fabric#1572 round 7).
+   */
   skipped: Array<{ itemId: string; source: string; reason: string }>;
+  /**
+   * Items the actor did not take (its queue and overflow are full, or it refused the item), and every later archived
+   * item, which waits behind them so archive order holds. None is recorded as offered: the archive still blocks a plain
+   * remove, and a later call offers them again (pi-fabric#1572 round 7).
+   */
+  notQueued: Array<{ itemId: string; source: string; reason: string }>;
 }
 
 /**

@@ -779,6 +779,13 @@ type StoppedQueueLine =
   | { format: 1; kind: "header"; actorId: string; actorName: string; rootId: string; stoppedAt: number; counts: FabricActorQueueCounts }
   | { kind: "in-flight" | "queued" | "overflow" | "parked" | "settled"; item: Record<string, unknown> }
   | { kind: "dead-letter"; entry?: ActorDeadLetter; raw?: string };
+/** A line's outcome in an archive's requeue ledger, <archive>.requeued.jsonl (smarty-dev#16416; skipped: pi-fabric#1572 round 7). */
+type RequeueLedgerOutcome = "requeued" | "filtered" | "superseded" | "skipped";
+/**
+ * Round 7 (pi-fabric#1572 P3): the ledger outcomes that leave nothing of the item outstanding for the remove guard: it was
+ * queued, a newer queued item covers it, or it is a caller's ask that is never fed again. A filtered item is not.
+ */
+const RESOLVED_REQUEUE_OUTCOMES: ReadonlySet<unknown> = new Set<RequeueLedgerOutcome>(["requeued", "superseded", "skipped"]);
 /**
  * pi-fabric#1572 round 3: the stop records next to the archives, in <actor dir>/stopped-queues/. The manager appends
  * one per archive, with the same path and sha256 as the MOVED-TO message; a removal moves it to session-archive/
@@ -3939,8 +3946,13 @@ export class ActorManager {
 
   /**
    * smarty-dev#16416: feed a stop archive to a (recreated) actor through its normal arrival path,
-   * activation filter included, once per archived item. <actor dir>/requeued-archives.jsonl records
-   * every item id offered, so a second call with the same archive offers nothing again.
+   * activation filter included, once per archived item. <archive>.requeued.jsonl records every item id
+   * offered, so a second call with the same archive offers nothing again.
+   * Round 7 (pi-fabric#1572, fabric-store F1): a full target refuses an item (holdWhenFull) instead of dropping it. That
+   * item, and every later one (archive order holds), is reported in notQueued and gets no ledger line, so the archive
+   * still blocks a plain remove and a later call offers it again. The target's queue is checkpointed durably BEFORE the
+   * batch's ledger lines are written and synced: a crash between the two can only offer an item twice, never record
+   * one that is not queued. A queued caller's ask, never fed again, is recorded as skipped (round 7 P3).
    */
   async requeueArchived(id: string, archive: string, beforeCommit?: (id: string) => void): Promise<FabricActorRequeueResult> {
     const actor = this.#requireOwnedActiveActor(id);
@@ -3971,28 +3983,51 @@ export class ActorManager {
       }
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     beforeCommit?.(actor.id);
-    const result: FabricActorRequeueResult = { id: actor.id, archive: file, sha256, requeued: 0, filtered: 0, superseded: 0, alreadyRequeued: 0, skipped: [] };
-    fs.mkdirSync(path.dirname(ledger), { recursive: true, mode: 0o700 });
-    const fd = fs.openSync(ledger, "a", 0o600);
+    const result: FabricActorRequeueResult = { id: actor.id, archive: file, sha256, requeued: 0, filtered: 0, superseded: 0, alreadyRequeued: 0,
+      skipped: [], notQueued: [] };
+    const entries: Array<{ itemId: string; outcome: RequeueLedgerOutcome }> = [];
+    let refusedAt: string | undefined;
+    let meshLanded = false;
     try {
       for (const line of lines.slice(1)) {
         const offer = this.#archivedOffer(line);
         if (!offer) continue;
+        if (offer.skip) {
+          result.skipped.push({ itemId: offer.itemId, source: offer.source, reason: offer.skip });
+          // Round 7 P3: a queued caller's ask is never fed again (its caller was answered at stop), so its skipped line
+          // resolves it for the remove guard. Any other skipped item stays unrecorded and keeps the archive blocking.
+          if (offer.callerAsk && !offered.has(offer.itemId)) { entries.push({ itemId: offer.itemId, outcome: "skipped" }); offered.add(offer.itemId); }
+          continue;
+        }
         if (offered.has(offer.itemId)) { result.alreadyRequeued++; continue; }
-        if (offer.skip) { result.skipped.push({ itemId: offer.itemId, source: offer.source, reason: offer.skip }); continue; }
-        let outcome: "requeued" | "filtered" | "superseded";
+        let outcome: RequeueLedgerOutcome;
         if (this.#skipOnArrival(actor, offer.source, offer.payload) ||
             (offer.source.startsWith("mesh:") && this.#hasProcessedKey(actor, offer.source, offer.payload))) {
           outcome = "filtered";
           result.filtered++;
+        } else if (refusedAt !== undefined) {
+          // Archive order holds: nothing lands ahead of an earlier archived item the target could not take.
+          result.notQueued.push({ itemId: offer.itemId, source: offer.source, reason: `behind ${refusedAt}, which could not be queued` });
+          continue;
         } else {
           // The normal callerless arrival: no resolve/reject, binding or outcome of the requeue caller, and
           // no sender but the archived one. archived: appended in archive order; an old item never replaces
-          // newer queued work with its coalesce key (it is then superseded by that newer item).
+          // newer queued work with its coalesce key (it is then superseded by that newer item). holdWhenFull
+          // (round 7, fabric-store F1): a full queue and overflow throw here instead of dropping the item.
           const mesh = offer.source.startsWith("mesh:");
-          const queued = this.#enqueue(actor, offer.source, offer.payload, mesh
-            ? { ...this.#meshEnqueueOptions(actor, offer.payload as MeshEvent), archived: true, deferDrain: true }
-            : { ownershipChecked: true, sender: offer.sender ?? null, ...(offer.images?.length ? { images: offer.images } : {}), archived: true, deferDrain: true });
+          let queued: ActorQueueItem;
+          try {
+            queued = this.#enqueue(actor, offer.source, offer.payload, mesh
+              ? { ...this.#meshEnqueueOptions(actor, offer.payload as MeshEvent), archived: true, deferDrain: true, holdWhenFull: true }
+              : { ownershipChecked: true, sender: offer.sender ?? null, ...(offer.images?.length ? { images: offer.images } : {}), archived: true,
+                deferDrain: true, holdWhenFull: true });
+          } catch (error) {
+            refusedAt = offer.itemId;
+            result.notQueued.push({ itemId: offer.itemId, source: offer.source, reason: errorText(error) });
+            continue;
+          }
+          // A durable host keeps a routed event past the full queue in its dead-letter file (#enqueue's archived contract).
+          if (mesh) meshLanded = true;
           if (mesh && (queued.payload as { id?: unknown } | undefined)?.id !== (offer.payload as MeshEvent).id) {
             outcome = "superseded";
             result.superseded++;
@@ -4001,18 +4036,41 @@ export class ActorManager {
             result.requeued++;
           }
         }
-        fs.writeSync(fd, `${JSON.stringify({ itemId: offer.itemId, archive: file, sha256, target: actor.id, outcome, at: Date.now() })}\n`);
+        entries.push({ itemId: offer.itemId, outcome });
         offered.add(offer.itemId);
       }
-      fs.fsyncSync(fd);
+      // Round 7 (fabric-store P2): what the ledger will call queued is durable first (the queue checkpoint, and the
+      // dead-letter file a routed event spilled to), so a crash before the ledger is synced can only offer an item twice.
+      if (this.#persistent && result.requeued + result.superseded > 0) {
+        let spill: number | undefined;
+        if (meshLanded) try { spill = fs.openSync(this.#deadLetterFile(actor.id), "r+"); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        if (spill !== undefined) try { fs.fsyncSync(spill); } finally { fs.closeSync(spill); }
+        if (!this.#persistQueue(actor.id, true)) {
+          throw new Error(`requeueArchived could not durably checkpoint ${actor.name}'s queue (${actor.lastError ?? "queue file not written"}); ` +
+            `${result.requeued + result.superseded} item(s) from ${file} are queued in memory but not recorded in ${ledger}, so a later ` +
+            `requeueArchived may offer them again`);
+        }
+      }
+      if (entries.length) {
+        fs.mkdirSync(path.dirname(ledger), { recursive: true, mode: 0o700 });
+        const fd = fs.openSync(ledger, "a", 0o600);
+        try {
+          const at = Date.now();
+          fs.writeSync(fd, entries.map(({ itemId, outcome }) => `${JSON.stringify({ itemId, archive: file, sha256, target: actor.id, outcome, at })}\n`).join(""));
+          fs.fsyncSync(fd);
+        } finally { fs.closeSync(fd); }
+      }
     } finally {
-      fs.closeSync(fd);
       if (result.requeued) this.#ensureDrain(actor);
     }
     this.#recordMessage(actor, {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "in", source: "actor:requeue-archived", createdAt: Date.now(),
-      reason: `requeued ${result.requeued} item(s) from ${file} (sha256 ${sha256})`,
-      data: { requeued: result.requeued, filtered: result.filtered, superseded: result.superseded, alreadyRequeued: result.alreadyRequeued, skipped: result.skipped.length },
+      reason: `requeued ${result.requeued} item(s) from ${file} (sha256 ${sha256})` +
+        (result.notQueued.length ? `; ${result.notQueued.length} could not be queued and stay unrecorded` : ""),
+      data: { requeued: result.requeued, filtered: result.filtered, superseded: result.superseded, alreadyRequeued: result.alreadyRequeued,
+        skipped: result.skipped.length, notQueued: result.notQueued.length },
     });
     return result;
   }
@@ -4061,7 +4119,7 @@ export class ActorManager {
     if (!recorded) throw refuse(`actor ${actorId}'s message log holds no stop record of this file with sha256 ${sha256}`);
   }
 
-  #archivedOffer(line: StoppedQueueLine): { itemId: string; source: string; payload: unknown; sender?: FabricMessageSender; images?: ImageContent[]; skip?: string } | undefined {
+  #archivedOffer(line: StoppedQueueLine): { itemId: string; source: string; payload: unknown; sender?: FabricMessageSender; images?: ImageContent[]; skip?: string; callerAsk?: true } | undefined {
     if (line.kind === "header") return undefined;
     if (line.kind === "dead-letter") {
       const entry = line.entry;
@@ -4076,7 +4134,7 @@ export class ActorManager {
     const itemId = typeof item.id === "string" ? item.id : `unknown:${createHash("sha256").update(JSON.stringify(item)).digest("hex")}`;
     const source = typeof item.source === "string" ? item.source : "unknown";
     const base = { itemId, source, payload: item.payload, ...(item.sender ? { sender: item.sender } : {}), ...(Array.isArray(item.images) ? { images: item.images } : {}) };
-    if (item.caller === true) return { ...base, skip: "a caller's ask, rejected when the actor stopped" };
+    if (item.caller === true) return { ...base, skip: "a caller's ask, rejected when the actor stopped", callerAsk: true };
     if (item.unserializable === true) return { ...base, skip: "its payload could not be archived" };
     if (!source.startsWith("mesh:") && !source.startsWith("host:") && source !== "direct") return { ...base, skip: `source ${source} is not fed again` };
     if (source.startsWith("mesh:") && typeof (item.payload as { id?: unknown } | undefined)?.id !== "string") return { ...base, skip: "a mesh item without an event id" };
@@ -4314,7 +4372,11 @@ export class ActorManager {
     this.#assertRemovalKeepsNoWork(actorId);
   }
 
-  /** Round 6 (astra F2): only a fully readable archive and ledger prove there is no archived work left. */
+  /**
+   * Round 6 (astra F2): only a fully readable archive and ledger prove there is no archived work left. Round 7
+   * (pi-fabric#1572): an item is done only by a requeued, superseded or skipped (caller's ask) line; a filtered line,
+   * or none (an item a full target could not take), leaves the archive blocking.
+   */
   #stopArchiveFullyRequeued(file: string): boolean {
     try {
       const bytes = fs.readFileSync(file);
@@ -4325,9 +4387,9 @@ export class ActorManager {
       if (!header || header.kind !== "header" || header.format !== 1) return false;
       const offered = new Set<string>();
       for (const line of fs.readFileSync(file.replace(/\.jsonl$/, ".requeued.jsonl"), "utf8").split("\n").filter(Boolean)) {
-        const value = JSON.parse(line) as { itemId?: unknown } | null;
+        const value = JSON.parse(line) as { itemId?: unknown; outcome?: unknown } | null;
         if (!value || typeof value.itemId !== "string") return false;
-        offered.add(value.itemId);
+        if (RESOLVED_REQUEUE_OUTCOMES.has(value.outcome)) offered.add(value.itemId);
       }
       return lines.slice(1).every(line => {
         const offer = this.#archivedOffer(line);

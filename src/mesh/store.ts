@@ -6,11 +6,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { delay, MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import type { LockTimingContext } from "./commit-stats.js";
 import { isNamespaceRace } from "../core/atomic-write.js";
 import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } from "./state-file.js";
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
-  type StateBackendDiagnostics } from "./state-backend.js";
+  type StateBackendDiagnostics, type StateChangeExceptions } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
 import { closeResidentWakeRetryCursor, indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
 import { writeFileAtomic } from "../core/atomic-write.js";
@@ -363,7 +364,7 @@ let unreadableStateRevisions = 0;
 
 /** The SQLite backend's revision views (SqliteStateBackend), reached without a value import. */
 interface SqliteStateViews {
-  unchangedSince(stamp: string, prefixes: readonly string[]): boolean;
+  unchangedSince(stamp: string, prefixes: readonly string[], exceptKeys?: StateChangeExceptions): boolean;
   stateView(): { stamp: string; view: MeshBatchView };
 }
 
@@ -581,10 +582,10 @@ export class MeshStore {
     return event;
   }
 
-  async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
+  async publishBatch(inputs: MeshPublishInput[], lockTiming?: LockTimingContext): Promise<MeshEvent[]> {
     const stamped = inputs.map((input) => ({ ...input, sender: input.sender ?? processSender() }));
     if (this.#scheduleDue()) await this.releaseDueSchedules().catch(() => undefined);
-    const events = await this.#events.publishBatch(stamped);
+    const events = await this.#events.publishBatch(stamped, lockTiming);
     await this.#wakeAfterPublish(events);
     return events;
   }
@@ -994,8 +995,8 @@ export class MeshStore {
    * The R20 write fence (StateBackend.withWriteFence): `operation` runs synchronously while no state
    * commit can happen. Only with `.lock` held or no lock at all: never take `.lock` inside it.
    */
-  withStateWriteFence<T>(operation: () => T): T {
-    return this.#state.withWriteFence(operation);
+  withStateWriteFence<T>(operation: () => T, timing?: LockTimingContext): T {
+    return this.#state.withWriteFence(operation, timing);
   }
 
   stateStamp(): string | undefined {
@@ -1019,9 +1020,9 @@ export class MeshStore {
    * smarty-dev#10391, sqlite only: whether no key under `prefixes` changed after `revision` (a `stateRevision()`),
    * from the change feed, cheap enough to run in `withStateWriteFence`. False on other backends or when unknown.
    */
-  stateUnchangedSince(revision: string, prefixes: readonly string[]): boolean {
+  stateUnchangedSince(revision: string, prefixes: readonly string[], exceptKeys?: StateChangeExceptions): boolean {
     const state = this.#sqliteState();
-    return state !== undefined && state.unchangedSince(revision, prefixes);
+    return state !== undefined && state.unchangedSince(revision, prefixes, exceptKeys);
   }
 
   /** smarty-dev#10391, sqlite only: a read-only view of the committed state now and its `stateRevision()`. */
@@ -1073,7 +1074,11 @@ export class MeshStore {
    * A foreign commit gate is never PID/age-recovered: a paused synchronous CAS must finish
    * before recovery can change its receipt. Async lease-owned transactions retain this gate until
    * settled; recovery requires matching machine identity and death/current-boot evidence.
-   * Without boot identity, only ESRCH plus the custody staleness bound permits recovery;
+   * Without boot identity, only ESRCH plus the custody staleness bound permits recovery. Without a
+   * machine id (Windows, macOS, a Linux without one), a record naming this host whose PID is gone
+   * or now another process (another native incarnation) permits it; one with no or an invalid
+   * incarnation (a failed or not yet settled native read) only when its PID is gone (pi-fabric#1562; custody-lock.ts
+   * clearDeadCustodyLock);
    * a missing owner pid is an alarmed typed refusal, never an ordinary busy timeout. */
   async leaseCustody<T>(file: string, operation: () => T | Promise<T>, lockTimeoutMs = 0,
     options: { ownIncarnation?: string | undefined } = {}): Promise<T> {

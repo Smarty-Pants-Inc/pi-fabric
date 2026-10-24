@@ -240,6 +240,20 @@ describe("persistent old-root settlement (#12785)", () => {
     expect(f.store.records()[0]!.sessionOrphan).not.toHaveProperty("directorySettlement");
   });
 
+  // pi-fabric#1562 review P1: settlement takes the participant namespace receipt first (zero-wait
+  // withParticipantFilesTryLock). Its preparation recovered only the two keys, so a dead namespace holder (a
+  // mirror killed mid-pass) refused every settlement pass until some other writer happened to recover it.
+  it("prepares a dead holder's participant namespace receipt before its namespace-first settlement", async () => {
+    const f = await fixture();
+    const lock = path.join(f.root, "participant-namespace", ".namespace");
+    fs.mkdirSync(lock, { recursive: true });
+    fs.writeFileSync(path.join(lock, "owner"), `${missingPid()}\n1\ndead-mirror\n`);
+    await f.repair.reconcile();
+    // 2dde3878: { status: "running" }, on this pass and every later one.
+    expect(f.mesh.get(f.legacy, { fresh: true })?.value).toMatchObject({ status: "stopped", stopReason: "owner-root-gone" });
+    expect(fs.existsSync(lock)).toBe(false);
+  });
+
   it("does not wait on an actual publisher holding the actor participant key", async () => {
     const f = await fixture(); const incarnation = await ownProcessIncarnation();
     const batch = f.mesh.writeBatch.bind(f.mesh); let held = false;

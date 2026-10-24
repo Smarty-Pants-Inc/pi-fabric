@@ -59,3 +59,17 @@ activity counters) can also appear. Readers must ignore fields they do not know.
 | 0 | The array is on standard output. |
 | 1 | An unexpected error, for example a `state.json` it cannot read. |
 | 2 | A named error on standard error: `FABRIC_MESH_MISSING` (the mesh directory does not exist), `FABRIC_MESH_UNREADABLE` (`state.json` does not parse) or `FABRIC_USAGE` (a bad flag). |
+
+## A participant lock with an unreadable owner
+
+Participant writes take a per-key lock under `participants/.locks/` and, for additions, the namespace lock
+`participant-namespace/.namespace`. Each lock is a directory with an `owner` file, written and synced to disk before the
+lock is published. Fabric clears a lock whose recorded owner process is gone. It never clears a lock whose `owner` is
+empty or unreadable, because it cannot prove the holder dead. Only a host crash on a release without the owner sync can
+leave one.
+
+If such a lock blocks participant writes (`ParticipantFileLockBusyError` on every add or bridge pass):
+
+1. Confirm that no process holds it: `<lock>/owner` is empty or torn, and no Fabric process on the host is mid-write.
+2. Rename the lock directory aside, for example to `<lock>.<UTC stamp>.operator-dead`. Never delete it.
+3. The next write takes the lock afresh.

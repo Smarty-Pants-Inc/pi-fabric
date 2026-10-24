@@ -31,6 +31,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout, MeshLockTimeoutError,
   MESH_STATE_WAL_CAP_CODE, isMeshStateWalCap } from "../core/atomic-write.js";
+import type { LockTimingContext } from "./commit-stats.js";
 import type { MeshIdentity } from "./event-log.js";
 import { isMeshStateBackendKind, MESH_STATE_BACKEND_KIND_LIST, type MeshStateBackendKind } from "./state-backend-kinds.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
@@ -134,6 +135,8 @@ export interface StateBackendBatchInput {
   beforeCommit?: () => void;
   /** Lock-stats class for the bridge's own writes; never inferred from the identity text. */
   lockClass?: "bridge";
+  /** Low-cardinality diagnostic labels; never inferred from caller-supplied identity or payloads. */
+  lockTiming?: LockTimingContext;
   /** R11: file reads before the transaction, re-checked by stamp inside it. */
   fileRead?: MeshStateFileRead;
   /** R11: file effects after COMMIT (L2b's outbox). */
@@ -201,6 +204,11 @@ export interface StateDivergence {
  * `writeSignal`, and a timeout is a `MeshLockTimeoutError` (`MeshStateBusy` for sqlite). Each write
  * is atomic: all of it commits or none of it does.
  */
+export type StateChangeExceptions = ReadonlySet<string> | ReadonlyMap<string, number> | {
+  readonly ignore: ReadonlySet<string>;
+  readonly versions: ReadonlyMap<string, number>;
+};
+
 export interface StateBackend {
   readonly kind: MeshStateBackendKind;
   /** Native opened-connection attestation; absence is unsupported for enforced slot admission. */
@@ -235,7 +243,7 @@ export interface StateBackend {
    * attempt, `operation` on that snapshot, ROLLBACK; a busy write lock throws `MeshStateBusyError`
    * before `operation` runs (nothing happened: retry after releasing `.lock`).
    */
-  withWriteFence<T>(operation: () => T): T;
+  withWriteFence<T>(operation: () => T, timing?: LockTimingContext): T;
 
   /**
    * Durability barrier (smarty-dev#9313): resolves once every state commit made before the call, by
@@ -720,7 +728,7 @@ export class SqliteStateBackend implements StateBackend {
     return { stamp: snapshot.stamp, view: snapshotView(() => snapshot) };
   }
 
-  unchangedSince(stamp: string, prefixes: readonly string[]): boolean {
+  unchangedSince(stamp: string, prefixes: readonly string[], exceptKeys?: StateChangeExceptions): boolean {
     const store = this.#read(() => this.#open());
     const current = store.stateStamp();
     if (current === stamp) return true;
@@ -728,7 +736,13 @@ export class SqliteStateBackend implements StateBackend {
     const after = Number(stamp.slice(lineage.length + 1));
     if (lineageOf(current) !== lineage || !Number.isSafeInteger(after)) return false;
     const feed = this.#read(() => store.changesSince(after));
-    return feed.complete && !feed.changes.some(change => prefixes.some(prefix => change.key.startsWith(prefix)));
+    const pair = exceptKeys !== undefined && "ignore" in exceptKeys && "versions" in exceptKeys ? exceptKeys : undefined;
+    const expectedVersions: ReadonlyMap<string, number> | undefined = pair ? pair.versions
+      : exceptKeys instanceof Map ? exceptKeys : undefined;
+    const ignored: ReadonlySet<string> | undefined = pair ? pair.ignore
+      : exceptKeys instanceof Set ? exceptKeys : undefined;
+    return feed.complete && !feed.changes.some(change => prefixes.some(prefix => change.key.startsWith(prefix)) &&
+      !ignored?.has(change.key) && (!expectedVersions || change.version > (expectedVersions.get(change.key) ?? -1)));
   }
 
   // ------------------------------------------------------------ writes
@@ -771,6 +785,7 @@ export class SqliteStateBackend implements StateBackend {
           ...(input.afterCommit ? { afterCommit: input.afterCommit } : {}),
           ...(input.beforeCommit || this.#slotClaimGuard ? { beforeCommit } : {}),
           ...(input.lockClass ? { lockClass: input.lockClass } : {}),
+          ...(input.lockTiming ? { lockTiming: input.lockTiming } : {}),
         }));
       } catch (error) {
         if (error !== FILE_READ_CHANGED) throw error;
@@ -797,11 +812,11 @@ export class SqliteStateBackend implements StateBackend {
     await this.#write((store) => store.confirmWritable(onAcquired));
   }
 
-  withWriteFence<T>(operation: () => T): T {
+  withWriteFence<T>(operation: () => T, timing?: LockTimingContext): T {
     const store = this.#read(() => this.#open());
     let entered = false;
     try {
-      return store.fenceSync(() => { entered = true; return operation(); });
+      return store.fenceSync(() => { entered = true; return operation(); }, timing);
     } catch (error) {
       if (entered || !(error instanceof MeshLockTimeoutError) || error instanceof MeshStateBusyError) throw error;
       this.#busyTimeouts += 1;
@@ -1134,7 +1149,7 @@ export class ShadowStateBackend implements StateBackend {
 
   // state.json is the authority and its writers take `.lock`; the shadow database is never read
   // for a decision, so fencing it would only add busy refusals.
-  withWriteFence<T>(operation: () => T): T { return this.#file.withWriteFence(operation); }
+  withWriteFence<T>(operation: () => T, timing?: LockTimingContext): T { return this.#file.withWriteFence(operation, timing); }
 
   // state.json is the authority; the shadow database is a copy rebuilt from it, so only the file syncs.
   sync(budgetMs: number): Promise<void> { return this.#file.sync(budgetMs); }

@@ -363,9 +363,11 @@ export class NatsLocalProjection {
     if (record.ownerIncarnation === undefined || entry.owner !== `${record.ownerHostId}#${record.ownerIncarnation}`) return;
     this.#participantKeysByKv.set(entry.key, participantKey(record.id));
     const marker = markerFor(entry);
-    let wrote = false;
-    await writeParticipantFileIf(this.options.mesh, key, current => {
-      this.#participantReconcileReads++;
+    // One reconciliation read per write attempt, even when an identity-changing update re-decides
+    // under the namespace gate (writeParticipantFileIf decides under every hold that writes, #13645 N1).
+    this.#participantReconcileReads++;
+    // Count only a write that happened: a first-hold decision can be refused again in the second hold.
+    if (await writeParticipantFileIf(this.options.mesh, key, current => {
       if (!this.options.leaseLive()) return undefined;
       const currentMarker = markerOf(current);
       if (current && object(current.value) && current.value.remoteHost !== undefined) {
@@ -380,7 +382,6 @@ export class NatsLocalProjection {
             key, value: record, version: entry.revision, updatedAt: record.updatedAt,
             updatedBy: participantIdentity(record), [MARKER]: marker,
           };
-          wrote = true;
           return projected;
         }
       } else if (current) {
@@ -394,10 +395,8 @@ export class NatsLocalProjection {
         key, value: record, version: entry.revision, updatedAt: record.updatedAt,
         updatedBy: participantIdentity(record), [MARKER]: marker,
       };
-      wrote = true;
       return projected;
-    });
-    if (wrote) this.#participantWrites++;
+    })) this.#participantWrites++;
   }
 
   #readHostMarker(hostId: string): NatsProjectionMarker | undefined {

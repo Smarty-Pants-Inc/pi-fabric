@@ -8,7 +8,9 @@ import { watchBridgeStore } from "../mesh/change-notifier.js";
 import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../agents/peer-lease-stale.js";
 import type { MeshStateEntry } from "../mesh/store.js";
 import { TransportUnavailableError, type TransportKv, type TransportKvEntry, type TransportOwner } from "../transport/types.js";
-import { HostLeaseLockBusyError, HostLeaseLockLostError, withHostLeaseLock, type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
+import { HostLeaseLockBusyError, HostLeaseLockLostError,
+  hostLeaseAdditionsGatePath, withHostLeaseLock,
+  type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
 
 // Host lease renewals outside the shared state (smarty-dev#816). Every heartbeat rewrote the
 // whole shared state under the one mesh lock, and heartbeats were 78% of all locked writes. Each
@@ -267,6 +269,37 @@ const fileName = (hostId: string): string =>
 export const hostLeasePath = (meshRoot: string, hostId: string): string =>
   path.join(meshRoot, LEASE_DIR, fileName(hostId));
 
+/** Holds the additions namespace and every existing per-host lease gate in path order.
+ * Call before reading lease JSON; additions are blocked by the namespace gate and replacements
+ * are blocked by their target gate until the caller releases custody after COMMIT. */
+/** Locks the namespace and only lease receipts that can affect this mirror's authority. Callers
+ * pass the identities they will admit; omitting the filter is reserved for full reaper custody. */
+export const withHostLeaseDirectoryCustody = <T>(mesh: HostLeaseMesh,
+  operation: () => T | Promise<T>, relevantIds?: ReadonlySet<string>): Promise<T> =>
+  mesh.leaseCustody(hostLeaseAdditionsGatePath(mesh.root), async () => {
+    const directory = path.join(mesh.root, LEASE_DIR);
+    let names: string[];
+    try { names = fs.readdirSync(directory).filter(name => /^[0-9a-f]{32}\.json$/.test(name)).sort(); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") names = []; else throw error; }
+    const relevant = relevantIds === undefined ? undefined : new Set<string>();
+    if (relevant && relevantIds) {
+      for (const id of relevantIds) {
+        const file = hostLeasePath(mesh.root, id);
+        if (fs.existsSync(file)) relevant.add(path.basename(file));
+      }
+      for (const lease of readHostLeases(mesh.root).values()) {
+        if (relevantIds.has(lease.id) || relevantIds.has(lease.rootId) || relevantIds.has(lease.identityId)) {
+          relevant.add(path.basename(hostLeasePath(mesh.root, lease.id)));
+        }
+      }
+    }
+    const files = names.filter(name => relevant === undefined || relevant.has(name)).map(name => path.join(directory, name));
+    const acquire = (index: number): Promise<T> => index === files.length
+      ? Promise.resolve().then(operation)
+      : mesh.leaseCustody(files[index]!, () => acquire(index + 1));
+    return acquire(0);
+  });
+
 export const writeHostLease = (meshRoot: string, lease: FabricHostLease): void =>
   writeJsonAtomic(hostLeasePath(meshRoot, lease.id), { format: 1, ...lease });
 
@@ -324,6 +357,9 @@ export const withOwnedHostLease = async <T>(mesh: HostLeaseMesh, owner: FabricHo
   const file = hostLeasePath(mesh.root, owner.id);
   let entered = false;
   try {
+    // An owned mutation never adds a lease filename: its owner's file must already exist (asserted
+    // first, under the gate), so only the per-host gate applies, as on main. Additions custody is
+    // for creators (withHostLeaseLock -> withHostLeaseFileCustody).
     return await mesh.leaseCustody(file, async () => {
       entered = true;
       assertHostLeaseOwner(mesh.root, owner);
@@ -443,6 +479,17 @@ export const removeOwnedHostLease = async (mesh: HostLeaseMesh, owner: FabricHos
 /** The exact observed renewal version, including deadlines/session metadata, not only its UUID. */
 export const sameHostLeaseVersion = (left: FabricHostLease | undefined, right: FabricHostLease | undefined): boolean =>
   JSON.stringify(left) === JSON.stringify(right);
+
+/** Exact-version atomic replacement. Caller holds the target lease-custody gate through this check/write. */
+export const writeHostLeaseVersionIf = (meshRoot: string, expected: FabricHostLease | undefined,
+  replacement: FabricHostLease): boolean => {
+  if (expected && expected.id !== replacement.id) return false;
+  const file = hostLeasePath(meshRoot, replacement.id);
+  const current = readHostLeaseCurrent(meshRoot, replacement.id);
+  if (!sameHostLeaseVersion(current, expected) || (!current && fs.existsSync(file))) return false;
+  writeHostLease(meshRoot, replacement);
+  return true;
+};
 
 /** Reaper compare-and-delete. Caller holds the TARGET's leaseCustody gate, as renew/claim do.
  * The detached-file check also keeps an unfenced historical replacement rather than unlinking it. */
@@ -607,6 +654,26 @@ export const hostLeasesStamp = (meshRoot: string): string | undefined => {
     const stat = fs.statSync(path.join(meshRoot, LEASE_DIR), { bigint: true });
     return `${stat.ino}:${stat.mtimeNs}:${stat.ctimeNs}`;
   } catch {
+    return undefined;
+  }
+};
+
+/** Cheap mutation stamp for a mirror plan: no lease JSON is opened or parsed. Every supported
+ * lease writer replaces or removes a directory entry atomically. POSIX directory metadata is one
+ * stat; Windows requires an entry listing and metadata-only stat of each lease file. */
+export const hostLeaseDirectoryStamp = (meshRoot: string): string | undefined => {
+  const dir = path.join(meshRoot, LEASE_DIR);
+  try {
+    if (process.platform !== "win32") {
+      const stat = fs.statSync(dir, { bigint: true });
+      return `${stat.dev}:${stat.ino}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    }
+    return fs.readdirSync(dir).filter(name => name.endsWith(".json")).sort().map(name => {
+      const stat = fs.statSync(path.join(dir, name), { bigint: true });
+      return `${name}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    }).join("|");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "absent";
     return undefined;
   }
 };

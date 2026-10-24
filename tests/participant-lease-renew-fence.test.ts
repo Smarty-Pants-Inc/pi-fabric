@@ -7,6 +7,7 @@ import { MeshStore } from "../src/mesh/store.js";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { hostLeasePath, readHostLeaseCurrent } from "../src/topology/host-leases.js";
+import { hostLeaseAdditionsGatePath } from "../src/topology/host-lease-lock.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -59,7 +60,10 @@ describe.each(["file", "sqlite"] as const)("%s host-lease owner fence (smarty-de
       await expect(directory.start()).rejects.toMatchObject({ busyCode: "FABRIC_HOST_LEASE_LOCK_BUSY" });
       await vi.advanceTimersByTimeAsync(1_000);
       expect(directory.canConsumeMesh()).toBe(false);
-      expect(attempts).toHaveBeenCalledOnce(); // <= 2, even across the preparation budget
+      // smarty-dev#13645 (option B, BUILD-mirror-custody3 P1-a: every lease writer uses the same gates,
+      // including additions): a first lease is an addition, so its one attempt takes the additions gate,
+      // then the contended host gate, once each. No retry of either, even across the preparation budget.
+      expect(attempts.mock.calls.map(([file]) => file)).toEqual([hostLeaseAdditionsGatePath(root), hostLeasePath(root, hostId)]);
       expect(timers).not.toHaveBeenCalled();
     } finally { release(); await holder; }
 

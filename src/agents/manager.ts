@@ -2793,7 +2793,9 @@ export class AgentManager {
           try { source = this.#shortTmpdirSource(); shortTmpdir = allocateShortTmpdir(id, source); }
           catch (error) { shortTmpdir = undefined; if (!source) sourceError = error; }
           // Lockout-safe: nothing fits, so keep the old run-tree TMPDIR (today's behaviour, never a refusal), but loudly.
-          if (!shortTmpdir && process.platform !== "win32") this.#shortTmpdirUnavailable(logFile, id, runner, source, sourceError);
+          if (!shortTmpdir && process.platform !== "win32") {
+            policyWarnings.push(this.#shortTmpdirUnavailable(logFile, id, runner, source, sourceError));
+          }
         }
         const tmpdir = shortTmpdir ?? (applyActorWritePolicy || applyTaskWriteDefault ? path.join(runDirectory, "tmp") : undefined);
         if (tmpdir && !shortTmpdir) mkdirPrivate(tmpdir, this.#trustRoot());
@@ -4710,7 +4712,7 @@ export class AgentManager {
    * held permits (the stderr diagnostics line plus onAdmissionAlarm, which Main publishes to its owner as a
    * fabric.alarm.agent-admission event), at most once per caller TMPDIR per 6 h. A failure to warn never blocks the launch.
    */
-  #shortTmpdirUnavailable(logFile: string, id: string, runner: string, source: ShortTmpdirSource | undefined, sourceError: unknown): void {
+  #shortTmpdirUnavailable(logFile: string, id: string, runner: string, source: ShortTmpdirSource | undefined, sourceError: unknown): string {
     try {
       const budgetBytes = source?.budgetBytes ?? BASH_GUARD_TMPDIR_BYTES;
       let candidates: { directory: string; bytes: number; fits: boolean }[] = [];
@@ -4720,19 +4722,23 @@ export class AgentManager {
         : candidates.length === 0 ? "no candidate root"
         : candidates.some(candidate => candidate.fits) ? "the candidate that fits is not under a private directory of ours, or could not be created"
         : `the shortest candidate needs ${Math.min(...candidates.map(candidate => candidate.bytes))} bytes for the guard's p.XXXXXX, over its ${budgetBytes}`;
+      const fallbackTmpdir = path.join(this.#runRoot, id, "tmp");
+      const warning = "tmpdir: short private TMPDIR unavailable (no suitable private candidate); child launched on " + fallbackTmpdir + " and bash may be refused by the fleet guard";
       const message = `FABRIC_SHORT_TMPDIR_UNAVAILABLE: run ${id}: no private short TMPDIR under ${root} fits the fleet bash guard (${reason}); ` +
         "it launched on its run directory's tmp, where the guard is likely to block its Bash (smarty-dev#15878)";
       const now = Date.now();
       fs.appendFileSync(logFile, JSON.stringify({ type: "tmpdir.short_unavailable", level: "warning", code: "FABRIC_SHORT_TMPDIR_UNAVAILABLE",
         ts: now, id, runner, budgetBytes, candidates, warning: message }) + "\n", { mode: 0o600 });
       const last = this.#shortTmpdirAlarmAt.get(root);
-      if (last !== undefined && now - last < ADMISSION_REALARM_MS) return;
+      if (last !== undefined && now - last < ADMISSION_REALARM_MS) return warning;
       this.#shortTmpdirAlarmAt.set(root, now);
       diagnostics.warn("src/agents/manager.ts", `[pi-fabric] ${message}`);
       const alarm: AgentAdmissionAlarm = { kind: "short-tmpdir-unavailable", runId: id, heldPermits: this.heldPermits(),
         maxConcurrent: this.config.maxConcurrent, at: now, message };
       try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
+      return warning;
     } catch { /* warning only: the launch proceeds on its old TMPDIR */ }
+    return "tmpdir: short private TMPDIR unavailable (diagnostic failed); child launched on " + path.join(this.#runRoot, id, "tmp") + " and bash may be refused by the fleet guard";
   }
   /** Recover only this actor's fenced sources under the configured host run root. */
   actorArchiveSources(actorId: string, sessionFile: string): Map<string, string> {

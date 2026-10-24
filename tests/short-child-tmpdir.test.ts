@@ -177,6 +177,16 @@ describe.skipIf(process.platform === "win32")("short private child TMPDIR (smart
       expect(admissionAlarmEnvelope({ kind: "recovered-answer-save-failed" })).toEqual({ topic: "ops.owner", kind: "actor.alarm" });
     });
 
+    it("returns the no-fit TMPDIR warning to the caller and status while the child launches", async () => {
+      const f = fixture(layout, { nothingFits: true });
+      const { result } = await report(f, { runner: "pi", actorId: "actor" });
+      const tmpdirWarning = expect.stringContaining("tmpdir: short private TMPDIR unavailable (");
+      expect(result.status).toBe("completed");
+      expect(result.warnings).toEqual(expect.arrayContaining([tmpdirWarning]));
+      expect(f.manager.status(result.id)).toMatchObject({ status: "completed", warnings: expect.arrayContaining([tmpdirWarning]) });
+      await f.manager.cleanup(result.id);
+    });
+
     it("falls back the same way when the TMPDIR source itself fails", async () => {
       const f = fixture(layout, { sourceFails: true });
       const { result, run, value } = await report(f);

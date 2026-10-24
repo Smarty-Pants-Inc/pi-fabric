@@ -440,7 +440,7 @@ describe("the CLI's readiness barrier backs off a retryable first pass (hosted m
         new Promise<string>(resolve => setTimeout(() => resolve("still waiting"), 10_000))]);
       const stopped = stoppedLines(cli.logs);
       expect({ outcome, stopped: stopped.length }).toEqual({ outcome: "exited 1", stopped: 1 });
-      expect(stopped[0]).toMatch(/^mesh-bridge: stopped: Bridge start still refused after \d+ ms \(deadline \d+ ms, \d+ attempts\); last: mesh lock timeout: FABRIC_MESH_LOCK_TIMEOUT: .*host-lease-commits\/5f43c55dca0091e6\/custody\.lock/);
+      expect(stopped[0]).toMatch(/^mesh-bridge: stopped: Bridge start still refused after \d+ ms \(deadline \d+ ms, \d+ attempts\); last: mesh lock timeout: FABRIC_MESH_LOCK_TIMEOUT: .*host-lease-commits[\\/]5f43c55dca0091e6[\\/]custody\.lock/);
       expect(Date.now() - startedAt).toBeLessThan(8_000);
       expect(cli.logs.join("")).toMatch(RETRY_LINE);
       expect(cli.logs.join("")).not.toContain("linked hub <-> far");

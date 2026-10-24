@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as atomic from "../src/core/atomic-write.js";
 import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
+import { HostLeaseLockBusyError } from "../src/topology/host-lease-lock.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { LIVENESS_POLICY_KEY, readHostLeaseCurrent, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -198,7 +199,7 @@ const MIRROR = String.raw`
   }, ids), ids);
 `;
 
-const killedMirror = async (root: string, id: string): Promise<{ pid: number; namespace: string }> => {
+const killedMirror = async (root: string, id: string): Promise<{ pid: number; namespace: string; additions: string; additionsOwner: string }> => {
   fs.mkdirSync(root, { recursive: true });
   const ready = path.join(path.dirname(root), "mirror-ready-" + digest(root).slice(0, 8));
   const child = spawn(process.execPath, ["--input-type=module", "-e", MIRROR, root, ready, id],
@@ -217,9 +218,52 @@ const killedMirror = async (root: string, id: string): Promise<{ pid: number; na
   expect(namespace.split("\n")[0]).toBe(String(pid));
   const additions = path.join(root, "host-lease-commits", digest(".additions").slice(0, 16));
   expect(fs.readdirSync(additions).length).toBeGreaterThan(0);
+  const additionsOwner = fs.readFileSync(path.join(additions, "custody.lock", "owner"), "utf8");
   child.kill("SIGKILL");
   await exited;
-  return { pid, namespace };
+  return { pid, namespace, additions, additionsOwner };
+};
+
+// The host-lease additions gate is a HOST-QUALIFIED custody lock (MeshStore.leaseCustody, src/mesh/store.ts). Its dead
+// holder is recovered only with this machine's identity: "A host-lease commit gate is never recovered by a
+// foreign/unknown PID. Matching machine evidence is still mandatory when boot/process identity is unavailable"
+// (src/mesh/custody-lock.ts clearDeadCustodyLock). That identity is read from /etc/machine-id and /proc only
+// (src/core/atomic-write.ts readPhysicalMachineId/readPhysicalHostIdentity), so on Windows it is absent and the gate
+// fails closed by design, as unreadable machine evidence does on Linux (tests/host-lease-round3.test.ts "unreadable
+// /etc/machine-id fails closed"; tests/mesh-lock-namespace.test.ts "host-qualified custody needs a machine id").
+const nativeMachineEvidence = atomic.readPhysicalMachineId() !== undefined;
+/** The Windows view on a host that has machine evidence: the machine and boot identity files are unreadable. */
+const withoutMachineEvidence = (): void => {
+  if (nativeMachineEvidence) {
+    const read = fs.readFileSync.bind(fs);
+    vi.spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
+      const file = String(args[0]);
+      if (file === "/etc/machine-id" || file === "/proc/sys/kernel/random/boot_id") {
+        throw Object.assign(new Error("no machine or boot identity (as on Windows)"), { code: "ENOENT" });
+      }
+      return read(...args);
+    }) as typeof fs.readFileSync);
+  }
+  expect(atomic.readPhysicalMachineId()).toBeUndefined();
+  expect(atomic.readPhysicalHostIdentity()).toBeUndefined();
+};
+/** The reused-PID variant: the OS hands the killed mirror's PID to a new process (same receipt, another start). */
+const reuseKilledPid = async (root: string, killed: { namespace: string }): Promise<void> => {
+  const pid = await standIn();
+  reusedPid(pid, "reused");
+  const [, start, token] = killed.namespace.split("\n");
+  plantNamespaceReceipt(root, pid, atomic.validProcessIncarnation(start) ? start! : START[0]!, token!);
+};
+/** The hub and far meshes of a later mirror pass, and its bridge (not yet started). */
+const laterMirrorPass = async (base: string, root: string, farId: string) => {
+  const far = new MeshStore(path.join(base, "far"), 65536, 1000);
+  await nativeOn(far, farId);
+  const hub = new MeshStore(root, 65536, 1000);
+  await nativeOn(hub, "session:hub-native");
+  const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local: new StoreBridgeSide(hub, "far"),
+    remote: new StoreBridgeSide(far, "hub"), cursorPath: path.join(base, "cursor.json") });
+  cleanups.push(() => bridge.stop());
+  return { hub, bridge };
 };
 
 /** A far mesh with one live native root, for a later mirror pass into the hub. */
@@ -235,19 +279,15 @@ const nativeOn = async (mesh: MeshStore, id: string): Promise<MeshIdentity> => {
 
 describe("a mirror killed mid-pass while holding the namespace receipt and the additions gate (pi-fabric#1562 review P1)", () => {
   const cases = (["dead", "reused"] as const).flatMap(pid => (["fenced add", "mirror pass"] as const).map(after => ({ pid, after })));
-  it.each(cases)("$pid PID: a later $after recovers", async ({ pid: holder, after }) => {
+  // Recovery needs this machine's identity (see nativeMachineEvidence): absent on Windows, which runs the fail-closed
+  // cases below natively instead (pi-fabric#1562 Windows CI: MeshLockTimeoutError on host-lease-locks/064d58ce...).
+  it.skipIf(!nativeMachineEvidence).each(cases)("$pid PID: a later $after recovers", async ({ pid: holder, after }) => {
     const base = scratch();
     const root = path.join(base, "hub");
     const farId = "session:far-native";
     const killed = await killedMirror(root, farId);
     expect(namespaceOwner(root)).toBe(killed.namespace);
-    if (holder === "reused") {
-      // The OS hands the killed mirror's PID to a new process: same receipt, a live PID with another start identity.
-      const pid = await standIn();
-      reusedPid(pid, "reused");
-      const [, start, token] = killed.namespace.split("\n");
-      plantNamespaceReceipt(root, pid, atomic.validProcessIncarnation(start) ? start! : START[0]!, token!);
-    }
+    if (holder === "reused") await reuseKilledPid(root, killed);
     if (after === "fenced add") {
       vi.spyOn(atomic, "ownProcessIncarnation").mockResolvedValue(undefined);
       const host = await fencedDirectory(root, "after-kill");
@@ -262,13 +302,7 @@ describe("a mirror killed mid-pass while holding the namespace receipt and the a
       // prepared retry the busy refusal schedules: one refused heartbeat, then the published one.
       expect(attempts).toBe(holder === "dead" ? 1 : 2);
     } else {
-      const far = new MeshStore(path.join(base, "far"), 65536, 1000);
-      await nativeOn(far, farId);
-      const hub = new MeshStore(root, 65536, 1000);
-      await nativeOn(hub, "session:hub-native");
-      const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local: new StoreBridgeSide(hub, "far"),
-        remote: new StoreBridgeSide(far, "hub"), cursorPath: path.join(base, "cursor.json") });
-      cleanups.push(() => bridge.stop());
+      const { hub, bridge } = await laterMirrorPass(base, root, farId);
       await bridge.start();
       // The pass took (recovered) both receipts: the far root's mirror and its lease are installed.
       expect(readHostLeaseCurrent(root, farId)).toMatchObject({ id: farId });
@@ -276,4 +310,38 @@ describe("a mirror killed mid-pass while holding the namespace receipt and the a
     }
     expect(namespaceOwner(root)).toBeUndefined();
   }, 40_000);
+
+  // Without machine evidence (Windows natively; simulated where /etc/machine-id exists) the dead mirror's additions
+  // gate cannot be proven dead: every later fenced add or mirror pass is refused busy, and nothing takes it over.
+  it.each(cases)("$pid PID, no machine evidence (as on Windows): a later $after stays busy and takes nothing over",
+    async ({ pid: holder, after }) => {
+      const base = scratch();
+      const root = path.join(base, "hub");
+      const farId = "session:far-native";
+      const killed = await killedMirror(root, farId);
+      withoutMachineEvidence();
+      if (holder === "reused") await reuseKilledPid(root, killed);
+      if (after === "fenced add") {
+        vi.spyOn(atomic, "ownProcessIncarnation").mockResolvedValue(undefined);
+        const host = await fencedDirectory(root, "after-kill");
+        const refusals: unknown[] = [];
+        for (let attempt = 0; attempt < 3; attempt++) await host.directory.refresh().catch(error => { refusals.push(error); });
+        expect(host.published()).toBe(false);
+        expect(refusals).toHaveLength(3);
+        for (const error of refusals) {
+          expect(error instanceof HostLeaseLockBusyError || error instanceof participantFiles.ParticipantFileLockBusyError,
+            String(error)).toBe(true);
+        }
+        // Whatever the namespace receipt did first, the last refusal is the unrecoverable additions gate.
+        expect(refusals.at(-1)).toBeInstanceOf(HostLeaseLockBusyError);
+      } else {
+        const { hub, bridge } = await laterMirrorPass(base, root, farId);
+        await expect(bridge.start()).rejects.toThrow(/FABRIC_MESH_LOCK_TIMEOUT: .*host-lease-commits[\\/]5f43c55dca0091e6[\\/]custody\.lock/);
+        expect(readHostLeaseCurrent(root, farId)).toBeUndefined();
+        expect(hub.listAll(PREFIX).some(entry => (entry.value as { id?: unknown }).id === farId)).toBe(false);
+      }
+      // No takeover: the killed mirror's receipt still owns the gate, and no recovery fence was made.
+      expect(fs.readFileSync(path.join(killed.additions, "custody.lock", "owner"), "utf8")).toBe(killed.additionsOwner);
+      expect(fs.readdirSync(killed.additions).filter(name => name.startsWith("custody.lock.dead."))).toEqual([]);
+    }, 40_000);
 });

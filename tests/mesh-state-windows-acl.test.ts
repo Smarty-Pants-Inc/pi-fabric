@@ -9,14 +9,16 @@ import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { openPrivateStateDb } from "../src/mesh/state-gate.js";
 import { openNodeSqlite, raiseCheckpointFlag, SqliteStateStore } from "../src/mesh/state-sqlite.js";
+import { defaultProfileDirectory } from "./helpers/default-profile.js";
 import { aclOwner, icaclsGrant, icaclsShow, readAcl, setOwner, tokenSids } from "./helpers/windows-acl.js";
 
 // smarty-dev#8920: Windows ACL privacy of the SQLite mesh state root, its state files, its flag directory and its
 // ancestors, proved on real NTFS ACLs (icacls grants, Get-Acl/icacls read-back) with the real node:sqlite opener.
 // No ACL mocks: the native-cache tests use only a call-through process-count spy. Hosted-only: fixtures live in a
 // private directory below the runner's DEFAULT USERPROFILE (not TMPDIR, whose RUNNER_TEMP ancestors are not a
-// profile), so local runs never create or delete them. The profile and its
-// system ancestors are never modified; every grant is on a fixture directory created by this suite.
+// profile), so local runs never create or delete them. That profile is the OS's (os.userInfo().homedir), not the
+// fleet USERPROFILE that test isolation points inside TMPDIR (pi-fabric#1562; tests/helpers/default-profile.ts).
+// The profile and its system ancestors are never modified; every grant is on a fixture directory created by this suite.
 //
 // Policy (fabric-store ruling): root, state.db/-wal/-shm and the flag directory refuse any foreign
 // write/modify/full/delete/WRITE_DAC/WRITE_OWNER ACE; owner must be the current user, or Administrators only when
@@ -56,9 +58,7 @@ afterEach(() => {
 });
 /** A fresh private fixture directory directly below the default profile (inherits only the profile ACL). */
 const profileDir = (): string => {
-  const profile = process.env.USERPROFILE;
-  if (!profile || path.resolve(os.homedir()) !== path.resolve(profile)) throw new Error(`USERPROFILE ${String(profile)} is not the home directory ${os.homedir()}`);
-  const dir = fs.mkdtempSync(path.join(profile, "fabric-mesh-acl-"));
+  const dir = fs.mkdtempSync(path.join(defaultProfileDirectory(), "fabric-mesh-acl-"));
   created.push(dir);
   ownFixture(dir);
   return dir;
@@ -313,7 +313,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   }, 120_000);
 
   it("opens real node:sqlite in a clean root below the default USERPROFILE without touching its ancestors", async () => {
-    const profile = os.homedir();
+    const profile = defaultProfileDirectory();
     const before = readAcl(profile).sddl;
     const root = profileDir();
     await roundTrip(await openAsync(root));

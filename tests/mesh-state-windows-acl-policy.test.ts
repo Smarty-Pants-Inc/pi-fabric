@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { windowsStateAclRefusal, type WindowsStateAclRequest } from "../src/mesh/windows-state-acl.js";
+import { defaultProfileDirectory, isWithin } from "./helpers/default-profile.js";
 
 const USER = "S-1-5-21-1-2-3-1001";
 const OTHER = "S-1-5-21-1-2-3-1002";
@@ -262,6 +263,27 @@ const roleRefusal = (
   }
   return windowsStateAclRefusal({ root: target, real: target, role, files: [], directories: [] }, runner(entries).run);
 };
+
+// pi-fabric#1562 Windows CI: the hosted ACL suite (tests/mesh-state-windows-acl.test.ts) built every fixture root below
+// os.homedir(), which test isolation points at the fleet root inside TMPDIR (USERPROFILE on win32, HOME on POSIX). On
+// a runner whose D:\ volume ACL grants Authenticated Users modify, D:\a\_temp\pi-fabric-vitest-job inherited it and every
+// enforced open refused that ancestor, correctly (the gate is unchanged: see "refuses an ancestor another account may
+// delete" below). The fixtures belong below the OS's default profile, outside TMPDIR.
+describe("the hosted ACL suite's fixture profile (pi-fabric#1562)", () => {
+  it("is the OS default profile, outside TMPDIR, even though fleet isolation moved the home variable into TMPDIR", () => {
+    // The premise: fleet isolation (tests/fleet-isolation-setup.ts) moved os.homedir() into this run's TMPDIR.
+    expect(isWithin(os.tmpdir(), os.homedir())).toBe(true);
+    const profile = defaultProfileDirectory();
+    expect(profile).toBe(path.resolve(os.userInfo().homedir));
+    expect(isWithin(os.tmpdir(), profile)).toBe(false);
+  });
+
+  it("refuses an OS profile inside TMPDIR or RUNNER_TEMP instead of building fixtures there", () => {
+    vi.stubEnv("RUNNER_TEMP", path.dirname(path.resolve(os.userInfo().homedir)));
+    try { expect(() => defaultProfileDirectory()).toThrow(/inside the temporary directory/); }
+    finally { vi.unstubAllEnvs(); }
+  });
+});
 
 describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
   afterEach(() => vi.restoreAllMocks());

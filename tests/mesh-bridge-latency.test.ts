@@ -251,7 +251,10 @@ describe("bridge presence latency (smarty-dev#6477)", () => {
     const stateViews = vi.spyOn(hub, "stateView");
     await hubSide.mirror(snapshot, t0);
     expect(batches).toHaveBeenCalledTimes(1);
-    expect(stateViews).toHaveBeenCalledTimes(path_ === "warm" ? 1 : 0);
+    // smarty-dev#13645 (option B): cold and warm passes both plan on a snapshot taken before the writer
+    // (BUILD-mirror-custody3: the global writer hold stays short; per-host file gates cover planning),
+    // as mirrored-root-liveness already asserts; the cold pass no longer plans inside its transaction.
+    expect(stateViews).toHaveBeenCalledTimes(1);
     const until = t0 + 500;
     const lease = readHostLeases(hub.root).get(lane.id)!;
     expect(lease.expiresAt).toBe(until);

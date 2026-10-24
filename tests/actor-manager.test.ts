@@ -1258,6 +1258,55 @@ const queueFiles = (root: string, actorId: string): Array<{ name: string; text: 
     .map((name) => ({ name, text: fs.readFileSync(path.join(dir, name), "utf8") }));
 };
 
+describe("ActorManager ownership at native worker start", () => {
+  it.each([
+    ["successor ownership", true],
+    ["current ownership", false],
+  ] as const)("checks the AgentManager authorize callback with %s", async (_scenario, successorOwns) => {
+    let currentOwner = true;
+    const canManage = vi.fn((_id: string) => currentOwner);
+    const { actors, agents, root } = setup(false, canManage);
+    const actor = await actors.create({ name: "start-fence", instructions: "Reply.", responseMode: "text", transport: "process" });
+    const originalRun = agents.run.bind(agents);
+    let actorRunEntered = false;
+    let authorizeResult: boolean | undefined;
+    const run = vi.spyOn(agents, "run").mockImplementation(async (
+      request, signal, onSpawned, authorize, onOutputPrincipalDowngrade, onQueued, preparation,
+    ) => {
+      if (request.actorId === actor.id) {
+        actorRunEntered = true;
+        if (successorOwns) currentOwner = false;
+        const guardedAuthorize = authorize && (() => {
+          const allowed = authorize();
+          if (authorizeResult === undefined) authorizeResult = allowed;
+          return allowed;
+        });
+        return originalRun(request, signal, onSpawned, guardedAuthorize, onOutputPrincipalDowngrade, onQueued, preparation);
+      }
+      return originalRun(request, signal, onSpawned, authorize, onOutputPrincipalDowngrade, onQueued, preparation);
+    });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+
+    try {
+      const { messageId } = actors.tell(actor.id, "preserve this turn");
+      if (successorOwns) {
+        await waitFor(() => actorRunEntered && authorizeResult !== undefined && actors.inFlightCount() === 0, 10_000);
+        expect(authorizeResult).toBe(false);
+        expect(launch).not.toHaveBeenCalled();
+        expect(actors.status(actor.id).queued).toBe(0);
+        const parked = queueFiles(root, actor.id).flatMap(({ text }) => JSON.parse(text).items ?? []);
+        expect(parked).toContainEqual(expect.objectContaining({
+          id: messageId, source: "direct", payload: { message: "preserve this turn" }, executionStarted: false,
+        }));
+      } else {
+        await waitFor(() => agents.list().some(run => run.actorId === actor.id && run.status === "completed"), 10_000);
+        expect(authorizeResult).toBe(true);
+        expect(launch).toHaveBeenCalledTimes(1);
+      }
+    } finally { run.mockRestore(); launch.mockRestore(); }
+  });
+});
+
 describe("ActorManager across a session reload", () => {
   const reloadable = (root: string, mesh: MeshStore, agents: AgentManager, replayAgeMs = 10 * 60_000, actorQueueLimit?: number) => {
     const manager = new ActorManager(

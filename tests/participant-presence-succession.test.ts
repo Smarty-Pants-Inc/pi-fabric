@@ -4,7 +4,7 @@
 // suite exercises authenticated broker CAS and the real FabricRuntimeState Main receiver.
 // Deletes are RECORD ONLY: close/rollback never removes an entry, even from this fixture.
 import { createHash } from "node:crypto";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { KvParticipantDirectory, type ParticipantLeaseGate } from "../src/topology/participant-view.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import { KvConflictError, type FabricTransport, type TransportKv, type TransportKvEntry, type TransportKvEvent } from "../src/transport/types.js";
@@ -21,7 +21,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-/** Atomic CAS plus event-driven snapshot watches; no clocks, TTL simulation or authority logic. */
+/** Atomic CAS plus explicit snapshot/expiry events; no automatic TTL or authority logic. */
 class RecordOnlyKv implements TransportKv {
   readonly rows = new Map<string, TransportKvEntry<unknown>>();
   readonly deletes: Array<{ key: string; revision: number }> = [];
@@ -37,6 +37,19 @@ class RecordOnlyKv implements TransportKv {
     this.rows.set(key, entry);
     for (const watcher of this.#watchers) { watcher.events.push({ type: "put", entry: clone(entry) }); watcher.wake(); }
     return clone(entry);
+  }
+  expire(entry: TransportKvEntry<unknown>): TransportKvEvent<unknown> | undefined {
+    const current = this.rows.get(entry.key);
+    const value = current?.value;
+    const expiresAt = value && typeof value === "object" && "expiresAt" in value ? value.expiresAt : undefined;
+    if (!current || current.revision !== entry.revision || current.owner !== entry.owner || current.machine !== entry.machine ||
+        typeof expiresAt !== "number" || expiresAt > Date.now()) return undefined;
+    this.rows.delete(entry.key);
+    const event: TransportKvEvent<unknown> = {
+      type: "gone", key: entry.key, machine: entry.machine, revision: ++this.#revision, reason: "expired",
+    };
+    for (const watcher of this.#watchers) { watcher.events.push(clone(event)); watcher.wake(); }
+    return clone(event);
   }
   async get<V>(key: string, signal?: AbortSignal): Promise<TransportKvEntry<V> | undefined> {
     signal?.throwIfAborted();
@@ -138,20 +151,116 @@ describe("#14115 initial own Main presence succession", () => {
     expect(f.presence.mutations).toEqual([{ key: pkey(), expected: 0, revision: publication.revision }]);
   });
 
-  it("lets the resident successor take over a root-owned durable actor row and keeps the CAS routable", async () => {
+  it("does not let the resident successor replace a live predecessor actor without a handoff receipt", async () => {
     const f = fixture();
     const main = root(OLD, { id: ACTOR, kind: "actor", parentId: ROOT, rootId: ROOT });
     const previous = f.presence.seed(pkey(ACTOR), `${ROOT}#${OLD}`, main);
+    f.lease(OLD);
     const resident = "resident:presence-resume";
-    f.lease(NEXT, { id: resident, identityId: resident, rootId: ROOT });
+    const successorLease = f.lease(NEXT, { id: resident, identityId: resident, rootId: ROOT });
     const successor = { ...main, ownerHostId: resident, ownerIdentityId: resident, ownerIncarnation: NEXT,
       name: "dev-supervisor", updatedAt: 2_100 };
     const view = f.view(NEXT, resident, resident);
-    const publication = await view.publish(successor);
-    expect(f.presence.rows.get(pkey(ACTOR))).toMatchObject({ owner: `${resident}#${NEXT}`, revision: publication.revision, value: successor });
-    expect(f.presence.mutations).toEqual([{ key: pkey(ACTOR), expected: previous.revision, revision: publication.revision }]);
-    expect(view.get(ACTOR)).toMatchObject({ id: ACTOR, ownerHostId: resident, stale: false });
+    await ready(view);
+    expect(view.resolve(ACTOR)).toMatchObject({ live: true, ownerIncarnation: OLD });
+    expect(f.leases.rows.get(hkey(resident))).toEqual(successorLease);
+    await expect(view.publish(successor)).rejects.toBeDefined();
+    expect(f.presence.rows.get(pkey(ACTOR))).toEqual(previous);
+    expect(f.presence.mutations).toEqual([]);
+    expect(view.get(ACTOR)).toMatchObject({ id: ACTOR, ownerHostId: ROOT, stale: false });
     expect(f.presence.deletes).toEqual([]);
+  });
+
+  it.each([
+    ["actor id", { actorId: "another-actor" }],
+    ["predecessor incarnation", { ownerIncarnation: NEXT }],
+  ] as const)("refuses an actor handoff receipt with a mismatched %s", async (_field, change) => {
+    const f = fixture();
+    const main = root(OLD, { id: ACTOR, kind: "actor", parentId: ROOT });
+    const previousRecord = { ...main, actorHandoffRelease: {
+      format: 1, actorId: ACTOR, ownerHostId: ROOT, ownerIdentityId: ROOT, ownerIncarnation: OLD, stoppedAt: 2_200, ...change,
+    } };
+    const previous = f.presence.seed(pkey(ACTOR), `${ROOT}#${OLD}`, previousRecord);
+    f.lease(OLD);
+    const resident = "resident:presence-resume";
+    f.lease(NEXT, { id: resident, identityId: resident, rootId: ROOT });
+    const successor = { ...main, ownerHostId: resident, ownerIdentityId: resident, ownerIncarnation: NEXT };
+    await expect(f.view(NEXT, resident, resident).publish(successor)).rejects.toBeDefined();
+    expect(f.presence.rows.get(pkey(ACTOR))).toEqual(previous);
+    expect(f.presence.mutations).toEqual([]);
+    expect(f.presence.deletes).toEqual([]);
+  });
+
+  it("waits for an expired event on the exact observed predecessor lease before actor takeover", async () => {
+    const initialTime = Date.now();
+    let now = initialTime;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      const f = fixture();
+      const main = root(OLD, { id: ACTOR, kind: "actor", parentId: ROOT });
+      const previous = f.presence.seed(pkey(ACTOR), `${ROOT}#${OLD}`, main);
+      const expiresAt = initialTime + 5_000;
+      const predecessorLease = f.lease(OLD, { expiresAt });
+      const resident = "resident:presence-resume";
+      f.lease(NEXT, { id: resident, identityId: resident, rootId: ROOT, expiresAt: initialTime + 60_000 });
+      const successor = { ...main, ownerHostId: resident, ownerIdentityId: resident, ownerIncarnation: NEXT };
+      const view = f.view(NEXT, resident, resident);
+      await ready(view);
+      expect(view.resolve(ACTOR)).toMatchObject({ live: true, ownerIncarnation: OLD });
+
+      now = expiresAt + 1;
+      await expect(view.publish(successor)).rejects.toBeDefined();
+      expect(f.presence.rows.get(pkey(ACTOR))).toEqual(previous);
+      expect(f.presence.mutations).toEqual([]);
+
+      const changed = view.whenChanged(ACTOR, AbortSignal.timeout(1_000));
+      const event = f.leases.expire(predecessorLease);
+      expect(event?.type).toBe("gone");
+      if (event?.type !== "gone") throw new Error("Expected the predecessor lease expiry event");
+      expect(event).toMatchObject({ key: predecessorLease.key, reason: "expired" });
+      expect(event.revision).toBeGreaterThan(predecessorLease.revision);
+      await changed;
+
+      const publication = await view.publish(successor);
+      expect(f.presence.rows.get(pkey(ACTOR))).toMatchObject({
+        owner: `${resident}#${NEXT}`, revision: publication.revision, value: successor,
+      });
+      expect(f.presence.mutations).toEqual([{ key: pkey(ACTOR), expected: previous.revision, revision: publication.revision }]);
+      expect(f.presence.deletes).toEqual([]);
+    } finally { nowSpy.mockRestore(); }
+  });
+
+  it("does not reuse an old expiry observation after the exact predecessor lease is recreated", async () => {
+    const initialTime = Date.now();
+    let now = initialTime;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      const f = fixture();
+      const main = root(OLD, { id: ACTOR, kind: "actor", parentId: ROOT });
+      f.presence.seed(pkey(ACTOR), `${ROOT}#${OLD}`, main);
+      const expiresAt = initialTime + 5_000;
+      const predecessorLease = f.lease(OLD, { expiresAt });
+      const resident = "resident:presence-resume";
+      f.lease(NEXT, { id: resident, identityId: resident, rootId: ROOT, expiresAt: initialTime + 60_000 });
+      const successor = { ...main, ownerHostId: resident, ownerIdentityId: resident, ownerIncarnation: NEXT };
+      const view = f.view(NEXT, resident, resident);
+      await ready(view);
+
+      now = expiresAt + 1;
+      const expiredChange = view.whenChanged(ACTOR, AbortSignal.timeout(1_000));
+      const expiredEvent = f.leases.expire(predecessorLease);
+      expect(expiredEvent).toMatchObject({ type: "gone", reason: "expired" });
+      if (expiredEvent?.type !== "gone") throw new Error("Expected the predecessor lease expiry event");
+      await expiredChange;
+
+      const recreatedLease = f.lease(OLD, { expiresAt: now + 5_000 });
+      await view.whenChanged(ACTOR, AbortSignal.timeout(1_000));
+      f.leases.rows.delete(recreatedLease.key);
+
+      await expect(view.publish(successor)).rejects.toBeDefined();
+      expect(f.presence.rows.get(pkey(ACTOR))?.value).toEqual(main);
+      expect(f.presence.mutations).toEqual([]);
+    } finally { nowSpy.mockRestore(); }
   });
 
   it.each(["absent", "expired"] as const)("replaces an actor row from a different root with a %s owner lease", async leaseState => {
@@ -433,12 +542,21 @@ describe("#14115 initial own Main presence succession", () => {
     expect(f.presence.deletes).toEqual([]);
   });
 
-  it("allows a successor incarnation to replace its own same-lineage actor row", async () => {
-    const f = fixture(); f.lease();
-    const child = root(NEXT, { id: "actor:run", kind: "actor", parentId: ROOT });
-    const previous = f.presence.seed(pkey(child.id), `${ROOT}#${OLD}`, { ...child, ownerIncarnation: OLD });
-    const publication = await f.view().publish(child);
-    expect(f.presence.rows.get(pkey(child.id))).toMatchObject({ revision: publication.revision, value: child });
+  it("allows a matching actor handoff receipt to replace its own same-lineage actor row", async () => {
+    const f = fixture();
+    const resident = "resident:presence-resume";
+    const child = root(NEXT, { id: "actor:run", kind: "actor", parentId: ROOT,
+      ownerHostId: resident, ownerIdentityId: resident });
+    const previousRecord = { ...root(OLD, { id: child.id, kind: "actor", parentId: ROOT }), actorHandoffRelease: {
+      format: 1, actorId: child.id, ownerHostId: ROOT, ownerIdentityId: ROOT, ownerIncarnation: OLD, stoppedAt: 2_200,
+    } };
+    const previous = f.presence.seed(pkey(child.id), `${ROOT}#${OLD}`, previousRecord);
+    f.lease(OLD);
+    f.lease(NEXT, { id: resident, identityId: resident, rootId: ROOT });
+    const publication = await f.view(NEXT, resident, resident).publish(child);
+    expect(f.presence.rows.get(pkey(child.id))).toMatchObject({
+      owner: `${resident}#${NEXT}`, revision: publication.revision, value: child,
+    });
     expect(f.presence.mutations).toEqual([{ key: pkey(child.id), expected: previous.revision, revision: publication.revision }]);
   });
 });

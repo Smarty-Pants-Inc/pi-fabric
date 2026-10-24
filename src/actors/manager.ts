@@ -894,6 +894,12 @@ export class ActorManager {
   readonly #pendingPresence = new Set<string>();
   /** Residents publish both scopes through their one registry-fenced host heartbeat. */
   readonly #presencePublisher: { refresh: () => Promise<void>; schedule: () => void } | undefined;
+  readonly #waitForActorClaimChange: ((id: string, signal: AbortSignal) => Promise<void>) | undefined;
+  readonly #ownershipWatchers = new Map<string, AbortController>();
+  readonly #handoffOwner: { hostId: string; incarnation: string } | undefined;
+  readonly #handoffReleases = new Map<string, {
+    format: 1; actorId: string; ownerHostId: string; ownerIdentityId: string; ownerIncarnation: string; stoppedAt: number;
+  }>();
   readonly #presenceRevisions = new Map<string, object>();
   /** Serialized presence this instance committed through the host heartbeat. A new
    * instance (restart) starts empty, so its first full heartbeat republishes all once. */
@@ -1042,6 +1048,10 @@ export class ActorManager {
       canConsumeMesh?: () => boolean;
       /** Delegate resident presence to the host heartbeat; never start per-actor retries. */
       presencePublisher?: { refresh: () => Promise<void>; schedule: () => void };
+      /** Wait for a participant/lease KV update so a visible successor claim aborts active work. */
+      waitForActorClaimChange?: (id: string, signal: AbortSignal) => Promise<void>;
+      /** NATS host identity used to attest actor release after every owned turn drains. */
+      handoffOwner?: { hostId: string; incarnation: string };
       /** Retry delay for failed presence writes (tests use a short one). */
       presenceRetryMs?: number;
       /** Outage-alarm bound of this manager's background paths (tests shorten it); default MESH_OUTAGE_ALARM_AFTER_MS. */
@@ -1118,6 +1128,8 @@ export class ActorManager {
     this.#deadSessionReap = options.reapDeadSessionPresence ?? true;
     this.#canConsumeMesh = options.canConsumeMesh;
     this.#presencePublisher = options.presencePublisher;
+    this.#waitForActorClaimChange = options.waitForActorClaimChange;
+    this.#handoffOwner = options.handoffOwner;
     this.#logs = new ActorLogStore(
       mesh,
       meshConfig,
@@ -1142,7 +1154,8 @@ export class ActorManager {
       if (this.#persistent && meshConfig.enabled) this.#loadActors();
       this.#registryFingerprint = this.#registry.fingerprint();
       for (const actor of this.#actors.values()) {
-        this.#ownership.set(actor.id, this.#ownershipDecision(actor.id));
+        const owned = this.#ownershipDecision(actor.id);
+        this.#ownership.set(actor.id, owned);
       }
     });
     this.#acquireCapabilityView = options.acquireCapabilityView;
@@ -4212,6 +4225,8 @@ export class ActorManager {
   }
 
   async #close(): Promise<void> {
+    for (const watcher of this.#ownershipWatchers.values()) watcher.abort();
+    this.#ownershipWatchers.clear();
     await this.#closeNatsEvents();
     this.#meshMonitor.close();
     // Join native watch closes before any owned file can be released.
@@ -4267,9 +4282,10 @@ export class ActorManager {
       const drains = Promise.allSettled(owned.map((actor) => actor.drain ?? Promise.resolve()));
       // A losing race deadline is still a live old-generation timer. The shared
       // bounded-settlement helper clears it when drains finish first (#4383).
-      if (!await settleWithin([drains], this.#closeGraceMs)) {
+      let drained = await settleWithin([drains], this.#closeGraceMs);
+      if (!drained) {
         await this.agents.close({ persistentSessionReload: this.identity.kind === "main" });
-        await settleWithin([drains], this.#closeGraceMs);
+        drained = await settleWithin([drains], this.#closeGraceMs);
       }
       // Retry every durable join before AgentManager.close. Failed sinks keep
       // their source veto on disk for the next execution owner.
@@ -4283,6 +4299,17 @@ export class ActorManager {
         actor.updatedAt = Date.now();
       }
       if (owned.length > 0) await this.#saveActorsAtClose();
+      if (drained && this.#handoffOwner && this.#presencePublisher && owned.length > 0) {
+        const stoppedAt = Date.now();
+        for (const actor of owned) this.#handoffReleases.set(actor.id, {
+          format: 1, actorId: actor.id, ownerHostId: this.#handoffOwner.hostId,
+          ownerIdentityId: this.identity.id, ownerIncarnation: this.#handoffOwner.incarnation, stoppedAt,
+        });
+        // The participant publisher writes this receipt through the same live host lease
+        // as ordinary presence. Failure is safe: successor admission then waits for expiry.
+        try { await this.#presencePublisher.refresh(); }
+        catch { /* The host lease expiry path remains the fallback. */ }
+      }
       return;
     }
     await Promise.allSettled([...this.#actors.keys()].map((id) => this.stop(id, undefined, false, "session-reset")));
@@ -5079,6 +5106,7 @@ export class ActorManager {
   }
 
   async #drain(actor: ManagedActor): Promise<void> {
+    if (actor.queue.length > 0) this.#ensureOwnershipWatch(actor.id);
     let retryDrain = false;
     let retryDelay = this.#preparationRetryMs;
     try {
@@ -5291,6 +5319,10 @@ export class ActorManager {
               if (this.#persistent && !this.#persistQueue(actor.id, true)) throw new Error("Actor activation manifest checkpoint failed");
             });
           }
+          // Re-read the latest participant view immediately before the turn is handed
+          // to AgentManager; a successor claim visible since preparation aborts and parks it.
+          this.#refreshOwnership(actor.id);
+          if (!this.#canManage(actor.id)) throw new Error(`Fabric actor ownership moved before run: ${actor.id}`);
           preLaunch = false; // AgentManager bounds model/auth setup after (not during) permit waiting.
           if (this.#slotEnforced(actor.topics)) this.#slotLaunchUnknown.add(actor.id);
           const result = await this.agents.run(
@@ -5321,11 +5353,16 @@ export class ActorManager {
             },
             // The controller identity is this activation's generation token. A
             // permit may arrive after stop/remove/halt or after a newer drain.
-            () => !this.#closing && !abortController.signal.aborted &&
-              this.#runningActor(actor.id)?.abortController === abortController &&
-              actor.status !== "stopped" && this.#actors.has(actor.id) &&
-              this.#actors.get(actor.id)?.status !== "stopped" && this.#ownershipDecision(actor.id) &&
-              this.#slotLaunchAllowed(actor),
+            () => {
+              // AgentManager can wait for a permit after preparation. Refresh the
+              // participant decision again at that native launch boundary as well.
+              this.#refreshOwnership(actor.id);
+              return !this.#closing && !abortController.signal.aborted &&
+                this.#runningActor(actor.id)?.abortController === abortController &&
+                actor.status !== "stopped" && this.#actors.has(actor.id) &&
+                this.#actors.get(actor.id)?.status !== "stopped" && this.#ownershipDecision(actor.id) &&
+                this.#slotLaunchAllowed(actor);
+            },
             () => this.#downgradeOutputPrincipal(actor, item),
             (handle) => {
               this.#noteSlotRun(actor, handle.id);
@@ -5768,6 +5805,7 @@ export class ActorManager {
       }
       actor.draining = false;
       if (this.#draining.get(actor.id) === actor) this.#draining.delete(actor.id);
+      this.#stopOwnershipWatch(actor.id);
       this.#emitChange(); // Final settlement changes dormancy eligibility, not just public status.
       // A reload may have moved this actor's queue to a new object while this drain ran.
       const live = this.#actors.get(actor.id);
@@ -9274,6 +9312,8 @@ export class ActorManager {
       ownershipToken: this.#lineage(actor),
       // binding.sessionId is the reader's overlay; this names the owner (lucky-asc-router report).
       ownerSessionId: actor.rootId.startsWith("session:") ? actor.rootId.slice(8) : this.sessionId,
+      ...(registryView && this.#handoffReleases.has(actor.id)
+        ? { actorHandoffRelease: { ...this.#handoffReleases.get(actor.id)! } } : {}),
       ...(actor.project ? { project: actor.project } : {}),
       ...(actor.sessionOrphan ? { sessionOrphan: { ...actor.sessionOrphan } } : {}),
       // The instruction text stays private; its digest lets a caller verify setInstructions
@@ -9589,6 +9629,29 @@ export class ActorManager {
     // to fence, adopt or restore, so do not build a fleet-wide ownership snapshot (#2039).
     if (this.#actors.size === 0 || !this.#canManageActor || this.#reloadingOwnership) return;
     this.#withOwnershipRead(() => this.#refreshOwnershipNow(id, fresh), fresh);
+  }
+
+  #ensureOwnershipWatch(id: string): void {
+    if (!this.#waitForActorClaimChange || this.#closing || !this.#actors.has(id) || this.#ownershipWatchers.has(id)) return;
+    const controller = new AbortController();
+    this.#ownershipWatchers.set(id, controller);
+    void (async () => {
+      while (!controller.signal.aborted && !this.#closing) {
+        try { await this.#waitForActorClaimChange!(id, controller.signal); }
+        catch { return; } // The regular actor poll retries after a watch reset/failure.
+        if (controller.signal.aborted || this.#closing || !this.#actors.has(id)) return;
+        this.#refreshOwnership(id);
+      }
+    })().finally(() => {
+      if (this.#ownershipWatchers.get(id) === controller) this.#ownershipWatchers.delete(id);
+    }).catch(() => undefined);
+  }
+
+  #stopOwnershipWatch(id: string): void {
+    const controller = this.#ownershipWatchers.get(id);
+    if (!controller) return;
+    this.#ownershipWatchers.delete(id);
+    controller.abort();
   }
 
   #refreshOwnershipNow(id?: string, fresh = true): void {

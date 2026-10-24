@@ -23,6 +23,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
+import { allocateShortTmpdir, BASH_GUARD_TMPDIR_BYTES, ownedShortTmpdir, recordedShortTmpdir, shortTmpdirCandidates, type ShortTmpdirSource } from "./short-tmpdir.js";
 import { mkdirPrivate } from "../storage/private-dir.js";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
@@ -235,6 +236,10 @@ const writePolicyDispositionAudit = (
 // checked exit receipt. Scope-cut release/collection rather than trust false.
 const uncheckedExternalExit = (transport: Pick<AgentTransportHandle, "kind">): boolean =>
   transport.kind === "tmux" || transport.kind === "screen";
+/** smarty-dev#15878: a run's recorded short TMPDIR outside its run tree, removed only while it is a real directory of ours. */
+const removeOwnedShortTmpdir = async (temporary: string | undefined): Promise<void> => {
+  if (temporary && ownedShortTmpdir(temporary)) await removeTree(temporary).catch(() => undefined);
+};
 // agents.childQuestionTimeoutMs default: routed child dialogs cancel after 10 minutes.
 const DEFAULT_CHILD_QUESTION_TIMEOUT_MS = 600_000;
 const MAX_NAME_LENGTH = 60;
@@ -398,7 +403,35 @@ const promptFileMatches = (filePath: string, expectedSha256: string, expectedByt
 /** Host-only provenance: public model fields never confer an implicit/default exemption. */
 export interface AgentModelSelection {
   modelSource?: "explicit" | "default" | "inherited" | "route";
+  /**
+   * Host-only (#16357): the exception lane this host captured from the SAME bound root at actor
+   * creation. Used only when that root's fresh record is unavailable; never a caller value.
+   */
+  persistedLane?: AgentExceptionLane | undefined;
 }
+
+/** basename(root Main cwd) as read from the bound ROOT record, with the root it was read from. */
+export interface AgentExceptionLane {
+  rootId: string;
+  lane: string;
+}
+
+/** A persisted lane is exactly one non-empty path segment captured from one named root. */
+export function validAgentExceptionLane(value: unknown): value is AgentExceptionLane {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const { rootId, lane } = value as Record<string, unknown>;
+  return typeof rootId === "string" && rootId.length > 0 && rootId.length <= 512 &&
+    typeof lane === "string" && lane.length > 0 && lane.length <= 255 && lane !== "." && lane !== ".." &&
+    !lane.includes("/") && !lane.includes("\\") && !lane.includes("\0");
+}
+
+/** An error's class for a lane-unresolved denial: never its message, paths or secrets (#16331). */
+const laneLookupErrorClass = (error: unknown): string => {
+  const name = error instanceof Error ? error.name : typeof error;
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  const safeName = /^[A-Za-z_$][\w$]{0,63}$/.test(name) ? name : "Error";
+  return typeof code === "string" && /^[A-Z][A-Z0-9_]{0,31}$/.test(code) ? `${safeName} ${code}` : safeName;
+};
 export interface AgentModelAdmission {
   model?: string | undefined;
   thinking?: FabricThinking | undefined;
@@ -452,6 +485,8 @@ class AgentTaskPresenceError extends Error {
 export interface AgentLaunchPreparationOptions {
   timeoutMs: number;
   onPreparing?: () => void;
+  /** The actor's lane persisted at creation (#16357); admission falls back to it only for its own root. */
+  exceptionLane?: AgentExceptionLane | undefined;
 }
 
 export class AgentLaunchPreparationTimeoutError extends Error {
@@ -731,6 +766,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   lifecycleOffset: number;
   lifecycleRemainder: Buffer;
   runDirectory: string;
+  /** smarty-dev#15878: the short private TMPDIR outside runDirectory; removed after the run tree. */
+  temporaryDirectory?: string;
   transport: AgentTransportHandle;
   adapter: AgentTransportAdapter;
   launch: AgentTransportLaunch;
@@ -808,6 +845,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   requestedThinking?: AgentRunRequest["thinking"];
   actorId?: string;
   actorName?: string;
+  /** #16357: the actor's creation-time lane, re-offered to a relaunch's admission. In memory only. */
+  exceptionLane?: AgentExceptionLane;
   spawner?: AgentSpawner;
   capabilityRequirements?: string[];
   capabilityDigest?: string;
@@ -1412,6 +1451,8 @@ export class AgentManager {
   readonly #onFollowUpAlarm: ((alarm: AgentFollowUpAlarm) => void) | undefined;
   readonly #onAdmissionAlarm: ((alarm: AgentAdmissionAlarm) => void) | undefined;
   #admissionAlarmAt: number | undefined;
+  /** pi-fabric#1554 P2-4: the last short-TMPDIR alarm per caller TMPDIR (one per 6 h, like the held-permit alarm). */
+  readonly #shortTmpdirAlarmAt = new Map<string, number>();
   readonly #terminalNoticeOutbox: TerminalNoticeOutbox;
   readonly #followUps = new Map<string, Map<string, AgentFollowUpDelivery>>();
   readonly #followUpTimers = new Map<string, NodeJS.Timeout>();
@@ -1430,6 +1471,7 @@ export class AgentManager {
   readonly #rootSessionCwd: (() => string | undefined) | undefined;
   readonly #sessionId: (() => string | undefined) | undefined;
   readonly #executorRuntime: (() => string | undefined) | undefined;
+  readonly #shortTmpdirSource: () => ShortTmpdirSource;
   /** This process's own confinement; children may only narrow it. */
   readonly #parentWritePolicy: FabricWritePolicy | undefined = readWritePolicy();
   readonly #parentLineage: FabricAgentLineage | undefined = readAgentLineage();
@@ -1566,6 +1608,9 @@ export class AgentManager {
       sessionId?: () => string | undefined;
       /** Caller TypeScript executor runtime; native runtimes escape write confinement. */
       executorRuntime?: () => string | undefined;
+      /** smarty-dev#15878: where a child's short private TMPDIR may go, read at each spawn. Default: Fabric's data
+       * root (the caller's TMPDIR) and smarty-role's SMARTY_SESSION_STORE. */
+      shortTmpdirSource?: () => ShortTmpdirSource;
     } = {},
   ) {
     this.#semaphore = new AgentAdmission(config.maxConcurrent, Infinity, config.maxDepth);
@@ -1610,6 +1655,11 @@ export class AgentManager {
     this.#rootSessionCwd = options.rootSessionCwd;
     this.#sessionId = options.sessionId;
     this.#executorRuntime = options.executorRuntime;
+    this.#shortTmpdirSource = options.shortTmpdirSource ??
+      (() => {
+        const sessionStore = process.env.SMARTY_SESSION_STORE;
+        return { tmpdir: fabricDataRoot(), ...(sessionStore ? { sessionStore } : {}) };
+      });
     this.#currentDepth = Math.max(0, Number(process.env.PI_FABRIC_DEPTH ?? "0") || 0);
     this.#fullCodeMode = options.fullCodeMode ?? true;
     this.#kernel = options.kernel ?? (() => "typescript");
@@ -1802,13 +1852,46 @@ export class AgentManager {
     return requiredPin ? requested : clampThinkingToBounds(requested, this.childThinkingBounds(bounds));
   }
 
-  #exceptionLane(): string | undefined {
-    try {
-      const cwd = this.#rootSessionCwd?.();
-      if (typeof cwd !== "string" || !path.isAbsolute(cwd)) return undefined;
-      const lane = path.basename(cwd);
-      return lane && lane !== "." && lane !== ".." ? lane : undefined;
-    } catch { return undefined; }
+  /**
+   * The bound ROOT lane, read fresh. Undefined only when no root binding exists at all
+   * (unchanged lane-mismatch); a missing/stale record or a failed lookup is `unresolved`.
+   */
+  #rootLane(): { lane: string } | { unresolved: string } | undefined {
+    if (!this.#rootSessionCwd) return undefined;
+    let cwd: string | undefined;
+    try { cwd = this.#rootSessionCwd(); }
+    catch (error) { return { unresolved: `root session lookup failed (${laneLookupErrorClass(error)})` }; }
+    if (typeof cwd !== "string") return { unresolved: "root session record is missing or not fresh" };
+    if (!path.isAbsolute(cwd)) return { unresolved: "root session cwd is not absolute" };
+    const lane = path.basename(cwd);
+    return lane && lane !== "." && lane !== ".." ? { lane } : { unresolved: "root session cwd names no lane" };
+  }
+
+  /**
+   * #16357: the lane to persist on an actor at creation, read from this host's bound root now.
+   * Undefined when that root is unknown or its lane is unresolved: nothing is captured then.
+   */
+  exceptionLaneCapture(): AgentExceptionLane | undefined {
+    const rootId = this.#mainAgentId;
+    const root = this.#rootLane();
+    if (!rootId || !root || !("lane" in root)) return undefined;
+    const capture = { rootId, lane: root.lane };
+    return validAgentExceptionLane(capture) ? capture : undefined;
+  }
+
+  /**
+   * The fresh root lane always wins, so every resolvable case is unchanged. Only when the bound
+   * root's record is unavailable may the lane persisted at creation stand in, and only when it was
+   * captured from this same root: never a wider value. Otherwise the denial is lane-unresolved.
+   */
+  #exceptionLane(persisted?: AgentExceptionLane): { lane?: string; unresolved?: string } {
+    const root = this.#rootLane();
+    if (!root) return {};
+    if ("lane" in root) return { lane: root.lane };
+    if (validAgentExceptionLane(persisted) && this.#mainAgentId && persisted.rootId === this.#mainAgentId) {
+      return { lane: persisted.lane };
+    }
+    return { unresolved: root.unresolved };
   }
 
   /**
@@ -1816,20 +1899,26 @@ export class AgentManager {
    * `/etc/smarty/model-exceptions.json` source now; direct embedders remain subject
    * to the reader's trusted-source checks. Fabric-created children are never `lead`.
    */
-  admitModelException(model: string | undefined, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, role = "task", thinking?: FabricThinking): Readonly<ModelExceptionEntry> {
+  admitModelException(model: string | undefined, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, role = "task", thinking?: FabricThinking, persistedLane?: AgentExceptionLane): Readonly<ModelExceptionEntry> {
+    const lane = this.#exceptionLane(persistedLane);
     return admitModelException({
       path: this.config.modelExceptionsPath, reason: modelReason,
-      model: this.#exceptionModel(model, runner), role, lane: this.#exceptionLane(),
+      model: this.#exceptionModel(model, runner), role, lane: lane.lane,
+      ...(lane.unresolved ? { laneUnresolved: lane.unresolved } : {}),
       host: os.hostname().split(".")[0]!, thinking: thinking ?? this.#effectiveThinking(),
     }).entry;
   }
 
   /** Compatibility API. Call with the RESOLVED selector and actual effective effort. */
-  assertExplicitModelReason(model: unknown, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, inheritedDefault?: string, role = "task", thinking?: FabricThinking): Readonly<ModelExceptionEntry> | undefined {
+  assertExplicitModelReason(model: unknown, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, inheritedDefault?: string, role = "task", thinking?: FabricThinking, persistedLane?: AgentExceptionLane): Readonly<ModelExceptionEntry> | undefined {
     const selector = typeof model === "string" ? model.trim() : undefined;
     if (!this.modelReasonRequired(selector, runner)) return;
     if (this.#validModelReason(modelReason)) {
-      if (isClaudeModel(selector, runner, this.config.veda.backend)) return this.admitModelException(selector, modelReason, runner, role, thinking);
+      if (isClaudeModel(selector, runner, this.config.veda.backend)) {
+        return persistedLane
+          ? this.admitModelException(selector, modelReason, runner, role, thinking, persistedLane)
+          : this.admitModelException(selector, modelReason, runner, role, thinking);
+      }
       return;
     }
     if (isClaudeModel(selector, runner, this.config.veda.backend)) {
@@ -1869,12 +1958,18 @@ export class AgentManager {
       return { model, thinking: options.thinking, fallback: false };
     }
     const thinking = this.#effectiveThinking(options.thinking, options.thinkingBounds, options.requiredPin);
+    // #16357: host-only; consulted only when the bound root's own record is unavailable.
+    const persistedLane = options.persistedLane;
     if (this.#nativeClaudeRequiresReason(runner)) {
-      const approvedGrant = this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking);
+      const approvedGrant = persistedLane
+        ? this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking, persistedLane)
+        : this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking);
       return { model, thinking, fallback: false, approvedRef: approvedGrant?.issue, approvedGrant };
     }
     if (this.#validModelReason(modelReason)) {
-      const approvedGrant = this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking);
+      const approvedGrant = persistedLane
+        ? this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking, persistedLane)
+        : this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking);
       return { model, thinking, fallback: false, approvedRef: approvedGrant?.issue, approvedGrant };
     }
     // A supplied but malformed Claude exception refuses, never silently switches.
@@ -2553,12 +2648,15 @@ export class AgentManager {
     // resolve before the reason check, even when the alias itself says "claude".
     // Trusted role snapshot: Fabric-created children are task or actor:<name>, never lead.
     const policyRole = request.actorName ? `actor:${request.actorName}` : "task";
+    // #16357: only the host's own actor launch options carry an actor's creation-time lane.
+    const persistedLane = request.actorName && preparation?.exceptionLane ? { persistedLane: preparation.exceptionLane } : {};
     // Alternate runners retain their pre-queue catalog/backend admission. Pi
     // model/auth preparation stays post-permit unless a durable route needs it.
     const alternatePrepared = runner === "claude" || runner === "veda";
     if (alternatePrepared) {
       applyAdmission(await this.prepareModelWithReason(model, request.modelReason, runner, {
         modelSource, thinking: effectiveThinking(), thinkingBounds, signal, timeoutMs: preparation?.timeoutMs, role: policyRole,
+        ...persistedLane,
       }));
     }
     // Strict route pins cannot resolve to another selector. Admit their reason
@@ -2571,6 +2669,7 @@ export class AgentManager {
     if (routePin) {
       applyAdmission(await this.resolveModelReasonPolicy(model, request.modelReason, runner, {
         modelSource: "route", thinking: routePin.effort, requiredPin: true, resolveFallback: resolveRouteFallback, role: policyRole,
+        ...persistedLane,
       }));
       // LIVE storage/admission may demote to its pin. Admit that alternative
       // before recording either branch, so a safe live choice cannot conceal an
@@ -2578,6 +2677,7 @@ export class AgentManager {
       if (request.routeDecision?.mode === "live" && request.routeDecision.pin.model !== model) {
         const pin = await this.resolveModelReasonPolicy(request.routeDecision.pin.model, request.modelReason, runner, {
           modelSource: "route", thinking: request.routeDecision.pin.effort, requiredPin: true, resolveFallback: resolveRouteFallback, role: policyRole,
+          ...persistedLane,
         });
         policyPinAdmission = pin;
         if (pin.fallback && pin.model && pin.thinking) {
@@ -2684,11 +2784,11 @@ export class AgentManager {
           ? await this.resolveModelReasonPolicy(selected, request.modelReason, runner, {
             modelSource: request.modelSource ?? modelSource, thinking: effectiveThinking(), thinkingBounds, requiredPin: Boolean(routePin),
             resolveFallback: key => this.prepareModelForAdmission(key, runner, undefined, false, signal, preparation?.timeoutMs),
-            role: policyRole,
+            role: policyRole, ...persistedLane,
           })
           : await this.prepareModelWithReason(selected, request.modelReason, runner, {
             modelSource: routePin ? "route" : request.modelSource ?? modelSource, thinking: effectiveThinking(), thinkingBounds,
-            requiredPin: Boolean(routePin), signal, timeoutMs: preparation?.timeoutMs, role: policyRole,
+            requiredPin: Boolean(routePin), signal, timeoutMs: preparation?.timeoutMs, role: policyRole, ...persistedLane,
           });
         // Do not rewrite an already recorded route dispatch/header if policy changed.
         if (routeDispatch && admitted.fallback) throw new Error("Model reason policy changed after route admission; no worker started (smarty-dev#2264)");
@@ -2772,11 +2872,24 @@ export class AgentManager {
         }
       }
 
+      let shortTmpdir: string | undefined;
       try {
         if (worktree && worktreeSetup?.trim()) await this.#worktrees.setup(id, worktreeSetup);
         if (applyTaskWriteDefault && worktree) applyTaskWriteDefault = defaultWriteScopeFits(agentCwd);
-        const tmpdir = applyActorWritePolicy || applyTaskWriteDefault ? path.join(runDirectory, "tmp") : undefined;
-        if (tmpdir) mkdirPrivate(tmpdir, this.#trustRoot());
+        // smarty-dev#15878: a short private TMPDIR outside the (arbitrarily deep) run tree, so the fleet bash guard's
+        // `<TMPDIR>/p.XXXXXX` fits its 60 bytes. A write-confined caller keeps the run tree (its grant must cover it).
+        if ((applyActorWritePolicy || applyTaskWriteDefault) && !this.#parentWritePolicy) {
+          let source: ShortTmpdirSource | undefined;
+          let sourceError: unknown;
+          try { source = this.#shortTmpdirSource(); shortTmpdir = allocateShortTmpdir(id, source); }
+          catch (error) { shortTmpdir = undefined; if (!source) sourceError = error; }
+          // Lockout-safe: nothing fits, so keep the old run-tree TMPDIR (today's behaviour, never a refusal), but loudly.
+          if (!shortTmpdir && process.platform !== "win32") {
+            policyWarnings.push(this.#shortTmpdirUnavailable(logFile, id, runner, source, sourceError));
+          }
+        }
+        const tmpdir = shortTmpdir ?? (applyActorWritePolicy || applyTaskWriteDefault ? path.join(runDirectory, "tmp") : undefined);
+        if (tmpdir && !shortTmpdir) mkdirPrivate(tmpdir, this.#trustRoot());
         const actorReadOnly = request.readOnly ?? this.#parentWritePolicy?.readOnly ?? false;
         const writePolicy = capabilities.writePolicy
           ? resolveChildWritePolicy(applyActorWritePolicy
@@ -2968,7 +3081,7 @@ export class AgentManager {
           ...(scope ? { scope } : {}),
         };
         if (request.modelPolicyOriginalModel && model) {
-          policyWarnings = [`model: inherited ${request.modelPolicyOriginalModel} -> ${model} ${thinking} (#11863)`];
+          policyWarnings = [...policyWarnings.filter(warning => !warning.startsWith("model: inherited ")), `model: inherited ${request.modelPolicyOriginalModel} -> ${model} ${thinking} (#11863)`];
         }
         logPolicyAdmission();
         if (this.#meshTransport?.transport === "nats") {
@@ -3246,6 +3359,7 @@ export class AgentManager {
           lifecycleOffset: 0,
           lifecycleRemainder: Buffer.alloc(0),
           runDirectory,
+          ...(shortTmpdir ? { temporaryDirectory: shortTmpdir } : {}),
           transport,
           adapter,
           // Ordinary caller abort detaches a managed worker; it must not veto
@@ -3265,6 +3379,7 @@ export class AgentManager {
           ...(routePin ? { routePin } : {}),
           ...(request.actorId ? { actorId: request.actorId } : {}),
           ...(request.actorName ? { actorName: request.actorName } : {}),
+          ...(persistedLane.persistedLane ? { exceptionLane: persistedLane.persistedLane } : {}),
           ...(this.#spawner ? { spawner: this.#spawner } : {}),
           ...(request.capabilityRequirements
             ? { capabilityRequirements: [...request.capabilityRequirements] }
@@ -3388,6 +3503,9 @@ export class AgentManager {
         if (worktree && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json")))) {
           await this.#worktrees.cleanup(id, true).catch(() => false);
         }
+        // smarty-dev#15878: a confirmed non-launch never used its short TMPDIR; an unknown launch keeps it above.
+        if (shortTmpdir && !this.#runs.has(id) && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json"))) &&
+          ownedShortTmpdir(shortTmpdir)) await removeTree(shortTmpdir).catch(() => undefined);
         throw error;
       }
     };
@@ -3738,6 +3856,8 @@ export class AgentManager {
       error: error instanceof Error ? error.message : String(error),
       ...(status === "failed" && error instanceof AgentLaunchPreparationTimeoutError && error.launchOutcome === "unlaunched"
         ? { launchPreparationTimeoutMs: error.timeoutMs } : {}),
+      ...(status === "failed" && error instanceof FabricModelExceptionDeniedError && error.denial === "lane-unresolved"
+        ? { launchDenial: "lane-unresolved" as const } : {}),
       startedAt: queued.enqueuedAt, updatedAt: now, finishedAt: now,
       turns: 0, toolCalls: 0, text: "",
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
@@ -4728,7 +4848,50 @@ export class AgentManager {
     syncDirectoryChain(directory);
     // A restarted owner has no live handle, but the saved native exit and all
     // other archive fences still govern collection of this exact source.
-    if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await removeTree(directory);
+    if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await this.#removeRunTree(directory, runId);
+  }
+
+  /** Remove a run tree, then (only once it is gone) its recorded short TMPDIR outside it (smarty-dev#15878). */
+  async #removeRunTree(runDirectory: string, id: string, known?: string): Promise<void> {
+    const temporary = recordedShortTmpdir(runDirectory, id, known);
+    await removeTree(runDirectory);
+    if (!fs.existsSync(runDirectory)) await removeOwnedShortTmpdir(temporary);
+  }
+
+  /**
+   * pi-fabric#1554 P2-4 (smarty-dev#15878): no private short TMPDIR fits the fleet bash guard, so this child launches on
+   * its run directory's tmp, as before this fix, where the guard will likely block its Bash. Never a refusal (no
+   * lockout), but loud: one named warning event per run in its events.jsonl, and the manager's operator alarm, as for
+   * held permits (the stderr diagnostics line plus onAdmissionAlarm, which Main publishes to its owner as a
+   * fabric.alarm.agent-admission event), at most once per caller TMPDIR per 6 h. A failure to warn never blocks the launch.
+   */
+  #shortTmpdirUnavailable(logFile: string, id: string, runner: string, source: ShortTmpdirSource | undefined, sourceError: unknown): string {
+    try {
+      const budgetBytes = source?.budgetBytes ?? BASH_GUARD_TMPDIR_BYTES;
+      let candidates: { directory: string; bytes: number; fits: boolean }[] = [];
+      try { if (source) candidates = shortTmpdirCandidates(id, source); } catch { /* reported as no candidate */ }
+      const root = source?.tmpdir ?? "the caller's TMPDIR";
+      const reason = !source ? `its TMPDIR source failed: ${sourceError instanceof Error ? sourceError.message : String(sourceError)}`
+        : candidates.length === 0 ? "no candidate root"
+        : candidates.some(candidate => candidate.fits) ? "the candidate that fits is not under a private directory of ours, or could not be created"
+        : `the shortest candidate needs ${Math.min(...candidates.map(candidate => candidate.bytes))} bytes for the guard's p.XXXXXX, over its ${budgetBytes}`;
+      const fallbackTmpdir = path.join(this.#runRoot, id, "tmp");
+      const warning = "tmpdir: short private TMPDIR unavailable (no suitable private candidate); child launched on " + fallbackTmpdir + " and bash may be refused by the fleet guard";
+      const message = `FABRIC_SHORT_TMPDIR_UNAVAILABLE: run ${id}: no private short TMPDIR under ${root} fits the fleet bash guard (${reason}); ` +
+        "it launched on its run directory's tmp, where the guard is likely to block its Bash (smarty-dev#15878)";
+      const now = Date.now();
+      fs.appendFileSync(logFile, JSON.stringify({ type: "tmpdir.short_unavailable", level: "warning", code: "FABRIC_SHORT_TMPDIR_UNAVAILABLE",
+        ts: now, id, runner, budgetBytes, candidates, warning: message }) + "\n", { mode: 0o600 });
+      const last = this.#shortTmpdirAlarmAt.get(root);
+      if (last !== undefined && now - last < ADMISSION_REALARM_MS) return warning;
+      this.#shortTmpdirAlarmAt.set(root, now);
+      diagnostics.warn("src/agents/manager.ts", `[pi-fabric] ${message}`);
+      const alarm: AgentAdmissionAlarm = { kind: "short-tmpdir-unavailable", runId: id, heldPermits: this.heldPermits(),
+        maxConcurrent: this.config.maxConcurrent, at: now, message };
+      try { this.#onAdmissionAlarm?.(structuredClone(alarm)); } catch { /* the stderr line stands */ }
+      return warning;
+    } catch { /* warning only: the launch proceeds on its old TMPDIR */ }
+    return "tmpdir: short private TMPDIR unavailable (diagnostic failed); child launched on " + path.join(this.#runRoot, id, "tmp") + " and bash may be refused by the fleet guard";
   }
   /** Recover only this actor's fenced sources under the configured host run root. */
   actorArchiveSources(actorId: string, sessionFile: string): Map<string, string> {
@@ -5116,7 +5279,7 @@ export class AgentManager {
       if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
       this.#onResultConsumed?.(id);
       const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
-      if (!this.config.retainRuns) await removeTree(runDirectory);
+      if (!this.config.retainRuns) await this.#removeRunTree(runDirectory, id);
       this.#queued.delete(id);
       this.#forgetRunMetadata(id);
       this.#invalidateUiList();
@@ -5154,7 +5317,7 @@ export class AgentManager {
     this.markForeground(id);
     const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
     if (!this.config.retainRuns) {
-      await removeTree(managed.runDirectory);
+      await this.#removeRunTree(managed.runDirectory, id, managed.temporaryDirectory);
     }
     this.#runs.delete(id);
     this.#forgetRunMetadata(id);
@@ -5680,7 +5843,7 @@ export class AgentManager {
           // explicit roots: an unexpected loss keeps custody and a loud refusal.
           if (managed.settledResultFile && !this.#exactResultPresent(managed)) return;
           if (await this.#retainTerminalPromptRecord(managed).catch(() => true)) return;
-          try { await removeTree(managed.runDirectory); } catch { return; } // A swallowed failure is no provenance.
+          try { await this.#removeRunTree(managed.runDirectory, managed.id, managed.temporaryDirectory); } catch { return; } // A swallowed failure is no provenance.
           // A no-op removal or remaining/dangling entry is not collection.
           if (managed.settledResultFile && pathAbsentNoFollow(managed.settledResultFile)) managed.resultCollected = true;
         }));
@@ -5702,7 +5865,7 @@ export class AgentManager {
           await Promise.all([...this.#queued.values()]
             .filter(queued => queued.terminal && !queued.routeSaveFailure && !queued.cleanupPending &&
               !runTreeExitVeto(path.join(this.#runRoot, queued.info.id)))
-            .map(queued => removeTree(path.join(this.#runRoot, queued.info.id)).catch(() => undefined)));
+            .map(queued => this.#removeRunTree(path.join(this.#runRoot, queued.info.id), queued.info.id).catch(() => undefined)));
           // Independently collectible tracked runs were removed above. Retry only
           // the owned empty root; never recursively remove unknown contents.
           await removeManagedRunRoot(this.#runRoot, this.#managedTempRoot);
@@ -5786,7 +5949,7 @@ export class AgentManager {
       if (!this.#canCollect(managed)) continue;
       // Retry settlement saves first; pending deliveries and unsafe contents still veto expiry.
       if (!canRemoveTerminalRun(managed.runDirectory)) continue;
-      await removeTree(managed.runDirectory).catch(() => undefined);
+      await this.#removeRunTree(managed.runDirectory, managed.id, managed.temporaryDirectory).catch(() => undefined);
       if (!fs.existsSync(managed.runDirectory)) {
         this.#runs.delete(managed.id);
         this.#forgetRunMetadata(managed.id);
@@ -6274,7 +6437,8 @@ export class AgentManager {
       let admission: AgentModelAdmission;
       if (managed.runner !== "pi" && managed.runner !== "pi-durable") {
         admission = await this.prepareModelWithReason(managed.model, managed.modelReason, managed.runner, { modelSource: "explicit",
-          thinking: record.thinking ?? managed.thinking, requiredPin: true, role: policyRole });
+          thinking: record.thinking ?? managed.thinking, requiredPin: true, role: policyRole,
+          ...(managed.actorName && managed.exceptionLane ? { persistedLane: managed.exceptionLane } : {}) });
         while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
         if (cancelled()) return false;
       } else {
@@ -6282,7 +6446,7 @@ export class AgentManager {
         // its concrete selector as explicit; refuse a newly protected alias/default.
         admission = await this.prepareModelWithReason(managed.routePin?.model ?? managed.model, managed.modelReason,
           managed.runner, { modelSource: "explicit", thinking: managed.routePin?.effort ?? record.thinking ?? managed.thinking, requiredPin: true,
-            role: policyRole });
+            role: policyRole, ...(managed.actorName && managed.exceptionLane ? { persistedLane: managed.exceptionLane } : {}) });
         while (this.#releasePaused) await this.#waitForRelease(managed.abortSignal);
         if (cancelled()) return false;
         const model = admission.model;
@@ -7460,6 +7624,9 @@ export class AgentManager {
       if (entry === "status.json" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
       await removeTree(path.join(managed.runDirectory, entry));
     }
+    // pi-fabric#1554 P1 (smarty-dev#15878): the loop above prunes the in-tree tmp/ such a run used before. Its short
+    // TMPDIR outside the run tree goes the same way here, or a scratch of more than 64 entries vetoes every later sweep.
+    await removeOwnedShortTmpdir(recordedShortTmpdir(managed.runDirectory, managed.id, managed.temporaryDirectory));
     // Once an unsuccessful run has a retained status, never fall back to deleting its
     // whole tree. Any cleanup error propagates to the close custody fence.
     return true;
@@ -7951,6 +8118,7 @@ export class AgentManager {
       ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
       ...(managed.transport.cgroup ? { cgroup: managed.transport.cgroup } : {}),
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
+      ...(managed.temporaryDirectory ? { temporaryDirectory: managed.temporaryDirectory } : {}),
       logFile: path.join(managed.runDirectory, "events.jsonl"),
       ...(nestedAgents.length > 0 ? { nestedAgents } : {}),
       ...(budget ? { budget } : {}),

@@ -121,7 +121,9 @@ describe("native actor write/edit confinement", () => {
             current.runId = runId!;
             const runDirectory = agents.runDirectory(runId!)!;
             expect(runDirectory).toBeTruthy();
-            const scratch = path.join(runDirectory, "tmp");
+            // smarty-dev#15878: a short private TMPDIR when one fits the host's temp path, else the run's own tmp.
+            const recorded = (JSON.parse(fs.readFileSync(path.join(runDirectory, "status.json"), "utf8")) as { temporaryDirectory?: string }).temporaryDirectory;
+            const scratch = recorded ?? path.join(runDirectory, "tmp");
             current.scratch = scratch;
             if (process.platform === "linux") {
               // Observe the live worker's exec environment as well as bash's:

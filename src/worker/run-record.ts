@@ -9,6 +9,7 @@ import type {
   AgentWorkerOptions,
 } from "../agents/types.js";
 import { actorNameClass } from "../guards/sender-headers.js";
+import { shortTmpdirName } from "../agents/short-tmpdir.js";
 
 const MAX_RUN_ERROR_CHARS = 20_000;
 const MAX_RUN_TEXT_CHARS = 100_000;
@@ -88,6 +89,11 @@ export const createRunningRecord = (
     ? { capabilityRequirements: [...options.capabilityRequirements] }
     : {}),
   ...(options.capabilityDigest ? { capabilityDigest: options.capabilityDigest } : {}),
+  // smarty-dev#15878: this run's own short TMPDIR outside the run directory is recorded so cleanup can find it; no
+  // other --tmpdir (pi-fabric#1554 P3-8).
+  ...(options.tmpdir && path.basename(options.tmpdir) === shortTmpdirName(options.id) &&
+    path.relative(path.dirname(options.statusFile), options.tmpdir).startsWith("..")
+    ? { temporaryDirectory: options.tmpdir } : {}),
   startedAt,
   updatedAt: startedAt,
   turns: options.carryOver?.turns ?? 0,

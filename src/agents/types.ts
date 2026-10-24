@@ -286,6 +286,8 @@ export interface AgentRunRecord {
   capabilityDigest?: string;
   recursive?: boolean;
   residency?: FabricParticipantResidency;
+  /** smarty-dev#15878: the run's short private TMPDIR outside its run directory; cleanup follows the run. */
+  temporaryDirectory?: string;
   startedAt: number;
   updatedAt: number;
   finishedAt?: number;
@@ -377,6 +379,9 @@ export interface AgentRunResult extends AgentRunRecord {
   /** Failed admission only: model/auth timed out before any transport launch was attempted.
    * The receipt remains terminal; an actor may separately retry its unlaunched activation. */
   launchPreparationTimeoutMs?: number;
+  /** Failed admission only (smarty-dev#16357): the bound root lane was unresolved, so no worker started.
+   * The receipt remains terminal; an actor may separately retry its unlaunched activation. */
+  launchDenial?: "lane-unresolved";
   status: "completed" | "failed" | "stopped" | "timed_out";
 }
 
@@ -676,8 +681,10 @@ export interface AgentAdmissionAlarm {
   maxConcurrent: number;
   at: number;
   message: string;
-  /** pi-fabric#939 round 4: one owner alarm when a held run's recovered answer cannot be saved (names the run). */
-  kind?: "recovered-answer-save-failed";
+  /** pi-fabric#939 round 4: one owner alarm when a held run's recovered answer cannot be saved (names the run).
+   * pi-fabric#1554 P2-4: one alarm when a child launches without a short TMPDIR that fits the fleet bash guard
+   * (names the first such run; at most once per caller TMPDIR per 6 h). */
+  kind?: "recovered-answer-save-failed" | "short-tmpdir-unavailable";
   runId?: string;
 }
 

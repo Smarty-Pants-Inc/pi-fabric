@@ -9,6 +9,7 @@ import { processStartTime } from "../residency/process-identity.js";
 import { FileLockBusy, lockFile } from "../residency/file-lock.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
 import { recoverEnodevTaskRun } from "../agents/enodev-recovery.js";
+import { ownedShortTmpdir, recordedShortTmpdir } from "../agents/short-tmpdir.js";
 import { copyFabricProvenance } from "../fabric-provenance.js";
 import { readFinalAnswerReceipt } from "../worker/terminal-answer.js";
 import { readTerminalAdmission, terminalAdmissionFromEntry, terminalControlMatchesAdmission, terminalSenderMatches, type TerminalAdmission } from "../agents/terminal-notices.js";
@@ -36,6 +37,7 @@ interface RunRecordSummary {
   processStartTime?: string;
   queuedArchiveCommitted?: boolean;
   cleanupPending?: boolean;
+  temporaryDirectory?: string;
 }
 export interface RetentionSweepResult {
   removedRoots: string[];
@@ -391,6 +393,15 @@ const safeDurableTree = (directory: string, expired: Deadline): boolean => !expi
   });
 }) && !expired();
 /** Unknown transports/contents and live descendants veto removal, even under a dead host. */
+/** smarty-dev#15878: a recorded short TMPDIR outside the run tree keeps the in-tree tmp's custody rule. */
+const externalScratchRefusal = (root: string, record: RunRecordSummary | undefined, expired: Deadline): string | undefined => {
+  const temporary = recordedShortTmpdir(root, path.basename(root), record?.temporaryDirectory ?? null);
+  if (!temporary) return undefined;
+  try { fs.lstatSync(temporary); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? undefined : "run tree unreadable"; }
+  if (!ownedStat(temporary)?.isDirectory()) return "an entry is a link, hard-linked or not ours";
+  return boundedRunTree(temporary, expired) ? undefined : "task scratch subtree is unsafe or exceeds scan bounds";
+};
 const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
   // Offline collection cannot establish never-launched custody from filenames
@@ -411,6 +422,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
   }
   try {
     if (!safeTerminalArtifacts(root, expired)) return false;
+    if (externalScratchRefusal(root, record, expired)) return false;
     for (const name of fs.readdirSync(root)) {
       if (expired()) return false;
       const file = path.join(root, name);
@@ -487,6 +499,8 @@ const runTreeRefusal = (root: string, acceptPidReuse: boolean): string => {
   if (pid !== undefined && savedWriterAlive(pid, record, acceptPidReuse)) return "saved worker PID is live";
   try {
     if (!safeTerminalArtifacts(root, noDeadline)) return "terminal answer, notices or controls not proven consumed";
+    const scratch = externalScratchRefusal(root, record, noDeadline);
+    if (scratch) return scratch;
     for (const name of fs.readdirSync(root)) {
       const file = path.join(root, name);
       const stat = ownedStat(file);
@@ -527,6 +541,20 @@ const recoverEnodevTask = (directory: string): void => {
 };
 /** Main's path-based recursive removal: the non-Linux fallback of verifiedRemove only (smarty-dev#7858). */
 const rmTree = (target: string) => (): boolean => { fs.rmSync(target, { recursive: true, force: true }); return true; };
+/** smarty-dev#15878: after its run tree, a run's recorded short TMPDIR outside it, by the same verified removal. */
+const removeShortTmpdirAfterRun = (temporary: string | undefined, deleter: string): void => {
+  const judged = temporary ? ownedShortTmpdir(temporary) : undefined;
+  if (temporary && judged) verifiedRemove(temporary, judged, { deleter, fallback: rmTree(temporary) });
+};
+/** pi-fabric#1554 P2-2: verifiedRemove of a run tree named by its run id, then (only once that removed it) its recorded
+ * short TMPDIR outside it. For deleters that hold their own safety proof, such as resident run retention. */
+export const removeRunTreeAndShortTmpdir = (directory: string, judged: fs.Stats | undefined,
+  options: { deleter: string; fallback: () => boolean }): boolean => {
+  const temporary = recordedShortTmpdir(directory, path.basename(directory));
+  const removed = verifiedRemove(directory, judged, options).removed;
+  if (removed) removeShortTmpdirAfterRun(temporary, options.deleter);
+  return removed;
+};
 export const removeEmptyRunRoot = (root: string): boolean => {
   try {
     const judged = ownedStat(root);
@@ -561,7 +589,11 @@ const pruneClosedRunRoot = (
     // The judged stat: taken after recovery, before the safety walk; the removal requires it unchanged.
     const judged = ownedStat(directory);
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) { countRefusal("pruneClosedRunRoot", "run tree is not proven safe", directory); continue; }
-    if (verifiedRemove(directory, judged, { deleter: "pruneClosedRunRoot", fallback: rmTree(directory) }).removed) removed.push(directory);
+    const temporary = recordedShortTmpdir(directory, entry.name, record?.temporaryDirectory ?? null);
+    if (verifiedRemove(directory, judged, { deleter: "pruneClosedRunRoot", fallback: rmTree(directory) }).removed) {
+      removed.push(directory);
+      removeShortTmpdirAfterRun(temporary, "pruneClosedRunRoot");
+    }
   }
   return removed;
 };
@@ -734,7 +766,10 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       const judged = ownedStat(directory);
       if (!safeRunTree(directory, false, 0, expired)) { countRefusal("sweepTempRunRoots", "run tree is not proven safe", directory); continue; }
       // Reported as the root's removal once it is empty, as before.
-      verifiedRemove(directory, judged, { deleter: "sweepTempRunRoots", fallback: rmTree(directory) });
+      const temporary = recordedShortTmpdir(directory, run.name);
+      if (verifiedRemove(directory, judged, { deleter: "sweepTempRunRoots", fallback: rmTree(directory) }).removed) {
+        removeShortTmpdirAfterRun(temporary, "sweepTempRunRoots");
+      }
     }
     if (removeEmptyRunRoot(root)) result.removedRoots.push(root);
   }
@@ -1099,8 +1134,11 @@ export const removeUnreferencedRun = (
 ): boolean => {
   const check = (): boolean => { try { return !!referenced?.(); } catch { return true; } };
   if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
-  return verifiedRemove(directory, judged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(),
+  const temporary = dryRun ? undefined : recordedShortTmpdir(directory, path.basename(directory));
+  const removed = verifiedRemove(directory, judged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(),
     fallback: () => mainRemoveUnreferencedRun(directory, referenced, check) }).removed;
+  if (removed) removeShortTmpdirAfterRun(temporary, deleter);
+  return removed;
 };
 /** Main's path-based tombstone removal, unchanged: the non-Linux fallback only (smarty-dev#7858). */
 const mainRemoveUnreferencedRun = (directory: string, referenced: (() => boolean) | undefined, check: () => boolean): boolean => {

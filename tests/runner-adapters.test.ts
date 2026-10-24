@@ -232,6 +232,77 @@ describe("custom worker runners", () => {
 });
 
 describe("hosted runners", () => {
+  // Incident probe: exercise the real manager/hosted boundary and persisted audit log,
+  // not the timeout-policy helper or adapter call counts alone.
+  it.each([30_000, 299_999, 300_000, 300_001, undefined])(
+    "records hosted timeout-ignore events exactly once with consistent notes: %s",
+    async (timeoutMs) => {
+      const root = tempRoot();
+      const readTimeoutEvents = (runDirectory: string) => {
+        const logFile = path.join(runDirectory, "events.jsonl");
+        // With no timeout note or transcript yet, no event file need exist.
+        const text = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "";
+        return text.split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as {
+            type: string;
+            ts: number;
+            id: string;
+            timeoutNote?: AgentRunRecord["timeoutNote"];
+          })
+          .filter((event) => event.type === "run.timeout_ignored");
+      };
+      let eventsAtStart: ReturnType<typeof readTimeoutEvents> = [];
+      const fake = fakeHosted("daemon", {
+        onStart: (reporter, context) => {
+          eventsAtStart = readTimeoutEvents(context.runDirectory);
+          reporter.transcript({ type: "message_end", message: { role: "assistant", content: "hosted progress" } });
+          reporter.finish({ status: "completed", output: "timeout audit complete" });
+        },
+      });
+      register(fake.adapter);
+      const manager = managerFor(root, { timeoutMs: 600_000 });
+      const beforeSpawn = Date.now();
+      const handle = await manager.spawn({
+        task: "Audit hosted one-shot timeout",
+        runner: "daemon",
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      });
+      const afterSpawn = Date.now();
+      const result = await manager.wait(handle.id);
+      expect(result).toMatchObject({ status: "completed", runner: "daemon", transport: "hosted" });
+      const expectedNote = timeoutMs !== undefined && timeoutMs < 300_000
+        ? {
+            code: "AGENT_TIMEOUT_BELOW_SHORTENING_FLOOR",
+            requestedTimeoutMs: timeoutMs,
+            effectiveTimeoutMs: 600_000,
+            minimumTimeoutMs: 300_000,
+          }
+        : undefined;
+      expect(handle.timeoutNote).toEqual(expectedNote);
+      expect(fake.statusAtStart?.timeoutNote).toEqual(expectedNote);
+      expect(readStatus(manager, handle.id).timeoutNote).toEqual(expectedNote);
+      expect(result.timeoutNote).toEqual(expectedNote);
+      const events = readTimeoutEvents(manager.runDirectory(handle.id)!);
+      expect(eventsAtStart).toEqual(events);
+      if (expectedNote) {
+        expect(events).toEqual([{
+          type: "run.timeout_ignored",
+          ts: expect.any(Number),
+          id: handle.id,
+          timeoutNote: expectedNote,
+        }]);
+        expect(events[0]!.ts).toBeGreaterThanOrEqual(beforeSpawn);
+        expect(events[0]!.ts).toBeLessThanOrEqual(afterSpawn);
+      } else {
+        expect(events).toEqual([]);
+      }
+      const effectiveTimeoutMs = expectedNote ? 600_000 : timeoutMs ?? 600_000;
+      expect(fake.contexts[0]!.deadlineAt).toBeGreaterThanOrEqual(beforeSpawn + effectiveTimeoutMs);
+      expect(fake.contexts[0]!.deadlineAt).toBeLessThanOrEqual(afterSpawn + effectiveTimeoutMs);
+    },
+  );
+
   it("persists the locator before start, routes questions, and finishes", async () => {
     const root = tempRoot();
     const fake = fakeHosted("daemon", {

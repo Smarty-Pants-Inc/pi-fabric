@@ -235,7 +235,7 @@ const runRequest = (
   options: { allowCwd?: boolean; inheritedThinking?: string | undefined } = {},
 ): AgentRunRequest => ({
   ...normalizeAgentRunRequest(
-    { ...args, timeoutMs: longerTimeoutOverride(args.timeoutMs, manager) },
+    args,
     {
       ...manager.config,
       ...(modelsConfig ? { models: modelsConfig } : {}),

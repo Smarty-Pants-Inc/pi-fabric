@@ -232,7 +232,16 @@ export interface AgentCompactionStatus {
   error?: string;
 }
 
+export interface AgentTimeoutIgnoredNote {
+  code: "AGENT_TIMEOUT_BELOW_SHORTENING_FLOOR";
+  requestedTimeoutMs: number;
+  effectiveTimeoutMs: number;
+  minimumTimeoutMs: number;
+}
+
 export interface AgentRunRecord {
+  /** A tiny explicit shortening was ignored to protect real work. */
+  timeoutNote?: AgentTimeoutIgnoredNote;
   /** Manager-owned durable intent distinguishing operator/deadline stops from worker checkpoints.
    * by/path are absent only on legacy records written before stop-caller provenance was added. */
   stopIntent?: AgentRunStopIntent;
@@ -386,6 +395,8 @@ export interface AgentRunResult extends AgentRunRecord {
 }
 
 export interface AgentHandleInfo {
+  /** A tiny explicit shortening was ignored to protect real work. */
+  timeoutNote?: AgentTimeoutIgnoredNote;
   /** Policy switch/audit diagnostics are present on receipts and final results. */
   warnings?: string[];
   /** Spawn admission: unavailable discovery never blocks launch, but is explicit in the receipt. */

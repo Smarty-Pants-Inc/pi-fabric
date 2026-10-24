@@ -150,6 +150,8 @@ export interface FabricExecutionResult {
   elapsedMs: number;
   typeErrors?: FabricTypeError[];
   error?: string;
+  /** Host-only terminal identity classification, never decoded from guest text. */
+  terminalAgentSpawnRefusal?: FabricSandboxResult["terminalAgentSpawnRefusal"];
   residentOutcomes?: FabricResidentOutcomeReceipt[];
   handoffRequest?: Record<string, unknown>;
   usage?: Usage;
@@ -1400,6 +1402,7 @@ export class FabricExecutionService {
       } catch (error) {
         sandboxResult.terminationReason = "runtime_error";
         sandboxResult.error = error instanceof Error ? error.message : String(error);
+        delete sandboxResult.terminalAgentSpawnRefusal;
       }
       if (executionOutcomeFromTermination(sandboxResult.terminationReason) === "succeeded") invocationOutcome = "succeeded";
     } catch (error) {
@@ -1471,6 +1474,9 @@ export class FabricExecutionService {
       elapsedMs: performance.now() - startedAt,
       ...(sandboxResult.error ? { error: sanitizeFabricMediaText(sandboxResult.error) } : {}),
       ...(sandboxResult.residentOutcomes ? { residentOutcomes: sandboxResult.residentOutcomes } : {}),
+      ...(runOutcome === "failed" && sandboxResult.terminationReason === "runtime_error" &&
+        !programSignal.aborted && !sandboxResult.residentOutcomes?.length && sandboxResult.terminalAgentSpawnRefusal
+        ? { terminalAgentSpawnRefusal: sandboxResult.terminalAgentSpawnRefusal } : {}),
       ...(handoffRequest ? { handoffRequest } : {}),
       ...(ownedWork.length > 0 ? { ownedWork } : {}),
       ...(classifierUsages.length > 0

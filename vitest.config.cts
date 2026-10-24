@@ -3,6 +3,7 @@ type UserConfig = import("vitest/config").ViteUserConfig;
 // Vite loads a CommonJS config bundle in memory; ESM configs emit into node_modules/.vite-temp
 // before cacheDir can take effect. Keep this entry .cts so plain `vitest run` is read-only-install safe.
 const { join } = require("node:path") as typeof import("node:path");
+const { hostedOnly } = require("./scripts/hosted-only.mjs") as typeof import("./scripts/hosted-only.mjs");
 const { isolatedTestTemp, isolateTestFleetEnvironment } = require("./scripts/test-temp.ts") as typeof import("./scripts/test-temp.js");
 
 // Assign the caller-owned run root before Vitest snapshots its environment, forks workers,
@@ -41,19 +42,17 @@ const hostedOnlyDeletionSuites = [
   "tests/stall-alarms.test.ts", // nice/bun crash fixture reaches MeshStore/lock cleanup before its crash.
   "tests/task-write-policy.test.ts", // sentinel run's native proof timed out; unproven slice stays hosted-only (#13018).
   "tests/temp-run-sweep.test.ts", // scriptSpawnArgs selects Bun for the real .ts sweep entry.
+  "tests/mesh-state-windows-acl.test.ts", // native ACL fixtures are created/removed below USERPROFILE, outside TMPDIR.
   "tests/verified-remove-windows.test.ts", // fabric-win-remove.exe deletes by handle, outside Node fs.
   "tests/windows-temp-root-native.test.ts", // diskpart formats a native NTFS VHD mounted outside TMPDIR.
 ];
 
-/** Unguarded or reverted deletion suites stay hosted-only; GitHub Actions always collects every suite. */
+/** Unguarded or reverted deletion suites require a GitHub-hosted runner with no fleet veto. */
 function productDeletionSuites(): string[] {
-  return process.env.GITHUB_ACTIONS === "true" ? [] : [...hostedOnlyDeletionSuites];
+  return hostedOnly("native/tool or reverted deletion suites") ? [] : [...hostedOnlyDeletionSuites];
 }
 
 const localRealDeleteSuites = productDeletionSuites();
-if (localRealDeleteSuites.length > 0) {
-  console.warn(`smarty-dev#4664: local run skips ${localRealDeleteSuites.length} native/tool or reverted deletion suites`);
-}
 
 // Generic CI checks do not own a broker. Exclude whole broker-capable suites before
 // affected-test discovery (including their fake cases); dedicated nats-* jobs run them.
@@ -63,6 +62,8 @@ const realBrokerNatsSuites = [
   "tests/mesh-state-backend-multiprocess.test.ts",
   "tests/mesh-backend-migration-nats.test.ts",
   "tests/state-backend-nats-election.test.ts",
+  "tests/state-backend-nats-publish-dedupe.test.ts",
+  "tests/state-backend-nats-pull-recovery.test.ts",
   "tests/nats-auth-server.test.ts",
 ];
 const excludedSuites = [...localRealDeleteSuites,

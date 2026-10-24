@@ -2,9 +2,10 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { diagnostics, notifyDiagnostic } from "./core/diagnostics.js";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
 import { RootInboxWatch } from "./topology/root-inbox-wake.js";
-import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmRecipient } from "./topology/stall-alarms.js";
+import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmEnvelope, admissionAlarmRecipient } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
-import { recordsInboxMessage, recordsInboxSession, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
+import { recordsInboxMessage, RecordsInboxCursor, type RecordsInboxBatch, type RecordsInboxSession } from "./records/inbox.js";
+import type { SessionEntryCursorManager } from "./core/preview.js";
 import { RECORDS_DISABLED_HINT } from "./records/config.js";
 import { RecordsProvider } from "./providers/records-provider.js";
 import { closeWithActors } from "./actors/close-order.js";
@@ -97,9 +98,11 @@ import { LifecycleBroker } from "./lifecycle/broker.js";
 import { extensionContextLive } from "./session-liveness.js";
 import type { FabricLifecycleEventType } from "./lifecycle/types.js";
 import { FabricControlPlane } from "./topology/control-plane.js";
-import { ParticipantDirectory } from "./topology/participant-directory.js";
+import { ParticipantDirectory, type FabricPeerListOptions } from "./topology/participant-directory.js";
 import type { FabricTransport } from "./transport/types.js";
+import type { SessionChannel, SessionChannelIdentity, SessionChannelOpenOptions } from "./transport/nats/session-channel.js";
 import { rootParticipantName, validName } from "./topology/participant-name.js";
+import { createSandboxFabricMesh } from "./transport/sandbox/fabric-mesh.js";
 import { herdrNameLookup, herdrPaneId, readHerdrAgentName } from "./topology/herdr-name.js";
 import type {
   FabricParticipantInfo,
@@ -160,7 +163,8 @@ import { participantProject, ParticipantRoleGrant } from "./topology/project-ide
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
 import { ActorChildCompletionStore } from "./actors/child-completions.js";
-import { resolveAgentSpawner } from "./agents/spawner.js";
+import { boundAgentSpawner, resolveAgentSpawner } from "./agents/spawner.js";
+import { sandboxAutoReturnForChildRoot, type SandboxAutoReturn } from "./agents/sandbox-auto-return.js";
 import { rememberStoppedAtClose, restoreStoppedRuns, STOPPED_AGENTS_ENTRY, type StoppedAgentsEntryData } from "./agents/stopped-runs.js";
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { FabricShellTimingBridge } from "./core/shell-timing.js";
@@ -249,6 +253,7 @@ export class FabricRuntimeState {
   #meshActivationReady: () => boolean = () => false;
   #records: Promise<RecordsService> | undefined;
   #openRecords: (() => Promise<RecordsService>) | undefined;
+  readonly #recordsInboxCursor = new RecordsInboxCursor();
   #mesh: MeshStore | undefined;
   #disposableMeshWrites: AbortController | undefined;
   #backgroundMesh = new MeshBackgroundQueue("runtime lifecycle/compaction");
@@ -263,9 +268,12 @@ export class FabricRuntimeState {
   #control: FabricControlPlane | undefined;
   #transport: FabricTransport | undefined;
   #transportAbort: AbortController | undefined;
+  readonly #sessionChannels = new Map<string, { readonly version: number; readonly channel: SessionChannel }>();
   #lifecycle: LifecycleBroker | undefined;
   #residency: ResidencyClient | undefined;
   #agentsProvider: AgentsProvider | undefined;
+  #sandboxAutoReturn: SandboxAutoReturn<FabricAgentMessageResult> | undefined;
+  readonly #sandboxAutoReturnUnsubscribe: Array<() => void> = [];
   #compact: CompactController | undefined;
   #schema: SchemaController | undefined;
   #componentSupervisor: FabricComponentSupervisor | undefined;
@@ -328,6 +336,43 @@ export class FabricRuntimeState {
 
   get initialized(): boolean {
     return Boolean(this.#execution);
+  }
+
+  async openSessionChannel(options: SessionChannelOpenOptions): Promise<SessionChannel> {
+    const org = this.#config?.mesh.nats.org;
+    if (!org) throw new Error("mesh.nats.org is required to open a Fabric session channel");
+    const transport = this.#transport;
+    if (!transport || transport.kind !== "nats") throw new Error("Fabric session channels require the NATS transport");
+    if (this.#identity?.kind !== "main" || !this.#participants) throw new Error("Fabric session channels require a local Main session");
+    const root = this.#participants.self();
+    if (!root?.sessionId) throw new Error("Fabric Main session identity is unavailable");
+    const natsTransport = transport as FabricTransport & {
+      openSessionChannel(identity: SessionChannelIdentity, channel: SessionChannelOpenOptions): Promise<SessionChannel>;
+    };
+    if (typeof natsTransport.openSessionChannel !== "function") throw new Error("NATS session channels are unavailable");
+    const channel = await natsTransport.openSessionChannel({
+      org,
+      hostId: transport.self.hostId,
+      sessionId: root.sessionId,
+      sessionGeneration: this.#participants.ownerIncarnation,
+    }, options);
+    const registration = { version: options.version, channel };
+    this.#sessionChannels.set(options.service, registration);
+    this.#participants.scheduleRefresh();
+    let closed = false;
+    return {
+      handle: (op, handler) => channel.handle(op, handler),
+      publish: (event) => channel.publish(event),
+      close: () => {
+        if (closed) return;
+        closed = true;
+        channel.close();
+        if (this.#sessionChannels.get(options.service) === registration) {
+          this.#sessionChannels.delete(options.service);
+          this.#participants?.scheduleRefresh();
+        }
+      },
+    };
   }
 
   get widgetDismissedAt(): number {
@@ -397,7 +442,7 @@ export class FabricRuntimeState {
     return this.#mainAgent.info(context);
   }
 
-  peerInfos(options: FabricParticipantListOptions = {}): FabricPeerInfo[] {
+  peerInfos(options: FabricPeerListOptions = {}): FabricPeerInfo[] {
     return this.#participants?.peers(undefined, options) ?? [];
   }
 
@@ -490,9 +535,14 @@ export class FabricRuntimeState {
     return service.inbox?.next(session);
   }
 
+  /** Re-derive the branch-local records cursor at each session_start/tree replacement. */
+  resetRecordsInboxCursor(session: SessionEntryCursorManager): void {
+    this.#recordsInboxCursor.reset(session);
+  }
+
   /** The same, as the one message that brings the batch into the session; undefined when empty. */
-  async nextRecordsInboxMessage(entries: readonly unknown[]): Promise<ReturnType<typeof recordsInboxMessage> | undefined> {
-    const batch = await this.nextRecordsInbox(recordsInboxSession(entries));
+  async nextRecordsInboxMessage(session: SessionEntryCursorManager): Promise<ReturnType<typeof recordsInboxMessage> | undefined> {
+    const batch = await this.nextRecordsInbox(this.#recordsInboxCursor.session(session));
     return batch?.records.length ? recordsInboxMessage(batch.records) : undefined;
   }
 
@@ -864,6 +914,11 @@ export class FabricRuntimeState {
     const sessionId = context.sessionManager.getSessionId();
     const role = this.#roleGrant.roleFor(sessionId, context.cwd);
     const { identity, mainAgentId } = resolveFabricIdentity(sessionId);
+    this.#sandboxAutoReturn = sandboxAutoReturnForChildRoot({
+      runId: process.env.PI_FABRIC_RUN_ID,
+      spawner: boundAgentSpawner(),
+      isRoot: identity.kind === "main",
+    }) as SandboxAutoReturn<FabricAgentMessageResult> | undefined;
     await builtins.install(createProviderComponent({
       provider: "cache",
       description: "Local prompt-cache observations and scoped native warming",
@@ -915,7 +970,7 @@ export class FabricRuntimeState {
       },
       (event) => { this.#alarmProviderDead(mainAgentId, event); },
       meshRoot,
-      role === "project-agent",
+      role === "project-agent" || role === "org-agent",
     );
     this.#mainAgent = mainAgent;
     // SMARTY_AGENT is the primary name (smarty-dev#11146). An unnamed interactive Main falls
@@ -1021,6 +1076,8 @@ export class FabricRuntimeState {
       presencePassMs: 25_000,
       terminalActor: entry => (transport ? directoryActors : this.#actors)?.validateSessionActorTombstone(entry),
       presencePass: async () => {
+        // Commit notifications are primary; reuse maintenance without delaying lease renewal on a backlog.
+        if (transport && meshConfig.nats.events === true) void mesh.retryEventPublications();
         await rootPresenceAlarms(transport ? mesh : this.#mesh!, identity, hostId,
           (transport ? participants : this.#participants!).list({ scope: "project", includeStale: true, fresh: true }),
           transport ? meshConfig.rootPresenceAlarmMs : this.#config!.mesh.rootPresenceAlarmMs);
@@ -1066,6 +1123,9 @@ export class FabricRuntimeState {
       if (!live.current()) throw new Error("Pi Fabric mesh activation lifecycle retired");
       let inboxActivation: string | undefined;
       if (meshConfig.enabled && mainAgent.local) {
+        // SQLite's first open initializes its store under the mesh fence. Open it before file
+        // custody, so resumeLineage's read below never tries to take that fence while custody is held.
+        if (mesh.stateBackend === "sqlite") mesh.stateBackendHandle.stateToken();
         // resumeLineage awaits a mesh write. Hold file custody across that await;
         // mesh.custody callbacks are synchronous and would release it too early.
         const releaseCustody = await acquireMeshCustodyLock(meshRoot);
@@ -1254,6 +1314,25 @@ export class FabricRuntimeState {
       actorChildStore ? (ids) => actorChildStore.consumeLiveBatch(ids) : undefined);
     this.#completionInbox = completionInbox;
     const firstSeenAgents = new Map<string, number>();
+    const sandboxDependencies = transport?.kind === "nats" && agentConfig.sandbox.enabled
+      ? await (async () => {
+          const { createSandboxFabricMesh } = await import("./transport/sandbox/fabric-mesh.js");
+          const participantView = participants.participantView;
+          if (!participantView) throw new Error("Sandbox requires the live NATS participant view");
+          return {
+            meshTransport: "nats" as const,
+            org: process.env.SMARTY_ORG?.trim() || "smarty-pants",
+            mesh: createSandboxFabricMesh({
+              transport,
+              participants,
+              participantView,
+              control: this.#control!,
+              canSend: () => controlInboxBound && meshActivationReady && natsPublicationReady &&
+                this.#bindingFresh() && live.current() && participants.canConsumeMesh(),
+            }),
+          };
+        })()
+      : undefined;
     let markStoppedDelivered = (_id: string): void => {};
     recordMainRelease(sessionId, loadedFabricRoot(import.meta.url));
     this.#agents = new AgentManager(context.cwd, agentConfig, {
@@ -1262,11 +1341,30 @@ export class FabricRuntimeState {
       kernel: () => this.#config?.executor.kernel ?? "typescript",
       pythonRuntime: () => this.#config?.executor.pythonRuntime ?? "monty",
       mainAgentId,
+      rootSessionCwd: () => {
+        const root = this.#participants?.get(mainAgentId, undefined, { fresh: true });
+        return root?.kind === "root" && root.id === mainAgentId && typeof root.cwd === "string" && root.cwd.trim().length > 0
+          ? root.cwd
+          : undefined;
+      },
       fabricSessionId,
       meshRoot,
       projectRoot,
       hostId,
       identityId: identity.id,
+      ...(sandboxDependencies ? { sandbox: sandboxDependencies } : {}),
+      placementTerminalWriter: async (record) => {
+        if (transport) {
+          if (!transport.writePlacementTerminal) {
+            const { PlacementTerminalWriteError } = await import("./placement/terminal.js");
+            throw new PlacementTerminalWriteError();
+          }
+          await transport.writePlacementTerminal(record);
+          return;
+        }
+        const { writePlacementTerminalFile } = await import("./placement/terminal.js");
+        writePlacementTerminalFile(meshRoot, hostId, record);
+      },
       ...(transport ? {
         meshTransport: structuredClone({ transport: meshConfig.transport,
           ...(meshConfig.hostTransport ? { hostTransport: meshConfig.hostTransport } : {}), nats: meshConfig.nats }),
@@ -1361,10 +1459,11 @@ export class FabricRuntimeState {
           diagnostics.warn("src/fabric-runtime-state.ts", "[pi-fabric] agent-admission alarm not published: no owner session address (the stderr line stands)");
           return;
         }
-        // A named run's failed recovery save is an ops.owner alarm (pi-fabric#939 round 4); the held count stays a fabric.alarm.
-        const owner = alarm.kind === "recovered-answer-save-failed";
-        void this.#backgroundMesh.enqueue(() => mesh.publish({ topic: owner ? "ops.owner" : "fabric.alarm.agent-admission",
-          kind: owner ? "actor.alarm" : "agent-admission-held", from, to, text: alarm.message, data: { ...alarm } })).catch(() => undefined);
+        // A named run's failed recovery save is an ops.owner alarm (pi-fabric#939 round 4); the held count and a child
+        // launched without a fitting short TMPDIR (pi-fabric#1554) are fabric.alarm.agent-admission events.
+        const envelope = admissionAlarmEnvelope(alarm);
+        void this.#backgroundMesh.enqueue(() => mesh.publish({ topic: envelope.topic,
+          kind: envelope.kind, from, to, text: alarm.message, data: { ...alarm } })).catch(() => undefined);
       },
       onFollowUpAlarm: (alarm) => {
         this.pi.sendMessage({ customType: "pi-fabric-follow-up-alarm", content: alarm.message, display: true, details: alarm },
@@ -1611,7 +1710,8 @@ export class FabricRuntimeState {
       participants.registerSource(() => {
         const current = live.read(ctx => mainAgent.info(ctx));
         rootInfo = current ?? { ...rootInfo, updatedAt: Date.now() };
-        return [participants.root(rootInfo, mainAgent.interactive, mainName(), { role }, herdr.pane)];
+        const services = [...this.#sessionChannels].map(([name, service]) => ({ name, version: service.version }));
+        return [participants.root(rootInfo, mainAgent.interactive, mainName(), { role }, herdr.pane, services)];
       });
     };
     const registerAgentSource = (): void => {
@@ -1698,9 +1798,11 @@ export class FabricRuntimeState {
         void pending.then(() => owner.pending.delete(pending), () => owner.pending.delete(pending));
         return pending;
       },
+      this.#sandboxAutoReturn,
     );
     agentsProvider.providerParticipants = providerParticipants;
     this.#agentsProvider = agentsProvider;
+    this.#installSandboxAutoReturn(agentsProvider, this.#sandboxAutoReturn);
     actorControlProvider = agentsProvider;
     if (transport) {
       // Publish native recovery and sources before control/spawn admission opens.
@@ -2337,6 +2439,8 @@ export class FabricRuntimeState {
   }
 
   async shutdown(reason?: string, targetSessionFile?: string): Promise<void> {
+    for (const { channel } of this.#sessionChannels.values()) channel.close();
+    this.#sessionChannels.clear();
     this.#stopHerdrLookup?.();
     this.#stopHerdrLookup = undefined;
     this.#meshActivationReady = () => false;
@@ -2561,6 +2665,65 @@ export class FabricRuntimeState {
     await repairs?.flush();
   }
 
+  #installSandboxAutoReturn(
+    provider: AgentsProvider,
+    autoReturn: SandboxAutoReturn<FabricAgentMessageResult> | undefined,
+  ): void {
+    if (!autoReturn) return;
+    let active = true;
+    let lastAssistantStopReason: string | undefined;
+    this.#sandboxAutoReturnUnsubscribe.push(() => { active = false; });
+    const subscribe = (event: string, handler: (...args: any[]) => unknown): void => {
+      const callback = (...args: any[]): unknown => active ? handler(...args) : undefined;
+      const unsubscribe = (this.pi.on as (name: string, callback: (...args: any[]) => unknown) => unknown)(event, callback);
+      if (typeof unsubscribe === "function") this.#sandboxAutoReturnUnsubscribe.push(unsubscribe as () => void);
+    };
+    const textOf = (content: unknown): string => {
+      if (typeof content === "string") return content;
+      if (!Array.isArray(content)) return "";
+      return content.map(part => {
+        if (typeof part !== "object" || part === null || Array.isArray(part)) return "";
+        const block = part as { type?: unknown; text?: unknown };
+        return block.type === "text" && typeof block.text === "string" ? block.text : "";
+      }).join("");
+    };
+    subscribe("message_start", event => {
+      const message = (event as { message?: { role?: unknown; content?: unknown; provenance?: unknown } }).message;
+      if (message?.role !== "user") return;
+      if (autoReturn.receiveTask({ message: textOf(message.content), provenance: message.provenance })) {
+        lastAssistantStopReason = undefined;
+      }
+    });
+    subscribe("message_end", event => {
+      const message = (event as { message?: { role?: unknown; content?: unknown; stopReason?: unknown } }).message;
+      if (message?.role !== "assistant" || !autoReturn.hasTaskReceipt) return;
+      autoReturn.recordAssistantText(textOf(message.content));
+      lastAssistantStopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
+    });
+    subscribe("agent_settled", async (event, context) => {
+      const settled = event as { outcome?: unknown; aborted?: unknown } | undefined;
+      const outcome = typeof settled?.outcome === "string" ? settled.outcome
+        : settled?.aborted === true || (context as ExtensionContext | undefined)?.signal?.aborted ? "aborted"
+          : lastAssistantStopReason === "error" || lastAssistantStopReason === "aborted" ? lastAssistantStopReason
+            : "unknown";
+      try {
+        await autoReturn.sendAutomaticResult(outcome, message => provider.sendSandboxAutoReturn(message));
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error && typeof error.code === "string"
+          ? error.code : error instanceof Error ? error.name : "UnknownError";
+        try {
+          this.pi.appendEntry("pi-fabric.sandbox-result-failure", {
+            runId: autoReturn.runId, spawnerId: autoReturn.spawnerId, code,
+          });
+        } catch { /* the parent result wait still owns terminal failure publication */ }
+        diagnostics.warn("src/fabric-runtime-state.ts",
+          `[pi-fabric] sandbox result send failed (${code}); the parent result wait will publish terminal failure if no result arrived`);
+      } finally {
+        lastAssistantStopReason = undefined;
+      }
+    });
+  }
+
   async #closeInternal(): Promise<void> {
     const transport = this.#transport;
     const transportAbort = this.#transportAbort;
@@ -2585,6 +2748,8 @@ export class FabricRuntimeState {
 
   async #closeInternalSteps(): Promise<void> {
     const transportAbort = this.#transportAbort;
+    for (const unsubscribe of this.#sandboxAutoReturnUnsubscribe.splice(0)) unsubscribe();
+    this.#sandboxAutoReturn = undefined;
     this.#stopHerdrLookup?.();
     this.#stopHerdrLookup = undefined;
     // /fabric reload and bootstrap replacement rebuild Fabric, not the creating

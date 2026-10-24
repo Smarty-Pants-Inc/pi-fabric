@@ -115,8 +115,9 @@ unreadable snapshot keeps the actor/host resident and logs a one-line reason.
 admission, delivery-owned launch and each successor start re-check equality;
 a mismatch refuses with `ResidentWakeConfigMismatch`
 (`RESIDENT_WAKE_CONFIG_MISMATCH`) without changing actor definitions. The
-archive-coupled index still retains deliveries while config is refused, so a
-later config repair and delivery event can retry without losing the cursor.
+archive-coupled index retains retryable pending deliveries while config is
+refused, so a later config repair and delivery event can retry without losing the
+cursor; a completed terminal decision ACKs its nudge, as described below.
 Old route snapshots without the config fence cannot authorize a wake. Explicit
 client starts still use the ordinary resident startup protocol.
 A throwing idle-check `queueMicrotask` enqueue clears its queued flag, allowing
@@ -146,12 +147,35 @@ watchdog explicitly ignores dormant definitions.
 
 Wake failures are isolated per residency root. A spawn failure leaves its durable
 request intact; `wake-failure.json` also retains the delivery reference if writing
-intent fails. The next committed delivery retries pending/failed intent even when
-its own topic is unrelated, and an explicit launcher start drains the archived
-backlog normally. No periodic retry service is added. If storage cannot persist
-either intent nor the failure receipt, the archive-coupled unacknowledged watermark
-remains pending; the already-committed archive remains the delivery authority.
-This is reported, not represented as a successful wake.
+intent fails.
+
+A config mismatch does not become terminal at a single Main lease expiry. The
+originating Main's valid native lease must have been expired for more than
+`max(60_000 ms, 3 * (expiresAt - updatedAt))`, and the existing native liveness
+and publication/lease fences must still permit terminalization. The named
+`RESIDENT_WAKE_TERMINAL_MIN_GRACE_MS` minimum tolerates delayed renewals rather
+than treating a brief scheduling lapse as permanent absence; longer recorded
+lease TTLs receive at least three TTLs of grace. Missing or invalid lease timing
+cannot authorize terminalization and keeps the delivery retryable.
+
+A retryable config refusal leaves its delivery pending in the
+archive-coupled index; ordinary maintenance or a new matching publication can
+retry after config repair, subject to the existing backoff. This pending state is
+different from a completed terminal decision: its original nudge is ACKed even
+though the archived event remains. The `wake-terminal.json` receipt is saved
+before that ACK, so interrupted completion can still leave the named delivery
+pending for normal recovery. The receipt is per-delivery evidence, not a
+disable/retire flag for the residency. For a completed terminal decision, repair
+config to match the exact retained restart snapshot; config
+repair alone, or moving/deleting the receipt, cannot restore the ACKed nudge.
+Preserve the receipt as evidence. To wake and drain the retained archive after
+repair, publish a new matching nudge or use the existing explicit client-start
+path; an explicit launcher start drains the archived backlog normally. A different
+or new pending delivery on the same root should process normally without moving
+the historical receipt. No periodic retry service is added. If storage cannot
+persist either intent nor the failure receipt, the archive-coupled unacknowledged
+watermark remains pending; the already-committed archive remains the delivery
+authority. This is reported, not represented as a successful wake.
 
 Direct steer/followUp/ask never wakes during preflight. `wake-routes.json` retains
 the host's published participant advertisement for dormant admission,

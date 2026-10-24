@@ -1,7 +1,9 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
 import childProcess from "node:child_process";
 import path from "node:path";
-import { windowsSecurityPowerShell } from "./windows-powershell.js";
+import { windowsSecurityPowerShell } from "./windows-powershell-command.js";
+
+export { windowsSecurityPowerShell };
 
 // Use SIDs, not localized names or the caller's group membership. These principals
 // can already administer the machine. Services and ordinary user groups are not trusted.

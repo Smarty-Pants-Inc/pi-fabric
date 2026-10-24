@@ -8,7 +8,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricAgentTransport } from "../config.js";
 import { isFabricThinking, type FabricThinking } from "../thinking.js";
 import { resolveActorDeliveryPolicy } from "./delivery-policy.js";
-import { FABRIC_ACTOR_HOST_EVENTS, MAX_ACTOR_BATCH_EVENTS, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
+import { FABRIC_ACTOR_HOST_EVENTS, MAX_ACTOR_BATCH_EVENTS, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, parseEventsStartAt, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "./types.js";
 import { normalizeActorActivationFilter, type FabricActorActivationFilter } from "./activation-filter.js";
 import { normalizeActorRecords } from "./records.js";
 import type {
@@ -218,6 +218,9 @@ export class GlobalActorRegistry {
       name: patch.name ?? existing.name,
       instructions: patch.instructions ?? existing.instructions,
       events: patch.events ?? existing.events,
+      ...(patch.eventsStartAt !== undefined
+        ? { eventsStartAt: patch.eventsStartAt }
+        : existing.eventsStartAt !== undefined ? { eventsStartAt: existing.eventsStartAt } : {}),
       topics: patch.topics ?? existing.topics,
       delivery: patch.delivery ?? existing.delivery,
       responseMode: patch.responseMode ?? existing.responseMode,
@@ -270,6 +273,9 @@ export class GlobalActorRegistry {
         : existing.dedupeKey !== undefined
           ? { dedupeKey: existing.dedupeKey }
           : {}),
+      ...(patch.deadLetterReplayMaxAgeMs !== undefined
+        ? { deadLetterReplayMaxAgeMs: patch.deadLetterReplayMaxAgeMs }
+        : existing.deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs: existing.deadLetterReplayMaxAgeMs } : {}),
       ...(patch.activationFilter === null
         ? {}
         : patch.activationFilter !== undefined
@@ -329,6 +335,7 @@ export class GlobalActorRegistry {
       name,
       instructions: def.instructions,
       events: [...def.events],
+      ...(def.eventsStartAt !== undefined ? { eventsStartAt: def.eventsStartAt } : {}),
       topics: [...def.topics],
       delivery: def.delivery,
       responseMode: def.responseMode,
@@ -352,6 +359,7 @@ export class GlobalActorRegistry {
       ...(def.coalesceKey !== undefined ? { coalesceKey: def.coalesceKey } : {}),
       ...(def.dedupeKey !== undefined ? { dedupeKey: def.dedupeKey } : {}),
       ...(def.activation ? { activation: clone(def.activation) } : {}),
+      ...(def.deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs: def.deadLetterReplayMaxAgeMs } : {}),
       ...(def.activationFilter !== undefined && !def.activationFilterError && !this.#invalidFilters.has(def.id)
         ? { activationFilter: clone(def.activationFilter) }
         : {}),
@@ -416,6 +424,7 @@ export class GlobalActorRegistry {
     validateActorCoalesceKey(def.coalesceKey);
     validateActorDedupeKey(def.dedupeKey);
     const activation = normalizeActorActivation(def.activation);
+    const deadLetterReplayMaxAgeMs = normalizeDeadLetterReplayMaxAgeMs(def.deadLetterReplayMaxAgeMs);
     const batching = normalizeActorBatching(def);
     const activationFilter = def.activationFilter === undefined ? undefined : normalizeActorActivationFilter(def.activationFilter);
     const records = normalizeActorRecords(def.records);
@@ -431,6 +440,7 @@ export class GlobalActorRegistry {
       name,
       instructions,
       events,
+      ...(def.eventsStartAt !== undefined ? { eventsStartAt: parseEventsStartAt(def.eventsStartAt) } : {}),
       topics,
       delivery: deliveryPolicy.delivery,
       responseMode,
@@ -456,6 +466,7 @@ export class GlobalActorRegistry {
       ...(activation ? { activation } : {}),
       ...batching,
       ...(activationFilter?.length ? { activationFilter } : {}),
+      ...(deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs } : {}),
       ...(validWhile ? { validWhile } : {}),
       ...(records ? { records } : {}),
     };
@@ -566,7 +577,9 @@ export class GlobalActorRegistry {
       let activation: FabricActorActivationPolicy | undefined;
       try { activation = normalizeActorActivation(record.activation); } catch { /* unreadable policy is off */ }
       let records: FabricActorRequest["records"];
+      let eventsStartAt: number | undefined;
       try {
+        eventsStartAt = record.eventsStartAt !== undefined ? parseEventsStartAt(record.eventsStartAt) : undefined;
         validateActorInferenceContext(record.inferenceContext, runner);
         validateActorCoalesceKey(record.coalesceKey);
         validateActorDedupeKey(record.dedupeKey);
@@ -585,6 +598,7 @@ export class GlobalActorRegistry {
         name: record.name,
         instructions: record.instructions,
         events,
+        ...(eventsStartAt !== undefined ? { eventsStartAt } : {}),
         topics,
         delivery,
         responseMode,
@@ -610,6 +624,8 @@ export class GlobalActorRegistry {
         ...(record.coalesceKey !== undefined ? { coalesceKey: record.coalesceKey } : {}),
         ...(record.dedupeKey !== undefined ? { dedupeKey: record.dedupeKey } : {}),
         ...(activation ? { activation } : {}),
+        ...(typeof record.deadLetterReplayMaxAgeMs === "number" && Number.isSafeInteger(record.deadLetterReplayMaxAgeMs) && record.deadLetterReplayMaxAgeMs >= 0
+          ? { deadLetterReplayMaxAgeMs: record.deadLetterReplayMaxAgeMs } : {}),
         ...(Number.isSafeInteger(record.batchWindowMs) && (record.batchWindowMs as number) >= 0 ? { batchWindowMs: record.batchWindowMs as number } : {}),
         ...(Number.isSafeInteger(record.batchMax) && (record.batchMax as number) > 0 && (record.batchMax as number) <= MAX_ACTOR_BATCH_EVENTS ? { batchMax: record.batchMax as number } : {}),
         ...(Number.isSafeInteger(record.batchMaxBytes) && (record.batchMaxBytes as number) > 0 ? { batchMaxBytes: record.batchMaxBytes as number } : {}),

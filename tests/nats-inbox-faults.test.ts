@@ -8,7 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { openNatsConnection, type NatsConnectionHandle } from "../src/transport/nats/connection.js";
 import { openNatsTransport, type NatsTransportOptions } from "../src/transport/nats/inbox.js";
-import { ensureTransportStream } from "../src/transport/nats/provision.js";
+import { ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS } from "../src/transport/nats/provision.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
 import { transportDurableName, transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import {
@@ -46,7 +46,7 @@ class WireFaults {
   publishes = 0;
   progress = 0;
   private dropAck = false;
-  private losePubAck = false;
+  private pubAcksToLose = 0;
   private readonly lostReplies = new Set<string>();
   private readonly listener = createServer((client) => this.accept(client));
   private constructor(private readonly upstream: URL, private readonly tls: PathBTlsFiles) {}
@@ -97,7 +97,11 @@ class WireFaults {
   }
 
   loseNextAck(): void { this.dropAck = true; }
-  loseNextPubAck(): void { this.losePubAck = true; }
+  loseNextPubAck(): void { this.loseNextPubAcks(1); }
+  loseNextPubAcks(count: number): void {
+    if (!Number.isSafeInteger(count) || count <= 0) throw new Error("PubAck drop count must be a positive safe integer");
+    this.pubAcksToLose += count;
+  }
 
   private forward(frame: Frame, outbound: boolean): boolean {
     if (outbound) {
@@ -112,8 +116,8 @@ class WireFaults {
       }
       if (frame.subject.startsWith("fabric.in.")) {
         this.publishes += 1;
-        if (this.losePubAck && frame.reply) {
-          this.losePubAck = false; this.lostReplies.add(frame.reply);
+        if (this.pubAcksToLose > 0 && frame.reply) {
+          this.pubAcksToLose -= 1; this.lostReplies.add(frame.reply);
         }
       }
     } else if (this.lostReplies.delete(frame.subject)) {
@@ -205,7 +209,7 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
     await openNatsKvForMachine(js, "presence", "machine-a");
     await Promise.all([fixture.users.machineA, fixture.users.machineB].map((user) => ensureTransportStream(manager, {
       name: transportInboxStream(user.machine), subjects: [transportInboxStreamSubject(user.machine)],
-      maxBytes: MAX_BYTES, maxAgeMs: 0, maxMessageBytes: MAX_MESSAGE_BYTES, duplicateWindowMs: 600_000, replicas: 1,
+      maxBytes: MAX_BYTES, maxAgeMs: 0, maxMessageBytes: MAX_MESSAGE_BYTES, duplicateWindowMs: INBOX_DUPLICATE_WINDOW_MS, replicas: 1,
     })));
     inspector = await openNatsConnection(fixture.operatorOptions());
   }, 60_000);
@@ -401,30 +405,36 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
     expect(after.num_ack_pending).toBe(0);
   }, 15_000);
 
-  it("lost PubAck is uncertain with the exact frozen body; no blind retry, same-id retry dedupes", async () => {
+  it("retries a lost PubAck with frozen bytes and the stable envelope id; JetStream stores one message", async () => {
     const proxy = await WireFaults.open(fixture.serverUrl, fixture.tls!); proxies.push(proxy);
     const sender = await open(fixture.users.machineA, "uncertain-sender", { servers: proxy.url });
     const receiver = await open(fixture.users.machineB, "uncertain-receiver");
-    const body = { text: "frozen-before-wire" };
+    const body = { commandId: "command-lost-puback", text: "frozen-before-wire" };
     let stamps = 0;
-    const input = envelope(sender, receiver, "lost-puback", () => { stamps += 1; return body; });
+    const input = envelope(sender, receiver, "lost-puback-envelope", () => { stamps += 1; return body; });
+    const stream = transportInboxStream(receiver.self.machine);
+    const before = (await inspector.manager.streams.info(stream)).state.messages;
     proxy.loseNextPubAck();
-    const sending = sender.send(input).catch((error: unknown) => error);
+    const sending = sender.send(input);
     body.text = "mutated-after-publish";
-    const error = await bounded(sending, "lost PubAck uncertainty");
-    expect(error).toBeInstanceOf(TransportUncertainError);
-    expect(error).toMatchObject({ id: input.id, resolvedBody: { text: "frozen-before-wire" } });
+    const sent = await bounded(sending, "retried lost PubAck");
+    expect(sent).toMatchObject({ id: input.id, duplicate: true, envelope: { id: input.id, body: { commandId: "command-lost-puback", text: "frozen-before-wire" } } });
     expect(stamps).toBe(1);
     expect(proxy.pubAckDrops).toBe(1);
-    expect(proxy.publishes).toBe(1);
-    await pendingIs(receiver, 0, 1);
-    const retry = await sender.send({ ...input, body: (error as TransportUncertainError).resolvedBody });
-    expect(retry.duplicate).toBe(true);
     expect(proxy.publishes).toBe(2);
+    expect((await inspector.manager.streams.info(stream)).state.messages - before).toBe(1);
+    const messageReader = await fixture.connect(fixture.users.bootstrap);
+    let storedMessageId: string | undefined;
+    try {
+      const { jetstreamManager } = await import("@nats-io/jetstream");
+      storedMessageId = (await (await jetstreamManager(messageReader)).streams.getMessage(stream, { seq: sent.sequence }))?.header.get("Nats-Msg-Id");
+    } finally { await messageReader.close(); }
+    expect(storedMessageId).toBe(input.id);
+    await pendingIs(receiver, 0, 1);
     const signal = new AbortController();
     const iterator = receiver.inbox(signal.signal)[Symbol.asyncIterator]();
     const delivered = await next(iterator);
-    expect(delivered).toMatchObject({ sequence: retry.sequence, payload: { body: { text: "frozen-before-wire" } } });
+    expect(delivered).toMatchObject({ sequence: sent.sequence, payload: { body: { commandId: "command-lost-puback", text: "frozen-before-wire" } } });
     await delivered.ack();
     await pendingIs(receiver, 0);
     signal.abort();
@@ -491,4 +501,63 @@ describe.skipIf(!binary)("real machine-authenticated inbox faults", () => {
       await admin.streams.update(transportInboxStream("machine-b"), { max_bytes: MAX_BYTES, max_msg_size: MAX_MESSAGE_BYTES });
     }
   }, 25_000);
+
+  it("expires uncertain same-ID retries 30 seconds inside the actual stream window", async () => {
+    const duplicateWindowMs = 30_500;
+    const shortFixture = await createPathBHarness({ binary: binary!, tls: {} });
+    const ownedTransports: FabricTransport[] = [];
+    let bootstrap: Awaited<ReturnType<PathBHarness["connect"]>> | undefined;
+    let proxy: WireFaults | undefined;
+    try {
+      const { jetstream, jetstreamManager } = await import("@nats-io/jetstream");
+      bootstrap = await shortFixture.connect(shortFixture.users.bootstrap);
+      const manager = await jetstreamManager(bootstrap);
+      const js = jetstream(bootstrap);
+      await ensureTransportStream(manager, { name: "FABRIC_ADV", subjects: ["$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>"],
+        maxBytes: 64 * 1024 * 1024, maxAgeMs: 30 * 24 * 60 * 60_000, maxMessageBytes: 64 * 1024, duplicateWindowMs: 600_000 });
+      await openNatsKvForMachine(js, "leases", "machine-a");
+      await openNatsKvForMachine(js, "presence", "machine-a");
+      await Promise.all([shortFixture.users.machineA, shortFixture.users.machineB].map(user => ensureTransportStream(manager, {
+        name: transportInboxStream(user.machine), subjects: [transportInboxStreamSubject(user.machine)],
+        maxBytes: MAX_BYTES, maxAgeMs: 0, maxMessageBytes: MAX_MESSAGE_BYTES, duplicateWindowMs, replicas: 1,
+      })));
+      const stream = transportInboxStream("machine-b");
+      const before = (await manager.streams.info(stream)).state.messages;
+      proxy = await WireFaults.open(shortFixture.serverUrl, shortFixture.tls!);
+      const sender = await openNatsTransport({ ...shortFixture.runtimeOptions(shortFixture.users.machineA), servers: proxy.url,
+        hostId: "retry-window-sender", duplicateWindowMs, requestTimeoutMs: 100 });
+      const receiver = await openNatsTransport({ ...shortFixture.runtimeOptions(shortFixture.users.machineB),
+        hostId: "retry-window-receiver", duplicateWindowMs, requestTimeoutMs: 100 });
+      ownedTransports.push(sender, receiver);
+      const input = envelope(sender, receiver, "retry-window-expired", { commandId: "retry-window-command", text: "still-stored" });
+      proxy.loseNextPubAcks(10);
+      const startedAt = Date.now();
+      const failure = await sender.send(input).then(() => undefined, error => error);
+      const elapsedMs = Date.now() - startedAt;
+      expect(failure).toBeInstanceOf(TransportUncertainError);
+      expect(failure).toMatchObject({ name: "NatsPublishRetryExpiredError", retryExpired: true,
+        expiryCode: "FABRIC_TRANSPORT_UNCERTAIN_EXPIRED", id: input.id,
+        resolvedBody: { commandId: "retry-window-command", text: "still-stored" } });
+      expect((failure as Error).message).toContain("safe retry window expired");
+      expect(elapsedMs).toBeLessThan(2_000);
+      expect(proxy.publishes).toBe(2);
+      expect(proxy.pubAckDrops).toBe(2);
+      expect((await manager.streams.info(stream)).state.messages - before).toBe(1);
+      const stored = await manager.streams.getMessage(stream, { seq: 1 });
+      expect(stored?.header.get("Nats-Msg-Id")).toBe(input.id);
+
+      const signal = new AbortController();
+      const iterator = receiver.inbox(signal.signal)[Symbol.asyncIterator]();
+      const delivered = await next(iterator, 3_000);
+      expect(delivered).toMatchObject({ payload: { id: input.id, body: { commandId: "retry-window-command", text: "still-stored" } } });
+      await delivered.ack();
+      signal.abort();
+      expect((await bounded(iterator.next(), "expired retry iterator end")).done).toBe(true);
+    } finally {
+      await Promise.allSettled(ownedTransports.map(transport => transport.close()));
+      await proxy?.close();
+      await bootstrap?.close();
+      await shortFixture.stop();
+    }
+  }, 30_000);
 });

@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { ActorManager } from "../src/actors/manager.js";
 import type { GlobalActorRegistry } from "../src/actors/global-registry.js";
@@ -14,7 +14,9 @@ import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { GUEST_TYPE_DECLARATIONS } from "../src/runtime/guest-types.js";
 import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { withRootExceptionMetadata, writeModelExceptions } from "./helpers/model-exceptions.js";
 import { AgentManager } from "../src/agents/manager.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { checkedSeed, completedBranchPrefix, snippetTask } from "../src/agents/fork-seed.js";
 import { writeForkSession } from "../src/agents/handoff.js";
 import fabricWriteGuard, { readWritePolicy, writePolicyDenial } from "../src/agents/write-guard.js";
@@ -27,9 +29,22 @@ const roots: string[] = [];
 const managers: AgentManager[] = [];
 const savedPolicy = process.env.PI_FABRIC_WRITE_POLICY;
 const savedLineage = process.env.PI_FABRIC_LINEAGE;
+const trustedExceptionFixturePaths = new Set<string>();
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+beforeEach(() => {
+  trustedExceptionFixturePaths.clear();
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args));
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
 
 afterEach(async () => {
   await Promise.all(managers.splice(0).map((manager) => manager.close()));
+  restoreAdmissionFixture?.();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   if (savedPolicy === undefined) delete process.env.PI_FABRIC_WRITE_POLICY;
   else process.env.PI_FABRIC_WRITE_POLICY = savedPolicy;
@@ -282,6 +297,7 @@ const statusFile = args.get("status-file");
 const task = fs.readFileSync(args.get("task-file"), "utf8");
 fs.mkdirSync(path.dirname(statusFile), { recursive: true });
 fs.writeFileSync(path.join(path.dirname(statusFile), "argv.json"), JSON.stringify(Object.fromEntries(args)));
+fs.writeFileSync(path.join(path.dirname(statusFile), "actor-self.json"), JSON.stringify(process.env.PI_FABRIC_ACTOR_SELF ?? null));
 let text = "done";
 if (task.includes("EDIT")) {
   fs.appendFileSync("README.md", "three\\n");
@@ -308,7 +324,13 @@ const createManager = (
   const root = tempRoot("pi-fabric-wp7-runs-");
   const workerPath = path.join(root, "worker.mjs");
   fs.writeFileSync(workerPath, workerSource);
-  const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, ...config }, {
+  const boundRootRecord = Object.freeze({ cwd });
+  const modelExceptionsPath = writeModelExceptions(root, ["claude-haiku-test"], boundRootRecord.cwd);
+  trustedExceptionFixturePaths.add(modelExceptionsPath);
+  const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000,
+    modelExceptionsPath, claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" }, ...config }, {
+    rootSessionCwd: () => boundRootRecord.cwd,
+    claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
     workerPath,
     runRoot: path.join(root, "runs"),
     fullCodeMode: false,
@@ -322,6 +344,35 @@ const launchArgs = (runRoot: string, id: string): Record<string, string> =>
   JSON.parse(fs.readFileSync(path.join(runRoot, id, "argv.json"), "utf8"));
 
 describe("agent manager spawning primitives", () => {
+  it("passes only the matching actor activation identity to its worker", async () => {
+    const cwd = tempRoot("pi-fabric-actor-self-env-");
+    const inherited = JSON.stringify({ actorId: "parent-actor", name: "parent", rootId: "session:root",
+      ownershipToken: "parent-lineage", instructionsDigest: "a".repeat(64) });
+    vi.stubEnv("PI_FABRIC_ACTOR_SELF", inherited);
+    const { manager, runRoot } = createManager(cwd);
+    const receivedEnvironments: NodeJS.ProcessEnv[] = [];
+    const processLaunch = ProcessTransport.prototype.launch;
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const childEnvironment = request.childEnvironment?.({ ...process.env, PI_FABRIC_ACTOR_SELF: inherited });
+      expect(childEnvironment).toBeDefined();
+      receivedEnvironments.push(childEnvironment!);
+      return processLaunch.call(this, request);
+    });
+    const actorSelf = Object.freeze({ actorId: "actor-one", name: "worker", rootId: "session:root",
+      ownershipToken: JSON.stringify(["session:root", null, []]), instructionsDigest: "b".repeat(64), roleStamp: "(role reviewer.md 0123456789ab)" });
+    const actor = await manager.run({ task: "actor activation", transport: "process", actorId: actorSelf.actorId,
+      actorName: actorSelf.name, actorSelf });
+    expect(JSON.parse(fs.readFileSync(path.join(runRoot, actor.id, "actor-self.json"), "utf8"))).toBe(JSON.stringify(actorSelf));
+    expect(process.env.PI_FABRIC_ACTOR_SELF).toBe(inherited);
+
+    const task = await manager.run({ task: "ordinary nested task", transport: "process" });
+    expect(JSON.parse(fs.readFileSync(path.join(runRoot, task.id, "actor-self.json"), "utf8"))).toBeNull();
+    expect(receivedEnvironments[0]!["PI_FABRIC_ACTOR_SELF"]).toBe(JSON.stringify(actorSelf));
+    expect(receivedEnvironments[1]).not.toHaveProperty("PI_FABRIC_ACTOR_SELF");
+    await expect(manager.run({ task: "mismatched activation", transport: "process", actorId: "different",
+      actorName: actorSelf.name, actorSelf })).rejects.toThrow(/Invalid actor activation identity/);
+  });
+
   it("passes write policy and lineage to Pi children with a per-parent child index", async () => {
     const cwd = tempRoot("pi-fabric-wp7-lineage-");
     const { manager, runRoot } = createManager(cwd, {
@@ -337,10 +388,12 @@ describe("agent manager spawning primitives", () => {
       runId: first.id, depth: 1, childIndex: 0, worker: true,
     });
     const secondArgs = launchArgs(runRoot, second.id);
+    // smarty-dev#15878: a short private TMPDIR when one fits the host's temp path, else the run's own tmp.
+    const secondTmp = second.temporaryDirectory ?? path.join(runRoot, second.id, "tmp");
     expect(JSON.parse(secondArgs["write-policy"]!)).toEqual({
-      readOnly: false, writableRoots: [cwd, path.join(runRoot, second.id, "tmp")].sort(), shell: "unconfined",
+      readOnly: false, writableRoots: [cwd, secondTmp].sort(), shell: "unconfined",
     });
-    expect(secondArgs.tmpdir).toBe(path.join(runRoot, second.id, "tmp"));
+    expect(secondArgs.tmpdir).toBe(secondTmp);
     expect(readAgentLineage(secondArgs.lineage)).toMatchObject({ runId: second.id, childIndex: 1 });
   });
 
@@ -466,8 +519,9 @@ describe("worker child environment contract", () => {
     managers.push(manager);
     const result = await manager.run({ task: "report", runner: "pi", transport: "process", extensions: false, writableRoots: ["."] });
     expect(result.status).toBe("completed");
-    const report = JSON.parse(result.text) as { lineage: string; writePolicy: string; extensionModel: string | null; args: string[] };
+    const report = JSON.parse(result.text) as { lineage: string; writePolicy: string; extensionModel: string | null; actorSelf: string | null; args: string[] };
     expect(report.extensionModel).toBeNull();
+    expect(report.actorSelf).toBeNull();
     expect(report.args.some((arg) => arg.includes("provider-bridge"))).toBe(false);
     expect(readAgentLineage(report.lineage)).toMatchObject({ rootSessionId: "root-session", runId: result.id, depth: 1 });
     expect(JSON.parse(report.writePolicy)).toEqual({ readOnly: false, writableRoots: [root], shell: "deny" });
@@ -477,34 +531,33 @@ describe("worker child environment contract", () => {
     const guard = loaded.find(entry => entry === path.resolve(guardPath!));
     expect(guard).toBe(path.resolve(guardPath!));
     expect(fs.existsSync(guard!)).toBe(true);
+
+    const actorSelf = Object.freeze({ actorId: "actor-worker", name: "reviewer", rootId: "session:root",
+      ownershipToken: JSON.stringify(["session:root", null, []]), instructionsDigest: "c".repeat(64),
+      roleStamp: "(role reviewer.md 0123456789ab)" });
+    const actorResult = await manager.run({ task: "report", runner: "pi", transport: "process", extensions: false,
+      actorId: actorSelf.actorId, actorName: actorSelf.name, actorSelf });
+    expect(JSON.parse(actorResult.text).actorSelf).toBe(JSON.stringify(actorSelf));
   }, 30_000);
 });
 
 describe("agents provider seeds and confinement", () => {
   const createProvider = () => {
     const requests: AgentRunRequest[] = [];
-    const manager = {
-      config: DEFAULT_FABRIC_CONFIG.agents,
-      resolveKernel: () => undefined,
-      resolvePythonRuntime: () => "monty",
-      resolveCwd: (cwd: string) => cwd,
-      childThinkingBounds: () => ({}),
-      // Fork model-policy hooks the provider consults before admission.
-      assertModelAllowed() {},
-      defaultModel: () => undefined,
-      detachSignal() {},
-      spawn: async (request: AgentRunRequest) => {
-        requests.push(request);
-        return { id: "child", name: "child", status: "running", runner: "pi", transport: "process", cwd: "/" };
-      },
-    } as unknown as AgentManager;
+    const { manager } = createManager(process.cwd());
+    vi.spyOn(manager, "spawn").mockImplementation(async (request: AgentRunRequest) => {
+      requests.push(request);
+      return { id: "child", name: "child", status: "running", runner: "pi", transport: "process", cwd: "/" };
+    });
+    // The spawn spy returns a fixture handle, not a manager-owned execution.
+    vi.spyOn(manager, "detachSignal").mockImplementation(() => {});
     const participants = {
       scheduleRefresh() {},
       self: () => ({ id: "self-participant" }),
     } as unknown as FabricParticipantSource;
     const provider = new AgentsProvider(
       manager,
-      {} as ActorManager,
+      { identity: { id: "session:caller-session", kind: "main" } } as ActorManager,
       {} as GlobalActorRegistry,
       {} as FabricMainAgentTarget,
       participants,
@@ -550,7 +603,7 @@ describe("agents provider seeds and confinement", () => {
 
   it("refuses seeds without Pi, without a session, or with durable branch forks", async () => {
     const { provider, requests } = createProvider();
-    await expect(provider.invoke("spawn", { task: "x", seed: "branch", runner: "claude" }, context(callerBranch())))
+    await expect(provider.invoke("spawn", { task: "x", seed: "branch", runner: "veda", model: "cliproxyapi/gpt-6.1-sol" }, context(callerBranch())))
       .rejects.toThrow(/requires the Pi runner/);
     await expect(provider.invoke("run", { task: "x", seed: "snippet" }, context(undefined)))
       .rejects.toThrow(/requires a Pi session/);
@@ -582,7 +635,8 @@ describe("guest declarations", () => {
         'const s = await agents.run({ task: "t", seed: "snippet", seedMessages: 4, writePolicy: "unrestricted" });',
         "const files: string[] = r.worktreeResult?.changedFiles ?? [];",
         "const self = await agents.self();",
-        "return { files, inserted: r.worktreeResult?.diffstat.insertions, index: self.lineage?.childIndex, s: s.status };",
+        "const actorStatus = self.actor ? await agents.actorStatus({ id: self.actor.actorId }) : undefined;",
+        "return { files, inserted: r.worktreeResult?.diffstat.insertions, index: self.lineage?.childIndex, actorId: self.actor?.actorId, rootId: self.actor?.rootId, token: actorStatus?.ownershipToken, stamp: self.actor?.roleStamp, s: s.status };",
       ].join("\n"),
       GUEST_TYPE_DECLARATIONS,
     );

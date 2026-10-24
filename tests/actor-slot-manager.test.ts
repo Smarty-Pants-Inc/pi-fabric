@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorSlotClaimRefusedError } from "../src/actors/slot-authority.js";
-import type { AgentManager } from "../src/agents/manager.js";
+import type { AgentManager, AgentModelAdmission } from "../src/agents/manager.js";
 import type { FabricActorRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshEvent } from "../src/mesh/store.js";
@@ -84,13 +84,26 @@ function coreDouble() {
   };
 }
 
+// Nonprotected fixture contract only; protected slot topics do not grant model exceptions.
+const assertModelAllowed: AgentManager["assertModelAllowed"] = (model, runner = DEFAULT_FABRIC_CONFIG.agents.runner) => {
+  if ((model !== undefined && model !== "test-model") || (runner !== "pi" && runner !== "pi-durable")) {
+    throw new Error(`Unexpected slot fixture model/runner: ${model}/${runner}`);
+  }
+};
+const resolveModelReasonPolicy = (
+  ...[model, _reason, runner, options = {}]: Parameters<AgentManager["resolveModelReasonPolicy"]>
+): AgentModelAdmission => {
+  assertModelAllowed(model, runner);
+  return { model, thinking: options.thinking, fallback: false };
+};
+
 function open(root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-slot-manager-"))) {
   if (!roots.includes(root)) roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const actorRoots = { project: path.join(root, "actors"), session: path.join(root, "actors", "alpha") };
   runner = vi.fn(() => { throw new Error("A worker must not launch in this safe suite"); });
   const agents = { config: DEFAULT_FABRIC_CONFIG.agents, resolveKernel: () => undefined, defaultModel: () => undefined,
-    assertModelAllowed: () => {}, run: runner, actorArchiveSources: () => new Map(), close: async () => {} } as unknown as AgentManager;
+    assertModelAllowed, resolveModelReasonPolicy, run: runner, actorArchiveSources: () => new Map(), close: async () => {} } as unknown as AgentManager;
   const directory = new ActorDirectory(["alpha", identity, mesh, DEFAULT_FABRIC_CONFIG.mesh, agents, () => {}, {
     persistent: true, rootId: identity.id, claimResidency: "session", releasePaused: true,
     resolvePiModel: model => resolveModel(model),
@@ -130,6 +143,23 @@ afterEach(async () => {
 });
 
 describe("manager protected birth/recovery seam", () => {
+  it("keeps the slot model-policy fixture synchronous and rejects unexpected/protected selectors before effects", async () => {
+    const { directory } = open();
+    for (const model of [undefined, "test-model"]) {
+      expect(resolveModelReasonPolicy(model, undefined, "pi", { thinking: "high" }))
+        .toEqual({ model, thinking: "high", fallback: false });
+    }
+    for (const model of ["unexpected-model", "anthropic/claude-opus-4-1"]) {
+      expect(() => resolveModelReasonPolicy(model, undefined, "pi")).toThrow("Unexpected slot fixture");
+      expect(() => assertModelAllowed(model, "pi")).toThrow("Unexpected slot fixture");
+      await expect(directory.create({ name: "rejected-model", instructions: "No effects.", model }))
+        .rejects.toThrow("Unexpected slot fixture");
+    }
+    expect(() => resolveModelReasonPolicy(undefined, undefined, "claude")).toThrow("Unexpected slot fixture");
+    expect(directory.listOwned()).toEqual([]);
+    expect(intents).toEqual([]);
+    expect(runner).not.toHaveBeenCalled();
+  });
   it("does not retain unrelated unknown-address input on an unenforced authority before recovery", () => {
     enforced = false;
     open();
@@ -197,6 +227,30 @@ describe("manager protected birth/recovery seam", () => {
     const files = fs.readdirSync(path.join(actorRoots[scope], actor.id)).filter(file => file.startsWith("queue-"));
     expect(files).toHaveLength(1);
     expect(fs.readFileSync(path.join(actorRoots[scope], actor.id, files[0]!), "utf8")).toContain(queued.messageId);
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it("replays protected dead letters only after every recovery scope is ready, without another event", async () => {
+    const { directory, actorRoots } = open();
+    const id = "a".repeat(32);
+    intents.push(seed(actorRoots.session, id, "session"));
+    fs.mkdirSync(path.join(actorRoots.session, id), { recursive: true });
+    const deadLetter = path.join(actorRoots.session, id, "dead-letter.jsonl");
+    const backlog = { at: Date.now(), source: `mesh:${protectedTopic}`, event: event() };
+    fs.writeFileSync(deadLetter, `${JSON.stringify(backlog)}\n`);
+    const hold = deferred(), reached = deferred();
+    recover = async registryRoot => {
+      if (registryRoot === actorRoots.project) { reached.resolve(); await hold.promise; }
+    };
+    const recovering = directory.recoverProtectedActors();
+    await reached.promise;
+    await vi.waitFor(() => expect(new ActorRegistryStore(actorRoots.session).snapshot().actors).toHaveLength(1));
+    expect(fs.readFileSync(deadLetter, "utf8")).toContain("input-1");
+    expect(runner).not.toHaveBeenCalled();
+    hold.resolve();
+    await recovering;
+    expect(directory.status(id).queued).toBe(1);
+    expect(fs.existsSync(deadLetter)).toBe(false);
     expect(runner).not.toHaveBeenCalled();
   });
 

@@ -9,4 +9,5 @@ export { FabricModelNotServedError } from "./core/model-served-error.js";
 export { FabricTargetTerminalError } from "./agents/terminal-target.js";
 export type { AgentTerminalNotice, AgentUndeliveredMessage, FabricTargetRunState } from "./agents/terminal-target.js";
 export { AgentInputError, RequiredInputMissingError } from "./host-compatibility.js";
+export { AgentSpawnForbiddenError } from "./agents/spawn-authority.js";
 export const HOSTED_AGENTS_PROTOCOL_VERSION = 1 as const;

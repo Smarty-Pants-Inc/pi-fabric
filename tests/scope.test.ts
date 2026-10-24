@@ -485,6 +485,7 @@ describe("agent scope narrowing", () => {
       // Our model-policy hooks (requireReason, denied models): no policy in this fixture.
       assertExplicitModelReason() {},
       assertModelAllowed() {},
+      resolveModelReasonPolicy: async (model: string | undefined) => ({ model, fallback: false }),
       prepareModelForAdmission: async (model: string | undefined) => model,
       defaultModel: () => undefined,
       spawn: async (request: unknown) => {
@@ -494,7 +495,7 @@ describe("agent scope narrowing", () => {
     } as unknown as AgentManager;
     const residency = { spawnAgent: async (request: unknown) => (resident.push(request), handle) };
     const provider = new AgentsProvider(
-      manager, {} as ActorManager, {} as GlobalActorRegistry, {} as FabricMainAgentTarget,
+      manager, { identity: { id: "session:scope-provider", kind: "main" } } as ActorManager, {} as GlobalActorRegistry, {} as FabricMainAgentTarget,
       { scheduleRefresh() {} } as unknown as FabricParticipantSource, undefined, {} as LifecycleBroker,
       () => true, residency as unknown as ConstructorParameters<typeof AgentsProvider>[8],
     );

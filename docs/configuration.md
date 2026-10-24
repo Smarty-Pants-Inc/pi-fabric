@@ -26,7 +26,7 @@ Only these keys are consumed from root policy; other settings remain in the ordi
     "processSlice": "batch.slice",
     "processMemoryMaxBytes": 25769803776,
     "deniedModels": ["provider/denied-model"],
-    "modelPolicy": { "requireReason": ["gpt-6-astra"] }
+    "modelPolicy": { "requireReason": ["gpt-6-astra", "opus", "claude"] }
   }
 }
 ```
@@ -37,7 +37,9 @@ Only these keys are consumed from root policy; other settings remain in the ordi
 - `agents.processSlice`: only root policy may select/change the process-worker slice. Agent-dir and project values cannot override it.
 - `agents.processMemoryMaxBytes`: only root policy may change the per-task memory cap (default 24 GiB, `25769803776`). Agent-dir and project values are ignored, so they can neither relax nor tighten it. In the root policy file, a value that is not a positive safe integer fails policy validation, like an invalid `processSlice`. A cap too small to admit the worker fails launch; it never falls back to an uncapped task.
 - `agents.deniedModels`: root policy provides the baseline deny list. The agent-dir list is **unioned** with it; clearing the agent-dir list cannot remove a root deny. Root may remove its own denies, but any remaining agent-dir deny still tightens the result.
-- `agents.modelPolicy.requireReason`: defaults to `["gpt-6-astra"]`. Root policy may replace/relax this baseline (including `[]`); the agent-dir list is **unioned** with the root/default baseline and can only add requirements. Workspace lists remain ignored.
+- `agents.modelPolicy.requireReason`: defaults to `["gpt-6-astra", "opus", "claude"]`. Root policy may replace/relax this baseline (including `[]`); the agent-dir list is **unioned** with the root/default baseline and can only add requirements. Workspace lists remain ignored. The root file consumes this rollback list only; `fallbackModel` and `fallbackThinking` remain profile/agent-dir settings.
+- `agents.modelPolicy.fallbackModel` is an optional host/profile selector for indirect model resolution; it has no package default. Indirect resolution prefers a configured non-protected `agents.model`, then this host/profile fallback. `agents.modelPolicy.fallbackThinking` defaults to `"high"`. If the configured fallback is absent or unavailable, resolution continues through the inherited model when permitted and otherwise refuses with `agents.modelPolicy.fallbackModel` named. Fleet profile installation uses `~/.local/share/smarty-dev/pi-agent/fabric.json` with `fallbackModel: "cliproxyapi/gpt-6-luna"` and `fallbackThinking: "high"`; a non-fleet profile may not have that provider installed, so provisioning must verify the selector on each target host.
+- Claude/Opus exceptions require host-owned admission from the fixed `/etc/smarty/model-exceptions.json`; no `fabric.json`, environment, agent directory, workspace or user config can redirect it. The v1 document is `{ "version": 1, "grants": [{ "id", "issue", "reason_url", "role", "lane", "host", "model", "thinking", "granted_by", "granted_at", "expires_at", "status" }] }` (field names shown; see the [complete JSON example and operator request flow](agents.md#explicit-model-exceptions-3134)). Every field is required. `role` is `task`, `actor:<name>` or `lane`; `status` is `active` or `revoked`. ONE active, unexpired grant must match the canonical issue in `modelReason`, ROOT-bound worktree lane, short host, exact role and exact resolved canonical model, with actual effective thinking at or below the ceiling. No prefixes or alternate provenance models match. The lane comes only from a host callback reading the bound ROOT participant's cwd basename; missing binding is `lane-mismatch`, never a manager/request cwd fallback. Bare `#N` means `Smarty-Pants-Inc/smarty-dev#N`; `repo#N`, full `Smarty-Pants-Inc/repo#N` and that organization's GitHub issue URLs normalize to the same issue. Provision only through `smarty-rootops`: root-owned regular file, at most 1 MiB, normally mode `0644`, no group/world write, and every parent through `/` root-owned and not group/world writable. The reader uses `O_NOFOLLOW`, fd `fstat`, bounded/stable reads. Missing files grant nothing (`file-unavailable`); unsafe metadata/symlinks or unsupported ownership platforms give `untrusted-source`. Duplicate ids, any malformed entry, unknown version/status, invalid ISO date-time or non-increasing timestamps invalidate the whole file (`malformed`). TTL over 72 hours gives `expiry-too-long`; expiration gives `expired` without any sweep, and revocation gives `revoked`. All refusals use `FABRIC_MODEL_EXCEPTION_DENIED` before worker launch. Leads/Main are unaffected. Each admitted launch appends one immutable-grant audit record with grant id, issue, lane, short host, role, model, effective thinking, run id and time; inherited-switch audit compatibility remains. The band file is only an untrusted meter, never authority.
 
 **Fail-safe behavior:** missing policy preserves the built-in `off` baseline and grants no authority relaxations. Any other unprovable policy fails strict: Landlock `enforce`, `disabled: false`, no `allowEscape`, and no root authority relaxations. Its once-per-process warning names `/etc/smarty/fabric-policy.json` and the failure reason. Agent deny/reason additions and other tightening settings still apply. Already-loaded enforcement remains enforced; live rereads of invalid/unreadable/unstable policy also tighten an already-loaded `off` baseline and revoke kill-switch/escape grants. A later missing policy uses defaults again, without weakening session tightening.
 
@@ -140,6 +142,16 @@ Use `local` in place of `ssh` only on the selected work host **if its real launc
 When that deployment boundary prevents a pre-merge native receipt, the repository owner (the Main handling the PR) owns an explicit exact-head evidence gate on Ryzen 1 after push/install, **before placement is enabled fleet-wide**. Record: candidate SHA and clean build; command and caller hostname; installed SDK and extension paths; one `RYZEN2_TASK_ACCEPTED <id> on ryzen2`; `placement.remote` and `placement.result`; native rc 0; selected host's hostname and full `agents.wait` result; and kept evidence paths. Pending/partial results, fake launchers/receipts, or unconfirmed exit debt fail the gate. If the receipt/result fails, keep placement absent/local; do not claim rollout acceptance. If failure is discovered after installation/enabling, revert the candidate release and restore the saved host config.
 
 Capacity-lead owns the subsequent Ryzen 1 host rollout: back up the selected `pi-agent/fabric.json`, enable host-only `default: "remote"` using the `--src`/host-map example above, canary one Main spawn/wait, then expand only after the same terminal receipt and full result pass. Revert means restoring that exact backup (and reverting the candidate release for an implementation failure). Re-measure Ryzen 1 spawned-agent CPU the next day; no workspace override enables the policy.
+
+## Placement API v1
+
+`agents.placementApi` is a separate host-only opt-in in `PI_CODING_AGENT_DIR/fabric.json`; workspace and project config cannot enable or override it. If absent or `enabled: false`, the existing spawn path is unchanged. Configure only `enabled: true`, `url`, and optional `requestTimeoutMs` / `watchTimeoutMs` (defaults 5,000 ms and 30,000 ms). Requests use unauthenticated plain HTTP to either `http://smarty-placement.smarty-island.svc:8080` inside the cluster or an island node's tailnet IPv4 address on NodePort `30880`.
+
+Both `agents.placementApi.url` and `agents.sandbox.placementUrl` also accept `http://127.0.0.1:<port>` for a local authenticated `kubectl port-forward` (explicit port 1024–65535 only).
+
+Placement refusal, delay, network/protocol errors, or binding mismatch never fall back to a local worker. Only `process` and `remote` are supported; sandbox placement remains unsupported. A process admission must bind to this host; remote placement uses the separately configured host-owned `agents.placement.command` launcher. On NATS, process-placement presence is published before worker launch; a presence failure still prevents launch. A new pod UID for the same run ID is an ordinary restart, not a conflicting run. This alpha is tracked by `smarty-dev#15310` (private tracker).
+
+After a proven worker exit, or when an admitted run never starts, Fabric makes a best-effort immutable terminal-record write (`finished`, `failed`, or `never-started`). FILE stores it beside the host lease; NATS uses the raw run id as the key in `fabric_placement_terminal` with a 900-second TTL. A receipt failure is logged without changing or delaying the child result. Fabric does not publish Placement's `placement.run.terminated` event.
 
 ## Execution kernels
 
@@ -307,6 +319,10 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
       "binary": "veda",
       "backend": "agy",
       "persona": "navigator-chat"
+    },
+    "modelPolicy": {
+      "requireReason": ["gpt-6-astra", "opus", "claude"],
+      "fallbackThinking": "high"
     },
     "thinking": "medium",
     "maxConcurrent": 4,
@@ -798,7 +814,8 @@ Other agent settings:
 
 - `router`: optional **host-only** external spawn/actor model selection hook: argv `command` (absolute executable path, minimal `PATH`/`HOME`/`LANG`/`TZ` environment plus fixed Windows `SystemRoot`/`COMSPEC`), `timeoutMs` (1500 by default, clamped 200–5000), `mode` (`off`/`shadow`/`enforce`, default `off`), and `includeTask` (default `false`). Explicit caller model/thinking bypasses it; failures keep static defaults. See [router command contract, privacy, decisions and rollback](spawn-router.md).
 
-- `modelPolicy.requireReason`: trusted-host-only model prefixes requiring a named `modelReason` on explicit `agents.spawn`, `run`, `create` and actor `setModel` requests. Defaults to `["gpt-6-astra"]` (any provider); provider-qualified entries restrict that provider/model prefix. Reasons must be non-blank and at most 200 characters, and are recorded on run/actor records and `run.spawned` lifecycle events. Omitted models/defaults are unchanged; no silent fallback. Workspace configuration cannot override this list. Set `[]` in the root-owned `/etc/smarty/fabric-policy.json` to roll back; agent-dir values only add requirements once that file is provisioned. See [root-owned host policy](#root-owned-host-policy) for the missing-file rollout window. See [explicit model exceptions](agents.md#explicit-model-exceptions-3134).
+- `modelPolicy.requireReason`: trusted-host-only model prefixes requiring a named `modelReason` on explicit `agents.spawn`, `run`, `create` and actor `setModel` requests. Defaults to `["gpt-6-astra", "opus", "claude"]` (any provider); provider-qualified entries restrict that provider/model prefix. `opusReason` is accepted as the request-level alias for `modelReason`; the config API is unchanged. Reasons must be non-blank and at most 200 characters. For a Claude model or the `claude` runner, the reason must name an issue (`#1234`) or contain an issue URL. Explicit protected selections refuse without that reason; indirect/default resolution may use the configured fallback instead. Omitted models/defaults are otherwise unchanged. Workspace configuration cannot override this list. Set `[]` in the root-owned `/etc/smarty/fabric-policy.json` to roll back; agent-dir values only add requirements once that file is provisioned. See [root-owned host policy](#root-owned-host-policy) for the missing-file rollout window and [explicit model exceptions](agents.md#explicit-model-exceptions-3134).
+- `modelPolicy.fallbackModel` is optional and host/profile-only; when set, it is the model used for an indirect fallback, paired with `fallbackThinking` (default `high`). It is not a package-wide default. If no usable configured fallback exists, an inherited Claude binding is refused with `agents.modelPolicy.fallbackModel` named. Fabric does not silently select an uninstalled provider. Successful fallback receipts/results identify the transition as `model: inherited <old> -> <new> <thinking> (#11863)`. Allowed exception and inherited-switch records append one JSON object to `~/.local/state/smarty/route/opus-exceptions.jsonl` using one `O_APPEND` write: `{ts, role, model, ref, reason, launcher, host}` where `ts` is ISO UTC, `role` is `task` or `actor:<name>`, `model` is the original Claude model, `ref` is an issue reference or `null`, `reason` is supplied text or `inherited-switch`, `launcher` is `fabric`, and `host` is the host name. A logging failure is surfaced but does not block the run.
 
 - `thinking`: default reasoning effort (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), default `medium`.
 - `maxConcurrent`: child concurrency semaphore. A session spawn beyond this limit returns a `queued` handle immediately. Queued children start in FIFO order as slots become free; `queuePosition` in list/status is one-based. Queued receipts are session-only for now: saturated durable spawns cancel their queue entry, safely reject, and return no queued handle.
@@ -916,6 +933,8 @@ variable `PI_FABRIC_MESH_STATE_BACKEND` overrides it. A root on a network filesy
 `node:sqlite` uses `"file"`. Switching an existing mesh to `"sqlite"` needs the migration of smarty-dev#6477 (L4); `fabric-mesh-backend cutover` is
 fenced only on the mesh `.lock` plus `custody.lock`; its writer census is advisory only (printed as
 `advisory: N writers, M unknown`) and never a cutover gate (smarty-dev#6982). Do not set it by hand on a shared mesh.
+
+Windows mesh-state ACL findings warn and startup continues by default; only exact `PI_FABRIC_MESH_STATE_ACL_ENFORCE=1` enables enforcement; unset the variable or set it to `0` to restore advisory startup without ACL mutation.
 
 `mesh.lockProtocol` accepts only numeric `1`, `2` or `3` and defaults to `1`. It is captured
 when each mesh store is constructed; editing configuration does not switch an existing
@@ -1068,13 +1087,140 @@ journal advances changed snapshots incrementally. Missing/legacy/invalid journal
 to canonical reads. The added UUID/hash fields and sidecar remain backward-compatible;
 writer cadence and CAS revisions are unchanged. See [mesh state read gates](mesh-state-reads.md).
 
-Mesh topics, shared state, and the participant directory remain project-scoped. Every runtime publishes one short-lived host lease and records for the roots, agents, and actors it owns. `agents.members()` and `mesh.members()` read those records. `agents.main()` and `agents.peers()` project roots. When a lease expires, its records leave normal discovery together. A host that stops without a clean shutdown leaves them in the shared state, so each runtime removes, every 15 minutes, the records of hosts whose lease expired more than 6 hours ago. Each removal is checked against the record's version. Existing needed directory writes also compact at most 64 expired native/resident host records per batch, without touching participant or delivery retention. `mesh.actorPollMs` controls fallback polling for actor events and owner-addressed commands when filesystem notifications are unavailable.
+Mesh topics, shared state, and the participant directory remain project-scoped. Every runtime publishes one short-lived host lease and records for the roots, agents, and actors it owns. `agents.members()` and `mesh.members()` read those records. `agents.main()` and `agents.peers()` project roots. When a lease expires, its records leave normal discovery together. A host that stops without a clean shutdown leaves them in the shared state, so each runtime removes, every 15 minutes, the records of hosts whose lease expired more than 6 hours ago. Each removal is checked against the record's version. Existing needed directory writes also compact at most 64 expired native/resident host records per batch, without touching participant or delivery retention. `mesh.actorPollMs` controls fallback polling for actor events and owner-addressed commands when filesystem notifications are unavailable. For the NATS-only host-local participant and lease projection, including its KV-authority and watch-recovery rules, see [NATS local presence projection](nats-local-projection.md).
 
 A resident host exits cleanly when its root Main is no longer live (including the existing 180-second reload lease), it owns no actors (including idle or stopped actors), and it has no queued/processing requests or active agents continuously for `mesh.residentIdleExitMs` (default `600000`, 10 minutes; range 0–7 days). `0` disables this exit policy. Actor/request activity or a renewed root lease resets the window. The host logs `resident exiting: root dead, no actors, idle N min`, withdraws its lease, and leaves an intentional-exit marker so its launcher does not restart it. A later explicit spawn or actor-create request clears the marker and starts a new host normally. Accepted same-release configuration updates apply the setting during resident maintenance; rollback is a revert or setting `mesh.residentIdleExitMs` to `0`.
 
 Shared state keeps a persistent revision clock (`highWater` in the mesh `state.json`). A new key takes the next clock revision, and an update takes its key's version plus one. Compare revisions only through `ifVersion`; a new key seldom starts at 1. Fabric builds from before this clock can still write to a shared root. A newer Fabric then raises its clock to the highest retained revision, so both can use one root.
 
 If `state.json` is empty or unparseable, reads return an empty table and every write fails with `invalid state format`. This barrier keeps Fabric from issuing a revision that an earlier caller still holds. To repair a root, stop every Fabric process that uses it, inspect the file, fix it or move it aside, and then start the processes again. Moving the file aside restarts revisions. That is safe only while no process runs, because each process reads fresh revisions after it starts.
+
+### NATS inbox retention (smarty-dev#15310)
+
+`mesh.nats.inboxMaxAgeMs` bounds inbox message age (default `604800000`, seven
+days; range `60000` through `7776000000`, 60 seconds through 90 days). A newly
+created `FABRIC_IN_<machine>` stream uses this `max_age`; incompatible nonzero
+ages still fail verification. Existing inbox streams with `max_age: 0` are
+accepted as legacy and are **not** updated by runtime startup or the provisioning
+command. To change a stream's age or retention mode, use a separately reviewed,
+explicit admin migration; NATS does not permit changing retention mode in place.
+
+Uncertain publishes retry with the same envelope ID and frozen bytes, capped
+at the minimum of the command deadline and the stream's actual
+`duplicate_window` minus 30 seconds; without a valid command deadline, the
+retry horizon defaults to 30 seconds. On expiry, the error remains a
+`TransportUncertainError` with `retryExpired: true` and
+`expiryCode: FABRIC_TRANSPORT_UNCERTAIN_EXPIRED`, because the message may already
+have been persisted. Existing inbox streams with the current 10-minute
+`duplicate_window` remain unchanged.
+
+Main hosts keep durable inbox consumers by default. Short-lived child processes
+inherit the NATS policy with `ephemeralHost: true`, and `pi-fabric nats send`
+and `dispatch` also default to `ephemeralHost: true` with the one-hour inactive
+threshold. An explicit `PI_FABRIC_MESH_NATS` JSON value for `ephemeralHost` or
+`ephemeralInactiveSeconds` overrides the CLI default. Placement pod templates
+must set the same fields in their own `PI_FABRIC_MESH_NATS` environment; the pod
+should use `ephemeralHost: true` and `ephemeralInactiveSeconds: 3600` unless its
+lifetime needs a different threshold. Clean shutdown deletes these consumers;
+server-side inactivity expiry cleans up after unclean exits.
+
+The admin provisioning command defaults new inbox streams to seven days and
+accepts an explicit `--inbox-max-age-ms` value when provisioning a different
+configured age. It verifies existing streams only and never updates them.
+Bounded age removes old and acknowledged traffic. An unacked message older
+than the configured age can also expire. The stream's byte limit still
+applies sooner at high throughput.
+
+Longer term, `WorkQueue` retention is likely a closer fit than `Interest`: each
+inbox message is addressed to one host and should have one disjoint durable
+consumer, so an ACK can release it immediately. That change requires proving
+consumer filters cannot overlap and checking offline/replay behavior; it is not
+part of this fix, and the current `Limits` retention policy remains unchanged.
+
+### NATS events: alpha
+
+`mesh.nats.events` **defaults to false**. With `mesh.transport: "nats"`, opt in
+with the keys below, added to the existing complete NATS configuration (TLS,
+credentials, machine inventory and custody/liveness policy remain required):
+
+```json
+{ "mesh": { "nats": { "events": true, "org": "smarty-pants-inc", "provision": false } } }
+```
+
+`mesh.nats.org` is a GitHub login slug, required when events are enabled. The
+active values are `smarty-pants-inc` and `versehq` (Playful's login is `versehq`,
+not `playful`). Values are 1–63 lowercase letters, digits or hyphens, starting
+with a letter or digit; `sys` is reserved. Stream names uppercase the slug and
+replace hyphens with `_`. `mesh.nats.provision` **defaults to false**;
+both flags must be booleans. FILE transport keeps them off. In NATS mode the
+existing `PI_FABRIC_MESH_NATS` replacement snapshot supplies these keys when
+present.
+
+**Two streams, no overlap:** `FABRIC_EV_SMARTY_PANTS_INC` owns only
+`fabric.ev.smarty-pants-inc.>`; `GITHUB_SMARTY_PANTS_INC` is the existing
+fabric-store stream for `github.smarty-pants-inc.>`. The equivalent names for
+`versehq` are `FABRIC_EV_VERSEHQ` and `GITHUB_VERSEHQ`. Fabric-store creates the
+event stream with admin credentials: Limits retention, DiscardNew, 2 GiB max,
+File storage, one replica, no age expiry, and a two-minute duplicate window.
+Runtime provisioning verifies this exact existing policy; runtime credentials do
+not need stream-create authority. `mesh.nats.provision` only opts an explicit
+provisioning path in; it grants no NATS authority. Missing/incompatible streams
+or permission failures surface and never fall back to FILE.
+
+**Subjects and actor durables:** plain Fabric topic `T` publishes unchanged as
+`fabric.ev.<org>.<T>`, with no machine prefix or topic hash. A topic beginning
+`github.<org>.` is consumed from the existing `GITHUB_<ORG>` stream; other Fabric
+topics use `FABRIC_EV_<ORG>`. Each actor has a pull durable per stream it uses:
+`ev_<hash(actorId)>` and, when it subscribes to GitHub topics, `gh_<hash(actorId)>`.
+A Fabric durable also includes its exact wake subject
+`fabric.ev.<org>.wake.<actorId>`, so factory stall-wakes arrive as ordinary
+NATS events. `agents.create({ eventsStartAt })` accepts epoch milliseconds or an
+ISO-8601 timestamp and sets `DeliverPolicy.StartTime` only when each durable is
+first created. If omitted, `DeliverPolicy.All` replays all retained events;
+reopening or changing topics does not reset the cursor.
+
+| Purpose | Subject |
+|---|---|
+| Fabric topic `fleet.work` in org `smarty-pants-inc` | `fabric.ev.smarty-pants-inc.fleet.work` |
+| Actor wake for `<actorId>` | `fabric.ev.smarty-pants-inc.wake.<actorId>` |
+| Raw GitHub ingress fact (separate factory authority) | `github.<org>.<repo>.<event>.<action>.<n>` |
+| GitHub review projection | `github.<org>.<repo>.pulls.shard<K>of<N>` |
+
+Both Path B template APIs take optional fourth argument `{ events: true, org }`.
+The runtime agent may publish only `fabric.ev.<org>.>`; it may use consumer
+CREATE/INFO/MSG.NEXT/DELETE and ACK subjects on both
+`FABRIC_EV_<ORG>` and `GITHUB_<ORG>`. It receives no `github.>` publish or stream
+administration grant. The publisher's stream-wide sequence CAS and lost-ACK
+read-back also require `STREAM.INFO` and `STREAM.MSG.GET` on `FABRIC_EV_<ORG>`;
+changing topic filters requires `CONSUMER.UPDATE` on the actor's event and GitHub
+durables. These exact additions are pending product-owner approval; event-mode
+runtime publishing and filter changes remain blocked until approved and minted.
+Absent/false preserves existing grants, and the operator gains no event rights.
+Minting and exact `USER.INFO` verification use the same options.
+
+Mail services can publish through the plain-Node CLI:
+
+```sh
+pi-fabric events publish --topic mail.inbound --id <message-id> --data-file ./event.json \
+  --creds /run/fabric/nats/user.creds --ca /etc/fabric/nats/ca.pem \
+  --servers tls://nats.example:4222 --org smarty-pants-inc
+```
+
+Provide exactly one of `--data` or `--data-file`; JSON input is limited to 1 MiB.
+The CLI requires an already-provisioned stream and publishes an external,
+untrusted `mail-service` event. Its output is only `{stream, seq, duplicate}`.
+With `--id`, retry using the same topic and JSON data: the original stored event
+is returned even if the CLI's generated `createdAt` differs. Reusing an ID with
+different event content fails; it does not silently suppress the new content.
+Without `--id`, the CLI generates a new ID, so callers cannot safely retry the
+same logical event.
+
+**Accepted alpha security gap:** one shared NATS user per org has broad consumer
+rights: a holder can read either stream and create/delete another actor's
+consumer, and can forge events on `fabric.ev.<org>.>`. Filters and actor names
+are conventions, not authorization boundaries; `mesh.nats.org` is not signed
+identity. [smarty-dev#15355](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/15355)
+tracks this gap. Per-actor signed tags and authorization hardening are deferred.
 
 ## Records
 

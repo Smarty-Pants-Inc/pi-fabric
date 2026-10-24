@@ -11,6 +11,8 @@ import {
 export function publishFailure(error: unknown, id: string, resolvedBody: unknown): Error {
   let cause = error;
   for (let depth = 0; cause && depth < 6; depth += 1) {
+    const code = cause instanceof Error ? (cause as Error & { readonly code?: unknown }).code : undefined;
+    if (cause instanceof Error && typeof code === "string" && code.startsWith("FABRIC_")) return cause;
     if (cause instanceof PermissionViolationError || cause instanceof AuthorizationError) {
       return new TransportDeniedError("NATS publish permission denied", { cause: error });
     }

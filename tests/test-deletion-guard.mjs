@@ -1,11 +1,12 @@
 // smarty-dev#11145: test-only deletion guard. Importing this module installs it (side effect).
-// Locally (GITHUB_ACTIONS !== "true" at install) deletion and rename operands, and copy/link destinations,
+// Outside a verified GitHub-hosted job, deletion and rename operands, and copy/link destinations,
 // refuse paths outside the physical TMPDIR pinned at install. cp checks every kept recursive destination.
 // Hosted CI logs TEST_DELETION_REPORT: per outside operand, then delegates. Children inherit NODE_OPTIONS.
 // ponytail: a JS seam, not native race protection; helpers deleting through their own syscalls are out of reach.
 import fs from "node:fs";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import { syncBuiltinESMExports } from "node:module";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isPromise } from "node:util/types";
@@ -52,8 +53,12 @@ const isShared = (root) => {
     try { return realpath(p); } catch { return p; }
   }));
   if (shared.has(root)) return true;
-  // The root must not contain the home directory (or be it).
-  try { return within(root, realpath(homedir())); } catch { return false; }
+  // Fleet isolation redirects HOME/USERPROFILE into private TMPDIR before installation.
+  // Protect the native account home, not that mutable environment; unprovable means shared.
+  try {
+    const home = userInfo().homedir;
+    return !isAbsolute(home) || within(root, realpath(home));
+  } catch { return true; }
 };
 
 function pinRoot() {
@@ -118,7 +123,7 @@ function callerFrame() {
 }
 
 function install() {
-  const report = process.env.GITHUB_ACTIONS === "true";
+  const report = hostedOnly("outside-temp deletion reporting");
   const state = { report, root: pinRoot(), count: 0 };
 
   /** An Error to refuse with, or undefined to delegate. */

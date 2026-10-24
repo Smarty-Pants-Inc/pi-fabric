@@ -39,6 +39,8 @@ export const agentParticipantRecords = (
     const settledAt = run?.finishedAt ?? run?.updatedAt ?? observedAt;
     if (terminalAgentStatuses.has(record.status) && now - settledAt > SETTLED_AGENT_PUBLISH_MS) return;
     const active = record.status === "queued" || record.status === "running";
+    const placement = run?.placementRunId !== undefined && run.placementKind !== undefined &&
+      run.placementHost !== undefined && run.expectedSeconds !== undefined;
     // Unregistered runners keep the historical surface; control fails closed later.
     const runner = getAgentRunner(record.runner)?.capabilities;
     participants.push({
@@ -57,12 +59,14 @@ export const agentParticipantRecords = (
       capabilities: [
         ...(active && (runner?.steer ?? true) ? (["steer"] as const) : []),
         ...(active && (runner?.followUp ?? true) ? (["followUp"] as const) : []),
-        ...(active ? (["stop"] as const) : []),
+        ...(active || record.status === "finishing" ? (["stop"] as const) : []),
         ...(record.attachCommand ? (["attach"] as const) : []),
         ...(record.recursive ? (["fabric"] as const) : []),
       ],
       cwd: record.cwd,
       ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+      ...(placement ? { placementRunId: run!.placementRunId, placementKind: run!.placementKind,
+        placementHost: run!.placementHost, expectedSeconds: run!.expectedSeconds } : {}),
       ...(record.model ? { model: record.model } : {}),
       ...(record.thinking ? { thinking: record.thinking } : {}),
       startedAt: run?.startedAt ?? observedAt,

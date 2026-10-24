@@ -8,6 +8,8 @@ export interface ParticipantView {
   whenChanged(participantId: string, signal: AbortSignal): Promise<void>;
   /** The host lease is live by the local monotonic window (§4.2). */
   leaseLive(): boolean;
+  /** False admission during a recoverable local expiry; terminal loss aborts the lease signal. */
+  leaseRecovering?(): boolean;
 }
 
 import { createHash } from "node:crypto";
@@ -22,10 +24,13 @@ import {
   type TransportKvEntry,
 } from "../transport/types.js";
 import type { FabricKvHostLease, FabricParticipantInfo, FabricParticipantListOptions, FabricParticipantRecord } from "./types.js";
+import { isPlacementRunId } from "./placement-run-id.js";
 
 /** The lease task owns acquisition, monotonic expiry, successor evidence and release. */
 export interface ParticipantLeaseGate {
   live(): boolean;
+  /** True only after a local TTL lapse that may be recovered by a fenced KV CAS. */
+  recovering?(): boolean;
   readonly signal: AbortSignal;
 }
 
@@ -54,7 +59,7 @@ const MACHINE_TOKEN = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const KEY_TOKEN = /^[a-f0-9]{32}$/;
 const RUNNER_TOKEN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const KV_CAPABILITIES = new Set(["steer", "followUp", "stop", "ask", "actor-bindings", "attach", "fabric"]);
-const KV_TRANSPORTS = new Set(["host", "hosted", "auto", "process", "tmux", "screen", "localterm", "herdr"]);
+const KV_TRANSPORTS = new Set(["host", "hosted", "auto", "process", "sandbox", "tmux", "screen", "localterm", "herdr"]);
 const KV_TERMINAL = new Set(["completed", "failed", "cancelled", "stopped", "timed_out", "done", "aborted"]);
 const tokenFor = (id: string): string => createHash("sha256").update(id).digest("hex").slice(0, 32);
 const objectValue = (value: unknown): value is Record<string, unknown> =>
@@ -83,7 +88,7 @@ function machineFromKey(key: string, kind: "p" | "h"): string | undefined {
     ? parts[0] : undefined;
 }
 
-function presenceValue(entry: TransportKvEntry<unknown>): FabricParticipantRecord | undefined {
+export function presenceValue(entry: TransportKvEntry<unknown>): FabricParticipantRecord | undefined {
   const value = entry.value;
   if (!machineFromKey(entry.key, "p") || !Number.isSafeInteger(entry.revision) || entry.revision <= 0 ||
     !objectValue(value) || value.format !== 1 || !textValue(value.id) ||
@@ -100,13 +105,14 @@ function presenceValue(entry: TransportKvEntry<unknown>): FabricParticipantRecor
       typeof capability === "string" && KV_CAPABILITIES.has(capability)) ||
     !finiteValue(value.startedAt) || !finiteValue(value.updatedAt) ||
     (value.interactive !== undefined && typeof value.interactive !== "boolean") ||
-    !["sessionId", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "finalAnswerReceiptId"]
+    !["sessionId", "cwd", "label", "role", "project", "projectRoot", "repository", "model", "thinking", "parentId", "finalAnswerReceiptId", "placementRunId"]
       .every(key => value[key] === undefined || typeof value[key] === "string") ||
+    value.placementRunId !== undefined && !isPlacementRunId(value.placementRunId) ||
     value.remoteHost !== undefined || value.bridgeVia !== undefined || value.stopReason !== undefined) return undefined;
   return value as unknown as FabricParticipantRecord;
 }
 
-function leaseValue(entry: TransportKvEntry<unknown>): FabricKvHostLease | undefined {
+export function leaseValue(entry: TransportKvEntry<unknown>): FabricKvHostLease | undefined {
   const value = entry.value;
   if (!machineFromKey(entry.key, "h") || !Number.isSafeInteger(entry.revision) || entry.revision <= 0 ||
     !objectValue(value) || !textValue(value.id) || entry.key.split(".")[2] !== tokenFor(value.id) ||
@@ -145,7 +151,9 @@ export class KvParticipantDirectory implements ParticipantView {
   #started = false;
   #closed = false;
   #watchFailed = false;
-  #watchTasks: Promise<void>[] = [];
+  readonly #failedWatches = new Set<TransportBucket>();
+  readonly #watchTasks = new Set<Promise<void>>();
+  #stopVerifiedReconnect: (() => void) | undefined;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #refreshPass: Promise<void> | undefined;
   #closing: Promise<void> | undefined;
@@ -177,7 +185,9 @@ export class KvParticipantDirectory implements ParticipantView {
     this.options.lease.signal.throwIfAborted();
     this.#started = true;
     this.options.lease.signal.addEventListener("abort", this.#leaseLost, { once: true });
-    this.#watchTasks = [this.#watch("presence"), this.#watch("leases")];
+    this.#stopVerifiedReconnect = this.options.transport.onVerifiedReconnect?.(() => this.#restartFailedWatches());
+    this.#launchWatch("presence");
+    this.#launchWatch("leases");
   }
 
   get ready(): boolean {
@@ -187,6 +197,33 @@ export class KvParticipantDirectory implements ParticipantView {
   leaseLive(): boolean {
     try { return !this.#closed && !this.options.lease.signal.aborted && this.options.lease.live(); }
     catch { return false; }
+  }
+
+  leaseRecovering(): boolean {
+    try { return !this.#closed && !this.options.lease.signal.aborted && this.options.lease.recovering?.() === true; }
+    catch { return false; }
+  }
+
+  #launchWatch(bucket: TransportBucket): void {
+    const task = this.#watch(bucket).finally(() => this.#watchTasks.delete(task));
+    this.#watchTasks.add(task);
+  }
+
+  #restartFailedWatches(): void {
+    if (this.#closed || !this.#started) return;
+    for (const bucket of [...this.#failedWatches]) {
+      this.#failedWatches.delete(bucket);
+      if (bucket === "presence") {
+        this.#presenceReady = false;
+        this.#records.clear();
+        this.#presenceRevisions.clear();
+      } else {
+        this.#leasesReady = false;
+        this.#hosts.clear();
+        this.#leaseRevisions.clear();
+      }
+      this.#launchWatch(bucket);
+    }
   }
 
   #assertReady(): void { if (!this.ready) throw new DirectoryNotReadyError(); }
@@ -207,6 +244,8 @@ export class KvParticipantDirectory implements ParticipantView {
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
     this.options.lease.signal.removeEventListener("abort", this.#leaseLost);
+    this.#stopVerifiedReconnect?.();
+    this.#stopVerifiedReconnect = undefined;
     this.#abort.abort(reason);
     for (const waiter of [...this.#waiters]) waiter.fail(reason);
   }
@@ -214,56 +253,81 @@ export class KvParticipantDirectory implements ParticipantView {
   async #watch(bucket: TransportBucket): Promise<void> {
     const presence = bucket === "presence";
     const kv = presence ? this.#presence : this.#leases;
-    try {
-      for await (const event of kv.watch<unknown>(">", this.#abort.signal)) {
-        if (this.#closed) break;
-        if (event.type === "reset") {
-          if (presence) { this.#presenceReady = false; this.#records.clear(); this.#presenceRevisions.clear(); }
-          else { this.#leasesReady = false; this.#hosts.clear(); this.#leaseRevisions.clear(); }
-          continue;
-        }
-        if (event.type === "ready") {
-          const wasReady = this.ready;
-          if (presence) this.#presenceReady = true; else this.#leasesReady = true;
-          if (!wasReady && this.ready) for (const waiter of [...this.#waiters]) waiter.changed();
-          if (presence) this.#requestCleanup();
-          continue;
-        }
-        const key = event.type === "put" ? event.entry.key : event.key;
-        const revision = event.type === "put" ? event.entry.revision : event.revision;
-        if (!machineFromKey(key, presence ? "p" : "h") || !Number.isSafeInteger(revision) || revision <= 0) continue;
-        const revisions = presence ? this.#presenceRevisions : this.#leaseRevisions;
-        if (revision <= (revisions.get(key) ?? 0)) continue;
-        revisions.set(key, revision);
-        if (presence) {
-          this.#records.delete(key);
-          if (event.type === "put") {
-            const record = presenceValue(event.entry);
-            if (record) this.#records.set(key, { ...event.entry, value: freezeJson(cloneJson(record)) });
+    let attempt = 0;
+    while (!this.#closed && !this.#abort.signal.aborted) {
+      attempt++;
+      let retryAfterReconnect = false;
+      let failureCode = "WATCH_ENDED";
+      try {
+        for await (const event of kv.watch<unknown>(">", this.#abort.signal)) {
+          if (this.#closed) break;
+          if (event.type === "reset") {
+            if (presence) { this.#presenceReady = false; this.#records.clear(); this.#presenceRevisions.clear(); }
+            else { this.#leasesReady = false; this.#hosts.clear(); this.#leaseRevisions.clear(); }
+            continue;
           }
-        } else {
-          this.#hosts.delete(key);
-          if (event.type === "put") {
-            const lease = leaseValue(event.entry);
-            if (lease) this.#hosts.set(key, { ...event.entry, value: freezeJson(cloneJson(lease)) });
+          if (event.type === "ready") {
+            const wasReady = this.ready;
+            if (presence) this.#presenceReady = true; else this.#leasesReady = true;
+            this.#failedWatches.delete(bucket);
+            if (this.#presenceReady && this.#leasesReady) this.#watchFailed = false;
+            if (!wasReady && this.ready) for (const waiter of [...this.#waiters]) waiter.changed();
+            if (presence) this.#requestCleanup();
+            continue;
           }
+          const key = event.type === "put" ? event.entry.key : event.key;
+          const revision = event.type === "put" ? event.entry.revision : event.revision;
+          if (!machineFromKey(key, presence ? "p" : "h") || !Number.isSafeInteger(revision) || revision <= 0) continue;
+          const revisions = presence ? this.#presenceRevisions : this.#leaseRevisions;
+          if (revision <= (revisions.get(key) ?? 0)) continue;
+          revisions.set(key, revision);
+          if (presence) {
+            this.#records.delete(key);
+            if (event.type === "put") {
+              const record = presenceValue(event.entry);
+              if (record) this.#records.set(key, { ...event.entry, value: freezeJson(cloneJson(record)) });
+            }
+          } else {
+            this.#hosts.delete(key);
+            if (event.type === "put") {
+              const lease = leaseValue(event.entry);
+              if (lease) this.#hosts.set(key, { ...event.entry, value: freezeJson(cloneJson(lease)) });
+            }
+          }
+          for (const waiter of [...this.#waiters]) {
+            if (presence ? key.endsWith(`.p.${tokenFor(waiter.id)}`) :
+              [...this.#records.values()].some(entry => entry.value.id === waiter.id &&
+                this.#hostKey(entry) === key)) waiter.changed();
+          }
+          if (presence && this.#pendingCleanup.has(key)) this.#requestCleanup();
         }
-        for (const waiter of [...this.#waiters]) {
-          if (presence ? key.endsWith(`.p.${tokenFor(waiter.id)}`) :
-            [...this.#records.values()].some(entry => entry.value.id === waiter.id &&
-              this.#hostKey(entry) === key)) waiter.changed();
+      } catch (error) {
+        if (!this.#closed && errorCode(error) === "FABRIC_TRANSPORT_UNAVAILABLE") {
+          retryAfterReconnect = true;
+          this.#report(error);
+        } else if (!this.#closed) {
+          const code = errorCode(error);
+          failureCode = typeof code === "string" && [
+            "FABRIC_TRANSPORT_INVALID", "FABRIC_TRANSPORT_DENIED", "FABRIC_TRANSPORT_CAPACITY",
+            "FABRIC_TRANSPORT_UNCERTAIN", "FABRIC_TRANSPORT_UNSUPPORTED", "FABRIC_KV_CONFLICT",
+            "FABRIC_DIRECTORY_NOT_READY",
+          ].includes(code) ? code : "UNKNOWN";
+          this.#report(error);
         }
-        if (presence && this.#pendingCleanup.has(key)) this.#requestCleanup();
       }
-    } catch (error) {
-      if (!this.#closed) this.#report(error);
-    } finally {
-      if (presence) { this.#presenceReady = false; this.#records.clear(); }
-      else { this.#leasesReady = false; this.#hosts.clear(); }
-      if (!this.#closed) {
-        this.#watchFailed = true;
-        for (const waiter of [...this.#waiters]) waiter.fail(new DirectoryNotReadyError());
+      if (presence) { this.#presenceReady = false; this.#records.clear(); this.#presenceRevisions.clear(); }
+      else { this.#leasesReady = false; this.#hosts.clear(); this.#leaseRevisions.clear(); }
+      if (this.#closed || this.#abort.signal.aborted) return;
+      if (retryAfterReconnect) continue;
+      this.#watchFailed = true;
+      if (!this.#failedWatches.has(bucket)) {
+        this.#failedWatches.add(bucket);
+        try {
+          console.warn(`[fabric:participants:kv-watch] ${JSON.stringify({ outcome: "failed", code: failureCode, bucket, attempt })}`);
+        } catch { /* diagnostic only */ }
       }
+      for (const waiter of [...this.#waiters]) waiter.fail(new DirectoryNotReadyError());
+      return;
     }
   }
 
@@ -405,18 +469,78 @@ export class KvParticipantDirectory implements ParticipantView {
     return this.#remember(key, record, revision);
   }
 
-  /** On-change publication. Existing rows use only the revision this helper actually owns. */
-  publish(record: FabricParticipantRecord): Promise<KvPresencePublication> {
+  /** On-change publication; only an initial own-root or restored durable actor may succeed a fenced predecessor. */
+  publish(record: FabricParticipantRecord, options: { force?: boolean } = {}): Promise<KvPresencePublication> {
     const copy = this.#ownRecord(record), key = this.#key(copy.id);
     return this.#serial(key, async () => {
       this.#assertWritable();
       if (this.#pendingCleanup.has(key)) throw new TransportUnavailableError("Presence awaits uncertain admission cleanup");
       const owned = this.#owned.get(key);
+      if (options.force) {
+        // A verified broker reconnect invalidates the local freshness shortcut: read the
+        // current KV revision and confirm an exact owner/value before refreshing it.
+        const current = await this.#presence.get<unknown>(key, this.#signal());
+        if (current && !this.#same(current, copy) && (!owned || !this.#same(current, owned.record))) {
+          throw new TransportInvalidError("Reconnect presence refresh does not own the current KV record");
+        }
+        this.#assertWritable();
+        const revision = await this.#update(key, copy, current?.revision ?? 0);
+        return this.#admitted(key, copy, revision);
+      }
       if (owned && canonicalJson(owned.record) === canonicalJson(copy) &&
         performance.now() - owned.writtenAt < KV_PRESENCE_REFRESH_MS) {
         return { key, revision: owned.revision, rollback: () => this.#serial(key, () => this.#removeRevision(key, owned.revision)) };
       }
-      const revision = await this.#update(key, copy, owned?.revision ?? 0);
+      let revision: number;
+      try { revision = await this.#update(key, copy, owned?.revision ?? 0); }
+      catch (error) {
+        // Restored durable actors retain their IDs across resident incarnations.
+        // Agents, session actors, owned revisions and same-incarnation conflicts
+        // must never acquire a read revision to displace another publisher.
+        const ownRoot = copy.kind === "root" && copy.id === this.options.rootId && copy.id === this.options.identityId;
+        const durableActor = copy.kind === "actor" && copy.residency === "durable";
+        if (owned || errorCode(error) !== "FABRIC_KV_CONFLICT" || !ownRoot && !durableActor) throw error;
+        const current = await this.#presence.get<unknown>(key, this.#signal());
+        const predecessor = current && presenceValue(current);
+        if (!current || current.key !== key || !predecessor || predecessor.kind !== copy.kind ||
+          predecessor.id !== copy.id || predecessor.rootId !== copy.rootId ||
+          predecessor.ownerHostId !== copy.ownerHostId || predecessor.ownerIdentityId !== copy.ownerIdentityId ||
+          predecessor.sessionId !== copy.sessionId || predecessor.ownerIncarnation === copy.ownerIncarnation ||
+          durableActor && (predecessor.residency !== "durable" || predecessor.parentId !== copy.parentId)) {
+          throw new TransportInvalidError("Presence create conflict is not an owned predecessor");
+        }
+        // Custody's clean/native-exit proof plus exclusive lease create establishes
+        // succession, not UUID ordering or a possibly stale lease watch snapshot.
+        // The SAME host key must directly contain our new incarnation: absence,
+        // malformed data or a still-live predecessor lease cannot authorize a CAS.
+        const leaseKey = `${this.options.transport.self.machine}.h.${tokenFor(copy.ownerHostId)}`;
+        const currentLease = await this.#leases.get<unknown>(leaseKey, this.#signal());
+        const lease = currentLease && leaseValue(currentLease);
+        if (!currentLease || currentLease.key !== leaseKey || currentLease.owner !== this.#owner() || !lease ||
+          lease.id !== copy.ownerHostId || lease.rootId !== copy.rootId ||
+          lease.identityId !== copy.ownerIdentityId || lease.incarnation !== copy.ownerIncarnation) {
+          throw new TransportUnavailableError("Current owner lease does not authorize presence succession");
+        }
+        this.#assertWritable(); // Reads may outlive the monotonic lease window.
+        revision = await this.#update(key, copy, current.revision); // One CAS; never retry/adopt a lost revision.
+        try {
+          // KV has no cross-bucket transaction. Validate the exact lease revision
+          // again after the CAS, before remembering or admitting this publication.
+          const confirmed = await this.#leases.get<unknown>(leaseKey, this.#signal());
+          const confirmedLease = confirmed && leaseValue(confirmed);
+          if (!confirmed || confirmed.key !== currentLease.key || confirmed.revision !== currentLease.revision ||
+            confirmed.owner !== currentLease.owner || !confirmedLease || canonicalJson(confirmedLease) !== canonicalJson(lease)) {
+            throw new TransportUnavailableError("Owner lease changed during presence succession");
+          }
+          this.#assertWritable();
+        } catch (error) {
+          // Restore only our successful CAS revision, even if local authority is
+          // now aborted. A newer presence writer wins; never retry or delete it.
+          try { await this.#presence.put(key, current.owner, predecessor, revision, this.#signal(true)); }
+          catch (undoError) { this.#report(undoError); }
+          throw new TransportUnavailableError("Owner lease no longer authorizes presence succession", { cause: error });
+        }
+      }
       return this.#admitted(key, copy, revision);
     });
   }
@@ -533,7 +657,7 @@ export class KvParticipantDirectory implements ParticipantView {
     if (this.#closing) return this.#closing;
     this.#stop(new DirectoryNotReadyError());
     this.#closing = (async () => {
-      await Promise.allSettled(this.#watchTasks);
+      await Promise.allSettled([...this.#watchTasks]);
       await this.#flushing?.catch(error => this.#report(error));
       await Promise.allSettled([...this.#writes.values()]);
       await Promise.all([...this.#owned].map(([key, owned]) => this.#serial(key, async () => {

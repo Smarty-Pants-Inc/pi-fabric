@@ -75,15 +75,15 @@ Fabric injections carry structured [turn provenance](turn-provenance.md) on capa
 
 ### Native Pi task final-answer boundary
 
-An ordinary native Pi process task ends when its final assistant answer is durably
+An ordinary native Pi process task freezes its final assistant answer when it is durably
 recorded in `final-answer.json`. The immutable receipt fences input immediately.
-Fabric then reads the worker's associated validated terminal snapshot and releases
-`agents.wait`/`run` once, **before native process/tree close**. Run/result/handle
-records expose `finalAnswerReceipt: { id, recordedAt }`. Structured replies retain
+Fabric reads the worker's associated validated terminal snapshot, but public status
+remains `finishing` and `agents.wait`/`run` stay pending until captured native/tree
+exit is confirmed. Run/result/handle records expose `finalAnswerReceipt: { id, recordedAt }`. Structured replies retain
 `replyVia`, `value`, and schema failures; the answer receipt cannot promote a failed
 reply to success. Intermediate prose and tool turns remain steerable. Actor
 activations retain their continuation semantics. Claude and external placement
-completion rules are unchanged.
+answer validation rules are unchanged; local process tasks also join execution exit.
 
 Later `steer` and `followUp` calls reject with `FabricTargetTerminalError`, carrying
 `code: "FABRIC_TARGET_TERMINAL"`, `targetId`, and `finalAnswerReceiptId`, including
@@ -161,6 +161,14 @@ The resident writes a read-only `admission.json` beside its session actors regis
 Held entries follow actual permits through preparation and execution, not actor registry `running` labels. `lastProgressAt` advances on newly observed worker status/lifecycle activity, never on an unchanged reread. It is not a death or cleanup proof: silent runs may remain live, publication can fail, and a stopped resident leaves its last snapshot behind.
 
 `agents.spawn` validates the request and returns a handle. With a free concurrency slot, Fabric launches the worker and returns a `running` handle. When every slot is occupied, it returns a `queued` handle without waiting for admission. `agents.list` and `agents.status` show queued runs with a one-based `queuePosition`. Fabric admits them in FIFO order as running children finish. Queued spawns count against `maxPerExecution` and the calling program's `agentBudget`; cancelling one does not refund that count.
+
+Process tasks enter non-terminal `finishing` after native final settlement, while the captured worker and its owned process tree drain. The worker keeps its raw `status.json` status `running` until stream draining and result validation finish; its `finishingAt` milestone lets the supervisor expose `finishing` without treating a provider-recovery attempt's EOF as task completion. Final text is already readable through `agents.status`/`list`, but text such as `QUIESCENT` or `done` is not a completion event. A worker's terminal candidate also remains `finishing` until the supervisor confirms native close and whole-tree exit using the existing custody checks. Confirmed exit permits normal terminal settlement and admission release. Unconfirmed custody instead produces a terminal failure while retaining execution admission and files.
+
+Descendants get the existing cooperative-stop grace to exit naturally (5 seconds in the execution worker; 7 seconds at process transport settlement). Survivors are terminated through birth-checked TERM/KILL custody. The terminal result retains a `finished with forced cleanup of N descendants` warning when descendants were forcibly cleaned up, unless the existing Pi exit-grace warning already records that escalation. Finishing has a fixed cleanup deadline; it cannot remain pending indefinitely. Unconfirmed tree exit settles as `failed` with `errorCode: "CUSTODY_UNCONFIRMED"`, `executionCustody: { state: "unconfirmed", descendantsMayRemain: N, reason }`, and an error beginning `custody unconfirmed: N descendants may remain`. Final text remains readable, and wait/join resolve; this failure is **not** an exit receipt. Execution admission, the unresolved-worker marker, and run/worktree files remain retained until exit is proven. A supervisor-owned `custody-failure.json` preserves the failed outcome even if the lost worker writes another status. An explicit `stopped` or `timed_out` outcome can retain the exact bounded native stop debt; it still cannot release admission or authorize collection. Unbounded custom handles and completed candidates cannot use that exception. Windows retains its native-close/helper contract; unconfirmed debt likewise cannot authorize success or collection.
+
+Worker finishing uses native child exit/close events and execution-specific cgroup.events `populated 0` notifications when available, with one absolute cleanup deadline anchored at native settlement and one-shot TERM/KILL escalation. The manager joins its captured `closed` and verified `treeClosed` receipts, or captures legacy descendant custody once on entry, checks it after native close, and once at the existing grace deadline if descendants remain. Its existing bounded grace is the safety check before cleanup. There is no periodic status/liveness timer or membership sampling during finishing. Without an execution-specific cgroup notification, native events, escalation events, and the deadline perform bounded exit checks; shared session scopes cannot prove that the worker's execution tree is empty.
+
+`agents.wait`/`join` wait through `finishing` and return only a supervisor-terminal result. Their ordinary observation bounds and cancellation behavior still apply. `finishing` is deliberately absent from the terminal status set, so callers that check only terminal statuses keep working.
 
 `agents.wait`/`join` can wait on a queued handle through admission and completion. Their wait bound includes time spent queued. `agents.stop` removes a queued run without launching its worker and settles its result as `stopped`. A returned queued handle belongs to the session: returning from, timing out, or aborting the calling `fabric_exec` program leaves it queued. Session shutdown still stops session-owned queued and running children. These admission rules apply to every local worker transport. Queued receipts are currently session-only: a saturated durable spawn cancels its accepted queue entry, safely rejects, and returns no queued handle. If a cancellation races worker creation and exit cannot be confirmed, Fabric retains its run/worktree files, reports cleanup pending, and refuses cleanup until the worker is checked manually.
 
@@ -248,6 +256,8 @@ Ordinary tasks drop the spawner's `PI_FABRIC_ROLE` override, `PI_FABRIC_ROLE_SES
 `PI_FABRIC_ROLE_PROJECT`, and `SMARTY_READ_CLASS`,
 so participant discovery cannot still report the parent's role or critical-read class.
 Explicit actor runs retain both. Parent environment and bound session/mesh routing are unchanged.
+
+Process task agents set `SMARTY_GIT_READ_ONLY=1` and replace inherited Git credential helpers with a task-only helper that requests the existing read App token for the GitHub owner in the remote path; it answers credential `get` only and refuses other hosts. The token is used in memory and grants only the read App's existing `contents:read` access, so fetches can work without exposing the global write helper and pushes remain denied. Actors and Main do not receive this configuration, and no standing access is added.
 
 Task agents return status to their parent; they must not call `smarty-status` to update the
 parent's status comment. That helper keys ordinary comments by role/worktree, so a task
@@ -349,11 +359,15 @@ These policy keys are ignored in project/workspace `.pi/fabric.json`, even in tr
 ### Explicit model exceptions (#3134)
 
 `agents.spawn`, `agents.run`, `agents.create` (including `createActor`) and actor
-`agents.setModel` refuse an explicit Astra selector unless `modelReason` is a
-non-blank string of at most 200 JavaScript characters. The default match is
-`/(^|\/)gpt-6-astra/`: bare IDs and provider-qualified Astra variants are covered.
-No model is silently substituted. The error names the configured runner role
-default and tells the caller to omit `model` or supply a named exception:
+`agents.setModel` refuse an explicit selector matching the configured
+`requireReason` prefixes unless `modelReason` (or its `opusReason` alias) is a
+non-blank string of at most 200 JavaScript characters. The package default is
+`["gpt-6-astra", "opus", "claude"]`; bare entries match any provider and
+provider-qualified entries restrict the provider/model prefix. Claude models
+and the `claude` runner additionally require the reason to name `#N` or an
+issue URL. No explicit model is silently substituted; only indirect/default
+resolution may use the optional host fallback. The error names the configured
+runner role default and tells the caller to omit `model` or supply a named exception:
 
 ```ts
 await agents.spawn({ task: "Bounded compatibility probe", model: "cliproxyapi/gpt-6-astra",
@@ -368,17 +382,134 @@ Only the trusted host's `<agentDir>/fabric.json` may override the list:
 
 Bare entries match a model-ID prefix on any provider; provider-qualified entries
 match that provider/model prefix. Matching is case-insensitive. The default list
-is `["gpt-6-astra"]`; `[]` disables the gate (rollback). Project/workspace policy
-entries are ignored even in trusted projects. Omitted `model`, inherited role or
-project defaults, Sol and other unlisted models are unaffected. Existing actors
-continue unchanged; an explicit `setModel` request needs its own exception.
-Aliases are tested as the explicitly requested selector, not their resolved target.
+is `["gpt-6-astra", "opus", "claude"]`; `[]` disables the gate (rollback).
+Project/workspace policy entries are ignored even in trusted projects. The
+trusted profile may also set `modelPolicy.fallbackModel` and
+`fallbackThinking`; these are not root-policy rollback fields and the fallback
+model is not package-defaulted. Omitted `model`, inherited role or project
+defaults, Sol and other unlisted models are unaffected unless indirect
+resolution needs the configured fallback. Existing actors recheck grants on launch/resume;
+an explicit `setModel` request needs its own exception. Aliases resolve before
+exception admission; only the exact canonical target can match a grant.
 
 The reason is retained verbatim on run records and actor definitions/session
 bindings, and follows the effective binding into activation run records. Clearing
-or replacing a binding clears its old reason. The `run.spawned` lifecycle event
-is emitted after actual worker registration (not queue admission) with
+or replacing a binding clears its old reason. `opusReason` is accepted as an
+alias for request-level `modelReason`; this does not add a configuration key or
+change the config API. A Claude model or the `claude` runner requires a reason
+that names an issue (`#N`) or includes an issue URL. The `run.spawned` lifecycle
+event is emitted after actual worker registration (not queue admission) with
 `data.model` and, when supplied, `data.modelReason` for metering.
+
+A valid reason is the record, not authority to use Claude/Opus. The switch is
+one matching grant in the fixed host source `/etc/smarty/model-exceptions.json`:
+
+```json
+{
+  "version": 1,
+  "grants": [{
+    "id": "g-20261014-0001",
+    "issue": "Smarty-Pants-Inc/smarty-dev#12140",
+    "reason_url": "https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12140#issuecomment-123",
+    "role": "task",
+    "lane": "fv2-1127fix",
+    "host": "intel1",
+    "model": "cliproxyapi-anthropic/claude-opus-5-5",
+    "thinking": "medium",
+    "granted_by": "model-economics-lead",
+    "granted_at": "2026-10-14T14:20:00Z",
+    "expires_at": "2026-10-17T14:20:00Z",
+    "status": "active"
+  }]
+}
+```
+
+Before worker or actor-binding admission, Fabric freshly reads this file. ONE
+active, unexpired grant must match the issue inside `modelReason`, the lane,
+short host name, exact role and exact canonical model, with effective thinking
+at or below the grant's ceiling. There are no model prefixes or alternate
+backend/provenance matches. Roles are `task`, `actor:<name>`, or `lane`; Fabric
+children are never leads. The lane is the cwd basename of the ROOT session's
+bound participant record, supplied by the host, not an environment variable,
+child cwd, request argument, manager cwd or project root. A host with no root
+binding refuses with `lane-mismatch`; a root record that is missing, not fresh,
+unreadable or not absolute refuses with `lane-unresolved` (with the lookup's
+error class, never its path), and an actor keeps retrying that refusal with its
+bounded preparation backoff. The lane is `basename(root Main cwd)`,
+so a grant for `smarty-pants` does not match a Main in `worktrees/<lane>`; each
+actor captures it once at creation and uses that copy only while its own root's
+record is unavailable. The host is `os.hostname().split('.')[0]`.
+Omitted thinking resolves to the actual effective host default, not low/off;
+child bounds clamp ordinary launches, while route-pin effort remains exact.
+
+The file must be a root-owned regular file of at most 1 MiB (normally mode
+`0644`), with no group/world write; every parent through `/` must also be
+root-owned and not group/world writable. The reader preserves `O_NOFOLLOW |
+O_NONBLOCK`, opened-fd `fstat`, bounded reads and stability checks. Provision
+only through the reviewed root runner (`smarty-rootops`); no config, agent
+directory, workspace or environment variable can redirect it. Unsupported
+Windows/ownership platforms admit no exceptions. Missing files use
+`file-unavailable`; unsafe metadata/symlinks use `untrusted-source`. Unknown
+versions, duplicate ids, ANY malformed entry, unknown status, invalid ISO
+date-time or non-increasing timestamps invalidate the whole file (`malformed`).
+TTL above 72 hours refuses with `expiry-too-long`; exactly 72 hours is valid.
+Set `status: "revoked"` to revoke (`revoked`). Expiration needs no file edit or
+sweep (`expired`). Other mismatch denials are `unlisted`, `lane-mismatch`,
+`host-mismatch`, `role-mismatch`, `model-mismatch` and `thinking-exceeds`, all
+through `FabricModelExceptionDeniedError` (`FABRIC_MODEL_EXCEPTION_DENIED`)
+before a worker is launched.
+
+Bare `#N` means `Smarty-Pants-Inc/smarty-dev#N`; `repo#N`,
+`Smarty-Pants-Inc/repo#N`, and that organization's GitHub issue URLs normalize
+to the same canonical issue. Foreign-owner references and arbitrary URL
+fragments cannot authorize. Leads and Main's own model selection are unchanged;
+the fleet default remains GPT-6.
+
+Each admitted launch appends once to
+`~/.local/state/smarty/route/opus-exceptions.jsonl`: `grant_id`, `issue`, `lane`,
+short `host`, `role`, canonical `model`, effective `thinking`, `run_id` and
+`time`. Audit uses the immutable approved grant, not another parse/read. Legacy
+`ts`, `ref`, `reason` and `launcher` remain; nonexception inherited-switch rows
+retain their old format. Audit failure is a warning, never an authority source.
+
+**Operator/lead request flow (event-driven, target under 10 minutes):** the
+launching lead publishes a mesh `ask` on `fleet.models.exception-request`,
+addressed to model-economics-lead's CURRENT session, with
+`{issue, reason_url, role, lane, host, model, thinking, requested_by}`.
+The lead reads the newest `kind: "announce"` on that topic immediately before
+sending; model-economics-lead publishes `data: {session}` at every start.
+Main cannot subscribe to a topic on this Fabric, and an unaddressed event
+wakes no one. Until [smarty-dev#11077](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/11077)
+installs name addressing, use that announced session, NOT
+`to: "model-economics-lead"`; after installation the name replaces the lookup.
+No extra actor is needed. model-economics-lead replies on the same topic with `kind: "answer"`,
+`to: requested_by`, and `{grant_id}` or `{refused: reason}`. A lane waiting more
+than 10 minutes alarms chief-of-staff. This is the lead/operator workflow, not
+an automatic denial transport or a new actor. The band file
+`~/.local/state/smarty/models/claude-band.json` is an untrusted meter, NEVER an
+admission authority. The launcher reader of this same v1 format is tracked in
+[smarty-dev#12389](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/12389).
+
+Decision C keeps the process-backed fake-worker integration: it proves a denied
+request produces no worker launch and a matching host exception completes the
+real manager/provider admission path, without contacting a model provider. It
+is a native-process admission integration, not a live model end-to-end test.
+
+Protected explicit selections refuse when the required reason is absent. An
+indirect/default selection first uses a configured non-protected `agents.model`
+when available, otherwise the host/profile
+`agents.modelPolicy.fallbackModel`, paired with `fallbackThinking` (default
+`high`); this fallback is optional and has no package-wide model default. If the
+fallback is unset or unavailable, an inherited Claude binding is refused with
+`agents.modelPolicy.fallbackModel` named. Fabric does not silently select a
+provider that may not be installed on a non-fleet host. A successful fallback
+receipt/result uses the exact transition label:
+`model: inherited <old> -> <new> <thinking> (#11863)`.
+
+Each allowed exception or inherited switch is appended as one JSON object to
+`~/.local/state/smarty/route/opus-exceptions.jsonl` using one `O_APPEND` write:
+`{ts: ISO UTC, role: task | actor:<name>, model: original Claude, ref: issue | null, reason: supplied | inherited-switch, launcher: fabric, host}`.
+A receipt/logging failure is surfaced to the caller but does not block the run.
 
 ### Requested models are authoritative
 
@@ -501,6 +632,8 @@ Extension-enabled Pi children inherit the parent’s full-code mode, including o
 
 A session actor is suspended, not stopped, when its Main reloads or exits. If the Main stays gone past the restart grace (120 s, with proof that its process died), a peer Main or its resident host retires the actor in its registry: it is `stopped` with `stopReason: "host-exit"` and a `sessionOrphan` marker. When the same session starts again (`pi --session <id>`, a herdr relaunch, or a resume), Fabric restarts every such actor in that session. Each keeps its id, instructions, filters, topics and mailbox. It resumes from the session's saved mesh cursor, so a long downtime replays only the last few minutes. Fabric never restarts a stopped actor whose `stopReason` is `explicit` (`agents.stop` or `agents.remove`) or `directive` (the actor stopped itself). It also never restarts an older stopped row that has no reason or root-gone marker. The owning Main removes a stopped actor of its own with `agents.remove({ id })` (smarty-dev#9241).
 
+A callerless delivery with an explicit stable replay ID, delivery ID or coalesce key that ends before inference is re-queued for that same actor once. If the retry also ends before inference, Fabric emits one addressed `ops.owner` event of kind `actor.run.unstarted` naming the actor, delivery ID and both run IDs, then consumes the item; a run that started inference is not re-driven. Removal never re-drives. Terminal run status records `stopIntent` with the reason, request time, caller `{ kind, id }` and path (including `agents.stop`, `actors.stop`, `actors.remove`, `session-reset` and `residency-teardown`); legacy status without caller provenance remains readable.
+
 ```ts
 const audit = await agents.spawn({
   name: "integration-audit",
@@ -546,7 +679,7 @@ A failed/timed-out start or client close keeps its owned launcher handle until t
 
 Explicit Windows host starts retain the legacy atomic exclusive-create (`"wx"`) claim on `host.lock`; neither the host claim nor its establishment path spawns `flock`. Clean close removes only the token-owned claim, after closing its descriptor. Existing empty, torn, or stale claims are never automatically unlinked: a verified drain is required. This compatibility path is not an OS-backed execution-tree fence and does not enable durable Windows residency or automatic crash recovery.
 
-Normal terminal process-worker publication is followed by a bounded natural-exit observation before destructive stop, so a final native-session flush is not interrupted. Settlement/admission still requires confirmed execution exit; a terminal record alone remains insufficient.
+Normal terminal process-worker publication is followed by a bounded natural-exit observation before destructive stop, so a final native-session flush is not interrupted. Successful settlement and admission release still require confirmed execution exit; a terminal failure with retained custody does not prove exit or authorize collection.
 
 Readiness transfers custody only when the published per-attempt launch token matches this client's launcher. If a competing host wins, the client leaves that winner untouched but joins/stops its own losing attempt before returning success. A successfully ready owned durable host is not terminated by client close. POSIX CI without lock tooling uses an explicit **test-only, in-process** lock adapter for isolated request/commit harnesses; this does not enable native Windows durable residency or replace the product kernel fence.
 
@@ -707,7 +840,9 @@ return agents.run({
 });
 ```
 
-With no active host policy, Fabric forwards Veda model values unchanged to the selected backend. Use `agents.veda.model` to set a backend-specific default. An explicit `agents.run({ model })` value has priority. If you omit both values and the host deny-list is empty, Veda selects its own backend default. Under an active host deny policy, Fabric refuses unknown defaults, aliases and bare selectors before queueing or durable submission; select `agents.veda.backend: "pi"` and configure `agents.veda.model` or pass an exact allowed `provider/model` present in the Pi registry. Other Veda backends are refused because their actual target cannot be established. The admitted concrete selection is forwarded to Veda. Personas do not depend on models. Add custom personas at `~/.config/veda/personas/<name>/AGENTS.md`. Set the global default with `agents.veda.persona`, or select a persona for one run with `agents.run({ persona })`. `agents.models({ runner: "veda" })` currently returns an empty advisory list. Fabric normalizes usage (`inputTokens`/`outputTokens`/`cachedTokens`), backend conversation ID, turns, and errors from the Veda `--json` envelope. The data appears in the standard Fabric result, dashboard, lifecycle events, and budget ledger.
+With no active host policy, Fabric forwards Veda model values unchanged to the selected backend. Use `agents.veda.model` to set a backend-specific default. An explicit `agents.run({ model })` value has priority. If you omit both values and the host deny-list is empty, Veda selects its own backend default. Under an active host deny policy, Fabric refuses unknown defaults, aliases and bare selectors before queueing or durable submission; select `agents.veda.backend: "pi"` and configure `agents.veda.model` or pass an exact allowed `provider/model` present in the Pi registry. Other Veda backends are refused because their actual target cannot be established. The admitted concrete selection is forwarded to Veda. Personas do not depend on models.
+
+When `agents.veda.backend` is `claude-code`, the Claude/Opus `modelPolicy.requireReason` guard applies independently of the deny-list. A reason alone cannot admit a backend default or opaque selector such as `sonnet`: exception admission requires one exact concrete `provider/model` confirmed by the host registry and a matching v1 grant. Native Claude requires a known concrete catalog target. Workers receive the canonical admitted selector; neither a backend-qualified provenance alternate nor a model prefix can match the grant. Audit records the approved canonical selector and effective thinking, not an inferred backend default. Other and unrecognized Veda backends retain their existing pass-through behavior; Fabric must not imply it knows what model their own defaults select. Add custom personas at `~/.config/veda/personas/<name>/AGENTS.md`. Set the global default with `agents.veda.persona`, or select a persona for one run with `agents.run({ persona })`. `agents.models({ runner: "veda" })` currently returns an empty advisory list. Fabric normalizes usage (`inputTokens`/`outputTokens`/`cachedTokens`), backend conversation ID, turns, and errors from the Veda `--json` envelope. The data appears in the standard Fabric result, dashboard, lifecycle events, and budget ledger.
 
 For each run, Fabric passes `--tools <allowlist>`. It passes `--no-tools` for an empty allowlist. This setting has priority over tool frontmatter in the persona. The built-in read-only personas specify `tools: none`. The `worker` persona specifies `tools: all` with `sandbox: workspace-write`. Fabric does not pass `--sandbox`, so persona frontmatter defines the sandbox, and `worker` agents can change files. The `navigator-plan` persona also requires a `<program>` design block, and `worker` requires a `<worker_report>`. A failure in either protocol appears as a run error, so `navigator-chat` is the default for free-form tasks.
 
@@ -1040,11 +1175,11 @@ Set `agents.worktree.setup` in [configuration](configuration.md#agents) or `work
 
 ### Write confinement
 
-Local process-transport Pi task agents launched by `agents.spawn()` (including `agents.run()` and durable tasks) now default to `writableRoots: [effectiveCwd, privateScratch]` with `shell: "unconfined"` when their host run root lies outside the task cwd. The private scratch is the run's dedicated `tmp/`, not its run root: host-owned completion routing, status, event, control and session records remain outside the model's write roots. No shared mesh, export or profile root is added. If the canonical host run root is inside the cwd (including the existing durable resident layout), Fabric skips only the implicit default, preserves the previous unscoped launch, and logs one `write_policy.default_overlap_unconfined` notice naming smarty-dev#11705, which tracks moving resident runs outside cwd. This is an accepted residual, not confinement; explicit `writableRoots` and inherited policies are unchanged. Manager and worker internal filesystem writes are unaffected by this tool policy. Fabric creates the scratch directory inside that task's run directory and exports it as the child's `TMPDIR`, `TMP`, and `TEMP`. Actors, resident startup probes, hosted runners, and the Main are unchanged. A runner without the `writePolicy` capability (including Claude and Veda) keeps its previous unrestricted behavior and logs `write_policy.unsupported` once per task run.
+Local process-transport Pi task agents launched by `agents.spawn()` (including `agents.run()` and durable tasks) now default to `writableRoots: [effectiveCwd, privateScratch]` with `shell: "unconfined"` when their host run root lies outside the task cwd. The private scratch is the run's own short TMPDIR, described below, outside its run root: host-owned completion routing, status, event, control and session records remain outside the model's write roots. No shared mesh, export or profile root is added. If the canonical host run root is inside the cwd (including the existing durable resident layout), Fabric skips only the implicit default, preserves the previous unscoped launch, and logs one `write_policy.default_overlap_unconfined` notice naming smarty-dev#11705, which tracks moving resident runs outside cwd. This is an accepted residual, not confinement; explicit `writableRoots` and inherited policies are unchanged. Manager and worker internal filesystem writes are unaffected by this tool policy. Fabric creates the scratch directory outside that task's run directory and exports it as the child's `TMPDIR`, `TMP`, and `TEMP`. Actors, resident startup probes, hosted runners, and the Main are unchanged. A runner without the `writePolicy` capability (including Claude and Veda) keeps its previous unrestricted behavior and logs `write_policy.unsupported` once per task run.
 
 An explicit `readOnly`, `writableRoots`, or `shell` request replaces the task default, subject to inherited confinement below. `writePolicy: "unrestricted"` opts out, writes a `write_policy.unrestricted` event before launch, and cannot be combined with those explicit fields. It cannot escape a caller's existing confinement.
 
-For writable local process tasks, `TMPDIR`, `TMP`, and `TEMP` are set before the worker starts, so native temporary files such as Pi's large-output spills stay inside the existing write grant. Fabric keeps a caller's `TMPDIR` when both its lexical and real paths are inside a granted root. Otherwise it creates a private `0700` directory beneath a granted root other than the cwd, falling back to the last root. The default task's dedicated `--tmpdir` takes precedence. No root is added to the policy; read-only, empty-root, and unrestricted launches keep their previous temporary environment.
+For writable local process tasks, `TMPDIR`, `TMP`, and `TEMP` are set before the worker starts, so native temporary files such as Pi's large-output spills stay inside the existing write grant. Fabric keeps a caller's `TMPDIR` when both its lexical and real paths are inside a granted root. Otherwise it creates a private `0700` directory beneath a granted root other than the cwd, falling back to the last root. The default task's dedicated `--tmpdir` takes precedence, as does an actor run's. It is a short private directory `r.<10 hex>` (created exclusively, exactly `0700`) outside the run directory, so the fleet bash guard's `<TMPDIR>/p.XXXXXX` fits its 60 bytes (smarty-dev#15878). It goes under the caller's own TMPDIR, else under the parent of smarty-role's `SMARTY_SESSION_STORE` when that store holds the caller's TMPDIR. Children of a write-confined caller keep `<run dir>/tmp`. The run's `status.json` records the directory as `temporaryDirectory`. Fabric removes it after the run tree, when it prunes a failed, stopped or timed-out run down to its retained record, and in the retention sweeps that remove the run, including resident run retention. A link, a hard link or more than 64 entries in it keeps the run, as the in-tree `tmp/` did. If no candidate fits, the child still launches on `<run dir>/tmp`, as before. Fabric then writes a `tmpdir.short_unavailable` warning event (code `FABRIC_SHORT_TMPDIR_UNAVAILABLE`) to that run's `events.jsonl` and, at most once per caller TMPDIR per 6 hours, raises the manager's alarm as for held admission permits: a stderr diagnostics line and, from Main, a `fabric.alarm.agent-admission` event of kind `short-tmpdir-unavailable` addressed to its owner. No root is added to the policy; read-only, empty-root, and unrestricted launches keep their previous temporary environment.
 
 `agents.run()` and `agents.spawn()` accept `readOnly?: boolean`, `writableRoots?: string[]`, and `shell?: "deny" | "unconfined"` for Pi children. Setting any of them creates an explicit write policy:
 
@@ -1100,7 +1235,7 @@ A launch role is not transferable to every history opened by a Pi process. At th
 `session_start`, Fabric binds the env role (`PI_FABRIC_ROLE`, else stamped `SMARTY_ROLE`)
 to the **native session id and `projectOf(session cwd)`** before any lazy runtime use.
 On `/new`, fork/clone, or resume/switch to a different history, an env-granted root
-publishes `area-lead`, not `project-agent`. Actor adoption, resident-host configuration,
+publishes `area-lead`, not its launch-granted `project-agent` or `org-agent` role. Actor adoption, resident-host configuration,
 and completion-recipient metadata use the same checked role. Returning to the exact
 original session/project retains its grant; changing only the cwd to another project
 demotes it too. `PI_FABRIC_PROJECT` and Fabric session/id aliases cannot satisfy this check.
@@ -1141,9 +1276,9 @@ For Main and one-shot agents, `steer` arrives after the tool calls in the curren
 
 Main message receipts include `triggered: true | false` when the owner can report it. `true` means delivery requested a new turn from an idle Main at admission; it is not a completion receipt. A normal `followUp` (including `tell` to Main) carries the same wake permission across mesh bridges as local delivery. A busy Main reports `false` while holding the followUp for the next eligible boundary, without starting an extra run. Passive, halted, provider-backoff-held, reload-held, and duplicate admissions also report `false`. A followUp received while Main is operator-halted also reports `halted: true, reason: "operator-halt"`; it stays passive and does not resume Main.
 
-A provider/compaction failure holds triggering peer `followUp` and `steer` messages until 60 seconds after the failure; consecutive failures without a successful turn double this delay, capped at 30 minutes. Held receipts include `reason: "provider-backoff until <ISO timestamp>"`. Fabric retains the messages (with the existing durable journal and quotas) and schedules their release at the deadline, even with the ordinary busy followUp drain disabled. Only one byte/provenance-bounded triggering batch is handed to Pi for a retry whose outcome is still unknown: remaining batches and new peer wakes stay in Fabric, not Pi's native continuation queue. New held admissions during that attempt report `reason: "provider-retry in flight"`. One best-effort `fabric.main.wake` mesh event per released batch, with kind `provider-backoff-released`, reports its message IDs and deadline. A successful turn resets the delay. Successful manual compaction also releases held wakes once Pi becomes idle, even with `mesh.followUpFlushMs: 0`, without resetting the consecutive-failure count. Escape/owner halts still suppress followUp, passive, actor-output, and host-event wakes and cancel the timer. A fresh verified direct steer from another Main root may grant one run to an idle, fully settled Main only when its launch-bound role is `project-agent`; principal and unknown roles stay halted until human input. The durable halt stays latched during and after that run, so later followUps, actor output and backlog stay passive; another fresh peer steer may grant one more run after settlement. This exception never lifts the global Escape stop-world gate for actors, advisors, or Jev. Passive and `nextTurn` context do not arm the provider retry timer. An older owner or non-Main target may omit the field: treat that as unknown, not as `false`. A replayed control acknowledgement retains the original admission report; it does not describe a new wake. Existing cancellation gates and `steer` delivery semantics are unchanged.
+A provider/compaction failure holds triggering peer `followUp` and `steer` messages until 60 seconds after the failure; consecutive failures without a successful turn double this delay, capped at 30 minutes. Held receipts include `reason: "provider-backoff until <ISO timestamp>"`. Fabric retains the messages (with the existing durable journal and quotas) and schedules their release at the deadline, even with the ordinary busy followUp drain disabled. Only one byte/provenance-bounded triggering batch is handed to Pi for a retry whose outcome is still unknown: remaining batches and new peer wakes stay in Fabric, not Pi's native continuation queue. New held admissions during that attempt report `reason: "provider-retry in flight"`. One best-effort `fabric.main.wake` mesh event per released batch, with kind `provider-backoff-released`, reports its message IDs and deadline. A successful turn resets the delay. Successful manual compaction also releases held wakes once Pi becomes idle, even with `mesh.followUpFlushMs: 0`, without resetting the consecutive-failure count. An explicit TUI Escape or Main stop durably latches the operator halt, suppressing followUp, passive, actor-output, and host-event wakes and cancelling the timer. Generic SDK turn/settle aborts and manual operation-signal cancellation retain transient no-wake gates only; they do not by themselves latch that durable halt. Raw native SDK/RPC abort is transient; clients requiring a durable halt must use explicit Fabric Main stop. A fresh verified direct steer from another Main root may grant one run to an idle, fully settled Main only when its launch-bound role is `project-agent` or `org-agent`; unmarked, unknown, `task-agent`, and `area-lead` roots stay halted until human input. The durable halt stays latched during and after that run, so later followUps, actor output and backlog stay passive; another fresh peer steer may grant one more run after settlement. This exception never lifts the global Escape stop-world gate for actors, advisors, or Jev. Passive and `nextTurn` context do not arm the provider retry timer. An older owner or non-Main target may omit the field: treat that as unknown, not as `false`. A replayed control acknowledgement retains the original admission report; it does not describe a new wake. Existing cancellation gates and `steer` delivery semantics are unchanged.
 
-A **non-retryable** provider error is never provider-backoff (smarty-dev#8742). Pi exposes only the failed assistant message to extensions (its `after_provider_response` hook fires for successful responses only), so Fabric classifies the HTTP status and JSON error body Pi formats into `errorMessage`: an HTTP 4xx other than 408, 429 and a throttling 409, a 409 whose body type is `invalid_request_error` (or another request/credential error type), or the gateway token `compaction_affinity_missing` (the raw-text fallback when no status survived). `X-Should-Retry` is not visible to extensions. 5xx, 429, a bare 409, network errors and Pi's `provider_limit` stay on the backoff above, unchanged. On a non-retryable error Main holds peer wakes, warns, and at the next idle boundary runs `ctx.compact` once (the path a human `/compact` takes). A completed compaction allows one attempt: the held work, or a one-time continuation of the failed turn when nothing is held. Success clears the incident. A failed compaction, or a second non-retryable failure of that attempt, raises one alarm. Any end of Fabric's own recovery compaction other than an explicit owner cancel counts as a failed compaction: an error, an extension veto, a no-op, or Pi's native compaction deadline, whether Pi reports it as aborted or not. The `session_compact_failed` event alone raises the alarm. An owner cancel halts Main as before. The alarm is a `ctx.ui.notify` warning, a `fabric.main.wake` event with kind `fabric.main.provider-dead`, an `ops.owner` / `fabric.main.provider-dead` event to Main's owner identity, and an `ops.owner` / `inbox.age.alarm` fired at once to the sender of every held message (all of them, up to Main's 200; published in batches of at most 50), once per address: it lists that sender's held message ids (the owner's lists all, at most 50 ids plus `heldCount`) and reuses the age pass's dedupe key for the address's first held message, so it crosses the mesh bridge to remote senders and the age pass never repeats it. No timer retries afterwards. Held receipts report `triggered: false` with `reason: "provider-dead (non-retryable: <short error>); …"` (at most 200 characters, so it survives the control acknowledgement). Owner input, a successful turn, or a later compaction (one more attempt, no second alarm) ends the hold.
+A **non-retryable** provider error is never provider-backoff (smarty-dev#8742). Pi exposes only the failed assistant message to extensions (its `after_provider_response` hook fires for successful responses only), so Fabric classifies the HTTP status and JSON error body Pi formats into `errorMessage`: an HTTP 4xx other than 408, 429 and a throttling 409, a 409 whose body type is `invalid_request_error` (or another request/credential error type), or the gateway token `compaction_affinity_missing` (the raw-text fallback when no status survived). `X-Should-Retry` is not visible to extensions. 5xx, 429, a bare 409, network errors and Pi's `provider_limit` stay on the backoff above, unchanged. On a non-retryable error Main holds peer wakes, warns, and at the next idle boundary runs `ctx.compact` once (the path a human `/compact` takes). A completed compaction allows one attempt: the held work, or a one-time continuation of the failed turn when nothing is held. Success clears the incident. A failed compaction, or a second non-retryable failure of that attempt, raises one alarm. Any end of Fabric's own recovery compaction other than an explicit owner cancel counts as a failed compaction: an error, an extension veto, a no-op, or Pi's native compaction deadline, whether Pi reports it as aborted or not. The `session_compact_failed` event alone raises the alarm. Only an explicit Escape/Main stop latches the durable operator halt; generic operation cancellation does not. The alarm is a `ctx.ui.notify` warning, a `fabric.main.wake` event with kind `fabric.main.provider-dead`, an `ops.owner` / `fabric.main.provider-dead` event to Main's owner identity, and an `ops.owner` / `inbox.age.alarm` fired at once to the sender of every held message (all of them, up to Main's 200; published in batches of at most 50), once per address: it lists that sender's held message ids (the owner's lists all, at most 50 ids plus `heldCount`) and reuses the age pass's dedupe key for the address's first held message, so it crosses the mesh bridge to remote senders and the age pass never repeats it. No timer retries afterwards. Held receipts report `triggered: false` with `reason: "provider-dead (non-retryable: <short error>); …"` (at most 200 characters, so it survives the control acknowledgement). Owner input, a successful turn, or a later compaction (one more attempt, no second alarm) ends the hold.
 
 The short error, notices, receipt reasons and alarm data carry only allowlisted tokens: the HTTP status, a known error type (such as `invalid_request_error`), and a fixed code (`compaction_affinity_missing`), for example `409 invalid_request_error: compaction_affinity_missing`. Provider message text never appears in them, because a provider can echo prompt or secret content and these fields reach peers, owners and the mesh bridge. The full provider text stays in the failed assistant message in the local session log. The same rule covers the `BLOCKED: provider error: <short error>` report that follows a retryable error's one automatic retry (#4012): its notice, session message and report payload carry the same short error, never the provider's first line.
 
@@ -1221,7 +1356,12 @@ The **owning host** (Main for local actors, resident for durable actors) resolve
 
 **Platform boundary:** File-backed instructions require Linux and a genuine, accessible `/proc/self/fd`. The owner pins the canonical root with an `O_DIRECTORY` handle, checks its identity, then opens each canonical path component relative to pinned directory descriptors with `O_NOFOLLOW`. An ancestor link swapped between containment checks and opening cannot redirect the read outside the root; all handles close on success or refusal. Static in-root symlinks still work because they are canonicalized before that no-follow walk. Node does not expose a portable handle-relative open or Windows reparse-safe equivalent, so Windows/macOS/other hosts refuse **all** file-backed sources (including reparse-point paths) before filesystem access or actor mutation; use inline `instructions` there. Missing/inaccessible procfs also fails closed; there is no pathname-only fallback. This assumes the host controls mount topology/procfs; it does not defend against a privileged mount replacement.
 
-The actor has a fixed runner, persistent runner session, serial mailbox, and optional subscriptions to parent-session events or durable mesh topics:
+The actor has a fixed runner, persistent runner session, serial mailbox, and optional
+subscriptions to parent-session events or durable mesh topics. For NATS mesh events,
+`eventsStartAt` on `agents.create` accepts epoch milliseconds or an ISO-8601 timestamp
+and sets `DeliverPolicy.StartTime` only when each durable is first created. If omitted,
+`DeliverPolicy.All` replays all retained events; reopening an existing durable or changing
+topics does not reset its cursor.
 
 ```ts
 return agents.create({
@@ -1357,7 +1497,8 @@ the backlog behind it (queue plus overflow) (smarty-dev#6337).
 A failed activation records `activationBlocked` on the actor, and routers (factory review
 routing) skip a blocked actor. Its `class` says whether it can recover by itself
 (smarty-dev#6509). A `transient` block comes from a provider stream or network error, a 5xx or
-429, a timeout, or a preparation or lock timeout (code `preparation-timeout`). It records
+429, a timeout, a preparation or lock timeout (code `preparation-timeout`), or a model-exception
+root lane that could not be read (code `lane-unresolved`, smarty-dev#16357). It records
 `blockedAt` and `backoffMs`, and expires at `retryAt`: after `actors.transientBlockCooldownMs`
 (default 10 minutes). After expiry, the actor info and the published actor record show
 `activationBlockExpired` instead, so routers admit the actor again. Its next activation, queued
@@ -1393,7 +1534,7 @@ Fabric sanitizes host-event JSON before placing it in the mailbox. The JSON incl
 
 Actors handle one message at a time. By default, they coalesce repeated host events, which is useful for `message_update` and `tool_execution_update`. They restore from the trusted project actor registry.
 
-Mesh events queue one by one. Past `mesh.actorQueueLimit`, an actor's callerless work waits in its own overflow (up to eight times the limit), which is saved with its queue and runs in order as the queue drains, so one busy actor never holds other actors' delivery. Past the overflow, a routed mesh event on a persistent host goes to the actor's own dead-letter file (`dead-letter.jsonl` in its registry directory, bounded at 10,000 entries or 50 MB with the oldest dropped and counted), the host cursor advances, and the owner gets at most one `actor.alarm` per actor per hour. Dead letters re-queue in order once the actor's queue drains below half, never ahead of work restored after a restart or an ownership change; restored work past the overflow goes back to the head of the dead-letter file and is not dropped, and an entry leaves the file only once the actor's queue file holds it. A recovered actor catches up and one sick actor never holds the other actors on its host. A failed preparation moves its item behind newer work, so it no longer stays first. Elsewhere, past the overflow an event is recorded on the actor as dropped. An `ask` to a full queue still fails at once. When an actor always acts on the latest state of a subject, set `coalesceKey` to a dotted path into the event's `data`. A queued event of the same topic with the same string or number there is replaced by the newer one and keeps its place in the queue. A running activation is never replaced. An event that arrives during a run still gets its own activation, regardless of residency. A review actor that reads the current pull request head is the typical case:
+Mesh events queue one by one. Past `mesh.actorQueueLimit`, an actor's callerless work waits in its own overflow (up to eight times the limit), which is saved with its queue and runs in order as the queue drains, so one busy actor never holds other actors' delivery. Past the overflow, a routed mesh event on a persistent host goes to the actor's own dead-letter file (`dead-letter.jsonl` in its registry directory, bounded at 10,000 entries or 50 MB with the oldest dropped and counted), the host cursor advances, and the owner gets at most one `actor.alarm` per actor per hour. Dead letters re-queue in order once the actor's queue drains below half, never ahead of work restored after a restart or an ownership change; restored work past the overflow goes back to the head of the dead-letter file and is not dropped, and a replayed entry leaves the file only once the actor's queue file holds it. Stale entries are archived before removal from the backlog, and current activation-filter matches use the normal skip receipt (see below). A recovered actor catches up and one sick actor never holds the other actors on its host. A failed preparation moves its item behind newer work, so it no longer stays first. Elsewhere, past the overflow an event is recorded on the actor as dropped. An `ask` to a full queue still fails at once. When an actor always acts on the latest state of a subject, set `coalesceKey` to a dotted path into the event's `data`. A queued event of the same topic with the same string or number there is replaced by the newer one and keeps its place in the queue. A running activation is never replaced. An event that arrives during a run still gets its own activation, regardless of residency. A review actor that reads the current pull request head is the typical case:
 
 ```ts
 const reviewers = await agents.actors();
@@ -1477,6 +1618,10 @@ active activation. Mixed-trust batches keep each input's trust marking and
 cannot inherit a different input's output principal.
 
 #### Activation filter
+
+Dead-letter replay uses `deadLetterReplayMaxAgeMs` (default six hours; `0` restores unlimited replay). Age comes from each dead-letter entry's recorded `at`, not its event timestamp. Stale event archives are bounded to a 1 MiB current file, `dead-letter.archive.jsonl`, plus one bounded backup, `dead-letter.archive.jsonl.1`, also at most 1 MiB, beside the backlog. Before retiring stale entries, replay durably checkpoints the mesh monitor's already-consumed cursor past their event identities; a lagging cursor or failed checkpoint keeps those identities in the active backlog without blocking fresh replayable entries. Replay then appends and syncs the fitting stale suffix before removing it from the backlog; an oversized stale prefix remains pending for a later attempt. Rotation uses the fitting suffix's byte size, not the entire pending stale batch. Bounded rotation can discard older backup bytes and the prefix of an oversized existing archive; its alarm reports the exact discarded byte count as `deadLetterArchiveDroppedBytes`. These are event archives, not raw session traces. A crash after the archive append but before the backlog rewrite can duplicate archive entries; archive persistence precedes backlog removal, but bounded rotation does not retain history forever.
+
+Replay also checks each raw live entry against the actor's current skip-only `activationFilter` through the normal head-skip path before coalescing: a matching entry is skipped and recorded, and only eligible live entries coalesce by key. A skipped newer event cannot replace older eligible work; eligible events beyond replay capacity remain in the backlog. Actor messages with source `actor:dead-letter-replay` report `replayed`, `archivedStale`, `filterSkipped` and `remaining`. Set the age limit on `agents.create`, or pass it alongside the current filter to `agents.setActivationFilter`; omitting it from a filter change preserves the limit. Global templates and resident actors support the same setting.
 
 An actor that runs a model on every event spends most runs on events it always ignores. Set `activationFilter` to a list of skip rules. Fabric checks each queued mesh or host event against the rules just before it would run the model. When a rule matches, Fabric skips the event with no model call. A rule only skips: it never acts, replies or changes the event. Direct messages (`ask`, `tell`) are never filtered. Fabric checks an event when it arrives, before it can join or replace a queued item, and again just before the run (for items queued before the filter was set). So a skipped event never replaces a queued one by `coalesceKey`: a comment edit that arrives while its comment's creation waits in the queue is skipped, and the creation still runs.
 

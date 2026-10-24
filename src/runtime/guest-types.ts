@@ -34,7 +34,7 @@ export const GUEST_TYPE_DECLARATIONS = `
 ${NATIVE_CODEMODE_TYPES}
 type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
-type FabricTransport = "auto" | "process" | "tmux" | "screen" | "localterm" | "herdr";
+type FabricTransport = "auto" | "process" | "sandbox" | "tmux" | "screen" | "localterm" | "herdr";
 type FabricAgentRunner = "pi-durable" | "pi" | "claude" | "veda" | (string & {});
 type FabricKernel = "typescript" | "python";
 type FabricThinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -72,8 +72,10 @@ interface FabricAgentRequest {
   runner?: FabricAgentRunner;
   transport?: FabricTransport;
   model?: string;
-  /** Named exception: non-blank and ≤200 chars for explicit models in the host requireReason list. */
+  /** Named exception: non-blank and ≤200 chars. Defaults require reasons for gpt-6-astra, opus and claude; Claude/Opus must name an issue (#N or an http(s) /issues/N URL). */
   modelReason?: string;
+  /** Compatibility alias for modelReason; modelReason wins. Claude/Opus exceptions require an issue reference. */
+  opusReason?: string;
   persona?: string;
   thinking?: FabricThinking;
   /** Child thinking bounds; must lie inside this session's bounds. Levels outside are clamped. */
@@ -319,6 +321,8 @@ interface FabricTargetTerminalNotice {
 interface FabricAgentHandle {
   /** A model-chosen tiny shortening was ignored; use >=300000ms for lane/audit timeboxes. */
   timeoutNote?: { code: "AGENT_TIMEOUT_BELOW_SHORTENING_FLOOR"; requestedTimeoutMs: number; effectiveTimeoutMs: number; minimumTimeoutMs: number };
+  /** Policy switch/audit diagnostics; warnings never override the run status. */
+  warnings?: string[];
   /** Spawn catalog discovery failed open when unverified. */
   modelVerification?: "verified" | "unverified";
   /** Durable answer boundary; does not confirm native worker/tree exit. */
@@ -822,14 +826,18 @@ interface FabricActorRequestBase extends FabricActorBatching {
   activation?: FabricActorActivationPolicy;
   /** Skip-only rules checked before a queued mesh or host event runs the model. */
   activationFilter?: FabricActorActivationFilter;
+  /** Age from dead-letter recorded time; default 6 h, 0 = unlimited. Stale entries are archived. */
+  deadLetterReplayMaxAgeMs?: number;
   /** Per-activation shadow routing; requires explicit model/thinking. */
   routeClass?: "status-groom";
   /** Required clear trusted state; review/security/audit/needs-security-pass must be true. */
   protected?: boolean;
   runner?: FabricAgentRunner;
   model?: string;
-  /** Named exception: non-blank and ≤200 chars for explicit models in the host requireReason list. */
+  /** Named exception: non-blank and ≤200 chars. Defaults require reasons for gpt-6-astra, opus and claude; Claude/Opus must name an issue (#N or an http(s) /issues/N URL). */
   modelReason?: string;
+  /** Compatibility alias for modelReason; modelReason wins. Claude/Opus exceptions require an issue reference. */
+  opusReason?: string;
   thinking?: FabricThinking;
   tools?: string[];
   transport?: FabricTransport;
@@ -873,6 +881,14 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
 };
 // Mirror actors/types.ts: guest programs use the same live actor states and diagnostics.
 type FabricActorStatus = "dormant" | "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
+interface FabricActorActivationIdentity {
+  actorId: string;
+  name: string;
+  rootId: string;
+  ownershipToken: string;
+  instructionsDigest: string;
+  roleStamp?: string;
+}
 interface FabricActorInfo extends FabricActorBatching {
   /** Resolution marker (alias name or closest); does not replace the effective model. */
   via?: string;
@@ -887,6 +903,8 @@ interface FabricActorInfo extends FabricActorBatching {
   instructionsLength?: number;
   scope: "session" | "project";
   name: string;
+  rootId?: string;
+  ownershipToken?: string;
   /** The session that owns and runs the actor, whoever reads it; binding.sessionId is the reading session. */
   ownerSessionId?: string;
   status: FabricActorStatus;
@@ -903,6 +921,8 @@ interface FabricActorInfo extends FabricActorBatching {
   dedupeKey?: string;
   activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
+  /** Effective replay age limit in milliseconds; 0 = unlimited. */
+  deadLetterReplayMaxAgeMs?: number;
   /** Skips since the filter was last set/cleared; null last fields mean no skip yet. */
   filterSkipped: { count: number; lastKey: string | null; lastTopic: string | null; lastAt: number | null };
   activationFilterExpiresAt?: number;
@@ -976,7 +996,13 @@ type FabricActorReadInfo = Omit<FabricActorInfo, "status" | "queued" | "messages
   status: FabricActorInfo["status"] | "unknown";
   queued?: number;
   messages?: number;
+  roleStamp?: string;
 };
+type FabricActorSelfReadInfo = Partial<FabricActorReadInfo> & Pick<FabricActorActivationIdentity,
+  "name" | "rootId" | "ownershipToken" | "instructionsDigest" | "roleStamp"> & {
+    id: string;
+    status: "unknown";
+  };
 interface FabricModelSwitchRequest {
   /** provider/id, a models.aliases name, or a search term; resolution tries aliases first, then exact matches, then the closest fuzzy match (recency from pi-model-sort breaks ties) against authenticated models. */
   model: string;
@@ -1023,7 +1049,11 @@ type FabricMessageTarget =
   | { to: string; id?: string; sessionId?: FabricSessionIdHint };
 /** sessionId is not a field: write id: "session:<sessionId>". */
 type FabricSessionIdHint = "sessionId is not a field: use id: 'session:<sessionId>'";
-/** coalesceKey (1-200 chars): a followUp/tell replaces your unread held one to a busy Main with the same key (like actor coalesceKey). */
+/**
+ * data.coalesceKey is ordinary payload for Main: accepted originals are retained
+ * independently, with one admission per stable message identity. Main does not
+ * merge, replace, or deduplicate by this key. Actor coalesceKey settings are separate.
+ */
 interface FabricMessageData { coalesceKey?: string; [key: string]: unknown }
 type FabricMessageArgs = FabricMessageTarget & {
   message: string;
@@ -1086,8 +1116,9 @@ interface FabricMessageDelivery {
   pendingFollowUps?: number;
   /** For a Main target: the age in seconds of your oldest followUp it still holds (0 when none). */
   oldestAgeS?: number;
-  /** Main: it replaced your held followUp replacedMessageId (same data.coalesceKey). */
+  /** Legacy/remote receiver compatibility; current Main does not report replacement. */
   coalesced?: true;
+  /** Replaced message identity when reported by a legacy/remote receiver. */
   replacedMessageId?: string;
 }
 /** Select the native store to inspect; this read-only preflight never starts a host. */
@@ -1123,7 +1154,7 @@ interface FabricAgentsApi {
   list(args?: { scope?: FabricParticipantScope }): Promise<Array<FabricAgentResult | FabricAgentHandle | FabricParticipantInfo>>;
   members(args?: { scope?: FabricParticipantScope; kinds?: FabricParticipantKind[]; includeStale?: boolean }): Promise<FabricParticipantInfo[]>;
   /** lineage mirrors PI_FABRIC_LINEAGE in child workers. */
-  self(): Promise<FabricParticipantInfo & { lineage?: {
+  self(): Promise<FabricParticipantInfo & { actor?: FabricActorActivationIdentity; lineage?: {
     version: 1; rootSessionId: string; parentSessionId?: string; parentRunId?: string;
     runId: string; depth: number; childIndex: number; worker: true;
   } }>;
@@ -1152,7 +1183,7 @@ interface FabricAgentsApi {
   createActor(args: FabricActorRequest): Promise<FabricActorInfo>;
   /** Main setModel (own or remote) is refused; deferred to smarty-dev#4153. Actor bindings are unchanged. */
   setModel(args: { id: \`session:\${string}\`; model?: string; scope?: "session" }): Promise<never>;
-  setModel<Id extends string>(args: { id: Id; model?: string; modelReason?: string; scope?: FabricActorBindingScope | "global" }): Promise<Id extends \`session:\${string}\` ? never : FabricActorInfo>;
+  setModel<Id extends string>(args: { id: Id; model?: string; modelReason?: string; opusReason?: string; scope?: FabricActorBindingScope | "global" }): Promise<Id extends \`session:\${string}\` ? never : FabricActorInfo>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
   /** Only this session's own Main is supported; remote Main targets are refused. */
   setThinking(args: { id: \`session:\${string}\`; thinking: FabricThinking; scope?: "session" }): Promise<FabricMainAgentBindingResult>;
@@ -1162,7 +1193,7 @@ interface FabricAgentsApi {
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setCoalesceKey(args: { id: string; coalesceKey: string | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setBatching(args: FabricActorBatching & { id: string; scope?: "project" | "global" }): Promise<FabricActorInfo>;
-  setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
+  setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number; deadLetterReplayMaxAgeMs?: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   /** Replace ordinary actor mesh topics; [] stops topic intake without discarding accepted work. Native slot-bound topics are immutable. Live actors require the local owner; global updates only the template. */
   setTopics(args: { id: string; topics: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setEvents(args: { id: string; events: FabricActorHostEvent[] }): Promise<FabricActorInfo>;
@@ -1194,7 +1225,7 @@ interface FabricAgentsApi {
   setFollowUpMode(args: { id: string; mode: "all" | "one-at-a-time" }): Promise<{ queued: true; messageId: string }>;
   /** Advisory compaction of a running Pi-runner child at its next safe turn boundary. */
   compact(args: { id: string; instructions?: string }): Promise<{ queued: true; messageId: string }>;
-  actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorReadInfo>;
+  actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorReadInfo | FabricActorSelfReadInfo>;
   /** Inspect session (default) or the selected live durable host without changing authority. */
   slotStatus(args?: FabricSlotStatusOptions): Promise<FabricSlotStatus>;
   /** Read a live actor's instruction text and its sha256 digest. Writes nothing. */

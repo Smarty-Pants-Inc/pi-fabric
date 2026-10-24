@@ -1,4 +1,5 @@
 import * as constants from "node:constants";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import { Readable } from "node:stream";
@@ -267,7 +268,7 @@ it("refuses Windows before any writes", async () => {
   expect(stderr.join("").includes("smarty-dev#11482")).toBe(true);
 });
 
-describe.skipIf(process.env.CI !== "true" || process.platform === "win32")("NATS hosted actual-CLI cleanup (E2E; owner fabric-store)", () => {
+describe.skipIf(!hostedOnly("NATS actual-CLI cleanup") || process.platform === "win32")("NATS hosted actual-CLI cleanup (E2E; owner fabric-store)", () => {
   const roots: string[] = [];
   const bun = process.versions.bun ? process.execPath : "bun";
 

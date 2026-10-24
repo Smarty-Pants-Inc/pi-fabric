@@ -31,7 +31,7 @@ const runProperties = {
   },
   transport: {
     type: "string",
-    enum: ["auto", "process", "tmux", "screen", "localterm", "herdr"],
+    enum: ["auto", "process", "sandbox", "tmux", "screen", "localterm", "herdr"],
   },
   model: {
     type: "string",
@@ -43,7 +43,12 @@ const runProperties = {
   modelReason: {
     type: "string",
     maxLength: 200,
-    description: "Named exception for an explicit model selection, recorded on the run/actor and spawn event. Required and non-blank for agents.modelPolicy.requireReason (default gpt-6-astra on any provider); omit model to use the role default. See smarty-dev#3134.",
+    description: "Named exception for an explicit model selection, recorded on the run/actor and spawn event. Required and non-blank for agents.modelPolicy.requireReason (defaults: gpt-6-astra, opus, claude on any provider). Claude/Opus exceptions must name an issue (#N or an http(s) /issues/N URL); arbitrary reasons do not grant an exception. Omit model to use the role default. See smarty-dev#3134.",
+  },
+  opusReason: {
+    type: "string",
+    maxLength: 200,
+    description: "Compatibility alias for modelReason; modelReason wins when both are supplied. Claude/Opus exceptions must name an issue (#N or an http(s) /issues/N URL).",
   },
   persona: {
     type: "string",
@@ -532,6 +537,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
           },
         },
         topics: { type: "array", items: { type: "string" } },
+        eventsStartAt: {
+          oneOf: [
+            { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+            { type: "string", minLength: 1, pattern: "^\\d{4}-\\d{2}-\\d{2}T" },
+          ],
+          description: "Epoch milliseconds or an ISO-8601 timestamp for the first NATS durable; omitted replays all retained events.",
+        },
         delivery: {
           type: "string",
           enum: ["mailbox", "steer", "followUp", "nextTurn"],
@@ -552,6 +564,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         batchMax: { type: "integer", minimum: 1, maximum: 1000, description: "Maximum events per activation; reaching this count flushes the window. Default 50. Queue limits and receipts remain per event." },
         batchMaxBytes: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "Aggregate serialized event/image byte budget per activation. Default 256 KiB; flush before crossing it. A single oversized event runs alone." },
         activationFilter: activationFilterSchema,
+        deadLetterReplayMaxAgeMs: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER, description: "Dead-letter replay age from each entry's recorded time (default 6 h). Older entries are archived, never deleted. 0 = unlimited." },
         routeClass: { type: "string", enum: ["status-groom"], description: "Per-activation shadow Choice for checks/grooming producing a status line or no-op; explicit model/thinking pins required." },
         protected: { type: "boolean", description: "Trusted protection snapshot; true for review/security/audit/needs-security-pass. Omitted excludes before Jev." },
         residency: residencySchema,
@@ -561,6 +574,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         kernel: runProperties.kernel,
         model: strictModelProperty,
         modelReason: runProperties.modelReason,
+        opusReason: runProperties.opusReason,
         thinking: runProperties.thinking,
         tools: runProperties.tools,
         transport: runProperties.transport,
@@ -790,6 +804,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         id: { type: "string" },
         model: { type: "string" },
         modelReason: runProperties.modelReason,
+        opusReason: runProperties.opusReason,
         scope: actorBindingScopeSchema,
       },
       required: ["id"],
@@ -871,6 +886,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         id: { type: "string" },
         activationFilter: { anyOf: [activationFilterSchema, { type: "null" }] },
         expiresAt: { type: "number", description: "Epoch milliseconds; clear at/after this time on the next event or poll. Live actors only." },
+        deadLetterReplayMaxAgeMs: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER, description: "Also set the replay age limit in milliseconds; 0 = unlimited. Omitted preserves the actor's current limit (default 6 h)." },
         scope: { type: "string", enum: ["project", "global"] },
       },
       required: ["id", "activationFilter"],

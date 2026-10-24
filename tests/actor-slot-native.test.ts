@@ -8,7 +8,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
-import type { AgentManager } from "../src/agents/manager.js";
+import type { AgentManager, AgentModelAdmission } from "../src/agents/manager.js";
 import type { FabricActorRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
@@ -23,10 +23,22 @@ const names = ["demo-review-astra", "demo-security-astra"];
 const claimKey = "factory/review-slots/v1/acme/demo/1/base";
 const roots: string[] = [], meshes: MeshStore[] = [], directories: ActorDirectory[] = [];
 const openMesh = (root: string) => { const mesh = new MeshStore(root, 64 * 1024, 1000, { stateBackend: "sqlite" }); meshes.push(mesh); return mesh; };
+// Nonprotected fixture contract only; protected slot topics do not grant model exceptions.
+const assertModelAllowed: AgentManager["assertModelAllowed"] = (model, runner = DEFAULT_FABRIC_CONFIG.agents.runner) => {
+  if ((model !== undefined && model !== "test-model") || (runner !== "pi" && runner !== "pi-durable")) {
+    throw new Error(`Unexpected slot fixture model/runner: ${model}/${runner}`);
+  }
+};
+const resolveModelReasonPolicy = (
+  ...[model, _reason, runner, options = {}]: Parameters<AgentManager["resolveModelReasonPolicy"]>
+): AgentModelAdmission => {
+  assertModelAllowed(model, runner);
+  return { model, thinking: options.thinking, fallback: false };
+};
 function openDirectory(mesh: MeshStore, actorRoots: { project: string; session: string }) {
   const run = vi.fn(() => { throw new Error("A worker may not run in this safe native projection suite"); });
   const agents = { config: DEFAULT_FABRIC_CONFIG.agents, resolveKernel: () => undefined, defaultModel: () => undefined,
-    actorArchiveSources: () => new Map(), run, close: async () => {} } as unknown as AgentManager;
+    assertModelAllowed, resolveModelReasonPolicy, actorArchiveSources: () => new Map(), run, close: async () => {} } as unknown as AgentManager;
   const directory = new ActorDirectory(["native-main", identity, mesh, DEFAULT_FABRIC_CONFIG.mesh, agents, () => {}, {
     persistent: true, rootId: identity.id, claimResidency: "session", releasePaused: true,
     canConsumeMesh: () => false, meshRetentionSweepPath: false, reapDeadSessionPresence: false,

@@ -11,6 +11,7 @@ import { MeshProvider } from "../src/providers/mesh-provider.js";
 import { MeshStore } from "../src/mesh/store.js";
 import type { FabricParticipantInfo } from "../src/topology/types.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
+import { withFabricHostCaller } from "../src/fabric-provenance.js";
 
 // Synthetic replay of the nine-wrong-identifiers failure class in smarty-dev#1612,
 // not purported copies of the historical identifiers.
@@ -64,6 +65,9 @@ const legacyHashReferences = [
   ["pid #1234567890", "pid 1234567890", "1234567890"],
 ] as const;
 const surfaces = ["legacy.steer", "legacy.followUp", "hosted.steer", "hosted.followUp", "mesh.publish"] as const;
+const payloads = [...replay.map(([, text]) => text), ...issueReferences.map(([, text]) => text),
+  ...legacyHashReferences.slice(0, 6).map(([text]) => text)]
+  .map((text, index) => `\tP01-${index}: ${text}\r\nUnicode é界; original spacing  \n`);
 const session = () => SessionManager.inMemory(process.cwd());
 const invocation = (manager: SessionManager): FabricInvocationContext => ({
   cwd: process.cwd(), signal: undefined, parentToolCallId: "outer", nestedToolCallId: "nested", update() {},
@@ -106,7 +110,20 @@ const harness = (surface: typeof surfaces[number], manager = session(), routeLim
 };
 
 describe("legacy routes and durable mesh delivery", () => {
-  it.each(["steer", "followUp"] as const)("preserves notices and data on every %s routing branch", async action => {
+  it.each(["legacy.steer", "legacy.followUp"] as const)("P01 sends 20 identifier-bearing payloads byte-for-byte exactly once: %s", async surface => {
+    const h = harness(surface);
+    read(h.manager, "unrelated prior read");
+    const history = vi.spyOn(h.manager, "getEntry").mockImplementation(() => { throw new Error("must not inspect history"); });
+    const receipts = [];
+    for (const text of payloads) receipts.push(await h.send(text));
+    expect(payloads).toHaveLength(20);
+    expect(h.sent).toHaveLength(20);
+    expect(h.sent.map(text => Buffer.from(text).toString("hex"))).toEqual(payloads.map(text => Buffer.from(text).toString("hex")));
+    expect(receipts.every(result => !("notice" in (result as object)))).toBe(true);
+    expect(history).not.toHaveBeenCalled();
+  });
+
+  it.each(["steer", "followUp"] as const)("preserves original text and data on every %s routing branch", async action => {
     type Ports = ConstructorParameters<typeof AgentsProvider>;
     const sent: Array<{ route: string; message: string; data: unknown }> = [];
     const deliver = (route: string, message: string, data: unknown) => {
@@ -137,16 +154,16 @@ describe("legacy routes and durable mesh delivery", () => {
     const context = invocation(session());
     const data = { untouched: "head def5678" };
     for (const id of ["main", "child", "actor", "remote-root", "remote-child", "remote-actor", "legacy-root"]) {
-      expect(await provider.invoke(action, { id, message: "head abc1234", data }, context)).toHaveProperty("notice", "unverified ids: abc1234");
+      expect(await provider.invoke(action, { id, message: "head abc1234", data }, context)).not.toHaveProperty("notice");
     }
     expect(sent.map(({ route }) => route)).toEqual(["main", "child", "actor", "remote-root", "remote-child", "remote-actor", "legacy-root"]);
-    expect(sent.every(item => item.message === "head abc1234\n\nunverified ids: abc1234" && item.data === data)).toBe(true);
+    expect(sent.every(item => item.message === "head abc1234" && item.data === data)).toBe(true);
     const bypass = await provider.routeMessage("main", "head def5678", data, action); // Host lifecycle; no model sender context.
     expect(bypass).not.toHaveProperty("notice");
     expect(sent.at(-1)?.message).toBe("head def5678");
   });
 
-  it("persists the mesh marker, leaves target/data alone, and accepts a later actual mesh read", async () => {
+  it.each(["publish", "schedule", "publishBatch"] as const)("P01 persists 20 exact-byte mesh payloads once with target/data unchanged: %s", async mode => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "id-mesh-"));
     try {
       type Ports = ConstructorParameters<typeof MeshProvider>;
@@ -155,17 +172,26 @@ describe("legacy routes and durable mesh delivery", () => {
       const participants = { get: (id: string) => id === "unknown-target" ? { id } : undefined, list: () => [] };
       const provider = new MeshProvider(store, { id: "sender", name: "Sender", kind: "main" }, participants as unknown as Ports[2]);
       const manager = session();
-      const context = invocation(manager);
-      const data = { untouched: "head def5678" };
-      const receipt = await provider.invoke("publish", { topic: "team", to: "unknown-target", text: "head abc1234", data }, context);
-      expect(receipt).toHaveProperty("notice", "unverified ids: abc1234");
-      const events = await provider.invoke("read", { topic: "team" }, context);
-      expect(events).toEqual([expect.objectContaining({ text: "head abc1234\n\nunverified ids: abc1234", to: "unknown-target", data })]);
-      expect((events as object[])[0]).not.toHaveProperty("notice"); // Notice is receipt-only; marker is durable text.
-      read(manager, JSON.stringify(receipt), "fabric_exec");
-      expect(await provider.invoke("publish", { topic: "team", text: "head abc1234" }, context)).toHaveProperty("notice");
-      read(manager, JSON.stringify(events), "fabric_exec");
-      expect(await provider.invoke("publish", { topic: "team", text: "head abc1234" }, context)).not.toHaveProperty("notice");
+      const context = mode === "publishBatch" ? withFabricHostCaller(invocation(manager), "p01") : invocation(manager);
+      const data = { untouched: "head def5678" }, receipts: unknown[] = [], dueAt = Date.now() + 60_000;
+      read(manager, "unrelated prior read");
+      const history = vi.spyOn(manager, "getEntry");
+      for (const [index, text] of payloads.entries()) {
+        const event = { topic: "team", to: "unknown-target", text, data };
+        const result = await provider.invoke(mode === "publishBatch" ? mode : "publish",
+          mode === "publishBatch" ? { events: [event] } : { ...event, ...(mode === "schedule" ? { notBefore: dueAt + index } : {}) }, context);
+        receipts.push(...(Array.isArray(result) ? result : [result]));
+      }
+      if (mode === "schedule") { expect(store.read()).toEqual([]); await store.releaseDueSchedules(dueAt + payloads.length); }
+      const events = await provider.invoke("read", { topic: "team" }, context) as Array<{ text: string; to: string; data: unknown }>;
+      expect(events).toHaveLength(20);
+      expect(events.map(event => Buffer.from(event.text).toString("hex"))).toEqual(payloads.map(text => Buffer.from(text).toString("hex")));
+      expect(events.every(event => event.to === "unknown-target" && JSON.stringify(event.data) === JSON.stringify(data))).toBe(true);
+      expect(receipts).toHaveLength(20);
+      expect([...receipts, ...events].every(result => !("notice" in (result as object)))).toBe(true);
+      expect(history).not.toHaveBeenCalled();
+      expect(await store.releaseDueSchedules(dueAt + payloads.length)).toEqual([]);
+      expect(store.read()).toHaveLength(20);
       expect(await provider.invoke("publish", { topic: "team", data }, context)).not.toHaveProperty("notice");
       expect(await provider.invoke("publish", { topic: "team", text: "Ready", data }, context)).not.toHaveProperty("notice");
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
@@ -173,7 +199,7 @@ describe("legacy routes and durable mesh delivery", () => {
 });
 
 describe("hosted service end-to-end identifier delivery", () => {
-  it.each(["steer", "followUp"] as const)("annotates hosted %s through both child and peer delivery ports", async action => {
+  it.each(["steer", "followUp"] as const)("P01 sends 20 exact-byte hosted %s payloads once through each child and peer delivery port", async action => {
     const messages: Array<{ route: string; message: string }> = [];
     let entered!: () => void;
     const ready = new Promise<void>(resolve => { entered = resolve; });
@@ -195,11 +221,16 @@ describe("hosted service end-to-end identifier delivery", () => {
       const child = await client.spawn({ task: "synthetic port only, no model/process" });
       await ready;
       const manager = session();
-      for (const id of [child.id, peer.id]) {
-        expect(await provider.invoke(action, { id, message: "head abc1234" }, invocation(manager)))
-          .toHaveProperty("notice", "unverified ids: abc1234");
+      read(manager, "unrelated prior read");
+      const history = vi.spyOn(manager, "getEntry"), receipts = [];
+      for (const id of [child.id, peer.id]) for (const message of payloads) {
+        receipts.push(await provider.invoke(action, { id, message }, invocation(manager)));
       }
-      expect(messages).toEqual(["child", "peer"].map(route => ({ route, message: "head abc1234\n\nunverified ids: abc1234" })));
+      expect(messages).toHaveLength(40);
+      expect(messages.map(({ route, message }) => ({ route, hex: Buffer.from(message).toString("hex") })))
+        .toEqual(["child", "peer"].flatMap(route => payloads.map(message => ({ route, hex: Buffer.from(message).toString("hex") }))));
+      expect(receipts.every(result => !("notice" in (result as object)))).toBe(true);
+      expect(history).not.toHaveBeenCalled();
       read(manager, "abc1234fedcba9876543210123456789abcdefff", "bash");
       expect(await provider.invoke(action, { id: peer.id, message: "head abc1234" }, invocation(manager))).not.toHaveProperty("notice");
       expect(messages.at(-1)).toEqual({ route: "peer", message: "head abc1234" });
@@ -216,7 +247,8 @@ describe("hosted service end-to-end identifier delivery", () => {
     expect(dispatch).not.toHaveBeenCalled();
     const enabled = createAgentsProvider(createAgentServiceClient(dispatch, { followUp: true }));
     await expect(enabled.invoke("followUp", { id: "main", message: "head abc1234" }, invocation(manager))).rejects.toThrow("delivery failed");
-    expect(dispatch).toHaveBeenCalledWith("followUp", { id: "main", message: "head abc1234\n\nunverified ids: abc1234" }, undefined);
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(dispatch).toHaveBeenCalledWith("followUp", { id: "main", message: "head abc1234" }, undefined);
   });
 });
 
@@ -247,17 +279,16 @@ const countedMatchWork = async (label: string, run: () => Promise<void>) => {
   return counts;
 };
 
-describe.each(surfaces)("unverified identifier annotations: %s", surface => {
+describe.each(surfaces)("original outgoing text delivery: %s", surface => {
   it.each(["outgoing", "history"] as const)("round-3 repeated legacy spans: %s is linear and delivered", async mode => {
     const h = harness(surface);
     const repeated = "comment #123456789 ".repeat(10_000);
     if (mode === "history") read(h.manager, repeated);
     const text = mode === "outgoing" ? repeated : "#123456789";
-    const notice = mode === "outgoing" ? "unverified ids: comment 123456789" : "unverified ids: #123456789";
     const counts = await countedMatchWork(`${surface} repeated ${mode}`, async () => {
       const result = await h.send(text);
-      expect(h.sent).toEqual([`${text}\n\n${(result as { notice?: string }).notice}`]);
-      expect(result).toHaveProperty("notice", notice);
+      expect(h.sent).toEqual([text]);
+      expect(result).not.toHaveProperty("notice");
     });
     expect(counts.total).toBeLessThanOrEqual(120_000);
   });
@@ -269,12 +300,15 @@ describe.each(surfaces)("unverified identifier annotations: %s", surface => {
     if (mode === "aggregate history") { read(h.manager, repeated); read(h.manager, repeated); }
     const text = mode === "outgoing" ? repeated : "#123456789";
     const counts = await countedMatchWork(`${surface} budget ${mode}`, async () => {
-      const notice = "unverified ids: check failed";
-      expect(await h.send(text)).toHaveProperty("notice", notice);
-      expect(h.sent).toEqual([`${text}\n\n${notice}`]);
+      expect(await h.send(text)).not.toHaveProperty("notice");
+      expect(h.sent).toEqual([text]);
     });
     expect(counts.total).toBeLessThanOrEqual(120_000);
   });
+});
+
+// Historical notice/parser policy only; helper/direct tests remain until cleanup.
+describe.skip.each(surfaces)("deferred annotation policy: %s", surface => {
   it.each(replay)("delivers and reports the synthetic wrong %s", async (_kind, text) => {
     const h = harness(surface);
     const result = await h.send(text) as { notice?: string };
@@ -338,29 +372,29 @@ describe.each(surfaces)("unverified identifier annotations: %s", surface => {
     expect(h.sent).toEqual([text]);
   });
 
-  it("round-1 omission: explains the missing recipient marker and logs each occurrence", async () => {
+});
+
+describe.each(surfaces)("original delivery at the route limit: %s", surface => {
+  it("sends once per occurrence without marker retries or omission logs", async () => {
     const log = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const h = harness(surface, session(), true);
       const text = "o/pi-fabric#179";
-      const omitted = "unverified ids: o/pi-fabric#179 (recipient marker omitted: message at the route size limit)";
-      expect(await h.send(text)).toHaveProperty("notice", omitted);
-      expect(await h.send(text)).toHaveProperty("notice", omitted);
-      expect(h.sent).toEqual([text, text]); // One unmarked delivery per occurrence.
-      expect(log).toHaveBeenCalledTimes(2);
-      const rows = log.mock.calls.map(([line]) => JSON.parse(String(line).slice("[pi-fabric] ".length)));
-      const route = surface === "mesh.publish" ? surface : `agents.${surface.split(".")[1]}`;
-      expect(rows).toEqual([
-        { event: "recipient-marker-omitted", route, count: expect.any(Number) },
-        { event: "recipient-marker-omitted", route, count: rows[0].count + 1 },
-      ]);
+      expect(await h.send(text)).not.toHaveProperty("notice");
+      expect(await h.send(text)).not.toHaveProperty("notice");
+      expect(h.sent).toEqual([text, text]); // One original delivery per occurrence.
+      expect(log).not.toHaveBeenCalled();
       const normal = harness(surface);
-      expect(await normal.send(text)).toHaveProperty("notice", "unverified ids: o/pi-fabric#179");
+      expect(await normal.send(text)).not.toHaveProperty("notice");
       expect(await normal.send("Ready")).not.toHaveProperty("notice");
-      expect(log).toHaveBeenCalledTimes(2); // No count/log for normal marked or no-ID delivery.
+      expect(normal.sent).toEqual([text, "Ready"]);
+      expect(log).not.toHaveBeenCalled();
     } finally { log.mockRestore(); }
   });
 
+});
+
+describe.skip.each(surfaces)("deferred read/notice policy: %s", surface => {
   it("round-1 repository-only: flags unread references and clears finalized reads", async () => {
     for (const text of ["smarty-dev#2175", "pi-fabric#179", "x#123"]) {
       const h = harness(surface);
@@ -416,6 +450,9 @@ describe.each(surfaces)("unverified identifier annotations: %s", surface => {
     expect(await h.send(text)).toHaveProperty("notice", `unverified ids: ${text}`);
   });
 
+});
+
+describe.each(surfaces)("original delivery with sender history: %s", surface => {
   it("does not annotate real reads from agents list/peers/create, git or the GitHub API", async () => {
     const manager = session();
     read(manager, 'agents.list: [{"id":"aaaa1111bbbb2222cccc3333dddd4444"}]', "fabric_exec");
@@ -443,11 +480,11 @@ describe.each(surfaces)("unverified identifier annotations: %s", surface => {
     vi.spyOn(h.manager, "getEntry").mockImplementation(() => { throw new Error("broken history"); });
     read(h.manager, "unrelated");
     const result = await h.send("head abc1234") as { notice?: string };
-    expect(result.notice).toBe("unverified ids: check failed");
-    expect(h.sent).toEqual(["head abc1234\n\nunverified ids: check failed"]);
+    expect(result).not.toHaveProperty("notice");
+    expect(h.sent).toEqual(["head abc1234"]);
   });
 
-  it("never counts outgoing assistant guesses or annotated send receipts as reads", async () => {
+  it.skip("deferred notice policy: never counts outgoing assistant guesses or annotated send receipts as reads", async () => {
     const h = harness(surface);
     h.manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "head abc1234" },
       { type: "toolCall", id: "guess", name: "fabric_exec", arguments: { code: 'await agents.followUp({id:"main",message:"head abc1234"});' } }],

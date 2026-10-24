@@ -14,10 +14,12 @@ import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import principalDelivery from "../src/worker/principal-delivery.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
-import { CONTROL_STALE_INCARNATION, FabricControlPlane, FabricControlStaleIncarnationError } from "../src/topology/control-plane.js";
+import { AgentMessageRouter, FabricDirectoryUnavailableError, NATS_RECONNECT_PRESENCE_GRACE_MS } from "../src/providers/agents-message-router.js";
+import { CONTROL_STALE_INCARNATION, FabricControlPlane, FabricControlStaleIncarnationError, type FabricControlCommand } from "../src/topology/control-plane.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricParticipantInfo } from "../src/topology/types.js";
+import type { ParticipantRoute } from "../src/topology/participant-view.js";
+import { PEER_LEASE_WAIT_MS } from "../src/agents/peer-lease-stale.js";
 
 const message = "followUp to a running task waits until its current run finishes; use agents.steer for a correction needed before completion.";
 const warning = (targetId: string) => ({ code: "FABRIC_FOLLOW_UP_RUNNING_TASK", targetId, kind: "agent", status: "running", message });
@@ -271,7 +273,7 @@ describe("sender incarnation fencing (#7514)", () => {
 });
 
 describe("directory availability for live Mains (#2386)", () => {
-  it.each([[false, false], [false, true], [true, false], [true, true]] as const)("reports a retryable lock outage then delivers after recovery (files=%s, fresh lease=%s)", async (files, freshLease) => {
+  it.each([[false, false], [false, true], [true, false], [true, true]] as const)("revalidates live routing without a writer fence but retains stale-lease refusal (files=%s, fresh lease=%s)", async (files, freshLease) => {
     const f = await mainLeaseFixture(files);
     if (freshLease) {
       const host = f.mesh.get(f.key("topology/hosts/"))!.value as Record<string, unknown>;
@@ -293,14 +295,15 @@ describe("directory availability for live Mains (#2386)", () => {
     fs.mkdirSync(lock, { mode: 0o700 });
     fs.writeFileSync(path.join(lock, "owner"), `contended\n${process.pid}\n${Date.now()}\n`);
     try {
-      const failure = await send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp").catch(error => error);
-      expect(failure).toMatchObject(freshLease
-        ? { name: "FabricDirectoryUnavailableError", code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true }
-        : { name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true });
-      expect(failure.message).toContain(freshLease ? "Timed out waiting for the Fabric mesh lock" : "lease late by");
-      expect(failure.message).not.toContain("Unknown Fabric actor");
+      const delivery = send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp");
+      if (freshLease) {
+        await expect(delivery).resolves.toMatchObject({ queued: true, messageId: "recovered" });
+        expect(request).toHaveBeenCalledOnce();
+      } else {
+        await expect(delivery).rejects.toMatchObject({ name: "FabricParticipantStaleError", code: "FABRIC_PARTICIPANT_STALE", retryable: true });
+        expect(request).not.toHaveBeenCalled();
+      }
       expect(probe).toHaveBeenCalledTimes(freshLease ? 1 : 0);
-      expect(request).not.toHaveBeenCalled();
       expect(send.actors.status).not.toHaveBeenCalled();
     } finally {
       fs.rmSync(lock, { recursive: true, force: true });
@@ -313,8 +316,8 @@ describe("directory availability for live Mains (#2386)", () => {
     // No sender heartbeat success is needed for the canonical routing read to recover.
     await expect(send.value.routeMessage(f.target.id, "live Main reply", { proof: "unchanged" }, "followUp"))
       .resolves.toMatchObject({ queued: true, messageId: "recovered", acknowledged: true });
-    expect(probe).toHaveBeenCalledTimes(freshLease ? 2 : 1);
-    expect(request).toHaveBeenCalledOnce();
+    expect(probe).toHaveBeenCalledOnce();
+    expect(request).toHaveBeenCalledTimes(freshLease ? 2 : 1);
     expect(request.mock.calls[0]?.slice(0, 4)).toEqual([f.target.id, f.target.id, "followUp", expect.objectContaining({ message: "live Main reply", data: { proof: "unchanged" } })]);
     expect(f.directory.canConsumeMesh()).toBe(false); // Routing did not weaken lease admission.
   });
@@ -344,54 +347,42 @@ describe("directory availability for live Mains (#2386)", () => {
     }
   });
 
-  it.each(["cached-root", "fresh-root", "fresh-negative", "retained-list", "name-list", "retained-lastKnown", "lineage", "diagnostic-lastKnown", "diagnostic-peers"] as const)("classifies the late %s read with one bounded probe", async (readPath) => {
+  it.each(["cached-root", "fresh-root", "fresh-negative", "retained-list", "name-list", "retained-lastKnown", "lineage", "diagnostic-lastKnown", "diagnostic-peers"] as const)("refuses the late %s read without a global probe or replay", async (readPath) => {
     const target = { ...remote("session:live", "running", "root"), name: "live-name", rootId: "session:live", controlProtocol: "v1" } as FabricParticipantInfo;
-    for (const fails of [false, true]) {
-      let failed = true;
-      let cachedReads = 0;
-      let lists = 0;
-      let retainedReads = 0;
-      const badRead = () => { if (failed) throw new Error(`fresh ${readPath} read failed`); };
-      const get = vi.fn((id: string, _scope?: unknown, options?: { fresh?: boolean }) => {
-        if (id === target.id) {
-          if (options?.fresh && readPath === "fresh-root") badRead();
-          if (!options?.fresh && readPath === "cached-root" && ++cachedReads >= 2) badRead();
-          if (!["retained-list", "retained-lastKnown", "lineage"].includes(readPath)) return target;
-        }
-        if (options?.fresh && readPath === "fresh-negative") badRead();
-        return undefined;
-      });
-      const list = vi.fn(() => {
-        if (readPath === "retained-list" || (readPath === "name-list" && ++lists >= 2)) badRead();
-        return readPath.startsWith("diagnostic") || readPath === "fresh-negative" ? [] : [target];
-      });
-      const lastKnown = vi.fn(() => {
-        if (readPath === "retained-lastKnown" || (readPath === "diagnostic-lastKnown" && ++retainedReads >= 3)) badRead();
-        return readPath === "retained-lastKnown" ? { participant: target, lapsedMs: 1 } : undefined;
-      });
-      const peers = vi.fn(() => { if (readPath === "diagnostic-peers") badRead(); return []; });
-      const lineageAlive = vi.fn(() => { if (readPath === "lineage") badRead(); return true; });
-      const refreshRoutingView = vi.fn(async () => { if (fails) throw new Error("probe failed"); failed = false; });
-      const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
-      const source = { get, ...(["retained-lastKnown", "diagnostic-lastKnown"].includes(readPath) ? {} : { list }),
-        lastKnown, peers, lineageAlive, scheduleRefresh: vi.fn(), routingUnavailable: () => undefined, refreshRoutingView };
-      const send = router(unknown, [], { request }, source);
-      const selector = ["name-list", "fresh-negative"].includes(readPath) ? "live-name"
-        : readPath.startsWith("diagnostic") ? "session:absent" : target.id;
-      const delivery = send.value.routeMessage(selector, "one bounded resolution", undefined, "followUp");
-      if (fails) {
-        await expect(delivery).rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
-        expect(request).not.toHaveBeenCalled();
-      } else if (readPath.startsWith("diagnostic") || readPath === "fresh-negative") {
-        await expect(delivery).rejects.toThrow("Unknown Fabric participant");
-        expect(request).not.toHaveBeenCalled();
-      } else {
-        await expect(delivery).resolves.toMatchObject({ queued: true });
-        expect(request).toHaveBeenCalledOnce();
+    let cachedReads = 0, lists = 0, retainedReads = 0;
+    const failure = new Error(`fresh ${readPath} read failed`);
+    const badRead = () => { throw failure; };
+    const get = vi.fn((id: string, _scope?: unknown, options?: { fresh?: boolean }) => {
+      if (id === target.id) {
+        if (options?.fresh && readPath === "fresh-root") badRead();
+        if (!options?.fresh && readPath === "cached-root" && ++cachedReads >= 2) badRead();
+        if (!["retained-list", "retained-lastKnown", "lineage"].includes(readPath)) return target;
       }
-      expect(refreshRoutingView).toHaveBeenCalledOnce();
-      if (readPath === "fresh-root") expect(get.mock.calls.some(call => call[0] === target.id && !call[2]?.fresh)).toBe(true);
-    }
+      if (options?.fresh && readPath === "fresh-negative") badRead();
+      return undefined;
+    });
+    const list = vi.fn(() => {
+      if (readPath === "retained-list" || (readPath === "name-list" && ++lists >= 2)) badRead();
+      return readPath.startsWith("diagnostic") || readPath === "fresh-negative" ? [] : [target];
+    });
+    const lastKnown = vi.fn(() => {
+      if (readPath === "retained-lastKnown" || (readPath === "diagnostic-lastKnown" && ++retainedReads >= 3)) badRead();
+      return readPath === "retained-lastKnown" ? { participant: target, lapsedMs: 1 } : undefined;
+    });
+    const peers = vi.fn(() => { if (readPath === "diagnostic-peers") badRead(); return []; });
+    const lineageAlive = vi.fn(() => { if (readPath === "lineage") badRead(); return true; });
+    const refreshRoutingView = vi.fn().mockResolvedValue(undefined);
+    const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
+    const source = { get, ...(["retained-lastKnown", "diagnostic-lastKnown"].includes(readPath) ? {} : { list }),
+      lastKnown, peers, lineageAlive, scheduleRefresh: vi.fn(), routingUnavailable: () => undefined, refreshRoutingView };
+    const send = router(unknown, [], { request }, source);
+    const selector = ["name-list", "fresh-negative"].includes(readPath) ? "live-name"
+      : readPath.startsWith("diagnostic") ? "session:absent" : target.id;
+    await expect(send.value.routeMessage(selector, "no automatic replay", undefined, "followUp"))
+      .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true, cause: failure });
+    expect(request).not.toHaveBeenCalled();
+    expect(refreshRoutingView).not.toHaveBeenCalled();
+    if (readPath === "fresh-root") expect(get.mock.calls.some(call => call[0] === target.id && !call[2]?.fresh)).toBe(true);
   });
 
   it.each(["no confirmed view", "view overdue", "last refresh failed"])("probes once when the %s, for both delivery modes", async (reason) => {
@@ -431,47 +422,36 @@ describe("directory availability for live Mains (#2386)", () => {
     expect(refreshRoutingView).toHaveBeenCalledOnce();
   });
 
-  it.each([false, true])("bounds recovery of a read failure after a healthy preflight (probe fails=%s)", async (fails) => {
+  it.each(["followUp", "steer"] as const)("leaves a late %s read failure to the caller; an explicit retry can succeed", async kind => {
     let failed = true;
+    const failure = new Error("directory read failed");
     const target = remote("session:live", "running", "root");
-    const get = vi.fn(() => { if (failed) throw new Error("directory read failed"); return target; });
-    const refreshRoutingView = vi.fn(async () => {
-      if (fails) throw new Error("Timed out waiting for the Fabric mesh lock");
-      failed = false;
-    });
+    const get = vi.fn(() => { if (failed) throw failure; return target; });
+    const refreshRoutingView = vi.fn().mockResolvedValue(undefined);
     const request = vi.fn().mockResolvedValue({ queued: true, routed: "mesh" });
     const send = router(unknown, [], { request }, { get, scheduleRefresh: vi.fn(), routingUnavailable: () => undefined, refreshRoutingView });
-    const delivery = send.value.routeMessage(target.id, "retry resolution", undefined, "followUp");
-    if (fails) {
-      await expect(delivery).rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
-      expect(request).not.toHaveBeenCalled();
-    } else {
-      await expect(delivery).resolves.toMatchObject({ queued: true });
-      expect(request).toHaveBeenCalledOnce();
-    }
-    expect(refreshRoutingView).toHaveBeenCalledOnce();
+    await expect(send.value.routeMessage(target.id, "caller retries", undefined, kind))
+      .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true, cause: failure });
+    expect(request).not.toHaveBeenCalled();
+    expect(refreshRoutingView).not.toHaveBeenCalled();
+    failed = false;
+    await expect(send.value.routeMessage(target.id, "caller retries", undefined, kind)).resolves.toMatchObject({ queued: true });
+    expect(request).toHaveBeenCalledOnce();
+    expect(refreshRoutingView).not.toHaveBeenCalled();
   });
 
-  it("never retries a repeated fresh-root read failure or a post-publication ACK failure", async () => {
+  it.each([false, true])("never replays a post-publication ACK failure (directory class=%s)", async directoryClass => {
     const target = remote("session:live", "running", "root");
-    const refreshRoutingView = vi.fn().mockResolvedValue(undefined);
-    const get = vi.fn((_id: string, _scope?: unknown, options?: { fresh?: boolean }) => {
-      if (options?.fresh) throw new Error("persistent fresh read failure");
-      return target;
-    });
-    const request = vi.fn();
-    const send = router(unknown, [], { request }, { get, scheduleRefresh: vi.fn(), routingUnavailable: () => undefined, refreshRoutingView });
-    await expect(send.value.routeMessage(target.id, "no publication", undefined, "followUp"))
-      .rejects.toMatchObject({ code: "FABRIC_DIRECTORY_UNAVAILABLE", retryable: true });
-    expect(refreshRoutingView).toHaveBeenCalledOnce();
-    expect(request).not.toHaveBeenCalled();
-    get.mockImplementation(() => target);
-    refreshRoutingView.mockClear();
-    const ackFailure = new Error("Control acknowledgement timed out after publication");
-    request.mockRejectedValue(ackFailure);
+    const refreshRoutingView = vi.fn().mockResolvedValue(undefined), resolveRoutingLease = vi.fn();
+    const ackFailure = directoryClass ? new FabricDirectoryUnavailableError("ACK failed after publication")
+      : new Error("Control acknowledgement timed out after publication");
+    const request = vi.fn().mockRejectedValue(ackFailure);
+    const send = router(unknown, [target], { request }, { get: () => target, scheduleRefresh: vi.fn(),
+      routingUnavailable: () => undefined, refreshRoutingView, resolveRoutingLease });
     await expect(send.value.routeMessage(target.id, "already published", undefined, "followUp")).rejects.toBe(ackFailure);
     expect(request).toHaveBeenCalledOnce();
     expect(refreshRoutingView).not.toHaveBeenCalled();
+    expect(resolveRoutingLease).not.toHaveBeenCalled();
   });
 
   it.each(["followUp", "steer"] as const)("delivers canonical local Main/tasks without probing an unavailable directory (%s)", async (kind) => {
@@ -532,6 +512,80 @@ describe("directory availability for live Mains (#2386)", () => {
     expect(() => send.value.resolveActorTarget("session:missing")).toThrow("is not an actor");
     expect(send.actors.status).not.toHaveBeenCalled();
     expect(send.actors.validateDirectMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("sandbox Main stop authorization", () => {
+  it("stops only the authenticated owner on the exact run-bound local route", async () => {
+    const runId = "sandbox-owner-run";
+    const childId = "session:sandbox-child";
+    const owner: MeshIdentity = { id: "session:sandbox-owner", sessionId: "sandbox-owner", name: "Sandbox owner", kind: "main" };
+    const attacker: MeshIdentity = { id: "session:sandbox-attacker", sessionId: "sandbox-attacker", name: "Other Main", kind: "main" };
+    vi.stubEnv("PI_FABRIC_RUN_ID", runId);
+    vi.stubEnv("PI_FABRIC_TASK_PROCESS_CHILD", "1");
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", runId);
+    vi.stubEnv("PI_FABRIC_SPAWNER_ID", owner.id);
+    vi.stubEnv("PI_FABRIC_SPAWNER_SESSION_ID", "sandbox-owner");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    try {
+      let incarnation = "incarnation-1";
+      let idle = false;
+      const aborter = new AbortController();
+      const context = { signal: aborter.signal, isIdle: () => idle, isSettling: () => false,
+        abort: () => { aborter.abort(); idle = true; } } as unknown as ExtensionContext;
+      const main = {
+        id: childId, local: true, interactive: true,
+        matches: (id: string) => id === childId || id === "main",
+        deliverAgent: vi.fn(() => ({ queued: true as const, messageId: "task-queued", routed: "local" as const })),
+        bindingContext: () => context,
+        stop: vi.fn(() => { aborter.abort(); idle = true; return { id: childId, status: "stopped" as const }; }),
+      };
+      const route = { machine: "island", ownerHostId: "runtime:sandbox", ownerIdentityId: childId,
+        get ownerIncarnation() { return incarnation; }, capabilities: ["followUp"], live: true };
+      const participant = { id: childId, kind: "root", local: true, stale: false, interactive: true,
+        placementRunId: runId, ownerHostId: route.ownerHostId, ownerIdentityId: route.ownerIdentityId,
+        get ownerIncarnation() { return incarnation; }, capabilities: ["followUp"] };
+      const participants = { get: vi.fn(() => participant), scheduleRefresh: vi.fn(), lastKnown: () => undefined };
+      const control = { transportKind: "nats" as const, participantView: { resolve: () => route, leaseLive: () => true } };
+      const manager = { status: vi.fn(), steer: vi.fn(), followUp: vi.fn(), stop: vi.fn() };
+      const actors = { identity, status: vi.fn(), validateDirectMessage: vi.fn(), tell: vi.fn(), ask: vi.fn(), stop: vi.fn(),
+        steerRemote: vi.fn(), resolveBinding: vi.fn(), resolveActivationBinding: vi.fn() };
+      const receive = new AgentMessageRouter(manager as never, actors as never, main as never, participants as never, control as never, binding => binding);
+      const data = { sandboxControl: { protocol: "pi-fabric-sandbox-stop-v1", runId } };
+      const task = (sender: MeshIdentity): FabricControlCommand => ({ version: 1, commandId: `sandbox-task-${sender.id}`,
+        targetId: childId, operation: "followUp", replyTo: sender.id, message: "Run the sandbox task", data,
+        ownerIncarnation: incarnation, requestedAt: Date.now() });
+      const stop = (sender: MeshIdentity, requestRunId = runId, ownerIncarnation = incarnation): FabricControlCommand => ({
+        version: 1, commandId: `stop-${sender.id}-${requestRunId}`, targetId: childId, operation: "stop", replyTo: sender.id,
+        data: { sandboxControl: { protocol: "pi-fabric-sandbox-stop-v1", runId: requestRunId } }, ownerIncarnation, requestedAt: Date.now(),
+      });
+
+      await expect(receive.acceptControl(task(attacker), attacker, undefined, "mesh")).resolves.toMatchObject({
+        accepted: false, error: "Sandbox task delivery refused: caller does not match the trusted spawn return address",
+      });
+      await expect(receive.acceptControl(stop(attacker), attacker, undefined, "mesh")).resolves.toMatchObject({
+        accepted: false, error: "Sandbox stop refused: caller does not match the trusted spawn return address",
+      });
+      expect(main.deliverAgent).not.toHaveBeenCalled();
+      await expect(receive.acceptControl(task(owner), owner, undefined, "mesh")).resolves.toMatchObject({ accepted: true, messageId: "task-queued" });
+      expect(main.deliverAgent).toHaveBeenCalledOnce();
+      await expect(receive.acceptControl(stop(owner, `${runId}-other`), owner, undefined, "mesh")).resolves.toMatchObject({
+        accepted: false, error: "Sandbox stop refused: requested run id does not match this Main session",
+      });
+      await expect(receive.acceptControl(stop(owner), owner)).resolves.toMatchObject({ accepted: false });
+      incarnation = "incarnation-2";
+      await expect(receive.acceptControl(stop(owner, runId, "incarnation-1"), owner, undefined, "mesh")).resolves.toMatchObject({
+        accepted: false, error: "Sandbox control refused: current child route, run binding, or capability does not match",
+      });
+      expect(main.stop).not.toHaveBeenCalled();
+
+      incarnation = "incarnation-1";
+      await expect(receive.acceptControl(stop(owner), owner, undefined, "mesh")).resolves.toMatchObject({ accepted: true });
+      expect(main.stop).toHaveBeenCalledOnce();
+      expect(participants.scheduleRefresh).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 
@@ -846,5 +900,109 @@ describe("running-task followUp advisory (#3005)", () => {
     const receipt = f.manager.followUp(f.id, "later");
     expect(receipt).toEqual({ queued: true, messageId: expect.any(String) });
     expect(f.entries()).toHaveLength(1);
+  });
+});
+
+// Keep: NATS presence can lag new actor publication or this sender's verified reconnect; reconnect grace never shortens the baseline route wait.
+describe("NATS reconnect presence grace", () => {
+  it("waits briefly for a target to reappear after this sender's verified reconnect", async () => {
+    expect(NATS_RECONNECT_PRESENCE_GRACE_MS).toBeGreaterThan(0);
+    expect(NATS_RECONNECT_PRESENCE_GRACE_MS).toBeLessThan(PEER_LEASE_WAIT_MS);
+    const target = remote("session:reconnect-grace", "running", "root");
+    const liveRoute: ParticipantRoute = { machine: "machine-a", ownerHostId: target.ownerHostId!,
+      ownerIdentityId: target.ownerIdentityId!, ownerIncarnation: target.ownerIncarnation!, capabilities: ["followUp"], live: true };
+    let currentRoute: ParticipantRoute | undefined;
+    let verifiedReconnect: (() => void) | undefined;
+    let releasePresence!: () => void;
+    const view = {
+      leaseLive: () => true,
+      resolve: vi.fn((id: string) => id === target.id ? currentRoute : undefined),
+      whenChanged: vi.fn((_id: string, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
+        const abort = () => { signal.removeEventListener("abort", abort); reject(signal.reason ?? new Error("presence wait aborted")); };
+        signal.addEventListener("abort", abort, { once: true });
+        releasePresence = () => {
+          currentRoute = liveRoute;
+          signal.removeEventListener("abort", abort);
+          resolve();
+        };
+      })),
+    };
+    const request = vi.fn().mockResolvedValue({ queued: true, acknowledged: true, routed: "mesh", messageId: "reconnected" });
+    const control = { request, transportKind: "nats" as const, participantView: view,
+      onVerifiedReconnect: (listener: () => void) => { verifiedReconnect = listener; return () => { verifiedReconnect = undefined; }; } };
+    const send = router(unknown, [target], control as unknown as Ports[4]);
+    verifiedReconnect?.();
+
+    const delivery = send.value.routeMessage(target.id, "after verified reconnect", undefined, "followUp");
+    await vi.waitFor(() => expect(view.whenChanged).toHaveBeenCalledOnce());
+    releasePresence();
+    await expect(delivery).resolves.toMatchObject({ queued: true, acknowledged: true, messageId: "reconnected" });
+    expect(request).toHaveBeenCalledOnce();
+    expect(view.whenChanged).toHaveBeenCalled();
+  });
+
+  it("keeps at least the baseline peer-lease wait when reconnect grace is shorter", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    try {
+      let verifiedReconnect: (() => void) | undefined;
+      let enteredWait!: () => void;
+      const waiting = new Promise<void>(resolve => { enteredWait = resolve; });
+      const view = { leaseLive: () => true, resolve: vi.fn(() => undefined),
+        whenChanged: vi.fn((_id: string, signal: AbortSignal) => new Promise<void>((_resolve, reject) => {
+          enteredWait();
+          signal.addEventListener("abort", () => reject(signal.reason ?? new Error("presence wait aborted")), { once: true });
+        })) };
+      const request = vi.fn();
+      const control = { request, transportKind: "nats" as const, participantView: view,
+        onVerifiedReconnect: (listener: () => void) => { verifiedReconnect = listener; return () => { verifiedReconnect = undefined; }; } };
+      const send = router(unknown, [], control as unknown as Ports[4]);
+      verifiedReconnect?.();
+      const startedAt = Date.now();
+      const delivery = send.value.routeMessage("session:missing-after-reconnect", "must not wait long", undefined, "followUp")
+        .then(result => ({ outcome: "ack" as const, result }), error => ({ outcome: "error" as const, error }));
+      await waiting;
+      const waitMs = Math.max(PEER_LEASE_WAIT_MS, NATS_RECONNECT_PRESENCE_GRACE_MS);
+      await vi.advanceTimersByTimeAsync(waitMs);
+      const settled = await delivery;
+      expect(settled.outcome).toBe("error");
+      if (settled.outcome === "error") expect(settled.error).toMatchObject({ message: "Unknown Fabric participant: session:missing-after-reconnect (no live record in NATS presence)" });
+      expect(Date.now() - startedAt).toBe(waitMs);
+      expect(view.whenChanged).toHaveBeenCalledOnce();
+      expect(request).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("retains the pre-reconnect peer-lease wait for a missing target", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    try {
+      let verifiedReconnect: (() => void) | undefined;
+      let enteredWait!: () => void;
+      const waiting = new Promise<void>(resolve => { enteredWait = resolve; });
+      const view = { leaseLive: () => true, resolve: vi.fn(() => undefined),
+        whenChanged: vi.fn((_id: string, signal: AbortSignal) => new Promise<void>((_resolve, reject) => {
+          enteredWait();
+          signal.addEventListener("abort", () => reject(signal.reason ?? new Error("presence wait aborted")), { once: true });
+        })) };
+      const request = vi.fn();
+      const control = { request, transportKind: "nats" as const, participantView: view,
+        onVerifiedReconnect: (listener: () => void) => { verifiedReconnect = listener; return () => { verifiedReconnect = undefined; }; } };
+      const send = router(unknown, [], control as unknown as Ports[4]);
+      expect(verifiedReconnect).toBeDefined();
+      const startedAt = Date.now();
+      const delivery = send.value.routeMessage("session:unknown-without-reconnect", "must wait only the existing budget", undefined, "followUp")
+        .then(result => ({ outcome: "ack" as const, result }), error => ({ outcome: "error" as const, error }));
+      await waiting;
+      expect(view.whenChanged).toHaveBeenCalledOnce();
+      expect(request).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(PEER_LEASE_WAIT_MS);
+      const settled = await delivery;
+      expect(settled.outcome).toBe("error");
+      if (settled.outcome === "error") expect(settled.error).toMatchObject({ message: "Unknown Fabric participant: session:unknown-without-reconnect (no live record in NATS presence)" });
+      expect(Date.now() - startedAt).toBe(PEER_LEASE_WAIT_MS);
+      expect(view.whenChanged).toHaveBeenCalledOnce();
+      expect(request).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
   });
 });

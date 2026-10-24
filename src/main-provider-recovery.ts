@@ -3,6 +3,7 @@ import { notifyDiagnostic, notifyPrincipalDiagnosticOnce, resetPrincipalDiagnost
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveFabricIdentity, sendFabricMessage } from "./fabric-provenance.js";
 import { extensionContextLive } from "./session-liveness.js";
+import { recentSessionEntries } from "./core/preview.js";
 
 /** Final settlement is after Pi's own retry/overflow recovery, unlike agent_end (#4012). */
 export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
@@ -22,7 +23,11 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
   };
   const reset = (): void => { cancel(); retried = false; reported = false; };
   pi.on("agent_start", (_event, context) => { resetPrincipalDiagnosticTurn(pi, context); cancel(); });
-  pi.on("input", (_event, context) => { resetPrincipalDiagnosticTurn(pi, context); cancel(); });
+  pi.on("input", (event: { source?: string }, context) => {
+    resetPrincipalDiagnosticTurn(pi, context);
+    if (event.source === "extension") { cancel(); return; }
+    reset();
+  });
   pi.on("session_start", (_event, context) => { resetPrincipalDiagnosticTurn(pi, context); reset(); });
   pi.on("session_shutdown", reset);
   pi.on("session_before_switch", (_event, context) => { resetPrincipalDiagnosticTurn(pi, context); reset(); });
@@ -33,11 +38,11 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     if (identity.kind !== "main" || identity.id !== mainAgentId) return;
     if (context.signal?.aborted || options.halted() ||
       (event as { outcome?: string }).outcome === "aborted") return;
-    const entries = context.sessionManager.getEntries();
+    const entries = recentSessionEntries(context.sessionManager, 50);
     let last: AssistantMessage | undefined;
-    for (let i = entries.length - 1; i >= Math.max(0, entries.length - 50); i--) {
-      const entry = entries[i]!;
-      if (entry.type === "message" && entry.message.role === "assistant") {
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i] as { type?: string; message?: AssistantMessage };
+      if (entry.type === "message" && entry.message?.role === "assistant") {
         last = entry.message;
         break;
       }
@@ -52,8 +57,14 @@ export const registerMainProviderRecovery = (pi: ExtensionAPI, options: {
     const live = (): boolean => generation === current && extensionContextLive(context);
     // The classifier loads at the first failed settle: it is shared with the lazy Main drain and
     // would otherwise split into its own eager startup chunk.
-    const { classifyProviderError } = await import("./provider-error-class.js");
+    const { classifyModelRefusal, classifyProviderError, hasRecordedModelRefusal } = await import("./provider-error-class.js");
     if (!live()) return;
+    // Pi's refusal and explicit retry veto both suppress Fabric's automatic recovery.
+    if (classifyModelRefusal(last) || hasRecordedModelRefusal(last) ||
+      (last as AssistantMessage & { recovery?: { retryable?: unknown } }).recovery?.retryable === false) {
+      reset();
+      return;
+    }
     // A blind retry of a request the provider rejects as non-retryable fails the same way.
     const classified = classifyProviderError(last);
     if (classified?.retryable === false && options.ownsNonRetryable?.() === true) {

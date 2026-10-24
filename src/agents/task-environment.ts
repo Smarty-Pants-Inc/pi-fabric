@@ -1,3 +1,6 @@
+import { hostedAdmissionMarker, isHostedOnlyAllowed } from "../../scripts/hosted-only.mjs";
+import { configureTaskGitReadOnlyEnvironment } from "./task-git-credential.js";
+
 /** A new run cannot claim its caller's task boundary; keep roles and ordinary env intact. */
 export const withoutTaskBoundary = (environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
   const child = { ...environment };
@@ -23,6 +26,14 @@ export const taskAgentEnvironment = (
   // an unstamped/non-fleet parent must not invent a revision.
   const revision = environment.SMARTY_ROLE?.match(/@([0-9a-f]{12,40})$/)?.[1];
   child.SMARTY_ROLE = `task-agent${revision ? `@${revision}` : ""}`;
+  // Process task agents always use the read-only Git credential token; never inherit
+  // a caller-selected value for this privilege-reducing boundary.
+  child.SMARTY_GIT_READ_ONLY = "1";
+  configureTaskGitReadOnlyEnvironment(child);
+  // Preserve the parent's actual hosted-only admission across this role change; a
+  // non-hosted parent cannot mint the marker merely by passing runner-looking env.
+  if (isHostedOnlyAllowed(environment)) child[hostedAdmissionMarker] = "1";
+  else delete child[hostedAdmissionMarker];
   // participantRole prefers this override; leaving it inherited hides the
   // child's task role. A parent's critical-read class is role-specific too.
   delete child.PI_FABRIC_ROLE;
@@ -32,6 +43,7 @@ export const taskAgentEnvironment = (
   delete child.SMARTY_READ_CLASS;
   // An actor's task child is a task, not another activation of the parent's actor.
   delete child.PI_FABRIC_ACTOR_ID;
+  delete child.PI_FABRIC_ACTOR_SELF;
   delete child.PI_FABRIC_TASK_PROCESS_CHILD;
   return child;
 };

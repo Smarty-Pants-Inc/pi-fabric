@@ -17,6 +17,7 @@ import { writePolicyDenial } from "../src/agents/write-guard.js";
 import { canRemoveTerminalRun, FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, pruneActorRunArchives, sweepTempRunRoots } from "../src/storage/retention.js";
 import { startRemovalTally, stopRemovalTally } from "../src/storage/verified-remove.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
+import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
 
 // All fixtures are below this test's own TMPDIR. Retention uses recorded deletions locally (#11199).
 const managers: AgentManager[] = [];
@@ -24,7 +25,7 @@ afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.unstubAllEnvs();
 });
-const fixture = (placement = false, overlap?: "option" | "environment" | "equal" | "alias" | "resident") => {
+const fixture = (placement = false, overlap?: "option" | "environment" | "equal" | "alias" | "resident", exceptionModel?: string) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-task-write-")));
   const cwd = path.join(root, "work");
   fs.mkdirSync(cwd);
@@ -40,7 +41,7 @@ const args = new Map(); for (let i=2;i<process.argv.length;i+=2) args.set(proces
 const policy = readWritePolicy(args.get('--write-policy'));
 const cwd = args.get('--cwd'), tmpdir = args.get('--tmpdir');
 const probes = [];
-if (args.get('--runner') === 'pi' && !args.get('--actor-id') && !args.get('--resident-startup-probe')) {
+if (['pi','pi-durable'].includes(args.get('--runner')) && !args.get('--resident-startup-probe')) {
   for (const file of [path.join(cwd,'inside.txt'), ...(tmpdir ? [path.join(tmpdir,'scratch.txt')] : []), ${JSON.stringify(outside)}]) {
     const reason = policy && writePolicyDenial(policy,'write',{path:file,content:'probe'},cwd);
     if (reason) probes.push({file,allowed:false,reason});
@@ -71,9 +72,13 @@ const [mode,id]=process.argv.slice(2); if(mode==='launch'){const dir=path.join($
     runRoot = alias;
   }
   if (overlap === "environment") vi.stubEnv("PI_FABRIC_RUN_ROOT", runRoot);
+  const modelExceptionsPath = exceptionModel ? path.join(root, "model-exceptions.json") : undefined;
+  if (exceptionModel) fs.writeFileSync(modelExceptionsPath!, JSON.stringify({ version: 1, grants: [modelExceptionGrant({ model: exceptionModel, lane: path.basename(cwd) })] }));
   const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 10_000, retainRuns: true,
-    ...(remote ? { placement: remote } : {}),
-  }, { workerPath: worker, ...(overlap === "environment" ? {} : { runRoot }), fullCodeMode: false, meshRoot, completionRecipient: recipient });
+    ...(remote ? { placement: remote } : {}), ...(modelExceptionsPath ? { modelExceptionsPath } : {}),
+  }, { workerPath: worker, ...(overlap === "environment" ? {} : { runRoot }), fullCodeMode: false, meshRoot, completionRecipient: recipient,
+    ...(exceptionModel ? { rootSessionCwd: () => cwd, claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs") } : {}),
+  });
   managers.push(manager);
   const events = (id: string) => fs.readFileSync(path.join(manager.runDirectory(id)!, "events.jsonl"), "utf8")
     .trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
@@ -92,7 +97,8 @@ describe("local process task write default", () => {
     const { result, value } = await report(f);
     const run = f.manager.runDirectory(result.id)!;
     expect(value.policy).toEqual({ readOnly: false, writableRoots: [f.cwd, value.tmpdir].sort(), shell: "unconfined" });
-    expect(value.tmpdir).toBe(path.join(run, "tmp"));
+    // smarty-dev#15878: a short private TMPDIR when one fits the host's temp path, else the run's own tmp.
+    expect(value.tmpdir).toBe(result.temporaryDirectory ?? path.join(run, "tmp"));
     for (const tool of ["write", "edit"]) {
       expect(writePolicyDenial(value.policy, tool, { path: path.join(value.tmpdir, "x") }, f.cwd)).toBeUndefined();
       for (const file of ["completion-recipient.json", "status.json", "events.jsonl", "session.jsonl", "terminal-controls/control.json", "deliveries/message.json", "nested/child/task.txt"]) {
@@ -237,24 +243,70 @@ describe("local process task write default", () => {
       .toEqual([expect.objectContaining({ type: "write_policy.unrestricted" })]);
   });
 
-  it("keeps actor and resident startup launches unchanged", async () => {
-    for (const request of [{ actorId: "actor" }, { residentStartupProbe: true }]) {
-      const f = fixture();
-      const { result, value } = await report(f, request);
-      expect(value.policy).toBeNull();
-      expect(value.tmpdir).toBeNull();
-      expect(f.events(result.id).filter(event => event.type.startsWith("write_policy."))).toEqual([]);
+  it.each([
+    { runner: "pi", actorId: "actor" },
+    { runner: "pi", actorName: "actor" },
+    { runner: "pi-durable", actorId: "actor" },
+    { runner: "pi-durable", actorName: "actor" },
+  ])("confines $runner $actorId $actorName activations to private scratch even in a resident layout", async request => {
+    const f = fixture(false, "resident");
+    const { result, value } = await report(f, request);
+    const run = f.manager.runDirectory(result.id)!;
+    expect(value.tmpdir).toBe(result.temporaryDirectory ?? path.join(run, "tmp"));
+    expect(value.policy).toEqual({ readOnly: false, writableRoots: [value.tmpdir], shell: "unconfined" });
+    if (process.platform !== "win32") expect(fs.statSync(value.tmpdir).mode & 0o777).toBe(0o700);
+    expect(value.probes.map((probe: { allowed: boolean }) => probe.allowed)).toEqual([false, true, false]);
+    expect(fs.existsSync(path.join(f.cwd, "inside.txt"))).toBe(false);
+    expect(fs.readFileSync(path.join(value.tmpdir, "scratch.txt"), "utf8")).toBe("probe");
+    for (const tool of ["write", "edit"]) {
+      for (const file of [path.join(f.cwd, "state.json"), path.join(run, "status.json"),
+        path.join(run, "events.jsonl"), path.join(run, "nested", "child", "task.txt"),
+        path.join(path.dirname(run), "other-run", "tmp", "scratch.txt")]) {
+        expect(writePolicyDenial(value.policy, tool, { path: file }, f.cwd)).toContain("outside writable roots");
+      }
+      expect(writePolicyDenial(value.policy, tool, { path: path.join(value.tmpdir, "ok.txt") }, f.cwd)).toBeUndefined();
     }
+    expect(f.events(result.id).filter(event => event.type.startsWith("write_policy.")))
+      .toEqual([expect.objectContaining({ type: "write_policy.actor", policy: value.policy })]);
   });
 
-  it.each(["claude", "veda"])("keeps %s unrestricted and logs the unsupported runner once", async runner => {
+  it("keeps resident startup launches unchanged", async () => {
     const f = fixture();
-    const { result, value } = await report(f, { runner });
+    const { result, value } = await report(f, { residentStartupProbe: true });
     expect(value.policy).toBeNull();
     expect(value.tmpdir).toBeNull();
-    expect(f.events(result.id).filter(event => event.type.startsWith("write_policy.")))
-      .toEqual([expect.objectContaining({ type: "write_policy.unsupported", runner })]);
+    expect(f.events(result.id).filter(event => event.type.startsWith("write_policy."))).toEqual([]);
   });
+
+  const assertUnsupportedRunner = async (runner: "claude" | "veda") => {
+    // Use an explicitly named fake canonical model and a real v1 grant so this policy test
+    // remains about write-policy behavior, not ambient host exception configuration.
+    const model = "claude/haiku";
+    const canonicalModel = "claude-haiku-test";
+    // Catalog aliases resolve first; grants name the exact backend model.
+    const f = fixture(false, undefined, runner === "claude" ? canonicalModel : undefined);
+    const originalAdmit = AgentManager.prototype.admitModelException;
+    const admission = runner === "claude" ? vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+      if (this !== f.manager || this.config.modelExceptionsPath !== path.join(f.root, "model-exceptions.json")) return originalAdmit.apply(this, args);
+      return withRootExceptionMetadata(this.config.modelExceptionsPath, () => originalAdmit.apply(this, args));
+    }) : undefined;
+    try {
+      const modelReason = "Unsupported-runner write-policy fixture #11864";
+      const { result, value } = await report(f, { runner, ...(runner === "claude" ? { model, modelReason } : {}) });
+      if (runner === "claude") {
+        expect(value.args["--model"]).toBe(canonicalModel);
+        expect(value.args["--model-reason"]).toBe(modelReason);
+        expect(result).toMatchObject({ model: canonicalModel, modelReason });
+      }
+      expect(value.policy).toBeNull();
+      expect(value.tmpdir).toBeNull();
+      expect(f.events(result.id).filter(event => event.type.startsWith("write_policy.")))
+        .toEqual([expect.objectContaining({ type: "write_policy.unsupported", runner })]);
+    } finally { admission?.mockRestore(); }
+  };
+  it("keeps veda unrestricted and logs the unsupported runner once", () => assertUnsupportedRunner("veda"));
+  // The production trust reader deliberately cannot prove root ownership on Windows.
+  it.runIf(process.platform !== "win32" && typeof process.getuid === "function")("keeps claude unrestricted and logs the unsupported runner once", () => assertUnsupportedRunner("claude"));
 
   it("preserves default remote placement and logs the missing forwarding rather than claiming confinement", async () => {
     const f = fixture(true);

@@ -285,7 +285,7 @@ const namespaceSnapshot = (target: string, receipt?: Inode) => {
     const identity = typeof receipt?.ino === "bigint" ? fs.lstatSync(current, { bigint: true }) : endpoint;
     if (receipt && !sameInode(receipt, identity)) throw new Error("Session receipt inode changed during namespace confirmation");
     parents.push(endpoint.isDirectory() ? current : path.dirname(current));
-    return { entries, directories, parents };
+    return { entries, directories, parents, hasSymlinks: hops !== 0 };
 };
 
 /**
@@ -320,6 +320,16 @@ export const syncPathNamespaceDurable = (target: string, receipt: Inode | undefi
 
 /** The checked complete-namespace identity syncPathNamespace compares (not a durability receipt). */
 export const namespaceKey = (target: string, receipt?: Inode): string => JSON.stringify(namespaceSnapshot(target, receipt).entries);
+
+/** Read-only identity inspection using the SAME resolver as the full barrier. Not a durability receipt. */
+export const namespaceIdentitySnapshot = (target: string, receipt?: Inode) => {
+  const snapshot = namespaceSnapshot(target, receipt);
+  return Object.freeze({ key: JSON.stringify(snapshot.entries), hasSymlinks: snapshot.hasSymlinks,
+    directories: Object.freeze([...snapshot.directories].map(([directory, stat]) => Object.freeze({
+      directory, dev: stat.dev, ino: stat.ino, mode: stat.mode & fs.constants.S_IFMT,
+    }))),
+  });
+};
 
 export const syncPathNamespace = (target: string, receipt?: Inode): void => {
   const before = namespaceSnapshot(target, receipt);
@@ -767,19 +777,31 @@ export class MeshLockTimeoutError extends Error {
  */
 export class MeshLockForeignHolderError extends MeshLockTimeoutError {
   readonly foreignCode: "FABRIC_MESH_LOCK_FOREIGN_HOLDER" | "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
-  /** The exact operator command that recovers this lock (pi-fabric#923: a stuck mesh lock stalls the fleet). */
+  /** Operator recovery command for valid owner metadata; malformed tokens remain non-operational placeholders. */
   readonly recovery: string;
   /** The same command as an argument vector: the safe form for a program to run. */
   readonly recoveryArgv: string[];
+  readonly holderNamespace: string;
+  readonly holderToken: string;
   constructor(holder: string, attempts: number, maxGapMs: number, readonly verdict: "foreign" | "unproven",
-    readonly holderNamespace: string, readonly lockPath = "", readonly holderToken = "") {
+    holderNamespace: unknown, readonly lockPath = "", holderToken: unknown = "") {
+    // Project disk metadata before retaining it or formatting any diagnostics. Keep this local: the namespace
+    // reader is optional/lazy, and these checks must not alter owner bytes or reclaim decisions.
+    const uuid = "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}";
+    const token = typeof holderToken === "string" && (holderToken.length === 32 || holderToken.length === 36) &&
+      new RegExp(`^(?:[0-9A-Fa-f]{32}|${uuid})$`).test(holderToken) ? holderToken : "invalid-token";
+    const namespace = holderNamespace === "" ? "" : typeof holderNamespace === "string" && holderNamespace.length <= 128 &&
+      new RegExp(`^(?:linux:(?:[0-9a-f]{32}|-):${uuid}:\\d+|darwin:(?:${uuid}|-):${uuid}:host|win32:${uuid}:\\d+:host)(?![\\s\\S])`).test(holderNamespace)
+        ? holderNamespace : "invalid-namespace";
     super(holder, attempts, maxGapMs);
+    this.holderNamespace = namespace;
+    this.holderToken = token;
     this.foreignCode = verdict === "foreign" ? "FABRIC_MESH_LOCK_FOREIGN_HOLDER" : "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
     const kind = path.basename(lockPath) === ".lock" ? "mesh" : "custody";
-    this.recoveryArgv = ["fabric-mesh-backend", "lock-recover", "--root", path.dirname(lockPath), "--lock", kind, "--holder", holderToken];
+    this.recoveryArgv = ["fabric-mesh-backend", "lock-recover", "--root", path.dirname(lockPath), "--lock", kind, "--holder", token];
     this.recovery = renderRecoveryCommand(this.recoveryArgv);
-    const where = verdict === "foreign" ? `another PID namespace (${holderNamespace})`
-      : holderNamespace ? `a PID namespace this process cannot prove (${holderNamespace})` : "no recorded PID namespace (a record from before protocol 3)";
+    const where = verdict === "foreign" ? `another PID namespace (${namespace})`
+      : namespace ? `a PID namespace this process cannot prove (${namespace})` : "no recorded PID namespace (a record from before protocol 3)";
     this.message = `${this.foreignCode}: ${this.message}; the holder of ${lockPath} is in ${where}, so it is never reclaimed on pid evidence. ` +
       `Recover it from inside the holder's namespace with: ${this.recovery} ; or, once the holder is STOPPED, add --unsafe-holder-stopped`;
     this.name = "MeshLockForeignHolderError";
@@ -811,12 +833,16 @@ export const alarmForeignHolder = (error: MeshLockForeignHolderError): void => {
 export const isMeshLockTimeout = (error: unknown): error is Error & { code: typeof MESH_LOCK_TIMEOUT_CODE } =>
   error instanceof Error && "code" in error && error.code === MESH_LOCK_TIMEOUT_CODE;
 
+/** Shared with state-backend.ts so the core deferred-write path does not import the storage backend. */
+export const MESH_STATE_WAL_CAP_CODE = "FABRIC_MESH_STATE_WAL_CAP";
+export const isMeshStateWalCap = (error: unknown): boolean =>
+  error instanceof Error && (error as { code?: unknown }).code === MESH_STATE_WAL_CAP_CODE;
+
 /** A write that wrote nothing and may succeed later: pending identity, snapshot validation exhaustion,
- * a lock timeout, or a SQLite WAL-cap refusal
- * (`FABRIC_MESH_STATE_WAL_CAP`, state-backend.ts isMeshStateWalCap; smarty-dev#7451 item 8). */
+ * a lock timeout, or a SQLite WAL-cap refusal (`FABRIC_MESH_STATE_WAL_CAP`; smarty-dev#7451 item 8). */
 export const isMeshWriteDeferred = (error: unknown): error is Error =>
   isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) || isMeshLockTimeout(error) ||
-  (error instanceof Error && (error as { code?: unknown }).code === "FABRIC_MESH_STATE_WAL_CAP");
+  isMeshStateWalCap(error);
 
 /** Best-effort protocol writes may swallow conflicts, but not retryable admission refusals.
  * Retain the historical name and the same refusals that previously carried the timeout code. */
@@ -910,13 +936,27 @@ export const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLi
   mirrorMeshJournalLine(line);
 };
 
-/** A log-safe description of a deferred write (pi-fabric#893 round 3). A WAL-cap refusal's message embeds the pinning
- * readers' pids and command lines, which can carry secrets: only its sizes and reader count are logged. */
+/** A log-safe description of a deferred write (pi-fabric#893 round 3). Only a typed WAL-cap refusal selects the
+ * numeric/count-only summary; ordinary errors and messages retain their own diagnostics. */
 export const meshDeferredSummary = (error: unknown): string => {
+  const details = error as { code?: unknown; message?: unknown } | null | undefined;
+  const code = details?.code;
+  if (isMeshStateWalCap(error)) {
+    const capped = error as { walBytes?: unknown; capBytes?: unknown; readerCount?: unknown };
+    const readers = typeof capped.readerCount === "number" && Number.isSafeInteger(capped.readerCount) && capped.readerCount >= 0
+      ? capped.readerCount : "unknown";
+    if (typeof capped.walBytes !== "number" || !Number.isFinite(capped.walBytes) || capped.walBytes < 0
+        || typeof capped.capBytes !== "number" || !Number.isFinite(capped.capBytes) || capped.capBytes <= 0) {
+      return `FABRIC_MESH_STATE_WAL_CAP (sizes not available); ${readers} WAL reader(s)`;
+    }
+    return `FABRIC_MESH_STATE_WAL_CAP: the SQLite WAL is ${String(capped.walBytes)} bytes, above the ${String(capped.capBytes)}-byte cap; `
+      + `${readers} WAL reader(s)`;
+  }
   if (isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) || isMeshLockTimeout(error)) return error.message;
-  const capped = error as { walBytes?: unknown; capBytes?: unknown; readerCount?: unknown };
-  return `FABRIC_MESH_STATE_WAL_CAP: the SQLite WAL is ${String(capped.walBytes)} bytes, above the ${String(capped.capBytes)}-byte cap; `
-    + `${typeof capped.readerCount === "number" ? capped.readerCount : "unknown"} WAL reader(s)`;
+  const message = error instanceof Error ? error.message
+    : typeof details?.message === "string" ? details.message : String(error);
+  const prefix = (typeof code === "string" && code.length > 0) || typeof code === "number" ? `${String(code)}: ` : "";
+  return `${prefix}${message}`;
 };
 
 type PendingAlarm = { alarm: MeshOutageAlarm; attempts: number; firstAt: number };

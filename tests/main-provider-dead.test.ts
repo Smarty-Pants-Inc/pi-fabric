@@ -4,6 +4,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MainAgentController, type FabricMainProviderDeadEvent } from "../src/main-agent.js";
+import { classifyModelRefusal } from "../src/provider-error-class.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { providerDeadAlarms } from "../src/topology/stall-alarms.js";
 
@@ -12,6 +13,8 @@ type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 type CompactOptions = { onComplete?: (result: unknown) => void; onError?: (error: Error) => void };
 const affinity = `409 ${JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "compaction_affinity_missing" } })}`;
 const errorTurn = (errorMessage: string) => ({ message: { role: "assistant", stopReason: "error", errorMessage } });
+const refusalTurn = (errorMessage = "private refusal detail", fields: Record<string, unknown> = {}) => ({ message: { role: "assistant", stopReason: "error",
+  rawStopReason: "refusal", errorMessage, responseId: "private-response-id", content: [{ type: "text", text: "partial output" }], ...fields } });
 const okTurn = { message: { role: "assistant", stopReason: "stop" } };
 const from = (name: string) => ({ id: `agent-${name}`, name, kind: "agent" as const });
 
@@ -63,6 +66,145 @@ beforeEach(() => {
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
 describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, smarty-dev#8742)", (flushMs) => {
+  it("classifies three refusals, including partial output, without provider backoff or alarms", () => {
+    const h = setup(flushMs);
+    const notice = "The model declined this request. Resending the same context will likely be declined again.";
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        h.emit("input", { source: "interactive" });
+        h.state.idle = false;
+        h.emit("agent_start", {});
+        const event = refusalTurn();
+        expect(classifyModelRefusal(event.message)).toEqual({ kind: "model-refusal" });
+        h.emit("turn_end", event);
+        expect(event.message.content).toEqual([{ type: "text", text: "partial output" }]);
+        h.settleError();
+        expect(h.main.providerDeadState).toBeUndefined();
+      }
+      vi.advanceTimersByTime(60 * 60_000);
+      expect(h.notify.mock.calls.filter(([message]) => message === notice)).toHaveLength(3);
+      expect(h.alarms).toEqual([]);
+      expect(h.compactions).toEqual([]);
+      expect(h.sent).toEqual([]);
+    } finally { h.main.closeFollowUpDrain(); }
+  });
+
+  it.each([
+    ["absent", { stopDetailsState: "absent" }, { stopDetailsState: "absent" }],
+    ["retained", { stopDetailsState: "retained", rawStopDetails: '{"type":"refusal","explanation":"private stop detail"}' },
+      { stopDetailsState: "retained", rawStopDetails: '{"type":"refusal","explanation":"private stop detail"}' }],
+    ["discarded", { stopDetailsState: "discarded", stopDetailsBytes: 8192, stopDetailsSha256: "a".repeat(64) },
+      { stopDetailsState: "discarded", stopDetailsBytes: 8192, stopDetailsSha256: "a".repeat(64) }],
+    ["unavailable", {}, { stopDetailsState: "unavailable" }],
+  ] as Array<[string, Record<string, unknown>, Record<string, unknown>]>)
+  ("privately records %s refusal details with the bounded session diagnostic", (_state, fields, expectedDetails) => {
+    const h = setup(flushMs);
+    const event = refusalTurn("private refusal detail", fields);
+    try {
+      h.emit("message_end", event);
+      h.emit("turn_end", event);
+      const diagnostic = (event.message as { diagnostics?: Array<Record<string, unknown>> }).diagnostics?.find(
+        entry => entry.type === "fabric_model_refusal");
+      expect(diagnostic).toMatchObject({ type: "fabric_model_refusal", details: {
+        rawStopReason: "refusal", responseId: "private-response-id", ...expectedDetails,
+      } });
+      if (_state !== "retained") expect(diagnostic?.details).not.toHaveProperty("rawStopDetails");
+      if (_state !== "discarded") {
+        expect(diagnostic?.details).not.toHaveProperty("stopDetailsBytes");
+        expect(diagnostic?.details).not.toHaveProperty("stopDetailsSha256");
+      }
+      expect(JSON.stringify(diagnostic)).not.toContain("partial output");
+      expect(JSON.stringify(h.notify.mock.calls)).not.toContain("private stop detail");
+      expect(h.alarms).toEqual([]);
+      expect(h.sent).toEqual([]);
+    } finally { h.main.closeFollowUpDrain(); }
+  });
+
+  it("omits retained stop details that are not valid JSON", () => {
+    const h = setup(flushMs);
+    const event = refusalTurn("private refusal detail", { stopDetailsState: "retained", rawStopDetails: "not JSON" });
+    try {
+      h.emit("message_end", event);
+      const diagnostic = (event.message as { diagnostics?: Array<Record<string, unknown>> }).diagnostics?.find(
+        entry => entry.type === "fabric_model_refusal");
+      expect(diagnostic).toMatchObject({ details: { stopDetailsState: "unavailable" } });
+      expect(diagnostic?.details).not.toHaveProperty("rawStopDetails");
+    } finally { h.main.closeFollowUpDrain(); }
+  });
+
+  it("omits nonconforming stop details larger than 4096 UTF-8 bytes", () => {
+    const h = setup(flushMs);
+    const event = refusalTurn("private refusal detail", { stopDetailsState: "retained", rawStopDetails: `"${"x".repeat(4095)}"` });
+    try {
+      h.emit("message_end", event);
+      const diagnostic = (event.message as { diagnostics?: Array<Record<string, unknown>> }).diagnostics?.find(
+        entry => entry.type === "fabric_model_refusal");
+      expect(diagnostic).toMatchObject({ details: { stopDetailsState: "unavailable" } });
+      expect(diagnostic?.details).not.toHaveProperty("rawStopDetails");
+      expect(Buffer.byteLength(JSON.stringify(diagnostic), "utf8")).toBeLessThan(1024);
+    } finally { h.main.closeFollowUpDrain(); }
+  });
+
+  it("refusal, refusal, owner input, refusal never creates a provider-dead hold", () => {
+    const h = setup(flushMs);
+    const refuse = () => {
+      h.state.idle = false;
+      h.emit("agent_start", {});
+      h.emit("turn_end", refusalTurn());
+      h.settleError();
+    };
+    try {
+      refuse();
+      refuse();
+      h.emit("input", { source: "interactive" });
+      refuse();
+      expect(h.main.providerDeadState).toBeUndefined();
+      expect(h.alarms).toEqual([]);
+      expect(h.compactions).toEqual([]);
+      expect(h.sent).toEqual([]);
+    } finally { h.main.closeFollowUpDrain(); }
+  });
+
+  it("honors Pi's retryable=false for a non-refusal error without compacting or continuing", () => {
+    const h = setup(flushMs);
+    try {
+      h.emit("turn_end", { message: { role: "assistant", stopReason: "error", errorMessage: "503 upstream transient",
+        recovery: { retryable: false } } });
+      h.settleError();
+      vi.advanceTimersByTime(60 * 60_000);
+      expect(h.compactions).toEqual([]);
+      expect(h.sent).toEqual([]);
+      expect(h.alarms).toEqual([]);
+      expect(h.main.providerDeadState).toBeUndefined();
+      expect(h.notify.mock.calls).toEqual([]);
+    } finally { h.main.closeFollowUpDrain(); }
+  });
+
+  it("does not reset an existing unclassified streak when refusals occur", () => {
+    const h = setup(flushMs);
+    const fail = () => {
+      h.emit("input", { source: "interactive" });
+      h.state.idle = false;
+      h.emit("agent_start", {});
+      h.emit("turn_end", errorTurn("Connection error."));
+      h.settleError();
+    };
+    try {
+      fail();
+      fail();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        h.emit("input", { source: "interactive" });
+        h.state.idle = false;
+        h.emit("agent_start", {});
+        h.emit("turn_end", refusalTurn());
+        h.settleError();
+      }
+      expect(h.alarms).toEqual([]);
+      fail();
+      expect(h.alarms).toEqual([expect.objectContaining({ kind: "unclassified", cause: "unclassified-repeated", failures: 3 })]);
+    } finally { h.main.closeFollowUpDrain(); }
+  });
+
   it.each(["org-agent@x", "ordinary-agent"])("shows the own-turn rejection and terminal alarm for %s without provider text", role => {
     vi.stubEnv("SMARTY_ROLE", role);
     const h = setup(flushMs);
@@ -315,8 +457,10 @@ describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, s
     expect(h.compactions).toHaveLength(1);
     const operation = new AbortController();
     h.emit("session_before_compact", { reason: "manual", signal: operation.signal });
-    operation.abort();                                  // Escape: a plain abort, not the deadline
+    h.main.halt(); // Explicit owner stop, not inferred from the SDK controller.
+    operation.abort();
     h.emit("session_compact_failed", { reason: "manual", aborted: true, willRetry: false });
+    h.compactions[0]!.onError?.(new Error("native cancellation"));
     expect(h.alarms).toHaveLength(0);
     expect(h.main.providerDeadState?.phase).toBe("compacting");
     // Halted: a peer message neither triggers nor gets a provider-dead receipt.
@@ -327,6 +471,43 @@ describe.each([120_000, 0])("Main non-retryable provider recovery (flushMs=%s, s
     expect(h.sent.every(entry => entry.options.triggerTurn === false)).toBe(true);   // passive context only
     expect(h.compactions).toHaveLength(1);
     expect(h.alarms).toHaveLength(0);
+    h.main.closeFollowUpDrain();
+  });
+
+  it("does not count a generic run-signal cancellation as a new provider failure", () => {
+    const h = setup(flushMs, undefined, undefined, { idle: true, aborted: true });
+    h.emit("session_compact_failed", { reason: "manual", aborted: false, willRetry: false, errorMessage: "canceled run" });
+    expect(h.alarms).toHaveLength(0);
+    expect(h.sent).toHaveLength(0);
+    (h.ctx.signal as { aborted: boolean }).aborted = false; // Fresh boundary, no owner input.
+    const peer = h.main.deliverAgent({ from: from("peer"), message: "fresh after transient cancellation", delivery: "followUp" });
+    expect(peer).toMatchObject({ triggered: true });
+    expect(peer.reason).toBeUndefined();
+    h.main.closeFollowUpDrain();
+  });
+
+  it("does not turn a generic recovery-compaction cancellation into durable owner authority", () => {
+    const h = setup(flushMs);
+    h.emit("turn_end", errorTurn(affinity));
+    h.settleError();
+    vi.advanceTimersByTime(0);
+    const operation = new AbortController();
+    h.emit("session_before_compact", { reason: "manual", signal: operation.signal });
+    operation.abort();
+    h.emit("session_compact_failed", { reason: "manual", aborted: true, willRetry: false });
+    h.compactions[0]!.onError?.(new Error("native cancellation"));
+    expect(h.alarms).toEqual([expect.objectContaining({ cause: "compaction-failed" })]);
+    expect(h.main.providerDeadState).toMatchObject({ phase: "alarmed", alarmed: true });
+    const peer = h.main.deliverAgent({ from: from("peer"), message: "defined provider hold, not operator halt", delivery: "followUp" });
+    expect(peer.halted).toBeUndefined();
+    expect(peer.reason).toMatch(/^provider-dead/);
+    // Cancellation itself never wakes Main. A later successful compact can recover
+    // without user input; unlike explicit halt, SDK cancellation grants no authority.
+    expect(h.sent).toHaveLength(0);
+    h.compactOk();
+    vi.advanceTimersByTime(25);
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]!.options.triggerTurn).toBe(true);
     h.main.closeFollowUpDrain();
   });
 

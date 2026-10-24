@@ -24,7 +24,7 @@ const setup = async (files: boolean, leaseMs = 15_000, kind: MeshIdentity["kind"
   roots.push(root);
   let now = Date.now();
   vi.spyOn(Date, "now").mockImplementation(() => now);
-  const identity: MeshIdentity = { id: "session:live", name: "main", kind, sessionId: "live" };
+  const identity: MeshIdentity = { id: "session:live-00000001", name: "main", kind, sessionId: "live" };
   const mesh = new MeshStore(root, 64 * 1024, 100, { readCacheMs: 0 });
   if (files) await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, hostLeases: "files" }, identity });
   const record: FabricParticipantRecord = {

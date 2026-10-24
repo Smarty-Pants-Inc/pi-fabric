@@ -24,6 +24,7 @@ import {
   type FabricSchemaMode,
 } from "./config.js";
 import { FabricSessionApprovals } from "./core/approval-controller.js";
+import type { SessionEntryCursorManager } from "./core/preview.js";
 import { readChildToolAllowlist } from "./core/child-tool-allowlist.js";
 import { NO_FOREGROUND, resolveForegroundTools, type FabricForegroundResolution } from "./core/foreground-tools.js";
 import { PrewalkController } from "./prewalk/controller.js";
@@ -54,6 +55,7 @@ import type {
   FabricProvider,
 } from "./protocol.js";
 import type { FabricRuntimeState } from "./fabric-runtime-state.js";
+import type { SessionChannel, SessionChannelOpenOptions } from "./transport/nats/session-channel.js";
 import type { FabricRuntimePaths } from "./runtime-paths.js";
 import type { FabricLoadedFileIdentity } from "./build-identity.js";
 
@@ -146,6 +148,10 @@ export class FabricState {
 
   get initialized(): boolean {
     return this.#current()?.initialized === true;
+  }
+
+  openSessionChannel(options: SessionChannelOpenOptions): Promise<SessionChannel> {
+    return this.#required().openSessionChannel(options);
   }
 
   // Lightweight bootstrap seam: true once configuration is loaded, with no
@@ -394,8 +400,11 @@ export class FabricState {
     return this.#runtime?.requestRootInboxWake() ?? false;
   }
 
-  async nextRecordsInboxMessage(entries: readonly unknown[]): Promise<{ customType: string; content: string; display: boolean; details: { ids: string[] } } | undefined> {
-    return this.#current()?.nextRecordsInboxMessage(entries);
+  resetRecordsInboxCursor(session: SessionEntryCursorManager): void {
+    this.#current()?.resetRecordsInboxCursor?.(session);
+  }
+  async nextRecordsInboxMessage(session: SessionEntryCursorManager): Promise<{ customType: string; content: string; display: boolean; details: { ids: string[] } } | undefined> {
+    return this.#current()?.nextRecordsInboxMessage?.(session);
   }
   observationHealth(): string[] { return this.#current()?.observationHealth() ?? []; }
   writeStalled(): Error | undefined { return this.#current()?.writeStalled(); }

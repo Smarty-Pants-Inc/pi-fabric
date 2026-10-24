@@ -42,6 +42,8 @@ export const fakeManagerHeapWorker = async (
   writeJsonAtomic(argument("--status-file"), record);
   return {
     kind: "process", sessionId: "2147483647",
+    // Held fixtures model natural finishing, not a cleanup deadline expiry.
+    ...(held ? { finishingGraceMs: 90_000 } : {}),
     closed: held?.closed ?? Promise.resolve(),
     isAlive: async () => held?.alive() ?? false,
     waitForClose: () => held?.closed ?? Promise.resolve(),
@@ -66,14 +68,18 @@ export const managerHeapProbe = async (mode: "ui" | "receipt" | "restored", root
   fs.rmdirSync = ((file: fs.PathLike) => { deletions.push(String(file)); }) as typeof fs.rmdirSync;
   fs.promises.rm = (async (file: fs.PathLike) => { deletions.push(String(file)); }) as typeof fs.promises.rm;
   const originalLaunch = ProcessTransport.prototype.launch;
-  let alive = true, releaseHeld!: () => void;
-  const closed = new Promise<void>(resolve => { releaseHeld = () => { alive = false; resolve(); }; });
-  const held = { closed, alive: () => alive, stop: () => closed };
+  const heldRuns = new Map<string, () => void>();
   // Receipt mode intentionally holds 100 native-close obligations while
-  // logical results settle: their shared lexical contexts must not own answers.
-  ProcessTransport.prototype.launch = request => fakeManagerHeapWorker(request,
-    request.name === "warm" ? 0 : 4 * 1024 * 1024, mode === "receipt",
-    mode === "receipt" && request.name !== "warm" ? held : undefined);
+  // results remain finishing: their shared lexical contexts must not own answers.
+  ProcessTransport.prototype.launch = request => {
+    let held: Parameters<typeof fakeManagerHeapWorker>[3];
+    if (mode === "receipt" && request.name !== "warm") {
+      let alive = true;
+      const closed = new Promise<void>(resolve => { heldRuns.set(request.id, () => { alive = false; resolve(); }); });
+      held = { closed, alive: () => alive, stop: () => closed };
+    }
+    return fakeManagerHeapWorker(request, request.name === "warm" ? 0 : 4 * 1024 * 1024, mode === "receipt", held);
+  };
   const manager = new AgentManager(process.cwd(), {
     ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 101, retainRuns: true, sessionExport: false,
   }, { runRoot: root, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fullCodeMode: false });
@@ -87,16 +93,23 @@ export const managerHeapProbe = async (mode: "ui" | "receipt" | "restored", root
         lastId = `restored-${index.toString(16).padStart(4, "0")}`;
         manager.restorePreviousRuns([heapRunResult(lastId, 4 * 1024 * 1024)]);
       } else {
-        lastId = (await manager.run({ task: `result ${index}`, transport: "process", extensions: false })).id;
+        const request = { task: `result ${index}`, transport: "process" as const, extensions: false as const };
+        lastId = (mode === "receipt" ? await manager.spawn(request) : await manager.run(request)).id;
       }
       // Repeated API/UI rehydration must not repopulate a hidden full cache.
-      assert.equal(manager.status(lastId).status, "completed");
+      assert.equal(manager.status(lastId).status, mode === "receipt" ? "finishing" : "completed");
+      if (mode === "receipt") assert.equal(manager.isSettled(lastId), false);
       manager.listForUi();
     }
     const retainedBytes = (await collect()) - baseline;
     const uiBytes = JSON.stringify(manager.listForUi()).length * 2;
     assert.ok(retainedBytes < 24 * 1024 * 1024, `${mode}: retained ${retainedBytes} bytes for 100 x 4 MiB results`);
     assert.ok(uiBytes <= 2 * 1024 * 1024, `${mode}: UI retained ${uiBytes} bytes`);
+    // Receipt-bound results may settle only after exact native close. All full
+    // answers were disk-backed, not settled caches, during the measured interval.
+    // Close each independent handle in turn, avoiding an unrelated 100-result
+    // simultaneous rehydration spike after the retention measurement.
+    for (const [id, release] of heldRuns) { release(); await manager.wait(id); }
     // Exact results are still available after GC and UI eviction.
     const full = await manager.wait(lastId);
     assert.equal(full.text.length, 4 * 1024 * 1024);
@@ -105,7 +118,7 @@ export const managerHeapProbe = async (mode: "ui" | "receipt" | "restored", root
     assert.ok(fs.existsSync(path.join(root, lastId, "status.json")));
     return { mode, runs: 100, retainedBytes, uiBytes, recordedDeletions: deletions.length };
   } finally {
-    releaseHeld();
+    for (const release of heldRuns.values()) release();
     await manager.close();
     ProcessTransport.prototype.launch = originalLaunch;
     fs.rmSync = originals.rmSync; fs.unlinkSync = originals.unlinkSync; fs.rmdirSync = originals.rmdirSync;

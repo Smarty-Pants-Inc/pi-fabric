@@ -16,21 +16,25 @@ vi.mock("../src/fabric-provenance.js", () => ({
 vi.mock("@earendil-works/pi-ai/compat", () => ({ isContextOverflow: () => false }));
 
 type Handler = (event: unknown, context: ExtensionContext) => unknown;
-const harness = (options: { errorMessage?: string; owns?: boolean } = {}) => {
+const harness = (options: { errorMessage?: string; rawStopReason?: string; recoveryRetryable?: boolean; diagnostics?: unknown; owns?: boolean } = {}) => {
   const handlers = new Map<string, Handler[]>();
   let idle = false;
   let settling = false;
   let halted = false;
   let owner = new AbortController();
+  const turn: { role: string; stopReason: string; errorMessage: string; rawStopReason?: string; recovery?: { retryable: boolean }; diagnostics?: unknown } = {
+    role: "assistant", stopReason: "error", errorMessage: options.errorMessage ?? "disconnect\nprivate diagnostic",
+    ...(options.rawStopReason === undefined ? {} : { rawStopReason: options.rawStopReason }),
+    ...(options.recoveryRetryable === undefined ? {} : { recovery: { retryable: options.recoveryRetryable } }),
+    ...(options.diagnostics === undefined ? {} : { diagnostics: options.diagnostics }),
+  };
   const context = {
     get signal() { return owner.signal; },
     isIdle: () => idle,
     isSettling: () => settling,
     sessionManager: {
       getSessionId: () => "main",
-      getEntries: () => [{ type: "message", message: {
-        role: "assistant", stopReason: "error", errorMessage: options.errorMessage ?? "disconnect\nprivate diagnostic",
-      } }],
+      getEntries: () => [{ type: "message", message: turn }],
     },
     hasUI: true,
     compact: vi.fn(),
@@ -46,7 +50,7 @@ const harness = (options: { errorMessage?: string; owns?: boolean } = {}) => {
     emit: async (name: string, event: unknown = { outcome: "error" }) => {
       for (const handler of handlers.get(name) ?? []) await handler(event, context);
     },
-    report, context, pi,
+    report, context, pi, turn,
     idle: () => { idle = true; },
     settling: (value: boolean) => { settling = value; },
     abort: () => { owner.abort(); },
@@ -59,6 +63,67 @@ beforeEach(() => { vi.useFakeTimers(); vi.clearAllMocks(); identityState.backgro
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
 describe("Main provider recovery waiting for settlement compaction", () => {
+  it("does not retry or latch a structured model refusal", async () => {
+    const h = harness({ errorMessage: "private refusal detail", rawStopReason: "refusal" });
+    h.idle();
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(sendFabricMessage).not.toHaveBeenCalled();
+    expect(h.report).not.toHaveBeenCalled();
+    expect(h.context.ui.notify).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not retry a refusal after Main records its private session diagnostic", async () => {
+    const h = harness({ errorMessage: "private refusal detail", rawStopReason: "refusal",
+      diagnostics: [{ type: "fabric_model_refusal", details: { rawStopReason: "refusal" } }] });
+    h.idle();
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(sendFabricMessage).not.toHaveBeenCalled();
+    expect(h.report).not.toHaveBeenCalled();
+    expect(h.context.ui.notify).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("honors Pi recovery.retryable=false even when the error text is unclassified", async () => {
+    const h = harness({ errorMessage: "private network diagnostic", recoveryRetryable: false });
+    h.idle();
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(sendFabricMessage).not.toHaveBeenCalled();
+    expect(h.report).not.toHaveBeenCalled();
+    expect(h.context.ui.notify).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("clears the blocked retry latch on principal input but not extension input", async () => {
+    const h = harness();
+    h.idle();
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sendFabricMessage).toHaveBeenCalledTimes(1);
+    await h.emit("agent_start");
+    await h.emit("agent_settled");
+    expect(sendFabricMessage).toHaveBeenCalledTimes(2);
+    expect(h.report).toHaveBeenCalledTimes(1);
+
+    await h.emit("input", { source: "extension" });
+    await h.emit("agent_start");
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sendFabricMessage).toHaveBeenCalledTimes(2);
+
+    await h.emit("input", { source: "rpc" });
+    await h.emit("agent_start");
+    await h.emit("agent_settled");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sendFabricMessage).toHaveBeenCalledTimes(3);
+    expect(sendFabricMessage).toHaveBeenLastCalledWith(expect.anything(),
+      expect.objectContaining({ customType: "pi-fabric-provider-retry" }), { deliverAs: "followUp", triggerTurn: true });
+    expect(h.report).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["org-agent@x", "project-agent@x"])("keeps the principal's own failed-turn report visible for %s", async role => {
     vi.stubEnv("SMARTY_ROLE", role);
     try {

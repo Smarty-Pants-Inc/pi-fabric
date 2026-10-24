@@ -23,4 +23,20 @@ describe("AgentMessageRouter provider backoff receipts", () => {
       delivery: operation, deliveryId: command.commandId, triggerTurn: true,
       outcomeSend: { eventId: command.commandId, to: command.targetId, from: from.id, mode: operation } });
   });
+
+  it.each(["provider-retry in flight", reason])("reports %s instead of advising another held steer", async heldReason => {
+    const deliverAgent = vi.fn(() => ({ queued: true as const, messageId: "held-message", routed: "main" as const,
+      triggered: false, reason: heldReason, pendingFollowUps: 2, oldestAgeS: 601, stalled: true as const }));
+    const router = new AgentMessageRouter(
+      { status: () => { throw new Error("Unknown Fabric agent"); } } as never, { identity: from } as never,
+      { id: "session:receiver", local: true, interactive: true, matches: id => id === "main", deliverAgent },
+      { get: () => undefined } as never, undefined, binding => binding,
+    );
+    const failure = await router.routeMessage("main", "resume", undefined, "followUp", undefined, { from })
+      .then(() => { throw new Error("Expected a stalled delivery error"); }, error => error as Error);
+    expect(failure.message).toContain(`The target reports ${heldReason}`);
+    expect(failure.message).toContain("agents.steer is held too");
+    expect(failure.message).not.toContain("Use agents.steer meanwhile");
+    expect(failure.message).toContain("The message is still held, not withdrawn.");
+  });
 });

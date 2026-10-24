@@ -29,11 +29,13 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout, MeshLockTimeoutError,
+  MESH_STATE_WAL_CAP_CODE, isMeshStateWalCap } from "../core/atomic-write.js";
 import type { MeshIdentity } from "./event-log.js";
 import { isMeshStateBackendKind, MESH_STATE_BACKEND_KIND_LIST, type MeshStateBackendKind } from "./state-backend-kinds.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
 import { preparedNatsStateBackend } from "./state-backend-nats.js";
+import { admitExistingStateRoot } from "./state-gate.js";
 import { bracketFileRead, FILE_READ_CHANGED, jsonClone, MeshStateFileReadChangedError, StateFile, type MeshBatchOperation, type MeshBatchResult,
   type MeshBatchView, type MeshReadOptions, type MeshStateEntry, type StateFileOptions } from "./state-file.js";
 import { filesystemRefusal, SqliteStateStore, validateMeshStateKey, type SqliteDeltaKey, type SqliteStateDelta, type SqliteStateExport,
@@ -319,10 +321,8 @@ export const isSqliteBusy = (error: unknown): boolean => {
 };
 const sqliteBusy = isSqliteBusy;
 
-/** `MeshStateWalCapError` (state-sqlite.ts) by its code: a write refused while a pinned reader holds the WAL above the cap. */
-export const MESH_STATE_WAL_CAP_CODE = "FABRIC_MESH_STATE_WAL_CAP";
-export const isMeshStateWalCap = (error: unknown): boolean =>
-  error instanceof Error && (error as { code?: unknown }).code === MESH_STATE_WAL_CAP_CODE;
+/** Keep the historic state-backend exports while sharing the predicate with atomic-write.ts. */
+export { MESH_STATE_WAL_CAP_CODE, isMeshStateWalCap };
 
 /**
  * A refusal a caller retries (smarty-dev#6477): pending process identity, snapshot validation exhaustion,
@@ -349,14 +349,6 @@ const READ_BUSY_BUDGET_MS = 15;
 // Only for the first synchronous read of a process: one database open, bounded the same way.
 const OPEN_BUSY_BUDGET_MS = 40;
 const busyHandlerMs = (options: SqliteStateStoreOptions): number => Math.max(0, Math.min(5, Math.floor(options.busyTimeoutMs ?? 2)));
-// smarty-dev#9805: a bounded try of at least BOUNDED_WAIT_FLOOR_MS (the 2 s routing refresh before a send) waits for
-// the state write lock for at least BOUNDED_WAIT_MS, so one burst-long writer (2-3 s) no longer fails the caller.
-// Shorter tries (zero-wait, the 50 ms registry-fenced publication) still fail fast by design. ponytail: a longer
-// wait inside the same awaited acquisition, not a retry: the body runs at most once and the waiter keeps its FIFO place.
-const BOUNDED_WAIT_FLOOR_MS = 1_000;
-const BOUNDED_WAIT_MS = 6_000;
-const boundedWaitMs = (timeoutMs: number): number =>
-  timeoutMs >= BOUNDED_WAIT_FLOOR_MS ? Math.max(timeoutMs, BOUNDED_WAIT_MS) : timeoutMs;
 
 /**
  * Retries a synchronous busy `attempt` until `budgetMs` of wall time (monotonic clock) would be exceeded.
@@ -419,13 +411,16 @@ export class MeshStateBackendNotBuiltError extends Error {
 const sqliteRefusal = (context: MeshStoreContext): string | undefined => filesystemRefusal(context.root) ?? sqliteUnavailable();
 
 /**
- * The registry the selector reads. `"file"` touches nothing new (no SQLite import side effect, no
- * file). `"sqlite"` and `"shadow"` fall back to `"file"` on a non-local filesystem (R16) or without
+ * The registry the selector reads. `"file"` never opens or creates SQLite; on Windows an existing state.db gets
+ * its root admission before the file writer's in-lock fence. `"sqlite"` and `"shadow"` fall back to `"file"` on a non-local filesystem (R16) or without
  * `node:sqlite` (R19). `"nats"` never falls back: a host that silently wrote local state while its
  * peers wrote the shared stream would split the mesh, so it refuses until a store is registered.
  */
 export const STATE_BACKEND_FACTORIES: Record<MeshStateBackendKind, StateBackendFactory> = {
-  file: { create: (context, options) => new StateFile(context, options) },
+  file: { create: (context, options) => {
+    if (process.platform === "win32") admitExistingStateRoot(context.root);
+    return new StateFile(context, options);
+  } },
   sqlite: { unavailable: sqliteRefusal, create: (context, options) => new SqliteStateBackend(context, options) },
   shadow: { unavailable: sqliteRefusal, create: (context, options) => new ShadowStateBackend(context, options) },
   // smarty-dev#7504: the factory is synchronous, the NATS connection and the stream replay are not. A host prepares
@@ -475,6 +470,7 @@ export const createStateBackend = (context: MeshStoreContext, options: CreateSta
   const factory = STATE_BACKEND_FACTORIES[kind];
   const refusal = factory.unavailable?.(context);
   if (refusal) {
+    if (process.platform === "win32") admitExistingStateRoot(context.root);
     const file = new StateFile(context, options);
     file.fallback = `${kind}: ${refusal}`;
     return file;
@@ -641,6 +637,9 @@ export class SqliteStateBackend implements StateBackend {
     this.#options = options;
     this.root = root;
     this.#storeOptions = storeOptions;
+    // Admission, not a SQL open: construction precedes first-read and withTryLock budgets. The root override
+    // matters for shadow's detached DB; a missing state.db keeps its fresh creation checks at first use.
+    if (process.platform === "win32") admitExistingStateRoot(root);
   }
 
   /** The open store, for maintenance callers (projector, census, tests). Opens synchronously. */
@@ -964,10 +963,9 @@ export class SqliteStateBackend implements StateBackend {
   async #write<T>(operation: (store: SqliteStateStore) => Promise<T>): Promise<T> {
     const started = performance.now();
     const scope = this.#context.lock.tryLockScope.getStore();
-    // A bounded try spends ONE budget on the whole write: first open included (review round 1). A try of 1 s or
-    // more gets at least BOUNDED_WAIT_MS of it (smarty-dev#9805).
+    // A bounded try spends ONE caller budget on the whole write, first open included.
     const deadline = scope?.active
-      ? started + Math.max(0, Math.min(boundedWaitMs(scope.timeoutMs), this.#storeOptions.lockTimeoutMs ?? Number.POSITIVE_INFINITY))
+      ? started + Math.max(0, Math.min(scope.timeoutMs, this.#storeOptions.lockTimeoutMs ?? Number.POSITIVE_INFINITY))
       : undefined;
     let store: SqliteStateStore | undefined;
     try {
@@ -1053,6 +1051,8 @@ export class ShadowStateBackend implements StateBackend {
   readonly #lockScope: MeshStoreContext["lock"]["tryLockScope"];
 
   constructor(context: MeshStoreContext, options: CreateStateBackendOptions = {}) {
+    // The authoritative file fence uses the mesh root; the SQLite backend admits shadowRoot separately.
+    if (process.platform === "win32") admitExistingStateRoot(context.root);
     this.#file = new StateFile(context, options);
     this.#budgetMs = Math.max(1, Math.floor(options.shadowBudgetMs ?? 250));
     const shadowRoot = path.join(context.root, "state-shadow");

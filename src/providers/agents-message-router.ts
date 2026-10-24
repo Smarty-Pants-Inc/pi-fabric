@@ -1,4 +1,5 @@
 import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
+import { captureSandboxFinalAnswer } from "../agents/completion-inbox.js";
 import { interruptErrorCode } from "../interrupt-authority.js";
 import { boundAgentSpawner } from "../agents/spawner.js";
 import { FabricTargetTerminalError, terminalRejectionFields } from "../agents/terminal-target.js";
@@ -24,9 +25,13 @@ import path from "node:path";
 import { kernelFenceAvailable } from "../residency/file-lock.js";
 import { processAlive } from "../storage/scratch.js";
 import { assertTaskMainTarget, readTaskReturnAddress } from "../agents/task-return-address.js";
+import { placementRunIdForParticipant, isPlacementRunId } from "../topology/placement-run-id.js";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // MeshStore's default stale window; recovery waits, never weakens mesh locking.
 export const RESIDENT_MESH_STALE_WINDOW_MS = 30_000;
+/** A missing NATS presence may settle only briefly after this sender's verified reconnect. */
+export const NATS_RECONNECT_PRESENCE_GRACE_MS = 8_000;
 
 export class FabricParticipantNotYetMirroredError extends Error {
   override readonly name = "FabricParticipantNotYetMirroredError";
@@ -145,6 +150,36 @@ const samePresenceOwner = (left: ParticipantRoute, right: ParticipantRoute): boo
   left.machine === right.machine && left.ownerHostId === right.ownerHostId &&
   left.ownerIdentityId === right.ownerIdentityId && left.ownerIncarnation === right.ownerIncarnation;
 
+const SANDBOX_CONTROL_PROTOCOL = "pi-fabric-sandbox-stop-v1";
+const SANDBOX_STOP_CONFIRMATION_MS = 30_000;
+const SANDBOX_STOP_OBSERVATION_MS = 50;
+const objectRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const sandboxControlRunId = (value: unknown): string | undefined => {
+  if (!objectRecord(value) || Object.keys(value).length !== 1 || !objectRecord(value.sandboxControl)) return undefined;
+  const binding = value.sandboxControl;
+  if (Object.keys(binding).length !== 2 || binding.protocol !== SANDBOX_CONTROL_PROTOCOL || !isPlacementRunId(binding.runId)) return undefined;
+  return binding.runId;
+};
+const hasSandboxControl = (value: unknown): boolean => objectRecord(value) && Object.hasOwn(value, "sandboxControl");
+const verifiedSandboxCaller = (from: MeshIdentity, verification: "mesh" | "bridge" | undefined): boolean =>
+  (verification === "mesh" || verification === "bridge") && (from.kind === "main" || from.kind === "actor") && from.id.trim().length > 0;
+
+const sandboxMainSettledAfterStop = async (context: ExtensionContext, signal?: AbortSignal): Promise<boolean> => {
+  const deadline = Date.now() + SANDBOX_STOP_CONFIRMATION_MS;
+  for (;;) {
+    if (signal?.aborted) return false;
+    try {
+      if (context.signal?.aborted === true && context.isIdle() &&
+        (context as ExtensionContext & { isSettling?: () => boolean }).isSettling?.() !== true) return true;
+    } catch { return false; }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    // Pi's agent_settled boundary drives isIdle; the bounded read is only this router's observation fallback.
+    await new Promise<void>(resolve => setTimeout(resolve, Math.min(SANDBOX_STOP_OBSERVATION_MS, remaining)));
+  }
+};
+
 export class AgentMessageRouter {
   readonly #taskReturnAddress = readTaskReturnAddress();
   /** Preserve authenticated machine/owner/epoch across asynchronous actor resolution. */
@@ -152,21 +187,24 @@ export class AgentMessageRouter {
   #legacyDeliveryCount = 0;
   /** Retained dormant wake routes this router resolved; only they may take the one wake resend. */
   readonly #dormantRoutes = new WeakSet<FabricParticipantInfo>();
+  #lastVerifiedReconnectAt = 0;
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; mesh?: { root: string } },
-    readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive">,
+    readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive" | "stop" | "bindingContext">,
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "retainedRouteAllowed">> & {
       resolveRoutingLease?: (id: string, signal?: AbortSignal, budget?: MirrorLeaseWaitBudget) => Promise<boolean>;
     },
-    readonly control: (Pick<FabricControlPlane, "request"> & {
+    readonly control: (Pick<FabricControlPlane, "request"> & Partial<Pick<FabricControlPlane, "onVerifiedReconnect">> & {
       readonly transportKind?: "file" | "nats";
       readonly participantView?: ParticipantView | undefined;
     }) | undefined,
-    readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext, requiredPin?: boolean) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
+    readonly resolvePiRunBinding: (binding: FabricActorRunBinding, runner: FabricAgentRunner, context: FabricInvocationContext, requiredPin?: boolean, role?: string) => FabricActorRunBinding | Promise<FabricActorRunBinding>,
     readonly residency?: Pick<ResidencyClient, "ensureActor" | "hostId"> & { options: { config: { rootId: string; meshRoot: string } } },
     readonly spawner = boundAgentSpawner(),
-  ) {}
+  ) {
+    this.control?.onVerifiedReconnect?.(() => { this.#lastVerifiedReconnectAt = Date.now(); });
+  }
 
   get #nats(): boolean { return this.control?.transportKind === "nats"; }
 
@@ -201,7 +239,8 @@ export class AgentMessageRouter {
     if (capability && !route.capabilities.includes(capability)) throw unsupported(participant, capability);
   }
 
-  async #waitForPresence(required: PresenceResolutionRequired, signal: AbortSignal | undefined, budget: RouterWaitBudget): Promise<void> {
+  async #waitForPresence(required: PresenceResolutionRequired, signal: AbortSignal | undefined, budget: RouterWaitBudget,
+    waitMs = PEER_LEASE_WAIT_MS): Promise<void> {
     signal?.throwIfAborted();
     if (budget.waited) throw required.original;
     const view = this.control?.participantView;
@@ -215,7 +254,7 @@ export class AgentMessageRouter {
     const abort = (): void => controller.abort(signal!.reason);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
-    const timer = setTimeout(() => controller.abort(timeout), PEER_LEASE_WAIT_MS);
+    const timer = setTimeout(() => controller.abort(timeout), Math.max(1, Math.floor(waitMs)));
     try {
       for (;;) {
         controller.signal.throwIfAborted();
@@ -248,6 +287,15 @@ export class AgentMessageRouter {
     }
   }
 
+  #recentReconnectPresenceGrace(error: PresenceResolutionRequired): number {
+    const missing = error.original instanceof FabricParticipantStaleError ||
+      error.original.message.startsWith("Unknown Fabric participant:");
+    if (!this.#nats || !missing || this.#lastVerifiedReconnectAt <= 0) return 0;
+    const elapsed = Date.now() - this.#lastVerifiedReconnectAt;
+    return elapsed >= 0 && elapsed < NATS_RECONNECT_PRESENCE_GRACE_MS
+      ? NATS_RECONNECT_PRESENCE_GRACE_MS - elapsed : 0;
+  }
+
   async #withPresence<T>(operation: (authority?: FabricParticipantInfo, budget?: RouterWaitBudget) => Promise<T>, id: string | undefined, recoverLease: boolean, signal?: AbortSignal): Promise<T> {
     const budget: RouterWaitBudget = {};
     const attempt = (): Promise<T> => {
@@ -267,8 +315,10 @@ export class AgentMessageRouter {
       signal?.throwIfAborted();
       // Only our private lookup refusal may replay resolution, never control.request's ACK failure.
       if (!(error instanceof PresenceResolutionRequired)) throw error;
-      if (!recoverLease) throw error.original;
-      await this.#waitForPresence(error, signal, budget);
+      const reconnectGraceMs = this.#recentReconnectPresenceGrace(error);
+      if (!recoverLease && reconnectGraceMs <= 0) throw error.original;
+      const waitMs = Math.max(recoverLease ? PEER_LEASE_WAIT_MS : 0, reconnectGraceMs);
+      await this.#waitForPresence(error, signal, budget, waitMs);
       try { return await attempt(); }
       catch (retryError) {
         if (retryError instanceof PresenceResolutionRequired) throw retryError.original;
@@ -369,7 +419,7 @@ export class AgentMessageRouter {
     });
     const resolveLease = async (target: string): Promise<boolean | undefined> => {
       if (!this.participants.resolveRoutingLease) return undefined;
-      // Bootstrap/late-read recovery must pin before waiting, even while the view is unavailable.
+      // Bootstrap recovery must pin before waiting, even while the view is unavailable.
       // If this raw refusal-fence read fails, skip the wait, but never skip the canonical probe.
       try {
         const known = this.participants.lastKnown?.(target)?.participant ??
@@ -407,13 +457,9 @@ export class AgentMessageRouter {
         throw error.original;
       }
       if (error instanceof LeaseResolutionRequired) throw error.original;
-      // A read can fail after the preflight. Retry resolution once, never delivery after
-      // an ACK/control error: only pre-publication directory failures have this class.
-      if (!(error instanceof FabricDirectoryUnavailableError) || reason || !this.participants.refreshRoutingView) throw error;
-      const resolved = recoverLease && id ? await resolveLease(id) : undefined;
-      await this.#refreshDirectory(error.message);
-      if (resolved === false) throw this.#unknownParticipant(id!);
-      return retry();
+      // Generic directory failures can also escape after publication. Only the private
+      // lookup refusal above may replay resolution; an ordinary retry is the caller's decision.
+      throw error;
     }
   }
 
@@ -622,6 +668,13 @@ export class AgentMessageRouter {
         throw new FabricParticipantStaleError(error.targetId, error.lapsedMs, options.idempotencyKey);
       }
       throw error;
+    }
+    if (kind === "followUp" && result?.stalled && result.reason?.startsWith("provider-")) {
+      throw new Error(
+        `Fabric followUp to ${id} was accepted but is not being delivered. ` +
+          `The target reports ${result.reason}; wait for the provider attempt or recovery. Triggering agents.steer is held too. ` +
+          "The message is still held, not withdrawn.",
+      );
     }
     // smarty-dev#1826: an ack alone hid a Main whose held followUps no boundary would release.
     // Older owners never report `stalled`, so their results pass unchanged.
@@ -905,7 +958,7 @@ export class AgentMessageRouter {
     const { actor, participant } = target;
     const localActor = Boolean(actor && (this.actorManager.owns?.(actor.id) ?? (!participant || participant.local)));
     const binding = options.binding && context && localActor
-      ? await this.resolvePiRunBinding(options.binding, actor!.runner, context, actor!.routeClass !== undefined)
+      ? await this.resolvePiRunBinding(options.binding, actor!.runner, context, actor!.routeClass !== undefined, `actor:${actor!.name}`)
       : options.binding;
     context?.signal?.throwIfAborted();
     if (actor && localActor) {
@@ -1033,6 +1086,26 @@ export class AgentMessageRouter {
     }
     if (command.operation === "cancel") {
       return { accepted: false, error: "Cancel commands are handled by the control plane" };
+    }
+    const sandboxRunId = placementRunIdForParticipant("root");
+    if (command.operation === "stop" && sandboxRunId && this.mainAgent.local && command.targetId === this.mainAgent.id) {
+      return this.#stopSandboxMain(command, from, signal, verification, sandboxRunId);
+    }
+    if (command.operation === "followUp" && sandboxRunId && this.mainAgent.local && command.targetId === this.mainAgent.id &&
+      hasSandboxControl(command.data)) {
+      const requestedRunId = sandboxControlRunId(command.data);
+      if (!requestedRunId || requestedRunId !== sandboxRunId) {
+        return { accepted: false, error: "Sandbox task delivery run binding does not match this Main session" };
+      }
+      if (!this.#isSandboxSpawnOwner(from, verification)) {
+        return { accepted: false, error: "Sandbox task delivery refused: caller does not match the trusted spawn return address" };
+      }
+      const routeError = this.#sandboxRouteRefusal(command, sandboxRunId, "followUp");
+      if (routeError) return { accepted: false, error: routeError };
+    }
+    if (command.operation === "followUp" && this.mainAgent.local && this.mainAgent.matches(command.targetId) &&
+      captureSandboxFinalAnswer(from, verification, command.message ?? "")) {
+      return { accepted: true, messageId: command.commandId };
     }
     if (command.operation === "stop") {
       try {
@@ -1169,6 +1242,67 @@ export class AgentMessageRouter {
       }
     }
     return { accepted: false, error: `Owner does not control Fabric participant ${command.targetId}` };
+  }
+
+  #isSandboxSpawnOwner(from: MeshIdentity, verification: "mesh" | "bridge" | undefined): boolean {
+    const address = this.#taskReturnAddress;
+    if (!verifiedSandboxCaller(from, verification) || !address?.spawnerId || from.id !== address.spawnerId) return false;
+    if (!address.spawnerSessionId) return true;
+    const expectedSession = address.spawnerSessionId.replace(/^session:/u, "");
+    const actualSession = from.sessionId?.trim() || (from.id.startsWith("session:") ? from.id.slice("session:".length) : undefined);
+    return expectedSession.length > 0 && actualSession === expectedSession;
+  }
+
+  #sandboxRouteRefusal(command: FabricControlCommand, runId: string, capability: "followUp" | "stop"): string | undefined {
+    if (!this.#nats || !command.ownerIncarnation) return "Sandbox control requires a fenced NATS owner route";
+    try {
+      const participant = this.#get(command.targetId, true);
+      const route = this.#presenceRoute(command.targetId);
+      if (!participant || participant.id !== this.mainAgent.id || participant.kind !== "root" || participant.local !== true ||
+        participant.interactive === false || participant.placementRunId !== runId ||
+        participant.ownerIncarnation !== command.ownerIncarnation || !participant.capabilities.includes(capability) ||
+        !route?.live || route.ownerHostId !== participant.ownerHostId || route.ownerIdentityId !== participant.ownerIdentityId ||
+        route.ownerIncarnation !== participant.ownerIncarnation || !route.capabilities.includes(capability)) {
+        return "Sandbox control refused: current child route, run binding, or capability does not match";
+      }
+      return undefined;
+    } catch {
+      return "Sandbox control refused: current child route could not be authenticated";
+    }
+  }
+
+  async #stopSandboxMain(
+    command: FabricControlCommand,
+    from: MeshIdentity,
+    signal: AbortSignal | undefined,
+    verification: "mesh" | "bridge" | undefined,
+    runId: string,
+  ): Promise<FabricControlAcceptance> {
+    if (sandboxControlRunId(command.data) !== runId) {
+      return { accepted: false, error: "Sandbox stop refused: requested run id does not match this Main session" };
+    }
+    if (!this.#isSandboxSpawnOwner(from, verification)) {
+      return { accepted: false, error: "Sandbox stop refused: caller does not match the trusted spawn return address" };
+    }
+    const routeError = this.#sandboxRouteRefusal(command, runId, "followUp");
+    if (routeError) return { accepted: false, error: routeError };
+    const context = this.mainAgent.bindingContext?.();
+    if (!context || !this.mainAgent.stop) {
+      return { accepted: false, error: "Sandbox stop refused: this Main has no local stop controller" };
+    }
+    try {
+      const stopped = this.mainAgent.stop();
+      if (stopped.id !== this.mainAgent.id || stopped.status !== "stopped" || context.signal?.aborted !== true) {
+        return { accepted: false, error: "Sandbox Main stop was not confirmed" };
+      }
+      if (!(await sandboxMainSettledAfterStop(context, signal))) {
+        return { accepted: false, error: "Sandbox Main stop was requested but its run did not reach a terminal idle state within 30 seconds" };
+      }
+      this.participants.scheduleRefresh();
+      return { accepted: true, messageId: command.commandId };
+    } catch (error) {
+      return { accepted: false, error: error instanceof Error ? error.message : "Sandbox Main stop failed" };
+    }
   }
 
   /** A lease can still look fresh after SIGKILL. For this root's non-owned durable

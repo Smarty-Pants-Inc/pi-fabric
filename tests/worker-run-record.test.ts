@@ -59,6 +59,17 @@ describe("record-only run classes", () => {
     expect(createRunRouteMetadata({ runner: "pi", transport: "process", handoff: true, routeClass: "custom-handoff" }))
       .toEqual({ routeClass: "custom-handoff", routeClassSource: "explicit" });
   });
+  // pi-fabric#1554 P3-8 (smarty-dev#15878): only the run's own short TMPDIR outside its run directory is recorded.
+  it("records temporaryDirectory only for the run's own short TMPDIR outside its run directory", async () => {
+    const { shortTmpdirName } = await import("../src/agents/short-tmpdir.js");
+    const record = (tmpdir: string) =>
+      createRunningRecord(parseWorkerOptions(argv({ "status-file": "/runs/run/status.json", tmpdir })), "task", undefined, 1);
+    const own = `/tmp/p.mN2CJ9/${shortTmpdirName("run")}`;
+    expect(record(own).temporaryDirectory).toBe(own);
+    expect(record("/repo/.pi-fabric-task-tmp-AbCdEf")).not.toHaveProperty("temporaryDirectory");
+    expect(record(`/tmp/p.mN2CJ9/${shortTmpdirName("another-run")}`)).not.toHaveProperty("temporaryDirectory");
+    expect(record("/runs/run/tmp")).not.toHaveProperty("temporaryDirectory");
+  });
   it("carries original and current input metadata through the worker record", () => {
     const options = parseWorkerOptions(argv({
       "prompt-sha256": "a".repeat(64), "prompt-bytes": "12", "prompt-path": "/runs/id/task.txt",

@@ -24,14 +24,15 @@ const context = (signal?: AbortSignal) => ({
 }) as unknown as FabricInvocationContext;
 type Args = ConstructorParameters<typeof AgentsProvider>;
 type CreateOptions = { beforeCommit(id: string, nativeBoundary?: boolean): void; checkActive(): void; onCommit(id: string): void };
-const setup = () => {
+const setup = (caller: Args[1]["identity"] = { ...identity }, omitBootstrapIdentity = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "agents-slot-provider-safe-"));
   roots.push(root);
   const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { runRoot: root });
   managers.push(manager);
   const create = vi.fn(async (request: FabricActorRequest, _options: CreateOptions) => ({ ...request, id: "actor" }));
   // mesh is deliberately absent. Ordinary adapters need no slot authority.
-  const actors = { create, identity };
+  const actors = { create, identity: caller };
+  if (omitBootstrapIdentity) Reflect.deleteProperty(actors, "identity");
   const participants = { scheduleRefresh() {}, async refresh() {} };
   const provider = new AgentsProvider(manager, actors as unknown as Args[1], {} as Args[2],
     { id: "main", local: true } as Args[3], participants as unknown as Args[4], undefined,
@@ -60,6 +61,8 @@ describe("safe actor provider admission boundary", () => {
 
   it("ordinary durable child forwarding preserves the two-argument call without self or identity", async () => {
     const { provider, actors } = setup();
+    // Caller authority was bound at construction; ordinary forwarding must not
+    // reread caller metadata or require participant self() afterward.
     Reflect.deleteProperty(actors, "identity");
     const createActor = vi.fn(async (request: FabricActorRequest) => ({ ...request, id: "resident" }));
     vi.spyOn(ResidentActorClient, "fromEnv").mockReturnValue({ createActor } as unknown as ResidentActorClient);
@@ -67,6 +70,49 @@ describe("safe actor provider admission boundary", () => {
     await expect(provider.invoke("create", { name: "ordinary", instructions: "Work.", residency: "durable" }, context(signal)))
       .resolves.toMatchObject({ id: "resident" });
     expect(createActor).toHaveBeenCalledWith(expect.objectContaining({ name: "ordinary", residency: "durable" }), signal);
+  });
+
+  it("ordinary durable forwarding retains the admitted Main caller after live identity demotion", async () => {
+    const { provider, actors } = setup();
+    actors.identity.kind = "agent";
+    const createActor = vi.fn(async (request: FabricActorRequest) => ({ ...request, id: "resident" }));
+    vi.spyOn(ResidentActorClient, "fromEnv").mockReturnValue({ createActor } as unknown as ResidentActorClient);
+    const signal = new AbortController().signal;
+    await expect(provider.invoke("create", { name: "ordinary", instructions: "Work.", residency: "durable" }, context(signal)))
+      .resolves.toMatchObject({ id: "resident" });
+    expect(createActor).toHaveBeenCalledWith(expect.objectContaining({ name: "ordinary", residency: "durable" }), signal);
+  });
+
+  it("refuses a task caller before forwarding even after live identity promotion to Main", async () => {
+    const { provider, actors, create } = setup({ ...identity, kind: "agent" });
+    const createActor = vi.fn();
+    vi.spyOn(ResidentActorClient, "fromEnv").mockReturnValue({ createActor } as unknown as ResidentActorClient);
+    const request = { name: "ordinary", instructions: "Work.", residency: "durable" };
+    await expect(provider.invoke("create", request, context())).rejects.toMatchObject({
+      code: "FABRIC_AGENT_SPAWN_FORBIDDEN", launchOutcome: "unlaunched",
+    });
+    actors.identity.kind = "main";
+    await expect(provider.invoke("create", request, context())).rejects.toMatchObject({
+      code: "FABRIC_AGENT_SPAWN_FORBIDDEN", launchOutcome: "unlaunched",
+    });
+    expect(create).not.toHaveBeenCalled();
+    expect(createActor).not.toHaveBeenCalled();
+  });
+
+  it("refuses a caller absent at bootstrap even after a Main identity is supplied later", async () => {
+    const { provider, actors, create } = setup(undefined, true);
+    const createActor = vi.fn();
+    vi.spyOn(ResidentActorClient, "fromEnv").mockReturnValue({ createActor } as unknown as ResidentActorClient);
+    const request = { name: "ordinary", instructions: "Work.", residency: "durable" };
+    await expect(provider.invoke("create", request, context())).rejects.toMatchObject({
+      code: "FABRIC_AGENT_SPAWN_FORBIDDEN", launchOutcome: "unlaunched",
+    });
+    actors.identity = { ...identity };
+    await expect(provider.invoke("create", request, context())).rejects.toMatchObject({
+      code: "FABRIC_AGENT_SPAWN_FORBIDDEN", launchOutcome: "unlaunched",
+    });
+    expect(create).not.toHaveBeenCalled();
+    expect(createActor).not.toHaveBeenCalled();
   });
 
   it("claim-bearing durable forwarding binds the caller and preserves claim/scope rather than request-forged metadata", async () => {

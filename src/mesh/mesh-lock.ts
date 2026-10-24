@@ -312,7 +312,7 @@ export class MeshLock {
         // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
       }
     };
-    // smarty-dev#9805: only the canonical mesh lock opts into the early free-lock bypass of a stalled head.
+    // smarty-dev#9805: only the canonical mesh lock opts into early free-lock reaping of a stalled head receipt.
     const admission = createMeshLockAdmission(this.root, token, waitMs, { stalledHeadBypassLock: this.#lockPath });
     const { ticket, deadline } = admission;
     let budgetSpent = false;

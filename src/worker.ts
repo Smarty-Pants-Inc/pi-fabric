@@ -24,6 +24,7 @@ import { taskAgentEnvironment, withoutTaskBoundary } from "./agents/task-environ
 import { applyTaskReturnAddress } from "./agents/task-return-address.js";
 import { processStartTime } from "./residency/process-identity.js";
 import { executionGroup, observeExecutionGroup } from "./worker/execution-group.js";
+import { waitForExecutionExit } from "./worker/execution-exit.js";
 import { createCrashFinisher } from "./worker/crash-finish.js";
 
 // ProcessTransport's native channel transfers the execution cleanup obligation
@@ -801,12 +802,16 @@ const main = async (): Promise<void> => {
   });
   // Every provider resume is a new execution obligation. Drain each attempt
   // before replacement, but retain the worker's custody until the whole run ends.
+  let finishingStartedAt: number | undefined;
+  const stopGroupObservers = new WeakMap<ChildProcess, () => void>();
   const retainExecutionCustody = (execution: ChildProcess): void => {
     const executionBirth = execution.pid === undefined ? undefined : processStartTime(execution.pid);
     let nativeClosed = false;
     // Windows preserves native-child cleanup, not an execution-tree receipt.
     const group = process.platform === "win32" ? {
+      cgroupEventsFile: undefined,
       observe(): void {},
+      forcedCleanupCount: (): number => 0,
       members: (): number[] => [],
       exited: () => nativeClosed,
       signal: (signal: NodeJS.Signals): void => {
@@ -817,29 +822,54 @@ const main = async (): Promise<void> => {
     execution.once("close", () => { nativeClosed = true; });
     // Background adoption only; signal()/exited() re-read members on demand.
     const groupObserver = observeExecutionGroup(group);
+    stopGroupObservers.set(execution, () => clearInterval(groupObserver));
     let draining: Promise<void> | undefined;
     executionCleanup = () => draining ??= (async () => {
-      const exited = () => nativeClosed && group.exited();
-      const wait = async (ms: number) => {
-        const deadline = Date.now() + ms;
-        do { if (exited()) return true; await new Promise(resolve => setTimeout(resolve, 20)); } while (Date.now() < deadline);
-        return exited();
-      };
-      if (!exited() && persistentPiTask && piRetrySdk && readFinalAnswerReceipt(path.dirname(options.statusFile), options.id)) {
-        // EOF drains buffered RPC frames through the native discard fence. TERM
-        // here would kill that reader before its durable per-frame ACKs land.
-        execution.stdin?.end();
-        await wait(KILL_GRACE_MS);
-      }
-      if (!exited()) {
-        group.signal("SIGTERM");
-        execution.stdin?.end();
-        if (!await wait(KILL_GRACE_MS)) {
-          group.signal("SIGKILL");
-          if (!await wait(2000)) throw new Error("Execution group did not confirm exit after cleanup");
-        }
-      }
+      // Membership sampling is allowed during execution, never during finishing.
       clearInterval(groupObserver);
+      const exited = () => nativeClosed && group.exited();
+      // The durable receipt can precede its IPC frame. EOF must drain buffered
+      // RPC frames through the discard fence before TERM, even on a failed or
+      // stopped run; only the native child's ACKs settle forwarded controls.
+      const terminalAnswerDrain = Boolean(persistentPiTask && piRetrySdk &&
+        (finalAnswerReceipt ?? readFinalAnswerReceipt(path.dirname(options.statusFile), options.id)));
+      if (terminalAnswerDrain) execution.stdin?.end();
+      const finishing = (finishingStartedAt !== undefined || finalAnswerReceipt !== undefined) && !externalStopRequested;
+      const natural = finishing && (!terminalStatus || terminalStatus === "completed");
+      const started = finishing ? finishingStartedAt ?? Date.now() : Date.now();
+      const killAt = started + KILL_GRACE_MS * (finishing || terminalAnswerDrain ? 2 : 1);
+      const deadline = killAt + 2000;
+      let termTimer: ReturnType<typeof setTimeout> | undefined;
+      let forceTimer: ReturnType<typeof setTimeout> | undefined;
+      let signalError: unknown;
+      let notifyExit: (() => void) | undefined;
+      const signal = (value: NodeJS.Signals): void => {
+        try {
+          if (!exited()) { group.signal(value); execution.stdin?.end(); }
+        } catch (error) { signalError = error; }
+        finally { notifyExit?.(); } // a one-shot cleanup event, never a poll
+      };
+      try {
+        if (!exited()) {
+          // These are one-shot escalation events, not exit probes or deadlines.
+          if (natural || terminalAnswerDrain) termTimer = setTimeout(() => signal("SIGTERM"), Math.max(0, started + KILL_GRACE_MS - Date.now()));
+          else signal("SIGTERM");
+          forceTimer = setTimeout(() => signal("SIGKILL"), Math.max(0, killAt - Date.now()));
+          if (!await waitForExecutionExit(execution, exited, deadline, group.cgroupEventsFile, notify => {
+            notifyExit = notify;
+            return () => { notifyExit = undefined; };
+          })) {
+            throw signalError ?? new Error("Execution group did not confirm exit after cleanup");
+          }
+        }
+        const forced = group.forcedCleanupCount();
+        // The exit-grace diagnostic already records this escalation. Do not
+        // add a second warning, or describe failed/stopped attempts as finished.
+        if (natural && forced > 0 && !record.warnings?.some(warning => warning.includes("did not exit after stdin closed"))) {
+          record.warnings = [...(record.warnings ?? []), `finished with forced cleanup of ${forced} descendants`];
+          update();
+        }
+      } finally { clearTimeout(termTimer); clearTimeout(forceTimer); }
     })();
     if (process.platform !== "win32") process.send?.({ type: "fabric-execution-started", pid: execution.pid, started: executionBirth }, () => undefined);
   };
@@ -1006,6 +1036,19 @@ const main = async (): Promise<void> => {
     killChild();
   };
   const closeChild = (): void => {
+    // Capture descendant births at the native boundary BEFORE EOF can reap the
+    // execution root. A periodic sample alone can miss a fast final turn.
+    executionGroups.get(child)?.observe();
+    stopGroupObservers.get(child)?.();
+    // Keep status.json running until streams and validation drain. The native
+    // milestone lets Main expose finishing without changing that raw contract.
+    // A failed provider attempt may resume in this same worker, so its EOF is
+    // not a final task boundary (nor is a pre-dispatch context reseed).
+    if (!contextReseedRequest && (piSettledSuccessfully || terminalStatus === "completed")) {
+      finishingStartedAt ??= Date.now();
+      record.finishingAt = finishingStartedAt;
+      update();
+    }
     piControlLive = false;
     child.stdin?.end();
     recoveryWatchdog.suspend();
@@ -1029,7 +1072,7 @@ const main = async (): Promise<void> => {
         appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
         process.stderr.write(`[pi-fabric] ${warning}\n`);
         // Persist the result and warning BEFORE signalling the owned group.
-        // Keep the public record running until close drains the streams and
+        // Keep the worker record running until close drains the streams and
         // reply/schema validation finishes; terminal records can be collected
         // immediately by the manager. Forced exit must not erase this result.
         update();
@@ -1683,6 +1726,8 @@ const main = async (): Promise<void> => {
     saveWorkerCompletion(options.statusFile, record);
     writeRunRecord(options.statusFile, record);
     terminalWritten = true;
+    finishingStartedAt ??= Date.now();
+    stopGroupObservers.get(child)?.();
     child.stdin?.end();
     // Reuse the sole custody/cleanup obligation, not a second kill mechanism.
     void executionCleanup().catch(finishCrash);
@@ -2486,6 +2531,10 @@ const main = async (): Promise<void> => {
     child.stderr?.on("error", () => {});
   };
   const restartPiChild = (): void => {
+    finishingStartedAt = undefined;
+    delete record.finishingAt;
+    record.status = "running";
+    update();
     taskResuming = true;
     attemptBase = { turns: record.turns, toolCalls: record.toolCalls, usage: { ...record.usage } };
     finalTurnCompleted = false;
@@ -2515,7 +2564,7 @@ const main = async (): Promise<void> => {
   startChildInput();
 
   const timeout = setTimeout(() => {
-    if (terminalStatus) return;
+    if (terminalStatus || finishingStartedAt !== undefined) return;
     terminalStatus = "timed_out";
     terminalError = `Agent timed out after ${options.timeoutMs}ms`;
     if (isPi && !modelControl.ready) {
@@ -2545,6 +2594,10 @@ const main = async (): Promise<void> => {
       child.once("close", (code) => {
         childExited = true;
         piControlLive = false;
+        // Native Pi close discharges its EOF grace, not descendant custody.
+        // Tree cleanup may outlive this timer and has its own bounded grace.
+        if (closeTimer) clearTimeout(closeTimer);
+        closeTimer = undefined;
         void executionCleanup().then(() => resolve(code)).catch(finishCrash);
       });
     });

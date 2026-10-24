@@ -1,6 +1,8 @@
 import { createLockEvents, createLockStats, lockHeldEventThreshold, type LockEventStore, type MeshLockClass } from "./commit-stats.js";
 import { meshLockQueueDirectory, MeshLockTicket } from "./lock-queue.js";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { meshInvocationStorage, MESH_INVOCATION_DEADLINE_MARGIN_MS } from "./invocation-context.js";
+export { withCommittedMeshPublication, withMeshInvocationContext } from "./invocation-context.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import type { MeshLockProtocol } from "../config.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -30,66 +32,6 @@ export const lockStats = createLockStats();
 // recorder: rare appends only, nothing on an ordinary acquisition.
 export const lockEvents = createLockEvents();
 const timed = lockStats !== undefined || lockEvents !== undefined;
-
-/** Leave a small execution-budget margin for the guest to catch a typed lock refusal. */
-const MESH_INVOCATION_DEADLINE_MARGIN_MS = 5;
-
-interface MeshInvocationContext {
-  readonly signal?: AbortSignal;
-  /** Live epoch deadline: host-call floors and human waits may move it. */
-  readonly deadlineAt: () => number;
-  /** Failed, cancelled, or expired dispatches cannot leave escaped writers. */
-  closed: boolean;
-  /** Successful dispatches preserve ordinary detached handles and refresh timers. */
-  detached: boolean;
-  readonly expired: boolean;
-}
-
-const meshInvocationStorage = new AsyncLocalStorage<MeshInvocationContext>();
-
-/** Host-only: publication owed by an already committed actor, not a new guest write.
- * Exit only for this continuation; never detach the dispatch or its sibling writers.
- * Store shutdown signals and the ordinary lock budget still apply. */
-export const withCommittedMeshPublication = <T>(operation: () => T): T => meshInvocationStorage.exit(operation);
-
-export const withMeshInvocationContext = async <T>(
-  context: Omit<MeshInvocationContext, "closed" | "detached" | "expired">,
-  operation: () => T | Promise<T>,
-  // Dispatchers can require canonical success even when a failed call resolves.
-  confirmSuccess: () => boolean = () => true,
-): Promise<T> => {
-  // A successful detached handle must not keep the caller's eventual runtime
-  // abort attached to mesh work that was already waiting when the handle returned.
-  const lifetime = context.signal ? new AbortController() : undefined;
-  const scope: MeshInvocationContext = {
-    ...context,
-    ...(lifetime ? { signal: lifetime.signal } : {}),
-    closed: false,
-    detached: false,
-    get expired(): boolean {
-      return this.closed || (!this.detached && (this.signal?.aborted === true || this.deadlineAt() <= Date.now()));
-    },
-  };
-  const onAbort = (): void => { if (!scope.detached) lifetime?.abort(context.signal?.reason); };
-  if (context.signal?.aborted) onAbort();
-  else context.signal?.addEventListener("abort", onAbort, { once: true });
-  return meshInvocationStorage.run(scope, async () => {
-    try {
-      const value = await operation();
-      // Confirmed detached work outlives its caller; only unsuccessful dispatches
-      // permanently close the inherited scope. A sibling never shares this object.
-      if (scope.expired || !confirmSuccess()) scope.closed = true;
-      else scope.detached = true;
-      return value;
-    } catch (error) {
-      scope.closed = true;
-      throw error;
-    } finally {
-      context.signal?.removeEventListener("abort", onAbort);
-      if (!scope.detached) scope.closed = true;
-    }
-  });
-};
 
 /** The pid a `.lock` owner record names (its second line), when readable. */
 export const lockOwnerPid = (ownerPath: string): number | undefined => {
@@ -320,7 +262,17 @@ export class MeshLock {
     let lockHeldAt = -1;
     let holdMs = -1;
     let failedWaitMs = -1;
-    this.#writeAbortSignal?.throwIfAborted();
+    const invocation = meshInvocationStorage.getStore();
+    const boundedInvocation = invocation && !invocation.detached ? invocation : undefined;
+    const invocationTimeout = (): MeshLockTimeoutError => new MeshLockTimeoutError(
+      boundedInvocation?.closed ? " (guest invocation closed)" : " (guest invocation deadline)", 0, 0,
+    );
+    const assertInvocationAvailable = (): void => {
+      if (!boundedInvocation || boundedInvocation.detached) return;
+      if (boundedInvocation.closed || boundedInvocation.deadlineAt() <= Date.now()) throw invocationTimeout();
+      boundedInvocation.signal?.throwIfAborted();
+    };
+    assertInvocationAvailable();
     // A registry-fenced publisher gets only a short try, never the ordinary wait.
     // Async-local scope leaves concurrent ordinary callers on their own budget.
     const scope = this.#tryLockScope.getStore();
@@ -338,10 +290,11 @@ export class MeshLock {
       : undefined;
     // A guest-bound acquisition must finish before the invocation deadline; preserve the
     // ordinary lock budget for non-guest callers. The margin leaves time to surface refusal.
-    const guestWaitMs = boundedInvocation
-      ? Math.max(0, boundedInvocation.deadlineAt() - Date.now() - MESH_INVOCATION_DEADLINE_MARGIN_MS)
-      : this.#lockTimeoutMs;
-    const waitMs = Math.min(this.#lockTimeoutMs, Math.max(0, budget), guestWaitMs);
+    assertInvocationAvailable();
+    const waitMs = Math.min(this.#lockTimeoutMs, Math.max(0, budget));
+    const waitSignal = this.#writeAbortSignal && boundedInvocation?.signal
+      ? AbortSignal.any([this.#writeAbortSignal, boundedInvocation.signal])
+      : boundedInvocation?.signal ?? this.#writeAbortSignal;
     const token = randomUUID();
     // Protocol 3 (smarty-dev#9569): the start line is always present (empty: unknown) and the PID namespace follows
     // on its own line (empty: unknown, which no reclaimer may treat as its own). Six fields: a reader from before
@@ -379,7 +332,14 @@ export class MeshLock {
     };
     // smarty-dev#9805: only the canonical mesh lock opts into early free-lock reaping of a stalled head receipt.
     const admission = createMeshLockAdmission(this.root, token, waitMs, { stalledHeadBypassLock: this.#lockPath });
-    const { ticket, deadline } = admission;
+    const { ticket } = admission;
+    // Guest time is a live absolute bound: host-call floors, human waits and successful detachment may move it.
+    const invocationDeadline = (): number => boundedInvocation && !boundedInvocation.detached
+      ? boundedInvocation.closed || boundedInvocation.signal?.aborted
+        ? Number.NEGATIVE_INFINITY
+        : boundedInvocation.deadlineAt() - MESH_INVOCATION_DEADLINE_MARGIN_MS
+      : Number.POSITIVE_INFINITY;
+    const deadline = (): number => Math.min(admission.deadline, invocationDeadline());
     let budgetSpent = false;
     let budgetTimer: ReturnType<typeof setTimeout> | undefined;
     // The shared admission helper fixes the relative budget only after setup; expiry cannot grant admission.
@@ -393,17 +353,17 @@ export class MeshLock {
       let waited = false;
       let waitSetupExpired = false;
       const wait = async (ms: number): Promise<void> => {
-        // Arm once, before watch setup, on the same relative timer clock as both wait paths.
-        // Date is lease time (it may jump); performance may be a separate diagnostic clock.
-        // Lazy arming keeps uncontended acquisitions free of another clock read or timer.
-        // Spent means strictly past the budget (+1 ms), so an attempt due exactly at the deadline still runs.
-        budgetTimer ??= setTimeout(() => { budgetSpent = true; }, Math.max(0, deadline - Date.now()) + 1);
+        // Only the ordinary relative budget owns this once-armed timer. Latching a guest deadline here would
+        // ignore later host-call floors, human waits or successful detachment. Arm before synchronous watch setup.
+        // Spent means strictly past the budget (+1 ms), so an eligible probe exactly at the deadline still runs.
+        budgetTimer ??= setTimeout(() => { budgetSpent = true; }, Math.max(0, admission.deadline - Date.now()) + 1);
+        const waitDeadline = deadline();
         const pending = ticket.queued
-          ? ticket.wait(ms, this.#writeAbortSignal, deadline)
-          : delay(ms, this.#writeAbortSignal);
-        // Invocation includes synchronous watch setup: retain its fixed-deadline refusal.
-        // After yielding, wall-clock lease time can jump independently of the relative timer.
-        waitSetupExpired = Date.now() > deadline;
+          ? ticket.wait(ms, waitSignal, waitDeadline)
+          : delay(ms, waitSignal);
+        // Watch setup spends the fixed ordinary deadline; a later wall-clock jump during the async wait does not.
+        // Guest expiry is always checked live, never latched across a deadline extension or detachment.
+        waitSetupExpired = Date.now() > admission.deadline;
         await pending;
         waited = true;
       };
@@ -419,14 +379,18 @@ export class MeshLock {
       };
       while (true) {
         this.#writeAbortSignal?.throwIfAborted();
+        assertInvocationAvailable();
+        if (boundedInvocation && !boundedInvocation.detached && waitMs > 0 && invocationDeadline() <= Date.now()) throw invocationTimeout();
         if (!ticket.mayContend()) {
-          if (!budgetSpent && Date.now() < deadline) {
+          const remaining = deadline() - Date.now();
+          if (!budgetSpent && remaining > 0) {
             // Woken when the predecessor's receipt goes; the short poll is only a safety net.
-            await wait(Math.min(20, Math.max(0, deadline - Date.now())));
+            await wait(Math.min(20, remaining));
             continue;
           }
           // Expiry never grants FIFO admission: only an eligible head may probe at its deadline. Keep the legacy
           // retry code, but report this zero-acquisition refusal separately from real lock contention.
+          if (boundedInvocation && !boundedInvocation.detached) throw invocationTimeout();
           throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
         }
         const attemptAt = Date.now();
@@ -497,13 +461,17 @@ export class MeshLock {
           const code = errorCode(error);
           if (code !== "EEXIST" && (this.#lockProtocol === 1 ||
             (code !== "ENOTEMPTY" && code !== "EPERM" && code !== "EACCES"))) throw error;
-          if (await this.clearStaleLock(ownerPath, deadline, blocked)) continue;
-          if (Date.now() >= deadline) throw timeout();
+          if (await this.clearStaleLock(ownerPath, deadline(), blocked)) continue;
+          if (Date.now() >= deadline()) throw timeout();
           // Only the FIFO head probes promptly, woken when .lock is released. After the bounded
           // admission fallback, full jitter spreads plain contenders; the deadline bounds every sleep.
-          await wait(ticket.queued ? Math.min(10, Math.max(0, deadline - Date.now()))
-            : retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()));
+          await wait(ticket.queued ? Math.min(10, Math.max(0, deadline() - Date.now()))
+            : retryDelayMs(retryAttempt++, 20, 250, Math.max(0, deadline() - Date.now())));
         }
+      }
+      if (boundedInvocation && !boundedInvocation.detached && waitMs > 0 && invocationDeadline() <= Date.now()) {
+        releaseOwned();
+        throw invocationTimeout();
       }
       pin = pinFenceLock(this.#lockPath, ownerRecord);
       // ponytail: fence-lock.ts stays main's code, so its verdicts are split here. On Linux the pin must hold:
@@ -520,7 +488,7 @@ export class MeshLock {
       }
       if (timed) lockHeldAt = performance.now();
       try {
-        this.#writeAbortSignal?.throwIfAborted();
+        assertInvocationAvailable();
         return acrossAwait ? await operation() : operation();
       } catch (error) {
         // A failed write (a version conflict above all) means this store's view is behind: the

@@ -57,6 +57,7 @@ const setup = () => {
     resolvePythonRuntime: () => undefined,
     defaultModel: () => undefined,
     assertModelAllowed: vi.fn(),
+    resolveModelReasonPolicy: () => ({ model: undefined, thinking: undefined, fallback: false }),
     actorArchiveSources: () => new Map(),
     spawn: vi.fn(() => { throw new Error("Publication must not launch a worker"); }),
   } as unknown as AgentManager;

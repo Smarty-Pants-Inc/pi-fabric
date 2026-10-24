@@ -411,6 +411,7 @@ describe("exclusive kernel tool surface", () => {
       expect(text).toBe(`Runtime error: ${error}`);
       expect(text).not.toContain("Recovery hint:");
     }
+  });
 
   it("keeps every failure-progress receipt above a tiny output budget", async () => {
     const state = {

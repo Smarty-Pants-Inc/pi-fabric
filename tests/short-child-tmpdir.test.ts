@@ -179,11 +179,13 @@ describe.skipIf(process.platform === "win32")("short private child TMPDIR (smart
 
     it("returns the no-fit TMPDIR warning to the caller and status while the child launches", async () => {
       const f = fixture(layout, { nothingFits: true });
-      const { result } = await report(f, { runner: "pi", actorId: "actor" });
+      const { result } = await report(f, { runner: "pi", actorId: "actor", model: "openai/gpt-4.1",
+        modelPolicyOriginalModel: "anthropic/claude-opus-4-1" });
       const tmpdirWarning = expect.stringContaining("tmpdir: short private TMPDIR unavailable (");
+      const inheritedWarning = expect.stringContaining("model: inherited anthropic/claude-opus-4-1 ->");
       expect(result.status).toBe("completed");
-      expect(result.warnings).toEqual(expect.arrayContaining([tmpdirWarning]));
-      expect(f.manager.status(result.id)).toMatchObject({ status: "completed", warnings: expect.arrayContaining([tmpdirWarning]) });
+      expect(result.warnings).toEqual(expect.arrayContaining([tmpdirWarning, inheritedWarning]));
+      expect(f.manager.status(result.id)).toMatchObject({ status: "completed", warnings: expect.arrayContaining([tmpdirWarning, inheritedWarning]) });
       await f.manager.cleanup(result.id);
     });
 

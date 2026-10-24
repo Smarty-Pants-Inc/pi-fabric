@@ -2990,7 +2990,7 @@ export class AgentManager {
           ...(scope ? { scope } : {}),
         };
         if (request.modelPolicyOriginalModel && model) {
-          policyWarnings = [`model: inherited ${request.modelPolicyOriginalModel} -> ${model} ${thinking} (#11863)`];
+          policyWarnings = [...policyWarnings.filter(warning => !warning.startsWith("model: inherited ")), `model: inherited ${request.modelPolicyOriginalModel} -> ${model} ${thinking} (#11863)`];
         }
         logPolicyAdmission();
         if (this.#meshTransport?.transport === "nats") {

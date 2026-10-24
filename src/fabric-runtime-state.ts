@@ -1216,6 +1216,8 @@ export class FabricRuntimeState {
         (!transport || live.current() && participantView?.leaseLive() === true) && controlParticipants.canConsumeMesh(),
       enabled: this.#config.mesh.enabled,
       hostId,
+      placementWakeSourceMachine: this.#config.agents.placementDecider?.wakeSourceMachine,
+      onPlacementWake: (targetId, wake) => directoryActors?.placementWake(targetId, wake) ?? false,
       pollMs: this.#config.mesh.actorPollMs,
       bridgeTimeoutMs: this.#config.mesh.bridgeControlTimeoutMs,
       ...(transport ? { inboxLanes: meshConfig.nats.inboxLanes ?? 8,

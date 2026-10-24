@@ -97,6 +97,7 @@ import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import { FabricControlPlane, controlOwnerIncarnation, controlActorBindingOptions, type FabricControlAcceptance, type FabricControlCommand } from "../topology/control-plane.js";
 import { MeshConsumptionPausedError, assertMeshConsumption } from "../topology/mesh-consumption.js";
 import { ParticipantDirectory } from "../topology/participant-directory.js";
+import { boundRootSessionCwd } from "../topology/root-session-cwd.js";
 import type { FabricTransport } from "../transport/types.js";
 import { hostLeasePath, readHostLeaseCurrent } from "../topology/host-leases.js";
 import { RESIDENT_IDLE_EXIT_MS, FabricMeshTransportConfigError, normalizeFabricConfig, validateFabricNatsOperatorMachine } from "../config.js";
@@ -682,12 +683,8 @@ export class ResidentHost {
       kernel: () => currentConfig().kernel ?? config.kernel ?? "typescript",
       pythonRuntime: () => currentConfig().pythonRuntime ?? config.pythonRuntime ?? "monty",
       mainAgentId: config.rootId,
-      rootSessionCwd: () => {
-        const root = this.participants.get(config.rootId, undefined, { fresh: true });
-        return root?.kind === "root" && root.id === config.rootId && typeof root.cwd === "string" && root.cwd.trim().length > 0
-          ? root.cwd
-          : undefined;
-      },
+      // A short lapse of the root's lease falls back to its own last-known record (smarty-dev#16357).
+      rootSessionCwd: () => boundRootSessionCwd(this.participants, config.rootId),
       fabricSessionId: config.sessionId,
       meshRoot: config.meshRoot,
       projectRoot: config.projectRoot,

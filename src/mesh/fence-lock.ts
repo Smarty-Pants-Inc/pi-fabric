@@ -88,6 +88,9 @@ export const pinFenceLock = (lock: string, record: string): number | undefined =
 
 const sameInode = (a: fs.Stats | undefined, b: fs.Stats): boolean => a !== undefined && a.isDirectory() && a.dev === b.dev && a.ino === b.ino;
 
+/** Only a completed canonical removal confirms release; refusal retains the native cause when available. */
+export type FenceLockRelease = { released: true } | { released: false; cause?: unknown };
+
 /**
  * Release without any step that can detach a successor (pi-fabric#694 P1, smarty-dev#6477, third design).
  * The shared name is never renamed, and no file is ever moved out of `<lock>`.
@@ -113,48 +116,50 @@ const sameInode = (a: fs.Stats | undefined, b: fs.Stats): boolean => a !== undef
  * record that cannot go back stays in `<lock>`, so the directory stays non-empty and nobody else can mkdir,
  * publish into or rmdir it. Residual there: only after a live owner's lock was replaced (the same precondition)
  * and only against a protocol-1 writer paused since an mkdir whose directory was reaped.
- * `hooks` is a test seam for the interleavings.
+ * `hooks` is a test seam for the interleavings. Ordinary callers may ignore the release result.
  */
 export const releaseFenceLock = (lock: string, record: string,
-  hooks: { afterCheck?: () => void; afterTake?: () => void } = {}, pin?: number): void => {
-  if (pin === FOREIGN_LOCK) return;
+  hooks: { afterCheck?: () => void; afterTake?: () => void } = {}, pin?: number): FenceLockRelease => {
+  if (pin === FOREIGN_LOCK) return { released: false };
   if (pin !== undefined) {
     try {
       const pinned = path.join(PIN_ROOT, String(pin));
-      try { if (fs.readFileSync(path.join(pinned, "owner"), "utf8") !== record) return; } catch { return; }
+      try { if (fs.readFileSync(path.join(pinned, "owner"), "utf8") !== record) return { released: false }; }
+      catch (cause) { return { released: false, cause }; }
       const ours = fs.fstatSync(pin);
       hooks.afterCheck?.();
-      if (!sameInode(fs.lstatSync(lock, { throwIfNoEntry: false }), ours)) return; // moved or replaced: not ours to touch
+      if (!sameInode(fs.lstatSync(lock, { throwIfNoEntry: false }), ours)) return { released: false }; // moved or replaced: not ours to touch
       // ponytail (smarty-dev#8907): not verifiedRemove (its open would refuse the /proc/self/fd/<fd> final symlink). The
       // unlink goes through the fd pinned on OUR directory inode, whose `owner` was just read as our unique record; no
       // writer replaces an owner in place (all use `wx`) and no recoverer moves one out of its directory (step 1 above).
-      try { fs.unlinkSync(path.join(pinned, "owner")); } catch { return; }
+      try { fs.unlinkSync(path.join(pinned, "owner")); } catch (cause) { return { released: false, cause }; }
       hooks.afterTake?.();
-      if (!sameInode(fs.lstatSync(lock, { throwIfNoEntry: false }), ours)) return;
+      if (!sameInode(fs.lstatSync(lock, { throwIfNoEntry: false }), ours)) return { released: false };
       // ponytail: atomic rmdir, fails closed (ENOTEMPTY) on any successor's record (step 4 above).
-      try { fs.rmdirSync(lock); } catch { /* a successor's owner is in it: never ours to remove */ }
+      try { fs.rmdirSync(lock); return { released: true }; } catch (cause) { return { released: false, cause }; }
     } finally { try { fs.closeSync(pin); } catch { /* already closed */ } }
-    return;
   }
   const ownerPath = path.join(lock, "owner");
-  try { if (fs.readFileSync(ownerPath, "utf8") !== record) return; } catch { return; }
+  try { if (fs.readFileSync(ownerPath, "utf8") !== record) return { released: false }; }
+  catch (cause) { return { released: false, cause }; }
   hooks.afterCheck?.();
   const taken = path.join(lock, `owner.released.${record.split("\n")[0] ?? ""}`);
-  try { fs.renameSync(ownerPath, taken); } catch { return; }
+  try { fs.renameSync(ownerPath, taken); } catch (cause) { return { released: false, cause }; }
   hooks.afterTake?.();
   let ours = false;
-  try { ours = fs.readFileSync(taken, "utf8") === record; } catch { /* unreadable: not provably ours */ }
+  let cause: unknown;
+  try { ours = fs.readFileSync(taken, "utf8") === record; } catch (error) { cause = error; }
   if (ours) {
     // ponytail (smarty-dev#8907; off Linux, or the synchronous fence's Linux pin-failure fallback):
     // `taken` is `owner.released.<our unique token>` inside <lock>, a name only this holder ever creates, just verified
     // as our record. The rmdir below is atomic and fails closed on any successor's owner; the link-back unlink removes
     // only the extra name of the inode just linked back to `owner`.
-    try { fs.unlinkSync(taken); } catch { /* best effort */ }
-    try { fs.rmdirSync(lock); } catch { /* a successor's owner is in it: never ours to remove */ }
-    return;
+    try { fs.unlinkSync(taken); } catch (error) { cause = error; }
+    try { fs.rmdirSync(lock); return { released: true }; } catch (error) { return { released: false, cause: cause ?? error }; }
   }
   try { fs.linkSync(taken, ownerPath); fs.unlinkSync(taken); }
-  catch { /* another owner holds the name: the foreign record stays inside <lock>, never deleted */ }
+  catch (error) { cause ??= error; /* another owner holds the name: the foreign record stays inside <lock>, never deleted */ }
+  return { released: false, cause };
 };
 
 /**

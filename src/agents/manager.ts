@@ -678,7 +678,14 @@ interface RecoveryRetry {
   recoveryAlarmed?: boolean;
 }
 
+/** Public observation failure is not a terminal result or execution-exit proof. */
+interface AgentResultObservation {
+  failure?: Error;
+  listeners: Set<{ resolve(result: AgentRunResult): void; reject(error: unknown): void }>;
+}
+
 interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
+  observation?: AgentResultObservation;
   runRoute: AgentRunRouteMetadata;
   /** smarty-dev#9855: the admission permit a lost-contact process run holds until it is proven gone (once-only). */
   heldPermit?: () => void;
@@ -845,6 +852,8 @@ const executionFencedRelease = (managed: ManagedAgent, release: () => void): (()
   };
 
 interface QueuedAgent {
+  /** Shared with the managed attempt on promotion, independently of its lifecycle result. */
+  observation?: AgentResultObservation;
   /** Host-owned admission address, including terminal outcomes with no launch manifest. */
   completionRecipient?: CompletionRecipient;
   routeSaveFailure?: string;
@@ -3244,6 +3253,7 @@ export class AgentManager {
           launch: { ...launch, signal: authorize ? signal : undefined },
           startupAttempts: 1,
           ...lifecycle,
+          ...(queued?.observation ? { observation: queued.observation } : {}),
           abortSignal: queued && !authorize ? undefined : signal,
           abortHandler: undefined,
           ...(model ? { model } : {}),
@@ -3288,31 +3298,34 @@ export class AgentManager {
         this.#queued.delete(id);
         this.#unregisteredTransports.delete(transport);
         this.#invalidateUiList();
-        if (launchCancelled) {
-          // Return a custody handle even for immediate admission. Actor run/wait
-          // remains joined to this exact attempt until a retry confirms exit.
-          void this.#stop(id, true, false).catch(() => undefined);
-        } else {
-          void this.#monitor(managed, timeoutMs, deadlineAt).catch(async (error) => {
-            // One transparent exact retry for an explicit process stop whose
-            // first stop attempt rejected with contact intact; no loop.
-            if (managed.explicitStopRequested && managed.transport.kind === "process" &&
-              managed.transport.lostContact?.() === undefined && !managed.launchCancelled && !managed.settled) {
-              try {
-                await this.#stop(managed.id, false);
-                return;
-              } catch { /* fall through to generic custody settlement */ }
-            }
-            // Publication and execution custody are independent: a failed drain
-            // must resolve wait/join, without releasing the native permit/files.
-            this.#markLost(managed, String(error));
-            const candidate = readRecord(managed.statusFile) ?? managed.latestRecord;
-            this.#settle(managed, {
-              ...failedRecord(managed, "failed", String(error)),
-              ...(candidate ?? {}), status: "failed",
-            });
+        // Join the cancelled launch's first bounded stop before monitoring, so
+        // observation neither duplicates that hook nor ends with its refusal.
+        const monitoring = launchCancelled
+          ? this.#stop(id, true, false).catch(() => undefined).then(() => this.#monitor(managed, timeoutMs, deadlineAt))
+          : this.#monitor(managed, timeoutMs, deadlineAt);
+        void monitoring.catch(async (error) => {
+          // One transparent exact retry for an explicit process stop whose
+          // first stop attempt rejected with contact intact; no loop.
+          if (managed.explicitStopRequested && managed.transport.kind === "process" &&
+            managed.transport.lostContact?.() === undefined && !managed.launchCancelled && !managed.settled) {
+            try {
+              await this.#stop(managed.id, false);
+              return;
+            } catch { /* fall through to generic custody settlement */ }
+          }
+          this.#markLost(managed, String(error));
+          if (managed.launchCancelled) {
+            this.#failCancelledObservation(managed, error);
+            return;
+          }
+          // Ordinary publication and execution custody are independent: a
+          // failed drain resolves wait/join without releasing native custody.
+          const candidate = readRecord(managed.statusFile) ?? managed.latestRecord;
+          this.#settle(managed, {
+            ...failedRecord(managed, "failed", String(error)),
+            ...(candidate ?? {}), status: "failed",
           });
-        }
+        });
         const handle = this.#handleInfo(managed, "running");
         this.#emitLifecycle(managed, "run.spawned", Date.now(), { status: "running", data: {
           ...(model ? { model } : {}),
@@ -3563,7 +3576,10 @@ export class AgentManager {
       // A normal Windows settlement owns release until its captured close/stop
       // joins. Rejection or the existing close bound permits reconciliation, not
       // release: every later scan must re-establish fresh host-owned death proof.
-      if (!managed.actorId || managed.relaunchPending || !managed.admissionRelease) continue;
+      // Cancelled registrations remain strict: primary death is not their
+      // checked tree-exit receipt, even when public observation has failed.
+      if (!managed.actorId || managed.relaunchPending || !managed.admissionRelease ||
+          (managed.launchCancelled && !managed.executionExited)) continue;
       const nativeFenced = managed.nativeAdmissionFenced;
       if (nativeFenced && managed.nativeAdmissionReconcile !== managed.transport) continue;
       // Every proof-triggered scan (close, admission, or native debt) can beat
@@ -4054,7 +4070,9 @@ export class AgentManager {
     const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned, preparation);
     const queued = this.#queued.get(handle.id);
     if (queued && !queued.terminal && !queued.preparing) onQueued?.(this.#queuedInfo(queued));
-    return this.wait(handle.id);
+    // The actor drain's own run is a same-session execution fence, including
+    // while its queued result is promoted. Public wait remains an observation.
+    return request.actorId ? this.#wait(handle.id, {}, false) : this.wait(handle.id);
   }
 
   /** Caller/actor quality assertion, joined to a locally owned routed run only. */
@@ -4074,8 +4092,14 @@ export class AgentManager {
    * detached instead (smarty-dev#854): it continues, nothing is consumed, and its result arrives
    * as a completion message. An optional signal cancels only this observation (Main's
    * program deadline / Escape), detaches the run, and leaves its result unconsumed.
+   * Unbounded public observation of an unobservable cancelled registration may
+   * reject without settling its lifecycle or consuming a result.
    */
-  async wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal; deferConsumption?: (consume: () => void, abandon?: () => void) => void } = {}): Promise<AgentRunResult> {
+  wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal; deferConsumption?: (consume: () => void, abandon?: () => void) => void } = {}): Promise<AgentRunResult> {
+    return this.#wait(id, options);
+  }
+
+  async #wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal; deferConsumption?: (consume: () => void, abandon?: () => void) => void }, observeFailure = true): Promise<AgentRunResult> {
     const previous = this.#previousRun(id);
     if (previous) {
       if (options.deferConsumption) options.deferConsumption(() => this.markForeground(id), () => this.abandonForeground(id));
@@ -4092,7 +4116,7 @@ export class AgentManager {
     if (queued) {
       if (!options.deferConsumption) queued.background = false;
       const result = options.timeoutMs === undefined && options.signal === undefined
-        ? await queued.result
+        ? await (observeFailure ? this.#observedResult(queued) : queued.result)
         : await this.#boundedResult(queued, options);
       consumed();
       return structuredClone(result);
@@ -4102,7 +4126,7 @@ export class AgentManager {
     if (!managed.settled) {
       if (!managed.result) throw new Error(`Agent ${id} has no pending result`);
       const result = options.timeoutMs === undefined && options.signal === undefined
-        ? await managed.result
+        ? await (observeFailure ? this.#observedResult(managed) : managed.result)
         : await this.#boundedResult(managed, options);
       consumed();
       return result;
@@ -4110,6 +4134,50 @@ export class AgentManager {
     const result = this.#settledResult(managed);
     consumed();
     return result;
+  }
+
+  /** No rejected shared promise: only current public observers receive this error. */
+  #failCancelledObservation(managed: ManagedAgent, error?: unknown): void {
+    const lost = uncheckedExternalExit(managed.transport)
+      ? "external transport has no checked exit contract" : managed.transport.lostContact?.();
+    // A refused stop or failed probe with exact contact remains observable.
+    if (!managed.launchCancelled || managed.settled || managed.executionExited || lost === undefined) return;
+    const observation = this.#resultObservation(managed);
+    observation.failure ??= error instanceof Error ? error
+      : new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained: ${lost}`);
+    for (const listener of observation.listeners) listener.reject(observation.failure);
+    observation.listeners.clear();
+  }
+
+  #resultObservation(managed: ManagedAgent | QueuedAgent): AgentResultObservation {
+    if (managed.observation) return managed.observation;
+    const result = managed.result;
+    if (!result) throw new Error(`Agent ${"info" in managed ? managed.info.id : managed.id} has no pending result`);
+    const observation: AgentResultObservation = { listeners: new Set() };
+    managed.observation = observation;
+    // One lifecycle subscription per promoted channel, not one retained promise
+    // reaction per rejected public waiter while execution may remain unknown.
+    void result.then(value => {
+      for (const listener of observation.listeners) listener.resolve(value);
+      observation.listeners.clear();
+    }, error => {
+      for (const listener of observation.listeners) listener.reject(error);
+      observation.listeners.clear();
+    });
+    return observation;
+  }
+
+  #observedResult(managed: ManagedAgent | QueuedAgent): Promise<AgentRunResult> {
+    const result = managed.result;
+    if (!result) throw new Error(`Agent ${"info" in managed ? managed.info.id : managed.id} has no pending result`);
+    // Normal managed runs retain their original result/promise path. A queued
+    // observer must carry its channel across possible cancelled promotion.
+    if ("info" in managed ? managed.terminal !== undefined : !managed.launchCancelled) return result;
+    const observation = this.#resultObservation(managed);
+    if (observation.failure) return Promise.reject(observation.failure);
+    return new Promise<AgentRunResult>((resolve, reject) => {
+      observation.listeners.add({ resolve, reject });
+    });
   }
 
   #readResult(managed: ManagedAgent): AgentRunRecord | undefined {
@@ -4958,8 +5026,8 @@ export class AgentManager {
       await this.#drainExecution(managed);
       // Passive exit proof during the drain can race the monitor's exact stop
       // retry. Join that hook before publishing, even if execution already exited.
-      // A cancelled launch has no monitor: its bounded drain already attempted
-      // stop and checked this exact handle's exit. A rejected request followed
+      // A cancelled launch's bounded drain already attempted stop and checked
+      // this exact handle's exit. A rejected request followed
       // by proven exit must not become a worker failure by issuing it again.
       // Still join any captured stop obligation; native/tree debt cannot pass
       // the drain's exit proof merely because the launch was cancelled.
@@ -4989,7 +5057,9 @@ export class AgentManager {
       else managed.stopDrainFailure = failure.message;
       // Preserve the owned cgroup's typed PID failure after recording custody,
       // just as #drainExecution does; generic drain failures keep the wrapper.
-      if ((error as { name?: unknown } | null)?.name === "TaskCgroupStopUnconfirmedError") throw error;
+      const nativeFailure = (error as { name?: unknown } | null)?.name === "TaskCgroupStopUnconfirmedError";
+      this.#failCancelledObservation(managed, nativeFailure ? error : failure);
+      if (nativeFailure) throw error;
       throw failure;
     }
     if (managed.settled) {
@@ -5837,6 +5907,7 @@ export class AgentManager {
     check?.();
     if (lost === undefined && !alive && nativeClosed) {
       managed.executionExited = true;
+      if (managed.observation) delete managed.observation.failure;
       this.#retentionRevision++;
       this.#scheduleManagedPlacementTerminal(managed);
       // Only this exact transport's positive exit probe discharges a transient
@@ -5902,6 +5973,7 @@ export class AgentManager {
         throw new Error(`Agent ${managed.id} execution exit unconfirmed; custody retained: ${managed.lostContact}`);
       }
       managed.executionExited = true;
+      if (managed.observation) delete managed.observation.failure;
       delete managed.lostContact;
       this.#scheduleManagedPlacementTerminal(managed);
       fs.rmSync(path.join(managed.runDirectory, "unresolved-worker.json"), { force: true });
@@ -6681,6 +6753,31 @@ export class AgentManager {
           wake?.();
         }, () => { /* notification is not exit proof */ });
       }
+      if (managed.launchCancelled) {
+        // Cancellation owns the verdict. Keep observing the SAME handle after
+        // a refused bounded stop, rather than running retries/deadline verdicts
+        // or turning a failed stop acknowledgement into terminal failure.
+        try {
+          const lost = uncheckedExternalExit(managed.transport)
+            ? "external transport has no checked exit contract" : managed.transport.lostContact?.();
+          if (lost !== undefined) {
+            this.#markLost(managed, lost);
+            this.#failCancelledObservation(managed);
+            return;
+          }
+          if (!await this.#transportAliveUntil(managed.transport, Date.now() + TRANSPORT_EXIT_GRACE_MS * 7)) {
+            // False liveness is only a reason to retry the checked stop/drain;
+            // its exact close/tree contract still owns exit and settlement.
+            await this.#stop(managed.id, false, false);
+            if (managed.settled) return;
+          }
+        } catch (error) {
+          this.#markLost(managed, error instanceof Error ? error.message : String(error));
+          this.#failCancelledObservation(managed, error);
+        }
+        await delay(managed.transport.livenessPollIntervalMs ?? AGENT_STATUS_POLL_INTERVAL_MS);
+        continue;
+      }
       this.#drainLifecycle(managed);
       if (this.#observeFinalAnswer(managed)) {
         // The receipt freezes input; result observers still join the owned-tree
@@ -6963,6 +7060,14 @@ export class AgentManager {
     const nested = this.#nestedAgents(managed, true);
     if (nested.length > 0) result.nestedAgents = reconcileNestedAgents(nested, result);
     this.#retentionRevision++;
+    // A cancelled registration never takes the ordinary custody-failure or
+    // Windows early-publication path. Observation failure cannot settle it.
+    if (managed.launchCancelled && !managed.executionExited) {
+      const lost = managed.transport.lostContact?.() ?? managed.lostContact;
+      if (lost !== undefined) this.#markLost(managed, lost);
+      this.#failCancelledObservation(managed);
+      return;
+    }
     // An actor result resumes its same-session activation drain. Holding only
     // a parent concurrency permit would not fence that writer when capacity >1.
     if (managed.actorId && !managed.executionExited &&
@@ -7124,6 +7229,7 @@ export class AgentManager {
     this.#invalidateUiList();
     const reported = this.#withTransportMetadata(result, managed) as AgentRunResult;
     finishAgentSettlement(managed, reported);
+    delete managed.observation;
     this.#scheduleManagedPlacementTerminal(managed);
     managed.task = "";
     delete managed.lastRetriedTransportFailure;

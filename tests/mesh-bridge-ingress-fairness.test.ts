@@ -8,12 +8,17 @@ import { afterEach, expect, it } from "vitest";
 import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
+import { FAIRNESS_MAX_ATTEMPTS, fairnessAttemptLine, runFairnessAttempts } from "./fixtures/mesh-ingress-fairness-attempts.js";
 
 // Ingress starvation regression probe. The target is a real held toLocal publication through
 // MeshBridge -> StoreBridgeSide -> MeshStore -> EventLog, with real SQLite state.db.
 // Only the competing publishers use transact's real append capability to add a brief,
 // deterministic hold after each real event append while they own the canonical .lock.
 // No lock admission or publication result is stubbed.
+// A measured aggregate hold share outside 50–70% means the host did not produce the intended
+// contention, so that attempt decides nothing: it is reported as an invalid attempt, fully torn
+// down, and replaced by a fresh scenario, three attempts at most. The first attempt inside the
+// band decides, and a progress failure there is never retried.
 const TEST_LOCK_TIMEOUT_MS = 500;
 const EXPECTED_RETAINED_TOTAL_MS = TEST_LOCK_TIMEOUT_MS * 2;
 const CONTENDER_PROCESSES = 3;
@@ -27,6 +32,7 @@ const SQLITE_WRITER_INTERVAL_MS = 150;
 const SQLITE_HOLD_AFTER_BUSY_MS = 75;
 const OBSERVATION_WINDOW_MS = 2_300;
 const SCENARIO_WINDOW_MS = 4_000;
+const FORMER_CASE_BUDGET_MS = 30_000;
 const WORKER_PUBLICATIONS = CONTENDER_PROCESSES * PUBLISHERS_PER_PROCESS * CONCURRENT_PER_PUBLISHER * PUBLISHER_ROUNDS;
 
 const CONTENDER = `
@@ -88,6 +94,16 @@ type ChildState = {
   stderr: () => string;
 };
 type HoldInterval = { began: string; ended: string };
+type ScenarioObservation = {
+  result: Record<string, unknown>;
+  heldPct: number;
+  progressAtMs: number | undefined;
+  intervals: HoldInterval[];
+  sqliteBusyBegins: number;
+  sqliteWrites: number;
+  meshBridge: MeshBridge;
+  runner: Promise<void>;
+};
 
 const scratchRoots: string[] = [];
 const stores: MeshStore[] = [];
@@ -183,7 +199,9 @@ const holdShare = (intervals: HoldInterval[], from: bigint, durationMs: number):
   return { heldMs: +heldMs.toFixed(1), heldPct: +(heldMs / durationMs * 100).toFixed(2) };
 };
 
-afterEach(async () => {
+// Releases and awaits everything one scenario owns: workers, the SQLite holder, the bridge loop,
+// the exec observer, SQLite stores and scratch. Idempotent; afterEach repeats it as a backstop.
+const cleanupScenario = async (): Promise<void> => {
   releaseSqliteHolder?.();
   releaseSqliteHolder = undefined;
   for (const state of children) {
@@ -199,10 +217,11 @@ afterEach(async () => {
   for (const store of stores.splice(0)) store.closeState();
   for (const root of scratchRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   children.splice(0);
-});
+};
 
-// Windows exceeds this fixture's 50–70% hold-share precondition; native calibration is not yet verified.
-it.skipIf(process.platform === "win32")("toLocal ingress makes durable progress through real publisher contention", async () => {
+afterEach(cleanupScenario);
+
+async function runScenario(): Promise<ScenarioObservation> {
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-bridge-ingress-fairness-"));
   scratchRoots.push(scratch);
   const hubRoot = path.join(scratch, "hub"), farRoot = path.join(scratch, "far");
@@ -351,7 +370,7 @@ it.skipIf(process.platform === "win32")("toLocal ingress makes durable progress 
   const intervals = workerOutcomes.flat();
   const measuredShare = holdShare(intervals, scenarioStartedAt, SCENARIO_WINDOW_MS);
   const progressWithinWindow = progressAtMs !== undefined && progressAtMs <= OBSERVATION_WINDOW_MS;
-  console.log("INGRESS_FAIRNESS_RESULT " + JSON.stringify({
+  const result = {
     baseHead: "f872f5ed39f586bccacf774df3b32690944433b4",
     ingressDirection: "toLocal", ingressSequence: ingress.sequence,
     durableIngressProgressAtMs: progressAtMs === undefined ? null : +progressAtMs.toFixed(1),
@@ -367,23 +386,43 @@ it.skipIf(process.platform === "win32")("toLocal ingress makes durable progress 
       enqueuedAfterIngressFenceRefusal: true, retainedAdmissionReferenceMs: EXPECTED_RETAINED_TOTAL_MS,
       startedAtMs: +(ordinaryStarted - busyAt).toFixed(1) },
     bridgeBusyLogs: bridgeLogs.length,
-  }));
+  };
+  return { result, heldPct: measuredShare.heldPct, progressAtMs, intervals, sqliteBusyBegins, sqliteWrites,
+    meshBridge: bridge, runner };
+}
 
-  restoreExec?.();
-  restoreExec = undefined;
-  await bridge.stop();
-  bridge = undefined;
-  await withTimeout(runner, 10_000, "bridge shutdown");
-  bridgeRun = undefined;
-  expect(intervals).toHaveLength(WORKER_PUBLICATIONS);
-  expect(measuredShare.heldPct, "production-shaped publishers must hold canonical .lock for 50–70% of the measured scenario")
-    .toBeGreaterThanOrEqual(50);
-  expect(measuredShare.heldPct, "production-shaped publishers must hold canonical .lock for 50–70% of the measured scenario")
-    .toBeLessThanOrEqual(70);
-  expect(sqliteBusyBegins, "the real intermittent SQLite writer must refuse the held ingress BEGIN IMMEDIATE")
-    .toBeGreaterThan(0);
-  expect(sqliteWrites).toBe(SQLITE_WRITER_ROUNDS);
-  expect(progressAtMs ?? Number.POSITIVE_INFINITY,
-    `toLocal ingress must have a durable destination event and cursor checkpoint within ${OBSERVATION_WINDOW_MS} ms`)
-    .toBeLessThanOrEqual(OBSERVATION_WINDOW_MS);
-}, 30_000);
+// Windows exceeds this fixture's 50–70% hold-share precondition; native calibration is not yet verified.
+// The 90 s timeout is the WHOLE-CASE runner timeout: 3 x the former 30 s case budget. There is no
+// per-attempt timer and no hard 30 s per-attempt ceiling; the existing scenario and step deadlines are
+// unchanged. retry: 0 stops a suite-wide runner retry from repeating a deciding progress failure; only
+// the attempt controller may start a fresh scenario.
+it.skipIf(process.platform === "win32")("toLocal ingress makes durable progress through real publisher contention",
+  { retry: 0, timeout: FORMER_CASE_BUDGET_MS * FAIRNESS_MAX_ATTEMPTS }, async () => {
+    await runFairnessAttempts<ScenarioObservation>({
+      run: runScenario,
+      heldPct: observation => observation.heldPct,
+      report: (record, invalid) => console.log(fairnessAttemptLine(record, invalid, record.observation.result)),
+      verify: async ({ meshBridge, runner, intervals, sqliteBusyBegins, sqliteWrites }) => {
+        restoreExec?.();
+        restoreExec = undefined;
+        await meshBridge.stop();
+        bridge = undefined;
+        await withTimeout(runner, 10_000, "bridge shutdown");
+        bridgeRun = undefined;
+        expect(intervals).toHaveLength(WORKER_PUBLICATIONS);
+        expect(sqliteBusyBegins, "the real intermittent SQLite writer must refuse the held ingress BEGIN IMMEDIATE")
+          .toBeGreaterThan(0);
+        expect(sqliteWrites).toBe(SQLITE_WRITER_ROUNDS);
+      },
+      cleanup: cleanupScenario,
+      decide: ({ heldPct, observation: { progressAtMs } }) => {
+        expect(heldPct, "production-shaped publishers must hold canonical .lock for 50–70% of the measured scenario")
+          .toBeGreaterThanOrEqual(50);
+        expect(heldPct, "production-shaped publishers must hold canonical .lock for 50–70% of the measured scenario")
+          .toBeLessThanOrEqual(70);
+        expect(progressAtMs ?? Number.POSITIVE_INFINITY,
+          `toLocal ingress must have a durable destination event and cursor checkpoint within ${OBSERVATION_WINDOW_MS} ms`)
+          .toBeLessThanOrEqual(OBSERVATION_WINDOW_MS);
+      },
+    });
+  });

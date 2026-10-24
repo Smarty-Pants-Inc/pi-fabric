@@ -624,6 +624,7 @@ globalThis.agents = Object.freeze({
   setDeliveryPolicy: (args) => __call("agents.setDeliveryPolicy", args),
   clearMessages: (args) => __call("agents.clearMessages", args),
   resetSession: (args) => __call("agents.resetSession", args),
+  abandonStuckRun: (args) => __call("agents.abandonStuckRun", args),
   setInstructions: (args) => __call("agents.setInstructions", args),
   actors: (args = {}) => __call("agents.actors", args),
   messages: (args) => __call("agents.messages", args),

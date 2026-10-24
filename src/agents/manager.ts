@@ -2242,9 +2242,32 @@ export class AgentManager {
       if (!managed.executionExited && !intact()) return unproven;
     }
     if (!open()) return unproven;
+    const result = this.#terminalRecord(managed);
+    return result ? { exited: true, result } : { exited: true };
+  }
+
+  /**
+   * smarty-dev#16333 round 5: a run's genuine terminal verdict, if it has one, with NO claim that its execution is
+   * over. It is executionExit's record branch: the relaunch failure, else the worker's own status.json with the same
+   * id, or, for a run this manager no longer holds, its archived result. Only for the owner's explicit abandon of a
+   * stuck actor run (ActorManager.abandonStuckRun), whose operator checked that no process of the run remains, so a
+   * finished run's real answer is still delivered instead of a failure. Undefined: no record, a queued run, an
+   * unreadable or forged archive, or a record that is not a genuine verdict (a transport loss, a recoverable stop).
+   */
+  terminalResult(runId: string): AgentRunResult | undefined {
+    if (this.#queued.has(runId)) return undefined;
+    const managed = this.#runs.get(runId);
+    if (managed) return this.#terminalRecord(managed);
+    let previous: AgentRunResult | undefined;
+    try { previous = this.#previousRun(runId); } catch { return undefined; }
+    return previous && terminalWorkerResult(previous) ? previous : undefined;
+  }
+
+  /** The run's genuine terminal record for executionExit and terminalResult (same id, terminalWorkerResult). */
+  #terminalRecord(managed: ManagedAgent): AgentRunResult | undefined {
     const record = managed.relaunchFailure ?? readRecord(managed.statusFile);
     return record && record.id === managed.id && terminalWorkerResult(record)
-      ? { exited: true, result: this.#withTransportMetadata(record, managed) as AgentRunResult } : { exited: true };
+      ? this.#withTransportMetadata(record, managed) as AgentRunResult : undefined;
   }
 
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch, probe = false): Promise<AgentTransportHandle> {

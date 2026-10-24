@@ -206,6 +206,11 @@ export const projectFabricAuditArgs = (
       return projected(args, (output) => copyIdentifier(output, args, "ref"));
     case "fabric.workflow.configure":
       return projected(args, (output) => copyString(output, args, "name"));
+    case "agents.abandonStuckRun":
+      return projected(args, (output) => {
+        copyString(output, args, "id");
+        copyString(output, args, "runId");
+      });
     case "agents.switchModel":
       return projected(args, (output) => {
         copyIdentifier(output, args, "model");

@@ -219,7 +219,8 @@ describe("actor state alarms (smarty-dev#9332)", () => {
       s.clock.skew = 31 * MINUTE;
       await waitFor(() => stuckAlarms().length === 1);
       const data = stuckAlarms()[0]!.data as Record<string, unknown>;
-      expect(data).toMatchObject({ runId, reason, ownerRoot: "session:test", thresholdMs: 30 * MINUTE });
+      // smarty-dev#16333 round 5: every stuck-run alarm names the owner's fixed remedy.
+      expect(data).toMatchObject({ runId, reason, ownerRoot: "session:test", thresholdMs: 30 * MINUTE, remedy: "abandonStuckRun" });
       await settle();
       expect(stuckAlarms()).toHaveLength(1);
       expect(s.alarms("actor-run-stuck", live.id)).toHaveLength(0);

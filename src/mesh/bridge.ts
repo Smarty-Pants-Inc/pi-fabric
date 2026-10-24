@@ -914,9 +914,9 @@ export class StoreBridgeSide implements BridgeSide {
     let eventsNext = false;
     let retryMs = LOCK_RETRY_MIN_MS;
     let baseline: ReturnType<typeof snapshot> | undefined;
-    // File snapshots are private, copy-on-write parses. Observe their read-only entries once,
-    // instead of cloning the whole topology for each projection on every catch-up notification.
-    // Cache content by object, never by version: legacy writers can reuse revision labels.
+    // File snapshots are private, copy-on-write parses: reuse their read-only entries.
+    // Other backends use detached prefix reads, reused only within one snapshot.
+    // Cache file content by object, never by version: legacy writers can reuse revision labels.
     const fileState = this.store.stateBackend === "file";
     const digests = new WeakMap<object, string>();
     const fingerprint = (value: object): string => {
@@ -926,13 +926,14 @@ export class StoreBridgeSide implements BridgeSide {
     };
     const snapshot = () => {
       const leases = readHostLeases(this.store.root);
-      const hostEntries = fileState ? this.store.listAllShared(HOST_PREFIX, { fresh: true }) : undefined;
-      const participantEntries = fileState ? this.store.listAllShared(PARTICIPANT_PREFIX, { fresh: true }) : undefined;
+      const hostEntries = fileState ? this.store.listAllShared(HOST_PREFIX, { fresh: true })
+        : this.store.listAll(HOST_PREFIX, { fresh: true });
+      const participantEntries = fileState ? this.store.listAllShared(PARTICIPANT_PREFIX, { fresh: true })
+        : this.store.listAll(PARTICIPANT_PREFIX, { fresh: true });
       // Include held projection existence/content, so an external prune/lease removal repairs
       // without waiting for traffic. Exclude our renewal fields: our own mirror writes then
       // cause at most one settling pass, never a self-sustaining lease-write feedback loop.
-      const mirrored = [...(hostEntries ?? this.store.listAll(HOST_PREFIX, { fresh: true })),
-        ...(participantEntries ?? this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }))]
+      const mirrored = [...hostEntries, ...participantEntries]
         .filter(entry => mirrorLinkOf(entry.value) === this.peer)
         .map(entry => {
           const host = hostOf(entry.key, entry.value);
@@ -943,12 +944,12 @@ export class StoreBridgeSide implements BridgeSide {
             ...(host ? { lease: lease ? { id: lease.id, rootId: lease.rootId, identityId: lease.identityId,
               startedAt: lease.startedAt, incarnationToken: lease.incarnationToken } : null } : {}) };
         }).sort((a, b) => a.key.localeCompare(b.key));
-      const native = hostEntries && participantEntries ? this.#presence(hostEntries,
+      const native = this.#presence(hostEntries,
         [...participantEntries, ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })],
-        this.store.listAllShared(BRIDGE_HANDOFF_PREFIX, { fresh: true })) : this.#presenceSnapshot();
+        fileState ? this.store.listAllShared(BRIDGE_HANDOFF_PREFIX, { fresh: true })
+          : this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true }), leases);
       // Other links' mirror additions/removals must wake the hub's exporting links.
-      const relays = [...(hostEntries ?? this.store.listAll(HOST_PREFIX, { fresh: true })),
-        ...(participantEntries ?? this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }))]
+      const relays = [...hostEntries, ...participantEntries]
         .filter(entry => remoteHostOf(entry.value) !== undefined && mirrorLinkOf(entry.value) !== this.peer)
         .map(entry => ({ key: entry.key, value: entry.key.startsWith(HOST_PREFIX) && isObject(entry.value)
           ? settled(entry.value) : fileState && isObject(entry.value) ? fingerprint(entry.value) : entry.value, updatedBy: entry.updatedBy }));
@@ -1038,15 +1039,19 @@ export class StoreBridgeSide implements BridgeSide {
     };
   }
 
-  #presence(hostEntries: readonly MeshStateEntry[], participantEntries: readonly MeshStateEntry[], handoffEntries: readonly MeshStateEntry[]): BridgePresence {
-    return this.#scan(hostEntries, participantEntries, handoffEntries).presence;
+  #presence(
+    hostEntries: readonly MeshStateEntry[], participantEntries: readonly MeshStateEntry[], handoffEntries: readonly MeshStateEntry[],
+    leases?: ReadonlyMap<string, FabricHostLease>,
+  ): BridgePresence {
+    return this.#scan(hostEntries, participantEntries, handoffEntries, leases).presence;
   }
 
   #scan(
     hostEntries: readonly MeshStateEntry[], participantEntries: readonly MeshStateEntry[], handoffEntries: readonly MeshStateEntry[],
+    capturedLeases?: ReadonlyMap<string, FabricHostLease>,
   ): { presence: BridgePresence; voided: MeshStateEntry[]; leases: ReadonlyMap<string, FabricHostLease>; now: number } {
     const now = this.now();
-    const leases = readHostLeases(this.store.root);
+    const leases = capturedLeases ?? readHostLeases(this.store.root);
     const handoffs = bridgeHandoffScope(handoffEntries, hostEntries, participantEntries, () => leases, now, this.peer);
     const reserved = new Set<string>(handoffs.reserved);
     // Only a handoff in force to this link waives a (dead) native's own ids (smarty-dev#9074).

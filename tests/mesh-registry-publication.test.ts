@@ -12,6 +12,7 @@ import type { AgentManager } from "../src/agents/manager.js";
 import { runAbortable, throwIfExecutionExpired } from "../src/async-settlement.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import * as fenceLock from "../src/mesh/fence-lock.js";
+import { meshInvocationStorage } from "../src/mesh/invocation-context.js";
 import { MeshLock, withMeshInvocationContext } from "../src/mesh/mesh-lock.js";
 import { MeshStore } from "../src/mesh/store.js";
 
@@ -45,9 +46,10 @@ const heldCanonical = (lock: string): (() => void) => {
     if (fs.existsSync(lock)) retain(lock);
   };
 };
-const setup = () => {
+const setup = (overrides: { lockTimeoutMs?: number; presenceRetryMs?: number } = {}) => {
   const mesh = new MeshStore(path.join(root, "mesh"), 65_536, 100, {
     lockProtocol: 1, stateBackend: "file", canWakeResidents: () => false,
+    ...(overrides.lockTimeoutMs !== undefined ? { lockTimeoutMs: overrides.lockTimeoutMs } : {}),
   });
   // No runner/worktree/worker is constructed or launched. The actor manager's
   // real admission, registry save and mesh publication paths are the subject.
@@ -67,6 +69,7 @@ const setup = () => {
       actorRoot, persistent: true, actorScope: "session",
       canConsumeMesh: () => false, reapDeadSessionPresence: false,
       meshRetentionSweepPath: false,
+      ...(overrides.presenceRetryMs !== undefined ? { presenceRetryMs: overrides.presenceRetryMs } : {}),
     });
   fixtures.push({ actors, mesh });
   return { actors, mesh, actorRoot };
@@ -229,5 +232,108 @@ describe("committed actor registry publication", () => {
         await uncommitted;
       }
     },
+  );
+});
+
+// PR #1269 review P1-1. Node hands an AsyncLocalStorage store to every asynchronous operation created inside
+// run(), timers included (https://nodejs.org/api/async_context.html#asynclocalstoragerunstore-callback-args).
+// A failed or cancelled guest call therefore reaches host timers armed during it; their later acquisitions
+// are host work, not the call's own wait, and must keep the ordinary lock budget.
+describe("closed guest scope reaching host-owned timers", () => {
+  const presenceOf = (mesh: MeshStore, id: string) =>
+    mesh.listAll("actors/test/").find(entry => entry.key === `actors/test/${id}`)?.value as FabricActorInfo | undefined;
+  const until = async (check: () => boolean, timeoutMs: number): Promise<boolean> => {
+    const stop = Date.now() + timeoutMs;
+    while (!check()) {
+      if (Date.now() >= stop) return false;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    return true;
+  };
+
+  it("standalone ALS probe against the real dispatch scope: a self-re-arming timer armed after rejection still publishes", async () => {
+    const mesh = new MeshStore(path.join(root, "mesh"), 65_536, 100, {
+      lockProtocol: 1, stateBackend: "file", canWakeResidents: () => false,
+    });
+    const fires: Array<{ closed: boolean | undefined; outcome: string }> = [];
+    const rejected = deferred();
+    const finished = deferred();
+    const abort = new AbortController();
+    try {
+      const observed = withMeshInvocationContext({ signal: abort.signal, deadlineAt: () => Date.now() + 10_000 }, () => {
+        // Background host work the call started; it outlives the rejected dispatch.
+        void rejected.promise.then(() => {
+          const fire = async (): Promise<void> => {
+            const closed = meshInvocationStorage.getStore()?.closed;
+            const outcome = await mesh.publish({ topic: "host.timer", from: identity })
+              .then(() => "published", (error: { code?: string }) => error?.code ?? String(error));
+            fires.push({ closed, outcome });
+            if (fires.length < 3) setTimeout(() => void fire(), 5); // re-armed from its own callback
+            else finished.resolve();
+          };
+          setTimeout(() => void fire(), 5);
+        });
+        return runAbortable(abort.signal, () => new Promise<never>(() => {}));
+      }).then(value => ({ value }), error => ({ error }));
+      abort.abort(new Error("Escape"));
+      expect(await observed).toHaveProperty("error");
+      rejected.resolve();
+      await finished.promise;
+      // Node semantics, unchanged: every fire still sees the closed store.
+      expect(fires.map(fire => fire.closed)).toEqual([true, true, true]);
+      // The fix: the closed call's refusal no longer extends to later host acquisitions.
+      expect(fires.map(fire => fire.outcome)).toEqual(["published", "published", "published"]);
+      expect(mesh.read({ topic: "host.timer" })).toHaveLength(3);
+    } finally {
+      mesh.closeState();
+    }
+  });
+
+  it.each(["Escape", "deadline"] as const)(
+    "keeps actor presence publication working after a guest setter ends (%s) with its presence write in flight",
+    async ending => {
+      // Short ordinary budget so the second actor's ordinary write fails while the lock is held.
+      const { actors, mesh } = setup({ lockTimeoutMs: 300, presenceRetryMs: 25 });
+      const first = await actors.create({ ...request, name: "first" });
+      const second = await actors.create({ ...request, name: "second" });
+      expect(presenceOf(mesh, first.id)?.topics).toEqual(request.topics);
+      expect(presenceOf(mesh, second.id)?.topics).toEqual(request.topics);
+      let release = heldCanonical(path.join(mesh.root, ".lock"));
+      const entered = deferred();
+      watchPresence(mesh, entered);
+      const abort = new AbortController();
+      let deadlineAt = Date.now() + 10_000;
+      let setter!: Promise<FabricActorInfo>;
+      const observed = withMeshInvocationContext({ signal: abort.signal, deadlineAt: () => deadlineAt }, () => {
+        setter = actors.setTopics(first.id, ["test.first"]);
+        return runAbortable(abort.signal, () => setter);
+      }).then(value => ({ value }), error => ({ error }));
+      try {
+        await entered.promise; // the setter's presence put is waiting on the held canonical lock
+        if (ending === "deadline") deadlineAt = Date.now() - 1;
+        else abort.abort(new Error(ending));
+        const outcome = await observed;
+        if (ending === "Escape") expect(outcome).toHaveProperty("error");
+        // The registry change committed; the in-flight presence write was the call's own and was refused.
+        expect((await setter).topics).toEqual(["test.first"]);
+        expect(presenceOf(mesh, first.id)?.topics).toEqual(request.topics);
+        release();
+        // 1. The first actor's presence lands through the host retry once the lock is free.
+        const firstLanded = await until(() => presenceOf(mesh, first.id)?.topics?.[0] === "test.first", 8_000);
+        // 2. A later ordinary presence failure for a second actor is retried and lands too.
+        release = heldCanonical(path.join(mesh.root, ".lock"));
+        expect((await actors.setTopics(second.id, ["test.second"])).topics).toEqual(["test.second"]);
+        expect(presenceOf(mesh, second.id)?.topics).toEqual(request.topics); // its own write timed out
+        release();
+        const secondLanded = await until(() => presenceOf(mesh, second.id)?.topics?.[0] === "test.second", 8_000);
+        expect({ firstLanded, secondLanded }).toEqual({ firstLanded: true, secondLanded: true });
+      } finally {
+        abort.abort(new Error("test cleanup"));
+        release();
+        await observed;
+        await setter?.catch(() => undefined);
+      }
+    },
+    30_000,
   );
 });

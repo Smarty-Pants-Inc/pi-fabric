@@ -7,7 +7,8 @@ export interface MeshInvocationContext {
   readonly signal?: AbortSignal;
   /** Live epoch deadline: host-call floors and human waits may move it. */
   readonly deadlineAt: () => number;
-  /** Failed, cancelled, or expired dispatches cannot leave escaped writers. */
+  /** Failed, cancelled, or expired: refuses the acquisitions the dispatch began while live, never later ones
+   * (a closed store still reaches host timers armed during the call; pi-fabric#1269 review P1-1). */
   closed: boolean;
   /** Successful dispatches preserve ordinary detached handles and refresh timers. */
   detached: boolean;

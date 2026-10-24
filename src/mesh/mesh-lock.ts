@@ -263,7 +263,11 @@ export class MeshLock {
     let holdMs = -1;
     let failedWaitMs = -1;
     const invocation = meshInvocationStorage.getStore();
-    const boundedInvocation = invocation && !invocation.detached ? invocation : undefined;
+    // Only an acquisition begun while its dispatch is live is that dispatch's own wait; closing still refuses it.
+    // Node hands a closed scope on to every host timer, retry loop or drain armed during the call
+    // (nodejs.org/api/async_context.html#asynclocalstoragerunstore-callback-args): those later acquisitions are
+    // host work and keep the ordinary budget (pi-fabric#1269 review P1-1).
+    const boundedInvocation = invocation && !invocation.detached && !invocation.closed ? invocation : undefined;
     const invocationTimeout = (): MeshLockTimeoutError => new MeshLockTimeoutError(
       boundedInvocation?.closed ? " (guest invocation closed)" : " (guest invocation deadline)", 0, 0,
     );

@@ -364,7 +364,8 @@ describe("public actor model-exception roles", () => {
         model, modelReason: reason, lane: boundRootLane, host: os.hostname().split(".")[0],
         cwd: boundRootCwd, rootSessionCwd: boundRootCwd,
       }, { ...context, cwd: boundRootCwd })).rejects.toMatchObject({
-        code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "lane-mismatch",
+        // #16331: an unreadable bound ROOT record is its own fail-closed denial, not a mismatch.
+        code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "lane-unresolved",
       });
       expect(state.actors.list()).toEqual([]);
       expect(state.agents.list()).toEqual([]);

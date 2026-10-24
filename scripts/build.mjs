@@ -118,6 +118,7 @@ const lazyEntryPoints = [
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
   "src/agents/model-route-prepare.ts",
+  "src/agents/placement-preflight-admission.ts",
   "src/agents/placement-admission.ts",
   "src/agents/placement-context.ts",
   "src/agents/placement-contract.ts",

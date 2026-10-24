@@ -15,39 +15,6 @@ export interface FabricPlacementDeciderConfig {
   wakeSourceMachine: string;
 }
 export type PlacementDeciderConfig = FabricPlacementDeciderConfig;
-export const DEFAULT_PLACEMENT_DECIDER_MODE: PlacementDeciderMode = "off";
-const badPlacementDeciderField = (field: string): never => { throw new Error(`Invalid agents.placementDecider.${field}`); };
-
-/** Host-only argv validation in the already-eager config helper; the adapter itself stays lazy. */
-export const normalizePlacementDeciderConfig = (value: unknown): FabricPlacementDeciderConfig | undefined => {
-  if (value === undefined) return undefined;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return badPlacementDeciderField("config");
-  const input = value as Record<string, unknown>;
-  for (const key of Object.keys(input)) if (!["command", "contextCommand", "mode", "wakeSourceMachine"].includes(key)) badPlacementDeciderField(key);
-  const mode = input.mode === undefined ? DEFAULT_PLACEMENT_DECIDER_MODE : input.mode;
-  if (mode !== "off" && mode !== "shadow" && mode !== "enforce") return badPlacementDeciderField("mode");
-  const validateArgv = (argv: unknown, field: "command" | "contextCommand", optional: boolean): string[] | undefined => {
-    if (argv === undefined && optional) return undefined;
-    if (!Array.isArray(argv) || argv.length < 1 || argv.length > 100 ||
-        argv.some(arg => typeof arg !== "string" || /[\u0000-\u001f\u007f]/u.test(arg))) return badPlacementDeciderField(field);
-    const entries = argv as string[];
-    const executable = entries[0]!;
-    if (!path.isAbsolute(executable) || !executable.trim() ||
-        /^(?:sh|bash|dash|zsh|fish|ksh|csh|tcsh|cmd|powershell|pwsh)(?:\.exe)?$/iu.test(path.basename(executable)) ||
-        /\.(?:cmd|bat)$/iu.test(executable)) return badPlacementDeciderField(field);
-    try {
-      if (!fs.statSync(executable).isFile()) return badPlacementDeciderField(field);
-      fs.accessSync(executable, process.platform === "win32" ? fs.constants.F_OK : fs.constants.X_OK);
-    } catch { return badPlacementDeciderField(field); }
-    return [...entries];
-  };
-  const command = validateArgv(input.command, "command", false)!;
-  const contextCommand = validateArgv(input.contextCommand, "contextCommand", true);
-  if (typeof input.wakeSourceMachine !== "string" || !/^[a-z0-9][a-z0-9-]{0,31}$(?![\s\S])/u.test(input.wakeSourceMachine)) {
-    return badPlacementDeciderField("wakeSourceMachine");
-  }
-  return { command, ...(contextCommand ? { contextCommand } : {}), mode, wakeSourceMachine: input.wakeSourceMachine };
-};
 
 export interface AgentPlacementConfig {
   /** Host-only shell-free argv templates. No placement is enabled when absent. */

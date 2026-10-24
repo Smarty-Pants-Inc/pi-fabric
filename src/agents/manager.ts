@@ -2076,65 +2076,10 @@ export class AgentManager {
     thinking: FabricThinking | undefined): Promise<void> {
     const config = this.config.placementDecider;
     if (!config || config.mode === "off" || (runner !== "pi" && runner !== "pi-durable")) return;
-    const run = async (): Promise<void> => {
-      const [{ CliPlacementDecider, PlacementAdmissionError, PlacementQueueError }, contextModule, contract] = await Promise.all([
-        import("./placement-admission.js"), import("./placement-context.js"), import("./placement-contract.js"),
-      ]);
-      const deadline = performance.now() + contract.PLACEMENT_DEADLINE_MS;
-      const binding = request.placement;
-      const actorActivation = binding?.actorActivation;
-      if ((actorActivation && (binding?.role !== "actor-activation" || actorActivation.actorId !== request.actorId ||
-          actorActivation.rootId !== this.#mainAgentId)) ||
-          (binding?.role === "actor-activation" && (!actorActivation || !request.actorId || !this.#mainAgentId))) {
-        this.#placementDiagnostic("actor-root-ownership-refused", id);
-        throw new PlacementAdmissionError("invalid-request");
-      }
-      const launchId = binding?.launchId ?? request.activationId ?? id;
-      const generation = binding?.generation ?? 1;
-      if (!Number.isSafeInteger(generation) || generation < 1) throw new PlacementAdmissionError("invalid-request");
-      const context = await contextModule.resolvePlacementCallerContext(config, deadline);
-      const draft = contextModule.buildPlacementRequestDraft(context, {
-        launchId, generation, agentName: `fabric-child:${launchId}`,
-        ...(binding ? { child: {
-          ...(binding.role ? { role: binding.role } : {}), ...(binding.complexity ? { complexity: binding.complexity } : {}),
-          ...(binding.profile ? { profile: binding.profile } : {}), ...(binding.memoryProfileRef ? { memoryProfileRef: binding.memoryProfileRef } : {}),
-          ...(binding.actorActivation ? { actorActivation: binding.actorActivation } : {}),
-        } } : {}),
-        ...(model ? { model } : {}), ...(thinking ? { thinking } : {}),
-        capabilities: request.capabilityRequirements ?? [],
-      });
-      const decider = new CliPlacementDecider(config);
-      if (config.mode === "shadow") {
-        const observation = await decider.observe(draft.request, { deadline });
-        this.#placementDiagnostic(`shadow-${observation.hypothetical.decision.toLowerCase()}`, id, draft.missingFields);
-        return;
-      }
-      if (draft.missingFields.length || !draft.roleAllowed) {
-        this.#placementDiagnostic("context-or-role-refused", id, draft.missingFields);
-        throw new PlacementAdmissionError("invalid-request");
-      }
-      const answer = await decider.decide(draft.request, { deadline });
-      if (answer.decision === "QUEUE") {
-        if (draft.request.interaction.class === "live-human") {
-          this.#placementDiagnostic("live-human-queue-refused", id);
-          throw new PlacementAdmissionError("invalid-response");
-        }
-        const anonymousUnavailable = answer.reason === "DECIDER_UNAVAILABLE" && answer.launch_id === undefined && answer.generation === undefined;
-        if (!anonymousUnavailable && (answer.launch_id !== draft.request.launch_id || answer.generation !== draft.request.generation)) {
-          this.#placementDiagnostic("queue-identity-missing", id);
-          throw new PlacementAdmissionError("invalid-response");
-        }
-        this.#placementDiagnostic(`queued-${answer.reason.toLowerCase()}`, id);
-        throw new PlacementQueueError(draft.request, answer);
-      }
-      // The current schema has typed native identity placeholders but no published
-      // systemd create-fence or registration receipt. A CLI PLACE is not authority.
-      this.#placementDiagnostic("native-create-proof-unavailable", id);
-      throw new PlacementAdmissionError("unavailable");
-    };
+    const { runPlacementPreflight } = await import("./placement-preflight-admission.js");
+    const run = () => runPlacementPreflight(config, request, runner, model, thinking, id, this.#mainAgentId,
+      this.#placementDiagnostic.bind(this));
     if (config.mode === "shadow") {
-      // Observation includes context resolution and the CLI round-trip; neither may
-      // delay or authorize a live launch.
       void run().catch(() => this.#placementDiagnostic("shadow-observation-unavailable", id));
       return;
     }

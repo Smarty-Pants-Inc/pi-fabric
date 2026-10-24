@@ -6,18 +6,25 @@ import { ActorManager } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { fleetSessionArchive } from "../src/storage/session-archive.js";
 import { actorTreeDeletionHooks } from "../src/topology/main-publication-fence.js";
+import { failActorTreeRemoval } from "./helpers/actor-tree-removal.js";
 
-// A real ActorManager removal whose tree delete fails AFTER the tree has left its original name (a busy entry at the
-// first unlink). The fault is injected on fs, never on the removal helper, and only for this test's own fixture files
-// below its own temporary actor root. Behavioral invariants only, no marker schema:
-// - the failed cleanup stays pending: obligation reported, marker kept, the actor data retained (never lost),
-// - a retry while the cause persists stays pending, although the original path is now absent,
-// - a cold manager over the same root still reports it pending and keeps it,
-// - once the cause is gone, the exact-id retry really removes the retained tree and the marker,
-// - a directory that appears at the original name after the retry's judgment is never deleted.
-// Linux only: the verified tree delete and the Main publication fence are Linux paths.
+// smarty-dev#16444 (R-keep-all-traces), pi-fabric#1568 round 3: an actor tree is archived, never deleted (one rename
+// into `<meshRoot>/session-archive/<root>/<actor>`). This file used to prove the verifiedRemove graveyard retry (a
+// delete that failed after the tree left its name stays pending, and a retry finds the retained tree). The archive
+// rename keeps the same guarantees, proven on a real ActorManager removal. Faults are injected on fs, only for this
+// test's own fixture, never on the removal code:
+// - a FAILED rename keeps the tree in place (every inode and byte), the cleanup pending (obligation, marker), blocked
+//   retries pending too, and the released exact-id retry archives the whole tree with nothing lost;
+// - an INTERRUPTED removal (the rename completed, its discharge was never saved, as a crash there leaves it) survives a
+//   cold restart as pending, and the cold manager's retry finds the pinned tree in the archive and completes;
+// - counterexample: a directory that appears at the original name after the retry's judgment is never moved or
+//   deleted, and the finished cleanup strands none of the archived data.
+// No fixture data is ever unlinked: every delete of it is recorded and refused.
+// Linux only: the held-parent rename and the Main publication fence are Linux paths.
 
+const ROOT_ID = "session:graveyard";
 const roots: string[] = [];
 const closers: Array<() => Promise<unknown>> = [];
 afterEach(async () => {
@@ -34,76 +41,14 @@ afterEach(async () => {
   }
 });
 
-/** This test's own actor data files (distinct names), written closed (0600) so the delete never refuses them for mode. */
-const DATA = ["fixture-history.jsonl", "fixture-a.bin", "fixture-b.bin"];
-const NAMES = new Set(DATA);
-
-/** Every fixture data file at or below `file` (no link followed), relative to `base`, sorted. */
-const dataBelow = (file: string, base = file): string[] => {
-  let stat: fs.Stats;
-  try { stat = fs.lstatSync(file); } catch { return []; }
-  if (stat.isFile()) return NAMES.has(path.basename(file)) ? [path.relative(base, file) || path.basename(file)] : [];
-  if (!stat.isDirectory()) return [];
-  return fs.readdirSync(file).flatMap(name => dataBelow(path.join(file, name), base)).sort();
-};
-const dataNames = (actorRoot: string): string[] => dataBelow(actorRoot).map(file => path.basename(file)).sort();
-/** Any entry still named for the actor anywhere below the actor root (its tree, or a retained copy of it). */
-const namedFor = (dir: string, id: string): string[] => {
-  let names: string[] = [];
-  try { names = fs.readdirSync(dir); } catch { return []; }
-  return names.flatMap(name => {
-    const file = path.join(dir, name);
-    const own = name.startsWith(id) ? [file] : [];
-    const stat = fs.lstatSync(file, { throwIfNoEntry: false });
-    return stat?.isDirectory() ? [...own, ...namedFor(file, id)] : own;
-  });
-};
-const isPending = (result: unknown): boolean => !!(result as { pending?: string } | undefined)?.pending;
-
-const busy = (): Error => Object.assign(new Error("EBUSY: resource busy (injected by the test on its own fixture)"), { code: "EBUSY" });
-/**
- * A persistent busy fault on this fixture's data files only, wherever they now are below its actor root (their own
- * name, or anywhere a removal moved them; directory-relative paths are resolved through their parent). `allowFirst`
- * lets exactly one fixture file go first, so the tree is partially removed when the fault hits.
- */
-const busyFault = (actorRoot: string, options: { allowFirst?: boolean } = {}) => {
-  const real = fs.realpathSync(actorRoot);
-  const below = (file: string): boolean => file === real || file.startsWith(real + path.sep);
-  const state = { blocked: true, faults: 0, unlinked: [] as string[] };
-  const ours = (file: unknown): boolean => {
-    if (!NAMES.has(path.basename(String(file)))) return false;
-    try { return below(fs.realpathSync(path.dirname(String(file)))); } catch { return false; }
-  };
-  const holdsData = (file: unknown): boolean => {
-    try { const resolved = fs.realpathSync(String(file)); return below(resolved) && dataBelow(resolved).length > 0; }
-    catch { return false; }
-  };
-  const unlinkSync = fs.unlinkSync.bind(fs);
-  vi.spyOn(fs, "unlinkSync").mockImplementation((file) => {
-    if (ours(file)) {
-      if (state.blocked && !(options.allowFirst && state.unlinked.length === 0)) { state.faults++; throw busy(); }
-      state.unlinked.push(path.basename(String(file)));
-    }
-    unlinkSync(file);
-  });
-  const unlink = fs.promises.unlink.bind(fs.promises);
-  vi.spyOn(fs.promises, "unlink").mockImplementation(async (file) => {
-    if (state.blocked && ours(file)) { state.faults++; throw busy(); }
-    await unlink(file);
-  });
-  // A path-based recursive delete of anything that still holds fixture data is busy too.
-  const rmSync = fs.rmSync.bind(fs);
-  vi.spyOn(fs, "rmSync").mockImplementation((file, rmOptions) => {
-    if (state.blocked && holdsData(file)) { state.faults++; throw busy(); }
-    rmSync(file, rmOptions);
-  });
-  const rm = fs.promises.rm.bind(fs.promises);
-  vi.spyOn(fs.promises, "rm").mockImplementation(async (file, rmOptions) => {
-    if (state.blocked && holdsData(file)) { state.faults++; throw busy(); }
-    await rm(file, rmOptions);
-  });
-  return { state, release: () => { state.blocked = false; } };
-};
+/** This test's own actor data files (relative to the actor directory), written closed (0600). */
+const DATA = ["fixture-history.jsonl", "sub/fixture-a.bin", "sub/fixture-b.bin"];
+/** The tree's own inode plus each fixture file's inode and bytes: what "nothing lost" compares. */
+const dataSnapshot = (tree: string): Record<string, string> => Object.fromEntries([
+  [".", `dir:${fs.lstatSync(tree).ino}`],
+  ...DATA.map(name => { const file = path.join(tree, name);
+    return [name, `${fs.lstatSync(file).ino}:${fs.readFileSync(file).toString("hex")}`]; }),
+]);
 
 const setup = async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-graveyard-retry-"));
@@ -113,11 +58,12 @@ const setup = async () => {
   const agents = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 },
     { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs") });
   closers.push(() => agents.close()); // closed last (closers run in reverse)
-  /** A manager over the same root: the first one, or a cold restart after the previous one closed. */
+  /** A manager over the same root: the first one, or a cold restart after the previous one closed. removalRetryMs is
+   * large: the only cleanup attempts are the ones this test makes. */
   const manager = () => {
-    const actors = new ActorManager("graveyard", { id: "session:graveyard", name: "main", kind: "main", sessionId: "graveyard" }, mesh,
+    const actors = new ActorManager("graveyard", { id: ROOT_ID, name: "main", kind: "main", sessionId: "graveyard" }, mesh,
       { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
-      { actorRoot, persistent: true, meshCursorPath: path.join(actorRoot, "mesh-cursor.json") });
+      { actorRoot, persistent: true, meshCursorPath: path.join(actorRoot, "mesh-cursor.json"), removalRetryMs: 60_000 });
     closers.push(() => actors.close());
     return actors;
   };
@@ -126,120 +72,191 @@ const setup = async () => {
   const sessionDir = path.join(actorRoot, actor.id);
   fs.mkdirSync(path.join(sessionDir, "sub"), { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(sessionDir, DATA[0]!), "history\n", { mode: 0o600 });
-  fs.writeFileSync(path.join(sessionDir, "sub", DATA[1]!), "actor data a\n", { mode: 0o600 });
-  fs.writeFileSync(path.join(sessionDir, "sub", DATA[2]!), "actor data b\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(sessionDir, DATA[1]!), "actor data a\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(sessionDir, DATA[2]!), "actor data b\n", { mode: 0o600 });
   const marker = path.join(actorRoot, `removal-${actor.id}.json`);
-  return { root, actorRoot, sessionDir, marker, id: actor.id, actors, manager };
+  const fleet = fleetSessionArchive(mesh.root, ROOT_ID);
+  const archived = fleetSessionArchive(mesh.root, ROOT_ID, actor.id);
+  /** The fleet manifest's phases, in order (none before the first intent). */
+  const phases = (): string[] => {
+    const file = path.join(fleet, "MANIFEST.jsonl");
+    return fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line).phase) : [];
+  };
+  return { root, actorRoot, sessionDir, marker, fleet, archived, phases, id: actor.id, actors, manager };
+};
+type Fixture = Awaited<ReturnType<typeof setup>>;
+
+/** Every delete of fixture data, wherever it is now (the tree or the archive), is recorded and refused. */
+const guardDeletes = (s: Fixture): string[] => {
+  const deletes: string[] = [];
+  const holdsData = (target: unknown): boolean => {
+    const name = String(target);
+    let resolved = path.resolve(name);
+    try { resolved = path.join(fs.realpathSync(path.dirname(name)), path.basename(name)); } catch { /* as given */ }
+    const below = (root: string) => resolved === root || resolved.startsWith(root + path.sep);
+    if (!below(s.sessionDir) && !below(s.archived) && !below(`${s.sessionDir}.judged`)) {
+      // A directory that contains the tree (the actor root, the fleet archive) holds the data too.
+      return [s.sessionDir, s.archived].some(tree => tree.startsWith(resolved + path.sep) && fs.existsSync(tree));
+    }
+    return fs.existsSync(resolved);
+  };
+  const refuse = (api: string, target: unknown): void => {
+    if (!holdsData(target)) return;
+    deletes.push(`${api} ${String(target)}`);
+    throw Object.assign(new Error(`guard: ${api} of fixture data`), { code: "EPERM" });
+  };
+  for (const name of ["unlinkSync", "rmSync", "rmdirSync"] as const) {
+    const original = (fs[name] as (...args: unknown[]) => unknown).bind(fs);
+    vi.spyOn(fs as unknown as Record<string, (...args: unknown[]) => unknown>, name)
+      .mockImplementation((...args: unknown[]) => { refuse(`fs.${name}`, args[0]); return original(...args); });
+  }
+  for (const name of ["unlink", "rm", "rmdir"] as const) {
+    const original = (fs.promises[name] as (...args: unknown[]) => Promise<unknown>).bind(fs.promises);
+    vi.spyOn(fs.promises as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>, name)
+      .mockImplementation(async (...args: unknown[]) => { refuse(`fs.promises.${name}`, args[0]); return original(...args); });
+  }
+  return deletes;
 };
 
-/** The cleanup is pending and nothing it still owes is lost: obligation, marker and the retained data. */
-const expectPending = (actors: ActorManager, s: { id: string; marker: string; actorRoot: string }, result: unknown, retained: string[]) => {
+const busy = (): Error => Object.assign(new Error("EBUSY: resource busy (injected by the test on its own fixture)"), { code: "EBUSY" });
+/** A persistent fault on this fixture's archive rename only (failActorTreeRemoval: the judged tree into session-archive). */
+const renameFault = (s: Fixture) => {
+  const state = { blocked: true, faults: 0 };
+  const spy = failActorTreeRemoval(s.sessionDir, () => { if (state.blocked) { state.faults++; throw busy(); } });
+  return { state, release: () => { state.blocked = false; spy.mockRestore(); } };
+};
+/** The archive rename succeeds; the marker save right after it (the discharge) fails once: on disk the obligation is
+ * still outstanding with its tree in the archive, exactly what a crash between the two leaves. */
+const dischargeFault = (s: Fixture) => {
+  const state = { renamed: false, faults: 0 };
+  const rename = fs.renameSync.bind(fs);
+  vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+    if (state.renamed && state.faults === 0 && path.resolve(String(destination)) === s.marker) {
+      state.faults++;
+      throw Object.assign(new Error("EIO: injected discharge save fault"), { code: "EIO" });
+    }
+    rename(source, destination);
+    if (path.resolve(String(destination)) === s.archived) state.renamed = true;
+  });
+  return state;
+};
+
+/** The cleanup is pending and nothing it owes is lost: obligation, marker and the tree in place, every byte. */
+const expectPending = (actors: ActorManager, s: Fixture, result: unknown, before: Record<string, string>) => {
   expect(result).toMatchObject({ removed: true, cleaned: false, pending: expect.any(String) });
   expect(actors.cleanupObligation(s.id)).toBeDefined();
   expect(actors.pendingRemovals().map(entry => entry.id)).toContain(s.id);
   expect(fs.existsSync(s.marker)).toBe(true);
   expect(JSON.parse(fs.readFileSync(s.marker, "utf8"))).toMatchObject({ id: s.id });
-  expect(dataNames(s.actorRoot)).toEqual(retained);
+  expect(dataSnapshot(s.sessionDir)).toEqual(before);
+  expect(fs.existsSync(s.archived)).toBe(false);
 };
-/** The exact-id cleanup really finished: no fixture data, nothing named for the actor, no marker, no obligation. */
-const expectRemoved = (actors: ActorManager, s: { id: string; marker: string; actorRoot: string; sessionDir: string }, result: unknown) => {
+/** The exact-id cleanup really finished, and the whole judged tree is in the archive: same inodes, same bytes. */
+const expectArchived = (actors: ActorManager, s: Fixture, result: unknown, before: Record<string, string>) => {
   expect(result).not.toHaveProperty("pending");
-  expect(dataNames(s.actorRoot)).toEqual([]);
-  expect(namedFor(s.actorRoot, s.id)).toEqual([]);
   expect(fs.existsSync(s.sessionDir)).toBe(false);
+  expect(dataSnapshot(s.archived)).toEqual(before);
   expect(fs.existsSync(s.marker)).toBe(false);
   expect(actors.cleanupObligation(s.id)).toBeUndefined();
   expect(actors.pendingRemovals().map(entry => entry.id)).not.toContain(s.id);
   expect(actors.list().map(entry => entry.id)).not.toContain(s.id);
 };
 
-describe.runIf(process.platform === "linux")("actor tree removal that fails after the move keeps its cleanup until the retained tree is removed", () => {
-  it("a busy entry after the move keeps the cleanup pending, blocked retries stay pending with the original path absent, and the released exact-id retry removes the retained tree and marker", async () => {
+describe.runIf(process.platform === "linux")("actor tree archive rename that fails or is interrupted keeps its cleanup until the tree is archived", () => {
+  it("a failed rename keeps the tree in place and the cleanup pending, blocked retries stay pending, and the released exact-id retry archives the whole tree with nothing lost", async () => {
     const s = await setup();
-    const all = [...DATA].sort();
-    const fault = busyFault(s.actorRoot);
+    const before = dataSnapshot(s.sessionDir);
+    const deletes = guardDeletes(s);
+    const fault = renameFault(s);
     const first = await s.actors.remove(s.id);
-    expect(fault.state.faults).toBeGreaterThan(0); // the fault was really hit
-    expectPending(s.actors, s, first, all);
-    // Premise: the failure came after the tree left its original name.
-    expect(fs.existsSync(s.sessionDir)).toBe(false);
+    expect(fault.state.faults).toBe(1); // the fault was really hit, at the rename itself
+    expectPending(s.actors, s, first, before);
+    // The intent was recorded before the rename, and its failed outcome after it; nothing reached the archive.
+    expect(s.phases()).toEqual(["MOVING", "MOVE-FAILED"]);
 
     for (let attempt = 0; attempt < 2; attempt++) {
-      // Exact id, cause still present: the original path is absent, yet the retained data is not "already gone".
+      // Exact id, cause still present: the tree stays in place, the cleanup pending.
       const blocked = await s.actors.remove(s.id);
-      expectPending(s.actors, s, blocked, all);
-      expect(fs.existsSync(s.sessionDir)).toBe(false);
+      expectPending(s.actors, s, blocked, before);
     }
+    expect(fault.state.faults).toBe(3);
 
     fault.release();
     const retry = await s.actors.remove(s.id);
-    expectRemoved(s.actors, s, retry);
+    expectArchived(s.actors, s, retry, before);
+    expect(s.phases()).toEqual([..."xxx"].flatMap(() => ["MOVING", "MOVE-FAILED"]).concat(["MOVING", "MOVED-TO"]));
     // Settled: a further exact-id request finds no cleanup left to finish.
     const again = await s.actors.remove(s.id).catch((error: Error) => ({ error: error.message }));
     expect(again).not.toHaveProperty("pending");
     expect(fs.existsSync(s.marker)).toBe(false);
+    expect(dataSnapshot(s.archived)).toEqual(before);
+    expect(deletes).toEqual([]);
   }, 60_000);
 
-  it("a partially removed retained tree survives a cold restart as pending, and the released exact-id retry on the cold manager removes it", async () => {
+  it("an interrupted removal (rename done, discharge not saved) survives a cold restart as pending, and the cold manager's retry finds the pinned tree in the archive and completes", async () => {
     const s = await setup();
-    const fault = busyFault(s.actorRoot, { allowFirst: true });
+    const before = dataSnapshot(s.sessionDir);
+    const deletes = guardDeletes(s);
+    const fault = dischargeFault(s);
     const first = await s.actors.remove(s.id);
-    expect(fault.state.faults).toBeGreaterThan(0);
-    expect(fault.state.unlinked).toHaveLength(1); // partial: one fixture file went before the busy one
-    const retained = DATA.filter(name => !fault.state.unlinked.includes(name)).sort();
-    expect(retained).toHaveLength(DATA.length - 1);
-    expectPending(s.actors, s, first, retained);
+    expect(fault).toEqual({ renamed: true, faults: 1 });
+    expect(first).toMatchObject({ removed: true, cleaned: false, pending: expect.stringContaining("EIO") });
+    // The tree left its name INTO the archive (nothing lost), but the saved obligation still says outstanding.
     expect(fs.existsSync(s.sessionDir)).toBe(false);
+    expect(dataSnapshot(s.archived)).toEqual(before);
+    expect(JSON.parse(fs.readFileSync(s.marker, "utf8"))).toMatchObject({ id: s.id, treeRemoval: { status: "outstanding" } });
+    expect(s.phases()).toEqual(["MOVING", "MOVED-TO"]);
 
-    // The owner stops; a cold manager over the same root takes over while the cause persists.
+    // The owner stops; a cold manager over the same root takes over from the saved obligation alone.
     await s.actors.close();
     const restarted = s.manager();
-    await restarted.finishPendingRemovals(); // a host start finishes what it can
     expect(restarted.cleanupObligation(s.id)).toBeDefined();
-    expect(restarted.pendingRemovals().map(entry => entry.id)).toContain(s.id);
-    expect(fs.existsSync(s.marker)).toBe(true);
-    expect(dataNames(s.actorRoot)).toEqual(retained);
-    const blocked = await restarted.remove(s.id);
-    expectPending(restarted, s, blocked, retained);
-
-    fault.release();
-    const retry = await restarted.remove(s.id);
-    expectRemoved(restarted, s, retry);
+    await restarted.finishPendingRemovals(); // a host start finishes what it can
+    expectArchived(restarted, s, {}, before);
+    // The rename's own MOVED-TO line stands; the recovery adds no second one.
+    expect(s.phases()).toEqual(["MOVING", "MOVED-TO"]);
 
     // A later cold start has nothing left to finish.
     await restarted.close();
     const third = s.manager();
     await third.finishPendingRemovals();
     expect(third.cleanupObligation(s.id)).toBeUndefined();
-    expect(third.pendingRemovals().map(entry => entry.id)).not.toContain(s.id);
     expect(fs.existsSync(s.marker)).toBe(false);
-    expect(dataNames(s.actorRoot)).toEqual([]);
+    expect(dataSnapshot(s.archived)).toEqual(before);
+    expect(deletes).toEqual([]);
   }, 60_000);
 
-  it("counterexample: a directory that appears at the original name after the retry's judgment is never deleted, and a finished cleanup strands none of the retained data", async () => {
+  it("counterexample: a directory that appears at the original name after the retry's judgment is never moved or deleted, and the finished cleanup strands none of the archived data", async () => {
     const s = await setup();
-    const fault = busyFault(s.actorRoot);
+    const before = dataSnapshot(s.sessionDir);
+    const deletes = guardDeletes(s);
+    dischargeFault(s);
     const first = await s.actors.remove(s.id);
-    expect(fault.state.faults).toBeGreaterThan(0);
-    expectPending(s.actors, s, first, [...DATA].sort());
+    expect(first).toMatchObject({ cleaned: false, pending: expect.any(String) });
     expect(fs.existsSync(s.sessionDir)).toBe(false);
+    await s.actors.close();
 
-    fault.release();
     const successor = path.join(s.sessionDir, "successor.jsonl");
-    let replaced = false;
-    // Under the held fence, after the final check judged what to delete: a same-name directory appears.
+    let replaced: number | undefined;
+    // Under the held fence, after the cold retry's final check judged the tree: a same-name directory appears.
     actorTreeDeletionHooks.beforeDelete = () => {
-      if (replaced) return;
-      replaced = true;
+      if (replaced !== undefined) return;
       fs.mkdirSync(s.sessionDir, { mode: 0o700 });
       fs.writeFileSync(successor, "successor history\n", { mode: 0o600 });
+      replaced = fs.lstatSync(s.sessionDir).ino;
     };
-    const retry = await s.actors.remove(s.id);
-    expect(replaced).toBe(true); // the retained-tree delete ran under the fence
+    const restarted = s.manager();
+    await restarted.finishPendingRemovals();
+    expect(replaced).toBeDefined(); // the retry ran its fenced step
+    // The successor never moved (same inode, same bytes) and was not deleted; the archive holds only the judged tree.
+    expect(fs.lstatSync(s.sessionDir).ino).toBe(replaced);
     expect(fs.readFileSync(successor, "utf8")).toBe("successor history\n");
-    // Whatever it reports, a cleanup reported finished leaves none of the retained data behind.
-    const cleaned = !isPending(retry);
-    expect({ cleaned, left: cleaned ? dataNames(s.actorRoot) : [] }).toEqual({ cleaned, left: [] });
-    if (!cleaned) expect(fs.existsSync(s.marker)).toBe(true);
+    expect(fs.existsSync(path.join(s.archived, "successor.jsonl"))).toBe(false);
+    expect(dataSnapshot(s.archived)).toEqual(before);
+    // Whatever it reports, a cleanup reported finished leaves none of the judged data outside the archive.
+    const cleaned = restarted.cleanupObligation(s.id) === undefined;
+    if (cleaned) expect(fs.existsSync(s.marker)).toBe(false); else expect(fs.existsSync(s.marker)).toBe(true);
+    expect(fs.readdirSync(s.fleet).filter(name => name !== "MANIFEST.jsonl")).toEqual([path.basename(s.archived)]);
+    expect(deletes).toEqual([]);
   }, 60_000);
 });

@@ -207,12 +207,13 @@ describe.skipIf(process.platform !== "linux")("retention CLI real entry with a l
           dryRun: true,
           removedRuns: [],
           bytesBefore: fs.statSync(testFixture.oldBackup).size,
-          bytesAfter: 0,
+          // smarty-dev#16444: the old backup would be archived into session-archive/, never deleted: nothing is freed.
+          bytesAfter: fs.statSync(testFixture.oldBackup).size,
         });
         expect(secondPlan!.changes).toEqual([{
           path: testFixture.oldBackup,
           beforeBytes: fs.statSync(testFixture.oldBackup).size,
-          afterBytes: 0,
+          afterBytes: fs.statSync(testFixture.oldBackup).size,
         }]);
         expect(secondPlan!.skipped).toEqual([]);
         expect(snapshot(testFixture.privateRoot)).toBe(before);

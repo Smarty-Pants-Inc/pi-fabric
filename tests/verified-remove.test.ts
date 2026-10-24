@@ -121,14 +121,8 @@ const FIXTURES: Record<string, () => Fixture> = {
     const target = path.join(directory, "events.jsonl");
     return { target, act: () => compactTerminalRunEvents(directory, { now: NOW, terminalRunEventsMaxBytes: 1024 }) };
   },
-  pruneActorSessionBackups: () => {
-    const directory = tmp("fabric-vr-backups-");
-    const session = path.join(directory, "session.jsonl");
-    write(session, "live");
-    const names = ["20260920T150000000Z", "20260921T150000000Z", "20260922T150000000Z"].map(stamp => `${session}.${stamp}.bak`);
-    names.forEach((name, index) => { write(name, name); const at = 1_000 + index; fs.utimesSync(name, at, at); });
-    return { target: names[0]!, act: () => pruneActorSessionBackups(session) };
-  },
+  // smarty-dev#16444: pruneActorSessionBackups is no longer a deleter (it moves older backups into session-archive/,
+  // tests/actor-session-trace-archive.test.ts), so it left this deletion matrix.
   sweepScratch: () => {
     const tempRoot = tmp("fabric-vr-scratch-");
     const target = createScratch("output", tempRoot);

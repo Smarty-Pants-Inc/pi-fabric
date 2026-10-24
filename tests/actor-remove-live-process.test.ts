@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import { mainPublicationFencePath, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
+import { fleetSessionArchive } from "../src/storage/session-archive.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 import { EVIDENCE, fixture, rootParticipantKey, type DeadRootFixture } from "./helpers/dead-root-fixture.js";
 import { processHarness, type ResidentCall } from "./helpers/process-harness.js";
@@ -34,7 +35,12 @@ describe.skipIf(!hostedOnly("live actor removal across processes") || process.pl
     (readParticipantFile(f.config.meshRoot, rootParticipantKey(f.config.rootId))?.value as { mainProcess?: { pid?: number } } | undefined)?.mainProcess?.pid;
   const fenced = (f: DeadRootFixture) => mainPublicationFenced(f.config.meshRoot, f.config.rootId);
   const history = (dir: string) => fs.readFileSync(path.join(dir, "session.jsonl"), "utf8");
-  const treeCalls = (calls: ResidentCall[], dir: string) => calls.filter(call => call.kind === "rm" && call.path === path.resolve(dir));
+  // smarty-dev#16444 (R-keep-all-traces): a whole actor tree leaves by ONE archive rename into the fleet archive (the
+  // harness records it as `archive`, with the fence state); a tree delete (`rm`) must never happen at all.
+  const treeCalls = (calls: ResidentCall[], dir: string) => calls.filter(call => call.kind === "archive" && call.path === path.resolve(dir));
+  const treeDeletes = (calls: ResidentCall[], dir: string) => calls.filter(call => call.kind === "rm" && call.path === path.resolve(dir));
+  const archivedHistory = (f: DeadRootFixture, id: string) =>
+    fs.readFileSync(path.join(fleetSessionArchive(f.config.meshRoot, f.config.rootId, id), "session.jsonl"), "utf8");
   const hooks = (calls: ResidentCall[]) => calls.filter(call => call.kind === "hook");
 
   it("(a) a Main that publishes after the operator acceptance but before the final check keeps the tree: pending, never removed", async () => {
@@ -60,6 +66,8 @@ describe.skipIf(!hostedOnly("live actor removal across processes") || process.pl
       expect(hooks(calls)).toContainEqual({ kind: "hook", name: "beforeCheck", fenced: true });
       expect(hooks(calls).some(call => call.name === "beforeDelete")).toBe(false);
       expect(treeCalls(calls, actor!.dir)).toEqual([]);
+      expect(treeDeletes(calls, actor!.dir)).toEqual([]);
+      expect(fs.existsSync(fleetSessionArchive(f.config.meshRoot, f.config.rootId, actor!.id))).toBe(false);
       // Released: the live Main keeps publishing.
       expect(fenced(f)).toBe(false);
       expect(await main.publish()).toMatchObject({ ok: true });
@@ -87,7 +95,9 @@ describe.skipIf(!hostedOnly("live actor removal across processes") || process.pl
       expect(fs.existsSync(actor!.dir)).toBe(false);
       const calls = await resident.report();
       expect(hooks(calls)).toEqual([{ kind: "hook", name: "beforeCheck", fenced: true }, { kind: "hook", name: "beforeDelete", fenced: true }]);
-      expect(treeCalls(calls, actor!.dir)).toEqual([{ kind: "rm", path: path.resolve(actor!.dir), fenced: true }]);
+      expect(treeCalls(calls, actor!.dir)).toEqual([{ kind: "archive", path: path.resolve(actor!.dir), fenced: true }]);
+      expect(treeDeletes(calls, actor!.dir)).toEqual([]);
+      expect(archivedHistory(f, actor!.id)).toBe("history\n"); // moved under the fence, nothing lost
       expect(fs.existsSync(mainPublicationFencePath(f.config.meshRoot, f.config.rootId))).toBe(false);
       expect(fenced(f)).toBe(false);
       expect(await main.publish()).toMatchObject({ ok: true });
@@ -149,7 +159,9 @@ describe.skipIf(!hostedOnly("live actor removal across processes") || process.pl
       expect(fs.existsSync(actor!.dir)).toBe(false);
       const calls = await resident.report();
       expect(calls).toContainEqual({ kind: "remove", id: actor!.id, options: expect.not.objectContaining({ operator: true }) });
-      expect(treeCalls(calls, actor!.dir)).toEqual([{ kind: "rm", path: path.resolve(actor!.dir), fenced: true }]);
+      expect(treeCalls(calls, actor!.dir)).toEqual([{ kind: "archive", path: path.resolve(actor!.dir), fenced: true }]);
+      expect(treeDeletes(calls, actor!.dir)).toEqual([]);
+      expect(archivedHistory(f, actor!.id)).toBe("history\n");
       expect(fenced(f)).toBe(false);
       expect(await main.publish()).toMatchObject({ ok: true });
     } finally { await h.close(); await f.close(); }

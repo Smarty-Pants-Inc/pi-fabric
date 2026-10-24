@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore } from "../src/mesh/store.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import * as verifiedRemoval from "../src/storage/verified-remove.js";
+import * as treeArchive from "../src/storage/tree-archive.js";
+import { fleetSessionArchive } from "../src/storage/session-archive.js";
 import { readResidentOperatorEvidence, ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import { actorTreeDeletionHooks, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
@@ -15,13 +17,17 @@ import { fixture, type DeadRootFixture } from "./helpers/dead-root-fixture.js";
 // kernel Main publication fence, the state transaction and the root participant key lock) uses the SAME Main-identity
 // verdict as the offline removal (rootParticipantVerdict). Age alone never proves a Main dead; neither does a stale
 // state row while a lease FILE is fresh (smarty-dev#7403 c6146802665). Real ResidentHost, real CLI request files, real
-// flock fence; only the actor-tree removal itself is recorded and never performed (#4664).
+// flock fence; no actor tree is ever deleted (#4664). Since smarty-dev#16444 (R-keep-all-traces) the tree step is one
+// archive rename of the whole judged tree (moveActorTreeToArchive): recorded as the "archive" event with the fence
+// state and the judged identity, and performed (it deletes nothing). A delete (verifiedRemove or a raw rm) of the tree
+// is recorded and never performed; it would fail the exact event expectations.
 type Call = { at: string; fenced: boolean; path?: string };
 const GUIDANCE = "stop the Main, or let a host start finish it";
 const STALE = () => Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS;
 const GONE = { pid: 2147483647, host: os.hostname(), startTime: "1" };
-const TREE_AT = process.platform === "linux" ? "verifiedRemove" : "rm";
+const TREE_AT = "archive"; // the same archive rename on every platform (smarty-dev#16444)
 const realVerifiedRemove = verifiedRemoval.verifiedRemove;
+const realArchive = treeArchive.moveActorTreeToArchive;
 
 afterEach(() => {
   delete actorTreeDeletionHooks.beforeCheck;
@@ -44,19 +50,24 @@ const record = (f: DeadRootFixture, dir: string, calls: Call[], beforeCheck?: ()
   vi.spyOn(fs.promises, "rm").mockImplementation(async (file, options) => {
     if (inTree(file)) calls.push({ at: "rm", path: path.resolve(String(file)), fenced: fenced() }); else await rm(file, options);
   });
-  // Keep the real judgment/walk while recording the boundary without deleting; exact event assertions below
-  // expose fence/identity violations even though cleanup catches exceptions.
+  // A delete of the tree is recorded and never performed (no product path calls it now; it would fail the events).
   vi.spyOn(verifiedRemoval, "verifiedRemove").mockImplementation((target, judged, options) => {
-    if (process.platform !== "linux" || !inTree(target)) return realVerifiedRemove(target, judged, options);
-    const file = path.resolve(target);
-    calls.push({ at: "verifiedRemove", path: file, fenced: fenced() });
-    const now = fs.lstatSync(file, { throwIfNoEntry: false });
-    if (!judged || !now || now.dev !== judged.dev || now.ino !== judged.ino) {
+    if (!inTree(target)) return realVerifiedRemove(target, judged, options);
+    calls.push({ at: "verifiedRemove", path: path.resolve(target), fenced: fenced() });
+    return { removed: true, bytes: 0 };
+  });
+  // The tree step: the real archive rename, recorded with the fence state; exact event assertions below expose
+  // fence/identity violations even though cleanup catches exceptions.
+  vi.spyOn(treeArchive, "moveActorTreeToArchive").mockImplementation((source, pin, archive, chain, name, route) => {
+    const file = path.resolve(route ?? source);
+    if (!inTree(file)) return realArchive(source, pin, archive, chain, name, route);
+    calls.push({ at: "archive", path: file, fenced: fenced() });
+    const now = fs.lstatSync(source, { throwIfNoEntry: false });
+    if (!now || now.dev !== pin.dev || now.ino !== pin.ino) {
       calls.push({ at: "violation: judged inode is not the current tree", path: file, fenced: fenced() });
     }
-    const result = realVerifiedRemove(target, judged, { ...options, dryRun: true });
-    if (!result.removed) calls.push({ at: `refused: ${result.reason}`, path: file, fenced: fenced() });
-    return result;
+    try { return realArchive(source, pin, archive, chain, name, route); }
+    catch (error) { calls.push({ at: `refused: ${(error as Error).message}`, path: file, fenced: fenced() }); throw error; }
   });
   actorTreeDeletionHooks.beforeCheck = async () => { calls.push({ at: "beforeCheck", fenced: fenced() }); beforeCheck?.(); };
   actorTreeDeletionHooks.beforeDelete = async () => { calls.push({ at: "beforeDelete", fenced: fenced() }); };
@@ -73,7 +84,12 @@ const operatorRemove = async (f: DeadRootFixture, seed: () => void, underFence?:
   const cli = await f.cli(actor.id, ["--confirm-dead-root", f.config.rootId]);
   await f.host.actors.removalSettled(actor.id)?.catch(() => undefined);
   const removal = cli.out + cli.err;
-  expect(fs.readFileSync(path.join(dir, "session.jsonl"), "utf8")).toBe("history\n"); // recorded, never performed
+  // smarty-dev#16444 (R-keep-all-traces): a removal that reaches the tree step renames the WHOLE tree into the fleet
+  // archive (never a delete); a refused one keeps it in place. Either way its bytes are intact.
+  const deleted = !fs.existsSync(dir);
+  const archive = fleetSessionArchive(f.config.meshRoot, f.config.rootId, actor.id);
+  expect(fs.readFileSync(path.join(deleted ? archive : dir, "session.jsonl"), "utf8")).toBe("history\n");
+  expect(fs.existsSync(path.join(dir, "session.jsonl"))).toBe(!deleted);
   expect(mainPublicationFenced(f.config.meshRoot, f.config.rootId)).toBe(false);
   return { calls, removal, dir, cli };
 };

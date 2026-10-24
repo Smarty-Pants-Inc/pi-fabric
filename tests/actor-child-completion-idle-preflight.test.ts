@@ -10,6 +10,7 @@ import { ActorManager } from "../src/actors/manager.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { fleetSessionArchive } from "../src/storage/session-archive.js";
 import * as verifiedRemoval from "../src/storage/verified-remove.js";
 import { mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import type { AgentRunResult } from "../src/agents/types.js";
@@ -189,28 +190,49 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
     }
     return remove(target, options);
   });
-  // Check the verifier boundary on every fence platform: known actor, held fence and current judged inode. Linux records
-  // here and runs the real verifier's production dry run; elsewhere the real verifier runs the manager's rmSync
-  // fallback, which the recorder above records without deleting. The manager catches failures, so record violations
-  // separately instead of allowing an assertion to disappear into pending cleanup.
-  const realVerifiedRemove = verifiedRemoval.verifiedRemove;
+  // smarty-dev#16444 (R-keep-all-traces): an actor tree is archived, never deleted: ONE rename of the whole directory
+  // into its root's fleet archive, on every fence platform (on Linux through the held parent, /proc/self/fd/<fd>/./<id>).
+  // The rename deletes nothing, so it is performed. Check that boundary: known actor, held fence, the tree created for
+  // the actor (same inode), a destination in its root's fleet archive, and a rename that succeeds. The manager catches
+  // failures, so record violations separately instead of allowing an assertion to disappear into pending cleanup.
   const rootIds = new Map<string, string | undefined>();
+  const trees = new Map<string, fs.Stats>();
   const violations: string[] = [];
+  const archives: string[] = [];
+  const rename = fs.renameSync.bind(fs);
+  const treeArchive = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+    let file = path.resolve(String(source));
+    try { file = path.join(fs.realpathSync(path.dirname(String(source))), path.basename(String(source))); }
+    catch { /* as given */ }
+    let realActorRoot = actorRoot;
+    try { realActorRoot = fs.realpathSync(actorRoot); } catch { /* not created yet */ }
+    const id = path.basename(file);
+    if (path.dirname(file) !== realActorRoot || !/^[a-f0-9]{32}$/.test(id)) return rename(source, destination);
+    const tree = path.join(actorRoot, id);
+    archives.push(tree);
+    const rootId = rootIds.get(id);
+    if (!rootId) violations.push(`${tree}: unknown actor`);
+    else {
+      if (!mainPublicationFenced(mesh.root, rootId)) violations.push(`${tree}: not under the Main publication fence`);
+      if (path.dirname(path.resolve(String(destination))) !== path.resolve(fleetSessionArchive(mesh.root, rootId))) {
+        violations.push(`${tree}: not archived into its root's fleet archive (${String(destination)})`);
+      }
+    }
+    const created = trees.get(id);
+    const now = fs.lstatSync(source, { throwIfNoEntry: false });
+    if (!created || !now || now.dev !== created.dev || now.ino !== created.ino) violations.push(`${tree}: not the tree created for the actor`);
+    try { return rename(source, destination); }
+    catch (error) { violations.push(`${tree}: archive rename failed (${String(error)})`); throw error; }
+  });
+  // No actor tree is ever deleted through the verifier either; a call is a violation and deletes nothing.
+  const realVerifiedRemove = verifiedRemoval.verifiedRemove;
   const treeRemoval = vi.spyOn(verifiedRemoval, "verifiedRemove").mockImplementation((target, judged, options) => {
     const file = path.resolve(target);
     if (path.dirname(file) !== actorRoot || !/^[a-f0-9]{32}$/.test(path.basename(file))) {
       return realVerifiedRemove(target, judged, options);
     }
-    const linux = process.platform === "linux";
-    if (linux) removals.push(file);
-    const rootId = rootIds.get(path.basename(file));
-    if (!rootId) violations.push(`${file}: unknown actor`);
-    else if (!mainPublicationFenced(mesh.root, rootId)) violations.push(`${file}: not under the Main publication fence`);
-    const now = fs.lstatSync(file, { throwIfNoEntry: false });
-    if (!judged || !now || now.dev !== judged.dev || now.ino !== judged.ino) violations.push(`${file}: judged inode is not the current tree`);
-    const result = realVerifiedRemove(target, judged, linux ? { ...options, dryRun: true } : options);
-    if (!result.removed) violations.push(`${file}: refused (${result.reason})`);
-    return result;
+    violations.push(`${file}: deleted through verifiedRemove (an actor tree is archived, never deleted)`);
+    throw new Error(`${file}: an actor tree is archived, never deleted (smarty-dev#16444)`);
   });
   const owner = new ActorManager("watch-lifecycle", { id: "session:watch-lifecycle", name: "owner", kind: "main" },
     mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 600_000 }, agents, vi.fn(), {
@@ -222,6 +244,7 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
     rootIds.set(actor.id, actor.rootId);
     // A real monitor pass, not a direct store/watch call; its preflight arms the watch.
     await vi.waitFor(() => expect(live.size).toBe(1), { timeout: 5000, interval: 10 });
+    trees.set(actor.id, fs.lstatSync(path.join(actorRoot, actor.id))); // the armed watch's tree: the one to archive
     return actor;
   };
   try {
@@ -248,18 +271,22 @@ it("releases completion watches on stop, transfer and 200 recorded actor removal
     owner.listOwned();
     await vi.waitFor(() => expect(live.size).toBe(0), { timeout: 5000, interval: 10 });
     expect(armed).toBeGreaterThanOrEqual(202);
-    // Only unsupported platforms keep trees/cleanup markers (smarty-dev#8090, smarty-dev#11335).
-    expect(removals.filter(file => /^[a-f0-9]{32}$/.test(path.basename(file))))
-      .toHaveLength(portableFence ? 200 : 0);
+    // Only unsupported platforms keep trees/cleanup markers (smarty-dev#8090, smarty-dev#11335). Every other removal
+    // archived its tree exactly once, and no tree was ever deleted (smarty-dev#16444).
+    expect(removals.filter(file => /^[a-f0-9]{32}$/.test(path.basename(file)))).toEqual([]);
     expect(violations).toEqual([]);
+    expect(archives).toHaveLength(portableFence ? 200 : 0);
+    expect(new Set(archives).size).toBe(archives.length);
+    for (const tree of archives) expect(fs.existsSync(tree)).toBe(false);
     expect(treeRemoval.mock.calls.filter(([target]) => path.dirname(path.resolve(target)) === actorRoot &&
-      /^[a-f0-9]{32}$/.test(path.basename(target)))).toHaveLength(portableFence ? 200 : 0);
+      /^[a-f0-9]{32}$/.test(path.basename(target)))).toEqual([]);
     expect(owner.status(stopped.id).status).toBe("stopped"); // not manager shutdown
   } finally {
     await owner.close();
     await agents.close();
     watch.mockRestore();
     recorder.mockRestore();
+    treeArchive.mockRestore();
     treeRemoval.mockRestore();
     fs.rmSync(root, { recursive: true, force: true }); // own test fixture cleanup
   }

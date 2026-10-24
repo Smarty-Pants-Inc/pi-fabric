@@ -90,8 +90,8 @@ the separate ID explicitly.
 Exports include `PiDurableRunner`, `PiDurableRunnerOptions`,
 `PiDurableStorageOptions`, `PiDurableStorageLease`, `PiDurableLocator`, and
 `PiDurableMessageOptions`. Import/construction stays lazy and does not register a
-runner. First use checks pinned `@earendil-works/pi-durable@1.1.0` and
-`@earendil-works/chord@1.1.0`. Credentials remain in Models/environment, never in
+runner. First use checks pinned `@earendil-works/pi-durable@1.2.0` and
+`@earendil-works/chord@1.2.0`. Credentials remain in Models/environment, never in
 a locator.
 
 ### Leaf host setup

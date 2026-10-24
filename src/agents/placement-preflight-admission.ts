@@ -8,7 +8,7 @@ export type PlacementDiagnostic = (kind: string, id: string, missingFields?: str
 /** Optional admission orchestration stays outside the eager AgentManager startup graph. */
 export async function runPlacementPreflight(
   config: FabricPlacementDeciderConfig,
-  request: AgentRunRequest,
+  request: Pick<AgentRunRequest, "actorId" | "capabilityRequirements" | "placement">,
   runner: FabricAgentRunner,
   model: string | undefined,
   thinking: FabricThinking | undefined,

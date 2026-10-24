@@ -1610,8 +1610,10 @@ batching suspends replacement-style `coalesce` and `coalesceKey`, so all matched
 observations are retained. An explicitly configured `activation.minIntervalMs`
 still performs its separate settlement admission before the queue.
 
-Direct asks/messages, mesh `steer` or `ask` kinds, Main-origin mesh messages,
-and host `input`/`user_bash` bypass the window. Pending observations run first
+Direct asks/messages, mesh `steer` or `ask` kinds, Main-origin mesh messages addressed
+to this actor, and host `input`/`user_bash` bypass the window. Main-origin topic
+broadcasts remain eligible for batching. A batch does not cross sender identities or
+output principals. Pending observations run first
 (in groups bounded by `batchMax` and `batchMaxBytes`); the urgent item then runs
 separately without a window. An unlaunched preparation retry keeps its older
 batch ahead of an already pending bypass; ordinary retries retain queue rotation. This keeps FIFO order and the caller's binding and attribution. Main

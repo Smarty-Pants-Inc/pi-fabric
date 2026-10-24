@@ -208,13 +208,16 @@ describe("placement CLI admission", () => {
     await rejects(cli(root(), { reply: place(), invalidUtf8: true }).decide(request()));
   });
   it("bounds stdout at 1 MiB while separately draining stderr diagnostics", async () => {
-    await rejects(cli(root(), { stdout: " ".repeat(PLACEMENT_MAX_BYTES + 1) }).decide(request()));
+    // Windows has no POSIX process-group wait, so a killed helper's teardown is reported unconfirmed (still a refusal).
+    await rejects(cli(root(), { stdout: " ".repeat(PLACEMENT_MAX_BYTES + 1) }).decide(request()),
+      process.platform === "win32" ? "helper-teardown-unconfirmed" : "invalid-response");
     const p = place();
     expect(await cli(root(), { reply: p, stderr: "x".repeat(128 * 1024) }).decide(request())).toEqual(p);
   });
   it("uses one fixed total two-second deadline even after partial stdout", async () => {
     const start = performance.now();
-    await rejects(cli(root(), { reply: place(), delay: 10_000, split: true }).decide(request()), "timeout");
+    await rejects(cli(root(), { reply: place(), delay: 10_000, split: true }).decide(request()),
+      process.platform === "win32" ? "helper-teardown-unconfirmed" : "timeout");
     expect(performance.now() - start).toBeLessThan(3_000);
   }, 5_000);
   it.skipIf(process.platform === "win32")("waits for the whole POSIX process group before resolving timeout refusal", async () => {

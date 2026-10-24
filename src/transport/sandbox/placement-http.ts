@@ -20,6 +20,16 @@ export class SandboxPlacementHttpError extends Error {
   }
 }
 
+/** Refuse rather than downgrade a move: an old broker cannot honor its import pin. */
+export class SandboxSessionImportUnsupportedError extends Error {
+  readonly code = "PLACEMENT_SESSION_IMPORT_UNSUPPORTED";
+  readonly status = 400;
+  constructor(readonly cause: SandboxPlacementHttpError) {
+    super("Placement refused branch/sessionImport fields; session import may not be supported by this broker");
+    this.name = "SandboxSessionImportUnsupportedError";
+  }
+}
+
 const operationSignal = (signal: AbortSignal | undefined, timeoutMs: number): AbortSignal =>
   signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs);
 
@@ -42,6 +52,16 @@ export class SandboxPlacementHttp implements SandboxPlacement {
   }
 
   async requestSpawn(intent: SandboxSpawnIntent, signal?: AbortSignal): Promise<SandboxSpawnResult> {
+    // Bypass even a cached profile fallback. Never strip move fields or its required profile.
+    if (intent.branch !== undefined || intent.sessionImport !== undefined) {
+      try { return await this.#post(intent, signal); }
+      catch (error) {
+        if (error instanceof SandboxPlacementHttpError && error.status === 400 && error.code === "INTENT_INVALID") {
+          throw new SandboxSessionImportUnsupportedError(error);
+        }
+        throw error;
+      }
+    }
     if (!this.#profileRejectedRuns.has(intent.runId)) {
       try { return await this.#post(intent, signal); }
       catch (error) {

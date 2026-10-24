@@ -86,6 +86,7 @@ import { scriptSpawnArgs } from "./transports/process-utils.js";
 import { ScreenTransport } from "./transports/screen-transport.js";
 import { TmuxTransport } from "./transports/tmux-transport.js";
 import type { SandboxTransportDependencies } from "../transport/sandbox/types.js";
+import type { FabricParticipantSource } from "../topology/types.js";
 import { resolveAgentSpawner } from "./spawner.js";
 import { senderAgent, senderHeaderValue } from "../guards/sender-headers.js";
 import { PlacementAdmissionError, makePlacementIntent, awaitPlacementAdmission, placementBindingMatches } from "../placement/spawn.js";
@@ -425,6 +426,43 @@ export function validAgentExceptionLane(value: unknown): value is AgentException
     !lane.includes("/") && !lane.includes("\\") && !lane.includes("\0");
 }
 
+/** #16357: an admitted lane, the root it belongs to, and where it came from (audit lane_source). */
+export interface AgentAdmittedExceptionLane extends AgentExceptionLane {
+  /** `root`: the bound root's fresh record; `persisted`: the actor's stored copy, while that root's record was not fresh. */
+  source: "root" | "persisted";
+}
+
+/**
+ * #16357: the longest the bound ROOT may go unseen while an actor's stored lane still stands in for
+ * its record. Beyond it (or once the root is proven ended) an exception admission that would otherwise
+ * pass refuses terminally with `root-ended`; an explicit actor reset is the way back.
+ */
+export const EXCEPTION_LANE_FALLBACK_MAX_AGE_MS = 30 * 60_000;
+
+/**
+ * #16357: the bound ROOT record's last-seen age from the host's participant directory, for the
+ * stored-lane fallback only. 0: a live record. A finite age: the record is present and its owner
+ * host's lease lapsed that long ago. Infinity: positive proof the root ended (a clean lineage close).
+ * undefined: unknown (no record visible without proof of closure, a write-stalled directory, a
+ * directory that reports no lapse age, or a lookup error); unknown never stands in and never parks.
+ */
+export function rootRecordLastSeenMs(
+  participants: Pick<FabricParticipantSource, "get"> & Partial<Pick<FabricParticipantSource, "lastKnown" | "lineageAlive" | "writeStalled">>,
+  rootId: string,
+  now = Date.now(),
+): number | undefined {
+  const live = participants.get(rootId, now, { fresh: true });
+  if (live?.kind === "root" && live.id === rootId) return 0;
+  // A clean, root-owned lineage close proves the end whatever a mirror or stale record still says.
+  if (participants.lineageAlive?.(rootId, now) === false) return Number.POSITIVE_INFINITY;
+  // A stalled mesh writer stops every lease renewing: a lapse then proves nothing about the root.
+  if (participants.writeStalled?.(now)) return undefined;
+  const known = participants.lastKnown?.(rootId, now);
+  if (!known || known.participant.kind !== "root" || known.participant.id !== rootId) return undefined;
+  // Infinity here means "owner host gone or replaced" (and NATS reports no age at all): not measurable.
+  return Number.isFinite(known.lapsedMs) && known.lapsedMs >= 0 ? known.lapsedMs : undefined;
+}
+
 /** An error's class for a lane-unresolved denial: never its message, paths or secrets (#16331). */
 const laneLookupErrorClass = (error: unknown): string => {
   const name = error instanceof Error ? error.name : typeof error;
@@ -441,6 +479,8 @@ export interface AgentModelAdmission {
   approvedRef?: string | undefined;
   /** Immutable complete grant approved for this launch, never reread for audit. */
   approvedGrant?: Readonly<ModelExceptionEntry> | undefined;
+  /** #16357: the lane that admitted approvedGrant and its source (audit lane_source, actor backfill). */
+  approvedLane?: Readonly<AgentAdmittedExceptionLane> | undefined;
 }
 
 export const effectiveAgentTimeoutMs = (
@@ -1460,6 +1500,9 @@ export class AgentManager {
   readonly #resolveInheritedSessionPins: (() => InheritedSessionPin[] | undefined) | undefined;
   readonly #thinkingBounds: (() => FabricThinkingBounds) | undefined;
   readonly #rootSessionCwd: (() => string | undefined) | undefined;
+  readonly #rootSessionLastSeenMs: (() => number | undefined) | undefined;
+  /** #16357: the lane (and its source) behind each grant this manager admitted, keyed by the frozen grant. */
+  readonly #admittedLanes = new WeakMap<object, Readonly<AgentAdmittedExceptionLane>>();
   readonly #sessionId: (() => string | undefined) | undefined;
   readonly #executorRuntime: (() => string | undefined) | undefined;
   readonly #shortTmpdirSource: () => ShortTmpdirSource;
@@ -1595,6 +1638,11 @@ export class AgentManager {
       thinkingBounds?: () => FabricThinkingBounds;
       /** Trusted bound ROOT participant cwd only; no child/request/environment fallback. */
       rootSessionCwd?: () => string | undefined;
+      /**
+       * #16357: the bound ROOT record's last-seen age in ms (see rootRecordLastSeenMs), consulted only
+       * when rootSessionCwd found no fresh record. Absent or undefined: unknown, so no stored lane stands in.
+       */
+      rootSessionLastSeenMs?: () => number | undefined;
       /** Caller Pi session id recorded as lineage parentSessionId. */
       sessionId?: () => string | undefined;
       /** Caller TypeScript executor runtime; native runtimes escape write confinement. */
@@ -1644,6 +1692,7 @@ export class AgentManager {
     this.#resolveInheritedSessionPins = options.resolveInheritedSessionPins;
     this.#thinkingBounds = options.thinkingBounds;
     this.#rootSessionCwd = options.rootSessionCwd;
+    this.#rootSessionLastSeenMs = options.rootSessionLastSeenMs;
     this.#sessionId = options.sessionId;
     this.#executorRuntime = options.executorRuntime;
     this.#shortTmpdirSource = options.shortTmpdirSource ??
@@ -1846,16 +1895,26 @@ export class AgentManager {
   /**
    * The bound ROOT lane, read fresh. Undefined only when no root binding exists at all
    * (unchanged lane-mismatch); a missing/stale record or a failed lookup is `unresolved`.
+   * #16357: `record` says what the read proved about the root's record: `fresh` (present and
+   * fresh, but its cwd is unusable), `not-fresh` (no fresh record) or `unknown` (lookup failed).
    */
-  #rootLane(): { lane: string } | { unresolved: string } | undefined {
+  #rootLane(): { lane: string } | { unresolved: string; record: "fresh" | "not-fresh" | "unknown" } | undefined {
     if (!this.#rootSessionCwd) return undefined;
     let cwd: string | undefined;
     try { cwd = this.#rootSessionCwd(); }
-    catch (error) { return { unresolved: `root session lookup failed (${laneLookupErrorClass(error)})` }; }
-    if (typeof cwd !== "string") return { unresolved: "root session record is missing or not fresh" };
-    if (!path.isAbsolute(cwd)) return { unresolved: "root session cwd is not absolute" };
+    catch (error) { return { unresolved: `root session lookup failed (${laneLookupErrorClass(error)})`, record: "unknown" }; }
+    if (typeof cwd !== "string") return { unresolved: "root session record is missing or not fresh", record: "not-fresh" };
+    if (!path.isAbsolute(cwd)) return { unresolved: "root session cwd is not absolute", record: "fresh" };
     const lane = path.basename(cwd);
-    return lane && lane !== "." && lane !== ".." ? { lane } : { unresolved: "root session cwd names no lane" };
+    return lane && lane !== "." && lane !== ".." ? { lane } : { unresolved: "root session cwd names no lane", record: "fresh" };
+  }
+
+  /** #16357: the host's last-seen age of the bound root's record; undefined when unknown or unreadable. */
+  #rootLastSeenMs(): number | undefined {
+    let age: unknown;
+    try { age = this.#rootSessionLastSeenMs?.(); }
+    catch { return undefined; }
+    return typeof age === "number" && !Number.isNaN(age) && age >= 0 ? age : undefined;
   }
 
   /**
@@ -1874,13 +1933,23 @@ export class AgentManager {
    * The fresh root lane always wins, so every resolvable case is unchanged. Only when the bound
    * root's record is unavailable may the lane persisted at creation stand in, and only when it was
    * captured from this same root: never a wider value. Otherwise the denial is lane-unresolved.
+   * #16357: the stored lane stands in only while the root's record is present and was last seen
+   * within EXCEPTION_LANE_FALLBACK_MAX_AGE_MS. A root proven ended, or unseen for longer, is
+   * `root-ended` (terminal) whether or not a lane was stored; an unknown age (a lookup error, no
+   * record without proof of closure) stays lane-unresolved and never uses the stored lane.
    */
-  #exceptionLane(persisted?: AgentExceptionLane): { lane?: string; unresolved?: string } {
+  #exceptionLane(persisted?: AgentExceptionLane): { lane?: string; source?: "root" | "persisted"; unresolved?: string; rootEnded?: string } {
     const root = this.#rootLane();
     if (!root) return {};
-    if ("lane" in root) return { lane: root.lane };
-    if (validAgentExceptionLane(persisted) && this.#mainAgentId && persisted.rootId === this.#mainAgentId) {
-      return { lane: persisted.lane };
+    if ("lane" in root) return { lane: root.lane, source: "root" };
+    const age = root.record === "fresh" ? 0 : root.record === "not-fresh" ? this.#rootLastSeenMs() : undefined;
+    if (age !== undefined && age > EXCEPTION_LANE_FALLBACK_MAX_AGE_MS) {
+      return { unresolved: root.unresolved, rootEnded: Number.isFinite(age)
+        ? `root session last seen ${Math.floor(age / 60_000)} min ago (limit ${EXCEPTION_LANE_FALLBACK_MAX_AGE_MS / 60_000} min)`
+        : "root session has ended" };
+    }
+    if (age !== undefined && validAgentExceptionLane(persisted) && this.#mainAgentId && persisted.rootId === this.#mainAgentId) {
+      return { lane: persisted.lane, source: "persisted" };
     }
     return { unresolved: root.unresolved };
   }
@@ -1892,12 +1961,23 @@ export class AgentManager {
    */
   admitModelException(model: string | undefined, modelReason: unknown, runner: FabricAgentRunner = this.config.runner, role = "task", thinking?: FabricThinking, persistedLane?: AgentExceptionLane): Readonly<ModelExceptionEntry> {
     const lane = this.#exceptionLane(persistedLane);
-    return admitModelException({
+    const entry = admitModelException({
       path: this.config.modelExceptionsPath, reason: modelReason,
       model: this.#exceptionModel(model, runner), role, lane: lane.lane,
       ...(lane.unresolved ? { laneUnresolved: lane.unresolved } : {}),
+      ...(lane.rootEnded ? { rootEnded: lane.rootEnded } : {}),
       host: os.hostname().split(".")[0]!, thinking: thinking ?? this.#effectiveThinking(),
     }).entry;
+    // #16357: remember which lane admitted this (fresh, frozen) grant for its audit row and backfill.
+    if (lane.lane && lane.source) {
+      this.#admittedLanes.set(entry, Object.freeze({ rootId: this.#mainAgentId ?? "", lane: lane.lane, source: lane.source }));
+    }
+    return entry;
+  }
+
+  /** #16357: the lane and its source behind a grant this manager admitted (undefined for any other value). */
+  admittedExceptionLane(grant: unknown): Readonly<AgentAdmittedExceptionLane> | undefined {
+    return grant && typeof grant === "object" ? this.#admittedLanes.get(grant) : undefined;
   }
 
   /** Compatibility API. Call with the RESOLVED selector and actual effective effort. */
@@ -1955,13 +2035,15 @@ export class AgentManager {
       const approvedGrant = persistedLane
         ? this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking, persistedLane)
         : this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking);
-      return { model, thinking, fallback: false, approvedRef: approvedGrant?.issue, approvedGrant };
+      const approvedLane = this.admittedExceptionLane(approvedGrant);
+      return { model, thinking, fallback: false, approvedRef: approvedGrant?.issue, approvedGrant, ...(approvedLane ? { approvedLane } : {}) };
     }
     if (this.#validModelReason(modelReason)) {
       const approvedGrant = persistedLane
         ? this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking, persistedLane)
         : this.assertExplicitModelReason(model, modelReason, runner, undefined, role, thinking);
-      return { model, thinking, fallback: false, approvedRef: approvedGrant?.issue, approvedGrant };
+      const approvedLane = this.admittedExceptionLane(approvedGrant);
+      return { model, thinking, fallback: false, approvedRef: approvedGrant?.issue, approvedGrant, ...(approvedLane ? { approvedLane } : {}) };
     }
     // A supplied but malformed Claude exception refuses, never silently switches.
     if (isClaudeModel(model, runner, this.config.veda.backend) && typeof modelReason === "string" && modelReason.trim()) {
@@ -2704,7 +2786,8 @@ export class AgentManager {
         warning = appendOpusPolicyLog({ role, model: request.modelPolicyOriginalModel, ref: null, reason: "inherited-switch" });
       } else if (isClaudeModel(model, runner, this.config.veda.backend) && this.#validModelReason(request.modelReason)) {
         if (admittedGrant) warning = appendOpusPolicyLog({ role, model: admittedGrant.model, ref: admittedRef ?? admittedGrant.issue,
-          reason: request.modelReason, grant: admittedGrant, thinking: admittedThinking, runId: id });
+          reason: request.modelReason, grant: admittedGrant, thinking: admittedThinking, runId: id,
+          laneSource: this.admittedExceptionLane(admittedGrant)?.source });
       }
       if (warning) policyWarnings.push(warning);
     };
@@ -6494,7 +6577,7 @@ export class AgentManager {
           this.#validModelReason(managed.modelReason)) {
         const warning = appendOpusPolicyLog({ role: policyRole, model: admission.approvedGrant.model,
           ref: admission.approvedGrant.issue, reason: managed.modelReason, grant: admission.approvedGrant,
-          thinking: admission.thinking, runId: managed.id });
+          thinking: admission.thinking, runId: managed.id, laneSource: this.admittedExceptionLane(admission.approvedGrant)?.source });
         if (warning) (managed.modelPolicyWarnings ??= []).push(warning);
       }
       const transport = await this.#launchTransport(managed.adapter, managed.launch);

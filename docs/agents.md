@@ -432,13 +432,30 @@ backend/provenance matches. Roles are `task`, `actor:<name>`, or `lane`; Fabric
 children are never leads. The lane is the cwd basename of the ROOT session's
 bound participant record, supplied by the host, not an environment variable,
 child cwd, request argument, manager cwd or project root. A host with no root
-binding refuses with `lane-mismatch`; a root record that is missing, not fresh,
-unreadable or not absolute refuses with `lane-unresolved` (with the lookup's
-error class, never its path), and an actor keeps retrying that refusal with its
-bounded preparation backoff. The lane is `basename(root Main cwd)`,
-so a grant for `smarty-pants` does not match a Main in `worktrees/<lane>`; each
-actor captures it once at creation and uses that copy only while its own root's
-record is unavailable. The host is `os.hostname().split('.')[0]`.
+binding refuses with `lane-mismatch`. When the root lane cannot be read, every
+lane-independent grant field is checked first: a grant that is unlisted,
+revoked, expired, over the 72 hour cap, or for another host, role, model or
+thinking keeps its own terminal denial. Only a grant that would admit but for
+the lane refuses with `lane-unresolved` (a root record that is missing, not
+fresh, unreadable, not absolute or names no lane; the detail carries the
+lookup's error class, never its path), and an actor keeps retrying that
+refusal with its bounded preparation backoff. The lane is
+`basename(root Main cwd)`, so a grant for `smarty-pants` does not match a Main
+in `worktrees/<lane>`. Each actor captures it once at creation; an actor with no
+stored lane (created before this, or whose capture failed) stores the lane
+that its first admission reads from a fresh root record. The stored copy stands
+in only while its own root's record is present but not fresh and was last seen
+at most 30 minutes ago (`EXCEPTION_LANE_FALLBACK_MAX_AGE_MS`). A Main's own
+Fabric runtime counts its root as seen now. A root whose lineage was cleanly
+closed, or that was last seen longer ago, refuses with `root-ended`. That
+refusal is terminal, with or without a stored lane: callerless work parks with
+a hard block, and `resetSession` once the root is back is the way out. When the
+host cannot tell the root's age (a lookup error, no record without a close
+receipt, a write-stalled mesh, or a NATS directory that reports no lapse age),
+the stored lane is not used and the refusal stays `lane-unresolved`. Upgrade
+note: an actor that an older Fabric already parked with a hard block over its
+lane needs one `resetSession`; its next fresh admission then stores its lane.
+The host is `os.hostname().split('.')[0]`.
 Omitted thinking resolves to the actual effective host default, not low/off;
 child bounds clamp ordinary launches, while route-pin effort remains exact.
 
@@ -455,9 +472,10 @@ date-time or non-increasing timestamps invalidate the whole file (`malformed`).
 TTL above 72 hours refuses with `expiry-too-long`; exactly 72 hours is valid.
 Set `status: "revoked"` to revoke (`revoked`). Expiration needs no file edit or
 sweep (`expired`). Other mismatch denials are `unlisted`, `lane-mismatch`,
-`host-mismatch`, `role-mismatch`, `model-mismatch` and `thinking-exceeds`, all
-through `FabricModelExceptionDeniedError` (`FABRIC_MODEL_EXCEPTION_DENIED`)
-before a worker is launched.
+`host-mismatch`, `role-mismatch`, `model-mismatch` and `thinking-exceeds`; an
+unreadable root lane gives `lane-unresolved` (retried) or `root-ended`
+(terminal), as above. All come through `FabricModelExceptionDeniedError`
+(`FABRIC_MODEL_EXCEPTION_DENIED`) before a worker is launched.
 
 Bare `#N` means `Smarty-Pants-Inc/smarty-dev#N`; `repo#N`,
 `Smarty-Pants-Inc/repo#N`, and that organization's GitHub issue URLs normalize
@@ -467,8 +485,10 @@ the fleet default remains GPT-6.
 
 Each admitted launch appends once to
 `~/.local/state/smarty/route/opus-exceptions.jsonl`: `grant_id`, `issue`, `lane`,
-short `host`, `role`, canonical `model`, effective `thinking`, `run_id` and
-`time`. Audit uses the immutable approved grant, not another parse/read. Legacy
+short `host`, `role`, canonical `model`, effective `thinking`, `run_id`,
+`time` and `lane_source`: `root` when the lane came from the root's fresh
+record, `persisted` when an actor's stored lane stood in for it. Audit uses the
+immutable approved grant, not another parse/read. Legacy
 `ts`, `ref`, `reason` and `launcher` remain; nonexception inherited-switch rows
 retain their old format. Audit failure is a warning, never an authority source.
 
@@ -1498,7 +1518,8 @@ A failed activation records `activationBlocked` on the actor, and routers (facto
 routing) skip a blocked actor. Its `class` says whether it can recover by itself
 (smarty-dev#6509). A `transient` block comes from a provider stream or network error, a 5xx or
 429, a timeout, a preparation or lock timeout (code `preparation-timeout`), or a model-exception
-root lane that could not be read (code `lane-unresolved`, smarty-dev#16357). It records
+root lane that could not be read (code `lane-unresolved`, smarty-dev#16357; a grant's own denial
+or a `root-ended` refusal is hard). It records
 `blockedAt` and `backoffMs`, and expires at `retryAt`: after `actors.transientBlockCooldownMs`
 (default 10 minutes). After expiry, the actor info and the published actor record show
 `activationBlockExpired` instead, so routers admit the actor again. Its next activation, queued

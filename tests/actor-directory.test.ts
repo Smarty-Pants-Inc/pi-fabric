@@ -147,7 +147,8 @@ describe("ActorDirectory", () => {
     directory.tell(actor.id, "go");
     await vi.waitFor(() => expect(directory.status(actor.id).inFlightRun?.id).toBe(runId));
     let removed = false;
-    const waiting = directory.remove(actor.id).then(() => { removed = true; });
+    // pi-fabric#1572 round 5: the tell in flight is live work; dropQueued archives it instead of refusing the removal.
+    const waiting = directory.remove(actor.id, { dropQueued: true }).then(() => { removed = true; });
     await vi.waitFor(() => expect(directory.status(actor.id).status).toBe("stopped"));
     const creating = directory.create({ name: "replacement", instructions: "Successor." });
     try {
@@ -188,7 +189,7 @@ describe("ActorDirectory", () => {
     const fail = failActorTreeRemoval(dir, () => { failures++; throw new Error("persistent cleanup failure"); });
     if (UNSUPPORTED_PLATFORM) { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "kept-11335.txt"), "history\n"); }
     try {
-      await directory.remove(actor.id, { wait: false });
+      await directory.remove(actor.id, { wait: false, dropQueued: true }); // pi-fabric#1572 round 5: archives the tell in flight
       release();
       await directory.removalSettled(actor.id);
       if (UNSUPPORTED_PLATFORM) expect(failures).toBe(0); // refused before the tree delete: the rm is never reached

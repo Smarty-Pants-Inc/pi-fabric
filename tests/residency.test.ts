@@ -2458,7 +2458,8 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         .toMatchObject({ status: "running", turns: 3, toolCalls: 1 });
 
       const started = Date.now();
-      const removed = await client.removeActor(actor.id);
+      // pi-fabric#1572 round 5: the followUp in flight is callerless live work; a plain removal refuses it, dropQueued archives it.
+      const removed = await client.removeActor(actor.id, undefined, { dropQueued: true });
       expect(Date.now() - started).toBeLessThan(2_000);
       expect(removed.pending).toContain(`pending behind its in-flight run ${runId}`);
       expect(client.hostStateNote()).toContain(`removal of hung reviewer (${actor.id}) is pending behind its in-flight run ${runId}`);

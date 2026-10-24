@@ -874,3 +874,118 @@ describe("queued-work guard, round 4: explicit stop of a busy actor (pi-fabric#1
 });
 const archiveLinesOf = (archive: string) => fs.readFileSync(archive, "utf8").split("\n").filter(Boolean)
   .map(line => JSON.parse(line) as { kind: string; item?: { source?: string; payload?: unknown } });
+
+// pi-fabric#1572 round 5 (fabric-store N4): a plain remove of a LIVE actor never drops its queue or its callerless item in
+// flight. It is refused before any effect; with dropQueued all of it is archived first and travels with the removed tree.
+describe("queued-work guard, round 5: remove of a live actor (pi-fabric#1572)", () => {
+  const providerFor = (fixture: ReturnType<typeof setup>) => {
+    const participants = { scheduleRefresh() {}, list: () => [], get: () => undefined } as unknown as FabricParticipantSource;
+    const main = { id: identity.id, local: true, matches: (id: string) => id === identity.id } as FabricMainAgentTarget;
+    const lifecycle = new LifecycleBroker(fixture.mesh, identity, participants, { enabled: false, pollMs: 20, maxReadEvents: 100 }, async () => {});
+    const provider = new AgentsProvider(fixture.agents, fixture.actors, new GlobalActorRegistry(fixture.root, 64 * 1024), main, participants, undefined, lifecycle);
+    const context: FabricInvocationContext = {
+      cwd: process.cwd(), signal: undefined, parentToolCallId: "test-parent", nestedToolCallId: "test-nested",
+      extensionContext: {} as FabricInvocationContext["extensionContext"], activity() {}, update() {},
+    };
+    return { provider, context };
+  };
+  const recoverable = (root: string, actorId: string) => {
+    const base = path.join(root, "mesh", "session-archive");
+    return (fs.existsSync(base) ? fs.readdirSync(base) : []).flatMap(entry => fs.readdirSync(path.join(base, entry))
+      .filter(name => name.startsWith(`${actorId}.recoverable-`)).map(name => path.join(base, entry, name)));
+  };
+
+  it("N4: remove with 2 queued and 1 in flight is refused with nothing changed (API, tool, /fabric remove); dropQueued archives all 3 and a same-name successor restores them", async () => {
+    const fixture = setup(10);
+    const { root, actors, agents } = fixture;
+    const { provider, context } = providerFor(fixture);
+    const old = await actors.create({ name: "live-removed", instructions: "Supervise.", topics: [TOPIC] });
+    const releaseOld = await holdWorker(actors, root, old.id);
+    actors.tell(old.id, "queued-one");
+    actors.tell(old.id, "queued-two");
+    await waitFor(() => actors.status(old.id).queued === 2);
+    const runId = actors.status(old.id).inFlightRun!.id;
+    const queueBefore = fs.readFileSync(queueFile(root, old.id)!);
+    const unchanged = () => {
+      expect(actors.status(old.id)).toMatchObject({ status: "running", queued: 2 });
+      expect(actors.status(old.id).inFlightRun?.id).toBe(runId);
+      expect(agents.status(runId)).toMatchObject({ status: "running" });
+      expect(fs.readFileSync(queueFile(root, old.id)!).equals(queueBefore)).toBe(true);
+      expect(fs.existsSync(path.join(root, "actors", old.id, "stopped-queues"))).toBe(false);
+      expect(actors.messages(old.id).filter(message => message.text?.startsWith("MOVED-TO") || message.error?.startsWith("Dropped a queued event"))).toEqual([]);
+      expect(actors.list().some(actor => actor.id === old.id)).toBe(true);
+    };
+    for (const attempt of [() => actors.remove(old.id), () => actors.remove(old.id, { wait: false, operator: true }),
+      () => provider.invoke("remove", { id: old.id }, context)]) {
+      const refusal = await attempt().then(() => undefined, (error: unknown) => error);
+      expect(refusal).toBeInstanceOf(queuedWorkError() ?? class Missing {});
+      expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "remove", actorId: old.id,
+        counts: { archived: 0, heldDeadLetter: 0, queued: 2, parked: 0, overflow: 0, inFlight: 1, settled: 0 } });
+      expect((refusal as Error).message).toMatch(/queued 2, parked 0, overflow 0, in-flight 1, settled 0\); remove refused and nothing changed.*dropQueued/);
+      unchanged();
+    }
+    // /fabric remove answers the refusal like /fabric stop does.
+    const notices: Array<[string, string]> = [];
+    const deps = { state: { ensure: async () => {}, actors, agents } } as unknown as Parameters<typeof runFabricCommand>[1];
+    const commandContext = { ui: { notify: (text: string, level: string) => { notices.push([text, level]); } } } as unknown as Parameters<typeof runFabricCommand>[3];
+    await runFabricCommand({} as Parameters<typeof runFabricCommand>[0], deps, `remove ${old.id}`, commandContext, async () => undefined,
+      {} as Parameters<typeof runFabricCommand>[5]);
+    expect(notices.at(-1)).toEqual([expect.stringMatching(/remove refused and nothing changed/), "error"]);
+    unchanged();
+    // With dropQueued (the agents tool): all three items are archived before anything is emptied, then kept with the tree.
+    const removing = provider.invoke("remove", { id: old.id, dropQueued: true }, context);
+    releaseOld();
+    await expect(removing).resolves.toMatchObject({ removed: true });
+    await waitFor(() => !fs.existsSync(path.join(root, "actors", old.id)));
+    const [kept] = recoverable(root, old.id);
+    expect(kept).toBeDefined();
+    const archives = fs.readdirSync(path.join(kept!, "stopped-queues")).filter(name => /^\d{8}T\d{9}Z-[0-9a-f]{12}\.jsonl$/.test(name));
+    expect(archives).toHaveLength(1);
+    const moved = path.join(kept!, "stopped-queues", archives[0]!);
+    const lines = archiveLinesOf(moved);
+    expect(lines.map(line => line.kind)).toEqual(["header", "in-flight", "queued", "queued"]);
+    expect(lines.slice(1).map(line => (line.item?.payload as { message?: string } | undefined)?.message))
+      .toEqual(["LIVE_WITH_PROGRESS", "queued-one", "queued-two"]);
+    const records = fs.readFileSync(path.join(kept!, "stopped-queues", "moved-to.jsonl"), "utf8").split("\n").filter(Boolean)
+      .map(line => JSON.parse(line) as { kind: string; sha256: string; counts: Record<string, number> });
+    expect(records).toEqual([expect.objectContaining({ kind: "MOVED-TO", sha256: createHash("sha256").update(fs.readFileSync(moved)).digest("hex"),
+      counts: expect.objectContaining({ queued: 2, inFlight: 1 }) })]);
+    // The same-name successor restores all three, through the path the removal's stop wrote.
+    const fresh = await provider.invoke("create", { name: "live-removed", instructions: "Supervise.", topics: ["queued-work.other"] }, context) as FabricActorInfo;
+    expect(fresh.id).not.toBe(old.id);
+    const releaseFresh = await holdWorker(actors, root, fresh.id);
+    const original = path.join(root, "actors", old.id, "stopped-queues", archives[0]!);
+    const fed = await provider.invoke("requeueArchived", { id: fresh.id, archive: original }, context) as actorTypes.FabricActorRequeueResult;
+    expect(fed).toMatchObject({ id: fresh.id, archive: moved, requeued: 3, filtered: 0, superseded: 0, alreadyRequeued: 0, skipped: [] });
+    expect(actors.status(fresh.id).queued).toBe(3);
+    releaseFresh();
+    // The refusal does not over-reach: only a caller's ask in flight (its caller hears the abort), or an idle actor, is removed as before.
+    const asked = await actors.create({ name: "asked-removed", instructions: "Advise.", responseMode: "text" });
+    const answer = actors.ask(asked.id, "HANG").then(() => "answered", (error: unknown) => error);
+    await waitFor(() => Boolean(actors.status(asked.id).inFlightRun));
+    await expect(actors.remove(asked.id)).resolves.toMatchObject({ removed: true });
+    expect(await answer).toBeInstanceOf(Error);
+    const idle = await actors.create({ name: "idle-removed", instructions: "Wait.", topics: [TOPIC] });
+    await expect(actors.remove(idle.id)).resolves.toMatchObject({ removed: true });
+  }, 120_000);
+
+  it("N7: the live requeue check reads the stop record in full, not only the bounded in-memory message history", async () => {
+    const { root, actors } = setup(10);
+    const old = await actors.create({ name: "chatty-supervisor", instructions: "Supervise.", topics: [TOPIC] });
+    const release = await holdWorker(actors, root, old.id);
+    const { archive } = stopArchive(await actors.stop(old.id, undefined, false, "actors.stop", { explicit: true }));
+    release();
+    await waitFor(() => !actors.status(old.id).inFlightRun);
+    // The in-memory history no longer holds the MOVED-TO message (cleared here; ACTOR_MESSAGE_HISTORY_LIMIT newer messages do the same).
+    await actors.clearMessages(old.id);
+    expect(actors.messages(old.id).some(message => message.text?.startsWith("MOVED-TO "))).toBe(false);
+    const fresh = await actors.create({ name: "chatty-successor", instructions: "Supervise.", topics: ["queued-work.other"] });
+    await holdWorker(actors, root, fresh.id);
+    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 1, skipped: [] });
+    // An edited file no stop recorded is still refused: the stop record names the archive's exact path and sha256.
+    const edited = fs.readFileSync(archive, "utf8").replace("LIVE_WITH_PROGRESS", "FORGED");
+    const tampered = path.join(path.dirname(archive), `20261024T000000001Z-${createHash("sha256").update(edited).digest("hex").slice(0, 12)}.jsonl`);
+    fs.writeFileSync(tampered, edited);
+    await expect(actors.requeueArchived(fresh.id, tampered)).rejects.toThrow(/no stop record/);
+  }, 60_000);
+});

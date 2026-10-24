@@ -1267,7 +1267,8 @@ interface FabricAgentsApi {
   /** Project-independent templates in the global registry. */
   actors(args: { scope: "global" }): Promise<FabricActorTemplate[]>;
   messages(args: { id: string; limit?: number }): Promise<FabricActorMessage[]>;
-  /** Refused while the actor keeps stop archives or held dead letters, unless dropQueued: true keeps them with the removed tree. */
+  /** Refused (FABRIC_ACTOR_QUEUED_WORK, before any effect) while the actor keeps stop archives or held dead letters, or holds queued,
+   * parked, overflow, callerless in-flight or settled-window work, unless dropQueued: true archives it and keeps it with the removed tree. */
   remove(args: { id: string; dropQueued?: boolean }): Promise<{ removed: boolean; pending?: string; cleaned?: boolean }>;
   /** Drop an actor's mailbox history without stopping the actor. */
   clearMessages(args: { id: string }): Promise<FabricActorInfo>;

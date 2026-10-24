@@ -14,8 +14,10 @@ stop refuses an actor that holds work (queued, parked, overflow, pending settled
 names the counts; the activation in flight alone never refuses it (its callerless item is archived). With stop,
 --drop-queued moves that work to
 <actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl instead, never deleting it, and prints the archive;
-agents.requeueArchived feeds it to a recreated actor (smarty-dev#16416). A live remove refuses an actor that keeps such
-archives or held dead letters; with --drop-queued it removes it and keeps them under <mesh root>/session-archive/.
+agents.requeueArchived feeds it to a recreated actor (smarty-dev#16416). A live remove refuses, before any effect, an
+actor that keeps such archives or held dead letters, or holds queued, parked, overflow, callerless in-flight or
+settled-window work (FABRIC_ACTOR_QUEUED_WORK); with --drop-queued it archives that work, removes the actor and keeps
+the archives under <mesh root>/session-archive/.
 
 When the resident host is dead, remove runs offline and needs --main-stopped (the live resident's own remove
 path is unchanged; smarty-dev#8090). The offline removal archives the actor by one rename of its directory into
@@ -199,6 +201,14 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
       return 0;
     } finally { clearTimeout(keepAlive); }
   } catch (error) {
+    // pi-fabric#1572 round 5 (fabric-store N8): a queued-work refusal keeps its code and counts, so a caller can branch on it.
+    const queued = error as { code?: unknown; operation?: unknown; actorId?: unknown; counts?: unknown } | undefined;
+    if (queued?.code === "FABRIC_ACTOR_QUEUED_WORK") {
+      io.err(`fabric-actors: FABRIC_ACTOR_QUEUED_WORK: ${(error as Error).message}\n`);
+      io.out(JSON.stringify({ ok: false, errorCode: "FABRIC_ACTOR_QUEUED_WORK",
+        queuedWork: { operation: queued.operation, actorId: queued.actorId, counts: queued.counts } }) + "\n");
+      return 1;
+    }
     io.err(`fabric-actors: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }

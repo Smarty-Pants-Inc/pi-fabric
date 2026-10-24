@@ -887,7 +887,8 @@ describe("queued actor activation revocation (#181 F1)", () => {
       const activation = agents.list().find((run) => run.actorId === actor.id)!;
       let removal: ReturnType<ActorManager["remove"]> | undefined;
       if (operation === "stop") await actors.stop(actor.id);
-      else if (operation === "remove") removal = actors.remove(actor.id, { wait: false });
+      // pi-fabric#1572 round 5: the activation's callerless tell is live work; a plain remove refuses it, dropQueued archives it.
+      else if (operation === "remove") removal = actors.remove(actor.id, { wait: false, dropQueued: true });
       else expect(actors.haltAll().halted).toBe(1);
       if (removal) await removal;
       await agents.stop(blocker.id);
@@ -925,7 +926,7 @@ describe("queued actor activation revocation (#181 F1)", () => {
       await agents.stop(blocker.id);
       await preparing;
       if (operation === "stop") await actors.stop(actor.id);
-      else if (operation === "remove") await actors.remove(actor.id, { wait: false });
+      else if (operation === "remove") await actors.remove(actor.id, { wait: false, dropQueued: true }); // pi-fabric#1572 round 5
       else expect(actors.haltAll().halted).toBe(1);
       release();
       await waitFor(() => actors.inFlightCount() === 0, 10_000);
@@ -6225,7 +6226,8 @@ describe("ActorManager removal behind an in-flight run", () => {
     actors.listOwned(); // Persistent ownership regain replaces the registered actor object.
     expect(actors.status(actor.id).inFlightRun).toBeUndefined();
     let callerSettled = false;
-    const removal = actors.remove(actor.id, { wait }).then((result) => { callerSettled = true; return result; });
+    // pi-fabric#1572 round 5: the run's callerless mesh event is live work; dropQueued archives it instead of refusing.
+    const removal = actors.remove(actor.id, { wait, dropQueued: true }).then((result) => { callerSettled = true; return result; });
     let recovery: Promise<void> | undefined;
     try {
       await waitFor(() => callerSettled || !!actors.status(actor.id).removal);
@@ -6295,7 +6297,7 @@ describe("ActorManager removal behind an in-flight run", () => {
 
     const started = Date.now();
     const removed = await Promise.race([
-      actors.remove(actor.id, { wait: false }),
+      actors.remove(actor.id, { wait: false, dropQueued: true }), // pi-fabric#1572 round 5: archives the tell in flight
       new Promise<"blocked">((resolve) => setTimeout(resolve, 1_500, "blocked")),
     ]);
     expect(removed).not.toBe("blocked");
@@ -6374,7 +6376,8 @@ describe("ActorManager removal behind an in-flight run", () => {
       rename(from, to);
     });
     try {
-      const accepted = await actors.remove(actor.id, { wait: false }); // Exercise the whole public call, including presence save.
+      // Exercise the whole public call, including presence save; dropQueued archives the tell in flight (pi-fabric#1572 round 5).
+      const accepted = await actors.remove(actor.id, { wait: false, dropQueued: true });
       expect(accepted).toMatchObject({ removed: true, pending: expect.stringContaining(runId) });
       if (phase === "unrelated update") {
         replacements.length = 0;
@@ -6474,7 +6477,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
     actors.tell(actor.id, "go");
     await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
-    await actors.remove(actor.id, { wait: false });
+    await actors.remove(actor.id, { wait: false, dropQueued: true }); // pi-fabric#1572 round 5: archives the tell in flight
     const actorRoot = path.join(root, "actors");
     readOnly(actorRoot);
     try {
@@ -6499,7 +6502,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
     actors.tell(actor.id, "go");
     await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
-    await actors.remove(actor.id, { wait: false });
+    await actors.remove(actor.id, { wait: false, dropQueued: true }); // pi-fabric#1572 round 5: archives the tell in flight
     const waiting = actors.remove(actor.id);
     const actorRoot = path.join(root, "actors");
     readOnly(actorRoot);
@@ -6531,7 +6534,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
     actors.tell(actor.id, "go");
     await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
-    await actors.remove(actor.id, { wait: false });
+    await actors.remove(actor.id, { wait: false, dropQueued: true }); // pi-fabric#1572 round 5: archives the tell in flight
     const waiting = actors.remove(actor.id);
     const sessionDir = path.join(actorRoot, actor.id);
     const presenceKey = `actors/test/${actor.id}`;
@@ -6586,7 +6589,7 @@ describe("ActorManager removal behind an in-flight run", () => {
     const actor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
     actors.tell(actor.id, "go");
     await waitFor(() => actors.status(actor.id).inFlightRun?.id === runId);
-    await actors.remove(actor.id, { wait: false });
+    await actors.remove(actor.id, { wait: false, dropQueued: true }); // pi-fabric#1572 round 5: archives the tell in flight
     const successor = await actors.create({ name: "reviewer", instructions: "Review.", responseMode: "text" });
     const registryIds = () => (JSON.parse(fs.readFileSync(path.join(root, "actors", "actors.json"), "utf8")) as
       { actors: Array<{ id: string; removal?: unknown }> }).actors.map((entry) => `${entry.id}${entry.removal ? ":removal" : ""}`);

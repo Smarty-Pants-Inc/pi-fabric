@@ -512,16 +512,25 @@ export async function runFabricCommand(
     return;
   }
   if (command === "remove" || command === "kill") {
-    const id = argumentsList[0];
+    // pi-fabric#1572 round 5: a removal refuses an actor holding work unless --drop-queued, which archives and keeps it.
+    const dropQueued = argumentsList.includes("--drop-queued");
+    const id = argumentsList.find((argument) => argument !== "--drop-queued");
     if (!id) {
-      context.ui.notify("Usage: /fabric remove <id>", "warning");
+      context.ui.notify("Usage: /fabric remove <id> [--drop-queued]", "warning");
       return;
     }
     const actor = state.actors
       .list()
       .find((candidate) => candidate.id.startsWith(id) || candidate.name === id);
     if (actor) {
-      await state.actors.remove(actor.id);
+      try {
+        await state.actors.remove(actor.id, dropQueued ? { dropQueued: true } : {});
+      } catch (error) {
+        // The refusal is an answer, as for /fabric stop; any other failure propagates as before.
+        if ((error as { code?: unknown } | undefined)?.code !== "FABRIC_ACTOR_QUEUED_WORK") throw error;
+        context.ui.notify((error as Error).message, "error");
+        return;
+      }
       context.ui.notify(`Removed Fabric actor ${actor.id.slice(0, 8)} (${actor.name})`, "info");
       return;
     }

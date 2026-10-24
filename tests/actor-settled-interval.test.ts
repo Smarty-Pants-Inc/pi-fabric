@@ -1371,7 +1371,8 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     vi.advanceTimersByTime(100);
     actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "cancelled" });
     if (cancel === "halt") actors.haltAll();
-    else if (cancel === "remove") await actors.remove(actor.id);
+    // pi-fabric#1572 round 5: the queued leading item and the pending window are live work; dropQueued archives them.
+    else if (cancel === "remove") await actors.remove(actor.id, { dropQueued: true });
     else {
       const definition = actors.definition(actor.id);
       await actors.stop(actor.id);
@@ -1657,7 +1658,7 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     vi.advanceTimersByTime(100);
     actors.dispatchHostEvent("agent_settled", payload());
     const timer = scheduled.mock.results[scheduled.mock.calls.findIndex(([, delay]) => delay === 900)]!.value;
-    await actors.remove(actor.id);
+    await actors.remove(actor.id, { dropQueued: true }); // pi-fabric#1572 round 5: archives the queued item and the pending window
     expect(cancelled).toHaveBeenCalledWith(timer);
     vi.advanceTimersByTime(2_000);
     expect(actors.list()).toHaveLength(0);

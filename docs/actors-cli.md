@@ -10,7 +10,7 @@ fabric-actors remove --resident <directory-or-prefix> --actor <id-or-name> --con
   --main-stopped --evidence-file <herdr-and-ps-check.txt>
 ```
 
-## Stop never drops queued work silently (smarty-dev#16416)
+## Stop and remove never drop queued work silently (smarty-dev#16416)
 
 `stop` refuses an actor that still holds work: queued, parked, overflow, pending settled-window or dead-letter
 work. The error names each count, and nothing changes. An activation in flight alone never refuses a stop: the run is
@@ -21,8 +21,14 @@ The printed result carries `actor.stoppedQueue` with the archive path, its full 
 message log gets a `MOVED-TO <path>` line with the same sha256. To restore the work, recreate the actor and call
 `agents.requeueArchived({ id: <new actor>, archive: <path> })` from its root's Main (see agents.md). The new
 actor may have the same name: the path still finds the archive after the removal moved it to session-archive/.
-`remove` refuses an actor that has stop archives or held dead letters; `remove --drop-queued` (or
-`agents.remove({ id, dropQueued: true })`) removes it and keeps them under `<mesh root>/session-archive/`.
+`remove` refuses an actor that has stop archives or held dead letters, or live work its removal would drop:
+queued, parked or overflow items, a callerless item in flight or a pending settled window (a caller's ask in
+flight does not refuse it: the caller hears the abort). The refusal comes before any effect: the actor keeps
+running with its queue and run, nothing is archived, and the error starts with `FABRIC_ACTOR_QUEUED_WORK` (stdout
+gets `{"ok":false,"errorCode":"FABRIC_ACTOR_QUEUED_WORK","queuedWork":{...}}` with the counts).
+`remove --drop-queued` (or `agents.remove({ id, dropQueued: true })`) first archives that live work into
+`stopped-queues/` as `stop --drop-queued` does, then removes the actor and keeps its archives under
+`<mesh root>/session-archive/`.
 
 ## Offline remove (dead resident host): `--main-stopped` is an operator attestation (smarty-dev#7817)
 

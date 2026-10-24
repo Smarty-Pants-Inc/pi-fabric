@@ -293,6 +293,13 @@ export class ActorDirectory extends ActorManager {
     if (finishing) return finishing === "primary" ? super.remove(...args) : this.#secondary.remove(...args);
     return this.#isPrimary(args[0]) ? super.remove(...args) : this.#secondary.remove(...args);
   }
+  /** pi-fabric#1572 round 5: the removal check, routed exactly as remove() is. */
+  override assertRemovable(...args: Parameters<ActorManager["assertRemovable"]>): void {
+    if (super.cleanupObligation(args[0]) || this.#secondary.cleanupObligation(args[0])) return;
+    const finishing = this.#finishingScope(args[0]);
+    if (finishing) return finishing === "primary" ? super.assertRemovable(...args) : this.#secondary.assertRemovable(...args);
+    return this.#isPrimary(args[0]) ? super.assertRemovable(...args) : this.#secondary.assertRemovable(...args);
+  }
   override get releaseAdmissionHeld(): boolean { return super.releaseAdmissionHeld && this.#secondary.releaseAdmissionHeld; }
   override pauseForRelease(options: Parameters<ActorManager["pauseForRelease"]>[0] = {}): void {
     this.#releaseCheckpointReady = false;

@@ -1018,7 +1018,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "remove",
     description:
-      'Stop and remove a persistent actor. Default scope "project" removes a live project actor; scope "global" removes a project-independent template from the global registry. Refused while the actor keeps stop archives or held dead letters, unless dropQueued: true, which archives its remaining work and keeps all of it with the removed tree.',
+      'Stop and remove a persistent actor. Default scope "project" removes a live project actor; scope "global" removes a project-independent template from the global registry. Refused before any effect (FABRIC_ACTOR_QUEUED_WORK, with the counts) while the actor keeps stop archives or held dead letters, or holds queued, parked, overflow, callerless in-flight or pending settled-window work; an ask in flight whose caller waits does not refuse it. dropQueued: true archives all of that work to <actor dir>/stopped-queues/ first and keeps it with the removed tree.',
     inputSchema: {
       type: "object",
       properties: {

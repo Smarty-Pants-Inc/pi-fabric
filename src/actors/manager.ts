@@ -4050,11 +4050,14 @@ export class ActorManager {
     const source = this.#actors.get(actorId) ?? this.#draining.get(actorId);
     if (!source) throw refuse(`actor ${actorId} is not known here`);
     if (path.resolve(this.#stoppedQueueDirectory(actorId)) !== path.dirname(file)) throw refuse(`it is not in ${actorId}'s stopped-queues directory`);
+    // Round 5 (fabric-store N7): the message history holds only the last ACTOR_MESSAGE_HISTORY_LIMIT messages, so the
+    // stop records the same stop appended to this directory's moved-to.jsonl are read in full as well.
     const recorded = source.messages.some((message) => {
       const stopped = (message.data as { stoppedQueue?: { archive?: unknown; sha256?: unknown } } | undefined)?.stoppedQueue;
       return message.direction === "out" && message.source === "fabric-host" && message.text?.startsWith("MOVED-TO ") === true &&
         typeof stopped?.archive === "string" && path.resolve(stopped.archive) === file && stopped.sha256 === sha256;
-    });
+    }) || this.#readStopRecords(path.dirname(file)).some((record) => record.actorId === actorId && record.sha256 === sha256 &&
+      path.resolve(record.archive) === file && record.actorName === source.name && record.rootId === source.rootId);
     if (!recorded) throw refuse(`actor ${actorId}'s message log holds no stop record of this file with sha256 ${sha256}`);
   }
 
@@ -4205,6 +4208,7 @@ export class ActorManager {
     const actorId = accepted ? id : this.#requireOwnedActor(id).id;
     // smarty-dev#16416 round 2: a new removal never takes stop archives or held dead letters with it unasked.
     // Round 4 (pi-fabric#1572): a same-name create's predecessor removal (replacingSameName) asks: it keeps them as dropQueued does.
+    // Round 5 (fabric-store N4): nor the live work its stop would drop (#assertRemovalKeepsNoWork), before any effect.
     const keep = dropQueued === true || this.#sameNameReplacements.has(actorId);
     if (!accepted && !this.#actors.get(actorId)?.removal && !keep) this.#assertRemovalKeepsNoWork(actorId);
     // Capture the admitted commit before persistence yields: later progress must not lose this caller's join.
@@ -4299,9 +4303,24 @@ export class ActorManager {
   }
 
   /**
+   * pi-fabric#1572 round 5 (fabric-store N2): the removal check of remove(), for a caller that must judge a removal
+   * BEFORE its own first effect (the operator CLI's preliminary stop). Throws FabricActorQueuedWorkError exactly when
+   * remove(id, { dropQueued }) would refuse; an accepted removal, dropQueued and a same-name replacement pass.
+   */
+  assertRemovable(id: string, { dropQueued }: { dropQueued?: boolean } = {}): void {
+    if (this.cleanupObligation(id) || this.#removeCalls.has(id) || this.finishingRemoval(id)) return;
+    const actorId = this.#requireOwnedActor(id).id;
+    if (dropQueued === true || this.#sameNameReplacements.has(actorId) || this.#actors.get(actorId)?.removal) return;
+    this.#assertRemovalKeepsNoWork(actorId);
+  }
+
+  /**
    * smarty-dev#16416 round 2: removal refuses (FabricActorQueuedWorkError, before any effect) while the actor
-   * has stop archives in <actor dir>/stopped-queues/ or dead letters setActivationFilter holds. With
-   * dropQueued the removal's stop archives the rest of its work there too, and the tree keeps it all
+   * has stop archives in <actor dir>/stopped-queues/ or dead letters setActivationFilter holds. Round 5 (pi-fabric#1572,
+   * fabric-store N4): also while it holds live work its removal's stop would drop: queued, parked or overflow items,
+   * a callerless item of the activation in flight, or pending settled windows. A caller's ask in flight is not
+   * counted: its caller hears the run's abort. With dropQueued the removal's stop archives all of it to
+   * stopped-queues/ (durably, with its MOVED-TO record) before anything is emptied, and the tree keeps it all
    * (#keepRecoverableWork; with pi-fabric#1568 the whole tree, archives inside, moves to session-archive/).
    */
   #assertRemovalKeepsNoWork(id: string): void {
@@ -4312,11 +4331,16 @@ export class ActorManager {
       archived = fs.readdirSync(this.#stoppedQueueDirectory(id)).filter(name => STOP_ARCHIVE_NAME.test(name)).length;
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const heldDeadLetter = this.#persistent && this.#deadLetterCount(id) > 0 ? this.#readDeadLetters(id).filter(entry => entry.heldBy).length : 0;
-    if (archived === 0 && heldDeadLetter === 0) return;
-    throw new FabricActorQueuedWorkError("remove", id, { archived, heldDeadLetter },
-      `Fabric actor ${actor.name} (${actor.id}) keeps work a removal would delete (stop archives ${archived}, held dead-letter ${heldDeadLetter}); ` +
-      `remove refused and nothing changed. Requeue it first (agents.requeueArchived; clear the activationFilter for held dead letters), ` +
-      `or pass dropQueued: true to remove the actor and keep that work with its archived tree.`);
+    const running = this.#runningActor(id) ?? actor;
+    const live = this.#queuedWorkCounts(actor, running, actor.status === "stopped");
+    const inFlight = actor.status === "stopped" ? 0 : this.#stoppableInFlight(id).filter(item => !(item.resolve || item.reject)).length;
+    const counts = { archived, heldDeadLetter, queued: live.queued, parked: live.parked, overflow: live.overflow, inFlight, settled: live.settled };
+    if (Object.values(counts).every(count => count === 0)) return;
+    throw new FabricActorQueuedWorkError("remove", id, counts,
+      `Fabric actor ${actor.name} (${actor.id}) keeps work a removal would delete (stop archives ${archived}, held dead-letter ${heldDeadLetter}, ` +
+      `queued ${counts.queued}, parked ${counts.parked}, overflow ${counts.overflow}, in-flight ${inFlight}, settled ${counts.settled}); ` +
+      `remove refused and nothing changed. Wait until it is idle, or requeue it first (agents.requeueArchived; clear the activationFilter for held ` +
+      `dead letters), or pass dropQueued: true to remove the actor and keep that work, archived, with its removed tree.`);
   }
 
   async #remove(id: string, operator = false, dropQueued = false): Promise<RemovalResult> {

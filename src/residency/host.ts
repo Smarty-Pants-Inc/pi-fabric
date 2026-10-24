@@ -2882,6 +2882,9 @@ export class ResidentHost {
           // pi-fabric#1572 round 3: a remove with dropQueued archives its remaining work and keeps its archives (no lock-out
           // after a stop --drop-queued, whose archive the removal guard otherwise refuses to take).
           const dropQueued = command.dropQueued === true ? { dropQueued: true } : {};
+          // pi-fabric#1572 round 5 (fabric-store N2): a remove is judged BEFORE its preliminary stop, which is an internal
+          // stop (never refused, no archive): a refused remove stops, empties, aborts and commits nothing.
+          if (command.action === "remove") this.actors.assertRemovable(actor.id, dropQueued);
           const pending = command.action === "stop"
             ? this.actors.stop(actor.id, id => { check(); commit(id); }, true, "actors.stop", { explicit: true, ...dropQueued })
             : this.actors.stop(actor.id, id => { check(); commit(id); }, true, "actors.remove", dropQueued);
@@ -3029,6 +3032,8 @@ export class ResidentHost {
     if (!operatorCleanup && (!this.actors.owns(id) || (cleanup && cleanup.residency !== "durable"))) {
       throw new Error(`Resident host does not own ${id}`);
     }
+    // pi-fabric#1572 round 5: the removal's queued-work check precedes the request's commit, as a refused stop's does.
+    this.actors.assertRemovable(id, dropQueued ? { dropQueued: true } : {});
     // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
     commit(id);
     const removed = await this.actors.remove(id, { wait: false, ...(operator ? { operator: true as const } : {}), ...(dropQueued ? { dropQueued: true } : {}) });

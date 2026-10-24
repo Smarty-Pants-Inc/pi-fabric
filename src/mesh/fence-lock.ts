@@ -88,8 +88,27 @@ export const pinFenceLock = (lock: string, record: string): number | undefined =
 
 const sameInode = (a: fs.Stats | undefined, b: fs.Stats): boolean => a !== undefined && a.isDirectory() && a.dev === b.dev && a.ino === b.ino;
 
-/** Only a completed canonical removal confirms release; refusal retains the native cause when available. */
+/** Only proven canonical relinquishment confirms release; refusal retains the native cause when available. */
 export type FenceLockRelease = { released: true } | { released: false; cause?: unknown };
+
+/** Called only AFTER our verified owner record was successfully unlinked, never on a missing ownership proof. */
+const releaseAfterOwnerUnlink = (lock: string, record: string, ours: fs.Stats): FenceLockRelease => {
+  try {
+    // A recoverer's rmdir or a staged successor's rename may already have taken our emptied directory off its name.
+    if (!sameInode(fs.lstatSync(lock, { throwIfNoEntry: false }), ours)) return { released: true };
+  } catch (cause) { return { released: false, cause }; }
+  // ponytail: atomic rmdir fails closed on any recorded successor, even one published after the inode check.
+  try { fs.rmdirSync(lock); return { released: true }; } catch (cause) {
+    if (codeOf(cause) === "ENOENT") return { released: true };
+    try {
+      if (!sameInode(fs.lstatSync(lock, { throwIfNoEntry: false }), ours)) return { released: true };
+      // A paused protocol-1 writer can publish into the SAME emptied inode. Read only: leave its record alone.
+      if (fs.readFileSync(path.join(lock, "owner"), "utf8") !== record) return { released: true };
+    } catch { /* missing owner alone, or an unreadable name/record, does not prove relinquishment */ }
+    // In particular, EPERM on our unchanged EMPTY directory is still unconfirmed. Keep the native rmdir cause.
+    return { released: false, cause };
+  }
+};
 
 /**
  * Release without any step that can detach a successor (pi-fabric#694 P1, smarty-dev#6477, third design).
@@ -103,9 +122,12 @@ export type FenceLockRelease = { released: true } | { released: false; cause?: u
  * 2. Our directory must still be at `<lock>` (same dev and inode). Moved away (a recoverer's `.dead.` receipt) or
  *    replaced: leave everything alone, the receipt stays non-empty and the successor untouched.
  * 3. Unlink `<pin>/owner`: through the fd, so it can only remove the file verified in step 1.
- * 4. `rmdir(<lock>)` only while the name still holds our inode. rmdir fails closed (ENOTEMPTY) on any record,
- *    so it can never remove a recorded successor; at worst it removes the EMPTY directory of a protocol-1
- *    acquirer between its mkdir and its owner write, whose `wx` write then fails (ENOENT) and it never enters.
+ * 4. AFTER that successful unlink, a missing or replaced directory confirms our release. Otherwise `rmdir(<lock>)`
+ *    only while the name still holds our inode. rmdir fails closed (ENOTEMPTY) on any record; a successor that lands
+ *    after the check, including a protocol-1 writer in the same inode, confirms our release without being removed.
+ *    At worst rmdir removes the EMPTY directory of a protocol-1 acquirer between its mkdir and its owner write,
+ *    whose `wx` write then fails (ENOENT) and it never enters. An unchanged empty directory whose rmdir fails for
+ *    permissions or an unknown observation remains unconfirmed: owner removal alone does not free the name.
  * Residual: only step 3 can follow a broken precondition, and only when our directory is renamed to a `.dead.`
  * receipt between steps 2 and 3, i.e. a recoverer removed a LIVE owner's lock (no code path does: mesh-lock.ts:
  * 343-413, custody-lock.ts:107-134, proven by tests/mesh-fence-lock.test.ts for both trees). Even then it
@@ -134,9 +156,7 @@ export const releaseFenceLock = (lock: string, record: string,
       // writer replaces an owner in place (all use `wx`) and no recoverer moves one out of its directory (step 1 above).
       try { fs.unlinkSync(path.join(pinned, "owner")); } catch (cause) { return { released: false, cause }; }
       hooks.afterTake?.();
-      if (!sameInode(fs.lstatSync(lock, { throwIfNoEntry: false }), ours)) return { released: false };
-      // ponytail: atomic rmdir, fails closed (ENOTEMPTY) on any successor's record (step 4 above).
-      try { fs.rmdirSync(lock); return { released: true }; } catch (cause) { return { released: false, cause }; }
+      return releaseAfterOwnerUnlink(lock, record, ours);
     } finally { try { fs.closeSync(pin); } catch { /* already closed */ } }
   }
   const ownerPath = path.join(lock, "owner");
@@ -146,16 +166,19 @@ export const releaseFenceLock = (lock: string, record: string,
   const taken = path.join(lock, `owner.released.${record.split("\n")[0] ?? ""}`);
   try { fs.renameSync(ownerPath, taken); } catch (cause) { return { released: false, cause }; }
   hooks.afterTake?.();
-  let ours = false;
+  let ours: fs.Stats | undefined;
   let cause: unknown;
-  try { ours = fs.readFileSync(taken, "utf8") === record; } catch (error) { cause = error; }
+  try {
+    const directory = fs.lstatSync(lock);
+    if (fs.readFileSync(taken, "utf8") === record) ours = directory;
+  } catch (error) { cause = error; }
   if (ours) {
     // ponytail (smarty-dev#8907; off Linux, or the synchronous fence's Linux pin-failure fallback):
     // `taken` is `owner.released.<our unique token>` inside <lock>, a name only this holder ever creates, just verified
     // as our record. The rmdir below is atomic and fails closed on any successor's owner; the link-back unlink removes
     // only the extra name of the inode just linked back to `owner`.
-    try { fs.unlinkSync(taken); } catch (error) { cause = error; }
-    try { fs.rmdirSync(lock); return { released: true }; } catch (error) { return { released: false, cause: cause ?? error }; }
+    try { fs.unlinkSync(taken); } catch (cause) { return { released: false, cause }; }
+    return releaseAfterOwnerUnlink(lock, record, ours);
   }
   try { fs.linkSync(taken, ownerPath); fs.unlinkSync(taken); }
   catch (error) { cause ??= error; /* another owner holds the name: the foreign record stays inside <lock>, never deleted */ }

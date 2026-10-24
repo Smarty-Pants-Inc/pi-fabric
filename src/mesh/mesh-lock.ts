@@ -400,6 +400,7 @@ export class MeshLock {
       pin = undefined;
       if (held !== undefined) return releaseFenceLock(this.#lockPath, ownerRecord, {}, held);
       // Non-Linux keeps main's release; the stalled-holder race there is tracked in smarty-dev#9569.
+      let canonicalRenamed = false;
       try {
         // smarty-dev#8907: the directory judged by its owner record, stat captured before that read; only that inode
         // is removed (detached into verifiedRemove's graveyard first). A swapped-in successor is refused, never removed.
@@ -412,14 +413,16 @@ export class MeshLock {
           try {
             const released = `${this.#lockPath}.released.${token}`;
             fs.renameSync(this.#lockPath, released);
+            canonicalRenamed = true; // Canonical custody is released, independently of detached-copy cleanup.
             fs.rmSync(released, { recursive: true, force: true });
             return true;
           } catch (cause) { fallbackCause = cause; throw cause; }
         } });
-        return removed.removed ? { released: true } : { released: false, cause: fallbackCause ?? removed };
+        // Keep verifiedRemove's cleanup failure/diagnostics truthful; a successful rename already freed the name.
+        return removed.removed || canonicalRenamed ? { released: true } : { released: false, cause: fallbackCause ?? removed };
       } catch (cause) {
-        // Already replaced/removed, unreadable, or cleanup failed: never delete canonical.
-        return { released: false, cause };
+        // Never follow canonical after rename, even if detached cleanup or its diagnostics throw.
+        return canonicalRenamed ? { released: true } : { released: false, cause };
       }
     };
     // Borrow only the explicitly designated, ordinary initial event acquisition. Existing try/short

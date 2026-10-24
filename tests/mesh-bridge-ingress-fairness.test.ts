@@ -17,8 +17,8 @@ import { FAIRNESS_MAX_ATTEMPTS, fairnessAttemptLine, runFairnessAttempts } from 
 // No lock admission or publication result is stubbed.
 // A measured aggregate hold share outside 50–70% means the host did not produce the intended
 // contention, so that attempt decides nothing: it is reported as an invalid attempt, fully torn
-// down, and replaced by a fresh scenario, three attempts at most. The first attempt inside the
-// band decides, and a progress failure there is never retried.
+// down, and replaced by a fresh scenario, three attempts at most per test attempt. The first
+// scenario inside the band decides that test attempt; inherited CI runner retries may rerun the whole case.
 const TEST_LOCK_TIMEOUT_MS = 500;
 const EXPECTED_RETAINED_TOTAL_MS = TEST_LOCK_TIMEOUT_MS * 2;
 const CONTENDER_PROCESSES = 3;
@@ -394,10 +394,11 @@ async function runScenario(): Promise<ScenarioObservation> {
 // Windows exceeds this fixture's 50–70% hold-share precondition; native calibration is not yet verified.
 // The 90 s timeout is the WHOLE-CASE runner timeout: 3 x the former 30 s case budget. There is no
 // per-attempt timer and no hard 30 s per-attempt ceiling; the existing scenario and step deadlines are
-// unchanged. retry: 0 stops a suite-wide runner retry from repeating a deciding progress failure; only
-// the attempt controller may start a fresh scenario.
+// unchanged. Runner retries inherit vitest.config.cts: 2 when CI=true, otherwise 0. A runner retry can
+// repeat the whole case, including a deciding progress failure. Within each test attempt, only an invalid
+// hold share permits the controller to replace a scenario; the first valid scenario still decides.
 it.skipIf(process.platform === "win32")("toLocal ingress makes durable progress through real publisher contention",
-  { retry: 0, timeout: FORMER_CASE_BUDGET_MS * FAIRNESS_MAX_ATTEMPTS }, async () => {
+  { timeout: FORMER_CASE_BUDGET_MS * FAIRNESS_MAX_ATTEMPTS }, async () => {
     await runFairnessAttempts<ScenarioObservation>({
       run: runScenario,
       heldPct: observation => observation.heldPct,

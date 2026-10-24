@@ -4,7 +4,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
-import { ActorManager } from "../src/actors/manager.js";
+import { ActorManager, ACTOR_DEAD_LETTER_MAX_ENTRIES, ACTOR_DEAD_LETTER_MAX_BYTES } from "../src/actors/manager.js";
 import * as actorTypes from "../src/actors/types.js";
 import type { FabricActorActivationFilter, FabricActorInfo } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -959,9 +959,9 @@ describe("queued-work guard, round 7: the requeue ledger records only queued wor
     return { ...fixture, old, fresh, archive, release, ledger: archive.replace(/\.jsonl$/, ".requeued.jsonl") };
   };
   const ledgerLines = (ledger: string) => fs.existsSync(ledger)
-    ? fs.readFileSync(ledger, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as { itemId: string; outcome: string }) : [];
+    ? fs.readFileSync(ledger, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as { itemId: string; outcome: string; reason?: string }) : [];
 
-  it("F1 probe: a full successor takes none of 4; none is recorded, remove stays refused, and after it drains all 4 land once", async () => {
+  it("F1 probe: a full successor takes none of 4; none is consumed, remove stays refused, and after it drains all 4 land once", async () => {
     const { actors, old, fresh, archive, ledger, release } = await archiveAndSuccessor(9);
     const first = await actors.requeueArchived(fresh.id, archive);
     expect(first).toMatchObject({ requeued: 0, filtered: 0, superseded: 0, alreadyRequeued: 0, skipped: [] });
@@ -969,10 +969,11 @@ describe("queued-work guard, round 7: the requeue ledger records only queued wor
       expect.stringMatching(/queue limit reached for requeue-successor \(1 and overflow 8\)/),
       ...Array(3).fill(expect.stringMatching(/^behind .+, which could not be queued$/)),
     ]);
-    // Nothing was dropped or recorded: the successor holds its own 9, the ledger is empty, and the archive still blocks.
+    // Nothing was dropped or consumed: the successor holds its own 9, refusals are ledgered as retryable, and the archive still blocks.
     expect(actors.status(fresh.id).queued).toBe(9);
     expect(actors.messages(fresh.id, 100).filter(message => message.error?.startsWith("Dropped a queued event"))).toEqual([]);
-    expect(ledgerLines(ledger)).toEqual([]);
+    expect(ledgerLines(ledger)).toEqual(first.notQueued.map(({ itemId, reason }) =>
+      expect.objectContaining({ itemId, outcome: "notQueued", reason })));
     const refusal = await actors.remove(old.id).catch((error: unknown) => error);
     expect(refusal).toMatchObject({ code: QUEUED_WORK, operation: "remove", counts: { archived: 1 } });
     expect((refusal as Error).message).toContain("requeue it first (agents.requeueArchived");
@@ -982,8 +983,9 @@ describe("queued-work guard, round 7: the requeue ledger records only queued wor
     await waitFor(() => actors.status(fresh.id).status === "idle" && actors.status(fresh.id).queued === 0, 150_000);
     await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 4, alreadyRequeued: 0, notQueued: [] });
     await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 0, alreadyRequeued: 4, notQueued: [] });
-    expect(ledgerLines(ledger).map(line => line.itemId)).toEqual(first.notQueued?.map(item => item.itemId));
-    expect(ledgerLines(ledger).map(line => line.outcome)).toEqual(Array(4).fill("requeued"));
+    const consumed = ledgerLines(ledger).filter(line => line.outcome === "requeued");
+    expect(consumed.map(line => line.itemId)).toEqual(first.notQueued?.map(item => item.itemId));
+    expect(ledgerLines(ledger).map(line => line.outcome)).toEqual([...Array(4).fill("notQueued"), ...Array(4).fill("requeued")]);
     await waitFor(() => actors.status(fresh.id).status === "idle" && actors.status(fresh.id).queued === 0, 150_000);
     const fed = actors.messages(fresh.id, 100).filter(message => message.direction === "in" && message.source === "direct")
       .map(message => message.data as { message: string; data?: { fakeWorkerReleasePath?: string } })
@@ -991,6 +993,54 @@ describe("queued-work guard, round 7: the requeue ledger records only queued wor
     expect(fed.map(data => data.message)).toEqual(["LIVE_WITH_PROGRESS", "archived 0", "archived 1", "archived 2"]);
     await expect(actors.remove(old.id)).resolves.toMatchObject({ removed: true });
   }, 360_000);
+
+  it.each(["entries", "bytes"] as const)("N1: dead-letter %s capacity refuses requeue spills before trim and keeps accepted spills", async (cap) => {
+    const { root, mesh, actors, old, fresh, archive, ledger } = await archiveAndSuccessor(8, true);
+    await actors.setActivationFilter(fresh.id, WAIT_FILTER);
+    const event = archiveLinesOf(archive).find(line => line.item?.source?.startsWith("mesh:"))!.item!.payload as MeshEvent;
+    const held = (index: number, padding = "") => ({ at: Date.now(), source: `mesh:${TOPIC}`,
+      event: { ...event, id: `held-${index}`, kind: "wait", data: { padding } },
+      heldBy: { reason: "activationFilter", ruleId: "wait", itemId: `held-${index}`, movedAt: Date.now() } });
+    let seed: string;
+    if (cap === "entries") {
+      seed = Array.from({ length: ACTOR_DEAD_LETTER_MAX_ENTRIES - 1 }, (_, index) => JSON.stringify(held(index)) + "\n").join("");
+    } else {
+      // Leave room for exactly one small spill, not two; use real serialized bytes, not a mocked stat.
+      const spill = { at: Date.now(), source: `mesh:${TOPIC}`, event, requeueSpill: true };
+      const room = Buffer.byteLength(JSON.stringify(spill)) + 1;
+      const entry = held(0);
+      entry.event.data.padding = "x".repeat(ACTOR_DEAD_LETTER_MAX_BYTES - room - Buffer.byteLength(JSON.stringify(entry)) - 1);
+      seed = JSON.stringify(entry) + "\n";
+    }
+    fs.writeFileSync(deadLetterFile(root, fresh.id), seed);
+    const first = await actors.requeueArchived(fresh.id, archive);
+    expect(first).toMatchObject({ requeued: 2, filtered: 0, superseded: 0, alreadyRequeued: 0, skipped: [] });
+    expect(first.notQueued).toEqual([
+      expect.objectContaining({ reason: expect.stringMatching(/dead-letter capacity reached/) }),
+      expect.objectContaining({ reason: expect.stringMatching(/^behind .+, which could not be queued$/) }),
+    ]);
+    const spillEvent = (archiveLinesOf(archive).filter(line => line.item?.source?.startsWith("mesh:"))[0]!.item!.payload as MeshEvent).id;
+    const file = deadLetterFile(root, fresh.id);
+    expect(fs.readFileSync(file, "utf8").startsWith(seed)).toBe(true);
+    expect(deadLetterLines(root, fresh.id).some(line => JSON.parse(line).event.id === spillEvent)).toBe(true);
+    expect(fs.statSync(file).size).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_MAX_BYTES);
+    expect(deadLetterLines(root, fresh.id).length).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_MAX_ENTRIES);
+    expect(ledgerLines(ledger).map(line => line.outcome)).toEqual(["requeued", "requeued", "notQueued", "notQueued"]);
+    expect(ledgerLines(ledger).filter(line => line.outcome === "notQueued").map(line => ({ itemId: line.itemId, reason: line.reason })))
+      .toEqual(first.notQueued.map(({ itemId, reason }) => ({ itemId, reason })));
+    // Refused ledger lines never consume archive items, even on a repeated call at capacity.
+    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 0, alreadyRequeued: 2,
+      notQueued: first.notQueued });
+    await expect(actors.remove(old.id)).rejects.toMatchObject({ code: QUEUED_WORK, counts: { archived: 1 } });
+    // A later ordinary routed arrival may trim itself, never the already-ledgered spill.
+    await actors.setTopics(fresh.id, [TOPIC]);
+    await publish(mesh, 99999);
+    await waitFor(() => actors.messages(fresh.id, 100).some(message =>
+      Number((message.data as { deadLetterDropped?: number } | undefined)?.deadLetterDropped) > 0));
+    expect(deadLetterLines(root, fresh.id).some(line => JSON.parse(line).event.id === spillEvent)).toBe(true);
+    expect(fs.statSync(file).size).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_MAX_BYTES);
+    expect(deadLetterLines(root, fresh.id).length).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_MAX_ENTRIES);
+  }, 120_000);
 
   // fabric-store P2: the queue checkpoint (and a routed event's dead-letter spill) is synced before any ledger line is written.
   it.each([

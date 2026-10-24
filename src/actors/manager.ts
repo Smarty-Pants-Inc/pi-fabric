@@ -764,6 +764,8 @@ const restoredActivationBlock = (stored: { reason: string; code: string; since: 
     ...(transient && finitePositive(stored.backoffMs) ? { backoffMs: stored.backoffMs } : {}) };
 };
 type ActorDeadLetter = { at: number; source: string; event: MeshEvent; batchQueued?: true; supersededSends?: DeliverySend[];
+  /** Accepted stop-archive spill: its requeue receipt must never outlive it through backlog trimming. */
+  requeueSpill?: true;
   /**
    * smarty-dev#16416: setActivationFilter({ dropQueued: true }) moved this queued item here. It waits,
    * never stale-retired, re-filtered away or coalesced, while the actor's filter skips it; once the
@@ -780,7 +782,7 @@ type StoppedQueueLine =
   | { kind: "in-flight" | "queued" | "overflow" | "parked" | "settled"; item: Record<string, unknown> }
   | { kind: "dead-letter"; entry?: ActorDeadLetter; raw?: string };
 /** A line's outcome in an archive's requeue ledger, <archive>.requeued.jsonl (smarty-dev#16416; skipped: pi-fabric#1572 round 7). */
-type RequeueLedgerOutcome = "requeued" | "filtered" | "superseded" | "skipped";
+type RequeueLedgerOutcome = "requeued" | "filtered" | "superseded" | "skipped" | "notQueued";
 /**
  * Round 7 (pi-fabric#1572 P3): the ledger outcomes that leave nothing of the item outstanding for the remove guard: it was
  * queued, a newer queued item covers it, or it is a caller's ask that is never fed again. A filtered item is not.
@@ -3949,7 +3951,7 @@ export class ActorManager {
    * activation filter included, once per archived item. <archive>.requeued.jsonl records every item id
    * offered, so a second call with the same archive offers nothing again.
    * Round 7 (pi-fabric#1572, fabric-store F1): a full target refuses an item (holdWhenFull) instead of dropping it. That
-   * item, and every later one (archive order holds), is reported in notQueued and gets no ledger line, so the archive
+   * item, and every later one (archive order holds), is reported and ledgered as notQueued (non-consuming), so the archive
    * still blocks a plain remove and a later call offers it again. The target's queue is checkpointed durably BEFORE the
    * batch's ledger lines are written and synced: a crash between the two can only offer an item twice, never record
    * one that is not queued. A queued caller's ask, never fed again, is recorded as skipped (round 7 P3).
@@ -3979,13 +3981,14 @@ export class ActorManager {
     try {
       for (const line of fs.readFileSync(ledger, "utf8").split("\n")) {
         if (!line) continue;
-        try { const value = JSON.parse(line) as { itemId?: unknown }; if (typeof value.itemId === "string") offered.add(value.itemId); } catch { /* torn final line */ }
+        try { const value = JSON.parse(line) as { itemId?: unknown; outcome?: unknown };
+          if (typeof value.itemId === "string" && value.outcome !== "notQueued") offered.add(value.itemId); } catch { /* torn final line */ }
       }
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     beforeCommit?.(actor.id);
     const result: FabricActorRequeueResult = { id: actor.id, archive: file, sha256, requeued: 0, filtered: 0, superseded: 0, alreadyRequeued: 0,
       skipped: [], notQueued: [] };
-    const entries: Array<{ itemId: string; outcome: RequeueLedgerOutcome }> = [];
+    const entries: Array<{ itemId: string; outcome: RequeueLedgerOutcome; reason?: string }> = [];
     let refusedAt: string | undefined;
     let meshLanded = false;
     try {
@@ -4007,7 +4010,9 @@ export class ActorManager {
           result.filtered++;
         } else if (refusedAt !== undefined) {
           // Archive order holds: nothing lands ahead of an earlier archived item the target could not take.
-          result.notQueued.push({ itemId: offer.itemId, source: offer.source, reason: `behind ${refusedAt}, which could not be queued` });
+          const reason = `behind ${refusedAt}, which could not be queued`;
+          result.notQueued.push({ itemId: offer.itemId, source: offer.source, reason });
+          entries.push({ itemId: offer.itemId, outcome: "notQueued", reason });
           continue;
         } else {
           // The normal callerless arrival: no resolve/reject, binding or outcome of the requeue caller, and
@@ -4023,7 +4028,9 @@ export class ActorManager {
                 deferDrain: true, holdWhenFull: true });
           } catch (error) {
             refusedAt = offer.itemId;
-            result.notQueued.push({ itemId: offer.itemId, source: offer.source, reason: errorText(error) });
+            const reason = errorText(error);
+            result.notQueued.push({ itemId: offer.itemId, source: offer.source, reason });
+            entries.push({ itemId: offer.itemId, outcome: "notQueued", reason });
             continue;
           }
           // A durable host keeps a routed event past the full queue in its dead-letter file (#enqueue's archived contract).
@@ -4058,7 +4065,7 @@ export class ActorManager {
         const fd = fs.openSync(ledger, "a", 0o600);
         try {
           const at = Date.now();
-          fs.writeSync(fd, entries.map(({ itemId, outcome }) => `${JSON.stringify({ itemId, archive: file, sha256, target: actor.id, outcome, at })}\n`).join(""));
+          fs.writeSync(fd, entries.map(({ itemId, outcome, reason }) => `${JSON.stringify({ itemId, archive: file, sha256, target: actor.id, outcome, ...(reason ? { reason } : {}), at })}\n`).join(""));
           fs.fsyncSync(fd);
         } finally { fs.closeSync(fd); }
       }
@@ -4068,7 +4075,7 @@ export class ActorManager {
     this.#recordMessage(actor, {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "in", source: "actor:requeue-archived", createdAt: Date.now(),
       reason: `requeued ${result.requeued} item(s) from ${file} (sha256 ${sha256})` +
-        (result.notQueued.length ? `; ${result.notQueued.length} could not be queued and stay unrecorded` : ""),
+        (result.notQueued.length ? `; ${result.notQueued.length} could not be queued and stay retryable` : ""),
       data: { requeued: result.requeued, filtered: result.filtered, superseded: result.superseded, alreadyRequeued: result.alreadyRequeued,
         skipped: result.skipped.length, notQueued: result.notQueued.length },
     });
@@ -5582,7 +5589,7 @@ export class ActorManager {
       (actor.queue.length >= this.meshConfig.actorQueueLimit && (this.#overflow.get(actor.id)?.length ?? 0) >= this.#overflowCap()))) {
       // smarty-dev#816: a sick actor's full queue never holds the shared host cursor. Its further
       // routed events wait in its own dead-letter file, behind any already there, so order holds.
-      this.#appendDeadLetter(actor, source, payload as MeshEvent);
+      this.#appendDeadLetter(actor, source, payload as MeshEvent, options.holdWhenFull);
       this.#replayDeadLetters(actor);
       return item;
     }
@@ -7643,7 +7650,7 @@ export class ActorManager {
     for (const entry of entries) {
       // Admission under batching remains non-replacing even after the window is disabled.
       // Work setActivationFilter held is never replaced by a later event (smarty-dev#16416).
-      const key = entry.batchQueued || entry.heldBy ? undefined : this.#meshEnqueueOptions(actor, entry.event).coalesceKey;
+      const key = entry.batchQueued || entry.heldBy || entry.requeueSpill ? undefined : this.#meshEnqueueOptions(actor, entry.event).coalesceKey;
       const index = key === undefined ? undefined : keyed.get(key);
       if (index === undefined) {
         if (key !== undefined) keyed.set(key, result.length);
@@ -7788,15 +7795,24 @@ export class ActorManager {
   // bound the oldest entries drop (to 90%, so a flood rewrites once per tenth), each drop counted
   // on the actor. A write failure is a checkpoint
   // failure, as for the queue file: the event stays in the mesh.
-  #appendDeadLetter(actor: ManagedActor, source: string, event: MeshEvent): void {
+  #appendDeadLetter(actor: ManagedActor, source: string, event: MeshEvent, holdWhenFull = false): void {
     const file = this.#deadLetterFile(actor.id);
     let count = this.#deadLetterCount(actor.id);
     if (!this.#deadLetterEventIds.has(actor.id)) this.#readDeadLetters(actor.id);
+    const entry: ActorDeadLetter = { at: Date.now(), source, event,
+      ...(actor.batchWindowMs! > 0 ? { batchQueued: true } : {}), ...(holdWhenFull ? { requeueSpill: true } : {}) };
+    // Round 8 N1: requeue must refuse BEFORE a spill could trigger the lossy 90% trim.
+    // Persisted protection below also prevents later ordinary arrivals trimming accepted spills.
+    if (holdWhenFull) {
+      count = this.#readDeadLetters(actor.id).length;
+      const bytes = fs.existsSync(file) ? fs.statSync(file).size : 0;
+      if (count + 1 > ACTOR_DEAD_LETTER_MAX_ENTRIES || bytes + Buffer.byteLength(JSON.stringify(entry)) + 1 > ACTOR_DEAD_LETTER_MAX_BYTES) {
+        throw new Error(`Fabric actor dead-letter capacity reached for ${actor.name} (${ACTOR_DEAD_LETTER_MAX_ENTRIES} entries or ${ACTOR_DEAD_LETTER_MAX_BYTES} bytes); archived item stays retryable`);
+      }
+    }
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      const entry: ActorDeadLetter = { at: Date.now(), source, event,
-        ...(actor.batchWindowMs! > 0 ? { batchQueued: true } : {}) };
-      if (this.#meshEnqueueOptions(actor, event).coalesceKey !== undefined) {
+      if (!holdWhenFull && this.#meshEnqueueOptions(actor, event).coalesceKey !== undefined) {
         const entries = this.#coalesceDeadLetters(actor, [...this.#readDeadLetters(actor.id), entry]);
         this.#writeDeadLetters(actor.id, entries);
         count = entries.length;
@@ -7807,9 +7823,10 @@ export class ActorManager {
       }
       if (count > ACTOR_DEAD_LETTER_MAX_ENTRIES || fs.statSync(file).size > ACTOR_DEAD_LETTER_MAX_BYTES) {
         const all = this.#readDeadLetters(actor.id);
-        // Work setActivationFilter moved here is never trimmed (smarty-dev#16416); only the routed backlog is.
-        const heldEntries = all.filter(entry => entry.heldBy);
-        const entries = all.filter(entry => !entry.heldBy);
+        // Filter-held work and accepted requeue spills are never trimmed. Requeue's preflight
+        // keeps its protected additions within both caps; ordinary routed backlog alone may drop.
+        const heldEntries = all.filter(entry => entry.heldBy || entry.requeueSpill);
+        const entries = all.filter(entry => !entry.heldBy && !entry.requeueSpill);
         const size = (entry: ActorDeadLetter) => Buffer.byteLength(JSON.stringify(entry)) + 1;
         let bytes = all.reduce((total, entry) => total + size(entry), 0);
         let dropped = 0;
@@ -7817,8 +7834,9 @@ export class ActorManager {
           bytes -= size(entries.shift()!);
           dropped++;
         }
-        this.#writeDeadLetters(actor.id, [...heldEntries, ...entries]);
-        count = heldEntries.length + entries.length;
+        const kept = new Set([...heldEntries, ...entries]);
+        this.#writeDeadLetters(actor.id, all.filter(entry => kept.has(entry)));
+        count = kept.size;
         const total = (this.#deadLettersDropped.get(actor.id) ?? 0) + dropped;
         this.#deadLettersDropped.set(actor.id, total);
         this.#recordMessage(actor, {

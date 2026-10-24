@@ -117,6 +117,19 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 7_000): Promise<voi
   }
 };
 
+// Output/history publication can precede activation settlement. Poll the live owner,
+// not those earlier notifications, before cleanup that must preserve all accepted work.
+const waitForActorIdle = async (client: Pick<ResidencyClient, "actorStatus">, id: string): Promise<void> => {
+  const signal = AbortSignal.timeout(7_000);
+  while (!signal.aborted) {
+    const status = await client.actorStatus(id, signal);
+    if (ROUTABLE_IDLE_STATUSES.includes(status.status) && status.queued === 0
+      && status.inFlightRun === undefined && status.preparing === undefined) return;
+    await delay(25);
+  }
+  throw new Error(`Timed out waiting for resident actor ${id} to become idle with an empty queue`);
+};
+
 const actorRecordWithHistory = (actorRoot: string, id: string) => {
   const store = new ActorRegistryStore(actorRoot);
   const record = store.records().find(record => record.id === id);
@@ -2206,6 +2219,8 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(after.id).toBe(actor.id);
       expect(after.messages.slice(0, before.messages.length)).toEqual(before.messages);
       expect(after.messages.map((item) => item.data?.message)).toEqual(expect.arrayContaining([`after ${signal}`, "queued successor"]));
+      // The replay and its successor must finish, not be dropped during cleanup.
+      await waitForActorIdle(client, actor.id);
       await client.removeActor(actor.id);
     } finally {
       await senderRestart;
@@ -2371,6 +2386,9 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       residentHostId(state.identity.id),
     );
     await waitFor(() => messageCount() >= before + 2);
+    // Stop only after the post-Main delivery settles; otherwise stop archives it and
+    // the later plain remove correctly refuses the still-recoverable work.
+    await waitForActorIdle(new ResidentActorClient(state.config.meshRoot, state.identity.id), actor.id);
     await peerControl.request(
       residentHostId(state.identity.id),
       actor.id,
@@ -2462,6 +2480,13 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       const removed = await client.removeActor(actor.id, undefined, { dropQueued: true });
       expect(Date.now() - started).toBeLessThan(2_000);
       expect(removed.pending).toContain(`pending behind its in-flight run ${runId}`);
+      const archiveDir = path.join(state.config.actorRoot, actor.id, "stopped-queues");
+      const archives = fs.readdirSync(archiveDir).filter(name => /^\d{8}T\d{9}Z-[0-9a-f]{12}\.jsonl$/.test(name));
+      expect(archives).toHaveLength(1);
+      const archived = fs.readFileSync(path.join(archiveDir, archives[0]!), "utf8").trim().split("\n")
+        .map(line => JSON.parse(line));
+      expect(archived.map(line => line.kind)).toEqual(["header", "in-flight"]);
+      expect(archived[1].item).toMatchObject({ payload: { message: "HANG_WITH_PROGRESS" } });
       expect(client.hostStateNote()).toContain(`removal of hung reviewer (${actor.id}) is pending behind its in-flight run ${runId}`);
       // Informational retention samples and durable removal diagnostics coexist.
       expect(client.hostStateNote()).toMatch(/residency retention:.*entries.*bytes/);
@@ -2584,6 +2609,8 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     await waitFor(() => state.mesh.listAll(prefix).length === 0);
     expect(state.mesh.listAll(prefix)).toEqual([]);
 
+    // Passive delivery is proved above; cleanup must wait for the activation too.
+    await waitForActorIdle(client, actor.id);
     await client.removeActor(actor.id);
     await control.close();
     await client.close();
@@ -3010,6 +3037,8 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
         client.hostId,
       )).rejects.toThrow(/not available to this Pi session/);
       expect(ownerPid()).toBe(pid);
+      // The pong output is visible before the callerless followUp has settled.
+      await waitForActorIdle(client, actor.id);
       await client.removeActor(actor.id);
     } finally {
       await control.close();

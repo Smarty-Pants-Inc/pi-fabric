@@ -1,9 +1,11 @@
 import fs from "node:fs";
+import { diagnostics, notifyDiagnostic } from "../core/diagnostics.js";
 import { ChildCompletionClaimLostError } from "../result-consumption.js";
 import { syncPathNamespace } from "../core/atomic-write.js";
 import { detachedPreview } from "../core/preview.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentRunResult } from "./types.js";
+import type { SandboxTaskResult } from "../transport/sandbox/types.js";
 import { fabricProvenanceSupported, sendFabricMessage } from "../fabric-provenance.js";
 import { extensionContextLive } from "../session-liveness.js";
 
@@ -14,6 +16,72 @@ const IDLE_BATCH_MS = 40;
 // UTF-16 backing bytes of pending preview prose, not IDs or delivery custody.
 const PENDING_PREVIEW_BYTES = 1024 * 1024;
 const TRUNCATED = "\n[truncated; use agents.wait({id}) for the full result]";
+
+interface SandboxResultWaiter {
+  childSession: string;
+  resolve: (result: SandboxTaskResult) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+}
+const sandboxResultWaiters = new Map<string, SandboxResultWaiter>();
+const SANDBOX_RUN_ID = /^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$/u;
+
+/** Arm before delivering a sandbox task so a fast child's followUp cannot beat result retrieval. */
+export const waitForSandboxFinalAnswer = (
+  childSession: string,
+  runId: string,
+  deadline: number,
+  signal?: AbortSignal,
+): Promise<SandboxTaskResult> => {
+  if (!childSession.startsWith("session:") || !SANDBOX_RUN_ID.test(runId) || !Number.isFinite(deadline)) {
+    return Promise.reject(new Error("Invalid sandbox result return address"));
+  }
+  if (signal?.aborted) return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error("Sandbox result wait aborted"));
+  if (deadline <= Date.now()) return Promise.reject(new Error("Sandbox result deadline expired"));
+  if (sandboxResultWaiters.has(runId)) return Promise.reject(new Error(`Sandbox result waiter already exists for ${runId}`));
+  return new Promise<SandboxTaskResult>((resolve, reject) => {
+    const waiter: SandboxResultWaiter = {
+      childSession,
+      resolve,
+      reject,
+      timer: setTimeout(() => finish(new Error("Sandbox result deadline expired")), Math.max(1, deadline - Date.now())),
+      ...(signal ? { signal } : {}),
+    };
+    const finish = (error?: Error, result?: SandboxTaskResult): void => {
+      if (sandboxResultWaiters.get(runId) !== waiter) return;
+      sandboxResultWaiters.delete(runId);
+      clearTimeout(waiter.timer);
+      if (waiter.onAbort) waiter.signal?.removeEventListener("abort", waiter.onAbort);
+      if (error) waiter.reject(error); else waiter.resolve(result!);
+    };
+    waiter.onAbort = () => finish(signal?.reason instanceof Error ? signal.reason : new Error("Sandbox result wait aborted"));
+    signal?.addEventListener("abort", waiter.onAbort, { once: true });
+    sandboxResultWaiters.set(runId, waiter);
+    if (signal?.aborted) waiter.onAbort();
+  });
+};
+
+/** Capture only a verified followUp from the exact child session bound to this run. */
+export const captureSandboxFinalAnswer = (
+  sender: { id: string; kind: string },
+  verification: "mesh" | "bridge" | undefined,
+  message: string,
+): boolean => {
+  if (verification !== "mesh" && verification !== "bridge" || sender.kind !== "main") return false;
+  const match = /^FABRIC-RESULT ([a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?)\n([\s\S]*)$/u.exec(message);
+  if (!match) return false;
+  const runId = match[1]!;
+  const waiter = sandboxResultWaiters.get(runId);
+  if (!waiter || waiter.childSession !== sender.id) return false;
+  const result: SandboxTaskResult = { runId, participantId: sender.id, status: "completed", text: match[2]!, exitCode: 0 };
+  sandboxResultWaiters.delete(runId);
+  clearTimeout(waiter.timer);
+  if (waiter.onAbort) waiter.signal?.removeEventListener("abort", waiter.onAbort);
+  waiter.resolve(result);
+  return true;
+};
 
 type Completion = Pick<AgentRunResult, "id" | "name" | "status" | "text" | "partialText" | "warnings" | "error" | "startedAt" | "finishedAt" | "completionDelivery">;
 type PendingCompletion = { result: Completion; delivered: (() => void) | undefined; prepare: (() => void) | undefined };
@@ -153,7 +221,9 @@ export class AgentCompletionInbox {
     if (this.#context.hasUI) {
       const failure = result.status !== "completed";
       const detail = failure && result.error ? `: ${detachedPreview(oneLine(result.error), 180)}` : "";
-      this.#context.ui.notify(`Agent ${detachedPreview(oneLine(result.name), 80)} ${result.status}${detail}`, failure ? "warning" : "info");
+      const message = `Agent ${detachedPreview(oneLine(result.name), 80)} ${result.status}${detail}`;
+      if (failure) notifyDiagnostic(this.#context, "src/agents/completion-inbox.ts", message, "warning");
+      else this.#context.ui.notify(message, "info");
     }
     this.#schedule();
   }
@@ -248,7 +318,7 @@ export class AgentCompletionInbox {
       this.#receiptFault = undefined;
     } catch (error) {
       const diagnostic = `Fabric completion carrier remains unconfirmed: ${detachedPreview(String(error), 1000)}`;
-      if (diagnostic !== this.#receiptFault) console.warn(diagnostic);
+      if (diagnostic !== this.#receiptFault) diagnostics.warn("src/agents/completion-inbox.ts", diagnostic);
       this.#receiptFault = diagnostic;
     }
   }

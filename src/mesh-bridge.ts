@@ -16,10 +16,14 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readMeshStateMovedMarker } from "./mesh/backend-fence.js";
-import { DEFAULT_CALL_TIMEOUT_MS, DEFAULT_FACTORY_RATE, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, validBridgeName } from "./mesh/bridge.js";
+import { BRIDGE_STALL_ALARM_TOPIC, DEFAULT_CALL_TIMEOUT_MS, DEFAULT_FACTORY_RATE, MeshBridge, RemoteBridgeSide,
+  serveBridgeAgent, StoreBridgeSide, validBridgeName, type BridgeStallAlarm } from "./mesh/bridge.js";
 import { BridgeRelayUnavailableError, startBridgeRelay } from "./mesh/bridge-relay.js";
+import { BRIDGE_DELIVERY_AGE_ALERT_MS, type BridgeDeliveryAgeAlarm } from "./mesh/bridge-delivery-age.js";
+import { publishBridgeLegacyBaselineAlarm, type BridgeLegacyBaselineAlarm } from "./mesh/bridge-baseline-alarms.js";
 import { BridgeHandoffRefusedError, BridgeHandoffUsageError, handOffNativeIdentity, handoffRootId, listHandoffs, revokeHandoff } from "./mesh/bridge-handoff.js";
-import { MeshStore, type MeshStoreOptions } from "./mesh/store.js";
+import { MeshStore, meshAlarmRecipient, type MeshStoreOptions } from "./mesh/store.js";
+import { systemdWatchdogNotify } from "./mesh/systemd-watchdog.js";
 
 // Fabric's defaults for mesh.maxEventBytes and mesh.maxReadEvents (src/config.ts).
 const MAX_EVENT_BYTES = 256 * 1024;
@@ -34,7 +38,7 @@ const HANDOFF_USAGE: ReadonlyMap<string, string> = new Map([
 
 const USAGE = `usage:
   mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--max-state-bytes BYTES] [--call-timeout-ms MS] [--log-level info|debug] [--factory-rate PER_MINUTE] [--factory-burst N] [--factory-bytes BYTES_PER_MINUTE] [--factory-byte-burst BYTES] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
-  mesh-bridge agent --mesh ROOT --peer NAME [--lock-protocol 1|2] [--max-state-bytes BYTES]
+  mesh-bridge agent --mesh ROOT --peer NAME [--lock-protocol 1|2] [--max-state-bytes BYTES] [--log-level info|debug]
 ${[...HANDOFF_USAGE.values()].map((line) => `  ${line}`).join("\n")}`;
 
 /**
@@ -110,13 +114,17 @@ const log = (message: string): void => void process.stderr.write(`mesh-bridge: $
 
 const runAgent = async (flags: Map<string, string>): Promise<void> => {
   const peer = required(flags, "peer");
-  const side = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), peer);
+  const side = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), peer, Date.now, true);
+  const logLevel = flags.get("log-level") ?? "info";
+  if (logLevel !== "info" && logLevel !== "debug") throw new Error("--log-level must be info or debug");
   await side.store.prepareLock();
-  await serveBridgeAgent(side, process.stdin, process.stdout);
+  await serveBridgeAgent(side, process.stdin, process.stdout, logLevel === "debug" ? log : undefined);
 };
 
-/** A transport child that ignores SIGTERM is killed this long after it. */
-const CHILD_KILL_MS = 2_000;
+/** Grace period after clean stdin EOF before terminating a stuck transport child. */
+const CHILD_STOP_GRACE_MS = 2_000;
+const CHILD_TERM_GRACE_MS = 500;
+const BRIDGE_STOP_MS = 5_000;
 
 /**
  * Run one bridge until the signal aborts it or the transport fails. Every wait on the remote is
@@ -152,13 +160,34 @@ export const runBridge = async (
   if (!(Number.isSafeInteger(factoryRate.burst) && factoryRate.burst > 0)) throw new Error("--factory-burst must be a positive integer");
   if (!(Number.isSafeInteger(factoryRate.bytesPerMinute) && factoryRate.bytesPerMinute > 0)) throw new Error("--factory-bytes must be a positive integer of bytes a minute");
   if (!(Number.isSafeInteger(factoryRate.byteBurst) && factoryRate.byteBurst > 0)) throw new Error("--factory-byte-burst must be a positive integer");
-  const local = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), remoteName);
+  const local = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), remoteName, Date.now, true);
   const argv = transportCommand(flags, command);
-  if (signal.aborted) return 0;
+  if (signal.aborted) {
+    local.store.closeState();
+    return 0;
+  }
   // Prepare before starting the link, not inside a short registry/mesh try. Readiness is
   // immutable for this store; an unknown identity still permits conservative publication.
-  await local.store.prepareLock();
-  if (signal.aborted) return 0;
+  let removePrepareAbort: (() => void) | undefined;
+  const abortedDuringPrepare = new Promise<void>((resolve) => {
+    if (signal.aborted) { resolve(); return; }
+    const onAbort = (): void => resolve();
+    signal.addEventListener("abort", onAbort, { once: true });
+    removePrepareAbort = () => signal.removeEventListener("abort", onAbort);
+  });
+  let prepared: boolean;
+  try {
+    prepared = await Promise.race([local.store.prepareLock().then(() => true), abortedDuringPrepare.then(() => false)]);
+  } catch (error) {
+    local.store.closeState();
+    throw error;
+  } finally {
+    removePrepareAbort?.();
+  }
+  if (!prepared || signal.aborted) {
+    local.store.closeState();
+    return 0;
+  }
 
   const child = spawn(argv[0]!, argv.slice(1), { env: childProcessEnvironment(), stdio: ["pipe", "pipe", "inherit"] });
   let spawnError: Error | undefined;
@@ -175,10 +204,40 @@ export const runBridge = async (
       resolve();
     });
   });
+  const childAlive = (): boolean => child.exitCode === null && child.signalCode === null;
+  const waitForExit = async (ms: number): Promise<void> => {
+    if (!childAlive()) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([exited, new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); })]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+  let transportStop: Promise<void> | undefined;
+  const stopTransport = (): Promise<void> => {
+    if (transportStop) return transportStop;
+    const stopError = new Error("Bridge stop requested");
+    if (remote?.closeGracefully) remote.closeGracefully(stopError);
+    else if (remote) remote.close?.(stopError);
+    else child.stdin.end();
+    transportStop = (async () => {
+      await waitForExit(CHILD_STOP_GRACE_MS);
+      if (childAlive()) {
+        child.kill("SIGTERM");
+        await waitForExit(CHILD_TERM_GRACE_MS);
+        if (childAlive()) child.kill("SIGKILL");
+        await waitForExit(CHILD_TERM_GRACE_MS);
+      }
+    })();
+    return transportStop;
+  };
   child.stdin.on("error", () => undefined);
   let bridge: MeshBridge | undefined;
   let relay: Awaited<ReturnType<typeof startBridgeRelay>> | undefined;
   let starting: Promise<void> | undefined;
+  let stopDeadline: number | undefined;
+  let abortListener: (() => void) | undefined;
   let code = 0;
   try {
     onChild?.(child.pid);
@@ -187,20 +246,57 @@ export const runBridge = async (
     const linked = remote;
     bridge = new MeshBridge({
       localName, remoteName, local, remote: linked, cursorPath,
+      publishLegacyBaselineAlarm: (alarm: BridgeLegacyBaselineAlarm) => publishBridgeLegacyBaselineAlarm(local.store,
+        { id: `bridge:${localName}`, name: "mesh-bridge", kind: "main" }, alarm),
       relay: async (destinationRemote, event) => {
         if (!relay || signal.aborted) throw new BridgeRelayUnavailableError();
         await relay.send(destinationRemote, event);
       },
       stopMs: Math.min(callTimeoutMs, 5_000),
       log,
+      notifyWatchdog: systemdWatchdogNotify,
+      publishStallAlarm: async (alarm: BridgeStallAlarm) => {
+        const to = meshAlarmRecipient();
+        if (!to) {
+          log("stall alarm has no configured mesh alarm session recipient");
+          return;
+        }
+        await local.store.publish({ topic: BRIDGE_STALL_ALARM_TOPIC, kind: "bridge-stall",
+          from: { id: `bridge:${localName}`, name: "mesh-bridge", kind: "main" }, to,
+          text: alarm.reason, data: alarm, dedupeKey: `bridge-stall:${localName}:${remoteName}:${alarm.stallId}` });
+      },
+      publishDeliveryAgeAlarm: async (alarm: BridgeDeliveryAgeAlarm) => {
+        const to = meshAlarmRecipient();
+        if (!to) {
+          log("delivery-age alarm has no configured mesh alarm session recipient");
+          return;
+        }
+        await local.store.publish({ topic: "ops.owner",
+          kind: alarm.state === "outage" ? "bridge.delivery-age.alarm" : "bridge.delivery-age.recovered",
+          from: { id: `bridge:${localName}`, name: "mesh-bridge", kind: "main" }, to,
+          text: alarm.state === "outage"
+            ? `Bridge ${remoteName} ${alarm.direction} delivery or receipt age exceeded ${BRIDGE_DELIVERY_AGE_ALERT_MS} ms (${alarm.reason}, delivery ${alarm.maxDeliveryAgeMs} ms, receipt ${alarm.maxAckLatencyMs} ms)`
+            : `Bridge ${remoteName} ${alarm.direction} delivery recovered after ${alarm.durationMs ?? 0} ms (max delivery ${alarm.maxDeliveryAgeMs} ms, receipt ${alarm.maxAckLatencyMs} ms)`,
+          data: alarm,
+          dedupeKey: `bridge-delivery-age:${localName}:${remoteName}:${alarm.direction}:${alarm.episodeId}:${alarm.state}` });
+      },
       factoryRate,
       ...(logLevel === "debug" ? { debug: (message: string) => log(`debug: ${message}`) } : {}),
     });
     const running = bridge;
-    const aborted = new Promise<void>((resolve) => {
-      if (signal.aborted) resolve();
-      else signal.addEventListener("abort", () => resolve(), { once: true });
-    });
+    let resolveAborted!: () => void;
+    const aborted = new Promise<void>((resolve) => { resolveAborted = resolve; });
+    const onAbort = (): void => {
+      stopDeadline ??= Date.now() + BRIDGE_STOP_MS;
+      // Fence sync/forwarding and end remote stdin now; waiting for the startup or pass promise
+      // before closing the transport could exceed systemd's stop budget on a silent peer.
+      void running.stop();
+      void stopTransport();
+      resolveAborted();
+    };
+    abortListener = onAbort;
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
     // Start/sync the link before binding a delivery server. The registered script is the
     // exact canonical bin entry in THIS package generation, never argv[1] or a current link.
     starting = (async () => {
@@ -210,9 +306,14 @@ export const runBridge = async (
       if (signal.aborted) return;
       if (process.platform === "linux") {
         try {
-          relay = await startBridgeRelay({ localName, remoteName, meshRoot: local.store.root,
+          const startedRelay = await startBridgeRelay({ localName, remoteName, meshRoot: local.store.root,
             bridgeScriptPath: fs.realpathSync(fileURLToPath(new URL("../bin/mesh-bridge", import.meta.url))),
             deliver: (sourceRemote, event) => running.deliverRelay(sourceRemote, event) });
+          if (signal.aborted) {
+            await startedRelay.close().catch(() => undefined);
+            return;
+          }
+          relay = startedRelay;
         } catch {
           // Unsafe/missing authentication or socket authority is a relay-only refusal.
           // Do not leak exception details; hub-local bridge traffic remains supported.
@@ -230,26 +331,38 @@ export const runBridge = async (
       aborted,
     ]);
   } catch (error) {
-    if (!signal.aborted || spawnError) {
+    if (!signal.aborted) {
       log(`stopped: ${(spawnError ?? (error instanceof Error ? error : new Error(String(error)))).message}`);
       code = 1;
     }
   } finally {
-    // Join initialization so an abort cannot leave a late-bound socket behind. All startup
-    // remote calls are bounded; no receiver is advertised before its presence is ready.
-    await starting?.catch(() => undefined);
-    // Fence/close delivery ingress BEFORE withdrawing presence or shutting down the link.
-    await relay?.close().catch(() => undefined);
+    abortListener && signal.removeEventListener("abort", abortListener);
+    stopDeadline ??= Date.now() + BRIDGE_STOP_MS;
+    const within = async (work: Promise<unknown>): Promise<void> => {
+      const remaining = stopDeadline! - Date.now();
+      if (remaining <= 0) {
+        void work.catch(() => undefined);
+        return;
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([work.catch(() => undefined), new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, remaining);
+          timer.unref?.();
+        })]);
+      } finally { if (timer !== undefined) clearTimeout(timer); }
+    };
+    // On SIGTERM/SIGINT this joins the already-started, idempotent fence and graceful close.
+    // Startup, relay, bridge and child cleanup all share the same five-second stop budget.
+    if (starting) await within(starting.catch(() => undefined));
+    const relayClose = relay?.close().catch(() => undefined) ?? Promise.resolve();
     relay = undefined;
-    // The mirrors of the remote on this side go at once; the remote's lapse with their lease.
-    await (bridge ? bridge.stop() : local.withdraw()).catch(() => undefined);
-    remote?.close();
-    if (child.pid !== undefined && child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-    const timer = setTimeout(() => child.kill("SIGKILL"), CHILD_KILL_MS);
-    await exited;
-    clearTimeout(timer);
+    const bridgeStop = bridge?.stop() ?? Promise.resolve();
+    const childStop = stopTransport();
+    await within(Promise.all([relayClose, bridgeStop, childStop]));
+    local.store.closeState();
   }
-  return spawnError ? 1 : code;
+  return signal.aborted ? 0 : spawnError ? 1 : code;
 };
 
 /**
@@ -321,10 +434,30 @@ export const main = async (
   }
   if (mode === "run") {
     const controller = new AbortController();
-    const abort = (): void => controller.abort();
-    process.once("SIGTERM", abort);
-    process.once("SIGINT", abort);
-    return runBridge(flags, command, controller.signal);
+    let signals = 0;
+    let transportPid: number | undefined;
+    const stop = (): void => {
+      if (++signals === 1) {
+        controller.abort();
+        return;
+      }
+      if (transportPid !== undefined) {
+        try { process.kill(transportPid, "SIGKILL"); } catch { /* Child already exited. */ }
+      }
+      process.exit(0);
+    };
+    process.on("SIGTERM", stop);
+    process.on("SIGINT", stop);
+    try {
+      return await runBridge(flags, command, controller.signal, (pid) => { transportPid = pid; });
+    } finally {
+      // Keep the two-signal contract armed until process exit after a requested stop; cleanup may
+      // finish before systemd or an operator delivers a second signal.
+      if (!controller.signal.aborted) {
+        process.off("SIGTERM", stop);
+        process.off("SIGINT", stop);
+      }
+    }
   }
   process.stderr.write(`${USAGE}\n`);
   return 2;

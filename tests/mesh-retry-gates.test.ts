@@ -236,6 +236,7 @@ it("actor preparation cause chains keep pending/snapshot work automatically retr
   for (const [index, error] of cases().entries()) {
     const agents = {
       config: DEFAULT_FABRIC_CONFIG.agents, resolveKernel: () => undefined, defaultModel: () => undefined,
+      resolveModelReasonPolicy: vi.fn(() => ({ model: undefined, thinking: undefined, fallback: false })),
       actorArchiveSources: () => new Map(), run: vi.fn(),
     } as unknown as AgentManager;
     const prepare = vi.fn(async () => { throw new Error("recorded custody refusal", { cause: error }); });
@@ -273,7 +274,7 @@ it("host reaper defers pending/snapshot without removing selected records and pr
     const writeBatch = vi.fn(async (input: MeshBatchInput) => {
       input.prepare?.({ get: key => entries.find(item => item.key === key),
         listAll: prefix => entries.filter(item => item.key.startsWith(prefix)),
-        version: key => entries.find(item => item.key === key)?.version ?? 0 });
+        version: key => entries.find(item => item.key === key)?.version ?? 0 }, io.leases);
       input.beforeCommit?.();
       throw error; // no COMMIT, so neither outbox nor post-commit file removal may run
     });

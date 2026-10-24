@@ -30,6 +30,21 @@ const fixture = async () => {
 };
 
 describe("participant directory display reads (smarty-dev#4250)", () => {
+  it("projects a supplied display snapshot but ignores it for ordinary and fresh peer reads (#13895)", async () => {
+    const f = await fixture();
+    const displayParticipants = [{ ...f.directory.self(), id: "session:projected", kind: "root" as const,
+      cwd: "/project", sessionId: "projected", status: "idle" as const }];
+    const list = vi.spyOn(f.directory, "list");
+    expect(f.directory.peers(undefined, { background: true, displayParticipants })).toMatchObject([{ id: "session:projected" }]);
+    expect(f.directory.peers(undefined, { background: true, displayParticipants: [] })).toEqual([]);
+    expect(list).not.toHaveBeenCalled();
+    for (const options of [{}, { fresh: true }, { background: true, fresh: true }]) {
+      expect(f.directory.peers(undefined, { ...options, displayParticipants })).toEqual([]);
+    }
+    expect(list).toHaveBeenCalledTimes(3);
+    expect(f.options().every(read => read.displayOnly !== true)).toBe(true);
+  });
+
   it("only background listings read displayOnly; ordinary and fresh listings stay bound", async () => {
     const f = await fixture();
     // Every state read one listing makes (its scan and its self fallback) uses one mode.

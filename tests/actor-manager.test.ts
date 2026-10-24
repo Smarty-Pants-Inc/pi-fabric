@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ACTOR_FAILURE_NOTICE_AFTER, ACTOR_TRANSIENT_BLOCK_BACKOFF_MAX_MS, ACTOR_TRANSIENT_BLOCK_BACKOFF_MS, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC,
   activationBlockBackoffMs, actorRealarmKey, ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
 import { classifyActivationFailure } from "../src/actors/activation-failure.js";
@@ -18,13 +18,14 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { closeWithActors } from "../src/actors/close-order.js";
-import { ActorRegistryStore } from "../src/actors/registry-store.js";
+import { ActorRegistryStore, ActorRegistryUpdateVetoedError } from "../src/actors/registry-store.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { actorParticipantRecord } from "../src/topology/records.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { LIVENESS_POLICY_KEY, writeHostLease } from "../src/topology/host-leases.js";
+import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
 
 // smarty-dev#1031: Linux, Darwin and Windows support the Main publication fence (smarty-dev#8090;
 // follow-up smarty-dev#11335). Only unsupported platforms resolve pending with this refusal and keep the tree.
@@ -38,6 +39,50 @@ const refusedRemoval = (rootId = "session:test") => ({
 const roots: string[] = [];
 const actorManagers: ActorManager[] = [];
 const agentManagers: AgentManager[] = [];
+// Private legacy-control fixture for this suite: #11864 is listed; #1 is not.
+const legacyExceptionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-manager-exceptions-"));
+const boundLegacyRootRecord = Object.freeze({ cwd: legacyExceptionRoot });
+const legacyExceptionPath = path.join(legacyExceptionRoot, "model-exceptions.json");
+const emptyLegacyGrantDocument = JSON.stringify({ version: 1, grants: [] });
+fs.writeFileSync(legacyExceptionPath, emptyLegacyGrantDocument);
+const legacyFixtureRoots = new Map<string, Readonly<{ cwd: string }>>();
+const legacyCanonicalModels = new Set([
+  "anthropic/claude-opus-5-5", "anthropic/claude-sonnet-4-5", "claude-haiku-test",
+]);
+const originalModelExceptionsPath = DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = legacyExceptionPath;
+const hasPosixTrustMetadata = process.platform !== "win32" && typeof process.getuid === "function";
+const trustedExceptionFixturePaths = new Set<string>();
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+beforeEach(() => {
+  trustedExceptionFixturePaths.clear();
+  trustedExceptionFixturePaths.add(legacyExceptionPath);
+  legacyFixtureRoots.clear();
+  legacyFixtureRoots.set(legacyExceptionPath, boundLegacyRootRecord);
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    const rootRecord = legacyFixtureRoots.get(file);
+    const previous = fs.readFileSync(file, "utf8");
+    const canonicalModel = args[0]?.trim();
+    // Only the registered, otherwise-empty legacy fixture gets an exact call-scoped row.
+    // Explicit role/model/issue-negative documents are NEVER replaced, nor is #1 allowed.
+    const materialize = rootRecord && canonicalModel && legacyCanonicalModels.has(canonicalModel) && previous === emptyLegacyGrantDocument;
+    if (materialize) fs.writeFileSync(file, JSON.stringify({ version: 1, grants: [modelExceptionGrant({
+      model: canonicalModel, lane: path.basename(rootRecord.cwd), role: args[3] ?? "task", thinking: args[4] ?? this.config.thinking,
+    })] }));
+    try { return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args)); }
+    finally { if (materialize) fs.writeFileSync(file, previous); }
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
+
+afterAll(() => {
+  if (originalModelExceptionsPath === undefined) delete DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+  else DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = originalModelExceptionsPath;
+  fs.rmSync(legacyExceptionRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+});
 
 const DEFAULT_WAIT_MS = process.env.CI ? 10_000 : 2_000;
 
@@ -67,7 +112,17 @@ const setup = (
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-test-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-  const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, ...agentOverrides }, {
+  // Private legacy-control fixture: #11864 is explicitly listed; #1 remains unlisted.
+  const boundRootRecord = Object.freeze({ cwd: root });
+  const modelExceptionsPath = agentOverrides.modelExceptionsPath ?? path.join(root, "model-exceptions.json");
+  if (!agentOverrides.modelExceptionsPath) {
+    fs.writeFileSync(modelExceptionsPath, emptyLegacyGrantDocument);
+    trustedExceptionFixturePaths.add(modelExceptionsPath);
+    legacyFixtureRoots.set(modelExceptionsPath, boundRootRecord);
+  }
+  const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, ...agentOverrides, modelExceptionsPath }, {
+    rootSessionCwd: () => boundRootRecord.cwd,
+    claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     runRoot: path.join(root, "runs"),
     ...(modelValidation?.preparePiModel
@@ -112,7 +167,34 @@ const setup = (
 afterEach(async () => {
   await Promise.all(actorManagers.splice(0).map((manager) => manager.close()));
   await Promise.all(agentManagers.splice(0).map((manager) => manager.close()));
+  restoreAdmissionFixture?.();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("F-01 Veda Claude-code actor admission", () => {
+  it("keeps unsupported Veda actors refused and allows a safe Pi override", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-veda-home-")); roots.push(home);
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+    const { actors, agents } = setup(false, undefined, undefined, undefined, {}, {
+      runner: "veda",
+      modelPolicy: { requireReason: ["claude", "opus"] },
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
+    });
+    const reason = "#11864 actor Claude-code exception";
+    try {
+      for (const modelReason of [undefined, reason]) {
+        await expect(actors.create({ name: "unsupported-veda", instructions: "Review.", ...(modelReason !== undefined ? { modelReason } : {}) }))
+          .rejects.toThrow(/Invalid Fabric actor runner/);
+      }
+      expect(actors.list()).toEqual([]);
+      const actor = await actors.create({ name: "safe-pi-actor", instructions: "Review.", runner: "pi", model: "cliproxyapi/gpt-6-luna" });
+      await actors.ask(actor.id, "Review the fixture.");
+      const run = agents.list().find(entry => entry.actorName === actor.name);
+      expect(run).toMatchObject({ status: "completed", runner: "pi", model: "cliproxyapi/gpt-6-luna", actorName: actor.name });
+      expect(run?.modelReason).toBeUndefined();
+      expect(fs.existsSync(path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl"))).toBe(false);
+    } finally { homedir.mockRestore(); }
+  });
 });
 
 describe("owner-minted supervisor interrupt binding (#7452)", () => {
@@ -251,9 +333,9 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     return registry.actors.find((actor: { id: string }) => actor.id === id);
   };
 
-  it("round 2 preserves project defaults through an old-runtime save that strips unknown fields", async () => {
+  it.runIf(hasPosixTrustMetadata)("round 2 preserves project defaults through an old-runtime save that strips unknown fields", async () => {
     const state = setup(true);
-    const defaults = { model: "anthropic/claude-opus-5-5", modelReason: "project policy", thinking: "medium" as const };
+    const defaults = { model: "anthropic/claude-opus-5-5", modelReason: "#11864 project policy", thinking: "medium" as const };
     const actor = await state.actors.create({ name: "rollback-defaults", instructions: "Observe.", ...defaults });
     await state.actors.ask(actor.id, "foreign run", undefined, undefined, {
       binding: { model: "provider/foreign", modelReason: "one run only", thinking: "low" },
@@ -359,10 +441,10 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     return restarted;
   };
 
-  it("republishes an idle actor's last resolved binding after a host restart without a run (#8487)", async () => {
+  it.runIf(hasPosixTrustMetadata)("republishes an idle actor's last resolved binding after a host restart without a run (#8487)", async () => {
     const state = setup(true);
     const actor = await state.actors.create({ name: "restart-binding", instructions: "Observe.",
-      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+      model: "anthropic/claude-opus-5-5", modelReason: "#11864 restart binding", thinking: "medium" });
     await state.actors.setModel(actor.id, "cliproxyapi/gpt-6-luna");
     await state.actors.setThinking(actor.id, "xhigh");
     await state.actors.ask(actor.id, "first");
@@ -555,10 +637,10 @@ describe("ActorManager bound registry metadata (#7682)", () => {
     expect(row(state.root, recreated.id)).toMatchObject({ model: "provider/new", thinking: "low" });
   });
 
-  it("replaces the Opus stamp with each admitted run binding without extra writes or wakes", async () => {
+  it.runIf(hasPosixTrustMetadata)("replaces the Opus stamp with each admitted run binding without extra writes or wakes", async () => {
     const state = setup(true);
     const actor = await state.actors.create({ name: "bound-registry", instructions: "Observe.",
-      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+      model: "anthropic/claude-opus-5-5", modelReason: "#11864 bound registry", thinking: "medium" });
     await state.actors.setModel(actor.id, "cliproxyapi/gpt-6-luna");
     await state.actors.setThinking(actor.id, "xhigh");
     const saves = vi.spyOn(ActorRegistryStore.prototype, "prepare");
@@ -4322,6 +4404,118 @@ describe("ActorManager", () => {
         return manager;
       };
 
+      it.each([true, false])("#11998 only a typed registry veto during preparation expires (typed=%s)", async typed => {
+        const s = setup(true);
+        const actor = await s.actors.create({ name: "veto-review", instructions: "Respond.", responseMode: "text", topics: ["veto.review"] });
+        await s.actors.close();
+        const manager = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+          actorRoot: path.join(s.root, "actors"), persistent: true, preparationRetryMs: 1,
+          transientBlockCooldownMs: 2_000, transientBlockMaxMs: 5_000,
+        });
+        actorManagers.push(manager);
+        const time = clock();
+        const runs = recordRuns(s.agents);
+        const update = ActorRegistryStore.prototype.update;
+        let veto = true;
+        vi.spyOn(ActorRegistryStore.prototype, "update").mockImplementation(function (this: ActorRegistryStore, select, label) {
+          if (veto && label === "manager-update" && manager.status(actor.id).preparing?.phase === "registry") {
+            return Promise.reject(typed ? new ActorRegistryUpdateVetoedError("ownership")
+              : new Error(new ActorRegistryUpdateVetoedError().message));
+          }
+          return update.call(this, select, label);
+        });
+        await expect(manager.ask(actor.id, "activate")).rejects.toThrow("Actor registry update was vetoed");
+        await waitFor(() => !manager.status(actor.id).preparing);
+        const blocked = manager.status(actor.id).activationBlocked!;
+        if (!typed) {
+          expect(blocked).toMatchObject({ code: "unknown", class: "hard" });
+          expect(blocked).not.toHaveProperty("retryAt");
+          expect(runs).toHaveLength(0);
+          time.set(Date.now() + 24 * 60 * 60 * 1_000);
+          expect(manager.status(actor.id).activationBlocked).toMatchObject({ code: "unknown", class: "hard" });
+          return;
+        }
+        expect(blocked).toMatchObject({ reason: "actor registry validation veto (ownership)",
+          classification: expect.stringContaining("(ownership)"), code: "registry-update-vetoed", class: "transient", backoffMs: 2_000,
+          retryAt: blocked.blockedAt! + 2_000 });
+        expect(runs).toHaveLength(0); // the registry did not admit a worker
+        time.freeze(blocked.retryAt! - 1);
+        expect(manager.status(actor.id).activationBlocked).toBeDefined();
+        veto = false;
+        time.freeze(blocked.retryAt! + 1);
+        expect(manager.status(actor.id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "registry-update-vetoed" } });
+        time.set(blocked.retryAt! + 1); // Resume wall-clock progress before asynchronous publish/wait.
+        await s.mesh.publish({ topic: "veto.review", from: s.identity, text: "probe after cooldown" });
+        await waitFor(() => runs[0]?.finishedAt !== undefined && !manager.status(actor.id).inFlightRun);
+        expect(runs).toHaveLength(1);
+        expect(manager.status(actor.id)).not.toHaveProperty("activationBlocked");
+        // A genuinely hard failure on the recovered actor still never expires.
+        await failOnce(manager, s.agents, actor.id, "Error: 401 Unauthorized: invalid api key");
+        expect(manager.status(actor.id).activationBlocked).toMatchObject({ code: "auth", class: "hard" });
+        expect(manager.status(actor.id).activationBlocked).not.toHaveProperty("retryAt");
+        time.set(Date.now() + 24 * 60 * 60 * 1_000);
+        expect(manager.status(actor.id).activationBlocked).toMatchObject({ code: "auth", class: "hard" });
+      }, 60_000);
+
+      it("#11998 reclassifies persisted hard registry blocks on host load, but preserves a real 401 hard block", async () => {
+        const s = setup(true);
+        const unknown = await s.actors.create({ name: "legacy-veto", instructions: "Respond.", responseMode: "text", topics: ["legacy.veto"] });
+        const prep = await s.actors.create({ name: "legacy-prep-veto", instructions: "Respond.", responseMode: "text" });
+        const auth = await s.actors.create({ name: "legacy-auth", instructions: "Respond.", responseMode: "text" });
+        const contention = await s.actors.create({ name: "legacy-contention", instructions: "Respond.", responseMode: "text", topics: ["legacy.contention"] });
+        const known = await s.actors.create({ name: "known-veto", instructions: "Respond.", responseMode: "text" });
+        const canonical = await s.actors.create({ name: "canonical-veto", instructions: "Respond.", responseMode: "text" });
+        const security = await s.actors.create({ name: "known-veto-security", instructions: "Respond.", responseMode: "text" });
+        await s.actors.close();
+        const file = path.join(s.root, "actors", "actors.json");
+        const registry = JSON.parse(fs.readFileSync(file, "utf8"));
+        const since = Date.now() - 13 * 60 * 60 * 1_000;
+        const veto = new ActorRegistryUpdateVetoedError().message;
+        const legacy: Record<string, Record<string, unknown>> = {
+          [unknown.id]: { reason: veto, code: "unknown", classification: "fail-closed: no transient cause recognised" },
+          [prep.id]: { reason: `Actor ${prep.id} preparation (registry): ${veto}`, code: "failing-preparation",
+            classification: "permanent: activation preparation kept failing past its retry budget" },
+          [auth.id]: { reason: "Error: 401 Unauthorized: invalid api key", code: "auth", classification: "permanent: credential or authentication failure" },
+          [contention.id]: { reason: "Actor registry changed repeatedly during preparation", code: "unknown",
+            classification: "fail-closed: no transient cause recognised" },
+          [known.id]: { reason: `Actor private-id preparation (registry): ${veto}`, code: "registry-update-vetoed",
+            classification: "transient: actor registry update veto committed nothing; retry after backoff" },
+          [canonical.id]: { reason: "actor registry validation veto (ownership)", code: "registry-update-vetoed",
+            classification: "transient: actor registry validation veto (ownership) committed nothing; retry after backoff" },
+          [security.id]: { reason: `Actor private-id preparation (registry): ${veto}`, code: "registry-update-vetoed",
+            classification: "security policy violation" },
+        };
+        for (const row of registry.actors as Array<Record<string, unknown>>) {
+          row.activationBlocked = { ...legacy[row.id as string]!, class: "hard", since: row.id === contention.id ? Date.now() : since, count: 7 };
+          row.failureStreak = { count: 7, notified: true };
+        }
+        fs.writeFileSync(file, JSON.stringify(registry));
+        const restored = new ActorManager("test", s.identity, s.mesh, s.meshConfig, s.agents, () => {}, {
+          actorRoot: path.join(s.root, "actors"), persistent: true,
+        });
+        actorManagers.push(restored);
+        expect(restored.status(contention.id).activationBlocked).toMatchObject({
+          code: "registry-changed-repeatedly", class: "transient", retryAt: expect.any(Number),
+          reason: "actor registry changed repeatedly during preparation",
+        });
+        for (const id of [unknown.id, prep.id, known.id, canonical.id]) {
+          const expired = restored.status(id).activationBlockExpired!;
+          expect(restored.status(id)).toMatchObject({ status: "idle", activationBlockExpired: { code: "registry-update-vetoed", class: "transient",
+            lastBlockedReason: `actor registry validation veto (${id === canonical.id ? "ownership" : "caller-validation"})` } });
+          expect(JSON.stringify(expired)).not.toContain("private-id");
+          expect(expired.lastBlockedReason).not.toContain(id);
+        }
+        expect(restored.status(security.id).activationBlocked).toMatchObject({ code: "security-policy", class: "hard" });
+        expect(restored.status(security.id).activationBlocked).not.toHaveProperty("retryAt");
+        expect(JSON.stringify(restored.status(security.id).activationBlocked)).not.toContain("private-id");
+        const runs = recordRuns(s.agents);
+        await s.mesh.publish({ topic: "legacy.veto", from: s.identity, text: "route after host restart" });
+        await waitFor(() => runs[0]?.finishedAt !== undefined && !restored.status(unknown.id).inFlightRun);
+        expect(restored.status(unknown.id)).not.toHaveProperty("activationBlocked");
+        expect(restored.status(auth.id)).toMatchObject({ status: "failed", activationBlocked: { code: "auth", class: "hard", since } });
+        expect(restored.status(auth.id).activationBlocked).not.toHaveProperty("retryAt");
+      }, 60_000);
+
       it("uses the configured cooldown; each failed probe doubles it up to the configured cap", async () => {
         const s = setup(true);
         const time = clock();
@@ -4610,14 +4804,17 @@ describe("ActorManager", () => {
     });
   });
 
-  it("resumes a Claude Code session after a persistent actor is restored", async () => {
+  it.runIf(hasPosixTrustMetadata)("resumes a Claude Code session after a persistent actor is restored", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-actor-"));
     roots.push(root);
     const invocationLog = path.join(root, "claude-args.jsonl");
     process.env.FAKE_CLAUDE_LOG = invocationLog;
     try {
       const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
-      const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents,
+        claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" },
+      }, {
+        rootSessionCwd: () => boundLegacyRootRecord.cwd,
         workerPath: path.resolve("src/worker.ts"),
         claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
         runRoot: path.join(root, "runs"),
@@ -4645,6 +4842,7 @@ describe("ActorManager", () => {
         name: "claude-reviewer",
         instructions: "Review each mailbox item.",
         runner: "claude",
+        modelReason: "Native Claude session persistence probe #11864",
         tools: ["read"],
       });
 
@@ -4669,14 +4867,27 @@ describe("ActorManager", () => {
       const secondReply = await restored.ask(actor.id, "second message");
       expect(secondReply.text).toContain("fake claude complete");
 
-      const invocations = fs
+      const calls = fs
         .readFileSync(invocationLog, "utf8")
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line) as { argv: string[] });
+      // Catalog discovery is separate from the two persistent actor activations.
+      const discovery = calls.filter(({ argv }) => !argv.includes("--model"));
+      expect(discovery).toHaveLength(1);
+      expect(discovery[0]!.argv).toEqual(expect.arrayContaining([
+        "--safe-mode", "--no-session-persistence", "--tools", "",
+      ]));
+      expect(discovery[0]!.argv).not.toContain("--resume");
+      const invocations = calls.filter(({ argv }) => argv.includes("--model"));
       expect(invocations).toHaveLength(2);
+      for (const { argv } of invocations) {
+        expect(argv[argv.indexOf("--model") + 1]).toBe("claude-haiku-test");
+        expect(argv).not.toContain("--no-session-persistence");
+      }
       expect(invocations[0]!.argv).not.toContain("--resume");
       const resumeAt = invocations[1]!.argv.indexOf("--resume");
+      expect(resumeAt).toBeGreaterThanOrEqual(0);
       expect(invocations[1]!.argv[resumeAt + 1]).toBe(
         "11111111-1111-4111-8111-111111111111",
       );
@@ -5076,7 +5287,80 @@ describe("ActorManager", () => {
     expect(eventTypes).toContain("agent_start");
   });
 
-  it("setModel updates and clears an actor's model and it takes effect on the next run", async () => {
+  it("requires the exact actor role for an issue grant before persistent admission", async () => {
+    const state = setup();
+    const exceptionPath = state.agents.config.modelExceptionsPath!;
+    const opus = "anthropic/claude-opus-5-5";
+    const reason = "Role-scoped actor test #1";
+    const writeGrant = (roles: string[]) => fs.writeFileSync(exceptionPath, JSON.stringify({ version: 1, grants: roles.map(role => modelExceptionGrant({
+      issue: "Smarty-Pants-Inc/smarty-dev#1", model: opus, lane: path.basename(state.root), role,
+    })) }));
+    writeGrant(["task"]);
+    if (!hasPosixTrustMetadata) {
+      await expect(state.actors.create({ name: "reviewer", instructions: "Review.", model: opus, modelReason: reason }))
+        .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "untrusted-source", role: "actor:reviewer" });
+      expect(state.actors.list()).toEqual([]);
+      return; // Trust fails earlier on Windows; never skip the no-mutation refusal.
+    }
+
+    const taskReceipt = await state.agents.run({ task: "task role control", model: opus, modelReason: reason, transport: "process" });
+    expect(taskReceipt).toMatchObject({ status: "completed", model: opus, modelReason: reason });
+    const auditFile = path.join(os.homedir(), ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
+    const auditRows = fs.readFileSync(auditFile, "utf8").trim().split("\n").filter(Boolean)
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+    expect(auditRows.find(row => row.reason === reason)).toMatchObject({ ref: "Smarty-Pants-Inc/smarty-dev#1", role: "task", model: opus,
+      grant_id: expect.any(String), issue: "Smarty-Pants-Inc/smarty-dev#1", lane: path.basename(state.root), host: os.hostname().split(".")[0], thinking: expect.any(String), run_id: taskReceipt.id, time: expect.any(String) });
+    await expect(state.actors.create({ name: "reviewer", instructions: "Review.", model: opus, modelReason: reason }))
+      .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "role-mismatch", role: "actor:reviewer" });
+    expect(state.actors.list()).toEqual([]);
+
+    writeGrant(["actor:reviewer"]);
+    const actor = await state.actors.create({ name: "reviewer", instructions: "Review.", model: opus, modelReason: reason });
+    expect(state.actors.status(actor.id)).toMatchObject({ model: opus, modelReason: reason });
+  });
+
+  it("model-policy boundary (#11864) guards direct actor create, binding rebind, and safe reset", async () => {
+    const opus = "anthropic/claude-opus-5-5";
+    const luna = "cliproxyapi/gpt-6-luna";
+    const reason = "#11864 direct actor exception";
+    const state = setup(false, undefined, undefined, undefined, {}, {
+      modelPolicy: { requireReason: ["gpt-6-astra", "opus", "claude"], fallbackModel: luna, fallbackThinking: "high" },
+    });
+    await expect(state.actors.create({ name: "bare-opus", instructions: "Review.", model: opus }))
+      .rejects.toThrow(/#2264|named exception/);
+    if (!hasPosixTrustMetadata) {
+      const safe = await state.actors.create({ name: "safe-binding", instructions: "Review.", model: luna });
+      await expect(state.actors.resolveActivationBinding(safe.id, { overrides: { model: opus } })).rejects.toThrow(/#2264|named exception/);
+      for (const scope of ["session", "project"] as const) {
+        await expect(state.actors.setModel(safe.id, opus, scope)).rejects.toThrow(/#2264|named exception/);
+        expect(state.actors.status(safe.id)).toMatchObject({ model: luna });
+        await state.actors.resetSession(safe.id);
+        expect(state.actors.status(safe.id)).toMatchObject({ model: luna });
+      }
+      return;
+    }
+    const actor = await state.actors.create({ name: "named-opus", instructions: "Review.", model: opus, opusReason: reason });
+    expect(state.actors.status(actor.id)).toMatchObject({ model: opus, modelReason: reason });
+
+    const safe = await state.actors.create({ name: "safe-binding", instructions: "Review.", model: luna });
+    await expect(state.actors.resolveActivationBinding(safe.id, { overrides: { model: opus } }))
+      .rejects.toThrow(/#2264|named exception/);
+    await expect(state.actors.resolveActivationBinding(safe.id, { overrides: { model: opus, modelReason: reason } }))
+      .resolves.toMatchObject({ model: opus, modelReason: reason });
+
+    for (const scope of ["session", "project"] as const) {
+      if (scope === "project") await state.actors.setModel(safe.id, undefined, "session");
+      await expect(state.actors.setModel(safe.id, opus, scope))
+        .rejects.toThrow(/#2264|named exception/);
+      expect(state.actors.status(safe.id)).toMatchObject({ model: luna });
+      await state.actors.resetSession(safe.id);
+      expect(state.actors.status(safe.id)).toMatchObject({ model: luna });
+      await state.actors.setModel(safe.id, opus, scope, undefined, reason);
+      expect(state.actors.status(safe.id)).toMatchObject({ model: opus, modelReason: reason });
+    }
+  });
+
+  it.runIf(hasPosixTrustMetadata)("setModel updates and clears an actor's model and it takes effect on the next run", async () => {
     const { actors } = setup();
     const actor = await actors.create({
       name: "reviewer",
@@ -5085,16 +5369,16 @@ describe("ActorManager", () => {
     });
     expect(actors.status(actor.id).model).toBeUndefined();
 
-    await actors.setModel(actor.id, "anthropic/claude-sonnet-4-5", "session", undefined, "Named setter metering probe");
+    await actors.setModel(actor.id, "anthropic/claude-sonnet-4-5", "session", undefined, "#11864 Named setter metering probe");
     expect(actors.status(actor.id).model).toBe("anthropic/claude-sonnet-4-5");
-    expect(actors.status(actor.id).modelReason).toBe("Named setter metering probe");
+    expect(actors.status(actor.id).modelReason).toBe("#11864 Named setter metering probe");
 
     // The new model is forwarded to the agent run launched for the next message.
     await actors.ask(actor.id, "Inspect auth");
     await waitFor(() => actors.status(actor.id).status === "idle");
     const run = actors.readLog(actor.id, { type: "run" });
     expect(run.run?.status?.model).toBe("anthropic/claude-sonnet-4-5");
-    expect(run.run?.status?.modelReason).toBe("Named setter metering probe");
+    expect(run.run?.status?.modelReason).toBe("#11864 Named setter metering probe");
 
     // Clearing the override falls back to the Fabric default (no stored model).
     await actors.setModel(actor.id, undefined);
@@ -5117,14 +5401,14 @@ describe("ActorManager", () => {
     );
   });
 
-  it("persists a session model binding without changing the project default", async () => {
+  it.runIf(hasPosixTrustMetadata)("persists a session model binding without changing the project default", async () => {
     const setupState = setup(true);
     const actor = await setupState.actors.create({
       name: "reviewer",
       instructions: "Review messages and reply concisely.",
       responseMode: "text",
     });
-    await setupState.actors.setModel(actor.id, "anthropic/claude-sonnet-4-5");
+    await setupState.actors.setModel(actor.id, "anthropic/claude-sonnet-4-5", "session", undefined, "Session binding persistence probe #11864");
     const registry = JSON.parse(
       fs.readFileSync(path.join(setupState.root, "actors", "actors.json"), "utf8"),
     ) as { actors: Array<{ id: string; model?: string }> };

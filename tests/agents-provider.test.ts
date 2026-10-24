@@ -10,7 +10,7 @@ import { deliveryRoot, projectOf } from "../src/topology/project-identity.js";
 import os from "node:os";
 import path from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
@@ -24,6 +24,7 @@ import type {
 } from "../src/lifecycle/types.js";
 import {
   DEFAULT_FABRIC_CONFIG,
+  MODEL_EXCEPTIONS_PATH,
   loadFabricConfig,
   normalizeFabricConfig,
   type FabricAgentConfig,
@@ -62,6 +63,8 @@ import { captureRuntimeDeadline } from "./helpers/early-runtime-deadline.js";
 import { captureMontyTransport } from "./helpers/monty-transport.js";
 import { executeAfterAdmission } from "./helpers/admission-clock.js";
 import { createMainExecutionCeilingError } from "../src/async-settlement.js";
+import { modelExceptionGrant, withRootExceptionMetadata } from "./helpers/model-exceptions.js";
+import type { FabricThinking } from "../src/thinking.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -72,6 +75,45 @@ const roots: string[] = [];
 const actorManagers: ActorManager[] = [];
 const agentManagers: AgentManager[] = [];
 const controlPlanes: FabricControlPlane[] = [];
+// Private finite v1 controls: exact resolved model and role, #11864 only.
+// Root-metadata controls are POSIX-only; unsupported hosts must fail closed in production.
+const boundRootCwd = path.resolve("provider-fixtures", "bound-provider-root");
+const boundRootLane = path.basename(boundRootCwd);
+const writeProviderGrants = (file: string): void => {
+  const taskModels = ["cliproxyapi-anthropic/claude-opus-5-5", "claude-haiku-test"];
+  fs.writeFileSync(file, JSON.stringify({ version: 1, grants: [
+    ...taskModels.map(model => modelExceptionGrant({ model, lane: boundRootLane })),
+    modelExceptionGrant({ model: "cliproxyapi-anthropic/claude-opus-5-5", lane: boundRootLane, role: "actor:named-opus" }),
+    modelExceptionGrant({ model: "anthropic/claude-opus-5-5", lane: boundRootLane, role: "actor:registry-member" }),
+  ] }));
+};
+const legacyExceptionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-provider-exceptions-"));
+const legacyExceptionPath = path.join(legacyExceptionRoot, "model-exceptions.json");
+writeProviderGrants(legacyExceptionPath);
+const originalModelExceptionsPath = DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = legacyExceptionPath;
+const trustedExceptionFixturePaths = new Set<string>([legacyExceptionPath]);
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+
+beforeEach(testContext => {
+  trustedExceptionFixturePaths.clear();
+  trustedExceptionFixturePaths.add(legacyExceptionPath);
+  // Call-through only: never replace the real policy result or inject a production trust adapter.
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    if (process.platform === "win32" || typeof process.getuid !== "function") testContext.skip();
+    return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args));
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
+
+afterAll(() => {
+  if (originalModelExceptionsPath === undefined) delete DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+  else DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = originalModelExceptionsPath;
+  fs.rmSync(legacyExceptionRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+});
 
 const usage = {
   input: 0,
@@ -84,8 +126,11 @@ const usage = {
 
 const visiblePiModels = [
   { provider: "cliproxyapi", id: "gpt-6.1-sol" },
+  { provider: "cliproxyapi", id: "gpt-6-luna" },
   { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
   { provider: "cliproxyapi", id: "gpt-6-astra" },
+  { provider: "openai-codex", id: "gpt-6-astra-xhigh" },
+  { provider: "cliproxyapi", id: "gpt-6-astra-preview" },
   { provider: "cliproxyapi", id: "gpt-6-sol" },
   { provider: "anthropic", id: "executor", name: "Executor" },
   { provider: "anthropic", id: "frontier", name: "Frontier" },
@@ -121,7 +166,7 @@ describe("records option", () => {
 
 describe("explicit Astra launch guard (#3134)", () => {
   const model = "cliproxyapi/gpt-6-astra";
-  const refusal = `model ${model} requires modelReason (named exception); omit model to use the role default pi default (inherited session model), see smarty-dev#3134`;
+  const refusal = new RegExp(`model ${model.replaceAll("/", "\\/")} requires modelReason.*#2264`);
   const reason = "  Explicit exception for a bounded compatibility probe  ";
   const argsFor = (action: string): Record<string, unknown> => action === "create" || action === "createActor"
     ? { name: "guard-probe", instructions: "Work." } : { task: "Work.", transport: "process" };
@@ -132,7 +177,7 @@ describe("explicit Astra launch guard (#3134)", () => {
     try {
       for (const modelReason of [undefined, "", " \t\n ", null, false, 1, {}]) {
         await expect(provider.invoke(action, { ...argsFor(action), model: ` ${model} `, modelReason }, context))
-          .rejects.toMatchObject({ message: refusal });
+          .rejects.toMatchObject({ message: expect.stringMatching(refusal) });
       }
       expect(agents.list()).toEqual([]);
       expect(actors.list()).toEqual([]);
@@ -143,14 +188,18 @@ describe("explicit Astra launch guard (#3134)", () => {
 
   it.each(["run", "spawn", "create", "createActor"] as const)("%s covers all Astra provider prefixes and the reason length boundary", async action => {
     const { provider, agents, actors } = setup([], [], undefined, { agentsConfig: { model: "cliproxyapi/gpt-6.1-sol" } });
-    for (const selection of ["gpt-6-astra", "openai-codex/gpt-6-astra-xhigh", "cliproxyapi/gpt-6-astra-preview"]) {
+    for (const [selection, canonical] of [
+      ["gpt-6-astra", "cliproxyapi/gpt-6-astra"],
+      ["openai-codex/gpt-6-astra-xhigh", "openai-codex/gpt-6-astra-xhigh"],
+      ["cliproxyapi/gpt-6-astra-preview", "cliproxyapi/gpt-6-astra-preview"],
+    ] as const) {
       await expect(provider.invoke(action, { ...argsFor(action), model: selection }, context))
-        .rejects.toThrow(`model ${selection} requires modelReason (named exception); omit model to use the role default cliproxyapi/gpt-6.1-sol, see smarty-dev#3134`);
+        .rejects.toThrow(new RegExp(`model ${canonical.replaceAll("/", "\\/")} requires modelReason.*#2264`));
     }
     const inherited = { ...context, extensionContext: { ...context.extensionContext, model: { provider: "provider", id: "session" } } as ExtensionContext };
-    await expect(provider.invoke(action, { ...argsFor(action), model }, inherited)).rejects.toThrow("role default provider/session, see smarty-dev#3134");
+    await expect(provider.invoke(action, { ...argsFor(action), model }, inherited)).rejects.toThrow(/role default provider\/session|#2264/);
     await expect(provider.invoke(action, { ...argsFor(action), model, modelReason: "x".repeat(201) }, context))
-      .rejects.toThrow("modelReason must be ≤200 chars");
+      .rejects.toThrow("modelReason must be nonblank and ≤200 chars");
     expect(agents.list()).toEqual([]); expect(actors.list()).toEqual([]);
     const receipt = await provider.invoke(action, { ...argsFor(action), model, modelReason: "x".repeat(200) }, context) as AgentRunRecord;
     if (action === "spawn") await agents.wait(receipt.id);
@@ -175,15 +224,22 @@ describe("explicit Astra launch guard (#3134)", () => {
     expect(cleared.modelReason).toBeUndefined();
   });
 
-  it("keeps existing actors and template imports running without a retroactive reason requirement", async () => {
-    const { provider, actors, agents, globalActors } = setup();
+  it("refuses unreasoned legacy explicit bindings while importing through a safe fallback", async () => {
+    const { provider, actors, agents, globalActors } = setup([], [], undefined, {
+      agentsConfig: { modelPolicy: { requireReason: [] } },
+    });
     const existing = await actors.create({ name: "pre-policy", instructions: "Work.", model });
-    const message = await provider.invoke("ask", { id: existing.id, message: "Work." }, context) as { runId: string };
-    expect(agents.status(message.runId)).toMatchObject({ model, status: "completed" });
-    expect(agents.status(message.runId).modelReason).toBeUndefined();
-    await expect(provider.invoke("setModel", { id: existing.id, model }, context)).rejects.toThrow("requires modelReason");
     const template = globalActors.create({ name: "pre-policy-template", instructions: "Work.", model });
-    expect(await provider.invoke("import", { id: template.id, as: "legacy-import" }, context)).toMatchObject({ model });
+    agents.config.modelPolicy = {
+      ...DEFAULT_FABRIC_CONFIG.agents.modelPolicy,
+      fallbackModel: "cliproxyapi/gpt-6-luna",
+      fallbackThinking: "high",
+    };
+    await expect(provider.invoke("ask", { id: existing.id, message: "Work." }, context))
+      .rejects.toThrow("requires modelReason");
+    expect(agents.list()).toEqual([]);
+    const imported = await provider.invoke("import", { id: template.id, as: "legacy-import" }, context) as FabricActorInfo;
+    expect(imported).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "high" });
   });
 
   it("honors an empty rollback list and a provider-qualified override", async () => {
@@ -231,9 +287,13 @@ describe("explicit Astra launch guard (#3134)", () => {
     expect(globalActors.toRequest(definition)).toMatchObject({ model, modelReason: reason });
   });
 
-  it.each(["run", "spawn", "create", "createActor"] as const)("%s leaves omitted, inherited, other and alias model selections unaffected", async action => {
+  it.each(["run", "spawn", "create", "createActor"] as const)("%s keeps safe explicit and alias selections while demoting guarded defaults", async action => {
     const { provider, agents } = setup([], [], undefined, {
-      agentsConfig: { model }, modelsConfig: { aliases: { probe: { targets: [model] } } },
+      agentsConfig: {
+        model,
+        modelPolicy: { ...DEFAULT_FABRIC_CONFIG.agents.modelPolicy, fallbackModel: "cliproxyapi/gpt-6-luna", fallbackThinking: "high" },
+      },
+      modelsConfig: { aliases: { probe: { targets: ["cliproxyapi/gpt-6.1-sol"] } } },
     });
     const inherited = { ...context, extensionContext: { ...context.extensionContext, model: { provider: "cliproxyapi", id: "gpt-6-astra" } } as ExtensionContext };
     let sequence = 0;
@@ -244,6 +304,8 @@ describe("explicit Astra launch guard (#3134)", () => {
       const receipt = await provider.invoke(action, { ...argsFor(action), name: `guard-probe-${sequence++}`, ...selection }, invocation) as AgentRunRecord;
       if (action === "spawn") expect((await agents.wait(receipt.id)).status).toBe("completed");
       else if (action === "run") expect(receipt.status).toBe("completed");
+      if (!("model" in selection)) expect(receipt).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "high" });
+      else expect(receipt.model).toBe("cliproxyapi/gpt-6.1-sol");
       expect(receipt).not.toHaveProperty("modelReason");
     }
   });
@@ -259,11 +321,484 @@ describe("explicit Astra launch guard (#3134)", () => {
         signal: undefined, parentToolCallId: "astra-guard-guest", context: context.extensionContext, onPartial() {},
       });
       expect(result.success, result.error).toBe(true);
-      expect(result.value).toBe(refusal);
+      expect(result.value).toEqual(expect.stringMatching(refusal));
       expect(agents.list()).toEqual([]);
       expect(actors.list()).toEqual([]);
       expect(globalActors.list()).toEqual([]);
     }
+  });
+});
+
+describe("public actor model-exception roles", () => {
+  const model = "cliproxyapi-anthropic/claude-opus-5-5";
+  const safeModel = "cliproxyapi/gpt-6.1-sol";
+  const reason = "Actor-only exception #1";
+  const writeActorGrant = (exceptionPath: string, thinking: FabricThinking = "max"): void => {
+    fs.writeFileSync(exceptionPath, JSON.stringify({ version: 1, grants: [modelExceptionGrant({
+      issue: "Smarty-Pants-Inc/smarty-dev#1", model, role: "actor:reviewer",
+      lane: boundRootLane, thinking,
+    })] }));
+  };
+
+  it.each(["run", "spawn", "create", "createActor", "setModel", "ask", "tell"] as const)(
+    "does not expose caller-selectable lane, host or root binding on %s", async action => {
+      const state = setup();
+      const descriptor = await state.provider.describe(action, context);
+      const properties = (descriptor?.inputSchema as { properties: Record<string, unknown> }).properties;
+      expect(properties).not.toHaveProperty("lane");
+      expect(properties).not.toHaveProperty("host");
+      expect(properties).not.toHaveProperty("rootSessionCwd");
+    },
+  );
+
+  it("denies an unbound ROOT despite forged caller lane/host/cwd and environment", async () => {
+    const state = setup([], [], undefined, { rootSessionCwd: () => undefined });
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    vi.stubEnv("PI_FABRIC_LANE", boundRootLane);
+    vi.stubEnv("SMARTY_LANE", boundRootLane);
+    vi.stubEnv("PI_FABRIC_ROOT_CWD", boundRootCwd);
+    vi.stubEnv("HOSTNAME", os.hostname().split(".")[0]!);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("create", { name: "reviewer", instructions: "Review.",
+        model, modelReason: reason, lane: boundRootLane, host: os.hostname().split(".")[0],
+        cwd: boundRootCwd, rootSessionCwd: boundRootCwd,
+      }, { ...context, cwd: boundRootCwd })).rejects.toMatchObject({
+        code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "lane-mismatch",
+      });
+      expect(state.actors.list()).toEqual([]);
+      expect(state.agents.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it.each(["low", "medium", "high"] as const)("applies the requested %s actor effort against a medium ceiling", async thinking => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!, "medium");
+    const create = () => state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model, modelReason: reason, thinking,
+    }, context);
+    if (thinking === "high") {
+      await expect(create()).rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "thinking-exceeds" });
+      expect(state.actors.list()).toEqual([]);
+      expect(state.agents.list()).toEqual([]);
+    } else {
+      await expect(create()).resolves.toMatchObject({ model, thinking, modelReason: reason });
+    }
+  });
+
+  it.each(["ask", "tell"] as const)("checks %s binding effort, not the manager default", async action => {
+    const state = setup([], [], undefined, { agentsConfig: { thinking: "low" } });
+    writeActorGrant(state.agents.config.modelExceptionsPath!, "medium");
+    const actor = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model: safeModel, thinking: "high",
+    }, context) as FabricActorInfo;
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke(action, { id: actor.id, message: "Above-ceiling binding",
+        model, modelReason: reason, thinking: "high",
+      }, context)).rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "thinking-exceeds" });
+      expect(state.agents.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      await expect(state.provider.invoke(action, { id: actor.id, message: "Below-ceiling binding",
+        model, modelReason: reason, thinking: "low",
+      }, context)).resolves.toBeDefined();
+    } finally { launch.mockRestore(); }
+  });
+
+  it.each(["session", "project", "global"] as const)("setModel checks existing high %s effort before mutation", async scope => {
+    const state = setup([], [], undefined, { agentsConfig: { thinking: "low" } });
+    writeActorGrant(state.agents.config.modelExceptionsPath!, "medium");
+    const actor = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model: safeModel, thinking: "high",
+      ...(scope === "global" ? { scope } : {}),
+    }, context) as FabricActorInfo;
+    const before = scope === "global"
+      ? structuredClone(state.globalActors.resolve(actor.id))
+      : structuredClone(state.actors.definition(actor.id));
+    await expect(state.provider.invoke("setModel", { id: actor.id, scope, model, modelReason: reason }, context))
+      .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "thinking-exceeds" });
+    expect(scope === "global" ? state.globalActors.resolve(actor.id) : state.actors.definition(actor.id)).toEqual(before);
+    expect(state.agents.list()).toEqual([]);
+    await state.provider.invoke("setThinking", { id: actor.id, scope, thinking: "low" }, context);
+    await expect(state.provider.invoke("setModel", { id: actor.id, scope, model, modelReason: reason }, context))
+      .resolves.toMatchObject({ model, thinking: "low", modelReason: reason });
+  });
+
+  it("uses actor:<name> rather than task when admitting an actor-only host grant", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const actor = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model, modelReason: reason,
+    }, context) as FabricActorInfo;
+    expect(actor).toMatchObject({ model, modelReason: reason });
+  });
+
+  it("uses the same host row to refuse wrong actor names and task roles before side effects", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("create", {
+        name: "wrong-name", instructions: "Review.", model, modelReason: reason,
+      }, context)).rejects.toMatchObject({
+        name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
+        denial: "role-mismatch", ref: "Smarty-Pants-Inc/smarty-dev#1", role: "actor:wrong-name",
+      });
+      await expect(state.provider.invoke("run", {
+        task: "Task role must not borrow an actor grant", model, modelReason: reason, transport: "process",
+      }, context)).rejects.toMatchObject({
+        name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
+        denial: "role-mismatch", ref: "Smarty-Pants-Inc/smarty-dev#1", role: "task",
+      });
+      expect(state.actors.list()).toEqual([]);
+      expect(state.agents.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); }
+  });
+
+  it("admits reviewer bindings and refuses a wrong-role setter through public setModel", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const reviewer = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model: safeModel,
+    }, context) as FabricActorInfo;
+    const selected = await state.provider.invoke("setModel", {
+      id: reviewer.id, model, modelReason: reason,
+    }, context) as FabricActorInfo;
+    expect(selected).toMatchObject({ id: reviewer.id, model, modelReason: reason });
+
+    const wrong = await state.provider.invoke("create", {
+      name: "wrong-name", instructions: "Review.", model: safeModel,
+    }, context) as FabricActorInfo;
+    const wrongDefinition = structuredClone(state.actors.definition(wrong.id));
+    await expect(state.provider.invoke("setModel", {
+      id: wrong.id, model, modelReason: reason,
+    }, context)).rejects.toMatchObject({
+      name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
+      denial: "role-mismatch", ref: "Smarty-Pants-Inc/smarty-dev#1", role: "actor:wrong-name",
+    });
+    expect(state.actors.definition(wrong.id)).toEqual(wrongDefinition);
+    expect(state.actors.status(wrong.id)).toMatchObject({ id: wrong.id, model: safeModel });
+  });
+
+  it.each(["ask", "tell"] as const)("applies the receiver actor role to %s bindings", async action => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const reviewer = await state.provider.invoke("create", {
+      name: "reviewer", instructions: "Review.", model: safeModel,
+    }, context) as FabricActorInfo;
+    const wrong = await state.provider.invoke("create", {
+      name: "wrong-name", instructions: "Review.", model: safeModel,
+    }, context) as FabricActorInfo;
+    const args = (id: string) => ({ id, message: `role-bound ${action}`, model, modelReason: reason });
+
+    if (action === "ask") {
+      await expect(state.provider.invoke(action, args(reviewer.id), context)).resolves.toBeDefined();
+    } else {
+      await expect(state.provider.invoke(action, args(reviewer.id), context)).resolves.toMatchObject({ queued: true });
+    }
+    await expect(state.provider.invoke(action, args(wrong.id), context)).rejects.toMatchObject({
+      name: "FabricModelExceptionDeniedError", code: "FABRIC_MODEL_EXCEPTION_DENIED",
+      denial: "role-mismatch", ref: "Smarty-Pants-Inc/smarty-dev#1", role: "actor:wrong-name",
+    });
+  });
+
+  it.each(["empty host exception list", "missing host exception file"] as const)(
+    "leaves Main switchModel unaffected with a %s",
+    async label => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-main-model-exception-"));
+      roots.push(root);
+      const exceptionPath = path.join(root, "model-exceptions.json");
+      if (label.startsWith("empty")) fs.writeFileSync(exceptionPath, JSON.stringify({ version: 1, grants: [] }));
+      const switchModel = vi.fn(async () => ({ ok: true }));
+      const state = setup([], [], undefined, {
+        switchModel,
+        agentsConfig: {
+          modelExceptionsPath: exceptionPath,
+          modelPolicy: { requireReason: ["opus", "claude"] },
+        },
+      });
+      const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+      try {
+        await expect(state.provider.invoke("switchModel", { model }, context)).resolves.toMatchObject({
+          switched: true, model,
+        });
+        expect(switchModel).toHaveBeenCalledOnce();
+        expect(state.agents.list()).toEqual([]);
+        expect(launch).not.toHaveBeenCalled();
+      } finally { launch.mockRestore(); }
+    },
+  );
+
+  it("bridges a denied bogus #1 to the public guest with only safe error fields", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const registry = new ActionRegistry(); registry.register(state.provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.agents = structuredClone(state.agents.config);
+    config.approvals.agent = "allow";
+    const service = new FabricExecutionService(registry, config);
+    const result = await service.execute({
+      code: `try {
+        await agents.create(${JSON.stringify({ name: "wrong-name", instructions: "Review.", model, modelReason: reason })});
+        return { admitted: true };
+      } catch (error) {
+        return { name: error.name, code: error.code, message: error.message };
+      }`,
+      signal: undefined, parentToolCallId: "model-exception-guest", context: {
+        ...context.extensionContext, cwd: process.cwd(), hasUI: false,
+      } as ExtensionContext, onPartial() {},
+    });
+    expect(result.success).toBe(true);
+    expect(result.value).toEqual({
+      name: "FabricModelExceptionDeniedError",
+      code: "FABRIC_MODEL_EXCEPTION_DENIED",
+      message: expect.stringContaining("smarty-dev#1"),
+    });
+    expect(state.actors.list()).toEqual([]);
+    expect(state.agents.list()).toEqual([]);
+  });
+
+  it("bridges schema-valid missing reasons and unlisted refs, while schema-invalid inputs remain refused", async () => {
+    const state = setup();
+    writeActorGrant(state.agents.config.modelExceptionsPath!);
+    const registry = new ActionRegistry(); registry.register(state.provider);
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.agents = structuredClone(state.agents.config);
+    config.approvals.agent = "allow";
+    const service = new FabricExecutionService(registry, config);
+    const executeCreate = (args: Record<string, unknown>) => service.execute({
+      code: `try {
+        const request = JSON.parse(${JSON.stringify(JSON.stringify(args))});
+        await agents.create(request);
+        return { admitted: true };
+      } catch (error) {
+        return { name: error.name, code: error.code, message: error.message };
+      }`,
+      signal: undefined, parentToolCallId: "model-exception-invalid-reason", context: {
+        ...context.extensionContext, cwd: process.cwd(), hasUI: false,
+      } as ExtensionContext, onPartial() {},
+    });
+    for (const modelReason of [undefined, "", "  "] as const) {
+      const args = { name: "reviewer", instructions: "Review.", model,
+        ...(modelReason === undefined ? {} : { modelReason }) };
+      const result = await executeCreate(args);
+      expect(result.success).toBe(true);
+      expect(result.value).toEqual({
+        name: "FabricModelExceptionDeniedError",
+        code: "FABRIC_MODEL_EXCEPTION_DENIED",
+        message: expect.stringContaining("requires"),
+      });
+    }
+    for (const modelReason of [false, "x".repeat(201)] as const) {
+      const result = await executeCreate({ name: "reviewer", instructions: "Review.", model, modelReason });
+      expect(result.success).toBe(true);
+      expect(result.value).toMatchObject({ message: expect.stringContaining("Invalid arguments for agents.create") });
+      expect(state.actors.list()).toEqual([]);
+      expect(state.agents.list()).toEqual([]);
+    }
+    fs.writeFileSync(state.agents.config.modelExceptionsPath!, JSON.stringify({ version: 1, grants: [] }));
+    const unlisted = await executeCreate({ name: "reviewer", instructions: "Review.", model, modelReason: reason });
+    expect(unlisted.success).toBe(true);
+    expect(unlisted.value).toEqual({
+      name: "FabricModelExceptionDeniedError",
+      code: "FABRIC_MODEL_EXCEPTION_DENIED",
+      message: expect.stringMatching(/smarty-dev#1.*(?:file-unavailable|unlisted)/),
+    });
+    expect(state.actors.list()).toEqual([]);
+    expect(state.agents.list()).toEqual([]);
+  });
+});
+
+describe("model reason policy boundary (#11864)", () => {
+  const opus = "cliproxyapi-anthropic/claude-opus-5-5";
+  const luna = "cliproxyapi/gpt-6-luna";
+  const issueReason = "#11864 bounded compatibility exception";
+  const nonIssueReason = "bounded compatibility exception without an issue";
+  const fallbackPolicy = {
+    requireReason: ["gpt-6-astra", "opus", "claude"],
+    fallbackModel: luna,
+    fallbackThinking: "high" as const,
+  };
+  const policy = { modelPolicy: fallbackPolicy };
+
+  it.each(["run", "spawn"] as const)("%s refuses bare Opus, then accepts opusReason and records worker/status evidence", async action => {
+    const state = setup([], [], undefined, { agentsConfig: policy });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke(action, {
+        task: "Opus boundary refusal",
+        model: opus,
+        transport: "process",
+      }, context)).rejects.toThrow(/#2264|named exception/);
+      expect(launch).not.toHaveBeenCalled();
+
+      const handle = await state.provider.invoke(action, {
+        task: "Opus named exception",
+        model: opus,
+        opusReason: issueReason,
+        transport: "process",
+      }, context) as AgentHandleInfo;
+      const result = action === "spawn" ? await state.agents.wait(handle.id) : handle;
+      expect(result).toMatchObject({ status: "completed", model: opus, modelReason: issueReason });
+      expect(state.agents.status(handle.id)).toMatchObject({ model: opus, modelReason: issueReason });
+      expect(launch.mock.calls.at(-1)?.[0].workerArguments).toEqual(expect.arrayContaining(["--model-reason", issueReason]));
+    } finally { launch.mockRestore(); }
+  });
+
+  it("F-01 guards Claude-code Veda defaults and aliases at the provider and actor boundary", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-claude-home-")); roots.push(home);
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+    const state = setup([], [], undefined, { preparePiModel: prepareVisiblePiModel, agentsConfig: {
+      runner: "veda",
+      modelPolicy: { requireReason: ["claude", "opus"] },
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
+    } });
+    const concreteModel = "cliproxyapi-anthropic/claude-opus-5-5";
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const exception = "#11864 bounded Veda Claude-code compatibility exception";
+    try {
+      for (const args of [
+        { task: "absent Veda model" },
+        { task: "configured undefined Veda model", model: undefined },
+        { task: "short Veda alias", model: "sonnet" },
+      ]) {
+        await expect(state.provider.invoke("run", { ...args, transport: "process" }, context))
+          .rejects.toThrow(/requires (?:modelReason|opusReason).*#2264|named exception/i);
+      }
+      expect(launch).not.toHaveBeenCalled();
+      expect(state.agents.list()).toEqual([]);
+
+      await expect(state.provider.invoke("create", { name: "unreasoned-claude-default", instructions: "Review." }, context))
+        .rejects.toThrow(/The Veda runner does not support persistent actors/);
+      expect(state.actors.list()).toEqual([]);
+
+      // Veda is a task runner, not an actor runner: a reason must not expand that API.
+      await expect(state.provider.invoke("create", {
+        name: "unsupported-veda-actor", instructions: "Review.", model: "sonnet", modelReason: exception,
+      }, context)).rejects.toThrow(/The Veda runner does not support persistent actors/);
+      const result = await state.provider.invoke("run", {
+        task: "reasoned Claude-code task", model: concreteModel, opusReason: exception, transport: "process",
+      }, context) as AgentRunRecord;
+      expect(result).toMatchObject({ status: "completed", model: concreteModel, modelReason: exception,
+        warnings: expect.arrayContaining([expect.stringMatching(/veda\/claude-code\/cliproxyapi-anthropic\/claude-opus-5-5/)]) });
+      const workerArguments = launch.mock.calls.at(-1)?.[0].workerArguments;
+      expect(workerArguments).toEqual(expect.arrayContaining(["--runner", "veda", "--model", concreteModel, "--model-reason", exception]));
+      const auditFile = path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
+      const rows = fs.readFileSync(auditFile, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>);
+      const matched = rows.filter(row => row.reason === exception);
+      expect(matched).toHaveLength(1);
+      expect(matched[0]).toMatchObject({ reason: exception,
+        ref: "Smarty-Pants-Inc/smarty-dev#11864", issue: "Smarty-Pants-Inc/smarty-dev#11864",
+        role: "task", model: concreteModel, lane: boundRootLane, host: os.hostname().split(".")[0],
+        grant_id: expect.any(String), thinking: result.thinking, run_id: result.id, time: expect.any(String),
+      });
+
+      const otherBackend = setup([], [], undefined, { agentsConfig: {
+        runner: "veda", modelPolicy: { requireReason: ["claude", "opus"] },
+        veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "agy" },
+      } });
+      expect(await otherBackend.provider.invoke("run", { task: "non-Claude Veda compatibility", model: "sonnet", transport: "process" }, context))
+        .toMatchObject({ status: "completed", runner: "veda", model: "sonnet" });
+      const rollback = setup([], [], undefined, { agentsConfig: {
+        runner: "veda", modelPolicy: { requireReason: [] },
+        veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
+      } });
+      expect(await rollback.provider.invoke("run", { task: "empty requireReason rollback", model: "sonnet", transport: "process" }, context))
+        .toMatchObject({ status: "completed", model: "sonnet" });
+      const customBackend = setup([], [], undefined, { agentsConfig: {
+        runner: "veda", modelPolicy: { requireReason: ["claude", "opus"] },
+        veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "private-custom-backend" },
+      } });
+      expect(await customBackend.provider.invoke("run", { task: "unknown backend uses its default", transport: "process" }, context))
+        .toMatchObject({ status: "completed", runner: "veda" });
+    } finally { launch.mockRestore(); homedir.mockRestore(); }
+  });
+
+  it("requires an explicit configured fallback for inherited Opus, with a safe absent-fallback countercase", async () => {
+    const inherited = { ...context, extensionContext: { ...context.extensionContext,
+      model: { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
+    } as ExtensionContext };
+    const configured = setup([], [], undefined, { agentsConfig: policy });
+    const safe = await configured.provider.invoke("spawn", { task: "inherited Opus with configured fallback", transport: "process" }, inherited) as AgentHandleInfo;
+    expect(safe).toMatchObject({ model: luna, thinking: "high" });
+    expect(await configured.agents.wait(safe.id)).toMatchObject({ status: "completed", model: luna, thinking: "high" });
+
+    const absent = setup([], [], undefined, { agentsConfig: { modelPolicy: {
+      requireReason: ["gpt-6-astra", "opus", "claude"], fallbackThinking: "high",
+    } } });
+    await expect(absent.provider.invoke("spawn", { task: "inherited Opus without configured fallback", transport: "process" }, inherited))
+      .rejects.toThrow(/fallbackModel|#2264|named exception/);
+    const absentClaude = setup([], [], undefined, { agentsConfig: {
+      runner: "claude", modelPolicy: { requireReason: ["gpt-6-astra", "opus", "claude"], fallbackThinking: "high" },
+    } });
+    await expect(absentClaude.provider.invoke("run", { task: "default Claude without configured fallback", runner: "claude", transport: "process" }, context))
+      .rejects.toThrow(/fallbackModel|#2264|named exception/);
+    expect(absent.agents.list()).toEqual([]); expect(absentClaude.agents.list()).toEqual([]);
+  });
+
+  it("guards an alias after it resolves to Opus, and requires an issue-bearing reason", async () => {
+    const state = setup([], [], undefined, {
+      agentsConfig: policy,
+      modelsConfig: { aliases: { guarded: { targets: [opus, luna] } } },
+    });
+    await expect(state.provider.invoke("run", { task: "guarded alias", model: "guarded", modelReason: nonIssueReason, transport: "process" }, context))
+      .rejects.toThrow(/#2264|named exception/);
+    const result = await state.provider.invoke("run", { task: "guarded alias", model: "guarded", opusReason: issueReason, transport: "process" }, context) as AgentRunRecord;
+    expect(result).toMatchObject({ status: "completed", model: opus, modelReason: issueReason });
+  });
+
+  it("demotes a protected route-pin alias indirectly, while an issue-bearing exception keeps the pin", async () => {
+    const state = setup([], [], undefined, {
+      agentsConfig: policy,
+      modelsConfig: { aliases: { guarded: { targets: [opus] } } },
+    });
+    const indirect = await state.provider.invoke("spawn", {
+      task: "protected route fallback", model: "auto", routeClass: "bounded-lookup",
+      pinModel: "guarded", pinThinking: "low", protected: true, transport: "process",
+    }, context) as AgentHandleInfo;
+    expect(indirect).toMatchObject({ model: luna, thinking: "high", routeDecision: { model: luna, effort: "high", reasonCode: "admission-blocked" } });
+    expect(await state.agents.wait(indirect.id)).toMatchObject({ status: "completed", model: luna, thinking: "high" });
+
+    const allowed = await state.provider.invoke("spawn", {
+      task: "protected route exception", model: "auto", routeClass: "bounded-lookup",
+      pinModel: "guarded", pinThinking: "low", protected: true, opusReason: issueReason, transport: "process",
+    }, context) as AgentHandleInfo;
+    expect(allowed).toMatchObject({ model: opus, modelReason: issueReason });
+    expect(await state.agents.wait(allowed.id)).toMatchObject({ status: "completed", model: opus, modelReason: issueReason });
+  });
+
+  it("applies the same issue-bearing guard to Claude runner selections", async () => {
+    const state = setup([], [], undefined, { agentsConfig: { ...policy, runner: "claude" } });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("run", { task: "Claude refusal", runner: "claude", model: "claude/haiku", transport: "process" }, context))
+        .rejects.toThrow(/#2264|named exception/);
+      expect(launch).not.toHaveBeenCalled();
+      const result = await state.provider.invoke("run", { task: "Claude exception", runner: "claude", model: "claude-haiku-test", opusReason: issueReason, transport: "process" }, context) as AgentRunRecord;
+      expect(result).toMatchObject({ status: "completed", model: expect.stringContaining("haiku"), modelReason: issueReason });
+      expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining([
+        "--runner", "claude", "--model", "claude-haiku-test", "--model-reason", issueReason,
+      ]));
+    } finally { launch.mockRestore(); }
+  });
+
+  it("keeps direct actor creation and implicit inherited actor defaults at the same boundary", async () => {
+    const state = setup([], [], undefined, { agentsConfig: policy });
+    await expect(state.provider.invoke("create", { name: "bare-opus", instructions: "Review.", model: opus }, context))
+      .rejects.toThrow(/#2264|named exception/);
+    const actor = await state.provider.invoke("create", {
+      name: "named-opus", instructions: "Review.", model: opus, opusReason: issueReason,
+    }, context) as FabricActorInfo;
+    expect(state.actors.definition(actor.id)).toMatchObject({ model: opus, modelReason: issueReason });
+
+    const inherited = { ...context, extensionContext: { ...context.extensionContext,
+      model: { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
+    } as ExtensionContext };
+    const fallbackActor = await state.provider.invoke("create", { name: "inherited-opus", instructions: "Review." }, inherited) as FabricActorInfo;
+    expect(fallbackActor).toMatchObject({ model: luna, thinking: "high" });
+    expect(state.actors.definition(fallbackActor.id)).toMatchObject({ model: luna, thinking: "high" });
   });
 });
 
@@ -285,14 +820,21 @@ describe("fleet model policy (#2490)", () => {
     (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
-      await expect(state.provider.invoke("spawn", { task: "must not submit", residency, transport: "process", ...(source === "explicit" ? { model: selector } : {}) }, context)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+      // An unknown native alias cannot establish a canonical exception target on any host.
+      const denial = runner === "claude" && selector === "unknown-runtime-alias"
+        ? { code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" }
+        : { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" };
+      await expect(state.provider.invoke("spawn", { task: "must not submit", residency, transport: "process",
+        ...(source === "explicit" ? { model: selector } : {}), modelReason: "#11864 backend denial boundary" }, context))
+        .rejects.toMatchObject(denial);
       expect(state.agents.list()).toEqual([]); expect(fs.existsSync(path.join(state.root, "runs"))).toBe(false);
       expect(launch).not.toHaveBeenCalled(); expect(spawnAgent).not.toHaveBeenCalled();
     } finally { launch.mockRestore(); }
   });
 
   it.each(["session", "durable"] as const)("round 5 F5 forwards allowed canonical alternate targets for %s admission", async residency => {
-    const state = setup([], [], undefined, { preparePiModel: prepareVisiblePiModel, agentsConfig: { deniedModels: ["cliproxyapi/gpt-6-astra"], budgetUsd: 0, veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi" } } });
+    const state = setup([], [], undefined, { preparePiModel: prepareVisiblePiModel, agentsConfig: { deniedModels: ["cliproxyapi/gpt-6-astra"], budgetUsd: 0,
+      modelPolicy: { requireReason: [] }, veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi" } } });
     const spawnAgent = vi.fn(async (request: { model?: string }) => ({ id: "allowed-durable", name: "allowed", runner: "veda", transport: "process", cwd: process.cwd(), status: "running", model: request.model }));
     (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
     for (const [runner, model, canonical] of [["veda", "veda/cliproxyapi/gpt-6.1-sol", "cliproxyapi/gpt-6.1-sol"], ["claude", "claude/haiku", "claude-haiku-test"]] as const) {
@@ -304,7 +846,7 @@ describe("fleet model policy (#2490)", () => {
   });
 
   it.each(["veda", "claude"] as const)("round 5 F5 preserves no-policy %s aliases for durable submission", async runner => {
-    const state = setup([], [], undefined, { agentsConfig: { deniedModels: [], budgetUsd: 0 } });
+    const state = setup([], [], undefined, { agentsConfig: { deniedModels: [], budgetUsd: 0, modelPolicy: { requireReason: [] } } });
     const spawnAgent = vi.fn(async (request: { model?: string }) => ({ id: "legacy-durable", name: "legacy", runner, transport: "process", cwd: process.cwd(), status: "running", model: request.model }));
     (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
     const catalog = vi.spyOn(state.agents, "claudeModels");
@@ -428,13 +970,25 @@ describe("fleet model policy (#2490)", () => {
 
   it("F6 #3115 missing child creation host fails closed before local commitment", async () => {
     const { provider, actors, agents, root } = setup([], [], undefined, {
-      identity: { id: "task:worker", name: "worker", kind: "agent" }, mainAgentId: "session:upstream-main",
+      identity: { id: "session:worker", name: "main", kind: "main" }, mainAgentId: "session:upstream-main",
     });
     vi.spyOn(agents, "runtimeHostId", "get").mockReturnValue(undefined);
     delete (provider.participants as Partial<FabricParticipantSource>).self;
     await expect(provider.invoke("create", { name: "no-owner", instructions: "Review." }, context))
       .rejects.toThrow("Local actor creation requires a runtime owner host ID");
     expect(actors.list()).toEqual([]);
+    expect(fs.existsSync(path.join(root, "actors"))).toBe(false);
+  });
+
+  it("TASK parent actor creation is forbidden before local commitment (#12187)", async () => {
+    const { provider, actors, agents, globalActors, root } = setup([], [], undefined, {
+      identity: { id: "task:worker", name: "worker", kind: "agent" }, mainAgentId: "session:upstream-main",
+    });
+    await expect(provider.invoke("create", { name: "no-child", instructions: "Review." }, context))
+      .rejects.toMatchObject({ name: "AgentSpawnForbiddenError", code: "FABRIC_AGENT_SPAWN_FORBIDDEN", launchOutcome: "unlaunched" });
+    expect(actors.list()).toEqual([]);
+    expect(agents.list()).toEqual([]);
+    expect(globalActors.list()).toEqual([]);
     expect(fs.existsSync(path.join(root, "actors"))).toBe(false);
   });
 
@@ -452,7 +1006,8 @@ describe("fleet model policy (#2490)", () => {
     expect(actors.status(previous.id).status).toBe("stopped");
   });
 
-  it.each((["main", "task", "actor"] as const).flatMap(parent =>
+  // TASK parents cannot create actors; their pre-commit refusal is covered above.
+  it.each((["main", "actor"] as const).flatMap(parent =>
     (["create", "import"] as const).flatMap(action =>
       (["registry", "presence"] as const).flatMap(publication =>
         (["Escape", "deadline", "revocation"] as const).map(ending => [parent, action, publication, ending] as const)))))(
@@ -460,7 +1015,7 @@ describe("fleet model policy (#2490)", () => {
       const hostId = parent === "main" ? "session:test" : "runtime:child-native-session";
       const { provider, actors, globalActors, root, mesh, identity } = setup([], [], undefined, parent === "main" ? { ownsRuntime: false } : {
         ownsRuntime: false,
-        identity: { id: `${parent}:worker`, name: "worker", kind: parent === "task" ? "agent" : "actor", sessionId: "test" },
+        identity: { id: `${parent}:worker`, name: "worker", kind: "actor", sessionId: "test" },
         hostId, mainAgentId: "session:upstream-main", selfOwnerHostId: "resident:upstream-main",
       });
       const published = new ParticipantDirectory(mesh, { enabled: true, hostId, rootId: provider.mainAgent.id, identity });
@@ -649,9 +1204,10 @@ describe("fleet model policy (#2490)", () => {
     expect(actors.list()).toEqual([]);
   });
   const policy = { model: "cliproxyapi/gpt-6-astra", thinking: "low" as const, deniedModels: ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6-sol"], deniedModelReplacement: "cliproxyapi/gpt-6.1-sol" };
-  it.each(["actor", "agent"] as const)("inherits the %s spawning run's admitted model and thinking", async (kind) => {
+  it.each(["actor", "main"] as const)("inherits the %s spawning run's admitted model and thinking", async (kind) => {
     const { provider, agents, actors } = setup([], [], undefined, {
       identity: { id: `${kind}:parent`, name: "parent", kind, sessionId: "test" },
+      ...(kind !== "main" ? { mainAgentId: "session:remote-main" } : {}),
       agentsConfig: { thinking: policy.thinking, deniedModels: policy.deniedModels, deniedModelReplacement: policy.deniedModelReplacement }, callerThinking: "max",
     });
     const parentContext = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6.1-sol" } } as unknown as ExtensionContext };
@@ -660,6 +1216,18 @@ describe("fleet model policy (#2490)", () => {
     await agents.wait(child.id);
     const actor = await provider.invoke("create", { name: "nested", instructions: "review" }, parentContext) as FabricActorInfo;
     expect(actors.definition(actor.id)).toMatchObject({ model: "cliproxyapi/gpt-6.1-sol", thinking: "max" });
+  });
+  it("refuses a task (agent) spawning run before inheriting its model or creating children", async () => {
+    const { provider, agents, actors } = setup([], [], undefined, {
+      identity: { id: "agent:parent", name: "parent", kind: "agent", sessionId: "test" }, mainAgentId: "session:remote-main",
+      agentsConfig: { thinking: policy.thinking, deniedModels: policy.deniedModels, deniedModelReplacement: policy.deniedModelReplacement }, callerThinking: "max",
+    });
+    const parentContext = { ...context, extensionContext: { modelRegistry: visibleModelRegistry, model: { provider: "cliproxyapi", id: "gpt-6.1-sol" } } as unknown as ExtensionContext };
+    const refused = { name: "AgentSpawnForbiddenError", code: "FABRIC_AGENT_SPAWN_FORBIDDEN", launchOutcome: "unlaunched" };
+    await expect(provider.invoke("spawn", { task: "review", transport: "process" }, parentContext)).rejects.toMatchObject(refused);
+    await expect(provider.invoke("create", { name: "nested", instructions: "review" }, parentContext)).rejects.toMatchObject(refused);
+    expect(agents.list()).toEqual([]);
+    expect(actors.list()).toEqual([]);
   });
   it.each(["spawn", "create"])("%s refuses explicit, alias, inherited and default denied models before creation", async (action) => {
     const { provider, agents, actors, globalActors } = setup([], [], undefined, { agentsConfig: policy, modelsConfig: { aliases: { review: { targets: ["cliproxyapi/gpt-6-astra", "cliproxyapi/gpt-6.1-sol"] } } } });
@@ -734,6 +1302,7 @@ const setup = (
   control?: FabricControlPlane,
   options?: {
     cwd?: string;
+    rootSessionCwd?: () => string | undefined;
     identity?: MeshIdentity;
     ownsRuntime?: boolean;
     hostId?: string;
@@ -755,15 +1324,26 @@ const setup = (
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-agents-provider-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+  const rootSessionRecord = { cwd: boundRootCwd };
+  // Private exact-key v1 controls: #11864 is listed; #1 remains unlisted.
+  // Only fixtures created here receive the test-only root-metadata seam.
+  const configuredExceptionPath = options?.agentsConfig?.modelExceptionsPath;
+  const useExceptionFixture = !configuredExceptionPath || configuredExceptionPath === MODEL_EXCEPTIONS_PATH;
+  const modelExceptionsPath = useExceptionFixture ? path.join(root, "model-exceptions.json") : configuredExceptionPath;
+  if (useExceptionFixture) {
+    writeProviderGrants(modelExceptionsPath);
+    trustedExceptionFixturePaths.add(modelExceptionsPath);
+  }
   const agents = new AgentManager(
     options?.cwd ?? process.cwd(),
-    { ...DEFAULT_FABRIC_CONFIG.agents, ...options?.agentsConfig },
+    { ...DEFAULT_FABRIC_CONFIG.agents, ...options?.agentsConfig, modelExceptionsPath },
     {
       workerPath: options?.workerPath ?? path.resolve("tests/fixtures/fake-worker.mjs"),
       claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
       vedaBinary: path.resolve("tests/fixtures/fake-veda.mjs"),
       runRoot: path.join(root, "runs"),
       hostId: options?.hostId ?? options?.identity?.id ?? "session:test",
+      rootSessionCwd: options?.rootSessionCwd ?? (() => rootSessionRecord.cwd),
       ...(options?.preparePiModel ? { preparePiModel: options.preparePiModel } : {}),
       ...(options?.onBackgroundComplete ? { onBackgroundComplete: options.onBackgroundComplete } : {}),
       ...(options?.onResultConsumed ? { onResultConsumed: options.onResultConsumed } : {}),
@@ -838,7 +1418,7 @@ const setup = (
       runner: "pi",
       transport: "host",
       capabilities: ["steer", "followUp", "fabric"],
-      cwd: process.cwd(),
+      cwd: rootSessionRecord.cwd,
       sessionId: "test",
       startedAt: 1,
       updatedAt: 1,
@@ -895,7 +1475,7 @@ const setup = (
 describe("configured task model precedence (#2890, #6062)", () => {
   const sol = "cliproxyapi/gpt-6.1-sol";
   const opus = "cliproxyapi-anthropic/claude-opus-5-5";
-  const callers = (["main", "actor", "agent"] as const)
+  const callers = (["main", "actor"] as const)
     .flatMap(kind => (["run", "spawn"] as const).map(action => [kind, action] as const));
   const parentContext = {
     ...context,
@@ -904,7 +1484,7 @@ describe("configured task model precedence (#2890, #6062)", () => {
       model: { provider: "cliproxyapi-anthropic", id: "claude-opus-5-5" },
     } as ExtensionContext,
   };
-  const callerOptions = (kind: "main" | "actor" | "agent", agentsConfig: FabricAgentConfig) => ({
+  const callerOptions = (kind: "main" | "actor", agentsConfig: FabricAgentConfig) => ({
     identity: { id: `${kind}:parent`, name: "parent", kind, sessionId: "test" },
     ...(kind !== "main" ? { mainAgentId: "session:remote-main" } : {}),
     agentsConfig,
@@ -933,18 +1513,21 @@ describe("configured task model precedence (#2890, #6062)", () => {
   }
 
   it.each(callers)("unconfigured model inherits %s caller via %s, not the remote Main", async (kind, action) => {
-    const config = normalizeFabricConfig({ agents: { thinking: "high" } });
+    const config = normalizeFabricConfig({ agents: {
+      thinking: "high",
+      modelPolicy: { fallbackModel: "cliproxyapi/gpt-6-luna", fallbackThinking: "high" },
+    } });
     const { provider, agents } = setup([], [], undefined, callerOptions(kind, config.agents));
     const child = await provider.invoke(action, { task: "review", transport: "process" }, parentContext) as AgentHandleInfo;
-    expect(child).toMatchObject({ model: opus, thinking: "xhigh" });
+    expect(child).toMatchObject({ model: "cliproxyapi/gpt-6-luna", thinking: "high" });
     if (action === "spawn") await agents.wait(child.id);
   });
 
   it.each(callers)("explicit model/effort beats configured defaults for %s caller via %s", async (kind, action) => {
     const config = normalizeFabricConfig({ agents: { model: sol, thinking: "high" } });
     const { provider, agents } = setup([], [], undefined, callerOptions(kind, config.agents));
-    const child = await provider.invoke(action, { task: "review", transport: "process", model: opus, thinking: "low" }, parentContext) as AgentHandleInfo;
-    expect(child).toMatchObject({ model: opus, thinking: "low" });
+    const child = await provider.invoke(action, { task: "review", transport: "process", model: opus, thinking: "low", opusReason: "#11864 explicit model exception" }, parentContext) as AgentHandleInfo;
+    expect(child).toMatchObject({ model: opus, thinking: "low", modelReason: "#11864 explicit model exception" });
     if (action === "spawn") await agents.wait(child.id);
   });
 
@@ -1538,7 +2121,9 @@ describe("Main remote ASK observation ownership", () => {
       } else await sender.provider.stopParticipant(actor.id);
       stopObservation.abort(new Error("stop observation finished"));
       await again;
-      expect(stop.mock.calls.filter(([id]) => id === activationId)).toHaveLength(1);
+      // #10150 separates lifecycle cancellation from durable operator intent.
+      // Observe the owned activation's terminal join, not the public stop seam.
+      expect(await owner.agents.wait(activationId)).toMatchObject({ id: activationId, status: "stopped" });
       expect(owner.actorDeliveries).toHaveLength(queued ? 2 : 1);
     } finally { pumping = false; await pump; await bridge?.stop(); vi.unstubAllEnvs(); }
   });
@@ -2075,6 +2660,8 @@ afterEach(async () => {
   await Promise.all(controlPlanes.splice(0).map((control) => control.close()));
   await Promise.all(actorManagers.splice(0).map((manager) => manager.close()));
   await Promise.all(agentManagers.splice(0).map((manager) => manager.close()));
+  restoreAdmissionFixture?.();
+  restoreAdmissionFixture = undefined;
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
@@ -3236,7 +3823,7 @@ describe("AgentsProvider runner support", () => {
       invocationContext,
     ) as { id: string; cwd: string };
     expect(handle.cwd).toBe(canonical);
-    expect(updates.some((message) => message.endsWith(`cwd ${canonical}`))).toBe(true);
+    expect(updates.some((message) => message.endsWith(`cwd ${canonical} · model unverified`))).toBe(true);
     await provider.invoke("wait", { id: handle.id }, invocationContext);
     await provider.invoke("cleanup", { id: handle.id }, invocationContext);
   });
@@ -3273,7 +3860,7 @@ describe("AgentsProvider runner support", () => {
       invocationContext,
     ) as { id: string; cwd: string };
     expect(handle.cwd).toBe(canonical);
-    expect(updates.some((message) => message.endsWith(`cwd ${shown}`))).toBe(true);
+    expect(updates.some((message) => message.endsWith(`cwd ${shown} · model unverified`))).toBe(true);
     expect(updates.every((message) => !/[\u0000-\u001f\u007f]/.test(message))).toBe(true);
     expect(updates.every((message) => message.length < 512)).toBe(true);
     await provider.invoke("wait", { id: handle.id }, invocationContext);
@@ -3635,7 +4222,6 @@ return { first, second, tail: "continued" };`,
       vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
       const actor = await actors.create({ name: "stoppable-advisor", instructions: "Advise.", responseMode: "text", delivery: "followUp", triggerTurn: false, transport: "process" });
       const controller = new AbortController();
-      const stop = vi.spyOn(agents, "stop");
       const observation = provider.invoke("ask", { id: actor.id, message: "HANG" }, {
         ...context, signal: controller.signal,
         extensionContext: { ...context.extensionContext, mode: "rpc", sessionManager: { getSessionId: () => "caller" } } as unknown as ExtensionContext,
@@ -3646,15 +4232,16 @@ return { first, second, tail: "continued" };`,
           const worker = agents.list()[0];
           return Boolean(actors.status(actor.id).inFlightRun) && worker?.status === "running" && "turns" in worker;
         }, PROCESS_WORKER_EVENT_TIMEOUT_MS);
-        expect(agents.list()[0]).toMatchObject({ turns: 0, toolCalls: 0 });
+        const activationId = actors.status(actor.id).inFlightRun!.id;
+        expect(agents.status(activationId)).toMatchObject({ status: "running", turns: 0, toolCalls: 0 });
         if (cancellation === "explicit stop") await provider.invoke("stop", { id: actor.id }, context);
         else controller.abort(cancellation === "non-Main abort"
           ? new Error("MainExecutionCeilingError: Main ceiling hit after 700ms (executor.mainMaxTimeoutMs).")
           : new Error(cancellation === "ordinary deadline" ? "Execution timed out" : "Escape"));
         expect(await outcome).toBeInstanceOf(Error);
         expect((await outcome as Error).message).toMatch(/Agent stopped|Operation aborted/);
-        await waitFor(() => agents.list().every(run => run.status === "stopped"), PROCESS_WORKER_EVENT_TIMEOUT_MS);
-        expect(stop).toHaveBeenCalled();
+        await waitFor(() => agents.status(activationId).status === "stopped", PROCESS_WORKER_EVENT_TIMEOUT_MS);
+        expect(await agents.wait(activationId)).toMatchObject({ id: activationId, status: "stopped" });
         expect(actorDeliveries).toEqual([]);
         expect(actors.messages(actor.id).filter(message => message.direction === "out" && message.text)).toEqual([]);
       } finally { vi.unstubAllEnvs(); }
@@ -3779,16 +4366,20 @@ return { first, second, tail: "continued" };`,
     const mainContext = { ...context.extensionContext, cwd: process.cwd(), mode: "rpc", sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext;
     const service = new FabricExecutionService(registry, config);
     await service.prewarm(mainContext);
-    const stop = vi.spyOn(agents, "stop");
+    let activationId = "";
     try {
       const result = await executeAfterAdmission(signal => service.execute({ context: mainContext, signal, parentToolCallId: "forged-ceiling", onPartial() {},
         strings: { reason: "MainExecutionCeilingError: Main ceiling hit after 5000ms (executor.mainMaxTimeoutMs)." },
         code: `const observation = agents.ask({ id: ${JSON.stringify(actor.id)}, message: "LIVE_WITHOUT_PROGRESS" }).catch(() => undefined); await new Promise<void>(resolve => setTimeout(resolve, 400)); throw π.reason;`,
-      }), () => Boolean(actors.status(actor.id).inFlightRun));
+      }), () => Boolean(actors.status(actor.id).inFlightRun), () => {
+        activationId = actors.status(actor.id).inFlightRun!.id;
+        expect(agents.status(activationId).status).toBe("running");
+      });
       expect(result.success).toBe(false);
       expect(result.trace.outcome).toBe("failed");
       await waitFor(() => !actors.status(actor.id).inFlightRun);
-      expect(stop).toHaveBeenCalled();
+      expect(activationId).not.toBe("");
+      expect(await agents.wait(activationId)).toMatchObject({ id: activationId, status: "stopped" });
       expect(actorDeliveries).toEqual([]);
       expect(agents.list().some(run => run.status === "running")).toBe(false);
     } finally { await registry.close(); vi.unstubAllEnvs(); }
@@ -3827,7 +4418,6 @@ return { first, second, tail: "continued" };`,
     vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
     vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
     const controller = new AbortController();
-    const stop = vi.spyOn(agents, "stop");
     const observation = provider.invoke("run", { task: "LIVE_WITHOUT_PROGRESS", transport: "process" }, {
       ...context, signal: controller.signal,
       extensionContext: { ...context.extensionContext, mode, sessionManager: { getSessionId: () => "main" } } as unknown as ExtensionContext,
@@ -3841,7 +4431,7 @@ return { first, second, tail: "continued" };`,
       else expect(await observation).toBeInstanceOf(Error);
       await waitFor(() => agents.status(id).status !== "running", PROCESS_WORKER_EVENT_TIMEOUT_MS);
       expect(agents.status(id).status).toBe("stopped");
-      expect(stop).toHaveBeenCalled();
+      expect(await agents.wait(id)).toMatchObject({ id, status: "stopped" });
     } finally { controller.abort(); await observation; vi.unstubAllEnvs(); }
   }, 30_000);
 
@@ -4212,7 +4802,7 @@ return { first, second, tail: "continued" };`,
   });
 
   it("enumerates Claude models and preserves runner on actors", async () => {
-    const { provider } = setup();
+    const { provider } = setup([], [], undefined, { agentsConfig: { modelPolicy: { requireReason: [] } } });
     const models = (await provider.invoke("models", { runner: "claude" }, context)) as Array<{
       runner: string;
       key: string;
@@ -4388,6 +4978,43 @@ describe("#2726 resident actor live read views", () => {
     expect(unknown.removal).toEqual(state.actor.removal);
     expect(unknown.inFlightRun).toBeUndefined();
     expect(unknown.queued).toBeUndefined();
+  });
+
+  it("uses a matching owning-root read view for its own activation and refuses other ids", async () => {
+    const state = await passiveState();
+    const identity = {
+      actorId: state.actor.id, name: state.actor.name, rootId: state.actor.rootId!,
+      ownershipToken: state.actor.ownershipToken!, instructionsDigest: state.actor.instructionsDigest!,
+      roleStamp: "(role reviewer.md 0123456789ab)",
+    };
+    vi.stubEnv("PI_FABRIC_ACTOR_SELF", JSON.stringify(identity));
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", identity.actorId);
+    try {
+      const ownerStatus = { ...state.actor, status: "running" as const, model: "owner-fresh-model" };
+      const actorStatus = vi.fn(async () => ownerStatus);
+      (state.provider as unknown as { residency?: ResidencyClient }).residency = { actorStatus } as unknown as ResidencyClient;
+      state.setLive({ ...state.live, name: state.actor.name, rootId: identity.rootId,
+        ownerHostId: residentHostId(identity.rootId), ownerIdentityId: identity.rootId,
+        actorOwnershipToken: identity.ownershipToken, status: "running" });
+
+      await expect(state.provider.invoke("actorStatus", { id: identity.actorId }, context)).resolves.toMatchObject({
+        id: identity.actorId, rootId: identity.rootId, ownershipToken: identity.ownershipToken,
+        model: "owner-fresh-model", roleStamp: identity.roleStamp,
+      });
+      expect(actorStatus).toHaveBeenCalledWith(identity.actorId, undefined);
+      actorStatus.mockResolvedValueOnce({ ...ownerStatus, instructionsDigest: "d".repeat(64) });
+      const changedDefinition = await state.provider.invoke("actorStatus", { id: identity.actorId }, context) as FabricActorReadInfo;
+      expect(changedDefinition).toMatchObject({ id: identity.actorId, status: "unknown", instructionsDigest: identity.instructionsDigest });
+      expect(changedDefinition).not.toHaveProperty("model");
+      await expect(state.provider.invoke("actorStatus", { id: "another-actor" }, context))
+        .rejects.toThrow("Unknown Fabric actor: another-actor");
+      expect(actorStatus).toHaveBeenCalledTimes(2);
+
+      vi.stubEnv("PI_FABRIC_ACTOR_SELF", "not-json");
+      await expect(state.provider.invoke("actorStatus", { id: identity.actorId }, context))
+        .rejects.toThrow("Fabric actor activation identity is unavailable");
+      expect(actorStatus).toHaveBeenCalledTimes(2);
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it("leaves owned local actors and global templates unchanged without reading a remote owner", async () => {
@@ -4621,7 +5248,7 @@ describe("AgentsProvider shared actor definitions", () => {
   it("members reports the resolved run binding, not the project default or owner overlay (#7682)", async () => {
     const state = setup();
     const actor = await state.actors.create({ name: "registry-member", instructions: "Observe.",
-      model: "anthropic/claude-opus-5-5", thinking: "medium" });
+      model: "anthropic/claude-opus-5-5", modelReason: "#11864 registry member", thinking: "medium" });
     const directory = new ParticipantDirectory(state.mesh, { enabled: true,
       hostId: state.identity.id, rootId: state.mainAgent.id, identity: state.identity });
     directory.registerSource(() => state.actors.listOwned(true).map(info =>
@@ -4929,10 +5556,12 @@ describe("AgentsProvider shared actor definitions", () => {
     const workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
     const ownerAgents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
       workerPath,
+      rootSessionCwd: () => boundRootCwd,
       runRoot: path.join(root, "owner-runs"),
     });
     const peerAgents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
       workerPath,
+      rootSessionCwd: () => boundRootCwd,
       runRoot: path.join(root, "peer-runs"),
     });
     agentManagers.push(ownerAgents, peerAgents);
@@ -5251,6 +5880,63 @@ describe("AgentsProvider global actors", () => {
     expect(imported.sessionFile).not.toBe(actor.sessionFile);
     await expect(provider.invoke("setInferenceContext", { id: actor.id, inferenceContext: "invalid" }, context)).rejects.toThrow();
     await expect(provider.invoke("create", { ...createRequest, name: "bad-window", inferenceContext: "invalid" }, context)).rejects.toThrow();
+  });
+
+  it.each(["project", "global"] as const)("replaces and clears %s topic subscriptions without changing the other scope", async scope => {
+    const { provider, actors, globalActors, root } = setup();
+    const local = await actors.create({ name: "topics-local", instructions: "Work.", topics: ["topics.local"] });
+    const template = globalActors.create({ name: "topics-global", instructions: "Work.", topics: ["topics.global"] });
+    const id = scope === "global" ? template.id : local.id;
+    const read = () => scope === "global" ? globalActors.resolve(id)! : actors.status(id);
+    expect(await provider.invoke("setTopics", { id, scope, topics: ["topics.new", "topics.new", "topics.other"] }, context))
+      .toMatchObject({ id, topics: ["topics.new", "topics.other"] });
+    expect(read().topics).toEqual(["topics.new", "topics.other"]);
+    expect(scope === "global" ? actors.status(local.id).topics : globalActors.resolve(template.id)!.topics)
+      .toEqual(scope === "global" ? ["topics.local"] : ["topics.global"]);
+    expect(await provider.invoke("setTopics", { id, scope, topics: [] }, context)).toMatchObject({ id, topics: [] });
+    expect(read().topics).toEqual([]);
+    if (scope === "global") {
+      const reopened = new GlobalActorRegistry(root, 64 * 1024);
+      expect(reopened.resolve(id)!.topics).toEqual([]);
+      expect(reopened.toRequest(reopened.resolve(id)!).topics).toEqual([]);
+      const imported = await provider.invoke("import", { id, as: "topics-imported" }, context) as FabricActorInfo;
+      expect(actors.status(imported.id).topics).toEqual([]);
+    }
+  });
+
+  it.each(["project", "global"] as const)("validates %s setTopics before mutating the definition", async scope => {
+    const { provider, actors, globalActors } = setup();
+    const request = { name: "topics-validation", instructions: "Work.", topics: ["topics.original"] };
+    const actor = scope === "global" ? globalActors.create(request) : await actors.create(request);
+    const read = () => scope === "global" ? globalActors.resolve(actor.id)! : actors.status(actor.id);
+    for (const topics of [undefined, null, "topics.string", 7, {}, [null], [7], [""], ["bad topic"], ["x".repeat(129)], ["topics.valid", "bad topic"]]) {
+      await expect(provider.invoke("setTopics", { id: actor.id, scope, ...(topics === undefined ? {} : { topics }) }, context)).rejects.toThrow();
+      expect(read().topics).toEqual(["topics.original"]);
+    }
+  });
+
+  it("validates and persists direct globalActors.update topics, including an empty replacement", () => {
+    const { globalActors, root } = setup();
+    const template = globalActors.create({ name: "topics-update", instructions: "Work.", topics: ["topics.original"] });
+    expect(globalActors.update(template.id, { topics: ["topics.updated", "topics.updated"] }).topics).toEqual(["topics.updated"]);
+    expect(new GlobalActorRegistry(root, 64 * 1024).resolve(template.id)!.topics).toEqual(["topics.updated"]);
+    for (const topics of [["bad topic"], [""], ["topics.valid", "bad topic"]]) {
+      expect(() => globalActors.update(template.id, { topics })).toThrow(/topic/);
+      expect(globalActors.resolve(template.id)!.topics).toEqual(["topics.updated"]);
+      expect(new GlobalActorRegistry(root, 64 * 1024).resolve(template.id)!.topics).toEqual(["topics.updated"]);
+    }
+    expect(globalActors.update(template.id, { topics: [] }).topics).toEqual([]);
+    expect(new GlobalActorRegistry(root, 64 * 1024).resolve(template.id)!.topics).toEqual([]);
+  });
+
+  it("refuses setTopics after canonical actor ownership moves without altering subscriptions or work", async () => {
+    let owned = true;
+    const { provider, actors, agents } = setup([], [], undefined, { canManageActor: () => owned });
+    const actor = await actors.create({ name: "topics-owner", instructions: "Work.", topics: ["topics.original"] });
+    owned = false;
+    await expect(provider.invoke("setTopics", { id: actor.id, topics: [] }, context)).rejects.toThrow("owned by another host");
+    expect(actors.status(actor.id)).toMatchObject({ topics: ["topics.original"], queued: 0 });
+    expect(agents.list()).toEqual([]);
   });
 
   it("updates tool allowlists for project actors and global templates", async () => {
@@ -5625,12 +6311,19 @@ describe("AgentsProvider steering", () => {
   it("creates an actor with an activationFilter and sets, clears and validates it", async () => {
     const { provider } = setup();
     const actor = (await provider.invoke("create", {
-      name: "supervisor", instructions: "Supervise.", topics: ["github.demo"], activationFilter: ["hold", "never-message-events"],
+      name: "supervisor", instructions: "Supervise.", topics: ["github.demo"], activationFilter: ["hold", "never-message-events"], deadLetterReplayMaxAgeMs: 0,
     }, context)) as { id: string; activationFilter?: unknown };
     expect(actor.activationFilter).toEqual(["hold", "never-message-events"]);
+    expect(actor).toMatchObject({ deadLetterReplayMaxAgeMs: 0 });
     const expiresAt = Date.now() + 60_000;
     await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], expiresAt }, context))
-      .resolves.toMatchObject({ activationFilterExpiresAt: expiresAt, filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } });
+      .resolves.toMatchObject({ deadLetterReplayMaxAgeMs: 0, activationFilterExpiresAt: expiresAt, filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null } });
+    await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], deadLetterReplayMaxAgeMs: 12_345 }, context))
+      .resolves.toMatchObject({ deadLetterReplayMaxAgeMs: 12_345 });
+    for (const deadLetterReplayMaxAgeMs of [-1, 0.5, Infinity, "0"]) {
+      await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], deadLetterReplayMaxAgeMs }, context)).rejects.toThrow("deadLetterReplayMaxAgeMs");
+      await expect(provider.invoke("create", { name: "bad-age", instructions: "x", deadLetterReplayMaxAgeMs }, context)).rejects.toThrow("deadLetterReplayMaxAgeMs");
+    }
     for (const invalid of [NaN, Infinity, "tomorrow"]) {
       await expect(provider.invoke("setActivationFilter", { id: actor.id, activationFilter: ["hold"], expiresAt: invalid }, context)).rejects.toThrow("expiresAt");
     }
@@ -5641,12 +6334,14 @@ describe("AgentsProvider steering", () => {
     await expect(provider.invoke("setActivationFilter", { id: actor.id }, context)).rejects.toThrow("activationFilter is required");
     await expect(provider.invoke("create", { name: "bad", instructions: "x", activationFilter: [{ id: "all" }] }, context)).rejects.toThrow("name a source, topic, kind or where");
     const template = (await provider.invoke("create", {
-      name: "template", instructions: "Supervise.", scope: "global", activationFilter: ["never-message-events"],
+      name: "template", instructions: "Supervise.", scope: "global", activationFilter: ["never-message-events"], deadLetterReplayMaxAgeMs: 0,
     }, context)) as { id: string; activationFilter?: unknown };
     expect(template.activationFilter).toEqual(["never-message-events"]);
+    expect(template).toMatchObject({ deadLetterReplayMaxAgeMs: 0 });
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], expiresAt, scope: "global" }, context)).rejects.toThrow("only supported for live actors");
-    await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], scope: "global" }, context))
-      .resolves.toMatchObject({ activationFilter: ["hold"] });
+    await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["hold"], scope: "global", deadLetterReplayMaxAgeMs: 12_345 }, context))
+      .resolves.toMatchObject({ activationFilter: ["hold"], deadLetterReplayMaxAgeMs: 12_345 });
+    await expect(provider.invoke("import", { id: template.id, as: "imported-backlog" }, context)).resolves.toMatchObject({ deadLetterReplayMaxAgeMs: 12_345 });
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: null, scope: "global" }, context))
       .resolves.not.toHaveProperty("activationFilter");
     await expect(provider.invoke("setActivationFilter", { id: template.id, activationFilter: ["x"], scope: "global" }, context)).rejects.toThrow("Unknown activationFilter preset");
@@ -6301,13 +6996,14 @@ describe("AgentsProvider switchModel", () => {
     ).rejects.toThrow(/not available to this Pi session/);
   });
 
-  it("passes Claude and Veda model strings through unchanged", async () => {
-    const { provider, agents } = setup();
+  it("passes Claude and Veda model strings through unchanged with the reason-policy rollback", async () => {
+    // Opaque native strings are not grant keys; this compatibility control has no exception policy.
+    const { provider, agents } = setup([], [], undefined, { agentsConfig: { modelPolicy: { requireReason: [] } } });
     const spawn = vi.spyOn(agents, "spawn");
 
     await provider.invoke(
       "spawn",
-      { task: "Claude pass-through", runner: "claude", model: "private/claude-model" },
+      { task: "Claude pass-through", runner: "claude", model: "private/claude-model", modelReason: "Native Claude passthrough probe #11864" },
       modelContext(),
     );
     await provider.invoke(
@@ -6501,11 +7197,11 @@ describe("own-root resident setters and authoritative status", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
-  it("forwards resident expiry to the execution owner", async () => {
+  it("forwards resident expiry and dead-letter replay age to the execution owner", async () => {
     const state = await remoteState();
     const expiresAt = Date.now() + 60000;
-    await state.provider.invoke("setActivationFilter", { id: state.actor.id, activationFilter: ["hold"], expiresAt }, context);
-    expect(state.setActor.mock.calls[0]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], expiresAt });
+    await state.provider.invoke("setActivationFilter", { id: state.actor.id, activationFilter: ["hold"], expiresAt, deadLetterReplayMaxAgeMs: 0 }, context);
+    expect(state.setActor.mock.calls[0]?.[0]).toEqual({ operation: "setActivationFilter", id: state.actor.id, activationFilter: ["hold"], expiresAt, deadLetterReplayMaxAgeMs: 0 });
   });
 
   it("returns host effective status/list rather than a stale Main overlay", async () => {
@@ -6595,9 +7291,46 @@ describe("external spawn router hook (#2890)", () => {
     });`, inputPath];
     const state = setup([], [], undefined, { agentsConfig: { ...configured, ...agentsConfig,
       router: { command, mode, timeoutMs: 400 } } });
-    const logs = () => fs.readFileSync(path.join(state.mesh.root, "router/decisions.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const logs = () => {
+      const entries = fs.readFileSync(path.join(state.mesh.root, "router/decisions.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      for (const entry of entries) {
+        const keys = entry.kind === "decision"
+          ? ["ts", "decisionId", "kind", "spawnKind", "mode", "commandDigest", "decision", "pick", "requested", "actual", "fallbackReason", "latencyMs", "error"]
+          : ["ts", "kind", "decisionId", "agentId", "sessionId", "launch", "host", "model", "thinking", "verified", "evidenceRef", ...(entry.kind === "start-failed" ? ["error"] : [])];
+        expect(Object.keys(entry).sort()).toEqual(keys.sort());
+        if (entry.kind === "decision") {
+          expect(entry.commandDigest).toBe(createHash("sha256").update(JSON.stringify(command)).digest("hex"));
+          expect(entry.requested).toEqual(entry.actual);
+          expect(entry.fallbackReason).toBe(entry.decision === "default" ? entry.error : null);
+        } else expect(Object.keys(entry.launch).sort()).toEqual(["pid", "processStartTime", "runId"]);
+      }
+      return entries;
+    };
     const requests = () => fs.readFileSync(inputPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
     return { ...state, dir, inputPath, logs, requests };
+  };
+  const decisionId = expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  const expectStarted = (state: ReturnType<typeof routerSetup>, child: { id: string },
+    actual: { model: string; thinking: string }, decision: Record<string, unknown>, sessionId: string | null = null) => {
+    const entries = state.logs();
+    const { kind: spawnKind, ...fields } = decision;
+    expect(entries).toEqual([
+      expect.objectContaining({ decisionId, kind: "decision", spawnKind, ...fields }),
+      { ts: expect.any(String), kind: "start", decisionId: entries[0]?.decisionId,
+        agentId: child.id, sessionId, ...actual, host: os.hostname(), launch: entries[1]?.launch,
+        verified: expect.any(Boolean), evidenceRef: entries[1]?.evidenceRef },
+    ]);
+    if (spawnKind === "actor") expect(entries[1]).toMatchObject({
+      launch: { runId: null, pid: null, processStartTime: null }, verified: false, evidenceRef: null });
+    else expect(entries[1].launch.runId).toBe(child.id);
+    if (entries[1].verified) expect(entries[1].evidenceRef).toEqual(expect.any(String));
+    expect(entries[0]).not.toHaveProperty("task");
+  };
+  const nativeActorSessionId = (actor: FabricActorInfo): string | null => {
+    if (!actor.sessionFile || !fs.existsSync(actor.sessionFile)) return null;
+    const header = fs.readFileSync(actor.sessionFile, "utf8").split("\n").filter(Boolean)
+      .map(line => JSON.parse(line)).find(entry => entry.type === "session");
+    return typeof header?.id === "string" ? header.id : null;
   };
   it.each(["off", "shadow", "enforce"] as const)("%s selects the expected actual worker model/thinking", async mode => {
     const state = routerSetup(mode);
@@ -6609,7 +7342,7 @@ describe("external spawn router hook (#2890)", () => {
       expect(fs.existsSync(state.inputPath)).toBe(false);
       expect(fs.existsSync(path.join(state.mesh.root, "router"))).toBe(false);
     } else {
-      expect(state.logs()).toEqual([expect.objectContaining({ actual, pick, error: null })]);
+      expectStarted(state, child, actual, { kind: "spawn", actual, pick, error: null });
       expect(state.requests()).toEqual([expect.objectContaining({ kind: "spawn", name: "normal child", requestedComplexity: "normal", parentId: state.identity.id,
         defaults: { model: "provider/model-a", thinking: "medium" } })]);
       expect(state.requests()[0]).not.toHaveProperty("task");
@@ -6626,7 +7359,7 @@ describe("external spawn router hook (#2890)", () => {
     const actual = mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : { model: "provider/model-a", thinking: "medium" };
     expect(await state.agents.wait(child.id)).toMatchObject({ ...actual, status: "completed" });
     expect(state.requests()).toEqual([expect.objectContaining({ kind: "spawn", requestedComplexity: "delicate" })]);
-    expect(state.logs()).toEqual([expect.objectContaining({ actual, pick, error: null })]);
+    expectStarted(state, child, actual, { kind: "spawn", actual, pick, error: null });
   });
   it.each([
     [{ model: "provider/project", thinking: "low" }, { model: "provider/project", thinking: "low" }],
@@ -6636,7 +7369,7 @@ describe("external spawn router hook (#2890)", () => {
     const child = await state.provider.invoke("spawn", { task: "explicit", ...overrides }, context) as AgentHandleInfo;
     expect(child).toMatchObject(actual); await state.agents.wait(child.id);
     expect(fs.existsSync(state.inputPath)).toBe(false);
-    expect(state.logs()).toEqual([expect.objectContaining({ decision: "explicit", pick: null, actual, error: null })]);
+    expectStarted(state, child, actual, { kind: "spawn", decision: "explicit", pick: null, actual, error: null });
   });
   it.each([
     ["process.stdout.write('garbage');", "invalid-json"],
@@ -6648,14 +7381,15 @@ describe("external spawn router hook (#2890)", () => {
     const child = await state.provider.invoke("spawn", { task: "fallback" }, context) as AgentHandleInfo;
     const actual = { model: "provider/model-a", thinking: "medium" };
     expect(child).toMatchObject(actual); expect(await state.agents.wait(child.id)).toMatchObject({ status: "completed", ...actual });
-    expect(state.logs()).toEqual([expect.objectContaining({ actual, error })]);
+    expectStarted(state, child, actual, { kind: "spawn", actual, error });
   });
   it("does not fuzzy-match or bypass host deny policy for a router pick", async () => {
     for (const model of ["provider/modle-b", "provider/model-b"]) {
       const state = routerSetup("enforce", `process.stdout.write(JSON.stringify({ model: ${JSON.stringify(model)}, thinking: 'high' }));`, { deniedModels: ["provider/model-b"] });
       const child = await state.provider.invoke("spawn", { task: "protected fallback" }, context) as AgentHandleInfo;
       expect(child.model).toBe("provider/model-a"); await state.agents.wait(child.id);
-      expect(state.logs()[0]).toMatchObject({ error: "unknown-or-denied-model" });
+      expectStarted(state, child, { model: "provider/model-a", thinking: "medium" },
+        { kind: "spawn", error: "unknown-or-denied-model" });
     }
   });
   const inheritedSpawn = async (state: ReturnType<typeof routerSetup>) => {
@@ -6672,14 +7406,16 @@ describe("external spawn router hook (#2890)", () => {
     const child = await inheritedSpawn(state);
     expect(child).toMatchObject({ model: "provider/session", thinking: "max" });
     expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/session", thinking: "max" } });
-    expect(state.logs()).toEqual([expect.objectContaining({ decision: "default", pick, actual: { model: "provider/session", thinking: "max" }, error: null })]);
+    const actual = { model: "provider/session", thinking: "max" };
+    expectStarted(state, child, actual, { kind: "spawn", decision: "default", pick, actual, error: null });
   });
   it("lets an enforce pick override the inherited static default", async () => {
     const state = routerSetup("enforce", undefined, {}, {});
     const child = await inheritedSpawn(state);
     expect(child).toMatchObject({ model: pick.model, thinking: pick.thinking });
     expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/session", thinking: "max" } });
-    expect(state.logs()).toEqual([expect.objectContaining({ decision: "enforce", pick, actual: { model: pick.model, thinking: pick.thinking }, error: null })]);
+    const actual = { model: pick.model, thinking: pick.thinking };
+    expectStarted(state, child, actual, { kind: "spawn", decision: "enforce", pick, actual, error: null });
   });
   // #699: a configured agents.model wins over the inherited binding as the static default; the router still runs.
   it.each(["shadow", "enforce"] as const)("%s: a configured agents.model wins over the inherited model as the router's static default", async mode => {
@@ -6688,7 +7424,7 @@ describe("external spawn router hook (#2890)", () => {
     const actual = mode === "enforce" ? { model: pick.model, thinking: pick.thinking } : { model: "provider/model-a", thinking: "medium" };
     expect(child).toMatchObject(actual);
     expect(state.requests()[0]).toMatchObject({ defaults: { model: "provider/model-a", thinking: "medium" } });
-    expect(state.logs()).toEqual([expect.objectContaining({ decision: mode === "enforce" ? "enforce" : "default", pick, actual, error: null })]);
+    expectStarted(state, child, actual, { kind: "spawn", decision: mode === "enforce" ? "enforce" : "default", pick, actual, error: null });
   });
   it.each(["create", "createActor"])("%s shares the hook once and freezes the enforce binding", async action => {
     const state = routerSetup("enforce");
@@ -6696,7 +7432,49 @@ describe("external spawn router hook (#2890)", () => {
     expect(actor).toMatchObject({ model: pick.model, thinking: pick.thinking });
     expect(state.actors.definition(actor.id)).toMatchObject({ model: pick.model, thinking: pick.thinking });
     expect(state.requests()).toEqual([expect.objectContaining({ kind: "actor", taskLength: Buffer.byteLength("private actor instructions") })]);
-    expect(state.logs()).toHaveLength(1);
+    const actual = { model: pick.model, thinking: pick.thinking };
+    expectStarted(state, actor, actual, { kind: "actor", decision: "enforce", actual, pick, error: null }, nativeActorSessionId(actor));
+  });
+  it.each([
+    ["shadow", "shadow", undefined, {}],
+    ["enforce", "enforce", undefined, {}],
+    ["default", "enforce", "process.stdout.write('garbage');", {}],
+    ["explicit", "enforce", undefined, { thinking: "low" }],
+  ] as const)("%s actor defaults stay dynamic unless enforce selected a binding", async (decision, mode, body, overrides) => {
+    const state = routerSetup(mode, body);
+    const actor = await state.provider.invoke("create", { name: "dynamic router actor", instructions: "Work.", ...overrides }, context) as FabricActorInfo;
+    const pinned = decision === "enforce";
+    const actual = pinned ? { model: pick.model, thinking: pick.thinking }
+      : { model: "provider/model-a", thinking: decision === "explicit" ? "low" : "medium" };
+    const definition = state.actors.definition(actor.id);
+    if (pinned) expect(definition).toMatchObject(actual);
+    else {
+      expect(definition.model).toBeUndefined();
+      if (decision === "explicit") expect(definition.thinking).toBe("low");
+      else expect(definition.thinking).toBeUndefined();
+    }
+    expectStarted(state, actor, actual, { kind: "actor", decision: pinned ? "enforce" : decision === "explicit" ? "explicit" : "default",
+      actual, pick: decision === "default" || decision === "explicit" ? null : pick,
+      error: decision === "default" ? "invalid-json" : null }, nativeActorSessionId(actor));
+    // Simulate a live defaults reload after creation, not an actor-specific setter.
+    state.agents.config.model = "provider/project-default";
+    state.agents.config.thinking = "minimal";
+    const next = pinned ? actual : { model: "provider/project-default", thinking: decision === "explicit" ? "low" : "minimal" };
+    const reply = await state.provider.invoke("ask", { id: actor.id, message: "Use the current binding." }, context) as { runId: string };
+    expect(state.agents.status(reply.runId)).toMatchObject({ ...next, status: "completed" });
+    // Activations use their effective defaults but must not route creation again.
+    expect(state.logs()).toHaveLength(2);
+    if (decision === "explicit") expect(fs.existsSync(state.inputPath)).toBe(false);
+    else expect(state.requests()).toHaveLength(1);
+  });
+  it("records the manager's clamped thinking at start rather than the router pick", async () => {
+    const state = routerSetup("enforce");
+    const child = await state.provider.invoke("spawn", { task: "bounded thinking", transport: "process", thinkingBounds: { max: "low" } }, context) as AgentHandleInfo;
+    const actual = { model: pick.model, thinking: "low" };
+    expect(child).toMatchObject(actual);
+    expect(await state.agents.wait(child.id)).toMatchObject({ ...actual, status: "completed" });
+    expectStarted(state, child, actual, { kind: "spawn", decision: "enforce", pick,
+      actual: { model: pick.model, thinking: pick.thinking }, error: null });
   });
   it.each(["complex", "delicate"] as const)("forwards the selected model and %s complexity to a durable spawn without a second router call", async complexity => {
     const state = routerSetup("enforce");
@@ -6704,8 +7482,17 @@ describe("external spawn router hook (#2890)", () => {
     (state.provider as unknown as { residency: ResidencyClient }).residency = { spawnAgent } as unknown as ResidencyClient;
     const child = await state.provider.invoke("spawn", { task: "durable", complexity, residency: "durable" }, context) as AgentHandleInfo;
     expect(child).toMatchObject({ model: pick.model, thinking: pick.thinking });
-    expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({ model: pick.model, thinking: pick.thinking, complexity }), undefined);
-    expect(state.requests()).toEqual([expect.objectContaining({ requestedComplexity: complexity })]); expect(state.logs()).toHaveLength(1);
+    // This fake never enters the native manager: only the decision exists locally.
+    const entries = state.logs();
+    expect(entries).toHaveLength(1);
+    expect(entries).toEqual([expect.objectContaining({ decisionId, kind: "decision", spawnKind: "spawn", decision: "enforce",
+      actual: { model: pick.model, thinking: pick.thinking }, pick, error: null })]);
+    expect(spawnAgent).toHaveBeenCalledTimes(1);
+    expect(spawnAgent).toHaveBeenCalledWith(expect.objectContaining({ model: pick.model, thinking: pick.thinking, complexity,
+      spawnRouterDecisionId: entries[0].decisionId }), undefined, expect.any(Function));
+    // The native resident receiver rejects meshRoot: keep its own configured root.
+    expect(spawnAgent.mock.calls[0]![0]).not.toHaveProperty("meshRoot");
+    expect(state.requests()).toEqual([expect.objectContaining({ requestedComplexity: complexity })]);
   });
   it("global templates and ordinary agents.run do not invoke the spawn-only router", async () => {
     const state = routerSetup("enforce");
@@ -6713,6 +7500,46 @@ describe("external spawn router hook (#2890)", () => {
     await state.provider.invoke("run", { task: "one-off" }, context);
     expect(fs.existsSync(state.inputPath)).toBe(false);
     expect(fs.existsSync(path.join(state.mesh.root, "router"))).toBe(false);
+  });
+  it("records one privacy-safe start failure when the native manager rejects a public spawn", async () => {
+    const state = routerSetup("enforce");
+    const task = "private failed spawn task must not enter the ledger";
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(state.provider.invoke("spawn", { task, transport: "tmux" }, context))
+        .rejects.toThrow("Fabric agent transport tmux is disabled");
+      expect(launch).not.toHaveBeenCalled();
+      expect(state.agents.list()).toEqual([]);
+      const entries = state.logs();
+      expect(entries).toEqual([
+        expect.objectContaining({ decisionId, kind: "decision", spawnKind: "spawn", decision: "enforce", pick,
+          actual: { model: pick.model, thinking: pick.thinking }, error: null }),
+        { ts: expect.any(String), kind: "start-failed", decisionId: entries[0]?.decisionId,
+          agentId: null, sessionId: null, launch: { runId: null, pid: null, processStartTime: null }, host: os.hostname(),
+          model: null, thinking: null, verified: false, evidenceRef: null, error: "start-failed" },
+      ]);
+      expect(state.requests()).toHaveLength(1);
+      expect(entries.every(entry => !Object.prototype.hasOwnProperty.call(entry, "task"))).toBe(true);
+      expect(JSON.stringify(entries)).not.toContain(task);
+      expect(JSON.stringify(entries)).not.toContain("detached execution custody");
+    } finally { launch.mockRestore(); }
+  });
+  it.each(["spawn", "create"] as const)("%s records a fixed failure if preparation rejects after routing but before native handoff", async action => {
+    const state = routerSetup("enforce");
+    const resolve = state.agents.resolveKernel.bind(state.agents);
+    vi.spyOn(state.agents, "resolveKernel").mockImplementation(request => {
+      if (fs.existsSync(state.inputPath)) throw new Error("private preparation failure");
+      return resolve(request);
+    });
+    const spawn = vi.spyOn(state.agents, "spawn");
+    const create = vi.spyOn(state.actors, "create");
+    const args = action === "spawn" ? { task: "private preparation failure" } : { name: "failed actor", instructions: "private preparation failure" };
+    await expect(state.provider.invoke(action, args, context)).rejects.toThrow("private preparation failure");
+    expect(spawn).not.toHaveBeenCalled(); expect(create).not.toHaveBeenCalled();
+    const entries = state.logs();
+    expect(entries).toHaveLength(2);
+    expect(entries[1]).toMatchObject({ kind: "start-failed", decisionId: entries[0].decisionId, verified: false, error: "start-failed" });
+    expect(JSON.stringify(entries)).not.toContain("private preparation failure");
   });
   it("validates complexity before command or launch", async () => {
     const state = routerSetup("enforce"); const launch = vi.spyOn(state.agents, "spawn");

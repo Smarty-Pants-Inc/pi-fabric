@@ -83,10 +83,11 @@ export const writePolicyDenial = (
       : `Fabric write policy refuses ${toolName}: shell commands cannot be confined; the parent must request shell: "unconfined"`;
   }
   if (!WRITE_TOOLS.has(toolName)) return undefined;
-  if (policy.readOnly) return `Fabric write policy refuses ${toolName}: this agent is read-only`;
   const args = typeof input === "object" && input !== null ? input as Record<string, unknown> : {};
   const raw = [args.path, args.file_path, args.filePath].find((value) => typeof value === "string");
-  if (typeof raw !== "string" || raw === "") return `Fabric write policy refuses ${toolName}: no path argument`;
+  const scope = `refused path: ${JSON.stringify(raw ?? null)}; allowed roots: ${JSON.stringify(policy.writableRoots)}`;
+  if (policy.readOnly) return `Fabric write policy refuses ${toolName}: this agent is read-only; ${scope}`;
+  if (typeof raw !== "string" || raw === "") return `Fabric write policy refuses ${toolName}: no path argument; ${scope}`;
   try {
     const lexical = resolveToolPath(raw, cwd);
     const real = nearestRealPath(lexical);
@@ -97,7 +98,10 @@ export const writePolicyDenial = (
   } catch {
     // Unresolvable paths fail closed.
   }
-  return `Fabric write policy refuses ${toolName} outside writable roots: ${raw}`;
+  const actorHint = process.env.PI_FABRIC_ACTOR_ID || process.env.PI_FABRIC_ACTOR_NAME
+    ? "; write outside actor scratch refused; use the shell or a trusted helper for factory state"
+    : "";
+  return `Fabric write policy refuses ${toolName} outside writable roots; ${scope}${actorHint}`;
 };
 
 /** Child-side guard loaded by the worker with -e only when a policy is set. */

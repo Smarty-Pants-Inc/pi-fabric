@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyProviderError } from "../src/provider-error-class.js";
+import { classifyModelRefusal, classifyProviderError, hasRecordedModelRefusal } from "../src/provider-error-class.js";
 
 // smarty-dev#8742: 26 Mains sat 13.5 h in provider-backoff on a gateway 409 that no retry could fix.
 const affinity = "compaction_affinity_missing: the signed compaction block belongs to another upstream account";
@@ -7,7 +7,59 @@ const anthropic = (status: number, type: string, message: string) =>
   `${status} ${JSON.stringify({ type: "error", error: { type, message } })}`;
 const failed = (errorMessage: string, extra: Record<string, unknown> = {}) => ({ stopReason: "error", errorMessage, ...extra });
 
+describe("classifyModelRefusal (smarty-dev#14952)", () => {
+  it("recognizes only Pi's structured raw stop reason, and only on errors", () => {
+    expect(classifyModelRefusal({ stopReason: "error", rawStopReason: "refusal", errorMessage: "private stop detail" }))
+      .toEqual({ kind: "model-refusal" });
+    expect(classifyModelRefusal({ stopReason: "error", errorMessage: "The model refused to complete the request" })).toBeUndefined();
+    expect(classifyModelRefusal({ stopReason: "stop", rawStopReason: "refusal" })).toBeUndefined();
+  });
+
+  it("keeps status, body, diagnostic, and fallback-text errors on the provider path", () => {
+    const rawReasonWith5xx = failed(anthropic(503, "api_error", "The model refused to complete the request"), { rawStopReason: "refusal" });
+    expect(classifyModelRefusal(rawReasonWith5xx)).toBeUndefined();
+    expect(classifyProviderError(rawReasonWith5xx)).toMatchObject({ retryable: true, status: 503 });
+
+    const rawReasonWithBody = failed(JSON.stringify({ type: "error", error: { type: "api_error", message: "refusal" } }), { rawStopReason: "refusal" });
+    expect(classifyModelRefusal(rawReasonWithBody)).toBeUndefined();
+    expect(classifyProviderError(rawReasonWithBody)).toMatchObject({ retryable: true });
+
+    const fallbackOnly = failed("The model refused to complete the request");
+    expect(classifyModelRefusal(fallbackOnly)).toBeUndefined();
+    expect(classifyProviderError(fallbackOnly)).toMatchObject({ retryable: true, basis: "default" });
+
+    const statusBearingFallback = failed("503 The model refused to complete the request");
+    expect(classifyModelRefusal(statusBearingFallback)).toBeUndefined();
+    expect(classifyProviderError(statusBearingFallback)).toMatchObject({ retryable: true, status: 503 });
+
+    expect(classifyModelRefusal(failed("private stop detail", { rawStopReason: "refusal", diagnostics: [{ type: "provider_limit" }] })))
+      .toBeUndefined();
+
+    const recorded = failed("private stop detail", { rawStopReason: "refusal",
+      diagnostics: [{ type: "fabric_model_refusal", details: { rawStopReason: "refusal" } }] });
+    expect(classifyModelRefusal(recorded)).toBeUndefined();
+    expect(hasRecordedModelRefusal(recorded)).toBe(true);
+    const marker = { type: "fabric_model_refusal", details: { rawStopReason: "refusal" } };
+    expect(hasRecordedModelRefusal(failed("private stop detail", { rawStopReason: "refusal", diagnostics: [marker] }))).toBe(true);
+    expect(hasRecordedModelRefusal(failed(anthropic(503, "api_error", "temporary"), { rawStopReason: "refusal", diagnostics: [marker] })))
+      .toBe(false);
+    expect(hasRecordedModelRefusal(failed(JSON.stringify({ type: "error", error: { type: "api_error", message: "temporary" } }),
+      { rawStopReason: "refusal", diagnostics: [marker] }))).toBe(false);
+    expect(hasRecordedModelRefusal(failed("private stop detail", { rawStopReason: "refusal", diagnostics: [
+      marker, { type: "provider_limit" },
+    ] }))).toBe(false);
+    expect(hasRecordedModelRefusal(failed("private stop detail", { diagnostics: [{ type: "provider_limit" }] }))).toBe(false);
+  });
+});
+
 describe("classifyProviderError (smarty-dev#8742)", () => {
+  it("classifies refusals and Pi's explicit non-retryable recovery without provider text", () => {
+    expect(classifyProviderError(failed("private refusal detail", { rawStopReason: "refusal" })))
+      .toMatchObject({ retryable: false, short: "model refusal", basis: "diagnostic" });
+    expect(classifyProviderError(failed("private network diagnostic", { recovery: { retryable: false } })))
+      .toMatchObject({ retryable: false, short: "non-retryable", basis: "diagnostic" });
+  });
+
   it("ignores turns that did not fail", () => {
     expect(classifyProviderError(undefined)).toBeUndefined();
     expect(classifyProviderError({ stopReason: "stop" })).toBeUndefined();
@@ -52,6 +104,43 @@ describe("classifyProviderError (smarty-dev#8742)", () => {
     "Anthropic stream ended without a stop reason",
   ])("keeps %s retryable (today's backoff)", (errorMessage) => {
     expect(classifyProviderError(failed(errorMessage))?.retryable).toBe(true);
+  });
+
+  // Retry decisions follow status/structured fields, not affinity tokens echoed in prose.
+  it("keeps 503 retryable when body.message echoes compaction_affinity_missing", () => {
+    const secret = "SECRET-fake-provider-key echoed private prompt";
+    const errorMessage = `503 ${JSON.stringify({ message: `upstream quoted: ${affinity}; ${secret}` })}`;
+    const verdict = classifyProviderError(failed(errorMessage))!;
+    expect(verdict.short).toBe("503: compaction_affinity_missing");
+    expect(JSON.stringify(verdict)).not.toMatch(/SECRET|private prompt|fake-provider-key/);
+    expect(verdict).toMatchObject({ retryable: true, status: 503, basis: "status" });
+  });
+
+  it.each([408, 429, 500, 503, 529, 599])("keeps HTTP %s retryable despite structured affinity code or type", (status) => {
+    for (const field of ["code", "type"]) {
+      const errorMessage = `${status} ${JSON.stringify({ [field]: "compaction_affinity_missing" })}`;
+      expect(classifyProviderError(failed(errorMessage))).toMatchObject({ retryable: true, status, basis: "status" });
+    }
+  });
+
+  it.each(["code", "type"])("keeps 400 body.%s affinity non-retryable", (field) => {
+    const errorMessage = `400 ${JSON.stringify({ [field]: "compaction_affinity_missing" })}`;
+    expect(classifyProviderError(failed(errorMessage))).toMatchObject({ retryable: false, status: 400, basis: "body" });
+  });
+
+  it("uses the normal 400 status rule when only body.message quotes affinity", () => {
+    const errorMessage = `400 ${JSON.stringify({ message: `request quoted: ${affinity}` })}`;
+    expect(classifyProviderError(failed(errorMessage))).toMatchObject({ retryable: false, status: 400, basis: "status" });
+  });
+
+  it("keeps 400 rate_limit_error retryable when its message merely mentions affinity", () => {
+    expect(classifyProviderError(failed(anthropic(400, "rate_limit_error", `rate limited; quoted: ${affinity}`))))
+      .toMatchObject({ retryable: true, status: 400, basis: "body" });
+  });
+
+  it("does not use raw-text affinity fallback when a parsed body.message survives without status", () => {
+    const errorMessage = JSON.stringify({ message: `upstream quoted: ${affinity}` });
+    expect(classifyProviderError(failed(errorMessage))).toMatchObject({ retryable: true, basis: "default" });
   });
 
   it("keeps a provider plan limit (Pi provider_limit diagnostic) on backoff", () => {

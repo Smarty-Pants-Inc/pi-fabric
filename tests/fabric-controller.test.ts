@@ -9,6 +9,7 @@ import { FabricActivityStore } from "../src/activity/store.js";
 import type { FabricState } from "../src/fabric-state.js";
 import { FabricUiController } from "../src/ui/controller.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { configureFabricDiagnostics, fabricDiagnosticsFile, flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import { readParticipantFiles } from "../src/topology/participant-files.js";
 import { hostLiveness, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricDashboard } from "../src/ui/dashboard.js";
@@ -239,12 +240,52 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
-  it("fences pending dashboard model discovery at controller stop (#5962)", async () => {
+  it.each(["org-agent@x", "project-agent@x"])("routes dashboard discovery failures privately only for %s and keeps actions visible", async role => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "dashboard-discovery-diagnostics-"));
+    vi.stubEnv("SMARTY_ROLE", role);
+    vi.stubEnv("PI_CODING_AGENT_DIR", root);
+    const state = stubState();
+    vi.mocked(state.actors.list).mockReturnValue([{ ...stubActor, runner: "claude" } as never]);
+    const claudeModels = vi.fn(async () => { throw new Error("runtime unavailable"); });
+    Object.assign(state.agents, { claudeModels });
+    const controller = new FabricUiController(state);
+    let dashboard: FabricDashboard | undefined;
+    const context = { mode: "tui", modelRegistry: { getAvailable: () => [] },
+      sessionManager: { getSessionId: () => "dashboard-discovery" }, ui: {
+        custom: vi.fn(async (factory: (t: TUI, theme: Theme, keys: unknown, done: () => void) => FabricDashboard) => {
+          dashboard = factory({ requestRender: vi.fn() } as unknown as TUI, theme, {}, () => {});
+        }), notify: vi.fn(), setWidget: vi.fn(),
+      } } as unknown as ExtensionContext;
+    try {
+      await controller.openDashboard(context);
+      expect(claudeModels).toHaveBeenCalledOnce();
+      expect(dashboard).toBeDefined();
+      await flushFabricDiagnostics();
+      if (role.startsWith("org-agent")) {
+        expect(context.ui.notify).not.toHaveBeenCalled();
+        const lines = fs.readFileSync(fabricDiagnosticsFile("dashboard-discovery"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+        expect(lines).toEqual([expect.objectContaining({ source: "src/ui/controller.ts", level: "warning",
+          message: "Claude model discovery failed: runtime unavailable" })]);
+      } else {
+        expect(context.ui.notify).toHaveBeenCalledExactlyOnceWith("Claude model discovery failed: runtime unavailable", "warning");
+        expect(fs.existsSync(fabricDiagnosticsFile("dashboard-discovery"))).toBe(false);
+      }
+      vi.mocked(context.ui.notify).mockClear();
+      for (const input of ["l", "g", "s", "finish the review", "\r"]) dashboard!.handleInput(input);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(state.queueUserMessage).toHaveBeenCalledWith("session:test", "finish the review", "steer");
+      expect(context.ui.notify).toHaveBeenCalledExactlyOnceWith("Steer queued for Main", "info");
+    } finally { dashboard?.dispose(); controller.stop(); await flushFabricDiagnostics(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["resolve", "reject"] as const)("fences pending dashboard model discovery %s at controller stop (#5962)", async outcome => {
     const state = stubState();
     vi.mocked(state.actors.list).mockReturnValue([{ ...stubActor, runner: "claude" } as never]);
     let entered!: () => void; let release!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });
-    Object.assign(state.agents, { claudeModels: () => { entered(); return new Promise(resolve => { release = () => resolve([]); }); } });
+    Object.assign(state.agents, { claudeModels: () => { entered(); return new Promise((resolve, reject) => {
+      release = () => outcome === "resolve" ? resolve([]) : reject(new Error("old discovery failed"));
+    }); } });
     const context = { mode: "tui", modelRegistry: { getAvailable: () => [] },
       ui: { notify: vi.fn(), setWidget: vi.fn(), custom: vi.fn() } } as unknown as ExtensionContext;
     const controller = new FabricUiController(state);
@@ -519,7 +560,29 @@ describe("FabricUiController dashboard wiring", () => {
     }
   });
 
+  it("logs dashboard refresh failures instead of notifying a principal", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "principal-dashboard-diagnostics-"));
+    vi.stubEnv("SMARTY_ROLE", "org-agent@x");
+    vi.stubEnv("PI_CODING_AGENT_DIR", root);
+    configureFabricDiagnostics("dashboard-principal");
+    const state = stubState();
+    vi.mocked(state.activity.runs).mockImplementation(() => { throw new Error("corrupt activity state"); });
+    const notify = vi.fn();
+    const context = { mode: "tui", sessionManager: { getSessionId: () => "dashboard-principal" },
+      ui: { setWidget: vi.fn(), notify } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    try {
+      controller.start(context);
+      await flushFabricDiagnostics();
+      expect(notify).not.toHaveBeenCalled();
+      const lines = fs.readFileSync(fabricDiagnosticsFile("dashboard-principal"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(lines).toContainEqual(expect.objectContaining({ source: "src/ui/controller.ts", level: "warning",
+        message: "Fabric dashboard refresh failed: corrupt activity state" }));
+    } finally { controller.stop(); vi.unstubAllEnvs(); }
+  });
+
   it("reports each dashboard refresh cause once per lifecycle while retaining the last snapshot", async () => {
+    vi.stubEnv("SMARTY_ROLE", "project-agent@x");
     vi.useFakeTimers();
     const state = stubState();
     let cause = "corrupt activity state";
@@ -563,6 +626,7 @@ describe("FabricUiController dashboard wiring", () => {
     } finally {
       controller.stop();
       vi.useRealTimers();
+      vi.unstubAllEnvs();
     }
   });
 
@@ -1118,6 +1182,48 @@ describe("FabricUiController dashboard wiring", () => {
       controller.stop();
       vi.useRealTimers();
     }
+  });
+
+  it.each([
+    { role: "org-agent@x", mode: "auto", visible: false },
+    { role: "org-agent@x", mode: "always", visible: false },
+    { role: "project-agent@x", mode: "auto", visible: true },
+    { role: "project-agent@x", mode: "always", visible: true },
+  ] as const)("applies $role widget visibility in $mode mode, including streaming-only gaps", ({ role, mode, visible }) => {
+    vi.stubEnv("SMARTY_ROLE", role);
+    const state = stubState();
+    Object.assign(state.config.ui, { widget: mode, maxRows: 6 });
+    vi.mocked(state.actors.list).mockReturnValue([{ ...stubActor, status: "running" } as never]);
+    vi.mocked(state.agents.list).mockReturnValue([
+      { id: "agent-1", name: "worker", status: "running", transport: "local", cwd: "/project" } as never,
+    ]);
+    const setWidget = vi.fn();
+    const context = { mode: "tui", ui: { notify: vi.fn(), setWidget } } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    const mounts = () => setWidget.mock.calls.filter(([, content]) => content !== undefined);
+    try {
+      controller.start(context);
+      expect(controller.snapshot().actors[0]?.status).toBe("running");
+      expect(controller.snapshot().agents[0]?.status).toBe("running");
+      expect(mounts()).toHaveLength(visible ? 1 : 0);
+      controller.setHostStreaming(true);
+      expect(controller.snapshot().main.status).toBe("running");
+      expect(mounts()).toHaveLength(visible ? 1 : 0);
+
+      // With no Fabric work left, auto mode can mount only via keepForStreaming.
+      vi.mocked(state.actors.list).mockReturnValue([]);
+      vi.mocked(state.agents.list).mockReturnValue([]);
+      controller.stop();
+      setWidget.mockClear();
+      controller.start(context);
+      controller.setHostStreaming(true);
+      expect(controller.snapshot().main.status).toBe("running");
+      expect(controller.snapshot().actors).toEqual([]);
+      expect(controller.snapshot().agents).toEqual([]);
+      expect(mounts()).toHaveLength(visible ? 1 : 0);
+      controller.setHostStreaming(false);
+      expect(context.ui.notify).not.toHaveBeenCalled();
+    } finally { controller.stop(); vi.unstubAllEnvs(); }
   });
 
   it("never mounts or reserves rows in explicit hidden mode despite active host and Fabric work", async () => {

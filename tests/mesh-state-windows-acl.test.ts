@@ -31,6 +31,11 @@ const MODIFY = 0x301bf;
 const EVERYONE_READ = 0x120089;
 const DATA_READ_BITS = 0x90000001;
 const UNSUPPORTED = { code: "FABRIC_MESH_STATE_UNSUPPORTED" };
+// ACL findings warn by default. Refusal rows opt in explicitly per test (in-process: stubbed env; fresh process:
+// the child's env only); afterEach unstubs. The gate reads the setting at each call.
+const ENFORCE = "PI_FABRIC_MESH_STATE_ACL_ENFORCE";
+const ADVISORY = "FABRIC_MESH_STATE_ACL_ADVISORY";
+const enforceAcl = () => vi.stubEnv(ENFORCE, "1");
 
 const created: string[] = [];
 let fixtureUser: string | undefined;
@@ -44,7 +49,10 @@ const ownFixture = (file: string): void => {
   expect(changed.changed, changed.trace.join(" | ")).toBe(true);
 };
 const ownedDirectory = (directory: string): void => { fs.mkdirSync(directory); ownFixture(directory); };
-afterEach(() => { for (const dir of created.splice(0).reverse()) fs.rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => {
+  vi.unstubAllEnvs();
+  for (const dir of created.splice(0).reverse()) fs.rmSync(dir, { recursive: true, force: true });
+});
 /** A fresh private fixture directory directly below the default profile (inherits only the profile ACL). */
 const profileDir = (): string => {
   const profile = process.env.USERPROFILE;
@@ -115,15 +123,22 @@ try {
 }
 `;
 interface FreshProcessResult { ok: boolean; code: string | null; message: string | null }
-const freshProcessRefusal = (root: string, mode: "async" | "sync" = "sync"): FreshProcessResult => {
+/** A fresh process opening `root` with the setting exactly `enforce` in its own environment (absent when undefined). */
+const freshProcessOpen = (root: string, mode: "async" | "sync", enforce: "1" | "0" | undefined) => {
+  const env = { ...process.env };
+  delete env[ENFORCE];
+  if (enforce !== undefined) env[ENFORCE] = enforce;
   const result = childProcess.spawnSync(process.execPath,
     ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", FRESH_PROCESS_ACL, root, mode],
-    { cwd: process.cwd(), encoding: "utf8", windowsHide: true, timeout: 60_000, maxBuffer: 1024 * 1024,
-      env: { ...process.env } });
+    { cwd: process.cwd(), encoding: "utf8", windowsHide: true, timeout: 60_000, maxBuffer: 1024 * 1024, env });
   expect(result.error?.message ?? "").toBe("");
   expect(result.status, String(result.stderr)).toBe(0);
-  expect(String(result.stderr)).toBe("");
-  const parsed = JSON.parse(String(result.stdout).trim()) as FreshProcessResult;
+  return { ...(JSON.parse(String(result.stdout).trim()) as FreshProcessResult), stderr: String(result.stderr) };
+};
+/** The enforced fresh-process refusal of the existing refusal rows (explicit opt-in in the child only). */
+const freshProcessRefusal = (root: string, mode: "async" | "sync" = "sync"): FreshProcessResult => {
+  const { stderr, ...parsed } = freshProcessOpen(root, mode, "1");
+  expect(stderr).toBe("");
   expect(parsed.ok).toBe(false);
   return parsed;
 };
@@ -234,6 +249,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   }, 120_000);
 
   it("native-cache-C3: first proof refuses a fixture root whose ancestor has foreign DELETE_CHILD", () => {
+    enforceAcl();
     const ancestor = profileDir();
     const root = path.join(ancestor, "root");
     ownedDirectory(root);
@@ -252,6 +268,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   }, 120_000);
 
   it.each(Object.keys(opens) as (keyof typeof opens)[])("%s refuses a root with a genuine Everyone:(M) grant before creating state.db", async name => {
+    enforceAcl();
     const root = profileDir();
     grant(root, EVERYONE, "(OI)(CI)(M)", MODIFY);
     expect(icaclsShow(root)).toMatch(/Everyone:\(OI\)\(CI\)\(M\)/);
@@ -262,6 +279,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   it.each([["write", "(W)", 0x2], ["modify", "(M)", MODIFY], ["full control", "(F)", FULL], ["delete", "(DE)", 0x10000],
     ["change permissions", "(WDAC)", 0x40000], ["take ownership", "(WO)", 0x80000]] as const)(
     "refuses a root where a foreign SID has %s", async (_name, rights, bits) => {
+      enforceAcl();
       const root = profileDir();
       grant(root, "S-1-5-32-545", rights, bits);
       expect(await refusal(() => openAsync(root))).toMatchObject(UNSUPPORTED);
@@ -394,6 +412,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   }, 120_000);
 
   it.each(Object.keys(opens) as (keyof typeof opens)[])("%s gives a new root an explicit protected ACL: current user and SYSTEM full control, inheritable", async name => {
+    enforceAcl(); // owner/protected-DACL setup is enforcement-only; the default never mutates ACLs
     const { user } = tokenSids();
     const root = path.join(profileDir(), "nested", "new-root");
     expect(fs.existsSync(path.dirname(root))).toBe(false);
@@ -417,6 +436,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   }, 120_000);
 
   it.each(["async", "sync"] as const)("refuses a missing root below an immediate parent with foreign inherit-only full control (%s) before creation", async mode => {
+    enforceAcl();
     const parent = profileDir();
     const root = path.join(parent, "new-root");
     grant(parent, EVERYONE, "(OI)(CI)(IO)(F)", FULL);
@@ -441,6 +461,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   }, 120_000);
 
   it("refuses a state.db planted with a genuine Everyone (M) ACL after the native snapshot, before SQLite opens it", () => {
+    enforceAcl();
     const root = profileDir();
     const file = path.join(root, "state.db");
     const seed = path.join(root, "controlled-seed.db");
@@ -474,6 +495,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   }, 120_000);
 
   it("allows SQLite-created WAL sidecars inheriting the protected root ACL without foreign data-read", async () => {
+    enforceAcl(); // the protected root exists only under enforcement
     const { user } = tokenSids();
     const trusted = new Set([user, SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER]);
     const root = path.join(profileDir(), "new-root");
@@ -512,6 +534,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   it.each([["delete child", "(DC)", 0x40], ["delete", "(DE)", 0x10000], ["change permissions", "(WDAC)", 0x40000],
     ["take ownership", "(WO)", 0x80000], ["write", "(W)", 0x2], ["modify", "(M)", MODIFY], ["full control", "(F)", FULL]] as const)(
     "refuses a private root whose private ancestor grants a foreign SID %s", async (_name, rights, bits) => {
+      enforceAcl();
       const ancestor = profileDir();
       const root = path.join(ancestor, "root");
       ownedDirectory(root);
@@ -545,6 +568,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   }, 120_000);
 
   it("refuses to raise a checkpoint flag in a flag directory that a foreign SID may modify", () => {
+    enforceAcl();
     const root = profileDir();
     const flags = path.join(root, "state-checkpoint.flags");
     ownedDirectory(flags);
@@ -556,6 +580,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   }, 120_000);
 
   it("opens an existing Administrators-owned root only with the elevated Administrators default owner", async () => {
+    enforceAcl();
     const { owner } = tokenSids();
     const root = profileDir();
     const changed = setOwner(root, ADMINISTRATORS);
@@ -571,6 +596,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   }, 120_000);
 
   it("refuses a pre-squatted root owned by a foreign SID (DACL unchanged, only the owner differs)", async () => {
+    enforceAcl();
     const { user, owner } = tokenSids();
     const foreign = ["S-1-5-32-545", SYSTEM, ADMINISTRATORS].find(sid => sid !== user && sid !== owner);
     expect(foreign, `token user ${user}, owner ${owner}`).toBeDefined();
@@ -593,6 +619,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   }, 240_000);
 
   it("refuses a junction ancestor with an actionable error, while the direct profile path opens", async () => {
+    enforceAcl(); // the reparse-ancestor finding and lexical creation walk refuse only under enforcement
     const parent = profileDir();
     const target = path.join(parent, "target");
     ownedDirectory(target);
@@ -607,6 +634,7 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
   }, 120_000);
 
   it("refuses a nested missing root below a junction without changing the target", async () => {
+    enforceAcl();
     const parent = profileDir();
     const target = path.join(parent, "target");
     ownedDirectory(target);
@@ -650,4 +678,71 @@ describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "wi
     grant(path.dirname(other), EVERYONE, "(DC)", 0x40);
     expect(freshProcessRefusal(other, "async")).toMatchObject({ code: UNSUPPORTED.code, message: expect.stringContaining(path.dirname(other)) });
   }, 120_000);
+
+  // Warn-by-default with a tested switch back, on real NTFS: one genuine Everyone:(M) root ACE, real native reads and
+  // real node:sqlite, in this process and in fresh processes. Only the setting changes; the ACL is never repaired.
+  it("native-rollback: a genuine unsafe root ACE warns and starts by default, refuses only with ENFORCE=1, then starts again when unset", async () => {
+    vi.stubEnv(ENFORCE, undefined);
+    const root = path.join(profileDir(), "root");
+    // Clean seed in a child process only: a parent open would cache this root+DB identity, and the same-identity
+    // grant below is not re-read in-process (native-cache-C2), hiding the finding this test needs.
+    expect(freshProcessOpen(root, "sync", undefined)).toMatchObject({ ok: true, code: null, stderr: "" });
+    expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
+    grant(root, EVERYONE, "(OI)(CI)(M)", MODIFY);
+    expect(icaclsShow(root)).toMatch(/Everyone:\(OI\)\(CI\)\(M\)/);
+    const sddl = readAcl(root).sddl;
+    const warnings = vi.spyOn(process, "emitWarning"); // call-through: the finding is still printed
+    const advisories = () => warnings.mock.calls
+      .filter(([, options]) => (options as { code?: string } | undefined)?.code === ADVISORY)
+      .map(([message]) => String(message));
+    const proofs = countNativeAclProofs();
+    const steps: { step: string; outcome: unknown; nativeProofs: number; advisories: number }[] = [];
+    const record = (step: string, outcome: unknown) =>
+      steps.push({ step, outcome, nativeProofs: proofs.count(), advisories: advisories().length });
+    try {
+      // 1. Default (unset): the privacy finding is logged and startup proceeds, sync and async.
+      await roundTrip(openSync(root));
+      await roundTrip(await openAsync(root));
+      expect(advisories()).toEqual([expect.stringContaining(EVERYONE)]);
+      expect(advisories()[0]).toContain(ENFORCE);
+      record("default-unset", "opened");
+      vi.stubEnv(ENFORCE, "0");
+      await roundTrip(openSync(root));
+      record("explicit-0", "opened");
+
+      // 2. On: the same process now refuses before SQLite opens, as does a fresh process.
+      enforceAcl();
+      for (const name of Object.keys(opens) as (keyof typeof opens)[]) {
+        const error = await refusal(() => opens[name](root));
+        expect(error).toMatchObject({ ...UNSUPPORTED, message: expect.stringContaining(EVERYONE) });
+        record(`enforced-${name}`, (error as Error).message);
+      }
+      const freshEnforced = freshProcessOpen(root, "sync", "1");
+      expect(freshEnforced).toMatchObject({ ok: false, code: UNSUPPORTED.code, message: expect.stringContaining(root) });
+      record("enforced-fresh-process", freshEnforced);
+
+      // 3. Off again (unset): the same process and a fresh process start; the earlier data is intact.
+      vi.stubEnv(ENFORCE, undefined);
+      const reopened = openSync(root);
+      try { expect(reopened.get("acl/probe")?.value).toBe("ok"); } finally { reopened.close(); }
+      await roundTrip(await openAsync(root));
+      record("rollback-unset", "opened");
+      const freshDefault = freshProcessOpen(root, "async", undefined);
+      expect(freshDefault).toMatchObject({ ok: true, code: null });
+      expect(freshDefault.stderr).toContain(ADVISORY);
+      expect(freshDefault.stderr).toContain(EVERYONE);
+      record("rollback-fresh-process", freshDefault);
+
+      // Neither mode repaired or changed the ACL; the finding was real native evidence, re-read while enforced.
+      expect(readAcl(root).sddl).toBe(sddl);
+      expect(icaclsShow(root)).toMatch(/Everyone:\(OI\)\(CI\)\(M\)/);
+      expect(advisories()).toHaveLength(1);
+      proofs.assertRealReads();
+      expect(steps.find(step => step.step === "enforced-openSync")!.nativeProofs)
+        .toBeGreaterThan(steps.find(step => step.step === "explicit-0")!.nativeProofs);
+    } finally {
+      try { console.log(JSON.stringify({ event: "native-rollback", root, steps, nativeProofs: proofs.count() })); }
+      finally { proofs.restore(); warnings.mockRestore(); }
+    }
+  }, 240_000);
 });

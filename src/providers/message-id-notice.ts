@@ -1,4 +1,5 @@
 import type { FabricInvocationContext } from "../protocol.js";
+import { diagnostics } from "../core/diagnostics.js";
 
 export interface OutgoingMessageNotice { text: string; notice?: string }
 
@@ -56,7 +57,7 @@ export async function deliverWithMessageNotice<T>(
     checked.notice += " (recipient marker omitted: message at the route size limit)";
     // Use Fabric's existing stderr diagnostic path, one structured line for each
     // successfully delivered unmarked message. Failed original sends do not count.
-    console.warn(`[pi-fabric] ${JSON.stringify({
+    diagnostics.warn("src/providers/message-id-notice.ts", `[pi-fabric] ${JSON.stringify({
       event: "recipient-marker-omitted", route, count: ++recipientMarkerOmissions,
     })}`);
     return result;

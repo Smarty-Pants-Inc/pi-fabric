@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs, { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { sweepStaleTestTemp, testTempOwnerMarker, testTempProcessIdentity } from "../scripts/test-temp.js";
 
@@ -255,6 +255,64 @@ describe("test temporary-storage isolation", () => {
       rmSync(runnerTemp, { recursive: true, force: true });
     }
   });
+  it("isolates os.homedir and model-policy audit logs from the original home", () => {
+    const helper = new URL("../scripts/test-temp.ts", import.meta.url).href;
+    const result = spawnSync(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", `
+      import { homedir } from "node:os";
+      import { dirname, join, sep } from "node:path";
+      import { isolateTestFleetEnvironment } from ${JSON.stringify(helper)};
+      const originalHome = homedir();
+      const env = isolateTestFleetEnvironment();
+      const home = homedir();
+      const fleetRoot = dirname(env.PI_CODING_AGENT_DIR);
+      const auditLog = join(home, ".local/state/smarty/route/opus-exceptions.jsonl");
+      process.stdout.write(JSON.stringify({ originalHome, home, fleetRoot, auditLog, sep, env }));
+    `], { env: { ...process.env, RUNNER_TEMP: "" }, encoding: "utf8", timeout: 10_000 });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    const probe = JSON.parse(result.stdout) as { originalHome: string; home: string; fleetRoot: string; auditLog: string; sep: string; env: Record<string, string> };
+    expect(probe.home).toBe(join(probe.fleetRoot, "home"));
+    expect(probe.home).not.toBe(probe.originalHome);
+    expect(probe.auditLog.startsWith(probe.fleetRoot + probe.sep)).toBe(true);
+    if (process.platform === "win32") expect(probe.env.USERPROFILE).toBe(probe.home);
+    else expect(probe.env.HOME).toBe(probe.home);
+  });
+
+  // `bun run test` is `node scripts/run-tests.mjs`, which imports ./test-temp.ts through Node's own type
+  // stripping: no Vitest or .js->.ts test resolver. Its source edges must resolve there, on every OS.
+  it("imports the launcher's helper natively, while its former .js wrapper edge fails there", () => {
+    const scripts = new URL("../scripts/", import.meta.url);
+    expect(readFileSync(new URL("run-tests.mjs", scripts), "utf8")).toContain('from "./test-temp.ts";');
+    const source = readFileSync(new URL("test-temp.ts", scripts), "utf8");
+    const leaf = 'from "../src/storage/windows-powershell-command.ts";';
+    expect(source).toContain(leaf);
+    const fixture = mkdtempSync(join(tmpdir(), "native-launcher-import-"));
+    try {
+      // Failing counterexample: the actual helper with only the former wrapper specifier restored.
+      // Every relative edge stays anchored in scripts/ so nothing else differs from the real file.
+      const reverted = source.replace(leaf, 'from "../src/storage/windows-powershell.js";')
+        .replace(/from "(\.\.?\/[^"]+)";/g, (_, specifier: string) => `from ${JSON.stringify(new URL(specifier, scripts).href)};`);
+      writeFileSync(join(fixture, "package.json"), '{"type":"module"}\n');
+      writeFileSync(join(fixture, "test-temp.ts"), reverted);
+      const result = spawnSync(process.execPath, ["--input-type=module", "-e", `
+        const helper = await import(${JSON.stringify(new URL("test-temp.ts", scripts).href)});
+        let refused = null;
+        try { await import(${JSON.stringify(pathToFileURL(join(fixture, "test-temp.ts")).href)}); }
+        catch (error) { refused = { code: error.code, url: error.url }; }
+        process.stdout.write(JSON.stringify({ refused, exports: [helper.launcherTestTemp, helper.cleanupIsolatedTestTemp,
+          helper.isolatedTestTemp, helper.isolateTestFleetEnvironment].map(value => typeof value) }));
+      `], { cwd: repo, env: process.env, encoding: "utf8", timeout: 10_000 });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      const probe = JSON.parse(result.stdout) as { refused: { code: string; url: string } | null; exports: string[] };
+      expect(probe.exports).toEqual(["function", "function", "function", "function"]);
+      expect(probe.refused).toEqual({ code: "ERR_MODULE_NOT_FOUND",
+        url: new URL("../src/storage/windows-powershell.js", scripts).href });
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
   // smarty-dev#11145 r5: the Windows job temp adopts only a run directory this helper created.
   const helper = new URL("../scripts/test-temp.ts", import.meta.url).href;
   const windowsTemp = (env: Record<string, string>) => {

@@ -62,7 +62,7 @@ describe("spawn router native retirement without close", () => {
       expect(settled).toBe(false); // Helper closure alone must not race direct child exit.
     } else expect(f.kill).toHaveBeenCalledWith(-123456, "SIGKILL");
     f.child.emit("exit", null, "SIGKILL");
-    await expect(pending).resolves.toBeUndefined();
+    await expect(pending).resolves.toEqual(expect.objectContaining({ ...f.options.defaults, decisionId: expect.any(String) }));
     expect(f.decision()).toMatchObject({ error: "timeout", pick: null, actual: f.options.defaults });
     expect(f.child.stdin.destroyed).toBe(true); expect(f.child.stdout.destroyed).toBe(true);
     // A late close cannot change the logged fallback or start a second tree kill.
@@ -83,7 +83,7 @@ describe("spawn router native retirement without close", () => {
     expect(settled).toBe(false); // Direct exit alone must not leave a running helper behind.
     expect(fs.existsSync(path.join(f.dir, "router/decisions.jsonl"))).toBe(false);
     helperClosed(null);
-    await expect(pending).resolves.toBeUndefined();
+    await expect(pending).resolves.toEqual(expect.objectContaining({ ...f.options.defaults, decisionId: expect.any(String) }));
     expect(f.decision()).toMatchObject({ error, pick: null, actual: f.options.defaults });
     expect(subprocess.execFile).toHaveBeenCalledTimes(1);
   });
@@ -94,7 +94,7 @@ describe("spawn router native retirement without close", () => {
     subprocess.execFile.mockImplementation((_file, _args, _options, callback) => callback(new Error("private helper error")));
     const pending = routeAgentCreation(f.options);
     await vi.advanceTimersByTimeAsync(200);
-    await expect(pending).resolves.toBeUndefined();
+    await expect(pending).resolves.toEqual(expect.objectContaining({ ...f.options.defaults, decisionId: expect.any(String) }));
     expect(f.child.kill).toHaveBeenCalledWith("SIGKILL");
     expect(f.decision()).toMatchObject({ error: "timeout" });
     expect(JSON.stringify(f.decision())).not.toContain("private helper error");
@@ -110,14 +110,14 @@ describe("spawn router native retirement without close", () => {
     const pending = routeAgentCreation({ ...f.options, signal: controller.signal });
     expect(subprocess.spawn.mock.calls[0]![2].env).toEqual({ ...windowsEnv("D:\\Windows"), HOME: "router-home", LANG: "C", TZ: "UTC" });
     controller.abort(); f.child.emit("exit", null, "SIGKILL");
-    await expect(pending).resolves.toBeUndefined();
+    await expect(pending).resolves.toEqual(expect.objectContaining({ ...f.options.defaults, decisionId: expect.any(String) }));
     expect(subprocess.execFile.mock.calls[0]![0]).toBe("D:\\Windows\\System32\\taskkill.exe");
     expect(subprocess.execFile.mock.calls[0]![2].env).toEqual(subprocess.spawn.mock.calls[0]![2].env);
   });
 
   it.each([undefined, "", "relative", "C:Windows"])("fails open without spawning for an invalid Windows system root %j", async root => {
     const f = fixture("win32", { SYSTEMROOT: root });
-    await expect(routeAgentCreation(f.options)).resolves.toBeUndefined();
+    await expect(routeAgentCreation(f.options)).resolves.toEqual(expect.objectContaining({ ...f.options.defaults, decisionId: expect.any(String) }));
     expect(subprocess.spawn).not.toHaveBeenCalled(); expect(subprocess.execFile).not.toHaveBeenCalled();
     expect(f.decision()).toMatchObject({ error: "command-error", actual: f.options.defaults });
   });

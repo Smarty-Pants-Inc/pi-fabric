@@ -12,6 +12,7 @@ import type { AgentTerminalNotice } from "../src/agents/terminal-target.js";
 import { TerminalNoticeOutbox, readTerminalAdmission } from "../src/agents/terminal-notices.js";
 import { canRemoveTerminalRun, pruneActorRunArchives } from "../src/storage/retention.js";
 
+// Keep reason: recorded real catch of pi-fabric#722 hosted Windows failures.
 // Decision C: the worker that wrote the legacy (pre-`forwarded`) row no longer
 // exists in this tree, so no E2E can produce the record; the regression drives
 // the real manager, restart outbox and collector over its exact persisted bytes.
@@ -62,6 +63,32 @@ const waitUntil = async (condition: () => boolean) => {
 };
 const settle = () => new Promise(resolve => setTimeout(resolve, 20));
 
+const finishAndJoin = async (f: ReturnType<typeof harness>, id: string) => {
+  const receipt = f.finish(id);
+  let waited = false;
+  let joined = false;
+  const wait = f.manager.wait(id, { timeoutMs: 1000 }).then(result => { waited = true; return result; });
+  const join = f.manager.join(id).then(() => { joined = true; });
+  // #722: the receipt freezes input, not public settlement or execution admission.
+  expect(f.manager.status(id)).toMatchObject({ status: "finishing", text: "done" });
+  expect(f.manager.listForUi().find(run => run.id === id)?.status).toBe("finishing");
+  expect(f.manager.isSettled(id)).toBe(false);
+  const next = await f.manager.spawn({ task: "native-close barrier", transport: "process" });
+  expect(next.status).toBe("queued");
+  await settle();
+  expect([waited, joined]).toEqual([false, false]);
+  expect(f.launch).toHaveBeenCalledOnce();
+  expect(f.manager.hasRetainedCustody()).toBe(true);
+  // Only the exact mocked native close discharges the first execution's barrier.
+  f.close(id);
+  expect(await wait).toMatchObject({ status: "completed", text: "done" });
+  await join;
+  await waitUntil(() => f.launch.mock.calls.length === 2);
+  expect(f.manager.status(id).status).toBe("completed");
+  f.close(next.id);
+  return receipt;
+};
+
 const sender = { id: "session:original", kind: "main" as const, verified: "mesh" as const };
 const provenance = { v: 1 as const, channel: "fabric" as const, via: "steer" as const, sender };
 const wrong = { ...provenance, sender: { ...sender, id: "session:other" } };
@@ -91,7 +118,8 @@ describe("legacy terminal refusal rows across manager, restart recovery and coll
     ["refused-discard-ack", true, true],
   ] as const)("%s: routed=%s collectible=%s", async (variant, routed, collectible) => {
     const notices: AgentTerminalNotice[] = [];
-    const { manager, root, launch, finish, close } = harness(notice => { notices.push(notice); });
+    const f = harness(notice => { notices.push(notice); });
+    const { manager, root } = f;
     const handle = await manager.spawn({ task: "ordinary", transport: "process" });
     const directory = path.join(root, handle.id);
     const sent = manager.steer(handle.id, "late steer", undefined, provenance);
@@ -99,14 +127,7 @@ describe("legacy terminal refusal rows across manager, restart recovery and coll
     const registry = path.join(directory, "terminal-controls", `${sent.messageId}.json`);
     writeJsonAtomic(registry, row(variant, sent.messageId));
     const persisted = fs.readFileSync(registry, "utf8");
-    const receipt = finish(handle.id);
-    await manager.wait(handle.id, { timeoutMs: 1000 });
-    // Native-close barrier: the next launch proves this execution drained.
-    const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
-    close(handle.id);
-    await waitUntil(() => launch.mock.calls.length === 2);
-    close(next.id);
-    manager.status(handle.id);
+    const receipt = await finishAndJoin(f, handle.id);
     const expected: AgentTerminalNotice = { code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,
       finalAnswerReceiptId: receipt.id, messageId: sent.messageId, delivery: "steer", sender };
     const pending = path.join(directory, "terminal-notices", `${sent.messageId}.json`);
@@ -133,17 +154,13 @@ describe("legacy terminal refusal rows across manager, restart recovery and coll
 
   it("a stale pending notice for a legacy refused row is never routed, and an old route receipt cannot retire it", async () => {
     const notices: AgentTerminalNotice[] = [];
-    const { manager, root, launch, finish, close } = harness(notice => { notices.push(notice); });
+    const f = harness(notice => { notices.push(notice); });
+    const { manager, root } = f;
     const handle = await manager.spawn({ task: "ordinary", transport: "process" });
     const directory = path.join(root, handle.id);
     const sent = manager.steer(handle.id, "late steer", undefined, provenance);
     writeJsonAtomic(path.join(directory, "terminal-controls", `${sent.messageId}.json`), row("legacy-refused", sent.messageId));
-    const receipt = finish(handle.id);
-    await manager.wait(handle.id, { timeoutMs: 1000 });
-    const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
-    close(handle.id);
-    await waitUntil(() => launch.mock.calls.length === 2);
-    close(next.id);
+    const receipt = await finishAndJoin(f, handle.id);
     await settle();
     // An earlier host may have retained the outbox entry before restart.
     const notice: AgentTerminalNotice = { code: "FABRIC_TARGET_TERMINAL", targetId: handle.id,

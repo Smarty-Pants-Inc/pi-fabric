@@ -1,5 +1,5 @@
 import releaseSyncVariant from "@jitl/quickjs-singlefile-mjs-release-sync";
-import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
+import { newQuickJSWASMModuleFromVariant, type QuickJSHandle } from "quickjs-emscripten-core";
 import ts from "typescript";
 import { ExecutionDeadline } from "./execution-deadline.js";
 import { MESH_INCARNATION_PENDING_CODE, MESH_LOCK_TIMEOUT_CODE, MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE } from "../core/atomic-write.js";
@@ -7,7 +7,9 @@ import { isMeshRetryableBusy } from "../mesh/state-backend.js";
 import { cancellationError, preserveCancellationOutcome, runAbortable, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
+import { FabricModelNotServedError } from "../core/model-served-error.js";
 import { FabricTargetTerminalError } from "../agents/terminal-target.js";
+import { AgentSpawnForbiddenError } from "../agents/spawn-authority.js";
 import { JevTransientHttpError } from "../jev/validation.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { PI_CORE_TOOL_NAMES } from "../core/pi-tools.js";
@@ -42,6 +44,7 @@ const GUEST_MESH_RETRYABLE_ERROR_NAMES: Readonly<Record<string, string>> = Objec
 // Explicit safe contracts, not Error serialization: never bridge stacks, causes, arbitrary
 // properties or getters. Keep this dependency-free so runtime loading cannot pull in providers.
 const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  FABRIC_MODEL_EXCEPTION_DENIED: "FabricModelExceptionDeniedError",
   FABRIC_MESH_HOST_PUBLISH_REQUIRED: "MeshHostPublishError",
   FABRIC_DIRECTORY_UNAVAILABLE: "FabricDirectoryUnavailableError",
   FABRIC_CONTROL_INCARNATION_REQUIRED: "FabricControlIncarnationRequiredError",
@@ -58,11 +61,13 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_PROJECT_AGENT_UNRESOLVED: "FabricProjectAgentUnresolvedError",
   FABRIC_PROJECT_AGENT_AMBIGUOUS: "FabricProjectAgentAmbiguousError",
   FABRIC_PROJECT_LEAD_INVALID: "FabricProjectLeadInvalidError",
+  FABRIC_AGENT_SPAWN_FORBIDDEN: "AgentSpawnForbiddenError",
 });
 const guestFabricErrorMetadata = (error: unknown): Record<string, string | boolean> | undefined => {
   if (!(error instanceof Error)) return undefined;
   // Preserve only the fixed policy classification, never arbitrary Error fields.
   if (error instanceof FabricModelDeniedError) return { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" };
+  if (error instanceof FabricModelNotServedError) return { name: "FabricModelNotServedError", code: "FABRIC_MODEL_NOT_SERVED" };
   if (error instanceof FabricTargetTerminalError) return {
     name: "FabricTargetTerminalError", code: "FABRIC_TARGET_TERMINAL",
     targetId: error.targetId, finalAnswerReceiptId: error.finalAnswerReceiptId,
@@ -72,6 +77,10 @@ const guestFabricErrorMetadata = (error: unknown): Record<string, string | boole
   const name = Object.getOwnPropertyDescriptor(error, "name")?.value;
   if (typeof code !== "string" || !Object.hasOwn(GUEST_FABRIC_ERROR_NAMES, code) || GUEST_FABRIC_ERROR_NAMES[code] !== name) return undefined;
   const metadata: Record<string, string | boolean> = { name, code };
+  if (code === "FABRIC_AGENT_SPAWN_FORBIDDEN") {
+    const launchOutcome = Object.getOwnPropertyDescriptor(error, "launchOutcome")?.value;
+    if (launchOutcome === "unlaunched") metadata.launchOutcome = launchOutcome;
+  }
   const retryable = Object.getOwnPropertyDescriptor(error, "retryable")?.value;
   if (typeof retryable === "boolean") metadata.retryable = retryable;
   if (code === "FABRIC_PARTICIPANT_STALE" || code === "FABRIC_RELAY_DESTINATION_UNAVAILABLE" || code === "FABRIC_IDEMPOTENCY_KEY_REUSED") {
@@ -608,7 +617,9 @@ globalThis.agents = Object.freeze({
   setNice: (args) => __call("agents.setNice", args),
   setInferenceContext: (args) => __call("agents.setInferenceContext", args),
   setCoalesceKey: (args) => __call("agents.setCoalesceKey", args),
+  setBatching: (args) => __call("agents.setBatching", args),
   setActivationFilter: (args) => __call("agents.setActivationFilter", args),
+  setTopics: (args) => __call("agents.setTopics", args),
   setEvents: (args) => __call("agents.setEvents", args),
   setDeliveryPolicy: (args) => __call("agents.setDeliveryPolicy", args),
   clearMessages: (args) => __call("agents.clearMessages", args),
@@ -1040,6 +1051,12 @@ export class QuickJsRuntime {
     const maxLogChars = options.maxLogChars ?? 100_000;
     let logChars = 0;
     let logsTruncated = false;
+    // Nonces and retained handles never enter the guest. Public error fields
+    // are mutable/copyable; only native SameValue proves terminal origin.
+    const spawnRefusals = new Map<symbol, {
+      ref: "agents.handoff" | "agents.spawn";
+      errorHandle: QuickJSHandle;
+    }>();
     const pendingHostPromises = new Set<any>();
     const hostTasks = new Set<Promise<void>>();
     const pendingTimers = new Set<NodeJS.Timeout>();
@@ -1244,6 +1261,10 @@ export class QuickJsRuntime {
                     field.dispose();
                   }
                 }
+                const ref = reference === "fabric.$call" ? args.ref : reference;
+                if (error instanceof AgentSpawnForbiddenError && (ref === "agents.handoff" || ref === "agents.spawn")) {
+                  spawnRefusals.set(Symbol(), { ref, errorHandle: errorHandle.dup() });
+                }
                 promise.reject(errorHandle);
               } finally {
                 errorHandle.dispose();
@@ -1386,6 +1407,9 @@ export class QuickJsRuntime {
       if (resolution.error) {
         const deadlineExceeded = timedOut || interruptedByCpu || deadlineReached();
         if (deadlineExceeded) timedOut = true;
+        const refusal = !options.signal?.aborted && !deadlineExceeded
+          ? [...spawnRefusals.values()].find(entry => context.sameValue(entry.errorHandle, resolution.error))
+          : undefined;
         const error = options.signal?.aborted
           ? cancellationMessage("Execution cancelled")
           : deadlineExceeded
@@ -1400,6 +1424,7 @@ export class QuickJsRuntime {
           value: undefined,
           logs,
           emitted,
+          ...(refusal ? { terminalAgentSpawnRefusal: { ref: refusal.ref } } : {}),
           terminationReason: options.signal?.aborted
             ? "aborted"
             : deadlineExceeded
@@ -1490,10 +1515,21 @@ export class QuickJsRuntime {
       }
       // A guest can finish or swallow a rejection before an unawaited host
       // mutation settles. Teardown still owes the caller every committed ID.
-      if (executionResult) preserveCancellationOutcome(executionResult, hostAbortController.signal, hostAbortController.signal.aborted || unawaitedHostCalls);
+      if (executionResult) {
+        const priorError = executionResult.error;
+        const priorReason = executionResult.terminationReason;
+        preserveCancellationOutcome(executionResult, hostAbortController.signal, hostAbortController.signal.aborted || unawaitedHostCalls);
+        if (timedOut || cancelled || options.signal?.aborted || unawaitedHostCalls ||
+          executionResult.residentOutcomes?.length || executionResult.error !== priorError ||
+          executionResult.terminationReason !== priorReason) {
+          delete executionResult.terminalAgentSpawnRefusal;
+        }
+      }
       if (activePromiseHandle?.alive !== false) activePromiseHandle?.dispose();
       if (executionGate?.alive !== false) executionGate?.dispose();
       pumpJobs();
+      for (const refusal of spawnRefusals.values()) refusal.errorHandle.dispose();
+      spawnRefusals.clear();
       jsonParse.dispose();
       jsonObject.dispose();
       disposeQuickJsContext(context);

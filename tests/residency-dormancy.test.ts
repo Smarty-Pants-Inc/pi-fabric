@@ -51,6 +51,12 @@ const fixture = () => {
   const host = new ResidentHost(config, idle);
   return { root, config, host, idle };
 };
+const wakeAdmission = (config: ResidentHostConfig) => {
+  const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+  let open = true; // This independent publisher, not the sleeping host, owns admission.
+  return { admission: { allowed: () => open, exclusive: mesh.exclusive.bind(mesh) },
+    close: () => { open = false; mesh.closeState(); } };
+};
 const fillWakeCapacity = (config: ResidentHostConfig): string[] => {
   const residents: string[] = [];
   for (let n = 0; n < 128; n++) {
@@ -79,9 +85,9 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
   it("preserves ordinary empty-host idle exit without a persisted restart config", async () => {
     const { root, config, host, idle } = fixture();
     fs.rmSync(path.join(config.residencyRoot, "config.json"));
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       await host.start();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       let now = Date.now();
       vi.spyOn(Date, "now").mockImplementation(() => now);
       await sleep(150); // An empty dead-root host retires after its continuous window (#683).
@@ -95,6 +101,7 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     const { root, config, host } = fixture();
     const file = path.join(config.residencyRoot, "config.json");
     const launch = vi.fn(async () => {});
+    const publisher = wakeAdmission(config);
     try {
       await host.start();
       const actor = await host.actors.create({ name: "config-fenced", instructions: "wait", residency: "durable" });
@@ -109,8 +116,8 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       };
       fs.writeFileSync(file, field === "unreadable" ? "{invalid json" : JSON.stringify(changed));
       expect(routesAt(config.residencyRoot)).toBeUndefined();
-      await expect(requestResidentWake(config.residencyRoot, { id: "refused" }, launch)).rejects.toBeInstanceOf(ResidentWakeConfigMismatch);
-      await expect(requestResidentWake(config.residencyRoot, { id: "refused" }, launch)).rejects.toMatchObject({
+      await expect(requestResidentWake(config.residencyRoot, { id: "refused" }, launch, undefined, publisher.admission)).rejects.toBeInstanceOf(ResidentWakeConfigMismatch);
+      await expect(requestResidentWake(config.residencyRoot, { id: "refused" }, launch, undefined, publisher.admission)).rejects.toMatchObject({
         code: "RESIDENT_WAKE_CONFIG_MISMATCH", root: config.residencyRoot,
       });
       if (process.platform !== "win32") {
@@ -122,13 +129,14 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       expect(fs.existsSync(path.join(config.residencyRoot, "owner.json"))).toBe(false);
       // Identical canonical config, even with reordered object keys, admits the ordinary wake.
       fs.writeFileSync(file, JSON.stringify(Object.fromEntries(Object.entries(config).reverse())));
-      await requestResidentWake(config.residencyRoot, { id: "accepted" }, launch);
+      await requestResidentWake(config.residencyRoot, { id: "accepted" }, launch, undefined, publisher.admission);
       expect(launch).toHaveBeenCalledOnce();
-    } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { publisher.close(); await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it("checkpoints the dormant wake receiver with a Windows-compatible file flush handle", async () => {
     const { root, config, host } = fixture();
+    const publisher = wakeAdmission(config);
     try {
       await host.start();
       const actor = await host.actors.create({ name: "flush-receiver", instructions: "wait", residency: "durable" });
@@ -146,9 +154,9 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       expect(new ActorRegistryStore(config.actorRoot).records().find(row => row.id === actor.id)?.status).toBe("dormant");
       await host.close();
       const launch = vi.fn(async () => {});
-      await requestResidentWake(config.residencyRoot, { id: "after-flush" }, launch);
+      await requestResidentWake(config.residencyRoot, { id: "after-flush" }, launch, undefined, publisher.admission);
       expect(launch).toHaveBeenCalledOnce();
-    } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { publisher.close(); vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
   it.skipIf(process.platform === "win32")("rechecks exact config before every delivery-owned successor", async () => {
@@ -170,13 +178,14 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
     const { root, config, host } = fixture();
     const file = path.join(config.residencyRoot, "config.json");
     const launch = vi.fn(async () => {});
+    const publisher = wakeAdmission(config);
     try {
       await expect(requestResidentWake(config.residencyRoot, { id: "committed", sequence: 8 }, launch, async () => {
         fs.writeFileSync(file, JSON.stringify({ ...config, actorRoot: path.join(root, "racing-actors") }));
-      })).rejects.toMatchObject({ code: "RESIDENT_WAKE_CONFIG_MISMATCH" });
+      }, publisher.admission)).rejects.toMatchObject({ code: "RESIDENT_WAKE_CONFIG_MISMATCH" });
       expect(launch).not.toHaveBeenCalled();
       expect(readWakeJson<{ id: string }>(residentWakeRequestPath(config.residencyRoot))?.id).toBe("committed");
-    } finally { await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
+    } finally { publisher.close(); await host.close(); vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
 
@@ -406,6 +415,162 @@ describe("resident dormancy (smarty-dev#6782 / #2264)", () => {
       await until(() => idle.mock.calls.length === 1);
       expect(checkpoint).toHaveBeenCalledOnce();
     } finally { vi.restoreAllMocks(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("P1 consumes the exact event when real host arming crosses an already-checked publication root", async () => {
+    const { root, config, host, idle } = fixture();
+    // Keep the real monitor, gates and checkpoint. Delay native notifications only;
+    // the ordinary safety net cannot race this deliberately held scheduling edge.
+    config.mesh.actorPollMs = 60_000;
+    fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config));
+    const wake = await import("../src/residency/wake.js");
+    const index = await import("../src/residency/wake-index.js");
+    const routeFile = path.join(config.residencyRoot, "wake-routes.json");
+    const sentinel = path.join(config.meshRoot, "residency", "zzzz-scan-boundary");
+    fs.mkdirSync(sentinel); // No route/owner: only keeps the real directory scan open.
+    const publisher = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+    const nativeWatch = fs.watch;
+    const rename = fs.renameSync;
+    const dispatch = wake.wakeResidentActors;
+    const retained = index.retainedRoutesAt;
+    const assertWatch = wake.assertResidentWakeWatch;
+    let holdNotifications = false;
+    const notifications: Array<() => void> = [];
+    const timeline: Array<Record<string, unknown>> = [];
+    let prove!: () => void;
+    const proofGate = new Promise<void>(resolve => { prove = resolve; });
+    let proofReady = false;
+    let releasePublish!: () => void;
+    const publicationGate = new Promise<void>(resolve => { releasePublish = resolve; });
+    let deferred: Parameters<typeof dispatch> | undefined;
+    let publishing: ReturnType<MeshStore["publish"]> | undefined;
+    let scan: Promise<void> | undefined;
+    let scanning = false;
+    let checkedBeforeArm = false;
+    let committedDuringScan = false;
+    let armRename: (() => void) | undefined;
+    let offset = 0;
+    const now = Date.now.bind(Date);
+    try {
+      vi.spyOn(fs, "watch").mockImplementation((...args: Parameters<typeof fs.watch>) => {
+        // Parameters picks fs.watch's last overload; retain its actual runtime arity.
+        const actualArgs = args as unknown as unknown[];
+        const callback = (actualArgs[2] ?? actualArgs[1]) as fs.WatchListener<string | NonSharedBuffer> | undefined;
+        if (actualArgs[0] !== config.meshRoot || typeof callback !== "function") {
+          return Reflect.apply(nativeWatch, undefined, actualArgs) as fs.FSWatcher;
+        }
+        const notifyEvent: fs.WatchListener<string | NonSharedBuffer> = (...event) => {
+          const notify = () => callback(...event);
+          if (holdNotifications) notifications.push(notify); else notify();
+        };
+        return Reflect.apply(nativeWatch, undefined, actualArgs[2] === undefined
+          ? [actualArgs[0], notifyEvent]
+          : [actualArgs[0], actualArgs[1], notifyEvent]) as fs.FSWatcher;
+      });
+      await host.start();
+      const runs = fakeRun(host); // Only the external inference/worker execution is faked.
+      vi.spyOn(wake, "assertResidentWakeWatch").mockImplementation(async directory => {
+        await assertWatch(directory); // The production native watcher proof still runs.
+        proofReady = true;
+        await proofGate;
+      });
+      const actor = await host.actors.create({ name: "p1-real-listener", instructions: "process", residency: "durable",
+        topics: ["test.p1-registration"], coalesce: false });
+      await until(() => proofReady && host.actors.meshCaughtUp());
+      expect(readWakeJson<ResidentWakeRoutes>(routeFile)?.actors).not.toContainEqual(expect.objectContaining({ id: actor.id }));
+      holdNotifications = true;
+      vi.spyOn(wake, "wakeResidentActors").mockImplementation(async (...args) => {
+        if (!args[1].some(event => event.topic === "test.p1-registration")) return dispatch(...args);
+        deferred = args; // Hold only scheduling of the actual post-commit dispatcher.
+        await publicationGate;
+      });
+      publishing = publisher.publish({ topic: "test.p1-registration", to: actor.id,
+        from: { id: "session:p1-publisher", name: "publisher", kind: "main" }, data: { marker: "p1-exact-event" } });
+      await until(() => deferred !== undefined);
+      const event = deferred![1][0]!;
+      expect(publisher.read({ topic: event.topic })).toEqual([event]); // Actual commit, not a synthetic event.
+      expect(index.residentUnacknowledgedDeliveries(config.meshRoot).has(config.residencyRoot)).toBe(false);
+      timeline.push({ phase: "append-committed", id: event.id, sequence: event.sequence, recipient: event.to,
+        ownerLive: index.residentOwnerLive(config.residencyRoot), sleeping: fs.existsSync(residentSleepingPath(config.residencyRoot)) });
+      const custody = vi.spyOn(publisher, "exclusive");
+      // The append-time index saw the real warm owner and the pre-arm route.
+      // Re-enter the real post-commit scan at the ACTUAL host writer's rename.
+      vi.spyOn(index, "retainedRoutesAt").mockImplementation(directory => {
+        const snapshot = retained(directory);
+        if (scanning && directory === config.residencyRoot) {
+          checkedBeforeArm = !snapshot?.actors.some(entry => entry.id === actor.id);
+          timeline.push({ phase: "publication-root-checked", hasRecipient: !checkedBeforeArm,
+            sleeping: fs.existsSync(residentSleepingPath(config.residencyRoot)) });
+        }
+        if (scanning && directory === sentinel && checkedBeforeArm && armRename) {
+          armRename();
+          armRename = undefined;
+          committedDuringScan = true;
+          timeline.push({ phase: "host-native-route-rename-committed", hasRecipient: retained(config.residencyRoot)?.actors.some(entry => entry.id === actor.id),
+            sleeping: fs.existsSync(residentSleepingPath(config.residencyRoot)) });
+        }
+        return snapshot;
+      });
+      vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+        if (String(destination) !== routeFile || committedDuringScan || !deferred) return rename(source, destination);
+        // Commit the production-prepared file exactly once; never rewrite routing JSON.
+        let renamed = false;
+        armRename = () => { rename(source, destination); renamed = true; };
+        scanning = true;
+        try { scan = dispatch(...deferred); }
+        finally { scanning = false; if (!renamed) rename(source, destination); armRename = undefined; }
+      });
+      prove();
+      await until(() => committedDuringScan);
+      await scan;
+      expect(custody).not.toHaveBeenCalled(); // Actual publicationRoots early-return, not a wake promise.
+      timeline.push({ phase: "publication-scan-skipped-custody", exclusiveCalls: custody.mock.calls.length,
+        sleeping: fs.existsSync(residentSleepingPath(config.residencyRoot)) });
+      releasePublish();
+      expect(await publishing).toEqual(event);
+      expect(checkedBeforeArm).toBe(true);
+      expect(readWakeJson<ResidentWakeRoutes>(routeFile)?.actors).toContainEqual(expect.objectContaining({ id: actor.id }));
+      expect(index.residentUnacknowledgedDeliveries(config.meshRoot).has(config.residencyRoot)).toBe(false);
+      expect(fs.existsSync(residentWakeRequestPath(config.residencyRoot))).toBe(false);
+      expect(runs).not.toHaveBeenCalled();
+      expect(host.actors.meshCaughtUp()).toBe(false);
+      vi.spyOn(Date, "now").mockImplementation(() => now() + offset);
+      offset = 31_000;
+      await sleep(150); // Existing request-poll exit checks must not release an unread cursor.
+      expect(idle).not.toHaveBeenCalled();
+      expect(fs.existsSync(residentSleepingPath(config.residencyRoot))).toBe(false);
+      timeline.push({ phase: "idle-exit-vetoed-unread-cursor", caughtUp: host.actors.meshCaughtUp(),
+        idleCallbacks: idle.mock.calls.length, sleeping: fs.existsSync(residentSleepingPath(config.residencyRoot)) });
+      holdNotifications = false;
+      for (const notify of notifications.splice(0)) notify();
+      await until(() => host.actors.messages(actor.id).some(message => message.direction === "out" && message.source === `mesh:${event.topic}`));
+      const incoming = host.actors.messages(actor.id).filter(message => message.direction === "in" && message.source === `mesh:${event.topic}`);
+      expect(incoming).toHaveLength(1);
+      expect(incoming[0]).toMatchObject({ actorId: actor.id, data: { id: event.id, sequence: event.sequence, to: actor.id } });
+      expect(runs).toHaveBeenCalledOnce();
+      expect(runs.mock.calls[0]![0]).toMatchObject({ actorId: actor.id });
+      expect(runs.mock.calls[0]![0].task).toContain(event.id);
+      timeline.push({ phase: "actor-consumed", actorId: incoming[0]!.actorId, event: incoming[0]!.data,
+        runs: runs.mock.calls.length, sleeping: fs.existsSync(residentSleepingPath(config.residencyRoot)) });
+      await until(() => host.actors.status(actor.id).status === "dormant" && host.actors.meshCaughtUp());
+      offset = 62_000;
+      await until(() => idle.mock.calls.length === 1);
+      expect(idle.mock.calls[0]![0]).toBe("dormant");
+      const cursor = readWakeJson<{ format: number; last: { id: string; sequence: number } }>(
+        path.join(config.residencyRoot, "actor-mesh-cursor.json.project"));
+      expect(cursor?.format).toBe(1);
+      expect(cursor!.last.sequence).toBeGreaterThanOrEqual(event.sequence);
+      if (cursor!.last.sequence === event.sequence) expect(cursor!.last.id).toBe(event.id);
+      expect(host.actors.messages(actor.id).filter(message => message.direction === "in" && message.source === `mesh:${event.topic}`)).toHaveLength(1);
+      timeline.push({ phase: "production-dormant-checkpoint", cursor, sleeping: fs.existsSync(residentSleepingPath(config.residencyRoot)),
+        idleReason: idle.mock.calls[0]![0] });
+      console.info(JSON.stringify({ evidence: "P1-real-host-registration", timeline }));
+    } finally {
+      prove(); releasePublish(); holdNotifications = false;
+      await scan; await publishing;
+      await host.close(); publisher.closeState(); vi.restoreAllMocks();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("marks an idle actor dormant without losing its subscriptions, then reaches clean host exit", async () => {

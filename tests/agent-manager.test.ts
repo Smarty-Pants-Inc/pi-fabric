@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { senderHeaderHookPath } from "../src/guards/sender-headers.js";
 import type { FabricLifecyclePublishRequest } from "../src/lifecycle/types.js";
@@ -24,10 +24,39 @@ import {
 } from "../src/agents/budget-ledger.js";
 import type { AgentRunRecord, AgentRunResult } from "../src/agents/types.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { buildVedaArguments } from "../src/agents/veda-cli.js";
+import { modelExceptionGrant, withRootExceptionMetadata, writeModelExceptions } from "./helpers/model-exceptions.js";
 import { fakeManagerHeapWorker } from "./fixtures/manager-heap-probe.js";
 
+const ProductionAgentManager = AgentManager;
 const managers: AgentManager[] = [];
 const roots: string[] = [];
+// Private legacy-control fixture: only #11864 is listed; #1 remains unlisted.
+const legacyExceptionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-agent-manager-exceptions-"));
+const boundRootRecord = Object.freeze({ cwd: legacyExceptionRoot });
+const legacyExceptionPath = writeModelExceptions(legacyExceptionRoot, [
+  "anthropic/claude-opus-5-5",
+  "cliproxyapi-anthropic/claude-opus-5-5",
+  "claude-haiku-test",
+  "claude-sonnet-test",
+  "anthropic/claude-sonnet-4-5",
+]);
+const originalModelExceptionsPath = DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = legacyExceptionPath;
+const hasPosixTrustMetadata = process.platform !== "win32" && typeof process.getuid === "function";
+const trustedExceptionFixturePaths = new Set<string>();
+const realAdmitModelException = AgentManager.prototype.admitModelException;
+let restoreAdmissionFixture: (() => void) | undefined;
+beforeEach(() => {
+  trustedExceptionFixturePaths.clear();
+  trustedExceptionFixturePaths.add(legacyExceptionPath);
+  const admission = vi.spyOn(AgentManager.prototype, "admitModelException").mockImplementation(function (this: AgentManager, ...args) {
+    const file = this.config.modelExceptionsPath;
+    if (!file || !trustedExceptionFixturePaths.has(file)) return realAdmitModelException.apply(this, args);
+    return withRootExceptionMetadata(file, () => realAdmitModelException.apply(this, args));
+  });
+  restoreAdmissionFixture = () => admission.mockRestore();
+});
 type FabricSurfaceResult = AgentRunResult & {
   fullCodeMode?: string;
   tools?: string[];
@@ -104,6 +133,9 @@ afterAll(() => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+  if (originalModelExceptionsPath === undefined) delete DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath;
+  else DEFAULT_FABRIC_CONFIG.agents.modelExceptionsPath = originalModelExceptionsPath;
+  fs.rmSync(legacyExceptionRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 describe("effectiveAgentTimeoutMs", () => {
@@ -123,6 +155,7 @@ describe("effectiveAgentTimeoutMs", () => {
 
 afterEach(async () => {
   await Promise.all(managers.splice(0).map((manager) => manager.close()));
+  restoreAdmissionFixture?.();
   // ponytail: on Windows a just-exited child can still hold its cwd (EBUSY on rmdir);
   // Node retries EBUSY/ENOTEMPTY/EPERM with backoff when maxRetries is set (smarty-dev#883).
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -283,6 +316,29 @@ describe("Agent prompt retention (#11663)", () => {
 });
 
 describe("AgentManager fleet model admission (#2490)", () => {
+  it("refuses a concrete denied model before cancellation and still aborts an allowed model", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-policy-aborted-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi", budgetUsd: 0, deniedModels: ["provider/blocked"] }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const controller = new AbortController();
+    controller.abort();
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "denied before cancellation", model: "provider/blocked", transport: "process" }, controller.signal))
+        .rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED", model: "provider/blocked" });
+      expect(manager.list()).toEqual([]);
+      expect(fs.readdirSync(root)).toEqual([]);
+      await expect(manager.spawn({ task: "allowed but cancelled", model: "provider/allowed", transport: "process" }, controller.signal))
+        .rejects.toThrow("Operation aborted");
+      expect(manager.list()).toEqual([]);
+      expect(fs.readdirSync(root)).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); }
+  });
+
   it.each([
     ["veda", "backend-shortcut", "explicit"],
     ["veda", "veda/gpt-6-astra", "configured"],
@@ -302,7 +358,11 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const before = fs.readdirSync(root); const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     const beforeCommit = vi.fn();
     try {
-      await expect(manager.spawn({ task: "must not queue", runner, ...(source === "explicit" ? { model: selector } : {}) }, undefined, undefined, beforeCommit)).rejects.toMatchObject({ name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" });
+      // An unknown alias has no canonical backend target for exception admission.
+      const denial = runner === "claude" && selector === "unknown-runtime-alias"
+        ? { code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" }
+        : { name: "FabricModelDeniedError", code: "FABRIC_MODEL_DENIED" };
+      await expect(manager.spawn({ task: "must not queue", runner, ...(source === "explicit" ? { model: selector } : {}), ...(runner === "claude" ? { modelReason: "Named exception to isolate Claude deny policy #11864" } : {}) }, undefined, undefined, beforeCommit)).rejects.toMatchObject(denial);
       expect(manager.list().map(agent => agent.id)).toEqual([occupied.id]);
       expect(fs.readdirSync(root)).toEqual(before);
       expect(launch).not.toHaveBeenCalled(); expect(beforeCommit).not.toHaveBeenCalled();
@@ -314,11 +374,12 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const preparePiModel = vi.fn(async (model: string | undefined) => model);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: ["cliproxyapi/gpt-6-astra"],
       veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi" },
-    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
+    }, { rootSessionCwd: () => boundRootRecord.cwd, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
     const veda = await manager.run({ task: "allowed concrete", runner: "veda", model: "veda/cliproxyapi/gpt-6.1-sol", transport: "process" });
     expect(veda).toMatchObject({ status: "completed", model: "cliproxyapi/gpt-6.1-sol" });
     expect(preparePiModel).toHaveBeenCalledWith("cliproxyapi/gpt-6.1-sol");
-    const claude = await manager.run({ task: "allowed alias", runner: "claude", model: "claude/haiku", transport: "process" });
+    if (!hasPosixTrustMetadata) return; // Only the positive Claude compatibility control is POSIX-only.
+    const claude = await manager.run({ task: "allowed alias", runner: "claude", model: "claude/haiku", modelReason: "Named Claude backend compatibility probe #11864", transport: "process" });
     expect(claude).toMatchObject({ status: "completed", model: "claude-haiku-test" });
   });
 
@@ -332,19 +393,29 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const catalog = vi.spyOn(manager, "claudeModels").mockResolvedValue([{ value: "shortcut", resolvedModel: "shortcut", resolvedModelKnown: false, displayName: "Shortcut", description: "No native target" }]);
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
-      await expect(manager.spawn({ task: "no proof", runner: mode === "unresolved-catalog" ? "claude" : "veda", model: mode === "unresolved-catalog" ? "shortcut" : "cliproxyapi/gpt-6.1-sol" })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+      const denial = mode === "unresolved-catalog"
+        ? { code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" }
+        : { code: "FABRIC_MODEL_DENIED" };
+      await expect(manager.spawn({ task: "no proof", runner: mode === "unresolved-catalog" ? "claude" : "veda", model: mode === "unresolved-catalog" ? "shortcut" : "cliproxyapi/gpt-6.1-sol", ...(mode === "unresolved-catalog" ? { modelReason: "Named exception to isolate Claude catalog denial #11864" } : {}) })).rejects.toMatchObject(denial);
       expect(manager.list()).toEqual([]); expect(launch).not.toHaveBeenCalled(); expect(fs.readdirSync(root)).toEqual([]);
     } finally { launch.mockRestore(); catalog.mockRestore(); }
   });
 
-  it.each(["veda", "claude"] as const)("round 5 F5 leaves %s backend aliases unchanged with no policy", async runner => {
+  it.each(["veda", "claude"] as const)("round 5 F5 keeps Veda aliases unchanged but refuses an unresolvable Claude alias", async runner => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-f5-no-policy-")); roots.push(root);
     const preparePiModel = vi.fn(async (model: string | undefined) => model);
-    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [] }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [] }, { rootSessionCwd: () => boundRootRecord.cwd, claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel }); managers.push(manager);
     const catalog = vi.spyOn(manager, "claudeModels");
     try {
-      expect(await manager.run({ task: "legacy alias", runner, model: "backend-shortcut", transport: "process" })).toMatchObject({ status: "completed", model: "backend-shortcut" });
-      expect(preparePiModel).not.toHaveBeenCalled(); expect(catalog).not.toHaveBeenCalled();
+      if (runner === "claude") {
+        await expect(manager.run({ task: "legacy alias", runner, model: "backend-shortcut", modelReason: "Named Claude backend compatibility probe #11864", transport: "process" }))
+          .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" });
+        expect(catalog).toHaveBeenCalledOnce();
+      } else {
+        expect(await manager.run({ task: "legacy alias", runner, model: "backend-shortcut", transport: "process" })).toMatchObject({ status: "completed", model: "backend-shortcut" });
+        expect(catalog).not.toHaveBeenCalled();
+      }
+      expect(preparePiModel).not.toHaveBeenCalled();
     } finally { catalog.mockRestore(); }
   });
 
@@ -374,17 +445,18 @@ describe("AgentManager fleet model admission (#2490)", () => {
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner, deniedModels: [denied], budgetUsd: 0, maxConcurrent: 1,
       claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, ...(runner === "claude" ? { model: selector } : {}) },
       veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi", ...(runner === "veda" ? { model: selector } : {}) },
-    }, { workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel: async model => model, claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs") });
+    }, { rootSessionCwd: () => boundRootRecord.cwd, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root, preparePiModel: async model => model, claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs") });
     managers.push(manager);
     const launch = vi.spyOn(ProcessTransport.prototype, "launch");
     try {
       for (const model of [selector, undefined]) {
-        await expect(manager.spawn({ task: "HANG", ...(model ? { model } : {}) })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
+        await expect(manager.spawn({ task: "HANG", ...(model ? { model } : {}), ...(runner === "claude" ? { modelReason: "Named exception to isolate Claude deny policy #11864" } : {}) })).rejects.toMatchObject({ code: "FABRIC_MODEL_DENIED" });
       }
       expect(manager.list()).toEqual([]);
       expect(launch).not.toHaveBeenCalled();
       expect(fs.readdirSync(root).filter((entry) => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
-      const allowed = await manager.run({ task: "allowed control", model: runner === "veda" ? "veda/cliproxyapi/gpt-6.1-sol" : "claude/haiku", transport: "process" });
+      if (runner === "claude" && !hasPosixTrustMetadata) return; // All deny assertions above remain unconditional.
+      const allowed = await manager.run({ task: "allowed control", model: runner === "veda" ? "veda/cliproxyapi/gpt-6.1-sol" : "claude/haiku", ...(runner === "claude" ? { modelReason: "Named Claude control for deny-policy probe #11864" } : {}), transport: "process" });
       expect(allowed.status).toBe("completed");
       expect(launch).toHaveBeenCalledTimes(1);
     } finally { launch.mockRestore(); }
@@ -405,6 +477,253 @@ describe("AgentManager fleet model admission (#2490)", () => {
       expect(launch).not.toHaveBeenCalled();
       expect(fs.readdirSync(root).filter((entry) => fs.statSync(path.join(root, entry)).isDirectory())).toEqual([]);
     } finally { launch.mockRestore(); }
+  });
+});
+
+describe("resolved manager policy (#11864)", () => {
+  const opus = "anthropic/claude-opus-5-5";
+  const luna = "cliproxyapi/gpt-6-luna";
+  const issueReason = "Named exception for the direct manager boundary #11864";
+  const makeManager = (root: string, overrides: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, preparePiModel?: (model: string | undefined) => Promise<string | void>) => {
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0,
+      claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" }, ...overrides }, {
+      rootSessionCwd: () => boundRootRecord.cwd,
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      claudeBinary: path.resolve("tests/fixtures/fake-claude.mjs"),
+      runRoot: root,
+      ...(preparePiModel ? { preparePiModel } : {}),
+    });
+    managers.push(manager);
+    return manager;
+  };
+  const policyFallback = { fallbackModel: luna };
+  const readAudit = (reason: string): Record<string, unknown> => {
+    const file = path.join(os.homedir(), ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
+    const rows = fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>);
+    const matches = rows.filter(row => row.reason === reason);
+    expect(matches, "a named model exception is appended once to the private test HOME audit").toHaveLength(1);
+    return matches[0]!;
+  };
+
+  it("prepares inherited session Opus to the configured safe fallback before constructing worker args", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-opus-inherited-fallback-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model === undefined ? opus : model);
+    const manager = makeManager(root, { modelPolicy: { ...DEFAULT_FABRIC_CONFIG.agents.modelPolicy, ...policyFallback } }, preparePiModel);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      const handle = await manager.spawn({ task: "inherited model fallback", modelSource: "inherited", transport: "process" });
+      expect(handle).toMatchObject({ model: luna, thinking: "high", warnings: [expect.stringContaining(`model: inherited ${opus} -> ${luna} high (#11863)`)] });
+      expect(launch).toHaveBeenCalledOnce();
+      expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining(["--model", luna, "--thinking", "high"]));
+      const result = await manager.wait(handle.id);
+      expect(result).toMatchObject({ status: "completed", model: luna, thinking: "high", warnings: [expect.stringContaining(`model: inherited ${opus} -> ${luna} high (#11863)`)] });
+    } finally { launch.mockRestore(); }
+  });
+
+  it("refuses inherited Opus when no explicit agents.modelPolicy.fallbackModel exists", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-opus-no-fallback-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model === undefined ? opus : model);
+    const manager = makeManager(root, {}, preparePiModel);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "no implicit fleet fallback", modelSource: "inherited", transport: "process" }))
+        .rejects.toThrow(/agents\.modelPolicy\.fallbackModel.*no worker started/);
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root)).toEqual([]);
+    } finally { launch.mockRestore(); }
+  });
+
+  it("refuses an innocuous explicit alias resolved to Opus without an issue and admits the opusReason alias with one audit write", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-opus-alias-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model === "provider/harmless-shortcut" ? opus : model);
+    const manager = makeManager(root, {}, preparePiModel);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "alias without issue", model: "provider/harmless-shortcut", transport: "process" }))
+        .rejects.toThrow(/requires (?:modelReason|opusReason).*#2264/);
+      await expect(manager.spawn({ task: "alias reason without issue reference", model: "provider/harmless-shortcut", modelReason: "Opus would be useful for this task", transport: "process" }))
+        .rejects.toThrow(/issue reference|#11864|#2264/i);
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      if (!hasPosixTrustMetadata) return; // Preserve the negative alias assertions on every platform.
+      const accepted = await manager.run({ task: "issue-bearing alias", model: "provider/harmless-shortcut", opusReason: issueReason, transport: "process" });
+      expect(accepted).toMatchObject({ status: "completed", model: opus, modelReason: issueReason });
+      expect(launch).toHaveBeenCalledOnce();
+      expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining(["--model", opus, "--model-reason", issueReason]));
+      expect(readAudit(issueReason)).toMatchObject({ model: opus, ref: "Smarty-Pants-Inc/smarty-dev#11864", reason: issueReason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+        grant_id: expect.any(String), issue: "Smarty-Pants-Inc/smarty-dev#11864", lane: path.basename(boundRootRecord.cwd), host: os.hostname().split(".")[0], thinking: expect.any(String), run_id: accepted.id, time: expect.any(String) });
+    } finally { launch.mockRestore(); }
+  });
+
+  it("falls back from a configured Opus default to its explicitly configured Luna policy target", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-opus-default-fallback-")); roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model);
+    const manager = makeManager(root, { model: opus, modelPolicy: { ...DEFAULT_FABRIC_CONFIG.agents.modelPolicy, ...policyFallback } }, preparePiModel);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      const result = await manager.run({ task: "configured protected default", transport: "process" });
+      expect(result).toMatchObject({ status: "completed", model: luna, thinking: "high", warnings: [expect.stringContaining(`model: inherited ${opus} -> ${luna} high (#11863)`)] });
+      expect(launch).toHaveBeenCalledOnce();
+      expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining(["--model", luna, "--thinking", "high"]));
+    } finally { launch.mockRestore(); }
+  });
+
+  it("refuses the Claude runner without an issue and records an issue-bearing exception", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-reason-")); roots.push(root);
+    const manager = makeManager(root, { claude: { ...DEFAULT_FABRIC_CONFIG.agents.claude, model: "claude/haiku" } });
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "Claude without issue", runner: "claude", transport: "process" }))
+        .rejects.toThrow(/requires (?:modelReason|opusReason).*#2264/);
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      if (!hasPosixTrustMetadata) return; // The missing-reason refusal above still runs.
+      const reason = "Named Claude-runner exception #11864";
+      const result = await manager.run({ task: "Claude with issue", runner: "claude", modelReason: reason, transport: "process" });
+      expect(result).toMatchObject({ status: "completed", runner: "claude", modelReason: reason });
+      expect(launch).toHaveBeenCalledOnce();
+      expect(readAudit(reason)).toMatchObject({ model: expect.stringContaining("claude"), ref: "Smarty-Pants-Inc/smarty-dev#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+        grant_id: expect.any(String), issue: "Smarty-Pants-Inc/smarty-dev#11864", lane: path.basename(boundRootRecord.cwd), host: os.hostname().split(".")[0], thinking: expect.any(String), run_id: result.id, time: expect.any(String) });
+    } finally { launch.mockRestore(); }
+  });
+
+  it("refuses an unspecified Claude backend whose catalog cannot establish a canonical target", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-opaque-default-")); roots.push(root);
+    const manager = makeManager(root, { claude: { binary: DEFAULT_FABRIC_CONFIG.agents.claude.binary } });
+    const catalog = vi.spyOn(manager, "claudeModels").mockResolvedValue([
+      { value: "default", resolvedModel: "default", resolvedModelKnown: false, displayName: "Unknown account default", description: "Unresolved" },
+    ]);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    try {
+      await expect(manager.spawn({ task: "unknown native default", runner: "claude", modelReason: "Unknown Claude default #11864", transport: "process" }))
+        .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" });
+      expect(manager.list()).toEqual([]); expect(launch).not.toHaveBeenCalled();
+    } finally { launch.mockRestore(); catalog.mockRestore(); }
+  });
+
+  it("F-01 refuses opaque Veda defaults/aliases and admits registry-confirmed concrete selectors", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-claude-policy-")); roots.push(root);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-claude-home-")); roots.push(home);
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+    const manager = makeManager(root, {
+      runner: "veda",
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
+      modelPolicy: { requireReason: ["claude", "opus"] },
+    }, async model => model);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const concrete = "anthropic/claude-sonnet-4-5";
+    const reason = "#11864 bounded Veda Claude-code exception";
+    try {
+      for (const request of [
+        { task: "Veda backend default" },
+        { task: "configured absent Veda model" },
+        { task: "Veda sonnet alias", model: "sonnet" },
+      ]) {
+        await expect(manager.spawn({ ...request, transport: "process" }))
+          .rejects.toThrow(/requires (?:modelReason|opusReason).*#2264|named exception/i);
+      }
+      expect(manager.list()).toEqual([]);
+      expect(launch).not.toHaveBeenCalled();
+      expect(fs.readdirSync(root)).toEqual([]);
+
+      for (const model of [undefined, "sonnet"]) await expect(manager.spawn({ task: "unsafe issue-bearing opaque selector", ...(model ? { model } : {}), modelReason: reason, transport: "process" }))
+        .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "model-mismatch" });
+      if (!hasPosixTrustMetadata) return; // All missing-reason/default/alias refusals above still run.
+      const defaultReason = "#11864 named exception for a concrete Veda backend target";
+      manager.config.veda.model = concrete;
+      const acceptedDefault = await manager.run({ task: "issue-bearing concrete Veda configured default", modelReason: defaultReason, transport: "process" });
+      expect(acceptedDefault).toMatchObject({ status: "completed", runner: "veda", model: concrete, modelReason: defaultReason,
+        warnings: expect.arrayContaining([expect.stringContaining(`veda/claude-code/${concrete}`)]) });
+      const defaultArgv = launch.mock.calls[0]![0].workerArguments;
+      expect(defaultArgv).toEqual(expect.arrayContaining(["--runner", "veda", "--model-reason", defaultReason]));
+      expect(defaultArgv).toEqual(expect.arrayContaining(["--model", concrete]));
+
+      const accepted = await manager.run({ task: "issue-bearing Veda concrete selector", model: concrete, modelReason: reason, transport: "process" });
+      expect(accepted).toMatchObject({ status: "completed", runner: "veda", model: concrete, modelReason: reason,
+        warnings: expect.arrayContaining([expect.stringContaining(`veda/claude-code/${concrete}`)]) });
+      expect(launch).toHaveBeenCalledTimes(2);
+      expect(launch.mock.calls[1]![0].workerArguments).toEqual(expect.arrayContaining([
+        "--runner", "veda", "--model", concrete, "--model-reason", reason,
+      ]));
+      expect(manager.status(accepted.id).modelReason).toBe(reason);
+      const auditFile = path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
+      const rows = fs.readFileSync(auditFile, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>);
+      const matching = rows.filter(row => row.reason === reason);
+      const defaultRows = rows.filter(row => row.reason === defaultReason);
+      expect(matching).toHaveLength(1);
+      expect(defaultRows).toHaveLength(1);
+      expect(Object.keys(matching[0]!).sort()).toEqual(["grant_id", "host", "issue", "lane", "launcher", "model", "reason", "ref", "role", "run_id", "thinking", "time", "ts"]);
+      expect(matching[0]).toMatchObject({ ref: "Smarty-Pants-Inc/smarty-dev#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+        grant_id: expect.any(String), issue: "Smarty-Pants-Inc/smarty-dev#11864", lane: path.basename(boundRootRecord.cwd), host: os.hostname().split(".")[0], thinking: expect.any(String), run_id: accepted.id, time: expect.any(String) });
+      expect(matching[0]!.model).toBe(concrete);
+      expect(defaultRows[0]!.model).toBe(concrete);
+    } finally { launch.mockRestore(); homedir.mockRestore(); }
+  });
+
+  it.each([
+    ["veda/anthropic/claude-sonnet-4-5", "anthropic/claude-sonnet-4-5"],
+    ["VEDA/sonnet", "VEDA/sonnet"],
+  ])("F-01-D1 keeps Veda selector attribution aligned with CLI normalization (%s)", async (model, cliModel) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-d1-")); roots.push(root);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-veda-d1-home-")); roots.push(home);
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+    const manager = makeManager(root, {
+      runner: "veda",
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "claude-code" },
+      modelPolicy: { requireReason: ["claude", "opus"] },
+    }, async selector => selector);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const reason = `F-01-D1 selector attribution #11864 (${model})`;
+    try {
+      if (model === "VEDA/sonnet") {
+        await expect(manager.spawn({ task: "opaque Veda selector", model, modelReason: reason, transport: "process" }))
+          .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: hasPosixTrustMetadata ? "model-mismatch" : "untrusted-source" });
+        expect(manager.list()).toEqual([]);
+        expect(launch).not.toHaveBeenCalled();
+        return;
+      }
+      if (!hasPosixTrustMetadata) return; // The unsafe-selector case above is never skipped.
+      const handle = await manager.spawn({ task: "Veda selector attribution", model, modelReason: reason, transport: "process" });
+      expect(handle.warnings).toContain(`model: named exception veda/claude-code/${cliModel} (Smarty-Pants-Inc/smarty-dev#11864)`);
+      const workerArgs = launch.mock.calls[0]![0].workerArguments;
+      expect(workerArgs).toEqual(expect.arrayContaining(["--model", cliModel]));
+      const cliArgs = buildVedaArguments({ backend: "claude-code", persona: "default", model, tools: [], session: "d1" });
+      expect(cliArgs[cliArgs.indexOf("-m") + 1]).toBe(cliModel);
+
+      const result = await manager.wait(handle.id);
+      expect(result.warnings).toContain(`model: named exception veda/claude-code/${cliModel} (Smarty-Pants-Inc/smarty-dev#11864)`);
+      const audit = readAudit(reason);
+      expect(Object.keys(audit).sort()).toEqual(["grant_id", "host", "issue", "lane", "launcher", "model", "reason", "ref", "role", "run_id", "thinking", "time", "ts"]);
+      expect(audit).toMatchObject({ grant_id: expect.any(String), issue: "Smarty-Pants-Inc/smarty-dev#11864", lane: path.basename(boundRootRecord.cwd), host: os.hostname().split(".")[0], thinking: expect.any(String), run_id: handle.id, time: expect.any(String) });
+      expect(audit.model).toBe(cliModel);
+      expect(audit.reason).toBe(reason);
+    } finally { launch.mockRestore(); homedir.mockRestore(); }
+  });
+
+  it.runIf(hasPosixTrustMetadata)("completes an issue-bearing Claude exception when its audit append fails and warns in both receipts", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-audit-failure-")); roots.push(root);
+    const home = path.join(root, "home");
+    const auditFile = path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
+    fs.mkdirSync(auditFile, { recursive: true });
+    const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+    const manager = makeManager(root);
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch");
+    const reason = "Named Claude audit failure exception #11864";
+    const warning = "Opus policy audit log failed; exception not fully recorded.";
+    const model = "claude/haiku";
+    const canonicalModel = "claude-haiku-test";
+    try {
+      const receipt = await manager.spawn({ task: "Claude survives audit failure", runner: "claude", model, modelReason: reason, transport: "process" });
+      expect(receipt).toMatchObject({ model: canonicalModel, modelReason: reason, warnings: [warning] });
+      expect(launch).toHaveBeenCalledOnce();
+      expect(launch.mock.calls[0]![0].workerArguments).toEqual(expect.arrayContaining(["--runner", "claude", "--model", canonicalModel, "--model-reason", reason]));
+      const result = await manager.wait(receipt.id);
+      expect(result).toMatchObject({ status: "completed", runner: "claude", model: canonicalModel, modelReason: reason, warnings: [warning] });
+      expect(result.model).toBe(receipt.model);
+      expect(result.modelReason).toBe(receipt.modelReason);
+      expect(fs.statSync(auditFile).isDirectory()).toBe(true);
+    } finally { launch.mockRestore(); homedir.mockRestore(); }
   });
 });
 
@@ -944,6 +1263,9 @@ describe("AgentManager", () => {
       expect(fs.existsSync(runDirectory)).toBe(true);
       expect(fs.existsSync(worktree!)).toBe(true);
       // A later exact exit discharges transient custody, never a terminal-only receipt.
+      // failed-stop loses the request ACK, not this handle's later exit proof:
+      // retrying that failed hook again after proof must not replace cancellation
+      // with a supervisor failure. The stopped expectation is intentional.
       workerExited = true;
       expect((await manager.stop(queued.id)).status).toBe("stopped");
       expect(fs.existsSync(path.join(runDirectory, "unresolved-worker.json"))).toBe(false);
@@ -1331,6 +1653,93 @@ describe("AgentManager", () => {
     expect(fs.readdirSync(root)).toEqual([]);
   });
 
+  it.each(["changed-ref", "same-ref", "missing", "expired", "inherited-fallback"] as const)(
+    "relaunch audits the fresh exception before worker launch (%s)", async (mode) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-relaunch-exception-"));
+      roots.push(root);
+      const home = path.join(root, "home");
+      const homedir = vi.spyOn(os, "homedir").mockReturnValue(home);
+      const exceptionsPath = path.join(root, "model-exceptions.json");
+      const auditFile = path.join(home, ".local", "state", "smarty", "route", "opus-exceptions.jsonl");
+      const model = "anthropic/claude-opus-5-5";
+      const safeModel = "openai-codex/gpt-5.4";
+      const inherited = mode === "inherited-fallback";
+      const reason = `relaunch ${mode} ${path.basename(root)} #12000 #11864`;
+      const boundRelaunchRootRecord = Object.freeze({ cwd: root });
+      const entry = (issue: string, expires_at?: string) => modelExceptionGrant({
+        issue, model, lane: path.basename(boundRelaunchRootRecord.cwd), role: "task",
+        ...(expires_at ? { granted_at: "1999-12-31T23:00:00.000Z", expires_at } : {}),
+      });
+      fs.writeFileSync(exceptionsPath, JSON.stringify({ version: 1, grants: [entry("Smarty-Pants-Inc/smarty-dev#12000")] }));
+      trustedExceptionFixturePaths.add(exceptionsPath);
+      const readAudit = (): Record<string, unknown>[] => fs.readFileSync(auditFile, "utf8")
+        .trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>)
+        .filter(row => row.reason === (inherited ? "inherited-switch" : reason));
+      const actualLaunch = ProcessTransport.prototype.launch;
+      let launches = 0;
+      const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+        const attempt = ++launches;
+        // These assertions run before the real process starts, not after the run settles.
+        const rows = readAudit();
+        const refs = inherited ? [null] : attempt === 1 ? ["Smarty-Pants-Inc/smarty-dev#12000"]
+          : ["Smarty-Pants-Inc/smarty-dev#12000", mode === "changed-ref" ? "Smarty-Pants-Inc/smarty-dev#11864" : "Smarty-Pants-Inc/smarty-dev#12000"];
+        expect(rows.map(row => row.ref)).toEqual(refs);
+        for (const row of rows) {
+          expect(Object.keys(row).sort()).toEqual(inherited ? ["host", "launcher", "model", "reason", "ref", "role", "ts"]
+            : ["grant_id", "host", "issue", "lane", "launcher", "model", "reason", "ref", "role", "run_id", "thinking", "time", "ts"]);
+          expect(row).toMatchObject({ role: "task", model, reason: inherited ? "inherited-switch" : reason,
+            launcher: "fabric", host: inherited ? os.hostname() : os.hostname().split(".")[0], ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
+          if (!inherited) expect(row).toMatchObject({ grant_id: expect.any(String), issue: row.ref,
+            lane: path.basename(boundRelaunchRootRecord.cwd), thinking: expect.any(String), run_id: request.id, time: expect.any(String) });
+        }
+        expect(request.workerArguments).toEqual(expect.arrayContaining(["--model", inherited ? safeModel : model]));
+        const handle = await actualLaunch.call(this, request);
+        if (attempt === 1) {
+          if (mode === "changed-ref") fs.writeFileSync(exceptionsPath, JSON.stringify({ version: 1, grants: [entry("Smarty-Pants-Inc/smarty-dev#11864")] }));
+          else if (mode === "missing") fs.writeFileSync(exceptionsPath, JSON.stringify({ version: 1, grants: [] }));
+          else if (mode === "expired") fs.writeFileSync(exceptionsPath, JSON.stringify({ version: 1, grants: [entry("Smarty-Pants-Inc/smarty-dev#12000", "2000-01-01T00:00:00.000Z")] }));
+        }
+        return handle;
+      });
+      try {
+        const preparePiModel = vi.fn(async (selector: string | undefined) => selector);
+        const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents,
+          modelExceptionsPath: exceptionsPath,
+          modelPolicy: { ...DEFAULT_FABRIC_CONFIG.agents.modelPolicy, fallbackModel: safeModel },
+        }, { rootSessionCwd: () => boundRelaunchRootRecord.cwd, workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root, preparePiModel });
+        managers.push(manager);
+        if (!hasPosixTrustMetadata && !inherited) {
+          await expect(manager.run({ task: `Recover startup ${mode}`, model, transport: "process", modelReason: reason }))
+            .rejects.toMatchObject({ code: "FABRIC_MODEL_EXCEPTION_DENIED", denial: "untrusted-source" });
+          expect(launches).toBe(0);
+          expect(manager.list()).toEqual([]);
+          expect(fs.existsSync(auditFile)).toBe(false);
+          return;
+        }
+        const result = await manager.run({ task: `Recover startup ${mode}`, model, transport: "process",
+          ...(inherited ? { modelSource: "inherited" as const } : { modelReason: reason }) });
+        const refused = mode === "missing" || mode === "expired";
+        expect(launches).toBe(refused ? 1 : 2);
+        expect(result.status).toBe(refused ? "failed" : "completed");
+        expect(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "startup-attempts"), "utf8"))
+          .toBe(refused ? "1" : "2");
+        expect(readAudit().map(row => row.ref)).toEqual(inherited ? [null] : refused ? ["Smarty-Pants-Inc/smarty-dev#12000"]
+          : ["Smarty-Pants-Inc/smarty-dev#12000", mode === "changed-ref" ? "Smarty-Pants-Inc/smarty-dev#11864" : "Smarty-Pants-Inc/smarty-dev#12000"]);
+        if (refused) {
+          expect(result.error).toMatch(/relaunch failed:.*(?:unlisted|expired)/);
+        } else {
+          expect(result.text).toBe("startup retry recovered");
+          expect(result.model).toBe(inherited ? safeModel : model);
+          expect(result.modelReason).toBe(inherited ? undefined : reason);
+          // Preparation may be cached or refreshed as an exact required pin;
+          // neither call shape may retarget the already admitted model.
+          const expectedModel = inherited ? safeModel : model;
+          expect([[expectedModel], [expectedModel, true]]).toContainEqual(preparePiModel.mock.calls.at(-1));
+        }
+      } finally { launch.mockRestore(); homedir.mockRestore(); }
+    }, 30_000,
+  );
+
   it("retries a Pi child that fails before its first turn", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -1491,19 +1900,25 @@ describe("AgentManager", () => {
         runRoot: root,
       });
       managers.push(manager);
-      const result = await manager.run({ task: "HANG until stopped", transport: "process" });
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
+      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 10_000 });
+      const candidate = manager.status(handle.id) as AgentRunRecord;
       expect(launches).toBe(1);
-      expect(result.status).toBe("failed");
-      expect(result.error).toContain("Agent transport exited without a result");
-      expect(fs.existsSync(path.join(manager.runDirectory(result.id)!, "relaunches.jsonl"))).toBe(false);
+      expect(candidate.error).toContain("Agent transport exited without a result");
+      await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      expect(fs.existsSync(path.join(manager.runDirectory(handle.id)!, "relaunches.jsonl"))).toBe(false);
+      expect(await handles[0]!.isAlive()).toBe(true);
+      await handles[0]!.stop();
+      await manager.stop(handle.id);
+      expect(manager.isSettled(handle.id)).toBe(true);
     } finally {
       spy.mockRestore();
       for (const handle of handles) await handle.stop();
     }
   }, 30_000);
 
-  // dev-lead review D1 on #26: lost contact is not an exit. The run fails as lost, once, and
-  // neither cleanup nor shutdown deletes files that the still-running worker may use.
+  // Lost contact is a terminal failed outcome, not an exit receipt: retain
+  // admission and files that the worker may still use.
   it("fails a run whose transport lost contact as lost, and keeps its worker's files", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -1523,10 +1938,13 @@ describe("AgentManager", () => {
         runRoot: root,
       });
       managers.push(manager);
-      const result = await manager.run({ task: "HANG until stopped", transport: "process" });
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
+      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 5_000 });
+      const result = manager.status(handle.id) as AgentRunRecord;
       expect(launches).toBe(1);
       expect(result.status).toBe("failed");
-      expect(result.error).toMatch(/^Lost track of the worker: the Herdr server has been unreachable/);
+      await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      expect(result.error).toContain("Lost track of the worker: the Herdr server has been unreachable");
       expect(result.error).not.toContain("exited without a result");
       const runDirectory = manager.runDirectory(result.id)!;
       await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
@@ -1540,8 +1958,8 @@ describe("AgentManager", () => {
     }
   }, 30_000);
 
-  // dev-lead review D1 on #26: lost contact is not an exit. The run fails as lost, once, and
-  // neither cleanup nor shutdown deletes files that the still-running worker may use.
+  // Lost contact is a terminal failed outcome, not an exit receipt: retain
+  // admission and files that the worker may still use.
   it("preserves modelReason in the persisted terminal record and settlement callback for a lost worker", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -1564,13 +1982,17 @@ describe("AgentManager", () => {
         onSettled: settled,
       });
       managers.push(manager);
-      const result = await manager.run({ task: "HANG until stopped", transport: "process", model: "cliproxyapi/gpt-6-astra", modelReason });
+      const handle = await manager.spawn({ task: "HANG until stopped", transport: "process", model: "cliproxyapi/gpt-6-astra", modelReason });
+      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 5_000 });
+      const result = manager.status(handle.id) as AgentRunRecord;
       const persisted = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "status.json"), "utf8"));
       expect.soft(persisted).toMatchObject({ status: "failed", modelReason });
-      expect.soft(settled).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: result.id, status: "failed", modelReason }));
+      expect.soft(settled).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ status: "failed", modelReason, errorCode: "CUSTODY_UNCONFIRMED" }));
       expect(launches).toBe(1);
       expect(result.status).toBe("failed");
-      expect(result.error).toMatch(/^Lost track of the worker: the Herdr server has been unreachable/);
+      expect(result.modelReason).toBe(modelReason);
+      await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      expect(result.error).toContain("Lost track of the worker: the Herdr server has been unreachable");
       expect(result.error).not.toContain("exited without a result");
       const runDirectory = manager.runDirectory(result.id)!;
       await expect(manager.cleanup(result.id)).rejects.toThrow(/lost track of its worker/);
@@ -1618,7 +2040,10 @@ describe("AgentManager", () => {
       managers.push(manager);
       const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
       if (path_ === "stop") await expect(manager.stop(handle.id)).rejects.toThrow(/execution exit unconfirmed/);
-      else expect((await manager.wait(handle.id)).status).toBe("timed_out");
+      else {
+        await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 12_000 });
+        await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+      }
       const runDirectory = manager.runDirectory(handle.id)!;
       expect(JSON.parse(fs.readFileSync(path.join(runDirectory, "unresolved-worker.json"), "utf8")).reason)
         .toMatch(/Herdr server has been unreachable/);
@@ -1746,17 +2171,21 @@ describe("AgentManager", () => {
       });
       managers.push(manager);
       const handle = await manager.spawn({ task: "HANG until stopped", transport: "process" });
-      const result = await manager.wait(handle.id);
+      await vi.waitFor(() => expect(manager.status(handle.id).status).toBe("failed"), { timeout: 25_000 });
+      const candidate = manager.status(handle.id) as AgentRunRecord;
       expect(launches).toBe(1);
-      expect(result.status).toBe("failed");
-      expect(result.error).toContain("did not stop, so it was not relaunched");
+      expect(candidate.error).toContain("did not stop, so it was not relaunched");
+      await expect(manager.wait(handle.id, { timeoutMs: 50 })).resolves.toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
       const relaunches = fs.readFileSync(path.join(manager.runDirectory(handle.id)!, "relaunches.jsonl"), "utf8")
         .trim().split("\n").map((line) => JSON.parse(line));
       expect(relaunches).toEqual([expect.objectContaining({ kind: "relaunch-failed" })]);
-      // review/astra on e170d9e: the worker that did not stop may still use its files.
-      await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
+      // The failed stop cannot release or replace a still-live worker.
+      await expect(manager.cleanup(handle.id)).rejects.toThrow(/execution exit unconfirmed/);
       expect(fs.existsSync(manager.runDirectory(handle.id)!)).toBe(true);
-      await expectUnconfirmedClose(manager);
+      expect(await first!.isAlive()).toBe(true);
+      await first!.stop();
+      await manager.stop(handle.id);
+      expect(manager.isSettled(handle.id)).toBe(true);
     } finally {
       spy.mockRestore();
       await first?.stop();
@@ -2074,15 +2503,16 @@ describe("AgentManager", () => {
       expect(workerJoined).toBe(false);
       expect(settled).toBe(false);
       releaseWorker();
-      if (outcome === "uncertain" && platform === "native" && process.platform !== "win32") {
-        // PR 218's POSIX tree custody is stricter than Windows logical stop:
-        // a closed primary alone cannot settle an unconfirmed execution tree.
+      if (outcome === "uncertain") {
+        // A captured primary/helper close is not whole-tree exit on either
+        // platform. Publish custody failure without releasing the execution fence.
         await expect(stopping).rejects.toThrow(/execution exit unconfirmed/);
-        await expect(manager.wait(handle.id, { timeoutMs: 20 })).rejects.toThrow(/still running/);
-        expect(manager.status(handle.id).status).toBe("running");
+        expect(await manager.wait(handle.id)).toMatchObject({ status: "failed", errorCode: "CUSTODY_UNCONFIRMED" });
+        expect(manager.status(handle.id).status).toBe("failed");
         expect(workerJoined).toBe(true);
         expect(fs.existsSync(path.join(manager.runDirectory(handle.id)!, "unresolved-worker.json"))).toBe(true);
-        await expect(manager.cleanup(handle.id)).rejects.toThrow(/running agent/);
+        await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track/);
+        // This custom handle has no exact bounded native stop-debt receipt.
         await expectUnconfirmedClose(manager);
         return;
       }
@@ -2097,14 +2527,8 @@ describe("AgentManager", () => {
       expect(launch).toHaveBeenCalledOnce();
       expect(JSON.parse(fs.readFileSync(statusFile, "utf8")).sessionId).toBe(sessionId);
       expect(() => process.kill(Number(sessionId), 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
-      if (outcome === "uncertain") {
-        expect(fs.existsSync(path.join(manager.runDirectory(handle.id)!, "unresolved-worker.json"))).toBe(true);
-        await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track of its worker/);
-        await expect(manager.checkpointForRelease()).rejects.toThrow(/unresolved/);
-      } else {
-        if (outcome === "failed-result") expect((await manager.wait(handle.id)).error).toBe("real worker failure");
-        expect(await manager.cleanup(handle.id)).toEqual({ cleaned: true });
-      }
+      if (outcome === "failed-result") expect((await manager.wait(handle.id)).error).toBe("real worker failure");
+      expect(await manager.cleanup(handle.id)).toEqual({ cleaned: true });
     } finally {
       releaseHelper(); releaseWorker();
       child.kill("SIGTERM");
@@ -2113,7 +2537,8 @@ describe("AgentManager", () => {
         await closed;
         // Join Windows logical close before restoring the native platform seam.
         if (platform === "win32") {
-          await manager.close();
+          if (outcome === "uncertain") await expect(manager.close()).rejects.toThrow(/execution exit unconfirmed/);
+          else await manager.close();
           const index = managers.indexOf(manager);
           if (index !== -1) managers.splice(index, 1);
         }
@@ -2146,7 +2571,7 @@ describe("AgentManager", () => {
       const record = JSON.parse(fs.readFileSync(statusFile, "utf8"));
       writeJsonAtomic(statusFile, { ...record, status: "completed", text: "finished before native close", finishedAt: Date.now() });
       if (state === "settled result") {
-        // POSIX settlement now includes the execution drain. A terminal file
+        // Settlement on both platforms includes the execution drain. A terminal file
         // alone remains insufficient; release the existing join before wait.
         release();
         await manager.wait(handle.id);
@@ -2729,7 +3154,7 @@ describe("AgentManager", () => {
   it("forwards the configured default model when a call omits one", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
-    const config = { ...DEFAULT_FABRIC_CONFIG.agents, model: "claude-sonnet-4-5" };
+    const config = { ...DEFAULT_FABRIC_CONFIG.agents, model: "provider/default" };
     const manager = new AgentManager(process.cwd(), config, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
       runRoot: root,
@@ -2738,7 +3163,7 @@ describe("AgentManager", () => {
     managers.push(manager);
     const result = await manager.run({ task: "Use the default model", transport: "process" });
     expect(result.status).toBe("completed");
-    expect(result.model).toBe("claude-sonnet-4-5");
+    expect(result.model).toBe("provider/default");
   });
 
   it("lets a per-call model override the configured default", async () => {
@@ -3091,8 +3516,18 @@ describe("AgentManager multimodal prompts", () => {
 
 describe("AgentManager Claude runner", () => {
   const fakeClaude = path.resolve("tests/fixtures/fake-claude.mjs");
+  // Every constructor in this native-only block binds to the stable ROOT fixture,
+  // pins a known catalog selector, and still executes the real manager/admission.
+  const NativeAgentManager = ProductionAgentManager;
+  const AgentManager = class extends NativeAgentManager {
+    constructor(cwd: string, config: ConstructorParameters<typeof NativeAgentManager>[1], options: ConstructorParameters<typeof NativeAgentManager>[2]) {
+      super(cwd, { ...config, claude: { ...config.claude, model: config.claude.model ?? "claude/haiku" } }, {
+        rootSessionCwd: () => boundRootRecord.cwd, claudeBinary: fakeClaude, ...options,
+      });
+    }
+  };
 
-  it("uses the independent configured Claude runner and model defaults", async () => {
+  it.runIf(hasPosixTrustMetadata)("uses the independent configured Claude runner and model defaults", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-"));
     roots.push(root);
     const config = {
@@ -3107,15 +3542,15 @@ describe("AgentManager Claude runner", () => {
     });
     managers.push(manager);
 
-    const result = await manager.run({ task: "Use Claude defaults", transport: "process" });
+    const result = await manager.run({ task: "Use Claude defaults", modelReason: "Named Claude default compatibility probe #11864", transport: "process" });
     expect(result).toMatchObject({
       status: "completed",
       runner: "claude",
-      model: "claude/haiku",
+      model: "claude-haiku-test",
     });
   });
 
-  it("runs Claude stream-json with mapped tools, native schema output, and usage", async () => {
+  it.runIf(hasPosixTrustMetadata)("runs Claude stream-json with mapped tools, native schema output, and usage", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-"));
     roots.push(root);
     const invocationLog = path.join(root, "claude-args.jsonl");
@@ -3132,6 +3567,7 @@ describe("AgentManager Claude runner", () => {
         runner: "claude",
         transport: "process",
         model: "claude/haiku",
+        modelReason: "Named Claude stream-json compatibility probe #11864",
         thinking: "minimal",
         tools: ["read", "grep", "find", "ls"],
         schema: {
@@ -3145,7 +3581,7 @@ describe("AgentManager Claude runner", () => {
       expect(result).toMatchObject({
         status: "completed",
         runner: "claude",
-        model: "claude/haiku",
+        model: "claude-haiku-test",
         thinking: "minimal",
         turns: 2,
         toolCalls: 1,
@@ -3153,13 +3589,20 @@ describe("AgentManager Claude runner", () => {
         runnerSessionId: "11111111-1111-4111-8111-111111111111",
         usage: { input: 10, output: 7, cacheRead: 2, cacheWrite: 3, cost: 0.001 },
       });
-      const invocation = JSON.parse(fs.readFileSync(invocationLog, "utf8").trim()) as {
+      const invocations = fs.readFileSync(invocationLog, "utf8").trim().split("\n").map(line => JSON.parse(line) as {
         argv: string[];
-      };
+      });
+      // Admission discovers the native catalog before launching the task.
+      expect(invocations).toHaveLength(2);
+      expect(invocations[0]!.argv).toEqual(expect.arrayContaining([
+        "--input-format", "stream-json", "--output-format", "stream-json", "--tools", "",
+      ]));
+      expect(invocations[0]!.argv).not.toContain("--help");
+      const invocation = invocations[1]!;
       expect(invocation.argv).toEqual(
         expect.arrayContaining([
           "--model",
-          "haiku",
+          "claude-haiku-test",
           "--effort",
           "low",
           "--tools",
@@ -3175,7 +3618,7 @@ describe("AgentManager Claude runner", () => {
     }
   });
 
-  it("preserves Claude result diagnostics on a failed run", async () => {
+  it.runIf(hasPosixTrustMetadata)("preserves Claude result diagnostics on a failed run", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
@@ -3188,6 +3631,7 @@ describe("AgentManager Claude runner", () => {
     const result = await manager.run({
       task: "CLAUDE_FAIL",
       runner: "claude",
+      modelReason: "Named Claude failure diagnostic probe #11864",
       transport: "process",
       tools: ["read"],
     });
@@ -3199,7 +3643,7 @@ describe("AgentManager Claude runner", () => {
     });
   });
 
-  it("delivers Claude steering and follow-up messages on later turns", async () => {
+  it.runIf(hasPosixTrustMetadata)("delivers Claude steering and follow-up messages on later turns", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-claude-"));
     roots.push(root);
     const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
@@ -3212,6 +3656,7 @@ describe("AgentManager Claude runner", () => {
     const handle = await manager.spawn({
       task: "Initial Claude task",
       runner: "claude",
+      modelReason: "Named Claude steering compatibility probe #11864",
       transport: "process",
       tools: ["read"],
     });
@@ -3508,19 +3953,21 @@ describe("AgentManager steering", () => {
     expect(() => manager.compact(result.id)).toThrow(/already finished/);
   });
 
-  it("compact rejects claude-runner children with a clear error", async () => {
+  it("compact rejects non-Pi runner children with a clear error", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-compact-"));
     roots.push(root);
-    const fakeClaude = path.resolve("tests/fixtures/fake-claude.mjs");
-    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
-      workerPath: path.resolve("src/worker.ts"),
-      claudeBinary: fakeClaude,
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents,
+      veda: { ...DEFAULT_FABRIC_CONFIG.agents.veda, backend: "pi" },
+    }, {
+      rootSessionCwd: () => boundRootRecord.cwd,
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
       runRoot: root,
     });
     managers.push(manager);
     const handle = await manager.spawn({
-      task: "Initial Claude task",
-      runner: "claude",
+      task: "Initial Veda task",
+      runner: "veda",
+      model: "cliproxyapi/gpt-6.1-sol",
       transport: "process",
       tools: ["read"],
     });

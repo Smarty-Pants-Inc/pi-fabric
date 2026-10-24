@@ -29,7 +29,8 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTimeout, MeshLockTimeoutError,
+  MESH_STATE_WAL_CAP_CODE, isMeshStateWalCap } from "../core/atomic-write.js";
 import type { MeshIdentity } from "./event-log.js";
 import { isMeshStateBackendKind, MESH_STATE_BACKEND_KIND_LIST, type MeshStateBackendKind } from "./state-backend-kinds.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
@@ -320,10 +321,8 @@ export const isSqliteBusy = (error: unknown): boolean => {
 };
 const sqliteBusy = isSqliteBusy;
 
-/** `MeshStateWalCapError` (state-sqlite.ts) by its code: a write refused while a pinned reader holds the WAL above the cap. */
-export const MESH_STATE_WAL_CAP_CODE = "FABRIC_MESH_STATE_WAL_CAP";
-export const isMeshStateWalCap = (error: unknown): boolean =>
-  error instanceof Error && (error as { code?: unknown }).code === MESH_STATE_WAL_CAP_CODE;
+/** Keep the historic state-backend exports while sharing the predicate with atomic-write.ts. */
+export { MESH_STATE_WAL_CAP_CODE, isMeshStateWalCap };
 
 /**
  * A refusal a caller retries (smarty-dev#6477): pending process identity, snapshot validation exhaustion,
@@ -350,14 +349,6 @@ const READ_BUSY_BUDGET_MS = 15;
 // Only for the first synchronous read of a process: one database open, bounded the same way.
 const OPEN_BUSY_BUDGET_MS = 40;
 const busyHandlerMs = (options: SqliteStateStoreOptions): number => Math.max(0, Math.min(5, Math.floor(options.busyTimeoutMs ?? 2)));
-// smarty-dev#9805: a bounded try of at least BOUNDED_WAIT_FLOOR_MS (the 2 s routing refresh before a send) waits for
-// the state write lock for at least BOUNDED_WAIT_MS, so one burst-long writer (2-3 s) no longer fails the caller.
-// Shorter tries (zero-wait, the 50 ms registry-fenced publication) still fail fast by design. ponytail: a longer
-// wait inside the same awaited acquisition, not a retry: the body runs at most once and the waiter keeps its FIFO place.
-const BOUNDED_WAIT_FLOOR_MS = 1_000;
-const BOUNDED_WAIT_MS = 6_000;
-const boundedWaitMs = (timeoutMs: number): number =>
-  timeoutMs >= BOUNDED_WAIT_FLOOR_MS ? Math.max(timeoutMs, BOUNDED_WAIT_MS) : timeoutMs;
 
 /**
  * Retries a synchronous busy `attempt` until `budgetMs` of wall time (monotonic clock) would be exceeded.
@@ -761,9 +752,9 @@ export class SqliteStateBackend implements StateBackend {
       const bracket = fileRead ? bracketFileRead(fileRead) : undefined;
       const userPrepare = input.prepare;
       let claimsTouched = input.ops.some(op => op.key.startsWith("factory/review-slots/v1/"));
-      const prepare = fileRead || userPrepare ? (view: MeshBatchView): MeshBatchOperation[] => {
+      const prepare = fileRead || userPrepare ? (view: MeshBatchView, preparedFileRead = bracket?.value): MeshBatchOperation[] => {
         if (fileRead && (!bracket || fileRead.stamp() !== bracket.stamp)) throw FILE_READ_CHANGED;
-        const prepared = userPrepare?.(view, bracket?.value) ?? [];
+        const prepared = userPrepare?.(view, preparedFileRead) ?? [];
         claimsTouched ||= prepared.some(op => op.key.startsWith("factory/review-slots/v1/"));
         return prepared;
       } : undefined;
@@ -972,10 +963,9 @@ export class SqliteStateBackend implements StateBackend {
   async #write<T>(operation: (store: SqliteStateStore) => Promise<T>): Promise<T> {
     const started = performance.now();
     const scope = this.#context.lock.tryLockScope.getStore();
-    // A bounded try spends ONE budget on the whole write: first open included (review round 1). A try of 1 s or
-    // more gets at least BOUNDED_WAIT_MS of it (smarty-dev#9805).
+    // A bounded try spends ONE caller budget on the whole write, first open included.
     const deadline = scope?.active
-      ? started + Math.max(0, Math.min(boundedWaitMs(scope.timeoutMs), this.#storeOptions.lockTimeoutMs ?? Number.POSITIVE_INFINITY))
+      ? started + Math.max(0, Math.min(scope.timeoutMs, this.#storeOptions.lockTimeoutMs ?? Number.POSITIVE_INFINITY))
       : undefined;
     let store: SqliteStateStore | undefined;
     try {

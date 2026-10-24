@@ -617,7 +617,11 @@ describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
 });
 
 describe("state gate wiring on win32 (smarty-dev#8920)", () => {
-  afterEach(() => { vi.restoreAllMocks(); vi.doUnmock("../src/mesh/windows-state-acl.js"); vi.resetModules(); });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.doUnmock("../src/mesh/windows-state-acl.js"); vi.resetModules(); });
+  // ACL findings warn by default. Tests of the enforced refusal/creation sequence opt in explicitly, per test.
+  const ENFORCE = "PI_FABRIC_MESH_STATE_ACL_ENFORCE";
+  const ADVISORY = "FABRIC_MESH_STATE_ACL_ADVISORY";
+  const enforceAcl = () => vi.stubEnv(ENFORCE, "1");
 
   const asWindows = async <T>(run: () => Promise<T>): Promise<T> => {
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
@@ -639,6 +643,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   const tmp = () => fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "winacl-"));
 
   it("refuses a proven foreign writer with FABRIC_MESH_STATE_UNSUPPORTED", async () => {
+    enforceAcl();
     const { gate } = await loadGate("C:\\x grants S-1-1-0 write");
     const root = tmp();
     await asWindows(async () => {
@@ -647,6 +652,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   });
 
   it("protects only a root it created, with the state files and flag directory in its read", async () => {
+    enforceAcl(); // creation-parent preflight and protect run only under enforcement
     const { gate, calls } = await loadGate(undefined);
     const root = path.join(tmp(), "mesh");
     await asWindows(async () => {
@@ -662,6 +668,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   // Decision C: this wiring seam deliberately does not cache. The real reader's identity-only process cache is
   // covered by mesh-state-windows-acl-cache.test.ts; here each gate call must still delegate its complete request.
   it("delegates successive root checks to the proof layer and propagates its refusal", async () => {
+    enforceAcl();
     const { gate, calls } = await loadGate(undefined, [undefined, "C:\\x grants S-1-1-0 write"]);
     const root = tmp();
     await asWindows(async () => {
@@ -674,6 +681,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   // F1: raiseCheckpointFlag calls the exported assertPrivatePath on its own, outside any open; a flag directory
   // another user may write must refuse there, not only inside the open's batched read.
   it("exported assertPrivatePath reads the native ACL: a foreign-writable flag directory refuses, nothing is written", async () => {
+    enforceAcl();
     const { gate, calls } = await loadGate("state-checkpoint.flags grants S-1-5-32-545 write");
     const sqlite = await import("../src/mesh/state-sqlite.js");
     const root = tmp();
@@ -734,6 +742,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
 
   // Decision C wiring: only positively observed absence may skip the full proof, not an indeterminate lstat.
   it("admitExistingStateRoot uses full native proof for an unreadable DB lstat, preserving safe/refused verdicts", async () => {
+    enforceAcl();
     const why = "state.db has an unreadable Windows security descriptor (recorded descriptor denial)";
     const { gate, calls } = await loadGate(undefined, [undefined, why]);
     const root = tmp();
@@ -787,6 +796,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   });
 
   it("runs a Windows create inside the gate with a post-create native recheck; a refused root gets no state.db", async () => {
+    enforceAcl();
     const order: string[] = [];
     const { gate, calls } = await loadGate(undefined);
     const root = tmp();
@@ -809,6 +819,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   });
 
   it("refuses a database planted after the first snapshot, including an EEXIST create winner", async () => {
+    enforceAcl();
     const planted = "state.db was created after the ACL snapshot and has an untrusted owner";
     const { gate, calls } = await loadGate(undefined, [undefined, planted]);
     const root = tmp();
@@ -827,6 +838,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   });
 
   it("delegates admission and open through the complete root plan, sync and async (fake reader has no cache)", async () => {
+    enforceAcl(); // exact delegation counts of the enforced creation path (default adds an advisory root read)
     const { calls } = await loadGate(undefined);
     const { SqliteStateStore } = await import("../src/mesh/state-sqlite.js");
     const root = tmp();
@@ -845,6 +857,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   // F1 recorded creation counterexample: a missing root through a junction used to mutate the target before
   // refusing. Exercise both public entrypoints, including their BEFORE-fence create path, on a real link fixture.
   it.each(["create", "detached"] as const)("public sync/async opens refuse a missing root below a junction before any mutation (%s)", async initialize => {
+    enforceAcl(); // the volume-down lexical creation walk is enforcement-only
     const { calls } = await loadGate(undefined);
     const { SqliteStateStore } = await import("../src/mesh/state-sqlite.js");
     const base = tmp();
@@ -867,6 +880,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   });
 
   it("public new-root opens refuse a failed setter before the fence or state.db creation", async () => {
+    enforceAcl();
     const why = "new root was created but its private ACL could not be set (native ACL reader failed: ENOENT)";
     const { calls } = await loadGate(undefined, [undefined, why, undefined, why]);
     const { SqliteStateStore } = await import("../src/mesh/state-sqlite.js");
@@ -886,6 +900,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   });
 
   it.each(["is a reparse point", "grants S-1-1-0 write"])("refuses a native ancestor preflight that %s before any mkdir or protect", async why => {
+    enforceAcl();
     const { gate, calls } = await loadGate(why);
     const base = tmp();
     const root = path.join(base, "new", "mesh");
@@ -897,6 +912,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   });
 
   it("creates a missing ordinary parent chain non-recursively, checking each new parent before using it", async () => {
+    enforceAcl();
     const { gate, calls } = await loadGate(undefined);
     const base = tmp();
     const parent = path.join(base, "new");
@@ -911,6 +927,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   });
 
   it("refuses a newly created parent whose inherited ACL is unsafe before creating its child", async () => {
+    enforceAcl();
     const { gate, calls } = await loadGate(undefined, [undefined, "new parent grants S-1-1-0 write"]);
     const base = tmp();
     const root = path.join(base, "new", "mesh");
@@ -920,6 +937,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   });
 
   it("rechecks a created parent before continuing if it is replaced by a junction", async () => {
+    enforceAcl();
     const { gate, calls } = await loadGate(undefined);
     const base = tmp();
     const target = path.join(base, "target");
@@ -945,6 +963,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
 
   // EEXIST at either boundary is someone else's directory, never our permission to protect, repair or adopt it.
   it.each(["parent", "root"])("never adopts or protects an EEXIST winner at the %s boundary", async winner => {
+    enforceAcl();
     const { gate, calls } = await loadGate(undefined);
     const root = path.join(tmp(), "missing-parent", "mesh");
     const parent = path.dirname(root);
@@ -959,5 +978,223 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     expect(made).toEqual(winner === "root" ? [[parent, false], [root, false]] : [[parent, false]]);
     expect(calls.map(call => call.protect)).toEqual(winner === "root" ? [false, false] : [false]);
     expect(fs.readdirSync(winner === "root" ? root : parent)).toEqual([]);
+  });
+
+  // Warn-by-default, exact opt-in, tested switch back. One gate module instance per test: the setting is read at
+  // each call, never captured at import. The recorded reader verdicts stay unsafe throughout; only the setting moves.
+  const advisoriesOf = (warn: { mock: { calls: unknown[][] } }) => warn.mock.calls
+    .filter(([, options]) => (options as { code?: string } | undefined)?.code === ADVISORY)
+    .map(([message]) => String(message));
+  const quietWarnings = () => vi.spyOn(process, "emitWarning").mockImplementation(() => undefined);
+  const loadGateBy = async (judge: (input: WindowsStateAclRequest) => string | undefined) => {
+    const calls: WindowsStateAclRequest[] = [];
+    vi.resetModules();
+    vi.doMock("../src/mesh/windows-state-acl.js", () => ({
+      windowsStateAclRefusal: (input: WindowsStateAclRequest) => { calls.push(input); return judge(input); },
+    }));
+    return { gate: await import("../src/mesh/state-gate.js"), calls };
+  };
+
+  it("default warns and startup reaches the actual opener; ENFORCE=1 refuses in the same process; unset and 0 restore startup", async () => {
+    const finding = "C:\\x grants S-1-1-0 write, delete or permission rights (mask 0x1301bf)";
+    const { gate, calls } = await loadGate(finding);
+    const { SqliteStateStore } = await import("../src/mesh/state-sqlite.js");
+    const warn = quietWarnings();
+    const root = tmp();
+    const file = path.join(root, "state.db");
+    fs.writeFileSync(file, "");
+    const store = tmp();
+    const opened: string[] = [];
+    const startup = async () => {
+      SqliteStateStore.openSync(store, 1024, 16, { initialize: "detached" }).close();
+      (await SqliteStateStore.open(store, 1024, 16, { initialize: "detached" })).close();
+    };
+    const refusedStartup = async () => {
+      expect(() => SqliteStateStore.openSync(store, 1024, 16, { initialize: "detached" }))
+        .toThrow(expect.objectContaining({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringContaining(finding) }));
+      await expect(SqliteStateStore.open(store, 1024, 16, { initialize: "detached" })).rejects.toThrow(finding);
+    };
+    await asWindows(async () => {
+      vi.stubEnv(ENFORCE, undefined);
+      expect(process.env[ENFORCE]).toBeUndefined();
+      gate.openPrivateStateDb(file, opener(opened)).close();
+      expect(opened).toEqual([file]);
+      await startup();
+      expect(fs.existsSync(path.join(store, "state.db"))).toBe(true);
+      const first = advisoriesOf(warn);
+      expect(first).toHaveLength(2); // the first finding for each checked root, then deduped
+      expect(first.every(message => message.includes(finding) && message.includes(ENFORCE))).toBe(true);
+      expect(first.some(message => message.includes(root))).toBe(true);
+      expect(first.some(message => message.includes(store))).toBe(true);
+      const advisoryCalls = calls.length;
+
+      enforceAcl();
+      expect(() => gate.openPrivateStateDb(file, opener(opened)))
+        .toThrow(expect.objectContaining({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringContaining(finding) }));
+      expect(opened).toEqual([file]);
+      await refusedStartup();
+      expect(calls.length).toBeGreaterThan(advisoryCalls); // the enforced call consulted the proof layer again
+
+      for (const off of [undefined, "0"]) {
+        vi.stubEnv(ENFORCE, off);
+        gate.openPrivateStateDb(file, opener(opened)).close();
+        await startup();
+      }
+      expect(opened).toEqual([file, file, file]);
+      enforceAcl(); // the advisory opens changed nothing: on again still refuses
+      await refusedStartup();
+    });
+    expect(advisoriesOf(warn)).toHaveLength(2);
+  });
+
+  it("strict opt-in: only the exact value 1 refuses; 0, false, true, padded and empty values keep starting", async () => {
+    const finding = "C:\\x grants S-1-1-0 write";
+    const { gate } = await loadGate(finding);
+    quietWarnings();
+    const root = tmp();
+    const file = path.join(root, "state.db");
+    fs.writeFileSync(file, "");
+    const opened: string[] = [];
+    const values = ["0", "false", "true", "TRUE", "yes", "on", "enforce", " 1", "1 ", "01", "1.0", "+1", ""];
+    await asWindows(async () => {
+      for (const value of values) {
+        vi.stubEnv(ENFORCE, value);
+        expect(() => gate.openPrivateStateDb(file, opener(opened)).close(), JSON.stringify(value)).not.toThrow();
+      }
+      enforceAcl();
+      expect(() => gate.openPrivateStateDb(file, opener(opened))).toThrow(finding);
+    });
+    expect(opened).toHaveLength(values.length);
+  });
+
+  it("dedupe never authorizes an enforced open and never hides the first actual warning", async () => {
+    const finding = "C:\\x grants S-1-1-0 write";
+    const { gate } = await loadGate(finding);
+    const warn = quietWarnings();
+    const root = tmp();
+    await asWindows(async () => {
+      enforceAcl(); // on first, in a fresh module
+      expect(() => gate.assertPrivateStateRoot(root)).toThrow(finding);
+      expect(advisoriesOf(warn)).toEqual([]);
+      vi.stubEnv(ENFORCE, undefined);
+      expect(() => gate.assertPrivateStateRoot(root)).not.toThrow();
+      expect(advisoriesOf(warn)).toEqual([expect.stringContaining(finding)]); // the refusal did not spend it
+      expect(() => gate.assertPrivateStateRoot(root)).not.toThrow();
+      expect(advisoriesOf(warn)).toHaveLength(1);
+      enforceAcl();
+      expect(() => gate.assertPrivateStateRoot(root)).toThrow(finding); // already warned, still refused
+      vi.stubEnv(ENFORCE, undefined);
+      const other = tmp();
+      expect(() => gate.assertPrivateStateRoot(other)).not.toThrow();
+      expect(advisoriesOf(warn)).toHaveLength(2);
+      expect(advisoriesOf(warn)[1]).toContain(other); // another root's first finding is not hidden
+    });
+  });
+
+  it("default new roots are not locked out by a foreign creation-parent grant or a failed ACL setter; ENFORCE=1 refuses both", async () => {
+    const parentGrant = "the immediate creation parent grants S-1-1-0 inheritable write rights";
+    const setterFailure = "new root was created but its private ACL could not be set (native ACL reader failed: ENOENT)";
+    let parentUnsafe = true;
+    const { gate, calls } = await loadGateBy(input => input.role === "creation-parent" && parentUnsafe ? parentGrant
+      : input.protect ? setterFailure : undefined);
+    const { SqliteStateStore } = await import("../src/mesh/state-sqlite.js");
+    quietWarnings();
+    const base = tmp();
+    const root = (name: string) => path.join(base, name, "nested", "mesh");
+    await asWindows(async () => {
+      vi.stubEnv(ENFORCE, undefined);
+      gate.createStateRoot(root("default"));
+      expect(fs.lstatSync(root("default")).isDirectory()).toBe(true);
+      SqliteStateStore.openSync(root("startup"), 1024, 16, { initialize: "create" }).close();
+      expect(fs.existsSync(path.join(root("startup"), "state.db"))).toBe(true);
+      expect(calls.filter(call => call.protect)).toEqual([]); // advisory startup never mutates ACLs
+
+      enforceAcl();
+      expect(() => gate.createStateRoot(root("parent"))).toThrow(parentGrant);
+      expect(fs.existsSync(path.join(base, "parent"))).toBe(false); // refused before any mkdir
+      parentUnsafe = false;
+      expect(() => gate.createStateRoot(root("setter"))).toThrow(setterFailure);
+      expect(fs.readdirSync(root("setter"))).toEqual([]);
+      expect(() => SqliteStateStore.openSync(root("refused"), 1024, 16, { initialize: "create" })).toThrow(setterFailure);
+      expect(fs.readdirSync(root("refused"))).toEqual([]);
+
+      parentUnsafe = true;
+      vi.stubEnv(ENFORCE, undefined);
+      SqliteStateStore.openSync(root("rollback"), 1024, 16, { initialize: "create" }).close();
+      expect(fs.existsSync(path.join(root("rollback"), "state.db"))).toBe(true);
+    });
+  });
+
+  it("default treats an unreadable snapshot and an unreadable real path as findings; ENFORCE=1 refuses them", async () => {
+    const snapshot = "C:\\x has an unreadable Windows ACL snapshot (not JSON)";
+    const { gate, calls } = await loadGate(snapshot);
+    const warn = quietWarnings();
+    const root = tmp();
+    const unreadableRoot = tmp();
+    await asWindows(async () => {
+      vi.stubEnv(ENFORCE, undefined);
+      expect(() => gate.assertPrivateStateRoot(root)).not.toThrow();
+      enforceAcl();
+      expect(() => gate.assertPrivateStateRoot(root)).toThrow(snapshot);
+      vi.stubEnv(ENFORCE, undefined);
+      const native = fs.realpathSync.native;
+      vi.spyOn(fs.realpathSync, "native").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+        if (String(file) === path.dirname(unreadableRoot)) throw Object.assign(new Error("recorded EACCES"), { code: "EACCES" });
+        return native(file, options as never);
+      }) as typeof fs.realpathSync.native);
+      const before = calls.length;
+      expect(() => gate.assertPrivateStateRoot(unreadableRoot)).not.toThrow();
+      enforceAcl();
+      expect(() => gate.assertPrivateStateRoot(unreadableRoot))
+        .toThrow(expect.objectContaining({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringContaining("real path is unreadable") }));
+      expect(calls.length).toBe(before); // no snapshot is judged for an unresolvable real chain
+    });
+    expect(advisoriesOf(warn)).toEqual([expect.stringContaining(snapshot), expect.stringContaining("real path is unreadable")]);
+  });
+
+  // The default is advisory for ACL evidence only. Filesystem, type/link and POSIX checks stay mandatory.
+  it("default keeps network-path, type, link and inode integrity refusals on win32", async () => {
+    const { gate } = await loadGate("C:\\x grants S-1-1-0 write");
+    quietWarnings();
+    const opened: string[] = [];
+    await asWindows(async () => {
+      vi.stubEnv(ENFORCE, undefined);
+      expect(() => gate.assertPrivateStateRoot("\\\\server\\share\\mesh")).toThrow(/needs a local filesystem: network path/);
+      const fileRoot = path.join(tmp(), "file");
+      fs.writeFileSync(fileRoot, "");
+      expect(() => gate.assertPrivateStateRoot(fileRoot)).toThrow(/is not a directory/);
+      const linked = tmp();
+      fs.writeFileSync(path.join(linked, "elsewhere.db"), "");
+      fs.symlinkSync(path.join(linked, "elsewhere.db"), path.join(linked, "state.db"));
+      expect(() => gate.openPrivateStateDb(path.join(linked, "state.db"), opener(opened))).toThrow(/is a symbolic link/);
+      const directory = tmp();
+      fs.mkdirSync(path.join(directory, "state.db"));
+      expect(() => gate.openPrivateStateDb(path.join(directory, "state.db"), opener(opened))).toThrow(/is not a regular file/);
+      const flags = path.join(tmp(), "state-checkpoint.flags");
+      fs.symlinkSync(tmp(), flags);
+      expect(() => gate.assertPrivatePath(flags, "directory")).toThrow(/is a symbolic link/);
+      expect(opened).toEqual([]);
+      const swapped = tmp();
+      const db = path.join(swapped, "state.db");
+      fs.writeFileSync(db, "");
+      let closed = 0;
+      expect(() => gate.openPrivateStateDb(db, file => {
+        opened.push(file);
+        fs.renameSync(db, path.join(swapped, "original.db"));
+        fs.writeFileSync(db, "replacement");
+        return { close: () => { closed += 1; } } as never;
+      })).toThrow(/replaced while opening/);
+      expect(opened).toEqual([db]);
+      expect(closed).toBe(1);
+    });
+  });
+
+  it.each([undefined, "0"])("POSIX privacy refusal is unchanged with the setting %s", async value => {
+    const { gate, calls } = await loadGate(undefined);
+    vi.stubEnv(ENFORCE, value);
+    const root = tmp();
+    fs.chmodSync(root, 0o777);
+    expect(() => gate.assertPrivateStateRoot(root)).toThrow(/group or other writable/);
+    expect(calls).toEqual([]);
   });
 });

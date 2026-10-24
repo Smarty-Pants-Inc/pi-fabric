@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { hostedOnly } from "../scripts/hosted-only.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -26,7 +27,7 @@ const entryArgs = (file: string, kind?: "f" | "d") => { const stat = fs.lstatSyn
 
 // Foreign-owner fixture helpers (smarty-dev#7858 / #4664): tests/helpers/windows-acl.ts, shared with smarty-dev#8920.
 
-describe.runIf(process.env.GITHUB_ACTIONS === "true" && process.platform === "win32")("Windows verified removal (smarty-dev#7858)", () => {
+describe.runIf(hostedOnly("Windows verified removal") && process.platform === "win32")("Windows verified removal (smarty-dev#7858)", () => {
   it("has the digest-verified helper in this build", () => {
     expect(windowsRemoveHelper()).toMatch(/fabric-win-remove\.exe$/);
   });

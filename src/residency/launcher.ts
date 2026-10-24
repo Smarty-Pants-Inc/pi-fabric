@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { childProcessEnvironment } from "../core/atomic-write.js";
+import { childProcessEnvironment, meshJournalAlarmLine, writeJsonAtomic } from "../core/atomic-write.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -8,9 +8,9 @@ import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import { observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
-import { watchResidentChild, type ResidentChildLifetime } from "./child-lifetime.js";
+import { watchResidentChild, type ResidentChildExit, type ResidentChildLifetime } from "./child-lifetime.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
-import { assertResidentWakeConfig, canonicalResidentWakeConfig, ResidentWakeConfigMismatch } from "./wake-index.js";
+import { assertResidentWakeConfig, canonicalResidentWakeConfig, retainedRoutesAt, ResidentWakeConfigMismatch } from "./wake-index.js";
 import { readWakeJson, residentOwnerLive, residentOwnerSleeping, residentSleepingPath, residentWakeRequestPath, residentWakeIntentLockPath, waitResidentChange, ResidentWakePending } from "./wake.js";
 import { FileLockBusy } from "./file-lock.js";
 import { lockFile } from "./file-lock.js";
@@ -265,8 +265,201 @@ export const pruneResidentChildLogs = (root: string, keep: string, now = Date.no
   } catch { /* diagnostics only; the next launch retries */ }
 };
 
+const RESIDENT_UNHOSTED_TOPIC = "fabric.alarm.resident-unhosted";
+const RESIDENT_UNHOSTED_AFTER_MS = 5 * 60_000;
+type UnhostedReason = "custody" | "wake-refused" | "child-exit" | "exit-0-unreceipted";
+interface UnhostedOutage {
+  format: 1; id: string; rootId: string; since: number; reason: UnhostedReason;
+  absentSince?: number; reportedReason?: UnhostedReason; recovered?: true;
+}
+const unhostedPath = (root: string): string => path.join(root, "resident-unhosted.json");
+const unhostedEpisodeId = (root: string, since: number): string =>
+  createHash("sha256").update(JSON.stringify([root, since])).digest("hex");
+const unhostedMonitors = new Map<string, { timer?: ReturnType<typeof setTimeout>; watcher?: fs.FSWatcher }>();
+const unhostedPublications = new Map<string, Promise<void>>();
+const stopUnhostedMonitor = (root: string): void => {
+  const monitor = unhostedMonitors.get(root);
+  if (monitor?.timer) clearTimeout(monitor.timer);
+  monitor?.watcher?.close();
+  unhostedMonitors.delete(root);
+};
+const unhostedDiagnostic = (root: string, error: unknown): void => {
+  console.warn(`[pi-fabric] ${RESIDENT_UNHOSTED_TOPIC} for ${root}: ${String(error).slice(0, 500)}`);
+};
+const unhostedConfig = (root: string): ResidentHostConfig | undefined => {
+  // A refused config still has the host's retained snapshot for diagnostics, never launch authority.
+  const routes = retainedRoutesAt(root);
+  return routes ? JSON.parse(routes.configJson) as ResidentHostConfig : readWakeJson<ResidentHostConfig>(path.join(root, "config.json"));
+};
+const unhostedActors = (root: string, config: ResidentHostConfig): number => {
+  if (!config.actorRoot) return retainedRoutesAt(root)?.actors.length ?? 0;
+  const roots = config.sessionActorRoot ? [config.actorRoot, config.sessionActorRoot]
+    : config.mesh?.actorScope === "session" ? [path.dirname(config.actorRoot), config.actorRoot]
+      : [config.actorRoot, path.join(config.actorRoot, config.sessionId)];
+  const ids = new Set<string>();
+  for (const directory of new Set(roots)) {
+    const registry = readWakeJson<{ actors?: Array<{ id?: string; rootId?: string; residency?: string; status?: string }> }>(path.join(directory, "actors.json"));
+    for (const actor of registry?.actors ?? []) {
+      if (typeof actor.id === "string" && actor.rootId === config.rootId && actor.residency === "durable" && actor.status !== "stopped") ids.add(actor.id);
+    }
+  }
+  return ids.size;
+};
+const readUnhosted = (root: string, config: ResidentHostConfig): UnhostedOutage | undefined => {
+  const value = readWakeJson<UnhostedOutage>(unhostedPath(root));
+  return value?.format === 1 && value.rootId === config.rootId && typeof value.id === "string" && Number.isFinite(value.since)
+    && ["custody", "wake-refused", "child-exit", "exit-0-unreceipted"].includes(value.reason) ? value : undefined;
+};
+const unhostedReason = (root: string, fallback: UnhostedReason): UnhostedReason => {
+  if (fs.existsSync(watchdogCustodyPath(root)) || handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(root)))) return "custody";
+  const failure = readWakeJson<{ format?: number; failedAt?: number; error?: string }>(path.join(root, "wake-failure.json"));
+  return failure?.format === 1 && Number.isFinite(failure.failedAt) && typeof failure.error === "string" ? "wake-refused" : fallback;
+};
+async function publishUnhosted(root: string, config: ResidentHostConfig, outage: UnhostedOutage, actorCount: number, state: "outage" | "recovered"): Promise<void> {
+  const hostId = `resident:${createHash("sha256").update(config.rootId).digest("hex").slice(0, 24)}`;
+  const episodeId = unhostedEpisodeId(root, outage.since);
+  const recoveryCurrent = (): boolean => {
+    const current = readUnhosted(root, config);
+    return !!current?.recovered && unhostedEpisodeId(root, current.since) === episodeId;
+  };
+  // A queued recovery cannot describe an episode that has since failed again or been replaced.
+  if (state === "recovered" && !recoveryCurrent()) return;
+  const data = { root: config.rootId, residency: root, actorCount, reason: outage.reason, since: outage.since, state, hostId, episodeId, advisory: true };
+  // Same fail-closed journal contract as mesh outages, even if mesh publication fails.
+  console.warn(meshJournalAlarmLine({ label: "resident unhosted", sinceMs: outage.since,
+    durationMs: Math.max(0, Date.now() - outage.since), topic: RESIDENT_UNHOSTED_TOPIC, ...data }));
+  try {
+    // Alarm-time only: neither MeshStore nor its transitive closure belongs in launcher startup.
+    const { MeshStore, meshAlarmRecipient, meshStateBackendFromMarker } = await import("../mesh.js");
+    // Preserve canonical session-target validation, with no ambient env fallback of either kind.
+    if (!meshAlarmRecipient({ SMARTY_LEAD_SESSION: config.rootId })) {
+      unhostedDiagnostic(root, "invalid root session alarm sink; stderr only"); return;
+    }
+    if (state === "recovered" && !recoveryCurrent()) return;
+    const mesh = new MeshStore(config.meshRoot, config.mesh?.maxEventBytes ?? 64 * 1024, config.mesh?.maxReadEvents ?? 100,
+      { lockProtocol: config.mesh?.lockProtocol, stateBackend: meshStateBackendFromMarker(config.meshRoot, config.mesh?.stateBackend),
+        canWakeResidents: () => false, lockTimeoutMs: 1_000 });
+    try {
+      // Diagnostic only: hostId is correlation, NOT sender authentication (smarty-dev#9641).
+      // No mesh event authorizes recovery or clears local outage/custody state.
+      // This alarm always belongs to the actor-owning root, independent of generic mesh-alarm env routing.
+      await mesh.publish({ topic: RESIDENT_UNHOSTED_TOPIC, to: config.rootId, kind: `resident-unhosted-${state}`,
+        from: { id: hostId, name: "Fabric resident launcher", kind: "agent" },
+        text: `Resident ${config.rootId} ${state}: ${actorCount} actors, ${outage.reason}`, data,
+        dedupeKey: `resident-unhosted:${episodeId}:${state}`, durable: true,
+        admit: () => {
+          // Also recheck after any asynchronous mesh-lock wait, before the append.
+          if (state === "recovered" && !recoveryCurrent()) throw new Error("Resident recovery episode superseded before publication");
+        } });
+    } finally { mesh.closeState(); }
+  } catch (error) { unhostedDiagnostic(root, error); }
+}
+const queueUnhosted = (root: string, config: ResidentHostConfig, outage: UnhostedOutage, actorCount: number, state: "outage" | "recovered"): void => {
+  const publication = (unhostedPublications.get(root) ?? Promise.resolve()).then(() => publishUnhosted(root, config, outage, actorCount, state));
+  unhostedPublications.set(root, publication);
+  void publication.finally(() => { if (unhostedPublications.get(root) === publication) unhostedPublications.delete(root); })
+    .catch(error => unhostedDiagnostic(root, error));
+};
+/** Native exits/refusals/custody changes own observation, never the supervisor's 50ms loop. */
+const residentUnhosted = (root: string, fallback: UnhostedReason, since = Date.now(), immediate = false): void => {
+  try {
+    if (residentOwnerLive(root)) return;
+    const config = unhostedConfig(root);
+    if (!config?.rootId || !config.meshRoot || !unhostedActors(root, config)) return;
+    const previous = readUnhosted(root, config);
+    const reason = unhostedReason(root, fallback);
+    const outage: UnhostedOutage = !previous || previous.recovered
+      ? { format: 1, id: unhostedEpisodeId(root, since), rootId: config.rootId, since, absentSince: since, reason }
+      : { ...previous, reason, absentSince: previous.absentSince ?? since,
+        since: previous.absentSince === undefined && previous.reportedReason === undefined ? since : previous.since };
+    if (JSON.stringify(previous) !== JSON.stringify(outage)) writeJsonAtomic(unhostedPath(root), outage);
+    // Legacy reportedReason records already spent this episode's one attempt, regardless of reason updates.
+    if (outage.reportedReason !== undefined) { stopUnhostedMonitor(root); return; }
+    if (previous?.recovered) stopUnhostedMonitor(root);
+    let monitor = unhostedMonitors.get(root);
+    if (!monitor) {
+      monitor = {}; unhostedMonitors.set(root, monitor);
+      try {
+        monitor.watcher = fs.watch(root, (_event, file) => {
+          if (!fs.existsSync(root)) { stopUnhostedMonitor(root); return; }
+          if (file === null || ["wake-failure.json", "watchdog-custody.json", "handover.json"].includes(String(file))) residentUnhosted(root, fallback);
+        });
+        monitor.watcher.on("error", error => unhostedDiagnostic(root, error));
+        monitor.watcher.unref();
+      } catch (error) { unhostedDiagnostic(root, error); }
+    }
+    const raise = (): void => {
+      try {
+        if (unhostedMonitors.get(root) !== monitor) return;
+        if (residentOwnerLive(root)) { stopUnhostedMonitor(root); return; }
+        const current = readUnhosted(root, config);
+        if (!current || current.recovered || current.absentSince === undefined) { stopUnhostedMonitor(root); return; }
+        if (!immediate && Date.now() - current.absentSince < RESIDENT_UNHOSTED_AFTER_MS) return;
+        const actorCount = unhostedActors(root, config);
+        const reason = unhostedReason(root, current.reason);
+        if (!actorCount || current.reportedReason !== undefined) { stopUnhostedMonitor(root); return; }
+        const claimed = { ...current, reason, reportedReason: reason };
+        // Best-effort notification: persist the attempt before publishing to suppress repeats across launchers.
+        // A failed sink is NOT delivery; publishUnhosted leaves the independent journal line and failure diagnostic.
+        writeJsonAtomic(unhostedPath(root), claimed);
+        stopUnhostedMonitor(root);
+        queueUnhosted(root, config, claimed, actorCount, "outage");
+      } catch (error) { unhostedDiagnostic(root, error); }
+    };
+    const remaining = outage.absentSince! + RESIDENT_UNHOSTED_AFTER_MS - Date.now();
+    if (immediate || remaining <= 0) raise();
+    else if (!monitor.timer) {
+      // ponytail: no outside event exists for "nothing happened for 5min". Reviewed exception:
+      // one referenced deadline while the launcher retains watchdog custody, no repeating timer or session wake.
+      // A returning launcher instead attempts and awaits the alarm immediately.
+      monitor.timer = setTimeout(() => { delete monitor!.timer; raise(); }, remaining);
+    }
+  } catch (error) { unhostedDiagnostic(root, error); }
+};
+const finishUnhosted = async (root: string, reason?: UnhostedReason): Promise<void> => {
+  if (reason) residentUnhosted(root, reason, Date.now(), true);
+  stopUnhostedMonitor(root);
+  await unhostedPublications.get(root)?.catch(error => unhostedDiagnostic(root, error));
+};
+const residentChildStarted = (root: string): void => {
+  stopUnhostedMonitor(root);
+  try {
+    if (!fs.existsSync(unhostedPath(root))) return;
+    const config = unhostedConfig(root);
+    const outage = config && readUnhosted(root, config);
+    if (outage && !outage.recovered && outage.absentSince !== undefined) writeJsonAtomic(unhostedPath(root), { ...outage, absentSince: undefined });
+  } catch (error) { unhostedDiagnostic(root, error); }
+};
+const residentChildReady = (root: string, config: ResidentHostConfig): void => {
+  stopUnhostedMonitor(root);
+  try {
+    const outage = readUnhosted(root, config);
+    if (!outage || outage.recovered) return;
+    writeJsonAtomic(unhostedPath(root), { ...outage, absentSince: undefined, recovered: true });
+    const actorCount = unhostedActors(root, config);
+    if (outage.reportedReason !== undefined) queueUnhosted(root, config, outage, actorCount, "recovered");
+  } catch (error) { unhostedDiagnostic(root, error); }
+};
+
 /** Timing injection is only for deterministic launcher tests; production uses fixed signal deadlines. */
-export async function supervise(configPath: string, options: { signal?: AbortSignal; reportWaitMs?: number; termMs?: number; killWaitMs?: number; proofRetryMs?: number; proofChecks?: number; wakeOnly?: boolean } = {}): Promise<void> {
+interface ResidentSuperviseOptions {
+  signal?: AbortSignal; reportWaitMs?: number; termMs?: number; killWaitMs?: number; proofRetryMs?: number; proofChecks?: number; wakeOnly?: boolean;
+}
+export async function supervise(configPath: string, options: ResidentSuperviseOptions = {}): Promise<void> {
+  const root = path.dirname(configPath);
+  try { await superviseResident(configPath, options); }
+  catch (error) {
+    let reason: UnhostedReason = options.wakeOnly ? "wake-refused" : "child-exit";
+    try {
+      const config = unhostedConfig(root);
+      const outage = config && readUnhosted(root, config);
+      if (outage && !outage.recovered) reason = outage.reason;
+    } catch { /* Preserve the original failure; the alarm path reports unavailable diagnostics. */ }
+    await finishUnhosted(root, reason);
+    throw error;
+  } finally { await finishUnhosted(root); }
+}
+async function superviseResident(configPath: string, options: ResidentSuperviseOptions): Promise<void> {
   const root = path.dirname(configPath);
   const launchTokenIndex = process.argv.indexOf("--launch-token");
   const launchToken = launchTokenIndex >= 0 ? process.argv[launchTokenIndex + 1] ?? "" : "";
@@ -280,11 +473,13 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   trace("launcher-started", { pid: process.pid, processStartTime: processStartTime(process.pid), configPath, platform: process.platform });
   try { assertNoWatchdogCustody(root); }
-  catch (error) { trace("watchdog-deferred", { reason: String(error).slice(0, 500) }); return; }
+  catch (error) { trace("watchdog-deferred", { reason: String(error).slice(0, 500) }); await finishUnhosted(root, "custody"); return; }
   if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(root)))) {
-    trace("launcher-deferred", { reason: "existing handover custody" }); return;
+    trace("launcher-deferred", { reason: "existing handover custody" }); await finishUnhosted(root, "custody"); return;
   }
-  const config = options.wakeOnly ? assertResidentWakeConfig(root) : readConfig(configPath);
+  let config: ResidentHostConfig;
+  try { config = options.wakeOnly ? assertResidentWakeConfig(root) : readConfig(configPath); }
+  catch (error) { await finishUnhosted(root, "wake-refused"); throw error; }
   if (readResidentIdleExit(root, config.rootId)) {
     trace("launcher-idle", { reason: "root dead, no actors; waiting for an explicit spawn request" });
     return;
@@ -307,11 +502,20 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   let stopping = false;
   const stop = (): void => {
     stopping = true;
+    stopUnhostedMonitor(root);
     const attempt = current;
     if (attempt) void stopAttempt(attempt).catch((error) => writeFailure(root, attempt.generation, error));
   };
   for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, stop);
   options.signal?.addEventListener("abort", stop, { once: true });
+  const childExitReason = (attempt: Attempt, exit: ResidentChildExit): UnhostedReason | undefined => {
+    if (exit.code !== 0 || exit.signal) return "child-exit";
+    const idleExit = readResidentIdleExit(root, (attempt.spec?.config ?? config).rootId);
+    // A short idle window can release before any owner sample. The chosen generation
+    // is already known; a receipt from another generation must never silence an exit.
+    return idleExit?.pid === attempt.child.pid && idleExit?.token === (attempt.ownerToken ?? attempt.generation)
+      ? undefined : "exit-0-unreceipted";
+  };
   const start = (spec?: ResidentLaunchSpec, plan?: ResidentHandoverPlan, kind?: "target" | "fallback", frozenConfigPath?: string): Attempt => {
     const launchConfig = spec?.config ?? config;
     if (options.wakeOnly) assertResidentWakeConfig(root, launchConfig);
@@ -355,6 +559,14 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
     pruneResidentChildLogs(root, logFile);
     const attempt: Attempt = { ...(spec ? { spec } : {}), child, native: watchResidentChild(child), generation,
       startedAt: Date.now(), logFile, seenOwner: false, claimedOwner: false, closingInput: false, processes: new Map(), stderr: "" };
+    child.on("message", (value: unknown) => {
+      const receipt = value as { event?: string; root?: string; token?: string } | null;
+      if (current !== attempt || attempt.native.exited || stopping || receipt?.event !== "resident-ready" || receipt.root !== root) return;
+      const owner = readOwner();
+      const maintenance = readWakeJson<{ token?: string }>(path.join(root, "maintenance-ready.json"));
+      if (owner && owner.pid === child.pid && owner.token === receipt.token && owner.readyAt > 0 && residentOwnerLive(root) && !residentOwnerSleeping(root) &&
+          owner.maintenanceReady === 1 && maintenance?.token === owner.token) residentChildReady(root, launchConfig);
+    });
     child.once("error", (error) => { trace("child-error", { message: error.message, kind }); writeFailure(root, attempt.generation, error); });
     if (process.connected && process.send) {
       // Report startup from this exact spawned host. Do not poll owner/readiness files.
@@ -373,6 +585,9 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
       });
     }
     void attempt.native.exit.then(({ code, signal }) => {
+      // An exact idle receipt is silent; otherwise retain the live-owner/custody guards.
+      const reason = childExitReason(attempt, { code, signal });
+      if (!stopping && reason) residentUnhosted(root, reason);
       // #2010: after an owned release this directory may already belong to the
       // next generation. Do not write its shared files (launcher.log)
       // then. An owned child's exit goes only to its own generation's record
@@ -383,13 +598,11 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
           reason: "unreported", pid: child.pid ?? 0, at: Date.now(), code, signal });
         return;
       }
-      // A very short configured idle window can release before our first owner sample.
-      const idleExit = readResidentIdleExit(root, launchConfig.rootId);
-      if (code === 0 && !signal && idleExit?.pid === child.pid &&
-          (!attempt.ownerToken || idleExit?.token === attempt.ownerToken)) return;
+      if (!reason) return;
       trace("child-exit", { pid: child.pid, code, signal, kind, seenOwner: attempt.seenOwner });
     });
     child.once("spawn", () => {
+      residentChildStarted(root);
       const birth = child.pid ? processStartTime(child.pid) : undefined;
       if (child.pid && birth) attempt.processes.set(child.pid, { pid: child.pid, processStartTime: birth, ppid: process.pid, state: "S" });
     });
@@ -478,6 +691,9 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
   };
   const recoverIfWedged = async (candidate: Attempt): Promise<void> => {
     const launchConfig = candidate.spec?.config ?? config;
+    // NATS wedge detection is OFF until 'NATS-mode resident watchdog: wedge detection from KV lease evidence'
+    // (smarty-dev issue filed, number pending); FILE lease bytes cannot authorize NATS watchdog custody.
+    if (launchConfig.mesh?.transport === "nats") return;
     const watchdog = launchConfig.watchdog;
     if (!watchdogSupported || watchdog?.enabled === false || candidate.watchdogGivenUp || Date.now() < nextWatchdogAt || candidate.native.exited) return;
     nextWatchdogAt = Date.now() + numberSetting(watchdog?.intervalMs, 30_000, 1);
@@ -551,11 +767,15 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
       const stopped = await terminateWedgedChild(candidate, options.termMs ?? 30_000, options.killWaitMs ?? 5_000, revalidate);
       if (!stopped && !candidate.native.exited) return;
       candidate.watchdogDeferred = { checks: 0, nextCheckAt: 0 };
+      residentUnhosted(root, "custody");
       retryExitProof(candidate);
     } catch (error) {
       trace("watchdog-deferred", { pid: candidate.child.pid, reason: String(error).slice(0, 500) });
       // A native exit still does not release custody of an uncertain attempt.
-      if (candidate.native.exited) candidate.watchdogDeferred ??= { checks: 0, nextCheckAt: 0 };
+      if (candidate.native.exited) {
+        candidate.watchdogDeferred ??= { checks: 0, nextCheckAt: 0 };
+        residentUnhosted(root, "custody");
+      }
     } finally { if (recoveryFd !== undefined) fs.closeSync(recoveryFd); }
   };
   try {
@@ -634,9 +854,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
       }
       const exit = await attempt.native.exit;
       if (stopping) { if (custodyFd !== undefined) fs.closeSync(custodyFd); return; }
-      const idleExit = readResidentIdleExit(root, config.rootId);
-      if (!plan && exit.code === 0 && !exit.signal && idleExit && idleExit.pid === attempt.child.pid &&
-          (!attempt.ownerToken || idleExit.token === attempt.ownerToken)) {
+      if (!plan && !childExitReason(attempt, exit)) {
         // The host has released this directory: another generation may already own it.
         // Like every other clean child exit, never make a late diagnostic mutation (#2010).
         process.exitCode = 0;
@@ -681,7 +899,7 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
               // Storage may be unreadable too. Keep the native handle without
               // consulting or rewriting transaction files until it exits.
               while (!attempt.native.exited && !stopping) { captureDescendants(attempt); await delay(50); }
-              await attempt.native.exit; process.exitCode = 1; return;
+              await attempt.native.exit; process.exitCode = 1; await finishUnhosted(root, "custody"); return;
             }
             failure = error;
             if (targetAttempted) {
@@ -710,21 +928,27 @@ export async function supervise(configPath: string, options: { signal?: AbortSig
             reason: error instanceof Error ? error.message : String(error) });
           if (custodyFd !== undefined) { fs.closeSync(custodyFd); custodyFd = undefined; }
           while (!attempt.native.exited && !stopping) { captureDescendants(attempt); await delay(50); }
-          await attempt.native.exit; process.exitCode = 1; return;
+          await attempt.native.exit; process.exitCode = 1; await finishUnhosted(root, "custody"); return;
         }
         // Unknown fence/termination and failed fallback are explicit blocked
         // outcomes. No loop, and no fabricated service success.
         await stopAttempt(attempt).catch(() => undefined);
         try { writeHandoverState(root, plan, "blocked", error instanceof Error ? error.message : String(error)); } catch { /* custody retained */ }
-        writeFailure(root, attempt.generation, error); process.exitCode = 1; return;
+        writeFailure(root, attempt.generation, error); process.exitCode = 1; await finishUnhosted(root, "custody"); return;
       } finally { if (custodyFd !== undefined) { try { fs.closeSync(custodyFd); } catch { /* closed on success */ } } }
     }
   } finally {
     // A native exit may precede completion of the already-started observed
     // cleanup. Always join it; never abandon a concurrent shutdown pass.
-    if (stopping && current) await stopAttempt(current);
-    for (const signal of ["SIGINT", "SIGTERM"] as const) process.off(signal, stop);
-    options.signal?.removeEventListener("abort", stop);
+    try { if (stopping && current) await stopAttempt(current); }
+    finally {
+      for (const signal of ["SIGINT", "SIGTERM"] as const) process.off(signal, stop);
+      options.signal?.removeEventListener("abort", stop);
+      const exit = current?.native.exited ? await current.native.exit : undefined;
+      // A live watchdog launcher owns its deferred deadline; a departing failed launcher cannot leave it behind.
+      // A clean idle exit must not create a late diagnostic writer.
+      await finishUnhosted(root, exit && current ? childExitReason(current, exit) : undefined);
+    }
   }
 }
 
@@ -776,13 +1000,20 @@ export async function superviseWake(configPath: string, run: (configPath: string
           // Deterministic test seam: a commit can happen right here, after equality was
           // observed. Its request writer cannot pass intent until lifetime custody is gone.
           await options.beforeFinalRelease?.();
+          if (process.exitCode) await finishUnhosted(root, "child-exit");
           fs.closeSync(fd); fd = undefined;
           return;
         }
       } finally { fs.closeSync(intent); }
       // Only a delivery crossing the host's final close boundary needs a successor.
     }
-  } finally { if (fd !== undefined) fs.closeSync(fd); }
+  } catch (error) {
+    await finishUnhosted(root, "wake-refused");
+    throw error;
+  } finally {
+    try { if (fd !== undefined) fs.closeSync(fd); }
+    finally { await finishUnhosted(root); }
+  }
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));

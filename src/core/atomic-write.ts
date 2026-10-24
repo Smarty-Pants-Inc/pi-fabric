@@ -11,6 +11,7 @@ export const bashProcessEnvironment = (environment: NodeJS.ProcessEnv = process.
     ? { PI_FABRIC_LANDLOCK_WRITES: environment.PI_FABRIC_LANDLOCK_WRITES } : {}),
 });
 import { retryDelayMs } from "./retry-backoff.js";
+import { diagnostics } from "./diagnostics.js";
 import { randomUUID } from "node:crypto";
 import childProcess from "node:child_process";
 import fs from "node:fs";
@@ -154,6 +155,8 @@ export interface AtomicWriteOptions {
   renameRetryDelayMs?: number;
   /** External ownership CAS after staging, immediately before EACH rename attempt. A throw leaves the target untouched. */
   beforeRename?: () => void;
+  /** Durable only: the post-rename directory barrier; default (and every other caller) syncDirectoryChain. */
+  syncDirectory?: (directory: string) => void;
 }
 
 const RETRYABLE_RENAME_CODES = new Set(["EPERM", "EACCES", "EEXIST", "EBUSY"]);
@@ -282,7 +285,7 @@ const namespaceSnapshot = (target: string, receipt?: Inode) => {
     const identity = typeof receipt?.ino === "bigint" ? fs.lstatSync(current, { bigint: true }) : endpoint;
     if (receipt && !sameInode(receipt, identity)) throw new Error("Session receipt inode changed during namespace confirmation");
     parents.push(endpoint.isDirectory() ? current : path.dirname(current));
-    return { entries, directories, parents };
+    return { entries, directories, parents, hasSymlinks: hops !== 0 };
 };
 
 /**
@@ -315,6 +318,19 @@ export const syncPathNamespaceDurable = (target: string, receipt: Inode | undefi
   syncPathNamespace(target, receipt);
 };
 
+/** The checked complete-namespace identity syncPathNamespace compares (not a durability receipt). */
+export const namespaceKey = (target: string, receipt?: Inode): string => JSON.stringify(namespaceSnapshot(target, receipt).entries);
+
+/** Read-only identity inspection using the SAME resolver as the full barrier. Not a durability receipt. */
+export const namespaceIdentitySnapshot = (target: string, receipt?: Inode) => {
+  const snapshot = namespaceSnapshot(target, receipt);
+  return Object.freeze({ key: JSON.stringify(snapshot.entries), hasSymlinks: snapshot.hasSymlinks,
+    directories: Object.freeze([...snapshot.directories].map(([directory, stat]) => Object.freeze({
+      directory, dev: stat.dev, ino: stat.ino, mode: stat.mode & fs.constants.S_IFMT,
+    }))),
+  });
+};
+
 export const syncPathNamespace = (target: string, receipt?: Inode): void => {
   const before = namespaceSnapshot(target, receipt);
   if (namespaceBarrierAvailable()) {
@@ -335,7 +351,7 @@ export const syncPathNamespace = (target: string, receipt?: Inode): void => {
       }
     }
   }
-  if (JSON.stringify(namespaceSnapshot(target, receipt).entries) !== JSON.stringify(before.entries)) {
+  if (namespaceKey(target, receipt) !== JSON.stringify(before.entries)) {
     throw new Error("Namespace changed during durability barriers");
   }
 };
@@ -355,7 +371,7 @@ export const syncPathNamespaceAsync = async (target: string, receipt: Inode): Pr
       } finally { await handle.close(); }
     }
   }
-  if (JSON.stringify(namespaceSnapshot(target, receipt).entries) !== JSON.stringify(before.entries)) {
+  if (namespaceKey(target, receipt) !== JSON.stringify(before.entries)) {
     throw new Error("Namespace changed during durability barriers");
   }
 };
@@ -455,7 +471,7 @@ export const writeFileAtomic = (
       });
     }
     renameAtomic(temporary, filePath, options);
-    if (options?.durable) syncDirectoryChain(directory);
+    if (options?.durable) (options.syncDirectory ?? syncDirectoryChain)(directory);
   } finally {
     // No-op right after a successful rename; removes the temp on failure.
     try { fs.rmSync(temporary, { force: true }); } finally { release(); }
@@ -740,11 +756,18 @@ export const isMeshSnapshotRetriesExhausted = (error: unknown): error is Error &
   error instanceof Error && "code" in error && error.code === MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE;
 
 /** A failed acquisition wrote nothing. Foreground callers must see this error, not a retry. */
+/** smarty-dev#10072: a gap between attempts this long means the waiter itself was not running (event-loop or paging stall). */
+export const MESH_LOCK_STALLED_GAP_MS = 1_000;
+
 export class MeshLockTimeoutError extends Error {
   readonly code = MESH_LOCK_TIMEOUT_CODE;
+  /** smarty-dev#10072: the waiter stalled (largest gap >= 1 s), so this timeout may not be contention; meters count it apart. */
+  readonly stalled: boolean;
   constructor(readonly holder: string, readonly attempts: number, readonly maxGapMs: number) {
-    super(`${MESH_LOCK_TIMEOUT_CODE}: Timed out waiting for the Fabric mesh lock${holder} after ${attempts} attempts, largest gap between attempts ${maxGapMs} ms`);
+    const stalled = maxGapMs >= MESH_LOCK_STALLED_GAP_MS;
+    super(`${MESH_LOCK_TIMEOUT_CODE}: Timed out waiting for the Fabric mesh lock${holder} after ${attempts} attempts, largest gap between attempts ${maxGapMs} ms${stalled ? `, waiter stalled ${maxGapMs} ms` : ""}`);
     this.name = "MeshLockTimeoutError";
+    this.stalled = stalled;
   }
 }
 
@@ -754,19 +777,31 @@ export class MeshLockTimeoutError extends Error {
  */
 export class MeshLockForeignHolderError extends MeshLockTimeoutError {
   readonly foreignCode: "FABRIC_MESH_LOCK_FOREIGN_HOLDER" | "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
-  /** The exact operator command that recovers this lock (pi-fabric#923: a stuck mesh lock stalls the fleet). */
+  /** Operator recovery command for valid owner metadata; malformed tokens remain non-operational placeholders. */
   readonly recovery: string;
   /** The same command as an argument vector: the safe form for a program to run. */
   readonly recoveryArgv: string[];
+  readonly holderNamespace: string;
+  readonly holderToken: string;
   constructor(holder: string, attempts: number, maxGapMs: number, readonly verdict: "foreign" | "unproven",
-    readonly holderNamespace: string, readonly lockPath = "", readonly holderToken = "") {
+    holderNamespace: unknown, readonly lockPath = "", holderToken: unknown = "") {
+    // Project disk metadata before retaining it or formatting any diagnostics. Keep this local: the namespace
+    // reader is optional/lazy, and these checks must not alter owner bytes or reclaim decisions.
+    const uuid = "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}";
+    const token = typeof holderToken === "string" && (holderToken.length === 32 || holderToken.length === 36) &&
+      new RegExp(`^(?:[0-9A-Fa-f]{32}|${uuid})$`).test(holderToken) ? holderToken : "invalid-token";
+    const namespace = holderNamespace === "" ? "" : typeof holderNamespace === "string" && holderNamespace.length <= 128 &&
+      new RegExp(`^(?:linux:(?:[0-9a-f]{32}|-):${uuid}:\\d+|darwin:(?:${uuid}|-):${uuid}:host|win32:${uuid}:\\d+:host)(?![\\s\\S])`).test(holderNamespace)
+        ? holderNamespace : "invalid-namespace";
     super(holder, attempts, maxGapMs);
+    this.holderNamespace = namespace;
+    this.holderToken = token;
     this.foreignCode = verdict === "foreign" ? "FABRIC_MESH_LOCK_FOREIGN_HOLDER" : "FABRIC_MESH_LOCK_UNPROVEN_HOLDER";
     const kind = path.basename(lockPath) === ".lock" ? "mesh" : "custody";
-    this.recoveryArgv = ["fabric-mesh-backend", "lock-recover", "--root", path.dirname(lockPath), "--lock", kind, "--holder", holderToken];
+    this.recoveryArgv = ["fabric-mesh-backend", "lock-recover", "--root", path.dirname(lockPath), "--lock", kind, "--holder", token];
     this.recovery = renderRecoveryCommand(this.recoveryArgv);
-    const where = verdict === "foreign" ? `another PID namespace (${holderNamespace})`
-      : holderNamespace ? `a PID namespace this process cannot prove (${holderNamespace})` : "no recorded PID namespace (a record from before protocol 3)";
+    const where = verdict === "foreign" ? `another PID namespace (${namespace})`
+      : namespace ? `a PID namespace this process cannot prove (${namespace})` : "no recorded PID namespace (a record from before protocol 3)";
     this.message = `${this.foreignCode}: ${this.message}; the holder of ${lockPath} is in ${where}, so it is never reclaimed on pid evidence. ` +
       `Recover it from inside the holder's namespace with: ${this.recovery} ; or, once the holder is STOPPED, add --unsafe-holder-stopped`;
     this.name = "MeshLockForeignHolderError";
@@ -791,19 +826,23 @@ export const alarmForeignHolder = (error: MeshLockForeignHolderError): void => {
   const key = `${error.lockPath}\n${error.holderToken}`;
   if (alarmedHolders.has(key)) return;
   alarmedHolders.add(key);
-  try { console.warn(`[pi-fabric] ALARM ${error.foreignCode}: ${error.message}`); } catch { /* an alarm never masks the refusal */ }
+  try { diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ALARM ${error.foreignCode}: ${error.message}`); } catch { /* an alarm never masks the refusal */ }
 };
 
 // Compatible with older stores and the bridge's deliberately narrow error wire.
 export const isMeshLockTimeout = (error: unknown): error is Error & { code: typeof MESH_LOCK_TIMEOUT_CODE } =>
   error instanceof Error && "code" in error && error.code === MESH_LOCK_TIMEOUT_CODE;
 
+/** Shared with state-backend.ts so the core deferred-write path does not import the storage backend. */
+export const MESH_STATE_WAL_CAP_CODE = "FABRIC_MESH_STATE_WAL_CAP";
+export const isMeshStateWalCap = (error: unknown): boolean =>
+  error instanceof Error && (error as { code?: unknown }).code === MESH_STATE_WAL_CAP_CODE;
+
 /** A write that wrote nothing and may succeed later: pending identity, snapshot validation exhaustion,
- * a lock timeout, or a SQLite WAL-cap refusal
- * (`FABRIC_MESH_STATE_WAL_CAP`, state-backend.ts isMeshStateWalCap; smarty-dev#7451 item 8). */
+ * a lock timeout, or a SQLite WAL-cap refusal (`FABRIC_MESH_STATE_WAL_CAP`; smarty-dev#7451 item 8). */
 export const isMeshWriteDeferred = (error: unknown): error is Error =>
   isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) || isMeshLockTimeout(error) ||
-  (error instanceof Error && (error as { code?: unknown }).code === "FABRIC_MESH_STATE_WAL_CAP");
+  isMeshStateWalCap(error);
 
 /** Best-effort protocol writes may swallow conflicts, but not retryable admission refusals.
  * Retain the historical name and the same refusals that previously carried the timeout code. */
@@ -891,19 +930,33 @@ const mirrorMeshJournalLine = (line: string): void => {
     child.stdin.end(`${line}\n`);
   } catch (error) { fail(error); }
 };
-const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLine>[0]): void => {
+export const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLine>[0]): void => {
   const line = meshJournalAlarmLine(alarm);
-  console.warn(line);
+  diagnostics.warn("src/core/atomic-write.ts", line);
   mirrorMeshJournalLine(line);
 };
 
-/** A log-safe description of a deferred write (pi-fabric#893 round 3). A WAL-cap refusal's message embeds the pinning
- * readers' pids and command lines, which can carry secrets: only its sizes and reader count are logged. */
+/** A log-safe description of a deferred write (pi-fabric#893 round 3). Only a typed WAL-cap refusal selects the
+ * numeric/count-only summary; ordinary errors and messages retain their own diagnostics. */
 export const meshDeferredSummary = (error: unknown): string => {
+  const details = error as { code?: unknown; message?: unknown } | null | undefined;
+  const code = details?.code;
+  if (isMeshStateWalCap(error)) {
+    const capped = error as { walBytes?: unknown; capBytes?: unknown; readerCount?: unknown };
+    const readers = typeof capped.readerCount === "number" && Number.isSafeInteger(capped.readerCount) && capped.readerCount >= 0
+      ? capped.readerCount : "unknown";
+    if (typeof capped.walBytes !== "number" || !Number.isFinite(capped.walBytes) || capped.walBytes < 0
+        || typeof capped.capBytes !== "number" || !Number.isFinite(capped.capBytes) || capped.capBytes <= 0) {
+      return `FABRIC_MESH_STATE_WAL_CAP (sizes not available); ${readers} WAL reader(s)`;
+    }
+    return `FABRIC_MESH_STATE_WAL_CAP: the SQLite WAL is ${String(capped.walBytes)} bytes, above the ${String(capped.capBytes)}-byte cap; `
+      + `${readers} WAL reader(s)`;
+  }
   if (isMeshIncarnationPending(error) || isMeshSnapshotRetriesExhausted(error) || isMeshLockTimeout(error)) return error.message;
-  const capped = error as { walBytes?: unknown; capBytes?: unknown; readerCount?: unknown };
-  return `FABRIC_MESH_STATE_WAL_CAP: the SQLite WAL is ${String(capped.walBytes)} bytes, above the ${String(capped.capBytes)}-byte cap; `
-    + `${typeof capped.readerCount === "number" ? capped.readerCount : "unknown"} WAL reader(s)`;
+  const message = error instanceof Error ? error.message
+    : typeof details?.message === "string" ? details.message : String(error);
+  const prefix = (typeof code === "string" && code.length > 0) || typeof code === "number" ? `${String(code)}: ` : "";
+  return `${prefix}${message}`;
 };
 
 type PendingAlarm = { alarm: MeshOutageAlarm; attempts: number; firstAt: number };
@@ -1042,7 +1095,7 @@ export class MeshBackgroundRetry {
     // Final summary: retries suppressed after the last line are reported once the window
     // has passed, so an outage that ends inside a window is not silently dropped. It takes
     // that window's single line; a later outage inside it is counted, not printed.
-    console.warn(`[pi-fabric] ${this.label}: ${this.#recoveryMessage} (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
+    diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ${this.label}: ${this.#recoveryMessage} (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
     this.#lastReportedAt = now;
     this.#suppressed = 0;
   }
@@ -1059,7 +1112,7 @@ export class MeshBackgroundRetry {
         return false;
       }
       this.#resetBackoff();
-      console.warn(`[pi-fabric] ${this.label}: background operation failed: ${message}`);
+      diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ${this.label}: background operation failed: ${message}`);
       return false;
     }
     this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
@@ -1087,7 +1140,7 @@ export class MeshBackgroundRetry {
     if (elapsedMs >= this.warningWindowMs) {
       const summary = this.#suppressed > 0
         ? ` (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
-      console.warn(`[pi-fabric] ${this.label}: ${refusal ?? (isMeshLockTimeout(error) ? "mesh lock timeout" : "mesh WAL cap")}; retrying in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
+      diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ${this.label}: ${refusal ?? (isMeshLockTimeout(error) ? "mesh lock timeout" : "mesh WAL cap")}; retrying in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
       this.#lastReportedAt = now;
       this.#suppressed = 0;
     } else {
@@ -1108,7 +1161,7 @@ export class MeshBackgroundRetry {
     }
     const summary = this.#failureSuppressed > 0
       ? ` (${this.#failureSuppressed} similar failures suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
-    console.warn(`[pi-fabric] ${this.label}: background operation failed: ${message}; retrying in ${this.#failureDelay} ms${summary}`);
+    diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ${this.label}: background operation failed: ${message}; retrying in ${this.#failureDelay} ms${summary}`);
     this.#failureMessage = message;
     this.#failureReportedAt = now;
     this.#failureSuppressed = 0;
@@ -1148,7 +1201,7 @@ export class MeshBackgroundQueue {
     // Bounded best-effort notifications. Durable protocol cursors are not stored here.
     if (this.#pending.length >= 1_000) {
       this.#failed = true;
-      console.warn("[pi-fabric] background mesh notification queue full; dropping newest notification");
+      diagnostics.warn("src/core/atomic-write.ts", "[pi-fabric] background mesh notification queue full; dropping newest notification");
       return Promise.resolve();
     }
     const admission = new Promise<void>(resolve => this.#pending.push({ operation, attempted: resolve }));

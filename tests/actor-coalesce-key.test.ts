@@ -3,9 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import type { AgentRunRequest, AgentRunResult } from "../src/agents/types.js";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { normalizeScope, senderStamp } from "../src/scope.js";
 
 const roots: string[] = [];
 const closers: Array<() => Promise<void>> = [];
@@ -17,14 +21,14 @@ afterEach(async () => {
 const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
 const from: MeshIdentity = { id: "session:forwarder", name: "forwarder", kind: "main", sessionId: "forwarder" };
 
-const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-coalesce-key-"))) => {
+const setup = (root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-coalesce-key-")), canConsumeMesh?: () => boolean) => {
   if (!roots.includes(root)) roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
   });
   const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
-    actorRoot: path.join(root, "actors"), persistent: true,
+    actorRoot: path.join(root, "actors"), persistent: true, ...(canConsumeMesh ? { canConsumeMesh } : {}),
   });
   closers.push(async () => { await actors.close(); await agents.close(); });
   return { root, mesh, agents, actors };
@@ -45,6 +49,177 @@ const runTasks = (root: string, actors: ActorManager, actorId: string) =>
     const file = runId ? path.join(root, "actors", actorId, "runs", runId, "task.txt") : undefined;
     return message.direction === "out" && file && fs.existsSync(file) ? [fs.readFileSync(file, "utf8")] : [];
   });
+
+// #6087 admission data safety: changing ingress subscriptions must not cancel
+// accepted mesh work, replace its owner claim, or resurrect finished work on restart.
+describe("actor setTopics", () => {
+  it("unsubscribes new mesh work without cancelling its running item or queued backlog, then resubscribes", async () => {
+    const { root, mesh, actors, agents } = setup();
+    const topic = "topics.work";
+    const actor = await actors.create({
+      name: "topics-worker", instructions: "Work.", topics: [topic],
+      responseMode: "text", coalesce: false, residency: "durable", dedupeKey: "data.key",
+    });
+    const release = path.join(root, "release-topics-worker");
+    const queue = () => fs.readdirSync(path.join(root, "actors", actor.id))
+      .filter(name => /^queue-.+\.json$/.test(name))
+      .map(name => ({ name, ...JSON.parse(fs.readFileSync(path.join(root, "actors", actor.id, name), "utf8")) }));
+    const claim = () => {
+      const row = new ActorRegistryStore(path.join(root, "actors")).snapshot().actors.find(row => row.id === actor.id)!;
+      return { rootId: row.rootId, residency: row.residency, adoptedAt: row.adoptedAt, adoptedFrom: row.adoptedFrom };
+    };
+    const completed = () => actors.messages(actor.id).filter(message => message.direction === "out" && !message.error);
+    const publish = (key: string) => mesh.publish({ topic, from, text: key, data: { key } });
+    try {
+      const first = await mesh.publish({ topic, from, text: "topics-first", data: { key: "first", fakeWorkerFinishGate: release } });
+      await waitFor(() => fs.existsSync(`${release}.entered`) && actors.status(actor.id).inFlightRun !== undefined);
+      const inFlight = actors.status(actor.id).inFlightRun!;
+      expect(agents.status(inFlight.id).status).toBe("running");
+      const second = await publish("topics-backlog-one");
+      const third = await publish("topics-backlog-two");
+      await waitFor(() => actors.status(actor.id).queued === 2);
+      const accepted = queue();
+      expect(accepted).toHaveLength(1);
+      expect(accepted[0].items.map((item: { payload: { id: string } }) => item.payload.id)).toEqual([first.id, second.id, third.id]);
+      const ownership = claim();
+
+      expect(await actors.setTopics(actor.id, [])).toMatchObject({ topics: [], status: "running", queued: 2 });
+      expect(actors.status(actor.id).inFlightRun).toMatchObject({ id: inFlight.id, startedAt: inFlight.startedAt });
+      expect(queue()).toEqual(accepted); // Same lineage file and item IDs, not a cancelled/recreated queue.
+      expect(claim()).toEqual(ownership);
+      const ignored = await publish("topics-ignored");
+      // A later addressed event is a positive monitor barrier: it must pass the
+      // ignored event before this receipt exists. No arbitrary negative sleep.
+      const direct = await mesh.publish({ topic: "topics.direct", to: actor.id, from, text: "topics-direct", data: { key: "direct" } });
+      await waitFor(() => queue().some(snapshot => snapshot.items.some((item: { payload: { id: string } }) => item.payload.id === direct.id)));
+      expect(actors.status(actor.id)).toMatchObject({ status: "running", queued: 3, topics: [] });
+      expect(queue()[0].items.map((item: { payload: { id: string } }) => item.payload.id)).toEqual([first.id, second.id, third.id, direct.id]);
+      expect(JSON.stringify(queue())).not.toContain(ignored.id);
+      expect(claim()).toEqual(ownership);
+      expect(completed()).toEqual([]);
+
+      fs.writeFileSync(release, "finish");
+      await waitFor(() => completed().length === 4 && actors.status(actor.id).status === "idle");
+      expect(actors.status(actor.id)).toMatchObject({ queued: 0, topics: [] });
+      expect(actors.status(actor.id).inFlightRun).toBeUndefined();
+      const tasks = runTasks(root, actors, actor.id);
+      for (const text of ["topics-first", "topics-backlog-one", "topics-backlog-two", "topics-direct"]) {
+        expect(tasks.filter(task => task.includes(text))).toHaveLength(1);
+      }
+      expect(tasks.some(task => task.includes("topics-ignored"))).toBe(false);
+      expect(new Set(completed().map(message => message.runId)).size).toBe(4);
+      expect(queue()[0].items).toEqual([]);
+      expect(queue()[0].processedKeys).toHaveLength(4);
+
+      expect((await actors.setTopics(actor.id, [topic, topic])).topics).toEqual([topic]);
+      await publish("topics-restored");
+      await waitFor(() => completed().length === 5 && actors.status(actor.id).status === "idle");
+      expect(runTasks(root, actors, actor.id).filter(task => task.includes("topics-restored"))).toHaveLength(1);
+      expect(claim()).toEqual(ownership);
+      expect(queue()[0].items).toEqual([]);
+      expect(queue()[0].processedKeys).toHaveLength(5);
+    } finally {
+      fs.writeFileSync(release, "finish");
+    }
+  }, 30_000);
+
+  // #1209 review P2: reconnect/log replacement must retain the admission boundary,
+  // not refresh subscriptions by moving the cursor or reconsidering accepted work.
+  it("delivers admitted old and new topic events once across a cutover and mesh reconnect", async () => {
+    let connected = true;
+    const { root, mesh, actors } = setup(undefined, () => connected);
+    const oldTopic = "topics.before-reconnect";
+    const newTopic = "topics.after-reconnect";
+    const actor = await actors.create({
+      name: "topics-reconnect", instructions: "Work.", topics: [oldTopic], coalesce: false,
+    });
+    const release = path.join(root, "release-topics-reconnect");
+    const queuedIds = () => fs.readdirSync(path.join(root, "actors", actor.id))
+      .filter(name => /^queue-.+\.json$/.test(name))
+      .flatMap(name => JSON.parse(fs.readFileSync(path.join(root, "actors", actor.id, name), "utf8"))
+        .items.map((item: { payload: { id: string } }) => item.payload.id));
+    const completed = () => actors.messages(actor.id).filter(message => message.direction === "out" && !message.error);
+    const publish = (topic: string, text: string) => mesh.publish({ topic, from, text });
+    try {
+      const a = await mesh.publish({ topic: oldTopic, from, text: "reconnect-event-A", data: { fakeWorkerFinishGate: release } });
+      await waitFor(() => fs.existsSync(`${release}.entered`) && actors.status(actor.id).inFlightRun !== undefined);
+      const inFlight = actors.status(actor.id).inFlightRun!;
+      expect(queuedIds()).toEqual([a.id]); // A matched and was durably admitted before the cutover.
+
+      connected = false; // Hold monitor admission while the hub's local projection reconnects.
+      expect((await actors.setTopics(actor.id, [newTopic])).topics).toEqual([newTopic]);
+      const removedDuringGap = await publish(oldTopic, "reconnect-removed-during-gap");
+      const b = await publish(newTopic, "reconnect-event-B");
+      expect(queuedIds()).toEqual([a.id]); // B is published, but not yet consumed.
+
+      // Same native-watch reconnect seam as actor-mesh-monitor.test.ts: atomically
+      // replace the projected log and generation, without restarting the manager.
+      const events = path.join(mesh.root, "events.jsonl");
+      fs.writeFileSync(`${events}.tmp`, fs.readFileSync(events));
+      fs.renameSync(`${events}.tmp`, events);
+      const generation = path.join(mesh.root, "generation");
+      fs.writeFileSync(`${generation}.tmp`, String(Number(fs.existsSync(generation) ? fs.readFileSync(generation, "utf8") : 0) + 1));
+      connected = true;
+      fs.renameSync(`${generation}.tmp`, generation); // A real watch edge wakes the existing monitor.
+      await waitFor(() => actors.status(actor.id).queued === 1);
+      expect(queuedIds()).toEqual([a.id, b.id]);
+      expect(actors.status(actor.id).inFlightRun).toMatchObject({ id: inFlight.id, startedAt: inFlight.startedAt });
+      expect(actors.status(actor.id).topics).toEqual([newTopic]);
+      expect(new ActorRegistryStore(path.join(root, "actors")).snapshot().actors.find(row => row.id === actor.id)?.topics).toEqual([newTopic]);
+
+      const removedAfterReconnect = await publish(oldTopic, "reconnect-removed-after-reconnect");
+      const c = await publish(newTopic, "reconnect-new-topic-still-live");
+      // Positive barrier: the monitor must pass both removed-topic events and B
+      // before admitting this addressed event; no negative timing assertion.
+      const barrier = await mesh.publish({ topic: "topics.reconnect-barrier", to: actor.id, from, text: "reconnect-direct-barrier" });
+      await waitFor(() => queuedIds().includes(barrier.id));
+      expect(queuedIds()).toEqual([a.id, b.id, c.id, barrier.id]);
+      expect(queuedIds()).not.toContain(removedDuringGap.id);
+      expect(queuedIds()).not.toContain(removedAfterReconnect.id);
+      expect(completed()).toEqual([]);
+
+      fs.writeFileSync(release, "finish");
+      await waitFor(() => completed().length >= 4 && actors.status(actor.id).status === "idle");
+      const tasks = runTasks(root, actors, actor.id);
+      expect(tasks).toHaveLength(4);
+      for (const text of ["reconnect-event-A", "reconnect-event-B", "reconnect-new-topic-still-live", "reconnect-direct-barrier"]) {
+        expect(tasks.filter(task => task.includes(text))).toHaveLength(1);
+      }
+      expect(tasks.some(task => task.includes("reconnect-removed-"))).toBe(false);
+      expect(new Set(completed().map(message => message.runId)).size).toBe(4);
+      expect(actors.status(actor.id)).toMatchObject({ topics: [newTopic], queued: 0 });
+      expect(queuedIds()).toEqual([]);
+    } finally {
+      connected = true;
+      fs.writeFileSync(release, "finish");
+    }
+  }, 30_000);
+
+  it.each([{ topics: [] }, { topics: ["topics.replacement"] }])("persists the replacement subscription $topics across restart without replaying completed work", async ({ topics }) => {
+    const first = setup();
+    const actor = await first.actors.create({ name: "topics-restart", instructions: "Work.", topics: ["topics.original"], coalesce: false });
+    await first.mesh.publish({ topic: "topics.original", from, text: "topics-before-restart" });
+    await waitFor(() => first.actors.status(actor.id).status === "idle" && first.actors.messages(actor.id).some(message => message.direction === "out" && !message.error));
+    await first.actors.setTopics(actor.id, topics);
+    await first.actors.close(); await first.agents.close(); closers.length = 0;
+    const second = setup(first.root);
+    expect(second.actors.status(actor.id).topics).toEqual(topics);
+    await second.mesh.publish({ topic: "topics.original", from, text: "topics-obsolete-after-restart" });
+    await second.mesh.publish({ topic: "topics.replacement", from, text: "topics-replacement-after-restart" });
+    // Direct addressing still works for an actor with no subscriptions and
+    // establishes that both preceding topic events have passed the monitor.
+    await second.mesh.publish({ topic: "topics.barrier", to: actor.id, from, text: "topics-restart-barrier" });
+    const expected = topics.length ? 3 : 2;
+    await waitFor(() => second.actors.messages(actor.id).filter(message => message.direction === "out" && !message.error).length >= expected && second.actors.status(actor.id).status === "idle");
+    const tasks = runTasks(first.root, second.actors, actor.id);
+    expect(tasks).toHaveLength(expected);
+    expect(tasks.filter(task => task.includes("topics-before-restart"))).toHaveLength(1);
+    expect(tasks.some(task => task.includes("topics-obsolete-after-restart"))).toBe(false);
+    expect(tasks.filter(task => task.includes("topics-replacement-after-restart"))).toHaveLength(topics.length ? 1 : 0);
+    expect(tasks.filter(task => task.includes("topics-restart-barrier"))).toHaveLength(1);
+    expect(second.actors.status(actor.id)).toMatchObject({ topics, queued: 0 });
+  }, 30_000);
+});
 
 // smarty-dev#705: a review actor queued every pull_request event (12 at once), although its role
 // reviews the current head only.
@@ -186,6 +361,95 @@ describe("actor coalesceKey for mesh events", () => {
     const tasks = runTasks(root, actors, actor.id).filter((task) => task.includes('"number":'));
     expect(tasks.map((task) => task.match(/rev-[a-z]+/)![0])).toEqual(["rev-b", "rev-x"]);   // PR 1 in its first place
   }, 30_000);
+
+  // Trust boundary: retroactive coalescing must carry the winning payload's authority,
+  // including after bootstrap. The reversed row also rejects an unconditional sender copy.
+  it.each([
+    { label: "older trusted then newer foreign", olderTrusted: true, reverse: false },
+    { label: "older foreign then newer trusted", olderTrusted: false, reverse: false },
+    { label: "newer foreign before an older trusted sequence", olderTrusted: true, reverse: true },
+  ])("$label retains the winning sender through restore and retroactive coalescing", async ({ olderTrusted, reverse }) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-coalesce-trust-"));
+    roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
+    });
+    const runs: AgentRunRequest[] = [];
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const run = vi.spyOn(agents, "run").mockImplementation(async (request, signal, onSpawned) => {
+      runs.push(request);
+      const id = `coalesce-trust-${runs.length}`;
+      onSpawned?.({ id, name: "recorded", status: "running", runner: "pi", transport: "process", cwd: process.cwd() });
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => reject(new Error("held coalescing test run aborted"));
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) abort();
+        void held.then(() => { signal?.removeEventListener("abort", abort); resolve(); });
+      });
+      return { id, name: "recorded", task: request.task, status: "completed", runner: "pi", transport: "process", cwd: process.cwd(),
+        startedAt: Date.now(), updatedAt: Date.now(), turns: 1, toolCalls: 0, inferenceStarted: true, text: "",
+        value: { action: "silent" }, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } } satisfies AgentRunResult;
+    });
+    let monitor!: ActorMeshMonitor;
+    const start = vi.spyOn(ActorMeshMonitor.prototype, "start").mockImplementation(function (this: ActorMeshMonitor) { monitor = this; });
+    const open = () => new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
+      actorRoot: path.join(root, "actors"), persistent: true, closeGraceMs: 1_000,
+      meshRetentionSweepPath: false, canConsumeMesh: () => false,
+    });
+    let actors = open();
+    closers.push(async () => {
+      release();
+      try { await actors.close(); await agents.close(); }
+      finally { run.mockRestore(); start.mockRestore(); }
+    });
+    const actor = await actors.create({ name: "trust-coalescer", instructions: "Inspect.", topics: ["coalesce.trust"], coalesce: false, batchWindowMs: 0 });
+    const dir = path.join(root, "actors", actor.id);
+    const queuedMesh = () => fs.readdirSync(dir).filter(name => /^queue-.+\.json$/.test(name)).flatMap(name =>
+      (JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")) as {
+        items: Array<{ source: string; payload: MeshEvent; sender?: ReturnType<typeof senderStamp> }>;
+      }).items.filter(item => item.source === "mesh:coalesce.trust"));
+    const trusted = senderStamp(undefined);
+    const foreign = senderStamp(normalizeScope({ principal: { id: "foreign-owner" }, grants: [{ resource: "mesh:coalesce.trust", actions: ["write"] }] }));
+    actors.tell(actor.id, "coalesce-blocker");
+    await waitFor(() => runs.length === 1);
+    const older = await mesh.publish({ topic: "coalesce.trust", from, sender: olderTrusted ? trusted : foreign, data: { key: "same", revision: "older" } });
+    const newer = await mesh.publish({ topic: "coalesce.trust", from, sender: olderTrusted ? foreign : trusted, data: { key: "same", revision: "newer" } });
+    expect(newer.sequence).toBeGreaterThan(older.sequence);
+    const admitted = reverse ? [newer, older] : [older, newer];
+    // Drive the real monitor admission callback, without a watcher/timing race.
+    for (const event of admitted) expect(monitor.callbacks.onEvent(event)).toBe(true);
+    expect(actors.status(actor.id).queued).toBe(2);
+    expect(queuedMesh().map(item => [item.payload, item.sender])).toEqual(admitted.map(event => [event, event.sender]));
+
+    await actors.close(); // Abort the blocker, leaving both accepted mesh items checkpointed.
+    actors = open();
+    await waitFor(() => runs.length === 2); // The restored blocker holds the queue again.
+    expect(actors.status(actor.id).queued).toBe(2);
+    expect(queuedMesh().map(item => [item.payload, item.sender])).toEqual(admitted.map(event => [event, event.sender]));
+    await actors.setCoalesceKey(actor.id, "key"); // Actual #mergeCoalesced, not enqueue replacement.
+    expect(actors.status(actor.id).queued).toBe(1);
+    const selected = queuedMesh();
+    expect(selected).toHaveLength(1);
+    expect(selected[0]!.payload).toEqual(newer);
+    release();
+    await waitFor(() => runs.length === 3 && actors.status(actor.id).status === "idle");
+    const task = runs[2]!.task;
+    const header = task.split("\n\n").find(part => part.startsWith("Fabric actor message from "))!;
+    const frame = JSON.parse(task.slice(task.lastIndexOf("\n\n") + 2)) as { source: string; payload: MeshEvent; untrusted?: true };
+    expect(frame.source).toBe("mesh:coalesce.trust");
+    expect(frame.payload).toEqual(newer);
+    expect(frame.payload.sender).toEqual(newer.sender);
+    if (olderTrusted) {
+      expect(header).toContain("UNTRUSTED input from a different or narrower principal");
+      expect(frame.untrusted).toBe(true);
+    } else {
+      expect(header).toBe("Fabric actor message from mesh:coalesce.trust:");
+      expect(frame).not.toHaveProperty("untrusted");
+    }
+    expect(selected[0]!.sender).toEqual(newer.sender);
+  });
 
   // A HANG run in flight is aborted by the ownership loss and retried first when ownership returns,
   // so PR 1's parked event cannot start, however the polls interleave (review/astra on #86: a

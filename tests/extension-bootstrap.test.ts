@@ -42,7 +42,7 @@ const fixture = (kernel = "typescript") => {
   } as unknown as ExtensionAPI;
   const context = {
     cwd, hasUI: false, isProjectTrusted: () => true,
-    sessionManager: { getSessionId: () => cwd, getBranch: () => [], getSessionFile: () => undefined },
+    sessionManager: { getSessionId: () => cwd, getBranch: () => [], getLeafEntry: () => undefined, getEntry: () => undefined, getSessionFile: () => undefined },
     ui: { setStatus: vi.fn(), notify: vi.fn() },
   } as unknown as ExtensionContext;
   const emit = async (name: string) => {

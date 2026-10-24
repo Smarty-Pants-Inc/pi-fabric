@@ -6,6 +6,7 @@ import type {
   SessionBeforeTreeEvent,
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { notifyDiagnostic } from "../core/diagnostics.js";
 import { acceptCompactionCut, acceptSummaryBounds } from "../verified/policy.js";
 import { calculateContextTokens, DEFAULT_COMPACTION_SETTINGS, estimateTokens } from "../core/token-math.js";
 import { applyContextEdits, buildSessionContext, sessionEntryToContextMessages } from "../core/session-context.js";
@@ -885,7 +886,7 @@ const notifyInstructionError = (
   error: CompactionInstructionDecodeError,
 ): void => {
   if (!context?.hasUI) return;
-  context.ui.notify(clipUtf8(`Fabric compaction rejected: ${error.code}: ${error.message}`, 512), "error");
+  notifyDiagnostic(context, "src/compaction/hook.ts", clipUtf8(`Fabric compaction rejected: ${error.code}: ${error.message}`, 512), "error");
 };
 
 export const handleFabricBeforeCompact = (

@@ -43,6 +43,12 @@ describe("native compiled actor activation-end result custody", () => {
     let handoffInferences = 0;
     const errors: unknown[] = [];
     const server = http.createServer((request, response) => {
+      // Served-model admission uses a bodyless discovery request before spawn.
+      if (request.method === "GET" && request.url === "/v1/models") {
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ object: "list", data: ["activation", "child"].map((id) => ({ id, object: "model" })) }));
+        return;
+      }
       let body = "";
       request.on("data", (data) => { body += data; });
       request.on("end", () => { void (async () => {
@@ -144,20 +150,29 @@ describe("native compiled actor activation-end result custody", () => {
     expect(saved).toMatchObject({ status: "completed", text: JSON.stringify(full), value: full,
       spawner: { id: actor.id, kind: "actor", runId: activation.id } });
     expect(store.pending().map(({ result }) => result.id)).toEqual(notify ? [childId] : []);
-    // retainRuns:false removes execution artifacts only after production close
-    // has joined custody. Nested artifacts belong to the enclosing run (upstream
-    // lineage), so the custody-checked cleanup of that run removes them. This
-    // proves shutdown ran; process exit alone cannot.
-    expect(path.dirname(saved.logFile!).startsWith(path.join(root, "runs", activation.id, "nested"))).toBe(true);
-    await agents.cleanup(activation.id);
-    expect(fs.existsSync(path.dirname(saved.logFile!))).toBe(false);
+    // This activation was launched directly while its owner was closed. Child
+    // result custody alone is not an archive receipt for the enclosing run: the
+    // old unconditional cleanup here deleted that run's unarchived raw traces.
+    const activationDirectory = path.join(root, "runs", activation.id);
+    const childDirectory = path.dirname(saved.logFile!);
+    expect(childDirectory.startsWith(path.join(activationDirectory, "nested"))).toBe(true);
+    await expect(agents.cleanup(activation.id)).rejects.toThrow("actor run receipt archive is pending");
+    expect(fs.existsSync(childDirectory)).toBe(true);
     const restarted = makeOwner();
     cleanups.push(() => restarted.close());
     await restarted.ask(actor.id, "next native activation after owner restart");
     await vi.waitFor(() => {
       expect(restarted.status(actor.id).status).toBe("idle");
+      expect(restarted.inFlightCount()).toBe(0);
       expect(handoffInferences).toBe(notify ? 1 : 0);
     }, { timeout: 30000 });
+    // The restarted owner discovers the pending activation and verifies its
+    // archive before cleanup can remove the source, including nested traces.
+    const archivedActivation = path.join(actor.logDir!, activation.id);
+    expect(fs.readFileSync(path.join(archivedActivation, "events.jsonl"), "utf8")).not.toBe("");
+    const archivedChild = path.join(archivedActivation, path.relative(activationDirectory, childDirectory));
+    expect(fs.readFileSync(path.join(archivedChild, "events.jsonl"), "utf8")).not.toBe("");
+    expect(fs.existsSync(activationDirectory)).toBe(false);
     expect(restarted.messages(actor.id).filter((message) => message.id === childId && message.direction === "in")).toHaveLength(notify ? 1 : 0);
     expect(fs.existsSync(store.resultFile(childId))).toBe(!notify);
     await restarted.close();

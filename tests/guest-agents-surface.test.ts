@@ -24,6 +24,43 @@ const names = (block: string, pattern: RegExp): Set<string> =>
 const IMPLEMENTED = AGENTS_ACTION_DESCRIPTORS.map((descriptor) => descriptor.name);
 
 describe("guest agents surface", () => {
+  // #6087 admission data safety / guest-host trust boundary: clearing topics
+  // must remain an explicit typed mutation, not lose [] or scope in transit.
+  it.each([false, true])("types setTopics replacements and rejects malformed subscriptions (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    const code = `const local = await agents.setTopics({ id: "reviewer", topics: [] });
+      const template = await agents.setTopics({ id: "template", scope: "global", topics: ["github.pulls"] });
+      const localTopics: string[] = local.topics;
+      const templateTopics: string[] = template.topics;
+      return { localTopics, templateTopics };`;
+    expect(typeCheckFabricCode(code, declarations, true).errors).toEqual([]);
+    for (const args of ['{ id: "reviewer" }', '{ id: "reviewer", topics: "github.pulls" }', '{ id: "reviewer", topics: [42] }']) {
+      expect(typeCheckFabricCode(`await agents.setTopics(${args});`, declarations, true).errors.length).toBeGreaterThan(0);
+    }
+    const descriptor = AGENTS_ACTION_DESCRIPTORS.find(action => action.name === "setTopics")!;
+    expect(descriptor.inputSchema).toMatchObject({ required: ["id", "topics"],
+      properties: { topics: { type: "array", items: { type: "string" } } } });
+  });
+
+  it("bridges empty local and non-empty global setTopics without dropping the scope or empty array", async () => {
+    const calls: Array<{ ref: string; args: unknown }> = [];
+    const result = await new QuickJsRuntime().execute(
+      `const local = await agents.setTopics({ id: "reviewer", topics: [] });
+       const template = await agents.setTopics({ id: "template", scope: "global", topics: ["github.pulls"] });
+       return { local, template };`,
+      async (ref, args) => {
+        calls.push({ ref, args });
+        return { id: (args as { id: string }).id, topics: (args as { topics: string[] }).topics };
+      },
+      { timeoutMs: 5_000, memoryLimitBytes: 32 * 1024 * 1024 },
+    );
+    expect(result.terminationReason).toBe("completed");
+    expect(calls).toEqual([
+      { ref: "agents.setTopics", args: { id: "reviewer", topics: [] } },
+      { ref: "agents.setTopics", args: { id: "template", scope: "global", topics: ["github.pulls"] } },
+    ]);
+    expect(result.value).toEqual({ local: { id: "reviewer", topics: [] }, template: { id: "template", topics: ["github.pulls"] } });
+  });
   it.each([false, true])("types exact slot claim and retry identity on create/import (fullCodeMode=%s)", fullCodeMode => {
     const declarations = guestTypeDeclarations(fullCodeMode);
     const code = `const slotClaim: FabricActorSlotClaim = { key: "factory/review-slots/v1/example/repo/1/base", ifVersion: 7 };
@@ -154,6 +191,22 @@ describe("guest agents surface", () => {
       .toEqual([expect.objectContaining({ message: expect.stringContaining("not assignable to type 'string'") })]);
   });
 
+  // F-001: preserve the served guest/host compatibility boundary, not a text snapshot.
+  it.each([false, true])("types same-key Main payloads and optional legacy replacement receipts (fullCodeMode=%s)", fullCodeMode => {
+    const calls = ["followUp", "tell", "steer"].flatMap(method => [1, 2].map(revision =>
+      `await agents.${method}({ id: "session:main", message: "original ${revision}", data: { ...data, revision: ${revision} } })`));
+    const code = `const data: FabricMessageData = { coalesceKey: "status" };
+      const receipts = [${calls.join(",\n")}];
+      return receipts.map(receipt => {
+        const omitted: Pick<typeof receipt, "coalesced" | "replacedMessageId"> = {};
+        const legacy: Pick<typeof receipt, "coalesced" | "replacedMessageId"> = { coalesced: true, replacedMessageId: "legacy-message" };
+        const coalesced: true | undefined = receipt.coalesced;
+        const replacedMessageId: string | undefined = receipt.replacedMessageId;
+        return { omitted, legacy, coalesced, replacedMessageId };
+      });`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+  });
+
   it.each([false, true])("types literal public message retry keys (fullCodeMode=%s)", fullCodeMode => {
     const code = `if (false) {
       await agents.followUp({ id: "session:peer", message: "unchanged", idempotencyKey: "follow-up-key" });
@@ -186,18 +239,41 @@ describe("guest agents surface", () => {
     expect(result.terminationReason).toBe("completed");
     expect(calls).toEqual([]);
   });
+  it.each([false, true])("types actor window batching and the live setter (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const actor = await agents.create({ name: "supervisor", instructions: "Observe.", batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 });
+      const updated = await agents.setBatching({ id: actor.id, batchWindowMs: 0, batchMaxBytes: 4096 });
+      const window: number | undefined = updated.batchWindowMs;
+      const max: number | undefined = actor.batchMax;
+      const bytes: number | undefined = updated.batchMaxBytes;
+      return { window, max, bytes };`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
+    expect(typeCheckFabricCode('await agents.setBatching({ id: "actor", batchMax: "50" });', guestTypeDeclarations(fullCodeMode), true).errors.length).toBeGreaterThan(0);
+    expect(typeCheckFabricCode('await agents.setBatching({ id: "actor", batchMaxBytes: "4096" });', guestTypeDeclarations(fullCodeMode), true).errors.length).toBeGreaterThan(0);
+  });
+  it("bridges the batching setter through the public provider", async () => {
+    const calls: Array<{ ref: string; args: unknown }> = [];
+    const result = await new QuickJsRuntime().execute('return await agents.setBatching({ id: "actor", batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 });',
+      async (ref, args) => { calls.push({ ref, args }); return { batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 }; },
+      { timeoutMs: 5000, memoryLimitBytes: 32 * 1024 * 1024 });
+    expect(result.terminationReason).toBe("completed");
+    expect(calls).toEqual([{ ref: "agents.setBatching", args: { id: "actor", batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 } }]);
+    expect(result.value).toEqual({ batchWindowMs: 300000, batchMax: 50, batchMaxBytes: 262144 });
+  });
   it.each([false, true])("types per-filter telemetry and expiry (fullCodeMode=%s)", fullCodeMode => {
-    const code = `await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60000 });
+    const code = `await agents.setActivationFilter({ id: "reviewer", activationFilter: ["hold"], expiresAt: Date.now() + 60000, deadLetterReplayMaxAgeMs: 0 });
       const actor = await agents.actorStatus({ id: "reviewer" });
-      const count: number = actor.filterSkipped.count;
-      const key: string | null = actor.filterSkipped.lastKey;
-      const topic: string | null = actor.filterSkipped.lastTopic;
-      const at: number | null = actor.filterSkipped.lastAt;
+      const count: number | undefined = actor.filterSkipped?.count;
+      const key: string | null | undefined = actor.filterSkipped?.lastKey;
+      const topic: string | null | undefined = actor.filterSkipped?.lastTopic;
+      const at: number | null | undefined = actor.filterSkipped?.lastAt;
       const expiry: number | undefined = actor.activationFilterExpiresAt;
-      return { count, key, topic, at, expiry };`;
+      const maxAgeMs: number | undefined = actor.deadLetterReplayMaxAgeMs;
+      await agents.create({ name: "backlog", instructions: "Supervise", deadLetterReplayMaxAgeMs: 0 });
+      return { count, key, topic, at, expiry, maxAgeMs };`;
     expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
     const descriptor = AGENTS_ACTION_DESCRIPTORS.find(d => d.name === "setActivationFilter")!;
     expect(descriptor.inputSchema.properties).toHaveProperty("expiresAt");
+    expect(descriptor.inputSchema.properties).toHaveProperty("deadLetterReplayMaxAgeMs");
   });
   it.each(["spawn", "run", "wait", "join"])("types the optional observed Fabric release on agents.%s", method => {
     const args = method === "spawn" || method === "run" ? '{ task: "work" }' : '{ id: "child" }';
@@ -265,6 +341,66 @@ describe("guest agents surface", () => {
       const schema = AGENTS_ACTION_DESCRIPTORS.find(descriptor => descriptor.name === name)!.inputSchema as { properties: Record<string, unknown> };
       expect(schema.properties.modelReason).toMatchObject({ type: "string", maxLength: 200 });
     }
+  });
+
+  // Decision C keep reasons: public-schema trust boundary and preserving issue evidence
+  // through the actual guest-to-host bridge, not merely a source-text advertisement.
+  it.each([false, true])("types and advertises the opusReason request alias (fullCodeMode=%s)", fullCodeMode => {
+    const declarations = guestTypeDeclarations(fullCodeMode);
+    const calls = [
+      ['run', 'task: "probe"'], ['spawn', 'task: "probe"'],
+      ['create', 'name: "probe", instructions: "Work."'],
+      ['createActor', 'name: "probe", instructions: "Work."'],
+      ['setModel', 'id: "actor"'],
+    ] as const;
+    const runSchema = AGENTS_ACTION_DESCRIPTORS.find(action => action.name === "run")!.inputSchema as { properties: Record<string, unknown> };
+    const sharedAlias = runSchema.properties.opusReason;
+    for (const [name, args] of calls) {
+      expect(typeCheckFabricCode(`await agents.${name}({ ${args}, model: "provider/claude-opus-5.5", opusReason: "Review #123" });`, declarations, true).errors).toEqual([]);
+      expect(typeCheckFabricCode(`await agents.${name}({ ${args}, modelReason: "Canonical #123", opusReason: "Alias #456" });`, declarations, true).errors).toEqual([]);
+      expect(typeCheckFabricCode(`await agents.${name}({ ${args}, opusReason: 123 });`, declarations, true).errors.length).toBeGreaterThan(0);
+      const schema = AGENTS_ACTION_DESCRIPTORS.find(action => action.name === name)!.inputSchema as { properties: Record<string, unknown> };
+      expect(schema.properties.opusReason).toBe(sharedAlias);
+      expect(schema.properties.opusReason).toMatchObject({ type: "string", maxLength: 200,
+        description: expect.stringContaining("modelReason wins") });
+      expect(schema.properties.modelReason).toMatchObject({ description: expect.stringContaining("gpt-6-astra, opus, claude") });
+      expect(schema.properties.modelReason).toMatchObject({ description: expect.stringContaining("must name an issue") });
+    }
+  });
+
+  it("preserves both reason fields through every guest launch/model-binding bridge", async () => {
+    const calls: Array<{ ref: string; args: unknown }> = [];
+    const result = await new QuickJsRuntime().execute(
+      `const reasons = { modelReason: "Canonical #123", opusReason: "Alias #456" };
+       await agents.run({ task: "probe", ...reasons });
+       await agents.spawn({ task: "probe", ...reasons });
+       await agents.create({ name: "probe", instructions: "Work.", ...reasons });
+       await agents.createActor({ name: "alias-probe", instructions: "Work.", ...reasons });
+       await agents.setModel({ id: "actor", model: "provider/opus", ...reasons });
+       return "forwarded";`,
+      async (ref, args) => { calls.push({ ref, args }); return { id: "probe" }; },
+      { timeoutMs: 5_000, memoryLimitBytes: 32 * 1024 * 1024 },
+    );
+    expect(result.terminationReason).toBe("completed");
+    expect(result.value).toBe("forwarded");
+    const reasons = { modelReason: "Canonical #123", opusReason: "Alias #456" };
+    expect(calls).toEqual([
+      { ref: "agents.run", args: { task: "probe", ...reasons } },
+      { ref: "agents.spawn", args: { task: "probe", ...reasons } },
+      { ref: "agents.create", args: { name: "probe", instructions: "Work.", ...reasons } },
+      { ref: "agents.createActor", args: { name: "alias-probe", instructions: "Work.", ...reasons } },
+      { ref: "agents.setModel", args: { id: "actor", model: "provider/opus", ...reasons } },
+    ]);
+  });
+
+  it.each([false, true])("types policy/audit warnings on launch receipts (fullCodeMode=%s)", fullCodeMode => {
+    const code = `const run = await agents.run({ task: "probe" });
+      const spawn = await agents.spawn({ task: "probe" });
+      const wait = await agents.wait({ id: "probe" });
+      const warnings: Array<string[] | undefined> = [run.warnings, spawn.warnings, wait.warnings];
+      const omitted: Pick<typeof spawn, "warnings"> = {};
+      return { warnings, omitted };`;
+    expect(typeCheckFabricCode(code, guestTypeDeclarations(fullCodeMode), true).errors).toEqual([]);
   });
 
   it.each([false, true])("types model selection provenance without conflating effective models (fullCodeMode=%s)", fullCodeMode => {

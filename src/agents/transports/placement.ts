@@ -52,6 +52,15 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   const statusFile = required("--status-file");
   const logFile = required("--log-file");
   const timeoutMs = Number(required("--timeout-ms"));
+  const placementDeadline = request.placementAdmission ? Date.parse(request.placementAdmission.executionDeadline) : undefined;
+  const ensurePlacementLive = (): void => {
+    if (placementDeadline !== undefined && (!Number.isSafeInteger(placementDeadline) || placementDeadline <= Date.now())) {
+      throw Object.assign(new Error("Placement execution deadline expired before remote worker launch"), {
+        launchOutcome: "unlaunched", code: "LOCAL_BINDING_NOT_ADMITTED",
+      });
+    }
+  };
+  ensurePlacementLive();
   const startedAt = Date.now();
   const deadline = startedAt + timeoutMs;
   const values: Record<string, string> = {
@@ -62,14 +71,24 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   // The launcher binds its inbox notification to the Pi caller, not this child.
   environment.PI_SESSION_ID = args.get("--fabric-session-id") ?? environment.PI_SESSION_ID;
   const prepared = await preflightFleetPlacement(request, config, config.command.map(entry => render(entry, values)), task, environment, preflightDeadline, selectedHost);
+  ensurePlacementLive();
+  if (request.placementAdmission?.placementKind === "remote"
+    && (!prepared || prepared.host !== request.placementAdmission.placementHost)) {
+    throw Object.assign(new Error("Remote launcher could not preserve the admitted Placement host"), {
+      launchOutcome: "unlaunched", code: "LOCAL_BINDING_MISMATCH",
+    });
+  }
   if (prepared) environment = prepared.environment;
-  const command = async (template: string[], limit = config.commandTimeoutMs, signal?: AbortSignal, extraArguments: string[] = []) => {
+  const command = async (template: string[], limit = config.commandTimeoutMs, signal?: AbortSignal, extraArguments: string[] = [], admissionBounded = false) => {
+    if (admissionBounded) ensurePlacementLive();
     const argv = template === config.command && prepared ? [...prepared.command] : template.map(entry => render(entry, values));
     // The fleet launcher's current repeatable preflight flag is --require.
     // Keep paths literal and before the prompt separator, never as task text.
     const separator = argv.indexOf("--");
     argv.splice(separator < 0 ? argv.length : separator, 0, ...extraArguments);
-    return executeFile(argv[0]!, argv.slice(1), { cwd: request.cwd, env: environment, timeoutMs: Math.max(1, limit), ...(signal ? { signal } : {}), killSignal: "SIGKILL" });
+    const boundedLimit = admissionBounded && placementDeadline !== undefined
+      ? Math.min(limit, placementDeadline - Date.now()) : limit;
+    return executeFile(argv[0]!, argv.slice(1), { cwd: request.cwd, env: environment, timeoutMs: Math.max(1, boundedLimit), ...(signal ? { signal } : {}), killSignal: "SIGKILL" });
   };
   const audit = (type: string, data: Record<string, unknown>) => fs.appendFileSync(logFile, JSON.stringify({ type, ts: Date.now(), id: request.id, ...data }) + "\n", { mode: 0o600 });
   const base: AgentRunRecord = {
@@ -160,11 +179,12 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   };
   // Rendering/read errors above are prelaunch. After exec starts, failure cannot
   // prove that nothing ran remotely: retain custody and never spawn locally.
+  ensurePlacementLive();
   assertTransportLaunchAllowed(request);
   request.onWritePolicyDisposition?.("remote");
   try {
     let output: string;
-    try { output = (await command(config.command, config.commandTimeoutMs, request.signal, (requires ?? []).flatMap(file => ["--require", file]))).stdout; }
+    try { output = (await command(config.command, config.commandTimeoutMs, request.signal, (requires ?? []).flatMap(file => ["--require", file]), true)).stdout; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw Object.assign(error as Error, { launchOutcome: "unlaunched" });
       const missing = requiredInputRefusal(error, requires);

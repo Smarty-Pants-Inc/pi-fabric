@@ -3,7 +3,8 @@ import { execFileSync } from "node:child_process";
 import childProcess from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { windowsSecurityPowerShell } from "../src/storage/windows-powershell.js";
+import { windowsSecurityPowerShell } from "../src/storage/windows-powershell-command.ts";
+import { rememberFleetHost } from "./hosted-only.mjs";
 
 // Pin immediately after creation or stale-marker validation: path ownership is not ownership of a replacement.
 const ownedRootCleanup = (directory: string, stillOwned: () => boolean = () => true): (() => void) => {
@@ -299,18 +300,19 @@ export function isolatedTestTemp(prefix: string): Record<"TMPDIR" | "TMP" | "TEM
 const fleetRootsKey = Symbol.for("pi-fabric.test-owned-fleet-roots");
 
 // An exact test-only channel, NOT a prefix exemption or production authority.
-// Jev owns its strict === "1" opt-ins; activation owns exact native/worker paths.
+// Jev and NATS rehearsal own strict === "1" opt-ins; activation owns exact native/worker paths.
 // PostgreSQL reads its binary directory at import; the shell seam reads a delay
 // at first use and accepts only positive integers. Preserve those semantics,
 // including missing/off values, without validating existence or rewriting paths.
 const testControls = new Set([
-  "PI_FABRIC_JEV_LIVE", "PI_FABRIC_JEV_LOCALTERM",
+  "PI_FABRIC_JEV_LIVE", "PI_FABRIC_JEV_LOCALTERM", "PI_FABRIC_NATS_REHEARSAL",
   "PI_FABRIC_ACTIVATION_TEST_PI_BINARY", "PI_FABRIC_ACTIVATION_TEST_WORKER",
-  "PI_FABRIC_TEST_PG_BIN", "PI_FABRIC_TEST_PID_DELAY_MS",
+  "PI_FABRIC_TEST_PG_BIN", "PI_FABRIC_TEST_PID_DELAY_MS", "PI_FABRIC_REQUIRE_NATS",
 ]);
 
 /** Run at config evaluation AND before each test file's source imports. */
 export function isolateTestFleetEnvironment(): Record<string, string> {
+  rememberFleetHost(); // Preserve the hosted-only veto BEFORE removing fleet attribution below.
   // Scrub production/future selectors, not the exact test-only controls above.
   // Keep values verbatim: consumers own strict booleans and artifact selection.
   // Unsetting paths alone would fall back to the checkout or the user's Pi profile.
@@ -344,13 +346,15 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
     PI_FABRIC_RUN_ROOT: join(root, "runs"),
     PI_FABRIC_AGENT_DIR: join(root, "exports"),
     PI_CODING_AGENT_DIR: join(root, "agent"),
+    // Keep home-directory audit logs and config writes inside this file's owned fleet root.
+    ...(process.platform === "win32" ? { USERPROFILE: join(root, "home") } : { HOME: join(root, "home") }),
     // An explicit private MCP layer prevents fallback to the real home config.
     MCPORTER_CONFIG: join(root, "mcporter.json"),
     // Mesh-lock diagnostics write <mesh>/lock-stats each minute and at exit (smarty-dev#6477 L8);
     // suites that list a mesh root must not race that timer. Lock-stats suites opt in explicitly.
     PI_FABRIC_LOCK_STATS: "0",
   };
-  for (const directory of ["mesh", "project", "runs", "exports", "agent"]) {
+  for (const directory of ["mesh", "project", "runs", "exports", "agent", "home"]) {
     mkdirSync(join(root, directory), { recursive: true });
   }
   writeFileSync(environment.MCPORTER_CONFIG, '{"mcpServers":{},"imports":[]}\n');

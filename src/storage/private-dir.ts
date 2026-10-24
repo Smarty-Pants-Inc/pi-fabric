@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { diagnostics } from "../core/diagnostics.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -97,7 +98,7 @@ const tighten = (fd: number, stat: fs.Stats, walked: string): fs.Stats => {
   if (!tightened.has(walked)) {
     if (tightened.size >= TIGHTENED_LOG_LIMIT) tightened.clear(); // bounded: a repeat line at worst
     tightened.add(walked);
-    console.warn(`[pi-fabric] tightened ${walked} from ${(stat.mode & 0o7777).toString(8)} to ${mode.toString(8)}`);
+    diagnostics.warn("src/storage/private-dir.ts", `[pi-fabric] tightened ${walked} from ${(stat.mode & 0o7777).toString(8)} to ${mode.toString(8)}`);
   }
   return fs.fstatSync(fd);
 };
@@ -268,9 +269,17 @@ export const mkdirPrivate = (directory: string, anchor?: string): void => { open
  */
 export const writeArchiveFile = (held: PrivateDirectory, name: string, content: { bytes: Buffer } | { source: string }, durable = false): boolean => {
   const bytes = "bytes" in content ? content.bytes : (() => {
+    // Windows has no O_NOFOLLOW: fstat alone would accept a symlink's target
+    // and falsely certify its bytes as an archive of the source entry.
+    const before = fs.lstatSync(content.source);
+    if (!before.isFile()) throw new UnsafeDirectory(`${content.source} is not a regular file`);
     const fd = fs.openSync(content.source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
     try {
-      if (!fs.fstatSync(fd).isFile()) throw new UnsafeDirectory(`${content.source} is not a regular file`);
+      const opened = fs.fstatSync(fd), named = fs.lstatSync(content.source);
+      if (!opened.isFile() || !named.isFile() || opened.dev !== before.dev || opened.ino !== before.ino ||
+          opened.dev !== named.dev || opened.ino !== named.ino) {
+        throw new UnsafeDirectory(`${content.source} changed while it was opened`);
+      }
       return fs.readFileSync(fd);
     } finally { fs.closeSync(fd); }
   })();

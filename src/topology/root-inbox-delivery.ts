@@ -11,8 +11,10 @@ const eventProvenance = (event: MeshEvent) => event.verification === "mesh" || e
 export const deliverRootInbox = (
   pi: ExtensionAPI, events: readonly RootInboxEvent[],
   options: Parameters<ExtensionAPI["sendMessage"]>[1] = { deliverAs: "followUp", triggerTurn: true },
-): void => {
-  if (!events.length) return;
+  /** Bind the rendered content and exact details the native host carries into message_end. */
+  onIssued?: (details: object, content: unknown) => void,
+): string[] => {
+  if (!events.length) return [];
   const seen = new Set<string>();
   events = events.filter(event => {
     const key = JSON.stringify([event.from.kind, event.from.id, event.topic, event.id]);
@@ -20,8 +22,9 @@ export const deliverRootInbox = (
     seen.add(key);
     return true;
   });
-  // One injection stays within the inbox budget across all its messages (R-token-waste): the
-  // overflow is one summary line in the last message, never more full event bodies.
+  // Budget once across provenance splits. Overflow is only a pending summary, never queued
+  // work, delivery evidence or a wake cause. Actions bypass ordinary row/total limits, but share
+  // one rendered-action cap across every carrier (each carrier adds its own wrapper overhead).
   const { shown, overflow } = rootInboxBudget(events);
   events = shown;
   let start = 0;
@@ -37,13 +40,16 @@ export const deliverRootInbox = (
     const batch = events.slice(start, end);
     const extra: readonly RootInboxEvent[] = end === events.length ? overflow : [];
     // A passive followUp records a receipt now and joins the next natural inference.
-    const delivery = first.deliveredLate && extra.every((event) => event.deliveredLate) ? { ...options, triggerTurn: false } : options;
+    const delivery = first.deliveredLate ? { ...options, triggerTurn: false } : options;
     const message = rootInboxMessage(batch, extra);
-    const wakeCauses = [...batch, ...extra].map((event) => fabricWakeCause(event.from, "mesh", event.topic, event.id));
+    const wakeCauses = batch.map((event) => fabricWakeCause(event.from, "mesh", event.topic, event.id));
     // One native message can admit several sources. Keep the whole FIFO cause
     // list, including on legacy hosts that batch events from different senders.
-    pi.sendMessage(fabricWakeMessage(pi, message, delivery, wakeCauses),
-      provenance ? fabricProvenanceOptions(pi, delivery, provenance) : delivery);
+    const issued = fabricWakeMessage(pi, message, delivery, wakeCauses);
+    // Wake stamping can replace details; register after stamping, before native ingestion.
+    if (issued.details && typeof issued.details === "object") onIssued?.(issued.details, issued.content);
+    pi.sendMessage(issued, provenance ? fabricProvenanceOptions(pi, delivery, provenance) : delivery);
     start = end;
   }
+  return events.map((event) => event.id);
 };

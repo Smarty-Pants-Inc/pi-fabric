@@ -1,16 +1,20 @@
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause } from "../fabric-provenance.js";
+import { diagnostics } from "../core/diagnostics.js";
 import { createHash, randomUUID } from "node:crypto";
 import { actorInstructionsSource, resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import { readTaskReturnAddress } from "../agents/task-return-address.js";
+import { sandboxResultPrefix, type SandboxAutoReturn } from "../agents/sandbox-auto-return.js";
 import type { RouteEvaluate } from "../agents/model-route.js";
+import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 import type { JevRequest, JevResponse } from "../jev/types.js";
 import { formatAge, residentHostId, RESIDENT_HOST_FORMAT, ResidentOutcomeUnknownError, ResidentActorAuthorizationError, assertResidentActorMain, assertResidentActorToolCeiling, type ResidentActorCaller, type ResidentActorMutation } from "../residency/protocol.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
+import { actorActivationIdentityFromEnvironment, type FabricActorActivationIdentity } from "../actors/activation-identity.js";
 import { slotAdmissionFor } from "../actors/slot-admission.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
-import { isFabricActorHostEvent, normalizeActorActivation, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
+import { isFabricActorHostEvent, FabricActorBatchPolicyError, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
 import { normalizeActorSlotClaim } from "../actors/slot-claim.js";
 import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
 import { normalizeActorRecords } from "../actors/records.js";
@@ -19,6 +23,7 @@ import type {
   FabricActorHostEvent,
   FabricActorInfo,
   FabricActorReadInfo,
+  FabricActorSelfReadInfo,
   FabricActorMessage,
   FabricActorRequest,
   FabricActorCreateRequest,
@@ -74,6 +79,7 @@ import {
 import { checkedHandoffCompaction } from "../agents/handoff.js";
 import { checkedSeed, completedBranchPrefix, snippetTask } from "../agents/fork-seed.js";
 import { readAgentLineage } from "../agents/child-env.js";
+import { assertAgentSpawnAllowed, snapshotAgentSpawnEnvironment, type AgentSpawnCaller } from "../agents/spawn-authority.js";
 import { childScope, sessionScope } from "../scope.js";
 import { withInheritedSessionPins } from "../agents/session-pins.js";
 import type {
@@ -92,11 +98,11 @@ import {
 import {
   aliasThinking,
   FUZZY_RESOLUTION_MARKERS,
-  resolveAvailablePiModel,
   resolveFabricModel,
   type FabricModelCandidate,
 } from "../core/model-resolution.js";
 import { resolvePiModel, resolvePiRoutePin, ModelRoutePinError } from "../core/model-refresh.js";
+import { FabricModelNotServedError } from "../core/model-served-error.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
 import { mainExecutionCeilingAbortReason, recordResidentOutcome, registerCancellationEffect, throwIfExecutionExpired, withoutMainExecutionCeiling } from "../async-settlement.js";
@@ -109,7 +115,7 @@ import {
   isInteractiveMain,
 } from "../agents/wait-bound.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
-import { isFabricThinking } from "../thinking.js";
+import { isFabricThinking, normalizeThinkingBounds } from "../thinking.js";
 import { normalizeAgentRunRequest } from "../agents/request.js";
 import { parseAgentNice } from "../agents/priority.js";
 import {
@@ -123,7 +129,6 @@ import { AgentTranscriptReader } from "../ui/transcript.js";
 import { waitWithProgress, waitWithActorProgress } from "./agents-progress.js";
 import { AgentMessageRouter, unknownParticipant } from "./agents-message-router.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
-import { deliverWithMessageNotice, outgoingMessageNotice } from "./message-id-notice.js";
 
 export { collectAgentToolPreviewNodes, type AgentToolPreviewTreeOptions } from "./agents-progress.js";
 
@@ -145,7 +150,7 @@ const displaySafeCwd = (cwd: string): string => {
 };
 
 const agentStartedMessage = (handle: AgentHandleInfo): string =>
-  `Agent ${handle.name} started via ${handle.runner}/${handle.transport}${handle.attachCommand ? ` · ${handle.attachCommand}` : ""} · cwd ${displaySafeCwd(handle.cwd)}`;
+  `Agent ${handle.name} started via ${handle.runner}/${handle.transport}${handle.attachCommand ? ` · ${handle.attachCommand}` : ""} · cwd ${displaySafeCwd(handle.cwd)}${handle.modelVerification === "unverified" ? " · model unverified" : ""}`;
 
 // Resolve source and executor reasoning channels for the trajectory handoff
 // boundary. The executor model must be registered to transfer at all; an
@@ -198,6 +203,7 @@ const actorRunBinding = (args: Record<string, unknown>): FabricActorRunBinding =
   ...(typeof args.model === "string" && args.model.trim()
     ? { model: args.model.trim() }
     : {}),
+  ...(typeof (args.modelReason ?? args.opusReason) === "string" ? { modelReason: (args.modelReason ?? args.opusReason) as string } : {}),
   ...(isFabricThinking(args.thinking) ? { thinking: args.thinking } : {}),
 });
 
@@ -292,6 +298,10 @@ const actorRequest = (
       )
     : undefined;
   const topics = stringArray(args.topics);
+  const eventsStartAt = args.eventsStartAt;
+  if (eventsStartAt !== undefined && typeof eventsStartAt !== "number" && typeof eventsStartAt !== "string") {
+    throw new Error("eventsStartAt must be a nonnegative epoch millisecond or ISO timestamp");
+  }
   const records = normalizeActorRecords(args.records);
   const tools = stringArray(args.tools);
   const requires = Array.isArray(args.requires)
@@ -336,6 +346,8 @@ const actorRequest = (
   validateActorCoalesceKey(args.coalesceKey);
   validateActorDedupeKey(args.dedupeKey);
   const activation = normalizeActorActivation(args.activation);
+  const deadLetterReplayMaxAgeMs = normalizeDeadLetterReplayMaxAgeMs(args.deadLetterReplayMaxAgeMs);
+  const batching = normalizeActorBatching(args);
   const slotClaim = normalizeActorSlotClaim(args.slotClaim);
   const activationFilter = args.activationFilter === undefined ? undefined : normalizeActorActivationFilter(args.activationFilter);
   const requestedKernel = checkedKernel(args.kernel);
@@ -358,6 +370,7 @@ const actorRequest = (
     runner,
     ...(kernel !== undefined ? { kernel } : {}),
     ...(events ? { events } : {}),
+    ...(eventsStartAt !== undefined ? { eventsStartAt } : {}),
     ...(topics ? { topics } : {}),
     ...(args.delivery === "mailbox" ||
     args.delivery === "steer" ||
@@ -373,7 +386,9 @@ const actorRequest = (
     ...(typeof args.coalesceKey === "string" ? { coalesceKey: args.coalesceKey } : {}),
     ...(typeof args.dedupeKey === "string" ? { dedupeKey: args.dedupeKey } : {}),
     ...(activation ? { activation } : {}),
+    ...batching,
     ...(activationFilter ? { activationFilter } : {}),
+    ...(deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs } : {}),
     ...(args.routeClass !== undefined ? { routeClass: args.routeClass as "status-groom" } : {}),
     ...(typeof args.protected === "boolean" ? { protected: args.protected } : {}),
     ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}),
@@ -384,7 +399,7 @@ const actorRequest = (
     ...(typeof args.model === "string" && args.model.trim()
       ? { model: args.model.trim() }
       : inheritedModel
-        ? { model: inheritedModel }
+        ? { model: inheritedModel, modelSource: "inherited" as const }
         : {}),
     ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}),
     ...(isFabricThinking(args.thinking) ? { thinking: args.thinking }
@@ -445,11 +460,14 @@ export class AgentsProvider implements FabricProvider {
   readonly #router: AgentMessageRouter;
   readonly #projectLeadId: string | undefined;
   readonly #taskReturnAddress = readTaskReturnAddress();
+  readonly #spawnEnvironment: NodeJS.ProcessEnv;
+  readonly #spawnCaller: AgentSpawnCaller;
+  readonly #creationAdmissions = new WeakMap<object, SpawnRouterAdmission>();
   readonly name = "agents";
   /** Session registry of `provider:` participants; stop/steer/followUp route there. */
   providerParticipants: ProviderParticipantRegistry | undefined;
   readonly description =
-    "The user-facing Main target, one-shot Pi or Claude Code agents, and persistent mailbox actors over process, tmux, screen, LocalTerm, or Herdr";
+    "The user-facing Main target, one-shot Pi or Claude Code agents, and persistent mailbox actors over process, sandbox, tmux, screen, LocalTerm, or Herdr";
 
   constructor(
     readonly manager: AgentManager,
@@ -466,18 +484,34 @@ export class AgentsProvider implements FabricProvider {
     /** Current host effort, including child processes where the Main target is remote. */
     readonly callerThinking: () => string | undefined = () => undefined,
     readonly routeEvaluate: (request: JevRequest, signal: AbortSignal, context: FabricInvocationContext) => Promise<JevResponse> = async () => { throw new Error("Jev routing unavailable"); },
+    readonly sandboxAutoReturn?: SandboxAutoReturn<FabricAgentMessageResult>,
   ) {
+    this.#spawnEnvironment = snapshotAgentSpawnEnvironment();
+    // Bind authority at bootstrap, not to mutable adapter or invocation metadata.
+    const identity = actorManager.identity;
+    // Real actor managers expose create() and must fail closed if bootstrap
+    // identity is absent. A few legacy model-admission fixtures use a minimal
+    // metadata-free adapter; keep their historical Main path without weakening
+    // an actual manager's authority boundary.
+    this.#spawnCaller = identity
+      ? Object.freeze({ kind: identity.kind, id: identity.id })
+      : (typeof (actorManager as { create?: unknown }).create === "function" ? null : undefined);
     this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,
-      (binding, runner, context, requiredPin) => this.#resolvePiRunBinding(binding, runner, context, requiredPin),
+      (binding, runner, context, requiredPin, role) => {
+        const actor = role?.startsWith("actor:") ? this.actorManager.status(role.slice("actor:".length)) : undefined;
+        const thinking = binding.thinking ?? (binding.model && actor ? this.actorManager.resolveBinding(actor.id).thinking : undefined);
+        return this.#resolvePiRunBinding({ ...binding, ...(thinking ? { thinking } : {}) }, runner, context, requiredPin, role);
+      },
       residency,
     );
     this.#lifecycleScheduler = new LifecycleDeliveryScheduler(
       DEFAULT_LIFECYCLE_COALESCE_MS,
       (target, batch) => this.#routeLifecycleBatch(target, batch),
       (target, batch, error) => {
-        console.warn(
+        diagnostics.warn(
+          "src/providers/agents-provider.ts",
           `[pi-fabric] lifecycle delivery to ${target} failed for ${batch.length} event(s): ` +
             (error instanceof Error ? error.message : String(error)),
         );
@@ -566,96 +600,125 @@ export class AgentsProvider implements FabricProvider {
     context: FabricInvocationContext,
     runnerOverride?: FabricAgentRunner,
     closest = true,
+    role = "task",
+    requiredPin = false,
   ): Promise<Record<string, unknown>> {
     const runner = runnerOverride ?? checkedRunner(args.runner, this.manager.config.runner);
     const model = typeof args.model === "string" ? args.model.trim() : "";
+    const source = args.modelSource === "default" || args.modelSource === "inherited" || args.modelSource === "route"
+      ? args.modelSource : "explicit";
     this.manager.assertModelAllowed(model || undefined, runner);
-    if (runner !== "pi") {
-      if (this.manager.config.deniedModels.length === 0) return args;
-      const prepared = await this.manager.prepareModelForAdmission(model || undefined, runner, selector => this.#resolvePiModel(selector, context));
-      return { ...args, model: prepared };
+    let resolved: { model?: string | undefined; via?: string };
+    if (runner !== "pi" && runner !== "pi-durable") {
+      resolved = { model: await this.manager.prepareModelForAdmission(model || this.manager.defaultModel(runner), runner,
+        selector => this.#resolvePiModel(selector, context)) };
+    } else {
+      if (model === "auto") throw new Error('model: "auto" is supported only by agents.spawn with required routing pins');
+      resolved = model ? await this.#resolvePiModelSelection(model, context, closest) : {};
     }
-    if (!model) return args;
-    if (model === "auto") throw new Error('model: "auto" is supported only by agents.spawn with required routing pins');
     const thinking = isFabricThinking(args.thinking) ? args.thinking
       : aliasThinking(this.modelsConfig().aliases, model);
-    const resolved = await this.#resolvePiModelSelection(model, context, closest);
-    return { ...args, ...resolved, ...(thinking ? { thinking } : {}) };
+    const admitted = await this.manager.resolveModelReasonPolicy(resolved.model, args.modelReason, runner, {
+      modelSource: source, thinking, role, requiredPin,
+      thinkingBounds: args.thinkingBounds === undefined ? undefined : normalizeThinkingBounds(args.thinkingBounds, "thinkingBounds"),
+      resolveFallback: selector => runner === "pi" || runner === "pi-durable"
+        ? this.#resolvePiModelSelection(selector, context, false).then(selection => selection.model)
+        : this.manager.prepareModelForAdmission(selector, runner, key => this.#resolvePiModelSelection(key, context, false).then(selection => selection.model)),
+    });
+    const result: Record<string, unknown> = { ...args, ...resolved, model: admitted.model,
+      ...(admitted.thinking ? { thinking: admitted.thinking } : {}),
+      ...(admitted.fallback ? { modelSource: "default", via: "model-policy-fallback" } : {}) };
+    if (admitted.fallback) {
+      delete result.modelReason;
+      result.modelPolicyOriginalModel = args.modelPolicyOriginalModel ?? admitted.originalModel;
+    }
+    return result;
   }
 
   /** `closest: false` (agents.spawn) refuses an inexact requested model instead of closest-matching it. */
-  async #runRequest(args: Record<string, unknown>, context: FabricInvocationContext, closest = true): Promise<AgentRunRequest & { via?: string }> {
+  async #runRequest(args: Record<string, unknown>, context: FabricInvocationContext, closest = true,
+    modelSource?: "explicit" | "default" | "inherited" | "route", requiredPin = false): Promise<AgentRunRequest & { via?: string }> {
     const request = runRequest(args, context, this.manager, this.modelsConfig(), { inheritedThinking: this.callerThinking() });
     const model = request.model ?? this.manager.defaultModel(request.runner);
     return await this.#resolvePiModelArgs(
-      { ...request, ...(model ? { model } : {}) }, context, undefined, closest || request.model === undefined,
+      { ...request, ...(model ? { model } : {}),
+        modelSource: modelSource ?? (typeof args.model === "string" && args.model.trim() ? "explicit"
+          : request.model ? "inherited" : "default") }, context, undefined, closest || request.model === undefined, "task", requiredPin,
     ) as unknown as AgentRunRequest & { via?: string };
   }
 
   async #admitActorRequest(request: FabricActorCreateRequest, context: FabricInvocationContext, closest = true): Promise<FabricActorCreateRequest & { via?: string }> {
+    const role = `actor:${request.name.trim()}`;
+    const source = request.modelSource
+      ?? (request.routeClass !== undefined ? "route" : request.model ? "explicit" : "default");
     if (request.routeClass !== undefined) {
       if (!request.model || !isFabricThinking(request.thinking)) throw new ModelRoutePinError(request.model ?? "");
-      const exact = await resolvePiRoutePin({ selector: request.model, registry: context.extensionContext.modelRegistry, aliases: this.modelsConfig().aliases });
-      this.manager.assertModelAllowed(`${exact.provider}/${exact.id}`, "pi");
-      return { ...request, model: `${exact.provider}/${exact.id}` };
+      const binding = await this.#resolvePiRunBinding(request, request.runner ?? this.manager.config.runner, context, true, role);
+      const admitted: FabricActorCreateRequest = { ...request, modelSource: "route",
+        ...(binding.model ? { model: binding.model } : {}),
+        ...(binding.thinking ? { thinking: binding.thinking } : {}),
+        ...(binding.modelPolicyOriginalModel ? { modelPolicyOriginalModel: binding.modelPolicyOriginalModel } : {}) };
+      if (binding.modelReason !== undefined) admitted.modelReason = binding.modelReason;
+      else delete admitted.modelReason;
+      return admitted;
     }
     const model = request.model ?? this.manager.defaultModel(request.runner);
-    if (!model && (request.runner === "pi" || this.manager.config.deniedModels.length === 0)) return request;
     const resolved = await this.#resolvePiModelArgs(
-      { model, thinking: request.thinking }, context, request.runner, closest || request.model === undefined,
+      { model, modelReason: request.modelReason, thinking: request.thinking, modelSource: source },
+      context, request.runner, closest || request.model === undefined, role,
     );
-    // Templates and unbound live actors retain their dynamic defaults, after validation.
-    return request.model ? { ...request, ...modelResolutionMetadata(resolved), model: resolved.model as string, ...(isFabricThinking(resolved.thinking) ? { thinking: resolved.thinking } : {}) } : request;
+    // Keep dynamic defaults only when policy did not substitute the launch target.
+    if (!request.model && resolved.via !== "model-policy-fallback") return request;
+    const result = { ...request, ...modelResolutionMetadata(resolved), model: resolved.model as string,
+      ...(isFabricThinking(resolved.thinking) ? { thinking: resolved.thinking } : {}),
+      modelSource: (resolved.modelSource ?? source) as NonNullable<FabricActorCreateRequest["modelSource"]> };
+    if (resolved.via === "model-policy-fallback") {
+      delete result.modelReason;
+      result.modelPolicyOriginalModel = resolved.modelPolicyOriginalModel as string;
+    }
+    return result;
   }
 
   async #routeCreationDefault<T extends {
     model?: string; thinking?: AgentRunRequest["thinking"]; runner?: FabricAgentRunner;
-    name?: string; cwd?: string; complexity?: AgentRunRequest["complexity"];
+    task?: string; instructions?: string; sha256?: string;
+    name?: string; cwd?: string; complexity?: AgentRunRequest["complexity"]; residency?: AgentRunRequest["residency"];
   }>(kind: "spawn" | "actor", args: Record<string, unknown>, request: T, context: FabricInvocationContext): Promise<T> {
     const config = this.manager.config.router;
     if (config?.mode !== "shadow" && config?.mode !== "enforce") return request;
-    const self = this.participants.self();
-    const runner = request.runner ?? this.manager.config.runner;
-    const defaultModel = request.model ?? this.manager.defaultModel(runner);
-    const defaults = {
-      ...(defaultModel ? { model: defaultModel } : {}),
-      thinking: request.thinking ?? this.manager.config.thinking,
-    };
-    const { routeAgentCreation } = await import("../agents/spawn-router.js");
-    const selected = await routeAgentCreation({
-      config, meshRoot: this.actorManager.mesh.root, kind,
-      role: self.role ?? (kind === "actor" ? "actor" : "task-agent"),
-      ...(request.name !== undefined ? { name: request.name } : {}),
-      cwd: kind === "spawn" ? await this.manager.resolveCwd(request.cwd, context.signal) : this.manager.cwd,
-      project: self.projectRoot ?? self.project ?? this.manager.cwd,
-      ...(kind === "spawn" ? { task: String(args.task) }
-        : typeof args.instructions === "string" ? { task: args.instructions }
-        : typeof args.sha256 === "string" ? { taskDigest: args.sha256 } : {}),
-      parentId: self.id, defaults,
-      ...(request.complexity ? { complexity: request.complexity } : {}),
-      explicit: (typeof args.model === "string" && !!args.model.trim()) || args.thinking !== undefined,
-      validateModel: model => {
-        this.manager.assertModelAllowed(model, runner);
-        // Non-Pi configured backend defaults are known keys; otherwise require
-        // an exact visible Pi id/alias, never a ranked closest match or a refresh.
-        if (runner !== "pi" && model === this.manager.defaultModel(runner)) return model;
-        const resolved = resolveAvailablePiModel(model, {
-          aliases: this.modelsConfig().aliases,
-          available: context.extensionContext.modelRegistry.getAvailable().map(model => ({
-            provider: String(model.provider), id: String(model.id),
-          })), exact: true, closest: false,
-        });
-        const canonical = `${resolved.provider}/${resolved.id}`;
-        this.manager.assertModelAllowed(canonical, runner);
-        return canonical;
-      },
-      ...(context.signal ? { signal: context.signal } : {}),
-    });
-    return selected ? { ...request, ...selected } : request;
+    const { routeProviderCreation } = await import("../agents/spawn-router.js");
+    const routed = await routeProviderCreation(this, kind, args, request, context);
+    if (!routed) return request;
+    this.#creationAdmissions.set(routed.request, routed.admission);
+    return routed.request;
+  }
+
+  async #recordCreationStartFailed(request: AgentRunRequest | FabricActorCreateRequest, kind: "spawn" | "actor"): Promise<void> {
+    const decisionId = (request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
+    if (typeof decisionId !== "string" || !decisionId) return;
+    try {
+      const { recordSpawnRouterStartFailed } = await import("../agents/spawn-router.js");
+      await recordSpawnRouterStartFailed({ meshRoot: this.actorManager.mesh.root, decisionId,
+        admission: this.#creationAdmissions.get(request), spawnKind: kind, request, cwd: this.manager.cwd });
+    } catch { /* Ledger writes never change admission behavior. */ }
   }
 
   async #prepareSpawnRequest(args: Record<string, unknown>, context: FabricInvocationContext): Promise<AgentRunRequest> {
-    if (args.model !== "auto") return this.#runRequest(args, context, false);
+    if (args.model !== "auto") {
+      try { return await this.#runRequest(args, context, false); }
+      catch (error) {
+        const runner = args.runner ?? this.manager.config.runner;
+        const transport = args.transport ?? this.manager.config.transport;
+        if ((runner === "pi" || runner === "pi-durable") && (transport === "process" || transport === "auto") &&
+          error instanceof Error && (error.message.includes("is not available to this Pi session") ||
+            error.message.includes("closest-match resolution is refused"))) {
+          const selector = typeof args.model === "string" ? args.model : this.manager.defaultModel(runner) ??
+            (context.extensionContext.model ? `${context.extensionContext.model.provider}/${context.extensionContext.model.id}` : "unknown");
+          throw new FabricModelNotServedError(selector, context.extensionContext.model?.provider, error.message);
+        }
+        throw error;
+      }
+    }
     const runner = args.runner ?? this.manager.config.runner;
     const transport = args.transport ?? this.manager.config.transport;
     if (runner !== "pi" || transport !== "process" || (args.residency !== undefined && args.residency !== "session") ||
@@ -677,7 +740,14 @@ export class AgentsProvider implements FabricProvider {
       evaluate: (request, signal) => this.routeEvaluate(request, signal, context), signal: context.signal });
     const { routeLaunchCandidate } = await import("../agents/model-route.js");
     const selected = routeLaunchCandidate(routeDecision);
-    return { ...await this.#runRequest({ ...args, model: selected.model, thinking: selected.effort }, context, false), routeDecision };
+    const request = await this.#runRequest({ ...args, model: selected.model, thinking: selected.effort }, context, false, "route", true);
+    if (request.model !== selected.model && request.model && request.thinking) {
+      routeDecision.mode = "shadow"; routeDecision.reasonCode = "admission-blocked";
+      routeDecision.pin = { model: request.model, effort: request.thinking };
+      routeDecision.model = request.model; routeDecision.effort = request.thinking;
+      delete routeDecision.modelReason;
+    }
+    return { ...request, routeDecision };
   }
 
   async #resolvePiRunBinding(
@@ -685,16 +755,30 @@ export class AgentsProvider implements FabricProvider {
     runner: FabricAgentRunner,
     context: FabricInvocationContext,
     requiredPin = false,
+    role = "task",
   ): Promise<FabricActorRunBinding> {
-    if ((runner !== "pi" && runner !== "pi-durable") || !binding.model) return binding;
-    if (requiredPin) {
-      const exact = await resolvePiRoutePin({ selector: binding.model, registry: context.extensionContext.modelRegistry, aliases: this.modelsConfig().aliases });
-      this.manager.assertModelAllowed(`${exact.provider}/${exact.id}`, "pi");
-      return { ...binding, model: `${exact.provider}/${exact.id}` };
+    if (!binding.model) return binding;
+    const resolve = async (selector: string, pin = false): Promise<string | undefined> => {
+      if (runner !== "pi" && runner !== "pi-durable") return this.manager.prepareModelForAdmission(selector, runner,
+        key => this.#resolvePiModel(key, context));
+      if (pin) {
+        const exact = await resolvePiRoutePin({ selector, registry: context.extensionContext.modelRegistry, aliases: this.modelsConfig().aliases });
+        return `${exact.provider}/${exact.id}`;
+      }
+      // ask/tell have no selection-provenance receipt: never closest-match.
+      return (await this.#resolvePiModelSelection(selector, context, false)).model;
+    };
+    const admitted = await this.manager.resolveModelReasonPolicy(await resolve(binding.model, requiredPin), binding.modelReason, runner, {
+      modelSource: requiredPin ? "route" : binding.modelSource ?? "explicit", thinking: binding.thinking, role, requiredPin,
+      resolveFallback: selector => resolve(selector, requiredPin),
+    });
+    const result = { ...binding, model: admitted.model, ...(admitted.thinking ? { thinking: admitted.thinking } : {}) };
+    if (admitted.fallback) {
+      delete result.modelReason;
+      result.modelPolicyOriginalModel = binding.modelPolicyOriginalModel ?? admitted.originalModel;
+      result.modelSource = "default";
     }
-    // ask/tell receipts do not expose selection provenance; refuse ranked closest picks.
-    // Remote bindings stay raw until their execution owner's admission boundary.
-    return { ...binding, model: (await this.#resolvePiModelSelection(binding.model, context, false)).model };
+    return result;
   }
 
   async list(
@@ -733,6 +817,7 @@ export class AgentsProvider implements FabricProvider {
     args: Record<string, unknown>,
     context: FabricInvocationContext,
   ): Promise<Record<string, unknown>> {
+    this.#assertAgentSpawnAllowed();
     context = snapshotFabricInvocation(context);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
@@ -764,6 +849,7 @@ export class AgentsProvider implements FabricProvider {
     context: FabricInvocationContext,
     sessionSeed: AgentSessionSeed,
   ): Promise<Record<string, unknown>> {
+    this.#assertAgentSpawnAllowed();
     context = snapshotFabricInvocation(context);
     const model = typeof args.model === "string" ? args.model.trim() : "";
     if (!model) throw new Error("agents.handoff requires an explicit Pi target model");
@@ -848,6 +934,10 @@ export class AgentsProvider implements FabricProvider {
     }
   }
 
+  #assertAgentSpawnAllowed(): void {
+    assertAgentSpawnAllowed(this.#spawnCaller, this.#spawnEnvironment);
+  }
+
   #mainWaitAtBound(record: object, timeoutMs: number): Record<string, unknown> {
     // The wait ended so Main can see news: held followUps land at this tool boundary.
     this.mainAgent.flushHeldAtNextBoundary?.();
@@ -866,14 +956,12 @@ export class AgentsProvider implements FabricProvider {
   ): Promise<unknown> {
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
-    // Only explicit public selections: inherited/default models and existing actors are untouched.
-    if (actionName === "run" || actionName === "spawn" || actionName === "create" || actionName === "createActor") {
-      const runner = checkedRunner(args.runner, this.manager.config.runner);
-      const inherited = (runner === "pi" || runner === "pi-durable") && args.scope !== "global" ? context.extensionContext.model : undefined;
-      // Host-supplied managers without our model policy (embeds, upstream fixtures) skip the check.
-      this.manager.assertExplicitModelReason?.(args.model, args.modelReason, runner,
-        inherited ? `${inherited.provider}/${inherited.id}` : undefined);
+    if (["run", "spawn", "handoff", "create", "createActor", "import", "export"].includes(actionName)) {
+      this.#assertAgentSpawnAllowed();
     }
+    if (args.modelReason === undefined && args.opusReason !== undefined) args = { ...args, modelReason: args.opusReason };
+    // Reason admission happens after aliases/defaults are resolved, at the shared
+    // AgentManager policy boundary; raw aliases never grant an exemption.
     switch (actionName) {
       case "run": {
         const main = isInteractiveMain(context.extensionContext);
@@ -915,12 +1003,24 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        const request = this.#applySeed(
-          args,
-          await this.#routeCreationDefault("spawn", args, await this.#prepareSpawnRequest(args, context), context),
-          context,
-        );
+        const routed = await this.#routeCreationDefault("spawn", args,
+          this.#applySeed(args, await this.#prepareSpawnRequest(args, context), context), context);
+        let handedOff = false;
+        const onDispatched = typeof (routed as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"
+          ? () => { handedOff = true; } : undefined;
+        try {
+        // Branch task bytes do not change, but transfer must use the router-selected model.
+        const request = args.seed === "branch" ? this.#applySeed(args, routed, context) : routed;
         if (request.residency === "durable") this.#assertUnconfinedDurable();
+        const runner = request.runner ?? this.manager.config.runner;
+        const transport = request.transport ?? this.manager.config.transport;
+        let modelVerification: AgentHandleInfo["modelVerification"];
+        if ((runner === "pi" || runner === "pi-durable") && (transport === "process" || transport === "auto")) {
+          const { verifyPiSpawnModel } = await import("../core/model-served.js");
+          modelVerification = request.model
+            ? await verifyPiSpawnModel(request.model, context.extensionContext.modelRegistry) : "unverified";
+          (isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal)?.throwIfAborted();
+        }
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...requestWithScope } = request;
         // The resident host has no session scope: send the derived scope in full.
@@ -941,9 +1041,22 @@ export class AgentsProvider implements FabricProvider {
             ? { thinkingBounds: this.manager.childThinkingBounds(request.thinkingBounds) }
             : {}),
         }, context.extensionContext.sessionManager?.getEntries?.() ?? []);
-        const handle = durableRequest.residency === "durable"
-          ? await this.#resident().spawnAgent(durableRequest, context.signal)
-          : await this.manager.spawn(durableRequest, isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal);
+        const resident = durableRequest.residency === "durable" ? this.#resident() : undefined;
+        let handle: AgentHandleInfo;
+        if (resident) {
+          // Resident custody begins only at publication, not client preparation.
+          handle = await (onDispatched ? resident.spawnAgent(durableRequest, context.signal, onDispatched)
+            : resident.spawnAgent(durableRequest, context.signal));
+        } else {
+          const signal = isInteractiveMain(context.extensionContext) ? withoutMainExecutionCeiling(context.signal) : context.signal;
+          const admission = this.#creationAdmissions.get(routed);
+          // Native admission owns preparation failures too; the provider must not consume twice.
+          handedOff = true;
+          handle = await (onDispatched
+            ? this.manager.spawn(durableRequest, signal,
+              undefined, undefined, undefined, undefined, undefined, undefined, admission)
+            : this.manager.spawn(durableRequest, signal));
+        }
         if (request.residency !== "durable") this.manager.detachSignal(handle.id);
         this.participants.scheduleRefresh();
         context.activity?.({
@@ -952,8 +1065,14 @@ export class AgentsProvider implements FabricProvider {
           kind: "agent",
           name: handle.name,
         });
-        context.update(agentStartedMessage(handle));
-        return request.routeDecision ? { ...handle, routeDecision: request.routeDecision } : handle;
+        const receipt = { ...handle, ...(modelVerification ? { modelVerification } : {}),
+          ...(request.routeDecision ? { routeDecision: request.routeDecision } : {}) };
+        context.update(agentStartedMessage(receipt));
+        return receipt;
+        } catch (error) {
+          if (!handedOff) await this.#recordCreationStartFailed(routed, "spawn");
+          throw error;
+        }
       }
       case "join":
       case "wait": {
@@ -1067,8 +1186,13 @@ export class AgentsProvider implements FabricProvider {
       }
       case "self": {
         const self = await this.participants.self();
+        const actor = actorActivationIdentityFromEnvironment();
         const lineage = readAgentLineage();
-        return lineage ? { ...self, lineage } : self;
+        return {
+          ...self,
+          ...(actor ? { actor } : {}),
+          ...(lineage ? { lineage } : {}),
+        };
       }
       case "main": {
         const address = this.#taskReturnAddress;
@@ -1336,7 +1460,9 @@ export class AgentsProvider implements FabricProvider {
         const ownsActor = actor ? this.actorManager.owns(actor.id) : false;
         const requestedOverrides = actorRunBinding(args);
         const overrides = ownsActor
-          ? await this.#resolvePiRunBinding(requestedOverrides, actor!.runner, context, actor!.routeClass !== undefined)
+          ? await this.#resolvePiRunBinding({ ...requestedOverrides,
+            ...(requestedOverrides.model ? { thinking: requestedOverrides.thinking ?? this.actorManager.resolveBinding(actor!.id).thinking } : {}) },
+            actor!.runner, context, actor!.routeClass !== undefined, `actor:${actor!.name}`)
           : requestedOverrides;
         context.activity?.({
           type: "entity",
@@ -1471,8 +1597,14 @@ export class AgentsProvider implements FabricProvider {
         return result;
       }
       case "actorStatus": {
-        await this.actorManager.reconcileSessionOrphans();
         const id = String(args.id);
+        const ownActor = actorActivationIdentityFromEnvironment();
+        if (ownActor || process.env.PI_FABRIC_ACTOR_ID) {
+          if (!ownActor) throw new Error("Fabric actor activation identity is unavailable");
+          if (id !== ownActor.actorId) throw new Error(`Unknown Fabric actor: ${id}`);
+          return await this.#ownActorStatus(ownActor, context.signal);
+        }
+        await this.actorManager.reconcileSessionOrphans();
         let actor: FabricActorInfo | undefined;
         try {
           actor = this.actorManager.status(id);
@@ -1527,24 +1659,30 @@ export class AgentsProvider implements FabricProvider {
         if (args.scope === "global") {
           const template = this.globalActors.resolve(id);
           if (!template) throw new Error(`Unknown global actor: ${id}`);
-          this.manager.assertExplicitModelReason(model, args.modelReason, template.runner);
-          const resolved = model && template.runner === "pi"
-            ? template.routeClass !== undefined
-              ? { model: (await this.#resolvePiRunBinding({ model }, "pi", context, true)).model! }
-              : await this.#resolvePiModelSelection(model, context)
+          const resolved = model
+            ? await this.#resolvePiModelArgs({ model, modelReason: args.modelReason, thinking: template.thinking, modelSource: "explicit" }, context, template.runner, true, `actor:${template.name}`)
             : { model };
           checkCommit();
-          return { ...this.globalActors.update(template.id, { model: resolved.model, ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}) }), ...modelResolutionMetadata(resolved) };
+          return { ...this.globalActors.update(template.id, { model: resolved.model as string, ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}) }), ...modelResolutionMetadata(resolved) };
         }
         const target = await this.#resolveActorTarget(id, context.signal);
         const runner = target.actor?.runner ?? target.participant!.runner ?? this.manager.config.runner;
-        this.manager.assertExplicitModelReason(model, args.modelReason, runner);
+        const role = `actor:${target.actor?.name ?? target.participant!.name}`;
+        const thinking = target.actor
+          ? args.scope === "project" ? this.actorManager.definition(target.actor.id).thinking : this.actorManager.resolveBinding(target.actor.id).thinking
+          : isFabricThinking(target.participant?.thinking) ? target.participant.thinking : undefined;
         const resident = await this.#residentActorOwner(id, context.signal);
         const ownsActor = target.actor ? this.actorManager.owns(target.actor.id) : false;
+        const opaquePassiveKey = model.includes("/") && !Object.hasOwn(this.modelsConfig().aliases, model.toLowerCase()) &&
+          !resident && !ownsActor && target.actor?.routeClass === undefined &&
+          (runner === "pi" || runner === "pi-durable") && this.manager.config.deniedModels.length === 0 &&
+          !this.manager.modelReasonRequired(model, runner);
         const resolved = model && target.actor?.routeClass !== undefined
-          ? await this.#resolvePiRunBinding({ model }, runner, context, true)
-          : model && (resident || ownsActor || this.manager.config.deniedModels.length > 0)
-            ? await this.#resolvePiModelArgs({ model }, context, runner) : { model: model || undefined };
+          ? await this.#resolvePiRunBinding({ model, modelReason: typeof args.modelReason === "string" ? args.modelReason : undefined, thinking }, runner, context, true, role)
+          : model && !opaquePassiveKey
+            ? await this.#resolvePiModelArgs({ model, modelReason: args.modelReason, thinking, modelSource: "explicit" }, context, runner, true, role)
+            : model ? await this.manager.resolveModelReasonPolicy(model, args.modelReason, runner, { modelSource: "explicit", thinking, role })
+              : { model: undefined };
         const resolvedModel = resolved.model as string | undefined;
         if (resident) {
           const actor = await this.#setResidentActor(resident, {
@@ -1560,6 +1698,7 @@ export class AgentsProvider implements FabricProvider {
           args.scope === "project" ? "project" : "session",
           checkCommit,
           typeof args.modelReason === "string" ? args.modelReason : undefined,
+          opaquePassiveKey,
         );
         return { ...actor, ...modelResolutionMetadata(resolved) };
       }
@@ -1612,19 +1751,40 @@ export class AgentsProvider implements FabricProvider {
         if (args.scope === "global") return this.globalActors.update(String(args.id), { coalesceKey });
         return this.actorManager.setCoalesceKey(String(args.id), coalesceKey);
       }
+      case "setBatching": {
+        const batching = normalizeActorBatching(args);
+        if (!Object.keys(batching).length) throw new FabricActorBatchPolicyError("batchWindowMs, batchMax or batchMaxBytes is required");
+        if (args.scope === "global") return this.globalActors.update(String(args.id), batching);
+        const resident = await this.#residentActorOwner(String(args.id));
+        if (resident) return this.#setResidentActor(resident, { operation: "setBatching", id: resident.id, ...batching }, context);
+        return this.actorManager.setBatching(String(args.id), batching, checkCommit);
+      }
       case "setActivationFilter": {
         if (args.activationFilter === undefined) throw new Error("activationFilter is required (a list of presets or rules, or null to clear)");
         const activationFilter = args.activationFilter === null ? null : normalizeActorActivationFilter(args.activationFilter);
+        const deadLetterReplayMaxAgeMs = normalizeDeadLetterReplayMaxAgeMs(args.deadLetterReplayMaxAgeMs);
+        const replayAge = deadLetterReplayMaxAgeMs === undefined ? {} : { deadLetterReplayMaxAgeMs };
         const expiresAt = args.expiresAt;
         if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))) throw new Error("expiresAt must be finite epoch milliseconds");
         if (args.scope === "global") {
           if (expiresAt !== undefined) throw new Error("expiresAt is only supported for live actors");
-          return this.globalActors.update(String(args.id), { activationFilter });
+          return this.globalActors.update(String(args.id), { activationFilter, ...replayAge });
         }
         const expiry = expiresAt === undefined ? {} : { expiresAt };
         const resident = await this.#residentActorOwner(String(args.id), context.signal);
-        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter, ...expiry }, context);
-        return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit, expiresAt as number | undefined);
+        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter, ...expiry, ...replayAge }, context);
+        return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit, expiresAt as number | undefined, deadLetterReplayMaxAgeMs);
+      }
+      case "setTopics": {
+        if (args.scope !== undefined && args.scope !== "project" && args.scope !== "global") {
+          throw new Error(`Invalid Fabric actor topics scope: ${String(args.scope)}`);
+        }
+        if (!Array.isArray(args.topics) || [...args.topics].some((topic) => typeof topic !== "string")) {
+          throw new Error("topics must be an array of strings");
+        }
+        if (args.scope === "global") return this.globalActors.update(String(args.id), { topics: args.topics });
+        // Like setEvents, live subscription changes require this manager's ownership.
+        return this.actorManager.setTopics(String(args.id), args.topics);
       }
       case "setEvents": {
         const events = Array.isArray(args.events)
@@ -1725,7 +1885,8 @@ export class AgentsProvider implements FabricProvider {
           ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}),
         };
         const resolvedRequest = await this.#admitActorRequest(
-          actorRequest(request as unknown as Record<string, unknown>, context, this.manager, true, this.callerThinking()), context,
+          { ...actorRequest(request as unknown as Record<string, unknown>, context, this.manager, true, this.callerThinking()),
+            modelSource: "inherited" }, context,
         );
         const actor = await this.#createActor(resolvedRequest, context);
         this.participants.scheduleRefresh();
@@ -1789,6 +1950,14 @@ export class AgentsProvider implements FabricProvider {
     return this.routeMessage(target, message, undefined, "followUp");
   }
 
+  async sendSandboxAutoReturn(message: string): Promise<FabricAgentMessageResult> {
+    const autoReturn = this.sandboxAutoReturn;
+    if (!autoReturn?.hasTaskReceipt || !message.startsWith(sandboxResultPrefix(autoReturn.runId))) {
+      throw new Error("Sandbox auto-return is not armed for this task");
+    }
+    return this.#router.routeMessage(autoReturn.spawnerId, message, undefined, "followUp");
+  }
+
   async routeMessage(
     id: string,
     message: string,
@@ -1811,14 +1980,15 @@ export class AgentsProvider implements FabricProvider {
         this.providerParticipants, this.participants, this.control, id, kind, message, data,
       ) as Promise<FabricAgentMessageResult>;
     }
-    // Host-authored lifecycle routing has no sender invocation/history. Check
-    // only model sends, before *all* local/actor/remote routing branches.
-    if (!context) return this.#router.routeMessage(id, message, data, kind, context, options);
-    context = snapshotFabricInvocation(context);
-    const checked = await outgoingMessageNotice(message, context, this.actorManager.identity.id);
-    const result = await deliverWithMessageNotice(message, checked,
-      text => this.#router.routeMessage(id, text, data, kind, context, options), `agents.${kind}`);
-    return checked.notice ? { ...result, notice: checked.notice } : result;
+    const send = (): Promise<FabricAgentMessageResult> => this.#router.routeMessage(id, message, data, kind, context, options);
+    if (kind === "followUp" && this.sandboxAutoReturn) {
+      const targetId = id === "spawner" ? this.#router.spawner?.id
+        : id.trim() === "main" ? this.#taskReturnAddress?.spawnerId ?? this.mainAgent.id
+          : id.trim();
+      const result = await this.sandboxAutoReturn.sendExplicitResult(targetId ?? "", message, send);
+      if (result.handled) return result.result;
+    }
+    return send();
   }
 
   /** Flush pending coalesced lifecycle deliveries; used by tests and shutdown. */
@@ -1908,6 +2078,12 @@ export class AgentsProvider implements FabricProvider {
   }
 
   async #createActor(request: FabricActorCreateRequest, context: FabricInvocationContext): Promise<FabricActorInfo> {
+    this.#assertAgentSpawnAllowed();
+    let handedOff = false;
+    const routerAdmission = this.#creationAdmissions.get(request);
+    const onDispatched = typeof (request as { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId === "string"
+      ? () => { handedOff = true; } : undefined;
+    try {
     const { signal } = context;
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
@@ -1924,6 +2100,7 @@ export class AgentsProvider implements FabricProvider {
       ...(kernel ? { kernel, pythonRuntime: this.manager.resolvePythonRuntime(request.pythonRuntime) } : {}),
       ...(principalScope ? { principalScope } : {}),
     };
+    if (routerAdmission) this.#creationAdmissions.set(request, routerAdmission);
     if (request.residency !== "durable") {
       // Reuse the host-originated outcome ledger for local actors too: publication
       // may await contended locks after the actor is already runnable/subscribed.
@@ -1955,7 +2132,9 @@ export class AgentsProvider implements FabricProvider {
         return outcome ??= new ResidentOutcomeUnknownError(command, decision, reason, signal);
       });
       try {
+        handedOff = true;
         return await this.actorManager.create(resolvedRequest, {
+          ...(routerAdmission ? { routerAdmission } : {}),
           // The protected native path invokes this synchronously at its final
           // validated SQL boundary, with the original ID on an exact retry.
           beforeCommit: (id, nativeBoundary) => {
@@ -1989,17 +2168,60 @@ export class AgentsProvider implements FabricProvider {
     // Even the first actor in an empty registry must use the authoritative
     // host's capability check and request fence. A local-create/cede path can
     // publish after cancellation with neither a decision nor a known-ID receipt.
-    if (this.residency) return this.residency.createActor(request, signal);
+    if (this.residency) return await (onDispatched ? this.residency.createActor(request, signal, onDispatched)
+      : this.residency.createActor(request, signal));
     const client = this.#residentActorClient();
     // Ordinary child handoffs need no protected caller metadata. The receiving
     // host still requires an authenticated caller for every protected topic,
     // including a request that omitted its required claim.
-    if (request.slotClaim === undefined) return client.createActor(request, signal);
-    return client.createActor(request, signal, {
-      identity: { ...this.actorManager.identity }, hostId: this.participants.self().ownerHostId,
+    if (!onDispatched && request.slotClaim === undefined) return await client.createActor(request, signal);
+    const self = this.participants.self();
+    const routerCaller = onDispatched ? { id: self.id, rootId: self.rootId, sessionId: self.sessionId ?? "",
+      ownerHostId: self.ownerHostId, ownerIdentityId: self.ownerIdentityId, kind: self.kind } : undefined;
+    if (request.slotClaim === undefined) return await client.createActor(request, signal, undefined, onDispatched, routerCaller);
+    const caller = {
+      identity: { ...this.actorManager.identity }, hostId: self.ownerHostId,
       ...(invocationFabricPrincipal(context) ? { principal: invocationFabricPrincipal(context) } : {}),
       ...(this.#toolCeiling === undefined ? {} : { toolCeiling: [...this.#toolCeiling] }),
-    });
+    };
+    return await (onDispatched ? client.createActor(request, signal, caller, onDispatched, routerCaller)
+      : client.createActor(request, signal, caller));
+    } catch (error) {
+      if (!handedOff) await this.#recordCreationStartFailed(request, "actor");
+      throw error;
+    }
+  }
+
+  async #ownActorStatus(
+    identity: FabricActorActivationIdentity,
+    signal?: AbortSignal,
+  ): Promise<FabricActorReadInfo | FabricActorSelfReadInfo> {
+    signal?.throwIfAborted();
+    // When its owning root exposes the read-only resident API, use that fresh
+    // status only if the actor still has this activation's immutable lineage.
+    try {
+      const resident = await this.#residentActorOwner(identity.actorId, signal);
+      if (resident?.id === identity.actorId) {
+        const status = await resident.client.actorStatus(resident.id, signal);
+        if (status.id === identity.actorId && status.name === identity.name && status.rootId === identity.rootId &&
+            status.ownershipToken === identity.ownershipToken && status.instructionsDigest === identity.instructionsDigest) {
+          return { ...status, ...(identity.roleStamp ? { roleStamp: identity.roleStamp } : {}) };
+        }
+      }
+    } catch {
+      signal?.throwIfAborted();
+      // The immutable activation tuple is sufficient when the owner is offline.
+    }
+    signal?.throwIfAborted();
+    return {
+      id: identity.actorId,
+      name: identity.name,
+      rootId: identity.rootId,
+      ownershipToken: identity.ownershipToken,
+      instructionsDigest: identity.instructionsDigest,
+      ...(identity.roleStamp ? { roleStamp: identity.roleStamp } : {}),
+      status: "unknown",
+    };
   }
 
   #actorsWithLiveState(): FabricActorReadInfo[] {

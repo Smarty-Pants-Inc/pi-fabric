@@ -9,7 +9,7 @@ import { terminateWindowsTree } from "../../child-process-tree.js";
 import { spawnDetached as spawnDetachedLegacy } from "./process-utils-legacy.js";
 import { randomBytes } from "node:crypto";
 import {
-  TASK_SCOPE_ENVIRONMENT, TASK_SCOPE_PREFIX, TaskScopeAdmissionError, assertMemoryMaxBytes, stopTaskCgroup, taskScopeProperties, taskScopeShim, verifiedTaskMemoryMax,
+  TASK_SCOPE_ENVIRONMENT, TASK_SCOPE_PREFIX, TaskScopeAdmissionError, assertMemoryMaxBytes, stopTaskCgroup, taskCgroupPids, taskScopeProperties, taskScopeShim, verifiedTaskMemoryMax,
   type TaskCgroupBoundary,
 } from "./task-cgroup.js";
 import { taskScopeWrapperSource } from "./task-scope-wrapper.js";
@@ -310,7 +310,7 @@ export const spawnDetached = async (
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; treeClosed?: Promise<void>; cgroup?: string; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; primaryExit?: Promise<void>; treeClosed?: Promise<void>; cgroup?: string; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
   // No PR observer or timer is created on the unscoped/unsupported path.
   const scopedLinux = Boolean(scope && process.platform === "linux");
   if (!scopedLinux) {
@@ -408,7 +408,9 @@ export const spawnDetached = async (
   let exited = false;
   let force: ReturnType<typeof setTimeout> | undefined;
   child.once("exit", () => { exited = true; clearTimeout(force); });
-  const closed = new Promise<void>((resolve) => child.once("close", () => { exited = true; clearTimeout(force); resolve(); }));
+  let nativeClosed = false;
+  const closed = new Promise<void>((resolve) => child.once("close", () => { nativeClosed = true; exited = true; clearTimeout(force); resolve(); }));
+  const forcedDescendants = new Set<string>();
   const workerExited = new Promise<void>(resolve => child.once("exit", () => resolve()));
   // Capture a scope-start failure for the typed capped admission refusal, never for replay.
   let exitStatus: { code: number | null; signal: NodeJS.Signals | null } | undefined;
@@ -530,9 +532,9 @@ export const spawnDetached = async (
     if (process.platform === "linux") members();
     else if (process.platform !== "win32") await portableMembers();
     const settled = async (): Promise<boolean> => {
-      if (process.platform === "linux") return members().length === 0 && exited && !(executionPending && groups.size === 1);
+      if (process.platform === "linux") return members().length === 0 && nativeClosed && !(executionPending && groups.size === 1);
       const remaining = process.platform === "win32" ? [] : await portableMembers();
-      if (!exited || executionPending || portableUncertain) return false;
+      if (!nativeClosed || executionPending || portableUncertain) return false;
       return remaining.length === 0;
     };
     const signal = (value: NodeJS.Signals): void => {
@@ -548,6 +550,11 @@ export const spawnDetached = async (
         // Refresh birth anchors immediately before EACH signal, not only once
         // before signalling several independently detached execution groups.
         if (process.platform === "linux" && !members().some((member) => member.group === -target)) continue;
+        if (process.platform === "linux") {
+          for (const member of members()) if (member.pid !== pid && member.group === -target) {
+            forcedDescendants.add(`${member.pid}:${member.started}`);
+          }
+        }
         try { process.kill(target, value); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
       }
@@ -594,7 +601,6 @@ export const spawnDetached = async (
     boundaryReleased = true;
   };
   let treeFinished = false;
-  let nativeClosed = false;
   // Receipt existence, not merely requested scope admission, enables events.
   let treeObservationReady = false;
   let censusTimer: ReturnType<typeof setTimeout> | undefined;
@@ -767,6 +773,12 @@ export const spawnDetached = async (
     closed,
     lostContact: () => lost,
     stopDebt: () => stopFailed ? undefined : lost,
+    forcedCleanupCount: () => forcedDescendants.size,
+    remainingDescendantCount: () => {
+      if (process.platform !== "linux") return 1;
+      try { return members().filter(member => member.pid !== pid).length; }
+      catch { return Math.max(1, [...owned.keys()].filter(member => member !== pid).length); }
+    },
     async waitForClose() {
       let deadline: ReturnType<typeof setTimeout> | undefined;
       try {
@@ -798,6 +810,17 @@ export const spawnDetached = async (
               await Promise.race([workerExited, new Promise<void>(resolve => { grace = setTimeout(resolve, termGraceMs); })]);
               clearTimeout(grace);
             }
+            // Count live descendant births at the owned kill, not during natural grace.
+            // Diagnostics must never prevent or replace the verified subtree stop.
+            try {
+              for (const descendant of taskCgroupPids(verified) ?? []) {
+                if (descendant === pid) continue;
+                const member = linuxGroupMember(descendant);
+                if (member && member.state !== "Z" && member.state !== "X") {
+                  forcedDescendants.add(`${member.pid}:${member.started}`);
+                }
+              }
+            } catch { /* diagnostic census failure cannot skip owned cleanup */ }
             await stopTaskCgroup(verified, { termMs: STOP_TERM_MS, killMs: STOP_KILL_MS });
           }
           // Successful teardown proves emptiness even if finishTree(error)
@@ -879,8 +902,8 @@ export const spawnDetached = async (
       if (exited && scopeEvents && !scopeIsEmpty()) return true;
       // A dead custodian is not proof its retained execution groups stopped.
       // The manager must not use it to admit an overlapping replacement.
-      if (exited) return process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
-        : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0);
+      if (exited) return !nativeClosed || (process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
+        : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0));
       if (processIsAlive(pid)) {
         // Retain observed descendants before a launcher can exit ahead of its Pi child.
         if (process.platform === "linux") { try { members(); } catch { /* stop must fail closed */ } }
@@ -890,8 +913,8 @@ export const spawnDetached = async (
       // Gone once is gone for good: the probe can see the exit before the "exit" event
       // (Windows), and any later answer for this number is another process.
       exited = true;
-      return process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
-        : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0);
+      return !nativeClosed || (process.platform === "linux" ? members().length > 0 || (executionPending && groups.size === 1)
+        : executionPending || portableUncertain || (process.platform !== "win32" && (await portableMembers()).length > 0));
     },
   };
   if (scope && marker) {
@@ -899,11 +922,25 @@ export const spawnDetached = async (
     // this same worker on checked legacy monitoring, without replay or receipt.
     const admittedHandle = async () => await armTreeObservation() ? { ...handle, treeClosed: treeClosed! } : handle;
     try {
+      let admissionFailureReason = "scope admission timed out before an authenticated marker";
       const admitted = await (async (): Promise<boolean> => {
         let watcher: fs.FSWatcher | undefined;
         let deadline: ReturnType<typeof setTimeout> | undefined;
         let finish!: (admitted: boolean) => void;
-        const ended = (): void => finish(false);
+        const finishIfMarkerAdmitted = (reason: string): void => {
+          const admitted = markerIsAdmitted();
+          if (!admitted) admissionFailureReason = reason;
+          finish(admitted);
+        };
+        const watcherFailed = (): void => finishIfMarkerAdmitted("scope admission watcher failed before an authenticated marker");
+        const aborted = (): void => {
+          admissionFailureReason = "scope admission aborted before an authenticated marker";
+          finish(false);
+        };
+        const childClosed = (): void => {
+          admissionFailureReason = "scope process closed before an authenticated marker";
+          finish(false);
+        };
         try {
           return await new Promise<boolean>(resolve => {
             let settled = false;
@@ -917,22 +954,24 @@ export const spawnDetached = async (
             watcher = fs.watch(path.dirname(marker), { persistent: false }, (_event, filename) => {
               if (filename?.toString() === path.basename(marker) && markerIsAdmitted()) finish(true);
             });
-            watcher.once("error", ended);
-            child.once("close", ended);
-            authority?.signal?.addEventListener("abort", ended, { once: true });
+            watcher.once("error", watcherFailed);
+            child.once("close", childClosed);
+            authority?.signal?.addEventListener("abort", aborted, { once: true });
             if (markerIsAdmitted()) finish(true);
-            else if (nativeClosed || authority?.signal?.aborted) finish(false);
-            else if (!settled) deadline = setTimeout(ended, 5_000);
+            else if (nativeClosed) childClosed();
+            else if (authority?.signal?.aborted) aborted();
+            else if (!settled) deadline = setTimeout(() => finishIfMarkerAdmitted("scope admission timed out before an authenticated marker"), 5_000);
           });
         } catch {
           // An unavailable directory watch uses the checked legacy fallback
           // below, never a marker polling loop or an unverified tree receipt.
+          admissionFailureReason = "scope admission directory watcher could not be created";
           return false;
         } finally {
           clearTimeout(deadline);
           watcher?.close();
-          child.removeListener("close", ended);
-          authority?.signal?.removeEventListener("abort", ended);
+          child.removeListener("close", childClosed);
+          authority?.signal?.removeEventListener("abort", aborted);
         }
       })();
       if (admitted && !capped) return await admittedHandle();
@@ -961,6 +1000,13 @@ export const spawnDetached = async (
           return { ...handle, treeClosed: treeClosed!, cgroup: boundary.relative };
         }
       }
+      // The watcher or deadline may have won the event-loop race after the
+      // shim published its marker. Preserve an uncapped worker already admitted
+      // before any teardown; capped launches remain fail-closed until release.
+      if (!capped && !authority?.signal?.aborted && markerIsAdmitted()) return await admittedHandle();
+      const admissionStopReason = cappedRefusal ?? (capped && admitted
+        ? "capped scope boundary could not be verified; refusing uncapped fallback"
+        : admissionFailureReason);
       // Unproven capped admission: EOF makes the shim exit 125 before the worker runs.
       gate?.destroy();
       if (!nativeClosed || (boundary && !boundaryReleased)) await handle.stop();
@@ -968,7 +1014,10 @@ export const spawnDetached = async (
       if (await handle.isAlive()) throw new Error("Scope termination is unconfirmed; custody retained");
       assertTransportLaunchAllowed(authority);
       // A gated shim never executed the worker, but that alone cannot authorize uncapped replay.
-      if (!capped && markerIsAdmitted()) return await admittedHandle(); // admitted during teardown: never replay
+      if (!capped && markerIsAdmitted()) {
+        scope.warn("scope admission marker appeared during teardown; the admitted worker was stopped and will be reported lost");
+        return await admittedHandle(); // admitted during teardown: never replay
+      }
       if (capped) {
         // The gate was never released: no worker ran. systemd-run launched (it had a pid), so
         // the executable was present: ANY exit status, diagnostic, signal, receipt mismatch or
@@ -976,7 +1025,9 @@ export const spawnDetached = async (
         throw new TaskScopeAdmissionError(scopeUnit!, cappedRefusal ?? (exitStatus
           ? `scope exited before release (code ${exitStatus.code}, signal ${exitStatus.signal})` : "scope admission timed out"));
       }
-      scope.warn(spawnError?.message ?? "systemd-run failed or scope admission timed out");
+      // Report the stop only when the authorized uncapped fallback will proceed;
+      // capped refusals and revoked launches already surface their own errors.
+      scope.warn(admissionStopReason);
       return await spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
     } finally {
       if (!gateReleased) gate?.destroy();

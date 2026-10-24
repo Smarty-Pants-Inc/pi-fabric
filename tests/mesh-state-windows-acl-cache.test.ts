@@ -45,6 +45,11 @@ const fakeStat = (ino: bigint, directory: boolean): fs.BigIntStats => ({
   isSymbolicLink: () => false, isDirectory: () => directory, isFile: () => !directory,
 } as fs.BigIntStats);
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+// Default Windows ACL findings are advisory. Old gate refusal/race rows opt in explicitly per test (never globally);
+// afterEach unstubs it. The value is read by the gate at each call, so the same module instance can switch.
+const ENFORCE = "PI_FABRIC_MESH_STATE_ACL_ENFORCE";
+const ADVISORY = "FABRIC_MESH_STATE_ACL_ADVISORY";
+const enforceAcl = () => vi.stubEnv(ENFORCE, "1");
 
 beforeEach(() => vi.resetModules());
 afterEach(() => {
@@ -430,6 +435,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
 
   it("CACHE-20 DB already absent BEFORE a fresh gate proof retains pre/post-create checks despite prior cache knowledge", async () => {
     const f = await fixture(USER, true);
+    enforceAcl(); // explicit opt-in: this test asserts the enforced refusal
     f.warm();
     f.absent(DB);
     const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
@@ -459,6 +465,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
   // Decision C: REAL gate -> REAL reader -> DEFAULT runner; recorded observations, not NTFS/deletion proof.
   it.each([DB, ROOT])("CACHE-19 real gate never calls the SQLite opener after known %s is renamed away during proof", async target => {
     const f = await fixture(USER, true);
+    enforceAcl(); // explicit opt-in: this test asserts the enforced refusal
     const events: string[] = [];
     f.state.output = snapshot => {
       const completeSafeSnapshot = JSON.stringify(snapshot);
@@ -548,6 +555,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
       .map(change => ({ target, before, change })))))(
     "CACHE-23 TABLE $target $before -> $change: refuse before create and SQLite", async row => {
       const f = await fixture(USER, true);
+      enforceAcl(); // explicit opt-in: this row asserts the enforced refusal
       observeAs(f, row.target, row.before, f.stat(row.target).ino);
       f.state.output = snapshot => {
         const safe = JSON.stringify({ ...snapshot, entries: snapshot.entries.map(entry =>
@@ -591,6 +599,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
 
   it.each([ROOT, DB])("CACHE-24 TABLE known %s -> different known ID: refuse before create/opener", async target => {
     const f = await fixture(USER, true);
+    enforceAcl(); // explicit opt-in: this test asserts the enforced refusal
     f.state.output = snapshot => {
       const safe = JSON.stringify(snapshot);
       f.stat(target).ino += 1n;
@@ -608,6 +617,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
     ["wrong-type", "link"].map(kind => ({ target, identity, kind })))))(
     "CACHE-25 TABLE initially $kind $target with $identity: invalid type refuses independently of ID", async row => {
       const f = await fixture(USER, true);
+      enforceAcl(); // explicit opt-in: exact create/native counts are the enforced sequence
       observeAs(f, row.target, row.identity, f.stat(row.target).ino);
       if (row.kind === "link") f.stat(row.target).isSymbolicLink = () => true;
       else {
@@ -625,6 +635,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
   it.each(["safe", "unsafe"] as const)(
     "CACHE-26 TABLE absent DB before/during/after preproof -> explicit create (%s): unconditional postproof", async safety => {
       const f = await fixture(USER, true);
+      if (safety === "unsafe") enforceAcl(); // the refusal row is enforcement-only
       f.absent(DB);
       const nativeDbPresence: boolean[] = [];
       f.state.output = snapshot => {
@@ -652,6 +663,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
     observations.map(after => ({ target, nativeState, after })))))(
     "CACHE-27 TABLE absent $target -> $after DURING proof ($nativeState), without create path: refuse", async row => {
       const f = await fixture(USER, true);
+      enforceAcl(); // explicit opt-in: this row asserts the enforced refusal
       f.absent(row.target);
       f.state.output = snapshot => {
         f.present(row.target);
@@ -670,6 +682,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
   it.each(["safe", "unsafe"] as const)(
     "CACHE-28 TABLE unreadable raw DB before -> native missing -> confirmed absent -> planted create (%s)", async safety => {
       const f = await fixture(USER, true);
+      if (safety === "unsafe") enforceAcl(); // the refusal row is enforcement-only
       f.rawUnreadable.add(key(DB));
       const nativeDbPresence: boolean[] = [];
       f.state.output = snapshot => {
@@ -701,6 +714,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
     ({ target, before, after })))))(
     "CACHE-29 TABLE $target $before -> native MISSING -> $after: missing descriptor never covers presence", async row => {
       const f = await fixture(USER, true);
+      enforceAcl(); // explicit opt-in: this row asserts the enforced refusal
       const identity = f.stat(row.target).ino;
       observeAs(f, row.target, row.before, identity);
       f.state.output = snapshot => {
@@ -720,6 +734,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
 
   it("CACHE-30 TABLE root absent -> native missing -> absent never bypasses createStateRoot/protect", async () => {
     const f = await fixture(USER, true);
+    enforceAcl(); // explicit opt-in: this test asserts the enforced refusal
     f.absent(ROOT);
     const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
     const create = vi.fn();
@@ -733,6 +748,7 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
   it.each(["unreadable", "absent"] as const)(
     "CACHE-31 TABLE no-create gate: %s before -> native missing -> after absent cannot authorize a connection", async before => {
       const f = await fixture(USER, true);
+      enforceAcl(); // explicit opt-in: this row asserts the enforced refusal
       if (before === "absent") f.absent(DB);
       else f.rawUnreadable.add(key(DB));
       let afterAbsent = false;
@@ -762,5 +778,113 @@ describe("Windows mesh ACL identity cache — Decision C MOCKED unit contract", 
       expect(f.native.mock.calls.length).toBeGreaterThanOrEqual(1);
       expect(f.native.mock.calls.length).toBeLessThanOrEqual(2);
       expect(f.warning).not.toHaveBeenCalled();
+    });
+
+  // Warn-by-default with an explicit, reversible opt-in. REAL gate -> REAL default reader (recorded snapshot); one
+  // module instance across every switch, so the setting must be read at each call. The unsafe snapshot never changes:
+  // only the setting does, and an unsafe proof is never cached, so every open below takes a fresh native read.
+  const advisories = (f: GateFixture) => f.warning.mock.calls
+    .filter(([, options]) => (options as { code?: string } | undefined)?.code === ADVISORY)
+    .map(([message]) => String(message));
+  const unsetEnforce = () => vi.stubEnv(ENFORCE, undefined);
+
+  it("ADVISORY-01 unsafe state.db ACE: default warns and reaches the opener; ENFORCE=1 refuses before it; unset/0 reach it again", async () => {
+    const f = await fixture(USER, true);
+    f.unsafe(DB);
+    const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+    unsetEnforce();
+    expect(process.env[ENFORCE]).toBeUndefined();
+    expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+    expect(sqliteOpen).toHaveBeenCalledTimes(1);
+    expect(sqliteOpen).toHaveBeenLastCalledWith(DB);
+    expect(advisories(f)).toEqual([expect.stringContaining(`state.db grants ${OTHER}`)]);
+    expect(advisories(f)[0]).toContain(ROOT);
+    expect(advisories(f)[0]).toContain(ENFORCE);
+    expect(f.native).toHaveBeenCalledTimes(1);
+
+    enforceAcl();
+    expect(openOutcome(f, sqliteOpen)).toMatchObject({
+      code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringContaining(`state.db grants ${OTHER}`) });
+    expect(sqliteOpen).toHaveBeenCalledTimes(1);
+    expect(f.native).toHaveBeenCalledTimes(2); // fresh evidence: the earlier advisory open cached nothing
+
+    unsetEnforce();
+    expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+    expect(sqliteOpen).toHaveBeenCalledTimes(2);
+    vi.stubEnv(ENFORCE, "0");
+    expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+    expect(sqliteOpen).toHaveBeenCalledTimes(3);
+    for (const call of [1, 2, 3]) expect(sqliteOpen).toHaveBeenNthCalledWith(call, DB);
+    expect(f.native).toHaveBeenCalledTimes(4);
+
+    // Advisory opens repaired nothing: switching back on still refuses the same unchanged finding.
+    enforceAcl();
+    expect(openOutcome(f, sqliteOpen)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+    expect(sqliteOpen).toHaveBeenCalledTimes(3);
+    expect(f.entry(DB).dacl).toContainEqual(allow(OTHER, FULL));
+    expect(advisories(f)).toHaveLength(1); // one warning per checked root; refusals add none
+  });
+
+  it("ADVISORY-02 only the exact string 1 enforces: 0/false/true/yes/padded/empty values keep starting", async () => {
+    const f = await fixture(USER, true);
+    f.unsafe(ROOT);
+    const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+    const advisoryValues = ["0", "false", "FALSE", "true", "yes", "on", "enforce", " 1", "1 ", "01", "1.0", "+1", ""];
+    for (const [index, value] of advisoryValues.entries()) {
+      vi.stubEnv(ENFORCE, value);
+      expect(openOutcome(f, sqliteOpen), JSON.stringify(value)).toBeUndefined();
+      expect(sqliteOpen, JSON.stringify(value)).toHaveBeenCalledTimes(index + 1);
+    }
+    enforceAcl();
+    expect(openOutcome(f, sqliteOpen)).toMatchObject({
+      code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringContaining(`grants ${OTHER}`) });
+    expect(sqliteOpen).toHaveBeenCalledTimes(advisoryValues.length);
+    expect(f.native).toHaveBeenCalledTimes(advisoryValues.length + 1);
+    expect(advisories(f)).toEqual([expect.stringContaining(`grants ${OTHER}`)]);
+  });
+
+  it("ADVISORY-03 warning dedupe never authorizes an enforced open and never hides the first actual warning", async () => {
+    const f = await fixture(USER, true);
+    f.unsafe(ROOT);
+    const sqliteOpen = vi.fn(() => ({ close: vi.fn() }) as never);
+    enforceAcl(); // on first, in a fresh module: refuses without spending the root's first warning
+    expect(openOutcome(f, sqliteOpen)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+    expect(sqliteOpen).not.toHaveBeenCalled();
+    expect(advisories(f)).toEqual([]);
+    unsetEnforce();
+    expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+    expect(sqliteOpen).toHaveBeenCalledTimes(1);
+    expect(advisories(f)).toEqual([expect.stringContaining(`grants ${OTHER}`)]); // the first actual warning
+    expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+    expect(sqliteOpen).toHaveBeenCalledTimes(2);
+    expect(advisories(f)).toHaveLength(1); // deduped per root
+    enforceAcl(); // an already-warned root is still refused
+    expect(openOutcome(f, sqliteOpen)).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED" });
+    expect(sqliteOpen).toHaveBeenCalledTimes(2);
+    unsetEnforce();
+    expect(openOutcome(f, sqliteOpen)).toBeUndefined();
+    expect(sqliteOpen).toHaveBeenCalledTimes(3);
+    expect(f.native).toHaveBeenCalledTimes(5);
+  });
+
+  // The advisory default covers ACL evidence only: lstat type/link and the post-open inode check still refuse.
+  it.each(["link", "wrong type", "replaced while opening"] as const)(
+    "ADVISORY-04 default mode keeps the state.db %s integrity refusal", async kind => {
+      const f = await fixture(USER, true);
+      unsetEnforce();
+      if (kind === "link") f.stat(DB).isSymbolicLink = () => true;
+      if (kind === "wrong type") { f.stat(DB).isDirectory = () => true; f.stat(DB).isFile = () => false; }
+      const close = vi.fn();
+      const sqliteOpen = vi.fn(() => {
+        if (kind === "replaced while opening") f.stat(DB).ino += 1n;
+        return { close } as never;
+      });
+      const refusal = openOutcome(f, sqliteOpen);
+      expect(refusal).toMatchObject({ code: "FABRIC_MESH_STATE_UNSUPPORTED", message: expect.stringContaining(DB) });
+      if (kind === "replaced while opening") {
+        expect((refusal as Error).message).toMatch(/replaced while opening/);
+        expect(sqliteOpen).toHaveBeenCalledTimes(1);
+        expect(close).toHaveBeenCalledTimes(1);
+      } else expect(sqliteOpen).not.toHaveBeenCalled();
     });
 });

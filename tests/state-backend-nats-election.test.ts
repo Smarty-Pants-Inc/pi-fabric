@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { importMeshStateToNats } from "../src/mesh/backend-migration-nats.js";
 import { closeNatsStateBackend, MeshStateNatsUnavailableError, natsStreamName, openNatsStateBackend, type JetStreamPort } from "../src/mesh/state-backend-nats.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { selectNatsSyncAlways } from "../src/mesh/nats-monitor-config.js";
 import { startNatsElectionCluster, stopNatsElectionCluster, type NatsElectionCluster } from "./helpers/nats-election-cluster.js";
+import { captureNatsConsumer, waitForNatsConsumerReady, waitForNatsStreamReady } from "./helpers/nats-consumer-ready.js";
 
 const binary = process.env.NATS_BIN?.trim();
 const identity: MeshIdentity = { id: "election-test", name: "election-test", kind: "agent" };
@@ -17,6 +19,20 @@ afterEach(async () => {
   }
 });
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const waitForStopped = async (child: { pid?: number | undefined }, deadline: number): Promise<void> => {
+  if (process.platform !== "linux" || child.pid === undefined) {
+    throw new Error("NATS_STOP_PROOF_UNAVAILABLE: SIGSTOP stopped-state proof needs Linux /proc and an owned child PID");
+  }
+  while (Date.now() < deadline) {
+    try {
+      const stat = fs.readFileSync(`/proc/${child.pid}/stat`, "utf8");
+      const state = stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3);
+      if (state === "T" || state === "t") return;
+    } catch { /* the owned child is still transitioning; the bounded deadline is the safety net */ }
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  throw new Error(`owned NATS child ${child.pid} did not report stopped before first NEXT`);
+};
 const streamInfo = async (seed: string, stream: string) => {
   const [{ connect }, { jetstreamManager }] = await Promise.all([import("@nats-io/transport-node"), import("@nats-io/jetstream")]);
   const nc = await connect({ servers: [seed], ignoreClusterUpdates: true });
@@ -40,7 +56,7 @@ const observePeerElection = async (cluster: NatsElectionCluster, paused: string,
           getMonitorJson(`${node.monitorUrl}/jsz?raft=true`),
         ]);
         return { node: node.name, id: server.server_id, leader: jsz.meta_cluster?.leader, health: health.status,
-          routes: routeInfo.num_routes ?? 0, syncAlways: server.jetstream?.config?.sync_always === true };
+          routes: routeInfo.num_routes ?? 0, syncAlways: selectNatsSyncAlways(server, jsz) === true };
       }));
       const leaders = new Set(states.map(state => state.leader));
       const leader = states.length === 2 && leaders.size === 1 ? states[0]!.leader : undefined;
@@ -53,9 +69,70 @@ const observePeerElection = async (cluster: NatsElectionCluster, paused: string,
   }
   throw new Error(`healthy peers did not agree on a new metadata leader before SIGCONT: ${JSON.stringify(last)}`);
 };
+describe("peer observer durability", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  const runObserver = async (varzSync: boolean | undefined, jszSync: boolean | undefined) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(() => new AbortController().signal);
+    const requestUrls: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const url = String(input);
+      requestUrls.push(url);
+      const node = url.split("/")[2]?.split(":")[0] ?? "";
+      if (url.includes("/healthz?")) return new Response(null, { status: 200 });
+      if (url.endsWith("/routez")) return new Response(JSON.stringify({ num_routes: 1 }), { status: 200 });
+      if (url.endsWith("/varz")) return new Response(JSON.stringify({ server_id: node, jetstream: varzSync === undefined ? {} : { config: { sync_always: varzSync } } }), { status: 200 });
+      if (url.includes("/jsz?raft=true")) return new Response(JSON.stringify({ meta_cluster: { leader: "peer-a" }, ...(jszSync === undefined ? {} : { config: { sync_always: jszSync } }) }), { status: 200 });
+      return new Response("unexpected monitor endpoint", { status: 404 });
+    });
+    const cluster = { nodes: ["peer-a", "peer-b", "paused"].map(name => ({ name, monitorUrl: `http://${name}` })) } as NatsElectionCluster;
+    const observation = observePeerElection(cluster, "paused", Date.now() + 250).then(
+      states => ({ kind: "resolved" as const, states }),
+      error => ({ kind: "rejected" as const, error }),
+    );
+    const bounded = Promise.race([
+      observation,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("peer observer fixture exceeded its fake-clock bound")), 1_000)),
+    ]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    return { outcome: await bounded, requestUrls };
+  };
+
+  it("accepts JSZ sync_always when the VARZ JetStream config is omitted", async () => {
+    const { outcome, requestUrls } = await runObserver(undefined, true);
+    expect(outcome.kind).toBe("resolved");
+    expect(requestUrls.some(url => url.endsWith("/routez"))).toBe(true);
+    expect(requestUrls.some(url => url.includes("/healthz?js-enabled-only=true"))).toBe(true);
+    expect(requestUrls.some(url => url.includes("/jsz?raft=true"))).toBe(true);
+    expect(requestUrls.every(url => !url.includes("paused"))).toBe(true);
+  });
+
+  it("keeps an explicit VARZ false as a veto over JSZ true", async () => {
+    const { outcome, requestUrls } = await runObserver(false, true);
+    expect(outcome.kind).toBe("rejected");
+    if (outcome.kind === "rejected") expect(outcome.error).toMatchObject({ message: expect.stringContaining("healthy peers did not agree") });
+    expect(requestUrls.some(url => url.endsWith("/routez"))).toBe(true);
+    expect(requestUrls.some(url => url.includes("/healthz?js-enabled-only=true"))).toBe(true);
+  });
+
+  it("rejects when both VARZ and JSZ omit sync_always", async () => {
+    const { outcome, requestUrls } = await runObserver(undefined, undefined);
+    expect(outcome.kind).toBe("rejected");
+    if (outcome.kind === "rejected") expect(outcome.error).toMatchObject({ message: expect.stringContaining("healthy peers did not agree") });
+    expect(requestUrls.some(url => url.endsWith("/routez"))).toBe(true);
+    expect(requestUrls.some(url => url.includes("/healthz?js-enabled-only=true"))).toBe(true);
+  });
+});
+
 describe("real three-node NATS metadata-leader election", () => {
   // Keep: #11950/#13112's real R3-history / silent R1-receiver split, without changing CREATE or pull budgets.
-  it.skipIf(!binary)("bootstraps exact R3 history while the actual distinct R1 consumer host is paused before first NEXT", async () => {
+  // Skip reason off Linux: SIGSTOP stopped-state proof needs Linux /proc.
+  it.skipIf(process.platform !== "linux" || !binary)("bootstraps exact R3 history while the actual distinct R1 consumer host is paused before first NEXT", async () => {
     const cluster = await startNatsElectionCluster(binary!);
     clusters.push(cluster); // Existing afterEach owns native child exit/scratch receipts on every outcome.
     const [{ connect }, { jetstream, jetstreamManager }, { connectJetStream }] = await Promise.all([
@@ -69,8 +146,19 @@ describe("real three-node NATS metadata-leader election", () => {
     const roots: string[] = [];
     const ports: JetStreamPort[] = [];
     const creates: ConsumerInfo[] = [];
+    const consumed = new Map<string, Consumer>();
     const placements: unknown[] = [];
     const metrics: { records: number; gets: number; elapsedMs: number }[] = [];
+    // Setup and placement have separate cumulative budgets. In particular, a healthy seed's initial NEXT may
+    // recover on the SDK's 30s pull expiry without spending the 30s allowed to find the actual fault placement.
+    let setupRemainingMs = 60_000;
+    let placementRemainingMs = 30_000;
+    const inFlight = new Set<Promise<unknown>>();
+    const track = <T,>(operation: Promise<T>): Promise<T> => {
+      inFlight.add(operation);
+      void operation.then(() => inFlight.delete(operation), () => inFlight.delete(operation));
+      return operation;
+    };
     const deferred = <T,>() => {
       let resolve!: (value: T) => void;
       const promise = new Promise<T>(yes => { resolve = yes; });
@@ -119,6 +207,7 @@ describe("real three-node NATS metadata-leader election", () => {
       // Install only AFTER the real get returns: no added await inside the adapter's existing 1s bootstrap get.
       const consume = consumer.consume.bind(consumer);
       consumer.consume = async (...consumeArgs: Parameters<Consumer["consume"]>) => {
+        consumed.set(args[0], consumer); // The selected get, never a late ACK from an abandoned bootstrap attempt.
         if (selecting) {
           const info = await consumer.info(false); // Uncached INFO, before original consume can issue its first NEXT.
           const stream = await manager.streams.info(args[0]);
@@ -150,6 +239,9 @@ describe("real three-node NATS metadata-leader election", () => {
             pausedAt = performance.now();
             resumeTimer = setTimeout(resume, 6_000); // One finite fault duration; finally also resumes on failed assertions.
             expect(host!.child.kill("SIGSTOP"), "owned R1 receiver SIGSTOP").toBe(true);
+            // SIGSTOP's kill() return only queues the signal. Wait for the owned child to report state T before
+            // allowing the original consume() to issue its first NEXT; this is the event under test, not a sleep.
+            await waitForStopped(host!.child, Date.now() + 1_000);
             faultArmed.resolve();
           }
         }
@@ -164,13 +256,28 @@ describe("real three-node NATS metadata-leader election", () => {
       let gets = 0;
       port.getMessage = (...args: Parameters<JetStreamPort["getMessage"]>) => { gets++; return get(...args); };
       const consume = port.consume.bind(port);
-      port.consume = (stream, after, onMessage, onError) => consume(stream, after, message => {
-        onMessage(message);
-        if (stream === faultStream && message.seq <= 3) {
-          received.push(message.seq);
-          if (received.length === 3) lateHistory.resolve();
+      port.consume = async (stream, after, onMessage, onError) => {
+        // Gate stream materialization before setup or fault selection, while all nodes are still running.
+        // This is NOT receiver readiness: the faulting consume below must issue its first NEXT while paused.
+        await waitForNatsStreamReady(cluster.seedUrl, stream);
+        const subscription = await consume(stream, after, message => {
+          onMessage(message);
+          if (stream === faultStream && message.seq <= 3) {
+            received.push(message.seq);
+            if (received.length === 3) lateHistory.resolve();
+          }
+        }, onError);
+        // Empty seed opens have no bootstrap history to wait for. Observe their real pending NEXT before the first
+        // setup publish; otherwise a not-yet-routed first pull can consume the entire write budget under load.
+        // The faulting reopen deliberately bypasses this readiness gate: its original receiver is stopped.
+        if (stream !== faultStream) {
+          const receiver = consumed.get(stream)!;
+          const selected = await receiver.info(true); // Cached real successful get identity, no extra request.
+          expect(creates.some(info => info.stream_name === stream && info.name === selected.name)).toBe(true);
+          await waitForNatsConsumerReady(cluster.seedUrl, stream, receiver);
         }
-      }, onError);
+        return subscription;
+      };
       const close = port.close.bind(port);
       let closing: Promise<void> | undefined;
       port.close = () => closing ??= close();
@@ -181,14 +288,47 @@ describe("real three-node NATS metadata-leader election", () => {
       fs.mkdirSync(root);
       roots.push(root);
       ownStreams.add(natsStreamName(root));
-      const { port } = await makePort();
-      const backend = await openNatsStateBackend({ root, port, replicas: 3, snapshotEvery: 0 });
-      for (let index = 0; index < records; index++) await backend.put({ key: `bootstrap/${index}`, value: { index }, identity });
-      const expected = backend.listAll();
-      expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: records, knownSeq: records });
-      closeNatsStateBackend(root);
-      await port.close();
-      return { root, expected };
+      const started = performance.now();
+      if (setupRemainingMs <= 0) throw new Error(`SETUP ${name}: cumulative seed preparation budget exhausted`);
+      const deadline = started + setupRemainingMs;
+      let active = true;
+      let port: JetStreamPort | undefined;
+      const assertActive = () => {
+        if (!active || performance.now() >= deadline) throw new Error(`SETUP ${name}: seed preparation budget expired`);
+      };
+      const preparing = (async () => {
+        ({ port } = await makePort());
+        assertActive();
+        const backend = await openNatsStateBackend({ root, port, replicas: 3, snapshotEvery: 0 });
+        assertActive();
+        for (let index = 0; index < records; index++) {
+          assertActive();
+          // Exactly one write per seed key. An unknown outcome or a projector BUSY ends SETUP; never retry it.
+          await backend.put({ key: `bootstrap/${index}`, value: { index }, identity });
+        }
+        assertActive();
+        const head = (await manager.streams.info(natsStreamName(root))).state.last_seq;
+        assertActive();
+        expect(head).toBe(records);
+        // put resolves after native projection. Confirm the actual server head, not just an ACK or a fixed sleep.
+        expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: head, knownSeq: head });
+        const expected = backend.listAll();
+        console.log(`NATS_BOOTSTRAP_SEED_READY ${JSON.stringify({ name, records, head, elapsedMs: performance.now() - started })}`);
+        return { root, expected };
+      })();
+      try { return await bounded(preparing, setupRemainingMs, `SETUP ${name}`); }
+      catch (error) { throw new Error(`SETUP ${name}: ${error instanceof Error ? error.message : String(error)}`, { cause: error }); }
+      finally {
+        active = false;
+        closeNatsStateBackend(root);
+        await port?.close();
+        // A deadline observes, but does not cancel, I/O. Join before final cleanup so no late open can register a
+        // prepared backend or begin another seed write after this setup has returned or failed.
+        await preparing.catch(() => undefined);
+        closeNatsStateBackend(root);
+        await port?.close();
+        setupRemainingMs -= performance.now() - started;
+      }
     };
     try {
       // Observations, not an invented one-GET or hard-millisecond performance SLA. Parent records BASE/candidate.
@@ -204,21 +344,24 @@ describe("real three-node NATS metadata-leader election", () => {
         closeNatsStateBackend(root);
         await measured.port.close();
       }
-      selectionDeadline = Date.now() + 30_000;
-      // Only successful healthy setups may advance this bounded placement precondition. ANY open/API error escapes.
-      for (let setup = 1; setup <= 32 && Date.now() < selectionDeadline; setup++) {
+      // Seed preparation is readiness-confirmed BEFORE opening this placement window. Neither its time nor a
+      // failed/ambiguous seed write may be mistaken for a failed fault-placement attempt.
+      for (let setup = 1; setup <= 32 && placementRemainingMs > 0; setup++) {
+        const { root, expected } = await makeSeed(`fault-bootstrap-${setup}`, 3);
+        const placementStarted = performance.now();
+        selectionDeadline = Date.now() + placementRemainingMs;
         const remaining = () => Math.max(1, selectionDeadline - Date.now());
-        const { root, expected } = await bounded(makeSeed(`fault-bootstrap-${setup}`, 3), remaining(), "seed placement precondition");
-        const measured = await bounded(makePort(), remaining(), "connect placement precondition");
+        const measured = await bounded(track(makePort()), remaining(), "connect placement precondition");
         selecting = true;
         const started = performance.now();
-        const opening = openNatsStateBackend({ root, port: measured.port, replicas: 3, snapshotEvery: 0 });
+        const opening = track(openNatsStateBackend({ root, port: measured.port, replicas: 3, snapshotEvery: 0 }));
         // Selection ends at the actual pre-NEXT placement event, not at a later faulted open's completion.
         const selected = await bounded(Promise.race([
           opening.then(backend => ({ backend })), faultArmed.promise.then(() => ({ fault: true as const })),
         ]), remaining(), "reopen placement precondition");
         const backend = "backend" in selected ? selected.backend : await bounded(opening, 5_500, "faulted initial open");
         selecting = false;
+        placementRemainingMs -= performance.now() - placementStarted;
         expect(backend.listAll()).toEqual(expected);
         expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: 3, knownSeq: 3 });
         if (!faults) {
@@ -242,7 +385,17 @@ describe("real three-node NATS metadata-leader election", () => {
         expect(backend.diagnostics().nats?.failure).toBeUndefined();
         expect((await faultConsumer!.info(false)).name).toBe(faultInfo!.name);
         expect((await manager.consumers.info(faultStream!, faultInfo!.name)).created).toBe(faultInfo!.created);
+        // SIGCONT, a leader flip and late delivery do not prove every R3 replica is current or that the
+        // original consumer has registered its next pull. Observe both, under the existing recovery bound.
+        await waitForNatsConsumerReady(cluster.seedUrl, faultStream!, faultConsumer!, { timeoutMs: 15_000 });
+        // Readiness may follow native recovery, but a successor must NEVER satisfy this original-receiver
+        // fault claim. Recheck the immutable original identity/creation and no-recreate evidence before CAS.
+        expect(await faultConsumer!.info(true)).toMatchObject({ stream_name: faultStream!, name: faultInfo!.name, created: faultInfo!.created });
+        expect((await manager.consumers.info(faultStream!, faultInfo!.name)).created).toBe(faultInfo!.created);
+        expect(faultConsumer).toMatchObject({ stream: faultStream!, name: faultInfo!.name });
+        expect(creates.filter(info => info.stream_name === faultStream)).toHaveLength(2);
         const entry = expected[0]!;
+        // Exactly one test-level PUT. Only the product's native same-msgID retries may recover a lost ACK.
         await backend.put({ key: entry.key, ifVersion: entry.version, value: { resumed: true }, identity });
         expect(backend.get(entry.key)).toMatchObject({ value: { resumed: true }, version: entry.version + 1 });
         expect(backend.diagnostics().nats).toMatchObject({ appliedSeq: 4, knownSeq: 4 });
@@ -259,13 +412,16 @@ describe("real three-node NATS metadata-leader election", () => {
       resume(); // Must precede observer/port close and the existing fixture afterEach cleanup.
       clearTimeout(resumeTimer);
       selecting = false;
+      // Join timed-out connect/open operations before restoring instrumentation and taking the cleanup snapshot.
+      // Every product request keeps its existing finite SDK/write budget; no open is retried by this harness.
+      await Promise.allSettled([...inFlight]);
       getSpy.mockRestore();
       addSpy.mockRestore();
       for (const root of roots) closeNatsStateBackend(root);
       try { await bounded(Promise.all(ports.map(port => port.close())), 3_000, "bootstrap ports close"); }
       finally { await observer.close(); }
     }
-  }, 90_000);
+  }, 180_000); // Covers separate 60s SETUP + 30s placement + recovery; the faulted-open budget remains 5s.
 
   it.skipIf(!binary)("bounds unavailable R3 placement and recovers migrations and new-root opens when the peer returns", async () => {
     const cluster = await startNatsElectionCluster(binary!);
@@ -314,9 +470,11 @@ describe("real three-node NATS metadata-leader election", () => {
       return ack;
     });
     restoreCreateSpy = () => createSpy.mockRestore();
-    const seedBackend = await openNatsStateBackend({ root, ...options, maxEventBytes: 64 * 1024 });
+    const { value: seedBackend, consumer: seedConsumer } = await captureNatsConsumer(cluster.seedUrl, initial.stream, () =>
+      openNatsStateBackend({ root, ...options, maxEventBytes: 64 * 1024 }));
     qualifiedOpens.push(initial.stream);
     try {
+      await waitForNatsConsumerReady(cluster.seedUrl, initial.stream, seedConsumer);
       await seedBackend.put({ key: "election/seed", value: { durable: true }, identity });
       const consumers = await manager.consumers.list(initial.stream).next();
       expect(consumers).toHaveLength(1);
@@ -446,10 +604,7 @@ describe("real three-node NATS metadata-leader election", () => {
       if (placement.kind === "success-r3") {
         // Observe the actual resumed stream replica becoming current, then reopen through that node and read
         // the write committed during its pause. Merely seeing num_replicas:3 on the healthy seed is not enough.
-        await expect.poll(async () => {
-          const info = await streamInfo(cluster.seedUrl, placement.value.stream);
-          return info.cluster?.leader === leader!.name || info.cluster?.replicas?.some(peer => peer.name === leader!.name && peer.current) === true;
-        }, { timeout: 10_000, interval: 100 }).toBe(true);
+        await waitForNatsStreamReady(cluster.seedUrl, placement.value.stream, { timeoutMs: 10_000 });
         const caughtUp = await openNatsStateBackend({ root: unavailableRoot, servers: [leader.clientUrl], monitoringUrl: leader.monitorUrl, replicas: 3 });
         qualifiedOpens.push(natsStreamName(unavailableRoot));
         try { expect(caughtUp.get("election/during-pause")?.value).toEqual({ durable: true }); }
@@ -494,6 +649,7 @@ describe("real three-node NATS metadata-leader election", () => {
     const casRaw = await connectJetStream([cluster.seedUrl], { monitoringUrl: cluster.seedMonitorUrl, replicas: 3 });
     try {
       const stream = initial.stream;
+      await waitForNatsStreamReady(cluster.seedUrl, stream);
       const seq = await casRaw.lastSequence(stream);
       const subject = `${stream}.state`;
       const payload = Buffer.from(JSON.stringify({ cas: "election-counterexample" }));

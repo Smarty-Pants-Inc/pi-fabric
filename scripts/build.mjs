@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { build as esbuild } from "esbuild";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { buildLandlock, stripGroupOtherWrite } from "./build-landlock.mjs";
 
 const primaryEntryPoints = [
@@ -48,10 +48,15 @@ const primaryEntryPoints = [
   "src/cli/index.ts",
 ];
 
-// Every package-local dynamic import is also an entry point. Its stable output
-// path lets a session that loaded the previous index resolve delayed modules
-// after the installed package is replaced, while preserving lazy evaluation.
+// Every package-local dynamic import is also an entry point, except the Windows-only
+// file-lock helper, which has a separately emitted stable standalone output. Stable output
+// paths let a session that loaded the previous index resolve delayed modules after
+// the installed package is replaced, while preserving lazy evaluation.
 const lazyEntryPoints = [
+  // Principal diagnostics load their private file sink only on the first diverted line.
+  "src/core/diagnostics-log.ts",
+  // Command registration is eager; the subcommand implementation loads on invocation.
+  "src/commands/fabric-handler.ts",
   // Native installer bootstrap; never exposed as a guest authority grant.
   "src/actors/slot-authority.ts",
   // Import-only per-materialization claim parsing, not idle registration work.
@@ -66,6 +71,8 @@ const lazyEntryPoints = [
   // Native host IPC is loaded only for a launch with trusted containment attestation.
   "src/residency/launcher-containment-control.ts",
   "src/residency/wake.ts",
+  // The terminal ROOT-liveness check loads only on restart-config mismatch.
+  "src/residency/wake-terminal.ts",
   "src/residency/process-work.ts",
   "src/agents/transports/process-utils.ts",
   "src/core/pid-namespace.ts",
@@ -85,12 +92,28 @@ const lazyEntryPoints = [
   "src/cli/mesh.ts",
   "src/cli/decisions.ts",
   "src/mesh/nats-auth/cli.ts",
+  "src/mesh/nats-auth/send-cli.ts",
+  "src/mesh/nats-auth/dispatch-cli.ts",
+  // First-use host custody and participant snapshots keep stable lazy paths.
+  "src/topology/host-leases.ts",
+  "src/topology/participant-view.ts",
+  // NATS-only local projection is loaded when a NATS directory starts, not for FILE sessions.
+  "src/topology/nats-local-projection.ts",
+  "src/storage/private-dir.ts",
+  "src/topology/nats-drain-receipt.ts",
+  "src/mesh/custody-lock.ts",
+  // Carrier selection and its first-use NATS module have stable lazy paths.
+  "src/transport/index.ts",
+  "src/transport/nats/index.ts",
+  "src/transport/sandbox/transport.ts",
+  "src/transport/sandbox/fabric-mesh.ts",
   "src/thinking-control.ts",
   "src/compaction/owner.ts",
   "src/compaction/orphan-repair.ts",
   "src/decisions/command.ts",
   "src/programs/host.ts",
   "src/core/provider-operations.ts",
+  "src/core/model-served.ts",
   "src/core/auto-approval-classifier-impl.ts",
   "src/guards/foreground-wait.ts",
   "src/agents/model-route.ts",
@@ -102,6 +125,9 @@ const lazyEntryPoints = [
   "src/agents/result.ts",
   "src/agents/veda-cli.ts",
   "src/agents/transports/placement.ts",
+  // Placement admission, intent construction and terminal receipts load only at first use.
+  "src/placement/client.ts",
+  "src/placement/terminal.ts",
   // Also loaded by the worker as a Pi extension (-e) for confined children.
   "src/agents/write-guard.ts",
   // Also loaded by the worker (-e) so extensions: false children keep
@@ -198,6 +224,17 @@ const result = await build({
       pluginBuild.onResolve({ filter: /\/(?:model-policy|fabric-provenance)\.js$/ }, () => ({
         path: resolve("src/host-compatibility.ts"),
       }));
+      pluginBuild.onResolve({ filter: /\/diagnostics\.js$/ }, () => ({
+        path: resolve("src/core/agent-dir.ts"),
+      }));
+    },
+  }, {
+    name: "stable-wake-file-lock",
+    setup(pluginBuild) {
+      pluginBuild.onResolve({ filter: /^\.\.\/core\/file-lock\.js$/ }, (args) =>
+        args.kind === "dynamic-import" && args.importer === resolve("src/residency/wake.ts")
+          ? { path: "../core/file-lock.js", external: true }
+          : undefined);
     },
   }],
   outdir: "dist",
@@ -231,9 +268,11 @@ const hostProvided = /^(?:typebox|@sinclair\/typebox|@(?:earendil-works|mariozec
 // today; scripts/smoke-package-install.mjs fails if one gains another.
 // fabric-mesh-backend (smarty-dev#6477 W1) is here too: its writer census shares host-leases.ts with
 // index.js, and a split build would carve that out of index.js into one more startup chunk.
+// The Windows wake-receipt helper is emitted here as a self-contained stable target; making it a
+// primary split entry would fracture the eager core/file-lock shared chunk.
 const standalone = await build({
   entryPoints: ["src/worker.ts", "src/memory/file-worker.ts", "src/storage/sweep-main.ts", "src/storage/retention-cli.ts",
-    "src/mesh/mesh-backend-cli.ts"],
+    "src/mesh/mesh-backend-cli.ts", "src/core/file-lock.ts"],
   outdir: "dist",
   outbase: "src",
   entryNames: "[dir]/[name]",
@@ -256,6 +295,17 @@ const standalone = await build({
     },
   }],
 });
+
+const standaloneFileLock = Object.entries(standalone.metafile.outputs).find(
+  ([output, metadata]) => resolve(output) === resolve("dist/core/file-lock.js") && metadata.entryPoint === "src/core/file-lock.ts",
+);
+if (!standaloneFileLock) throw new Error("Standalone core/file-lock output is missing");
+const unsupportedFileLockImports = standaloneFileLock[1].imports.filter(
+  (entry) => !entry.external || !entry.path.startsWith("node:"),
+);
+if (unsupportedFileLockImports.length > 0) {
+  throw new Error(`Standalone core/file-lock must depend only on Node built-ins:\n${unsupportedFileLockImports.map((entry) => entry.path).join("\n")}`);
+}
 
 // smarty-dev#2184: the worker loads this timeout-only hook into every Pi actor run, native-tool
 // ones included. Built on its own, without splitting, so it shares no chunk with index.js.
@@ -361,6 +411,16 @@ if (unstableLazyImports.length > 0) {
   throw new Error(
     `Package-local dynamic imports must use stable entry paths:\n${unstableLazyImports.join("\n")}`,
   );
+}
+
+const stableWakeFileLockImports = Object.entries(result.metafile.outputs).flatMap(
+  ([output, metadata]) => metadata.imports
+    .filter((entry) => entry.kind === "dynamic-import" && entry.external && entry.path === "../core/file-lock.js")
+    .map((entry) => ({ output, path: entry.path })),
+);
+if (stableWakeFileLockImports.length !== 1 || stableWakeFileLockImports.some(({ output, path }) =>
+  resolve(dirname(output), path) !== resolve("dist/core/file-lock.js"))) {
+  throw new Error("Windows wake receipt must dynamically import the stable dist/core/file-lock.js output");
 }
 
 // Last: nothing in dist/ may be writable by another user (smarty-dev#8145; assert-build-artifacts.mjs checks).

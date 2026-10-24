@@ -162,7 +162,7 @@ renewals, 11.1), except break-glass, and the maintainer also publishes `fabric.a
 
 | role | publish allow | subscribe allow |
 |---|---|---|
-| `agent` | `<B>.state`, `<B>.snapshot`, `$JS.API.INFO`, `$JS.API.STREAM.INFO.<B>`, `$JS.API.STREAM.MSG.GET.<B>`, `$JS.API.CONSUMER.{CREATE,MSG.NEXT,DELETE,INFO}.<B>.>`, `$SYS.REQ.USER.INFO` | `_INBOX.{{subject()}}.>` |
+| `agent` | `<B>.state`, `<B>.snapshot`, `$JS.API.INFO`, `$JS.API.STREAM.INFO.<B>`, `$JS.API.STREAM.MSG.GET.<B>`, `$JS.API.CONSUMER.{CREATE,MSG.NEXT,DELETE,INFO}.<B>.>`, `$JS.FC.KV_fabric_presence.>`, `$JS.FC.KV_fabric_leases.>`, `$SYS.REQ.USER.INFO` | `_INBOX.{{subject()}}.>` |
 | `principal` | `$JS.API.INFO`, `$JS.API.STREAM.INFO.*`, `$JS.API.STREAM.MSG.GET.*`, the 4 consumer verbs `.*.>`, `$JS.API.STREAM.NAMES`, `$SYS.REQ.USER.INFO` | `_INBOX.{{subject()}}.>` |
 | `maintainer` | `*.state`, `*.snapshot`, `$JS.API.INFO`, `$JS.API.STREAM.{INFO,MSG.GET,CREATE,UPDATE,DELETE,PURGE}.*`, `$JS.API.STREAM.NAMES`, the 4 consumer verbs `.*.>`, `$SYS.REQ.USER.INFO` | `_INBOX.{{subject()}}.>` |
 | `break-glass` (10.1; not a normal role) | `$JS.API.INFO`, `$JS.API.STREAM.{INFO,CREATE,UPDATE}.<CUS>`, `$JS.API.STREAM.{INFO,CREATE,UPDATE}.<LIVE>`, `$SYS.REQ.USER.INFO`; nothing else (no `MSG.GET`, no mesh root, no state subject) | `_INBOX.{{subject()}}.>` |
@@ -197,10 +197,10 @@ with its own allow and deny lists (10.1). So the normal-role deny and the break-
   agent that opens a root it was not minted for gets `Permissions Violation`; Fabric maps it to a clear error.
   `unverified:` substring expansion (`FABRIC_MESH_{{tag(mesh)}}`) and one subject per tag value; T2 measures both.
   Fallback: tag the whole stream name (works only if the server keeps tag case). Else D2.
-- **Denied to every role** (allow lists deny the rest): `CONSUMER.DURABLE.CREATE`, the unnamed one-token
+- **Denied by every role except the runtime agent's two KV flow-control replies** (allow lists deny the rest): `CONSUMER.DURABLE.CREATE`, the unnamed one-token
   `CONSUMER.CREATE.<S>` (the probe refused it; nats.js 3.4.0 uses the named form), `STREAM.MSG.DELETE`,
-  `$JS.API.ACCOUNT.>`, other `$SYS.>` (no explicit deny: deny wins and would block USER.INFO), `$JS.ACK`/`$JS.FC`
-  (pull consumers need neither), and subscribe outside the own inbox. No allow list holds `$JS.API.DIRECT.GET`;
+  `$JS.API.ACCOUNT.>`, other `$SYS.>` (no explicit deny: deny wins and would block USER.INFO), `$JS.ACK` and `$JS.FC`
+  outside the two runtime KV flow-control subjects (pull consumers need neither), and subscribe outside the own inbox. No allow list holds `$JS.API.DIRECT.GET`;
   on `<CUS>` the explicit deny (table) also keeps a later allow from opening it. Purge and stream deletion on `<CUS>`
   and `<LIVE>` are explicitly denied to every role, break-glass included; create and update on them are denied to
   every normal role; maintainer mesh-root operations stay allowed; agents purge nothing. No role, break-glass
@@ -210,9 +210,10 @@ with its own allow and deny lists (10.1). So the normal-role deny and the break-
   org on Ryzen 1 (hourly timer) mints a 1 h maintainer user, reads each root's latest snapshot, checks it as a
   reader does, and purges below its first sequence. A bad writer can still forge a snapshot and so cause loss, but
   only in the roots it is bound to.
-- **Later sets (not designed here):** event log (`origin/feat/nats-event-log`) and KV leases
-  (`origin/feat/nats-kv-leases`) each need their own bound allow entries. Custody and liveness storage (9.2) have the
-  explicit deny above; their allow entries are open item O-2.
+- **Later sets (not designed here):** event log (`origin/feat/nats-event-log`) still needs its own bound allow entries.
+  Runtime KV watches now publish only `$JS.FC.KV_fabric_presence.>` and `$JS.FC.KV_fabric_leases.>` for ordered
+  flow-control replies. Custody and liveness storage (9.2) have the explicit deny above; their data allow entries are
+  open item O-2.
 - **Expiry.** Agent `exp` = 7 days; Fabric's own cutoff at `exp − 1 h` (C6). Maintainer: 2 h migration, 1 h
   compaction. Principal: 90 days. Break-glass: 1 h (10.1). *Amended (11.1, slice 2+):* every user JWT has `exp` at
   most 1 h after it is signed (agent, principal, maintainer, custodian; break-glass and the SYS-only user stay 1 h, not

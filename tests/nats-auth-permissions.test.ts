@@ -23,6 +23,8 @@ interface RoleTemplate {
 }
 interface PermissionsModule {
   roleTemplate(role: NatsRole, input: { custodyStream: string; livenessStream: string }): RoleTemplate;
+  roleTemplateWithPathB(role: NatsRole | "operator", input: { custodyStream: string; livenessStream: string }, machines?: readonly string[]): RoleTemplate;
+  legacyRoleTemplateWithPathB(role: "agent", input: { custodyStream: string; livenessStream: string }, machines?: readonly string[]): RoleTemplate;
 }
 
 async function loadPermissions(): Promise<PermissionsModule> {
@@ -260,6 +262,21 @@ describe("#7504 roleTemplate: refused verbs", () => {
     for (const subject of [`${root}.state`, `${root}.snapshot`, ...["CREATE", "UPDATE", "DELETE", "PURGE"].map((v) => `$JS.API.STREAM.${v}.${root}`)]) {
       expect(mayPublish(template, anyUser, subject), subject).toBe(false);
     }
+  });
+});
+
+describe("#1276 runtime KV flow-control grants", () => {
+  it("adds only the two ordered-consumer flow-control replies to the current agent scope", async () => {
+    const { roleTemplateWithPathB, legacyRoleTemplateWithPathB } = await loadPermissions();
+    const current = roleTemplateWithPathB("agent", STREAMS, ["machine-a"]);
+    const legacy = legacyRoleTemplateWithPathB("agent", STREAMS, ["machine-a"]);
+    const flowControl = ["$JS.FC.KV_fabric_presence.>", "$JS.FC.KV_fabric_leases.>"];
+    expect(flowControl.every((subject) => current.pub.allow.includes(subject))).toBe(true);
+    expect(flowControl.some((subject) => current.pub.deny.includes(subject))).toBe(false);
+    expect(flowControl.some((subject) => legacy.pub.allow.includes(subject))).toBe(false);
+    expect(current.pub.allow.filter((subject) => !legacy.pub.allow.includes(subject))).toEqual(flowControl);
+    expect(current.pub.deny).toEqual(legacy.pub.deny);
+    expect(current.sub).toEqual(legacy.sub);
   });
 });
 

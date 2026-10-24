@@ -6,8 +6,8 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { deadSessionPresence, reapDeadSessionPresence } from "../src/actors/presence-reaper.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { writeHostLease } from "../src/topology/host-leases.js";
+import { MeshStore, type MeshBatchView, type MeshIdentity, type MeshStateEntry } from "../src/mesh/store.js";
+import { hostLeasePath, writeHostLease } from "../src/topology/host-leases.js";
 
 const roots: string[] = [];
 const closers: Array<() => Promise<void>> = [];
@@ -30,6 +30,174 @@ const presence = (mesh: MeshStore, session: string, actor: string) =>
   mesh.put({ key: `actors/${session}/${actor}`, value: { id: actor, name: actor, status: "idle" }, identity: writer });
 const lease = (mesh: MeshStore, key: string, value: Record<string, unknown>) =>
   mesh.put({ key: `topology/hosts/${key}`, value, identity: writer });
+
+// Data-safety regressions: exercise the reaper's real conditions/fences but NEVER call a
+// backend delete. The receipt is staged until beforeCommit succeeds, as on file/SQLite.
+const recordedReaper = (count = 1) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-presence-recorded-"));
+  roots.push(root);
+  const t0 = Date.now();
+  const entries = new Map<string, MeshStateEntry>();
+  const put = (key: string, value: unknown, updatedAt = t0, version = 1) => {
+    entries.set(key, { key, value, updatedAt, version, updatedBy: writer });
+  };
+  for (let n = 0; n < count; n++) put(`actors/dead/a${n.toString().padStart(3, "0")}`, { id: `a${n.toString().padStart(3, "0")}` });
+  const options = { ownSessionId: "mine", now: t0 + 2 * DAY };
+  const fileLease = (id = "session:dead", fresh = false) => writeHostLease(root, {
+    id, rootId: "session:dead", identityId: id, updatedAt: fresh ? options.now : t0,
+    expiresAt: fresh ? options.now + HOUR : t0, incarnationToken: "owner",
+  });
+  const held: string[] = [];
+  const sizes: number[] = [];
+  const gatesAtBatch: string[][] = [];
+  const committed: string[] = [];
+  let beforeBatch = (_batch: number) => {};
+  let beforeCommit = (_batch: number) => {};
+  const list = (prefix = "") => [...entries.values()].filter(entry => entry.key.startsWith(prefix));
+  const view: MeshBatchView = { get: key => entries.get(key), version: key => entries.get(key)?.version ?? 0,
+    listAll: prefix => {
+      // Locked prepare must never rescan actors (or plan over the whole state).
+      expect(prefix).toBe("topology/hosts/");
+      return list(prefix);
+    } };
+  const mesh: Pick<MeshStore, "listAll" | "writeBatch" | "leaseCustody"> & { root: string } = {
+    root,
+    listAll: (prefix = "") => list(prefix),
+    leaseCustody: async (file, operation) => {
+      held.push(file);
+      try { return await operation(); } finally { expect(held.pop()).toBe(file); }
+    },
+    writeBatch: async input => {
+      gatesAtBatch.push([...held]);
+      sizes.push(input.ops.length);
+      beforeBatch(sizes.length);
+      const ops = [...input.ops, ...(input.prepare?.(view) ?? [])];
+      const results = ops.map(op => ({ key: op.key, version: entries.get(op.key)?.version ?? 0,
+        applied: op.kind === "delete" && (op.condition?.(view.get) ?? true) && entries.get(op.key)?.version === op.ifVersion }));
+      beforeCommit(sizes.length);
+      input.beforeCommit?.();
+      committed.push(...results.filter(result => result.applied).map(result => result.key));
+      // Deliberately do not mutate entries or invoke any product deletion.
+      return results;
+    },
+  };
+  return { mesh, entries, put, options, fileLease, committed, sizes, held, gatesAtBatch,
+    beforeBatch: (hook: typeof beforeBatch) => { beforeBatch = hook; },
+    beforeCommit: (hook: typeof beforeCommit) => { beforeCommit = hook; } };
+};
+
+describe("presence reaper commit admission (recorded deletion only)", () => {
+  it.each(["state", "file"])("keeps unchanged actor rows when only the %s owner lease renews after selection", async kind => {
+    const run = recordedReaper();
+    run.put("topology/hosts/session:dead", { id: "session:dead", expiresAt: run.options.now - 2 * DAY });
+    run.fileLease();
+    const actor = structuredClone(run.entries.get("actors/dead/a000"));
+    run.beforeBatch(() => {
+      if (kind === "file") run.fileLease("session:dead", true);
+      else run.put("topology/hosts/session:dead", { id: "session:dead", expiresAt: run.options.now + HOUR }, run.options.now, 2);
+    });
+    expect(await reapDeadSessionPresence(run.mesh, writer, run.options)).toBe(0);
+    expect(run.committed).toEqual([]);
+    expect(run.entries.get("actors/dead/a000")).toEqual(actor);
+    expect(run.held).toEqual([]);
+  });
+
+  it("fences a file-only renewal AFTER conditions, at the actual commit boundary", async () => {
+    const run = recordedReaper();
+    run.fileLease();
+    run.beforeCommit(() => run.fileLease("session:dead", true));
+    expect(await reapDeadSessionPresence(run.mesh, writer, run.options)).toBe(0);
+    expect(run.committed).toEqual([]);
+    expect(run.sizes).toEqual([1]);
+  });
+
+  it("admits truly dead rows and retains exact actor-row CAS", async () => {
+    const run = recordedReaper(2);
+    run.fileLease();
+    run.beforeBatch(() => run.put("actors/dead/a001", { id: "a001" }, run.options.now, 2));
+    expect(await reapDeadSessionPresence(run.mesh, writer, run.options)).toBe(1);
+    expect(run.committed).toEqual(["actors/dead/a000"]);
+    expect(run.entries.size).toBe(2); // Recording, not real deletion.
+  });
+
+  it("releases all gates between 64-row batches and refuses a later lease-only renewal", async () => {
+    const run = recordedReaper(137);
+    run.fileLease();
+    run.beforeCommit(batch => { if (batch === 2) run.fileLease("session:dead", true); });
+    expect(await reapDeadSessionPresence(run.mesh, writer, run.options)).toBe(64);
+    expect(run.sizes).toEqual([64, 64]);
+    expect(run.committed).toHaveLength(64);
+    expect(run.held).toEqual([]);
+  });
+
+  it("retains batch64 and yielding for a truly dead owner", async () => {
+    const run = recordedReaper(137);
+    run.fileLease();
+    expect(await reapDeadSessionPresence(run.mesh, writer, run.options)).toBe(137);
+    expect(run.sizes).toEqual([64, 64, 9]);
+    expect(run.committed).toHaveLength(137);
+    expect(run.gatesAtBatch).toEqual(Array.from({ length: 3 }, () => [hostLeasePath(run.mesh.root, "session:dead")]));
+    expect(run.held).toEqual([]);
+  });
+
+  it.each(["before conditions", "before commit"])("refuses a new file-only resident appearing %s", async when => {
+    const run = recordedReaper();
+    const replace = () => run.fileLease("resident:new-owner", true);
+    if (when === "before conditions") run.beforeBatch(replace);
+    else run.beforeCommit(replace);
+    expect(await reapDeadSessionPresence(run.mesh, writer, run.options)).toBe(0);
+    expect(run.committed).toEqual([]);
+  });
+
+  it("gates and revision-fences an existing resident's file-only renewal", async () => {
+    const run = recordedReaper();
+    run.fileLease("resident:old-owner");
+    run.beforeCommit(() => run.fileLease("resident:old-owner", true));
+    expect(await reapDeadSessionPresence(run.mesh, writer, run.options)).toBe(0);
+    expect(run.committed).toEqual([]);
+    expect(run.gatesAtBatch[0]).toContain(hostLeasePath(run.mesh.root, "resident:old-owner"));
+  });
+
+  it("sees a replacement resident published only in state after selection", async () => {
+    const run = recordedReaper();
+    run.beforeBatch(() => run.put("topology/hosts/resident:new", {
+      id: "resident:new", rootId: "session:dead", expiresAt: run.options.now + HOUR,
+    }, run.options.now));
+    expect(await reapDeadSessionPresence(run.mesh, writer, run.options)).toBe(0);
+    expect(run.committed).toEqual([]);
+  });
+
+  it("checks a legacy session's current row independently for each delete", async () => {
+    const run = recordedReaper();
+    run.put("actors/legacy/a", { id: "a" });
+    run.put("sessions/legacy", { id: "session:legacy" });
+    run.beforeBatch(() => run.put("sessions/legacy", { id: "session:legacy" }, run.options.now, 2));
+    expect(await reapDeadSessionPresence(run.mesh, writer, run.options)).toBe(1);
+    expect(run.committed).toEqual(["actors/dead/a000"]);
+  });
+
+  it("refuses an unreadable lease directory rather than interpreting it as empty", async () => {
+    const run = recordedReaper();
+    run.fileLease();
+    const unreadable = vi.spyOn(fs, "readdirSync").mockImplementation(() => {
+      throw Object.assign(new Error("unreadable lease directory"), { code: "EACCES" });
+    });
+    try {
+      expect(await reapDeadSessionPresence(run.mesh, writer, run.options)).toBe(0);
+      expect(run.committed).toEqual([]);
+    } finally { unreadable.mockRestore(); }
+  });
+
+  it.each(["selection", "commit"])("refuses invalid lease evidence at %s", async when => {
+    const run = recordedReaper();
+    run.fileLease();
+    const corrupt = () => fs.writeFileSync(hostLeasePath(run.mesh.root, "session:dead"), "invalid lease");
+    if (when === "selection") corrupt();
+    else run.beforeCommit(corrupt);
+    expect(await reapDeadSessionPresence(run.mesh, writer, run.options)).toBe(0);
+    expect(run.committed).toEqual([]);
+  });
+});
 
 // Every entry below is written now; "now" in the reaper is moved forward to age them.
 describe("dead sessions' actor presence with file leases (smarty-dev#816)", () => {
@@ -101,6 +269,27 @@ describe("dead sessions' actor presence (smarty-dev#448)", () => {
     batch.mockClear();
     await reapDeadSessionPresence(mesh, writer, { ownSessionId: "mine", now: Date.now() });
     expect(batch).not.toHaveBeenCalled();
+  });
+
+  it("yields custody every 64 deletions and keeps a renewed entry in a later batch", async () => {
+    const { mesh } = store();
+    await mesh.writeBatch({ identity: writer, ops: Array.from({ length: 137 }, (_, n) => ({
+      kind: "put" as const, key: `actors/dead/a${n}`, value: { id: `a${n}` },
+    })) });
+    const original = mesh.writeBatch.bind(mesh);
+    const sizes: number[] = [];
+    let active = false;
+    vi.spyOn(mesh, "writeBatch").mockImplementation(async input => {
+      expect(active).toBe(false); active = true;
+      sizes.push(input.ops.length);
+      try {
+        if (sizes.length === 1) await presence(mesh, "dead", "a70");
+        return await original(input);
+      } finally { active = false; }
+    });
+    expect(await reapDeadSessionPresence(mesh, writer, { ownSessionId: "mine", now: Date.now() + 2 * DAY })).toBe(136);
+    expect(sizes).toEqual([64, 64, 9]);
+    expect(mesh.listAll("actors/", { fresh: true }).map(entry => entry.key)).toEqual(["actors/dead/a70"]);
   });
 
   it("runs on a persistent manager's retention sweep, and not on a secondary scope manager", async () => {

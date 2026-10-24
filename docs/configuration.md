@@ -379,7 +379,6 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
   "mesh": {
     "controlIncarnationFence": "warn",
     "lockProtocol": 1,
-    "stateBackend": "file",
     "enabled": true,
     "announce": false,
     "actorScope": "project",
@@ -925,13 +924,18 @@ Mesh data lives at `<project>/.pi/fabric/mesh` by default. Set `mesh.root` to a 
 
 Sessions that share one `mesh.root` share one participant directory, so each sees the others through `agents.sessions()` and can `steer` or `followUp` them. A Main normally joins that directory when it first uses Fabric. Set `mesh.announce` to `true` in the project configuration to join at session start instead, so an idle peer is reachable. Announcing loads the Fabric runtime during startup, so avoid it in a global configuration that applies to every project.
 
-`mesh.stateBackend` selects where keyed mesh state lives: `"file"` (the default, `state.json` behind the mesh
-`.lock`), `"shadow"` (`state.json` stays the authority; committed values are also mirrored to
+`mesh.stateBackend` is optional. When set, it selects where keyed mesh state lives: `"file"` (`state.json` behind
+the mesh `.lock`), `"shadow"` (`state.json` stays the authority; committed values are also mirrored to
 `<mesh>/state-shadow/state.db` for divergence checks, and a SQLite failure never fails a write) or `"sqlite"`
-(`<mesh>/state.db`, SQLite WAL, no mesh `.lock` for state; see `src/mesh/state-backend.ts`). The environment
-variable `PI_FABRIC_MESH_STATE_BACKEND` overrides it. A root on a network filesystem or a runtime without
-`node:sqlite` uses `"file"`. Switching an existing mesh to `"sqlite"` needs the migration of smarty-dev#6477 (L4); `fabric-mesh-backend cutover` is
-fenced only on the mesh `.lock` plus `custody.lock`; its writer census is advisory only (printed as
+(`<mesh>/state.db`, SQLite WAL, no mesh `.lock` for state; see `src/mesh/state-backend.ts`). The nonblank
+`PI_FABRIC_MESH_STATE_BACKEND` environment variable overrides the configured value. If neither configuration nor
+that environment variable selects a backend, Fabric uses `"sqlite"` only when the effective root has a valid marker
+for a completed SQLite state move; otherwise it uses `"file"`, including for fresh roots and roots with file-backed
+state. Explicit configuration and environment selections remain in force. If a selected backend conflicts with state
+already established at the root, the existing fences refuse initialization to prevent split state.
+File-backed roots on a network filesystem or in a runtime without `node:sqlite` continue to use `"file"`. Switching
+an existing mesh to `"sqlite"` needs the migration of smarty-dev#6477 (L4); `fabric-mesh-backend cutover` is fenced
+only on the mesh `.lock` plus `custody.lock`; its writer census is advisory only (printed as
 `advisory: N writers, M unknown`) and never a cutover gate (smarty-dev#6982). Do not set it by hand on a shared mesh.
 
 `mesh.lockProtocol` accepts only numeric `1`, `2` or `3` and defaults to `1`. It is captured

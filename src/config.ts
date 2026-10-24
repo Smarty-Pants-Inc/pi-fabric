@@ -487,7 +487,7 @@ export type MeshStateBackend = MeshStateBackendKind;
 
 // The import-free kinds leaf on purpose: importing state-backend.ts here would put SQLite in the config graph.
 const MESH_STATE_BACKENDS: readonly MeshStateBackend[] = MESH_STATE_BACKEND_KINDS;
-const meshStateBackend = (value: unknown, env = process.env.PI_FABRIC_MESH_STATE_BACKEND): MeshStateBackend => {
+const meshStateBackend = (value: unknown, env = process.env.PI_FABRIC_MESH_STATE_BACKEND): MeshStateBackend | undefined => {
   // The environment overrides the file setting. An unknown non-empty value is refused, never ignored:
   // a typo would silently open a different store than its peers and split the mesh (pi-fabric#796).
   const override = env?.trim().toLowerCase();
@@ -495,7 +495,8 @@ const meshStateBackend = (value: unknown, env = process.env.PI_FABRIC_MESH_STATE
     if ((MESH_STATE_BACKENDS as readonly string[]).includes(override)) return override as MeshStateBackend;
     throw new Error(`PI_FABRIC_MESH_STATE_BACKEND must be ${MESH_STATE_BACKEND_KIND_LIST} (got ${JSON.stringify(env)})`);
   }
-  if (value === undefined) return "file";
+  // Preserve omission: only the backend factory can choose the effective default for a root.
+  if (value === undefined) return undefined;
   if (typeof value === "string" && (MESH_STATE_BACKENDS as readonly string[]).includes(value)) return value as MeshStateBackend;
   throw new Error(`mesh.stateBackend must be ${MESH_STATE_BACKEND_KIND_LIST}`);
 };
@@ -805,8 +806,8 @@ export interface FabricMeshConfig {
   controlIncarnationFence: MeshControlIncarnationFence;
   /** Startup-only wire protocol; 1 preserves compatibility with B68 writers. */
   lockProtocol: MeshLockProtocol;
-  /** Keyed-state backend: "file" (default), "shadow", "sqlite" or "nats" (refused until built); env PI_FABRIC_MESH_STATE_BACKEND overrides. */
-  stateBackend: MeshStateBackend;
+  /** Explicit keyed-state backend; env PI_FABRIC_MESH_STATE_BACKEND overrides. Unset defers to the root's backend factory. */
+  stateBackend?: MeshStateBackend;
   /** Control carrier; default file, env PI_FABRIC_MESH_TRANSPORT overrides. */
   transport: FabricMeshTransport;
   /** Explicit per-host rollout stamp. A differing runtime carrier is refused. */
@@ -1154,7 +1155,6 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   mesh: {
     controlIncarnationFence: "warn",
     lockProtocol: 1,
-    stateBackend: "file",
     transport: "file",
     nats: { replicas: 1, inboxLanes: 8, events: false, provision: false, ephemeralHost: false, ephemeralInactiveSeconds: 3_600, inboxMaxAgeMs: DEFAULT_INBOX_MAX_AGE_MS },
     enabled: true,
@@ -1560,6 +1560,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const retention = objectValue(input.retention);
   const actors = objectValue(input.actors);
   const mesh = objectValue(input.mesh);
+  const stateBackend = meshStateBackend(mesh.stateBackend);
   const carrier = meshTransport(mesh.transport);
   const hostTransport = meshHostTransport(mesh.hostTransport);
   // An unstamped host is on today's file carrier; selecting NATS never silently flips the host.
@@ -2140,7 +2141,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
     mesh: {
       controlIncarnationFence: meshControlIncarnationFence(mesh.controlIncarnationFence),
       lockProtocol: meshLockProtocol(mesh.lockProtocol),
-      stateBackend: meshStateBackend(mesh.stateBackend),
+      ...(stateBackend !== undefined ? { stateBackend } : {}),
       transport: carrier,
       ...(hostTransport !== undefined ? { hostTransport } : {}),
       nats: meshNatsConfig(mesh.nats, carrier),

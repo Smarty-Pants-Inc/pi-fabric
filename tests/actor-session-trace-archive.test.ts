@@ -284,7 +284,8 @@ describe("actor session traces are archived, never deleted (smarty-dev#16444)", 
     };
     const moved = pruneActorSessionBackups(session);
     expect(moved[0]).toMatchObject({ from: names[0], sha256: hashes[0], manifest: false });
-    expect(moved[0]!.problem).toMatch(/EACCES|permission/i);
+    // Linux and macOS: EACCES; Windows: EPERM (the read-only manifest refuses the append there with EPERM).
+    expect(moved[0]!.problem).toMatch(/EACCES|EPERM|permission/i);
     expect(sha(moved[0]!.to)).toBe(hashes[0]);
     expect(fs.existsSync(names[0]!)).toBe(false);
     // The read-only manifest refuses the next MOVING intent: those backups stay in place (nothing moved, nothing lost).

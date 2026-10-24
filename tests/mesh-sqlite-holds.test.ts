@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -237,6 +238,44 @@ it("never alters result objects or adapter receivers and resets per-hold aggrega
   }
 });
 
+it.each(["run", "get", "all"] as const)("%s bookkeeping failures preserve driver successes and original exceptions", async method => {
+  const f = fake(), root = temp();
+  const original = f.db.prepare("SELECT value FROM kv");
+  let failClock = false;
+  const invoke = <T,>(call: () => T): T => {
+    try { return call(); } finally { failClock = true; }
+  };
+  vi.spyOn(f.db, "prepare").mockReturnValue({
+    run: (...params) => invoke(() => original.run(...params)),
+    get: (...params) => invoke(() => original.get(...params)),
+    all: (...params) => invoke(() => original.all(...params)),
+  });
+  const db = recordSqliteHolds(f.db, root, "bookkeeping", { thresholdMs: 1, now: () => {
+    if (failClock) { failClock = false; throw new Error("diagnostic clock failed"); }
+    return f.now();
+  } });
+  const statement = db.prepare("SELECT value FROM kv");
+  db.exec("BEGIN IMMEDIATE");
+  expect(statement[method]()).toBe({ run: f.result, get: f.row, all: f.rows }[method]);
+  f.state.stepError = new Error("original driver failure");
+  expect(() => statement[method]()).toThrow(f.state.stepError);
+  db.exec("ROLLBACK");
+  await Promise.resolve();
+  expect(read(root)).toMatchObject([{ outcome: "rollback", phases: [] }]);
+});
+
+it("a throwing changes getter cannot replace a successful run result or record a statement error", async () => {
+  const f = fake(), root = temp();
+  Object.defineProperty(f.result, "changes", { get() { throw new Error("diagnostic conversion failed"); } });
+  const db = recordSqliteHolds(f.db, root, "changes", { thresholdMs: 1, now: f.now });
+  const statement = db.prepare("UPDATE kv SET value = ?");
+  db.exec("BEGIN IMMEDIATE");
+  expect(statement.run()).toBe(f.result);
+  db.exec("COMMIT");
+  await Promise.resolve();
+  expect(read(root)).toMatchObject([{ outcome: "commit", phases: [] }]);
+});
+
 it("times prepare/exec inside custody and preserves preparation errors", async () => {
   const f = fake(), root = temp();
   const db = recordSqliteHolds(f.db, root, "prepare", { thresholdMs: 1, now: f.now });
@@ -294,6 +333,115 @@ it("bounds the current and previous generations; contention drops instead of wai
   expect(read(root)).toHaveLength(2);
   expect(fs.statSync(file).size).toBeLessThanOrEqual(SQLITE_HOLDS_MAX_BYTES);
 });
+
+const metricLine = (): SqliteHoldLine => ({ v: 1, at: new Date().toISOString(), tag: "test:append", pid: process.pid,
+  release: "test", bridge: false, waitMs: 0, holdMs: 3, commitMs: 0, rollbackMs: 0, outcome: "commit", phases: [] });
+
+// Keep: recorded real catch, PR #1582: a bridge's umask-0002 metrics directory stranded the append lock.
+it.skipIf(process.platform === "win32")("appends every line and releases its lock in a 0775 metrics directory", () => {
+  const root = temp(), file = sqliteHoldsPath(root);
+  fs.mkdirSync(path.dirname(file));
+  fs.chmodSync(path.dirname(file), 0o775);
+  expect(fs.statSync(path.dirname(file)).mode & 0o777).toBe(0o775);
+  for (let i = 0; i < 5; i++) {
+    appendSqliteHold(root, { ...metricLine(), holdMs: i });
+    expect(fs.existsSync(file + ".lock")).toBe(false);
+  }
+  expect(read(root).map(line => line.holdMs)).toEqual([0, 1, 2, 3, 4]);
+});
+
+it.skipIf(process.platform === "win32")("reclaims a stale append lock in a 0775 metrics directory", () => {
+  const root = temp(), file = sqliteHoldsPath(root);
+  fs.mkdirSync(path.dirname(file));
+  fs.chmodSync(path.dirname(file), 0o775);
+  fs.writeFileSync(file + ".lock", "");
+  fs.utimesSync(file + ".lock", new Date(0), new Date(0));
+  for (let i = 0; i < 3; i++) appendSqliteHold(root, { ...metricLine(), holdMs: i });
+  expect(read(root).map(line => line.holdMs)).toEqual([0, 1, 2]);
+  expect(fs.existsSync(file + ".lock")).toBe(false);
+});
+
+it("does not remove a successor lock installed while releasing our own lock", () => {
+  const root = temp(), file = sqliteHoldsPath(root), lock = file + ".lock";
+  const write = fs.writeSync.bind(fs);
+  vi.spyOn(fs, "writeSync").mockImplementation((...args: Parameters<typeof fs.writeSync>) => {
+    // Keep the old inode alive under another name so even inode reuse cannot mask a mismatch.
+    fs.renameSync(lock, lock + ".old");
+    fs.writeFileSync(lock, "successor");
+    return write(...args);
+  });
+  appendSqliteHold(root, metricLine());
+  expect(read(root)).toHaveLength(1);
+  expect(fs.readFileSync(lock, "utf8")).toBe("successor");
+});
+
+it("does not reclaim a fresh successor swapped in after observing a stale lock", () => {
+  const root = temp(), file = sqliteHoldsPath(root), lock = file + ".lock";
+  fs.mkdirSync(path.dirname(file));
+  fs.writeFileSync(lock, "stale");
+  fs.utimesSync(lock, new Date(0), new Date(0));
+  const lstat = fs.lstatSync.bind(fs);
+  let swapped = false;
+  vi.spyOn(fs, "lstatSync").mockImplementation((...args: Parameters<typeof fs.lstatSync>) => {
+    const seen = lstat(...args);
+    if (args[0] === lock && !swapped) {
+      swapped = true;
+      fs.renameSync(lock, lock + ".old");
+      fs.writeFileSync(lock, "successor");
+    }
+    return seen;
+  });
+  appendSqliteHold(root, metricLine());
+  expect(read(root)).toEqual([]);
+  expect(fs.readFileSync(lock, "utf8")).toBe("successor");
+});
+
+it("four processes append complete bounded JSON lines through rotation without leaving lock or temporary files", async () => {
+  const root = temp(), file = sqliteHoldsPath(root);
+  fs.mkdirSync(path.dirname(file));
+  if (process.platform !== "win32") fs.chmodSync(path.dirname(file), 0o775);
+  const seed = JSON.stringify({ ...metricLine(), tag: "s".repeat(20_000) }) + "\n";
+  fs.writeFileSync(file, seed.repeat(Math.floor(SQLITE_HOLDS_MAX_BYTES / Buffer.byteLength(seed))));
+  const script = `import { createJiti } from "jiti"; import { pathToFileURL } from "node:url";
+    const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+    const { appendSqliteHold } = await jiti.import("./src/mesh/sqlite-holds.ts");
+    process.send("ready");
+    process.once("message", () => {
+      for (let i = 0; i < 200; i++) appendSqliteHold(process.argv[1], {
+        v: 1, at: new Date().toISOString(), tag: "p".repeat(20_000), pid: process.pid,
+        release: "test", bridge: false, waitMs: 0, holdMs: i, commitMs: 0, rollbackMs: 0, outcome: "commit", phases: []
+      });
+      process.disconnect();
+    });`;
+  const children = Array.from({ length: 4 }, () => spawn(process.execPath, ["--input-type=module", "-e", script, root],
+    { cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe", "ipc"] }));
+  const exits = children.map(child => new Promise<void>((resolve, reject) => {
+    let stderr = "";
+    child.stderr!.on("data", chunk => { stderr += String(chunk); });
+    child.once("error", reject);
+    child.once("exit", code => code === 0 ? resolve() : reject(new Error(`appender exit ${code}: ${stderr}`)));
+  }));
+  // Install rejection handlers before waiting for the ready barrier, including early import failures.
+  const completed = Promise.all(exits);
+  try {
+    await Promise.race([completed.then(() => { throw new Error("appenders exited before ready"); }),
+      Promise.all(children.map(child => new Promise<void>(resolve => child.once("message", () => resolve()))))]);
+    for (const child of children) child.send("go");
+    await completed;
+  } finally {
+    for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill();
+    await Promise.allSettled(exits);
+  }
+  expect(fs.readdirSync(path.dirname(file)).sort()).toEqual(["sqlite-holds.jsonl", "sqlite-holds.jsonl.1"]);
+  for (const generation of [file, file + ".1"]) {
+    expect(fs.statSync(generation).size).toBeLessThanOrEqual(SQLITE_HOLDS_MAX_BYTES);
+    const data = fs.readFileSync(generation, "utf8");
+    expect(data.endsWith("\n")).toBe(true);
+    const lines = data.trimEnd().split("\n").map(line => JSON.parse(line) as SqliteHoldLine);
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) expect(line).toMatchObject({ v: 1, outcome: "commit", phases: [] });
+  }
+}, 30_000);
 
 it("bounds statement cardinality on a connection, including dynamic prepare calls", async () => {
   const f = fake(), root = temp();

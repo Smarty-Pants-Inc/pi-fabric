@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import { verifiedRemove } from "../storage/verified-remove.js";
 import type { SqliteConnection, SqliteStatement, SqliteValue } from "./state-sqlite.js";
 
 export const DEFAULT_SQLITE_HOLD_MS = 2_000;
@@ -35,11 +34,16 @@ export const sqliteHoldsPath = (root: string): string => path.join(root, "metric
  */
 export function appendSqliteHold(root: string, line: SqliteHoldLine): void {
   let lockFd: number | undefined;
-  let own: fs.Stats | undefined;
+  let own: fs.BigIntStats | undefined;
   const file = sqliteHoldsPath(root);
   const lock = file + ".lock";
-  const unlinkGone = () => {
-    try { fs.unlinkSync(lock); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  // Metrics may already be group-writable (other appenders use the bridge's umask).
+  // Remove only the lock inode we held or judged stale, not a successor at the same name.
+  // BigInt preserves the full file id on Windows as well as Unix.
+  const removeLock = (seen: fs.BigIntStats): boolean => {
+    const current = fs.lstatSync(lock, { bigint: true, throwIfNoEntry: false });
+    if (!current || current.dev !== seen.dev || current.ino !== seen.ino) return false;
+    fs.unlinkSync(lock);
     return true;
   };
   try {
@@ -54,13 +58,13 @@ export function appendSqliteHold(root: string, line: SqliteHoldLine): void {
       try { lockFd = fs.openSync(lock, "wx", 0o600); break; }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt !== 0) return;
-        const seen = fs.lstatSync(lock);
-        if (!seen.isFile() || seen.isSymbolicLink() || Date.now() - seen.mtimeMs <= 60_000) return;
-        if (!verifiedRemove(lock, seen, { deleter: "sqliteHoldsLock", fallback: unlinkGone }).removed) return;
+        const seen = fs.lstatSync(lock, { bigint: true });
+        if (!seen.isFile() || seen.isSymbolicLink() || Date.now() - Number(seen.mtimeMs) <= 60_000) return;
+        if (!removeLock(seen)) return;
       }
     }
     if (lockFd === undefined) return;
-    own = fs.fstatSync(lockFd);
+    own = fs.fstatSync(lockFd, { bigint: true });
     const seen = fs.lstatSync(file, { throwIfNoEntry: false });
     if (seen && (!seen.isFile() || seen.isSymbolicLink())) return;
     if (seen && seen.size + data.length > SQLITE_HOLDS_MAX_BYTES) {
@@ -78,7 +82,7 @@ export function appendSqliteHold(root: string, line: SqliteHoldLine): void {
   finally {
     if (lockFd !== undefined) {
       try { fs.closeSync(lockFd); } catch { /* best effort */ }
-      try { if (own) verifiedRemove(lock, own, { deleter: "sqliteHoldsLock", fallback: unlinkGone }); } catch { /* best effort */ }
+      try { if (own) removeLock(own); } catch { /* best effort */ }
     }
   }
 }
@@ -279,37 +283,44 @@ export function recordSqliteHolds(db: SqliteConnection, root: string, defaultTag
         run(...params: SqliteValue[]) {
           if (!r.active) return statement.run(...params);
           const started = r.now();
-          try {
-            const result = statement.run(...params);
-            r.note(runId, r.now() - started, Number(result.changes));
-            return result;
-          } catch (error) {
-            r.note(runId, r.now() - started, 0, true);
+          let result: ReturnType<SqliteStatement["run"]>;
+          try { result = statement.run(...params); }
+          catch (error) {
+            try { r.note(runId, r.now() - started, 0, true); } catch { /* diagnostics only */ }
             endedOnError();
             throw error;
           }
+          // Bookkeeping cannot classify a successful driver call as a statement error or replace its result.
+          try { r.note(runId, r.now() - started, Number(result.changes)); } catch { /* diagnostics only */ }
+          return result;
         },
         get(...params: SqliteValue[]) {
           if (!r.active) return statement.get(...params);
           const started = r.now();
-          try {
-            const result = statement.get(...params);
-            r.note(getId, r.now() - started);
-            return result;
-          } catch (error) {
-            r.note(getId, r.now() - started, 0, true); endedOnError(); throw error;
+          let result: ReturnType<SqliteStatement["get"]>;
+          try { result = statement.get(...params); }
+          catch (error) {
+            try { r.note(getId, r.now() - started, 0, true); } catch { /* diagnostics only */ }
+            endedOnError();
+            throw error;
           }
+          // Bookkeeping cannot classify a successful driver call as a statement error or replace its result.
+          try { r.note(getId, r.now() - started, 0); } catch { /* diagnostics only */ }
+          return result;
         },
         all(...params: SqliteValue[]) {
           if (!r.active) return statement.all(...params);
           const started = r.now();
-          try {
-            const result = statement.all(...params);
-            r.note(allId, r.now() - started);
-            return result;
-          } catch (error) {
-            r.note(allId, r.now() - started, 0, true); endedOnError(); throw error;
+          let result: ReturnType<SqliteStatement["all"]>;
+          try { result = statement.all(...params); }
+          catch (error) {
+            try { r.note(allId, r.now() - started, 0, true); } catch { /* diagnostics only */ }
+            endedOnError();
+            throw error;
           }
+          // Bookkeeping cannot classify a successful driver call as a statement error or replace its result.
+          try { r.note(allId, r.now() - started, 0); } catch { /* diagnostics only */ }
+          return result;
         },
       };
     },

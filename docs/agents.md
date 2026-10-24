@@ -1526,6 +1526,9 @@ never SQL or bound values; a connection caps phase classes at 128 (overflow is `
 Unmeasured JS/scheduling time remains in `holdMs`. Only holds exceeding the threshold emit,
 in a microtask after release and synchronous cleanup. The current file and one rotated `.1` are each capped at
 1 MiB; append contention or write/rotation failures drop the diagnostic, never the write.
+New metrics directories use mode `0700`; existing group-writable directories (such as `0775`)
+are supported, and append locks are released immediately or reclaimed when over 60 seconds old,
+only if their device/inode still matches.
 
 A failed activation records `activationBlocked` on the actor, and routers (factory review
 routing) skip a blocked actor. Its `class` says whether it can recover by itself

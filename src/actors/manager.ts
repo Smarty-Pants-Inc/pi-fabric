@@ -31,7 +31,8 @@ import { MeshStore, meshOutageAlarmSink, type MeshBatchOperation, type MeshBatch
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantRecord, FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
-import { AgentLaunchPreparationTimeoutError, AgentManager } from "../agents/manager.js";
+import { AgentLaunchPreparationTimeoutError, AgentManager, validAgentExceptionLane, type AgentExceptionLane } from "../agents/manager.js";
+import { FabricModelExceptionDeniedError } from "../agents/model-policy-log.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult, AgentRunStopCaller, AgentRunStopPath } from "../agents/types.js";
 import { isRecoveredDurableStop } from "../agents/enodev-recovery.js";
 import type { ModelRouteDecision } from "../agents/model-route.js";
@@ -242,6 +243,8 @@ interface ManagedActor extends FabricActorBatching {
   model?: string;
   modelReason?: string;
   modelPolicyOriginalModel?: string;
+  /** smarty-dev#16357: basename(root Main cwd) captured once at creation, with that root's id. */
+  exceptionLane?: AgentExceptionLane;
   thinking?: FabricThinking;
   routeClass?: "status-groom";
   protected?: boolean;
@@ -584,7 +587,7 @@ export const ACTOR_ALARM_KINDS: readonly ActorAlarmKind[] = ["actor-activation-b
 const actorAlarmReason = (reason: unknown): string => typeof reason === "string" && [
   "unknown", "context-overflow", "auth", "permission", "security-policy", "quota", "invalid-request",
   "provider-transient", "activation-window-lost", "child-exit-before-admission", "preparation-timeout", "failing-preparation", "registry-update-vetoed", "registry-changed-repeatedly",
-  "relaunch", "stop", "error", "worker-unverified", "run-dir-missing", "worker-gone", "worker-pid-reused",
+  "lane-unresolved", "relaunch", "stop", "error", "worker-unverified", "run-dir-missing", "worker-gone", "worker-pid-reused",
 ].includes(reason) ? reason : "unknown";
 /** Mesh key of an actor's alarm claim for one kind; the blocked kind keeps its #7782 key. */
 export const actorAlarmKey = (actorId: string, kind: ActorAlarmKind): string =>
@@ -778,9 +781,27 @@ export class ActorPreparationTimeoutError extends ActorPreparationError {
   }
 }
 
-/** Only known preparation deadlines/deferred mesh writes and registry-phase vetoes may expire.
- * A typed veto from binding or another phase is not registry retry authority. */
-const preparationFailureKind = (error: unknown): true | "timeout" | ActorRegistryUpdateVetoedError => {
+/** smarty-dev#16357: a queued launch's typed lane-unresolved receipt (no worker started). */
+class ActorLaneUnresolvedLaunchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ActorLaneUnresolvedLaunchError";
+  }
+}
+
+/** smarty-dev#16357: a typed lane-unresolved model-exception denial; no worker started. */
+const laneUnresolvedDenial = (error: unknown): boolean => {
+  for (let cause: unknown = error, depth = 0; cause instanceof Error && depth < 4; cause = cause.cause, depth++) {
+    if (cause instanceof ActorLaneUnresolvedLaunchError ||
+      (cause instanceof FabricModelExceptionDeniedError && cause.denial === "lane-unresolved")) return true;
+  }
+  return false;
+};
+
+/** Only known preparation deadlines/deferred mesh writes, registry-phase vetoes and an unresolved
+ * root lane may expire. A typed veto from binding or another phase is not registry retry authority. */
+const preparationFailureKind = (error: unknown): true | "timeout" | "lane-unresolved" | ActorRegistryUpdateVetoedError => {
+  if (laneUnresolvedDenial(error)) return "lane-unresolved";
   for (let cause: unknown = error, depth = 0; cause instanceof Error && depth < 4; cause = cause.cause, depth++) {
     if (cause instanceof ActorRegistryUpdateVetoedError && error instanceof ActorPreparationError && error.phase === "registry") return cause;
     if (cause instanceof ActorPreparationTimeoutError || cause instanceof AgentLaunchPreparationTimeoutError || Boolean(isMeshWriteDeferred(cause))) return "timeout";
@@ -1717,6 +1738,9 @@ export class ActorManager {
       ...(admittedBinding.modelPolicyOriginalModel ? { modelPolicyOriginalModel: admittedBinding.modelPolicyOriginalModel } : {}) };
     if (admittedBinding.modelReason !== undefined) request.modelReason = admittedBinding.modelReason;
     else delete request.modelReason;
+    // smarty-dev#16357: capture basename(root Main cwd) once, while this host's bound root is known.
+    // Preparation still prefers the fresh root record; this stands in only while that record is unavailable.
+    const exceptionLane = typeof this.agents.exceptionLaneCapture === "function" ? this.agents.exceptionLaneCapture() : undefined;
     const requirements = normalizeCapabilityRequirements(request.requires);
     if (requirements.length > 0 && !this.#acquireCapabilityView) {
       throw new Error("This Fabric host cannot commit actor capability requirements");
@@ -1754,6 +1778,7 @@ export class ActorManager {
       ...(model ? { model } : {}),
       ...(request.modelReason !== undefined ? { modelReason: request.modelReason } : {}),
       ...(request.modelPolicyOriginalModel ? { modelPolicyOriginalModel: request.modelPolicyOriginalModel } : {}),
+      ...(exceptionLane ? { exceptionLane } : {}),
       ...(request.thinking ? { thinking: request.thinking } : {}),
       ...(request.routeClass ? { routeClass: request.routeClass } : {}),
       ...(typeof request.protected === "boolean" ? { protected: request.protected } : {}),
@@ -2348,7 +2373,7 @@ export class ActorManager {
     const thinking = scope === "session" ? this.#runBinding(actor).thinking : actor.thinking;
     const resolved = next
       ? (await this.#resolvedRunBindingFor(actor.runner, { model: next, modelReason, thinking, modelSource: "explicit" }, actor.routeClass !== undefined, policyOnly,
-        `actor:${actor.name}`)).model
+        `actor:${actor.name}`, undefined, actor.exceptionLane)).model
       : undefined;
     this.agents.assertModelAllowed(resolved);
     if (!resolved) {
@@ -2358,9 +2383,10 @@ export class ActorManager {
       if (fallback) await this.#resolvedRunBindingFor(actor.runner, {
         model: fallback, modelReason: reason, thinking,
         modelSource: inherited ? "explicit" : "default",
-      }, actor.routeClass !== undefined, false, `actor:${actor.name}`);
+      }, actor.routeClass !== undefined, false, `actor:${actor.name}`, undefined, actor.exceptionLane);
       else await this.agents.prepareModelWithReason(undefined, reason, actor.runner, {
         modelSource: "default", thinking, requiredPin: actor.routeClass !== undefined, role: `actor:${actor.name}`,
+        ...(actor.exceptionLane ? { persistedLane: actor.exceptionLane } : {}),
       });
     }
     // Validate both the effective view and duplicated binding/default metadata before commit.
@@ -4776,7 +4802,7 @@ export class ActorManager {
     // Foreign resolved bindings must not borrow the owner's private defaults.
     const ownerThinking = options.binding === undefined ? this.#runBinding(actor).thinking : undefined;
     const resolving = unresolved.model ? this.#resolvedRunBindingFor(
-      actor.runner, unresolved, actor.routeClass !== undefined, false, `actor:${actor.name}`, ownerThinking,
+      actor.runner, unresolved, actor.routeClass !== undefined, false, `actor:${actor.name}`, ownerThinking, actor.exceptionLane,
     ) : unresolved;
     const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const sender = options.sender === null ? undefined : options.sender ?? processSender();
@@ -5577,7 +5603,7 @@ export class ActorManager {
                 runId: handle.id, ...(handle.queuePosition !== undefined ? { queuePosition: handle.queuePosition } : {}) };
               void this.#publishPresence(actor).catch(() => undefined);
             },
-            { timeoutMs: this.#preparationTimeoutMs, onPreparing: () => {
+            { timeoutMs: this.#preparationTimeoutMs, ...(actor.exceptionLane ? { exceptionLane: actor.exceptionLane } : {}), onPreparing: () => {
               actor.status = "preparing";
               const admittedAt = Date.now();
               this.#preparationClock(actor.id, item.id, "active", admittedAt);
@@ -5601,7 +5627,7 @@ export class ActorManager {
             this.#cancelledInFlight.get(actor.id)?.has(event.id));
           const mayRedrive = !handoffConsumed && retryIdentity !== undefined && !actor.removal &&
             (actor.status as string) !== "stopped" && actor.stopReason === undefined && actor.ownershipAbort !== abortController &&
-            !explicitlyCancelled && this.#canManage(actor.id) && !result.launchPreparationTimeoutMs &&
+            !explicitlyCancelled && this.#canManage(actor.id) && !result.launchPreparationTimeoutMs && !result.launchDenial &&
             result.errorCode !== "CONTEXT_OVERFLOW";
           if (mayRedrive) {
             if (!item.unstartedRedrive) item.unstartedRedrive = { replayId: retryIdentity!, firstRunId: result.id };
@@ -5629,6 +5655,9 @@ export class ActorManager {
           // Preserve typed, confirmed-unlaunched evidence before directive/text handling.
           if (!workerLaunched && result.status === "failed" && result.launchPreparationTimeoutMs !== undefined) {
             throw new AgentLaunchPreparationTimeoutError(result.launchPreparationTimeoutMs);
+          }
+          if (!workerLaunched && result.status === "failed" && result.launchDenial === "lane-unresolved") {
+            throw new ActorLaneUnresolvedLaunchError(result.error ?? "model exception lane unresolved; no worker started");
           }
           actor.lastRunId = result.id;
           if (unstartedRedrive) continue;
@@ -5813,7 +5842,8 @@ export class ActorManager {
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const preparationKind = preparationFailureKind(error);
-          if (error instanceof AgentLaunchPreparationTimeoutError && error.launchOutcome === "unlaunched") {
+          if ((error instanceof AgentLaunchPreparationTimeoutError && error.launchOutcome === "unlaunched") ||
+            (!workerLaunched && preparationKind === "lane-unresolved")) {
             this.#slotLaunchUnknown.delete(actor.id);
           }
           if (!this.#slotCurrent(actor) && !runCompleted) {
@@ -5859,7 +5889,10 @@ export class ActorManager {
           // binding refusal stays hard, but cannot consume callerless work.
           const launchPreparationTimeout = !workerLaunched && error instanceof AgentLaunchPreparationTimeoutError &&
             error.launchOutcome === "unlaunched";
-          const retryPreparation = launchPreparationTimeout || (preLaunch && (error instanceof ActorPreparationTimeoutError ||
+          // smarty-dev#16357: an unresolved root lane refused before any worker started (binding
+          // or launch admission). It is transient, never a terminal denial: retry with backoff.
+          const laneUnresolved = !workerLaunched && preparationKind === "lane-unresolved";
+          const retryPreparation = launchPreparationTimeout || laneUnresolved || (preLaunch && (error instanceof ActorPreparationTimeoutError ||
             (error instanceof ActorPreparationError && error.phase !== "binding")));
           const callerless = !item.resolve && !item.reject;
           const retainPreparation = retryPreparation || preLaunch;
@@ -5918,7 +5951,7 @@ export class ActorManager {
           item.reject?.(error instanceof ActorContextOverflowError ? error : new Error(message));
           this.#noteFailedActivation(actor, message, runId, abortController.signal.aborted || runStopped,
             retryPreparation && (item.preparationAttempts ?? 0) >= ACTOR_PREPARATION_MAX_RETRIES ? ACTOR_FAILURE_NOTICE_AFTER : 0,
-            preparationKind instanceof ActorRegistryUpdateVetoedError ? preparationKind : false,
+            preparationKind instanceof ActorRegistryUpdateVetoedError || laneUnresolved ? preparationKind : false,
             error instanceof ActorContextOverflowError, runEvidence, item.overflowRetried === true);
           // A callerless event that failed here is not retried: it is dropped (smarty-dev#9332).
           if (!item.resolve && !item.reject && !abortController.signal.aborted && !runStopped) {
@@ -6080,7 +6113,7 @@ export class ActorManager {
   // Counts consecutive failed activations and, once per streak, tells the owner's Main:
   // a blind supervisor is otherwise silent for as long as it stays broken.
   #noteFailedActivation(actor: ManagedActor, error: string, runId: string | undefined, interrupted: boolean, countFloor = 0,
-    preparation: boolean | "timeout" | ActorRegistryUpdateVetoedError = false, contextOverflowCode = false, evidence?: readonly string[], overflowRetried = false): void {
+    preparation: boolean | "timeout" | "lane-unresolved" | ActorRegistryUpdateVetoedError = false, contextOverflowCode = false, evidence?: readonly string[], overflowRetried = false): void {
     // An interrupt (ESC), a stop or a shutdown is not a failing actor, and a notice that
     // starts a turn must never cut through the stop-the-world halt.
     if (interrupted || this.#halted || this.#closing) return;
@@ -6101,6 +6134,7 @@ export class ActorManager {
     // Fail closed (smarty-dev#8487): only an explicitly transient cause may expire.
     const failure = classifyManagerActivationFailure({ lastError, error, evidence,
       preparation: preparation === true, preparationTimeout: preparation === "timeout",
+      laneUnresolved: preparation === "lane-unresolved",
       registryVeto: preparation instanceof ActorRegistryUpdateVetoedError ? preparation.reason : false },
       contextOverflowCode && !preparation);
     const classified = contextOverflowCode && !preparation && !CONTRADICTORY_OVERFLOW_CODES.has(failure.code)
@@ -7914,6 +7948,7 @@ export class ActorManager {
       ...(actor.model ? { model: actor.model } : {}),
       ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
       ...(actor.modelPolicyOriginalModel ? { modelPolicyOriginalModel: actor.modelPolicyOriginalModel } : {}),
+      ...(actor.exceptionLane ? { exceptionLane: { rootId: actor.exceptionLane.rootId, lane: actor.exceptionLane.lane } } : {}),
       ...(actor.thinking ? { thinking: actor.thinking } : {}),
       ...(actor.resolvedBinding ? { resolvedBinding: { ...actor.resolvedBinding } } : {}),
       ...(actor.routeClass ? { routeClass: actor.routeClass } : {}),
@@ -8497,6 +8532,8 @@ export class ActorManager {
         ...(typeof record.model === "string" ? { model: record.model } : {}),
         ...(typeof record.modelReason === "string" ? { modelReason: record.modelReason } : {}),
         ...(typeof record.modelPolicyOriginalModel === "string" ? { modelPolicyOriginalModel: record.modelPolicyOriginalModel } : {}),
+        ...(validAgentExceptionLane(record.exceptionLane)
+          ? { exceptionLane: { rootId: record.exceptionLane.rootId, lane: record.exceptionLane.lane } } : {}),
         ...(isFabricThinking(record.thinking) ? { thinking: record.thinking } : {}),
         ...(binding ? { resolvedBinding: {
           ...(typeof binding.model === "string" ? { model: binding.model } : {}),
@@ -9403,6 +9440,8 @@ export class ActorManager {
     policyOnly = false,
     role?: string,
     ownerThinking?: FabricThinking,
+    /** smarty-dev#16357: the actor's creation-time lane; used only while its root record is unavailable. */
+    exceptionLane?: AgentExceptionLane,
   ): FabricActorRunBinding | Promise<FabricActorRunBinding> {
     const reason = binding.modelReason ?? binding.opusReason;
     const source = binding.modelSource ?? (requiredPin ? "route" : binding.model ? "explicit" : "default");
@@ -9413,6 +9452,7 @@ export class ActorManager {
         modelSource: source, thinking: binding.thinking ?? ownerThinking, requiredPin,
         resolveFallback: key => this.#resolvedModel(runner, key, true),
         ...(role !== undefined ? { role } : {}),
+        ...(exceptionLane ? { persistedLane: exceptionLane } : {}),
       });
       const finish = (admitted: { model?: string | undefined; thinking?: FabricThinking | undefined; fallback: boolean }): FabricActorRunBinding => {
         const result: FabricActorRunBinding = { ...binding,
@@ -9444,7 +9484,8 @@ export class ActorManager {
     actor: ManagedActor,
     binding: FabricActorRunBinding,
   ): FabricActorRunBinding | Promise<FabricActorRunBinding> {
-    return this.#resolvedRunBindingFor(actor.runner, binding, actor.routeClass !== undefined, false, `actor:${actor.name}`);
+    return this.#resolvedRunBindingFor(actor.runner, binding, actor.routeClass !== undefined, false, `actor:${actor.name}`,
+      undefined, actor.exceptionLane);
   }
 
   #validatedRunBinding(binding: FabricActorRunBinding): FabricActorRunBinding {
@@ -9550,7 +9591,8 @@ export class ActorManager {
     // Expired transient blocks retain diagnostics but no longer affect routing.
     return actor.status === "stopped" ? "stopped"
       : (actor.failureStreak?.count ?? 0) >= ACTOR_FAILURE_NOTICE_AFTER && !blockExpired
-      ? actor.activationBlocked?.code === "failing-preparation" || actor.activationBlocked?.code === "preparation-timeout"
+      ? actor.activationBlocked?.code === "failing-preparation" || actor.activationBlocked?.code === "preparation-timeout" ||
+        actor.activationBlocked?.code === "lane-unresolved"
         ? "failing-preparation" : "failed" : actor.preparing
       ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status;
   }

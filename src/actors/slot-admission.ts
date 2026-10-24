@@ -87,8 +87,10 @@ const normalized = (value: unknown, ancestors = new Set<object>()): unknown => {
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 const fingerprint = (request: FabricActorRequest, spec: Record<string, unknown>, registryRoot: string, callerId: string): string => {
   // These are freshly preallocated/generated each attempt, not immutable actor arguments.
+  // smarty-dev#16357: the root lane captured at creation is host-observed, not a caller argument;
+  // a retry whose root record was briefly unavailable is still the same request.
   const { id: _id, createdAt: _created, updatedAt: _updated, sessionFile: _file,
-    runnerSessionId: _runnerSession, ownershipToken: _ownership, ...immutable } = spec;
+    runnerSessionId: _runnerSession, ownershipToken: _ownership, exceptionLane: _lane, ...immutable } = spec;
   return createHash("sha256").update(JSON.stringify(normalized({ request, spec: immutable, registryRoot, callerId }))).digest("hex");
 };
 const address = (key: string): SlotAddress => {

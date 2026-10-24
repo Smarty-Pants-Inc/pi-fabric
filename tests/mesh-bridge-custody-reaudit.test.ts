@@ -388,7 +388,8 @@ describe("the CLI's readiness barrier backs off a retryable first pass (hosted m
     return { id, hubRoot, logs, running, controller, isLinked, isRetrying, cleanup, held: () => holder !== undefined };
   };
   const stoppedLines = (logs: string[]) => logs.filter(line => line.includes("stopped:"));
-  const RETRY_LINE = /start: mesh lock timeout; retrying in 100 ms: FABRIC_MESH_LOCK_TIMEOUT: .*host-lease-commits\/5f43c55dca0091e6\/custody\.lock.* after 1 attempts/;
+  // The lock path uses the platform separator (backslashes on Windows).
+  const RETRY_LINE = /start: mesh lock timeout; retrying in 100 ms: FABRIC_MESH_LOCK_TIMEOUT: .*host-lease-commits[\\/]5f43c55dca0091e6[\\/]custody\.lock.* after 1 attempts/;
 
   it("a first pass whose lease effect meets a busy additions gate backs off and links, instead of stopping the link", async () => {
     const cli = await cliWithBusyFirstPass(true);

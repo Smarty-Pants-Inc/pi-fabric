@@ -653,8 +653,8 @@ describe("resolved manager policy (#11864)", () => {
       const defaultRows = rows.filter(row => row.reason === defaultReason);
       expect(matching).toHaveLength(1);
       expect(defaultRows).toHaveLength(1);
-      expect(Object.keys(matching[0]!).sort()).toEqual(["grant_id", "host", "issue", "lane", "launcher", "model", "reason", "ref", "role", "run_id", "thinking", "time", "ts"]);
-      expect(matching[0]).toMatchObject({ ref: "Smarty-Pants-Inc/smarty-dev#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+      expect(Object.keys(matching[0]!).sort()).toEqual(["grant_id", "host", "issue", "lane", "lane_source", "launcher", "model", "reason", "ref", "role", "run_id", "thinking", "time", "ts"]);
+      expect(matching[0]).toMatchObject({ ref: "Smarty-Pants-Inc/smarty-dev#11864", reason, role: expect.any(String), ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/), lane_source: "root",
         grant_id: expect.any(String), issue: "Smarty-Pants-Inc/smarty-dev#11864", lane: path.basename(boundRootRecord.cwd), host: os.hostname().split(".")[0], thinking: expect.any(String), run_id: accepted.id, time: expect.any(String) });
       expect(matching[0]!.model).toBe(concrete);
       expect(defaultRows[0]!.model).toBe(concrete);
@@ -694,8 +694,8 @@ describe("resolved manager policy (#11864)", () => {
       const result = await manager.wait(handle.id);
       expect(result.warnings).toContain(`model: named exception veda/claude-code/${cliModel} (Smarty-Pants-Inc/smarty-dev#11864)`);
       const audit = readAudit(reason);
-      expect(Object.keys(audit).sort()).toEqual(["grant_id", "host", "issue", "lane", "launcher", "model", "reason", "ref", "role", "run_id", "thinking", "time", "ts"]);
-      expect(audit).toMatchObject({ grant_id: expect.any(String), issue: "Smarty-Pants-Inc/smarty-dev#11864", lane: path.basename(boundRootRecord.cwd), host: os.hostname().split(".")[0], thinking: expect.any(String), run_id: handle.id, time: expect.any(String) });
+      expect(Object.keys(audit).sort()).toEqual(["grant_id", "host", "issue", "lane", "lane_source", "launcher", "model", "reason", "ref", "role", "run_id", "thinking", "time", "ts"]);
+      expect(audit).toMatchObject({ lane_source: "root", grant_id: expect.any(String), issue: "Smarty-Pants-Inc/smarty-dev#11864", lane: path.basename(boundRootRecord.cwd), host: os.hostname().split(".")[0], thinking: expect.any(String), run_id: handle.id, time: expect.any(String) });
       expect(audit.model).toBe(cliModel);
       expect(audit.reason).toBe(reason);
     } finally { launch.mockRestore(); homedir.mockRestore(); }
@@ -1686,10 +1686,10 @@ describe("AgentManager", () => {
         expect(rows.map(row => row.ref)).toEqual(refs);
         for (const row of rows) {
           expect(Object.keys(row).sort()).toEqual(inherited ? ["host", "launcher", "model", "reason", "ref", "role", "ts"]
-            : ["grant_id", "host", "issue", "lane", "launcher", "model", "reason", "ref", "role", "run_id", "thinking", "time", "ts"]);
+            : ["grant_id", "host", "issue", "lane", "lane_source", "launcher", "model", "reason", "ref", "role", "run_id", "thinking", "time", "ts"]);
           expect(row).toMatchObject({ role: "task", model, reason: inherited ? "inherited-switch" : reason,
             launcher: "fabric", host: inherited ? os.hostname() : os.hostname().split(".")[0], ts: expect.stringMatching(/^\d{4}-\d\d-\d\dT/) });
-          if (!inherited) expect(row).toMatchObject({ grant_id: expect.any(String), issue: row.ref,
+          if (!inherited) expect(row).toMatchObject({ lane_source: "root", grant_id: expect.any(String), issue: row.ref,
             lane: path.basename(boundRelaunchRootRecord.cwd), thinking: expect.any(String), run_id: request.id, time: expect.any(String) });
         }
         expect(request.workerArguments).toEqual(expect.arrayContaining(["--model", inherited ? safeModel : model]));

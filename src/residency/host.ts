@@ -82,7 +82,7 @@ import { ActorSessionResetCancelledError } from "../actors/session-reset-error.j
 import type { FabricActorInfo } from "../actors/types.js";
 import type { AgentRunRecord } from "../agents/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
-import { AgentManager } from "../agents/manager.js";
+import { AgentManager, rootRecordLastSeenMs } from "../agents/manager.js";
 import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 import { FabricTargetTerminalError, terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
 import { launchScope } from "../scope.js";
@@ -688,6 +688,8 @@ export class ResidentHost {
           ? root.cwd
           : undefined;
       },
+      // #16357: bounds an actor's stored exception lane to a root seen recently (or proven ended).
+      rootSessionLastSeenMs: () => rootRecordLastSeenMs(this.participants, config.rootId),
       fabricSessionId: config.sessionId,
       meshRoot: config.meshRoot,
       projectRoot: config.projectRoot,

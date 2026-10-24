@@ -92,7 +92,9 @@ const confirmHelperTeardown = async (pid: number | undefined, close: Promise<voi
     if (timer) clearTimeout(timer);
     if (!closed) return false;
   }
-  if (process.platform === "win32" || pid === undefined) return true;
+  // Direct-child close on Windows does not prove descendants are gone without a Job Object.
+  if (process.platform === "win32") return false;
+  if (pid === undefined) return true;
   while (performance.now() < deadline) {
     try { process.kill(-pid, 0); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return true; }

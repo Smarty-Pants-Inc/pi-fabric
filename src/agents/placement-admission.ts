@@ -82,7 +82,10 @@ const confirmHelperTeardown = async (pid: number | undefined, close: Promise<voi
     if (timer) clearTimeout(timer);
     if (!closed) return false;
   }
-  if (process.platform === "win32" || pid === undefined) return true;
+  // child.kill() on Windows only addresses the direct process. Without a Job
+  // Object there is no proof that descendants which inherited stdio are gone.
+  if (process.platform === "win32") return false;
+  if (pid === undefined) return true;
   while (performance.now() < deadline) {
     try { process.kill(-pid, 0); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return true; }

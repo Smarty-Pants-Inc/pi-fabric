@@ -114,7 +114,11 @@ export const writePolicyDispositionHeapProbe = async (root: string) => {
           checks.push(`local audit payload ${id}: ${JSON.stringify(rest)}`);
         // Default task policy unchanged: exactly [agent cwd, run tmpdir], shell unconfined.
         const roots = policy?.writableRoots?.map(real);
-        if (policy?.shell !== "unconfined" || JSON.stringify(roots?.sort()) !== JSON.stringify([real(cwd), real(path.join(root, id, "tmp"))].sort()))
+        // smarty-dev#15878: a short private r.<10 hex> TMPDIR when one fits the host's temp path, else the run's own tmp.
+        const scratch = roots?.find(entry => entry !== real(cwd));
+        const runTmp = path.join(root, id, "tmp");
+        const tmpdir = scratch && /^r\.[0-9a-f]{10}$/.test(path.basename(scratch)) ? scratch : real(runTmp);
+        if (policy?.shell !== "unconfined" || JSON.stringify(roots?.sort()) !== JSON.stringify([real(cwd), tmpdir].sort()))
           checks.push(`local audit policy ${id}: ${JSON.stringify(policy)}`);
       } else {
         remoteRuns++;

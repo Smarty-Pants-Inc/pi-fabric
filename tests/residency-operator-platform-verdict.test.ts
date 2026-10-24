@@ -14,6 +14,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import * as verifiedRemoval from "../src/storage/verified-remove.js";
+import * as treeArchive from "../src/storage/tree-archive.js";
 import { fleetSessionArchive } from "../src/storage/session-archive.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import {
@@ -26,7 +27,9 @@ import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 // #4664: never execute a product deletion, INCLUDING metadata/locks. All nine fs deletion APIs
 // record their calls; metadata disappearance is emulated by rename into this fixture's own trash.
-// An actor tree delete is recorded only, leaving every byte and inode in place. The sole real
+// An actor tree delete is recorded only, leaving every byte and inode in place. Since smarty-dev#16444 the tree step is
+// one archive rename of the whole judged tree (moveActorTreeToArchive): recorded ("archive") and performed (it deletes
+// nothing; every byte and inode moves with it). The sole real
 // recursive deletion below is teardown of our own mkdtemp fixture, after ResidentHost.close().
 // No dead-root-fixture, CLI, worker or native deletion helper is run. Linux flock/setpriv helpers
 // remain real. Darwin/Windows override ONLY the synchronous verdict callback, after Linux-native
@@ -38,8 +41,9 @@ const GUIDANCE = "stop the Main, or let a host start finish it";
 const stale = () => Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS;
 const gone = { pid: 2147483647, host: os.hostname(), startTime: "1" };
 type Call = { api: string; path: string; tree: boolean };
-const TREE_API = process.platform === "linux" ? "verifiedRemove" : "rmSync";
+const TREE_API = "archive"; // the same archive rename on every platform (smarty-dev#16444)
 const realVerifiedRemove = verifiedRemoval.verifiedRemove;
+const realArchive = treeArchive.moveActorTreeToArchive;
 
 const restorePlatform = () => Object.defineProperty(process, "platform", nativePlatform);
 afterEach(() => {
@@ -107,18 +111,25 @@ const guardDeletions = (root: string, actorRoots: string[], calls: Call[], fence
   vi.spyOn(fs.promises, "rmdir").mockImplementation(async (file) => emulate("promises.rmdir", file));
   vi.spyOn(fs.promises, "unlink").mockImplementation(async (file) => emulate("promises.unlink", file));
 
-  // Keep the real verifier's judgment/walk, but use its production dry-run option before any mutation.
+  const wholeTree = (file: string) => actorRoots.some(actorRoot => path.dirname(file) === actorRoot && /^[a-f0-9]{32}$/.test(path.basename(file)));
+  // A verified delete of a whole actor tree is a violation now (recorded, never performed): it is archived instead.
   vi.spyOn(verifiedRemoval, "verifiedRemove").mockImplementation((target, judged, options) => {
     const file = path.resolve(target);
-    const inActorTree = actorRoots.some(actorRoot => path.dirname(file) === actorRoot && /^[a-f0-9]{32}$/.test(path.basename(file)));
-    if (process.platform !== "linux" || !inActorTree) return realVerifiedRemove(target, judged, options);
-    const now = fs.lstatSync(file, { throwIfNoEntry: false });
-    calls.push({ api: "verifiedRemove", path: file, tree: now?.isDirectory() === true });
+    if (!wholeTree(file)) return realVerifiedRemove(target, judged, options);
+    calls.push({ api: "verifiedRemove", path: file, tree: true });
+    violations.push(`${file}: deleted through verifiedRemove, not archived`);
+    return { removed: true, bytes: 0 };
+  });
+  // The tree step: the real archive rename (it deletes nothing), recorded with its fence and judged identity.
+  vi.spyOn(treeArchive, "moveActorTreeToArchive").mockImplementation((source, pin, archive, chain, name, route) => {
+    const file = path.resolve(route ?? source);
+    if (!wholeTree(file)) return realArchive(source, pin, archive, chain, name, route);
+    const now = fs.lstatSync(source, { throwIfNoEntry: false });
+    calls.push({ api: "archive", path: file, tree: now?.isDirectory() === true });
     if (!fenced()) violations.push(`${file}: not under the Main publication fence`);
-    if (!judged || !now || now.dev !== judged.dev || now.ino !== judged.ino) violations.push(`${file}: judged inode is not the current tree`);
-    const result = realVerifiedRemove(target, judged, { ...options, dryRun: true });
-    if (!result.removed) violations.push(`${file}: refused (${result.reason})`);
-    return result;
+    if (!now || now.dev !== pin.dev || now.ino !== pin.ino) violations.push(`${file}: judged inode is not the current tree`);
+    try { return realArchive(source, pin, archive, chain, name, route); }
+    catch (error) { violations.push(`${file}: refused (${(error as Error).message})`); throw error; }
   });
 
   // A native delete bypasses fs spies. Record and refuse it (also any unexpected CLI/worker),
@@ -257,17 +268,11 @@ const probe = async (f: Fixture, platform: "darwin" | "win32" | "linux", operato
   // response is the settled cleanup refusal, and the real saved obligation proves pending custody.
   expect(f.host.actors.removalSettled(actor.id)).toBeUndefined();
   expect(process.platform).toBe(nativePlatform.value);
-  // smarty-dev#16444 (R-keep-all-traces): a removal that reaches the (recorded) tree delete first moved the session trace
-  // into the fleet archive by rename (same inode, same bytes); a refused removal keeps every entry in place.
-  const reached = f.calls.some(call => call.tree);
-  const isTrace = (entry: { name: string }) => /^session\.jsonl/.test(entry.name);
-  expect(treeSnapshot(tree)).toEqual(reached ? snapshot.filter(entry => !isTrace(entry)) : snapshot); // every byte and inode (including root/nested dirs)
-  if (reached) {
-    const archived = treeSnapshot(fleetSessionArchive(f.config.meshRoot, f.config.rootId, actor.id))
-      .filter(entry => entry.name.endsWith(".jsonl") && entry.name !== "MANIFEST.jsonl");
-    expect(archived.map(({ dev, ino, bytes }) => ({ dev, ino, bytes })))
-      .toEqual(snapshot.filter(isTrace).map(({ dev, ino, bytes }) => ({ dev, ino, bytes })));
-  }
+  // smarty-dev#16444 (R-keep-all-traces): a removal that reaches the tree step renames the WHOLE tree into the fleet
+  // archive (one rename: every entry keeps its inode and bytes); a refused removal keeps every entry in place.
+  const reached = !fs.existsSync(tree);
+  // every byte and inode (including root/nested dirs), wherever the tree is now
+  expect(treeSnapshot(reached ? fleetSessionArchive(f.config.meshRoot, f.config.rootId, actor.id) : tree)).toEqual(snapshot);
   expect(fenced()).toBe(false);
   expect(readResidentRequestDecision(f.config.residencyRoot, result.requestId)).toMatchObject({
     state: "committed", id: actor.id, operation: operator ? "operatorActor" : "removeActor",
@@ -306,7 +311,7 @@ describe.skipIf(process.platform !== "linux")("resident operator cleanup uses th
       } finally { await f.close(); }
     }, 30_000);
 
-  it("Linux identity control: stale recorded Main with a provably gone pid/start and expired lease reaches recorded tree delete", async () => {
+  it("Linux identity control: stale recorded Main with a provably gone pid/start and expired lease reaches the recorded tree archive", async () => {
     const f = await safeFixture();
     try {
       const result = await probe(f, "linux", true, "expired", "stale");
@@ -319,7 +324,7 @@ describe.skipIf(process.platform !== "linux")("resident operator cleanup uses th
     } finally { await f.close(); }
   }, 30_000);
 
-  it("ordinary non-operator removal counterexample: no Main identity check, reaches recorded delete with no root evidence", async () => {
+  it("ordinary non-operator removal counterexample: no Main identity check, reaches the recorded tree archive with no root evidence", async () => {
     const f = await safeFixture();
     try {
       const result = await probe(f, "darwin", false, "absent", "missing");

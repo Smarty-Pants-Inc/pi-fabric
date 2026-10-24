@@ -10,14 +10,20 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // Every trace a path used to delete is MOVED (one same-filesystem rename) into a retained archive with its sha256.
 //
 // THE GUARD: for this whole file (tests 1-4 plus an actor stop and remove), these deleters are spies that record any
-// call whose existing target is a session trace (a path matching /session\.jsonl/ or below a session-archive/) or a
-// directory holding one: fs.unlinkSync, fs.rmSync, fs.rmdirSync, fs.promises.unlink, fs.promises.rm, and the
-// verifiedRemove deleter (module mock, also reached through the manager's lazy import). verifiedRemove's own
-// directory-relative unlinks (/proc/self/fd/<fd>/<name>) go through the fs.unlinkSync spy too. Not covered: named
-// imports of node:fs functions bound before the spies, fs.unlink/fs.rm callbacks, child processes and native helpers.
+// call whose existing target is a session trace (a path matching /session\.jsonl/, an activation session
+// `.activation-*.jsonl`, a message log `messages*.jsonl`, or below a session-archive/) or a directory holding one:
+// fs.unlinkSync, fs.rmSync, fs.rmdirSync, fs.truncateSync, fs.promises.unlink, fs.promises.rm, fs.renameSync ONTO an
+// existing trace (a rename-over replaces its bytes), and the verifiedRemove deleter (module mock, also reached through
+// the manager's lazy import). verifiedRemove's own directory-relative unlinks (/proc/self/fd/<fd>/<name>) go through
+// the fs.unlinkSync spy too. Not covered (smarty-dev#16469): named imports of node:fs functions bound before the
+// spies, fs.unlink/fs.rm/fs.rename/fs.truncate callbacks and their fs.promises forms other than unlink/rm,
+// fs.ftruncateSync and fs.writeFileSync/openSync(O_TRUNC) overwrites, child processes (workers) and native helpers.
 const violations: string[] = [];
 let guarding = false;
-const TRACE = /session\.jsonl|session-archive[\\/]/;
+const TRACE = /session\.jsonl|session-archive[\\/]|\.activation-[^\\/]*\.jsonl|messages[^\\/]*\.jsonl/;
+/** Test hooks around the real rename (fault injection and the at-rename snapshot of a moved tree). */
+let beforeRename: ((source: string, destination: string) => void) | undefined;
+let afterRename: ((source: string, destination: string) => void) | undefined;
 const holdsTrace = (target: string, depth = 0): boolean => {
   let stat: fs.Stats;
   try { stat = fs.lstatSync(target); } catch { return false; } // absent: the call deletes nothing
@@ -55,12 +61,19 @@ type MeshIdentity = import("../src/mesh/store.js").MeshIdentity;
 
 // vitest.config.cts sets restoreMocks: true (spies are restored before every test), so the spies go in per test.
 beforeEach(() => {
-  const wrap = <K extends "unlinkSync" | "rmSync" | "rmdirSync">(name: K) => {
+  const wrap = <K extends "unlinkSync" | "rmSync" | "rmdirSync" | "truncateSync">(name: K) => {
     const original = fs[name].bind(fs) as (...args: unknown[]) => unknown;
     vi.spyOn(fs as unknown as Record<string, (...args: unknown[]) => unknown>, name)
       .mockImplementation((...args: unknown[]) => { record(`fs.${name}`, args[0]); return original(...args); });
   };
-  wrap("unlinkSync"); wrap("rmSync"); wrap("rmdirSync");
+  wrap("unlinkSync"); wrap("rmSync"); wrap("rmdirSync"); wrap("truncateSync");
+  const rename = fs.renameSync.bind(fs);
+  vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+    record("fs.renameSync(over)", destination); // only an EXISTING trace destination is a violation
+    beforeRename?.(String(source), String(destination));
+    rename(source, destination);
+    afterRename?.(String(source), String(destination));
+  });
   for (const name of ["unlink", "rm"] as const) {
     const original = fs.promises[name].bind(fs.promises) as (...args: unknown[]) => Promise<unknown>;
     vi.spyOn(fs.promises as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>, name)
@@ -78,7 +91,34 @@ afterEach(async () => {
   guarding = false;
   try { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); } finally { guarding = true; }
 });
+afterEach(() => { beforeRename = undefined; afterRename = undefined; });
 afterAll(() => { guarding = false; vi.restoreAllMocks(); });
+
+// smarty-dev#1568 P3: every ask spawns a fresh worker process (tests/fixtures/session-worker.mjs loads the public
+// barrel), 3-6 s each on a loaded 8-CPU host; tests 1, 2a, 2b, 4a and 4b run 2-3 asks each. They share no state (each
+// asserts its own actor's whole history), so they keep their own fixtures with an explicit timeout instead of the
+// default 15 s.
+const SLOW = 90_000;
+/** Every entry below `root`, by relative path: a regular file's sha256, a link's target. */
+const snapshot = (root: string): Record<string, string> => {
+  const out: Record<string, string> = {};
+  const walk = (directory: string, relative: string): void => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const file = path.join(directory, entry.name), name = relative ? `${relative}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) walk(file, name);
+      else if (entry.isSymbolicLink()) out[name] = `link:${fs.readlinkSync(file)}`;
+      else out[name] = sha(file);
+    }
+  };
+  walk(root, "");
+  return out;
+};
+/** An activation session the journal merge refused (worker/activation-session.ts: "isolated session retained"). */
+const retainedActivation = (actorDir: string, marker: string): string => {
+  const file = path.join(actorDir, `.activation-${marker}.jsonl`);
+  fs.writeFileSync(file, `${JSON.stringify({ type: "session", version: 3, id: marker, timestamp: new Date().toISOString(), cwd: "/" })}\n${JSON.stringify({ type: "message", id: `${marker}-1`, parentId: null, message: { role: "user", content: marker } })}\n`);
+  return file;
+};
 
 const sha = (file: string): string => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 type Usage = { tokens: number; contextWindow: number };
@@ -115,8 +155,19 @@ const backups = (sessionFile: string): string[] => fs.readdirSync(path.dirname(s
 const archiveOf = (sessionFile: string): string => path.join(path.dirname(sessionFile), "session-archive");
 const archived = (directory: string): string[] => fs.existsSync(directory)
   ? fs.readdirSync(directory).filter(name => /^\d{8}T\d{9}Z-[0-9a-f]{12}(\.\d+)?\.jsonl$/.test(name)).sort() : [];
-const manifest = (directory: string): Array<Record<string, any>> =>
-  fs.readFileSync(path.join(directory, "MANIFEST.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+/** The archive's manifest lines; `phase` selects MOVING (the intent, before the rename) or MOVED-TO (after it). */
+const manifest = (directory: string, phase?: "MOVING" | "MOVED-TO"): Array<Record<string, any>> =>
+  fs.readFileSync(path.join(directory, "MANIFEST.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line))
+    .filter(line => phase === undefined || line.phase === phase);
+/** Each MOVED-TO line follows its own MOVING intent (same from, to and sha256). */
+const intentsPrecede = (lines: Array<Record<string, any>>): void => {
+  lines.forEach((line, index) => {
+    if (line.phase !== "MOVED-TO") return;
+    expect(lines.slice(0, index).some(before => before.phase === "MOVING" && before.from === line.from && before.to === line.to &&
+      before.sha256 === line.sha256)).toBe(true);
+  });
+  expect(lines.filter(line => line.phase === "MOVING").length).toBe(lines.filter(line => line.phase === "MOVED-TO").length);
+};
 const resets = (actors: InstanceType<typeof ActorManager>, id: string) => actors.messages(id, 100)
   .filter(message => (message.data as { sessionReset?: unknown } | undefined)?.sessionReset);
 /** Every trace the actor still holds, kept .bak plus its session-archive, by sha256. */
@@ -141,21 +192,24 @@ describe("actor session traces are archived, never deleted (smarty-dev#16444)", 
     expect(sha(path.join(path.dirname(actor.sessionFile!), backups(actor.sessionFile!)[0]!))).toBe(before[2]);
     expect(archived(archiveOf(actor.sessionFile!))).toHaveLength(2);
     expect(heldHashes(actor.sessionFile!)).toEqual([...before].sort());
-    // Each archive name carries the first 12 hex of its sha256; the manifest has the full sha256 and the MOVED-TO line.
+    // Each archive name carries the first 12 hex of its sha256; the manifest has the full sha256, a MOVING intent
+    // before each rename and the MOVED-TO line after it.
     for (const name of archived(archiveOf(actor.sessionFile!))) {
       expect(sha(path.join(archiveOf(actor.sessionFile!), name)).slice(0, 12)).toBe(name.split("-")[1]!.slice(0, 12));
     }
-    const lines = manifest(archiveOf(actor.sessionFile!));
+    intentsPrecede(manifest(archiveOf(actor.sessionFile!)));
+    const lines = manifest(archiveOf(actor.sessionFile!), "MOVED-TO");
     expect(lines.map(line => line.sha256)).toEqual([before[0], before[1]]);
     for (const line of lines) expect(line.line).toBe(`MOVED-TO ${line.to}`);
-    // The message log: every reset has the displaced trace's sha256; the 2nd and 3rd name their move.
+    // The message log: every reset has the displaced trace's sha256; the 2nd and 3rd name their move in archivedTo.
+    // smarty-dev#1568 P3-4: the reason text is unchanged (a consumer may match it exactly).
     const logged = resets(actors, actor.id).map(message => ({ reason: message.reason!, ...(message.data as any).sessionReset }));
     expect(logged.map(entry => entry.sha256)).toEqual(before);
     expect(logged[0]!.archivedTo).toEqual([]);
     expect(logged[1]!.archivedTo).toEqual([expect.objectContaining({ sha256: before[0], to: lines[0]!.to })]);
     expect(logged[2]!.archivedTo).toEqual([expect.objectContaining({ sha256: before[1], to: lines[1]!.to })]);
-    expect(logged[2]!.reason).toContain(`\nMOVED-TO ${lines[1]!.to} (sha256 ${before[1]})`);
-  });
+    expect(logged.map(entry => entry.reason)).toEqual(Array(3).fill("session reset (requested)"));
+  }, SLOW);
 
   it("2a. a size rotation archives the older backup and unlinks nothing", async () => {
     const { actors } = setup({ maxSessionBytes: 64 });
@@ -167,8 +221,8 @@ describe("actor session traces are archived, never deleted (smarty-dev#16444)", 
     await actors.ask(actor.id, "three"); // size reset: "one" moves into session-archive/
     expect(resets(actors, actor.id).map(message => (message.data as any).sessionReset.trigger)).toEqual(["size", "size"]);
     expect(heldHashes(actor.sessionFile!)).toEqual([first, second].sort());
-    expect(manifest(archiveOf(actor.sessionFile!)).map(line => line.sha256)).toEqual([first]);
-  });
+    expect(manifest(archiveOf(actor.sessionFile!), "MOVED-TO").map(line => line.sha256)).toEqual([first]);
+  }, SLOW);
 
   it("2b. a context rotation archives the older backup and unlinks nothing", async () => {
     let usage: Usage | undefined = { tokens: 250_000, contextWindow: 272_000 };
@@ -182,10 +236,10 @@ describe("actor session traces are archived, never deleted (smarty-dev#16444)", 
     await actors.ask(actor.id, "three"); // context reset: "one" moves into session-archive/
     expect(resets(actors, actor.id).map(message => (message.data as any).sessionReset.trigger)).toEqual(["context", "context"]);
     expect(heldHashes(actor.sessionFile!)).toEqual([first, second].sort());
-    expect(manifest(archiveOf(actor.sessionFile!)).map(line => line.sha256)).toEqual([first]);
-  });
+    expect(manifest(archiveOf(actor.sessionFile!), "MOVED-TO").map(line => line.sha256)).toEqual([first]);
+  }, SLOW);
 
-  it("3. pruneActorSessionBackups on 5 backups unlinks nothing, archives 4 and keeps the newest in place", () => {
+  const fiveBackups = () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-trace-prune-"));
     roots.push(directory);
     const session = path.join(directory, "session.jsonl");
@@ -196,75 +250,161 @@ describe("actor session traces are archived, never deleted (smarty-dev#16444)", 
       fs.utimesSync(name, 1_000 + index, 1_000 + index);
       return sha(name);
     });
+    return { session, names, hashes };
+  };
+
+  it("3. pruneActorSessionBackups on 5 backups unlinks nothing, archives 4 and keeps the newest in place", () => {
+    const { session, names, hashes } = fiveBackups();
     const dry = pruneActorSessionBackups(session, { dryRun: true });
     expect(dry.map(move => move.from)).toEqual(names.slice(0, 4));
     expect(names.every(name => fs.existsSync(name))).toBe(true); // a dry run moves nothing
     const moved = pruneActorSessionBackups(session);
     expect(moved.map(move => move.from)).toEqual(names.slice(0, 4));
     expect(moved.map(move => move.sha256)).toEqual(hashes.slice(0, 4));
+    expect(moved.every(move => move.manifest === undefined)).toBe(true);
     expect(fs.existsSync(names[4]!)).toBe(true);
     expect(names.slice(0, 4).some(name => fs.existsSync(name))).toBe(false);
     const archive = archiveOf(session);
     expect(archived(archive)).toHaveLength(4);
     expect(moved.map(move => sha(move.to))).toEqual(hashes.slice(0, 4));
-    expect(manifest(archive).map(line => [line.from, line.to, line.sha256])).toEqual(moved.map(move => [move.from, move.to, move.sha256]));
+    // smarty-dev#1568 P2-1: a fsynced MOVING intent (from, to, sha256) before each rename, MOVED-TO after it.
+    expect(manifest(archive).map(line => [line.phase, line.from, line.to, line.sha256]))
+      .toEqual(moved.flatMap(move => [["MOVING", move.from, move.to, move.sha256], ["MOVED-TO", move.from, move.to, move.sha256]]));
     expect(fs.readFileSync(session, "utf8")).toBe("live\n");
     // Idempotent: only the newest is left, so a second prune moves nothing.
     expect(pruneActorSessionBackups(session)).toEqual([]);
   });
 
-  it("4a. actor removal leaves its session files in the fleet archive, with a manifest", async () => {
+  it("3b. a failure AFTER the rename is reported as moved with manifest:false, never as kept in place (smarty-dev#1568 P2-1)", () => {
+    const { session, names, hashes } = fiveBackups();
+    const archive = archiveOf(session);
+    // The MOVED-TO append fails (MANIFEST.jsonl made read-only right after the first rename); the MOVING intent is on disk.
+    afterRename = (_source, destination) => {
+      if (path.dirname(destination) === archive) { fs.chmodSync(path.join(archive, "MANIFEST.jsonl"), 0o400); afterRename = undefined; }
+    };
+    const moved = pruneActorSessionBackups(session);
+    expect(moved[0]).toMatchObject({ from: names[0], sha256: hashes[0], manifest: false });
+    expect(moved[0]!.problem).toMatch(/EACCES|permission/i);
+    expect(sha(moved[0]!.to)).toBe(hashes[0]);
+    expect(fs.existsSync(names[0]!)).toBe(false);
+    // The read-only manifest refuses the next MOVING intent: those backups stay in place (nothing moved, nothing lost).
+    expect(moved).toHaveLength(1);
+    expect(names.slice(1).every(name => fs.existsSync(name))).toBe(true);
+    expect(manifest(archive).map(line => [line.phase, line.from, line.to, line.sha256]))
+      .toEqual([["MOVING", names[0], moved[0]!.to, hashes[0]]]);
+  });
+
+  it("4a. actor removal moves the WHOLE actor dir into the fleet archive: every file byte-identical, with a manifest", async () => {
     const { actors, mesh, identity } = setup();
     const actor = await actors.create({ name: "leaving", instructions: "Leave." });
-    const hashes: string[] = [];
-    for (const word of ["one", "two", "three"]) {
+    const actorDir = path.dirname(actor.sessionFile!);
+    for (const word of ["one", "two"]) {
       await actors.ask(actor.id, word);
-      hashes.push(sha(actor.sessionFile!));
       await actors.resetSession(actor.id);
     }
-    await actors.ask(actor.id, "four");
-    hashes.push(sha(actor.sessionFile!));
+    await actors.ask(actor.id, "three");
     await actors.stop(actor.id);
+    retainedActivation(actorDir, "refused-merge");
+    const before = snapshot(actorDir);
+    // Every kind of trace the tree holds: the live session, the kept .bak, the per-actor archive, the retained
+    // activation session and the message log (where the reset records live).
+    expect(Object.keys(before)).toEqual(expect.arrayContaining(["session.jsonl", ".activation-refused-merge.jsonl",
+      "registry/messages.jsonl", "session-archive/MANIFEST.jsonl"]));
+    expect(Object.keys(before).filter(name => /^session\.jsonl\.\d{8}T\d{9}Z\.bak$/.test(name))).toHaveLength(1);
+    let atRename: Record<string, string> | undefined;
+    const pinned = fs.lstatSync(actorDir);
+    beforeRename = source => {
+      const stat = fs.lstatSync(source, { throwIfNoEntry: false });
+      if (stat?.dev === pinned.dev && stat.ino === pinned.ino) atRename = snapshot(source);
+    };
     const removed = await actors.remove(actor.id);
     expect(removed).toMatchObject({ removed: true });
     expect(removed.pending).toBeUndefined();
-    expect(fs.existsSync(path.dirname(actor.sessionFile!))).toBe(false);
+    expect(fs.existsSync(actorDir)).toBe(false);
     const fleet = fleetSessionArchive(mesh.root, identity.id, actor.id);
-    const lines = manifest(fleet);
-    // The live session and the kept .bak moved one by one; the actor's own session-archive/ moved whole.
-    const files = lines.filter(line => line.kind === "file");
-    const directory = lines.find(line => line.kind === "directory")!;
-    expect(lines.every(line => line.actorId === actor.id && line.rootId === identity.id && line.line === `MOVED-TO ${line.to}`)).toBe(true);
-    const names = files.map(line => path.basename(line.from)).sort();
-    expect(names).toEqual(["session.jsonl", expect.stringMatching(/^session\.jsonl\.\d{8}T\d{9}Z\.bak$/)]);
-    for (const line of files) expect(sha(line.to)).toBe(line.sha256);
-    const held = [...files.map(line => sha(line.to)),
-      ...archived(directory.to).map(name => sha(path.join(directory.to, name)))].sort();
-    // Every trace this actor ever had: the three reset sessions (two archived, one kept .bak) and the live one.
-    expect(held).toEqual([...hashes].sort());
-    expect(fs.existsSync(path.join(directory.to, "MANIFEST.jsonl"))).toBe(true);
-  });
+    // One rename: the archived tree is exactly the tree at the rename, and holds every file the actor had before.
+    expect(atRename).toBeDefined();
+    expect(snapshot(fleet)).toEqual(atRename);
+    for (const [name, digest] of Object.entries(before)) expect([name, snapshot(fleet)[name]]).toEqual([name, digest]);
+    const lines = manifest(path.dirname(fleet));
+    expect(lines.map(line => [line.phase, line.kind, line.from, line.to, line.actorId, line.rootId])).toEqual([
+      ["MOVING", "tree", actorDir, fleet, actor.id, identity.id], ["MOVED-TO", "tree", actorDir, fleet, actor.id, identity.id]]);
+    expect(lines[1]!.line).toBe(`MOVED-TO ${fleet}`);
+    // The intent recorded each trace's sha256 before the rename.
+    const traces = Object.fromEntries((lines[0]!.files as Array<{ path: string; sha256?: string }>).filter(file => file.sha256)
+      .map(file => [file.path, file.sha256]));
+    expect(traces).toMatchObject({ "session.jsonl": before["session.jsonl"], ".activation-refused-merge.jsonl": before[".activation-refused-merge.jsonl"] });
+  }, SLOW);
 
-  it("4b. a non-persistent manager's root-tree reset (close) moves its session traces into the fleet archive first", async () => {
+  it("4b. a non-persistent manager's root-tree reset (close) moves the WHOLE actor root into the fleet archive", async () => {
     const { actors, mesh, identity } = setup({ persistent: false });
     const actor = await actors.create({ name: "ephemeral", instructions: "Pass." });
     await actors.ask(actor.id, "one");
-    const first = sha(actor.sessionFile!);
     await actors.resetSession(actor.id);
     await actors.ask(actor.id, "two");
-    const live = sha(actor.sessionFile!);
     const actorRoot = path.dirname(path.dirname(actor.sessionFile!));
+    retainedActivation(path.dirname(actor.sessionFile!), "kept-at-close");
+    const before = snapshot(actorRoot);
+    const relative = path.basename(path.dirname(actor.sessionFile!));
+    // A non-persistent manager keeps its message log in memory (no registry/messages.jsonl); every file it has moves.
+    expect(Object.keys(before)).toEqual(expect.arrayContaining([`${relative}/session.jsonl`,
+      `${relative}/.activation-kept-at-close.jsonl`, expect.stringMatching(new RegExp(`^${relative}/session\\.jsonl\\.\\d{8}T\\d{9}Z\\.bak$`))]));
+    let atRename: Record<string, string> | undefined;
+    beforeRename = source => { if (path.resolve(source) === path.resolve(actorRoot)) atRename = snapshot(source); };
     await managers.splice(0, 1)[0]!.close();
     expect(fs.existsSync(actorRoot)).toBe(false);
-    const fleet = path.join(fleetSessionArchive(mesh.root, identity.id), actor.id);
-    const lines = manifest(fleet);
-    expect(lines.map(line => line.sha256).sort()).toEqual([first, live].sort());
-    for (const line of lines) expect(sha(line.to)).toBe(line.sha256);
-  });
+    const fleet = path.join(fleetSessionArchive(mesh.root, identity.id), "actor-root");
+    expect(atRename).toBeDefined();
+    expect(snapshot(fleet)).toEqual(atRename);
+    for (const [name, digest] of Object.entries(before)) expect([name, snapshot(fleet)[name]]).toEqual([name, digest]);
+    expect(manifest(path.dirname(fleet)).map(line => [line.phase, line.kind, line.from, line.to]))
+      .toEqual([["MOVING", "tree", actorRoot, fleet], ["MOVED-TO", "tree", actorRoot, fleet]]);
+  }, SLOW);
 
-  it("5. GUARD: no code path in tests 1-4 or the actor stop/remove unlinked a session trace", () => {
+  // fabric-store's review (pi-fabric#1568): `create()` of a name whose namesake is STOPPED removes the namesake first
+  // (src/actors/manager.ts create(): `if (sameName?.status === "stopped") await this.remove(sameName.id, ...)`). That
+  // path must keep every trace of the old actor too.
+  it("4c. stop, then create with the SAME name: every trace of the stopped namesake is byte-identical in its fleet archive", async () => {
+    const { actors, mesh, identity } = setup();
+    const old = await actors.create({ name: "namesake", instructions: "First." });
+    const oldDir = path.dirname(old.sessionFile!);
+    await actors.ask(old.id, "one");
+    await actors.resetSession(old.id);
+    await actors.ask(old.id, "two");
+    await actors.stop(old.id);
+    retainedActivation(oldDir, "namesake-refused-merge");
+    const before = snapshot(oldDir);
+    // Every kind of trace: the session, its kept .bak, the activation session and the message log.
+    expect(Object.keys(before)).toEqual(expect.arrayContaining(["session.jsonl", ".activation-namesake-refused-merge.jsonl",
+      "registry/messages.jsonl"]));
+    expect(Object.keys(before).filter(name => /^session\.jsonl\.\d{8}T\d{9}Z\.bak$/.test(name))).toHaveLength(1);
+    let atRename: Record<string, string> | undefined;
+    const pinned = fs.lstatSync(oldDir);
+    beforeRename = source => {
+      const stat = fs.lstatSync(source, { throwIfNoEntry: false });
+      if (stat?.dev === pinned.dev && stat.ino === pinned.ino) atRename = snapshot(source);
+    };
+    const next = await actors.create({ name: "namesake", instructions: "Second." });
+    await actors.removalSettled(old.id);
+    expect(next.id).not.toBe(old.id);
+    expect(actors.list().map(actor => actor.id)).not.toContain(old.id);
+    expect(actors.cleanupObligation(old.id)).toBeUndefined();
+    expect(fs.existsSync(oldDir)).toBe(false);
+    // The old actor's whole tree, by one rename: exactly the tree at the rename, and every file it had before.
+    const fleet = fleetSessionArchive(mesh.root, identity.id, old.id);
+    expect(atRename).toBeDefined();
+    expect(snapshot(fleet)).toEqual(atRename);
+    for (const [name, digest] of Object.entries(before)) expect([name, snapshot(fleet)[name]]).toEqual([name, digest]);
+    expect(manifest(path.dirname(fleet)).map(line => [line.phase, line.from, line.to, line.actorId]))
+      .toEqual([["MOVING", oldDir, fleet, old.id], ["MOVED-TO", oldDir, fleet, old.id]]);
+    // The successor starts fresh in its own directory; the archive is untouched by it.
+    expect(path.dirname(next.sessionFile!)).not.toBe(oldDir);
+  }, SLOW);
+
+  it("5. GUARD: no code path in tests 1-4 or the actor stop/remove deleted, truncated or renamed over a session trace", () => {
     const seen = [...violations];
-    // Canary: the spies are live and do catch a real session-file unlink and a recursive rm of a tree holding one.
+    // Canary: the spies are live and catch a real session-file unlink, a recursive rm of a tree holding one, an
+    // activation-session unlink, a truncate of a message log and a rename onto a session file.
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-trace-canary-"));
     roots.push(directory);
     const canary = path.join(directory, "session.jsonl.canary");
@@ -273,7 +413,17 @@ describe("actor session traces are archived, never deleted (smarty-dev#16444)", 
     fs.mkdirSync(path.join(directory, "tree"));
     fs.writeFileSync(path.join(directory, "tree", "session.jsonl"), "x");
     fs.rmSync(path.join(directory, "tree"), { recursive: true, force: true });
-    expect(violations.slice(seen.length)).toEqual([`fs.unlinkSync ${canary}`, `fs.rmSync ${path.join(directory, "tree")}`]);
+    const activation = path.join(directory, ".activation-run.jsonl");
+    fs.writeFileSync(activation, "x");
+    fs.unlinkSync(activation);
+    const messages = path.join(directory, "messages.jsonl");
+    fs.writeFileSync(messages, "x");
+    fs.truncateSync(messages, 0);
+    const live = path.join(directory, "session.jsonl"), other = path.join(directory, "other.json");
+    fs.writeFileSync(live, "x"); fs.writeFileSync(other, "y");
+    fs.renameSync(other, live);
+    expect(violations.slice(seen.length)).toEqual([`fs.unlinkSync ${canary}`, `fs.rmSync ${path.join(directory, "tree")}`,
+      `fs.unlinkSync ${activation}`, `fs.truncateSync ${messages}`, `fs.renameSync(over) ${live}`]);
     expect(seen).toEqual([]);
   });
 });

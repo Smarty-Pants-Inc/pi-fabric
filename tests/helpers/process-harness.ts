@@ -28,6 +28,8 @@ export type ResidentPause = "beforeRemove" | "beforeCheck" | "beforeDelete" | "f
 export type ResidentCall =
   | { kind: "hook"; name: "beforeCheck" | "beforeDelete"; fenced: boolean }
   | { kind: "rm"; path: string; fenced: boolean }
+  /** smarty-dev#16444: a whole actor tree's one archive rename (performed: it deletes nothing). */
+  | { kind: "archive"; path: string; fenced: boolean }
   | { kind: "remove"; id: string; options: { wait?: boolean; operator?: true } };
 
 const CHILD = path.resolve("tests/fixtures/process-harness-child.mjs");

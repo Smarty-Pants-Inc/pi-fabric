@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager } from "../src/actors/manager.js";
+import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -29,13 +30,11 @@ type Call = { at: string; fenced: boolean; path?: string };
 // whole actor root) and directories under them. Permitted: metadata lock directories (`<file>.lock` and its
 // `.lock.dead.<hash>` takeover fence), which the registry and binding stores create and release beside the trees.
 const METADATA_LOCK = /\.lock(\.dead\.[0-9a-f]+)?$/;
-/** smarty-dev#16444 (R-keep-all-traces): a removal moves the session trace into the fleet archive BEFORE its tree delete
- * (here recorded, never performed); the moved bytes, read back from there. */
-const archivedSession = (meshRoot: string, rootId: string, actorId: string): string => {
-  const directory = fleetSessionArchive(meshRoot, rootId, actorId);
-  const name = fs.readdirSync(directory).find(entry => entry.endsWith(".jsonl") && entry !== "MANIFEST.jsonl")!;
-  return fs.readFileSync(path.join(directory, name), "utf8");
-};
+/** smarty-dev#16444 (R-keep-all-traces): a removal renames the WHOLE actor tree into the fleet archive (never a delete);
+ * the session bytes, read back from there (`actorId` under `via`: a root reset's archived actor root). */
+const archivedSession = (meshRoot: string, rootId: string, actorId: string, via?: string): string =>
+  fs.readFileSync(via === undefined ? path.join(fleetSessionArchive(meshRoot, rootId, actorId), "session.jsonl")
+    : path.join(fleetSessionArchive(meshRoot, rootId), via, actorId, "session.jsonl"), "utf8");
 const guardActorTrees = (roots: string[], fenced: () => boolean, calls: Call[]) => {
   const inTree = (file: unknown) => {
     const resolved = path.resolve(String(file));
@@ -44,6 +43,21 @@ const guardActorTrees = (roots: string[], fenced: () => boolean, calls: Call[]) 
       fs.existsSync(resolved) && fs.statSync(resolved).isDirectory();
   };
   const record = (file: unknown) => { calls.push({ at: "rm", path: path.resolve(String(file)), fenced: fenced() }); };
+  // smarty-dev#16444: the tree now leaves its location by ONE archive rename (performed: it deletes nothing). The source
+  // may be the held-parent path (/proc/self/fd/<fd>/./<name>), resolved through its parent.
+  const rename = fs.renameSync.bind(fs);
+  const real = (file: unknown): string => {
+    try { return path.join(fs.realpathSync(path.dirname(String(file))), path.basename(String(file))); } catch { return path.resolve(String(file)); }
+  };
+  const protectedTree = (file: unknown): string | undefined => {
+    const resolved = real(file);
+    return roots.map(root => path.resolve(root)).find(root => resolved === root || resolved === real(root));
+  };
+  vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+    const tree = protectedTree(source);
+    if (tree) calls.push({ at: "archive", path: tree, fenced: fenced() });
+    rename(source, destination);
+  });
   const rmSync = fs.rmSync.bind(fs), rmdirSync = fs.rmdirSync.bind(fs) as (file: fs.PathLike, options?: fs.RmDirOptions) => void, rm = fs.promises.rm.bind(fs.promises);
   vi.spyOn(fs, "rmSync").mockImplementation((file, options) => { if (inTree(file)) record(file); else rmSync(file, options); });
   vi.spyOn(fs, "rmdirSync").mockImplementation(((file: fs.PathLike, options?: fs.RmDirOptions) => {
@@ -160,9 +174,9 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
       const removed = await f.cli(actor.id, ["--confirm-dead-root", f.config.rootId]);
       expect(removed).toMatchObject({ code: 0, err: "" });
       expect(calls).toEqual([
-        { at: "beforeCheck", fenced: true }, { at: "beforeDelete", fenced: true }, { at: "rm", path: path.resolve(dir), fenced: true }]);
+        { at: "beforeCheck", fenced: true }, { at: "beforeDelete", fenced: true }, { at: "archive", path: path.resolve(dir), fenced: true }]);
       expect(refused).toMatchObject({ code: "FABRIC_MAIN_PUBLICATION_FENCED" });
-      // smarty-dev#16444: the session moved into the fleet archive before the delete, which is recorded, never performed.
+      // smarty-dev#16444: the whole tree was renamed into the fleet archive (never deleted).
       expect(archivedSession(f.config.meshRoot, f.config.rootId, actor.id)).toBe("history\n");
       expect(fenced()).toBe(false);
       await expect(main.refresh()).resolves.toBeUndefined();
@@ -197,19 +211,18 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
     } finally { vi.restoreAllMocks(); await main.close(); await f.close(); }
   }, 60_000);
 
-  // Timing regression: the operator caller joins while the ordinary cleanup's lazy verifier import resolves (after
-  // the bindings await and any operator check placed before the import). The import must precede the final operator
-  // check, so the joined provenance is checked and the tree kept; the recorded verifier is never reached. Seam: the
-  // dynamic import's destructure reads the module namespace's verifiedRemove export, so a getter on it (the guard's
-  // spy, configurable under Vitest's module runner) observes exactly that resolution. Only an access whose caller is
-  // src/actors/manager.ts launches the join (binding and mesh lock releases read the same export from other modules).
-  it("an operator removal that joins while the ordinary cleanup's verifier import resolves gets the final operator check and keeps the tree", async () => {
+  // smarty-dev#16444 replaces the "operator joins while the cleanup's lazy verifier import resolves" timing regression:
+  // the archive rename has no import (or any other await) after the final operator check, so that window is gone.
+  // What is left is proven here: (1) a join at the LAST await before the rename (the bindings delete) still gets the
+  // final operator check and keeps the tree; (2) once the rename runs, a live writer loses nothing: its open file moves
+  // with the tree (same inode) and every byte written through its descriptor, before the judgment, under the fence and
+  // after the rename, is in the archived file; nothing is unlinked.
+  it("an operator removal that joins at the last await before the archive rename (the bindings delete) gets the final operator check and keeps the tree", async () => {
     const f = await fixture();
     const main = mainDirectory(f.config.meshRoot, f.config.rootId);
-    let restoreExport = () => {};
     let joined: ReturnType<typeof f.host.actors.remove> | undefined;
     try {
-      const actor = await f.create("import-join");
+      const actor = await f.create("bindings-join");
       const dir = path.join(f.config.actorRoot, actor.id);
       fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "session.jsonl"), "history\n");
       await main.refresh(); // a live Main with a fresh participant: ordinary removal is allowed, operator removal is not
@@ -217,37 +230,81 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
       const calls: Call[] = [];
       guardActorTrees([dir], fenced, calls);
       observeHooks(fenced, calls);
-      const recorded = verifier.verifiedRemove; // the guard's recording spy
-      const descriptor = Object.getOwnPropertyDescriptor(verifier, "verifiedRemove");
-      expect(descriptor?.configurable, "verifiedRemove namespace export is not configurable").toBe(true);
-      const managerSource = path.join("src", "actors", "manager.ts");
-      let launched = false;
-      Object.defineProperty(verifier, "verifiedRemove", { configurable: true, enumerable: descriptor!.enumerable ?? false, get() {
-        const caller = (new Error().stack ?? "").split("\n").filter(line => /^\s+at /.test(line))[1] ?? "";
-        if (!launched && caller.includes(managerSource)) {
-          launched = true; // sticky before remove() runs its synchronous escalation
+      const deleteBinding = ActorBindingStore.prototype.delete;
+      vi.spyOn(ActorBindingStore.prototype, "delete").mockImplementation(function (this: ActorBindingStore, id: string) {
+        if (id === actor.id && joined === undefined) {
           calls.push({ at: "join", fenced: fenced() });
           joined = f.host.actors.remove(actor.id, { wait: false, operator: true });
           joined.catch(() => undefined);
         }
-        return recorded;
-      } });
-      restoreExport = () => { Object.defineProperty(verifier, "verifiedRemove", descriptor!); restoreExport = () => {}; };
-      const ordinary = f.host.actors.remove(actor.id, { wait: false });
-      const first = await ordinary;
-      expect(joined, "the verifier import never resolved through the namespace export").toBeDefined();
+        return deleteBinding.call(this, id);
+      });
+      const first = await f.host.actors.remove(actor.id, { wait: false });
+      expect(joined, "the bindings delete never ran under the fence").toBeDefined();
       const second = await joined!;
+      // The join came after the judgment, under the fence; the final operator check refused; nothing was archived.
       expect(calls).toEqual([
         { at: "beforeCheck", fenced: true }, { at: "beforeDelete", fenced: true }, { at: "join", fenced: true }]);
-      expect(vi.mocked(recorded).mock.calls.filter(([target]) => path.resolve(String(target)) === path.resolve(dir))).toEqual([]);
       for (const result of [first, second]) expect(result).toMatchObject({ cleaned: false, pending: expect.stringMatching(/kept|live|fresh/i) });
       expect(fs.readFileSync(path.join(dir, "session.jsonl"), "utf8")).toBe("history\n");
+      expect(fs.existsSync(fleetSessionArchive(f.config.meshRoot, f.config.rootId, actor.id))).toBe(false);
       expect(fenced()).toBe(false);
     } finally {
-      restoreExport(); // the exact spy descriptor, before any mock restore
       await joined?.catch(() => undefined);
       await main.close(); await f.close();
       vi.restoreAllMocks(); // the guard stays installed through every close and the temp-root teardown
+    }
+  }, 60_000);
+
+  it("a live writer's open session file moves with the tree: every byte written through its descriptor, before, under the fence and after the rename, is archived; nothing is unlinked", async () => {
+    const f = await fixture();
+    const main = mainDirectory(f.config.meshRoot, f.config.rootId);
+    let fd: number | undefined;
+    try {
+      const actor = await f.create("live-writer");
+      const dir = path.join(f.config.actorRoot, actor.id);
+      fs.mkdirSync(dir, { recursive: true });
+      const session = path.join(dir, "session.jsonl");
+      fd = fs.openSync(session, "a");
+      fs.writeSync(fd, "before\n");
+      const inode = fs.fstatSync(fd).ino;
+      await main.refresh();
+      const fenced = () => mainPublicationFenced(f.config.meshRoot, f.config.rootId);
+      const calls: Call[] = [];
+      guardActorTrees([dir], fenced, calls);
+      // Any unlink of a trace (wherever it is now: the tree or the archive) is recorded and refused.
+      const archive = fleetSessionArchive(f.config.meshRoot, f.config.rootId);
+      const traced = (file: unknown): boolean => {
+        const name = String(file);
+        let resolved = path.resolve(name);
+        try { resolved = path.join(fs.realpathSync(path.dirname(name)), path.basename(name)); } catch { /* as given */ }
+        return [dir, archive].some(root => resolved.startsWith(root + path.sep)) && /session\.jsonl|\.activation-|messages.*\.jsonl/.test(resolved);
+      };
+      const unlinkSync = fs.unlinkSync.bind(fs), unlink = fs.promises.unlink.bind(fs.promises);
+      vi.spyOn(fs, "unlinkSync").mockImplementation(file => {
+        if (traced(file)) { calls.push({ at: "unlink", path: String(file), fenced: fenced() }); throw new Error(`guard: unlink of a trace ${String(file)}`); }
+        unlinkSync(file);
+      });
+      vi.spyOn(fs.promises, "unlink").mockImplementation(async file => {
+        if (traced(file)) { calls.push({ at: "unlink", path: String(file), fenced: fenced() }); throw new Error(`guard: unlink of a trace ${String(file)}`); }
+        await unlink(file);
+      });
+      // The writer keeps appending under the fence, after the judgment, right before the rename.
+      observeHooks(fenced, calls, { beforeDelete: async () => { fs.writeSync(fd!, "under-fence\n"); } });
+      const result = await f.host.actors.remove(actor.id);
+      expect(result).not.toMatchObject({ cleaned: false });
+      expect(calls).toEqual([
+        { at: "beforeCheck", fenced: true }, { at: "beforeDelete", fenced: true }, { at: "archive", path: path.resolve(dir), fenced: true }]);
+      // After the rename the writer still holds the same file, now in the archive.
+      fs.writeSync(fd, "after\n");
+      const archived = path.join(fleetSessionArchive(f.config.meshRoot, f.config.rootId, actor.id), "session.jsonl");
+      expect(fs.lstatSync(archived).ino).toBe(inode);
+      expect(fs.readFileSync(archived, "utf8")).toBe("before\nunder-fence\nafter\n");
+      expect(fs.existsSync(dir)).toBe(false);
+      expect(fenced()).toBe(false);
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+      vi.restoreAllMocks(); await main.close(); await f.close();
     }
   }, 60_000);
 
@@ -266,7 +323,7 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
       const result = await f.host.actors.remove(actor.id);
       expect(result).not.toMatchObject({ cleaned: false });
       expect(calls).toEqual([
-        { at: "beforeCheck", fenced: true }, { at: "beforeDelete", fenced: true }, { at: "rm", path: path.resolve(dir), fenced: true }]);
+        { at: "beforeCheck", fenced: true }, { at: "beforeDelete", fenced: true }, { at: "archive", path: path.resolve(dir), fenced: true }]);
       // smarty-dev#16444: the session moved into the fleet archive before the delete, which is recorded, never performed.
       expect(archivedSession(f.config.meshRoot, f.config.rootId, actor.id)).toBe("history\n");
       expect(fenced()).toBe(false);
@@ -623,8 +680,8 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
       expect(calls).toContainEqual({ kind: "remove", id: actor.id, options: expect.objectContaining({ operator: true }) });
       expect(calls.filter(call => call.kind === "hook")).toEqual([
         { kind: "hook", name: "beforeCheck", fenced: true }, { kind: "hook", name: "beforeDelete", fenced: true }]);
-      expect(calls.filter(call => call.kind === "rm" && call.path === path.resolve(dir))).toEqual([
-        { kind: "rm", path: path.resolve(dir), fenced: true }]);
+      expect(calls.filter(call => call.kind === "archive" && call.path === path.resolve(dir))).toEqual([
+        { kind: "archive", path: path.resolve(dir), fenced: true }]);
       // smarty-dev#16444: the session moved into the fleet archive before the delete, which is recorded, never performed.
       expect(archivedSession(f.config.meshRoot, f.config.rootId, actor.id)).toBe("history\n");
       expect(fenced()).toBe(false);
@@ -651,11 +708,12 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
       guardActorTrees([actorRoot], fenced, calls);
       observeHooks(fenced, calls);
       await actors.close();
-      const rm = calls.filter(call => call.at === "rm");
-      expect(rm).toEqual([{ at: "rm", path: path.resolve(actorRoot), fenced: true }]);
-      expect(calls.findIndex(call => call.at === "beforeDelete")).toBeLessThan(calls.indexOf(rm[0]!));
-      // smarty-dev#16444: the close moved the session into the fleet archive before the (recorded) root-tree delete.
-      expect(archivedSession(mesh.root, rootId, "a1")).toBe("history\n");
+      expect(calls.filter(call => call.at === "rm")).toEqual([]);
+      const moved = calls.filter(call => call.at === "archive");
+      expect(moved).toEqual([{ at: "archive", path: path.resolve(actorRoot), fenced: true }]);
+      expect(calls.findIndex(call => call.at === "beforeDelete")).toBeLessThan(calls.indexOf(moved[0]!));
+      // smarty-dev#16444: the close renamed the whole actor root into the fleet archive (never deleted).
+      expect(archivedSession(mesh.root, rootId, "a1", "actor-root")).toBe("history\n");
       expect(fenced()).toBe(false);
     } finally {
       vi.restoreAllMocks();

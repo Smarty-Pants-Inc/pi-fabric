@@ -6,21 +6,23 @@ import { ActorDirectory } from "../src/actors/directory.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { fleetSessionArchive } from "../src/storage/session-archive.js";
 import { mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { failActorTreeRemoval } from "./helpers/actor-tree-removal.js";
 
 // Supplement to actor-directory.test.ts "... cleanup-only id after exhausted retries": the same exact-id cleanup retry
-// contract, recorded instead of deleting (no product actor tree is actually deleted locally). The first cleanup
-// runs the REAL verifiedRemove with the manager's own options; failActorTreeRemoval faults its first tree mutation
-// (Linux: the graveyard move; elsewhere: main's path fallback), so the cleanup stays pending. The explicit exact-id
-// retry runs the same REAL verifier with dryRun: true only: it verifies the judged tree under the held fence and
-// reports success, and the tree stays on disk (a recorded removal, not an absence).
-type Verify = typeof import("../src/storage/verified-remove.js").verifiedRemove;
-const verifier = vi.hoisted(() => ({ wrap: undefined as undefined | ((real: Verify, ...args: Parameters<Verify>) => ReturnType<Verify>) }));
-vi.mock("../src/storage/verified-remove.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/storage/verified-remove.js")>();
-  const verifiedRemove: Verify = (...args) => verifier.wrap ? verifier.wrap(actual.verifiedRemove, ...args) : actual.verifiedRemove(...args);
-  return { ...actual, verifiedRemove };
+// contract, around the archive rename. smarty-dev#16444 (R-keep-all-traces): an actor tree is archived, never deleted
+// (one rename of the judged directory into `<meshRoot>/session-archive/<root>/<actor>`), so nothing is deleted
+// locally and the rename really runs. The first cleanup runs the REAL moveActorTreeToArchive with the manager's own
+// arguments; failActorTreeRemoval faults its rename, so the cleanup stays pending with the tree in place. The explicit
+// exact-id retry runs the same REAL rename: recorded with its judged identity and the fence state, it moves the tree
+// (same inode, same bytes) into the archive, with its MOVING and MOVED-TO lines.
+type Move = typeof import("../src/storage/tree-archive.js").moveActorTreeToArchive;
+const archiver = vi.hoisted(() => ({ wrap: undefined as undefined | ((real: Move, ...args: Parameters<Move>) => ReturnType<Move>) }));
+vi.mock("../src/storage/tree-archive.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/storage/tree-archive.js")>();
+  const moveActorTreeToArchive: Move = (...args) => archiver.wrap ? archiver.wrap(actual.moveActorTreeToArchive, ...args) : actual.moveActorTreeToArchive(...args);
+  return { ...actual, moveActorTreeToArchive };
 });
 
 const UNSUPPORTED_PLATFORM = process.platform !== "linux" && process.platform !== "darwin" && process.platform !== "win32";
@@ -60,7 +62,7 @@ const guardRawDeletes = (trees: string[], blocked: string[]): (() => void) => {
 };
 
 describe.skipIf(UNSUPPORTED_PLATFORM)("ActorDirectory recorded cleanup retry", () => {
-  it.each(["project", "session"] as const)("retries an exact %s cleanup-only id through the real verifier, recorded", async (scope) => {
+  it.each(["project", "session"] as const)("retries an exact %s cleanup-only id through the real archive rename, recorded", async (scope) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-cleanup-retry-recorded-"));
     const meshRoot = path.join(root, "mesh");
     const trees: string[] = [];
@@ -85,19 +87,21 @@ describe.skipIf(UNSUPPORTED_PLATFORM)("ActorDirectory recorded cleanup retry", (
       fs.writeFileSync(sentinel, "history\n");
       const target = fs.lstatSync(dir);
       const marker = path.join(actorRoots[scope], `removal-${actor.id}.json`);
+      const fleet = fleetSessionArchive(meshRoot, ROOT_ID);
+      const archived = fleetSessionArchive(meshRoot, ROOT_ID, actor.id);
+      trees.push(archived); // a raw delete of the archived tree is refused too
 
       let phase: "fault" | "retry" = "fault";
-      const calls: Array<{ phase: string; dryRun: boolean; sameInode: boolean; fenced: boolean; removed: boolean }> = [];
-      verifier.wrap = (real, at, judged, options) => {
-        if (options.deleter !== "actor-tree" || at !== dir) return real(at, judged, options);
-        const now = fs.lstatSync(at, { throwIfNoEntry: false });
-        const sameInode = !!judged && !!now && now.dev === judged.dev && now.ino === judged.ino &&
-          now.dev === target.dev && now.ino === target.ino;
+      const calls: Array<{ phase: string; to: string; sameInode: boolean; fenced: boolean; moved: boolean }> = [];
+      archiver.wrap = (real, source, pin, archive, chain, name, route) => {
+        if (archive !== fleet || !name?.startsWith(actor.id)) return real(source, pin, archive, chain, name, route);
+        // The judged pin and the entry the rename takes are this exact tree.
+        const now = fs.lstatSync(source, { throwIfNoEntry: false });
+        const sameInode = !!now && now.dev === pin.dev && now.ino === pin.ino && now.dev === target.dev && now.ino === target.ino;
         const fenced = mainPublicationFenced(meshRoot, ROOT_ID);
-        // Initial phase: the manager's options object, unchanged, so the real move (and its injected fault) runs.
-        const result = phase === "fault" ? real(at, judged, options) : real(at, judged, { ...options, dryRun: true });
-        calls.push({ phase, dryRun: phase === "retry", sameInode, fenced, removed: result.removed });
-        return result;
+        let moved = false;
+        try { const to = real(source, pin, archive, chain, name, route); moved = true; return to; }
+        finally { calls.push({ phase, to: path.join(archive, name), sameInode, fenced, moved }); }
       };
 
       let faults = 0;
@@ -108,7 +112,11 @@ describe.skipIf(UNSUPPORTED_PLATFORM)("ActorDirectory recorded cleanup retry", (
         await directory.removalSettled(actor.id);
       } finally { fault.mockRestore(); }
       expect(faults).toBe(1);
-      expect(calls).toEqual([{ phase: "fault", dryRun: false, sameInode: true, fenced: true, removed: false }]);
+      expect(calls).toEqual([{ phase: "fault", to: archived, sameInode: true, fenced: true, moved: false }]);
+      // The failed rename kept the tree in place (same inode, same bytes); the intent and its failure are recorded.
+      expect(fs.lstatSync(dir)).toMatchObject({ dev: target.dev, ino: target.ino });
+      expect(fs.readFileSync(sentinel, "utf8")).toBe("history\n");
+      expect(fs.existsSync(archived)).toBe(false);
       expect(fs.existsSync(marker)).toBe(true);
       expect(directory.owns(actor.id)).toBe(true);
       expect(directory.pendingRemovals()).toEqual([expect.objectContaining({ id: actor.id, state: expect.stringContaining("cleanup failed") })]);
@@ -127,16 +135,21 @@ describe.skipIf(UNSUPPORTED_PLATFORM)("ActorDirectory recorded cleanup retry", (
       phase = "retry";
       await expect(directory.remove(actor.id)).resolves.toEqual({ removed: true });
       expect(faults).toBe(1);
-      expect(calls.slice(1)).toEqual([{ phase: "retry", dryRun: true, sameInode: true, fenced: true, removed: true }]);
+      expect(calls.slice(1)).toEqual([{ phase: "retry", to: archived, sameInode: true, fenced: true, moved: true }]);
       expect(directory.pendingRemovals()).toEqual([]);
       expect(fs.existsSync(marker)).toBe(false);
-      // Recorded, not absent: the old tree and its bytes are kept, and the successor is untouched.
-      expect(fs.lstatSync(dir)).toMatchObject({ dev: target.dev, ino: target.ino });
-      expect(fs.readFileSync(sentinel, "utf8")).toBe("history\n");
+      // Archived, never deleted: the old tree (same inode) and its bytes are in the fleet archive, recorded MOVING
+      // then MOVED-TO after the faulted attempt's MOVING and MOVE-FAILED; the successor is untouched.
+      expect(fs.existsSync(dir)).toBe(false);
+      expect(fs.lstatSync(archived)).toMatchObject({ dev: target.dev, ino: target.ino });
+      expect(fs.readFileSync(path.join(archived, "kept-recorded.txt"), "utf8")).toBe("history\n");
+      const lines = fs.readFileSync(path.join(fleet, "MANIFEST.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+      expect(lines.map(line => [line.phase, line.from, line.to])).toEqual([
+        ["MOVING", dir, archived], ["MOVE-FAILED", dir, archived], ["MOVING", dir, archived], ["MOVED-TO", dir, archived]]);
       expect(directory.status("reviewer").id).toBe(successor.id);
       expect(fs.readFileSync(successor.sessionFile!, "utf8")).toBe("successor\n");
     } finally {
-      verifier.wrap = undefined;
+      archiver.wrap = undefined;
       try { await directory.close(); await manager.close(); } finally { restoreGuards(); }
     }
     expect(blocked).toEqual([]);

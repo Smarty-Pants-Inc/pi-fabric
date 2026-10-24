@@ -270,6 +270,8 @@ export function isolateTestFleetEnvironment(): Record<string, string> {
   for (const key of [
     "PI_CODING_AGENT_DIR", "PI_CODING_AGENT", "PI_SESSION_ID", "PI_SESSION_FILE",
     "SMARTY_ROLE", "SMARTY_AGENT", "SMARTY_LEAD_SESSION", "MCPORTER_CONFIG",
+    // smarty-dev#15878: the agent's own session store would place children's short TMPDIRs outside test temp.
+    "SMARTY_SESSION_STORE", "SMARTY_SESSION_STORE_ID", "SMARTY_SESSION_STORE_TICKS",
   ]) delete process.env[key];
 
   // Keep Windows' stable TMP policy, but never share fleet state between workers/files.

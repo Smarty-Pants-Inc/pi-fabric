@@ -23,6 +23,7 @@ import { spawn } from "node:child_process";
 import os from "node:os";
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
+import { allocateShortTmpdir, ownedShortTmpdir, recordedShortTmpdir, type ShortTmpdirSource } from "./short-tmpdir.js";
 import { mkdirPrivate } from "../storage/private-dir.js";
 import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
@@ -724,6 +725,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   lifecycleOffset: number;
   lifecycleRemainder: Buffer;
   runDirectory: string;
+  /** smarty-dev#15878: the short private TMPDIR outside runDirectory; removed after the run tree. */
+  temporaryDirectory?: string;
   transport: AgentTransportHandle;
   adapter: AgentTransportAdapter;
   launch: AgentTransportLaunch;
@@ -1421,6 +1424,7 @@ export class AgentManager {
   readonly #rootSessionCwd: (() => string | undefined) | undefined;
   readonly #sessionId: (() => string | undefined) | undefined;
   readonly #executorRuntime: (() => string | undefined) | undefined;
+  readonly #shortTmpdirSource: () => ShortTmpdirSource;
   /** This process's own confinement; children may only narrow it. */
   readonly #parentWritePolicy: FabricWritePolicy | undefined = readWritePolicy();
   readonly #parentLineage: FabricAgentLineage | undefined = readAgentLineage();
@@ -1557,6 +1561,9 @@ export class AgentManager {
       sessionId?: () => string | undefined;
       /** Caller TypeScript executor runtime; native runtimes escape write confinement. */
       executorRuntime?: () => string | undefined;
+      /** smarty-dev#15878: where a child's short private TMPDIR may go, read at each spawn. Default: Fabric's data
+       * root (the caller's TMPDIR) and smarty-role's SMARTY_SESSION_STORE. */
+      shortTmpdirSource?: () => ShortTmpdirSource;
     } = {},
   ) {
     this.#semaphore = new AgentAdmission(config.maxConcurrent, Infinity, config.maxDepth);
@@ -1601,6 +1608,11 @@ export class AgentManager {
     this.#rootSessionCwd = options.rootSessionCwd;
     this.#sessionId = options.sessionId;
     this.#executorRuntime = options.executorRuntime;
+    this.#shortTmpdirSource = options.shortTmpdirSource ??
+      (() => {
+        const sessionStore = process.env.SMARTY_SESSION_STORE;
+        return { tmpdir: fabricDataRoot(), ...(sessionStore ? { sessionStore } : {}) };
+      });
     this.#currentDepth = Math.max(0, Number(process.env.PI_FABRIC_DEPTH ?? "0") || 0);
     this.#fullCodeMode = options.fullCodeMode ?? true;
     this.#kernel = options.kernel ?? (() => "typescript");
@@ -2763,11 +2775,24 @@ export class AgentManager {
         }
       }
 
+      let shortTmpdir: string | undefined;
       try {
         if (worktree && worktreeSetup?.trim()) await this.#worktrees.setup(id, worktreeSetup);
         if (applyTaskWriteDefault && worktree) applyTaskWriteDefault = defaultWriteScopeFits(agentCwd);
-        const tmpdir = applyActorWritePolicy || applyTaskWriteDefault ? path.join(runDirectory, "tmp") : undefined;
-        if (tmpdir) mkdirPrivate(tmpdir, this.#trustRoot());
+        // smarty-dev#15878: a short private TMPDIR outside the (arbitrarily deep) run tree, so the fleet bash guard's
+        // `<TMPDIR>/p.XXXXXX` fits its 60 bytes. A write-confined caller keeps the run tree (its grant must cover it).
+        if ((applyActorWritePolicy || applyTaskWriteDefault) && !this.#parentWritePolicy) {
+          let source: ShortTmpdirSource | undefined;
+          try { source = this.#shortTmpdirSource(); shortTmpdir = allocateShortTmpdir(id, source); }
+          catch { shortTmpdir = undefined; }
+          // Lockout-safe: nothing fits, so keep the old run-tree TMPDIR (no worse than before) and say so once.
+          if (!shortTmpdir && process.platform !== "win32") {
+            fs.appendFileSync(logFile, JSON.stringify({ type: "tmpdir.fallback", ts: Date.now(), id, runner,
+              warning: `smarty-dev#15878: no private short TMPDIR under ${source?.tmpdir ?? "the caller's TMPDIR"} fits the fleet bash guard's budget; using the run directory's tmp` }) + "\n", { mode: 0o600 });
+          }
+        }
+        const tmpdir = shortTmpdir ?? (applyActorWritePolicy || applyTaskWriteDefault ? path.join(runDirectory, "tmp") : undefined);
+        if (tmpdir && !shortTmpdir) mkdirPrivate(tmpdir, this.#trustRoot());
         const actorReadOnly = request.readOnly ?? this.#parentWritePolicy?.readOnly ?? false;
         const writePolicy = capabilities.writePolicy
           ? resolveChildWritePolicy(applyActorWritePolicy
@@ -3237,6 +3262,7 @@ export class AgentManager {
           lifecycleOffset: 0,
           lifecycleRemainder: Buffer.alloc(0),
           runDirectory,
+          ...(shortTmpdir ? { temporaryDirectory: shortTmpdir } : {}),
           transport,
           adapter,
           // Ordinary caller abort detaches a managed worker; it must not veto
@@ -3375,6 +3401,9 @@ export class AgentManager {
         if (worktree && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json")))) {
           await this.#worktrees.cleanup(id, true).catch(() => false);
         }
+        // smarty-dev#15878: a confirmed non-launch never used its short TMPDIR; an unknown launch keeps it above.
+        if (shortTmpdir && !this.#runs.has(id) && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json"))) &&
+          ownedShortTmpdir(shortTmpdir)) await removeTree(shortTmpdir).catch(() => undefined);
         throw error;
       }
     };
@@ -4660,7 +4689,14 @@ export class AgentManager {
     syncDirectoryChain(directory);
     // A restarted owner has no live handle, but the saved native exit and all
     // other archive fences still govern collection of this exact source.
-    if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await removeTree(directory);
+    if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await this.#removeRunTree(directory, runId);
+  }
+
+  /** Remove a run tree, then (only once it is gone) its recorded short TMPDIR outside it (smarty-dev#15878). */
+  async #removeRunTree(runDirectory: string, id: string, known?: string): Promise<void> {
+    const temporary = recordedShortTmpdir(runDirectory, id, known);
+    await removeTree(runDirectory);
+    if (temporary && !fs.existsSync(runDirectory) && ownedShortTmpdir(temporary)) await removeTree(temporary).catch(() => undefined);
   }
   /** Recover only this actor's fenced sources under the configured host run root. */
   actorArchiveSources(actorId: string, sessionFile: string): Map<string, string> {
@@ -5046,7 +5082,7 @@ export class AgentManager {
       if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
       this.#onResultConsumed?.(id);
       const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
-      if (!this.config.retainRuns) await removeTree(runDirectory);
+      if (!this.config.retainRuns) await this.#removeRunTree(runDirectory, id);
       this.#queued.delete(id);
       this.#forgetRunMetadata(id);
       this.#invalidateUiList();
@@ -5084,7 +5120,7 @@ export class AgentManager {
     this.markForeground(id);
     const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
     if (!this.config.retainRuns) {
-      await removeTree(managed.runDirectory);
+      await this.#removeRunTree(managed.runDirectory, id, managed.temporaryDirectory);
     }
     this.#runs.delete(id);
     this.#forgetRunMetadata(id);
@@ -5610,7 +5646,7 @@ export class AgentManager {
           // explicit roots: an unexpected loss keeps custody and a loud refusal.
           if (managed.settledResultFile && !this.#exactResultPresent(managed)) return;
           if (await this.#retainTerminalPromptRecord(managed).catch(() => true)) return;
-          try { await removeTree(managed.runDirectory); } catch { return; } // A swallowed failure is no provenance.
+          try { await this.#removeRunTree(managed.runDirectory, managed.id, managed.temporaryDirectory); } catch { return; } // A swallowed failure is no provenance.
           // A no-op removal or remaining/dangling entry is not collection.
           if (managed.settledResultFile && pathAbsentNoFollow(managed.settledResultFile)) managed.resultCollected = true;
         }));
@@ -5632,7 +5668,7 @@ export class AgentManager {
           await Promise.all([...this.#queued.values()]
             .filter(queued => queued.terminal && !queued.routeSaveFailure && !queued.cleanupPending &&
               !runTreeExitVeto(path.join(this.#runRoot, queued.info.id)))
-            .map(queued => removeTree(path.join(this.#runRoot, queued.info.id)).catch(() => undefined)));
+            .map(queued => this.#removeRunTree(path.join(this.#runRoot, queued.info.id), queued.info.id).catch(() => undefined)));
           // Independently collectible tracked runs were removed above. Retry only
           // the owned empty root; never recursively remove unknown contents.
           await removeManagedRunRoot(this.#runRoot, this.#managedTempRoot);
@@ -5716,7 +5752,7 @@ export class AgentManager {
       if (!this.#canCollect(managed)) continue;
       // Retry settlement saves first; pending deliveries and unsafe contents still veto expiry.
       if (!canRemoveTerminalRun(managed.runDirectory)) continue;
-      await removeTree(managed.runDirectory).catch(() => undefined);
+      await this.#removeRunTree(managed.runDirectory, managed.id, managed.temporaryDirectory).catch(() => undefined);
       if (!fs.existsSync(managed.runDirectory)) {
         this.#runs.delete(managed.id);
         this.#forgetRunMetadata(managed.id);
@@ -7845,6 +7881,7 @@ export class AgentManager {
       ...(managed.transport.fabricRelease ? { fabricRelease: managed.transport.fabricRelease } : {}),
       ...(managed.transport.cgroup ? { cgroup: managed.transport.cgroup } : {}),
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
+      ...(managed.temporaryDirectory ? { temporaryDirectory: managed.temporaryDirectory } : {}),
       logFile: path.join(managed.runDirectory, "events.jsonl"),
       ...(nestedAgents.length > 0 ? { nestedAgents } : {}),
       ...(budget ? { budget } : {}),

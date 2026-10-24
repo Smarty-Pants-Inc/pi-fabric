@@ -286,6 +286,8 @@ export interface AgentRunRecord {
   capabilityDigest?: string;
   recursive?: boolean;
   residency?: FabricParticipantResidency;
+  /** smarty-dev#15878: the run's short private TMPDIR outside its run directory; cleanup follows the run. */
+  temporaryDirectory?: string;
   startedAt: number;
   updatedAt: number;
   finishedAt?: number;

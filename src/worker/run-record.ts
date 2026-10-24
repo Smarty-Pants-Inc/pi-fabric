@@ -88,6 +88,9 @@ export const createRunningRecord = (
     ? { capabilityRequirements: [...options.capabilityRequirements] }
     : {}),
   ...(options.capabilityDigest ? { capabilityDigest: options.capabilityDigest } : {}),
+  // smarty-dev#15878: a short TMPDIR outside the run directory is recorded so cleanup can find it.
+  ...(options.tmpdir && path.relative(path.dirname(options.statusFile), options.tmpdir).startsWith("..")
+    ? { temporaryDirectory: options.tmpdir } : {}),
   startedAt,
   updatedAt: startedAt,
   turns: options.carryOver?.turns ?? 0,

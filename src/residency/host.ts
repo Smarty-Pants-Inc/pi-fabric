@@ -2888,7 +2888,7 @@ export class ResidentHost {
       } else if (command.operation !== "removeActor") {
         if (command.operation === "setInstructions" || command.operation === "setModel" ||
           command.operation === "setThinking" || command.operation === "setBatching" || command.operation === "setActivationFilter" || command.operation === "setTools" ||
-          command.operation === "resetSession" || command.operation === "stop") {
+          command.operation === "resetSession" || command.operation === "stop" || command.operation === "abandonStuckRun") {
           this.#authorizeResidentSetter(command.caller);
           if (command.operation === "setTools") assertResidentActorToolCeiling(command.tools, command.caller?.toolCeiling);
         }
@@ -2917,6 +2917,12 @@ export class ResidentHost {
             const pending = this.actors.stop(actor.id, commit, true);
             boundaryAdmitted?.();
             updated = await pending;
+            break;
+          }
+          // smarty-dev#16333 round 5: synchronous and non-blocking; the queue is kept (ActorManager.abandonStuckRun).
+          case "abandonStuckRun": {
+            if (typeof command.runId !== "string" || !command.runId) throw new Error("abandonStuckRun requires runId");
+            updated = this.actors.abandonStuckRun(actor.id, command.runId, { beforeCommit: commit });
             break;
           }
           case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope, commit, command.modelReason); break;

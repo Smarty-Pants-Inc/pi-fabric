@@ -581,6 +581,8 @@ export const assertResidentActorToolCeiling = (tools: string[], ceiling: readonl
 export type ResidentActorMutation =
   | ({ operation: "setInstructions"; id: string; replace?: boolean } & import("../actors/instructions-file.js").FabricActorInstructionsSource)
   | { operation: "resetSession"; id: string }
+  /** smarty-dev#16333 round 5: the owner's queue-preserving way out of a stuck in-flight run. */
+  | { operation: "abandonStuckRun"; id: string; runId: string }
   | { operation: "stop"; id: string }
   | { operation: "setTools"; id: string; tools: string[] }
   | { operation: "setModel"; id: string; model?: string; modelReason?: string; scope: FabricActorBindingScope }
@@ -645,6 +647,7 @@ const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor
 export const RESIDENT_COMMANDS = [
   "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "slotStatus", "setInstructions", "setModel",
   "setThinking", "setTools", "setBatching", "setActivationFilter", "resetSession", "stop", "releaseChange", "releaseDrain", "operatorActor",
+  "abandonStuckRun",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
 export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>

@@ -260,3 +260,97 @@ for (const kind of ["Main", "proxy"] as const) {
     }
   });
 }
+
+// smarty-dev#16333 round 5: agents.abandonStuckRun reaches the actor's owning manager on both provider routes: the
+// root Main's call goes to its resident host as its own negotiated command, and a local owner calls its own manager.
+// Never through agents.stop. The manager's gates decide (tests/actor-abandon-stuck-run.test.ts covers them).
+describe("agents.abandonStuckRun through the provider", () => {
+  const context = { cwd: process.cwd(), signal: undefined, parentToolCallId: "abandon", nestedToolCallId: "abandon",
+    update() {}, activity() {} } as unknown as import("../src/protocol.js").FabricInvocationContext;
+  const providers = (state: Awaited<ReturnType<typeof fixture>>) => {
+    const passive = new ActorManager(state.config.sessionId, state.caller.identity, state.mesh, state.config.mesh, state.host.agents, () => {}, {
+      actorRoot: state.config.actorRoot, persistent: true, canManageActor: () => false,
+    });
+    const mainAgent = { id: state.config.rootId, local: true, matches: (id: string) => id === state.config.rootId } as FabricMainAgentTarget;
+    const make = (actors: ActorManager, residency?: ResidencyClient) => new AgentsProvider(state.host.agents, actors,
+      new GlobalActorRegistry(state.config.cwd, 64 * 1024), mainAgent, state.participants, undefined, state.host.lifecycle, () => false, residency, false);
+    return { passive, resident: make(passive, state.main), local: make(state.host.actors) };
+  };
+
+  it("routes to the resident host's manager and to a local owner's manager, whose gates refuse without a stuck run", async () => {
+    const state = await fixture("Main", 5_000);
+    const { passive, resident, local } = providers(state);
+    const abandon = vi.spyOn(state.host.actors, "abandonStuckRun");
+    try {
+      const runId = "e".repeat(32);
+      const refused = `did not abandon run ${runId}: the actor has no run in flight; nothing changed`;
+      expect(passive.owns(state.actor.id)).toBe(false);
+      await expect(resident.invoke("abandonStuckRun", { id: state.actor.id }, context)).rejects.toThrow("requires runId");
+      expect(abandon).not.toHaveBeenCalled();
+      expect(files(state.config.residencyRoot, "decisions")).toEqual([]);
+      await expect(resident.invoke("abandonStuckRun", { id: state.actor.id, runId }, context)).rejects.toThrow(refused);
+      expect(abandon).toHaveBeenCalledTimes(1);
+      expect(abandon).toHaveBeenLastCalledWith(state.actor.id, runId, { beforeCommit: expect.any(Function) });
+      // The refusal came before the commit fence: no committed decision.
+      for (const file of files(state.config.residencyRoot, "decisions")) {
+        expect(JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "decisions", file), "utf8")).state).not.toBe("committed");
+      }
+      await expect(local.invoke("abandonStuckRun", { id: state.actor.id, runId }, context)).rejects.toThrow(refused);
+      expect(abandon).toHaveBeenCalledTimes(2);
+      expect(state.host.actors.status(state.actor.id)).toMatchObject({ queued: 0 });
+    } finally { abandon.mockRestore(); await passive.close(); await state.close(); }
+  });
+
+  // smarty-dev#16333 round 6 (P2): the manager accepts only a run the actor-run-stuck alarm reports, by the alarm's own
+  // condition. The clock is skewed past the 30 min threshold; the hung live worker is healthy until its status record
+  // is gone (worker-unverified, as in tests/actor-state-alarms.test.ts). As in tests/residency-actor-renewal.test.ts,
+  // real I/O and timers keep running, and the leases are renewed right after the clock moves: until then the
+  // in-process fixture's 5 s participant leases read as lapsed.
+  it("the root Main's call is refused for a healthy run; for a run the alarm reports it ends the resident actor's wait and keeps the queue", async () => {
+    const realNow = Date.now.bind(Date);
+    const clock = { skew: 0 };
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + clock.skew);
+    const state = await fixture("Main", 5_000);
+    const { passive, resident } = providers(state);
+    const actors = state.host.actors;
+    let runId: string | undefined;
+    const abandonDecisions = () => files(state.config.residencyRoot, "decisions").map(file =>
+      JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "decisions", file), "utf8")))
+      .filter(decision => decision.operation === "abandonStuckRun");
+    try {
+      actors.tell(state.actor.id, "HANG_WITH_PROGRESS MSG-1");
+      await waitFor(() => actors.status(state.actor.id).inFlightRun !== undefined);
+      runId = actors.status(state.actor.id).inFlightRun!.id;
+      const status = path.join(state.host.agents.runDirectory(runId)!, "status.json");
+      await waitFor(() => fs.existsSync(status));
+      actors.tell(state.actor.id, "MSG-2");
+      expect(actors.status(state.actor.id)).toMatchObject({ queued: 1, inFlightRun: { id: runId } });
+      // A healthy run is refused before the commit fence: young, then past the threshold with its worker alive.
+      await expect(resident.invoke("abandonStuckRun", { id: state.actor.id, runId }, context))
+        .rejects.toThrow(`did not abandon run ${runId}: it is not stuck: it is not past its stuck threshold, so no actor-run-stuck alarm reports it; nothing changed`);
+      clock.skew = 31 * 60_000;
+      await state.host.participants.refresh();
+      await state.participants.refresh();
+      await expect(resident.invoke("abandonStuckRun", { id: state.actor.id, runId }, context))
+        .rejects.toThrow(`did not abandon run ${runId}: it is not stuck: this host shows it running, so no actor-run-stuck alarm reports it; nothing changed`);
+      expect(abandonDecisions().filter(decision => decision.state === "committed")).toEqual([]);
+      expect(actors.status(state.actor.id)).toMatchObject({ queued: 1, inFlightRun: { id: runId } });
+      // Its status record gone past the threshold, the alarm reports it (worker-unverified), and the call is accepted.
+      fs.rmSync(status);
+      await expect(resident.invoke("abandonStuckRun", { id: state.actor.id, runId }, context)).resolves.toMatchObject({ id: state.actor.id });
+      // The decision was committed at the fence, and MSG-2 ran once after the run failed operator-abandoned.
+      expect(abandonDecisions().filter(decision => decision.state === "committed"))
+        .toEqual([expect.objectContaining({ state: "committed", id: state.actor.id })]);
+      await waitFor(() => actors.status(state.actor.id).queued === 0 && actors.status(state.actor.id).inFlightRun === undefined &&
+        actors.messages(state.actor.id, 50).some(message => message.text === "fake worker complete"));
+      const out = actors.messages(state.actor.id, 50).filter(message => message.direction === "out");
+      expect(out.filter(message => message.error?.includes(`${runId} failed: its owner abandoned it (operator-abandoned)`))).toHaveLength(1);
+      expect(out.filter(message => message.text === "fake worker complete")).toHaveLength(1);
+      await expect(resident.invoke("abandonStuckRun", { id: state.actor.id, runId }, context))
+        .rejects.toThrow(`did not abandon run ${runId}: the actor has no run in flight; nothing changed`);
+    } finally {
+      if (runId) await state.host.agents.stop(runId).catch(() => undefined);
+      await passive.close(); await state.close();
+    }
+  }, 30_000);
+});

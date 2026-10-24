@@ -1816,6 +1816,16 @@ export class AgentsProvider implements FabricProvider {
         if (resident) return this.#setResidentActor(resident, { operation: "resetSession", id: resident.id }, context);
         return this.actorManager.resetSession(id, { beforeCommit: checkCommit });
       }
+      // smarty-dev#16333 round 5: the owner's queue-preserving way out of a stuck in-flight run (docs/agents.md).
+      // Never through agents.stop: that keeps its custody refusal, and an actor stop drops the queue.
+      case "abandonStuckRun": {
+        const id = String(args.id);
+        if (typeof args.runId !== "string" || !args.runId) throw new Error("agents.abandonStuckRun requires runId: the actor's in-flight run id");
+        const runId = args.runId;
+        const resident = await this.#residentActorOwner(id, context.signal);
+        if (resident) return this.#setResidentActor(resident, { operation: "abandonStuckRun", id: resident.id, runId }, context);
+        return this.actorManager.abandonStuckRun(id, runId, { beforeCommit: checkCommit });
+      }
       case "remove": {
         if (args.scope === "global") return this.globalActors.remove(String(args.id));
         // Foreign terminal history has its own retirement path; never widen removeActor.

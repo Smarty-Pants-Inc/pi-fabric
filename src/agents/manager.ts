@@ -2104,7 +2104,7 @@ export class AgentManager {
     thinking: FabricThinking | undefined): Promise<AgentTransportLaunch["placementGrant"]> {
     // This private method accepts compact host facts only. Each observation
     // snapshots its generation before awaiting context or the decider.
-    const request = { ...facts, placement: facts.placement ? { ...facts.placement } : undefined };
+    const request = { ...facts, ...(facts.placement ? { placement: { ...facts.placement } } : {}) };
     const config = this.config.placementDecider;
     if (!config || config.mode === "off" || (runner !== "pi" && runner !== "pi-durable")) return;
     const { runPlacementPreflight } = await import("./placement-preflight-admission.js");
@@ -2946,8 +2946,8 @@ export class AgentManager {
         const placementKind = this.config.placement?.default === "remote" ? "remote" : "process";
         const legacyPlacementLocalReason = this.#meshTransport?.transport === "nats" && (!placementApiConfig || placementKind !== "process")
           ? "NATS task custody and host credentials require the owning host's native worker"
-          : writePolicy && !applyTaskWriteDefault
-          ? "explicit or inherited write policy requires the local worker; one-shot placement cannot forward confinement"
+          : !placementApiConfig && writePolicy !== undefined
+            ? "write-policy-not-transportable"
           : isClaudeModel(model, runner, this.config.veda.backend) && request.modelReason
             ? "Claude exception reason requires the local worker"
           : this.#spawner?.kind === "actor" || this.#spawner?.kind === "agent" || this.#currentDepth > 0
@@ -2963,9 +2963,7 @@ export class AgentManager {
           : timeoutMs > 240 * 60_000 ? "launcher supports at most 240 minutes" : undefined;
         const placementApiLocalReason = placementApiConfig && request.needs?.includes("local")
           ? "reserved need: local pins to the Main host"
-          : writePolicy !== undefined
-            ? "write-policy-not-transportable"
-            : legacyPlacementLocalReason;
+          : legacyPlacementLocalReason;
         let deadlineAt = Date.now() + timeoutMs;
         if (placementApiConfig) {
           if (hostedAdapter || adapter.kind !== "process") {
@@ -3009,6 +3007,9 @@ export class AgentManager {
           const executionDeadline = Date.parse(binding.executionDeadline);
           if (!Number.isSafeInteger(executionDeadline) || executionDeadline <= Date.now()) {
             throw new PlacementAdmissionError({ status: "refused", code: "LOCAL_BINDING_NOT_ADMITTED" });
+          }
+          if (writePolicy !== undefined && binding.host.toLowerCase() !== os.hostname().toLowerCase()) {
+            throw new PlacementAdmissionError({ status: "refused", code: "LOCAL_TRANSPORT_UNSUPPORTED" });
           }
           placementAdmission = {
             placementRunId: id,

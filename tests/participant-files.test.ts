@@ -54,6 +54,11 @@ const directory = (root: string, name: string, source: () => FabricParticipantRe
 const stateParticipants = (root: string) =>
   new MeshStore(root, 64 * 1024, 1_000).listAll(PREFIX, { fresh: true });
 const mockNativePlatform = (platform: "darwin" | "win32", start: string) => {
+  // The simulated platform still writes to this runner's filesystem: no directory fsync where the runner has none
+  // (Windows: an fsync of a directory fails there, so a simulated darwin lock never published and its waiter timed out,
+  // pi-fabric#1562 review/astra P1-2), and none where the simulated platform has none (win32).
+  const runner = process.platform;
+  vi.spyOn(atomic, "namespaceBarrierAvailable").mockImplementation(() => runner !== "win32" && platform !== "win32");
   vi.spyOn(process, "platform", "get").mockReturnValue(platform);
   vi.stubEnv("SystemRoot", "C:\\Windows");
   // A simulated non-Linux host must not accidentally expose this runner's /proc.

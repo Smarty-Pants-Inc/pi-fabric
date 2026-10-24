@@ -444,8 +444,14 @@ describe("the additions gate where there is no machine id: recovered only on pro
 // Its process has already read its own incarnation (as participant-file writes or the mesh lock do). "recorded": that
 // read succeeded, and the directory now passes it, so the record has it. "none": the read failed (a PowerShell read past
 // its 2 s budget), so the record has none, as every unfenced record had before; ESRCH alone recovers it.
+// The read is settled in every loaded instance of atomic-write (pi-fabric#1562 review/astra P1-1). jiti keys a module by
+// the path it resolved, and on Windows it resolves the sources' "../core/atomic-write.js" (no such file: Node's
+// require.resolve of the .ts, D:\...\atomic-write.ts) and a direct "./src/core/atomic-write.ts" (D:/.../atomic-write.ts)
+// to two keys: two instances, each with its own memoized read. The child settled only its direct import's, so the
+// directory's own instance had none and the 'recorded' rows failed on Windows alone. A build has one instance.
 const CREATOR = String.raw`
   import { createJiti } from "jiti";
+  import { createRequire } from "node:module";
   import { pathToFileURL } from "node:url";
   import childProcess from "node:child_process";
   import fs from "node:fs";
@@ -475,12 +481,15 @@ const CREATOR = String.raw`
     }
     return execFile.call(this, file, args, ...rest);
   };
-  const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+  const base = pathToFileURL(process.cwd() + "/index.js").href;
+  const jiti = createJiti(base);
   const { MeshStore } = await jiti.import("./src/mesh/store.ts");
   const { ParticipantDirectory } = await jiti.import("./src/topology/participant-directory.ts");
   const { hostLeaseAdditionsGatePath } = await jiti.import("./src/topology/host-lease-lock.ts");
-  const { ownProcessIncarnation } = await jiti.import("./src/core/atomic-write.ts");
-  await ownProcessIncarnation();
+  // Every atomic-write instance jiti loaded, the directory's among them (see above): each settles its own read.
+  const instances = Object.entries(createRequire(base).cache)
+    .filter(([file]) => /[\\/]src[\\/]core[\\/]atomic-write\.ts$/.test(file)).map(([, module]) => module.exports);
+  for (const instance of instances) await instance.ownProcessIncarnation();
   const store = new MeshStore(root, 65536, 1000);
   // Hold the additions gate once the creator's own work under it is done: report the custody options it was given
   // (the record's incarnation comes from them), then block this thread until the parent kills it.
@@ -489,7 +498,7 @@ const CREATOR = String.raw`
     ? operation : async () => {
       const value = await operation();
       fs.writeFileSync(ready, JSON.stringify({ pid: process.pid, passed: Object.hasOwn(options ?? {}, "ownIncarnation"),
-        ownIncarnation: options?.ownIncarnation ?? null }));
+        ownIncarnation: options?.ownIncarnation ?? null, instances: instances.length }));
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
       return value;
     }, timeoutMs, options);
@@ -501,7 +510,7 @@ const CREATOR = String.raw`
 `;
 
 const killedCreator = async (root: string, id: string, machine: Machine, incarnation: "recorded" | "none"):
-  Promise<{ pid: number; passed: boolean; ownIncarnation: string | null; additionsOwner: string }> => {
+  Promise<{ pid: number; passed: boolean; ownIncarnation: string | null; instances: number; additionsOwner: string }> => {
   fs.mkdirSync(root, { recursive: true });
   const ready = path.join(path.dirname(root), "creator-ready-" + digest(root).slice(0, 8));
   const child = spawn(process.execPath, ["--input-type=module", "-e", CREATOR, root, ready, id, machine, incarnation],
@@ -510,7 +519,7 @@ const killedCreator = async (root: string, id: string, machine: Machine, incarna
   let stderr = "";
   child.stderr!.on("data", chunk => { stderr += chunk; });
   const exited = new Promise<void>(resolve => child.once("close", () => resolve()));
-  let reported: { pid: number; passed: boolean; ownIncarnation: string | null } | undefined;
+  let reported: { pid: number; passed: boolean; ownIncarnation: string | null; instances: number } | undefined;
   await vi.waitFor(() => {
     if (child.exitCode !== null) throw new Error("creator child exited early: " + stderr);
     reported = JSON.parse(fs.readFileSync(ready, "utf8")) as typeof reported;
@@ -546,6 +555,7 @@ describe("a session (no publication fence) killed while its start holds the addi
     const root = path.join(base, "hub");
     const killed = await killedCreator(root, "session:killed-creator", machine, incarnation);
     // The unfenced creator passes the incarnation its process already read, or none; custody never reads one for it.
+    expect(killed.instances).toBeGreaterThanOrEqual(1);
     expect(killed.passed).toBe(true);
     const gate = killed.additionsOwner.split("\n");
     expect(gate[1]).toBe(String(killed.pid));

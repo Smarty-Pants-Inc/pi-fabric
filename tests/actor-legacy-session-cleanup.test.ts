@@ -8,6 +8,8 @@ import * as offlineRemoval from "../src/actors/remove-offline.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ROOT_PARTICIPANT_FRESH_MS } from "../src/residency/operator-safety.js";
 import * as treeRemoval from "../src/storage/verified-remove.js";
+import * as treeArchive from "../src/storage/tree-archive.js";
+import { fleetSessionArchive } from "../src/storage/session-archive.js";
 import { actorTreeDeletionHooks, mainPublicationFenced } from "../src/topology/main-publication-fence.js";
 import { fixture, mainDirectory, type DeadRootFixture } from "./helpers/dead-root-fixture.js";
 
@@ -21,17 +23,19 @@ import { fixture, mainDirectory, type DeadRootFixture } from "./helpers/dead-roo
 // manager.remove. Decision C: native operator-bin integration with a RECORDED tree delete (supplemental); the real
 // deletion is the hosted-only test at the end. Not an installed Pi product E2E.
 //
-// LOCAL tests (names start "recorded:"): the actor-tree delete is recorded with the kernel fence state at that instant
-// and NOT performed. On Linux the manager deletes the tree through verifiedRemove (a graveyard move, then
-// directory-relative unlink/rmdir through /proc/self/fd paths that a path-prefix guard on fs.rmSync never sees), so the
-// recorder sits at that boundary: an in-tree verifiedRemove call is the "rm" event, with its judged stat kept for the
-// identity assertion. The raw fs.rmSync / fs.promises.rm / fs.rmdirSync guard stays as a second net for a path-based
-// fallback, and a beforeOpen hook makes any in-tree call that still reaches the real helper refuse before its first
-// open (recorded as "unguarded", which fails the event expectations). The fence, the hooks, the operator check and the
-// marker are real. Safe local selection: bunx vitest run tests/actor-legacy-session-cleanup.test.ts -t "recorded:"
+// LOCAL tests (names start "recorded:"): since smarty-dev#16444 (R-keep-all-traces) the manager never deletes an actor
+// tree: it renames the whole judged tree into the fleet archive `<meshRoot>/session-archive/<root>/<actor>`
+// (moveActorTreeToArchive, through the held parent on Linux). That rename deletes nothing, so it really runs; the
+// recorder sits at that boundary: an in-tree moveActorTreeToArchive call is the "archive" event, with the judged pin it
+// was handed, its target and the kernel fence state at that instant kept for the identity assertion, and the manifest's
+// MOVING and MOVED-TO lines are asserted. Every delete stays guarded: an in-tree verifiedRemove call or raw
+// fs.rmSync / fs.promises.rm / fs.rmdirSync is the "rm" event (recorded, not performed), and a beforeOpen hook makes any
+// in-tree call that still reaches the real verifier refuse before its first open (recorded as "unguarded"); either
+// fails the event expectations. The fence, the hooks, the operator check and the marker are real. Safe local
+// selection: bunx vitest run tests/actor-legacy-session-cleanup.test.ts -t "recorded:"
 type Call = { at: string; fenced: boolean; path?: string };
-/** One recorded in-tree verifiedRemove call: its target, the judged stat it was handed and the fence at that instant. */
-type Judged = { target: string; deleter: string; dryRun: boolean; fenced: boolean; dev?: number; ino?: number; directory?: boolean };
+/** One recorded in-tree archive rename: the judged tree, its archive target, the pin it was handed and the fence. */
+type Judged = { from: string; to: string; fenced: boolean; dev: number; ino: number };
 
 const METADATA_LOCK = /\.lock(\.dead\.[0-9a-f]+)?$/;
 const guardActorTrees = (roots: string[], fenced: () => boolean, calls: Call[], judgedRemovals: Judged[] = []) => {
@@ -48,15 +52,24 @@ const guardActorTrees = (roots: string[], fenced: () => boolean, calls: Call[], 
     if (inTree(file)) record(file); else rmdirSync(file, options);
   }) as typeof fs.rmdirSync);
   vi.spyOn(fs.promises, "rm").mockImplementation(async (file, options) => { if (inTree(file)) record(file); else await rm(file, options); });
-  // The actual Linux boundary: record an in-tree verifiedRemove (as the "rm" event) and report it removed, performing
+  // A delete of an in-tree target through verifiedRemove is the "rm" event: recorded, reported removed, performing
   // nothing. Every other target goes to the real helper unchanged.
   const verify = treeRemoval.verifiedRemove;
   vi.spyOn(treeRemoval, "verifiedRemove").mockImplementation((target, judged, options) => {
     if (!inTree(target)) return verify(target, judged, options);
     record(target);
-    judgedRemovals.push({ target: path.resolve(target), deleter: options.deleter, dryRun: options.dryRun === true, fenced: fenced(),
-      ...(judged ? { dev: judged.dev, ino: judged.ino, directory: judged.isDirectory() } : {}) });
     return { removed: true, bytes: 0 };
+  });
+  // The actual boundary: the archive rename of an in-tree directory (the lexical route it was judged by, else its
+  // source) is the "archive" event, performed for real (it deletes nothing).
+  const move = treeArchive.moveActorTreeToArchive;
+  vi.spyOn(treeArchive, "moveActorTreeToArchive").mockImplementation((source, pin, archive, chain, name, route) => {
+    const from = path.resolve(route ?? source);
+    if (!inTree(from)) return move(source, pin, archive, chain, name, route);
+    calls.push({ at: "archive", path: from, fenced: fenced() });
+    const to = move(source, pin, archive, chain, name, route);
+    judgedRemovals.push({ from, to, fenced: fenced(), dev: pin.dev, ino: pin.ino });
+    return to;
   });
   // Fail safe: an in-tree call that bypassed the spy refuses before the real helper opens anything.
   treeRemoval.verifiedRemoveTestHooks.beforeOpen = (target) => {
@@ -103,6 +116,14 @@ const bin = async (f: DeadRootFixture, action: "remove" | "stop", actor: string,
 };
 
 const ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"; // a 32-hex actor id never present in any registry
+
+/** smarty-dev#16444 (R-keep-all-traces): a removal renames the WHOLE tree into the fleet archive (never a delete). */
+const archivedTree = (meshRoot: string, rootId: string, actorId: string): string => fleetSessionArchive(meshRoot, rootId, actorId);
+/** The fleet archive manifest's [phase, from, to] records. */
+const manifest = (meshRoot: string, rootId: string): Array<[string, string, string]> =>
+  fs.readFileSync(path.join(fleetSessionArchive(meshRoot, rootId), "MANIFEST.jsonl"), "utf8").split("\n").filter(Boolean)
+    .map(line => JSON.parse(line)).map(line => [line.phase, line.from, line.to]);
+
 const NAME = "legacy-worker";
 
 /** The legacy shape: an empty session registry (row revoked), the actor tree with history and an unflagged
@@ -121,12 +142,15 @@ const seedLegacy = (f: DeadRootFixture, options: { rootId?: string } = {}) => {
   f.mainParticipant(Date.now() - 2 * ROOT_PARTICIPANT_FRESH_MS); // default record: pid 2147483647 never exists
   const registered = () => new ActorRegistryStore(sessionRoot).records().some(record => record.id === ID);
   const history = () => fs.readFileSync(path.join(tree, "session.jsonl"), "utf8");
-  return { sessionRoot, tree, marker, registered, history };
+  const archive = archivedTree(f.config.meshRoot, options.rootId ?? f.config.rootId, ID);
+  const archived = (file = "session.jsonl") => fs.readFileSync(path.join(archive, file), "utf8");
+  const moves = () => manifest(f.config.meshRoot, options.rootId ?? f.config.rootId);
+  return { sessionRoot, tree, marker, registered, history, archive, archived, moves };
 };
 
 // Linux-only: the Main publication fence (real flock) is the availability requirement.
 describe.skipIf(process.platform !== "linux")("legacy session actor cleanup marker via the real fabric-actors bin (#10189)", () => {
-  it("recorded: an exact-id operator remove finishes the legacy session marker under the fence; the tree delete is recorded, not performed", async () => {
+  it("recorded: an exact-id operator remove finishes the legacy session marker under the fence; the tree is archived (recorded), never deleted", async () => {
     const f = await fixture();
     const fenced = () => mainPublicationFenced(f.config.meshRoot, f.config.rootId);
     const calls: Call[] = [];
@@ -153,15 +177,18 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
       expect(f.host.actors.cleanupObligation(ID)).toBeUndefined();
       expect(f.host.actors.pendingRemovals().map(entry => entry.id)).not.toContain(ID);
       expect(s.registered()).toBe(false); // stays revoked, never resurrected
-      // The operator check ran under the held fence, between the hooks; the tree delete only after it.
+      // The operator check ran under the held fence, between the hooks; the archive rename only after it.
       expect(calls).toEqual([
         { at: "beforeCheck", fenced: true }, { at: "operatorCheck", fenced: true }, { at: "beforeDelete", fenced: true },
-        { at: "rm", path: path.resolve(s.tree), fenced: true }]);
-      // The one tree delete was handed the judged inode of this exact tree, under the held fence, as a real apply.
-      expect(judged).toEqual([{ target: path.resolve(s.tree), deleter: "actor-tree", dryRun: false, fenced: true,
-        dev: tree.dev, ino: tree.ino, directory: true }]);
-      expect(s.history()).toBe("history\n"); // recorded, never performed
-      expect(fs.readFileSync(path.join(s.tree, "history", "run.jsonl"), "utf8")).toBe("run\n");
+        { at: "archive", path: path.resolve(s.tree), fenced: true }]);
+      // The one archive rename was handed the judged inode of this exact tree, under the held fence, and moved it to
+      // the actor's fleet archive: the same inode, every byte, recorded MOVING then MOVED-TO. Nothing was deleted.
+      expect(judged).toEqual([{ from: path.resolve(s.tree), to: s.archive, fenced: true, dev: tree.dev, ino: tree.ino }]);
+      expect(fs.existsSync(s.tree)).toBe(false);
+      expect(fs.lstatSync(s.archive)).toMatchObject({ dev: tree.dev, ino: tree.ino });
+      expect(s.archived()).toBe("history\n");
+      expect(s.archived(path.join("history", "run.jsonl"))).toBe("run\n");
+      expect(s.moves()).toEqual([["MOVING", path.resolve(s.tree), s.archive], ["MOVED-TO", path.resolve(s.tree), s.archive]]);
       expect(fenced()).toBe(false);
     } finally { await f.close(); vi.restoreAllMocks(); } // guard kept through teardown
   }, 120_000);
@@ -179,8 +206,9 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
       observe(fenced, calls);
       await bin(f, "remove", ID, "--confirm-dead-root", f.config.rootId);
       await f.host.actors.removalSettled(ID)?.catch(() => undefined);
-      expect(calls.filter(call => call.at === "rm" || call.at === "unguarded")).toEqual([]);
+      expect(calls.filter(call => call.at === "rm" || call.at === "unguarded" || call.at === "archive")).toEqual([]);
       expect(judged).toEqual([]);
+      expect(fs.existsSync(s.archive)).toBe(false);
       expect(JSON.parse(fs.readFileSync(s.marker, "utf8"))).toMatchObject({ id: ID, owner: { rootId: f.config.rootId, residency: "session" } });
       expect(s.history()).toBe("history\n");
       expect(s.registered()).toBe(false);
@@ -216,9 +244,10 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
       expect(f.host.actors.cleanupObligation(ID)).toBeDefined();
       expect(calls.some(call => call.at === "operatorCheck")).toBe(true);
       expect(calls.filter(call => call.at === "operatorCheck").every(call => call.fenced)).toBe(true);
-      expect(calls.filter(call => call.at === "beforeDelete" || call.at === "rm" || call.at === "unguarded")).toEqual([]);
-      // The late Main's veto stopped the delete before the boundary: verifiedRemove was never handed the tree.
+      expect(calls.filter(call => call.at === "beforeDelete" || call.at === "rm" || call.at === "unguarded" || call.at === "archive")).toEqual([]);
+      // The late Main's veto stopped the removal before the boundary: the archive rename was never handed the tree.
       expect(judged).toEqual([]);
+      expect(fs.existsSync(s.archive)).toBe(false);
       expect(s.history()).toBe("history\n");
       expect(fenced()).toBe(false);
 
@@ -234,12 +263,15 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
       expect(s.registered()).toBe(false);
       expect(calls).toEqual([
         { at: "beforeCheck", fenced: true }, { at: "operatorCheck", fenced: true }, { at: "beforeDelete", fenced: true },
-        { at: "rm", path: path.resolve(s.tree), fenced: true }]);
-      // The retry's one delete was handed this tree's judged inode under the held fence.
-      expect(judged).toEqual([{ target: path.resolve(s.tree), deleter: "actor-tree", dryRun: false, fenced: true,
-        dev: tree.dev, ino: tree.ino, directory: true }]);
-      expect(s.history()).toBe("history\n"); // recorded, never performed
-      expect(fs.readFileSync(path.join(s.tree, "history", "run.jsonl"), "utf8")).toBe("run\n");
+        { at: "archive", path: path.resolve(s.tree), fenced: true }]);
+      // The retry's one archive rename was handed this tree's judged inode under the held fence: the same inode and
+      // every byte are in the fleet archive, recorded MOVING then MOVED-TO (the vetoed attempt recorded nothing).
+      expect(judged).toEqual([{ from: path.resolve(s.tree), to: s.archive, fenced: true, dev: tree.dev, ino: tree.ino }]);
+      expect(fs.existsSync(s.tree)).toBe(false);
+      expect(fs.lstatSync(s.archive)).toMatchObject({ dev: tree.dev, ino: tree.ino });
+      expect(s.archived()).toBe("history\n");
+      expect(s.archived(path.join("history", "run.jsonl"))).toBe("run\n");
+      expect(s.moves()).toEqual([["MOVING", path.resolve(s.tree), s.archive], ["MOVED-TO", path.resolve(s.tree), s.archive]]);
       expect(fenced()).toBe(false);
     } finally { if (mainOpen) await main.close(); await f.close(); vi.restoreAllMocks(); }
   }, 120_000);
@@ -302,8 +334,9 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
     } finally { await f.close(); vi.restoreAllMocks(); }
   }, 120_000);
 
-  // HOSTED ONLY. NEVER RUN LOCALLY (#4664: it performs a real actor-tree deletion). The parent selects only the
-  // "recorded:" tests locally; this one runs only in hosted CI as the real-path red/green proof. No interception.
+  // HOSTED ONLY. NEVER RUN LOCALLY (#4664: it was the real actor-tree deletion; since smarty-dev#16444 the tree is
+  // archived, and the hosted run still proves the real path). The parent selects only the "recorded:" tests locally;
+  // this one runs only in hosted CI as the real-path red/green proof. No interception.
   it.runIf(hostedOnly("legacy session actor deletion"))("hosted real deletion: the real bin's exact-id operator remove deletes the legacy session tree and its marker", async () => {
     const f = await fixture();
     try {
@@ -314,6 +347,7 @@ describe.skipIf(process.platform !== "linux")("legacy session actor cleanup mark
       await f.host.actors.removalSettled(ID)?.catch(() => undefined);
       expect(fs.existsSync(s.marker)).toBe(false);
       expect(fs.existsSync(s.tree)).toBe(false);
+      expect(s.archived()).toBe("history\n"); // smarty-dev#16444: archived, never deleted
       expect(f.host.actors.cleanupObligation(ID)).toBeUndefined();
       expect(s.registered()).toBe(false);
       expect(mainPublicationFenced(f.config.meshRoot, f.config.rootId)).toBe(false);

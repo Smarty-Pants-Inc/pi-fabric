@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { windowsStateAclRefusal, type WindowsStateAclRequest } from "../src/mesh/windows-state-acl.js";
+import { defaultProfileDirectory, isWithin } from "./helpers/default-profile.js";
 
 const USER = "S-1-5-21-1-2-3-1001";
 const OTHER = "S-1-5-21-1-2-3-1002";
@@ -262,6 +263,27 @@ const roleRefusal = (
   }
   return windowsStateAclRefusal({ root: target, real: target, role, files: [], directories: [] }, runner(entries).run);
 };
+
+// pi-fabric#1562 Windows CI: the hosted ACL suite (tests/mesh-state-windows-acl.test.ts) built every fixture root below
+// os.homedir(), which test isolation points at the fleet root inside TMPDIR (USERPROFILE on win32, HOME on POSIX). On
+// a runner whose D:\ volume ACL grants Authenticated Users modify, D:\a\_temp\pi-fabric-vitest-job inherited it and every
+// enforced open refused that ancestor, correctly (the gate is unchanged: see "refuses an ancestor another account may
+// delete" below). The fixtures belong below the OS's default profile, outside TMPDIR.
+describe("the hosted ACL suite's fixture profile (pi-fabric#1562)", () => {
+  it("is the OS default profile, outside TMPDIR, even though fleet isolation moved the home variable into TMPDIR", () => {
+    // The premise: fleet isolation (tests/fleet-isolation-setup.ts) moved os.homedir() into this run's TMPDIR.
+    expect(isWithin(os.tmpdir(), os.homedir())).toBe(true);
+    const profile = defaultProfileDirectory();
+    expect(profile).toBe(path.resolve(os.userInfo().homedir));
+    expect(isWithin(os.tmpdir(), profile)).toBe(false);
+  });
+
+  it("refuses an OS profile inside TMPDIR or RUNNER_TEMP instead of building fixtures there", () => {
+    vi.stubEnv("RUNNER_TEMP", path.dirname(path.resolve(os.userInfo().homedir)));
+    try { expect(() => defaultProfileDirectory()).toThrow(/inside the temporary directory/); }
+    finally { vi.unstubAllEnvs(); }
+  });
+});
 
 describe("Windows mesh state ACL policy (smarty-dev#8920)", () => {
   afterEach(() => vi.restoreAllMocks());
@@ -834,7 +856,8 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   const channels: ReturnType<typeof captureDiagnostics>[] = [];
   afterEach(() => {
     const violations = channels.splice(0).flatMap(channel => channel.violations());
-    vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.doUnmock("../src/mesh/windows-state-acl.js"); vi.resetModules();
+    vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.doUnmock("../src/mesh/windows-state-acl.js"); vi.doUnmock("../src/mesh/state-gate.js");
+    vi.resetModules();
     expect(violations).toEqual([]);
   });
   // ACL findings warn by default. Tests of the enforced refusal/creation sequence opt in explicitly, per test.
@@ -1057,7 +1080,7 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
   });
 
   it("delegates admission and open through the complete root plan, sync and async (fake reader has no cache)", async () => {
-    enforceAcl(); // exact delegation counts of the enforced creation path (default adds an advisory root read)
+    enforceAcl(); // exact delegation counts of the enforced creation path (the default takes the same, smarty-dev#8920)
     const { calls } = await loadGate(undefined);
     const { SqliteStateStore } = await import("../src/mesh/state-sqlite.js");
     const root = tmp();
@@ -1071,6 +1094,117 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
       expect(calls).toHaveLength(5);
     });
     expect(calls.every(call => call.root === root && call.protect === false && call.directories.length === 1)).toBe(true);
+  });
+
+  // smarty-dev#8920 perf: one Windows state-root creation takes each distinct ACL proof once: the gate's pre-create root
+  // proof (state.db absent) and its post-create proof (state.db required). On a fresh root the real reader never
+  // caches (an absent DB has no identity: windows-state-acl.ts admissionDecision), so each delegation counted here is
+  // one PowerShell child in production. Its own runner seam would turn that cache off, so the counts are taken at the
+  // layer where the repeats were: the snapshot delegations and the store's createStateRoot calls. f7bbd79b took 4
+  // snapshots and 2 createStateRoot calls per fenced create (the unimported test (5): 32 children in one body).
+  const loadCountingStore = async () => {
+    const { calls } = await loadGateBy(() => undefined);
+    const creates: string[] = [];
+    vi.doMock("../src/mesh/state-gate.js", async importOriginal => {
+      const actual = await importOriginal<typeof import("../src/mesh/state-gate.js")>();
+      return { ...actual, createStateRoot: (...args: Parameters<typeof actual.createStateRoot>) => {
+        creates.push(args[0]);
+        return actual.createStateRoot(...args);
+      } };
+    });
+    const sqlite = await import("../src/mesh/state-sqlite.js");
+    const { importMeshState } = await import("../src/mesh/backend-migration.js");
+    // What one create added: [requireDatabase per snapshot], every one the normal root plan of `root`.
+    const counted = async (root: string, run: () => unknown) => {
+      const [before, createdBefore] = [calls.length, creates.length];
+      await run();
+      const made = calls.slice(before);
+      for (const call of made) {
+        expect(call).toMatchObject({ root, protect: false });
+        expect(call.role).toBeUndefined();
+        expect(call.files.map(file => path.basename(file))).toEqual(["state.db", "state.db-wal", "state.db-shm", "state.db-journal"]);
+      }
+      return { proofs: made.map(call => call.requireDatabase === true ? "post-create" : "pre-create"),
+        createStateRoot: creates.slice(createdBefore).filter(created => created === root).length };
+    };
+    return { calls, creates, sqlite, importMeshState, counted };
+  };
+  const ONCE_EACH = { proofs: ["pre-create", "post-create"], createStateRoot: 1 };
+
+  it("each distinct ACL proof once per create on the unimported (5) race path: 2 snapshots, 1 createStateRoot (was 4 and 2)", async () => {
+    const { calls, sqlite, counted } = await loadCountingStore();
+    const globals = globalThis as Record<symbol, unknown>;
+    const MARKER_HOOK = Symbol.for("pi-fabric.mesh.sqlite-create.marker-hook");
+    const populated = JSON.stringify({ format: 1, revisionFormat: 2, entries: { live: { key: "live", value: 1, version: 1 } }, highWater: 1 });
+    const cases = [
+      ...["before-marker", "before-claim"].flatMap(phase => (["absent", "zero-length", "empty"] as const).map(start => [phase, start] as const)),
+      ...(["zero-length", "empty"] as const).map(start => ["before-rename", start] as const),
+    ];
+    await asWindows(async () => {
+      vi.stubEnv(ENFORCE, undefined); // the default (advisory) mode, as on hosted CI
+      try {
+        for (const [phase, start] of cases) {
+          const root = tmp();
+          if (start === "zero-length") fs.writeFileSync(path.join(root, "state.json"), "");
+          if (start === "empty") fs.writeFileSync(path.join(root, "state.json"), JSON.stringify({ format: 1, entries: {}, highWater: 0 }));
+          let fired = 0;
+          globals[MARKER_HOOK] = (at: string, hooked: string) => {
+            if (at !== phase || hooked !== root) return;
+            fired += 1;
+            fs.writeFileSync(path.join(root, "state.json.writer.tmp"), populated);
+            fs.renameSync(path.join(root, "state.json.writer.tmp"), path.join(root, "state.json"));
+          };
+          expect(await counted(root, () => expect(() => sqlite.SqliteStateStore.openSync(root, 64 * 1024, 1_000, { initialize: "create" }))
+            .toThrow(/initialize "create" raced/)), `${phase}/${start}`).toEqual(ONCE_EACH);
+          expect(fired).toBe(1);
+          expect(fs.readFileSync(path.join(root, "state.json"), "utf8")).toBe(populated);
+        }
+      } finally { delete globals[MARKER_HOOK]; }
+    });
+    expect(calls).toHaveLength(2 * cases.length); // 16 children on Windows; f7bbd79b: 32
+  });
+
+  it("each distinct ACL proof once per create on every store and import create path, advisory and enforced", async () => {
+    const { calls, creates, sqlite, importMeshState, counted } = await loadCountingStore();
+    const { SqliteStateStore } = sqlite;
+    const base = tmp();
+    let next = 0;
+    const fresh = () => { const root = path.join(base, `r${next += 1}`); fs.mkdirSync(root); return root; };
+    const paths = {
+      "openSync create": (root: string) => SqliteStateStore.openSync(root, 1024, 16, { initialize: "create" }).close(),
+      "open create": async (root: string) => (await SqliteStateStore.open(root, 1024, 16, { initialize: "create" })).close(),
+      "openSync detached": (root: string) => SqliteStateStore.openSync(root, 1024, 16, { initialize: "detached" }).close(),
+      "open detached": async (root: string) => (await SqliteStateStore.open(root, 1024, 16, { initialize: "detached" })).close(),
+    };
+    await asWindows(async () => {
+      for (const enforce of [undefined, "1"]) {
+        vi.stubEnv(ENFORCE, enforce);
+        for (const [name, run] of Object.entries(paths)) {
+          const root = fresh();
+          expect(await counted(root, () => run(root)), `${name} ENFORCE=${enforce}`).toEqual(ONCE_EACH);
+          expect(fs.existsSync(path.join(root, "state.db"))).toBe(true);
+        }
+      }
+      // A missing root in the default mode: the same recursive mkdir, still no snapshot before the gate's own.
+      vi.stubEnv(ENFORCE, undefined);
+      const missing = path.join(base, "missing", "nested", "mesh");
+      expect(await counted(missing, () => paths["openSync create"](missing))).toEqual(ONCE_EACH);
+      // The import's create path (backend-migration.ts): createStateRoot, then the gate with its create callback.
+      const imported = fresh();
+      const outcome = await counted(imported, () => importMeshState(imported));
+      expect(outcome).toEqual(ONCE_EACH);
+      // Enforced creation of a missing root keeps every distinct proof: each creation parent before its mkdir, the
+      // protect/readback of the new root, then (after that ACL mutation and the fence) the gate's pre- and post-create.
+      enforceAcl();
+      const created = path.join(base, "enforced", "mesh");
+      const before = calls.length;
+      const createdBefore = creates.length;
+      paths["openSync create"](created);
+      expect(calls.slice(before).map(call => call.role
+        ?? (call.protect ? "protect" : call.requireDatabase ? "post-create" : "pre-create")))
+        .toEqual(["creation-parent", "creation-parent", "protect", "pre-create", "post-create"]);
+      expect(creates.slice(createdBefore)).toEqual([created]);
+    });
   });
 
   // F1 recorded creation counterexample: a missing root through a junction used to mutate the target before
@@ -1510,7 +1644,10 @@ describe("state gate wiring on win32 (smarty-dev#8920)", () => {
     await asWindows(async () => {
       vi.stubEnv(ENFORCE, undefined);
       expect(await delta(async () => (await sqlite.SqliteStateStore.open(first, 1024, 16, { initialize: "create" })).close())).toBe(1);
-      expect(fenced).toEqual([false]); // the one read precedes the fence; none is taken while it is held
+      // smarty-dev#8920 perf: createStateRoot no longer repeats the gate's pre-create root proof, so the one read is
+      // that proof, taken under the fence just before state.db would be created (as under enforcement). A safe root
+      // now holds the fence for 2 reads instead of 3; an unsafe one for its single read, then none.
+      expect(fenced).toEqual([true]);
       expect(advisories()).toEqual([expect.stringContaining(first)]);
       expect(advisories()[0]).toContain(finding);
       expect(await delta(lifecycle(first))).toBe(0);

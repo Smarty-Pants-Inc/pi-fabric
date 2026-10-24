@@ -4,7 +4,8 @@ import path from "node:path";
 import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { boundedRunTree } from "./reference-scan.js";
-import { countRefusal, removalTallyOn, verifiedRemove } from "./verified-remove.js";
+import { countRefusal, countRemoval, removalTallyOn, verifiedRemove } from "./verified-remove.js";
+import { archiveSessionTrace, SESSION_ARCHIVE_DIR, type SessionTraceMove } from "./session-archive.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { FileLockBusy, lockFile } from "../residency/file-lock.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
@@ -1013,12 +1014,16 @@ const publishExclusive = (file: string, data: Buffer): boolean => {
 };
 
 /** Immutable, ordinary rotation history only. Malformed-session orphan backups are
- * recovery evidence, not rotation history, and keep their existing exemption. */
+ * recovery evidence, not rotation history, and keep their existing exemption.
+ * smarty-dev#16444 (R-keep-all-traces): this never unlinks. Every older backup MOVES, by one same-filesystem rename,
+ * into `<actor dir>/session-archive/<stamp>-<sha256-12>.jsonl` with a MANIFEST.jsonl line; the newest backup stays in
+ * place (resume semantics are unchanged). Returns what it moved (a dry run: what it would move, `to` the archive
+ * directory and no sha256). A failed move keeps that backup where it is. */
 export const pruneActorSessionBackups = (sessionFile: string, options: {
-  dryRun?: boolean; onPrune?: (change: { path: string; bytes: number }) => void;
-  /** Asked right before each unlink; true stops the prune there (smarty-dev#7766: a hold or epoch change mid-prune). */
+  dryRun?: boolean; onPrune?: (change: { path: string; bytes: number; to?: string; sha256?: string }) => void;
+  /** Asked right before each move; true stops the prune there (smarty-dev#7766: a hold or epoch change mid-prune). */
   stop?: () => boolean;
-} = {}): string[] => {
+} = {}): SessionTraceMove[] => {
   const directory = path.dirname(sessionFile);
   if (!ownedStat(directory)?.isDirectory()) return [];
   const prefix = `${path.basename(sessionFile)}.`;
@@ -1044,17 +1049,30 @@ export const pruneActorSessionBackups = (sessionFile: string, options: {
         countRefusal("pruneActorSessionBackups", "future-dated or unparsable backup name", path.join(directory, backup.name));
       }
     }
-    const removed: string[] = [];
+    const archive = path.join(directory, SESSION_ARCHIVE_DIR);
+    const moved: SessionTraceMove[] = [];
     for (const backup of byAge) {
       if (keep.has(backup.name)) continue;
       const file = path.join(directory, backup.name);
       if (options.stop?.()) break;
-      if (!verifiedRemove(file, backup.stat, { deleter: "pruneActorSessionBackups", ...(options.dryRun ? { dryRun: true } : {}),
-        fallback: () => { fs.unlinkSync(file); return true; } }).removed) continue;
-      options.onPrune?.({ path: file, bytes: backup.stat.size });
-      removed.push(file);
+      if (options.dryRun) {
+        countRemoval("pruneActorSessionBackups", backup.stat.size);
+        options.onPrune?.({ path: file, bytes: backup.stat.size, to: archive });
+        moved.push({ from: file, to: archive, sha256: "", bytes: backup.stat.size });
+        continue;
+      }
+      let move: SessionTraceMove;
+      try {
+        move = archiveSessionTrace(file, archive, { reason: "rotation history", deleter: "pruneActorSessionBackups" }, backup.stat);
+      } catch {
+        countRefusal("pruneActorSessionBackups", "archive move failed; backup kept in place", file, backup.stat.size);
+        continue;
+      }
+      countRemoval("pruneActorSessionBackups", move.bytes);
+      options.onPrune?.({ path: file, bytes: move.bytes, to: move.to, sha256: move.sha256 });
+      moved.push(move);
     }
-    return removed;
+    return moved;
   } catch { return []; }
 };
 

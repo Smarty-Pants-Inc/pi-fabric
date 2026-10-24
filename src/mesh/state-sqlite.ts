@@ -117,7 +117,7 @@ import { MeshBatchConflictError, type MeshBatchOperation, type MeshBatchResult, 
   type MeshReadOptions, type MeshStateEntry } from "./state-file.js";
 import type { MeshIdentity } from "./event-log.js";
 import { formatWalReaders, walReaderComm, walReaderPids, walWriterPid, type WalReader } from "./wal-readers.js";
-import { createLockEvents, lockHeldEventThreshold, type MeshLockClass } from "./commit-stats.js";
+import { createLockEvents, lockHeldEventThreshold, type LockTimingContext, type MeshLockClass } from "./commit-stats.js";
 import { admitExistingStateRoot, assertGatedFlagDirectory, assertPrivatePath, assertPrivateStateRoot, createStateRoot, filesystemRefusal,
   MeshStateUnsupportedError, openPrivateStateDb } from "./state-gate.js";
 
@@ -966,21 +966,26 @@ export class SqliteStateStore {
     // ponytail: a nonempty db without its marker may be a concurrent creator between schema commit and
     // marker publication. Wait on its fence, then re-check; never adopt an unmarked db as a fresh one.
     if (initialize !== "create" && (requested === "detached" || readMeshStateMovedMarker(root))) {
-      return SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, initialize, initTimeoutMs);
+      return SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, initialize, false, initTimeoutMs);
     }
     // smarty-dev#6477 review round 2: "create" on a fresh root runs under the import's fence (custody.lock, then
     // .lock) from the re-checked guard through the db init to the marker, so a file-mode writer either commits
     // first (the guard below sees its state.json and refuses) or its fence check sees this state.db and refuses.
     // smarty-dev#8920: on Windows the root is created (and made private) before the fence, which would create it
-    // untracked. POSIX keeps the fence's own mkdir: nothing runs before it.
-    if (process.platform === "win32") createStateRoot(root);
+    // untracked. POSIX keeps the fence's own mkdir: nothing runs before it. Its advisory root snapshot is left to the
+    // gate's pre-create proof in #openAsync (gateFollows), and #openAsync does not create the root a second time.
+    const windows = process.platform === "win32";
+    if (windows) createStateRoot(root, { gateFollows: true });
     return holdMeshFence(root, { lockTimeoutMs: options.lockTimeoutMs ?? LOCK_TIMEOUT_MS }, () =>
-      SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested), initTimeoutMs));
+      SqliteStateStore.#openAsync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested), windows, initTimeoutMs));
   }
 
+  // `rootCreated`: this caller already ran createStateRoot for this root (Windows, before the fence). A second call
+  // would add nothing: the gate's pre-create proof below re-checks the root's type and, natively, the whole plan.
   static async #openAsync(root: string, maxEventBytes: number, maxReadEvents: number, options: SqliteStateStoreOptions,
-    initialize: SqliteStateStoreOptions["initialize"], initTimeoutMs?: number): Promise<SqliteStateStore> {
-    createStateRoot(root);
+    initialize: SqliteStateStoreOptions["initialize"], rootCreated: boolean, initTimeoutMs?: number): Promise<SqliteStateStore> {
+    // smarty-dev#8920: openCreatingStateDb's gate takes this root's pre-create proof, so no advisory read here.
+    if (!rootCreated) createStateRoot(root, { gateFollows: true });
     const file = path.join(root, "state.db");
     const db = openCreatingStateDb(root, file, options.open ?? openNodeSqlite); // the one gate (smarty-dev#7548, pi-fabric#694 P2-E)
     const deadline = Date.now() + Math.max(0, initTimeoutMs ?? options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
@@ -1021,18 +1026,20 @@ export class SqliteStateStore {
     const initialize = guardBeforeOpen(root, requested);
     // As in open(), an unmarked db must wait for a creator's marker before it can be judged imported.
     if (initialize !== "create" && (requested === "detached" || readMeshStateMovedMarker(root))) {
-      return SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, initialize);
+      return SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, initialize, false);
     }
     // The same fence as open(), one synchronous attempt at the same two locks: a busy fence throws an
     // SQLITE_BUSY-coded MeshFenceBusyError, which callers retry like a busy database (see the contract above).
-    if (process.platform === "win32") createStateRoot(root); // smarty-dev#8920: before the fence, as in open()
+    const windows = process.platform === "win32";
+    if (windows) createStateRoot(root, { gateFollows: true }); // smarty-dev#8920: before the fence, as in open()
     return holdMeshFenceSync(root, 0, () =>
-      SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested)));
+      SqliteStateStore.#openSync(root, maxEventBytes, maxReadEvents, options, guardBeforeOpen(root, requested), windows));
   }
 
+  // `rootCreated`: as in #openAsync.
   static #openSync(root: string, maxEventBytes: number, maxReadEvents: number, options: SqliteStateStoreOptions,
-    initialize: SqliteStateStoreOptions["initialize"]): SqliteStateStore {
-    createStateRoot(root);
+    initialize: SqliteStateStoreOptions["initialize"], rootCreated: boolean): SqliteStateStore {
+    if (!rootCreated) createStateRoot(root, { gateFollows: true }); // the gate's pre-create proof follows (#8920)
     const file = path.join(root, "state.db");
     const db = openCreatingStateDb(root, file, options.open ?? openNodeSqlite);
     try {
@@ -1259,12 +1266,14 @@ export class SqliteStateStore {
     beforeCommit?: () => void;
     /** Lock-event class for the bridge's own writes (as the file store's lock stats). */
     lockClass?: "bridge";
+    lockTiming?: LockTimingContext;
   }): Promise<MeshBatchResult[]> {
     const lockClass: MeshLockClass = input.lockClass === "bridge" ? "bridge" : "writeBatch";
     const batchIdentity = input.identity;
     const prepare = input.prepare;
     const afterCommit = input.afterCommit;
     const beforeCommit = input.beforeCommit;
+    const timing = input.lockTiming;
     // Snapshot every caller operation before any serialization. Later toJSON hooks may mutate
     // the caller's operations or input.ops; the frozen descriptors are the only operations used below.
     const callerOps = snapshotBatchOperations(input.ops, batchIdentity);
@@ -1284,11 +1293,17 @@ export class SqliteStateStore {
       if (beforeCommit) tx.beforeCommit = beforeCommit;
       const view = this.#view();
       const started = performance.now();
-      const prepared = prepare?.(view) ?? [];
-      if (typeof (prepared as unknown as { then?: unknown }).then === "function") {
-        throw new Error("Fabric mesh writeBatch prepare must be synchronous");
+      let prepared: MeshBatchOperation[];
+      try {
+        prepared = prepare?.(view) ?? [];
+        if (typeof (prepared as unknown as { then?: unknown }).then === "function") {
+          throw new Error("Fabric mesh writeBatch prepare must be synchronous");
+        }
+      } finally {
+        const prepareMs = performance.now() - started;
+        this.#stats.maxPrepareMs = Math.max(this.#stats.maxPrepareMs, prepareMs);
+        if (timing?.preparePhase) lockStats?.phase(this.root, lockClass, timing.operation, timing.preparePhase, prepareMs);
       }
-      this.#stats.maxPrepareMs = Math.max(this.#stats.maxPrepareMs, performance.now() - started);
       // Prepare is one phase: snapshot all generated descriptors before any value or identity
       // serialization. Caller descriptors were captured before entering this transaction.
       const preparedOps = snapshotBatchOperations(prepared, batchIdentity, callerOps.length);
@@ -1296,7 +1311,8 @@ export class SqliteStateStore {
       for (const op of ops) validateMeshStateKey(op.key);
       const results: MeshBatchResult[] = [];
       const now = Date.now();
-      for (const op of ops) {
+      const commitStarted = performance.now();
+      try { for (const op of ops) {
         const slot = this.#slot(op.key);
         if (op.kind === "delete" && op.condition && !op.condition(view.get)) {
           results.push({ key: op.key, applied: false, version: slot.version });
@@ -1326,21 +1342,26 @@ export class SqliteStateStore {
         else this.#applyPut(tx, slot, plan, now);
         results.push({ key: op.key, applied: true, version: plan.version });
       }
+      } finally {
+        if (timing?.commitPhase) lockStats?.phase(this.root, lockClass, timing.operation, timing.commitPhase, performance.now() - commitStarted);
+      }
       if (tx.changes.length > 0) committed = tx.commit + 1;
       // A write-free batch still validates external ownership before its legacy effect.
       // Run that effect on the exact snapshot, preserving the write-free contract.
       else if (afterCommit) {
         beforeCommit?.();
-        this.#timedAfterCommit(afterCommit, view);
+        this.#timedAfterCommit(afterCommit, view, lockClass, timing);
       }
       return results;
-    });
+    }, undefined, false, timing);
     if (committed !== undefined && afterCommit) {
       this.#stats.afterCommitReacquired += 1;
+      const afterTiming = timing ? { operation: timing.operation,
+        ...(timing.afterCommitPhase ? { afterCommitPhase: timing.afterCommitPhase } : {}) } : undefined;
       await this.#write(lockClass, (tx) => {
         if (tx.commit !== committed) this.#stats.afterCommitIntervened += 1;
-        this.#timedAfterCommit(afterCommit, this.#view());
-      });
+        this.#timedAfterCommit(afterCommit, this.#view(), lockClass, afterTiming);
+      }, undefined, false, afterTiming);
     }
     return results;
   }
@@ -1366,24 +1387,33 @@ export class SqliteStateStore {
    * connection commits while it runs, and it writes nothing. It never waits asynchronously, so a
    * caller that holds `.lock` (lock order: `.lock`, then this) never waits for a SQLite writer while
    * holding `.lock`: a busy write lock throws `MeshLockTimeoutError` before `operation` runs, and
-   * the caller retries with `.lock` released. `operation` must be synchronous and must not call writers.
+   * the caller retries with `.lock` released. Held bridge ingress retains only its advisory initial
+   * event admission across proven pre-append refusals, bounded by twice the ordinary acquisition
+   * budget; all retry waits happen outside `.lock`. This fence remains synchronous and zero-wait.
+   * `operation` must be synchronous and must not call writers.
    */
-  fenceSync<T>(operation: () => T): T {
+  fenceSync<T>(operation: () => T, timing?: LockTimingContext): T {
     this.#assertOpen();
     if (this.#inTransaction) throw new Error("Fabric mesh state callbacks must not call store writers");
     // A caller may hold the fair mesh .lock while fencing an append. Never wait for a competing
     // SQLite writer in that critical section: fail this BEGIN once, then let the caller release
     // .lock and retry with backoff. Restore the connection's ordinary read/write busy policy before
     // running the fenced callback or returning to its caller.
+    const lockClass: MeshLockClass = timing ? "bridge" : "other";
+    let fenceRefusal: MeshLockTimeoutError | undefined;
     this.#db.exec("PRAGMA busy_timeout = 0");
     try {
       this.#db.exec("BEGIN IMMEDIATE");
     } catch (error) {
       if (!isBusy(error) && !isTransient(error)) throw error;
       this.#stats.busyRetries += 1;
-      throw new MeshLockTimeoutError(` (SQLite state ${this.file}, write fence)`, 1, 0);
+      fenceRefusal = new MeshLockTimeoutError(` (SQLite state ${this.file}, write fence)`, 1, 0);
     } finally {
       this.#db.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
+    }
+    if (fenceRefusal) {
+      lockStats?.fenceRefused(this.root, lockClass, timing, walWriterPid(this.file));
+      throw fenceRefusal;
     }
     this.#inTransaction = true;
     const began = performance.now();
@@ -1398,7 +1428,9 @@ export class SqliteStateStore {
     } finally {
       try { if (this.#db.isTransaction) this.#db.exec("ROLLBACK"); } catch { /* connection ends it */ }
       this.#inTransaction = false;
-      this.#heldEvent("other", performance.now() - began);
+      const holdMs = performance.now() - began;
+      lockStats?.acquired(this.root, lockClass, 0, holdMs, timing);
+      this.#heldEvent(lockClass, holdMs);
     }
   }
 
@@ -1796,17 +1828,22 @@ export class SqliteStateStore {
     tx.changes.push({ key: plan.key, version: plan.version, deleted: true });
   }
 
-  #timedAfterCommit(afterCommit: (view: MeshBatchView) => void, view: MeshBatchView): void {
+  #timedAfterCommit(afterCommit: (view: MeshBatchView) => void, view: MeshBatchView, lockClass: MeshLockClass,
+    timing?: LockTimingContext): void {
     const started = performance.now();
     try { afterCommit(view); }
-    finally { this.#stats.maxAfterCommitMs = Math.max(this.#stats.maxAfterCommitMs, performance.now() - started); }
+    finally {
+      const elapsed = performance.now() - started;
+      this.#stats.maxAfterCommitMs = Math.max(this.#stats.maxAfterCommitMs, elapsed);
+      if (timing) lockStats?.phase(this.root, lockClass, timing.operation, timing.afterCommitPhase ?? "after-commit", elapsed);
+    }
   }
 
   // Asynchronous acquisition of the state write lock (see the module comment). Each attempt
   // runs BEGIN IMMEDIATE, the synchronous body and COMMIT in ONE synchronous segment, so no other
   // caller in this process can interleave a statement on this connection while the lock is held.
   async #write<T>(lockClass: MeshLockClass, body: (tx: Tx) => T, lockTimeoutMs = this.#lockTimeoutMs,
-    walCapExempt = false): Promise<T> {
+    walCapExempt = false, timing?: LockTimingContext): Promise<T> {
     const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
     const started = performance.now();
@@ -1850,7 +1887,7 @@ export class SqliteStateStore {
             this.#window.maxWaitMs = Math.max(this.#window.maxWaitMs, waitMs);
             this.#writesWaiting -= 1;
             waiting = false;
-            return this.#run(body, lockClass, waitMs);
+            return this.#run(body, lockClass, waitMs, timing);
           }
         }
         const now = performance.now();
@@ -1864,7 +1901,7 @@ export class SqliteStateStore {
           // smarty-dev#9290: a full-budget waiter names the writer from the kernel's lock table; a
           // bounded try (a withTryLock scope or a zero budget) fails by design and emits nothing.
           const tried = Boolean(scope?.active) || budget <= 0;
-          lockStats?.failed(this.root, lockClass, now - started, tried);
+          lockStats?.failed(this.root, lockClass, now - started, tried, timing);
           if (!tried) lockEvents?.waitTimeout(this.root, "sqlite", lockClass, now - started, walWriterPid(this.file));
           throw new MeshLockTimeoutError(` (SQLite state ${this.file})`, attempts, Math.round(maxGap));
         }
@@ -1883,7 +1920,7 @@ export class SqliteStateStore {
   }
 
   // The synchronous body between BEGIN IMMEDIATE (already taken) and COMMIT.
-  #run<T>(body: (tx: Tx) => T, lockClass: MeshLockClass, waitMs: number): T {
+  #run<T>(body: (tx: Tx) => T, lockClass: MeshLockClass, waitMs: number, timing?: LockTimingContext): T {
     const began = performance.now();
     this.#inTransaction = true;
     this.#stats.transactions += 1;
@@ -1915,7 +1952,7 @@ export class SqliteStateStore {
       this.#stats.totalHoldMs += hold;
       this.#stats.maxHoldMs = Math.max(this.#stats.maxHoldMs, hold);
       // One sample per actual SQLite transaction, including rollback, after releasing its writer lock.
-      lockStats?.acquired(this.root, lockClass, waitMs, hold);
+      lockStats?.acquired(this.root, lockClass, waitMs, hold, timing);
       this.#heldEvent(lockClass, hold);
       if (committed && changed) {
         // data_version does not change for this connection's own commits. Metadata-only

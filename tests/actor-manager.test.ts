@@ -6555,7 +6555,7 @@ describe("ActorManager removal behind an in-flight run", () => {
         });
     try {
       release();
-      await expect(waiting).resolves.toMatchObject({ removed: true, cleaned: false, pending: expect.stringContaining(failure === "directory" ? "actor tree not removed" : "presence deletion pending") });
+      await expect(waiting).resolves.toMatchObject({ removed: true, cleaned: false, pending: expect.stringContaining(failure === "directory" ? "actor tree not archived; tree kept" : "presence deletion pending") });
       expect(failures).toBeGreaterThanOrEqual(6);              // persistent across the bounded retries
       expect(registryIds()).not.toContain(actor.id);
       const marker = path.join(actorRoot, `removal-${actor.id}.json`);

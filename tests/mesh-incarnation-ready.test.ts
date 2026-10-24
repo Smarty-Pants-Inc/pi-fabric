@@ -389,7 +389,9 @@ describe("optimistic snapshot exhaustion is not preparation or contention", () =
     vi.spyOn(mesh, "writeBatch").mockImplementation(input => writeBatch({
       ...input,
       prepare: (...args) => { admission(); return input.prepare!(...args); },
-      afterCommit: (...args) => { committed(); input.afterCommit!(...args); },
+      // smarty-dev#13645 (option B): the mirror's post-COMMIT work runs in its commitOutbox hook and after its
+      // batches (first audit P1-b), not in afterCommit; this wrapper still observes every commit.
+      afterCommit: (...args) => { committed(); input.afterCommit?.(...args); },
     }));
     const writes = [vi.spyOn(fs, "writeFileSync"), vi.spyOn(fs, "appendFileSync")];
     const budgets: Array<number | undefined> = [];

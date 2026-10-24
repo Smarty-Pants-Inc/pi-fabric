@@ -7,10 +7,11 @@ import { ActorManager } from "../src/actors/manager.js";
 import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { fleetSessionArchive, ROOT_TREE_ARCHIVE_NAME } from "../src/storage/session-archive.js";
 import { mainPublicationFencePath } from "../src/topology/main-publication-fence.js";
 
 describe("ActorManager registry-cache lifecycle (#7791)", () => {
-  const evictsOnClose = async (persistent: boolean, options: { emulateWindows?: boolean; recordOnly?: boolean } = {}) => {
+  const evictsOnClose = async (persistent: boolean, options: { emulateWindows?: boolean } = {}) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-cache-lifecycle-"));
     const actorRoot = path.join(root, "actors");
     fs.mkdirSync(actorRoot);
@@ -60,15 +61,23 @@ describe("ActorManager registry-cache lifecycle (#7791)", () => {
       statOptions?.bigint === true && registryFds.has(fd)
         ? stamp : Reflect.apply(fstat, fs, [fd, statOptions])) as typeof fs.fstatSync);
     const before = alias.read();
-    const remove = fs.rmSync.bind(fs);
-    let removed = false;
-    vi.spyOn(fs, "rmSync").mockImplementation((name, rmOptions) => {
-      if (String(name) === actorRoot) {
-        removed = true;
+    // smarty-dev#16444 (R-keep-all-traces): the temporary root's actor tree leaves by ONE archive rename into the fleet
+    // archive, never a delete. Performed (it deletes nothing); the cache state is captured at that boundary.
+    const rename = fs.renameSync.bind(fs);
+    let archivedTo: string | undefined;
+    let releasedAtArchive: boolean | undefined;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (path.resolve(String(from)) === path.resolve(actorRoot)) {
+        archivedTo = path.resolve(String(to));
         // The cache must already be released at the removal boundary, not just later in close.finally.
-        expect(alias.read()).not.toBe(before);
-        if (options.recordOnly) return; // #4664: the emulated probe records product removal, never performs it.
+        releasedAtArchive = alias.read() !== before;
       }
+      rename(from, to);
+    });
+    const remove = fs.rmSync.bind(fs);
+    let deleted = false;
+    vi.spyOn(fs, "rmSync").mockImplementation((name, rmOptions) => {
+      if (path.resolve(String(name)) === path.resolve(actorRoot)) { deleted = true; return; } // #4664: recorded, never performed
       remove(name, rmOptions);
     });
     if (options.emulateWindows) {
@@ -82,16 +91,17 @@ describe("ActorManager registry-cache lifecycle (#7791)", () => {
     }
     try {
       await actors.close();
-      expect(removed).toBe(!persistent);
-      if (!persistent && !options.recordOnly) {
+      expect(deleted).toBe(false); // never deleted, persistent or not
+      expect(archivedTo !== undefined).toBe(!persistent);
+      if (!persistent) {
+        expect(releasedAtArchive).toBe(true);
+        if (options.emulateWindows) expect(fenceOpened).toBe(true); // The emulated Windows path reached the fence before the archive.
+        // The whole tree moved into the root's fleet archive (nothing lost) and left its location.
+        expect(archivedTo).toBe(path.resolve(fleetSessionArchive(mesh.root, identity.id), ROOT_TREE_ARCHIVE_NAME));
+        expect(fs.existsSync(path.join(archivedTo!, "actors.json"))).toBe(true);
         expect(fs.existsSync(actorRoot)).toBe(false);
         fs.mkdirSync(actorRoot);
         fs.writeFileSync(file, '{"format":1,"actors":[]}');
-      }
-      if (!persistent && options.recordOnly) {
-        expect(fenceOpened).toBe(true); // The emulated Windows path reached the fence before the recorded remove.
-        expect(fs.existsSync(actorRoot)).toBe(true);
-        fs.writeFileSync(file, '{"format":1,"actors":[]}'); // Emulate the post-removal replacement without deleting.
       }
       const parse = vi.spyOn(JSON, "parse");
       expect(alias.read()).not.toBe(before); // Forced identical identity makes cache eviction observable.
@@ -108,6 +118,6 @@ describe("ActorManager registry-cache lifecycle (#7791)", () => {
   it.each([true])("evicts on close (persistent=%s), including before temporary-root removal", persistent => evictsOnClose(persistent));
   // The fence is supported on Linux, Darwin, and Windows; only genuinely unsupported platforms stay gated.
   it.skipIf(!["linux", "darwin", "win32"].includes(process.platform)).each([false])("evicts on close (persistent=%s), including before temporary-root removal", persistent => evictsOnClose(persistent));
-  it("records an emulated Windows fence and cache eviction before root removal (not native Windows proof)", () =>
-    evictsOnClose(false, { emulateWindows: true, recordOnly: true }));
+  it("records an emulated Windows fence and cache eviction before the root archive (not native Windows proof)", () =>
+    evictsOnClose(false, { emulateWindows: true }));
 });

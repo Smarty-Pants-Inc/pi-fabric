@@ -997,7 +997,9 @@ describe("queued-work guard, round 7: the requeue ledger records only queued wor
   it.each(["entries", "bytes"] as const)("N1: dead-letter %s capacity refuses requeue spills before trim and keeps accepted spills", async (cap) => {
     const { root, mesh, actors, old, fresh, archive, ledger } = await archiveAndSuccessor(8, true);
     await actors.setActivationFilter(fresh.id, WAIT_FILTER);
-    const event = archiveLinesOf(archive).find(line => line.item?.source?.startsWith("mesh:"))!.item!.payload as MeshEvent;
+    const archived = archiveLinesOf(archive).find(line => line.item?.source?.startsWith("mesh:"))!.item as unknown as {
+      payload: MeshEvent; activation: { kind: string; id: string; source: string; sequence: number; createdAt: number; topic: string } };
+    const event = archived.payload;
     const held = (index: number, padding = "") => ({ at: Date.now(), source: `mesh:${TOPIC}`,
       event: { ...event, id: `held-${index}`, kind: "wait", data: { padding } },
       heldBy: { reason: "activationFilter", ruleId: "wait", itemId: `held-${index}`, movedAt: Date.now() } });
@@ -1005,8 +1007,10 @@ describe("queued-work guard, round 7: the requeue ledger records only queued wor
     if (cap === "entries") {
       seed = Array.from({ length: ACTOR_DEAD_LETTER_MAX_ENTRIES - 1 }, (_, index) => JSON.stringify(held(index)) + "\n").join("");
     } else {
-      // Leave room for exactly one small spill, not two; use real serialized bytes, not a mocked stat.
-      const spill = { at: Date.now(), source: `mesh:${TOPIC}`, event, requeueSpill: true };
+      // Leave room for exactly one small spill, not two; use real serialized bytes, not a mocked stat. The spill
+      // carries the archived item's mesh acceptance facts, as #1574's dead letters do.
+      const { kind, id, source, sequence, createdAt, topic } = archived.activation;
+      const spill = { at: Date.now(), source: `mesh:${TOPIC}`, event, activation: { kind, id, source, sequence, createdAt, topic }, requeueSpill: true };
       const room = Buffer.byteLength(JSON.stringify(spill)) + 1;
       const entry = held(0);
       entry.event.data.padding = "x".repeat(ACTOR_DEAD_LETTER_MAX_BYTES - room - Buffer.byteLength(JSON.stringify(entry)) - 1);
@@ -1223,4 +1227,75 @@ describe("queued-work guard, round 5: remove of a live actor (pi-fabric#1572)", 
     fs.writeFileSync(tampered, edited);
     await expect(actors.requeueArchived(fresh.id, tampered)).rejects.toThrow(/no stop record/);
   }, 60_000);
+});
+
+// pi-fabric#1572 round 9 with pi-fabric#1574: an archived item from a coalesced activation keeps its coalesced history,
+// older-omission summary and acceptance facts through requeueArchived, queued directly or spilled to the dead-letter file.
+describe("queued-work guard, round 9: coalesced history through requeueArchived (pi-fabric#1572, pi-fabric#1574)", () => {
+  type Omitted = { count: number; firstSequence: number; lastSequence: number; countIsLowerBound?: true };
+  type Activation = { kind: string; id: string; source: string; sequence: number; createdAt: number; topic: string; data?: unknown };
+  type MeshItem = { id: string; source: string; payload: MeshEvent; coalesced?: Array<{ id: string; omittedBefore?: Omitted }>;
+    omittedBefore?: Omitted; activation: Activation };
+  const runTasks = (root: string, actors: ActorManager, id: string) => actors.messages(id, 200).flatMap(message => {
+    const runId = (message as { runId?: string }).runId;
+    const file = runId ? path.join(root, "actors", id, "runs", runId, "task.txt") : undefined;
+    return message.direction === "out" && file && fs.existsSync(file) ? [fs.readFileSync(file, "utf8")] : [];
+  });
+
+  it.each([["queued", 0], ["dead-letter spill", 8]] as const)("%s: the requeued item keeps coalesced, omittedBefore and activation", async (leg, load) => {
+    const { root, mesh, actors } = setup(1);
+    const old = await actors.create({ name: "coalesced-old", instructions: "Review.", topics: [TOPIC], coalesce: false, coalesceKey: "subject" });
+    const releaseOld = await holdWorker(actors, root, old.id);
+    // 105 events for one subject collapse into the one queued item; #1574 keeps 100 records and summarizes the rest.
+    // Published in batches of at most 50, each admitted before the next: this store reads at most 100 events a page, and
+    // the monitor does not re-poll at once after a page that size (its configured page is 500), so keep pages smaller.
+    const newest = () => ((meshRecords(root, old.id)[0] as unknown as MeshItem | undefined)?.payload.data as { marker?: string } | undefined)?.marker;
+    for (const [start, end] of [[0, 50], [50, 100], [100, 105]] as const) {
+      for (let index = start; index < end; index++) {
+        await mesh.publish({ topic: TOPIC, kind: "work", from, data: { subject: "pr-1", marker: `event-${index}` } });
+      }
+      await waitFor(() => newest() === `event-${end - 1}`, 120_000);
+    }
+    await waitFor(() => (meshRecords(root, old.id)[0] as unknown as MeshItem | undefined)?.coalesced?.[0]?.omittedBefore !== undefined);
+    const { archive } = stopArchive(await actors.stop(old.id, undefined, false, "actors.stop", { dropQueued: true }));
+    releaseOld();
+    await waitFor(() => actors.inFlightCount() === 0);
+    const original = archiveLinesOf(archive).find(line => line.item?.source?.startsWith("mesh:"))!.item as unknown as MeshItem;
+    // The archived item really came from a coalesced activation with an omission summary and mesh acceptance facts.
+    expect(original.coalesced!.length).toBeGreaterThan(1);
+    const omitted = original.coalesced![0]!.omittedBefore!;
+    expect(omitted.count).toBeGreaterThan(0);
+    expect(original.activation).toMatchObject({ kind: "mesh", source: `mesh:${TOPIC}`, topic: TOPIC });
+
+    const fresh = await actors.create({ name: "coalesced-successor", instructions: "Review.", coalesce: false, coalesceKey: "subject" });
+    const release = await holdWorker(actors, root, fresh.id);
+    for (let index = 0; index < load; index++) actors.tell(fresh.id, `successor ${index}`);
+    // The old in-flight item takes the last free slot; the coalesced item is queued (load 0) or spills (load 8).
+    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 2, filtered: 0, superseded: 0, notQueued: [] });
+    if (leg === "queued") {
+      const queued = meshRecords(root, fresh.id) as unknown as MeshItem[];
+      expect(queued).toHaveLength(1);
+      expect(queued[0]!.payload.id).toBe(original.payload.id);
+      expect(queued[0]!.coalesced).toEqual(original.coalesced);
+      expect(queued[0]!.omittedBefore).toEqual(original.omittedBefore);
+      expect(queued[0]!.activation).toEqual(original.activation);
+      return;
+    }
+    expect(meshRecords(root, fresh.id)).toEqual([]);
+    const spilled = deadLetterLines(root, fresh.id).map(line => JSON.parse(line) as Omit<MeshItem, "activation"> & {
+      event: MeshEvent; requeueSpill?: true; activation?: Activation });
+    expect(spilled).toHaveLength(1);
+    const { data: _data, ...facts } = original.activation;
+    expect(spilled[0]).toMatchObject({ requeueSpill: true, event: { id: original.payload.id } });
+    expect(spilled[0]!.coalesced).toEqual(original.coalesced);
+    expect(spilled[0]!.omittedBefore).toEqual(original.omittedBefore);
+    expect(spilled[0]!.activation).toEqual(facts);
+    // Replayed from the spill, its run still receives the full collapsed history and the older-omission summary.
+    release();
+    await waitFor(() => deadLetterLines(root, fresh.id).length === 0 && actors.status(fresh.id).status === "idle" &&
+      runTasks(root, actors, fresh.id).some(task => task.includes("event-104")), 150_000);
+    const task = runTasks(root, actors, fresh.id).find(task => task.includes("event-104"))!;
+    expect(task).toContain(`${original.coalesced!.length} individually named events collapsed into this run`);
+    expect(task).toContain(`${omitted.count} older events summarized across sequence range ${omitted.firstSequence}..${omitted.lastSequence}`);
+  }, 420_000);
 });

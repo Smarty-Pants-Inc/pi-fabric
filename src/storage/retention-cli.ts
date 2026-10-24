@@ -170,14 +170,19 @@ export const sweepMeshRetention = async (meshRoot: string, options: {
     return { ...result, summary };
   } finally { stopRemovalTally(); setWindowsVerifiedRemoval(false); }
 };
+/** smarty-dev#16444 (R-keep-all-traces): these "deleters" never delete. They move session traces into the actor's
+ * session-archive/; their bytes stay on disk, so they count as archived, never as freed. */
+const ARCHIVING_DELETERS: ReadonlySet<string> = new Set(["pruneActorSessionBackups"]);
 /** The operator's lines: per deleter, then the one total (GiB) on its own line. */
 export const summaryLines = (dryRun: boolean, summary: MeshRetentionSummary): string[] => {
   const lines: string[] = [];
   let bytes = 0;
   for (const [name, item] of Object.entries(summary.deleters).sort(([a], [b]) => a.localeCompare(b))) {
-    bytes += item.bytes;
+    const archiving = ARCHIVING_DELETERS.has(name);
+    if (!archiving) bytes += item.bytes;
     const refused = Object.values(item.refused).reduce((sum, count) => sum + count, 0);
-    lines.push(`${name}: ${dryRun ? "would delete" : "deleted"} ${item.removed} (${item.bytes} bytes), refused ${refused}`);
+    const verb = archiving ? dryRun ? "would archive" : "archived" : dryRun ? "would delete" : "deleted";
+    lines.push(`${name}: ${verb} ${item.removed} (${item.bytes} bytes), refused ${refused}`);
     for (const [reason, count] of Object.entries(item.refused)) {
       const held = item.refusedBytes[reason];
       lines.push(`  refused ${count}${held ? ` (${(held / 1024 ** 3).toFixed(3)} GiB)` : ""}: ${reason}`);
@@ -548,7 +553,8 @@ const sweep = async (meshRoot: string, options: {
           compactRuns(path.join(actorRoot, "runs"), veto, registryRoot);
           // Pending launch/drain/removal is not a joined writer receipt for session history.
           if (actor.inFlightRun !== undefined || actor.preparing !== undefined || !["idle", "stopped"].includes(actor.status)) continue;
-          pruneActorSessionBackups(actor.sessionFile, { dryRun, stop: veto, onPrune: change => changes.push({ path: change.path, beforeBytes: change.bytes, afterBytes: 0 }) });
+          // smarty-dev#16444: archive, never delete: the older backups move into session-archive/ (nothing is freed).
+          pruneActorSessionBackups(actor.sessionFile, { dryRun, stop: veto, onPrune: change => changes.push({ path: change.path, beforeBytes: change.bytes, afterBytes: change.bytes }) });
         }
       };
       let rootIds: Set<string>;
@@ -591,10 +597,11 @@ const sweep = async (meshRoot: string, options: {
               onRemove: (run, bytes) => { changes.push({ path: run, beforeBytes: bytes, afterBytes: 0 }); removedRuns.push(run); },
               onCompact: change => changes.push(change),
             });
-            // Rotation history of an actor whose writer is joined: keep only the newest backup.
+            // Rotation history of an actor whose writer is joined: the newest backup stays, older ones move into its
+            // session-archive/ (smarty-dev#16444: archive, never delete; nothing is freed).
             if (row && row.inFlightRun === undefined && row.preparing === undefined && ["idle", "stopped"].includes(row.status) &&
                 typeof row.sessionFile === "string" && path.resolve(row.sessionFile) === path.join(path.resolve(actorRoot), "session.jsonl")) {
-              pruneActorSessionBackups(row.sessionFile, { dryRun, stop: gate, onPrune: change => changes.push({ path: change.path, beforeBytes: change.bytes, afterBytes: 0 }) });
+              pruneActorSessionBackups(row.sessionFile, { dryRun, stop: gate, onPrune: change => changes.push({ path: change.path, beforeBytes: change.bytes, afterBytes: change.bytes }) });
             }
           }
         } catch (error) { skipped.push({ path: registryRoot, reason: String(error) }); }

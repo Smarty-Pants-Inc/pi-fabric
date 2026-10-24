@@ -8,7 +8,8 @@ import { meshEventsNotDurable } from "./not-durable.js";
 import { FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 import { readJsonlPage } from "../log-tail.js";
 import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChanged, type MeshArchiveEntry, type MeshArchiveRecoveryPlan } from "./archive.js";
-import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import { consumeInitialMeshLockAdmission, withInitialMeshLockAcquisition, delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
+import type { LockTimingContext } from "./commit-stats.js";
 import { jsonClone } from "./state-file.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import { prepareKeyedPublishNamespace, receiptDirectoryBarrier, type ReceiptNamespace, type KeyedPublishPrefix, type LiveNamespaceBarrier } from "./receipt-namespace.js";
@@ -614,6 +615,8 @@ export class EventLog {
     let text: string;
     try { text = fs.readFileSync(file, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
+    // An existing intent may restore a live/archive append or settle durable metadata.
+    consumeInitialMeshLockAdmission(this.root);
     const intent = JSON.parse(text) as MeshDedupeIntent;
     if (typeof intent.dedupeKey !== "string" || !intent.dedupeKey ||
         (dedupeKey !== undefined && intent.dedupeKey !== dedupeKey) ||
@@ -812,6 +815,7 @@ export class EventLog {
       if (input.dedupeKey) {
         const prior = this.#readDedupeReceipt(input.dedupeKey, !after);
         if (prior) {
+          consumeInitialMeshLockAdmission(this.root);
           this.#assertDedupeFingerprint(prior, input.dedupeFingerprint);
           // Receipt-before-unlink crash: the receipt is authoritative; finish cleanup.
           // A single publish confirms the visible receipt and unlinks after release.
@@ -857,12 +861,17 @@ export class EventLog {
       }
       if (archive) {
         this.#recoverArchive(archive, false, prepared, liveCatchUp);
-        if (archive.dir === preflight?.dir) archive.installDigestRepair(digestRepair);
+        if (archive.dir === preflight?.dir) {
+          if (digestRepair) consumeInitialMeshLockAdmission(this.root);
+          archive.installDigestRepair(digestRepair);
+        }
       }
       // Only a new single archived keyed append gets this publish's proof. Recovery above,
       // batch, prior receipts and changed off-lock archive selection retain their defaults.
       let publishNamespace: ReturnType<KeyedPublishPrefix["forArchive"]>;
       const append = (): { event: MeshEvent; line: string; bytes: number } => {
+        // Unknown admission/data/outbox errors and possible partial appends must never replay.
+        consumeInitialMeshLockAdmission(this.root);
         input.admit?.();
         const createdAt = Date.now();
         const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
@@ -1000,7 +1009,11 @@ export class EventLog {
     const after: AfterUnlock = { namespace: preparation?.receiptNamespace };
     let event: MeshEvent;
     for (;;) {
-      try { event = await this.#lock.withLock(this.#preparePublish(input, undefined, after, preparation?.prefixScope), undefined, "publish"); break; }
+      try {
+        event = await withInitialMeshLockAcquisition(this.root, () =>
+          this.#lock.withLock(this.#preparePublish(input, undefined, after, preparation?.prefixScope), undefined, "publish"));
+        break;
+      }
       catch (error) {
         if (!(error instanceof MeshArchiveRecoveryChanged) || Date.now() >= recoveryDeadline) throw error;
         await delay(0);
@@ -1021,7 +1034,7 @@ export class EventLog {
    * in order, before the batch resolves (smarty-dev#6729). A failed suffix is retried by
    * the caller after checkpointing the returned committed prefix.
    */
-  async publishBatch(inputs: MeshPublishInput[]): Promise<MeshEvent[]> {
+  async publishBatch(inputs: MeshPublishInput[], timing?: LockTimingContext): Promise<MeshEvent[]> {
     if (!inputs.length || inputs.length > 256) throw new Error("Mesh publish batch must contain 1..256 events");
     inputs = inputs.map(input => this.#capturePublication(input));
     const recoveryDeadline = Date.now() + this.#lock.lockTimeoutMs;
@@ -1036,7 +1049,7 @@ export class EventLog {
           try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, after), outcome, after }); }
           catch (error) { if (error instanceof FabricIdempotencyKeyReusedError || !prepared.length) throw error; break; }
         }
-        events = await this.#lock.withLock(() => {
+        events = await withInitialMeshLockAcquisition(this.root, () => this.#lock.withLock(() => {
           const started = performance.now();
           const events: MeshEvent[] = [];
           let bytes = 0;
@@ -1060,7 +1073,7 @@ export class EventLog {
           // Compaction stays under the lock, as on main (off-lock compaction: smarty-dev#7002).
           this.#compactEventLog();
           return events;
-        }, undefined, "bridge");
+        }, undefined, "bridge", false, timing));
       } catch (error) {
         // A hold that failed after committing a prefix never retries; its committed receipts
         // still finish (best effort: an intent left behind recovers like a death after append).
@@ -1163,9 +1176,14 @@ export class EventLog {
   // without the archive appended (an older Fabric, or before the archive was set).
   #recoverArchive(archive: MeshArchive, rebootOnly = false, prepared?: MeshArchiveRecoveryPlan,
     liveCatchUp?: PreparedLiveCatchUp): void {
+    // Same-boot recovery with no pending record is read-only: do not disable fleet ingress
+    // retries merely because archives are enabled. Reboot/pending recovery can mutate BEFORE
+    // returning, so consume first (a raced/missing plan throws before promotion).
+    if (prepared || archive.pending()) consumeInitialMeshLockAdmission(this.root);
     const recovery = archive.recover(this.#readLastEventSequence(), prepared, rebootOnly);
     if (rebootOnly && !recovery.rebooted) return;
     if (recovery.rebooted) {
+      consumeInitialMeshLockAdmission(this.root);
       // A power loss took live appends whose archive lines were synced: they go live again,
       // synced this time, before anything else can take their sequences.
       const last = recovery.promote.at(-1);
@@ -1184,6 +1202,7 @@ export class EventLog {
     const archived = archive.head()?.sequence ?? 0;
     if (archived < this.#readLastEventSequence()) {
       if (!liveCatchUp || liveCatchUp.dir !== archive.dir || liveCatchUp.after > archived) throw new MeshArchiveRecoveryChanged();
+      consumeInitialMeshLockAdmission(this.root);
       archive.catchUp(liveCatchUp.entries.filter(entry => entry.event.sequence > archived));
     }
   }
@@ -1677,6 +1696,7 @@ export class EventLog {
       const tail = Buffer.allocUnsafe(readBytes);
       fs.readSync(descriptor, tail, 0, readBytes, size - readBytes);
       const newline = tail.lastIndexOf(0x0a);
+      consumeInitialMeshLockAdmission(this.root);
       fs.ftruncateSync(descriptor, newline >= 0 ? size - readBytes + newline + 1 : 0);
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;

@@ -63,7 +63,7 @@ import type { KvParticipantDirectory, ParticipantView } from "./participant-view
 import type { NatsLocalProjection, NatsLocalProjectionMetrics } from "./nats-local-projection.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
-import { ownProcessIncarnation } from "../core/atomic-write.js";
+import { knownOwnProcessIncarnation, ownProcessIncarnation } from "../core/atomic-write.js";
 import {
   ParticipantFileLockBusyError,
   prepareParticipantFileLocks,
@@ -412,7 +412,9 @@ const sessionServicesValid = (value: unknown, kind: FabricParticipantKind): bool
   });
 };
 
-const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
+/** The participant record this directory reads from an entry, or undefined when it refuses the entry.
+ * Exported for the mesh bridge, which never writes a mirror row its own host's readers must refuse. */
+export const participantFromEntry = (entry: MeshStateEntry): FabricParticipantRecord | undefined => {
   if (!isObject(entry.value) || entry.value.format !== 1 || entry.value.stopReason === "owner-root-gone") return undefined;
   const value = entry.value as Partial<FabricParticipantRecord> & Record<string, unknown>;
   const kind = participantKind(value.kind);
@@ -1258,6 +1260,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // only when its withdrawal committed: otherwise the reload lease would keep stale child or
   // legacy entries alive after the process is gone (smarty-dev#6622, review round 2). A close()
   // still awaiting its withdrawal has not committed either (round 4).
+  // smarty-dev#13645: Node's synchronous `exit` event cannot await the per-host custody gate, but
+  // removeHostLeaseIf is itself a compare-and-remove: it renames the file aside, rechecks the moved
+  // bytes' owner and restores anything else, so a successor's or a mirror's lease is never removed.
   #installExitHook(): void {
     this.#withdrawn = false;
     this.#withdrawalFailed = false;
@@ -1451,7 +1456,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (this.#closed) return false;
       if (this.options.enabled && this.#prepareLeaseLock) {
         await this.#withLeaseCommit(() => withHostLeaseLock(this.mesh, hostLeasePath(this.mesh.root, this.options.hostId), () => undefined,
-          { timeoutMs: 1_000, signal: this.#leaseAbort.signal, ownIncarnation: this.#ownIncarnationValue }));
+          { timeoutMs: 1_000, signal: this.#leaseAbort.signal, ...this.#leaseLockIncarnation() }));
         this.#prepareLeaseLock = false;
         if (this.#closed) return false;
       }
@@ -1954,6 +1959,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #routeEnded(participant: FabricParticipantRecord, read: MeshReadOptions = {}): boolean {
     return (participant.kind === "root" || participant.residency !== "durable" || participant.ownerHostId === participant.rootId) &&
       this.#sessionEnded(participant.rootId, read);
+  }
+
+  /** The closure check get() applies, read fresh, for a record get() did not answer (lastKnown).
+   * Unknown (NATS, a disabled mesh) counts as ended: callers only accept a record that is not. */
+  routeEnded(participant: FabricParticipantRecord): boolean {
+    if (this.#isNats() || !this.options.enabled) return true;
+    return this.#routeEnded(participant, { fresh: true });
   }
 
   /** Capture owner authority once. Subsequent ACK checks only stat/read that owner's file. */
@@ -3588,7 +3600,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     try { await renewHostLease(this.mesh, this.#fileLease(leaseAt),
       { claim: !this.#leaseClaimed, expected: this.#leasePredecessor, signal: this.#leaseAbort.signal,
-        ownIncarnation: this.#ownIncarnationValue });
+        ...this.#leaseLockIncarnation() });
       this.#lastLeaseRenewedAt = leaseAt;
     } catch (error) {
       if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);
@@ -3748,13 +3760,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return this.#withLeaseCommit(async () => {
       this.#assertLeaseActive();
       try { return await withOwnedHostLease(this.mesh, this.#leaseFenceOwner(), operation,
-        { ownIncarnation: this.#ownIncarnationValue, ownerAfter: () => this.#leaseFenceOwner() }); }
+        { ...this.#leaseLockIncarnation(), ownerAfter: () => this.#leaseFenceOwner() }); }
       catch (error) {
         if (error instanceof FabricHostLeaseSupersededError) this.#markSuperseded(error);
         if (isMeshLockTimeout(error)) this.#prepareLeaseLock = true;
         throw error;
       }
     });
+  }
+
+  /** The incarnation host-lease custody records for its holder (custody-lock.ts). A fenced directory passes the one it
+   * prepared before any registry fence. An unfenced directory (the session runtime, fabric-runtime-state.ts) never waits on
+   * a native read for its lease (a slow probe would lapse it), so it always passed undefined and its gate records had
+   * none (pi-fabric#1562 review-fleet-lead P1). It now passes this process's own incarnation once any read has settled
+   * (participant files, the mesh lock, custody), still without starting or awaiting one; otherwise none, as before. */
+  #leaseLockIncarnation(): { ownIncarnation: string | undefined } {
+    return { ownIncarnation: this.options.withPublicationFence ? this.#ownIncarnationValue : knownOwnProcessIncarnation() };
   }
 
   #fileLockOptions(): ParticipantFileLockOptions {

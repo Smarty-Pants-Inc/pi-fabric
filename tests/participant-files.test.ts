@@ -54,6 +54,11 @@ const directory = (root: string, name: string, source: () => FabricParticipantRe
 const stateParticipants = (root: string) =>
   new MeshStore(root, 64 * 1024, 1_000).listAll(PREFIX, { fresh: true });
 const mockNativePlatform = (platform: "darwin" | "win32", start: string) => {
+  // The simulated platform still writes to this runner's filesystem: no directory fsync where the runner has none
+  // (Windows: an fsync of a directory fails there, so a simulated darwin lock never published and its waiter timed out,
+  // pi-fabric#1562 review/astra P1-2), and none where the simulated platform has none (win32).
+  const runner = process.platform;
+  vi.spyOn(atomic, "namespaceBarrierAvailable").mockImplementation(() => runner !== "win32" && platform !== "win32");
   vi.spyOn(process, "platform", "get").mockReturnValue(platform);
   vi.stubEnv("SystemRoot", "C:\\Windows");
   // A simulated non-Linux host must not accidentally expose this runner's /proc.
@@ -73,6 +78,41 @@ const setPolicy = (root: string) => new MeshStore(root, 64 * 1024, 1_000).put({
 });
 
 describe("participant files", () => {
+  it("under a mirror's directory custody, an unrelated record's update proceeds; additions and identity changes wait (smarty-dev#13645)", async () => {
+    const root = meshRoot();
+    const mesh = new MeshStore(root, 64 * 1024, 1_000);
+    const entry = (value: FabricParticipantRecord, version: number) => ({
+      key: keyOf(value.id), value, version, updatedAt: Date.now(), updatedBy: identityOf(value.sessionId!) });
+    writeParticipantFile(root, entry(record("heartbeat"), 1));
+    writeParticipantFile(root, entry(record("alias"), 1));
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const inCustody = new Promise<void>(resolve => { entered = resolve; });
+    // A mirror whose incoming ids touch neither existing record holds the namespace for a while.
+    const custody = participantFiles.withParticipantFileDirectoryCustody(mesh, async () => { entered(); await held; },
+      new Set(["session:incoming"]));
+    await inCustody;
+    // A heartbeat of an unrelated, existing record: same identity fields, only its key receipt.
+    await expect(participantFiles.writeParticipantFileIf(mesh, keyOf("session:heartbeat"),
+      current => entry({ ...record("heartbeat"), status: "running", updatedAt: 3 }, (current?.version ?? 0) + 1))).resolves.toBe(true);
+    expect(participantFiles.readParticipantFile(root, keyOf("session:heartbeat"))?.value).toMatchObject({ status: "running" });
+    // A new record, and an existing record rewritten to alias the incoming id, both wait for the namespace.
+    let added = false, aliased = false;
+    const addition = participantFiles.writeParticipantFileIf(mesh, keyOf("session:incoming"),
+      () => entry(record("incoming"), 1)).then(result => { added = true; return result; });
+    const identityChange = participantFiles.writeParticipantFileIf(mesh, keyOf("session:alias"),
+      current => entry({ ...record("alias"), rootId: "session:incoming" }, (current?.version ?? 0) + 1))
+      .then(result => { aliased = true; return result; });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect([added, aliased]).toEqual([false, false]);
+    release();
+    await custody;
+    await expect(Promise.all([addition, identityChange])).resolves.toEqual([true, true]);
+    expect(participantFiles.readParticipantFile(root, keyOf("session:alias"))?.value).toMatchObject({ rootId: "session:incoming" });
+    mesh.closeState();
+  });
+
   it.each([false, true])("renews a live host through per-key contention (files-only=%s), retries and lets dead hosts expire", async (filesOnly) => {
     vi.useFakeTimers({ now: Date.now() });
     const root = meshRoot();
@@ -230,8 +270,14 @@ describe("participant files", () => {
       if (failure === "write") throw new Error("migration I/O failed");
       if (failure === "refused") return false;
       if (failure === "barrier") {
-        const barrier = vi.spyOn(fs, "fsyncSync").mockImplementationOnce(() => { throw new Error("migration barrier failed"); });
-        try { return await write(mesh, writtenKey, decide, options); }
+        // The migration's own barrier: the first fsync after the decision, not the key lock's owner fsync before it.
+        const fsync = fs.fsyncSync.bind(fs);
+        let armed = false;
+        const barrier = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+          if (armed) { armed = false; throw new Error("migration barrier failed"); }
+          return fsync(fd);
+        });
+        try { return await write(mesh, writtenKey, (current) => { armed = true; return decide(current); }, options); }
         finally { barrier.mockRestore(); }
       }
       const read = fs.readFileSync.bind(fs);
@@ -722,6 +768,47 @@ describe("participant files", () => {
       expect(fs.readdirSync(path.dirname(canonical)).sort()).toEqual([
         path.basename(canonical), `${path.basename(canonical)}.recent.dead`, `${path.basename(canonical)}.recent.tmp`,
       ].sort());
+    });
+
+    it("publishes a key lock only once its owner is on disk, then syncs the published name (pi-fabric#1562 fabric-store P2)", async () => {
+      const root = meshRoot();
+      const mesh = new MeshStore(root, 64 * 1024, 1_000);
+      const key = keyOf("session:a");
+      const lock = lockOf(root, "session:a");
+      const events: string[] = [];
+      const opened = new Map<number, string>();
+      const open = fs.openSync.bind(fs), fsync = fs.fsyncSync.bind(fs), rename = fs.renameSync.bind(fs);
+      vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+        const fd = open(...args);
+        opened.set(fd, String(args[0]));
+        return fd;
+      }) as typeof fs.openSync);
+      vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => { events.push(`fsync ${opened.get(fd)}`); return fsync(fd); });
+      vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { events.push(`rename ${String(from)} -> ${String(to)}`); return rename(from, to); });
+      await expect(participantFiles.writeParticipantFileIf(mesh, key, () => ({
+        key, value: record("a"), version: 1, updatedAt: 1, updatedBy: identityOf("a"),
+      }))).resolves.toBe(true);
+      const publish = events.findIndex((event) => event.startsWith("rename ") && event.endsWith(` -> ${lock}`));
+      expect(publish, events.join("\n")).toBeGreaterThan(-1);
+      const staging = events[publish]!.slice("rename ".length, events[publish]!.indexOf(" -> "));
+      const before = events.slice(0, publish);
+      // Its bytes, then (where directories can be synced) its name in the staging directory, before the rename publishes it.
+      expect(before).toContain(`fsync ${path.join(staging, "owner")}`);
+      if (process.platform === "win32") return;
+      expect(before.indexOf(`fsync ${path.join(staging, "owner")}`)).toBeLessThan(before.indexOf(`fsync ${staging}`));
+      expect(events[publish + 1]).toBe(`fsync ${path.dirname(lock)}`);
+    });
+
+    it("a held key lock refuses a contender before it stages or syncs anything", async () => {
+      const root = meshRoot();
+      const mesh = new MeshStore(root, 64 * 1024, 1_000);
+      const lock = holdLock(root, "session:a", process.pid);
+      const syncs = vi.spyOn(fs, "fsyncSync");
+      const staged = vi.spyOn(fs, "mkdirSync");
+      expect(() => participantFiles.withParticipantFileTryLock(mesh, keyOf("session:a"), undefined, () => "entered"))
+        .toThrow(participantFiles.ParticipantFileLockBusyError);
+      expect(syncs).not.toHaveBeenCalled();
+      expect(staged.mock.calls.filter(([target]) => String(target).startsWith(`${lock}.`))).toEqual([]);
     });
 
     it.each(["EACCES", "EIO", undefined].flatMap(code =>

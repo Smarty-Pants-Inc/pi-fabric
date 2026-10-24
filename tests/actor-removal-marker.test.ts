@@ -7,11 +7,13 @@ import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { actorTreeDeletionHooks } from "../src/topology/main-publication-fence.js";
+import { failActorTreeRemoval } from "./helpers/actor-tree-removal.js";
 
 // Fail-closed coverage for the actor tree removal obligation marker, on a real ActorManager over its own temporary
 // fixture. Faults are injected on fs only: the durable publish (temporary -> name rename) of this fixture's own
-// removal marker, and unlinks of this fixture's own data files. The removal helper itself is never mocked.
-// Linux only, like the tracked tree delete.
+// removal marker, and (smarty-dev#16444: a removal archives the tree by one rename, never deletes it) the archive
+// rename of this fixture's own judged tree. The removal helper itself is never mocked.
+// Linux only, like the tracked tree removal.
 
 const PREFIX = "fabric-removal-marker-";
 const roots: string[] = [];
@@ -104,25 +106,21 @@ const markerPublishFault = (s: Fixture, when: (published: Record<string, unknown
   });
   return { state, release: () => { state.blocked = false; } };
 };
-/** A busy unlink of this fixture's own data files wherever they are below its actor root (after a move too). */
-const busyUnlinks = (s: Fixture) => {
+/** A busy archive rename of this fixture's own judged tree (into the fleet session-archive) while the fault holds.
+ * smarty-dev#16444: the tree leaves its location only by that one rename; a failed rename leaves it in place. */
+const busyArchiveRename = (s: Fixture) => {
   const state = { blocked: true, faults: 0 };
-  const realRoot = fs.realpathSync(s.actorRoot);
-  const unlink = fs.unlinkSync.bind(fs);
-  vi.spyOn(fs, "unlinkSync").mockImplementation((file) => {
-    if (state.blocked && NAMES.has(path.basename(String(file)))) {
-      let below = false;
-      try { const dir = fs.realpathSync(path.dirname(String(file))); below = dir === realRoot || dir.startsWith(realRoot + path.sep); }
-      catch { below = false; }
-      if (below) {
-        state.faults++;
-        throw Object.assign(new Error("EBUSY: resource busy (injected by the test on its own fixture)"), { code: "EBUSY" });
-      }
-    }
-    unlink(file);
+  const spy = failActorTreeRemoval(s.sessionDir, () => {
+    if (!state.blocked) return;
+    state.faults++;
+    throw Object.assign(new Error("EBUSY: resource busy (injected by the test on its own fixture)"), { code: "EBUSY" });
   });
-  return { state, release: () => { state.blocked = false; } };
+  return { state, release: () => { state.blocked = false; spy.mockRestore(); } };
 };
+/** The fleet archive of this fixture's mesh (every root): where an archived actor tree goes. */
+const fleetArchive = (s: Fixture): string => path.join(s.root, "mesh", "session-archive");
+/** The actor's archived trees in the fleet archive (never anywhere else). */
+const archivedTrees = (s: Fixture): string[] => namedFor(fleetArchive(s), s.id);
 /** The obligation stays: pending result, reported obligation, marker kept. */
 const expectPending = (actors: ActorManager, s: Fixture, result: unknown) => {
   expect(result).toMatchObject({ removed: true, cleaned: false, pending: expect.any(String) });
@@ -171,34 +169,52 @@ describe.runIf(process.platform === "linux")("actor tree removal marker failures
     expect(namedFor(s.actorRoot, s.id)).toEqual([]);
     expect(fs.existsSync(s.marker)).toBe(false);
     expect(s.actors.cleanupObligation(s.id)).toBeUndefined();
+    // smarty-dev#16444: removed from the actor root by its archive rename; nothing lost.
+    const archived = archivedTrees(s);
+    expect(archived).toHaveLength(1);
+    expect(fs.lstatSync(archived[0]!).ino).toBe(ino);
+    expect(dataIn(archived[0]!)).toEqual(ALL);
   }, 60_000);
 
-  it("an unpublished returned graveyard location stays pending with the data retained, in process and on a cold manager, with every fault released", async () => {
+  it("a failed archive rename keeps the tree in place and pending, in process and on a cold manager, and the released retry archives it with the data retained", async () => {
     const s = await setup();
-    const busy = busyUnlinks(s);
-    // Only a publish after the tree left its original name: the returned location save.
-    const fault = markerPublishFault(s, published => "treeRemoval" in published && !fs.existsSync(s.sessionDir));
+    const ino = fs.lstatSync(s.sessionDir).ino;
+    const intact = () => {
+      expect(fs.lstatSync(s.sessionDir).ino).toBe(ino);
+      expect(dataIn(s.sessionDir)).toEqual(ALL);
+      expect(fs.readFileSync(path.join(s.sessionDir, DATA[0]!), "utf8")).toBe("history\n");
+      expect(movedCopies(s)).toEqual([]);
+      expect(archivedTrees(s)).toEqual([]);
+    };
+    const busy = busyArchiveRename(s);
     const first = await s.actors.remove(s.id);
-    expect(busy.state.faults).toBeGreaterThan(0); // the real move happened, then a busy entry
-    expect(fault.state.faults).toBeGreaterThan(0);
+    expect(busy.state.faults).toBeGreaterThan(0); // the real archive rename was reached, and refused
     expectPending(s.actors, s, first);
-    expect(fs.existsSync(s.sessionDir)).toBe(false);
-    expect(dataIn(s.actorRoot)).toEqual(ALL);
-    const moved = movedCopies(s);
-    expect(moved.length).toBeGreaterThan(0);
+    intact();
+    // The tree obligation was published before the rename: the judged tree, still at its original name.
+    expect(JSON.parse(fs.readFileSync(s.marker, "utf8"))).toMatchObject({
+      treeRemoval: { ino, location: path.resolve(s.sessionDir), status: "outstanding" } });
 
-    // Nothing blocks deletion any more, but the tree's location was never published: absence is not completion.
-    busy.release();
-    fault.release();
+    // Still refused: a retry, in process and on a cold manager, moves nothing and keeps the cleanup pending.
     expectPending(s.actors, s, await s.actors.remove(s.id));
-    expect(dataIn(s.actorRoot)).toEqual(ALL);
-
+    intact();
     const restarted = await coldStart(s, s.actors);
     expect(restarted.cleanupObligation(s.id)).toBeDefined();
     expectPending(restarted, s, await restarted.remove(s.id));
+    intact();
+
+    // Every fault released: the exact-id retry archives the whole judged tree, every data file in it.
+    busy.release();
+    const retry = await restarted.remove(s.id);
+    expect(retry).not.toHaveProperty("pending");
     expect(fs.existsSync(s.sessionDir)).toBe(false);
-    expect(dataIn(s.actorRoot)).toEqual(ALL);
-    expect(movedCopies(s)).toEqual(moved);
+    expect(fs.existsSync(s.marker)).toBe(false);
+    expect(restarted.cleanupObligation(s.id)).toBeUndefined();
+    const archived = archivedTrees(s);
+    expect(archived).toHaveLength(1);
+    expect(fs.lstatSync(archived[0]!).ino).toBe(ino);
+    expect(dataIn(archived[0]!)).toEqual(ALL);
+    expect(fs.readFileSync(path.join(archived[0]!, DATA[0]!), "utf8")).toBe("history\n");
   }, 60_000);
 
   type Extension = { dev: number; ino: number; uid: number; type: number; location: string; status: string };
@@ -237,15 +253,15 @@ describe.runIf(process.platform === "linux")("actor tree removal marker failures
     expect(dataIn(place)).toEqual(ALL);
   }, 60_000);
 
-  it("a different inode at the recorded location stays pending and deletes neither the replacement nor the retained data", async () => {
+  it("a different inode at the recorded location stays pending and archives (or deletes) neither the replacement nor the retained data", async () => {
     const s = await setup();
-    const busy = busyUnlinks(s);
+    const busy = busyArchiveRename(s);
     expectPending(s.actors, s, await s.actors.remove(s.id));
-    expect(busy.state.faults).toBeGreaterThan(0);
-    expect(fs.existsSync(s.sessionDir)).toBe(false);
-    // Premise: the retained tree's moved location was published.
+    expect(busy.state.faults).toBeGreaterThan(0); // the archive rename failed: the tree is kept where it was judged
+    expect(archivedTrees(s)).toEqual([]);
+    // Premise: the retained tree's location (its original name, smarty-dev#16444) was published with its identity.
     const location = (JSON.parse(fs.readFileSync(s.marker, "utf8")) as { treeRemoval?: { location?: unknown } }).treeRemoval?.location;
-    expect(typeof location).toBe("string");
+    expect(location).toBe(path.resolve(s.sessionDir));
     expect(dataIn(location as string)).toEqual(ALL);
 
     // The retained tree leaves for elsewhere in the fixture root; a different directory takes the recorded location.
@@ -254,10 +270,13 @@ describe.runIf(process.platform === "linux")("actor tree removal marker failures
     fs.mkdirSync(location as string, { mode: 0o700 });
     const replacement = path.join(location as string, "replacement.jsonl");
     fs.writeFileSync(replacement, "replacement\n", { mode: 0o600 });
-    busy.release();
+    const replacementIno = fs.lstatSync(location as string).ino;
+    busy.release(); // nothing blocks the archive rename any more: only the identity check keeps the replacement
     const untouched = () => {
+      expect(fs.lstatSync(location as string).ino).toBe(replacementIno);
       expect(fs.readFileSync(replacement, "utf8")).toBe("replacement\n");
       expect(dataIn(kept)).toEqual(ALL);
+      expect(archivedTrees(s)).toEqual([]);
     };
 
     expectPending(s.actors, s, await s.actors.remove(s.id));

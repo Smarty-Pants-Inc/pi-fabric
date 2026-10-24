@@ -177,6 +177,7 @@ export class ActorLogStore {
   }
 
   pruneRuns(actor: ActorLogTarget, now = Date.now()): void {
+    // smarty-dev#16444: archives, never deletes: older session backups move into <actor dir>/session-archive/.
     pruneActorSessionBackups(actor.sessionFile);
     pruneActorRunArchives({
       runsDirectory: path.join(path.dirname(actor.sessionFile), "runs"),

@@ -1372,7 +1372,8 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     else if (cancel === "remove") await actors.remove(actor.id);
     else {
       const definition = actors.definition(actor.id);
-      await actors.stop(actor.id);
+      // smarty-dev#16416: the queued leading item is archived; the pending window is still cancelled.
+      await actors.stop(actor.id, undefined, false, "actors.stop", { dropQueued: true });
       if (cancel === "recreate") expect((await actors.create(definition)).id).not.toBe(actor.id);
     }
     await first.close();
@@ -1636,7 +1637,9 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     vi.advanceTimersByTime(100);
     actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "old" });
     const timer = scheduled.mock.results[scheduled.mock.calls.findIndex(([, delay]) => delay === 900)]!.value;
-    await actors.stop(actor.id);
+    await expect(actors.stop(actor.id)).rejects.toMatchObject({ code: "FABRIC_ACTOR_QUEUED_WORK", counts: { queued: 1 } }); // smarty-dev#16416
+    expect(cancelled).not.toHaveBeenCalledWith(timer);
+    await actors.stop(actor.id, undefined, false, "actors.stop", { dropQueued: true });
     expect(cancelled).toHaveBeenCalledWith(timer);
     const replacement = await actors.create({ ...actors.definition(actor.id), name: actor.name });
     expect(replacement.id).not.toBe(actor.id);
@@ -1744,25 +1747,31 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
       settledWindows?: Array<{ pending: { payload: { marker: string }; deliveryId: string } }>;
     };
     const before = snapshot();
-    const changed = await actors.setActivationFilter(actor.id, [
+    const filter = [
       { id: "settles", source: ["host:agent_settled"] },
       { id: "errors", source: ["host:tool_error"] },
-    ]);
-    expect(changed).toMatchObject({ queued: 1, filterSkipped: { count: 1 } });
+    ];
+    // smarty-dev#16416: the interval-managed settle is not counted; only the ordinary item would be skipped.
+    await expect(actors.setActivationFilter(actor.id, filter)).rejects.toMatchObject({ code: "FABRIC_ACTOR_QUEUED_WORK", counts: { skipped: 1 } });
+    const changed = await actors.setActivationFilter(actor.id, filter, undefined, undefined, undefined, { dropQueued: true });
+    expect(changed).toMatchObject({ queued: 1, movedToDeadLetter: 1, filterSkipped: { count: 0 } });
     expect(snapshot().items).toEqual(before.items.filter(item => item.source === "host:agent_settled"));
     expect(snapshot().settledWindows).toEqual(before.settledWindows); // Preserve pending custody and receipt.
-    expect(actors.messages(actor.id).filter(message => message.reason?.startsWith("filtered: ")).map(message => message.reason))
-      .toEqual(["filtered: errors"]);
+    const held = fs.readFileSync(path.join(directory, "dead-letter.jsonl"), "utf8").split("\n").filter(Boolean)
+      .map(line => JSON.parse(line) as { source: string; payload?: { marker: string }; heldBy?: { raw?: boolean } });
+    expect(held).toEqual([expect.objectContaining({ source: "host:tool_error", payload: { marker: "ordinary" }, heldBy: expect.objectContaining({ raw: true }) })]);
+    expect(actors.messages(actor.id).filter(message => message.reason?.startsWith("filtered: "))).toEqual([]);
     vi.advanceTimersByTime(1_000);
-    expect(actors.status(actor.id)).toMatchObject({ queued: 1, filterSkipped: { count: 2 } });
+    expect(actors.status(actor.id)).toMatchObject({ queued: 1, filterSkipped: { count: 1 } });
     expect(snapshot().settledWindows ?? []).toEqual([]);
     vi.advanceTimersByTime(2_000);
-    expect(actors.status(actor.id).filterSkipped.count).toBe(2);
+    expect(actors.status(actor.id).filterSkipped.count).toBe(1);
     expect(actors.messages(actor.id).filter(message => message.reason?.startsWith("filtered: ")).map(message => message.reason))
-      .toEqual(["filtered: errors", "filtered: settles"]);
+      .toEqual(["filtered: settles"]);
     actors.resumeAfterRelease();
     await new Promise<void>(resolve => setImmediate(resolve));
-    expect(actors.status(actor.id)).toMatchObject({ queued: 0, filterSkipped: { count: 3 } }); // Leading skips once at dequeue.
+    expect(actors.status(actor.id)).toMatchObject({ queued: 0, filterSkipped: { count: 2 } }); // Leading skips once at dequeue.
+    expect(fs.readFileSync(path.join(directory, "dead-letter.jsonl"), "utf8").split("\n").filter(Boolean)).toHaveLength(1); // still held
     expect(actors.messages(actor.id).filter(message => message.direction === "out")).toEqual([]); // No worker launched.
   });
 
@@ -1771,10 +1780,13 @@ describe("actor agent_settled leading + latest trailing minimum interval", () =>
     actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "first" });
     actors.dispatchHostEvent("agent_settled", { ...payload(), marker: "second" });
     expect(actors.status(actor.id).queued).toBe(2);
-    const changed = await actors.setActivationFilter(actor.id, [{ id: "settles", source: ["host:agent_settled"] }]);
-    expect(changed).toMatchObject({ queued: 0, filterSkipped: { count: 2 } });
+    const filter = [{ id: "settles", source: ["host:agent_settled"] }];
+    await expect(actors.setActivationFilter(actor.id, filter)).rejects.toMatchObject({ code: "FABRIC_ACTOR_QUEUED_WORK", counts: { skipped: 2 } });
+    // smarty-dev#16416: with dropQueued they move to the dead-letter queue instead of being skipped.
+    const changed = await actors.setActivationFilter(actor.id, filter, undefined, undefined, undefined, { dropQueued: true });
+    expect(changed).toMatchObject({ queued: 0, movedToDeadLetter: 2, filterSkipped: { count: 0 } });
     vi.advanceTimersByTime(2_000);
-    expect(actors.status(actor.id).filterSkipped.count).toBe(2);
+    expect(actors.status(actor.id).filterSkipped.count).toBe(0);
   });
 
   it("clones latest payload/images and retains the existing queue coalescing contract", async () => {

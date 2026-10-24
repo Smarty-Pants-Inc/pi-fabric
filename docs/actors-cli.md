@@ -10,6 +10,16 @@ fabric-actors remove --resident <directory-or-prefix> --actor <id-or-name> --con
   --main-stopped --evidence-file <herdr-and-ps-check.txt>
 ```
 
+## Stop never drops queued work silently (smarty-dev#16416)
+
+`stop` refuses an actor that still holds queued, parked, overflow or dead-letter work. The error names each
+count, and nothing changes. To stop it anyway, add `--drop-queued` (stop only). The work is then **moved**, not
+deleted, into one archive file in the actor's directory, `<actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl`.
+The printed result carries `actor.stoppedQueue` with the archive path, its full sha256 and the counts. The actor's
+message log gets a `MOVED-TO <path>` line with the same sha256. To restore the work, recreate the actor and call
+`agents.requeueArchived({ id: <new actor>, archive: <path> })` from its root's Main (see agents.md). `remove`
+keeps its own semantics.
+
 ## Offline remove (dead resident host): `--main-stopped` is an operator attestation (smarty-dev#7817)
 
 When the root's resident host is dead, `remove` runs offline in the CLI and also needs `--main-stopped` with `--evidence <text>` or `--evidence-file <path>` (text, capped at

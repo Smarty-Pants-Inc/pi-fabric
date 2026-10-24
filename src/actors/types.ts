@@ -290,6 +290,63 @@ export class FabricActorBatchPolicyError extends Error {
   }
 }
 
+/** Queued work an actor holds outside its in-flight run (smarty-dev#16416). */
+export interface FabricActorQueueCounts {
+  queued: number;
+  parked: number;
+  overflow: number;
+  deadLetter: number;
+}
+
+/** agents.stop options (smarty-dev#16416). */
+export interface FabricActorStopOptions {
+  /**
+   * Stop even though the actor holds queued, parked, overflow or dead-letter work. That work
+   * is moved to `<actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl`, never deleted;
+   * agents.requeueArchived feeds it to a recreated actor.
+   */
+  dropQueued?: boolean;
+}
+
+/** The archive a stop with dropQueued wrote, returned on its result (smarty-dev#16416). */
+export interface FabricActorStoppedQueue {
+  archive: string;
+  sha256: string;
+  counts: FabricActorQueueCounts;
+}
+
+/** agents.requeueArchived result (smarty-dev#16416). */
+export interface FabricActorRequeueResult {
+  id: string;
+  archive: string;
+  sha256: string;
+  /** Items this call admitted to the actor's queue. */
+  requeued: number;
+  /** Items this call offered that the actor's activation filter skipped on arrival. */
+  filtered: number;
+  /** Items an earlier call already offered; never offered twice. */
+  alreadyRequeued: number;
+  /** Items that cannot be fed again (a rejected caller's ask, a non-mesh/host/direct source). */
+  skipped: Array<{ itemId: string; source: string; reason: string }>;
+}
+
+/**
+ * smarty-dev#16416: an operation that would discard or skip queued work without an explicit
+ * dropQueued: true. Nothing changed; the counts name the work that is still queued.
+ */
+export class FabricActorQueuedWorkError extends Error {
+  readonly code = "FABRIC_ACTOR_QUEUED_WORK";
+  constructor(
+    readonly operation: "stop" | "setActivationFilter",
+    readonly actorId: string,
+    readonly counts: Record<string, number>,
+    message: string,
+  ) {
+    super(message);
+    this.name = "FabricActorQueuedWorkError";
+  }
+}
+
 export function normalizeActorBatching(value: unknown): FabricActorBatching {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new FabricActorBatchPolicyError("Invalid actor batching policy");
   const input = value as Record<string, unknown>;
@@ -424,6 +481,10 @@ export interface FabricActorSessionOrphan {
 
 export interface FabricActorInfo extends FabricActorBatching {
   id: string;
+  /** Only on an agents.stop({ dropQueued: true }) result that archived work (smarty-dev#16416). */
+  stoppedQueue?: FabricActorStoppedQueue;
+  /** Only on an agents.setActivationFilter({ dropQueued: true }) result: items moved to the dead-letter queue. */
+  movedToDeadLetter?: number;
   scope: FabricActorStorageScope;
   name: string;
   /** sha256 (hex) of the actor's default instructions, as setInstructions stored them. */

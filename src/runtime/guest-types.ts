@@ -889,7 +889,22 @@ interface FabricActorActivationIdentity {
   instructionsDigest: string;
   roleStamp?: string;
 }
+interface FabricActorQueueCounts { queued: number; parked: number; overflow: number; deadLetter: number }
+/** Returned by agents.requeueArchived. */
+interface FabricActorRequeueResult {
+  id: string;
+  archive: string;
+  sha256: string;
+  requeued: number;
+  filtered: number;
+  alreadyRequeued: number;
+  skipped: Array<{ itemId: string; source: string; reason: string }>;
+}
 interface FabricActorInfo extends FabricActorBatching {
+  /** Only on agents.stop({ dropQueued: true }) when work was archived: the archive, its sha256 and what it holds. */
+  stoppedQueue?: { archive: string; sha256: string; counts: FabricActorQueueCounts };
+  /** Only on agents.setActivationFilter({ dropQueued: true }): queued items moved to the dead-letter queue. */
+  movedToDeadLetter?: number;
   /** Resolution marker (alias name or closest); does not replace the effective model. */
   via?: string;
   /** Canonical selection when via is present; session bindings may select a different model. */
@@ -1176,7 +1191,13 @@ interface FabricAgentsApi {
   subscriptions(args?: { from?: string; to?: string }): Promise<FabricLifecycleSubscription[]>;
   unsubscribe(args: FabricAgentTargetArgs): Promise<{ removed: boolean }>;
   models(args?: { runner?: FabricAgentRunner; refresh?: boolean }): Promise<FabricModelInfo[]>;
-  stop(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricActorInfo | FabricRemoteControlResult>;
+  /**
+   * An actor holding queued, parked, overflow or dead-letter work is refused (FABRIC_ACTOR_QUEUED_WORK, with the
+   * counts) unless dropQueued: true, which moves that work to <actor dir>/stopped-queues/ (stoppedQueue on the result).
+   */
+  stop(args: FabricAgentTargetArgs & { dropQueued?: boolean }): Promise<FabricAgentResult | FabricActorInfo | FabricRemoteControlResult>;
+  /** Feed a stop archive to a live (recreated) actor through its normal activation filter, once per item; idempotent. */
+  requeueArchived(args: { id: string; archive: string }): Promise<FabricActorRequeueResult>;
   cleanup(args: FabricAgentTargetArgs & { deleteBranch?: boolean; delete_branch?: boolean }): Promise<{ cleaned: boolean }>;
   create(args: FabricActorRequest): Promise<FabricActorInfo>;
   /** Alias of create; file paths are resolved by the owning host. */
@@ -1193,7 +1214,8 @@ interface FabricAgentsApi {
   setInferenceContext(args: { id: string; inferenceContext: "full-history" | "activation"; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setCoalesceKey(args: { id: string; coalesceKey: string | null; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setBatching(args: FabricActorBatching & { id: string; scope?: "project" | "global" }): Promise<FabricActorInfo>;
-  setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number; deadLetterReplayMaxAgeMs?: number; scope?: "project" | "global" }): Promise<FabricActorInfo>;
+  /** Refused when the new filter would skip queued items, unless dropQueued: true moves them to the dead-letter queue. */
+  setActivationFilter(args: { id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number; deadLetterReplayMaxAgeMs?: number; dropQueued?: boolean; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   /** Replace ordinary actor mesh topics; [] stops topic intake without discarding accepted work. Native slot-bound topics are immutable. Live actors require the local owner; global updates only the template. */
   setTopics(args: { id: string; topics: string[]; scope?: "project" | "global" }): Promise<FabricActorInfo>;
   setEvents(args: { id: string; events: FabricActorHostEvent[] }): Promise<FabricActorInfo>;

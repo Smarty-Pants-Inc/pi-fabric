@@ -530,11 +530,13 @@ describe("wake text in actor activations", () => {
     await publish(mesh, projected("pull_request_review_comment", 9)); // NONE, available only after receipt hydration
     await publish(mesh, projected("issue_comment", 7));
     await waitFor(() => actors.status(actor.id).queued === 2);
-    const changed = await actors.setActivationFilter(actor.id, [{ id: "outsiders", topic: ["github.demo"],
-      where: [{ path: "wakeText.authorAssociation", equals: "NONE" }] }]);
-    expect(changed).toMatchObject({ queued: 1, status: "running", filterSkipped: { count: 1 } });
-    expect(actors.messages(actor.id).filter(message => message.reason?.startsWith("filtered: ")).map(message => message.reason))
-      .toEqual(["filtered: outsiders"]);
+    const outsiders = [{ id: "outsiders", topic: ["github.demo"], where: [{ path: "wakeText.authorAssociation", equals: "NONE" }] }];
+    // smarty-dev#16416: the set-time check sees hydrated wakeText too; the match is refused, then moved with dropQueued.
+    await expect(actors.setActivationFilter(actor.id, outsiders)).rejects.toMatchObject({ code: "FABRIC_ACTOR_QUEUED_WORK", counts: { skipped: 1 } });
+    const changed = await actors.setActivationFilter(actor.id, outsiders, undefined, undefined, undefined, { dropQueued: true });
+    expect(changed).toMatchObject({ queued: 1, status: "running", movedToDeadLetter: 1, filterSkipped: { count: 0 } });
+    expect(actors.messages(actor.id).filter(message => message.reason?.startsWith("filtered: "))).toEqual([]);
+    expect(fs.readFileSync(path.join(root, "actors", actor.id, "dead-letter.jsonl"), "utf8").split("\n").filter(Boolean)).toHaveLength(1);
     fs.writeFileSync(release, "release");
     await waitFor(() => runTasks(root, actor.id).length === 2 && actors.status(actor.id).status === "idle");
     expect(fenced(runTasks(root, actor.id)[1]!)).toMatchObject({ event: "issue_comment", author: "alice" });

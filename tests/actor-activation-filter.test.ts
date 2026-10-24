@@ -274,8 +274,15 @@ const holdWorker = async (actors: ActorManager, root: string, id: string) => {
   await waitFor(() => actors.status(id).status === "running");
   return () => fs.writeFileSync(release, "release");
 };
+// smarty-dev#16416: the set-time prune of accepted work needs dropQueued, which moves the
+// skipped items to the dead-letter queue (held while the filter skips them), never drops them.
+const DROP_QUEUED = { dropQueued: true } as const;
+const deadLetterLines = (root: string, id: string) => {
+  const file = path.join(root, "actors", id, "dead-letter.jsonl");
+  return fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean) : [];
+};
 describe("setting activation filters on accepted queues", () => {
-  it("prunes six of ten queued items, preserving FIFO, receipts and head-skip processed keys", async () => {
+  it("prunes six of ten queued items into the dead-letter queue, preserving FIFO and head-skip processed keys", async () => {
     const { root, mesh, actors, agents } = setup(undefined, 10);
     const actor = await actors.create({ name: "queued-supervisor", instructions: "Supervise.", topics: ["filter-queued.work"],
       coalesce: false, dedupeKey: "data.key", residency: "durable" });
@@ -287,19 +294,20 @@ describe("setting activation filters on accepted queues", () => {
     await waitFor(() => actors.status(actor.id).queued === 10);
     const before = queueSnapshot(root, actor.id);
     expect(before.saved.processedKeys).toEqual([JSON.stringify(["mesh-dedupe", "data.key", "filter-queued.work", "event--1"])]);
-    const changed = await actors.setActivationFilter(actor.id, WAIT_FILTER);
+    await expect(actors.setActivationFilter(actor.id, WAIT_FILTER)).rejects.toMatchObject({ code: "FABRIC_ACTOR_QUEUED_WORK", counts: { skipped: 6 } });
+    const changed = await actors.setActivationFilter(actor.id, WAIT_FILTER, undefined, undefined, undefined, DROP_QUEUED);
     expect(changed.queued).toBe(4);
+    expect(changed.movedToDeadLetter).toBe(6);
     expect(changed.status).toBe("running"); // setting the filter never consumes the active caller's work
-    expect(changed.filterSkipped.count).toBe(6);
-    expect(changed.filteredCount).toBe(6);
+    expect(changed.filterSkipped.count).toBe(0); // moved, not skipped
     const after = queueSnapshot(root, actor.id).saved;
     expect(after.items.filter(item => item.source.startsWith("mesh:")).map(item => item.payload.data))
       .toEqual([1, 4, 6, 8].map(index => ({ key: `event-${index}`, marker: `event-${index}` })));
     expect(after.processedKeys).toEqual(before.saved.processedKeys);
     const skippedItems = before.saved.items.filter(item => item.payload.kind === "wait");
-    const receipts = filtered(actors, actor.id).map(({ source, reason, data }) => ({ source, reason, data }));
-    expect(receipts).toEqual(skippedItems.map(item => ({ source: item.source, reason: "filtered: wait", data: { filteredItemId: item.id } })));
-    expect(changed.filterSkipped).toMatchObject({ lastKey: skippedItems.at(-1)!.payload.id, lastTopic: "filter-queued.work", lastAt: changed.lastFilteredAt });
+    expect(filtered(actors, actor.id)).toEqual([]);
+    expect(deadLetterLines(root, actor.id).map(line => (JSON.parse(line) as { event: MeshEvent }).event.id)).toEqual(skippedItems.map(item => item.payload.id));
+    const receipts = skippedItems.map(item => ({ source: item.source, reason: "filtered: wait", data: { filteredItemId: item.id } }));
     expect(runDirs(root, actor.id)).toHaveLength(1); // only the completed seed is archived; the caller is still active
 
     // Stop admission/drain at the release boundary only AFTER all events are queued.
@@ -313,8 +321,9 @@ describe("setting activation filters on accepted queues", () => {
     // actual head skips, not a mock or another call to the setter under test.
     fs.writeFileSync(before.file, JSON.stringify({ ...before.saved, items: skippedItems }));
     const again = setup(root, 10).actors;
-    await waitFor(() => again.status(actor.id).queued === 0 && filtered(again, actor.id).length === 12);
+    await waitFor(() => again.status(actor.id).queued === 0 && filtered(again, actor.id).length === 6);
     expect(filtered(again, actor.id).slice(-6).map(({ source, reason, data }) => ({ source, reason, data }))).toEqual(receipts);
+    expect(deadLetterLines(root, actor.id)).toHaveLength(6); // the held copies wait while the filter skips them
     expect(queueSnapshot(root, actor.id).saved.processedKeys).toEqual(after.processedKeys);
     expect(runDirs(root, actor.id)).toHaveLength(2);
   }, 30_000);
@@ -326,15 +335,16 @@ describe("setting activation filters on accepted queues", () => {
     const matches = new Set([0, 2, 3, 5, 7, 9]);
     for (let index = 0; index < 10; index++) await queuedEvent(mesh, index, matches.has(index));
     await waitFor(() => actors.status(actor.id).queued === 10); // two in queue, eight in overflow
-    const changed = await actors.setActivationFilter(actor.id, WAIT_FILTER);
-    expect(changed).toMatchObject({ queued: 4, filterSkipped: { count: 6 } });
+    const changed = await actors.setActivationFilter(actor.id, WAIT_FILTER, undefined, undefined, undefined, DROP_QUEUED);
+    expect(changed).toMatchObject({ queued: 4, movedToDeadLetter: 6, filterSkipped: { count: 0 } });
     expect(queueSnapshot(root, actor.id).saved.items.filter(item => item.source.startsWith("mesh:")).map(item => (item.payload.data as { marker: string }).marker))
       .toEqual(["event-1", "event-4", "event-6", "event-8"]);
     release();
     await waitFor(() => actors.status(actor.id).status === "idle" && actors.messages(actor.id).filter(message => message.direction === "out" && message.source.startsWith("mesh:")).length === 4);
     expect(runTasks(root, actor.id).map(task => task.match(/"marker": "([^"]+)"/)?.[1]).filter(Boolean))
       .toEqual(["event-1", "event-4", "event-6", "event-8"]);
-    expect(actors.status(actor.id).filterSkipped.count).toBe(6);
+    expect(actors.status(actor.id).filterSkipped.count).toBe(0);
+    expect(deadLetterLines(root, actor.id)).toHaveLength(6);
   }, 30_000);
 
   it("replays a pre-existing dead letter exactly once when pruning frees queue and overflow", async () => {
@@ -346,12 +356,15 @@ describe("setting activation filters on accepted queues", () => {
     const deadLetter = path.join(root, "actors", actor.id, "dead-letter.jsonl");
     await waitFor(() => actors.status(actor.id).queued === 18 && fs.existsSync(deadLetter) && fs.readFileSync(deadLetter, "utf8").includes(real.id));
     expect(fs.readFileSync(deadLetter, "utf8").trim().split("\n")).toHaveLength(1);
-    const changed = await actors.setActivationFilter(actor.id, WAIT_FILTER);
-    expect(changed).toMatchObject({ queued: 1, filterSkipped: { count: 18 } });
+    const changed = await actors.setActivationFilter(actor.id, WAIT_FILTER, undefined, undefined, undefined, DROP_QUEUED);
+    expect(changed).toMatchObject({ queued: 1, movedToDeadLetter: 18, filterSkipped: { count: 0 } });
     expect(queueSnapshot(root, actor.id).saved.items.filter(item => item.source.startsWith("mesh:")).map(item => item.payload.id)).toEqual([real.id]);
-    expect(fs.existsSync(deadLetter)).toBe(false);
+    const held = deadLetterLines(root, actor.id).map(line => JSON.parse(line) as { event: MeshEvent; heldBy?: unknown });
+    expect(held).toHaveLength(18);
+    expect(held.every(entry => entry.heldBy && entry.event.id !== real.id)).toBe(true);
     await actors.setActivationFilter(actor.id, WAIT_FILTER); // no second replay on re-apply
     expect(queueSnapshot(root, actor.id).saved.items.filter(item => item.source.startsWith("mesh:")).map(item => item.payload.id)).toEqual([real.id]);
+    expect(deadLetterLines(root, actor.id)).toHaveLength(18);
     release();
     await waitFor(() => actors.status(actor.id).status === "idle" && actors.messages(actor.id).some(message => message.direction === "out" && message.source === "mesh:filter-queued.work"));
     expect(runDirs(root, actor.id)).toHaveLength(2); // active caller plus the one replayed real event

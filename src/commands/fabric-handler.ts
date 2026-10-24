@@ -482,17 +482,23 @@ export async function runFabricCommand(
     return;
   }
   if (command === "stop") {
-    const id = argumentsList[0];
+    // smarty-dev#16416: --drop-queued archives an actor's queued work instead of refusing the stop.
+    const dropQueued = argumentsList.includes("--drop-queued");
+    const id = argumentsList.find((argument) => argument !== "--drop-queued");
     if (!id) {
-      context.ui.notify("Usage: /fabric stop <id>", "warning");
+      context.ui.notify("Usage: /fabric stop <id> [--drop-queued]", "warning");
       return;
     }
     const actor = state.actors
       .list()
       .find((candidate) => candidate.id.startsWith(id) || candidate.name === id);
     if (actor) {
-      await state.actors.stop(actor.id);
-      context.ui.notify(`Stopped Fabric actor ${actor.id.slice(0, 8)}`, "info");
+      try {
+        const stopped = await state.actors.stop(actor.id, undefined, false, "actors.stop", dropQueued ? { dropQueued: true } : {});
+        context.ui.notify(`Stopped Fabric actor ${actor.id.slice(0, 8)}${stopped.stoppedQueue ? `; queued work archived to ${stopped.stoppedQueue.archive}` : ""}`, "info");
+      } catch (error) {
+        context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
       return;
     }
     const agent = state.agents.list().find((candidate) => candidate.id.startsWith(id));

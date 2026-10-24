@@ -1123,7 +1123,9 @@ export class AgentMessageRouter {
         if (ownership && !ownership.local) {
           return { accepted: false, error: `Participant ${actor.id} is owned by ${ownership.ownerHostId}` };
         }
-        await this.actorManager.stop(actor.id);
+        // smarty-dev#16416: a remote stop opts in to archiving queued work with data.dropQueued.
+        await this.actorManager.stop(actor.id, undefined, false, "actors.stop",
+          (command.data as { dropQueued?: unknown } | undefined)?.dropQueued === true ? { dropQueued: true } : {});
         this.participants.scheduleRefresh();
         return { accepted: true, messageId: command.commandId };
       } catch (error) {

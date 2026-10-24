@@ -14,6 +14,7 @@ import { actorActivationIdentityFromEnvironment, type FabricActorActivationIdent
 import { slotAdmissionFor } from "../actors/slot-admission.js";
 import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
+import type { FabricActorStopOptions } from "../actors/types.js";
 import { isFabricActorHostEvent, FabricActorBatchPolicyError, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
 import { normalizeActorSlotClaim } from "../actors/slot-claim.js";
 import { normalizeActorActivationFilter } from "../actors/activation-filter.js";
@@ -1400,6 +1401,9 @@ export class AgentsProvider implements FabricProvider {
       }
       case "stop": {
         const id = String(args.id);
+        if (args.dropQueued !== undefined && typeof args.dropQueued !== "boolean") throw new Error("dropQueued must be a boolean");
+        // smarty-dev#16416: every actor stop route carries the same explicit opt-in.
+        const stopOptions = args.dropQueued === true ? { dropQueued: true as const } : {};
         return this.#router.withStopDirectory(id, async () => {
           // Only canonical process-owned tasks/Main bypass actor classification.
           // Resident and foreign actors retain the root identity and request fence.
@@ -1415,11 +1419,21 @@ export class AgentsProvider implements FabricProvider {
                 throw new ResidentActorAuthorizationError();
               }
               const resident = await this.#residentActorOwner(id, context.signal);
-              if (resident) return this.#setResidentActor(resident, { operation: "stop", id: resident.id }, context);
+              if (resident) return this.#setResidentActor(resident, { operation: "stop", id: resident.id, ...stopOptions }, context);
             }
           }
-          return this.#stopParticipant(id, context);
+          return this.#stopParticipant(id, context, stopOptions);
         }, context.signal);
+      }
+      case "requeueArchived": {
+        const id = String(args.id);
+        if (typeof args.archive !== "string" || !args.archive.trim()) throw new Error("requeueArchived requires archive: a stop archive path");
+        const resident = await this.#residentActorOwner(id, context.signal);
+        if (resident) {
+          return resident.client.requeueArchived({ operation: "requeueArchived", id: resident.id, archive: args.archive },
+            context.signal, this.#residentActorCaller(context));
+        }
+        return this.actorManager.requeueArchived(id, args.archive, () => throwIfExecutionExpired(context));
       }
       case "cleanup": {
         const id = String(args.id);
@@ -1766,14 +1780,17 @@ export class AgentsProvider implements FabricProvider {
         const replayAge = deadLetterReplayMaxAgeMs === undefined ? {} : { deadLetterReplayMaxAgeMs };
         const expiresAt = args.expiresAt;
         if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))) throw new Error("expiresAt must be finite epoch milliseconds");
+        if (args.dropQueued !== undefined && typeof args.dropQueued !== "boolean") throw new Error("dropQueued must be a boolean");
         if (args.scope === "global") {
           if (expiresAt !== undefined) throw new Error("expiresAt is only supported for live actors");
+          if (args.dropQueued !== undefined) throw new Error("dropQueued is only supported for live actors");
           return this.globalActors.update(String(args.id), { activationFilter, ...replayAge });
         }
         const expiry = expiresAt === undefined ? {} : { expiresAt };
+        const dropQueued = args.dropQueued === true ? { dropQueued: true as const } : {};
         const resident = await this.#residentActorOwner(String(args.id), context.signal);
-        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter, ...expiry, ...replayAge }, context);
-        return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit, expiresAt as number | undefined, deadLetterReplayMaxAgeMs);
+        if (resident) return this.#setResidentActor(resident, { operation: "setActivationFilter", id: resident.id, activationFilter, ...expiry, ...replayAge, ...dropQueued }, context);
+        return this.actorManager.setActivationFilter(String(args.id), activationFilter, checkCommit, expiresAt as number | undefined, deadLetterReplayMaxAgeMs, dropQueued);
       }
       case "setTopics": {
         if (args.scope !== undefined && args.scope !== "project" && args.scope !== "global") {
@@ -2275,7 +2292,7 @@ export class AgentsProvider implements FabricProvider {
     return client?.isLive() ? client : undefined;
   }
 
-  async #residentActorOwner(id: string, signal?: AbortSignal): Promise<{ id: string; client: Pick<ResidentActorClient, "setActor" | "actorStatus" | "removeActor"> | Pick<ResidencyClient, "setActor" | "actorStatus" | "removeActor"> } | undefined> {
+  async #residentActorOwner(id: string, signal?: AbortSignal): Promise<{ id: string; client: Pick<ResidentActorClient, "setActor" | "actorStatus" | "removeActor" | "requeueArchived"> | Pick<ResidencyClient, "setActor" | "actorStatus" | "removeActor" | "requeueArchived"> } | undefined> {
     const { actor, participant } = await this.#resolveActorTarget(id, signal);
     const rootId = actor?.rootId ?? participant?.rootId;
     if (rootId !== this.mainAgent.id) return undefined; // foreign session overlays remain caller-local
@@ -2292,6 +2309,10 @@ export class AgentsProvider implements FabricProvider {
     mutation: ResidentActorMutation,
     context: FabricInvocationContext,
   ): Promise<FabricActorInfo> {
+    return resident.client.setActor(mutation, context.signal, this.#residentActorCaller(context));
+  }
+
+  #residentActorCaller(context: FabricInvocationContext): ResidentActorCaller {
     // mainAgent.id is inherited by actors/tasks. Native setters require local
     // execution ownership; proxying must not turn inherited lineage into that authority.
     if (!this.mainAgent.local) throw new ResidentActorAuthorizationError();
@@ -2306,7 +2327,7 @@ export class AgentsProvider implements FabricProvider {
     if (self.kind !== "root" || self.id !== caller.identity.id || self.rootId !== this.mainAgent.id) {
       throw new ResidentActorAuthorizationError();
     }
-    return resident.client.setActor(mutation, context.signal, caller);
+    return caller;
   }
 
   // The shared resident host cannot inherit this process's write confinement;
@@ -2422,7 +2443,7 @@ export class AgentsProvider implements FabricProvider {
     return this.#router.withStopDirectory(id, () => this.#stopParticipant(id, context), context?.signal);
   }
 
-  async #stopParticipant(id: string, context?: FabricInvocationContext): Promise<unknown> {
+  async #stopParticipant(id: string, context?: FabricInvocationContext, options: FabricActorStopOptions = {}): Promise<unknown> {
     if (isProviderParticipantRef(id)) {
       return controlProviderParticipant(this.providerParticipants, this.participants, this.control, id, "stop");
     }
@@ -2447,7 +2468,7 @@ export class AgentsProvider implements FabricProvider {
       const actor = this.actorManager.status(id);
       const ownership = this.#router.resolveStopParticipant(actor.id);
       if (!ownership || ownership.local) {
-        const result = await this.actorManager.stop(actor.id);
+        const result = await this.actorManager.stop(actor.id, undefined, false, "actors.stop", options);
         this.participants.scheduleRefresh();
         return result;
       }
@@ -2472,7 +2493,8 @@ export class AgentsProvider implements FabricProvider {
       participant.ownerHostId,
       participant.id,
       "stop",
-      { ownerIncarnation },
+      // An owning actor host reads data.dropQueued; an older owner ignores it.
+      { ownerIncarnation, ...(options.dropQueued ? { data: { dropQueued: true } } : {}) },
       participant.ownerIdentityId,
       { routedRemoteHost: participant.remoteHost ?? null },
     );

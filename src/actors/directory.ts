@@ -264,6 +264,7 @@ export class ActorDirectory extends ActorManager {
   override dispatchHostEvent(...args: Parameters<ActorManager["dispatchHostEvent"]>): number { return super.dispatchHostEvent(...args) + this.#secondary.dispatchHostEvent(...args); }
   override dispatchObservedHostEvent(...args: Parameters<ActorManager["dispatchObservedHostEvent"]>): number { return super.dispatchObservedHostEvent(...args) + this.#secondary.dispatchObservedHostEvent(...args); }
   override stop(...args: Parameters<ActorManager["stop"]>): ReturnType<ActorManager["stop"]> { return this.#isPrimary(args[0]) ? super.stop(...args) : this.#secondary.stop(...args); }
+  override requeueArchived(...args: Parameters<ActorManager["requeueArchived"]>): ReturnType<ActorManager["requeueArchived"]> { return this.#isPrimary(args[0]) ? super.requeueArchived(...args) : this.#secondary.requeueArchived(...args); }
   override get halted(): boolean { return super.halted && this.#secondary.halted; }
   /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
   override inFlightActorIds(): string[] { return [...super.inFlightActorIds(), ...this.#secondary.inFlightActorIds()]; }

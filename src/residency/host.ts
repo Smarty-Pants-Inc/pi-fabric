@@ -79,7 +79,8 @@ import { DEFAULT_STUCK_PREPARING_MS, STUCK_PREPARING_CHECK_MS } from "../actors/
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { canonicalResidentWakeConfig, residentWakeConfigMatches, residentWakeCapacityAvailable, residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS, ResidentWakeRecoveryReader, type ResidentWakeRecoveryBatch } from "./wake-index.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
-import type { FabricActorInfo } from "../actors/types.js";
+import type { FabricActorInfo, FabricActorRequeueResult } from "../actors/types.js";
+import { FabricActorQueuedWorkError } from "../actors/types.js";
 import type { AgentRunRecord } from "../agents/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager, rootRecordLastSeenMs } from "../agents/manager.js";
@@ -1344,7 +1345,9 @@ export class ResidentHost {
           const caller = this.participants.get(from.id, now, { fresh: true });
           this.#authorizeResidentSetter({ identity: from, hostId: caller?.ownerHostId ?? "" });
         }
-        await this.actors.stop(command.targetId);
+        // smarty-dev#16416: a remote stop opts in to archiving queued work with data.dropQueued.
+        await this.actors.stop(command.targetId, undefined, false, "actors.stop",
+          (command.data as { dropQueued?: unknown } | undefined)?.dropQueued === true ? { dropQueued: true } : {});
         this.participants.scheduleRefresh();
         return { accepted: true, messageId: command.commandId };
       } catch (error) {
@@ -2836,7 +2839,8 @@ export class ResidentHost {
         if ((command.action !== "stop" && command.action !== "remove") ||
             typeof command.id !== "string" || !command.id.trim() ||
             (command.confirmDeadRoot !== undefined && typeof command.confirmDeadRoot !== "string") ||
-            (command.dryRun !== undefined && typeof command.dryRun !== "boolean")) {
+            (command.dryRun !== undefined && typeof command.dryRun !== "boolean") ||
+            (command.dropQueued !== undefined && (typeof command.dropQueued !== "boolean" || command.action !== "stop"))) {
           throw new Error("Invalid resident operator actor request");
         }
         const evidence = readResidentOperatorEvidence(this.config, this.mesh);
@@ -2872,7 +2876,10 @@ export class ResidentHost {
           // Re-read the uncached current lease immediately before each mutation.
           // This is a lease veto, not a proof that no Main exists or can restart.
           const actor = candidates[0]!;
-          const pending = this.actors.stop(actor.id, id => { check(); commit(id); }, true);
+          // smarty-dev#16416: operator stop refuses queued work unless dropQueued (archived); a remove keeps removal semantics.
+          const pending = command.action === "stop"
+            ? this.actors.stop(actor.id, id => { check(); commit(id); }, true, "actors.stop", command.dropQueued === true ? { dropQueued: true } : {})
+            : this.actors.stop(actor.id, id => { check(); commit(id); }, true, "actors.remove");
           boundaryAdmitted?.();
           const stopped = await pending;
           response = command.action === "stop"
@@ -2891,7 +2898,7 @@ export class ResidentHost {
       } else if (command.operation !== "removeActor") {
         if (command.operation === "setInstructions" || command.operation === "setModel" ||
           command.operation === "setThinking" || command.operation === "setBatching" || command.operation === "setActivationFilter" || command.operation === "setTools" ||
-          command.operation === "resetSession" || command.operation === "stop") {
+          command.operation === "resetSession" || command.operation === "stop" || command.operation === "requeueArchived") {
           this.#authorizeResidentSetter(command.caller);
           if (command.operation === "setTools") assertResidentActorToolCeiling(command.tools, command.caller?.toolCeiling);
         }
@@ -2900,6 +2907,7 @@ export class ResidentHost {
           throw new Error(`Resident host does not own root actor ${actor.id}`);
         }
         let updated: FabricActorInfo;
+        let requeued: FabricActorRequeueResult | undefined;
         switch (command.operation) {
           case "actorStatus": updated = actor; break;
           case "setInstructions": {
@@ -2917,19 +2925,26 @@ export class ResidentHost {
             break;
           }
           case "stop": {
-            const pending = this.actors.stop(actor.id, commit, true);
+            const pending = this.actors.stop(actor.id, commit, true, "actors.stop", command.dropQueued === true ? { dropQueued: true } : {});
             boundaryAdmitted?.();
             updated = await pending;
+            break;
+          }
+          case "requeueArchived": {
+            if (typeof command.archive !== "string" || !command.archive.trim()) throw new Error("Invalid resident requeueArchived request");
+            requeued = await this.actors.requeueArchived(actor.id, command.archive, commit);
+            updated = this.actors.status(actor.id);
             break;
           }
           case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope, commit, command.modelReason); break;
           case "setThinking": updated = await this.actors.setThinking(actor.id, command.thinking, command.scope, commit); break;
           case "setBatching": updated = await this.actors.setBatching(actor.id, command, commit); break;
-          case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter, commit, command.expiresAt, command.deadLetterReplayMaxAgeMs); break;
+          case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter, commit, command.expiresAt, command.deadLetterReplayMaxAgeMs,
+            command.dropQueued === true ? { dropQueued: true } : {}); break;
           case "setTools": updated = await this.actors.setTools(actor.id, command.tools, commit); break;
           default: throw new Error("Unknown resident actor operation");
         }
-        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: updated, completedAt: Date.now() };
+        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: updated, ...(requeued ? { requeued } : {}), completedAt: Date.now() };
       } else {
         const pending = this.#removeResidentActor(command.id, requestId, commit);
         boundaryAdmitted?.();
@@ -2973,6 +2988,9 @@ export class ResidentHost {
         ...(error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError || error instanceof ResidentRequestExpiredError
           ? { errorCode: error.code } : {}),
         ...(error instanceof ActorSessionResetCancelledError ? { errorCode: error.code } : {}),
+        ...(error instanceof FabricActorQueuedWorkError ? {
+          errorCode: error.code, queuedWork: { operation: error.operation, actorId: error.actorId, counts: { ...error.counts } },
+        } : {}),
         ...(error instanceof FabricModelDeniedError ? {
           errorCode: error.code, modelDenied: { model: error.model, ...(error.replacement ? { replacement: error.replacement } : {}) },
         } : {}),

@@ -9,6 +9,7 @@ import { AgentWaitBoundError, describeWaitBound } from "./wait-bound.js";
 import { admitModelException, appendOpusPolicyLog, FabricModelExceptionDeniedError, isClaudeModel, type ModelExceptionEntry } from "./model-policy-log.js";
 import { normalizeAgentRequires } from "./input-validation.js";
 import { AgentInputError, normalizeAgentCapabilityTokens } from "../host-compatibility.js";
+import { validateAgentExtensionPaths } from "./extension-paths.js";
 import {
   childThinkingBounds,
   clampThinkingToBounds,
@@ -809,6 +810,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   fabricSessionId?: string;
   branch?: string;
   worktree?: string;
+  extensionPaths?: AgentRunRecord["extensionPaths"];
   worktreeResult?: AgentWorktreeResult;
   nestedSnapshot?: AgentRunRecord[];
   nestedSnapshotAt?: number;
@@ -2155,6 +2157,23 @@ export class AgentManager {
    * callerReturnAddress is a validated resident caller snapshot, never a task request field.
    */
   spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, routerAdmission?: SpawnRouterAdmission): Promise<AgentHandleInfo> {
+    request = { ...request };
+    delete request.extensionPathReceipts;
+    if (request.extensionPaths !== undefined) {
+      const runner = request.runner ?? this.config.runner;
+      const transport = request.transport ?? this.config.transport;
+      if (runner !== "pi") throw new AgentInputError("extensionPaths", "agents.spawn extensionPaths requires the Pi runner; no worker started");
+      if (transport !== "process" && transport !== "auto") throw new AgentInputError("extensionPaths", `agents.spawn extensionPaths requires process transport, not ${transport}; no worker started`);
+      if (request.recursive === true) throw new AgentInputError("extensionPaths", "agents.spawn extensionPaths cannot be combined with recursive: true; no worker started");
+      if (!Array.isArray(request.tools) || request.tools.some(tool => typeof tool !== "string" || !tool.trim())) {
+        throw new AgentInputError("extensionPaths", "agents.spawn extensionPaths requires an explicit tools allow-list; no worker started");
+      }
+      const receipts = validateAgentExtensionPaths(request.extensionPaths, this.config.extensionPins, this.config.extensionRoots, this.cwd);
+      request.extensionPaths = receipts.map(receipt => receipt.path);
+      request.extensionPathReceipts = receipts;
+      const needs = normalizeAgentCapabilityTokens(request.needs) ?? [];
+      request.needs = [...new Set([...needs, "local"])];
+    }
     // Only a native argument may carry caller authority. Task-supplied fields are ignored.
     routerAdmission = routerAdmission && { ...routerAdmission,
       targetRootId: this.#mainAgentId ?? routerAdmission.targetRootId,
@@ -2168,7 +2187,6 @@ export class AgentManager {
     const probe = request.residentStartupProbe === true && (request.runner ?? this.config.runner) === "pi" &&
       (request.transport ?? this.config.transport) === "process" && !request.sessionSeed && !request.actorId;
     if (request.residentStartupProbe && !probe) return this.#recordSpawnRouterStartFailed(request, routerAdmission).then(() => { throw new Error("Invalid resident startup probe"); });
-    request = { ...request };
     const returnAddress = callerReturnAddress && structuredClone(callerReturnAddress);
     const routerDecisionId = (request as AgentRunRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
     const routerStart = { settled: typeof routerDecisionId !== "string" || routerDecisionId.length === 0, admission: routerAdmission };
@@ -2822,6 +2840,9 @@ export class AgentManager {
             )
           : routedActor ? request.sessionFile : routeDispatch?.bindSession(agentCwd) ?? request.sessionFile;
         const adapter = await this.#resolveTransport(request.transport ?? this.config.transport);
+        if (request.extensionPaths !== undefined && adapter.kind !== "process") {
+          throw new AgentInputError("extensionPaths", `agents.spawn extensionPaths requires process transport, not ${adapter.kind}; no worker started`);
+        }
         const runRoute = createRunRouteMetadata({ ...routeFacts, runner, transport: adapter.kind });
         let timeoutMs = effectiveAgentTimeoutMs(
           this.config.timeoutMs,
@@ -2836,8 +2857,8 @@ export class AgentManager {
         const serializedThinkingBounds = serializeThinkingBounds(thinkingBounds);
         const nice = effectiveAgentNice(this.config.nice ?? 0, request.nice);
         const recursive = capabilities.recursiveFabric && request.recursive === true;
-        const extensions = recursive ? true : (request.extensions ?? this.config.extensions);
-        const inheritedSessionPins = (runner === "pi" || runner === "pi-durable") && extensions
+        const extensions = request.extensionPaths !== undefined ? true : recursive ? true : (request.extensions ?? this.config.extensions);
+        const inheritedSessionPins = request.extensionPaths === undefined && (runner === "pi" || runner === "pi-durable") && extensions
           ? this.#inheritedSessionPins(request)
           : undefined;
         // In a full-code parent every extension-enabled Pi child runs Fabric
@@ -2846,7 +2867,7 @@ export class AgentManager {
         // surface, and a non-full-code parent keeps the historical behavior.
         // Recursive children additionally keep their recursive permission
         // surface (the "agent" granted risk) below.
-        const inheritedFullCodeMode = capabilities.recursiveFabric && this.#fullCodeMode && extensions;
+        const inheritedFullCodeMode = request.extensionPaths === undefined && capabilities.recursiveFabric && this.#fullCodeMode && extensions;
         const componentGuidance = recursive
           ? undefined
           : this.#resolveParticipantGuidance?.({ ...(model ? { model } : {}), runner })?.trim();
@@ -2979,6 +3000,7 @@ export class AgentManager {
               placementHost: placementAdmission.placementHost, expectedSeconds: placementAdmission.expectedSeconds } : {}),
             ...(request.actorId ? { actorId: request.actorId } : {}),
             ...(request.actorName ? { actorName: request.actorName } : {}),
+            ...(request.extensionPathReceipts ? { extensionPaths: request.extensionPathReceipts } : {}),
             ...(this.#spawner ? { spawner: this.#spawner } : {}),
             ...(this.#mainAgentId ? { mainAgentId: this.#mainAgentId } : {}),
             ...(this.#fabricSessionId ? { fabricSessionId: this.#fabricSessionId } : {}),
@@ -3074,6 +3096,7 @@ export class AgentManager {
             : []),
           "--extensions",
           String(extensions),
+          ...(request.extensionPathReceipts ? ["--extension-paths", JSON.stringify(request.extensionPathReceipts)] : []),
           "--tools",
           JSON.stringify(tools),
           "--granted-risks",
@@ -3087,7 +3110,7 @@ export class AgentManager {
           "--route-class", runRoute.routeClass,
           "--route-class-source", runRoute.routeClassSource,
           ...(runRoute.protected !== undefined ? ["--protected", String(runRoute.protected)] : []),
-          ...(recursive || inheritedFullCodeMode || requiresFabricKernel
+          ...(request.extensionPaths === undefined && (recursive || inheritedFullCodeMode || requiresFabricKernel)
             ? ["--fabric-extension", this.#fabricExtensionPath]
             : []),
           ...(model ? ["--model", model] : []),
@@ -3230,6 +3253,7 @@ export class AgentManager {
           runnerAdapter,
           ...(kernel ? { kernel } : {}),
           recursive,
+          ...(request.extensionPathReceipts ? { extensionPaths: structuredClone(request.extensionPathReceipts) } : {}),
           residency,
           cwd: agentCwd,
           statusFile,
@@ -3255,6 +3279,7 @@ export class AgentManager {
           ...(routePin ? { routePin } : {}),
           ...(request.actorId ? { actorId: request.actorId } : {}),
           ...(request.actorName ? { actorName: request.actorName } : {}),
+          ...(request.extensionPathReceipts ? { extensionPaths: request.extensionPathReceipts } : {}),
           ...(this.#spawner ? { spawner: this.#spawner } : {}),
           ...(request.capabilityRequirements
             ? { capabilityRequirements: [...request.capabilityRequirements] }
@@ -3337,6 +3362,7 @@ export class AgentManager {
             queued = {
               info: { id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
                 cwd: agentCwd, residency, recursive: request.recursive === true,
+                ...(request.extensionPathReceipts ? { extensionPaths: structuredClone(request.extensionPathReceipts) } : {}),
                 ...prompt,
                 ...(request.actorId ? { actorId: request.actorId } : {}),
                 ...(request.actorName ? { actorName: request.actorName } : {}) },
@@ -3422,6 +3448,7 @@ export class AgentManager {
       ...createRunRouteMetadata({ ...routeFacts, runner, transport: request.transport ?? this.config.transport }),
       id, name, status: "queued", runner, transport: request.transport ?? this.config.transport,
       cwd: selectedCwd, residency, recursive: request.recursive === true,
+      ...(request.extensionPathReceipts ? { extensionPaths: structuredClone(request.extensionPathReceipts) } : {}),
       ...prompt,
       ...(kernel ? { kernel } : {}),
       ...(model ? { model } : {}),
@@ -7591,7 +7618,7 @@ export class AgentManager {
       ? true
       : (request.extensions ?? this.config.extensions);
     if (
-      runner.capabilities.recursiveFabric &&
+      request.extensionPaths === undefined && runner.capabilities.recursiveFabric &&
       (request.recursive || ((this.#fullCodeMode || requiresFabricKernel) && extensions))
     ) {
       tools.push("fabric_exec");
@@ -7748,6 +7775,7 @@ export class AgentManager {
         : {}),
       ...(managed.capabilityDigest ? { capabilityDigest: managed.capabilityDigest } : {}),
       ...(managed.recursive ? { recursive: true } : {}),
+      ...(managed.extensionPaths ? { extensionPaths: structuredClone(managed.extensionPaths) } : {}),
       ...(managed.runnerSessionId ? { runnerSessionId: managed.runnerSessionId } : {}),
       ...(managed.transport.sessionId ? { sessionId: managed.transport.sessionId } : {}),
       ...(managed.transport.attachCommand
@@ -7860,6 +7888,7 @@ export class AgentManager {
         : {}),
       ...(managed.capabilityDigest ? { capabilityDigest: managed.capabilityDigest } : {}),
       ...(managed.recursive ? { recursive: true } : {}),
+      ...(managed.extensionPaths ? { extensionPaths: structuredClone(managed.extensionPaths) } : {}),
       ...(runnerSessionId ? { runnerSessionId } : {}),
       ...(this.#mainAgentId ? { mainAgentId: this.#mainAgentId } : {}),
       ...(this.#fabricSessionId ? { fabricSessionId: this.#fabricSessionId } : {}),

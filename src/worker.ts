@@ -481,9 +481,15 @@ const main = async (): Promise<void> => {
   // Resource selection must reach Pi's pre-load discovery boundary, not just -e.
   // Keep the CLI lifecycle for activation/actors and SDK task retry semantics.
   let piReleaseSdk: string | undefined;
+  const explicitExtensionPaths = options.extensionPaths !== undefined;
+  let verifyExplicitExtensions: (() => void) | undefined;
+  if (explicitExtensionPaths) {
+    const verifier = await import("./agents/extension-paths.js");
+    verifyExplicitExtensions = () => verifier.verifyAgentExtensionPathReceipts(options.extensionPaths!);
+  }
   const pinnedFabricExtension = options.fabricRelease
     ? path.join(options.fabricRelease, "dist/index.js") : options.fabricExtensionPath;
-  if (options.runner === "pi" && options.fabricExtensionPath && pinnedFabricExtension) {
+  if (options.runner === "pi" && !explicitExtensionPaths && options.fabricExtensionPath && pinnedFabricExtension) {
     const profileModule = import.meta.url.endsWith(".ts") ? "./worker/retry-profile.ts" : "./worker/retry-profile.js";
     const { resolveRetrySdk } = await import(profileModule) as typeof import("./worker/retry-profile.js");
     piReleaseSdk = piRetrySdk ?? resolveRetrySdk(options.piBinary);
@@ -496,8 +502,8 @@ const main = async (): Promise<void> => {
   // so its guard policy survives. Native launchers retain their own discovery.
   // The release fence is for the pi CLI launcher; the durable host is Fabric's own
   // pinned SDK and keeps native discovery (upstream pi-durable).
-  const opaqueFabricLauncher = options.runner === "pi" && options.fabricExtensionPath && !piReleaseSdk;
-  if (!options.extensions || opaqueFabricLauncher) piArguments.push("--no-extensions");
+  const opaqueFabricLauncher = options.runner === "pi" && !explicitExtensionPaths && options.fabricExtensionPath && !piReleaseSdk;
+  if (!options.extensions || opaqueFabricLauncher || explicitExtensionPaths) piArguments.push("--no-extensions");
   if (options.judgment) piArguments.push("--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--no-approve", "--no-auto-compaction");
   if (options.residentStartupProbe) {
     // Explicit Fabric -e still loads. Do not execute unrelated profile hooks,
@@ -518,7 +524,7 @@ const main = async (): Promise<void> => {
     // guard before any other hook can start summarization work.
     piArguments.push("-e", hookPath, "--no-auto-compaction");
   }
-  if (opaqueFabricLauncher && options.extensions && !options.residentStartupProbe) {
+  if (opaqueFabricLauncher && options.extensions && !options.residentStartupProbe && !explicitExtensionPaths) {
     const profileModule = import.meta.url.endsWith(".ts") ? "./worker/profile-extensions.ts" : "./worker/profile-extensions.js";
     const { resolveProfileExtensions, ProfileSettingsError } = await import(profileModule) as typeof import("./worker/profile-extensions.js");
     let profile: ReturnType<typeof resolveProfileExtensions>;
@@ -544,7 +550,8 @@ const main = async (): Promise<void> => {
     appendLog(`${JSON.stringify({ type: "fabric_profile_extensions", names: profile.names, loadedCount: profile.names.length, skippedCount: profile.warnings.length })}\n`);
     writeRunRecord(options.statusFile, record);
   }
-  if (options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
+  if (!explicitExtensionPaths && options.fabricExtensionPath) piArguments.push("-e", options.fabricExtensionPath);
+  for (const extension of options.extensionPaths ?? []) piArguments.push("-e", extension.path);
   const deliveryHook = fileURLToPath(new URL(
     import.meta.url.endsWith(".ts") ? "./worker/principal-delivery.ts" : "./worker/principal-delivery.js", import.meta.url));
   piArguments.push("-e", deliveryHook);
@@ -721,7 +728,11 @@ const main = async (): Promise<void> => {
     return { PI_SESSION_ID: header.id, PI_SESSION_FILE: nativeFile };
   };
   let taskResuming = false;
-  const spawnChild = (): ChildProcess => spawnCli(piRetrySdk ? taskEntryPath : piReleaseSdk ? releaseEntryPath : childBinary,
+  const spawnChild = (): ChildProcess => {
+    // Re-hash immediately before Pi loads any extension code. The module is
+    // loaded only for explicit paths, keeping ordinary worker startup unchanged.
+    verifyExplicitExtensions?.();
+    return spawnCli(piRetrySdk ? taskEntryPath : piReleaseSdk ? releaseEntryPath : childBinary,
     piRetrySdk ? [piRetrySdk, String(recoveryScale), ...childArguments]
       : piReleaseSdk ? [piReleaseSdk, pinnedFabricExtension!, ...childArguments] : childArguments, {
     cwd: options.cwd,
@@ -799,7 +810,8 @@ const main = async (): Promise<void> => {
       PI_FABRIC_EXTENSION_MODEL: undefined,
     },
     stdio: piRetrySdk ? ["pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe"],
-  });
+    });
+  };
   // Every provider resume is a new execution obligation. Drain each attempt
   // before replacement, but retain the worker's custody until the whole run ends.
   let finishingStartedAt: number | undefined;

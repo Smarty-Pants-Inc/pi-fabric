@@ -20,11 +20,23 @@ import { modelExceptionGrant } from "./helpers/model-exceptions.js";
 
 const temporaryDirectories: string[] = [];
 const originalCompactionEngineEnv = process.env.PI_FABRIC_COMPACTION_ENGINE;
+const supportsUidOwnership = typeof process.getuid === "function";
 
 const temporaryDirectory = (): string => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-config-"));
   temporaryDirectories.push(directory);
   return directory;
+};
+
+const fakePathOwner = <T>(file: string, uid: number, run: () => T): T => {
+  const original = fs.lstatSync;
+  const owner = vi.spyOn(fs, "lstatSync").mockImplementation(((candidate: fs.PathLike, ...args: unknown[]) => {
+    const stats = (original as (...values: unknown[]) => fs.Stats)(candidate, ...args);
+    return path.resolve(String(candidate)) === file
+      ? Object.assign(Object.create(Object.getPrototypeOf(stats)) as fs.Stats, stats, { uid })
+      : stats;
+  }) as typeof fs.lstatSync);
+  try { return run(); } finally { owner.mockRestore(); }
 };
 
 afterEach(() => {
@@ -170,20 +182,101 @@ describe("host-only model exception file location", () => {
   });
 });
 
-describe("host-only actor instruction root (#3819)", () => {
-  it("leaves the default implicit and normalizes the configured root", () => {
+describe("host-only actor instruction and extension pins", () => {
+  it("leaves defaults implicit, preserves the extensions boolean, and normalizes pins and optional roots", () => {
+    const pin = { id: "offline-probe", path: "/host/extensions/probe.mjs", sha256: "a".repeat(64) };
     expect(normalizeFabricConfig({}).agents.instructionsRoot).toBeUndefined();
     expect(normalizeFabricConfig({ agents: { instructionsRoot: " /factory/current " } }).agents.instructionsRoot).toBe("/factory/current");
     expect(normalizeFabricConfig({ agents: { instructionsRoot: " " } }).agents.instructionsRoot).toBeUndefined();
+    expect(normalizeFabricConfig({}).agents.extensionRoots).toBeUndefined();
+    expect(normalizeFabricConfig({}).agents.extensionPins).toBeUndefined();
+    expect(normalizeFabricConfig({ agents: { extensions: false } }).agents.extensions).toBe(false);
+    expect(normalizeFabricConfig({ agents: { extensionRoots: [" /host/extensions "] } }).agents.extensionRoots).toEqual(["/host/extensions"]);
+    expect(normalizeFabricConfig({ agents: { extensionPins: [pin] } }).agents.extensionPins).toEqual([pin]);
+    expect(() => normalizeFabricConfig({ agents: { extensionPins: [{ ...pin, sha256: "invalid" }] } })).toThrow(/extensionPins\[0\]\.sha256/);
+    expect(() => normalizeFabricConfig({ agents: { extensionPins: [pin, pin] } })).toThrow(/duplicate id/);
   });
-  it.each([true, false])("cannot be widened by workspace config (trusted: %s)", projectTrusted => {
+  it("fails config loading rather than dropping malformed roots or pins", () => {
     const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const configPath = path.join(agentDir, "fabric.json");
+    for (const extensionRoots of [["/opt/pi/extensions", " "], ["/opt/pi/extensions", 42], "/opt/pi/extensions"] as unknown[]) {
+      fs.writeFileSync(configPath, JSON.stringify({ agents: { extensionRoots } }));
+      expect(() => loadFabricConfig({ cwd, agentDir, projectTrusted: false }))
+        .toThrow(/Invalid agents\.extensionRoots: expected an array of non-empty path strings/);
+    }
+    for (const extensionPins of [[null], [{ id: "probe", path: "/host/probe.mjs", sha256: "invalid" }], "not-an-array"] as unknown[]) {
+      fs.writeFileSync(configPath, JSON.stringify({ agents: { extensionPins } }));
+      expect(() => loadFabricConfig({ cwd, agentDir, projectTrusted: false })).toThrow(/Invalid agents\.extensionPins/);
+    }
+    const validRoot = path.join(agentDir, "valid-root");
+    fs.mkdirSync(validRoot);
+    fs.writeFileSync(configPath, JSON.stringify({ agents: { extensionRoots: [` ${validRoot} `] } }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted: false }).agents.extensionRoots).toEqual([fs.realpathSync(validRoot)]);
+    fs.writeFileSync(configPath, JSON.stringify({ agents: {} }));
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted: false }).agents.extensionRoots).toBeUndefined();
+  });
+  it.skipIf(!supportsUidOwnership).each([true, false])("cannot be widened by workspace config (trusted: %s)", projectTrusted => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const hostExtensions = path.join(agentDir, "approved-extensions");
+    const hostPinPath = path.join(hostExtensions, "probe.mjs");
+    const hostPin = { id: "host-probe", path: hostPinPath, sha256: "b".repeat(64) };
+    fs.mkdirSync(hostExtensions);
+    fs.writeFileSync(hostPinPath, "export default () => {};\n");
     fs.mkdirSync(path.join(cwd, ".pi"));
-    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/host/factory" } }));
-    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/" } }));
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/host/factory", extensionRoots: [hostExtensions], extensionPins: [hostPin] } }));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ agents: { instructionsRoot: "/", extensionRoots: ["/"], extensionPins: [{ id: "workspace-probe", path: "/workspace/evil.mjs", sha256: "c".repeat(64) }] } }));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.instructionsRoot).toBe("/host/factory");
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.extensionRoots).toEqual([fs.realpathSync(hostExtensions)]);
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.extensionPins).toEqual([hostPin]);
     fs.unlinkSync(path.join(agentDir, "fabric.json"));
     expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.instructionsRoot).toBeUndefined();
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.extensionRoots).toBeUndefined();
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted }).agents.extensionPins).toBeUndefined();
+  });
+  it.skipIf(!supportsUidOwnership)("accepts root-owned pins and rejects another non-root owner at config load", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const artifact = path.join(agentDir, "root-extension.mjs");
+    const pin = { id: "root-extension", path: artifact, sha256: "e".repeat(64) };
+    fs.writeFileSync(artifact, "export default () => {};\n");
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { extensionPins: [pin] } }));
+
+    expect(fakePathOwner(artifact, 0, () => loadFabricConfig({ cwd, agentDir, projectTrusted: false }).agents.extensionPins))
+      .toEqual([pin]);
+    expect(() => fakePathOwner(artifact, process.getuid!() + 1,
+      () => loadFabricConfig({ cwd, agentDir, projectTrusted: false })))
+      .toThrow(/not owned by root or the current UID/);
+  });
+  it.skipIf(!supportsUidOwnership)("rejects a pinned artifact path that is not its exact realpath", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const realFile = path.join(agentDir, "real-extension.mjs");
+    const alias = path.join(agentDir, "extension-alias.mjs");
+    fs.writeFileSync(realFile, "export default () => {};\n");
+    fs.symlinkSync(realFile, alias);
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { extensionPins: [{ id: "alias", path: alias, sha256: "d".repeat(64) }] } }));
+    expect(() => loadFabricConfig({ cwd, agentDir, projectTrusted: false }))
+      .toThrow(/Invalid agents\.extensionPins\[0\]\.path: must equal its realpath/);
+  });
+  it.skipIf(!supportsUidOwnership)("rejects an extension root beneath a group-writable parent at config load", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const unsafeParent = path.join(cwd, "group-writable-parent");
+    const extensionRoot = path.join(unsafeParent, "extensions");
+    fs.mkdirSync(extensionRoot, { recursive: true, mode: 0o700 });
+    fs.chmodSync(unsafeParent, 0o777);
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { extensionRoots: [extensionRoot] } }));
+    expect(() => loadFabricConfig({ cwd, agentDir, projectTrusted: false }))
+      .toThrow(/Invalid agents\.extensionRoots\[0\].*group-writable-parent.*group- or world-writable/);
+  });
+  it.skipIf(!supportsUidOwnership)("rejects an extension root reached through a symlinked parent at config load", () => {
+    const cwd = temporaryDirectory(); const agentDir = temporaryDirectory();
+    const realParent = path.join(cwd, "real-parent");
+    const extensionRoot = path.join(realParent, "extensions");
+    const symlinkParent = path.join(cwd, "symlink-parent");
+    fs.mkdirSync(extensionRoot, { recursive: true });
+    fs.symlinkSync(realParent, symlinkParent, "dir");
+    const configuredRoot = path.join(symlinkParent, "extensions");
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { extensionRoots: [configuredRoot] } }));
+    expect(() => loadFabricConfig({ cwd, agentDir, projectTrusted: false }))
+      .toThrow(/Invalid agents\.extensionRoots\[0\].*symlink/);
   });
 });
 describe("host-only processSlice (#4383)", () => {

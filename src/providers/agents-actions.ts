@@ -86,6 +86,12 @@ const runProperties = {
       "Optional longer wall-clock limit in milliseconds. Omit to use agents.timeoutMs (60 minutes by default); values below the configured default are ignored.",
   },
   extensions: { type: "boolean" },
+  extensionPaths: {
+    type: "array",
+    maxItems: 4,
+    items: { type: "string", minLength: 1, maxLength: 4096 },
+    description: "Host-pinned Pi extension IDs or exact canonical paths. Loads only the selected pins, disables default extension discovery, and requires tools to name every admitted tool. The host agents.extensionPins SHA-256 is verified at admission and again before worker load; optional agents.extensionRoots only adds a path constraint.",
+  },
   recursive: { type: "boolean" },
   cwd: {
     type: "string",

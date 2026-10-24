@@ -22,6 +22,22 @@ const required = (args: Map<string, string>, name: string): string => {
 const optional = (args: Map<string, string>, name: string): string | undefined =>
   args.get(name) || undefined;
 
+const parseExtensionPathReceipts = (value: unknown): AgentWorkerOptions["extensionPaths"] => {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 4 || value.some(entry =>
+    typeof entry !== "object" || entry === null || Array.isArray(entry) ||
+    typeof (entry as Record<string, unknown>).path !== "string" ||
+    !(entry as Record<string, unknown>).path ||
+    typeof (entry as Record<string, unknown>).sha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test((entry as Record<string, unknown>).sha256 as string))) {
+    throw new Error("Invalid worker extension path receipts");
+  }
+  return value.map(entry => ({
+    path: (entry as Record<string, unknown>).path as string,
+    sha256: (entry as Record<string, unknown>).sha256 as string,
+  }));
+};
+
 const nonNegative = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 
@@ -97,6 +113,14 @@ export const parseWorkerOptions = (
   const thinking = optional(args, "thinking");
   const thinkingBounds = optional(args, "thinking-bounds");
   const fabricExtensionPath = optional(args, "fabric-extension");
+  const extensionPathsSource = optional(args, "extension-paths");
+  let extensionPaths: AgentWorkerOptions["extensionPaths"];
+  if (extensionPathsSource !== undefined) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(extensionPathsSource); } catch { /* rejected below */ }
+    extensionPaths = parseExtensionPathReceipts(parsed);
+    if (!extensionPaths) throw new Error("Invalid worker extension path receipts");
+  }
   const fabricRelease = optional(args, "fabric-release");
   const schemaFile = optional(args, "schema-file");
   const replyTool = optional(args, "reply-tool") === "true";
@@ -273,6 +297,7 @@ export const parseWorkerOptions = (
     grantedRisks: JSON.parse(required(args, "granted-risks")) as string[],
     transport: required(args, "transport") as AgentWorkerOptions["transport"],
     ...(fabricExtensionPath ? { fabricExtensionPath } : {}),
+    ...(extensionPaths ? { extensionPaths } : {}),
     ...(model ? { model } : {}),
     ...(modelReason !== undefined ? { modelReason } : {}),
     ...(modelPolicyWarnings?.length ? { modelPolicyWarnings } : {}),

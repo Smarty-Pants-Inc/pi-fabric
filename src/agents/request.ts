@@ -12,6 +12,13 @@ const checkedKernel = (value: unknown): AgentRunRequest["kernel"] => {
   if (value === undefined || value === "inherit" || value === "typescript" || value === "python") return value;
   throw new Error(`Invalid Fabric agent kernel: ${String(value)}`);
 };
+const extensionPathsValue = (value: unknown): string[] | undefined => {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 4 || value.some(entry => typeof entry !== "string" || !entry.trim() || entry.length > 4096)) {
+    throw new Error("Invalid Fabric agent extensionPaths: expected at most four non-empty extension IDs or exact paths");
+  }
+  return [...value] as string[];
+};
 
 /**
  * True when fleet policy would deny the configured selector: the selector itself or any target of the alias it
@@ -71,6 +78,7 @@ export const normalizeAgentRunRequest = (
     : isFabricThinking(defaults.configuredThinking) ? defaults.configuredThinking
     : aliasThinking(defaults.models?.aliases, requestedModel ?? "");
   const tools = stringArray(args.tools);
+  const extensionPaths = extensionPathsValue(args.extensionPaths);
   if (args.complexity !== undefined && args.complexity !== "simple" && args.complexity !== "normal" && args.complexity !== "complex" && args.complexity !== "delicate") {
     throw new Error("Invalid agent complexity: expected simple, normal, complex or delicate");
   }
@@ -120,6 +128,7 @@ export const normalizeAgentRunRequest = (
     ...(typeof args.extensions === "boolean"
       ? { extensions: args.extensions }
       : args.recursive === true ? { extensions: true } : {}),
+    ...(extensionPaths !== undefined ? { extensionPaths } : {}),
     ...(typeof args.recursive === "boolean" ? { recursive: args.recursive } : {}),
     ...(options.allowCwd !== false && typeof args.cwd === "string" ? { cwd: args.cwd } : {}),
     ...(typeof args.worktree === "boolean" ? { worktree: args.worktree } : {}),

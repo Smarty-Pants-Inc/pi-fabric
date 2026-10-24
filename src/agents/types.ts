@@ -96,6 +96,12 @@ export interface AgentSpawner {
   runId?: string;
 }
 
+/** Host-validated extension code admitted to a process child. */
+export interface AgentExtensionPathReceipt {
+  path: string;
+  sha256: string;
+}
+
 export interface AgentRunRequest {
   /** Host-only: the actor queue item this run serves (smarty-dev#8935 recovery of an ENODEV-unconfirmed run). */
   activationId?: string;
@@ -144,6 +150,10 @@ export interface AgentRunRequest {
   tools?: string[];
   timeoutMs?: number;
   extensions?: boolean;
+  /** Explicit host-authorized extension allow-list; unset preserves normal discovery. */
+  extensionPaths?: string[];
+  /** Host-computed path digests; never accepted from normalized guest arguments. */
+  extensionPathReceipts?: AgentExtensionPathReceipt[];
   recursive?: boolean;
   /** Leaf or recursive execution cwd; relative to the immediate caller, independent of project/mesh lineage. */
   cwd?: string;
@@ -285,6 +295,8 @@ export interface AgentRunRecord {
   capabilityRequirements?: string[];
   capabilityDigest?: string;
   recursive?: boolean;
+  /** Host receipt of each explicitly admitted extension path and its host-pinned digest. */
+  extensionPaths?: AgentExtensionPathReceipt[];
   residency?: FabricParticipantResidency;
   startedAt: number;
   updatedAt: number;
@@ -428,6 +440,7 @@ export interface AgentHandleInfo {
   capabilityRequirements?: string[];
   capabilityDigest?: string;
   recursive?: boolean;
+  extensionPaths?: AgentExtensionPathReceipt[];
   residency?: FabricParticipantResidency;
   sessionId?: string;
   runnerSessionId?: string;
@@ -488,6 +501,7 @@ export interface AgentWorkerOptions {
   bashTimeoutSeconds?: number;
   bashIdleSeconds?: number;
   fabricExtensionPath?: string;
+  extensionPaths?: AgentExtensionPathReceipt[];
   routeHeader?: string;
   /** Host-only bounded judge: no ambient resources, compaction or retry. */
   judgment?: boolean;

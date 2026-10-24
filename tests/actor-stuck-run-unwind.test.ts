@@ -13,8 +13,12 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 // agents.stop(runId) answered "Unknown Fabric participant"). The existing stuck-run check saw worker-gone but only
 // alarmed, so every message queued behind that run waited forever. No real worker runs here: agents.run is a fake
 // whose first handle never settles, and the stuck-run check reads that run's worker through spied AgentManager
-// accessors. The retention sweep that runs the check ticks every 20 ms.
+// accessors. The retention sweep that runs the check ticks every 20 ms. Round 4: a first proof is confirmed only by a
+// proof at least 60 s later (CONFIRM_MS at this sweep interval), and the wait ends only once AgentManager proves the
+// run's whole execution over. AgentManager never launched this fake run, so it holds no execution for it, and no
+// result (tests/actor-stuck-run-tree.test.ts covers a live tree and a real result).
 const MINUTE = 60_000;
+const CONFIRM_MS = 60_000;
 const roots: string[] = [];
 const closers: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -131,9 +135,12 @@ describe("an actor run whose worker is gone (smarty-dev#16333)", () => {
     expect(s.actors.status(actor.id)).toMatchObject({ queued: 2, inFlightRun: { id: phantom } });
 
     s.clock.skew = 31 * MINUTE;
-    // 1. The check confirms worker-gone (its existing alarm; the wait ends on the next consecutive proof).
+    // 1. The check confirms worker-gone (its existing alarm; the wait ends on a consecutive proof CONFIRM_MS later).
     await waitFor(() => s.alarms(actor.id).length === 1);
     expect(s.alarms(actor.id)[0]!.data).toMatchObject({ reason: "worker-gone", runId: phantom });
+    await ticks();
+    expect(s.actors.status(actor.id)).toMatchObject({ queued: 2, inFlightRun: { id: phantom } });
+    s.clock.skew = 31 * MINUTE + CONFIRM_MS + 1_000;
     // 2. The drain unwinds: the phantom is no longer in flight and the queue moves.
     await waitFor(() => s.actors.status(actor.id).inFlightRun?.id !== phantom);
     await waitFor(() => s.launches.length === 3 && s.actors.status(actor.id).queued === 0 &&
@@ -148,7 +155,9 @@ describe("an actor run whose worker is gone (smarty-dev#16333)", () => {
     // 4. Message 2 (and 3) ran exactly once, in order, and each output was recorded once.
     const outputs = s.actors.messages(actor.id, 200).filter(message => message.text?.startsWith("done "));
     expect(outputs.map(message => message.text)).toEqual([`done ${s.launches[1]!.id}`, `done ${s.launches[2]!.id}`]);
-    // 5. No loop: N more ticks add no activation, alarm or failure record.
+    // 5. No loop: N more ticks, past more confirmation gaps, add no activation, alarm or failure record.
+    await ticks();
+    s.clock.skew += 5 * CONFIRM_MS;
     await ticks();
     expect(s.launches).toHaveLength(3);
     expect(s.alarms(actor.id)).toHaveLength(1);
@@ -190,6 +199,8 @@ describe("an actor run whose worker is gone (smarty-dev#16333)", () => {
     await waitFor(() => s.alarms(actor.id).length === 1);
     expect(s.alarms(actor.id)[0]!.data).toMatchObject({ reason: "worker-gone", runId: phantom });
     await ticks();
+    s.clock.skew = 31 * MINUTE + CONFIRM_MS + 1_000; // past the confirmation gap: the reset, not the gap, keeps the run
+    await ticks();
     expect(s.timeline).toEqual(["run:MSG-1", "check"]);
     expect(s.actors.status(actor.id)).toMatchObject({ queued: 2, inFlightRun: { id: phantom } });
     expect(s.phantomFailures(actor.id)).toHaveLength(0);
@@ -208,6 +219,7 @@ describe("an actor run whose worker is gone (smarty-dev#16333)", () => {
     s.clock.skew = 31 * MINUTE;
     await waitFor(() => s.alarms(actor.id).length === 1);
     expect(s.alarms(actor.id)[0]!.data).toMatchObject({ reason: "worker-gone", runId: phantom });
+    s.clock.skew = 31 * MINUTE + CONFIRM_MS + 1_000;
     await waitFor(() => !s.actors.inFlightActorIds().includes(actor.id));
     expect(s.actors.status(actor.id).inFlightRun).toBeUndefined();
     expect(s.phantomFailures(actor.id)).toHaveLength(1);

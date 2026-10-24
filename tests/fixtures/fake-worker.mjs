@@ -89,6 +89,30 @@ if (finishGateMatch) {
   });
 }
 
+// Opt-in lingering descendant (smarty-dev#16333 round 4): before its normal result, start one child in this
+// worker's own process group and leave it running after this worker exits. The child writes its pid to
+// `<release>.pid`, then exits once the release file exists (or after 60 s, so a red test never leaks it).
+const lingerMatch = task.match(/"fakeWorkerLingerChild":\s*("(?:\\.|[^"\\])*")/);
+if (lingerMatch) {
+  const release = JSON.parse(lingerMatch[1]);
+  const { spawn } = await import("node:child_process");
+  const child = spawn(process.execPath, ["-e", [
+    "const fs = require('node:fs');",
+    `const release = ${JSON.stringify(release)};`,
+    "fs.writeFileSync(release + '.pid', String(process.pid));",
+    "const until = Date.now() + 60000;",
+    "const poll = () => (fs.existsSync(release) || Date.now() > until) ? process.exit(0) : setTimeout(poll, 25);",
+    "poll();",
+  ].join("\n")], { stdio: "ignore" });
+  child.unref();
+  // The child must be running before this worker writes its result and exits.
+  const deadline = Date.now() + 10_000;
+  while (!fs.existsSync(`${release}.pid`)) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for the lingering child");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 if (task.includes("HANG_WITH_PROGRESS")) {
   // A run that has done work (so an abort detaches it) and never finishes on its own:
   // only a stop or a kill ends it (smarty-dev#1113).

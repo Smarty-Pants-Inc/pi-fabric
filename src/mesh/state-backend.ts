@@ -134,6 +134,8 @@ export interface StateBackendBatchInput {
   beforeCommit?: () => void;
   /** Lock-stats class for the bridge's own writes; never inferred from the identity text. */
   lockClass?: "bridge";
+  /** Diagnostic caller class only; never changes transaction semantics. */
+  sqliteHoldTag?: import("./sqlite-holds.js").SqliteBatchHoldTag;
   /** R11: file reads before the transaction, re-checked by stamp inside it. */
   fileRead?: MeshStateFileRead;
   /** R11: file effects after COMMIT (L2b's outbox). */
@@ -771,6 +773,7 @@ export class SqliteStateBackend implements StateBackend {
           ...(input.afterCommit ? { afterCommit: input.afterCommit } : {}),
           ...(input.beforeCommit || this.#slotClaimGuard ? { beforeCommit } : {}),
           ...(input.lockClass ? { lockClass: input.lockClass } : {}),
+          ...(input.sqliteHoldTag ? { sqliteHoldTag: input.sqliteHoldTag } : {}),
         }));
       } catch (error) {
         if (error !== FILE_READ_CHANGED) throw error;
@@ -1061,6 +1064,7 @@ export class ShadowStateBackend implements StateBackend {
     this.#lockScope = context.lock.tryLockScope;
     this.#shadow = new SqliteStateBackend(context, {}, shadowRoot, {
       ...sqliteOptions(shadowOptions, this.#budgetMs),
+      holdMetricsRoot: context.root,
       // No maintainer runs for the shadow: keep its WAL small without one.
       emergencyCheckpointBytes: 8 * 1024 * 1024,
       // A copy outside the mesh root, never the fence: it initialises itself (smarty-dev#6477).
@@ -1250,6 +1254,7 @@ export class ShadowStateBackend implements StateBackend {
       else for (const entry of this.#file.listAll("", { fresh: true })) wanted.set(entry.key, entry);
       try {
         await this.#shadow.writeBatch({
+          sqliteHoldTag: "shadow:mirror",
           identity: SHADOW_IDENTITY, ops: [],
           prepare: (view) => {
             if (this.#file.stateStamp() !== stamp) throw FILE_READ_CHANGED;

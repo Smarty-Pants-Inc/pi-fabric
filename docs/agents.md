@@ -1514,6 +1514,19 @@ The episode ends when the activation leaves preparing; each notice appends a lin
 `<mesh>/metrics/stuck-preparing.jsonl` with `stuckMs`, the uncounted `waitedMs`, and `queued`,
 the backlog behind it (queue plus overflow) (smarty-dev#6337).
 
+Slow SQLite writer custody appends best-effort JSONL to `<mesh>/metrics/sqlite-holds.jsonl`
+(smarty-dev#16549). `PI_FABRIC_SQLITE_HOLD_MS` sets the hold threshold in milliseconds
+(default `2000`, `0` disables recording; invalid values use the default). Each line gives
+`v`, `at` (release time), caller `tag`, holder `pid`, `release` (build SHA or package version),
+`bridge` (this process hosts a bridge), `waitMs` (including async retries), `holdMs`,
+`commitMs` (the COMMIT call, including its fsync), `rollbackMs`, `outcome`, and `phases`
+with statement `tag`, `count`, `totalMs`, `changes` (from run results only), and `errors`.
+Statement tags are the SQL verb, known table (when present), eight-digit fingerprint and method,
+never SQL or bound values; a connection caps phase classes at 128 (overflow is `other`).
+Unmeasured JS/scheduling time remains in `holdMs`. Only holds exceeding the threshold emit,
+in a microtask after release and synchronous cleanup. The current file and one rotated `.1` are each capped at
+1 MiB; append contention or write/rotation failures drop the diagnostic, never the write.
+
 A failed activation records `activationBlocked` on the actor, and routers (factory review
 routing) skip a blocked actor. Its `class` says whether it can recover by itself
 (smarty-dev#6509). A `transient` block comes from a provider stream or network error, a 5xx or

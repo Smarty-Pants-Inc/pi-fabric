@@ -43,6 +43,9 @@ describe("mesh backend mixed-load soak", () => {
     // Hold the legacy mesh .lock in another process: SQLite state writes must still complete while
     // event publication remains lock-coupled. This proves keyed-state writes never enter .lock.
     const held = path.join(root, "lock-held"); const holder = start("holder", root, held);
+    // Failure cleanup only: release the probe's SQLite handle and join the holder before afterEach
+    // removes the root, so a cleanup error cannot replace the original assertion. close() is idempotent.
+    try {
     const until = Date.now() + 5_000; while (!fs.existsSync(held) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 10));
     expect(fs.existsSync(held)).toBe(true);
     const startAt = Date.now(); await probe.put({ key: "soak/probe", value: 1, identity });
@@ -56,6 +59,10 @@ describe("mesh backend mixed-load soak", () => {
       expect(line, worker.output).toBeTruthy();
       const counts = JSON.parse(line!) as { operations: number; lockTimeouts: number; sqliteBusy: number; otherErrors: string[] };
       expect(counts.operations).toBeGreaterThan(0); expect(counts.lockTimeouts, worker.output).toBe(0); expect(counts.sqliteBusy, worker.output).toBe(0); expect(counts.otherErrors, worker.output).toEqual([]);
+    }
+    } finally {
+      try { probe.close(); } catch { /* keep the original failure */ }
+      await holder.catch(() => undefined);
     }
   }, 85_000);
 });

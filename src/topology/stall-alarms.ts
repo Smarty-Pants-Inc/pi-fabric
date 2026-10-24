@@ -230,6 +230,12 @@ const SESSION_ADDRESS = /^session:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4
 export const admissionAlarmRecipient = (ownerIdentityId: string | undefined, identity: MeshIdentity | undefined): string | undefined =>
   [ownerIdentityId?.trim(), identity?.kind === "main" ? identity.id : undefined]
     .find((candidate): candidate is string => typeof candidate === "string" && SESSION_ADDRESS.test(candidate));
+/** The mesh envelope of an AgentManager alarm. A named run's failed recovery save is an ops.owner `actor.alarm`
+ * (pi-fabric#939 round 4). The held-permit count and a child launched without a short TMPDIR that fits the fleet bash
+ * guard (pi-fabric#1554, a host condition) are fabric.alarm.agent-admission events of their own kinds. */
+export const admissionAlarmEnvelope = (alarm: { kind?: string }): { topic: string; kind: string } =>
+  alarm.kind === "recovered-answer-save-failed" ? { topic: "ops.owner", kind: "actor.alarm" }
+    : { topic: "fabric.alarm.agent-admission", kind: alarm.kind === "short-tmpdir-unavailable" ? alarm.kind : "agent-admission-held" };
 
 export const providerDeadAlarms = async (mesh: MeshStore, identity: MeshIdentity, rootId: string,
   event: ProviderDeadAlarmEvent, ownerIdentityId?: string): Promise<void> => {

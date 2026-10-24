@@ -31,7 +31,9 @@ export const MODEL_EXCEPTION_DENIED_CODE = "FABRIC_MODEL_EXCEPTION_DENIED" as co
 export type ModelExceptionDenial =
   | "invalid-reason" | "missing-reference" | "file-unavailable" | "untrusted-source" | "malformed"
   | "unlisted" | "expired" | "revoked" | "expiry-too-long" | "model-mismatch" | "role-mismatch"
-  | "lane-mismatch" | "host-mismatch" | "thinking-exceeds";
+  | "lane-mismatch" | "host-mismatch" | "thinking-exceeds"
+  /** The bound ROOT lane could not be read (stale/missing record or lookup error): fail closed, retryable (#16331). */
+  | "lane-unresolved";
 
 /** Version 1 grant from the fixed root-owned host source. */
 export interface ModelExceptionEntry {
@@ -279,6 +281,8 @@ export function readModelExceptions(file: string): ModelExceptionEntry[] {
 export function admitModelException(input: {
   path: string | undefined; reason: unknown; model: string; role: string;
   lane?: string | undefined; host: string; thinking: FabricThinking; now?: number;
+  /** Why a bound ROOT lane is absent: a distinct, retryable denial instead of lane-mismatch (#16331). */
+  laneUnresolved?: string | undefined;
 }): { ref: string; entry: Readonly<ModelExceptionEntry> } {
   const model = input.model;
   const refs = canonicalIssueReferences(input.reason);
@@ -294,7 +298,9 @@ export function admitModelException(input: {
       error instanceof SyntaxError ? "malformed" : "file-unavailable", refs[0]);
   }
   const now = input.now ?? Date.now();
-  if (!input.lane) deny("lane-mismatch", refs[0], "no bound ROOT session worktree");
+  if (!input.lane) {
+    deny(input.laneUnresolved ? "lane-unresolved" : "lane-mismatch", refs[0], input.laneUnresolved ?? "no bound ROOT session worktree");
+  }
   if (!isFabricThinking(input.thinking)) deny("thinking-exceeds", refs[0], "effective thinking is unknown");
   if (!Number.isFinite(now)) deny("expired", refs[0], "current time is unknown");
   const rank: ModelExceptionDenial[] = ["unlisted", "lane-mismatch", "host-mismatch", "role-mismatch",

@@ -8,7 +8,7 @@ import {
   createLockEvents, LOCK_EVENT_MAX_LINE_BYTES, LOCK_EVENTS_FILE, LOCK_EVENTS_ROTATE_BYTES, LOCK_EVENTS_ROTATE_LOCK,
   LOCK_EVENTS_ROTATE_LOCK_STALE_MS, LOCK_EVENTS_WIN32_ROTATION_ISSUE, LOCK_HELD_EVENT_MS, lockEventLine, lockStatsHost, type LockEvent, type LockEvents,
 } from "../src/mesh/commit-stats.js";
-import { SqliteStateStore } from "../src/mesh/state-sqlite.js";
+import { openNodeSqlite, SqliteStateStore, type SqliteOpener } from "../src/mesh/state-sqlite.js";
 import type { MeshIdentity } from "../src/mesh/store.js";
 
 // smarty-dev#9290: held-time and wait-timeout events at the source, in <root>/lock-stats/events.jsonl.
@@ -33,6 +33,9 @@ const temp = (): string => {
   return root;
 };
 const eventsFile = (root: string): string => path.join(root, "lock-stats", LOCK_EVENTS_FILE);
+// Handles a test opened on a temp root: closed before the root is removed, also when the test timed out (on
+// Windows an open SQLite handle makes the removal fail with EPERM and masks the real failure).
+const closers: (() => void)[] = [];
 const readEvents = (file: string): LockEvent[] => {
   if (!fs.existsSync(file)) return [];
   const text = fs.readFileSync(file, "utf8");
@@ -43,6 +46,19 @@ const readEvents = (file: string): LockEvent[] => {
   });
 };
 const spin = (ms: number): void => { const until = performance.now() + ms; while (performance.now() < until) { /* hold */ } };
+// Real store admission and fresh-root creation are setup, not the measured lock operation. A fresh root is created
+// under the mesh fence (.lock, class "other"); Windows CI recorded this setup taking over the default 1 s threshold.
+// It includes ACL inspection and DB initialisation. Run it with this file's statically imported module graph, whose
+// recorder the test environment disabled (PI_FABRIC_LOCK_STATS=0), so the measured store reopens an imported root.
+// Keep the setup connection open until afterEach: the last close deletes the WAL, and the measured store's first
+// write would then restart it, an open overhead a store that created its root in-process never paid.
+const initialisedRoot = async (open?: SqliteOpener): Promise<string> => {
+  const root = temp();
+  const setup = await SqliteStateStore.open(root, 64 * 1024, 1_000, open ? { open } : {});
+  closers.push(() => setup.close());
+  expect(readEvents(eventsFile(root))).toEqual([]);
+  return root;
+};
 // Rotation is disabled on Windows (scope cut, smarty-dev#10191): tests of a real rotation run elsewhere.
 const itRotates = it.skipIf(process.platform === "win32");
 const ownComm = (): string | undefined => {
@@ -66,6 +82,7 @@ const load = async (options: { warn?: (message: string) => void } = {}) => {
 
 beforeEach(reset);
 afterEach(() => {
+  for (const close of closers.splice(0).reverse()) try { close(); } catch { /* already closed by the test */ }
   reset();
   vi.useRealTimers();
   vi.unstubAllEnvs();
@@ -459,9 +476,10 @@ describe("lock events in one process", () => {
   it("SQLite native BEGIN timeout emits one wait-timeout event", async () => {
     const { events, SqliteStateStore: Store } = await load();
     const { openNodeSqlite } = await import("../src/mesh/state-sqlite.js");
-    const root = temp();
+    const root = await initialisedRoot();
     const store = await Store.open(root, 64 * 1024, 1_000, { lockTimeoutMs: 100 });
     const holder = openNodeSqlite(store.file);
+    closers.push(() => store.close(), () => holder.close());
     holder.exec("BEGIN IMMEDIATE");
     const generic = vi.spyOn(events, "waitTimeout");
     try {
@@ -627,7 +645,7 @@ describe("lock events in one process", () => {
   it("threshold 0 switches held events off (mesh .lock and SQLite); the default is 1000 ms", async () => {
     expect(LOCK_HELD_EVENT_MS).toBe(1_000);
     const { MeshLock, SqliteStateStore: Store } = await load();
-    const root = temp();
+    const root = await initialisedRoot();
     const off = new MeshLock(root, { lockHeldEventMs: 0 }, () => undefined);
     const byDefault = new MeshLock(root, {}, () => undefined);
     const on = new MeshLock(root, { lockHeldEventMs: 10 }, () => undefined);
@@ -701,9 +719,40 @@ describe("lock events in one process", () => {
   });
 
   // Review round 3 P2: native holder diagnostics are appended only after holder lookup.
+  // pi-fabric Windows CI: a fresh root's creation under the mesh fence (the private-ACL child) is a real held .lock
+  // event when it is what is measured; separated as setup, it cannot leak into the measured lock operation's events.
+  it("fresh-root creation overhead is a held .lock event only when measured, never in a separately measured operation", async () => {
+    const { SqliteStateStore: Store } = await load();
+    // A slow initial open stands in for the Windows ACL child: both run inside the fresh-root fence.
+    const slowOpen: SqliteOpener = (file) => { spin(LOCK_HELD_EVENT_MS + 100); return openNodeSqlite(file); };
+    const measuredCreation = temp();
+    (await Store.open(measuredCreation, 64 * 1024, 1_000, { open: slowOpen })).close();
+    const creation = readEvents(eventsFile(measuredCreation));
+    expect(creation.map((event) => [event.kind, event.store, event.class])).toEqual([["held", "mesh-lock", "other"]]);
+    expect(creation[0]).toMatchObject({ holder: { pid: process.pid, op: "other", host: lockStatsHost() } });
+    expect(creation[0]!.heldMs).toBeGreaterThan(LOCK_HELD_EVENT_MS);
+    // The same slow creation as setup: the measured store's hold and timeout are the only events.
+    const root = await initialisedRoot(slowOpen);
+    const store = await Store.open(root, 64 * 1024, 1_000, { lockTimeoutMs: 100, lockHeldEventMs: 10 });
+    const holder = openNodeSqlite(store.file);
+    closers.push(() => store.close(), () => holder.close());
+    try {
+      await store.exclusive(() => spin(40));
+      holder.exec("BEGIN IMMEDIATE");
+      await expect(store.put({ key: "w/1", value: 1, identity })).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    } finally {
+      if (holder.isTransaction) holder.exec("ROLLBACK");
+      holder.close();
+      store.close();
+    }
+    expect(readEvents(eventsFile(root)).map((event) => [event.kind, event.store, event.class])).toEqual([
+      ["held", "sqlite", "custody"], ["wait-timeout", "sqlite", "put/delete"],
+    ]);
+  });
+
   it("SQLite wait-timeout performs native holder lookup before the event append", async () => {
     const { events, SqliteStateStore: Store } = await load();
-    const root = temp();
+    const root = await initialisedRoot();
     const order: string[] = [];
     const waitTimeout = events.waitTimeout.bind(events);
     vi.spyOn(events, "waitTimeout").mockImplementation((...args: Parameters<LockEvents["waitTimeout"]>) => {
@@ -712,6 +761,7 @@ describe("lock events in one process", () => {
     });
     const store = await Store.open(root, 64 * 1024, 1_000, { lockTimeoutMs: 100 });
     const holder = new (process.getBuiltinModule("node:sqlite").DatabaseSync)(store.file, { timeout: 0 });
+    closers.push(() => store.close(), () => holder.close());
     const readFileSync = fs.readFileSync;
     vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
       if (file === "/proc/locks") order.push("proc-locks");
@@ -737,7 +787,7 @@ describe("lock events in one process", () => {
   it("a failing append never affects the lock: counted, warned at most once a minute", async () => {
     const warnings: string[] = [];
     const { events, MeshLock, SqliteStateStore: Store } = await load({ warn: (message) => warnings.push(message) });
-    const root = temp();
+    const root = await initialisedRoot();
     const original = fs.openSync;
     vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
       if (String(file).endsWith(LOCK_EVENTS_FILE)) throw Object.assign(new Error("EIO: injected"), { code: "EIO" });

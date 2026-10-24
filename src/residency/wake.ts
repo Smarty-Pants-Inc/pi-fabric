@@ -43,6 +43,15 @@ export const residentSleepingPath = (root: string): string => path.join(root, "s
 export const residentWakeRequestPath = (root: string): string => path.join(root, "wake-request.json");
 export const residentWakeIntentLockPath = (root: string): string => path.join(root, "wake-intent.lock");
 const wakeFailurePath = (root: string): string => path.join(root, "wake-failure.json");
+const wakeTerminalPath = (root: string): string => path.join(root, "wake-terminal.json");
+interface ResidentWakeTerminal {
+  format: 1;
+  rootId: string;
+  delivery: WakeDelivery;
+  code: "RESIDENT_WAKE_CONFIG_MISMATCH";
+  error: string;
+  failedAt: number;
+}
 /** Failed wakes are retried by existing maintenance, not unrelated publications. */
 export const RESIDENT_WAKE_RETRY_MIN_MS = 1_000;
 export const RESIDENT_WAKE_RETRY_MAX_MS = 60_000;
@@ -70,21 +79,117 @@ const wakeFailures = (failure: ResidentWakeFailure | undefined): number =>
   Number.isSafeInteger(failure?.failures) && failure!.failures! >= 0 ? failure!.failures! : 0;
 const residentWakeRetrySweeps = new Map<string, Promise<void>>();
 
-/** Maintenance may transfer pending to a durable failure receipt; publication keeps pending. */
+/** Receipt writers share intent custody; only index operations need mesh custody. */
+const withWakeReceipt = async <T>(root: string, operation: () => Promise<T>): Promise<T> => {
+  if (process.platform === "win32") {
+    const { withExclusiveFileLockAsync } = await import("../core/file-lock.js");
+    return withExclusiveFileLockAsync({ directory: root, lockName: "wake-receipt.lock",
+      timeoutMessage: "Resident wake receipt is busy" }, operation);
+  }
+  const fd = await lockFile(residentWakeIntentLockPath(root), 90, process.platform === "linux");
+  try { return await operation(); } finally { fs.closeSync(fd); }
+};
+const deliveryCovers = (served: WakeDelivery, pending: WakeDelivery): boolean => served.id === pending.id ||
+  (served.sequence !== undefined && pending.sequence !== undefined && served.sequence >= pending.sequence);
+const sameWakeDelivery = (left: WakeDelivery, right: WakeDelivery): boolean =>
+  left.id === right.id && left.sequence === right.sequence;
+const wakeObject = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+/** Terminal receipts are untrusted hints, never high-watermark authority. First
+ * match only their named delivery; unrelated or unidentifiable bytes own no work.
+ * An exact match still needs full schema, committed archive and current route proof.
+ * All archive/route/receipt I/O runs outside global mesh custody. */
+const wakeTerminalAt = (mesh: ResidentWakeMesh, root: string, attempted: WakeDelivery): ResidentWakeTerminal | undefined => {
+  const value = readWakeJson<unknown>(wakeTerminalPath(root));
+  if (!wakeObject(value) || !wakeObject(value.delivery) ||
+      value.delivery.id !== attempted.id || value.delivery.sequence !== attempted.sequence) return;
+  if (Object.keys(value).sort().join(",") !== "code,delivery,error,failedAt,format,rootId" ||
+      value.format !== 1 || typeof value.rootId !== "string" || !value.rootId.length ||
+      value.code !== "RESIDENT_WAKE_CONFIG_MISMATCH" || typeof value.error !== "string" || !value.error.length ||
+      !Number.isSafeInteger(value.failedAt) || (value.failedAt as number) < 0 || !wakeObject(value.delivery))
+    throw new Error("Resident wake terminal receipt is invalid");
+  const delivery = value.delivery;
+  if (typeof delivery.id !== "string" || !delivery.id.length || !Number.isSafeInteger(delivery.sequence) ||
+      (delivery.sequence as number) < 1 || Object.keys(delivery).some(key => !["id", "sequence", "deferredAt"].includes(key)) ||
+      (delivery.deferredAt !== undefined && (!Number.isSafeInteger(delivery.deferredAt) ||
+        (delivery.deferredAt as number) < 1 || (delivery.deferredAt as number) > (delivery.sequence as number))))
+    throw new Error("Resident wake terminal delivery is invalid");
+  const routes = retainedRoutesAt(root);
+  const entry = MeshArchive.fromRoot(mesh.root)?.lookupEntry(delivery.sequence as number, RESIDENT_WAKE_RECOVERY_MAX_BYTES);
+  if (!routes || routes.rootId !== value.rootId || !entry?.committed || entry.event.id !== delivery.id ||
+      entry.event.sequence !== delivery.sequence || !residentDeliveryMatches(routes, entry.event,
+        mesh.listAll("topology/subscriptions/", { fresh: true }).map(row => row.value as { from?: string; to?: string; events?: string[] })))
+    throw new Error("Resident wake terminal delivery has no matching committed archive event");
+  return value as unknown as ResidentWakeTerminal;
+};
+const clearWakeFailure = (root: string, delivery: WakeDelivery): Promise<void> => withWakeReceipt(root, async () => {
+  const prior = wakeFailureAt(root);
+  if (prior && deliveryCovers(delivery, prior.delivery)) fs.rmSync(wakeFailurePath(root), { force: true });
+});
+
+/** Maintenance may transfer pending to a durable failure receipt; publication keeps pending.
+ * A terminal mismatch instead retires only this attempt's watermark, never a newer publication. */
 const recordResidentWakeFailure = async (mesh: ResidentWakeMesh, root: string, delivery: WakeDelivery,
-  error: unknown, now: number, claimId?: string, acknowledge = true): Promise<void> => {
+  error: unknown, now: number, claimId?: string, acknowledge = true, terminalOnly = false): Promise<boolean> => {
+  let terminal = false;
   try {
-    await mesh.exclusive(() => {
+    const message = String(error);
+    const mismatch = error instanceof ResidentWakeConfigMismatch;
+    const inspect = mismatch ? (await import("./wake-terminal.js")).withResidentWakeTerminalRoot : undefined;
+    return await withWakeReceipt(root, async () => {
       const prior = wakeFailureAt(root);
-      if (claimId !== undefined && prior?.claimId !== claimId) return;
+      if (claimId !== undefined && prior?.claimId !== claimId) return true;
+      const existing = wakeTerminalAt(mesh, root, delivery); // Invalid SAME-delivery evidence cannot authorize any mutation.
+      if (terminalOnly && !existing) return false;
+      const disposed = await inspect?.(mesh, root, async rootId => {
+        if (existing && existing.rootId !== rootId) return false;
+        // The original failure/receipt is not current config authority. Repair
+        // must resume normal waking, including interrupted SAME-receipt recovery.
+        try { assertResidentWakeConfig(root); return false; }
+        catch (error) { if (!(error instanceof ResidentWakeConfigMismatch)) throw error; }
+        if (!existing) {
+          writeJsonAtomic(wakeTerminalPath(root), { format: 1, rootId,
+            delivery: { id: delivery.id, ...(delivery.sequence !== undefined ? { sequence: delivery.sequence } : {}) },
+            code: "RESIDENT_WAKE_CONFIG_MISMATCH", error: message, failedAt: now } satisfies ResidentWakeTerminal, { durable: true });
+          diagnostics.warn("src/residency/wake.ts", `[pi-fabric] resident wake terminal for ${root}: ${message}`);
+        }
+        terminal = true;
+        const acknowledged = await mesh.exclusive(() => {
+          const pending = residentUnacknowledgedDelivery(mesh.root, root);
+          // No terminal receipt, fresh or recovered, covers a different nudge.
+          if (pending && !sameWakeDelivery(delivery, pending)) return false;
+          acknowledgeResidentDelivery(mesh.root, root, delivery);
+          return true;
+        });
+        if (acknowledged && prior && deliveryCovers(delivery, prior.delivery)) fs.rmSync(wakeFailurePath(root), { force: true });
+        return true;
+      }).catch(() => undefined);
+      if (disposed) return true;
+      if (terminalOnly) return false;
       const failures = wakeFailures(prior) + 1;
-      writeJsonAtomic(wakeFailurePath(root), { format: 1, delivery, error: String(error), failedAt: now,
+      const retained = prior && deliveryCovers(prior.delivery, delivery) ? prior.delivery : delivery;
+      writeJsonAtomic(wakeFailurePath(root), { format: 1, delivery: retained, error: message, failedAt: now,
         failures, nextRetryAt: now + wakeRetryDelay(failures) }, { durable: true });
-      if (acknowledge) acknowledgeResidentDelivery(mesh.root, root, delivery);
+      // Live/unknown/busy mismatch decisions keep the pending index as well as
+      // ordinary backoff. Failure to acquire a native fence never authorizes ACK.
+      if (acknowledge && !mismatch) await mesh.exclusive(() => acknowledgeResidentDelivery(mesh.root, root, delivery));
+      return false;
     });
-  } catch { /* Double failure: the archive-coupled index remains pending. */ }
+  } catch { return terminal; } // Persistence failure retains the pending index or durable claim.
 };
 
+/** Finish an interrupted terminal ACK without claiming or launching the same watermark again. */
+const acknowledgeWakeTerminal = async (mesh: ResidentWakeMesh, root: string, delivery: WakeDelivery,
+  claimId?: string): Promise<boolean> => {
+  try {
+    const terminal = wakeTerminalAt(mesh, root, delivery);
+    if (!terminal) return false;
+    return await recordResidentWakeFailure(mesh, root, delivery, new ResidentWakeConfigMismatch(root), Date.now(), claimId, false, true);
+  } catch {
+    return true; // Only an exact identity reached validation: retain BOTH this pending and its prior failure.
+  }
+};
 
 /** Retained, actually published authority for admission, not a live lease or permission to deliver. */
 export function dormantActorRoute(meshRoot: string, actor: FabricActorInfo): FabricParticipantInfo | undefined {
@@ -296,12 +401,14 @@ export async function requestResidentWake(root: string, delivery: { id: string; 
   let written: ResidentWakeRequest | undefined;
   let warm = false;
   try {
+    assertAdmission();
+    assertResidentWakeConfig(root, config);
+    warm = residentOwnerLive(root) && !residentOwnerSleeping(root);
+    const previous = readWakeJson<ResidentWakeRequest>(residentWakeRequestPath(root));
+    const request = previous?.sequence !== undefined && delivery.sequence !== undefined && previous.sequence > delivery.sequence
+      ? previous : { format: 1 as const, ...delivery, requestedAt: Date.now() };
     const writeIntent = (): void => {
       assertAdmission(); // Live owner admission, inside mesh custody after the intent-lock wait.
-      warm = residentOwnerLive(root) && !residentOwnerSleeping(root);
-      const previous = readWakeJson<ResidentWakeRequest>(residentWakeRequestPath(root));
-      const request = previous?.sequence !== undefined && delivery.sequence !== undefined && previous.sequence > delivery.sequence
-        ? previous : { format: 1 as const, ...delivery, requestedAt: Date.now() };
       // Persist AFTER mesh commit and BEFORE spawn. The existing cursor owns delivery.
       writeJsonAtomic(residentWakeRequestPath(root), request, { durable: true });
       written = request;
@@ -310,7 +417,7 @@ export async function requestResidentWake(root: string, delivery: { id: string; 
   } finally { if (fd !== undefined) fs.closeSync(fd); }
   if (written) await onIntentWritten?.(written);
   assertAdmission();
-  if (warm) return; // A racing warm owner covers this durable request without a new child.
+  if (warm && residentOwnerLive(root) && !residentOwnerSleeping(root)) return; // Recheck after the mesh wait.
   // Spawn is outside the short transaction. A busy contender is covered by the holder's final check.
   assertResidentWakeConfig(root, config);
   if (launch) return launch(configPath, config);
@@ -408,6 +515,7 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
     if (!canWake()) break;
     if (!recovery && attempted >= RESIDENT_WAKE_INDEX_MAX_ROOTS) break; // Overflow stays pending for the next drain.
     let delivery: { id: string; sequence?: number } | undefined;
+    let attemptedDelivery: WakeDelivery | undefined;
     let served = false;
     const onIntentWritten = async (written: ResidentWakeRequest): Promise<void> => {
       // The intent may adopt a newer watermark than this publication captured.
@@ -430,7 +538,9 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
         const covered = pending.get(root);
         if (covered) {
           delivery = covered;
+          if (await acknowledgeWakeTerminal(mesh, root, covered)) continue;
           attempted++;
+          attemptedDelivery = covered;
           await requestResidentWake(root, covered, launch, onIntentWritten, admission);
           served = true;
           await acknowledge(root, delivery);
@@ -445,11 +555,13 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
       delivery = last ? { id: last.id, sequence: last.sequence } : pending.get(root) ?? failed?.delivery ??
         (request && JSON.stringify(sleeping?.request) !== JSON.stringify(request) ? request : undefined);
       if (delivery) {
+        if (await acknowledgeWakeTerminal(mesh, root, delivery)) continue;
         attempted++;
+        attemptedDelivery = delivery;
         await requestResidentWake(root, delivery, launch, onIntentWritten, admission);
         served = true;
         await acknowledge(root, delivery);
-        fs.rmSync(wakeFailurePath(root), { force: true });
+        await clearWakeFailure(root, delivery);
       }
     } catch (error) {
       if (error instanceof ResidentWakeAdmissionClosed) {
@@ -461,7 +573,8 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
       // Failed publication wakes keep pending even when a backoff receipt is
       // durable. In particular, a post-success ACK error must NEVER run the
       // failure recorder (which could otherwise turn that error into an ACK).
-      if (delivery && !served) await recordResidentWakeFailure(mesh, root, delivery, error, Date.now(), undefined, false);
+      if (delivery && !served && await recordResidentWakeFailure(mesh, root, attemptedDelivery ?? delivery,
+          error, Date.now(), undefined, false)) continue;
       diagnostics.warn("src/residency/wake.ts", `[pi-fabric] resident wake deferred for ${root}: ${String(error)}`);
     }
   }
@@ -476,37 +589,67 @@ export async function retryResidentWakes(mesh: ResidentWakeMesh,
   const running = residentWakeRetrySweeps.get(key);
   if (running) return running;
   const sweep = (async () => {
-    const candidates = await mesh.exclusive(() => {
-      if (!canWake()) return [];
-      return residentWakeRetryCandidates(mesh.root); // Bounded pages; next sweep resumes the cursor.
-    });
+    // Discovery is a bounded observation, not authority to mutate. Its cursor
+    // still advances on idle sweeps; fresh keyed reads below catch later work.
+    const candidates = residentWakeRetryCandidates(mesh.root);
     if (!canWake()) return;
     const attempts: Array<{ root: string; delivery: WakeDelivery; claimId: string }> = [];
     for (const root of candidates.slice(0, RESIDENT_WAKE_RETRY_MAX_CANDIDATES)) {
       if (!canWake()) break;
       const claimId = randomUUID();
       try {
-        const delivery = await mesh.exclusive(() => {
+        // Fresh bounded hints only: no mesh OR receipt custody for idle roots.
+        // A racing/unreadable index defers this root; no observation authorizes ACK.
+        const observedPrior = wakeFailureAt(root);
+        const observedCurrent = residentUnacknowledgedDelivery(mesh.root, root);
+        if (!canWake()) break;
+        if (!observedCurrent && !observedPrior?.delivery) continue;
+        const observedRoutes = retainedRoutesAt(root);
+        const observedDelivery = observedCurrent ?? observedPrior?.delivery;
+        if (observedRoutes && observedDelivery && await acknowledgeWakeTerminal(mesh, root, observedDelivery)) continue;
+        if (observedRoutes && observedPrior?.nextRetryAt !== undefined && observedPrior.nextRetryAt > now) continue;
+        if (!observedRoutes) {
+          try { fs.lstatSync(path.join(root, "wake-routes.json")); continue; }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+          try { fs.lstatSync(root); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            if (observedCurrent) await mesh.exclusive(() => {
+              if (!canWake()) return;
+              try { fs.lstatSync(root); return; }
+              catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+              const current = residentUnacknowledgedDelivery(mesh.root, root);
+              if (current && sameWakeDelivery(current, observedCurrent)) acknowledgeResidentDelivery(mesh.root, root, current);
+            });
+            continue; // An absent residency directory has no receipt requiring root custody.
+          }
+        }
+        const delivery = await withWakeReceipt(root, async () => {
           if (!canWake()) return;
           const prior = wakeFailureAt(root);
-          // Revalidate this candidate only; never multiply full-backlog I/O by
-          // the number of claims while publications wait for mesh custody.
-          const current = residentUnacknowledgedDelivery(mesh.root, root);
-          if (!retainedRoutesAt(root)) {
-            // Only an absent route is retired. Malformed/unreadable metadata is
-            // not proof of retirement and must retain its durable delivery.
+          const routes = retainedRoutesAt(root);
+          let retired = false;
+          if (!routes) {
+            // Only ENOENT retires routes; malformed/unreadable metadata retains work.
             try { fs.lstatSync(path.join(root, "wake-routes.json")); }
             catch (error) {
               if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-              if (current) acknowledgeResidentDelivery(mesh.root, root, current);
-              if (prior) fs.rmSync(wakeFailurePath(root), { force: true });
+              retired = true;
             }
+          }
+          // Revalidate only this keyed watermark under mesh custody. Config,
+          // receipt parsing and durable receipt writes do not hold the mesh lock.
+          const current = await mesh.exclusive(() => canWake() ? residentUnacknowledgedDelivery(mesh.root, root) : undefined);
+          if (!canWake()) return;
+          if (retired) {
+            if (current) await mesh.exclusive(() => { if (canWake()) acknowledgeResidentDelivery(mesh.root, root, current); });
+            if (canWake() && prior) fs.rmSync(wakeFailurePath(root), { force: true });
             return;
           }
-          if (prior?.nextRetryAt !== undefined && prior.nextRetryAt > now) return;
-          let delivery = prior?.delivery;
-          if (current && (!delivery || (current.sequence !== undefined &&
-              (delivery.sequence === undefined || current.sequence >= delivery.sequence)))) delivery = current;
+          if (!routes || (prior?.nextRetryAt !== undefined && prior.nextRetryAt > now)) return;
+          // A failure/terminal receipt for another watermark cannot displace
+          // independently pending work, even if its sequence is higher.
+          const delivery = current ?? prior?.delivery;
           if (!delivery) return;
           writeJsonAtomic(wakeFailurePath(root), { ...prior, format: 1, delivery, claimId,
             nextRetryAt: now + RESIDENT_WAKE_ATTEMPT_LEASE_MS }, { durable: true });
@@ -519,18 +662,25 @@ export async function retryResidentWakes(mesh: ResidentWakeMesh,
       }
     }
     await Promise.all(attempts.map(async ({ root, delivery, claimId }) => {
+      let served: WakeDelivery = delivery;
       try {
-        await requestResidentWake(root, delivery, launch, written => mesh.exclusive(() => {
-          if (wakeFailureAt(root)?.claimId === claimId) acknowledgeResidentDelivery(mesh.root, root, written);
+        if (await acknowledgeWakeTerminal(mesh, root, delivery, claimId)) return;
+        await requestResidentWake(root, delivery, launch, written => withWakeReceipt(root, async () => {
+          served = written;
+          // The durable claim owns only the original watermark until launch succeeds.
+          if (wakeFailureAt(root)?.claimId === claimId)
+            await mesh.exclusive(() => acknowledgeResidentDelivery(mesh.root, root, delivery));
         }), { allowed: canWake, exclusive: mesh.exclusive.bind(mesh) });
-        await mesh.exclusive(() => {
-          if (wakeFailureAt(root)?.claimId === claimId) fs.rmSync(wakeFailurePath(root), { force: true });
+        await withWakeReceipt(root, async () => {
+          if (wakeFailureAt(root)?.claimId !== claimId) return;
+          await mesh.exclusive(() => acknowledgeResidentDelivery(mesh.root, root, served));
+          fs.rmSync(wakeFailurePath(root), { force: true });
         });
       } catch (error) {
         if (error instanceof ResidentWakeAdmissionClosed) {
           // Revocation is not a root failure. Retain the consolidated nudge, release
           // only our claim, and make it eligible when the owner's gate opens again.
-          await mesh.exclusive(() => {
+          await withWakeReceipt(root, async () => {
             const current = wakeFailureAt(root);
             if (current?.claimId !== claimId) return;
             const { claimId: _claimId, ...retained } = current;
@@ -538,7 +688,7 @@ export async function retryResidentWakes(mesh: ResidentWakeMesh,
           });
           return;
         }
-        await recordResidentWakeFailure(mesh, root, delivery, error, Math.max(now, Date.now()), claimId);
+        if (await recordResidentWakeFailure(mesh, root, delivery, error, Math.max(now, Date.now()), claimId)) return;
         diagnostics.warn("src/residency/wake.ts", `[pi-fabric] resident wake deferred for ${root}: ${String(error)}`);
       }
     }));

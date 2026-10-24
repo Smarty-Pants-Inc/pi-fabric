@@ -97,7 +97,8 @@ describe("local process task write default", () => {
     const { result, value } = await report(f);
     const run = f.manager.runDirectory(result.id)!;
     expect(value.policy).toEqual({ readOnly: false, writableRoots: [f.cwd, value.tmpdir].sort(), shell: "unconfined" });
-    expect(value.tmpdir).toBe(path.join(run, "tmp"));
+    // smarty-dev#15878: a short private TMPDIR when one fits the host's temp path, else the run's own tmp.
+    expect(value.tmpdir).toBe(result.temporaryDirectory ?? path.join(run, "tmp"));
     for (const tool of ["write", "edit"]) {
       expect(writePolicyDenial(value.policy, tool, { path: path.join(value.tmpdir, "x") }, f.cwd)).toBeUndefined();
       for (const file of ["completion-recipient.json", "status.json", "events.jsonl", "session.jsonl", "terminal-controls/control.json", "deliveries/message.json", "nested/child/task.txt"]) {
@@ -251,7 +252,7 @@ describe("local process task write default", () => {
     const f = fixture(false, "resident");
     const { result, value } = await report(f, request);
     const run = f.manager.runDirectory(result.id)!;
-    expect(value.tmpdir).toBe(path.join(run, "tmp"));
+    expect(value.tmpdir).toBe(result.temporaryDirectory ?? path.join(run, "tmp"));
     expect(value.policy).toEqual({ readOnly: false, writableRoots: [value.tmpdir], shell: "unconfined" });
     if (process.platform !== "win32") expect(fs.statSync(value.tmpdir).mode & 0o777).toBe(0o700);
     expect(value.probes.map((probe: { allowed: boolean }) => probe.allowed)).toEqual([false, true, false]);

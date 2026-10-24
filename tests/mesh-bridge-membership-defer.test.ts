@@ -298,7 +298,17 @@ describe("canonical membership admission while mirrors are deferred", () => {
         await bounded(held.entered);
       }
       const sent = await controls(f.far, newcomer, f.lead, "new-membership");
-      if (seam === "degraded stdio") await until(() => f.logs.some(line => line.includes("bridge mirror degraded")));
+      if (seam === "degraded stdio") {
+        await until(() => f.logs.some(line => line.includes("bridge mirror degraded")));
+        const degraded = f.logs.find(line => line.includes("bridge mirror degraded"))!;
+        // Either the in-flight refusal or its deadline may win the real stdio race.
+        const deferredError = new BridgeMirrorDeferredError(degraded.includes("FABRIC_BRIDGE_STALE"), 500);
+        expect(degraded).toContain(deferredError.code);
+        expect(degraded).toContain(deferredError.message);
+        expect(degraded).not.toContain("FABRIC_MESH_STATE_WAL_CAP");
+        expect(degraded).not.toContain("undefined");
+        expect(degraded).not.toContain("reader-secret");
+      }
       await sleep(120); // cover several 25/50/100 ms retry opportunities while still held
       expect(f.local.holds(newcomer.id)).toBe(false);
       expect(f.hub.get(key("participants", newcomer.id))).toBeUndefined();

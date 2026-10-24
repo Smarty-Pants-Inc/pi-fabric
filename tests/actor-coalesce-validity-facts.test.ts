@@ -1,7 +1,8 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import type { AgentRunRequest, AgentRunResult } from "../src/agents/types.js";
 import { ActorManager } from "../src/actors/manager.js";
@@ -10,6 +11,8 @@ import type { CoalescedMeshEvent } from "../src/actors/coalesced-events.js";
 import type { FabricActorActivation, FabricActorRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
+import { ExecutionDeadline } from "../src/runtime/execution-deadline.js";
+import { QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
 
 // Keep reason: #4605 P2-A/P3-1/P3-2, data safety and the attribution boundary.
 // Drive the real monitor receiver, durable queue, sandbox predicate and run boundary.
@@ -104,7 +107,33 @@ const world = () => {
 const staleIds = (actors: ActorManager, id: string) => actors.messages(id).filter(message => message.stale)
   .flatMap(message => (message.data as { invalidatedEventId?: string } | undefined)?.invalidatedEventId ?? []);
 
+// Keep reason: #4605 P3-A/data safety. Use the reviewed record-decisions
+// predicate clock: real QuickJS execution and deadline comparison, with only
+// the deadline getter's clock frozen in each async-local evaluation.
+const withPredicateClock = () => {
+  const clock = new AsyncLocalStorage<{ elapsedMs: number }>();
+  const realExecute = QuickJsRuntime.prototype.execute;
+  const realReached = Object.getOwnPropertyDescriptor(ExecutionDeadline.prototype, "reached")!.get!;
+  const reached = vi.spyOn(ExecutionDeadline.prototype, "reached", "get").mockImplementation(function (this: ExecutionDeadline) {
+    const active = clock.getStore();
+    if (!active) return realReached.call(this) as boolean;
+    // Preserve an existing Date.now spy (the merged-createdAt case); nesting
+    // spyOn/mockRestore here would restore that spy out from under its owner.
+    const now = Date.now;
+    Date.now = () => this.startedAt + active.elapsedMs;
+    try { return realReached.call(this) as boolean; }
+    finally { Date.now = now; }
+  });
+  const execute = vi.spyOn(QuickJsRuntime.prototype, "execute").mockImplementation(function (this: QuickJsRuntime, code, hostCall, options) {
+    return clock.run({ elapsedMs: 0 }, () => realExecute.call(this, code, hostCall, options));
+  });
+  return () => { execute.mockRestore(); reached.mockRestore(); clock.disable(); };
+};
+
 describe("merged validity facts retain each original's own data (#4605 round 3)", () => {
+  // Install after Vitest's restoreMocks; finish cleanup also runs on thrown cases.
+  beforeEach(() => { const restore = withPredicateClock(); onTestFinished(restore); });
+
   it("P2-A: comment then check_run on PR7 with activation.sequence === current.latestActivationSequence retains BOTH", async () => {
     const w = world();
     const actor = await w.create();

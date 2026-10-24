@@ -5059,25 +5059,51 @@ export class ActorManager {
     return refRecord(event.payload)?.untrusted === true || event.coalesced?.some(record => record.origin === "external") === true;
   }
 
-  #foreignInput(actor: ManagedActor, event: ActorQueueItem): boolean {
-    return Boolean(this.#meshOmission(event)) || !senderTrusted(actor.principalScope, event.sender) ||
-      event.coalesced?.some(record => record.untrusted || !senderTrusted(actor.principalScope, record.sender)) === true;
+  #foreignRecord(actor: ManagedActor, record: CoalescedMeshEvent, principal: FabricPrincipal | undefined): boolean {
+    return Boolean(record.untrusted) || record.origin === "external" || record.sender === undefined ||
+      !senderTrusted(actor.principalScope, record.sender) || !record.principal || !principal ||
+      JSON.stringify(record.principal) !== JSON.stringify(principal);
   }
 
-  #batchEnvelope(actor: ManagedActor, event: ActorQueueItem) {
+  #foreignInput(actor: ManagedActor, event: ActorQueueItem, principal: FabricPrincipal | undefined): boolean {
+    return Boolean(this.#meshOmission(event)) || !senderTrusted(actor.principalScope, event.sender) ||
+      event.coalesced?.some(record => this.#foreignRecord(actor, record, principal)) === true;
+  }
+
+  /** Select output lineage before rendering; a dropped principal must not fall back to the primary's. */
+  #runProvenance(actor: ManagedActor, items: ActorQueueItem[]): FabricTurnProvenance | undefined {
+    const item = items[0]!;
+    const external = items.some(event => this.#externalInput(event));
+    const foreign = items.some(event => this.#foreignInput(actor, event, event.provenance?.principal));
+    const provenance = item.provenance ? structuredClone(item.provenance) : undefined;
+    const mixedHistory = items.some(event => this.#meshOmission(event) || event.coalesced?.some(record =>
+      record.untrusted || record.sender === undefined || !senderTrusted(actor.principalScope, record.sender) ||
+      JSON.stringify(record.principal) !== JSON.stringify(event.provenance?.principal)));
+    if (provenance && (mixedHistory || items.length > 1 && (external || foreign || items.some(event =>
+        JSON.stringify(event.provenance?.principal) !== JSON.stringify(item.provenance?.principal))))) delete provenance.principal;
+    return provenance;
+  }
+
+  #batchEnvelope(actor: ManagedActor, event: ActorQueueItem, principal: FabricPrincipal | undefined) {
     return { source: event.source,
-      ...(this.#externalInput(event) || this.#foreignInput(actor, event) ? { untrusted: true } : {}),
+      ...(this.#externalInput(event) || this.#foreignInput(actor, event, principal) ? { untrusted: true } : {}),
       payload: event.payload, id: event.id,
       ...(event.omittedBefore ? { omittedBefore: event.omittedBefore } : {}),
-      ...(event.coalesced?.length ? { coalesced: event.coalesced.map(record => ({ ...record,
-        ...(record.untrusted || !senderTrusted(actor.principalScope, record.sender) ? { untrusted: true } : {}),
-      })) } : {}) };
+      ...(event.coalesced?.length ? { coalesced: event.coalesced.map(record => {
+        if (!this.#foreignRecord(actor, record, principal)) return record;
+        // Sanitize only the rendered copies, never queue history or validity's original events.
+        const { sender: _sender, principal: _principal, payload, ...metadata } = record;
+        if (!payload) return { ...metadata, untrusted: true };
+        const { sender: _payloadSender, principal: _payloadPrincipal, ...original } = payload;
+        return { ...metadata, untrusted: true, payload: original };
+      }) } : {}) };
   }
 
-  #activationTask(actor: ManagedActor, items: ActorQueueItem[], batched: boolean, manifest: boolean): string {
+  #activationTask(actor: ManagedActor, items: ActorQueueItem[], batched: boolean, manifest: boolean,
+    principal: FabricPrincipal | undefined): string {
     const first = items[0]!;
     const external = items.some(event => this.#externalInput(event));
-    const foreign = items.some(event => this.#foreignInput(actor, event));
+    const foreign = items.some(event => this.#foreignInput(actor, event, principal));
     const batchIds = first.batchIds ?? items.map(event => event.id);
     const histories = items.flatMap(event => {
       const older = this.#meshOmission(event);
@@ -5107,7 +5133,7 @@ export class ActorManager {
       ...histories,
       // New history-bearing envelopes stay the final block for existing JSON readers.
       ...(histories.length ? context : []),
-      JSON.stringify(batched ? items.map(event => this.#batchEnvelope(actor, event)) : this.#batchEnvelope(actor, first), null, 2),
+      JSON.stringify(batched ? items.map(event => this.#batchEnvelope(actor, event, principal)) : this.#batchEnvelope(actor, first, principal), null, 2),
       ...(!histories.length ? context : []),
     ].join("\n\n");
   }
@@ -5116,7 +5142,7 @@ export class ActorManager {
     // Use the exact launch serializer: header, trust framing, labels and context
     // count too. The planned manifest already has the same IDs as the real run.
     const images = items.flatMap(event => event.images ?? []);
-    return Buffer.byteLength(this.#activationTask(actor, items, true, true), "utf8") +
+    return Buffer.byteLength(this.#activationTask(actor, items, true, true, this.#runProvenance(actor, items)?.principal), "utf8") +
       (images.length ? Buffer.byteLength(JSON.stringify(images), "utf8") : 0);
   }
 
@@ -6405,18 +6431,9 @@ export class ActorManager {
     capabilityRequirements?: string[],
     capabilityDigest?: string,
   ): AgentRunRequest {
-    // Events posted through an external grant come from outside every Fabric
-    // participant: mark the envelope so the actor never treats them as instructions.
     const items = this.#batchItems(actor.id, item);
-    const external = items.some(event => this.#externalInput(event));
     // Neither a mixed batch nor collapsed history can borrow the primary sender's authority.
-    const foreign = items.some(event => this.#foreignInput(actor, event));
-    const provenance = item.provenance ? structuredClone(item.provenance) : undefined;
-    const mixedHistory = items.some(event => this.#meshOmission(event) || event.coalesced?.some(record =>
-      record.untrusted || record.sender === undefined || !senderTrusted(actor.principalScope, record.sender) ||
-      JSON.stringify(record.principal) !== JSON.stringify(event.provenance?.principal)));
-    if (provenance && (mixedHistory || items.length > 1 && (external || foreign || items.some(event =>
-        JSON.stringify(event.provenance?.principal) !== JSON.stringify(item.provenance?.principal))))) delete provenance.principal;
+    const provenance = this.#runProvenance(actor, items);
     const batched = items.length > 1 || (actor.batchWindowMs! > 0 && !this.#batchBypass(item));
     const roleStamp = actorRoleStamp(actor.instructions, (actor as ManagedActor & { roleStamp?: unknown }).roleStamp);
     const actorSelf = normalizeFabricActorActivationIdentity({
@@ -6432,7 +6449,7 @@ export class ActorManager {
       ...(provenance ? { provenance } : {}),
       // smarty-dev#8935: a restored activation may already have run to completion before a restart.
       ...(item.resumed || item.activationId ? { activationId: item.activationId ?? item.id } : {}),
-      task: this.#activationTask(actor, items, batched, Boolean(item.activationId && item.batchIds)),
+      task: this.#activationTask(actor, items, batched, Boolean(item.activationId && item.batchIds), provenance?.principal),
       name: actor.name,
       runner: actor.runner,
       ...(actor.kernel ? { kernel: actor.kernel } : {}),

@@ -1,13 +1,16 @@
 /**
  * The one gate for every SQLite connection to a mesh state root's state.db (smarty-dev#7548): the store
  * (state-sqlite.ts), the backend tool's FenceDb (backend-migration.ts), the file-mode writer fence's meta read
- * (backend-fence.ts) and the projector (state-projector.ts). A leaf module (node:fs and node:path only, types
- * otherwise), so the file-mode fence can use it without loading the SQLite store. Moved unchanged from
- * state-sqlite.ts (filesystemRefusal, assertPrivatePath, openPinned), plus the StrictModes ancestor walk.
+ * (backend-fence.ts) and the projector (state-projector.ts). A leaf module (node:fs, node:path and the Windows ACL
+ * reader windows-state-acl.ts, types otherwise), so the file-mode fence can use it without loading the SQLite store.
+ * Windows ACL findings are advisory unless PI_FABRIC_MESH_STATE_ACL_ENFORCE is exactly "1" at call time;
+ * filesystem, file-type, inode and POSIX checks remain mandatory.
  */
+import { Console } from "node:console";
 import fs from "node:fs";
 import path from "node:path";
 import type { SqliteConnection, SqliteOpener } from "./state-sqlite.js";
+import { windowsStateAclRefusal } from "./windows-state-acl.js";
 
 export class MeshStateUnsupportedError extends Error {
   readonly code = "FABRIC_MESH_STATE_UNSUPPORTED";
@@ -88,14 +91,39 @@ export const filesystemRefusal = (root: string,
  * type; owned by this uid; no group or other write. A state FILE must also be owner-only (0600): mesh state holds
  * credentials (smarty-dev#6787). An owned file with group/other bits is tightened in place, through an
  * O_NOFOLLOW descriptor whose dev/ino must match the lstat, then re-checked. Anything else is refused
- * (FABRIC_MESH_STATE_UNSUPPORTED). A missing path passes. Windows has no uid or mode bits here, so only the
- * type and symlink checks apply.
+ * (FABRIC_MESH_STATE_UNSUPPORTED). A missing path passes. Windows retains the type/symlink checks, but has no uid
+ * or mode bits: an existing path gets an advisory native ACL read, enforced only with
+ * PI_FABRIC_MESH_STATE_ACL_ENFORCE=1: the path itself as a strict directory or file target (the elevated
+ * Administrators owner exception included), every parent as an ancestor. Standalone enforced requests always get a
+ * fresh native proof. State-root callers instead use the full root plan, whose successful Windows proof is process-cached
+ * by root/DB identity in the ACL reader; checkpoint flag writers reuse that same plan plus cheap directory checks.
+ * The read-only flag scan uses assertGatedFlagDirectory instead.
  */
 export const assertPrivatePath = (file: string, kind: "directory" | "file"): fs.Stats | undefined => {
+  const stat = checkPrivatePath(file, kind);
+  if (stat && process.platform === "win32") assertWindowsAcl(file, { role: kind, files: [], directories: [] }, false);
+  return stat;
+};
+
+/**
+ * smarty-dev#8920: the checkpoint flag directory for the READ-ONLY advisory scan (checkpointFlagRaised, polled on
+ * every writer-lock attempt of an open store). POSIX: exactly assertPrivatePath (lstat, type, uid, mode). Windows:
+ * the lstat half only (no symbolic link, a directory), and no native ACL read, so polling never spawns a child. The
+ * native snapshot includes this directory at root admission (assertPrivateStateRoot names it among its strict targets).
+ * Findings warn by default; only opt-in enforcement establishes the following privacy guarantees: an existing foreign
+ * grant (inherit-only included) refuses admission; a directory created later inherits the validated root's DACL,
+ * whose inheritable grants were judged as strictly. Re-ACLing or replacing it needs WRITE_DAC, ownership or delete
+ * rights that enforcement refused to every foreign SID. The lstat runs on every call, independently of the reader's
+ * root/DB identity cache. Same-identity user/Admin DACL mutations after admission are outside that cache's contract.
+ * Writers use the same advisory-or-enforced root plan and this cheap directory check before writing.
+ */
+export const assertGatedFlagDirectory = (dir: string): fs.Stats | undefined => checkPrivatePath(dir, "directory");
+
+// The lstat half of assertPrivatePath. Windows: type and symlink checks only; the gate's callers use the matching
+// root plan (assertWindowsAcl) covering state files, flag directory and ancestors, with identity caching in the reader.
+const checkPrivatePath = (file: string, kind: "directory" | "file"): fs.Stats | undefined => {
   const stat = fs.lstatSync(file, { throwIfNoEntry: false });
   if (!stat) return undefined;
-  // ponytail: Windows keeps main's behavior (type and symlink checks only, no ACL check); failing closed would break
-  // Windows mesh users. The ACL check was cut from smarty-dev#7548 to smarty-dev#8920.
   const posix = process.platform !== "win32" && typeof process.getuid === "function";
   const uid = posix ? process.getuid!() : undefined;
   const why = stat.isSymbolicLink() ? "is a symbolic link"
@@ -236,28 +264,158 @@ const fdSnapshot = (): Map<string, string> | undefined => {
 };
 
 /**
- * smarty-dev#7548: the ONE gate for every connection to a state root's state.db. A local filesystem, private
- * ancestors, a private root and state files, and a connection bound to the checked inode (openPinned, #7784).
+ * The ONE gate for every connection to a state root's state.db. A local filesystem, mandatory POSIX
+ * privacy checks, advisory Windows ACL checks (enforced only by explicit opt-in), mandatory file-type checks and
+ * a connection bound to the checked inode (openPinned).
+ * `create` (smarty-dev#8920, Windows creation paths only): the exclusive create of a missing state.db, run AFTER the
+ * root half (filesystem, ancestors, root, state files and flag directory: the normal root plan) and BEFORE the
+ * state files' lstat and the pinned open, so a refused root still gets no file (#846 SEC P2). When state.db was missing
+ * for that first proof, enforcement requires a second full native proof after the callback before the open. Existing
+ * state.db reuses the reader's successful admission proof only for the same root/DB identities and target plan.
+ * Advisory mode skips repeat ACL reads for a previously warned path, never the mandatory checks below.
+ * A state.db it creates inherits the root's DACL, whose inheritable grants the read judged (advisory unless enforced).
+ * POSIX callers keep their own sequence
+ * (assertPrivateStateRoot, the create, then this gate without `create`).
  */
-export const openPrivateStateDb = (file: string, open: SqliteOpener): SqliteConnection => {
-  assertPrivateStateRoot(path.dirname(file));
+export const openPrivateStateDb = (file: string, open: SqliteOpener, create?: () => void): SqliteConnection => {
+  // A no-create open must prove DB presence in the native snapshot immediately. A create path gets the normal
+  // pre-create allowance for confirmed absence, then the mandatory post-create proof below requires presence.
+  const requireDatabase = process.platform === "win32" && create === undefined;
+  assertPrivateStateRoot(path.dirname(file), path.basename(file), requireDatabase);
+  create?.();
+  // Always rerun the normal Windows root gate after the callback. With enforcement, stable known IDs hit the complete
+  // cached proof; unknown IDs and newly created DBs take a fresh native proof, so an EEXIST/planted winner is never
+  // lstat-only.
+  if (process.platform === "win32" && create !== undefined) assertPrivateStateRoot(path.dirname(file), path.basename(file), true);
   return openPinned(file, open, assertPrivateStateFiles(file));
 };
 
-/** The root half of the gate: run it before creating state.db too, so a refused root gets no file (#846 SEC P2). */
-export const assertPrivateStateRoot = (root: string): void => {
+/**
+ * Prime an EXISTING Windows state.db's normal root proof before any bounded lock/busy operation. No SQLite open,
+ * schema work or creation: a missing DB returns after one lstat and retains fresh pre/post-create proofs under enforcement.
+ * Successful identity-keyed caching (and cheap lexical ancestor/reparse guards on hits) belongs to the ACL reader;
+ * advisory findings are separately memoized by this gate without establishing trust.
+ */
+export const admitExistingStateRoot = (root: string): void => {
+  if (process.platform !== "win32") return;
+  try { if (fs.lstatSync(path.join(root, "state.db"), { throwIfNoEntry: false }) === undefined) return; }
+  catch { /* Indeterminate presence is not absence: let the full native proof decide, without caching unknown IDs. */ }
+  assertPrivateStateRoot(root, "state.db", true);
+};
+
+/** The root half of the gate: run before creating state.db; Windows ACL findings warn unless opted into enforcement. */
+export const assertPrivateStateRoot = (root: string, db = "state.db", requireDatabase = false): void => {
   const refusal = filesystemRefusal(root);
   if (refusal) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state needs a local filesystem: ${refusal}`);
   assertPrivateAncestors(root);
-  assertPrivatePath(root, "directory");
+  checkPrivatePath(root, "directory");
+  if (process.platform === "win32") assertWindowsAcl(root, { ...stateTargets(root, db), requireDatabase }, false);
+};
+
+/**
+ * smarty-dev#8920: creates a missing state root (mode 0700). POSIX: the same recursive mkdir as before, nothing
+ * else. Windows defaults to recursive mkdir plus an advisory root snapshot unless already warned, without ACL
+ * preflights or mutation.
+ * Only PI_FABRIC_MESH_STATE_ACL_ENFORCE=1 enables the volume-down lexical checks and ancestor ACL preflights BEFORE
+ * each non-recursive mkdir, followed by an explicit owner and protected private DACL on the root we just created.
+ * In enforcement mode an EEXIST winner is refused, never repaired or adopted; existing roots are gated at admission/open.
+ * Neither mode repairs an existing root. Windows callers run this BEFORE the fence
+ * (custody-lock.ts and fence-lock.ts create the root too, untracked).
+ */
+export const createStateRoot = (root: string): void => {
+  if (process.platform !== "win32") { fs.mkdirSync(root, { recursive: true, mode: 0o700 }); return; }
+  if (!windowsAclEnforced()) {
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    checkPrivatePath(root, "directory");
+    assertWindowsAcl(root, stateTargets(root, "state.db"), false);
+    return;
+  }
+  const chain = [path.resolve(root)];
+  while (path.dirname(chain[0]!) !== chain[0]) chain.unshift(path.dirname(chain[0]!));
+  const refuse = (why: string) => new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${root}: ${why}`);
+  // Start at the volume: lstat of a descendant alone would follow an unchecked junction in its parent path.
+  const existing = (): number => {
+    for (const [index, component] of chain.entries()) {
+      const stat = fs.lstatSync(component, { throwIfNoEntry: false });
+      if (!stat) return index;
+      if (stat.isSymbolicLink()) throw refuse(`${component} is a reparse point (junction or symbolic link); `
+        + "set the mesh state root to a path with no junctions or symbolic links in it");
+      if (!stat.isDirectory()) throw refuse(`${component} is not a directory`);
+    }
+    return chain.length;
+  };
+  const firstMissing = existing();
+  if (firstMissing === chain.length) return;
+  for (let index = firstMissing; index < chain.length; index += 1) {
+    const parent = chain[index - 1];
+    if (!parent || existing() !== index) throw refuse("its directory chain changed before creation");
+    // The immediate parent is a creation boundary: its foreign inheritable write grants must not reach the new child.
+    // Distant ancestors retain the ordinary add-child/inherit-only policy (the default profile/volume controls).
+    assertWindowsAcl(parent, { role: "creation-parent", files: [], directories: [] }, false);
+    if (existing() !== index) throw refuse("its directory chain changed during the ancestor ACL read");
+    try { fs.mkdirSync(chain[index]!, { mode: 0o700 }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw refuse(`${chain[index]} appeared during creation; it was not adopted`);
+      throw error;
+    }
+  }
+  if (existing() !== chain.length) throw refuse("its directory chain changed before setting the private ACL");
+  assertWindowsAcl(root, stateTargets(root, "state.db"), true);
+};
+
+// The flag directory's name (state-sqlite.ts CHECKPOINT_FLAGS): checked with the state files when it exists.
+const CHECKPOINT_FLAGS = "state-checkpoint.flags";
+const stateTargets = (root: string, db: string) => {
+  const file = path.join(root, db);
+  return { files: [file, `${file}-wal`, `${file}-shm`, `${file}-journal`], directories: [path.join(root, CHECKPOINT_FLAGS)] };
+};
+// The normal root plan must match at early admission, open and checkpoint flag writes. The ACL reader alone caches
+// verified successful root-role proofs for stable root+DB identities (volume and lossless file IDs, never ctime).
+// Missing/unknown DB identity and unverified tooling fallbacks never cache there; enforced standalone target,
+// creation-parent and protect requests stay fresh. Enforcement gives a missing DB full pre/post-create snapshots.
+// The gate separately memoizes advisory findings and accepted tooling gaps, not admissions. Only enforcement
+// creates N missing directories with N creation-parent preflights plus protect/readback; those cannot satisfy the open's plan.
+type AclTargets = { role?: "root" | "directory" | "file" | "ancestor" | "creation-parent"; files: string[]; directories: string[]; requireDatabase?: boolean };
+// Read on every call: removing the setting restores advisory startup without changing any ACL.
+const windowsAclEnforced = (): boolean => process.env.PI_FABRIC_MESH_STATE_ACL_ENFORCE === "1";
+// Private stderr channel: Pi may suppress emitWarning, and application console spies must not see ACL diagnostics.
+const aclDiagnostics = new Console({ stdout: process.stderr, stderr: process.stderr });
+// Advisory findings and tooling gaps only, never proof. Do not evict and restart warnings on each busy-root poll.
+const warnedWindowsAclRoots = new Set<string>();
+const MAX_WINDOWS_ACL_WARNINGS = 64;
+const windowsAclFinding = (root: string, why: string, cause?: unknown): void => {
+  // Enforcement precedes warning dedupe, so a previous advisory can never authorize an enforced open.
+  if (windowsAclEnforced()) {
+    throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${root}: ${why}`, cause === undefined ? undefined : { cause });
+  }
+  const key = path.resolve(root).toLowerCase();
+  if (warnedWindowsAclRoots.has(key) || warnedWindowsAclRoots.size >= MAX_WINDOWS_ACL_WARNINGS) return;
+  warnedWindowsAclRoots.add(key);
+  aclDiagnostics.warn(`[pi-fabric] FABRIC_MESH_STATE_ACL_ADVISORY: Fabric mesh SQLite state Windows ACL privacy finding for ${root}: ${why}. `
+    + "Continuing with advisory ACL checks. Set PI_FABRIC_MESH_STATE_ACL_ENFORCE=1 to enforce refusal; "
+    + "remove/unset PI_FABRIC_MESH_STATE_ACL_ENFORCE to restore warning-only startup (no ACL changes needed).");
+};
+const assertWindowsAcl = (root: string, targets: AclTargets, protect: boolean): void => {
+  // This advisory cache is not a trust or security proof: skip repeat ACL reads after a finding or tooling gap.
+  // Exact opt-in always consults the original reader, including its verified successful identity cache.
+  const key = path.resolve(root).toLowerCase();
+  if (!windowsAclEnforced() && warnedWindowsAclRoots.has(key)) return;
+  let real: string;
+  // The real chain is the parent's: the target itself is never followed; its reparse finding uses the same policy.
+  try { real = path.join(fs.realpathSync.native(path.dirname(path.resolve(root))), path.basename(path.resolve(root))); }
+  catch (error) { windowsAclFinding(root, "its real path is unreadable", error); return; }
+  const why = windowsStateAclRefusal({ root, real, protect, ...targets, onUnverified: () => {
+    // Keep failures out of the reader's successful identity cache and out of enforced calls' memory.
+    if (!windowsAclEnforced() && warnedWindowsAclRoots.size < MAX_WINDOWS_ACL_WARNINGS) warnedWindowsAclRoots.add(key);
+  } });
+  if (why) windowsAclFinding(root, why);
 };
 
 // StrictModes (smarty-dev#7548): every ancestor of the root, on the lexical and the real chain, is owned by this
 // uid or root, and a directory among them is not group or other writable unless sticky (like /tmp). Otherwise
 // another user could swap the root out from under the checks.
 const assertPrivateAncestors = (root: string): void => {
-  // ponytail: no ancestor walk on Windows (none existed on main; no uid or mode bits here). The Windows ACL check was
-  // cut from smarty-dev#7548 to smarty-dev#8920; it covers the ancestors too.
+  // Windows: no uid or mode bits; the ACL snapshot (assertWindowsAcl, smarty-dev#8920) judges the ancestors.
   if (process.platform === "win32" || typeof process.getuid !== "function") return;
   const uid = process.getuid();
   const above = (dir: string): string[] => {
@@ -276,9 +434,10 @@ const assertPrivateAncestors = (root: string): void => {
 
 // The validated lstat of state.db is returned: openPinned binds the connection to it.
 const assertPrivateStateFiles = (file: string): fs.Stats => {
-  assertPrivatePath(path.dirname(file), "directory"); // nobody else may swap files in the root
-  for (const name of [`${file}-wal`, `${file}-shm`]) assertPrivatePath(name, "file");
-  const stat = assertPrivatePath(file, "file");
+  // lstat only: the matching root proof (assertPrivateStateRoot, just before) covers these Windows ACLs.
+  checkPrivatePath(path.dirname(file), "directory"); // type checks always; Windows ACL privacy is opt-in
+  for (const name of [`${file}-wal`, `${file}-shm`]) checkPrivatePath(name, "file");
+  const stat = checkPrivatePath(file, "file");
   if (!stat?.isFile()) throw new MeshStateUnsupportedError(`Fabric mesh SQLite state refuses ${file}: it is not a regular file`);
   return stat;
 };

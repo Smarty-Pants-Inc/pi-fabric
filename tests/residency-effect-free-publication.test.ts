@@ -15,18 +15,80 @@ import { readParticipantFile } from "../src/topology/participant-files.js";
 import * as fileLock from "../src/residency/file-lock.js";
 import * as removal from "../src/storage/verified-remove.js";
 import * as atomic from "../src/core/atomic-write.js";
+import { windowsStateAclRefusal } from "../src/mesh/windows-state-acl.js";
 
 const participantKey = (id: string) => "topology/participants/" + createHash("sha256").update(id).digest("hex");
 const fixtureRemove = fs.rmSync.bind(fs); // Only the freshly allocated fixture root may actually be removed.
 
+// sha256 of the exact UTF-16LE -EncodedCommand bytes: windowsSecurityPowerShell's fixed module prefix plus the
+// reviewed read-only SNAPSHOT_ACLS reader (src/mesh/windows-state-acl.ts). A change to either is re-reviewed and re-pinned.
+const ACL_READER_SHA256 = "23ef37816a7b37876a9becaa552fa07c60716c1e978e75ba9a4e966e84841b46";
+const ACL_READER_FLAGS = ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"];
+const ACL_READER_OPTIONS = "encoding,env,maxBuffer,stdio,timeout,windowsHide"; // No shell, cwd, argv0, input, ...
+type ChildHost = { platform: NodeJS.Platform; environment: NodeJS.ProcessEnv; execute: (...call: unknown[]) => unknown };
+const plain = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+// Windows environment names are case-insensitive: exactly one spelling, the production one, or nothing.
+const onlyVariable = (env: Record<string, unknown>, name: string): unknown => {
+  const hits = Object.entries(env).filter(([key]) => key.toLowerCase() === name.toLowerCase());
+  return hits.length === 1 && hits[0]![0] === name ? hits[0]![1] : undefined;
+};
+
+/** The startup child exception as a pure predicate of one execFileSync call (platform-injectable, so the Windows
+ * input contract is checked on every OS). It returns the first snapshot path only for the exact pinned reader:
+ * pinned PowerShell 5.1 file, exact flags with no extra argv, canonical encoding of the pinned script bytes, the
+ * exact option keys, its own system module path, and a read-only (`protect: null`) request whose every path is one
+ * of `roots`, inside them, or a lexical/real ancestor. Anything else is undefined. */
+const aclSnapshotReader = (platform: NodeJS.Platform, environment: NodeJS.ProcessEnv, roots: string[]) => {
+  const bases = roots.map(base => path.win32.resolve(base).toLowerCase());
+  const covered = (target: unknown) => {
+    if (typeof target !== "string") return false;
+    const at = path.win32.resolve(target).toLowerCase();
+    return bases.some(base => at === base || at.startsWith(base + "\\") || base.startsWith(at.endsWith("\\") ? at : at + "\\"));
+  };
+  return (file: unknown, args: unknown, options: unknown): string | undefined => {
+    if (platform !== "win32") return undefined;
+    const systemRoot = Object.entries(environment).find(([key]) => key.toLowerCase() === "systemroot")?.[1];
+    if (!systemRoot || !path.win32.isAbsolute(systemRoot)) return undefined;
+    const home = path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0");
+    if (file !== path.win32.join(home, "powershell.exe")) return undefined;
+    if (!Array.isArray(args) || args.length !== ACL_READER_FLAGS.length + 1
+      || ACL_READER_FLAGS.some((flag, index) => args[index] !== flag)) return undefined;
+    const encoded: unknown = args[ACL_READER_FLAGS.length];
+    if (typeof encoded !== "string") return undefined;
+    const script = Buffer.from(encoded, "base64");
+    if (script.toString("base64") !== encoded || createHash("sha256").update(script).digest("hex") !== ACL_READER_SHA256) return undefined;
+    if (!plain(options) || Object.keys(options).sort().join() !== ACL_READER_OPTIONS || !plain(options.env)) return undefined;
+    if (onlyVariable(options.env, "PSModulePath") !== path.win32.join(home, "Modules")) return undefined;
+    let request: unknown;
+    try { request = JSON.parse(String(onlyVariable(options.env, "PI_FABRIC_STATE_ACL"))); } catch { return undefined; }
+    if (!plain(request) || Object.keys(request).sort().join() !== "paths,protect") return undefined;
+    const { protect, paths } = request;
+    // Read-only snapshot only: a protect request would run icacls, which startup here never needs.
+    if (protect !== null || !Array.isArray(paths) || paths.length === 0 || !paths.every(covered)) return undefined;
+    return String(paths[0]);
+  };
+};
+
 /** #4664: every product deletion is recorded BEFORE emulation by rename. No
  * original delete is delegated, even for lock receipts or already absent files.
- * /proc/self/fd paths are resolved while their directory descriptor is held. */
-const recordDeletes = (root: string) => {
+ * /proc/self/fd paths are resolved while their directory descriptor is held.
+ * Child processes are violations. The one exception is startup admission before
+ * `seal()`: the exact pinned read-only native mesh-state ACL snapshot (aclSnapshotReader;
+ * Windows SQLite only) runs for real, so the gate admits this root as production does
+ * instead of failing open uncached on a guard throw. It deletes nothing and sets no ACL.
+ * After `seal()` every child, that reader included, is a violation. `host` is injectable
+ * only so the guard probe below can stub the executor and pose as Windows. */
+const recordDeletes = (root: string, host: ChildHost = {
+  platform: process.platform, environment: process.env, execute: childProcess.execFileSync as unknown as ChildHost["execute"],
+}) => {
   const grave = path.join(root, "delete-emulation");
   fs.mkdirSync(grave, { mode: 0o700 });
   const records: Array<{ api: string; target: string; present: boolean }> = [];
   const violations: string[] = [];
+  const admissions: string[] = [];
+  let sealed = false;
+  const aclSnapshot = aclSnapshotReader(host.platform, host.environment, [root, fs.realpathSync.native(root)]);
   const emulate = (api: string, target: fs.PathLike, force = false) => {
     const raw = String(target);
     const directory = path.dirname(raw);
@@ -77,9 +139,13 @@ const recordDeletes = (root: string) => {
     return result;
   });
   for (const api of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"] as const) {
-    vi.spyOn(childProcess, api).mockImplementation(() => { violations.push(`child:${api}`); throw new Error(`No child processes: ${api}`); });
+    vi.spyOn(childProcess, api).mockImplementation(((...call: unknown[]) => {
+      const admitted = !sealed && api === "execFileSync" ? aclSnapshot(call[0], call[1], call[2]) : undefined;
+      if (admitted !== undefined) { admissions.push(admitted); return host.execute(...call); }
+      violations.push(`child:${api}`); throw new Error(`No child processes: ${api}`);
+    }) as never);
   }
-  return { records, violations };
+  return { records, violations, admissions, seal: () => { sealed = true; } };
 };
 
 const fixture = async (files = false, backend: "file" | "sqlite" = "file") => {
@@ -141,6 +207,10 @@ const fixture = async (files = false, backend: "file" | "sqlite" = "file") => {
     expect(host.participants.heartbeatArmed).toBe(true);
     expect(host.participants.options.heartbeatMs).toBeUndefined();
     host.participants.suspend();
+    // Startup admission is real and complete (non-vacuous exactly for Windows SQLite). From here on, hot path,
+    // failed-mesh and registry/generation counterexamples and close included, any child is a violation.
+    expect(safety.admissions.length > 0).toBe(process.platform === "win32" && backend === "sqlite");
+    safety.seal();
     return { root, config, host, actorRoots, acquired, acquisitions, custody, clear, observe, close };
   } catch (error) { await close(); throw error; }
 };
@@ -327,5 +397,78 @@ describe("effect-free resident publication (#8526)", () => {
       expect(f.host.participants.get(actor.id, Date.now(), { fresh: true })).toMatchObject({ status: "stopped", stale: false });
       expect(f.host.participants.canConsumeMesh()).toBe(true);
     } finally { await f.close(); }
+  });
+});
+
+// Guard matching only, on every OS: no NTFS ACL is read here and no child runs. Each executor is a stub.
+describe("startup ACL reader exception admits only the exact pinned reader", () => {
+  it("refuses marker lookalikes, extra argv, module, protect and foreign-target variants, and everything after seal", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "effect-free-publication-"));
+    const foreign = fs.mkdtempSync(path.join(os.tmpdir(), "effect-free-publication-"));
+    try {
+      vi.stubEnv("SystemRoot", "C:\\Windows");
+      // Record the production reader's own execFileSync calls; the stub returns non-JSON, so nothing runs.
+      const captured: unknown[][] = [];
+      const capture = vi.spyOn(childProcess, "execFileSync").mockImplementation(((...call: unknown[]) => {
+        captured.push(call); return "not a snapshot";
+      }) as never);
+      const read = (at: string, protect?: true) => windowsStateAclRefusal({ root: at, real: fs.realpathSync.native(at),
+        files: [path.join(at, "state.db")], directories: [], ...(protect ? { protect } : {}) });
+      for (const refusal of [read(root), read(root, true), read(foreign)]) expect(refusal).toMatch(/unreadable Windows ACL snapshot/);
+      capture.mockRestore();
+      expect(captured).toHaveLength(3);
+      const [exact, protect, foreignTarget] = captured as [unknown[], unknown[], unknown[]];
+      const [file, args, options] = exact as [string, string[], { env: NodeJS.ProcessEnv }];
+      const request = (call: unknown[]) => JSON.parse((call[2] as typeof options).env.PI_FABRIC_STATE_ACL!) as { protect: unknown };
+      expect(request(exact).protect).toBeNull();
+      expect(request(protect).protect).toBe(path.win32.resolve(root));
+      const encode = (script: string) => Buffer.from(script, "utf16le").toString("base64");
+      const reader = Buffer.from(args[4]!, "base64").toString("utf16le");
+      const prefix = reader.slice(0, reader.indexOf("\n", reader.indexOf("Import-Module")) + 1);
+      const destructive = "Remove-Item -LiteralPath $env:TEMP -Recurse -Force"; // Never executed: the executor is a stub.
+      const lookalike = prefix + "# $env:PI_FABRIC_STATE_ACL GetSecurityDescriptorBinaryForm\n" + destructive + "\n";
+      // Both scripts contain the two markers that the earlier contains-only guard accepted.
+      for (const script of [lookalike, reader + destructive]) {
+        expect(script).toContain("$env:PI_FABRIC_STATE_ACL");
+        expect(script).toContain("GetSecurityDescriptorBinaryForm");
+      }
+      const flags = args.slice(0, 4);
+      const forbidden: Record<string, unknown[]> = {
+        "marker lookalike script": [file, [...flags, encode(lookalike)], options],
+        "reader with an appended command": [file, [...flags, encode(reader + destructive)], options],
+        "non-canonical encoding of the reader": [file, [...flags, args[4] + "\n"], options],
+        "extra trailing argv": [file, [...args, "-Command", destructive], options],
+        "extra leading argv": [file, ["-ExecutionPolicy", "Bypass", ...args], options],
+        "other PowerShell binary": ["C:\\Program Files\\PowerShell\\7\\pwsh.exe", args, options],
+        "wrong module path": [file, args, { ...options, env: { ...options.env, PSModulePath: "C:\\Users\\Public\\Modules" } }],
+        "second module path spelling": [file, args, { ...options, env: { ...options.env, psmodulepath: "C:\\Users\\Public\\Modules" } }],
+        "shell option": [file, args, { ...options, shell: true }],
+        "protect request": protect,
+        "foreign target": foreignTarget,
+      };
+      const executed = vi.fn((..._call: unknown[]) => "executor stub: nothing ran");
+      const safety = recordDeletes(root, { platform: "win32", environment: process.env, execute: executed });
+      const execFile = (call: unknown[]) => (childProcess.execFileSync as unknown as (...call: unknown[]) => unknown)(...call);
+      for (const [name, call] of Object.entries(forbidden)) expect(() => execFile(call), name).toThrow("No child processes: execFileSync");
+      expect(() => (childProcess.spawnSync as unknown as (...call: unknown[]) => unknown)(...exact)).toThrow("No child processes: spawnSync");
+      expect(aclSnapshotReader("linux", process.env, [root])(file, args, options)).toBeUndefined(); // Never off Windows.
+      expect(executed).not.toHaveBeenCalled();
+      expect(safety.admissions).toEqual([]);
+      // The exact production reader for this root is admitted once, before seal, through the stubbed executor.
+      expect(execFile(exact)).toBe("executor stub: nothing ran");
+      expect(executed).toHaveBeenCalledOnce();
+      expect(executed).toHaveBeenCalledWith(...exact);
+      expect(safety.admissions).toEqual([path.win32.resolve(root)]);
+      safety.seal();
+      expect(() => execFile(exact)).toThrow("No child processes: execFileSync");
+      expect(executed).toHaveBeenCalledOnce();
+      expect(safety.violations).toEqual([...Object.keys(forbidden).map(() => "child:execFileSync"),
+        "child:spawnSync", "child:execFileSync"]);
+      expect(safety.records).toEqual([]);
+    } finally {
+      vi.restoreAllMocks();
+      vi.unstubAllEnvs();
+      for (const at of [root, foreign]) fixtureRemove(at, { recursive: true, force: true });
+    }
   });
 });

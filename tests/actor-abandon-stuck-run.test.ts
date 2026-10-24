@@ -16,7 +16,13 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 // the stuck-run check only alarms (correct: with contact lost the tree may live). Before this round nothing kept the
 // queue: the owner's agents.stop(runId) threw "custody retained", resetSession hung, and an actor stop dropped the
 // queue. ActorManager.abandonStuckRun (agents.abandonStuckRun) is the owner's documented, queue-preserving way out.
+// Round 6 (P2): it accepts exactly the runs the actor-run-stuck alarm reports (past the stuck threshold, and the host
+// cannot show the run running), so these tests skew the clock past the threshold, and a healthy run is refused.
 const MINUTE = 60_000;
+const notStuckYet = (runId: string) =>
+  `did not abandon run ${runId}: it is not stuck: it is not past its stuck threshold, so no actor-run-stuck alarm reports it; nothing changed`;
+const shownRunning = (runId: string) =>
+  `did not abandon run ${runId}: it is not stuck: this host shows it running, so no actor-run-stuck alarm reports it; nothing changed`;
 const roots: string[] = [];
 const closers: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -119,6 +125,12 @@ describe("abandonStuckRun: a run whose transport latched lost contact (smarty-de
     actors.tell(actor.id, "MSG-2");
     await ticks();
     expect(actors.status(actor.id)).toMatchObject({ queued: 1, inFlightRun: { id: runId } });
+    // Round 6 (P2): before the threshold no actor-run-stuck alarm reports the run, so the call is refused, changing nothing.
+    expect(stuckAlarms(mesh, actor.id)).toHaveLength(0);
+    expect(() => actors.abandonStuckRun(actor.id, runId)).toThrow(notStuckYet(runId));
+    await ticks();
+    expect(actors.status(actor.id)).toMatchObject({ queued: 1, inFlightRun: { id: runId } });
+    expect(starts).toEqual(["MSG-1"]);
 
     // Stuck BEFORE the call: past the threshold the check proves the worker gone and alarms, naming the remedy; for a
     // day of sweeps, far past every confirmation gap, nothing unwinds, because the manager cannot prove the tree gone.
@@ -135,9 +147,13 @@ describe("abandonStuckRun: a run whose transport latched lost contact (smarty-de
     await expect(agents.executionExit(runId)).resolves.toEqual({ exited: false });
     expect(failures(actors, actor.id, runId)).toHaveLength(0);
     expect(delivered).toEqual([]);
-    // The repeat alarm's notice to the owner's Main names the remedy with its ids.
+    // The repeat alarm's notice to the owner's Main names the remedy with its ids, and (round 6, P1) the process check
+    // that finds the run's detached pi runner: its environment, plus the worker's group. The call stops no process.
     expect(notices.at(-1)).toContain(`Fabric host notice: actor-run-stuck; reason: worker-gone.`);
-    expect(notices.at(-1)).toContain(`agents.abandonStuckRun({ id: ${JSON.stringify(actor.id)}, runId: ${JSON.stringify(runId)} }) ends that run and keeps the queue.`);
+    expect(notices.at(-1)).toContain(`grep -lzx PI_FABRIC_PARENT_RUN=${runId} /proc/[0-9]*/environ 2>/dev/null`);
+    expect(notices.at(-1)).toContain("pgrep -a -g <sessionId>");
+    expect(notices.at(-1)).not.toContain("pgrep -af");
+    expect(notices.at(-1)).toContain(`agents.abandonStuckRun({ id: ${JSON.stringify(actor.id)}, runId: ${JSON.stringify(runId)} }) ends the actor's wait (it stops no process) and keeps the queue.`);
 
     // A wrong run id is refused and changes nothing.
     expect(() => actors.abandonStuckRun(actor.id, "f".repeat(32)))
@@ -181,6 +197,9 @@ describe("abandonStuckRun: a run whose transport latched lost contact (smarty-de
  * no record and no result. The registry is persistent, so a second manager on it can be a non-owner.
  */
 const stubbed = async () => {
+  const realNow = Date.now.bind(Date);
+  const clock = { skew: 0 };
+  vi.spyOn(Date, "now").mockImplementation(() => realNow() + clock.skew);
   const root = tempRoot("pi-fabric-abandon-gates-");
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, {
@@ -217,12 +236,17 @@ const stubbed = async () => {
     expect(launches).toEqual(["MSG-1"]);
     expect(await pending(answer)).toBe("pending");
   };
-  return { root, mesh, agents, actors, meshConfig, actor, answer, launches, unchanged, phantom: phantom!, release: () => releasePhantom?.() };
+  return { root, mesh, agents, actors, meshConfig, actor, answer, launches, unchanged, clock, phantom: phantom!, release: () => releasePhantom?.() };
 };
 
 describe("abandonStuckRun: the gates, and a run with no result (smarty-dev#16333 round 5)", () => {
   it("refuses a wrong run id, an unknown actor and a non-owner, changing nothing; the owner's call fails the run operator-abandoned and keeps the queue", async () => {
     const s = await stubbed();
+    // Round 6 (P2): the incident's phantom while it is young. No actor-run-stuck alarm reports it yet: refused.
+    expect(() => s.actors.abandonStuckRun(s.actor.id, s.phantom)).toThrow(notStuckYet(s.phantom));
+    await s.unchanged();
+    // Past the threshold the alarm's condition holds: this host never registered the run (worker-unverified).
+    s.clock.skew = 31 * MINUTE;
     expect(() => s.actors.abandonStuckRun(s.actor.id, "0".repeat(32)))
       .toThrow(`did not abandon run ${"0".repeat(32)}: it is not the in-flight run (${s.phantom}); nothing changed`);
     // Only the exact run id: a prefix of the in-flight run is not it.
@@ -268,6 +292,7 @@ describe("abandonStuckRun: the gates, and a run with no result (smarty-dev#16333
 
   it("refuses while its host is closing, changing nothing", async () => {
     const s = await stubbed();
+    s.clock.skew = 31 * MINUTE; // past the threshold: only the closing host refuses it
     const closing = s.actors.close();
     expect(() => s.actors.abandonStuckRun(s.actor.id, s.phantom))
       .toThrow(`did not abandon run ${s.phantom}: this host is closing; nothing changed`);
@@ -276,5 +301,61 @@ describe("abandonStuckRun: the gates, and a run with no result (smarty-dev#16333
     s.release();
     await closing;
     expect(s.launches).toEqual(["MSG-1"]);
+  }, 60_000);
+});
+
+// smarty-dev#16333 round 6 (P2), the round-5 review's probe case 2: the call was accepted on a healthy run (0.45 s old,
+// worker alive, no alarm), so MSG-2 started while MSG-1's worker still ran and MSG-1's real result was lost. Now the call
+// takes the actor-run-stuck alarm's own condition: a healthy run is refused while young and past its threshold alike.
+describe("abandonStuckRun: a healthy run (smarty-dev#16333 round 6)", () => {
+  it("refuses a healthy run, young or past its stuck threshold, changing nothing: no actor-run-stuck alarm reports it", async () => {
+    const realNow = Date.now.bind(Date);
+    const clock = { skew: 0 };
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + clock.skew);
+    const root = tempRoot("pi-fabric-abandon-healthy-");
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
+    const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs") });
+    const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {},
+      { actorRoot: path.join(root, "actors"), persistent: false, retentionSweepMs: 20 });
+    closers.push(() => agents.close(), () => actors.close());
+    const starts: string[] = [];
+    const run = agents.run.bind(agents);
+    vi.spyOn(agents, "run").mockImplementation((request, ...rest) => {
+      starts.push(/MSG-\d/.exec(request.task)?.[0] ?? "unknown");
+      return run(request, ...rest);
+    });
+    const actor = await actors.create({ name: "healthy", instructions: "Run", coalesce: false, delivery: "followUp", triggerTurn: false });
+    const answer = actors.ask(actor.id, "HANG_WITH_PROGRESS MSG-1").then(message => ({ message }), (error: unknown) => ({ error }));
+    await waitFor(() => actors.status(actor.id).inFlightRun !== undefined);
+    const runId = actors.status(actor.id).inFlightRun!.id;
+    // Teardown: end the hung run itself (closers run in reverse, so this runs first).
+    closers.push(async () => { await agents.stop(runId).catch(() => undefined); });
+    await waitFor(() => fs.existsSync(path.join(agents.runDirectory(runId)!, "status.json")));
+    const worker = agents.workerIdentity(runId)!;
+    actors.tell(actor.id, "MSG-2");
+    await ticks();
+    /** Nothing changed: MSG-1 in flight with its worker alive, MSG-2 queued and not launched, the ask pending. */
+    const unchanged = async () => {
+      await ticks();
+      expect(actors.status(actor.id)).toMatchObject({ queued: 1, inFlightRun: { id: runId } });
+      expect(starts).toEqual(["MSG-1"]);
+      expect(await pending(answer)).toBe("pending");
+      expect(processIsAlive(worker.pid)).toBe(true);
+      expect(failures(actors, actor.id, runId)).toHaveLength(0);
+    };
+    await unchanged();
+
+    // The review's probe case 2: a healthy run, under a second old.
+    expect(() => actors.abandonStuckRun(actor.id, runId)).toThrow(notStuckYet(runId));
+    await unchanged();
+    // Past the threshold it is still healthy: this host's own record shows its worker alive, with a readable status
+    // record. No alarm reports it, and the call is refused.
+    clock.skew = 31 * MINUTE;
+    await ticks();
+    expect(stuckAlarms(mesh, actor.id)).toHaveLength(0);
+    expect(() => actors.abandonStuckRun(actor.id, runId)).toThrow(shownRunning(runId));
+    await unchanged();
+    expect(stuckAlarms(mesh, actor.id)).toHaveLength(0);
   }, 60_000);
 });

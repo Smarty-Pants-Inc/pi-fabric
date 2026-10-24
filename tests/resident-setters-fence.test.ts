@@ -301,23 +301,46 @@ describe("agents.abandonStuckRun through the provider", () => {
     } finally { abandon.mockRestore(); await passive.close(); await state.close(); }
   });
 
-  it("the root Main's call ends the resident actor's wait on its in-flight run and keeps the queue", async () => {
+  // smarty-dev#16333 round 6 (P2): the manager accepts only a run the actor-run-stuck alarm reports, by the alarm's own
+  // condition. The clock is skewed past the 30 min threshold; the hung live worker is healthy until its status record
+  // is gone (worker-unverified, as in tests/actor-state-alarms.test.ts). As in tests/residency-actor-renewal.test.ts,
+  // real I/O and timers keep running, and the leases are renewed right after the clock moves: until then the
+  // in-process fixture's 5 s participant leases read as lapsed.
+  it("the root Main's call is refused for a healthy run; for a run the alarm reports it ends the resident actor's wait and keeps the queue", async () => {
+    const realNow = Date.now.bind(Date);
+    const clock = { skew: 0 };
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + clock.skew);
     const state = await fixture("Main", 5_000);
     const { passive, resident } = providers(state);
     const actors = state.host.actors;
     let runId: string | undefined;
+    const abandonDecisions = () => files(state.config.residencyRoot, "decisions").map(file =>
+      JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "decisions", file), "utf8")))
+      .filter(decision => decision.operation === "abandonStuckRun");
     try {
-      // The gates do not judge liveness (the operator does, docs/agents.md): a hung live worker stands in for the stuck run.
       actors.tell(state.actor.id, "HANG_WITH_PROGRESS MSG-1");
       await waitFor(() => actors.status(state.actor.id).inFlightRun !== undefined);
       runId = actors.status(state.actor.id).inFlightRun!.id;
+      const status = path.join(state.host.agents.runDirectory(runId)!, "status.json");
+      await waitFor(() => fs.existsSync(status));
       actors.tell(state.actor.id, "MSG-2");
       expect(actors.status(state.actor.id)).toMatchObject({ queued: 1, inFlightRun: { id: runId } });
+      // A healthy run is refused before the commit fence: young, then past the threshold with its worker alive.
+      await expect(resident.invoke("abandonStuckRun", { id: state.actor.id, runId }, context))
+        .rejects.toThrow(`did not abandon run ${runId}: it is not stuck: it is not past its stuck threshold, so no actor-run-stuck alarm reports it; nothing changed`);
+      clock.skew = 31 * 60_000;
+      await state.host.participants.refresh();
+      await state.participants.refresh();
+      await expect(resident.invoke("abandonStuckRun", { id: state.actor.id, runId }, context))
+        .rejects.toThrow(`did not abandon run ${runId}: it is not stuck: this host shows it running, so no actor-run-stuck alarm reports it; nothing changed`);
+      expect(abandonDecisions().filter(decision => decision.state === "committed")).toEqual([]);
+      expect(actors.status(state.actor.id)).toMatchObject({ queued: 1, inFlightRun: { id: runId } });
+      // Its status record gone past the threshold, the alarm reports it (worker-unverified), and the call is accepted.
+      fs.rmSync(status);
       await expect(resident.invoke("abandonStuckRun", { id: state.actor.id, runId }, context)).resolves.toMatchObject({ id: state.actor.id });
       // The decision was committed at the fence, and MSG-2 ran once after the run failed operator-abandoned.
-      expect(files(state.config.residencyRoot, "decisions").map(file =>
-        JSON.parse(fs.readFileSync(path.join(state.config.residencyRoot, "decisions", file), "utf8")))
-        .filter(decision => decision.operation === "abandonStuckRun")).toEqual([expect.objectContaining({ state: "committed", id: state.actor.id })]);
+      expect(abandonDecisions().filter(decision => decision.state === "committed"))
+        .toEqual([expect.objectContaining({ state: "committed", id: state.actor.id })]);
       await waitFor(() => actors.status(state.actor.id).queued === 0 && actors.status(state.actor.id).inFlightRun === undefined &&
         actors.messages(state.actor.id, 50).some(message => message.text === "fake worker complete"));
       const out = actors.messages(state.actor.id, 50).filter(message => message.direction === "out");

@@ -7343,9 +7343,9 @@ export class ActorManager {
     const run = actor.inFlightRun;
     const proven = this.#goneRuns.get(actor.id);
     if (proven && !proven.unwound && proven.runId !== run?.id) this.#goneRuns.delete(actor.id);
-    if (run && now - run.startedAt > ACTOR_RUN_STUCK_MIN_MS) {
-      const threshold = Math.max(ACTOR_RUN_STUCK_MIN_MS, 2 * (this.#p95RunMs(actor) ?? 0));
-      const gone = now - run.startedAt > threshold ? this.#runGone(run.id) : undefined;
+    const stuck = run ? this.#stuckRun(actor, run, now) : undefined;
+    if (run && stuck) {
+      const { threshold, gone } = stuck;
       // smarty-dev#16333: a worker proven gone (its pid exited, or names another process) can leave the drain's wait
       // on a run handle that never settles, and that wait holds every queued message. The first proof only alarms,
       // as before, and records its time. A consecutive proof at least one sweep interval later (round 4, P2: time,
@@ -7372,6 +7372,19 @@ export class ActorManager {
     }
     const dropped = actor.eventsDropped;
     if (dropped) this.#alarmDroppedEvents(actor, dropped, now);
+  }
+
+  /**
+   * The actor-run-stuck alarm's condition, for an in-flight run at `now`. Undefined until the run is older than
+   * ACTOR_RUN_STUCK_MIN_MS; then its stuck threshold, max(30 min, 2x the actor's p95 run time), and, once the run is
+   * past that threshold, `gone`: #runGone's fixed reason code, or undefined while this host can show the run running.
+   * The alarm fires exactly when `gone` is set. smarty-dev#16333 round 6 (P2): abandonStuckRun applies this same
+   * condition, so it accepts exactly the runs the alarm reports.
+   */
+  #stuckRun(actor: ManagedActor, run: { id: string; startedAt: number }, now: number): { threshold: number; gone: string | undefined } | undefined {
+    if (now - run.startedAt <= ACTOR_RUN_STUCK_MIN_MS) return undefined;
+    const threshold = Math.max(ACTOR_RUN_STUCK_MIN_MS, 2 * (this.#p95RunMs(actor) ?? 0));
+    return { threshold, gone: now - run.startedAt > threshold ? this.#runGone(run.id) : undefined };
   }
 
   /**
@@ -7424,11 +7437,14 @@ export class ActorManager {
    * (#confirmGoneRun). Where that proof can never come (the run's transport latched lost contact, a stop or relaunch
    * never returns, a liveness probe always fails, or this host never registered the run), actor-run-stuck alarms
    * with remedy "abandonStuckRun" and the drain holds every queued message. Not unwinding there by itself is correct,
-   * because the tree may live. So the operator checks that no process of the run remains (the run's
-   * unresolved-worker.json names why its exit is unproven), then calls this.
+   * because the tree may live. So the operator checks that no process of the run remains (docs/agents.md "Stuck actor
+   * runs": the worker's process group, and every process whose environment names the run, as its detached pi runner's
+   * does), then calls this. It ends the actor's wait only: it stops no process.
    *
    * Gates, #confirmGoneRun's own: this host is not closing, not strictly release-paused and not barred from the mesh;
-   * the registered actor is owned here; runId is exactly its in-flight run, and a drain waits on it. Action,
+   * the registered actor is owned here; runId is exactly its in-flight run, and a drain waits on it. Round 6 (P2): the
+   * run is one the actor-run-stuck alarm reports, by the alarm's own condition (#stuckRun): past its stuck threshold,
+   * and this host cannot show it running. A healthy run, young or old, is refused. Action,
    * #unwindGoneRun's: the run is abandoned (never relaunched for this owner), and the drain's wait ends with the run's
    * genuine terminal result when one exists (AgentManager.terminalResult, executionExit's record branch), else the run
    * fails "operator-abandoned". The queue is never touched: the drain continues through its normal cleanup and
@@ -7452,6 +7468,13 @@ export class ActorManager {
         refuse(actor.inFlightRun ? `it is not the in-flight run (${actor.inFlightRun.id})` : "the actor has no run in flight");
       }
       if (!this.#runWaits.has(runId)) refuse("no drain is waiting on it");
+      // smarty-dev#16333 round 6 (P2): only a run the actor-run-stuck alarm reports. Never a run Fabric shows running.
+      const now = Date.now();
+      const stuck = this.#stuckRun(actor, actor.inFlightRun!, now);
+      if (!stuck || now - actor.inFlightRun!.startedAt <= stuck.threshold) {
+        refuse("it is not stuck: it is not past its stuck threshold, so no actor-run-stuck alarm reports it");
+      }
+      if (stuck!.gone === undefined) refuse("it is not stuck: this host shows it running, so no actor-run-stuck alarm reports it");
       options.beforeCommit?.(actor.id);
       let result: AgentRunResult | undefined;
       try { result = this.agents.terminalResult(runId); } catch { /* no genuine verdict: it fails operator-abandoned */ }
@@ -7603,9 +7626,16 @@ export class ActorManager {
       if (repeat && event.id === attemptId && current() && this.mesh.get(key)?.version === claim.version) {
         const reason = actorAlarmReason(data.reason);
         // smarty-dev#16333 round 5: a stuck run's notice names the owner's queue-preserving way out, with its ids.
-        const remedy = kind === "actor-run-stuck" && typeof data.runId === "string"
-          ? ` If it persists, check that no process of the run remains (see its unresolved-worker.json), then ` +
-            `agents.abandonStuckRun({ id: ${JSON.stringify(actor.id)}, runId: ${JSON.stringify(data.runId)} }) ends that run and keeps the queue.`
+        // Round 6 (P1): the process check that finds the run's pi runner. The worker starts it detached (its own process
+        // group and session) with no run id in its argv, but with PI_FABRIC_PARENT_RUN=<runId> in its environment.
+        const runId = typeof data.runId === "string" ? data.runId : undefined;
+        const remedy = kind === "actor-run-stuck" && runId
+          ? ` If it persists, check that no process of the run remains (docs/agents.md, "Stuck actor runs"). On Linux both ` +
+            `must print nothing: grep -lzx PI_FABRIC_PARENT_RUN=${/^[A-Za-z0-9_-]+$/.test(runId) ? runId : "<runId>"} ` +
+            `/proc/[0-9]*/environ 2>/dev/null (the run's detached pi runner and its children), and pgrep -a -g <sessionId> ` +
+            `(the worker's process group; sessionId is in the run's unresolved-worker.json). Then ` +
+            `agents.abandonStuckRun({ id: ${JSON.stringify(actor.id)}, runId: ${JSON.stringify(runId)} }) ends the actor's wait ` +
+            `(it stops no process) and keeps the queue.`
           : "";
         const notice: FabricActorMessage = {
           id: dedupeKey, actorId: actor.id, actorName: actor.name, direction: "out",

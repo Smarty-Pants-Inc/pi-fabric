@@ -1901,19 +1901,24 @@ Some runs can never get that proof:
 Fabric does not guess in these cases, because the run's processes may still be using the actor's session. The alarm keeps firing and the queue keeps waiting. `agents.stop({ id: runId })` refuses such a run with `execution exit unconfirmed; custody retained`, `agents.resetSession()` waits for it, and stopping the actor drops its queue. Use `agents.abandonStuckRun` instead:
 
 1. Confirm that the alarm's `runId` is still the actor's `inFlightRun.id` in `agents.actorStatus({ id })`.
-2. Check that no process of the run remains. Fabric cannot prove this here; you must. Find the run's directory: `agents.log({ id: runId })` returns it as `runDirectory` for a session actor, and a durable actor's is `<residency root>/runs/<runId>/`. It holds the worker's `status.json` and, when the run's exit is unproven, `unresolved-worker.json`, whose `reason` says why, for example `Owned process worker did not confirm native close within 7000ms`. For the process transport, its `sessionId` is the worker's pid, which leads the worker's process group. `pgrep -a -g <sessionId>` must list nothing, and no process may still name the run (`pgrep -af <runId>`). If anything remains, stop it first, or leave the run alone.
+2. Check that no process of the run remains. Fabric cannot prove this here; you must. Find the run's directory: `agents.log({ id: runId })` returns it as `runDirectory` for a session actor, and a durable actor's is `<residency root>/runs/<runId>/`. It holds the worker's `status.json` and, when the run's exit is unproven, `unresolved-worker.json`, whose `reason` says why, for example `Owned process worker did not confirm native close within 7000ms`. For the process transport, its `sessionId` is the worker's pid. On Linux, both of these checks must print nothing:
+   - `pgrep -a -g <sessionId>` lists the worker's process group, which the worker leads.
+   - `grep -lzx PI_FABRIC_PARENT_RUN=<runId> /proc/[0-9]*/environ 2>/dev/null` lists every process whose environment names the run. The worker starts the run's `pi` runner, the process that writes the actor's session, in a new process group and session, and the runner's command line does not contain the run ID. So the group check and `pgrep -af <runId>` both miss the runner, even while it runs. The worker sets `PI_FABRIC_PARENT_RUN=<runId>` in the runner's environment, and the runner's children inherit it.
+
+   If anything remains, stop it first, or leave the run alone.
 3. From the owning Main, call:
 
 ```ts
 await agents.abandonStuckRun({ id: "release-reviewer", runId: "<the alarm's runId>" });
 ```
 
-The call ends the actor's wait on that run and returns the actor's status. If the run has a genuine terminal result (the worker's own `status.json`), the actor delivers it once, as the run's result. Otherwise the actor records the run failed with `operator-abandoned`, with data `{ runId, reason: "operator-abandoned" }`. The run is marked abandoned, so it is never relaunched. **The queue is kept:** queued messages then run in order, through the normal admission gates. A pending `agents.resetSession()` completes at that boundary. The run's directory and its `unresolved-worker.json` are kept, as for any lost run.
+The call ends the actor's wait on that run and returns the actor's status. It stops no process: anything of the run that still runs keeps running. If the run has a genuine terminal result (the worker's own `status.json`), the actor delivers it once, as the run's result. Otherwise the actor records the run failed with `operator-abandoned`, with data `{ runId, reason: "operator-abandoned" }`. The run is marked abandoned, so it is never relaunched. **The queue is kept:** queued messages then run in order, through the normal admission gates. A pending `agents.resetSession()` completes at that boundary. The run's directory and its `unresolved-worker.json` are kept, as for any lost run.
 
 The call throws and changes nothing in these cases:
 - the caller's host does not own the actor;
 - `runId` is not exactly the actor's in-flight run;
 - no drain is waiting on that run;
+- the run is not stuck: it is not past its stuck threshold, or this host can show that it is running. This is the `actor-run-stuck` alarm's own condition, so the call accepts every run the alarm reports and refuses a healthy run at any age;
 - the host is closing, paused for a strict release, or not consuming the mesh.
 
 A second call for the same run throws `the actor has no run in flight`. For a durable actor, the root Main's call goes to its resident host. The call never goes through `agents.stop`. It adds no automatic path: without the call, nothing changes.

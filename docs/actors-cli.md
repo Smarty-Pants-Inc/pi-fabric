@@ -14,8 +14,11 @@ fabric-actors remove --resident <directory-or-prefix> --actor <id-or-name> --con
 
 `stop` and `remove` drop the actor's queued messages. If the root's Main is alive and the actor only has a stuck
 in-flight run (alarm `actor-run-stuck`, `remedy: "abandonStuckRun"`), do not stop it. Check that no process of the
-run remains, then call `agents.abandonStuckRun({ id, runId })` from that Main. It ends the wait on the run and keeps
-the queue. See [Stuck actor runs](agents.md#stuck-actor-runs).
+run remains. On Linux, `pgrep -a -g <sessionId>` (the worker's process group) and
+`grep -lzx PI_FABRIC_PARENT_RUN=<runId> /proc/[0-9]*/environ 2>/dev/null` (the run's `pi` runner, which the worker
+starts in its own process group and session, and the runner's children) must print nothing. Then call
+`agents.abandonStuckRun({ id, runId })` from that Main. It ends the actor's wait on the run (it stops no process) and
+keeps the queue. See [Stuck actor runs](agents.md#stuck-actor-runs).
 
 ## Offline remove (dead resident host): `--main-stopped` is an operator attestation (smarty-dev#7817)
 

@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, renameAtomic, AtomicFileWriter, MeshLockTimeoutError } from "../core/atomic-write.js";
+import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, renameAtomic, AtomicFileWriter, MeshLockTimeoutError,
+  namespaceBarrierAvailable } from "../core/atomic-write.js";
 import type { MeshStateEntry } from "../mesh/store.js";
 
 // Participant records outside the shared state (smarty-dev#2004). Each record lived in the one
@@ -214,30 +215,54 @@ const holderAlive = async (owner: string, lock: string, registryFenced = false):
   return actual === undefined || actual === startTime;
 };
 
+/** One directory fsync, no chain walk: the lock directories already exist. Skipped where there is no directory fsync
+ * (namespaceBarrierAvailable: Windows; NTFS journals the names). */
+const syncDirectoryEntries = (directory: string): void => {
+  if (!namespaceBarrierAvailable()) return;
+  const fd = fs.openSync(directory, fs.constants.O_RDONLY);
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+};
+
 // A per-key lock receipt is atomically renamed into place with its owner record.
 const keyReceipt = (mesh: ParticipantFileMesh, file: string, incarnation: string | undefined) => {
   const locks = file === namespaceReceiptFile(mesh) ? namespaceLockDirectory(mesh) : path.join(mesh.root, DIR, ".locks");
   const lock = path.join(locks, path.basename(file, ".json"));
   fs.mkdirSync(locks, { recursive: true, mode: 0o700 });
   const token = `${process.pid}\n${incarnation ?? ""}\n${randomUUID()}\n`;
+  const release = (): void => {
+    const tombstone = `${lock}.${randomUUID()}.dead`;
+    renameAtomic(lock, tombstone);
+    fs.rmSync(tombstone, { recursive: true, force: true });
+  };
   return {
     lock,
     acquire: (): void => {
+      // A held lock is refused before any staging or fsync, as its rename would be: waiters retry every 5 ms (withKeyLock),
+      // and three fsyncs per refused attempt made contention cost real disk time (pi-fabric#1562: 5 s waits under fake
+      // timers ran ~1,000 attempts and timed out on ZFS). Only a fast path: the rename below still decides.
+      if (fs.existsSync(lock)) throw Object.assign(new Error(`Participant lock is held: ${lock}`), { code: "EEXIST" });
       const staging = `${lock}.${process.pid}.${randomUUID()}.tmp`;
       fs.mkdirSync(staging, { mode: 0o700 });
       try {
-        fs.writeFileSync(path.join(staging, "owner"), token, { mode: 0o600 });
+        // Durable before it becomes visible (pi-fabric#1562, fabric-store P2): a host crash must never leave a published lock
+        // with an empty or torn owner, which recovery cannot judge and so never clears. The owner's bytes, then its name in
+        // the staging directory, reach the disk before the rename publishes them.
+        const fd = fs.openSync(path.join(staging, "owner"), "wx", 0o600);
+        try { fs.writeFileSync(fd, token); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        syncDirectoryEntries(staging);
         fs.renameSync(staging, lock);
       } catch (error) {
         fs.rmSync(staging, { recursive: true, force: true });
         throw error;
       }
+      // Then the published name. If that sync fails, give the lock back rather than hold it while reporting an error.
+      try { syncDirectoryEntries(locks); }
+      catch (error) {
+        try { release(); } catch { /* left to recovery: our pid ends, and a dead holder is cleared */ }
+        throw error;
+      }
     },
-    release: (): void => {
-      const tombstone = `${lock}.${randomUUID()}.dead`;
-      renameAtomic(lock, tombstone);
-      fs.rmSync(tombstone, { recursive: true, force: true });
-    },
+    release,
   };
 };
 
@@ -380,6 +405,9 @@ const readOwner = (lock: string): string | undefined => {
   } catch { return undefined; }
 };
 
+/** An owner that cannot be read (empty or torn: only a host crash on a build without the owner fsync can leave one) is
+ * never judged dead here. The operator step (docs/participants-cli.md): confirm no process holds the lock, then rename
+ * the lock directory aside to `<lock>.<UTC stamp>.operator-dead` (never delete it). */
 const recoverDeadKeyLock = async (mesh: ParticipantFileMesh, lock: string, registryFenced = false): Promise<void> => {
   let owner = readOwner(lock);
   if (!owner || await holderAlive(owner, lock, registryFenced)) return;

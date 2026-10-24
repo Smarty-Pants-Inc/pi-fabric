@@ -265,8 +265,14 @@ describe("participant files", () => {
       if (failure === "write") throw new Error("migration I/O failed");
       if (failure === "refused") return false;
       if (failure === "barrier") {
-        const barrier = vi.spyOn(fs, "fsyncSync").mockImplementationOnce(() => { throw new Error("migration barrier failed"); });
-        try { return await write(mesh, writtenKey, decide, options); }
+        // The migration's own barrier: the first fsync after the decision, not the key lock's owner fsync before it.
+        const fsync = fs.fsyncSync.bind(fs);
+        let armed = false;
+        const barrier = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+          if (armed) { armed = false; throw new Error("migration barrier failed"); }
+          return fsync(fd);
+        });
+        try { return await write(mesh, writtenKey, (current) => { armed = true; return decide(current); }, options); }
         finally { barrier.mockRestore(); }
       }
       const read = fs.readFileSync.bind(fs);
@@ -757,6 +763,47 @@ describe("participant files", () => {
       expect(fs.readdirSync(path.dirname(canonical)).sort()).toEqual([
         path.basename(canonical), `${path.basename(canonical)}.recent.dead`, `${path.basename(canonical)}.recent.tmp`,
       ].sort());
+    });
+
+    it("publishes a key lock only once its owner is on disk, then syncs the published name (pi-fabric#1562 fabric-store P2)", async () => {
+      const root = meshRoot();
+      const mesh = new MeshStore(root, 64 * 1024, 1_000);
+      const key = keyOf("session:a");
+      const lock = lockOf(root, "session:a");
+      const events: string[] = [];
+      const opened = new Map<number, string>();
+      const open = fs.openSync.bind(fs), fsync = fs.fsyncSync.bind(fs), rename = fs.renameSync.bind(fs);
+      vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+        const fd = open(...args);
+        opened.set(fd, String(args[0]));
+        return fd;
+      }) as typeof fs.openSync);
+      vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => { events.push(`fsync ${opened.get(fd)}`); return fsync(fd); });
+      vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { events.push(`rename ${String(from)} -> ${String(to)}`); return rename(from, to); });
+      await expect(participantFiles.writeParticipantFileIf(mesh, key, () => ({
+        key, value: record("a"), version: 1, updatedAt: 1, updatedBy: identityOf("a"),
+      }))).resolves.toBe(true);
+      const publish = events.findIndex((event) => event.startsWith("rename ") && event.endsWith(` -> ${lock}`));
+      expect(publish, events.join("\n")).toBeGreaterThan(-1);
+      const staging = events[publish]!.slice("rename ".length, events[publish]!.indexOf(" -> "));
+      const before = events.slice(0, publish);
+      // Its bytes, then (where directories can be synced) its name in the staging directory, before the rename publishes it.
+      expect(before).toContain(`fsync ${path.join(staging, "owner")}`);
+      if (process.platform === "win32") return;
+      expect(before.indexOf(`fsync ${path.join(staging, "owner")}`)).toBeLessThan(before.indexOf(`fsync ${staging}`));
+      expect(events[publish + 1]).toBe(`fsync ${path.dirname(lock)}`);
+    });
+
+    it("a held key lock refuses a contender before it stages or syncs anything", async () => {
+      const root = meshRoot();
+      const mesh = new MeshStore(root, 64 * 1024, 1_000);
+      const lock = holdLock(root, "session:a", process.pid);
+      const syncs = vi.spyOn(fs, "fsyncSync");
+      const staged = vi.spyOn(fs, "mkdirSync");
+      expect(() => participantFiles.withParticipantFileTryLock(mesh, keyOf("session:a"), undefined, () => "entered"))
+        .toThrow(participantFiles.ParticipantFileLockBusyError);
+      expect(syncs).not.toHaveBeenCalled();
+      expect(staged.mock.calls.filter(([target]) => String(target).startsWith(`${lock}.`))).toEqual([]);
     });
 
     it.each(["EACCES", "EIO", undefined].flatMap(code =>

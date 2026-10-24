@@ -1074,7 +1074,10 @@ export class MeshStore {
    * A foreign commit gate is never PID/age-recovered: a paused synchronous CAS must finish
    * before recovery can change its receipt. Async lease-owned transactions retain this gate until
    * settled; recovery requires matching machine identity and death/current-boot evidence.
-   * Without boot identity, only ESRCH plus the custody staleness bound permits recovery;
+   * Without boot identity, only ESRCH plus the custody staleness bound permits recovery. Without a
+   * machine id (Windows, macOS, a Linux without one), a record naming this host whose PID is gone
+   * or now another process (another native incarnation) permits it (pi-fabric#1562; custody-lock.ts
+   * clearDeadCustodyLock);
    * a missing owner pid is an alarmed typed refusal, never an ordinary busy timeout. */
   async leaseCustody<T>(file: string, operation: () => T | Promise<T>, lockTimeoutMs = 0,
     options: { ownIncarnation?: string | undefined } = {}): Promise<T> {

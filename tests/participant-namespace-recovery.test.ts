@@ -6,7 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as atomic from "../src/core/atomic-write.js";
 import { MeshBridge, StoreBridgeSide } from "../src/mesh/bridge.js";
-import { HostLeaseLockBusyError } from "../src/topology/host-lease-lock.js";
+import { HostLeaseLockBusyError, hostLeaseAdditionsGatePath } from "../src/topology/host-lease-lock.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { LIVENESS_POLICY_KEY, readHostLeaseCurrent, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -40,12 +40,13 @@ const namespaceLock = (root: string): string => path.join(root, "participant-nam
 const namespaceOwner = (root: string): string | undefined => {
   try { return fs.readFileSync(path.join(namespaceLock(root), "owner"), "utf8"); } catch { return undefined; }
 };
-/** Two distinct valid start identities on this platform: the receipt's, and the one the reused PID has now. */
-const START = {
+/** Two distinct valid start identities per platform: the receipt's, and the one the reused PID has now. */
+const STARTS = {
   linux: ["4242", "4243"],
   win32: ["win32:639264528000000000", "win32:639264528000000001"],
   darwin: ["darwin:Thu Oct  1 12:00:00 2026", "darwin:Fri Oct  2 12:00:00 2026"],
-}[process.platform as "linux" | "win32" | "darwin"] ?? ["4242", "4243"];
+} as const;
+const START = STARTS[process.platform as keyof typeof STARTS] ?? STARTS.linux;
 
 /** A live process standing in for whatever the OS gave the dead holder's PID to. */
 const standIn = async (): Promise<number> => {
@@ -73,7 +74,7 @@ const reusedPid = (pid: number, mode: "reused" | "eperm") => {
   return reads;
 };
 
-const plantNamespaceReceipt = (root: string, pid: number, start = START[0]!, token = "dead-namespace-holder"): string => {
+const plantNamespaceReceipt = (root: string, pid: number, start: string = START[0], token = "dead-namespace-holder"): string => {
   const lock = namespaceLock(root);
   fs.mkdirSync(lock, { recursive: true, mode: 0o700 });
   const receipt = String(pid) + "\n" + start + "\n" + token + "\n";
@@ -180,16 +181,27 @@ describe("a dead holder of the participant namespace receipt (pi-fabric#1562 rev
 
 // The bridge's mirror custody (bridge.ts withMirrorCustody): the participant namespace and the relevant key
 // receipts, then the host-lease additions gate and the relevant per-host gates. A child takes exactly that
-// custody, reports, and is SIGKILLed mid-pass (an OOM kill), leaving both receipts behind.
+// custody, reports, and is SIGKILLed mid-pass (an OOM kill), leaving both receipts behind. With machine "none" the
+// child sees no machine or boot identity either (as on Windows; a no-op there), so its gate record is the one a
+// Windows or macOS mirror writes: this host's label instead of a machine id (src/mesh/custody-lock.ts).
 const MIRROR = String.raw`
   import { createJiti } from "jiti";
   import { pathToFileURL } from "node:url";
   import fs from "node:fs";
+  const [root, ready, id, machine] = process.argv.slice(1);
+  if (machine === "none") {
+    const read = fs.readFileSync;
+    fs.readFileSync = (file, ...rest) => {
+      if (file === "/etc/machine-id" || file === "/proc/sys/kernel/random/boot_id") {
+        throw Object.assign(new Error("no machine or boot identity (as on Windows)"), { code: "ENOENT" });
+      }
+      return read.call(fs, file, ...rest);
+    };
+  }
   const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
   const { MeshStore } = await jiti.import("./src/mesh/store.ts");
   const { withParticipantFileDirectoryCustody } = await jiti.import("./src/topology/participant-files.ts");
   const { withHostLeaseDirectoryCustody } = await jiti.import("./src/topology/host-leases.ts");
-  const [root, ready, id] = process.argv.slice(1);
   const store = new MeshStore(root, 65536, 1000);
   const ids = new Set([id]);
   setInterval(() => {}, 1000);
@@ -199,10 +211,11 @@ const MIRROR = String.raw`
   }, ids), ids);
 `;
 
-const killedMirror = async (root: string, id: string): Promise<{ pid: number; namespace: string; additions: string; additionsOwner: string }> => {
+const killedMirror = async (root: string, id: string, machine: Machine = "native"):
+  Promise<{ pid: number; namespace: string; additions: string; additionsOwner: string }> => {
   fs.mkdirSync(root, { recursive: true });
   const ready = path.join(path.dirname(root), "mirror-ready-" + digest(root).slice(0, 8));
-  const child = spawn(process.execPath, ["--input-type=module", "-e", MIRROR, root, ready, id],
+  const child = spawn(process.execPath, ["--input-type=module", "-e", MIRROR, root, ready, id, machine],
     { cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe"] });
   children.push(child);
   let stderr = "";
@@ -224,13 +237,13 @@ const killedMirror = async (root: string, id: string): Promise<{ pid: number; na
   return { pid, namespace, additions, additionsOwner };
 };
 
-// The host-lease additions gate is a HOST-QUALIFIED custody lock (MeshStore.leaseCustody, src/mesh/store.ts). Its dead
-// holder is recovered only with this machine's identity: "A host-lease commit gate is never recovered by a
-// foreign/unknown PID. Matching machine evidence is still mandatory when boot/process identity is unavailable"
-// (src/mesh/custody-lock.ts clearDeadCustodyLock). That identity is read from /etc/machine-id and /proc only
-// (src/core/atomic-write.ts readPhysicalMachineId/readPhysicalHostIdentity), so on Windows it is absent and the gate
-// fails closed by design, as unreadable machine evidence does on Linux (tests/host-lease-round3.test.ts "unreadable
-// /etc/machine-id fails closed"; tests/mesh-lock-namespace.test.ts "host-qualified custody needs a machine id").
+// The host-lease additions gate is a HOST-QUALIFIED custody lock (MeshStore.leaseCustody, src/mesh/store.ts). With this
+// machine's identity (/etc/machine-id and the boot id, src/core/atomic-write.ts) its dead holder is recovered on machine,
+// boot and process evidence. Windows and macOS have no machine id, and there the gate stayed busy for good after its
+// holder died, blocking every new host lease on the mesh (pi-fabric#1562 review/astra P1; Windows CI). Now
+// (src/mesh/custody-lock.ts clearDeadCustodyLock) such a record names this host instead, and is recovered on the
+// participant locks' process proof: its PID is gone, or is now another process (another native incarnation).
+type Machine = "native" | "none";
 const nativeMachineEvidence = atomic.readPhysicalMachineId() !== undefined;
 /** The Windows view on a host that has machine evidence: the machine and boot identity files are unreadable. */
 const withoutMachineEvidence = (): void => {
@@ -277,16 +290,30 @@ const nativeOn = async (mesh: MeshStore, id: string): Promise<MeshIdentity> => {
   return identity;
 };
 
+/** The additions gate's custody lock: the 16-hex domain of ".additions" (the test's mesh has no legacy full-hash one). */
+const additionsGate = (root: string): string => path.join(root, "host-lease-commits", digest(".additions").slice(0, 16), "custody.lock");
+const deadFences = (lock: string): string[] => fs.readdirSync(path.dirname(lock))
+  .filter(name => name.startsWith(path.basename(lock) + ".dead."))
+  .map(name => fs.readFileSync(path.join(path.dirname(lock), name, "owner"), "utf8"));
+
 describe("a mirror killed mid-pass while holding the namespace receipt and the additions gate (pi-fabric#1562 review P1)", () => {
-  const cases = (["dead", "reused"] as const).flatMap(pid => (["fenced add", "mirror pass"] as const).map(after => ({ pid, after })));
-  // Recovery needs this machine's identity (see nativeMachineEvidence): absent on Windows, which runs the fail-closed
-  // cases below natively instead (pi-fabric#1562 Windows CI: MeshLockTimeoutError on host-lease-locks/064d58ce...).
-  it.skipIf(!nativeMachineEvidence).each(cases)("$pid PID: a later $after recovers", async ({ pid: holder, after }) => {
+  const cases = (machine: Machine) => (["dead", "reused"] as const)
+    .flatMap(pid => (["fenced add", "mirror pass"] as const).map(after => ({ machine, pid, after })));
+  const recovers = async ({ machine, pid: holder, after }: ReturnType<typeof cases>[number]) => {
     const base = scratch();
     const root = path.join(base, "hub");
     const farId = "session:far-native";
-    const killed = await killedMirror(root, farId);
+    const killed = await killedMirror(root, farId, machine);
     expect(namespaceOwner(root)).toBe(killed.namespace);
+    // The gate record: the killed mirror's own native incarnation, and this machine's id or (with none) this host's label.
+    const gate = killed.additionsOwner.split("\n");
+    expect(gate[1]).toBe(String(killed.pid));
+    expect(atomic.validProcessIncarnation(gate[3])).toBe(true);
+    if (machine === "native") expect(gate[4]).toBe(atomic.readPhysicalMachineId());
+    else {
+      expect(gate[4]).toMatch(/^host:./);
+      withoutMachineEvidence();
+    }
     if (holder === "reused") await reuseKilledPid(root, killed);
     if (after === "fenced add") {
       vi.spyOn(atomic, "ownProcessIncarnation").mockResolvedValue(undefined);
@@ -309,39 +336,92 @@ describe("a mirror killed mid-pass while holding the namespace receipt and the a
       expect(hub.listAll(PREFIX).some(entry => (entry.value as { id?: unknown }).id === farId)).toBe(true);
     }
     expect(namespaceOwner(root)).toBeUndefined();
-  }, 40_000);
+    // The killed mirror's gate was recovered: renamed aside to its identity-named fence, never deleted.
+    expect(deadFences(additionsGate(root))).toEqual([killed.additionsOwner]);
+  };
+  // This machine's identity: skipped where there is none (Windows and macOS run the cases below natively).
+  it.skipIf(!nativeMachineEvidence).each(cases("native"))("$pid PID: a later $after recovers", recovers, 40_000);
+  // No machine identity: natively on Windows and macOS; simulated here for the killed mirror and the later process alike.
+  // Before pi-fabric#1562's fix these four stayed busy (Windows CI: MeshLockTimeoutError on
+  // host-lease-commits/5f43c55dca0091e6/custody.lock, and HostLeaseLockBusyError for the fenced add).
+  it.each(cases("none"))("$pid PID, no machine evidence (as on Windows): a later $after recovers", recovers, 40_000);
+});
 
-  // Without machine evidence (Windows natively; simulated where /etc/machine-id exists) the dead mirror's additions
-  // gate cannot be proven dead: every later fenced add or mirror pass is refused busy, and nothing takes it over.
-  it.each(cases)("$pid PID, no machine evidence (as on Windows): a later $after stays busy and takes nothing over",
-    async ({ pid: holder, after }) => {
-      const base = scratch();
-      const root = path.join(base, "hub");
-      const farId = "session:far-native";
-      const killed = await killedMirror(root, farId);
-      withoutMachineEvidence();
-      if (holder === "reused") await reuseKilledPid(root, killed);
-      if (after === "fenced add") {
-        vi.spyOn(atomic, "ownProcessIncarnation").mockResolvedValue(undefined);
-        const host = await fencedDirectory(root, "after-kill");
-        const refusals: unknown[] = [];
-        for (let attempt = 0; attempt < 3; attempt++) await host.directory.refresh().catch(error => { refusals.push(error); });
-        expect(host.published()).toBe(false);
-        expect(refusals).toHaveLength(3);
-        for (const error of refusals) {
-          expect(error instanceof HostLeaseLockBusyError || error instanceof participantFiles.ParticipantFileLockBusyError,
-            String(error)).toBe(true);
-        }
-        // Whatever the namespace receipt did first, the last refusal is the unrecoverable additions gate.
-        expect(refusals.at(-1)).toBeInstanceOf(HostLeaseLockBusyError);
-      } else {
-        const { hub, bridge } = await laterMirrorPass(base, root, farId);
-        await expect(bridge.start()).rejects.toThrow(/FABRIC_MESH_LOCK_TIMEOUT: .*host-lease-commits[\\/]5f43c55dca0091e6[\\/]custody\.lock/);
-        expect(readHostLeaseCurrent(root, farId)).toBeUndefined();
-        expect(hub.listAll(PREFIX).some(entry => (entry.value as { id?: unknown }).id === farId)).toBe(false);
+describe("the additions gate where there is no machine id: recovered only on process proof (pi-fabric#1562 review/astra P1)", () => {
+  const DEAD = 999_999_999;
+  type Scenario = { name: string; recovers: boolean; pid: "dead" | "live" | "denied"; native?: "other" | "same" | "unknown";
+    edit?: (fields: string[], starts: readonly string[]) => void };
+  const scenarios: Scenario[] = [
+    { name: "its PID is gone (ESRCH)", recovers: true, pid: "dead" },
+    { name: "its PID is now another process (another native incarnation)", recovers: true, pid: "live", native: "other" },
+    { name: "an unprobeable PID (EPERM) that is now another process", recovers: true, pid: "denied", native: "other" },
+    { name: "a live holder (the same incarnation)", recovers: false, pid: "live", native: "same" },
+    { name: "a live PID whose incarnation is unknown (unreadable or timed out)", recovers: false, pid: "live", native: "unknown" },
+    { name: "a denied probe (EPERM) and an unknown incarnation", recovers: false, pid: "denied", native: "unknown" },
+    { name: "a dead PID, but no incarnation in the record", recovers: false, pid: "dead", edit: fields => { fields[3] = ""; } },
+    { name: "a dead PID, but another platform's incarnation", recovers: false, pid: "dead",
+      edit: (fields, starts) => { fields[3] = starts === STARTS.linux ? STARTS.win32[0] : STARTS.linux[0]; } },
+    { name: "a dead PID, but another host", recovers: false, pid: "dead", edit: fields => { fields[4] = "host:another-host"; } },
+    { name: "a dead PID, but an older build's record (no host label)", recovers: false, pid: "dead", edit: fields => { fields[4] = ""; } },
+    { name: "a dead PID, but a holder that had a machine id", recovers: false, pid: "dead",
+      edit: fields => { fields[4] = "0123456789abcdef0123456789abcdef"; } },
+  ];
+  const platforms = [...new Set([process.platform, "win32"] as const)].filter((platform): platform is keyof typeof STARTS => platform in STARTS);
+  const table = platforms.flatMap(platform => scenarios.map(scenario => ({ ...scenario, platform,
+    label: platform + (platform === process.platform ? "" : " (simulated)") + ": " + scenario.name + (scenario.recovers ? ": recovered" : ": kept busy") })));
+
+  // One test per row: `it.each` would truncate these titles.
+  for (const { label, platform, pid: kind, native, edit, recovers } of table) it(label, async () => {
+    const root = path.join(scratch(), "mesh");
+    const mesh = new MeshStore(root, 65536, 1000);
+    withoutMachineEvidence();
+    if (platform !== process.platform) vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+    const starts = STARTS[platform];
+    // What acquisition records here: this host's label in the machine slot, and the holder's incarnation.
+    let fields: string[] = [];
+    await mesh.leaseCustody(hostLeaseAdditionsGatePath(root), () => {
+      fields = fs.readFileSync(path.join(additionsGate(root), "owner"), "utf8").split("\n");
+    }, 0, { ownIncarnation: starts[0] });
+    expect(fields).toHaveLength(7);
+    expect(fields[3]).toBe(starts[0]);
+    expect(fields[4]).toMatch(/^host:./);
+    expect(fields[5]).toBe("");
+    // A killed holder's receipt: the same record with its pid (and the scenario's edit).
+    const pid = kind === "live" ? await standIn() : DEAD;
+    fields = [...fields];
+    fields[0] = "killed-holder";
+    fields[1] = String(pid);
+    edit?.(fields, starts);
+    const lock = additionsGate(root);
+    fs.mkdirSync(lock, { recursive: true, mode: 0o700 });
+    const owner = fields.join("\n");
+    fs.writeFileSync(path.join(lock, "owner"), owner, { mode: 0o600 });
+    const reads: number[] = [];
+    vi.spyOn(atomic, "processIncarnation").mockImplementation(async (target: number) => {
+      reads.push(target);
+      return native === "same" ? starts[0] : native === "other" ? starts[1] : undefined;
+    });
+    const kill = process.kill.bind(process);
+    const probes = vi.spyOn(process, "kill").mockImplementation(((target: number, signal?: string | number) => {
+      if (kind === "denied" && target === pid && (signal === 0 || signal === undefined)) {
+        throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
       }
-      // No takeover: the killed mirror's receipt still owns the gate, and no recovery fence was made.
-      expect(fs.readFileSync(path.join(killed.additions, "custody.lock", "owner"), "utf8")).toBe(killed.additionsOwner);
-      expect(fs.readdirSync(killed.additions).filter(name => name.startsWith("custody.lock.dead."))).toEqual([]);
-    }, 40_000);
+      return kill(target, signal);
+    }) as typeof process.kill);
+    const entered = vi.fn(() => "entered");
+    const attempt = mesh.leaseCustody(hostLeaseAdditionsGatePath(root), entered, recovers ? 2_000 : 300, { ownIncarnation: undefined });
+    if (recovers) {
+      await expect(attempt).resolves.toBe("entered");
+      expect(deadFences(lock)).toEqual([owner]);
+    } else {
+      await expect(attempt).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+      expect(entered).not.toHaveBeenCalled();
+      expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
+      expect(deadFences(lock)).toEqual([]);
+    }
+    // A refused record is judged before any probe of its PID; a gone PID needs no native read.
+    if (edit) expect(probes.mock.calls.filter(([target]) => target === pid)).toEqual([]);
+    if (kind === "dead") expect(reads).toEqual([]);
+    else expect(new Set(reads)).toEqual(new Set([pid]));
+  }, 20_000);
 });

@@ -1956,6 +1956,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#sessionEnded(participant.rootId, read);
   }
 
+  /** The closure check get() applies, read fresh, for a record get() did not answer (lastKnown).
+   * Unknown (NATS, a disabled mesh) counts as ended: callers only accept a record that is not. */
+  routeEnded(participant: FabricParticipantRecord): boolean {
+    if (this.#isNats() || !this.options.enabled) return true;
+    return this.#routeEnded(participant, { fresh: true });
+  }
+
   /** Capture owner authority once. Subsequent ACK checks only stat/read that owner's file. */
   captureControlOwnerLease(ownerHostId: string, ownerIdentityId: string, targetId: string): (() => number) | undefined {
     if (this.#isNats()) {

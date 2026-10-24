@@ -5,22 +5,39 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { canRemoveTerminalRun } from "../src/storage/retention.js";
 
 // Trust-boundary regressions for smarty-dev#10544 / pi-fabric#1192: native
 // os.tmpdir()/mkdtemp and >50KiB spills must work without widening the grant.
-// Fixtures remain for inspection.
+// Each private fixture root is removed after its manager closes.
 const managers: AgentManager[] = [];
+const roots: string[] = [];
+const scratchPaths: string[] = [];
+const taskTmpPaths: string[] = [];
+const outputPaths: string[] = [];
+let taskTmpRoot = "";
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
+  for (const output of outputPaths.splice(0)) fs.rmSync(output, { recursive: true, force: true });
+  for (const temporary of taskTmpPaths.splice(0)) fs.rmSync(temporary, { recursive: true, force: true });
+  if (taskTmpRoot) {
+    for (const directory of scratchPaths.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
+  }
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   vi.unstubAllEnvs();
 });
 
-const fixture = (processSlice?: string) => {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-process-task-tmpdir-")));
-  const cwd = path.join(root, "cwd");
-  const scratch = path.join(root, "scratch");
+const fixture = (processSlice?: string, longRunRoot = false, retainRuns = true,
+  taskTmpRootOverride?: (runRoot: string, shortRoot: string) => string) => {
+  taskTmpRoot = fs.realpathSync(os.tmpdir());
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(taskTmpRoot, "fpt-")));
+  roots.push(root);
+  const cwd = path.join(taskTmpRoot, "c");
+  const scratch = path.join(taskTmpRoot, "s");
+  const scratchPath = (suffix: string): string => path.join(scratch, suffix);
+  scratchPaths.push(cwd, scratch);
   const parentTemp = path.join(root, "parent-temp");
-  const runRoot = path.join(root, "runs");
+  const runRoot = path.join(root, longRunRoot ? `runs-${"x".repeat(64)}` : "runs");
   for (const directory of [cwd, scratch, parentTemp]) fs.mkdirSync(directory);
   if (processSlice && process.platform === "linux") {
     fs.writeFileSync(path.join(root, "systemd-run"), '#!/bin/sh\nprintf \'%s\\n\' "$@" > scope-args\nwhile [ "$1" != "--" ]; do shift; done; shift; exec "$@"\n', { mode: 0o700 });
@@ -57,22 +74,29 @@ fs.writeFileSync(args.get('--status-file'), JSON.stringify({
   exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
 }));`);
   const manager = new AgentManager(cwd, {
-    ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 8_000, retainRuns: true,
+    ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 8_000, retainRuns,
     ...(processSlice ? { processSlice } : {}),
-  }, { workerPath: worker, fullCodeMode: false, runRoot });
+  }, { workerPath: worker, fullCodeMode: false, runRoot,
+    taskTmpRoot: taskTmpRootOverride?.(root, taskTmpRoot) ?? taskTmpRoot });
   managers.push(manager);
-  return { root, cwd, scratch, parentTemp, runRoot, manager, worker };
+  return { root, cwd, scratch, scratchPath, parentTemp, runRoot, taskTmpRoot, manager, worker };
 };
 
 const report = async (f: ReturnType<typeof fixture>, request: Partial<Parameters<AgentManager["spawn"]>[0]>) => {
   const handle = await f.manager.spawn({ task: "filesystem probe", transport: "process", ...request });
   const result = await f.manager.wait(handle.id);
   expect(result.status, result.error).toBe("completed");
-  return { result, value: JSON.parse(result.text) as {
+  const value = JSON.parse(result.text) as {
     tmp: string; env: Record<string, string | undefined>; argTmpdir: string | null;
     policy: { readOnly: boolean; writableRoots: string[]; shell: string } | null;
     output: string; payload: string; bytes: number;
-  } };
+  };
+  const temporary = path.isAbsolute(value.tmp) ? value.tmp : path.resolve(f.cwd, value.tmp);
+  if ([f.taskTmpRoot, f.cwd, f.scratch].includes(path.dirname(temporary)) &&
+      /^(?:r|t)\.[A-Za-z0-9]{6}$/.test(path.basename(temporary))) taskTmpPaths.push(temporary);
+  const output = path.isAbsolute(value.output) ? value.output : path.resolve(f.cwd, value.output);
+  if (path.dirname(output) === temporary && /^pi-output-[A-Za-z0-9]{6}$/.test(path.basename(output))) outputPaths.push(output);
+  return { result, value };
 };
 
 const inside = (root: string, candidate: string) => {
@@ -101,7 +125,8 @@ describe("native process task temporary directory containment", () => {
 
   it.each(["missing", "regular-file"] as const)("replaces %s in-root TMPDIR with usable private scratch", async kind => {
     const f = fixture("batch.slice");
-    const callerTemp = path.join(f.scratch, "invalid-temp");
+    const callerTemp = f.scratchPath("i");
+    scratchPaths.push(callerTemp);
     if (kind === "regular-file") fs.writeFileSync(callerTemp, "not a directory");
     vi.stubEnv("TMPDIR", callerTemp);
     const requestedRoots = [f.cwd, f.scratch];
@@ -122,7 +147,8 @@ describe("native process task temporary directory containment", () => {
 
   it.each(["missing", "regular-file"] as const)("replaces %s in-root --tmpdir before worker bootstrap", async kind => {
     const f = fixture();
-    const optionTmpdir = path.join(f.scratch, "invalid-option-temp");
+    const optionTmpdir = f.scratchPath("o");
+    scratchPaths.push(optionTmpdir);
     if (kind === "regular-file") fs.writeFileSync(optionTmpdir, "not a directory");
     const nativeLaunch = ProcessTransport.prototype.launch;
     // Inject at the receiver boundary, including retries, while retaining the real native transport.
@@ -148,8 +174,11 @@ describe("native process task temporary directory containment", () => {
 
   it.each(["equal", "inside"] as const)("preserves caller TMPDIR when it is %s an authorized root", async placement => {
     const f = fixture("batch.slice");
-    const callerTemp = placement === "equal" ? f.scratch : path.join(f.scratch, "caller-temp");
-    if (placement === "inside") fs.mkdirSync(callerTemp);
+    const callerTemp = placement === "equal" ? f.scratch : f.scratchPath("t");
+    if (placement === "inside") {
+      fs.mkdirSync(callerTemp);
+      scratchPaths.push(callerTemp);
+    }
     vi.stubEnv("TMPDIR", callerTemp);
     // Other native temp aliases must follow the accepted TMPDIR, not leak outside.
     const requestedRoots = [f.cwd, f.scratch];
@@ -164,17 +193,19 @@ describe("native process task temporary directory containment", () => {
 
   it.each(["relative", "native-symlink-parent"] as const)("preserves valid %s TMPDIR for scoped state", async kind => {
     const f = fixture("batch.slice");
-    const candidate = path.join(f.scratch, "caller-temp");
+    const candidate = f.scratchPath(kind === "native-symlink-parent" ? "l" : "t");
     let callerTemp: string;
     let expected: string;
     if (kind === "relative") {
       fs.mkdirSync(candidate);
+      scratchPaths.push(candidate);
       callerTemp = path.relative(f.cwd, candidate);
       expected = candidate;
     } else {
       const nested = path.join(f.cwd, "nested");
       fs.mkdirSync(nested);
       fs.symlinkSync(nested, candidate, "junction");
+      scratchPaths.push(candidate);
       callerTemp = `${candidate}${path.sep}..`;
       expected = process.platform === "win32" ? f.scratch : f.cwd;
     }
@@ -192,8 +223,9 @@ describe("native process task temporary directory containment", () => {
 
   it("preserves a temp symlink when its lexical and real paths are both granted", async () => {
     const f = fixture();
-    const callerTemp = path.join(f.scratch, "linked-temp");
+    const callerTemp = f.scratchPath("l");
     fs.symlinkSync(f.cwd, callerTemp, "junction");
+    scratchPaths.push(callerTemp);
     vi.stubEnv("TMPDIR", callerTemp);
     const { value } = await report(f, { writableRoots: [f.cwd, f.scratch], shell: "unconfined" });
     expect(value.tmp).toBe(callerTemp);
@@ -224,19 +256,67 @@ describe("native process task temporary directory containment", () => {
     expect(inside(f.cwd, value.output)).toBe(true);
   });
 
-  it.each([undefined, "batch.slice"])("honors default --tmpdir before the worker starts (slice %s)", async processSlice => {
-    const f = fixture(processSlice);
-    const { result, value } = await report(f, {});
-    const expected = path.join(f.manager.runDirectory(result.id)!, "tmp");
-    expect(value.argTmpdir).toBe(expected);
-    expect(value.tmp).toBe(expected);
-    expect(value.env).toEqual({ TMPDIR: expected, TMP: expected, TEMP: expected });
-    expect(value.policy).toEqual({ readOnly: false, writableRoots: [f.cwd, expected].sort(), shell: "unconfined" });
-    expect(inside(expected, value.output)).toBe(true);
+  it.each([undefined, "batch.slice"])("uses a short associated --tmpdir for a long run directory (slice %s)", async processSlice => {
+    const f = fixture(processSlice, true);
+    const { result, value } = await report(f, { actorId: "tmpdir-test-actor" });
+    const runDirectory = f.manager.runDirectory(result.id)!;
+    const association = JSON.parse(fs.readFileSync(path.join(runDirectory, "tmp", "task-tmp.json"), "utf8")) as {
+      runId: string; path: string; dev: string; ino: string;
+    };
+    const stat = fs.statSync(value.tmp);
+    expect(Buffer.byteLength(runDirectory, "utf8")).toBeGreaterThan(60);
+    expect(value.argTmpdir).toBe(value.tmp);
+    expect(Buffer.byteLength(value.tmp, "utf8")).toBeLessThanOrEqual(51);
+    expect(value.tmp).not.toBe(path.join(runDirectory, "tmp"));
+    expect(association).toMatchObject({ runId: result.id, path: value.tmp, dev: String(stat.dev), ino: String(stat.ino) });
+    expect(canRemoveTerminalRun(runDirectory)).toBe(true);
+    expect(path.dirname(value.tmp)).toBe(f.taskTmpRoot);
+    expect(stat.isDirectory()).toBe(true);
+    if (process.platform !== "win32") expect(stat.mode & 0o777).toBe(0o700);
+    if (process.getuid) expect(stat.uid).toBe(process.getuid());
+    expect(value.env).toEqual({ TMPDIR: value.tmp, TMP: value.tmp, TEMP: value.tmp });
+    expect(value.policy).toEqual({ readOnly: false, writableRoots: [value.tmp], shell: "unconfined" });
+    expect(inside(value.tmp, value.output)).toBe(true);
     expect(value.bytes).toBeGreaterThan(50 * 1024);
     if (processSlice && process.platform === "linux") {
       expect(fs.readFileSync(path.join(f.cwd, "scope-args"), "utf8")).toContain("--slice=batch.slice\n");
     }
+  });
+
+  it("removes the associated scratch only after a confirmed run cleanup", async () => {
+    const f = fixture(undefined, true, false);
+    const { result, value } = await report(f, { actorId: "tmpdir-cleanup-test" });
+    const runDirectory = f.manager.runDirectory(result.id)!;
+    expect(fs.existsSync(value.tmp)).toBe(true);
+    expect(fs.existsSync(path.join(runDirectory, "tmp", "task-tmp.json"))).toBe(true);
+    await f.manager.cleanup(result.id);
+    expect(fs.existsSync(value.tmp)).toBe(false);
+    expect(fs.existsSync(runDirectory)).toBe(false);
+  });
+
+  it("retains the run and scratch if its association disappears while the manager owns it", async () => {
+    const f = fixture(undefined, true, false);
+    const { result, value } = await report(f, { actorId: "tmpdir-missing-association" });
+    const runDirectory = f.manager.runDirectory(result.id)!;
+    fs.unlinkSync(path.join(runDirectory, "tmp", "task-tmp.json"));
+    await expect(f.manager.cleanup(result.id)).rejects.toThrow("task temporary directory custody is unknown");
+    expect(fs.existsSync(runDirectory)).toBe(true);
+    expect(fs.existsSync(value.tmp)).toBe(true);
+  });
+
+  it("retains the run and replacement scratch when its recorded inode is unknown", async () => {
+    const f = fixture(undefined, true, false);
+    const { result, value } = await report(f, { actorId: "tmpdir-unknown-test" });
+    const runDirectory = f.manager.runDirectory(result.id)!;
+    const moved = path.join(f.root, "moved-original-task-tmp");
+    fs.renameSync(value.tmp, moved);
+    taskTmpPaths.push(moved);
+    fs.mkdirSync(value.tmp, { mode: 0o700 });
+    await expect(f.manager.cleanup(result.id)).rejects.toThrow("task temporary directory custody is unknown");
+    expect(fs.existsSync(runDirectory)).toBe(true);
+    expect(fs.existsSync(path.join(runDirectory, "tmp", "task-tmp.json"))).toBe(true);
+    expect(fs.existsSync(value.tmp)).toBe(true);
+    expect(fs.existsSync(moved)).toBe(true);
   });
 
   it.each(["missing", "regular-file", "escaping-symlink"] as const)(
@@ -262,8 +342,9 @@ describe("native process task temporary directory containment", () => {
 
   it("does not preserve a lexically contained TMPDIR symlink that escapes the root", async () => {
     const f = fixture();
-    const escape = path.join(f.scratch, "temp-escape");
+    const escape = f.scratchPath("e");
     fs.symlinkSync(f.parentTemp, escape, "junction");
+    scratchPaths.push(escape);
     vi.stubEnv("TMPDIR", escape);
     vi.stubEnv("TMP", escape);
     vi.stubEnv("TEMP", escape);
@@ -279,8 +360,9 @@ describe("native process task temporary directory containment", () => {
     const f = fixture();
     const nested = path.join(f.parentTemp, "nested");
     fs.mkdirSync(nested);
-    const link = path.join(f.scratch, "linked-temp");
+    const link = f.scratchPath("l");
     fs.symlinkSync(nested, link, "junction");
+    scratchPaths.push(link);
     const callerTemp = `${link}${path.sep}..`;
     vi.stubEnv("TMPDIR", callerTemp);
     const { value } = await report(f, { writableRoots: [f.cwd, f.scratch], shell: "unconfined" });
@@ -296,6 +378,31 @@ describe("native process task temporary directory containment", () => {
     expect(fs.readdirSync(f.parentTemp)).toEqual(["nested"]);
   });
 
+  it("rejects a configured task-temp root with symlink ancestry before spawning", async () => {
+    const f = fixture(undefined, true, true, (root, shortRoot) => {
+      const link = path.join(root, "task-temp-link");
+      fs.symlinkSync(shortRoot, link, "junction");
+      return link;
+    });
+    const before = fs.readdirSync(f.taskTmpRoot).filter(name => /^r\.[A-Za-z0-9]{6}$/.test(name)).sort();
+    await expect(f.manager.spawn({ task: "filesystem probe", transport: "process", actorId: "unsafe-tmp-root" }))
+      .rejects.toThrow("Task temporary root contains a symlink");
+    expect(fs.readdirSync(f.taskTmpRoot).filter(name => /^r\.[A-Za-z0-9]{6}$/.test(name)).sort()).toEqual(before);
+  });
+
+  it("refuses a selected TMPDIR whose bootstrap path exceeds 60 bytes", async () => {
+    const f = fixture();
+    const longRoot = path.join(f.root, `long-${"x".repeat(64)}`);
+    const longTmp = path.join(longRoot, "scratch");
+    fs.mkdirSync(longTmp, { recursive: true });
+    const policy = { readOnly: false, writableRoots: [longRoot], shell: "unconfined" };
+    await expect(new ProcessTransport().launch({
+      id: "overbudget", name: "overbudget", cwd: f.cwd, workerPath: f.worker,
+      workerArguments: ["--write-policy", JSON.stringify(policy), "--tmpdir", longTmp],
+    })).rejects.toThrow("60-byte bootstrap limit");
+    expect(fs.existsSync(longTmp)).toBe(true);
+  });
+
   it("refuses a replaced grant root before allocating temporary files through its symlink", async () => {
     const f = fixture();
     fs.renameSync(f.scratch, path.join(f.root, "scratch-original"));
@@ -309,17 +416,19 @@ describe("native process task temporary directory containment", () => {
 
   it("checks revoked launch authority before allocating a new temporary directory", async () => {
     const f = fixture();
+    const before = fs.readdirSync(f.scratch).sort();
     await expect(new ProcessTransport().launch({
       id: "revoked", name: "revoked", cwd: f.cwd, workerPath: f.worker, authorize: () => false,
       workerArguments: ["--write-policy", JSON.stringify({ readOnly: false, writableRoots: [f.cwd, f.scratch], shell: "unconfined" })],
     })).rejects.toThrow("no longer authorized");
-    expect(fs.readdirSync(f.scratch)).toEqual([]);
+    expect(fs.readdirSync(f.scratch).sort()).toEqual(before);
   });
 
   it("does not treat a sibling-prefix path as being inside an authorized root", async () => {
     const f = fixture();
     const sibling = `${f.scratch}-sibling`;
     fs.mkdirSync(sibling);
+    scratchPaths.push(sibling);
     vi.stubEnv("TMPDIR", sibling);
     vi.stubEnv("TMP", sibling);
     vi.stubEnv("TEMP", sibling);

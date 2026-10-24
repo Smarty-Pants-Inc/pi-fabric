@@ -252,11 +252,63 @@ const PRIVATE_FILE_FINGERPRINT_BYTES = 256;
 // during native close, after host schema validation has already settled the task.
 const MANAGER_RESULT_FILE = "manager-result.json";
 const MANAGER_NESTED_FILE = "manager-nested.json";
+const TASK_TMP_ASSOCIATION_FILE = "task-tmp.json";
+const TASK_TMP_MAX_PARENT_BYTES = 51;
+type TaskTmpAssociation = {
+  format: 1;
+  runId: string;
+  path: string;
+  dev: string;
+  ino: string;
+  parent: string;
+  parentDev: string;
+  parentIno: string;
+};
 const MAX_LOG_SUMMARY_CHARS = 7_000;
 const MAX_LOG_DETAIL_CHARS = 900;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
 /** Unsuccessful managed prompts are retained only up to the existing UI bound, in bytes. */
 const TERMINAL_PROMPT_RETENTION_MAX_BYTES = MAX_UI_TEXT_CHARS;
+
+const taskTmpParent = (configured?: string): string => {
+  const validate = (candidate: string): string => {
+    if (!path.isAbsolute(candidate)) throw new Error("Task temporary root must be an absolute path");
+    const absolute = path.resolve(candidate);
+    const physical = fs.realpathSync.native(absolute);
+    if (physical !== absolute) throw new Error(`Task temporary root contains a symlink: ${candidate}`);
+    const chain: string[] = [];
+    for (let current = physical; ; current = path.dirname(current)) {
+      chain.unshift(current);
+      if (path.dirname(current) === current) break;
+    }
+    const uid = process.getuid?.();
+    for (const directory of chain) {
+      const stat = fs.lstatSync(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Task temporary root ancestry is not physical: ${directory}`);
+      if (uid !== undefined && stat.uid !== uid && stat.uid !== 0) throw new Error(`Task temporary root ancestry is not owned by this user: ${directory}`);
+      if ((stat.mode & 0o022) !== 0 && !(stat.uid === 0 && (stat.mode & 0o1000) !== 0)) {
+        throw new Error(`Task temporary root ancestry is writable by other users: ${directory}`);
+      }
+    }
+    if (Buffer.byteLength(path.join(physical, "r.XXXXXX"), "utf8") > TASK_TMP_MAX_PARENT_BYTES) {
+      throw new Error(`Task temporary root is too long for the 60-byte bootstrap limit: ${physical}`);
+    }
+    return physical;
+  };
+  const explicit = configured ?? process.env.PI_FABRIC_TASK_TMP_ROOT;
+  if (explicit !== undefined) return validate(explicit);
+  // Pi's session store is below PI_CODING_AGENT_DIR; this short parent keeps each
+  // task's private r.XXXXXX directory beside, not inside, the session store.
+  const sessionStoreParent = process.env.PI_CODING_AGENT_DIR;
+  for (const candidate of [sessionStoreParent, os.tmpdir()]) {
+    if (!candidate) continue;
+    try { return validate(fs.realpathSync.native(candidate)); } catch { /* try the next explicit default */ }
+  }
+  throw new Error("Cannot allocate a private short task temporary root; configure PI_FABRIC_TASK_TMP_ROOT to an existing safe path whose r.XXXXXX child is at most 51 bytes");
+};
+
+const sameTaskTmpStat = (stat: fs.Stats, dev: string, ino: string): boolean =>
+  String(stat.dev) === dev && String(stat.ino) === ino;
 
 const clearChildActorSelfEnvironment = (environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
   const child = { ...environment };
@@ -1345,6 +1397,8 @@ export class AgentManager {
   #admissionSnapshotClosed = false;
   readonly #worktrees = new WorktreeManager();
   readonly #runRoot: string;
+  readonly #taskTmpRoot: string | undefined;
+  readonly #taskTmpAllocations = new Map<string, string>();
   readonly #managedTempRoot: boolean;
   readonly #parentOwnedRunRoot: boolean;
   readonly #retention: FabricRetentionConfig;
@@ -1376,6 +1430,105 @@ export class AgentManager {
     const mesh = this.#meshRoot === undefined ? undefined : path.resolve(this.#meshRoot);
     return mesh !== undefined && runRoot.startsWith(mesh + path.sep) ? mesh : runRoot;
   }
+
+  #allocateTaskTmp(runDirectory: string, runId: string): string {
+    const parent = taskTmpParent(this.#taskTmpRoot);
+    const temporary = fs.mkdtempSync(path.join(parent, "r."));
+    let pin: fs.Stats | undefined;
+    try {
+      fs.chmodSync(temporary, 0o700);
+      const physical = fs.realpathSync.native(temporary);
+      const stat = fs.lstatSync(temporary);
+      const parentStat = fs.lstatSync(parent);
+      if (physical !== temporary || !stat.isDirectory() || stat.isSymbolicLink() ||
+          (process.getuid !== undefined && stat.uid !== process.getuid()) ||
+          (process.platform !== "win32" && (stat.mode & 0o777) !== 0o700) ||
+          Buffer.byteLength(temporary, "utf8") > TASK_TMP_MAX_PARENT_BYTES) {
+        throw new Error("Private task temporary directory failed its short-path ownership checks");
+      }
+      pin = stat;
+      const association: TaskTmpAssociation = {
+        format: 1, runId, path: temporary, dev: String(stat.dev), ino: String(stat.ino),
+        parent, parentDev: String(parentStat.dev), parentIno: String(parentStat.ino),
+      };
+      const runTmp = path.join(runDirectory, "tmp");
+      mkdirPrivate(runTmp, this.#trustRoot());
+      writeJsonAtomic(path.join(runTmp, TASK_TMP_ASSOCIATION_FILE), association, { durable: true });
+      this.#taskTmpAllocations.set(runId, temporary);
+      return temporary;
+    } catch (error) {
+      if (pin) {
+        try {
+          const current = fs.lstatSync(temporary);
+          if (current.isDirectory() && !current.isSymbolicLink() && current.dev === pin.dev && current.ino === pin.ino) {
+            fs.rmSync(temporary, { recursive: true, force: true });
+          }
+        } catch { /* the association or directory is unknown; leave it for inspection */ }
+      }
+      throw error;
+    }
+  }
+
+  async #cleanupTaskTmp(runDirectory: string, runId: string): Promise<boolean> {
+    const file = path.join(runDirectory, "tmp", TASK_TMP_ASSOCIATION_FILE);
+    let pin: fs.Stats;
+    try { pin = fs.lstatSync(file); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+      return !this.#taskTmpAllocations.has(runId);
+    }
+    if (!pin.isFile() || pin.isSymbolicLink() || pin.nlink !== 1 ||
+        (process.getuid !== undefined && pin.uid !== process.getuid()) ||
+        (process.platform !== "win32" && (pin.mode & 0o777) !== 0o600) || pin.size > 4096) return false;
+    let fd: number | undefined;
+    let value: TaskTmpAssociation;
+    try {
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== pin.dev || opened.ino !== pin.ino ||
+          opened.uid !== pin.uid || opened.mode !== pin.mode || opened.size !== pin.size || opened.size > 4096) return false;
+      value = JSON.parse(fs.readFileSync(fd, "utf8")) as TaskTmpAssociation;
+      const after = fs.fstatSync(fd);
+      const current = fs.lstatSync(file);
+      if (!after.isFile() || after.nlink !== 1 || after.dev !== pin.dev || after.ino !== pin.ino ||
+          after.uid !== pin.uid || after.mode !== pin.mode || after.size !== pin.size ||
+          current.isSymbolicLink() || current.nlink !== 1 || current.dev !== pin.dev || current.ino !== pin.ino ||
+          current.uid !== pin.uid || current.mode !== pin.mode || current.size !== pin.size) return false;
+    } catch { return false; }
+    finally { if (fd !== undefined) fs.closeSync(fd); }
+    if (value?.format !== 1 || value.runId !== runId || !path.isAbsolute(value.path) || !path.isAbsolute(value.parent) ||
+        path.resolve(value.path) !== value.path || path.dirname(value.path) !== value.parent ||
+        !/^r\.[A-Za-z0-9]{6}$/.test(path.basename(value.path)) ||
+        Buffer.byteLength(value.path, "utf8") > TASK_TMP_MAX_PARENT_BYTES ||
+        ![value.dev, value.ino, value.parentDev, value.parentIno].every(item => typeof item === "string" && /^\d+$/.test(item))) return false;
+    try {
+      if (taskTmpParent(value.parent) !== value.parent) return false;
+      const parentStat = fs.lstatSync(value.parent);
+      if (!parentStat.isDirectory() || parentStat.isSymbolicLink() || !sameTaskTmpStat(parentStat, value.parentDev, value.parentIno)) return false;
+    } catch { return false; }
+
+    let temporaryStat: fs.Stats | undefined;
+    try { temporaryStat = fs.lstatSync(value.path); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+    if (temporaryStat) {
+      if (!temporaryStat.isDirectory() || temporaryStat.isSymbolicLink() ||
+          (process.getuid !== undefined && temporaryStat.uid !== process.getuid()) ||
+          (process.platform !== "win32" && (temporaryStat.mode & 0o777) !== 0o700) ||
+          !sameTaskTmpStat(temporaryStat, value.dev, value.ino)) return false;
+      await removeTree(value.path).catch(() => undefined);
+      if (!pathAbsentNoFollow(value.path)) return false;
+    }
+    try {
+      const current = fs.lstatSync(file);
+      if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1 || current.dev !== pin.dev ||
+          current.ino !== pin.ino || current.uid !== pin.uid || current.mode !== pin.mode || current.size !== pin.size) return false;
+      fs.unlinkSync(file);
+      const absent = pathAbsentNoFollow(file);
+      if (absent) this.#taskTmpAllocations.delete(runId);
+      return absent;
+    } catch { return false; }
+  }
+
   readonly #projectRoot: string;
   readonly #completionRecipient: CompletionRecipient | (() => CompletionRecipient) | undefined;
   readonly #hostId: string | undefined;
@@ -1503,6 +1656,8 @@ export class AgentManager {
       claudeBinary?: string;
       vedaBinary?: string;
       runRoot?: string;
+      /** Existing short safe parent for private task temporary roots; also configurable through PI_FABRIC_TASK_TMP_ROOT. */
+      taskTmpRoot?: string;
       /** Host-only, read-only projection of this manager's native admission pool. */
       admissionSnapshotPath?: string;
       fullCodeMode?: boolean;
@@ -1564,6 +1719,7 @@ export class AgentManager {
     this.#managedTempRoot = options.runRoot === undefined && process.env.PI_FABRIC_RUN_ROOT === undefined;
     this.#runRoot =
       options.runRoot ?? process.env.PI_FABRIC_RUN_ROOT ?? fs.mkdtempSync(path.join(fabricDataRoot(), "pi-fabric-runs-"));
+    this.#taskTmpRoot = options.taskTmpRoot;
     // Nested run artifacts belong to the enclosing run, not the short-lived Pi
     // child. Its owner removes them on cleanup/retention/root shutdown.
     this.#parentOwnedRunRoot = options.runRoot === undefined &&
@@ -2766,8 +2922,7 @@ export class AgentManager {
       try {
         if (worktree && worktreeSetup?.trim()) await this.#worktrees.setup(id, worktreeSetup);
         if (applyTaskWriteDefault && worktree) applyTaskWriteDefault = defaultWriteScopeFits(agentCwd);
-        const tmpdir = applyActorWritePolicy || applyTaskWriteDefault ? path.join(runDirectory, "tmp") : undefined;
-        if (tmpdir) mkdirPrivate(tmpdir, this.#trustRoot());
+        const tmpdir = applyActorWritePolicy || applyTaskWriteDefault ? this.#allocateTaskTmp(runDirectory, id) : undefined;
         const actorReadOnly = request.readOnly ?? this.#parentWritePolicy?.readOnly ?? false;
         const writePolicy = capabilities.writePolicy
           ? resolveChildWritePolicy(applyActorWritePolicy
@@ -3370,6 +3525,12 @@ export class AgentManager {
         }
         release();
         try { routeDispatch?.outcome({ status: signal?.aborted ? "stopped" : "failed" }); } catch { /* pinned work is never blocked by routing storage */ }
+        // An error before launch returns is not enough by itself: require the same
+        // run-tree exit proof as worktree rollback before releasing task scratch.
+        if (!transportLaunchReturned && !this.#runs.has(id) &&
+            !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json")))) {
+          await this.#cleanupTaskTmp(runDirectory, id);
+        }
         // Prelaunch archive custody is not native worker debt. Persisted worker
         // records still require a checked root exit before rollback.
         if (worktree && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json")))) {
@@ -5045,6 +5206,9 @@ export class AgentManager {
       const exitVeto = runTreeExitVeto(runDirectory);
       if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
       this.#onResultConsumed?.(id);
+      if (!this.config.retainRuns && !await this.#cleanupTaskTmp(runDirectory, id)) {
+        throw new Error(`Cannot clean up agent ${id}: task temporary directory custody is unknown; run retained at ${runDirectory}`);
+      }
       const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
       if (!this.config.retainRuns) await removeTree(runDirectory);
       this.#queued.delete(id);
@@ -5082,10 +5246,11 @@ export class AgentManager {
       throw new Error(`Cannot clean up agent ${id}: ${uncheckedExternalExit(managed.transport) ? "external transport has no checked worker exit receipt" : managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
     }
     this.markForeground(id);
-    const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
-    if (!this.config.retainRuns) {
-      await removeTree(managed.runDirectory);
+    if (!this.config.retainRuns && !await this.#cleanupTaskTmp(managed.runDirectory, id)) {
+      throw new Error(`Cannot clean up agent ${id}: task temporary directory custody is unknown; run retained at ${managed.runDirectory}`);
     }
+    const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
+    if (!this.config.retainRuns) await removeTree(managed.runDirectory);
     this.#runs.delete(id);
     this.#forgetRunMetadata(id);
     this.#pruneRetainedUiRecords();
@@ -5610,6 +5775,7 @@ export class AgentManager {
           // explicit roots: an unexpected loss keeps custody and a loud refusal.
           if (managed.settledResultFile && !this.#exactResultPresent(managed)) return;
           if (await this.#retainTerminalPromptRecord(managed).catch(() => true)) return;
+          if (!await this.#cleanupTaskTmp(managed.runDirectory, managed.id)) return;
           try { await removeTree(managed.runDirectory); } catch { return; } // A swallowed failure is no provenance.
           // A no-op removal or remaining/dangling entry is not collection.
           if (managed.settledResultFile && pathAbsentNoFollow(managed.settledResultFile)) managed.resultCollected = true;
@@ -5629,10 +5795,12 @@ export class AgentManager {
           }
           // A recovered manager does not own workers left by an earlier host.
           // All tracked transports are confirmed exited above; untracked runs stay put.
-          await Promise.all([...this.#queued.values()]
-            .filter(queued => queued.terminal && !queued.routeSaveFailure && !queued.cleanupPending &&
-              !runTreeExitVeto(path.join(this.#runRoot, queued.info.id)))
-            .map(queued => removeTree(path.join(this.#runRoot, queued.info.id)).catch(() => undefined)));
+          for (const queued of this.#queued.values()) {
+            const directory = path.join(this.#runRoot, queued.info.id);
+            if (!queued.terminal || queued.routeSaveFailure || queued.cleanupPending || runTreeExitVeto(directory)) continue;
+            if (!await this.#cleanupTaskTmp(directory, queued.info.id)) continue;
+            await removeTree(directory).catch(() => undefined);
+          }
           // Independently collectible tracked runs were removed above. Retry only
           // the owned empty root; never recursively remove unknown contents.
           await removeManagedRunRoot(this.#runRoot, this.#managedTempRoot);
@@ -5716,6 +5884,7 @@ export class AgentManager {
       if (!this.#canCollect(managed)) continue;
       // Retry settlement saves first; pending deliveries and unsafe contents still veto expiry.
       if (!canRemoveTerminalRun(managed.runDirectory)) continue;
+      if (!await this.#cleanupTaskTmp(managed.runDirectory, managed.id)) continue;
       await removeTree(managed.runDirectory).catch(() => undefined);
       if (!fs.existsSync(managed.runDirectory)) {
         this.#runs.delete(managed.id);
@@ -7328,6 +7497,8 @@ export class AgentManager {
     // have written a completed status.json after host validation failed the run.
     const record = this.#readResult(managed) ?? managed.latestRecord;
     if (!record || (record.status !== "failed" && record.status !== "stopped" && record.status !== "timed_out")) return false;
+    // Unknown temp custody retains the entire run, including its raw trace and association.
+    if (!await this.#cleanupTaskTmp(managed.runDirectory, managed.id)) return true;
     const resultFile = managed.settledResultFile;
     const keepResult = resultFile === path.join(managed.runDirectory, MANAGER_RESULT_FILE) && this.#exactResultPresent(managed);
     const promptFile = path.join(managed.runDirectory, "task.txt");

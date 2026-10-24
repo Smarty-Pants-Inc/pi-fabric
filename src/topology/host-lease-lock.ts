@@ -16,15 +16,22 @@ export const hostLeaseAdditionsGatePath = (root: string): string => path.join(ro
 /** Lease namespace custody blocks new filenames while a mirror brackets its directory snapshot.
  * Existing renewals need only their per-host gate. A creator takes additions before its host gate;
  * if a prior removal races the initial existence check, retry in that same stable order. */
-/** Shared host-lease directory gate. Every supported writer takes it before a target gate, so
- * mirror snapshots can stabilize the lease namespace with one short lock rather than every file. */
+/** Namespace custody blocks new lease filenames. Existing renewals use only their per-host gate. */
 export const withHostLeaseDirectoryCustody = <T>(mesh: HostLeaseMesh,
   operation: () => T | Promise<T>, timeoutMs = 0, options: { ownIncarnation?: string | undefined } = {}): Promise<T> =>
   mesh.leaseCustody(hostLeaseAdditionsGatePath(mesh.root), operation, timeoutMs, options);
 
-export const withHostLeaseFileCustody = <T>(mesh: HostLeaseMesh, file: string,
-  operation: () => T | Promise<T>, timeoutMs = 0, options: { ownIncarnation?: string | undefined } = {}): Promise<T> =>
-  withHostLeaseDirectoryCustody(mesh, () => mesh.leaseCustody(file, operation, timeoutMs, options), timeoutMs, options);
+export const withHostLeaseFileCustody = async <T>(mesh: HostLeaseMesh, file: string,
+  operation: () => T | Promise<T>, timeoutMs = 0, options: { ownIncarnation?: string | undefined } = {}): Promise<T> => {
+  const target = () => mesh.leaseCustody(file, operation, timeoutMs, options);
+  if (!fs.existsSync(file)) return withHostLeaseDirectoryCustody(mesh, target, timeoutMs, options);
+  let missing = false;
+  const current = await mesh.leaseCustody(file, () => {
+    if (!fs.existsSync(file)) { missing = true; return undefined; }
+    return operation();
+  }, timeoutMs, options);
+  return missing ? withHostLeaseDirectoryCustody(mesh, target, timeoutMs, options) : current as T;
+};
 export interface HostLeaseLockOptions {
   signal?: AbortSignal;
   ownIncarnation?: string | undefined;

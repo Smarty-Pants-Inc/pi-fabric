@@ -11,7 +11,7 @@ import { isNamespaceRace } from "../core/atomic-write.js";
 import { acquireMeshCustodyLock, withMeshCustody } from "./custody-lock.js";
 import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } from "./state-file.js";
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
-  type StateBackendDiagnostics } from "./state-backend.js";
+  type StateBackendDiagnostics, type StateChangeExceptions } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
 import { closeResidentWakeRetryCursor, indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
 import { writeFileAtomic } from "../core/atomic-write.js";
@@ -364,7 +364,7 @@ let unreadableStateRevisions = 0;
 
 /** The SQLite backend's revision views (SqliteStateBackend), reached without a value import. */
 interface SqliteStateViews {
-  unchangedSince(stamp: string, prefixes: readonly string[], exceptKeys?: ReadonlySet<string>): boolean;
+  unchangedSince(stamp: string, prefixes: readonly string[], exceptKeys?: StateChangeExceptions): boolean;
   stateView(): { stamp: string; view: MeshBatchView };
 }
 
@@ -1011,7 +1011,7 @@ export class MeshStore {
    * smarty-dev#10391, sqlite only: whether no key under `prefixes` changed after `revision` (a `stateRevision()`),
    * from the change feed, cheap enough to run in `withStateWriteFence`. False on other backends or when unknown.
    */
-  stateUnchangedSince(revision: string, prefixes: readonly string[], exceptKeys?: ReadonlySet<string>): boolean {
+  stateUnchangedSince(revision: string, prefixes: readonly string[], exceptKeys?: StateChangeExceptions): boolean {
     const state = this.#sqliteState();
     return state !== undefined && state.unchangedSince(revision, prefixes, exceptKeys);
   }

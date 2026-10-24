@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { ownProcessIncarnation, processIncarnation, validProcessIncarnation, readFileRetrying, renameAtomic, AtomicFileWriter, MeshLockTimeoutError } from "../core/atomic-write.js";
@@ -57,22 +57,6 @@ export class ParticipantFileLockBusyError extends MeshLockTimeoutError {
   constructor(lock: string) { super(` participant file lock ${lock}`, 1, 0); }
 }
 
-const withNamespaceKeyWrite = async <T>(mesh: ParticipantFileMesh, file: string, operation: () => T,
-  options: ParticipantFileLockOptions = {}): Promise<T> => {
-  for (;;) {
-    const attempt = await withParticipantNamespaceLock(mesh, async () => {
-      try { return { acquired: true as const, value: await withKeyLock(mesh, file, operation, { ...options, tryOnly: true }) }; }
-      catch (error) {
-        if (error instanceof ParticipantFileLockBusyError) return { acquired: false as const };
-        throw error;
-      }
-    }, options);
-    if (attempt.acquired) return attempt.value;
-    const { withCommitFence: _withCommitFence, ...waitOptions } = options;
-    await withKeyLock(mesh, file, () => undefined, waitOptions);
-  }
-};
-
 export const writeParticipantFileIf = async (
   mesh: ParticipantFileMesh,
   key: string,
@@ -93,10 +77,28 @@ export const writeParticipantFileIf = async (
     rescan(path.dirname(file));
     return true;
   };
-  return withNamespaceKeyWrite(mesh, file, write, options);
+  for (;;) {
+    // Additions take the namespace gate before their per-key receipt. Existing entries release
+    // that short check before waiting on their key, so unrelated renewals remain concurrent.
+    const { withCommitFence: _withCommitFence, ...namespaceOptions } = options;
+    const namespace = await withParticipantNamespaceLock(mesh, async () => {
+      if (fs.existsSync(file)) return { present: true as const };
+      try {
+        return { present: false as const, result: await withKeyLock(mesh, file, write, { ...options, tryOnly: true }) };
+      } catch (error) {
+        if (!(error instanceof ParticipantFileLockBusyError)) throw error;
+        return { present: false as const, contended: true as const };
+      }
+    }, namespaceOptions);
+    if (!namespace.present && !("contended" in namespace)) return namespace.result;
+    const result = await withKeyLock(mesh, file, () => fs.existsSync(file) ? write() : RETRY_ADDITION, options);
+    if (result !== RETRY_ADDITION) return result;
+  }
 };
 
-/** Removes a record under shared namespace custody, then its per-key receipt. */
+const RETRY_ADDITION = Symbol("participant-file-addition-raced-removal");
+
+/** Removes a record under its per-key receipt; the namespace gate is only for additions. */
 export const removeParticipantFileIf = async (
   mesh: ParticipantFileMesh,
   key: string,
@@ -105,7 +107,7 @@ export const removeParticipantFileIf = async (
 ): Promise<boolean> => {
   const file = fileOf(mesh.root, key);
   if (!file) return false;
-  return withNamespaceKeyWrite(mesh, file, () => {
+  return withKeyLock(mesh, file, () => {
     const current = readFresh(file);
     if (!current || !decide(current)) return false;
     fs.rmSync(file, { force: true });
@@ -204,7 +206,15 @@ export const withParticipantFileTryLock = <T>(
 ): T => {
   const file = fileOf(mesh.root, key);
   if (!file) throw new Error(`Not a participant key: ${key}`);
-  return withParticipantFilesTryLock(mesh, [key], ownIncarnation, operation);
+  const receipt = keyReceipt(mesh, file, ownIncarnation);
+  try { receipt.acquire(); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (["EEXIST", "ENOTEMPTY", "EPERM", "EACCES"].includes(code ?? "")) throw new ParticipantFileLockBusyError(receipt.lock);
+    throw error;
+  }
+  try { return operation(); }
+  finally { receipt.release(); }
 };
 
 const namespaceReceiptFile = (mesh: ParticipantFileMesh): string => path.join(mesh.root, DIR, ".namespace.json");
@@ -213,10 +223,37 @@ const namespaceReceiptFile = (mesh: ParticipantFileMesh): string => path.join(me
 const withParticipantNamespaceLock = <T>(mesh: ParticipantFileMesh, operation: () => T | Promise<T>,
   options: ParticipantFileLockOptions = {}): Promise<T> => withKeyLock(mesh, namespaceReceiptFile(mesh), operation, options);
 
-/** Shared participant namespace custody. Every supported file writer takes this receipt before
- * its per-key receipt, so the mirror stabilizes entries and additions with one short lock. */
+/** Stabilize additions and the selected existing records in key order. The ID filter excludes
+ * unrelated native heartbeat files while still locking every entry that can alias this mirror. */
 export const withParticipantFileDirectoryCustody = <T>(mesh: ParticipantFileMesh,
-  operation: () => T | Promise<T>): Promise<T> => withParticipantNamespaceLock(mesh, operation);
+  operation: () => T | Promise<T>, relevantIds?: ReadonlySet<string>): Promise<T> => withParticipantNamespaceLock(mesh, async () => {
+    const directory = path.join(mesh.root, DIR);
+    let names: string[];
+    try { names = fs.readdirSync(directory).filter(name => NAME.test(name)).sort(); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") names = []; else throw error; }
+    const relevantFiles = relevantIds === undefined ? undefined : new Set<string>();
+    if (relevantFiles && relevantIds) {
+      for (const id of relevantIds) {
+        const key = `${PREFIX}${createHash("sha256").update(id).digest("hex")}`;
+        const file = fileOf(mesh.root, key);
+        if (file) relevantFiles.add(path.basename(file));
+      }
+      for (const name of names) {
+        const entry = readFresh(path.join(directory, name));
+        if (entry && typeof entry.value === "object" && entry.value !== null) {
+          const value = entry.value as Record<string, unknown>;
+          if ([value.id, value.rootId, value.ownerHostId, value.ownerIdentityId].some(id => typeof id === "string" && relevantIds.has(id))) {
+            relevantFiles.add(name);
+          }
+        }
+      }
+    }
+    const files = names.filter(name => relevantFiles === undefined || relevantFiles.has(name)).map(name => path.join(directory, name));
+    const acquire = (index: number): Promise<T> => index === files.length
+      ? Promise.resolve().then(operation)
+      : withKeyLock(mesh, files[index]!, () => acquire(index + 1));
+    return acquire(0);
+  });
 
 /** Synchronous form for already-prepared publication fences; namespace first, then sorted keys. */
 export const withParticipantFilesTryLock = <T>(mesh: ParticipantFileMesh, keys: readonly string[],

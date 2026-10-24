@@ -226,16 +226,14 @@ export const reapDeadHostRecords = async (
       : Promise.resolve().then(operation);
   // Acquire target gates in a stable order, before the reaper's gate and shared state.
   // A renewal on ANY selected target aborts this pass before any record/file deletion.
-  const targetGates = <T>(operation: () => T | Promise<T>, index = 0): Promise<T> => {
-    const acquire = (at: number): Promise<T> => at === targets.length
-      ? Promise.resolve().then(operation)
-      : targetGate(targets[at]!, () => {
-        assertTarget(targets[at]!, selectedLeases.get(targets[at]!));
-        return acquire(at + 1);
-      });
+  const targetGates = <T>(operation: () => T | Promise<T>): Promise<T> => {
+    const guarded = () => {
+      for (const hostId of targets) assertTarget(hostId, selectedLeases.get(hostId));
+      return operation();
+    };
     return typeof root === "string" && mesh.leaseCustody
-      ? withHostLeaseDirectoryCustody(mesh as MeshStore, () => acquire(index))
-      : acquire(index);
+      ? withHostLeaseDirectoryCustody(mesh as MeshStore, guarded, new Set(targets))
+      : Promise.resolve().then(guarded);
   };
   const retired = new Set<string>();
   const reapable = new Set<string>();

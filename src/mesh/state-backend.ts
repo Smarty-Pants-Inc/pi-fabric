@@ -202,6 +202,11 @@ export interface StateDivergence {
  * `writeSignal`, and a timeout is a `MeshLockTimeoutError` (`MeshStateBusy` for sqlite). Each write
  * is atomic: all of it commits or none of it does.
  */
+export type StateChangeExceptions = ReadonlySet<string> | ReadonlyMap<string, number> | {
+  readonly ignore: ReadonlySet<string>;
+  readonly versions: ReadonlyMap<string, number>;
+};
+
 export interface StateBackend {
   readonly kind: MeshStateBackendKind;
   /** Native opened-connection attestation; absence is unsupported for enforced slot admission. */
@@ -716,7 +721,7 @@ export class SqliteStateBackend implements StateBackend {
     return { stamp: snapshot.stamp, view: snapshotView(() => snapshot) };
   }
 
-  unchangedSince(stamp: string, prefixes: readonly string[], exceptKeys?: ReadonlySet<string>): boolean {
+  unchangedSince(stamp: string, prefixes: readonly string[], exceptKeys?: StateChangeExceptions): boolean {
     const store = this.#read(() => this.#open());
     const current = store.stateStamp();
     if (current === stamp) return true;
@@ -724,8 +729,12 @@ export class SqliteStateBackend implements StateBackend {
     const after = Number(stamp.slice(lineage.length + 1));
     if (lineageOf(current) !== lineage || !Number.isSafeInteger(after)) return false;
     const feed = this.#read(() => store.changesSince(after));
-    return feed.complete && !feed.changes.some(change => !exceptKeys?.has(change.key) &&
-      prefixes.some(prefix => change.key.startsWith(prefix)));
+    const expectedVersions = exceptKeys instanceof Map ? exceptKeys
+      : exceptKeys && !(exceptKeys instanceof Set) ? exceptKeys.versions : undefined;
+    const ignored = exceptKeys instanceof Set ? exceptKeys
+      : exceptKeys && !(exceptKeys instanceof Map) ? exceptKeys.ignore : undefined;
+    return feed.complete && !feed.changes.some(change => prefixes.some(prefix => change.key.startsWith(prefix)) &&
+      !ignored?.has(change.key) && (!expectedVersions || change.version > (expectedVersions.get(change.key) ?? -1)));
   }
 
   // ------------------------------------------------------------ writes

@@ -504,6 +504,22 @@ const hostLeaseAuthorityStamp = (root: string, relevantIds: ReadonlySet<string>)
       lease.bridgeSupersededTokens, lease.bridgeSupersededTokenSeen])
     .sort((left, right) => String(left[0]).localeCompare(String(right[0]))));
 
+const unrelatedMirrorStateKeys = (view: MeshBatchView, relevantIds: ReadonlySet<string>): ReadonlySet<string> => {
+  const ignored = new Set<string>();
+  for (const entry of [...view.listAll(HOST_PREFIX), ...view.listAll(PARTICIPANT_PREFIX), ...view.listAll(BRIDGE_HANDOFF_PREFIX)]) {
+    const host = hostOf(entry.key, entry.value);
+    const participant = participantOf(entry.key, entry.value);
+    const handoff = bridgeHandoffOf(entry);
+    const relevant = host
+      ? [host.id, host.rootId, host.identity.id].some(id => relevantIds.has(id))
+      : participant
+        ? [participant.id, participant.rootId, participant.ownerHostId, participant.ownerIdentityId].some(id => relevantIds.has(id))
+        : handoff ? relevantIds.has(handoff.id) : false;
+    if (!relevant) ignored.add(entry.key);
+  }
+  return ignored;
+};
+
 const droppedPresenceOf = (type: BridgeDroppedPresence["type"], value: unknown, protect = true): BridgeDroppedPresence | undefined => {
   if (!isObject(value)) return undefined;
   const identityId = typeof value.identityId === "string" ? value.identityId
@@ -534,6 +550,23 @@ const uniqueDroppedPresence = (values: readonly unknown[], preserveLocalProtecti
 const contentDigest = (value: unknown): string => createHash("sha256").update(JSON.stringify(value, (_key, item) =>
   isObject(item) ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : item,
 )).digest("hex");
+
+const mirrorInputFingerprint = (presence: BridgeMirrorPresence, fromHub: boolean): string => contentDigest({
+  fromHub,
+  hosts: presence.hosts.map(({ observedAt: _observedAt, expiresAt: _expiresAt, record, ...host }) => ({
+    ...host, record: { ...record, updatedAt: undefined, expiresAt: undefined },
+  })).sort((a, b) => a.record.id.localeCompare(b.record.id)),
+  participants: presence.participants.map(({ updatedAt: _updatedAt, ...participant }) => participant)
+    .sort((a, b) => a.id.localeCompare(b.id)),
+  dropped: presence.dropped,
+  partial: presence.partial,
+  droppedCount: presence.droppedCount,
+});
+
+const mirrorSafeThrough = (presence: BridgeMirrorPresence, liveAt: number): number => presence.hosts.reduce((until, host) =>
+  Math.min(until, liveAt + Math.min(BRIDGE_LEASE_MS,
+    Math.max(0, host.expiresAt - (typeof host.observedAt === "number" ? host.observedAt : liveAt)))),
+  liveAt + BRIDGE_LEASE_MS);
 
 // ---------------------------------------------------------------------------------------------
 // Handoffs (smarty-dev#9074). A Main moved from the hub to a remote host keeps its session id, so
@@ -779,6 +812,7 @@ export class StoreBridgeSide implements BridgeSide {
   // Active only during one mirror commit attempt, including recovery and afterCommit retries.
   #skippedRoots: ReadonlySet<string> | undefined;
   #leaseProcess: Promise<BridgeLeaseProcess | undefined> | undefined;
+  #mirrorFastCache: { fingerprint: string; revision: string; safeThrough: number; ignoredStateKeys: ReadonlySet<string> } | undefined;
 
   constructor(
     readonly store: MeshStore,
@@ -1513,6 +1547,15 @@ export class StoreBridgeSide implements BridgeSide {
       incomingAuthorityIds.add(participant.ownerIdentityId);
     }
     const partial = presenceIsPartial(presence);
+    const fingerprint = mirrorInputFingerprint(presence, fromHub);
+    const fastCache = this.#mirrorFastCache;
+    const fastRevision = this.store.stateRevision();
+    if (!final && !partial && this.#recovered && fastCache && fastRevision !== undefined &&
+      fastCache.fingerprint === fingerprint && now < fastCache.safeThrough &&
+      this.store.stateUnchangedSince(fastCache.revision, HELD_STATE_PREFIXES,
+        { ignore: fastCache.ignoredStateKeys, versions: new Map() }) &&
+      this.store.listAll(this.#outbox.prefix, { fresh: true }).length === 0) return;
+    this.#mirrorFastCache = undefined;
     // Stamp the existing mirror lease with LOCAL writer evidence, outside state custody.
     // A peer's claimed pid/host is never used, including for one-hop re-exports.
     const bridgeProcess = this.monitorLease ? await (this.#leaseProcess ??= (async () => {
@@ -1529,6 +1572,7 @@ export class StoreBridgeSide implements BridgeSide {
     // rows are committed, so newly-created lease files do not inflate every later custody scan.
     const stagedEffects = new Set<string>();
     const pendingEffects: Array<{ plan: ReturnType<CommitOutbox["plan"]>; view: MeshBatchView }> = [];
+    let completedIgnoreStateKeys: ReadonlySet<string> = new Set();
     const mirrorStateBatchSize = this.store.stateBackend === "sqlite" ? MIRROR_STATE_BATCH_SIZE : Number.MAX_SAFE_INTEGER;
     const mirrorEffectBatchSize = this.store.stateBackend === "sqlite" ? MIRROR_EFFECT_BATCH_SIZE : Number.MAX_SAFE_INTEGER;
     // A trusted hub can carry a stale projection from another link. That projection is
@@ -1855,7 +1899,9 @@ export class StoreBridgeSide implements BridgeSide {
     };
     type CachedMirrorPlan = {
       revision: string;
+      participantDirectoryStamp: string;
       participantAuthorityStamp: string;
+      handoffSensitive: boolean;
       leaseStamp: string;
       leaseAuthorityStamp: string;
       livenessWindow: ReturnType<typeof leaseLivenessWindow> | undefined;
@@ -1863,8 +1909,17 @@ export class StoreBridgeSide implements BridgeSide {
       leases: BridgeLease[];
       removed: NonNullable<ReturnType<typeof compute>>["removed"];
       ownVersions: Map<string, number>;
+      ignoredStateKeys: ReadonlySet<string>;
     };
     let cachedPlan: CachedMirrorPlan | undefined;
+    const custodyAuthorityIds = new Set(incomingAuthorityIds);
+    for (const entry of this.store.listAll(BRIDGE_HANDOFF_PREFIX)) {
+      const handoff = bridgeHandoffOf(entry);
+      if (handoff) custodyAuthorityIds.add(handoff.id);
+    }
+    // Hold only the additions gates and file receipts that can affect these incoming identities.
+    // Unrelated native heartbeat files remain writable while all mirror batches share this plan.
+    await withParticipantFileDirectoryCustody(this.store, () => withHostLeaseDirectoryCustody(this.store, async () => {
     for (;;) {
       let retries = 0;
       let more = false;
@@ -1881,41 +1936,62 @@ export class StoreBridgeSide implements BridgeSide {
         plan = this.#outbox.plan();
         this.#skippedRoots = skippedRoots;
         try {
-          // Stable cross-namespace order: participant namespace + every extant per-file gate,
-          // then host lease additions + every extant per-host lease gate. Writers use the same
-          // gates. They cover only one bounded commit at a time, never the yielding effects.
-          await withParticipantFileDirectoryCustody(this.store, () => withHostLeaseDirectoryCustody(this.store, async () => {
+          // Stable cross-namespace order: participant namespace and relevant key receipts,
+          // then host-lease additions and relevant per-host receipts.
+          {
             const filesStamp = meshDirectoryStamp(this.store.root, "participants");
-            const files = participantFileSnapshot(this.store.root);
-            const participantAuthority = participantAuthorityStamp(files);
-            const early = this.store.stateView();
-            const handoffEntries = early?.view.listAll(BRIDGE_HANDOFF_PREFIX) ?? [];
-            const judgesLeaseLiveness = early !== undefined && handoffEntries.length > 0;
-            const leaseAuthorityIds = new Set(incomingAuthorityIds);
+            let files = cachedPlan ? undefined : participantFileSnapshot(this.store.root);
+            let participantAuthority = cachedPlan?.participantAuthorityStamp ?? (files ? participantAuthorityStamp(files) : undefined);
+            const currentRevision = this.store.stateRevision();
+            let early = cachedPlan && currentRevision !== undefined ? undefined : this.store.stateView();
+            let handoffEntries = early?.view.listAll(BRIDGE_HANDOFF_PREFIX) ?? [];
+            let judgesLeaseLiveness = cachedPlan?.handoffSensitive ?? (early !== undefined && handoffEntries.length > 0);
+            const leaseAuthorityIds = new Set(custodyAuthorityIds);
             for (const entry of handoffEntries) {
               const handoff = bridgeHandoffOf(entry);
               if (handoff) leaseAuthorityIds.add(handoff.id);
             }
-            const leaseStampBefore = early ? hostLeaseDirectoryStamp(this.store.root) : undefined;
-            const cachedKeys = cachedPlan ? new Set(cachedPlan.ownVersions.keys()) : undefined;
-            const leaseAuthority = early && cachedPlan && leaseStampBefore !== cachedPlan.leaseStamp
-              ? hostLeaseAuthorityStamp(this.store.root, leaseAuthorityIds) : undefined;
-            const cacheStillOwnsState = early !== undefined && cachedPlan !== undefined && participantAuthority !== undefined &&
+            const leaseStampBefore = currentRevision !== undefined || early ? hostLeaseDirectoryStamp(this.store.root) : undefined;
+            const leaseAuthorityBefore = cachedPlan?.leaseAuthorityStamp ?? hostLeaseAuthorityStamp(this.store.root, leaseAuthorityIds);
+            const leaseAuthority = cachedPlan && leaseStampBefore !== cachedPlan.leaseStamp
+              ? cachedPlan.leaseAuthorityStamp : undefined;
+            const cacheStillOwnsState = currentRevision !== undefined && cachedPlan !== undefined && participantAuthority !== undefined &&
               cachedPlan.participantAuthorityStamp === participantAuthority &&
               (cachedPlan.leaseStamp === leaseStampBefore || (leaseAuthority !== undefined &&
                 cachedPlan.leaseAuthorityStamp === leaseAuthority)) &&
-              this.store.stateUnchangedSince(cachedPlan.revision, HELD_STATE_PREFIXES, cachedKeys) &&
-              [...cachedPlan.ownVersions].every(([key, version]) => early.view.version(key) === version) &&
+              this.store.stateUnchangedSince(cachedPlan.revision, HELD_STATE_PREFIXES,
+                { ignore: cachedPlan.ignoredStateKeys, versions: cachedPlan.ownVersions }) &&
               (!judgesLeaseLiveness || leaseLivenessUnchanged(cachedPlan.livenessWindow, this.now()));
-            const planned = early && !halted()
-              ? cacheStillOwnsState ? undefined : compute(early.view, files, judgesLeaseLiveness)
+            if (!cacheStillOwnsState && !early && currentRevision !== undefined) {
+              const snapshot = this.store.stateView();
+              if (snapshot) {
+                early = snapshot;
+                handoffEntries = early.view.listAll(BRIDGE_HANDOFF_PREFIX);
+                judgesLeaseLiveness = handoffEntries.length > 0;
+                for (const entry of handoffEntries) {
+                  const handoff = bridgeHandoffOf(entry);
+                  if (handoff) leaseAuthorityIds.add(handoff.id);
+                }
+                if (!files) files = participantFileSnapshot(this.store.root);
+                participantAuthority = participantAuthorityStamp(files);
+              }
+            }
+            const planRevision = early?.revision ?? currentRevision;
+            const planned = planRevision !== undefined && !halted()
+              ? cacheStillOwnsState ? undefined : compute(early!.view, files!, judgesLeaseLiveness)
               : undefined;
-            const leaseStampAfter = early ? hostLeaseDirectoryStamp(this.store.root) : undefined;
-            if (early && (cacheStillOwnsState || planned) &&
-              (leaseStampBefore === undefined || leaseStampBefore !== leaseStampAfter)) throw new MirrorPlanStale();
-            const leaseStamp = early && (cacheStillOwnsState || planned) ? leaseStampAfter : undefined;
-            if (cacheStillOwnsState) activePlan = cachedPlan;
-            else if (early && planned && leaseStamp !== undefined) {
+            const leaseStampAfter = planRevision !== undefined ? hostLeaseDirectoryStamp(this.store.root) : undefined;
+            const leaseAuthorityAfter = !cachedPlan && leaseStampBefore !== leaseStampAfter
+              ? hostLeaseAuthorityStamp(this.store.root, leaseAuthorityIds) : leaseAuthorityBefore;
+            if (planRevision !== undefined && (cacheStillOwnsState || planned) &&
+              (leaseStampBefore === undefined || (leaseStampBefore !== leaseStampAfter && leaseAuthorityBefore !== leaseAuthorityAfter))) {
+              throw new MirrorPlanStale();
+            }
+            const leaseStamp = planRevision !== undefined && (cacheStillOwnsState || planned) ? leaseStampAfter : undefined;
+            if (cacheStillOwnsState && cachedPlan) {
+              activePlan = cachedPlan;
+              cachedPlan.participantDirectoryStamp = filesStamp;
+            } else if (planRevision !== undefined && planned && leaseStamp !== undefined) {
               const deadlines = new Map<string, number>();
               const cachedLeases = planned.leases.map(lease => {
                 const sample = lease.mirror;
@@ -1930,30 +2006,33 @@ export class StoreBridgeSide implements BridgeSide {
                 return op.kind === "put" && until !== undefined && isObject(op.value)
                   ? { ...op, value: { ...op.value, expiresAt: until } } : op;
               });
-              cachedPlan = activePlan = { revision: early.revision,
-                participantAuthorityStamp: participantAuthority ?? "unknown", leaseStamp,
-                leaseAuthorityStamp: hostLeaseAuthorityStamp(this.store.root, leaseAuthorityIds),
+              cachedPlan = activePlan = { revision: planRevision,
+                participantDirectoryStamp: filesStamp, participantAuthorityStamp: participantAuthority ?? "unknown",
+                handoffSensitive: judgesLeaseLiveness, leaseStamp,
+                leaseAuthorityStamp: leaseAuthorityAfter,
                 livenessWindow: judgesLeaseLiveness ? planned.judged.livenessWindow : undefined,
                 remainingOps: [...cachedOps], leases: cachedLeases, removed: planned.removed,
-                ownVersions: new Map() };
+                ownVersions: new Map(), ignoredStateKeys: unrelatedMirrorStateKeys(early!.view, custodyAuthorityIds) };
             }
             await this.store.writeBatch({
               identity: this.#identity(),
               lockClass: "bridge",
-              lockTiming: early
+              lockTiming: planRevision !== undefined
                 ? { operation: "bridge-presence-mirror", preparePhase: "mirror-revalidate", commitPhase: "mirror-commit" }
                 : { operation: "bridge-presence-mirror", phase: "mirror-fallback" },
               ops: [],
               prepare: (view) => {
                 if (halted()) return plan!.stage([], []);
-                const sameFiles = meshDirectoryStamp(this.store.root, "participants") === filesStamp;
+                const sameFiles = planRevision !== undefined || meshDirectoryStamp(this.store.root, "participants") === filesStamp;
                 let current = activePlan;
-                if (early) {
-                  if (!current || !sameFiles || !this.store.stateUnchangedSince(early.revision, HELD_STATE_PREFIXES) ||
-                    leaseStamp === undefined || hostLeaseDirectoryStamp(this.store.root) !== leaseStamp ||
+                if (planRevision !== undefined) {
+                  if (!current || !sameFiles || !this.store.stateUnchangedSince(planRevision, HELD_STATE_PREFIXES,
+                    { ignore: current.ignoredStateKeys, versions: new Map() }) ||
+                    leaseStamp === undefined ||
                     (judgesLeaseLiveness && !leaseLivenessUnchanged(current.livenessWindow, this.now()))) throw new MirrorPlanStale();
                 } else {
-                  const participantFiles = sameFiles ? files : participantFileSnapshot(this.store.root);
+                  const participantFiles = sameFiles ? (files ?? participantFileSnapshot(this.store.root))
+                    : participantFileSnapshot(this.store.root);
                   const result = compute(view, participantFiles, false);
                   if (!result) return plan!.stage([], []);
                   const deadlines = new Map<string, number>();
@@ -1970,10 +2049,11 @@ export class StoreBridgeSide implements BridgeSide {
                     return op.kind === "put" && until !== undefined && isObject(op.value)
                       ? { ...op, value: { ...op.value, expiresAt: until } } : op;
                   });
-                  current = { revision: "", participantAuthorityStamp: participantAuthority ?? "unknown",
+                  current = { revision: "", participantDirectoryStamp: filesStamp,
+                    participantAuthorityStamp: participantAuthority ?? "unknown", handoffSensitive: false,
                     leaseStamp: "", leaseAuthorityStamp: "unknown", livenessWindow: undefined,
                     remainingOps: [...cachedOps], leases: cachedLeases, removed: result.removed,
-                    ownVersions: new Map() };
+                    ownVersions: new Map(), ignoredStateKeys: new Set() };
                   activePlan = current;
                 }
                 if (!current) return plan!.stage([], []);
@@ -2014,9 +2094,8 @@ export class StoreBridgeSide implements BridgeSide {
                     !skippedRoots.has(row.payload.rootId);
                 });
               },
-              ...(early && activePlan ? { beforeCommit: () => {
-                if (meshDirectoryStamp(this.store.root, "participants") !== filesStamp || leaseStamp === undefined ||
-                  hostLeaseDirectoryStamp(this.store.root) !== leaseStamp ||
+              ...(planRevision !== undefined && activePlan ? { beforeCommit: () => {
+                if (leaseStamp === undefined ||
                   (judgesLeaseLiveness && !leaseLivenessUnchanged(activePlan!.livenessWindow, this.now()))) throw new MirrorPlanStale();
               } } : {}),
               commitOutbox: ({ view, results }) => {
@@ -2029,8 +2108,19 @@ export class StoreBridgeSide implements BridgeSide {
                 }
               },
             });
-          }));
-          if (activePlan) activePlan.remainingOps = activePlan.remainingOps.slice(batchStateOps.length);
+            if (activePlan && planRevision !== undefined) {
+              const committedRevision = this.store.stateRevision();
+              if (committedRevision === undefined || !this.store.stateUnchangedSince(
+                activePlan.revision, HELD_STATE_PREFIXES,
+                { ignore: activePlan.ignoredStateKeys, versions: activePlan.ownVersions })) throw new MirrorPlanStale();
+              activePlan.revision = committedRevision;
+              activePlan.ownVersions.clear();
+            }
+          }
+          if (activePlan) {
+            completedIgnoreStateKeys = activePlan.ignoredStateKeys;
+            activePlan.remainingOps = activePlan.remainingOps.slice(batchStateOps.length);
+          }
           break;
         } catch (error) {
           this.#skippedRoots = undefined;
@@ -2050,6 +2140,7 @@ export class StoreBridgeSide implements BridgeSide {
       if (!more) break;
       await new Promise<void>(resolve => setImmediate(resolve));
     }
+    }, custodyAuthorityIds), custodyAuthorityIds);
     if (!halted()) {
       // Effects are durable in the row commits above. Apply each batch's effects only after the
       // last topology batch; the stored views keep per-batch stamp checks, and runAsync yields
@@ -2066,6 +2157,12 @@ export class StoreBridgeSide implements BridgeSide {
       this.#hasCommittedPass = true;
       // A complete committed pass ends recovery; partial passes cannot certify pending omissions.
       if (!partial) this.#recovered = true;
+    }
+    const revision = this.store.stateRevision();
+    if (!final && !partial && !halted() && this.#recovered && revision !== undefined &&
+      this.store.listAll(this.#outbox.prefix, { fresh: true }).length === 0) {
+      this.#mirrorFastCache = { fingerprint, revision, safeThrough: mirrorSafeThrough(presence, liveAt),
+        ignoredStateKeys: completedIgnoreStateKeys };
     }
   }
 

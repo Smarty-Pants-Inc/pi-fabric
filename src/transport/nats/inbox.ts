@@ -723,8 +723,14 @@ class NatsTransportImpl implements FabricTransport {
         }
         throw uncertainFailure ?? error;
       }
+      const remaining = Math.max(1, retryDeadline - Date.now());
+      // Do not begin another wire attempt unless its configured PubAck timeout can
+      // fit inside the safe dedupe horizon. A clipped timeout can race the horizon
+      // abort and add a third publication after the outcome is already uncertain.
+      if (lastFailure && remaining < this.#options.requestTimeoutMs) {
+        throw retryHorizonFailure(uncertainFailure ?? lastFailure);
+      }
       try {
-        const remaining = Math.max(1, retryDeadline - Date.now());
         ack = await session.js.publish(prepared.subject, prepared.bytes, {
           msgID: prepared.resolved.id,
           timeout: Math.min(this.#options.requestTimeoutMs, remaining),
@@ -764,8 +770,14 @@ class NatsTransportImpl implements FabricTransport {
         throw callerSignal.reason ?? error;
       }
       if (this.#closed || this.#terminalError) throw lastFailure;
+      // timers/promises rejects with AbortError, not signal.reason. The internal
+      // retry timer is the retry-deadline boundary, so never leak that wrapper
+      // instead of the classified uncertainty when its callback runs slightly early.
+      if (signal.aborted) {
+        if (callerSignal?.aborted) throw callerSignal.reason ?? error;
+        throw retryHorizonFailure(lastFailure);
+      }
       if (Date.now() >= retryDeadline) throw retryHorizonFailure(lastFailure);
-      if (error === signal.reason) throw lastFailure;
       throw error;
     }
   }

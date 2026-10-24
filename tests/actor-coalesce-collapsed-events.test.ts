@@ -18,10 +18,11 @@ import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.
 // Contract adapter: the ONLY place in this file that names the new surface. The implementation chooses
 // the names; map them here once and every test below follows.
 //
-// Assumed: the run's JSON frame ({ source, payload, id }) gains a list field `coalesced`, one record per
+// The run's JSON frame ({ source, payload, id }) gains a list field `coalesced`, one record per
 // collapsed event in sequence order:
-//   { sequence, topic, kind, event, action, data }
-// `event` is the event's data.event, `action` its data.payload.action, and `data` its full data, which
+//   { sequence, topic, kind, event, action, payload }
+// `event` is the event's data.event and `action` its data.payload.action. Each record's `payload` is
+// the entire original MeshEvent, so this adapter reads its full data from payload.data. The payload
 // is absent on a bounded summary (past the full-data cap).
 // =====================================================================================================
 interface Collapsed {
@@ -59,7 +60,7 @@ const collapsedEvents = (task: string): Collapsed[] => {
     kind: raw.kind as string | undefined,
     event: raw.event as string | undefined,
     action: raw.action as string | undefined,
-    data: raw.data,
+    data: (raw.payload as { data?: unknown } | undefined)?.data,
   })) : [];
 };
 // =====================================================================================================

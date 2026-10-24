@@ -133,8 +133,8 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     }
     if (Date.now() >= deadline) {
       const owner = (() => { try { return readOwner(); } catch { return undefined; } })();
-      const pid = owner?.split("\n")[1];
-      const holder = ` (custody lock ${lock}${pid ? `, held by pid ${pid}` : ""})`;
+      const pid = Number(owner?.split("\n")[1]);
+      const holder = ` (custody lock ${lock}, ${Number.isSafeInteger(pid) && pid > 0 ? `held by pid ${pid}` : "owner pid unreadable"})`;
       if (blocked.verdict) {
         const refused = new MeshLockForeignHolderError(holder, attempts, maxGapMs, blocked.verdict, blocked.namespace ?? "", lock, blocked.token ?? "");
         alarmForeignHolder(refused);

@@ -22,7 +22,8 @@ afterEach(() => {
 const identity: MeshIdentity = { id: "session:wal-cap", name: "main", kind: "main" };
 
 // A store whose state writes the cap refuses while `pinned` is true (a reader pins the WAL above the cap).
-const cappedStore = () => {
+const cappedStore = (refused: () => Error = () => new MeshStateWalCapError(120 * 1024 * 1024, 96 * 1024 * 1024,
+  "pid 4242 (S, 3m, node secret-tool) slot 0", 1)) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-wal-cap-alarm-"));
   roots.push(root);
   const state = { pinned: true };
@@ -31,7 +32,6 @@ const cappedStore = () => {
     const backend = create(context, options) as StateFile;
     const put = backend.put.bind(backend);
     const remove = backend.delete.bind(backend);
-    const refused = () => new MeshStateWalCapError(120 * 1024 * 1024, 96 * 1024 * 1024, "pid 4242 (S, 3m, node secret-tool) slot 0", 1);
     backend.put = (input) => state.pinned ? Promise.reject(refused()) : put(input);
     backend.delete = (input) => state.pinned ? Promise.reject(refused()) : remove(input);
     return backend;
@@ -65,6 +65,32 @@ describe("mesh WAL-cap alarm (smarty-dev#7451 item 6)", () => {
     state.pinned = false;
     await store.put({ key: "a/b", value: 10, identity });
     expect(alarms()).toHaveLength(2);
+  });
+
+  it("reports unavailable sizes for a bridge-reconstructed cap error without logging undefined", async () => {
+    const { store } = cappedStore(() => Object.assign(new Error("bridge-reconstructed WAL refusal"), {
+      code: "FABRIC_MESH_STATE_WAL_CAP",
+    }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await expect(store.put({ key: "a/b", value: 1, identity })).rejects.toMatchObject({ code: "FABRIC_MESH_STATE_WAL_CAP" });
+    await vi.waitFor(() => expect(store.read({ topic: MESH_WAL_CAP_ALARM_TOPIC })).toHaveLength(1));
+    const alarm = store.read({ topic: MESH_WAL_CAP_ALARM_TOPIC })[0]!;
+    const text = `${alarm.text}\n${warn.mock.calls.map(([line]) => String(line)).join("\n")}`;
+    expect(text).toContain("sizes not available");
+    expect(text).not.toContain("undefined");
+    expect(text).not.toContain("secret-tool");
+  });
+
+  it("does not raise or log a WAL-cap alarm for a non-cap state write error", async () => {
+    const failure = Object.assign(new Error("SQLite returned SQLITE_BUSY"), {
+      code: "SQLITE_BUSY", walBytes: 120 * 1024 * 1024, capBytes: 96 * 1024 * 1024,
+      readerCount: 1, readers: "pid 4242 (S, 3m, node secret-tool) slot 0",
+    });
+    const { store } = cappedStore(() => failure);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await expect(store.put({ key: "a/b", value: 1, identity })).rejects.toBe(failure);
+    expect(store.read({ topic: MESH_WAL_CAP_ALARM_TOPIC })).toHaveLength(0);
+    expect(warn.mock.calls.map(([line]) => String(line)).join("\n")).not.toMatch(/mesh-wal-cap|WAL cap/);
   });
 
   // smarty-dev#9513: the identity is the refused operation's own, and a write without one still alarms.

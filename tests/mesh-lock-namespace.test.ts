@@ -300,11 +300,17 @@ describe("the mesh .lock under protocol 3 (smarty-dev#9569)", () => {
     expect(onLocalFilesystem(link)).toBe(false);
   });
 
-  it("pi-fabric#923 round 4: the recovery command is quoted for the platform's shell (POSIX and PowerShell), and given as argv", async () => {
+  it("pi-fabric#923 round 4: projects unsafe owner text but quotes arbitrary command vectors on POSIX and PowerShell", async () => {
     const { renderRecoveryCommand } = await import("../src/core/atomic-write.js");
-    const refused = new MeshLockForeignHolderError(" (x)", 1, 0, "unproven", "", "/srv/it's here/.lock", "tok'$(touch pwned)");
-    expect(refused.recoveryArgv).toEqual(["fabric-mesh-backend", "lock-recover", "--root", "/srv/it's here", "--lock", "mesh", "--holder", "tok'$(touch pwned)"]);
-    expect(renderRecoveryCommand(refused.recoveryArgv, "linux"))
+    const secret = "tok'$(touch pwned)";
+    const refused = new MeshLockForeignHolderError(" (x)", 1, 0, "unproven", "", "/srv/it's here/.lock", secret);
+    expect(refused.holderToken).toBe("invalid-token");
+    expect(refused.recoveryArgv).toEqual(["fabric-mesh-backend", "lock-recover", "--root", "/srv/it's here", "--lock", "mesh", "--holder", "invalid-token"]);
+    for (const surface of [refused.message, refused.recovery, JSON.stringify(refused), JSON.stringify(refused.recoveryArgv)]) {
+      expect(surface).not.toContain(secret);
+    }
+    const unsafeArgv = ["fabric-mesh-backend", "lock-recover", "--root", "/srv/it's here", "--lock", "mesh", "--holder", secret];
+    expect(renderRecoveryCommand(unsafeArgv, "linux"))
       .toBe("fabric-mesh-backend lock-recover --root '/srv/it'\\''s here' --lock mesh --holder 'tok'\\''$(touch pwned)'");
     expect(renderRecoveryCommand(["fabric-mesh-backend", "lock-recover", "--root", "C:\\Users\\o'neil\\mesh", "--holder", "t'k"], "win32"))
       .toBe("fabric-mesh-backend lock-recover --root 'C:\\Users\\o''neil\\mesh' --holder 't''k'");

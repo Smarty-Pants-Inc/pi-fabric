@@ -21,16 +21,28 @@ export const withHostLeaseDirectoryCustody = <T>(mesh: HostLeaseMesh,
   operation: () => T | Promise<T>, timeoutMs = 0, options: { ownIncarnation?: string | undefined } = {}): Promise<T> =>
   mesh.leaseCustody(hostLeaseAdditionsGatePath(mesh.root), operation, timeoutMs, options);
 
+/**
+ * smarty-dev#13645: how long a NATIVE lease creator waits for the shared additions gate. That gate is one
+ * per mesh, so with zero wait two hosts that create their first lease together (concurrent starts,
+ * first-time registrations) refused each other, which main's per-host gates never did. Other creators,
+ * the reaper and a mirror's first-install effect hold it for one short synchronous commit; a mirror's
+ * custody pass holds it longer, and a creator that outwaits this bound still gets the one-attempt busy
+ * refusal its caller already retries. The waiter holds no lease gate (additions -> host order), so the
+ * wait cannot close a cycle. Bridge effects keep zero wait (re-audit P2-1: busy is surfaced and retried).
+ */
+export const HOST_LEASE_ADDITIONS_WAIT_MS = 2_000;
+
 export const withHostLeaseFileCustody = async <T>(mesh: HostLeaseMesh, file: string,
-  operation: () => T | Promise<T>, timeoutMs = 0, options: { ownIncarnation?: string | undefined } = {}): Promise<T> => {
+  operation: () => T | Promise<T>, timeoutMs = 0, options: { ownIncarnation?: string | undefined } = {},
+  additionsTimeoutMs = timeoutMs): Promise<T> => {
   const target = () => mesh.leaseCustody(file, operation, timeoutMs, options);
-  if (!fs.existsSync(file)) return withHostLeaseDirectoryCustody(mesh, target, timeoutMs, options);
+  if (!fs.existsSync(file)) return withHostLeaseDirectoryCustody(mesh, target, additionsTimeoutMs, options);
   let missing = false;
   const current = await mesh.leaseCustody(file, () => {
     if (!fs.existsSync(file)) { missing = true; return undefined; }
     return operation();
   }, timeoutMs, options);
-  return missing ? withHostLeaseDirectoryCustody(mesh, target, timeoutMs, options) : current as T;
+  return missing ? withHostLeaseDirectoryCustody(mesh, target, additionsTimeoutMs, options) : current as T;
 };
 export interface HostLeaseLockOptions {
   signal?: AbortSignal;
@@ -158,7 +170,8 @@ export const withHostLeaseLock = async <T>(mesh: HostLeaseMesh, file: string,
             fs.rmSync(aside, { recursive: true, force: true });
           }
         }
-      }, 0, Object.hasOwn(options, "ownIncarnation") ? { ownIncarnation: options.ownIncarnation } : {});
+      }, 0, Object.hasOwn(options, "ownIncarnation") ? { ownIncarnation: options.ownIncarnation } : {},
+      HOST_LEASE_ADDITIONS_WAIT_MS);
     } catch (error) {
       if (enteredCustody || !isMeshLockTimeout(error)) throw error;
     }

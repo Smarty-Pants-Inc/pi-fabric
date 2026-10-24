@@ -84,9 +84,18 @@ export const writeParticipantFileIf = async (
 ): Promise<boolean> => {
   const file = fileOf(mesh.root, key);
   if (!file) throw new Error(`Not a participant key: ${key}`);
+  // One decision per observed file: an identity-changing update decided under its key receipt is
+  // retried under the namespace gate, and reuses that decision while the file still holds the bytes it
+  // was made on (callers count and log decisions, as on main, where the key lock decided once).
+  let decided: { seen: string; entry: MeshStateEntry | undefined } | undefined;
+  const decideOnce = (current: MeshStateEntry | undefined): MeshStateEntry | undefined => {
+    const seen = JSON.stringify(current ?? null);
+    if (decided?.seen !== seen) decided = { seen, entry: decide(current) };
+    return decided.entry;
+  };
   const write = (requireSameIdentity = false): boolean | typeof RETRY_ADDITION => {
     const current = readFresh(file);
-    const entry = decide(current);
+    const entry = decideOnce(current);
     if (!entry) return false;
     if (entry.key !== key) throw new Error(`Participant entry key mismatch: ${entry.key}`);
     if (requireSameIdentity && (identityOf(current) === undefined || identityOf(current) !== identityOf(entry))) return RETRY_ADDITION;
@@ -153,10 +162,11 @@ export const removeParticipantFileIf = async (
   }, options);
 };
 
-/** Writes a changed record (tests and tools; runtimes use writeParticipantFileIf). */
+/** Writes a changed record (tests and tools; runtimes use writeParticipantFileIf, which takes the
+ * key receipt, and the namespace gate for additions, that a mirror's directory custody holds). As on
+ * main this has no receipt of its own: one atomic replacement, none for byte-identical bytes. */
 export const writeParticipantFile = (meshRoot: string, entry: MeshStateEntry): void => {
-  const mesh: ParticipantFileMesh = { root: meshRoot, custody: async operation => operation() };
-  withParticipantFilesTryLock(mesh, [entry.key], undefined, () => writeParticipantFileUnderCustody(meshRoot, entry));
+  writeParticipantFileUnderCustody(meshRoot, entry);
 };
 
 /** Synchronous file replacement for a caller already holding the namespace and key receipts. */
@@ -211,7 +221,7 @@ const holderAlive = async (owner: string, lock: string, registryFenced = false):
 
 // A per-key lock receipt is atomically renamed into place with its owner record.
 const keyReceipt = (mesh: ParticipantFileMesh, file: string, incarnation: string | undefined) => {
-  const locks = path.join(mesh.root, DIR, ".locks");
+  const locks = file === namespaceReceiptFile(mesh) ? namespaceLockDirectory(mesh) : path.join(mesh.root, DIR, ".locks");
   const lock = path.join(locks, path.basename(file, ".json"));
   fs.mkdirSync(locks, { recursive: true, mode: 0o700 });
   const token = `${process.pid}\n${incarnation ?? ""}\n${randomUUID()}\n`;
@@ -255,6 +265,12 @@ export const withParticipantFileTryLock = <T>(
 };
 
 const namespaceReceiptFile = (mesh: ParticipantFileMesh): string => path.join(mesh.root, DIR, ".namespace.json");
+/** smarty-dev#13645: the namespace receipt lives OUTSIDE participants/. A mirror takes it on every
+ * state-changing pass, and keeping it under participants/.locks created participants/ on a mesh that
+ * has no participant file yet, so readers watching for that directory's creation never saw it. The
+ * per-key receipts stay in participants/.locks, which only exists once a participant file does. */
+const NAMESPACE_LOCK_DIR = "participant-namespace";
+const namespaceLockDirectory = (mesh: ParticipantFileMesh): string => path.join(mesh.root, NAMESPACE_LOCK_DIR);
 
 /** Additions take the namespace receipt before per-key custody. */
 const withParticipantNamespaceLock = <T>(mesh: ParticipantFileMesh, operation: () => T | Promise<T>,
@@ -423,18 +439,19 @@ export const sweepParticipantLockLeftovers = (
 ): Promise<void> => mesh.custody(() => {
   // Share recovery's lock for the entire scan/removal: never unlink the owner of
   // a detached lock between recovery's rename and its compare/restore decision.
-  const locks = path.join(mesh.root, DIR, ".locks");
-  let names: string[];
-  try { names = fs.readdirSync(locks); }
-  catch { return; }
-  for (const name of names) {
-    if (!name.endsWith(".tmp") && !name.endsWith(".dead")) continue;
-    try {
-      if (now - fs.statSync(path.join(locks, name)).mtimeMs > olderThanMs) {
-        fs.rmSync(path.join(locks, name), { recursive: true, force: true });
+  for (const locks of [path.join(mesh.root, DIR, ".locks"), namespaceLockDirectory(mesh)]) {
+    let names: string[];
+    try { names = fs.readdirSync(locks); }
+    catch { continue; }
+    for (const name of names) {
+      if (!name.endsWith(".tmp") && !name.endsWith(".dead")) continue;
+      try {
+        if (now - fs.statSync(path.join(locks, name)).mtimeMs > olderThanMs) {
+          fs.rmSync(path.join(locks, name), { recursive: true, force: true });
+        }
+      } catch {
+        // Removed meanwhile.
       }
-    } catch {
-      // Removed meanwhile.
     }
   }
 });

@@ -9,7 +9,7 @@ import { FabricPeerLeaseStaleError, PEER_LEASE_WAIT_MS } from "../agents/peer-le
 import type { MeshStateEntry } from "../mesh/store.js";
 import { TransportUnavailableError, type TransportKv, type TransportKvEntry, type TransportOwner } from "../transport/types.js";
 import { HostLeaseLockBusyError, HostLeaseLockLostError,
-  hostLeaseAdditionsGatePath, withHostLeaseFileCustody, withHostLeaseLock,
+  hostLeaseAdditionsGatePath, withHostLeaseLock,
   type HostLeaseLockOptions, type HostLeaseMesh } from "./host-lease-lock.js";
 
 // Host lease renewals outside the shared state (smarty-dev#816). Every heartbeat rewrote the
@@ -357,7 +357,10 @@ export const withOwnedHostLease = async <T>(mesh: HostLeaseMesh, owner: FabricHo
   const file = hostLeasePath(mesh.root, owner.id);
   let entered = false;
   try {
-    return await withHostLeaseFileCustody(mesh, file, async () => {
+    // An owned mutation never adds a lease filename: its owner's file must already exist (asserted
+    // first, under the gate), so only the per-host gate applies, as on main. Additions custody is
+    // for creators (withHostLeaseLock -> withHostLeaseFileCustody).
+    return await mesh.leaseCustody(file, async () => {
       entered = true;
       assertHostLeaseOwner(mesh.root, owner);
       const result = await operation();

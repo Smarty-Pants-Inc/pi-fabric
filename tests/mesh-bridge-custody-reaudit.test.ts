@@ -8,7 +8,7 @@ import { BridgeStaleIncarnationError, StoreBridgeSide } from "../src/mesh/bridge
 import { COMMIT_OUTBOX_PREFIX, CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { isMeshRetryableBusy } from "../src/mesh/state-backend.js";
 import { MeshStore, type MeshBatchView, type MeshIdentity } from "../src/mesh/store.js";
-import { hostLeasePath, readHostLeaseCurrent, writeHostLease } from "../src/topology/host-leases.js";
+import { hostEntryLiveness, hostLeasePath, readHostLeaseCurrent, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { withParticipantFileDirectoryCustody } from "../src/topology/participant-files.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -20,10 +20,11 @@ afterEach(() => {
   for (const s of stores.splice(0)) s.closeState();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
-const store = () => {
+const store = (stateBackend: "sqlite" | "file" = "sqlite") => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "reaudit-wip5-"));
   roots.push(root);
-  const hub = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, { stateBackend: "sqlite" });
+  const hub = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, { stateBackend });
+  expect(hub.stateBackend).toBe(stateBackend);
   stores.push(hub);
   return hub;
 };
@@ -234,5 +235,68 @@ describe("mirror custody re-audit regressions (smarty-dev#13645 WIP 5)", () => {
     expect(claimed).toBe(true);
     expect(readHostLeaseCurrent(hub.root, identity.id)).toMatchObject({ incarnationToken: "native-claim-token",
       session: { id: "native-session" } });
+  });
+});
+
+// smarty-dev#13645, independent delta audit of WIP 5 (AUDIT-mirror-wip5-RESULT.md): F1 and F2, built from the
+// audit's probe (zz-audit-wip5.test.ts). Main's results: NONROOT lease=T2 and live; C1B/C1B-FRESH STALE/STALE.
+describe("mirror custody delta-audit regressions (smarty-dev#13645 WIP 5 audit)", () => {
+  it.each(["sqlite", "file"] as const)("F1: a resident host that restarts behind the bridge with a new token keeps a renewed mirror lease (%s)", async backend => {
+    const hub = store(backend);
+    const side = new StoreBridgeSide(hub, "ryzen2", () => NOW);
+    // A resident keeps its id across restarts (resident:<digest(rootId)>) and gets a new incarnation token.
+    const residentId = "resident:" + "c".repeat(24);
+    const resident = (token: string, startedAt: number): FabricHostRecord => ({ format: 1, id: residentId, rootId: identity.id,
+      identity: { id: residentId, name: "resident", kind: "agent" }, startedAt, updatedAt: NOW, expiresAt: NOW + 60_000,
+      incarnationToken: token });
+    // Sampled, as a real far side's presence() reports each host, so the mirror rows carry mirrorLease: 1.
+    const withResident = (record: FabricHostRecord) => ({ hosts: [{ record: host, expiresAt: host.expiresAt, observedAt: NOW },
+      { record, expiresAt: record.expiresAt, observedAt: NOW }], participants: [participant] });
+    await side.mirror(withResident(resident("child-T1", NOW - 5_000)));
+    await side.mirror(withResident(resident("child-T1", NOW - 5_000)));
+    expect(readHostLeaseCurrent(hub.root, residentId)).toMatchObject({ incarnationToken: "child-T1" });
+    // T1 -> T2 directly (a crash restart within the lease TTL): the row and the lease both move to T2.
+    await side.mirror(withResident(resident("child-T2", NOW - 1_000)));
+    await side.mirror(withResident(resident("child-T2", NOW - 1_000)));
+    const entry = hub.get(hostKey(residentId), { fresh: true });
+    expect(entry?.value).toMatchObject({ incarnationToken: "child-T2", mirrorLease: 1 });
+    expect(readHostLeaseCurrent(hub.root, residentId)).toMatchObject({ incarnationToken: "child-T2", startedAt: NOW - 1_000 });
+    // Readers match the lease by token: the host reads live on this side, not expired.
+    expect(hostEntryLiveness(entry!, readHostLeases(hub.root)).expiresAt).toBeGreaterThan(NOW);
+  });
+
+  // F2: main ran the stale check before any custody on every backend and side. The file backend (the
+  // default) has no revision view, and a fresh side has completed no pass; both must still fence A.
+  it("F2: a recovered stale A is fenced on its next pass while B holds A's host gate (file)", async () => {
+    const hub = store("file");
+    const a = new StoreBridgeSide(hub, "ryzen2", () => NOW);
+    await a.mirror(presence);
+    await a.mirror(presence);
+    await new StoreBridgeSide(hub, "ryzen2", () => NOW).mirror(successor);
+    const releaseGate = await holdGate(hub, hostLeasePath(hub.root, identity.id));
+    const first = await settle(() => a.mirror(presence));
+    await releaseGate();
+    const second = await settle(() => a.mirror(presence));
+    expect({ first, second }).toEqual({ first: "STALE", second: "STALE" });
+    expect(hub.get(hostKey(identity.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "opaque-a-successor" });
+  });
+
+  it.each(["sqlite", "file"] as const)("F2: an unrecovered (fresh) stale A2 is fenced on its first pass while B holds the host gate (%s)", async backend => {
+    const hub = store(backend);
+    const a = new StoreBridgeSide(hub, "ryzen2", () => NOW);
+    await a.mirror(presence);
+    await a.mirror(presence);
+    const b = new StoreBridgeSide(hub, "ryzen2", () => NOW);
+    await b.mirror(successor);
+    await b.mirror(successor);
+    const leaseB = fs.readFileSync(hostLeasePath(hub.root, identity.id));
+    const a2 = new StoreBridgeSide(hub, "ryzen2", () => NOW);
+    const releaseGate = await holdGate(hub, hostLeasePath(hub.root, identity.id));
+    const first = await settle(() => a2.mirror(presence));
+    await releaseGate();
+    const second = await settle(() => a2.mirror(presence));
+    expect({ first, second }).toEqual({ first: "STALE", second: "STALE" });
+    expect(hub.get(hostKey(identity.id), { fresh: true })?.value).toMatchObject({ incarnationToken: "opaque-a-successor" });
+    expect(fs.readFileSync(hostLeasePath(hub.root, identity.id))).toEqual(leaseB);
   });
 });

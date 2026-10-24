@@ -113,6 +113,16 @@ export interface CommitOutboxPlan {
   runAsync(view: MeshBatchView, halted?: () => boolean, options?: CommitOutboxRunOptions): Promise<number>;
 }
 
+export interface CommitOutboxRecoverOptions {
+  /** smarty-dev#13645: a committed view for handlers that read every row fresh under their own effect
+   * custody (the mesh bridge). Recovery then opens no empty write transaction just to obtain a view. */
+  view?: MeshBatchView;
+  /** Leave the rows that ran for the caller's next durable commit, which retires them version-fenced
+   * (the bridge's mirror batches retire up to 16 each). A crash before then replays them again; every
+   * bridge effect is idempotent under its gate. Default: retire them here, in batches of 64. */
+  deferRetire?: boolean;
+}
+
 export interface CommitOutboxRunOptions {
   /** smarty-dev#13645 (re-audit P2-1): after every staged effect was attempted, reject with the first
    * effect-custody MeshLockTimeout (a busy gate; the effect stays pending in #failed) instead of
@@ -272,7 +282,7 @@ export class CommitOutbox {
 
   /** Runs every pending row of this scope on the committed state (after a crash or restart), then
    * deletes the rows that ran. Returns how many effects ran. */
-  async recover(halted?: () => boolean): Promise<number> {
+  async recover(halted?: () => boolean, options: CommitOutboxRecoverOptions = {}): Promise<number> {
     // The common start has nothing to replay: a fresh read, and no lock, says so.
     if (halted?.() || this.mesh.listAll(this.prefix, { fresh: true }).length === 0) return 0;
     let ran = 0;
@@ -287,16 +297,18 @@ export class CommitOutbox {
           return attempted.has(stamp) ? [] : [{ entry, stored, stamp }];
         }).slice(0, EFFECT_BATCH_SIZE);
       if (pending.length === 0) break;
-      let view: MeshBatchView | undefined;
-      await this.mesh.writeBatch({ identity: this.identity, ops: [], prepare: current => { view = current; return []; } });
+      let view: MeshBatchView | undefined = options.view;
+      if (!view) await this.mesh.writeBatch({ identity: this.identity, ops: [], prepare: current => { view = current; return []; } });
       if (!view) break;
       for (const { entry, stored, stamp } of pending) {
         if (halted?.()) break;
         attempted.add(stamp);
         if (await this.#executeAsync(entry.key, stored.kind, stored.payload, view, true, stored.stamp, true, halted)) ran += 1;
       }
-      await this.retire();
-      await new Promise<void>(resolve => setImmediate(resolve));
+      if (!options.deferRetire) await this.retire();
+      // A real event-loop turn only between FULL replay batches (a large backlog); a recovery that
+      // fits one batch completes in the pass that started it, as main's did.
+      if (pending.length >= EFFECT_BATCH_SIZE) await new Promise<void>(resolve => setImmediate(resolve));
     }
     return ran;
   }

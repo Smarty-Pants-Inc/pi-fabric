@@ -844,8 +844,12 @@ const prepareStatements = (db: SqliteConnection) => ({
   changeInsert: db.prepare("INSERT INTO changes(commit_no, key, version, deleted) VALUES (?, ?, ?, ?)"),
   // Trims whole commits only: the commit holding row `seq` goes entirely, so a reader never sees half of one.
   changeTrim: db.prepare("DELETE FROM changes WHERE commit_no <= (SELECT commit_no FROM changes WHERE seq <= ? ORDER BY seq DESC LIMIT 1)"),
-  changesSince: db.prepare("SELECT commit_no, key, version, deleted FROM changes WHERE commit_no > ? ORDER BY seq"),
-  changesOldest: db.prepare("SELECT min(commit_no) AS oldest FROM changes"),
+  // commit_no is nondecreasing in append seq (changeTrim relies on this too). Walk only the
+  // newer tail plus one boundary backwards, then seek past it; never scan the retained prefix.
+  changesSince: db.prepare(`SELECT commit_no, key, version, deleted FROM changes
+    WHERE seq > COALESCE((SELECT seq FROM changes WHERE commit_no <= ?1 ORDER BY seq DESC LIMIT 1), 0)
+    AND commit_no > ?1 ORDER BY seq`),
+  changesOldest: db.prepare("SELECT commit_no AS oldest FROM changes ORDER BY seq LIMIT 1"),
   dataVersion: db.prepare("PRAGMA data_version"),
   checkpointPassive: db.prepare("PRAGMA wal_checkpoint(PASSIVE)"),
   checkpointTruncate: db.prepare("PRAGMA wal_checkpoint(TRUNCATE)"),

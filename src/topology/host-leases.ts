@@ -992,6 +992,7 @@ export class TransportHostLease {
   #loss: TransportHostLeaseLostError | undefined;
   #suspension: TransportHostLeaseLostError | undefined;
   #revision = 0;
+  #recreated = false;
   #deadline: number | undefined;
   #lastClock: number | undefined;
   #timer: ReturnType<typeof setTimeout> | undefined;
@@ -1031,6 +1032,19 @@ export class TransportHostLease {
 
   /** A TTL lapse stops admission but does not prove a different owner took the lease. */
   recovering(): boolean { return this.#state === "suspended"; }
+
+  /** The broker revision of this lease's last confirmed write. */
+  get revision(): number { return this.#revision; }
+
+  /**
+   * True once after a recovery found the lease key absent in KV (it had expired) and created it
+   * again. Another machine may have taken this host's root during that gap (smarty-dev#15310).
+   */
+  takeRecreated(): boolean {
+    const recreated = this.#recreated;
+    this.#recreated = false;
+    return recreated;
+  }
 
   acquire(signal?: AbortSignal): Promise<TransportHostLeaseValue> {
     if (this.#state !== "idle") throw this.#loss ?? new Error("Transport host lease acquisition is single-use");
@@ -1171,6 +1185,7 @@ export class TransportHostLease {
           try {
             const revision = await this.#kv.put(this.key, this.owner, value, current?.revision ?? 0, operationSignal);
             this.#confirmRevision(revision);
+            if (!current) this.#recreated = true;
             if (this.#clock() >= deadline) throw this.#suspend();
             operationSignal.throwIfAborted();
             this.#deadline = deadline;

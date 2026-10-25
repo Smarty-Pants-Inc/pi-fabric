@@ -150,6 +150,45 @@ describe("A2 callers across verified NATS reopen", () => {
       expect(lease.signal.aborted).toBe(false);
       expect(current?.owner).toBe(lease.owner);
       expect(current?.revision).toBe(revision);
+      expect(lease.revision).toBe(revision);
+      expect(lease.takeRecreated(), "a same-owner CAS recovery is not a re-creation").toBe(false);
+    } finally {
+      await lease.release().catch(() => undefined);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // smarty-dev#15310: a key that expired in KV is created again; that gap is reported once.
+  it.skipIf(process.platform !== "linux")("reports a recovery that re-created an expired lease key, exactly once", async () => {
+    let monotonic = 0, revision = 0;
+    let current: TransportKvEntry<unknown> | undefined;
+    const root = temporary();
+    const kv: TransportKv = { ...unusedKv,
+      async get<V>() { return current as TransportKvEntry<V> | undefined; },
+      async put<V>(key: string, ownerId: string, value: V, ifRevision: number) {
+        if (ifRevision === 0 ? current !== undefined : current?.revision !== ifRevision) {
+          throw Object.assign(new Error("KV revision conflict"), { code: "FABRIC_KV_CONFLICT" });
+        }
+        current = { key, machine: owner.machine, owner: ownerId, value, revision: ++revision };
+        return revision;
+      },
+      async delete() { current = undefined; return true; },
+    };
+    const lease = new TransportHostLease({ kv, self: owner, rootId: identity.id, identityId: identity.id,
+      incarnation: epoch, localStateDir: root, monotonic: () => monotonic });
+    try {
+      await lease.acquire();
+      expect(lease.takeRecreated(), "first acquisition is not a recovery").toBe(false);
+      current = undefined; // The broker TTL expired the key during the lapse.
+      monotonic = 13_000;
+      expect(lease.live()).toBe(false); // Latches the local cutoff.
+      expect(lease.recovering()).toBe(true);
+      await lease.renew();
+      expect(lease.live()).toBe(true);
+      expect((current as TransportKvEntry<unknown> | undefined)?.owner).toBe(lease.owner);
+      expect(lease.revision).toBe(revision);
+      expect(lease.takeRecreated()).toBe(true);
+      expect(lease.takeRecreated()).toBe(false);
     } finally {
       await lease.release().catch(() => undefined);
       fs.rmSync(root, { recursive: true, force: true });

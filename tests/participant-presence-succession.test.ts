@@ -567,6 +567,28 @@ describe("#15310 a live session root on another machine blocks a second registra
     expect(f.presence.mutations).toEqual([]);
   });
 
+  it("after a re-created owner lease, refuses the owned root if another machine registered during the gap", async () => {
+    const f = fixture(); f.lease(); const view = f.view();
+    await view.publish(root());
+    // Our lease expired; meanwhile machine-b registered (its check saw no lease here); then ours was re-created.
+    elsewhere(f);
+    const recreated = f.lease();
+    await expect(view.confirmSoleRoot(root(), recreated.revision)).rejects.toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE",
+      owners: [{ machine: OTHER, routable: true }] });
+    expect(f.presence.deletes).toEqual([]);
+  });
+
+  it("after a re-created owner lease, keeps the owned root when no other machine holds it, waiting for that revision", async () => {
+    const f = fixture(); const first = f.lease(); const view = f.view();
+    await view.publish(root());
+    const pending = view.confirmSoleRoot(root(), first.revision + 1);
+    let settled = false; void pending.finally(() => { settled = true; });
+    await ready(view); await Promise.resolve();
+    expect(settled, "must wait until this view observes the re-created revision").toBe(false);
+    f.lease();
+    await expect(pending).resolves.toBeUndefined();
+  });
+
   it("allows registration when the other machine's lease has lapsed (crashed owner)", async () => {
     const f = fixture(); f.lease(); elsewhere(f, { lease: false });
     const view = f.view();

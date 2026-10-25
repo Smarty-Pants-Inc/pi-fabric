@@ -759,6 +759,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #confirmedReconnectGeneration = 0;
   #natsConfirmedAt = 0;
   #transportRecovering = false;
+  /** The owner lease was re-created after expiring in KV; its root must be re-checked (confirmSoleRoot). */
+  #rootRecheckPending = false;
   #transportLost = false;
   readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh")
     .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.options.identity })));
@@ -943,7 +945,25 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const lease = this.#transportLease;
     if (!lease || this.#closed || this.#transportLost) return Promise.resolve();
     if (this.#transportRenewing) return this.#transportRenewing;
-    const work = Promise.resolve().then(() => lease.renew(AbortSignal.timeout(5_000))).then(() => {
+    const work = Promise.resolve().then(() => lease.renew(AbortSignal.timeout(5_000))).then(async () => {
+      // smarty-dev#15310: a lease that expired in KV and was created again may have let another
+      // machine register this root meanwhile. Re-check before admission resumes; yield if so.
+      if (lease.takeRecreated()) this.#rootRecheckPending = true;
+      if (this.#rootRecheckPending && lease.live()) {
+        const root = this.#natsPublished.get(this.options.rootId);
+        const view = this.#participantView;
+        if (root?.kind === "root" && view) {
+          try { await view.confirmSoleRoot(root, lease.revision); }
+          catch (error) {
+            if ((error as { code?: unknown } | null)?.code === "FABRIC_PRESENCE_OWNED_ELSEWHERE") {
+              this.#transportRecovering = false;
+              this.#transportLostNow(error);
+            }
+            throw error; // Otherwise admission stays suspended; the next renewal checks again.
+          }
+        }
+        this.#rootRecheckPending = false;
+      }
       if (this.#transportRecovering && lease.live()) {
         this.#transportRecovering = false;
         this.#refreshError = undefined;

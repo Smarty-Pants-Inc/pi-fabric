@@ -17,7 +17,7 @@ import { openFabricTransport } from "../src/transport/index.js";
 import { NatsKvStore } from "../src/transport/nats/kv.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
-import { readHostLease } from "../src/topology/host-leases.js";
+import { readHostLease, TransportHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import type { FabricTransport, TransportKv, TransportKvEntry } from "../src/transport/types.js";
@@ -368,6 +368,66 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
       await inspector?.close(); vi.unstubAllEnvs();
     }
   }, 60_000);
+
+  // smarty-dev#15310 G1: a live Main whose lease expires in the broker (renewals stalled) must not
+  // come back next to a Main that registered the session on another machine during the gap.
+  it("yields a root whose lease was re-created after expiring while another machine registered it", async () => {
+    for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
+    vi.stubEnv("SMARTY_AGENT", undefined);
+    const rootA = fs.mkdtempSync(path.join(os.tmpdir(), "presence-gap-a-"));
+    const rootB = fs.mkdtempSync(path.join(os.tmpdir(), "presence-gap-b-"));
+    const sessionId = "15310ddd-bbbb-4000-8000-000000000004", id = `session:${sessionId}`;
+    const at = (root: string) => { vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent")); vi.stubEnv("PI_FABRIC_PROJECT_ROOT", root); };
+    const leaseA = key("machine-a", "h", id), leaseB = key("machine-b", "h", id);
+    // Stall only machine-a's renewals for this session until released; then run them normally.
+    let release!: () => void;
+    const stalled = new Promise<void>(resolve => { release = resolve; });
+    let stalledCalls = 0;
+    const rawRenew = TransportHostLease.prototype.renew;
+    vi.spyOn(TransportHostLease.prototype, "renew").mockImplementation(function (this: TransportHostLease, signal?: AbortSignal) {
+      if (this.key !== leaseA) return rawRenew.call(this, signal);
+      stalledCalls++;
+      return stalled.then(() => rawRenew.call(this, AbortSignal.timeout(5_000)));
+    });
+    const owner = main(rootA, sessionId, "gap-owner"), taker = main(rootB, sessionId, "gap-owner");
+    let inspector: FabricTransport | undefined;
+    try {
+      inspector = await openFabricTransport({ config: configFor(rootB, "machine-b").mesh, hostId: "gap-inspector",
+        mesh: new MeshStore(path.join(rootB, "inspector"), 65_536, 1_000) });
+      const expiredA = armLeaseGone(inspector.kv("leases"), leaseA);
+      await expiredA.ready;
+      at(rootA);
+      await owner.runtime.initialize(owner.context, configFor(rootA, "machine-a"));
+      await expiredA.gone; // A's renewals are stalled: the broker expires its lease.
+      expect(stalledCalls).toBeGreaterThan(0);
+      at(rootB);
+      await taker.runtime.initialize(taker.context, configFor(rootB, "machine-b")); // A's lease is gone: B may register.
+      expect(await inspector.kv("presence").get(key("machine-b", "p", id))).toBeDefined();
+      // A's renewal now runs: it re-creates A's lease, re-checks, sees B, and yields for good.
+      // Watch from the live tail: the snapshot's expiry marker for the first lapse is not this one.
+      const stop = new AbortController();
+      let recreatedAt = 0, renewedAfter = 0;
+      const yieldedA = (async () => {
+        let live = false;
+        for await (const event of inspector!.kv("leases").watch(">", AbortSignal.any([stop.signal, AbortSignal.timeout(40_000)]))) {
+          if (event.type === "ready") { live = true; release(); continue; }
+          if (!live) continue;
+          if (event.type === "put" && event.entry.key === leaseA) { if (recreatedAt) renewedAfter++; else recreatedAt = performance.now(); }
+          if (event.type === "gone" && event.key === leaseA && recreatedAt) { expect(event.reason).toBe("expired"); return performance.now() - recreatedAt; }
+        }
+        throw new Error("machine-a's re-created lease never expired");
+      })();
+      try {
+        expect(await yieldedA, "a yielded runtime never renews its re-created lease").toBeGreaterThan(10_000);
+      } finally { stop.abort(); }
+      expect(renewedAfter).toBe(0);
+      expect(await inspector.kv("leases").get(leaseB), "the rightful machine-b owner keeps its lease").toBeDefined();
+    } finally {
+      release();
+      await Promise.allSettled([owner.runtime.shutdown("exit"), taker.runtime.shutdown("exit")]);
+      await inspector?.close(); vi.unstubAllEnvs();
+    }
+  }, 75_000);
 
   // The carrier, on the real broker, with each machine's real authenticated user: both write their
   // own host lease and register at once, as two hosts starting one session would. (Two full

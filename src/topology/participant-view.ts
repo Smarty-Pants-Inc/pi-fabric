@@ -448,6 +448,31 @@ export class KvParticipantDirectory implements ParticipantView {
     this.#refuseHeldElsewhere(record);
   }
 
+  /**
+   * After the owner lease expired in KV and was created again, this view's root is checked like a
+   * first registration: another machine may have registered it during the gap (its own fresh
+   * check saw no lease here). Waits until this view has observed the re-created lease revision,
+   * so every lease written before it is in the snapshot, then refuses if another machine holds
+   * the root. The caller must stop using this view's presence on refusal.
+   */
+  async confirmSoleRoot(record: FabricParticipantRecord, leaseRevision: number): Promise<void> {
+    if (record.kind !== "root") return;
+    const self = this.options.transport.self;
+    const key = `${self.machine}.h.${tokenFor(self.hostId)}`;
+    const signal = this.#signal();
+    try {
+      while (!this.ready || (this.#hosts.get(key)?.revision ?? 0) < leaseRevision) await this.whenChanged(record.id, signal);
+    } catch (error) {
+      if (errorCode(error) === "FABRIC_DIRECTORY_NOT_READY") throw error;
+      throw new DirectoryNotReadyError("Presence view has not observed the recovered owner lease", { cause: error });
+    }
+    const own = this.#hosts.get(key)!;
+    if (own.owner !== this.#owner() || own.value.id !== self.hostId || own.value.incarnation !== this.options.ownerIncarnation) {
+      throw new TransportUnavailableError("The recovered owner lease is not this view's");
+    }
+    this.#refuseHeldElsewhere(record);
+  }
+
   #refuseHeldElsewhere(record: FabricParticipantRecord): void {
     if (record.kind !== "root") return;
     const holders = this.#heldElsewhere(record);

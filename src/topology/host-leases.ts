@@ -859,6 +859,8 @@ export interface TransportHostLeaseProcessProof {
 export interface TransportHostLeaseValue extends FabricHostLease, TransportHostLeaseProcessProof {
   readonly incarnation: string;
   incarnationToken: string;
+  /** See FabricKvHostLease.rootRecheck: written until clearRootRecheck() after a re-created lease. */
+  readonly rootRecheck?: true;
 }
 
 export class TransportHostLeaseProofError extends Error {
@@ -992,6 +994,8 @@ export class TransportHostLease {
   #loss: TransportHostLeaseLostError | undefined;
   #suspension: TransportHostLeaseLostError | undefined;
   #revision = 0;
+  #recreated = false;
+  #rootRecheck = false;
   #deadline: number | undefined;
   #lastClock: number | undefined;
   #timer: ReturnType<typeof setTimeout> | undefined;
@@ -1031,6 +1035,27 @@ export class TransportHostLease {
 
   /** A TTL lapse stops admission but does not prove a different owner took the lease. */
   recovering(): boolean { return this.#state === "suspended"; }
+
+  /** The broker revision of this lease's last confirmed write. */
+  get revision(): number { return this.#revision; }
+
+  /**
+   * True once after a recovery found the lease key absent in KV (it had expired) and created it
+   * again. Another machine may have taken this host's root during that gap (smarty-dev#15310).
+   * The re-created lease carries `rootRecheck: true`, which readers do not route to, until the
+   * owner confirms its root and calls clearRootRecheck(); the next write then drops the flag.
+   */
+  takeRecreated(): boolean {
+    const recreated = this.#recreated;
+    this.#recreated = false;
+    return recreated;
+  }
+
+  /** Whether this lease's writes still carry `rootRecheck: true`. */
+  get rootRecheck(): boolean { return this.#rootRecheck; }
+
+  /** The owner confirmed its root after a re-creation: later writes route again. */
+  clearRootRecheck(): void { this.#rootRecheck = false; }
 
   acquire(signal?: AbortSignal): Promise<TransportHostLeaseValue> {
     if (this.#state !== "idle") throw this.#loss ?? new Error("Transport host lease acquisition is single-use");
@@ -1167,10 +1192,13 @@ export class TransportHostLease {
           const deadline = started + TRANSPORT_HOST_LEASE_TTL_MS - TRANSPORT_HOST_LEASE_SAFETY_MS;
           const current = await this.#kv.get<unknown>(this.key, operationSignal);
           if (current && !this.#isOwnLeaseEntry(current)) throw this.#lose("conflict");
+          // KV expired the key: until the owner re-checks its root, write it as not routable.
+          if (!current) this.#rootRecheck = true;
           const value = this.#value();
           try {
             const revision = await this.#kv.put(this.key, this.owner, value, current?.revision ?? 0, operationSignal);
             this.#confirmRevision(revision);
+            if (this.#rootRecheck) this.#recreated = true;
             if (this.#clock() >= deadline) throw this.#suspend();
             operationSignal.throwIfAborted();
             this.#deadline = deadline;
@@ -1210,7 +1238,7 @@ export class TransportHostLease {
     const updatedAt = Date.now();
     return Object.freeze({ id: this.self.hostId, rootId: this.#rootId, identityId: this.#identityId,
       incarnation: this.#incarnation, incarnationToken: this.#incarnation, ...this.#processProof,
-      updatedAt, expiresAt: updatedAt + TRANSPORT_HOST_LEASE_TTL_MS });
+      updatedAt, expiresAt: updatedAt + TRANSPORT_HOST_LEASE_TTL_MS, ...(this.#rootRecheck ? { rootRecheck: true as const } : {}) });
   }
 
   #confirmRevision(revision: number): void {

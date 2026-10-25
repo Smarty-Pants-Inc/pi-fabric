@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +19,8 @@ export const orgDoc = {
   ],
 };
 export const pins = readBridgeNatsSeatPins(orgDoc);
+// The writer is POSIX-only (uid checks, /proc/self/fd, O_NOFOLLOW directory descriptors), like the seam itself.
+const linux = process.platform === "linux" && typeof process.getuid === "function";
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
@@ -51,7 +54,55 @@ const want: SeatEntry = { kind: "root", id: `session:${SEAT_SID}`, principal: "A
   receive: [...SEAT_RECEIVE] };
 const seat = { sessionId: SEAT_SID, machine: "sp-alpha" };
 
-describe("the bridge seam's A' config writer (one entry, never a free-form edit)", () => {
+/**
+ * One writer in its OWN process (the product module through jiti): withConfigLock -> planPublish -> applyPlan for one
+ * seat. It sends "held" once inside the lock, waits for "go" before its swap, then sends "done".
+ */
+const writerProcess = (file: string, sessionId: string, machine: string) => {
+  const child = spawn(process.execPath, ["--input-type=module", "-e", `
+    import { createJiti } from "jiti";
+    import { pathToFileURL } from "node:url";
+    const [file, sessionId, machine, org] = process.argv.slice(1);
+    const jiti = createJiti(pathToFileURL(process.cwd() + "/index.js").href);
+    const { withConfigLock, readLinkConfig, planPublish, applyPlan } = await jiti.import("./src/seat-bridge/allow-writer.ts");
+    const { readBridgeNatsSeatPins } = await jiti.import("./src/mesh/bridge-nats-identity.ts");
+    const pins = readBridgeNatsSeatPins(JSON.parse(org));
+    setTimeout(() => process.exit(2), 45000);
+    const go = new Promise(resolve => process.on("message", message => { if (message === "go") resolve(); }));
+    try {
+      await withConfigLock(file, async () => {
+        const plan = planPublish(readLinkConfig(file), pins, { sessionId, machine });
+        process.send("held");
+        await go;
+        applyPlan(plan);
+      }, { sleep: ms => new Promise(resolve => setTimeout(resolve, Math.min(ms, 20))) });
+      process.send("done", () => process.exit(0));
+    } catch (error) { process.send("error:" + (error.code ?? error.message), () => process.exit(1)); }
+  `, file, sessionId, machine, JSON.stringify(orgDoc)], { cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe", "ipc"] });
+  let stderr = "";
+  child.stderr!.on("data", chunk => { stderr += chunk; });
+  const messages: string[] = [];
+  child.on("message", message => { messages.push(String(message)); });
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => {
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  /** Event-driven wait for one message (a deadline is only the safety net). */
+  const next = (want: string): Promise<void> => new Promise((resolve, reject) => {
+    const check = () => {
+      if (messages.includes(want)) { done(); resolve(); }
+      else if (messages.some(message => message.startsWith("error:"))) { done(); reject(new Error(`${messages.join(",")} ${stderr}`)); }
+    };
+    const timer = setTimeout(() => { done(); reject(new Error(`timed out waiting for ${want}: ${messages.join(",")} ${stderr}`)); }, 30_000);
+    const closed = () => { done(); reject(new Error(`exited before ${want}: ${messages.join(",")} ${stderr}`)); };
+    const done = () => { clearTimeout(timer); child.off("message", check); child.off("close", closed); };
+    child.on("message", check);
+    child.once("close", closed);
+    check();
+  });
+  return { child, messages, exited, next };
+};
+
+describe.skipIf(!linux)("the bridge seam's A' config writer (one entry, never a free-form edit)", () => {
   it("MOVES the seat's own file entry to the fixed nats entry; every other value stays identical; returns the re-read post-state", () => {
     const file = writeLinkConfig({ file: [leadEntry, seatFileEntry, supervisorEntry] });
     const before = readLinkConfig(file);
@@ -140,22 +191,71 @@ describe("the bridge seam's A' config writer (one entry, never a free-form edit)
     expect(order).toEqual(["a-planned", "a-renamed", "b-read", "b-renamed"]);
     const nats = readLinkConfig(file).value.allow as { nats: Array<{ id: string }> };
     expect(nats.nats.map(entry => entry.id).sort()).toEqual([`session:${SEAT_SID}`, `session:${OTHER_SID}`].sort());
-    expect(fs.readdirSync(path.dirname(file))).toEqual(["v2.json"]);
+    // The stable lock file stays (it is never removed); no temp file is left.
+    expect(fs.readdirSync(path.dirname(file)).sort()).toEqual([".v2.json.fabric-v2.lock", "v2.json"]);
   });
 
-  it("the lock of a dead holder is reclaimed; a live holder is waited for, bounded", async () => {
+  it("#1609 review (lock P2): a lock file's content is never evidence: an empty one (a crash right after create) or an old record does not block", async () => {
     const file = writeLinkConfig({ file: [seatFileEntry] });
     const lock = path.join(path.dirname(file), ".v2.json.fabric-v2.lock");
-    fs.writeFileSync(lock, JSON.stringify({ pid: 2 ** 22 + 7, startTime: "1", at: "t" }), { mode: 0o600 });
-    expect(await withConfigLock(file, () => "ran")).toBe("ran");
-    expect(fs.existsSync(lock)).toBe(false);
+    fs.writeFileSync(lock, "", { mode: 0o600 });
+    expect(await withConfigLock(file, () => "ran", { waitMs: 0 })).toBe("ran");
+    fs.writeFileSync(lock, JSON.stringify({ pid: 2 ** 22 + 7, startTime: "1", at: "t" }));
+    expect(await withConfigLock(file, () => "ran again", { waitMs: 0 })).toBe("ran again");
+    expect(fs.existsSync(lock)).toBe(true);
+    // A live holder is waited for, bounded.
     let t = 0;
     const held = withConfigLock(file, () => new Promise(resolve => setTimeout(resolve, 200)));
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await new Promise(resolve => setTimeout(resolve, 50));
     await expect(withConfigLock(file, () => "never", { waitMs: 1_000, now: () => t, sleep: async ms => { t += ms; } }))
       .rejects.toMatchObject({ code: "link-config-busy" });
     await held;
+    // An unsafe lock file refuses: group/other-writable, a second hard link, or a symlink.
+    fs.chmodSync(lock, 0o666);
+    await expect(withConfigLock(file, () => "never")).rejects.toMatchObject({ code: "link-config-lock-unsafe" });
+    fs.chmodSync(lock, 0o600);
+    fs.linkSync(lock, `${lock}.second`);
+    await expect(withConfigLock(file, () => "never")).rejects.toMatchObject({ code: "link-config-lock-unsafe" });
+    fs.unlinkSync(`${lock}.second`);
+    fs.unlinkSync(lock);
+    fs.symlinkSync(path.join(path.dirname(file), "elsewhere"), lock);
+    await expect(withConfigLock(file, () => "never")).rejects.toMatchObject({ code: "link-config-lock-failed" });
+    expect(fs.existsSync(path.join(path.dirname(file), "elsewhere"))).toBe(false);
   });
+
+  it("#1609 review (lock P1): two writer PROCESSES; one is killed holding the lock; the other gets it, and no entry is lost", async () => {
+    const file = writeLinkConfig({ file: [leadEntry, seatFileEntry, otherFileEntry] });
+    const lock = path.join(path.dirname(file), ".v2.json.fabric-v2.lock");
+    const a = writerProcess(file, SEAT_SID, "sp-alpha");
+    try {
+      await a.next("held");
+      const inode = fs.statSync(lock).ino;
+      // B, a second process, cannot take the lock while A holds it.
+      const b = writerProcess(file, OTHER_SID, "sandbox1");
+      try {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        expect(b.messages).toEqual([]);
+        // A crashes holding the lock, before its rename: the kernel releases the flock; nothing is reclaimed or removed.
+        a.child.kill("SIGKILL");
+        expect(await a.exited).toMatchObject({ signal: "SIGKILL" });
+        await b.next("held");
+        b.child.send("go");
+        await b.next("done");
+        expect(await b.exited).toMatchObject({ code: 0 });
+      } finally { b.child.kill("SIGKILL"); }
+      // A's retry, a third process, then writes its own entry: both survive, on the SAME lock file.
+      const retry = writerProcess(file, SEAT_SID, "sp-alpha");
+      try {
+        await retry.next("held");
+        retry.child.send("go");
+        await retry.next("done");
+      } finally { retry.child.kill("SIGKILL"); }
+      const nats = readLinkConfig(file).value.allow as { nats: Array<{ id: string }> };
+      expect(nats.nats.map(entry => entry.id).sort()).toEqual([`session:${SEAT_SID}`, `session:${OTHER_SID}`].sort());
+      expect(fs.statSync(lock).ino).toBe(inode);
+      expect(fs.readdirSync(path.dirname(file)).sort()).toEqual([".v2.json.fabric-v2.lock", "v2.json"]);
+    } finally { a.child.kill("SIGKILL"); }
+  }, 60_000);
 
   it("#1609 review P1-8: refuses a symlink in ANY path component, an unsafe ancestor, or an unsafe file", () => {
     const file = writeLinkConfig({ file: [seatFileEntry] });

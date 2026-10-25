@@ -215,9 +215,10 @@ export const installedSeam = async (directory: string): Promise<string> => {
 };
 
 /** Run the installed seam the way A does (tests/fixtures/seat-drain-harness.py), without blocking this event loop. */
-export const runSeam = (seat: Seat, exe: string, phase: string, request: string, nolock = false):
+export const runSeam = (seat: Seat, exe: string, phase: string, request: string, nolock = false, home?: string):
   Promise<{ code: number | null; stdout: string; stderr: string }> => new Promise((resolve, reject) => {
-  const child = spawn("python3", [path.join("tests", "fixtures", "seat-drain-harness.py"), seat.runDir, exe, phase, ...(nolock ? ["nolock"] : [])],
+  const child = spawn("python3", [path.join("tests", "fixtures", "seat-drain-harness.py"), seat.runDir, exe, phase, ...(nolock ? ["nolock"] : []),
+    ...(home === undefined ? [] : [`home=${home}`])],
     { stdio: ["pipe", "pipe", "pipe"] });
   let out = "";
   let err = "";

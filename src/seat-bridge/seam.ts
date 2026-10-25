@@ -333,6 +333,8 @@ const seatPins = (context: Context, orgJson: string | undefined): BridgeNatsSeat
 
 const readOptions = (context: Context): ReadOptions =>
   context.deps.durableStateDir === undefined ? {} : { durableStateDir: context.deps.durableStateDir };
+const lockOptions = (context: Context) => ({ sleep: context.sleep, now: context.now,
+  ...(context.deps.python === undefined ? {} : { python: context.deps.python }) });
 
 /**
  * The seat's NATS machine, from the run-pinned principal NATS binding (A's T-FIX6: top-level `natsMachine` in the sealed
@@ -407,7 +409,7 @@ const publish = async (context: Context): Promise<number> => {
         plan: planEvidence(planned), rollback: authorityEvidence(rollbackAuthority(planned)), unit: context.pins.linkUnit, routesBefore,
         measured: measuredPod, residuals: RESIDUALS });
       return { planned, sha, after: applyPlan(planned) };
-    }, { sleep: context.sleep, now: context.now });
+    }, lockOptions(context));
     plan = locked.planned;
     intentSha256 = locked.sha;
     post = locked.after;
@@ -528,7 +530,7 @@ const restoreRoute = async (context: Context): Promise<number> => {
       plan: planEvidence(planned), unit: context.pins.linkUnit, routesBefore,
       measured: { meshRoot, interpreter: interpreterIdentity(), startedAt: new Date().toISOString() }, residuals: RESIDUALS });
     return { planned, sha, after: applyPlan(planned) };
-  }, { sleep: context.sleep, now: context.now });
+  }, lockOptions(context));
   const { planned: plan, sha: intentSha256, after: post } = locked;
   let reason: string | null = null;
   let reload: Awaited<ReturnType<typeof reloadLink>> | null = null;

@@ -1,9 +1,9 @@
+import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { parseNatsLinkConfig, natsLinkAllowListConfig, NATS_LINK_CONFIG_MAX_BYTES, type NatsLinkConfig } from "../mesh/bridge-nats-config.js";
 import { createBridgeNatsIdentityGate, type BridgeNatsSeatPins } from "../mesh/bridge-nats-identity.js";
-import { procStartTime } from "../main-drain/binding.js";
 import { SeamGap, sha256 } from "../seat-drain/run.js";
 
 /**
@@ -195,61 +195,51 @@ export const readLinkConfig = (file: string, options: ReadOptions = {}): LinkCon
 
 // ---------------------------------------------------------------- the config-scoped lock
 
-interface LockRecord { pid: number; startTime: string | null; at: string }
 const lockName = (name: string): string => `.${name}.fabric-v2.lock`;
-
-const readLock = (fd: number, name: string): (LockRecord & { ino: number }) | undefined => {
-  try {
-    const file = inDirectory(fd, lockName(name));
-    const stat = fs.lstatSync(file);
-    const value = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<LockRecord>;
-    if (!stat.isFile() || !Number.isSafeInteger(value.pid)) return { pid: -1, startTime: null, at: "", ino: stat.ino };
-    return { pid: value.pid!, startTime: typeof value.startTime === "string" ? value.startTime : null, at: String(value.at), ino: stat.ino };
-  } catch { return undefined; }
-};
+const PYTHON = "/usr/bin/python3";
+/** flock(2) on fd 3, non-blocking: exit 0 = taken on that open file description, 3 = another holder has it. */
+const FLOCK = "import fcntl, sys\ntry:\n    fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept BlockingIOError:\n    sys.exit(3)\n";
 
 /**
- * Hold the config-scoped lock (an O_EXCL file beside the config, through the verified directory) for `work`: every
- * bridge seam write, on any seat, takes it across read, plan, check, rename and read-back. A lock whose holder process
- * is gone (pid and start time) is removed only while it is the same file; a live holder is waited for, bounded.
+ * Hold the config-scoped lock for `work`: an flock(2) on ONE stable lock file beside the config
+ * (`.<name>.fabric-v2.lock`, opened through the verified directory, never removed). Every bridge seam write, on any
+ * seat, takes it across read, plan, check, rename and read-back. Node has no flock, so the fixed python helper takes it
+ * on this process's open file description (shared as the helper's fd 3); it is released when this process closes that
+ * descriptor, or dies. So there is no stale lock to reclaim, no create/remove identity race and no empty lock left by a
+ * crash. A live holder is waited for, bounded.
  */
 export const withConfigLock = async <T>(file: string, work: () => Promise<T> | T,
-  options: { waitMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => number } = {}): Promise<T> => {
+  options: { waitMs?: number; sleep?: (ms: number) => Promise<void>; now?: () => number; python?: string } = {}): Promise<T> => {
   const { directory, name } = verifyPath(file);
   const dir = openDirectory(directory);
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
   const now = options.now ?? Date.now;
   const until = now() + (options.waitMs ?? LOCK_WAIT_MS);
-  const mine: LockRecord = { pid: process.pid, startTime: procStartTime(process.pid) ?? null, at: new Date().toISOString() };
-  let held: number | undefined;
+  let lock: number | undefined;
   try {
+    try {
+      lock = fs.openSync(inDirectory(dir.fd, lockName(name)), fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
+    } catch { throw new SeamGap("link-config-lock-failed"); }
+    const held = fs.fstatSync(lock);
+    if (!held.isFile() || (held.uid !== 0 && held.uid !== uid()) || held.nlink !== 1 || (held.mode & 0o022) !== 0) {
+      throw new SeamGap("link-config-lock-unsafe");
+    }
     for (;;) {
-      try {
-        const fd = fs.openSync(inDirectory(dir.fd, lockName(name)), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
-          fs.constants.O_NOFOLLOW, 0o600);
-        try { fs.writeSync(fd, JSON.stringify(mine)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-        held = fs.lstatSync(inDirectory(dir.fd, lockName(name))).ino;
-        break;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new SeamGap("link-config-lock-failed");
-      }
-      const holder = readLock(dir.fd, name);
-      const alive = holder !== undefined && holder.pid > 0 && holder.startTime !== null && procStartTime(holder.pid) === holder.startTime;
-      if (holder && !alive && holder.pid !== process.pid) {
-        // A dead holder: remove THAT file only (same inode), then try again.
-        try { if (fs.lstatSync(inDirectory(dir.fd, lockName(name))).ino === holder.ino) fs.unlinkSync(inDirectory(dir.fd, lockName(name))); }
-        catch { /* gone already */ }
-        continue;
-      }
+      const taken = spawnSync(options.python ?? PYTHON, ["-I", "-B", "-c", FLOCK], { stdio: ["ignore", "ignore", "ignore", lock],
+        env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" }, timeout: 10_000 });
+      if (taken.status === 0) break;
+      if (taken.status !== 3) throw new SeamGap("link-config-lock-failed");
       if (now() >= until) throw new SeamGap("link-config-busy");
       await sleep(200);
     }
+    // The name must still be the file this descriptor locked: nothing of ours removes or replaces it.
+    let named: fs.Stats;
+    try { named = fs.lstatSync(inDirectory(dir.fd, lockName(name))); } catch { throw new SeamGap("link-config-lock-unsafe"); }
+    if (named.dev !== held.dev || named.ino !== held.ino) throw new SeamGap("link-config-lock-unsafe");
     return await work();
   } finally {
-    if (held !== undefined) {
-      try { if (fs.lstatSync(inDirectory(dir.fd, lockName(name))).ino === held) fs.unlinkSync(inDirectory(dir.fd, lockName(name))); }
-      catch { /* already gone */ }
-    }
+    // The only descriptor of that open file description: closing it releases the flock.
+    if (lock !== undefined) fs.closeSync(lock);
     fs.closeSync(dir.fd);
   }
 };

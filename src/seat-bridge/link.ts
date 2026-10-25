@@ -113,9 +113,11 @@ export const reloadLink = async (config: NatsLinkConfig, unit: string, seat: { u
     if (fresh) {
       try {
         const status = await (deps.status ?? natsLinkStatus)(config);
-        problems = Array.isArray(status.problems) ? (status.problems as unknown[]).map(String).slice(0, 50) : ["status unreadable"];
-        // Only a named, expected leftover is tolerated (recorded): the removed seat's own old mirror row.
-        statusOk = Array.isArray(status.problems) && problems.every(tolerate);
+        const all = Array.isArray(status.problems) ? (status.problems as unknown[]).map(String) : ["status unreadable"];
+        // Only a named, expected leftover is tolerated (recorded): the removed seat's own old mirror row. EVERY problem is
+        // judged; only the evidence copy is cut to 50.
+        statusOk = Array.isArray(status.problems) && all.every(tolerate);
+        problems = all.slice(0, 50);
       } catch { problems = ["status unreadable"]; statusOk = false; }
       if (statusOk) break;
     } else problems = ["the link lock does not name a new process"];

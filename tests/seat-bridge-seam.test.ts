@@ -22,10 +22,11 @@ const LEAD = "session:00000000-0000-4000-8000-0000000000c3";
 const POD_JOURNAL = "/var/lib/fabric/sessions/synthetic.jsonl";
 const INCARNATION = "00000000-0000-4000-8000-0000000001d1";
 const V1_INCARNATION = "00000000-0000-4000-8000-0000000001c1";
-const pins = readBridgeNatsSeatPins({ productOwner: { name: "Delta" }, principals: [
+const ORG = { productOwner: { name: "Delta" }, principals: [
   { name: "Delta", orgInstance: { herdrAgent: "org-delta", herdrWorkspaceLabel: "Delta", fabricSession: SID } },
   { name: "Echo", orgInstance: { herdrAgent: "org-echo", herdrWorkspaceLabel: "Echo", fabricSession: "00000000-0000-4000-8000-0000000000e5" } },
-] });
+] };
+const pins = readBridgeNatsSeatPins(ORG);
 const seatFileEntry = { kind: "root", id: `session:${SID}`, principal: "Delta", send: ["followUp"], receive: ["followUp", "cancel"] };
 const leadEntry = { kind: "root", id: LEAD, send: ["followUp"] };
 
@@ -74,12 +75,15 @@ const world = async (options: { podJournal?: string; machines?: string[]; allow?
   const kubectl = path.join(kube, "kubectl");
   fs.copyFileSync(path.join("tests", "fixtures", "fake-kubectl.py"), kubectl);
   fs.chmodSync(kubectl, 0o700);
-  // The synthetic link config: hub file mesh = the seat's mesh, the seat's own Path B machine listed.
+  // The synthetic link config: hub file mesh = the seat's mesh, the seat's own Path B machine listed. Its seat pins are
+  // the synthetic org.json beside it (the pins the in-process runs inject), never a host's real org.json.
   const linkDir = path.join(seat.base, "link");
   fs.mkdirSync(linkDir, { mode: 0o700 });
+  const orgJson = path.join(linkDir, "org.json");
+  fs.writeFileSync(orgJson, JSON.stringify(ORG), { mode: 0o600 });
   const config = path.join(linkDir, "v2.json");
   fs.writeFileSync(config, `${JSON.stringify({ version: 1, name: "hub-a", link: "v2", file: { mesh: seat.meshRoot, lockProtocol: 2 },
-    stateDir: "/synthetic/link-state", nats: { servers: ["tls://nats.example.test:4222"], machine: "hub-a-bridge",
+    orgJson, stateDir: "/synthetic/link-state", nats: { servers: ["tls://nats.example.test:4222"], machine: "hub-a-bridge",
       credentials: "/synthetic/creds", caFile: "/synthetic/ca.pem", custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS",
       pathBMachines: options.machines ?? ["hub-a-bridge", "sandbox1", "sp-org-d3synth"], operatorMachine: "fabric-ops" },
     allow: options.allow ?? { file: [leadEntry, seatFileEntry] } }, null, 2)}\n`, { mode: 0o600 });
@@ -142,7 +146,7 @@ const request = (seat: Seat, phase: string, inputs: Record<string, unknown>) => 
   runSha256: seat.runSha256, phase, principal: "d3synth", sessionId: SID, inputs });
 
 const run = async (w: World, phase: string, given: Record<string, unknown> | ((w: World) => Record<string, unknown>),
-  extra: Partial<BridgeDeps> = {}) => {
+  extra: Partial<BridgeDeps> = {}, stdin?: Buffer) => {
   const inputs = typeof given === "function" ? given(w) : given;
   let stdout = ""; let stderr = "";
   let t = 0;
@@ -160,7 +164,7 @@ const run = async (w: World, phase: string, given: Record<string, unknown> | ((w
     ...extra,
   };
   const code = await main(["--run-dir", w.seat.runDir, "--phase", phase], {
-    stdin: () => Buffer.from(request(w.seat, phase, inputs)), stdout: text => { stdout += text; }, stderr: text => { stderr += text; },
+    stdin: () => stdin ?? Buffer.from(request(w.seat, phase, inputs)), stdout: text => { stdout += text; }, stderr: text => { stderr += text; },
     env: { D3_SEAT_LOCK_FD: String(w.seat.lockFd()) },
   }, { linkConfig: w.config, linkUnit: "smarty-nats-link.service" }, deps);
   return { code, stdout, stderr, receipt: stdout ? JSON.parse(stdout) as Record<string, any> : undefined };
@@ -247,6 +251,72 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     setKube(w, RAW, { line: identityLine(w) });
     expect((await run(w, "resume", resumeInputs)).code).toBe(0);
     expect(await run(w, "resume", resumeInputs)).toMatchObject({ code: 2, stdout: "", stderr: "GAP: evidence-write-failed [owner: fabric-v2]\n" });
+  });
+});
+
+// The contract with A's OWN side (#1609): A's final-seal producer, A's request encoder and A's receipt checks and resume
+// consumer, run from A's published code. A's code is not in this repository: D3_A_RESUME_CONSUMER names an external
+// driver (`<driver> <D3_A_CODE> seal|request|consume`, one JSON object on stdin), D3_A_CODE A's code directory.
+// Without both it is skipped; the lane runs it against A's published commit and records the result on the PR.
+const A_CONSUMER = process.env.D3_A_RESUME_CONSUMER;
+const A_CODE = process.env.D3_A_CODE;
+describe.skipIf(!linux || !A_CONSUMER || !A_CODE)("the resume contract against A's own seal, request and consumer (external)", () => {
+  const a = async (command: string, input: unknown): Promise<Buffer> => {
+    const { spawnSync } = await import("node:child_process");
+    const result = spawnSync("python3", [A_CONSUMER!, A_CODE!, command], { input: JSON.stringify(input) });
+    if (result.status !== 0) throw new Error(`A's ${command}: ${result.stderr.toString()}`);
+    return result.stdout;
+  };
+  const ARGS = ["--session", POD_JOURNAL, "--thinking", "high"];
+  /** Pi's own startup append (session-manager: exactly these five fields, an 8-hex id, a millisecond timestamp). */
+  const piThinking = (id: string, parentId: string, thinkingLevel: string) =>
+    `${JSON.stringify({ type: "thinking_level_change", id, parentId, timestamp: "2026-10-25T00:00:03.123Z", thinkingLevel })}\n`;
+
+  /** Seal the host journal with A's producer, resume through the seam with A's request bytes, consume with A. */
+  const contract = async (sealedEntries: string, appended: string) => {
+    const w = await world();
+    const source = JSON.parse(fs.readFileSync(path.join(w.seat.runDir, "seat-run.json"), "utf8")).source.journal as string;
+    const sealed = Buffer.concat([fs.readFileSync(source), Buffer.from(sealedEntries)]);
+    fs.writeFileSync(source, sealed);
+    fs.writeFileSync(w.journalFile, Buffer.concat([sealed, Buffer.from(appended)]));
+    const sealBytes = await a("seal", { journal: source, sessionId: SID, run: w.seat.run });
+    const sealFile = path.join(w.seat.runDir, "receipts", "final-seal.json");
+    fs.chmodSync(sealFile, 0o600); fs.writeFileSync(sealFile, sealBytes); fs.chmodSync(sealFile, 0o400);
+    const journalPath = path.join(w.seat.runDir, "seat-journal.jsonl");
+    fs.writeFileSync(journalPath, fs.readFileSync(journalPath, "utf8").trim().split("\n").map(line => JSON.parse(line) as Record<string, unknown>)
+      .map(record => record.event === "final-seal" ? { ...record, sha256: sha(sealBytes) } : record).map(record => `${JSON.stringify(record)}\n`).join(""));
+    const final = JSON.parse(sealBytes.toString("utf8")) as { leafId: string; journalBytes: number; sealHasThinkingEntry: boolean };
+    setKube(w, RAW, { line: identityLine(w, { journal: journalBranch(w.journalFile, final.leafId, final.journalBytes) }) }, { args: ARGS });
+    const requestBytes = await a("request", { run: w.seat.run, runSha256: w.seat.runSha256, principal: "d3synth", sessionId: SID, pod: RAW,
+      finalSeal: final });
+    const seam = await run(w, "resume", {}, {}, requestBytes);
+    const consumed = JSON.parse((await a("consume", { code: seam.code, stdout: seam.stdout, stderr: seam.stderr, run: w.seat.run, sessionId: SID,
+      pod: RAW, final, args: ARGS })).toString("utf8")) as { ok: boolean; gap?: string; identity?: Record<string, unknown> };
+    return { final, seam, consumed };
+  };
+
+  it("a sealed branch WITH a thinking entry and no append: the seam passes, and A accepts it with the sealed leaf", async () => {
+    const { final, seam, consumed } = await contract(`${entry("e1", null)}\n${piThinking("e2", "e1", "medium")}${entry("e3", "e2")}\n`, "");
+    expect(final.sealHasThinkingEntry).toBe(true);
+    expect(seam.receipt).toMatchObject({ result: "pass", observed: { leafId: "e3", appendedSinceSeal: [], suffixBase64: "" } });
+    expect(consumed).toMatchObject({ ok: true, identity: { sealLeafId: "e3", leafId: "e3", appendBytes: 0,
+      thinkingLevelPolicy: "sealed-branch-has-thinking-entry" } });
+  });
+
+  it("a sealed branch WITHOUT one and Pi's one thinking_level_change: the seam passes, and A accepts the new leaf", async () => {
+    const append = piThinking("a1b2c3d4", "e2", "high");
+    const { final, seam, consumed } = await contract(`${entry("e1", null)}\n${entry("e2", "e1")}\n`, append);
+    expect(final.sealHasThinkingEntry).toBe(false);
+    expect(seam.receipt).toMatchObject({ result: "pass", observed: { leafId: "a1b2c3d4", suffixBase64: Buffer.from(append).toString("base64"),
+      appendedSinceSeal: [{ id: "a1b2c3d4", parentId: "e2", type: "thinking_level_change", thinkingLevel: "high" }] } });
+    expect(consumed).toMatchObject({ ok: true, identity: { sealLeafId: "e2", leafId: "a1b2c3d4", appendBytes: Buffer.byteLength(append),
+      effectiveThinkingLevel: "high" } });
+  });
+
+  it("the counterexample: no thinking entry and NO append is the seam's true report, and A refuses it", async () => {
+    const { seam, consumed } = await contract(`${entry("e1", null)}\n${entry("e2", "e1")}\n`, "");
+    expect(seam.receipt).toMatchObject({ result: "pass", observed: { leafId: "e2", appendedSinceSeal: [] } });
+    expect(consumed).toEqual({ ok: false, gap: "resume-identity-mismatch [owner: fabric-v2]" });
   });
 });
 
@@ -376,8 +446,11 @@ describe.skipIf(!linux)("the REAL bridge bundle: built as scripts/build.mjs buil
     await build({ entryPoints: ["src/seat-bridge/entry.ts"], outfile: bundle, bundle: true, platform: "node", format: "cjs", target: "node24",
       logLevel: "silent" });
     const { spawnSync } = await import("node:child_process");
-    // A runs seams with a fixed env (no NODE_OPTIONS from this test runner).
-    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C", LC_ALL: "C" };
+    // A runs seams with a fixed env (no NODE_OPTIONS from this test runner). HOME is an empty directory here: nothing
+    // may fall back to a host file under the real home (a host's org.json above all).
+    const emptyHome = path.join(w.seat.base, "empty-home");
+    fs.mkdirSync(emptyHome, { mode: 0o700 });
+    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C", LC_ALL: "C", HOME: emptyHome };
     const uninstalled = spawnSync("node", [bundle, "--run-dir", w.seat.runDir, "--phase", "resume"], { encoding: "utf8", input: "{}", env });
     expect(uninstalled).toMatchObject({ status: 2, stdout: "", stderr: "GAP: seam-not-installed [owner: fabric-v2]\n" });
     const out = path.join(w.seat.base, "fabric-seat-bridge");
@@ -415,9 +488,22 @@ describe.skipIf(!linux)("the REAL bridge bundle: built as scripts/build.mjs buil
     const body = request(w.seat, "rc-restore-route", inputs);
     expect(await runSeam(w.seat, out, "rc-restore-route", body, true)).toMatchObject({ code: 2, stdout: "",
       stderr: "GAP: lock-not-held [owner: fabric-v2]\n" });
-    // With the lock, the installed seam reads ITS pinned config and the seat's mesh, then stops on a link it cannot read.
+    // With the lock, the installed seam reads ITS pinned config, the seat pins from the config's orgJson and the seat's
+    // mesh, then stops on a link it cannot read: in A's environment (no HOME), and with HOME an empty directory.
     expect(await runSeam(w.seat, out, "rc-restore-route", body)).toMatchObject({ code: 2, stdout: "",
       stderr: "GAP: link-status-unreadable [owner: fabric-v2]\n" });
+    expect(await runSeam(w.seat, out, "rc-restore-route", body, false, emptyHome)).toMatchObject({ code: 2, stdout: "",
+      stderr: "GAP: link-status-unreadable [owner: fabric-v2]\n" });
+    expect(fs.readdirSync(emptyHome)).toEqual([]);
+    // The counterexample: a config without orgJson falls back to the factory paths under HOME, finds nothing in the
+    // empty one, and refuses (it reached no host org.json).
+    const unpinned = path.join(path.dirname(w.config), "unpinned.json");
+    const { orgJson: _orgJson, ...withoutOrg } = JSON.parse(fs.readFileSync(w.config, "utf8")) as Record<string, unknown>;
+    fs.writeFileSync(unpinned, JSON.stringify(withoutOrg), { mode: 0o600 });
+    expect(spawnSync("node", [bundle, "--install", "--out", `${out}-4`, "--link-config", unpinned, "--link-unit", "smarty-nats-link.service"],
+      { env }).status).toBe(0);
+    expect(await runSeam(w.seat, `${out}-4`, "rc-restore-route", body, false, emptyHome)).toMatchObject({ code: 2, stdout: "",
+      stderr: "GAP: seat-pins-unreadable [owner: fabric-v2]\n" });
   }, 60_000);
 });
 
@@ -484,6 +570,22 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     w.statusAfter = { ...w.statusAfter!, problems: [`mirror not on allow.nats: ${LEAD}`] };
     expect((await run(w, "rc-restore-route", writer(w))).receipt).toMatchObject({ result: "refused" });
     expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json").reason).toBe("link-not-reloaded");
+  });
+
+  it("#1609 review (status P1): every status problem is judged, not only the 50 kept as evidence", async () => {
+    const leftover = `mirror not on allow.nats: session:${SID}`;
+    // 50 tolerated rows, then ONE untolerated row past the evidence cut: refused.
+    const w = await published();
+    w.statusAfter = { ...w.statusAfter!, problems: [...Array<string>(50).fill(leftover), `mirror not on allow.nats: ${LEAD}`] };
+    expect((await run(w, "rc-restore-route", writer(w))).receipt).toMatchObject({ result: "refused" });
+    const outcome = evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json");
+    expect(outcome.reason).toBe("link-not-reloaded");
+    expect(outcome.measured.reload).toMatchObject({ statusOk: false, problems: Array<string>(50).fill(leftover) });
+    // The counterexample: 51 rows that are ALL tolerated still pass.
+    const ok = await published();
+    ok.statusAfter = { ...ok.statusAfter!, problems: Array<string>(51).fill(leftover) };
+    expect((await run(ok, "rc-restore-route", writer(ok))).receipt).toMatchObject({ result: "pass" });
+    expect(evidenceOf(ok, "fabric-v2-bridge-rc-restore-route-outcome.json").measured.reload).toMatchObject({ statusOk: true });
   });
 
   it("#1609 review P1-5: a no-op publish (the entry already there) gives the rollback nothing to remove", async () => {

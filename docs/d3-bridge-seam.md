@@ -150,9 +150,12 @@ free-form edit.
   directory. The file is regular, root's or the seat user's, one link, not group/other-writable, at most 1 MiB.
   Every read, the temp file and the rename go through a descriptor of that verified directory, whose identity must
   still be the one the plan read.
-- **One config-scoped lock** (`.<config name>.fabric-v2.lock`, an O_EXCL file beside the config) is held across
-  read, plan, intent, check, rename and read-back by every seam write, on any seat. A lock whose holder process is
-  gone (pid and start time) is removed only while it is the same file; a live holder is waited for, at most 30 s.
+- **One config-scoped lock** is held across read, plan, intent, check, rename and read-back by every seam write, on
+  any seat. It is an `flock` on one stable file beside the config, `.<config name>.fabric-v2.lock`, which is opened
+  through the verified directory and never removed. The file must be regular, have one link, belong to root or the
+  seat user, and not be group- or other-writable. Node has no `flock`, so `/usr/bin/python3` takes the lock on the
+  seam's own open file description. The lock is released when the seam closes that descriptor or dies, so a crash
+  leaves no stale lock and nothing is ever reclaimed. A live holder is waited for, at most 30 s.
 - **The entry** has one fixed shape, built only from sealed values:
   - `id` is `session:<run sessionId>`;
   - `principal` is the org.json principal whose seat is that session;

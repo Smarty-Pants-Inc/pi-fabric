@@ -87,6 +87,8 @@ export interface PathBHarnessOptions {
   readonly removeAgentDeny?: readonly string[];
   /** Serve client TLS from an owned ephemeral test CA (openssl subprocess). Server cert SANs default to localhost/127.0.0.1. */
   readonly tls?: { readonly dnsNames?: readonly string[]; readonly ipAddresses?: readonly string[] };
+  /** App-account JetStream file storage, bytes (default 4 GiB). Streams reserve their max_bytes against it. */
+  readonly accountDiskBytes?: number;
 }
 
 export interface PathBTlsFiles {
@@ -382,7 +384,8 @@ export class PathBHarness {
           },
         ];
         const appAccountJwt = encodeAccountJwt(
-          { name: "path-b-app", subject: appAccount, signingKeys: scopedKeys, limits: ACCOUNT_LIMITS },
+          { name: "path-b-app", subject: appAccount, signingKeys: scopedKeys,
+            limits: options.accountDiskBytes === undefined ? ACCOUNT_LIMITS : { ...ACCOUNT_LIMITS, disk_storage: options.accountDiskBytes } },
           signerOf(operatorSigning),
           clock,
         );

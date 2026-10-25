@@ -137,21 +137,23 @@ describe.skipIf(!binary)("A' N4 republish on a real Path B broker", () => {
     closers.push(() => handle!.stop());
 
     const base = { kind: "message", from: { id: NATS_ROOT, name: "claimed-by-body", kind: "main" as const }, createdAt: Date.now() };
-    await publisher.publish({ ...base, id: "v2-task-1", topic: "fleet.work.tasks", to: "factory", text: "task done", data: { task: 1 } });
+    // A work topic the hub factory takes when addressed to it (fleet.work.<repo>.<n>).
+    const topic = "fleet.work.pi-fabric.1593";
+    await publisher.publish({ ...base, id: "v2-task-1", topic, to: "factory", text: "task done", data: { task: 1 } });
     // Already bridged somewhere: must never cross again (no loops).
-    await publisher.publish({ ...base, id: "v2-loop-1", topic: "fleet.work.tasks", to: "factory", text: "loop",
+    await publisher.publish({ ...base, id: "v2-loop-1", topic, to: "factory", text: "loop",
       data: { bridge: { from: "elsewhere", id: "x" } } });
     // The same message id again inside the dedupe window is a broker duplicate: one stream copy.
-    await publisher.publish({ ...base, id: "v2-task-1", topic: "fleet.work.tasks", to: "factory", text: "task done", data: { task: 1 } });
+    await publisher.publish({ ...base, id: "v2-task-1", topic, to: "factory", text: "task done", data: { task: 1 } });
     // A live allow-listed root without fleet.work.* in its republishTopics: L3's gate refuses it.
     await publisher.publish({ ...base, from: { id: OTHER_ROOT, name: "other", kind: "main" }, id: "v2-other-1",
-      topic: "fleet.work.tasks", to: "factory", text: "not mine to republish" });
-    const crossed = () => store.read({ after: 0, topic: "fleet.work.tasks", limit: 100 });
+      topic, to: "factory", text: "not mine to republish" });
+    const crossed = () => store.read({ after: 0, topic, limit: 100 });
     await vi.waitFor(() => expect(counted.filter(name => name === "republish.refused")).toHaveLength(2),
       { timeout: 15_000, interval: 50 });
     await vi.waitFor(() => expect(counted).toContain("republish.accepted"), { timeout: 15_000, interval: 50 });
     expect(crossed()).toHaveLength(1);
-    expect(crossed()[0]).toMatchObject({ topic: "fleet.work.tasks", to: "factory", text: "task done",
+    expect(crossed()[0]).toMatchObject({ topic, to: "factory", text: "task done",
       from: { id: `bridge:${LINK}`, name: "mesh-bridge", kind: "main" },
       data: { task: 1, bridge: { from: LINK, id: "v2-task-1", sender: { id: NATS_ROOT, name: "v2-lead", machine: V2 } } } });
     await handle!.stop();

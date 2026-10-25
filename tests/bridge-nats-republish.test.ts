@@ -101,7 +101,7 @@ const onV2 = (id: string): string | undefined => id === LEAD || id === OTHER ? V
 
 async function run(messages: FakeMessage[], options: { store?: FakeStore; ledger?: ReturnType<typeof ledger>;
   rate?: NatsRepublishRate; topics?: string[]; machineOf?: (id: string) => string | undefined; fileNative?: string[];
-  recipientAllowed?: (to: string) => boolean } = {}) {
+  recipientAllowed?: (to: string, topic: string) => boolean } = {}) {
   const store = options.store ?? new FakeStore();
   const counted: string[] = [];
   const machineOf = options.machineOf ?? onV2;
@@ -151,8 +151,8 @@ describe("N4 republish: v2 work topics into the hub file mesh", () => {
   it("appends once across a redelivery (ledger) and across a crash before the ledger write (keyed append)", async () => {
     const book = ledger();
     const store = new FakeStore();
-    const first = eventMessage("fleet.work.tasks", {}, { msgId: "evt-7" });
-    const again = eventMessage("fleet.work.tasks", {}, { msgId: "evt-7" });
+    const first = eventMessage("fleet.work.pi-fabric.7", {}, { msgId: "evt-7" });
+    const again = eventMessage("fleet.work.pi-fabric.7", {}, { msgId: "evt-7" });
     const { counters } = await run([first, again], { ledger: book, store });
     expect(store.appended).toHaveLength(1);
     expect(store.inputs).toHaveLength(1);
@@ -160,7 +160,7 @@ describe("N4 republish: v2 work topics into the hub file mesh", () => {
     expect(again.calls).toEqual(["ack"]);
     // The ledger lost the record (crash after the append): the keyed append appends nothing new.
     book.map.clear();
-    const replay = eventMessage("fleet.work.tasks", {}, { msgId: "evt-7" });
+    const replay = eventMessage("fleet.work.pi-fabric.7", {}, { msgId: "evt-7" });
     await run([replay], { ledger: book, store });
     expect(store.inputs).toHaveLength(2);
     expect(store.appended).toHaveLength(1);
@@ -187,19 +187,27 @@ describe("N4 republish: v2 work topics into the hub file mesh", () => {
     expect(fourth.counters.refused).toEqual({ BRIDGE_NATS_AMBIGUOUS: 1 });
   });
 
-  it("keeps an addressed event's recipient only for the hub factory or a file-side allow-listed identity (pass P3)", async () => {
+  it("keeps an addressed event's recipient only for a factory event or a file root opted in to the topic (pass P3)", async () => {
     const FILE_ROOT = "session:44444444-4444-4444-8444-444444444444";
     const HUB_OTHER = "session:55555555-5555-4555-8555-555555555555";
     const factory = eventMessage("fleet.work.a.1", {}, { msgId: "r-1" });
+    // `to: factory` only where the file bridge admits it (fleet.work.<repo>.<n>): not on any other fleet.work topic.
+    const notFactory = eventMessage("fleet.work.tasks", {}, { msgId: "r-7" });
     const listed = eventMessage("fleet.work.a.2", { to: FILE_ROOT }, { msgId: "r-2" });
+    const notOptedIn = eventMessage("fleet.work.lanes", { to: FILE_ROOT }, { msgId: "r-8" });
     const other = eventMessage("fleet.work.a.3", { to: HUB_OTHER }, { msgId: "r-3" });
     const topicOnly = eventMessage("fleet.work.a.4", { to: undefined }, { msgId: "r-4" });
-    const { store, counters, counted } = await run([factory, listed, other, topicOnly], { recipientAllowed: to => to === FILE_ROOT });
+    const asked: string[] = [];
+    const { store, counters, counted } = await run([factory, notFactory, listed, notOptedIn, other, topicOnly], {
+      recipientAllowed: (to, topic) => { asked.push(`${to} ${topic}`); return to === FILE_ROOT && topic === "fleet.work.a.2"; } });
     expect(store.inputs.map(input => input.to)).toEqual(["factory", FILE_ROOT, undefined]);
     expect(store.inputs[2]).not.toHaveProperty("to");
-    expect(other.calls).toEqual([expect.stringMatching(/^term:/)]);
-    expect(counters.refused).toEqual({ BRIDGE_NATS_NOT_ALLOWED: 1 });
-    expect(counted).toEqual(["republish.accepted", "republish.accepted", "republish.refused", "republish.accepted"]);
+    for (const refused of [notFactory, notOptedIn, other]) expect(refused.calls).toEqual([expect.stringMatching(/^term:/)]);
+    expect(counters.refused).toEqual({ BRIDGE_NATS_NOT_ALLOWED: 3 });
+    expect(counted).toEqual(["republish.accepted", "republish.refused", "republish.accepted", "republish.refused", "republish.refused",
+      "republish.accepted"]);
+    // The link decides participants by recipient AND topic; the factory never reaches that check.
+    expect(asked).toEqual([`${FILE_ROOT} fleet.work.a.2`, `${FILE_ROOT} fleet.work.lanes`, `${HUB_OTHER} fleet.work.a.3`]);
     // Without the link's allow.file check no participant is a recipient (fail closed); the factory still is.
     const closed = await run([eventMessage("fleet.work.a.5", { to: FILE_ROOT }, { msgId: "r-5" }),
       eventMessage("fleet.work.a.6", {}, { msgId: "r-6" })]);

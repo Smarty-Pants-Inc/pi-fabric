@@ -11,7 +11,9 @@ import { createNatsFileLink, FileCarrierPresence, NatsCarrierDeferredError, type
 import { createBridgeNatsIdentityGate, parseBridgeNatsAllowSection, type BridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
 import { BRIDGE_NATS_LEDGER_LOCK, openBridgeNatsLedger, type FileBridgeNatsLedger } from "../src/mesh/bridge-nats-ledger.js";
 import type { NatsLinkConfig } from "../src/mesh/bridge-nats-config.js";
-import { natsCarrierLedger, natsLinkAuthorizers, natsLinkFileTargetAllowed, natsLinkMirrorAllowed, startNatsLink } from "../src/mesh/bridge-nats-link.js";
+import {
+  natsCarrierLedger, natsLinkAuthorizers, natsLinkFileTargetAllowed, natsLinkMirrorAllowed, natsLinkRepublishRecipient, startNatsLink,
+} from "../src/mesh/bridge-nats-link.js";
 import { bridgeNatsMappedCommandId, type BridgeNatsAllowSection } from "../src/mesh/bridge-nats-types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
@@ -308,5 +310,45 @@ describe("file presence for the gate (PR 2 P0)", () => {
     const nats = { side: "nats" as const, records: () => [], list: () => [] };
     expect(gate.verifySender("file", direct.id, view, nats)).toMatchObject({ ok: true, identity: { viaSpoke: SPOKE } });
     expect(gate.verifySender("file", reexport.id, view, nats)).toMatchObject({ ok: false });
+  });
+});
+
+describe("N4 recipients opt in (security pass P3)", () => {
+  const HUB_ROOT = "session:a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1";
+  const PLAIN_ROOT = "session:a2a2a2a2-a2a2-4a2a-8a2a-a2a2a2a2a2a2";
+  const MUTED_SEAT = "session:a3a3a3a3-a3a3-4a3a-8a3a-a3a3a3a3a3a3";
+  const SEAT = "session:a4a4a4a4-a4a4-4a4a-8a4a-a4a4a4a4a4a4";
+  const SPOKE_ROOT = "session:a5a5a5a5-a5a5-4a5a-8a5a-a5a5a5a5a5a5";
+  const recipient = natsLinkRepublishRecipient(parseBridgeNatsAllowSection({
+    file: [
+      { kind: "root", id: HUB_ROOT, receiveTopics: ["fleet.work.*"] },
+      { kind: "root", id: PLAIN_ROOT },
+      { kind: "root", id: MUTED_SEAT, principal: "Paul", receive: [], receiveTopics: ["fleet.work.*"] },
+      { kind: "root", id: SEAT, principal: "Kate", receive: ["followUp"], receiveTopics: ["fleet.work.lanes"] },
+      { kind: "root", id: SPOKE_ROOT, viaSpoke: "spoke-a", receiveTopics: ["fleet.work.*"] },
+      { kind: "actor", rootId: HUB_ROOT, name: "review" },
+    ],
+    nats: [{ kind: "root", id: natsLead.id, machine: POD_MACHINE, receiveTopics: ["fleet.work.*"] }],
+  }, { link: LINK, natsMachine: BRIDGE_MACHINE, spokes: ["spoke-a"] }));
+
+  it("lets an addressed event name a hub root only on a topic it opted in to", () => {
+    expect(recipient(HUB_ROOT, "fleet.work.pi-fabric.1")).toBe(true);
+    expect(recipient(HUB_ROOT, "ops.owner")).toBe(false);
+    // On the list, but no receiveTopics: never addressed from across.
+    expect(recipient(PLAIN_ROOT, "fleet.work.pi-fabric.1")).toBe(false);
+  });
+
+  it("refuses a principal seat that receives nothing, and holds an opted-in seat to its own topics", () => {
+    expect(recipient(MUTED_SEAT, "fleet.work.pi-fabric.1")).toBe(false);
+    expect(recipient(SEAT, "fleet.work.lanes")).toBe(true);
+    expect(recipient(SEAT, "fleet.work.tasks")).toBe(false);
+  });
+
+  it("never names a spoke root, an actor, a NATS root or an id off the list", () => {
+    expect(recipient(SPOKE_ROOT, "fleet.work.pi-fabric.1")).toBe(false);
+    expect(recipient("0123456789abcdef0123456789abcdef", "fleet.work.pi-fabric.1")).toBe(false);
+    expect(recipient(natsLead.id, "fleet.work.pi-fabric.1")).toBe(false);
+    expect(recipient(offList.id, "fleet.work.pi-fabric.1")).toBe(false);
+    expect(recipient("factory", "fleet.work.pi-fabric.1")).toBe(false);
   });
 });

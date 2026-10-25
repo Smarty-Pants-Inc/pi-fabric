@@ -10,8 +10,9 @@
 //   needs the topic in that entry's `republishTopics` (default none). The events leg checks the KV view
 //   first as well. The file event is authored as the gate's `author` (the link, `bridge:<link>`); the
 //   gate's verified sender (from KV presence, never the body) is kept in `data.bridge.sender`.
-// - Recipient: an addressed event keeps its `to` only when that names the hub's factory or a file-side
-//   allow-listed root or actor (`recipientAllowed`); any other addressed event is refused
+// - Recipient: an addressed event keeps its `to` only for the hub factory, on exactly the events the file
+//   bridge admits to it (isAddressedHubFactoryEvent), or for a file-side root that opted in to the topic
+//   (`recipientAllowed`: the link's allow.file receiveTopics check). Any other addressed event is refused
 //   (BRIDGE_NATS_NOT_ALLOWED), so a v2 Main can never address an arbitrary hub participant through the
 //   link. An unaddressed (topic-only) event crosses as it is.
 // - Stamp: `data.bridge = { from: <link>, id: <NATS message id>, sender }`, the file bridge's own
@@ -38,7 +39,7 @@ import {
   BRIDGE_NATS_REFUSAL, type BridgeNatsPort, type BridgeNatsPortResolved, type BridgeNatsPresenceView, type BridgeNatsRepublishDecision,
   type BridgeNatsRepublishRequest, type BridgeNatsVerified, type BridgeNatsVerifiedIdentity,
 } from "./bridge-nats-types.js";
-import { HUB_FACTORY_RECIPIENT, isWorkTopic } from "./bridge-topics.js";
+import { HUB_FACTORY_RECIPIENT, isAddressedHubFactoryEvent, isWorkTopic } from "./bridge-topics.js";
 import { ensureNatsBridgeEventConsumer, natsBridgeEventsDurable, natsBridgeEventSource, runNatsBridgeEvents,
   type NatsBridgeEventDelivery, type NatsBridgeEventDisposition, type NatsBridgeEventRefusal, type NatsBridgeEventSource,
 } from "./bridge-nats-events.js";
@@ -116,10 +117,11 @@ export interface NatsRepublishOptions {
   readonly gate: NatsRepublishGate;
   readonly views: NatsRepublishViews;
   /**
-   * Whether an addressed event may keep its `to` in the file mesh: a file-side allow-listed root or actor
-   * (the link passes its allow.file check). The hub factory is always a recipient; absent, no participant is.
+   * Whether an addressed event on `topic` may keep its `to` in the file mesh: a file-side root that opted in
+   * to the topic (the link passes its allow.file check). The factory is decided apart (isAddressedHubFactoryEvent);
+   * absent, no participant is a recipient.
    */
-  readonly recipientAllowed?: (to: string) => boolean;
+  readonly recipientAllowed?: (to: string, topic: string) => boolean;
   /** L3's ledger, for the seen skip (the keyed append alone already guarantees one append). */
   readonly ledger?: {
     seen(direction: "toFile", eventId: string): unknown;
@@ -208,13 +210,15 @@ export const runNatsRepublish = (options: NatsRepublishOptions, signal: AbortSig
       }
       return refuse(decision.refuse);
     }
-    // An addressed event reaches only the hub factory or a file-side allow-listed identity, never any hub participant.
-    if (typeof event.to === "string" && event.to !== HUB_FACTORY_RECIPIENT && options.recipientAllowed?.(event.to) !== true) {
+    // An addressed event reaches only the hub factory (on the events the file bridge admits to it) or a file-side
+    // root that opted in to its topic; never any other hub participant.
+    if (typeof event.to === "string" && (event.to === HUB_FACTORY_RECIPIENT ? !isAddressedHubFactoryEvent(event)
+      : options.recipientAllowed?.(event.to, event.topic) !== true)) {
       const key = `${event.from.id}\0${event.topic}\0to\0${event.to}`;
       if (!reported.has(key) && reported.size < 1_000) {
         reported.add(key);
         options.log?.(`nats republish: refused ${event.topic} from ${event.from.id} to ${event.to}: ${BRIDGE_NATS_REFUSAL.notAllowed} ` +
-          "(not the hub factory or a file-side allow-listed root or actor)");
+          (event.to === HUB_FACTORY_RECIPIENT ? "(not a factory event)" : "(no file-side root receives this topic from across)"));
       }
       return refuse(BRIDGE_NATS_REFUSAL.notAllowed);
     }

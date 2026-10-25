@@ -11,14 +11,14 @@ import type {
 } from "./bridge-nats-carrier.js";
 import { createNatsFileLink, type NatsCarrierSide } from "./bridge-nats-file.js";
 import {
-  createBridgeNatsIdentityGate, loadBridgeNatsSeatPins, parseBridgeNatsAllowSection, type BridgeNatsSeatPins,
+  bridgeNatsTopicMatches, createBridgeNatsIdentityGate, loadBridgeNatsSeatPins, parseBridgeNatsAllowSection, type BridgeNatsSeatPins,
 } from "./bridge-nats-identity.js";
 import { bridgeNatsClaimAction, openBridgeNatsLedger } from "./bridge-nats-ledger.js";
 import { openNatsBridgeSide, type NatsBridgeSideConfig } from "./bridge-nats-port.js";
 import { startNatsRepublishLink, type NatsRepublishHandle } from "./bridge-nats-republish.js";
 import type { NatsTopicAuthorize } from "./bridge-nats-topics.js";
 import {
-  BRIDGE_NATS_REFUSAL, bridgeNatsLinkIdentity, type BridgeNatsAllowDecision, type BridgeNatsAllowListConfig, type BridgeNatsAllowSection,
+  BRIDGE_NATS_CLASS_RECEIVE, BRIDGE_NATS_REFUSAL, bridgeNatsDestinationClass, bridgeNatsLinkIdentity, type BridgeNatsAllowDecision, type BridgeNatsAllowListConfig, type BridgeNatsAllowSection,
   type BridgeNatsCommandRecord, type BridgeNatsIdentityGate, type BridgeNatsLedger, type BridgeNatsPort,
   type BridgeNatsPresenceView,
 } from "./bridge-nats-types.js";
@@ -177,6 +177,18 @@ export const natsLinkFileTargetAllowed = (allow: BridgeNatsAllowListConfig, file
       : fileView().records(targetId).some(record => record.kind === "actor" && record.mirroredBy === undefined &&
         record.rootId === entry.rootId && record.name === entry.name)));
 
+/**
+ * N4 (security pass P3): whether a republished v2 event may keep `to` naming this hub recipient. Recipients
+ * opt in: only an allow.file hub root whose receiveTopics list the topic, and that receives followUp within its
+ * destination class (a topic event lands in a root's inbox as a followUp does, so a principal seat or any root
+ * with receive [] gets none). Never a spoke root (the hub never forwards a bridged event) or an actor (an
+ * actor entry lists no topics). The hub factory is decided in the republish leg (isAddressedHubFactoryEvent).
+ */
+export const natsLinkRepublishRecipient = (allow: BridgeNatsAllowListConfig) => (to: string, topic: string): boolean =>
+  allow.entries.some(entry => entry.side === "file" && entry.kind === "root" && entry.id === to && entry.viaSpoke === undefined &&
+    entry.receive.includes("followUp") && BRIDGE_NATS_CLASS_RECEIVE[bridgeNatsDestinationClass(entry)].includes("followUp") &&
+    (entry.receiveTopics ?? []).some(pattern => bridgeNatsTopicMatches(pattern, topic)));
+
 /** L3's durable ledger as the carrier's ledger port. */
 export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsCarrierLedger => {
   const linkId = bridgeNatsLinkIdentity(link).id;
@@ -329,9 +341,9 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     // N4 (PR 2, lane L1): with nats.events, v2 work topics are republished into this file mesh, decided by
     // L3's gate (verifyEventSender + allowRepublish) on both sides' presence. A missing consume grant
     // refuses the start here, before MeshBridge links anything.
-    // An addressed v2 event keeps its `to` only for the hub factory or a file-side allow-listed root or actor.
+    // An addressed v2 event keeps its `to` only for the hub factory or an allow.file root that opted in to its topic.
     republish = await startNatsRepublishLink(config, { store, port, gate, ledger: opened, signal, log, counters: openedCounters,
-      recipientAllowed: natsLinkFileTargetAllowed(allow, () => remote!.filePresence.view()),
+      recipientAllowed: natsLinkRepublishRecipient(allow),
       views: { refresh: () => remote!.filePresence.refresh(), nats: () => openedPort.presenceView(),
         file: () => remote!.filePresence.view() } });
     await bridge.startWithBackoff();

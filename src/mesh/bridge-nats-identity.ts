@@ -436,6 +436,8 @@ const refuse = (code: BridgeNatsRefusalCode, reason: string): { ok: false; refus
 
 const topicMatches = (pattern: string, topic: string): boolean =>
   pattern.endsWith(".*") ? topic.length > pattern.length - 1 && topic.startsWith(pattern.slice(0, -1)) : pattern === topic;
+/** The allow-list's one topic rule (exact, or `prefix.*`), for the link's N4 recipient opt-in (receiveTopics). */
+export const bridgeNatsTopicMatches = topicMatches;
 
 const isNativePublisher = (value: unknown): value is BridgeNatsNativePublisher =>
   isPlainObject(value) && value.native === true && value.side === "file" && typeof value.fromId === "string";

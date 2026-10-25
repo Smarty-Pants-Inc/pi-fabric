@@ -24,14 +24,19 @@ if (!n4) console.warn("A' N4 E2E skipped: no link entry or no allow.nats republi
 
 const identity = (main: MixedMain): MeshIdentity => ({ id: main.id, name: main.label, kind: "main", sessionId: main.sessionId });
 const dataOf = (event: MeshEvent) => (event.data ?? {}) as Record<string, unknown>;
+/** A work topic the hub factory takes when addressed to it (fleet.work.<repo>.<n>: bridge-topics isAddressedHubFactoryEvent). */
+const FACTORY_TOPIC = "fleet.work.pi-fabric.1593";
 
 describe.skipIf(!binary || process.platform !== "linux" || !n4)("A' N4: v2 fleet.work publications reach the Ryzen 1 hub", () => {
   let h: MixedHarness;
   beforeAll(async () => {
-    // natsMain may republish fleet.work.*; natsPeer is allow-listed for control only (no republishTopics).
+    // natsMain may republish fleet.work.*; natsPeer is allow-listed for control only (no republishTopics). The hub's
+    // file Main opts in to addressed fleet.work.lanes events from across (receiveTopics), and to nothing else.
     h = await createMixedHarness({ binary: binary!, events: true, natsPeer: true, allow: (allow, ids) => {
       allow.nats = allow.nats.map((entry) => entry.kind === "root" && entry.id === ids.natsMain
         ? allowRoot(ids.natsMain, { machine: NATS_MAIN_MACHINE, republishTopics: ["fleet.work.*"] }) : entry);
+      allow.file = allow.file.map((entry) => entry.kind === "root" && entry.id === ids.fileMain
+        ? allowRoot(ids.fileMain, { receiveTopics: ["fleet.work.lanes"] }) : entry);
     } });
   }, E2E_WAIT_MS + 60_000);
   afterAll(async () => { await h?.stop(); }, 60_000);
@@ -43,15 +48,15 @@ describe.skipIf(!binary || process.platform !== "linux" || !n4)("A' N4: v2 fleet
   /** Stream-order barrier: a later allowed publication reached the hub, so every earlier one was decided. */
   const barrier = async () => {
     const token = `N4_BARRIER_${randomUUID()}`;
-    await publishFrom(h.natsMain, "fleet.work.tasks", "completed", "factory", token);
+    await publishFrom(h.natsMain, FACTORY_TOPIC, "completed", "factory", token);
     await waitForValue(() => hubCopies(token).length ? true : undefined, () => `N4 barrier republished\n${linkTail(h)}`, E2E_WAIT_MS);
   };
 
-  it("a v2 Main's fleet.work.tasks to factory appears once in the hub mesh, authored by the link, with the verified sender", async () => {
+  it("a v2 Main's work-topic event to factory appears once in the hub mesh, authored by the link, with the verified sender", async () => {
     const token = `V2_TASK_DONE_${randomUUID()}`;
-    const published = await publishFrom(h.natsMain, "fleet.work.tasks", "completed", "factory", token, { repo: "pi-fabric", number: 1593 });
+    const published = await publishFrom(h.natsMain, FACTORY_TOPIC, "completed", "factory", token, { repo: "pi-fabric", number: 1593 });
     const copy = await waitForValue(() => hubCopies(token)[0], () => `republished into the hub mesh\n${linkTail(h)}`, E2E_WAIT_MS);
-    expect(copy).toMatchObject({ topic: "fleet.work.tasks", kind: "completed", to: "factory", text: token, from: { id: link().id },
+    expect(copy).toMatchObject({ topic: FACTORY_TOPIC, kind: "completed", to: "factory", text: token, from: { id: link().id },
       data: { repo: "pi-fabric", number: 1593 } });
     // The crossing stamp (L1 bridge-nats-republish.ts): the link, the source event id, and the sender as KV presence
     // verified it on its credential machine. The sender is attribution only, never presented as `from`.
@@ -65,11 +70,11 @@ describe.skipIf(!binary || process.platform !== "linux" || !n4)("A' N4: v2 fleet
 
   it("exactly once across a link restart: an event already republished is not republished again", async () => {
     const token = `V2_TASK_BEFORE_RESTART_${randomUUID()}`;
-    await publishFrom(h.natsMain, "fleet.work.tasks", "completed", "factory", token);
+    await publishFrom(h.natsMain, FACTORY_TOPIC, "completed", "factory", token);
     await waitForValue(() => hubCopies(token).length ? true : undefined, () => `republished before restart\n${linkTail(h)}`, E2E_WAIT_MS);
     await h.stopLink();
     const during = `V2_TASK_WHILE_STOPPED_${randomUUID()}`;
-    await publishFrom(h.natsMain, "fleet.work.tasks", "completed", "factory", during);
+    await publishFrom(h.natsMain, FACTORY_TOPIC, "completed", "factory", during);
     await h.startLinkNow();
     await h.waitMirrored();
     // The event published while the link was down crosses after the restart (the stream retains it) ...
@@ -93,24 +98,29 @@ describe.skipIf(!binary || process.platform !== "linux" || !n4)("A' N4: v2 fleet
     expect(h.faults.publishedWith(token)).toEqual([]); // the link never published it into any NATS inbox
   }, E2E_WAIT_MS * 3);
 
-  it("an addressed event keeps its recipient only for a file-side allow-listed root; any other hub participant is refused", async () => {
-    const listed = `V2_TO_HUB_ROOT_${randomUUID()}`, offList = `V2_TO_OFF_LIST_${randomUUID()}`;
-    // The pass's P3: the NATS event's `to` must never let a v2 Main address an arbitrary hub participant.
+  it("an addressed event keeps its recipient only for a hub root opted in to its topic, or the factory on a factory topic", async () => {
+    const listed = `V2_TO_HUB_ROOT_${randomUUID()}`, notOptedIn = `V2_TO_HUB_ROOT_OTHER_TOPIC_${randomUUID()}`;
+    const offList = `V2_TO_OFF_LIST_${randomUUID()}`, notFactory = `V2_FACTORY_OFF_TOPIC_${randomUUID()}`;
+    // The pass's P3: the NATS event's `to` must never let a v2 Main address an arbitrary hub participant. The file
+    // Main opted in to fleet.work.lanes only; the factory takes only what the file bridge gives it (fleet.work.<repo>.<n>).
     await publishFrom(h.natsMain, "fleet.work.lanes", "report", h.fileMain.id, listed);
+    await publishFrom(h.natsMain, FACTORY_TOPIC, "report", h.fileMain.id, notOptedIn);
     await publishFrom(h.natsMain, "fleet.work.lanes", "report", `session:${randomUUID()}`, offList);
+    await publishFrom(h.natsMain, "fleet.work.tasks", "completed", "factory", notFactory);
     const copy = await waitForValue(() => hubCopies(listed)[0], () => `addressed republish into the hub\n${linkTail(h)}`, E2E_WAIT_MS);
     expect(copy).toMatchObject({ topic: "fleet.work.lanes", kind: "report", to: h.fileMain.id, from: { id: link().id } });
     await barrier();
     expect(hubCopies(listed)).toHaveLength(1);
-    expect(hubCopies(offList)).toEqual([]);
+    for (const token of [notOptedIn, offList, notFactory]) expect(hubCopies(token), token).toEqual([]);
     expect(h.linkLog.some((line) => line.includes("BRIDGE_NATS_NOT_ALLOWED") && line.includes("fleet.work.lanes"))).toBe(true);
+    expect(h.linkLog.some((line) => line.includes("BRIDGE_NATS_NOT_ALLOWED") && line.includes("not a factory event"))).toBe(true);
   }, E2E_WAIT_MS * 3);
 
   it("never crosses: a topic outside republishTopics, a sender without republishTopics, and a forged sender", async () => {
     const offTopic = `V2_OFF_TOPIC_${randomUUID()}`, unlisted = `V2_UNLISTED_SENDER_${randomUUID()}`;
     const forgedFile = `V2_FORGED_FILE_ROOT_${randomUUID()}`, forgedUnknown = `V2_FORGED_UNKNOWN_${randomUUID()}`;
     await publishFrom(h.natsMain, "fleet.alerts", "raised", "factory", offTopic);
-    await publishFrom(h.natsPeer!, "fleet.work.tasks", "completed", "factory", unlisted);
+    await publishFrom(h.natsPeer!, FACTORY_TOPIC, "completed", "factory", unlisted);
     // A machine-b credential publishing straight into FABRIC_EV_<org> with a rewritten `from`: a file-native
     // root (a forged origin / loop) and an id live nowhere. Only verified presence may name the sender.
     const nats = await openNatsConnection({ servers: `tls://localhost:${new URL(h.broker.serverUrl).port}`,
@@ -119,7 +129,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !n4)("A' N4: v2 fleet
     try {
       const publisher = await openNatsEventsPublisher(nats, { org: HARNESS_ORG, provision: false });
       const forged = (from: MeshIdentity, text: string): MeshEvent => ({ id: randomUUID(), sequence: 0, createdAt: Date.now(),
-        topic: "fleet.work.tasks", kind: "completed", from, to: "factory", text });
+        topic: FACTORY_TOPIC, kind: "completed", from, to: "factory", text });
       await publisher.publishWithAck(forged(identity(h.fileMain), forgedFile));
       await publisher.publishWithAck(forged({ id: `session:${randomUUID()}`, name: "nobody", kind: "main" }, forgedUnknown));
     } finally { await nats.close(); }

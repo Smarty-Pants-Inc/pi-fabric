@@ -23,7 +23,9 @@ import { acquireMeshCustodyLock, MESH_CUSTODY_LOCK_NAME } from "./custody-lock.j
 import {
   BRIDGE_NATS_HORIZON_MS,
   BRIDGE_NATS_OPERATIONS,
+  BRIDGE_NATS_REFUSAL,
   type BridgeNatsAckRecord,
+  type BridgeNatsClaimAction,
   type BridgeNatsClaimInput,
   type BridgeNatsClaimResult,
   type BridgeNatsCommandRecord,
@@ -154,6 +156,19 @@ const encode = (line: Line): string => {
     throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_INVALID", "ledger record is larger than the line bound");
   }
   return encoded;
+};
+
+/**
+ * The one decision for a claim result, never a wait (integrator note 8 item 3; E2E finding A: a resend of
+ * an already-ACKed command must replay the recorded ACK at once, never block the link).
+ */
+export const bridgeNatsClaimAction = (result: BridgeNatsClaimResult): BridgeNatsClaimAction => {
+  const { record } = result;
+  if (result.status === "new") return { action: "publish", record };
+  if (result.status === "conflict") return { action: "refuse", record, refuse: BRIDGE_NATS_REFUSAL.idConflict };
+  if (result.status === "mismatch") return { action: "refuse", record, refuse: BRIDGE_NATS_REFUSAL.claimMismatch };
+  if (record.ack !== undefined) return { action: "replayAck", record, ack: record.ack };
+  return { action: record.state === "sent" ? "awaitAck" : "resend", record };
 };
 
 /** Write every byte (a regular-file write may return a short count) or throw. */

@@ -185,7 +185,12 @@ const call = async (context: Context, op: "drain" | "stop-actors" | "undo" | "pr
     // The Main must name this run's mesh root and root; another one is a binding failure (rev 3: no receipt).
     let ours: string | undefined, theirs: string | undefined;
     try { ours = fs.realpathSync(context.meshRoot); theirs = fs.realpathSync(reply.meshRoot); } catch { /* compared below */ }
-    if (!ours || ours !== theirs || reply.rootId !== `session:${context.request.sessionId}`) throw new BindingGap("main-binding-mismatch");
+    if (!ours || ours !== theirs || reply.rootId !== `session:${context.request.sessionId}`) {
+      // Read-only ops mutate nothing: a mismatch there is a binding failure (no receipt). After a mutating op,
+      // the drain must still undo, so it is an ordinary error the loop refuses on.
+      if (op === "probe") throw new BindingGap("main-binding-mismatch");
+      return { error: "MAIN_DRAIN_BINDING_MISMATCH", written: true };
+    }
     return { reply, written: true };
   } catch (error) {
     if (error instanceof BindingGap) throw error;
@@ -275,6 +280,8 @@ const drain = async (context: Context): Promise<number> => {
       t0MonotonicMs: context.started, main: pre?.followUps.owner ?? null },
     deadlineS: Math.min(context.deps.deadlineMs ?? DEADLINE_MS, DEADLINE_MS) / 1000, undoBudgetS: UNDO_BUDGET_MS / 1000, residuals: RESIDUALS,
   });
+  // A read-only look first: a Main that names another mesh root or root is a binding failure before anything closes.
+  await call(context, "probe", null, Math.min(30_000, context.deadline - context.now()));
   const passes: Array<{ atMs: number; drained: boolean; error: string | null; reasons: string[] }> = [];
   const steps: Array<{ atMs: number; step: string; detail: unknown; basis: "asserted" | "measured" }> = [];
   const step = (name: string, detail: unknown, basis: "asserted" | "measured" = "asserted"): void => {

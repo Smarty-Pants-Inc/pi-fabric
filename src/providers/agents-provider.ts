@@ -496,6 +496,7 @@ export class AgentsProvider implements FabricProvider {
     this.#spawnCaller = identity
       ? Object.freeze({ kind: identity.kind, id: identity.id })
       : (typeof (actorManager as { create?: unknown }).create === "function" ? null : undefined);
+    // Capture trusted launch metadata once; later cwd or marker changes cannot rebind us.
     this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,

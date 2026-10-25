@@ -21,7 +21,8 @@ import type { FabricParticipantRecord } from "../src/topology/types.js";
 // Keep reason: smarty-dev#16723's recorded cross-repository return address and the
 // directory's lease/collision trust boundary. Real provider, resolver and on-disk directory;
 // no workers, native deletion or live fleet state. All fixtures stay in the isolated TMPDIR.
-describe("#16723 projectAgent launch binding", () => {
+// File-based launch authority requires POSIX ownership; explicit env metadata works everywhere.
+describe.skipIf(process.getuid === undefined)("#16723 projectAgent launch binding", () => {
   const roots: string[] = [];
   const directories: ParticipantDirectory[] = [];
   const providers: AgentsProvider[] = [];
@@ -45,7 +46,7 @@ describe("#16723 projectAgent launch binding", () => {
     const cwd = path.join(lane, "sub");
     fs.mkdirSync(cwd);
     if (binding === "marker") {
-      fs.mkdirSync(path.join(lane, ".local"));
+      fs.mkdirSync(path.join(lane, ".local"), { mode: 0o700 });
       fs.writeFileSync(path.join(lane, ".local", "lead"), `${leadId}\n`);
     }
     const mesh = new MeshStore(path.join(lane, "mesh"), 64 * 1024, 1_000);

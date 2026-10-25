@@ -42,6 +42,66 @@ The pinned `@nats-io/jetstream` 3.4.0 implementation of `ConsumerAPI.update` rea
 for inbox creation. No new UPDATE-subject grant is necessary. Dormant legacy durables whose hosts never return
 are not retroactively repaired by a source patch; inventory or one-time administrative cleanup is separate work.
 
+## Rollout and tested downgrade
+
+This is an owner-by-owner rollout, **not** a promise that an old binary can open a migrated durable.
+A host migrates only its own exact-name/owner-checked inbox. Hosts that keep running the frozen
+`f33937156f587f2479c651ae301de44ec0f0592a` or `ca4b1482119748394df5125c2a8d2853676f7e04`
+code do not migrate their inboxes. Do not reuse a migrated host identity with an old binary without
+first restoring its threshold: the frozen `ca4b1482` helper rejects a positive threshold when its
+normal-host policy omits the field. Forward healing in the new helper cannot change that old binary.
+
+**Before downgrading a host whose old policy was unbounded** (ordinary/default-runtime `rt_`, or `br_`),
+restore zero using the procedure below. **Do not zero-reset explicitly temporary `ephemeralHost` inboxes.**
+Their original positive `ephemeralInactiveSeconds` setting is unchanged by this release; retain that setting
+and they need no reset. The frozen old helper requires that explicit positive threshold and rejects zero.
+A `runtime:` prefix alone does not imply explicit temporary-host configuration: check the host's original
+`ephemeralHost` setting, not just the current threshold or ID.
+
+For previously unbounded inboxes:
+
+1. Stop/quiesce that host's new-code process through its normal owner-controlled lifecycle. Keep it
+   stopped during restoration; a running new helper can heal the threshold back to the finite policy.
+   Do not downgrade or start the old binary yet.
+2. From a checkout of this release with its dependencies installed, run
+   `bun tools/nats-inbox-downgrade.ts` using that host's existing machine-scoped runtime credentials,
+   TLS CA/server addresses, and exact host ID. Supply the existing policy via `PI_FABRIC_MESH_NATS`,
+   or `PI_FABRIC_NATS_CUSTODY_STREAM`, `PI_FABRIC_NATS_LIVENESS_STREAM`, and `PI_FABRIC_NATS_MACHINES`.
+   No bootstrap/operator credentials or new grants are needed. `$CREDS_FILE` is an absolute file
+   path, not credential contents. Preview is read-only and is the default:
+
+   ```sh
+   bun tools/nats-inbox-downgrade.ts --host-id "$HOST_ID" --kind rt --machine "$MACHINE" --creds "$CREDS_FILE" --ca "$CA_FILE" --servers "$NATS_SERVERS"
+   ```
+
+3. Check the preview's computed stream/durable and current/target thresholds, then apply:
+
+   ```sh
+   bun tools/nats-inbox-downgrade.ts --host-id "$HOST_ID" --kind rt --machine "$MACHINE" --creds "$CREDS_FILE" --ca "$CA_FILE" --servers "$NATS_SERVERS" --apply
+   ```
+
+   For a bridge, **also** restore its `br_` inbox with the same command and `--kind br`; the host ID
+   must be its exact `bridge:<link>` identity. If the bridge also owns an ordinary `rt_` inbox, restore
+   that with `--kind rt` too. `br_` ownership is checked against the link, not a session description.
+   Add `--org "$ORG"` if the host uses a non-default NATS org.
+4. Require a successful JSON receipt reporting threshold zero before starting the old binary. If an
+   apply fails or its outcome is ambiguous, keep the host stopped and run the read-only preview to
+   reconcile; never assume success or delete/recreate the durable as a fallback. The tool is not a
+   fleet sweep and does not change actor/event/operator durables.
+
+The tool validates the computed name, exact owner description, filter and all non-lifetime inbox
+policy invariants before writing. Its only update delta is `{ inactive_threshold: 0 }`, followed by an
+independent read-back and validation. It never creates, deletes or resets a consumer. An already-zero
+consumer needs no write. A missing/expired durable is refused: this tool cannot restore a cursor
+already lost to expiry. Re-enabling the new code later migrates the threshold forward again.
+
+`tests/nats-inbox-downgrade.test.ts` exercises the real TLS/USER.INFO CLI path on NATS 2.14.7 with
+unchanged runtime grants: the byte-pinned frozen old helper creates a legacy consumer; the new helper
+migrates it; the old helper honestly rejects it; dry-run does not mutate it; applying the tool restores
+zero; and the old helper reopens it with creation identity, ACK floor and pending state intact. A separate
+frozen-old explicit-positive counterexample preserves the unchanged temporary-host policy and shows why
+zero-reset must not be used for that case.
+
 ## Reconnect and replay boundary
 
 Every host inbox delivery generation calls `ensureTransportConsumer` before binding. Verified native reconnect

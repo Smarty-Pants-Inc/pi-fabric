@@ -7,6 +7,7 @@ import { validBridgeName } from "../src/mesh/bridge.js";
 import {
   describeNatsLinkConfig,
   loadNatsLinkConfig,
+  natsLinkAllowListConfig,
   natsLinkMeshNatsConfig,
   natsLinkStatePaths,
   NatsLinkConfigError,
@@ -79,15 +80,19 @@ describe("nats-link config", () => {
     expect(config.logLevel).toBe("info");
     expect(config.nats.events).toBe(false);
     expect(config.nats.inboxLanes).toBe(8);
-    // L3's parser: frozen, both lists in one entries list, each entry with its home side and defaults.
-    expect(Object.isFrozen(config.allow)).toBe(true);
-    expect(config.allow).toEqual({ version: 1, link: "v2", natsMachine: "ryzen1-bridge", entries: [
+    // The section as written (L3's BridgeNatsAllowSection), frozen; startNatsLink parses it itself.
+    expect(config.allow).toEqual(ALLOW);
+    expect(Object.isFrozen(config.allow) && Object.isFrozen(config.allow.nats![0])).toBe(true);
+    // L3's parser: one frozen entries list, each entry with its home side and defaults.
+    const parsed = natsLinkAllowListConfig(config);
+    expect(Object.isFrozen(parsed)).toBe(true);
+    expect(parsed).toEqual({ version: 1, link: "v2", natsMachine: "ryzen1-bridge", entries: [
       { ...FILE[0], side: "file" },
       // An entry that omits receive may only receive followUp.
       { ...FILE[1], side: "file", receive: ["followUp"] },
       ...NATS_ALLOW.map((entry) => ({ ...entry, side: "nats" })),
     ] });
-    expect(parseNatsLinkConfig(sample({ allow: { nats: [{ kind: "root", id: KATE, machine: "sandbox1" }] } })).allow.entries)
+    expect(natsLinkAllowListConfig(parseNatsLinkConfig(sample({ allow: { nats: [{ kind: "root", id: KATE, machine: "sandbox1" }] } }))).entries)
       .toEqual([{ kind: "root", id: KATE, machine: "sandbox1", side: "nats", send: ["followUp"], receive: ["followUp"] }]);
     expect(config.orgJson).toBeUndefined();
     expect(parseNatsLinkConfig(sample({ orgJson: "/srv/test-org/org.json" })).orgJson).toBe("/srv/test-org/org.json");
@@ -182,8 +187,8 @@ describe("nats-link config", () => {
     refused(withEntry("nats", 0, { receiveTopics: ["fleet.*.x"] }), "allow.nats[0].receiveTopics");
     refused(withEntry("nats", 0, { receiveTopics: ["*"] }), "allow.nats[0].receiveTopics");
     refused(withEntry("file", 1, { receiveTopics: ["ops.owner"] }), "allow.file[0].receiveTopics");
-    expect(parseNatsLinkConfig(withEntry("nats", 1, { send: [] })).allow.entries[0]!.send).toEqual([]);
-    expect(parseNatsLinkConfig(sample({ allow: undefined })).allow.entries).toEqual([]);
+    expect(natsLinkAllowListConfig(parseNatsLinkConfig(withEntry("nats", 1, { send: [] }))).entries[0]!.send).toEqual([]);
+    expect(natsLinkAllowListConfig(parseNatsLinkConfig(sample({ allow: undefined }))).entries).toEqual([]);
   });
 
   it("describes the config without reading a credential", () => {

@@ -43,16 +43,33 @@ an incomplete read; **2** means usage (help is written to stderr). A receipt is 
 point-in-time observation, not an atomic cross-backend snapshot, a reservation,
 an ownership-transfer fence, or permission to release a host. Routing liveness
 comes from `KvParticipantDirectory`, not a new timestamp comparison. Broker TTL
-and its ordered-watch expiry notifications decide lease presence.
+and the direct gets' current lease rows decide the snapshot's lease presence.
 
 ## Read-only boundary and limits
 
 The reader uses `openNatsConnection(role: "agent")`, then
-`openNatsKv(..., false)` for the existing presence and lease buckets. It uses
-ordered ephemeral KV-watch consumers, but never provisions a stream, bucket,
-inbox/durable consumer, or key. Its transport rejects send/inbox/write operations;
-its lease gate is always false. No publication, renewal or removal is invoked.
-Closing the unregistered directory has no owned rows or cleanup intents.
+`openNatsKv(..., false)` for the existing presence and lease buckets. **No consumer
+is created**, including ephemeral/ordered consumers. It lists subjects with
+`STREAM INFO KV_fabric_presence` filtered to
+`$KV.fabric_presence.*.p.<token(rootId)>`, then uses the existing KV get
+(`STREAM.MSG.GET`, not `DIRECT.GET`) for each listed key. For leases it lists
+`KV_fabric_leases` with `$KV.fabric_leases.*.h.<token(hostId)>` for the root and
+every distinct `ownerHostId` in the presence rows, then gets those keys. Tokens
+are the first 32 hex characters of SHA-256 of the ID. Deleted/purged or expired
+rows returned as missing by get are omitted. Incomplete listings fail closed as
+unknown NATS state/exit 1. Paged listings are conservatively refused: the installed
+SDK merges pages and clears the original count, so this reader cannot verify that
+such a listing is complete. It never accepts that unverifiable partial result.
+
+The listing and gets are a **non-atomic observation**, as the earlier watch
+snapshots were: a row can change or expire between reads. The command does not
+subscribe for later changes or fence a move. In-memory snapshot iterators feed
+`put` events and `ready` to `KvParticipantDirectory`, then wait for its close;
+`owners()` and `resolve()` retain the participant view's validation and liveness
+logic. No broker KV watch runs. The transport rejects send/inbox/write operations;
+its lease gate is always false. It never provisions a stream, bucket or key and
+invokes no publication, renewal or removal. Closing the unregistered directory
+has no owned rows or cleanup intents.
 
 `--mesh` supports the **file and SQLite backends**, selected by the runtime's
 `meshStateSourceOf` reader rule using the moved marker and database metadata,
@@ -67,6 +84,10 @@ before opening. A WAL reader may update SQLite's `-shm` read marks/locks; the
 read-only guarantee covers DB/WAL bytes and durable mesh state, not that
 shared-memory coordination file.
 
+read-only: no DB/WAL writes; SQLite takes shared-memory read locks in state.db-shm
+
+The `-shm` read marks are coordination memory, not durable state.
+
 A missing root/state/database, unknown or NATS backend, malformed state/handoff,
 unreadable participant or invalid lease fails closed. Direct bounded JSON reads,
 read-only SQL and `readHostLeases(..., problems)` avoid `MeshStore` construction,
@@ -78,6 +99,12 @@ not serialized.
 
 The tests compare path, size, mode and nanosecond mtime before/after real-handoff
 readback (excluding only SQLite `-shm`), compare SQLite DB/WAL bytes, require zero
-fake-KV writes/deletes, and exercise this command with a
-real authenticated `FabricRuntimeState` Main and real broker lease expiry.
+fake-KV writes/deletes, explicitly check SQLite DB/WAL nanosecond mtimes, and
+exercise this command with a real authenticated `FabricRuntimeState` Main and
+real broker lease expiry. Both KV streams' consumer counts must stay unchanged
+around every real CLI invocation, including a two-machine ambiguous root whose
+second presence and lease are written with the second machine's credential.
+The real broker also confirms agent `DIRECT.GET` permission denials for both
+buckets; the successful receipt exercises the permitted `STREAM.INFO` and
+`STREAM.MSG.GET` path.
 CLI dispatch/build wiring is maintained by the integration owner.

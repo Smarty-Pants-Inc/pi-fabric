@@ -7,6 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { Bucket } from "@nats-io/kv";
+import type { StreamInfo, StreamInfoRequestOptions } from "@nats-io/jetstream";
+import { PermissionViolationError } from "@nats-io/transport-node";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ownershipReceipt, runNatsOwnerCli, type OwnershipReceipt } from "../src/mesh/nats-auth/owner-cli.js";
@@ -20,6 +22,8 @@ import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
 import { openNatsConnection } from "../src/transport/nats/connection.js";
+import * as natsConnection from "../src/transport/nats/connection.js";
+import * as natsKv from "../src/transport/nats/kv.js";
 import { LEASES_BUCKET, PRESENCE_BUCKET, NatsKvStore, openNatsKv } from "../src/transport/nats/kv.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { createPathBHarness, PATH_B_MACHINES, PATH_B_PERMISSION_POLICY, PATH_B_POLICY_ENV, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
@@ -198,6 +202,7 @@ describe("file-side handoff readback without opening MeshStore", () => {
       const db = path.join(sqliteRoot, "state.db"), wal = `${db}-wal`;
       expect(fs.statSync(wal).size).toBeGreaterThan(0);
       const beforeDb = fs.readFileSync(db), beforeWal = fs.readFileSync(wal);
+      const beforeDbMtime = fs.statSync(db, { bigint: true }).mtimeNs, beforeWalMtime = fs.statSync(wal, { bigint: true }).mtimeNs;
       // SQLite WAL readers may update read marks/locks in -shm by design. Exclude ONLY
       // that shared-memory file; DB/WAL, census, directories and all other files stay exact.
       const snapshotWithoutShm = () => treeSnapshot(sqliteRoot).filter(row => row.path !== "state.db-shm");
@@ -206,6 +211,8 @@ describe("file-side handoff readback without opening MeshStore", () => {
       expect(sqliteResult).toEqual({ ...fileResult, receipt: { ...fileResult.receipt,
         file: { ...fileResult.receipt.file, meshRoot: sqliteRoot } } });
       expect(fs.readFileSync(db)).toEqual(beforeDb); expect(fs.readFileSync(wal)).toEqual(beforeWal);
+      expect(fs.statSync(db, { bigint: true }).mtimeNs).toBe(beforeDbMtime);
+      expect(fs.statSync(wal, { bigint: true }).mtimeNs).toBe(beforeWalMtime);
       expect(snapshotWithoutShm()).toEqual(beforeTree); await f.assertNoWrites();
     } finally { store.closeState(); }
   });
@@ -319,7 +326,116 @@ async function cli(args: string[]) {
   const lines = stdout.trim().split("\n").filter(Boolean);
   return { code, stdout, stderr, lines, receipt: lines.length ? JSON.parse(lines[0]!) as OwnershipReceipt : undefined };
 }
+/** CLI-level seam: real command/view, only the authenticated connection and broker KV are fake. */
+function cliFixture() {
+  for (const [name, value] of Object.entries(PATH_B_POLICY_ENV)) vi.stubEnv(name, value);
+  vi.stubEnv("PI_FABRIC_MESH_NATS", undefined);
+  const presence = new RecordOnlyKv(600_000), leases = new RecordOnlyKv(15_000);
+  const list = async (stream: string, request?: Partial<StreamInfoRequestOptions>): Promise<StreamInfo> => {
+    const bucket = stream.slice(3), kv = bucket === PRESENCE_BUCKET ? presence : leases;
+    const filter = request?.subjects_filter?.split(".") ?? [];
+    const subjects = Object.fromEntries([...kv.rows.keys()].map(entryKey => `$KV.${bucket}.${entryKey}`).filter(subject => {
+      const tokens = subject.split(".");
+      return tokens.length === filter.length && tokens.every((token, index) => filter[index] === "*" || filter[index] === token);
+    }).map(subject => [subject, 1]));
+    return { total: Object.keys(subjects).length, offset: 0, limit: 100_000,
+      state: { subjects, num_subjects: kv.rows.size } } as StreamInfo;
+  };
+  const info = vi.fn(list), close = vi.fn(async () => {});
+  vi.spyOn(natsConnection, "openNatsConnection").mockResolvedValue({ manager: { streams: { info } }, close,
+    isVerified: () => true } as unknown as Awaited<ReturnType<typeof openNatsConnection>>);
+  vi.spyOn(natsKv, "openNatsKv").mockImplementation(async (_js, policy) =>
+    (policy.bucket === PRESENCE_BUCKET ? presence : leases) as unknown as NatsKvStore);
+  const presenceWatch = vi.spyOn(presence, "watch").mockImplementation(() => { throw new Error("broker watch forbidden"); });
+  const leasesWatch = vi.spyOn(leases, "watch").mockImplementation(() => { throw new Error("broker watch forbidden"); });
+  const presenceGet = vi.spyOn(presence, "get"), leasesGet = vi.spyOn(leases, "get");
+  function seed(machine = MACHINE, ownerHostId = ROOT, live = true) {
+    const incarnation = machine === MACHINE ? INCARNATION : "other-incarnation";
+    presence.seed(key(machine, "p"), `${ownerHostId}#${incarnation}`, { ...participant(incarnation), ownerHostId, ownerIdentityId: ownerHostId });
+    if (live) leases.seed(key(machine, "h", ownerHostId), `${ownerHostId}#${incarnation}`,
+      { ...hostLease(incarnation), id: ownerHostId, identityId: ownerHostId });
+  }
+  function assertReadOnly() {
+    expect(presenceWatch).not.toHaveBeenCalled(); expect(leasesWatch).not.toHaveBeenCalled();
+    expect(presence.mutations).toEqual([]); expect(leases.mutations).toEqual([]);
+    expect(presence.deletes).toEqual([]); expect(leases.deletes).toEqual([]);
+    expect(close).toHaveBeenCalledOnce();
+  }
+  return { presence, leases, info, list, presenceGet, leasesGet, seed, assertReadOnly };
+}
+
+describe("owner CLI consumer-free snapshots", () => {
+  it("lists only this root, directly gets its rows, and reuses the view without broker watches", async () => {
+    const f = cliFixture(); f.seed();
+    // A whole-stream num_subjects is NOT the count matching this root's filter.
+    f.presence.seed(key(MACHINE, "p", "another-root"), "unrelated-owner", {});
+    f.leases.seed(key(MACHINE, "h", "another-host"), "unrelated-owner", {});
+    const result = await cli(validArgs);
+    expect(result, result.stdout).toMatchObject({ code: 0, receipt: { verdict: "owned", owner: { machine: MACHINE,
+      hostId: ROOT, incarnation: INCARNATION, presenceRevision: 1, lease: { revision: 1 } } } });
+    expect(f.info.mock.calls).toEqual([
+      [`KV_${PRESENCE_BUCKET}`, { subjects_filter: `$KV.${PRESENCE_BUCKET}.*.p.${hash(ROOT).slice(0, 32)}`, offset: 0 }],
+      [`KV_${LEASES_BUCKET}`, { subjects_filter: `$KV.${LEASES_BUCKET}.*.h.${hash(ROOT).slice(0, 32)}`, offset: 0 }],
+    ]);
+    expect(f.presenceGet.mock.calls.map(call => call[0])).toEqual([key(MACHINE, "p")]);
+    expect(f.leasesGet.mock.calls.map(call => call[0])).toEqual([key(MACHINE, "h")]);
+    f.assertReadOnly();
+  });
+  it("lists each distinct owner host as well as the root and reports both machines", async () => {
+    const f = cliFixture(), otherHost = "host:machine-b";
+    f.seed(); f.seed("machine-b", otherHost);
+    const result = await cli(validArgs);
+    expect(result, result.stdout).toMatchObject({ code: 1, receipt: { verdict: "ambiguous", owner: null,
+      nats: { rows: [{ machine: MACHINE, live: true }, { machine: "machine-b", live: true, ownerHostId: otherHost,
+        lease: { revision: 2, incarnation: "other-incarnation" } }] } } });
+    expect(f.info.mock.calls.map(call => call[1]?.subjects_filter)).toEqual([
+      `$KV.${PRESENCE_BUCKET}.*.p.${hash(ROOT).slice(0, 32)}`,
+      `$KV.${LEASES_BUCKET}.*.h.${hash(ROOT).slice(0, 32)}`,
+      `$KV.${LEASES_BUCKET}.*.h.${hash(otherHost).slice(0, 32)}`,
+    ]);
+    f.assertReadOnly();
+  });
+  it.each(["empty", "deleted/purged", "missing lease"])("treats a complete %s snapshot as absence/staleness, not unknown", async state => {
+    const f = cliFixture();
+    if (state !== "empty") f.seed(MACHINE, ROOT, state !== "missing lease");
+    if (state === "deleted/purged") f.presenceGet.mockResolvedValueOnce(undefined);
+    const result = await cli(validArgs);
+    expect(result).toMatchObject({ code: 1, receipt: { verdict: state === "missing lease" ? "stale" : "absent", owner: null } });
+    expect(result.receipt?.unknown).toBeUndefined();
+    f.assertReadOnly();
+  });
+  it.each(["truncated", "missing subjects", "offset", "SDK-hidden paging", "missing counts", "invalid subject", "lease listing", "listing failure", "get failure"])(
+    "fails closed on %s instead of emitting a partial owner receipt", async fault => {
+      const f = cliFixture(); f.seed();
+      if (fault === "listing failure") f.info.mockRejectedValueOnce(new Error("do-not-print-broker-detail"));
+      else if (fault === "get failure") f.presenceGet.mockRejectedValueOnce(new Error("do-not-print-broker-detail"));
+      else if (fault === "lease listing") {
+        f.info.mockImplementationOnce(f.list).mockImplementationOnce(async (stream, request) =>
+          ({ ...await f.list(stream, request), total: 2 }));
+      } else f.info.mockImplementationOnce(async (stream, request) => {
+        const info = await f.list(stream, request);
+        if (fault === "truncated") info.total = 2;
+        if (fault === "missing subjects") delete info.state.subjects;
+        if (fault === "offset") info.offset = 1;
+        if (fault === "SDK-hidden paging") { request!.offset = 100_000; info.total = 0; info.limit = 0; }
+        if (fault === "missing counts") { delete (info as Partial<StreamInfo>).total; delete info.state.num_subjects; }
+        if (fault === "invalid subject") info.state.subjects = { [`$KV.${PRESENCE_BUCKET}.${MACHINE}.p.wrong`]: 1 };
+        return info;
+      });
+      const result = await cli(validArgs);
+      expect(result).toMatchObject({ code: 1, receipt: { verdict: "stale", owner: null, nats: { rows: [] }, unknown: ["connection", "nats"] } });
+      expect(result.stdout).not.toContain("do-not-print-broker-detail");
+      f.assertReadOnly();
+    });
+});
+
 describe("owner CLI input and failure output", () => {
+  it("discloses SQLite shared-memory coordination in --help", async () => {
+    const result = await cli(["--help"]);
+    expect(result).toMatchObject({ code: 2, stdout: "" });
+    expect(result.stderr).toContain("read-only: no DB/WAL writes; SQLite takes shared-memory read locks in state.db-shm");
+    expect(result.stderr).toContain("SQLite -shm read marks are coordination memory, not durable state.");
+  });
   it.each([
     [], [...validArgs, "--machine", "machine-b"], [...validArgs, "--unexpected", "x"],
     validArgs.map(value => value === SESSION ? "not-a-uuid" : value),
@@ -394,8 +510,29 @@ async function leaseGone(kv: TransportKv, leaseKey: string): Promise<void> {
   } finally { stop.abort(); }
 }
 
+async function expectDirectGetDenied(connection: Awaited<ReturnType<typeof openNatsConnection>>, bucket: string): Promise<void> {
+  const subject = `$JS.API.DIRECT.GET.KV_${bucket}`, denied = deferred();
+  const observed: { violation?: PermissionViolationError } = {};
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stop = connection.onStatus(status => {
+    if (status.type === "error" && status.error instanceof PermissionViolationError && status.error.subject === subject) {
+      observed.violation = status.error; denied.resolve();
+    }
+  });
+  try {
+    connection.nc.publish(subject, JSON.stringify({ last_by_subj: `$KV.${bucket}.${key(MACHINE, bucket === PRESENCE_BUCKET ? "p" : "h")}` }));
+    await connection.nc.flush();
+    // The broker permission event is the oracle; a timeout/API error is NOT denial.
+    await Promise.race([denied.promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`no broker permission denial for ${subject}`)), 2_000);
+    })]);
+    expect(observed.violation).toBeInstanceOf(PermissionViolationError);
+    expect(observed.violation?.operation).toBe("publish");
+  } finally { stop(); if (timer) clearTimeout(timer); }
+}
+
 describe.skipIf(!binary || process.platform !== "linux")("owner CLI with a real authenticated NATS Main", () => {
-  it("reads the broker owner/lease exactly, adds no KV keys, and refuses owned after the Main stops", async () => {
+  it("reads exact owners without consumers or KV changes, detects two machines, and refuses owned after stop", async () => {
     // Prevent product deletion paths, including accidental duplicate adapters, from deleting real keys.
     const deletes: string[] = [];
     vi.spyOn(Bucket.prototype, "delete").mockImplementation(async () => { throw new Error("broker deletes forbidden"); });
@@ -414,6 +551,8 @@ describe.skipIf(!binary || process.platform !== "linux")("owner CLI with a real 
       vi.stubEnv("PI_FABRIC_MESH_NATS", undefined);
       await owner.runtime.initialize(owner.context, configFor(root, broker));
       inspector = await openNatsConnection({ ...broker.runtimeOptions(broker.users.machineB), role: "agent" });
+      await expectDirectGetDenied(inspector, PRESENCE_BUCKET);
+      await expectDirectGetDenied(inspector, LEASES_BUCKET);
       const presence = await openNatsKv(inspector.js, { bucket: PRESENCE_BUCKET }, false, inspector.onStatus);
       const leases = await openNatsKv(inspector.js, { bucket: LEASES_BUCKET }, false, inspector.onStatus);
       const pkey = key(MACHINE, "p", id), hkey = key(MACHINE, "h", id);
@@ -423,8 +562,18 @@ describe.skipIf(!binary || process.platform !== "linux")("owner CLI with a real 
       const args = ["--session", id, "--creds", broker.users.machineA.credsPath, "--ca", broker.tls!.caFile,
         "--servers", `tls://localhost:${new URL(broker.serverUrl).port}`, "--machine", MACHINE, "--org", "tristar",
         "--path-b-machines", PATH_B_MACHINES.join(","), "--timeout-ms", "5000", "--no-mesh"];
+      const consumerCounts = async () => ({
+        presence: (await inspector!.manager.streams.info(`KV_${PRESENCE_BUCKET}`)).state.consumer_count,
+        leases: (await inspector!.manager.streams.info(`KV_${LEASES_BUCKET}`)).state.consumer_count,
+      });
+      const readWithoutConsumers = async (readArgs: string[]) => {
+        const before = await consumerCounts();
+        const result = await cli(readArgs);
+        expect(await consumerCounts(), "owner receipt must not create consumers in either KV stream").toEqual(before);
+        return result;
+      };
       const beforeDeletes = deletes.length;
-      const result = await cli(args);
+      const result = await readWithoutConsumers(args);
       expect(result, result.stdout).toMatchObject({ code: 0, stderr: "", receipt: { verdict: "owned", rootId: id, sessionId,
         owner: { machine: MACHINE, hostId: (brokerPresence.value as FabricParticipantRecord).ownerHostId,
           identityId: (brokerPresence.value as FabricParticipantRecord).ownerIdentityId,
@@ -439,21 +588,40 @@ describe.skipIf(!binary || process.platform !== "linux")("owner CLI with a real 
       const mesh = tempRoot(), stateFile = path.join(mesh, "state.json");
       fs.writeFileSync(stateFile, JSON.stringify({ format: 1, entries: {} }));
       const fileArgs = [...args.filter(value => value !== "--no-mesh").map(value => value === id ? sessionId : value), "--mesh", mesh];
-      const fileBefore = treeSnapshot(mesh), withFile = await cli(fileArgs);
+      const fileBefore = treeSnapshot(mesh), withFile = await readWithoutConsumers(fileArgs);
       expect(withFile).toMatchObject({ code: 0, receipt: { verdict: "owned", file: { meshRoot: mesh, handoff: null, mirror: null } } });
       expect(treeSnapshot(mesh)).toEqual(fileBefore);
       fs.writeFileSync(stateFile, "{}");
-      const corruptBefore = treeSnapshot(mesh), corrupt = await cli(fileArgs);
+      const corruptBefore = treeSnapshot(mesh), corrupt = await readWithoutConsumers(fileArgs);
       expect(corrupt).toMatchObject({ code: 1, receipt: { verdict: "owned", unknown: ["file"], file: null } });
       expect(treeSnapshot(mesh)).toEqual(corruptBefore);
       expect(deletes).toHaveLength(beforeDeletes);
       expect([...(await snapshot(presence)).keys()].sort()).toEqual([...beforeP.keys()].sort());
       expect([...(await snapshot(leases)).keys()].sort()).toEqual([...beforeL.keys()].sort());
-      const stopped = leaseGone(leases, hkey);
+      // A second authenticated machine can still leave contradictory broker evidence.
+      // The receipt must list both rows, including a non-root ownerHostId's lease.
+      const secondHost = `host:machine-b:${sessionId}`, secondIncarnation = "machine-b-incarnation";
+      const secondPresence = { ...brokerPresence.value as FabricParticipantRecord,
+        ownerHostId: secondHost, ownerIdentityId: secondHost, ownerIncarnation: secondIncarnation };
+      const secondLease = { ...brokerLease.value as FabricKvHostLease,
+        id: secondHost, identityId: secondHost, incarnation: secondIncarnation };
+      const secondHkey = key("machine-b", "h", secondHost), secondOwner = `${secondHost}#${secondIncarnation}`;
+      const secondLeaseRevision = await leases.withMachine("machine-b").put(secondHkey, secondOwner, secondLease, 0);
+      const secondRevision = await presence.withMachine("machine-b").put(key("machine-b", "p", id), secondOwner, secondPresence, 0);
+      const ambiguousP = await snapshot(presence), ambiguousL = await snapshot(leases);
+      const ambiguous = await readWithoutConsumers(args);
+      expect(ambiguous, ambiguous.stdout).toMatchObject({ code: 1, receipt: { verdict: "ambiguous", owner: null,
+        nats: { rows: [{ machine: MACHINE, live: true }, { machine: "machine-b", live: true, ownerHostId: secondHost,
+          presenceRevision: secondRevision, lease: { revision: secondLeaseRevision, incarnation: secondIncarnation } }] } } });
+      expect(ambiguous.receipt?.unknown).toBeUndefined();
+      expect(deletes).toHaveLength(beforeDeletes);
+      expect([...(await snapshot(presence)).keys()].sort()).toEqual([...ambiguousP.keys()].sort());
+      expect([...(await snapshot(leases)).keys()].sort()).toEqual([...ambiguousL.keys()].sort());
+      const stopped = Promise.all([leaseGone(leases, hkey), leaseGone(leases, secondHkey)]);
       await owner.runtime.shutdown("exit");
       await stopped;
       const stoppedP = await snapshot(presence), stoppedL = await snapshot(leases);
-      const after = await cli(args);
+      const after = await readWithoutConsumers(args);
       expect(after.code).toBe(1); expect(after.receipt?.verdict).not.toBe("owned"); expect(after.receipt?.unknown).toBeUndefined();
       expect([...(await snapshot(presence)).keys()].sort()).toEqual([...stoppedP.keys()].sort());
       expect([...(await snapshot(leases)).keys()].sort()).toEqual([...stoppedL.keys()].sort());

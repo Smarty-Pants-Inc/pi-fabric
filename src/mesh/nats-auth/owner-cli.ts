@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { openNatsConnection, type NatsConnectionHandle } from "../../transport/nats/connection.js";
 import { LEASES_BUCKET, PRESENCE_BUCKET, openNatsKv } from "../../transport/nats/kv.js";
-import type { FabricTransport, TransportKv } from "../../transport/types.js";
+import type { FabricTransport, TransportKv, TransportKvEntry, TransportKvEvent } from "../../transport/types.js";
 import { KvParticipantDirectory, type ParticipantOwnerRecord } from "../../topology/participant-view.js";
 import { readHostLeases } from "../../topology/host-leases.js";
 import { ROOT_ID_PREFIX } from "../../topology/root-inbox.js";
@@ -19,6 +19,8 @@ const USAGE = [
   "  --machine <machine> (--mesh <absolute-mesh-root> | --no-mesh) [--org <org>] [--path-b-machines <csv>] [--timeout-ms <ms>]",
   "Policy comes from PI_FABRIC_MESH_NATS or PI_FABRIC_NATS_CUSTODY_STREAM, PI_FABRIC_NATS_LIVENESS_STREAM, PI_FABRIC_NATS_MACHINES.",
   "Read-only JSON receipt; exit 0 only for an owned session and every requested source read; 1 unknown/not owned; 2 usage.",
+  "read-only: no DB/WAL writes; SQLite takes shared-memory read locks in state.db-shm",
+  "SQLite -shm read marks are coordination memory, not durable state.",
 ].join("\n");
 const MAX_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const HOST_PREFIX = "topology/hosts/", PARTICIPANT_PREFIX = "topology/participants/";
@@ -295,8 +297,60 @@ export async function ownershipReceipt(view: OwnershipView, rootId: string, opti
 }
 
 const noWrites = (): never => { throw new Error("Ownership reader is read-only"); };
-function readOnlyKv(kv: TransportKv): TransportKv {
-  return { ttlMs: kv.ttlMs, get: kv.get.bind(kv), watch: kv.watch.bind(kv), put: async () => noWrites(), delete: async () => noWrites() };
+const tokenFor = (id: string): string => createHash("sha256").update(id).digest("hex").slice(0, 32);
+
+/** STREAM INFO is a read, unlike a KV watch (which creates a JetStream consumer). */
+async function snapshotEntries(connection: NatsConnectionHandle, kv: TransportKv, bucket: string,
+  kind: "p" | "h", id: string, signal: AbortSignal): Promise<TransportKvEntry<unknown>[]> {
+  signal.throwIfAborted();
+  const prefix = `$KV.${bucket}.`, suffix = `.${kind}.${tokenFor(id)}`;
+  const request = { subjects_filter: `${prefix}*${suffix}`, offset: 0 };
+  const info = await connection.manager.streams.info(`KV_${bucket}`, request);
+  signal.throwIfAborted();
+  const subjects = Object.entries(info.state.subjects ?? {});
+  // num_subjects counts the WHOLE stream, not just this filter. The filtered count
+  // is total. The SDK auto-pages and clears its response paging metadata; it also
+  // mutates request.offset. Refuse that case rather than trusting a merged result
+  // whose original total was lost (including an early/short page during churn).
+  const count = info.total ?? info.state.num_subjects;
+  if (request.offset !== 0 || (info.offset !== undefined && info.offset !== 0) ||
+    !Number.isSafeInteger(count) || count !== subjects.length ||
+    (info.state.num_subjects !== undefined && (!Number.isSafeInteger(info.state.num_subjects) || info.state.num_subjects < subjects.length))) {
+    throw new Error("Incomplete ownership subject listing");
+  }
+  const entries: TransportKvEntry<unknown>[] = [];
+  for (const [subject, messages] of subjects) {
+    const entryKey = subject.slice(prefix.length), parts = entryKey.split(".");
+    if (!subject.startsWith(prefix) || parts.length !== 3 || !/^[a-z0-9][a-z0-9-]{0,31}$/.test(parts[0]!) ||
+      !subject.endsWith(suffix) || !Number.isSafeInteger(messages) || messages < 1) throw new Error("Invalid ownership subject listing");
+    const entry = await kv.get(entryKey, signal);
+    // A listed row can expire or become a deleted/purged marker before its get.
+    if (entry) entries.push(entry);
+  }
+  return entries;
+}
+
+/** Only an in-memory snapshot drives the view. No broker watch/consumer is opened. */
+function snapshotKv(kv: TransportKv, entries: readonly TransportKvEntry<unknown>[]): TransportKv {
+  return { ttlMs: kv.ttlMs, get: kv.get.bind(kv), put: async () => noWrites(), delete: async () => noWrites(),
+    async *watch<V>(_prefix: string, signal: AbortSignal): AsyncIterable<TransportKvEvent<V>> {
+      if (signal.aborted) return;
+      for (const entry of entries) {
+        if (signal.aborted) return;
+        yield { type: "put", entry: entry as TransportKvEntry<V> };
+      }
+      if (signal.aborted) return;
+      yield { type: "ready" };
+      // Ending a watch invalidates the directory. Stay ready until its close aborts.
+      let done: (() => void) | undefined;
+      try {
+        await new Promise<void>(resolve => {
+          done = () => resolve();
+          signal.addEventListener("abort", done, { once: true });
+          if (signal.aborted) resolve();
+        });
+      } finally { if (done) signal.removeEventListener("abort", done); }
+    } };
 }
 export async function runNatsOwnerCli(argv: string[], io: { out?: (text: string) => void; err?: (text: string) => void } = {}): Promise<number> {
   const out = io.out ?? (value => { process.stdout.write(value); });
@@ -322,16 +376,24 @@ export async function runNatsOwnerCli(argv: string[], io: { out?: (text: string)
       pathBMachines: options.pathBMachines ?? policy.pathBMachines, ...(options.org === undefined ? {} : { org: options.org }),
       name: "pi-fabric nats owner (read-only)", timeoutMs: options.timeoutMs, signal });
     stage = "presence bucket";
-    const presence = readOnlyKv(await openNatsKv(connection.js, { bucket: PRESENCE_BUCKET }, false, connection.onStatus));
+    const presence = await openNatsKv(connection.js, { bucket: PRESENCE_BUCKET }, false, connection.onStatus);
     stage = "leases bucket";
-    const leases = readOnlyKv(await openNatsKv(connection.js, { bucket: LEASES_BUCKET }, false, connection.onStatus));
+    const leases = await openNatsKv(connection.js, { bucket: LEASES_BUCKET }, false, connection.onStatus);
+    stage = "presence listing";
+    const presenceEntries = await snapshotEntries(connection, presence, PRESENCE_BUCKET, "p", options.rootId, signal);
+    const hostIds = new Set([options.rootId]);
+    for (const { value } of presenceEntries) if (object(value) && text(value.ownerHostId)) hostIds.add(value.ownerHostId);
+    stage = "leases listing";
+    const leaseEntries: TransportKvEntry<unknown>[] = [];
+    for (const hostId of hostIds) leaseEntries.push(...await snapshotEntries(connection, leases, LEASES_BUCKET, "h", hostId, signal));
+    const presenceSnapshot = snapshotKv(presence, presenceEntries), leasesSnapshot = snapshotKv(leases, leaseEntries);
     stage = "participant view";
     signal.throwIfAborted();
     // An unrelated reader host avoids the directory's special local-owner monotonic lease gate,
     // including when --machine equals the real owner's machine. This reader never owns a lease.
     const readerId = `owner-reader:${randomUUID()}`;
     const transport: FabricTransport = { kind: "nats", self: { machine: options.machine, hostId: readerId },
-      kv: bucket => bucket === "presence" ? presence : leases, send: async () => noWrites(),
+      kv: bucket => bucket === "presence" ? presenceSnapshot : leasesSnapshot, send: async () => noWrites(),
       async *inbox() { noWrites(); }, drainState: async () => noWrites(), close: async () => {} };
     view = new KvParticipantDirectory({ transport, lease: { live: () => false, signal }, identityId: readerId,
       ownerIncarnation: readerId, rootId: options.rootId, operationTimeoutMs: Math.min(options.timeoutMs, 30_000) });
@@ -346,8 +408,8 @@ export async function runNatsOwnerCli(argv: string[], io: { out?: (text: string)
     receipt.error = `Ownership read failed at ${stage}`;
     outcome = { receipt, exitCode: 1 };
   } finally {
-    // No publications were ever admitted: close joins the watches; its owned/cleanup maps are empty.
-    try { await view?.close(); } catch { /* Connection close below still ends subscriptions. */ }
+    // No publications were ever admitted: close joins only in-memory snapshot iterators.
+    try { await view?.close(); } catch { /* Connection close below still releases the reader. */ }
     try { await connection?.close(); } catch { /* No data writes or custody to release. */ }
   }
   out(`${JSON.stringify(outcome.receipt)}\n`);

@@ -9,7 +9,7 @@ import { createNatsFileLink, type NatsCarrierSide } from "./bridge-nats-file.js"
 import {
   createBridgeNatsIdentityGate, loadBridgeNatsSeatPins, parseBridgeNatsAllowSection, type BridgeNatsSeatPins,
 } from "./bridge-nats-identity.js";
-import { bridgeNatsClaimAction, openBridgeNatsLedger } from "./bridge-nats-ledger.js";
+import { bridgeNatsClaimAction, openBridgeNatsLedger, type FileBridgeNatsLedger } from "./bridge-nats-ledger.js";
 import { openNatsBridgeSide, type NatsBridgeSideConfig } from "./bridge-nats-port.js";
 import type { NatsTopicAuthorize } from "./bridge-nats-topics.js";
 import {
@@ -183,6 +183,12 @@ export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsC
     async lookup(direction, id) {
       const stored = ledger.lookup(direction, id);
       return stored ? record(stored) : undefined;
+    },
+    async projectNativeIngress(input) {
+      // The actual startNatsLink owns this ledger and pins `link` in this closure. Neither paths
+      // nor pins come from an event body. Legacy/injected ledgers have no receipt-minting power.
+      const projection = ledger as BridgeNatsLedger & Partial<Pick<FileBridgeNatsLedger, "projectNativeIngress">>;
+      await projection.projectNativeIngress?.(input.destinationCommandId, link);
     },
     async settle(direction, id, outcome) {
       const stored = ledger.lookup(direction, id);

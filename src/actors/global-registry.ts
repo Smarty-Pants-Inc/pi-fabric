@@ -60,8 +60,25 @@ const TRANSPORTS = new Set<FabricAgentTransport>([
 
 interface RegistryFile {
   format: 1;
-  actors: GlobalActorDefinition[];
+  actors: object[];
 }
+
+interface LoadedRegistry {
+  actors: Map<string, GlobalActorDefinition>;
+  quarantined: object[];
+}
+
+// Presence, not validity: even an own execution: undefined must never be stripped
+// by model-template reconstruction. No native execution variant is importable here.
+const hasExecutionMarker = (value: object): boolean =>
+  Object.prototype.hasOwnProperty.call(value, "execution") ||
+  (value as { runner?: unknown }).runner === "native";
+
+const assertModelTemplate = (value: object): void => {
+  if (hasExecutionMarker(value)) {
+    throw new Error("Global actor templates do not support execution markers or the native runner");
+  }
+};
 
 const atomicWrite = (filePath: string, value: unknown): void => {
   writeJsonAtomic(filePath, value, { space: 2 });
@@ -107,12 +124,15 @@ const resolveDefinition = (
  */
 // One warning per template and reason per process, however often the registry is reread.
 const warnedFilters = new Set<string>();
+let warnedExecution = false;
 
 export class GlobalActorRegistry {
   readonly #actors = new Map<string, GlobalActorDefinition>();
   readonly #path: string;
   readonly #maxBytes: number;
   #fingerprint: string | undefined;
+  // Opaque non-model rows stay unavailable, but unrelated writes retain every field.
+  #quarantined: object[] = [];
   // Templates whose stored activationFilter cannot be read, with the reason (smarty-dev#1579).
   // The stored value is kept byte for byte and written back; it is only not applied.
   readonly #invalidFilters = new Map<string, string>();
@@ -169,6 +189,7 @@ export class GlobalActorRegistry {
    * definition.
    */
   create(def: FabricActorRequest, overwrite = false): GlobalActorDefinition {
+    assertModelTemplate(def);
     this.#refresh(true);
     const validated = this.#validate(def);
     const existing = [...this.#actors.values()].find((actor) => actor.name === validated.name);
@@ -211,6 +232,7 @@ export class GlobalActorRegistry {
       activationFilter?: FabricActorActivationFilter | null;
     },
   ): GlobalActorDefinition {
+    assertModelTemplate(patch);
     this.#refresh(true);
     const existing = resolveDefinition(this.#actors, idOrName);
     if (!existing) throw new Error(`Unknown global actor: ${idOrName}`);
@@ -330,6 +352,7 @@ export class GlobalActorRegistry {
    * avoid a collision with a live actor).
    */
   toRequest(def: GlobalActorDefinition, as?: string): FabricActorRequest {
+    assertModelTemplate(def);
     const name = as?.trim() || def.name;
     const request: FabricActorRequest = {
       name,
@@ -492,7 +515,7 @@ export class GlobalActorRegistry {
   #refresh(forWrite = false): void {
     const fingerprint = this.#stat();
     if (fingerprint !== undefined && fingerprint === this.#fingerprint) return;
-    let loaded: Map<string, GlobalActorDefinition>;
+    let loaded: LoadedRegistry;
     try {
       loaded = this.#load();
     } catch (error) {
@@ -504,7 +527,8 @@ export class GlobalActorRegistry {
     }
     this.#actors.clear();
     this.#invalidFilters.clear();
-    for (const [id, def] of loaded) {
+    this.#quarantined = loaded.quarantined;
+    for (const [id, def] of loaded.actors) {
       this.#actors.set(id, def);
       this.#noteFilter(def);
     }
@@ -513,13 +537,14 @@ export class GlobalActorRegistry {
 
   // The registry file's templates. A missing file is an empty registry; an unreadable or
   // malformed one throws (smarty-dev#918: treating it as empty let a later write erase it).
-  #load(): Map<string, GlobalActorDefinition> {
+  #load(): LoadedRegistry {
     const actors = new Map<string, GlobalActorDefinition>();
+    const loaded: LoadedRegistry = { actors, quarantined: [] };
     let parsed: unknown;
     try {
       parsed = JSON.parse(fs.readFileSync(this.#path, "utf8"));
     } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT") return actors;
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return loaded;
       throw error;
     }
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -529,6 +554,19 @@ export class GlobalActorRegistry {
     if (!Array.isArray(records)) throw new Error("the global actor registry has no actors list");
     for (const value of records) {
       if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+      // Check before even the legacy required fields: native sentinels deliberately
+      // have instructions: null, and unknown variants may have other unreadable fields.
+      if (hasExecutionMarker(value)) {
+        loaded.quarantined.push(value);
+        if (!warnedExecution) {
+          warnedExecution = true;
+          process.emitWarning(
+            "Global actor templates with execution markers or the native runner are quarantined; they are kept but unavailable for import",
+            { code: "PI_FABRIC_ACTOR_EXECUTION" },
+          );
+        }
+        continue;
+      }
       const record = value as Partial<GlobalActorDefinition>;
       if (
         typeof record.id !== "string" ||
@@ -636,11 +674,11 @@ export class GlobalActorRegistry {
       };
       actors.set(def.id, def);
     }
-    return actors;
+    return loaded;
   }
 
   #save(): void {
-    const file: RegistryFile = { format: 1, actors: [...this.#actors.values()] };
+    const file: RegistryFile = { format: 1, actors: [...this.#actors.values(), ...this.#quarantined] };
     atomicWrite(this.#path, file);
     // Not stat'ed here: another session may already have replaced the file, and binding its
     // identity to this copy would hide that change (review/astra F1 on #77). The next call

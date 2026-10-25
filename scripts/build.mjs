@@ -23,6 +23,8 @@ const primaryEntryPoints = [
   "src/agents/worker-protocol.ts",
   // Runner adapter registration; never reachable from the extension entry.
   "src/runners.ts",
+  // Host-only native actor registration; no extension-entry or guest edge.
+  "src/native-actors.ts",
   // Opt-in durable Pi adapter; never reachable from the extension entry.
   "src/durable.ts",
   "src/jev.ts",

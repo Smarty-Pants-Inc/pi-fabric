@@ -197,8 +197,7 @@ describe("startNatsLink composition with L3's allow gate", () => {
     (await meshRoot(root)).closeState();
     stores.pop();
     const config: NatsLinkConfig = { version: 1, name: "ryzen1", link: LINK, file: { mesh: path.join(root, "hub"), lockProtocol: 1 },
-      stateDir: path.join(root, "state"), allow: parseBridgeNatsAllowSection(ALLOW, { link: LINK, natsMachine: BRIDGE_MACHINE }),
-      callTimeoutMs: 30_000, logLevel: "info",
+      stateDir: path.join(root, "state"), allow: ALLOW, callTimeoutMs: 30_000, logLevel: "info",
       nats: { servers: ["tls://nats.invalid:4222"], machine: BRIDGE_MACHINE, credentials: path.join(root, "user.creds"),
         caFile: path.join(root, "ca.pem"), custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS",
         pathBMachines: [BRIDGE_MACHINE, POD_MACHINE], operatorMachine: "fabric-ops", events: false, inboxLanes: 8 } };

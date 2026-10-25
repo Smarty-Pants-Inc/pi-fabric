@@ -240,11 +240,12 @@ describe("nats-link CLI", () => {
     }
   });
 
-  it("start without a link module in this build fails by name", async () => {
+  it("start loads the real link module and fails closed on unusable credentials", async () => {
     const { config } = await setup();
-    const missing = await run(["start", "--config", config], { signal: new AbortController().signal });
-    expect(missing.code).toBe(1);
-    expect(missing.err).toMatch(/no NATS link module|startNatsLink/);
+    // The fixture's user.creds holds no JWT: the link (bridge-nats-link -> L1's port) refuses before any connection.
+    const refused = await run(["start", "--config", config], { signal: new AbortController().signal });
+    expect(refused.code).toBe(1);
+    expect(refused.err).toMatch(/NATS credentials/);
   });
 
   it("start refuses, before anything opens, an allow-list that contradicts org.json's principal seats", async () => {

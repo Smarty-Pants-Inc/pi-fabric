@@ -547,10 +547,10 @@ export interface BridgeNatsClaimInput extends BridgeNatsCommandMapping {
   readonly ownerHostId: string;
   readonly ownerIdentityId: string;
   readonly ownerIncarnation?: string;
-  /** toNats: the target's NATS machine. */
+  /** toNats: the target's NATS machine (required toward NATS; the owner's ACK must come from it). */
   readonly targetMachine?: string;
   readonly deadlineAt: number;
-  /** toNats: the exact body to (re)send. */
+  /** toNats: the exact body to (re)send (required toward NATS; a resend uses these bytes). */
   readonly resolvedBody?: Record<string, unknown>;
 }
 

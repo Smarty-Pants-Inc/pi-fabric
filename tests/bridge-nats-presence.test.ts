@@ -12,6 +12,7 @@ import { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import type { TransportHostLeaseProcessProof } from "../src/topology/host-leases.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import { advance, hKey, kvWorld as world, natsLease, pKey, seedNative, type Clock } from "./helpers/bridge-nats-kv.js";
+import { TransportDeniedError, type FabricTransport } from "../src/transport/types.js";
 
 const BRIDGE = "ryzen1-bridge";
 const V2 = "v2-org";
@@ -188,6 +189,41 @@ describe("NATS presence -> file mirror snapshot", () => {
     // This link's own mirrored rows are never a NATS sender (no loop through the bridge machine).
     expect(side.verifySender(FILE_ROOT, BRIDGE)).toEqual({ ok: false, refuse: "FABRIC_SENDER_UNVERIFIED" });
     expect(side.verifySender("session:unknown-0000", V2)).toEqual({ ok: false, refuse: "FABRIC_SENDER_UNVERIFIED" });
+  });
+
+  it("reports a terminal watch refusal once, so the link stops instead of routing on a frozen view", async () => {
+    const w = world();
+    const base = w.transport(BRIDGE, "bridge:ryzen1");
+    let attempts = 0;
+    const transport: FabricTransport = { ...base, kv: bucket => {
+      const kv = base.kv(bucket);
+      if (bucket !== "presence") return kv;
+      return { ttlMs: kv.ttlMs, get: kv.get.bind(kv), put: kv.put.bind(kv), delete: kv.delete.bind(kv),
+        async *watch() { attempts++; throw new TransportDeniedError("KV watch permission denied"); } };
+    } };
+    const clock = { wall: 1_000_000, mono: 50_000 };
+    const side = new NatsBridgePresence({ transport, link: "nats", admit: () => true, processProof: PROOF,
+      now: () => clock.wall, monotonic: () => clock.mono });
+    openers.push(side);
+    const failures: Error[] = [];
+    side.subscribeChanges(() => undefined, error => { failures.push(error); });
+    side.start();
+    await waitFor(() => expect(attempts).toBeGreaterThanOrEqual(2));
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toBeInstanceOf(TransportDeniedError);
+    expect(await side.presence()).toMatchObject({ hosts: [], partial: true });
+    // A transient unavailability is not terminal.
+    const unavailable = new NatsBridgePresence({ transport: { ...base, kv: bucket => {
+      const kv = base.kv(bucket);
+      return bucket === "leases" ? kv : { ttlMs: kv.ttlMs, get: kv.get.bind(kv), put: kv.put.bind(kv), delete: kv.delete.bind(kv),
+        async *watch() { throw Object.assign(new Error("down"), { code: "FABRIC_TRANSPORT_UNAVAILABLE" }); } };
+    } }, link: "nats", admit: () => true, processProof: PROOF });
+    openers.push(unavailable);
+    const none: Error[] = [];
+    unavailable.subscribeChanges(() => undefined, error => { none.push(error); });
+    unavailable.start();
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(none).toEqual([]);
   });
 
   it("wakes the bridge on another machine's change, never on its own renewals", async () => {

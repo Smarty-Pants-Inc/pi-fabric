@@ -71,6 +71,17 @@ const errorCode = (error: unknown): unknown =>
 const isConflict = (error: unknown): boolean => errorCode(error) === "FABRIC_KV_CONFLICT";
 const isUncertain = (error: unknown): boolean => errorCode(error) === "FABRIC_TRANSPORT_UNCERTAIN";
 const isUnavailable = (error: unknown): boolean => errorCode(error) === "FABRIC_TRANSPORT_UNAVAILABLE";
+/** Refusals a retry cannot fix: the credential lost its grant, or the bucket is not the expected one. */
+const isTerminalWatchError = (error: unknown): boolean => {
+  for (let depth = 0, cause = error; depth < 6 && typeof cause === "object" && cause !== null; depth++) {
+    const code = errorCode(cause);
+    const name = (cause as { name?: unknown }).name;
+    if (code === "FABRIC_TRANSPORT_DENIED" || code === "FABRIC_TRANSPORT_INVALID" || code === "FABRIC_NATS_AUTHORIZATION" ||
+      name === "NatsAuthorizationError" || name === "PermissionViolationError" || name === "AuthorizationError") return true;
+    cause = (cause as { cause?: unknown }).cause;
+  }
+  return false;
+};
 
 const canonicalJson = (value: unknown): string => JSON.stringify(value, (_key, child: unknown) => {
   if (typeof child !== "object" || child === null || Array.isArray(child)) return child;
@@ -164,6 +175,8 @@ export class NatsPresenceReader {
   readonly #revisions: Record<Bucket, Map<string, number>> = { presence: new Map(), leases: new Map() };
   readonly #ready = new Set<Bucket>();
   readonly #listeners = new Set<NatsPresenceListener>();
+  readonly #failureListeners = new Set<(error: Error) => void>();
+  #failure: Error | undefined;
   readonly #readyWaiters = new Set<() => void>();
   readonly #abort = new AbortController();
   readonly #tasks: Promise<void>[] = [];
@@ -210,6 +223,24 @@ export class NatsPresenceReader {
       this.#abort.signal.addEventListener("abort", abort, { once: true });
       if (signal?.aborted || this.#abort.signal.aborted) abort();
     });
+  }
+
+  /** A terminal watch refusal (denied credential, invalid bucket), reported once per reader. */
+  subscribeFailure(listener: (error: Error) => void): () => void {
+    if (this.#failure) {
+      const failure = this.#failure;
+      queueMicrotask(() => { try { listener(failure); } catch (error) { this.#report(error); } });
+    }
+    this.#failureListeners.add(listener);
+    return () => { this.#failureListeners.delete(listener); };
+  }
+
+  #fail(error: unknown): void {
+    if (this.#failure) return;
+    this.#failure = error instanceof Error ? error : new Error("NATS bridge presence watch refused", { cause: error });
+    for (const listener of [...this.#failureListeners]) {
+      try { listener(this.#failure); } catch (failure) { this.#report(failure); }
+    }
   }
 
   subscribe(listener: NatsPresenceListener): () => void {
@@ -342,6 +373,7 @@ export class NatsPresenceReader {
         this.#clear(bucket);
         this.#notify(bucket);
         if (!isUnavailable(error)) this.#report(error);
+        if (isTerminalWatchError(error)) this.#fail(error);
         const delayMs = Math.min(5_000, 100 * 2 ** Math.min(attempt, 6));
         attempt += 1;
         await new Promise<void>(resolve => {
@@ -1032,12 +1064,18 @@ export class NatsBridgePresence {
     return await this.writer.replace("actors", claims, options.complete);
   }
 
-  /** Wake the bridge on another machine's presence or lease change. Own rows never wake it. */
-  subscribeChanges(changed: (kind: BridgeChange) => void, _failed?: (error: Error) => void): () => void {
-    return this.reader.subscribe((bucket, machine) => {
+  /**
+   * Wake the bridge on another machine's presence or lease change; own rows never wake it.
+   * `failed` fires once on a terminal watch refusal (credential denied, bucket invalid): the link
+   * must stop, not keep routing on a view that can no longer be refreshed.
+   */
+  subscribeChanges(changed: (kind: BridgeChange) => void, failed?: (error: Error) => void): () => void {
+    const stopChanges = this.reader.subscribe((bucket, machine) => {
       if (machine === this.reader.machine) return;
       changed(bucket === "presence" ? "presence" : "lease");
     });
+    const stopFailures = failed ? this.reader.subscribeFailure(failed) : undefined;
+    return () => { stopChanges(); stopFailures?.(); };
   }
 
   holds(id: string): boolean { return this.writer.holds(id); }

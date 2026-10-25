@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { FabricParticipantRecord } from "../topology/types.js";
+import { assertNatsLinkPlatform } from "./bridge-nats-config.js";
 import { BRIDGE_STALL_ALARM_TOPIC, type BridgeStallAlarm } from "./bridge.js";
 import type {
   NatsCarrierAuthorize, NatsCarrierDecision, NatsCarrierLedger, NatsCarrierRecord,
@@ -127,6 +128,17 @@ export const natsLinkMirrorAllowed = (allow: BridgeNatsAllowListConfig) =>
       : participant.kind === "actor" && participant.rootId === entry.rootId && participant.name === entry.name &&
         (entry.id === undefined || entry.id === participant.id)));
 
+/**
+ * Whether an inbound command's target is named on allow.file, so a moment's KV lag may be waited for:
+ * a root by id, a pinned actor by id, an unpinned actor by the native file record answering to the id.
+ */
+export const natsLinkFileTargetAllowed = (allow: BridgeNatsAllowListConfig, fileView: () => BridgeNatsPresenceView) =>
+  (targetId: string): boolean => allow.entries.some(entry => entry.side === "file" && (entry.kind === "root"
+    ? entry.id === targetId
+    : entry.id !== undefined ? entry.id === targetId
+      : fileView().records(targetId).some(record => record.kind === "actor" && record.mirroredBy === undefined &&
+        record.rootId === entry.rootId && record.name === entry.name)));
+
 /** L3's durable ledger as the carrier's ledger port. */
 export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsCarrierLedger => {
   const linkId = bridgeNatsLinkIdentity(link).id;
@@ -196,6 +208,8 @@ export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsC
  * L3's ledger, then MeshBridge. Resolves once the first presence pass has linked both sides.
  */
 export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLinkStartOptions): Promise<NatsLinkHandle> => {
+  // The hub runs Linux or macOS; the ledger, lock and config checks rely on POSIX file semantics.
+  assertNatsLinkPlatform();
   const { signal, log } = options;
   const factories = options.factories ?? {};
   signal.throwIfAborted();
@@ -237,6 +251,7 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
       port, ledger, authorize, authorizeTopic, mirrorAllowed: natsLinkMirrorAllowed(allow), log,
       // L1's port lists native file actors itself (N1): the mirror set carries roots only.
       mirrorActors: false,
+      waitForTarget: natsLinkFileTargetAllowed(allow, () => remote!.filePresence.view()),
       bridge: {
         stopMs: STOP_MS, notifyWatchdog: systemdWatchdogNotify,
         publishStallAlarm: async (alarm: BridgeStallAlarm) => {

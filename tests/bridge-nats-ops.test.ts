@@ -102,7 +102,8 @@ const until = async (check: () => boolean): Promise<void> => {
 };
 
 describe("nats-link lock", () => {
-  it("lets one process own a state directory, replaces a stale lock and releases only its own", async () => {
+  // Stated skip: nats-link is Linux/macOS only (POSIX file modes, fsync/rename and lock semantics); start refuses on Windows.
+  it.skipIf(process.platform === "win32")("lets one process own a state directory, replaces a stale lock and releases only its own", async () => {
     const { config } = await setup();
     const release = acquireNatsLinkLock(config, "start");
     expect(natsLinkLockHolder(config)).toMatchObject({ link: "v2", purpose: "start", pid: process.pid });

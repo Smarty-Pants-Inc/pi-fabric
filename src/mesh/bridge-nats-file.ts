@@ -226,6 +226,8 @@ export interface NatsCarrierSideOptions {
   readonly maxInHand?: number;
   /** Bound on an inbound delivery's wait for its target in this link's KV view (default 15 s). */
   readonly presenceWaitMs?: number;
+  /** Only these inbound targets (allow.file) may wait for KV visibility; any other is refused at once. */
+  readonly waitForTarget?: (targetId: string) => boolean;
 }
 
 interface InHand {
@@ -280,7 +282,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
       file: id => this.filePresence.file(id),
     };
     this.carrier = new NatsBridgeCarrier({ link: options.link, machine: options.port.machine, presence, ledger: options.ledger,
-      authorize: options.authorize, now: this.#now });
+      authorize: options.authorize, now: this.#now, ...(options.waitForTarget ? { waitForTarget: options.waitForTarget } : {}) });
     this.topics = new NatsTopicTranslator({ link: options.link, machine: options.port.machine, presence, ledger: options.ledger,
       authorize: options.authorizeTopic, now: this.#now,
       ...(options.topicTimeoutMs !== undefined ? { timeoutMs: options.topicTimeoutMs } : {}) });

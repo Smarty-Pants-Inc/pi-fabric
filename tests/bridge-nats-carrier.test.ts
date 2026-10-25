@@ -265,6 +265,19 @@ describe("NATS -> file commands", () => {
     expect(await carrier.inbound(delivery(natsCommand({}, { id: "relay:abc" })))).toMatchObject({ kind: "refused" });
   });
 
+  it("waits for an allow-listed target missing from this link's KV view; refuses any other at once, notRun with a stable code", async () => {
+    const presence = new FakePresence();
+    presence.natsEntries.delete(fileLead.id);
+    const make = (waitForTarget: (id: string) => boolean) => new NatsBridgeCarrier({ link: LINK, machine: BRIDGE_MACHINE, presence,
+      ledger: new MemoryLedger(), authorize: allow, now: () => T, waitForTarget });
+    expect(await make(id => id === fileLead.id).inbound(delivery(natsCommand()))).toMatchObject({ kind: "wait" });
+    const refused = await make(() => false).inbound(delivery(natsCommand({}, { principal })));
+    expect(refused).toMatchObject({ kind: "reply", envelope: { id: "ack:nats-env-1", kind: "ack", operation: "rejected",
+      to: { machine: POD_MACHINE, hostId: natsLead.id }, from: { id: fileLead.id }, targetId: fileLead.id,
+      body: { accepted: false, notRun: true, errorCode: "BRIDGE_NATS_NOT_ALLOWED", commandId: "nats-cmd-1", targetId: fileLead.id,
+        ownerIncarnation: "inc-file-lead", bodyDigest: controlBodyFingerprint(natsCommand().body, principal) } } });
+  });
+
   it("answers a gate refusal and an id conflict for the hop, notRun, in the NATS owner's exact ACK shape", async () => {
     const gated = setup(() => ({ ok: false, refuse: "BRIDGE_NATS_OPERATION_NOT_ALLOWED", reason: "seat receives followUp and cancel only" }));
     const refused = await gated.carrier.inbound(delivery(natsCommand({}, { principal })));

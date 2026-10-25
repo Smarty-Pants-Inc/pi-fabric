@@ -349,7 +349,8 @@ describe("crash durability", () => {
     void ledger;
   });
 
-  it("completes short writes, in appends and in compaction, so a reload keeps every resolved mutation", async () => {
+  // Stated skip: nats-link is Linux/macOS only (POSIX file modes, fsync/rename and lock semantics); start refuses on Windows.
+  it.skipIf(process.platform === "win32")("completes short writes, in appends and in compaction, so a reload keeps every resolved mutation", async () => {
     const real = fs.writeSync;
     const spy = vi.spyOn(fs, "writeSync").mockImplementation(((fd: number, buffer: Buffer, offset?: number, length?: number) =>
       real(fd, buffer, offset ?? 0, Math.min(length ?? buffer.length, 20))) as unknown as typeof fs.writeSync);
@@ -421,7 +422,8 @@ describe("crash durability", () => {
 });
 
 describe("horizon and compaction", () => {
-  it("drops records past the 24 h horizon and compacts the file; live ones survive a reopen", async () => {
+  // Stated skip: nats-link is Linux/macOS only (POSIX file modes, fsync/rename and lock semantics); start refuses on Windows.
+  it.skipIf(process.platform === "win32")("drops records past the 24 h horizon and compacts the file; live ones survive a reopen", async () => {
     let ledger = await ledgerAt(dir(), 4);
     const old = (await ledger.claim(toNats("old"))).record.commandId;
     await ledger.markSeen("toFile", "old-event");

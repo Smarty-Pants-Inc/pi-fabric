@@ -77,6 +77,26 @@ export interface NatsLinkConfig {
   readonly logLevel: "info" | "debug";
 }
 
+export const BRIDGE_NATS_UNSUPPORTED_PLATFORM = "BRIDGE_NATS_UNSUPPORTED_PLATFORM";
+
+/**
+ * The link runs on the file-mesh hub: Linux and macOS only. Its ledger, lock and config checks rely on POSIX
+ * file modes, fsync/rename and lock semantics, so `nats-link start`, `nats-link dry-run` and startNatsLink
+ * refuse on Windows by name rather than run on semantics they were never built for.
+ */
+export class NatsLinkPlatformError extends Error {
+  readonly code = BRIDGE_NATS_UNSUPPORTED_PLATFORM;
+  constructor() {
+    super("nats-link runs only on Linux and macOS");
+    this.name = "NatsLinkPlatformError";
+  }
+}
+
+/** Refuse a platform the link does not support (read at call time, so tests can set it). */
+export const assertNatsLinkPlatform = (platform: NodeJS.Platform = process.platform): void => {
+  if (platform === "win32") throw new NatsLinkPlatformError();
+};
+
 /** A config the operator must fix. `field` names the JSON path; the message never repeats a value from the file. */
 export class NatsLinkConfigError extends Error {
   readonly code = "FABRIC_NATS_LINK_CONFIG";

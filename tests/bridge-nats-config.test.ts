@@ -73,7 +73,8 @@ const refused = (value: unknown, field: string): void => {
   expect((error as NatsLinkConfigError).field).toBe(field);
 };
 
-describe("nats-link config", () => {
+// Stated skip: nats-link is Linux/macOS only (POSIX file modes, fsync/rename and lock semantics); start refuses on Windows.
+describe.skipIf(process.platform === "win32")("nats-link config (Linux/macOS only)", () => {
   it("parses a complete config into L3's normalized allow entries, with least-privilege defaults", () => {
     const config = parseNatsLinkConfig(sample());
     expect(config.callTimeoutMs).toBe(30_000);

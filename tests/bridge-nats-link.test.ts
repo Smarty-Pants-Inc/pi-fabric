@@ -6,11 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { NatsCarrierRecord } from "../src/mesh/bridge-nats-carrier.js";
-import { createNatsFileLink, type NatsCarrierSide } from "../src/mesh/bridge-nats-file.js";
+import { createNatsFileLink, NatsCarrierDeferredError, type NatsCarrierSide } from "../src/mesh/bridge-nats-file.js";
 import { createBridgeNatsIdentityGate, parseBridgeNatsAllowSection, type BridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
 import { BRIDGE_NATS_LEDGER_LOCK, openBridgeNatsLedger, type FileBridgeNatsLedger } from "../src/mesh/bridge-nats-ledger.js";
 import type { NatsLinkConfig } from "../src/mesh/bridge-nats-config.js";
-import { natsCarrierLedger, natsLinkAuthorizers, natsLinkMirrorAllowed, startNatsLink } from "../src/mesh/bridge-nats-link.js";
+import { natsCarrierLedger, natsLinkAuthorizers, natsLinkFileTargetAllowed, natsLinkMirrorAllowed, startNatsLink } from "../src/mesh/bridge-nats-link.js";
 import { bridgeNatsMappedCommandId, type BridgeNatsAllowSection } from "../src/mesh/bridge-nats-types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
@@ -84,6 +84,7 @@ const gatedFixture = async () => {
   const ledger = await ledgerIn(root);
   const link = createNatsFileLink({ store, localName: "ryzen1", link: LINK, cursorPath: path.join(root, "cursor.json"), port,
     ledger: natsCarrierLedger(ledger, LINK), authorize, authorizeTopic, mirrorAllowed: natsLinkMirrorAllowed(allow),
+    waitForTarget: natsLinkFileTargetAllowed(allow, () => remote!.filePresence.view()),
     log: line => logs.push(line), resendDelayMs: 0, bridge: { presenceMs: 60_000 } });
   remote = link.remote;
   closers.push(() => link.bridge.stop());
@@ -98,11 +99,20 @@ const fileCommand = (store: MeshStore, operation: string, commandId: string, ext
     message: "hello", requestedAt: Date.now(), deadlineAt: Date.now() + 60_000, destinationRemoteHost: LINK, ...extra },
 });
 
-const natsCommand = (id: string, operation: string, commandId: string) => ({
-  id, kind: "command", to: { machine: BRIDGE_MACHINE, hostId: fileLead.id }, targetId: fileLead.id, operation, from: natsLead,
-  body: { version: 1, commandId, targetId: fileLead.id, operation, ownerIncarnation: "inc-file-lead", message: "from v2",
+const natsCommand = (id: string, operation: string, commandId: string, target: MeshIdentity = fileLead) => ({
+  id, kind: "command", to: { machine: BRIDGE_MACHINE, hostId: target.id }, targetId: target.id, operation, from: natsLead,
+  body: { version: 1, commandId, targetId: target.id, operation, ownerIncarnation: `inc-${target.name}`, message: "from v2",
     replyTo: natsLead.id, requestedAt: Date.now(), deadlineAt: Date.now() + 60_000 },
 });
+
+/** Run with process.platform reporting `platform` (the refusal reads it at call time). */
+const onPlatform = async <T>(platform: NodeJS.Platform, work: () => Promise<T>): Promise<T> => {
+  const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { ...original, value: platform });
+  try { return await work(); } finally { Object.defineProperty(process, "platform", original); }
+};
+/** Stated skip: start refuses on Windows by design (its refusal is tested below on every platform). */
+const WINDOWS = process.platform === "win32";
 
 describe("startNatsLink composition with L3's allow gate", () => {
   it("mirrors only allow-listed file identities into KV", async () => {
@@ -198,7 +208,40 @@ describe("startNatsLink composition with L3's allow gate", () => {
     expect(cancel.record).toMatchObject({ sourceCancelCommandId: "orig", cancelCommandId: "f".repeat(64) });
   });
 
-  it("startNatsLink links (L5's config shape, L3's default ledger, the store handed to the port) and stops cleanly", async () => {
+  it("NATS -> file: a target not on allow.file is refused at once (notRun, stable code); an allow-listed one waits for KV", async () => {
+    const { port, link, events } = await gatedFixture();
+    // offList is a live native file root, but not allow-listed: never mirrored, never waited for.
+    const stranger = port.deliver(natsCommand("env-stranger", "followUp", "n-stranger", offList), POD_MACHINE, 1);
+    await settle();
+    await link.bridge.step();
+    expect(stranger.acked).toBe(1);
+    expect(port.sent.find(envelope => envelope.id === "ack:env-stranger")).toMatchObject({ kind: "ack", operation: "rejected",
+      to: { machine: POD_MACHINE, hostId: natsLead.id }, body: { accepted: false, notRun: true, errorCode: "BRIDGE_NATS_NOT_ALLOWED",
+        commandId: "n-stranger" } });
+    // The allow-listed file root missing from the link's KV view for a moment: a bounded wait, not a refusal.
+    const route = port.routes.get(fileLead.id)!;
+    port.routes.delete(fileLead.id);
+    const listed = port.deliver(natsCommand("env-listed", "followUp", "n-listed"), POD_MACHINE, 2);
+    await settle();
+    await expect(link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(listed.termed).toEqual([]);
+    expect(port.sent.find(envelope => envelope.id === "ack:env-listed")).toBeUndefined();
+    port.routes.set(fileLead.id, route);
+    await link.bridge.step();
+    await link.bridge.step();
+    expect(listed.acked).toBe(1);
+    expect(events("fabric.control.command").map(event => (event.data as { bridge: { id: string } }).bridge.id)).toEqual(["env-listed"]);
+  });
+
+  it("startNatsLink refuses on Windows by name, before anything opens", async () => {
+    await onPlatform("win32", async () => {
+      await expect(startNatsLink({} as NatsLinkConfig, { signal: new AbortController().signal, log: () => undefined, factories: {
+        openPort: async () => { throw new Error("opened"); } } }))
+        .rejects.toMatchObject({ code: "BRIDGE_NATS_UNSUPPORTED_PLATFORM", message: "nats-link runs only on Linux and macOS" });
+    });
+  });
+
+  it.skipIf(WINDOWS)("startNatsLink links (L5's config shape, L3's default ledger, the store handed to the port) and stops cleanly", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-start-"));
     roots.push(root);
     (await meshRoot(root)).closeState();

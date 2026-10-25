@@ -7,7 +7,7 @@ import type { TransportDelivery, TransportEnvelope } from "../transport/types.js
 import type { BridgePublish } from "./bridge.js";
 import {
   BRIDGE_NATS_ACK_TOPIC, BRIDGE_NATS_CONTROL_TOPIC, BRIDGE_NATS_HORIZON_MS, BRIDGE_NATS_MACHINE, bridgeNatsAckEnvelopeId,
-  bridgeNatsEnvelopeId, bridgeNatsMappedCommandId, type BridgeNatsDirection, type BridgeNatsPortDelivery,
+  bridgeNatsEnvelopeId, bridgeNatsMappedCommandId, BRIDGE_NATS_REFUSAL, type BridgeNatsDirection, type BridgeNatsPortDelivery,
 } from "./bridge-nats-types.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED } from "./control-idempotency.js";
 import type { MeshEvent, MeshIdentity } from "./store.js";
@@ -184,6 +184,11 @@ export interface NatsCarrierOptions {
   ledger: NatsCarrierLedger;
   /** The allow-list gate; required in production (startNatsLink wires L3's). */
   authorize: NatsCarrierAuthorize;
+  /**
+   * Whether an inbound target missing from this link's KV view may be waited for (its allow.file entry
+   * names it); any other is refused at once. Default: every target (tests without an allow-list).
+   */
+  waitForTarget?: (targetId: string) => boolean;
   now?: () => number;
   /** Largest ACK body carried either way (default NATS_CARRIER_MAX_ACK_BYTES). */
   maxAckBytes?: number;
@@ -369,6 +374,7 @@ export class NatsBridgeCarrier {
   readonly #presence: NatsCarrierPresence;
   readonly #ledger: NatsCarrierLedger;
   readonly #authorize: NatsCarrierAuthorize;
+  readonly #waitForTarget: (targetId: string) => boolean;
   readonly #now: () => number;
   readonly #maxAckBytes: number;
 
@@ -380,6 +386,7 @@ export class NatsBridgeCarrier {
     this.#presence = options.presence;
     this.#ledger = options.ledger;
     this.#authorize = options.authorize;
+    this.#waitForTarget = options.waitForTarget ?? (() => true);
     this.#now = options.now ?? Date.now;
     this.#maxAckBytes = options.maxAckBytes ?? NATS_CARRIER_MAX_ACK_BYTES;
   }
@@ -570,18 +577,28 @@ export class NatsBridgeCarrier {
     if (body.replyTo !== sender.route.ownerHostId) return { kind: "refused", reason: "replyTo is not the sender's own host" };
     const targetId = input.targetId;
     const target = this.#presence.nats(targetId);
+    const principal = copyFabricPrincipal(input.envelope.principal);
+    // The NATS sender's ACK check compares the digest of its own wire (body and principal as sent): digest that, unmapped.
+    const bodyDigest = controlBodyFingerprint(wire(body), input.envelope.principal === undefined ? undefined : wire(input.envelope.principal));
     // The target must be one this bridge mirrors into KV, under the host the sender addressed.
     if (!target?.route.live || target.route.machine !== this.machine || target.route.ownerHostId !== input.hostId) {
       const why = !target ? "no live KV route" : !target.route.live ? "its KV route is not live"
         : target.route.machine !== this.machine ? "its KV route is on another machine" : "the envelope names another owner host";
       const reason = `target is not a file participant this bridge carries (${why})`;
-      // A live route elsewhere is never ours. A missing or lapsed one may be this link's own KV view lagging
-      // its watch (the sender resolved it a moment ago): wait a bounded time, never TERM on first sight.
-      return target?.route.live ? { kind: "refused", reason } : { kind: "wait", reason };
+      // A live route elsewhere is never ours.
+      if (target?.route.live) return { kind: "refused", reason };
+      // A missing or lapsed one may be this link's own KV view lagging its watch, but only for a target on
+      // allow.file: wait a bounded time for that one. Any other target is never ours to wait for: the
+      // verified sender gets a notRun refusal with the stable code at once, never a timeout.
+      if (this.#waitForTarget(targetId)) return { kind: "wait", reason };
+      return { kind: "reply", reason, envelope: this.#envelope({
+        id: bridgeNatsAckEnvelopeId(input.id), kind: "ack", to: { machine: sourceMachine, hostId: body.replyTo as string },
+        targetId, operation: "rejected", from: { id: input.hostId, name: input.hostId, kind: "main" },
+        body: { accepted: false, error: `Fabric NATS bridge refused the command: ${BRIDGE_NATS_REFUSAL.notAllowed}: ${reason}`,
+          errorCode: BRIDGE_NATS_REFUSAL.notAllowed, notRun: true, version: 1, commandId: body.commandId, targetId, bodyDigest,
+          ...(typeof body.ownerIncarnation === "string" ? { ownerIncarnation: body.ownerIncarnation } : {}) },
+      }) };
     }
-    const principal = copyFabricPrincipal(input.envelope.principal);
-    // The NATS sender's ACK check compares the digest of its own wire (body and principal as sent): digest that, unmapped.
-    const bodyDigest = controlBodyFingerprint(wire(body), input.envelope.principal === undefined ? undefined : wire(input.envelope.principal));
     const refuse = (acceptance: Record<string, unknown>, reason: string): NatsInbound =>
       ({ kind: "reply", reason, envelope: this.#refusalAck(input.id, sourceMachine, body, bodyDigest, target, acceptance) });
     const operation = body.operation as FabricControlOperation;

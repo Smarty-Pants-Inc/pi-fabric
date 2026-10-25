@@ -20,10 +20,12 @@ import { readMeshStateMovedMarker } from "./mesh/backend-fence.js";
 import { listHandoffs } from "./mesh/bridge-handoff.js";
 import {
   assertFabricMeshRoot,
+  assertNatsLinkPlatform,
   describeNatsLinkConfig,
   loadNatsLinkConfig,
   type NatsLinkConfig,
   NatsLinkConfigError,
+  NatsLinkPlatformError,
   natsLinkAllowListConfig,
   natsLinkStatePaths,
   preflightNatsLinkConfig,
@@ -501,6 +503,8 @@ export const main = async (argv: string[], io: NatsLinkCliIo = {}): Promise<numb
     return 2;
   }
   try {
+    // The link itself runs on Linux and macOS only; read-only modes stay usable anywhere.
+    if (mode === "start" || mode === "dry-run") assertNatsLinkPlatform();
     const flags = parseFlags(mode, rest);
     if (mode === "roots") {
       const config = one(flags, "config");
@@ -614,7 +618,7 @@ export const main = async (argv: string[], io: NatsLinkCliIo = {}): Promise<numb
       return 2;
     }
     if (error instanceof NatsLinkConfigError || error instanceof BridgeNatsAllowListError || error instanceof BridgeNatsSeatPinsError ||
-      error instanceof NatsLinkBusyError) {
+      error instanceof NatsLinkBusyError || error instanceof NatsLinkPlatformError) {
       log(`${error.code}: ${error.message}`);
       return 2;
     }

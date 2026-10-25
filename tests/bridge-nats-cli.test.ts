@@ -8,6 +8,9 @@ import { main, type NatsLinkCliIo, type NatsLinkHandle, type NatsLinkStarter } f
 import { NatsRootsUnavailableError, type NatsRootInfo, type NatsRootsSource } from "../src/mesh/bridge-nats-roots.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
+/** nats-link start and dry-run refuse on Windows (Linux/macOS only); their full behavior is tested elsewhere. */
+const WINDOWS = process.platform === "win32";
+
 // Fictional ids only: pi-fabric is public.
 const KATE = "session:00000000-0000-7000-8000-00000000000a";
 const PAUL = "session:00000000-0000-7000-8000-00000000000b";
@@ -209,7 +212,25 @@ describe("nats-link CLI", () => {
     expect([unknown.code, unknown.json().problems]).toEqual([1, ["not on this link's allow-list", "no file-mesh record"]]);
   });
 
-  it("start runs the link until stopped (exit 0) and exits 1 when the link ends by itself", async () => {
+  it("start and dry-run refuse on Windows by name (exit 2, BRIDGE_NATS_UNSUPPORTED_PLATFORM); read-only modes still run", async () => {
+    const { config } = await setup();
+    const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...original, value: "win32" });
+    try {
+      let started = false;
+      const starter: NatsLinkStarter = async () => { started = true; return { closed: new Promise(() => undefined), stop: async () => undefined }; };
+      for (const mode of ["start", "dry-run"]) {
+        const refused = await run([mode, "--config", config], { starter, signal: new AbortController().signal, readRoots: async () => [] });
+        expect(refused.code).toBe(2);
+        expect(refused.err).toContain("BRIDGE_NATS_UNSUPPORTED_PLATFORM: nats-link runs only on Linux and macOS");
+      }
+      expect(started).toBe(false);
+      expect((await run(["help"])).code).toBe(0);
+    } finally { Object.defineProperty(process, "platform", original); }
+  });
+
+  // Stated skip: start and dry-run refuse on Windows by design (the refusal is tested above on every platform).
+  it.skipIf(WINDOWS)("start runs the link until stopped (exit 0) and exits 1 when the link ends by itself", async () => {
     const { config, credentials, stateDir } = await setup();
     let stops = 0;
     let seen: { link?: string; signal?: AbortSignal } = {};
@@ -260,7 +281,7 @@ describe("nats-link CLI", () => {
       file: { removed: [KATE], remaining: [] }, problems: ["NATS withdraw failed"] });
   });
 
-  it("start loads the real link module and fails closed on unusable credentials", async () => {
+  it.skipIf(WINDOWS)("start loads the real link module and fails closed on unusable credentials", async () => {
     const { config } = await setup();
     // The fixture's user.creds holds no JWT: the link (bridge-nats-link -> L1's port) refuses before any connection.
     const refused = await run(["start", "--config", config], { signal: new AbortController().signal });
@@ -268,7 +289,7 @@ describe("nats-link CLI", () => {
     expect(refused.err).toMatch(/NATS credentials/);
   });
 
-  it("start refuses, before anything opens, an allow-list that contradicts org.json's principal seats", async () => {
+  it.skipIf(WINDOWS)("start refuses, before anything opens, an allow-list that contradicts org.json's principal seats", async () => {
     const { config, dir } = await setup();
     let started = false;
     const starter: NatsLinkStarter = async () => { started = true; return { closed: new Promise(() => undefined), stop: async () => undefined }; };
@@ -284,7 +305,7 @@ describe("nats-link CLI", () => {
     expect(missing.err).toContain("BRIDGE_NATS_SEAT_PINS_INVALID");
   });
 
-  it("dry-run reports what each allow entry resolves to now, and writes nothing", async () => {
+  it.skipIf(WINDOWS)("dry-run reports what each allow entry resolves to now, and writes nothing", async () => {
     const { config, store, stateDir } = await setup();
     fs.rmdirSync(stateDir);
     await addRoot(store, PAUL, { incarnation: "inc-p" });

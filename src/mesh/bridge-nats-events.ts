@@ -197,12 +197,6 @@ export const runNatsBridgeEvents = async (options: NatsBridgeEventsOptions, sign
 };
 
 /**
- * The real source: one durable (`bev_<hash(link identity)>`) on FABRIC_EV_<ORG> over the filters,
- * explicit ACK, unlimited redelivery with backoff, one message in flight (stream order end to end).
- * A new durable starts at the stream's NEW messages (or `startAt`), never replaying history into
- * Ryzen 1. Needs a connection verified WITH the events grant (events: true, org).
- */
-/**
  * The one events durable of a bridge machine, named under the machine so the org can grant exactly it
  * (`$JS.API.CONSUMER.{CREATE,INFO,MSG.NEXT}.FABRIC_EV_<ORG>.bev_<machine>`, `$JS.ACK.FABRIC_EV_<ORG>.bev_<machine>.>`).
  */
@@ -263,6 +257,12 @@ export const ensureNatsBridgeEventConsumer = async (connection: Pick<NatsConnect
   return { stream, durable };
 };
 
+/**
+ * The real source: the machine's one durable on FABRIC_EV_<ORG> over the filters, explicit ACK, unlimited
+ * redelivery with backoff, one message in flight (stream order end to end). A new durable starts at the
+ * stream's NEW messages (or `startAt`), never replaying history into Ryzen 1. The connection needs only the
+ * consume + ACK grant on that durable (verified with the standard agent policy), never the publish side.
+ */
 export const natsBridgeEventSource = (connection: NatsConnectionHandle, options: NatsBridgeEventSourceOptions): NatsBridgeEventSource => {
   natsBridgeEventSubjects(options.org, options.topics);
   return {

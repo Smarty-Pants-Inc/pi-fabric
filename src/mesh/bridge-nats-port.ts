@@ -528,6 +528,7 @@ export interface NatsBridgeSideConfig {
     /** Absolute path of the bridge machine's user.creds file. */
     readonly credentials: string;
     readonly caFile: string;
+    /** The org of FABRIC_EV_<ORG>, read by N4 only; the port never asks the credential for org grants. */
     readonly org?: string;
     readonly custodyStream: string;
     readonly livenessStream: string;
@@ -549,15 +550,16 @@ export interface OpenNatsBridgeSideOptions {
  * identity (send, KV), a second verified connection for the machine-wide inbox, presence admission
  * from `config.allow`, and file actors when `fileStore` is given. Resolves once both KV snapshots are
  * ready and the link identity is live. Event grants (PR 2) stay unused here: an agent credential may
- * carry more than this port asks for, never less.
+ * carry more than this port asks for, never less. The port uses neither org service subjects nor
+ * session channels, so it verifies the unscoped agent policy: `nats.org` (needed only by N4) never makes
+ * it demand org grants, and a credential without the event grant fails at N4's own start, by name.
  */
 export const openNatsBridgeSide = async (config: NatsBridgeSideConfig, options: OpenNatsBridgeSideOptions = {}): Promise<NatsBridgePort> => {
   const identity = bridgeNatsLinkIdentity(config.link);
   const common = {
     servers: [...config.nats.servers], machine: config.nats.machine, credentials: config.nats.credentials,
     tls: { caFile: config.nats.caFile }, custodyStream: config.nats.custodyStream, livenessStream: config.nats.livenessStream,
-    pathBMachines: [...config.nats.pathBMachines], ...(config.nats.org === undefined ? {} : { org: config.nats.org }),
-    ...(options.signal ? { signal: options.signal } : {}),
+    pathBMachines: [...config.nats.pathBMachines], ...(options.signal ? { signal: options.signal } : {}),
   };
   const transport = await openNatsTransport({ ...common, hostId: identity.id, name: `nats-link:${config.link}`, events: false, provision: false });
   let connection: NatsConnectionHandle;

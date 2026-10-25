@@ -138,12 +138,20 @@ describe("Path B NATS grants", () => {
       const options = { ...baseOptions, events: true };
       await (await openNatsConnection(options)).close();
       for (const off of [baseOptions, { ...baseOptions, events: false }]) await (await openNatsConnection(off)).close();
-      await expect(openNatsConnection({ ...options, org: "other-org" })).rejects.toThrow("machine tag mismatch");
+      // The refusal names what is missing (A' PR 2): another org's scope, or the event grants, never a machine tag.
+      await expect(openNatsConnection({ ...options, org: "other-org" })).rejects.toThrow("the credential is not scoped to org other-org");
       publish = allowed.filter(value => value !== "fabric.ev.smarty-dev.>");
-      await expect(openNatsConnection(options)).rejects.toThrow("machine tag mismatch");
+      await expect(openNatsConnection(options)).rejects.toThrow("the credential lacks the Fabric event grants for org smarty-dev");
       publish = [...allowed, "github.>"];
       await (await openNatsConnection(options)).close();
       publish = expand(roleTemplateWithPathB("agent", streams, policy.pathBMachines, { org: policy.org }).pub.allow);
+      await expect(openNatsConnection(options)).rejects.toThrow("the credential lacks the Fabric event grants for org smarty-dev");
+      // Unscoped (no org service subjects, no events): the org scope is what is missing.
+      publish = expand(roleTemplateWithPathB("agent", streams, policy.pathBMachines).pub.allow);
+      await expect(openNatsConnection(options)).rejects.toThrow("the credential is not scoped to org smarty-dev");
+      // Off-machine grants still read as the identity mismatch they are.
+      publish = expand(roleTemplateWithPathB("agent", streams, policy.pathBMachines, { org: policy.org, events: true }).pub.allow)
+        .map(value => value.replaceAll("ryzen2", "ryzen3"));
       await expect(openNatsConnection(options)).rejects.toThrow("machine tag mismatch");
       publish = allowed;
       for (const off of [baseOptions, { ...baseOptions, events: false }]) await (await openNatsConnection(off)).close();

@@ -105,7 +105,7 @@ describe("natsBridgeInboxSource", () => {
 });
 
 describe("natsBridgeEventSource", () => {
-  const ORG = "smarty-pants-inc";
+  const ORG = "example-org";
   it("creates its durable at NEW messages over the exact filters, one in flight, unlimited redelivery", async () => {
     const fake = fakeConnection();
     const source = natsBridgeEventSource(fake.connection, { org: ORG, link: "v2", topics: ["ops.owner", "fleet.work.>"] });
@@ -114,7 +114,7 @@ describe("natsBridgeEventSource", () => {
     const first = iterator.next();
     await vi.waitFor(() => expect(fake.gets).toHaveLength(1), { timeout: 5_000 });
     expect(fake.added).toHaveLength(1);
-    expect(fake.added[0]).toMatchObject({ stream: "FABRIC_EV_SMARTY_PANTS_INC", config: {
+    expect(fake.added[0]).toMatchObject({ stream: "FABRIC_EV_EXAMPLE_ORG", config: {
       durable_name: `bev_${hashToken("bridge:v2")}`, deliver_policy: DeliverPolicy.New, ack_policy: AckPolicy.Explicit,
       max_deliver: -1, max_ack_pending: 1, filter_subjects: [`fabric.ev.${ORG}.fleet.work.>`, `fabric.ev.${ORG}.ops.owner`] } });
     fake.push({ subject: "x" });

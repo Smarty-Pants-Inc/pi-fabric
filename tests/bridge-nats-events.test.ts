@@ -13,7 +13,7 @@ import {
 } from "../src/mesh/bridge-nats-events.js";
 import type { BridgeNatsPortResolved } from "../src/mesh/bridge-nats-types.js";
 
-const ORG = "smarty-pants-inc";
+const ORG = "example-org";
 const BRIDGE = "ryzen1-bridge";
 const LEAD = "session:22222222-2222-4222-8222-222222222222";
 const MIRRORED = "session:11111111-1111-4111-8111-111111111111";
@@ -46,7 +46,7 @@ function eventMessage(topic: string, body: Record<string, unknown> = {}, options
 
 const resolved = (id: string, machine: string, live = true, kind: "main" | "actor" = "main"): BridgeNatsPortResolved => ({
   route: { machine, ownerHostId: id, ownerIdentityId: id, ownerIncarnation: "inc", capabilities: ["followUp"], live },
-  identity: { id, name: "kate-lead", kind, sessionId: id.slice(8) },
+  identity: { id, name: "v2-lead", kind, sessionId: id.slice(8) },
 });
 
 async function run(messages: FakeMessage[], options: { resolve?: (id: string) => BridgeNatsPortResolved | undefined;
@@ -86,7 +86,7 @@ describe("NATS bridge events: consume leg", () => {
     expect(delivered[0]).toMatchObject({ messageId: "evt-1", streamSequence: 42, attempt: 3, senderMachine: "v2-org",
       claimedFrom: { id: LEAD, name: "claimed-name" } });
     // The sender identity is the KV record's, and the stream owns the sequence.
-    expect(delivered[0]!.event.from).toEqual({ id: LEAD, name: "kate-lead", kind: "main", sessionId: LEAD.slice(8) });
+    expect(delivered[0]!.event.from).toEqual({ id: LEAD, name: "v2-lead", kind: "main", sessionId: LEAD.slice(8) });
     expect(delivered[0]!.event.sequence).toBe(42);
     expect(message.calls).toEqual(["ack"]);
   });
@@ -99,7 +99,7 @@ describe("NATS bridge events: consume leg", () => {
   it("refuses senders it cannot verify and anything already bridged, by TERM", async () => {
     const unknown = eventMessage("fleet.work.a.1", { from: { id: "session:nobody-000000", name: "x", kind: "main" } });
     const stale = eventMessage("fleet.work.a.2");
-    const mirror = eventMessage("fleet.work.a.3", { from: { id: MIRRORED, name: "paul", kind: "main" } });
+    const mirror = eventMessage("fleet.work.a.3", { from: { id: MIRRORED, name: "file-lead", kind: "main" } });
     const bridged = eventMessage("fleet.work.a.4", { data: { bridge: { from: "spoke", id: "x" } } });
     const actor = eventMessage("fleet.work.a.5", { from: { id: "actor-1", name: "a", kind: "actor" } });
     const lookups: string[] = [];

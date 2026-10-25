@@ -39,18 +39,18 @@ function bridge(w: ReturnType<typeof world>, options: { admit?: (record: FabricP
 
 function natsRoot(id = NATS_ROOT, incarnation = "nats-inc-1", overrides: Partial<FabricParticipantRecord> = {}): FabricParticipantRecord {
   return { format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id, ownerIncarnation: incarnation,
-    name: "kate-main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp", "fabric"],
+    name: "v2-main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp", "fabric"],
     controlProtocol: "v1", startedAt: 999_000, updatedAt: 1_000_000, sessionId: id.slice("session:".length), cwd: "/work", ...overrides };
 }
 function fileRoot(id = FILE_ROOT, incarnation = "file-inc-1", overrides: Partial<FabricParticipantRecord> = {}): FabricParticipantRecord {
   return { format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id, ownerIncarnation: incarnation,
-    name: "paul-lead", status: "running", runner: "pi", transport: "host", capabilities: ["steer", "followUp", "fabric"],
-    controlProtocol: "v1", startedAt: 900_000, updatedAt: 1_000_000, sessionId: id.slice("session:".length), cwd: "/home/paul/repo",
+    name: "file-lead", status: "running", runner: "pi", transport: "host", capabilities: ["steer", "followUp", "fabric"],
+    controlProtocol: "v1", startedAt: 900_000, updatedAt: 1_000_000, sessionId: id.slice("session:".length), cwd: "/work/repo",
     herdrPane: "p1", mainProcess: { pid: 1, host: "ryzen1" }, mainBindings: false, interactive: true,
     services: [{ name: "x", version: 1 }], ...overrides } as FabricParticipantRecord;
 }
 function fileHost(id: string, observedAt: number, expiresAt: number, incarnationToken = "host-token-1"): BridgeHost {
-  return { record: { format: 1, id, rootId: id, identity: { id, name: "paul-lead", kind: "main" }, incarnationToken,
+  return { record: { format: 1, id, rootId: id, identity: { id, name: "file-lead", kind: "main" }, incarnationToken,
     startedAt: 900_000, updatedAt: observedAt, expiresAt }, expiresAt, observedAt };
 }
 const filePresence = (clock: Clock, roots: FabricParticipantRecord[], extra: Partial<NatsBridgeMirrorPresence> = {}): NatsBridgeMirrorPresence =>
@@ -90,7 +90,7 @@ describe("NATS presence -> file mirror snapshot", () => {
     expect(presence.hosts).toHaveLength(1);
     const host = presence.hosts[0]!;
     expect(host.record).toMatchObject({ format: 1, id: NATS_ROOT, rootId: NATS_ROOT, incarnationToken: "nats-inc-1",
-      identity: { id: NATS_ROOT, name: "kate-main", kind: "main", sessionId: NATS_ROOT.slice(8) } });
+      identity: { id: NATS_ROOT, name: "v2-main", kind: "main", sessionId: NATS_ROOT.slice(8) } });
     expect(host.observedAt).toBe(clock.wall);
     // Receipt-bounded: 15 s TTL less the 2 s safety, never more than the mirror freshness bound.
     expect(host.expiresAt).toBe(clock.wall + 13_000);

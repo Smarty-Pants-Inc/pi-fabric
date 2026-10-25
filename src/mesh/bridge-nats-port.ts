@@ -309,23 +309,22 @@ export class NatsBridgePort implements BridgeNatsPort {
     };
   }
 
+  /** Every KV record (every machine, live or not) as the identity gate reads it; `list()` serves the dry run. */
   presenceView(): BridgeNatsPresenceView {
-    return {
-      side: "nats",
-      records: (id: string): readonly BridgeNatsPresenceRecord[] => {
-        const observedAt = this.#now();
-        return this.kv.reader.records(id).flatMap(route => {
-          const kind = meshKind(route.kind);
-          if (!kind) return [];
-          return [{
-            id: route.id, name: route.record.name, kind, rootId: route.rootId,
-            ...(route.record.sessionId !== undefined ? { sessionId: route.record.sessionId } : {}),
-            ownerHostId: route.ownerHostId, ownerIdentityId: route.ownerIdentityId, ownerIncarnation: route.ownerIncarnation,
-            machine: route.machine, live: route.live, observedAt,
-          }];
-        });
-      },
+    const map = (id?: string): readonly BridgeNatsPresenceRecord[] => {
+      const observedAt = this.#now();
+      return this.kv.reader.records(id).flatMap(route => {
+        const kind = meshKind(route.kind);
+        if (!kind) return [];
+        return [{
+          id: route.id, name: route.record.name, kind, rootId: route.rootId,
+          ...(route.record.sessionId !== undefined ? { sessionId: route.record.sessionId } : {}),
+          ownerHostId: route.ownerHostId, ownerIdentityId: route.ownerIdentityId, ownerIncarnation: route.ownerIncarnation,
+          machine: route.machine, live: route.live, observedAt,
+        }];
+      });
     };
+    return { side: "nats", records: (id: string) => typeof id === "string" ? map(id) : [], list: () => map() };
   }
 
   /**

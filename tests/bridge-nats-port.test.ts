@@ -13,6 +13,7 @@ import {
 } from "../src/mesh/bridge-nats-port.js";
 import { bridgeNatsLinkIdentity, type BridgeNatsMirrorSet, type BridgeNatsPort } from "../src/mesh/bridge-nats-types.js";
 import type { NatsFileActorRead } from "../src/mesh/bridge-nats-actors.js";
+import { createBridgeNatsIdentityGate, parseBridgeNatsAllowSection } from "../src/mesh/bridge-nats-identity.js";
 import { controlBodyFingerprint } from "../src/mesh/control-idempotency.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import type { BridgeHost } from "../src/mesh/bridge.js";
@@ -63,7 +64,7 @@ function message(options: { id: string; kind?: "command" | "ack"; toHostId?: str
   const body = options.body ?? { commandId: "c".repeat(64), targetId, operation: "followUp", message: "hi", replyTo: NATS_ROOT,
     requestedAt: 1, deadlineAt: 2, ownerIncarnation: "file-inc-1" };
   const envelope = { id: options.id, kind, to: { machine: options.toMachine ?? BRIDGE, hostId: toHostId }, targetId,
-    operation: kind === "command" ? "followUp" : "accepted", from: { id: NATS_ROOT, name: "kate-main", kind: "main" },
+    operation: kind === "command" ? "followUp" : "accepted", from: { id: NATS_ROOT, name: "v2-main", kind: "main" },
     ...(options.principal !== undefined ? { principal: options.principal } : {}), body, createdAt: 123 };
   const calls: string[] = [];
   return {
@@ -101,11 +102,11 @@ function port(w: KvWorld, options: { send?: (envelope: TransportEnvelope) => Pro
 
 function natsRoot(id = NATS_ROOT): FabricParticipantRecord {
   return { format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id, ownerIncarnation: "nats-inc-1",
-    name: "kate-main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp", "fabric"],
+    name: "v2-main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp", "fabric"],
     controlProtocol: "v1", startedAt: 999_000, updatedAt: 1_000_000, sessionId: id.slice(8) };
 }
 function fileRoot(id = FILE_ROOT): FabricParticipantRecord {
-  return { ...natsRoot(id), ownerIncarnation: "file-inc-1", name: "paul-lead" };
+  return { ...natsRoot(id), ownerIncarnation: "file-inc-1", name: "file-lead" };
 }
 function fileActor(overrides: Partial<FabricParticipantRecord> = {}): FabricParticipantRecord {
   return { format: 1, id: SUPERVISOR, kind: "actor", rootId: FILE_ROOT, ownerHostId: "resident:0123456789abcdef01234567",
@@ -114,13 +115,13 @@ function fileActor(overrides: Partial<FabricParticipantRecord> = {}): FabricPart
     controlProtocol: "v1", startedAt: 900_000, updatedAt: 1_000_000, ...overrides };
 }
 const fileHost = (id: string, at: number, expiresAt = at + 60_000): BridgeHost => ({ record: { format: 1, id, rootId: id,
-  identity: { id, name: "paul-lead", kind: "main" }, startedAt: 900_000, updatedAt: at, expiresAt }, expiresAt, observedAt: at });
+  identity: { id, name: "file-lead", kind: "main" }, startedAt: 900_000, updatedAt: at, expiresAt }, expiresAt, observedAt: at });
 const mirrorSet = (at: number, participants: FabricParticipantRecord[] = [fileRoot()], hosts = [fileHost(FILE_ROOT, at)]): BridgeNatsMirrorSet =>
   ({ hosts, participants, linkIdentity: LINK_IDENTITY });
 
 const command = (overrides: Partial<TransportEnvelope> = {}): TransportEnvelope => ({
   id: "bnf1-abc", kind: "command", to: { machine: V2, hostId: NATS_ROOT }, targetId: NATS_ROOT, operation: "followUp",
-  from: { id: FILE_ROOT, name: "paul-lead", kind: "main" }, body: { commandId: "x", targetId: NATS_ROOT, operation: "followUp" }, ...overrides,
+  from: { id: FILE_ROOT, name: "file-lead", kind: "main" }, body: { commandId: "x", targetId: NATS_ROOT, operation: "followUp" }, ...overrides,
 });
 
 async function next(iterator: AsyncIterator<NatsBridgeDelivery>): Promise<NatsBridgeDelivery> {
@@ -175,7 +176,7 @@ describe("NATS bridge port: link identity and presence", () => {
     expect(p.resolve(NATS_ROOT)).toEqual({
       route: { machine: V2, ownerHostId: NATS_ROOT, ownerIdentityId: NATS_ROOT, ownerIncarnation: "nats-inc-1",
         capabilities: ["steer", "followUp", "fabric"], live: true },
-      identity: { id: NATS_ROOT, name: "kate-main", kind: "main", sessionId: NATS_ROOT.slice(8) },
+      identity: { id: NATS_ROOT, name: "v2-main", kind: "main", sessionId: NATS_ROOT.slice(8) },
     });
     expect(p.resolve("session:absent-0000")).toBeUndefined();
   });
@@ -188,7 +189,7 @@ describe("NATS bridge port: link identity and presence", () => {
     await p.mirror(mirrorSet(clock.wall), clock.wall);
     const view = p.presenceView();
     expect(view.side).toBe("nats");
-    expect(view.records(NATS_ROOT)).toEqual([{ id: NATS_ROOT, name: "kate-main", kind: "main", rootId: NATS_ROOT,
+    expect(view.records(NATS_ROOT)).toEqual([{ id: NATS_ROOT, name: "v2-main", kind: "main", rootId: NATS_ROOT,
       sessionId: NATS_ROOT.slice(8), ownerHostId: NATS_ROOT, ownerIdentityId: NATS_ROOT, ownerIncarnation: "nats-inc-1",
       machine: V2, live: true, observedAt: clock.wall }]);
     // The link's own mirror is a record under the bridge machine; mirroredBy stays unset on NATS.
@@ -197,6 +198,9 @@ describe("NATS bridge port: link identity and presence", () => {
     seedNative(w, "v3-org", { ...natsRoot(), ownerIncarnation: "other" }, 1_000_000);
     await vi.waitFor(() => expect(view.records(NATS_ROOT)).toHaveLength(2));
     expect(p.resolve(NATS_ROOT)).toBeUndefined();
+    // The full listing (dry run) is every record on every machine, the link identity included.
+    expect(view.list?.().map(record => `${record.id}@${record.machine}`)).toEqual([
+      `${LINK_ID}@${BRIDGE}`, `${FILE_ROOT}@${BRIDGE}`, `${NATS_ROOT}@v2-org`, `${NATS_ROOT}@v3-org`]);
   });
 
   it("returns only admitted roots from other machines, and wakes only on another machine's change", async () => {
@@ -213,6 +217,26 @@ describe("NATS bridge port: link identity and presence", () => {
     expect(changes).toEqual([]);
     seedNative(w, "v3-org", natsRoot("session:44444444-4444-4444-8444-444444444444"), clock.wall);
     await vi.waitFor(() => expect(changes.length).toBe(2));
+  });
+});
+
+describe("NATS bridge port: with L3's identity gate", () => {
+  it("verifies a NATS sender on its source machine and refuses this link's own mirrors, from the port's presenceView", async () => {
+    const w = kvWorld();
+    seedNative(w, V2, natsRoot(), 1_000_000);
+    const { port: p, clock } = port(w);
+    await p.start();
+    await p.mirror(mirrorSet(clock.wall), clock.wall);
+    const config = parseBridgeNatsAllowSection({ file: [{ kind: "root", id: FILE_ROOT }], nats: [{ kind: "root", id: NATS_ROOT }] },
+      { link: LINK, natsMachine: BRIDGE });
+    const gate = createBridgeNatsIdentityGate(config, { pins: { seats: new Map(), bound: new Map() }, clock: () => clock.wall });
+    const fileView = { side: "file" as const, records: () => [] };
+    const nats = p.presenceView();
+    expect(gate.verifySender("nats", NATS_ROOT, nats, fileView, V2)).toMatchObject({ ok: true,
+      identity: { side: "nats", id: NATS_ROOT, machine: V2, ownerIncarnation: "nats-inc-1" } });
+    expect(gate.verifySender("nats", NATS_ROOT, nats, fileView, "v3-org")).toMatchObject({ ok: false });
+    expect(gate.verifyTarget("nats", NATS_ROOT, nats, fileView)).toMatchObject({ ok: true });
+    expect(gate.verifySender("nats", FILE_ROOT, nats, fileView, V2)).toMatchObject({ ok: false, refuse: "BRIDGE_NATS_SIDE_MISMATCH" });
   });
 });
 
@@ -292,7 +316,7 @@ describe("NATS bridge port: send", () => {
     const { port: p, sent, clock } = port(w);
     await p.start();
     await p.mirror(mirrorSet(clock.wall), clock.wall);
-    const envelope = command({ principal: { kind: "human", id: "paul" } as unknown as TransportEnvelope["principal"] });
+    const envelope = command({ principal: { kind: "human", id: "principal-a" } as unknown as TransportEnvelope["principal"] });
     expect(await p.send(envelope)).toMatchObject({ id: "bnf1-abc", sequence: 41, duplicate: false });
     expect(sent).toEqual([envelope]);
     expect((await p.send(command({ id: "bnf1-link", from: LINK_IDENTITY }))).id).toBe("bnf1-link");
@@ -338,7 +362,7 @@ describe("NATS bridge port: machine-wide inbox", () => {
     const w = kvWorld();
     const { port: p, inbox } = port(w);
     const iterator = p.inbox(new AbortController().signal)[Symbol.asyncIterator]();
-    const principal = { kind: "human", id: "kate" };
+    const principal = { kind: "human", id: "principal-b" };
     const sent = message({ id: "n-1", sequence: 7, attempt: 2, principal });
     inbox.push(sent);
     const delivery = await next(iterator);

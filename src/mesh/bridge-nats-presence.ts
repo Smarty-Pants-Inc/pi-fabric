@@ -224,11 +224,11 @@ export class NatsPresenceReader {
     return [...machines].sort();
   }
 
-  /** Every row answering to the id, one per machine, live or not. */
-  records(id: string): NatsRoute[] {
+  /** Every row answering to the id (every row when id is undefined), one per machine, live or not. */
+  records(id?: string): NatsRoute[] {
     if (!this.ready) return [];
-    return [...this.#records.values()].filter(seen => seen.entry.value.id === id).map(seen => this.#route(seen))
-      .sort((a, b) => a.machine.localeCompare(b.machine));
+    return [...this.#records.values()].filter(seen => id === undefined || seen.entry.value.id === id).map(seen => this.#route(seen))
+      .sort((a, b) => a.id.localeCompare(b.id) || a.machine.localeCompare(b.machine));
   }
 
   /** A receiver's route for the id: undefined when absent or ambiguous (rows on two machines). */

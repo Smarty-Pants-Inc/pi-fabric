@@ -5,6 +5,7 @@ import path from "node:path";
 import { peerCredentials, type PeerInfo } from "../records/peer.js";
 import type { BridgePublish } from "./bridge.js";
 import { FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
+import { loadNatsLinkConfig } from "./bridge-nats-config.js";
 
 export const FABRIC_RELAY_DESTINATION_UNAVAILABLE = "FABRIC_RELAY_DESTINATION_UNAVAILABLE";
 
@@ -164,6 +165,31 @@ const startTicks = (pid: number): string => {
 };
 const canonical = (value: string, cwd: string): string => fs.realpathSync(path.resolve(cwd, value));
 
+/**
+ * The bridge entry points of ONE release that may hold a relay slot: `bin/mesh-bridge run ...` and, for the
+ * A' link (smarty-dev#15310 PR 2), `bin/nats-link start --config FILE`. Both live in the bin directory of the
+ * expected script; a script of another release (another directory) never matches.
+ */
+const RELAY_ENTRIES = ["mesh-bridge", "nats-link"] as const;
+const releaseEntry = (expected: Binding, script: string): typeof RELAY_ENTRIES[number] | undefined => {
+  const bin = path.dirname(expected.bridgeScriptPath);
+  return RELAY_ENTRIES.find(entry => script === path.join(bin, entry));
+};
+
+/**
+ * A nats-link peer's names and mesh, from its own config file. The file must be private to us: a regular
+ * file (not a symlink) owned by this uid with no group or other permission bits (0600 or stricter), since
+ * it names the link a relay slot speaks for.
+ */
+const natsLinkBinding = (configPath: string): { localName: string; remoteName: string; mesh: string } => {
+  if (!path.isAbsolute(configPath) || path.normalize(configPath) !== configPath) throw unavailable();
+  const stat = fs.lstatSync(configPath, { throwIfNoEntry: false });
+  if (!stat?.isFile() || stat.uid !== process.getuid!() || (stat.mode & 0o077) !== 0) throw unavailable();
+  let config: { name: string; link: string; file: { mesh: string } };
+  try { config = loadNatsLinkConfig(configPath); } catch { throw unavailable(); }
+  return { localName: config.name, remoteName: config.link, mesh: config.file.mesh };
+};
+
 /** Main script is argv[1], not a matching token in flags or in the transport command. */
 const inspectProcess = (pid: number, uid: number, expected: Binding, remote?: string): ProcIdentity => {
   if (!Number.isSafeInteger(pid) || pid <= 0 || fs.statSync(`/proc/${pid}`).uid !== uid) throw unavailable();
@@ -173,26 +199,47 @@ const inspectProcess = (pid: number, uid: number, expected: Binding, remote?: st
   const raw = procText(`/proc/${pid}/cmdline`, 64 * 1024);
   if (!raw.endsWith("\0")) throw unavailable();
   const argv = raw.slice(0, -1).split("\0");
-  if (!argv[0] || !argv[1] || argv[1].startsWith("-") || argv[2] !== "run" || nodePath !== expected.nodePath ||
-    canonical(argv[1], cwd) !== expected.bridgeScriptPath) throw unavailable();
-  const flags = new Map<string, string>();
-  for (let index = 3; index < argv.length; index += 2) {
-    if (argv[index] === "--") break;
-    const flag = argv[index]!;
-    const value = argv[index + 1];
-    const name = flag.slice(2);
-    if (!flag.startsWith("--") || !RUN_FLAGS.has(name) || flags.has(name) || !value) throw unavailable();
-    flags.set(name, value);
+  if (!argv[0] || !argv[1] || argv[1].startsWith("-") || nodePath !== expected.nodePath) throw unavailable();
+  const script = canonical(argv[1], cwd);
+  const entry = releaseEntry(expected, script);
+  let localName: string | undefined, sourceRemote: string | undefined, mesh: string | undefined;
+  if (entry === "mesh-bridge") {
+    if (argv[2] !== "run") throw unavailable();
+    const flags = new Map<string, string>();
+    for (let index = 3; index < argv.length; index += 2) {
+      if (argv[index] === "--") break;
+      const flag = argv[index]!;
+      const value = argv[index + 1];
+      const name = flag.slice(2);
+      if (!flag.startsWith("--") || !RUN_FLAGS.has(name) || flags.has(name) || !value) throw unavailable();
+      flags.set(name, value);
+    }
+    if (!flags.get("cursor")) throw unavailable();
+    localName = flags.get("name");
+    sourceRemote = flags.get("remote");
+    mesh = flags.get("mesh");
+  } else if (entry === "nats-link") {
+    // Exactly `nats-link start --config FILE` (its only start form); the names come from that config.
+    if (argv.length !== 5 || argv[2] !== "start" || argv[3] !== "--config" || !argv[4]) throw unavailable();
+    ({ localName, remoteName: sourceRemote, mesh } = natsLinkBinding(argv[4]));
+  } else {
+    throw unavailable();
   }
-  const mesh = flags.get("mesh");
-  const sourceRemote = flags.get("remote");
   if (!mesh || !sourceRemote || !NAME_PATTERN.test(sourceRemote) || sourceRemote === expected.localName ||
-    flags.get("name") !== expected.localName || (remote !== undefined && sourceRemote !== remote) ||
-    canonical(mesh, cwd) !== expected.meshRoot || !flags.get("cursor")) throw unavailable();
+    localName !== expected.localName || (remote !== undefined && sourceRemote !== remote) ||
+    canonical(mesh, cwd) !== expected.meshRoot) throw unavailable();
   if (startTicks(pid) !== before || fs.realpathSync(`/proc/${pid}/exe`) !== nodePath ||
     procText(`/proc/${pid}/cmdline`, 64 * 1024) !== raw || fs.statSync(`/proc/${pid}`).uid !== uid) throw unavailable();
-  return { ...expected, pid, startTicks: before, remoteName: sourceRemote };
+  // The peer's own entry point is part of its identity: its registration must name the same script.
+  return { ...expected, bridgeScriptPath: script, pid, startTicks: before, remoteName: sourceRemote };
 };
+
+/** Test seam only: the /proc identity a relay peer is admitted by. Never authority by itself. */
+export const inspectBridgeRelayProcessForTest = (pid: number, expected: Binding, remote?: string): ProcIdentity =>
+  inspectProcess(pid, process.getuid!(), {
+    ...expected, meshRoot: fs.realpathSync(expected.meshRoot), bridgeScriptPath: fs.realpathSync(expected.bridgeScriptPath),
+    nodePath: fs.realpathSync(expected.nodePath),
+  }, remote);
 
 const pinSocket = (directory: Directory, name: string, uid: number): Pin => {
   const at = `${directory.route}/${name}`;
@@ -458,7 +505,8 @@ export async function startBridgeRelay(options: {
       meshRoot: fs.realpathSync(options.meshRoot), bridgeScriptPath: fs.realpathSync(options.bridgeScriptPath),
       nodePath: fs.realpathSync(process.execPath),
     };
-    if (path.basename(expected.bridgeScriptPath) !== "mesh-bridge" || path.basename(path.dirname(expected.bridgeScriptPath)) !== "bin" ||
+    if (!(RELAY_ENTRIES as readonly string[]).includes(path.basename(expected.bridgeScriptPath)) ||
+      path.basename(path.dirname(expected.bridgeScriptPath)) !== "bin" ||
       !fs.statSync(expected.bridgeScriptPath).isFile() || !fs.statSync(expected.meshRoot).isDirectory() ||
       !/^node(?:js)?$/.test(path.basename(expected.nodePath))) throw unavailable();
     const currentBoot = bootId();

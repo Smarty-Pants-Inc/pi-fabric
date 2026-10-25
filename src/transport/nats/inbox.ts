@@ -56,6 +56,7 @@ const PUBLISH_RETRY_WINDOW_SAFETY_MS = 30_000;
 const PUBLISH_RETRY_INITIAL_MS = 250;
 const PUBLISH_RETRY_MAX_MS = 5_000;
 const DEFAULT_EPHEMERAL_INACTIVE_SECONDS = 3_600;
+const RUNTIME_INACTIVE_THRESHOLD_NS = 60 * 60 * 1_000_000_000;
 const EPHEMERAL_DELETE_TIMEOUT_MS = 1_000;
 const utf8 = new TextEncoder();
 const validMessageId = (id: string): boolean => id.length > 0 && id === id.trim() && !/[\u0000-\u001f\u007f]/.test(id);
@@ -82,7 +83,7 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly duplicateWindowMs?: number;
   readonly requestTimeoutMs?: number;
   readonly provision?: boolean;
-  /** Host-only opt-in to expiring this host's own inbox durable. */
+  /** Host-only opt-in to a custom idle lifetime and best-effort durable deletion on close. */
   readonly ephemeralHost?: boolean;
   /** Idle expiration in seconds when ephemeralHost is enabled (300..86400). */
   readonly ephemeralInactiveSeconds?: number;
@@ -196,7 +197,9 @@ const transportConsumerPolicy = (options: ResolvedNatsOptions): TransportConsume
   filterSubject: transportInboxFilter(options.machine, options.hostId),
   description: JSON.stringify({ fabricHostId: options.hostId, machine: options.machine }),
   maxAckPending: 128,
-  ...(options.ephemeralHost ? { inactiveThresholdNs: options.ephemeralInactiveSeconds * 1_000_000_000 } : {}),
+  ...(options.ephemeralHost
+    ? { inactiveThresholdNs: options.ephemeralInactiveSeconds * 1_000_000_000 }
+    : options.hostId.startsWith("runtime:") ? { inactiveThresholdNs: RUNTIME_INACTIVE_THRESHOLD_NS } : {}),
 });
 
 const isTransportEnvelope = (value: unknown): value is TransportEnvelope => {

@@ -10,6 +10,8 @@ const primaryEntryPoints = [
   "src/memory.ts",
   "src/mesh.ts",
   "src/mesh-bridge.ts",
+  // bin/nats-link and `pi-fabric nats-link` (smarty-dev#15310).
+  "src/mesh-bridge-nats-cli.ts",
   "src/participants-cli.ts",
   "src/actors-cli.ts",
   "src/resident-drain-cli.ts",
@@ -95,6 +97,8 @@ const lazyEntryPoints = [
   "src/mesh/nats-auth/cli.ts",
   "src/mesh/nats-auth/send-cli.ts",
   "src/mesh/nats-auth/dispatch-cli.ts",
+  // `nats-link start` loads the file <-> NATS link only when it starts (smarty-dev#15310).
+  "src/mesh/bridge-nats-link.ts",
   "src/mesh/nats-auth/owner-cli.ts",
   // First-use host custody and participant snapshots keep stable lazy paths.
   "src/topology/host-leases.ts",

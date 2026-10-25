@@ -16,6 +16,8 @@ const commands: Record<string, () => Promise<FabricCliCommand>> = {
   mesh: async () => (await import("./mesh.js")).runMeshCli,
   decisions: async () => (await import("./decisions.js")).runDecisionsCli,
   nats: async () => (await import("../mesh/nats-auth/cli.js")).runNatsCli,
+  // The NATS link CLI, also as bin/nats-link; images that link only pi-fabric reach `nats-link roots` here.
+  "nats-link": async () => (await import("../mesh-bridge-nats-cli.js")).main,
   events: async () => runEventsCli,
   session: async () => runSessionCli,
 };

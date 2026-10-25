@@ -208,6 +208,9 @@ export class NatsPresenceReader {
 
   get ready(): boolean { return this.#started && !this.#closed && this.#ready.size === 2; }
 
+  /** A reconnect gap is open: the served view is the last snapshot, and absence in it proves nothing. */
+  get resyncing(): boolean { return this.#resync.presence !== undefined || this.#resync.leases !== undefined; }
+
   /** Resolves once both snapshots are ready; rejects on close or abort. */
   whenReady(signal?: AbortSignal): Promise<void> {
     if (this.ready) return Promise.resolve();
@@ -1011,7 +1014,8 @@ export class NatsBridgePresence {
       });
       participants.push(record);
     }
-    return { hosts, participants, reserved: [] };
+    // During a reconnect gap a root that aged out is unknown, not gone: never withdrawal evidence.
+    return { hosts, participants, reserved: [], ...(this.reader.resyncing ? { partial: true } : {}) };
   }
 
   /**

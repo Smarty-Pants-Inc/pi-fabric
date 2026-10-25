@@ -172,10 +172,14 @@ describe("NATS presence -> file mirror snapshot", () => {
     expect(side.reader.ready).toBe(true);
     expect(side.resolve(NATS_ROOT)?.live).toBe(true);
     expect(side.resolve(gone)?.live).toBe(true);
-    expect((await side.presence()).hosts.map(host => host.record.id).sort()).toEqual([NATS_ROOT, gone].sort());
+    const during = await side.presence();
+    expect(during.hosts.map(host => host.record.id).sort()).toEqual([NATS_ROOT, gone].sort());
+    // Absence in a gap's snapshot proves nothing: it is partial, so the file side holds, never withdraws.
+    expect(during.partial).toBe(true);
     // Liveness still ages by receipt: a long gap ends it without any new event.
     advance(clock, 13_000);
     expect(side.resolve(NATS_ROOT)?.live).toBe(false);
+    expect(await side.presence()).toMatchObject({ hosts: [], partial: true });
     // The new snapshot replaces the view in one step: the deleted root is gone, the renewed one is live.
     w.leases.put(hKey(V2, NATS_ROOT), `${NATS_ROOT}#nats-inc-1`, natsLease(NATS_ROOT, "nats-inc-1", clock.wall),
       w.leases.values.get(hKey(V2, NATS_ROOT))!.revision);
@@ -184,6 +188,9 @@ describe("NATS presence -> file mirror snapshot", () => {
     await waitFor(() => expect(side.resolve(gone)).toBeUndefined());
     expect(side.resolve(NATS_ROOT)?.live).toBe(true);
     expect(changes).toContain("presence");
+    const after = await side.presence();
+    expect(after.partial).toBeUndefined();
+    expect(after.hosts.map(host => host.record.id)).toEqual([NATS_ROOT]);
   });
 
   it("drops an expired lease at once and ignores a JSON-claimed machine or mirror provenance", async () => {

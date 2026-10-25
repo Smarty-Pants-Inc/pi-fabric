@@ -2,7 +2,8 @@
  * The NATS link's config file (smarty-dev#15310, A' lane L5): one JSON object that names everything a
  * file-mesh <-> NATS link needs. Names and paths only: never a credential's bytes, a JWT, a seed or a CA's
  * private part. L5 owns this schema; its `allow` section is L3's `BridgeNatsAllowSection` (bridge-nats-types.ts),
- * parsed by L3's own `parseBridgeNatsAllowSection` into the frozen allow-list its identity gate takes. `startNatsLink`
+ * checked here with L3's own `parseBridgeNatsAllowSection`; `natsLinkAllowListConfig` gives the frozen allow-list
+ * L3's identity gate takes, and `startNatsLink` parses the same section itself. `startNatsLink`
  * (bridge-nats-link.ts) takes the parsed `NatsLinkConfig`; `nats-link start|status|receipt` load it with
  * `loadNatsLinkConfig`.
  *
@@ -20,7 +21,7 @@ import path from "node:path";
 import type { FabricMeshNatsConfig } from "../config.js";
 import { DEFAULT_INBOX_MAX_AGE_MS } from "../transport/nats/inbox-policy.js";
 import { BridgeNatsAllowListError, bridgeNatsAllowKey, parseBridgeNatsAllowSection } from "./bridge-nats-identity.js";
-import type { BridgeNatsAllowListConfig } from "./bridge-nats-types.js";
+import type { BridgeNatsAllowListConfig, BridgeNatsAllowSection } from "./bridge-nats-types.js";
 
 export const NATS_LINK_CONFIG_VERSION = 1;
 /** A config file larger than this is refused unread. */
@@ -63,12 +64,12 @@ export interface NatsLinkConfig {
     readonly inboxLanes: number;
   };
   /**
-   * Who may cross, from the config's `allow: {file, nats}` (L3's BridgeNatsAllowSection), parsed by L3's
-   * parseBridgeNatsAllowSection: frozen, each entry normalized with its home side. `file` entries are native
-   * on the file mesh and mirrored into NATS KV under nats.machine; `nats` entries are native on the broker and
-   * mirrored into the file mesh with remoteHost = link. Pass it unchanged to createBridgeNatsIdentityGate.
+   * Who may cross: the config's `allow: {file, nats}` as written (L3's BridgeNatsAllowSection), frozen, after
+   * L3's parseBridgeNatsAllowSection accepted it. `file` entries are native on the file mesh and mirrored into
+   * NATS KV under nats.machine; `nats` entries are native on the broker and mirrored into the file mesh with
+   * remoteHost = link. `natsLinkAllowListConfig` gives the normalized list for L3's gate.
    */
-  readonly allow: BridgeNatsAllowListConfig;
+  readonly allow: BridgeNatsAllowSection;
   /** Absolute path of the org.json whose principal seats pin the allow-list; absent = bridgeNatsOrgJsonCandidates(). */
   readonly orgJson?: string;
   /** Deadline of each call to the NATS side, ms (default 30,000). */
@@ -212,21 +213,23 @@ export const parseNatsLinkConfig = (value: unknown): NatsLinkConfig => {
     throw new NatsLinkConfigError("nats.operatorMachine", "must match fabric-ops(-<lowercase alphanumeric>)");
   }
 
-  let allow: BridgeNatsAllowListConfig;
+  let parsed: BridgeNatsAllowListConfig;
   try {
-    allow = parseBridgeNatsAllowSection(root.allow, { link: root.link, natsMachine: nats.machine });
+    parsed = parseBridgeNatsAllowSection(root.allow, { link: root.link, natsMachine: nats.machine });
   } catch (error) {
     if (!(error instanceof BridgeNatsAllowListError)) throw error;
     throw new NatsLinkConfigError(error.field, error.message.slice(error.field.length + 1));
   }
   // A machine pin names an org machine: one in the inventory (L3 already refuses the bridge's own).
-  allow.entries.forEach((entry) => {
+  parsed.entries.forEach((entry) => {
     if (entry.machine !== undefined && !(machines as string[]).includes(entry.machine)) {
-      const index = allow.entries.filter((other) => other.side === entry.side).indexOf(entry);
+      const index = parsed.entries.filter((other) => other.side === entry.side).indexOf(entry);
       throw new NatsLinkConfigError(`allow.${entry.side}[${index}].machine`, "must be one of nats.pathBMachines");
     }
   });
   const orgJson = root.orgJson === undefined ? undefined : absolutePath(root.orgJson, "orgJson");
+  // The section as written, frozen: L3's parser accepted it, and every reader parses it again the same way.
+  const allow = deepFreeze(JSON.parse(JSON.stringify(root.allow ?? {})) as BridgeNatsAllowSection);
 
   const logLevel = root.logLevel === undefined ? "info" : root.logLevel;
   if (logLevel !== "info" && logLevel !== "debug") throw new NatsLinkConfigError("logLevel", "must be info or debug");
@@ -257,6 +260,18 @@ export const parseNatsLinkConfig = (value: unknown): NatsLinkConfig => {
     logLevel,
   };
 };
+
+const deepFreeze = <T>(value: T): T => {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+};
+
+/** The normalized, frozen allow-list L3's identity gate takes (createBridgeNatsIdentityGate), from the config's section. */
+export const natsLinkAllowListConfig = (config: Pick<NatsLinkConfig, "allow" | "link" | "nats">): BridgeNatsAllowListConfig =>
+  parseBridgeNatsAllowSection(config.allow, { link: config.link, natsMachine: config.nats.machine });
 
 const euid = (): number | undefined => process.geteuid?.();
 
@@ -387,7 +402,7 @@ export const describeNatsLinkConfig = (config: NatsLinkConfig): Record<string, u
     events: config.nats.events, credentials: config.nats.credentials, caFile: config.nats.caFile,
   },
   allow: {
-    file: config.allow.entries.filter((entry) => entry.side === "file").map(bridgeNatsAllowKey),
-    nats: config.allow.entries.filter((entry) => entry.side === "nats").map(bridgeNatsAllowKey),
+    file: natsLinkAllowListConfig(config).entries.filter((entry) => entry.side === "file").map(bridgeNatsAllowKey),
+    nats: natsLinkAllowListConfig(config).entries.filter((entry) => entry.side === "nats").map(bridgeNatsAllowKey),
   },
 });

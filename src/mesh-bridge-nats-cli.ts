@@ -24,6 +24,7 @@ import {
   loadNatsLinkConfig,
   type NatsLinkConfig,
   NatsLinkConfigError,
+  natsLinkAllowListConfig,
   natsLinkStatePaths,
   preflightNatsLinkConfig,
 } from "./mesh/bridge-nats-config.js";
@@ -212,7 +213,7 @@ const fileParticipants = (store: MeshStore): ParticipantRow[] => {
 };
 
 const sideEntries = (config: NatsLinkConfig, side: BridgeNatsSide): BridgeNatsAllowEntry[] =>
-  config.allow.entries.filter((entry) => entry.side === side);
+  natsLinkAllowListConfig(config).entries.filter((entry) => entry.side === side);
 
 /** A root entry names a root by id; an actor entry by owner root and name (and its id, when pinned). */
 const allowMatches = (entry: BridgeNatsAllowEntry, row: Pick<ParticipantRow, "id" | "kind" | "rootId" | "name">): boolean =>
@@ -269,7 +270,7 @@ export const natsPresenceView = (roots: readonly NatsRootInfo[], observedAt: num
  * contradicts a principal's bound session. Fails closed on a missing, unsafe or malformed org.json.
  */
 const identityGate = (config: NatsLinkConfig) =>
-  createBridgeNatsIdentityGate(config.allow, { pins: loadBridgeNatsSeatPins(config.orgJson) });
+  createBridgeNatsIdentityGate(natsLinkAllowListConfig(config), { pins: loadBridgeNatsSeatPins(config.orgJson) });
 
 /**
  * dry-run: for every allow entry, what it resolves to on its home side right now and what the link would
@@ -428,7 +429,7 @@ export const sessionReceipt = async (
   }
   const found = rows.filter((row) => row.id === id);
   const file = found.length === 1 ? found[0]! : undefined;
-  const side = config.allow.entries.find((entry) => entry.kind === "root" && entry.id === id)?.side ?? null;
+  const side = natsLinkAllowListConfig(config).entries.find((entry) => entry.kind === "root" && entry.id === id)?.side ?? null;
   const problems: string[] = [];
   if (!side) problems.push("not on this link's allow-list");
   if (found.length > 1) problems.push("several file-mesh records answer to this id");

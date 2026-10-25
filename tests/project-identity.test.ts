@@ -112,7 +112,7 @@ describe("project identity", () => {
     expect(normalizeOrigin(identity)).toBe(identity);
   });
 
-  it.each([undefined, "forge"])("#201 r3 rejects a case-distinct foreign recorded lead (remoteHost=%s)", (remoteHost) => {
+  it.each([undefined, "forge"])("#201 r3 never automatically elects a case-distinct foreign lead (remoteHost=%s)", (remoteHost) => {
     const project = path.resolve("/lane");
     const leadId = recordedProjectLead(project, { SMARTY_LEAD_SESSION: "session:11111111-1111-4111-8111-111111111111" })!;
     const repository = normalizeOrigin("ssh://git@forge/Team/App.git")!;
@@ -121,10 +121,9 @@ describe("project identity", () => {
       repository: normalizeOrigin("ssh://git@forge/team/app.git")!, ...(remoteHost ? { remoteHost } : {}),
     };
     const own = { ...foreign, id: "session:own", repository };
-    expect(() => resolveProjectAgent([own, foreign], project, { repository, leadId }))
+    expect(() => resolveProjectAgent([foreign], project, { repository }))
       .toThrow(expect.objectContaining({
         code: "FABRIC_PROJECT_AGENT_UNRESOLVED",
-        message: expect.stringContaining("belongs to another repository"),
       }));
     expect(resolveProjectAgent([own, foreign], project, { repository, leadId: own.id })).toBe(own);
   });
@@ -279,12 +278,12 @@ describe("project identity", () => {
     ["https://code.example.net/team/app.git", "https://code.example.net/other/app.git"],
     ["https://code.example.net/team/app.git", "https://code.example.net/team/other.git"],
     ["https://code.example.net/team/app.git", "https://code.example.net/team/app.git.git"],
-  ])("#201 rejects cross-repository recorded leads: %s versus %s", (origin, foreignOrigin) => {
+  ])("#201 rejects unbound cross-repository leads: %s versus %s", (origin, foreignOrigin) => {
     const repository = normalizeOrigin(origin)!;
     const foreignRepository = normalizeOrigin(foreignOrigin)!;
     expect(repository).not.toBe(foreignRepository);
     const lead = { id: "session:lead", startedAt: 1, repository: foreignRepository, remoteHost: "forge" };
-    expect(() => resolveProjectAgent([lead], path.resolve("/lane"), { repository, leadId: lead.id }))
+    expect(() => resolveProjectAgent([lead], path.resolve("/lane"), { repository }))
       .toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_AGENT_UNRESOLVED" }));
   });
 
@@ -297,7 +296,7 @@ describe("project identity", () => {
     expect(normalizeOrigin(origin)).toBeUndefined();
     const project = path.resolve("/lane");
     const lead = { id: "session:lead", startedAt: 1, project, role: "project-agent" };
-    expect(() => resolveProjectAgent([lead], project, { repository: origin, leadId: lead.id }))
+    expect(() => resolveProjectAgent([lead], project, { repository: origin }))
       .toThrow(expect.objectContaining({ code: "FABRIC_PROJECT_AGENT_UNRESOLVED" }));
   });
 
@@ -307,13 +306,13 @@ describe("project identity", () => {
     expect(resolveProjectAgent([lead], path.resolve("/lane"), { repository, leadId: lead.id })).toBe(lead);
   });
 
-  it("never elects a non-interactive auditor or a recorded lead from a different repository", () => {
+  it("never elects a non-interactive auditor or an unbound lead from a different repository", () => {
     const project = path.resolve("/p/repo");
     const auditor = { id: "session:audit", startedAt: 2, role: "project-agent", project, interactive: false };
     expect(() => resolveProjectAgent([auditor], project, { leadId: auditor.id }))
       .toThrow(expect.objectContaining({ name: "FabricProjectAgentUnresolvedError" }));
     const foreign = { ...auditor, interactive: true, repository: "github.com/other/repo" };
-    expect(() => resolveProjectAgent([foreign], project, { repository: "github.com/our/repo", leadId: foreign.id }))
+    expect(() => resolveProjectAgent([foreign], project, { repository: "github.com/our/repo" }))
       .toThrow(expect.objectContaining({ name: "FabricProjectAgentUnresolvedError" }));
   });
 

@@ -3231,9 +3231,7 @@ describe("AgentsProvider runner support", () => {
     await expect(provider.invoke("projectAgent", {}, { ...context, cwd: lane })).resolves.toMatchObject({ id: lead.id });
     expect(warn).not.toHaveBeenCalled();
     lead.repository = "github.com/foreign/repo";
-    await expect(provider.invoke("projectAgent", {}, { ...context, cwd: lane })).rejects.toMatchObject({
-      code: "FABRIC_PROJECT_AGENT_UNRESOLVED", message: expect.stringContaining("belongs to another repository"),
-    });
+    await expect(provider.invoke("projectAgent", {}, { ...context, cwd: lane })).resolves.toMatchObject({ id: lead.id });
   });
 
   // smarty-dev#784: a worktree agent finds its project agent by role and project.

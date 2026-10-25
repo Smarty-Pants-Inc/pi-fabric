@@ -130,12 +130,20 @@ kubectl exec <pod> -c pi -- /opt/pi-fabric/dist/cli/index.js session drain <sid>
 
 The pod UID is checked against the input pin before and after. `exited` is the pi container's own exit status.
 
-`resume-drain` stays refused while either of these is open:
-- the image owner confirms the in-image CLI path;
-- a trusted pod-identity and caller proof exists.
+Pod bindings carry no seat lock. Inside the Pod, the Main accepts one only from a process that the container runtime
+injected, which is what `kubectl exec` produces. Four checks prove it:
+- its SO_PEERCRED uid is the Main's euid;
+- it is neither the Main nor pid 1;
+- `/proc/<pid>/stat` reads PPid 0 before and after;
+- its start time is unchanged between those two reads.
 
-The second one exists because pod bindings carry no seat lock, so inside the Pod any same-UID process could present
-one.
+Every process the Main or its tools fork has a parent inside the Pod's PID namespace. An orphan reparents to pid 1.
+
+SO_PEERCRED needs `/usr/bin/python3` in the image. Without it, pod bindings refuse. The in-pod CLI reports YAMA
+`ptrace_scope`, because at scope 0 a same-UID ptrace of the exec'd CLI is the A6-class residual. Anyone with
+`pods/exec` RBAC on the Pod is authorized by design.
+
+`resume-drain` stays refused until the image owner confirms the in-image CLI path (`POD_FABRIC_CLI.confirmed`).
 
 ## Claims and residuals
 

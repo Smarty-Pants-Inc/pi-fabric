@@ -1,6 +1,6 @@
 import { BRIDGE_STALL_ALARM_TOPIC, type BridgePublish } from "./bridge.js";
 import {
-  carrierIdentity, isStaleIncarnationRefusal, NatsCarrierRefusal,
+  carrierIdentity, isStaleIncarnationRefusal, NatsCarrierRefusal, NatsCarrierUnavailable,
   type NatsCarrierDecision, type NatsCarrierEnvelope, type NatsCarrierLedger, type NatsCarrierPresence, type NatsCarrierRecord,
   type NatsOutbound, type NatsPresenceEntry,
 } from "./bridge-nats-carrier.js";
@@ -166,8 +166,10 @@ export class NatsTopicTranslator {
 
   #target(id: string): NatsPresenceEntry {
     const target = this.#presence.nats(id);
+    // A KV gap (reconnect, watch reset) while MeshBridge still holds the target's mirror is a wait, not a drop.
+    if (!target?.route.live) throw new NatsCarrierUnavailable(id);
     // A NATS-native root itself (its own host and identity), never an actor or this bridge's own mirror.
-    if (!target?.route.live || target.route.machine === this.machine || !BRIDGE_NATS_MACHINE.test(target.route.machine) ||
+    if (target.route.machine === this.machine || !BRIDGE_NATS_MACHINE.test(target.route.machine) ||
         target.route.ownerHostId !== id || target.route.ownerIdentityId !== id || target.identity.id !== id) {
       throw new NatsCarrierRefusal("topic target is not a live NATS root");
     }

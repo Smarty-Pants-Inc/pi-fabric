@@ -131,6 +131,8 @@ export interface NatsCarrierRecord {
    * restart rebuilds the envelope from it: same id, same body bytes, the same verified sender id.
    */
   readonly body?: Record<string, unknown>;
+  /** The owner's first recorded answer, once settled (data is the ACK as sent back to the source). */
+  readonly outcome?: NatsCarrierOutcome;
 }
 
 /** What the owner answered, recorded once against a record. */
@@ -171,6 +173,13 @@ export interface NatsCarrierOptions {
   now?: () => number;
   /** Largest ACK body carried either way (default NATS_CARRIER_MAX_ACK_BYTES). */
   maxAckBytes?: number;
+}
+
+/** Retryable: the target's NATS route is missing right now. MeshBridge keeps its cursor before the event. */
+export class NatsCarrierUnavailable extends Error {
+  override readonly name = "NatsCarrierUnavailable";
+  readonly code = "FABRIC_NATS_CARRIER_TARGET_UNAVAILABLE";
+  constructor(readonly targetId: string) { super(`NATS route for ${targetId} is unavailable; the event waits for presence`); }
 }
 
 /** Thrown for a permanent refusal. "not allowed" makes MeshBridge drop and log the event, never retry it. */
@@ -376,9 +385,10 @@ export class NatsBridgeCarrier {
     const targetId = data.targetId as string;
     const owner = this.#presence.nats(targetId);
     // Only a NATS-native owner: a route back to this bridge's own machine would loop into the file mesh.
-    if (!owner?.route.live || !BRIDGE_NATS_MACHINE.test(owner.route.machine) || owner.route.machine === this.machine) {
-      throw new NatsCarrierRefusal("target is not a live NATS participant");
-    }
+    if (owner && owner.route.machine === this.machine) throw new NatsCarrierRefusal("target is a file participant this bridge mirrors");
+    // MeshBridge just held the target's file mirror. A KV gap (reconnect, watch reset) is a wait, never a
+    // drop: the cursor stays before the command, and MeshBridge itself drops it if the mirror lapses.
+    if (!owner?.route.live || !BRIDGE_NATS_MACHINE.test(owner.route.machine)) throw new NatsCarrierUnavailable(targetId);
     if (owner.route.ownerHostId !== pub.to) throw new NatsCarrierRefusal("command host is not the target's NATS owner");
     const operation = data.operation as FabricControlOperation;
     const requesterId = sender.identity.id;
@@ -423,15 +433,20 @@ export class NatsBridgeCarrier {
     };
     const { created, record: stored } = await this.#ledger.claim(record);
     if (created) return { kind: "send", envelope, record };
-    // A repeat of one carried command resends its first envelope: the stored id, machine and body bytes.
     if (stored.direction !== "toNats" || stored.origin !== "control" || stored.bodyDigest !== bodyDigest ||
         stored.requesterId !== requesterId || stored.targetId !== targetId || !stored.body || !stored.ownerMachine) {
       throw new NatsCarrierRefusal("command id reused with different input");
     }
-    return { kind: "send", record: stored, envelope: this.#envelope({
-      id: stored.destinationEventId, kind: "command", to: { machine: stored.ownerMachine, hostId: stored.ownerHostId },
-      targetId, operation, from: stored.from, principal: stored.principal, body: stored.body,
-    }) };
+    // The same file event again (restart, uncertain PubAck): its first envelope, byte for byte.
+    if (stored.sourceEventId === sourceEventId) {
+      return { kind: "send", record: stored, envelope: this.#envelope({
+        id: stored.destinationEventId, kind: "command", to: { machine: stored.ownerMachine, hostId: stored.ownerHostId },
+        targetId, operation, from: stored.from, principal: stored.principal, body: stored.body,
+      }) };
+    }
+    // A same-key resend (a new file event, the same commandId and input): a new envelope, so the broker
+    // window never swallows it, and the NATS owner replays its stored outcome from its seen claim.
+    return { kind: "send", record: stored, envelope };
   }
 
   async #outboundAck(pub: BridgePublish): Promise<NatsOutbound> {
@@ -549,9 +564,23 @@ export class NatsBridgeCarrier {
         return refuse({ accepted: false, error: "Fabric control id reused with different input",
           errorCode: "FABRIC_CONTROL_ID_CONFLICT", notRun: true }, "command id reused with different input");
       }
-      if (stored.replyTo !== record.replyTo || stored.sourceEventId !== input.id) {
-        // Same sender, same id, another publication: the first one owns the file event and its ACK.
-        return { kind: "settled", reason: "command already carried under its first envelope" };
+      if (stored.replyTo !== record.replyTo || stored.sourceMachine !== sourceMachine) {
+        return { kind: "settled", reason: "command already carried for another reply address" };
+      }
+      if (stored.sourceEventId !== input.id) {
+        // A same-key resend under a new envelope. The file store dedupes the command by its mapped id, so the
+        // owner never sees it again: replay the owner's recorded answer to this envelope, as a NATS owner
+        // replays its seen claim. With no answer yet, the first ACK settles both (a NATS sender matches an
+        // ACK by commandId and digest, never by envelope id).
+        const answer = stored.outcome?.data;
+        if (!answer) return { kind: "settled", reason: "same-key resend; the owner's answer is still pending" };
+        return { kind: "reply", reason: "same-key resend answered from the recorded outcome", envelope: this.#envelope({
+          id: bridgeNatsAckEnvelopeId(input.id), kind: "ack", to: { machine: sourceMachine, hostId: stored.replyTo },
+          targetId, operation: answer.accepted === true ? "accepted" : "rejected", from: carrierIdentity(target.identity),
+          // The responder's current epoch authenticates this attempt; the recorded one is history.
+          body: { ...answer, ownerIncarnation: target.route.ownerIncarnation,
+            originalOwnerIncarnation: typeof answer.ownerIncarnation === "string" ? answer.ownerIncarnation : null },
+        }) };
       }
     }
     const data = wire({ ...pick(body, COMMAND_FIELDS), commandId, ...(cancelCommandId !== undefined ? { cancelCommandId } : {}) });
@@ -572,9 +601,10 @@ export class NatsBridgeCarrier {
     const record = await this.#ledger.lookup("toNats", body.commandId);
     if (!record) return { kind: "settled", reason: "ack names no command this link sent" };
     // Only the owner the command went to, from its own machine, about the exact wire this link sent.
+    // Not bound to one envelope id: a same-key resend goes out under its own envelope, and the owner's
+    // replay answers that one (control-plane binds NATS ACKs to commandId and digest the same way).
     if (record.ownerMachine !== delivery.sourceMachine || sender.identity.id !== record.ownerIdentityId ||
-        body.targetId !== record.targetId || body.bodyDigest !== record.bodyDigest ||
-        input.id !== bridgeNatsAckEnvelopeId(record.destinationEventId) || input.hostId !== record.replyTo) {
+        body.targetId !== record.targetId || body.bodyDigest !== record.bodyDigest || input.hostId !== record.replyTo) {
       return { kind: "refused", reason: "ack does not match the command this link sent" };
     }
     const outcome = ackOutcome(body);

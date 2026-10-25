@@ -1,7 +1,7 @@
 // Lane L2 (smarty-dev#15310) N3: a Ryzen 1 work/owner event addressed to a NATS root becomes one keyed followUp.
 import { describe, expect, it } from "vitest";
 import type { BridgePublish } from "../src/mesh/bridge.js";
-import { NatsBridgeCarrier, NatsCarrierRefusal, type NatsCarrierRecord } from "../src/mesh/bridge-nats-carrier.js";
+import { NatsBridgeCarrier, NatsCarrierRefusal, NatsCarrierUnavailable, type NatsCarrierRecord } from "../src/mesh/bridge-nats-carrier.js";
 import { NatsTopicTranslator, isNatsTopicEvent, type NatsTopicAuthorize } from "../src/mesh/bridge-nats-topics.js";
 import {
   bridgeNatsCommandId, bridgeNatsEnvelopeId, bridgeNatsTopicIdempotencyKey,
@@ -85,9 +85,10 @@ describe("N3 topic translator", () => {
     await expect(topics.outbound(taskDone({ topic: "ops.owner", kind: "cleanup" }, "cleanup-1"))).rejects.toBeInstanceOf(NatsCarrierRefusal);
   });
 
-  it("refuses a target that is not a live NATS root, and a gate refusal, permanently", async () => {
+  it("refuses a target that is not a NATS root, and a gate refusal, permanently; waits out a KV gap", async () => {
     const { topics, presence } = setup();
-    await expect(topics.outbound(taskDone({ to: "session:unknown" }))).rejects.toThrow(/not allowed/);
+    // Absent from KV right now: retryable, so MeshBridge keeps the event (it drops it itself if its mirror lapses).
+    await expect(topics.outbound(taskDone({ to: "session:unknown" }))).rejects.toBeInstanceOf(NatsCarrierUnavailable);
     presence.natsEntries.set("actor-1", route({ id: "actor-1", name: "review", kind: "actor" }, POD_MACHINE, "inc", { ownerHostId: natsLead.id,
       ownerIdentityId: natsLead.id }));
     await expect(topics.outbound(taskDone({ to: "actor-1" }))).rejects.toThrow(/live NATS root/);

@@ -2,7 +2,7 @@
 import { describe, expect, it } from "vitest";
 import type { BridgePublish } from "../src/mesh/bridge.js";
 import {
-  NatsBridgeCarrier, NatsCarrierRefusal, boundNatsAck, type NatsCarrierAuthorize, type NatsInbound,
+  NatsBridgeCarrier, NatsCarrierRefusal, NatsCarrierUnavailable, boundNatsAck, type NatsCarrierAuthorize, type NatsInbound,
 } from "../src/mesh/bridge-nats-carrier.js";
 import { bridgeNatsEnvelopeId, bridgeNatsMappedCommandId } from "../src/mesh/bridge-nats-types.js";
 import { controlBodyFingerprint } from "../src/mesh/control-idempotency.js";
@@ -78,6 +78,16 @@ describe("file -> NATS commands", () => {
     expect(ledger.records.size).toBe(1);
   });
 
+  it("a same-key resend (new file event, same commandId and input) goes out under its own envelope id", async () => {
+    const { carrier } = setup();
+    const first = sendOf(await carrier.outbound(fileCommand()));
+    const again = sendOf(await carrier.outbound(fileCommand({ eventId: "file-event-2", requestedAt: T + 5, deadlineAt: T + 30_005 })));
+    // A new Nats-Msg-Id the broker window cannot swallow; the same mapped commandId and digest the owner replays on.
+    expect(again.envelope.id).toBe(bridgeNatsEnvelopeId(LINK, "file-event-2"));
+    expect(again.envelope.body.commandId).toBe(first.envelope.body.commandId);
+    expect(controlBodyFingerprint(again.envelope.body, again.envelope.principal)).toBe(first.record!.bodyDigest);
+  });
+
   it("carries steer, stop, ask and a legacy command without deadlineAt", async () => {
     const { carrier } = setup();
     for (const [index, operation] of ["steer", "stop", "ask"].entries()) {
@@ -95,11 +105,14 @@ describe("file -> NATS commands", () => {
     await expectRefusal(carrier.outbound(fileCommand({}, { from: { id: "session:nobody", name: "x", kind: "main" } })), /live file participant/);
     await expectRefusal(carrier.outbound(fileCommand({ replyTo: otherNats.id })), /replyTo/);
     // A target this bridge mirrors itself would loop the command back into the file mesh.
-    await expectRefusal(carrier.outbound(fileCommand({ targetId: fileLead.id }, { to: fileLead.id })), /live NATS participant/);
-    await expectRefusal(carrier.outbound(fileCommand({ targetId: "session:gone" }, { to: "session:gone" })), /live NATS participant/);
+    await expectRefusal(carrier.outbound(fileCommand({ targetId: fileLead.id }, { to: fileLead.id })), /file participant this bridge mirrors/);
     await expectRefusal(carrier.outbound(fileCommand({}, { to: otherNats.id })), /NATS owner/);
+    // A KV gap is a wait, never a drop: retryable (not "not allowed"), so MeshBridge keeps its cursor.
+    const missing = await carrier.outbound(fileCommand({ targetId: "session:gone" }, { to: "session:gone" })).catch((caught: unknown) => caught);
+    expect(missing).toBeInstanceOf(NatsCarrierUnavailable);
+    expect((missing as Error).message).not.toMatch(/exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i);
     presence.natsEntries.set(natsLead.id, { ...presence.natsEntries.get(natsLead.id)!, route: { ...presence.natsEntries.get(natsLead.id)!.route, live: false } });
-    await expectRefusal(carrier.outbound(fileCommand()), /live NATS participant/);
+    await expect(carrier.outbound(fileCommand())).rejects.toBeInstanceOf(NatsCarrierUnavailable);
     const gated = setup(() => ({ ok: false, refuse: "BRIDGE_NATS_OPERATION_NOT_ALLOWED", reason: "seat receives followUp and cancel only" }));
     const error = await gated.carrier.outbound(fileCommand({ operation: "steer" })).catch((caught: unknown) => caught);
     expect(error).toMatchObject({ code: "BRIDGE_NATS_OPERATION_NOT_ALLOWED" });
@@ -167,7 +180,8 @@ describe("NATS ACK -> file ACK (the answer to a file sender)", () => {
     expect(await carrier.inbound(delivery(ack(), "evil-machine"))).toMatchObject({ kind: "refused" });
     expect(await carrier.inbound(delivery(ack({}, { from: otherNats })))).toMatchObject({ kind: "refused" });
     expect(await carrier.inbound(delivery(ack({ bodyDigest: "0".repeat(64) })))).toMatchObject({ kind: "refused" });
-    expect(await carrier.inbound(delivery(ack({}, { id: "ack:another-envelope" })))).toMatchObject({ kind: "refused" });
+    // Not bound to one envelope id: an owner's replay answers a same-key resend's own envelope.
+    expect(await carrier.inbound(delivery(ack({}, { id: "ack:another-envelope" })))).toMatchObject({ kind: "event" });
     expect(await carrier.inbound(delivery(ack({}, { to: { machine: BRIDGE_MACHINE, hostId: otherNats.id } })))).toMatchObject({ kind: "refused" });
     expect(await carrier.inbound(delivery(ack({ commandId: "f".repeat(64) })))).toMatchObject({ kind: "settled" });
     expect(await carrier.inbound(delivery(ack({ errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", accepted: false })))).toMatchObject({ kind: "refused" });
@@ -257,6 +271,22 @@ describe("NATS -> file commands", () => {
     const conflict = await carrier.inbound(delivery(natsCommand({ message: "different" }, { id: "nats-env-9" })));
     expect(conflict).toMatchObject({ kind: "reply", envelope: { id: "ack:nats-env-9",
       body: { accepted: false, errorCode: "FABRIC_CONTROL_ID_CONFLICT", notRun: true } } });
+  });
+
+  it("a NATS same-key resend under a new envelope gets the owner's recorded answer, or waits for the first ACK", async () => {
+    const { carrier } = setup();
+    await carrier.inbound(delivery(natsCommand()));
+    // No answer recorded yet: the first ACK (matched by commandId and digest) settles both attempts.
+    expect(await carrier.inbound(delivery(natsCommand({}, { id: "nats-env-2" })))).toMatchObject({ kind: "settled" });
+    const mapped = bridgeNatsMappedCommandId(LINK, "toFile", natsLead.id, "nats-cmd-1");
+    const answer = sendOf(await carrier.outbound({ topic: "fabric.control.ack", kind: "accepted", from: fileLead, to: natsLead.id,
+      data: { version: 1, commandId: mapped, targetId: fileLead.id, ownerIncarnation: "inc-file-lead", accepted: true, messageId: "m-1",
+        bridge: { from: "ryzen1", id: "file-ack" } } as BridgePublish["data"] }));
+    await carrier.settle(answer.settle!, true);
+    const replay = await carrier.inbound(delivery(natsCommand({}, { id: "nats-env-3" })));
+    expect(replay).toMatchObject({ kind: "reply", envelope: { id: "ack:nats-env-3", kind: "ack", operation: "accepted", from: fileLead,
+      to: { machine: POD_MACHINE, hostId: natsLead.id }, body: { accepted: true, messageId: "m-1", commandId: "nats-cmd-1",
+        bodyDigest: answer.envelope.body.bodyDigest, ownerIncarnation: "inc-file-lead", originalOwnerIncarnation: "inc-file-lead" } } });
   });
 
   it("maps a NATS cancel onto the sender's own carried command and absorbs any other", async () => {

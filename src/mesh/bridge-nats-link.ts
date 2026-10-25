@@ -146,6 +146,8 @@ export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsC
     deadlineAt: stored.deadlineAt, expiresAt: stored.expiresAt,
     ...(stored.ownerIncarnation !== undefined ? { ownerIncarnation: stored.ownerIncarnation } : {}),
     ...(stored.resolvedBody !== undefined ? { body: stored.resolvedBody } : {}),
+    ...(stored.ack !== undefined ? { outcome: { accepted: stored.ack.accepted, at: stored.ack.receivedAt, fromId: stored.ack.fromId,
+      ackEventId: stored.ack.ackEventId, data: stored.ack.data } } : {}),
   });
   return {
     async claim(input) {

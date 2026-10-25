@@ -34,7 +34,11 @@ export class MemoryLedger implements NatsCarrierLedger {
     return this.records.get(`${direction}:${id}`);
   }
   async settle(direction: NatsCarrierDirection, id: string, outcome: NatsCarrierOutcome): Promise<void> {
-    this.settled.set(`${direction}:${id}`, outcome);
+    const key = `${direction}:${id}`;
+    this.settled.set(key, outcome);
+    const record = this.records.get(key);
+    // The first answer stands, as in L3's ledger.
+    if (record && !record.outcome) this.records.set(key, { ...record, outcome: JSON.parse(JSON.stringify(outcome)) as NatsCarrierOutcome });
   }
 }
 

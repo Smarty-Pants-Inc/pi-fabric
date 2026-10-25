@@ -49,7 +49,7 @@ const pins: BridgeNatsSeatPins = { seats: new Map(), bound: new Map() };
 const ALLOW: BridgeNatsAllowSection = {
   file: [{ kind: "root", id: fileLead.id, send: ["followUp", "ask", "cancel", "stop"], receive: ["followUp", "ask", "cancel"] }],
   nats: [{ kind: "root", id: natsLead.id, send: ["followUp", "ask", "cancel", "steer"], receive: ["followUp", "steer", "ask", "cancel"],
-    receiveTopics: ["fleet.work.*"] }],
+    receiveTopics: ["fleet.work.*"], machine: POD_MACHINE }],
 };
 
 const meshRoot = async (root: string): Promise<MeshStore> => {
@@ -183,7 +183,7 @@ describe("startNatsLink composition with L3's allow gate", () => {
     expect(ledger.lookup("toNats", record.destinationCommandId)).toMatchObject({ state: "ackForwarded", ack: { accepted: true, fromId: natsLead.id } });
     const conflict = await port.claim({ ...record, bodyDigest: "b".repeat(64) });
     expect(conflict).toMatchObject({ created: false, record: { bodyDigest: "a".repeat(64) } });
-    const topic = await port.claim({ ...record, destinationCommandId: "e".repeat(64), requesterId: linkIdentity.id, from: linkIdentity });
+    const topic = await port.claim({ ...record, origin: "topic", destinationCommandId: "e".repeat(64), requesterId: linkIdentity.id, from: linkIdentity });
     expect(topic.record.origin).toBe("topic");
     // The cancel mapping is kept both ways.
     const cancel = await port.claim({ ...record, operation: "cancel", destinationCommandId: "d".repeat(64), sourceCommandId: "orig-cancel",

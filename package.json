@@ -56,6 +56,7 @@
     "fabric-participants": "./bin/fabric-participants",
     "fabric-judge": "./bin/fabric-judge",
     "mesh-bridge": "./bin/mesh-bridge",
+    "nats-link": "./bin/nats-link",
     "fabric-releases": "./bin/fabric-releases",
     "fabric-actors": "./bin/fabric-actors",
     "fabric-resident-drain": "./bin/fabric-resident-drain",

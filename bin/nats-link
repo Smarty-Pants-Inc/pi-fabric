@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+// Fabric file-mesh <-> NATS link (smarty-dev#15310); see src/mesh-bridge-nats-cli.ts and docs/mesh-bridge-nats.md.
+import { main } from "../dist/mesh-bridge-nats-cli.js";
+
+main(process.argv.slice(2)).then(
+  (code) => { process.exitCode = code; },
+  (error) => { process.stderr.write(`nats-link: ${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 2; },
+);

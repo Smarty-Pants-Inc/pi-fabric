@@ -28,6 +28,7 @@
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
 import { openNatsConnection, type NatsConnectionHandle } from "../transport/nats/connection.js";
+import { natsEventsStreamName } from "../transport/nats/provision.js";
 import type { MeshEvent, MeshIdentity, MeshPublishInput } from "./event-log.js";
 import type {
   BridgeNatsPort, BridgeNatsPortResolved, BridgeNatsPresenceView, BridgeNatsRepublishDecision, BridgeNatsRepublishRequest,
@@ -225,9 +226,9 @@ export const runNatsRepublish = (options: NatsRepublishOptions, signal: AbortSig
 /** The bridge machine's credential has no events grant: N4 cannot run, so a link configured for it refuses to start. */
 export class NatsRepublishGrantError extends Error {
   readonly code = "FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING";
-  constructor(options?: ErrorOptions) {
-    super("nats-link: republish (nats.events) needs the consume grant on FABRIC_EV for the bridge machine's own durable " +
-      "(CONSUMER.CREATE/INFO/MSG.NEXT and ACK of bev_<machine>); the credential refused it", options);
+  constructor(readonly stream: string, readonly durable: string, options?: ErrorOptions) {
+    super(`FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING: nats.events is on, but the bridge credential lacks the ${stream} ` +
+      `consume grant (durable ${durable}: CONSUMER.CREATE/INFO/MSG.NEXT and ACK). Re-issue it with that grant, or turn nats.events off`, options);
     this.name = "NatsRepublishGrantError";
   }
 }
@@ -307,7 +308,7 @@ export const startNatsRepublishLink = async (config: NatsRepublishLinkConfig, op
   } catch (error) {
     await connection.close().catch(() => undefined);
     if (isPermissionRefusal(error)) {
-      const refused = new NatsRepublishGrantError({ cause: error });
+      const refused = new NatsRepublishGrantError(natsEventsStreamName(org), durable, { cause: error });
       record({ state: "refused", code: refused.code, reason: refused.message });
       throw refused;
     }

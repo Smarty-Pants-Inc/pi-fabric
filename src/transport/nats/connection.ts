@@ -210,6 +210,12 @@ interface PermissionSet {
 interface ExpectedPermissions extends PermissionSet {
   readonly legacy: PermissionSet;
   readonly allowAdditionalPermissions: boolean;
+  /**
+   * Diagnosis only, never a grant: the same signed identity's scope without the org or event additions this
+   * connection asks for. A credential that matches one of these is missing exactly that addition, which the
+   * refusal names instead of reporting a machine tag mismatch.
+   */
+  readonly narrower?: readonly { readonly scopes: readonly { readonly set: PermissionSet; readonly exact: boolean }[]; readonly missing: string }[];
 }
 
 /** Expand one role template for the signed identity exactly as nats-server expands it. */
@@ -249,10 +255,25 @@ const expectedPermissions = (role: "agent" | "operator", machine: string, policy
   const legacy = role === "agent" && policy.org === undefined
     ? legacyRoleTemplateWithPathB("agent", input, machines)
     : template;
+  const narrower: { scopes: { set: PermissionSet; exact: boolean }[]; missing: string }[] = [];
+  if (role === "agent" && policy.org !== undefined) {
+    const org = policy.org;
+    if (policy.events === true) {
+      narrower.push({ scopes: [{ set: expandPermissions(roleTemplateWithPathB(role, input, machines, { org }), machine, meshes, auth), exact: false }],
+        missing: `the credential lacks the Fabric event grants for org ${org} (fabric.ev.${org}, its FABRIC_EV stream); ` +
+          "re-issue it with events, or connect without events" });
+    }
+    narrower.push({ scopes: [
+      { set: expandPermissions(roleTemplateWithPathB(role, input, machines), machine, meshes, auth), exact: false },
+      { set: expandPermissions(legacyRoleTemplateWithPathB("agent", input, machines), machine, meshes, auth), exact: true },
+    ], missing: `the credential is not scoped to org ${org} (fabric.svc.${org}${policy.events === true ? ", and no event grants" : ""}); ` +
+      "re-issue it for that org, or connect without org" });
+  }
   return {
     ...expandPermissions(template, machine, meshes, auth),
     legacy: expandPermissions(legacy, machine, meshes, auth),
     allowAdditionalPermissions: role === "agent",
+    ...(narrower.length > 0 ? { narrower } : {}),
   };
 };
 
@@ -323,7 +344,13 @@ const verifyIdentity = async (nc: NatsConnection, timeoutMs: number, auth: Retur
   const legacy = matchesPermissions(publish, expected.legacy, false, false) &&
     matchesPermissions(subscribe, expected.legacy, true, false) &&
     responsesAtLeast(permissions.responses, expected.legacy, false);
-  if (!current && !legacy) throw new NatsAuthorizationError(MISMATCH);
+  if (!current && !legacy) {
+    // The identity and base scope match, only an org or event addition is missing: say which, not "machine tag".
+    const narrower = expected.narrower?.find((candidate) => candidate.scopes.some(({ set, exact }) =>
+      matchesPermissions(publish, set, false, !exact) && matchesPermissions(subscribe, set, true, !exact) &&
+      responsesAtLeast(permissions.responses, set, !exact)));
+    throw new NatsAuthorizationError(narrower ? `NATS USER.INFO: ${narrower.missing}` : MISMATCH);
+  }
   if (!current && !warnedLegacyPermissions) {
     warnedLegacyPermissions = true;
     console.warn(NATS_KV_FLOW_CONTROL_WARNING);

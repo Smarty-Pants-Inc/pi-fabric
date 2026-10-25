@@ -164,11 +164,20 @@ describe.skipIf(!binary)("A' N4 republish on a real Path B broker", () => {
     temps.push(dir);
     const store = new MeshStore(path.join(dir, "mesh"), 256 * 1024, 1_000);
     closers.push(async () => store.closeState());
-    const empty = () => ({ side: "file" as const, records: () => [] });
-    await expect(startNatsRepublishLink(linkConfig(plain, dir), { store, port: { machine: BRIDGE, resolve: () => undefined },
-      gate, views: { nats: () => ({ ...empty(), side: "nats" as const }), file: empty },
-      signal: AbortSignal.timeout(20_000), log: () => undefined }))
-      .rejects.toMatchObject({ code: "FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING" });
+    const config = linkConfig(plain, dir);
+    // The link's port opens on this credential even though the config names an org (N4's): it never asks for
+    // org or event grants, so the refusal below is N4's own, by name, not a USER.INFO mismatch.
+    expect(config.nats.org).toBe(ORG);
+    const port = await openNatsBridgeSide({ link: LINK, nats: config.nats, allow: { file: [], nats: [] } },
+      { signal: AbortSignal.timeout(20_000) });
+    closers.push(() => port.close());
+    const filePresence = new FileCarrierPresence(new StoreBridgeSide(store, LINK));
+    const refusal = startNatsRepublishLink(config, { store, port, gate,
+      views: { refresh: () => filePresence.refresh(), nats: () => port.presenceView(), file: () => filePresence.view() },
+      signal: AbortSignal.timeout(20_000), log: () => undefined });
+    await expect(refusal).rejects.toMatchObject({ code: "FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING" });
+    await expect(refusal).rejects.toThrow(
+      /^FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING: .* lacks the FABRIC_EV_\S+ consume grant \(durable bev_machine-a: /);
     expect(JSON.parse(fs.readFileSync(natsRepublishStatePath(dir), "utf8"))).toMatchObject({ state: "refused",
       code: "FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING" });
   }, 60_000);

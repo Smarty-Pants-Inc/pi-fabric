@@ -301,9 +301,18 @@ describe("N4 start: the consume grant, and nothing published into FABRIC_EV", ()
   it("refuses the start without the consume grant, and records why for nats-link status", async () => {
     const fake = fakeConnection({ refuse: true });
     const dir = stateDir();
-    await expect(startNatsRepublishLink(config(dir), { store: new FakeStore(), port: { machine: BRIDGE, resolve: () => undefined },
-      gate, views: viewsFor(onV2), signal: new AbortController().signal, log: () => undefined, connect: async () => fake.connection }))
-      .rejects.toMatchObject({ code: "FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING" });
+    const opened: Record<string, unknown>[] = [];
+    const start = startNatsRepublishLink(config(dir), { store: new FakeStore(), port: { machine: BRIDGE, resolve: () => undefined },
+      gate, views: viewsFor(onV2), signal: new AbortController().signal, log: () => undefined,
+      connect: async input => { opened.push({ ...input }); return fake.connection; } });
+    await expect(start).rejects.toMatchObject({ code: "FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING" });
+    // The message names the code, the stream and the durable (never a USER.INFO machine tag mismatch).
+    await expect(start).rejects.toThrow("FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING: nats.events is on, but the bridge credential lacks " +
+      "the FABRIC_EV_EXAMPLE_ORG consume grant (durable bev_machine-a: ");
+    // Verified with the standard agent policy: no `events` (which would demand fabric.ev publish) and no `org`.
+    expect(opened).toHaveLength(1);
+    expect(opened[0]).not.toHaveProperty("events");
+    expect(opened[0]).not.toHaveProperty("org");
     expect(JSON.parse(fs.readFileSync(natsRepublishStatePath(dir), "utf8"))).toMatchObject({ state: "refused",
       code: "FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING", durable: "bev_machine-a" });
     expect(fake.published).toEqual([]);

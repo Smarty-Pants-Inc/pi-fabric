@@ -15,7 +15,8 @@ const USAGE = `Usage:
       --run <32 hex> --run-sha256 <64 hex> --operation-id <32 hex> --generation <32 hex> [--deadline-s <1-600>]
 
 Owner-only D3 seat drain of THIS host's live Main (smarty-dev#15310), through its local socket
-<meshRoot>/main-drain/ (mode 0700, the Main's own OS user). It is never reachable from the mesh.
+<parent>/.<mesh>.main-drain/, the mesh root's private sibling (mode 0700, the Main's own OS user). It is never
+reachable from the mesh.
   --status  observe only;  --probe  the dry-run ingress probes
   --exit    raw-Pod resume-drain, inside the Pod: bind to the pod UID, drain (bound wait), run the
             same zero and children checks as the host seam, then ask the Main for a clean exit
@@ -128,12 +129,15 @@ export const runSessionDrainCli = async (
     let reply = await callBound("drain");
     let evaluation = check(reply);
     let previous = false;
+    // The last stop refusal, reported in the result line (RFL P2: never dropped).
+    let stopRefused: string | null = null;
     while (!(evaluation.drained && previous) && !evaluation.haltedWithHeld && now() + POLL_MS < deadline) {
       previous = evaluation.drained;
       await sleep(POLL_MS);
       // r2 N2: the raw Pod's session actors are stopped only as the last act, exactly as on the host.
       if (reply.native.inputsFenced && evaluation.reasons.length > 0 && evaluation.reasons.every(reason => reason.startsWith("children:live-actor:"))) {
         const stop = await callBound("stop-actors");
+        stopRefused = stop.stopRefused;
         // A failed, unproven or unknown stop is not retried: the Pod's Main undoes below (#1607 P1).
         if (stop.stopRefused && !["NOT_FENCED", "NOT_DRAINED", "ACTORS_NOT_QUIESCED"].includes(stop.stopRefused)) break;
       }
@@ -146,11 +150,11 @@ export const runSessionDrainCli = async (
       return emit({ op: "exit", drained: false, exiting: false,
         inputsFenced: !undo || undo.undo?.restartRequired === true ||
           (undo.native.capability && !(undo.native.fenceApi && undo.native.piInputsFenced === false)),
-        reasons: evaluation.reasons, observed: evaluation.observed, reply, undo: undo?.undo ?? null }, false);
+        reasons: evaluation.reasons, observed: evaluation.observed, reply, undo: undo?.undo ?? null, stopRefused }, false);
     }
     const exit = await callBound("exit");
     return emit({ op: "exit", drained: true, exiting: exit.exiting, inputsFenced: evaluation.observed.inputsFenced && exit.native.inputsFenced,
-      exitRefused: exit.exitRefused, observed: evaluation.observed, reply: exit }, exit.exiting);
+      exitRefused: exit.exitRefused, observed: evaluation.observed, reply: exit, stopRefused }, exit.exiting);
   } catch (error) {
     const usage = error instanceof UsageError;
     const code = error instanceof MainDrainClientError ? error.code : "MAIN_DRAIN_UNAVAILABLE";

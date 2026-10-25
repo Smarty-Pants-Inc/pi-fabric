@@ -4,7 +4,7 @@ import path from "node:path";
 import { diagnostics } from "../core/diagnostics.js";
 import { peerCredentials } from "../records/peer.js";
 import type { MainDrainControl, MainDrainPeer } from "./control.js";
-import { MAIN_DRAIN_DIRECTORY, MAIN_DRAIN_MAX_REQUEST_BYTES, mainDrainSocketName, parseMainDrainRequest, type MainDrainOp } from "./protocol.js";
+import { MAIN_DRAIN_MAX_REQUEST_BYTES, mainDrainDirectory, mainDrainSocketName, parseMainDrainRequest, type MainDrainOp } from "./protocol.js";
 
 const MAX_CONNECTIONS = 4;
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -25,10 +25,15 @@ const safeChain = (directory: string, uid: number): boolean => {
  */
 interface Pinned { directory: string; socket: string; address: string; fd: number; dev: number; ino: number }
 
-/** The private socket directory: real path, uid-owned, exactly 0700, safe ancestors. Throws a fixed code. */
+/**
+ * The private socket directory, the mesh root's sibling: real path, uid-owned, exactly 0700, safe ancestors, on the
+ * SAME filesystem as the mesh root, which this uid owns. Throws a fixed code.
+ */
 const pinDirectory = (meshRoot: string, uid: number): Pinned => {
   const root = fs.realpathSync(meshRoot);
-  const directory = path.join(root, MAIN_DRAIN_DIRECTORY);
+  const mesh = fs.statSync(root);
+  if (!mesh.isDirectory() || mesh.uid !== uid) throw new Error("MAIN_DRAIN_DIRECTORY_UNSAFE");
+  const directory = mainDrainDirectory(root);
   try { fs.mkdirSync(directory, { mode: 0o700 }); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("MAIN_DRAIN_DIRECTORY_UNAVAILABLE");
   }
@@ -38,7 +43,7 @@ const pinDirectory = (meshRoot: string, uid: number): Pinned => {
   const held = fs.fstatSync(fd);
   const named = fs.lstatSync(directory);
   if (!held.isDirectory() || held.uid !== uid || (held.mode & 0o7777) !== 0o700 || named.ino !== held.ino || named.dev !== held.dev ||
-    !safeChain(directory, uid)) {
+    held.dev !== mesh.dev || !safeChain(directory, uid)) {
     fs.closeSync(fd);
     throw new Error("MAIN_DRAIN_DIRECTORY_UNSAFE");
   }

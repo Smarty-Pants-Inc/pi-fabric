@@ -98,7 +98,8 @@ export const createSeat = async (options: { fenceApi?: boolean; start?: boolean;
     plannedSeats: ["alpha", "bravo", "charlie"], context: "synthetic", namespace: "org-synthetic", namespaceUID: "00000000-0000-4000-8000-000000000001",
     natsSecret: "org-d3synth-nats", source: { journal, journalSha256: "0".repeat(64), journalBytes: 1, leafId: "leaf", handoffs: null },
     target: { claim: "synthetic-claim", node: "synthetic-node" },
-    seams: { drain: { owner: "fabric-v2", path: "/synthetic/drain", sha256: "1".repeat(64) } },
+    seams: { drain: { owner: "fabric-v2", path: "/synthetic/drain", sha256: "1".repeat(64) },
+      fence: { owner: "synthetic-fence-owner", path: "/synthetic/fence", sha256: "2".repeat(64) } },
     recoveryRoot: "/synthetic/recovery", createdAt: "2026-10-25T00:00:00Z",
   });
   const runSha256 = sha(runBytes);
@@ -175,14 +176,13 @@ export const createSeat = async (options: { fenceApi?: boolean; start?: boolean;
   };
 };
 
-/** Every path, type, size and content hash under the mesh root, except the drain channel itself. */
+/** Every path, type, size and content hash under the mesh root (the drain channel lives outside it). */
 const snapshot = (root: string): string => {
   const lines: string[] = [];
   const walk = (directory: string): void => {
     for (const name of fs.readdirSync(directory).sort()) {
       const file = path.join(directory, name);
       const stat = fs.lstatSync(file);
-      if (path.relative(root, file) === "main-drain") continue;
       if (stat.isDirectory()) { lines.push(`d ${path.relative(root, file)}`); walk(file); }
       else lines.push(`f ${path.relative(root, file)} ${stat.size} ${sha(fs.readFileSync(file))}`);
     }

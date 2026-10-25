@@ -39,7 +39,7 @@ const storeReceipt = (target: Seat, phase: string, text: string): string => {
 };
 const undoInputs = (attempt: number, drainReceiptSha256: string | null) => ({ attempt, drainReceiptSha256 });
 const fenceReceipt = (target: Seat): string => JSON.stringify({ schema: "d3-seam-receipt-v1", run: target.run, phase: "fence",
-  owner: "factory-lead", result: "pass", observed: { tombstone: true } });
+  owner: "synthetic-fence-owner", result: "pass", observed: { tombstone: true } });
 
 describe.skipIf(!linux)("fabric-seat-drain, the real installed artifact run as A runs it", () => {
   it("drains an idle Main to exactly the six passing keys, writes evidence once and changes no mesh file", async () => {
@@ -216,6 +216,23 @@ describe.skipIf(!linux)("children (B2/B3/B4, r2 N1/N2)", () => {
     // The full registry row (instructions included) is captured from the file BEFORE the stop, for recreation.
     expect(outcome(target).stoppedActors).toEqual([expect.objectContaining({ id, spec: expect.objectContaining({ id, name: "quiet" }),
       registryRow: expect.objectContaining({ id, instructions: "stay quiet", status: "idle" }) })]);
+  });
+
+  it("RFL P2: retried ACTORS_NOT_QUIESCED refusals cost no stop-intent file and never end the wait early", async () => {
+    const target = await seat();
+    const id = "8".repeat(32);
+    const row = { status: "idle" };
+    let busy = 400;
+    target.actors.listOwned = () => [{ id, name: "slow", status: row.status, rootId: ROOT }];
+    target.actors.drainQuiescence = () => row.status !== "idle" ? ["status-stopped"] : busy-- > 0 ? ["busy"] : [];
+    target.actors.drainWorker = () => null;
+    target.actors.stop = async () => { row.status = "stopped"; target.writeActors([actorRow(id, "stopped", { stopReason: "explicit" })]); return {}; };
+    target.writeActors([actorRow(id, "idle")]);
+    const result = await inProcess(target, "drain", {}, { deadlineMs: 120_000, sleep: async () => {} });
+    expect(result.receipt).toMatchObject({ result: "pass" });
+    const steps = (outcome(target).steps as Array<{ step: string; detail: { refused: string | null } }>).filter(entry => entry.step === "stop-actors");
+    expect(steps.filter(entry => entry.detail.refused === "ACTORS_NOT_QUIESCED").length).toBeGreaterThan(20);
+    expect(fs.readdirSync(target.runDir).filter(name => name.startsWith("fabric-v2-drain-stop-"))).toEqual(["fabric-v2-drain-stop-1-intent.json"]);
   });
 
   it("#1607 P1: a failed stop is not swallowed or retried: the drain refuses, the actor is attempted but never 'stopped'", async () => {
@@ -521,6 +538,26 @@ describe.skipIf(!linux)("evidence, binding and undo (contract rev 4)", () => {
     expect(outcome(target, "fabric-v2-drain-undo-1-outcome.json")).toMatchObject({ neverFenced: true, evidence: "outcome-begin-never-sent" });
   });
 
+  // RFL P2: the never-fenced proof needs BOTH the outcome's beginSent:false AND its binding to this intent's sha256.
+  for (const [label, mutate] of [
+    ["an outcome bound to another intent", (value: Record<string, unknown>) => ({ ...value, intentSha256: "0".repeat(64) })],
+    ["an outcome without beginSent:false", (value: Record<string, unknown>) => { const { beginSent: _drop, ...rest } = value; return rest; }],
+    ["an outcome with beginSent:true", (value: Record<string, unknown>) => ({ ...value, beginSent: true })],
+  ] as const) {
+    it(`#1607 B1: ${label} is no never-fenced proof; with the Main down the undo is restart-required`, async () => {
+      const target = await seat();
+      await target.server.close();
+      const refused = await inProcess(target, "drain", {}, { deadlineMs: 2_000 });
+      expect(refused.receipt?.observed).toMatchObject({ reason: "main-unreachable" });
+      const file = path.join(target.runDir, "fabric-v2-drain-outcome.json");
+      const value = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+      fs.chmodSync(file, 0o600);
+      fs.writeFileSync(file, JSON.stringify(mutate(value)));
+      const undo = await inProcess(target, "drain-undo", undoInputs(1, storeReceipt(target, "drain", refused.stdout)), { undoBudgetMs: 1_500 });
+      expect(undo.receipt).toMatchObject({ result: "refused", observed: { inputsFenced: true, admissionRestored: false } });
+    });
+  }
+
   it("#1607 B1 counterexample: a drain that DID reach the Main is never 'never fenced'; an unreachable Main then is restart-required", async () => {
     const target = await seat();
     expect((await inProcess(target, "drain")).receipt?.result).toBe("pass");
@@ -566,7 +603,9 @@ describe.skipIf(!linux)("evidence, binding and undo (contract rev 4)", () => {
     expect(await inProcess(target, "drain-recheck")).toMatchObject({ code: 2, stderr: "GAP: fence-receipt-missing [owner: fabric-v2]\n" });
     // Re-review finding 3: an invalid fence receipt is not phase evidence.
     for (const bad of ["{}", JSON.stringify({ ...JSON.parse(fenceReceipt(target)), result: "refused" }),
-      JSON.stringify({ ...JSON.parse(fenceReceipt(target)), run: "another-run" }), JSON.stringify({ ...JSON.parse(fenceReceipt(target)), owner: "fabric-v2" })]) {
+      JSON.stringify({ ...JSON.parse(fenceReceipt(target)), run: "another-run" }), JSON.stringify({ ...JSON.parse(fenceReceipt(target)), owner: "fabric-v2" }),
+      // RFL P2: the owner comes from the sealed run's seams.fence.owner, never a constant in the seam.
+      JSON.stringify({ ...JSON.parse(fenceReceipt(target)), owner: "factory-lead" })]) {
       storeReceipt(target, "fence", bad);
       expect(await inProcess(target, "drain-recheck")).toMatchObject({ code: 2, stdout: "", stderr: "GAP: fence-receipt-invalid [owner: fabric-v2]\n" });
     }

@@ -7,13 +7,17 @@ import type { NativeInputObservation } from "./native-port.js";
  * D3 seat drain (smarty-dev#15310): the local, owner-only wire protocol between a drain client
  * (`pi-fabric session drain`, `fabric-seat-drain`) and this host's live Main.
  *
- * Transport: one Unix-domain stream socket per Main session at `<meshRoot>/main-drain/<24 hex>.sock`.
- * The directory is mode 0700 and owned by the Main's OS user, so the kernel lets only that user
+ * Transport: one Unix-domain stream socket per Main session at `<parent>/.<mesh>.main-drain/<24 hex>.sock`, a
+ * private SIBLING of the mesh root (`<parent>/<mesh>`), never inside it: a socket in the mesh root would break any
+ * tool that walks the mesh and reads its files (ENXIO), and a mesh copy would carry it. The directory is mode 0700
+ * and owned by the Main's OS user, so the kernel lets only that user
  * (or root) connect. It is never reachable from the mesh, NATS or a bridge. One request line, one
  * reply line, then close. Mutating ops also carry a run binding proved against the seat lock (binding.ts).
  */
 export const MAIN_DRAIN_PROTOCOL = 1;
-export const MAIN_DRAIN_DIRECTORY = "main-drain";
+/** The channel's directory for a mesh root (give its real path): `<parent>/.<basename>.main-drain`. */
+export const mainDrainDirectory = (realMeshRoot: string): string =>
+  path.join(path.dirname(realMeshRoot), `.${path.basename(realMeshRoot)}.main-drain`);
 export const MAIN_DRAIN_MAX_REQUEST_BYTES = 4 * 1024;
 export const MAIN_DRAIN_MAX_REPLY_BYTES = 1024 * 1024;
 /** Linux sun_path holds 107 bytes plus the terminator. */
@@ -31,8 +35,8 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export const mainDrainSocketName = (sessionId: string): string =>
   `${createHash("sha256").update(`pi-fabric-main-drain-v1\0${sessionId}`).digest("hex").slice(0, 24)}.sock`;
-export const mainDrainSocketPath = (meshRoot: string, sessionId: string): string =>
-  path.join(meshRoot, MAIN_DRAIN_DIRECTORY, mainDrainSocketName(sessionId));
+export const mainDrainSocketPath = (realMeshRoot: string, sessionId: string): string =>
+  path.join(mainDrainDirectory(realMeshRoot), mainDrainSocketName(sessionId));
 
 export interface MainDrainRequest { v: 1; op: MainDrainOp; sessionId: string; binding: MainDrainBindingRequest | null }
 

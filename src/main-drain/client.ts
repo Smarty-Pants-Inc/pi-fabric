@@ -2,7 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import type { MainDrainBindingRequest } from "./binding.js";
-import { MAIN_DRAIN_DIRECTORY, MAIN_DRAIN_MAX_REPLY_BYTES, mainDrainSocketName, type MainDrainOp, type MainDrainReply } from "./protocol.js";
+import { MAIN_DRAIN_MAX_REPLY_BYTES, mainDrainDirectory, mainDrainSocketName, type MainDrainOp, type MainDrainReply } from "./protocol.js";
 
 /** A fixed-code client failure: never a payload, a path or an OS message. */
 export class MainDrainClientError extends Error {
@@ -17,10 +17,18 @@ export class MainDrainClientError extends Error {
  */
 export const mainDrainSocket = (meshRoot: string, sessionId: string, uid: number): string => {
   let directory: string;
-  try { directory = path.join(fs.realpathSync(meshRoot), MAIN_DRAIN_DIRECTORY); } catch { throw new MainDrainClientError("MAIN_DRAIN_MESH_ROOT_UNREADABLE"); }
+  let mesh: fs.Stats;
+  try {
+    const root = fs.realpathSync(meshRoot);
+    mesh = fs.statSync(root);
+    directory = mainDrainDirectory(root);
+  } catch { throw new MainDrainClientError("MAIN_DRAIN_MESH_ROOT_UNREADABLE"); }
   try {
     const stat = fs.lstatSync(directory);
-    if (!stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o7777) !== 0o700) throw new MainDrainClientError("MAIN_DRAIN_DIRECTORY_UNSAFE");
+    // The mesh root's own sibling: on the same filesystem as the mesh root, which this uid owns.
+    if (!stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o7777) !== 0o700 || stat.dev !== mesh.dev || mesh.uid !== uid) {
+      throw new MainDrainClientError("MAIN_DRAIN_DIRECTORY_UNSAFE");
+    }
     for (let current = path.dirname(directory); ; current = path.dirname(current)) {
       const parent = fs.lstatSync(current);
       if (!parent.isDirectory() || (parent.uid !== 0 && parent.uid !== uid) || ((parent.mode & 0o022) !== 0 && (parent.mode & 0o1000) === 0)) {

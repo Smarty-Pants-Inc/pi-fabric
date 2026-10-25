@@ -38,7 +38,7 @@ const POLL_MS = 1_000;
 const MAX_REQUEST = 64 * 1024;
 const PHASES = new Set(["drain", "drain-undo", "drain-recheck", "resume-drain"]);
 const INTENT = "fabric-v2-drain-intent.json";
-/** Stop requests per drain (one stop-intent file each). */
+/** Stop-intent files per drain: one per new set of actors to stop (a retried request reuses the last one). */
 const MAX_STOP_CALLS = 20;
 /** Stop refusals a later pass can clear by waiting; any other stop refusal ends the drain (refused, then undone). */
 const RETRYABLE_STOP = new Set(["NOT_FENCED", "NOT_DRAINED", "ACTORS_NOT_QUIESCED"]);
@@ -78,6 +78,8 @@ export interface SeamDeps {
 interface Context {
   runDir: string; request: SeamRequest; meshRoot: string; lockFd: number; uid: number; io: SeamIo; deps: SeamDeps;
   now: () => number; sleep: (ms: number) => Promise<void>; deadline: number; started: number; requestSha256: string;
+  /** The sealed run's `seams.fence.owner`: the owner a fence receipt must name (never a constant here). */
+  fenceOwner?: string;
 }
 /** A binding failure discovered after the seam started talking: still no receipt, exit 2. */
 class BindingGap extends SeamGap {}
@@ -134,8 +136,10 @@ export const main = async (argv: string[], io: SeamIo, deps: SeamDeps = {}): Pro
       // Only drain has a refusal for it (DRAIN-DESIGN.r1 §1.2): an unreadable mesh root is inventory-incomplete.
       if (phase !== "drain" || !(error instanceof SeamGap)) throw error;
     }
+    const seams = sealed.run.seams as Record<string, { owner?: unknown } | undefined> | undefined;
+    const fenceOwner = typeof seams?.fence?.owner === "string" && seams.fence.owner ? seams.fence.owner : undefined;
     const context: Context = { runDir, request, meshRoot: meshRoot ?? "", lockFd, uid, io, deps, now, sleep, deadline, started,
-      requestSha256: sha256(stdin) };
+      requestSha256: sha256(stdin), ...(fenceOwner ? { fenceOwner } : {}) };
     if (phase === "drain") {
       if (Object.keys(request.inputs).join(",") !== "operationId") throw new SeamGap("inputs-invalid");
       if (meshRoot === undefined) return refuse(context, "inventory-incomplete", false);
@@ -356,13 +360,17 @@ const drain = async (context: Context): Promise<number> => {
         } catch { /* recorded as missing: the evidence then carries only the Main's public spec */ }
       }
       // #1607 P1: the rows are durable BEFORE the stop request, so a crash after it still leaves them for drain-undo
-      // and the operator. One write-once file per stop request; past the cap, no further stop is asked.
-      if (stopCalls >= MAX_STOP_CALLS) break;
-      stopCalls += 1;
+      // and the operator. A new write-once file only when this request names an actor no earlier file named: a
+      // retried request (a retryable refusal such as ACTORS_NOT_QUIESCED) is already covered and costs no file, so
+      // the cap counts distinct actor sets, never the 600 s wait (RFL P2).
       const toStop = (files?.actors ?? []).filter(actor => actor.rootId === rootId && actor.status !== "stopped");
-      for (const actor of toStop) intendedStops.add(actor.id);
-      evidence(context, `fabric-v2-drain-stop-${stopCalls}-intent.json`, { schema: "fabric-v2-drain-stop-intent-v1", generation,
-        actors: toStop.map(actor => ({ id: actor.id, registryRow: specs.get(actor.id) ?? null, basis: "measured" })) });
+      if (stopCalls === 0 || toStop.some(actor => !intendedStops.has(actor.id))) {
+        if (stopCalls >= MAX_STOP_CALLS) break;
+        stopCalls += 1;
+        for (const actor of toStop) intendedStops.add(actor.id);
+        evidence(context, `fabric-v2-drain-stop-${stopCalls}-intent.json`, { schema: "fabric-v2-drain-stop-intent-v1", generation,
+          actors: toStop.map(actor => ({ id: actor.id, registryRow: specs.get(actor.id) ?? null, basis: "measured" })) });
+      }
       const stop = await call(context, "stop-actors", binding(context, "drain", generation), context.deadline - context.now());
       step("stop-actors", { error: stop.error ?? null, refused: stop.reply?.stopRefused ?? null, stopped: stop.reply?.stopped ?? [] });
       if (stop.reply) last = { ...last!, reply: stop.reply };
@@ -486,14 +494,15 @@ const verifyDrainReceipt = (context: Context, expected: string): "pass" | "refus
   return value.result;
 };
 
-/** A's stored `fence` receipt: this run, phase fence, owner factory-lead, a pass (re-review finding 3). */
+/** A's stored `fence` receipt: this run, phase fence, the sealed run's fence owner, a pass (re-review finding 3). */
 const verifyFenceReceipt = (context: Context): void => {
+  if (!context.fenceOwner) throw new SeamGap("fence-owner-unpinned");
   const bytes = readOwned(path.join(context.runDir, "receipts", "fence.json"), context.uid, 4 * 1024 * 1024, undefined, "fence-receipt-missing");
   let value: Record<string, unknown>;
   try { value = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>; } catch { throw new SeamGap("fence-receipt-invalid"); }
   // A's own receipt acceptance shape: exactly these six keys, and the fence seam's owner value.
   if (typeof value !== "object" || value === null || Object.keys(value).sort().join(",") !== "observed,owner,phase,result,run,schema" ||
-    value.schema !== "d3-seam-receipt-v1" || value.run !== context.request.run || value.phase !== "fence" || value.owner !== "factory-lead" ||
+    value.schema !== "d3-seam-receipt-v1" || value.run !== context.request.run || value.phase !== "fence" || value.owner !== context.fenceOwner ||
     value.result !== "pass" || typeof value.observed !== "object" || value.observed === null) throw new SeamGap("fence-receipt-invalid");
 };
 

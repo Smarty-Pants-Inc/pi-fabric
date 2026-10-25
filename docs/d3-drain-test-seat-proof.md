@@ -242,9 +242,11 @@ The CLI must check the server against the owner record before it writes. This pr
 fake mesh whose owner record names pid 1.
 
 ```sh
-F=$(dirname "$RUN")/d3-drain-fakemesh-$(hex 4); mkdir -m 700 "$F" "$F/main-drain" "$F/main-followups"
+F=$(dirname "$RUN")/d3-drain-fakemesh-$(hex 4); FD="$(dirname "$F")/.$(basename "$F").main-drain"
+mkdir -m 700 "$F" "$FD" "$F/main-followups"
+MD="$(dirname "$(realpath "$MESH")")/.$(basename "$(realpath "$MESH")").main-drain"   # the channel: the mesh root's sibling
 S=$(python3 -I -c 'import hashlib,sys; print(hashlib.sha256(b"pi-fabric-main-drain-v1\0"+sys.argv[1].encode()).hexdigest()[:24]+".sock")' "$SID")
-ln "$MESH/main-drain/$S" "$F/main-drain/$S"
+ln "$MD/$S" "$FD/$S"
 python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); d["pid"]=1; json.dump(d,open(sys.argv[2],"w"))' \
   "$MESH/main-followups/$SID.owner.json" "$F/main-followups/$SID.owner.json"
 exit_probe() { node "$PIF" session drain "$SID" --mesh "$1" --exit --pod-uid "$(uuid)" --run "$(hex 16)" --run-sha256 "$(hex 32)" \
@@ -292,7 +294,7 @@ Then `closed False piInputsFenced False binding None odd []`.
 FAIL: `refused`. `{inputsFenced: true, admissionRestored: false}` means restart required: restart v1 before §4. See
 `drain-undo` in d3-drain-seam.md.
 
-Keep `$P1`, `$P2` and `$F` as evidence. To clean up the fake mesh later, unlink only `$F/main-drain/$S` and the copied
+Keep `$P1`, `$P2` and `$F` as evidence. To clean up the fake mesh later, unlink only `$FD/$S` and the copied
 owner file. Removing the link leaves the real socket in place.
 
 ## 4. The forward run (c)

@@ -100,13 +100,35 @@ describe.skipIf(!linux)("owner-only drain control (M10)", () => {
     expect(mainInboxDrainGate(ROOT)).toBeDefined();
   });
 
-  it("the channel is a 0700 seat-owned directory, reachable through its held descriptor whatever the path length", async () => {
+  it("the channel is a 0700 seat-owned SIBLING of the mesh root, reachable through its held descriptor whatever the path length", async () => {
     const seat = await createSeat(); seats.push(seat);
-    const directory = path.join(fs.realpathSync(seat.meshRoot), "main-drain");
+    const root = fs.realpathSync(seat.meshRoot);
+    const directory = path.join(path.dirname(root), `.${path.basename(root)}.main-drain`);
     expect(fs.lstatSync(directory).mode & 0o7777).toBe(0o700);
+    expect(path.dirname(seat.server.socketPath!)).toBe(directory);
     expect(fs.lstatSync(seat.server.socketPath!).mode & 0o777).toBe(0o600);
     expect(Buffer.byteLength(seat.server.socketPath!)).toBeGreaterThan(0);
     await seat.server.close();
     expect(fs.existsSync(seat.server.socketPath!)).toBe(false);
+  });
+
+  it("#1607 CI: the mesh root holds no socket while the channel listens (a tool that reads every mesh file never meets one)", async () => {
+    const seat = await createSeat(); seats.push(seat);
+    expect(await callMainDrain(socketOf(seat), SID, "status", null)).toMatchObject({ ok: true });
+    const walk = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true })
+      .flatMap(entry => entry.isDirectory() ? walk(path.join(dir, entry.name)) : [path.join(dir, entry.name)]);
+    const files = walk(seat.meshRoot);
+    expect(files.filter(file => !fs.lstatSync(file).isFile())).toEqual([]);
+    // Exactly what the provider-dead leak scan does: read every entry under the mesh root.
+    expect(() => files.forEach(file => fs.readFileSync(file))).not.toThrow();
+  });
+
+  it("refuses a sibling directory that is not private (another mode), and never contacts a socket there", async () => {
+    const seat = await createSeat(); seats.push(seat);
+    const root = fs.realpathSync(seat.meshRoot);
+    const directory = path.join(path.dirname(root), `.${path.basename(root)}.main-drain`);
+    fs.chmodSync(directory, 0o750);
+    try { expect(() => socketOf(seat)).toThrow(expect.objectContaining({ code: "MAIN_DRAIN_DIRECTORY_UNSAFE" })); }
+    finally { fs.chmodSync(directory, 0o700); }
   });
 });

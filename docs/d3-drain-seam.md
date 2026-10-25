@@ -35,7 +35,10 @@ A user-owned interpreter is the accepted same-UID residual (A6 in A's seat contr
 ## What the live Main needs
 
 The v1 Main must run a pi-fabric release that has the owner-only drain channel, `src/main-drain/`. That channel is
-a Unix socket in `<meshRoot>/main-drain/`, a 0700 directory owned by the seat user. It is never reachable over the
+a Unix socket in `<parent>/.<mesh>.main-drain/`, the mesh root's private sibling: a 0700 directory owned by the seat
+user, on the mesh root's own filesystem. It stays out of the mesh root, so no tool that walks the mesh meets a
+socket, and a copy of the mesh root never carries one. On a seat Pod it is `/var/lib/fabric/.mesh.main-drain/`, next
+to `/var/lib/fabric/mesh` on the seat volume. It is never reachable over the
 mesh, NATS or a bridge.
 
 The Main also needs a Pi that has the extension input fence (`pi.hostCapabilities.extensionInputFence === 1`,

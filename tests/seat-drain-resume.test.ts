@@ -176,6 +176,23 @@ describe.skipIf(!linux)("the in-pod CLI half: pi-fabric session drain --exit aga
     expect(mainInboxDrainGate(ROOT)).toBeUndefined();
   });
 
+  it("RFL P2: the in-Pod CLI reports a stop refusal in its result line, and undoes", async () => {
+    const seat = await createSeat(); seats.push(seat);
+    await podChannel(seat, "0");
+    const id = "4".repeat(32);
+    seat.actors.listOwned = () => [{ id, name: "stuck", status: "idle", rootId: ROOT }];
+    seat.actors.drainQuiescence = () => [];
+    seat.actors.drainWorker = () => null;
+    seat.actors.stop = async () => { throw new Error("synthetic stop failure"); };
+    fs.mkdirSync(path.join(seat.meshRoot, "actors", SID), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(seat.meshRoot, "actors", SID, "actors.json"), JSON.stringify({ format: 1,
+      actors: [{ id, name: "stuck", rootId: ROOT, status: "idle" }] }), { mode: 0o600 });
+    const result = await cli(seat, exitArgs(seat));
+    expect(result.line).toMatchObject({ op: "exit", drained: false, exiting: false, stopRefused: "ACTOR_STOP_FAILED" });
+    expect(result.code).toBe(1);
+    expect(seat.native.state.shutdown).not.toHaveBeenCalled();
+  });
+
   it("drains, then the Main accepts a clean exit and shuts down after its reply", async () => {
     const seat = await createSeat(); seats.push(seat);
     await podChannel(seat, "0");

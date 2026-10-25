@@ -465,9 +465,7 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     if (options.seat && !natsPeer) throw new Error("seat needs natsPeer");
     const allow = {
       file: [allowRoot(fileMain.id), ...(actor ? [allowActor(fileMain.id, actor.name)] : [])],
-      // L3 (audit): every allow.nats entry pins the machine its root must be live on.
-      nats: [allowRoot(natsMain.id), ...(natsPeer ? [options.seat ? allowRoot(natsPeer.id, SEAT_OPERATIONS, SEAT_PRINCIPAL) : allowRoot(natsPeer.id)] : [])]
-        .map(entry => ({ ...entry, machine: NATS_MAIN_MACHINE })),
+      nats: [allowRoot(natsMain.id), ...(natsPeer ? [options.seat ? allowRoot(natsPeer.id, SEAT_OPERATIONS, SEAT_PRINCIPAL) : allowRoot(natsPeer.id)] : [])],
     };
     // Seat pins come only from org.json (L3). The fixture binds the product owner to a session nobody runs,
     // and SEAT_PRINCIPAL to natsPeer only when the test asks for a seat.
@@ -480,6 +478,8 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     const home = fs.realpathSync.native(os.homedir());
     if (orgJson === home || orgJson.startsWith(`${home}${path.sep}`)) throw new Error(`fixture org.json must not be under $HOME: ${orgJson}`);
     options.allow?.(allow, ids);
+    // L3 (audit): every allow.nats entry pins the machine its root must be live on (after any test edit).
+    allow.nats = allow.nats.map(entry => entry.machine === undefined ? { ...entry, machine: NATS_MAIN_MACHINE } : entry);
     const linkConfig: MixedLinkConfig = {
       version: 1, name: "ryzen1", link: linkName,
       file: { mesh: fileMeshRoot },

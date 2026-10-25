@@ -227,7 +227,8 @@ describe("NATS bridge port: with L3's identity gate", () => {
     const { port: p, clock } = port(w);
     await p.start();
     await p.mirror(mirrorSet(clock.wall), clock.wall);
-    const config = parseBridgeNatsAllowSection({ file: [{ kind: "root", id: FILE_ROOT }], nats: [{ kind: "root", id: NATS_ROOT }] },
+    // L3 (audit): every allow.nats entry pins its machine.
+    const config = parseBridgeNatsAllowSection({ file: [{ kind: "root", id: FILE_ROOT }], nats: [{ kind: "root", id: NATS_ROOT, machine: V2 }] },
       { link: LINK, natsMachine: BRIDGE });
     const gate = createBridgeNatsIdentityGate(config, { pins: { seats: new Map(), bound: new Map() }, clock: () => clock.wall });
     const fileView = { side: "file" as const, records: () => [] };

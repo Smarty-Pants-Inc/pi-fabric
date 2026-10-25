@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { AckPolicy, DeliverPolicy, ReplayPolicy, type ConsumerAPI, type ConsumerInfo } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, ReplayPolicy, type ConsumerConfig } from "@nats-io/jetstream";
 import { openNatsConnection } from "../src/transport/nats/connection.js";
 import {
   LEASE_TTL_MS,
@@ -10,6 +10,7 @@ import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { consumeDeadLetters, type DeadLetterEnvelope } from "../src/transport/nats/dead-letter.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { createPathBHarness, openJetStream, PATH_B_MACHINES, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
+import { NatsWireFaults } from "./helpers/nats-wire-faults.js";
 import { ensureTransportConsumer } from "../src/transport/nats/provision.js";
 import { normalizeFabricConfig } from "../src/config.js";
 import {
@@ -32,46 +33,26 @@ const bounded = async <T>(promise: Promise<T>, label: string, timeoutMs = 5_000)
   } finally { if (timer) clearTimeout(timer); }
 };
 
-const consumerInfo = (inactiveThreshold?: number): ConsumerInfo => ({
-  config: {
-    durable_name: "policy-test",
-    description: "policy test",
-    filter_subject: "fabric.in.machine-a.policy-test",
-    ack_policy: AckPolicy.Explicit,
-    deliver_policy: DeliverPolicy.All,
-    replay_policy: ReplayPolicy.Instant,
-    ack_wait: 30_000_000_000,
-    max_deliver: 5,
-    backoff: Array.from({ length: 5 }, () => 30_000_000_000),
-    max_ack_pending: 128,
-    max_waiting: 1,
-    ...(inactiveThreshold === undefined ? {} : { inactive_threshold: inactiveThreshold }),
-  },
-} as unknown as ConsumerInfo);
+// Explicit fixture config seeds pre-migration durables; product open/ensure must repair them
+// using only the unchanged runtime agent grants (data safety and ownership trust boundary).
+const legacyConsumerConfig = (hostId: string, inactiveThreshold = 0): ConsumerConfig => ({
+  durable_name: transportDurableName(hostId),
+  description: JSON.stringify({ fabricHostId: hostId, machine: "machine-a" }),
+  filter_subject: transportInboxFilter("machine-a", hostId),
+  ack_policy: AckPolicy.Explicit,
+  deliver_policy: DeliverPolicy.All,
+  replay_policy: ReplayPolicy.Instant,
+  ack_wait: 30_000_000_000,
+  max_deliver: 5,
+  backoff: Array.from({ length: 5 }, () => 30_000_000_000),
+  max_ack_pending: 128,
+  max_waiting: 1,
+  inactive_threshold: inactiveThreshold,
+});
 
-const consumerApi = (info: ConsumerInfo): ConsumerAPI => ({
-  info: async () => info,
-} as unknown as ConsumerAPI);
-
-describe("inbox consumer inactive-threshold policy", () => {
-  const basePolicy = {
-    stream: "FABRIC_IN_machine-a",
-    durable: "policy-test",
-    filterSubject: "fabric.in.machine-a.policy-test",
-    description: "policy test",
-    maxAckPending: 128,
-  };
-
-  it("accepts the configured ephemeral threshold and still refuses it for normal hosts", async () => {
-    const thresholdNs = 300 * 1_000_000_000;
-    await expect(ensureTransportConsumer(consumerApi(consumerInfo(thresholdNs)), {
-      ...basePolicy, inactiveThresholdNs: thresholdNs,
-    })).resolves.toMatchObject({ config: { inactive_threshold: thresholdNs } });
-    await expect(ensureTransportConsumer(consumerApi(consumerInfo(thresholdNs)), basePolicy))
-      .rejects.toThrow("NATS consumer configuration mismatch: policy-test");
-    await expect(ensureTransportConsumer(consumerApi(consumerInfo(0)), basePolicy))
-      .resolves.toMatchObject({ config: { inactive_threshold: 0 } });
-  });
+const inboxEnvelope = (hostId: string, id: string) => ({
+  id, kind: "command" as const, to: { machine: "machine-a", hostId }, targetId: `target:${id}`, operation: "followUp",
+  from: { id: "lifetime-test-sender", name: "lifetime-test", kind: "main" as const }, body: { text: id },
 });
 
 // Formerly an anonymous server with verifyMachine:false; now the scoped Path B fixture with real agent
@@ -137,7 +118,7 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
         stream: transportInboxStream("machine-a"),
         durable,
         filterSubject: transportInboxFilter("machine-a", "runtime-provision"),
-        description: "test consumer",
+        description: JSON.stringify({ fabricHostId: "runtime-provision", machine: "machine-a" }),
         maxAckPending: 128,
       });
       expect(consumer.config.ack_policy).toBe("explicit");
@@ -145,13 +126,79 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
       expect(consumer.config.ack_wait).toBe(30_000_000_000);
       expect(consumer.config.max_deliver).toBe(5);
       expect(consumer.config.max_ack_pending).toBe(128);
-      expect(consumer.config.inactive_threshold ?? 0).toBe(0);
+      expect(consumer.config.inactive_threshold).toBe(7 * 24 * 60 * 60 * 1_000_000_000);
       expect(consumer.config.filter_subject).toBe(transportInboxFilter("machine-a", "runtime-provision"));
       expect(await transport.drainState()).toEqual({ pending: 0, ackPending: 0 });
     } finally {
       await inspector.close();
     }
   }, 30_000);
+
+  it.each([
+    { hostId: "session:bounded-inbox", seconds: 7 * 24 * 60 * 60 },
+    { hostId: "runtime:bounded-inbox", seconds: 7 * 24 * 60 * 60 },
+    { hostId: "runtime-without-colon", seconds: 7 * 24 * 60 * 60 },
+  ])("creates $hostId with a bounded server-side idle lifetime", async ({ hostId, seconds }) => {
+    const transport = await openNatsTransport({ ...shared.runtimeOptions(shared.users.machineA), hostId });
+    transports.push(transport);
+    const inspector = await shared.connect(shared.users.bootstrap);
+    try {
+      const admin = await openJetStream(inspector);
+      const info = await admin.manager.consumers.info(transportInboxStream("machine-a"), transportDurableName(hostId));
+      expect(info.config.inactive_threshold).toBe(seconds * 1_000_000_000);
+      await transport.close();
+      // Bounded ordinary/runtime hosts keep their cursor on clean close; only explicit
+      // ephemeralHost retains the pre-existing best-effort delete-on-close behavior.
+      expect((await admin.manager.consumers.info(info.stream_name, info.name)).created).toBe(info.created);
+    } finally { await inspector.close(); }
+  });
+
+  it.each([
+    { hostId: "session:legacy-lifetime", legacyNs: 0, seconds: 7 * 24 * 60 * 60 },
+    { hostId: "runtime:legacy-lifetime", legacyNs: 60 * 60 * 1_000_000_000, seconds: 7 * 24 * 60 * 60 },
+  ])("heals $hostId with runtime credentials without resetting ACKs, pending records or unrelated config", async ({ hostId, legacyNs, seconds }) => {
+    const inspector = await shared.connect(shared.users.bootstrap);
+    const admin = await openJetStream(inspector);
+    const runtime = await openNatsConnection(shared.runtimeOptions(shared.users.machineA));
+    const sender = await openNatsTransport({ ...shared.runtimeOptions(shared.users.machineA), hostId: `${hostId}:sender` });
+    transports.push(sender);
+    try {
+      const stream = transportInboxStream("machine-a"), durable = transportDurableName(hostId);
+      await admin.manager.consumers.add(stream, {
+        ...legacyConsumerConfig(hostId, legacyNs), sample_freq: "25%", max_batch: 32,
+        metadata: { lifetime_test: "preserve-unrelated-config" },
+      });
+      const sent = [];
+      for (const suffix of ["acked", "held", "pending"]) {
+        sent.push(await sender.send(inboxEnvelope(hostId, `${hostId}:${suffix}`)));
+      }
+      // Single-message pulls leave exactly one ACKed record, one in flight and one
+      // never delivered. No product inbox prefetch can move the cursor during repair.
+      const consumer = await runtime.js.consumers.get(stream, durable);
+      const acked = await consumer.next({ expires: 2_000 });
+      expect(acked?.info.streamSequence).toBe(sent[0]!.sequence);
+      expect(await acked!.ackAck()).toBe(true);
+      const held = await consumer.next({ expires: 2_000 });
+      expect(held?.info.streamSequence).toBe(sent[1]!.sequence);
+      const before = await admin.manager.consumers.info(stream, durable);
+      expect(before.ack_floor).toMatchObject({ consumer_seq: 1, stream_seq: sent[0]!.sequence });
+      expect(before.delivered).toMatchObject({ consumer_seq: 2, stream_seq: sent[1]!.sequence });
+      expect([before.num_ack_pending, before.num_pending]).toEqual([1, 1]);
+
+      // This is the actual scoped runtime opener, not a bootstrap update or fake API.
+      const reopened = await openNatsTransport({ ...shared.runtimeOptions(shared.users.machineA), hostId });
+      transports.push(reopened);
+      const after = await runtime.manager.consumers.info(stream, durable);
+      expect(after.config).toEqual({ ...before.config, inactive_threshold: seconds * 1_000_000_000 });
+      expect(after.created).toBe(before.created);
+      expect(after.ack_floor).toEqual(before.ack_floor);
+      expect(after.delivered).toEqual(before.delivered);
+      expect([after.num_ack_pending, after.num_pending, after.num_redelivered])
+        .toEqual([before.num_ack_pending, before.num_pending, before.num_redelivered]);
+      expect(await reopened.drainState()).toEqual({ pending: 1, ackPending: 1 });
+      expect(await held!.ackAck()).toBe(true);
+    } finally { await runtime.close(); await inspector.close(); }
+  }, 15_000);
 
   it("sets server-side idle expiry for an ephemeral host and deletes its durable on clean close", async () => {
     const runtime = shared.runtimeOptions(shared.users.machineA);
@@ -163,7 +210,7 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
       ephemeralHost: true,
       ephemeralInactiveSeconds: 300,
     }));
-    const hostId = "runtime-ephemeral-clean-exit";
+    const hostId = "runtime:ephemeral-clean-exit";
     const durable = transportDurableName(hostId);
     let transport: Awaited<ReturnType<typeof openNatsTransport>> | undefined;
     let inspector: Awaited<ReturnType<typeof shared.connect>> | undefined;
@@ -215,21 +262,111 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
     }
   }, 30_000);
 
-  it("refuses a pre-existing runtime durable with a broader inbox filter", async () => {
+  it.each([
+    { fault: "filter", error: /consumer configuration mismatch/ },
+    { fault: "owner", error: /consumer owner description mismatch/ },
+  ])("refuses a legacy durable with the wrong $fault without any mutation", async ({ fault, error }) => {
     const inspector = await shared.connect(shared.users.bootstrap);
     const admin = await openJetStream(inspector);
     try {
-      const hostId = "runtime-drifted-consumer";
-      await admin.manager.consumers.add(transportInboxStream("machine-a"), {
-        durable_name: transportDurableName(hostId), filter_subject: "fabric.in.machine-a.>", ack_policy: AckPolicy.Explicit,
-        deliver_policy: DeliverPolicy.All,
-        replay_policy: ReplayPolicy.Instant,
-        ack_wait: 30_000_000_000, max_deliver: 5, backoff: [30_000_000_000, 30_000_000_000, 30_000_000_000, 30_000_000_000, 30_000_000_000], max_ack_pending: 128, max_waiting: 1,
+      const hostId = `runtime:foreign-${fault}`;
+      const before = await admin.manager.consumers.add(transportInboxStream("machine-a"), {
+        ...legacyConsumerConfig(hostId),
+        ...(fault === "filter" ? { filter_subject: "fabric.in.machine-a.>" } : { description: "another owner" }),
       });
-      await expect(openNatsTransport({ ...shared.runtimeOptions(shared.users.machineA), hostId })).rejects.toThrow("consumer configuration mismatch");
-      expect((await admin.manager.consumers.info(transportInboxStream("machine-a"), transportDurableName(hostId))).config.filter_subject).toBe("fabric.in.machine-a.>");
+      await expect(openNatsTransport({ ...shared.runtimeOptions(shared.users.machineA), hostId })).rejects.toThrow(error);
+      const after = await admin.manager.consumers.info(transportInboxStream("machine-a"), transportDurableName(hostId));
+      expect(after.config).toEqual(before.config);
+      expect(after.created).toBe(before.created);
+      expect(after.ack_floor).toEqual(before.ack_floor);
+      expect(after.delivered).toEqual(before.delivered);
     } finally { await inspector.close(); }
   });
+
+  it("reprovisions a missing durable on reopen and deliberately replays retained ACKed records", async () => {
+    const hostId = "runtime:missing-on-reopen", stream = transportInboxStream("machine-a");
+    const original = await openNatsTransport({ ...shared.runtimeOptions(shared.users.machineA), hostId });
+    transports.push(original);
+    const inspector = await shared.connect(shared.users.bootstrap);
+    const admin = await openJetStream(inspector);
+    const signal = new AbortController();
+    const iterator = original.inbox(signal.signal)[Symbol.asyncIterator]();
+    try {
+      const sent = await original.send(inboxEnvelope(hostId, "retained-acked-before-expiry"));
+      const first = await bounded(iterator.next(), "delivery before cursor loss");
+      expect(first.value?.sequence).toBe(sent.sequence);
+      await first.value!.ack();
+      signal.abort();
+      await iterator.return?.();
+      await original.close();
+      // Deterministic stand-in for elapsed server GC: only bootstrap removes the
+      // test cursor. The product must create the missing durable with agent grants.
+      expect(await admin.manager.consumers.delete(stream, transportDurableName(hostId))).toBe(true);
+      const reopened = await openNatsTransport({ ...shared.runtimeOptions(shared.users.machineA), hostId });
+      transports.push(reopened);
+      const info = await admin.manager.consumers.info(stream, transportDurableName(hostId));
+      expect(info.config.inactive_threshold).toBe(7 * 24 * 60 * 60 * 1_000_000_000);
+      expect(info.num_pending).toBe(1);
+      const replaySignal = new AbortController();
+      const replay = reopened.inbox(replaySignal.signal)[Symbol.asyncIterator]();
+      try {
+        const result = await bounded(replay.next(), "DeliverAll replay after cursor loss");
+        expect(result.value).toMatchObject({ sequence: sent.sequence, attempt: 1, payload: { id: sent.id } });
+        await result.value!.ack();
+      } finally { replaySignal.abort(); await replay.return?.(); }
+    } finally { signal.abort(); await iterator.return?.(); await inspector.close(); }
+  }, 15_000);
+
+  it("reprovisions a missing durable in the same inbox iterator after a verified native reconnect", async () => {
+    const hostId = "runtime:missing-on-reconnect", stream = transportInboxStream("machine-a");
+    const relay = await NatsWireFaults.open(shared.serverUrl, shared.tls!);
+    const opened: Array<{ close(): Promise<void> }> = [];
+    const signal = new AbortController();
+    let unsubscribe: (() => void) | undefined;
+    let returnInbox: (() => Promise<unknown>) | undefined;
+    try {
+      const inspector = await shared.connect(shared.users.bootstrap);
+      opened.push(inspector);
+      const admin = await openJetStream(inspector);
+      const receiver = await openNatsTransport({ ...shared.runtimeOptions(shared.users.machineA), hostId, servers: relay.url });
+      opened.push(receiver);
+      transports.push(receiver);
+      const sender = await openNatsTransport({ ...shared.runtimeOptions(shared.users.machineA), hostId: "reconnect-lifetime-sender" });
+      opened.push(sender);
+      transports.push(sender);
+      const iterator = receiver.inbox(signal.signal)[Symbol.asyncIterator]();
+      returnInbox = () => iterator.return!();
+      let reconnect!: () => void;
+      const reverified = new Promise<void>((resolve) => { reconnect = resolve; });
+      unsubscribe = receiver.onVerifiedReconnect!(reconnect);
+      const waiting = iterator.next();
+      void waiting.catch(() => undefined);
+      // The server-side outstanding pull is the readiness event. Poll only as a
+      // bounded test safety net; no wall-clock sleep guesses when setup finished.
+      await expect.poll(async () => (await admin.manager.consumers.info(stream, transportDurableName(hostId))).num_waiting,
+        { timeout: 5_000, interval: 25 }).toBe(1);
+      relay.block();
+      expect(relay.severed).toBe(1);
+      expect(await admin.manager.consumers.delete(stream, transportDurableName(hostId))).toBe(true);
+      const sent = await sender.send(inboxEnvelope(hostId, "backlog-during-missing-durable"));
+      relay.unblock();
+      await bounded(reverified, "verified native reconnect", 10_000);
+      const result = await bounded(waiting, "same-iterator delivery after reprovision", 10_000);
+      expect(result.value).toMatchObject({ sequence: sent.sequence, attempt: 1, payload: { id: sent.id } });
+      await result.value!.ack();
+      const info = await admin.manager.consumers.info(stream, transportDurableName(hostId));
+      expect(info.config.inactive_threshold).toBe(7 * 24 * 60 * 60 * 1_000_000_000);
+      expect(await receiver.drainState()).toEqual({ pending: 0, ackPending: 0 });
+      expect(relay.accepts).toBeGreaterThanOrEqual(2);
+    } finally {
+      unsubscribe?.();
+      signal.abort();
+      try {
+        await Promise.all(opened.map((connection) => connection.close()));
+        if (returnInbox) await bounded(returnInbox(), "reconnected iterator cleanup");
+      } finally { await relay.close(); }
+    }
+  }, 30_000);
 
   it("sends, dedupes, redelivers, confirms ACKs and captures max-delivery advisories", async () => {
     // This selected integration path uses actual role credentials and default USER.INFO verification.

@@ -19,6 +19,8 @@ const CONSUMER_NOT_FOUND = 10014;
 const nanos = (ms: number): number => ms * 1_000_000;
 /** Preserve the existing inbox deduplication window; longer retries require a separate migration. */
 export const INBOX_DUPLICATE_WINDOW_MS = 10 * 60_000;
+/** Bound idle inbox durables, including bridge inboxes that use the shared default. */
+const DEFAULT_CONSUMER_INACTIVE_THRESHOLD_NS = 7 * 24 * 60 * 60 * 1_000_000_000;
 const code = (error: unknown): number | undefined => {
   if (!(error instanceof JetStreamApiError)) return undefined;
   try { return error.apiError().err_code; } catch { return error.code; }
@@ -153,12 +155,16 @@ export interface TransportConsumerPolicy {
   readonly filterSubject: string;
   readonly description: string;
   readonly maxAckPending: number;
-  /** JetStream nanoseconds; omitted preserves the normal-host inactive_threshold: 0 policy. */
+  /** Positive JetStream nanoseconds; omitted expires an idle durable after seven days. */
   readonly inactiveThresholdNs?: number;
 }
 
 export const ensureTransportConsumer = async (api: ConsumerAPI, policy: TransportConsumerPolicy): Promise<ConsumerInfo> => {
   const backoff = Array.from({ length: 5 }, () => nanos(30_000));
+  const inactiveThresholdNs = policy.inactiveThresholdNs ?? DEFAULT_CONSUMER_INACTIVE_THRESHOLD_NS;
+  if (!Number.isSafeInteger(inactiveThresholdNs) || inactiveThresholdNs <= 0) {
+    throw new Error("NATS consumer inactive threshold must be a positive safe integer");
+  }
   let info: ConsumerInfo;
   try { info = await api.info(policy.stream, policy.durable); }
   catch (error) {
@@ -176,7 +182,7 @@ export const ensureTransportConsumer = async (api: ConsumerAPI, policy: Transpor
         backoff,
         max_ack_pending: policy.maxAckPending,
         max_waiting: 1,
-        inactive_threshold: policy.inactiveThresholdNs ?? 0,
+        inactive_threshold: inactiveThresholdNs,
       });
     } catch (createError) {
       // A concurrent opener may have won the create. Read it back only if the winner exists;
@@ -185,16 +191,33 @@ export const ensureTransportConsumer = async (api: ConsumerAPI, policy: Transpor
       catch { throw createError; }
     }
   }
-  const actual = info.config;
-  const inactiveThresholdMismatch = policy.inactiveThresholdNs === undefined
-    ? actual.inactive_threshold !== 0 && actual.inactive_threshold !== undefined
-    : actual.inactive_threshold !== policy.inactiveThresholdNs;
-  if (actual.durable_name !== policy.durable || actual.filter_subject !== policy.filterSubject || actual.filter_subjects?.length ||
-    actual.deliver_subject || actual.headers_only || actual.ack_policy !== AckPolicy.Explicit || actual.replay_policy !== ReplayPolicy.Instant ||
-    actual.max_waiting !== 1 || actual.deliver_policy !== DeliverPolicy.All || actual.ack_wait !== nanos(30_000) || actual.max_deliver !== 5 ||
-    actual.max_ack_pending !== policy.maxAckPending || inactiveThresholdMismatch ||
-    JSON.stringify(actual.backoff) !== JSON.stringify(backoff)) {
-    throw new Error(`NATS consumer configuration mismatch: ${policy.durable}`);
+  const assertCompatible = (candidate: ConsumerInfo): void => {
+    const actual = candidate.config;
+    if (actual.durable_name !== policy.durable || actual.filter_subject !== policy.filterSubject || actual.filter_subjects?.length ||
+      actual.deliver_subject || actual.headers_only || actual.ack_policy !== AckPolicy.Explicit || actual.replay_policy !== ReplayPolicy.Instant ||
+      actual.max_waiting !== 1 || actual.deliver_policy !== DeliverPolicy.All || actual.ack_wait !== nanos(30_000) || actual.max_deliver !== 5 ||
+      actual.max_ack_pending !== policy.maxAckPending || JSON.stringify(actual.backoff) !== JSON.stringify(backoff)) {
+      throw new Error(`NATS consumer configuration mismatch: ${policy.durable}`);
+    }
+    // Callers also verify ownership before pulling. Validate here before repairing lifetime:
+    // a durable with our name/filter but another owner must never be mutated by an opener.
+    if (actual.description !== policy.description) {
+      throw new Error(`NATS consumer owner description mismatch: ${policy.durable}`);
+    }
+  };
+  assertCompatible(info);
+  if (info.config.inactive_threshold !== inactiveThresholdNs) {
+    // The SDK merges this one-field delta into existing config and uses the already-granted
+    // CONSUMER.CREATE subject with action=update. Never delete/recreate: preserve the cursor,
+    // ACK floor, pending deliveries and unrelated settings of an existing compatible durable.
+    await api.update(policy.stream, policy.durable, { inactive_threshold: inactiveThresholdNs });
+    info = await api.info(policy.stream, policy.durable);
+    assertCompatible(info);
+    if (info.config.inactive_threshold !== inactiveThresholdNs) {
+      throw new Error(`NATS consumer configuration mismatch: ${policy.durable}`);
+    }
   }
+  // Expiry discards the cursor, not retained Limits records. A later DeliverAll recreation
+  // deliberately replays even ACKed records; application receipts may deduplicate them.
   return info;
 };

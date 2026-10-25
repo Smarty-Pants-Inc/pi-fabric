@@ -180,6 +180,8 @@ export interface NatsCarrierSideOptions {
   readonly authorizeTopic: NatsTopicAuthorize;
   /** Which file identities the link mirrors into KV (the allow-list's file entries). Default: none. */
   readonly mirrorAllowed?: (participant: Pick<FabricParticipantRecord, "id" | "kind" | "rootId" | "name">) => boolean;
+  /** Add allow-listed native file actors to the mirror set (default true); false when the port lists them itself. */
+  readonly mirrorActors?: boolean;
   readonly now?: () => number;
   readonly log?: (line: string) => void;
   readonly resendAttempts?: number;
@@ -210,6 +212,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   readonly #now: () => number;
   readonly #log: (line: string) => void;
   readonly #mirrorAllowed: NonNullable<NatsCarrierSideOptions["mirrorAllowed"]>;
+  readonly #mirrorActors: boolean;
   readonly #resendAttempts: number;
   readonly #resendDelayMs: number;
   readonly #workingIntervalMs: number;
@@ -242,6 +245,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
       ...(options.topicTimeoutMs !== undefined ? { timeoutMs: options.topicTimeoutMs } : {}) });
     this.#log = options.log ?? (() => undefined);
     this.#mirrorAllowed = options.mirrorAllowed ?? (() => false);
+    this.#mirrorActors = options.mirrorActors ?? true;
     this.#resendAttempts = Math.max(1, options.resendAttempts ?? RESEND_ATTEMPTS);
     this.#resendDelayMs = Math.max(0, options.resendDelayMs ?? RESEND_DELAY_MS);
     this.#workingIntervalMs = Math.max(1, options.workingIntervalMs ?? WORKING_INTERVAL_MS);
@@ -347,7 +351,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     await this.filePresence.refresh(true);
     const hostIds = new Set<string>();
     const participants = presence.participants.filter(participant => participant.kind === "root" && this.#mirrorAllowed(participant));
-    for (const actor of this.filePresence.actors()) if (this.#mirrorAllowed(actor)) participants.push(actor);
+    if (this.#mirrorActors) for (const actor of this.filePresence.actors()) if (this.#mirrorAllowed(actor)) participants.push(actor);
     for (const participant of participants) hostIds.add(participant.ownerHostId);
     const hosts = presence.hosts.filter(host => hostIds.has(host.record.id));
     let set = { hosts, participants };

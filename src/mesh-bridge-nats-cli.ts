@@ -110,13 +110,12 @@ export interface NatsLinkStartOptions {
 }
 export type NatsLinkStarter = (config: NatsLinkConfig, options: NatsLinkStartOptions) => Promise<NatsLinkHandle>;
 
-// Not a literal on purpose until lane L2's module lands in this branch: integration swaps in
-// `await import("./mesh/bridge-nats-link.js")`. A build without it fails start by name, never silently.
-const LINK_MODULE: string = "./mesh/bridge-nats-link.js";
+// The link (lane L2) loads only for `start`: status, receipt and roots never pay for the bridge graph.
+// A build without it fails start by name, never silently.
 export const loadNatsLinkStarter = async (): Promise<NatsLinkStarter> => {
   let module: { startNatsLink?: unknown };
   try {
-    module = await import(LINK_MODULE) as { startNatsLink?: unknown };
+    module = await import("./mesh/bridge-nats-link.js") as { startNatsLink?: unknown };
   } catch (error) {
     throw new Error("this build has no NATS link module (bridge-nats-link)", { cause: error });
   }

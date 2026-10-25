@@ -9,6 +9,7 @@ import type { NatsCarrierRecord } from "../src/mesh/bridge-nats-carrier.js";
 import { createNatsFileLink, type NatsCarrierSide } from "../src/mesh/bridge-nats-file.js";
 import { createBridgeNatsIdentityGate, parseBridgeNatsAllowSection, type BridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
 import { openBridgeNatsLedger, type FileBridgeNatsLedger } from "../src/mesh/bridge-nats-ledger.js";
+import type { NatsLinkConfig } from "../src/mesh/bridge-nats-config.js";
 import { natsCarrierLedger, natsLinkAuthorizers, natsLinkMirrorAllowed, startNatsLink } from "../src/mesh/bridge-nats-link.js";
 import { bridgeNatsMappedCommandId, type BridgeNatsAllowSection } from "../src/mesh/bridge-nats-types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
@@ -190,20 +191,25 @@ describe("startNatsLink composition with L3's allow gate", () => {
     expect(cancel.record).toMatchObject({ sourceCancelCommandId: "orig", cancelCommandId: "f".repeat(64) });
   });
 
-  it("startNatsLink links with injected factories, refuses without them, and stops cleanly", async () => {
+  it("startNatsLink links (L5's config shape, L3's default ledger, the store handed to the port) and stops cleanly", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-start-"));
     roots.push(root);
     (await meshRoot(root)).closeState();
     stores.pop();
-    const config = { name: "ryzen1", link: LINK, file: { mesh: path.join(root, "hub"), lockProtocol: 1 as const },
-      stateDir: path.join(root, "state"), nats: { machine: BRIDGE_MACHINE }, allow: ALLOW };
+    const config: NatsLinkConfig = { version: 1, name: "ryzen1", link: LINK, file: { mesh: path.join(root, "hub"), lockProtocol: 1 },
+      stateDir: path.join(root, "state"), allow: parseBridgeNatsAllowSection(ALLOW, { link: LINK, natsMachine: BRIDGE_MACHINE }),
+      callTimeoutMs: 30_000, logLevel: "info",
+      nats: { servers: ["tls://nats.invalid:4222"], machine: BRIDGE_MACHINE, credentials: path.join(root, "user.creds"),
+        caFile: path.join(root, "ca.pem"), custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS",
+        pathBMachines: [BRIDGE_MACHINE, POD_MACHINE], operatorMachine: "fabric-ops", events: false, inboxLanes: 8 } };
     const controller = new AbortController();
     const logs: string[] = [];
-    await expect(startNatsLink(config, { signal: controller.signal, log: line => logs.push(line) })).rejects.toThrow(/factories/);
     const port = fakePort();
+    let handedStore: MeshStore | undefined;
     const handle = await startNatsLink(config, { signal: controller.signal, log: line => logs.push(line), factories: {
-      openPort: async () => port, seatPins: () => pins,
+      openPort: async (_config, options) => { handedStore = options.fileStore; return port; }, seatPins: () => pins,
     } });
+    expect(handedStore?.root).toBe(path.join(root, "hub"));
     expect(logs).toContain(`linked ryzen1 <-> ${LINK} (NATS machine ${BRIDGE_MACHINE})`);
     expect(port.mirrors.at(-1)!.participants.map(entry => entry.id)).toEqual([fileLead.id]);
     controller.abort();

@@ -9,6 +9,7 @@ import {
   createBridgeNatsIdentityGate, loadBridgeNatsSeatPins, parseBridgeNatsAllowSection, type BridgeNatsSeatPins,
 } from "./bridge-nats-identity.js";
 import { openBridgeNatsLedger } from "./bridge-nats-ledger.js";
+import { openNatsBridgeSide, type NatsBridgeSideConfig } from "./bridge-nats-port.js";
 import type { NatsTopicAuthorize } from "./bridge-nats-topics.js";
 import {
   bridgeNatsLinkIdentity, type BridgeNatsAllowDecision, type BridgeNatsAllowListConfig, type BridgeNatsAllowSection,
@@ -34,7 +35,7 @@ const MAX_EVENT_BYTES = 256 * 1024;
 const MAX_READ_EVENTS = 500;
 const STOP_MS = 5_000;
 
-/** What startNatsLink reads from the link config (L5's NatsLinkConfig is assignable to it). */
+/** What startNatsLink reads from the link config (L5's parsed NatsLinkConfig is assignable to it). */
 export interface NatsLinkStartConfig {
   /** This hub's bridge name (MeshBridge localName), e.g. `ryzen1`. */
   readonly name: string;
@@ -47,14 +48,28 @@ export interface NatsLinkStartConfig {
     readonly maxStateBytes?: number;
   };
   readonly stateDir: string;
-  readonly nats: { readonly machine: string };
-  readonly allow: BridgeNatsAllowSection;
+  /** The bridge machine's NATS settings (L1's openNatsBridgeSide reads them). */
+  readonly nats: NatsBridgeSideConfig["nats"];
+  /** L5 hands the allow-list already parsed by L3; a raw `allow` section is parsed here the same way. */
+  readonly allow: BridgeNatsAllowListConfig | BridgeNatsAllowSection;
+  /** The org.json whose principal seats pin the allow-list; absent = L3's default candidates. */
+  readonly orgJson?: string;
 }
 
-/** The factories the link composes. L1 and L3 own them; tests inject fakes. */
+const parsedAllow = (value: BridgeNatsAllowListConfig | BridgeNatsAllowSection): value is BridgeNatsAllowListConfig =>
+  "entries" in value && Array.isArray((value as BridgeNatsAllowListConfig).entries);
+
+export interface NatsLinkPortOptions {
+  readonly signal: AbortSignal;
+  readonly log: (line: string) => void;
+  /** The hub store the link opened: the port's native file-actor listing (N1) reads it. */
+  readonly fileStore: MeshStore;
+}
+
+/** The factories the link composes (L1's and L3's by default); tests inject fakes. */
 export interface NatsLinkFactories {
-  /** L1: the raw NATS port for this config (connection, KV, inbox), closed by the link on stop. */
-  openPort(config: NatsLinkStartConfig, options: { signal: AbortSignal; log: (line: string) => void }): Promise<BridgeNatsPort>;
+  /** L1: the raw NATS port for this config (connection, KV, inbox), closed by the link on stop; default openNatsBridgeSide. */
+  openPort?(config: NatsBridgeSideConfig, options: NatsLinkPortOptions): Promise<BridgeNatsPort>;
   /** L3: the crash-durable ledger in `directory`; default openBridgeNatsLedger. */
   openLedger?(directory: string): Promise<BridgeNatsLedger>;
   /** org.json seat pins; default: L3's loadBridgeNatsSeatPins (smarty-send's strict reader). */
@@ -64,7 +79,6 @@ export interface NatsLinkFactories {
 export interface NatsLinkStartOptions {
   readonly signal: AbortSignal;
   readonly log: (line: string) => void;
-  /** Required until L1's openNatsBridgeSide is on this branch (it becomes the openPort default). */
   readonly factories?: NatsLinkFactories;
 }
 
@@ -178,12 +192,18 @@ export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsC
  */
 export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLinkStartOptions): Promise<NatsLinkHandle> => {
   const { signal, log } = options;
-  const factories = options.factories;
-  if (!factories) throw new Error("startNatsLink: this build has no NATS port or ledger factories wired (L1 openNatsBridgeSide, L3 openBridgeNatsLedger)");
+  const factories = options.factories ?? {};
   signal.throwIfAborted();
   // The allow-list and the seat pins are checked before anything is opened: a bad list never links.
-  const allow = parseBridgeNatsAllowSection(config.allow, { link: config.link, natsMachine: config.nats.machine });
-  const gate = createBridgeNatsIdentityGate(allow, { pins: factories.seatPins?.() ?? loadBridgeNatsSeatPins() });
+  const allow = parsedAllow(config.allow) ? config.allow
+    : parseBridgeNatsAllowSection(config.allow, { link: config.link, natsMachine: config.nats.machine });
+  if (allow.link !== config.link || allow.natsMachine !== config.nats.machine) {
+    throw new Error("startNatsLink: the allow-list was parsed for another link or NATS machine");
+  }
+  const gate = createBridgeNatsIdentityGate(allow, { pins: factories.seatPins?.() ?? loadBridgeNatsSeatPins(config.orgJson) });
+  // L1's port admits presence from the allow section's two lists (the side is the list).
+  const portConfig: NatsBridgeSideConfig = { link: config.link, nats: config.nats, allow: {
+    file: allow.entries.filter(entry => entry.side === "file"), nats: allow.entries.filter(entry => entry.side === "nats") } };
   const store = new MeshStore(config.file.mesh, MAX_EVENT_BYTES, MAX_READ_EVENTS, {
     lockProtocol: config.file.lockProtocol,
     ...(config.file.stateBackend !== undefined ? { stateBackend: config.file.stateBackend } : {}),
@@ -194,7 +214,10 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
   try {
     await store.prepareLock();
     signal.throwIfAborted();
-    port = await factories.openPort(config, { signal, log });
+    port = factories.openPort
+      ? await factories.openPort(portConfig, { signal, log, fileStore: store })
+      : await openNatsBridgeSide(portConfig, { signal, log, fileStore: store, onError: error =>
+        log(`NATS port: ${error instanceof Error ? error.message : String(error)}`) });
     const ledgerDir = path.join(config.stateDir, "ledger");
     opened = await (factories.openLedger ? factories.openLedger(ledgerDir) : openBridgeNatsLedger({ dir: ledgerDir }));
     const ledger = natsCarrierLedger(opened, config.link);
@@ -207,6 +230,8 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     const link = createNatsFileLink({
       store, localName: config.name, link: config.link, cursorPath: path.join(config.stateDir, "cursor.json"),
       port, ledger, authorize, authorizeTopic, mirrorAllowed: natsLinkMirrorAllowed(allow), log,
+      // L1's port lists native file actors itself (N1): the mirror set carries roots only.
+      mirrorActors: false,
       bridge: {
         stopMs: STOP_MS, notifyWatchdog: systemdWatchdogNotify,
         publishStallAlarm: async (alarm: BridgeStallAlarm) => {

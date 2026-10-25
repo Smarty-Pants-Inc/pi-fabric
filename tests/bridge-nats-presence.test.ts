@@ -1,6 +1,5 @@
 // L1 (smarty-dev#15310): NATS side of the A' bridge, presence both ways, against an in-memory
 // multi-machine KV with the broker's CAS/watch semantics and the real KV participant directory.
-import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   NatsBridgePresence,
@@ -12,110 +11,14 @@ import type { BridgeHost } from "../src/mesh/bridge.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import type { TransportHostLeaseProcessProof } from "../src/topology/host-leases.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
-import {
-  KvConflictError,
-  TransportDeniedError,
-  TransportUncertainError,
-  type FabricTransport,
-  type TransportBucket,
-  type TransportKv,
-  type TransportKvEntry,
-  type TransportKvEvent,
-} from "../src/transport/types.js";
+import { advance, hKey, kvWorld as world, natsLease, pKey, seedNative, type Clock } from "./helpers/bridge-nats-kv.js";
 
 const BRIDGE = "ryzen1-bridge";
 const V2 = "v2-org";
-const token = (id: string): string => createHash("sha256").update(id).digest("hex").slice(0, 32);
-const pKey = (machine: string, id: string): string => `${machine}.p.${token(id)}`;
-const hKey = (machine: string, id: string): string => `${machine}.h.${token(id)}`;
 const FILE_ROOT = "session:11111111-1111-4111-8111-111111111111";
 const NATS_ROOT = "session:22222222-2222-4222-8222-222222222222";
 const PROOF: TransportHostLeaseProcessProof = { pid: 4242, pidStartTime: "777", bootId: "12345678-1234-4234-8234-123456789abc" };
 const OTHER_PROOF: TransportHostLeaseProcessProof = { pid: 999, pidStartTime: "555", bootId: PROOF.bootId };
-
-type Event = TransportKvEvent<unknown>;
-interface Watcher { queue: Event[]; wake?: (() => void) | undefined }
-
-/** One KV bucket shared by every machine: CAS revisions, ordered watches, explicit expiry. */
-class MemoryBucket {
-  readonly values = new Map<string, TransportKvEntry<unknown>>();
-  readonly watchers = new Set<Watcher>();
-  revision = 0;
-  failNextPut: ((key: string) => "uncertain-stored" | "uncertain-lost" | undefined) | undefined;
-  constructor(readonly ttlMs: number, readonly writes: string[] = []) {}
-  emit(event: Event): void { for (const watcher of this.watchers) { watcher.queue.push(event); watcher.wake?.(); } }
-  put(key: string, owner: string, value: unknown, ifRevision: number): number {
-    const current = this.values.get(key);
-    if ((ifRevision === 0 && current) || (ifRevision > 0 && current?.revision !== ifRevision)) throw new KvConflictError(key, ifRevision);
-    const fault = this.failNextPut?.(key);
-    if (fault) this.failNextPut = undefined;
-    if (fault === "uncertain-lost") throw new TransportUncertainError(key, { owner, value });
-    const entry = { key, machine: key.split(".")[0]!, owner, value: JSON.parse(JSON.stringify(value)) as unknown, revision: ++this.revision };
-    this.writes.push(key);
-    this.values.set(key, entry);
-    this.emit({ type: "put", entry });
-    if (fault === "uncertain-stored") throw new TransportUncertainError(key, { owner, value });
-    return entry.revision;
-  }
-  delete(key: string, ifRevision: number): boolean {
-    const current = this.values.get(key);
-    if (!current || current.revision !== ifRevision) return false;
-    this.values.delete(key);
-    this.emit({ type: "gone", key, machine: key.split(".")[0]!, revision: ++this.revision, reason: "deleted" });
-    return true;
-  }
-  expire(key: string): void {
-    if (!this.values.delete(key)) return;
-    this.emit({ type: "gone", key, machine: key.split(".")[0]!, revision: ++this.revision, reason: "expired" });
-  }
-}
-
-class MemoryKv implements TransportKv {
-  constructor(readonly bucket: MemoryBucket, readonly machine: string) {}
-  get ttlMs(): number { return this.bucket.ttlMs; }
-  async get<V>(key: string): Promise<TransportKvEntry<V> | undefined> { return this.bucket.values.get(key) as TransportKvEntry<V> | undefined; }
-  async put<V>(key: string, owner: string, value: V, ifRevision: number): Promise<number> {
-    if (key.split(".")[0] !== this.machine) throw new TransportDeniedError("KV write is outside the credential's machine prefix");
-    return this.bucket.put(key, owner, value, ifRevision);
-  }
-  async delete(key: string, ifRevision: number): Promise<boolean> {
-    if (key.split(".")[0] !== this.machine) throw new TransportDeniedError("KV write is outside the credential's machine prefix");
-    return this.bucket.delete(key, ifRevision);
-  }
-  async *watch<V>(_prefix: string, signal: AbortSignal): AsyncIterable<TransportKvEvent<V>> {
-    const watcher: Watcher = { queue: [] };
-    for (const entry of this.bucket.values.values()) watcher.queue.push({ type: "put", entry });
-    watcher.queue.push({ type: "ready" });
-    this.bucket.watchers.add(watcher);
-    try {
-      while (!signal.aborted) {
-        const event = watcher.queue.shift() ?? await new Promise<Event | undefined>(resolve => {
-          const abort = (): void => { watcher.wake = undefined; resolve(undefined); };
-          watcher.wake = () => { watcher.wake = undefined; signal.removeEventListener("abort", abort); resolve(watcher.queue.shift()); };
-          signal.addEventListener("abort", abort, { once: true });
-        });
-        if (!event) return;
-        yield event as TransportKvEvent<V>;
-      }
-    } finally { this.bucket.watchers.delete(watcher); }
-  }
-}
-
-interface Clock { wall: number; mono: number }
-const advance = (clock: Clock, ms: number): void => { clock.wall += ms; clock.mono += ms; };
-
-function world() {
-  const writes: string[] = [];
-  const presence = new MemoryBucket(600_000, writes);
-  const leases = new MemoryBucket(15_000, writes);
-  const transport = (machine: string, hostId: string): FabricTransport => ({
-    kind: "nats", self: { machine, hostId },
-    async send() { throw new Error("unused"); }, async *inbox() { return; },
-    kv(bucket: TransportBucket) { return new MemoryKv(bucket === "presence" ? presence : leases, machine); },
-    async drainState() { return { pending: 0, ackPending: 0 }; }, async close() {},
-  });
-  return { presence, leases, transport, writes };
-}
 
 const openers: Array<{ close(): Promise<void> }> = [];
 afterEach(async () => { await Promise.allSettled(openers.splice(0).map(item => item.close())); });
@@ -139,17 +42,6 @@ function natsRoot(id = NATS_ROOT, incarnation = "nats-inc-1", overrides: Partial
     name: "kate-main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp", "fabric"],
     controlProtocol: "v1", startedAt: 999_000, updatedAt: 1_000_000, sessionId: id.slice("session:".length), cwd: "/work", ...overrides };
 }
-function natsLease(id: string, incarnation: string, updatedAt: number): FabricKvHostLease & { incarnationToken: string } {
-  return { id, rootId: id, identityId: id, incarnation, incarnationToken: incarnation, pid: 7, pidStartTime: "70",
-    bootId: "aaaaaaaa-1234-4234-8234-123456789abc", updatedAt, expiresAt: updatedAt + 15_000 };
-}
-/** A native NATS Main on `machine`: presence plus its own host lease. */
-function seedNative(w: ReturnType<typeof world>, machine: string, record: FabricParticipantRecord, leaseAt: number): void {
-  const owner = `${record.ownerHostId}#${record.ownerIncarnation}`;
-  w.leases.put(hKey(machine, record.ownerHostId), owner, natsLease(record.ownerHostId, record.ownerIncarnation!, leaseAt), 0);
-  w.presence.put(pKey(machine, record.id), owner, record, 0);
-}
-
 function fileRoot(id = FILE_ROOT, incarnation = "file-inc-1", overrides: Partial<FabricParticipantRecord> = {}): FabricParticipantRecord {
   return { format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id, ownerIncarnation: incarnation,
     name: "paul-lead", status: "running", runner: "pi", transport: "host", capabilities: ["steer", "followUp", "fabric"],

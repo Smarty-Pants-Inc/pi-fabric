@@ -53,12 +53,10 @@ describe.skipIf(!binary || process.platform !== "linux" || !n4)("A' N4: v2 fleet
     const copy = await waitForValue(() => hubCopies(token)[0], () => `republished into the hub mesh\n${linkTail(h)}`, E2E_WAIT_MS);
     expect(copy).toMatchObject({ topic: "fleet.work.tasks", kind: "completed", to: "factory", text: token, from: { id: link().id },
       data: { repo: "pi-fabric", number: 1593 } });
-    // The crossing stamp names the link and the source event; the verified v2 sender is recorded, never presented as `from`.
-    const stamp = dataOf(copy).bridge as Record<string, unknown> | undefined;
-    expect(stamp).toBeDefined();
-    expect(JSON.stringify(stamp)).toContain(h.linkName);
-    expect(JSON.stringify(stamp)).toContain(published.id);
-    expect(Object.values(stamp!)).toContain(h.natsMain.id);
+    // The crossing stamp (L1 bridge-nats-republish.ts): the link, the source event id, and the sender as KV presence
+    // verified it on its credential machine. The sender is attribution only, never presented as `from`.
+    expect(dataOf(copy).bridge).toMatchObject({ from: h.linkName, id: published.id,
+      sender: { id: h.natsMain.id, kind: "main", machine: NATS_MAIN_MACHINE } });
     await barrier();
     expect(hubCopies(token)).toHaveLength(1);
   }, E2E_WAIT_MS * 3);

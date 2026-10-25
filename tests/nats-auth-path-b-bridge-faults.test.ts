@@ -35,6 +35,8 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link fau
   afterAll(async () => { await h?.stop(); }, 60_000);
 
   const settle = <T>(work: Promise<T>) => work.catch((error: unknown) => { throw new Error(`${String(error)}\n${linkTail(h)}`); });
+  /** Observe the outcome now (no unhandled rejection if an earlier assertion fails); assert it later. */
+  const outcome = <T>(work: Promise<T>) => settle(work).then((value) => ({ value }), (error: unknown) => ({ error: String(error) }));
   const natsCommandsFor = (mark: number, token: string) => h.wire.since(mark).filter((event) => event.phase === "deliver" &&
     event.hostId === h.natsMain.id && event.envelope.kind === "command" && bodyOf(event).message === token);
   const fileCommandsFor = (token: string) => h.fileEvents({ topic: CONTROL }).filter((event) => dataOf(event).message === token);
@@ -44,8 +46,8 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link fau
     const mark = h.wire.mark(), refusedBefore = h.faults.refused;
     h.faults.block();
     // Both sends are issued during the outage: the file command is in the hub log, the NATS command in the broker.
-    const toNats = settle(h.fileMain.invoke("agents.followUp", { id: h.natsMain.id, message: f2n, idempotencyKey: `o-${randomUUID()}` }));
-    const toFile = settle(h.natsMain.invoke("agents.followUp", { id: h.fileMain.id, message: n2f, idempotencyKey: `o-${randomUUID()}` }));
+    const toNats = outcome(h.fileMain.invoke("agents.followUp", { id: h.natsMain.id, message: f2n, idempotencyKey: `o-${randomUUID()}` }));
+    const toFile = outcome(h.natsMain.invoke("agents.followUp", { id: h.fileMain.id, message: n2f, idempotencyKey: `o-${randomUUID()}` }));
     await waitForValue(() => fileCommandsFor(f2n).length ? true : undefined, "file command appended during the outage", 10_000);
     await h.wire.until(() => h.wire.since(mark).some((event) => event.phase === "send" && event.hostId === h.natsMain.id &&
       bodyOf(event).message === n2f), "NATS command stored during the outage");
@@ -54,26 +56,31 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link fau
     expect(mentions(h.natsMain, f2n)).toEqual([]);
     expect(mentions(h.fileMain, n2f)).toEqual([]);
     h.faults.unblock();
-    await expect(toNats).resolves.toMatchObject({ acknowledged: true });
-    await expect(toFile).resolves.toMatchObject({ acknowledged: true });
+    expect(await toNats).toMatchObject({ value: { acknowledged: true } });
+    expect(await toFile).toMatchObject({ value: { acknowledged: true } });
     expect(mentions(h.natsMain, f2n)).toHaveLength(1);
     expect(mentions(h.fileMain, n2f)).toHaveLength(1);
     expect(natsCommandsFor(mark, f2n)).toHaveLength(1);
   }, 90_000);
 
-  it("a lost PubAck on the link's publish is resent under the same id: the broker dedupes, one consumption", async () => {
+  it("a lost PubAck on the link's publish: the stored command is consumed once, and any resend is the same id", async () => {
     const token = `LOST_PUBACK_${randomUUID()}`;
-    const mark = h.wire.mark(), drops = h.faults.pubAckDrops, published = h.faults.inboxPublishes.length;
+    const mark = h.wire.mark(), drops = h.faults.pubAckDrops, published = h.faults.inboxFrames.length;
     h.faults.losePubAcks(publishTo(NATS_MAIN_MACHINE, "cmd"));
     await expect(settle(h.fileMain.invoke("agents.followUp", { id: h.natsMain.id, message: token, idempotencyKey: `p-${randomUUID()}` })))
       .resolves.toMatchObject({ acknowledged: true });
     expect(h.faults.pubAckDrops - drops).toBe(1);
-    const commandPublishes = h.faults.inboxPublishes.slice(published).filter((subject) => parseInboxSubject(subject)?.kind === "cmd" &&
-      parseInboxSubject(subject)?.machine === NATS_MAIN_MACHINE);
-    expect(commandPublishes.length).toBeGreaterThanOrEqual(2); // the original and its resend
-    expect(natsCommandsFor(mark, token)).toHaveLength(1); // one stored copy: same Nats-Msg-Id
+    // The owner's ACK may settle it before any PubAck timeout; a resend (now or later) must reuse the
+    // first envelope id so the broker's Nats-Msg-Id window stores one copy.
+    const barrier = `LOST_PUBACK_BARRIER_${randomUUID()}`;
+    await expect(settle(h.fileMain.invoke("agents.followUp", { id: h.natsMain.id, message: barrier, idempotencyKey: `b-${randomUUID()}` })))
+      .resolves.toMatchObject({ acknowledged: true });
+    // Wire format (src/transport/nats/inbox.ts #wire): { format: 1, sourceMachine, envelope }.
+    const ids = new Set(h.faults.publishedWith(token, published).map((frame) => (JSON.parse(frame.body) as { envelope?: { id?: string } }).envelope?.id));
+    expect(ids.size).toBe(1);
+    expect(natsCommandsFor(mark, token)).toHaveLength(1);
     expect(mentions(h.natsMain, token)).toHaveLength(1);
-  }, 60_000);
+  }, 90_000);
 
   it("a lost broker +ACK after the durable file append, then a link restart: the real redelivery is not consumed again", async () => {
     const token = `LOST_ACK_${randomUUID()}`;

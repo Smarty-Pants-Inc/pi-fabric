@@ -53,19 +53,22 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: ad
     expect(h.natsMain.delivered().filter((entry) => entry.text.includes(text))).toHaveLength(1);
   }, 45_000);
 
-  it("an ops.owner notice crosses; an unlisted topic, a broadcast and a report to an unlisted recipient never do", async () => {
-    const notice = `pr.wake ${randomUUID()}`, github = `GITHUB_${randomUUID()}`, broadcast = `BROADCAST_${randomUUID()}`, other = `OTHER_${randomUUID()}`;
+  it("an ops.owner alarm crosses; pr.wake, an unlisted topic, a broadcast and a report to an unlisted recipient never do", async () => {
+    const notice = `inbox age alarm ${randomUUID()}`, github = `GITHUB_${randomUUID()}`, broadcast = `BROADCAST_${randomUUID()}`,
+      other = `OTHER_${randomUUID()}`, wake = `PR_WAKE_${randomUUID()}`;
     const relayMark = h.faults.inboxFrames.length;
     await publish(REPORT_RELAY, "github.pull_request", "opened", h.natsMain.id, github);
     await publish(REPORT_RELAY, "fleet.work.lanes", "report", undefined, broadcast);
     await publish(REPORT_RELAY, "fleet.work.lanes", "report", h.natsPeer!.id, other); // natsPeer has no receiveTopics
-    await publish(OWNER_INBOX, "ops.owner", "pr.wake", h.natsMain.id, notice);
+    // pr.wake registers a PR with the hub factory; it is not Main work (L2 bridge-nats-topics.ts OWNER_KINDS).
+    await publish(OWNER_INBOX, "ops.owner", "pr.wake", h.natsMain.id, wake);
+    await publish(OWNER_INBOX, "ops.owner", "inbox.age.alarm", h.natsMain.id, notice);
     // Ordered barrier: the later allowed notice arrived, so every earlier event was already decided.
     await waitForValue(() => h.natsMain.delivered().find((entry) => entry.text.includes(notice)), `ops.owner notice delivered\n${linkTail(h)}`, 20_000);
-    expect(h.natsMain.delivered().filter((entry) => entry.text.includes(github) || entry.text.includes(broadcast))).toEqual([]);
+    expect(h.natsMain.delivered().filter((entry) => [github, broadcast, wake].some((token) => entry.text.includes(token)))).toEqual([]);
     expect(h.natsPeer!.delivered().filter((entry) => entry.text.includes(other))).toEqual([]);
     // Nothing for them was even published by the link (decided before the barrier, in file-log order).
-    for (const token of [github, broadcast, other]) expect(h.faults.publishedWith(token, relayMark), token).toEqual([]);
+    for (const token of [github, broadcast, other, wake]) expect(h.faults.publishedWith(token, relayMark), token).toEqual([]);
     expect(h.faults.publishedWith(notice, relayMark)).toHaveLength(1);
   }, 45_000);
 });

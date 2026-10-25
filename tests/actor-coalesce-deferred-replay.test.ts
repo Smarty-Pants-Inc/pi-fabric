@@ -33,6 +33,13 @@ const frame = (task: string): { payload: MeshEvent; coalesced?: Array<{ id: stri
 };
 const seenIds = (task: string) => frame(task).coalesced?.map(record => record.id) ?? [frame(task).payload.id];
 const skipPadding = { id: "padding", where: [{ path: "data.event", equals: "padding" }] };
+// pi-fabric#1572 (smarty-dev#16416): a filter set over queued filler items refuses unless dropQueued, which holds the
+// 9 queued and overflow paddings in the dead-letter file instead of dropping them. Coalesced records are still judged
+// one by one (round 9, option B), so the replayed history below is pruned exactly as before.
+const DROP_QUEUED = { dropQueued: true } as const;
+const paddings = (entries: Array<{ heldBy?: { ruleId?: string }; event: MeshEvent }>) =>
+  entries.map(entry => [entry.heldBy?.ruleId, (entry.event.data as { event?: string }).event]);
+const HELD_PADDINGS = Array(9).fill(["padding", "padding"]);
 const history = (event: MeshEvent) => ({ id: event.id, sequence: event.sequence, topic: event.topic, kind: event.kind,
   from: event.from, sender: event.sender, event: (event.data as { event: string }).event,
   action: "created", payload: event });
@@ -88,6 +95,11 @@ const world = () => {
     },
     write: (id: string, entries: unknown[]) => fs.writeFileSync(file(id), entries.map(entry => JSON.stringify(entry)).join("\n") + "\n"),
     deadLetters: (id: string) => fs.existsSync(file(id)) ? fs.readFileSync(file(id), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : [],
+    // pi-fabric#1572: the 9 queued and overflow paddings a whole-item skipPadding moves, held while the filter skips them.
+    held: (id: string) => (fs.existsSync(file(id)) ? fs.readFileSync(file(id), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : [])
+      .filter((entry: { heldBy?: unknown }) => entry.heldBy),
+    pending: (id: string) => (fs.existsSync(file(id)) ? fs.readFileSync(file(id), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : [])
+      .filter((entry: { heldBy?: unknown }) => !entry.heldBy),
     entry: (event: MeshEvent, coalesced?: unknown[]) => ({ at: Date.now(), source: `mesh:${TOPIC}`, event, ...(coalesced ? { coalesced } : {}) }),
     finish: async (id: string, count: number) => { release(); await waitFor(() => runs.length >= count && actors.status(id).status === "idle"); expect(runs).toHaveLength(count); },
   };
@@ -105,13 +117,17 @@ describe("settlement releases richer deferred coalesced dead letters (#4605 roun
     const immutable = w.runs[0]!.task;
     await w.primeBacklog();
     w.write(actor.id, [w.entry(primary, [history(older), history(primary)]), w.entry(unrelated)]);
-    await w.actors.setActivationFilter(actor.id, [skipPadding]); // removes filler, NOT a new input event
+    // Moves (holds) the filler, NOT a new input event.
+    await expect(w.actors.setActivationFilter(actor.id, [skipPadding], undefined, undefined, undefined, DROP_QUEUED))
+      .resolves.toMatchObject({ movedToDeadLetter: 9 });
     expect(w.actors.status(actor.id).queued).toBe(0);
-    expect(w.deadLetters(actor.id)).toHaveLength(2);
+    expect(w.pending(actor.id)).toHaveLength(2);
+    expect(paddings(w.held(actor.id))).toEqual(HELD_PADDINGS);
     expect(w.runs[0]!.task).toBe(immutable);
     await w.finish(actor.id, 3);
     expect(w.runs.slice(1).flatMap(run => seenIds(run.task))).toEqual([older.id, unrelated.id]);
-    expect(w.deadLetters(actor.id)).toEqual([]);
+    expect(w.pending(actor.id)).toEqual([]);
+    expect(paddings(w.held(actor.id))).toEqual(HELD_PADDINGS);
   });
 
   it("ADV-3d: the already captured primary is not delivered twice when only older history was missing", async () => {
@@ -123,7 +139,9 @@ describe("settlement releases richer deferred coalesced dead letters (#4605 roun
     await waitFor(() => w.runs.length === 1);
     await w.primeBacklog();
     w.write(actor.id, [w.entry(primary, [history(older), history(primary)])]);
-    await w.actors.setActivationFilter(actor.id, [skipPadding]);
+    await expect(w.actors.setActivationFilter(actor.id, [skipPadding], undefined, undefined, undefined, DROP_QUEUED))
+      .resolves.toMatchObject({ movedToDeadLetter: 9 });
+    expect(paddings(w.held(actor.id))).toEqual(HELD_PADDINGS);
     await w.finish(actor.id, 2);
     expect(w.runs.flatMap(run => seenIds(run.task)).filter(id => id === primary.id)).toHaveLength(1);
     expect(frame(w.runs[1]!.task).payload).toEqual(older);
@@ -141,7 +159,9 @@ describe("settlement releases richer deferred coalesced dead letters (#4605 roun
     const richer = { ...history(primary), untrusted: true };
     await w.primeBacklog();
     w.write(actor.id, [w.entry(primary, [history(older), richer])]);
-    await w.actors.setActivationFilter(actor.id, [skipPadding]);
+    await expect(w.actors.setActivationFilter(actor.id, [skipPadding], undefined, undefined, undefined, DROP_QUEUED))
+      .resolves.toMatchObject({ movedToDeadLetter: 9 });
+    expect(paddings(w.held(actor.id))).toEqual(HELD_PADDINGS);
     expect(w.runs[0]!.task).toBe(immutable);
     await w.finish(actor.id, 2);
     expect(seenIds(w.runs[1]!.task)).toEqual([older.id, primary.id]);
@@ -158,7 +178,9 @@ describe("settlement releases richer deferred coalesced dead letters (#4605 roun
     const primary = await w.publish("check_run");
     await w.primeBacklog();
     w.write(actor.id, [w.entry(primary, [history(older), history(primary)])]);
-    await w.actors.setActivationFilter(actor.id, [skipPadding, { id: "checks", where: [{ path: "data.event", equals: "check_run" }] }]);
+    await expect(w.actors.setActivationFilter(actor.id, [skipPadding, { id: "checks", where: [{ path: "data.event", equals: "check_run" }] }],
+      undefined, undefined, undefined, DROP_QUEUED)).resolves.toMatchObject({ movedToDeadLetter: 9 });
+    expect(paddings(w.held(actor.id))).toEqual(HELD_PADDINGS);
     expect(w.actors.status(actor.id).queued).toBe(1);
     await w.finish(actor.id, 2);
     expect(frame(w.runs[1]!.task).payload).toEqual(older);
@@ -182,8 +204,10 @@ describe("settlement releases richer deferred coalesced dead letters (#4605 roun
     const allCompleted = await w.publish("check_run", 300);
     await w.primeBacklog();
     w.write(actor.id, [w.entry(duplicate, [history(fresh), history(duplicate)]), w.entry(allCompleted)]);
-    await w.actors.setActivationFilter(actor.id, [skipPadding]);
-    expect(w.deadLetters(actor.id)).toEqual([]);
+    await expect(w.actors.setActivationFilter(actor.id, [skipPadding], undefined, undefined, undefined, DROP_QUEUED))
+      .resolves.toMatchObject({ movedToDeadLetter: 9 });
+    expect(w.pending(actor.id)).toEqual([]);
+    expect(paddings(w.held(actor.id))).toEqual(HELD_PADDINGS);
     expect(w.actors.status(actor.id).queued).toBe(1);
     await w.finish(actor.id, 3);
     expect(seenIds(w.runs[2]!.task)).toEqual([fresh.id]);
@@ -203,7 +227,9 @@ describe("settlement releases richer deferred coalesced dead letters (#4605 roun
     // provides the merged actor facts; each record still supplies its own data.
     await w.primeBacklog();
     w.write(actor.id, [w.entry(primary, [history(older), history(primary)])]);
-    await w.actors.setActivationFilter(actor.id, [skipPadding]);
+    await expect(w.actors.setActivationFilter(actor.id, [skipPadding], undefined, undefined, undefined, DROP_QUEUED))
+      .resolves.toMatchObject({ movedToDeadLetter: 9 });
+    expect(paddings(w.held(actor.id))).toEqual(HELD_PADDINGS);
     await w.finish(actor.id, 2);
     expect(seenIds(w.runs[1]!.task)).toContain(older.id);
     expect(w.runs[1]!.task).toContain("human-7-issue_comment");

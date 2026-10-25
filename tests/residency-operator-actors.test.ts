@@ -91,14 +91,21 @@ describe("same-user resident actor operator", () => {
       const dry = await f.cli("stop", victim.name, ["--dry-run", ...f.confirm], path.basename(f.config.residencyRoot).slice(0, 12));
       expect(dry).toMatchObject({ code: 0, err: "" });
       expect(f.host.actors.status(victim.id).status).toBe("running");
+      // pi-fabric#1572 round 4: the CLI stop is an explicit operator stop; the activation in flight never refuses it. The
+      // run is stopped, and its callerless item is archived, not dropped.
       const stopped = await f.cli("stop", victim.name, f.confirm);
       expect(stopped).toMatchObject({ code: 0, err: "" });
+      expect(JSON.parse(stopped.out).actor.stoppedQueue).toMatchObject({ counts: { inFlight: 1 } });
       expect(JSON.parse(stopped.out).actor.status).toBe("stopped");
       expect(f.host.actors.status(victim.id).inFlightRun).toBeUndefined();
       expect(residentProcessAlive(runPid)).toBe(false);
       expect(f.host.actors.status(survivor.id).status).toBe("running");
       f.deadMain();
-      const removed = await f.cli("remove", victim.id, f.confirm);
+      // The stop archive is kept work: a plain remove is refused; --drop-queued removes and keeps it (pi-fabric#1572 round 3).
+      const kept = await f.cli("remove", victim.id, f.confirm);
+      expect(kept.code).not.toBe(0);
+      expect(kept.err).toMatch(/stop archives 1.*remove refused and nothing changed/);
+      const removed = await f.cli("remove", victim.id, ["--drop-queued", ...f.confirm]);
       expect(removed).toMatchObject({ code: 0, err: "" });
       if (operatorCleanupUnknownOnThisPlatform()) expectPendingOperatorRemoval(f, victim.id, JSON.parse(removed.out));
       else await waitFor(() => !new ActorRegistryStore(f.config.actorRoot).records().some(actor => actor.id === victim.id));
@@ -121,14 +128,20 @@ describe("same-user resident actor operator", () => {
       const runPid = Number(f.host.agents.status(runId).sessionId);
 
       f.deadMain();
+      // pi-fabric#1572 round 5 (fabric-store N4): the run's callerless tell is live work a plain remove refuses to drop;
+      // --drop-queued archives it and removes the actor through the same terminal drain.
+      const plain = await f.cli("remove", victim.name, f.confirm);
+      expect(plain.code).toBe(1);
+      expect(plain.err).toMatch(/in-flight 1, settled 0\); remove refused and nothing changed/);
+      expect(residentProcessAlive(runPid)).toBe(true);
       if (operatorCleanupUnknownOnThisPlatform()) {
-        const removed = await f.cli("remove", victim.name, f.confirm);
+        const removed = await f.cli("remove", victim.name, ["--drop-queued", ...f.confirm]);
         expect(removed).toMatchObject({ code: 0, err: "" });
         expectPendingOperatorRemoval(f, victim.id, JSON.parse(removed.out));
         await f.host.participants.refresh();
         expect(f.host.participants.get(victim.id, Date.now(), { fresh: true })).toBeUndefined();
       } else {
-        expect(await f.cli("remove", victim.name, f.confirm)).toMatchObject({ code: 0, err: "" });
+        expect(await f.cli("remove", victim.name, ["--drop-queued", ...f.confirm])).toMatchObject({ code: 0, err: "" });
         await f.host.actors.removalSettled(victim.id);
         await f.host.participants.refresh();
         expect(new ActorRegistryStore(f.config.actorRoot).records().some(actor => actor.id === victim.id)).toBe(false);
@@ -138,6 +151,67 @@ describe("same-user resident actor operator", () => {
       expect(f.host.actors.status(survivor.id).status).toBe("running");
     } finally { await f.close(); }
   }, 40_000);
+
+  it("a refused CLI remove changes nothing: the actor keeps running with its queue bytes and its run; the tool's resident removeActor too (pi-fabric#1572 round 5)", async () => {
+    const f = await fixture();
+    try {
+      const victim = await f.create("busy-remove");
+      f.host.actors.tell(victim.id, "HANG_WITH_PROGRESS");
+      await waitFor(() => !!f.host.actors.status(victim.id).inFlightRun);
+      const runId = f.host.actors.status(victim.id).inFlightRun!.id;
+      await waitFor(() => ("turns" in f.host.agents.status(runId) && Number((f.host.agents.status(runId) as { turns?: number }).turns) > 0));
+      const runPid = Number(f.host.agents.status(runId).sessionId);
+      f.host.actors.tell(victim.id, "queued-one");
+      f.host.actors.tell(victim.id, "queued-two");
+      await waitFor(() => f.host.actors.status(victim.id).queued === 2);
+      const actorDir = path.join(f.config.actorRoot, victim.id);
+      const queueFile = path.join(actorDir, fs.readdirSync(actorDir).find(name => name.startsWith("queue-") && name.endsWith(".json"))!);
+      const queueBytes = fs.readFileSync(queueFile);
+      const unchanged = () => {
+        expect(f.host.actors.status(victim.id)).toMatchObject({ status: "running", queued: 2 });
+        expect(f.host.actors.status(victim.id).inFlightRun?.id).toBe(runId);
+        expect(residentProcessAlive(runPid)).toBe(true);
+        expect(fs.readFileSync(queueFile).equals(queueBytes)).toBe(true);
+        expect(fs.existsSync(path.join(actorDir, "stopped-queues"))).toBe(false);
+        expect(f.host.actors.messages(victim.id).filter(message => message.text?.startsWith("MOVED-TO") ||
+          message.error?.startsWith("Dropped a queued event"))).toEqual([]);
+        expect(new ActorRegistryStore(f.config.actorRoot).records().some(actor => actor.id === victim.id)).toBe(true);
+      };
+      f.deadMain();
+      // fabric-store N2 (probe O): the remove is judged before its preliminary stop, so the refusal is true.
+      const refused = await f.cli("remove", victim.name, f.confirm);
+      expect(refused.code).toBe(1);
+      expect(refused.err).toMatch(/^fabric-actors: FABRIC_ACTOR_QUEUED_WORK: .*queued 2, parked 0, overflow 0, in-flight 1, settled 0\); remove refused and nothing changed/);
+      expect(JSON.parse(refused.out)).toMatchObject({ ok: false, errorCode: "FABRIC_ACTOR_QUEUED_WORK",
+        queuedWork: { operation: "remove", actorId: victim.id, counts: { archived: 0, heldDeadLetter: 0, queued: 2, inFlight: 1 } } });
+      unchanged();
+      // The agents.remove tool forwards a resident-owned actor's removal to ResidentActorClient.removeActor: the same check.
+      const client = new ResidentActorClient(f.config.meshRoot, f.config.rootId);
+      await expect(client.removeActor(victim.id)).rejects.toMatchObject({ code: "FABRIC_ACTOR_QUEUED_WORK", operation: "remove",
+        counts: { queued: 2, inFlight: 1 } });
+      unchanged();
+      // --drop-queued archives all three before anything is emptied, then removes the actor and keeps them.
+      const removed = await f.cli("remove", victim.name, ["--drop-queued", ...f.confirm]);
+      expect(removed).toMatchObject({ code: 0, err: "" });
+      expect(residentProcessAlive(runPid)).toBe(false);
+      let archiveDir = path.join(actorDir, "stopped-queues");
+      if (operatorCleanupUnknownOnThisPlatform()) expectPendingOperatorRemoval(f, victim.id, JSON.parse(removed.out));
+      else {
+        await f.host.actors.removalSettled(victim.id);
+        await waitFor(() => !fs.existsSync(actorDir));
+        const base = path.join(f.config.meshRoot, "session-archive", encodeURIComponent(f.config.rootId));
+        const kept = fs.readdirSync(base).filter(name => name.startsWith(`${victim.id}.recoverable-`));
+        expect(kept).toHaveLength(1);
+        archiveDir = path.join(base, kept[0]!, "stopped-queues");
+      }
+      const archives = fs.readdirSync(archiveDir).filter(name => /^\d{8}T\d{9}Z-[0-9a-f]{12}\.jsonl$/.test(name));
+      expect(archives).toHaveLength(1);
+      const lines = fs.readFileSync(path.join(archiveDir, archives[0]!), "utf8").split("\n").filter(Boolean)
+        .map(line => JSON.parse(line) as { kind: string; item?: { payload?: { message?: string } } });
+      expect(lines.map(line => line.kind)).toEqual(["header", "in-flight", "queued", "queued"]);
+      expect(lines.slice(1).map(line => line.item?.payload?.message)).toEqual(["HANG_WITH_PROGRESS", "queued-one", "queued-two"]);
+    } finally { await f.close(); }
+  }, 60_000);
 
   it("a live file-only root lease vetoes confirmed control", async () => {
     const f = await fixture();

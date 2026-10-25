@@ -7,7 +7,7 @@ import type { AgentRunRequest, AgentRunResult } from "../src/agents/types.js";
 import { ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES, ActorManager } from "../src/actors/manager.js";
 import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
-import { DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS, normalizeDeadLetterReplayMaxAgeMs, type FabricActorRequest } from "../src/actors/types.js";
+import { DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS, normalizeDeadLetterReplayMaxAgeMs, type FabricActorActivationFilter, type FabricActorRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { normalizeScope, senderStamp } from "../src/scope.js";
@@ -33,6 +33,7 @@ type Entry = { at: number; source: string; event: MeshEvent };
 // Real registry, restart, mesh envelopes and queue checkpoint. Worker launches are held at the
 // run boundary, so assertions inspect accepted durable work without calling a model. No cleanup
 // deletes: the enclosing local probe records/retains product delete targets (#11199).
+const NOISE_FILTER: FabricActorActivationFilter = [{ id: "noise", kind: ["noise"] }];
 async function backlog(patch: Partial<FabricActorRequest> = {}, queueLimit = 16) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dead-letter-replay-"));
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
@@ -45,10 +46,11 @@ async function backlog(patch: Partial<FabricActorRequest> = {}, queueLimit = 16)
     });
     throw new Error("held test run aborted");
   });
-  const open = () => {
+  const open = (consumeMesh = true) => {
     const manager = new ActorManager("test", identity, mesh,
       { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20, actorQueueLimit: queueLimit }, agents, () => {},
-      { actorRoot: path.join(root, "actors"), persistent: true, closeGraceMs: 0, meshRetentionSweepPath: false });
+      { actorRoot: path.join(root, "actors"), persistent: true, closeGraceMs: 0, meshRetentionSweepPath: false,
+        canConsumeMesh: () => consumeMesh });
     closers.push(() => manager.close());
     return manager;
   };
@@ -304,15 +306,15 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
       if (batch > 0) expect(readLines(w.file)).toEqual([]);
       const overwrittenBackupBytes = fs.existsSync(`${w.archive}.1`) ? fs.statSync(`${w.archive}.1`).size : 0;
       fs.writeFileSync(w.file, entries.map(entry => JSON.stringify(entry) + "\n").join(""));
-      const manager = w.open();
-      // Replay is synchronous up to the presence write. Close immediately, before queued
-      // microtasks/timers can archive the retained prefix and hide the first checkpoint.
-      const configured = manager.setActivationFilter(w.actor.id, null);
+      // Inspect only the restart's first replay. The setter now awaits its filter commit before
+      // doing another replay (pi-fabric#1572 round 11), so it cannot be a synchronous replay trigger.
+      // Suspend monitor maintenance and join the initial-load microtask before closing.
+      const manager = w.open(false);
+      await Promise.resolve();
       const receipt = receipts(manager, w.actor.id).at(-1);
       const notices = manager.messages(w.actor.id).filter(message =>
         (message.data as { reason?: unknown } | undefined)?.reason === "dead_letter_archive");
       await manager.close();
-      await configured;
       expect(readLines<Entry>(w.archive)).toEqual(suffix);
       expect(fs.statSync(w.archive).size).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES);
       expect(readLines<Entry>(w.file)).toEqual(prefix);
@@ -325,11 +327,10 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
         expect(notices.at(-1)?.data).not.toHaveProperty("deadLetterArchiveDropped");
       }
 
-      const restarted = w.open();
-      const retried = restarted.setActivationFilter(w.actor.id, null);
+      const restarted = w.open(false);
+      await Promise.resolve();
       const retryReceipt = receipts(restarted, w.actor.id).at(-1);
       await restarted.close();
-      await retried;
       expect(readLines(w.file)).toEqual([]);
       expect(readLines<Entry>(w.archive)).toEqual(prefix);
       expect(readLines<Entry>(`${w.archive}.1`)).toEqual(suffix);
@@ -378,12 +379,11 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     fs.writeFileSync(`${w.archive}.1`, backupText);
     fs.writeFileSync(w.file, stale.map(entry => JSON.stringify(entry) + "\n").join(""));
     const manager = w.open();
-    const configured = manager.setActivationFilter(w.actor.id, null);
+    await manager.setActivationFilter(w.actor.id, null);
     const receipt = receipts(manager, w.actor.id).at(-1);
     const notices = manager.messages(w.actor.id).filter(message =>
       (message.data as { reason?: unknown } | undefined)?.reason === "dead_letter_archive");
     await manager.close();
-    await configured;
     expect(readLines<Entry>(w.file)).toEqual(prefix);
     expect(fs.readFileSync(w.archive, "utf8")).toBe(historyText + suffix.map(entry => `${JSON.stringify(entry)}\n`).join(""));
     expect(fs.readFileSync(`${w.archive}.1`, "utf8")).toBe(backupText);
@@ -400,10 +400,9 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     fs.writeFileSync(w.archive, history);
     fs.writeFileSync(w.file, entries.map(entry => JSON.stringify(entry) + "\n").join(""));
     const manager = w.open();
-    const configured = manager.setActivationFilter(w.actor.id, null);
+    await manager.setActivationFilter(w.actor.id, null);
     const replayReceipts = receipts(manager, w.actor.id);
     await manager.close();
-    await configured;
     expect(readLines<Entry>(w.file)).toEqual([oversized]);
     expect(fs.readFileSync(w.archive, "utf8")).toBe(history);
     expect(fs.existsSync(`${w.archive}.1`)).toBe(false);
@@ -457,8 +456,11 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     expect(reloaded.status(w.actor.id).deadLetterReplayMaxAgeMs).toBe(0);
   });
 
+  // smarty-dev#16416 round 2: setActivationFilter refuses a NEW filter that would skip routed dead-letter backlog
+  // (queued-work guard). These cases test replay under a filter already set when the backlog formed: the actor is
+  // created with it, and re-applying it (which also triggers a replay) skips nothing newly.
   it("uses the current head-skip filter before replay and keeps unmatched events in order", async () => {
-    const w = await backlog();
+    const w = await backlog({ activationFilter: NOISE_FILTER });
     // Configure synchronously before the restart's queued replay microtask.
     const manager = w.open();
     await manager.setActivationFilter(w.actor.id, [{ id: "noise", kind: ["noise"] }]);
@@ -470,7 +472,7 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
   });
 
   it("archives raw stale entries before coalescing live keys by sequence, preserving FIFO and the current filter", async () => {
-    const w = await backlog({ coalesceKey: "payload.number" });
+    const w = await backlog({ coalesceKey: "payload.number", activationFilter: NOISE_FILTER });
     const now = Date.now();
     const staleAge = DEFAULT_DEAD_LETTER_REPLAY_MAX_AGE_MS + 60_000;
     // [key, mesh sequence, recorded age]: stale duplicates outrank every live event.
@@ -505,7 +507,7 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     { ordering: "filtered entry is older", filteredSequence: 10, replayableSequence: 20 },
     { ordering: "filtered entry is newer", filteredSequence: 20, replayableSequence: 10 },
   ])("keeps same-key replayable work when a live entry is skipped ($ordering)", async ({ filteredSequence, replayableSequence }) => {
-    const w = await backlog({ coalesceKey: "payload.number" });
+    const w = await backlog({ coalesceKey: "payload.number", activationFilter: NOISE_FILTER });
     const now = Date.now();
     const filtered: Entry = {
       ...w.entries[0]!, at: now,
@@ -532,7 +534,7 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
   });
 
   it("retains eligible same-key work untouched beyond replay capacity while skipping newer noise", async () => {
-    const w = await backlog({ coalesceKey: "payload.number" }, 2);
+    const w = await backlog({ coalesceKey: "payload.number", activationFilter: NOISE_FILTER }, 2);
     const entries = w.entries.slice(6).map((entry, index) => ({
       ...entry,
       event: { ...entry.event, sequence: index + 1, kind: index === 3 ? "noise" : "work",
@@ -540,10 +542,9 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
     }));
     fs.writeFileSync(w.file, entries.map(entry => `${JSON.stringify(entry)}\n`).join(""));
     const manager = w.open();
-    const configured = manager.setActivationFilter(w.actor.id, [{ id: "noise", kind: ["noise"] }]);
+    await manager.setActivationFilter(w.actor.id, [{ id: "noise", kind: ["noise"] }]);
     const replayReceipts = receipts(manager, w.actor.id);
     await manager.close();
-    await configured;
     // The first item can already be in flight; the second keeps the queue at half full
     // so its synchronous refill cannot consume the retained same-key entry.
     expect(w.queued()).toEqual(entries.slice(0, 2).map(entry => entry.event.id));
@@ -555,7 +556,7 @@ describe("dead-letter replay age and current activation filter (#10630)", () => 
   });
 
   it("removes and receipts every raw entry when a same-key live batch is entirely filtered", async () => {
-    const w = await backlog({ coalesceKey: "payload.number" });
+    const w = await backlog({ coalesceKey: "payload.number", activationFilter: NOISE_FILTER });
     const entries = w.entries.slice(6, 8).map(entry => ({
       ...entry, event: { ...entry.event, kind: "noise", data: { payload: { number: 77 } } },
     }));

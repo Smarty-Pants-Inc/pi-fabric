@@ -79,7 +79,8 @@ import { DEFAULT_STUCK_PREPARING_MS, STUCK_PREPARING_CHECK_MS } from "../actors/
 import { ActorRegistryStore } from "../actors/registry-store.js";
 import { canonicalResidentWakeConfig, residentWakeConfigMatches, residentWakeCapacityAvailable, residentWakeIndexPath, RESIDENT_WAKE_INDEX_MAX_ROOTS, ResidentWakeRecoveryReader, type ResidentWakeRecoveryBatch } from "./wake-index.js";
 import { ActorSessionResetCancelledError } from "../actors/session-reset-error.js";
-import type { FabricActorInfo } from "../actors/types.js";
+import type { FabricActorInfo, FabricActorRequeueResult } from "../actors/types.js";
+import { FabricActorQueuedWorkError } from "../actors/types.js";
 import type { AgentRunRecord } from "../agents/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager, rootRecordLastSeenMs } from "../agents/manager.js";
@@ -1059,6 +1060,7 @@ export class ResidentHost {
         callerBoundSpawn: 1,
         requestExpiry: 1,
         creationIdempotency: 1,
+        queuedWork: 1,
         ...(this.launch ? { releaseRoot: this.launch.spec.releaseRoot, configDigest: this.launch.spec.digest,
           handover: { abi: RESIDENT_HANDOVER_ABI, launcher: this.launch.launcher },
           ...(this.#drainSupported() ? { drain: { abi: RESIDENT_DRAIN_ABI } } : {}),
@@ -1341,7 +1343,10 @@ export class ResidentHost {
           const caller = this.participants.get(from.id, now, { fresh: true });
           this.#authorizeResidentSetter({ identity: from, hostId: caller?.ownerHostId ?? "" });
         }
-        await this.actors.stop(command.targetId);
+        // smarty-dev#16416: a remote stop opts in to archiving queued work with data.dropQueued.
+        // pi-fabric#1572 round 3: a routed agents.stop is an explicit operator stop.
+        await this.actors.stop(command.targetId, undefined, false, "actors.stop",
+          { explicit: true, ...((command.data as { dropQueued?: unknown } | undefined)?.dropQueued === true ? { dropQueued: true } : {}) });
         this.participants.scheduleRefresh();
         return { accepted: true, messageId: command.commandId };
       } catch (error) {
@@ -2833,7 +2838,8 @@ export class ResidentHost {
         if ((command.action !== "stop" && command.action !== "remove") ||
             typeof command.id !== "string" || !command.id.trim() ||
             (command.confirmDeadRoot !== undefined && typeof command.confirmDeadRoot !== "string") ||
-            (command.dryRun !== undefined && typeof command.dryRun !== "boolean")) {
+            (command.dryRun !== undefined && typeof command.dryRun !== "boolean") ||
+            (command.dropQueued !== undefined && typeof command.dropQueued !== "boolean")) {
           throw new Error("Invalid resident operator actor request");
         }
         const evidence = readResidentOperatorEvidence(this.config, this.mesh);
@@ -2869,12 +2875,21 @@ export class ResidentHost {
           // Re-read the uncached current lease immediately before each mutation.
           // This is a lease veto, not a proof that no Main exists or can restart.
           const actor = candidates[0]!;
-          const pending = this.actors.stop(actor.id, id => { check(); commit(id); }, true);
+          // smarty-dev#16416: operator stop refuses queued work unless dropQueued (archived); a remove keeps removal semantics.
+          // pi-fabric#1572 round 3: a remove with dropQueued archives its remaining work and keeps its archives (no lock-out
+          // after a stop --drop-queued, whose archive the removal guard otherwise refuses to take).
+          const dropQueued = command.dropQueued === true ? { dropQueued: true } : {};
+          // pi-fabric#1572 round 5 (fabric-store N2): a remove is judged BEFORE its preliminary stop, which is an internal
+          // stop (never refused, no archive): a refused remove stops, empties, aborts and commits nothing.
+          if (command.action === "remove") this.actors.assertRemovable(actor.id, dropQueued);
+          const pending = command.action === "stop"
+            ? this.actors.stop(actor.id, id => { check(); commit(id); }, true, "actors.stop", { explicit: true, ...dropQueued })
+            : this.actors.stop(actor.id, id => { check(); commit(id); }, true, "actors.remove", dropQueued);
           boundaryAdmitted?.();
           const stopped = await pending;
           response = command.action === "stop"
             ? { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: stopped, completedAt: Date.now() }
-            : await this.#removeResidentActor(actor.id, requestId, () => check(), true);
+            : await this.#removeResidentActor(actor.id, requestId, () => check(), true, command.dropQueued === true);
         }
       } else if (command.operation === "slotStatus") {
         response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true,
@@ -2888,7 +2903,7 @@ export class ResidentHost {
       } else if (command.operation !== "removeActor") {
         if (command.operation === "setInstructions" || command.operation === "setModel" ||
           command.operation === "setThinking" || command.operation === "setBatching" || command.operation === "setActivationFilter" || command.operation === "setTools" ||
-          command.operation === "resetSession" || command.operation === "stop") {
+          command.operation === "resetSession" || command.operation === "stop" || command.operation === "requeueArchived") {
           this.#authorizeResidentSetter(command.caller);
           if (command.operation === "setTools") assertResidentActorToolCeiling(command.tools, command.caller?.toolCeiling);
         }
@@ -2897,6 +2912,7 @@ export class ResidentHost {
           throw new Error(`Resident host does not own root actor ${actor.id}`);
         }
         let updated: FabricActorInfo;
+        let requeued: FabricActorRequeueResult | undefined;
         switch (command.operation) {
           case "actorStatus": updated = actor; break;
           case "setInstructions": {
@@ -2914,21 +2930,32 @@ export class ResidentHost {
             break;
           }
           case "stop": {
-            const pending = this.actors.stop(actor.id, commit, true);
+            if (command.dropQueued !== undefined && command.dropQueued !== true) throw new Error("Invalid resident stop request: dropQueued must be true or absent");
+            // The agents.stop API forwarded to its owning resident: an explicit operator stop (pi-fabric#1572 round 3).
+            const pending = this.actors.stop(actor.id, commit, true, "actors.stop", { explicit: true, ...(command.dropQueued === true ? { dropQueued: true } : {}) });
             boundaryAdmitted?.();
             updated = await pending;
+            break;
+          }
+          case "requeueArchived": {
+            if (typeof command.archive !== "string" || !command.archive.trim()) throw new Error("Invalid resident requeueArchived request");
+            requeued = await this.actors.requeueArchived(actor.id, command.archive, commit);
+            updated = this.actors.status(actor.id);
             break;
           }
           case "setModel": updated = await this.actors.setModel(actor.id, command.model, command.scope, commit, command.modelReason); break;
           case "setThinking": updated = await this.actors.setThinking(actor.id, command.thinking, command.scope, commit); break;
           case "setBatching": updated = await this.actors.setBatching(actor.id, command, commit); break;
-          case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter, commit, command.expiresAt, command.deadLetterReplayMaxAgeMs); break;
+          case "setActivationFilter": updated = await this.actors.setActivationFilter(actor.id, command.activationFilter, commit, command.expiresAt, command.deadLetterReplayMaxAgeMs,
+            command.dropQueued === true ? { dropQueued: true } : {}); break;
           case "setTools": updated = await this.actors.setTools(actor.id, command.tools, commit); break;
           default: throw new Error("Unknown resident actor operation");
         }
-        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: updated, completedAt: Date.now() };
+        response = { format: RESIDENT_HOST_FORMAT, requestId, ok: true, actor: updated, ...(requeued ? { requeued } : {}), completedAt: Date.now() };
       } else {
-        const pending = this.#removeResidentActor(command.id, requestId, commit);
+        // pi-fabric#1572 round 3: the removal forwards dropQueued; anything but true is refused, never ignored.
+        if (command.dropQueued !== undefined && command.dropQueued !== true) throw new Error("Invalid resident removeActor request: dropQueued must be true or absent");
+        const pending = this.#removeResidentActor(command.id, requestId, commit, false, command.dropQueued === true);
         boundaryAdmitted?.();
         response = await pending;
       }
@@ -2970,6 +2997,9 @@ export class ResidentHost {
         ...(error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError || error instanceof ResidentRequestExpiredError
           ? { errorCode: error.code } : {}),
         ...(error instanceof ActorSessionResetCancelledError ? { errorCode: error.code } : {}),
+        ...(error instanceof FabricActorQueuedWorkError ? {
+          errorCode: error.code, queuedWork: { operation: error.operation, actorId: error.actorId, counts: { ...error.counts } },
+        } : {}),
         ...(error instanceof FabricModelDeniedError ? {
           errorCode: error.code, modelDenied: { model: error.model, ...(error.replacement ? { replacement: error.replacement } : {}) },
         } : {}),
@@ -2991,7 +3021,7 @@ export class ResidentHost {
         ? error.code : "DRAIN_REFUSED", reason: errorMessage(error), at: Date.now(), deadlineAt: Date.now(), admissionHeld: false, terminal: true });
   }
 
-  async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void, operator = false): Promise<ResidentCommandResponse> {
+  async #removeResidentActor(id: string, requestId: string, commit: (id: string) => void, operator = false, dropQueued = false): Promise<ResidentCommandResponse> {
     const cleanup = this.actors.cleanupObligation(id);
     // Only an explicit operator request can waive durable ownership for this root's cleanup (#10189).
     // The manager rechecks eligibility and requires the host's fenced final check.
@@ -2999,9 +3029,11 @@ export class ResidentHost {
     if (!operatorCleanup && (!this.actors.owns(id) || (cleanup && cleanup.residency !== "durable"))) {
       throw new Error(`Resident host does not own ${id}`);
     }
+    // pi-fabric#1572 round 5: the removal's queued-work check precedes the request's commit, as a refused stop's does.
+    this.actors.assertRemovable(id, dropQueued ? { dropQueued: true } : {});
     // smarty-dev#2184 item 8: stop now and return; the removal finishes behind its run.
     commit(id);
-    const removed = await this.actors.remove(id, { wait: false, ...(operator ? { operator: true as const } : {}) });
+    const removed = await this.actors.remove(id, { wait: false, ...(operator ? { operator: true as const } : {}), ...(dropQueued ? { dropQueued: true } : {}) });
     this.#writeRemovals();
     if (removed.pending) {
       void this.actors.removalSettled(id)?.finally(() => {

@@ -98,7 +98,8 @@ describe.skipIf(process.platform !== "linux")("remove during the finisher's comm
         }
         // Counterexample kept: an accepted removal behind a live run answers pending at once (wait:false).
         expect(actors.owns(actor.id)).toBe(true);
-        expect((await actors.remove(actor.id, { wait: false })).pending).toMatch(/pending behind/);
+        // pi-fabric#1572 round 5: the tell in flight is live work; dropQueued archives it instead of refusing.
+        expect((await actors.remove(actor.id, { wait: false, dropQueued: true })).pending).toMatch(/pending behind/);
         settled = actors.removalSettled(actor.id);
         release();
         await atPause;

@@ -43,8 +43,9 @@ These legacy operations are not substitutes for cooperative PREPARE:
   gates and checked publication barriers.
 - `releaseChange` unconditionally defers before arming those gates. Its successful
   request exchange does not mean the release changed.
-- `fabric-actors stop` is terminal cancellation: it drops queued work. It must
-  not be used as an installer drain.
+- `fabric-actors stop` is terminal cancellation. It refuses an actor with queued
+  work, and with `--drop-queued` it moves that work to a stop archive
+  (smarty-dev#16416). It must not be used as an installer drain.
 
 Persistent host close retains committed actor queues better than terminal stop,
 but an external quiet-state scan followed by shutdown can race a new admission.

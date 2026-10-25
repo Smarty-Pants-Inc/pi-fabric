@@ -7,8 +7,17 @@ import { residentRoot, residentHostId, type ResidentHostConfig, type ResidentHos
 import { residentProcessAlive } from "./residency/process-identity.js";
 import { windowsSecurityPowerShell } from "./storage/windows-powershell.js";
 
-const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--confirm-dead-root <rootId>] [--main-stopped --evidence <text> | --evidence-file <path>]";
+const usage = "Usage: fabric-actors stop|remove --resident <directory-or-prefix> --actor <id-or-name> [--mesh-root <dir>] [--dry-run] [--drop-queued] [--confirm-dead-root <rootId>] [--main-stopped --evidence <text> | --evidence-file <path>]";
 const help = `${usage}
+
+stop refuses an actor that holds work (queued, parked, overflow, pending settled-window or dead-letter work) and
+names the counts; the activation in flight alone never refuses it (its callerless item is archived). With stop,
+--drop-queued moves that work to
+<actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl instead, never deleting it, and prints the archive;
+agents.requeueArchived feeds it to a recreated actor (smarty-dev#16416). A live remove refuses, before any effect, an
+actor that keeps such archives or held dead letters, or holds queued, parked, overflow, callerless in-flight or
+settled-window work (FABRIC_ACTOR_QUEUED_WORK); with --drop-queued it archives that work, removes the actor and keeps
+the archives under <mesh root>/session-archive/.
 
 When the resident host is dead, remove runs offline and needs --main-stopped (the live resident's own remove
 path is unchanged; smarty-dev#8090). The offline removal archives the actor by one rename of its directory into
@@ -130,11 +139,13 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
     if (action !== "stop" && action !== "remove") throw new Error(usage);
     const values: Record<string, string> = {};
     let dryRun = false;
+    let dropQueued = false;
     // remove: the operator asserts the root's Main process is gone (automatic proof: smarty-dev#7956).
     let mainStopped = false;
     for (let index = 0; index < rest.length; index++) {
       const option = rest[index]!;
       if (option === "--dry-run") { dryRun = true; continue; }
+      if (option === "--drop-queued" && !dropQueued) { dropQueued = true; continue; }
       if (option === "--main-stopped" && !mainStopped) { mainStopped = true; continue; }
       if (!["--resident", "--actor", "--mesh-root", "--confirm-dead-root", "--evidence", "--evidence-file"].includes(option) || values[option] !== undefined ||
           !rest[index + 1] || rest[index + 1]!.startsWith("--")) throw new Error(usage);
@@ -184,11 +195,20 @@ export async function main(argv: string[], io: { out: (text: string) => void; er
     const keepAlive = setTimeout(() => {}, client.commandTimeoutMs + 1_000);
     try {
       const response = await client.operatorActor(action,
-        values["--actor"], { dryRun, ...(confirmation.confirmDeadRoot !== undefined ? { confirmDeadRoot: confirmation.confirmDeadRoot } : {}) });
+        values["--actor"], { dryRun, ...(dropQueued ? { dropQueued: true } : {}),
+          ...(confirmation.confirmDeadRoot !== undefined ? { confirmDeadRoot: confirmation.confirmDeadRoot } : {}) });
       io.out(JSON.stringify({ resident: directory, action, dryRun, ...response }) + "\n");
       return 0;
     } finally { clearTimeout(keepAlive); }
   } catch (error) {
+    // pi-fabric#1572 round 5 (fabric-store N8): a queued-work refusal keeps its code and counts, so a caller can branch on it.
+    const queued = error as { code?: unknown; operation?: unknown; actorId?: unknown; counts?: unknown } | undefined;
+    if (queued?.code === "FABRIC_ACTOR_QUEUED_WORK") {
+      io.err(`fabric-actors: FABRIC_ACTOR_QUEUED_WORK: ${(error as Error).message}\n`);
+      io.out(JSON.stringify({ ok: false, errorCode: "FABRIC_ACTOR_QUEUED_WORK",
+        queuedWork: { operation: queued.operation, actorId: queued.actorId, counts: queued.counts } }) + "\n");
+      return 1;
+    }
     io.err(`fabric-actors: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }

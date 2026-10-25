@@ -495,8 +495,30 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "stop",
-    description: "Stop a local or remotely owned agent or actor that advertises the stop capability",
-    inputSchema: idSchema,
+    description: "Stop a local or remotely owned agent or actor that advertises the stop capability. An actor holding queued, parked, overflow or dead-letter work is refused with the counts unless dropQueued: true, which moves that work to <actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl (never deleted; the result names it) and stops. agents.requeueArchived restores it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        dropQueued: { type: "boolean", description: "Actors only: stop even with queued work, archiving it instead of refusing." },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+    risk: "agent",
+  },
+  {
+    name: "requeueArchived",
+    description: "Feed a stop archive (the stoppedQueue.archive path a dropQueued stop returned) to a live, usually recreated, actor through its normal arrival path and activation filter, once per archived item. Idempotent: the actor records the item ids it was offered, so a second call adds nothing. Items the actor cannot take (a full queue and overflow, and no dead-letter room within 90% of its bounds) come back in notQueued. Their notQueued ledger lines do not count as requeued, so a later call offers them again.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        archive: { type: "string", description: "<actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl" },
+      },
+      required: ["id", "archive"],
+      additionalProperties: false,
+    },
     risk: "agent",
   },
   {
@@ -882,7 +904,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "setActivationFilter",
-    description: "Set or clear (null or []) the actor's skip-only activation filter: preset names (hold, never-message-events) or rule objects. Invalid rules are rejected. Applies from the next queued event and resets filterSkipped. Optional expiresAt (epoch ms, live actors only) clears on the next event or poll, with an actor audit message.",
+    description: "Set or clear (null or []) the actor's skip-only activation filter: preset names (hold, never-message-events) or rule objects. Invalid rules are rejected. Applies from the next queued event and resets filterSkipped. If the new filter would skip already queued or overflow items, it is refused with the count unless dropQueued: true, which moves those items to the actor's dead-letter queue (never deleted; movedToDeadLetter on the result). Optional expiresAt (epoch ms, live actors only) clears on the next event or poll, with an actor audit message.",
     inputSchema: {
       type: "object",
       properties: {
@@ -890,6 +912,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
         activationFilter: { anyOf: [activationFilterSchema, { type: "null" }] },
         expiresAt: { type: "number", description: "Epoch milliseconds; clear at/after this time on the next event or poll. Live actors only." },
         deadLetterReplayMaxAgeMs: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER, description: "Also set the replay age limit in milliseconds; 0 = unlimited. Omitted preserves the actor's current limit (default 6 h)." },
+        dropQueued: { type: "boolean", description: "Live actors only: move queued items the new filter skips to the dead-letter queue instead of refusing." },
         scope: { type: "string", enum: ["project", "global"] },
       },
       required: ["id", "activationFilter"],
@@ -998,12 +1021,13 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "remove",
     description:
-      'Stop and remove a persistent actor. Default scope "project" removes a live project actor; scope "global" removes a project-independent template from the global registry.',
+      'Stop and remove a persistent actor. Default scope "project" removes a live project actor; scope "global" removes a project-independent template from the global registry. Refused before any effect (FABRIC_ACTOR_QUEUED_WORK, with the counts) while the actor keeps stop archives or held dead letters, or holds queued, parked, overflow, callerless in-flight or pending settled-window work; an ask in flight whose caller waits does not refuse it. dropQueued: true archives all of that work to <actor dir>/stopped-queues/ first and keeps it with the removed tree.',
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "string" },
         scope: { type: "string", enum: ["project", "global"] },
+        dropQueued: { type: "boolean" },
       },
       required: ["id"],
       additionalProperties: false,

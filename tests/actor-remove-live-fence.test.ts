@@ -392,7 +392,7 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
         if (Date.now() > until) throw new Error("run never started");
         await new Promise(resolve => setTimeout(resolve, 10));
       }
-      const accepted = await first.remove(actor.id, { wait: false });
+      const accepted = await first.remove(actor.id, { wait: false, dropQueued: true }); // pi-fabric#1572 round 5: archives the tell in flight
       expect(accepted.pending).toMatch(/pending behind its in-flight run/);
       const requestedAt = row(actor.id)?.removal?.requestedAt;
       expect(requestedAt).toEqual(expect.any(Number));
@@ -488,7 +488,7 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
         if (Date.now() > until) throw new Error("run never started");
         await new Promise(resolve => setTimeout(resolve, 10));
       }
-      const accepted = await first.remove(actor.id, { wait: false });
+      const accepted = await first.remove(actor.id, { wait: false, dropQueued: true }); // pi-fabric#1572 round 5: archives the tell in flight
       expect(accepted.pending).toMatch(/pending behind its in-flight run/);
       const requestedAt = row(actor.id)?.removal?.requestedAt;
       expect(requestedAt).toEqual(expect.any(Number));
@@ -574,7 +574,7 @@ describe.skipIf(process.platform !== "linux")("live actor-tree removal boundary,
         if (Date.now() > until) throw new Error("run never started");
         await new Promise(resolve => setTimeout(resolve, 10));
       }
-      const accepted = await first.remove(actor.id, { wait: false });
+      const accepted = await first.remove(actor.id, { wait: false, dropQueued: true }); // pi-fabric#1572 round 5: archives the tell in flight
       expect(accepted.pending).toMatch(/pending behind its in-flight run/);
       const requestedAt = row(actor.id)?.removal?.requestedAt;
       expect(requestedAt).toEqual(expect.any(Number));

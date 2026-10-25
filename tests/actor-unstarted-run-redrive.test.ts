@@ -232,7 +232,8 @@ else setInterval(() => {}, 1_000);
       data: { replayId: "remove:review@1" }, text: "HANG until actor removal" });
     await waitFor(() => h.actors.status(actor.id).inFlightRun !== undefined);
     const runId = h.actors.status(actor.id).inFlightRun!.id;
-    const removed = await h.actors.remove(actor.id);
+    // pi-fabric#1572 round 5: the mesh event in flight is live work; dropQueued archives it instead of refusing.
+    const removed = await h.actors.remove(actor.id, { dropQueued: true });
     expect(removed.removed).toBe(true);
     expect(runs).toHaveBeenCalledTimes(1);
     const saved = JSON.parse(fs.readFileSync(path.join(h.agents.runDirectory(runId)!, "status.json"), "utf8"));

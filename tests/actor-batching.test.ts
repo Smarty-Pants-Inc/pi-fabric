@@ -266,8 +266,12 @@ describe("actor window batching on the durable receiver path", () => {
     expect(f.actors.status(actor.id)).toMatchObject({ queued: 0, filterSkipped: { count: 1 } });
     f.send({ ref: "kept" });
     f.send({ ref: "pruned" });
-    await f.actors.setActivationFilter(actor.id, [{ id: "prune", where: [{ path: "data.ref", equals: "pruned" }] }]);
-    expect(f.actors.status(actor.id)).toMatchObject({ queued: 1, filterSkipped: { count: 1 } });
+    const prune = [{ id: "prune", where: [{ path: "data.ref", equals: "pruned" }] }];
+    // smarty-dev#16416: accepted work is never pruned silently; dropQueued moves it to the dead-letter queue.
+    await expect(f.actors.setActivationFilter(actor.id, prune)).rejects.toMatchObject({ code: "FABRIC_ACTOR_QUEUED_WORK", counts: { skipped: 1 } });
+    await expect(f.actors.setActivationFilter(actor.id, prune, undefined, undefined, undefined, { dropQueued: true }))
+      .resolves.toMatchObject({ movedToDeadLetter: 1 });
+    expect(f.actors.status(actor.id)).toMatchObject({ queued: 1, filterSkipped: { count: 0 } }); // a new filter resets telemetry; moved is not skipped
     await vi.advanceTimersByTimeAsync(W);
     await settled(f.actors, actor.id);
     expect(f.runs).toHaveLength(1);
@@ -455,11 +459,19 @@ describe("actor window batching on the durable receiver path", () => {
       if (String(target) !== file) return remove(target, options);
       fs.renameSync(file, `${file}.recorded-${++removals}`);
     });
-    await f.actors.setActivationFilter(actor.id, [{ id: "discard", where: [{ path: "data.ref", equals: "discard-pending" }] }]);
+    const discard = [{ id: "discard", where: [{ path: "data.ref", equals: "discard-pending" }] }];
     try {
+      // smarty-dev#16416: the pending discards move to the dead-letter queue (held while the filter skips them).
+      await expect(f.actors.setActivationFilter(actor.id, discard)).rejects.toMatchObject({ code: "FABRIC_ACTOR_QUEUED_WORK", counts: { skipped: 18 } });
+      await expect(f.actors.setActivationFilter(actor.id, discard, undefined, undefined, undefined, { dropQueued: true }))
+        .resolves.toMatchObject({ movedToDeadLetter: 18 });
       expect(f.actors.status(actor.id).queued).toBe(0);
       expect(f.snapshot(actor.id).items.map(item => item.payload.id)).toEqual(events.map(event => event.id));
-      expect(removals).toBe(1);
+      // Replay recognized the held non-head original: it left the backlog without queuing; only the held discards remain.
+      const remaining = fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as { event: { id: string }; heldBy?: unknown });
+      expect(remaining).toHaveLength(18);
+      expect(remaining.every(entry => entry.heldBy !== undefined && entry.event.id !== events[1]!.id)).toBe(true);
+      expect(removals).toBe(0);
     } finally { release(); }
     await settled(f.actors, actor.id);
     expect(f.runs).toHaveLength(1);

@@ -124,7 +124,34 @@ describe("bounded pre-lock scan coalescing", () => {
     expect(f.scans).not.toHaveBeenCalled();
   });
 
-  it("classifies a burst's lease renewal before waking its events, so routed work refreshes authority", async () => {
+  it("delivers events within the 150 ms watchdog bound while a topology scan is coalesced", async () => {
+    const f = await subscribe();
+    f.fire("presence");
+    await macrotasks();
+    expect(f.scans).toHaveBeenCalledTimes(1);
+    f.fire("presence");
+    await macrotasks();
+    expect(f.scans).toHaveBeenCalledTimes(1);
+
+    const startedAt = Date.now();
+    await f.store.publish({ topic: "ops.owner", kind: "pr.wake",
+      from: { id: "session:source-00000000", name: "source", kind: "main" },
+      to: "session:destination-00000000", data: { path: "coalesced-event" } });
+    await vi.advanceTimersByTimeAsync(150);
+    await macrotasks();
+    expect(Date.now() - startedAt).toBeLessThanOrEqual(150);
+    expect(f.changes).toEqual(["events"]);
+    // The urgent event fence consumes, rather than duplicates, the already-pending scan.
+    expect(f.scans).toHaveBeenCalledTimes(2);
+
+    await vi.advanceTimersByTimeAsync(100);
+    await macrotasks();
+    expect(f.scans).toHaveBeenCalledTimes(2);
+    expect(f.changes).toEqual(["events"]);
+    expect(f.failures).toEqual([]);
+  });
+
+  it("classifies a pending lease before an actual routed event within the watchdog bound", async () => {
     const f = await subscribe();
     const id = "session:lane-00000000";
     const identity: MeshIdentity = { id, name: "main", kind: "main", sessionId: "lane" };
@@ -136,16 +163,23 @@ describe("bounded pre-lock scan coalescing", () => {
     await vi.advanceTimersByTimeAsync(250);
     await macrotasks();
     f.changes.length = 0;
-    // A heartbeat renewal, then actual work: one poll phase delivers the lease directory and events notifications.
+    f.scans.mockClear();
+    // A heartbeat renewal is pending when actual routed work arrives.
     lease(now + 12_000);
     f.fire("presence");
     await Promise.resolve();
-    f.fire("events");
-    expect(f.changes).toEqual([]);
-    await immediate();
-    await vi.advanceTimersByTimeAsync(250);
+    const startedAt = Date.now();
+    await f.store.publish({ topic: "ops.owner", kind: "pr.wake", from: identity, to: id,
+      data: { path: "lease-before-authority" } });
+    await vi.advanceTimersByTimeAsync(150);
+    await macrotasks();
+    expect(Date.now() - startedAt).toBeLessThanOrEqual(150);
+    expect(f.changes).toEqual(["lease", "events"]);
+    expect(f.scans).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(100);
     await macrotasks();
     expect(f.changes).toEqual(["lease", "events"]);
+    expect(f.scans).toHaveBeenCalledTimes(1);
     // Lease-only burst: classified as a lease change (half-lease batching in MeshBridge), no events wake.
     f.changes.length = 0;
     lease(now + 14_000);
@@ -193,8 +227,6 @@ describe("bounded pre-lock scan coalescing", () => {
     expect(f.scans).toHaveBeenCalledTimes(1);
     f.fire("presence");
     f.fire("events");
-    await immediate();
-    expect(f.changes).toEqual([]);
     f.unsubscribe();
     await vi.advanceTimersByTimeAsync(1_000);
     await macrotasks();

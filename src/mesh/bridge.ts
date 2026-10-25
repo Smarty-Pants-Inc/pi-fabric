@@ -1189,7 +1189,8 @@ export class StoreBridgeSide implements BridgeSide {
     };
     const flush = (): void => {
       if (!active || scanning || !scanNext) return;
-      if (monotonicClock.now() < Math.max(nextScanAt, retryAt ?? 0)) { schedule(); return; }
+      if (monotonicClock.now() < Math.max(eventsNext ? 0 : nextScanAt, retryAt ?? 0)) { schedule(); return; }
+      if (scanTimer !== undefined) { clearTimeout(scanTimer); scanTimer = undefined; }
       scanNext = false;
       scanning = true;
       nextScanAt = monotonicClock.now() + 250;
@@ -1216,14 +1217,14 @@ export class StoreBridgeSide implements BridgeSide {
         schedule();
       }
     };
-    // Events-only bursts stay prompt. With topology pending, classify its lease first
-    // at the fixed <=250 ms slot; events never force an extra scan or wait on busy backoff.
+    // Actual work bypasses only the topology coalescing floor: classify its pending
+    // lease/presence first, then wake events even if capture met busy or latched new hints.
     const tick = (): void => {
       if (burst !== undefined) clearImmediate(burst);
       burst = undefined;
       if (!active) return;
-      if (scanNext && scanTimer === undefined) flush();
-      if (eventsNext && active && (!scanNext || retryAt !== undefined)) { eventsNext = false; changed("events"); }
+      if (scanNext && (eventsNext || scanTimer === undefined)) flush();
+      if (eventsNext && active) { eventsNext = false; changed("events"); }
     };
     close = watchBridgeStore(this.store.root, (kind) => {
       if (!active) return;

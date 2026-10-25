@@ -170,9 +170,11 @@ export class NatsPresenceReader {
   readonly machine: string;
   readonly #presence: TransportKv;
   readonly #leases: TransportKv;
-  readonly #records = new Map<string, Seen<FabricParticipantRecord>>();
-  readonly #hosts = new Map<string, Seen<FabricKvHostLease>>();
+  #records = new Map<string, Seen<FabricParticipantRecord>>();
+  #hosts = new Map<string, Seen<FabricKvHostLease>>();
   readonly #revisions: Record<Bucket, Map<string, number>> = { presence: new Map(), leases: new Map() };
+  /** A watch gap (reconnect) re-snapshots into these; the served view switches only at the new `ready`. */
+  readonly #resync: Partial<Record<Bucket, { entries: Map<string, Seen<never>>; revisions: Map<string, number> }>> = {};
   readonly #ready = new Set<Bucket>();
   readonly #listeners = new Set<NatsPresenceListener>();
   readonly #failureListeners = new Set<(error: Error) => void>();
@@ -324,6 +326,7 @@ export class NatsPresenceReader {
 
   #clear(bucket: Bucket): void {
     this.#ready.delete(bucket);
+    delete this.#resync[bucket];
     this.#revisions[bucket].clear();
     if (bucket === "presence") this.#records.clear(); else this.#hosts.clear();
   }
@@ -337,11 +340,20 @@ export class NatsPresenceReader {
         for await (const event of kv.watch<unknown>(">", this.#abort.signal)) {
           if (this.#closed) return;
           if (event.type === "reset") {
-            this.#clear(bucket);
-            this.#notify(bucket);
+            // A reconnect gap: keep serving the last snapshot (each lease still ages out by its own
+            // receipt time) while the new one loads, so a short outage never reads as "everyone left".
+            if (this.#ready.has(bucket)) this.#resync[bucket] = { entries: new Map(), revisions: new Map() };
+            else { this.#clear(bucket); this.#notify(bucket); }
             continue;
           }
           if (event.type === "ready") {
+            const resync = this.#resync[bucket];
+            if (resync) {
+              delete this.#resync[bucket];
+              if (bucket === "presence") this.#records = resync.entries as Map<string, Seen<FabricParticipantRecord>>;
+              else this.#hosts = resync.entries as Map<string, Seen<FabricKvHostLease>>;
+              this.#revisions[bucket] = resync.revisions;
+            }
             this.#ready.add(bucket);
             attempt = 0;
             this.#notify(bucket);
@@ -351,19 +363,23 @@ export class NatsPresenceReader {
           const revision = event.type === "put" ? event.entry.revision : event.revision;
           const machine = machineOfKey(key, kind);
           if (!machine || !Number.isSafeInteger(revision) || revision <= 0) continue;
-          if (revision <= (this.#revisions[bucket].get(key) ?? 0)) continue;
-          this.#revisions[bucket].set(key, revision);
+          const resync = this.#resync[bucket];
+          const revisions = resync?.revisions ?? this.#revisions[bucket];
+          if (revision <= (revisions.get(key) ?? 0)) continue;
+          revisions.set(key, revision);
           const receivedAt = this.#monotonic();
           if (bucket === "presence") {
-            this.#records.delete(key);
+            const target = (resync?.entries ?? this.#records) as Map<string, Seen<FabricParticipantRecord>>;
+            target.delete(key);
             const record = event.type === "put" ? presenceValue(event.entry) : undefined;
-            if (record && event.type === "put") this.#records.set(key, { entry: { ...event.entry, value: cloneFrozen(record) }, receivedAt });
+            if (record && event.type === "put") target.set(key, { entry: { ...event.entry, value: cloneFrozen(record) }, receivedAt });
           } else {
-            this.#hosts.delete(key);
+            const target = (resync?.entries ?? this.#hosts) as Map<string, Seen<FabricKvHostLease>>;
+            target.delete(key);
             const lease = event.type === "put" ? leaseValue(event.entry) : undefined;
-            if (lease && event.type === "put") this.#hosts.set(key, { entry: { ...event.entry, value: cloneFrozen(lease) }, receivedAt });
+            if (lease && event.type === "put") target.set(key, { entry: { ...event.entry, value: cloneFrozen(lease) }, receivedAt });
           }
-          this.#notify(bucket, machine);
+          if (!resync) this.#notify(bucket, machine);
         }
         if (this.#closed) return;
         throw new Error(`NATS bridge ${bucket} watch ended`);

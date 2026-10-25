@@ -199,6 +199,16 @@ describe("NATS bridge port: link identity and presence", () => {
     await expect(p.start()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_NATS_ID_ON_ANOTHER_MACHINE" });
   });
 
+  it("answers 'unknown' (DirectoryNotReadyError), never 'absent', before it has a KV snapshot", async () => {
+    const w = kvWorld();
+    const { port: p } = port(w);
+    expect(() => p.resolve(NATS_ROOT)).toThrow(expect.objectContaining({ code: "FABRIC_DIRECTORY_NOT_READY" }));
+    expect(() => p.presenceView().records(NATS_ROOT)).toThrow(expect.objectContaining({ code: "FABRIC_DIRECTORY_NOT_READY" }));
+    expect(() => p.presenceView().list?.()).toThrow(expect.objectContaining({ code: "FABRIC_DIRECTORY_NOT_READY" }));
+    await p.start();
+    expect(p.resolve(NATS_ROOT)).toBeUndefined();
+  });
+
   it("resolves the one KV record for an id with the identity from that record", async () => {
     const w = kvWorld();
     seedNative(w, V2, natsRoot(), 1_000_000);

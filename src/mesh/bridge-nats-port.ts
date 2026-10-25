@@ -31,7 +31,7 @@ import type { MeshStore } from "./store.js";
 import type { FabricParticipantRecord } from "../topology/types.js";
 import type { ConsumerMessages } from "@nats-io/jetstream";
 import type { NatsConnectionHandle } from "../transport/nats/connection.js";
-import { TransportUncertainError, type FabricTransport, type TransportEnvelope, type TransportSent } from "../transport/types.js";
+import { DirectoryNotReadyError, TransportUncertainError, type FabricTransport, type TransportEnvelope, type TransportSent } from "../transport/types.js";
 import { hashToken } from "../transport/nats/subjects.js";
 
 const MACHINE_TOKEN = /^[a-z0-9][a-z0-9-]{0,31}$/;
@@ -315,6 +315,10 @@ export class NatsBridgePort implements BridgeNatsPort {
     return pass;
   }
 
+  #assertViewReady(): void {
+    if (!this.kv.reader.ready) throw new DirectoryNotReadyError("NATS bridge KV presence is not ready; the answer is unknown, retry");
+  }
+
   /** Live, unique, admitted canonical NATS roots on other machines (never this machine's own rows). */
   presence(): Promise<BridgePresence> { return this.kv.presence(); }
 
@@ -323,7 +327,12 @@ export class NatsBridgePort implements BridgeNatsPort {
     return this.kv.subscribeChanges(() => { changed(); }, failed);
   }
 
+  /**
+   * ParticipantView semantics: undefined is a FACT (absent, or on two machines). Without a KV
+   * snapshot the answer is unknown, and that throws DirectoryNotReadyError: hold, never refuse.
+   */
   resolve(id: string): BridgeNatsPortResolved | undefined {
+    this.#assertViewReady();
     const route = this.kv.resolve(id);
     const kind = route && meshKind(route.kind);
     if (!route || !kind) return undefined;
@@ -338,6 +347,7 @@ export class NatsBridgePort implements BridgeNatsPort {
   /** Every KV record (every machine, live or not) as the identity gate reads it; `list()` serves the dry run. */
   presenceView(): BridgeNatsPresenceView {
     const map = (id?: string): readonly BridgeNatsPresenceRecord[] => {
+      this.#assertViewReady();
       const observedAt = this.#now();
       return this.kv.reader.records(id).flatMap(route => {
         const kind = meshKind(route.kind);

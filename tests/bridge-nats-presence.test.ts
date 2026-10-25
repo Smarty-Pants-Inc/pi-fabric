@@ -154,6 +154,38 @@ describe("NATS presence -> file mirror snapshot", () => {
     await waitFor(() => expect(side.resolve(NATS_ROOT)?.live).toBe(false));
   });
 
+  it("keeps serving the last snapshot through a reconnect gap, bounded by lease age, and switches at the new ready", async () => {
+    const w = world();
+    seedNative(w, V2, natsRoot(), 1_000_000);
+    const gone = "session:33333333-3333-4333-8333-333333333333";
+    seedNative(w, V2, natsRoot(gone, "inc-3"), 1_000_000);
+    const { side, clock } = bridge(w);
+    await side.whenReady();
+    const changes: string[] = [];
+    side.subscribeChanges(kind => { changes.push(kind); });
+    w.presence.gap();
+    w.leases.gap();
+    // While disconnected the other side deletes one root; nothing of that reaches us yet.
+    w.presence.values.delete(pKey(V2, gone));
+    w.leases.values.delete(hKey(V2, gone));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(side.reader.ready).toBe(true);
+    expect(side.resolve(NATS_ROOT)?.live).toBe(true);
+    expect(side.resolve(gone)?.live).toBe(true);
+    expect((await side.presence()).hosts.map(host => host.record.id).sort()).toEqual([NATS_ROOT, gone].sort());
+    // Liveness still ages by receipt: a long gap ends it without any new event.
+    advance(clock, 13_000);
+    expect(side.resolve(NATS_ROOT)?.live).toBe(false);
+    // The new snapshot replaces the view in one step: the deleted root is gone, the renewed one is live.
+    w.leases.put(hKey(V2, NATS_ROOT), `${NATS_ROOT}#nats-inc-1`, natsLease(NATS_ROOT, "nats-inc-1", clock.wall),
+      w.leases.values.get(hKey(V2, NATS_ROOT))!.revision);
+    w.presence.resnapshot();
+    w.leases.resnapshot();
+    await waitFor(() => expect(side.resolve(gone)).toBeUndefined());
+    expect(side.resolve(NATS_ROOT)?.live).toBe(true);
+    expect(changes).toContain("presence");
+  });
+
   it("drops an expired lease at once and ignores a JSON-claimed machine or mirror provenance", async () => {
     const w = world();
     seedNative(w, V2, natsRoot(), 1_000_000);

@@ -53,6 +53,13 @@ export class MemoryBucket {
     if (!this.values.delete(key)) return;
     this.emit({ type: "gone", key, machine: key.split(".")[0]!, revision: ++this.revision, reason: "expired" });
   }
+  /** A reconnect gap: every watch emits `reset` (NatsKvStore's ordered-consumer restart). */
+  gap(): void { this.emit({ type: "reset" }); }
+  /** The new ordered consumer's snapshot, then `ready`. */
+  resnapshot(): void {
+    for (const entry of this.values.values()) this.emit({ type: "put", entry });
+    this.emit({ type: "ready" });
+  }
 }
 
 export class MemoryKv implements TransportKv {

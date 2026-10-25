@@ -153,7 +153,14 @@ export const runNatsBridgeEvents = async (options: NatsBridgeEventsOptions, sign
       settleTerm("already bridged");
       continue;
     }
-    const sender = options.resolve(event.from.id);
+    let sender: BridgeNatsPortResolved | undefined;
+    try { sender = options.resolve(event.from.id); }
+    catch (error) {
+      // An unknown view (no KV snapshot yet) is not a refusal: see the event again later.
+      if ((error as { code?: unknown } | null)?.code !== "FABRIC_DIRECTORY_NOT_READY") throw error;
+      message.nak(delay(message.info.deliveryCount));
+      continue;
+    }
     if (sender && sender.route.machine === options.machine) {
       // A file identity this link mirrors (or the link itself) can only be spoken for by this link.
       refuse("BRIDGE_NATS_SENDER_IS_BRIDGE", { subject: message.subject, messageId, fromId: event.from.id });

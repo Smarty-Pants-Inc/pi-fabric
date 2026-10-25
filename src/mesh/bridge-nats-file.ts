@@ -14,6 +14,7 @@ import {
   type NatsCarrierEnvelope, type NatsCarrierFileAnswer, type NatsCarrierLedger, type NatsCarrierPresence, type NatsCarrierSettle,
   type NatsInbound, type NatsOutbound, type NatsPresenceEntry,
 } from "./bridge-nats-carrier.js";
+import { bridgeNatsFilePresenceRecord } from "./bridge-nats-identity.js";
 import { NatsTopicTranslator, type NatsTopicAuthorize } from "./bridge-nats-topics.js";
 import {
   BRIDGE_NATS_ACK_TOPIC, BRIDGE_NATS_CONTROL_TOPIC, bridgeNatsLinkIdentity, type BridgeNatsPort, type BridgeNatsPortDelivery,
@@ -146,15 +147,13 @@ export class FileCarrierPresence {
       if (participant && kind) {
         const mirroredBy = participant.bridgeVia ?? participant.remoteHost;
         const list = records.get(participant.id) ?? [];
-        // The state row and the participant file of one native are one record, not an ambiguity.
-        if (!list.some(record => record.mirroredBy === mirroredBy && record.ownerHostId === participant.ownerHostId &&
+        // The state row and the participant file of one native are one record, not an ambiguity. A row
+        // held by another link, or carrying another stored origin, stays a separate record.
+        if (!list.some(record => record.mirroredBy === mirroredBy && record.remoteHost === participant.remoteHost &&
+            record.bridgeVia === participant.bridgeVia && record.ownerHostId === participant.ownerHostId &&
             record.ownerIdentityId === participant.ownerIdentityId && record.rootId === participant.rootId)) {
-          list.push(Object.freeze({
-            id: participant.id, name: participant.name, kind, rootId: participant.rootId,
-            ...(participant.sessionId !== undefined ? { sessionId: participant.sessionId } : {}),
-            ownerHostId: participant.ownerHostId, ownerIdentityId: participant.ownerIdentityId,
-            ...(participant.ownerIncarnation !== undefined ? { ownerIncarnation: participant.ownerIncarnation } : {}),
-            ...(mirroredBy !== undefined ? { mirroredBy } : {}),
+          // L3's one builder: the gate judges the stored remoteHost and bridgeVia, not only the holder.
+          list.push(bridgeNatsFilePresenceRecord(participant, {
             live: participant.retiredAt === undefined && (mirroredBy === undefined
               ? hosts.get(participant.ownerHostId)?.id === participant.ownerIdentityId
               : (mirrorHosts.get(participant.ownerHostId) ?? 0) > now),

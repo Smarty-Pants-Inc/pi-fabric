@@ -6,7 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { NatsCarrierRecord } from "../src/mesh/bridge-nats-carrier.js";
-import { createNatsFileLink, NatsCarrierDeferredError, type NatsCarrierSide } from "../src/mesh/bridge-nats-file.js";
+import { StoreBridgeSide } from "../src/mesh/bridge.js";
+import { createNatsFileLink, FileCarrierPresence, NatsCarrierDeferredError, type NatsCarrierSide } from "../src/mesh/bridge-nats-file.js";
 import { createBridgeNatsIdentityGate, parseBridgeNatsAllowSection, type BridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
 import { BRIDGE_NATS_LEDGER_LOCK, openBridgeNatsLedger, type FileBridgeNatsLedger } from "../src/mesh/bridge-nats-ledger.js";
 import type { NatsLinkConfig } from "../src/mesh/bridge-nats-config.js";
@@ -273,5 +274,39 @@ describe("startNatsLink composition with L3's allow gate", () => {
     await expect(startNatsLink({ ...config, allow: { nats: [{ kind: "root", id: "session:not-a-uuid" }] } },
       { signal: new AbortController().signal, log: () => undefined, factories: { openPort: async () => { throw new Error("opened"); },
         seatPins: () => pins } })).rejects.toThrow(/allow/);
+  });
+});
+
+describe("file presence for the gate (PR 2 P0)", () => {
+  const SPOKE = "spoke-a";
+  const direct: MeshIdentity = { id: "session:66666666-6666-4666-8666-666666666666", name: "spoke-lane", kind: "main" };
+  const reexport: MeshIdentity = { id: "session:77777777-7777-4777-8777-777777777777", name: "far-lane", kind: "main" };
+
+  it("keeps a spoke root's stored remoteHost and bridgeVia, so only the spoke link's DIRECT mirror verifies", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-link-p0-"));
+    roots.push(root);
+    const store = new MeshStore(path.join(root, "hub"), 256 * 1024, 1_000);
+    stores.push(store);
+    // The spoke link's direct mirror, and a re-export from another link that the spoke link carries here.
+    for (const [identity, stored] of [[direct, { remoteHost: SPOKE }], [reexport, { remoteHost: "far", bridgeVia: SPOKE }]] as const) {
+      await store.put({ key: key("topology/hosts/", identity.id), value: { ...host(identity), ...stored }, identity });
+      await store.put({ key: key("topology/participants/", identity.id), value: { ...participant(identity, "inc-spoke"), ...stored },
+        identity });
+    }
+    const presence = new FileCarrierPresence(new StoreBridgeSide(store, LINK));
+    await presence.refresh(true);
+    const view = presence.view();
+    expect(view.records(direct.id)).toEqual([expect.objectContaining({ mirroredBy: SPOKE, remoteHost: SPOKE, live: true })]);
+    expect(view.records(direct.id)[0]).not.toHaveProperty("bridgeVia");
+    // Held by the spoke link too, but its stored origin is another link: never a direct spoke mirror.
+    expect(view.records(reexport.id)).toEqual([expect.objectContaining({ mirroredBy: SPOKE, remoteHost: "far", bridgeVia: SPOKE })]);
+    const allow = parseBridgeNatsAllowSection({
+      file: [direct, reexport].map(identity => ({ kind: "root", id: identity.id, viaSpoke: SPOKE, send: ["followUp"], receive: ["followUp"] })),
+      nats: ALLOW.nats,
+    }, { link: LINK, natsMachine: BRIDGE_MACHINE, spokes: [SPOKE] });
+    const gate = createBridgeNatsIdentityGate(allow, { pins });
+    const nats = { side: "nats" as const, records: () => [], list: () => [] };
+    expect(gate.verifySender("file", direct.id, view, nats)).toMatchObject({ ok: true, identity: { viaSpoke: SPOKE } });
+    expect(gate.verifySender("file", reexport.id, view, nats)).toMatchObject({ ok: false });
   });
 });

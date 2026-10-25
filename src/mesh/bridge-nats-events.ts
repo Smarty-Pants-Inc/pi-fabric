@@ -14,7 +14,10 @@
 // still claim another live root's id. Nothing that already crossed a bridge (`data.bridge`)
 // crosses again, and nothing that claims a file identity this link mirrors comes back.
 import { Buffer } from "node:buffer";
-import type { ConsumerMessages } from "@nats-io/jetstream";
+// Static on purpose (scripts/build.mjs refuses unstable package-local dynamic chunks); nothing in the
+// startup graph imports this module.
+import { AckPolicy, DeliverPolicy, ReplayPolicy, type ConsumerMessages } from "@nats-io/jetstream";
+import { natsEventsStreamName } from "../transport/nats/provision.js";
 import type { MeshEvent, MeshIdentity } from "./event-log.js";
 import type { BridgeNatsPortResolved } from "./bridge-nats-types.js";
 import { hashToken } from "../transport/nats/subjects.js";
@@ -207,8 +210,6 @@ export const natsBridgeEventSource = (connection: NatsConnectionHandle, options:
   return {
     isVerified: () => connection.isVerified(),
     async *consume(signal) {
-      const [{ AckPolicy, DeliverPolicy, ReplayPolicy }, { natsEventsStreamName }] = await Promise.all([
-        import("@nats-io/jetstream"), import("../transport/nats/provision.js")]);
       const stream = natsEventsStreamName(options.org);
       const durable = `bev_${hashToken(`bridge:${options.link}`)}`;
       const api = connection.manager.consumers;

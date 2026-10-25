@@ -8,6 +8,8 @@
 // authority by that read (or its owner host's sample) and writes through the shared KV mirror.
 import type { MeshStore } from "./store.js";
 import type { FabricParticipantInfo, FabricParticipantListOptions, FabricParticipantRecord } from "../topology/types.js";
+// Static: loaded only behind the lazy bridge-nats-link entry (the build forbids unstable dynamic chunks).
+import { ParticipantDirectory } from "../topology/participant-directory.js";
 
 // Same set as participant-view KV_TERMINAL.
 const TERMINAL = new Set(["completed", "failed", "cancelled", "stopped", "timed_out", "done", "aborted"]);
@@ -47,7 +49,6 @@ export const readFileActorsForMirror = (directory: NatsFileActorDirectory, now: 
  * an identity no participant has, no heartbeat, no host reaping. It never publishes this link.
  */
 export const createFileActorDirectory = async (store: MeshStore, link: string): Promise<NatsFileActorDirectory> => {
-  const { ParticipantDirectory } = await import("../topology/participant-directory.js");
   const id = `nats-bridge-actors:${link}:${process.pid}`;
   return new ParticipantDirectory(store, {
     enabled: true, hostId: id, rootId: id, identity: { id, name: "nats-bridge-actors", kind: "main" }, reapDeadHosts: false,

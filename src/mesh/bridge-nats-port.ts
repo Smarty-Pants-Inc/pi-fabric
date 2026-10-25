@@ -13,6 +13,13 @@
 // anything else as unverified); the link never publishes into its own machine's inbox.
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
+import { Readable } from "node:stream";
+// Static on purpose: this module loads only behind the lazy bridge-nats-link entry, and the build
+// requires every package-local dynamic import to be a stable entry (scripts/build.mjs).
+import { ensureTransportConsumer } from "../transport/nats/provision.js";
+import { classifyNatsInboxTerminalError, openNatsTransport } from "../transport/nats/inbox.js";
+import { openNatsConnection } from "../transport/nats/connection.js";
+import { createFileActorDirectory, readFileActorsForMirror } from "./bridge-nats-actors.js";
 import type { MeshIdentity } from "./event-log.js";
 import type { BridgePresence } from "./bridge.js";
 import {
@@ -119,9 +126,6 @@ export const natsBridgeInboxSource = (connection: NatsConnectionHandle, options:
   return {
     isVerified: () => connection.isVerified(),
     async *consume(signal) {
-      const [{ ensureTransportConsumer }, { classifyNatsInboxTerminalError }] = await Promise.all([
-        import("../transport/nats/provision.js"), import("../transport/nats/inbox.js")]);
-      const { Readable } = await import("node:stream");
       for (let attempt = 0; !signal.aborted; attempt++) {
         if (attempt > 0) {
           const delay = Math.min(5_000, 250 * 2 ** Math.min(attempt - 1, 5));
@@ -548,8 +552,6 @@ export interface OpenNatsBridgeSideOptions {
  * carry more than this port asks for, never less.
  */
 export const openNatsBridgeSide = async (config: NatsBridgeSideConfig, options: OpenNatsBridgeSideOptions = {}): Promise<NatsBridgePort> => {
-  const [{ openNatsTransport }, { openNatsConnection }] = await Promise.all([
-    import("../transport/nats/inbox.js"), import("../transport/nats/connection.js")]);
   const identity = bridgeNatsLinkIdentity(config.link);
   const common = {
     servers: [...config.nats.servers], machine: config.nats.machine, credentials: config.nats.credentials,
@@ -565,7 +567,6 @@ export const openNatsBridgeSide = async (config: NatsBridgeSideConfig, options: 
   try {
     let fileActors: (() => NatsFileActorRead) | undefined;
     if (options.fileStore) {
-      const { createFileActorDirectory, readFileActorsForMirror } = await import("./bridge-nats-actors.js");
       const directory = await createFileActorDirectory(options.fileStore, config.link);
       fileActors = () => readFileActorsForMirror(directory);
     }

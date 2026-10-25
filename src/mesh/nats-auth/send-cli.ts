@@ -207,7 +207,7 @@ function readTextStream(fd: number): string {
   return decodeTextInput(Buffer.concat(chunks, total), "stdin");
 }
 
-function policyConfig(): { custodyStream: string; livenessStream: string; pathBMachines: string[]; operatorMachine: string;
+export function policyConfig(): { custodyStream: string; livenessStream: string; pathBMachines: string[]; operatorMachine: string;
   ephemeralHost: boolean; ephemeralInactiveSeconds: number; inboxMaxAgeMs: number } {
   const raw = process.env.PI_FABRIC_MESH_NATS;
   let source: Record<string, unknown> | undefined;

@@ -41,6 +41,7 @@ import {
   loadBridgeNatsSeatPins,
 } from "./mesh/bridge-nats-identity.js";
 import type { BridgeNatsAllowEntry, BridgeNatsPresenceRecord, BridgeNatsPresenceView, BridgeNatsSide } from "./mesh/bridge-nats-types.js";
+import { type NatsLinkCounterName, readNatsLinkCounters } from "./mesh/bridge-nats-counters.js";
 import type { MeshEvent } from "./mesh/event-log.js";
 import { MeshStore } from "./mesh/store.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
@@ -322,14 +323,42 @@ export const natsLinkStatus = async (config: NatsLinkConfig, now = Date.now()): 
   for (const row of mirrored) {
     if (!sideEntries(config, "nats").some((entry) => allowMatches(entry, row))) problems.push(`mirror not on allow.nats: ${row.id}`);
   }
-  // Each listed identity as the file mesh shows it: a file identity native there, a NATS one as this link's mirror.
+  // Each listed identity as the file mesh shows it: a hub identity native there (a spoke root as its spoke
+  // link's mirror), a NATS one as this link's mirror.
   const listed = (entries: readonly BridgeNatsAllowEntry[]) => entries.map((entry) => {
+    const { viaSpoke, republishTopics } = pr2Fields(entry);
     const row = rows.find((candidate) => allowMatches(entry, candidate) &&
-      (entry.side === "file" ? candidate.remoteHost === undefined : candidate.remoteHost === config.link));
+      (entry.side === "file" ? candidate.remoteHost === viaSpoke : candidate.remoteHost === config.link));
     return { identity: bridgeNatsAllowKey(entry), ...(row ? { id: row.id } : {}), present: row !== undefined,
-      live: row !== undefined && row.stale !== true, send: entry.send, receive: entry.receive };
+      live: row !== undefined && row.stale !== true, send: entry.send, receive: entry.receive,
+      ...(viaSpoke === undefined ? {} : { viaSpoke }), ...(republishTopics === undefined ? {} : { republishTopics }) };
   });
   const allow = { file: listed(sideEntries(config, "file")), nats: listed(sideEntries(config, "nats")) };
+
+  // The running link's crossing counters (PR 2): what each leg carried and refused, cumulative across restarts.
+  const snapshot = readNatsLinkCounters(config.stateDir);
+  if (snapshot && snapshot.link !== config.link) problems.push("counters name another link");
+  const count = (name: NatsLinkCounterName): number => snapshot?.counters[name] ?? 0;
+  const counters = snapshot
+    ? { present: true, since: snapshot.since, startedAt: snapshot.startedAt, updatedAt: snapshot.updatedAt, pid: snapshot.pid,
+      ageMs: Math.max(0, Math.round(now - Date.parse(snapshot.updatedAt))), values: snapshot.counters, last: snapshot.last }
+    : { present: false };
+  const republishing = sideEntries(config, "nats").filter((entry) => pr2Fields(entry).republishTopics?.length);
+  if (republishing.length && !config.nats.events) {
+    problems.push("allow.nats lists republishTopics but nats.events is false: nothing is republished");
+  }
+  const republish = {
+    enabled: config.nats.events,
+    senders: republishing.map((entry) => ({ identity: bridgeNatsAllowKey(entry), topics: pr2Fields(entry).republishTopics })),
+    accepted: count("republish.accepted"), duplicate: count("republish.duplicate"), refused: count("republish.refused"),
+  };
+  const relay = {
+    spokeRoots: sideEntries(config, "file").flatMap((entry) => {
+      const { viaSpoke } = pr2Fields(entry);
+      return viaSpoke === undefined ? [] : [{ identity: bridgeNatsAllowKey(entry), viaSpoke }];
+    }),
+    toNats: count("relay.toNats"), toFile: count("relay.toFile"), refused: count("relay.refused"),
+  };
   return {
     ok: problems.length === 0,
     at: new Date(now).toISOString(),
@@ -338,7 +367,23 @@ export const natsLinkStatus = async (config: NatsLinkConfig, now = Date.now()): 
     stall: { path: paths.stallReason, reason: stallText || null },
     mirrors: mirrored.map(participantSummary),
     allow,
+    counters,
+    republish,
+    relay,
     problems,
+  };
+};
+
+/**
+ * The PR 2 allow fields (L3's parser owns them): `republishTopics` on a NATS entry (N4: its fleet.work events
+ * republished into the file mesh) and `viaSpoke` on a file root that lives on a spoke bridged to this hub.
+ */
+const pr2Fields = (entry: BridgeNatsAllowEntry): { viaSpoke?: string; republishTopics?: readonly string[] } => {
+  const value = entry as unknown as { viaSpoke?: unknown; republishTopics?: unknown };
+  return {
+    ...(typeof value.viaSpoke === "string" ? { viaSpoke: value.viaSpoke } : {}),
+    ...(Array.isArray(value.republishTopics) && value.republishTopics.every((topic) => typeof topic === "string")
+      ? { republishTopics: value.republishTopics as string[] } : {}),
   };
 };
 

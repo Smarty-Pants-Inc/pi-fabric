@@ -46,9 +46,41 @@ command the link claimed. Addressed `fleet.work.*` and allow-listed `ops.owner` 
 NATS root become one keyed `followUp` to it, from `bridge:<link>`, when the entry lists the topic in
 `receiveTopics`.
 
-Not in PR 1: commands between a work-host spoke and a NATS root through the hub relay, and NATS-side
-`fleet.work.<repo>.<n>` events to the hub factory (`nats.events`). Both are PR 2. `github.*` never
-crosses.
+`github.*` never crosses.
+
+## What crosses (PR 2)
+
+### NATS events republished into the hub (N4)
+
+A Main on NATS publishes its topic events to the org's event stream (`FABRIC_EV_<ORG>`), not to any file
+mesh. With `nats.events: true`, the link reads that stream and republishes a `fleet.work.*` event into the
+hub's mesh on the same topic, so the hub factory and every file-mesh reader see it as they see a hub event.
+
+- Only events from an `allow.nats` entry that lists the topic in `republishTopics` (default none) cross.
+- The sender is the KV presence record its `from.id` resolves to: exactly one live root on an org machine
+  other than the link's own. An event subject names no source machine, so this is the only binding.
+- The republished event is authored as `bridge:<link>`. It keeps the verified sender and the source in
+  its `data.bridge` stamp.
+- Exactly once by the stream sequence and the ledger: a redelivery after a crash is recognized and
+  appended once. The stream message is acknowledged only after the durable file append.
+- No loops: an event that already crossed a bridge (`data.bridge`), or that claims an identity the link
+  mirrors from the hub, is never republished.
+- It needs the events grant on the link's NATS user (FABRIC_EV consume), a grant beyond the standard
+  agent template. `start` refuses a config with `nats.events: true` when the credential does not carry
+  it, and the config refuses `republishTopics` without `nats.events: true`.
+
+### Spoke relays
+
+A root on a work host's file mesh (a spoke bridged to this hub by `mesh-bridge`) reaches a NATS root, and
+gets its answers, through the hub's existing relay between bridge processes: the NATS link is one more
+relay side.
+
+- The spoke root is listed in `allow.file` with `viaSpoke: "<spoke link>"`, the name of the hub's bridge
+  to that spoke. On the hub its record is that bridge's mirror (`remoteHost` = the spoke link), and its
+  identity comes only from that mirror's verified presence, never from the relayed message.
+- The same destination classes and operations apply as for a hub root.
+
+The counters of both legs are in `nats-link status`.
 
 ## Identity rules
 
@@ -122,7 +154,7 @@ at every level, so a misspelt field never falls back to a default.
 | `nats.machine` | The link's own Path B machine. Must be in `pathBMachines`, never an operator machine. |
 | `nats.credentials`, `nats.caFile` | Absolute paths. The credential must be a regular file owned by the user running the link, mode 0600 or 0400. |
 | `nats.org`, `custodyStream`, `livenessStream`, `pathBMachines`, `operatorMachine` | The org's Path B policy, as `mesh.nats` in `fabric.json`. They must match the scope the credential was minted with. |
-| `nats.events` | Default false. PR 2 (v2 → hub factory topics); needs the events grant and `org`. |
+| `nats.events` | Default false. True reads the org's event stream for N4 republishing; needs `org` and the events grant on the link's NATS user. |
 | `nats.inboxLanes` | Default 8. |
 | `allow.file`, `allow.nats` | Who may cross; see below. |
 | `callTimeoutMs` | Deadline of each NATS-side call (default 30,000; 1,000 to 300,000). |
@@ -146,6 +178,10 @@ appears once, on one side.
 - `receive`: operations it may receive from across, within its destination class (default
   `["followUp"]` where the class takes it; a NATS actor receives nothing).
 - `receiveTopics`: roots only; exact topics or `prefix.*`.
+- `republishTopics`: `allow.nats` roots only (PR 2, N4); the `fleet.work.*` topics of this identity's
+  NATS-published events that the link republishes into the hub's mesh. Default none; needs
+  `nats.events: true`.
+- `viaSpoke`: `allow.file` roots only (PR 2); the hub's `mesh-bridge` link to the spoke this root lives on.
 - `principals`: Fabric principal ids whose authority this sender may carry across; any other is stripped.
 - `machine`: required on every `allow.nats` entry, and only there; pins the identity to one org machine in
   `pathBMachines` (never the link's own). Without a pin, another machine could register that id while the
@@ -207,10 +243,23 @@ their 15 s leases lapse, and its file mirrors expire by their lease TTL.
     nats-link status --config FILE
 
 Reads the link's state and the hub's mesh: the cursor (`toRemote`, `toLocal`, age), the stall reason,
-every record this link mirrors into the mesh, and each allow entry as the mesh shows it (a file entry
-native, a NATS entry as this link's mirror; `present`, `live`). `problems` lists what is wrong; exit 0
-when it is empty. A mirror under this link that the allow-list does not name is a problem: the link must
-never carry it.
+every record this link mirrors into the mesh, and each allow entry as the mesh shows it (a hub entry
+native, a spoke root as its spoke link's mirror, a NATS entry as this link's mirror; `present`, `live`).
+`problems` lists what is wrong; exit 0 when it is empty. A mirror under this link that the allow-list does
+not name is a problem: the link must never carry it.
+
+It also shows the running link's crossing counters, from `<stateDir>/counters.json`, which the link
+writes at most once a second and on stop (cumulative across restarts; `since` is when counting began):
+
+- `counters.values`: `control.toNats`, `control.toFile`, `control.refused`, `topic.toNats`,
+  `topic.refused`, `republish.accepted`, `republish.duplicate`, `republish.refused`, `relay.toNats`,
+  `relay.toFile` and `relay.refused`, with `counters.last` naming when each last moved;
+- `republish`: whether `nats.events` is on, which senders list `republishTopics`, and the accepted,
+  duplicate and refused counts;
+- `relay`: the spoke roots (`viaSpoke`) and the toNats, toFile and refused counts.
+
+Counters are an operator signal only: exactly-once and authority live in the ledger and the gates. A
+snapshot written by another link is a problem.
 
 ### receipt
 

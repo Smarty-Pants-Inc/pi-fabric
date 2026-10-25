@@ -247,6 +247,11 @@ export const parseNatsLinkConfig = (value: unknown): NatsLinkConfig => {
       throw new NatsLinkConfigError(`allow.${entry.side}[${index}].machine`, "must be one of nats.pathBMachines");
     }
   });
+  // N4 (PR 2): a NATS entry's republishTopics are read from the org's event stream, which needs nats.events.
+  if (!events && parsed.entries.some((entry) => entry.side === "nats" &&
+    ((entry as unknown as { republishTopics?: unknown[] }).republishTopics?.length ?? 0) > 0)) {
+    throw new NatsLinkConfigError("nats.events", "must be true when an allow.nats entry lists republishTopics");
+  }
   const orgJson = root.orgJson === undefined ? undefined : absolutePath(root.orgJson, "orgJson");
   // The section as written, frozen: L3's parser accepted it, and every reader parses it again the same way.
   const allow = deepFreeze(JSON.parse(JSON.stringify(root.allow ?? {})) as BridgeNatsAllowSection);

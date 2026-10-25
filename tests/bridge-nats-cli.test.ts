@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runFabricCli } from "../src/cli/index.js";
 import { main, type NatsLinkCliIo, type NatsLinkHandle, type NatsLinkStarter } from "../src/mesh-bridge-nats-cli.js";
+import { openNatsLinkCounters } from "../src/mesh/bridge-nats-counters.js";
 import { NatsRootsUnavailableError, type NatsRootInfo, type NatsRootsSource } from "../src/mesh/bridge-nats-roots.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -148,6 +149,32 @@ describe("nats-link CLI", () => {
     ]);
     cursor(stateDir, "ryzen1", "other");
     expect((await run(["status", "--config", config])).json().problems).toContain("cursor names another link (local/remote differ from name/link)");
+  });
+
+  it("status shows the running link's republish and relay counters", async () => {
+    const { config, stateDir } = await setup();
+    cursor(stateDir);
+    const before = (await run(["status", "--config", config])).json();
+    expect(before).toMatchObject({ counters: { present: false },
+      republish: { enabled: false, senders: [], accepted: 0, duplicate: 0, refused: 0 },
+      relay: { spokeRoots: [], toNats: 0, toFile: 0, refused: 0 } });
+    const counters = openNatsLinkCounters(stateDir, "v2");
+    counters.add("republish.accepted", 2);
+    counters.add("republish.refused");
+    counters.add("relay.toNats", 3);
+    counters.add("control.toFile");
+    counters.close();
+    const after = await run(["status", "--config", config]);
+    expect(after.code).toBe(0);
+    expect(after.json()).toMatchObject({
+      counters: { present: true, pid: process.pid, values: { "republish.accepted": 2, "relay.toNats": 3, "control.toFile": 1 } },
+      republish: { accepted: 2, duplicate: 0, refused: 1 },
+      relay: { toNats: 3, toFile: 0, refused: 0 },
+      problems: [],
+    });
+    // A snapshot left by another link in this state directory is a problem, never this link's numbers.
+    openNatsLinkCounters(stateDir, "v9").close();
+    expect((await run(["status", "--config", config])).json().problems).toContain("counters name another link");
   });
 
   it("receipt --command proves one command and its ACK, and never exits 0 on missing or doubled evidence", async () => {

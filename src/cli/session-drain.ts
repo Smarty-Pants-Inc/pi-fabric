@@ -1,7 +1,10 @@
 import fs from "node:fs";
+import type net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { callMainDrain, mainDrainSocket, MainDrainClientError } from "../main-drain/client.js";
-import type { MainDrainBindingRequest } from "../main-drain/binding.js";
+import { procStartTime, type MainDrainBindingRequest } from "../main-drain/binding.js";
+import { socketPeer } from "../seat-drain/run.js";
 import type { MainDrainReply } from "../main-drain/protocol.js";
 import { evaluateDrain, scanCompletions } from "../seat-drain/evaluate.js";
 import { inventorySessionPending } from "./session-pending.js";
@@ -31,7 +34,28 @@ interface CliIo {
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   uid?: number;
+  /** Tests only: the /proc root for the server's start time. */
+  procRoot?: string;
 }
+
+/**
+ * The server must be the Main that owns this session's inbox, exactly as the host seam checks it (DRAIN-DESIGN.r1
+ * §1.7): its SO_PEERCRED uid is ours, and its pid and /proc start time are those in main-followups/<sid>.owner.json.
+ * A stale socket of another Main, or of another session, is refused before any request is written.
+ */
+const verifyServer = (mesh: string, sessionId: string, uid: number, procRoot?: string) =>
+  async (client: net.Socket): Promise<string | undefined> => {
+    let owner: Record<string, unknown>;
+    try {
+      owner = JSON.parse(fs.readFileSync(path.join(mesh, "main-followups", `${encodeURIComponent(sessionId)}.owner.json`), "utf8")) as Record<string, unknown>;
+    } catch { return "MAIN_DRAIN_OWNER_UNREADABLE"; }
+    const peer = await socketPeer(client);
+    if (!peer || peer.uid !== uid) return "MAIN_DRAIN_SERVER_UNVERIFIED";
+    if (owner.pid !== peer.pid || owner.rootId !== `session:${sessionId}` || owner.retired === true ||
+      (typeof owner.host === "string" && owner.host !== os.hostname()) || typeof owner.processStartedAt !== "string" ||
+      procStartTime(peer.pid, procRoot) !== owner.processStartedAt) return "MAIN_DRAIN_SERVER_NOT_OWNER";
+    return undefined;
+  };
 
 const VALUE_FLAGS = new Set(["--mesh", "--pod-uid", "--run", "--run-sha256", "--operation-id", "--generation", "--deadline-s"]);
 const MODE_FLAGS = new Set(["--status", "--probe", "--exit", "--help"]);
@@ -91,11 +115,17 @@ export const runSessionDrainCli = async (
     const now = io.now ?? Date.now;
     const sleep = io.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
     const deadline = now() + deadlineS * 1000;
+    const verify = verifyServer(mesh, sessionId, uid, io.procRoot);
+    const callBound = async (op: "drain" | "stop-actors" | "undo" | "exit"): Promise<MainDrainReply> => {
+      const value = await callMainDrain(socket, sessionId, op, binding, 30_000, verify);
+      if (value.rootId !== `session:${sessionId}`) throw new MainDrainClientError("MAIN_DRAIN_SERVER_NOT_OWNER");
+      return value;
+    };
     // M9: the SAME zero and children checks as the host seam, measured inside the Pod.
     const check = (reply: MainDrainReply) => evaluateDrain({ sessionId, meshRoot: mesh, reply,
       inventory: (() => { try { return inventorySessionPending(mesh, sessionId); } catch { return undefined; } })(),
       completions: scanCompletions(mesh, `session:${sessionId}`) });
-    let reply = await callMainDrain(socket, sessionId, "drain", binding);
+    let reply = await callBound("drain");
     let evaluation = check(reply);
     let previous = false;
     while (!(evaluation.drained && previous) && !evaluation.haltedWithHeld && now() + POLL_MS < deadline) {
@@ -103,20 +133,20 @@ export const runSessionDrainCli = async (
       await sleep(POLL_MS);
       // r2 N2: the raw Pod's session actors are stopped only as the last act, exactly as on the host.
       if (reply.native.inputsFenced && evaluation.reasons.length > 0 && evaluation.reasons.every(reason => reason.startsWith("children:live-actor:"))) {
-        await callMainDrain(socket, sessionId, "stop-actors", binding);
+        await callBound("stop-actors");
       }
-      reply = await callMainDrain(socket, sessionId, "drain", binding);
+      reply = await callBound("drain");
       evaluation = check(reply);
     }
     if (!evaluation.drained) {
       // Not drained: the Pod's Main undoes itself here (release, reopen); the seam reports refused.
-      const undo = await callMainDrain(socket, sessionId, "undo", binding).catch(() => undefined);
+      const undo = await callBound("undo").catch(() => undefined);
       return emit({ op: "exit", drained: false, exiting: false,
         inputsFenced: !undo || undo.undo?.restartRequired === true ||
           (undo.native.capability && !(undo.native.fenceApi && undo.native.piInputsFenced === false)),
         reasons: evaluation.reasons, observed: evaluation.observed, reply, undo: undo?.undo ?? null }, false);
     }
-    const exit = await callMainDrain(socket, sessionId, "exit", binding);
+    const exit = await callBound("exit");
     return emit({ op: "exit", drained: true, exiting: exit.exiting, inputsFenced: evaluation.observed.inputsFenced && exit.native.inputsFenced,
       exitRefused: exit.exitRefused, observed: evaluation.observed, reply: exit }, exit.exiting);
   } catch (error) {

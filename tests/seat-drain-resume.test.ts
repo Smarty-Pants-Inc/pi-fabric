@@ -177,8 +177,30 @@ describe.skipIf(!linux)("the in-pod CLI half: pi-fabric session drain --exit aga
     expect(result.line).toMatchObject({ format: 1, sessionId: SID, op: "exit", drained: true, exiting: true, inputsFenced: true });
     expect(result.code).toBe(0);
     expect(seat.native.state.shutdown).not.toHaveBeenCalled();
+    // The accepted exit is final: the same operation cannot undo inside the shutdown grace, so the fence stays held.
+    const { callMainDrain, mainDrainSocket } = await import("../src/main-drain/client.js");
+    const binding = { runDir: null, run: seat.run, runSha256: seat.runSha256, phase: "resume-drain" as const, operationId: seat.operationId,
+      generation: "a".repeat(32), lockFd: null, podUid: POD.uid };
+    await expect(callMainDrain(mainDrainSocket(seat.meshRoot, SID, process.getuid!()), SID, "undo", binding))
+      .rejects.toMatchObject({ code: "MAIN_DRAIN_REFUSED_EXITING" });
+    expect(seat.native.state.fenced).toBe(true);
     await new Promise(resolve => setTimeout(resolve, 1_300));
     expect(seat.native.state.shutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it("the in-Pod CLI refuses a server that is not this session's inbox owner, before writing any request", async () => {
+    const seat = await createSeat(); seats.push(seat);
+    await podChannel(seat, "0");
+    const owner = path.join(seat.meshRoot, "main-followups", `${SID}.owner.json`);
+    const record = JSON.parse(fs.readFileSync(owner, "utf8"));
+    fs.writeFileSync(owner, JSON.stringify({ ...record, pid: process.pid + 100_000 }));
+    expect(await cli(seat, exitArgs(seat))).toMatchObject({ code: 1, line: { error: "MAIN_DRAIN_SERVER_NOT_OWNER" } });
+    fs.writeFileSync(owner, JSON.stringify({ ...record, processStartedAt: "1" }));
+    expect(await cli(seat, exitArgs(seat))).toMatchObject({ code: 1, line: { error: "MAIN_DRAIN_SERVER_NOT_OWNER" } });
+    fs.rmSync(owner);
+    expect(await cli(seat, exitArgs(seat))).toMatchObject({ code: 1, line: { error: "MAIN_DRAIN_OWNER_UNREADABLE" } });
+    expect(mainInboxDrainGate(ROOT)).toBeUndefined();
+    expect(seat.native.state.fenced).toBe(false);
   });
 
   it("a host Main (no Kubernetes env) refuses a pod binding, and a later op must carry the SAME pod UID", async () => {

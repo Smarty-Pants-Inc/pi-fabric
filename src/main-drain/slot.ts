@@ -36,6 +36,8 @@ export interface MainDrainSlot {
   ledgerOverflow?: number;
   /** N2: actors this operation stopped, with their recorded public spec. */
   stopped?: Array<{ id: string; spec: Record<string, unknown>; stoppedAt: number }>;
+  /** A clean exit was accepted (pod binding): it is final, and every later mutating op is refused. */
+  exitingAt?: number;
 }
 
 const SLOTS = Symbol.for("pi-fabric.main.drain-slot.v1");

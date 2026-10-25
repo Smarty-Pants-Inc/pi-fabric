@@ -119,6 +119,9 @@ export class MainDrainControl {
     const { rootId } = this.host;
     if (op === "drain" || op === "stop-actors" || op === "undo" || op === "exit") {
       if (!request) return "BINDING_REQUIRED";
+      // An accepted exit is final: no undo can reopen admission in the shutdown grace, which would admit
+      // input that the shutdown then cuts off after the exit reply already claimed the fence held.
+      if (peekDrainSlot(rootId)?.exitingAt !== undefined) return "EXITING";
       const kind = request.podUid === null ? "host" : "pod";
       if (kind === "pod") {
         if (!podBindingAllowed(this.host.environment)) return "POD_BINDING_OUTSIDE_POD";
@@ -154,7 +157,7 @@ export class MainDrainControl {
     if (op === "exit") {
       reply.exitRefused = this.#exitRefusals(reply);
       reply.exiting = reply.exitRefused.length === 0;
-      if (reply.exiting) this.#exitAccepted = true;
+      if (reply.exiting) { this.#exitAccepted = true; drainSlot(rootId).exitingAt = Date.now(); }
     }
     return reply;
   }

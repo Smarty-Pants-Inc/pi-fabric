@@ -31,12 +31,15 @@ import type { MeshStore } from "./store.js";
 import type { FabricParticipantRecord } from "../topology/types.js";
 import type { ConsumerMessages } from "@nats-io/jetstream";
 import type { NatsConnectionHandle } from "../transport/nats/connection.js";
-import type { FabricTransport, TransportEnvelope, TransportSent } from "../transport/types.js";
+import { TransportUncertainError, type FabricTransport, type TransportEnvelope, type TransportSent } from "../transport/types.js";
 import { hashToken } from "../transport/nats/subjects.js";
 
 const MACHINE_TOKEN = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const SELF_GROUP = "self";
 const SELF_CHECK_MS = 5_000;
+/** One lease TTL plus the safety margin: the longest a predecessor's lease can outlive its last renewal. */
+const SELF_TAKEOVER_MS = 17_000;
+const SELF_TAKEOVER_POLL_MS = 500;
 
 const validMessageId = (id: unknown): id is string =>
   typeof id === "string" && id.length > 0 && id === id.trim() && !/[\u0000-\u001f\u007f]/.test(id);
@@ -189,6 +192,8 @@ export interface NatsBridgePortOptions extends Omit<NatsBridgePresenceOptions, "
   readonly identity?: MeshIdentity;
   /** One fresh listing of native file actors (bridge-nats-actors.ts); absent = actors come only in the mirror set. */
   readonly fileActors?: () => NatsFileActorRead;
+  /** How long start() waits for a predecessor's link identity lease to expire (default one TTL plus margin). */
+  readonly takeoverMs?: number;
   /** Runs once at the end of close(): the factory closes the transport and inbox connection it opened. */
   readonly onClose?: () => Promise<void>;
 }
@@ -232,6 +237,7 @@ export class NatsBridgePort implements BridgeNatsPort {
   readonly #inbox: NatsBridgeInboxSource;
   readonly #now: () => number;
   readonly #abort = new AbortController();
+  readonly #takeoverMs: number;
   #selfRecord: FabricParticipantRecord | undefined;
   #selfTimer: ReturnType<typeof setInterval> | undefined;
   #selfPass: Promise<void> | undefined;
@@ -248,6 +254,7 @@ export class NatsBridgePort implements BridgeNatsPort {
     this.#transport = transport;
     this.#inbox = options.inbox;
     this.#now = options.now ?? Date.now;
+    this.#takeoverMs = options.takeoverMs ?? SELF_TAKEOVER_MS;
     const monotonic = options.monotonic ?? (() => performance.now());
     this.kv = new NatsBridgePresence({ ...options, transport, now: this.#now, monotonic });
   }
@@ -257,7 +264,22 @@ export class NatsBridgePort implements BridgeNatsPort {
     if (this.#closed) throw new Error("NATS bridge port is closed");
     this.kv.start();
     await this.kv.whenReady(signal);
-    await this.#ensureSelf(true);
+    // A predecessor this process cannot prove gone (another boot or host, or still alive) keeps its
+    // lease until the broker expires it: retry for one lease TTL plus margin, then refuse to start.
+    const deadline = performance.now() + this.#takeoverMs;
+    for (;;) {
+      try { await this.#ensureSelf(true); break; }
+      catch (error) {
+        const code = (error as { code?: unknown } | null)?.code;
+        if (code !== "FABRIC_BRIDGE_NATS_LEASE_CONFLICT" || performance.now() >= deadline || signal?.aborted) throw error;
+        this.options.log?.(`nats port: link identity ${this.identity.id} still leased by a predecessor; waiting for it to expire`);
+        await new Promise<void>(resolve => {
+          const done = (): void => { clearTimeout(timer); signal?.removeEventListener("abort", done); resolve(); };
+          const timer = setTimeout(done, SELF_TAKEOVER_POLL_MS);
+          signal?.addEventListener("abort", done, { once: true });
+        });
+      }
+    }
     this.#selfTimer ??= setInterval(() => { void this.#ensureSelf(false).catch(() => undefined); }, SELF_CHECK_MS);
     this.#selfTimer.unref?.();
   }
@@ -392,10 +414,24 @@ export class NatsBridgePort implements BridgeNatsPort {
       throw coded("NATS bridge destination must be another machine", "FABRIC_TRANSPORT_INVALID");
     }
     const fromId = envelope.from?.id;
-    if (envelope.kind === "command" && (typeof fromId !== "string" || (fromId !== this.identity.id && !this.kv.holds(fromId)))) {
+    const held = typeof fromId !== "string" ? "absent" : fromId === this.identity.id ? "live" : this.kv.writer.holdState(fromId);
+    if (envelope.kind === "command" && held === "absent") {
       throw coded("NATS bridge sender is not held live by this link", "FABRIC_SENDER_UNVERIFIED");
     }
-    return await this.#transport.send(envelope, signal);
+    if (envelope.kind === "command" && held === "renewing") {
+      // An outage has kept its lease unconfirmed: hold the command for a same-id resend, never refuse it.
+      throw new TransportUncertainError(envelope.id, envelope.body, { cause: coded("NATS bridge sender lease is unconfirmed", "FABRIC_TRANSPORT_UNAVAILABLE") });
+    }
+    try {
+      return await this.#transport.send(envelope, signal);
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (code === "FABRIC_TRANSPORT_UNCERTAIN" || code === "FABRIC_TRANSPORT_DENIED" || code === "FABRIC_TRANSPORT_INVALID") throw error;
+      // Everything else (unavailable during an outage or reconnect, capacity, the transport's retry
+      // horizon, an unclassified failure) is retryable with the same id and bytes: report it as
+      // uncertain, which is what the carrier resends, never as a final refusal that drops the message.
+      throw new TransportUncertainError(envelope.id, envelope.body, { cause: error });
+    }
   }
 
   /**
@@ -460,8 +496,12 @@ export class NatsBridgePort implements BridgeNatsPort {
     if (this.#selfTimer) clearInterval(this.#selfTimer);
     this.#selfTimer = undefined;
     await this.#selfPass?.catch(() => undefined);
-    try { await this.kv.close(); }
-    finally { await this.options.onClose?.(); }
+    try {
+      // A clean stop releases the link identity at once, so a restart never waits on its own lease.
+      // Mirrored rows stay fenced: their leases lapse within one TTL, or the restarted link adopts them.
+      if (!this.kv.writer.fenced) await this.kv.writer.release(SELF_GROUP).catch(error => { this.options.onError?.(error); });
+      await this.kv.close();
+    } finally { await this.options.onClose?.(); }
   }
 }
 

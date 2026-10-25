@@ -525,13 +525,19 @@ export class NatsKvMirror {
    * Whether this link holds a routable row for the id now: its lease is ours, matches the row's
    * incarnation, was confirmed within one TTL less the safety margin, and a claim is unexpired.
    */
-  holds(id: string): boolean {
-    if (typeof id !== "string" || id.length === 0) return false;
+  holds(id: string): boolean { return this.holdState(id) === "live"; }
+
+  /**
+   * live: routable now. renewing: still claimed and its lease is ours, but no lease write was
+   * confirmed within the window (a broker outage): retry, do not refuse. absent: not this link's.
+   */
+  holdState(id: string): "live" | "renewing" | "absent" {
+    if (typeof id !== "string" || id.length === 0) return "absent";
     const row = this.#rows.get(natsPresenceKey(this.machine, id));
     const lease = row && this.#owned.get(natsLeaseKey(this.machine, row.record.ownerHostId));
     const now = this.#monotonic();
-    return !!row && !!lease && sameSpec(lease.spec, specOf(row.record)) &&
-      now - lease.writtenAt < KV_LEASE_TTL_MS - TRANSPORT_HOST_LEASE_SAFETY_MS && [...row.claims.values()].some(until => until > now);
+    if (!row || !lease || !sameSpec(lease.spec, specOf(row.record)) || ![...row.claims.values()].some(until => until > now)) return "absent";
+    return now - lease.writtenAt < KV_LEASE_TTL_MS - TRANSPORT_HOST_LEASE_SAFETY_MS ? "live" : "renewing";
   }
 
   /** The rows this link has written, with whether each is routable now. */
@@ -635,6 +641,9 @@ export class NatsKvMirror {
       !sameSpec({ id: lease.id, rootId: lease.rootId, identityId: lease.identityId, incarnation: lease.incarnation }, spec)) return false;
     const proof = this.#processProof();
     if (lease.pid === proof.pid && lease.pidStartTime === proof.pidStartTime && lease.bootId === proof.bootId) return true;
+    // Exit evidence is local: only a predecessor on this same boot can be proved gone. Another boot
+    // or host (one machine credential used twice) waits for the broker to expire its lease instead.
+    if (lease.bootId !== proof.bootId) return false;
     try {
       return (this.options.predecessorExited ?? transportHostLeasePredecessorExited)({ pid: lease.pid, pidStartTime: lease.pidStartTime, bootId: lease.bootId });
     } catch { return false; } // An unreadable proof is not exit evidence.
@@ -845,6 +854,26 @@ export class NatsKvMirror {
     await this.#replacing.catch(() => undefined);
     await this.#renewing?.catch(() => undefined);
     await Promise.allSettled([...this.#queues.values()]);
+  }
+
+  /**
+   * Withdraw one group now (CAS-deletes its rows, and each lease no other group still uses), for a
+   * clean stop of an identity the link owns. Other groups and their leases are untouched.
+   */
+  async release(group: string): Promise<void> {
+    const run = this.#replacing.catch(() => undefined).then(async () => {
+      for (const row of [...this.#rows.values()]) {
+        if (!row.claims.delete(group) || row.claims.size > 0) continue;
+        const lease = this.#owned.get(natsLeaseKey(this.machine, row.record.ownerHostId));
+        const shared = [...this.#rows.values()].some(other => other !== row && other.record.ownerHostId === row.record.ownerHostId);
+        try {
+          if (lease && !shared) await this.#serial(lease.key, () => this.#dropLease(lease));
+          await this.#serial(row.key, () => this.#dropRow(row));
+        } catch (error) { this.#report(error); }
+      }
+    });
+    this.#replacing = run;
+    await run;
   }
 
   /** Fence, then CAS-delete every owned row: leases first, so routing stops at once. */

@@ -83,7 +83,8 @@ const closers: Array<{ close(): Promise<void> }> = [];
 afterEach(async () => { await Promise.allSettled(closers.splice(0).map(item => item.close())); });
 
 function port(w: KvWorld, options: { send?: (envelope: TransportEnvelope) => Promise<TransportSent>; fileActors?: () => NatsFileActorRead;
-  allow?: Parameters<typeof natsBridgeAdmit>[0]; onClose?: () => Promise<void>; proof?: typeof PROOF; predecessorExited?: () => boolean } = {}) {
+  allow?: Parameters<typeof natsBridgeAdmit>[0]; onClose?: () => Promise<void>; proof?: typeof PROOF; predecessorExited?: () => boolean;
+  takeoverMs?: number } = {}) {
   const clock = { wall: 1_000_000, mono: 50_000 };
   const sent: TransportEnvelope[] = [];
   const inbox = new ScriptedInbox();
@@ -95,7 +96,8 @@ function port(w: KvWorld, options: { send?: (envelope: TransportEnvelope) => Pro
   const allow = options.allow ?? { file: [{ kind: "root" as const, id: FILE_ROOT }], nats: [{ kind: "root" as const, id: NATS_ROOT }] };
   const instance = new NatsBridgePort({ transport, inbox, link: LINK, admit: natsBridgeAdmit(allow), processProof: options.proof ?? PROOF,
     predecessorExited: options.predecessorExited ?? (() => false), now: () => clock.wall, monotonic: () => clock.mono,
-    ...(options.fileActors ? { fileActors: options.fileActors } : {}), ...(options.onClose ? { onClose: options.onClose } : {}) });
+    ...(options.fileActors ? { fileActors: options.fileActors } : {}), ...(options.onClose ? { onClose: options.onClose } : {}),
+    ...(options.takeoverMs !== undefined ? { takeoverMs: options.takeoverMs } : {}) });
   closers.push(instance);
   return { port: instance, inbox, sent, clock };
 }
@@ -160,15 +162,27 @@ describe("NATS bridge port: link identity and presence", () => {
     expect(w.presence.values.size + w.leases.values.size).toBe(0);
   });
 
-  it("after a crash, takes over its own link identity only from a provably exited predecessor", async () => {
+  it("releases its link identity on a clean stop, so a restart within the lease TTL starts at once", async () => {
+    const w = kvWorld();
+    const first = port(w).port;
+    await first.start();
+    await first.close();
+    expect(w.presence.values.has(pKey(BRIDGE, LINK_ID))).toBe(false);
+    expect(w.leases.values.has(hKey(BRIDGE, LINK_ID))).toBe(false);
+    const restarted = port(w, { proof: { pid: 5151, pidStartTime: "888", bootId: PROOF.bootId }, takeoverMs: 0 }).port;
+    await restarted.start();
+    expect((await receiver(w)).resolve(LINK_ID)).toMatchObject({ machine: BRIDGE, live: true });
+  });
+
+  it("after a crash, takes over its own link identity at once from a provably exited predecessor", async () => {
     const w = kvWorld();
     const first = port(w).port;
     await first.start();
     const incarnation = first.selfRecord!.ownerIncarnation;
-    await first.close(); // A crash leaves the rows: close only fences.
+    await first.fence(); // A crash: the rows stay and nothing renews them.
     expect(w.presence.values.has(pKey(BRIDGE, LINK_ID))).toBe(true);
     const next = { pid: 5151, pidStartTime: "888", bootId: PROOF.bootId };
-    const alive = port(w, { proof: next, predecessorExited: () => false }).port;
+    const alive = port(w, { proof: next, predecessorExited: () => false, takeoverMs: 0 }).port;
     await expect(alive.start()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_NATS_LEASE_CONFLICT" });
     const successor = port(w, { proof: next, predecessorExited: () => true }).port;
     await successor.start();
@@ -370,6 +384,40 @@ describe("NATS bridge port: send", () => {
       await expect(p.send(bad)).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID" });
     }
     expect(sent).toEqual([]);
+  });
+
+  it("waits out a predecessor lease from another boot instead of trusting its exit proof", async () => {
+    const w = kvWorld();
+    const first = port(w).port;
+    await first.start();
+    await first.fence();
+    const otherHost = { pid: 5151, pidStartTime: "888", bootId: "ffffffff-1234-4234-8234-123456789abc" };
+    const early = port(w, { proof: otherHost, predecessorExited: () => true, takeoverMs: 0 }).port;
+    await expect(early.start()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_NATS_LEASE_CONFLICT" });
+    const waiting = port(w, { proof: otherHost, predecessorExited: () => true }).port;
+    const started = waiting.start();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    w.leases.expire(hKey(BRIDGE, LINK_ID)); // The broker expires the old lease (15 s TTL).
+    await started;
+    expect(w.leases.values.get(hKey(BRIDGE, LINK_ID))?.value).toMatchObject({ pid: 5151, bootId: otherHost.bootId });
+  });
+
+  it("reports an outage as uncertain (same id and bytes may be resent), never as a refusal", async () => {
+    const w = kvWorld();
+    const down = Object.assign(new Error("NATS transport is temporarily unavailable"), { code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+    const { port: p, clock } = port(w, { send: async () => { throw down; } });
+    await p.start();
+    const outage = command({ from: LINK_IDENTITY });
+    await expect(p.send(outage)).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNCERTAIN", id: outage.id, resolvedBody: outage.body, cause: down });
+    // A held sender whose lease writes have failed past the window is held for a resend too, not refused.
+    await p.mirror(mirrorSet(clock.wall), clock.wall);
+    const put = w.leases.put.bind(w.leases);
+    w.leases.put = () => { throw Object.assign(new Error("broker down"), { code: "FABRIC_TRANSPORT_UNAVAILABLE" }); };
+    advance(clock, 5_000);
+    await p.kv.writer.renew().catch(() => undefined);
+    advance(clock, 9_000);
+    await expect(p.send(command())).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNCERTAIN", id: "bnf1-abc" });
+    w.leases.put = put;
   });
 
   it("passes an uncertain outcome and a definite refusal through unchanged", async () => {

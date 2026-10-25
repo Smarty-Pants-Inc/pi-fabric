@@ -69,12 +69,12 @@ describe("N3 topic translator", () => {
     expect(ledger.records.size).toBe(1);
   });
 
-  it("translates lane reports and owner alarms, not hub-factory registrations or other topics", async () => {
+  it("translates lane reports and the owner kinds MeshBridge carries, not other topics or kinds", async () => {
     expect(isNatsTopicEvent({ topic: "fleet.work.lanes", kind: "ready", to: natsLead.id })).toBe(true);
     expect(isNatsTopicEvent({ topic: "fleet.work.pi-fabric.15310", kind: "done", to: natsLead.id })).toBe(true);
     expect(isNatsTopicEvent({ topic: "ops.owner", kind: "inbox.age.alarm", to: natsLead.id })).toBe(true);
     expect(isNatsTopicEvent({ topic: "ops.owner", kind: "bridge.lease.alarm", to: natsLead.id })).toBe(true);
-    expect(isNatsTopicEvent({ topic: "ops.owner", kind: "pr.wake", to: natsLead.id })).toBe(false);
+    expect(isNatsTopicEvent({ topic: "ops.owner", kind: "pr.wake", to: natsLead.id })).toBe(true);
     expect(isNatsTopicEvent({ topic: "ops.owner", kind: "cleanup", to: natsLead.id })).toBe(false);
     expect(isNatsTopicEvent({ topic: "fabric.alarm.bridge-stall", kind: "bridge-stall", to: natsLead.id })).toBe(true);
     expect(isNatsTopicEvent({ topic: "fabric.alarm.bridge-stall", kind: "bridge-stall", to: "factory" })).toBe(false);
@@ -82,7 +82,7 @@ describe("N3 topic translator", () => {
     const { topics } = setup();
     const lanes = await sent(topics, taskDone({ topic: "fleet.work.lanes", kind: "ready", text: "READY head abc" }, "lane-1"));
     expect(lanes.envelope.body.message).toBe("[mesh fleet.work.lanes/ready from fleet-tool:smarty-task-ryzen2]\nREADY head abc");
-    await expect(topics.outbound(taskDone({ topic: "ops.owner", kind: "pr.wake" }, "wake-1"))).rejects.toBeInstanceOf(NatsCarrierRefusal);
+    await expect(topics.outbound(taskDone({ topic: "ops.owner", kind: "cleanup" }, "cleanup-1"))).rejects.toBeInstanceOf(NatsCarrierRefusal);
   });
 
   it("refuses a target that is not a live NATS root, and a gate refusal, permanently", async () => {

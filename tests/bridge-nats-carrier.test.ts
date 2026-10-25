@@ -6,6 +6,7 @@ import {
 } from "../src/mesh/bridge-nats-carrier.js";
 import { bridgeNatsEnvelopeId, bridgeNatsMappedCommandId } from "../src/mesh/bridge-nats-types.js";
 import { controlBodyFingerprint } from "../src/mesh/control-idempotency.js";
+import { STALE_INCARNATION_ERROR } from "../src/topology/control-plane.js";
 import {
   BRIDGE_MACHINE, FakePresence, LINK, MemoryLedger, POD_MACHINE, fileLead, natsLead, otherNats,
 } from "./helpers/bridge-nats-l2-fakes.js";
@@ -303,6 +304,19 @@ describe("file ACK -> NATS ACK (the answer to a NATS sender)", () => {
       ownerIncarnation: "inc-file-lead", version: 1, commandId: "nats-cmd-1", targetId: fileLead.id, bodyDigest: senderFingerprint });
     expect(plan.settle).toEqual({ direction: "toFile", commandId: mapped, accepted: true, fromId: fileLead.id,
       ackEventId: "file-ack-1", data: envelope.body });
+  });
+
+  it("states notRun on a file owner's stale-epoch refusal, which a NATS sender accepts only with it", async () => {
+    const { carrier, ack } = await answered();
+    const stale = sendOf(await carrier.outbound(ack({ accepted: false, error: STALE_INCARNATION_ERROR,
+      errorCode: "FABRIC_CONTROL_STALE_INCARNATION", ownerIncarnation: "inc-file-lead-new", staleIncarnation: "inc-file-lead",
+      messageId: undefined, result: undefined }, { kind: "rejected" })));
+    expect(stale.envelope.body).toMatchObject({ accepted: false, notRun: true, errorCode: "FABRIC_CONTROL_STALE_INCARNATION",
+      ownerIncarnation: "inc-file-lead-new", staleIncarnation: "inc-file-lead", commandId: "nats-cmd-1" });
+    // Any other refusal keeps exactly what the owner said.
+    const { carrier: other, ack: otherAck } = await answered();
+    const plain = sendOf(await other.outbound(otherAck({ accepted: false, error: "busy", messageId: undefined, result: undefined })));
+    expect(plain.envelope.body.notRun).toBeUndefined();
   });
 
   it("refuses an ACK to another sender, from another owner, for an unknown id, or a relay refusal", async () => {

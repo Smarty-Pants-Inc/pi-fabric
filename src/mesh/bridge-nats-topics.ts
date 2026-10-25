@@ -29,9 +29,12 @@ import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, type MeshIdentity } 
  *   current epoch at most `maxAttempts - 1` times; any other answer is final.
  */
 
-/** ops.owner kinds a root acts on. pr.wake is a registration for the hub factory, not Main work. */
+/**
+ * The ops.owner kinds MeshBridge itself carries (isBridgedTopic). Which of them a given root receives is the
+ * allow-list's decision (receiveTopics), never a second list here.
+ */
 const OWNER_KINDS: ReadonlySet<string> = new Set([
-  "inbox.age.alarm", "bridge.lease.alarm", "bridge.lease.recovered", "bridge.delivery-age.alarm", "bridge.delivery-age.recovered",
+  "pr.wake", "inbox.age.alarm", "bridge.lease.alarm", "bridge.lease.recovered", "bridge.delivery-age.alarm", "bridge.delivery-age.recovered",
   "bridge.legacy-baseline.alarm", "bridge.legacy-baseline.recovered",
 ]);
 /** Text over this is cut, with a marker: a followUp is a turn, and the full event stays in the file mesh. */

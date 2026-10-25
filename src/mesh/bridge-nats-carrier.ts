@@ -1,6 +1,6 @@
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
 import {
-  CONTROL_STALE_INCARNATION, RELAY_DESTINATION_UNAVAILABLE, type FabricControlOperation,
+  CONTROL_STALE_INCARNATION, RELAY_DESTINATION_UNAVAILABLE, STALE_INCARNATION_ERROR, type FabricControlOperation,
 } from "../topology/control-plane.js";
 import type { ParticipantRoute } from "../topology/participant-view.js";
 import type { TransportDelivery, TransportEnvelope } from "../transport/types.js";
@@ -310,6 +310,12 @@ const ackOutcome = (data: Record<string, unknown>): Record<string, unknown> | un
   return outcome;
 };
 
+/** A file owner's stale-epoch refusal: exactly the control plane's typed answer, from a valid new epoch. */
+const isStaleIncarnationAnswer = (ack: Readonly<Record<string, unknown>>): boolean =>
+  ack.accepted === false && ack.errorCode === CONTROL_STALE_INCARNATION && ack.error === STALE_INCARNATION_ERROR &&
+  typeof ack.ownerIncarnation === "string" && ack.ownerIncarnation.length > 0 &&
+  (ack.staleIncarnation === null || typeof ack.staleIncarnation === "string");
+
 /** True when a NATS refusal proves the owner never ran the command under a stale owner epoch. */
 export const isStaleIncarnationRefusal = (ack: Readonly<Record<string, unknown>> | undefined): boolean =>
   ack?.accepted === false && ack.notRun === true && ack.errorCode === CONTROL_STALE_INCARNATION;
@@ -442,6 +448,10 @@ export class NatsBridgeCarrier {
     if (!owner || owner.identity.id !== record.ownerIdentityId || owner.hostId !== record.ownerHostId) {
       throw new NatsCarrierRefusal("ack sender is not the command's live file owner");
     }
+    // A file owner refuses a stale epoch before any claim or handler (control-plane #acceptCommand), but
+    // says so without notRun (the file sender's own no-resend policy). A NATS sender accepts a stale
+    // refusal from a new epoch only with notRun (#acceptNatsAcknowledgement): state the proven fact.
+    if (isStaleIncarnationAnswer(outcome)) outcome.notRun = true;
     // The NATS sender settles on the owner's machine (this bridge), its owner identity and the digest of its own wire.
     const body = boundNatsAck({ ...outcome, version: 1, commandId: record.sourceCommandId, targetId: record.targetId,
       bodyDigest: record.bodyDigest }, this.#maxAckBytes);

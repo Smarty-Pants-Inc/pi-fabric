@@ -238,6 +238,8 @@ interface ManagedActor extends FabricActorBatching {
   dedupeKey?: string;
   activation?: FabricActorActivationPolicy;
   activationFilter?: FabricActorActivationFilter;
+  /** Keep replay behind staged configuration saves, including a restart's queued replay microtask. */
+  filterCommitsPending?: number;
   deadLetterReplayMaxAgeMs?: number;
   activationFilterExpiresAt?: number;
   filterSkipped?: FabricActorInfo["filterSkipped"];
@@ -309,6 +311,10 @@ interface ManagedActor extends FabricActorBatching {
   drain?: Promise<void>;
   draining: boolean;
 }
+
+/** Staged setter value: serialized by its own commit, never exposed to queue readers before acceptance. */
+type ActorFilterUpdate = { [K in "activationFilter" | "invalidActivationFilter" | "activationFilterExpiresAt" |
+  "deadLetterReplayMaxAgeMs" | "filterSkipped" | "updatedAt"]: ManagedActor[K] };
 
 /** Validate an actor's bashTimeoutSeconds within Pi's timer limit (0 = no default timeout). */
 export const parseBashTimeoutSeconds = (value: unknown): number => {
@@ -2607,7 +2613,7 @@ export class ActorManager {
 
   /**
    * Set or clear (null or []) the skip-only activation filter (smarty-dev#1579). It applies to
-   * ordinary queue and overflow immediately, without touching an in-flight run. Interval-managed
+   * ordinary queue and overflow after its registry commit, without touching an in-flight run. Interval-managed
    * agent_settled deliveries recheck at arrival, their trailing boundary and dequeue. Per-filter
    * telemetry resets; legacy lifetime count is kept.
    */
@@ -2644,15 +2650,15 @@ export class ActorManager {
     beforeCommit?.(actor.id);
     // Durable in the dead-letter file before the filter or the queue changes; a failure changes nothing.
     if (total) this.#holdFilterSkipped(actor, skipped, skippedDeadLetters);
-    if (deadLetterReplayMaxAgeMs !== undefined) actor.deadLetterReplayMaxAgeMs = deadLetterReplayMaxAgeMs;
-    if (filter.length > 0) actor.activationFilter = filter;
-    else delete actor.activationFilter;
-    delete actor.invalidActivationFilter;
-    delete actor.activationFilterExpiresAt;
-    if (filter.length && expiresAt !== undefined) actor.activationFilterExpiresAt = expiresAt;
-    actor.filterSkipped = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
-    if (!filter.length) this.#recordFilterClear(actor, "explicit");
-    actor.updatedAt = Date.now();
+    // Round 12: keep the candidate OUT of the live actor. While the registry lock is held elsewhere,
+    // enqueue, batch timers, drain heads, settled-window microtasks and replay still see only the old
+    // filter. A failed save therefore leaves the old filter (including expiry and telemetry) untouched.
+    const filterUpdate: ActorFilterUpdate = {
+      activationFilter: filter.length ? filter : undefined, invalidActivationFilter: undefined,
+      activationFilterExpiresAt: filter.length ? expiresAt : undefined,
+      deadLetterReplayMaxAgeMs: deadLetterReplayMaxAgeMs ?? actor.deadLetterReplayMaxAgeMs,
+      filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null }, updatedAt: Date.now(),
+    };
     // The guard above already removed (moved) every whole item the new filter skips.
     if (skipped.length) this.#releaseFilterSkipped(actor, skipped);
     if (skippedDeadLetters.length) {
@@ -2662,11 +2668,22 @@ export class ActorManager {
         data: { heldInDeadLetter: skippedDeadLetters.length, eventIds: skippedDeadLetters.map(({ entry }) => entry.event.id) },
       });
     }
-    await this.#publishPresence(actor, true);
-    // Round 11 (fabric-store P1): commit the filter BEFORE pruning even in memory. A concurrent tell, mesh delivery
-    // or run finish can checkpoint the queue while #publishPresence waits. A failed commit must leave these records
-    // intact too. Round 9 (option B): partial matches now prune with #1574's normal per-record receipts and checkpoint.
-    // A crash before this pass leaves the records queued under the saved filter for the next drain.
+    // A restart's scheduled replay must not race the setter's replay-age change or telemetry reset.
+    // Queue readers need no such gate: they continue to see the old, committed filter.
+    actor.filterCommitsPending = (actor.filterCommitsPending ?? 0) + 1;
+    try {
+      await this.#publishPresence(actor, true, filterUpdate);
+    } catch (error) {
+      // A deferred startup replay still needs its wake when the candidate was rejected.
+      queueMicrotask(() => this.#replayDeadLetters(actor));
+      throw error;
+    } finally {
+      actor.filterCommitsPending = (actor.filterCommitsPending ?? 1) - 1;
+    }
+    if (!filter.length) this.#recordFilterClear(actor, "explicit");
+    // The accepted commit installs the filter before any later registry save can serialize the actor.
+    // Only now may any path prune under it. Round 9 (option B): partial matches prune with #1574's
+    // normal per-record receipts and checkpoint. A crash before this pass retains work under the saved filter.
     if (filter.length) this.#filterQueued(actor, true);
     // Replay can prune partial coalesced dead letters and checkpoint the queue too; it needs the committed filter.
     this.#replayDeadLetters(actor);
@@ -8516,7 +8533,7 @@ export class ActorManager {
   // held in memory, or met twice in one batch, is skipped, so each dead letter runs once. Entries
   // leave the file only after the queue file durably holds what they replayed.
   #replayDeadLetters(actor: ManagedActor): void {
-    if (!this.#persistent || this.#closing || this.#halted || this.#releaseStrict || actor.status === "stopped" || actor.removal ||
+    if (actor.filterCommitsPending || !this.#persistent || this.#closing || this.#halted || this.#releaseStrict || actor.status === "stopped" || actor.removal ||
       this.#parked.get(actor.id)?.length || !this.#canManageCached(actor.id) || !this.#slotCurrent(actor) || this.#deadLetterCount(actor.id) === 0) return;
     const limit = this.meshConfig.actorQueueLimit;
     if (actor.queue.length * 2 >= limit || this.#overflow.get(actor.id)?.length) return;
@@ -9061,7 +9078,7 @@ export class ActorManager {
     }
   }
 
-  async #publishPresence(actor: ManagedActor, requireCommit = false): Promise<void> {
+  async #publishPresence(actor: ManagedActor, requireCommit = false, filterUpdate?: ActorFilterUpdate): Promise<void> {
     if (!this.#canManage(actor.id) || !this.#slotCurrent(actor) || (requireCommit && this.#actors.get(actor.id) !== actor)) {
       if (requireCommit) throw new ActorRegistryOwnershipError();
       return;
@@ -9072,7 +9089,8 @@ export class ActorManager {
     // must not wrap this async setter/create/remove path in mesh.exclusive.
     // Maintenance may skip a displaced actor, but an acknowledged mutation must
     // prove its selected object/generation survived inside the commit fence.
-    await this.#saveActors(new Set(), requireCommit ? { requiredActor: actor } : undefined);
+    await this.#saveActors(new Set(), requireCommit ? { requiredActor: actor, ...(filterUpdate ? { filterUpdate } : {}) } : undefined);
+    if (filterUpdate) this.#emitChange(); // the staged value is live only after the registry accepts it
     await this.#writePresence(actor.id);
   }
 
@@ -9532,7 +9550,7 @@ export class ActorManager {
 
   #saveActors(removedIds: ReadonlySet<string> = new Set(), options?: {
     durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
-    operatorRow?: true; assertHeld?: () => void;
+    operatorRow?: true; assertHeld?: () => void; filterUpdate?: ActorFilterUpdate;
   }): Promise<void> {
     ++this.#registrySaveRevision;
     // Serialization is process-local and OUTSIDE custody. A later preparation
@@ -9560,9 +9578,12 @@ export class ActorManager {
 
   async #saveActorsNow(removedIds: ReadonlySet<string> = new Set(), options?: {
     durable?: boolean; flush?: boolean; removedLineages?: ReadonlyMap<string, string>; requiredActor?: ManagedActor;
-    operatorRow?: true; assertHeld?: () => void;
+    operatorRow?: true; assertHeld?: () => void; filterUpdate?: ActorFilterUpdate;
   }, signal?: AbortSignal): Promise<void> {
-    if (!this.#persistent || !this.meshConfig.enabled) return;
+    if (!this.#persistent || !this.meshConfig.enabled) {
+      if (options?.filterUpdate && options.requiredActor) Object.assign(options.requiredActor, options.filterUpdate);
+      return;
+    }
     if (this.#registrySaveDurable) options = { ...options, durable: true };
     let committed;
     try {
@@ -9587,7 +9608,9 @@ export class ActorManager {
           (actor.removal !== undefined || this.#slotCurrent(actor)));
         if (options?.requiredActor && !owned.includes(options.requiredActor)) throw new ActorRegistryOwnershipError();
         const rows = owned.map(actor => {
-          const row = this.#serializedActor(actor);
+          const row: Record<string, unknown> = { ...this.#serializedActor(actor),
+            ...(actor === options?.requiredActor ? options?.filterUpdate : undefined) };
+          // Only this setter's save carries the staged filter; other saves still serialize the live value.
           // Only the operator escalation's own save writes its pending bit (#escalateOperator).
           return options?.operatorRow && actor === options.requiredActor && actor.removal
             ? { ...row, removal: { ...actor.removal, operator: true } } : row;
@@ -9649,7 +9672,11 @@ export class ActorManager {
           })) throw new Error("Actor registry release readback differs");
       options.assertHeld();
     }
-    // Accepted: set synchronously, before the next queued save serializes this row.
+    // Accepted: install synchronously, before sync/reload or the next queued save serializes this row.
+    // No caller can prune under the candidate until its registry value is durable.
+    if (options?.filterUpdate && options.requiredActor && committed.owned.includes(options.requiredActor)) {
+      Object.assign(options.requiredActor, options.filterUpdate);
+    }
     if (options?.operatorRow && options.requiredActor?.removal &&
         committed.owned.includes(options.requiredActor)) options.requiredActor.removal.operator = true;
     if (this.#registrySaveFailures > 0) {

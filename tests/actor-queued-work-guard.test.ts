@@ -1467,6 +1467,106 @@ describe("queued-work guard, round 9: a partial coalesced match passes the filte
     }));
   }, 120_000);
 
+  // Round 12: real batching drains must not expose a pending filter to any queue writer.
+  // Keep reason: data safety; fabric-store reproduced silent accepted-record loss on bc802a58.
+  const batchFrom: MeshIdentity = { id: "agent:factory", name: "factory", kind: "agent" };
+  const batchingFilterFixture = async (batchWindowMs = 60_000) => {
+    const fixture = setup(10);
+    const { root, mesh, actors } = fixture;
+    actors.pauseForRelease(); // accept mesh work without starting a worker
+    const actor = await actors.create({ name: "batching-filter", instructions: "Review.", topics: [TOPIC], coalesce: false, coalesceKey: "subject" });
+    const comment = await mesh.publish({ topic: TOPIC, kind: "comment", from: batchFrom, data: { subject: "pr-1", marker: "comment-1" } });
+    const check = await mesh.publish({ topic: TOPIC, kind: "check", from: batchFrom, data: { subject: "pr-1", marker: "check-1" } });
+    type Item = { payload: MeshEvent; coalesced?: Array<{ id: string }> };
+    const queuedIds = () => (meshRecords(root, actor.id) as unknown as Item[]).flatMap(item => item.coalesced?.map(record => record.id) ?? [item.payload.id]);
+    await waitFor(() => queuedIds().join() === `${comment.id},${check.id}`);
+    // This history predates batching, as in the reported failure. Resume into a real batch
+    // window with no worker in flight, so enqueue and timer wakes reach #batchReady.
+    await actors.setBatching(actor.id, { batchWindowMs });
+    actors.resumeAfterRelease();
+    expect(actors.inFlightCount()).toBe(0);
+    expect(actors.status(actor.id).queued).toBe(1);
+    const registry = new ActorRegistryStore(path.join(root, "actors"));
+    const savedFilter = () => registry.records().find(record => record.id === actor.id)?.activationFilter;
+    const lock = async () => {
+      let unlock!: () => void;
+      let acquired!: () => void;
+      const acquiredLock = new Promise<void>(resolve => { acquired = resolve; });
+      const releaseLock = new Promise<void>(resolve => { unlock = resolve; });
+      const holding = registry.withLock(async () => { acquired(); await releaseLock; }, undefined, "batching-filter-regression");
+      await acquiredLock;
+      return { unlock, holding };
+    };
+    return { ...fixture, actor, comment, check, queuedIds, savedFilter, lock };
+  };
+
+  it.each(["tell", "mesh", "timer"] as const)("round 12: batching %s during a real filter commit never checkpoints an unexplained prune", async trigger => {
+    const { root, mesh, actors, actor, comment, check, queuedIds, savedFilter, lock } = await batchingFilterFixture(trigger === "timer" ? 2_000 : 60_000);
+    const { unlock, holding } = await lock();
+    const setting = actors.setActivationFilter(actor.id, CHECKS);
+    try {
+      expect(savedFilter()).toBeUndefined();
+      expect(queuedIds()).toEqual([comment.id, check.id]);
+      if (trigger === "tell") {
+        actors.tell(actor.id, "persist during batching filter commit");
+        expect(actors.status(actor.id).queued).toBeGreaterThan(0);
+      } else if (trigger === "mesh") {
+        const other = await mesh.publish({ topic: TOPIC, kind: "comment", from: batchFrom, data: { subject: "pr-2", marker: "other" } });
+        await waitFor(() => queuedIds().includes(other.id));
+      } else {
+        // No second queue writer: the real window timer reaches drain preparation, which
+        // waits behind the setter's registry save. Its queue checkpoint must keep the check.
+        await waitFor(() => actors.status(actor.id).status === "preparing");
+      }
+      expect(savedFilter()).toBeUndefined(); // the second store still owns the real registry lock
+      expect(queuedIds(), `${trigger}: accepted check disappeared before its filter was durable`).toContain(check.id);
+      expect(filtered(actors, actor.id)).toEqual([]);
+    } finally {
+      unlock();
+      await holding;
+      await setting;
+    }
+    expect(savedFilter()).toEqual(CHECKS);
+    if (trigger === "mesh") {
+      expect(queuedIds()).not.toContain(check.id);
+      expect(filtered(actors, actor.id).filter(message => (message.data as { filteredEventId?: string })?.filteredEventId === check.id)).toHaveLength(1);
+    } else {
+      // The old filter may already have admitted this batch before the commit. An in-flight
+      // input is immutable: either it runs intact, or the committed filter supplies a receipt.
+      await waitFor(() => actors.status(actor.id).status === "idle");
+      expect(runTasks(root, actors, actor.id).some(task => task.includes("check-1")) ||
+        filtered(actors, actor.id).some(message => (message.data as { filteredEventId?: string })?.filteredEventId === check.id)).toBe(true);
+    }
+  }, 120_000);
+
+  it("round 12: a failed batching filter save restores the previous filter and keeps every record queued", async () => {
+    const { actors, actor, comment, check, queuedIds, savedFilter, lock } = await batchingFilterFixture();
+    const previous: FabricActorActivationFilter = [{ id: "old", topic: [TOPIC], kind: ["unrelated"] }];
+    const expiresAt = Date.now() + 600_000;
+    await actors.setActivationFilter(actor.id, previous, undefined, expiresAt, 123_456);
+    const { unlock, holding } = await lock();
+    try {
+      // Real ActorRegistryStore lock acquisition timeout, not a rejected/mocked registry save.
+      await expect(actors.setActivationFilter(actor.id, CHECKS)).rejects.toThrow(/lock/i);
+      expect(actors.status(actor.id)).toMatchObject({ activationFilter: previous, activationFilterExpiresAt: expiresAt,
+        deadLetterReplayMaxAgeMs: 123_456 });
+      expect(savedFilter()).toEqual(previous);
+      expect(queuedIds()).toEqual([comment.id, check.id]);
+      expect(filtered(actors, actor.id)).toEqual([]);
+      actors.pauseForRelease();
+      actors.tell(actor.id, "checkpoint after rejected filter change");
+      expect(queuedIds()).toEqual([comment.id, check.id]);
+    } finally {
+      unlock();
+      await holding;
+    }
+    // A later unrelated registry save must not smuggle the rejected filter onto disk.
+    await actors.setNice(actor.id, 1);
+    expect(savedFilter()).toEqual(previous);
+    expect(queuedIds()).toEqual([comment.id, check.id]);
+    expect(filtered(actors, actor.id)).toEqual([]);
+  }, 120_000);
+
   // Round 10 (fabric-store P1, probe OB-crash): the setter rewrote the queue file without the pruned check BEFORE its
   // registry commit saved the new filter and the check's filtered receipt; a crash between them lost the check with no
   // receipt. The crash lands at the setter's registry commit: the disk is copied as it stands right before the commit, or

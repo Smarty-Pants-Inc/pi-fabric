@@ -8,6 +8,7 @@ import { createNatsFileLink, type NatsCarrierSide } from "./bridge-nats-file.js"
 import {
   createBridgeNatsIdentityGate, loadBridgeNatsSeatPins, parseBridgeNatsAllowSection, type BridgeNatsSeatPins,
 } from "./bridge-nats-identity.js";
+import { openBridgeNatsLedger } from "./bridge-nats-ledger.js";
 import type { NatsTopicAuthorize } from "./bridge-nats-topics.js";
 import {
   bridgeNatsLinkIdentity, type BridgeNatsAllowDecision, type BridgeNatsAllowListConfig, type BridgeNatsAllowSection,
@@ -54,8 +55,8 @@ export interface NatsLinkStartConfig {
 export interface NatsLinkFactories {
   /** L1: the raw NATS port for this config (connection, KV, inbox), closed by the link on stop. */
   openPort(config: NatsLinkStartConfig, options: { signal: AbortSignal; log: (line: string) => void }): Promise<BridgeNatsPort>;
-  /** L3: the crash-durable ledger in `directory`. */
-  openLedger(directory: string): Promise<BridgeNatsLedger>;
+  /** L3: the crash-durable ledger in `directory`; default openBridgeNatsLedger. */
+  openLedger?(directory: string): Promise<BridgeNatsLedger>;
   /** org.json seat pins; default: L3's loadBridgeNatsSeatPins (smarty-send's strict reader). */
   seatPins?(): BridgeNatsSeatPins;
 }
@@ -63,7 +64,7 @@ export interface NatsLinkFactories {
 export interface NatsLinkStartOptions {
   readonly signal: AbortSignal;
   readonly log: (line: string) => void;
-  /** Required until L1's openNatsBridgeSide and L3's openBridgeNatsLedger are on this branch. */
+  /** Required until L1's openNatsBridgeSide is on this branch (it becomes the openPort default). */
   readonly factories?: NatsLinkFactories;
 }
 
@@ -118,38 +119,55 @@ export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsC
   const record = (stored: BridgeNatsCommandRecord): NatsCarrierRecord => ({
     v: 1, direction: stored.direction, origin: stored.requesterId === linkId ? "topic" : "control", link,
     operation: stored.operation, sourceCommandId: stored.originalCommandId, destinationCommandId: stored.commandId,
-    sourceEventId: stored.sourceEventId, destinationEventId: stored.envelopeId ?? stored.sourceEventId,
+    // Toward the file mesh the destination id is the source envelope id (markSent's file event id is bookkeeping).
+    sourceEventId: stored.sourceEventId,
+    destinationEventId: stored.direction === "toNats" ? stored.envelopeId ?? stored.sourceEventId : stored.sourceEventId,
     targetId: stored.targetId, ownerHostId: stored.ownerHostId, ownerIdentityId: stored.ownerIdentityId,
     ...(stored.targetMachine !== undefined ? { ownerMachine: stored.targetMachine } : {}),
-    requesterId: stored.requesterId, sourceMachine: stored.sourceMachine, replyTo: stored.replyTo, bodyDigest: stored.bodyDigest,
+    requesterId: stored.requesterId, from: stored.from, ...(stored.principal !== undefined ? { principal: stored.principal } : {}),
+    sourceMachine: stored.sourceMachine,
+    ...(stored.originalCancelCommandId !== undefined ? { sourceCancelCommandId: stored.originalCancelCommandId } : {}),
+    ...(stored.cancelCommandId !== undefined ? { cancelCommandId: stored.cancelCommandId } : {}),
+    replyTo: stored.replyTo, bodyDigest: stored.bodyDigest,
     deadlineAt: stored.deadlineAt, expiresAt: stored.expiresAt,
     ...(stored.ownerIncarnation !== undefined ? { ownerIncarnation: stored.ownerIncarnation } : {}),
     ...(stored.resolvedBody !== undefined ? { body: stored.resolvedBody } : {}),
   });
   return {
     async claim(input) {
-      const cancel = typeof input.body?.cancelCommandId === "string" ? input.body.cancelCommandId : undefined;
       const result = await ledger.claim({
         direction: input.direction, originalCommandId: input.sourceCommandId, commandId: input.destinationCommandId,
         sourceEventId: input.sourceEventId, ...(input.direction === "toNats" ? { envelopeId: input.destinationEventId } : {}),
-        ...(cancel !== undefined ? { cancelCommandId: cancel } : {}),
+        ...(input.cancelCommandId !== undefined ? { cancelCommandId: input.cancelCommandId } : {}),
+        ...(input.sourceCancelCommandId !== undefined ? { originalCancelCommandId: input.sourceCancelCommandId } : {}),
+        from: input.from, ...(input.principal !== undefined ? { principal: input.principal } : {}),
         bodyDigest: input.bodyDigest, sourceMachine: input.sourceMachine, requesterId: input.requesterId, replyTo: input.replyTo,
         targetId: input.targetId, operation: input.operation, ownerHostId: input.ownerHostId, ownerIdentityId: input.ownerIdentityId,
         ...(input.ownerIncarnation !== undefined ? { ownerIncarnation: input.ownerIncarnation } : {}),
         ...(input.ownerMachine !== undefined ? { targetMachine: input.ownerMachine } : {}),
         deadlineAt: input.deadlineAt, ...(input.body !== undefined ? { resolvedBody: input.body } : {}),
       });
-      return { created: result.status === "new", record: record(result.record) };
+      return { created: result.created, record: record(result.record) };
     },
     async lookup(direction, id) {
-      const stored = ledger.lookup(id);
-      return stored && stored.direction === direction ? record(stored) : undefined;
+      const stored = ledger.lookup(direction, id);
+      return stored ? record(stored) : undefined;
     },
     async settle(direction, id, outcome) {
-      const stored = ledger.lookup(id);
-      if (!stored || stored.direction !== direction) return;
+      const stored = ledger.lookup(direction, id);
+      if (!stored) return;
       await ledger.settle(id, { v: 1, commandId: id, accepted: outcome.accepted, fromId: outcome.fromId ?? stored.ownerIdentityId,
-        ackEventId: outcome.ackEventId ?? "", data: { ...(outcome.data ?? { accepted: outcome.accepted }) }, receivedAt: outcome.at });
+        ackEventId: outcome.ackEventId ?? `settled:${id}`, data: { ...(outcome.data ?? { accepted: outcome.accepted }) },
+        receivedAt: outcome.at });
+    },
+    async sent(direction, id, receipt) {
+      // Toward the file mesh markSent needs the appended event id, which MeshBridge keeps: bookkeeping toward NATS only.
+      if (direction === "toNats" && ledger.lookup(direction, id)) {
+        await ledger.markSent(id, receipt.sequence !== undefined ? { sequence: receipt.sequence } : {});
+      }
+    },
+    async forwarded(direction, id) {
+      if (ledger.lookup(direction, id)?.ack !== undefined) await ledger.markAckForwarded(id);
     },
   };
 };
@@ -172,11 +190,14 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     ...(config.file.maxStateBytes !== undefined ? { maxStateBytes: config.file.maxStateBytes } : {}),
   });
   let port: BridgeNatsPort | undefined;
+  let opened: BridgeNatsLedger | undefined;
   try {
     await store.prepareLock();
     signal.throwIfAborted();
     port = await factories.openPort(config, { signal, log });
-    const ledger = natsCarrierLedger(await factories.openLedger(path.join(config.stateDir, "ledger")), config.link);
+    const ledgerDir = path.join(config.stateDir, "ledger");
+    opened = await (factories.openLedger ? factories.openLedger(ledgerDir) : openBridgeNatsLedger({ dir: ledgerDir }));
+    const ledger = natsCarrierLedger(opened, config.link);
     let remote: NatsCarrierSide | undefined;
     const openedPort = port;
     const { authorize, authorizeTopic } = natsLinkAuthorizers(gate, {
@@ -202,9 +223,11 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     signal.throwIfAborted();
     log(`linked ${config.name} <-> ${config.link} (NATS machine ${port.machine})`);
     let stopping: Promise<void> | undefined;
+    const openedLedger = opened;
     const stop = (): Promise<void> => stopping ??= (async () => {
       await bridge.stop().catch(() => undefined);
       await openedPort.close().catch(() => undefined);
+      await openedLedger.close().catch(() => undefined);
       store.closeState();
     })();
     const onAbort = (): void => { void stop(); };
@@ -220,6 +243,7 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     return { closed, stop };
   } catch (error) {
     await port?.close().catch(() => undefined);
+    await opened?.close().catch(() => undefined);
     store.closeState();
     throw error;
   }

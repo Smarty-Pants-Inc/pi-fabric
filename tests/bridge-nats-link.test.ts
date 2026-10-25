@@ -8,12 +8,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { NatsCarrierRecord } from "../src/mesh/bridge-nats-carrier.js";
 import { createNatsFileLink, type NatsCarrierSide } from "../src/mesh/bridge-nats-file.js";
 import { createBridgeNatsIdentityGate, parseBridgeNatsAllowSection, type BridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
+import { openBridgeNatsLedger, type FileBridgeNatsLedger } from "../src/mesh/bridge-nats-ledger.js";
 import { natsCarrierLedger, natsLinkAuthorizers, natsLinkMirrorAllowed, startNatsLink } from "../src/mesh/bridge-nats-link.js";
 import { bridgeNatsMappedCommandId, type BridgeNatsAllowSection } from "../src/mesh/bridge-nats-types.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
 import {
-  BRIDGE_MACHINE, FakePort, LINK, MemoryBridgeNatsLedger, POD_MACHINE, fileLead, linkIdentity, natsLead, route, settle,
+  BRIDGE_MACHINE, FakePort, LINK, POD_MACHINE, fileLead, linkIdentity, natsLead, route, settle,
 } from "./helpers/bridge-nats-l2-fakes.js";
 
 const roots: string[] = [];
@@ -26,6 +27,12 @@ afterEach(async () => {
 });
 
 const key = (prefix: string, id: string): string => prefix + createHash("sha256").update(id).digest("hex");
+const ledgerIn = async (root: string): Promise<FileBridgeNatsLedger> => {
+  // L3's real crash-durable ledger, in this test's own temp directory.
+  const ledger = await openBridgeNatsLedger({ dir: path.join(root, "ledger") });
+  closers.push(() => ledger.close());
+  return ledger;
+};
 const NOW = Date.now();
 const offList: MeshIdentity = { id: "session:55555555-5555-4555-8555-555555555555", name: "not-listed", kind: "main" };
 const host = (identity: MeshIdentity): FabricHostRecord => ({
@@ -73,7 +80,7 @@ const gatedFixture = async () => {
   let remote: NatsCarrierSide | undefined;
   const { authorize, authorizeTopic } = natsLinkAuthorizers(gate, { file: () => remote!.filePresence.view(), nats: () => port.presenceView() });
   const logs: string[] = [];
-  const ledger = new MemoryBridgeNatsLedger();
+  const ledger = await ledgerIn(root);
   const link = createNatsFileLink({ store, localName: "ryzen1", link: LINK, cursorPath: path.join(root, "cursor.json"), port,
     ledger: natsCarrierLedger(ledger, LINK), authorize, authorizeTopic, mirrorAllowed: natsLinkMirrorAllowed(allow),
     log: line => logs.push(line), resendDelayMs: 0, bridge: { presenceMs: 60_000 } });
@@ -149,13 +156,16 @@ describe("startNatsLink composition with L3's allow gate", () => {
   });
 
   it("the L3 ledger adapter round-trips a carrier record and maps claim statuses", async () => {
-    const ledger = new MemoryBridgeNatsLedger();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-ledger-"));
+    roots.push(root);
+    const ledger = await ledgerIn(root);
     const port = natsCarrierLedger(ledger, LINK);
     const record: NatsCarrierRecord = {
       v: 1, direction: "toNats", origin: "control", link: LINK, operation: "followUp", sourceCommandId: "orig",
       destinationCommandId: "f".repeat(64), sourceEventId: "file-event", destinationEventId: "bnf1-abc", targetId: natsLead.id,
-      ownerHostId: natsLead.id, ownerIdentityId: natsLead.id, ownerMachine: POD_MACHINE, requesterId: fileLead.id,
-      sourceMachine: "file", replyTo: fileLead.id, bodyDigest: "a".repeat(64), deadlineAt: NOW + 1_000, expiresAt: NOW + 2_000,
+      ownerHostId: natsLead.id, ownerIdentityId: natsLead.id, ownerMachine: POD_MACHINE, requesterId: fileLead.id, from: fileLead,
+      principal: { id: "principal:paul", binding: "herdr-client" },
+      sourceMachine: BRIDGE_MACHINE, replyTo: fileLead.id, bodyDigest: "a".repeat(64), deadlineAt: NOW + 1_000, expiresAt: NOW + 2_000,
       ownerIncarnation: "inc", body: { version: 1, commandId: "f".repeat(64) },
     };
     const first = await port.claim(record);
@@ -165,10 +175,19 @@ describe("startNatsLink composition with L3's allow gate", () => {
     expect((await port.claim(record)).created).toBe(false);
     expect(await port.lookup("toNats", record.destinationCommandId)).toMatchObject(rest);
     expect(await port.lookup("toFile", record.destinationCommandId)).toBeUndefined();
+    await port.sent!("toNats", record.destinationCommandId, { sequence: 9 });
+    expect(ledger.lookup("toNats", record.destinationCommandId)).toMatchObject({ state: "sent", destinationSequence: 9 });
     await port.settle("toNats", record.destinationCommandId, { accepted: true, at: NOW, fromId: natsLead.id, ackEventId: "ack:bnf1-abc", data: { accepted: true } });
-    expect(ledger.lookup(record.destinationCommandId)).toMatchObject({ state: "acked", ack: { accepted: true, fromId: natsLead.id } });
-    const topic = await port.claim({ ...record, destinationCommandId: "e".repeat(64), requesterId: linkIdentity.id });
+    await port.forwarded!("toNats", record.destinationCommandId);
+    expect(ledger.lookup("toNats", record.destinationCommandId)).toMatchObject({ state: "ackForwarded", ack: { accepted: true, fromId: natsLead.id } });
+    const conflict = await port.claim({ ...record, bodyDigest: "b".repeat(64) });
+    expect(conflict).toMatchObject({ created: false, record: { bodyDigest: "a".repeat(64) } });
+    const topic = await port.claim({ ...record, destinationCommandId: "e".repeat(64), requesterId: linkIdentity.id, from: linkIdentity });
     expect(topic.record.origin).toBe("topic");
+    // The cancel mapping is kept both ways.
+    const cancel = await port.claim({ ...record, operation: "cancel", destinationCommandId: "d".repeat(64), sourceCommandId: "orig-cancel",
+      sourceCancelCommandId: "orig", cancelCommandId: "f".repeat(64) });
+    expect(cancel.record).toMatchObject({ sourceCancelCommandId: "orig", cancelCommandId: "f".repeat(64) });
   });
 
   it("startNatsLink links with injected factories, refuses without them, and stops cleanly", async () => {
@@ -183,16 +202,18 @@ describe("startNatsLink composition with L3's allow gate", () => {
     await expect(startNatsLink(config, { signal: controller.signal, log: line => logs.push(line) })).rejects.toThrow(/factories/);
     const port = fakePort();
     const handle = await startNatsLink(config, { signal: controller.signal, log: line => logs.push(line), factories: {
-      openPort: async () => port, openLedger: async () => new MemoryBridgeNatsLedger(), seatPins: () => pins,
+      openPort: async () => port, seatPins: () => pins,
     } });
     expect(logs).toContain(`linked ryzen1 <-> ${LINK} (NATS machine ${BRIDGE_MACHINE})`);
     expect(port.mirrors.at(-1)!.participants.map(entry => entry.id)).toEqual([fileLead.id]);
     controller.abort();
     await handle.closed;
     expect(port.closed).toBe(true);
+    // The default ledger is L3's, in the state dir, and its writer lock was released on stop.
+    expect(fs.existsSync(path.join(root, "state", "ledger", "ledger.lock"))).toBe(false);
     // A bad allow-list never opens anything.
     await expect(startNatsLink({ ...config, allow: { nats: [{ kind: "root", id: "session:not-a-uuid" }] } },
       { signal: new AbortController().signal, log: () => undefined, factories: { openPort: async () => { throw new Error("opened"); },
-        openLedger: async () => new MemoryBridgeNatsLedger(), seatPins: () => pins } })).rejects.toThrow(/allow/);
+        seatPins: () => pins } })).rejects.toThrow(/allow/);
   });
 });

@@ -392,7 +392,9 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
       return { sequence: 0 };
     }
     const sent = await this.#send(plan.envelope);
-    if (plan.settle) await this.carrier.settle(plan.settle);
+    // An ACK going back to a NATS sender is that command's forward; a command is now sent.
+    if (plan.settle) await this.carrier.settle(plan.settle, true);
+    else if (plan.record?.direction === "toNats" && plan.envelope.kind === "command") await this.carrier.sent(plan.record, sent.sequence);
     return { sequence: sent.sequence };
   }
 
@@ -452,7 +454,10 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
               `${typeof plan.ack?.error === "string" ? plan.ack.error.slice(0, 200) : "no reason given"}`);
           }
           const retry = await this.topics.retry(plan.record, plan.ack);
-          if (retry?.kind === "send") await this.#send(retry.envelope);
+          if (retry?.kind === "send") {
+            const resent = await this.#send(retry.envelope);
+            if (retry.record) await this.carrier.sent(retry.record, resent.sequence);
+          }
         }
         await delivery.ack();
         this.#release(stream);
@@ -478,7 +483,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
         continue;
       }
       if (held.settle) {
-        try { await this.carrier.settle(held.settle); }
+        try { await this.carrier.settle(held.settle, true); }
         catch (error) { this.#log(`toFile: ledger settle for stream sequence ${stream} failed: ${message(error)}`); }
       }
       this.#release(stream);

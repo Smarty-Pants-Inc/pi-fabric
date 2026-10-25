@@ -1,6 +1,6 @@
 import { BRIDGE_STALL_ALARM_TOPIC, type BridgePublish } from "./bridge.js";
 import {
-  carrierIdentity, isStaleIncarnationRefusal, NATS_CARRIER_FILE_SOURCE, NatsCarrierRefusal,
+  carrierIdentity, isStaleIncarnationRefusal, NatsCarrierRefusal,
   type NatsCarrierDecision, type NatsCarrierEnvelope, type NatsCarrierLedger, type NatsCarrierPresence, type NatsCarrierRecord,
   type NatsOutbound, type NatsPresenceEntry,
 } from "./bridge-nats-carrier.js";
@@ -202,7 +202,7 @@ export class NatsTopicTranslator {
       v: 1, direction: "toNats", origin: "topic", link: this.link, operation: "followUp",
       sourceCommandId: idempotencyKey, destinationCommandId: commandId, sourceEventId: eventId, destinationEventId: envelope.id,
       targetId: route.ownerIdentityId, ownerHostId: route.ownerHostId, ownerIdentityId: route.ownerIdentityId,
-      ownerMachine: route.machine, requesterId: this.identity.id, sourceMachine: NATS_CARRIER_FILE_SOURCE, replyTo: hostId,
+      ownerMachine: route.machine, requesterId: this.identity.id, from: envelope.from, sourceMachine: this.machine, replyTo: hostId,
       bodyDigest: controlBodyFingerprint(body, undefined), deadlineAt: now + this.#timeoutMs,
       expiresAt: now + this.#timeoutMs + BRIDGE_NATS_HORIZON_MS, ownerIncarnation: route.ownerIncarnation, body,
     };
@@ -218,7 +218,7 @@ export class NatsTopicTranslator {
     return { kind: "send", record, envelope: Object.freeze({
       id: record.destinationEventId, kind: "command" as const,
       to: Object.freeze({ machine: record.ownerMachine, hostId: record.ownerHostId }), targetId: record.targetId,
-      operation: "followUp", from: carrierIdentity(this.identity), body: record.body,
+      operation: "followUp", from: record.from, body: record.body,
     }) };
   }
 }

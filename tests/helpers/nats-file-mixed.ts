@@ -118,11 +118,17 @@ export const ROOT_SEND_OPERATIONS: readonly FabricControlOperation[] = ["steer",
 /** A principal seat receives followUp and cancel only (L3 BRIDGE_NATS_SEAT_RECEIVE). */
 export const SEAT_OPERATIONS: readonly FabricControlOperation[] = ["followUp", "cancel"];
 
-/** One root allow entry (L3 BridgeNatsAllowEntryInput): it may send and receive `operations`. */
-export function allowRoot(id: string, operations: readonly FabricControlOperation[] = ROOT_SEND_OPERATIONS, principal?: string,
-  receiveTopics?: readonly string[]): BridgeNatsAllowEntryInput {
-  return { kind: "root", id, send: [...operations], receive: [...operations], ...(principal === undefined ? {} : { principal }),
-    ...(receiveTopics === undefined ? {} : { receiveTopics: [...receiveTopics] }) };
+/**
+ * One root allow entry (L3 BridgeNatsAllowEntryInput): it may send and receive `operations`. A NATS-side
+ * entry is pinned to its machine (L3 requires `machine` on every allow.nats entry; integrator note 8).
+ */
+export function allowRoot(id: string, options: { operations?: readonly FabricControlOperation[]; principal?: string;
+  receiveTopics?: readonly string[]; machine?: string } = {}): BridgeNatsAllowEntryInput {
+  const operations = options.operations ?? ROOT_SEND_OPERATIONS;
+  return { kind: "root", id, send: [...operations], receive: [...operations],
+    ...(options.principal === undefined ? {} : { principal: options.principal }),
+    ...(options.receiveTopics === undefined ? {} : { receiveTopics: [...options.receiveTopics] }),
+    ...(options.machine === undefined ? {} : { machine: options.machine }) };
 }
 
 /** A file-side actor allow entry (owner root + name; the verified presence must match both). */
@@ -465,7 +471,8 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     if (options.seat && !natsPeer) throw new Error("seat needs natsPeer");
     const allow = {
       file: [allowRoot(fileMain.id), ...(actor ? [allowActor(fileMain.id, actor.name)] : [])],
-      nats: [allowRoot(natsMain.id), ...(natsPeer ? [options.seat ? allowRoot(natsPeer.id, SEAT_OPERATIONS, SEAT_PRINCIPAL) : allowRoot(natsPeer.id)] : [])],
+      nats: [allowRoot(natsMain.id, { machine: NATS_MAIN_MACHINE }), ...(natsPeer ? [allowRoot(natsPeer.id, { machine: NATS_MAIN_MACHINE,
+        ...(options.seat ? { operations: SEAT_OPERATIONS, principal: SEAT_PRINCIPAL } : {}) })] : [])],
     };
     // Seat pins come only from org.json (L3). The fixture binds the product owner to a session nobody runs,
     // and SEAT_PRINCIPAL to natsPeer only when the test asks for a seat.

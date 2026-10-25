@@ -9,7 +9,7 @@ import { bridgeNatsCommandId, bridgeNatsLinkIdentity, bridgeNatsTopicIdempotency
 import type { MeshIdentity } from "../src/mesh/store.js";
 import { resolveNatsBinary } from "./helpers/nats-cluster.js";
 import {
-  allowRoot, BRIDGE_MACHINE, createMixedHarness, linkTail, natsLinkPresent, waitForValue, type MixedHarness, type WireEvent,
+  allowRoot, BRIDGE_MACHINE, createMixedHarness, linkTail, NATS_MAIN_MACHINE, natsLinkPresent, waitForValue, type MixedHarness, type WireEvent,
 } from "./helpers/nats-file-mixed.js";
 
 const binary = resolveNatsBinary();
@@ -27,7 +27,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: ad
   beforeAll(async () => {
     h = await createMixedHarness({ binary: binary!, natsPeer: true, allow: (allow, ids) => {
       allow.nats = allow.nats.map((entry) => entry.kind === "root" && entry.id === ids.natsMain
-        ? allowRoot(ids.natsMain, undefined, undefined, ["fleet.work.*", "ops.owner"]) : entry);
+        ? allowRoot(ids.natsMain, { machine: NATS_MAIN_MACHINE, receiveTopics: ["fleet.work.*", "ops.owner"] }) : entry);
     } });
   }, 90_000);
   afterAll(async () => { await h?.stop(); }, 60_000);

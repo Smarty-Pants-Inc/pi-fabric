@@ -831,7 +831,7 @@ export interface NatsBridgePresenceOptions {
   /** The link name; the file side records mirrored NATS roots with this `remoteHost`. */
   readonly link: string;
   /** Static allow-list decision (L3 identity module). Nothing crosses without it. */
-  readonly admit: (record: FabricParticipantRecord, direction: NatsPresenceDirection) => boolean;
+  readonly admit: (record: FabricParticipantRecord, direction: NatsPresenceDirection, machine?: string) => boolean;
   readonly processProof?: TransportHostLeaseProcessProof;
   readonly predecessorExited?: (proof: TransportHostLeaseProcessProof) => boolean;
   readonly now?: () => number;
@@ -911,7 +911,7 @@ export class NatsBridgePresence {
       const record = projectNatsMirrorRecord(route.record);
       if (!record || !isCanonicalRoot(record.id) || record.id !== record.rootId || record.id !== record.ownerHostId ||
         record.id !== record.ownerIdentityId) continue;
-      if (!this.options.admit(record, "toFile")) continue;
+      if (!this.options.admit(record, "toFile", route.machine)) continue;
       const remaining = Math.min(MIRROR_FRESH_MS, route.liveUntil - monotonicNow);
       if (remaining <= 0) continue;
       const expiresAt = observedAt + remaining;
@@ -987,6 +987,41 @@ export class NatsBridgePresence {
     const route = typeof fromId === "string" ? this.reader.resolve(fromId) : undefined;
     return route?.live === true && route.machine === sourceMachine && route.machine !== this.reader.machine
       ? { ok: true, route } : { ok: false, refuse: "FABRIC_SENDER_UNVERIFIED" };
+  }
+
+  /**
+   * Hold allow-listed file actors in KV (their own group, so a roots pass never withdraws them).
+   * Each actor's authority ends at its owner host's sample deadline when `hosts` carries that host,
+   * else at `sampledAt` (when the native listing proved it live) plus the mirror freshness bound.
+   */
+  async mirrorActors(actors: readonly FabricParticipantRecord[], options: { hosts?: readonly BridgeHost[];
+    sampledAt: number; complete: boolean }): Promise<NatsMirrorOutcome> {
+    const now = this.#now();
+    const monotonicNow = this.#monotonic();
+    const owners = new Map<string, BridgeHost>();
+    for (const host of options.hosts ?? []) {
+      const record = host?.record;
+      if (record && typeof record.id === "string" && record.remoteHost === undefined && record.bridgeVia === undefined) owners.set(record.id, host);
+    }
+    const claims: NatsMirrorClaim[] = [];
+    for (const actor of actors) {
+      const record = actor && projectNatsMirrorRecord(actor);
+      if (!record || record.kind !== "actor") {
+        this.#skip(actor?.id, "not carried: needs a v1 native actor with an owner incarnation");
+        continue;
+      }
+      if (!this.options.admit(record, "toNats")) continue;
+      this.#skipped.delete(record.id);
+      let deadline = Math.min(options.sampledAt, now) + MIRROR_FRESH_MS;
+      const owner = owners.get(record.ownerHostId);
+      if (owner && Number.isFinite(owner.expiresAt)) {
+        const ownerSampledAt = typeof owner.observedAt === "number" && Number.isFinite(owner.observedAt) ? owner.observedAt : now;
+        deadline = Math.min(deadline, owner.expiresAt, ownerSampledAt + MIRROR_FRESH_MS);
+      }
+      if (deadline <= now) continue;
+      claims.push({ record, until: monotonicNow + (deadline - now) });
+    }
+    return await this.writer.replace("actors", claims, options.complete);
   }
 
   /** Wake the bridge on another machine's presence or lease change. Own rows never wake it. */

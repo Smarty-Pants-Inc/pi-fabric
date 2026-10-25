@@ -7,8 +7,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BridgeChange } from "../src/mesh/change-notifier.js";
 import type { MeshStateEntry } from "../src/mesh/store.js";
 
-// Only scheduling is replaced: every capture, state fence, lease read, mirror repair and
-// held publication below uses the real SQLite MeshStore and real files in an owned temp root.
+// Scheduling is replaced; the coarse-tick cases additionally pin ONLY directory metadata.
+// Captures, file identities/bytes, readers, SQLite fences, mirror repair and held publication
+// all remain real in an owned temp root.
 const observation = vi.hoisted(() => ({
   notify: new Map<string, (kind: BridgeChange) => void>(),
   inputs: [] as string[],
@@ -22,6 +23,10 @@ vi.mock("../src/mesh/change-notifier.js", () => ({
 vi.mock("../src/topology/host-leases.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/topology/host-leases.js")>();
   return { ...actual, readHostLeases: vi.fn(actual.readHostLeases) };
+});
+vi.mock("../src/topology/participant-files.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/topology/participant-files.js")>();
+  return { ...actual, readParticipantFiles: vi.fn(actual.readParticipantFiles) };
 });
 // Observe the exact canonical bytes passed to SHA-256 without exporting a private snapshot
 // API or reproducing its implementation. Hashing itself is unchanged (including chained calls).
@@ -49,7 +54,7 @@ const { SqliteStateBackend } = await import("../src/mesh/state-backend.js");
 const { SqliteStateStore } = await import("../src/mesh/state-sqlite.js");
 const { hostLeasePath, readHostLease, readHostLeases, writeHostLease } = await import("../src/topology/host-leases.js");
 const { meshDirectoryStamp } = await import("../src/topology/publication-generation.js");
-const { writeParticipantFile } = await import("../src/topology/participant-files.js");
+const { readParticipantFiles, writeParticipantFile } = await import("../src/topology/participant-files.js");
 import type { BridgePresence } from "../src/mesh/bridge.js";
 
 const NOW = 1_800_000_000_000;
@@ -65,6 +70,7 @@ afterEach(() => {
   observation.notify.clear();
   observation.inputs.length = 0;
   vi.mocked(readHostLeases).mockClear();
+  vi.mocked(readParticipantFiles).mockClear();
 });
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 const claimed = (name: string): BridgePresence => {
@@ -106,8 +112,8 @@ const fixture = async () => {
   await side.mirror(direct);
   await new StoreBridgeSide(store, "other", () => NOW).mirror(relay);
   const changes: BridgeChange[] = [], failures: Error[] = [];
-  const subscribe = () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  const subscribe = (at?: number) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"], ...(at === undefined ? {} : { now: at }) });
     vi.spyOn(performance, "now").mockImplementation(() => Date.now());
     const unsubscribe = side.subscribeChanges(kind => changes.push(kind), error => failures.push(error));
     cleanup.push(unsubscribe);
@@ -130,7 +136,39 @@ const frames = () => {
     content: observation.inputs[index * 2]!, topology: observation.inputs[index * 2 + 1]!,
   }));
 };
-const clearInputs = () => { observation.inputs.length = 0; vi.mocked(readHostLeases).mockClear(); };
+const clearInputs = () => {
+  observation.inputs.length = 0;
+  vi.mocked(readHostLeases).mockClear();
+  vi.mocked(readParticipantFiles).mockClear();
+};
+const participantFile = async (f: Fixture) => {
+  const entry = f.store.get(key("participants", f.participant.id), { fresh: true })!;
+  await f.store.delete({ key: entry.key });
+  writeParticipantFile(f.root, entry);
+  return { entry, file: path.join(f.root, "participants", `${entry.key.slice(PREFIXES[1].length)}.json`) };
+};
+// Reproduce a POSIX coarse timestamp tick even on fine-timestamp kernels. Never mock a
+// leaf stat, listing, read, replacement, SQLite revision or fence. Keep size too: the
+// bridge stamp includes it, and a same-name rename need not change directory size.
+const coarseDirectories = (root: string, names: readonly string[], mtimeMs: number) => {
+  const realStat = fs.statSync;
+  const directories = new Map(names.map(name => {
+    const dir = path.join(root, name);
+    return [dir, { numeric: realStat(dir), bigint: realStat(dir, { bigint: true }) }] as const;
+  }));
+  return vi.spyOn(fs, "statSync").mockImplementation(((file: fs.PathLike, options?: fs.StatSyncOptions) => {
+    const stat = realStat(file, options);
+    const pinned = directories.get(String(file));
+    if (!pinned || !stat) return stat;
+    const base = options?.bigint ? pinned.bigint : pinned.numeric;
+    const time = options?.bigint ? BigInt(mtimeMs) : mtimeMs;
+    return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, {
+      dev: base.dev, ino: base.ino, size: base.size, mtimeMs: time, ctimeMs: time,
+      mtimeNs: BigInt(mtimeMs) * 1_000_000n, ctimeNs: BigInt(mtimeMs) * 1_000_000n,
+      mtime: new Date(mtimeMs), ctime: new Date(mtimeMs),
+    });
+  }) as typeof fs.statSync);
+};
 const measure = (f: Fixture) => {
   let fenced = false;
   const reads: Array<{ prefix: string; fresh: boolean; fenced: boolean }> = [];
@@ -236,7 +274,127 @@ describe("SQLite bridge snapshot reuse is fence-validated", () => {
     ]));
     expect(f.changes.splice(0)).toEqual(["presence"]);
     m.expectAttempts([], { ranges: { [PREFIXES[1]]: [false, false, false], [PREFIXES[2]]: [false] },
-      leaseReads: 2, hashes: 6 });
+      leaseReads: 7, hashes: 6 });
+  });
+
+  // Windows includes leaf stamps in meshDirectoryStamp; this unchanged-directory-stamp
+  // regression is specifically the POSIX coarse-timestamp path, not a mocked file system.
+  it.skipIf(process.platform === "win32").each(["participants", "host-leases"] as const)(
+    "sees a real same-tick %s rename-replace despite an unchanged coarse directory stamp", async directory => {
+      const f = await fixture();
+      const participant = directory === "participants" ? await participantFile(f) : undefined;
+      const file = participant?.file ?? hostLeasePath(f.root, f.host.id);
+      coarseDirectories(f.root, [directory], NOW);
+      clearInputs();
+      f.subscribe(NOW + 25); // The accepted reader/listing is INSIDE the directory's 100 ms tick.
+      const baseline = frames().at(-1)!;
+      const firstParticipant = vi.mocked(readParticipantFiles).mock.results.at(-1)!.value;
+      const firstLease = vi.mocked(readHostLeases).mock.results.at(-1)!.value.get(f.host.id);
+      const revision = f.store.stateRevision();
+      const stamp = meshDirectoryStamp(f.root, directory);
+      const before = fs.statSync(file, { bigint: true });
+      const listings = vi.spyOn(fs, "readdirSync");
+      if (participant) writeParticipantFile(f.root, { ...participant.entry,
+        value: { ...f.participant, status: "running" } });
+      else f.renew(NOW + 90_000);
+      expect(Date.now()).toBe(NOW + 25); // Both real file versions occupy the SAME coarse tick.
+      expect(fs.statSync(file, { bigint: true }).ino).not.toBe(before.ino);
+      expect(meshDirectoryStamp(f.root, directory)).toBe(stamp);
+      expect(f.store.stateRevision()).toBe(revision);
+      clearInputs();
+      const m = measure(f);
+      await f.fire(); // Now >100 ms old: a guard based on current age alone is NOT sufficient.
+      const latest = frames().at(-1);
+      if (participant) {
+        expect(latest && JSON.parse(latest.content).native.participants[0].status).toBe("running");
+        expect(f.changes).toEqual(["presence"]);
+        const parsed = vi.mocked(readParticipantFiles).mock.results.at(-1)!.value;
+        expect(parsed).not.toBe(firstParticipant);
+        expect(parsed[0].value).toMatchObject({ status: "running" });
+      } else {
+        expect(latest && JSON.parse(latest.content).native.hosts[0].expiresAt).toBe(NOW + 90_000);
+        expect(latest!.topology).toBe(baseline.topology);
+        expect(f.changes).toEqual(["lease"]);
+        const parsed = vi.mocked(readHostLeases).mock.results.at(-1)!.value.get(f.host.id);
+        expect(parsed).not.toBe(firstLease);
+        expect(parsed).toMatchObject({ expiresAt: NOW + 90_000 });
+      }
+      // Trace the REAL reader's known.scannedAt/listedAt guard: although its directory
+      // metadata matched and the scan is now outside the tick, it must list again because
+      // its previous accepted listing was within the tick. No direct reader warmed it.
+      expect(listings.mock.calls.filter(([dir]) => String(dir) === path.join(f.root, directory))).toHaveLength(1);
+      expect(m.validations()).toEqual([true]);
+      expect(m.fences).toHaveBeenCalledTimes(1);
+      m.expectAttempts([], { ranges: {}, leaseReads: 1, hashes: 1 });
+    },
+  );
+
+  it.skipIf(process.platform === "win32")("sees a real in-place lease rewrite with unchanged directory stamp and file inode", async () => {
+    const f = await fixture();
+    f.subscribe();
+    const baseline = frames().at(-1)!;
+    const file = hostLeasePath(f.root, f.host.id);
+    const before = fs.statSync(file, { bigint: true });
+    const stamp = meshDirectoryStamp(f.root, "host-leases");
+    const revision = f.store.stateRevision();
+    const lease = JSON.parse(fs.readFileSync(file, "utf8"));
+    // No rename and NO metadata mock: a changed length guarantees an own-file cache miss
+    // even on coarse timestamp kernels, while the parent directory really stays unchanged.
+    fs.writeFileSync(file, JSON.stringify({ ...lease, updatedAt: NOW + 30_000, expiresAt: NOW + 90_000 }, null, 2));
+    const after = fs.statSync(file, { bigint: true });
+    expect(after.ino).toBe(before.ino);
+    expect(after.size).not.toBe(before.size);
+    expect(meshDirectoryStamp(f.root, "host-leases")).toBe(stamp);
+    expect(f.store.stateRevision()).toBe(revision);
+    clearInputs();
+    const stats = vi.spyOn(fs, "statSync");
+    const m = measure(f);
+    await f.fire();
+    const latest = frames().at(-1);
+    expect(latest && JSON.parse(latest.content).native.hosts[0].expiresAt).toBe(NOW + 90_000);
+    expect(latest!.topology).toBe(baseline.topology);
+    expect(f.changes).toEqual(["lease"]);
+    expect(vi.mocked(readHostLeases).mock.results.at(-1)!.value.get(f.host.id)).toMatchObject({ expiresAt: NOW + 90_000 });
+    expect(stats.mock.calls.some(([name]) => String(name) === file)).toBe(true);
+    expect(m.validations()).toEqual([true]);
+    expect(m.fences).toHaveBeenCalledTimes(1);
+    m.expectAttempts([], { ranges: {}, leaseReads: 1, hashes: 1 });
+  });
+
+  it.skipIf(process.platform === "win32")("reuses quiet parsed values and projection hashes after DIR_TICK_MS but still stats every lease", async () => {
+    const f = await fixture();
+    const participant = await participantFile(f);
+    const stats = coarseDirectories(f.root, ["participants", "host-leases"], NOW - 1_000);
+    f.subscribe(NOW); // Both REAL readers accept a listing safely outside the 100 ms tick.
+    const initialLeases = vi.mocked(readHostLeases).mock.results.at(-1)!.value;
+    const initialParticipants = vi.mocked(readParticipantFiles).mock.results.at(-1)!.value;
+    const leaseFiles = [...initialLeases.keys()].map(id => hostLeasePath(f.root, id));
+    expect(leaseFiles).toHaveLength(3); // native, directly mirrored, and relayed authority
+    expect(initialParticipants[0].value).toEqual(f.participant);
+    const stamps = ["participants", "host-leases"].map(dir => meshDirectoryStamp(f.root, dir));
+    clearInputs();
+    stats.mockClear();
+    const listings = vi.spyOn(fs, "readdirSync");
+    const opens = vi.spyOn(fs, "readFileSync");
+    const m = measure(f);
+    await f.fire();
+    await f.fire();
+    expect(f.changes).toEqual([]);
+    expect(["participants", "host-leases"].map(dir => meshDirectoryStamp(f.root, dir))).toEqual(stamps);
+    // Mandatory own-file freshness survives the quiet-directory fast path. The real
+    // lease reader reuses each parsed lease object, not an unvalidated whole-map cache.
+    expect(vi.mocked(readHostLeases).mock.results).toHaveLength(2);
+    for (const result of vi.mocked(readHostLeases).mock.results) {
+      for (const [id, lease] of initialLeases) expect(result.value.get(id)).toBe(lease);
+    }
+    for (const file of leaseFiles) expect(stats.mock.calls.filter(([name]) => String(name) === file)).toHaveLength(2);
+    for (const result of vi.mocked(readParticipantFiles).mock.results) expect(result.value).toBe(initialParticipants);
+    const topologyFiles = [participant.file, ...leaseFiles];
+    expect(opens.mock.calls.filter(([name]) => topologyFiles.includes(String(name)))).toEqual([]);
+    expect(listings.mock.calls.filter(([dir]) => ["participants", "host-leases"].some(name => String(dir) === path.join(f.root, name)))).toEqual([]);
+    expect(m.validations()).toEqual([true, true]);
+    expect(m.fences).toHaveBeenCalledTimes(2);
+    m.expectAttempts([], { ranges: {}, leaseReads: 2, hashes: 0 });
   });
 
   it("rejects two obsolete SQLite captures and accepts only the fenced third", async () => {
@@ -273,7 +431,7 @@ describe("SQLite bridge snapshot reuse is fence-validated", () => {
     expect(m.validations()).toEqual([false, false]);
     expect(m.revisions).toHaveBeenCalledTimes(3);
     expect(m.fences).toHaveBeenCalledTimes(3);
-    m.expectAttempts([], { ranges: { [PREFIXES[1]]: [false, false, true] }, leaseReads: 0, hashes: 3 });
+    m.expectAttempts([], { ranges: { [PREFIXES[1]]: [false, false, true] }, leaseReads: 3, hashes: 3 });
   });
 
   it.each(["participants", "host-leases"] as const)("rejects directory-only %s churn even when the state revision still proves unchanged", async directory => {
@@ -321,7 +479,7 @@ describe("SQLite bridge snapshot reuse is fence-validated", () => {
       expect(frames().at(-1)!.topology).toBe(baseline.topology);
       expect(f.changes).toEqual(["lease"]);
     }
-    m.expectAttempts([], { ranges: {}, leaseReads: directory === "host-leases" ? 3 : 0, hashes: 3 });
+    m.expectAttempts([], { ranges: {}, leaseReads: 3, hashes: 3 });
   });
 
   it.each(["hosts", "participants", "lease"] as const)("detects externally removed mirror %s and repairs real held authority", async removed => {

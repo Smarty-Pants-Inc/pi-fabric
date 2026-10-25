@@ -1123,13 +1123,29 @@ export class StoreBridgeSide implements BridgeSide {
       const entries = (prefix: string, known: readonly MeshStateEntry[] | undefined): readonly MeshStateEntry[] =>
         known && previous?.revision !== undefined && (unchanged || this.store.stateUnchangedSince(previous.revision, [prefix]))
           ? known : this.store.listAll(prefix, { fresh: true });
+      // Let the readers enforce directory-tick/platform freshness; leases also stat each file
+      // even when an aged directory is unchanged. Reuse arrays/maps only after a current read
+      // confirms the same cached entry objects, retaining quiet projection/hash reuse.
+      const participantFiles = (): readonly MeshStateEntry[] => {
+        const current = readParticipantFiles(this.store.root, { maxAgeMs: 0 });
+        if (!previous || previous.participantFiles.length !== current.length) return current;
+        for (let index = 0; index < current.length; index += 1) {
+          if (previous.participantFiles[index] !== current[index]) return current;
+        }
+        return previous.participantFiles;
+      };
+      const leases = (): ReadonlyMap<string, FabricHostLease> => {
+        const current = readHostLeases(this.store.root);
+        if (!previous || previous.leases.size !== current.size) return current;
+        for (const [id, lease] of current) if (previous.leases.get(id) !== lease) return current;
+        return previous.leases;
+      };
       const inputs: Inputs = { revision, ...stamps,
         hosts: entries(HOST_PREFIX, previous?.hosts),
         participants: entries(PARTICIPANT_PREFIX, previous?.participants),
         handoffs: entries(BRIDGE_HANDOFF_PREFIX, previous?.handoffs),
-        participantFiles: previous?.participantStamp === stamps.participantStamp ? previous.participantFiles
-          : readParticipantFiles(this.store.root, { maxAgeMs: 0 }),
-        leases: previous?.leaseStamp === stamps.leaseStamp ? previous.leases : readHostLeases(this.store.root),
+        participantFiles: participantFiles(),
+        leases: leases(),
       };
       const at = this.now();
       // Reused rows/files can cross an expiry without a write. Rebuild on the next hint

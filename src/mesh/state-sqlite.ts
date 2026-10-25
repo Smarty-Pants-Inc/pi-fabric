@@ -1997,6 +1997,10 @@ export class SqliteStateStore {
     if (tx.grew && tx.stateBytes + ENVELOPE_BYTES > this.#maxStateBytes) {
       throw new Error(`Fabric mesh state exceeds ${this.#maxStateBytes} bytes`);
     }
+    // changesSince/changesOldest rely on commit_no being nondecreasing as seq grows. This writer
+    // appends at commit+1; state-projector's transactional #finish does likewise, while
+    // backend-migration.replaceState deletes the feed before reinserting one commit. changeTrim
+    // removes whole front commits only.
     const commit = tx.commit + 1;
     this.#sql.metaSet.run(tx.highWater, "high_water");
     this.#sql.metaSet.run(commit, "commit_no");

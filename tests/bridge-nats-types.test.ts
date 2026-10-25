@@ -92,7 +92,8 @@ describe("bridge-nats contract ids", () => {
     expect(bridgeNatsDestinationClass({ kind: "actor", side: "file" })).toBe("fileParticipant");
     expect(bridgeNatsDestinationClass({ kind: "actor", side: "nats" })).toBe("refused");
     expect(BRIDGE_NATS_CLASS_RECEIVE).toEqual({ seat: ["followUp", "cancel"], movedLead: ["followUp", "steer", "ask", "cancel"],
-      fileParticipant: ["followUp", "steer", "ask", "cancel"], refused: [] });
+      fileParticipant: ["followUp", "steer", "ask", "cancel"], spokeRoot: ["followUp", "steer", "ask", "cancel"], refused: [] });
+    expect(bridgeNatsDestinationClass({ kind: "root", side: "file", viaSpoke: "ryzen2" })).toBe("spokeRoot");
     expect(BRIDGE_NATS_CLASS_RECEIVE.seat).toBe(BRIDGE_NATS_SEAT_RECEIVE);
     expect(Object.isFrozen(BRIDGE_NATS_CLASS_RECEIVE) && Object.isFrozen(BRIDGE_NATS_CLASS_RECEIVE.movedLead)).toBe(true);
   });

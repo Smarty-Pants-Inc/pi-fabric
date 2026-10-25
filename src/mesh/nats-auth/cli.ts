@@ -31,8 +31,10 @@ const USAGE = [
   "  send --to <id> --kind <followUp|steer> (--text <text>|--text-file <file>) ...",
   "       [--name <host-name>] [--await-reply-seconds <seconds>] [--org <org>] [--path-b-machines <csv>]",
   "  dispatch --run-id <runId> --task-file <f> --out <burst.jsonl> --creds --ca --servers --machine --org ...",
+  "  owner --session <uuid|session:uuid> --creds --ca --servers --machine [--org] [--path-b-machines] [--mesh <dir>]",
+  "       read-only ownership receipt: the session's NATS presence/lease owner and file-side handoff, as JSON",
   "",
-  "send and dispatch use org NATS policy from PI_FABRIC_MESH_NATS or the PI_FABRIC_NATS_* policy variables.",
+  "send, dispatch and owner use org NATS policy from PI_FABRIC_MESH_NATS or the PI_FABRIC_NATS_* policy variables.",
   "Input: one JSON object on stdin for mint/config. <dir> is an absolute path to a new directory; <file> an absolute path to a new file.",
 ].join("\n");
 
@@ -304,6 +306,7 @@ function reason(error: unknown): string {
 export async function runNatsCli(argv: string[]): Promise<number> {
   if (argv[0] === "send") return (await import("./send-cli.js")).runNatsSendCli(argv.slice(1));
   if (argv[0] === "dispatch") return (await import("./dispatch-cli.js")).runNatsDispatchCli(argv.slice(1));
+  if (argv[0] === "owner") return (await import("./owner-cli.js")).runNatsOwnerCli(argv.slice(1));
   if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help")) {
     process.stdout.write(`${USAGE}\n`);
     return 0;

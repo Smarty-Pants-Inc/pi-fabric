@@ -302,6 +302,45 @@ describe("session pending CLI recorded-state inventory", () => {
     expect(settled.code).toBe(0); expect(settled.value.actors.map((entry: { id: string }) => entry.id)).toEqual([ID]);
   });
 
+  it("refuses when a foreign route is rewritten to this root during the scan, and retries a foreign route replaced mid-read", async () => {
+    const mesh = fixture(); const project = path.join(mesh, "actors");
+    fs.mkdirSync(project, { recursive: true });
+    const routeFile = path.join(mesh, "main-followups", "routes", `${"e".repeat(64)}.json`);
+    const foreignRoute = { oldRoot: `session:${OTHER}`, newRoot: "session:dead-root", messageId: "m-2" };
+    json(routeFile, foreignRoute);
+    const replace = (value: unknown) => { const temp = `${routeFile}.tmp`; fs.writeFileSync(temp, JSON.stringify(value)); fs.renameSync(temp, routeFile); };
+    // J2: another session atomically replaces its own route while this read is in progress.
+    const realRead = fs.readFileSync;
+    let replaced = false;
+    const readSpy = vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      const bytes = (realRead as (...args: unknown[]) => unknown)(target, ...rest);
+      if (!replaced && typeof target === "number") {
+        try { if (fs.readlinkSync(`/proc/self/fd/${target}`) === routeFile) { replaced = true; replace({ ...foreignRoute, done: true }); } } catch { /* not linux */ }
+      }
+      return bytes;
+    }) as typeof fs.readFileSync);
+    let busy;
+    try { busy = await run([SESSION, "--mesh", mesh]); } finally { readSpy.mockRestore(); }
+    if (process.platform === "linux") expect(replaced).toBe(true);
+    expect(busy.code, JSON.stringify(busy.value?.unknown)).toBe(0); expect(busy.value.routing).toMatchObject({ routes: 0 });
+    // J1: after the first route read, the reroute to the dead root's successor names this root.
+    const realReaddir = fs.readdirSync;
+    let fired = false;
+    const listSpy = vi.spyOn(fs, "readdirSync").mockImplementation(((dir: fs.PathLike, ...rest: unknown[]) => {
+      const listing = (realReaddir as (...args: unknown[]) => unknown)(dir, ...rest);
+      if (!fired && String(dir) === project) { fired = true; replace({ ...foreignRoute, newRoot: ROOT }); }
+      return listing;
+    }) as typeof fs.readdirSync);
+    let moved;
+    try { moved = await run([SESSION, "--mesh", mesh]); } finally { listSpy.mockRestore(); }
+    expect(fired).toBe(true);
+    expect(moved.code).toBe(1);
+    expect(moved.value).toMatchObject({ complete: false, routing: { routes: null, unfinishedRoutes: null } });
+    // Settled, the route is counted as this root's unfinished route.
+    const settled = await run([SESSION, "--mesh", mesh]);
+    expect(settled.code).toBe(0); expect(settled.value.routing).toMatchObject({ routes: 1, unfinishedRoutes: 1 });
+  });
+
   it("is reachable as `pi-fabric session pending` through the standalone CLI entry", async () => {
     const mesh = fixture(); followUps(mesh, 2); const before = snapshot(mesh);
     const writes: string[] = [];

@@ -24,6 +24,30 @@ const time = (value: unknown): value is number => typeof value === "number" && N
 const absent = (error: unknown): boolean => (error as NodeJS.ErrnoException)?.code === "ENOENT";
 const signature = (stat: fs.BigIntStats): string => `${stat.dev}:${stat.ino}:${stat.mode}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
 
+/**
+ * Read one JSON file another session may atomically replace at any time, without change tracking:
+ * an absent file is `{ absent: true }`; a replacement during the read is retried; still unreadable
+ * or invalid after three tries is undefined (unknown).
+ */
+const quietJson = (file: string): { absent: true } | { absent: false; value: unknown } | undefined => {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let fd: number | undefined;
+    try {
+      const stat = fs.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+      if (!stat) return { absent: true };
+      if (!stat.isFile() || stat.size > BigInt(MAX_BYTES)) return undefined;
+      fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+      if (signature(fs.fstatSync(fd, { bigint: true })) !== signature(stat)) continue;
+      const value: unknown = JSON.parse(fs.readFileSync(fd, "utf8"));
+      if (signature(fs.fstatSync(fd, { bigint: true })) !== signature(stat)) continue;
+      return { absent: false, value };
+    } catch (error) {
+      if (absent(error)) return { absent: true };
+    } finally { if (fd !== undefined) fs.closeSync(fd); }
+  }
+  return undefined;
+};
+
 /** No store constructors, locks, recovery, or receipt acknowledgement: filesystem reads only. */
 class Observation {
   readonly unknown: string[] = [];
@@ -208,6 +232,7 @@ export const runSessionPendingCli = async (
     const routing: { successorRootId: string | null; routes: number | null; unfinishedRoutes: number | null } =
       { successorRootId: null, routes: null, unfinishedRoutes: null };
     let actorCoverage = true;
+    let verifyRoutes: (() => void) | undefined;
     const root = observation.quietNames(meshRoot);
     if (!root) {
       observation.problem(meshRoot, "missing or unreadable mesh root"); actorCoverage = false;
@@ -253,25 +278,45 @@ export const runSessionPendingCli = async (
         } else routing.successorRootId = value.newRoot as string | undefined ?? null;
       }
       const routeDirectory = path.join(meshRoot, "main-followups", "routes");
-      const routes = observation.quietNames(routeDirectory, true);
-      routing.routes = routing.unfinishedRoutes = 0;
-      let routesValid = routes !== undefined;
-      for (const name of routes ?? []) {
-        const file = path.join(routeDirectory, name);
-        const read = observation.json(file);
-        if (read.present === false) { observation.forget(file); continue; } // removed after the listing
-        const route = row(read.value);
-        if (route && route.oldRoot !== rootId && route.newRoot !== rootId) observation.forget(file); // another root's route
-        if (!/^[a-f0-9]{64}\.json$/.test(name) || !route || typeof route.oldRoot !== "string" ||
-            typeof route.messageId !== "string" || (route.newRoot !== undefined && typeof route.newRoot !== "string") ||
-            (route.done !== undefined && route.done !== true)) {
-          observation.problem(file, "unknown follow-up route shape"); routesValid = false; continue;
+      // Every session's reroutes share routes/, and a route can be rewritten to name this root
+      // (a pending reroute to a dead root's successor). Read them without change tracking, retrying
+      // an atomic replacement, keep only this root's, and read again after the rest of the
+      // inventory: any change to this root's set in between is a change, not a silent zero.
+      const readRoutes = (): Map<string, string> | undefined => {
+        const names = observation.quietNames(routeDirectory, true);
+        if (!names) return undefined;
+        const ours = new Map<string, string>();
+        for (const name of names) {
+          const file = path.join(routeDirectory, name);
+          const read = quietJson(file);
+          if (read === undefined) { observation.problem(file, "unreadable follow-up route"); return undefined; }
+          if (read.absent) continue; // removed after the listing
+          const route = row(read.value);
+          if (!/^[a-f0-9]{64}\.json$/.test(name) || !route || typeof route.oldRoot !== "string" ||
+              typeof route.messageId !== "string" || (route.newRoot !== undefined && typeof route.newRoot !== "string") ||
+              (route.done !== undefined && route.done !== true)) {
+            observation.problem(file, "unknown follow-up route shape"); return undefined;
+          }
+          if (route.oldRoot === rootId || route.newRoot === rootId) {
+            ours.set(name, JSON.stringify([route.oldRoot, route.newRoot ?? null, route.messageId, route.done === true]));
+          }
         }
-        if (route.oldRoot === rootId || route.newRoot === rootId) {
-          routing.routes!++; if (!route.done) routing.unfinishedRoutes!++;
-        }
+        return ours;
+      };
+      const firstRoutes = readRoutes();
+      if (firstRoutes) {
+        routing.routes = firstRoutes.size;
+        routing.unfinishedRoutes = [...firstRoutes.values()].filter(route => !(JSON.parse(route) as unknown[])[3]).length;
       }
-      if (!routesValid) routing.routes = routing.unfinishedRoutes = null;
+      verifyRoutes = () => {
+        if (!firstRoutes) return;
+        const again = readRoutes();
+        if (!again) { routing.routes = routing.unfinishedRoutes = null; return; }
+        if (again.size !== firstRoutes.size || [...again].some(([name, route]) => firstRoutes.get(name) !== route)) {
+          observation.problem(routeDirectory, "this root's follow-up routes changed during inventory; retry with writers quiesced");
+          routing.routes = routing.unfinishedRoutes = null;
+        }
+      };
       const actorRoot = path.join(meshRoot, "actors");
       const names = observation.quietNames(actorRoot, true);
       if (!names) actorCoverage = false;
@@ -359,6 +404,7 @@ export const runSessionPendingCli = async (
         }
       }
     }
+    verifyRoutes?.();
     observation.verify();
     const complete = observation.unknown.length === 0;
     const sum = (key: "queued" | "inFlight" | "settledWindows" | "pendingDeliveryOutcomes" | "childCompletionEntries"): number | null =>

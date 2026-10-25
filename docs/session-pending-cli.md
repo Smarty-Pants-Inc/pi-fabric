@@ -70,7 +70,9 @@ Unknown/repeated flags, extra arguments, and non-UUID sessions are usage errors.
 No store constructors, lock creation, mkdir, repairs, migrations, acknowledgments,
 rewrites, or deletion. Symlink state files/namespaces are refused. Observed
 metadata of this root's state is checked again for changes: its journal, owner
-and successor files, its routes, its own and owning registries, its actors'
+and successor files, its routes (all routes are read twice, retrying a file
+replaced mid-read; any change to the set naming this root refuses), its own and
+owning registries, its actors'
 directories and queues, and this root's checkpoint paths in every other actor
 directory. Shared namespaces (the mesh root, `main-followups/`, `routes/`,
 `actors/` and other sessions' registries) are listed without change tracking,

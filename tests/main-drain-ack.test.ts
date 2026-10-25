@@ -109,7 +109,7 @@ class Endpoint implements FabricTransport {
     if (!destination) throw new TransportUnavailableError("Fixture destination absent");
     const createdAt = Date.now();
     const body = typeof envelope.body === "function" ? (envelope.body as (at: number) => T)(createdAt) : envelope.body;
-    const resolved = JSON.parse(JSON.stringify({ ...envelope, body, createdAt })) as TransportEnvelope<T>;
+    const resolved = JSON.parse(JSON.stringify({ ...envelope, body, createdAt })) as TransportEnvelope<T> & { body: T; createdAt: number };
     const sequence = ++this.carrier.sequence;
     destination.push({ payload: resolved as unknown as TransportEnvelope, sourceMachine: this.self.machine, verification: "bridge",
       attempt: 1, sequence, working() {}, async ack() {}, nak() {}, async term() {} });

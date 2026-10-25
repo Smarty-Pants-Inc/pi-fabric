@@ -315,6 +315,60 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
     }
   }, 60_000);
 
+  // smarty-dev#15310 D3: a seat move must not leave one session registered on two machines.
+  // Each Main has its own project/mesh root, as on two hosts; only the broker is shared.
+  it("refuses a second machine's Main for a session that is live on another machine, then admits it after that lease lapses", async () => {
+    for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
+    vi.stubEnv("SMARTY_AGENT", undefined);
+    const rootA = fs.mkdtempSync(path.join(os.tmpdir(), "presence-seat-a-"));
+    const rootB = fs.mkdtempSync(path.join(os.tmpdir(), "presence-seat-b-"));
+    const sessionId = "15310aaa-bbbb-4000-8000-000000000001", id = `session:${sessionId}`;
+    const at = (root: string) => { vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent")); vi.stubEnv("PI_FABRIC_PROJECT_ROOT", root); };
+    const owner = main(rootA, sessionId, "seat-owner");
+    const moved = main(rootB, sessionId, "seat-owner");
+    const sender = main(rootB, "15310bbb-bbbb-4000-8000-000000000002", "seat-sender");
+    let inspector: FabricTransport | undefined;
+    try {
+      inspector = await openFabricTransport({ config: configFor(rootA, "machine-a").mesh, hostId: "seat-inspector",
+        mesh: new MeshStore(path.join(rootA, "inspector"), 65_536, 1_000) });
+      at(rootA);
+      await owner.runtime.initialize(owner.context, configFor(rootA, "machine-a"));
+      at(rootB);
+      await sender.runtime.initialize(sender.context, configFor(rootB, "machine-b"));
+      await vi.waitFor(() => expect(sender.runtime.participantInfos().find(row => row.id === id)).toMatchObject({ stale: false, machine: "machine-a" }), { timeout: 3_000 });
+      const before = await inspector.kv("presence").get<FabricParticipantRecord>(key("machine-a", "p", id));
+      expect(before?.value).toMatchObject({ id, kind: "root", sessionId });
+      const refused: unknown = await moved.runtime.initialize(moved.context, configFor(rootB, "machine-b")).then(() => undefined, (error: unknown) => error);
+      expect(refused).toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE", participantId: id,
+        owners: [{ machine: "machine-a", ownerIncarnation: before!.value.ownerIncarnation, live: true }] });
+      expect(moved.runtime.initialized).toBe(false);
+      expect(await inspector.kv("presence").get(key("machine-b", "p", id)), "nothing registered on machine-b").toBeUndefined();
+      expect(await inspector.kv("presence").get(key("machine-a", "p", id))).toEqual(before);
+      // The live owner stays the only route: a real followUp reaches it, not the refused Main.
+      await expect(sender.invoke("agents.followUp", { id, message: "SEAT_OWNER_STILL_ROUTABLE" })).resolves.toMatchObject({ acknowledged: true });
+      await vi.waitFor(() => expect(JSON.stringify(owner.messages)).toContain("SEAT_OWNER_STILL_ROUTABLE"), { timeout: 3_000 });
+      expect(moved.messages).toEqual([]);
+      // Counterexample: once the old owner stopped and its broker lease expired, the move registers.
+      // Fixture deletes are record-only, so the refused Main's own machine-b lease must expire too.
+      const expiries = [key("machine-a", "h", id), key("machine-b", "h", id)].map(leaseKey => armLeaseGone(inspector!.kv("leases"), leaseKey));
+      await Promise.all(expiries.map(expiry => expiry.ready));
+      await moved.runtime.shutdown("exit");
+      await owner.runtime.shutdown("exit");
+      await Promise.all(expiries.map(expiry => expiry.gone));
+      const resumed = main(rootB, sessionId, "seat-owner");
+      try {
+        at(rootB);
+        await resumed.runtime.initialize(resumed.context, configFor(rootB, "machine-b"));
+        const registered = await inspector.kv("presence").get<FabricParticipantRecord>(key("machine-b", "p", id));
+        expect(registered?.value).toMatchObject({ id, kind: "root", sessionId });
+        expect(registered!.value.ownerIncarnation).not.toBe(before!.value.ownerIncarnation);
+      } finally { await resumed.runtime.shutdown("exit"); }
+    } finally {
+      await Promise.allSettled([sender.runtime.shutdown("exit"), moved.runtime.shutdown("exit"), owner.runtime.shutdown("exit")]);
+      await inspector?.close(); vi.unstubAllEnvs();
+    }
+  }, 60_000);
+
   it("real broker CAS admits exactly one concurrent own-root resumer and leaves the winner live", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "presence-broker-cas-"));
     const config = configFor(root, "machine-a");

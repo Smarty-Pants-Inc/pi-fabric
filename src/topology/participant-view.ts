@@ -45,6 +45,34 @@ export interface KvParticipantDirectoryOptions {
   onError?: (error: unknown) => void;
 }
 
+/**
+ * A new session-root presence registration was refused because another authenticated machine
+ * holds a live record for the same root id (smarty-dev#15310 D3). Nothing was written. Two
+ * machines presenting one id would leave it ambiguous and unroutable; the old owner must stop
+ * (or its lease must lapse) before the session can register here.
+ */
+export class PresenceOwnedElsewhereError extends Error {
+  readonly code = "FABRIC_PRESENCE_OWNED_ELSEWHERE";
+  readonly persisted = false;
+  readonly owners: readonly ParticipantRoute[];
+  constructor(readonly participantId: string, owners: readonly ParticipantRoute[]) {
+    super(`Participant ${participantId} is live on machine ${owners.map(owner => owner.machine).join(", ")}; refusing a second registration`);
+    this.owners = owners.map(owner => ({ ...owner, capabilities: [...owner.capabilities] }));
+  }
+}
+
+/** One authenticated machine's current record for an id, for read-only ownership receipts. */
+export interface ParticipantOwnerRecord extends ParticipantRoute {
+  readonly kind: FabricParticipantRecord["kind"];
+  readonly status: string;
+  readonly rootId: string;
+  readonly sessionId?: string;
+  readonly updatedAt: number;
+  readonly presenceRevision: number;
+  /** The machine's lease row for ownerHostId, when one is present and valid. */
+  readonly lease?: { readonly revision: number; readonly incarnation: string; readonly updatedAt: number; readonly expiresAt: number };
+}
+
 /** Only this exact admission revision may be rolled back; a later change is never deleted. */
 export interface KvPresencePublication {
   readonly key: string;
@@ -335,6 +363,60 @@ export class KvParticipantDirectory implements ParticipantView {
     return `${machineFromKey(entry.key, "p")!}.h.${tokenFor(entry.value.ownerHostId)}`;
   }
 
+  /** Every authenticated machine's current record for `id`, sorted by machine. Read-only. */
+  owners(participantId: string): ParticipantOwnerRecord[] {
+    this.#assertReady();
+    return [...this.#records.values()].filter(entry => entry.value.id === participantId).map(entry => {
+      const record = entry.value, route = this.#route(entry);
+      const host = this.#hosts.get(this.#hostKey(entry));
+      return {
+        ...route, kind: record.kind, status: record.status, rootId: record.rootId,
+        ...(record.sessionId === undefined ? {} : { sessionId: record.sessionId }),
+        updatedAt: record.updatedAt, presenceRevision: entry.revision,
+        ...(host && host.value.id === record.ownerHostId ? { lease: { revision: host.revision, incarnation: host.value.incarnation,
+          updatedAt: host.value.updatedAt, expiresAt: host.value.expiresAt } } : {}),
+      };
+    }).sort((a, b) => a.machine.localeCompare(b.machine));
+  }
+
+  /** Live records for `id` on OTHER authenticated machines, from the ready snapshot. */
+  #liveElsewhere(id: string): ParticipantRoute[] {
+    const self = this.options.transport.self.machine;
+    return [...this.#records.values()]
+      .filter(entry => entry.value.id === id && machineFromKey(entry.key, "p") !== self)
+      .map(entry => this.#route(entry)).filter(route => route.live);
+  }
+
+  /**
+   * A NEW registration of a session root (create or same-machine succession) first waits for
+   * both ready watches, then refuses while another machine holds a live record for that id. A
+   * view that cannot become ready refuses too: never register a root blind. Only roots are
+   * fenced: a root refusal fails that runtime's activation, while a refused child or actor row
+   * would stall the whole refresh pass for every other row. Refreshes of a row this view already
+   * owns are not registrations. KV has no cross-key transaction, so two first registrations
+   * racing on different machines can both pass; routing still treats that id as ambiguous
+   * (#entry) and resolves neither.
+   */
+  async #assertSoleRegistration(record: FabricParticipantRecord): Promise<void> {
+    if (record.kind !== "root") return;
+    const id = record.id;
+    if (!this.ready) {
+      const signal = this.#signal();
+      try { while (!this.ready) await this.whenChanged(id, signal); }
+      catch (error) {
+        if (errorCode(error) === "FABRIC_DIRECTORY_NOT_READY") throw error;
+        throw new DirectoryNotReadyError("Presence view is not ready; refusing an unchecked registration", { cause: error });
+      }
+    }
+    this.#refuseLiveElsewhere(record);
+  }
+
+  #refuseLiveElsewhere(record: FabricParticipantRecord): void {
+    if (record.kind !== "root") return;
+    const owners = this.#liveElsewhere(record.id);
+    if (owners.length) throw new PresenceOwnedElsewhereError(record.id, owners);
+  }
+
   #entry(id: string): TransportKvEntry<FabricParticipantRecord> | undefined {
     // The same id on multiple authenticated machines is ambiguous, never source authority.
     const matches = [...this.#records.values()].filter(entry => entry.value.id === id);
@@ -437,6 +519,8 @@ export class KvParticipantDirectory implements ParticipantView {
     return this.#serial(key, async () => {
       this.#assertWritable();
       if (this.#owned.has(key) || this.#pendingCleanup.has(key)) throw new TransportInvalidError("Presence admission already exists or needs cleanup");
+      await this.#assertSoleRegistration(copy);
+      this.#assertWritable();
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           const revision = await this.#presence.put(key, this.#owner(), copy, 0, this.#signal());
@@ -476,6 +560,10 @@ export class KvParticipantDirectory implements ParticipantView {
       this.#assertWritable();
       if (this.#pendingCleanup.has(key)) throw new TransportUnavailableError("Presence awaits uncertain admission cleanup");
       const owned = this.#owned.get(key);
+      if (!owned) {
+        await this.#assertSoleRegistration(copy);
+        this.#assertWritable();
+      }
       if (options.force) {
         // A verified broker reconnect invalidates the local freshness shortcut: read the
         // current KV revision and confirm an exact owner/value before refreshing it.
@@ -522,6 +610,7 @@ export class KvParticipantDirectory implements ParticipantView {
           throw new TransportUnavailableError("Current owner lease does not authorize presence succession");
         }
         this.#assertWritable(); // Reads may outlive the monotonic lease window.
+        this.#refuseLiveElsewhere(copy); // The watch may have seen another machine register during those reads.
         revision = await this.#update(key, copy, current.revision); // One CAS; never retry/adopt a lost revision.
         try {
           // KV has no cross-bucket transaction. Validate the exact lease revision

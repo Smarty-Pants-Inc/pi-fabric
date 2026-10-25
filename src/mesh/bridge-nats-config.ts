@@ -70,6 +70,12 @@ export interface NatsLinkConfig {
    * remoteHost = link. `natsLinkAllowListConfig` gives the normalized list for L3's gate.
    */
   readonly allow: BridgeNatsAllowSection;
+  /**
+   * PR 2 relay: the hub's spoke links (the `--remote` names of its `mesh-bridge run` links to work hosts). An
+   * `allow.file` root with `viaSpoke` must name one; with none, no spoke root is accepted. The parser always
+   * sets it (default empty); a hand-built config may leave it out.
+   */
+  readonly relay?: { readonly spokes: readonly string[] };
   /** Absolute path of the org.json whose principal seats pin the allow-list; absent = bridgeNatsOrgJsonCandidates(). */
   readonly orgJson?: string;
   /** Deadline of each call to the NATS side, ms (default 30,000). */
@@ -174,7 +180,7 @@ const server = (value: unknown): boolean => {
  */
 export const parseNatsLinkConfig = (value: unknown): NatsLinkConfig => {
   const root = object(value, "config",
-    ["version", "name", "link", "file", "stateDir", "nats", "allow", "orgJson", "callTimeoutMs", "logLevel"],
+    ["version", "name", "link", "file", "stateDir", "nats", "allow", "relay", "orgJson", "callTimeoutMs", "logLevel"],
     ["version", "name", "link", "file", "stateDir", "nats"]);
   if (root.version !== NATS_LINK_CONFIG_VERSION) throw new NatsLinkConfigError("version", `must be ${NATS_LINK_CONFIG_VERSION}`);
   if (!full(BRIDGE_NAME, root.name)) throw new NatsLinkConfigError("name", "must be a bridge name ([A-Za-z0-9][A-Za-z0-9._-]{0,62})");
@@ -233,9 +239,16 @@ export const parseNatsLinkConfig = (value: unknown): NatsLinkConfig => {
     throw new NatsLinkConfigError("nats.operatorMachine", "must match fabric-ops(-<lowercase alphanumeric>)");
   }
 
+  // PR 2 relay: the hub's spoke links (their `mesh-bridge run --remote` names). A viaSpoke root must name one.
+  const relay = root.relay === undefined ? {} : object(root.relay, "relay", ["spokes"], []);
+  const spokes = relay.spokes === undefined ? [] : relay.spokes;
+  if (!Array.isArray(spokes) || spokes.length > 64 || new Set(spokes).size !== spokes.length ||
+    !spokes.every((spoke) => full(BRIDGE_NAME, spoke) && spoke !== root.link && spoke !== root.name)) {
+    throw new NatsLinkConfigError("relay.spokes", "must be at most 64 distinct bridge link names other than name and link");
+  }
   let parsed: BridgeNatsAllowListConfig;
   try {
-    parsed = parseBridgeNatsAllowSection(root.allow, { link: root.link, natsMachine: nats.machine });
+    parsed = parseBridgeNatsAllowSection(root.allow, { link: root.link, natsMachine: nats.machine, spokes: spokes as string[] });
   } catch (error) {
     if (!(error instanceof BridgeNatsAllowListError)) throw error;
     throw new NatsLinkConfigError(error.field, error.message.slice(error.field.length + 1));
@@ -248,8 +261,7 @@ export const parseNatsLinkConfig = (value: unknown): NatsLinkConfig => {
     }
   });
   // N4 (PR 2): a NATS entry's republishTopics are read from the org's event stream, which needs nats.events.
-  if (!events && parsed.entries.some((entry) => entry.side === "nats" &&
-    ((entry as unknown as { republishTopics?: unknown[] }).republishTopics?.length ?? 0) > 0)) {
+  if (!events && parsed.entries.some((entry) => entry.side === "nats" && entry.kind === "root" && (entry.republishTopics?.length ?? 0) > 0)) {
     throw new NatsLinkConfigError("nats.events", "must be true when an allow.nats entry lists republishTopics");
   }
   const orgJson = root.orgJson === undefined ? undefined : absolutePath(root.orgJson, "orgJson");
@@ -280,6 +292,7 @@ export const parseNatsLinkConfig = (value: unknown): NatsLinkConfig => {
       inboxLanes: integer(nats.inboxLanes, "nats.inboxLanes", 8, 1, 64),
     },
     allow,
+    relay: { spokes: Object.freeze([...spokes] as string[]) },
     ...(orgJson === undefined ? {} : { orgJson }),
     callTimeoutMs: integer(root.callTimeoutMs, "callTimeoutMs", 30_000, 1_000, 300_000),
     logLevel,
@@ -295,8 +308,8 @@ const deepFreeze = <T>(value: T): T => {
 };
 
 /** The normalized, frozen allow-list L3's identity gate takes (createBridgeNatsIdentityGate), from the config's section. */
-export const natsLinkAllowListConfig = (config: Pick<NatsLinkConfig, "allow" | "link" | "nats">): BridgeNatsAllowListConfig =>
-  parseBridgeNatsAllowSection(config.allow, { link: config.link, natsMachine: config.nats.machine });
+export const natsLinkAllowListConfig = (config: Pick<NatsLinkConfig, "allow" | "link" | "nats" | "relay">): BridgeNatsAllowListConfig =>
+  parseBridgeNatsAllowSection(config.allow, { link: config.link, natsMachine: config.nats.machine, spokes: config.relay?.spokes ?? [] });
 
 const euid = (): number | undefined => process.geteuid?.();
 
@@ -430,4 +443,5 @@ export const describeNatsLinkConfig = (config: NatsLinkConfig): Record<string, u
     file: natsLinkAllowListConfig(config).entries.filter((entry) => entry.side === "file").map(bridgeNatsAllowKey),
     nats: natsLinkAllowListConfig(config).entries.filter((entry) => entry.side === "nats").map(bridgeNatsAllowKey),
   },
+  relay: { spokes: config.relay?.spokes ?? [] },
 });

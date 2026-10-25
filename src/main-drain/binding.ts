@@ -177,12 +177,39 @@ export const proveHostBinding = (request: MainDrainBindingRequest, sessionId: st
   return { refusal: null, lock: identity, peerStartTime: startedBefore };
 };
 
+/** A pod binding is considered only by a Main whose own environment is a Kubernetes container. */
+export const podBindingAllowed = (environment: NodeJS.ProcessEnv = process.env): boolean =>
+  typeof environment.KUBERNETES_SERVICE_HOST === "string" && environment.KUBERNETES_SERVICE_HOST.length > 0;
+
+/** /proc/<pid>/stat fields 4 (ppid) and 22 (starttime); undefined when unreadable. */
+const procParentAndStart = (pid: number, procRoot: string): { ppid: string; start: string } | undefined => {
+  try {
+    const stat = fs.readFileSync(path.join(procRoot, String(pid), "stat"), "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const ppid = fields[1];
+    const start = fields[19];
+    return ppid && /^[0-9]+$/.test(ppid) && start && /^[0-9]+$/.test(start) ? { ppid, start } : undefined;
+  } catch { return undefined; }
+};
+
 /**
- * A pod binding carries no lock: inside the Pod any same-UID process (the Main's own tools included) could
- * present one. Until a trusted pod-identity and caller proof exists (stage 1 review finding 1), pod bindings
- * are REFUSED. `unproven` is a test-only override; production never sets it. Even then, only a Main whose own
- * environment is a Kubernetes container honours one.
+ * The raw-Pod caller proof (stage 1 review finding 1; ruling 10-25). A pod binding carries no seat lock, so the
+ * caller must be a process the container runtime injected (kubectl exec), never one the Main or its tools forked:
+ * - its SO_PEERCRED uid is the Main's euid, and it is neither the Main nor the namespace's pid 1;
+ * - its PPid is 0, read before and after with an unchanged start time. Only a process whose parent is OUTSIDE the
+ *   Pod's PID namespace reads PPid 0. Every descendant of the Main has a parent inside it (an orphan reparents to
+ *   pid 1), and a PID-namespace init cannot CLONE_PARENT a sibling.
+ * Residuals: anyone with pods/exec RBAC on the Pod is authorized by design; a same-UID ptrace of the exec'd CLI
+ * (YAMA ptrace_scope 0) is the A6-class same-UID residual. Without SO_PEERCRED (no python3) this refuses.
  */
-export const POD_BINDING_PROOF = false;
-export const podBindingAllowed = (environment: NodeJS.ProcessEnv = process.env, unproven = false): boolean =>
-  (POD_BINDING_PROOF || unproven) && typeof environment.KUBERNETES_SERVICE_HOST === "string" && environment.KUBERNETES_SERVICE_HOST.length > 0;
+export const provePodCaller = (peer: { pid: number; uid: number } | undefined, uid: number, procRoot = "/proc",
+  self = process.pid): string | null => {
+  if (!peer || peer.uid !== uid || !Number.isSafeInteger(peer.pid) || peer.pid <= 0) return "PEER_UNVERIFIED";
+  if (peer.pid === self || peer.pid === 1) return "POD_CALLER_IS_MAIN";
+  const before = procParentAndStart(peer.pid, procRoot);
+  if (!before) return "PEER_UNVERIFIED";
+  if (before.ppid !== "0") return "POD_CALLER_NOT_EXEC";
+  const after = procParentAndStart(peer.pid, procRoot);
+  if (!after || after.start !== before.start || after.ppid !== "0") return "PEER_PID_REUSED";
+  return null;
+};

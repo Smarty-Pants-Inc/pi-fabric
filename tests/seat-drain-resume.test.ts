@@ -118,20 +118,38 @@ describe.skipIf(!linux)("the in-pod CLI half: pi-fabric session drain --exit aga
     return { code, stderr, line: stdout ? JSON.parse(stdout) as Record<string, any> : undefined };
   };
 
-  // Pod bindings stay refused in production until a trusted pod-identity proof exists (stage 1 review finding 1);
-  // these tests exercise the in-pod mechanics behind the test-only override.
-  it("pod bindings are refused without a trusted pod proof, even inside a Kubernetes container", async () => {
-    const seat = await createSeat(); seats.push(seat);
+  // The raw-Pod caller proof (review finding 1, ruling 10-25): only a process the runtime injected (kubectl exec)
+  // reads PPid 0 inside the Pod's PID namespace. The test stands in a fake /proc and a fixed SO_PEERCRED peer.
+  const EXEC_PID = 4242;
+  const podChannel = async (seat: Seat, ppid: string, peer: { pid: number; uid: number } | null = { pid: EXEC_PID, uid: process.getuid!() }) => {
+    const proc = path.join(seat.base, "proc", String(EXEC_PID));
+    fs.mkdirSync(proc, { recursive: true });
+    const fields = ["S", ppid, ...Array.from({ length: 17 }, () => "1"), "12345", "0"];
+    fs.writeFileSync(path.join(proc, "stat"), `${EXEC_PID} (node index.js) ${fields.join(" ")}\n`);
     seat.host.environment = { KUBERNETES_SERVICE_HOST: "10.0.0.1" };
-    const result = await cli(seat, exitArgs(seat));
-    expect(result).toMatchObject({ code: 1, line: { error: "MAIN_DRAIN_REFUSED_POD_BINDING_UNPROVEN" } });
+    seat.host.procRoot = path.join(seat.base, "proc");
+    await seat.server.close();
+    const { MainDrainServer } = await import("../src/main-drain/server.js");
+    seat.server = new MainDrainServer(seat.control, { peer: async () => peer ?? undefined });
+    expect(await seat.server.start()).toBe("listening");
+  };
+
+  it("refuses a pod binding from a process the Main forked (PPid not 0), from the Main itself, or without peer creds", async () => {
+    const seat = await createSeat(); seats.push(seat);
+    await podChannel(seat, "77");
+    expect(await cli(seat, exitArgs(seat))).toMatchObject({ code: 1, line: { error: "MAIN_DRAIN_REFUSED_POD_CALLER_NOT_EXEC" } });
+    await podChannel(seat, "0", { pid: process.pid, uid: process.getuid!() });
+    expect(await cli(seat, exitArgs(seat))).toMatchObject({ code: 1, line: { error: "MAIN_DRAIN_REFUSED_POD_CALLER_IS_MAIN" } });
+    await podChannel(seat, "0", null);
+    expect(await cli(seat, exitArgs(seat))).toMatchObject({ code: 1, line: { error: "MAIN_DRAIN_REFUSED_PEER_UNVERIFIED" } });
+    await podChannel(seat, "0", { pid: EXEC_PID, uid: process.getuid!() + 1 });
+    expect(await cli(seat, exitArgs(seat))).toMatchObject({ code: 1, line: { error: "MAIN_DRAIN_REFUSED_PEER_UNVERIFIED" } });
     expect(mainInboxDrainGate(ROOT)).toBeUndefined();
   });
 
   it("drains, then the Main accepts a clean exit and shuts down after its reply", async () => {
     const seat = await createSeat(); seats.push(seat);
-    seat.host.environment = { KUBERNETES_SERVICE_HOST: "10.0.0.1" };
-    seat.host.allowUnprovenPodBinding = true;
+    await podChannel(seat, "0");
     const result = await cli(seat, exitArgs(seat));
     expect(result.line).toMatchObject({ format: 1, sessionId: SID, op: "exit", drained: true, exiting: true, inputsFenced: true });
     expect(result.code).toBe(0);
@@ -139,18 +157,26 @@ describe.skipIf(!linux)("the in-pod CLI half: pi-fabric session drain --exit aga
     expect(seat.native.state.shutdown).toHaveBeenCalledTimes(1);
   });
 
-  it("a host Main (no Kubernetes env) refuses a pod binding", async () => {
+  it("a host Main (no Kubernetes env) refuses a pod binding, and a later op must carry the SAME pod UID", async () => {
     const seat = await createSeat(); seats.push(seat);
-    seat.host.allowUnprovenPodBinding = true;
-    const result = await cli(seat, exitArgs(seat));
-    expect(result).toMatchObject({ code: 1, line: { error: "MAIN_DRAIN_REFUSED_POD_BINDING_UNPROVEN" } });
+    await podChannel(seat, "0");
+    seat.host.environment = {};
+    expect(await cli(seat, exitArgs(seat))).toMatchObject({ code: 1, line: { error: "MAIN_DRAIN_REFUSED_POD_BINDING_OUTSIDE_POD" } });
+    seat.host.environment = { KUBERNETES_SERVICE_HOST: "10.0.0.1" };
+    const { callMainDrain, mainDrainSocket } = await import("../src/main-drain/client.js");
+    const socket = mainDrainSocket(seat.meshRoot, SID, process.getuid!());
+    const binding = { runDir: null, run: seat.run, runSha256: seat.runSha256, phase: "resume-drain" as const, operationId: seat.operationId,
+      generation: "a".repeat(32), lockFd: null, podUid: POD.uid };
+    await callMainDrain(socket, SID, "drain", binding);
+    await expect(callMainDrain(socket, SID, "undo", { ...binding, podUid: "00000000-0000-4000-8000-0000000000ac" }))
+      .rejects.toMatchObject({ code: "MAIN_DRAIN_REFUSED_DRAIN_BOUND_ELSEWHERE" });
+    await callMainDrain(socket, SID, "undo", binding);
     expect(mainInboxDrainGate(ROOT)).toBeUndefined();
   });
 
   it("a Pod Main that does not drain undoes itself and reports inputsFenced false; it never exits", async () => {
     const seat = await createSeat(); seats.push(seat);
-    seat.host.environment = { KUBERNETES_SERVICE_HOST: "10.0.0.1" };
-    seat.host.allowUnprovenPodBinding = true;
+    await podChannel(seat, "0");
     seat.writeJournal([{ id: "replayed-1" }]);
     const result = await cli(seat, exitArgs(seat));
     expect(result.line).toMatchObject({ op: "exit", drained: false, exiting: false, inputsFenced: false });

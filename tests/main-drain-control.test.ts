@@ -45,7 +45,7 @@ describe.skipIf(!linux)("owner-only drain control (M10)", () => {
     await expect(callMainDrain(socketOf(seat), SID, "drain", bindingFor(seat, { runSha256: "f".repeat(64) })))
       .rejects.toMatchObject({ code: "MAIN_DRAIN_REFUSED_RUN_SHA256_MISMATCH" });
     await expect(callMainDrain(socketOf(seat), SID, "drain", { ...bindingFor(seat), runDir: null, lockFd: null, podUid: "00000000-0000-4000-8000-0000000000ee" }))
-      .rejects.toMatchObject({ code: "MAIN_DRAIN_REFUSED_POD_BINDING_UNPROVEN" });
+      .rejects.toMatchObject({ code: "MAIN_DRAIN_REFUSED_POD_BINDING_OUTSIDE_POD" });
     const other = "00000000-0000-4000-8000-0000000000ef";
     await expect(callMainDrain(socketOf(seat), other, "status", null)).rejects.toMatchObject({ code: "MAIN_DRAIN_REFUSED_SESSION_MISMATCH" });
     expect(mainInboxDrainGate(ROOT)).toBeUndefined();

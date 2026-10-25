@@ -172,8 +172,8 @@ export class MainDrainServer {
       const request = newline <= MAIN_DRAIN_MAX_REQUEST_BYTES ? parseMainDrainRequest(buffer.subarray(0, newline).toString("utf8")) : undefined;
       if (!request) { this.#refuse(socket, null, "REQUEST_INVALID"); return; }
       if (request.sessionId !== this.control.host.sessionId) { this.#refuse(socket, request.op, "SESSION_MISMATCH"); return; }
-      // A host binding needs the caller's kernel identity (SO_PEERCRED) for its lock proof.
-      const peer = request.binding?.runDir ? (this.options.peer ?? peerCredentials)(socket) : Promise.resolve(undefined);
+      // Every binding needs the caller's kernel identity (SO_PEERCRED): the host lock proof and the pod caller proof.
+      const peer = request.binding ? (this.options.peer ?? peerCredentials)(socket) : Promise.resolve(undefined);
       // One op at a time, in arrival order: the fence and the actor stops never race.
       const run = this.#queue.then(async () => this.control.handle(request.op, request.binding, await peer.catch(() => undefined), uid));
       this.#queue = run.catch(() => undefined);

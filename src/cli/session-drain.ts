@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { callMainDrain, mainDrainSocket, MainDrainClientError } from "../main-drain/client.js";
 import type { MainDrainBindingRequest } from "../main-drain/binding.js";
@@ -64,8 +65,11 @@ export const runSessionDrainCli = async (
     const uid = io.uid ?? process.geteuid?.();
     if (uid === undefined) throw new MainDrainClientError("MAIN_DRAIN_UNSUPPORTED_PLATFORM");
     const socket = mainDrainSocket(mesh, sessionId, uid);
+    // The pod caller proof's named residual: a same-UID ptrace of this process is blocked only at YAMA ptrace_scope >= 1.
+    let ptraceScope: string | null = null;
+    try { ptraceScope = fs.readFileSync("/proc/sys/kernel/yama/ptrace_scope", "utf8").trim(); } catch { ptraceScope = null; }
     const emit = (value: Record<string, unknown>, ok: boolean): number => {
-      io.stdout.write(`${JSON.stringify({ format: 1, sessionId, ...value })}\n`);
+      io.stdout.write(`${JSON.stringify({ format: 1, sessionId, ptraceScope, ...value })}\n`);
       return ok ? 0 : 1;
     };
     if (mode === "--status" || mode === "--probe") {

@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { bindOrMatch, clearBinding, currentBinding, podBindingAllowed, proveHostBinding, sameOperation, type MainDrainBinding,
-  type MainDrainBindingRequest } from "./binding.js";
+import { bindOrMatch, clearBinding, currentBinding, podBindingAllowed, provePodCaller, proveHostBinding, sameOperation,
+  type MainDrainBinding, type MainDrainBindingRequest } from "./binding.js";
 import { assertMainInboxOpen, closeMainInbox, mainInboxDrainGate, reopenMainInbox } from "./gate.js";
 import { fenceNativeInput, nativeFenceHeld, observeNativeInput, releaseNativeInput, type NativeInputObservation } from "./native-port.js";
 import { drainSlot, peekDrainSlot } from "./slot.js";
@@ -18,10 +18,9 @@ export interface MainDrainHost {
   agents(): MainDrainAgents | undefined;
   /** The in-memory completion inbox's unconfirmed count (no residency); undefined when there is no inbox. */
   completions?(): number | undefined;
-  /** Tests only: the Main's own environment and /proc, and the unproven pod binding (refused in production). */
+  /** Tests only: the Main's own environment and /proc. */
   environment?: NodeJS.ProcessEnv;
   procRoot?: string;
-  allowUnprovenPodBinding?: boolean;
 }
 export interface MainDrainMain {
   drainSnapshot(): { held: number; handed: number; heldIds: string[]; handedIds: string[]; journalOpen: boolean; halted: boolean; reloading: boolean };
@@ -120,7 +119,11 @@ export class MainDrainControl {
     if (op === "drain" || op === "stop-actors" || op === "undo" || op === "exit") {
       if (!request) return "BINDING_REQUIRED";
       const kind = request.podUid === null ? "host" : "pod";
-      if (kind === "pod" && !podBindingAllowed(this.host.environment, this.host.allowUnprovenPodBinding === true)) return "POD_BINDING_UNPROVEN";
+      if (kind === "pod") {
+        if (!podBindingAllowed(this.host.environment)) return "POD_BINDING_OUTSIDE_POD";
+        const refusal = provePodCaller(peer, uid, this.host.procRoot);
+        if (refusal) return refusal;
+      }
       if (op === "exit" && kind !== "pod") return "EXIT_REQUIRES_POD_BINDING";
       let lock: { dev: string; ino: string } | null = null;
       if (kind === "host") {

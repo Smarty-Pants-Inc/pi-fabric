@@ -21,6 +21,7 @@ import type { FabricParticipantRecord } from "../src/topology/types.js";
 // Keep reason: smarty-dev#16723's recorded cross-repository return address and the
 // directory's lease/collision trust boundary. Real provider, resolver and on-disk directory;
 // no workers, native deletion or live fleet state. All fixtures stay in the isolated TMPDIR.
+// File-based launch authority requires POSIX ownership; explicit env metadata works everywhere.
 describe("#16723 projectAgent launch binding", () => {
   const roots: string[] = [];
   const directories: ParticipantDirectory[] = [];
@@ -45,7 +46,7 @@ describe("#16723 projectAgent launch binding", () => {
     const cwd = path.join(lane, "sub");
     fs.mkdirSync(cwd);
     if (binding === "marker") {
-      fs.mkdirSync(path.join(lane, ".local"));
+      fs.mkdirSync(path.join(lane, ".local"), { mode: 0o700 });
       fs.writeFileSync(path.join(lane, ".local", "lead"), `${leadId}\n`);
     }
     const mesh = new MeshStore(path.join(lane, "mesh"), 64 * 1024, 1_000);
@@ -103,15 +104,17 @@ describe("#16723 projectAgent launch binding", () => {
     code: "FABRIC_PROJECT_AGENT_UNRESOLVED", message: expect.stringContaining("is absent or stale"),
   };
 
-  it.each(["marker", "env"] as const)("resolves the exact same-repo then cross-repo recorded lead via %s", async binding => {
-    const f = await fixture(binding);
-    await f.publish(leadId);
-    await expect(f.call()).resolves.toMatchObject({ id: leadId });
-    await f.publish(leadId, { repository: "code.example/team/control" });
-    await expect(f.call()).resolves.toMatchObject({ id: leadId });
+  describe.each(["marker", "env"] as const)("recorded lead via %s", binding => {
+    it.skipIf(binding === "marker" && process.getuid === undefined)("resolves the exact same-repo then cross-repo recorded lead", async () => {
+      const f = await fixture(binding);
+      await f.publish(leadId);
+      await expect(f.call()).resolves.toMatchObject({ id: leadId });
+      await f.publish(leadId, { repository: "code.example/team/control" });
+      await expect(f.call()).resolves.toMatchObject({ id: leadId });
+    });
   });
 
-  it.each(["absent", "expired", "reloading"] as const)("refuses the %s recorded lead without falling back", async kind => {
+  it.skipIf(process.getuid === undefined).each(["absent", "expired", "reloading"] as const)("refuses the %s recorded lead without falling back", async kind => {
     const f = await fixture();
     if (kind === "expired") await f.publish(leadId, {}, Date.now() - 1);
     if (kind === "reloading") await f.publish(leadId, { status: "reloading", reloadUntil: Date.now() - 1 });
@@ -119,7 +122,7 @@ describe("#16723 projectAgent launch binding", () => {
     await expect(f.call()).rejects.toMatchObject(unavailable);
   });
 
-  it.each<Partial<FabricParticipantRecord>>([
+  it.skipIf(process.getuid === undefined).each<Partial<FabricParticipantRecord>>([
     { interactive: false }, { capabilities: ["fabric"] }, { capabilities: ["followUp"] }, { capabilities: ["steer"] },
   ])("refuses a present non-interactive recorded lead: %j", async patch => {
     const f = await fixture();
@@ -142,7 +145,7 @@ describe("#16723 projectAgent launch binding", () => {
     await expect(f.call()).resolves.toMatchObject({ id: otherId });
   });
 
-  it.each(["bridge", "source-lease"] as const)("accepts a cross-repo recorded mirror only while its %s is fresh", async kind => {
+  it.skipIf(process.getuid === undefined).each(["bridge", "source-lease"] as const)("accepts a cross-repo recorded mirror only while its %s is fresh", async kind => {
     const f = await fixture("marker", true);
     await f.publish(leadId, { repository: "code.example/team/control" });
     await expect(f.call()).resolves.toMatchObject({ id: leadId, remoteHost: "remote" });
@@ -153,7 +156,7 @@ describe("#16723 projectAgent launch binding", () => {
     await expect(f.call()).rejects.toMatchObject(unavailable);
   });
 
-  it("refuses a colliding recorded mirror instead of electing a native root", async () => {
+  it.skipIf(process.getuid === undefined)("refuses a colliding recorded mirror instead of electing a native root", async () => {
     const f = await fixture("marker", true);
     await f.publish(leadId, { repository: "code.example/team/control" });
     const identity: MeshIdentity = { id: "session:native-owner", name: "main", kind: "main" };

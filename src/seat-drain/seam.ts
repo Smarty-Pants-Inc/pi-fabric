@@ -204,9 +204,11 @@ const inventory = (context: Context): SessionPendingInventory | undefined => {
 
 /** B1's canary, through the SAME gate functions as live admission: every gate admits, nothing is bound, native is open. */
 const canary = (probe: MainDrainReply | undefined): { inboxOpen: boolean; inputsFenced: boolean } => {
+  // Every Fabric-gated row, the combined ones included, must admit through its Fabric half (re-review finding 2);
+  // the native half is judged by `inputsFenced` below.
   const inboxOpen = probe !== undefined && probe.binding === null && probe.inbox.closed === false &&
-    MAIN_DRAIN_INGRESS.filter(row => row.mechanism === "fabric-gate")
-      .every(row => probe.probes.some(entry => entry.path === row.path && entry.admits === true));
+    MAIN_DRAIN_INGRESS.filter(row => row.mechanism === "fabric-gate" || row.mechanism === "both")
+      .every(row => probe.probes.some(entry => entry.path === row.path && entry.mechanism === row.mechanism && entry.fabric === true));
   // A host without the fence capability can never have been fenced by this operation. A fence-capable host must
   // READ open: a missing context or unreadable state is unknown, so still fenced (stage 1 review finding 4).
   const inputsFenced = probe === undefined || (probe.native.capability !== false &&
@@ -397,10 +399,15 @@ const drain = async (context: Context): Promise<number> => {
   return refuse(context, reason, !undone.admissionRestored);
 };
 
+/** Any directory entry, a dangling symlink included: only ENOENT is absence (re-review finding 1). */
+const present = (file: string): boolean => {
+  try { return fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined; } catch { return true; }
+};
+
 /** The drain intent (absent: no drain reached its intent in this run). Its operationId must be the request's. */
 const readIntent = (context: Context): { generation: string } | undefined => {
   const file = path.join(context.runDir, INTENT);
-  if (!fs.existsSync(file)) return undefined;
+  if (!present(file)) return undefined;
   let value: Record<string, unknown>;
   try { value = JSON.parse(readOwned(file, context.uid, 1024 * 1024, { mode: 0o600 }, "intent-unreadable").toString("utf8")) as Record<string, unknown>; }
   catch { throw new SeamGap("intent-unreadable"); }
@@ -426,18 +433,38 @@ const verifyDrainReceipt = (context: Context, expected: string): "pass" | "refus
   const observed = value.observed as Record<string, unknown> | undefined;
   if (value.schema !== "d3-seam-receipt-v1" || value.run !== context.request.run || value.phase !== "drain" || value.owner !== OWNER ||
     (value.result !== "refused" && value.result !== "pass") || observed?.sessionId !== context.request.sessionId) throw new SeamGap("drain-receipt-invalid");
-  if (value.result === "pass" && fs.existsSync(path.join(context.runDir, "receipts", "fence.json"))) throw new SeamGap("drain-pass-after-fence");
+  if (value.result === "pass" && present(path.join(context.runDir, "receipts", "fence.json"))) throw new SeamGap("drain-pass-after-fence");
   return value.result;
+};
+
+/** A's stored `fence` receipt: this run, phase fence, owner factory-lead, a pass (re-review finding 3). */
+const verifyFenceReceipt = (context: Context): void => {
+  const bytes = readOwned(path.join(context.runDir, "receipts", "fence.json"), context.uid, 4 * 1024 * 1024, undefined, "fence-receipt-missing");
+  let value: Record<string, unknown>;
+  try { value = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>; } catch { throw new SeamGap("fence-receipt-invalid"); }
+  // A's own acceptance shape (seat.py run_seam): exactly these six keys, owner factory-lead (seat.py SEAMS).
+  if (typeof value !== "object" || value === null || Object.keys(value).sort().join(",") !== "observed,owner,phase,result,run,schema" ||
+    value.schema !== "d3-seam-receipt-v1" || value.run !== context.request.run || value.phase !== "fence" || value.owner !== "factory-lead" ||
+    value.result !== "pass" || typeof value.observed !== "object" || value.observed === null) throw new SeamGap("fence-receipt-invalid");
 };
 
 /** The drain outcome's records (absent: the drain never wrote one). */
 const drainOutcome = (context: Context): { dispositions: Array<{ id: string; disposition: string }>; stopped: string[]; result: string | null } | undefined => {
   const file = path.join(context.runDir, OUTCOME);
-  if (!fs.existsSync(file)) return undefined;
+  if (!present(file)) return undefined;
   let value: Record<string, unknown>;
   try { value = JSON.parse(readOwned(file, context.uid, 64 * 1024 * 1024, { mode: 0o600 }, "outcome-unreadable").toString("utf8")) as Record<string, unknown>; }
   catch { throw new SeamGap("outcome-unreadable"); }
-  if (value.operationId !== context.request.operationId || value.run !== context.request.run) throw new SeamGap("outcome-invalid");
+  if (value.schema !== "fabric-v2-drain-outcome-v2" || value.operationId !== context.request.operationId || value.run !== context.request.run ||
+    value.sessionId !== context.request.sessionId || value.owner !== OWNER || (value.result !== "pass" && value.result !== "refused")) {
+    throw new SeamGap("outcome-invalid");
+  }
+  // A passing outcome carries exactly the passing drain values (truthful results).
+  const observed = value.observed as Record<string, unknown> | undefined;
+  if (value.result === "pass" && !(observed?.sessionId === context.request.sessionId && observed.inputAdmission === 1 &&
+    observed.inputsFenced === true && observed.queued === 0 && observed.admitted === 0 && observed.childrenTerminal === true)) {
+    throw new SeamGap("outcome-invalid");
+  }
   const dispositions = Array.isArray(value.dispositions) ? value.dispositions as Array<{ id: string; disposition: string }> : [];
   const stopped = Array.isArray(value.stoppedActors) ? (value.stoppedActors as Array<{ id: string }>).map(entry => entry.id) : [];
   return { dispositions, stopped, result: typeof value.result === "string" ? value.result : null };
@@ -463,30 +490,35 @@ const drainUndo = async (context: Context): Promise<number> => {
   }
   const drainResult = sha !== null ? verifyDrainReceipt(context, sha) : undefined;
   // null: only the operator path, after a drain that left no receipt (contract rev 4 §2).
-  if (sha === null && fs.existsSync(path.join(context.runDir, "receipts", "drain.json"))) throw new SeamGap("drain-receipt-exists");
+  if (sha === null && present(path.join(context.runDir, "receipts", "drain.json"))) throw new SeamGap("drain-receipt-exists");
   const names = { intent: `fabric-v2-drain-undo-${attempt}-intent.json`, outcome: `fabric-v2-drain-undo-${attempt}-outcome.json` };
   // Idempotent per (operationId, phase, attempt): a finished attempt reprints its receipt; a crashed one is UNKNOWN.
-  if (fs.existsSync(path.join(context.runDir, names.outcome))) {
+  if (present(path.join(context.runDir, names.outcome))) {
     const done = JSON.parse(readOwned(path.join(context.runDir, names.outcome), context.uid, 64 * 1024 * 1024, { mode: 0o600 },
       "undo-outcome-unreadable").toString("utf8")) as Record<string, unknown>;
     if (done.operationId !== context.request.operationId || typeof done.receipt !== "string") throw new SeamGap("undo-outcome-invalid");
     context.io.stdout(done.receipt);
     return 0;
   }
-  if (fs.existsSync(path.join(context.runDir, names.intent))) throw new SeamGap("undo-attempt-unfinished");
+  if (present(path.join(context.runDir, names.intent))) throw new SeamGap("undo-attempt-unfinished");
   const main = ownerIdentity(context);
   // Attempts are contiguous (stage 1 review finding 8): n > 1 follows an UNKNOWN attempt n-1 (its intent without an
   // outcome), or a refused one followed by a PROVEN v1 restart (another owner pid or start time). Never after a pass.
   if ((attempt as number) > 1) {
     const previous = `fabric-v2-drain-undo-${(attempt as number) - 1}`;
-    if (!fs.existsSync(path.join(context.runDir, `${previous}-intent.json`))) throw new SeamGap("undo-attempt-out-of-order");
+    if (!present(path.join(context.runDir, `${previous}-intent.json`))) throw new SeamGap("undo-attempt-out-of-order");
     const prior = path.join(context.runDir, `${previous}-outcome.json`);
-    if (fs.existsSync(prior)) {
+    if (present(prior)) {
       const done = JSON.parse(readOwned(prior, context.uid, 64 * 1024 * 1024, { mode: 0o600 }, "undo-outcome-unreadable").toString("utf8")) as
         Record<string, unknown>;
       if (done.result === "pass") throw new SeamGap("undo-already-passed");
+      // Only a closed-set HANDLE-LOST refusal {inputsFenced: true, admissionRestored: false} is retried (contract rev 4
+      // N6 i), and only after a PROVEN restart: both owner records known and different.
+      const seen = done.observed as Record<string, unknown> | undefined;
+      if (done.result !== "refused" || seen?.inputsFenced !== true || seen.admissionRestored !== false) throw new SeamGap("undo-retry-not-handle-lost");
       const before = done.main as { pid?: unknown; processStartedAt?: unknown } | null | undefined;
-      if (!main || (before && before.pid === main.pid && before.processStartedAt === main.processStartedAt)) {
+      if (!main || !before || typeof before.pid !== "number" || typeof before.processStartedAt !== "string" ||
+        (before.pid === main.pid && before.processStartedAt === main.processStartedAt)) {
         throw new SeamGap("undo-retry-without-restart");
       }
     }
@@ -524,7 +556,7 @@ const recheck = (context: Context): number => {
   // Lineage (stage 1 review finding 5): this operation's drain intent, its PASSING outcome and A's fence receipt.
   if (!readIntent(context)) throw new SeamGap("intent-missing");
   if (drainOutcome(context)?.result !== "pass") throw new SeamGap("drain-not-passed");
-  if (!fs.existsSync(path.join(context.runDir, "receipts", "fence.json"))) throw new SeamGap("fence-receipt-missing");
+  verifyFenceReceipt(context);
   const intentSha256 = evidence(context, "fabric-v2-drain-recheck-intent.json", { schema: "fabric-v2-drain-recheck-intent-v1",
     measured: { meshRoot: context.meshRoot, startedAt: new Date().toISOString() } });
   // The in-process `pi-fabric session pending`: exit 0 is complete; exit 1 is complete:false; a throw is any other exit.
@@ -583,6 +615,10 @@ const resumeDrain = async (context: Context, sealed: SealedRun): Promise<number>
   await verifyKubeconfig(access, Math.min(30_000, remaining()));
   const before = await readPod(access, pod.name, Math.min(30_000, remaining()));
   if (before && before.uid !== pod.uid) throw new SeamGap("pod-uid-mismatch");
+  // The sealed run's target node (re-review finding 4): the raw Pod A created there, nowhere else.
+  const target = sealed.run.target as Record<string, unknown> | undefined;
+  if (typeof target?.node !== "string" || !target.node) throw new SeamGap("target-node-unpinned");
+  if (before && before.nodeName !== target.node) throw new SeamGap("pod-node-mismatch");
   const generation = randomBytes(16).toString("hex");
   const intentSha256 = evidence(context, "fabric-v2-resume-drain-intent.json", { schema: "fabric-v2-resume-drain-intent-v1", generation,
     podUid: pod.uid, requestSha256: context.requestSha256, measured: { kubectl: access.kubectl, server: access.server, before: before ?? null,
@@ -590,6 +626,8 @@ const resumeDrain = async (context: Context, sealed: SealedRun): Promise<number>
   const cli = context.deps.podCli ?? (POD_FABRIC_CLI.confirmed ? POD_FABRIC_CLI.path : null);
   let reason: string | null = null;
   let exec: Record<string, unknown> | undefined;
+  let execAttempted = false;
+  let execCode: number | null = null;
   if (!before) reason = "pod-unreadable";
   else if (!cli) reason = "pod-cli-unconfirmed";
   else if (!before.piRunning || !before.meshRoot) reason = before.piRunning ? "pod-mesh-root-unknown" : "pod-not-running";
@@ -597,30 +635,38 @@ const resumeDrain = async (context: Context, sealed: SealedRun): Promise<number>
     Math.min(30_000, remaining()))).code !== 0) reason = "pod-cli-missing";
   else {
     const deadlineS = Math.max(1, Math.min(540, Math.floor(remaining() / 1000) - 30));
+    execAttempted = true;
     const result = await kubectl(access, ["-n", access.namespace, "exec", pod.name, "-c", "pi", "--", cli, "session", "drain", request.sessionId,
       "--mesh", before.meshRoot, "--exit", "--pod-uid", pod.uid, "--run", request.run, "--run-sha256", request.runSha256,
       "--operation-id", request.operationId, "--generation", generation, "--deadline-s", String(deadlineS)], remaining());
+    execCode = result.code;
     const line = result.stdout.trim().split("\n").at(-1) ?? "";
     try { exec = JSON.parse(line) as Record<string, unknown>; } catch { exec = undefined; }
-    if (!exec || exec.format !== 1 || exec.sessionId !== request.sessionId) { reason = "pod-drain-unreadable"; exec = undefined; }
-    else if (exec.exiting !== true) reason = "pod-not-drained";
+    if (!exec || exec.format !== 1 || exec.sessionId !== request.sessionId || exec.op !== "exit") { reason = "pod-drain-unreadable"; exec = undefined; }
+    // The complete exit response, with a zero kubectl exit (re-review finding 5).
+    else if (result.code !== 0 || exec.drained !== true || exec.exiting !== true || exec.inputsFenced !== true) {
+      reason = exec.exiting === true ? "pod-exit-incomplete" : "pod-not-drained";
+    }
   }
-  // The pi container's own exit status, polled until it terminates or the bound ends; the UID must not change.
+  // After ANY attempted exec, re-read the Pod: the pi container's own exit status, polled until it terminates or the
+  // bound ends (only when it said it is exiting); the UID must not change.
   let after = before;
-  if (exec?.exiting === true) {
+  if (execAttempted) {
     for (;;) {
       after = await readPod(access, pod.name, Math.min(30_000, Math.max(1_000, remaining())));
-      if (!after || after.piTerminated || remaining() <= 2_000) break;
+      if (!after || after.piTerminated || exec?.exiting !== true || remaining() <= 2_000) break;
       await context.sleep(2_000);
     }
   }
-  const exited = after?.uid === pod.uid && after.piTerminated?.exitCode === 0;
-  const inputsFenced = exec?.exiting === true && exec.inputsFenced === true;
+  const exited = execAttempted && after?.uid === pod.uid && after.piTerminated?.exitCode === 0;
+  // Fence state is the CLI's own report; when an attempted exec gave no complete report it is unknown, so fenced.
+  const inputsFenced = execAttempted ? exec === undefined || exec.inputsFenced !== false : false;
   if (!reason && !exited) reason = after?.uid === pod.uid ? "pod-exit-unconfirmed" : "pod-uid-changed";
+  if (execAttempted && after && after.uid !== pod.uid) reason = "pod-uid-changed";
   const observed = { podUid: pod.uid, inputsFenced, exited };
-  const passed = inputsFenced && exited && reason === null;
+  const passed = reason === null && inputsFenced && exited;
   evidence(context, "fabric-v2-resume-drain-outcome.json", { schema: "fabric-v2-resume-drain-outcome-v1", result: passed ? "pass" : "refused",
-    reason, intentSha256, observed, measured: { before: before ?? null, after: after ?? null }, asserted: { podDrain: exec ?? null } });
+    reason, intentSha256, observed, measured: { before: before ?? null, after: after ?? null, execCode }, asserted: { podDrain: exec ?? null } });
   context.io.stdout(receipt(request, passed ? "pass" : "refused", observed));
   return 0;
 };

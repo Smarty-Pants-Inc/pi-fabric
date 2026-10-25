@@ -61,7 +61,8 @@ is absent. The operator must hold the seat lock and pass the run's `operationId`
 
 Attempts are contiguous. Attempt `n + 1` is allowed only in two cases:
 - attempt `n` is UNKNOWN: it has an intent file and no outcome file;
-- attempt `n` was refused and v1 has since been restarted, which shows as another owner pid or start time.
+- attempt `n` was a handle-lost refusal (`inputsFenced: true`, `admissionRestored: false`), and v1 has since been
+  restarted. The restart shows as another owner pid or start time, and both owner records must be readable.
 
 `refused {inputsFenced: true, admissionRestored: false}` means restart required: the fence handle was lost, or v1
 is unreachable. Restart v1 (a new process starts unfenced), then run the next attempt.

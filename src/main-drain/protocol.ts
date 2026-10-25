@@ -58,6 +58,8 @@ export interface MainDrainIngressProbe {
   mechanism: "fabric-gate" | "native-fence" | "both" | "hold";
   /** Would a NEW input on this path be admitted now? null: unknown (counts as admitted). */
   admits: boolean | null;
+  /** The Fabric-gate half alone (fabric-gate and both rows); null for native-fence and hold rows. */
+  fabric: boolean | null;
 }
 
 export interface MainDrainActorRow {

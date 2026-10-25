@@ -17,7 +17,8 @@ const POD = { name: "org-d3synth-raw", uid: "00000000-0000-4000-8000-0000000000a
 const CA = Buffer.from("synthetic CA bytes");
 const SERVER = "https://synthetic.invalid:6443";
 
-const kubeSeat = async (exec: { line: string; terminate?: boolean }, pod: Record<string, unknown> = {}, options: { cliPresent?: boolean } = {}) => {
+const kubeSeat = async (exec: { line: string; terminate?: boolean; code?: number }, pod: Record<string, unknown> = {},
+  options: { cliPresent?: boolean } = {}) => {
   const seat = await createSeat({ kube: { kubeconfig: "/placeholder", server: SERVER, caSha256: createHash("sha256").update(CA).digest("hex") } });
   seats.push(seat);
   const kube = path.join(seat.base, "kube");
@@ -90,6 +91,21 @@ describe.skipIf(!linux)("resume-drain through kubectl exec (M9)", () => {
     expect(result.receipt).toMatchObject({ result: "refused", observed: { podUid: POD.uid, inputsFenced: false, exited: false } });
   });
 
+  it("re-review finding 5: a nonzero kubectl exit, or unreadable output after an exec, is never a pass and never 'unfenced'", async () => {
+    const nonzero = await kubeSeat({ line: exiting, terminate: true, code: 137 });
+    expect((await resume(nonzero.seat, nonzero.kubectl, "/opt/pi-fabric/dist/cli/index.js")).receipt)
+      .toMatchObject({ result: "refused", observed: { podUid: POD.uid, inputsFenced: true, exited: true } });
+    const garbled = await kubeSeat({ line: "not json" });
+    expect((await resume(garbled.seat, garbled.kubectl, "/opt/pi-fabric/dist/cli/index.js")).receipt)
+      .toMatchObject({ result: "refused", observed: { podUid: POD.uid, inputsFenced: true, exited: false } });
+  });
+
+  it("re-review finding 4: a pod on another node than the sealed target is UNKNOWN (exit 2)", async () => {
+    const moved = await kubeSeat({ line: exiting, terminate: true }, { nodeName: "other-node" });
+    expect(await resume(moved.seat, moved.kubectl, "/opt/pi-fabric/dist/cli/index.js")).toMatchObject({ code: 2, stdout: "",
+      stderr: "GAP: pod-node-mismatch [owner: fabric-v2]\n" });
+  });
+
   it("an exit that never terminates the container is refused with inputsFenced true, exited false", async () => {
     const { seat, kubectl } = await kubeSeat({ line: exiting, terminate: false });
     const result = await resume(seat, kubectl, "/opt/pi-fabric/dist/cli/index.js", { deadlineMs: 3_000 });
@@ -153,7 +169,8 @@ describe.skipIf(!linux)("the in-pod CLI half: pi-fabric session drain --exit aga
     const result = await cli(seat, exitArgs(seat));
     expect(result.line).toMatchObject({ format: 1, sessionId: SID, op: "exit", drained: true, exiting: true, inputsFenced: true });
     expect(result.code).toBe(0);
-    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(seat.native.state.shutdown).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 1_300));
     expect(seat.native.state.shutdown).toHaveBeenCalledTimes(1);
   });
 

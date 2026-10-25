@@ -38,6 +38,8 @@ const storeReceipt = (target: Seat, phase: string, text: string): string => {
   return sha(text);
 };
 const undoInputs = (attempt: number, drainReceiptSha256: string | null) => ({ attempt, drainReceiptSha256 });
+const fenceReceipt = (target: Seat): string => JSON.stringify({ schema: "d3-seam-receipt-v1", run: target.run, phase: "fence",
+  owner: "factory-lead", result: "pass", observed: { tombstone: true } });
 
 describe.skipIf(!linux)("fabric-seat-drain, the real installed artifact run as A runs it", () => {
   it("drains an idle Main to exactly the six passing keys, writes evidence once and changes no mesh file", async () => {
@@ -371,6 +373,64 @@ describe.skipIf(!linux)("evidence, binding and undo (contract rev 4)", () => {
     expect(undo.receipt).toMatchObject({ result: "refused", observed: { sessionId: SID, inputsFenced: true, admissionRestored: false } });
   });
 
+  it("re-review finding 8: only a handle-lost refusal is retried, and only after a PROVEN v1 restart", async () => {
+    const target = await seat();
+    expect((await inProcess(target, "drain")).receipt?.result).toBe("pass");
+    delete drainSlot(ROOT).fence;
+    expect((await inProcess(target, "drain-undo", undoInputs(1, null))).receipt?.observed).toMatchObject({ inputsFenced: true, admissionRestored: false });
+    // Same owner record: no restart shown.
+    expect(await inProcess(target, "drain-undo", undoInputs(2, null))).toMatchObject({ code: 2, stdout: "",
+      stderr: "GAP: undo-retry-without-restart [owner: fabric-v2]\n" });
+    // An unreadable owner record proves nothing either.
+    const owner = path.join(target.meshRoot, "main-followups", `${SID}.owner.json`);
+    const record = fs.readFileSync(owner);
+    fs.writeFileSync(owner, "{");
+    expect(await inProcess(target, "drain-undo", undoInputs(2, null))).toMatchObject({ code: 2, stderr: "GAP: undo-retry-without-restart [owner: fabric-v2]\n" });
+    // Counterexample: a readable owner record with another pid IS a proven restart, so attempt 2 runs (a receipt, exit 0).
+    fs.writeFileSync(owner, JSON.stringify({ ...JSON.parse(record.toString("utf8")), pid: process.pid + 100_000 }));
+    expect(await inProcess(target, "drain-undo", undoInputs(2, null))).toMatchObject({ code: 0, stderr: "",
+      receipt: { phase: "drain-undo", observed: { inputsFenced: true, admissionRestored: false } } });
+    fs.writeFileSync(owner, record);
+    // A refusal that is not handle-lost (actors not restored, inputs open) is never retried.
+    const second = await seat();
+    const actor = "3".repeat(32);
+    const row = { status: "idle" };
+    second.actors.listOwned = () => [{ id: actor, name: "live", status: row.status, rootId: ROOT }];
+    second.actors.drainQuiescence = () => row.status === "idle" ? [] : ["status-stopped"];
+    second.actors.drainWorker = () => null;
+    second.actors.stop = async () => {
+      row.status = "stopped"; second.writeActors([actorRow(actor, "stopped", { stopReason: "explicit" })]); return {};
+    };
+    second.writeActors([actorRow(actor, "idle")]);
+    const drained = await inProcess(second, "drain", {}, { deadlineMs: 8_000 });
+    expect(drained.receipt?.result).toBe("pass");
+    const undone = await inProcess(second, "drain-undo", undoInputs(1, storeReceipt(second, "drain", drained.stdout)));
+    expect(undone.receipt?.observed).toMatchObject({ inputsFenced: false, admissionRestored: false });
+    expect(await inProcess(second, "drain-undo", undoInputs(2, storeReceipt(second, "drain", drained.stdout)))).toMatchObject({ code: 2,
+      stderr: "GAP: undo-retry-not-handle-lost [owner: fabric-v2]\n" });
+  });
+
+  it("re-review finding 1: a dangling symlink in place of the drain intent is UNKNOWN, never the N3 shortcut", async () => {
+    const target = await seat();
+    expect((await inProcess(target, "drain")).receipt?.result).toBe("pass");
+    const intent = path.join(target.runDir, "fabric-v2-drain-intent.json");
+    fs.rmSync(intent);
+    fs.symlinkSync(path.join(target.runDir, "missing"), intent);
+    expect(await inProcess(target, "drain-undo", undoInputs(1, null))).toMatchObject({ code: 2, stdout: "",
+      stderr: "GAP: intent-unreadable [owner: fabric-v2]\n" });
+    expect(target.native.state.fenced).toBe(true);
+  });
+
+  it("re-review finding 2: a combined (both) ingress row refused by its Fabric half keeps admission unrestored", async () => {
+    const target = await seat();
+    expect((await inProcess(target, "drain")).receipt?.result).toBe("pass");
+    // The inbox reopens and the native fence releases, but the Main still refuses NEW turns (mainAdmits false).
+    const main = target.host.main;
+    target.host.main = () => ({ ...main()!, probeAdmission: () => false });
+    const undo = await inProcess(target, "drain-undo", undoInputs(1, null));
+    expect(undo.receipt).toMatchObject({ result: "refused", observed: { admissionRestored: false } });
+  });
+
   it("review finding 4: a fence-capable host whose state cannot be read is never reported open", async () => {
     const target = await seat();
     expect((await inProcess(target, "drain")).receipt?.result).toBe("pass");
@@ -406,7 +466,7 @@ describe.skipIf(!linux)("evidence, binding and undo (contract rev 4)", () => {
     target.actors.drainQuiescence = () => ["status-stopped"];
     target.actors.drainWorker = () => null;
     expect((await inProcess(target, "drain")).receipt?.result).toBe("pass");
-    storeReceipt(target, "fence", "{}");
+    storeReceipt(target, "fence", fenceReceipt(target));
     // v1 crash-restarted between drain and fence: a new actor, retired as host-exit, revives on v2.
     target.writeActors([actorRow(done, "stopped", { stopReason: "explicit" }), actorRow("2".repeat(32), "stopped", { stopReason: "host-exit" })]);
     const result = await inProcess(target, "drain-recheck");
@@ -422,7 +482,13 @@ describe.skipIf(!linux)("evidence, binding and undo (contract rev 4)", () => {
     expect(await inProcess(target, "drain-recheck")).toMatchObject({ code: 2, stderr: "GAP: intent-missing [owner: fabric-v2]\n" });
     expect((await inProcess(target, "drain")).receipt?.result).toBe("pass");
     expect(await inProcess(target, "drain-recheck")).toMatchObject({ code: 2, stderr: "GAP: fence-receipt-missing [owner: fabric-v2]\n" });
-    storeReceipt(target, "fence", "{}");
+    // Re-review finding 3: an invalid fence receipt is not phase evidence.
+    for (const bad of ["{}", JSON.stringify({ ...JSON.parse(fenceReceipt(target)), result: "refused" }),
+      JSON.stringify({ ...JSON.parse(fenceReceipt(target)), run: "another-run" }), JSON.stringify({ ...JSON.parse(fenceReceipt(target)), owner: "fabric-v2" })]) {
+      storeReceipt(target, "fence", bad);
+      expect(await inProcess(target, "drain-recheck")).toMatchObject({ code: 2, stdout: "", stderr: "GAP: fence-receipt-invalid [owner: fabric-v2]\n" });
+    }
+    storeReceipt(target, "fence", fenceReceipt(target));
     const result = await inProcess(target, "drain-recheck");
     expect(result.receipt).toEqual({ schema: "d3-seam-receipt-v1", run: target.run, phase: "drain-recheck", owner: "fabric-v2", result: "pass",
       observed: { sessionId: SID, complete: true, totals: { actors: 0, followUps: 0, queued: 0, inFlight: 0, settledWindows: 0,

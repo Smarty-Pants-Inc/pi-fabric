@@ -83,12 +83,13 @@ export const probeIngress = (rootId: string, native: NativeInputObservation, mai
   const gateOpen = (): boolean => { try { assertMainInboxOpen(rootId); return true; } catch { return false; } };
   const nativeOpen = native.fenceApi && native.piInputsFenced !== null ? !native.piInputsFenced : null;
   return MAIN_DRAIN_INGRESS.map(({ path, mechanism }) => {
-    if (mechanism === "hold") return { path, mechanism, admits: null };
-    if (mechanism === "native-fence") return { path, mechanism, admits: nativeOpen };
+    if (mechanism === "hold") return { path, mechanism, admits: null, fabric: null };
+    if (mechanism === "native-fence") return { path, mechanism, admits: nativeOpen, fabric: null };
     const fabric = path === "agents.spawn" || path === "actors.create" || path === "dashboard.composer" ? gateOpen() : mainAdmits;
-    if (mechanism === "fabric-gate") return { path, mechanism, admits: fabric };
-    // both: admitted only through BOTH gates; a refusal by either is a refusal.
-    return { path, mechanism, admits: fabric === false || nativeOpen === false ? false : fabric === true && nativeOpen === true ? true : null };
+    if (mechanism === "fabric-gate") return { path, mechanism, admits: fabric, fabric };
+    // both: admitted only through BOTH gates; a refusal by either is a refusal. `fabric` keeps the Fabric half.
+    return { path, mechanism, fabric,
+      admits: fabric === false || nativeOpen === false ? false : fabric === true && nativeOpen === true ? true : null };
   });
 };
 
@@ -163,7 +164,8 @@ export class MainDrainControl {
     if (!this.#exitAccepted) return;
     const ctx = this.host.context();
     // Pi's orderly shutdown; the fence stays held, and nothing queued remains (checked above).
-    setTimeout(() => { try { ctx?.shutdown(); } catch { /* the context retired: the process is going anyway */ } }, 100);
+    // A short grace lets the exec'd CLI print its receipt line and exit 0 before the container stops.
+    setTimeout(() => { try { ctx?.shutdown(); } catch { /* the context retired: the process is going anyway */ } }, 1_000);
   }
 
   /** The first bind: record the drain's own children (r2 N1) and start a fresh ledger (N8). */

@@ -72,7 +72,7 @@ export const verifyKubeconfig = async (access: KubeAccess, timeoutMs: number): P
   if (!ca || createHash("sha256").update(ca).digest("hex") !== access.caSha256) throw new SeamGap("kubeconfig-ca-mismatch");
 };
 
-export interface PodView { uid: string; piRunning: boolean; piTerminated: { exitCode: number } | null; meshRoot: string | null }
+export interface PodView { uid: string; nodeName: string | null; piRunning: boolean; piTerminated: { exitCode: number } | null; meshRoot: string | null }
 
 /** The pod as the API reports it; undefined when it cannot be read. */
 export const readPod = async (access: KubeAccess, name: string, timeoutMs: number): Promise<PodView | undefined> => {
@@ -88,5 +88,6 @@ export const readPod = async (access: KubeAccess, name: string, timeoutMs: numbe
   const status = statuses.find(entry => object(entry) && entry.name === "pi") as Record<string, unknown> | undefined;
   const state = object(status?.state) ? status.state : {};
   const terminated = object(state.terminated) && Number.isSafeInteger(state.terminated.exitCode) ? { exitCode: state.terminated.exitCode as number } : null;
-  return { uid: pod.metadata.uid, piRunning: object(state.running), piTerminated: terminated, meshRoot };
+  const nodeName = object(pod.spec) && typeof pod.spec.nodeName === "string" ? pod.spec.nodeName : null;
+  return { uid: pod.metadata.uid, nodeName, piRunning: object(state.running), piTerminated: terminated, meshRoot };
 };

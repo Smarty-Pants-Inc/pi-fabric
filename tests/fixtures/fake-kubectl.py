@@ -32,7 +32,8 @@ elif rest[0] == "-n" and rest[2:4] == ["get", "pod"]:
         sys.exit(1)
     status = {"terminated": {"exitCode": pod["terminated"]}} if pod["terminated"] is not None else ({"running": {}} if pod["running"] else {"waiting": {}})
     print(json.dumps({"metadata": {"name": pod["name"], "uid": pod["uid"]},
-                      "spec": {"containers": [{"name": "pi", "env": [{"name": "PI_FABRIC_MESH_ROOT", "value": pod["meshRoot"]}]}]},
+                      "spec": {"nodeName": pod.get("nodeName", "synthetic-node"),
+                               "containers": [{"name": "pi", "env": [{"name": "PI_FABRIC_MESH_ROOT", "value": pod["meshRoot"]}]}]},
                       "status": {"containerStatuses": [{"name": "pi", "state": status}]}}))
 elif rest[0] == "-n" and rest[2] == "exec" and rest[7:9] == ["test", "-x"]:
     sys.exit(0 if state.get("cliPresent", True) else 1)
@@ -42,5 +43,7 @@ elif rest[0] == "-n" and rest[2] == "exec":
         state["pod"]["running"] = False
         state["pod"]["terminated"] = 0
         save()
+    if state["exec"].get("code"):
+        sys.exit(state["exec"]["code"])
 else:
     sys.exit(2)

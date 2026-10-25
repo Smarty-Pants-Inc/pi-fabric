@@ -23,10 +23,13 @@ const CONTROL = "fabric.control.command", ACK = "fabric.control.ack";
 const bodyOf = (event: Pick<WireEvent, "envelope">) => event.envelope.body as Record<string, unknown>;
 const dataOf = (event: MeshEvent) => (event.data ?? {}) as Record<string, unknown>;
 const mentions = (main: MixedMain, token: string) => main.delivered().filter((row) => row.text.includes(token));
+let current: MixedHarness | undefined;
+/** Attach the link's log tail to a failure. */
+const withLog = <T>(work: Promise<T>): Promise<T> => work.catch((error: unknown) => { throw new Error(`${String(error)}\n${current ? linkTail(current) : ""}`); });
 
 describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: FILE Main <-> NATS Main on a real broker", () => {
   let h: MixedHarness;
-  beforeAll(async () => { h = await createMixedHarness({ binary: binary!, natsPeer: true }); }, 90_000);
+  beforeAll(async () => { h = current = await createMixedHarness({ binary: binary!, natsPeer: true }); }, 90_000);
   afterAll(async () => { await h?.stop(); }, 60_000);
 
   it("mirrors each allow-listed root live onto the other side, under the link's name and the bridge machine", async () => {
@@ -72,7 +75,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: FI
     expect(acks.length).toBeGreaterThanOrEqual(1);
     expect(acks[0]).toMatchObject({ kind: "accepted", from: { id: h.natsMain.id }, data: { accepted: true, messageId: first.messageId } });
     // The same key and input again: the receiver replays its stored outcome; nothing is consumed twice.
-    const again = await h.fileMain.invoke("agents.followUp", { id: h.natsMain.id, message: token, idempotencyKey: key }) as Record<string, unknown>;
+    const again = await withLog(h.fileMain.invoke("agents.followUp", { id: h.natsMain.id, message: token, idempotencyKey: key })) as Record<string, unknown>;
     expect(again).toMatchObject({ acknowledged: true, messageId: first.messageId });
     expect(mentions(h.natsMain, token)).toHaveLength(1);
   }, 60_000);
@@ -101,7 +104,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: FI
       event.envelope.kind === "ack" && bodyOf(event).commandId === bodyOf(sent).commandId);
     expect(ack).toMatchObject({ sourceMachine: BRIDGE_MACHINE, envelope: { id: `ack:${sent.envelope.id}`, from: { id: h.fileMain.id },
       body: { accepted: true } } });
-    const again = await h.natsMain.invoke("agents.followUp", { id: h.fileMain.id, message: token, idempotencyKey: key }) as Record<string, unknown>;
+    const again = await withLog(h.natsMain.invoke("agents.followUp", { id: h.fileMain.id, message: token, idempotencyKey: key })) as Record<string, unknown>;
     expect(again).toMatchObject({ acknowledged: true, messageId: first.messageId });
     expect(mentions(h.fileMain, token)).toHaveLength(1);
     expect(h.fileEvents({ topic: CONTROL, to: h.fileMain.id }).filter((event) => dataOf(event).message === token).length).toBeLessThanOrEqual(2);

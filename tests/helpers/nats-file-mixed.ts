@@ -564,7 +564,12 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
         await harness.startLinkNow();
         await harness.waitMirrored();
       } catch (error) {
-        throw new Error(`A' link did not come up: ${String(error)}\n${linkLog.slice(-40).join("\n")}`, { cause: error });
+        const rows = (viewer: MixedMain, id: string) => JSON.stringify(viewer.runtime.participantInfos({ fresh: true, includeStale: true })
+          .filter((row) => row.id === id));
+        throw new Error(`A' link did not come up: ${String(error)}\nfile side sees ${natsMain.id}: ${rows(fileMain, natsMain.id)}\n` +
+          `nats side sees ${fileMain.id}: ${rows(natsMain, fileMain.id)}\nKV ${BRIDGE_MACHINE}: ${JSON.stringify(await harness.kvRoot(BRIDGE_MACHINE, fileMain.id))}\n` +
+          (actor ? `file side actor: ${rows(fileMain, actor.id)}\nnats side actor: ${rows(natsMain, actor.id)}\n` : "") +
+          `${linkLog.slice(-40).join("\n")}`, { cause: error });
       }
     }
     return harness;

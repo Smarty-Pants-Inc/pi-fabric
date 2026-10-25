@@ -114,6 +114,12 @@ export class NatsWireFaults {
     this.pubAckRules.push({ match, remaining: count });
   }
 
+  /** Remove every pending ACK/PubAck drop rule (frames already dropped stay dropped). */
+  clearFaults(): void {
+    this.ackRules.length = 0;
+    this.pubAckRules.length = 0;
+  }
+
   /** A forced disconnect: destroy every live client connection now. Reconnects are accepted. */
   sever(): number {
     const live = [...this.clients];

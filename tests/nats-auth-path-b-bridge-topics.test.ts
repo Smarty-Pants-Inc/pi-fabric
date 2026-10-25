@@ -9,7 +9,7 @@ import { bridgeNatsCommandId, bridgeNatsLinkIdentity, bridgeNatsTopicIdempotency
 import type { MeshIdentity } from "../src/mesh/store.js";
 import { resolveNatsBinary } from "./helpers/nats-cluster.js";
 import {
-  allowRoot, BRIDGE_MACHINE, createMixedHarness, linkTail, natsLinkPresent, waitForValue, type MixedHarness, type WireEvent,
+  allowRoot, BRIDGE_MACHINE, createMixedHarness, E2E_WAIT_MS, linkTail, NATS_MAIN_MACHINE, natsLinkPresent, waitForValue, type MixedHarness, type WireEvent,
 } from "./helpers/nats-file-mixed.js";
 
 const binary = resolveNatsBinary();
@@ -27,9 +27,9 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: ad
   beforeAll(async () => {
     h = await createMixedHarness({ binary: binary!, natsPeer: true, allow: (allow, ids) => {
       allow.nats = allow.nats.map((entry) => entry.kind === "root" && entry.id === ids.natsMain
-        ? allowRoot(ids.natsMain, undefined, undefined, ["fleet.work.*", "ops.owner"]) : entry);
+        ? allowRoot(ids.natsMain, { machine: NATS_MAIN_MACHINE, receiveTopics: ["fleet.work.*", "ops.owner"] }) : entry);
     } });
-  }, 90_000);
+  }, E2E_WAIT_MS + 60_000);
   afterAll(async () => { await h?.stop(); }, 60_000);
 
   const link = () => bridgeNatsLinkIdentity(h.linkName);
@@ -41,7 +41,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: ad
     const mark = h.wire.mark();
     const event = await publish(REPORT_RELAY, "fleet.work.lanes", "report", h.natsMain.id, text);
     const row = await waitForValue(() => h.natsMain.delivered().find((entry) => entry.text.includes(text)),
-      `lane report delivered to the v2 lead\n${linkTail(h)}`, 20_000);
+      () => `lane report delivered to the v2 lead\n${linkTail(h)}`, E2E_WAIT_MS);
     expect(row).toMatchObject({ deliverAs: "followUp", from: { id: link().id } });
     expect(row.text).toContain(`[mesh fleet.work.lanes/report from ${REPORT_RELAY.id}]`);
     // The link's own command: from its verified KV identity on the bridge machine, keyed by the event id.
@@ -51,7 +51,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: ad
     expect(bodyOf(command).commandId).toBe(bridgeNatsCommandId({ hostId: link().id, ownerHostId: h.natsMain.id, ownerIdentityId: h.natsMain.id,
       targetId: h.natsMain.id, operation: "followUp", idempotencyKey: bridgeNatsTopicIdempotencyKey(h.linkName, event.id) }));
     expect(h.natsMain.delivered().filter((entry) => entry.text.includes(text))).toHaveLength(1);
-  }, 45_000);
+  }, E2E_WAIT_MS + 30_000);
 
   it("an ops.owner alarm crosses; pr.wake, an unlisted topic, a broadcast and a report to an unlisted recipient never do", async () => {
     const notice = `inbox age alarm ${randomUUID()}`, github = `GITHUB_${randomUUID()}`, broadcast = `BROADCAST_${randomUUID()}`,
@@ -64,11 +64,11 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: ad
     await publish(OWNER_INBOX, "ops.owner", "pr.wake", h.natsMain.id, wake);
     await publish(OWNER_INBOX, "ops.owner", "inbox.age.alarm", h.natsMain.id, notice);
     // Ordered barrier: the later allowed notice arrived, so every earlier event was already decided.
-    await waitForValue(() => h.natsMain.delivered().find((entry) => entry.text.includes(notice)), `ops.owner notice delivered\n${linkTail(h)}`, 20_000);
+    await waitForValue(() => h.natsMain.delivered().find((entry) => entry.text.includes(notice)), () => `ops.owner notice delivered\n${linkTail(h)}`, E2E_WAIT_MS);
     expect(h.natsMain.delivered().filter((entry) => [github, broadcast, wake].some((token) => entry.text.includes(token)))).toEqual([]);
     expect(h.natsPeer!.delivered().filter((entry) => entry.text.includes(other))).toEqual([]);
     // Nothing for them was even published by the link (decided before the barrier, in file-log order).
     for (const token of [github, broadcast, other, wake]) expect(h.faults.publishedWith(token, relayMark), token).toEqual([]);
     expect(h.faults.publishedWith(notice, relayMark)).toHaveLength(1);
-  }, 45_000);
+  }, E2E_WAIT_MS + 30_000);
 });

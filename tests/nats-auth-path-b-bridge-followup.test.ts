@@ -10,7 +10,7 @@ import type { MeshEvent } from "../src/mesh/store.js";
 import type { TransportEnvelope } from "../src/transport/types.js";
 import { resolveNatsBinary } from "./helpers/nats-cluster.js";
 import {
-  BRIDGE_MACHINE, createMixedHarness, linkTail, liveRow, NATS_MAIN_MACHINE, natsLinkPresent, selfRecord, waitForValue,
+  BRIDGE_MACHINE, createMixedHarness, E2E_WAIT_MS, linkTail, liveRow, NATS_MAIN_MACHINE, natsLinkPresent, selfRecord, waitForValue,
   type MixedHarness, type MixedMain, type WireEvent,
 } from "./helpers/nats-file-mixed.js";
 
@@ -29,7 +29,7 @@ const withLog = <T>(work: Promise<T>): Promise<T> => work.catch((error: unknown)
 
 describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: FILE Main <-> NATS Main on a real broker", () => {
   let h: MixedHarness;
-  beforeAll(async () => { h = current = await createMixedHarness({ binary: binary!, natsPeer: true }); }, 90_000);
+  beforeAll(async () => { h = current = await createMixedHarness({ binary: binary!, natsPeer: true }); }, E2E_WAIT_MS + 60_000);
   afterAll(async () => { await h?.stop(); }, 60_000);
 
   it("mirrors each allow-listed root live onto the other side, under the link's name and the bridge machine", async () => {
@@ -47,7 +47,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: FI
     // Never mirrored back the other way, and never written under the NATS Main's machine.
     expect(await h.kvRoot(NATS_MAIN_MACHINE, h.fileMain.id)).toBeUndefined();
     expect(await h.kvRoot(BRIDGE_MACHINE, h.natsMain.id)).toBeUndefined();
-  }, 30_000);
+  }, E2E_WAIT_MS + 30_000);
 
   it("file Main -> NATS Main: one keyed followUp, one consumption, outer from, exact epoch, ACK; a same-key resend replays", async () => {
     const token = `FILE_TO_NATS_${randomUUID()}`, key = `k-${randomUUID()}`;
@@ -122,7 +122,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: FI
 
   it("a second verified NATS sender re-using another sender's commandId never receives that sender's outcome", async () => {
     const peer = h.natsPeer!;
-    await waitForValue(() => liveRow(peer, h.fileMain.id), "file root routable from the NATS peer", 10_000);
+    await waitForValue(() => liveRow(peer, h.fileMain.id), "file root routable from the NATS peer", E2E_WAIT_MS);
     const token = `COLLISION_${randomUUID()}`;
     const mark = h.wire.mark();
     const original = await h.natsMain.invoke("agents.followUp", { id: h.fileMain.id, message: token, idempotencyKey: `c-${randomUUID()}` }) as Record<string, unknown>;
@@ -155,5 +155,5 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: FI
     // The original sender's message was consumed once, from the original sender only.
     expect(mentions(h.fileMain, token).filter((row) => row.from?.id === h.natsMain.id)).toHaveLength(1);
     expect(mentions(h.fileMain, token).every((row) => row.from?.id === h.natsMain.id || row.from?.id === peer.id)).toBe(true);
-  }, 60_000);
+  }, E2E_WAIT_MS * 3);
 });

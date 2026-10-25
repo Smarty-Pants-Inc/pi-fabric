@@ -51,6 +51,11 @@ export const NATS_PEER_SESSION = "15310b44-dddd-4000-8000-000000000004";
 export const OWNER_SEAT_SESSION = "15310a55-eeee-4000-8000-000000000005";
 export const SEAT_PRINCIPAL = "Kate";
 export const rootId = (session: string): string => `session:${session}`;
+/**
+ * Deadline for one event-driven crossing wait (a barrier, never a sleep). It covers the CI nats-auth job,
+ * where every bridge E2E harness and the other real-broker suites run at once; a passing wait returns early.
+ */
+export const E2E_WAIT_MS = 60_000;
 
 // ---------------------------------------------------------------------------------------------
 // Link entry (L2). Config: L5's NatsLinkConfig JSON. Handle: { closed, stop }.
@@ -118,11 +123,17 @@ export const ROOT_SEND_OPERATIONS: readonly FabricControlOperation[] = ["steer",
 /** A principal seat receives followUp and cancel only (L3 BRIDGE_NATS_SEAT_RECEIVE). */
 export const SEAT_OPERATIONS: readonly FabricControlOperation[] = ["followUp", "cancel"];
 
-/** One root allow entry (L3 BridgeNatsAllowEntryInput): it may send and receive `operations`. */
-export function allowRoot(id: string, operations: readonly FabricControlOperation[] = ROOT_SEND_OPERATIONS, principal?: string,
-  receiveTopics?: readonly string[]): BridgeNatsAllowEntryInput {
-  return { kind: "root", id, send: [...operations], receive: [...operations], ...(principal === undefined ? {} : { principal }),
-    ...(receiveTopics === undefined ? {} : { receiveTopics: [...receiveTopics] }) };
+/**
+ * One root allow entry (L3 BridgeNatsAllowEntryInput): it may send and receive `operations`. A NATS-side
+ * entry is pinned to its machine (L3 requires `machine` on every allow.nats entry; integrator note 8).
+ */
+export function allowRoot(id: string, options: { operations?: readonly FabricControlOperation[]; principal?: string;
+  receiveTopics?: readonly string[]; machine?: string } = {}): BridgeNatsAllowEntryInput {
+  const operations = options.operations ?? ROOT_SEND_OPERATIONS;
+  return { kind: "root", id, send: [...operations], receive: [...operations],
+    ...(options.principal === undefined ? {} : { principal: options.principal }),
+    ...(options.receiveTopics === undefined ? {} : { receiveTopics: [...options.receiveTopics] }),
+    ...(options.machine === undefined ? {} : { machine: options.machine }) };
 }
 
 /** A file-side actor allow entry (owner root + name; the verified presence must match both). */
@@ -381,7 +392,8 @@ export interface MixedHarness {
 
 const kvKey = (machine: string, kind: "p" | "h", id: string): string => `${machine}.${kind}.${hashToken(id)}`;
 
-async function waitFor<T>(read: () => T | undefined | Promise<T | undefined>, label: string, timeoutMs: number, everyMs = 50): Promise<T> {
+/** Poll `read` until it returns a value. `label` may be a thunk, evaluated only on timeout (e.g. a log tail). */
+async function waitFor<T>(read: () => T | undefined | Promise<T | undefined>, label: string | (() => string), timeoutMs: number, everyMs = 50): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   let last: unknown;
   for (;;) {
@@ -389,7 +401,9 @@ async function waitFor<T>(read: () => T | undefined | Promise<T | undefined>, la
       const value = await read();
       if (value !== undefined) return value;
     } catch (error) { last = error; }
-    if (Date.now() > deadline) throw new Error(`Timed out after ${timeoutMs}ms: ${label}${last ? ` (last error: ${String(last)})` : ""}`);
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out after ${timeoutMs}ms: ${typeof label === "function" ? label() : label}${last ? ` (last error: ${String(last)})` : ""}`);
+    }
     await new Promise((resolve) => setTimeout(resolve, everyMs));
   }
 }
@@ -465,7 +479,8 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     if (options.seat && !natsPeer) throw new Error("seat needs natsPeer");
     const allow = {
       file: [allowRoot(fileMain.id), ...(actor ? [allowActor(fileMain.id, actor.name)] : [])],
-      nats: [allowRoot(natsMain.id), ...(natsPeer ? [options.seat ? allowRoot(natsPeer.id, SEAT_OPERATIONS, SEAT_PRINCIPAL) : allowRoot(natsPeer.id)] : [])],
+      nats: [allowRoot(natsMain.id, { machine: NATS_MAIN_MACHINE }), ...(natsPeer ? [allowRoot(natsPeer.id, { machine: NATS_MAIN_MACHINE,
+        ...(options.seat ? { operations: SEAT_OPERATIONS, principal: SEAT_PRINCIPAL } : {}) })] : [])],
     };
     // Seat pins come only from org.json (L3). The fixture binds the product owner to a session nobody runs,
     // and SEAT_PRINCIPAL to natsPeer only when the test asks for a seat.
@@ -534,7 +549,7 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
         if (!presence && !lease) return undefined;
         return { ...(presence ? { presence: presence.value, presenceRevision: presence.revision } : {}), ...(lease ? { lease: lease.value } : {}) };
       },
-      async waitMirrored(timeoutMs = 20_000) {
+      async waitMirrored(timeoutMs = E2E_WAIT_MS) {
         const fileView = await waitFor(() => {
           const row = liveRow(fileMain, natsMain.id);
           return row?.remoteHost === linkName ? row : undefined;

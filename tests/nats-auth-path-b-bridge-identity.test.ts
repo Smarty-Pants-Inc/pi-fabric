@@ -10,7 +10,7 @@ import type { MeshEvent, MeshIdentity } from "../src/mesh/store.js";
 import type { TransportEnvelope } from "../src/transport/types.js";
 import { resolveNatsBinary } from "./helpers/nats-cluster.js";
 import {
-  BRIDGE_MACHINE, createMixedHarness, linkTail, liveRow, NATS_MAIN_MACHINE, natsLinkPresent, selfRecord, waitForValue,
+  BRIDGE_MACHINE, createMixedHarness, E2E_WAIT_MS, linkTail, liveRow, NATS_MAIN_MACHINE, natsLinkPresent, selfRecord, waitForValue,
   type MixedHarness, type MixedMain, type WireEvent,
 } from "./helpers/nats-file-mixed.js";
 
@@ -21,6 +21,8 @@ if (!linked) console.warn("A' bridge identity E2E skipped: src/mesh/bridge-nats-
 
 const CONTROL = "fabric.control.command", ACK = "fabric.control.ack";
 const STALE = "FABRIC_CONTROL_STALE_INCARNATION";
+/** A refusal must reach the sender inside its own 30 s bridge window; past it, the sender reports "outcome unknown". */
+const REFUSAL_MS = 25_000;
 const bodyOf = (event: Pick<WireEvent, "envelope">) => event.envelope.body as Record<string, unknown>;
 const dataOf = (event: MeshEvent) => (event.data ?? {}) as Record<string, unknown>;
 const mentions = (main: MixedMain, token: string) => main.delivered().filter((row) => row.text.includes(token));
@@ -39,7 +41,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link ide
   beforeAll(async () => {
     // natsPeer is a principal seat: AGENTS lets a principal's org instance receive followUp (and cancel) only.
     h = await createMixedHarness({ binary: binary!, outsider: true, natsPeer: true, seat: true });
-  }, 90_000);
+  }, E2E_WAIT_MS + 60_000);
   afterAll(async () => { await h?.stop(); }, 60_000);
 
   /** Ordered barrier on the file -> NATS path: a later legitimate followUp is acknowledged. */
@@ -81,7 +83,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link ide
       expect(mentions(h.fileMain, token), token).toEqual([]);
       expect(h.fileEvents({ topic: CONTROL }).filter((event) => dataOf(event).message === token), token).toEqual([]);
     }
-  }, 60_000);
+  }, E2E_WAIT_MS * 2);
 
   it("file side: a command whose sender is not a live allow-listed native file root never crosses", async () => {
     const natsEpoch = selfRecord(h.natsMain)!.ownerIncarnation!;
@@ -100,29 +102,31 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link ide
     }
     // A real, live, native file root that is simply not on the allow-list.
     const outsider = h.outsider!;
-    await waitForValue(() => liveRow(outsider, h.natsMain.id), "mirrored NATS root visible to the outsider", 10_000);
+    await waitForValue(() => liveRow(outsider, h.natsMain.id), "mirrored NATS root visible to the outsider", E2E_WAIT_MS);
     const outsiderToken = `UNLISTED_FILE_ROOT_${randomUUID()}`;
     tokens.push(outsiderToken);
+    // A verified sender is ALWAYS answered (integrator note 10, F): a notRun refusal ACK from bridge:<link>
+    // with a stable BRIDGE_NATS_* code, inside its 30 s bridge window. An abort at REFUSAL_MS is no answer.
     const unlisted = outsider.invoke("agents.followUp", { id: h.natsMain.id, message: outsiderToken, idempotencyKey: `o-${randomUUID()}` },
-      AbortSignal.timeout(20_000)).then(() => "accepted", () => "refused");
+      AbortSignal.timeout(REFUSAL_MS)).then(() => "accepted", (error: unknown) => /BRIDGE_NATS_/.test(String(error)) ? "refused" : String(error));
     await fileToNatsBarrier();
     expect(await unlisted).toBe("refused");
     for (const token of tokens) {
       expect(mentions(h.natsMain, token), token).toEqual([]);
       expect(crossedToNats(mark, token), token).toEqual([]);
     }
-  }, 60_000);
+  }, E2E_WAIT_MS * 2);
 
   it("file -> NATS: a stale target epoch crosses unchanged, the NATS owner refuses it notRun, and that ACK returns", async () => {
     const token = `STALE_TO_NATS_${randomUUID()}`;
     const command = { ...natsCommand(h.natsMain.id, h.fileMain.id, `stale-${randomUUID()}`, token), destinationRemoteHost: h.linkName };
     await h.fileMain.runtime.mesh.publish({ topic: CONTROL, kind: "followUp", from: identity(h.fileMain), to: h.natsMain.id, data: command });
     const ack = await waitForValue(() => h.fileEvents({ topic: ACK, to: h.fileMain.id }).find((event) => dataOf(event).commandId === command.commandId),
-      "stale refusal ACK back in the file mesh", 30_000);
+      "stale refusal ACK back in the file mesh", E2E_WAIT_MS);
     expect(ack).toMatchObject({ kind: "rejected", from: { id: h.natsMain.id },
       data: { accepted: false, notRun: true, errorCode: STALE, targetId: h.natsMain.id } });
     expect(mentions(h.natsMain, token)).toEqual([]);
-  }, 45_000);
+  }, E2E_WAIT_MS + 30_000);
 
   it("NATS -> file: a stale target epoch is refused notRun by the file owner, the ACK returns, nothing is consumed", async () => {
     const token = `STALE_TO_FILE_${randomUUID()}`;
@@ -133,24 +137,25 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link ide
     await raw.send({ id: randomUUID(), kind: "command", to: { machine: BRIDGE_MACHINE, hostId: h.fileMain.id },
       targetId: h.fileMain.id, operation: "followUp", from: identity(h.natsMain), body });
     await h.wire.until(() => h.wire.since(mark).some((event) => event.phase === "deliver" && event.hostId === h.natsMain.id &&
-      event.envelope.kind === "ack" && bodyOf(event).commandId === body.commandId), "stale refusal ACK at the NATS sender", 30_000);
+      event.envelope.kind === "ack" && bodyOf(event).commandId === body.commandId), "stale refusal ACK at the NATS sender", E2E_WAIT_MS);
     const ack = h.wire.since(mark).find((event) => event.phase === "deliver" && event.hostId === h.natsMain.id &&
       event.envelope.kind === "ack" && bodyOf(event).commandId === body.commandId)!;
     expect(ack).toMatchObject({ sourceMachine: BRIDGE_MACHINE, envelope: { operation: "rejected", from: { id: h.fileMain.id } } });
     expect(bodyOf(ack)).toMatchObject({ accepted: false, notRun: true });
     expect(String(bodyOf(ack).errorCode)).toMatch(/STALE_INCARNATION/);
     expect(mentions(h.fileMain, token)).toEqual([]);
-  }, 45_000);
+  }, E2E_WAIT_MS + 30_000);
 
   it("a principal seat across the link receives followUp but never steer", async () => {
     const seat = h.natsPeer!;
-    await waitForValue(() => liveRow(h.fileMain, seat.id), "seat mirrored into the file mesh", 15_000);
+    await waitForValue(() => liveRow(h.fileMain, seat.id), "seat mirrored into the file mesh", E2E_WAIT_MS);
     const steer = `SEAT_STEER_${randomUUID()}`, followUp = `SEAT_FOLLOWUP_${randomUUID()}`;
-    await expect(h.fileMain.invoke("agents.steer", { id: seat.id, message: steer, idempotencyKey: `s-${randomUUID()}` }, AbortSignal.timeout(40_000)))
-      .rejects.toThrow();
+    // Refused before publish by destination class and answered with the stable code, never left to time out.
+    await expect(h.fileMain.invoke("agents.steer", { id: seat.id, message: steer, idempotencyKey: `s-${randomUUID()}` }, AbortSignal.timeout(REFUSAL_MS)))
+      .rejects.toThrow(/BRIDGE_NATS_DESTINATION_CLASS_REFUSED/);
     await expect(h.fileMain.invoke("agents.followUp", { id: seat.id, message: followUp, idempotencyKey: `f-${randomUUID()}` }))
       .resolves.toMatchObject({ acknowledged: true });
     expect(mentions(seat, steer)).toEqual([]);
     expect(mentions(seat, followUp)).toEqual([expect.objectContaining({ deliverAs: "followUp", from: expect.objectContaining({ id: h.fileMain.id }) })]);
-  }, 60_000);
+  }, E2E_WAIT_MS * 2);
 });

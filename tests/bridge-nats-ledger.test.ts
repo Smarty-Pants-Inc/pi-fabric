@@ -8,6 +8,7 @@ import {
   BRIDGE_NATS_LEDGER_FILE,
   BRIDGE_NATS_LEDGER_LOCK,
   BridgeNatsLedgerError,
+  bridgeNatsClaimAction,
   openBridgeNatsLedger,
   type FileBridgeNatsLedger,
 } from "../src/mesh/bridge-nats-ledger.js";
@@ -175,6 +176,31 @@ describe("states", () => {
     expect((await ledger.markAckForwarded(commandId)).state).toBe("ackForwarded");
     expect(ledger.pendingAcks()).toEqual([]);
     expect((await ledger.markAckForwarded(commandId)).state).toBe("ackForwarded");
+  });
+
+  it("decides every claim result at once: publish, resend, awaitAck, replayAck or refuse (E2E finding A)", async () => {
+    const ledger = await ledgerAt();
+    const first = await ledger.claim(toNats());
+    expect(bridgeNatsClaimAction(first)).toMatchObject({ action: "publish" });
+    const { commandId } = first.record;
+    expect(bridgeNatsClaimAction(await ledger.claim(toNats()))).toMatchObject({ action: "resend" }); // claimed
+    await ledger.markUncertain(commandId);
+    expect(bridgeNatsClaimAction(await ledger.claim(toNats()))).toMatchObject({ action: "resend" }); // uncertain
+    await ledger.markSent(commandId, {});
+    expect(bridgeNatsClaimAction(await ledger.claim(toNats()))).toMatchObject({ action: "awaitAck" });
+    await ledger.settle(commandId, ack(commandId, true, { messageId: "m-1" }));
+    const replay = bridgeNatsClaimAction(await ledger.claim(toNats()));
+    expect(replay).toMatchObject({ action: "replayAck", ack: { accepted: true, data: { messageId: "m-1" } } });
+    await ledger.markAckForwarded(commandId);
+    expect(bridgeNatsClaimAction(await ledger.claim(toNats()))).toMatchObject({ action: "replayAck" });
+    expect(bridgeNatsClaimAction(await ledger.claim(toNats("orig-1", { bodyDigest: "f".repeat(64) }))))
+      .toMatchObject({ action: "refuse", refuse: "BRIDGE_NATS_ID_CONFLICT" });
+    expect(bridgeNatsClaimAction(await ledger.claim(toNats("orig-1", { replyTo: "elsewhere" }))))
+      .toMatchObject({ action: "refuse", refuse: "BRIDGE_NATS_CLAIM_MISMATCH" });
+    // An ACK recorded before the append receipt still replays (never waits for the receipt).
+    const early = (await ledger.claim(toFile())).record.commandId;
+    await ledger.settle(early, { ...ack(early), fromId: LEAD });
+    expect(bridgeNatsClaimAction(await ledger.claim(toFile()))).toMatchObject({ action: "replayAck" });
   });
 
   it("records the first owner ACK only; a replay or a different ACK changes nothing", async () => {

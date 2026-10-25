@@ -596,6 +596,20 @@ export type BridgeNatsClaimResult =
   /** Same mapped id and digest, different source machine / replyTo / target: refuse (BRIDGE_NATS_CLAIM_MISMATCH). */
   | { readonly status: "mismatch"; readonly created: false; readonly record: BridgeNatsCommandRecord };
 
+/**
+ * What the link does with a claim result, at once and without waiting (bridgeNatsClaimAction):
+ * publish: first claim, cross publish now. resend: published or not, the outcome is unconfirmed: send the
+ * same envelope id and recorded bytes again. awaitAck: the destination confirmed the append; nothing to
+ * send (acknowledge the source delivery), the owner's ACK arrives on its own. replayAck: the owner's ACK
+ * is recorded: send it back to the source again now (idempotent there). refuse: answer the verified
+ * source with a notRun refusal carrying the code; never publish.
+ */
+export type BridgeNatsClaimAction =
+  | { readonly action: "publish" | "resend" | "awaitAck"; readonly record: BridgeNatsCommandRecord }
+  | { readonly action: "replayAck"; readonly record: BridgeNatsCommandRecord; readonly ack: BridgeNatsAckRecord }
+  | { readonly action: "refuse"; readonly record: BridgeNatsCommandRecord;
+    readonly refuse: typeof BRIDGE_NATS_REFUSAL.idConflict | typeof BRIDGE_NATS_REFUSAL.claimMismatch };
+
 export interface BridgeNatsSeenRecord {
   readonly v: 1;
   /** Source event/envelope id. */

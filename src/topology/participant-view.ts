@@ -158,6 +158,7 @@ export function leaseValue(entry: TransportKvEntry<unknown>): FabricKvHostLease 
     !Number.isSafeInteger(value.pid) || (value.pid as number) <= 0 ||
     !textValue(value.pidStartTime) || !textValue(value.bootId) ||
     !finiteValue(value.updatedAt) || !finiteValue(value.expiresAt) ||
+    (value.rootRecheck !== undefined && value.rootRecheck !== true) ||
     value.mirror !== undefined || value.mirrorLease !== undefined) return undefined;
   return value as unknown as FabricKvHostLease;
 }
@@ -497,7 +498,7 @@ export class KvParticipantDirectory implements ParticipantView {
       live: !!lease && machineFromKey(host!.key, "h") === machine &&
         lease.id === record.ownerHostId && lease.identityId === record.ownerIdentityId &&
         lease.rootId === record.rootId && lease.incarnation === record.ownerIncarnation &&
-        host!.owner === entry.owner && !KV_TERMINAL.has(record.status) &&
+        host!.owner === entry.owner && !KV_TERMINAL.has(record.status) && lease.rootRecheck !== true &&
         (!ownHost || record.ownerIncarnation === this.options.ownerIncarnation && this.leaseLive()),
     };
   }

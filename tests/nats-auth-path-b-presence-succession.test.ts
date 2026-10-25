@@ -461,7 +461,13 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
       enabled: true, transport: transportA, transportStateDir: stateDir, hostId: id, rootId: id, identity });
     let name = "recheck-owner";
     directory.registerSource(() => [{ ...participant(id, "source", name, Date.now()), sessionId: identity.sessionId }]);
+    // A remote reader on machine-b (its own authenticated user), as any sender would route.
+    const observerTransport = await openFabricTransport({ config: configFor(root, "machine-b").mesh, hostId: "recheck-observer",
+      mesh: new MeshStore(path.join(root, "mesh-observer"), 65_536, 1_000) });
+    const observer = new KvParticipantDirectory({ transport: observerTransport, lease: { live: () => true, signal: new AbortController().signal },
+      identityId: "recheck-observer", rootId: "recheck-observer", ownerIncarnation: "observer" });
     try {
+      observer.start();
       await directory.start();
       expect((await transportA.kv("presence").get(presenceA))?.value).toMatchObject({ id, kind: "root" });
       const expired = armLeaseGone(transportB.kv("leases"), leaseA);
@@ -473,7 +479,11 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
       await transportB.kv("presence").put(key("machine-b", "p", id), `${id}#taker`, participant(id, "taker", "taker", now), 0);
       releaseRenew();
       await checkEntered; // machine-a re-created its lease and now awaits the root re-check
-      expect(await transportA.kv("leases").get(leaseA)).toBeDefined();
+      const recreated = await transportA.kv("leases").get<FabricKvHostLease>(leaseA);
+      expect(recreated?.value).toMatchObject({ rootRecheck: true });
+      // To the remote reader, machine-a's retained row is NOT live beside machine-b's during the check.
+      await vi.waitFor(() => expect(observer.owners(id).find(row => row.machine === "machine-a")?.lease?.revision).toBe(recreated!.revision), { timeout: 5_000 });
+      expect(observer.owners(id).map(row => [row.machine, row.live])).toEqual([["machine-a", false], ["machine-b", true]]);
       holding = true;
       name = "changed-while-recheck-pending";
       directory.scheduleRefresh();
@@ -489,10 +499,14 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
       expect((directory.participantView as KvParticipantDirectory | undefined)?.ready).toBe(false);
       expect(directory.canConsumeMesh()).toBe(false);
       expect(hooks.puts.filter(call => call.key === key("machine-b", "p", id))).toHaveLength(1);
+      // Yielding withdrew machine-a's row (fixture deletes are record-only) and never wrote it live again.
+      expect(deletes.some(item => item.key === presenceA)).toBe(true);
+      expect(observer.owners(id).find(row => row.machine === "machine-a")?.live).toBe(false);
     } finally {
       releaseRenew(); releaseCheck();
       await directory.close().catch(() => undefined);
-      await Promise.allSettled([transportA.close(), transportB.close()]);
+      await observer.close().catch(() => undefined);
+      await Promise.allSettled([transportA.close(), transportB.close(), observerTransport.close()]);
     }
   }, 60_000);
 

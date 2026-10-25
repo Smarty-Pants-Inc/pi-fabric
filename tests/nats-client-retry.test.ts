@@ -152,6 +152,8 @@ describe("A2 callers across verified NATS reopen", () => {
       expect(current?.revision).toBe(revision);
       expect(lease.revision).toBe(revision);
       expect(lease.takeRecreated(), "a same-owner CAS recovery is not a re-creation").toBe(false);
+      expect(lease.rootRecheck).toBe(false);
+      expect(current?.value).not.toHaveProperty("rootRecheck");
     } finally {
       await lease.release().catch(() => undefined);
       fs.rmSync(root, { recursive: true, force: true });
@@ -189,6 +191,14 @@ describe("A2 callers across verified NATS reopen", () => {
       expect(lease.revision).toBe(revision);
       expect(lease.takeRecreated()).toBe(true);
       expect(lease.takeRecreated()).toBe(false);
+      // Written as not routable until the owner re-checks its root; the next write after that is routable.
+      expect((current as TransportKvEntry<unknown> | undefined)?.value).toMatchObject({ rootRecheck: true });
+      await lease.renew();
+      expect((current as TransportKvEntry<unknown> | undefined)?.value).toMatchObject({ rootRecheck: true });
+      lease.clearRootRecheck();
+      await lease.renew();
+      expect(lease.rootRecheck).toBe(false);
+      expect((current as TransportKvEntry<unknown> | undefined)?.value).not.toHaveProperty("rootRecheck");
     } finally {
       await lease.release().catch(() => undefined);
       fs.rmSync(root, { recursive: true, force: true });

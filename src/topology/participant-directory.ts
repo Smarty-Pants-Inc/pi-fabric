@@ -948,7 +948,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const work = Promise.resolve().then(() => lease.renew(AbortSignal.timeout(5_000))).then(async () => {
       // smarty-dev#15310: a lease that expired in KV and was created again may have let another
       // machine register this root meanwhile. Re-check before admission resumes; yield if so.
-      if (lease.takeRecreated()) this.#rootRecheckPending = true;
+      if (lease.takeRecreated() || lease.rootRecheck) this.#rootRecheckPending = true;
       if (this.#rootRecheckPending && lease.live()) {
         const root = this.#natsPublished.get(this.options.rootId);
         const view = this.#participantView;
@@ -963,6 +963,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
           }
         }
         this.#rootRecheckPending = false;
+        // The re-created lease was written with rootRecheck (routes nothing); write it routable again.
+        lease.clearRootRecheck();
+        await lease.renew(AbortSignal.timeout(5_000));
       }
       if (this.#transportRecovering && lease.live()) {
         this.#transportRecovering = false;

@@ -589,6 +589,21 @@ describe("#15310 a live session root on another machine blocks a second registra
     await expect(pending).resolves.toBeUndefined();
   });
 
+  it("routes nothing to a re-created lease awaiting its root re-check, yet it still holds the root against others", async () => {
+    const f = fixture(); f.lease();
+    const flagged = f.leases.seed(otherKey("h"), `${ROOT}#${ELSEWHERE}`, { ...hostLease(ELSEWHERE), rootRecheck: true });
+    f.presence.seed(otherKey("p"), `${ROOT}#${ELSEWHERE}`, root(ELSEWHERE));
+    const observer = f.observer(); await ready(observer);
+    expect(observer.owners(ROOT)).toMatchObject([{ machine: OTHER, live: false, lease: { revision: flagged.revision } }]);
+    expect(observer.resolve(ROOT)).toMatchObject({ live: false });
+    await expect(f.view().publish(root())).rejects.toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE",
+      owners: [{ machine: OTHER, routable: false }] });
+    expect(f.presence.mutations).toEqual([]);
+    // Cleared by its owner's next write: routable again.
+    f.leases.seed(otherKey("h"), `${ROOT}#${ELSEWHERE}`, hostLease(ELSEWHERE));
+    expect(await liveRoute(observer)).toMatchObject({ machine: OTHER, live: true });
+  });
+
   it("allows registration when the other machine's lease has lapsed (crashed owner)", async () => {
     const f = fixture(); f.lease(); elsewhere(f, { lease: false });
     const view = f.view();

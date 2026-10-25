@@ -55,8 +55,10 @@ describe.skipIf(!binary || process.platform !== "linux" || !n4)("A' N4: v2 fleet
       data: { repo: "pi-fabric", number: 1593 } });
     // The crossing stamp (L1 bridge-nats-republish.ts): the link, the source event id, and the sender as KV presence
     // verified it on its credential machine. The sender is attribution only, never presented as `from`.
-    expect(dataOf(copy).bridge).toMatchObject({ from: h.linkName, id: published.id,
-      sender: { id: h.natsMain.id, kind: "main", machine: NATS_MAIN_MACHINE } });
+    // Pinned shape (integrator note 18): no principal; sender = {id, name, kind, sessionId, machine}.
+    expect(dataOf(copy).bridge).toEqual({ from: h.linkName, id: published.id,
+      sender: { id: h.natsMain.id, name: h.natsMain.label, kind: "main", sessionId: h.natsMain.sessionId, machine: NATS_MAIN_MACHINE } });
+    expect(copy.principal).toBeUndefined();
     await barrier();
     expect(hubCopies(token)).toHaveLength(1);
   }, E2E_WAIT_MS * 3);

@@ -93,7 +93,7 @@ export interface MixedLinkConfig {
   /** Seat pins (L3): ALWAYS this harness's fixture; asserted never under $HOME. */
   readonly orgJson: string;
   /** PR 2 relay: hub spoke link names a `viaSpoke` entry may name. */
-  readonly spokes?: readonly string[];
+  readonly relay?: { readonly spokes: readonly string[] };
   readonly nats: {
     readonly servers: readonly string[]; readonly machine: string; readonly credentials: string; readonly caFile: string;
     readonly custodyStream: string; readonly livenessStream: string; readonly pathBMachines: readonly string[]; readonly operatorMachine: string;
@@ -604,8 +604,8 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
       file: { mesh: fileMeshRoot },
       stateDir: path.join(root, "link-state"),
       orgJson,
-      // PR 2 relay: the spoke links a viaSpoke allow entry may name (L3 parseBridgeNatsAllowSection `spokes`).
-      ...(spoke ? { spokes: [SPOKE_LINK_NAME] } : {}),
+      // PR 2 relay: the spoke links a viaSpoke allow entry may name (L5 NatsLinkConfig.relay.spokes -> L3's parser).
+      ...(spoke ? { relay: { spokes: [SPOKE_LINK_NAME] } } : {}),
       nats: { servers: [faults.url], machine: BRIDGE_MACHINE, credentials: broker.users.machineA.credsPath, caFile: broker.tls!.caFile,
         custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream,
         pathBMachines: [...PATH_B_MACHINES], operatorMachine: "fabric-ops",

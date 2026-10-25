@@ -118,7 +118,11 @@ describe.skipIf(!binary || process.platform !== "linux" || !n4)("A' N4: start ga
     // A broker whose agent template carries no event grants (and no FABRIC_EV stream), but a link config asking for events.
     const h = await createMixedHarness({ binary: binary!, autoStart: false, linkEvents: true });
     try {
-      await expect(h.startLinkNow()).rejects.toThrow(/event/i);
+      // Integrator note 18: the refusal names the missing event grant, never reads as a wrong machine credential.
+      const error = await h.startLinkNow().then(() => undefined, (failure: unknown) => failure);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toMatch(/event/i);
+      expect(String(error)).not.toMatch(/machine tag mismatch/i);
       expect(h.link).toBeUndefined();
     } finally { await h.stop(); }
   }, E2E_WAIT_MS + 60_000);

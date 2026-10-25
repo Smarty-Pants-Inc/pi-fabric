@@ -284,6 +284,40 @@ describe("BridgeNatsIdentity: senders and targets come only from presence", () =
     expect(refusal(gate.verifySender("nats", actor.id, views, view("file", []), "other-v2"))).toBe(BRIDGE_NATS_REFUSAL.senderUnverified);
   });
 
+  it("never lets an actor record resolve to a session id (a root's, a seat's, a rotation's)", () => {
+    const gate = createBridgeNatsIdentityGate(parseBridgeNatsAllowSection({
+      file: [{ kind: "root", id: PAUL_SEAT, principal: "Paul" }, { kind: "root", id: LEAD },
+        { kind: "actor", rootId: LEAD, name: "worker", receive: ["followUp", "steer"] }],
+      nats: [{ kind: "root", id: MOVED, machine: "lead-v2" },
+        { kind: "actor", rootId: MOVED, name: "worker", machine: "lead-v2", send: ["followUp"], receive: [] }],
+    }, { link: LINK, natsMachine: BRIDGE }), { pins: PINS, clock: () => NOW });
+    // The audit's F1 sequence: an unpinned NATS actor entry; a fresh, live record on its machine claims the
+    // name of that actor but carries a principal's seat session as its id.
+    for (const forged of [KATE_SEAT, KATE_ROTATION, PAUL_SEAT, LEAD]) {
+      const nats = natsView([record("nats", { id: MOVED, machine: "lead-v2" }),
+        record("nats", { id: forged, kind: "actor", name: "worker", rootId: MOVED, ownerIdentityId: MOVED, machine: "lead-v2" })], false);
+      expect(refusal(gate.verifySender("nats", forged, nats, view("file", []), "lead-v2"))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+    }
+    // The same on the file side: an actor record with a seat's id never gets the actor's (wider) class.
+    const file = view("file", [record("file", { id: LEAD }), record("file", { id: PAUL_SEAT, kind: "actor", name: "worker", rootId: LEAD })]);
+    expect(refusal(gate.verifyTarget("file", PAUL_SEAT, file, natsView([], false)))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);
+    // Counterexample that must keep working: a real actor id with its live owner root.
+    const good = natsView([record("nats", { id: MOVED, machine: "lead-v2" }),
+      record("nats", { id: "b".repeat(32), kind: "actor", name: "worker", rootId: MOVED, machine: "lead-v2" })], false);
+    expect(identity(gate.verifySender("nats", "b".repeat(32), good, view("file", []), "lead-v2")).kind).toBe("actor");
+  });
+
+  it("requires an actor's owner root observation to be fresh too", () => {
+    const gate = createBridgeNatsIdentityGate(parseBridgeNatsAllowSection({
+      nats: [{ kind: "actor", rootId: MOVED, name: "worker", machine: "lead-v2", receive: [] }],
+    }, { link: LINK, natsMachine: BRIDGE }), { pins: PINS, clock: () => NOW });
+    const actor = record("nats", { id: "c".repeat(32), kind: "actor", name: "worker", rootId: MOVED, machine: "lead-v2" });
+    const stale = natsView([record("nats", { id: MOVED, machine: "lead-v2", observedAt: NOW - 15_001 }), actor], false);
+    expect(refusal(gate.verifySender("nats", actor.id, stale, view("file", []), "lead-v2"))).toBe(BRIDGE_NATS_REFUSAL.senderUnverified);
+    const fresh = natsView([record("nats", { id: MOVED, machine: "lead-v2" }), actor], false);
+    expect(identity(gate.verifySender("nats", actor.id, fresh, view("file", []), "lead-v2")).id).toBe(actor.id);
+  });
+
   it("refuses agents and non-canonical roots even when an id matches", () => {
     const agent = view("file", [record("file", { id: LEAD, kind: "agent" })]);
     expect(refusal(gateAt().verifySender("file", LEAD, agent, natsView([], false)))).toBe(BRIDGE_NATS_REFUSAL.notAllowed);

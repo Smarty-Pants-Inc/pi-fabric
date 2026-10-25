@@ -464,9 +464,7 @@ export class BridgeNatsIdentity implements BridgeNatsIdentityGate {
     const record = native[0]!;
     if (!record.live) return refuse(missing, `${id} is not live on ${side}`);
     const now = this.#clock();
-    if (!Number.isFinite(record.observedAt) || now - record.observedAt > this.#maxAgeMs || record.observedAt - now > this.#maxAgeMs) {
-      return refuse(missing, `${id}: the ${side} presence observation is not fresh`);
-    }
+    if (!this.#fresh(record.observedAt, now)) return refuse(missing, `${id}: the ${side} presence observation is not fresh`);
     let entry: BridgeNatsAllowEntry | undefined;
     if (record.kind === "main") {
       if (record.rootId !== record.id || !full(BRIDGE_NATS_SESSION_ID, record.id)) {
@@ -474,6 +472,11 @@ export class BridgeNatsIdentity implements BridgeNatsIdentityGate {
       }
       entry = this.#roots.get(record.id);
     } else if (record.kind === "actor") {
+      // An actor's id is always an actor id (32 lowercase hex), pinned or not: a record that resolves to a
+      // session id (a root's, a principal seat's, a keeper rotation's) can never speak as an actor entry.
+      if (!full(ACTOR_ID, record.id) || this.#roots.has(record.id) || !full(BRIDGE_NATS_SESSION_ID, record.rootId)) {
+        return refuse(BRIDGE_NATS_REFUSAL.notAllowed, `${id} is not an actor id`);
+      }
       entry = this.#actors.get(`${record.rootId}\0${record.name}`);
       if (entry?.kind === "actor" && entry.id !== undefined && entry.id !== record.id) entry = undefined;
     }
@@ -490,9 +493,10 @@ export class BridgeNatsIdentity implements BridgeNatsIdentityGate {
     if (record.kind === "actor") {
       // An actor runs in its owner root's runtime: the root must be live with it, natively, on the same machine.
       const roots = [...view.records(record.rootId)].filter(root => root.id === record.rootId && this.#native(side, root));
-      if (roots.length !== 1 || !roots[0]!.live || roots[0]!.kind !== "main" ||
-          (side === "nats" && roots[0]!.machine !== record.machine)) {
-        return refuse(missing, `${id}: its owner root is not live with it on ${side}`);
+      const root = roots[0];
+      if (roots.length !== 1 || !root!.live || root!.kind !== "main" || root!.rootId !== root!.id ||
+          (side === "nats" && root!.machine !== record.machine) || !this.#fresh(root!.observedAt, now)) {
+        return refuse(missing, `${id}: its owner root is not live with it on ${side}, freshly observed`);
       }
     }
     const identity: BridgeNatsVerifiedIdentity = Object.freeze({
@@ -505,6 +509,10 @@ export class BridgeNatsIdentity implements BridgeNatsIdentityGate {
     });
     this.#issued.add(identity);
     return { ok: true, identity };
+  }
+
+  #fresh(observedAt: number, now: number): boolean {
+    return Number.isFinite(observedAt) && now - observedAt <= this.#maxAgeMs && observedAt - now <= this.#maxAgeMs;
   }
 
   #current(identity: unknown): identity is BridgeNatsVerifiedIdentity {

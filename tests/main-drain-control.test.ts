@@ -45,7 +45,7 @@ describe.skipIf(!linux)("owner-only drain control (M10)", () => {
     await expect(callMainDrain(socketOf(seat), SID, "drain", bindingFor(seat, { runSha256: "f".repeat(64) })))
       .rejects.toMatchObject({ code: "MAIN_DRAIN_REFUSED_RUN_SHA256_MISMATCH" });
     await expect(callMainDrain(socketOf(seat), SID, "drain", { ...bindingFor(seat), runDir: null, lockFd: null, podUid: "00000000-0000-4000-8000-0000000000ee" }))
-      .rejects.toMatchObject({ code: "MAIN_DRAIN_REFUSED_POD_BINDING_OUTSIDE_POD" });
+      .rejects.toMatchObject({ code: "MAIN_DRAIN_REFUSED_POD_BINDING_UNPROVEN" });
     const other = "00000000-0000-4000-8000-0000000000ef";
     await expect(callMainDrain(socketOf(seat), other, "status", null)).rejects.toMatchObject({ code: "MAIN_DRAIN_REFUSED_SESSION_MISMATCH" });
     expect(mainInboxDrainGate(ROOT)).toBeUndefined();
@@ -65,6 +65,24 @@ describe.skipIf(!linux)("owner-only drain control (M10)", () => {
     const undo = await callMainDrain(socketOf(seat), SID, "undo", bindingFor(seat, { phase: "drain-undo" }));
     expect(undo.undo).toMatchObject({ inboxReopened: true, restartRequired: false });
     expect(mainInboxDrainGate(ROOT)).toBeUndefined();
+  });
+
+  it("stage 1 review finding 2: a copied RUN with its own lock cannot replay the operation's tuple", async () => {
+    const seat = await createSeat(); seats.push(seat);
+    await callMainDrain(socketOf(seat), SID, "drain", bindingFor(seat));
+    const copy = path.join(seat.base, "copied-run");
+    fs.mkdirSync(copy, { mode: 0o700 });
+    for (const name of ["seat-run.json", "seat.lock"]) fs.copyFileSync(path.join(seat.runDir, name), path.join(copy, name));
+    fs.chmodSync(path.join(copy, "seat.lock"), 0o600);
+    const lock = fs.openSync(path.join(copy, "seat.lock"), fs.constants.O_RDWR);
+    try {
+      const taken = (await import("node:child_process")).spawnSync("python3", ["-c", "import fcntl; fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)"],
+        { stdio: ["ignore", "ignore", "pipe", lock] });
+      expect(taken.status).toBe(0);
+      await expect(callMainDrain(socketOf(seat), SID, "undo", bindingFor(seat, { phase: "drain-undo", runDir: copy, lockFd: lock })))
+        .rejects.toMatchObject({ code: "MAIN_DRAIN_REFUSED_DRAIN_BOUND_ELSEWHERE" });
+    } finally { fs.closeSync(lock); }
+    expect(mainInboxDrainGate(ROOT)).toBeDefined();
   });
 
   it("the channel is a 0700 seat-owned directory, reachable through its held descriptor whatever the path length", async () => {

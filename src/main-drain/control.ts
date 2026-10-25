@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { bindOrMatch, clearBinding, currentBinding, podBindingAllowed, proveHostBinding, type MainDrainBinding,
+import { bindOrMatch, clearBinding, currentBinding, podBindingAllowed, proveHostBinding, sameOperation, type MainDrainBinding,
   type MainDrainBindingRequest } from "./binding.js";
 import { assertMainInboxOpen, closeMainInbox, mainInboxDrainGate, reopenMainInbox } from "./gate.js";
 import { fenceNativeInput, nativeFenceHeld, observeNativeInput, releaseNativeInput, type NativeInputObservation } from "./native-port.js";
@@ -18,9 +18,10 @@ export interface MainDrainHost {
   agents(): MainDrainAgents | undefined;
   /** The in-memory completion inbox's unconfirmed count (no residency); undefined when there is no inbox. */
   completions?(): number | undefined;
-  /** Tests only: the Main's own environment and /proc. */
+  /** Tests only: the Main's own environment and /proc, and the unproven pod binding (refused in production). */
   environment?: NodeJS.ProcessEnv;
   procRoot?: string;
+  allowUnprovenPodBinding?: boolean;
 }
 export interface MainDrainMain {
   drainSnapshot(): { held: number; handed: number; heldIds: string[]; handedIds: string[]; journalOpen: boolean; halted: boolean; reloading: boolean };
@@ -119,22 +120,23 @@ export class MainDrainControl {
     if (op === "drain" || op === "stop-actors" || op === "undo" || op === "exit") {
       if (!request) return "BINDING_REQUIRED";
       const kind = request.podUid === null ? "host" : "pod";
-      if (kind === "pod" && !podBindingAllowed(this.host.environment)) return "POD_BINDING_OUTSIDE_POD";
+      if (kind === "pod" && !podBindingAllowed(this.host.environment, this.host.allowUnprovenPodBinding === true)) return "POD_BINDING_UNPROVEN";
       if (op === "exit" && kind !== "pod") return "EXIT_REQUIRES_POD_BINDING";
+      let lock: { dev: string; ino: string } | null = null;
       if (kind === "host") {
         const proof = proveHostBinding(request, this.host.sessionId, peer, uid, this.host.procRoot);
         if (proof.refusal) return proof.refusal;
+        lock = proof.lock;
       }
       if (op === "drain") {
         const fresh = currentBinding(rootId) === undefined;
-        const bound = bindOrMatch(rootId, request, kind);
+        const bound = bindOrMatch(rootId, request, kind, lock);
         if (typeof bound === "string") return bound;
         if (fresh) this.#begin();
       } else {
-        // Only the SAME (run, operationId, generation) may act on a standing record: another operation's fence is UNKNOWN.
+        // Only the SAME operation, holding the SAME lock, may act on a standing record: another operation's fence is UNKNOWN.
         const existing: MainDrainBinding | undefined = currentBinding(rootId);
-        if (existing && (existing.run !== request.run || existing.operationId !== request.operationId ||
-          existing.generation !== request.generation || existing.kind !== kind)) return "DRAIN_BOUND_ELSEWHERE";
+        if (existing && !sameOperation(existing, request, kind, lock)) return "DRAIN_BOUND_ELSEWHERE";
         if (op !== "undo" && !existing) return "NOT_BOUND";
       }
     }
@@ -165,8 +167,6 @@ export class MainDrainControl {
   #begin(): void {
     const slot = drainSlot(this.host.rootId);
     slot.children = { runIds: new Set((this.#agentRuns() ?? []).map(run => run.id)), actorIds: new Set(this.#liveSessionActorIds()) };
-    slot.admitted = [];
-    slot.ledger = [];
   }
 
   #liveSessionActorIds(): string[] {
@@ -236,7 +236,8 @@ export class MainDrainControl {
     // The process-global handle survives a reload, and Pi's original release() still reopens its fence.
     // Only a LOST handle (Pi still fenced, nothing held here) needs a restart.
     const native = observeNativeInput(this.host.pi, this.host.context(), rootId);
-    const restartRequired = native.fenceApi && native.piInputsFenced !== false;
+    // A fence-capable host must READ open (a missing context or unreadable state is unknown, never open).
+    const restartRequired = native.capability && !(native.fenceApi && native.piInputsFenced === false);
     // Stage 1 does not recreate a stopped actor: every one this operation stopped must be active again.
     const owned = this.#owned();
     const stopped = peekDrainSlot(rootId)?.stopped ?? [];
@@ -295,7 +296,7 @@ export class MainDrainControl {
     return {
       v: 1, ok: true, op, error: null, sessionId, rootId, meshRoot, pid: process.pid,
       binding: binding ? { kind: binding.kind, run: binding.run, operationId: binding.operationId, generation: binding.generation,
-        phase: binding.phase, podUid: binding.podUid, boundAt: binding.boundAt } : null,
+        phase: binding.phase, podUid: binding.podUid, boundAt: binding.boundAt, lock: binding.lock } : null,
       inbox: { closed: gate !== undefined, closedAt: gate?.closedAt ?? null, held: fabric?.held ?? null, handed: fabric?.handed ?? null,
         heldIds: fabric?.heldIds ?? null, handedIds: fabric?.handedIds ?? null,
         journalOpen: fabric?.journalOpen ?? null, halted: fabric?.halted ?? null, reloading: fabric?.reloading ?? null },
@@ -306,6 +307,7 @@ export class MainDrainControl {
         workers: (runs ?? []).flatMap(run => run.worker ? [{ id: run.id, status: run.status, ...run.worker }] : []) },
       completions: { inboxPending: completions },
       admitted: [...(peekDrainSlot(rootId)?.admitted ?? [])], ledger: [...(peekDrainSlot(rootId)?.ledger ?? [])],
+      ledgerOverflow: peekDrainSlot(rootId)?.ledgerOverflow ?? 0,
       stopped: [...(peekDrainSlot(rootId)?.stopped ?? [])], stopRefused: null,
       undo, exiting: false, exitRefused: [],
     };

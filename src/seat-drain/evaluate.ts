@@ -73,7 +73,16 @@ export const scanCompletions = (meshRoot: string, rootId: string): CompletionSca
     const root = recipientRoot(value);
     if (root === undefined) { result.unknown++; continue; }
     if (root !== rootId) continue;
-    if (!fs.existsSync(path.join(directory, "receipts", name))) result.pending++;
+    // Consumed only by a VALID receipt for this envelope's run (no-follow read, its own id and fields); an
+    // absent receipt is pending, and anything else is unknown, never acknowledged (stage 1 review finding 3).
+    const receiptFile = path.join(directory, "receipts", name);
+    let present = true;
+    try { present = fs.lstatSync(receiptFile, { throwIfNoEntry: false }) !== undefined; } catch { result.unknown++; continue; }
+    if (!present) { result.pending++; continue; }
+    const runId = (value?.result as Record<string, unknown> | undefined)?.id;
+    const receipt = read(receiptFile);
+    if (typeof runId !== "string" || !runId || receipt?.id !== runId || typeof receipt.sessionId !== "string" || !receipt.sessionId ||
+      typeof receipt.consumedAt !== "number" || !Number.isFinite(receipt.consumedAt) || receipt.consumedAt <= 0) result.unknown++;
   }
   const attempts = names(path.join(directory, "attempts"));
   if (!attempts) { result.unknown++; return result; }

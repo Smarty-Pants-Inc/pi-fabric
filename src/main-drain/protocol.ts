@@ -84,7 +84,7 @@ export interface MainDrainReply {
   meshRoot: string;
   pid: number;
   binding: { kind: "host" | "pod"; run: string; operationId: string; generation: string; phase: string; podUid: string | null;
-    boundAt: number } | null;
+    boundAt: number; lock: { dev: string; ino: string } | null } | null;
   inbox: { closed: boolean; closedAt: number | null; held: number | null; handed: number | null; heldIds: string[] | null;
     handedIds: string[] | null; journalOpen: boolean | null; halted: boolean | null; reloading: boolean | null };
   native: NativeInputObservation;
@@ -98,6 +98,8 @@ export interface MainDrainReply {
   /** N1: the drain's own children admitted through the gate; N8: refused inputs (no text). Both for the bound run. */
   admitted: Array<{ at: number; path: string; fromId: string | null; id: string | null }>;
   ledger: Array<{ at: number; path: string; fromId: string | null; id: string | null; textSha256: string | null }>;
+  /** Refusals that did not fit the bounded ledger: nonzero means the ledger is incomplete evidence. */
+  ledgerOverflow: number;
   /** N2: the session actors this operation stopped, each with its recorded public spec, and whether a stop was refused. */
   stopped: Array<{ id: string; spec: Record<string, unknown>; stoppedAt: number }>;
   stopRefused: string | null;

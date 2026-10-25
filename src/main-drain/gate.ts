@@ -86,7 +86,9 @@ export const assertMainInboxOpen = (rootId: string, admission?: MainDrainAdmissi
     appendBounded(slot.admitted ??= [], { at: Date.now(), path: admission.path, fromId, id });
     return;
   }
-  appendBounded(slot.ledger ??= [], { at: Date.now(), path: admission.path, fromId, id,
-    textSha256: admission.text === undefined ? null : createHash("sha256").update(admission.text).digest("hex") });
+  if (!appendBounded(slot.ledger ??= [], { at: Date.now(), path: admission.path, fromId, id,
+    textSha256: admission.text === undefined ? null : createHash("sha256").update(admission.text).digest("hex") })) {
+    slot.ledgerOverflow = (slot.ledgerOverflow ?? 0) + 1;
+  }
   throw new FabricMainDrainingError(rootId);
 };

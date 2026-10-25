@@ -303,8 +303,31 @@ describe.skipIf(!linux)("evidence, binding and undo (contract rev 4)", () => {
     expect(first.receipt).toEqual({ schema: "d3-seam-receipt-v1", run: target.run, phase: "drain-undo", owner: "fabric-v2", result: "pass",
       observed: { sessionId: SID, inputsFenced: false, admissionRestored: true } });
     expect((await inProcess(target, "drain-undo", undoInputs(1, digest))).stdout).toBe(first.stdout);
-    expect((await inProcess(target, "drain-undo", undoInputs(2, digest))).receipt?.result).toBe("pass");
+    // Attempts are contiguous and never follow a pass (review finding 8).
+    expect(await inProcess(target, "drain-undo", undoInputs(2, digest))).toMatchObject({ code: 2, stdout: "",
+      stderr: "GAP: undo-already-passed [owner: fabric-v2]\n" });
+    expect(await inProcess(target, "drain-undo", undoInputs(5, digest))).toMatchObject({ code: 2, stdout: "",
+      stderr: "GAP: undo-attempt-out-of-order [owner: fabric-v2]\n" });
     expect(await inProcess(target, "drain-undo", undoInputs(3, "0".repeat(64)))).toMatchObject({ code: 2, stdout: "" });
+  });
+
+  it("review finding 5: a stored PASS receipt with no drain intent is a contradiction, never the N3 shortcut", async () => {
+    const target = await seat();
+    const fake = JSON.stringify({ schema: "d3-seam-receipt-v1", run: target.run, phase: "drain", owner: "fabric-v2", result: "pass",
+      observed: { sessionId: SID, inputAdmission: 1, inputsFenced: true, queued: 0, admitted: 0, childrenTerminal: true } });
+    const digest = storeReceipt(target, "drain", fake);
+    expect(await inProcess(target, "drain-undo", undoInputs(1, digest))).toMatchObject({ code: 2, stdout: "",
+      stderr: "GAP: drain-pass-without-intent [owner: fabric-v2]\n" });
+  });
+
+  it("review finding 3: a malformed completion receipt is unknown custody, never consumed", async () => {
+    const target = await seat();
+    const directory = path.join(target.meshRoot, "agent-completions");
+    fs.mkdirSync(path.join(directory, "receipts"), { recursive: true });
+    fs.writeFileSync(path.join(directory, "r.json"), JSON.stringify({ format: 1, recipient: { rootId: ROOT }, result: { id: "6".repeat(32) } }));
+    fs.writeFileSync(path.join(directory, "receipts", "r.json"), "{}");
+    expect((await inProcess(target, "drain", {}, { deadlineMs: 2_000 })).receipt?.observed.reason).toBe("children-live");
+    expect(outcome(target).reasons).toContain("children:completion-unknown:1");
   });
 
   it("N6 iii: a PASS that A rejected is undone while receipts/fence.json is absent, never after", async () => {
@@ -348,6 +371,14 @@ describe.skipIf(!linux)("evidence, binding and undo (contract rev 4)", () => {
     expect(undo.receipt).toMatchObject({ result: "refused", observed: { sessionId: SID, inputsFenced: true, admissionRestored: false } });
   });
 
+  it("review finding 4: a fence-capable host whose state cannot be read is never reported open", async () => {
+    const target = await seat();
+    expect((await inProcess(target, "drain")).receipt?.result).toBe("pass");
+    target.host.context = () => undefined;
+    const undo = await inProcess(target, "drain-undo", undoInputs(1, null));
+    expect(undo.receipt).toMatchObject({ result: "refused", observed: { sessionId: SID, inputsFenced: true, admissionRestored: false } });
+  });
+
   it("N6 ii: another operation's fence is UNKNOWN (exit 2) and stays held", async () => {
     const target = await seat();
     expect((await inProcess(target, "drain")).receipt?.result).toBe("pass");
@@ -375,6 +406,7 @@ describe.skipIf(!linux)("evidence, binding and undo (contract rev 4)", () => {
     target.actors.drainQuiescence = () => ["status-stopped"];
     target.actors.drainWorker = () => null;
     expect((await inProcess(target, "drain")).receipt?.result).toBe("pass");
+    storeReceipt(target, "fence", "{}");
     // v1 crash-restarted between drain and fence: a new actor, retired as host-exit, revives on v2.
     target.writeActors([actorRow(done, "stopped", { stopReason: "explicit" }), actorRow("2".repeat(32), "stopped", { stopReason: "host-exit" })]);
     const result = await inProcess(target, "drain-recheck");
@@ -384,9 +416,13 @@ describe.skipIf(!linux)("evidence, binding and undo (contract rev 4)", () => {
     expect(result.receipt).toMatchObject({ result: "refused", observed: { sessionId: SID, complete: true, actorsNotStopped: 1, totals: { actors: 2, followUps: 0 } } });
   });
 
-  it("drain-recheck passes truthfully only with the passing values", async () => {
+  it("drain-recheck passes truthfully only with the passing values, and only after this operation's drain and A's fence", async () => {
     const target = await seat();
+    // Lineage first (review finding 5): no drain intent, a refused drain, or no fence receipt is UNKNOWN.
+    expect(await inProcess(target, "drain-recheck")).toMatchObject({ code: 2, stderr: "GAP: intent-missing [owner: fabric-v2]\n" });
     expect((await inProcess(target, "drain")).receipt?.result).toBe("pass");
+    expect(await inProcess(target, "drain-recheck")).toMatchObject({ code: 2, stderr: "GAP: fence-receipt-missing [owner: fabric-v2]\n" });
+    storeReceipt(target, "fence", "{}");
     const result = await inProcess(target, "drain-recheck");
     expect(result.receipt).toEqual({ schema: "d3-seam-receipt-v1", run: target.run, phase: "drain-recheck", owner: "fabric-v2", result: "pass",
       observed: { sessionId: SID, complete: true, totals: { actors: 0, followUps: 0, queued: 0, inFlight: 0, settledWindows: 0,

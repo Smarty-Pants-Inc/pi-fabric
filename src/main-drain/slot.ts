@@ -17,6 +17,9 @@ export interface MainDrainSlotBinding {
   phase: string;
   podUid: string | null;
   boundAt: number;
+  /** Host bindings: the canonical RUN and the seat lock's inode proved at bind; every later op must prove the SAME lock. */
+  runDir: string | null;
+  lock: { dev: string; ino: string } | null;
 }
 /** challenge r2 N8: one refused input, without its text. */
 export interface MainDrainRefusal { at: number; path: string; fromId: string | null; id: string | null; textSha256: string | null }
@@ -28,8 +31,9 @@ export interface MainDrainSlot {
   /** N1: the drain's own children, admitted through the gate until the native fence is taken. */
   children?: { runIds: Set<string>; actorIds: Set<string> };
   admitted?: Array<{ at: number; path: string; fromId: string | null; id: string | null }>;
-  /** N8: the refusal ledger of the current binding (bounded). */
+  /** N8: the refusal ledger of the current binding (bounded); ledgerOverflow counts entries that did not fit. */
   ledger?: MainDrainRefusal[];
+  ledgerOverflow?: number;
   /** N2: actors this operation stopped, with their recorded public spec. */
   stopped?: Array<{ id: string; spec: Record<string, unknown>; stoppedAt: number }>;
 }

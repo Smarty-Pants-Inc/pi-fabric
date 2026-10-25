@@ -29,6 +29,8 @@ type Capabilities = { inputAdmission?: unknown; extensionInputFence?: unknown };
 export interface NativeInputObservation {
   /** `pi.hostCapabilities.inputAdmission` (1 on an input-admission host); null when absent. */
   inputAdmission: number | null;
+  /** The host advertises the extension fence (`extensionInputFence === 1`), whether or not a live context is at hand. */
+  capability: boolean;
   /** The extension-facing fence API is present on this host and context. */
   fenceApi: boolean;
   /** This process holds the root's fence and Pi reads it back as fenced. */
@@ -83,6 +85,7 @@ export const observeNativeInput = (pi: ExtensionAPI, ctx: ExtensionContext | und
   const state = api ? inputState(ctx) : undefined;
   return {
     inputAdmission: Number.isSafeInteger(admission) ? admission as number : null,
+    capability: capabilities(pi)?.extensionInputFence === 1,
     fenceApi: api,
     inputsFenced: api && peekDrainSlot(rootId)?.fence !== undefined && state?.inputsFenced === true,
     piInputsFenced: state?.inputsFenced ?? null,

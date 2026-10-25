@@ -70,19 +70,31 @@ export const clearBinding = (rootId: string): void => {
  * Bind (first call) or match (same run, operation and generation: idempotent). A different run or
  * operation while a binding stands is refused: one fence per Main.
  */
-export const bindOrMatch = (rootId: string, request: MainDrainBindingRequest, kind: "host" | "pod", now = Date.now()): MainDrainBinding | string => {
+export const bindOrMatch = (rootId: string, request: MainDrainBindingRequest, kind: "host" | "pod", lock: { dev: string; ino: string } | null,
+  now = Date.now()): MainDrainBinding | string => {
   const slot = drainSlot(rootId);
   const existing = slot.binding;
-  if (existing) {
-    return existing.run === request.run && existing.runSha256 === request.runSha256 && existing.operationId === request.operationId &&
-      existing.generation === request.generation && existing.kind === kind && existing.podUid === request.podUid
-      ? existing : "DRAIN_BOUND_ELSEWHERE";
-  }
+  if (existing) return sameOperation(existing, request, kind, lock) ? existing : "DRAIN_BOUND_ELSEWHERE";
   const binding: MainDrainBinding = { kind, run: request.run, runSha256: request.runSha256, operationId: request.operationId,
-    generation: request.generation, phase: request.phase, podUid: request.podUid, boundAt: now };
+    generation: request.generation, phase: request.phase, podUid: request.podUid, boundAt: now,
+    runDir: request.runDir, lock };
   slot.binding = binding;
+  slot.admitted = [];
+  slot.ledger = [];
+  slot.ledgerOverflow = 0;
   return binding;
 };
+
+/**
+ * The SAME operation: run, its bytes, operationId, generation, kind and pod UID, and for a host binding the SAME
+ * canonical RUN and the SAME seat-lock inode proved at bind (a copied RUN with its own lock cannot replay the tuple).
+ */
+export const sameOperation = (existing: MainDrainBinding, request: MainDrainBindingRequest, kind: "host" | "pod",
+  lock: { dev: string; ino: string } | null): boolean =>
+  existing.run === request.run && existing.runSha256 === request.runSha256 && existing.operationId === request.operationId &&
+  existing.generation === request.generation && existing.kind === kind && existing.podUid === request.podUid &&
+  existing.runDir === request.runDir && (existing.lock === null ? lock === null : lock !== null && existing.lock.dev === lock.dev &&
+    existing.lock.ino === lock.ino);
 
 const readNoFollow = (file: string, uid: number, limit: number): Buffer => {
   const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | (fs.constants.O_NONBLOCK ?? 0));
@@ -165,6 +177,12 @@ export const proveHostBinding = (request: MainDrainBindingRequest, sessionId: st
   return { refusal: null, lock: identity, peerStartTime: startedBefore };
 };
 
-/** A pod binding is honoured only by a Main whose own environment is a Kubernetes container. */
-export const podBindingAllowed = (environment: NodeJS.ProcessEnv = process.env): boolean =>
-  typeof environment.KUBERNETES_SERVICE_HOST === "string" && environment.KUBERNETES_SERVICE_HOST.length > 0;
+/**
+ * A pod binding carries no lock: inside the Pod any same-UID process (the Main's own tools included) could
+ * present one. Until a trusted pod-identity and caller proof exists (stage 1 review finding 1), pod bindings
+ * are REFUSED. `unproven` is a test-only override; production never sets it. Even then, only a Main whose own
+ * environment is a Kubernetes container honours one.
+ */
+export const POD_BINDING_PROOF = false;
+export const podBindingAllowed = (environment: NodeJS.ProcessEnv = process.env, unproven = false): boolean =>
+  (POD_BINDING_PROOF || unproven) && typeof environment.KUBERNETES_SERVICE_HOST === "string" && environment.KUBERNETES_SERVICE_HOST.length > 0;

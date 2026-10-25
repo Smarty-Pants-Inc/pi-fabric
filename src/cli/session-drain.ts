@@ -108,7 +108,8 @@ export const runSessionDrainCli = async (
       // Not drained: the Pod's Main undoes itself here (release, reopen); the seam reports refused.
       const undo = await callMainDrain(socket, sessionId, "undo", binding).catch(() => undefined);
       return emit({ op: "exit", drained: false, exiting: false,
-        inputsFenced: !undo || undo.undo?.restartRequired === true || (undo.native.fenceApi && undo.native.piInputsFenced !== false),
+        inputsFenced: !undo || undo.undo?.restartRequired === true ||
+          (undo.native.capability && !(undo.native.fenceApi && undo.native.piInputsFenced === false)),
         reasons: evaluation.reasons, observed: evaluation.observed, reply, undo: undo?.undo ?? null }, false);
     }
     const exit = await callMainDrain(socket, sessionId, "exit", binding);

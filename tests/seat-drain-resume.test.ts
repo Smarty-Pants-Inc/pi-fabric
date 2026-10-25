@@ -118,9 +118,20 @@ describe.skipIf(!linux)("the in-pod CLI half: pi-fabric session drain --exit aga
     return { code, stderr, line: stdout ? JSON.parse(stdout) as Record<string, any> : undefined };
   };
 
+  // Pod bindings stay refused in production until a trusted pod-identity proof exists (stage 1 review finding 1);
+  // these tests exercise the in-pod mechanics behind the test-only override.
+  it("pod bindings are refused without a trusted pod proof, even inside a Kubernetes container", async () => {
+    const seat = await createSeat(); seats.push(seat);
+    seat.host.environment = { KUBERNETES_SERVICE_HOST: "10.0.0.1" };
+    const result = await cli(seat, exitArgs(seat));
+    expect(result).toMatchObject({ code: 1, line: { error: "MAIN_DRAIN_REFUSED_POD_BINDING_UNPROVEN" } });
+    expect(mainInboxDrainGate(ROOT)).toBeUndefined();
+  });
+
   it("drains, then the Main accepts a clean exit and shuts down after its reply", async () => {
     const seat = await createSeat(); seats.push(seat);
     seat.host.environment = { KUBERNETES_SERVICE_HOST: "10.0.0.1" };
+    seat.host.allowUnprovenPodBinding = true;
     const result = await cli(seat, exitArgs(seat));
     expect(result.line).toMatchObject({ format: 1, sessionId: SID, op: "exit", drained: true, exiting: true, inputsFenced: true });
     expect(result.code).toBe(0);
@@ -130,14 +141,16 @@ describe.skipIf(!linux)("the in-pod CLI half: pi-fabric session drain --exit aga
 
   it("a host Main (no Kubernetes env) refuses a pod binding", async () => {
     const seat = await createSeat(); seats.push(seat);
+    seat.host.allowUnprovenPodBinding = true;
     const result = await cli(seat, exitArgs(seat));
-    expect(result).toMatchObject({ code: 1, line: { error: "MAIN_DRAIN_REFUSED_POD_BINDING_OUTSIDE_POD" } });
+    expect(result).toMatchObject({ code: 1, line: { error: "MAIN_DRAIN_REFUSED_POD_BINDING_UNPROVEN" } });
     expect(mainInboxDrainGate(ROOT)).toBeUndefined();
   });
 
   it("a Pod Main that does not drain undoes itself and reports inputsFenced false; it never exits", async () => {
     const seat = await createSeat(); seats.push(seat);
     seat.host.environment = { KUBERNETES_SERVICE_HOST: "10.0.0.1" };
+    seat.host.allowUnprovenPodBinding = true;
     seat.writeJournal([{ id: "replayed-1" }]);
     const result = await cli(seat, exitArgs(seat));
     expect(result.line).toMatchObject({ op: "exit", drained: false, exiting: false, inputsFenced: false });

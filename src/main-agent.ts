@@ -15,6 +15,7 @@ import { extensionContextLive } from "./session-liveness.js";
 import { fabricPathBProbeEpochNs, hasFabricPathBProbeObserver, recordFabricPathBProbe } from "./transport/probe-hooks.js";
 
 import { FabricInterruptNotAuthorizedError, FabricInterruptRateLimitedError, type FabricInterruptAuthority } from "./interrupt-authority.js";
+import { assertMainInboxOpen } from "./main-drain/gate.js";
 
 const MAIN_AGENT_ALIAS = "main";
 // Pi can report idle while a prompt's preflight still runs. Sending a followUp then puts it
@@ -769,6 +770,9 @@ export class MainAgentController implements FabricMainAgentTarget {
       const admitted = this.#admitted(deliveryId);
       if (admitted) return { queued: true, messageId: admitted, routed: "main", duplicate: true, triggered: false };
     }
+    // D3 seat drain (smarty-dev#15310): refuse a NEW delivery before any admission, journal write
+    // or Pi handoff. A duplicate of an admitted delivery still gets its truthful receipt above.
+    assertMainInboxOpen(this.id);
     if (request.priority === "interrupt") {
       const now = performance.now();
       for (const [id, at] of this.#lastInterrupt) if (now - at >= 60_000) this.#lastInterrupt.delete(id);
@@ -932,6 +936,16 @@ export class MainAgentController implements FabricMainAgentTarget {
   /** Presence maintenance confirms only the existing durable native receipt path. */
   confirmInbox(): void { this.#confirm(); }
 
+  /**
+   * D3 seat drain (smarty-dev#15310), read-only: what this controller holds in memory. held: not
+   * yet handed to Pi; handed: handed or replayed but not yet confirmed in the session. The journal
+   * file is the durable record; the seam counts that file, and this is private evidence beside it.
+   */
+  drainSnapshot(): { held: number; handed: number; journalOpen: boolean; halted: boolean; reloading: boolean } {
+    return { held: this.#held.length, handed: this.#sent.length + this.#unverified.length,
+      journalOpen: this.#journal !== undefined, halted: this.#halted, reloading: this.#reloading };
+  }
+
   /** Admit a claimed rotation carrier with its ORIGINAL native message id. The existing
    * delivery-id index and journal-before-Pi barrier make a crash/retry idempotent. */
   receiveInboxItem(original: HeldAgentMessage): void {
@@ -939,6 +953,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (this.#inboxFence && (!this.#inboxFence.active() || !this.#inboxFence.owns(original.id))) throw new Error("Main inbox claim belongs elsewhere");
     const deliveryId = original.deliveryId ?? `inbox:${original.id}`;
     if (this.#admitted(deliveryId) || this.#refreshDelivered(true).has(original.id)) return;
+    // A draining root claims no new rotation carrier; it stays with its predecessor (smarty-dev#15310).
+    assertMainInboxOpen(this.id);
     const { handed: _handed, ...item } = original;
     const retained = { ...item, deliveryId };
     this.#admit(retained);

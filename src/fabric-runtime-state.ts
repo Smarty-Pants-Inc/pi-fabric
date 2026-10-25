@@ -200,6 +200,8 @@ const escapeXmlText = (value: string): string =>
 import type { FabricManagedHost } from "./managed-host.js";
 import { captureLoadedFileIdentity, type FabricLoadedFileIdentity } from "./build-identity.js";
 import { senderAgent } from "./guards/sender-headers.js";
+import { MainDrainControl } from "./main-drain/control.js";
+import { MainDrainServer } from "./main-drain/server.js";
 
 // Loaded-code identity of this lazy runtime module. Stable-path lazy imports
 // keep their first evaluation for the life of the host process, so a hash
@@ -264,6 +266,8 @@ export class FabricRuntimeState {
   /** Durable decisions for headless approvals and routed child dialogs; mesh-enabled sessions only. */
   #decisions: DecisionStore | undefined;
   #mainAgent: MainAgentController | undefined;
+  /** D3 seat drain (smarty-dev#15310): the owner-only local drain channel of this Main. */
+  #mainDrain: MainDrainServer | undefined;
   #participants: ParticipantDirectory | undefined;
   #providerParticipants = new ProviderParticipantRegistry();
   #control: FabricControlPlane | undefined;
@@ -1174,6 +1178,15 @@ export class FabricRuntimeState {
           active: () => this.#meshActivationReady() && live.current() && mainInboxActive(meshRoot, mainAgentId, inboxActivation),
         } : undefined,
       );
+      if (meshConfig.enabled && mainAgent.local && mainAgent.id === `session:${sessionId}` && !this.#mainDrain) {
+        // D3 seat drain (smarty-dev#15310): owner-only, local socket; never a mesh path.
+        const drain = new MainDrainServer(new MainDrainControl({
+          rootId: mainAgent.id, sessionId, meshRoot, pi: this.pi, context: () => live.read(ctx => ctx),
+          main: () => mainAgent, actors: () => this.#actors, agents: () => this.#agents,
+        }));
+        this.#mainDrain = drain;
+        void drain.start();
+      }
       if (meshConfig.enabled && mainAgent.local) {
         inboxMaintenance = new MainInboxMaintenance(mesh, identity, participants, mainAgent, meshConfig);
         if (recordedRotation || (predecessor && predecessor.id !== mainAgentId)) await inboxMaintenance.run();
@@ -2480,6 +2493,10 @@ export class FabricRuntimeState {
   async #shutdownSteps(reason?: string, targetSessionFile?: string): Promise<void> {
     const transportAbort = this.#transportAbort;
     this.sessionApprovals.reset();
+    // The drain gate and fence are process-wide; only this generation's listener closes here.
+    const mainDrain = this.#mainDrain;
+    this.#mainDrain = undefined;
+    await mainDrain?.close().catch(() => undefined);
     // Disposable actor/task results and journals belong to their worker, not
     // to this runtime's advisory presence/heartbeat writes. EOF must not convoy
     // behind the shared mesh lock before local teardown stops its timers (#5256).
@@ -2749,6 +2766,9 @@ export class FabricRuntimeState {
 
   async #closeInternalSteps(): Promise<void> {
     const transportAbort = this.#transportAbort;
+    const mainDrain = this.#mainDrain;
+    this.#mainDrain = undefined;
+    await mainDrain?.close().catch(() => undefined);
     for (const unsubscribe of this.#sandboxAutoReturnUnsubscribe.splice(0)) unsubscribe();
     this.#sandboxAutoReturn = undefined;
     this.#stopHerdrLookup?.();

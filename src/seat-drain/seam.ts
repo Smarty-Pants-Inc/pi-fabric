@@ -629,6 +629,8 @@ const resumeDrain = async (context: Context, sealed: SealedRun): Promise<number>
   let exec: Record<string, unknown> | undefined;
   let execAttempted = false;
   let execCode: number | null = null;
+  // The CLI's last stdout line, bounded, kept even when it is a refusal ({format, error}) for triage.
+  let podLine: string | null = null;
   if (!before) reason = "pod-unreadable";
   else if (!cli) reason = "pod-cli-unconfirmed";
   else if (!before.piRunning || !before.meshRoot) reason = before.piRunning ? "pod-mesh-root-unknown" : "pod-not-running";
@@ -642,6 +644,7 @@ const resumeDrain = async (context: Context, sealed: SealedRun): Promise<number>
       "--operation-id", request.operationId, "--generation", generation, "--deadline-s", String(deadlineS)], remaining());
     execCode = result.code;
     const line = result.stdout.trim().split("\n").at(-1) ?? "";
+    podLine = line.slice(0, 4096);
     try { exec = JSON.parse(line) as Record<string, unknown>; } catch { exec = undefined; }
     if (!exec || exec.format !== 1 || exec.sessionId !== request.sessionId || exec.op !== "exit") { reason = "pod-drain-unreadable"; exec = undefined; }
     // The complete exit response, with a zero kubectl exit (re-review finding 5).
@@ -667,7 +670,7 @@ const resumeDrain = async (context: Context, sealed: SealedRun): Promise<number>
   const observed = { podUid: pod.uid, inputsFenced, exited };
   const passed = reason === null && inputsFenced && exited;
   evidence(context, "fabric-v2-resume-drain-outcome.json", { schema: "fabric-v2-resume-drain-outcome-v1", result: passed ? "pass" : "refused",
-    reason, intentSha256, observed, measured: { before: before ?? null, after: after ?? null, execCode }, asserted: { podDrain: exec ?? null } });
+    reason, intentSha256, observed, measured: { before: before ?? null, after: after ?? null, execCode }, asserted: { podDrain: exec ?? null, podLine } });
   context.io.stdout(receipt(request, passed ? "pass" : "refused", observed));
   return 0;
 };

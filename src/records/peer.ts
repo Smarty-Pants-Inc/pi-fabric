@@ -14,7 +14,8 @@ export interface PeerInfo { pid: number; uid: number; gid: number; cmdline?: str
 const PEERCRED = "import ctypes,struct; l=ctypes.CDLL(None,use_errno=True); b=ctypes.create_string_buffer(12); n=ctypes.c_uint32(12); "
   + "r=l.getsockopt(3,1,17,b,ctypes.byref(n)); print(*struct.unpack('3i', b.raw)) if r==0 else None";
 
-export const peerCredentials = (socket: net.Socket, timeoutMs = 5_000): Promise<PeerInfo | undefined> =>
+/** `python`: a fixed interpreter, run isolated (-I) with a minimal env, for callers whose PATH is not trusted. */
+export const peerCredentials = (socket: net.Socket, timeoutMs = 5_000, python?: string): Promise<PeerInfo | undefined> =>
   new Promise((resolve) => {
     let out = "";
     let child: ReturnType<typeof spawn>;
@@ -26,7 +27,9 @@ export const peerCredentials = (socket: net.Socket, timeoutMs = 5_000): Promise<
       return;
     }
     try {
-      child = spawn("python3", ["-c", PEERCRED], { env: childProcessEnvironment(), stdio: ["ignore", "pipe", "ignore", fd], timeout: timeoutMs });
+      child = python
+        ? spawn(python, ["-I", "-B", "-c", PEERCRED], { env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" }, stdio: ["ignore", "pipe", "ignore", fd], timeout: timeoutMs })
+        : spawn("python3", ["-c", PEERCRED], { env: childProcessEnvironment(), stdio: ["ignore", "pipe", "ignore", fd], timeout: timeoutMs });
     } catch {
       resolve(undefined);
       return;

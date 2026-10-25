@@ -15,6 +15,8 @@ It reads one request on stdin and writes one receipt on stdout. The contract is 
 
 The seam never deletes or acknowledges anything. Its evidence is private, write-once, and kept under RUN.
 
+The live proof on the synthetic test seat is in [d3-drain-test-seat-proof.md](d3-drain-test-seat-proof.md).
+
 ## Install (per seat host)
 
 ```sh

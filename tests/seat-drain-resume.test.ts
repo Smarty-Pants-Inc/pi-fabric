@@ -105,6 +105,12 @@ describe.skipIf(!linux)("resume-drain through kubectl exec (M9)", () => {
     const garbled = await kubeSeat({ line: "not json" });
     expect((await resume(garbled.seat, garbled.kubectl, "/opt/pi-fabric/dist/cli/index.js")).receipt)
       .toMatchObject({ result: "refused", observed: { podUid: POD.uid, inputsFenced: true, exited: false } });
+    // The CLI's own refusal line is kept for triage (the test-seat runbook reads it).
+    const refusal = JSON.stringify({ format: 1, error: "MAIN_DRAIN_REFUSED_PEER_UNVERIFIED" });
+    const refused = await kubeSeat({ line: refusal, code: 1 });
+    expect((await resume(refused.seat, refused.kubectl, "/opt/pi-fabric/dist/cli/index.js")).receipt).toMatchObject({ result: "refused" });
+    const outcome = JSON.parse(fs.readFileSync(path.join(refused.seat.runDir, "fabric-v2-resume-drain-outcome.json"), "utf8"));
+    expect(outcome).toMatchObject({ reason: "pod-drain-unreadable", asserted: { podDrain: null, podLine: refusal } });
   });
 
   it("re-review finding 4: a pod on another node than the sealed target is UNKNOWN (exit 2)", async () => {

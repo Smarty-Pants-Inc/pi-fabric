@@ -40,6 +40,21 @@ describe.skipIf(!linux)("owner-only drain control (M10)", () => {
     expect(mainInboxDrainGate(ROOT)).toBeUndefined();
   });
 
+  it("the Main's SO_PEERCRED helper is the fixed /usr/bin/python3: a python3 planted first in its PATH cannot answer", async () => {
+    const seat = await createSeat(); seats.push(seat);
+    const planted = path.join(seat.base, "planted-bin");
+    fs.mkdirSync(planted, { mode: 0o700 });
+    // A lying helper: it would name pid 1 as root, which the lock proof refuses.
+    fs.writeFileSync(path.join(planted, "python3"), "#!/bin/sh\necho 1 0 0\n", { mode: 0o700 });
+    const binding = bindingFor(seat); // takes the synthetic lock first, with the real python3
+    const saved = process.env.PATH;
+    process.env.PATH = `${planted}:${saved ?? ""}`;
+    try {
+      const reply = await callMainDrain(socketOf(seat), SID, "drain", binding);
+      expect(reply.binding).toMatchObject({ kind: "host", run: seat.run, operationId: seat.operationId });
+    } finally { process.env.PATH = saved; }
+  });
+
   it("refuses a request bound to another run's bytes, another session, or a pod on a host Main", async () => {
     const seat = await createSeat(); seats.push(seat);
     await expect(callMainDrain(socketOf(seat), SID, "drain", bindingFor(seat, { runSha256: "f".repeat(64) })))

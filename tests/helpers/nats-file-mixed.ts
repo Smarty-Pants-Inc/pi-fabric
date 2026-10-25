@@ -10,9 +10,11 @@
 // presence, leases, ACKs and the broker are the product's.
 //
 // The link contract: `startNatsLink(config, { signal, log }) -> { closed, stop }` in src/mesh/bridge-nats-link.ts
-// (L2), the config is L5's NatsLinkConfig (src/mesh/bridge-nats-config.ts, validated here with its own
-// parser), shared ids/types are L3's (src/mesh/bridge-nats-types.ts). Until L2 lands, `loadNatsLink()`
-// returns undefined and the link-dependent E2E files skip; `startLink` may also be injected.
+// (L2). The config is L5's NatsLinkConfig (src/mesh/bridge-nats-config.ts): the harness builds its JSON and,
+// when L5's module is in the checkout, validates it with L5's own parser (`validateLinkConfig`). Allow entries
+// are L3's BridgeNatsAllowEntryInput (send/receive/receiveTopics), the only shape (integrator notes 4-6).
+// `orgJson` is always this harness's fixture with fictional ids, never a real org.json. Until L2 lands,
+// `loadNatsLink()` returns undefined and the link-dependent E2E files skip; `startLink` may also be injected.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -28,7 +30,7 @@ import { MeshStore, type MeshEvent, type MeshIdentity } from "../../src/mesh/sto
 import { openFabricTransport } from "../../src/transport/index.js";
 import { runTransportAdmin } from "../../src/transport/nats/admin.js";
 import { hashToken } from "../../src/transport/nats/subjects.js";
-import { parseNatsLinkConfig, type NatsLinkAllowEntry, type NatsLinkConfig } from "../../src/mesh/bridge-nats-config.js";
+import type { BridgeNatsAllowEntryInput } from "../../src/mesh/bridge-nats-types.js";
 import type { FabricControlOperation } from "../../src/topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantRecord, FabricKvHostLease } from "../../src/topology/types.js";
 import type { FabricTransport, TransportEnvelope, TransportSent } from "../../src/transport/types.js";
@@ -51,7 +53,7 @@ export const SEAT_PRINCIPAL = "Kate";
 export const rootId = (session: string): string => `session:${session}`;
 
 // ---------------------------------------------------------------------------------------------
-// Link entry (L2). Config: L5's NatsLinkConfig. Handle: { closed, stop }.
+// Link entry (L2). Config: L5's NatsLinkConfig JSON. Handle: { closed, stop }.
 // ---------------------------------------------------------------------------------------------
 
 export interface MixedLinkHandle {
@@ -64,11 +66,38 @@ export interface MixedLinkHandle {
 export interface MixedLinkStartOptions {
   readonly signal: AbortSignal;
   readonly log: (line: string) => void;
-  /** The org.json seat-pin file (fixture). Production default: bridgeNatsOrgJsonCandidates(). */
-  readonly orgJson: string;
 }
 
-export type StartMixedLink = (config: NatsLinkConfig, options: MixedLinkStartOptions) => Promise<MixedLinkHandle>;
+/** The NatsLinkConfig JSON the harness builds (L5 owns the schema; L5's parser validates it when present). */
+export interface MixedLinkConfig {
+  readonly version: 1;
+  readonly name: string;
+  readonly link: string;
+  readonly file: { readonly mesh: string };
+  readonly stateDir: string;
+  /** Seat pins (L3): ALWAYS this harness's fixture; asserted never under $HOME. */
+  readonly orgJson: string;
+  readonly nats: {
+    readonly servers: readonly string[]; readonly machine: string; readonly credentials: string; readonly caFile: string;
+    readonly custodyStream: string; readonly livenessStream: string; readonly pathBMachines: readonly string[]; readonly operatorMachine: string;
+  };
+  readonly allow: { readonly file: readonly BridgeNatsAllowEntryInput[]; readonly nats: readonly BridgeNatsAllowEntryInput[] };
+}
+
+export type StartMixedLink = (config: unknown, options: MixedLinkStartOptions) => Promise<MixedLinkHandle>;
+
+const CONFIG_MODULE = path.resolve(import.meta.dirname, "../../src/mesh/bridge-nats-config.ts");
+/** L5's link-config module, when this checkout has it. */
+export async function loadLinkConfigModule(): Promise<Record<string, unknown> | undefined> {
+  return fs.existsSync(CONFIG_MODULE) ? await import(pathToFileURL(CONFIG_MODULE).href) as Record<string, unknown> : undefined;
+}
+
+/** L5's parsed NatsLinkConfig for this JSON (its parser refuses any drift), or the JSON itself before L5 lands. */
+export async function validateLinkConfig(config: MixedLinkConfig): Promise<unknown> {
+  const module = await loadLinkConfigModule();
+  const parse = module?.parseNatsLinkConfig;
+  return typeof parse === "function" ? (parse as (value: unknown) => unknown)(config) : config;
+}
 
 const LINK_ENTRY = path.resolve(import.meta.dirname, "../../src/mesh/bridge-nats-link.ts");
 
@@ -89,19 +118,16 @@ export const ROOT_SEND_OPERATIONS: readonly FabricControlOperation[] = ["steer",
 /** A principal seat receives followUp and cancel only (L3 BRIDGE_NATS_SEAT_RECEIVE). */
 export const SEAT_OPERATIONS: readonly FabricControlOperation[] = ["followUp", "cancel"];
 
-/**
- * One root allow entry in the link config's schema. The single place that tracks the L5/L3 allow
- * convergence (L5 812157f9 takes `operations`; L3 a5dcd430 BridgeNatsAllowEntryInput takes `send`/`receive`).
- */
+/** One root allow entry (L3 BridgeNatsAllowEntryInput): it may send and receive `operations`. */
 export function allowRoot(id: string, operations: readonly FabricControlOperation[] = ROOT_SEND_OPERATIONS, principal?: string,
-  receiveTopics?: readonly string[]): NatsLinkAllowEntry {
-  return { kind: "root", id, operations: [...operations], ...(principal === undefined ? {} : { principal }),
-    ...(receiveTopics === undefined ? {} : { receiveTopics: [...receiveTopics] }) } as NatsLinkAllowEntry;
+  receiveTopics?: readonly string[]): BridgeNatsAllowEntryInput {
+  return { kind: "root", id, send: [...operations], receive: [...operations], ...(principal === undefined ? {} : { principal }),
+    ...(receiveTopics === undefined ? {} : { receiveTopics: [...receiveTopics] }) };
 }
 
 /** A file-side actor allow entry (owner root + name; the verified presence must match both). */
-export function allowActor(rootId: string, name: string, operations: readonly FabricControlOperation[] = ROOT_SEND_OPERATIONS): NatsLinkAllowEntry {
-  return { kind: "actor", rootId, name, operations: [...operations] };
+export function allowActor(rootId: string, name: string, operations: readonly FabricControlOperation[] = ROOT_SEND_OPERATIONS): BridgeNatsAllowEntryInput {
+  return { kind: "actor", rootId, name, send: [...operations], receive: [...operations] };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -309,7 +335,7 @@ export interface MixedHarnessOptions {
   /** Make natsPeer a principal seat: org.json binds SEAT_PRINCIPAL to it and its allow entry declares that principal. */
   readonly seat?: boolean;
   /** Last-word edit of the allow-list before validation (e.g. mark a seat with `principal`). */
-  readonly allow?: (allow: { file: NatsLinkAllowEntry[]; nats: NatsLinkAllowEntry[] }, ids: MixedIds) => void;
+  readonly allow?: (allow: { file: BridgeNatsAllowEntryInput[]; nats: BridgeNatsAllowEntryInput[] }, ids: MixedIds) => void;
 }
 
 export interface MixedIds { readonly fileMain: string; readonly natsMain: string; readonly outsider: string; readonly natsPeer: string }
@@ -328,8 +354,8 @@ export interface MixedHarness {
   /** The file Main's actor (options.fileActor), as agents.create returned it. */
   readonly actor?: { readonly id: string; readonly name: string } & Record<string, unknown>;
   readonly linkName: string;
-  /** The exact L5 config the link runs with, already validated by parseNatsLinkConfig. */
-  readonly linkConfig: NatsLinkConfig;
+  /** The config JSON the link runs with (validated by L5's parser when present). */
+  readonly linkConfig: MixedLinkConfig;
   /** The fixture org.json (0600) the link reads seat pins from; never the host's real org.json. */
   readonly orgJson: string;
   /** Link log lines (all starts). */
@@ -447,16 +473,21 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     const orgJson = path.join(root, "org.json");
     fs.writeFileSync(orgJson, JSON.stringify({ productOwner: { name: "Paul" },
       principals: [seat("Paul", OWNER_SEAT_SESSION), ...(options.seat ? [seat(SEAT_PRINCIPAL, NATS_PEER_SESSION)] : [])] }), { mode: 0o600 });
+    // Integrator note 6: a test never reads a real org.json.
+    const home = fs.realpathSync.native(os.homedir());
+    if (orgJson === home || orgJson.startsWith(`${home}${path.sep}`)) throw new Error(`fixture org.json must not be under $HOME: ${orgJson}`);
     options.allow?.(allow, ids);
-    const linkConfig = parseNatsLinkConfig({
+    const linkConfig: MixedLinkConfig = {
       version: 1, name: "ryzen1", link: linkName,
       file: { mesh: fileMeshRoot },
       stateDir: path.join(root, "link-state"),
+      orgJson,
       nats: { servers: [faults.url], machine: BRIDGE_MACHINE, credentials: broker.users.machineA.credsPath, caFile: broker.tls!.caFile,
         custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream,
         pathBMachines: [...PATH_B_MACHINES], operatorMachine: "fabric-ops" },
       allow,
-    });
+    };
+    const validatedConfig = await validateLinkConfig(linkConfig);
     const startLink = options.startLink === null ? undefined : options.startLink ?? await loadNatsLink();
     const peers: FabricTransport[] = [];
     cleanup.push(async () => { await Promise.allSettled(peers.splice(0).map((peer) => teardownWithin("peer close", () => peer.close(), 5_000))); });
@@ -471,7 +502,7 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
         if (harness.link) throw new Error("link already running");
         linkAbort = new AbortController();
         linkLog.push(`--- harness: link start ${new Date().toISOString()}`);
-        harness.link = await startLink(linkConfig, { signal: linkAbort.signal, log: (line) => { linkLog.push(line); }, orgJson });
+        harness.link = await startLink(validatedConfig, { signal: linkAbort.signal, log: (line) => { linkLog.push(line); } });
         return harness.link;
       },
       async stopLink() {

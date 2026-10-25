@@ -2,17 +2,23 @@
 // Keep reason: smarty-dev#15310 A' (D3 gate 3). Self-test of the mixed FILE <-> NATS harness that every
 // tests/nats-auth-path-b-bridge-*.test.ts E2E uses: both real Mains boot on one real broker and stay
 // isolated with no link, and the link's fault relay really disconnects and really loses a PubAck.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { natsLinkStatePaths, preflightNatsLinkConfig } from "../src/mesh/bridge-nats-config.js";
-import { loadBridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
+import { checkBridgeNatsSeatPins, loadBridgeNatsSeatPins, parseBridgeNatsAllowSection } from "../src/mesh/bridge-nats-identity.js";
 import type { TransportEnvelope } from "../src/transport/types.js";
 import { resolveNatsBinary } from "./helpers/nats-cluster.js";
-import { BRIDGE_MACHINE, createMixedHarness, NATS_MAIN_MACHINE, OWNER_SEAT_SESSION, selfRecord, waitForValue, type MixedHarness } from "./helpers/nats-file-mixed.js";
+import {
+  BRIDGE_MACHINE, createMixedHarness, loadLinkConfigModule, NATS_MAIN_MACHINE, OWNER_SEAT_SESSION, selfRecord, validateLinkConfig, waitForValue,
+  type MixedHarness,
+} from "./helpers/nats-file-mixed.js";
 import { publishTo } from "./helpers/nats-wire-faults.js";
 
 const binary = resolveNatsBinary();
 if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUTH_REQUIRED=1: the mixed bridge harness needs NATS_BIN");
+const l5Present = fs.existsSync(path.resolve(import.meta.dirname, "../src/mesh/bridge-nats-config.ts"));
 
 describe.skipIf(!binary || process.platform !== "linux")("A' mixed FILE <-> NATS harness (no link)", () => {
   let h: MixedHarness;
@@ -54,15 +60,26 @@ describe.skipIf(!binary || process.platform !== "linux")("A' mixed FILE <-> NATS
     await waitForValue(() => h.fileMain.runtime.actors.status(actor.id).inFlightRun ? undefined : true, "HANG run ended after abort", 20_000);
   }, 60_000);
 
-  it("hands the link an L5 config that passes the real start preflight against these files", () => {
-    expect(h.linkConfig).toMatchObject({ link: h.linkName, file: { mesh: h.fileMeshRoot },
+  it("hands the link an allow-list and seat pins L3's gate accepts, from a fixture org.json outside $HOME", () => {
+    expect(h.linkConfig).toMatchObject({ link: h.linkName, file: { mesh: h.fileMeshRoot }, orgJson: h.orgJson,
       nats: { machine: BRIDGE_MACHINE, servers: [h.faults.url] },
       allow: { file: [{ kind: "root", id: h.fileMain.id }, { kind: "actor", rootId: h.fileMain.id, name: "bridge-review" }],
         nats: [{ kind: "root", id: h.natsMain.id }] } });
-    expect(() => preflightNatsLinkConfig(h.linkConfig)).not.toThrow();
-    // Seat pins come from the harness's own org.json fixture, never the host's (L3's strict reader accepts it).
-    expect(loadBridgeNatsSeatPins(h.orgJson)).toMatchObject({ source: h.orgJson, seats: new Map([["Paul", `session:${OWNER_SEAT_SESSION}`]]) });
-    expect(natsLinkStatePaths(h.linkConfig).ledger.startsWith(h.root)).toBe(true);
+    // A test never reads a real org.json (integrator note 6).
+    const home = fs.realpathSync.native(os.homedir());
+    expect(h.orgJson.startsWith(`${home}${path.sep}`)).toBe(false);
+    const pins = loadBridgeNatsSeatPins(h.orgJson);
+    expect(pins).toMatchObject({ source: h.orgJson, seats: new Map([["Paul", `session:${OWNER_SEAT_SESSION}`]]) });
+    const allow = parseBridgeNatsAllowSection(h.linkConfig.allow, { link: h.linkName, natsMachine: BRIDGE_MACHINE });
+    expect(() => checkBridgeNatsSeatPins(allow, pins)).not.toThrow();
+  });
+
+  it.skipIf(!l5Present)("the same config passes L5's parser and the real start preflight against these files", async () => {
+    const module = (await loadLinkConfigModule())!;
+    const parsed = await validateLinkConfig(h.linkConfig);
+    expect(parsed).toMatchObject({ link: h.linkName, orgJson: h.orgJson });
+    expect(() => (module.preflightNatsLinkConfig as (config: unknown) => void)(parsed)).not.toThrow();
+    expect((module.natsLinkStatePaths as (config: unknown) => { ledger: string })(parsed).ledger.startsWith(h.root)).toBe(true);
   });
 
   it("the link's relay severs a real authenticated connection, which reconnects, and loses a real PubAck once", async () => {

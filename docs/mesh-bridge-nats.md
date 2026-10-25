@@ -23,8 +23,11 @@ model is in [bridge-nats-threat-model.md](bridge-nats-threat-model.md).
   so hub readers such as `smarty-org-target` and `review_gate.live_roots` see it as a live mirrored
   root, the same way they see a work host's roots.
 - Its own identity on both sides is `bridge:<link>` (`bridgeNatsLinkIdentity`). It is never on the
-  allow-list and never a target; it signs only what the link originates itself (topic deliveries and
-  refusals).
+  allow-list and never a target; it signs only what the link originates itself (topic deliveries).
+- A command the link refuses from a verified hub sender is answered on the hub with a `notRun` ACK
+  authored as the mirrored owner it was addressed to, with the link stamp (`data.bridge.from` = the link),
+  because a hub sender accepts a mirrored owner's ACK only in that form. An unverified sender gets no
+  answer: its command is dropped and logged.
 
 ## What crosses (PR 1)
 

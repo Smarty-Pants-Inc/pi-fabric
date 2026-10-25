@@ -17,6 +17,7 @@ import { openFabricTransport } from "../src/transport/index.js";
 import { NatsKvStore } from "../src/transport/nats/kv.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { readHostLease, TransportHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
@@ -428,6 +429,72 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
       await inspector?.close(); vi.unstubAllEnvs();
     }
   }, 75_000);
+
+  // smarty-dev#15310 G1 (re-review): until the re-created lease's root re-check passes, no refresh
+  // path may publish presence, even though the lease itself is live again.
+  it("publishes no presence between a lease re-creation and its root re-check, then yields to the other machine", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "presence-recheck-"));
+    const id = `session:presence-recheck-${Date.now()}`;
+    const identity = { id, name: "recheck-owner", kind: "main" as const, sessionId: id.slice(8) };
+    const leaseA = key("machine-a", "h", id), presenceA = key("machine-a", "p", id);
+    let releaseRenew!: () => void, releaseCheck!: () => void, entered!: () => void;
+    const renewStalled = new Promise<void>(resolve => { releaseRenew = resolve; });
+    const checkHeld = new Promise<void>(resolve => { releaseCheck = resolve; });
+    const checkEntered = new Promise<void>(resolve => { entered = resolve; });
+    const rawRenew = TransportHostLease.prototype.renew;
+    vi.spyOn(TransportHostLease.prototype, "renew").mockImplementation(function (this: TransportHostLease, signal?: AbortSignal) {
+      return this.key === leaseA ? renewStalled.then(() => rawRenew.call(this, AbortSignal.timeout(5_000))) : rawRenew.call(this, signal);
+    });
+    const rawConfirm = KvParticipantDirectory.prototype.confirmSoleRoot;
+    vi.spyOn(KvParticipantDirectory.prototype, "confirmSoleRoot").mockImplementation(async function (this: KvParticipantDirectory, record, revision) {
+      entered(); await checkHeld; return rawConfirm.call(this, record, revision);
+    });
+    let holding = false;
+    const heldPresencePuts: string[] = [];
+    const hooks = installKvHooks(call => { if (holding && call.key === presenceA) heldPresencePuts.push(call.key); });
+    const transportA = await openFabricTransport({ config: configFor(root, "machine-a").mesh, hostId: id,
+      mesh: new MeshStore(path.join(root, "mesh-a"), 65_536, 1_000) });
+    const transportB = await openFabricTransport({ config: configFor(root, "machine-b").mesh, hostId: id,
+      mesh: new MeshStore(path.join(root, "mesh-b"), 65_536, 1_000) });
+    const stateDir = path.join(root, "transport-a"); fs.mkdirSync(stateDir, { mode: 0o700 });
+    const directory = new ParticipantDirectory(new MeshStore(path.join(root, "mesh-a"), 65_536, 1_000), {
+      enabled: true, transport: transportA, transportStateDir: stateDir, hostId: id, rootId: id, identity });
+    let name = "recheck-owner";
+    directory.registerSource(() => [{ ...participant(id, "source", name, Date.now()), sessionId: identity.sessionId }]);
+    try {
+      await directory.start();
+      expect((await transportA.kv("presence").get(presenceA))?.value).toMatchObject({ id, kind: "root" });
+      const expired = armLeaseGone(transportB.kv("leases"), leaseA);
+      await expired.ready;
+      await expired.gone; // machine-a's renewals are stalled until the broker expires its lease
+      // machine-b registers the session in that gap (its own fresh check would see no machine-a lease).
+      const now = Date.now();
+      await transportB.kv("leases").put(key("machine-b", "h", id), `${id}#taker`, hostLease(id, "taker", now), 0);
+      await transportB.kv("presence").put(key("machine-b", "p", id), `${id}#taker`, participant(id, "taker", "taker", now), 0);
+      releaseRenew();
+      await checkEntered; // machine-a re-created its lease and now awaits the root re-check
+      expect(await transportA.kv("leases").get(leaseA)).toBeDefined();
+      holding = true;
+      name = "changed-while-recheck-pending";
+      directory.scheduleRefresh();
+      await expect(directory.refreshPresence()).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+      expect(directory.canConsumeMesh()).toBe(false);
+      expect(directory.heartbeatArmed, "still recovering, not yet yielded").toBe(true);
+      await new Promise(resolve => setTimeout(resolve, 1_500)); // let a scheduled change refresh fire, if one could
+      expect(heldPresencePuts, "no presence write while the root re-check is pending").toEqual([]);
+      holding = false;
+      releaseCheck();
+      // The re-check sees machine-b: machine-a yields for good (no heartbeat, no view, no admission).
+      await vi.waitFor(() => expect(directory.heartbeatArmed).toBe(false), { timeout: 10_000 });
+      expect((directory.participantView as KvParticipantDirectory | undefined)?.ready).toBe(false);
+      expect(directory.canConsumeMesh()).toBe(false);
+      expect(hooks.puts.filter(call => call.key === key("machine-b", "p", id))).toHaveLength(1);
+    } finally {
+      releaseRenew(); releaseCheck();
+      await directory.close().catch(() => undefined);
+      await Promise.allSettled([transportA.close(), transportB.close()]);
+    }
+  }, 60_000);
 
   // The carrier, on the real broker, with each machine's real authenticated user: both write their
   // own host lease and register at once, as two hosts starting one session would. (Two full

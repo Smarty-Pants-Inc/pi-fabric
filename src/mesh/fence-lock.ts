@@ -4,6 +4,7 @@ import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
 import { acquireMeshCustodyLock, MESH_CUSTODY_LOCK_NAME } from "./custody-lock.js";
 import { MeshLock } from "./mesh-lock.js";
+import { deferSqliteHoldWrites } from "./sqlite-holds.js";
 
 /**
  * The migration fence (smarty-dev#6477, org decision 10-08): `custody.lock` then the mesh `.lock` (the
@@ -24,11 +25,14 @@ export interface MeshFenceOptions {
 /** Holds the fence across awaits until the operation settles. */
 export const holdMeshFence = async <T>(root: string, options: MeshFenceOptions,
   operation: (lock: MeshLock) => Promise<T> | T): Promise<T> => {
-  const releaseCustody = await acquireMeshCustodyLock(root, options.lockTimeoutMs, { lockProtocol: options.lockProtocol ?? 1 });
+  const resumeHoldWrites = deferSqliteHoldWrites();
   try {
-    const lock = new MeshLock(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs }, () => undefined);
-    return await lock.withLockAcrossAwait(async () => operation(lock), options.lockTimeoutMs, "other");
-  } finally { releaseCustody(); }
+    const releaseCustody = await acquireMeshCustodyLock(root, options.lockTimeoutMs, { lockProtocol: options.lockProtocol ?? 1 });
+    try {
+      const lock = new MeshLock(root, { lockProtocol: options.lockProtocol ?? 1, lockTimeoutMs: options.lockTimeoutMs }, () => undefined);
+      return await lock.withLockAcrossAwait(async () => operation(lock), options.lockTimeoutMs, "other");
+    } finally { releaseCustody(); }
+  } finally { resumeHoldWrites(); }
 };
 
 const sleepSync = (ms: number): void => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
@@ -226,11 +230,14 @@ export const holdMeshFenceSync = <T>(root: string, timeoutMs: number, operation:
       sleepSync(Math.min(Math.max(1, deadline - Date.now()), 2 + Math.floor(Math.random() * 4)));
     }
   };
-  const custody = path.join(root, MESH_CUSTODY_LOCK_NAME);
-  const releaseCustody = acquire(custody, (token, record) => tryCustody(custody, token, record));
+  const resumeHoldWrites = deferSqliteHoldWrites();
   try {
-    const mesh = path.join(root, ".lock");
-    const releaseMesh = acquire(mesh, (_token, record) => tryMeshLock(mesh, record));
-    try { return operation(); } finally { releaseMesh(); }
-  } finally { releaseCustody(); }
+    const custody = path.join(root, MESH_CUSTODY_LOCK_NAME);
+    const releaseCustody = acquire(custody, (token, record) => tryCustody(custody, token, record));
+    try {
+      const mesh = path.join(root, ".lock");
+      const releaseMesh = acquire(mesh, (_token, record) => tryMeshLock(mesh, record));
+      try { return operation(); } finally { releaseMesh(); }
+    } finally { releaseCustody(); }
+  } finally { resumeHoldWrites(); }
 };

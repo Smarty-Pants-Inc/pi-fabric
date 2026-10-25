@@ -121,8 +121,15 @@ import { createLockEvents, lockHeldEventThreshold, type LockTimingContext, type 
 import { admitExistingStateRoot, assertGatedFlagDirectory, assertPrivatePath, assertPrivateStateRoot, createStateRoot, filesystemRefusal,
   MeshStateUnsupportedError, openPrivateStateDb } from "./state-gate.js";
 
+import { recordSqliteHolds, sqliteHoldContext, type SqliteBatchHoldTag } from "./sqlite-holds.js";
+
 // The process's lock-event appender (smarty-dev#9290), shared with mesh-lock.ts through its registry.
 const lockEvents = createLockEvents();
+const HOLD_TAGS: Record<MeshLockClass, string> = {
+  publish: "state:publish", "put/delete": "state:put/delete", writeBatch: "state:writeBatch",
+  "heartbeat/confirm": "state:heartbeat/confirm", custody: "state:custody",
+  bridge: "bridge:mirror", other: "state:other",
+};
 
 export type SqliteValue = null | number | bigint | string | Uint8Array;
 export type SqliteRow = Record<string, unknown>;
@@ -456,6 +463,8 @@ export interface SqliteStateStoreOptions {
   journalSizeLimitBytes?: number;
   /** Rows kept in the `changes` feed. Default 4,096. */
   changesRetained?: number;
+  /** Diagnostic sink root for a detached shadow/projector copy. Defaults to its database root. */
+  holdMetricsRoot?: string;
   /** Driver adapter. Default: node:sqlite, loaded at first use. */
   open?: SqliteOpener;
   /** A writer-lock hold longer than this emits a `held` lock event (smarty-dev#9290). Default 1,000 ms; 0 disables. */
@@ -987,7 +996,8 @@ export class SqliteStateStore {
     // smarty-dev#8920: openCreatingStateDb's gate takes this root's pre-create proof, so no advisory read here.
     if (!rootCreated) createStateRoot(root, { gateFollows: true });
     const file = path.join(root, "state.db");
-    const db = openCreatingStateDb(root, file, options.open ?? openNodeSqlite); // the one gate (smarty-dev#7548, pi-fabric#694 P2-E)
+    const db = recordSqliteHolds(openCreatingStateDb(root, file, options.open ?? openNodeSqlite), options.holdMetricsRoot ?? root, "state:init"); // the one gate (smarty-dev#7548, pi-fabric#694 P2-E)
+    const holdWaitStarted = performance.now();
     const deadline = Date.now() + Math.max(0, initTimeoutMs ?? options.lockTimeoutMs ?? LOCK_TIMEOUT_MS);
     try {
       let transient = 0;
@@ -996,6 +1006,7 @@ export class SqliteStateStore {
         try {
           const fresh = initialize === "create" && !hasMeta(db);
           if (initialize !== "detached" && !fresh) assertImportedDatabase(db, root);
+          sqliteHoldContext(db, "state:init", holdWaitStarted);
           const identity = initialise(db, options);
           if (fresh) ensureMovedMarker(root, identity.epoch);
           return new SqliteStateStore(path.resolve(root), maxEventBytes, maxReadEvents, db, file, identity, options);
@@ -1041,7 +1052,7 @@ export class SqliteStateStore {
     initialize: SqliteStateStoreOptions["initialize"], rootCreated: boolean): SqliteStateStore {
     if (!rootCreated) createStateRoot(root, { gateFollows: true }); // the gate's pre-create proof follows (#8920)
     const file = path.join(root, "state.db");
-    const db = openCreatingStateDb(root, file, options.open ?? openNodeSqlite);
+    const db = recordSqliteHolds(openCreatingStateDb(root, file, options.open ?? openNodeSqlite), options.holdMetricsRoot ?? root, "state:init");
     try {
       const fresh = initialize === "create" && !hasMeta(db);
       if (initialize !== "detached" && !fresh) assertImportedDatabase(db, root);
@@ -1266,9 +1277,11 @@ export class SqliteStateStore {
     beforeCommit?: () => void;
     /** Lock-event class for the bridge's own writes (as the file store's lock stats). */
     lockClass?: "bridge";
+    sqliteHoldTag?: SqliteBatchHoldTag;
     lockTiming?: LockTimingContext;
   }): Promise<MeshBatchResult[]> {
     const lockClass: MeshLockClass = input.lockClass === "bridge" ? "bridge" : "writeBatch";
+    const holdTag = input.sqliteHoldTag ?? (lockClass === "bridge" ? "bridge:mirror" : "state:writeBatch");
     const batchIdentity = input.identity;
     const prepare = input.prepare;
     const afterCommit = input.afterCommit;
@@ -1353,7 +1366,7 @@ export class SqliteStateStore {
         this.#timedAfterCommit(afterCommit, view, lockClass, timing);
       }
       return results;
-    }, undefined, false, timing);
+    }, undefined, false, timing, holdTag);
     if (committed !== undefined && afterCommit) {
       this.#stats.afterCommitReacquired += 1;
       const afterTiming = timing ? { operation: timing.operation,
@@ -1361,7 +1374,7 @@ export class SqliteStateStore {
       await this.#write(lockClass, (tx) => {
         if (tx.commit !== committed) this.#stats.afterCommitIntervened += 1;
         this.#timedAfterCommit(afterCommit, this.#view(), lockClass, afterTiming);
-      }, undefined, false, afterTiming);
+      }, undefined, false, afterTiming, holdTag + ":afterCommit");
     }
     return results;
   }
@@ -1402,6 +1415,7 @@ export class SqliteStateStore {
     const lockClass: MeshLockClass = timing ? "bridge" : "other";
     let fenceRefusal: MeshLockTimeoutError | undefined;
     this.#db.exec("PRAGMA busy_timeout = 0");
+    sqliteHoldContext(this.#db, "state:fence", performance.now());
     try {
       this.#db.exec("BEGIN IMMEDIATE");
     } catch (error) {
@@ -1843,7 +1857,7 @@ export class SqliteStateStore {
   // runs BEGIN IMMEDIATE, the synchronous body and COMMIT in ONE synchronous segment, so no other
   // caller in this process can interleave a statement on this connection while the lock is held.
   async #write<T>(lockClass: MeshLockClass, body: (tx: Tx) => T, lockTimeoutMs = this.#lockTimeoutMs,
-    walCapExempt = false, timing?: LockTimingContext): Promise<T> {
+    walCapExempt = false, timing?: LockTimingContext, holdTag = HOLD_TAGS[lockClass]): Promise<T> {
     const scope = this.#tryLockScope.getStore();
     const budget = scope?.active ? Math.min(scope.timeoutMs, lockTimeoutMs) : lockTimeoutMs;
     const started = performance.now();
@@ -1873,6 +1887,7 @@ export class SqliteStateStore {
           last = now;
           attempts += 1;
           let begun = false;
+          sqliteHoldContext(this.#db, holdTag, started);
           try {
             this.#db.exec("BEGIN IMMEDIATE");
             begun = true;

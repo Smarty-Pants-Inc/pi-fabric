@@ -249,8 +249,10 @@ links over the hub's relay IPC (`#relayCommand`, `deliverRelay`) and returns its
 - **Allow-list:** a spoke lane is an `allow.file` root with `viaSpoke: <spoke link>`, which must name a
   configured spoke link. It cannot be a principal seat or a NATS entry. Destination class `spokeRoot`:
   followUp, steer, ask (and its answer), cancel, the same as a Ryzen 1 root (integrator decision).
-- **Identity:** such a root is verified ONLY as the hub's direct mirror held by its spoke link
-  (`remoteHost == viaSpoke`, no `bridgeVia`), live and fresh. It is refused next to a native record or
+- **Identity:** such a root is verified ONLY as the hub's direct mirror held by its spoke link, live and
+  fresh: its stored `remoteHost` is the spoke, the holding link (`mirroredBy`, `bridgeVia ?? remoteHost`) is
+  the spoke, and it has no `bridgeVia`. All three must agree, so a file view that drops a field fails
+  closed; L2 and L5 build file records with `bridgeNatsFilePresenceRecord`, which copies them as stored. It is refused next to a native record or
   another link's mirror of the same id, and when the same id answers on NATS (a spoofed spoke sender).
   `MeshBridge.deliverRelay` also requires the authenticated relay peer to be that same spoke link
   (`relayOrigin(sender) == sourceRemote`, `data.bridge.from == sourceRemote`).

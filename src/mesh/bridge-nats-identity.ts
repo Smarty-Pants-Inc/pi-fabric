@@ -233,6 +233,31 @@ const parseEntry = (value: unknown, field: string, side: BridgeNatsSide, natsMac
   throw new BridgeNatsAllowListError(`${field}.kind`, "must be root or actor");
 };
 
+/**
+ * The one way to turn a stored file-mesh participant into a gate presence record: every field the gate
+ * judges is copied as stored, and `mirroredBy` is the holding link (`bridgeVia ?? remoteHost`, as
+ * bridge.ts mirrorLinkOf). Liveness is the caller's (state or file lease rules). L2 and L5 use this so the
+ * two file views cannot drift.
+ */
+export const bridgeNatsFilePresenceRecord = (row: {
+  readonly id: string; readonly kind: string; readonly name: string; readonly rootId: string; readonly sessionId?: string | undefined;
+  readonly ownerHostId: string; readonly ownerIdentityId: string; readonly ownerIncarnation?: string | undefined;
+  readonly remoteHost?: string | undefined; readonly bridgeVia?: string | undefined;
+}, observation: { readonly live: boolean; readonly observedAt: number }): BridgeNatsPresenceRecord => {
+  const mirroredBy = row.bridgeVia ?? row.remoteHost;
+  return Object.freeze({
+    id: row.id, name: row.name, kind: row.kind === "root" ? "main" as const : row.kind === "actor" ? "actor" as const : "agent" as const,
+    rootId: row.rootId,
+    ...(row.sessionId !== undefined ? { sessionId: row.sessionId } : {}),
+    ownerHostId: row.ownerHostId, ownerIdentityId: row.ownerIdentityId,
+    ...(row.ownerIncarnation !== undefined ? { ownerIncarnation: row.ownerIncarnation } : {}),
+    ...(mirroredBy !== undefined ? { mirroredBy } : {}),
+    ...(row.remoteHost !== undefined ? { remoteHost: row.remoteHost } : {}),
+    ...(row.bridgeVia !== undefined ? { bridgeVia: row.bridgeVia } : {}),
+    live: observation.live, observedAt: observation.observedAt,
+  });
+};
+
 /** The identity an entry names, for duplicate checks across both lists. */
 export const bridgeNatsAllowKey = (entry: BridgeNatsAllowEntryInput): string =>
   entry.kind === "root" ? entry.id : `actor:${entry.rootId}/${entry.name}`;
@@ -489,8 +514,11 @@ export class BridgeNatsIdentity implements BridgeNatsIdentityGate {
     // PR 2 relay: a spoke root's home is the hub's DIRECT mirror held by its spoke link, never a native record.
     const listed = side === "file" ? this.#roots.get(id) : undefined;
     const spoke = listed?.kind === "root" ? listed.viaSpoke : undefined;
+    // All three stored facts must agree, so an adapter that drops a field fails closed: the origin is the
+    // spoke (remoteHost), the spoke link holds it (mirroredBy), and it is not a re-export (no bridgeVia).
     const home = (record: BridgeNatsPresenceRecord): boolean => spoke !== undefined
-      ? record.mirroredBy === spoke && record.bridgeVia === undefined : this.#native(side, record);
+      ? record.remoteHost === spoke && record.mirroredBy === spoke && record.bridgeVia === undefined
+      : this.#native(side, record);
     const native = records.filter(home);
     const mirrored = records.filter(record => !home(record));
     const ours = side === "nats" ? mirrored : mirrored.filter(record => record.mirroredBy === this.config.link);

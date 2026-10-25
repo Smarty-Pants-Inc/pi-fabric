@@ -362,7 +362,8 @@ export interface MixedHarness {
   readonly linkLog: string[];
   /** The file mesh the link bridges (Ryzen 1's): same root as fileMain's runtime mesh. */
   readonly fileMeshRoot: string;
-  /** A raw product transport on machine-a with a test-only host id, for broker reads (KV presence/leases). */
+  /** A raw product transport with a test-only host id, for broker reads (KV presence/leases). It uses machine-b:
+   *  the bridge machine's inbox belongs to the link alone (L1's durable filters `fabric.in.<bridge>.>`). */
   readonly inspector: FabricTransport;
   link: MixedLinkHandle | undefined;
   readonly startLink: StartMixedLink | undefined;
@@ -444,7 +445,7 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     const natsPeer = options.natsPeer ? makeMain("v2-peer", NATS_PEER_SESSION, dirs.peer, natsConfig(dirs.peer)) : undefined;
 
     const inspector = await openFabricTransport({ config: baseConfig({ transport: "nats", hostTransport: "nats", root: path.join(root, "inspector-mesh"),
-      nats: { ...broker.runtimeOptions(broker.users.machineA), operatorMachine: "fabric-ops" } }).mesh,
+      nats: { ...broker.runtimeOptions(broker.users.machineB), operatorMachine: "fabric-ops" } }).mesh,
       hostId: "mixed-harness-inspector", mesh: new MeshStore(path.join(root, "inspector-mesh"), 65_536, 1_000) });
     cleanup.push(() => teardownWithin("inspector close", () => inspector.close(), 5_000));
     // Before any Main binds its inbox iterator: record the whole run, and restore last.

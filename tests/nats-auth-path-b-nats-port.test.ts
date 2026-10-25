@@ -126,5 +126,31 @@ describe.skipIf(!binary)("A' bridge port on a real Path B broker", () => {
     // Withdraw: the receiver loses the mirrored root at once (lease first).
     await port.withdraw();
     await vi.waitFor(() => expect(receiver!.resolve(FILE_ROOT)?.live ?? false).toBe(false), { timeout: 10_000, interval: 50 });
+    await port.close();
+  }, 60_000);
+
+  it("ends a route at the file sample's deadline (next renewal tick, broker TTL as backstop); the link identity stays", async () => {
+    const runtime = broker.runtimeOptions(broker.users.machineA);
+    port = await openNatsBridgeSide({
+      link: LINK,
+      nats: { servers: [String(runtime.servers)], machine: BRIDGE, credentials: runtime.credentials, caFile: broker.tls!.caFile,
+        custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream,
+        pathBMachines: [...PATH_B_PERMISSION_POLICY.pathBMachines] },
+      allow: { file: [{ kind: "root", id: FILE_ROOT }], nats: [] },
+    }, { signal: AbortSignal.timeout(20_000) });
+    const now = Date.now();
+    // The file side proved the root live for 3 s only, then said nothing more (a stalled hub read).
+    await port.mirror({ hosts: [{ record: { format: 1, id: FILE_ROOT, rootId: FILE_ROOT,
+      identity: { id: FILE_ROOT, name: "file-lead", kind: "main" }, startedAt: now, updatedAt: now, expiresAt: now + 3_000 },
+    expiresAt: now + 3_000, observedAt: now }], participants: [{ ...fileRoot(now), ownerIncarnation: "file-inc-2" }],
+    linkIdentity: bridgeNatsLinkIdentity(LINK) }, now);
+    await vi.waitFor(() => expect(receiver!.resolve(FILE_ROOT)).toMatchObject({ ownerIncarnation: "file-inc-2", live: true }),
+      { timeout: 10_000, interval: 50 });
+    const startedAt = Date.now();
+    await vi.waitFor(() => expect(receiver!.resolve(FILE_ROOT)?.live ?? false).toBe(false), { timeout: 30_000, interval: 100 });
+    // The renewal tick after the 3 s deadline CAS-deletes the lease (about 5 s); the 15 s broker TTL
+    // bounds it even if that delete were lost.
+    expect(Date.now() - startedAt).toBeLessThan(25_000);
+    expect(receiver!.resolve(LINK_ID)?.live).toBe(true);
   }, 60_000);
 });

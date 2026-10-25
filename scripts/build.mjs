@@ -94,6 +94,7 @@ const lazyEntryPoints = [
   "src/cli/mesh.ts",
   "src/cli/decisions.ts",
   "src/cli/session-pending.ts",
+  "src/cli/session-drain.ts",
   "src/mesh/nats-auth/cli.ts",
   "src/mesh/nats-auth/send-cli.ts",
   "src/mesh/nats-auth/dispatch-cli.ts",

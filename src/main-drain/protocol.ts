@@ -118,4 +118,9 @@ export interface MainDrainReply {
   exiting: boolean;
   /** exit only: why the Main refused to exit (fixed codes). */
   exitRefused: string[];
+  /**
+   * The Main's own session, read-only (the bridge seam's identity read): its session file, its current leaf and the
+   * owner incarnation its presence records carry. null when unknown.
+   */
+  session: { file: string | null; leafId: string | null; ownerIncarnation: string | null };
 }

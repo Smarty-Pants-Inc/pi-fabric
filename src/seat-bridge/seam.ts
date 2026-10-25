@@ -329,6 +329,21 @@ const seatMachine = (context: Context): string => {
   return machine;
 };
 
+/**
+ * The route the receipt shows, judged here (not by its overall verdict, which also counts an old, non-live NATS key the
+ * link left behind): the identity is on `side`; ONE live file-mesh record (native, or this link's mirror) and exactly
+ * ONE live NATS record, on `natsMachine`, both with `incarnation`.
+ */
+const routedTo = (value: Record<string, unknown>, want: { side: "file" | "nats"; fileRemoteHost: string | null; natsMachine: string;
+  incarnation: string }): boolean => {
+  const file = object(value.file) ? value.file : undefined;
+  const nats = object(value.nats) && Array.isArray(value.nats.records) ? (value.nats.records as unknown[]).filter(object) : [];
+  const live = nats.filter(record => record.live === true);
+  return value.side === want.side && file !== undefined && (file.remoteHost ?? null) === want.fileRemoteHost && file.live === true &&
+    file.ownerIncarnation === want.incarnation && live.length === 1 && live[0]!.machine === want.natsMachine &&
+    live[0]!.ownerIncarnation === want.incarnation;
+};
+
 const planEvidence = (plan: WriterPlan) => ({ change: plan.change, beforeSha256: plan.before.sha256, afterSha256: plan.afterSha256,
   natsEntry: plan.natsEntry, fileEntry: plan.fileEntry, beforeBytes: plan.before.bytes.toString("utf8"),
   afterBytes: plan.after?.toString("utf8") ?? null, file: plan.before.file });
@@ -368,13 +383,8 @@ const publish = async (context: Context): Promise<number> => {
   }
   if (!reason) {
     const incarnation = read.identity!.ownerIncarnation;
-    routed = await awaitRoutable(config.config, sessionId, context.deps, clock(context, 120_000), value => {
-      const file = object(value.file) ? value.file : undefined;
-      const nats = object(value.nats) && Array.isArray(value.nats.records) ? value.nats.records as Array<Record<string, unknown>> : [];
-      return value.ok === true && value.side === "nats" && file?.remoteHost === config.config.link && file.live === true &&
-        file.ownerIncarnation === incarnation && nats.length === 1 && nats[0]!.machine === machine && nats[0]!.live === true &&
-        nats[0]!.ownerIncarnation === incarnation;
-    });
+    routed = await awaitRoutable(config.config, sessionId, context.deps, clock(context, 120_000), value =>
+      routedTo(value, { side: "nats", fileRemoteHost: config.config.link, natsMachine: machine, incarnation: incarnation! }));
     if (!routed.ok) reason = "seat-not-routable";
   }
   if (written) {
@@ -469,7 +479,10 @@ const restoreRoute = async (context: Context): Promise<number> => {
   let reload: Awaited<ReturnType<typeof reloadLink>> | null = null;
   let others: Awaited<ReturnType<typeof otherRoutesBack>> | null = null;
   if (plan.change !== "none") {
-    reload = await reloadLink(config.config, context.pins.linkUnit, context.sealed.seat, context.deps, clock(context, 120_000));
+    // The v2 seat's old mirror row on the hub is the one expected leftover once its entry is gone.
+    const leftover = `mirror not on allow.nats: session:${sessionId}`;
+    reload = await reloadLink(config.config, context.pins.linkUnit, context.sealed.seat, context.deps, clock(context, 120_000),
+      problem => problem === leftover);
     if (!reload.statusOk) reason = "link-not-reloaded";
     others = await otherRoutesBack(config.config, routesBefore, `session:${sessionId}`, context.deps, clock(context, 120_000));
     if (!reason && others.down.length > 0) reason = "other-routes-down";
@@ -485,13 +498,12 @@ const restoreRoute = async (context: Context): Promise<number> => {
   let routed: Awaited<ReturnType<typeof awaitRoutable>> | null = null;
   let v2Live: Array<Record<string, unknown>> = [];
   if (!reason) {
-    const incarnation = v1!.session.ownerIncarnation;
+    const incarnation = v1!.session.ownerIncarnation!;
     routed = await awaitRoutable(config.config, sessionId, context.deps, clock(context, 120_000), value => {
-      const file = object(value.file) ? value.file : undefined;
-      const nativeV1 = file !== undefined && (file.remoteHost === null || file.remoteHost === undefined) && file.live === true &&
-        file.ownerIncarnation === incarnation;
       // With the seat's file entry restored, the link mirrors v1 into NATS under its own machine: that must route too.
-      return published.fileEntry ? value.ok === true && value.side === "file" && nativeV1 : nativeV1;
+      if (published.fileEntry) return routedTo(value, { side: "file", fileRemoteHost: null, natsMachine: config.config.nats.machine, incarnation });
+      const file = object(value.file) ? value.file : undefined;
+      return file !== undefined && (file.remoteHost ?? null) === null && file.live === true && file.ownerIncarnation === incarnation;
     });
     if (!routed.ok) reason = "v1-not-routable";
     // No v2 left: no live NATS presence for the session on any machine but the link's own (its mirror of v1).

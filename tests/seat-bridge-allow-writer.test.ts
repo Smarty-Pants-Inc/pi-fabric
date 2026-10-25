@@ -141,6 +141,9 @@ describe("the bridge seam's A' config writer (one entry, never a free-form edit)
       .toThrow(expect.objectContaining({ code: "seat-entry-conflict" }));
     expect(() => planRestore(readLinkConfig(file), pins, { sessionId: SEAT_SID, natsEntry: { ...want, machine: "sandbox1" }, fileEntry: null }))
       .toThrow(expect.objectContaining({ code: "seat-entry-conflict" }));
+    // No publish record and the seat on the file side only (v1 never moved): nothing to undo.
+    expect(planRestore(readLinkConfig(writeLinkConfig({ file: [seatFileEntry] })), pins, { sessionId: SEAT_SID, natsEntry: null, fileEntry: null })
+      .change).toBe("none");
     // Publish's own entry with no file entry to put back: REMOVE.
     const remove = planRestore(readLinkConfig(file), pins, { sessionId: SEAT_SID, natsEntry: want, fileEntry: null });
     expect(remove.change).toBe("remove");

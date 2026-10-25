@@ -180,9 +180,14 @@ export const planRestore = (before: LinkConfigFile, pins: BridgeNatsSeatPins, pu
   const allow = isObject(value.allow) ? value.allow : {};
   const nats = list(allow, "nats").filter(item => item.id === id || item.rootId === id);
   const file = list(allow, "file").filter(item => item.id === id || item.rootId === id);
+  // No publish write recorded in this RUN: there is nothing of ours to undo, and the seat must have no nats entry.
+  if (published.natsEntry === null) {
+    if (nats.length > 0) throw new SeamGap("seat-entry-conflict");
+    return { change: "none", before, after: null, afterSha256: null, natsEntry: null, fileEntry: null };
+  }
   const restored = published.fileEntry === null ? file.length === 0 : file.length === 1 && sameJson(file[0], published.fileEntry.entry);
   if (nats.length === 0 && restored) return { change: "none", before, after: null, afterSha256: null, natsEntry: null, fileEntry: null };
-  if (nats.length !== 1 || published.natsEntry === null || !sameJson(nats[0], published.natsEntry)) throw new SeamGap("seat-entry-conflict");
+  if (nats.length !== 1 || !sameJson(nats[0], published.natsEntry)) throw new SeamGap("seat-entry-conflict");
   if (file.length > 0) throw new SeamGap("seat-entry-conflict");
   const candidate = structuredClone(value);
   const nextAllow = candidate.allow as Record<string, unknown>;

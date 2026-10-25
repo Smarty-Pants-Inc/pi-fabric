@@ -215,8 +215,10 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
 
 const owner = { template: { name: "t", uid: "00000000-0000-4000-8000-000000000101" }, claim: { name: "c", uid: "00000000-0000-4000-8000-000000000102" },
   sandbox: { name: "s", uid: "00000000-0000-4000-8000-000000000103" }, pod: MANAGED };
-const routable = (incarnation = INCARNATION, machine = "org-d3synth") => ({ ok: true, verdict: "routable", side: "nats",
-  file: { remoteHost: "v2", live: true, ownerIncarnation: incarnation }, nats: { read: true, records: [{ machine, live: true, ownerIncarnation: incarnation }] } });
+// The link's own verdict also counts the old, no longer live NATS key of the v1 mirror; the seam judges live records.
+const routable = (incarnation = INCARNATION, machine = "org-d3synth") => ({ ok: false, verdict: "not-routable", side: "nats",
+  file: { remoteHost: "v2", live: true, ownerIncarnation: incarnation }, nats: { read: true, records: [
+    { machine: "hub-a-bridge", live: false, ownerIncarnation: V1_INCARNATION }, { machine, live: true, ownerIncarnation: incarnation }] } });
 
 describe.skipIf(!linux)("bridge publish: the seat's one allow-list entry, a link restart, and the read-backs", () => {
   it("moves the seat's entry, restarts the pinned unit, and passes on the proof chain (incarnation = the managed Pod UID)", async () => {
@@ -282,9 +284,47 @@ describe.skipIf(!linux)("bridge publish: the seat's one allow-list entry, a link
   });
 });
 
+describe.skipIf(!linux)("the REAL bridge bundle: built as scripts/build.mjs builds it, installed with its pins, run as A runs it", () => {
+  it("pins the interpreter, the link config and the unit into the bytes; uninstalled refuses; the lock proof holds", async () => {
+    const w = await world();
+    const { build } = await import("esbuild");
+    const bundle = path.join(w.seat.base, "fabric-seat-bridge.cjs");
+    await build({ entryPoints: ["src/seat-bridge/entry.ts"], outfile: bundle, bundle: true, platform: "node", format: "cjs", target: "node24",
+      logLevel: "silent" });
+    const { spawnSync } = await import("node:child_process");
+    // A runs seams with a fixed env (no NODE_OPTIONS from this test runner).
+    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C", LC_ALL: "C" };
+    const uninstalled = spawnSync("node", [bundle, "--run-dir", w.seat.runDir, "--phase", "resume"], { encoding: "utf8", input: "{}", env });
+    expect(uninstalled).toMatchObject({ status: 2, stdout: "", stderr: "GAP: seam-not-installed [owner: fabric-v2]\n" });
+    const out = path.join(w.seat.base, "fabric-seat-bridge");
+    const installed = spawnSync("node", [bundle, "--install", "--out", out, "--link-config", w.config, "--link-unit", "smarty-nats-link.service"],
+      { encoding: "utf8", env });
+    expect(installed.status).toBe(0);
+    const printed = JSON.parse(installed.stdout) as Record<string, unknown>;
+    expect(printed).toMatchObject({ path: out, sha256: sha(fs.readFileSync(out)), owner: "fabric-v2", linkConfig: w.config,
+      linkUnit: "smarty-nats-link.service" });
+    const bytes = fs.readFileSync(out, "utf8");
+    expect(bytes).toContain(JSON.stringify(w.config));
+    expect(bytes).not.toContain("__FABRIC_SEAT_BRIDGE_");
+    expect(fs.statSync(out).mode & 0o777).toBe(0o500);
+    // A bad unit name or an unsafe link config is refused at install.
+    expect(spawnSync("node", [bundle, "--install", "--out", `${out}-2`, "--link-config", w.config, "--link-unit", "x;y"], { env }).status).toBe(2);
+    const { runSeam } = await import("./seat-drain-fixture.js");
+    const inputs = writerInputs(w);
+    const body = request(w.seat, "rc-restore-route", inputs);
+    expect(await runSeam(w.seat, out, "rc-restore-route", body, true)).toMatchObject({ code: 2, stdout: "",
+      stderr: "GAP: lock-not-held [owner: fabric-v2]\n" });
+    // With the lock, the installed seam reads ITS pinned config and the seat's mesh, then stops on a link it cannot read.
+    expect(await runSeam(w.seat, out, "rc-restore-route", body)).toMatchObject({ code: 2, stdout: "",
+      stderr: "GAP: link-status-unreadable [owner: fabric-v2]\n" });
+  }, 60_000);
+});
+
+const writerInputs = (w: World, extra: Record<string, unknown> = {}) => ({ recoveryRun: "c".repeat(32), parentRun: w.seat.run,
+  parentRunSha256: w.seat.runSha256, writer: { sessionId: SID, pid: process.pid, sessionFile: "/synthetic/v1/session.jsonl", singleWriter: true, ...extra } });
+
 describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the relaunched v1 as the live owner", () => {
-  const writer = (w: World, extra: Record<string, unknown> = {}) => ({ recoveryRun: "c".repeat(32), parentRun: w.seat.run,
-    parentRunSha256: w.seat.runSha256, writer: { sessionId: SID, pid: process.pid, sessionFile: "/synthetic/v1/session.jsonl", singleWriter: true, ...extra } });
+  const writer = writerInputs;
 
   const published = async () => {
     const w = await world();
@@ -292,8 +332,12 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     w.receipt = routable();
     expect((await run(w, "publish", { owner })).receipt?.result).toBe("pass");
     w.seat.native.state.sessionFile = "/synthetic/v1/session.jsonl";
-    w.receipt = { ok: true, verdict: "routable", side: "file", file: { remoteHost: null, live: true, ownerIncarnation: V1_INCARNATION },
-      nats: { read: true, records: [{ machine: "hub-a-bridge", live: true, ownerIncarnation: V1_INCARNATION }] } };
+    w.receipt = { ok: false, verdict: "not-routable", side: "file", file: { remoteHost: null, live: true, ownerIncarnation: V1_INCARNATION },
+      nats: { read: true, records: [{ machine: "hub-a-bridge", live: true, ownerIncarnation: V1_INCARNATION },
+        { machine: "org-d3synth", live: false, ownerIncarnation: INCARNATION }] } };
+    // After the restore, the hub still holds the v2 seat's old mirror row: the one tolerated status problem.
+    w.statusAfter = { ok: false, problems: [`mirror not on allow.nats: session:${SID}`],
+      allow: { file: [{ identity: LEAD, live: true }, { identity: `session:${SID}`, live: true }], nats: [] } };
     w.roots = [{ id: `session:${SID}`, machine: "hub-a-bridge", live: true, ownerIncarnation: V1_INCARNATION }];
     return w;
   };
@@ -315,6 +359,23 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     const wrong = await published();
     expect((await run(wrong, "rc-restore-route", writer(wrong, { pid: process.pid + 100_000 }))).receipt).toMatchObject({ result: "refused" });
     expect(evidenceOf(wrong, "fabric-v2-bridge-rc-restore-route-outcome.json").reason).toBe("v1-writer-mismatch");
+  });
+
+  it("a rollback before any publish write changes nothing and restarts nothing", async () => {
+    const w = await world();
+    w.seat.native.state.sessionFile = "/synthetic/v1/session.jsonl";
+    w.receipt = { side: "file", file: { remoteHost: null, live: true, ownerIncarnation: V1_INCARNATION }, nats: { read: true, records: [] } };
+    const before = fs.readFileSync(w.config);
+    expect((await run(w, "rc-restore-route", writer(w))).receipt).toMatchObject({ result: "pass" });
+    expect(fs.readFileSync(w.config)).toEqual(before);
+    expect(fs.existsSync(w.marker)).toBe(false);
+  });
+
+  it("another status problem after the reload is not tolerated", async () => {
+    const w = await published();
+    w.statusAfter = { ...w.statusAfter!, problems: [`mirror not on allow.nats: ${LEAD}`] };
+    expect((await run(w, "rc-restore-route", writer(w))).receipt).toMatchObject({ result: "refused" });
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json").reason).toBe("link-not-reloaded");
   });
 
   it("never removes a seat entry that publish did not write in this RUN", async () => {

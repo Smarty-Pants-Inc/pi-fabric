@@ -79,7 +79,8 @@ const holderOf = (config: NatsLinkConfig, deps: LinkDeps) => {
  * reports no problem. Not reloaded in time is a refusal, never assumed done.
  */
 export const reloadLink = async (config: NatsLinkConfig, unit: string, seat: { uid: number; home: string }, deps: LinkDeps,
-  clock: { now: () => number; sleep: (ms: number) => Promise<void>; deadline: number }): Promise<ReloadEvidence> => {
+  clock: { now: () => number; sleep: (ms: number) => Promise<void>; deadline: number },
+  tolerate: (problem: string) => boolean = () => false): Promise<ReloadEvidence> => {
   const started = clock.now();
   const before = holderOf(config, deps);
   const restartExit = await restartUnit(unit, seat.uid, seat.home, deps, Math.min(60_000, clock.deadline - clock.now()));
@@ -93,7 +94,8 @@ export const reloadLink = async (config: NatsLinkConfig, unit: string, seat: { u
       try {
         const status = await (deps.status ?? natsLinkStatus)(config);
         problems = Array.isArray(status.problems) ? (status.problems as unknown[]).map(String).slice(0, 50) : ["status unreadable"];
-        statusOk = status.ok === true && problems.length === 0;
+        // Only a named, expected leftover is tolerated (recorded): the removed seat's own old mirror row.
+        statusOk = Array.isArray(status.problems) && problems.every(tolerate);
       } catch { problems = ["status unreadable"]; statusOk = false; }
       if (statusOk) break;
     } else problems = ["the link lock does not name a new process"];

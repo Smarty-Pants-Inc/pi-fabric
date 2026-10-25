@@ -138,7 +138,7 @@ export class NatsTopicTranslator {
    * current epoch (bounded); everything else is final and returns undefined.
    */
   async retry(record: NatsCarrierRecord, ack: Readonly<Record<string, unknown>> | undefined): Promise<NatsOutbound | undefined> {
-    if (record.origin !== "topic" || !isStaleIncarnationRefusal(ack) || !record.envelope) return undefined;
+    if (record.origin !== "topic" || !isStaleIncarnationRefusal(ack) || !record.body) return undefined;
     const refused = this.#attemptOf(record);
     if (refused === undefined) return undefined;
     const attempt = refused + 1;
@@ -146,8 +146,8 @@ export class NatsTopicTranslator {
     let target: NatsPresenceEntry;
     try { target = this.#target(record.targetId); } catch { return undefined; }
     // Only a NEW epoch of the same root: the refused one would refuse again.
-    if (target.route.ownerIncarnation === record.envelope.body.ownerIncarnation) return undefined;
-    const body = record.envelope.body;
+    if (target.route.ownerIncarnation === record.body.ownerIncarnation) return undefined;
+    const body = record.body;
     return this.#send(record.sourceEventId, attempt, target, body.message as string, body.data as Record<string, unknown>);
   }
 
@@ -187,7 +187,7 @@ export class NatsTopicTranslator {
     const commandId = bridgeNatsCommandId({ hostId, ownerHostId: route.ownerHostId, ownerIdentityId: route.ownerIdentityId,
       targetId: route.ownerIdentityId, operation: "followUp", idempotencyKey, notRunAttempt: attempt });
     const existing = await this.#ledger.lookup("toNats", commandId);
-    if (existing?.envelope) return { kind: "send", envelope: existing.envelope, record: existing };
+    if (existing) return this.#resend(existing);
     const now = this.#now();
     const body = JSON.parse(JSON.stringify({
       version: 1, commandId, targetId: route.ownerIdentityId, operation: "followUp", ownerIncarnation: route.ownerIncarnation,
@@ -203,12 +203,23 @@ export class NatsTopicTranslator {
       sourceCommandId: idempotencyKey, destinationCommandId: commandId, sourceEventId: eventId, destinationEventId: envelope.id,
       targetId: route.ownerIdentityId, ownerHostId: route.ownerHostId, ownerIdentityId: route.ownerIdentityId,
       ownerMachine: route.machine, requesterId: this.identity.id, sourceMachine: NATS_CARRIER_FILE_SOURCE, replyTo: hostId,
-      bodyDigest: controlBodyFingerprint(body, undefined), expiresAt: now + this.#timeoutMs + BRIDGE_NATS_HORIZON_MS,
-      envelope,
+      bodyDigest: controlBodyFingerprint(body, undefined), deadlineAt: now + this.#timeoutMs,
+      expiresAt: now + this.#timeoutMs + BRIDGE_NATS_HORIZON_MS, ownerIncarnation: route.ownerIncarnation, body,
     };
-    const { record: stored } = await this.#ledger.claim(record);
-    if (!stored.envelope || stored.origin !== "topic") throw new NatsCarrierRefusal("topic followUp id collides with another command");
-    return { kind: "send", envelope: stored.envelope, record: stored };
+    const { created, record: stored } = await this.#ledger.claim(record);
+    return created ? { kind: "send", envelope, record } : this.#resend(stored);
+  }
+
+  /** The first envelope again, from the recorded id, machine and body bytes. */
+  #resend(record: NatsCarrierRecord): NatsOutbound {
+    if (record.origin !== "topic" || record.direction !== "toNats" || !record.body || !record.ownerMachine) {
+      throw new NatsCarrierRefusal("topic followUp id collides with another command");
+    }
+    return { kind: "send", record, envelope: Object.freeze({
+      id: record.destinationEventId, kind: "command" as const,
+      to: Object.freeze({ machine: record.ownerMachine, hostId: record.ownerHostId }), targetId: record.targetId,
+      operation: "followUp", from: carrierIdentity(this.identity), body: record.body,
+    }) };
   }
 }
 

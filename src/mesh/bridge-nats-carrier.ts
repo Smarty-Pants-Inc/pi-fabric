@@ -78,6 +78,8 @@ export interface NatsCarrierAuthorization {
   readonly targetId: string;
   readonly operation: FabricControlOperation;
   readonly principal?: FabricPrincipal | undefined;
+  /** toFile: the delivery's credential-bound source machine the sender was verified on. */
+  readonly sourceMachine?: string;
 }
 export type NatsCarrierDecision =
   | { readonly ok: true; readonly principal: "carry" | "strip" | "none" }
@@ -114,9 +116,27 @@ export interface NatsCarrierRecord {
   readonly replyTo: string;
   /** controlBodyFingerprint of the wire body the NATS end digests. */
   readonly bodyDigest: string;
+  /** The command's own deadline (NATS body deadlineAt). */
+  readonly deadlineAt: number;
   readonly expiresAt: number;
-  /** toNats: the exact envelope, so a resend after any restart has the same id and bytes. */
-  readonly envelope?: NatsCarrierEnvelope;
+  /** The owner epoch the command was addressed to. */
+  readonly ownerIncarnation?: string;
+  /**
+   * toNats: the exact resolved body sent under destinationEventId to ownerMachine. A resend after any
+   * restart rebuilds the envelope from it: same id, same body bytes, the same verified sender id.
+   */
+  readonly body?: Record<string, unknown>;
+}
+
+/** What the owner answered, recorded once against a record. */
+export interface NatsCarrierOutcome {
+  readonly accepted: boolean;
+  readonly at: number;
+  /** The verified owner identity id the ACK came from, and the ACK's source id. */
+  readonly fromId?: string;
+  readonly ackEventId?: string;
+  /** The translated ACK data republished to the source (bounded). */
+  readonly data?: Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -127,7 +147,7 @@ export interface NatsCarrierLedger {
   claim(record: NatsCarrierRecord): Promise<{ readonly created: boolean; readonly record: NatsCarrierRecord }>;
   lookup(direction: NatsCarrierDirection, destinationCommandId: string): Promise<NatsCarrierRecord | undefined>;
   /** Records the owner's outcome. The record stays to its expiry so replays and conflicts still resolve. */
-  settle(direction: NatsCarrierDirection, destinationCommandId: string, outcome: { accepted: boolean; at: number }): Promise<void>;
+  settle(direction: NatsCarrierDirection, destinationCommandId: string, outcome: NatsCarrierOutcome): Promise<void>;
 }
 
 export interface NatsCarrierOptions {
@@ -150,7 +170,14 @@ export class NatsCarrierRefusal extends Error {
   constructor(readonly reason: string, readonly code?: string) { super(`Fabric NATS carrier refused: ${reason} (not allowed)`); }
 }
 
-export interface NatsCarrierSettle { readonly direction: NatsCarrierDirection; readonly commandId: string; readonly accepted: boolean }
+export interface NatsCarrierSettle {
+  readonly direction: NatsCarrierDirection;
+  readonly commandId: string;
+  readonly accepted: boolean;
+  readonly fromId?: string;
+  readonly ackEventId?: string;
+  readonly data?: Readonly<Record<string, unknown>>;
+}
 
 export type NatsOutbound =
   /** Send this envelope (fixed body); the source event is done only once the destination persisted it. */
@@ -308,7 +335,10 @@ export class NatsBridgeCarrier {
 
   /** Mark an outcome settled: call only after the durable append (or the absorb) it belongs to. */
   async settle(settle: NatsCarrierSettle): Promise<void> {
-    await this.#ledger.settle(settle.direction, settle.commandId, { accepted: settle.accepted, at: this.#now() });
+    await this.#ledger.settle(settle.direction, settle.commandId, { accepted: settle.accepted, at: this.#now(),
+      ...(settle.fromId !== undefined ? { fromId: settle.fromId } : {}),
+      ...(settle.ackEventId !== undefined ? { ackEventId: settle.ackEventId } : {}),
+      ...(settle.data !== undefined ? { data: settle.data } : {}) });
   }
 
   async #outboundCommand(pub: BridgePublish): Promise<NatsOutbound> {
@@ -343,7 +373,7 @@ export class NatsBridgeCarrier {
     }
     const principal = decision.principal === "carry" ? copyFabricPrincipal(pub.principal) : undefined;
     const requestedAt = data.requestedAt as number;
-    const body = wire({
+    const body: Record<string, unknown> = wire({
       ...pick(data, COMMAND_FIELDS),
       commandId, ...(cancelCommandId !== undefined ? { cancelCommandId } : {}),
       deadlineAt: typeof data.deadlineAt === "number" ? data.deadlineAt : requestedAt + LEGACY_DEADLINE_MS,
@@ -362,16 +392,20 @@ export class NatsBridgeCarrier {
       sourceEventId, destinationEventId: envelope.id, targetId,
       ownerHostId: owner.route.ownerHostId, ownerIdentityId: owner.route.ownerIdentityId, ownerMachine: owner.route.machine,
       requesterId, sourceMachine: NATS_CARRIER_FILE_SOURCE, replyTo: data.replyTo as string, bodyDigest,
-      expiresAt: Math.max(body.deadlineAt as number, this.#now()) + BRIDGE_NATS_HORIZON_MS, envelope,
+      deadlineAt: body.deadlineAt as number, expiresAt: Math.max(body.deadlineAt as number, this.#now()) + BRIDGE_NATS_HORIZON_MS,
+      ...(typeof body.ownerIncarnation === "string" ? { ownerIncarnation: body.ownerIncarnation } : {}), body,
     };
     const { created, record: stored } = await this.#ledger.claim(record);
     if (created) return { kind: "send", envelope, record };
-    // A repeat of one carried command resends its first envelope byte for byte.
+    // A repeat of one carried command resends its first envelope: the stored id, machine and body bytes.
     if (stored.direction !== "toNats" || stored.origin !== "control" || stored.bodyDigest !== bodyDigest ||
-        stored.requesterId !== requesterId || stored.targetId !== targetId || !stored.envelope) {
+        stored.requesterId !== requesterId || stored.targetId !== targetId || !stored.body || !stored.ownerMachine) {
       throw new NatsCarrierRefusal("command id reused with different input");
     }
-    return { kind: "send", envelope: stored.envelope, record: stored };
+    return { kind: "send", record: stored, envelope: this.#envelope({
+      id: stored.destinationEventId, kind: "command", to: { machine: stored.ownerMachine, hostId: stored.ownerHostId },
+      targetId, operation, from: carrierIdentity(sender.identity), principal, body: stored.body,
+    }) };
   }
 
   async #outboundAck(pub: BridgePublish): Promise<NatsOutbound> {
@@ -397,7 +431,8 @@ export class NatsBridgeCarrier {
       from: carrierIdentity(owner.identity), body,
     });
     return { kind: "send", envelope, record,
-      settle: { direction: "toFile", commandId: record.destinationCommandId, accepted: body.accepted === true } };
+      settle: { direction: "toFile", commandId: record.destinationCommandId, accepted: body.accepted === true,
+        fromId: owner.identity.id, ackEventId: pub.data.bridge.id, data: body } };
   }
 
   /** NATS -> file: one delivery from this bridge machine's inbox. */
@@ -450,7 +485,7 @@ export class NatsBridgeCarrier {
     const refuse = (acceptance: Record<string, unknown>, reason: string): NatsInbound =>
       ({ kind: "reply", reason, envelope: this.#refusalAck(input.id, sourceMachine, body, bodyDigest, target, acceptance) });
     const operation = body.operation as FabricControlOperation;
-    const decision = this.#authorize({ direction: "toFile", senderId: requesterId, targetId, operation, principal });
+    const decision = this.#authorize({ direction: "toFile", senderId: requesterId, targetId, operation, principal, sourceMachine });
     if (!decision.ok) {
       // A verified sender to a target this link speaks for: a definite, notRun answer beats a timeout.
       return refuse({ accepted: false, error: `Fabric NATS bridge refused the command: ${decision.refuse}`, notRun: true }, decision.reason);
@@ -469,8 +504,9 @@ export class NatsBridgeCarrier {
       v: 1, direction: "toFile", origin: "control", link: this.link, operation,
       sourceCommandId: body.commandId as string, destinationCommandId: commandId, sourceEventId: input.id, destinationEventId: input.id,
       targetId, ownerHostId: target.route.ownerHostId, ownerIdentityId: target.route.ownerIdentityId,
-      requesterId, sourceMachine, replyTo: body.replyTo as string, bodyDigest,
+      requesterId, sourceMachine, replyTo: body.replyTo as string, bodyDigest, deadlineAt: body.deadlineAt as number,
       expiresAt: Math.max(body.deadlineAt as number, this.#now()) + BRIDGE_NATS_HORIZON_MS,
+      ...(typeof body.ownerIncarnation === "string" ? { ownerIncarnation: body.ownerIncarnation } : {}),
     };
     const { created, record: stored } = await this.#ledger.claim(record);
     if (!created) {
@@ -511,13 +547,14 @@ export class NatsBridgeCarrier {
     }
     const outcome = ackOutcome(body);
     if (!outcome) return { kind: "refused", reason: "ack carries no owner outcome" };
-    const settle: NatsCarrierSettle = { direction: "toNats", commandId: record.destinationCommandId, accepted: body.accepted };
+    const data = boundNatsAck({ version: 1, commandId: record.sourceCommandId, targetId: record.targetId, ...outcome },
+      this.#maxAckBytes);
+    const settle: NatsCarrierSettle = { direction: "toNats", commandId: record.destinationCommandId, accepted: body.accepted,
+      fromId: sender.identity.id, ackEventId: input.id, data };
     // N3 followUps and cancels have no file sender waiting on an ACK.
     if (record.origin === "topic" || record.operation === "cancel") {
       return { kind: "settled", reason: record.origin === "topic" ? "topic followUp settled" : "cancel settled", settle, record, ack: outcome };
     }
-    const data = boundNatsAck({ version: 1, commandId: record.sourceCommandId, targetId: record.targetId, ...outcome },
-      this.#maxAckBytes);
     const event: MeshEvent = {
       id: input.id, sequence: delivery.sequence, createdAt: this.#now(), topic: BRIDGE_NATS_ACK_TOPIC,
       kind: data.accepted === true ? "accepted" : "rejected", from: carrierIdentity(sender.identity), to: record.replyTo,

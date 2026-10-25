@@ -2,7 +2,8 @@
 // BridgeNatsPort that records sends and feeds inbox deliveries. Not a broker: L4's harness owns E2E.
 import type { BridgePresence } from "../../src/mesh/bridge.js";
 import type {
-  FilePresenceEntry, NatsCarrierDirection, NatsCarrierLedger, NatsCarrierPresence, NatsCarrierRecord, NatsPresenceEntry,
+  FilePresenceEntry, NatsCarrierDirection, NatsCarrierLedger, NatsCarrierOutcome, NatsCarrierPresence, NatsCarrierRecord,
+  NatsPresenceEntry,
 } from "../../src/mesh/bridge-nats-carrier.js";
 import type {
   BridgeNatsMirrorSet, BridgeNatsPort, BridgeNatsPortDelivery, BridgeNatsPortResolved, BridgeNatsPresenceView,
@@ -21,7 +22,7 @@ export const linkIdentity: MeshIdentity = { id: `bridge:${LINK}`, name: "mesh-br
 
 export class MemoryLedger implements NatsCarrierLedger {
   readonly records = new Map<string, NatsCarrierRecord>();
-  readonly settled = new Map<string, { accepted: boolean; at: number }>();
+  readonly settled = new Map<string, NatsCarrierOutcome>();
   async claim(record: NatsCarrierRecord): Promise<{ created: boolean; record: NatsCarrierRecord }> {
     const key = `${record.direction}:${record.destinationCommandId}`;
     const existing = this.records.get(key);
@@ -32,7 +33,7 @@ export class MemoryLedger implements NatsCarrierLedger {
   async lookup(direction: NatsCarrierDirection, id: string): Promise<NatsCarrierRecord | undefined> {
     return this.records.get(`${direction}:${id}`);
   }
-  async settle(direction: NatsCarrierDirection, id: string, outcome: { accepted: boolean; at: number }): Promise<void> {
+  async settle(direction: NatsCarrierDirection, id: string, outcome: NatsCarrierOutcome): Promise<void> {
     this.settled.set(`${direction}:${id}`, outcome);
   }
 }

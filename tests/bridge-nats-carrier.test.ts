@@ -157,7 +157,8 @@ describe("NATS ACK -> file ACK (the answer to a file sender)", () => {
       verification: "bridge", sequence: 7 });
     expect(event.data).toEqual({ version: 1, commandId: "file-cmd-1", targetId: natsLead.id, accepted: true,
       messageId: "answer-1", result: { text: "42" }, ownerIncarnation: "inc-moved-lead" });
-    expect(settle).toEqual({ direction: "toNats", commandId: mapped, accepted: true });
+    expect(settle).toEqual({ direction: "toNats", commandId: mapped, accepted: true, fromId: natsLead.id,
+      ackEventId: `ack:${bridgeNatsEnvelopeId(LINK, "file-event-1")}`, data: event.data });
   });
 
   it("refuses an ACK from the wrong machine, owner, digest or id, and settles one for nothing it sent", async () => {
@@ -300,7 +301,8 @@ describe("file ACK -> NATS ACK (the answer to a NATS sender)", () => {
     expect(envelope.operation).toBe("accepted");
     expect(envelope.body).toEqual({ accepted: true, messageId: "file-answer", result: { text: "the answer" },
       ownerIncarnation: "inc-file-lead", version: 1, commandId: "nats-cmd-1", targetId: fileLead.id, bodyDigest: senderFingerprint });
-    expect(plan.settle).toEqual({ direction: "toFile", commandId: mapped, accepted: true });
+    expect(plan.settle).toEqual({ direction: "toFile", commandId: mapped, accepted: true, fromId: fileLead.id,
+      ackEventId: "file-ack-1", data: envelope.body });
   });
 
   it("refuses an ACK to another sender, from another owner, for an unknown id, or a relay refusal", async () => {

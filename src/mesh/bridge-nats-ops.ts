@@ -162,11 +162,16 @@ const fileMirrors = (store: MeshStore, link: string): string[] =>
     return via === link && typeof value?.id === "string" ? [value.id] : [];
   }).sort();
 
-/** The link's own NATS connection settings (its machine and credential), as the link uses them. */
+/**
+ * The link's own NATS connection for presence and lease KV only (roots, receipt --nats, dry-run, withdraw): its
+ * machine and credential under the unscoped standard agent policy, as L1's port verifies it. Never `events` or
+ * `org`: those would make the connection demand the full events template (fabric.ev publish) and org grants,
+ * and refuse the consume-only bridge credential an N4 config runs with, blocking the rollback on exactly the
+ * N4 configs. These reads need neither.
+ */
 export const natsLinkRootsSource = (config: NatsLinkConfig): NatsRootsSource => ({
   servers: config.nats.servers, machine: config.nats.machine, credentials: config.nats.credentials, caFile: config.nats.caFile,
   custodyStream: config.nats.custodyStream, livenessStream: config.nats.livenessStream, pathBMachines: config.nats.pathBMachines,
-  ...(config.nats.org === undefined ? {} : { org: config.nats.org }), events: config.nats.events,
 });
 
 const message = (error: unknown): string => (error instanceof Error ? error.message : String(error)).replace(/[\r\n]+/g, " ").slice(0, 500);

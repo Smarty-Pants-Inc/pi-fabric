@@ -10,6 +10,7 @@ import {
   NatsLinkBusyError,
   natsLinkLockHolder,
   natsLinkLockPath,
+  natsLinkRootsSource,
   withdrawNatsLink,
 } from "../src/mesh/bridge-nats-ops.js";
 import type { NatsPresenceBuckets, NatsRootsSource } from "../src/mesh/bridge-nats-roots.js";
@@ -68,7 +69,7 @@ const addRoot = async (store: MeshStore, id: string, remoteHost?: string): Promi
 const participants = (store: MeshStore): string[] =>
   store.listAll("topology/participants/", { fresh: true }).map((entry) => (entry.value as { id: string }).id).sort();
 
-const setup = async (): Promise<{ config: NatsLinkConfig; store: MeshStore; dir: string }> => {
+const setup = async (n4 = false): Promise<{ config: NatsLinkConfig; store: MeshStore; dir: string }> => {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "nats-link-ops-")));
   roots.push(dir);
   const mesh = path.join(dir, "mesh");
@@ -80,8 +81,10 @@ const setup = async (): Promise<{ config: NatsLinkConfig; store: MeshStore; dir:
     version: 1, name: "ryzen1", link: "v2", file: { mesh }, stateDir, orgJson: path.join(dir, "org.json"),
     nats: { servers: ["tls://broker.example.test:4222"], machine: "ryzen1-bridge", credentials: path.join(dir, "bridge.creds"),
       caFile: path.join(dir, "ca.pem"), custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS",
-      pathBMachines: ["ryzen1-bridge", "sandbox1"], operatorMachine: "fabric-ops" },
-    allow: { file: [{ kind: "root", id: PAUL }], nats: [{ kind: "root", id: KATE, machine: "sandbox1" }] },
+      pathBMachines: ["ryzen1-bridge", "sandbox1"], operatorMachine: "fabric-ops",
+      ...(n4 ? { events: true, org: "test-org" } : {}) },
+    allow: { file: [{ kind: "root", id: PAUL }], nats: [{ kind: "root", id: KATE, machine: "sandbox1",
+      ...(n4 ? { republishTopics: ["fleet.work.*"] } : {}) }] },
   });
   return { config, store, dir };
 };
@@ -195,6 +198,21 @@ describe("nats-link withdraw", () => {
 
     const down = await withdrawNatsLink(config, { open: async () => { throw new Error("NATS USER.INFO machine tag mismatch"); } });
     expect(down).toMatchObject({ ok: false, nats: { error: "NATS USER.INFO machine tag mismatch" }, problems: ["NATS withdraw failed"] });
+  });
+
+  it("withdraws an N4 config (nats.events on) over the standard agent policy, so a consume-only credential can roll back", async () => {
+    const { config, store } = await setup(true);
+    expect(config.nats).toMatchObject({ events: true, org: "test-org" });
+    await addRoot(store, KATE, "v2");
+    const kv = buckets();
+    const report = await withdrawNatsLink(config, { open: kv.open });
+    expect(report).toMatchObject({ ok: true, file: { removed: [KATE] } });
+    // The presence/lease connection never asks for the events template (fabric.ev publish) or org grants: a
+    // bridge credential holding only the N4 consume grant passes the standard agent USER.INFO check.
+    const source = kv.opened()!;
+    expect(source).toMatchObject({ machine: "ryzen1-bridge", credentials: config.nats.credentials });
+    expect("events" in source || "org" in source).toBe(false);
+    expect(natsLinkRootsSource(config)).toEqual(natsLinkRootsSource({ ...config, nats: { ...config.nats, events: false } }));
   });
 
   it("refuses while another withdraw runs", async () => {

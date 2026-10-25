@@ -1,19 +1,24 @@
+import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { FabricParticipantRecord } from "../topology/types.js";
 import { assertNatsLinkPlatform } from "./bridge-nats-config.js";
-import { BRIDGE_STALL_ALARM_TOPIC, type BridgeStallAlarm } from "./bridge.js";
+import { openNatsLinkCounters, type NatsLinkCounters } from "./bridge-nats-counters.js";
+import { BRIDGE_STALL_ALARM_TOPIC, type BridgePublish, type BridgeStallAlarm } from "./bridge.js";
+import { BridgeRelayUnavailableError, startBridgeRelay } from "./bridge-relay.js";
 import type {
   NatsCarrierAuthorize, NatsCarrierDecision, NatsCarrierLedger, NatsCarrierRecord,
 } from "./bridge-nats-carrier.js";
 import { createNatsFileLink, type NatsCarrierSide } from "./bridge-nats-file.js";
 import {
-  createBridgeNatsIdentityGate, loadBridgeNatsSeatPins, parseBridgeNatsAllowSection, type BridgeNatsSeatPins,
+  bridgeNatsTopicMatches, createBridgeNatsIdentityGate, loadBridgeNatsSeatPins, parseBridgeNatsAllowSection, type BridgeNatsSeatPins,
 } from "./bridge-nats-identity.js";
 import { bridgeNatsClaimAction, openBridgeNatsLedger } from "./bridge-nats-ledger.js";
 import { openNatsBridgeSide, type NatsBridgeSideConfig } from "./bridge-nats-port.js";
+import { startNatsRepublishLink, type NatsRepublishHandle } from "./bridge-nats-republish.js";
 import type { NatsTopicAuthorize } from "./bridge-nats-topics.js";
 import {
-  bridgeNatsLinkIdentity, type BridgeNatsAllowDecision, type BridgeNatsAllowListConfig, type BridgeNatsAllowSection,
+  BRIDGE_NATS_CLASS_RECEIVE, BRIDGE_NATS_REFUSAL, bridgeNatsDestinationClass, bridgeNatsLinkIdentity, type BridgeNatsAllowDecision, type BridgeNatsAllowListConfig, type BridgeNatsAllowSection,
   type BridgeNatsCommandRecord, type BridgeNatsIdentityGate, type BridgeNatsLedger, type BridgeNatsPort,
   type BridgeNatsPresenceView,
 } from "./bridge-nats-types.js";
@@ -28,8 +33,10 @@ import { systemdWatchdogNotify } from "./systemd-watchdog.js";
  * Every crossing passes three independent checks: MeshBridge's own (sender from presence,
  * addressed recipient, held mirrors at commit), the carrier's (verified presence on the source
  * side, the KV source machine, ledger-bound ACKs), and L3's allow gate (static list, destination
- * class, principal carry or strip). There is no relay hook: spoke relays and NATS -> factory
- * topics are PR 2, and MeshBridge fails a cross-spoke command closed without one.
+ * class, principal carry or strip).
+ *
+ * PR 2: N4 republishes v2 work topics into the file mesh (nats.events), and the link joins the hub's
+ * relay between bridges (relay.spokes), so a work-host lane on a spoke reaches a v2 root and back.
  */
 
 const MAX_EVENT_BYTES = 256 * 1024;
@@ -49,12 +56,17 @@ export interface NatsLinkStartConfig {
     readonly maxStateBytes?: number;
   };
   readonly stateDir: string;
-  /** The bridge machine's NATS settings (L1's openNatsBridgeSide reads them). */
-  readonly nats: NatsBridgeSideConfig["nats"];
+  /** The bridge machine's NATS settings (L1's openNatsBridgeSide reads them); `events` turns on N4 (PR 2). */
+  readonly nats: NatsBridgeSideConfig["nats"] & { readonly events?: boolean };
   /** L5 hands the allow-list already parsed by L3; a raw `allow` section is parsed here the same way. */
   readonly allow: BridgeNatsAllowListConfig | BridgeNatsAllowSection;
   /** The org.json whose principal seats pin the allow-list; absent = L3's default candidates. */
   readonly orgJson?: string;
+  /**
+   * PR 2 relay: the hub's spoke links (their `mesh-bridge run --remote` names). A viaSpoke allow entry must
+   * name one, and with any configured the link joins the hub relay (bin/nats-link start, Linux).
+   */
+  readonly relay?: { readonly spokes: readonly string[] };
 }
 
 const parsedAllow = (value: BridgeNatsAllowListConfig | BridgeNatsAllowSection): value is BridgeNatsAllowListConfig =>
@@ -75,19 +87,32 @@ export interface NatsLinkFactories {
   openLedger?(directory: string): Promise<BridgeNatsLedger>;
   /** org.json seat pins; default: L3's loadBridgeNatsSeatPins (smarty-send's strict reader). */
   seatPins?(): BridgeNatsSeatPins;
+  /** The hub relay registration (L3's peer-authenticated UDS relay); default startBridgeRelay. */
+  startRelay?(options: Parameters<typeof startBridgeRelay>[0]): ReturnType<typeof startBridgeRelay>;
 }
 
 export interface NatsLinkStartOptions {
   readonly signal: AbortSignal;
   readonly log: (line: string) => void;
   readonly factories?: NatsLinkFactories;
+  /**
+   * In-process TEST seam only (integrator note 18), the shape of MeshBridge's own `relay`: send one event to
+   * another hub link. Given, the link registers NO UDS relay, and its handle offers deliverRelay for the
+   * inbound half. Neither the config file nor the CLI can set it: production always uses the UDS relay.
+   */
+  readonly relay?: (destinationRemote: string, event: BridgePublish) => Promise<void>;
 }
 
 export interface NatsLinkHandle {
   /** Settles when the link has stopped: resolves after stop() or an abort, rejects when the link failed. */
   readonly closed: Promise<void>;
   stop(): Promise<void>;
+  /** Only with options.relay (the test seam): deliver one event another hub link relayed (MeshBridge.deliverRelay). */
+  deliverRelay?(sourceRemote: string, event: BridgePublish): Promise<void>;
 }
+
+/** This release's `bin/nats-link`: the only entry the hub relay admits as this link (src/mesh, dist/mesh or dist/chunks). */
+export const natsLinkBinPath = (): string => fileURLToPath(new URL("../../bin/nats-link", import.meta.url));
 
 const decision = (allowed: BridgeNatsAllowDecision): NatsCarrierDecision =>
   allowed.ok ? { ok: true, principal: allowed.principal } : { ok: false, refuse: allowed.refuse, reason: allowed.reason };
@@ -95,7 +120,9 @@ const decision = (allowed: BridgeNatsAllowDecision): NatsCarrierDecision =>
 /**
  * L3's gate as the carrier's and N3's authorize hooks. Both identities are verified again here, from
  * the presence views of their own sides (the NATS sender on its delivery's source machine), before
- * allow() decides; the carrier's own checks stay in force as well.
+ * allow() decides; the carrier's own checks stay in force as well. PR 2 relay: a relayed sender must
+ * verify as a spoke root of exactly the spoke link it came through, an unrelayed one as no spoke root;
+ * a spoke root target is handed back with its spoke, so the command is relayed there.
  */
 export const natsLinkAuthorizers = (gate: BridgeNatsIdentityGate, views: {
   readonly file: () => BridgeNatsPresenceView; readonly nats: () => BridgeNatsPresenceView;
@@ -106,10 +133,17 @@ export const natsLinkAuthorizers = (gate: BridgeNatsIdentityGate, views: {
     const sourceView = views[source](), destinationView = views[destination]();
     const sender = gate.verifySender(source, request.senderId, sourceView, destinationView, request.sourceMachine);
     if (!sender.ok) return { ok: false, refuse: sender.refuse, reason: sender.reason };
+    if (sender.identity.viaSpoke !== request.viaSpoke) {
+      return { ok: false, refuse: BRIDGE_NATS_REFUSAL.senderUnverified, reason: request.viaSpoke === undefined
+        ? `${request.senderId} is a spoke root; it sends only through its spoke link's relay`
+        : `${request.senderId} is not a root that spoke link ${request.viaSpoke} relays` };
+    }
     const target = gate.verifyTarget(destination, request.targetId, destinationView, sourceView);
     if (!target.ok) return { ok: false, refuse: target.refuse, reason: target.reason };
-    return decision(gate.allow({ direction: request.direction, sender: sender.identity, target: target.identity,
+    const allowed = decision(gate.allow({ direction: request.direction, sender: sender.identity, target: target.identity,
       subject: { type: "control", operation: request.operation }, principal: request.principal }));
+    const spoke = request.direction === "toFile" ? target.identity.viaSpoke : undefined;
+    return allowed.ok && spoke !== undefined ? { ...allowed, viaSpoke: spoke } : allowed;
   },
   authorizeTopic: request => {
     const natsView = views.nats(), fileView = views.file();
@@ -120,13 +154,17 @@ export const natsLinkAuthorizers = (gate: BridgeNatsIdentityGate, views: {
   },
 });
 
-/** Only file identities on the allow-list are mirrored into KV (roots by id; actors by root + name, and id when pinned). */
+/**
+ * Only file identities on the allow-list are mirrored into KV (roots by id; actors by root + name, and id when
+ * pinned). A root's stored origin must match its entry: native for a hub root, its own spoke link for a spoke
+ * root (PR 2 relay), so no other link's mirror is ever held under an allow-listed id.
+ */
 export const natsLinkMirrorAllowed = (allow: BridgeNatsAllowListConfig) =>
-  (participant: Pick<FabricParticipantRecord, "id" | "kind" | "rootId" | "name">): boolean =>
+  (participant: Pick<FabricParticipantRecord, "id" | "kind" | "rootId" | "name" | "remoteHost">): boolean =>
     allow.entries.some(entry => entry.side === "file" && (entry.kind === "root"
-      ? participant.kind === "root" && participant.id === entry.id
-      : participant.kind === "actor" && participant.rootId === entry.rootId && participant.name === entry.name &&
-        (entry.id === undefined || entry.id === participant.id)));
+      ? participant.kind === "root" && participant.id === entry.id && participant.remoteHost === entry.viaSpoke
+      : participant.kind === "actor" && participant.remoteHost === undefined && participant.rootId === entry.rootId &&
+        participant.name === entry.name && (entry.id === undefined || entry.id === participant.id)));
 
 /**
  * Whether an inbound command's target is named on allow.file, so a moment's KV lag may be waited for:
@@ -138,6 +176,18 @@ export const natsLinkFileTargetAllowed = (allow: BridgeNatsAllowListConfig, file
     : entry.id !== undefined ? entry.id === targetId
       : fileView().records(targetId).some(record => record.kind === "actor" && record.mirroredBy === undefined &&
         record.rootId === entry.rootId && record.name === entry.name)));
+
+/**
+ * N4 (security pass P3): whether a republished v2 event may keep `to` naming this hub recipient. Recipients
+ * opt in: only an allow.file hub root whose receiveTopics list the topic, and that receives followUp within its
+ * destination class (a topic event lands in a root's inbox as a followUp does, so a principal seat or any root
+ * with receive [] gets none). Never a spoke root (the hub never forwards a bridged event) or an actor (an
+ * actor entry lists no topics). The hub factory is decided in the republish leg (isAddressedHubFactoryEvent).
+ */
+export const natsLinkRepublishRecipient = (allow: BridgeNatsAllowListConfig) => (to: string, topic: string): boolean =>
+  allow.entries.some(entry => entry.side === "file" && entry.kind === "root" && entry.id === to && entry.viaSpoke === undefined &&
+    entry.receive.includes("followUp") && BRIDGE_NATS_CLASS_RECEIVE[bridgeNatsDestinationClass(entry)].includes("followUp") &&
+    (entry.receiveTopics ?? []).some(pattern => bridgeNatsTopicMatches(pattern, topic)));
 
 /** L3's durable ledger as the carrier's ledger port. */
 export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsCarrierLedger => {
@@ -205,7 +255,8 @@ export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsC
 
 /**
  * Start the link: open the file store, the gate (allow-list plus org.json seat pins), L1's port and
- * L3's ledger, then MeshBridge. Resolves once the first presence pass has linked both sides.
+ * L3's ledger, then MeshBridge, then (PR 2, with relay.spokes) the hub relay. Resolves once the first
+ * presence pass has linked both sides.
  */
 export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLinkStartOptions): Promise<NatsLinkHandle> => {
   // The hub runs Linux or macOS; the ledger, lock and config checks rely on POSIX file semantics.
@@ -214,10 +265,20 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
   const factories = options.factories ?? {};
   signal.throwIfAborted();
   // The allow-list and the seat pins are checked before anything is opened: a bad list never links.
+  // PR 2: a viaSpoke entry must name one of relay.spokes (the same parse as L5's config).
+  const spokes = config.relay?.spokes ?? [];
   const allow = parsedAllow(config.allow) ? config.allow
-    : parseBridgeNatsAllowSection(config.allow, { link: config.link, natsMachine: config.nats.machine });
+    : parseBridgeNatsAllowSection(config.allow, { link: config.link, natsMachine: config.nats.machine, spokes });
   if (allow.link !== config.link || allow.natsMachine !== config.nats.machine) {
     throw new Error("startNatsLink: the allow-list was parsed for another link or NATS machine");
+  }
+  if (allow.entries.some(entry => entry.kind === "root" && entry.viaSpoke !== undefined && !spokes.includes(entry.viaSpoke))) {
+    throw new Error("startNatsLink: a viaSpoke allow entry names no configured relay.spokes link");
+  }
+  // N4 reads republishTopics from the org's event stream: without nats.events they would silently do nothing.
+  if (config.nats.events !== true &&
+      allow.entries.some(entry => entry.side === "nats" && entry.kind === "root" && (entry.republishTopics?.length ?? 0) > 0)) {
+    throw new Error("startNatsLink: an allow.nats entry lists republishTopics, which need nats.events");
   }
   const gate = createBridgeNatsIdentityGate(allow, { pins: factories.seatPins?.() ?? loadBridgeNatsSeatPins(config.orgJson) });
   // L1's port admits presence from the allow section's two lists (the side is the list).
@@ -230,9 +291,16 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
   });
   let port: BridgeNatsPort | undefined;
   let opened: BridgeNatsLedger | undefined;
+  let republish: NatsRepublishHandle | undefined;
+  let counters: NatsLinkCounters | undefined;
+  let udsRelay: Awaited<ReturnType<typeof startBridgeRelay>> | undefined;
   try {
     await store.prepareLock();
     signal.throwIfAborted();
+    // L5's crossing counters (`nats-link status`), one snapshot in the state dir, closed on stop.
+    fs.mkdirSync(config.stateDir, { recursive: true, mode: 0o700 });
+    counters = openNatsLinkCounters(config.stateDir, config.link);
+    const openedCounters = counters;
     port = factories.openPort
       ? await factories.openPort(portConfig, { signal, log, fileStore: store })
       : await openNatsBridgeSide(portConfig, { signal, log, fileStore: store, onError: error =>
@@ -246,9 +314,15 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
       file: () => remote!.filePresence.view(), nats: () => openedPort.presenceView(),
     });
     const identity = { id: `bridge:${config.name}`, name: "mesh-bridge", kind: "main" as const };
+    // PR 2 relay: MeshBridge's delivery-only hub-link IPC. The test seam replaces it; otherwise the UDS relay
+    // registered below carries it, and until then (or without one) a cross-link command fails closed.
+    const relay = options.relay ?? (async (destinationRemote: string, event: BridgePublish): Promise<void> => {
+      if (!udsRelay || signal.aborted) throw new BridgeRelayUnavailableError();
+      await udsRelay.send(destinationRemote, event);
+    });
     const link = createNatsFileLink({
       store, localName: config.name, link: config.link, cursorPath: path.join(config.stateDir, "cursor.json"),
-      port, ledger, authorize, authorizeTopic, mirrorAllowed: natsLinkMirrorAllowed(allow), log,
+      port, ledger, authorize, authorizeTopic, mirrorAllowed: natsLinkMirrorAllowed(allow), log, relay, counters: openedCounters,
       // L1's port lists native file actors itself (N1): the mirror set carries roots only.
       mirrorActors: false,
       waitForTarget: natsLinkFileTargetAllowed(allow, () => remote!.filePresence.view()),
@@ -264,15 +338,44 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     });
     remote = link.remote;
     const { bridge } = link;
+    // N4 (PR 2, lane L1): with nats.events, v2 work topics are republished into this file mesh, decided by
+    // L3's gate (verifyEventSender + allowRepublish) on both sides' presence. A missing consume grant
+    // refuses the start here, before MeshBridge links anything.
+    // An addressed v2 event keeps its `to` only for the hub factory or an allow.file root that opted in to its topic.
+    republish = await startNatsRepublishLink(config, { store, port, gate, ledger: opened, signal, log, counters: openedCounters,
+      recipientAllowed: natsLinkRepublishRecipient(allow),
+      views: { refresh: () => remote!.filePresence.refresh(), nats: () => openedPort.presenceView(),
+        file: () => remote!.filePresence.view() } });
     await bridge.startWithBackoff();
     signal.throwIfAborted();
+    // PR 2 relay: join the hub's relay between bridges once linked, as `mesh-bridge run` does. Only with spokes
+    // configured, never beside the test seam. A refusal (another release, a config that is not private, the
+    // slot held, not Linux) costs only the relay: hub-local traffic goes on, cross-link commands fail closed.
+    if (!options.relay && spokes.length > 0) {
+      try {
+        udsRelay = await (factories.startRelay ?? startBridgeRelay)({ localName: config.name, remoteName: config.link,
+          meshRoot: store.root, bridgeScriptPath: fs.realpathSync(natsLinkBinPath()),
+          deliver: (sourceRemote, event) => bridge.deliverRelay(sourceRemote, event) });
+        log(`relay: joined the hub relay as ${config.link} (spokes ${spokes.join(", ")})`);
+      } catch {
+        // Never log the refusal's details (bridge-relay's rule); the operator sees the relay is down.
+        log(`relay unavailable; hub-local link remains active; commands between ${spokes.join(", ")} and ${config.link} fail closed`);
+      }
+      signal.throwIfAborted();
+    }
     log(`linked ${config.name} <-> ${config.link} (NATS machine ${port.machine})`);
     let stopping: Promise<void> | undefined;
     const openedLedger = opened;
+    const openedRepublish = republish;
     const stop = (): Promise<void> => stopping ??= (async () => {
+      const joined = udsRelay;
+      udsRelay = undefined;
+      await joined?.close().catch(() => undefined);
+      await openedRepublish?.stop().catch(() => undefined);
       await bridge.stop().catch(() => undefined);
       await openedPort.close().catch(() => undefined);
       await openedLedger.close().catch(() => undefined);
+      try { openedCounters.close(); } catch (error) { log(`counters: ${error instanceof Error ? error.message : String(error)}`); }
       store.closeState();
     })();
     const onAbort = (): void => { void stop(); };
@@ -285,10 +388,14 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
         if (!signal.aborted) throw error;
       });
     void closed.catch(() => undefined);
-    return { closed, stop };
+    return { closed, stop,
+      ...(options.relay ? { deliverRelay: (sourceRemote: string, event: BridgePublish) => bridge.deliverRelay(sourceRemote, event) } : {}) };
   } catch (error) {
+    await udsRelay?.close().catch(() => undefined);
+    await republish?.stop().catch(() => undefined);
     await port?.close().catch(() => undefined);
     await opened?.close().catch(() => undefined);
+    try { counters?.close(); } catch { /* the start error is the one to report */ }
     store.closeState();
     throw error;
   }

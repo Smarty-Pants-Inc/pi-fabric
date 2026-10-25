@@ -36,11 +36,13 @@ import {
   BridgeNatsAllowListError,
   bridgeNatsAllowKey,
   bridgeNatsDryRun,
+  bridgeNatsFilePresenceRecord,
   BridgeNatsSeatPinsError,
   createBridgeNatsIdentityGate,
   loadBridgeNatsSeatPins,
 } from "./mesh/bridge-nats-identity.js";
 import type { BridgeNatsAllowEntry, BridgeNatsPresenceRecord, BridgeNatsPresenceView, BridgeNatsSide } from "./mesh/bridge-nats-types.js";
+import { type NatsLinkCounterName, readNatsLinkCounters } from "./mesh/bridge-nats-counters.js";
 import type { MeshEvent } from "./mesh/event-log.js";
 import { MeshStore } from "./mesh/store.js";
 import { ParticipantDirectory } from "./topology/participant-directory.js";
@@ -202,7 +204,7 @@ const openReadOnly = (config: NatsLinkConfig): MeshStore => {
   });
 };
 
-type ParticipantRow = FabricParticipantInfo & { remoteHost?: string };
+type ParticipantRow = FabricParticipantInfo & { remoteHost?: string; bridgeVia?: string };
 
 /** Every participant on the file mesh, stale ones included, as agents.members lists them. */
 const fileParticipants = (store: MeshStore): ParticipantRow[] => {
@@ -245,16 +247,13 @@ const presenceView = (side: BridgeNatsSide, records: readonly BridgeNatsPresence
   list: () => records,
 });
 
-/** The file mesh as L3's gate reads it: every record, live or not, with this link's mirrors marked. */
+/**
+ * The file mesh as L3's gate reads it: every record, live or not, built by L3's one builder
+ * (bridgeNatsFilePresenceRecord), which keeps the stored remoteHost and bridgeVia apart: a spoke link's
+ * re-export of another link's mirror is never taken for that spoke's direct mirror (L3 audit P0).
+ */
 export const filePresenceView = (rows: readonly ParticipantRow[], observedAt: number): BridgeNatsPresenceView =>
-  presenceView("file", rows.map((row) => ({
-    id: row.id, name: row.name, kind: meshKind(row.kind), rootId: row.rootId,
-    ...(row.sessionId ? { sessionId: row.sessionId } : {}),
-    ownerHostId: row.ownerHostId, ownerIdentityId: row.ownerIdentityId,
-    ...(row.ownerIncarnation ? { ownerIncarnation: row.ownerIncarnation } : {}),
-    ...(row.remoteHost ? { mirroredBy: row.remoteHost } : {}),
-    live: row.stale !== true, observedAt,
-  })));
+  presenceView("file", rows.map((row) => bridgeNatsFilePresenceRecord(row, { live: row.stale !== true, observedAt })));
 
 /** NATS KV presence as L3's gate reads it: the machine comes from each record's KV key. */
 export const natsPresenceView = (roots: readonly NatsRootInfo[], observedAt: number): BridgeNatsPresenceView =>
@@ -322,14 +321,42 @@ export const natsLinkStatus = async (config: NatsLinkConfig, now = Date.now()): 
   for (const row of mirrored) {
     if (!sideEntries(config, "nats").some((entry) => allowMatches(entry, row))) problems.push(`mirror not on allow.nats: ${row.id}`);
   }
-  // Each listed identity as the file mesh shows it: a file identity native there, a NATS one as this link's mirror.
+  // Each listed identity as the file mesh shows it: a hub identity native there (a spoke root as its spoke
+  // link's mirror), a NATS one as this link's mirror.
   const listed = (entries: readonly BridgeNatsAllowEntry[]) => entries.map((entry) => {
+    const { viaSpoke, republishTopics } = pr2Fields(entry);
     const row = rows.find((candidate) => allowMatches(entry, candidate) &&
-      (entry.side === "file" ? candidate.remoteHost === undefined : candidate.remoteHost === config.link));
+      (entry.side === "file" ? candidate.remoteHost === viaSpoke && candidate.bridgeVia === undefined
+        : candidate.remoteHost === config.link));
     return { identity: bridgeNatsAllowKey(entry), ...(row ? { id: row.id } : {}), present: row !== undefined,
-      live: row !== undefined && row.stale !== true, send: entry.send, receive: entry.receive };
+      live: row !== undefined && row.stale !== true, send: entry.send, receive: entry.receive,
+      ...(viaSpoke === undefined ? {} : { viaSpoke }), ...(republishTopics === undefined ? {} : { republishTopics }) };
   });
   const allow = { file: listed(sideEntries(config, "file")), nats: listed(sideEntries(config, "nats")) };
+
+  // The running link's crossing counters (PR 2): what each leg carried and refused, cumulative across restarts.
+  const snapshot = readNatsLinkCounters(config.stateDir);
+  if (snapshot && snapshot.link !== config.link) problems.push("counters name another link");
+  const count = (name: NatsLinkCounterName): number => snapshot?.counters[name] ?? 0;
+  const counters = snapshot
+    ? { present: true, since: snapshot.since, startedAt: snapshot.startedAt, updatedAt: snapshot.updatedAt, pid: snapshot.pid,
+      ageMs: Math.max(0, Math.round(now - Date.parse(snapshot.updatedAt))), values: snapshot.counters, last: snapshot.last }
+    : { present: false };
+  // The config refuses republishTopics without nats.events, so a listed sender here is read from the stream.
+  const republishing = sideEntries(config, "nats").filter((entry) => pr2Fields(entry).republishTopics?.length);
+  const republish = {
+    enabled: config.nats.events,
+    senders: republishing.map((entry) => ({ identity: bridgeNatsAllowKey(entry), topics: pr2Fields(entry).republishTopics })),
+    accepted: count("republish.accepted"), duplicate: count("republish.duplicate"), refused: count("republish.refused"),
+  };
+  const relay = {
+    spokes: config.relay?.spokes ?? [],
+    spokeRoots: sideEntries(config, "file").flatMap((entry) => {
+      const { viaSpoke } = pr2Fields(entry);
+      return viaSpoke === undefined ? [] : [{ identity: bridgeNatsAllowKey(entry), viaSpoke }];
+    }),
+    toNats: count("relay.toNats"), toFile: count("relay.toFile"), refused: count("relay.refused"),
+  };
   return {
     ok: problems.length === 0,
     at: new Date(now).toISOString(),
@@ -338,9 +365,22 @@ export const natsLinkStatus = async (config: NatsLinkConfig, now = Date.now()): 
     stall: { path: paths.stallReason, reason: stallText || null },
     mirrors: mirrored.map(participantSummary),
     allow,
+    counters,
+    republish,
+    relay,
     problems,
   };
 };
+
+/**
+ * The PR 2 allow fields of a root entry (L3's parser owns them): `republishTopics` on a NATS root (N4: its
+ * fleet.work/ops events republished into the file mesh) and `viaSpoke` on a file root that lives on a spoke.
+ */
+const pr2Fields = (entry: BridgeNatsAllowEntry): { viaSpoke?: string; republishTopics?: readonly string[] } =>
+  entry.kind !== "root" ? {} : {
+    ...(entry.viaSpoke === undefined ? {} : { viaSpoke: entry.viaSpoke }),
+    ...(entry.republishTopics === undefined ? {} : { republishTopics: entry.republishTopics }),
+  };
 
 // ---------------------------------------------------------------- receipt
 
@@ -430,7 +470,9 @@ export const sessionReceipt = async (
   }
   const found = rows.filter((row) => row.id === id);
   const file = found.length === 1 ? found[0]! : undefined;
-  const side = natsLinkAllowListConfig(config).entries.find((entry) => entry.kind === "root" && entry.id === id)?.side ?? null;
+  const entry = natsLinkAllowListConfig(config).entries.find((candidate) => candidate.kind === "root" && candidate.id === id);
+  const side = entry?.side ?? null;
+  const viaSpoke = entry ? pr2Fields(entry).viaSpoke : undefined;
   const problems: string[] = [];
   if (!side) problems.push("not on this link's allow-list");
   if (found.length > 1) problems.push("several file-mesh records answer to this id");
@@ -438,7 +480,13 @@ export const sessionReceipt = async (
   else {
     if (file.stale) problems.push("file-mesh record is not live");
     if (side === "nats" && file.remoteHost !== config.link) problems.push(`file-mesh record is not this link's mirror (remoteHost ${file.remoteHost ?? "none"})`);
-    if (side === "file" && file.remoteHost !== undefined) problems.push(`file-mesh record is a mirror (remoteHost ${file.remoteHost}), not native`);
+    if (side === "file" && viaSpoke === undefined && file.remoteHost !== undefined) {
+      problems.push(`file-mesh record is a mirror (remoteHost ${file.remoteHost}), not native`);
+    }
+    // A spoke root is the hub's DIRECT mirror held by its spoke link: remoteHost is the spoke, no relay hop.
+    if (viaSpoke !== undefined && (file.remoteHost !== viaSpoke || file.bridgeVia !== undefined)) {
+      problems.push(`file-mesh record is not spoke ${viaSpoke}'s direct mirror (remoteHost ${file.remoteHost ?? "none"})`);
+    }
   }
   let nats: Record<string, unknown> | null = null;
   if (options.nats) {
@@ -466,6 +514,7 @@ export const sessionReceipt = async (
     id,
     link: config.link,
     side,
+    ...(viaSpoke === undefined ? {} : { viaSpoke }),
     file: file ? participantSummary(file) : null,
     handoffs,
     nats,
@@ -563,6 +612,13 @@ export const main = async (argv: string[], io: NatsLinkCliIo = {}): Promise<numb
     }
     if (mode === "start") {
       preflightNatsLinkConfig(config);
+      // The hub relay (PR 2) accepts this process as a relay peer only if its config file has no group or other
+      // bits (src/mesh/bridge-relay.ts): with spoke links configured, refuse now, by name, never at the first relay.
+      if ((config.relay?.spokes.length ?? 0) > 0 && process.platform !== "win32" &&
+        (fs.statSync(required(flags, "config")).mode & 0o077) !== 0) {
+        throw new NatsLinkConfigError("--config", "must have no group or other permission bits (0600 or 0400) when relay.spokes is set: " +
+          "the hub relay authenticates the link by it");
+      }
       // Fail fast, before anything opens: an allow entry that contradicts org.json's seats refuses the start.
       identityGate(config);
       const starter = io.starter ?? await loadNatsLinkStarter();

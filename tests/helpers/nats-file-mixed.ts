@@ -31,11 +31,17 @@ import { openFabricTransport } from "../../src/transport/index.js";
 import { runTransportAdmin } from "../../src/transport/nats/admin.js";
 import { hashToken } from "../../src/transport/nats/subjects.js";
 import type { BridgeNatsAllowEntryInput } from "../../src/mesh/bridge-nats-types.js";
+import { parseBridgeNatsAllowSection } from "../../src/mesh/bridge-nats-identity.js";
 import type { FabricControlOperation } from "../../src/topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantRecord, FabricKvHostLease } from "../../src/topology/types.js";
 import type { FabricTransport, TransportEnvelope, TransportSent } from "../../src/transport/types.js";
 import { createPathBHarness, PATH_B_MACHINES, PATH_B_PERMISSION_POLICY, teardownWithin, type PathBHarness } from "./nats-cluster.js";
 import { NatsWireFaults } from "./nats-wire-faults.js";
+import { PassThrough } from "node:stream";
+import { MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePublish } from "../../src/mesh/bridge.js";
+import { BridgeRelayUnavailableError } from "../../src/mesh/bridge-relay.js";
+import { openBootstrapNatsConnection } from "../../src/transport/nats/connection.js";
+import { ensureNatsEventsStream } from "../../src/transport/nats/provision.js";
 
 export const BRIDGE_MACHINE = "machine-a";
 export const NATS_MAIN_MACHINE = "machine-b";
@@ -66,11 +72,15 @@ export interface MixedLinkHandle {
   stop(): Promise<void>;
   /** Settles when the link ends (stop or a fatal error). */
   readonly closed?: Promise<unknown>;
+  /** PR 2 relay (proposed, MeshBridge's in-process seam): deliver one event another hub link relays to this link. */
+  deliverRelay?(sourceRemote: string, event: BridgePublish): Promise<void>;
 }
 
 export interface MixedLinkStartOptions {
   readonly signal: AbortSignal;
   readonly log: (line: string) => void;
+  /** PR 2 relay (proposed, MeshBridge's `relay` option): send one event to another hub link by its name. */
+  readonly relay?: (destinationRemote: string, event: BridgePublish) => Promise<void>;
 }
 
 /** The NatsLinkConfig JSON the harness builds (L5 owns the schema; L5's parser validates it when present). */
@@ -82,9 +92,13 @@ export interface MixedLinkConfig {
   readonly stateDir: string;
   /** Seat pins (L3): ALWAYS this harness's fixture; asserted never under $HOME. */
   readonly orgJson: string;
+  /** PR 2 relay: hub spoke link names a `viaSpoke` entry may name. */
+  readonly relay?: { readonly spokes: readonly string[] };
   readonly nats: {
     readonly servers: readonly string[]; readonly machine: string; readonly credentials: string; readonly caFile: string;
     readonly custodyStream: string; readonly livenessStream: string; readonly pathBMachines: readonly string[]; readonly operatorMachine: string;
+    /** PR 2 N4: the org event stream FABRIC_EV_<org> (L5: org is required when events is true). */
+    readonly org?: string; readonly events?: boolean;
   };
   readonly allow: { readonly file: readonly BridgeNatsAllowEntryInput[]; readonly nats: readonly BridgeNatsAllowEntryInput[] };
 }
@@ -128,12 +142,26 @@ export const SEAT_OPERATIONS: readonly FabricControlOperation[] = ["followUp", "
  * entry is pinned to its machine (L3 requires `machine` on every allow.nats entry; integrator note 8).
  */
 export function allowRoot(id: string, options: { operations?: readonly FabricControlOperation[]; principal?: string;
-  receiveTopics?: readonly string[]; machine?: string } = {}): BridgeNatsAllowEntryInput {
+  receiveTopics?: readonly string[]; machine?: string; republishTopics?: readonly string[]; viaSpoke?: string } = {}): BridgeNatsAllowEntryInput {
   const operations = options.operations ?? ROOT_SEND_OPERATIONS;
   return { kind: "root", id, send: [...operations], receive: [...operations],
     ...(options.principal === undefined ? {} : { principal: options.principal }),
     ...(options.receiveTopics === undefined ? {} : { receiveTopics: [...options.receiveTopics] }),
-    ...(options.machine === undefined ? {} : { machine: options.machine }) };
+    ...(options.machine === undefined ? {} : { machine: options.machine }),
+    // PR 2 fields (L3): N4 republish topics on a NATS entry; a spoke root's hub link on a file entry.
+    ...(options.republishTopics === undefined ? {} : { republishTopics: [...options.republishTopics] }),
+    ...(options.viaSpoke === undefined ? {} : { viaSpoke: options.viaSpoke }) } as BridgeNatsAllowEntryInput;
+}
+
+/**
+ * Whether this checkout's allow-list parser (L3) accepts one entry on `side`: the capability probe for PR 2
+ * fields (republishTopics, viaSpoke). Any refusal but an unknown key means the field exists.
+ */
+export function allowEntrySupported(side: "file" | "nats", entry: BridgeNatsAllowEntryInput): boolean {
+  try {
+    parseBridgeNatsAllowSection({ [side]: [entry] }, { link: DEFAULT_LINK_NAME, natsMachine: BRIDGE_MACHINE, spokes: [SPOKE_LINK_NAME] } as never);
+    return true;
+  } catch (error) { return !/unknown key/i.test(String(error)); }
 }
 
 /** A file-side actor allow entry (owner root + name; the verified presence must match both). */
@@ -347,9 +375,32 @@ export interface MixedHarnessOptions {
   readonly seat?: boolean;
   /** Last-word edit of the allow-list before validation (e.g. mark a seat with `principal`). */
   readonly allow?: (allow: { file: BridgeNatsAllowEntryInput[]; nats: BridgeNatsAllowEntryInput[] }, ids: MixedIds) => void;
+  /** PR 2 N4: the org event stream FABRIC_EV_<HARNESS_ORG> exists, and the v2 Mains and the link run with events:true. */
+  readonly events?: boolean;
+  /**
+   * PR 2 relay: a work-host spoke. A spoke file mesh with its own real file Main (the lane root), linked to
+   * the hub by an in-process file<->file MeshBridge (serveBridgeAgent over PassThrough, as production's
+   * ssh agent), whose relay hook and the A' link's meet in `harness.relays`.
+   */
+  readonly spoke?: boolean;
+  /** Override the link's own nats.events flag (default: options.events), e.g. to prove start refuses without the grant. */
+  readonly linkEvents?: boolean;
 }
 
-export interface MixedIds { readonly fileMain: string; readonly natsMain: string; readonly outsider: string; readonly natsPeer: string }
+export interface MixedIds {
+  readonly fileMain: string; readonly natsMain: string; readonly outsider: string; readonly natsPeer: string; readonly spokeMain: string;
+}
+
+/** The fictional org of the event stream (PR 2 N4). */
+export const HARNESS_ORG = "l4bridge";
+/** The spoke host's bridge name (as the hub sees it) and the hub's name as the spoke sees it. */
+export const SPOKE_LINK_NAME = "ryzen2";
+export const HUB_NAME = "ryzen1";
+/** A canonical root on the spoke file mesh: the work-host lane. */
+export const SPOKE_MAIN_SESSION = "15310c66-ffff-4000-8000-000000000006";
+
+/** A hub link's in-process relay endpoint: deliver one relayed event that came from `source`. */
+export type RelayEndpoint = (source: string, event: BridgePublish) => Promise<void>;
 
 export interface MixedHarness {
   readonly root: string;
@@ -387,6 +438,12 @@ export interface MixedHarness {
   kvRoot(machine: string, id: string): Promise<{ presence?: FabricParticipantRecord; presenceRevision?: number; lease?: FabricKvHostLease } | undefined>;
   /** Wait until each side routes the other's allow-listed root through the link. */
   waitMirrored(timeoutMs?: number): Promise<{ fileView: FabricParticipantInfo; natsView: FabricParticipantInfo }>;
+  /** PR 2 relay (options.spoke): the spoke lane Main, its mesh root and the running hub<->spoke bridge. */
+  readonly spoke?: { readonly main: MixedMain; readonly meshRoot: string; readonly bridge: MeshBridge; readonly log: string[] };
+  /** The hub's in-process relay registry, keyed by link name: the spoke bridge and (when it offers one) the A' link. */
+  readonly relays: Map<string, RelayEndpoint>;
+  /** PR 2 N4 (options.events): the org of FABRIC_EV_<org>. */
+  readonly org?: string;
   stop(): Promise<void>;
 }
 
@@ -432,7 +489,11 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     for (const step of cleanup.splice(0).reverse()) { try { await step(); } catch (error) { failures.push(error); } }
   };
   try {
-    const broker = await createPathBHarness({ binary: options.binary, tls: {} });
+    const org = options.events ? HARNESS_ORG : undefined;
+    // The org event stream reserves its product default (2 GiB) on top of every machine's inbox: lift the fixture
+    // account's 4 GiB file-storage reservation for this one case (nothing is written near it).
+    const broker = await createPathBHarness({ binary: options.binary, tls: {},
+      ...(org ? { org, events: true, accountDiskBytes: 8 * 1_073_741_824 } : {}) });
     cleanup.push(() => broker.stop());
     for (const [name, value] of Object.entries(broker.adminEnv(broker.users.bootstrap))) vi.stubEnv(name, value);
     try {
@@ -440,6 +501,13 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
       if (code !== 0) throw new Error(`nats-auth provision exited ${code}`);
     } finally {
       for (const name of Object.keys(broker.adminEnv(broker.users.bootstrap))) vi.stubEnv(name, undefined);
+    }
+    if (org) {
+      // The org's Fabric event stream is operator-provisioned (as tests/nats-events.test.ts does), never by a runtime.
+      const bootstrap = await openBootstrapNatsConnection({ servers: `tls://localhost:${new URL(broker.serverUrl).port}`,
+        credentials: broker.users.bootstrap.credsPath, tls: { caFile: broker.tls!.caFile }, name: "mixed-harness-events-bootstrap" });
+      try { await ensureNatsEventsStream(bootstrap.manager, { org, provision: true }); }
+      finally { await bootstrap.close(); }
     }
     const faults = await NatsWireFaults.open(broker.serverUrl, broker.tls!);
     cleanup.push(() => faults.close());
@@ -451,7 +519,7 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     const fileConfig = baseConfig({ transport: "file", hostTransport: "file", root: fileMeshRoot, announce: true },
       options.fileActor ? { enabled: true, transport: "process", model: "", maxConcurrent: 2, timeoutMs: 60_000, nice: 0 } : undefined);
     const natsConfig = (cwd: string) => baseConfig({ transport: "nats", hostTransport: "nats", root: path.join(cwd, "mesh"), announce: true,
-      nats: { ...broker.runtimeOptions(broker.users.machineB), operatorMachine: "fabric-ops" } });
+      nats: { ...broker.runtimeOptions(broker.users.machineB), operatorMachine: "fabric-ops", ...(org ? { org, events: true } : {}) } });
     const fileMain = makeMain("ryzen1-lead", FILE_MAIN_SESSION, dirs.file, fileConfig, options.fileActor ? FIXTURE_WORKER : undefined,
       options.fileActor ? await fixtureModelContext(dirs.agent) : {});
     const natsMain = makeMain("v2-lead", NATS_MAIN_SESSION, dirs.nats, natsConfig(dirs.nats));
@@ -474,8 +542,44 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     const actor = options.fileActor ? await fileMain.invoke("agents.create", { name: options.fileActor, scope: "session",
       instructions: "Answer each ask once.", responseMode: "text", coalesce: false }) as MixedHarness["actor"] : undefined;
 
+    // PR 2 relay: the hub's links meet only through this registry (production: the UDS relay, bridge-relay.ts).
+    const relays = new Map<string, RelayEndpoint>();
+    const relayTo = (source: string) => async (destination: string, event: BridgePublish): Promise<void> => {
+      const endpoint = relays.get(destination);
+      if (!endpoint || destination === source) throw new BridgeRelayUnavailableError();
+      await endpoint(source, event);
+    };
+    let spoke: MixedHarness["spoke"];
+    if (options.spoke) {
+      const spokeCwd = path.join(root, SPOKE_LINK_NAME), spokeMeshRoot = path.join(root, `${SPOKE_LINK_NAME}-mesh`);
+      fs.mkdirSync(spokeCwd, { recursive: true, mode: 0o700 });
+      const spokeMain = makeMain(`${SPOKE_LINK_NAME}-lane`, SPOKE_MAIN_SESSION, spokeCwd,
+        baseConfig({ transport: "file", hostTransport: "file", root: spokeMeshRoot, announce: true }));
+      await spokeMain.start();
+      cleanup.push(() => spokeMain.stop());
+      // The hub runs the bridge; the spoke side is served as production's `mesh-bridge agent` (ssh stdio) would be.
+      const hubStore = new MeshStore(fileMeshRoot, 256 * 1024, 500), spokeStore = new MeshStore(spokeMeshRoot, 256 * 1024, 500);
+      const input = new PassThrough(), output = new PassThrough();
+      const serving = serveBridgeAgent(new StoreBridgeSide(spokeStore, HUB_NAME), input, output);
+      const remote = new RemoteBridgeSide(output, input);
+      const log: string[] = [];
+      const bridge = new MeshBridge({ localName: HUB_NAME, remoteName: SPOKE_LINK_NAME, local: new StoreBridgeSide(hubStore, SPOKE_LINK_NAME),
+        remote, cursorPath: path.join(root, `${SPOKE_LINK_NAME}-bridge-cursor.json`), log: (line) => { log.push(line); },
+        relay: relayTo(SPOKE_LINK_NAME) });
+      relays.set(SPOKE_LINK_NAME, (source, event) => bridge.deliverRelay(source, event));
+      await bridge.startWithBackoff();
+      const running = bridge.run().catch((error: unknown) => { log.push(`--- harness: spoke bridge run ended: ${String(error)}`); });
+      cleanup.push(async () => {
+        relays.delete(SPOKE_LINK_NAME);
+        try { await teardownWithin("spoke bridge stop", () => bridge.stop(), 15_000); await running; }
+        finally { remote.close(); input.end(); await serving; output.end(); hubStore.closeState(); spokeStore.closeState(); }
+      });
+      spoke = { main: spokeMain, meshRoot: spokeMeshRoot, bridge, log };
+    }
+
     const linkName = options.linkName ?? DEFAULT_LINK_NAME;
-    const ids: MixedIds = { fileMain: fileMain.id, natsMain: natsMain.id, outsider: rootId(FILE_OUTSIDER_SESSION), natsPeer: rootId(NATS_PEER_SESSION) };
+    const ids: MixedIds = { fileMain: fileMain.id, natsMain: natsMain.id, outsider: rootId(FILE_OUTSIDER_SESSION), natsPeer: rootId(NATS_PEER_SESSION),
+      spokeMain: rootId(SPOKE_MAIN_SESSION) };
     if (options.seat && !natsPeer) throw new Error("seat needs natsPeer");
     const allow = {
       file: [allowRoot(fileMain.id), ...(actor ? [allowActor(fileMain.id, actor.name)] : [])],
@@ -500,9 +604,12 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
       file: { mesh: fileMeshRoot },
       stateDir: path.join(root, "link-state"),
       orgJson,
+      // PR 2 relay: the spoke links a viaSpoke allow entry may name (L5 NatsLinkConfig.relay.spokes -> L3's parser).
+      ...(spoke ? { relay: { spokes: [SPOKE_LINK_NAME] } } : {}),
       nats: { servers: [faults.url], machine: BRIDGE_MACHINE, credentials: broker.users.machineA.credsPath, caFile: broker.tls!.caFile,
         custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream,
-        pathBMachines: [...PATH_B_MACHINES], operatorMachine: "fabric-ops" },
+        pathBMachines: [...PATH_B_MACHINES], operatorMachine: "fabric-ops",
+        ...((options.linkEvents ?? Boolean(org)) ? { org: org ?? HARNESS_ORG, events: true } : {}) },
       allow,
     };
     const validatedConfig = await validateLinkConfig(linkConfig);
@@ -515,17 +622,24 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     const harness: MixedHarness = {
       root, broker, faults, wire, fileMain, natsMain, ...(outsider ? { outsider } : {}), ...(natsPeer ? { natsPeer } : {}), ...(actor ? { actor } : {}),
       linkName, linkConfig, orgJson, linkLog, fileMeshRoot, inspector, link: undefined, startLink,
+      ...(spoke ? { spoke } : {}), relays, ...(org ? { org } : {}),
       async startLinkNow() {
         if (!startLink) throw new Error("A' link entry (src/mesh/bridge-nats-link.ts startNatsLink) is not available");
         if (harness.link) throw new Error("link already running");
         linkAbort = new AbortController();
         linkLog.push(`--- harness: link start ${new Date().toISOString()}`);
-        harness.link = await startLink(validatedConfig, { signal: linkAbort.signal, log: (line) => { linkLog.push(line); } });
+        // The relay seam (PR 2): outbound relays go to the hub's other links; an inbound endpoint, when the
+        // handle offers deliverRelay, joins the registry under the link's name. Unknown options are ignored.
+        harness.link = await startLink(validatedConfig, { signal: linkAbort.signal, log: (line) => { linkLog.push(line); },
+          relay: relayTo(linkName) });
+        const deliver = harness.link.deliverRelay;
+        if (typeof deliver === "function") relays.set(linkName, (source, event) => deliver.call(harness.link, source, event));
         return harness.link;
       },
       async stopLink() {
         const link = harness.link, abort = linkAbort;
         harness.link = undefined; linkAbort = undefined;
+        relays.delete(linkName);
         if (!link) return;
         linkLog.push(`--- harness: link stop ${new Date().toISOString()}`);
         try { await teardownWithin("link stop", () => link.stop(), 15_000); }

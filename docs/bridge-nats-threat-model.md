@@ -17,8 +17,9 @@ Status of the code it describes (PR 1):
   `-ops.ts`, `src/mesh-bridge-nats-cli.ts`, `bin/nats-link`, `docs/mesh-bridge-nats.md`). Where this
   page says "L1 must" or "L2 must", the pass checks that code for it. L1's event-stream consumer
   (`src/mesh/bridge-nats-events.ts`, N4) is PR 2 and not wired in PR 1.
-- Not in PR 1: the relay between bridges for work-host lanes (N2) and the v2 -> factory `fleet.work`
-  republish (N4). Until PR 2, topic routes cross file -> NATS only.
+- PR 2 adds the relay between bridges for work-host lanes (R13) and the republish of a v2 Main's own
+  `fleet.work`/`ops` events into the file mesh (N4, R14). Without them, topic routes cross file -> NATS
+  only and a work-host lane cannot reach a v2 lead.
 
 ## 1. What the link is
 
@@ -238,6 +239,66 @@ never waits for its timeout:
 - **Only before publish:** `notRun` tells the sender a resend cannot deliver twice. The link writes it
   only for a command it never published; a command it carried is answered only by its owner's ACK (R7).
 
+### R13. PR 2 relay: a work-host lane reaches a v2 lead only through the hub's relay, as its spoke mirror
+
+A lane on a work host lives in its spoke's file mesh; the spoke's own `mesh-bridge` link mirrors it into
+Ryzen 1's mesh (`remoteHost: <spoke>`). The existing `MeshBridge` relay carries a command between two hub
+links over the hub's relay IPC (`#relayCommand`, `deliverRelay`) and returns its ACK through the hub mesh
+(`relayRecipients`, only the outcome fields). The A' link joins that relay as one more peer.
+
+- **Allow-list:** a spoke lane is an `allow.file` root with `viaSpoke: <spoke link>`, which must name a
+  configured spoke link. It cannot be a principal seat or a NATS entry. Destination class `spokeRoot`:
+  followUp, steer, ask (and its answer), cancel, the same as a Ryzen 1 root (integrator decision).
+- **Identity:** such a root is verified ONLY as the hub's direct mirror held by its spoke link, live and
+  fresh: its stored `remoteHost` is the spoke, the holding link (`mirroredBy`, `bridgeVia ?? remoteHost`) is
+  the spoke, and it has no `bridgeVia`. All three must agree, so a file view that drops a field fails
+  closed; L2 and L5 build file records with `bridgeNatsFilePresenceRecord`, which copies them as stored. It is refused next to a native record or
+  another link's mirror of the same id, and when the same id answers on NATS (a spoofed spoke sender).
+  `MeshBridge.deliverRelay` also requires the authenticated relay peer to be that same spoke link
+  (`relayOrigin(sender) == sourceRemote`, `data.bridge.from == sourceRemote`).
+- **Relay peer authentication** (`src/mesh/bridge-relay.ts`, the security-relevant change of PR 2): a
+  relay peer was only `<release>/bin/mesh-bridge run --mesh M --name H --remote R --cursor C`, judged from
+  `/proc` (uid, start ticks, exe, cwd, cmdline) and its registration. It may now also be
+  `<release>/bin/nats-link start --config FILE`, where:
+  - the script is in the SAME release bin directory as this process's own entry (another release never
+    matches), run by the same node binary and uid;
+  - argv is exactly `start --config FILE`, FILE absolute and normalized;
+  - FILE is a regular file (not a symlink) owned by this uid with no group or other bits (0600 or
+    stricter), and parses as a link config (`loadNatsLinkConfig`);
+  - its `name` must be this hub's name, its `link` the requested remote, its `file.mesh` this mesh root,
+    exactly as `mesh-bridge`'s `--name`, `--remote` and `--mesh` must;
+  - the peer's own entry script is part of its identity, so its registration must name the same script.
+  `mesh-bridge run` peers are judged exactly as before. Tests:
+  `tests/bridge-nats-relay-identity.test.ts` (real processes).
+- **No `src/mesh/bridge.ts` hunk** is needed: `MeshBridge` already re-exports other links' hub mirrors to
+  its remote with `bridgeVia`, relays commands, and returns relayed ACKs with only the outcome fields.
+- **L2 must:** start the relay server for the A' link (`startBridgeRelay` with `bin/nats-link`) and pass
+  `MeshBridge` its `relay`; for a relayed command, verify the sender with `verifySender` (which accepts
+  `viaSpoke` roots only as above) and use `bridgeNatsRelayEnvelopeId(link, spoke, spokeEventId)`; set
+  `destinationRemoteHost` to the spoke for a NATS command whose target is a spoke root; keep allow-listed
+  spoke roots in the KV mirror. **L1 must** write those spoke roots under `ryzen1-bridge` only, with
+  `remoteHost`/`bridgeVia` stripped (KV presence refuses them).
+
+### R14. PR 2 N4: a v2 Main's own events are republished as the link, never as the Main
+
+A v2 Main publishes `fleet.work.*` and owner events to the org's `FABRIC_EV_<ORG>` stream. The link reads
+the allow-listed subjects (L1's consume leg) and republishes them into Ryzen 1's mesh on the same topic.
+
+- **Allow-list:** an `allow.nats` root lists `republishTopics` (exact or `prefix.*`, `fleet.work.*` and
+  `ops.*` only; default none). L5's config refuses them unless `nats.events` is true. The events grant is
+  a NEW grant for the bridge machine (integrator: raised with hosts-lead and org); the link's start is
+  gated on it.
+- **Identity, weaker than R1:** an events subject carries NO source machine, and the events grant lets any
+  events-granted machine publish any `fabric.ev.<org>.>` subject. `verifyEventSender` can therefore only
+  require the claimed sender to be ONE live, fresh KV root on its pinned machine (never the bridge's),
+  allow-listed on NATS. It marks the identity `presenceOnly`; `allow()` refuses such an identity for any
+  control command or topic route.
+- **Authorship:** `allowRepublish` allows only that root's `republishTopics` and returns the link's own
+  identity `bridge:<link>` as the author. The claimed sender is attribution only (L1 records it beside the
+  link stamp), never the event's `from`.
+- **Exactly once and no loops:** by stream sequence plus the ledger; an event that already crossed a bridge
+  (`data.bridge`), or that claims a file identity this link mirrors, never crosses back (L1).
+
 ## 5. Threats
 
 | # | Threat | Mitigation | Residual |
@@ -259,6 +320,9 @@ never waits for its timeout:
 | T15 | Topic injection into a moved lead | R10 receiveTopics, followUp only, rate bounds, never control | A file publisher can post allowed topics to a root that asked for them (as today on the file mesh) |
 | T16 | Flooding across the link | Topic routes spend the file bridge's factory rate buckets (L2); past 1,000,000 live records the ledger refuses new claims and drops none | Control commands from an allow-listed sender have no new per-sender rate bound in PR 1 |
 | T17 | The link answers in a mirrored owner's name | R12: only for a command it refused before any publish, with `notRun` and a `BRIDGE_NATS_*` code, no owner epoch, under the held fence on that owner, to a verified sender only | A link bug that refused after publishing would let the sender's resend deliver twice; L2's tests must show every refusal precedes the claim's publish |
+| T18 | A process impersonates a relay peer to send or receive a spoke's commands | R13: `/proc` identity (uid, start ticks, exe, cmdline) of the same release's `mesh-bridge run` or `nats-link start --config FILE`, a private config whose names and mesh must match, and the peer's registration | A same-UID process can still edit the config or the registration (the accepted same-UID boundary, as for `mesh-bridge` today) |
+| T19 | A spoofed spoke sender reaches a v2 lead | R13: only the hub's direct mirror held by the named spoke link, refused next to a native or other mirror or when the id answers on NATS; `deliverRelay` requires the relay peer to be that spoke link | none known beyond the spoke link's own trust |
+| T20 | An events-granted machine posts `fleet.work` events as a moved lead | R14: presence-only sender on its pinned machine, authored as `bridge:<link>`, only the root's `republishTopics`, never control | **Accepted residual** (integrator): an events-granted machine can claim a live root's id; the machine pin narrows it. Same family as security-gap smarty-dev#16633 (bounding which ids a machine may present) |
 
 ## 6. Checklist for the pass
 
@@ -279,12 +343,18 @@ never waits for its timeout:
    directory; `withdraw` deletes only the bridge machine's own KV keys and this link's file mirrors.
 6. The real-broker E2E (L4): one keyed followUp each way, a dropped ACK and a forced disconnect give one
    consumption; a second sender reusing a commandId gets no answer; a seat refuses steer; an
-   un-listed NATS root is refused.
+   un-listed NATS root is refused. PR 2: a spoke root's followUp reaches a v2 lead and its ACK comes back;
+   a spoofed spoke sender is refused; an N4 republish appears once with no loop; a presence-only identity
+   is refused for control.
+7. PR 2 relay peer authentication (`src/mesh/bridge-relay.ts`): every refusal listed in R13, and that a
+   `mesh-bridge run` peer is judged exactly as before.
 
 ## 7. Residual risks to record
 
 - T4 (bridge credential speaks for any id it presents): security-gap smarty-dev#16633, receiver-side
   bounds on bridge-machine identities.
+- T20 (an events-granted machine can claim a live root's id on `FABRIC_EV`): accepted for PR 2, same family
+  as smarty-dev#16633; republished events are authored as the link and carry no authority.
 - T3 availability: a compromised NATS machine can make a pinned id unroutable; it cannot impersonate it
   across the link.
 - The same-UID boundary on Ryzen 1 (T11, T12) is unchanged by the link.

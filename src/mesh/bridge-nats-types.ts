@@ -102,10 +102,15 @@ export interface BridgeNatsPresenceRecord {
   /** NATS only: the machine of the KV key that holds the record (credential-bound writer), never a JSON field. */
   readonly machine?: string;
   /**
-   * File only: set when the record is a mirror (its `remoteHost`, the link that mirrored it). On NATS a
-   * mirror is a record under the bridge machine (KV presence refuses `remoteHost`), so this stays unset there.
+   * File only: set when the record is a mirror: the link that HOLDS it here (`bridgeVia ?? remoteHost`,
+   * as bridge.ts mirrorLinkOf). On NATS a mirror is a record under the bridge machine (KV presence refuses
+   * `remoteHost`), so this stays unset there. Build file records with bridgeNatsFilePresenceRecord.
    */
   readonly mirroredBy?: string;
+  /** File only: the record's stored `remoteHost` (its origin link), unchanged. A spoke root needs it. */
+  readonly remoteHost?: string;
+  /** File only: the record's stored `bridgeVia` (a re-export hop); a spoke root must have none. */
+  readonly bridgeVia?: string;
   /** Live by this side's lease rules at observation time (NATS: presence + lease pair, same incarnation). */
   readonly live: boolean;
   /** Bridge clock (ms) when this record was read. */
@@ -140,6 +145,13 @@ export interface BridgeNatsVerifiedIdentity {
   /** The allow-list entry that admitted it. */
   readonly entry: BridgeNatsAllowEntry;
   readonly verifiedAt: number;
+  /**
+   * Set by verifyEventSender: the id resolved in presence, but nothing bound it to the publisher. Such an
+   * identity is attribution for a republished event only; allow() refuses it as a control sender.
+   */
+  readonly presenceOnly?: true;
+  /** File side, PR 2 relay: the spoke link whose direct hub mirror verified it. */
+  readonly viaSpoke?: string;
 }
 
 /** The MeshIdentity a verified identity becomes on the far side (`from` of the crossing event). */
@@ -194,6 +206,16 @@ export type BridgeNatsAllowEntryInput =
     readonly id: string;
     /** The org.json principal whose org seat this root is. */
     readonly principal?: string;
+    /**
+     * PR 2 relay, allow.file only: a work-host lane root on spoke link `viaSpoke`. It is verified only as the
+     * hub's DIRECT mirror held by that spoke link (`remoteHost == viaSpoke`, no `bridgeVia`), never natively.
+     */
+    readonly viaSpoke?: string;
+    /**
+     * PR 2 N4, allow.nats only: topics this NATS root's own FABRIC_EV publications may be republished on into
+     * the file mesh (exact or `prefix.*`). Default none.
+     */
+    readonly republishTopics?: readonly string[];
   })
   | (BridgeNatsAllowCommonInput & {
     readonly kind: "actor";
@@ -229,7 +251,7 @@ export const BRIDGE_NATS_SEAT_RECEIVE: readonly BridgeNatsOperation[] = Object.f
  * seat = a root with an org.json principal (either side); movedLead = a root on the NATS side;
  * fileParticipant = a root or actor on the file side (Ryzen 1); refused = anything else (a NATS actor).
  */
-export type BridgeNatsDestinationClass = "seat" | "movedLead" | "fileParticipant" | "refused";
+export type BridgeNatsDestinationClass = "seat" | "movedLead" | "fileParticipant" | "spokeRoot" | "refused";
 
 /**
  * The most a destination class may receive across; enforced at parse and again before every publish.
@@ -241,14 +263,17 @@ export const BRIDGE_NATS_CLASS_RECEIVE: Readonly<Record<BridgeNatsDestinationCla
   seat: BRIDGE_NATS_SEAT_RECEIVE,
   movedLead: Object.freeze(["followUp", "steer", "ask", "cancel"] as const),
   fileParticipant: Object.freeze(["followUp", "steer", "ask", "cancel"] as const),
+  /** PR 2: a work-host lane root reached through its spoke link (same ops as a Ryzen 1 root). */
+  spokeRoot: Object.freeze(["followUp", "steer", "ask", "cancel"] as const),
   refused: Object.freeze([] as const),
 });
 
 export const bridgeNatsDestinationClass = (entry: { readonly kind: "root" | "actor"; readonly side: BridgeNatsSide;
-  readonly principal?: string }): BridgeNatsDestinationClass =>
+  readonly principal?: string; readonly viaSpoke?: string }): BridgeNatsDestinationClass =>
   entry.kind === "root" && entry.principal !== undefined ? "seat"
-    : entry.side === "file" ? "fileParticipant"
-      : entry.kind === "root" ? "movedLead" : "refused";
+    : entry.kind === "root" && entry.viaSpoke !== undefined ? "spokeRoot"
+      : entry.side === "file" ? "fileParticipant"
+        : entry.kind === "root" ? "movedLead" : "refused";
 
 /** The normalized allow-list the gate uses. Built once at start from the link config; never widened at runtime. */
 export interface BridgeNatsAllowListConfig {
@@ -356,7 +381,32 @@ export interface BridgeNatsIdentityGate {
   allow(request: BridgeNatsAllowRequest): BridgeNatsAllowDecision;
   /** An ACK crosses back only for a claimed command, from its claimed owner (and machine, digest and id on NATS). */
   verifyAck(claim: BridgeNatsCommandRecord, ack: BridgeNatsAckSource): BridgeNatsAckCheck;
+  /**
+   * PR 2 N4: the claimed sender of a FABRIC_EV event, from NATS presence alone. The events subject carries
+   * no source machine, so this binds the id to ONE live KV root on its pinned machine, not to the publisher
+   * (see the threat model). The identity is marked `binding: "presence"`.
+   */
+  verifyEventSender(claimedId: string, presence: BridgeNatsPresenceView, other: BridgeNatsPresenceView): BridgeNatsVerified;
+  /** PR 2 N4: whether this verified NATS root's own event on `topic` may be republished into the file mesh. */
+  allowRepublish(request: BridgeNatsRepublishRequest): BridgeNatsRepublishDecision;
 }
+
+export interface BridgeNatsRepublishRequest {
+  /** From verifyEventSender (side nats). */
+  readonly sender: BridgeNatsVerifiedIdentity;
+  readonly topic: string;
+  readonly kind: string;
+}
+
+export type BridgeNatsRepublishDecision =
+  | {
+    readonly ok: true;
+    /** The file event is authored as this (bridgeNatsLinkIdentity), never as the claimed sender. */
+    readonly author: MeshIdentity;
+    /** The claimed sender, presence-checked only: attribution, never authority. */
+    readonly sender: BridgeNatsVerifiedIdentity;
+  }
+  | { readonly ok: false; readonly refuse: BridgeNatsRefusalCode; readonly reason: string };
 
 // ---------------------------------------------------------------------------------------------
 // Deterministic ids and per-hop command id mapping
@@ -387,6 +437,17 @@ export const bridgeNatsEnvelopeId = (link: string, fileEventId: string): string 
 
 /** NATS ACK envelope id answering a NATS command envelope: what a native NATS owner would send. */
 export const bridgeNatsAckEnvelopeId = (natsCommandEnvelopeId: string): string => `ack:${natsCommandEnvelopeId}`;
+
+/** Prefix of NATS envelope ids the bridge mints for commands relayed from a spoke (PR 2). */
+export const BRIDGE_NATS_RELAY_ENVELOPE_PREFIX = "bnr1-" as const;
+
+/**
+ * NATS envelope id for a command a spoke link relays through the hub (PR 2): deterministic from the link,
+ * the spoke link and the spoke's original event id (`data.bridge.id`), so it never collides with a hub
+ * event's id or another spoke's.
+ */
+export const bridgeNatsRelayEnvelopeId = (link: string, spoke: string, spokeEventId: string): string =>
+  `${BRIDGE_NATS_RELAY_ENVELOPE_PREFIX}${digest("bridge-nats/relay-envelope/v1", link, spoke, spokeEventId).slice(0, 48)}`;
 
 /**
  * The link's own identity, for commands it originates itself (N3 topic -> followUp) and refusals it

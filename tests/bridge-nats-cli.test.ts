@@ -4,7 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runFabricCli } from "../src/cli/index.js";
-import { main, type NatsLinkCliIo, type NatsLinkHandle, type NatsLinkStarter } from "../src/mesh-bridge-nats-cli.js";
+import { filePresenceView, main, type NatsLinkCliIo, type NatsLinkHandle, type NatsLinkStarter } from "../src/mesh-bridge-nats-cli.js";
+import { loadNatsLinkConfig, natsLinkAllowListConfig } from "../src/mesh/bridge-nats-config.js";
+import { openNatsLinkCounters } from "../src/mesh/bridge-nats-counters.js";
+import { createBridgeNatsIdentityGate, readBridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
 import { NatsRootsUnavailableError, type NatsRootInfo, type NatsRootsSource } from "../src/mesh/bridge-nats-roots.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
@@ -35,8 +38,20 @@ const orgJsonFixture = (dir: string, seats: { paul: string; kate: string } = { p
   return file;
 };
 
+/** PR 2 additions to the base config: a spoke root, a republishing moved lead, events and the spoke link. */
+const SPOKE_ROOT = "session:00000000-0000-7000-8000-00000000000f";
+const LEAD = "session:00000000-0000-7000-8000-00000000000d";
+const PR2 = {
+  relay: { spokes: ["ryzen4"] },
+  nats: { events: true, org: "test-org" },
+  allow: {
+    file: [{ kind: "root", id: SPOKE_ROOT, viaSpoke: "ryzen4", send: ["followUp", "cancel"] }],
+    nats: [{ kind: "root", id: LEAD, machine: "sandbox1", republishTopics: ["fleet.work.*"] }],
+  },
+};
+
 /** A private scratch tree: mesh, state dir, a 0600 fake credential, a fixture org.json and a config naming them. */
-const setup = async () => {
+const setup = async (extra?: typeof PR2) => {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "nats-link-cli-")));
   roots.push(dir);
   const mesh = path.join(dir, "mesh");
@@ -57,21 +72,24 @@ const setup = async () => {
     version: 1, name: "ryzen1", link: "v2", file: { mesh }, stateDir, orgJson,
     nats: { servers: ["tls://broker.example.test:4222"], machine: "ryzen1-bridge", credentials, caFile,
       custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS", pathBMachines: ["ryzen1-bridge", "sandbox1"],
-      operatorMachine: "fabric-ops" },
+      operatorMachine: "fabric-ops", ...extra?.nats },
     allow: {
-      file: [{ kind: "root", id: PAUL, principal: "Paul", receive: ["followUp", "cancel"] }],
-      nats: [{ kind: "root", id: KATE, principal: "Kate", machine: "sandbox1", receive: ["followUp", "cancel"] }],
+      file: [{ kind: "root", id: PAUL, principal: "Paul", receive: ["followUp", "cancel"] }, ...extra?.allow.file ?? []],
+      nats: [{ kind: "root", id: KATE, principal: "Kate", machine: "sandbox1", receive: ["followUp", "cancel"] },
+        ...extra?.allow.nats ?? []],
     },
+    ...(extra ? { relay: extra.relay } : {}),
   }), { mode: 0o600 });
   return { dir, mesh, stateDir, store, config, credentials, orgJson };
 };
 
 /** A root and its host record, as the participant directory, or a bridge mirror (remoteHost), writes them. */
-const addRoot = async (store: MeshStore, id: string, options: { remoteHost?: string; incarnation?: string; expiresIn?: number } = {}) => {
+const addRoot = async (store: MeshStore, id: string,
+  options: { remoteHost?: string; bridgeVia?: string; incarnation?: string; expiresIn?: number } = {}) => {
   const now = Date.now();
   const sessionId = id.slice("session:".length);
   const identity: MeshIdentity = { id, name: "main", kind: "main", sessionId };
-  const remote = options.remoteHost ? { remoteHost: options.remoteHost } : {};
+  const remote = { ...(options.remoteHost ? { remoteHost: options.remoteHost } : {}), ...(options.bridgeVia ? { bridgeVia: options.bridgeVia } : {}) };
   await store.put({ key: `topology/hosts/${hash(id)}`, identity, value: {
     format: 1, id, rootId: id, identity, startedAt: now, updatedAt: now, expiresAt: now + (options.expiresIn ?? 60_000), ...remote,
   } });
@@ -148,6 +166,97 @@ describe("nats-link CLI", () => {
     ]);
     cursor(stateDir, "ryzen1", "other");
     expect((await run(["status", "--config", config])).json().problems).toContain("cursor names another link (local/remote differ from name/link)");
+  });
+
+  it("status shows the running link's republish and relay counters", async () => {
+    const { config, stateDir } = await setup();
+    cursor(stateDir);
+    const before = (await run(["status", "--config", config])).json();
+    expect(before).toMatchObject({ counters: { present: false },
+      republish: { enabled: false, senders: [], accepted: 0, duplicate: 0, refused: 0 },
+      relay: { spokeRoots: [], toNats: 0, toFile: 0, refused: 0 } });
+    const counters = openNatsLinkCounters(stateDir, "v2");
+    counters.add("republish.accepted", 2);
+    counters.add("republish.refused");
+    counters.add("relay.toNats", 3);
+    counters.add("control.toFile");
+    counters.close();
+    const after = await run(["status", "--config", config]);
+    expect(after.code).toBe(0);
+    expect(after.json()).toMatchObject({
+      counters: { present: true, pid: process.pid, values: { "republish.accepted": 2, "relay.toNats": 3, "control.toFile": 1 } },
+      republish: { accepted: 2, duplicate: 0, refused: 1 },
+      relay: { toNats: 3, toFile: 0, refused: 0 },
+      problems: [],
+    });
+    // A snapshot left by another link in this state directory is a problem, never this link's numbers.
+    openNatsLinkCounters(stateDir, "v9").close();
+    expect((await run(["status", "--config", config])).json().problems).toContain("counters name another link");
+  });
+
+  it("status and receipt find a spoke root as its spoke link's direct mirror, and list republishing senders", async () => {
+    const { config, store, stateDir } = await setup(PR2);
+    cursor(stateDir);
+    // The spoke root as the hub's ryzen4 link mirrors it.
+    await addRoot(store, SPOKE_ROOT, { remoteHost: "ryzen4", incarnation: "inc-s" });
+    const status = (await run(["status", "--config", config])).json();
+    expect(status).toMatchObject({
+      allow: { file: [{ identity: PAUL }, { identity: SPOKE_ROOT, id: SPOKE_ROOT, present: true, live: true, viaSpoke: "ryzen4" }],
+        nats: [{ identity: KATE }, { identity: LEAD, republishTopics: ["fleet.work.*"] }] },
+      republish: { enabled: true, senders: [{ identity: LEAD, topics: ["fleet.work.*"] }] },
+      relay: { spokes: ["ryzen4"], spokeRoots: [{ identity: SPOKE_ROOT, viaSpoke: "ryzen4" }] },
+      config: { relay: { spokes: ["ryzen4"] } },
+    });
+    const receipt = await run(["receipt", "--config", config, "--session", SPOKE_ROOT]);
+    expect([receipt.code, receipt.json()]).toMatchObject([0, { verdict: "routable", side: "file", viaSpoke: "ryzen4",
+      file: { remoteHost: "ryzen4" } }]);
+    // Natively on the hub (no spoke mirror), the same id is not the spoke root the allow-list names.
+    const native = await setup(PR2);
+    await addRoot(native.store, SPOKE_ROOT);
+    const wrong = await run(["receipt", "--config", native.config, "--session", SPOKE_ROOT]);
+    expect([wrong.code, wrong.json().problems]).toEqual([1, ["file-mesh record is not spoke ryzen4's direct mirror (remoteHost none)"]]);
+    expect((await run(["status", "--config", native.config])).json())
+      .toMatchObject({ allow: { file: [{ identity: PAUL }, { identity: SPOKE_ROOT, present: false }] } });
+  });
+
+  // Stated skip: dry-run refuses on Windows by design (nats-link is Linux/macOS only); that refusal is tested below.
+  it.skipIf(WINDOWS)("dry-run takes a spoke root only as its spoke link's direct mirror, never a re-export (L3 audit P0)", async () => {
+    const kate: NatsRootInfo = { id: KATE, kind: "root", name: "main", sessionId: KATE.slice(8), rootId: KATE, machine: "sandbox1",
+      ownerHostId: KATE, ownerIdentityId: KATE, ownerIncarnation: "inc-k", status: "idle", capabilities: ["followUp"], live: true };
+    const spokeRow = async (options: { remoteHost: string; bridgeVia?: string }) => {
+      const { config, store } = await setup(PR2);
+      await addRoot(store, PAUL);
+      await addRoot(store, SPOKE_ROOT, options);
+      const status = (await run(["status", "--config", config])).json();
+      const dry = await run(["dry-run", "--config", config], { readRoots: async () => [kate] });
+      return { status, row: (dry.json().rows as Array<{ key: string; status: string; reason?: string }>).find((row) => row.key === SPOKE_ROOT)! };
+    };
+    expect((await spokeRow({ remoteHost: "ryzen4" })).row.status).toBe("live");
+    // The view keeps a record's stored origin (remoteHost) and holder (bridgeVia) apart, through L3's builder:
+    // the same id held BY ryzen4 as a re-export of another link's mirror (origin epyc1) is not ryzen4's spoke
+    // root, and L3's gate refuses it as a target.
+    const row = { id: SPOKE_ROOT, kind: "root", name: "main", rootId: SPOKE_ROOT, ownerHostId: SPOKE_ROOT, ownerIdentityId: SPOKE_ROOT,
+      ownerIncarnation: "inc-s", remoteHost: "epyc1", bridgeVia: "ryzen4", stale: false } as unknown as Parameters<typeof filePresenceView>[0][number];
+    const [record] = filePresenceView([row], Date.now()).records(SPOKE_ROOT);
+    expect(record).toMatchObject({ remoteHost: "epyc1", bridgeVia: "ryzen4", mirroredBy: "ryzen4", kind: "main", live: true });
+    const { config } = await setup(PR2);
+    const parsed = natsLinkAllowListConfig(loadNatsLinkConfig(config));
+    const gate = createBridgeNatsIdentityGate(parsed, { pins: readBridgeNatsSeatPins(JSON.parse(fs.readFileSync(path.join(path.dirname(config), "org.json"), "utf8"))) });
+    const verified = gate.verifyTarget("file", SPOKE_ROOT, filePresenceView([row], Date.now()), { side: "nats", records: () => [] });
+    expect(verified.ok).toBe(false);
+  });
+
+  it.skipIf(process.platform === "win32")("start with spoke links needs a config file the hub relay accepts as its peer's (0600)", async () => {
+    const { config } = await setup(PR2);
+    let started = 0;
+    const starter: NatsLinkStarter = async () => { started += 1; return { closed: Promise.resolve(), stop: async () => undefined }; };
+    fs.chmodSync(config, 0o640);
+    const loose = await run(["start", "--config", config], { starter, signal: new AbortController().signal });
+    expect([loose.code, started]).toEqual([2, 0]);
+    expect(loose.err).toContain("must have no group or other permission bits (0600 or 0400) when relay.spokes is set");
+    fs.chmodSync(config, 0o600);
+    expect((await run(["start", "--config", config], { starter, signal: new AbortController().signal })).code).toBe(1);
+    expect(started).toBe(1);
   });
 
   it("receipt --command proves one command and its ACK, and never exits 0 on missing or doubled evidence", async () => {

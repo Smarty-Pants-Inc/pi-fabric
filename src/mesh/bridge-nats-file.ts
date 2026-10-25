@@ -14,7 +14,7 @@ import {
 import { NatsTopicTranslator, type NatsTopicAuthorize } from "./bridge-nats-topics.js";
 import {
   BRIDGE_NATS_ACK_TOPIC, BRIDGE_NATS_CONTROL_TOPIC, bridgeNatsLinkIdentity, type BridgeNatsPort, type BridgeNatsPortDelivery,
-  type NatsCarrierSideContract,
+  type BridgeNatsPresenceRecord, type BridgeNatsPresenceView, type NatsCarrierSideContract,
 } from "./bridge-nats-types.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "./store.js";
 
@@ -67,14 +67,19 @@ const copy = (identity: MeshIdentity): MeshIdentity => ({
   ...(typeof identity.sessionId === "string" ? { sessionId: identity.sessionId } : {}),
 });
 
+const MESH_KIND: Readonly<Record<string, MeshIdentity["kind"] | undefined>> = { root: "main", actor: "actor", agent: "agent" };
+
 /**
  * Native, live file presence: root hosts from StoreBridgeSide's own snapshot (never a mirror) and
  * actor participants whose owner is one of those hosts. One snapshot serves calls within its TTL.
+ * view() is the same snapshot as L3's BridgeNatsPresenceView: one record per participant row,
+ * native or mirrored (any link), so the gate can see an id that answers twice.
  */
 export class FileCarrierPresence {
   #at = Number.NEGATIVE_INFINITY;
   #entries = new Map<string, FilePresenceEntry>();
   #actors: FabricParticipantRecord[] = [];
+  #records = new Map<string, BridgeNatsPresenceRecord[]>();
 
   constructor(readonly side: StoreBridgeSide, readonly now: () => number = Date.now, readonly ttlMs = FILE_PRESENCE_TTL_MS) {}
 
@@ -92,9 +97,38 @@ export class FileCarrierPresence {
       if (record.identity.id === record.id) entries.set(record.id, { identity: copy(record.identity), hostId: record.id });
     }
     const actors = new Map<string, FabricParticipantRecord | null>();
+    const records = new Map<string, BridgeNatsPresenceRecord[]>();
     const store = this.side.store;
+    const mirrorHosts = new Map<string, number>();
+    for (const entry of store.listAll("topology/hosts/", { fresh: true })) {
+      const value = entry.value as Partial<{ id: unknown; remoteHost: unknown; expiresAt: unknown }> | undefined;
+      if (typeof value?.id === "string" && typeof value.remoteHost === "string" && typeof value.expiresAt === "number") {
+        mirrorHosts.set(value.id, value.expiresAt);
+      }
+    }
     for (const entry of [...store.listAll(PARTICIPANT_PREFIX, { fresh: true }), ...readParticipantFiles(store.root, { maxAgeMs: 0 })]) {
       const participant = participantFromEntry(entry);
+      const kind = participant && MESH_KIND[participant.kind];
+      if (participant && kind) {
+        const mirroredBy = participant.bridgeVia ?? participant.remoteHost;
+        const list = records.get(participant.id) ?? [];
+        // The state row and the participant file of one native are one record, not an ambiguity.
+        if (!list.some(record => record.mirroredBy === mirroredBy && record.ownerHostId === participant.ownerHostId &&
+            record.ownerIdentityId === participant.ownerIdentityId && record.rootId === participant.rootId)) {
+          list.push(Object.freeze({
+            id: participant.id, name: participant.name, kind, rootId: participant.rootId,
+            ...(participant.sessionId !== undefined ? { sessionId: participant.sessionId } : {}),
+            ownerHostId: participant.ownerHostId, ownerIdentityId: participant.ownerIdentityId,
+            ...(participant.ownerIncarnation !== undefined ? { ownerIncarnation: participant.ownerIncarnation } : {}),
+            ...(mirroredBy !== undefined ? { mirroredBy } : {}),
+            live: participant.retiredAt === undefined && (mirroredBy === undefined
+              ? hosts.get(participant.ownerHostId)?.id === participant.ownerIdentityId
+              : (mirrorHosts.get(participant.ownerHostId) ?? 0) > now),
+            observedAt: now,
+          }));
+          records.set(participant.id, list);
+        }
+      }
       if (!participant || participant.kind !== "actor" || participant.remoteHost !== undefined || participant.bridgeVia !== undefined ||
           participant.retiredAt !== undefined) continue;
       const owner = hosts.get(participant.ownerHostId);
@@ -112,7 +146,14 @@ export class FileCarrierPresence {
     }
     this.#entries = entries;
     this.#actors = live;
+    this.#records = records;
     this.#at = now;
+  }
+
+  /** L3's file-side presence view over the last snapshot. */
+  view(): BridgeNatsPresenceView {
+    const records = this.#records;
+    return { side: "file", records: id => records.get(id) ?? [], list: () => [...records.values()].flat() };
   }
 
   file(id: string): FilePresenceEntry | undefined {
@@ -342,11 +383,10 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
 
   /** toNats: one event MeshBridge admitted toward the NATS side. Resolves only after the PubAck. */
   async publish(event: BridgePublish): Promise<{ sequence: number }> {
-    let plan;
-    if (event.topic === BRIDGE_NATS_CONTROL_TOPIC || event.topic === BRIDGE_NATS_ACK_TOPIC) {
-      await this.filePresence.refresh();
-      plan = await this.carrier.outbound(event);
-    } else plan = await this.topics.outbound(event);
+    // Identity and the allow gate read the file side's presence: at most one TTL old, never stale.
+    await this.filePresence.refresh();
+    const plan = event.topic === BRIDGE_NATS_CONTROL_TOPIC || event.topic === BRIDGE_NATS_ACK_TOPIC
+      ? await this.carrier.outbound(event) : await this.topics.outbound(event);
     if (plan.kind === "absorb") {
       this.#log(`toNats: ${event.topic} ${event.data.bridge.id} needs no send: ${plan.reason}`);
       return { sequence: 0 };
@@ -387,6 +427,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
 
   async #inbound(stream: number, held: InHand): Promise<MeshEvent | undefined> {
     if (held.event) return held.event;
+    await this.filePresence.refresh();
     const delivery = held.delivery;
     const envelopeId = typeof delivery.envelope?.id === "string" ? delivery.envelope.id : `stream:${stream}`;
     const plan: NatsInbound = await this.carrier.inbound(carrierDeliveryFromPort(delivery));

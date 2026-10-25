@@ -6,7 +6,9 @@ import type {
   NatsPresenceEntry,
 } from "../../src/mesh/bridge-nats-carrier.js";
 import type {
-  BridgeNatsMirrorSet, BridgeNatsPort, BridgeNatsPortDelivery, BridgeNatsPortResolved, BridgeNatsPresenceView,
+  BridgeNatsAckRecord, BridgeNatsClaimInput, BridgeNatsClaimResult, BridgeNatsCommandRecord, BridgeNatsDirection, BridgeNatsLedger,
+  BridgeNatsMirrorSet, BridgeNatsPort, BridgeNatsPortDelivery, BridgeNatsPortResolved, BridgeNatsPresenceRecord, BridgeNatsPresenceView,
+  BridgeNatsSeenRecord,
 } from "../../src/mesh/bridge-nats-types.js";
 import type { MeshIdentity } from "../../src/mesh/store.js";
 import { TransportUncertainError, type TransportEnvelope, type TransportSent } from "../../src/transport/types.js";
@@ -81,7 +83,17 @@ export class FakePort implements BridgeNatsPort {
   async presence(): Promise<BridgePresence> { return this.natsPresence; }
   watchPresence(): () => void { return () => undefined; }
   resolve(id: string): BridgeNatsPortResolved | undefined { return this.routes.get(id); }
-  presenceView(): BridgeNatsPresenceView { return { side: "nats", records: () => [] }; }
+  /** KV records as L1 lists them: one per resolved route, machine from the (fake) KV key. */
+  presenceView(): BridgeNatsPresenceView {
+    const record = (resolved: BridgeNatsPortResolved): BridgeNatsPresenceRecord => ({
+      id: resolved.identity.id, name: resolved.identity.name, kind: resolved.identity.kind,
+      rootId: resolved.identity.kind === "main" ? resolved.identity.id : resolved.route.ownerHostId,
+      ownerHostId: resolved.route.ownerHostId, ownerIdentityId: resolved.route.ownerIdentityId,
+      ownerIncarnation: resolved.route.ownerIncarnation, machine: resolved.route.machine, live: resolved.route.live,
+      observedAt: Date.now(),
+    });
+    return { side: "nats", records: id => { const resolved = this.routes.get(id); return resolved ? [record(resolved)] : []; } };
+  }
   async mirror(set: BridgeNatsMirrorSet): Promise<void> { this.mirrors.push(set); }
   async fence(): Promise<void> {}
   async withdraw(): Promise<void> {}
@@ -125,6 +137,47 @@ export class FakePort implements BridgeNatsPort {
       });
       this.#wake = undefined;
     }
+  }
+}
+
+/** An in-memory stand-in for L3's durable ledger: the contract's claim statuses, no persistence. */
+export class MemoryBridgeNatsLedger implements BridgeNatsLedger {
+  readonly records = new Map<string, BridgeNatsCommandRecord>();
+  async claim(input: BridgeNatsClaimInput): Promise<BridgeNatsClaimResult> {
+    const existing = this.records.get(input.commandId);
+    if (existing) {
+      return { status: existing.bodyDigest !== input.bodyDigest ? "conflict"
+        : existing.sourceMachine !== input.sourceMachine || existing.replyTo !== input.replyTo ? "mismatch" : "duplicate", record: existing };
+    }
+    const claimedAt = Date.now();
+    const record: BridgeNatsCommandRecord = JSON.parse(JSON.stringify({ ...input, v: 1, state: "claimed", claimedAt,
+      expiresAt: Math.max(input.deadlineAt, claimedAt) + 86_400_000 })) as BridgeNatsCommandRecord;
+    this.records.set(input.commandId, record);
+    return { status: "new", record };
+  }
+  lookup(commandId: string): BridgeNatsCommandRecord | undefined { return this.records.get(commandId); }
+  lookupOriginal(direction: BridgeNatsDirection, requesterId: string, original: string): BridgeNatsCommandRecord | undefined {
+    return [...this.records.values()].find(record => record.direction === direction && record.requesterId === requesterId &&
+      record.originalCommandId === original);
+  }
+  async markUncertain(commandId: string): Promise<BridgeNatsCommandRecord> { return this.#set(commandId, { state: "uncertain" }); }
+  async markSent(commandId: string): Promise<BridgeNatsCommandRecord> { return this.#set(commandId, { state: "sent" }); }
+  async settle(commandId: string, ack: BridgeNatsAckRecord): Promise<BridgeNatsCommandRecord> {
+    const record = this.records.get(commandId)!;
+    return record.ack ? record : this.#set(commandId, { state: "acked", ack });
+  }
+  async markAckForwarded(commandId: string): Promise<BridgeNatsCommandRecord> { return this.#set(commandId, { state: "ackForwarded" }); }
+  pendingResends(): readonly BridgeNatsCommandRecord[] { return [...this.records.values()].filter(record => record.state === "claimed" || record.state === "uncertain"); }
+  pendingAcks(): readonly BridgeNatsCommandRecord[] { return [...this.records.values()].filter(record => record.state === "acked"); }
+  seen(): BridgeNatsSeenRecord | undefined { return undefined; }
+  async markSeen(direction: BridgeNatsDirection, eventId: string): Promise<BridgeNatsSeenRecord> {
+    return { v: 1, eventId, direction, seenAt: Date.now(), expiresAt: Date.now() + 86_400_000 };
+  }
+  async close(): Promise<void> {}
+  #set(commandId: string, change: Partial<BridgeNatsCommandRecord>): BridgeNatsCommandRecord {
+    const next = { ...this.records.get(commandId)!, ...change } as BridgeNatsCommandRecord;
+    this.records.set(commandId, next);
+    return next;
   }
 }
 

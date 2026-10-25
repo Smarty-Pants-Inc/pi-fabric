@@ -230,6 +230,25 @@ describe("session pending CLI recorded-state inventory", () => {
     const result = await run(["--help"]); expect(result.code).toBe(0); expect(result.stdout).toContain("Usage:"); expect(result.stderr).toBe("");
   });
 
+  it("refuses a queue checkpoint for this root whose actor has no registry row, and ignores a foreign root's", async () => {
+    const mesh = fixture(); const project = path.join(mesh, "actors");
+    // Foreign lineage only: complete, zero (the counterexample that must keep working).
+    json(queueFile(project, `session:${OTHER}`), { format: 1, items: [item("foreign")] });
+    const foreign = await run([SESSION, "--mesh", mesh]);
+    expect(foreign.code).toBe(0); expect(foreign.value).toMatchObject({ complete: true, totals: { actors: 0, queued: 0 } });
+    // This root's lineage file with no owned registry row (project or session scope): unknown, exit 1.
+    for (const directory of [project, path.join(project, "fabric-session-override")]) {
+      const mine = queueFile(directory);
+      json(mine, { format: 1, items: [item("orphan", true)] });
+      const before = snapshot(mesh); const result = await run([SESSION, "--mesh", mesh]);
+      expect(result.code).toBe(1);
+      expect(result.value).toMatchObject({ complete: false, totals: { actors: null, queued: null, inFlight: null } });
+      expect(result.value.unknown.join("\n")).toContain("without an owned registry row");
+      expect(snapshot(mesh)).toEqual(before);
+      fs.rmSync(path.dirname(mine), { recursive: true, force: true });
+    }
+  });
+
   it("is reachable as `pi-fabric session pending` through the standalone CLI entry", async () => {
     const mesh = fixture(); followUps(mesh, 2); const before = snapshot(mesh);
     const writes: string[] = [];

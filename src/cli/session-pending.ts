@@ -281,6 +281,33 @@ export const runSessionPendingCli = async (
           actors.push(actorInventory(observation, value, file, scope));
         }
       }
+      // A queue checkpoint for this root's lineage (ActorManager.#queueFile: queue-<sha256(rootId\0residency)[:16]>)
+      // under an actor directory with no owned registry row is recorded work of unknown custody, not zero.
+      const lineages = new Set(["session", "durable"].map(residency =>
+        `queue-${createHash("sha256").update([rootId, residency].join("\0")).digest("hex").slice(0, 16)}.json`));
+      const inventoried = new Set(actors.map(entry => path.join(path.dirname(entry.registry), entry.id)));
+      // Other sessions' actors keep writing in a shared mesh: list them without change tracking,
+      // and stop only on this root's lineage file or a directory that cannot be listed.
+      const list = (directory: string): string[] | undefined => {
+        try { return fs.readdirSync(directory); }
+        catch (error) {
+          if (absent(error) || (error as NodeJS.ErrnoException)?.code === "ENOTDIR") return [];
+          observation.problem(directory, "unreadable actor directory"); return undefined;
+        }
+      };
+      for (const { file } of registries) {
+        const registryRoot = path.dirname(file);
+        for (const name of (registryRoot === actorRoot ? names : list(registryRoot)) ?? []) {
+          const directory = path.join(registryRoot, name);
+          if (!ACTOR_ID.test(name) || inventoried.has(directory)) continue;
+          const children = list(directory);
+          if (!children) { actorCoverage = false; continue; }
+          if (children.some(entry => lineages.has(entry))) {
+            observation.problem(directory, "queue checkpoint for this root without an owned registry row; custody unknown");
+            actorCoverage = false;
+          }
+        }
+      }
     }
     observation.verify();
     const complete = observation.unknown.length === 0;

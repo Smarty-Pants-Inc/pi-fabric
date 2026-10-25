@@ -10,7 +10,7 @@ import { fixedKubectl, kubectl, POD_FABRIC_CLI, readPod, verifyKubeconfig, type 
 import { interpreterIdentity, parseRequest, proveSeatLock, readOwned, readSealedRun, resolveSeatMeshRoot, SeamGap, sha256,
   socketPeer, verifyRunDir, writeOnce, type SealedRun, type SeamRequest } from "../seat-drain/run.js";
 import { natsLinkAllowListConfig } from "../mesh/bridge-nats-config.js";
-import { applyPlan, planPublish, planRestore, readLinkConfig, rollbackAuthority, withConfigLock, type LinkConfigFile, type RollbackAuthority,
+import { applyPlan, planPublish, planRestore, readLinkConfig, rollbackAuthority, withConfigLock, type LinkConfigFile, type ReadOptions, type RollbackAuthority,
   type SeatEntry, type WriterPlan } from "./allow-writer.js";
 import { awaitRoutable, LINK_UNIT, natsRecords, otherRoutesBack, reloadLink, routeTable, type LinkDeps } from "./link.js";
 
@@ -76,6 +76,8 @@ export interface BridgeDeps extends LinkDeps {
   seatPins?: () => BridgeNatsSeatPins;
   /** Tests only: see the error behind a fixed GAP code. */
   onError?: (error: unknown) => void;
+  /** Tests only: the real-broker test's link state directory, counted as durable (allow-writer ReadOptions). */
+  durableStateDir?: string;
 }
 interface Context {
   runDir: string; request: SeamRequest; sealed: SealedRun; lockFd: number; uid: number; io: BridgeIo; deps: BridgeDeps; pins: BridgePins;
@@ -329,6 +331,9 @@ const seatPins = (context: Context, orgJson: string | undefined): BridgeNatsSeat
   catch { throw new SeamGap("seat-pins-unreadable"); }
 };
 
+const readOptions = (context: Context): ReadOptions =>
+  context.deps.durableStateDir === undefined ? {} : { durableStateDir: context.deps.durableStateDir };
+
 /**
  * The seat's NATS machine, from the run-pinned principal NATS binding (A's T-FIX6: top-level `natsMachine` in the sealed
  * run; never `instance`, which is the Herdr agent). Absent or malformed refuses.
@@ -375,7 +380,7 @@ const publish = async (context: Context): Promise<number> => {
   const access = kubeAccess(context);
   await verifyKubeconfig(access, Math.min(30_000, context.deadline - context.now()));
   // A first, unlocked read: the seat pins, a dry plan (refuses early) and the routes the link carries now.
-  const first = readLinkConfig(context.pins.linkConfig);
+  const first = readLinkConfig(context.pins.linkConfig, readOptions(context));
   const pins = seatPins(context, first.config.orgJson);
   planPublish(first, pins, { sessionId, machine });
   const routesBefore = await routeTable(first.config, context.deps);
@@ -395,7 +400,7 @@ const publish = async (context: Context): Promise<number> => {
   } else {
     // ONE config-scoped lock across read, plan, intent, check, rename and read-back.
     const locked = await withConfigLock(context.pins.linkConfig, () => {
-      const current = readLinkConfig(context.pins.linkConfig);
+      const current = readLinkConfig(context.pins.linkConfig, readOptions(context));
       const planned = planPublish(current, pins, { sessionId, machine });
       // Durable BEFORE the write: the exact change, and the rollback authority (null when nothing is written).
       const sha = evidence(context, "intent", { schema: "fabric-v2-bridge-publish-intent-v1", owner: inputs.owner, machine,
@@ -504,7 +509,7 @@ const restoreRoute = async (context: Context): Promise<number> => {
     typeof writer.sessionFile !== "string" || !path.isAbsolute(writer.sessionFile)) throw new SeamGap("inputs-invalid");
   if (inputs.parentRun !== context.request.run || inputs.parentRunSha256 !== context.request.runSha256) throw new SeamGap("inputs-invalid");
   const machine = seatMachine(context);
-  const first = readLinkConfig(context.pins.linkConfig);
+  const first = readLinkConfig(context.pins.linkConfig, readOptions(context));
   // The v1 Main must answer on the same mesh the link mirrors: the seat's mesh root IS the link's file mesh.
   const meshRoot = resolveSeatMeshRoot(context.sealed.journal, sessionId, context.uid);
   let linkMesh: string;
@@ -517,7 +522,7 @@ const restoreRoute = async (context: Context): Promise<number> => {
   if (!routesBefore) throw new SeamGap("link-status-unreadable");
   // ONE config-scoped lock across read, plan, intent, check, rename and read-back.
   const locked = await withConfigLock(context.pins.linkConfig, () => {
-    const current = readLinkConfig(context.pins.linkConfig);
+    const current = readLinkConfig(context.pins.linkConfig, readOptions(context));
     const planned = planRestore(current, pins, sessionId, authority);
     const sha = evidence(context, "intent", { schema: "fabric-v2-bridge-rc-restore-route-intent-v1", writer, machine,
       plan: planEvidence(planned), unit: context.pins.linkUnit, routesBefore,

@@ -187,6 +187,20 @@ describe("the bridge seam's A' config writer (one entry, never a free-form edit)
       .config.stateDir).toBe("/home/synthetic/.local/state/nats-link/v2");
   });
 
+  it("the test-only durable state directory exempts that EXACT path, through the write and its read-back, and nothing else", () => {
+    const stateDir = "/tmp/nats-link/v2";
+    const file = writeLinkConfig({ file: [seatFileEntry] }, value => { value.stateDir = stateDir; });
+    for (const other of ["/tmp/nats-link", "/tmp/nats-link/v2/", "/tmp/nats-link/v3"]) {
+      expect(() => readLinkConfig(file, { durableStateDir: other })).toThrow(expect.objectContaining({ code: "link-state-dir-temporary" }));
+    }
+    const before = readLinkConfig(file, { durableStateDir: stateDir });
+    expect(before.durableStateDir).toBe(stateDir);
+    const after = applyPlan(planPublish(before, pins, seat));
+    expect(after).toMatchObject({ durableStateDir: stateDir, config: { stateDir } });
+    // Without it, the same file refuses again.
+    expect(() => readLinkConfig(file)).toThrow(expect.objectContaining({ code: "link-state-dir-temporary" }));
+  });
+
   it("#1609 review P1-6: a rollback while the file still holds publish's bytes puts back the old bytes EXACTLY", () => {
     // An operator's layout (compact JSON, no allow.nats at all): the publish rewrites it; the rollback restores it byte for byte.
     const file = writeLinkConfig({ file: [leadEntry, seatFileEntry, supervisorEntry] }, () => {}, value => `${JSON.stringify(value)}\n`);

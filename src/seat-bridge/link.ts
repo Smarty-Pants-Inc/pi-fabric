@@ -22,6 +22,11 @@ export interface LinkDeps {
   holder?: (config: NatsLinkConfig) => { pid: number; startTime?: string | undefined; purpose: string } | undefined;
   /** The link's REAL identity gate over both sides' presence (`nats-link dry-run`). */
   dryRun?: (config: NatsLinkConfig) => Promise<{ rows: ReadonlyArray<Record<string, unknown>> }>;
+  /**
+   * Tests only: restart an in-process link in place of `systemctl --user restart <unit>` (the real-broker test). The
+   * installed bundle's entry passes no deps, so neither its argv nor its env can reach this; a test asserts it.
+   */
+  restartLink?: (unit: string) => Promise<number | null>;
 }
 
 /**
@@ -61,6 +66,7 @@ const fixedSystemctl = (): string => {
 const restartUnit = (unit: string, uid: number, home: string, deps: LinkDeps, timeoutMs: number): Promise<number | null> =>
   new Promise(resolve => {
     if (!LINK_UNIT.test(unit)) { resolve(null); return; }
+    if (deps.restartLink) { deps.restartLink(unit).then(resolve, () => resolve(null)); return; }
     const runtime = `/run/user/${uid}`;
     const child = spawn(deps.systemctl ?? fixedSystemctl(), ["--user", "restart", unit], {
       stdio: ["ignore", "ignore", "ignore"], timeout: Math.max(1_000, Math.floor(timeoutMs)),

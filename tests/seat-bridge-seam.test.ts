@@ -391,6 +391,16 @@ describe.skipIf(!linux)("the REAL bridge bundle: built as scripts/build.mjs buil
     expect(bytes).toContain(JSON.stringify(w.config));
     expect(bytes).not.toContain("__FABRIC_SEAT_BRIDGE_");
     expect(fs.statSync(out).mode & 0o777).toBe(0o500);
+    // The test-only deps (the in-process link restart, the one durable state directory) are unreachable here: the seam's
+    // main is called once, with the pins and no deps, and nothing in the bundle supplies either hook.
+    const seamMain = /\bvar (\w+) = async \(argv\d*, io\d*, pins\d*, deps\d* = \{\}\) =>/.exec(bytes)?.[1];
+    expect(seamMain).toBeDefined();
+    expect([...bytes.matchAll(new RegExp(`\\b${seamMain}\\(([^;]*)\\);`, "g"))].map(call => call[1]))
+      .toEqual(["argv2, io, { linkConfig: PINNED_LINK_CONFIG, linkUnit: PINNED_LINK_UNIT }"]);
+    expect(bytes).not.toMatch(/\brestartLink\s*:/);
+    expect(bytes).toMatch(/\bdeps\.restartLink\b/);
+    expect([...bytes.matchAll(/\bdurableStateDir\s*:\s*([\w.]+)/g)].map(match => match[1]).sort())
+      .toEqual(["context.deps.durableStateDir", "options.durableStateDir"]);
     // A bad unit name, or a link whose state lives in a temporary store, is refused at install.
     expect(spawnSync("node", [bundle, "--install", "--out", `${out}-2`, "--link-config", w.config, "--link-unit", "x;y"], { env }).status).toBe(2);
     const temporary = path.join(path.dirname(w.config), "temporary.json");

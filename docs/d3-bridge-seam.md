@@ -175,6 +175,18 @@ free-form edit.
 A publish rewrites the file as indented JSON: its values are the guarded property, and the bytes may differ in
 layout only. A rollback while the file still holds publish's bytes restores the old bytes exactly, layout included.
 
+## Tested on a real broker and link
+
+`tests/nats-auth-path-b-bridge-seam.test.ts` (CI's `nats-auth` job, pinned nats-server) runs `publish` and
+`rc-restore-route` against a real authenticated broker, the real A' link in-process and real FILE and NATS Mains. The
+link's readers, its identity gate and the message paths are the product's own. It covers publish, the route through
+the real gate, one message to the moved seat, the rollback to a relaunched v1 seat with the old bytes back exactly,
+and one message on the v1 route. It also covers a stale mirror row: the gate refuses the seat and publish refuses.
+Three things are test-only deps that the installed bundle cannot reach: kubectl, the unit restart (it restarts the
+in-process link) and one exact state directory counted as durable. The test deletion guard keeps the link's state
+in the test's private temp store, which the production rule refuses. That test also shows the refusal without the
+exemption. `tests/seat-bridge-seam.test.ts` checks the built bundle: one call to the seam with the pins and no deps.
+
 ## Preconditions (each is checked live in the test-seat runbook)
 
 - The link runs as the seat user under the pinned `systemd --user` unit, with `Restart=on-failure`, and its

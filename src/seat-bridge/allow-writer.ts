@@ -39,6 +39,17 @@ export interface LinkConfigFile {
   sha256: string;
   value: Record<string, unknown>;
   config: NatsLinkConfig;
+  /** Tests only: the one state directory counted as durable (see ReadOptions). Carried to the restore parse and read-back. */
+  durableStateDir?: string;
+}
+
+export interface ReadOptions {
+  /**
+   * Tests only: this EXACT state directory counts as durable. The real-broker test's link must keep its state in the
+   * private TMPDIR (the test deletion guard refuses renames anywhere else). Production passes none: the installed
+   * bundle's entry calls the seam with no deps.
+   */
+  durableStateDir?: string;
 }
 
 /** What publish wrote, recorded in its intent: the only change a rollback may undo. */
@@ -150,6 +161,8 @@ const readThrough = (fd: number, name: string): Buffer => {
  * remove it under a running link. A path in a temporary root, or in any agent session's private temp store, refuses.
  */
 const TEMPORARY_ROOTS = ["/tmp", "/var/tmp", "/dev/shm", "/run"];
+const exemption = (options: ReadOptions): ReadOptions =>
+  options.durableStateDir === undefined ? {} : { durableStateDir: options.durableStateDir };
 export const temporaryStateDir = (stateDir: string): boolean => {
   const candidates = [stateDir];
   try { candidates.push(fs.realpathSync(stateDir)); } catch { /* not created yet: the path as written */ }
@@ -157,13 +170,13 @@ export const temporaryStateDir = (stateDir: string): boolean => {
     TEMPORARY_ROOTS.some(root => dir === root || dir.startsWith(`${root}${path.sep}`)));
 };
 
-const parseConfig = (bytes: Buffer): { value: Record<string, unknown>; config: NatsLinkConfig } => {
+const parseConfig = (bytes: Buffer, options: ReadOptions = {}): { value: Record<string, unknown>; config: NatsLinkConfig } => {
   let value: unknown;
   try { value = JSON.parse(bytes.toString("utf8")); } catch { throw new SeamGap("link-config-invalid"); }
   if (!isObject(value)) throw new SeamGap("link-config-invalid");
   let config: NatsLinkConfig;
   try { config = parseNatsLinkConfig(value); } catch { throw new SeamGap("link-config-invalid"); }
-  if (temporaryStateDir(config.stateDir)) throw new SeamGap("link-state-dir-temporary");
+  if (config.stateDir !== options.durableStateDir && temporaryStateDir(config.stateDir)) throw new SeamGap("link-state-dir-temporary");
   return { value, config };
 };
 
@@ -171,12 +184,12 @@ const parseConfig = (bytes: Buffer): { value: Record<string, unknown>; config: N
  * Read the pinned config: the path checks above, then the bytes through the verified directory's descriptor, parsed
  * by the link's own parser. The bytes read here are the ones the compare-and-swap protects.
  */
-export const readLinkConfig = (file: string): LinkConfigFile => {
+export const readLinkConfig = (file: string, options: ReadOptions = {}): LinkConfigFile => {
   const { directory, name } = verifyPath(file);
   const dir = openDirectory(directory);
   try {
     const bytes = readThrough(dir.fd, name);
-    return { file, dirDev: dir.dev, dirIno: dir.ino, bytes, sha256: sha256(bytes), ...parseConfig(bytes) };
+    return { file, dirDev: dir.dev, dirIno: dir.ino, bytes, sha256: sha256(bytes), ...parseConfig(bytes, options), ...exemption(options) };
   } finally { fs.closeSync(dir.fd); }
 };
 
@@ -349,7 +362,7 @@ export const planRestore = (before: LinkConfigFile, pins: BridgeNatsSeatPins, se
   }
   if (before.sha256 === authority.beforeSha256) return none(before);
   if (before.sha256 === authority.afterSha256) {
-    const reverted = parseConfig(authority.beforeBytes);
+    const reverted = parseConfig(authority.beforeBytes, before);
     validated(reverted.value, pins);
     return { change: "revert", before, after: authority.beforeBytes, afterSha256: authority.beforeSha256, natsEntry: authority.natsEntry,
       fileEntry: authority.fileEntry, beforeHadNats: authority.beforeHadNats };
@@ -385,7 +398,7 @@ export const planRestore = (before: LinkConfigFile, pins: BridgeNatsSeatPins, se
  * for byte. A failure before the rename leaves the old file untouched. Returns the post-state, re-read and re-validated.
  */
 export const applyPlan = (plan: WriterPlan): LinkConfigFile => {
-  if (plan.after === null) return readLinkConfig(plan.before.file);
+  if (plan.after === null) return readLinkConfig(plan.before.file, plan.before);
   const { directory, name } = verifyPath(plan.before.file);
   const dir = openDirectory(directory, { dev: plan.before.dirDev, ino: plan.before.dirIno });
   const temp = `.${name}.fabric-v2-${randomBytes(8).toString("hex")}.tmp`;
@@ -406,7 +419,8 @@ export const applyPlan = (plan: WriterPlan): LinkConfigFile => {
     fs.fsyncSync(dir.fd);
     const back = readThrough(dir.fd, name);
     if (sha256(back) !== plan.afterSha256) throw new SeamGap("link-config-readback-failed");
-    return { file: plan.before.file, dirDev: dir.dev, dirIno: dir.ino, bytes: back, sha256: sha256(back), ...parseConfig(back) };
+    return { file: plan.before.file, dirDev: dir.dev, dirIno: dir.ino, bytes: back, sha256: sha256(back), ...parseConfig(back, plan.before),
+      ...exemption(plan.before) };
   } catch (error) {
     if (error instanceof SeamGap) throw error;
     throw new SeamGap(renamed ? "link-config-sync-failed" : "link-config-write-failed");

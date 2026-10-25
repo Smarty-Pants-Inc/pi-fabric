@@ -236,7 +236,7 @@ Post these on smarty-dev#15310 with the run id, the UTC time and the pass or FAI
 | `refused`, `pod-identity-unreadable` | the Pod's CLI lacks `--identity`, or its server check failed: read `asserted.podLine` | the image owner, or fabric-v2 |
 | `refused`, `link-not-reloaded` | no new lock holder, or a status problem: read `measured.reload` | the link's operator |
 | `refused`, `seat-not-routable` | no single live record on the seat's machine with the Pod Main's incarnation: read `measured.receipt` | fabric-v2 |
-| `refused`, `seat-route-refused-by-gate` | the link's identity gate does not resolve the seat (for example `BRIDGE_NATS_AMBIGUOUS`: an old presence record for the id, live or not): read `measured.gate`. A presence row expires within its 10-minute TTL | fabric-v2 |
+| `refused`, `seat-route-refused-by-gate` | the link's identity gate does not resolve the seat: read `measured.gate`. An old presence row for the id on a second machine (for example a mirror row a killed link left), live or not, hides the id from the NATS directory, so the gate says `BRIDGE_NATS_TARGET_UNAVAILABLE`, "has no nats presence", even though the seat's live row is there. Check for an extra row before anything else; a presence row expires within its 10-minute TTL | fabric-v2 |
 | `refused`, `pod-nats-machine-mismatch` or `-unknown` | the managed Pod's `PI_FABRIC_MESH_NATS` does not name the run's `natsMachine` | A's owner |
 | `GAP: seat-nats-machine-unpinned` | the sealed run has no `natsMachine` (A predates T-FIX6) | A's owner |
 | `GAP: link-config-path-unsafe` | a symlink or an unsafe directory on the config's path | the link's operator |

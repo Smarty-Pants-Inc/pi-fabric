@@ -82,7 +82,7 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly duplicateWindowMs?: number;
   readonly requestTimeoutMs?: number;
   readonly provision?: boolean;
-  /** Host-only opt-in to expiring this host's own inbox durable. */
+  /** Host-only opt-in to a custom idle lifetime and best-effort durable deletion on close. */
   readonly ephemeralHost?: boolean;
   /** Idle expiration in seconds when ephemeralHost is enabled (300..86400). */
   readonly ephemeralInactiveSeconds?: number;
@@ -196,7 +196,9 @@ const transportConsumerPolicy = (options: ResolvedNatsOptions): TransportConsume
   filterSubject: transportInboxFilter(options.machine, options.hostId),
   description: JSON.stringify({ fabricHostId: options.hostId, machine: options.machine }),
   maxAckPending: 128,
-  ...(options.ephemeralHost ? { inactiveThresholdNs: options.ephemeralInactiveSeconds * 1_000_000_000 } : {}),
+  ...(options.ephemeralHost
+    ? { inactiveThresholdNs: options.ephemeralInactiveSeconds * 1_000_000_000 }
+    : {}),
 });
 
 const isTransportEnvelope = (value: unknown): value is TransportEnvelope => {

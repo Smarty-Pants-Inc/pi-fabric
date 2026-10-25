@@ -13,16 +13,28 @@ const notFound = (): JetStreamApiError => new JetStreamApiError({ code: 404, err
 interface Fake {
   connection: NatsConnectionHandle;
   added: Array<{ stream: string; config: Record<string, unknown> }>;
+  updated: Array<{ stream: string; durable: string; config: Record<string, unknown> }>;
   gets: Array<{ stream: string; durable: string }>;
+  snapshot(durable: string): { config: Record<string, unknown>; state?: Record<string, unknown> } | undefined;
   push(message: unknown): void;
   end(): void;
   verified: boolean;
 }
 
-function fakeConnection(existing?: Record<string, unknown>): Fake {
+function fakeConnection(existing?: Record<string, unknown>, existingState?: Record<string, unknown>): Fake {
   const consumers = new Map<string, Record<string, unknown>>();
-  if (existing) consumers.set(String(existing.durable_name), existing);
-  const fake: Fake = { added: [], gets: [], verified: true, push: () => undefined, end: () => undefined } as unknown as Fake;
+  const states = new Map<string, Record<string, unknown>>();
+  if (existing) {
+    const durable = String(existing.durable_name);
+    consumers.set(durable, existing);
+    if (existingState) states.set(durable, existingState);
+  }
+  const fake: Fake = { added: [], updated: [], gets: [], verified: true, push: () => undefined, end: () => undefined,
+    snapshot: (durable: string) => {
+      const config = consumers.get(durable);
+      const state = states.get(durable);
+      return config ? { config, ...(state ? { state } : {}) } : undefined;
+    } } as unknown as Fake;
   let callback: ((message: unknown) => void) | undefined;
   const queue: unknown[] = [];
   let wake: (() => void) | undefined;
@@ -51,12 +63,21 @@ function fakeConnection(existing?: Record<string, unknown>): Fake {
       async info(stream: string, durable: string) {
         const config = consumers.get(durable);
         if (!config) throw notFound();
-        return { stream_name: stream, name: durable, config };
+        const state = states.get(durable);
+        return { stream_name: stream, name: durable, config, ...(state ? { state } : {}) };
       },
       async add(stream: string, config: Record<string, unknown>) {
         fake.added.push({ stream, config });
         consumers.set(String(config.durable_name), config);
         return { stream_name: stream, name: config.durable_name, config };
+      },
+      async update(stream: string, durable: string, config: Record<string, unknown>) {
+        fake.updated.push({ stream, durable, config });
+        const current = consumers.get(durable);
+        if (!current) throw notFound();
+        Object.assign(current, config);
+        const state = states.get(durable);
+        return { stream_name: stream, name: durable, config: current, ...(state ? { state } : {}) };
       },
     } },
     js: { consumers: {
@@ -72,6 +93,22 @@ function fakeConnection(existing?: Record<string, unknown>): Fake {
   return fake;
 }
 
+const validBridgeInboxConsumerConfig = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+  durable_name: `br_${hashToken("bridge:v2")}`,
+  description: JSON.stringify({ fabricBridgeLink: "v2", machine: "ryzen1-bridge" }),
+  filter_subject: "fabric.in.ryzen1-bridge.>",
+  ack_policy: AckPolicy.Explicit,
+  deliver_policy: DeliverPolicy.All,
+  replay_policy: ReplayPolicy.Instant,
+  ack_wait: 30_000_000_000,
+  max_deliver: 5,
+  backoff: Array.from({ length: 5 }, () => 30_000_000_000),
+  max_ack_pending: 128,
+  max_waiting: 1,
+  inactive_threshold: 0,
+  ...overrides,
+});
+
 describe("natsBridgeInboxSource", () => {
   it("creates one machine-wide durable with the transport inbox policy and yields only verified deliveries", async () => {
     const fake = fakeConnection();
@@ -85,6 +122,7 @@ describe("natsBridgeInboxSource", () => {
     expect(fake.added[0]).toMatchObject({ stream: "FABRIC_IN_ryzen1-bridge", config: {
       durable_name: durable, filter_subject: "fabric.in.ryzen1-bridge.>", ack_policy: AckPolicy.Explicit,
       deliver_policy: DeliverPolicy.All, replay_policy: ReplayPolicy.Instant, max_ack_pending: 128, max_waiting: 1,
+      inactive_threshold: 604_800_000_000_000,
       description: JSON.stringify({ fabricBridgeLink: "v2", machine: "ryzen1-bridge" }) } });
     expect(fake.gets).toEqual([{ stream: "FABRIC_IN_ryzen1-bridge", durable }]);
     fake.verified = false;
@@ -96,11 +134,38 @@ describe("natsBridgeInboxSource", () => {
     expect((await iterator.next()).done).toBe(true);
   });
 
-  it("refuses a durable of the same name with another owner or filter", async () => {
-    const fake = fakeConnection({ durable_name: `br_${hashToken("bridge:v2")}`, filter_subject: "fabric.in.ryzen1-bridge.x.>",
-      description: "{}", ack_policy: AckPolicy.Explicit });
-    const source = natsBridgeInboxSource(fake.connection, { machine: "ryzen1-bridge", link: "v2" });
-    await expect(source.consume(new AbortController().signal)[Symbol.asyncIterator]().next()).rejects.toBeTruthy();
+  it("heals a compatible legacy durable in place without resetting its cursor or unrelated config", async () => {
+    const durable = `br_${hashToken("bridge:v2")}`;
+    const legacy = { ...validBridgeInboxConsumerConfig(), metadata: { retained: "yes" } };
+    const cursor = { delivered: { consumer_seq: 23, stream_seq: 81 }, ack_floor: { consumer_seq: 19, stream_seq: 76 } };
+    const fake = fakeConnection(legacy, cursor);
+    const abort = new AbortController();
+    const iterator = natsBridgeInboxSource(fake.connection, { machine: "ryzen1-bridge", link: "v2" }).consume(abort.signal)[Symbol.asyncIterator]();
+    const pending = iterator.next();
+    await vi.waitFor(() => expect(fake.gets).toHaveLength(1), { timeout: 5_000 });
+    expect(fake.added).toEqual([]);
+    expect(fake.updated).toEqual([{ stream: "FABRIC_IN_ryzen1-bridge", durable,
+      config: { inactive_threshold: 604_800_000_000_000 } }]);
+    expect(fake.snapshot(durable)).toEqual({
+      config: { ...legacy, inactive_threshold: 604_800_000_000_000 }, state: cursor,
+    });
+    abort.abort();
+    expect((await pending).done).toBe(true);
+  });
+
+  it("refuses fully configured wrong-owner or broader-filter durables without updating or adding", async () => {
+    const incompatible = [
+      validBridgeInboxConsumerConfig({ description: JSON.stringify({ fabricBridgeLink: "another-link", machine: "ryzen1-bridge" }) }),
+      validBridgeInboxConsumerConfig({ filter_subject: "fabric.in.>" }),
+    ];
+    for (const config of incompatible) {
+      const fake = fakeConnection(config);
+      const source = natsBridgeInboxSource(fake.connection, { machine: "ryzen1-bridge", link: "v2" });
+      await expect(source.consume(new AbortController().signal)[Symbol.asyncIterator]().next())
+        .rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID" });
+      expect(fake.updated).toEqual([]);
+      expect(fake.added).toEqual([]);
+    }
   });
 });
 
@@ -116,7 +181,8 @@ describe("natsBridgeEventSource", () => {
     expect(fake.added).toHaveLength(1);
     expect(fake.added[0]).toMatchObject({ stream: "FABRIC_EV_EXAMPLE_ORG", config: {
       durable_name: `bev_${hashToken("bridge:v2")}`, deliver_policy: DeliverPolicy.New, ack_policy: AckPolicy.Explicit,
-      max_deliver: -1, max_ack_pending: 1, filter_subjects: [`fabric.ev.${ORG}.fleet.work.>`, `fabric.ev.${ORG}.ops.owner`] } });
+      inactive_threshold: 0, max_deliver: -1, max_ack_pending: 1,
+      filter_subjects: [`fabric.ev.${ORG}.fleet.work.>`, `fabric.ev.${ORG}.ops.owner`] } });
     fake.push({ subject: "x" });
     expect((await first).value).toEqual({ subject: "x" });
     abort.abort();

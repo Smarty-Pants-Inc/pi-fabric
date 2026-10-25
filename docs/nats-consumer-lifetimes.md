@@ -1,7 +1,6 @@
 # NATS consumer lifetimes
 
-The host inbox leak is tracked in [smarty-dev#4605](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/4605).
-An open NATS connection is not consumer interest: a host that only sends messages can leave an idle inbox behind.
+Hosts that only send messages can leave abandoned inbox durable consumers behind.
 `inactive_threshold` bounds abandoned consumer state; it is not a hard lifetime for a consumer with live pulls.
 
 ## Inventory
@@ -116,7 +115,7 @@ Stream age/size limits still apply: this is not indefinite offline retention.
 **Expiry destroys the broker ACK cursor.** `All` also replays retained records that were already ACKed, TERMed or
 exhausted; their delivery counts restart. An ordinary reconnect or threshold-only migration preserves that cursor;
 re-creation does not. The ten-minute publisher deduplication window does not deduplicate consumer replay.
-The application control inbox, rather than JetStream publication dedupe, prevents repeated command execution:
+The application control inbox prevents repeated command execution independently of JetStream publication dedupe:
 
 - `src/topology/control-plane.ts` stores a local `control-seen` claim keyed by stable host and `commandId` **before**
   invoking the handler. The retained outcome binds target, requester, source machine and body digest. Replayed
@@ -144,7 +143,7 @@ Adding a threshold to these consumers alone would change delivery guarantees:
 
 - Actor consumers restart at `All` or their original `eventsStartAt`, not a persisted broker resume point. Actor
   queues keep only 4,096 recent event-ID receipts. Older replay can repeat completed activations, and a missing
-  consumer on a live connection currently leaves a sticky delivery failure rather than automatic recovery.
+  consumer on a live connection currently leaves a sticky delivery failure with no automatic recovery.
 - The event bridge defaults to `DeliverNew` on creation. Expiring it would skip messages published during the outage.
   Replacing that with `All` would replay accepted history instead; neither is equivalent to retaining its cursor.
 - The advisory operator deliberately cannot create consumers. Expiring the fixed singleton would require bootstrap
@@ -158,7 +157,6 @@ A threshold-only patch cannot provide both lossless and duplicate-free delivery 
 Use the real Path B fixture with machine-scoped credentials to check create, legacy threshold-only update and
 missing-consumer recovery. Preserve the verified reconnect/ACK and KV-resnapshot regressions introduced by frozen
 `f33937156f587f2479c651ae301de44ec0f0592a` (`tests/nats-reconnect-auth.test.ts`, `tests/nats-kv-watch.test.ts`).
-The repository pins NATS 2.14.7 for CI. Fabric-store supplied a read-only intel1 `/varz` observation at
-2026-10-25 16:58:58Z: `server_name: smarty-nats-intel1`, `version: 2.14.7`, `git_commit: 8d8b69a`, `go1.26.8`.
+Tested against NATS 2.14.7 (the CI pin) and 2.11.17.
 A passing fixture run is version-specific compatibility evidence, not proof that existing fleet consumers have
 already migrated. Deployment and any one-time cleanup are separate from this source change.

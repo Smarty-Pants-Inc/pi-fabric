@@ -1,5 +1,5 @@
 // expected-skip: no nats-server or Windows: the TLS/credential-file Path B acceptance needs a POSIX broker job.
-// Keep reasons: #16868 rollback data safety and the runtime-agent USER.INFO/ownership trust boundary.
+// Keep reasons: rollback data safety and the runtime-agent USER.INFO/ownership trust boundary.
 // The parent runs checks under smarty-test-env/CPUQuota/nice; this file never starts another test runner.
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";

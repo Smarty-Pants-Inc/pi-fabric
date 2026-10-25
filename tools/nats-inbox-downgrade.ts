@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-/** Standalone rollback for https://github.com/Smarty-Pants-Inc/smarty-dev/issues/16868. */
+/** Standalone inbox rollback for downgrades to an unbounded-lifetime release. */
 import { isAbsolute, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { AckPolicy, DeliverPolicy, ReplayPolicy, type ConsumerInfo } from "@nats-io/jetstream";

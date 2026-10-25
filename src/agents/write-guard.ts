@@ -70,6 +70,32 @@ const nearestRealPath = (target: string): string => {
   }
 };
 
+/**
+ * smarty-dev#15856: the fleet launcher moves the TMPDIR that Fabric granted as this child's private scratch. The
+ * role-pi shim (smarty-role --session-pi) execs Pi with TMPDIR set to a fresh 0700 session store, recorded as
+ * SMARTY_SESSION_STORE and SMARTY_SESSION_STORE_ID (dev:ino), and the fleet bash guard then exports its own 0700
+ * `p.XXXXXX` child of that store as TMPDIR. That child is the scratch Bash's `mktemp -d` uses, so it is this child's
+ * actual private scratch. Only exactly that directory qualifies: a physical directory of ours, mode 0700, directly
+ * inside the store the launcher recorded. The store itself, its other entries and anything deeper do not.
+ */
+export const bootstrapScratchRoot = (env: NodeJS.ProcessEnv = process.env): string | undefined => {
+  const uid = process.getuid?.();
+  const { TMPDIR: tmpdir, SMARTY_SESSION_STORE: store, SMARTY_SESSION_STORE_ID: id } = env;
+  if (uid === undefined || !tmpdir || !store || !id || !path.isAbsolute(tmpdir) || !path.isAbsolute(store)) return undefined;
+  if (path.dirname(tmpdir) !== store || !/^p\.[A-Za-z0-9]{6}$/.test(path.basename(tmpdir))) return undefined;
+  try {
+    const owned = (directory: string): fs.BigIntStats | undefined => {
+      const stat = fs.lstatSync(directory, { bigint: true });
+      return fs.realpathSync(directory) === directory && stat.isDirectory() && stat.uid === BigInt(uid) &&
+        (stat.mode & 0o7777n) === 0o700n ? stat : undefined;
+    };
+    const recorded = owned(store);
+    return recorded && `${recorded.dev}:${recorded.ino}` === id && owned(tmpdir) ? tmpdir : undefined;
+  } catch {
+    return undefined; // Missing or unreadable: no extra root.
+  }
+};
+
 /** Return a refusal reason, or undefined when the policy allows the call. */
 export const writePolicyDenial = (
   policy: FabricWritePolicy,
@@ -85,16 +111,16 @@ export const writePolicyDenial = (
   if (!WRITE_TOOLS.has(toolName)) return undefined;
   const args = typeof input === "object" && input !== null ? input as Record<string, unknown> : {};
   const raw = [args.path, args.file_path, args.filePath].find((value) => typeof value === "string");
-  const scope = `refused path: ${JSON.stringify(raw ?? null)}; allowed roots: ${JSON.stringify(policy.writableRoots)}`;
+  // An unconfined shell can already write the bootstrap scratch; this lets write/edit reach it too (smarty-dev#15856).
+  const scratch = !policy.readOnly && policy.shell === "unconfined" ? bootstrapScratchRoot() : undefined;
+  const roots = scratch && !policy.writableRoots.includes(scratch) ? [...policy.writableRoots, scratch] : policy.writableRoots;
+  const scope = `refused path: ${JSON.stringify(raw ?? null)}; allowed roots: ${JSON.stringify(roots)}`;
   if (policy.readOnly) return `Fabric write policy refuses ${toolName}: this agent is read-only; ${scope}`;
   if (typeof raw !== "string" || raw === "") return `Fabric write policy refuses ${toolName}: no path argument; ${scope}`;
   try {
     const lexical = resolveToolPath(raw, cwd);
     const real = nearestRealPath(lexical);
-    if (
-      policy.writableRoots.some((root) => isInside(root, lexical)) &&
-      policy.writableRoots.some((root) => isInside(root, real))
-    ) return undefined;
+    if (roots.some((root) => isInside(root, lexical)) && roots.some((root) => isInside(root, real))) return undefined;
   } catch {
     // Unresolvable paths fail closed.
   }

@@ -1,6 +1,7 @@
 // Path B hosted-test harness. NATS_BIN is preferred and must be an absolute executable path when set;
 // otherwise this resolves nats-server from PATH, then the fleet pinned-tool location. The harness owns one
-// child process, two loopback ports, a private resolver/store tree, and credential files. The rendered config
+// child process, two loopback ports, a private resolver/store tree, and credential files. Optional additional
+// runtime machines use the same production policy/signing path; the default remains machine-a/b. The rendered config
 // sets JetStream sync_interval: always. restart() reuses the same config/store; stop() is terminal cleanup.
 // nats-state-server.ts was inspected: it exports external-server selectors, not readiness/version functions.
 // No credential bytes, seeds, JWTs, or identity values are included in errors or public diagnostics.
@@ -15,6 +16,7 @@ import { jetstream, jetstreamManager, type JetStreamManager } from "@nats-io/jet
 import { connect, credsAuthenticator, nkeys, type NatsConnection } from "@nats-io/transport-node";
 import { encodeAccountJwt, encodeOperatorJwt, encodeUserJwt, formatUserCreds, type ScopedSigningKey } from "../../src/mesh/nats-auth/jwt.js";
 import { PATH_B_OPERATOR_MACHINE, roleTemplateWithPathB, type RoleTemplate } from "../../src/mesh/nats-auth/permissions.js";
+import { pathBMachines } from "../../src/mesh/nats-auth/mint.js";
 import { renderNatsServerConfig } from "../../src/mesh/nats-auth/server-config.js";
 import { startTime } from "./owned-processes.js";
 
@@ -35,8 +37,8 @@ export const PATH_B_POLICY_ENV: Readonly<Record<string, string>> = {
   PI_FABRIC_NATS_MACHINES: PATH_B_MACHINES.join(","),
 };
 
-export interface PathBUser {
-  readonly machine: PathBMachine | typeof PATH_B_OPERATOR_MACHINE;
+export interface PathBUser<Machine extends string = PathBMachine | typeof PATH_B_OPERATOR_MACHINE> {
+  readonly machine: Machine;
   readonly publicKey: string;
   readonly credsPath: string;
 }
@@ -69,6 +71,11 @@ export interface PathBHarnessOptions {
   readonly org?: string;
   /** Mint the runtime agent with the opt-in shared-org event grants. Requires org. */
   readonly events?: boolean;
+  /** Add independently keyed TEST runtime machines to this harness's signed scope + expected policy.
+   * Production pathBMachines() validates the COMPLETE inventory (including default a/b).
+   * Cannot combine with identityFactory: that factory owns its account policy and issuance.
+   */
+  readonly additionalRuntimeMachines?: readonly string[];
   /** Issue real CLI artifacts without changing the default hand-built fault-injection fixture. */
   readonly identityFactory?: (root: string) => PathBIdentity | Promise<PathBIdentity>;
   /** Additional publish allows for agent superset-verification tests. */
@@ -121,11 +128,11 @@ function createTestTls(root: string, dnsNames: readonly string[], ipAddresses: r
   return { caFile: file("path-b-test-ca.pem"), untrustedCaFile: file("path-b-untrusted-ca.pem"), certFile: file("server.pem"), keyFile: file("server.key") };
 }
 
-function faultedAgentTemplate(options: PathBHarnessOptions): RoleTemplate {
+function faultedAgentTemplate(options: PathBHarnessOptions, machines: readonly string[]): RoleTemplate {
   const policy = options.events === true
     ? { events: true, ...(options.org === undefined ? {} : { org: options.org }) }
     : options.org;
-  const base = roleTemplateWithPathB("agent", { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream }, PATH_B_MACHINES, policy);
+  const base = roleTemplateWithPathB("agent", { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream }, machines, policy);
   const removedPublish = new Set(options.removeAgentPublish ?? []);
   const removedDeny = new Set(options.removeAgentDeny ?? []);
   return {
@@ -291,6 +298,10 @@ export class PathBHarness {
   readonly serverUrl: string;
   readonly monitorUrl: string;
   readonly users: PathBUsers;
+  readonly additionalRuntimeUsers: readonly PathBUser<string>[];
+  /** The exact inventory used by this account's signed templates and all verification consumers. */
+  readonly permissionPolicy: typeof PATH_B_PERMISSION_POLICY;
+  readonly policyEnv: Readonly<Record<string, string>>;
   readonly configText: string;
   readonly binary: string;
   readonly tls: PathBTlsFiles | undefined;
@@ -303,6 +314,9 @@ export class PathBHarness {
     serverUrl: string;
     monitorUrl: string;
     users: PathBUsers;
+    additionalRuntimeUsers: readonly PathBUser<string>[];
+    permissionPolicy: typeof PATH_B_PERMISSION_POLICY;
+    policyEnv: Readonly<Record<string, string>>;
     configText: string;
     binary: string;
     tls?: PathBTlsFiles;
@@ -312,11 +326,29 @@ export class PathBHarness {
     this.serverUrl = input.serverUrl;
     this.monitorUrl = input.monitorUrl;
     this.users = input.users;
+    this.additionalRuntimeUsers = input.additionalRuntimeUsers;
+    this.permissionPolicy = input.permissionPolicy;
+    this.policyEnv = input.policyEnv;
     this.configText = input.configText;
     this.binary = input.binary;
   }
 
   static async create(options: PathBHarnessOptions = {}): Promise<PathBHarness> {
+    // Refuse ambiguous composition and invalid inventory BEFORE root/port/key/process effects.
+    if (options.identityFactory && options.additionalRuntimeMachines !== undefined) {
+      throw new TypeError("Path B additionalRuntimeMachines cannot be combined with identityFactory");
+    }
+    if (options.additionalRuntimeMachines !== undefined && !Array.isArray(options.additionalRuntimeMachines)) {
+      throw new TypeError("Path B additionalRuntimeMachines must be an array");
+    }
+    const machines = pathBMachines([...PATH_B_MACHINES, ...(options.additionalRuntimeMachines ?? [])]);
+    // Keep literals exact: the mint validator uses a JS `$` anchor, which may
+    // match before a final line terminator. Refuse whitespace, never trim it into a grant.
+    if (machines.some(machine => machine !== machine.trim())) throw new TypeError("invalid pathBMachines");
+    const permissionPolicy = options.additionalRuntimeMachines === undefined
+      ? PATH_B_PERMISSION_POLICY : { ...PATH_B_PERMISSION_POLICY, pathBMachines: machines };
+    const policyEnv = options.additionalRuntimeMachines === undefined
+      ? PATH_B_POLICY_ENV : { ...PATH_B_POLICY_ENV, PI_FABRIC_NATS_MACHINES: machines.join(",") };
     const binary = resolveNatsBinary(options.binary);
     if (!binary) throw new Error("nats auth Path B test skipped: nats-server executable was not found");
     const parent = fs.realpathSync.native(process.env.TMPDIR?.trim() || os.tmpdir());
@@ -328,7 +360,7 @@ export class PathBHarness {
     try {
       const listenPort = await freeLoopbackPort(used);
       const monitorPort = await freeLoopbackPort(used);
-      const createIdentity = async (): Promise<PathBIdentity> => {
+      const createIdentity = async (): Promise<PathBIdentity & { readonly additionalRuntimeUsers?: readonly PathBUser<string>[] }> => {
         if (options.identityFactory) return options.identityFactory(root);
         const operatorIdentity = pairOf(nkeys.createOperator());
         const operatorSigning = pairOf(nkeys.createOperator());
@@ -362,9 +394,9 @@ export class PathBHarness {
         );
         // Fully merged #1276 templates (no copied grants); only the explicit fault options perturb the agent template.
         const streams = { custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream };
-        const operatorTemplate = roleTemplateWithPathB("operator", streams, PATH_B_MACHINES);
+        const operatorTemplate = roleTemplateWithPathB("operator", streams, machines);
         const scopedKeys: ScopedSigningKey[] = [
-          { key: agentSigning.getPublicKey(), role: "agent", template: faultedAgentTemplate(options) },
+          { key: agentSigning.getPublicKey(), role: "agent", template: faultedAgentTemplate(options, machines) },
           {
             key: maintainerSigning.getPublicKey(),
             role: "operator",
@@ -374,7 +406,7 @@ export class PathBHarness {
               sub: { allow: [...operatorTemplate.sub.allow, ...(options.additionalOperatorSubscribe ?? [])] },
             },
           },
-          { key: principalSigning.getPublicKey(), role: "principal", template: roleTemplateWithPathB("principal", streams, PATH_B_MACHINES) },
+          { key: principalSigning.getPublicKey(), role: "principal", template: roleTemplateWithPathB("principal", streams, machines) },
           {
             key: bootstrapSigning.getPublicKey(),
             role: "maintainer",
@@ -386,7 +418,7 @@ export class PathBHarness {
           signerOf(operatorSigning),
           clock,
         );
-        const user = (pair: KeyPair, machine: PathBUser["machine"], signer: KeyPair, role: "agent" | "maintainer" | "operator" | "principal", name: string, fileName: string): PathBUser => {
+        const user = <Machine extends string>(pair: KeyPair, machine: Machine, signer: KeyPair, role: "agent" | "maintainer" | "operator" | "principal", name: string, fileName: string): PathBUser<Machine> => {
           const tags = role === "agent"
             ? [`role:${role}`, `machine:${machine}`, ...[PATH_B_TEST_MESH, ...(options.additionalAgentMeshes ?? [])].map((mesh) => `mesh:${mesh}`)]
             : [`role:${role}`, `machine:${machine}`];
@@ -418,12 +450,19 @@ export class PathBHarness {
         const systemCreds = path.join(root, "system.creds");
         fs.writeFileSync(systemCreds, formatUserCreds(systemJwt, systemUser.getSeed()), { flag: "wx", mode: 0o600 });
         const system: PathBUser = { machine: "machine-a", publicKey: systemUser.getPublicKey(), credsPath: systemCreds };
+        const additionalRuntimeUsers = machines.slice(PATH_B_MACHINES.length).map(machine => {
+          const pair = pairOf(nkeys.createUser());
+          pairs.push(pair);
+          // Same scoped agent signer/template and user encoder; only the signed machine + independent key differ.
+          return user(pair, machine, agentSigning, "agent", `agent/path-b/${machine}`, `${machine}.creds`);
+        });
         return {
           operatorJwt, systemAccount, systemAccountJwt, appAccount, appAccountJwt,
           users: { machineA: machineAUser, machineB: machineBUser, maintainer: maintainerUser, bootstrap: bootstrapUser, principal: principalUser, system },
+          ...(additionalRuntimeUsers.length ? { additionalRuntimeUsers } : {}),
         };
       };
-      const { operatorJwt, systemAccount, systemAccountJwt, appAccount, appAccountJwt, users } = await createIdentity();
+      const { operatorJwt, systemAccount, systemAccountJwt, appAccount, appAccountJwt, users, additionalRuntimeUsers = [] } = await createIdentity();
       const storeDir = path.join(root, "store");
       const resolverDir = path.join(root, "resolver");
       fs.mkdirSync(storeDir, { mode: 0o700 });
@@ -454,7 +493,7 @@ export class PathBHarness {
         root,
         serverUrl: `${tlsFiles ? "tls" : "nats"}://127.0.0.1:${listenPort}`,
         monitorUrl: `http://127.0.0.1:${monitorPort}`,
-        users,
+        users, additionalRuntimeUsers, permissionPolicy, policyEnv,
         configText: fullConfig,
         binary,
         ...(tlsFiles ? { tls: {
@@ -530,13 +569,13 @@ export class PathBHarness {
   }
 
   /** Runtime (agent) options: TLS fixtures use the certificate DNS identity; default raw auth fixtures stay plaintext. */
-  runtimeOptions(user: Pick<PathBUser, "machine" | "credsPath">) {
+  runtimeOptions(user: Pick<PathBUser<string>, "machine" | "credsPath">) {
     const port = new URL(this.serverUrl).port;
     return {
       servers: this.tls ? `tls://localhost:${port}` : this.serverUrl,
       credentials: user.credsPath,
       machine: user.machine,
-      ...PATH_B_PERMISSION_POLICY,
+      ...this.permissionPolicy,
       ...(this.tls ? { tls: { caFile: this.tls.caFile } } : {}),
     };
   }
@@ -547,9 +586,9 @@ export class PathBHarness {
   }
 
   /** Admin CLI environment; TLS callers supply the CA path explicitly on the command line. */
-  adminEnv(user: Pick<PathBUser, "machine" | "credsPath">): Record<string, string> {
+  adminEnv(user: Pick<PathBUser<string>, "machine" | "credsPath">): Record<string, string> {
     const port = new URL(this.serverUrl).port;
-    return { ...PATH_B_POLICY_ENV, PI_FABRIC_NATS_SERVERS: this.tls ? `tls://localhost:${port}` : this.serverUrl, PI_FABRIC_NATS_CREDENTIALS: user.credsPath, PI_FABRIC_MACHINE: user.machine };
+    return { ...this.policyEnv, PI_FABRIC_NATS_SERVERS: this.tls ? `tls://localhost:${port}` : this.serverUrl, PI_FABRIC_NATS_CREDENTIALS: user.credsPath, PI_FABRIC_MACHINE: user.machine };
   }
 
   async userInfoFieldPaths(user: PathBUser): Promise<string[]> {

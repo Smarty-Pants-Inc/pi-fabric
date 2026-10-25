@@ -362,7 +362,11 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
     if (fd === undefined) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_CLOSED", "ledger is closed");
     const bytes = Buffer.from(encoded, "utf8");
     try {
-      writeAll(fd, bytes);
+      // One append syscall for one fully encoded line. Never finish a short append with another
+      // write: stop and roll it back so a crash can leave only ONE incomplete final record.
+      // This is not a disk/power atomicity guarantee; load still recovers that single torn tail.
+      const written = fs.writeSync(fd, bytes, 0, bytes.length);
+      if (written !== bytes.length) throw new Error(`ledger append was short (${written}/${bytes.length} bytes); restart the link`);
       fs.fsyncSync(fd);
     } catch (error) {
       // Never leave a torn line in front of later ones (load would refuse it as corruption). After a

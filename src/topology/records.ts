@@ -99,13 +99,15 @@ export const actorParticipantRecord = (
   name: actor.name,
   status: actor.status,
   residency: actor.residency ?? "session",
-  runner: actor.runner,
+  ...(actor.runner !== "native" ? { runner: actor.runner } : {}),
   transport: "host",
   capabilities: [
     ...(actor.status === "stopped"
       ? []
-      : (["steer", "followUp", "stop", "ask", "actor-bindings"] as const)),
-    ...(getAgentRunner(actor.runner)?.capabilities.recursiveFabric && actor.extensions !== false
+      : actor.runner === "native"
+        ? (["stop", "ask"] as const)
+        : (["steer", "followUp", "stop", "ask", "actor-bindings"] as const)),
+    ...(actor.runner !== "native" && getAgentRunner(actor.runner)?.capabilities.recursiveFabric && actor.extensions !== false
       ? (["fabric"] as const)
       : []),
   ],

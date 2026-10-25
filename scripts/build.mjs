@@ -101,6 +101,8 @@ const lazyEntryPoints = [
   "src/mesh/nats-auth/dispatch-cli.ts",
   // `nats-link start` loads the file <-> NATS link only when it starts (smarty-dev#15310).
   "src/mesh/bridge-nats-link.ts",
+  // Native ask claim/consume stays first-use and generation-stable in installed owners.
+  "src/mesh/bridge-nats-ingress.ts",
   "src/mesh/nats-auth/owner-cli.ts",
   // First-use host custody and participant snapshots keep stable lazy paths.
   "src/topology/host-leases.ts",

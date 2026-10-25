@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { NATIVE_INGRESS_DIRECTORY, readNativeIngressReceipt } from "../src/mesh/bridge-nats-ingress.js";
 import {
   BRIDGE_NATS_LEDGER_FILE,
   BRIDGE_NATS_LEDGER_LOCK,
@@ -350,23 +351,53 @@ describe("crash durability", () => {
   });
 
   // Stated skip: nats-link is Linux/macOS only (POSIX file modes, fsync/rename and lock semantics); start refuses on Windows.
-  it.skipIf(process.platform === "win32")("completes short writes, in appends and in compaction, so a reload keeps every resolved mutation", async () => {
-    const real = fs.writeSync;
-    const spy = vi.spyOn(fs, "writeSync").mockImplementation(((fd: number, buffer: Buffer, offset?: number, length?: number) =>
-      real(fd, buffer, offset ?? 0, Math.min(length ?? buffer.length, 20))) as unknown as typeof fs.writeSync);
+  it.skipIf(process.platform === "win32")("keeps single-write appends while retrying short compaction and receipt writes across reload", async () => {
+    let ledger = await ledgerAt(dir(), 1);
+    const file = path.join(dir(), BRIDGE_NATS_LEDGER_FILE);
+    const ingress = toFile("receipt", MOVED, { operation: "ask" });
+    const claim = toNats("a"), { commandId } = claim;
+    const real = fs.writeSync, realOpen = fs.openSync;
+    const retryable = new Set<number>();
+    let appendWrites = 0, shortWrites = 0;
+    const openSpy = vi.spyOn(fs, "openSync").mockImplementation(((name: fs.PathLike, flags?: fs.OpenMode, mode?: fs.Mode) => {
+      const fd = realOpen(name, flags ?? "r", mode), opened = String(name);
+      retryable.delete(fd); // descriptors are reused, including when compaction reopens the append file
+      if (opened.startsWith(`${file}.compact-`) ||
+          (path.dirname(opened) === path.join(dir(), NATIVE_INGRESS_DIRECTORY) && opened.endsWith(".tmp"))) retryable.add(fd);
+      return fd;
+    }) as typeof fs.openSync);
+    const spy = vi.spyOn(fs, "writeSync").mockImplementation(((fd: number, buffer: Buffer, offset?: number, length?: number) => {
+      // Append must get one complete line; only unpublished staging files use writeAll's retry contract.
+      if (!retryable.has(fd)) {
+        appendWrites += 1;
+        return real(fd, buffer, offset ?? 0, length ?? buffer.length);
+      }
+      shortWrites += 1;
+      return real(fd, buffer, offset ?? 0, Math.min(length ?? buffer.length, 20));
+    }) as unknown as typeof fs.writeSync);
     try {
-      let ledger = await ledgerAt(dir(), 1);
-      const { commandId } = (await ledger.claim(toNats("a"))).record;
+      await ledger.claim(claim);
       await ledger.markUncertain(commandId);
       await ledger.markSent(commandId, {});
       await ledger.settle(commandId, ack(commandId));
       await ledger.markAckForwarded(commandId); // the fifth line triggers a compaction
-      expect(fs.readFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_FILE), "utf8").trim().split("\n")).toHaveLength(1);
-      await ledger.close();
-      ledger = await ledgerAt(dir(), 1);
-      expect(ledger.lookup("toNats", commandId)?.state).toBe("ackForwarded");
-      expect(ledger.lookupOriginal("toNats", LEAD, "a")?.commandId).toBe(commandId);
-    } finally { spy.mockRestore(); }
+      expect(appendWrites).toBe(5);
+      expect(shortWrites).toBeGreaterThan(1);
+      expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(1);
+      await ledger.claim({ ...ingress, resolvedBody: { version: 1, commandId: ingress.commandId, targetId: ingress.targetId,
+        operation: ingress.operation, replyTo: ingress.replyTo, message: "hello", requestedAt: T0, deadlineAt: ingress.deadlineAt } });
+      shortWrites = 0;
+      await ledger.projectNativeIngress(ingress.commandId, LINK);
+      expect(appendWrites).toBe(6);
+      expect(shortWrites).toBeGreaterThan(1);
+      expect(readNativeIngressReceipt(dir(), ingress.commandId)).toMatchObject({ commandId: ingress.commandId, operation: "ask" });
+    } finally { spy.mockRestore(); openSpy.mockRestore(); }
+    await ledger.close();
+    ledger = await ledgerAt(dir(), 1);
+    expect(ledger.lookup("toNats", commandId)?.state).toBe("ackForwarded");
+    expect(ledger.lookupOriginal("toNats", LEAD, "a")?.commandId).toBe(commandId);
+    expect(ledger.lookup("toFile", ingress.commandId)?.state).toBe("claimed");
+    expect(readNativeIngressReceipt(dir(), ingress.commandId)).toMatchObject({ commandId: ingress.commandId, operation: "ask" });
   });
 
   it.skipIf(process.platform !== "linux")("never treats a failed directory fsync as durable", async () => {

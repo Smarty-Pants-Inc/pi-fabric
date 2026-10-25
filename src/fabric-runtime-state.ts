@@ -20,6 +20,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FabricActivityStore } from "./activity/store.js";
 import { ActorDirectory, haltEvery } from "./actors/directory.js";
+import { snapshotNativeActorHandlers } from "./actors/native-handler.js";
+import { copyResidentNativeActorBindings } from "./residency/native-actors.js";
+import { createNativeActorIngress } from "./mesh/bridge-nats-ingress.js";
 import { ActorSlotRecoveryParkedError } from "./actors/slot-recovery.js";
 import type { ActorModelRouteInput } from "./actors/manager.js";
 import { resolvePiBinary } from "./agents/pi-binary.js";
@@ -1194,12 +1197,20 @@ export class FabricRuntimeState {
     // Capture this activation's directory: no control may claim/run before its epoch
     // commits, after failed renewal, or through a replacement generation's lease.
     const controlParticipants = participants;
+    // Capture only immutable declarations. Main never retains/exposes the registered
+    // callbacks as manager executors, nor imports their resident application module.
+    const nativeBindings = copyResidentNativeActorBindings({ rootId: mainAgentId, sessionId, mesh: meshConfig,
+      nativeActors: identity.kind === "main"
+        ? snapshotNativeActorHandlers(mainAgentId, "session").map(({ binding }) => binding) : [] });
+    if (nativeBindings.length && !ownsPersistentActorRegistry) throw new Error("Native actors require the owning persistent Main");
     const participantView = transport ? participants.participantView : undefined;
     if (transport && !participantView) throw new Error("Fabric NATS participant view unavailable");
     let controlInboxBound = false;
     this.#control = new FabricControlPlane(this.#mesh, identity, {
       ...(transport && participantView ? { transport, participants: participantView } : {}),
       ownerIncarnation: controlParticipants.ownerIncarnation,
+      nativeActorIngress: createNativeActorIngress({ bindings: nativeBindings,
+        isNativeActor: id => directoryActors?.isNativeActor(id) === true }),
       controlIncarnationFence: transport ? "enforce" : meshConfig.controlIncarnationFence,
       onUnfencedSenderWarning: message => {
         if (live.read(ctx => {
@@ -1584,6 +1595,7 @@ export class FabricRuntimeState {
       ownsPersistentActorRegistry
         ? {
             persistent: true,
+            nativeBindings,
             mainAgent,
             canManageActor,
             snapshotActorOwnership,
@@ -1611,6 +1623,7 @@ export class FabricRuntimeState {
           }
         : {
             persistent: false,
+            nativeBindings,
             mainAgent,
             canManageActor,
             snapshotActorOwnership,
@@ -1690,6 +1703,7 @@ export class FabricRuntimeState {
               process.env.PI_FABRIC_VEDA_BINARY ?? this.#config.agents.veda.binary,
             piModels: piModelState(),
             modelGuidance: [],
+            ...(nativeBindings.length ? { nativeActors: nativeBindings } : {}),
           },
           mesh: this.#mesh,
           participants: this.#participants,
@@ -1824,8 +1838,8 @@ export class FabricRuntimeState {
         leaseSignal.addEventListener("abort", retireInbox, { once: true });
         if (leaseSignal.aborted) { retireInbox(); leaseSignal.throwIfAborted(); }
       }
-      control.start((command, from, signal, verification) =>
-        agentsProvider.acceptControl(command, from, signal, verification));
+      control.start((command, from, signal, verification, nativeAdmission) =>
+        agentsProvider.acceptControl(command, from, signal, verification, nativeAdmission));
       controlInboxBound = !transport || !participants.transportLeaseSignal?.aborted;
     };
     if (!transport) bindControlInbox();
@@ -1852,6 +1866,9 @@ export class FabricRuntimeState {
     }
     this.#lifecycle.start();
     this.#residency?.start();
+    // Explicit native configuration is first use, not generic idle preloading.
+    // Its callback modules load only in the resident under its own fence/lease.
+    if (nativeBindings.length) await this.#residency!.ensureHost();
     await builtins.install(createProviderComponent({
       provider: "agents",
       description: "Agents, actors, lifecycle delivery, and residency control",

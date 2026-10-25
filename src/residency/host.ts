@@ -72,6 +72,9 @@ import {
   resolveFabricModelGuidance,
 } from "../components/model-guidance.js";
 import { ActorDirectory } from "../actors/directory.js";
+import type { NativeActorBinding, NativeActorRegistration } from "../actors/native-handler.js";
+import { createNativeActorIngress, type NativeControlAdmission } from "../mesh/bridge-nats-ingress.js";
+import { copyResidentNativeActorBindings, loadResidentNativeActorHandlers, residentNativeActorBindingsMatch, NativeResidentCustodyBusyError } from "./native-actors.js";
 import { slotAdmissionFor } from "../actors/slot-admission.js";
 import { ActorSlotRecoveryParkedError } from "../actors/slot-recovery.js";
 import { wakeResidentActors, assertResidentWakeWatch, ensureResidentWakeArchive, readWakeJson, residentWakeRequestPath, residentSleepingPath, ResidentWakeWatchError, subscribeResidentWakeWatchErrors, type ResidentWakeRoutes } from "./wake.js";
@@ -256,6 +259,7 @@ const validateResidentHostConfig = (value: unknown, configPath: string): Residen
     throw new Error("Fabric resident host config is outside its residency root");
   }
   if (!config.mesh.enabled) throw new Error("Durable residency requires the Fabric mesh");
+  if (config.nativeActors !== undefined) config.nativeActors = copyResidentNativeActorBindings(config as ResidentHostConfig);
   return config as ResidentHostConfig;
 };
 
@@ -382,6 +386,9 @@ export class ResidentHost {
   readonly #publications = new Set<Promise<unknown>>();
   #effectiveConfig: (() => ResidentHostConfig) | undefined;
   readonly #retention: ResidentHostConfig["retention"] & { retainRuns: boolean };
+  readonly #nativeBindings: readonly NativeActorBinding[];
+  #nativeCloseFailure: NativeResidentCustodyBusyError | undefined;
+  #nativeMaterializing = false;
 
   constructor(
     readonly config: ResidentHostConfig,
@@ -393,7 +400,9 @@ export class ResidentHost {
     readonly containment: AttemptContainment = failClosedContainment,
   ) {
     // NATS owns its snapshot; ordinary FILE constructor callers retain their behavior.
-    if (config.mesh.transport === "nats") this.config = structuredClone(config);
+    if (config.mesh.transport === "nats" || config.nativeActors !== undefined) this.config = structuredClone(config);
+    this.#nativeBindings = copyResidentNativeActorBindings(this.config);
+    if (config.nativeActors !== undefined) Object.defineProperty(this.config, "nativeActors", { value: this.#nativeBindings, enumerable: true, writable: false, configurable: false });
     this.#staged = !!launch?.attempt;
     this.#residentIdleExitMs = config.mesh.residentIdleExitMs ?? RESIDENT_IDLE_EXIT_MS;
     this.hostId = residentHostId(config.rootId);
@@ -524,7 +533,7 @@ export class ResidentHost {
           const topics = Array.isArray(row.topics) ? row.topics.filter((topic): topic is string => typeof topic === "string") : [];
           const slots = slotAdmissionFor(this.mesh);
           if (slots.requiresEnforcement(topics, known.root, config.rootId) &&
-              (!this.actors.slotRecoveryStatus().ready || !slots.isCurrent(record.id, topics, known.root))) return false;
+              (!this.actors || !this.actors.slotRecoveryStatus().ready || !slots.isCurrent(record.id, topics, known.root))) return false;
           return row.rootId === config.rootId && (row.residency ?? "session") === "durable" &&
             record.actorOwnershipToken === JSON.stringify([row.rootId, row.adoptedAt ?? null, row.adoptedFrom ?? []]);
         }
@@ -547,7 +556,7 @@ export class ResidentHost {
       // registry acquisition. FIFO waiting gets us into periodic free windows. A state
       // fence, so it waits on whichever lock the state backend commits under (R3).
       waitForPublicationRetry: () => withStateFence(this.mesh, this.identity, () => undefined),
-      publicationBatch: full => this.actors.presenceBatch(full),
+      publicationBatch: full => this.actors?.presenceBatch(full) ?? { ops: [], committed() {}, actorIds: [] },
       hostId: this.hostId,
       rootId: config.rootId,
       identity: this.identity,
@@ -561,12 +570,14 @@ export class ResidentHost {
       },
     });
     const participants = this.participants;
-    const initializeNative = (): void => {
+    const initializeNative = (nativeHandlers: readonly NativeActorRegistration[] = []): void => {
     const participantView = transport ? participants.participantView : undefined;
     if (transport && !participantView) throw new Error("Fabric NATS participant view unavailable");
     this.control = new FabricControlPlane(this.mesh, this.identity, {
       ...(transport && participantView ? { transport, participants: participantView } : {}),
       ownerIncarnation: participants.ownerIncarnation,
+      nativeActorIngress: createNativeActorIngress({ bindings: this.#nativeBindings,
+        isNativeActor: id => this.actors?.isNativeActor(id) === true }),
       controlIncarnationFence: transport ? "enforce" : config.mesh.controlIncarnationFence,
       enabled: true,
       hostId: this.hostId,
@@ -602,7 +613,8 @@ export class ResidentHost {
       // optional policy is an explicit revocation, not permission to fall back
       // to the constructor's startup policy.
       return desired?.fabricExtensionPath === config.fabricExtensionPath && desired.workerPath === config.workerPath &&
-        desired.rootId === config.rootId && desired.sessionId === config.sessionId ? desired : config;
+        desired.rootId === config.rootId && desired.sessionId === config.sessionId &&
+        residentNativeActorBindingsMatch(desired as ResidentHostConfig, config) ? desired : config;
     };
     const currentModelRouting = (): ResidentHostConfig["agents"]["modelRouting"] => {
       const overlay = currentConfig();
@@ -822,7 +834,13 @@ export class ResidentHost {
       {
         // Restoration must not launch queued work until owner and readiness publication commit.
         releasePaused: true,
+        nativeBindings: this.#nativeBindings,
+        nativeHandlers,
         canConsumeMesh: () => this.#ready && (transport ? participants : this.participants).canConsumeMesh(),
+        // ONLY ensureNativeActor may consult this trusted birth precondition. All
+        // source/ask/drain/control admission retains the ordinary readiness gate.
+        canMaterializeNative: () => this.#nativeMaterializing && !this.#ready && !this.#closed &&
+          this.#holdsRoot() && (transport ? participants : this.participants).canConsumeMesh(),
         presencePublisher: { refresh: async () => {
           try {
             await (transport ? participants : this.participants).refreshPresence();
@@ -903,6 +921,20 @@ export class ResidentHost {
         initializeNative();
       });
     }
+    if (this.#nativeBindings.length) {
+      // A configured native owner acquires/renews its real FILE lease before module evaluation.
+      // Publication callbacks above are empty until the managers exist; no business ingress is open.
+      return participants.start().then(async () => {
+        const assertCustody = (): void => {
+          if (this.#closed || !this.#holdsRoot() || !participants.canConsumeMesh()) {
+            throw new Error("Native resident lost OWNER custody or its live directory lease");
+          }
+        };
+        assertCustody();
+        const nativeHandlers = await loadResidentNativeActorHandlers(this.#nativeBindings, assertCustody);
+        initializeNative(nativeHandlers);
+      });
+    }
     initializeNative();
   }
 
@@ -944,7 +976,16 @@ export class ResidentHost {
       if (this.config.mesh.transport === "nats") {
         const transportStateDir = await this.#prepareNatsTransport();
         await this.#initialize(transportStateDir);
-      } else this.#initialize();
+      } else await this.#initialize();
+      this.#nativeMaterializing = this.#nativeBindings.length > 0;
+      try {
+        // releasePaused still holds all drains; control/lifecycle have not started.
+        for (const binding of this.#nativeBindings) {
+          if (!this.#holdsRoot() || !this.participants.canConsumeMesh()) throw new Error("Native resident custody lost before actor birth");
+          await this.actors.ensureNativeActor(binding);
+          if (!this.#holdsRoot() || !this.participants.canConsumeMesh()) throw new Error("Native resident custody lost during actor birth");
+        }
+      } finally { this.#nativeMaterializing = false; }
       // Both actor scopes must reconcile durable intents before any actor source,
       // control ingress, readiness receipt, or release resume can become visible.
       try { await this.actors.recoverProtectedActors(); }
@@ -997,8 +1038,8 @@ export class ResidentHost {
         this.#wakeWatchNeedsReprobe = true;
         this.#scheduleIdleCheck();
       });
-      if (!this.#transport) this.control.start((command, from, signal, verification) =>
-        this.#acceptControl(command, from, signal, verification));
+      if (!this.#transport) this.control.start((command, from, signal, verification, nativeAdmission) =>
+        this.#acceptControl(command, from, signal, verification, nativeAdmission));
       if (this.#staged) (this.control as unknown as ResidentDrainIngress).pause(true);
       if (this.#transport) {
         // Managers, native actor recovery, and sources exist before publication.
@@ -1058,6 +1099,7 @@ export class ResidentHost {
         commands: RESIDENT_COMMANDS,
         requestFence: 1,
         callerBoundSpawn: 1,
+        ...(this.#nativeBindings.length ? { nativeActors: this.#nativeBindings } : {}),
         requestExpiry: 1,
         creationIdempotency: 1,
         queuedWork: 1,
@@ -1099,7 +1141,7 @@ export class ResidentHost {
         if (!this.participants.canConsumeMesh()) throw new Error("Fabric NATS owner lease retired before inbox binding");
         // One initial start, not a resume after lease loss. The loss listener was
         // installed before readiness; a staged host retains its existing pause.
-        this.control.start((command, from, signal, verification) => this.#acceptControl(command, from, signal, verification));
+        this.control.start((command, from, signal, verification, nativeAdmission) => this.#acceptControl(command, from, signal, verification, nativeAdmission));
         this.#controlInboxBound = !leaseSignal.aborted;
         leaseSignal.throwIfAborted();
       }
@@ -1200,7 +1242,11 @@ export class ResidentHost {
   }
 
   async close(): Promise<void> {
-    if (!this.#started || (this.#closed && !this.#closePending)) return;
+    if (this.#nativeCloseFailure) {
+      if (this.actors.inFlightActorIds().some(id => this.actors.isNativeActor(id))) throw this.#nativeCloseFailure;
+      this.#nativeCloseFailure = undefined; // A fresh close may release only AFTER actual settlement.
+    }
+    if (!this.#started || (this.#closed && !this.#closePending && this.#lockFd === undefined)) return;
     this.#closePending ??= this.#closeWithTransport().finally(() => { this.#closePending = undefined; });
     return this.#closePending;
   }
@@ -1262,6 +1308,19 @@ export class ResidentHost {
     // Observed below by closeWithActors, but only after further awaits: a rejection
     // before then must not become an unhandled rejection that kills the host (pi-fabric#577).
     void actorsClosed?.catch(() => undefined);
+    // Observe the actual actor close before any owner/lease withdrawal. A timeout/abort
+    // is not settlement of a non-cooperative native callback. Keep this live process's
+    // fence on that failed close; only actual settlement or confirmed termination releases it.
+    if (this.#nativeBindings.length) {
+      try { await actorsClosed; }
+      catch (error) {
+        if (this.actors?.inFlightActorIds().some(id => this.actors.isNativeActor(id))) {
+          this.#nativeCloseFailure = new NativeResidentCustodyBusyError({ cause: error });
+          throw this.#nativeCloseFailure;
+        }
+        // Ordinary actor teardown retains its existing all-steps cleanup below.
+      }
+    }
     // Retire an eligibility/probe already in flight before releasing host custody.
     await this.#idleCheckPending?.catch(() => undefined);
     while (this.#pollingRequests || this.#admissions) await delay(10);
@@ -1295,6 +1354,7 @@ export class ResidentHost {
     from: MeshIdentity,
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
+    nativeAdmission?: NativeControlAdmission,
   ): Promise<FabricControlAcceptance> {
     if (this.#closed || this.#idleExitRequested || this.#staged || this.#handover || this.#drain) {
       return { accepted: false, error: HOST_CLOSING_RETRY };
@@ -1303,11 +1363,11 @@ export class ResidentHost {
     this.#idleSince = undefined;
     this.#admissions++;
     this.#businessAdmissions++;
-    try { return await this.#handleControl(command, from, signal, verification); }
+    try { return await this.#handleControl(command, from, signal, verification, nativeAdmission); }
     finally { this.#admissions--; this.#scheduleIdleCheck(); }
   }
 
-  async #handleControl(command: FabricControlCommand, from: MeshIdentity, signal?: AbortSignal, verification?: "mesh" | "bridge"): Promise<FabricControlAcceptance> {
+  async #handleControl(command: FabricControlCommand, from: MeshIdentity, signal?: AbortSignal, verification?: "mesh" | "bridge", nativeAdmission?: NativeControlAdmission): Promise<FabricControlAcceptance> {
     if (command.operation === "setModel" || command.operation === "setThinking") {
       return { accepted: false, error: "remote Main model changes are not supported yet; see smarty-dev#4153" };
     }
@@ -1355,20 +1415,38 @@ export class ResidentHost {
     }
     const provenance = from && (verification === "mesh" || verification === "bridge")
       ? fabricTurnProvenance(from, command.operation === "steer" ? "steer" : "followUp", verification, command.principal) : undefined;
-    const message = command.message?.trim();
-    if (!message) return { accepted: false, error: "Fabric control message must not be empty" };
+    const native = this.actors.isNativeActor(command.targetId);
+    if (native && command.operation !== "ask") return { accepted: false, error: "Native actors accept only admitted asks" };
+    const message = native ? command.message : command.message?.trim();
+    if (typeof message !== "string" || (!native && !message)) return { accepted: false, error: "Fabric control message must not be empty" };
     if (command.operation === "ask") {
       try {
+        if (native && !nativeAdmission) throw new Error("Native actor ask requires authenticated bridge admission");
+        if (native && (command.binding !== undefined ||
+            ["model", "thinking", "modelReason", "routeClass", "runner", "execution"].some(key => Object.hasOwn(command, key)))) {
+          throw new Error("Native actors do not support model/thinking overrides");
+        }
         if (!this.actors.owns(command.targetId)) {
           return { accepted: false, error: `Resident host does not own ${command.targetId}` };
+        }
+        // Run the same owner-default provenance validation as generic asks. Native
+        // calls must not receive helper-synthesized empty foreign binding views.
+        const bindingOptions = controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
+          this.participants.get(from.id, undefined, { fresh: true })?.rootId);
+        if (native) {
+          if ((bindingOptions.binding && Object.keys(bindingOptions.binding).length) ||
+              (bindingOptions.overrides && Object.keys(bindingOptions.overrides).length)) {
+            throw new Error("Native actors do not support model/thinking overrides");
+          }
+          delete bindingOptions.binding;
+          delete bindingOptions.overrides;
         }
         const result = await this.actors.ask(
           command.targetId,
           message,
           command.data,
           signal,
-          { provenance, ...controlActorBindingOptions(command, from, this.actors.status(command.targetId).rootId,
-            this.participants.get(from.id, undefined, { fresh: true })?.rootId), sender: command.sender ?? null },
+          { provenance, ...bindingOptions, ...(nativeAdmission ? { nativeAdmission } : {}), sender: command.sender ?? null },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {

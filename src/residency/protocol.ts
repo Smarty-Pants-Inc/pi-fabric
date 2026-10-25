@@ -1,4 +1,5 @@
 import type { TaskReturnAddress } from "../agents/task-return-address.js";
+import type { NativeActorBinding } from "../actors/native-handler.js";
 import type { slotAdmissionFor } from "../actors/slot-admission.js";
 import type { FabricParticipantInfo } from "../topology/types.js";
 import type { FabricPrincipal, FabricWakeCause } from "../fabric-provenance.js";
@@ -413,6 +414,8 @@ export interface ResidentHostConfig {
   vedaBinary: string;
   piModels?: ResidentPiModelState;
   modelGuidance?: FabricOwnedModelGuidance[];
+  /** Host-pinned, serializable declarations. Only the resident loads their callbacks. */
+  nativeActors?: readonly NativeActorBinding[];
 }
 
 export interface ResidentHostOwner {
@@ -436,6 +439,8 @@ export interface ResidentHostOwner {
   requestFence?: 1;
   /** Loaded executor validates and applies a trusted per-launch caller return address. */
   callerBoundSpawn?: 1;
+  /** Actual loaded declarations, not desired config.json; absence cannot attest native support. */
+  nativeActors?: readonly NativeActorBinding[];
   /** Generation format 3 with durable expiry; absent on older fenced hosts. */
   requestExpiry?: 1;
   /** Operation-scoped retry keys implemented by this loaded host, not desired config. */

@@ -100,7 +100,8 @@ const viewsFor = (machineOf: (id: string) => string | undefined, fileNative: str
 const onV2 = (id: string): string | undefined => id === LEAD || id === OTHER ? V2 : undefined;
 
 async function run(messages: FakeMessage[], options: { store?: FakeStore; ledger?: ReturnType<typeof ledger>;
-  rate?: NatsRepublishRate; topics?: string[]; machineOf?: (id: string) => string | undefined; fileNative?: string[] } = {}) {
+  rate?: NatsRepublishRate; topics?: string[]; machineOf?: (id: string) => string | undefined; fileNative?: string[];
+  recipientAllowed?: (to: string) => boolean } = {}) {
   const store = options.store ?? new FakeStore();
   const counted: string[] = [];
   const machineOf = options.machineOf ?? onV2;
@@ -115,6 +116,7 @@ async function run(messages: FakeMessage[], options: { store?: FakeStore; ledger
     resolve: id => { const machine = machineOf(id); return machine ? resolved(id, machine) : undefined; },
     ...(options.ledger ? { ledger: options.ledger } : {}),
     ...(options.rate ? { rate: options.rate } : {}), ...(options.topics ? { topics: options.topics } : {}), now: () => 1_000,
+    ...(options.recipientAllowed ? { recipientAllowed: options.recipientAllowed } : {}),
   }, new AbortController().signal);
   await leg.done;
   return { store, counters: leg.counters(), counted };
@@ -183,6 +185,26 @@ describe("N4 republish: v2 work topics into the hub file mesh", () => {
     expect(second.counters.refused).toEqual({ BRIDGE_NATS_SENDER_UNVERIFIED: 1 });
     expect(third.counters.refused).toEqual({ BRIDGE_NATS_NOT_A_WORK_TOPIC: 1 });
     expect(fourth.counters.refused).toEqual({ BRIDGE_NATS_AMBIGUOUS: 1 });
+  });
+
+  it("keeps an addressed event's recipient only for the hub factory or a file-side allow-listed identity (pass P3)", async () => {
+    const FILE_ROOT = "session:44444444-4444-4444-8444-444444444444";
+    const HUB_OTHER = "session:55555555-5555-4555-8555-555555555555";
+    const factory = eventMessage("fleet.work.a.1", {}, { msgId: "r-1" });
+    const listed = eventMessage("fleet.work.a.2", { to: FILE_ROOT }, { msgId: "r-2" });
+    const other = eventMessage("fleet.work.a.3", { to: HUB_OTHER }, { msgId: "r-3" });
+    const topicOnly = eventMessage("fleet.work.a.4", { to: undefined }, { msgId: "r-4" });
+    const { store, counters, counted } = await run([factory, listed, other, topicOnly], { recipientAllowed: to => to === FILE_ROOT });
+    expect(store.inputs.map(input => input.to)).toEqual(["factory", FILE_ROOT, undefined]);
+    expect(store.inputs[2]).not.toHaveProperty("to");
+    expect(other.calls).toEqual([expect.stringMatching(/^term:/)]);
+    expect(counters.refused).toEqual({ BRIDGE_NATS_NOT_ALLOWED: 1 });
+    expect(counted).toEqual(["republish.accepted", "republish.accepted", "republish.refused", "republish.accepted"]);
+    // Without the link's allow.file check no participant is a recipient (fail closed); the factory still is.
+    const closed = await run([eventMessage("fleet.work.a.5", { to: FILE_ROOT }, { msgId: "r-5" }),
+      eventMessage("fleet.work.a.6", {}, { msgId: "r-6" })]);
+    expect(closed.store.inputs.map(input => input.to)).toEqual(["factory"]);
+    expect(closed.counters.refused).toEqual({ BRIDGE_NATS_NOT_ALLOWED: 1 });
   });
 
   it("retries (never refuses) while a side's presence is unknown", async () => {

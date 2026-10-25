@@ -80,17 +80,30 @@ describe.skipIf(!binary || process.platform !== "linux" || !n4)("A' N4: v2 fleet
     expect(hubCopies(during)).toHaveLength(1);
   }, E2E_WAIT_MS * 5);
 
-  it("no loop: a republished event addressed to a v2 root is never carried back to NATS as a followUp", async () => {
+  it("no loop: an event addressed to a v2 root never enters the hub, so it is never carried back to NATS", async () => {
     const token = `V2_LANE_TO_V2_${randomUUID()}`;
     const peer = h.natsPeer!;
-    // fleet.work.lanes addressed to another v2 root: N4 may republish it into the hub, but N3 must not send it back.
+    // fleet.work.lanes addressed to another v2 root: no file-side recipient, so N4 refuses it (pass P3), and N3
+    // has nothing to send back.
     await publishFrom(h.natsMain, "fleet.work.lanes", "report", peer.id, token);
-    await waitForValue(() => hubCopies(token).length ? true : undefined, () => `republished into the hub\n${linkTail(h)}`, E2E_WAIT_MS);
     await barrier();
-    expect(hubCopies(token)).toHaveLength(1);
+    expect(hubCopies(token)).toEqual([]);
     expect(peer.delivered().filter((row) => row.text.includes(token))).toEqual([]);
     expect(h.natsMain.delivered().filter((row) => row.text.includes(token))).toEqual([]);
     expect(h.faults.publishedWith(token)).toEqual([]); // the link never published it into any NATS inbox
+  }, E2E_WAIT_MS * 3);
+
+  it("an addressed event keeps its recipient only for a file-side allow-listed root; any other hub participant is refused", async () => {
+    const listed = `V2_TO_HUB_ROOT_${randomUUID()}`, offList = `V2_TO_OFF_LIST_${randomUUID()}`;
+    // The pass's P3: the NATS event's `to` must never let a v2 Main address an arbitrary hub participant.
+    await publishFrom(h.natsMain, "fleet.work.lanes", "report", h.fileMain.id, listed);
+    await publishFrom(h.natsMain, "fleet.work.lanes", "report", `session:${randomUUID()}`, offList);
+    const copy = await waitForValue(() => hubCopies(listed)[0], () => `addressed republish into the hub\n${linkTail(h)}`, E2E_WAIT_MS);
+    expect(copy).toMatchObject({ topic: "fleet.work.lanes", kind: "report", to: h.fileMain.id, from: { id: link().id } });
+    await barrier();
+    expect(hubCopies(listed)).toHaveLength(1);
+    expect(hubCopies(offList)).toEqual([]);
+    expect(h.linkLog.some((line) => line.includes("BRIDGE_NATS_NOT_ALLOWED") && line.includes("fleet.work.lanes"))).toBe(true);
   }, E2E_WAIT_MS * 3);
 
   it("never crosses: a topic outside republishTopics, a sender without republishTopics, and a forged sender", async () => {

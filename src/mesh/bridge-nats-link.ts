@@ -329,7 +329,9 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     // N4 (PR 2, lane L1): with nats.events, v2 work topics are republished into this file mesh, decided by
     // L3's gate (verifyEventSender + allowRepublish) on both sides' presence. A missing consume grant
     // refuses the start here, before MeshBridge links anything.
+    // An addressed v2 event keeps its `to` only for the hub factory or a file-side allow-listed root or actor.
     republish = await startNatsRepublishLink(config, { store, port, gate, ledger: opened, signal, log, counters: openedCounters,
+      recipientAllowed: natsLinkFileTargetAllowed(allow, () => remote!.filePresence.view()),
       views: { refresh: () => remote!.filePresence.refresh(), nats: () => openedPort.presenceView(),
         file: () => remote!.filePresence.view() } });
     await bridge.startWithBackoff();

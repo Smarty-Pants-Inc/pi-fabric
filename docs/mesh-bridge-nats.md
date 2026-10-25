@@ -64,6 +64,9 @@ see a hub event.
   is weaker than for a control command: such an identity carries no control or topic-route authority.
 - The republished event is authored as `bridge:<link>`. The claimed sender is attribution only, recorded
   beside the link stamp, never the event's `from`.
+- An addressed event keeps its `to` only when that is the hub factory (`factory`) or an `allow.file` root
+  or actor; any other addressed event is refused (`BRIDGE_NATS_NOT_ALLOWED`), so a v2 Main cannot address
+  an arbitrary hub participant. An unaddressed event crosses as it is.
 - Exactly once by the stream sequence and the ledger: a redelivery after a crash is recognized and
   appended once. The stream message is acknowledged only after the durable file append.
 - No loops: an event that already crossed a bridge (`data.bridge`), or that claims an identity the link

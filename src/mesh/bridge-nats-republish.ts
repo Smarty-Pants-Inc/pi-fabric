@@ -10,6 +10,10 @@
 //   needs the topic in that entry's `republishTopics` (default none). The events leg checks the KV view
 //   first as well. The file event is authored as the gate's `author` (the link, `bridge:<link>`); the
 //   gate's verified sender (from KV presence, never the body) is kept in `data.bridge.sender`.
+// - Recipient: an addressed event keeps its `to` only when that names the hub's factory or a file-side
+//   allow-listed root or actor (`recipientAllowed`); any other addressed event is refused
+//   (BRIDGE_NATS_NOT_ALLOWED), so a v2 Main can never address an arbitrary hub participant through the
+//   link. An unaddressed (topic-only) event crosses as it is.
 // - Stamp: `data.bridge = { from: <link>, id: <NATS message id>, sender }`, the file bridge's own
 //   convention, so no bridge ever forwards it again; an event that already carries a stamp, or that
 //   claims one of this link's mirrors, is refused by the events leg (no loops).
@@ -30,11 +34,11 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import { openNatsConnection, type NatsConnectionHandle } from "../transport/nats/connection.js";
 import { natsEventsStreamName } from "../transport/nats/provision.js";
 import type { MeshEvent, MeshIdentity, MeshPublishInput } from "./event-log.js";
-import type {
-  BridgeNatsPort, BridgeNatsPortResolved, BridgeNatsPresenceView, BridgeNatsRepublishDecision, BridgeNatsRepublishRequest,
-  BridgeNatsVerified, BridgeNatsVerifiedIdentity,
+import {
+  BRIDGE_NATS_REFUSAL, type BridgeNatsPort, type BridgeNatsPortResolved, type BridgeNatsPresenceView, type BridgeNatsRepublishDecision,
+  type BridgeNatsRepublishRequest, type BridgeNatsVerified, type BridgeNatsVerifiedIdentity,
 } from "./bridge-nats-types.js";
-import { isWorkTopic } from "./bridge-topics.js";
+import { HUB_FACTORY_RECIPIENT, isWorkTopic } from "./bridge-topics.js";
 import { ensureNatsBridgeEventConsumer, natsBridgeEventsDurable, natsBridgeEventSource, runNatsBridgeEvents,
   type NatsBridgeEventDelivery, type NatsBridgeEventDisposition, type NatsBridgeEventRefusal, type NatsBridgeEventSource,
 } from "./bridge-nats-events.js";
@@ -111,6 +115,11 @@ export interface NatsRepublishOptions {
   /** L3's gate: the only sender and topic decision. */
   readonly gate: NatsRepublishGate;
   readonly views: NatsRepublishViews;
+  /**
+   * Whether an addressed event may keep its `to` in the file mesh: a file-side allow-listed root or actor
+   * (the link passes its allow.file check). The hub factory is always a recipient; absent, no participant is.
+   */
+  readonly recipientAllowed?: (to: string) => boolean;
   /** L3's ledger, for the seen skip (the keyed append alone already guarantees one append). */
   readonly ledger?: {
     seen(direction: "toFile", eventId: string): unknown;
@@ -199,6 +208,16 @@ export const runNatsRepublish = (options: NatsRepublishOptions, signal: AbortSig
       }
       return refuse(decision.refuse);
     }
+    // An addressed event reaches only the hub factory or a file-side allow-listed identity, never any hub participant.
+    if (typeof event.to === "string" && event.to !== HUB_FACTORY_RECIPIENT && options.recipientAllowed?.(event.to) !== true) {
+      const key = `${event.from.id}\0${event.topic}\0to\0${event.to}`;
+      if (!reported.has(key) && reported.size < 1_000) {
+        reported.add(key);
+        options.log?.(`nats republish: refused ${event.topic} from ${event.from.id} to ${event.to}: ${BRIDGE_NATS_REFUSAL.notAllowed} ` +
+          "(not the hub factory or a file-side allow-listed root or actor)");
+      }
+      return refuse(BRIDGE_NATS_REFUSAL.notAllowed);
+    }
     const id = seenId(options.link, messageId);
     if (options.ledger?.seen("toFile", id)) { counters.duplicates += 1; count("republish.duplicate"); return "accepted"; }
     const input = natsRepublishInput(options.link, delivery, decision);
@@ -277,6 +296,7 @@ export const startNatsRepublishLink = async (config: NatsRepublishLinkConfig, op
   readonly port: Pick<BridgeNatsPort, "resolve" | "machine">;
   readonly gate: NatsRepublishGate;
   readonly views: NatsRepublishViews;
+  readonly recipientAllowed?: NatsRepublishOptions["recipientAllowed"];
   readonly ledger?: NatsRepublishOptions["ledger"];
   readonly signal: AbortSignal;
   readonly log: (line: string) => void;
@@ -322,6 +342,7 @@ export const startNatsRepublishLink = async (config: NatsRepublishLinkConfig, op
     link: config.link, org, machine: options.port.machine, store: options.store,
     source: natsBridgeEventSource(connection, sourceOptions),
     resolve: id => options.port.resolve(id), gate: options.gate, views: options.views,
+    ...(options.recipientAllowed ? { recipientAllowed: options.recipientAllowed } : {}),
     ...(options.ledger ? { ledger: options.ledger } : {}), log: options.log,
     onError: error => options.log(`nats republish: ${error instanceof Error ? error.message : String(error)}`),
     ...(options.counters ? { counters: options.counters } : {}),

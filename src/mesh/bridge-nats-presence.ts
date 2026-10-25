@@ -71,6 +71,17 @@ const errorCode = (error: unknown): unknown =>
 const isConflict = (error: unknown): boolean => errorCode(error) === "FABRIC_KV_CONFLICT";
 const isUncertain = (error: unknown): boolean => errorCode(error) === "FABRIC_TRANSPORT_UNCERTAIN";
 const isUnavailable = (error: unknown): boolean => errorCode(error) === "FABRIC_TRANSPORT_UNAVAILABLE";
+/** Refusals a retry cannot fix: the credential lost its grant, or the bucket is not the expected one. */
+const isTerminalWatchError = (error: unknown): boolean => {
+  for (let depth = 0, cause = error; depth < 6 && typeof cause === "object" && cause !== null; depth++) {
+    const code = errorCode(cause);
+    const name = (cause as { name?: unknown }).name;
+    if (code === "FABRIC_TRANSPORT_DENIED" || code === "FABRIC_TRANSPORT_INVALID" || code === "FABRIC_NATS_AUTHORIZATION" ||
+      name === "NatsAuthorizationError" || name === "PermissionViolationError" || name === "AuthorizationError") return true;
+    cause = (cause as { cause?: unknown }).cause;
+  }
+  return false;
+};
 
 const canonicalJson = (value: unknown): string => JSON.stringify(value, (_key, child: unknown) => {
   if (typeof child !== "object" || child === null || Array.isArray(child)) return child;
@@ -159,11 +170,15 @@ export class NatsPresenceReader {
   readonly machine: string;
   readonly #presence: TransportKv;
   readonly #leases: TransportKv;
-  readonly #records = new Map<string, Seen<FabricParticipantRecord>>();
-  readonly #hosts = new Map<string, Seen<FabricKvHostLease>>();
+  #records = new Map<string, Seen<FabricParticipantRecord>>();
+  #hosts = new Map<string, Seen<FabricKvHostLease>>();
   readonly #revisions: Record<Bucket, Map<string, number>> = { presence: new Map(), leases: new Map() };
+  /** A watch gap (reconnect) re-snapshots into these; the served view switches only at the new `ready`. */
+  readonly #resync: Partial<Record<Bucket, { entries: Map<string, Seen<never>>; revisions: Map<string, number> }>> = {};
   readonly #ready = new Set<Bucket>();
   readonly #listeners = new Set<NatsPresenceListener>();
+  readonly #failureListeners = new Set<(error: Error) => void>();
+  #failure: Error | undefined;
   readonly #readyWaiters = new Set<() => void>();
   readonly #abort = new AbortController();
   readonly #tasks: Promise<void>[] = [];
@@ -193,6 +208,9 @@ export class NatsPresenceReader {
 
   get ready(): boolean { return this.#started && !this.#closed && this.#ready.size === 2; }
 
+  /** A reconnect gap is open: the served view is the last snapshot, and absence in it proves nothing. */
+  get resyncing(): boolean { return this.#resync.presence !== undefined || this.#resync.leases !== undefined; }
+
   /** Resolves once both snapshots are ready; rejects on close or abort. */
   whenReady(signal?: AbortSignal): Promise<void> {
     if (this.ready) return Promise.resolve();
@@ -210,6 +228,24 @@ export class NatsPresenceReader {
       this.#abort.signal.addEventListener("abort", abort, { once: true });
       if (signal?.aborted || this.#abort.signal.aborted) abort();
     });
+  }
+
+  /** A terminal watch refusal (denied credential, invalid bucket), reported once per reader. */
+  subscribeFailure(listener: (error: Error) => void): () => void {
+    if (this.#failure) {
+      const failure = this.#failure;
+      queueMicrotask(() => { try { listener(failure); } catch (error) { this.#report(error); } });
+    }
+    this.#failureListeners.add(listener);
+    return () => { this.#failureListeners.delete(listener); };
+  }
+
+  #fail(error: unknown): void {
+    if (this.#failure) return;
+    this.#failure = error instanceof Error ? error : new Error("NATS bridge presence watch refused", { cause: error });
+    for (const listener of [...this.#failureListeners]) {
+      try { listener(this.#failure); } catch (failure) { this.#report(failure); }
+    }
   }
 
   subscribe(listener: NatsPresenceListener): () => void {
@@ -293,6 +329,7 @@ export class NatsPresenceReader {
 
   #clear(bucket: Bucket): void {
     this.#ready.delete(bucket);
+    delete this.#resync[bucket];
     this.#revisions[bucket].clear();
     if (bucket === "presence") this.#records.clear(); else this.#hosts.clear();
   }
@@ -306,11 +343,20 @@ export class NatsPresenceReader {
         for await (const event of kv.watch<unknown>(">", this.#abort.signal)) {
           if (this.#closed) return;
           if (event.type === "reset") {
-            this.#clear(bucket);
-            this.#notify(bucket);
+            // A reconnect gap: keep serving the last snapshot (each lease still ages out by its own
+            // receipt time) while the new one loads, so a short outage never reads as "everyone left".
+            if (this.#ready.has(bucket)) this.#resync[bucket] = { entries: new Map(), revisions: new Map() };
+            else { this.#clear(bucket); this.#notify(bucket); }
             continue;
           }
           if (event.type === "ready") {
+            const resync = this.#resync[bucket];
+            if (resync) {
+              delete this.#resync[bucket];
+              if (bucket === "presence") this.#records = resync.entries as Map<string, Seen<FabricParticipantRecord>>;
+              else this.#hosts = resync.entries as Map<string, Seen<FabricKvHostLease>>;
+              this.#revisions[bucket] = resync.revisions;
+            }
             this.#ready.add(bucket);
             attempt = 0;
             this.#notify(bucket);
@@ -320,19 +366,23 @@ export class NatsPresenceReader {
           const revision = event.type === "put" ? event.entry.revision : event.revision;
           const machine = machineOfKey(key, kind);
           if (!machine || !Number.isSafeInteger(revision) || revision <= 0) continue;
-          if (revision <= (this.#revisions[bucket].get(key) ?? 0)) continue;
-          this.#revisions[bucket].set(key, revision);
+          const resync = this.#resync[bucket];
+          const revisions = resync?.revisions ?? this.#revisions[bucket];
+          if (revision <= (revisions.get(key) ?? 0)) continue;
+          revisions.set(key, revision);
           const receivedAt = this.#monotonic();
           if (bucket === "presence") {
-            this.#records.delete(key);
+            const target = (resync?.entries ?? this.#records) as Map<string, Seen<FabricParticipantRecord>>;
+            target.delete(key);
             const record = event.type === "put" ? presenceValue(event.entry) : undefined;
-            if (record && event.type === "put") this.#records.set(key, { entry: { ...event.entry, value: cloneFrozen(record) }, receivedAt });
+            if (record && event.type === "put") target.set(key, { entry: { ...event.entry, value: cloneFrozen(record) }, receivedAt });
           } else {
-            this.#hosts.delete(key);
+            const target = (resync?.entries ?? this.#hosts) as Map<string, Seen<FabricKvHostLease>>;
+            target.delete(key);
             const lease = event.type === "put" ? leaseValue(event.entry) : undefined;
-            if (lease && event.type === "put") this.#hosts.set(key, { entry: { ...event.entry, value: cloneFrozen(lease) }, receivedAt });
+            if (lease && event.type === "put") target.set(key, { entry: { ...event.entry, value: cloneFrozen(lease) }, receivedAt });
           }
-          this.#notify(bucket, machine);
+          if (!resync) this.#notify(bucket, machine);
         }
         if (this.#closed) return;
         throw new Error(`NATS bridge ${bucket} watch ended`);
@@ -342,6 +392,7 @@ export class NatsPresenceReader {
         this.#clear(bucket);
         this.#notify(bucket);
         if (!isUnavailable(error)) this.#report(error);
+        if (isTerminalWatchError(error)) this.#fail(error);
         const delayMs = Math.min(5_000, 100 * 2 ** Math.min(attempt, 6));
         attempt += 1;
         await new Promise<void>(resolve => {
@@ -493,13 +544,19 @@ export class NatsKvMirror {
    * Whether this link holds a routable row for the id now: its lease is ours, matches the row's
    * incarnation, was confirmed within one TTL less the safety margin, and a claim is unexpired.
    */
-  holds(id: string): boolean {
-    if (typeof id !== "string" || id.length === 0) return false;
+  holds(id: string): boolean { return this.holdState(id) === "live"; }
+
+  /**
+   * live: routable now. renewing: still claimed and its lease is ours, but no lease write was
+   * confirmed within the window (a broker outage): retry, do not refuse. absent: not this link's.
+   */
+  holdState(id: string): "live" | "renewing" | "absent" {
+    if (typeof id !== "string" || id.length === 0) return "absent";
     const row = this.#rows.get(natsPresenceKey(this.machine, id));
     const lease = row && this.#owned.get(natsLeaseKey(this.machine, row.record.ownerHostId));
     const now = this.#monotonic();
-    return !!row && !!lease && sameSpec(lease.spec, specOf(row.record)) &&
-      now - lease.writtenAt < KV_LEASE_TTL_MS - TRANSPORT_HOST_LEASE_SAFETY_MS && [...row.claims.values()].some(until => until > now);
+    if (!row || !lease || !sameSpec(lease.spec, specOf(row.record)) || ![...row.claims.values()].some(until => until > now)) return "absent";
+    return now - lease.writtenAt < KV_LEASE_TTL_MS - TRANSPORT_HOST_LEASE_SAFETY_MS ? "live" : "renewing";
   }
 
   /** The rows this link has written, with whether each is routable now. */
@@ -603,6 +660,9 @@ export class NatsKvMirror {
       !sameSpec({ id: lease.id, rootId: lease.rootId, identityId: lease.identityId, incarnation: lease.incarnation }, spec)) return false;
     const proof = this.#processProof();
     if (lease.pid === proof.pid && lease.pidStartTime === proof.pidStartTime && lease.bootId === proof.bootId) return true;
+    // Exit evidence is local: only a predecessor on this same boot can be proved gone. Another boot
+    // or host (one machine credential used twice) waits for the broker to expire its lease instead.
+    if (lease.bootId !== proof.bootId) return false;
     try {
       return (this.options.predecessorExited ?? transportHostLeasePredecessorExited)({ pid: lease.pid, pidStartTime: lease.pidStartTime, bootId: lease.bootId });
     } catch { return false; } // An unreadable proof is not exit evidence.
@@ -815,6 +875,26 @@ export class NatsKvMirror {
     await Promise.allSettled([...this.#queues.values()]);
   }
 
+  /**
+   * Withdraw one group now (CAS-deletes its rows, and each lease no other group still uses), for a
+   * clean stop of an identity the link owns. Other groups and their leases are untouched.
+   */
+  async release(group: string): Promise<void> {
+    const run = this.#replacing.catch(() => undefined).then(async () => {
+      for (const row of [...this.#rows.values()]) {
+        if (!row.claims.delete(group) || row.claims.size > 0) continue;
+        const lease = this.#owned.get(natsLeaseKey(this.machine, row.record.ownerHostId));
+        const shared = [...this.#rows.values()].some(other => other !== row && other.record.ownerHostId === row.record.ownerHostId);
+        try {
+          if (lease && !shared) await this.#serial(lease.key, () => this.#dropLease(lease));
+          await this.#serial(row.key, () => this.#dropRow(row));
+        } catch (error) { this.#report(error); }
+      }
+    });
+    this.#replacing = run;
+    await run;
+  }
+
   /** Fence, then CAS-delete every owned row: leases first, so routing stops at once. */
   async withdraw(): Promise<void> {
     await this.fence();
@@ -934,7 +1014,8 @@ export class NatsBridgePresence {
       });
       participants.push(record);
     }
-    return { hosts, participants, reserved: [] };
+    // During a reconnect gap a root that aged out is unknown, not gone: never withdrawal evidence.
+    return { hosts, participants, reserved: [], ...(this.reader.resyncing ? { partial: true } : {}) };
   }
 
   /**
@@ -1032,12 +1113,18 @@ export class NatsBridgePresence {
     return await this.writer.replace("actors", claims, options.complete);
   }
 
-  /** Wake the bridge on another machine's presence or lease change. Own rows never wake it. */
-  subscribeChanges(changed: (kind: BridgeChange) => void, _failed?: (error: Error) => void): () => void {
-    return this.reader.subscribe((bucket, machine) => {
+  /**
+   * Wake the bridge on another machine's presence or lease change; own rows never wake it.
+   * `failed` fires once on a terminal watch refusal (credential denied, bucket invalid): the link
+   * must stop, not keep routing on a view that can no longer be refreshed.
+   */
+  subscribeChanges(changed: (kind: BridgeChange) => void, failed?: (error: Error) => void): () => void {
+    const stopChanges = this.reader.subscribe((bucket, machine) => {
       if (machine === this.reader.machine) return;
       changed(bucket === "presence" ? "presence" : "lease");
     });
+    const stopFailures = failed ? this.reader.subscribeFailure(failed) : undefined;
+    return () => { stopChanges(); stopFailures?.(); };
   }
 
   holds(id: string): boolean { return this.writer.holds(id); }

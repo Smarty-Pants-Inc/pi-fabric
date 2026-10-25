@@ -140,6 +140,16 @@ describe("NATS bridge events: consume leg", () => {
     expect(refusedRoute.calls).toEqual(["term:refused by the bridge route rules"]);
   });
 
+  it("NAKs (never refuses) an event whose sender cannot be looked up yet", async () => {
+    const message = eventMessage("fleet.work.a.1");
+    const { delivered, refused } = await run([message], { resolve: () => {
+      throw Object.assign(new Error("not ready"), { code: "FABRIC_DIRECTORY_NOT_READY" });
+    } });
+    expect(delivered).toEqual([]);
+    expect(refused).toEqual([]);
+    expect(message.calls).toEqual(["nak:100"]);
+  });
+
   it("neither admits nor settles anything while the connection awaits re-verification", async () => {
     const message = eventMessage("fleet.work.a.1");
     const { delivered } = await run([message], { verified: false });

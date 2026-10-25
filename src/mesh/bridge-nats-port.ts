@@ -38,12 +38,15 @@ import type { MeshStore } from "./store.js";
 import type { FabricParticipantRecord } from "../topology/types.js";
 import type { ConsumerMessages } from "@nats-io/jetstream";
 import type { NatsConnectionHandle } from "../transport/nats/connection.js";
-import type { FabricTransport, TransportEnvelope, TransportSent } from "../transport/types.js";
+import { DirectoryNotReadyError, TransportUncertainError, type FabricTransport, type TransportEnvelope, type TransportSent } from "../transport/types.js";
 import { hashToken } from "../transport/nats/subjects.js";
 
 const MACHINE_TOKEN = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const SELF_GROUP = "self";
 const SELF_CHECK_MS = 5_000;
+/** One lease TTL plus the safety margin: the longest a predecessor's lease can outlive its last renewal. */
+const SELF_TAKEOVER_MS = 17_000;
+const SELF_TAKEOVER_POLL_MS = 500;
 
 const validMessageId = (id: unknown): id is string =>
   typeof id === "string" && id.length > 0 && id === id.trim() && !/[\u0000-\u001f\u007f]/.test(id);
@@ -193,6 +196,8 @@ export interface NatsBridgePortOptions extends Omit<NatsBridgePresenceOptions, "
   readonly identity?: MeshIdentity;
   /** One fresh listing of native file actors (bridge-nats-actors.ts); absent = actors come only in the mirror set. */
   readonly fileActors?: () => NatsFileActorRead;
+  /** How long start() waits for a predecessor's link identity lease to expire (default one TTL plus margin). */
+  readonly takeoverMs?: number;
   /** Runs once at the end of close(): the factory closes the transport and inbox connection it opened. */
   readonly onClose?: () => Promise<void>;
 }
@@ -236,6 +241,7 @@ export class NatsBridgePort implements BridgeNatsPort {
   readonly #inbox: NatsBridgeInboxSource;
   readonly #now: () => number;
   readonly #abort = new AbortController();
+  readonly #takeoverMs: number;
   #selfRecord: FabricParticipantRecord | undefined;
   #selfTimer: ReturnType<typeof setInterval> | undefined;
   #selfPass: Promise<void> | undefined;
@@ -252,6 +258,7 @@ export class NatsBridgePort implements BridgeNatsPort {
     this.#transport = transport;
     this.#inbox = options.inbox;
     this.#now = options.now ?? Date.now;
+    this.#takeoverMs = options.takeoverMs ?? SELF_TAKEOVER_MS;
     const monotonic = options.monotonic ?? (() => performance.now());
     this.kv = new NatsBridgePresence({ ...options, transport, now: this.#now, monotonic });
   }
@@ -261,7 +268,22 @@ export class NatsBridgePort implements BridgeNatsPort {
     if (this.#closed) throw new Error("NATS bridge port is closed");
     this.kv.start();
     await this.kv.whenReady(signal);
-    await this.#ensureSelf(true);
+    // A predecessor this process cannot prove gone (another boot or host, or still alive) keeps its
+    // lease until the broker expires it: retry for one lease TTL plus margin, then refuse to start.
+    const deadline = performance.now() + this.#takeoverMs;
+    for (;;) {
+      try { await this.#ensureSelf(true); break; }
+      catch (error) {
+        const code = (error as { code?: unknown } | null)?.code;
+        if (code !== "FABRIC_BRIDGE_NATS_LEASE_CONFLICT" || performance.now() >= deadline || signal?.aborted) throw error;
+        this.options.log?.(`nats port: link identity ${this.identity.id} still leased by a predecessor; waiting for it to expire`);
+        await new Promise<void>(resolve => {
+          const done = (): void => { clearTimeout(timer); signal?.removeEventListener("abort", done); resolve(); };
+          const timer = setTimeout(done, SELF_TAKEOVER_POLL_MS);
+          signal?.addEventListener("abort", done, { once: true });
+        });
+      }
+    }
     this.#selfTimer ??= setInterval(() => { void this.#ensureSelf(false).catch(() => undefined); }, SELF_CHECK_MS);
     this.#selfTimer.unref?.();
   }
@@ -276,10 +298,14 @@ export class NatsBridgePort implements BridgeNatsPort {
       const id = this.identity.id;
       if (this.#selfRecord && this.kv.writer.holds(id)) return;
       const now = this.#now();
-      // A fresh incarnation whenever the row must be (re)created: an earlier one may be superseded.
+      // A restarted link finds its predecessor's row under this machine (a crash leaves it for up to the
+      // 600 s presence TTL). Reuse that incarnation so the row can be adopted; the lease is adopted only
+      // from this process or a provably exited predecessor, so a second live link on this machine is refused.
+      const previous = this.kv.reader.records(id).find(route => route.machine === this.machine && route.kind === "root" &&
+        route.rootId === id && route.ownerHostId === this.#transport.self.hostId && route.ownerIdentityId === id)?.ownerIncarnation;
       this.#selfRecord = {
         format: 1, id, kind: "root", rootId: id, ownerHostId: this.#transport.self.hostId, ownerIdentityId: id,
-        ownerIncarnation: randomUUID(), name: this.identity.name, status: "running", runner: "pi", transport: "host",
+        ownerIncarnation: previous ?? randomUUID(), name: this.identity.name, status: "running", runner: "pi", transport: "host",
         capabilities: [], startedAt: now, updatedAt: now, controlProtocol: "v1",
       };
       const outcome = await this.kv.writer.replace(SELF_GROUP, [{ record: this.#selfRecord, until: Number.POSITIVE_INFINITY }], true);
@@ -293,6 +319,10 @@ export class NatsBridgePort implements BridgeNatsPort {
     return pass;
   }
 
+  #assertViewReady(): void {
+    if (!this.kv.reader.ready) throw new DirectoryNotReadyError("NATS bridge KV presence is not ready; the answer is unknown, retry");
+  }
+
   /** Live, unique, admitted canonical NATS roots on other machines (never this machine's own rows). */
   presence(): Promise<BridgePresence> { return this.kv.presence(); }
 
@@ -301,7 +331,12 @@ export class NatsBridgePort implements BridgeNatsPort {
     return this.kv.subscribeChanges(() => { changed(); }, failed);
   }
 
+  /**
+   * ParticipantView semantics: undefined is a FACT (absent, or on two machines). Without a KV
+   * snapshot the answer is unknown, and that throws DirectoryNotReadyError: hold, never refuse.
+   */
   resolve(id: string): BridgeNatsPortResolved | undefined {
+    this.#assertViewReady();
     const route = this.kv.resolve(id);
     const kind = route && meshKind(route.kind);
     if (!route || !kind) return undefined;
@@ -316,6 +351,7 @@ export class NatsBridgePort implements BridgeNatsPort {
   /** Every KV record (every machine, live or not) as the identity gate reads it; `list()` serves the dry run. */
   presenceView(): BridgeNatsPresenceView {
     const map = (id?: string): readonly BridgeNatsPresenceRecord[] => {
+      this.#assertViewReady();
       const observedAt = this.#now();
       return this.kv.reader.records(id).flatMap(route => {
         const kind = meshKind(route.kind);
@@ -349,7 +385,10 @@ export class NatsBridgePort implements BridgeNatsPort {
     if (this.options.fileActors) {
       try {
         const read = this.options.fileActors();
-        actors = [...actors, ...read.actors];
+        // One claim per actor: the native listing wins over the same actor in the set (two claims
+        // for one id in a pass would refuse both).
+        const listed = new Set(read.actors.map(actor => actor.id));
+        actors = [...actors.filter(actor => !listed.has(actor.id)), ...read.actors];
         sampledAt = Math.min(sampledAt, read.sampledAt);
         complete = true; // The native listing, not the roots snapshot, is the actors' authority.
       } catch (error) {
@@ -389,10 +428,24 @@ export class NatsBridgePort implements BridgeNatsPort {
       throw coded("NATS bridge destination must be another machine", "FABRIC_TRANSPORT_INVALID");
     }
     const fromId = envelope.from?.id;
-    if (envelope.kind === "command" && (typeof fromId !== "string" || (fromId !== this.identity.id && !this.kv.holds(fromId)))) {
+    const held = typeof fromId !== "string" ? "absent" : fromId === this.identity.id ? "live" : this.kv.writer.holdState(fromId);
+    if (envelope.kind === "command" && held === "absent") {
       throw coded("NATS bridge sender is not held live by this link", "FABRIC_SENDER_UNVERIFIED");
     }
-    return await this.#transport.send(envelope, signal);
+    if (envelope.kind === "command" && held === "renewing") {
+      // An outage has kept its lease unconfirmed: hold the command for a same-id resend, never refuse it.
+      throw new TransportUncertainError(envelope.id, envelope.body, { cause: coded("NATS bridge sender lease is unconfirmed", "FABRIC_TRANSPORT_UNAVAILABLE") });
+    }
+    try {
+      return await this.#transport.send(envelope, signal);
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (code === "FABRIC_TRANSPORT_UNCERTAIN" || code === "FABRIC_TRANSPORT_DENIED" || code === "FABRIC_TRANSPORT_INVALID") throw error;
+      // Everything else (unavailable during an outage or reconnect, capacity, the transport's retry
+      // horizon, an unclassified failure) is retryable with the same id and bytes: report it as
+      // uncertain, which is what the carrier resends, never as a final refusal that drops the message.
+      throw new TransportUncertainError(envelope.id, envelope.body, { cause: error });
+    }
   }
 
   /**
@@ -457,8 +510,12 @@ export class NatsBridgePort implements BridgeNatsPort {
     if (this.#selfTimer) clearInterval(this.#selfTimer);
     this.#selfTimer = undefined;
     await this.#selfPass?.catch(() => undefined);
-    try { await this.kv.close(); }
-    finally { await this.options.onClose?.(); }
+    try {
+      // A clean stop releases the link identity at once, so a restart never waits on its own lease.
+      // Mirrored rows stay fenced: their leases lapse within one TTL, or the restarted link adopts them.
+      if (!this.kv.writer.fenced) await this.kv.writer.release(SELF_GROUP).catch(error => { this.options.onError?.(error); });
+      await this.kv.close();
+    } finally { await this.options.onClose?.(); }
   }
 }
 

@@ -12,6 +12,7 @@ import { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import type { TransportHostLeaseProcessProof } from "../src/topology/host-leases.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import { advance, hKey, kvWorld as world, natsLease, pKey, seedNative, type Clock } from "./helpers/bridge-nats-kv.js";
+import { TransportDeniedError, type FabricTransport } from "../src/transport/types.js";
 
 const BRIDGE = "ryzen1-bridge";
 const V2 = "v2-org";
@@ -153,6 +154,45 @@ describe("NATS presence -> file mirror snapshot", () => {
     await waitFor(() => expect(side.resolve(NATS_ROOT)?.live).toBe(false));
   });
 
+  it("keeps serving the last snapshot through a reconnect gap, bounded by lease age, and switches at the new ready", async () => {
+    const w = world();
+    seedNative(w, V2, natsRoot(), 1_000_000);
+    const gone = "session:33333333-3333-4333-8333-333333333333";
+    seedNative(w, V2, natsRoot(gone, "inc-3"), 1_000_000);
+    const { side, clock } = bridge(w);
+    await side.whenReady();
+    const changes: string[] = [];
+    side.subscribeChanges(kind => { changes.push(kind); });
+    w.presence.gap();
+    w.leases.gap();
+    // While disconnected the other side deletes one root; nothing of that reaches us yet.
+    w.presence.values.delete(pKey(V2, gone));
+    w.leases.values.delete(hKey(V2, gone));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(side.reader.ready).toBe(true);
+    expect(side.resolve(NATS_ROOT)?.live).toBe(true);
+    expect(side.resolve(gone)?.live).toBe(true);
+    const during = await side.presence();
+    expect(during.hosts.map(host => host.record.id).sort()).toEqual([NATS_ROOT, gone].sort());
+    // Absence in a gap's snapshot proves nothing: it is partial, so the file side holds, never withdraws.
+    expect(during.partial).toBe(true);
+    // Liveness still ages by receipt: a long gap ends it without any new event.
+    advance(clock, 13_000);
+    expect(side.resolve(NATS_ROOT)?.live).toBe(false);
+    expect(await side.presence()).toMatchObject({ hosts: [], partial: true });
+    // The new snapshot replaces the view in one step: the deleted root is gone, the renewed one is live.
+    w.leases.put(hKey(V2, NATS_ROOT), `${NATS_ROOT}#nats-inc-1`, natsLease(NATS_ROOT, "nats-inc-1", clock.wall),
+      w.leases.values.get(hKey(V2, NATS_ROOT))!.revision);
+    w.presence.resnapshot();
+    w.leases.resnapshot();
+    await waitFor(() => expect(side.resolve(gone)).toBeUndefined());
+    expect(side.resolve(NATS_ROOT)?.live).toBe(true);
+    expect(changes).toContain("presence");
+    const after = await side.presence();
+    expect(after.partial).toBeUndefined();
+    expect(after.hosts.map(host => host.record.id)).toEqual([NATS_ROOT]);
+  });
+
   it("drops an expired lease at once and ignores a JSON-claimed machine or mirror provenance", async () => {
     const w = world();
     seedNative(w, V2, natsRoot(), 1_000_000);
@@ -188,6 +228,41 @@ describe("NATS presence -> file mirror snapshot", () => {
     // This link's own mirrored rows are never a NATS sender (no loop through the bridge machine).
     expect(side.verifySender(FILE_ROOT, BRIDGE)).toEqual({ ok: false, refuse: "FABRIC_SENDER_UNVERIFIED" });
     expect(side.verifySender("session:unknown-0000", V2)).toEqual({ ok: false, refuse: "FABRIC_SENDER_UNVERIFIED" });
+  });
+
+  it("reports a terminal watch refusal once, so the link stops instead of routing on a frozen view", async () => {
+    const w = world();
+    const base = w.transport(BRIDGE, "bridge:ryzen1");
+    let attempts = 0;
+    const transport: FabricTransport = { ...base, kv: bucket => {
+      const kv = base.kv(bucket);
+      if (bucket !== "presence") return kv;
+      return { ttlMs: kv.ttlMs, get: kv.get.bind(kv), put: kv.put.bind(kv), delete: kv.delete.bind(kv),
+        async *watch() { attempts++; throw new TransportDeniedError("KV watch permission denied"); } };
+    } };
+    const clock = { wall: 1_000_000, mono: 50_000 };
+    const side = new NatsBridgePresence({ transport, link: "nats", admit: () => true, processProof: PROOF,
+      now: () => clock.wall, monotonic: () => clock.mono });
+    openers.push(side);
+    const failures: Error[] = [];
+    side.subscribeChanges(() => undefined, error => { failures.push(error); });
+    side.start();
+    await waitFor(() => expect(attempts).toBeGreaterThanOrEqual(2));
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toBeInstanceOf(TransportDeniedError);
+    expect(await side.presence()).toMatchObject({ hosts: [], partial: true });
+    // A transient unavailability is not terminal.
+    const unavailable = new NatsBridgePresence({ transport: { ...base, kv: bucket => {
+      const kv = base.kv(bucket);
+      return bucket === "leases" ? kv : { ttlMs: kv.ttlMs, get: kv.get.bind(kv), put: kv.put.bind(kv), delete: kv.delete.bind(kv),
+        async *watch() { throw Object.assign(new Error("down"), { code: "FABRIC_TRANSPORT_UNAVAILABLE" }); } };
+    } }, link: "nats", admit: () => true, processProof: PROOF });
+    openers.push(unavailable);
+    const none: Error[] = [];
+    unavailable.subscribeChanges(() => undefined, error => { none.push(error); });
+    unavailable.start();
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(none).toEqual([]);
   });
 
   it("wakes the bridge on another machine's change, never on its own renewals", async () => {

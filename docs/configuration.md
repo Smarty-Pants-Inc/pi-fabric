@@ -1114,8 +1114,15 @@ retry horizon defaults to 30 seconds. On expiry, the error remains a
 have been persisted. Existing inbox streams with the current 10-minute
 `duplicate_window` remain unchanged.
 
-Main hosts keep durable inbox consumers by default. Short-lived child processes
-inherit the NATS policy with `ephemeralHost: true`, and `pi-fabric nats send`
+Main, `runtime:` and bridge inbox durables share the seven-inactive-day default.
+A shorter runtime threshold waits for the reconnect-recovery fix: expiry can leave
+a paused or asleep host's inbox silently stopped after a consumer-not-found (404)
+response. Compatible existing inboxes are updated in place when reopened or
+re-ensured, without resetting their delivery cursor.
+After expiry, recreation uses `DeliverAll`: retained ACKed messages can replay;
+application control claims prevent repeated command execution. See
+[NATS consumer lifetimes](nats-consumer-lifetimes.md) for the inventory and replay limits.
+Short-lived child processes inherit the NATS policy with `ephemeralHost: true`, and `pi-fabric nats send`
 and `dispatch` also default to `ephemeralHost: true` with the one-hour inactive
 threshold. An explicit `PI_FABRIC_MESH_NATS` JSON value for `ephemeralHost` or
 `ephemeralInactiveSeconds` overrides the CLI default. Placement pod templates

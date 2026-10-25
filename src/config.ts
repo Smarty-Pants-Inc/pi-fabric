@@ -616,7 +616,7 @@ export interface FabricMeshNatsConfig {
   rollbackHoldUntil?: string;
   /** Parallel inbox lanes; normalized configs supply 8, with a minimum of 1. */
   inboxLanes?: number;
-  /** Host-only: allow server-side expiration and clean-shutdown deletion of this host's inbox durable (default false). */
+  /** Host-only: use a custom idle lifetime and clean-shutdown deletion for this host's inbox durable (default false). */
   ephemeralHost?: boolean;
   /** Server-side durable idle expiration in seconds when ephemeralHost is enabled (300..86400, default 3600). */
   ephemeralInactiveSeconds?: number;

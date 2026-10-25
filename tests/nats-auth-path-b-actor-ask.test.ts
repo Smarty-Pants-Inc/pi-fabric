@@ -201,8 +201,11 @@ for await (const line of commands) {
  try {
   if (request.method === "create") { actor = await invoke("agents.create", request.args); respond(request.id, actor); }
   else if (request.method === "evidence") {
-   await wait(() => runtime.actors.inFlightCount() === 0 && events.some(event => event.phase === "broker-ack" && event.envelope.kind === "command" &&
-     (!request.args?.eventId || event.envelope.id === request.args.eventId)));
+   const minimumCommandBrokerAcks = request.args?.minimumCommandBrokerAcks ?? 1;
+   await wait(() => runtime.actors.inFlightCount() === 0 &&
+     events.filter(event => event.phase === "broker-ack" && event.envelope.kind === "command").length >= minimumCommandBrokerAcks &&
+     (!request.args?.eventId || events.some(event => event.phase === "broker-ack" && event.envelope.kind === "command" &&
+       event.envelope.id === request.args.eventId)));
    respond(request.id, { actor: runtime.actors.status(actor.id), messages: runtime.actors.messages(actor.id), stages, events,
     queueFiles: fs.readdirSync(path.dirname(actor.sessionFile)).filter(name => name.startsWith("queue-")),
     runs: fs.existsSync(actor.logDir) ? fs.readdirSync(actor.logDir).filter(name => fs.existsSync(path.join(actor.logDir, name, "status.json")))
@@ -477,7 +480,8 @@ describe.skipIf(!binary || process.platform !== "linux")("Path B cross-process a
       expect(replayed.session).toBe(evidence.session);
       expect(replayed.actor).toMatchObject({ status: "idle", queued: 0, lastRunId: result!.runId });
       expect(replayed.queueFiles).toEqual([]);
-      expect(replayed.events.filter(event => event.phase === "broker-ack" && event.envelope.kind === "command")).toHaveLength(2);
+      const replayedCommandAcks = replayed.events.filter(event => event.phase === "broker-ack" && event.envelope.kind === "command");
+      expect(replayedCommandAcks.map(event => event.envelope.id).sort()).toEqual([command.envelope.id, duplicateEnvelope.id].sort());
       expect(snapshot(sender.runtime.mesh.root)).toEqual(before);
       // Birth-qualified absence proves the actual native model process AND its
       // production worker have ended; logical actor-idle alone is not custody.
@@ -487,22 +491,81 @@ describe.skipIf(!binary || process.platform !== "linux")("Path B cross-process a
       expect(processBirth(modelEvents[0].workerPid)).not.toBe(modelEvents[0].workerBirth);
       expect(evidence.runs[0]).toMatchObject({ sessionId: String(modelEvents[0].workerPid), processStartTime: modelEvents[0].workerBirth });
 
-      // Query only AFTER real ackAck barriers; zero pending is independent broker
-      // state, not an assumption based on protocol success or a timed sleep.
-      // https://docs.nats.io/reference/2.14/jetstream/api/consumer/create
+      // Retain the same private fixture manager for deletion and final independent
+      // broker evidence; the live owner inbox remains untouched during this cursor loss.
+      const ownerStreamName = transportInboxStream("machine-a"), ownerDurable = transportDurableName(ownerId);
       const { manager } = await openJetStream(await broker.connect(broker.users.bootstrap));
-      const ownerConsumer = await manager.consumers.info(transportInboxStream("machine-a"), transportDurableName(ownerId));
+      const ownerConsumerBeforeRecovery = await manager.consumers.info(ownerStreamName, ownerDurable);
+      expect(ownerConsumerBeforeRecovery).toMatchObject({ num_pending: 0, num_ack_pending: 0 });
+      expect(ownerConsumerBeforeRecovery.ack_floor.consumer_seq).toBe(2);
+      const ownerStreamBeforeRecovery = await manager.streams.info(ownerStreamName);
+      expect(ownerStreamBeforeRecovery.state.messages).toBe(2);
+      const retainedRecordState = (state: typeof ownerStreamBeforeRecovery.state) => ({
+        messages: state.messages, bytes: state.bytes, firstSeq: state.first_seq, firstTs: state.first_ts,
+        lastSeq: state.last_seq, lastTs: state.last_ts, numDeleted: state.num_deleted,
+      });
+      const retainedRecordsBeforeRecovery = retainedRecordState(ownerStreamBeforeRecovery.state);
+      expect(await manager.consumers.delete(ownerStreamName, ownerDurable)).toBe(true);
+
+      // The live NatsTransport inbox observes consumer_deleted, recreates the durable
+      // with DeliverAll, and ACKs both retained command records. The count floor avoids
+      // accepting the two pre-deletion ACK events as a one-shot evidence barrier.
+      const recovered = await owner.call<OwnerEvidence>("evidence", { minimumCommandBrokerAcks: 4 });
+      const recoveredCommandAcks = recovered.events.filter(event => event.phase === "broker-ack" && event.envelope.kind === "command");
+      expect(recoveredCommandAcks).toHaveLength(4);
+      for (const [eventId, sequence] of [[command.envelope.id, command.sequence], [duplicateEnvelope.id, logicalDuplicate.sequence]] as const) {
+        const priorDelivery = replayedCommandAcks.find(event => event.envelope.id === eventId)!;
+        const deliveries = recoveredCommandAcks.filter(event => event.envelope.id === eventId);
+        expect(deliveries).toHaveLength(2);
+        expect(deliveries.map(event => event.sequence)).toEqual([sequence, sequence]);
+        expect(deliveries.map(event => event.envelope)).toEqual([priorDelivery.envelope, priorDelivery.envelope]);
+      }
+      expect(recovered.messages).toEqual(evidence.messages);
+      expect(recovered.runs).toEqual(evidence.runs);
+      expect(recovered.runs).toHaveLength(1);
+      expect(recovered.modelEvents).toBe(evidence.modelEvents);
+      expect(recovered.session).toBe(evidence.session);
+      expect(recovered.actor).toMatchObject({ status: "idle", queued: 0, lastRunId: result!.runId });
+      expect(recovered.queueFiles).toEqual([]);
+      const recoveredActivations = [...new Set(recovered.stages.flatMap(stage => stage.inFlightRun ? [stage.inFlightRun.id] : []))];
+      expect(recoveredActivations).toEqual(activated);
+      expect(recoveredActivations).toEqual([result!.runId]);
+      // Replayed records can share one in-flight command settlement. That coalesces
+      // response publication, not the two independent broker ACKs counted above.
+      const responseIds = [`ack:${command.envelope.id}`, `ack:${duplicateEnvelope.id}`];
+      const allResponseSends = recovered.events.filter(event => event.phase === "send" && event.envelope.kind === "ack" && responseIds.includes(event.envelope.id));
+      expect(allResponseSends.length).toBeGreaterThanOrEqual(3);
+      for (const responseId of responseIds) {
+        const responseSends = allResponseSends.filter(event => event.envelope.id === responseId);
+        expect(responseSends[0]!.duplicate).toBe(false);
+        expect(responseSends.slice(1).every(event => event.duplicate === true)).toBe(true);
+        for (const response of responseSends) {
+          expect(response.envelope).toMatchObject({ body: { accepted: true, commandId, messageId: result!.id, result } });
+        }
+      }
+      expect(events.filter(event => event.phase === "broker-ack" && event.hostId === senderId && event.envelope.kind === "ack")).toHaveLength(2);
+      expect(snapshot(sender.runtime.mesh.root)).toEqual(before);
+
+      // Query only AFTER the four real ackAck barriers; zero pending is independent
+      // broker state, not an assumption based on protocol success or a timed sleep.
+      // https://docs.nats.io/reference/2.14/jetstream/api/consumer/create
+      const ownerConsumer = await manager.consumers.info(ownerStreamName, ownerDurable);
       const senderConsumer = await manager.consumers.info(transportInboxStream("machine-b"), transportDurableName(senderId));
+      expect(ownerConsumer.created).not.toBe(ownerConsumerBeforeRecovery.created);
+      expect(ownerConsumer.config.inactive_threshold).toBe(7 * 24 * 60 * 60 * 1_000_000_000);
       for (const consumer of [ownerConsumer, senderConsumer]) {
         expect({ pending: consumer.num_pending, ackPending: consumer.num_ack_pending }).toEqual({ pending: 0, ackPending: 0 });
         expect(consumer.ack_floor.consumer_seq).toBe(2);
       }
+      const ownerStreamAfterRecovery = await manager.streams.info(ownerStreamName);
+      expect(retainedRecordState(ownerStreamAfterRecovery.state)).toEqual(retainedRecordsBeforeRecovery);
       console.log("PATH_B_ASK_GREEN", JSON.stringify({ senderPid: process.pid, ownerPid: ready.pid, senderRoot, ownerRoot, modelPid: modelEvents[0].pid,
         modelBirth: modelEvents[0].birth, workerPid: modelEvents[0].workerPid, workerBirth: modelEvents[0].workerBirth, nativeWritersGone: true,
         commandId, commandEventId: command.envelope.id, messageId: result!.id, runId: result!.runId, text: result!.text,
-        logicalReplayEventId: duplicateEnvelope.id, brokerDuplicate: brokerDuplicate.duplicate, admitted: inbound.length, activations: activated.length,
-        ownerAckFloor: ownerConsumer.ack_floor, senderAckFloor: senderConsumer.ack_floor,
-        ownerAckPending: ownerConsumer.num_ack_pending, senderAckPending: senderConsumer.num_ack_pending,
+        logicalReplayEventId: duplicateEnvelope.id, brokerDuplicate: brokerDuplicate.duplicate, admitted: inbound.length, activations: recoveredActivations.length,
+        ownerConsumerCreatedBeforeRecovery: ownerConsumerBeforeRecovery.created, ownerConsumerCreatedAfterRecovery: ownerConsumer.created,
+        ownerInactiveThreshold: ownerConsumer.config.inactive_threshold, ownerAckFloor: ownerConsumer.ack_floor, senderAckFloor: senderConsumer.ack_floor,
+        ownerAckPending: ownerConsumer.num_ack_pending, senderAckPending: senderConsumer.num_ack_pending, recoveredCommandAcks: recoveredCommandAcks.length,
         senderSnapshotPaths: Object.keys(before).sort(), senderSnapshotUnchanged: true }));
     } finally {
       await cleanupPathB(root, sender, owner, inspector, broker);

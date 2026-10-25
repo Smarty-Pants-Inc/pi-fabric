@@ -16,11 +16,10 @@
 import { Buffer } from "node:buffer";
 // Static on purpose (scripts/build.mjs refuses unstable package-local dynamic chunks); nothing in the
 // startup graph imports this module.
-import { AckPolicy, DeliverPolicy, ReplayPolicy, type ConsumerMessages } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, JetStreamApiError, ReplayPolicy, type ConsumerMessages } from "@nats-io/jetstream";
 import { natsEventsStreamName } from "../transport/nats/provision.js";
 import type { MeshEvent, MeshIdentity } from "./event-log.js";
 import type { BridgeNatsPortResolved } from "./bridge-nats-types.js";
-import { hashToken } from "../transport/nats/subjects.js";
 import type { NatsConnectionHandle } from "../transport/nats/connection.js";
 
 const ORG = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -203,38 +202,73 @@ export const runNatsBridgeEvents = async (options: NatsBridgeEventsOptions, sign
  * A new durable starts at the stream's NEW messages (or `startAt`), never replaying history into
  * Ryzen 1. Needs a connection verified WITH the events grant (events: true, org).
  */
-export const natsBridgeEventSource = (connection: NatsConnectionHandle, options: { org: string; link: string; topics: readonly string[];
-  startAt?: number | string | Date; retryDelayScheduleMs?: readonly number[] }): NatsBridgeEventSource => {
+/**
+ * The one events durable of a bridge machine, named under the machine so the org can grant exactly it
+ * (`$JS.API.CONSUMER.{CREATE,INFO,MSG.NEXT}.FABRIC_EV_<ORG>.bev_<machine>`, `$JS.ACK.FABRIC_EV_<ORG>.bev_<machine>.>`).
+ */
+export const natsBridgeEventsDurable = (machine: string): string => {
+  if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(machine)) throw new TypeError("Invalid NATS bridge machine");
+  return `bev_${machine}`;
+};
+
+const CONSUMER_NOT_FOUND = 10014;
+const apiErrorCode = (error: unknown): number | undefined => {
+  if (!(error instanceof JetStreamApiError)) return undefined;
+  try { return error.apiError().err_code; } catch { return undefined; }
+};
+
+export interface NatsBridgeEventSourceOptions {
+  readonly org: string;
+  /** The bridge's own machine: it names the durable. */
+  readonly machine: string;
+  readonly topics: readonly string[];
+  /** Only when the durable is created; default: new messages only, never replaying history into the hub. */
+  readonly startAt?: number | string | Date;
+  readonly retryDelayScheduleMs?: readonly number[];
+}
+
+/**
+ * Read-only on the stream: look the durable up and create it if absent. Nothing here publishes, and
+ * nothing creates, updates or deletes a stream. A durable with other settings is refused, never changed.
+ */
+export const ensureNatsBridgeEventConsumer = async (connection: Pick<NatsConnectionHandle, "manager">,
+  options: NatsBridgeEventSourceOptions): Promise<{ stream: string; durable: string }> => {
   const filters = natsBridgeEventSubjects(options.org, options.topics);
   const schedule = options.retryDelayScheduleMs ?? NATS_BRIDGE_EVENT_RETRY_MS;
-  return {
-    isVerified: () => connection.isVerified(),
-    async *consume(signal) {
-      const stream = natsEventsStreamName(options.org);
-      const durable = `bev_${hashToken(`bridge:${options.link}`)}`;
-      const api = connection.manager.consumers;
-      const config = {
+  const stream = natsEventsStreamName(options.org);
+  const durable = natsBridgeEventsDurable(options.machine);
+  const api = connection.manager.consumers;
+  let info;
+  try { info = await api.info(stream, durable); }
+  catch (error) {
+    if (apiErrorCode(error) !== CONSUMER_NOT_FOUND) throw error;
+    const startTime = options.startAt === undefined ? undefined : new Date(options.startAt).toISOString();
+    try {
+      info = await api.add(stream, {
         filter_subjects: filters, ack_policy: AckPolicy.Explicit, replay_policy: ReplayPolicy.Instant,
         ack_wait: 60_000 * 1_000_000, max_deliver: -1, max_ack_pending: 1,
         backoff: [...schedule, schedule[schedule.length - 1]!].map(ms => ms * 1_000_000), inactive_threshold: 0,
-      };
-      try { await api.info(stream, durable); }
-      catch {
-        const startTime = options.startAt === undefined ? undefined : new Date(options.startAt).toISOString();
-        try {
-          await api.add(stream, { ...config, durable_name: durable,
-            deliver_policy: startTime === undefined ? DeliverPolicy.New : DeliverPolicy.StartTime,
-            ...(startTime === undefined ? {} : { opt_start_time: startTime }) });
-        } catch (error) {
-          // A concurrent opener may have created it; never reset an existing cursor.
-          await api.info(stream, durable).catch(() => { throw error; });
-        }
-      }
-      const info = await api.info(stream, durable);
-      if (info.config.ack_policy !== AckPolicy.Explicit || info.config.deliver_subject ||
-        JSON.stringify([...(info.config.filter_subjects ?? [])].sort()) !== JSON.stringify(filters)) {
-        throw Object.assign(new Error(`Incompatible NATS bridge events consumer: ${durable}`), { code: "FABRIC_TRANSPORT_INVALID" });
-      }
+        durable_name: durable, deliver_policy: startTime === undefined ? DeliverPolicy.New : DeliverPolicy.StartTime,
+        ...(startTime === undefined ? {} : { opt_start_time: startTime }),
+      });
+    } catch (createError) {
+      // A concurrent opener may have created it; never reset an existing cursor.
+      info = await api.info(stream, durable).catch(() => { throw createError; });
+    }
+  }
+  if (info.config.ack_policy !== AckPolicy.Explicit || info.config.deliver_subject ||
+    JSON.stringify([...(info.config.filter_subjects ?? [])].sort()) !== JSON.stringify(filters)) {
+    throw Object.assign(new Error(`Incompatible NATS bridge events consumer: ${durable}`), { code: "FABRIC_TRANSPORT_INVALID" });
+  }
+  return { stream, durable };
+};
+
+export const natsBridgeEventSource = (connection: NatsConnectionHandle, options: NatsBridgeEventSourceOptions): NatsBridgeEventSource => {
+  natsBridgeEventSubjects(options.org, options.topics);
+  return {
+    isVerified: () => connection.isVerified(),
+    async *consume(signal) {
+      const { stream, durable } = await ensureNatsBridgeEventConsumer(connection, options);
       const consumer = await connection.js.consumers.get(stream, durable);
       const messages: ConsumerMessages = await consumer.consume({ max_messages: 1, abort_on_missing_resource: true });
       const stop = (): void => { void messages.close().catch(() => undefined); };

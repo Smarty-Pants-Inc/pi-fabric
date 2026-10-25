@@ -231,7 +231,7 @@ all further appends until a restart.
 | T13 | Ledger crash inconsistency | R11 fsync before visible, complete writes, namespace barriers, one-append tail cut, refusal on longer damage, fail-stop | A disk that loses fsync'd data is out of scope |
 | T14 | Stale presence authorizes traffic | 15 s freshness on observations and issued identities | Within 15 s a just-stopped Main can still be targeted; its owner refuses a stale incarnation |
 | T15 | Topic injection into a moved lead | R10 receiveTopics, followUp only, rate bounds, never control | A file publisher can post allowed topics to a root that asked for them (as today on the file mesh) |
-| T16 | Flooding across the link | Topic routes spend the file bridge's factory rate buckets (L2); the ledger refuses new claims past 1,000,000 live records instead of dropping any | Control commands from an allow-listed sender have no new per-sender rate bound in PR 1 |
+| T16 | Flooding across the link | Topic routes spend the file bridge's factory rate buckets (L2); past 1,000,000 live records the ledger refuses new claims and drops none | Control commands from an allow-listed sender have no new per-sender rate bound in PR 1 |
 
 ## 6. Checklist for the pass
 

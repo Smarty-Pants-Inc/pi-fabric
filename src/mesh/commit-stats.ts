@@ -583,6 +583,10 @@ export interface LockEventHolder {
   op: MeshLockClass | null;
   /** Sanitized host label (both locks live on a local filesystem). */
   host: string;
+  /** SQLite timeout only: current procfs membership for the sampled PID, at most 512 UTF-8 bytes. */
+  cgroup?: string;
+  /** Nearest service/scope component of that membership, at most 256 UTF-8 bytes. */
+  unit?: string;
 }
 export interface LockEventWaiter { pid: number; process: string; op: MeshLockClass }
 export interface LockEvent {
@@ -670,6 +674,39 @@ export const lockEventProcessName = (pid: number): string | undefined => {
   } catch { return undefined; }
 };
 
+/** Current local membership, never owner evidence. Only SQLite's kernel-sampled PID is eligible. */
+const lockEventCgroup = (pid: number): Pick<LockEventHolder, "cgroup" | "unit"> => {
+  if (process.platform !== "linux" || !Number.isSafeInteger(pid) || pid <= 0) return {};
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(`/proc/${pid}/cgroup`, "r");
+    // Proc files report size 0: read cap+1, not an unbounded readFileSync or a truncated prefix.
+    const buffer = Buffer.alloc(4097);
+    let used = 0;
+    while (used < buffer.length) {
+      const count = fs.readSync(descriptor, buffer, used, buffer.length - used, null);
+      if (!count) break;
+      used += count;
+    }
+    if (used === buffer.length) return {};
+    const bytes = buffer.subarray(0, used);
+    const text = bytes.toString("utf8");
+    if (!Buffer.from(text).equals(bytes) || !text.endsWith("\n")) return {};
+    const rows = text.slice(0, -1).split("\n");
+    if (!rows.every(row => /^(?:0:|[1-9]\d*:[A-Za-z0-9_,=-]+):\/[^\r\n]*$/.test(row) &&
+      !/[\p{C}\p{Zl}\p{Zp}]/u.test(row))) return {};
+    const unified = rows.filter(row => row.startsWith("0::"));
+    const selected = unified.length ? unified : rows.filter(row => /^[1-9]\d*:name=systemd:/.test(row));
+    if (selected.length !== 1) return {};
+    const cgroup = selected[0]!.replace(/^[^:]*:[^:]*:/, "");
+    if (cgroup.endsWith(" (deleted)") || Buffer.byteLength(cgroup) > 512 ||
+      (cgroup !== "/" && cgroup.slice(1).split("/").some(part => !part || part === "." || part === ".."))) return {};
+    const unit = cgroup.split("/").reverse().find(part => /.+\.(?:service|scope)$/.test(part));
+    return { cgroup, ...(unit && Buffer.byteLength(unit) <= 256 ? { unit } : {}) };
+  } catch { return {}; }
+  finally { if (descriptor !== undefined) try { fs.closeSync(descriptor); } catch { /* Observation only. */ } }
+};
+
 /** One JSONL line of at most LOCK_EVENT_MAX_LINE_BYTES: process names shrink until it fits. */
 export const lockEventLine = (event: LockEvent): string => {
   let line = `${JSON.stringify(event)}\n`;
@@ -697,7 +734,7 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
     sleep?: (ms: number) => void;
   } = {}): LockEvents | undefined => {
   const existing = eventsGlobals[eventsKey];
-  if (existing && (!existing.events || (existing.version >= 3 && typeof existing.events.queueExpired === "function"))) return existing.events;
+  if (existing && (!existing.events || (existing.version >= 4 && typeof existing.events.queueExpired === "function"))) return existing.events;
   if (!existing && lockStatsDisabled(setting)) {
     eventsGlobals[eventsKey] = { version: 1, events: undefined, dispose() {} };
     return undefined;
@@ -848,7 +885,8 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
       const pid = holderPid !== undefined && Number.isSafeInteger(holderPid) && holderPid > 0 ? holderPid : null;
       const name = pid === null ? null : pid === process.pid ? self() : lockEventProcessName(pid) ?? null;
       append(root, { v: 1, at: Date.now(), kind: "wait-timeout", store, class: lockClass, waitedMs: Math.round(waitedMs),
-        holder: { pid, process: name, op: null, host }, waiter: { pid: process.pid, process: self(), op: lockClass } });
+        holder: { pid, process: name, op: null, host, ...(store === "sqlite" && pid !== null ? lockEventCgroup(pid) : {}) },
+        waiter: { pid: process.pid, process: self(), op: lockClass } });
     },
     queueExpired(root, store, lockClass, waitedMs, waitersAhead) {
       append(root, { v: 1, at: Date.now(), kind: "pre-lock", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", store, class: lockClass,
@@ -857,12 +895,13 @@ export const createLockEvents = (setting = process.env.PI_FABRIC_LOCK_STATS,
     },
     get errors() { return errors; },
   };
-  // Additive handover from captured v1/v2 appenders: retain existing methods/sink/error count. The queue event
-  // uses this generation's full code, so reload cannot retain the older abbreviated field or a missing method.
+  // Newly captured v1-v3 recorders use this timeout implementation exactly once. Already-captured old
+  // methods remain valid; retain held, current queue writers, opt-in and accumulated append errors.
   const legacy = existing?.events;
-  const shared: LockEvents = legacy ? { held: legacy.held, waitTimeout: legacy.waitTimeout,
-    queueExpired: events.queueExpired, get errors() { return legacy.errors + events.errors; } } : events;
-  eventsGlobals[eventsKey] = { version: 3, events: shared, dispose: existing?.dispose ?? (() => {}) };
+  const shared: LockEvents = legacy ? { held: legacy.held, waitTimeout: events.waitTimeout,
+    queueExpired: existing!.version >= 3 ? legacy.queueExpired : events.queueExpired,
+    get errors() { return legacy.errors + events.errors; } } : events;
+  eventsGlobals[eventsKey] = { version: 4, events: shared, dispose: existing?.dispose ?? (() => {}) };
   return shared;
 };
 

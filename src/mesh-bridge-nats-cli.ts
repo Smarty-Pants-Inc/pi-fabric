@@ -36,6 +36,7 @@ import {
   BridgeNatsAllowListError,
   bridgeNatsAllowKey,
   bridgeNatsDryRun,
+  bridgeNatsFilePresenceRecord,
   BridgeNatsSeatPinsError,
   createBridgeNatsIdentityGate,
   loadBridgeNatsSeatPins,
@@ -246,16 +247,13 @@ const presenceView = (side: BridgeNatsSide, records: readonly BridgeNatsPresence
   list: () => records,
 });
 
-/** The file mesh as L3's gate reads it: every record, live or not, with this link's mirrors marked. */
+/**
+ * The file mesh as L3's gate reads it: every record, live or not, built by L3's one builder
+ * (bridgeNatsFilePresenceRecord), which keeps the stored remoteHost and bridgeVia apart: a spoke link's
+ * re-export of another link's mirror is never taken for that spoke's direct mirror (L3 audit P0).
+ */
 export const filePresenceView = (rows: readonly ParticipantRow[], observedAt: number): BridgeNatsPresenceView =>
-  presenceView("file", rows.map((row) => ({
-    id: row.id, name: row.name, kind: meshKind(row.kind), rootId: row.rootId,
-    ...(row.sessionId ? { sessionId: row.sessionId } : {}),
-    ownerHostId: row.ownerHostId, ownerIdentityId: row.ownerIdentityId,
-    ...(row.ownerIncarnation ? { ownerIncarnation: row.ownerIncarnation } : {}),
-    ...(row.remoteHost ? { mirroredBy: row.remoteHost } : {}),
-    live: row.stale !== true, observedAt,
-  })));
+  presenceView("file", rows.map((row) => bridgeNatsFilePresenceRecord(row, { live: row.stale !== true, observedAt })));
 
 /** NATS KV presence as L3's gate reads it: the machine comes from each record's KV key. */
 export const natsPresenceView = (roots: readonly NatsRootInfo[], observedAt: number): BridgeNatsPresenceView =>

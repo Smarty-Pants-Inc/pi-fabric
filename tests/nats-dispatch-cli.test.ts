@@ -144,10 +144,11 @@ brokerSuite("pi-fabric nats dispatch by real placement-run presence", () => {
         }
         const rawPresence = await transport.kv("presence").get<Record<string, unknown>>(`machine-b.p.${tokenFor(id)}`);
         expect(rawPresence?.value.placementRunId).toBe(runId);
-        const published = directory.list({ scope: "project", kinds: ["root"], fresh: true }).find((participant) => participant.id === id);
-        expect(published?.placementRunId).toBe(runId);
+        // The KV ACK/read does not synchronize the separate presence/lease watches backing list().
         const routeSignal = AbortSignal.timeout(10_000);
         while (!view.resolve(id)?.live) await view.whenChanged(id, routeSignal);
+        const published = directory.list({ scope: "project", kinds: ["root"], fresh: true }).find((participant) => participant.id === id);
+        expect(published?.placementRunId).toBe(runId);
         const plane = new FabricControlPlane(mesh, identity, {
           enabled: true, hostId: id, transport, participants: view,
           ownerIncarnation: directory.ownerIncarnation, controlIncarnationFence: "enforce",

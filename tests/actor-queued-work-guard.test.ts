@@ -17,6 +17,7 @@ import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import type { FabricMainAgentTarget } from "../src/main-agent.js";
@@ -38,8 +39,8 @@ afterEach(async () => {
 });
 const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
 const from: MeshIdentity = { id: "session:forwarder", name: "forwarder", kind: "main", sessionId: "forwarder" };
-const setup = (actorQueueLimit = DEFAULT_FABRIC_CONFIG.mesh.actorQueueLimit) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-queued-work-"));
+const setup = (actorQueueLimit = DEFAULT_FABRIC_CONFIG.mesh.actorQueueLimit, existingRoot?: string) => {
+  const root = existingRoot ?? fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-queued-work-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const agents = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
@@ -1134,9 +1135,9 @@ describe("queued-work guard, round 7: the requeue ledger records only queued wor
   }, 30_000);
 
   // Round 9 (fabric-store P1, probe Q): round 8 re-read the whole dead-letter file for every spill, inside a loop with no
-  // await, so 2,000 spills took 71.5 s on Ryzen 1 (517 s for 4,000) with the event loop blocked. The file is now read once
+  // await, so 2,000 spills took 71.5 s on the test host (517 s for 4,000) with the event loop blocked. The file is now read once
   // per call. The read count is the host-independent check (round 8: 2,001 reads). TIMING_BOUND_MS is the time guard.
-  // Measured with this test on Ryzen 1 at load average ~120 on 8 cores: the fix took 10.7 s (1 read); round 8 (c983410a)
+  // Measured with this test on the test host at load average ~120 on 8 cores: the fix took 10.7 s (1 read); round 8 (c983410a)
   // took 112.7 s (2,001 reads), and fabric-store measured 71.5 s. 30 s keeps ~3x margin over the fix on a badly
   // overloaded host, and the quadratic cost still fails it by more than 2x.
   const TIMING_BOUND_MS = 30_000;
@@ -1420,5 +1421,51 @@ describe("queued-work guard, round 9: a partial coalesced match passes the filte
     expect(receipts).toHaveLength(1);
     expect(receipts[0]!.data).toMatchObject({ filteredEventId: check.id, sequence: check.sequence, topic: TOPIC });
     expect(deadLetterLines(root, actor.id)).toEqual([]);
+  }, 90_000);
+
+  // Round 10 (fabric-store P1, probe OB-crash): the setter rewrote the queue file without the pruned check BEFORE its
+  // registry commit saved the new filter and the check's filtered receipt; a crash between them lost the check with no
+  // receipt. The crash lands at the setter's registry commit: the disk is copied as it stands right before the commit, or
+  // right after it, and a new manager opens the copy. The pruned check has its receipt, or it is still queued on disk.
+  it.each(["before", "after"] as const)("OB-crash (round 10): a crash %s the filter commit never leaves a pruned record without its filtered receipt", async point => {
+    const { root, mesh, actors } = setup(10);
+    const actor = await actors.create({ name: "crash-order", instructions: "Review.", topics: [TOPIC], coalesce: false, coalesceKey: "subject" });
+    const release = await holdWorker(actors, root, actor.id);
+    const comment = await mesh.publish({ topic: TOPIC, kind: "comment", from, data: { subject: "pr-1", marker: "comment-1" } });
+    const check = await mesh.publish({ topic: TOPIC, kind: "check", from, data: { subject: "pr-1", marker: "check-1" } });
+    type Item = { payload: MeshEvent; coalesced?: Array<{ id: string }> };
+    await waitFor(() => (meshRecords(root, actor.id) as unknown as Item[])[0]?.coalesced?.map(record => record.id).join() === `${comment.id},${check.id}`);
+    const crashed = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-queued-work-crash-"));
+    roots.push(crashed);
+    const update = ActorRegistryStore.prototype.update;
+    const crash = vi.spyOn(ActorRegistryStore.prototype, "update").mockImplementation(async function (this: ActorRegistryStore, ...args) {
+      if (point === "after") await update.apply(this, args);
+      fs.cpSync(root, crashed, { recursive: true });
+      throw new Error("injected crash at the filter commit");
+    });
+    await expect(actors.setActivationFilter(actor.id, CHECKS)).rejects.toThrow();
+    crash.mockRestore();
+    release();
+
+    const second = setup(10, crashed);
+    const receipts = () => second.actors.messages(actor.id, 200).filter(message => message.reason === "filtered: checks" &&
+      (message.data as { filteredEventId?: string } | undefined)?.filteredEventId === check.id);
+    const queuedIds = () => (meshRecords(crashed, actor.id) as unknown as Item[]).flatMap(item => item.coalesced?.map(record => record.id) ?? [item.payload.id]);
+    // Never gone with no receipt. On 4d7e7795, a crash before the commit left neither.
+    expect(receipts().length > 0 || queuedIds().includes(check.id)).toBe(true);
+    second.actors.resumeQueued();
+    await waitFor(() => second.actors.status(actor.id).status === "idle" &&
+      runTasks(crashed, second.actors, actor.id).some(task => task.includes("comment-1")), 60_000);
+    const ranCheck = runTasks(crashed, second.actors, actor.id).some(task => task.includes("check-1"));
+    if (point === "after") {
+      // The commit saved the filter: the record is pruned, by the setter or by the next drain, with its receipt.
+      expect(second.actors.status(actor.id).activationFilter).toEqual(CHECKS);
+      expect(receipts().length).toBeGreaterThan(0);
+      expect(ranCheck).toBe(false);
+    } else {
+      // The filter never committed: the check still runs with the comment, as accepted work.
+      expect(second.actors.status(actor.id).activationFilter).toBeUndefined();
+      expect(ranCheck).toBe(true);
+    }
   }, 90_000);
 });

@@ -135,6 +135,20 @@ export interface NatsCarrierRecord {
   readonly outcome?: NatsCarrierOutcome;
 }
 
+/**
+ * A claim and L3's one never-blocking decision for it (bridgeNatsClaimAction): publish (first claim);
+ * resend (outcome unconfirmed: the same envelope id and recorded bytes); awaitAck (the destination has it;
+ * the owner's ACK arrives on its own); replayAck (the owner's ACK is recorded: give it to the source now);
+ * refuse (conflict or mismatch: a notRun answer with the code, never a publish).
+ */
+export interface NatsCarrierClaim {
+  readonly created: boolean;
+  readonly record: NatsCarrierRecord;
+  readonly action: "publish" | "resend" | "awaitAck" | "replayAck" | "refuse";
+  /** On refuse: BRIDGE_NATS_ID_CONFLICT or BRIDGE_NATS_CLAIM_MISMATCH. */
+  readonly refuse?: string;
+}
+
 /** What the owner answered, recorded once against a record. */
 export interface NatsCarrierOutcome {
   readonly accepted: boolean;
@@ -151,7 +165,7 @@ export interface NatsCarrierOutcome {
  * create-only and returns what is stored: the new record (created), or the earlier one unchanged.
  */
 export interface NatsCarrierLedger {
-  claim(record: NatsCarrierRecord): Promise<{ readonly created: boolean; readonly record: NatsCarrierRecord }>;
+  claim(record: NatsCarrierRecord): Promise<NatsCarrierClaim>;
   lookup(direction: NatsCarrierDirection, destinationCommandId: string): Promise<NatsCarrierRecord | undefined>;
   /** Records the owner's outcome. The record stays to its expiry so replays and conflicts still resolve. */
   settle(direction: NatsCarrierDirection, destinationCommandId: string, outcome: NatsCarrierOutcome): Promise<void>;
@@ -198,7 +212,8 @@ export class NatsCarrierRefusal extends Error {
 export interface NatsCarrierFileAnswer {
   readonly to: string;
   readonly from: MeshIdentity;
-  readonly refusedEventId: string;
+  /** The bridge stamp id of the written ACK (its dedupe key): `refused:` or `replay:` plus the source event id. */
+  readonly stampId: string;
   readonly data: Record<string, unknown>;
 }
 
@@ -216,7 +231,9 @@ export type NatsOutbound =
   /** Send this envelope (fixed body); the source event is done only once the destination persisted it. */
   | { readonly kind: "send"; readonly envelope: NatsCarrierEnvelope; readonly record?: NatsCarrierRecord; readonly settle?: NatsCarrierSettle }
   /** Nothing to send; the source event is complete (a cancel naming no command this link carried). */
-  | { readonly kind: "absorb"; readonly reason: string };
+  | { readonly kind: "absorb"; readonly reason: string }
+  /** Nothing to send to NATS: write this ACK back into the file mesh for the source (a replayed answer). */
+  | { readonly kind: "answer"; readonly answer: NatsCarrierFileAnswer; readonly reason: string };
 
 export type NatsInbound =
   /** Append this event to the file mesh; ACK the delivery only after that append is durable, then settle. */
@@ -412,7 +429,7 @@ export class NatsBridgeCarrier {
     const decision = this.#authorize({ direction: "toNats", senderId: requesterId, targetId, operation, principal: pub.principal });
     // From here the sender is verified and the target is the NATS owner this link mirrors: a refusal is answered.
     const answer = (code: string, reason: string): NatsCarrierFileAnswer => ({
-      to: data.replyTo as string, from: carrierIdentity(owner.identity), refusedEventId: pub.data.bridge.id,
+      to: data.replyTo as string, from: carrierIdentity(owner.identity), stampId: `refused:${pub.data.bridge.id}`,
       data: { version: 1, commandId: data.commandId, targetId,
         ...(typeof data.ownerIncarnation === "string" ? { ownerIncarnation: data.ownerIncarnation } : {}),
         accepted: false, error: `Fabric NATS bridge refused the command: ${code}: ${reason}`, errorCode: code, notRun: true },
@@ -455,23 +472,31 @@ export class NatsBridgeCarrier {
       deadlineAt: body.deadlineAt as number, expiresAt: Math.max(body.deadlineAt as number, this.#now()) + BRIDGE_NATS_HORIZON_MS,
       ...(typeof body.ownerIncarnation === "string" ? { ownerIncarnation: body.ownerIncarnation } : {}), body,
     };
-    const { created, record: stored } = await this.#ledger.claim(record);
-    if (created) return { kind: "send", envelope, record };
-    if (stored.direction !== "toNats" || stored.origin !== "control" || stored.bodyDigest !== bodyDigest ||
-        stored.requesterId !== requesterId || stored.targetId !== targetId || !stored.body || !stored.ownerMachine) {
-      throw new NatsCarrierRefusal("command id reused with different input", "BRIDGE_NATS_ID_CONFLICT",
-        answer("BRIDGE_NATS_ID_CONFLICT", "command id reused with different input"));
+    // L3's claim table decides, at once and without waiting (bridgeNatsClaimAction).
+    const claim = await this.#ledger.claim(record);
+    const stored = claim.record;
+    const refuse = (code: string, reason: string): never => { throw new NatsCarrierRefusal(reason, code, answer(code, reason)); };
+    if (claim.action === "refuse" || (!claim.created && (stored.direction !== "toNats" || stored.origin !== "control"))) {
+      return refuse(claim.refuse ?? "BRIDGE_NATS_ID_CONFLICT", "command id reused with different input");
     }
-    // The same file event again (restart, uncertain PubAck): its first envelope, byte for byte.
-    if (stored.sourceEventId === sourceEventId) {
-      return { kind: "send", record: stored, envelope: this.#envelope({
-        id: stored.destinationEventId, kind: "command", to: { machine: stored.ownerMachine, hostId: stored.ownerHostId },
-        targetId, operation, from: stored.from, principal: stored.principal, body: stored.body,
-      }) };
+    switch (claim.action) {
+      case "publish": return { kind: "send", envelope, record };
+      case "resend":
+        // Unconfirmed: the first envelope again, byte for byte (its id, machine, body, sender and principal).
+        if (!stored.body || !stored.ownerMachine) return refuse("BRIDGE_NATS_CLAIM_MISMATCH", "recorded command has no resend bytes");
+        return { kind: "send", record: stored, envelope: this.#envelope({
+          id: stored.destinationEventId, kind: "command", to: { machine: stored.ownerMachine, hostId: stored.ownerHostId },
+          targetId, operation, from: stored.from, principal: stored.principal, body: stored.body,
+        }) };
+      case "awaitAck": return { kind: "absorb", reason: "the NATS owner holds this command; its ACK arrives on its own" };
+      case "replayAck": {
+        const recorded = stored.outcome?.data;
+        if (!recorded) return { kind: "absorb", reason: "the owner's answer is recorded without data" };
+        // A same-key resend of an answered command: the recorded answer, to this event's sender, at once.
+        return { kind: "answer", reason: "answered from the recorded outcome", answer: {
+          to: data.replyTo as string, from: carrierIdentity(owner.identity), stampId: `replay:${sourceEventId}`, data: { ...recorded } } };
+      }
     }
-    // A same-key resend (a new file event, the same commandId and input): a new envelope, so the broker
-    // window never swallows it, and the NATS owner replays its stored outcome from its seen claim.
-    return { kind: "send", record: stored, envelope };
   }
 
   async #outboundAck(pub: BridgePublish): Promise<NatsOutbound> {
@@ -587,33 +612,34 @@ export class NatsBridgeCarrier {
       expiresAt: Math.max(body.deadlineAt as number, this.#now()) + BRIDGE_NATS_HORIZON_MS,
       ...(typeof body.ownerIncarnation === "string" ? { ownerIncarnation: body.ownerIncarnation } : {}),
     };
-    const { created, record: stored } = await this.#ledger.claim(record);
-    if (!created) {
-      if (stored.direction !== "toFile" || stored.origin !== "control" || stored.bodyDigest !== bodyDigest ||
-          stored.targetId !== targetId || stored.operation !== operation) {
-        // The owner never sees a reused id: answer for the hop, as the NATS receiver does (notRun).
-        return refuse({ accepted: false, error: "Fabric control id reused with different input",
-          errorCode: "FABRIC_CONTROL_ID_CONFLICT", notRun: true }, "command id reused with different input");
-      }
-      if (stored.replyTo !== record.replyTo || stored.sourceMachine !== sourceMachine) {
-        return { kind: "settled", reason: "command already carried for another reply address" };
-      }
-      if (stored.sourceEventId !== input.id) {
-        // A same-key resend under a new envelope. The file store dedupes the command by its mapped id, so the
-        // owner never sees it again: replay the owner's recorded answer to this envelope, as a NATS owner
-        // replays its seen claim. With no answer yet, the first ACK settles both (a NATS sender matches an
-        // ACK by commandId and digest, never by envelope id).
-        const answer = stored.outcome?.data;
-        if (!answer) return { kind: "settled", reason: "same-key resend; the owner's answer is still pending" };
-        return { kind: "reply", reason: "same-key resend answered from the recorded outcome", envelope: this.#envelope({
-          id: bridgeNatsAckEnvelopeId(input.id), kind: "ack", to: { machine: sourceMachine, hostId: stored.replyTo },
-          targetId, operation: answer.accepted === true ? "accepted" : "rejected", from: carrierIdentity(target.identity),
-          // The responder's current epoch authenticates this attempt; the recorded one is history.
-          body: { ...answer, ownerIncarnation: target.route.ownerIncarnation,
-            originalOwnerIncarnation: typeof answer.ownerIncarnation === "string" ? answer.ownerIncarnation : null },
-        }) };
-      }
+    // L3's claim table decides, at once and without waiting (bridgeNatsClaimAction).
+    const claim = await this.#ledger.claim(record);
+    const stored = claim.record;
+    if (claim.action === "refuse" || (!claim.created && (stored.direction !== "toFile" || stored.origin !== "control"))) {
+      // The owner never sees a reused id: answer for the hop, as the NATS receiver does (notRun). A digest
+      // conflict keeps the NATS-native code its sender understands; the stable bridge code names the class.
+      const code = claim.refuse ?? "BRIDGE_NATS_ID_CONFLICT";
+      return refuse(code === "BRIDGE_NATS_ID_CONFLICT"
+        ? { accepted: false, error: "Fabric control id reused with different input", errorCode: "FABRIC_CONTROL_ID_CONFLICT",
+          bridgeErrorCode: code, notRun: true }
+        : { accepted: false, error: `Fabric NATS bridge refused the command: ${code}`, errorCode: code, notRun: true },
+      "command id reused with different input or from another reply address");
     }
+    if (claim.action === "awaitAck") return { kind: "settled", reason: "the file owner holds this command; its ACK arrives on its own" };
+    if (claim.action === "replayAck") {
+      // The file store dedupes the command by its mapped id, so the owner never sees a resend: give this
+      // envelope the owner's recorded answer, as a NATS owner replays its seen claim.
+      const answer = stored.outcome?.data;
+      if (!answer) return { kind: "settled", reason: "the owner's answer is recorded without data" };
+      return { kind: "reply", reason: "answered from the recorded outcome", envelope: this.#envelope({
+        id: bridgeNatsAckEnvelopeId(input.id), kind: "ack", to: { machine: sourceMachine, hostId: stored.replyTo },
+        targetId, operation: answer.accepted === true ? "accepted" : "rejected", from: carrierIdentity(target.identity),
+        // The responder's current epoch authenticates this attempt; the recorded one is history.
+        body: { ...answer, ownerIncarnation: target.route.ownerIncarnation,
+          originalOwnerIncarnation: typeof answer.ownerIncarnation === "string" ? answer.ownerIncarnation : null },
+      }) };
+    }
+    // publish, or resend (unconfirmed): present the event; the file store's receipt makes a repeat one append.
     const data = wire({ ...pick(body, COMMAND_FIELDS), commandId, ...(cancelCommandId !== undefined ? { cancelCommandId } : {}) });
     const event: MeshEvent = {
       id: input.id, sequence: delivery.sequence, createdAt: body.requestedAt as number,

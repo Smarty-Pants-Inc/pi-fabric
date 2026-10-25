@@ -8,7 +8,7 @@ import { createNatsFileLink, type NatsCarrierSide } from "./bridge-nats-file.js"
 import {
   createBridgeNatsIdentityGate, loadBridgeNatsSeatPins, parseBridgeNatsAllowSection, type BridgeNatsSeatPins,
 } from "./bridge-nats-identity.js";
-import { openBridgeNatsLedger } from "./bridge-nats-ledger.js";
+import { bridgeNatsClaimAction, openBridgeNatsLedger } from "./bridge-nats-ledger.js";
 import { openNatsBridgeSide, type NatsBridgeSideConfig } from "./bridge-nats-port.js";
 import type { NatsTopicAuthorize } from "./bridge-nats-topics.js";
 import {
@@ -20,7 +20,7 @@ import { MeshStore, meshAlarmRecipient } from "./store.js";
 import { systemdWatchdogNotify } from "./systemd-watchdog.js";
 
 /**
- * The A' link (smarty-dev#15310, lane L2): Ryzen 1's file mesh <-> the org's NATS broker, as the
+ * The A' link (smarty-dev#15310, lane L2): the hub's file mesh <-> the org's NATS broker, as the
  * existing MeshBridge with the file store as its local StoreBridgeSide and NatsCarrierSide (over
  * lane L1's BridgeNatsPort) as its remote. L5's `nats-link start` calls startNatsLink.
  *
@@ -37,7 +37,7 @@ const STOP_MS = 5_000;
 
 /** What startNatsLink reads from the link config (L5's parsed NatsLinkConfig is assignable to it). */
 export interface NatsLinkStartConfig {
-  /** This hub's bridge name (MeshBridge localName), e.g. `ryzen1`. */
+  /** This hub's bridge name (MeshBridge localName). */
   readonly name: string;
   /** The link name (MeshBridge remoteName; the remoteHost of NATS mirrors), e.g. `v2`. */
   readonly link: string;
@@ -163,7 +163,10 @@ export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsC
         ...(input.ownerMachine !== undefined ? { targetMachine: input.ownerMachine } : {}),
         deadlineAt: input.deadlineAt, ...(input.body !== undefined ? { resolvedBody: input.body } : {}),
       });
-      return { created: result.created, record: record(result.record) };
+      // L3's one never-blocking decision per claim, verbatim.
+      const decided = bridgeNatsClaimAction(result);
+      return { created: result.created, record: record(result.record), action: decided.action,
+        ...(decided.action === "refuse" ? { refuse: decided.refuse } : {}) };
     },
     async lookup(direction, id) {
       const stored = ledger.lookup(direction, id);

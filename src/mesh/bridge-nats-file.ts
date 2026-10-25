@@ -448,6 +448,11 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
       this.#log(`toNats: ${event.topic} ${event.data.bridge.id} needs no send: ${plan.reason}`);
       return { sequence: 0 };
     }
+    if (plan.kind === "answer") {
+      // A recorded answer replayed to the source: it must land (a retry re-presents the event), never be logged away.
+      await this.#writeFileAnswer(plan.answer);
+      return { sequence: 0 };
+    }
     let sent: TransportSent<Record<string, unknown>>;
     try { sent = await this.#send(plan.envelope); } catch (error) { throw deferTransient(error); }
     // An ACK going back to a NATS sender is that command's forward; a command is now sent.
@@ -461,12 +466,13 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
    * committed only while this link still holds the owner it speaks for (the held fence).
    */
   async #answerFileSender(answer: NatsCarrierFileAnswer): Promise<void> {
-    try {
-      await this.#file.publish({ topic: BRIDGE_NATS_ACK_TOPIC, kind: "rejected", from: answer.from, to: answer.to,
-        data: { ...answer.data, bridge: { from: this.#link, id: `refused:${answer.refusedEventId}` } } }, [answer.from.id]);
-    } catch (error) {
-      this.#log(`toNats: could not answer the refusal of ${answer.refusedEventId}: ${message(error)}`);
-    }
+    try { await this.#writeFileAnswer(answer); }
+    catch (error) { this.#log(`toNats: could not write ${answer.stampId}: ${message(error)}`); }
+  }
+
+  #writeFileAnswer(answer: NatsCarrierFileAnswer): Promise<{ sequence: number }> {
+    return this.#file.publish({ topic: BRIDGE_NATS_ACK_TOPIC, kind: answer.data.accepted === true ? "accepted" : "rejected",
+      from: answer.from, to: answer.to, data: { ...answer.data, bridge: { from: this.#link, id: answer.stampId } } }, [answer.from.id]);
   }
 
   /**

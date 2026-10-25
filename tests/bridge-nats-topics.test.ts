@@ -115,7 +115,7 @@ describe("N3 topic translator", () => {
       now: () => T, maxTextBytes: 64 });
     const plan = await topics.outbound(taskDone({ text: "é".repeat(100) }));
     if (plan.kind !== "send") throw new Error("expected a send");
-    expect(plan.envelope.body.message).toMatch(/^\[mesh fleet\.work\.tasks\/answer from fleet-tool:smarty-task-ryzen2\]\n(é){32}\n\[\.\.\. 136 more bytes in the Ryzen 1 mesh event\]$/);
+    expect(plan.envelope.body.message).toMatch(/^\[mesh fleet\.work\.tasks\/answer from fleet-tool:smarty-task-ryzen2\]\n(é){32}\n\[\.\.\. 136 more bytes in the hub's mesh event\]$/);
   });
 
   it("re-sends a stale-epoch refusal to the root's new epoch, bounded; any other answer is final", async () => {

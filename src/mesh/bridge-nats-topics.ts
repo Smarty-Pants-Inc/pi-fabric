@@ -14,9 +14,9 @@ import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, type MeshIdentity } 
 
 /**
  * N3 topic translator (smarty-dev#15310, A' lane L2). A NATS Main's RootInbox reads addressed work
- * topics only from its own local log (root-inbox.ts:375), so a Ryzen 1 event addressed to a moved
- * lead (a `smarty-task-ryzen2` completion on fleet.work.tasks, a `smarty-report` lane report on
- * fleet.work.lanes, an inbox-age or bridge alarm on ops.owner) would never reach it. MeshBridge
+ * topics only from its own local log (root-inbox.ts:375), so a hub event addressed to a moved
+ * lead (a task completion on fleet.work.tasks, a lane report on fleet.work.lanes, an inbox-age or
+ * bridge alarm on ops.owner) would never reach it. MeshBridge
  * still selects and checks these events toward the NATS side as it does for a file peer; this
  * module turns each one into ONE keyed followUp to the addressed NATS root.
  *
@@ -83,7 +83,7 @@ const boundedText = (text: string, maxBytes: number): string => {
   if (bytes <= maxBytes) return text;
   let cut = Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
   if (cut.endsWith("\uFFFD")) cut = cut.slice(0, -1);
-  return `${cut}\n[... ${bytes - Buffer.byteLength(cut, "utf8")} more bytes in the Ryzen 1 mesh event]`;
+  return `${cut}\n[... ${bytes - Buffer.byteLength(cut, "utf8")} more bytes in the hub's mesh event]`;
 };
 
 const label = (value: unknown): string | undefined =>
@@ -191,8 +191,6 @@ export class NatsTopicTranslator {
     const idempotencyKey = bridgeNatsTopicIdempotencyKey(this.link, eventId);
     const commandId = bridgeNatsCommandId({ hostId, ownerHostId: route.ownerHostId, ownerIdentityId: route.ownerIdentityId,
       targetId: route.ownerIdentityId, operation: "followUp", idempotencyKey, notRunAttempt: attempt });
-    const existing = await this.#ledger.lookup("toNats", commandId);
-    if (existing) return this.#resend(existing);
     const now = this.#now();
     const body = JSON.parse(JSON.stringify({
       version: 1, commandId, targetId: route.ownerIdentityId, operation: "followUp", ownerIncarnation: route.ownerIncarnation,
@@ -211,8 +209,14 @@ export class NatsTopicTranslator {
       bodyDigest: controlBodyFingerprint(body, undefined), deadlineAt: now + this.#timeoutMs,
       expiresAt: now + this.#timeoutMs + BRIDGE_NATS_HORIZON_MS, ownerIncarnation: route.ownerIncarnation, body,
     };
-    const { created, record: stored } = await this.#ledger.claim(record);
-    return created ? { kind: "send", envelope, record } : this.#resend(stored);
+    // L3's claim table (bridgeNatsClaimAction): only an unconfirmed claim is resent, from its recorded bytes.
+    const claim = await this.#ledger.claim(record);
+    switch (claim.action) {
+      case "publish": return { kind: "send", envelope, record };
+      case "resend": return this.#resend(claim.record);
+      case "awaitAck": case "replayAck": return { kind: "absorb", reason: "topic followUp already delivered to its root" };
+      case "refuse": throw new NatsCarrierRefusal("topic followUp id collides with another command", claim.refuse);
+    }
   }
 
   /** The first envelope again, from the recorded id, machine and body bytes. */

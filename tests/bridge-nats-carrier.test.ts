@@ -78,14 +78,22 @@ describe("file -> NATS commands", () => {
     expect(ledger.records.size).toBe(1);
   });
 
-  it("a same-key resend (new file event, same commandId and input) goes out under its own envelope id", async () => {
-    const { carrier } = setup();
+  it("a same-key resend follows L3's claim table: resend unconfirmed bytes, await a sent one, replay a recorded answer", async () => {
+    const { carrier, ledger } = setup();
     const first = sendOf(await carrier.outbound(fileCommand()));
-    const again = sendOf(await carrier.outbound(fileCommand({ eventId: "file-event-2", requestedAt: T + 5, deadlineAt: T + 30_005 })));
-    // A new Nats-Msg-Id the broker window cannot swallow; the same mapped commandId and digest the owner replays on.
-    expect(again.envelope.id).toBe(bridgeNatsEnvelopeId(LINK, "file-event-2"));
-    expect(again.envelope.body.commandId).toBe(first.envelope.body.commandId);
-    expect(controlBodyFingerprint(again.envelope.body, again.envelope.principal)).toBe(first.record!.bodyDigest);
+    const again = () => carrier.outbound(fileCommand({ eventId: "file-event-2", requestedAt: T + 5, deadlineAt: T + 30_005 }));
+    // Unconfirmed: the first envelope again, byte for byte.
+    expect(JSON.stringify(sendOf(await again()).envelope)).toBe(JSON.stringify(first.envelope));
+    // The destination confirmed it: nothing to send, the owner's ACK arrives on its own (never blocks).
+    await carrier.sent(first.record!, 3);
+    expect(await again()).toMatchObject({ kind: "absorb" });
+    // The owner answered: the recorded answer goes back to this event's sender at once, nothing to NATS.
+    const recorded = { version: 1, commandId: "file-cmd-1", targetId: natsLead.id, accepted: true, messageId: "m-1", ownerIncarnation: "inc-moved-lead" };
+    await carrier.settle({ direction: "toNats", commandId: first.record!.destinationCommandId, accepted: true, fromId: natsLead.id,
+      ackEventId: `ack:${first.envelope.id}`, data: recorded }, true);
+    expect(await again()).toEqual({ kind: "answer", reason: "answered from the recorded outcome",
+      answer: { to: fileLead.id, from: natsLead, stampId: "replay:file-event-2", data: recorded } });
+    expect(ledger.records.size).toBe(1);
   });
 
   it("carries steer, stop, ask and a legacy command without deadlineAt", async () => {
@@ -276,8 +284,10 @@ describe("NATS -> file commands", () => {
   it("a NATS same-key resend under a new envelope gets the owner's recorded answer, or waits for the first ACK", async () => {
     const { carrier } = setup();
     await carrier.inbound(delivery(natsCommand()));
-    // No answer recorded yet: the first ACK (matched by commandId and digest) settles both attempts.
-    expect(await carrier.inbound(delivery(natsCommand({}, { id: "nats-env-2" })))).toMatchObject({ kind: "settled" });
+    // No answer recorded yet (claim table: resend): presented again under the same mapped id; the file store's
+    // receipt makes it one append, and the first ACK (matched by commandId and digest) settles both attempts.
+    const resent = await carrier.inbound(delivery(natsCommand({}, { id: "nats-env-2" })));
+    expect(resent).toMatchObject({ kind: "event", event: { data: { commandId: bridgeNatsMappedCommandId(LINK, "toFile", natsLead.id, "nats-cmd-1") } } });
     const mapped = bridgeNatsMappedCommandId(LINK, "toFile", natsLead.id, "nats-cmd-1");
     const answer = sendOf(await carrier.outbound({ topic: "fabric.control.ack", kind: "accepted", from: fileLead, to: natsLead.id,
       data: { version: 1, commandId: mapped, targetId: fileLead.id, ownerIncarnation: "inc-file-lead", accepted: true, messageId: "m-1",

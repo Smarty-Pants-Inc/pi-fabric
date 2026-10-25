@@ -2,8 +2,8 @@
 // BridgeNatsPort that records sends and feeds inbox deliveries. Not a broker: L4's harness owns E2E.
 import type { BridgePresence } from "../../src/mesh/bridge.js";
 import type {
-  FilePresenceEntry, NatsCarrierDirection, NatsCarrierLedger, NatsCarrierOutcome, NatsCarrierPresence, NatsCarrierRecord,
-  NatsPresenceEntry,
+  FilePresenceEntry, NatsCarrierClaim, NatsCarrierDirection, NatsCarrierLedger, NatsCarrierOutcome, NatsCarrierPresence,
+  NatsCarrierRecord, NatsPresenceEntry,
 } from "../../src/mesh/bridge-nats-carrier.js";
 import type {
   BridgeNatsMirrorSet, BridgeNatsPort, BridgeNatsPortDelivery, BridgeNatsPortResolved, BridgeNatsPresenceRecord, BridgeNatsPresenceView,
@@ -20,16 +20,28 @@ export const natsLead: MeshIdentity = { id: "session:22222222-2222-4222-8222-222
 export const otherNats: MeshIdentity = { id: "session:33333333-3333-4333-8333-333333333333", name: "other-v2", kind: "main" };
 export const linkIdentity: MeshIdentity = { id: `bridge:${LINK}`, name: "mesh-bridge", kind: "main" };
 
+/** In-memory carrier ledger with L3's claim table (bridge-nats-ledger.ts claim + bridgeNatsClaimAction). */
 export class MemoryLedger implements NatsCarrierLedger {
   readonly records = new Map<string, NatsCarrierRecord>();
   readonly settled = new Map<string, NatsCarrierOutcome>();
-  async claim(record: NatsCarrierRecord): Promise<{ created: boolean; record: NatsCarrierRecord }> {
+  readonly sentKeys = new Set<string>();
+  async claim(record: NatsCarrierRecord): Promise<NatsCarrierClaim> {
     const key = `${record.direction}:${record.destinationCommandId}`;
     const existing = this.records.get(key);
-    if (existing) return { created: false, record: existing };
-    this.records.set(key, JSON.parse(JSON.stringify(record)) as NatsCarrierRecord);
-    return { created: true, record: this.records.get(key)! };
+    if (!existing) {
+      this.records.set(key, JSON.parse(JSON.stringify(record)) as NatsCarrierRecord);
+      return { created: true, record: this.records.get(key)!, action: "publish" };
+    }
+    if (existing.bodyDigest !== record.bodyDigest) return { created: false, record: existing, action: "refuse", refuse: "BRIDGE_NATS_ID_CONFLICT" };
+    if (existing.sourceMachine !== record.sourceMachine || existing.requesterId !== record.requesterId ||
+        existing.sourceCommandId !== record.sourceCommandId || existing.replyTo !== record.replyTo ||
+        existing.targetId !== record.targetId || existing.operation !== record.operation) {
+      return { created: false, record: existing, action: "refuse", refuse: "BRIDGE_NATS_CLAIM_MISMATCH" };
+    }
+    if (existing.outcome) return { created: false, record: existing, action: "replayAck" };
+    return { created: false, record: existing, action: this.sentKeys.has(key) ? "awaitAck" : "resend" };
   }
+  async sent(direction: NatsCarrierDirection, id: string): Promise<void> { this.sentKeys.add(`${direction}:${id}`); }
   async lookup(direction: NatsCarrierDirection, id: string): Promise<NatsCarrierRecord | undefined> {
     return this.records.get(`${direction}:${id}`);
   }

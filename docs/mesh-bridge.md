@@ -292,14 +292,20 @@ existing events and mirrors root presence. The additive publish-receipt hello ca
   store contention can still delay traffic. In `mesh-bridge agent`, one worker owns the store,
   both lanes, directory watches and topology scans. The stdio thread never opens the store: it
   answers `ping` from memory with a `busy` flag, and serves a bounded, exact-cursor tail mailbox.
-  A missing page replies immediately with `busy: true` and unchanged sequence/offset, coalesces
-  the worker read, and wakes the retained drain when ready. Busy pages are not caught-up or
-  delivery evidence; the hub uses notifications and a bounded safety retry without advancing its
-  durable cursor. Publication receipts still wait for durable writes, and their existing fatal
+  A hub opts into busy-tail replies with `busyTail: true` in hello; a successful negotiation
+  advertises the same capability. Without that opt-in, tails return ordinary completed pages
+  from the worker, never an unexpected busy page. For opted-in hubs, a tail admitted while
+  worker work is pending replies immediately with `busy: true` and unchanged sequence/offset.
+  An idle admission gives the worker 50 ms to return its page in that same RPC; if still pending,
+  it returns busy and retains the read. A completed retained read wakes the drain when ready.
+  Busy pages are not caught-up or delivery evidence; the hub uses notifications and a bounded
+  safety retry without advancing its durable cursor. Publication receipts still wait for durable writes, and their existing fatal
   30 s default deadline is unchanged. Mirror arrival time is captured before the worker queue.
-  Input shutdown disposes watches and skips queued work; the stdio owner gives the worker two
-  seconds to settle before terminating it. Debug RPC timing is opt-in, contains no event bodies,
-  and reports `queueDepth` as the number of earlier requests in that request's worker lane at
+  Input shutdown disposes watches and skips queued work; after a two-second cleanup grace the
+  stdio owner requests worker termination. A native SQLite call can delay actual termination,
+  promise settlement and process exit until that call returns; the grace is not a hard shutdown
+  bound. Debug RPC timing is opt-in, contains no event bodies, and reports `queueDepth` as the
+  number of earlier requests in that request's worker lane at
   admission, including its in-service request, not work in the independent lane.
 
 ## Control deadlines and retention

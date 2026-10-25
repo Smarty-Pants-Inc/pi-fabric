@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { procStartTime } from "../src/main-drain/binding.js";
@@ -33,11 +34,17 @@ const leadEntry = { kind: "root", id: LEAD, send: ["followUp"] };
 const header = JSON.stringify({ type: "session", version: 3, id: SID, timestamp: "2026-10-25T00:00:00.000Z", cwd: "/synthetic" });
 const entry = (id: string, parentId: string | null, extra: Record<string, unknown> = {}) =>
   JSON.stringify({ type: "message", id, parentId, timestamp: "2026-10-25T00:00:01.000Z", ...extra });
-const SEALED = `${header}\n${entry("e1", null)}\n${entry("e2", "e1")}\n`;
+/** A sealed journal whose branch already has a thinking_level_change: Pi appends nothing on resume. */
+const SEALED = `${header}\n${entry("e1", null)}\n${JSON.stringify({ type: "thinking_level_change", id: "t1", parentId: "e1",
+  timestamp: "2026-10-25T00:00:01.500Z", thinkingLevel: "medium" })}\n${entry("e2", "t1")}\n`;
+/** A sealed journal (an older session) whose branch has none: Pi appends exactly one on resume. */
+const SEALED_BARE = `${header}\n${entry("e1", null)}\n${entry("e2", "e1")}\n`;
 const THINKING = `${JSON.stringify({ type: "thinking_level_change", id: "e3", parentId: "e2", timestamp: "2026-10-25T00:00:02.000Z", thinkingLevel: "high" })}\n`;
 
 interface World {
   seat: Seat; kube: string; marker: string; config: string; calls: () => Array<{ argv: string[] }>; journalFile: string;
+  /** The sealed source journal text A's final seal describes. */
+  sealed: string;
   status: { ok: boolean; problems: string[]; allow: { file: Array<Record<string, unknown>>; nats: Array<Record<string, unknown>> } };
   receipt: Record<string, unknown>; roots: Array<Record<string, unknown>>; holderStuck: boolean;
   /** What `nats-link status` reads once the unit was restarted (default: the same as before). */
@@ -48,7 +55,9 @@ interface World {
   seenConfigs: Array<{ allow: unknown }>;
 }
 
-const world = async (options: { podJournal?: string; machines?: string[]; allow?: Record<string, unknown> } = {}): Promise<World> => {
+const world = async (options: { podJournal?: string; machines?: string[]; allow?: Record<string, unknown>; sealed?: string } = {}):
+  Promise<World> => {
+  const sealed = options.sealed ?? SEALED;
   const seat = await createSeat({ kube: { kubeconfig: "/placeholder", server: SERVER, caSha256: sha(CA) } });
   seats.push(seat);
   const kube = path.join(seat.base, "kube");
@@ -61,9 +70,9 @@ const world = async (options: { podJournal?: string; machines?: string[]; allow?
   const journalPath = path.join(seat.runDir, "seat-journal.jsonl");
   const records = fs.readFileSync(journalPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
   records[1].sha256 = sha(fs.readFileSync(inputsFile));
-  // A's final seal of the source journal (SEALED), journaled once.
+  // A's final seal of the source journal (the sealed text), journaled once.
   const sourceJournal = JSON.parse(fs.readFileSync(path.join(seat.runDir, "seat-run.json"), "utf8")).source.journal as string;
-  const seal = Buffer.from(`${JSON.stringify(finalSealFor(seat, sourceJournal))}\n`);
+  const seal = Buffer.from(`${JSON.stringify(finalSealFor(seat, sourceJournal, sealed))}\n`);
   fs.mkdirSync(path.join(seat.runDir, "receipts"), { mode: 0o700 });
   fs.writeFileSync(path.join(seat.runDir, "receipts", "final-seal.json"), seal, { mode: 0o400 });
   records.push({ event: "final-seal", sha256: sha(seal) });
@@ -71,7 +80,7 @@ const world = async (options: { podJournal?: string; machines?: string[]; allow?
   fs.writeFileSync(path.join(kube, "config"), "synthetic", { mode: 0o600 });
   // The Pod's own journal, read by the REAL journal reader to make the in-Pod CLI's line.
   const journalFile = path.join(seat.base, "pod-journal.jsonl");
-  fs.writeFileSync(journalFile, options.podJournal ?? SEALED);
+  fs.writeFileSync(journalFile, options.podJournal ?? sealed);
   const kubectl = path.join(kube, "kubectl");
   fs.copyFileSync(path.join("tests", "fixtures", "fake-kubectl.py"), kubectl);
   fs.chmodSync(kubectl, 0o700);
@@ -91,7 +100,7 @@ const world = async (options: { podJournal?: string; machines?: string[]; allow?
   const systemctl = path.join(seat.base, "systemctl");
   fs.writeFileSync(systemctl, `#!/bin/sh\necho "$@" >> ${marker}\n`, { mode: 0o700 });
   const w: World = {
-    seat, kube, marker, config, journalFile,
+    seat, kube, marker, config, journalFile, sealed,
     calls: () => fs.existsSync(path.join(kube, "kube-calls.jsonl"))
       ? fs.readFileSync(path.join(kube, "kube-calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line)) : [],
     status: { ok: true, problems: [], allow: { file: [{ identity: LEAD, live: true }, { identity: `session:${SID}`, live: true }], nats: [] } },
@@ -100,10 +109,12 @@ const world = async (options: { podJournal?: string; machines?: string[]; allow?
   return w;
 };
 
-/** A's final seal: exactly seven keys (A at 7d2e09af+, rule T-FIX3). */
-const finalSealFor = (seat: Seat, journal?: string) => ({ schema: "d3-seat-final-seal-v1", run: seat.run,
+/** A's final seal: exactly seven keys (A at 7d2e09af+, rule T-FIX3); the leaf is the last line's id. */
+const finalSealFor = (seat: Seat, journal?: string, sealed = SEALED) => ({ schema: "d3-seat-final-seal-v1", run: seat.run,
   journal: journal ?? JSON.parse(fs.readFileSync(path.join(seat.runDir, "seat-run.json"), "utf8")).source.journal as string,
-  journalSha256: sha(SEALED), journalBytes: Buffer.byteLength(SEALED), leafId: "e2", sealHasThinkingEntry: false });
+  journalSha256: sha(sealed), journalBytes: Buffer.byteLength(sealed),
+  leafId: (JSON.parse(sealed.trim().split("\n").at(-1)!) as { id: string }).id,
+  sealHasThinkingEntry: sealed.split("\n").some(line => line.includes('"type":"thinking_level_change"')) });
 
 /** Re-seal the run with a change (and every pin that names its sha256), as a different A packet would. */
 const resealRun = (w: World, mutate: (run: Record<string, unknown>) => void): void => {
@@ -135,7 +146,7 @@ const setKube = (w: World, pod: { name: string; uid: string }, identity: { line:
 
 /** The in-Pod CLI's `--identity` line, with the journal read by the REAL reader over the synthetic Pod journal. */
 const identityLine = (w: World, options: { leafId?: string; sessionFile?: string; ownerIncarnation?: string; journal?: unknown } = {}) => {
-  const journal = options.journal ?? journalBranch(w.journalFile, "e2", Buffer.byteLength(SEALED));
+  const journal = options.journal ?? journalBranch(w.journalFile, "e2", Buffer.byteLength(w.sealed));
   const leaf = options.leafId ?? (journal as { leafId: string }).leafId;
   return JSON.stringify({ format: 1, sessionId: SID, ptraceScope: "1", op: "identity", identity: { rootId: `session:${SID}`, pid: 7,
     meshRoot: "/var/lib/fabric/mesh", sessionFile: options.sessionFile ?? POD_JOURNAL, leafId: leaf,
@@ -170,7 +181,7 @@ const run = async (w: World, phase: string, given: Record<string, unknown> | ((w
   return { code, stdout, stderr, receipt: stdout ? JSON.parse(stdout) as Record<string, any> : undefined };
 };
 
-const resumeInputs = (w: World) => ({ pod: RAW, finalSeal: finalSealFor(w.seat) });
+const resumeInputs = (w: World) => ({ pod: RAW, finalSeal: finalSealFor(w.seat, undefined, w.sealed) });
 const evidenceOf = (w: World, name: string) => JSON.parse(fs.readFileSync(path.join(w.seat.runDir, name), "utf8"));
 
 describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in the raw Pod", () => {
@@ -187,12 +198,44 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
   });
 
   it("reports exactly the one thinking_level_change Pi appends on resume, its bytes and the true leaf", async () => {
-    const w = await world({ podJournal: SEALED + THINKING });
+    const w = await world({ sealed: SEALED_BARE, podJournal: SEALED_BARE + THINKING });
     setKube(w, RAW, { line: identityLine(w) });
     const result = await run(w, "resume", resumeInputs);
-    expect(result.receipt).toMatchObject({ result: "pass", observed: { leafId: "e3", journalSha256: sha(SEALED + THINKING),
+    expect(result.receipt).toMatchObject({ result: "pass", observed: { leafId: "e3", journalSha256: sha(SEALED_BARE + THINKING),
       suffixBase64: Buffer.from(THINKING).toString("base64"),
       appendedSinceSeal: [{ id: "e3", parentId: "e2", type: "thinking_level_change", thinkingLevel: "high" }] } });
+  });
+
+  it("a seal WITHOUT a thinking entry and no append is not a completed resume: re-observed, bounded, then UNKNOWN", async () => {
+    const w = await world({ sealed: SEALED_BARE });
+    setKube(w, RAW, { line: identityLine(w) });
+    expect(await run(w, "resume", resumeInputs)).toMatchObject({ code: 2, stdout: "",
+      stderr: "GAP: resume-thinking-append-missing [owner: fabric-v2]\n" });
+    const outcome = evidenceOf(w, "fabric-v2-bridge-resume-outcome.json");
+    expect(outcome).toMatchObject({ result: "unknown", gap: "resume-thinking-append-missing",
+      measured: { finalSeal: { sealHasThinkingEntry: false }, journal: { appendedSinceSeal: [], suffixBytes: 0 } } });
+    // It waited, bounded (120 s at one observation per 2 s, on the test's clock), re-reading the Pod each time.
+    expect(outcome.measured.observations).toBe(60);
+    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(60);
+    expect(outcome.elapsedMs).toBeLessThanOrEqual(120_000);
+  }, 60_000);
+
+  it("the counterexample: Pi's one append arriving DURING the wait passes, with the new leaf", async () => {
+    const w = await world({ sealed: SEALED_BARE });
+    setKube(w, RAW, { line: identityLine(w) });
+    let sleeps = 0;
+    const result = await run(w, "resume", resumeInputs, { sleep: async () => {
+      sleeps += 1;
+      if (sleeps === 3) { fs.appendFileSync(w.journalFile, THINKING); setKube(w, RAW, { line: identityLine(w) }); }
+    } });
+    expect(result.receipt).toMatchObject({ result: "pass", observed: { leafId: "e3",
+      appendedSinceSeal: [{ id: "e3", parentId: "e2", type: "thinking_level_change", thinkingLevel: "high" }] } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json").measured.observations).toBe(4);
+    // A seal WITH a thinking entry is not waited on: one observation, and no append passes.
+    const sealedThinking = await world();
+    setKube(sealedThinking, RAW, { line: identityLine(sealedThinking) });
+    expect((await run(sealedThinking, "resume", resumeInputs)).receipt).toMatchObject({ result: "pass" });
+    expect(evidenceOf(sealedThinking, "fabric-v2-bridge-resume-outcome.json").measured.observations).toBe(1);
   });
 
   it("a diverged branch (the sealed leaf is no ancestor of the current leaf) is UNKNOWN: no receipt", async () => {
@@ -234,7 +277,7 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     // A's real input is its whole 7-key seal: the old 3-key subset, or a 6-key seal without sealHasThinkingEntry, is refused.
     const { sealHasThinkingEntry: _drop, ...sixKeys } = finalSealFor(w.seat);
     expect(await run(w, "resume", { pod: RAW, finalSeal: sixKeys })).toMatchObject({ code: 2, stderr: "GAP: inputs-invalid [owner: fabric-v2]\n" });
-    expect(await run(w, "resume", { pod: RAW, finalSeal: { ...finalSealFor(w.seat), sealHasThinkingEntry: true } }))
+    expect(await run(w, "resume", { pod: RAW, finalSeal: { ...finalSealFor(w.seat), sealHasThinkingEntry: !finalSealFor(w.seat).sealHasThinkingEntry } }))
       .toMatchObject({ code: 2, stderr: "GAP: final-seal-mismatch [owner: fabric-v2]\n" });
     expect(await run(w, "resume", { pod: RAW, finalSeal: { ...finalSealFor(w.seat), leafId: "e1" } }))
       .toMatchObject({ code: 2, stderr: "GAP: final-seal-mismatch [owner: fabric-v2]\n" });
@@ -313,11 +356,70 @@ describe.skipIf(!linux || !A_CONSUMER || !A_CODE)("the resume contract against A
       effectiveThinkingLevel: "high" } });
   });
 
-  it("the counterexample: no thinking entry and NO append is the seam's true report, and A refuses it", async () => {
+  it("no thinking entry and NO append is not a completed resume: BOTH sides refuse it", async () => {
     const { seam, consumed } = await contract(`${entry("e1", null)}\n${entry("e2", "e1")}\n`, "");
-    expect(seam.receipt).toMatchObject({ result: "pass", observed: { leafId: "e2", appendedSinceSeal: [] } });
-    expect(consumed).toEqual({ ok: false, gap: "resume-identity-mismatch [owner: fabric-v2]" });
+    expect(seam).toMatchObject({ code: 2, stdout: "", stderr: "GAP: resume-thinking-append-missing [owner: fabric-v2]\n" });
+    expect(consumed).toEqual({ ok: false, gap: "seam-refused-or-unknown:resume [owner: fabric-v2]" });
   });
+});
+
+// The contract with the REAL pinned Pi (#1609 ruling): Pi opens an existing session whose branch has no
+// thinking_level_change and appends exactly one, before any prompt. D3_PINNED_PI names the pinned Pi package's CLI
+// (`<package>/dist/bundle/cli.js`); without it this is skipped. A Pi upgrade that changes the append fails here loudly.
+const PINNED_PI = process.env.D3_PINNED_PI;
+describe.skipIf(!linux || !PINNED_PI)("the resume contract against the REAL pinned Pi (external)", () => {
+  /** A sealed older session, as Pi writes it: a header and one user message, no thinking_level_change. */
+  const sealedFor = (project: string) => `${JSON.stringify({ type: "session", version: 3, id: SID, timestamp: "2026-10-25T00:00:00.000Z",
+    cwd: project })}\n${JSON.stringify({ type: "message", id: "e1", parentId: null, timestamp: "2026-10-25T00:00:01.000Z",
+    message: { role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1792886401000 } })}\n`;
+  const scene = () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "real-pi-")));
+    const dirs = { home: path.join(base, "home"), agent: path.join(base, "agent"), project: path.join(base, "project") };
+    for (const dir of Object.values(dirs)) fs.mkdirSync(dir, { mode: 0o700 });
+    return { ...dirs, sealed: sealedFor(dirs.project) };
+  };
+  /** The Pod's Pi starting on the session: the real CLI, isolated and offline, RPC mode, no prompt, stdin closed. */
+  const piResume = async (file: string, dirs: { home: string; agent: string; project: string }) => {
+    const { spawnSync } = await import("node:child_process");
+    const result = spawnSync(process.execPath, [PINNED_PI!, "--session", file, "--mode", "rpc", "--thinking", "high"], {
+      cwd: dirs.project, input: "", timeout: 60_000, encoding: "utf8",
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: dirs.home, PI_CODING_AGENT_DIR: dirs.agent, PI_OFFLINE: "1",
+        PI_SKIP_VERSION_CHECK: "1", ...(process.env.NODE_OPTIONS ? { NODE_OPTIONS: process.env.NODE_OPTIONS } : {}) } });
+    if (result.status !== 0) throw new Error(`pinned Pi exited ${result.status}: ${result.stderr}`);
+  };
+
+  it("Pi appends exactly ONE thinking_level_change on the sealed leaf, and the seam's resume passes over it", async () => {
+    const s = scene();
+    const w = await world({ sealed: s.sealed });
+    await piResume(w.journalFile, s);
+    const after = fs.readFileSync(w.journalFile, "utf8");
+    expect(after.startsWith(s.sealed)).toBe(true);
+    const suffix = after.slice(s.sealed.length);
+    expect(suffix.endsWith("\n")).toBe(true);
+    expect(suffix.trim().split("\n")).toHaveLength(1);
+    const appended = JSON.parse(suffix) as Record<string, unknown>;
+    expect(Object.keys(appended).sort()).toEqual(["id", "parentId", "thinkingLevel", "timestamp", "type"]);
+    expect(appended).toMatchObject({ type: "thinking_level_change", parentId: "e1", id: expect.stringMatching(/^[0-9a-f]{8}$/),
+      timestamp: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/), thinkingLevel: expect.any(String) });
+    setKube(w, RAW, { line: identityLine(w, { journal: journalBranch(w.journalFile, "e1", Buffer.byteLength(s.sealed)) }) });
+    const result = await run(w, "resume", resumeInputs);
+    expect(result.receipt).toMatchObject({ result: "pass", observed: { leafId: appended.id, suffixBase64: Buffer.from(suffix).toString("base64"),
+      appendedSinceSeal: [{ id: appended.id, parentId: "e1", type: "thinking_level_change", thinkingLevel: appended.thinkingLevel }] } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json").measured.observations).toBe(1);
+  }, 90_000);
+
+  it("before Pi has opened the session (zero appends), the seam refuses after the bounded wait", async () => {
+    const s = scene();
+    const w = await world({ sealed: s.sealed });
+    setKube(w, RAW, { line: identityLine(w, { journal: journalBranch(w.journalFile, "e1", Buffer.byteLength(s.sealed)) }) });
+    expect(await run(w, "resume", resumeInputs)).toMatchObject({ code: 2, stdout: "",
+      stderr: "GAP: resume-thinking-append-missing [owner: fabric-v2]\n" });
+    // The same file, once the real Pi has opened it, passes: the refusal was only "not resumed yet".
+    await piResume(w.journalFile, s);
+    const again = await world({ sealed: s.sealed, podJournal: fs.readFileSync(w.journalFile, "utf8") });
+    setKube(again, RAW, { line: identityLine(again, { journal: journalBranch(again.journalFile, "e1", Buffer.byteLength(s.sealed)) }) });
+    expect((await run(again, "resume", resumeInputs)).receipt).toMatchObject({ result: "pass" });
+  }, 90_000);
 });
 
 const owner = { template: { name: "t", uid: "00000000-0000-4000-8000-000000000101" }, claim: { name: "c", uid: "00000000-0000-4000-8000-000000000102" },

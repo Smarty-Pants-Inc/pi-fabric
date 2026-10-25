@@ -238,7 +238,8 @@ const FINAL_SEAL_KEYS = "journal,journalBytes,journalSha256,leafId,run,schema,se
  * A's final seal, from RUN itself: RUN/receipts/final-seal.json, whose sha256 is the journal's ONE `final-seal`
  * record, for this run and the sealed source journal, and identical (all seven keys) to the request's finalSeal.
  */
-const finalSealOf = (context: Context, requested: Record<string, unknown>): { journalSha256: string; journalBytes: number; leafId: string } => {
+const finalSealOf = (context: Context, requested: Record<string, unknown>):
+  { journalSha256: string; journalBytes: number; leafId: string; sealHasThinkingEntry: boolean } => {
   const bytes = readOwned(path.join(context.runDir, "receipts", "final-seal.json"), context.uid, 64 * 1024, undefined, "final-seal-unreadable");
   const records = readOwned(path.join(context.runDir, "seat-journal.jsonl"), context.uid, 64 * 1024 * 1024, undefined, "seat-journal-unreadable")
     .toString("utf8").split("\n").filter(line => line.trim()).map(line => { try { return JSON.parse(line) as Record<string, unknown>; } catch { return {}; } })
@@ -253,8 +254,18 @@ const finalSealOf = (context: Context, requested: Record<string, unknown>): { jo
     throw new SeamGap("final-seal-invalid");
   }
   if (!FINAL_SEAL_KEYS.split(",").every(key => requested[key] === seal[key])) throw new SeamGap("final-seal-mismatch");
-  return { journalSha256: seal.journalSha256, journalBytes: seal.journalBytes as number, leafId: seal.leafId };
+  return { journalSha256: seal.journalSha256, journalBytes: seal.journalBytes as number, leafId: seal.leafId,
+    sealHasThinkingEntry: seal.sealHasThinkingEntry as boolean };
 };
+
+/**
+ * Pi (031c7499 sdk.js:135, :346-349) appends exactly one thinking_level_change when it opens an existing session whose
+ * branch has none, at session creation, before any prompt; the file gets it at once (session-manager #persistEntry).
+ * So for a seal without one, zero appended entries means Pi has not created the session on the target yet: not a
+ * completed resume. The seam re-observes for at most this long (within the phase deadline), then refuses.
+ */
+const APPEND_WAIT_MS = 120_000;
+const APPEND_POLL_MS = 2_000;
 
 const sessionArg = (pod: PodView | null): string | null => {
   const args = pod?.piArgs;
@@ -277,12 +288,24 @@ const resume = async (context: Context): Promise<number> => {
   const intentSha256 = evidence(context, "intent", { schema: "fabric-v2-bridge-resume-intent-v1", pod: pin, finalSeal: inputs.finalSeal,
     measured: { kubectl: access.kubectl, server: access.server, interpreter: interpreterIdentity(), startedAt: new Date().toISOString() },
     residuals: RESIDUALS });
-  const read = await podIdentity(context, access, pin, seal);
+  let read = await podIdentity(context, access, pin, seal);
+  let observations = 1;
+  // Only the one state that Pi's startup append ends is re-observed: the exact sealed bytes, nothing after them.
+  const awaitingAppend = (): boolean => !seal.sealHasThinkingEntry && read.reason === null && read.journal !== null &&
+    read.journal.sealedSha256 === seal.journalSha256 && read.journal.sealOnBranch && read.journal.suffixBytes === 0 &&
+    (read.journal.appendedSinceSeal ?? []).length === 0;
+  const wait = clock(context, APPEND_WAIT_MS);
+  while (awaitingAppend() && wait.now() + APPEND_POLL_MS < wait.deadline) {
+    await wait.sleep(APPEND_POLL_MS);
+    read = await podIdentity(context, access, pin, seal);
+    observations += 1;
+  }
   const rendered = sessionArg(read.before);
   const journal = read.journal;
   const gap = (code: string): never => {
     evidence(context, "outcome", { schema: "fabric-v2-bridge-resume-outcome-v1", result: "unknown", gap: code, intentSha256,
-      measured: { before: read.before, after: read.after, renderedSession: rendered, execCode: read.execCode, journal, finalSeal: seal },
+      measured: { before: read.before, after: read.after, renderedSession: rendered, execCode: read.execCode, journal, finalSeal: seal,
+        observations },
       asserted: { identity: read.identity, podLine: read.line } });
     throw new SeamGap(code);
   };
@@ -305,6 +328,8 @@ const resume = async (context: Context): Promise<number> => {
     const chained = appended.every((entry, index) => entry.parentId === (index === 0 ? seal.leafId : appended[index - 1]!.id));
     if (!chained || !sameEntries(appended, journal.appendedSinceSeal ?? []) ||
       journal.leafId !== (appended.at(-1)?.id ?? seal.leafId)) gap("journal-suffix-not-the-branch");
+    // A seal without a thinking entry and still no append after the bounded wait: Pi has not resumed this session.
+    if (!seal.sealHasThinkingEntry && appended.length === 0) gap("resume-thinking-append-missing");
   }
   if (!reason && !rendered) reason = "pod-session-arg-unknown";
   if (!reason && read.identity!.sessionFile !== rendered) reason = "journal-mismatch";
@@ -315,7 +340,7 @@ const resume = async (context: Context): Promise<number> => {
   const passed = reason === null;
   evidence(context, "outcome", { schema: "fabric-v2-bridge-resume-outcome-v1", result: passed ? "pass" : "refused", reason, intentSha256,
     observed, measured: { before: read.before, after: read.after, renderedSession: rendered, execCode: read.execCode, journal,
-      finalSeal: seal }, asserted: { identity: read.identity, podLine: read.line } });
+      finalSeal: seal, observations }, asserted: { identity: read.identity, podLine: read.line } });
   context.io.stdout(receipt(context.request, passed ? "pass" : "refused", observed));
   return 0;
 };

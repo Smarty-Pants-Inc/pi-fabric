@@ -232,6 +232,7 @@ Post these on smarty-dev#15310 with the run id, the UTC time and the pass or FAI
 | `GAP: final-seal-*` | A's final seal is missing, unjournaled or differs from the request | A's owner |
 | `GAP: journal-prefix-mismatch` | the Pod's journal no longer starts with the sealed bytes | stop: the copy is not the sealed journal |
 | `GAP: branch-diverged` or `journal-suffix-*` | the resumed session moved off the sealed branch, or grew too much | stop |
+| `GAP: resume-thinking-append-missing` | the seal has no thinking entry and, after 120 s of re-reads, the Pod's journal still holds only the sealed bytes: Pi has not opened the session (a real resume appends exactly one `thinking_level_change` at start). Check that pi runs with the rendered `--session` and has started; this is not a completed resume | fabric-v2 |
 | `GAP: seat-mesh-not-link-mesh` | the v1 seat's mesh is not the link's file mesh | fabric-v2 |
 | `refused`, `pod-identity-unreadable` | the Pod's CLI lacks `--identity`, or its server check failed: read `asserted.podLine` | the image owner, or fabric-v2 |
 | `refused`, `link-not-reloaded` | no new lock holder, or a status problem: read `measured.reload` | the link's operator |

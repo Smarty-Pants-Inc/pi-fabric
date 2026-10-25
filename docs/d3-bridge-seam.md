@@ -59,6 +59,9 @@ Observed: `{sessionId, journal, leafId, podUid, appendedSinceSeal, journalSha256
    - the file's sha256 and the sha256 of its first `<n>` bytes;
    - the bytes after them, base64, when they are at most 64 KiB.
 4. The Pod is read again: same UID, pi still running.
+5. If the seal has no thinking entry (`sealHasThinkingEntry: false`) and the file is still exactly the sealed bytes,
+   Pi has not opened the session yet: steps 2-4 are repeated every 2 s for at most 120 s, within the phase
+   deadline.
 
 No receipt (exit 2) when:
 - the first `<n>` bytes do not hash to the final seal (`journal-prefix-mismatch`);
@@ -66,17 +69,22 @@ No receipt (exit 2) when:
 - the sealed leaf is not an ancestor of the current leaf (`branch-diverged`);
 - the suffix bytes, parsed by the seam, are not exactly the reported entries chained from the sealed leaf
   (`journal-suffix-not-the-branch`). This check means the seam verifies the CLI's branch read for the appended
-  part.
+  part;
+- the seal has no thinking entry and, after the wait in step 5, nothing was appended
+  (`resume-thinking-append-missing`). That state is not a completed resume (see below).
 
 A `refused` receipt when:
 - the Pod or its Main cannot be read;
 - the Main runs another session file than the rendered `--session` (`journal-mismatch`);
 - the Main's leaf differs from its file's last entry (`leaf-memory-file-mismatch`).
 
-Pi core appends one `thinking_level_change` entry on resume when the sealed branch has none. A judges
-`appendedSinceSeal` under its rule T-FIX3: it re-reads the host journal from its final seal, checks
-`sha256(sealed bytes + decoded suffix) == journalSha256`, and that the suffix parses to exactly `appendedSinceSeal`.
-The seam reports it exactly as found.
+Pi core appends one `thinking_level_change` entry on resume when the sealed branch has none: at session creation,
+before any prompt, written to the file at once (pinned Pi 031c7499: `sdk.js:135`, `sdk.js:346-349`). So a seal
+without a thinking entry and zero appended entries means Pi has not resumed yet. A seal without one is still valid
+(older sessions). A judges `appendedSinceSeal` under its rule T-FIX3: it re-reads the host journal from its final
+seal, checks `sha256(sealed bytes + decoded suffix) == journalSha256`, and that the suffix parses to exactly
+`appendedSinceSeal`. The seam reports the append exactly as found. A test runs the real pinned Pi CLI on a sealed
+session and checks the one append and the seam's pass over it (`D3_PINNED_PI`, skipped without it).
 
 ## `publish`
 

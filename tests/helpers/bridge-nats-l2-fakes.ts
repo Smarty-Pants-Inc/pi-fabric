@@ -98,13 +98,13 @@ export class FakePort implements BridgeNatsPort {
     return { id: envelope.id, sequence: ++this.#sequence, duplicate: false, envelope: { ...envelope, body, createdAt: Date.now() } };
   }
 
-  /** Queue one inbox delivery; returns its handle (ack/term counters). */
-  deliver(envelope: Record<string, unknown>, sourceMachine = POD_MACHINE, streamSequence = ++this.#stream): FakeDelivery {
+  /** Queue one inbox delivery; returns its handle (ack/term counters). onAck runs inside ack(), before it counts. */
+  deliver(envelope: Record<string, unknown>, sourceMachine = POD_MACHINE, streamSequence = ++this.#stream, onAck?: () => void): FakeDelivery {
     this.#stream = Math.max(this.#stream, streamSequence);
     const delivery: FakeDelivery = {
       envelope: { createdAt: Date.now(), ...envelope } as unknown as FakeDelivery["envelope"],
       sourceMachine, streamSequence, attempt: 1, acked: 0, termed: [], worked: 0,
-      async ack() { delivery.acked += 1; },
+      async ack() { onAck?.(); delivery.acked += 1; },
       async term(reason: string) { delivery.termed.push(reason); },
       nak() {},
       working() { delivery.worked += 1; },

@@ -108,14 +108,15 @@ describe("natsBridgeEventSource", () => {
   const ORG = "example-org";
   it("creates its durable at NEW messages over the exact filters, one in flight, unlimited redelivery", async () => {
     const fake = fakeConnection();
-    const source = natsBridgeEventSource(fake.connection, { org: ORG, link: "v2", topics: ["ops.owner", "fleet.work.>"] });
+    const source = natsBridgeEventSource(fake.connection, { org: ORG, machine: "machine-a", topics: ["ops.owner", "fleet.work.>"] });
     const abort = new AbortController();
     const iterator = source.consume(abort.signal)[Symbol.asyncIterator]();
     const first = iterator.next();
     await vi.waitFor(() => expect(fake.gets).toHaveLength(1), { timeout: 5_000 });
     expect(fake.added).toHaveLength(1);
     expect(fake.added[0]).toMatchObject({ stream: "FABRIC_EV_EXAMPLE_ORG", config: {
-      durable_name: `bev_${hashToken("bridge:v2")}`, deliver_policy: DeliverPolicy.New, ack_policy: AckPolicy.Explicit,
+      // Named under the bridge machine, so the org grants exactly this durable.
+      durable_name: "bev_machine-a", deliver_policy: DeliverPolicy.New, ack_policy: AckPolicy.Explicit,
       max_deliver: -1, max_ack_pending: 1, filter_subjects: [`fabric.ev.${ORG}.fleet.work.>`, `fabric.ev.${ORG}.ops.owner`] } });
     fake.push({ subject: "x" });
     expect((await first).value).toEqual({ subject: "x" });
@@ -124,18 +125,18 @@ describe("natsBridgeEventSource", () => {
   });
 
   it("reuses an existing durable without resetting its cursor, and refuses one with other filters", async () => {
-    const durable = `bev_${hashToken("bridge:v2")}`;
+    const durable = "bev_machine-a";
     const existing = { durable_name: durable, ack_policy: AckPolicy.Explicit, filter_subjects: [`fabric.ev.${ORG}.ops.owner`] };
     const reused = fakeConnection(existing);
     const abort = new AbortController();
-    const iterator = natsBridgeEventSource(reused.connection, { org: ORG, link: "v2", topics: ["ops.owner"] }).consume(abort.signal)[Symbol.asyncIterator]();
+    const iterator = natsBridgeEventSource(reused.connection, { org: ORG, machine: "machine-a", topics: ["ops.owner"] }).consume(abort.signal)[Symbol.asyncIterator]();
     const pending = iterator.next();
     await vi.waitFor(() => expect(reused.gets).toHaveLength(1), { timeout: 5_000 });
     expect(reused.added).toEqual([]);
     abort.abort();
     expect((await pending).done).toBe(true);
     const other = fakeConnection(existing);
-    await expect(natsBridgeEventSource(other.connection, { org: ORG, link: "v2", topics: ["fleet.work.>"] })
+    await expect(natsBridgeEventSource(other.connection, { org: ORG, machine: "machine-a", topics: ["fleet.work.>"] })
       .consume(new AbortController().signal)[Symbol.asyncIterator]().next()).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID" });
   });
 });

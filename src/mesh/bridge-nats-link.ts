@@ -11,6 +11,7 @@ import {
 } from "./bridge-nats-identity.js";
 import { bridgeNatsClaimAction, openBridgeNatsLedger } from "./bridge-nats-ledger.js";
 import { openNatsBridgeSide, type NatsBridgeSideConfig } from "./bridge-nats-port.js";
+import { startNatsRepublishLink, type NatsRepublishHandle } from "./bridge-nats-republish.js";
 import type { NatsTopicAuthorize } from "./bridge-nats-topics.js";
 import {
   bridgeNatsLinkIdentity, type BridgeNatsAllowDecision, type BridgeNatsAllowListConfig, type BridgeNatsAllowSection,
@@ -49,8 +50,8 @@ export interface NatsLinkStartConfig {
     readonly maxStateBytes?: number;
   };
   readonly stateDir: string;
-  /** The bridge machine's NATS settings (L1's openNatsBridgeSide reads them). */
-  readonly nats: NatsBridgeSideConfig["nats"];
+  /** The bridge machine's NATS settings (L1's openNatsBridgeSide reads them); `events` turns on N4 (PR 2). */
+  readonly nats: NatsBridgeSideConfig["nats"] & { readonly events?: boolean };
   /** L5 hands the allow-list already parsed by L3; a raw `allow` section is parsed here the same way. */
   readonly allow: BridgeNatsAllowListConfig | BridgeNatsAllowSection;
   /** The org.json whose principal seats pin the allow-list; absent = L3's default candidates. */
@@ -230,6 +231,7 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
   });
   let port: BridgeNatsPort | undefined;
   let opened: BridgeNatsLedger | undefined;
+  let republish: NatsRepublishHandle | undefined;
   try {
     await store.prepareLock();
     signal.throwIfAborted();
@@ -264,12 +266,20 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     });
     remote = link.remote;
     const { bridge } = link;
+    // N4 (PR 2, lane L1): with nats.events, v2 work topics are republished into this file mesh, decided by
+    // L3's gate (verifyEventSender + allowRepublish) on both sides' presence. A missing consume grant
+    // refuses the start here, before MeshBridge links anything.
+    republish = await startNatsRepublishLink(config, { store, port, gate, ledger: opened, signal, log,
+      views: { refresh: () => remote!.filePresence.refresh(), nats: () => openedPort.presenceView(),
+        file: () => remote!.filePresence.view() } });
     await bridge.startWithBackoff();
     signal.throwIfAborted();
     log(`linked ${config.name} <-> ${config.link} (NATS machine ${port.machine})`);
     let stopping: Promise<void> | undefined;
     const openedLedger = opened;
+    const openedRepublish = republish;
     const stop = (): Promise<void> => stopping ??= (async () => {
+      await openedRepublish?.stop().catch(() => undefined);
       await bridge.stop().catch(() => undefined);
       await openedPort.close().catch(() => undefined);
       await openedLedger.close().catch(() => undefined);
@@ -287,6 +297,7 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     void closed.catch(() => undefined);
     return { closed, stop };
   } catch (error) {
+    await republish?.stop().catch(() => undefined);
     await port?.close().catch(() => undefined);
     await opened?.close().catch(() => undefined);
     store.closeState();

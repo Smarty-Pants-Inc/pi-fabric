@@ -1483,7 +1483,11 @@ describe("queued-work guard, round 9: a partial coalesced match passes the filte
     // This history predates batching, as in the reported failure. Resume into a real batch
     // window with no worker in flight, so enqueue and timer wakes reach #batchReady.
     await actors.setBatching(actor.id, { batchWindowMs });
-    actors.resumeAfterRelease();
+    // Anchor the short real timer at resume, not at admission before slow fixture I/O.
+    // Widening past 5 s would instead outlast the pending setter's registry-lock timeout.
+    const clock = batchWindowMs === 2_000 ? vi.spyOn(Date, "now").mockReturnValue(
+      (meshRecords(root, actor.id)[0] as QueueRecord & { createdAt: number }).createdAt) : undefined;
+    try { actors.resumeAfterRelease(); } finally { clock?.mockRestore(); }
     expect(actors.inFlightCount()).toBe(0);
     expect(actors.status(actor.id).queued).toBe(1);
     const registry = new ActorRegistryStore(path.join(root, "actors"));
@@ -1565,6 +1569,45 @@ describe("queued-work guard, round 9: a partial coalesced match passes the filte
     expect(savedFilter()).toEqual(previous);
     expect(queuedIds()).toEqual([comment.id, check.id]);
     expect(filtered(actors, actor.id)).toEqual([]);
+  }, 120_000);
+
+  // Round 13: real concurrent setters must use the preceding committed configuration.
+  // Keep reason: recorded real catch, fabric-store RACE-age/RACE-refresh (pi-fabric#1572).
+  it.each(["age", "refresh"] as const)("round 13 RACE-%s: concurrent setters preserve acknowledged configuration", async race => {
+    const { root, mesh, actors } = setup(10);
+    actors.pauseForRelease();
+    const actor = await actors.create({ name: `race-${race}`, instructions: "Review.", topics: [TOPIC], coalesce: false });
+    const registry = new ActorRegistryStore(path.join(root, "actors"));
+    let unlock!: () => void;
+    let acquired!: () => void;
+    const acquiredLock = new Promise<void>(resolve => { acquired = resolve; });
+    const releaseLock = new Promise<void>(resolve => { unlock = resolve; });
+    const holding = registry.withLock(async () => { acquired(); await releaseLock; }, undefined, "concurrent-filter-regression");
+    await acquiredLock;
+    let staged!: () => void;
+    const firstStaged = new Promise<void>(resolve => { staged = resolve; });
+    const first = actors.setActivationFilter(actor.id, CHECKS, staged, undefined, 60_000);
+    let second: Promise<FabricActorInfo | Error> | undefined;
+    try {
+      await firstStaged;
+      expect(registry.records().find(record => record.id === actor.id)?.activationFilter).toBeUndefined();
+      if (race === "refresh") {
+        // This check is accepted by the old filter while A waits for its registry commit.
+        const check = await mesh.publish({ topic: TOPIC, kind: "check", from: batchFrom, data: { marker: "during-commit" } });
+        await waitFor(() => meshRecords(root, actor.id).some(item => item.payload.id === check.id));
+      }
+      // No age means keep A's acknowledged value. An unchanged refresh must not be refused.
+      second = actors.setActivationFilter(actor.id, CHECKS).catch((error: Error) => error);
+    } finally {
+      unlock();
+      await holding;
+    }
+    const [acknowledged, refreshed] = await Promise.all([first, second!]);
+    expect(refreshed).not.toBeInstanceOf(Error);
+    expect(acknowledged.deadLetterReplayMaxAgeMs).toBe(60_000);
+    expect(refreshed).toMatchObject({ activationFilter: CHECKS, deadLetterReplayMaxAgeMs: 60_000 });
+    expect(actors.status(actor.id)).toMatchObject({ activationFilter: CHECKS, deadLetterReplayMaxAgeMs: 60_000 });
+    expect(registry.records().find(record => record.id === actor.id)).toMatchObject({ activationFilter: CHECKS, deadLetterReplayMaxAgeMs: 60_000 });
   }, 120_000);
 
   // Round 10 (fabric-store P1, probe OB-crash): the setter rewrote the queue file without the pruned check BEFORE its

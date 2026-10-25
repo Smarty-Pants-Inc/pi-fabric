@@ -878,6 +878,8 @@ const preparationFailureKind = (error: unknown): true | "timeout" | "lane-unreso
 
 export class ActorManager {
   readonly #actors = new Map<string, ManagedActor>();
+  /** Each filter setter observes the preceding setter's committed and installed state. */
+  readonly #activationFilterChains = new Map<string, Promise<void>>();
   /** Queued mesh and host events held while this host does not own their actor (smarty-dev#442). */
   readonly #parked = new Map<string, ActorQueueItem[]>();
   // Accepted active work (preparing, waiting, or running), retained durably until settlement (#878).
@@ -2618,6 +2620,22 @@ export class ActorManager {
    * telemetry resets; legacy lifetime count is kept.
    */
   async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void, expiresAt?: number, deadLetterReplayMaxAgeMs?: number, options: { dropQueued?: boolean } = {}): Promise<FabricActorInfo> {
+    const actorId = this.#requireOwnedActor(id).id;
+    const previous = this.#activationFilterChains.get(actorId);
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    this.#activationFilterChains.set(actorId, pending);
+    try {
+      if (previous) await previous;
+      return await this.#setActivationFilter(actorId, activationFilter, beforeCommit, expiresAt, deadLetterReplayMaxAgeMs, options);
+    } finally {
+      release(); // A failed setter must not poison later setters.
+      if (this.#activationFilterChains.get(actorId) === pending) this.#activationFilterChains.delete(actorId);
+    }
+  }
+
+  async #setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit: ((id: string) => void) | undefined, expiresAt: number | undefined, deadLetterReplayMaxAgeMs: number | undefined, options: { dropQueued?: boolean }): Promise<FabricActorInfo> {
+    // Recheck ownership after waiting: a reload/removal may have displaced the selected actor.
     const actor = this.#requireOwnedActor(id);
     const filter = activationFilter === null ? [] : normalizeActorActivationFilter(activationFilter);
     normalizeDeadLetterReplayMaxAgeMs(deadLetterReplayMaxAgeMs);

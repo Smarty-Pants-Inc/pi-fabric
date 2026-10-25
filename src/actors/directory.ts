@@ -143,7 +143,9 @@ export class ActorDirectory extends ActorManager {
         // Cross-scope predecessor removal is part of this create's mutation too.
         for (const actor of sameName.filter((actor) => actor.scope !== scope)) {
           options.checkActive?.();
-          await this.remove(actor.id, { wait: false });
+          // smarty-dev#16416 round 2: the replaced actor's archived and held work is kept with its tree, not refused.
+          // Round 4 (pi-fabric#1572): through replacingSameName, so this stays the plain remove(id, { wait: false }).
+          await this.replacingSameName(actor.id, () => this.remove(actor.id, { wait: false }));
         }
       },
     };
@@ -264,6 +266,8 @@ export class ActorDirectory extends ActorManager {
   override dispatchHostEvent(...args: Parameters<ActorManager["dispatchHostEvent"]>): number { return super.dispatchHostEvent(...args) + this.#secondary.dispatchHostEvent(...args); }
   override dispatchObservedHostEvent(...args: Parameters<ActorManager["dispatchObservedHostEvent"]>): number { return super.dispatchObservedHostEvent(...args) + this.#secondary.dispatchObservedHostEvent(...args); }
   override stop(...args: Parameters<ActorManager["stop"]>): ReturnType<ActorManager["stop"]> { return this.#isPrimary(args[0]) ? super.stop(...args) : this.#secondary.stop(...args); }
+  override requeueArchived(...args: Parameters<ActorManager["requeueArchived"]>): ReturnType<ActorManager["requeueArchived"]> { return this.#isPrimary(args[0]) ? super.requeueArchived(...args) : this.#secondary.requeueArchived(...args); }
+  override replacingSameName<T>(id: string, run: () => Promise<T>): Promise<T> { return this.#isPrimary(id) ? super.replacingSameName(id, run) : this.#secondary.replacingSameName(id, run); }
   override get halted(): boolean { return super.halted && this.#secondary.halted; }
   /** Both scopes: a reload stops a session-scope actor's run as well (review/astra round 2 on #158). */
   override inFlightActorIds(): string[] { return [...super.inFlightActorIds(), ...this.#secondary.inFlightActorIds()]; }
@@ -288,6 +292,13 @@ export class ActorDirectory extends ActorManager {
     const finishing = this.#finishingScope(args[0]);
     if (finishing) return finishing === "primary" ? super.remove(...args) : this.#secondary.remove(...args);
     return this.#isPrimary(args[0]) ? super.remove(...args) : this.#secondary.remove(...args);
+  }
+  /** pi-fabric#1572 round 5: the removal check, routed exactly as remove() is. */
+  override assertRemovable(...args: Parameters<ActorManager["assertRemovable"]>): void {
+    if (super.cleanupObligation(args[0]) || this.#secondary.cleanupObligation(args[0])) return;
+    const finishing = this.#finishingScope(args[0]);
+    if (finishing) return finishing === "primary" ? super.assertRemovable(...args) : this.#secondary.assertRemovable(...args);
+    return this.#isPrimary(args[0]) ? super.assertRemovable(...args) : this.#secondary.assertRemovable(...args);
   }
   override get releaseAdmissionHeld(): boolean { return super.releaseAdmissionHeld && this.#secondary.releaseAdmissionHeld; }
   override pauseForRelease(options: Parameters<ActorManager["pauseForRelease"]>[0] = {}): void {

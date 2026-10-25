@@ -8,7 +8,8 @@ import { throwIfAborted } from "../async-settlement.js";
 import fs from "node:fs";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
-import type { FabricActorInfo, FabricActorCreateRequest } from "../actors/types.js";
+import type { FabricActorInfo, FabricActorCreateRequest, FabricActorRequeueResult } from "../actors/types.js";
+import { FabricActorQueuedWorkError } from "../actors/types.js";
 import {
   abandonResidentRequest,
   acknowledgeResidentResponse,
@@ -16,6 +17,7 @@ import {
   ResidentActorAuthorizationError,
   ResidentCommandUnsupportedError,
   assertResidentCommandSupported,
+  assertResidentDropQueuedSupported,
   prepareResidentCreationCommand,
   type ResidentHostOwner,
   assertResidentActorToolCeiling,
@@ -85,16 +87,28 @@ export class ResidentActorClient {
   }
 
   async setActor(mutation: ResidentActorMutation, signal?: AbortSignal, caller?: ResidentActorCaller): Promise<FabricActorInfo> {
+    const response = await this.#mutate(mutation, signal, caller);
+    if (!response.actor) throw new Error("Resident host returned no actor from setter");
+    return response.actor;
+  }
+
+  /** smarty-dev#16416: feed a stop archive to a resident-owned actor. */
+  async requeueArchived(mutation: Extract<ResidentActorMutation, { operation: "requeueArchived" }>, signal?: AbortSignal,
+    caller?: ResidentActorCaller): Promise<FabricActorRequeueResult> {
+    const response = await this.#mutate(mutation, signal, caller);
+    if (!response.requeued) throw new Error("Resident host returned no requeueArchived result");
+    return response.requeued;
+  }
+
+  #mutate(mutation: ResidentActorMutation, signal?: AbortSignal, caller?: ResidentActorCaller): Promise<ResidentCommandResponse> {
     // Nested proxies cannot manufacture the Main's control identity. A genuine
     // Main fallback must supply the identity captured by its provider.
     if (this.#toolCeiling !== undefined && caller) caller = { ...caller, toolCeiling: [...this.#toolCeiling] };
     if (mutation.operation === "setTools") assertResidentActorToolCeiling(mutation.tools, caller?.toolCeiling);
-    const response = await this.#send({
+    return this.#send({
       ...mutation, ...(caller ? { caller } : {}), format: RESIDENT_ACTOR_COMMAND_FORMAT, requestId: randomUUID(),
       rootId: this.#rootId, createdAt: Date.now(),
     }, signal);
-    if (!response.actor) throw new Error("Resident host returned no actor from setter");
-    return response.actor;
   }
 
   async actorStatus(id: string, signal?: AbortSignal): Promise<FabricActorInfo> {
@@ -142,13 +156,14 @@ export class ResidentActorClient {
     return response.actor;
   }
 
-  async removeActor(id: string, signal?: AbortSignal): Promise<{ removed: true; pending?: string; cleaned?: boolean }> {
+  async removeActor(id: string, signal?: AbortSignal, options: { dropQueued?: true } = {}): Promise<{ removed: true; pending?: string; cleaned?: boolean }> {
     const response = await this.#send({
       format: RESIDENT_HOST_FORMAT,
       operation: "removeActor",
       requestId: randomUUID(),
       rootId: this.#rootId,
       id,
+      ...(options.dropQueued === true ? { dropQueued: true as const } : {}),
       createdAt: Date.now(),
     }, signal);
     return { removed: true, ...(response.pending === undefined ? {} : { pending: response.pending }),
@@ -157,7 +172,7 @@ export class ResidentActorClient {
 
   /** Same-user operator control; the resident executor requires root confirmation and vetoes live leases. */
   async operatorActor(action: "stop" | "remove", id: string,
-    options: { dryRun?: boolean; confirmDeadRoot?: string } = {}, signal?: AbortSignal): Promise<ResidentCommandResponse> {
+    options: { dryRun?: boolean; confirmDeadRoot?: string; dropQueued?: boolean } = {}, signal?: AbortSignal): Promise<ResidentCommandResponse> {
     return this.#send({ format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "operatorActor",
       action, id, ...options, requestId: randomUUID(), rootId: this.#rootId, createdAt: Date.now() }, signal);
   }
@@ -175,6 +190,7 @@ export class ResidentActorClient {
     const owner = readJson<ResidentHostOwner>(this.#ownerPath);
     if (!owner) throw new Error("Root resident host is not live");
     assertResidentCommandSupported(owner, command.operation);
+    assertResidentDropQueuedSupported(owner, command);
     if (command.operation === "releaseDrain") {
       if (owner.drain?.abi !== drainProtocol!.RESIDENT_DRAIN_ABI) throw new ResidentCommandUnsupportedError("The loaded resident lacks cooperative drain support; no request was dispatched");
       const expected = command.expected;
@@ -253,6 +269,10 @@ export class ResidentActorClient {
             if (command.operation === "resetSession" && response.errorCode === "ACTOR_SESSION_RESET_CANCELLED") {
               throw new ActorSessionResetCancelledError(command.id, response.error, command.requestId);
             }
+            if (response.errorCode === "FABRIC_ACTOR_QUEUED_WORK" && response.queuedWork) {
+              throw new FabricActorQueuedWorkError(response.queuedWork.operation, response.queuedWork.actorId,
+                { ...response.queuedWork.counts }, response.error ?? "Fabric actor holds queued work");
+            }
             if (response.errorCode === "RESIDENT_REQUEST_EXPIRED") throw new ResidentRequestExpiredError(command.requestId);
             if (response.errorCode === "RESIDENT_ACTOR_FORBIDDEN") throw new ResidentActorAuthorizationError(response.error);
             if (response.errorCode === "RESIDENT_COMMAND_UNSUPPORTED") throw new ResidentCommandUnsupportedError(response.error);
@@ -276,7 +296,7 @@ export class ResidentActorClient {
       // These negotiated terminal errors are native pre-effect refusals. The
       // protected host transports any post-accept failure as slot uncertainty.
       if (error instanceof ResidentActorAuthorizationError || error instanceof ResidentCommandUnsupportedError ||
-          error instanceof FabricModelDeniedError) { dispatched = false; throw error; }
+          error instanceof FabricModelDeniedError || error instanceof FabricActorQueuedWorkError) { dispatched = false; throw error; }
       if (error instanceof ResidentRequestExpiredError) throw residentRequestExpiredOutcome(this.#residencyDir, command, signal);
       let decision;
       try {

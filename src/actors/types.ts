@@ -290,6 +290,86 @@ export class FabricActorBatchPolicyError extends Error {
   }
 }
 
+/** Work a stop would otherwise discard (smarty-dev#16416). */
+export interface FabricActorQueueCounts {
+  queued: number;
+  parked: number;
+  overflow: number;
+  deadLetter: number;
+  /** The item(s) of the activation in flight when the stop came (pi-fabric#1572 round 3). */
+  inFlight: number;
+  /** Pending agent_settled interval windows, not yet admitted to the queue (pi-fabric#1572 round 3). */
+  settled: number;
+}
+
+/** agents.stop options (smarty-dev#16416). */
+export interface FabricActorStopOptions {
+  /**
+   * Stop even though the actor holds work (queued, parked, overflow, pending settled-window or
+   * dead-letter work; the activation in flight is archived too). That work is moved to
+   * `<actor dir>/stopped-queues/<stamp>-<sha256-12>.jsonl`, never deleted;
+   * agents.requeueArchived feeds it to a recreated actor.
+   */
+  dropQueued?: boolean;
+  /**
+   * pi-fabric#1572 round 3: an explicit operator stop (the agents.stop API and tool, /fabric stop, the
+   * operator CLI). Only these refuse while the actor holds work and no dropQueued was given; round 4: the activation
+   * in flight never refuses, and its callerless item is archived before the run is stopped. Internal
+   * stops (removal, session reset, Main close, host shutdown) never set it and stop as they always did.
+   */
+  explicit?: true;
+}
+
+/** The archive a stop with dropQueued wrote, returned on its result (smarty-dev#16416). */
+export interface FabricActorStoppedQueue {
+  archive: string;
+  sha256: string;
+  counts: FabricActorQueueCounts;
+}
+
+/** agents.requeueArchived result (smarty-dev#16416). */
+export interface FabricActorRequeueResult {
+  id: string;
+  archive: string;
+  sha256: string;
+  /** Items this call admitted to the actor's queue. */
+  requeued: number;
+  /** Items this call offered that the actor's activation filter skipped on arrival. */
+  filtered: number;
+  /** Items a newer queued item with the same coalesce key already covers; that newer item kept its place and payload. */
+  superseded: number;
+  /** Items an earlier call already offered; never offered twice. */
+  alreadyRequeued: number;
+  /**
+   * Items that cannot be fed again (a rejected caller's ask, a non-mesh/host/direct source). A caller's ask is recorded
+   * as skipped in the archive's ledger, so it no longer blocks a plain remove (pi-fabric#1572 round 7).
+   */
+  skipped: Array<{ itemId: string; source: string; reason: string }>;
+  /**
+   * Items the actor did not take (its queue and overflow are full, or it refused the item), and every later archived
+   * item, which waits behind them so archive order holds. None is recorded as offered: the archive still blocks a plain
+   * remove, and a later call offers them again (pi-fabric#1572 round 7).
+   */
+  notQueued: Array<{ itemId: string; source: string; reason: string }>;
+}
+
+/**
+ * smarty-dev#16416: an operation that would discard or skip queued work without an explicit
+ * dropQueued: true. Nothing changed; the counts name the work that is still queued.
+ */
+export class FabricActorQueuedWorkError extends Error {
+  readonly code = "FABRIC_ACTOR_QUEUED_WORK";
+  constructor(
+    readonly operation: "stop" | "setActivationFilter" | "remove",
+    readonly actorId: string,
+    readonly counts: Record<string, number>,
+    message: string,
+  ) {
+    super(message);
+    this.name = "FabricActorQueuedWorkError";
+  }
+}
+
 export function normalizeActorBatching(value: unknown): FabricActorBatching {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new FabricActorBatchPolicyError("Invalid actor batching policy");
   const input = value as Record<string, unknown>;
@@ -425,6 +505,12 @@ export interface FabricActorSessionOrphan {
 
 export interface FabricActorInfo extends FabricActorBatching {
   id: string;
+  /** Only on an agents.stop({ dropQueued: true }) result that archived work (smarty-dev#16416). */
+  stoppedQueue?: FabricActorStoppedQueue;
+  /** Only on an agents.setActivationFilter({ dropQueued: true }) result: items moved to the dead-letter queue. */
+  movedToDeadLetter?: number;
+  /** Only on an agents.setActivationFilter({ dropQueued: true }) result: dead-letter backlog items now held in place. */
+  heldInDeadLetter?: number;
   scope: FabricActorStorageScope;
   name: string;
   /** sha256 (hex) of the actor's default instructions, as setInstructions stored them. */

@@ -121,7 +121,7 @@ describe.skipIf(process.platform !== "linux")("operator escalation durability ac
       }
 
       // Ordinary removal, accepted behind the held run.
-      const accepted = await first.remove(actor.id, { wait: false });
+      const accepted = await first.remove(actor.id, { wait: false, dropQueued: true }); // pi-fabric#1572 round 5: archives the tell in flight
       expect(accepted.pending).toMatch(/pending behind its in-flight run/);
       const requestedAt = rowOf(actor.id)?.removal?.requestedAt;
       expect(requestedAt).toEqual(expect.any(Number));

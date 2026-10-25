@@ -91,7 +91,9 @@ it.each(["Main", "proxy"] as const)("public reset leaves status, other actors an
     // All use the public provider, which routes to this resident's command dispatcher.
     const status = observe(f.provider.invoke("actorStatus", { id: f.actor.id }, f.context));
     const unrelated = observe(f.provider.invoke("setInstructions", { id: other.id, instructions: "Still serviceable" }, f.context));
-    const stop = observe(f.provider.invoke("stop", { id: f.actor.id }, f.context));
+    // pi-fabric#1572 (astra F2): the public agents.stop is an explicit operator stop; over a queued ask it is refused
+    // unless dropQueued, which archives it (the ask is still rejected). The activation in flight alone never refuses (round 4).
+    const stop = observe(f.provider.invoke("stop", { id: f.actor.id, dropQueued: true }, f.context));
     const results = await promptly(Promise.all([status, unrelated, stop]));
     expect(results[0]).toMatchObject({ value: { id: f.actor.id } });
     expect(results[1]).toMatchObject({ value: { id: other.id } });

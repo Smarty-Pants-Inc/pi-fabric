@@ -440,6 +440,11 @@ export interface ResidentHostOwner {
   requestExpiry?: 1;
   /** Operation-scoped retry keys implemented by this loaded host, not desired config. */
   creationIdempotency?: 1;
+  /**
+   * pi-fabric#1572 round 3: the loaded host honours dropQueued on stop, removeActor, setActivationFilter and
+   * operatorActor. A client never sends dropQueued to an owner without it: an older host would ignore the field.
+   */
+  queuedWork?: 1;
   /** Attestation from the loaded host, never desired config.json. */
   releaseRoot?: string;
   configDigest?: string;
@@ -527,6 +532,8 @@ interface ResidentRemoveActorCommand {
   requestId: string;
   rootId: string;
   id: string;
+  /** pi-fabric#1572 round 3: remove despite kept work (smarty-dev#16416); sent only to an owner publishing queuedWork: 1. */
+  dropQueued?: true;
   createdAt: number;
 }
 
@@ -581,12 +588,13 @@ export const assertResidentActorToolCeiling = (tools: string[], ceiling: readonl
 export type ResidentActorMutation =
   | ({ operation: "setInstructions"; id: string; replace?: boolean } & import("../actors/instructions-file.js").FabricActorInstructionsSource)
   | { operation: "resetSession"; id: string }
-  | { operation: "stop"; id: string }
+  | { operation: "stop"; id: string; dropQueued?: true }
+  | { operation: "requeueArchived"; id: string; archive: string }
   | { operation: "setTools"; id: string; tools: string[] }
   | { operation: "setModel"; id: string; model?: string; modelReason?: string; scope: FabricActorBindingScope }
   | { operation: "setThinking"; id: string; thinking?: FabricThinking; scope: FabricActorBindingScope }
   | ({ operation: "setBatching"; id: string } & FabricActorBatching)
-  | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number; deadLetterReplayMaxAgeMs?: number };
+  | { operation: "setActivationFilter"; id: string; activationFilter: FabricActorActivationFilter | null; expiresAt?: number; deadLetterReplayMaxAgeMs?: number; dropQueued?: true };
 
 type ResidentActorMutationCommand = ResidentActorMutation & {
   caller?: ResidentActorCaller;
@@ -611,6 +619,8 @@ export interface ResidentOperatorActorCommand {
   action: "stop" | "remove";
   id: string;
   dryRun?: boolean;
+  /** stop: archive queued work instead of refusing (smarty-dev#16416); remove: also take kept archives (pi-fabric#1572 round 3). */
+  dropQueued?: boolean;
   confirmDeadRoot?: string;
   requestId: string;
   rootId: string;
@@ -645,6 +655,7 @@ const LEGACY_RESIDENT_COMMANDS = ["spawn", "foreground", "cleanup", "createActor
 export const RESIDENT_COMMANDS = [
   "spawnBound", "foreground", "cleanup", "createActor", "removeActor", "actors", "actorStatus", "slotStatus", "setInstructions", "setModel",
   "setThinking", "setTools", "setBatching", "setActivationFilter", "resetSession", "stop", "releaseChange", "releaseDrain", "operatorActor",
+  "requeueArchived",
 ] as const satisfies readonly ResidentCommand["operation"][];
 
 export const isResidentCommandOperation = (operation: unknown): operation is ResidentCommand["operation"] =>
@@ -675,6 +686,18 @@ export const assertResidentCommandSupported = (owner: ResidentHostOwner, operati
       !(supported as readonly string[]).includes(operation)) {
     throw new ResidentCommandUnsupportedError();
   }
+};
+
+/**
+ * pi-fabric#1572 round 3: a dropQueued request goes only to an owner that publishes queuedWork: 1. An older host
+ * would ignore the unknown field (a stop or removal without the archive it asked for): refuse before dispatch.
+ */
+export const assertResidentDropQueuedSupported = (owner: ResidentHostOwner, command: ResidentCommand): void => {
+  if ((command as { dropQueued?: unknown }).dropQueued === undefined || owner.queuedWork === 1) return;
+  throw new ResidentCommandUnsupportedError(
+    `The owning resident host ${owner.hostId} (pid ${owner.pid}) predates dropQueued and would ignore it; ` +
+    "complete the resident host handover to the current release before retrying. No request was dispatched.",
+  );
 };
 
 /** Fence explicit retry keys before publication; keep unkeyed calls compatible with older hosts. */
@@ -775,8 +798,12 @@ export interface ResidentCommandResponse {
   /** A removeActor that returned before the actor's in-flight run ended: the pending state. */
   pending?: string;
   cleaned?: boolean;
+  /** requeueArchived (smarty-dev#16416). */
+  requeued?: import("../actors/types.js").FabricActorRequeueResult;
   error?: string;
-  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED" | "ACTOR_SESSION_RESET_CANCELLED" | ResidentSlotErrorCode;
+  errorCode?: "RESIDENT_ACTOR_FORBIDDEN" | "RESIDENT_COMMAND_UNSUPPORTED" | "RESIDENT_REQUEST_EXPIRED" | "FABRIC_MODEL_DENIED" | "ACTOR_SESSION_RESET_CANCELLED" | "FABRIC_ACTOR_QUEUED_WORK" | ResidentSlotErrorCode;
+  /** Allowlisted FabricActorQueuedWorkError payload (smarty-dev#16416). */
+  queuedWork?: { operation: "stop" | "setActivationFilter" | "remove"; actorId: string; counts: Record<string, number> };
   /** Narrow native slot error payload; no arbitrary Error properties cross the wire. */
   slotError?: ResidentSlotErrorDetails;
   /** Allowlisted policy-refusal payload, never arbitrary host Error properties. */

@@ -279,6 +279,17 @@ describe("NATS bridge port: mirror set", () => {
     expect(w.presence.values.has(pKey(BRIDGE, SUPERVISOR))).toBe(true);
   });
 
+  it("holds an actor that is both in the set and in the native listing once", async () => {
+    const w = kvWorld();
+    const { port: p, clock } = port(w, {
+      fileActors: () => ({ actors: [fileActor()], sampledAt: clock.wall }),
+      allow: { file: [{ kind: "root", id: FILE_ROOT }, { kind: "actor", rootId: FILE_ROOT, name: "fleet-supervisor" }] },
+    });
+    await p.start();
+    await p.mirror(mirrorSet(clock.wall, [fileRoot(), fileActor()]), clock.wall);
+    expect(w.presence.values.has(pKey(BRIDGE, SUPERVISOR))).toBe(true);
+  });
+
   it("refuses a mirror set that names another link identity, and any mirror once fenced", async () => {
     const w = kvWorld();
     const { port: p, clock } = port(w);

@@ -345,7 +345,10 @@ export class NatsBridgePort implements BridgeNatsPort {
     if (this.options.fileActors) {
       try {
         const read = this.options.fileActors();
-        actors = [...actors, ...read.actors];
+        // One claim per actor: the native listing wins over the same actor in the set (two claims
+        // for one id in a pass would refuse both).
+        const listed = new Set(read.actors.map(actor => actor.id));
+        actors = [...actors.filter(actor => !listed.has(actor.id)), ...read.actors];
         sampledAt = Math.min(sampledAt, read.sampledAt);
         complete = true; // The native listing, not the roots snapshot, is the actors' authority.
       } catch (error) {

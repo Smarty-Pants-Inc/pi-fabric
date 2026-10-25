@@ -6,8 +6,9 @@ import type { ParticipantRoute } from "../topology/participant-view.js";
 import type { TransportDelivery, TransportEnvelope } from "../transport/types.js";
 import type { BridgePublish } from "./bridge.js";
 import {
-  BRIDGE_NATS_ACK_TOPIC, BRIDGE_NATS_CONTROL_TOPIC, BRIDGE_NATS_HORIZON_MS, BRIDGE_NATS_MACHINE, bridgeNatsAckEnvelopeId,
-  bridgeNatsEnvelopeId, bridgeNatsMappedCommandId, BRIDGE_NATS_REFUSAL, type BridgeNatsDirection, type BridgeNatsPortDelivery,
+  BRIDGE_NATS_ACK_TOPIC, BRIDGE_NATS_CONTROL_TOPIC, BRIDGE_NATS_HORIZON_MS, BRIDGE_NATS_MACHINE, BRIDGE_NATS_RELAY_ENVELOPE_PREFIX,
+  bridgeNatsAckEnvelopeId, bridgeNatsEnvelopeId, bridgeNatsMappedCommandId, bridgeNatsRelayEnvelopeId, BRIDGE_NATS_REFUSAL,
+  type BridgeNatsDirection, type BridgeNatsPortDelivery,
 } from "./bridge-nats-types.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED } from "./control-idempotency.js";
 import type { MeshEvent, MeshIdentity } from "./store.js";
@@ -30,6 +31,11 @@ import type { MeshEvent, MeshIdentity } from "./store.js";
  * - Every resend of one source event carries the same envelope id and the same bytes; the
  *   destination's dedupe (broker window, then the owner's seen claim) makes it run once.
  * - An ACK crosses only for a command this link carried, from the owner the command went to.
+ * - PR 2 relay (a work-host lane on a spoke file mesh): a command or ACK MeshBridge relays from
+ *   another hub link carries `data.bridge.via`. Its sender is verified only as the hub's DIRECT
+ *   mirror held by that source link (`data.bridge.from`), never as a native file participant, and
+ *   the gate must verify it there too (viaSpoke). Toward a spoke root, the file command names the
+ *   spoke as its destinationRemoteHost, so MeshBridge relays it and never appends it on the hub.
  */
 
 /** Default control deadline for a legacy file command without deadlineAt. */
@@ -65,6 +71,11 @@ export interface NatsCarrierPresence {
   nats(id: string): NatsPresenceEntry | undefined;
   /** Live native file presence only; never a record the link mirrored from NATS. */
   file(id: string): FilePresenceEntry | undefined;
+  /**
+   * PR 2 relay: a live root the hub holds as the DIRECT mirror of spoke link `spoke` (its stored origin and
+   * holder are that link, no re-export hop), and the only record for the id. Absent: no relayed traffic.
+   */
+  spoke?(id: string, spoke: string): FilePresenceEntry | undefined;
 }
 
 /** The allow-list question for one crossing command (L3's gate answers it). */
@@ -78,9 +89,15 @@ export interface NatsCarrierAuthorization {
   readonly principal?: FabricPrincipal | undefined;
   /** toFile: the delivery's credential-bound source machine the sender was verified on. */
   readonly sourceMachine?: string;
+  /**
+   * toNats, PR 2 relay: the spoke link a relayed command came through. The gate must verify the sender as
+   * that link's direct hub mirror (and an unrelayed sender as no spoke root at all).
+   */
+  readonly viaSpoke?: string;
 }
 export type NatsCarrierDecision =
-  | { readonly ok: true; readonly principal: "carry" | "strip" | "none" }
+  /** viaSpoke (toFile): the target is a spoke root on that spoke link; MeshBridge relays the command there. */
+  | { readonly ok: true; readonly principal: "carry" | "strip" | "none"; readonly viaSpoke?: string }
   | { readonly ok: false; readonly refuse: string; readonly reason: string };
 export type NatsCarrierAuthorize = (request: NatsCarrierAuthorization) => NatsCarrierDecision;
 
@@ -241,10 +258,16 @@ export type NatsOutbound =
   | { readonly kind: "answer"; readonly answer: NatsCarrierFileAnswer; readonly reason: string };
 
 export type NatsInbound =
-  /** Append this event to the file mesh; ACK the delivery only after that append is durable, then settle. */
-  | { readonly kind: "event"; readonly event: MeshEvent; readonly settle?: NatsCarrierSettle }
-  /** Send this ACK to the NATS sender (the link answers for the hop, notRun), then ACK the delivery. */
-  | { readonly kind: "reply"; readonly envelope: NatsCarrierEnvelope; readonly reason: string }
+  /**
+   * Append this event to the file mesh; ACK the delivery only after that append is durable, then settle.
+   * relay: it goes to a spoke root through the hub relay (a command), or answers a relayed command (an ACK).
+   */
+  | { readonly kind: "event"; readonly event: MeshEvent; readonly settle?: NatsCarrierSettle; readonly relay?: true }
+  /**
+   * Send this ACK to the NATS sender (the link answers for the hop, notRun), then ACK the delivery.
+   * replay: the owner's recorded answer, not a refusal.
+   */
+  | { readonly kind: "reply"; readonly envelope: NatsCarrierEnvelope; readonly reason: string; readonly replay?: true }
   /** Nothing for the file mesh: settle (when given), then ACK the delivery. */
   | {
     readonly kind: "settled"; readonly reason: string; readonly settle?: NatsCarrierSettle;
@@ -415,13 +438,36 @@ export class NatsBridgeCarrier {
     await this.#ledger.sent?.(record.direction, record.destinationCommandId, sequence !== undefined ? { sequence } : {});
   }
 
+  /**
+   * PR 2 relay: the source link of an event MeshBridge relayed from another hub link (`data.bridge.via` set),
+   * or undefined for a hub-native one. A stamp that names this link, or no source, is refused.
+   */
+  #relaySource(pub: BridgePublish): string | undefined {
+    const stamp = pub.data.bridge;
+    if (stamp.via === undefined) return undefined;
+    if (!nonEmpty(stamp.via, 128) || !nonEmpty(stamp.from, 128) || stamp.from === this.link || stamp.from === stamp.via) {
+      throw new NatsCarrierRefusal("relay stamp is malformed");
+    }
+    return stamp.from;
+  }
+
+  /** The verified file sender: native, or (relayed) the direct hub mirror held by its source spoke link. */
+  #fileSender(pub: BridgePublish, spoke: string | undefined): FilePresenceEntry {
+    const sender = spoke === undefined ? this.#presence.file(pub.from.id) : this.#presence.spoke?.(pub.from.id, spoke);
+    // A live file participant, whose ACK (and an ask's answer) returns to its own runtime only.
+    if (!sender || sender.identity.id !== pub.from.id) {
+      throw new NatsCarrierRefusal(spoke === undefined ? "sender is not a live file participant"
+        : `sender is not a live root that spoke link ${spoke} mirrors on the hub`);
+    }
+    return sender;
+  }
+
   async #outboundCommand(pub: BridgePublish): Promise<NatsOutbound> {
     const data = pub.data as Record<string, unknown>;
     const problem = controlCommandProblem(data, pub.kind);
     if (problem) throw new NatsCarrierRefusal(problem);
-    const sender = this.#presence.file(pub.from.id);
-    // A live native file participant, whose ACK (and an ask's answer) returns to its own runtime only.
-    if (!sender || sender.identity.id !== pub.from.id) throw new NatsCarrierRefusal("sender is not a live file participant");
+    const spoke = this.#relaySource(pub);
+    const sender = this.#fileSender(pub, spoke);
     if (data.replyTo !== sender.hostId) throw new NatsCarrierRefusal("replyTo is not the sender's own host");
     const targetId = data.targetId as string;
     const owner = this.#presence.nats(targetId);
@@ -433,10 +479,17 @@ export class NatsBridgeCarrier {
     if (owner.route.ownerHostId !== pub.to) throw new NatsCarrierRefusal("command host is not the target's NATS owner");
     const operation = data.operation as FabricControlOperation;
     const requesterId = sender.identity.id;
-    const decision = this.#authorize({ direction: "toNats", senderId: requesterId, targetId, operation, principal: pub.principal });
+    const decision = this.#authorize({ direction: "toNats", senderId: requesterId, targetId, operation, principal: pub.principal,
+      ...(spoke !== undefined ? { viaSpoke: spoke } : {}) });
+    const sourceEventId = pub.data.bridge.id;
+    if (!nonEmpty(sourceEventId)) throw new NatsCarrierRefusal("command has no source event id");
+    // A relayed command's id is the spoke's event id: its envelope id is bound to that spoke link as well.
+    const envelopeId = spoke === undefined ? bridgeNatsEnvelopeId(this.link, sourceEventId)
+      : bridgeNatsRelayEnvelopeId(this.link, spoke, sourceEventId);
+    const answerKey = spoke === undefined ? sourceEventId : envelopeId;
     // From here the sender is verified and the target is the NATS owner this link mirrors: a refusal is answered.
     const answer = (code: string, reason: string): NatsCarrierFileAnswer => ({
-      to: data.replyTo as string, from: carrierIdentity(owner.identity), stampId: `refused:${pub.data.bridge.id}`,
+      to: data.replyTo as string, from: carrierIdentity(owner.identity), stampId: `refused:${answerKey}`,
       data: { version: 1, commandId: data.commandId, targetId,
         ...(typeof data.ownerIncarnation === "string" ? { ownerIncarnation: data.ownerIncarnation } : {}),
         accepted: false, error: `Fabric NATS bridge refused the command: ${code}: ${reason}`, errorCode: code, notRun: true },
@@ -461,10 +514,8 @@ export class NatsBridgeCarrier {
       deadlineAt: typeof data.deadlineAt === "number" ? data.deadlineAt : requestedAt + LEGACY_DEADLINE_MS,
     });
     const bodyDigest = controlBodyFingerprint(body, principal);
-    const sourceEventId = pub.data.bridge.id;
-    if (!nonEmpty(sourceEventId)) throw new NatsCarrierRefusal("command has no source event id");
     const envelope = this.#envelope({
-      id: bridgeNatsEnvelopeId(this.link, sourceEventId), kind: "command",
+      id: envelopeId, kind: "command",
       to: { machine: owner.route.machine, hostId: owner.route.ownerHostId }, targetId, operation,
       from: carrierIdentity(sender.identity), principal, body,
     });
@@ -501,7 +552,7 @@ export class NatsBridgeCarrier {
         if (!recorded) return { kind: "absorb", reason: "the owner's answer is recorded without data" };
         // A same-key resend of an answered command: the recorded answer, to this event's sender, at once.
         return { kind: "answer", reason: "answered from the recorded outcome", answer: {
-          to: data.replyTo as string, from: carrierIdentity(owner.identity), stampId: `replay:${sourceEventId}`, data: { ...recorded } } };
+          to: data.replyTo as string, from: carrierIdentity(owner.identity), stampId: `replay:${answerKey}`, data: { ...recorded } } };
       }
     }
   }
@@ -516,7 +567,9 @@ export class NatsBridgeCarrier {
     if (pub.to !== record.replyTo || data.targetId !== record.targetId || pub.from.id !== record.ownerIdentityId) {
       throw new NatsCarrierRefusal("ack does not match its carried command");
     }
-    const owner = this.#presence.file(pub.from.id);
+    // A spoke root's ACK arrives relayed (from its spoke link's direct hub mirror); any other from a native owner.
+    const spoke = this.#relaySource(pub);
+    const owner = spoke === undefined ? this.#presence.file(pub.from.id) : this.#presence.spoke?.(pub.from.id, spoke);
     if (!owner || owner.identity.id !== record.ownerIdentityId || owner.hostId !== record.ownerHostId) {
       throw new NatsCarrierRefusal("ack sender is not the command's live file owner");
     }
@@ -648,7 +701,7 @@ export class NatsBridgeCarrier {
       // envelope the owner's recorded answer, as a NATS owner replays its seen claim.
       const answer = stored.outcome?.data;
       if (!answer) return { kind: "settled", reason: "the owner's answer is recorded without data" };
-      return { kind: "reply", reason: "answered from the recorded outcome", envelope: this.#envelope({
+      return { kind: "reply", reason: "answered from the recorded outcome", replay: true, envelope: this.#envelope({
         id: bridgeNatsAckEnvelopeId(input.id), kind: "ack", to: { machine: sourceMachine, hostId: stored.replyTo },
         targetId, operation: answer.accepted === true ? "accepted" : "rejected", from: carrierIdentity(target.identity),
         // The responder's current epoch authenticates this attempt; the recorded one is history.
@@ -657,13 +710,16 @@ export class NatsBridgeCarrier {
       }) };
     }
     // publish, or resend (unconfirmed): present the event; the file store's receipt makes a repeat one append.
-    const data = wire({ ...pick(body, COMMAND_FIELDS), commandId, ...(cancelCommandId !== undefined ? { cancelCommandId } : {}) });
+    // A spoke root's command names its spoke as the destination, so MeshBridge relays it there (never the hub log).
+    const spoke = decision.viaSpoke;
+    const data = wire({ ...pick(body, COMMAND_FIELDS), commandId, ...(cancelCommandId !== undefined ? { cancelCommandId } : {}),
+      ...(spoke !== undefined ? { destinationRemoteHost: spoke } : {}) });
     const event: MeshEvent = {
       id: input.id, sequence: delivery.sequence, createdAt: body.requestedAt as number,
       topic: BRIDGE_NATS_CONTROL_TOPIC, kind: operation, from: carrierIdentity(sender.identity), to: input.hostId,
       ...(carried ? { principal: carried } : {}), verification: "bridge", data,
     };
-    return { kind: "event", event };
+    return { kind: "event", event, ...(spoke !== undefined ? { relay: true as const } : {}) };
   }
 
   async #inboundAck(
@@ -696,7 +752,9 @@ export class NatsBridgeCarrier {
       kind: data.accepted === true ? "accepted" : "rejected", from: carrierIdentity(sender.identity), to: record.replyTo,
       verification: "bridge", data,
     };
-    return { kind: "event", event, settle };
+    // The answer to a command relayed from a spoke goes back through the hub to that spoke's root.
+    return { kind: "event", event, settle,
+      ...(record.destinationEventId.startsWith(BRIDGE_NATS_RELAY_ENVELOPE_PREFIX) ? { relay: true as const } : {}) };
   }
 
   /** An ACK the link answers for the hop, shaped exactly as the NATS owner's (#sendNatsAcknowledgement). */

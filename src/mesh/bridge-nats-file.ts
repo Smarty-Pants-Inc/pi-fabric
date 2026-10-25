@@ -4,7 +4,10 @@ import type { FabricParticipantRecord } from "../topology/types.js";
 import {
   DirectoryNotReadyError, TransportUncertainError, TransportUnavailableError, type TransportSent,
 } from "../transport/types.js";
+import { RELAY_DESTINATION_UNAVAILABLE } from "../topology/control-plane.js";
 import type { BridgeChange } from "./change-notifier.js";
+import { FABRIC_IDEMPOTENCY_KEY_REUSED } from "./control-idempotency.js";
+import type { NatsLinkCounterName } from "./bridge-nats-counters.js";
 import {
   BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
   type BridgeRead, type BridgeSide, type MeshBridgeOptions,
@@ -194,11 +197,30 @@ export class FileCarrierPresence {
     return entry && { identity: copy(entry.identity), hostId: entry.hostId };
   }
 
+  /**
+   * PR 2 relay: a live canonical root the hub holds as spoke link `spoke`'s DIRECT mirror (stored origin and
+   * holder both that link, no re-export hop), and the only record for the id (no native, no other link's).
+   */
+  spoke(id: string, spoke: string): FilePresenceEntry | undefined {
+    const records = (this.#records.get(id) ?? []).filter(record => record.id === id);
+    const record = records.length === 1 ? records[0]! : undefined;
+    if (!record || !record.live || record.kind !== "main" || record.remoteHost !== spoke || record.mirroredBy !== spoke ||
+        record.bridgeVia !== undefined || record.rootId !== id || record.ownerHostId !== id || record.ownerIdentityId !== id) return undefined;
+    return { identity: { id, name: record.name, kind: "main", ...(record.sessionId !== undefined ? { sessionId: record.sessionId } : {}) },
+      hostId: id };
+  }
+
   /** Live native file actors from the last refresh (candidates for the KV mirror, filtered by the allow-list). */
   actors(): readonly FabricParticipantRecord[] { return this.#actors; }
 }
 
 const delay = (ms: number): Promise<void> => new Promise(resolve => { setTimeout(resolve, ms).unref?.(); });
+
+/** A relayed root's record as L1's port holds it (PR 2): its stored origin, hub hop and mirror lease stripped. */
+const withoutHop = <T extends { remoteHost?: string | undefined; bridgeVia?: string | undefined }>(record: T): T => {
+  const { remoteHost: _origin, bridgeVia: _hop, mirrorLease: _lease, ...native } = record as T & { mirrorLease?: unknown };
+  return native as unknown as T;
+};
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 export interface NatsCarrierSideOptions {
@@ -211,8 +233,11 @@ export interface NatsCarrierSideOptions {
   readonly ledger: NatsCarrierLedger;
   readonly authorize: NatsCarrierAuthorize;
   readonly authorizeTopic: NatsTopicAuthorize;
-  /** Which file identities the link mirrors into KV (the allow-list's file entries). Default: none. */
-  readonly mirrorAllowed?: (participant: Pick<FabricParticipantRecord, "id" | "kind" | "rootId" | "name">) => boolean;
+  /**
+   * Which file identities the link mirrors into KV (the allow-list's file entries). Default: none. A root with a
+   * stored origin (`remoteHost`) is another hub link's: PR 2 holds one only for a spoke root entry naming that link.
+   */
+  readonly mirrorAllowed?: (participant: Pick<FabricParticipantRecord, "id" | "kind" | "rootId" | "name" | "remoteHost">) => boolean;
   /** Add allow-listed native file actors to the mirror set (default true); false when the port lists them itself. */
   readonly mirrorActors?: boolean;
   readonly now?: () => number;
@@ -227,7 +252,17 @@ export interface NatsCarrierSideOptions {
   readonly presenceWaitMs?: number;
   /** Only these inbound targets (allow.file) may wait for KV visibility; any other is refused at once. */
   readonly waitForTarget?: (targetId: string) => boolean;
+  /**
+   * This hub's bridge name (MeshBridge localName). PR 2 relay: the hop a re-exported spoke root carries, and the
+   * author of MeshBridge's own relay refusals, which this side never sends to NATS.
+   */
+  readonly localName?: string;
+  /** L5's link counters (bridge-nats-counters.ts): the control.*, topic.* and relay.* legs this side carries. */
+  readonly counters?: NatsCarrierCounters;
 }
+
+/** The part of L5's NatsLinkCounters this side uses. */
+export interface NatsCarrierCounters { add(name: NatsLinkCounterName): void }
 
 interface InHand {
   delivery: BridgeNatsPortDelivery;
@@ -236,6 +271,8 @@ interface InHand {
   /** The carrier's conversion, cached so a reread presents the same event. */
   event?: MeshEvent;
   settle?: NatsCarrierSettle;
+  /** PR 2 relay: the event goes to (or answers) a spoke root through the hub relay. */
+  relay?: true;
   /** When a presence wait for this delivery began (this side's clock). */
   waitingSince?: number;
 }
@@ -253,6 +290,8 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   readonly #log: (line: string) => void;
   readonly #mirrorAllowed: NonNullable<NatsCarrierSideOptions["mirrorAllowed"]>;
   readonly #mirrorActors: boolean;
+  readonly #localName: string | undefined;
+  readonly #counters: NatsCarrierCounters | undefined;
   readonly #resendAttempts: number;
   readonly #resendDelayMs: number;
   readonly #workingIntervalMs: number;
@@ -279,6 +318,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     const presence: NatsCarrierPresence = {
       nats: id => natsPresenceEntry(this.port, id),
       file: id => this.filePresence.file(id),
+      spoke: (id, spoke) => this.filePresence.spoke(id, spoke),
     };
     this.carrier = new NatsBridgeCarrier({ link: options.link, machine: options.port.machine, presence, ledger: options.ledger,
       authorize: options.authorize, now: this.#now, ...(options.waitForTarget ? { waitForTarget: options.waitForTarget } : {}) });
@@ -288,6 +328,8 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     this.#log = options.log ?? (() => undefined);
     this.#mirrorAllowed = options.mirrorAllowed ?? (() => false);
     this.#mirrorActors = options.mirrorActors ?? true;
+    this.#localName = options.localName;
+    this.#counters = options.counters;
     this.#resendAttempts = Math.max(1, options.resendAttempts ?? RESEND_ATTEMPTS);
     this.#resendDelayMs = Math.max(0, options.resendDelayMs ?? RESEND_DELAY_MS);
     this.#workingIntervalMs = Math.max(1, options.workingIntervalMs ?? WORKING_INTERVAL_MS);
@@ -394,11 +436,37 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
    */
   async mirror(presence: Parameters<BridgeSide["mirror"]>[0], observedAt?: number): Promise<void> {
     await this.filePresence.refresh(true);
-    const hostIds = new Set<string>();
-    const participants = presence.participants.filter(participant => participant.kind === "root" && this.#mirrorAllowed(participant));
-    if (this.#mirrorActors) for (const actor of this.filePresence.actors()) if (this.#mirrorAllowed(actor)) participants.push(actor);
-    for (const participant of participants) hostIds.add(participant.ownerHostId);
-    const hosts = presence.hosts.filter(host => hostIds.has(host.record.id));
+    // Each mirrored root's host, by id, and the stored origin that host record must carry (undefined: native).
+    const hostOrigins = new Map<string, string | undefined>();
+    const participants: FabricParticipantRecord[] = [];
+    for (const participant of presence.participants) {
+      if (participant.kind !== "root" || !this.#mirrorAllowed(participant)) continue;
+      if (participant.remoteHost === undefined && participant.bridgeVia === undefined) {
+        participants.push(participant);
+        hostOrigins.set(participant.ownerHostId, undefined);
+        continue;
+      }
+      // PR 2 relay: an allow-listed spoke root, which MeshBridge re-exports from another hub link (bridgeVia =
+      // this hub). L1's port holds only native-shaped rows, so it is held with its stored origin and hop
+      // stripped: under the bridge machine, it is this link that answers for it.
+      const origin = participant.remoteHost;
+      if (origin === undefined || origin === this.#link || participant.bridgeVia === undefined ||
+          (this.#localName !== undefined && participant.bridgeVia !== this.#localName)) continue;
+      participants.push(withoutHop(participant));
+      hostOrigins.set(participant.ownerHostId, origin);
+    }
+    if (this.#mirrorActors) {
+      for (const actor of this.filePresence.actors()) {
+        if (!this.#mirrorAllowed(actor)) continue;
+        participants.push(actor);
+        hostOrigins.set(actor.ownerHostId, undefined);
+      }
+    }
+    const hosts = presence.hosts.flatMap(host => {
+      const id = host.record.id;
+      if (!hostOrigins.has(id) || host.record.remoteHost !== hostOrigins.get(id)) return [];
+      return [host.record.remoteHost === undefined ? host : { ...host, record: withoutHop(host.record) }];
+    });
     let set = { hosts, participants };
     const partial = presence.partial === true || (presence.droppedCount ?? 0) > 0 || (presence.dropped?.length ?? 0) > 0;
     if (partial && this.#lastMirror) {
@@ -432,17 +500,45 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
 
   closeGracefully(error?: Error): void { this.close(error); }
 
+  #count(name: NatsLinkCounterName): void {
+    try { this.#counters?.add(name); } catch (error) { this.#log(`counters: ${message(error)}`); }
+  }
+
+  /**
+   * MeshBridge's own answer to a relay it could not complete (#relayCommand: the destination link is down, or
+   * its store refused a reused key). It speaks for the hub's relay, which no NATS receiver accepts from this
+   * machine, and makes no non-execution claim, so it never crosses: the NATS sender keeps waiting (a same-key
+   * resend is relayed again), and the link goes on.
+   */
+  #hubRelayRefusal(event: BridgePublish): boolean {
+    const hub = this.#localName;
+    return hub !== undefined && event.topic === BRIDGE_NATS_ACK_TOPIC && event.from.id === `bridge:${hub}` &&
+      event.data.bridge.from === hub && event.data.bridge.via === undefined &&
+      (event.data.errorCode === RELAY_DESTINATION_UNAVAILABLE || event.data.errorCode === FABRIC_IDEMPOTENCY_KEY_REUSED);
+  }
+
   /** toNats: one event MeshBridge admitted toward the NATS side. Resolves only after the PubAck. */
   async publish(event: BridgePublish): Promise<{ sequence: number }> {
+    const control = event.topic === BRIDGE_NATS_CONTROL_TOPIC || event.topic === BRIDGE_NATS_ACK_TOPIC;
+    // PR 2 relay: a command or ACK MeshBridge relays from another hub link (a spoke's root) carries the hop.
+    const leg = !control ? "topic" : event.data.bridge.via !== undefined ? "relay" : "control";
+    if (this.#hubRelayRefusal(event)) {
+      this.#log(`toNats: relay of ${String(event.data.commandId)} to ${event.to} not completed ` +
+        `(${String(event.data.errorCode)}); not sent: the NATS sender keeps waiting`);
+      this.#count("relay.refused");
+      return { sequence: 0 };
+    }
     // Identity and the allow gate read the file side's presence: at most one TTL old, never stale.
     await this.filePresence.refresh();
     let plan: NatsOutbound;
     try {
-      plan = event.topic === BRIDGE_NATS_CONTROL_TOPIC || event.topic === BRIDGE_NATS_ACK_TOPIC
-        ? await this.carrier.outbound(event) : await this.topics.outbound(event);
+      plan = control ? await this.carrier.outbound(event) : await this.topics.outbound(event);
     } catch (error) {
       // A refused command from a verified file sender is answered (notRun, stable code) before MeshBridge drops it.
-      if (error instanceof NatsCarrierRefusal && error.answer) await this.#answerFileSender(error.answer);
+      if (error instanceof NatsCarrierRefusal) {
+        this.#count(`${leg}.refused`);
+        if (error.answer) await this.#answerFileSender(error.answer);
+      }
       throw deferTransient(error);
     }
     if (plan.kind === "absorb") {
@@ -456,6 +552,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     }
     let sent: TransportSent<Record<string, unknown>>;
     try { sent = await this.#send(plan.envelope); } catch (error) { throw deferTransient(error); }
+    this.#count(`${leg}.toNats`);
     // An ACK going back to a NATS sender is that command's forward; a command is now sent.
     if (plan.settle) await this.carrier.settle(plan.settle, true);
     else if (plan.record?.direction === "toNats" && plan.envelope.kind === "command") await this.carrier.sent(plan.record, sent.sequence);
@@ -520,10 +617,12 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
         held.sequence = ++this.#sequence;
         held.event = { ...plan.event, sequence: held.sequence };
         if (plan.settle) held.settle = plan.settle;
+        if (plan.relay) held.relay = true;
         return held.event;
       }
       case "reply":
         await this.#send(plan.envelope);
+        if (!plan.replay) this.#count("control.refused");
         this.#log(`toFile: answered ${envelopeId} for the hop: ${plan.reason}`);
         await delivery.ack();
         this.#release(stream);
@@ -550,12 +649,14 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
         if (this.#now() - since < this.#presenceWaitMs) throw new NatsCarrierDeferredError(new Error(plan.reason));
         this.#log(`toFile: refused ${envelopeId} from ${delivery.sourceMachine} after ${this.#presenceWaitMs} ms: ${plan.reason}`);
         await delivery.term(plan.reason);
+        this.#count("control.refused");
         this.#release(stream);
         return undefined;
       }
       case "refused":
         this.#log(`toFile: refused ${envelopeId} from ${delivery.sourceMachine}: ${plan.reason}`);
         await delivery.term(plan.reason);
+        this.#count("control.refused");
         this.#release(stream);
         return undefined;
     }
@@ -572,6 +673,8 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
         this.#log(`toFile: broker ACK of stream sequence ${stream} failed (retried next read): ${message(error)}`);
         continue;
       }
+      // Durably appended on the hub (or relayed to its spoke, receipt recorded) and ACKed to the broker.
+      this.#count(held.relay ? "relay.toFile" : "control.toFile");
       if (held.settle) {
         try { await this.carrier.settle(held.settle, true); }
         catch (error) { this.#log(`toFile: ledger settle for stream sequence ${stream} failed: ${message(error)}`); }
@@ -596,26 +699,31 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   }
 }
 
-export interface NatsFileLinkOptions extends Omit<NatsCarrierSideOptions, "file"> {
+export interface NatsFileLinkOptions extends Omit<NatsCarrierSideOptions, "file" | "localName"> {
   /** The hub's file mesh. */
   readonly store: MeshStore;
   /** This hub's bridge name (MeshBridge localName). */
   readonly localName: string;
   readonly cursorPath: string;
-  /** Further MeshBridge options (alarms, watchdog, rates); never `relay` in PR 1. */
+  /**
+   * PR 2: MeshBridge's delivery-only hub-link relay (the UDS relay, or a test's in-process seam). Absent, a
+   * command to another link's root fails closed in MeshBridge.
+   */
+  readonly relay?: MeshBridgeOptions["relay"];
+  /** Further MeshBridge options (alarms, watchdog, rates). */
   readonly bridge?: Omit<MeshBridgeOptions, "localName" | "remoteName" | "local" | "remote" | "cursorPath" | "relay" | "log">;
 }
 
 /**
  * The link: the existing MeshBridge with the file store as its local StoreBridgeSide (peer = the
- * link name) and the NATS carrier side as its remote. No relay hook: spoke relays are PR 2, and a
- * missing hook fails cross-spoke commands closed in MeshBridge.
+ * link name) and the NATS carrier side as its remote, joined to the hub's other links by `relay`.
  */
 export const createNatsFileLink = (options: NatsFileLinkOptions): { bridge: MeshBridge; local: StoreBridgeSide; remote: NatsCarrierSide } => {
   const local = new StoreBridgeSide(options.store, options.link, options.now ?? Date.now, true);
   const remote = new NatsCarrierSide({ ...options, file: local });
   const bridge = new MeshBridge({
     ...options.bridge, localName: options.localName, remoteName: options.link, local, remote, cursorPath: options.cursorPath,
+    ...(options.relay ? { relay: options.relay } : {}),
     ...(options.log ? { log: options.log } : {}),
   });
   return { bridge, local, remote };

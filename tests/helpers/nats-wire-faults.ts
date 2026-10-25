@@ -57,6 +57,13 @@ export class NatsWireFaults {
   readonly deliveries: JsDelivery[] = [];
   /** Outbound publishes to `fabric.in.*` (commands and protocol ACKs crossing to an inbox). */
   readonly inboxPublishes: string[] = [];
+  /** The same publishes with their envelope JSON (test data only; credential frames are never PUBs to fabric.in). */
+  readonly inboxFrames: Array<{ readonly subject: string; readonly body: string }> = [];
+
+  /** Envelope bodies this relay's clients published to an inbox since index `since`, containing `token`. */
+  publishedWith(token: string, since = 0): Array<{ readonly subject: string; readonly body: string }> {
+    return this.inboxFrames.slice(since).filter((frame) => frame.body.includes(token));
+  }
   url = "";
   private blocked = false;
   private readonly sockets = new Set<Socket>();
@@ -198,6 +205,7 @@ export class NatsWireFaults {
       }
       if (frame.subject.startsWith("fabric.in.")) {
         this.inboxPublishes.push(frame.subject);
+        this.inboxFrames.push({ subject: frame.subject, body: frame.body.toString("utf8") });
         if (frame.reply && this.take(this.pubAckRules, frame)) this.lostReplies.add(frame.reply);
       }
     } else {

@@ -54,8 +54,11 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link ide
     await expect(h.natsMain.invoke("agents.followUp", { id: h.fileMain.id, message: token, idempotencyKey: `b-${randomUUID()}` })
       .catch((error: unknown) => { throw new Error(`${String(error)}\n${linkTail(h)}`); })).resolves.toMatchObject({ acknowledged: true });
   };
-  const crossedToNats = (mark: number, token: string) => h.wire.since(mark).filter((event) =>
-    event.envelope.kind === "command" && bodyOf(event).message === token && (event.phase === "send" ? event.machine === BRIDGE_MACHINE : event.hostId === h.natsMain.id));
+  /** Wire-level: anything the link published to an inbox carrying the token, or any delivery of it to the v2 Main. */
+  const crossedToNats = (mark: { wire: number; relay: number }, token: string) => [
+    ...h.faults.publishedWith(token, mark.relay),
+    ...h.wire.since(mark.wire).filter((event) => event.phase === "deliver" && event.hostId === h.natsMain.id && bodyOf(event).message === token),
+  ];
 
   it("NATS side: a delivery whose from.id is not live on its credential's machine is refused and never consumed", async () => {
     const fileEpoch = selfRecord(h.fileMain)!.ownerIncarnation!;
@@ -83,7 +86,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link ide
   it("file side: a command whose sender is not a live allow-listed native file root never crosses", async () => {
     const natsEpoch = selfRecord(h.natsMain)!.ownerIncarnation!;
     const store = h.fileMain.runtime.mesh;
-    const mark = h.wire.mark();
+    const mark = { wire: h.wire.mark(), relay: h.faults.inboxFrames.length };
     const forged: Array<[string, MeshIdentity]> = [
       ["mirrored NATS root", identity(h.natsMain)], // native to NATS: the hub must not speak for it back
       ["unknown root", { id: `session:${randomUUID()}`, name: "nobody", kind: "main" }],

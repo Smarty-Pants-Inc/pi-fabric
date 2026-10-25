@@ -55,7 +55,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: ad
 
   it("an ops.owner notice crosses; an unlisted topic, a broadcast and a report to an unlisted recipient never do", async () => {
     const notice = `pr.wake ${randomUUID()}`, github = `GITHUB_${randomUUID()}`, broadcast = `BROADCAST_${randomUUID()}`, other = `OTHER_${randomUUID()}`;
-    const mark = h.wire.mark();
+    const relayMark = h.faults.inboxFrames.length;
     await publish(REPORT_RELAY, "github.pull_request", "opened", h.natsMain.id, github);
     await publish(REPORT_RELAY, "fleet.work.lanes", "report", undefined, broadcast);
     await publish(REPORT_RELAY, "fleet.work.lanes", "report", h.natsPeer!.id, other); // natsPeer has no receiveTopics
@@ -65,7 +65,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: ad
     expect(h.natsMain.delivered().filter((entry) => entry.text.includes(github) || entry.text.includes(broadcast))).toEqual([]);
     expect(h.natsPeer!.delivered().filter((entry) => entry.text.includes(other))).toEqual([]);
     // Nothing for them was even published by the link (decided before the barrier, in file-log order).
-    expect(h.wire.since(mark).filter((entry) => entry.phase === "send" && entry.machine === BRIDGE_MACHINE &&
-      [github, broadcast, other].some((token) => String(bodyOf(entry).message ?? "").includes(token)))).toEqual([]);
+    for (const token of [github, broadcast, other]) expect(h.faults.publishedWith(token, relayMark), token).toEqual([]);
+    expect(h.faults.publishedWith(notice, relayMark)).toHaveLength(1);
   }, 45_000);
 });

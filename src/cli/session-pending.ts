@@ -249,7 +249,7 @@ export const runSessionPendingCli = async (
 export interface SessionPendingFollowUps {
   file: string; present: boolean | null; count: number | null; ids?: string[]; oldestAt?: number; owner?: Row | null;
   /** held: Fabric still holds it (no `handed`); handed: handed to Pi, not yet confirmed in the session. */
-  held?: number; handed?: number;
+  held?: number; handed?: number; handedIds?: string[];
   /** The Main's owner halt (`<journal>.delivered` halted): a halted Main never flushes held items. null: unknown. */
   halted?: boolean | null;
 }
@@ -284,7 +284,7 @@ export const inventorySessionPending = (meshRoot: string, sessionId: string): Se
       observation.quietNames(path.join(meshRoot, "main-followups"), true);
       const journal = observation.json(mailbox);
       followUps.present = journal.present;
-      if (journal.present === false) { followUps.count = 0; followUps.held = 0; followUps.handed = 0; }
+      if (journal.present === false) { followUps.count = 0; followUps.held = 0; followUps.handed = 0; followUps.ids = []; followUps.handedIds = []; }
       else {
         const saved = row(journal.value);
         if (!saved || saved.version !== 1 || !Array.isArray(saved.items) || saved.items.some(item => {
@@ -296,7 +296,8 @@ export const inventorySessionPending = (meshRoot: string, sessionId: string): Se
         else {
           const items = saved.items as Array<{ id: string; sentAt: number; handed?: true }>;
           followUps.count = items.length; followUps.ids = items.map(item => item.id);
-          followUps.handed = items.filter(item => item.handed === true).length;
+          followUps.handedIds = items.filter(item => item.handed === true).map(item => item.id);
+          followUps.handed = followUps.handedIds.length;
           followUps.held = items.length - followUps.handed;
           if (items.length) followUps.oldestAt = items.reduce((oldest, item) => Math.min(oldest, item.sentAt), Infinity);
         }

@@ -358,6 +358,25 @@ await build({
   banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
 });
 
+// The D3 drain seam (smarty-dev#15310) is pinned by the sha256 of ONE file: inline everything, Node built-ins
+// only, so the pin covers all of its logic. `--install --out` writes the seat's copy with its interpreter's shebang.
+const seatDrain = await build({
+  entryPoints: ["src/seat-drain/entry.ts"],
+  outfile: "dist/seat-drain/fabric-seat-drain.cjs",
+  bundle: true,
+  platform: "node",
+  format: "cjs",
+  target: "node24",
+  metafile: true,
+  logLevel: "info",
+});
+const seatDrainForeign = [
+  ...Object.keys(seatDrain.metafile.inputs).filter((input) => input.includes("node_modules/")),
+  ...Object.values(seatDrain.metafile.outputs).flatMap((output) =>
+    output.imports.filter((entry) => !entry.path.startsWith("node:") && !entry.external).map((entry) => entry.path)),
+];
+if (seatDrainForeign.length > 0) throw new Error(`The seat drain seam must be self-contained:\n${seatDrainForeign.join("\n")}`);
+
 // tsc does not copy input .d.ts files; ship the generated kernel ABI and receipt.
 mkdirSync("dist/verified/generated", { recursive: true });
 const receiptPath = "src/verified/generated/manifest.json";

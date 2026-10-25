@@ -1183,6 +1183,7 @@ export class FabricRuntimeState {
         const drain = new MainDrainServer(new MainDrainControl({
           rootId: mainAgent.id, sessionId, meshRoot, pi: this.pi, context: () => live.read(ctx => ctx),
           main: () => mainAgent, actors: () => this.#actors, agents: () => this.#agents,
+          completions: () => this.#completionInbox?.drainPending(),
         }));
         this.#mainDrain = drain;
         void drain.start();

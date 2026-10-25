@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { drainSlot, peekDrainSlot, pruneDrainSlot, type MainDrainSlotBinding } from "./slot.js";
 
 /**
  * D3 seat drain (smarty-dev#15310) M10: bind each mutating drain request to ONE seat run, and
@@ -24,20 +25,13 @@ export interface MainDrainBindingRequest {
   runSha256: string;
   phase: MainDrainPhase;
   operationId: string;
+  /** The seam-minted fence generation, recorded in its intent file before the first control call. */
+  generation: string;
   lockFd: number | null;
   podUid: string | null;
 }
-export interface MainDrainBinding {
-  kind: "host" | "pod";
-  run: string;
-  runSha256: string;
-  operationId: string;
-  phase: MainDrainPhase;
-  podUid: string | null;
-  boundAt: number;
-  /** Per-process, monotonically increasing: one fence per Main at a time. */
-  fenceGeneration: number;
-}
+/** The drain record (one per Main): the run and operation that hold its gate and fence. */
+export type MainDrainBinding = MainDrainSlotBinding;
 
 const HEX32 = /^[0-9a-f]{32}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -49,10 +43,11 @@ const PHASES = new Set<MainDrainPhase>(["drain", "drain-undo", "resume-drain"]);
 export const parseBindingRequest = (value: unknown): MainDrainBindingRequest | undefined => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const binding = value as Record<string, unknown>;
-  if (Object.keys(binding).sort().join(",") !== "lockFd,operationId,phase,podUid,run,runDir,runSha256") return undefined;
-  const { runDir, run, runSha256, phase, operationId, lockFd, podUid } = binding;
+  if (Object.keys(binding).sort().join(",") !== "generation,lockFd,operationId,phase,podUid,run,runDir,runSha256") return undefined;
+  const { runDir, run, runSha256, phase, operationId, generation, lockFd, podUid } = binding;
   if (typeof run !== "string" || !HEX32.test(run) || typeof runSha256 !== "string" || !HEX64.test(runSha256) ||
-    typeof operationId !== "string" || !HEX32.test(operationId) || !PHASES.has(phase as MainDrainPhase)) return undefined;
+    typeof operationId !== "string" || !HEX32.test(operationId) || typeof generation !== "string" || !HEX32.test(generation) ||
+    !PHASES.has(phase as MainDrainPhase)) return undefined;
   if (runDir !== null && (typeof runDir !== "string" || !path.isAbsolute(runDir) || runDir.length > 4096)) return undefined;
   if (lockFd !== null && (!Number.isSafeInteger(lockFd) || (lockFd as number) < 0 || (lockFd as number) > 1_048_576)) return undefined;
   if (podUid !== null && (typeof podUid !== "string" || !POD_UID.test(podUid))) return undefined;
@@ -60,34 +55,32 @@ export const parseBindingRequest = (value: unknown): MainDrainBindingRequest | u
   const host = runDir !== null && lockFd !== null && podUid === null;
   const pod = runDir === null && lockFd === null && podUid !== null;
   if (!host && !pod) return undefined;
-  return { runDir: runDir as string | null, run, runSha256, phase: phase as MainDrainPhase, operationId, lockFd: lockFd as number | null,
-    podUid: podUid as string | null };
+  return { runDir: runDir as string | null, run, runSha256, phase: phase as MainDrainPhase, operationId, generation,
+    lockFd: lockFd as number | null, podUid: podUid as string | null };
 };
 
-const BINDINGS = Symbol.for("pi-fabric.main.drain-bindings.v1");
-const GENERATION = Symbol.for("pi-fabric.main.drain-generation.v1");
-const store = globalThis as Record<symbol, unknown>;
-const bindings = (): Map<string, MainDrainBinding> =>
-  (store[BINDINGS] ??= new Map<string, MainDrainBinding>()) as Map<string, MainDrainBinding>;
-
-export const currentBinding = (rootId: string): MainDrainBinding | undefined => bindings().get(rootId);
-export const clearBinding = (rootId: string): void => { bindings().delete(rootId); };
+export const currentBinding = (rootId: string): MainDrainBinding | undefined => peekDrainSlot(rootId)?.binding;
+export const clearBinding = (rootId: string): void => {
+  const slot = peekDrainSlot(rootId);
+  if (slot) delete slot.binding;
+  pruneDrainSlot(rootId);
+};
 
 /**
- * Bind (first call) or match (same run AND operationId: idempotent). A different run or
+ * Bind (first call) or match (same run, operation and generation: idempotent). A different run or
  * operation while a binding stands is refused: one fence per Main.
  */
 export const bindOrMatch = (rootId: string, request: MainDrainBindingRequest, kind: "host" | "pod", now = Date.now()): MainDrainBinding | string => {
-  const existing = bindings().get(rootId);
+  const slot = drainSlot(rootId);
+  const existing = slot.binding;
   if (existing) {
     return existing.run === request.run && existing.runSha256 === request.runSha256 && existing.operationId === request.operationId &&
-      existing.kind === kind && existing.podUid === request.podUid ? existing : "DRAIN_BOUND_ELSEWHERE";
+      existing.generation === request.generation && existing.kind === kind && existing.podUid === request.podUid
+      ? existing : "DRAIN_BOUND_ELSEWHERE";
   }
-  const fenceGeneration = ((store[GENERATION] as number | undefined) ?? 0) + 1;
-  store[GENERATION] = fenceGeneration;
   const binding: MainDrainBinding = { kind, run: request.run, runSha256: request.runSha256, operationId: request.operationId,
-    phase: request.phase, podUid: request.podUid, boundAt: now, fenceGeneration };
-  bindings().set(rootId, binding);
+    generation: request.generation, phase: request.phase, podUid: request.podUid, boundAt: now };
+  slot.binding = binding;
   return binding;
 };
 

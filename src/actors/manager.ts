@@ -1708,7 +1708,7 @@ export class ActorManager {
     } = {},
   ): Promise<FabricActorInfo> {
     // D3 seat drain (smarty-dev#15310): a draining root creates no new actor (rejects before any effect).
-    try { assertMainInboxOpen(this.#rootId); } catch (error) { return Promise.reject(error); }
+    try { assertMainInboxOpen(this.#rootId, { path: "actors.create", text: request.name }); } catch (error) { return Promise.reject(error); }
     ++this.#pendingCreates;
     routerAdmission = routerAdmission && { ...routerAdmission, targetRootId: this.#rootId,
       targetHostId: this.agents.runtimeHostId ?? routerAdmission.targetHostId };

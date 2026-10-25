@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { drainSlot, peekDrainSlot, pruneDrainSlot } from "./slot.js";
 
 /**
  * D3 seat drain (smarty-dev#15310): the typed port to Pi's native input fence.
@@ -46,13 +47,9 @@ export interface NativeInputObservation {
   fenceError: string | null;
 }
 
-// The release handle survives a live extension reload (same process; Pi keeps the fence across a
-// reload and the ORIGINAL release still reopens it); a restart starts unfenced. Only a lost handle
-// means restart required.
-const FENCES = Symbol.for("pi-fabric.main.drain-fences.v1");
-const fences = (): Map<string, ExtensionInputFence> =>
-  ((globalThis as Record<symbol, unknown>)[FENCES] ??= new Map<string, ExtensionInputFence>()) as Map<string, ExtensionInputFence>;
-const lastErrors = new Map<string, string>();
+// The release handle lives in the process-global drain slot (slot.ts): it survives a live extension
+// reload (Pi keeps the fence across a reload, and the ORIGINAL release still reopens it); a restart
+// starts unfenced. Only a lost handle means restart required.
 
 const count = (value: unknown): number | null => Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : null;
 const flag = (read: () => unknown): boolean | null => {
@@ -87,7 +84,7 @@ export const observeNativeInput = (pi: ExtensionAPI, ctx: ExtensionContext | und
   return {
     inputAdmission: Number.isSafeInteger(admission) ? admission as number : null,
     fenceApi: api,
-    inputsFenced: api && fences().has(rootId) && state?.inputsFenced === true,
+    inputsFenced: api && peekDrainSlot(rootId)?.fence !== undefined && state?.inputsFenced === true,
     piInputsFenced: state?.inputsFenced ?? null,
     inputAdmissionCount: state?.inputAdmissionCount ?? null,
     queued: state?.queued ?? null,
@@ -95,34 +92,36 @@ export const observeNativeInput = (pi: ExtensionAPI, ctx: ExtensionContext | und
     idle: ctx ? flag(() => ctx.isIdle()) : null,
     promptPending: ctx ? flag(() => (ctx as { isPromptPending?: () => boolean }).isPromptPending?.()) : null,
     pendingMessages: ctx ? flag(() => ctx.hasPendingMessages()) : null,
-    fenceError: api ? lastErrors.get(rootId) ?? null : "FENCE_API_UNAVAILABLE",
+    fenceError: api ? peekDrainSlot(rootId)?.fenceError ?? null : "FENCE_API_UNAVAILABLE",
   };
 };
 
 /** Acquire the root's native fence once. Never passes rejectQueuedInput: a BUSY refusal keeps every queued input. */
 export const fenceNativeInput = async (pi: ExtensionAPI, ctx: ExtensionContext | undefined, rootId: string): Promise<boolean> => {
-  if (!fenceApi(pi, ctx)) { lastErrors.set(rootId, "FENCE_API_UNAVAILABLE"); return false; }
-  if (fences().has(rootId)) return inputState(ctx)?.inputsFenced === true;
+  if (!fenceApi(pi, ctx)) return false;
+  const slot = drainSlot(rootId);
+  if (slot.fence) return inputState(ctx)?.inputsFenced === true;
   try {
     const fence = await ctx.fenceInputs!();
-    if (typeof fence?.release !== "function") { lastErrors.set(rootId, "FENCE_HANDLE_INVALID"); return false; }
-    fences().set(rootId, fence);
-    lastErrors.delete(rootId);
+    if (typeof fence?.release !== "function") { slot.fenceError = "FENCE_HANDLE_INVALID"; return false; }
+    slot.fence = fence;
+    delete slot.fenceError;
     return inputState(ctx)?.inputsFenced === true;
   } catch (error) {
-    lastErrors.set(rootId, errorCode(error));
+    slot.fenceError = errorCode(error);
     return false;
   }
 };
 
-/** Release only the fence this process acquired for the root. Idempotent. */
+/** Release only the fence this process acquired for the root, through its original handle. Idempotent. */
 export const releaseNativeInput = (rootId: string): boolean => {
-  const fence = fences().get(rootId);
-  fences().delete(rootId);
-  lastErrors.delete(rootId);
+  const slot = peekDrainSlot(rootId);
+  const fence = slot?.fence;
+  if (slot) { delete slot.fence; delete slot.fenceError; }
+  pruneDrainSlot(rootId);
   if (!fence) return false;
   fence.release();
   return true;
 };
 
-export const nativeFenceHeld = (rootId: string): boolean => fences().has(rootId);
+export const nativeFenceHeld = (rootId: string): boolean => peekDrainSlot(rootId)?.fence !== undefined;

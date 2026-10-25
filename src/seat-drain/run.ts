@@ -1,4 +1,5 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import type net from "node:net";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -62,17 +63,24 @@ export const verifyRunDir = (runDir: string, uid: number): void => {
 
 export interface SeamRequest {
   schema: "d3-seam-request-v1"; run: string; runSha256: string; phase: string; principal: string; sessionId: string;
+  /** DRAIN-PHASE-CONTRACT rev 4: `inputs.operationId`, ONE per run, minted and journaled by A, shared by every drain phase. */
+  operationId: string;
   inputs: Record<string, unknown>;
 }
-/** Closed request keys (SEAT.md §3), and the phase from argv. */
+/**
+ * A's shared request schema (SEAT.md §3, closed keys), the phase from argv, and the contract's
+ * `inputs.operationId` (32 lowercase hex). A missing or malformed operationId is a binding failure.
+ */
 export const parseRequest = (bytes: Buffer, phase: string): SeamRequest => {
   const value = parse(bytes, "request-invalid");
+  const inputs = object(value.inputs) ? value.inputs : undefined;
+  if (typeof inputs?.operationId !== "string" || !HEX32.test(inputs.operationId)) gap("operation-id-invalid");
   if (Object.keys(value).sort().join(",") !== "inputs,phase,principal,run,runSha256,schema,sessionId" ||
     value.schema !== "d3-seam-request-v1" || value.phase !== phase || typeof value.run !== "string" || !HEX32.test(value.run) ||
     typeof value.runSha256 !== "string" || !HEX64.test(value.runSha256) || typeof value.sessionId !== "string" ||
     !UUID.test(value.sessionId) || typeof value.principal !== "string" || !/^[a-z0-9]{1,32}$/.test(value.principal) ||
     !object(value.inputs)) gap("request-invalid");
-  return value as unknown as SeamRequest;
+  return { ...(value as unknown as SeamRequest), operationId: inputs!.operationId as string };
 };
 
 export interface SealedRun {
@@ -163,6 +171,28 @@ export const proveSeatLock = (runDir: string, fdText: string | undefined, uid: n
   if (result.status !== 0 || result.stdout !== "blocked held") gap("lock-not-held");
   return fd;
 };
+
+// As records/peer.ts: getsockopt through ctypes on fd 3, which leaves the shared descriptor non-blocking.
+const PEERCRED = "import ctypes, struct, sys; l = ctypes.CDLL(None, use_errno=True); b = ctypes.create_string_buffer(12); " +
+  "n = ctypes.c_uint32(12); r = l.getsockopt(3, 1, 17, b, ctypes.byref(n)); " +
+  "sys.stdout.write('%d %d %d' % struct.unpack('3i', b.raw)) if r == 0 else sys.exit(1)";
+
+/** The connected peer's {pid, uid} from SO_PEERCRED, via the fixed python helper (Node exposes none). */
+export const socketPeer = (socket: net.Socket, python = PYTHON): Promise<{ pid: number; uid: number } | undefined> =>
+  new Promise(resolve => {
+    const fd = (socket as unknown as { _handle?: { fd?: unknown } })._handle?.fd;
+    if (typeof fd !== "number" || fd < 0) { resolve(undefined); return; }
+    let out = "";
+    const child = spawn(python, ["-I", "-B", "-c", PEERCRED], { stdio: ["ignore", "pipe", "ignore", fd],
+      env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" }, timeout: 5_000 });
+    child.stdout!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => { out += chunk; });
+    child.on("error", () => resolve(undefined));
+    child.on("close", code => {
+      const [pid, uid] = out.split(" ").map(Number);
+      resolve(code === 0 && Number.isSafeInteger(pid) && pid! > 0 && Number.isSafeInteger(uid) ? { pid: pid!, uid: uid! } : undefined);
+    });
+  });
 
 /**
  * The mesh root the seat's Main uses, from the sealed packet and the seat's Fabric config only

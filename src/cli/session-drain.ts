@@ -8,7 +8,7 @@ import { inventorySessionPending } from "./session-pending.js";
 const USAGE = `Usage:
   pi-fabric session drain <session-uuid | session:uuid> --mesh <meshRoot> --status | --probe
   pi-fabric session drain <session-uuid | session:uuid> --mesh <meshRoot> --exit --pod-uid <uid>
-      --run <32 hex> --run-sha256 <64 hex> --operation-id <32 hex> [--deadline-s <1-600>]
+      --run <32 hex> --run-sha256 <64 hex> --operation-id <32 hex> --generation <32 hex> [--deadline-s <1-600>]
 
 Owner-only D3 seat drain of THIS host's live Main (smarty-dev#15310), through its local socket
 <meshRoot>/main-drain/ (mode 0700, the Main's own OS user). It is never reachable from the mesh.
@@ -32,7 +32,7 @@ interface CliIo {
   uid?: number;
 }
 
-const VALUE_FLAGS = new Set(["--mesh", "--pod-uid", "--run", "--run-sha256", "--operation-id", "--deadline-s"]);
+const VALUE_FLAGS = new Set(["--mesh", "--pod-uid", "--run", "--run-sha256", "--operation-id", "--generation", "--deadline-s"]);
 const MODE_FLAGS = new Set(["--status", "--probe", "--exit", "--help"]);
 
 export const runSessionDrainCli = async (
@@ -59,7 +59,7 @@ export const runSessionDrainCli = async (
     if (!mesh || !path.isAbsolute(mesh)) throw new UsageError("--mesh is required and must be absolute; there is no environment default");
     if (modes.size !== 1) throw new UsageError("Choose exactly one of --status, --probe, --exit");
     const mode = [...modes][0]!;
-    const exitValues = ["--pod-uid", "--run", "--run-sha256", "--operation-id"];
+    const exitValues = ["--pod-uid", "--run", "--run-sha256", "--operation-id", "--generation"];
     if (mode !== "--exit" && (exitValues.some(flag => values.has(flag)) || values.has("--deadline-s"))) throw new UsageError("Binding options belong to --exit");
     const uid = io.uid ?? process.geteuid?.();
     if (uid === undefined) throw new MainDrainClientError("MAIN_DRAIN_UNSUPPORTED_PLATFORM");
@@ -76,13 +76,14 @@ export const runSessionDrainCli = async (
     const run = values.get("--run") ?? "";
     const runSha256 = values.get("--run-sha256") ?? "";
     const operationId = values.get("--operation-id") ?? "";
-    if (!UUID.test(podUid) || !HEX32.test(run) || !HEX64.test(runSha256) || !HEX32.test(operationId)) {
-      throw new UsageError("--exit needs --pod-uid <uid> --run <32 hex> --run-sha256 <64 hex> --operation-id <32 hex>");
+    const generation = values.get("--generation") ?? "";
+    if (!UUID.test(podUid) || !HEX32.test(run) || !HEX64.test(runSha256) || !HEX32.test(operationId) || !HEX32.test(generation)) {
+      throw new UsageError("--exit needs --pod-uid <uid> --run <32 hex> --run-sha256 <64 hex> --operation-id <32 hex> --generation <32 hex>");
     }
     const deadlineText = values.get("--deadline-s") ?? String(DEFAULT_DEADLINE_S);
     const deadlineS = Number(deadlineText);
     if (!/^[0-9]{1,3}$/.test(deadlineText) || deadlineS < 1 || deadlineS > 600) throw new UsageError("--deadline-s must be 1-600");
-    const binding: MainDrainBindingRequest = { runDir: null, run, runSha256, phase: "resume-drain", operationId, lockFd: null, podUid };
+    const binding: MainDrainBindingRequest = { runDir: null, run, runSha256, phase: "resume-drain", operationId, generation, lockFd: null, podUid };
     const now = io.now ?? Date.now;
     const sleep = io.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
     const deadline = now() + deadlineS * 1000;

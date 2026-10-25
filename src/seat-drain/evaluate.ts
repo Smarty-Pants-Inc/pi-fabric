@@ -27,7 +27,7 @@ export interface DrainEvaluation {
   /** A halted Main never flushes held follow-ups: stop waiting. */
   haltedWithHeld: boolean;
   parts: {
-    measured: { fabricHeld: number; fabricHanded: number; unfinishedRoutes: number; inventoryComplete: boolean;
+    measured: { fabricHeld: number; fabricHanded: number; heldUnion: number; handedUnion: number; unfinishedRoutes: number; inventoryComplete: boolean;
       completions: CompletionScan; workers: Array<{ id: string; pid: number; exited: boolean | null }> };
     asserted: { fabricHeld: number; fabricHanded: number; nativeQueued: number; nativeAdmitted: number; nativeRunActive: boolean;
       nativeBusy: boolean; fenceApi: boolean; probesRefused: boolean; inboxClosed: boolean; bound: boolean };
@@ -134,16 +134,27 @@ export const evaluateDrain = (input: {
   const native = reply?.native;
   const memHeld = known(reply?.inbox.held);
   const memHanded = known(reply?.inbox.handed);
+  // DRAIN-DESIGN.r1 §1.6: the journal (measured) and the Main's own lists (asserted), de-duplicated by id.
+  const fileIds = complete ? inventory.followUps.ids ?? [] : undefined;
+  const fileHandedIds = complete ? inventory.followUps.handedIds : undefined;
+  const union = (a: string[] | undefined, b: string[] | null | undefined, fallback: number): number =>
+    a !== undefined && Array.isArray(b) ? new Set([...a, ...b]).size : fallback;
+  const heldUnion = union(fileIds?.filter(id => !fileHandedIds?.includes(id)), reply?.inbox.heldIds, Math.max(fileHeld, memHeld));
+  const handedUnion = union(fileHandedIds, reply?.inbox.handedIds, Math.max(fileHanded, memHanded));
   const nativeQueued = !native ? 1 : native.fenceApi ? known(native.queued) : native.pendingMessages === false ? 0 : 1;
   const nativeAdmitted = !native ? 1 : native.fenceApi ? known(native.inputAdmissionCount)
     : native.promptPending === false && native.pendingMessages === false ? 0 : 1;
   const nativeRunActive = native?.idle !== true;
   const nativeBusy = native?.fenceApi === true && native.drained !== true;
+  // Every probed row (all but code-lead's route hold, which A observes) must refuse.
   const probesRefused = reply !== undefined && reply.probes.length === MAIN_DRAIN_INGRESS.length &&
-    MAIN_DRAIN_INGRESS.every(row => reply.probes.some(probe => probe.path === row.path && probe.mechanism === row.mechanism && probe.admits === false));
+    MAIN_DRAIN_INGRESS.filter(row => row.mechanism !== "hold")
+      .every(row => reply.probes.some(probe => probe.path === row.path && probe.mechanism === row.mechanism && probe.admits === false));
   const inputsFenced = native?.fenceApi === true && native.inputsFenced === true && probesRefused && reply!.inbox.closed && reply!.binding !== null;
-  const queued = Math.max(fileHeld, memHeld) + nativeQueued + (complete ? 0 : 1);
-  const admitted = Math.max(fileHanded, memHanded) + routes + nativeAdmitted + (nativeRunActive ? 1 : 0) + (nativeBusy ? 1 : 0);
+  // queued: held journal items + unfinished reroutes + Pi's queue; admitted: handed items + Pi's admissions,
+  // plus 1 for a live turn and 1 when Pi's own drained check fails.
+  const queued = heldUnion + routes + nativeQueued + (complete ? 0 : 1);
+  const admitted = handedUnion + nativeAdmitted + (nativeRunActive ? 1 : 0) + (nativeBusy ? 1 : 0);
 
   if (!reply) reasons.push("main-unreachable");
   else {
@@ -186,6 +197,16 @@ export const evaluateDrain = (input: {
   }
   if (!reply?.agents.known) children.push("agents-unknown");
   for (const agent of reply?.agents.running ?? []) children.push(`agent-running:${agent.id}`);
+  // A terminal run's local worker must be gone too (pid + start time from the launch record).
+  for (const run of reply?.agents.workers ?? []) {
+    if (run.startTime === null) { children.push(`agent-worker-unverified:${run.id}`); continue; }
+    const now = procStartTime(run.pid, input.procRoot);
+    const exited = now === undefined ? (fs.existsSync(path.join(input.procRoot ?? "/proc", String(run.pid))) ? null : true) : now !== run.startTime;
+    workers.push({ id: run.id, pid: run.pid, exited });
+    if (exited !== true) children.push(`agent-worker-alive:${run.id}`);
+  }
+  const inboxPending = reply?.completions.inboxPending;
+  if (inboxPending !== 0) children.push(`completion-inbox:${inboxPending ?? "unknown"}`);
   if (completions.pending) children.push(`completion-pending:${completions.pending}`);
   if (completions.attempts) children.push(`agent-attempt:${completions.attempts}`);
   if (completions.unknown) children.push(`completion-unknown:${completions.unknown}`);
@@ -199,9 +220,10 @@ export const evaluateDrain = (input: {
   return {
     drained: reasons.length === 0,
     observed, reasons,
-    haltedWithHeld: halted && Math.max(fileHeld, memHeld) > 0,
+    haltedWithHeld: halted && heldUnion > 0,
     parts: {
-      measured: { fabricHeld: fileHeld, fabricHanded: fileHanded, unfinishedRoutes: routes, inventoryComplete: complete, completions, workers },
+      measured: { fabricHeld: fileHeld, fabricHanded: fileHanded, heldUnion, handedUnion, unfinishedRoutes: routes, inventoryComplete: complete,
+        completions, workers },
       asserted: { fabricHeld: memHeld, fabricHanded: memHanded, nativeQueued, nativeAdmitted, nativeRunActive, nativeBusy,
         fenceApi: native?.fenceApi === true, probesRefused, inboxClosed: reply?.inbox.closed === true, bound: reply?.binding != null },
     },

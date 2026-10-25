@@ -2,12 +2,12 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import type { MainDrainBindingRequest } from "./binding.js";
-import { MAIN_DRAIN_DIRECTORY, MAIN_DRAIN_MAX_REPLY_BYTES, MAIN_DRAIN_MAX_SOCKET_PATH, mainDrainSocketName,
-  type MainDrainOp, type MainDrainReply } from "./protocol.js";
+import { MAIN_DRAIN_DIRECTORY, MAIN_DRAIN_MAX_REPLY_BYTES, mainDrainSocketName, type MainDrainOp, type MainDrainReply } from "./protocol.js";
 
 /** A fixed-code client failure: never a payload, a path or an OS message. */
 export class MainDrainClientError extends Error {
-  constructor(readonly code: string) { super(code); this.name = "MainDrainClientError"; }
+  /** written: the request reached the socket, so the Main may have acted on it. */
+  constructor(readonly code: string, readonly written = false) { super(code); this.name = "MainDrainClientError"; }
 }
 
 /**
@@ -33,29 +33,51 @@ export const mainDrainSocket = (meshRoot: string, sessionId: string, uid: number
     throw new MainDrainClientError("MAIN_DRAIN_UNREACHABLE");
   }
   const socket = path.join(directory, mainDrainSocketName(sessionId));
-  if (Buffer.byteLength(socket) > MAIN_DRAIN_MAX_SOCKET_PATH) throw new MainDrainClientError("MAIN_DRAIN_SOCKET_PATH_TOO_LONG");
   let entry: fs.Stats;
   try { entry = fs.lstatSync(socket); } catch { throw new MainDrainClientError("MAIN_DRAIN_UNREACHABLE"); }
   if (!entry.isSocket() || entry.uid !== uid) throw new MainDrainClientError("MAIN_DRAIN_SOCKET_UNSAFE");
   return socket;
 };
 
-/** One request, one reply line. A refusal rejects with MAIN_DRAIN_REFUSED_<code>. */
+/**
+ * One request, one reply line. A refusal rejects with MAIN_DRAIN_REFUSED_<code>. `verifyServer`, when
+ * given, checks the connected server's kernel identity BEFORE the request is written; a code refuses.
+ */
 export const callMainDrain = (socket: string, sessionId: string, op: MainDrainOp, binding: MainDrainBindingRequest | null,
-  timeoutMs = 30_000): Promise<MainDrainReply> =>
+  timeoutMs = 30_000, verifyServer?: (client: net.Socket) => Promise<string | undefined>): Promise<MainDrainReply> =>
   new Promise((resolve, reject) => {
-    const client = net.connect(socket);
+    // Connect through a held descriptor of the (re-checked) directory: no sun_path length limit, no swap.
+    const directory = path.dirname(socket);
+    let fd: number;
+    try {
+      fd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    } catch { reject(new MainDrainClientError("MAIN_DRAIN_UNREACHABLE")); return; }
+    try {
+      const held = fs.fstatSync(fd);
+      const named = fs.lstatSync(directory);
+      if (held.dev !== named.dev || held.ino !== named.ino || held.uid !== process.geteuid?.() || (held.mode & 0o7777) !== 0o700) {
+        throw new Error("unsafe");
+      }
+    } catch { fs.closeSync(fd); reject(new MainDrainClientError("MAIN_DRAIN_DIRECTORY_UNSAFE")); return; }
+    const client = net.connect(`/proc/self/fd/${fd}/${path.basename(socket)}`);
     let buffer = Buffer.alloc(0);
     let done = false;
-    const finish = (error?: Error, reply?: MainDrainReply): void => {
+    let written = false;
+    const finish = (error?: MainDrainClientError, reply?: MainDrainReply): void => {
       if (done) return;
       done = true;
       client.destroy();
-      if (error) reject(error); else resolve(reply!);
+      try { fs.closeSync(fd); } catch { /* closed */ }
+      if (error) reject(written && !error.written ? new MainDrainClientError(error.code, true) : error); else resolve(reply!);
     };
     client.setTimeout(timeoutMs, () => finish(new MainDrainClientError("MAIN_DRAIN_TIMEOUT")));
     client.once("error", () => finish(new MainDrainClientError("MAIN_DRAIN_UNREACHABLE")));
-    client.once("connect", () => client.write(`${JSON.stringify({ v: 1, op, sessionId, binding })}\n`));
+    client.once("connect", () => {
+      const write = (): void => { if (!done) { written = true; client.write(`${JSON.stringify({ v: 1, op, sessionId, binding })}\n`); } };
+      if (!verifyServer) { write(); return; }
+      verifyServer(client).then(refusal => refusal ? finish(new MainDrainClientError(refusal)) : write(),
+        () => finish(new MainDrainClientError("MAIN_DRAIN_SERVER_UNVERIFIED")));
+    });
     client.on("data", (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk]);
       if (buffer.length > MAIN_DRAIN_MAX_REPLY_BYTES) { finish(new MainDrainClientError("MAIN_DRAIN_REPLY_TOO_LARGE")); return; }

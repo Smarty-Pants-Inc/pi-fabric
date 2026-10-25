@@ -3,6 +3,7 @@ import { bindOrMatch, clearBinding, currentBinding, podBindingAllowed, proveHost
   type MainDrainBindingRequest } from "./binding.js";
 import { assertMainInboxOpen, closeMainInbox, mainInboxDrainGate, reopenMainInbox } from "./gate.js";
 import { fenceNativeInput, nativeFenceHeld, observeNativeInput, releaseNativeInput, type NativeInputObservation } from "./native-port.js";
+import { drainSlot, peekDrainSlot } from "./slot.js";
 import type { MainDrainActorRow, MainDrainIngressProbe, MainDrainOp, MainDrainReply } from "./protocol.js";
 
 /** What the drain control needs from the live Main runtime. Getters: a reload replaces each one. */
@@ -12,12 +13,19 @@ export interface MainDrainHost {
   meshRoot: string;
   pi: ExtensionAPI;
   context(): ExtensionContext | undefined;
-  main(): { drainSnapshot(): { held: number; handed: number; journalOpen: boolean; halted: boolean; reloading: boolean } } | undefined;
+  main(): MainDrainMain | undefined;
   actors(): MainDrainActors | undefined;
-  agents(): { list(): ReadonlyArray<{ id: string; status: string }> } | undefined;
+  agents(): MainDrainAgents | undefined;
+  /** The in-memory completion inbox's unconfirmed count (no residency); undefined when there is no inbox. */
+  completions?(): number | undefined;
   /** Tests only: the Main's own environment and /proc. */
   environment?: NodeJS.ProcessEnv;
   procRoot?: string;
+}
+export interface MainDrainMain {
+  drainSnapshot(): { held: number; handed: number; heldIds: string[]; handedIds: string[]; journalOpen: boolean; halted: boolean; reloading: boolean };
+  /** deliverAgent's own admission gates, dry run. */
+  probeAdmission(): boolean;
 }
 export interface MainDrainActors {
   listOwned(): ReadonlyArray<{ id: string; name: string; status: string; rootId?: string; residency?: string }>;
@@ -25,61 +33,81 @@ export interface MainDrainActors {
   drainWorker(id: string): { runId: string; pid: number; startTime: string | undefined } | null | undefined;
   stop(id: string, beforeCommit: undefined, wait: boolean, path: "actors.stop", options: { explicit: true }): Promise<unknown>;
 }
-/** The caller as the kernel reports it (SO_PEERCRED) and its /proc start time; undefined: not verifiable. */
+export interface MainDrainAgents {
+  list(): ReadonlyArray<{ id: string; status: string }>;
+  workerIdentity?(runId: string): { pid: number; startTime: string | undefined } | undefined;
+}
+/** The caller as the kernel reports it (SO_PEERCRED); undefined: not verifiable. */
 export interface MainDrainPeer { pid: number; uid: number }
 
 const TERMINAL_AGENT = new Set(["completed", "failed", "stopped", "timed_out"]);
 const STOP_WAIT_MS = 10_000;
-const code = (error: unknown, fallback: string): string => {
-  const value = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
-  return typeof value === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(value) ? value : fallback;
-};
 const residency = (value: unknown): MainDrainActorRow["residency"] =>
   value === undefined || value === "session" ? "session" : value === "durable" ? "durable" : "unknown";
 
 /**
- * The ingress table (challenge r1 M7). Each row's probe calls the SAME gate function that live
- * admission calls, so a dry run and a live attempt cannot disagree. Fabric-gate rows run
- * `assertMainInboxOpen` (main-agent.ts deliverAgent / deliverUser / receiveInboxItem,
- * agents/manager.ts spawn, actors/manager.ts create). Native-fence rows read Pi's own fence state:
- * user typing, Herdr feed prompts and the user input that lifts an actor halt all enter Pi's native
- * admission, which refuses once it is fenced.
+ * The ingress table (DRAIN-DESIGN.r1 §1.9, its 14 rows plus three). Each row's probe calls the
+ * SAME gate function as live admission, so a dry run and a live attempt cannot disagree:
+ * - fabric-gate: MainAgentController.probeAdmission(), which runs deliverAgent's own gates
+ *   (#admissionGates), or for spawn/create/composer the assertMainInboxOpen they call;
+ * - native-fence: Pi's own fence state (getInputState().inputsFenced, the field _assertInputsOpen checks);
+ * - both: the gate AND the fence; hold: code-lead's route hold, observed by A, never probed here.
+ * `refusal` says what the producer sees: visible (a typed FABRIC_MAIN_DRAINING or Pi refusal), retried
+ * (the record stays and is delivered later), dropped, or unknown. "Visible refusal", not "exactly once",
+ * for every producer that does not retry.
  */
-export const MAIN_DRAIN_INGRESS: ReadonlyArray<{ path: string; mechanism: MainDrainIngressProbe["mechanism"] }> = [
-  { path: "fabric-inbox.deliverAgent", mechanism: "fabric-gate" },         // peer Mains, factory events, control plane, bridge
-  { path: "fabric-inbox.peer-steer-wake", mechanism: "fabric-gate" },      // gate precedes the halted-Main wake
-  { path: "fabric-inbox.resident-delivery", mechanism: "fabric-gate" },    // residency client deliveries (record kept on refusal)
-  { path: "fabric-inbox.agent-completion-journal", mechanism: "fabric-gate" },
-  { path: "fabric-inbox.rotation-carrier", mechanism: "fabric-gate" },     // receiveInboxItem
-  { path: "fabric-inbox.legacy-steer-relay", mechanism: "fabric-gate" },   // best-effort legacy fabric.steer (sender is not told)
-  { path: "dashboard.deliverUser", mechanism: "fabric-gate" },
-  { path: "agents.spawn", mechanism: "fabric-gate" },
-  { path: "actors.create", mechanism: "fabric-gate" },
-  { path: "native.user-input", mechanism: "native-fence" },                // TUI/RPC input, incl. the input that lifts an actor halt
-  { path: "native.herdr-feed-prompt", mechanism: "native-fence" },         // org feed: herdr agent prompt into the pane
-  { path: "native.agent-completion-inbox", mechanism: "native-fence" },    // completion-inbox pi.sendMessage
-  { path: "native.follow-up-alarm", mechanism: "native-fence" },           // pi.sendMessage steer alarm
-  { path: "native.actor-output", mechanism: "native-fence" },              // deliverActorToMain pi.sendMessage
+export const MAIN_DRAIN_INGRESS: ReadonlyArray<{ path: string; row: string; mechanism: MainDrainIngressProbe["mechanism"];
+  refusal: "visible" | "retried" | "dropped" | "unknown" | "uncovered-precondition" }> = [
+  { path: "control.followUp-steer", row: "1", mechanism: "fabric-gate", refusal: "visible" },
+  { path: "in-process.producer", row: "2", mechanism: "fabric-gate", refusal: "visible" },
+  { path: "resident-host.delivery", row: "3", mechanism: "fabric-gate", refusal: "retried" },
+  { path: "completion.journal", row: "4a", mechanism: "fabric-gate", refusal: "retried" },
+  { path: "completion.inbox", row: "4b", mechanism: "native-fence", refusal: "retried" },
+  { path: "follow-up-alarm", row: "5", mechanism: "native-fence", refusal: "dropped" },
+  { path: "dashboard.composer", row: "6", mechanism: "both", refusal: "visible" },
+  { path: "tui.keyboard", row: "7", mechanism: "native-fence", refusal: "unknown" },
+  { path: "feed.herdr-prompt", row: "8", mechanism: "native-fence", refusal: "uncovered-precondition" },
+  { path: "peer-steer-wake", row: "9", mechanism: "fabric-gate", refusal: "visible" },
+  { path: "actor-halt-lift", row: "10", mechanism: "native-fence", refusal: "unknown" },
+  { path: "legacy-fabric-steer", row: "11", mechanism: "fabric-gate", refusal: "dropped" },
+  { path: "extension.sendMessage", row: "12", mechanism: "native-fence", refusal: "unknown" },
+  { path: "session-replacement-reload", row: "13", mechanism: "both", refusal: "visible" },
+  { path: "code-route", row: "14", mechanism: "hold", refusal: "retried" },
+  { path: "rotation-carrier", row: "1b", mechanism: "fabric-gate", refusal: "retried" },
+  { path: "agents.spawn", row: "s1", mechanism: "fabric-gate", refusal: "visible" },
+  { path: "actors.create", row: "s2", mechanism: "fabric-gate", refusal: "visible" },
 ];
 
-export const probeIngress = (rootId: string, native: NativeInputObservation): MainDrainIngressProbe[] =>
-  MAIN_DRAIN_INGRESS.map(({ path, mechanism }) => {
-    // Pi's own fence state, whoever holds it: a fence this process lost still refuses input.
-    if (mechanism === "native-fence") return { path, mechanism, admits: native.fenceApi && native.piInputsFenced !== null ? !native.piInputsFenced : null };
-    try { assertMainInboxOpen(rootId); return { path, mechanism, admits: true }; } catch { return { path, mechanism, admits: false }; }
+/** Dry-run verdicts. Fabric-gate paths through `mainAdmits` (deliverAgent's gates) or the gate function itself. */
+export const probeIngress = (rootId: string, native: NativeInputObservation, mainAdmits: boolean | null): MainDrainIngressProbe[] => {
+  const gateOpen = (): boolean => { try { assertMainInboxOpen(rootId); return true; } catch { return false; } };
+  const nativeOpen = native.fenceApi && native.piInputsFenced !== null ? !native.piInputsFenced : null;
+  return MAIN_DRAIN_INGRESS.map(({ path, mechanism }) => {
+    if (mechanism === "hold") return { path, mechanism, admits: null };
+    if (mechanism === "native-fence") return { path, mechanism, admits: nativeOpen };
+    const fabric = path === "agents.spawn" || path === "actors.create" || path === "dashboard.composer" ? gateOpen() : mainAdmits;
+    if (mechanism === "fabric-gate") return { path, mechanism, admits: fabric };
+    // both: admitted only through BOTH gates; a refusal by either is a refusal.
+    return { path, mechanism, admits: fabric === false || nativeOpen === false ? false : fabric === true && nativeOpen === true ? true : null };
   });
+};
 
 /**
- * D3 seat drain (smarty-dev#15310, challenge r1): the owner's drain of THIS Main, for the local
- * owner-only channel (server.ts) only. It never deletes or acknowledges a message.
- * - drain (bound): close the Fabric gates (inbox, dashboard, spawn, create). Once Fabric holds nothing
- *   for Pi, take the native fence. Once fenced with no running agent run, owner-stop each session actor
- *   that is QUIESCED (B3), waiting for its run to end. Idempotent for the same binding.
- * - undo (same binding, B1): release this process's fence, reopen the gates, clear the binding; the
- *   reply's probes are the canary. After a reload the old fence handle cannot reopen: restartRequired.
- * - exit (pod binding, M9): when fully drained, accept a clean Main exit.
- * - status, probe: observe only.
- * Durable actors are reported, never stopped.
+ * D3 seat drain (smarty-dev#15310, DRAIN-DESIGN.r1): the owner's drain of THIS Main, for the
+ * local owner-only channel (server.ts) only. It never deletes or acknowledges a message.
+ * - drain (bound; = begin + fence-native, idempotent per (operationId, generation)): close the Fabric
+ *   gate (also spawn/create/composer), which still admits the drain's OWN children until the fence
+ *   (r2 N1). Once Fabric holds nothing for Pi, no agent run is live, no completion is unconfirmed and Pi
+ *   is drained and idle, take the native fence. If Fabric still holds items once fenced, release ONLY
+ *   the native fence (§1.11 4d).
+ * - stop-actors (bound; r2 N2): the LAST act. With the fence held and all else 0, and only if EVERY
+ *   session actor is quiesced, owner-stop them all (wait=true; B3), recording each one's public spec.
+ * - undo (same run, operationId AND generation, r2 N6 ii; = release): release the fence through the
+ *   kept handle, reopen the gate, clear the record. The reply's probes are the canary. Only a LOST
+ *   handle means restart required. Actors this operation stopped are not recreated here (stage 1): the
+ *   undo reports actorsRestored:false, which the seam folds into admissionRestored.
+ * - exit (pod binding, §1.13): when fully drained, accept a clean Main exit.
+ * - status, probe: observe only. Durable actors are reported, never stopped.
  */
 export class MainDrainControl {
   #exitAccepted = false;
@@ -88,8 +116,7 @@ export class MainDrainControl {
   /** Authorize, then run one op. Returns a refusal code instead of throwing. */
   async handle(op: MainDrainOp, request: MainDrainBindingRequest | null, peer: MainDrainPeer | undefined, uid: number): Promise<MainDrainReply | string> {
     const { rootId } = this.host;
-    let binding: MainDrainBinding | undefined;
-    if (op === "drain" || op === "undo" || op === "exit") {
+    if (op === "drain" || op === "stop-actors" || op === "undo" || op === "exit") {
       if (!request) return "BINDING_REQUIRED";
       const kind = request.podUid === null ? "host" : "pod";
       if (kind === "pod" && !podBindingAllowed(this.host.environment)) return "POD_BINDING_OUTSIDE_POD";
@@ -99,22 +126,25 @@ export class MainDrainControl {
         if (proof.refusal) return proof.refusal;
       }
       if (op === "drain") {
+        const fresh = currentBinding(rootId) === undefined;
         const bound = bindOrMatch(rootId, request, kind);
         if (typeof bound === "string") return bound;
-        binding = bound;
+        if (fresh) this.#begin();
       } else {
-        const existing = currentBinding(rootId);
-        if (existing && (existing.run !== request.run || existing.operationId !== request.operationId || existing.kind !== kind)) {
-          return "DRAIN_BOUND_ELSEWHERE";
-        }
-        binding = existing;
-        if (op === "exit" && !binding) return "EXIT_WITHOUT_DRAIN";
+        // Only the SAME (run, operationId, generation) may act on a standing record: another operation's fence is UNKNOWN.
+        const existing: MainDrainBinding | undefined = currentBinding(rootId);
+        if (existing && (existing.run !== request.run || existing.operationId !== request.operationId ||
+          existing.generation !== request.generation || existing.kind !== kind)) return "DRAIN_BOUND_ELSEWHERE";
+        if (op !== "undo" && !existing) return "NOT_BOUND";
       }
     }
     let undo: MainDrainReply["undo"] = null;
+    let stopRefused: string | null = null;
     if (op === "drain") await this.#drain();
+    if (op === "stop-actors") stopRefused = await this.#stopActors();
     if (op === "undo") undo = this.#undo();
     const reply = this.#reply(op, undo);
+    reply.stopRefused = stopRefused;
     if (op === "exit") {
       reply.exitRefused = this.#exitRefusals(reply);
       reply.exiting = reply.exitRefused.length === 0;
@@ -131,23 +161,70 @@ export class MainDrainControl {
     setTimeout(() => { try { ctx?.shutdown(); } catch { /* the context retired: the process is going anyway */ } }, 100);
   }
 
+  /** The first bind: record the drain's own children (r2 N1) and start a fresh ledger (N8). */
+  #begin(): void {
+    const slot = drainSlot(this.host.rootId);
+    slot.children = { runIds: new Set((this.#agentRuns() ?? []).map(run => run.id)), actorIds: new Set(this.#liveSessionActorIds()) };
+    slot.admitted = [];
+    slot.ledger = [];
+  }
+
+  #liveSessionActorIds(): string[] {
+    return (this.#owned() ?? []).filter(actor => actor.residency === "session" && actor.status !== "stopped").map(actor => actor.id);
+  }
+
+  /** Fence held, Fabric empty, no live run, no unconfirmed completion, Pi drained and idle. */
+  #allElseDrained(): boolean {
+    const fabric = this.#mainSnapshot();
+    const runs = this.#agentRuns();
+    const native = observeNativeInput(this.host.pi, this.host.context(), this.host.rootId);
+    let completions: number | undefined;
+    try { completions = this.host.completions ? this.host.completions() ?? 0 : undefined; } catch { completions = undefined; }
+    return fabric !== undefined && fabric.held === 0 && fabric.handed === 0 && runs !== undefined &&
+      runs.every(run => TERMINAL_AGENT.has(run.status)) && completions === 0 &&
+      native.fenceApi && native.drained === true && native.idle === true;
+  }
+
+  async #stopActors(): Promise<string | null> {
+    const { rootId } = this.host;
+    const native = observeNativeInput(this.host.pi, this.host.context(), rootId);
+    if (!native.inputsFenced) return "NOT_FENCED";
+    if (!this.#allElseDrained()) return "NOT_DRAINED";
+    const actors = this.host.actors();
+    const owned = this.#owned();
+    if (!actors || !owned) return "ACTORS_UNKNOWN";
+    const live = owned.filter(actor => actor.residency === "session" && actor.status !== "stopped");
+    if (owned.some(actor => actor.residency !== "session" && actor.residency !== "durable")) return "ACTORS_UNKNOWN";
+    // All or none: one actor that is not quiesced stops nothing (r2 N2, N9).
+    if (live.some(actor => actor.quiescence === null || actor.quiescence.length > 0)) return "ACTORS_NOT_QUIESCED";
+    const slot = drainSlot(rootId);
+    const specs = new Map(actors.listOwned().map(actor => [actor.id, actor as unknown as Record<string, unknown>]));
+    for (const actor of live) {
+      // Re-check the predicate at the moment of the stop: a quiesced actor has nothing to drop.
+      let reasons: string[];
+      try { reasons = actors.drainQuiescence(actor.id); } catch { return "ACTORS_UNKNOWN"; }
+      if (reasons.length) return "ACTORS_NOT_QUIESCED";
+      (slot.stopped ??= []).push({ id: actor.id, spec: structuredClone(specs.get(actor.id) ?? { id: actor.id }), stoppedAt: Date.now() });
+      slot.children?.actorIds.delete(actor.id);
+      const stop = actors.stop(actor.id, undefined, true, "actors.stop", { explicit: true });
+      await Promise.race([stop.catch(() => undefined), new Promise(resolve => setTimeout(resolve, STOP_WAIT_MS))]);
+    }
+    return null;
+  }
+
   async #drain(): Promise<void> {
     const { rootId } = this.host;
     closeMainInbox(rootId);
+    const slot = drainSlot(rootId);
+    if (slot.children) slot.children.actorIds = new Set(this.#liveSessionActorIds());
     const fabric = this.#mainSnapshot();
-    if (fabric && fabric.held === 0 && fabric.handed === 0 && !nativeFenceHeld(rootId)) {
-      await fenceNativeInput(this.host.pi, this.host.context(), rootId);
+    const fabricEmpty = fabric !== undefined && fabric.held === 0 && fabric.handed === 0;
+    if (nativeFenceHeld(rootId)) {
+      // Fenced, but Fabric still holds items for Pi: they cannot flush through a fence. Lift ONLY the fence.
+      if (!fabricEmpty) releaseNativeInput(rootId);
+      return;
     }
-    // Stop actors last, only once input is fenced and no agent run is live: a refused drain then stops nothing.
-    const native = observeNativeInput(this.host.pi, this.host.context(), rootId);
-    const running = this.#runningAgents();
-    if (!native.inputsFenced || running === undefined || running.length > 0) return;
-    const actors = this.host.actors();
-    for (const actor of this.#owned() ?? []) {
-      if (actor.residency !== "session" || actor.status === "stopped" || !actor.quiescence || actor.quiescence.length) continue;
-      const stop = actors!.stop(actor.id, undefined, true, "actors.stop", { explicit: true });
-      await Promise.race([stop.catch(() => undefined), new Promise(resolve => setTimeout(resolve, STOP_WAIT_MS))]);
-    }
+    if (this.#allElseDrained()) await fenceNativeInput(this.host.pi, this.host.context(), rootId);
   }
 
   #undo(): NonNullable<MainDrainReply["undo"]> {
@@ -160,16 +237,25 @@ export class MainDrainControl {
     // Only a LOST handle (Pi still fenced, nothing held here) needs a restart.
     const native = observeNativeInput(this.host.pi, this.host.context(), rootId);
     const restartRequired = native.fenceApi && native.piInputsFenced !== false;
-    return { fenceReleased: held && !restartRequired, inboxReopened, restartRequired };
+    // Stage 1 does not recreate a stopped actor: every one this operation stopped must be active again.
+    const owned = this.#owned();
+    const stopped = peekDrainSlot(rootId)?.stopped ?? [];
+    const actorsRestored = owned !== undefined && stopped.every(entry => owned.some(actor => actor.id === entry.id && actor.status !== "stopped"));
+    return { fenceReleased: held && !restartRequired, inboxReopened, restartRequired, actorsRestored };
   }
 
-  #mainSnapshot(): ReturnType<NonNullable<ReturnType<MainDrainHost["main"]>>["drainSnapshot"]> | undefined {
+  #mainSnapshot(): ReturnType<MainDrainMain["drainSnapshot"]> | undefined {
     try { return this.host.main()?.drainSnapshot(); } catch { return undefined; }
   }
 
-  #runningAgents(): Array<{ id: string; status: string }> | undefined {
+  #agentRuns(): Array<{ id: string; status: string; worker: { pid: number; startTime: string | null } | null }> | undefined {
     try {
-      return this.host.agents()?.list().filter(agent => !TERMINAL_AGENT.has(agent.status)).map(agent => ({ id: agent.id, status: agent.status }));
+      const agents = this.host.agents();
+      if (!agents) return undefined;
+      return agents.list().map(agent => {
+        const worker = agents.workerIdentity?.(agent.id);
+        return { id: agent.id, status: agent.status, worker: worker ? { pid: worker.pid, startTime: worker.startTime ?? null } : null };
+      });
     } catch { return undefined; }
   }
 
@@ -199,19 +285,28 @@ export class MainDrainControl {
     const gate = mainInboxDrainGate(rootId);
     const fabric = this.#mainSnapshot();
     const owned = this.#owned();
-    const running = this.#runningAgents();
+    const runs = this.#agentRuns();
     const binding = currentBinding(rootId);
     const native = observeNativeInput(this.host.pi, this.host.context(), rootId);
+    let mainAdmits: boolean | null;
+    try { mainAdmits = this.host.main()?.probeAdmission() ?? null; } catch { mainAdmits = null; }
+    let completions: number | null;
+    try { completions = this.host.completions ? this.host.completions() ?? 0 : null; } catch { completions = null; }
     return {
       v: 1, ok: true, op, error: null, sessionId, rootId, meshRoot, pid: process.pid,
-      binding: binding ? { kind: binding.kind, run: binding.run, operationId: binding.operationId, phase: binding.phase,
-        podUid: binding.podUid, boundAt: binding.boundAt, fenceGeneration: binding.fenceGeneration } : null,
+      binding: binding ? { kind: binding.kind, run: binding.run, operationId: binding.operationId, generation: binding.generation,
+        phase: binding.phase, podUid: binding.podUid, boundAt: binding.boundAt } : null,
       inbox: { closed: gate !== undefined, closedAt: gate?.closedAt ?? null, held: fabric?.held ?? null, handed: fabric?.handed ?? null,
+        heldIds: fabric?.heldIds ?? null, handedIds: fabric?.handedIds ?? null,
         journalOpen: fabric?.journalOpen ?? null, halted: fabric?.halted ?? null, reloading: fabric?.reloading ?? null },
       native,
-      probes: probeIngress(rootId, native),
+      probes: probeIngress(rootId, native, mainAdmits),
       actors: { known: owned !== undefined, owned: owned ?? [] },
-      agents: { known: running !== undefined, running: running ?? [] },
+      agents: { known: runs !== undefined, running: (runs ?? []).filter(run => !TERMINAL_AGENT.has(run.status)).map(({ id, status }) => ({ id, status })),
+        workers: (runs ?? []).flatMap(run => run.worker ? [{ id: run.id, status: run.status, ...run.worker }] : []) },
+      completions: { inboxPending: completions },
+      admitted: [...(peekDrainSlot(rootId)?.admitted ?? [])], ledger: [...(peekDrainSlot(rootId)?.ledger ?? [])],
+      stopped: [...(peekDrainSlot(rootId)?.stopped ?? [])], stopRefused: null,
       undo, exiting: false, exitRefused: [],
     };
   }
@@ -221,13 +316,14 @@ export class MainDrainControl {
     if (!this.host.context()) reasons.push("CONTEXT_GONE");
     if (!reply.inbox.closed) reasons.push("INBOX_OPEN");
     if (reply.inbox.held !== 0 || reply.inbox.handed !== 0) reasons.push("FABRIC_FOLLOWUPS_PENDING");
-    if (!reply.native.inputsFenced || reply.probes.some(probe => probe.admits !== false)) reasons.push("NATIVE_NOT_FENCED");
+    if (!reply.native.inputsFenced || reply.probes.some(probe => probe.mechanism !== "hold" && probe.admits !== false)) reasons.push("NATIVE_NOT_FENCED");
     if (reply.native.drained !== true || reply.native.queued !== 0 || reply.native.inputAdmissionCount !== 0) reasons.push("NATIVE_NOT_DRAINED");
     if (reply.native.idle !== true) reasons.push("NATIVE_RUN_ACTIVE");
     if (!reply.actors.known || reply.actors.owned.some(actor => actor.residency !== "durable" && actor.status !== "stopped")) {
       reasons.push("SESSION_ACTORS_LIVE");
     }
     if (!reply.agents.known || reply.agents.running.length > 0) reasons.push("TASK_AGENTS_RUNNING");
+    if (reply.completions.inboxPending !== 0 && reply.completions.inboxPending !== null) reasons.push("COMPLETIONS_PENDING");
     return reasons;
   }
 }

@@ -4,8 +4,7 @@ import path from "node:path";
 import { diagnostics } from "../core/diagnostics.js";
 import { peerCredentials } from "../records/peer.js";
 import type { MainDrainControl, MainDrainPeer } from "./control.js";
-import { MAIN_DRAIN_DIRECTORY, MAIN_DRAIN_MAX_REQUEST_BYTES, MAIN_DRAIN_MAX_SOCKET_PATH, mainDrainSocketName,
-  parseMainDrainRequest, type MainDrainOp } from "./protocol.js";
+import { MAIN_DRAIN_DIRECTORY, MAIN_DRAIN_MAX_REQUEST_BYTES, mainDrainSocketName, parseMainDrainRequest, type MainDrainOp } from "./protocol.js";
 
 const MAX_CONNECTIONS = 4;
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -19,7 +18,12 @@ const safeChain = (directory: string, uid: number): boolean => {
   }
 };
 
-interface Pinned { directory: string; socket: string; dev: number; ino: number }
+/**
+ * The socket directory, pinned by an open descriptor. Its sockaddr is `/proc/self/fd/<fd>/<name>`:
+ * the kernel resolves it through the held directory, so the mesh root's length never meets the
+ * 107-byte sun_path limit, and a swapped directory cannot be bound or reached.
+ */
+interface Pinned { directory: string; socket: string; address: string; fd: number; dev: number; ino: number }
 
 /** The private socket directory: real path, uid-owned, exactly 0700, safe ancestors. Throws a fixed code. */
 const pinDirectory = (meshRoot: string, uid: number): Pinned => {
@@ -28,29 +32,37 @@ const pinDirectory = (meshRoot: string, uid: number): Pinned => {
   try { fs.mkdirSync(directory, { mode: 0o700 }); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("MAIN_DRAIN_DIRECTORY_UNAVAILABLE");
   }
-  const stat = fs.lstatSync(directory);
-  if (!stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o7777) !== 0o700 || !safeChain(directory, uid)) {
+  let fd: number;
+  try { fd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW); }
+  catch { throw new Error("MAIN_DRAIN_DIRECTORY_UNSAFE"); }
+  const held = fs.fstatSync(fd);
+  const named = fs.lstatSync(directory);
+  if (!held.isDirectory() || held.uid !== uid || (held.mode & 0o7777) !== 0o700 || named.ino !== held.ino || named.dev !== held.dev ||
+    !safeChain(directory, uid)) {
+    fs.closeSync(fd);
     throw new Error("MAIN_DRAIN_DIRECTORY_UNSAFE");
   }
-  return { directory, socket: "", dev: stat.dev, ino: stat.ino };
+  return { directory, socket: "", address: "", fd, dev: held.dev, ino: held.ino };
 };
 
 const stillPinned = (pinned: Pinned, uid: number): boolean => {
   try {
-    const stat = fs.lstatSync(pinned.directory);
-    return stat.isDirectory() && stat.dev === pinned.dev && stat.ino === pinned.ino && stat.uid === uid && (stat.mode & 0o7777) === 0o700;
+    const held = fs.fstatSync(pinned.fd);
+    const named = fs.lstatSync(pinned.directory);
+    return held.dev === pinned.dev && held.ino === pinned.ino && named.dev === pinned.dev && named.ino === pinned.ino &&
+      held.uid === uid && (held.mode & 0o7777) === 0o700;
   } catch { return false; }
 };
 
 /** A leftover socket is removed only when it is ours (uid) and nobody answers on it. */
-const clearStaleSocket = (socket: string, uid: number): Promise<void> => new Promise((resolve, reject) => {
+const clearStaleSocket = (socket: string, address: string, uid: number): Promise<void> => new Promise((resolve, reject) => {
   let stat: fs.Stats | undefined;
   try { stat = fs.lstatSync(socket); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") { resolve(); return; }
     reject(new Error("MAIN_DRAIN_SOCKET_UNREADABLE")); return;
   }
   if (!stat.isSocket() || stat.uid !== uid) { reject(new Error("MAIN_DRAIN_SOCKET_FOREIGN")); return; }
-  const probe = net.connect(socket);
+  const probe = net.connect(address);
   probe.once("connect", () => { probe.destroy(); reject(new Error("MAIN_DRAIN_SOCKET_IN_USE")); });
   probe.once("error", (error: NodeJS.ErrnoException) => {
     if (error.code !== "ECONNREFUSED") { reject(new Error("MAIN_DRAIN_SOCKET_IN_USE")); return; }
@@ -94,20 +106,24 @@ export class MainDrainServer {
       const uid = this.options.uid ?? process.geteuid?.();
       if (platform !== "linux" || uid === undefined) return "MAIN_DRAIN_UNSUPPORTED_PLATFORM";
       const pinned = pinDirectory(this.control.host.meshRoot, uid);
-      pinned.socket = path.join(pinned.directory, mainDrainSocketName(this.control.host.sessionId));
-      if (Buffer.byteLength(pinned.socket) > MAIN_DRAIN_MAX_SOCKET_PATH) return "MAIN_DRAIN_SOCKET_PATH_TOO_LONG";
-      await clearStaleSocket(pinned.socket, uid);
+      const name = mainDrainSocketName(this.control.host.sessionId);
+      pinned.socket = path.join(pinned.directory, name);
+      pinned.address = `/proc/self/fd/${pinned.fd}/${name}`;
+      const fail = (code: string): string => { fs.closeSync(pinned.fd); return code; };
+      try { await clearStaleSocket(pinned.socket, pinned.address, uid); } catch (error) { fs.closeSync(pinned.fd); throw error; }
       const server = net.createServer({ allowHalfOpen: false });
       server.maxConnections = MAX_CONNECTIONS;
       server.on("connection", socket => this.#serve(socket, uid));
-      await new Promise<void>((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(pinned.socket, () => { server.off("error", reject); resolve(); });
-      });
-      if (this.#closed) { server.close(); return "MAIN_DRAIN_CLOSED"; }
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(pinned.address, () => { server.off("error", reject); resolve(); });
+        });
+      } catch { return fail("MAIN_DRAIN_LISTEN_FAILED"); }
+      if (this.#closed) { server.close(); return fail("MAIN_DRAIN_CLOSED"); }
       fs.chmodSync(pinned.socket, 0o600);
       const stat = fs.lstatSync(pinned.socket);
-      if (!stat.isSocket() || stat.uid !== uid || !stillPinned(pinned, uid)) { server.close(); return "MAIN_DRAIN_SOCKET_UNSAFE"; }
+      if (!stat.isSocket() || stat.uid !== uid || !stillPinned(pinned, uid)) { server.close(); return fail("MAIN_DRAIN_SOCKET_UNSAFE"); }
       server.on("error", error => diagnostics.warn("src/main-drain/server.ts", "[pi-fabric] main drain channel error", error));
       this.#server = server;
       this.#pinned = pinned;
@@ -133,6 +149,7 @@ export class MainDrainServer {
       const stat = fs.lstatSync(pinned.socket);
       if (stat.dev === identity.dev && stat.ino === identity.ino) fs.unlinkSync(pinned.socket);
     } catch { /* already gone */ }
+    try { fs.closeSync(pinned.fd); } catch { /* already closed */ }
   }
 
   #serve(socket: net.Socket, uid: number): void {

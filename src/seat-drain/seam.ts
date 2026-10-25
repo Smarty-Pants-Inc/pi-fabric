@@ -1,32 +1,34 @@
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
+import type net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { inventorySessionPending, type SessionPendingInventory } from "../cli/session-pending.js";
-import type { MainDrainBindingRequest } from "../main-drain/binding.js";
+import { procStartTime, type MainDrainBindingRequest } from "../main-drain/binding.js";
 import { callMainDrain, mainDrainSocket, MainDrainClientError } from "../main-drain/client.js";
 import { MAIN_DRAIN_INGRESS } from "../main-drain/control.js";
 import { mainDrainSocketPath, type MainDrainReply } from "../main-drain/protocol.js";
 import { evaluateDrain, scanCompletions, type DrainEvaluation } from "./evaluate.js";
 import { interpreterIdentity, parseRequest, proveSeatLock, readOwned, readSealedRun, resolveSeatMeshRoot, SeamGap, sha256,
-  verifyRunDir, writeOnce, type SeamRequest } from "./run.js";
+  socketPeer, verifyRunDir, writeOnce, type SeamRequest } from "./run.js";
 
 /**
- * fabric-v2's D3 `drain` seam (smarty-dev#15310 prep item 13). Contract: SEAT.md §3 and
- * DRAIN-PHASE-CONTRACT.md (sha256 800e7790…), challenge r1 and the 10-25 rulings.
+ * fabric-v2's D3 `drain` seam (smarty-dev#15310 prep item 13). Contract: SEAT.md §3,
+ * DRAIN-PHASE-CONTRACT.md rev 3 (sha256 c67041c7…) and DRAIN-DESIGN.r1 (sha256 7ecdac72…).
  *
  *   <exe> --run-dir RUN --phase drain|drain-undo|drain-recheck|resume-drain   stdin: request   stdout: ONE receipt
  *
- * - drain: bind the v1 Main to this run (seat-lock proof), close its gates, then wait (600 s,
- *   monotonic from seam start) until every count is 0 and every child is terminal, two passes in a row.
- *   On success: a `pass` receipt. Otherwise: undo (≤60 s), canary, evidence, then a `refused`
- *   receipt {sessionId, reason, inputsFenced} where inputsFenced is the state AFTER the undo.
- * - drain-undo: the intent's operationId releases the fence and reopens the gates; the canary
- *   decides admissionRestored. Idempotent per operationId.
+ * Results are truthful: `pass` only with the phase's passing values, otherwise `refused` with the same
+ * closed set. A valid receipt is exit 0 with empty stderr. A lock-proof or binding failure prints NO
+ * receipt and exits 2 (UNKNOWN), in every phase, before anything is fenced.
+ * - drain: pre-read; intent; bind the v1 Main (seat-lock proof) and close its gates; wait (600 s,
+ *   monotonic from seam start) until every count is 0 and every child terminal, two passes in a row.
+ *   Otherwise undo (≤60 s) and canary, then `refused` {sessionId, reason, inputsFenced-after-undo}.
+ * - drain-undo: release through the kept handle and reopen; the canary decides admissionRestored.
  * - drain-recheck: after v1 is terminal, the filesystem-only session-pending inventory.
  * - resume-drain: the raw Pod (stage 2, kubectl exec); fails closed until then.
- * Nothing is deleted or acknowledged. Evidence is private and write-once under RUN.
- * Exit 2 with no receipt means UNKNOWN: an unparseable request, or evidence that could not be written.
+ * Nothing is deleted or acknowledged. Evidence is private, write-once, under RUN.
  */
 const OWNER = "fabric-v2";
 const DEADLINE_MS = 600_000;
@@ -35,7 +37,7 @@ const POLL_MS = 1_000;
 const MAX_REQUEST = 64 * 1024;
 const PHASES = new Set(["drain", "drain-undo", "drain-recheck", "resume-drain"]);
 const INTENT = "fabric-v2-drain-intent.json";
-const BOUND = "fabric-v2-drain-bound.json";
+const OUTCOME = "fabric-v2-drain-outcome.json";
 const HEX64 = /^[0-9a-f]{64}$/;
 export const DRAIN_REFUSAL_REASONS = ["pending-timeout", "children-live", "durable-actor-present", "inventory-incomplete",
   "fence-unavailable", "lock-proof-refused", "request-binding-refused", "main-unreachable"] as const;
@@ -43,7 +45,9 @@ export type DrainRefusalReason = typeof DRAIN_REFUSAL_REASONS[number];
 const RESIDUALS = [
   "SEAT.md §3 A6: a same-UID writer could alter this seam or its user-owned interpreter between hash and exec",
   "native input fence: fail-closed until Pi ships the extension-facing fence (PI-FENCE-API.md)",
-  "A-side (principal-lead): the persistent fence across a v1 restart; drain-recheck is the post-stop recount",
+  "A-side (principal-lead): no persisted fence across a v1 restart; drain-recheck is the post-stop recount",
+  "non-retrying producers get a visible FABRIC_MAIN_DRAINING refusal, not exactly-once delivery",
+  "ingress row 8 (feed herdr prompt): a Pi refusal is invisible to the feed; an A/runbook precondition",
 ];
 
 export interface SeamIo {
@@ -63,22 +67,30 @@ export interface SeamDeps {
 }
 interface Context {
   runDir: string; request: SeamRequest; meshRoot: string; lockFd: number; uid: number; io: SeamIo; deps: SeamDeps;
-  now: () => number; sleep: (ms: number) => Promise<void>; deadline: number; started: number;
+  now: () => number; sleep: (ms: number) => Promise<void>; deadline: number; started: number; requestSha256: string;
 }
+/** A binding failure discovered after the seam started talking: still no receipt, exit 2. */
+class BindingGap extends SeamGap {}
 
 const json = (value: unknown): Buffer => Buffer.from(`${JSON.stringify(value, null, 1)}\n`);
-const receipt = (request: Pick<SeamRequest, "run" | "phase">, result: "pass" | "refused", observed: Record<string, unknown>): string =>
+const receipt = (request: SeamRequest, result: "pass" | "refused", observed: Record<string, unknown>): string =>
   JSON.stringify({ schema: "d3-seam-receipt-v1", run: request.run, phase: request.phase, owner: OWNER, result, observed });
 const clientCode = (error: unknown): string =>
   error instanceof MainDrainClientError || error instanceof SeamGap ? error.code : "MAIN_DRAIN_CALL_FAILED";
+const INTERPRETER_TOKEN = ["__FABRIC_SEAT_DRAIN", "INTERPRETER_SHA256__"].join("_");
 
-/** Self-install: write `#!<this node>` + this bundle, write-once 0500; print path and hashes. */
-const install = (argv: string[], io: SeamIo): number => {
+/**
+ * Self-install: `#!<this node's absolute path>` + this bundle, with that interpreter's sha256 embedded
+ * (the entry refuses any other interpreter), written once, 0500. Prints the path and both hashes.
+ */
+export const install = (argv: string[], io: SeamIo, self: string): number => {
   if (argv.length !== 3 || argv[1] !== "--out" || !path.isAbsolute(argv[2]!)) { io.stderr("usage: --install --out <absolute path>\n"); return 2; }
-  const self = fs.readFileSync(__filename, "utf8");
-  const body = self.startsWith("#!") ? self.slice(self.indexOf("\n") + 1) : self;
+  const source = fs.readFileSync(self, "utf8");
+  const body = source.startsWith("#!") ? source.slice(source.indexOf("\n") + 1) : source;
   const node = interpreterIdentity();
-  const bytes = Buffer.from(`#!${node.execPath}\n${body}`);
+  const quoted = JSON.stringify(INTERPRETER_TOKEN);
+  if (!node.sha256 || body.split(quoted).length !== 2) { io.stderr("install: interpreter unhashable or bundle token missing\n"); return 2; }
+  const bytes = Buffer.from(`#!${node.execPath}\n${body.replace(quoted, JSON.stringify(node.sha256))}`);
   const fd = fs.openSync(argv[2]!, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o500);
   try { fs.writeSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   io.stdout(`${JSON.stringify({ path: argv[2], sha256: sha256(bytes), owner: OWNER, interpreter: node,
@@ -86,282 +98,406 @@ const install = (argv: string[], io: SeamIo): number => {
   return 0;
 };
 
-const BINDING_GAPS = /^(run-dir|request|seat-run|seat-journal|seat-inputs|executor|source-journal|fabric-config|mesh-root|inputs)/;
-
 export const main = async (argv: string[], io: SeamIo, deps: SeamDeps = {}): Promise<number> => {
-  if (argv[0] === "--install") return install(argv, io);
   const now = deps.now ?? (() => performance.now());
   const started = now();
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
   const deadline = started + Math.min(deps.deadlineMs ?? DEADLINE_MS, DEADLINE_MS);
   const uid = deps.uid ?? process.getuid!();
-  let request: SeamRequest | undefined;
   try {
     if (argv.length !== 4 || argv[0] !== "--run-dir" || argv[2] !== "--phase" || !PHASES.has(argv[3]!)) throw new SeamGap("usage");
     const runDir = argv[1]!;
     const phase = argv[3]!;
     const stdin = io.stdin();
     if (stdin.length > MAX_REQUEST) throw new SeamGap("request-too-large");
-    request = parseRequest(stdin, phase);
+    const request = parseRequest(stdin, phase);
     verifyRunDir(runDir, uid);
     const sealed = readSealedRun(runDir, request, uid);
-    let lockFd: number;
-    try { lockFd = proveSeatLock(runDir, io.env.D3_SEAT_LOCK_FD, uid, deps.python); }
-    catch (error) {
-      // Without the lock nothing is written under RUN and the Main is never contacted.
-      if (phase === "drain" && error instanceof SeamGap) return refuse(io, request, "lock-proof-refused", false);
-      throw error;
-    }
+    const lockFd = proveSeatLock(runDir, io.env.D3_SEAT_LOCK_FD, uid, deps.python);
     if (phase === "resume-drain") return resumeDrainUnavailable(runDir, request, io);
-    const meshRoot = resolveSeatMeshRoot(sealed.journal, request.sessionId, uid);
-    const context: Context = { runDir, request, meshRoot, lockFd, uid, io, deps, now, sleep, deadline, started };
+    let meshRoot: string | undefined;
+    try { meshRoot = resolveSeatMeshRoot(sealed.journal, request.sessionId, uid); }
+    catch (error) {
+      // Only drain has a refusal for it (DRAIN-DESIGN.r1 §1.2): an unreadable mesh root is inventory-incomplete.
+      if (phase !== "drain" || !(error instanceof SeamGap)) throw error;
+    }
+    const context: Context = { runDir, request, meshRoot: meshRoot ?? "", lockFd, uid, io, deps, now, sleep, deadline, started,
+      requestSha256: sha256(stdin) };
     if (phase === "drain") {
-      if (Object.keys(request.inputs).length !== 0) throw new SeamGap("inputs-invalid");
+      if (Object.keys(request.inputs).join(",") !== "operationId") throw new SeamGap("inputs-invalid");
+      if (meshRoot === undefined) return refuse(context, "inventory-incomplete", false);
       return await drain(context);
     }
     if (phase === "drain-undo") return await drainUndo(context);
-    if (Object.keys(request.inputs).length !== 0) throw new SeamGap("inputs-invalid");
+    if (Object.keys(request.inputs).join(",") !== "operationId") throw new SeamGap("inputs-invalid");
     return recheck(context);
   } catch (error) {
     const code = error instanceof SeamGap ? error.code : "seam-internal";
-    // A drain whose binding cannot be verified touched nothing: a valid refusal opens A's abort path.
-    if (request?.phase === "drain" && BINDING_GAPS.test(code)) return refuse(io, request, "request-binding-refused", false);
     io.stderr(`GAP: ${code} [owner: ${OWNER}]\n`);
     return 2;
   }
 };
 
-const refuse = (io: SeamIo, request: SeamRequest, reason: DrainRefusalReason, inputsFenced: boolean): number => {
-  io.stdout(receipt(request, "refused", { sessionId: request.sessionId, reason, inputsFenced }));
+const refuse = (context: Context, reason: DrainRefusalReason, inputsFenced: boolean): number => {
+  context.io.stdout(receipt(context.request, "refused", { sessionId: context.request.sessionId, reason, inputsFenced }));
   return 0;
 };
 
-const binding = (context: Context, phase: MainDrainBindingRequest["phase"], operationId: string): MainDrainBindingRequest => ({
-  runDir: context.runDir, run: context.request.run, runSha256: context.request.runSha256, phase, operationId, lockFd: context.lockFd, podUid: null,
+const binding = (context: Context, phase: MainDrainBindingRequest["phase"], generation: string): MainDrainBindingRequest => ({
+  runDir: context.runDir, run: context.request.run, runSha256: context.request.runSha256, phase,
+  operationId: context.request.operationId, generation, lockFd: context.lockFd, podUid: null,
 });
 
-const call = async (context: Context, op: "drain" | "undo" | "probe", bound: MainDrainBindingRequest | null, timeoutMs: number):
-  Promise<{ reply?: MainDrainReply; error?: string }> => {
+/**
+ * DRAIN-DESIGN.r1 §1.7: the server must be the Main that owns this session's inbox: its SO_PEERCRED
+ * uid is ours, and its pid and /proc start time are those in `main-followups/<sid>.owner.json`.
+ */
+const verifyServer = (context: Context) => async (client: net.Socket): Promise<string | undefined> => {
+  let owner: Record<string, unknown> | undefined;
+  try {
+    owner = JSON.parse(readOwned(path.join(context.meshRoot, "main-followups", `${encodeURIComponent(context.request.sessionId)}.owner.json`),
+      context.uid, 64 * 1024, undefined, "owner-unreadable").toString("utf8")) as Record<string, unknown>;
+  } catch { return "MAIN_DRAIN_OWNER_UNREADABLE"; }
+  const peer = await socketPeer(client, context.deps.python);
+  if (!peer || peer.uid !== context.uid) return "MAIN_DRAIN_SERVER_UNVERIFIED";
+  if (owner.pid !== peer.pid || owner.rootId !== `session:${context.request.sessionId}` || owner.retired === true ||
+    (typeof owner.host === "string" && owner.host !== os.hostname()) || typeof owner.processStartedAt !== "string" ||
+    procStartTime(peer.pid, context.deps.procRoot) !== owner.processStartedAt) return "MAIN_DRAIN_SERVER_NOT_OWNER";
+  return undefined;
+};
+
+const call = async (context: Context, op: "drain" | "stop-actors" | "undo" | "probe", bound: MainDrainBindingRequest | null, timeoutMs: number):
+  Promise<{ reply?: MainDrainReply; error?: string; written?: boolean }> => {
   try {
     const socket = mainDrainSocket(context.meshRoot, context.request.sessionId, context.uid);
-    return { reply: await callMainDrain(socket, context.request.sessionId, op, bound, Math.max(1_000, Math.min(timeoutMs, 30_000))) };
-  } catch (error) { return { error: clientCode(error) }; }
+    const reply = await callMainDrain(socket, context.request.sessionId, op, bound, Math.max(1_000, Math.min(timeoutMs, 30_000)),
+      verifyServer(context));
+    // The Main must name this run's mesh root and root; another one is a binding failure (rev 3: no receipt).
+    let ours: string | undefined, theirs: string | undefined;
+    try { ours = fs.realpathSync(context.meshRoot); theirs = fs.realpathSync(reply.meshRoot); } catch { /* compared below */ }
+    if (!ours || ours !== theirs || reply.rootId !== `session:${context.request.sessionId}`) throw new BindingGap("main-binding-mismatch");
+    return { reply, written: true };
+  } catch (error) {
+    if (error instanceof BindingGap) throw error;
+    return { error: clientCode(error), written: error instanceof MainDrainClientError && error.written };
+  }
 };
 
 const inventory = (context: Context): SessionPendingInventory | undefined => {
   try { return inventorySessionPending(context.meshRoot, context.request.sessionId); } catch { return undefined; }
 };
 
-/** B1's canary through the SAME gate functions as live admission: every gate admits, nothing is bound, native is open. */
+/** B1's canary, through the SAME gate functions as live admission: every gate admits, nothing is bound, native is open. */
 const canary = (probe: MainDrainReply | undefined): { inboxOpen: boolean; inputsFenced: boolean } => {
   const inboxOpen = probe !== undefined && probe.binding === null && probe.inbox.closed === false &&
     MAIN_DRAIN_INGRESS.filter(row => row.mechanism === "fabric-gate")
       .every(row => probe.probes.some(entry => entry.path === row.path && entry.admits === true));
-  // Without the fence API this process never fenced: native admission is open.
+  // Without the fence API nothing was fenced: native admission is open.
   const inputsFenced = probe === undefined || (probe.native.fenceApi && probe.native.piInputsFenced !== false);
   return { inboxOpen, inputsFenced };
 };
 
-/** Undo through the binding (when one was taken), then probe. ≤60 s. admissionRestored folds in no-restart-needed. */
-const undoAndProbe = async (context: Context, operationId: string | undefined, phase: MainDrainBindingRequest["phase"]) => {
+/**
+ * Undo (when a binding was taken), then probe; ≤60 s. admissionRestored folds in no-restart-needed AND
+ * (r2 N2) every actor this operation stopped being active again. A refusal of the undo's binding (another
+ * operation's fence, no lock) is a binding failure: no receipt (contract rev 4 §2).
+ */
+const undoAndProbe = async (context: Context, generation: string | undefined, phase: MainDrainBindingRequest["phase"],
+  stoppedIds: readonly string[] = []) => {
   const until = context.now() + Math.min(context.deps.undoBudgetMs ?? UNDO_BUDGET_MS, UNDO_BUDGET_MS);
   const attempts: string[] = [];
   let undo: MainDrainReply | undefined;
   let probe: MainDrainReply | undefined;
-  let undone = operationId === undefined;
+  let undone = generation === undefined;
   while (context.now() < until) {
     if (!undone) {
-      const result = await call(context, "undo", binding(context, phase, operationId!), until - context.now());
+      const result = await call(context, "undo", binding(context, phase, generation!), until - context.now());
+      if (result.error?.startsWith("MAIN_DRAIN_REFUSED")) throw new BindingGap(`undo-refused:${result.error.slice(19).toLowerCase()}`);
       if (result.error) attempts.push(`undo:${result.error}`); else { undo = result.reply; undone = true; }
     }
     if (undone) {
       const result = await call(context, "probe", null, until - context.now());
       if (result.error) attempts.push(`probe:${result.error}`); else { probe = result.reply; break; }
     }
-    if (attempts.at(-1)?.includes("REFUSED")) break;          // a refused binding does not change on retry
     await context.sleep(Math.min(POLL_MS, Math.max(0, until - context.now())));
   }
   const seen = canary(probe);
   const restartRequired = !undone || undo?.undo?.restartRequired === true || seen.inputsFenced;
-  return { undo, probe, attempts: attempts.slice(-20), ...seen, restartRequired, admissionRestored: seen.inboxOpen && !restartRequired };
+  const stopped = new Set([...stoppedIds, ...(undo?.stopped ?? []).map(entry => entry.id)]);
+  const actorsRestored = undo?.undo?.actorsRestored !== false && [...stopped].every(id =>
+    probe?.actors.owned.some(actor => actor.id === id && actor.status !== "stopped") === true);
+  return { undo, probe, attempts: attempts.slice(-20), ...seen, restartRequired, actorsRestored,
+    admissionRestored: seen.inboxOpen && !restartRequired && actorsRestored };
 };
 
 const evidence = (context: Context, name: string, value: Record<string, unknown>): string =>
   writeOnce(context.runDir, name, json({ ...value, owner: OWNER, run: context.request.run, sessionId: context.request.sessionId,
-    elapsedMs: Math.round(context.now() - context.started) }));
+    operationId: context.request.operationId, elapsedMs: Math.round(context.now() - context.started) }));
 
-/** The fixed reason for a not-drained outcome, in a fixed precedence. */
-export const refusalReason = (evaluation: DrainEvaluation, lastError: string | undefined, everReplied: boolean): DrainRefusalReason => {
-  const error = lastError ?? "";
-  if (/^MAIN_DRAIN_REFUSED_(PEER_|LOCK_)/.test(error)) return "lock-proof-refused";
-  if (/^MAIN_DRAIN_REFUSED/.test(error) || evaluation.reasons.some(reason => reason === "main-identity-mismatch" || reason === "mesh-root-mismatch")) {
-    return "request-binding-refused";
-  }
-  if (!everReplied || evaluation.reasons.includes("main-unreachable")) return "main-unreachable";
+/** The fixed reason for a not-drained outcome, in DRAIN-DESIGN.r1 §1.10's order. */
+export const refusalReason = (evaluation: DrainEvaluation | undefined, everReplied: boolean): DrainRefusalReason => {
+  if (!everReplied || !evaluation || evaluation.reasons.includes("main-unreachable")) return "main-unreachable";
   if (evaluation.reasons.some(reason => reason.startsWith("children:durable-actor:"))) return "durable-actor-present";
-  if (evaluation.reasons.includes("inventory-incomplete")) return "inventory-incomplete";
   if (evaluation.reasons.includes("native-fence-api-unavailable")) return "fence-unavailable";
-  if (evaluation.observed.queued || evaluation.observed.admitted) return "pending-timeout";
+  if (evaluation.reasons.includes("inventory-incomplete")) return "inventory-incomplete";
   if (!evaluation.observed.childrenTerminal) return "children-live";
+  if (evaluation.observed.queued || evaluation.observed.admitted) return "pending-timeout";
   return "fence-unavailable";
 };
 
 const drain = async (context: Context): Promise<number> => {
   const { request, meshRoot } = context;
-  const operationId = randomBytes(16).toString("hex");
-  // M12: the intent is durable BEFORE the first control call, so a SIGKILLed seam leaves its operationId for drain-undo.
+  const rootId = `session:${request.sessionId}`;
+  // §1.11 step 2: a measured pre-read. An owned durable actor refuses before anything is touched.
+  const pre = inventory(context);
+  if (pre?.complete && pre.actors.some(actor => actor.rootId === rootId && actor.residency === "durable")) {
+    return refuse(context, "durable-actor-present", false);
+  }
+  const generation = randomBytes(16).toString("hex");
+  const socket = mainDrainSocketPath(meshRoot, request.sessionId);
+  let socketInode: string | null = null;
+  try { socketInode = String(fs.lstatSync(socket).ino); } catch { /* absent: the drain will report main-unreachable */ }
+  // M12: the intent is durable BEFORE the first control call, so a SIGKILLed seam leaves the operation for drain-undo.
   const intentSha256 = evidence(context, INTENT, {
-    schema: "fabric-v2-drain-intent-v1", phase: "drain", runSha256: request.runSha256, operationId,
-    measured: { meshRoot, socket: mainDrainSocketPath(meshRoot, request.sessionId), interpreter: interpreterIdentity(),
-      seam: seamIdentity(), startedAt: new Date().toISOString() },
+    schema: "fabric-v2-drain-intent-v2", phase: "drain", runSha256: request.runSha256, generation,
+    requestSha256: context.requestSha256,
+    measured: { meshRoot, socket, socketInode, interpreter: interpreterIdentity(), seam: seamIdentity(), startedAt: new Date().toISOString(),
+      t0MonotonicMs: context.started, main: pre?.followUps.owner ?? null },
     deadlineS: Math.min(context.deps.deadlineMs ?? DEADLINE_MS, DEADLINE_MS) / 1000, undoBudgetS: UNDO_BUDGET_MS / 1000, residuals: RESIDUALS,
   });
-  const rootId = `session:${request.sessionId}`;
   const passes: Array<{ atMs: number; drained: boolean; error: string | null; reasons: string[] }> = [];
+  const steps: Array<{ atMs: number; step: string; detail: unknown; basis: "asserted" | "measured" }> = [];
+  const step = (name: string, detail: unknown, basis: "asserted" | "measured" = "asserted"): void => {
+    steps.push({ atMs: Math.round(context.now() - context.started), step: name, detail, basis });
+  };
   let previous = false;
-  let everReplied = false;
-  let boundWritten = false;
-  let last: { reply: MainDrainReply | undefined; error: string | undefined; inventory: SessionPendingInventory | undefined;
-    evaluation: DrainEvaluation } | undefined;
+  let bound = false;
+  let fenced = false;
+  let stopAsked = false;
+  // Whether any drain request reached the Main: if none did, nothing was closed or fenced.
+  let everSent = false;
+  const dispositions = new Map<string, string>();
+  let last: { reply: MainDrainReply | undefined; inventory: SessionPendingInventory | undefined; evaluation: DrainEvaluation } | undefined;
   let success = false;
   for (;;) {
-    const result = await call(context, "drain", binding(context, "drain", operationId), context.deadline - context.now());
-    if (result.reply) everReplied = true;
-    if (result.reply?.binding && !boundWritten) {
-      // The Main's fence generation for this operation, for an operator drain-undo.
-      evidence(context, BOUND, { schema: "fabric-v2-drain-bound-v1", operationId, basis: "asserted", binding: result.reply.binding,
-        mainPid: result.reply.pid });
-      boundWritten = true;
+    const result = await call(context, "drain", binding(context, "drain", generation), context.deadline - context.now());
+    if (result.written) everSent = true;
+    if (!bound) {
+      // Before any gate closed, a lock-proof or binding refusal is UNKNOWN: no receipt (contract rev 3).
+      if (result.error?.startsWith("MAIN_DRAIN_REFUSED")) throw new BindingGap(`main-refused:${result.error.slice(19).toLowerCase()}`);
+      if (result.reply?.binding) { bound = true; step("begin", { binding: result.reply.binding, mainPid: result.reply.pid }); }
+    }
+    if (result.reply) {
+      for (const actor of result.reply.actors.owned) {
+        if (dispositions.get(actor.id) !== actor.disposition) {
+          dispositions.set(actor.id, actor.disposition);
+          step("actor", { id: actor.id, status: actor.status, disposition: actor.disposition, worker: actor.worker });
+        }
+      }
+      if (result.reply.native.inputsFenced !== fenced) { fenced = result.reply.native.inputsFenced; step(fenced ? "fence" : "fence-released", result.reply.native); }
     }
     const files = inventory(context);
     const evaluation = evaluateDrain({ sessionId: request.sessionId, meshRoot, reply: result.reply, inventory: files,
       completions: scanCompletions(meshRoot, rootId), ...(context.deps.procRoot ? { procRoot: context.deps.procRoot } : {}) });
-    last = { reply: result.reply ?? last?.reply, error: result.error, inventory: files, evaluation };
+    last = { reply: result.reply ?? last?.reply, inventory: files, evaluation };
     passes.push({ atMs: Math.round(context.now() - context.started), drained: evaluation.drained, error: result.error ?? null,
       reasons: evaluation.reasons.slice(0, 50) });
     if (passes.length > 200) passes.splice(1, 1);
     if (evaluation.drained && previous) { success = true; break; }
     previous = evaluation.drained;
-    // Waiting cannot fix these: a refused binding, a durable actor, no fence API, a halted Main holding follow-ups.
-    if (result.error?.startsWith("MAIN_DRAIN_REFUSED") || evaluation.haltedWithHeld ||
-      evaluation.reasons.includes("native-fence-api-unavailable") ||
+    // r2 N2: actors are stopped ONLY as the last act: the fence is held and nothing but live session actors remains.
+    if (fenced && !stopAsked && evaluation.reasons.length > 0 && evaluation.reasons.every(reason => reason.startsWith("children:live-actor:"))) {
+      stopAsked = true;
+      const stop = await call(context, "stop-actors", binding(context, "drain", generation), context.deadline - context.now());
+      step("stop-actors", { error: stop.error ?? null, refused: stop.reply?.stopRefused ?? null, stopped: stop.reply?.stopped ?? [] });
+      if (stop.reply?.stopRefused) stopAsked = false;                // not all quiesced yet: ask again on a later pass
+      if (stop.reply) last = { ...last!, reply: stop.reply };
+      if (context.deadline - context.now() <= POLL_MS) break;
+      await context.sleep(POLL_MS);
+      continue;
+    }
+    // Waiting cannot fix these: no Main at all, a durable actor, no fence API, a halted Main holding follow-ups.
+    if ((!bound && result.error) || evaluation.haltedWithHeld || evaluation.reasons.includes("native-fence-api-unavailable") ||
       evaluation.reasons.some(reason => reason.startsWith("children:durable-actor:")) || context.deadline - context.now() <= POLL_MS) break;
     await context.sleep(POLL_MS);
   }
   const final = last!;
+  step("probes", final.reply?.probes ?? null);
   if (success) {
-    evidence(context, "fabric-v2-drain-evidence.json", {
-      schema: "fabric-v2-drain-evidence-v1", result: "drained", operationId, intentSha256, observed: final.evaluation.observed,
+    evidence(context, OUTCOME, {
+      schema: "fabric-v2-drain-outcome-v2", result: "pass", intentSha256, observed: final.evaluation.observed, steps,
       measured: { inventory: final.inventory ?? null, ...final.evaluation.parts.measured },
       asserted: { reply: final.reply ?? null, ...final.evaluation.parts.asserted }, passes,
-      dispositions: final.reply?.actors.owned.map(actor => ({ id: actor.id, disposition: actor.disposition, basis: "asserted" })) ?? [],
+      dispositions: [...dispositions].map(([id, disposition]) => ({ id, disposition, basis: "asserted" })),
+      stoppedActors: final.reply?.stopped ?? [], admitted: final.reply?.admitted ?? [], ledger: final.reply?.ledger ?? [],
+      ingress: MAIN_DRAIN_INGRESS,
     });
     context.io.stdout(receipt(request, "pass", { ...final.evaluation.observed }));
     return 0;
   }
-  const reason = refusalReason(final.evaluation, final.error, everReplied);
-  const undone = await undoAndProbe(context, operationId, "drain");
-  evidence(context, "fabric-v2-drain-evidence.json", {
-    schema: "fabric-v2-drain-evidence-v1", result: "refused", reason, operationId, intentSha256, reasons: final.evaluation.reasons,
-    wouldBeObserved: final.evaluation.observed,
+  const reason = refusalReason(final.evaluation, bound || final.reply !== undefined);
+  const ledger = final.reply?.ledger ?? [];
+  const admitted = final.reply?.admitted ?? [];
+  const stoppedActors = final.reply?.stopped ?? [];
+  if (!everSent) {
+    // begin never reached the Main (refused before the request was written): nothing to undo.
+    evidence(context, OUTCOME, {
+      schema: "fabric-v2-drain-outcome-v2", result: "refused", reason, intentSha256, reasons: final.evaluation.reasons,
+      wouldBeObserved: final.evaluation.observed, steps, passes, beginSent: false, basis: "measured",
+      undo: { admissionRestored: true, restartRequired: false, neverSent: true }, ingress: MAIN_DRAIN_INGRESS,
+    });
+    return refuse(context, reason, false);
+  }
+  const undone = await undoAndProbe(context, generation, "drain", stoppedActors.map(entry => entry.id));
+  step("undo", { admissionRestored: undone.admissionRestored, restartRequired: undone.restartRequired, attempts: undone.attempts });
+  evidence(context, OUTCOME, {
+    schema: "fabric-v2-drain-outcome-v2", result: "refused", reason, intentSha256, reasons: final.evaluation.reasons,
+    wouldBeObserved: final.evaluation.observed, steps,
     measured: { inventory: final.inventory ?? null, ...final.evaluation.parts.measured,
       canary: { inboxOpen: undone.inboxOpen, inputsFenced: undone.inputsFenced } },
     asserted: { reply: final.reply ?? null, ...final.evaluation.parts.asserted, undo: undone.undo?.undo ?? null, probe: undone.probe ?? null },
-    undo: { admissionRestored: undone.admissionRestored, restartRequired: undone.restartRequired, attempts: undone.attempts }, passes,
+    passes, dispositions: [...dispositions].map(([id, disposition]) => ({ id, disposition, basis: "asserted" })), ingress: MAIN_DRAIN_INGRESS,
+    stoppedActors, actorsRestored: undone.actorsRestored, admitted, ledger,
+    undo: { admissionRestored: undone.admissionRestored, restartRequired: undone.restartRequired, attempts: undone.attempts },
   });
-  // inputsFenced is the state AFTER the undo: false only when the canary proved admission restored.
-  return refuse(context.io, request, reason, !undone.admissionRestored);
+  // inputsFenced is the state AFTER the undo: false only when the canary proved admission restored (or nothing was bound).
+  return refuse(context, reason, !undone.admissionRestored);
 };
 
-/** The intent's operationId (absent: no drain ever reached the Main from this run). */
-const readIntent = (context: Context): { operationId: string } | undefined => {
+/** The drain intent (absent: no drain reached its intent in this run). Its operationId must be the request's. */
+const readIntent = (context: Context): { generation: string } | undefined => {
   const file = path.join(context.runDir, INTENT);
   if (!fs.existsSync(file)) return undefined;
   let value: Record<string, unknown>;
   try { value = JSON.parse(readOwned(file, context.uid, 1024 * 1024, { mode: 0o600 }, "intent-unreadable").toString("utf8")) as Record<string, unknown>; }
   catch { throw new SeamGap("intent-unreadable"); }
   const measured = value.measured as Record<string, unknown> | undefined;
-  if (value.schema !== "fabric-v2-drain-intent-v1" || value.run !== context.request.run || value.sessionId !== context.request.sessionId ||
-    typeof value.operationId !== "string" || !/^[0-9a-f]{32}$/.test(value.operationId) || measured?.meshRoot !== context.meshRoot) {
+  if (value.schema !== "fabric-v2-drain-intent-v2" || value.run !== context.request.run || value.sessionId !== context.request.sessionId ||
+    typeof value.generation !== "string" || !/^[0-9a-f]{32}$/.test(value.generation) || measured?.meshRoot !== context.meshRoot) {
     throw new SeamGap("intent-invalid");
   }
-  return { operationId: value.operationId };
+  if (value.operationId !== context.request.operationId) throw new SeamGap("operation-id-mismatch");
+  return { generation: value.generation };
 };
 
-/** A's refused drain receipt, byte-exact under RUN/receipts/, hashing to the given value. */
-const verifyRefusedReceipt = (context: Context, expected: string): void => {
-  const bytes = readOwned(path.join(context.runDir, "receipts", "drain.json"), context.uid, 1024 * 1024, undefined, "refused-receipt-unreadable");
-  if (sha256(bytes) !== expected) throw new SeamGap("refused-receipt-sha256-mismatch");
+/**
+ * A's stored `drain` receipt, byte-exact under RUN/receipts/, hashing to the given value: this run, phase
+ * drain, owner fabric-v2, this session. A `pass` is accepted only while RUN/receipts/fence.json is absent
+ * (contract rev 4 §2, N6 iii: A rejected the pass, or died before `fence`).
+ */
+const verifyDrainReceipt = (context: Context, expected: string): void => {
+  const bytes = readOwned(path.join(context.runDir, "receipts", "drain.json"), context.uid, 1024 * 1024, undefined, "drain-receipt-unreadable");
+  if (sha256(bytes) !== expected) throw new SeamGap("drain-receipt-sha256-mismatch");
   let value: Record<string, unknown>;
-  try { value = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>; } catch { throw new SeamGap("refused-receipt-invalid"); }
+  try { value = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>; } catch { throw new SeamGap("drain-receipt-invalid"); }
   const observed = value.observed as Record<string, unknown> | undefined;
   if (value.schema !== "d3-seam-receipt-v1" || value.run !== context.request.run || value.phase !== "drain" || value.owner !== OWNER ||
-    value.result !== "refused" || observed?.sessionId !== context.request.sessionId) throw new SeamGap("refused-receipt-invalid");
+    (value.result !== "refused" && value.result !== "pass") || observed?.sessionId !== context.request.sessionId) throw new SeamGap("drain-receipt-invalid");
+  if (value.result === "pass" && fs.existsSync(path.join(context.runDir, "receipts", "fence.json"))) throw new SeamGap("drain-pass-after-fence");
 };
 
-/** Write-once evidence: a repeated call (idempotent per operationId) takes the next free name. */
-const nextName = (context: Context, base: string): string => {
-  for (let index = 0; index < 1000; index++) {
-    const name = index === 0 ? `${base}.json` : `${base}-${index}.json`;
-    if (!fs.existsSync(path.join(context.runDir, name))) return name;
-  }
-  throw new SeamGap("evidence-names-exhausted");
+/** The drain outcome's records (absent: the drain never wrote one). */
+const drainOutcome = (context: Context): { dispositions: Array<{ id: string; disposition: string }>; stopped: string[] } | undefined => {
+  const file = path.join(context.runDir, OUTCOME);
+  if (!fs.existsSync(file)) return undefined;
+  let value: Record<string, unknown>;
+  try { value = JSON.parse(readOwned(file, context.uid, 64 * 1024 * 1024, { mode: 0o600 }, "outcome-unreadable").toString("utf8")) as Record<string, unknown>; }
+  catch { throw new SeamGap("outcome-unreadable"); }
+  if (value.operationId !== context.request.operationId || value.run !== context.request.run) throw new SeamGap("outcome-invalid");
+  const dispositions = Array.isArray(value.dispositions) ? value.dispositions as Array<{ id: string; disposition: string }> : [];
+  const stopped = Array.isArray(value.stoppedActors) ? (value.stoppedActors as Array<{ id: string }>).map(entry => entry.id) : [];
+  return { dispositions, stopped };
 };
 
 const drainUndo = async (context: Context): Promise<number> => {
   const inputs = context.request.inputs;
-  const sha = inputs.refusedReceiptSha256;
-  if (Object.keys(inputs).join(",") !== "refusedReceiptSha256" || (sha !== null && (typeof sha !== "string" || !HEX64.test(sha)))) {
+  const sha = inputs.drainReceiptSha256;
+  const attempt = inputs.attempt;
+  if (Object.keys(inputs).sort().join(",") !== "attempt,drainReceiptSha256,operationId" || !Number.isSafeInteger(attempt) ||
+    (attempt as number) < 1 || (attempt as number) > 999 || (sha !== null && (typeof sha !== "string" || !HEX64.test(sha)))) {
     throw new SeamGap("inputs-invalid");
   }
-  // null only on the operator path (a SIGKILLed seam wrote no receipt): the intent file alone names the operation.
-  if (sha !== null) verifyRefusedReceipt(context, sha);
+  if (sha !== null) verifyDrainReceipt(context, sha);
+  // null: only the operator path, after a drain that left no receipt (contract rev 4 §2).
+  else if (fs.existsSync(path.join(context.runDir, "receipts", "drain.json"))) throw new SeamGap("drain-receipt-exists");
+  const names = { intent: `fabric-v2-drain-undo-${attempt}-intent.json`, outcome: `fabric-v2-drain-undo-${attempt}-outcome.json` };
+  // Idempotent per (operationId, phase, attempt): a finished attempt reprints its receipt; a crashed one is UNKNOWN.
+  if (fs.existsSync(path.join(context.runDir, names.outcome))) {
+    const done = JSON.parse(readOwned(path.join(context.runDir, names.outcome), context.uid, 64 * 1024 * 1024, { mode: 0o600 },
+      "undo-outcome-unreadable").toString("utf8")) as Record<string, unknown>;
+    if (done.operationId !== context.request.operationId || typeof done.receipt !== "string") throw new SeamGap("undo-outcome-invalid");
+    context.io.stdout(done.receipt);
+    return 0;
+  }
+  if (fs.existsSync(path.join(context.runDir, names.intent))) throw new SeamGap("undo-attempt-unfinished");
   const intent = readIntent(context);
-  if (sha === null && !intent) throw new SeamGap("intent-missing");
-  const undone = await undoAndProbe(context, intent?.operationId, "drain-undo");
-  const observed = { sessionId: context.request.sessionId, inputsFenced: undone.inputsFenced, admissionRestored: undone.admissionRestored };
-  evidence(context, nextName(context, "fabric-v2-drain-undo-evidence"), {
-    schema: "fabric-v2-drain-undo-evidence-v1", operationId: intent?.operationId ?? null, refusedReceiptSha256: sha, observed,
-    measured: { canary: { inboxOpen: undone.inboxOpen, inputsFenced: undone.inputsFenced } },
-    asserted: { undo: undone.undo?.undo ?? null, probe: undone.probe ?? null },
-    restartRequired: undone.restartRequired, attempts: undone.attempts,
-  });
-  context.io.stdout(receipt(context.request, "pass", observed));
+  const outcome = drainOutcome(context);
+  const undoIntentSha256 = evidence(context, names.intent, { schema: "fabric-v2-drain-undo-intent-v2", attempt, drainReceiptSha256: sha,
+    generation: intent?.generation ?? null, measured: { startedAt: new Date().toISOString(), interpreter: interpreterIdentity(),
+      drainIntentPresent: intent !== undefined } });
+  let observed: { sessionId: string; inputsFenced: boolean; admissionRestored: boolean };
+  let detail: Record<string, unknown>;
+  if (!intent) {
+    // r2 N3: the intent is written O_EXCL before `begin`; without it this operation never fenced anything.
+    observed = { sessionId: context.request.sessionId, inputsFenced: false, admissionRestored: true };
+    detail = { basis: "measured", neverFenced: true };
+  } else {
+    const undone = await undoAndProbe(context, intent.generation, "drain-undo", outcome?.stopped ?? []);
+    observed = { sessionId: context.request.sessionId, inputsFenced: undone.inputsFenced, admissionRestored: undone.admissionRestored };
+    detail = { measured: { canary: { inboxOpen: undone.inboxOpen, inputsFenced: undone.inputsFenced } },
+      asserted: { undo: undone.undo?.undo ?? null, probe: undone.probe ?? null },
+      restartRequired: undone.restartRequired, actorsRestored: undone.actorsRestored, attempts: undone.attempts };
+  }
+  const passed = !observed.inputsFenced && observed.admissionRestored;
+  const text = receipt(context.request, passed ? "pass" : "refused", observed);
+  evidence(context, names.outcome, { schema: "fabric-v2-drain-undo-outcome-v2", attempt, result: passed ? "pass" : "refused",
+    intentSha256: undoIntentSha256, observed, receipt: text, ...detail });
+  context.io.stdout(text);
   return 0;
 };
 
 /** drain-recheck (after `fence`, v1 terminal): the session-pending inventory, filesystem only. */
 const recheck = (context: Context): number => {
-  const files = inventory(context);
-  const totals = files?.totals ?? { actors: null, followUps: null, queued: null, inFlight: null, settledWindows: null,
-    pendingDeliveryOutcomes: null, childCompletionEntries: null };
+  readIntent(context);                                    // the run's operationId, when a drain recorded one
+  const intentSha256 = evidence(context, "fabric-v2-drain-recheck-intent.json", { schema: "fabric-v2-drain-recheck-intent-v1",
+    measured: { meshRoot: context.meshRoot, startedAt: new Date().toISOString() } });
+  // The in-process `pi-fabric session pending`: exit 0 is complete; exit 1 is complete:false; a throw is any other exit.
+  const files = inventorySessionPending(context.meshRoot, context.request.sessionId);
+  const totals = files.totals;
+  // r2 N4: a row is stopped only when stopped for good (explicit or directive) AND it is in the drain's
+  // disposition list. A host-exit stop revives on a same-session start, so it is NOT stopped.
+  const known = new Set((drainOutcome(context)?.dispositions ?? []).map(entry => entry.id));
+  const stoppedForGood = (actor: { id: string; status: string; stopReason: string | null }): boolean =>
+    actor.status === "stopped" && (actor.stopReason === "explicit" || actor.stopReason === "directive") && known.has(actor.id);
   const observed = {
     sessionId: context.request.sessionId,
-    complete: files?.complete === true,
+    complete: files.complete,
     totals: { actors: totals.actors, followUps: totals.followUps, queued: totals.queued, inFlight: totals.inFlight,
       settledWindows: totals.settledWindows, pendingDeliveryOutcomes: totals.pendingDeliveryOutcomes, childCompletionEntries: totals.childCompletionEntries },
-    // Unknown counts as not stopped: an unreadable inventory is one row we could not see.
-    actorsNotStopped: files ? files.actors.filter(actor => actor.status !== "stopped").length : 1,
+    actorsNotStopped: files.actors.filter(actor => !stoppedForGood(actor)).length,
   };
-  evidence(context, "fabric-v2-drain-recheck-evidence.json", {
-    schema: "fabric-v2-drain-recheck-evidence-v1", observed, basis: "measured", inventory: files ?? null,
+  const passed = observed.complete && Number.isSafeInteger(totals.actors) && (totals.actors ?? -1) >= 0 && observed.actorsNotStopped === 0 &&
+    (["followUps", "queued", "inFlight", "settledWindows", "pendingDeliveryOutcomes", "childCompletionEntries"] as const).every(key => totals[key] === 0);
+  evidence(context, "fabric-v2-drain-recheck-outcome.json", {
+    schema: "fabric-v2-drain-recheck-outcome-v1", result: passed ? "pass" : "refused", intentSha256, observed, basis: "measured", inventory: files,
     completions: scanCompletions(context.meshRoot, `session:${context.request.sessionId}`),
   });
-  context.io.stdout(receipt(context.request, "pass", observed));
+  context.io.stdout(receipt(context.request, passed ? "pass" : "refused", observed));
   return 0;
 };
 
 /** Stage 2 builds the kubectl-exec path (ruling 10-25); until then the raw Pod is never reported drained. */
 const resumeDrainUnavailable = (runDir: string, request: SeamRequest, io: SeamIo): number => {
   const pod = request.inputs.pod as Record<string, unknown> | undefined;
-  if (Object.keys(request.inputs).join(",") !== "pod" || typeof pod !== "object" || pod === null ||
+  if (Object.keys(request.inputs).sort().join(",") !== "operationId,pod" || typeof pod !== "object" || pod === null ||
     Object.keys(pod).sort().join(",") !== "name,uid" || typeof pod.uid !== "string" || typeof pod.name !== "string") {
     throw new SeamGap("inputs-invalid");
   }
   const observed = { podUid: pod.uid, inputsFenced: false, exited: false };
-  writeOnce(runDir, "fabric-v2-resume-drain-evidence.json", json({ schema: "fabric-v2-resume-drain-evidence-v1", owner: OWNER,
-    run: request.run, sessionId: request.sessionId, result: "unavailable", reason: "resume-drain-channel-not-built", observed }));
-  io.stdout(receipt(request, "pass", observed));
+  writeOnce(runDir, "fabric-v2-resume-drain-outcome.json", json({ schema: "fabric-v2-resume-drain-outcome-v1", owner: OWNER,
+    run: request.run, sessionId: request.sessionId, operationId: request.operationId, result: "refused",
+    reason: "resume-drain-channel-not-built", observed }));
+  io.stdout(receipt(request, "refused", observed));
   return 0;
 };
 

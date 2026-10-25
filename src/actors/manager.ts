@@ -629,9 +629,18 @@ export const ACTOR_STOPPED_ALARM_AFTER_MS = 10 * 60 * 1000;
 export const ACTOR_UNKNOWN_BLOCK_ALARM_AFTER_MS = 30 * 60 * 1000;
 /** An in-flight run is stuck past max(this, 2x the actor's p95 run time) when its worker is gone. */
 export const ACTOR_RUN_STUCK_MIN_MS = 30 * 60 * 1000;
-/** Bounds of an actor's dead-letter file (smarty-dev#816): past them, the oldest entries drop, counted. */
+/**
+ * Bounds of an actor's dead-letter file (smarty-dev#816): past either, ordinary routed entries are trimmed, oldest first,
+ * to 90% of both; each drop is counted and alarmed. Filter-held entries and accepted requeue spills are never trimmed.
+ */
 export const ACTOR_DEAD_LETTER_MAX_ENTRIES = 10_000;
 export const ACTOR_DEAD_LETTER_MAX_BYTES = 50 * 1024 * 1024;
+/**
+ * pi-fabric#1572 round 9 (fabric-store P2): requeue spills are accepted only up to the trim target, 90% of both bounds
+ * (9,000 entries, 45 MiB), so ordinary routed arrivals always keep 10% of the file as headroom.
+ */
+export const ACTOR_DEAD_LETTER_SPILL_MAX_ENTRIES = Math.floor(ACTOR_DEAD_LETTER_MAX_ENTRIES * 0.9);
+export const ACTOR_DEAD_LETTER_SPILL_MAX_BYTES = Math.floor(ACTOR_DEAD_LETTER_MAX_BYTES * 0.9);
 /** The stale-entry archive keeps one rotated generation and drops its older backup. */
 export const ACTOR_DEAD_LETTER_ARCHIVE_MAX_BYTES = 1 * 1024 * 1024;
 /** At most one owner alarm per actor per hour while its events dead-letter. */
@@ -787,6 +796,11 @@ type ActorDeadLetter = { at: number; source: string; event: MeshEvent; coalesced
    */
   heldBy?: { reason: "activationFilter"; ruleId: string; itemId: string; movedAt: number; raw?: true };
   payload?: unknown; sender?: FabricMessageSender };
+/**
+ * pi-fabric#1572 round 9 (fabric-store P1): one requeueArchived call's view of the dead-letter file. It is read once, at
+ * the call's first spill; each accepted spill then adds to the running count and byte size, so no spill re-reads the file.
+ */
+type RequeueSpillBudget = { count?: number; bytes?: number; tornTail?: boolean };
 /** A stop archive's file name in <actor dir>/stopped-queues/ (smarty-dev#16416). */
 const STOP_ARCHIVE_NAME = /^[0-9TZ]+-[0-9a-f]{12}\.jsonl$/;
 /** One line of a stop archive (smarty-dev#16416; in-flight and settled: pi-fabric#1572 round 3). */
@@ -884,8 +898,8 @@ export class ActorManager {
   // smarty-dev#1065: callerless work past an actor's queue limit waits here, in order, instead of
   // holding the mesh cursor for every actor of this manager (or being lost in live mode).
   readonly #overflow = new Map<string, ActorQueueItem[]>();
-  // smarty-dev#816: entries in each actor's dead-letter file (read lazily), the oldest dropped
-  // by the bound, and when each actor last raised its dead-letter owner alarm.
+  // smarty-dev#816: entries in each actor's dead-letter file (read lazily), the ordinary entries
+  // the bound trimmed, and when each actor last raised each kind of dead-letter owner alarm.
   readonly #deadLetters = new Map<string, number>();
   /** Active backlog identities, bounded by its cap, independent of the recent-delivery LRU. */
   readonly #deadLetterEventIds = new Map<string, Set<string>>();
@@ -4007,6 +4021,8 @@ export class ActorManager {
    * still blocks a plain remove and a later call offers it again. The target's queue is checkpointed durably BEFORE the
    * batch's ledger lines are written and synced: a crash between the two can only offer an item twice, never record
    * one that is not queued. A queued caller's ask, never fed again, is recorded as skipped (round 7 P3).
+   * Round 9: past the queue and overflow a routed item spills to the dead-letter file as a protected entry, only while
+   * the file stays within 90% of both its bounds; the file is read once per call, not once per spill.
    */
   async requeueArchived(id: string, archive: string, beforeCommit?: (id: string) => void): Promise<FabricActorRequeueResult> {
     const actor = this.#requireOwnedActiveActor(id);
@@ -4043,6 +4059,8 @@ export class ActorManager {
     const entries: Array<{ itemId: string; outcome: RequeueLedgerOutcome; reason?: string }> = [];
     let refusedAt: string | undefined;
     let meshLanded = false;
+    // Round 9 P1: this call's one view of the dead-letter file; spills add to it instead of re-reading the file.
+    const spillBudget: RequeueSpillBudget = {};
     try {
       for (const line of lines.slice(1)) {
         const offer = this.#archivedOffer(line);
@@ -4083,7 +4101,7 @@ export class ActorManager {
                 ...(offer.coalesced?.length ? { coalesced: offer.coalesced } : {}),
                 ...(offer.activation ? { meshActivation: offer.activation } : {}),
                 ...(offer.omittedBefore ? { omittedBefore: offer.omittedBefore } : {}),
-                archived: true, deferDrain: true, holdWhenFull: true }
+                archived: true, deferDrain: true, holdWhenFull: true, requeueSpill: spillBudget }
               : { ownershipChecked: true, sender: offer.sender ?? null, ...(offer.images?.length ? { images: offer.images } : {}), archived: true,
                 deferDrain: true, holdWhenFull: true });
           } catch (error) {
@@ -5508,6 +5526,11 @@ export class ActorManager {
       ownershipChecked?: boolean;
       /** A full queue and overflow reject the item instead of recording it dropped. */
       holdWhenFull?: boolean;
+      /**
+       * requeueArchived's per-call budget (pi-fabric#1572 round 9): past the queue and overflow, a routed event is kept
+       * as a protected requeue spill, checked against this running count and size instead of re-reading the file.
+       */
+      requeueSpill?: RequeueSpillBudget;
       /** Host-owned deterministic child completion id and write-ahead handoff. */
       id?: string;
       deferDrain?: boolean;
@@ -5695,7 +5718,7 @@ export class ActorManager {
       (actor.queue.length >= this.meshConfig.actorQueueLimit && (this.#overflow.get(actor.id)?.length ?? 0) >= this.#overflowCap()))) {
       // smarty-dev#816: a sick actor's full queue never holds the shared host cursor. Its further
       // routed events wait in its own dead-letter file, behind any already there, so order holds.
-      this.#appendDeadLetter(actor, source, payload as MeshEvent, options.holdWhenFull, item.coalesced,
+      this.#appendDeadLetter(actor, source, payload as MeshEvent, options.requeueSpill, item.coalesced,
         item.activation.kind === "mesh" ? item.activation : undefined, item.omittedBefore);
       this.#replayDeadLetters(actor);
       return item;
@@ -8171,12 +8194,15 @@ export class ActorManager {
       .filter((id): id is string => typeof id === "string");
   }
 
-  #noticeDeadLetter(actor: ManagedActor, text: string, data: Record<string, unknown>): void {
+  // At most one notice per actor and kind per ACTOR_DEAD_LETTER_ALARM_MS. A trim drop has its own kind, so an earlier
+  // backlog notice never silences it (pi-fabric#1572 round 9).
+  #noticeDeadLetter(actor: ManagedActor, text: string, data: Record<string, unknown>, kind: "backlog" | "dropped" = "backlog"): void {
     if (this.#closing) return;
     const now = Date.now();
-    const last = this.#deadLetterAlarms.get(actor.id);
+    const key = kind === "backlog" ? actor.id : `${actor.id}\0${kind}`;
+    const last = this.#deadLetterAlarms.get(key);
     if (last !== undefined && now - last < ACTOR_DEAD_LETTER_ALARM_MS) return;
-    this.#deadLetterAlarms.set(actor.id, now);
+    this.#deadLetterAlarms.set(key, now);
     const notice: FabricActorMessage = {
       id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
       createdAt: now, action: "message", text, data,
@@ -8262,11 +8288,28 @@ export class ActorManager {
     return { rotated: rotate, droppedBytes, archived: lines.length - start };
   }
 
-  // Keyed entries replace their prior dead letter; unkeyed entries stay append-only. Past the
-  // bound the oldest entries drop (to 90%, so a flood rewrites once per tenth), each drop counted
-  // on the actor. A write failure is a checkpoint
-  // failure, as for the queue file: the event stays in the mesh.
-  #appendDeadLetter(actor: ManagedActor, source: string, event: MeshEvent, holdWhenFull = false,
+  /** The dead-letter file's size, and whether a crash left its last line torn (no final newline), from one open. */
+  #deadLetterTail(file: string): { size: number; torn: boolean } {
+    let fd: number;
+    try { fd = fs.openSync(file, "r"); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { size: 0, torn: false };
+      throw error;
+    }
+    try {
+      const size = fs.fstatSync(fd).size;
+      if (size === 0) return { size, torn: false };
+      const last = Buffer.alloc(1);
+      fs.readSync(fd, last, 0, 1, size - 1);
+      return { size, torn: last[0] !== 0x0a };
+    } finally { fs.closeSync(fd); }
+  }
+
+  // Keyed entries replace their prior dead letter; unkeyed entries stay append-only. Past either bound,
+  // ordinary routed entries are trimmed oldest first to 90% (so a flood rewrites once per tenth), each
+  // drop counted on the actor and alarmed. Filter-held entries and accepted requeue spills are never
+  // trimmed, and spills stop at that 90% (ACTOR_DEAD_LETTER_SPILL_MAX_*), so ordinary arrivals keep 10%
+  // headroom. A write failure is a checkpoint failure, as for the queue file: the event stays in the mesh.
+  #appendDeadLetter(actor: ManagedActor, source: string, event: MeshEvent, spill?: RequeueSpillBudget,
     coalesced?: CoalescedMeshEvent[], activation?: MeshActivationFacts, omittedBefore?: OmittedMeshHistory): void {
     const file = this.#deadLetterFile(actor.id);
     let count = this.#deadLetterCount(actor.id);
@@ -8275,31 +8318,50 @@ export class ActorManager {
       ...(activation ? { activation: this.#meshActivationFacts(activation) } : {}),
       ...(coalesced?.length ? { coalesced } : {}),
       ...(omittedBefore ? { omittedBefore } : {}),
-      ...(actor.batchWindowMs! > 0 ? { batchQueued: true } : {}), ...(holdWhenFull ? { requeueSpill: true } : {}) };
-    // Round 8 N1: requeue must refuse BEFORE a spill could trigger the lossy 90% trim.
-    // Persisted protection below also prevents later ordinary arrivals trimming accepted spills.
-    if (holdWhenFull) {
-      count = this.#readDeadLetters(actor.id).length;
-      const bytes = fs.existsSync(file) ? fs.statSync(file).size : 0;
-      if (count + 1 > ACTOR_DEAD_LETTER_MAX_ENTRIES || bytes + Buffer.byteLength(JSON.stringify(entry)) + 1 > ACTOR_DEAD_LETTER_MAX_BYTES) {
-        throw new Error(`Fabric actor dead-letter capacity reached for ${actor.name} (${ACTOR_DEAD_LETTER_MAX_ENTRIES} entries or ${ACTOR_DEAD_LETTER_MAX_BYTES} bytes); archived item stays retryable`);
+      ...(actor.batchWindowMs! > 0 ? { batchQueued: true } : {}), ...(spill ? { requeueSpill: true } : {}) };
+    const line = `${JSON.stringify(entry)}\n`;
+    // Round 8 N1: requeue must refuse BEFORE a spill could reach the lossy trim. Round 9 P1: the file is
+    // read once per requeueArchived call, at its first spill; every later spill checks the running count
+    // and byte size that call keeps, so a large archive is no longer quadratic.
+    if (spill) {
+      if (spill.count === undefined || spill.bytes === undefined) {
+        const tail = this.#deadLetterTail(file);
+        spill.count = this.#readDeadLetters(actor.id).length;
+        spill.bytes = tail.size;
+        spill.tornTail = tail.torn;
+        this.#deadLetters.set(actor.id, count = spill.count);
+      }
+      const added = Buffer.byteLength(line) + (spill.tornTail ? 1 : 0);
+      if (spill.count + 1 > ACTOR_DEAD_LETTER_SPILL_MAX_ENTRIES || spill.bytes + added > ACTOR_DEAD_LETTER_SPILL_MAX_BYTES) {
+        throw new Error(`Fabric actor dead-letter capacity reached for ${actor.name}: requeue spills stop at ` +
+          `${ACTOR_DEAD_LETTER_SPILL_MAX_ENTRIES} entries or ${ACTOR_DEAD_LETTER_SPILL_MAX_BYTES} bytes (90% of its bound), so ordinary ` +
+          `routed events keep 10% headroom; archived item stays retryable`);
       }
     }
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      if (!holdWhenFull && this.#meshEnqueueOptions(actor, event).coalesceKey !== undefined) {
+      if (!spill && this.#meshEnqueueOptions(actor, event).coalesceKey !== undefined) {
         const entries = this.#coalesceDeadLetters(actor, [...this.#readDeadLetters(actor.id), entry]);
         this.#writeDeadLetters(actor.id, entries);
         count = entries.length;
       } else {
-        fs.appendFileSync(file, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+        // Round 9 (fabric-store P2, probe T): after a crash tore the last line, start this entry on a fresh
+        // line. The torn bytes stay one unreadable line, as before, and never swallow the appended entry.
+        const torn = spill ? spill.tornTail === true : this.#deadLetterTail(file).torn;
+        const text = torn ? `\n${line}` : line;
+        fs.appendFileSync(file, text, { mode: 0o600 });
+        if (spill) {
+          spill.count! += 1;
+          spill.bytes! += Buffer.byteLength(text);
+          spill.tornTail = false;
+        }
         this.#deadLetters.set(actor.id, ++count);
         this.#deadLetterEventIds.get(actor.id)!.add(event.id);
       }
       if (count > ACTOR_DEAD_LETTER_MAX_ENTRIES || fs.statSync(file).size > ACTOR_DEAD_LETTER_MAX_BYTES) {
         const all = this.#readDeadLetters(actor.id);
-        // Filter-held work and accepted requeue spills are never trimmed. Requeue's preflight
-        // keeps its protected additions within both caps; ordinary routed backlog alone may drop.
+        // Filter-held work and accepted requeue spills are never trimmed. Requeue's preflight keeps
+        // spills within 90% of both bounds; ordinary routed backlog alone may drop, oldest first.
         const heldEntries = all.filter(entry => entry.heldBy || entry.requeueSpill);
         const entries = all.filter(entry => !entry.heldBy && !entry.requeueSpill);
         const size = (entry: ActorDeadLetter) => Buffer.byteLength(JSON.stringify(entry)) + 1;
@@ -8314,12 +8376,21 @@ export class ActorManager {
         count = kept.size;
         const total = (this.#deadLettersDropped.get(actor.id) ?? 0) + dropped;
         this.#deadLettersDropped.set(actor.id, total);
+        // Round 9 (fabric-store P2): say what was dropped. Ordinary entries go oldest first, so while
+        // protected entries hold the space that can include the event that just arrived.
+        const arrivalDropped = ![...kept].some(left => left.event.id === event.id || left.coalesced?.some(record => record.id === event.id));
+        const text = `Fabric host notice: actor ${actor.name} dropped ${dropped} ordinary dead-lettered event(s), oldest first` +
+          `${arrivalDropped ? ", including the event that just arrived" : ""}. Its dead-letter file is bounded at ` +
+          `${ACTOR_DEAD_LETTER_MAX_ENTRIES} entries and ${ACTOR_DEAD_LETTER_MAX_BYTES} bytes and trims to 90%` +
+          `${heldEntries.length ? `; ${heldEntries.length} protected entries (accepted requeue spills and filter-held work) hold part of that space and are never dropped` : ""}` +
+          ` (${total} dropped since start).`;
+        const data = { deadLetterDropped: dropped, deadLetterDroppedTotal: total,
+          ...(heldEntries.length ? { deadLetterProtected: heldEntries.length } : {}), ...(arrivalDropped ? { deadLetterArrivalDropped: true } : {}) };
         this.#recordMessage(actor, {
           id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "out", source: "fabric-host",
-          createdAt: Date.now(),
-          error: `Dropped the ${dropped} oldest dead-lettered events: the dead-letter file is bounded at ${ACTOR_DEAD_LETTER_MAX_ENTRIES} entries and ${ACTOR_DEAD_LETTER_MAX_BYTES} bytes (${total} dropped since start)`,
-          data: { deadLetterDropped: dropped, deadLetterDroppedTotal: total },
+          createdAt: Date.now(), error: text, data,
         });
+        if (dropped > 0) this.#noticeDeadLetter(actor, text, { reason: "dead_letter_dropped", ...data }, "dropped");
       }
     } catch {
       throw new ActorQueueCheckpointError(actor);

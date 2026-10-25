@@ -4,7 +4,8 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
-import { ActorManager, ACTOR_DEAD_LETTER_MAX_ENTRIES, ACTOR_DEAD_LETTER_MAX_BYTES } from "../src/actors/manager.js";
+import { ActorManager, ACTOR_DEAD_LETTER_MAX_ENTRIES, ACTOR_DEAD_LETTER_MAX_BYTES, ACTOR_DEAD_LETTER_SPILL_MAX_ENTRIES,
+  ACTOR_DEAD_LETTER_SPILL_MAX_BYTES } from "../src/actors/manager.js";
 import * as actorTypes from "../src/actors/types.js";
 import type { FabricActorActivationFilter, FabricActorInfo } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -994,6 +995,7 @@ describe("queued-work guard, round 7: the requeue ledger records only queued wor
     await expect(actors.remove(old.id)).resolves.toMatchObject({ removed: true });
   }, 360_000);
 
+  // Round 9 (fabric-store P2): spills stop at the 90% trim target of both bounds, so seed against that cap.
   it.each(["entries", "bytes"] as const)("N1: dead-letter %s capacity refuses requeue spills before trim and keeps accepted spills", async (cap) => {
     const { root, mesh, actors, old, fresh, archive, ledger } = await archiveAndSuccessor(8, true);
     await actors.setActivationFilter(fresh.id, WAIT_FILTER);
@@ -1005,7 +1007,7 @@ describe("queued-work guard, round 7: the requeue ledger records only queued wor
       heldBy: { reason: "activationFilter", ruleId: "wait", itemId: `held-${index}`, movedAt: Date.now() } });
     let seed: string;
     if (cap === "entries") {
-      seed = Array.from({ length: ACTOR_DEAD_LETTER_MAX_ENTRIES - 1 }, (_, index) => JSON.stringify(held(index)) + "\n").join("");
+      seed = Array.from({ length: ACTOR_DEAD_LETTER_SPILL_MAX_ENTRIES - 1 }, (_, index) => JSON.stringify(held(index)) + "\n").join("");
     } else {
       // Leave room for exactly one small spill, not two; use real serialized bytes, not a mocked stat. The spill
       // carries the archived item's mesh acceptance facts, as #1574's dead letters do.
@@ -1013,7 +1015,7 @@ describe("queued-work guard, round 7: the requeue ledger records only queued wor
       const spill = { at: Date.now(), source: `mesh:${TOPIC}`, event, activation: { kind, id, source, sequence, createdAt, topic }, requeueSpill: true };
       const room = Buffer.byteLength(JSON.stringify(spill)) + 1;
       const entry = held(0);
-      entry.event.data.padding = "x".repeat(ACTOR_DEAD_LETTER_MAX_BYTES - room - Buffer.byteLength(JSON.stringify(entry)) - 1);
+      entry.event.data.padding = "x".repeat(ACTOR_DEAD_LETTER_SPILL_MAX_BYTES - room - Buffer.byteLength(JSON.stringify(entry)) - 1);
       seed = JSON.stringify(entry) + "\n";
     }
     fs.writeFileSync(deadLetterFile(root, fresh.id), seed);
@@ -1032,18 +1034,37 @@ describe("queued-work guard, round 7: the requeue ledger records only queued wor
     expect(ledgerLines(ledger).map(line => line.outcome)).toEqual(["requeued", "requeued", "notQueued", "notQueued"]);
     expect(ledgerLines(ledger).filter(line => line.outcome === "notQueued").map(line => ({ itemId: line.itemId, reason: line.reason })))
       .toEqual(first.notQueued.map(({ itemId, reason }) => ({ itemId, reason })));
+    // The 10% above the spill cap is headroom for ordinary routed events: fill it, so the next arrival must trim.
+    if (cap === "entries") {
+      fs.appendFileSync(file, Array.from({ length: ACTOR_DEAD_LETTER_MAX_ENTRIES - ACTOR_DEAD_LETTER_SPILL_MAX_ENTRIES }, (_, index) =>
+        JSON.stringify({ at: Date.now(), source: `mesh:${TOPIC}`, event: { ...event, id: `ordinary-${index}` } }) + "\n").join(""));
+    } else {
+      const ordinary = { at: Date.now(), source: `mesh:${TOPIC}`, event: { ...event, id: "ordinary-0", data: { padding: "" } } };
+      ordinary.event.data.padding = "x".repeat(ACTOR_DEAD_LETTER_MAX_BYTES - fs.statSync(file).size - Buffer.byteLength(JSON.stringify(ordinary)) - 1);
+      fs.appendFileSync(file, JSON.stringify(ordinary) + "\n");
+    }
     // Refused ledger lines never consume archive items, even on a repeated call at capacity.
     await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 0, alreadyRequeued: 2,
       notQueued: first.notQueued });
     await expect(actors.remove(old.id)).rejects.toMatchObject({ code: QUEUED_WORK, counts: { archived: 1 } });
-    // A later ordinary routed arrival may trim itself, never the already-ledgered spill.
+    // A later ordinary routed arrival trims ordinary entries, itself included, never the already-ledgered spill, and alarms.
     await actors.setTopics(fresh.id, [TOPIC]);
-    await publish(mesh, 99999);
-    await waitFor(() => actors.messages(fresh.id, 100).some(message =>
-      Number((message.data as { deadLetterDropped?: number } | undefined)?.deadLetterDropped) > 0));
+    const arrival = await publish(mesh, 99999);
+    const dropAlarm = () => actors.messages(fresh.id, 200).find(message => (message.data as { reason?: string } | undefined)?.reason === "dead_letter_dropped");
+    await waitFor(() => dropAlarm() !== undefined);
     expect(deadLetterLines(root, fresh.id).some(line => JSON.parse(line).event.id === spillEvent)).toBe(true);
+    expect(deadLetterLines(root, fresh.id).some(line => JSON.parse(line).event.id === arrival.id)).toBe(false);
     expect(fs.statSync(file).size).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_MAX_BYTES);
     expect(deadLetterLines(root, fresh.id).length).toBeLessThanOrEqual(ACTOR_DEAD_LETTER_MAX_ENTRIES);
+    const ordinaryDropped = cap === "entries" ? ACTOR_DEAD_LETTER_MAX_ENTRIES - ACTOR_DEAD_LETTER_SPILL_MAX_ENTRIES + 1 : 2;
+    expect(dropAlarm()!.data).toMatchObject({ reason: "dead_letter_dropped", deadLetterDropped: ordinaryDropped,
+      deadLetterProtected: cap === "entries" ? ACTOR_DEAD_LETTER_SPILL_MAX_ENTRIES : 2, deadLetterArrivalDropped: true });
+    expect(dropAlarm()!.text).toContain(`dropped ${ordinaryDropped} ordinary dead-lettered event(s), oldest first, including the event that just arrived`);
+    expect(dropAlarm()!.text).not.toMatch(/Dropped the \d+ oldest/);
+    // The same drop reaches the owner as an actor.alarm on ops.owner.
+    await waitFor(() => mesh.read({ after: 0, topic: "ops.owner", limit: 1_000 }).some(alarm => alarm.kind === "actor.alarm" &&
+      (alarm.data as { reason?: string; actorId?: string } | undefined)?.reason === "dead_letter_dropped" &&
+      (alarm.data as { actorId?: string }).actorId === fresh.id));
   }, 120_000);
 
   // fabric-store P2: the queue checkpoint (and a routed event's dead-letter spill) is synced before any ledger line is written.
@@ -1111,6 +1132,67 @@ describe("queued-work guard, round 7: the requeue ledger records only queued wor
     expect(actors.status(old.id).status).toBe("stopped");
     await expect(actors.remove(old.id, { dropQueued: true })).resolves.toMatchObject({ removed: true });
   }, 30_000);
+
+  // Round 9 (fabric-store P1, probe Q): round 8 re-read the whole dead-letter file for every spill, inside a loop with no
+  // await, so 2,000 spills took 71.5 s on Ryzen 1 (517 s for 4,000) with the event loop blocked. The file is now read once
+  // per call. The read count is the host-independent check (round 8: 2,001 reads). TIMING_BOUND_MS is the time guard.
+  // Measured with this test on Ryzen 1 at load average ~120 on 8 cores: the fix took 10.7 s (1 read); round 8 (c983410a)
+  // took 112.7 s (2,001 reads), and fabric-store measured 71.5 s. 30 s keeps ~3x margin over the fix on a badly
+  // overloaded host, and the quadratic cost still fails it by more than 2x.
+  const TIMING_BOUND_MS = 30_000;
+  it("P1 (round 9): 2,000 archived dead letters spill with one dead-letter read and in well under the old quadratic time", async () => {
+    const { root, mesh, actors } = setup(1);
+    const old = await actors.create({ name: "spill-old", instructions: "Supervise.", topics: [TOPIC], coalesce: false });
+    const releaseOld = await holdWorker(actors, root, old.id);
+    const queued = await publish(mesh, 0);
+    await waitFor(() => actors.status(old.id).queued === 1);
+    // 2,000 routed dead letters in the old actor's file; its stop archives the file as it stands.
+    const count = 2_000;
+    fs.writeFileSync(deadLetterFile(root, old.id), Array.from({ length: count }, (_, index) => JSON.stringify({ at: Date.now(),
+      source: `mesh:${TOPIC}`, event: { ...queued, id: `dead-${index}`, sequence: queued.sequence + 1 + index, data: { marker: `dead-${index}` } } }) + "\n").join(""));
+    const { archive, counts } = stopArchive(await actors.stop(old.id, undefined, false, "actors.stop", { dropQueued: true }));
+    expect(counts).toMatchObject({ inFlight: 1, queued: 1, deadLetter: count });
+    releaseOld();
+    await waitFor(() => actors.inFlightCount() === 0);
+    // A busy successor with one free slot: the archived in-flight item takes it, and every mesh item spills.
+    const fresh = await actors.create({ name: "spill-successor", instructions: "Supervise." });
+    await holdWorker(actors, root, fresh.id);
+    for (let index = 0; index < 8; index++) actors.tell(fresh.id, `successor ${index}`);
+    const file = deadLetterFile(root, fresh.id);
+    const realRead = fs.readFileSync as (...args: unknown[]) => unknown;
+    let reads = 0;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((...args: unknown[]) => {
+      if (path.resolve(String(args[0])) === path.resolve(file)) reads++;
+      return realRead(...args);
+    }) as typeof fs.readFileSync);
+    const started = performance.now();
+    let result: actorTypes.FabricActorRequeueResult;
+    try { result = await actors.requeueArchived(fresh.id, archive); } finally { vi.restoreAllMocks(); }
+    const elapsedMs = performance.now() - started;
+    console.info(`requeueArchived of ${count + 2} items (${count + 1} spills): ${Math.round(elapsedMs)} ms, ${reads} dead-letter read(s)`);
+    expect(result).toMatchObject({ requeued: count + 2, filtered: 0, superseded: 0, notQueued: [] });
+    expect(deadLetterLines(root, fresh.id)).toHaveLength(count + 1);
+    expect(deadLetterLines(root, fresh.id).every(line => (JSON.parse(line) as { requeueSpill?: true }).requeueSpill === true)).toBe(true);
+    expect(reads, `dead-letter reads; the requeue took ${Math.round(elapsedMs)} ms`).toBeLessThanOrEqual(2);
+    expect(elapsedMs).toBeLessThan(TIMING_BOUND_MS);
+  }, 300_000);
+
+  // Round 9 (fabric-store P2, probe T): a crash can leave the dead-letter file's last line torn. An append used to glue the
+  // next spill onto it, so a requeued item was in neither the queue nor the file. It now starts on a fresh line.
+  it("P2 (round 9): a torn last dead-letter line never swallows the next requeue spill", async () => {
+    const { root, actors, fresh, archive } = await archiveAndSuccessor(8, true);
+    const file = deadLetterFile(root, fresh.id);
+    const torn = `{"at":1,"source":"mesh:${TOPIC}","event":{"id":"torn`;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, torn);
+    await expect(actors.requeueArchived(fresh.id, archive)).resolves.toMatchObject({ requeued: 4, notQueued: [] });
+    const spilled = archiveLinesOf(archive).filter(line => line.item?.source?.startsWith("mesh:")).map(line => (line.item!.payload as MeshEvent).id);
+    expect(spilled).toHaveLength(3);
+    const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+    // The torn bytes stay one unreadable line; every spilled event is a whole entry after it.
+    expect(lines[0]).toBe(torn);
+    expect(lines.slice(1).map(line => (JSON.parse(line) as { event: MeshEvent }).event.id)).toEqual(spilled);
+  }, 60_000);
 });
 
 // pi-fabric#1572 round 5 (fabric-store N4): a plain remove of a LIVE actor never drops its queue or its callerless item in

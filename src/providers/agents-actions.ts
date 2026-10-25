@@ -509,7 +509,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "requeueArchived",
-    description: "Feed a stop archive (the stoppedQueue.archive path a dropQueued stop returned) to a live, usually recreated, actor through its normal arrival path and activation filter, once per archived item. Idempotent: the actor records the item ids it was offered, so a second call adds nothing. Items a full actor cannot take come back in notQueued, unrecorded, so a later call offers them again.",
+    description: "Feed a stop archive (the stoppedQueue.archive path a dropQueued stop returned) to a live, usually recreated, actor through its normal arrival path and activation filter, once per archived item. Idempotent: the actor records the item ids it was offered, so a second call adds nothing. Items the actor cannot take (a full queue and overflow, and no dead-letter room within 90% of its bounds) come back in notQueued. Their notQueued ledger lines do not count as requeued, so a later call offers them again.",
     inputSchema: {
       type: "object",
       properties: {

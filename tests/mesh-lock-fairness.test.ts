@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { buildSync } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshLockTicket, meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
+import { MeshLockQueueExpiredError } from "../src/mesh/mesh-lock.js";
 import { MeshStore } from "../src/mesh/store.js";
 
 const roots: string[] = [];
@@ -164,19 +165,28 @@ describe("bounded FIFO mesh admission", () => {
     expect(fs.readdirSync(queue(root))).toEqual([]);
   });
 
-  it("falls back after 80% of the budget even behind a live stalled ticket", async () => {
+  it.each([0, 100])("%s ms budget: refuses before a live ticket can be judged stalled, without probing a free lock", async budgetMs => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     const root = scratch();
     const first = oldTicket(root, process.pid);
-    const store = new MeshStore(root, 65536, 100, { lockTimeoutMs: 100 });
-    const operation = vi.fn(() => "fallback");
-    const pending = store.exclusive(operation);
-    await vi.advanceTimersByTimeAsync(79);
+    const store = new MeshStore(root, 65536, 100, { lockProtocol: 1, lockTimeoutMs: budgetMs });
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    const operation = vi.fn(() => "barged");
+    const pending = store.exclusive(operation, budgetMs).catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(budgetMs * 0.8);
     expect(operation).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1);
-    await expect(pending).resolves.toBe("fallback");
-    expect(operation).toHaveBeenCalledOnce();
-    expect(fs.existsSync(first)).toBe(true); // admission fallback never reaps a live receipt
+    await vi.advanceTimersByTimeAsync(budgetMs * 0.2);
+    expect(await pending).toBeInstanceOf(MeshLockQueueExpiredError);
+    expect(await pending).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED",
+      attempts: 0, waitersAhead: 1, waitedMs: budgetMs, kind: "pre-lock", retryable: true });
+    expect(operation).not.toHaveBeenCalled();
+    expect(mkdir.mock.calls.filter(([file]) => String(file) === path.join(root, ".lock"))).toEqual([]);
+    expect(fs.readdirSync(queue(root))).toEqual([path.basename(first)]);
+    fs.unlinkSync(first);
+    await expect(store.exclusive(() => "eligible zero-budget head", 0)).resolves.toBe("eligible zero-budget head");
+    expect(fs.readdirSync(queue(root))).toEqual([]);
+    expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("a missing own ticket cannot strand a waiter", async () => {
@@ -208,6 +218,52 @@ describe("bounded FIFO mesh admission", () => {
     expect(fs.readdirSync(queue(root))).toEqual([]);
     expect(fs.existsSync(lock)).toBe(false);
   });
+
+  it("stress harness: four short-budget writers/waiters acquire within 1 s without losing writes", async () => {
+    const directory = scratch();
+    const output = path.join(directory, "short-store.mjs");
+    const committed = path.join(directory, "committed.json");
+    // Reuse the real multiprocess/critical-marker harness. Its default is 7 s; this adapter bounds every
+    // acquisition to 1 s and read-modify-writes one shared durable receipt list under the actual mesh lock.
+    buildSync({ stdin: { contents: `
+      import fs from "node:fs";
+      import { MeshStore as Store } from "./src/mesh/store.ts";
+      export { meshLockQueueDirectory } from "./src/mesh/lock-queue.ts";
+      const committed = ${JSON.stringify(committed)};
+      export class MeshStore extends Store {
+        sequence = 0;
+        constructor(root, maxEventBytes, maxReadEvents, options) {
+          super(root, maxEventBytes, maxReadEvents, { ...options, lockTimeoutMs: 1000 });
+        }
+        exclusive(operation) {
+          const id = process.pid + "/" + this.sequence++;
+          const started = performance.now();
+          return super.exclusive(() => {
+            const waitMs = performance.now() - started;
+            const result = operation();
+            const writes = fs.existsSync(committed) ? JSON.parse(fs.readFileSync(committed, "utf8")) : [];
+            writes.push({ id, pid: process.pid, waitMs });
+            fs.writeFileSync(committed, JSON.stringify(writes));
+            return result;
+          }, 1000);
+        }
+      }
+    `, resolveDir: process.cwd() }, bundle: true, platform: "node", format: "esm", outfile: output });
+    const { stdout } = await promisify(execFile)(process.execPath, ["scripts/stress-mesh-lock.mjs", `--module=${output}`,
+      "--n=4", "--rounds=2", "--load=0", "--cpuMs=2"],
+      { timeout: 85_000, env: { ...process.env, PI_FABRIC_LOCK_STATS: "1", PI_FABRIC_MESH_STATE_BACKEND: "file" } });
+    const report = JSON.parse(stdout);
+    expect(report).toMatchObject({ n: 4, acquisitions: 8, timeouts: 0, mutualExclusion: true, remainingTickets: 0 });
+    expect(report.lockStats).toMatchObject({ files: 4, acquisitions: 8, timeouts: 0 });
+    expect(report.waitMs.max).toBeLessThanOrEqual(1000);
+    const writes: { id: string; pid: number; waitMs: number }[] = JSON.parse(fs.readFileSync(committed, "utf8"));
+    const pids = [...new Set(writes.map(write => write.pid))];
+    expect(pids).toHaveLength(4);
+    expect(writes).toHaveLength(8);
+    expect(new Set(writes.map(write => write.id)).size).toBe(8);
+    expect(writes.map(write => write.id).sort()).toEqual(pids.flatMap(pid => Array.from({ length: 2 }, (_, index) => `${pid}/${index}`)).sort());
+    expect(Math.max(...writes.map(write => write.waitMs))).toBeLessThanOrEqual(1000);
+  }, 90_000);
 
   it.each([0, 4])("stress harness: 24 processes under CPU load, including %s legacy contenders", async (legacyN) => {
     const output = path.join(scratch(), "store.mjs");

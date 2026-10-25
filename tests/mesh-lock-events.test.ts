@@ -86,6 +86,7 @@ afterEach(() => {
   reset();
   vi.useRealTimers();
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   vi.restoreAllMocks();
   for (const root of temps.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -125,6 +126,7 @@ describe("lock events across processes", () => {
       fs.writeFileSync(opened, "");
       await until(peer);
       await store.exclusive(() => {
+        fs.writeFileSync(holding + ".cgroup", fs.readFileSync("/proc/" + process.pid + "/cgroup"));
         fs.writeFileSync(holding, "");
         const end = Date.now() + 1600; while (Date.now() < end) { /* hold the writer lock */ }
       });
@@ -155,11 +157,130 @@ describe("lock events across processes", () => {
     expect(timeout).toMatchObject({ v: 1, kind: "wait-timeout", store: "sqlite", class: "put/delete",
       holder: { pid: holder.pid, process: heldEvent.holder.process, op: null, host },
       waiter: { pid: waiter.pid, op: "put/delete" } });
+    // Compare the real recorder's output with the holder's proc record captured during custody.
+    const cgroup = fs.readFileSync(signal("holding.cgroup"), "utf8").split("\n").find(line => line.startsWith("0::"))?.slice(3);
+    if (cgroup && /^[\x20-\x7e]+$/.test(cgroup) && Buffer.byteLength(cgroup) <= 512) {
+      expect(timeout.holder).toHaveProperty("cgroup", cgroup);
+      const unit = cgroup.split("/").reverse().find(part => /.+\.(?:service|scope)$/.test(part));
+      if (unit && Buffer.byteLength(unit) <= 256) expect(timeout.holder).toHaveProperty("unit", unit);
+      else expect(timeout.holder).not.toHaveProperty("unit");
+    }
+    expect(heldEvent.holder).not.toHaveProperty("cgroup");
     expect(timeout.waitedMs).toBeGreaterThanOrEqual(290);
     expect(typeof timeout.waiter!.process).toBe("string");
     // The waiter gave up while the holder still held the lock; the holder reported at release.
     expect(timeout.at).toBeLessThanOrEqual(heldEvent.at);
   }, 60_000);
+});
+
+// Trust-boundary/failure-path checks: exercise the actual appender against bounded proc-file fixtures.
+describe("lock events: timeout cgroup observation", () => {
+  const fixture = () => {
+    const root = temp();
+    const file = path.join(root, "proc-cgroup");
+    const open = fs.openSync;
+    const observed: string[] = [];
+    vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (String(target).startsWith("/proc/")) {
+        observed.push(String(target));
+        if (String(target) === `/proc/${process.pid}/cgroup`) target = file;
+      }
+      return (open as (...args: unknown[]) => number)(target, ...rest);
+    }) as typeof fs.openSync);
+    const events = createLockEvents("1")!;
+    const record = (text: string | Buffer, pid: number | undefined = process.pid) => {
+      fs.writeFileSync(file, text);
+      events.waitTimeout(root, "sqlite", "bridge", 10_000, pid);
+      expect(events.errors).toBe(0);
+      return readEvents(eventsFile(root)).at(-1)!.holder;
+    };
+    return { root, file, events, observed, record };
+  };
+
+  it.runIf(process.platform === "linux")("prefers unified membership, safely records printable text, and derives the nearest service/scope (never a slice)", () => {
+    const { record } = fixture();
+    expect(record("1:name=systemd:/old.service\n0::/user.slice/parent.service/app.slice/worker@a\\x2db.scope/leaf\n"))
+      .toMatchObject({ cgroup: "/user.slice/parent.service/app.slice/worker@a\\x2db.scope/leaf", unit: "worker@a\\x2db.scope" });
+    expect(record("1:name=systemd:/parent.service/child.scope/leaf\n"))
+      .toMatchObject({ cgroup: "/parent.service/child.scope/leaf", unit: "child.scope" });
+    expect(record('0::/quoted"\\\\.service/leaf\n'))
+      .toMatchObject({ cgroup: '/quoted"\\\\.service/leaf', unit: 'quoted"\\\\.service' });
+    expect(record("0::/user.slice/app.slice\n")).not.toHaveProperty("unit");
+    expect(record("0::/\n")).toHaveProperty("cgroup", "/");
+  });
+
+  it.runIf(process.platform === "linux")("omits missing, malformed and oversized observations; caps reads and independently bounds cgroup/unit", () => {
+    const { file, events, root, record, observed } = fixture();
+    const read = vi.spyOn(fs, "readSync");
+    for (const text of ["", "garbage\n", "0::relative\n", "0::/unterminated", "0::/a\n0::/b\n", "0::/a\nmalformed\n",
+      "1:cpu:/not-systemd.service\n", "1:name=systemd:/a\n2:name=systemd:/b\n", "0::/ok\n1:cpu:/x\u001b\n",
+      "0::/a/../b\n", "0::/x\u001b[31m.service\n", "0::/x\u0000.service\n", "0::/x\t.service\n", "0::/x\u202e.service\n",
+      Buffer.from([48, 58, 58, 47, 255, 10]), `0::/${"x".repeat(512)}\n`, `0::/${"é".repeat(256)}\n`]) {
+      const holder = record(text);
+      expect(holder).not.toHaveProperty("cgroup");
+      expect(holder).not.toHaveProperty("unit");
+      expect(holder.pid).toBe(process.pid); // observation failure does not erase the sampled kernel PID
+    }
+    read.mockClear();
+    expect(record(`0::/${"x".repeat(5_000)}\n`)).not.toHaveProperty("cgroup");
+    expect(read.mock.results.reduce((sum, result) => sum + Number(result.value), 0)).toBe(4097);
+    expect(read.mock.calls.every(([, buffer]) => (buffer as Buffer).byteLength <= 4097)).toBe(true);
+    expect(record(`0::/${"x".repeat(511)}\n`).cgroup).toHaveLength(512);
+    expect(record(`0::/${"x".repeat(248)}.service\n`).unit).toHaveLength(256);
+    const longUnit = record(`0::/${"x".repeat(249)}.service\n`);
+    expect(longUnit).toHaveProperty("cgroup", `/${"x".repeat(249)}.service`);
+    expect(longUnit).not.toHaveProperty("unit");
+    read.mockImplementationOnce(() => { throw new Error("proc read failed"); });
+    expect(() => events.waitTimeout(root, "sqlite", "bridge", 10_000, process.pid)).not.toThrow();
+    expect(readEvents(eventsFile(root)).at(-1)!.holder).not.toHaveProperty("cgroup");
+    fs.renameSync(file, `${file}.gone`); // exited PID / unreadable proc entry
+    expect(() => events.waitTimeout(root, "sqlite", "bridge", 10_000, process.pid)).not.toThrow();
+    expect(readEvents(eventsFile(root)).at(-1)!.holder).not.toHaveProperty("cgroup");
+    observed.length = 0;
+    for (const pid of [undefined, 0, -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      events.waitTimeout(root, "sqlite", "bridge", 10_000, pid);
+      expect(readEvents(eventsFile(root)).at(-1)!.holder).toMatchObject({ pid: null, process: null });
+    }
+    expect(observed).toEqual([]);
+    expect(events.errors).toBe(0);
+  });
+
+  it("non-Linux omits membership without opening procfs", () => {
+    vi.stubGlobal("process", Object.create(process, { platform: { value: "darwin" } }));
+    const { record, observed } = fixture();
+    const holder = record("0::/not-linux.service\n");
+    expect(holder).not.toHaveProperty("cgroup");
+    expect(holder).not.toHaveProperty("unit");
+    expect(observed).toEqual([]);
+  });
+
+  it.each([false, true])("canonical foreign/unproven owner (legacy=%s) never receives local PID membership", async (legacy) => {
+    const { MeshLock } = await load();
+    const { pidNamespaceTestHooks, localFilesystemTestHooks } = await import("../src/core/pid-namespace.js");
+    const own = "linux:0123456789abcdef0123456789abcdef:5a5a5a5a-5a5a-4a5a-8a5a-5a5a5a5a5a5a:4026531836";
+    pidNamespaceTestHooks.set(own);
+    localFilesystemTestHooks.set(0xEF53);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { root, file, observed } = fixture();
+      fs.writeFileSync(file, "0::/local-not-foreign.service\n");
+      const record = `foreign\n${process.pid}\n${Date.now()}\n${legacy ? "" : `\n${own.replace(/1836$/, "2999")}\n`}`;
+      fs.mkdirSync(path.join(root, ".lock"));
+      const owner = path.join(root, ".lock", "owner");
+      fs.writeFileSync(owner, record);
+      const lock = new MeshLock(root, { lockProtocol: 3, lockTimeoutMs: 150 }, () => undefined);
+      await lock.ownIncarnation;
+      await expect(lock.withLock(() => "must not enter", undefined, "publish")).rejects.toMatchObject({
+        foreignCode: legacy ? "FABRIC_MESH_LOCK_UNPROVEN_HOLDER" : "FABRIC_MESH_LOCK_FOREIGN_HOLDER",
+      });
+      const [event] = readEvents(eventsFile(root));
+      expect(event).toMatchObject({ kind: "wait-timeout", store: "mesh-lock", holder: { pid: process.pid } });
+      expect(event!.holder).not.toHaveProperty("cgroup");
+      expect(event!.holder).not.toHaveProperty("unit");
+      expect(observed).not.toContain(`/proc/${process.pid}/cgroup`);
+      expect(fs.readFileSync(owner, "utf8")).toBe(record);
+    } finally { pidNamespaceTestHooks.reset(); localFilesystemTestHooks.reset(); }
+  });
 });
 
 describe("lock events: rotation across processes", () => {
@@ -545,7 +666,7 @@ describe("lock events in one process", () => {
     registry[eventsKey] = { dispose() {}, events: legacy as LockEvents }; // pre-queue-event runtime generation
     const upgraded = createLockEvents("0", { warn: () => undefined })!; // first owner's opt-in stays in force
     expect(upgraded.held).toBe(legacy.held);
-    expect(upgraded.waitTimeout).toBe(legacy.waitTimeout);
+    expect(upgraded.waitTimeout).not.toBe(legacy.waitTimeout);
     const root = temp();
     upgraded.queueExpired(root, "mesh-lock", "bridge", 2_000, 1);
     upgraded.waitTimeout(root, "mesh-lock", "publish", 100, process.pid);
@@ -566,13 +687,13 @@ describe("lock events in one process", () => {
     expect(upgraded.errors).toBe(2); // both old and new appender failures remain visible
   });
 
-  it("upgrades a captured v2 queue event writer to the full refusal code, while preserving its contention sink", () => {
+  it("upgrades a captured v2 queue event writer to the full refusal code and current timeout observation", () => {
     const original = createLockEvents("1")!;
     const obsoleteQueueWriter = vi.fn();
     registry[eventsKey] = { version: 2, dispose() {}, events: { held: original.held, waitTimeout: original.waitTimeout,
       queueExpired: obsoleteQueueWriter, get errors() { return original.errors; } } };
     const current = createLockEvents("1")!;
-    expect(current.waitTimeout).toBe(original.waitTimeout);
+    expect(current.waitTimeout).not.toBe(original.waitTimeout);
     const root = temp();
     current.queueExpired(root, "sqlite", "publish", 2_000, 2);
     expect(obsoleteQueueWriter).not.toHaveBeenCalled();
@@ -582,12 +703,36 @@ describe("lock events in one process", () => {
     expect(createLockEvents("0")).toBe(current);
   });
 
-  // smarty-dev#12036: pending incarnation is not contention. A shorter-budget cold acquisition
-  // has its own retry code before it ever tries .lock, with no wait-timeout event.
-  it("a cold protocol-2 pending acquisition records no wait-timeout event", async () => {
-    const { MeshLock } = await load();
+  it.runIf(process.platform === "linux")("a v3 reload captures the new timeout recorder once without enabling a disabled singleton", async () => {
     const root = temp();
-    const holder = new MeshLock(root, {}, () => undefined);
+    const oldTimeout = vi.fn();
+    const original = createLockEvents("1")!;
+    registry[eventsKey] = { version: 3, dispose() {}, events: { held: original.held, waitTimeout: oldTimeout,
+      queueExpired: original.queueExpired, get errors() { return original.errors; } } };
+    const upgraded = createLockEvents("0")!;
+    upgraded.waitTimeout(root, "sqlite", "bridge", 10_000, process.pid);
+    expect(oldTimeout).not.toHaveBeenCalled();
+    expect(readEvents(eventsFile(root))).toHaveLength(1);
+    expect(readEvents(eventsFile(root))[0]!.holder.pid).toBe(process.pid);
+    vi.resetModules();
+    const reloaded = await import("../src/mesh/commit-stats.js");
+    expect(reloaded.createLockEvents("1")).toBe(upgraded);
+    reset();
+    expect(reloaded.createLockEvents("0")).toBeUndefined();
+    expect(createLockEvents("1")).toBeUndefined();
+    expect(readEvents(eventsFile(root))).toHaveLength(1);
+  });
+
+  // smarty-dev#12036: pending incarnation is not contention. A shorter-budget cold acquisition
+  // has its own retry code before it ever tries .lock, with no event at all. Once ready, the same
+  // short-budget caller joins FIFO: expiry behind the holder's live receipt is still not contention.
+  it("a cold protocol-2 pending acquisition records no wait-timeout event", async () => {
+    const { events, MeshLock } = await load();
+    const root = temp();
+    const holder = new MeshLock(root, { lockHeldEventMs: 0 }, () => undefined);
+    const waitTimeout = vi.spyOn(events, "waitTimeout");
+    const queueExpired = vi.spyOn(events, "queueExpired");
+    const operation = vi.fn(() => 1);
     let release!: () => void;
     const released = new Promise<void>((resolve) => { release = resolve; });
     let entered!: () => void;
@@ -595,18 +740,40 @@ describe("lock events in one process", () => {
     const holding = holder.withLockAcrossAwait(async () => { entered(); await released; }, undefined, "custody");
     await inside;
     const cold = new MeshLock(root, { lockProtocol: 2 }, () => undefined);
-    expect(cold.ownIncarnationReady).toBe(false);
-    await expect(cold.withLock(() => 1, 50, "publish")).rejects.toMatchObject({ code: "FABRIC_MESH_INCARNATION_PENDING" });
-    release();
-    await holding;
-    expect(readEvents(eventsFile(root))).toEqual([]);
-    // Once ready, the same store tries .lock: a full-budget timeout is an event again.
+    try {
+      expect(cold.ownIncarnationReady).toBe(false);
+      await expect(cold.withLock(operation, 50, "publish")).rejects.toMatchObject({ code: "FABRIC_MESH_INCARNATION_PENDING" });
+      expect(operation).not.toHaveBeenCalled();
+      expect(waitTimeout).not.toHaveBeenCalled();
+      expect(queueExpired).not.toHaveBeenCalled();
+      expect(readEvents(eventsFile(root))).toEqual([]);
+    } finally { release(); await holding; }
     await cold.ownIncarnation;
-    const holdingAgain = holder.withLockAcrossAwait(async () => { await new Promise((resolve) => setTimeout(resolve, 300)); }, undefined, "custody");
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    await expect(cold.withLock(() => 1, 100, "publish")).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
-    await holdingAgain;
-    expect(readEvents(eventsFile(root)).map((event) => [event.kind, event.class])).toEqual([["wait-timeout", "publish"]]);
+    expect(cold.ownIncarnationReady).toBe(true);
+    let releaseAgain!: () => void;
+    const releasedAgain = new Promise<void>((resolve) => { releaseAgain = resolve; });
+    let enteredAgain!: () => void;
+    const insideAgain = new Promise<void>((resolve) => { enteredAgain = resolve; });
+    const holdingAgain = holder.withLockAcrossAwait(async () => { enteredAgain(); await releasedAgain; }, undefined, "custody");
+    await insideAgain; // Real canonical custody AND its advisory receipt, not a sleep-based guess.
+    try {
+      const refusal = await cold.withLock(operation, 100, "publish").catch((error: unknown) => error);
+      expect(refusal).toMatchObject({ name: "MeshLockQueueExpiredError", code: "FABRIC_MESH_LOCK_TIMEOUT",
+        preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", kind: "pre-lock", attempts: 0 });
+      expect((refusal as { waitersAhead: number }).waitersAhead).toBeGreaterThanOrEqual(1);
+      expect((refusal as { waitedMs: number }).waitedMs).toBeGreaterThanOrEqual(100);
+      expect(operation).not.toHaveBeenCalled();
+      expect(waitTimeout).not.toHaveBeenCalled();
+      expect(queueExpired).toHaveBeenCalledOnce();
+      const recorded = readEvents(eventsFile(root));
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0]).toMatchObject({ kind: "pre-lock", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED",
+        store: "mesh-lock", class: "publish", holder: { pid: null, process: null, op: null },
+        waiter: { pid: process.pid, op: "publish" } });
+      expect(recorded[0]!.waitedMs).toBeGreaterThanOrEqual(100);
+      expect(recorded[0]!.waitersAhead).toBeGreaterThanOrEqual(1);
+      // The separate queue-blind legacy-holder test below still requires a real wait-timeout event.
+    } finally { releaseAgain(); await holdingAgain; }
   });
 
   it("mesh .lock: held above the threshold, wait-timeout naming the owner record's pid, nothing for a bounded try", async () => {
@@ -620,6 +787,12 @@ describe("lock events in one process", () => {
     const inside = new Promise<void>((resolve) => { entered = resolve; });
     const holding = holder.withLockAcrossAwait(async () => { entered(); await released; spin(60); }, undefined, "custody");
     await inside;
+    // Model a queue-blind/legacy canonical holder: diagnostics must exercise actual .lock contention,
+    // not FIFO expiry behind a live receipt (short callers no longer abandon that queue).
+    const { meshLockQueueDirectory } = await import("../src/mesh/lock-queue.js");
+    const directory = meshLockQueueDirectory(root);
+    const [receipt] = fs.readdirSync(directory);
+    fs.renameSync(path.join(directory, receipt!), path.join(root, "legacy-holder-receipt"));
     // A fresh module graph (load): match the typed timeout by code, not by class identity.
     const timedOut = { code: "FABRIC_MESH_LOCK_TIMEOUT" };
     await expect(waiter.withLock(() => 1, 150, "publish")).rejects.toMatchObject(timedOut);

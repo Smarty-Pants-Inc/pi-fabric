@@ -12,7 +12,7 @@ describe("#16723 project lead marker trust", () => {
   const leadId = "session:11111111-1111-4111-8111-111111111111";
   const otherId = "session:22222222-2222-4222-8222-222222222222";
   const git = (cwd: string, ...args: string[]) => execFileSync("git", args, {
-    cwd, stdio: "ignore", env: { ...process.env, GIT_CONFIG_GLOBAL: os.devNull, GIT_CONFIG_NOSYSTEM: "1" },
+    cwd, stdio: "ignore", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
   });
   afterEach(() => {
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });

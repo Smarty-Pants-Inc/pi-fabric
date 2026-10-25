@@ -22,7 +22,7 @@ import type { FabricParticipantRecord } from "../src/topology/types.js";
 // directory's lease/collision trust boundary. Real provider, resolver and on-disk directory;
 // no workers, native deletion or live fleet state. All fixtures stay in the isolated TMPDIR.
 // File-based launch authority requires POSIX ownership; explicit env metadata works everywhere.
-describe.skipIf(process.getuid === undefined)("#16723 projectAgent launch binding", () => {
+describe("#16723 projectAgent launch binding", () => {
   const roots: string[] = [];
   const directories: ParticipantDirectory[] = [];
   const providers: AgentsProvider[] = [];
@@ -104,15 +104,17 @@ describe.skipIf(process.getuid === undefined)("#16723 projectAgent launch bindin
     code: "FABRIC_PROJECT_AGENT_UNRESOLVED", message: expect.stringContaining("is absent or stale"),
   };
 
-  it.each(["marker", "env"] as const)("resolves the exact same-repo then cross-repo recorded lead via %s", async binding => {
-    const f = await fixture(binding);
-    await f.publish(leadId);
-    await expect(f.call()).resolves.toMatchObject({ id: leadId });
-    await f.publish(leadId, { repository: "code.example/team/control" });
-    await expect(f.call()).resolves.toMatchObject({ id: leadId });
+  describe.each(["marker", "env"] as const)("recorded lead via %s", binding => {
+    it.skipIf(binding === "marker" && process.getuid === undefined)("resolves the exact same-repo then cross-repo recorded lead", async () => {
+      const f = await fixture(binding);
+      await f.publish(leadId);
+      await expect(f.call()).resolves.toMatchObject({ id: leadId });
+      await f.publish(leadId, { repository: "code.example/team/control" });
+      await expect(f.call()).resolves.toMatchObject({ id: leadId });
+    });
   });
 
-  it.each(["absent", "expired", "reloading"] as const)("refuses the %s recorded lead without falling back", async kind => {
+  it.skipIf(process.getuid === undefined).each(["absent", "expired", "reloading"] as const)("refuses the %s recorded lead without falling back", async kind => {
     const f = await fixture();
     if (kind === "expired") await f.publish(leadId, {}, Date.now() - 1);
     if (kind === "reloading") await f.publish(leadId, { status: "reloading", reloadUntil: Date.now() - 1 });
@@ -120,7 +122,7 @@ describe.skipIf(process.getuid === undefined)("#16723 projectAgent launch bindin
     await expect(f.call()).rejects.toMatchObject(unavailable);
   });
 
-  it.each<Partial<FabricParticipantRecord>>([
+  it.skipIf(process.getuid === undefined).each<Partial<FabricParticipantRecord>>([
     { interactive: false }, { capabilities: ["fabric"] }, { capabilities: ["followUp"] }, { capabilities: ["steer"] },
   ])("refuses a present non-interactive recorded lead: %j", async patch => {
     const f = await fixture();
@@ -143,7 +145,7 @@ describe.skipIf(process.getuid === undefined)("#16723 projectAgent launch bindin
     await expect(f.call()).resolves.toMatchObject({ id: otherId });
   });
 
-  it.each(["bridge", "source-lease"] as const)("accepts a cross-repo recorded mirror only while its %s is fresh", async kind => {
+  it.skipIf(process.getuid === undefined).each(["bridge", "source-lease"] as const)("accepts a cross-repo recorded mirror only while its %s is fresh", async kind => {
     const f = await fixture("marker", true);
     await f.publish(leadId, { repository: "code.example/team/control" });
     await expect(f.call()).resolves.toMatchObject({ id: leadId, remoteHost: "remote" });
@@ -154,7 +156,7 @@ describe.skipIf(process.getuid === undefined)("#16723 projectAgent launch bindin
     await expect(f.call()).rejects.toMatchObject(unavailable);
   });
 
-  it("refuses a colliding recorded mirror instead of electing a native root", async () => {
+  it.skipIf(process.getuid === undefined)("refuses a colliding recorded mirror instead of electing a native root", async () => {
     const f = await fixture("marker", true);
     await f.publish(leadId, { repository: "code.example/team/control" });
     const identity: MeshIdentity = { id: "session:native-owner", name: "main", kind: "main" };

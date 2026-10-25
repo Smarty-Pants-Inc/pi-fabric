@@ -1,7 +1,8 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BRIDGE_NATS_LEDGER_FILE,
@@ -39,6 +40,34 @@ afterEach(async () => {
 });
 
 const dir = () => path.join(root, "ledger");
+
+/** A real crash needs a separate process and machine evidence (the custody lock's dead-holder proof). */
+const realCrash = process.platform === "linux" && fs.existsSync("/etc/machine-id") &&
+  spawnSync("bun", ["--version"], { encoding: "utf8" }).status === 0;
+const LEDGER_MODULE = fileURLToPath(new URL("../src/mesh/bridge-nats-ledger.ts", import.meta.url));
+
+/** Open the ledger in another process (bun runs the TypeScript module), optionally claim, and hold it until killed. */
+const holdInChild = async (where: string, claim?: BridgeNatsClaimInput): Promise<{ kill(): Promise<void> }> => {
+  const script = path.join(root, `holder-${Math.random().toString(16).slice(2)}.ts`);
+  fs.writeFileSync(script, [
+    `import { openBridgeNatsLedger } from ${JSON.stringify(LEDGER_MODULE)};`,
+    "const [where, claim] = process.argv.slice(2);",
+    "const ledger = await openBridgeNatsLedger({ dir: where });",
+    "if (claim) await ledger.claim(JSON.parse(claim));",
+    "process.stdout.write('ready\\n');",
+    "setInterval(() => {}, 1 << 30);",
+  ].join("\n"));
+  const child = spawn("bun", [script, where, ...(claim ? [JSON.stringify(claim)] : [])], { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", chunk => { stderr += String(chunk); });
+  await new Promise<void>((resolve, reject) => {
+    child.stdout.on("data", chunk => { if (String(chunk).includes("ready")) resolve(); });
+    child.once("exit", code => reject(new Error(`holder exited ${code}: ${stderr}`)));
+  });
+  return {
+    kill: () => new Promise<void>(resolve => { child.once("exit", () => resolve()); child.kill("SIGKILL"); }),
+  };
+};
 const ledgerAt = async (where = dir(), minCompactLines?: number) => {
   const ledger = await openBridgeNatsLedger({ dir: where, clock: () => clock.now, ...(minCompactLines ? { minCompactLines } : {}) });
   open.push(ledger);
@@ -47,7 +76,7 @@ const ledgerAt = async (where = dir(), minCompactLines?: number) => {
 
 /** File -> NATS: the lead sends a followUp to the moved lead. */
 const toNats = (original = "orig-1", fields: Partial<BridgeNatsClaimInput> = {}): BridgeNatsClaimInput => ({
-  direction: "toNats", originalCommandId: original, commandId: bridgeNatsMappedCommandId(LINK, "toNats", LEAD, original),
+  direction: "toNats", origin: "control", originalCommandId: original, commandId: bridgeNatsMappedCommandId(LINK, "toNats", LEAD, original),
   sourceEventId: `file-event-${original}`, envelopeId: bridgeNatsEnvelopeId(LINK, `file-event-${original}`),
   bodyDigest: "d".repeat(64), sourceMachine: "ryzen1-bridge", requesterId: LEAD, replyTo: "host-lead", targetId: MOVED,
   from: { id: LEAD, name: "lead", kind: "main", sessionId: LEAD.slice(8) }, principal: { id: "herdr:paul", binding: "herdr-client" },
@@ -57,7 +86,7 @@ const toNats = (original = "orig-1", fields: Partial<BridgeNatsClaimInput> = {})
 
 /** NATS -> file: the moved lead sends a followUp to the lead. */
 const toFile = (original = "orig-2", sender = MOVED, fields: Partial<BridgeNatsClaimInput> = {}): BridgeNatsClaimInput => ({
-  direction: "toFile", originalCommandId: original, commandId: bridgeNatsMappedCommandId(LINK, "toFile", sender, original),
+  direction: "toFile", origin: "control", originalCommandId: original, commandId: bridgeNatsMappedCommandId(LINK, "toFile", sender, original),
   sourceEventId: `nats-envelope-${original}`, bodyDigest: "e".repeat(64), sourceMachine: "lead-v2", requesterId: sender,
   from: { id: sender, name: "moved", kind: "main" },
   replyTo: "host-moved", targetId: LEAD, operation: "followUp", ownerHostId: "host-lead", ownerIdentityId: LEAD,
@@ -115,6 +144,13 @@ describe("claims: exactly once by mapped commandId", () => {
     await expect(ledger.claim(noBody)).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
     await expect(ledger.claim(toFile("w", MOVED, { envelopeId: "early" }))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
     await expect(ledger.claim(toFile("c", MOVED, { operation: "cancel" }))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
+    // A topic route (N3) is a followUp the link originates toward NATS; nothing else may claim that origin.
+    const topic = await ledger.claim(toNats("t", { origin: "topic", requesterId: "bridge:v2", replyTo: "bridge:v2",
+      from: { id: "bridge:v2", name: "mesh-bridge", kind: "main" } }));
+    expect(topic.record.origin).toBe("topic");
+    await expect(ledger.claim(toNats("t2", { origin: "topic", operation: "steer" }))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
+    await expect(ledger.claim(toFile("t3", MOVED, { origin: "topic" }))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
+    await expect(ledger.claim(toNats("o", { origin: "other" as never }))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
     await expect(ledger.claim(toFile("f", MOVED, { from: { id: MOVED, name: "m", kind: "bogus" } as never })))
       .rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
     await expect(ledger.claim(toFile("p", MOVED, { principal: { id: "x", binding: "root" } as never })))
@@ -194,17 +230,26 @@ describe("crash durability", () => {
     expect((await ledger.claim(toNats("a"))).status).toBe("duplicate"); // exactly once across the restart
   });
 
-  it("survives a process that died without closing (the stale lock is recovered)", async () => {
-    const ledger = await ledgerAt();
-    await ledger.claim(toNats("a"));
-    // Simulate a crash: the holder vanished without close(); its lock names a dead pid.
-    const lock = path.join(dir(), BRIDGE_NATS_LEDGER_LOCK);
-    const record = JSON.parse(fs.readFileSync(lock, "utf8")) as Record<string, unknown>;
-    const dead = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" });
-    open = [];
-    fs.writeFileSync(lock, `${JSON.stringify({ ...record, pid: Number(dead.stdout), incarnation: undefined })}\n`);
+  it.skipIf(!realCrash)("survives a holder process killed without closing: its lock is recovered, its claims kept", async () => {
+    const holder = await holdInChild(dir(), toNats("a"));
+    // A live holder in another process is never displaced.
+    await expect(openBridgeNatsLedger({ dir: dir(), lockTimeoutMs: 300 })).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_LOCKED" });
+    await holder.kill();
     const reopened = await ledgerAt();
     expect((await reopened.claim(toNats("a"))).status).toBe("duplicate");
+  });
+
+  it.skipIf(!realCrash)("lets exactly one of two concurrent openers recover a dead holder's lock", async () => {
+    await (await holdInChild(dir())).kill();
+    const results = await Promise.allSettled([
+      openBridgeNatsLedger({ dir: dir(), lockTimeoutMs: 500 }),
+      openBridgeNatsLedger({ dir: dir(), lockTimeoutMs: 500 }),
+    ]);
+    const opened = results.filter(result => result.status === "fulfilled");
+    for (const result of opened) open.push((result as PromiseFulfilledResult<FileBridgeNatsLedger>).value);
+    expect(opened).toHaveLength(1);
+    expect((results.find(result => result.status === "rejected") as PromiseRejectedResult).reason)
+      .toMatchObject({ code: "BRIDGE_NATS_LEDGER_LOCKED" });
   });
 
   it("cuts an unfinished final append and opens", async () => {
@@ -263,6 +308,80 @@ describe("crash durability", () => {
     expect((await ledger.claim(toNats("b"))).status).toBe("new");
   });
 
+  it("refuses to open over a damaged suffix longer than one unfinished append", async () => {
+    let ledger = await ledgerAt();
+    for (const id of ["a", "b", "c"]) await ledger.claim(toNats(id));
+    await ledger.close();
+    const file = path.join(dir(), BRIDGE_NATS_LEDGER_FILE);
+    const lines = fs.readFileSync(file, "utf8").split("\n");
+    for (const index of [1, 2]) lines[index] = lines[index]!.replace('"bodyDigest":"d', '"bodyDigest":"e');
+    fs.writeFileSync(file, lines.join("\n"), { mode: 0o600 });
+    await expect(openBridgeNatsLedger({ dir: dir(), clock: () => clock.now })).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_CORRUPT" });
+    // One damaged complete line followed by an unfinished segment is two damaged appends too.
+    fs.writeFileSync(file, `${lines[0]}\n\u0000\u0000\n{"t":"cmd"`, { mode: 0o600 });
+    await expect(openBridgeNatsLedger({ dir: dir(), clock: () => clock.now })).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_CORRUPT" });
+    void ledger;
+  });
+
+  it("completes short writes, in appends and in compaction, so a reload keeps every resolved mutation", async () => {
+    const real = fs.writeSync;
+    const spy = vi.spyOn(fs, "writeSync").mockImplementation(((fd: number, buffer: Buffer, offset?: number, length?: number) =>
+      real(fd, buffer, offset ?? 0, Math.min(length ?? buffer.length, 20))) as unknown as typeof fs.writeSync);
+    try {
+      let ledger = await ledgerAt(dir(), 1);
+      const { commandId } = (await ledger.claim(toNats("a"))).record;
+      await ledger.markUncertain(commandId);
+      await ledger.markSent(commandId, {});
+      await ledger.settle(commandId, ack(commandId));
+      await ledger.markAckForwarded(commandId); // the fifth line triggers a compaction
+      expect(fs.readFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_FILE), "utf8").trim().split("\n")).toHaveLength(1);
+      await ledger.close();
+      ledger = await ledgerAt(dir(), 1);
+      expect(ledger.lookup("toNats", commandId)?.state).toBe("ackForwarded");
+      expect(ledger.lookupOriginal("toNats", LEAD, "a")?.commandId).toBe(commandId);
+    } finally { spy.mockRestore(); }
+  });
+
+  it.skipIf(process.platform !== "linux")("never treats a failed directory fsync as durable", async () => {
+    const realOpen = fs.openSync, realFsync = fs.fsyncSync;
+    const opened: string[] = [];
+    const openSpy = vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags?: fs.OpenMode, mode?: fs.Mode) => {
+      const fd = realOpen(file, flags ?? "r", mode);
+      if (flags === "r" && fs.fstatSync(fd).isDirectory()) opened.push(String(file));
+      return fd;
+    }) as typeof fs.openSync);
+    let failDirs = true;
+    // Fail only a directory's fsync (descriptor numbers are reused, so judge the descriptor now).
+    const fsyncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
+      if (failDirs && fs.fstatSync(fd).isDirectory()) throw Object.assign(new Error("EIO: i/o error, fsync"), { code: "EIO" });
+      realFsync(fd);
+    });
+    try {
+      // A new ledger directory (two new components) whose namespace barrier fails: the open fails.
+      const nested = path.join(root, "new", "ledger");
+      await expect(openBridgeNatsLedger({ dir: nested, clock: () => clock.now })).rejects.toMatchObject({ code: "EIO" });
+      failDirs = false;
+      opened.length = 0;
+      const deeper = path.join(root, "a", "b", "ledger");
+      const ledger = await ledgerAt(deeper, 1);
+      // Every newly created component's entry was synced in its parent.
+      expect(opened).toEqual(expect.arrayContaining([root, path.join(root, "a"), path.join(root, "a", "b")]));
+      const { commandId } = (await ledger.claim(toNats("a"))).record;
+      await ledger.markUncertain(commandId);
+      await ledger.markSent(commandId, {});
+      await ledger.settle(commandId, ack(commandId));
+      // The fifth line compacts; its rename cannot be confirmed: the mutation stands (it is in the new
+      // file), then the ledger stops appending.
+      failDirs = true;
+      expect((await ledger.markAckForwarded(commandId)).state).toBe("ackForwarded");
+      await expect(ledger.claim(toNats("b"))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_CLOSED" });
+      failDirs = false;
+      await ledger.close();
+      const reopened = await ledgerAt(deeper, 1);
+      expect(reopened.lookup("toNats", commandId)?.state).toBe("ackForwarded");
+    } finally { openSpy.mockRestore(); fsyncSpy.mockRestore(); }
+  });
+
   it("ignores a compaction that crashed before its rename", async () => {
     let ledger = await ledgerAt();
     await ledger.claim(toNats("a"));
@@ -311,11 +430,15 @@ describe("one writer, private files", () => {
   });
 
   it("never steals a lock it cannot prove stale", async () => {
-    fs.mkdirSync(dir(), { mode: 0o700 });
-    fs.writeFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_LOCK), "not json\n", { mode: 0o600 });
-    await expect(openBridgeNatsLedger({ dir: dir() })).rejects.toBeInstanceOf(BridgeNatsLedgerError);
-    fs.writeFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_LOCK), `${JSON.stringify({ v: 1, pid: process.pid, machineId: "f".repeat(32), bootId: "x" })}\n`);
-    await expect(openBridgeNatsLedger({ dir: dir() })).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_LOCKED" });
+    fs.mkdirSync(path.join(dir(), BRIDGE_NATS_LEDGER_LOCK), { recursive: true, mode: 0o700 });
+    fs.chmodSync(dir(), 0o700);
+    fs.writeFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_LOCK, "owner"), "not a record\n", { mode: 0o600 });
+    await expect(openBridgeNatsLedger({ dir: dir(), lockTimeoutMs: 300 })).rejects.toBeInstanceOf(BridgeNatsLedgerError);
+    // A holder on another machine (or an unreadable one) stays, whatever its pid.
+    fs.writeFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_LOCK, "owner"),
+      `token\n${process.pid}\n${Date.now()}\n\n${"f".repeat(32)}\n00000000-0000-4000-8000-000000000000\n`);
+    await expect(openBridgeNatsLedger({ dir: dir(), lockTimeoutMs: 300 })).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_LOCKED" });
+    expect(fs.readFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_LOCK, "owner"), "utf8")).toContain("f".repeat(32));
   });
 
   it.skipIf(!process.geteuid)("creates a 0700 directory and a 0600 file, and refuses a shared directory", async () => {

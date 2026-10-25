@@ -10,20 +10,16 @@
 //  - a lost markSent leaves the claim pending: resend with the same envelope id and bytes, which the
 //    destination dedupes (Nats-Msg-Id inside its window, then the receiver's seen claim by commandId);
 //  - a lost settle leaves the source delivery unacknowledged, so the ACK is received again.
-// Load: a final line without its newline, or a final line that fails its checksum, is an unfinished
-// append and is cut off. A bad line followed by good ones is corruption: the ledger refuses to open
-// (exactly-once cannot be claimed over a damaged history).
+// Load: ONE final line without its newline, or ONE final line that fails its checksum, is an unfinished
+// append and is cut off. Anything more (a bad line followed by good ones, or two damaged appends) is
+// corruption: the ledger refuses to open (exactly-once cannot be claimed over a damaged history).
+// Directory entries are made durable (parent fsyncs); a failed directory fsync is an error.
 // The directory is 0700 and the file 0600: the ledger holds command bodies and ACK results.
-// One writer: a lock file pins the owning process (pid + process incarnation + machine + boot).
+// One writer: the mesh's host-qualified custody lock (pid + process incarnation + machine + boot).
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import {
-  ownProcessIncarnation,
-  processIncarnation,
-  readPhysicalHostIdentity,
-  validProcessIncarnation,
-} from "../core/atomic-write.js";
+import { acquireMeshCustodyLock, MESH_CUSTODY_LOCK_NAME } from "./custody-lock.js";
 import {
   BRIDGE_NATS_HORIZON_MS,
   BRIDGE_NATS_OPERATIONS,
@@ -38,7 +34,8 @@ import {
 } from "./bridge-nats-types.js";
 
 export const BRIDGE_NATS_LEDGER_FILE = "ledger.jsonl";
-export const BRIDGE_NATS_LEDGER_LOCK = "ledger.lock";
+/** The writer lock: a custody-lock directory inside the ledger directory. */
+export const BRIDGE_NATS_LEDGER_LOCK = MESH_CUSTODY_LOCK_NAME;
 /** One record line at most (a resolved command body is bounded by the 1 MiB NATS payload). */
 export const BRIDGE_NATS_LEDGER_MAX_LINE_BYTES = 4 * 1024 * 1024;
 /** Live records at most; past it a new claim is refused (never silently dropped). */
@@ -58,6 +55,8 @@ export interface BridgeNatsLedgerOptions {
   readonly clock?: () => number;
   /** Compact when the file holds more than max(minCompactLines, 4 x live records) lines. */
   readonly minCompactLines?: number;
+  /** How long to wait for the writer lock before refusing (default 2 s); a live holder is never displaced. */
+  readonly lockTimeoutMs?: number;
 }
 
 type Line =
@@ -102,6 +101,8 @@ const validCommand = (r: unknown): r is BridgeNatsCommandRecord => {
       !(BRIDGE_NATS_OPERATIONS as readonly unknown[]).includes(r.operation) || !text(r.ownerHostId) || !text(r.ownerIdentityId) ||
       !finite(r.deadlineAt) || !finite(r.claimedAt) || !finite(r.expiresAt)) return false;
   if (!validIdentity(r.from) || (r.principal !== undefined && !validPrincipal(r.principal))) return false;
+  if (r.origin !== "control" && r.origin !== "topic") return false;
+  if (r.origin === "topic" && (r.operation !== "followUp" || r.direction !== "toNats")) return false;
   if (r.envelopeId !== undefined && !text(r.envelopeId)) return false;
   if (r.direction === "toNats" && (r.envelopeId === undefined || !isObject(r.resolvedBody) || !text(r.targetMachine, 64))) return false;
   if (r.ownerIncarnation !== undefined && !text(r.ownerIncarnation, 128)) return false;
@@ -155,28 +156,37 @@ const encode = (line: Line): string => {
   return encoded;
 };
 
-interface LockRecord { v: 1; pid: number; incarnation?: string; machineId?: string; bootId?: string; acquiredAt: number }
-
-const pidAlive = (pid: number): boolean => {
-  try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+/** Write every byte (a regular-file write may return a short count) or throw. */
+const writeAll = (fd: number, bytes: Buffer): void => {
+  let written = 0;
+  while (written < bytes.length) written += fs.writeSync(fd, bytes, written, bytes.length - written);
 };
 
-/** Whether a recorded holder is provably gone: same machine and boot, and its pid dead or reused. */
-const holderGone = async (holder: unknown): Promise<boolean> => {
-  if (!isObject(holder) || holder.v !== 1 || !Number.isSafeInteger(holder.pid) || (holder.pid as number) <= 0) return false;
-  const host = readPhysicalHostIdentity();
-  if (!host || holder.machineId !== host.machineId) return false; // foreign or unprovable: never steal
-  if (holder.bootId !== host.bootId) return typeof holder.bootId === "string"; // the machine rebooted since
-  if (!pidAlive(holder.pid as number)) return true;
-  if (typeof holder.incarnation !== "string" || !validProcessIncarnation(holder.incarnation)) return false;
-  const current = await processIncarnation(holder.pid as number, 2_000);
-  return validProcessIncarnation(current) && current !== holder.incarnation;
-};
-
+/**
+ * A namespace barrier: fsync a directory so a created or renamed entry in it is durable. A real I/O
+ * error is never mistaken for success. Only Windows (directories cannot be opened for fsync) skips it,
+ * and only a non-Linux filesystem that reports the operation unsupported (EINVAL, ENOTSUP) passes.
+ */
 const fsyncDir = (dir: string): void => {
-  let fd: number | undefined;
-  try { fd = fs.openSync(dir, "r"); fs.fsyncSync(fd); } catch { /* not supported on this platform */ } finally {
-    if (fd !== undefined) fs.closeSync(fd);
+  if (process.platform === "win32") return;
+  const fd = fs.openSync(dir, "r");
+  try { fs.fsyncSync(fd); } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (process.platform === "linux" || (code !== "EINVAL" && code !== "ENOTSUP")) throw error;
+  } finally { fs.closeSync(fd); }
+};
+
+/** Create `dir` (0700) and make every newly created component durable in its parent. */
+const makeDurableDir = (dir: string): void => {
+  const target = path.resolve(dir);
+  const first = fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+  if (first === undefined) return;
+  let created = path.resolve(first);
+  const rest = path.relative(created, target).split(path.sep).filter(Boolean);
+  fsyncDir(path.dirname(created));
+  for (const part of rest) {
+    fsyncDir(created);
+    created = path.join(created, part);
   }
 };
 
@@ -189,51 +199,32 @@ const unsafeMode = (stat: fs.Stats, expected: "dir" | "file"): string | undefine
   return undefined;
 };
 
-/** Open the ledger: take the writer lock, replay the file, cut an unfinished final append, compact. */
+/**
+ * Open the ledger: take the writer lock, replay the file, cut an unfinished final append, compact.
+ * The writer lock is the mesh's host-qualified custody lock (src/mesh/custody-lock.ts) inside the ledger
+ * directory: a dead holder (same machine, dead or reused pid, or a previous boot) is recovered by renaming
+ * its lock to a name derived from the judged lock itself, so two recoverers can never displace a live
+ * successor; a live, foreign or unprovable holder is never displaced.
+ */
 export const openBridgeNatsLedger = async (options: BridgeNatsLedgerOptions): Promise<FileBridgeNatsLedger> => {
   const dir = path.resolve(options.dir);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  makeDurableDir(dir);
   const dirStat = fs.lstatSync(dir);
   const unsafeDir = unsafeMode(dirStat, "dir");
   if (unsafeDir) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_UNSAFE", `ledger directory ${dir} ${unsafeDir}`);
-  const lock = path.join(dir, BRIDGE_NATS_LEDGER_LOCK);
-  const host = readPhysicalHostIdentity();
-  const record: LockRecord = { v: 1, pid: process.pid, acquiredAt: (options.clock ?? Date.now)() };
-  const incarnation = await ownProcessIncarnation();
-  if (incarnation !== undefined && validProcessIncarnation(incarnation)) record.incarnation = incarnation;
-  if (host) { record.machineId = host.machineId; record.bootId = host.bootId; }
-  const body = `${JSON.stringify(record)}\n`;
-  for (let attempt = 0; ; attempt++) {
-    try {
-      const fd = fs.openSync(lock, "wx", 0o600);
-      try { fs.writeFileSync(fd, body); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-      fsyncDir(dir);
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt > 0) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-          throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_LOCKED", `ledger ${dir} is held by another process`);
-        }
-        throw error;
-      }
-      let raw = "", holder: unknown;
-      try { raw = fs.readFileSync(lock, "utf8"); holder = JSON.parse(raw); } catch { holder = undefined; }
-      if (!await holderGone(holder)) {
-        throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_LOCKED", `ledger ${dir} is held by another live or unprovable process`);
-      }
-      // Remove only the exact stale holder judged above; a racing taker that already replaced it wins.
-      if (fs.readFileSync(lock, "utf8") !== raw) {
-        throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_LOCKED", `ledger ${dir} lock changed while recovering it`);
-      }
-      fs.unlinkSync(lock);
-    }
+  let release: () => void;
+  try {
+    release = await acquireMeshCustodyLock(dir, options.lockTimeoutMs ?? 2_000, { hostQualified: true });
+  } catch (error) {
+    throw Object.assign(new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_LOCKED",
+      `ledger ${dir} is held by another live, foreign or unprovable process`), { cause: error });
   }
   try {
-    const ledger = new FileBridgeNatsLedger(dir, lock, body, options);
+    const ledger = new FileBridgeNatsLedger(dir, release, options);
     ledger.load();
     return ledger;
   } catch (error) {
-    try { if (fs.readFileSync(lock, "utf8") === body) fs.unlinkSync(lock); } catch { /* best effort */ }
+    release();
     throw error;
   }
 };
@@ -241,8 +232,7 @@ export const openBridgeNatsLedger = async (options: BridgeNatsLedgerOptions): Pr
 export class FileBridgeNatsLedger implements BridgeNatsLedger {
   readonly #dir: string;
   readonly #file: string;
-  readonly #lock: string;
-  readonly #lockBody: string;
+  readonly #release: () => void;
   readonly #clock: () => number;
   readonly #minCompactLines: number;
   readonly #commands = new Map<string, BridgeNatsCommandRecord>();
@@ -257,11 +247,10 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
   /** Fail-stop: after a write/fsync failure nothing more is appended; reopen (restart) recovers. */
   #failed: unknown;
 
-  constructor(dir: string, lock: string, lockBody: string, options: BridgeNatsLedgerOptions) {
+  constructor(dir: string, release: () => void, options: BridgeNatsLedgerOptions) {
     this.#dir = dir;
     this.#file = path.join(dir, BRIDGE_NATS_LEDGER_FILE);
-    this.#lock = lock;
-    this.#lockBody = lockBody;
+    this.#release = release;
     this.#clock = options.clock ?? Date.now;
     this.#minCompactLines = Math.max(1, options.minCompactLines ?? 1024);
   }
@@ -277,13 +266,14 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
       const unsafe = unsafeMode(existing, "file");
       if (unsafe) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_UNSAFE", `ledger file ${this.#file} ${unsafe}`);
       const data = fs.readFileSync(this.#file);
-      let offset = 0, good = 0, badAt: number | undefined;
+      let offset = 0, good = 0, bad = 0, badAt: number | undefined;
       const lines: Line[] = [];
       while (offset < data.length) {
         const end = data.indexOf(0x0a, offset);
-        if (end < 0) break; // unfinished final append: cut below
+        if (end < 0) break; // an unfinished final append (no newline): cut below
         const line = parseLine(data.subarray(offset, end).toString("utf8"));
         if (!line) {
+          bad += 1;
           badAt ??= offset;
         } else {
           if (badAt !== undefined) {
@@ -294,6 +284,13 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
           good = end + 1;
         }
         offset = end + 1;
+      }
+      // Appends are sequential and each one's fsync returns before the next begins (a failure stops all
+      // appends), so at most ONE append can be unfinished: either one damaged complete line or one
+      // segment without its newline, never more. A longer damaged suffix is corruption, not a crash.
+      if (bad > 1 || (bad === 1 && offset < data.length)) {
+        throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_CORRUPT",
+          `ledger ${this.#file} ends in more than one damaged record (from byte ${badAt}); refusing to open`);
       }
       if (good < data.length) {
         // Only the unacknowledged tail: an append whose fsync never returned to its caller.
@@ -344,8 +341,7 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
     if (fd === undefined) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_CLOSED", "ledger is closed");
     const bytes = Buffer.from(encoded, "utf8");
     try {
-      let written = 0;
-      while (written < bytes.length) written += fs.writeSync(fd, bytes, written, bytes.length - written);
+      writeAll(fd, bytes);
       fs.fsyncSync(fd);
     } catch (error) {
       // Never leave a torn line in front of later ones (load would refuse it as corruption). After a
@@ -376,7 +372,12 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
       const fd = fs.openSync(temp, "wx", 0o600);
       let size = 0;
       try {
-        for (const line of lines) size += fs.writeSync(fd, encode(line));
+        // Every byte of every record, or no rename: a short write is completed, never taken as done.
+        for (const line of lines) {
+          const bytes = Buffer.from(encode(line), "utf8");
+          writeAll(fd, bytes);
+          size += bytes.length;
+        }
         fs.fsyncSync(fd);
       } finally { fs.closeSync(fd); }
       fs.renameSync(temp, this.#file);
@@ -408,6 +409,10 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
     if (!text(input.sourceEventId)) invalid("sourceEventId");
     if (!DIGEST.test(String(input.bodyDigest))) invalid("bodyDigest");
     if (!(BRIDGE_NATS_OPERATIONS as readonly unknown[]).includes(input.operation)) invalid("operation");
+    if (input.origin !== "control" && input.origin !== "topic") invalid("origin");
+    if (input.origin === "topic" && (input.operation !== "followUp" || input.direction !== "toNats")) {
+      invalid("origin (a topic route is a followUp toward NATS)");
+    }
     if (!validIdentity(input.from)) invalid("from");
     if (input.principal !== undefined && !validPrincipal(input.principal)) invalid("principal");
     if (input.resolvedBody !== undefined && !isObject(input.resolvedBody)) invalid("resolvedBody");
@@ -562,8 +567,9 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
     const run = this.#queue.then(() => {
       if (this.#closed) return;
       this.#closed = true;
-      if (this.#fd !== undefined) { try { fs.closeSync(this.#fd); } finally { this.#fd = undefined; } }
-      try { if (fs.readFileSync(this.#lock, "utf8") === this.#lockBody) fs.unlinkSync(this.#lock); } catch { /* already gone */ }
+      try {
+        if (this.#fd !== undefined) { try { fs.closeSync(this.#fd); } finally { this.#fd = undefined; } }
+      } finally { this.#release(); }
     });
     this.#queue = run.catch(() => undefined);
     return run;

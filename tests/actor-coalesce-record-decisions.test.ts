@@ -165,15 +165,22 @@ describe("coalesced record decisions use each original input (#4605 round 2)", (
     const all1 = await w.publish("issue_comment", "all-1", 8);
     const all2 = await w.publish("issue_comment", "all-2", 8);
     w.admit(comment, check, all1, all2);
-    await w.actors.setActivationFilter(actor.id, skipComments);
+    // pi-fabric#1572 option B: PR 8's item is all comments, a whole-item skip, so the setter refuses unless dropQueued,
+    // which holds it in the dead-letter file. PR 7's item matches only in part and is pruned record by record.
+    await expect(w.actors.setActivationFilter(actor.id, skipComments)).rejects.toMatchObject({ code: "FABRIC_ACTOR_QUEUED_WORK", counts: { skipped: 1 } });
+    await expect(w.actors.setActivationFilter(actor.id, skipComments, undefined, undefined, undefined, { dropQueued: true }))
+      .resolves.toMatchObject({ movedToDeadLetter: 1 });
     expect(w.actors.status(actor.id).queued).toBe(1);
+    const held = fs.readFileSync(path.join(w.root, "actors", actor.id, "dead-letter.jsonl"), "utf8").split("\n").filter(Boolean)
+      .map(line => JSON.parse(line) as { heldBy?: { ruleId: string }; coalesced?: Array<{ id: string }> });
+    expect(held.map(entry => [entry.heldBy?.ruleId, entry.coalesced?.map(record => record.id)])).toEqual([["comments", [all1.id, all2.id]]]);
     await w.idle(actor.id, 2);
     expect(frame(w.runs[1]!.task).payload).toEqual(check);
     expect(ids(w.runs[1]!.task)).toEqual([check.id]);
     const dropped = w.actors.messages(actor.id).filter(message => message.reason === "filtered: comments")
       .map(message => (message.data as { filteredEventId: string }).filteredEventId);
-    expect(dropped).toEqual([comment.id, all1.id, all2.id]);
-    expect(w.actors.status(actor.id).filterSkipped?.count).toBe(3);
+    expect(dropped).toEqual([comment.id]);
+    expect(w.actors.status(actor.id).filterSkipped?.count).toBe(1);
   });
 
   it("arrival filtering still prevents a rejected newer event from replacing eligible queued input", async () => {

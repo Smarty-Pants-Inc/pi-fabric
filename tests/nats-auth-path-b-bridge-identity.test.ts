@@ -10,7 +10,7 @@ import type { MeshEvent, MeshIdentity } from "../src/mesh/store.js";
 import type { TransportEnvelope } from "../src/transport/types.js";
 import { resolveNatsBinary } from "./helpers/nats-cluster.js";
 import {
-  allowRoot, BRIDGE_MACHINE, createMixedHarness, linkTail, liveRow, NATS_MAIN_MACHINE, natsLinkPresent, SEAT_OPERATIONS, selfRecord, waitForValue,
+  BRIDGE_MACHINE, createMixedHarness, linkTail, liveRow, NATS_MAIN_MACHINE, natsLinkPresent, selfRecord, waitForValue,
   type MixedHarness, type MixedMain, type WireEvent,
 } from "./helpers/nats-file-mixed.js";
 
@@ -38,10 +38,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link ide
   let h: MixedHarness;
   beforeAll(async () => {
     // natsPeer is a principal seat: AGENTS lets a principal's org instance receive followUp (and cancel) only.
-    h = await createMixedHarness({ binary: binary!, outsider: true, natsPeer: true, allow: (allow, ids) => {
-      allow.nats = allow.nats.map((entry) => entry.kind === "root" && entry.id === ids.natsPeer
-        ? allowRoot(ids.natsPeer, SEAT_OPERATIONS, "Kate") : entry);
-    } });
+    h = await createMixedHarness({ binary: binary!, outsider: true, natsPeer: true, seat: true });
   }, 90_000);
   afterAll(async () => { await h?.stop(); }, 60_000);
 

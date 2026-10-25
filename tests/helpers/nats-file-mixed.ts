@@ -45,6 +45,9 @@ export const NATS_MAIN_SESSION = "15310b22-bbbb-4000-8000-000000000002";
 export const FILE_OUTSIDER_SESSION = "15310f33-cccc-4000-8000-000000000003";
 /** A second allow-listed NATS root on the same machine as natsMain (commandId-collision and seat tests). */
 export const NATS_PEER_SESSION = "15310b44-dddd-4000-8000-000000000004";
+/** The fixture org.json's product owner seat (never booted; it only makes the pins file valid). */
+export const OWNER_SEAT_SESSION = "15310a55-eeee-4000-8000-000000000005";
+export const SEAT_PRINCIPAL = "Kate";
 export const rootId = (session: string): string => `session:${session}`;
 
 // ---------------------------------------------------------------------------------------------
@@ -58,7 +61,14 @@ export interface MixedLinkHandle {
   readonly closed?: Promise<unknown>;
 }
 
-export type StartMixedLink = (config: NatsLinkConfig, options: { signal: AbortSignal; log: (line: string) => void }) => Promise<MixedLinkHandle>;
+export interface MixedLinkStartOptions {
+  readonly signal: AbortSignal;
+  readonly log: (line: string) => void;
+  /** The org.json seat-pin file (fixture). Production default: bridgeNatsOrgJsonCandidates(). */
+  readonly orgJson: string;
+}
+
+export type StartMixedLink = (config: NatsLinkConfig, options: MixedLinkStartOptions) => Promise<MixedLinkHandle>;
 
 const LINK_ENTRY = path.resolve(import.meta.dirname, "../../src/mesh/bridge-nats-link.ts");
 
@@ -296,6 +306,8 @@ export interface MixedHarnessOptions {
   readonly natsPeer?: boolean;
   /** Create a persistent actor with this name, owned by the file Main (a Ryzen 1 actor, e.g. review-astra), and allow-list it. */
   readonly fileActor?: string;
+  /** Make natsPeer a principal seat: org.json binds SEAT_PRINCIPAL to it and its allow entry declares that principal. */
+  readonly seat?: boolean;
   /** Last-word edit of the allow-list before validation (e.g. mark a seat with `principal`). */
   readonly allow?: (allow: { file: NatsLinkAllowEntry[]; nats: NatsLinkAllowEntry[] }, ids: MixedIds) => void;
 }
@@ -318,6 +330,8 @@ export interface MixedHarness {
   readonly linkName: string;
   /** The exact L5 config the link runs with, already validated by parseNatsLinkConfig. */
   readonly linkConfig: NatsLinkConfig;
+  /** The fixture org.json (0600) the link reads seat pins from; never the host's real org.json. */
+  readonly orgJson: string;
   /** Link log lines (all starts). */
   readonly linkLog: string[];
   /** The file mesh the link bridges (Ryzen 1's): same root as fileMain's runtime mesh. */
@@ -421,10 +435,18 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
 
     const linkName = options.linkName ?? DEFAULT_LINK_NAME;
     const ids: MixedIds = { fileMain: fileMain.id, natsMain: natsMain.id, outsider: rootId(FILE_OUTSIDER_SESSION), natsPeer: rootId(NATS_PEER_SESSION) };
+    if (options.seat && !natsPeer) throw new Error("seat needs natsPeer");
     const allow = {
       file: [allowRoot(fileMain.id), ...(actor ? [allowActor(fileMain.id, actor.name)] : [])],
-      nats: [allowRoot(natsMain.id), ...(natsPeer ? [allowRoot(natsPeer.id)] : [])],
+      nats: [allowRoot(natsMain.id), ...(natsPeer ? [options.seat ? allowRoot(natsPeer.id, SEAT_OPERATIONS, SEAT_PRINCIPAL) : allowRoot(natsPeer.id)] : [])],
     };
+    // Seat pins come only from org.json (L3). The fixture binds the product owner to a session nobody runs,
+    // and SEAT_PRINCIPAL to natsPeer only when the test asks for a seat.
+    const seat = (name: string, session: string) => ({ name, orgInstance: { herdrAgent: `org-${name.toLowerCase()}`,
+      herdrWorkspaceLabel: `Org ${name}`, fabricSession: session } });
+    const orgJson = path.join(root, "org.json");
+    fs.writeFileSync(orgJson, JSON.stringify({ productOwner: { name: "Paul" },
+      principals: [seat("Paul", OWNER_SEAT_SESSION), ...(options.seat ? [seat(SEAT_PRINCIPAL, NATS_PEER_SESSION)] : [])] }), { mode: 0o600 });
     options.allow?.(allow, ids);
     const linkConfig = parseNatsLinkConfig({
       version: 1, name: "ryzen1", link: linkName,
@@ -443,13 +465,13 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
 
     const harness: MixedHarness = {
       root, broker, faults, wire, fileMain, natsMain, ...(outsider ? { outsider } : {}), ...(natsPeer ? { natsPeer } : {}), ...(actor ? { actor } : {}),
-      linkName, linkConfig, linkLog, fileMeshRoot, inspector, link: undefined, startLink,
+      linkName, linkConfig, orgJson, linkLog, fileMeshRoot, inspector, link: undefined, startLink,
       async startLinkNow() {
         if (!startLink) throw new Error("A' link entry (src/mesh/bridge-nats-link.ts startNatsLink) is not available");
         if (harness.link) throw new Error("link already running");
         linkAbort = new AbortController();
         linkLog.push(`--- harness: link start ${new Date().toISOString()}`);
-        harness.link = await startLink(linkConfig, { signal: linkAbort.signal, log: (line) => { linkLog.push(line); } });
+        harness.link = await startLink(linkConfig, { signal: linkAbort.signal, log: (line) => { linkLog.push(line); }, orgJson });
         return harness.link;
       },
       async stopLink() {

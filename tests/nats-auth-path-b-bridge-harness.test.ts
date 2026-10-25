@@ -5,9 +5,10 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { natsLinkStatePaths, preflightNatsLinkConfig } from "../src/mesh/bridge-nats-config.js";
+import { loadBridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
 import type { TransportEnvelope } from "../src/transport/types.js";
 import { resolveNatsBinary } from "./helpers/nats-cluster.js";
-import { BRIDGE_MACHINE, createMixedHarness, NATS_MAIN_MACHINE, selfRecord, waitForValue, type MixedHarness } from "./helpers/nats-file-mixed.js";
+import { BRIDGE_MACHINE, createMixedHarness, NATS_MAIN_MACHINE, OWNER_SEAT_SESSION, selfRecord, waitForValue, type MixedHarness } from "./helpers/nats-file-mixed.js";
 import { publishTo } from "./helpers/nats-wire-faults.js";
 
 const binary = resolveNatsBinary();
@@ -59,6 +60,8 @@ describe.skipIf(!binary || process.platform !== "linux")("A' mixed FILE <-> NATS
       allow: { file: [{ kind: "root", id: h.fileMain.id }, { kind: "actor", rootId: h.fileMain.id, name: "bridge-review" }],
         nats: [{ kind: "root", id: h.natsMain.id }] } });
     expect(() => preflightNatsLinkConfig(h.linkConfig)).not.toThrow();
+    // Seat pins come from the harness's own org.json fixture, never the host's (L3's strict reader accepts it).
+    expect(loadBridgeNatsSeatPins(h.orgJson)).toMatchObject({ source: h.orgJson, seats: new Map([["Paul", `session:${OWNER_SEAT_SESSION}`]]) });
     expect(natsLinkStatePaths(h.linkConfig).ledger.startsWith(h.root)).toBe(true);
   });
 

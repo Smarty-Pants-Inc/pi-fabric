@@ -88,7 +88,7 @@ export const callMainDrain = (socket: string, sessionId: string, op: MainDrainOp
       catch { finish(new MainDrainClientError("MAIN_DRAIN_REPLY_INVALID")); return; }
       if (typeof value !== "object" || value === null || value.v !== 1) { finish(new MainDrainClientError("MAIN_DRAIN_REPLY_INVALID")); return; }
       if (value.ok !== true) {
-        finish(new MainDrainClientError(typeof value.error === "string" && /^[A-Z_]{1,64}$/.test(value.error)
+        finish(new MainDrainClientError(typeof value.error === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(value.error)
           ? `MAIN_DRAIN_REFUSED_${value.error}` : "MAIN_DRAIN_REFUSED"));
         return;
       }

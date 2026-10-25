@@ -29,6 +29,8 @@ import type { ParticipantRoute, ParticipantView } from "./participant-view.js";
 import { assertNatsDrainReceiptForRelease, readNatsDrainReceipt } from "./nats-drain-receipt.js";
 
 const CONTROL_TOPIC = "fabric.control.command";
+/** D3 seat drain (smarty-dev#15310 r2 N7): a draining Main's typed, retryable pre-admission refusal (main-drain/gate.ts). */
+const MAIN_DRAINING = "FABRIC_MAIN_DRAINING";
 const ACK_TOPIC = "fabric.control.ack";
 const CONTROL_SEEN_PREFIX = "topology/control-seen/";
 // The participant directory's host records (topology/participant-directory.ts).
@@ -202,7 +204,7 @@ export interface FabricControlAcceptance {
   replacedMessageId?: string;
   result?: unknown;
   error?: string;
-  errorCode?: typeof CONTROL_STALE_INCARNATION | FabricInterruptErrorCode | NatsControlErrorCode;
+  errorCode?: typeof CONTROL_STALE_INCARNATION | FabricInterruptErrorCode | NatsControlErrorCode | typeof MAIN_DRAINING;
   /** The owner proves the handler did not run for this command, so a new command cannot deliver twice. */
   notRun?: true;
 }
@@ -211,10 +213,11 @@ export interface FabricControlAcceptance {
 class FabricControlRejection extends Error {
   /** Marks an owner's remote rejection; the router records no local refusal outcome for it. */
   readonly rejection = "FABRIC_CONTROL_REJECTED";
-  constructor(message: string, readonly notRun: boolean, readonly code?: FabricInterruptErrorCode | NatsControlErrorCode) {
+  constructor(message: string, readonly notRun: boolean, readonly code?: FabricInterruptErrorCode | NatsControlErrorCode | typeof MAIN_DRAINING) {
     super(message);
     if (code === "FABRIC_INTERRUPT_NOT_AUTHORIZED" || code === "FABRIC_INTERRUPT_RATE_LIMITED") this.name = code === "FABRIC_INTERRUPT_NOT_AUTHORIZED"
       ? "FabricInterruptNotAuthorizedError" : "FabricInterruptRateLimitedError";
+    if (code === MAIN_DRAINING) this.name = "FabricMainDrainingError";
   }
 }
 
@@ -2119,7 +2122,8 @@ export class FabricControlPlane {
       ...(typeof data.error === "string" ? { error: data.error } : {}),
       ...(data.accepted === false && data.errorCode === CONTROL_STALE_INCARNATION
         ? { errorCode: CONTROL_STALE_INCARNATION } : {}),
-      ...(data.errorCode === "FABRIC_INTERRUPT_NOT_AUTHORIZED" || data.errorCode === "FABRIC_INTERRUPT_RATE_LIMITED"
+      ...(data.errorCode === "FABRIC_INTERRUPT_NOT_AUTHORIZED" || data.errorCode === "FABRIC_INTERRUPT_RATE_LIMITED" ||
+        (data.accepted === false && data.errorCode === MAIN_DRAINING)
         ? { errorCode: data.errorCode } : {}),
       ...(pending.ownerMachine !== undefined && data.accepted === false &&
         (data.errorCode === "FABRIC_CONTROL_ID_CONFLICT" || data.errorCode === "FABRIC_SENDER_UNVERIFIED")

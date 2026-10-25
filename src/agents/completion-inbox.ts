@@ -278,6 +278,9 @@ export class AgentCompletionInbox {
     this.#schedule();
   }
 
+  /** D3 seat drain (smarty-dev#15310), read-only: completions not yet confirmed in the session (pending or handed). */
+  drainPending(): number { return this.#pending.size + this.#handed.size; }
+
   close(): void {
     for (const receipt of this.#receiptRetries) this.#confirmDelivery(receipt);
     this.#closed = true;

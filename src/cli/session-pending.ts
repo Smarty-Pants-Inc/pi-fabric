@@ -126,13 +126,21 @@ class Observation {
   }
 }
 
-interface ActorInventory {
+export interface ActorInventory {
   id: string;
   name: string;
   scope: "project" | "session";
   rootId: string;
   registry: string;
   status: string;
+  /** The row's own residency (absent reads as session, as ActorManager loads it); anything else is unknown. */
+  residency: "session" | "durable" | "unknown";
+  /** Row fields that mean work or a removal is still pending (smarty-dev#15310 drain). */
+  inFlightRun: boolean;
+  preparing: boolean;
+  removal: boolean;
+  stopReason: string | null;
+  lastRunId: string | null;
   queued: number | null;
   inFlight: number | null;
   queueFiles: string[];
@@ -146,7 +154,12 @@ const actorInventory = (observation: Observation, source: Row, registry: string,
   const names = observation.names(directory);
   const result: ActorInventory = {
     id: source.id as string, name: source.name as string, rootId: source.rootId as string, scope, registry,
-    status: source.status as string, queued: 0, inFlight: 0, queueFiles: [], settledWindows: 0,
+    status: source.status as string,
+    residency: source.residency === undefined || source.residency === "session" ? "session" : source.residency === "durable" ? "durable" : "unknown",
+    inFlightRun: source.inFlightRun !== undefined, preparing: source.preparing !== undefined, removal: source.removal !== undefined,
+    stopReason: typeof source.stopReason === "string" ? source.stopReason : null,
+    lastRunId: typeof source.lastRunId === "string" ? source.lastRunId : null,
+    queued: 0, inFlight: 0, queueFiles: [], settledWindows: 0,
     pendingDeliveryOutcomes: 0, childCompletionEntries: null,
   };
   const items = new Map<string, boolean>();
@@ -222,12 +235,43 @@ export const runSessionPendingCli = async (
       io.stdout.write(`${JSON.stringify({ format: 1, error: "mesh-required", unknown: ["Specify --mesh or PI_FABRIC_MESH_ROOT; implicit discovery imports the runtime store graph"] })}\n`);
       return 1;
     }
-    const meshRoot = path.resolve(mesh);
+    const inventory = inventorySessionPending(path.resolve(mesh), sessionId);
+    io.stdout.write(`${JSON.stringify(inventory)}\n`);
+    return inventory.complete ? 0 : 1;
+  } catch (error) {
+    const usage = error instanceof UsageError;
+    io[usage ? "stderr" : "stdout"].write(`${JSON.stringify({ format: 1, error: usage ? "usage" : "unreadable-state",
+      ...(usage ? { message: error.message, usage: USAGE } : { unknown: ["Inventory could not be completed"] }) })}\n`);
+    return usage ? 2 : 1;
+  }
+};
+
+export interface SessionPendingFollowUps {
+  file: string; present: boolean | null; count: number | null; ids?: string[]; oldestAt?: number; owner?: Row | null;
+  /** held: Fabric still holds it (no `handed`); handed: handed to Pi, not yet confirmed in the session. */
+  held?: number; handed?: number; handedIds?: string[];
+  /** The Main's owner halt (`<journal>.delivered` halted): a halted Main never flushes held items. null: unknown. */
+  halted?: boolean | null;
+}
+export type SessionPendingInventory = {
+  format: 1; checkedAt: string; meshRoot: string; sessionId: string; rootId: string; basis: "recorded-files-not-live-state";
+  complete: boolean; followUps: SessionPendingFollowUps;
+  routing: { successorRootId: string | null; routes: number | null; unfinishedRoutes: number | null };
+  actors: ActorInventory[];
+  totals: Record<"actors" | "followUps" | "queued" | "inFlight" | "settledWindows" | "pendingDeliveryOutcomes" | "childCompletionEntries", number | null>;
+  unknown: string[];
+};
+
+/**
+ * The filesystem-only inventory behind `pi-fabric session pending`, also reused by the D3 drain seam
+ * (smarty-dev#15310): no store constructors, locks, recovery or receipt acknowledgement. It throws
+ * only on an unexpected internal failure, which a caller reports as unknown.
+ */
+export const inventorySessionPending = (meshRoot: string, sessionId: string): SessionPendingInventory => {
     const rootId = `session:${sessionId}`;
     const observation = new Observation();
     const mailbox = path.join(meshRoot, "main-followups", `${encodeURIComponent(sessionId)}.json`);
-    const followUps: { file: string; present: boolean | null; count: number | null; ids?: string[]; oldestAt?: number; owner?: Row | null } =
-      { file: mailbox, present: null, count: null };
+    const followUps: SessionPendingFollowUps = { file: mailbox, present: null, count: null };
     const actors: ActorInventory[] = [];
     const routing: { successorRootId: string | null; routes: number | null; unfinishedRoutes: number | null } =
       { successorRootId: null, routes: null, unfinishedRoutes: null };
@@ -240,18 +284,21 @@ export const runSessionPendingCli = async (
       observation.quietNames(path.join(meshRoot, "main-followups"), true);
       const journal = observation.json(mailbox);
       followUps.present = journal.present;
-      if (journal.present === false) followUps.count = 0;
+      if (journal.present === false) { followUps.count = 0; followUps.held = 0; followUps.handed = 0; followUps.ids = []; followUps.handedIds = []; }
       else {
         const saved = row(journal.value);
         if (!saved || saved.version !== 1 || !Array.isArray(saved.items) || saved.items.some(item => {
           const entry = row(item); const from = row(entry?.from);
           return !entry || typeof entry.id !== "string" || !entry.id || !time(entry.sentAt) ||
             typeof entry.message !== "string" || !from || typeof from.id !== "string" || !from.id.trim() ||
-            typeof from.kind !== "string" || !from.kind.trim();
+            typeof from.kind !== "string" || !from.kind.trim() || (entry.handed !== undefined && entry.handed !== true);
         })) observation.problem(mailbox, "unknown follow-up journal shape");
         else {
-          const items = saved.items as Array<{ id: string; sentAt: number }>;
+          const items = saved.items as Array<{ id: string; sentAt: number; handed?: true }>;
           followUps.count = items.length; followUps.ids = items.map(item => item.id);
+          followUps.handedIds = items.filter(item => item.handed === true).map(item => item.id);
+          followUps.handed = followUps.handedIds.length;
+          followUps.held = items.length - followUps.handed;
           if (items.length) followUps.oldestAt = items.reduce((oldest, item) => Math.min(oldest, item.sentAt), Infinity);
         }
       }
@@ -268,6 +315,11 @@ export const runSessionPendingCli = async (
         } else followUps.owner = Object.fromEntries(["rootId", "sessionId", "ownerIdentityId", "pid", "host", "activationId", "processStartedAt", "retired"]
           .filter(key => value[key] !== undefined).map(key => [key, value[key]]));
       }
+      // The owner halt index is rewritten at every consumption: read it untracked (it holds no work).
+      const haltIndex = quietJson(`${mailbox}.delivered`);
+      const halt = haltIndex && !haltIndex.absent ? row(haltIndex.value) : undefined;
+      followUps.halted = haltIndex?.absent ? false
+        : halt && halt.version === 1 && (halt.halted === undefined || typeof halt.halted === "boolean") ? halt.halted === true : null;
       const successorFile = path.join(meshRoot, "main-followups", "successors", `${createHash("sha256").update(rootId).digest("hex")}.json`);
       const successor = observation.json(successorFile);
       if (successor.present !== false) {
@@ -409,17 +461,10 @@ export const runSessionPendingCli = async (
     const complete = observation.unknown.length === 0;
     const sum = (key: "queued" | "inFlight" | "settledWindows" | "pendingDeliveryOutcomes" | "childCompletionEntries"): number | null =>
       complete && actorCoverage && actors.every(actor => actor[key] !== null) ? actors.reduce((total, actor) => total + actor[key]!, 0) : null;
-    io.stdout.write(`${JSON.stringify({ format: 1, checkedAt: new Date().toISOString(), meshRoot, sessionId, rootId,
+    return { format: 1, checkedAt: new Date().toISOString(), meshRoot, sessionId, rootId,
       basis: "recorded-files-not-live-state", complete, followUps, routing, actors,
       totals: { actors: actorCoverage && complete ? actors.length : null, followUps: complete ? followUps.count : null,
         queued: sum("queued"), inFlight: sum("inFlight"), settledWindows: sum("settledWindows"),
         pendingDeliveryOutcomes: sum("pendingDeliveryOutcomes"), childCompletionEntries: sum("childCompletionEntries") },
-      unknown: observation.unknown })}\n`);
-    return complete ? 0 : 1;
-  } catch (error) {
-    const usage = error instanceof UsageError;
-    io[usage ? "stderr" : "stdout"].write(`${JSON.stringify({ format: 1, error: usage ? "usage" : "unreadable-state",
-      ...(usage ? { message: error.message, usage: USAGE } : { unknown: ["Inventory could not be completed"] }) })}\n`);
-    return usage ? 2 : 1;
-  }
+      unknown: observation.unknown };
 };

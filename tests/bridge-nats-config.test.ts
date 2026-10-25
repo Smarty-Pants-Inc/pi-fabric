@@ -48,7 +48,7 @@ const FILE = [
 const NATS_ALLOW = [
   { kind: "root", id: KATE, principal: "Kate", machine: "sandbox1",
     send: ["followUp", "cancel"], receive: ["followUp", "cancel"], receiveTopics: ["ops.owner", "fleet.work.*"] },
-  { kind: "root", id: LEAD, send: ["followUp", "steer", "ask", "cancel"], receive: ["followUp", "steer", "ask"] },
+  { kind: "root", id: LEAD, machine: "sandbox1", send: ["followUp", "steer", "ask", "cancel"], receive: ["followUp", "steer", "ask"] },
 ];
 const ALLOW = { file: FILE, nats: NATS_ALLOW };
 const sample = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -87,8 +87,8 @@ describe("nats-link config", () => {
       { ...FILE[1], side: "file", receive: ["followUp"] },
       ...NATS_ALLOW.map((entry) => ({ ...entry, side: "nats" })),
     ] });
-    expect(parseNatsLinkConfig(sample({ allow: { nats: [{ kind: "root", id: KATE }] } })).allow.entries)
-      .toEqual([{ kind: "root", id: KATE, side: "nats", send: ["followUp"], receive: ["followUp"] }]);
+    expect(parseNatsLinkConfig(sample({ allow: { nats: [{ kind: "root", id: KATE, machine: "sandbox1" }] } })).allow.entries)
+      .toEqual([{ kind: "root", id: KATE, machine: "sandbox1", side: "nats", send: ["followUp"], receive: ["followUp"] }]);
     expect(config.orgJson).toBeUndefined();
     expect(parseNatsLinkConfig(sample({ orgJson: "/srv/test-org/org.json" })).orgJson).toBe("/srv/test-org/org.json");
     refused(sample({ orgJson: "org.json" }), "orgJson");
@@ -157,7 +157,7 @@ describe("nats-link config", () => {
 
   it("keeps each identity listed once and on one side, seats capped and pins sane", () => {
     // An identity lives on one side only, and is listed once.
-    refused(sample({ allow: { file: [{ kind: "root", id: KATE }], nats: [{ kind: "root", id: KATE }] } }), "allow.nats[0]");
+    refused(sample({ allow: { file: [{ kind: "root", id: KATE }], nats: [{ kind: "root", id: KATE, machine: "sandbox1" }] } }), "allow.nats[0]");
     refused(sample({ allow: { nats: [NATS_ALLOW[1], { ...NATS_ALLOW[1], send: ["steer"] }] } }), "allow.nats[1]");
     refused(sample({ allow: { file: [FILE[1], { kind: "actor", rootId: PAUL, name: "other", id: ASTRA }] } }), "allow.file[1]");
     refused(sample({ allow: { file: [FILE[1], { kind: "actor", rootId: PAUL, name: "review-astra" }] } }), "allow.file[1]");
@@ -165,7 +165,7 @@ describe("nats-link config", () => {
     refused(withEntry("nats", 0, { receive: ["followUp", "steer"] }), "allow.nats[0].receive");
     // stop, setModel and setThinking are received by no destination class; a NATS actor receives nothing.
     refused(withEntry("nats", 1, { receive: ["followUp", "stop"] }), "allow.nats[0].receive");
-    refused(sample({ allow: { nats: [{ kind: "actor", rootId: LEAD, name: "helper", receive: ["followUp"] }] } }), "allow.nats[0].receive");
+    refused(sample({ allow: { nats: [{ kind: "actor", rootId: LEAD, name: "helper", machine: "sandbox1", receive: ["followUp"] }] } }), "allow.nats[0].receive");
     refused(withEntry("nats", 1, { send: ["followUp", "followUp"] }), "allow.nats[0].send");
     refused(withEntry("nats", 1, { send: ["tell"] }), "allow.nats[0].send");
     refused(withEntry("file", 1, { principal: "Paul" }), "allow.file[0]");
@@ -173,7 +173,7 @@ describe("nats-link config", () => {
     refused(withEntry("file", 1, { id: "review-astra" }), "allow.file[0].id");
     refused(withEntry("file", 1, { rootId: "bridge:v2" }), "allow.file[0].rootId");
     refused(withEntry("nats", 1, { id: "bridge:v2" }), "allow.nats[0].id");
-    refused(sample({ allow: { nats: [{ kind: "main", id: LEAD }] } }), "allow.nats[0].kind");
+    refused(sample({ allow: { nats: [{ kind: "main", id: LEAD, machine: "sandbox1" }] } }), "allow.nats[0].kind");
     refused(withEntry("nats", 1, { note: "x".repeat(201) }), "allow.nats[0].note");
     // A machine pin is for a NATS identity, on an org machine, never the bridge's own machine (where mirrors live).
     refused(withEntry("nats", 0, { machine: "ryzen1-bridge" }), "allow.nats[0].machine");

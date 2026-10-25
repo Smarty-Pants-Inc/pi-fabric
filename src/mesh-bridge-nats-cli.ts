@@ -1,15 +1,18 @@
 // nats-link (smarty-dev#15310, A' lane L5): run and inspect one file-mesh <-> NATS link.
 //
-//   nats-link start   --config FILE [--dry-run]
-//   nats-link status  --config FILE
-//   nats-link receipt --config FILE (--command ID [--after SEQ] | --session ID [--nats])
-//   nats-link roots   [--config FILE] [--servers URLS] [--machine M] [--creds FILE] [--ca FILE]
-//                     [--include-stale] [--kind root|actor|agent|provider]... [--timeout-ms N]
+//   nats-link start    --config FILE
+//   nats-link dry-run  --config FILE
+//   nats-link withdraw --config FILE
+//   nats-link status   --config FILE
+//   nats-link receipt  --config FILE (--command ID [--after SEQ] | --session ID [--nats])
+//   nats-link roots    [--config FILE] [--servers URLS] [--machine M] [--creds FILE] [--ca FILE]
+//                      [--include-stale] [--kind root|actor|agent|provider]... [--timeout-ms N]
 //
-// start checks the allow-list against org.json's principal seats, then runs the link in the foreground under
-// the service manager; with --dry-run it prints what each allow entry resolves to now and starts nothing.
-// status, receipt, roots and start --dry-run only read: they write no mesh state or event, no link state and
-// nothing to NATS. One JSON object (roots: one array) on stdout.
+// start checks the allow-list against org.json's principal seats, takes the link's state-directory lock,
+// then runs the link in the foreground under the service manager. dry-run prints what each allow entry
+// resolves to now and starts nothing. withdraw is the rollback: it stops the running link and withdraws its
+// mirrors on both sides. status, receipt, roots and dry-run only read: they write no mesh state or event, no
+// link state and nothing to NATS. One JSON object (roots: one array) on stdout.
 // Exit 0 ok, 1 not ok or unknown (never 0 on missing data), 2 usage or config. Contract: docs/mesh-bridge-nats.md.
 import fs from "node:fs";
 import path from "node:path";
@@ -21,11 +24,11 @@ import {
   loadNatsLinkConfig,
   type NatsLinkConfig,
   NatsLinkConfigError,
-  natsLinkMeshNatsConfig,
   natsLinkStatePaths,
   preflightNatsLinkConfig,
 } from "./mesh/bridge-nats-config.js";
 import { type NatsRootInfo, type NatsRootsSource, NatsRootsUnavailableError, natsRootsSourceFromEnv, readNatsRoots } from "./mesh/bridge-nats-roots.js";
+import { acquireNatsLinkLock, NatsLinkBusyError, natsLinkRootsSource, type NatsLinkWithdrawOptions, withdrawNatsLink } from "./mesh/bridge-nats-ops.js";
 import {
   BridgeNatsAllowListError,
   bridgeNatsAllowKey,
@@ -49,10 +52,12 @@ const KINDS: readonly FabricParticipantKind[] = ["root", "actor", "agent", "prov
 const SESSION = /^(?:session:)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 
 export const USAGE = `usage:
-  nats-link start   --config FILE [--dry-run]
-  nats-link status  --config FILE
-  nats-link receipt --config FILE (--command ID [--after SEQ] | --session ID [--nats])
-  nats-link roots   [--config FILE] [--servers URLS] [--machine M] [--creds FILE] [--ca FILE] [--include-stale] [--kind KIND]... [--timeout-ms N]`;
+  nats-link start    --config FILE
+  nats-link dry-run  --config FILE
+  nats-link withdraw --config FILE
+  nats-link status   --config FILE
+  nats-link receipt  --config FILE (--command ID [--after SEQ] | --session ID [--nats])
+  nats-link roots    [--config FILE] [--servers URLS] [--machine M] [--creds FILE] [--ca FILE] [--include-stale] [--kind KIND]... [--timeout-ms N]`;
 
 class UsageError extends Error {}
 
@@ -60,11 +65,13 @@ type Flags = { values: Map<string, string[]>; booleans: Set<string> };
 
 const VALUED: Record<string, readonly string[]> = {
   start: ["config"],
+  "dry-run": ["config"],
+  withdraw: ["config"],
   status: ["config"],
   receipt: ["config", "command", "session", "after"],
   roots: ["config", "servers", "machine", "creds", "ca", "kind", "timeout-ms"],
 };
-const BOOLEAN: Record<string, readonly string[]> = { start: ["dry-run"], receipt: ["nats"], roots: ["include-stale"] };
+const BOOLEAN: Record<string, readonly string[]> = { receipt: ["nats"], roots: ["include-stale"] };
 const REPEATABLE = new Set(["kind"]);
 
 const parseFlags = (mode: string, argv: readonly string[]): Flags => {
@@ -265,8 +272,8 @@ const identityGate = (config: NatsLinkConfig) =>
   createBridgeNatsIdentityGate(config.allow, { pins: loadBridgeNatsSeatPins(config.orgJson) });
 
 /**
- * start --dry-run: for every allow entry, what it resolves to on its home side right now and what the link
- * would mirror (L3's bridgeNatsDryRun). Reads the file mesh and NATS presence only; writes nothing.
+ * dry-run: for every allow entry, what it resolves to on its home side right now and what the link would
+ * mirror (L3's bridgeNatsDryRun). Reads the file mesh and NATS presence only; writes nothing.
  */
 export const natsLinkDryRun = async (
   config: NatsLinkConfig,
@@ -276,7 +283,7 @@ export const natsLinkDryRun = async (
   const store = openReadOnly(config);
   let rows: ParticipantRow[];
   try { rows = fileParticipants(store); } finally { store.closeState(); }
-  const roots = await (options.readRoots ?? readNatsRoots)(linkSource(config), { includeStale: true, kinds: ["root", "actor"] });
+  const roots = await (options.readRoots ?? readNatsRoots)(natsLinkRootsSource(config), { includeStale: true, kinds: ["root", "actor"] });
   const now = (options.now ?? Date.now)();
   return bridgeNatsDryRun(gate, { file: filePresenceView(rows, now), nats: natsPresenceView(roots, now) }, now);
 };
@@ -397,15 +404,6 @@ export const commandReceipt = (config: NatsLinkConfig, commandId: string, after 
   }
 };
 
-const linkSource = (config: NatsLinkConfig): NatsRootsSource => {
-  const nats = natsLinkMeshNatsConfig(config);
-  return {
-    servers: nats.servers as string[], machine: nats.machine!, credentials: nats.credentials!, caFile: nats.tls!.caFile!,
-    custodyStream: nats.custodyStream!, livenessStream: nats.livenessStream!, pathBMachines: nats.pathBMachines!,
-    ...(nats.org === undefined ? {} : { org: nats.org }), events: nats.events === true,
-  };
-};
-
 /**
  * One identity's route evidence: its record on the file mesh (native, or this link's mirror), any hub
  * handoff of it, its allow-list entry, and with `nats` its NATS presence. `routable` (exit 0) needs a live
@@ -443,7 +441,7 @@ export const sessionReceipt = async (
   let nats: Record<string, unknown> | null = null;
   if (options.nats) {
     try {
-      const roots = await (options.readRoots ?? readNatsRoots)(linkSource(config), { includeStale: true });
+      const roots = await (options.readRoots ?? readNatsRoots)(natsLinkRootsSource(config), { includeStale: true });
       const matches: NatsRootInfo[] = roots.filter((root) => root.id === id);
       const root = matches.length === 1 ? matches[0]! : undefined;
       nats = { read: true, records: matches };
@@ -485,6 +483,8 @@ export interface NatsLinkCliIo {
   env?: NodeJS.ProcessEnv;
   /** start's stop signal; default: SIGTERM/SIGINT (a second signal exits at once, as mesh-bridge run). */
   signal?: AbortSignal;
+  /** withdraw's NATS opener, stop bound and signal sender (tests). */
+  withdraw?: NatsLinkWithdrawOptions;
 }
 
 export const main = async (argv: string[], io: NatsLinkCliIo = {}): Promise<number> => {
@@ -508,7 +508,7 @@ export const main = async (argv: string[], io: NatsLinkCliIo = {}): Promise<numb
         throw new UsageError("--config and connection flags are exclusive");
       }
       let source: NatsRootsSource;
-      if (config) source = linkSource(loadNatsLinkConfig(config));
+      if (config) source = natsLinkRootsSource(loadNatsLinkConfig(config));
       else {
         try {
           source = natsRootsSourceFromEnv(io.env ?? process.env, {
@@ -546,34 +546,45 @@ export const main = async (argv: string[], io: NatsLinkCliIo = {}): Promise<numb
       }
     }
     const config = loadNatsLinkConfig(required(flags, "config"));
+    if (mode === "dry-run") {
+      preflightNatsLinkConfig(config, { createStateDir: false });
+      const report = await natsLinkDryRun(config, io.readRoots ? { readRoots: io.readRoots } : {});
+      write(out, report);
+      return report.refused === 0 ? 0 : 1;
+    }
+    if (mode === "withdraw") {
+      const report = await withdrawNatsLink(config, io.withdraw ?? {});
+      write(out, report);
+      return report.ok ? 0 : 1;
+    }
     if (mode === "start") {
-      const dryRun = flags.booleans.has("dry-run");
-      preflightNatsLinkConfig(config, { createStateDir: !dryRun });
-      if (dryRun) {
-        const report = await natsLinkDryRun(config, io.readRoots ? { readRoots: io.readRoots } : {});
-        write(out, report);
-        return report.refused === 0 ? 0 : 1;
-      }
+      preflightNatsLinkConfig(config);
       // Fail fast, before anything opens: an allow entry that contradicts org.json's seats refuses the start.
       identityGate(config);
       const starter = io.starter ?? await loadNatsLinkStarter();
-      if (io.signal) return await runNatsLink(config, io.signal, starter, log);
-      const controller = new AbortController();
-      let signals = 0;
-      const stop = (): void => {
-        if (++signals === 1) controller.abort();
-        else process.exit(0);
-      };
-      process.on("SIGTERM", stop);
-      process.on("SIGINT", stop);
+      // One link per state directory: a second start (or a running withdraw) is refused by name.
+      const release = acquireNatsLinkLock(config, "start");
       try {
-        return await runNatsLink(config, controller.signal, starter, log);
-      } finally {
-        // After a requested stop keep the two-signal contract armed until exit (as mesh-bridge run).
-        if (!controller.signal.aborted) {
-          process.off("SIGTERM", stop);
-          process.off("SIGINT", stop);
+        if (io.signal) return await runNatsLink(config, io.signal, starter, log);
+        const controller = new AbortController();
+        let signals = 0;
+        const stop = (): void => {
+          if (++signals === 1) controller.abort();
+          else process.exit(0);
+        };
+        process.on("SIGTERM", stop);
+        process.on("SIGINT", stop);
+        try {
+          return await runNatsLink(config, controller.signal, starter, log);
+        } finally {
+          // After a requested stop keep the two-signal contract armed until exit (as mesh-bridge run).
+          if (!controller.signal.aborted) {
+            process.off("SIGTERM", stop);
+            process.off("SIGINT", stop);
+          }
         }
+      } finally {
+        release();
       }
     }
     if (mode === "status") {
@@ -602,7 +613,8 @@ export const main = async (argv: string[], io: NatsLinkCliIo = {}): Promise<numb
       err(`nats-link: ${error.message}\n${USAGE}\n`);
       return 2;
     }
-    if (error instanceof NatsLinkConfigError || error instanceof BridgeNatsAllowListError || error instanceof BridgeNatsSeatPinsError) {
+    if (error instanceof NatsLinkConfigError || error instanceof BridgeNatsAllowListError || error instanceof BridgeNatsSeatPinsError ||
+      error instanceof NatsLinkBusyError) {
       log(`${error.code}: ${error.message}`);
       return 2;
     }

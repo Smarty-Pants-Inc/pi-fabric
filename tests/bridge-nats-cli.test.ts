@@ -57,7 +57,7 @@ const setup = async () => {
       operatorMachine: "fabric-ops" },
     allow: {
       file: [{ kind: "root", id: PAUL, principal: "Paul", receive: ["followUp", "cancel"] }],
-      nats: [{ kind: "root", id: KATE, principal: "Kate", receive: ["followUp", "cancel"] }],
+      nats: [{ kind: "root", id: KATE, principal: "Kate", machine: "sandbox1", receive: ["followUp", "cancel"] }],
     },
   }), { mode: 0o600 });
   return { dir, mesh, stateDir, store, config, credentials, orgJson };
@@ -210,19 +210,29 @@ describe("nats-link CLI", () => {
   });
 
   it("start runs the link until stopped (exit 0) and exits 1 when the link ends by itself", async () => {
-    const { config, credentials } = await setup();
+    const { config, credentials, stateDir } = await setup();
     let stops = 0;
     let seen: { link?: string; signal?: AbortSignal } = {};
     const handle = (closed: Promise<void>): NatsLinkHandle => ({ closed, stop: async () => { stops += 1; } });
     const controller = new AbortController();
+    const lock = path.join(stateDir, "link.lock");
+    let second: Awaited<ReturnType<typeof run>> | undefined;
     const starter: NatsLinkStarter = async (linkConfig, options) => {
       seen = { link: linkConfig.link, signal: options.signal };
+      // While it runs, the link holds its state directory: a second start is refused by name.
+      expect(JSON.parse(fs.readFileSync(lock, "utf8"))).toMatchObject({ link: "v2", purpose: "start", pid: process.pid });
       setTimeout(() => controller.abort(), 10);
       return handle(new Promise<void>(() => undefined));
     };
-    expect((await run(["start", "--config", config], { starter, signal: controller.signal })).code).toBe(0);
+    const running = run(["start", "--config", config], { starter, signal: controller.signal });
+    second = await run(["start", "--config", config], { starter: async () => handle(new Promise(() => undefined)),
+      signal: new AbortController().signal });
+    expect((await running).code).toBe(0);
     expect(seen.link).toBe("v2");
     expect(stops).toBe(1);
+    expect(fs.existsSync(lock)).toBe(false);
+    expect(second.code).toBe(2);
+    expect(second.err).toContain("FABRIC_NATS_LINK_BUSY: link v2 is held by start pid");
 
     const failed = await run(["start", "--config", config], {
       starter: async () => handle(Promise.reject(new Error("NATS connection lost"))), signal: new AbortController().signal });
@@ -238,6 +248,16 @@ describe("nats-link CLI", () => {
       expect(unsafe.code).toBe(2);
       expect(unsafe.err).toContain("nats.credentials must not be readable by group or others");
     }
+  });
+
+  it("withdraw prints its report and exits 1 unless both sides came out clean", async () => {
+    const { config, store } = await setup();
+    await addRoot(store, KATE, { remoteHost: "v2" });
+    const result = await run(["withdraw", "--config", config], {
+      withdraw: { open: async () => { throw new Error("broker unreachable"); } } });
+    expect(result.code).toBe(1);
+    expect(result.json()).toMatchObject({ ok: false, link: "v2", stopped: null, nats: { error: "broker unreachable" },
+      file: { removed: [KATE], remaining: [] }, problems: ["NATS withdraw failed"] });
   });
 
   it("start without a link module in this build fails by name", async () => {
@@ -263,7 +283,7 @@ describe("nats-link CLI", () => {
     expect(missing.err).toContain("BRIDGE_NATS_SEAT_PINS_INVALID");
   });
 
-  it("start --dry-run reports what each allow entry resolves to now, and writes nothing", async () => {
+  it("dry-run reports what each allow entry resolves to now, and writes nothing", async () => {
     const { config, store, stateDir } = await setup();
     fs.rmdirSync(stateDir);
     await addRoot(store, PAUL, { incarnation: "inc-p" });
@@ -271,7 +291,8 @@ describe("nats-link CLI", () => {
       ownerHostId: KATE, ownerIdentityId: KATE, ownerIncarnation: "inc-k", status: "idle", capabilities: ["followUp"], live: true };
     let starts = 0;
     const starter: NatsLinkStarter = async () => { starts += 1; return { closed: new Promise(() => undefined), stop: async () => undefined }; };
-    const dry = await run(["start", "--config", config, "--dry-run"], { starter, readRoots: async () => [kate] });
+    expect((await run(["start", "--config", config, "--dry-run"], { starter, readRoots: async () => [kate] })).code).toBe(2);
+    const dry = await run(["dry-run", "--config", config], { starter, readRoots: async () => [kate] });
     expect(dry.code).toBe(0);
     expect(dry.json()).toMatchObject({ v: 1, link: "v2", natsMachine: "ryzen1-bridge", live: 2, refused: 0, rows: [
       { side: "file", key: PAUL, status: "live", id: PAUL, mirrorTo: "nats", principal: "Paul" },
@@ -279,10 +300,10 @@ describe("nats-link CLI", () => {
     ] });
     expect([starts, fs.existsSync(stateDir)]).toEqual([0, false]);
     // Kate not on NATS yet: the row says so and the dry run exits 1.
-    const absent = await run(["start", "--config", config, "--dry-run"], { starter, readRoots: async () => [] });
+    const absent = await run(["dry-run", "--config", config], { starter, readRoots: async () => [] });
     expect(absent.code).toBe(1);
     expect((absent.json().rows as Array<{ side: string; status: string }>).find((row) => row.side === "nats")!.status).not.toBe("live");
-    const down = await run(["start", "--config", config, "--dry-run"], { starter,
+    const down = await run(["dry-run", "--config", config], { starter,
       readRoots: async () => { throw new NatsRootsUnavailableError("no complete NATS presence snapshot within 10000 ms"); } });
     expect([down.code, down.out]).toEqual([1, ""]);
   });

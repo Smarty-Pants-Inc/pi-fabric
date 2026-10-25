@@ -104,7 +104,8 @@ How to read it:
   `BRIDGE_NATS_SIDE_MISMATCH` (the id lives on the other side), `BRIDGE_NATS_NOT_ALLOWED`, or
   `unresolved` (an actor entry without an id pin that the listing did not find).
 - A seat row must show `receive` within `followUp, cancel`; a moved lead or Ryzen 1 row within
-  `followUp, steer, ask, cancel`. Anything else would not have parsed (exit `2`).
+  `followUp, steer, ask, cancel`. Every `nats` row is pinned to a `machine`. Anything else would not have
+  parsed (exit `2`).
 - A refused row is not an error of the dry run; it is what the pass and the operator must look at before
   the live start. Kate's seat refused as `BRIDGE_NATS_AMBIGUOUS`, for example, means a second machine
   holds a record for her session id: stop and find it before going live.
@@ -149,8 +150,9 @@ directory. Nothing else on either side is written, so the rollback is:
    "$FABRIC/bin/nats-link" withdraw --config "$CONFIG"
    ```
 
-   It deletes only the bridge machine's own KV presence and lease records (the grant allows nothing else)
-   and only the file-mesh mirror records whose `remoteHost` is this link.
+   It stops the link if it is still running, then deletes only the bridge machine's own KV presence and
+   lease records (the grant allows nothing else) and only the file-mesh mirror records whose `remoteHost`
+   is this link. If systemd could not stop the unit in step 1, this step alone is the rollback.
 3. **Verify.** Repeat step 1 of the dry run: `0` mirrors in the file mesh, `running: false`,
    `natsMirror: 0`, `fileMirror: 0`. The ledger directory remains (step 4).
 4. **Keep `"$STATE/ledger"`.** Never delete it as part of a rollback. It holds the exactly-once claims of

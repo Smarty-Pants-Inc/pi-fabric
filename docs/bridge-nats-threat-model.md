@@ -93,8 +93,9 @@ event's own `from`.
 `parseBridgeNatsAllowSection` parses the link config's `allow` section once at start: root entries by
 exact canonical id (`session:<lowercase uuid>`), actor entries by owner root plus name (optional id pin),
 each in the list of its home side (`allow.file` or `allow.nats`). Unknown keys, duplicate identities, an
-identity on both lists, malformed ids (upper case, bare uuid, trailing newline) and machine pins in the
-file list or on the bridge's own machine are refused. The result is deep-frozen; there is no add or
+identity on both lists, malformed ids (upper case, bare uuid, trailing newline), an `allow.nats` entry
+without a `machine` pin, and machine pins in the file list or on the bridge's own machine are refused.
+Every NATS identity is pinned to the machine it must be live on (integrator decision, threat T3). The result is deep-frozen; there is no add or
 remove API. L5's `loadNatsLinkConfig` refuses a config file that is a symlink, not ours (or root's), or
 group/other-writable.
 
@@ -209,8 +210,8 @@ write or fsync failure stops all further appends until a restart.
 |---|---|---|---|
 | T1 | A message body or `from` names another identity | R1: lookup key only; identity rebuilt from presence | none known |
 | T2 | A NATS runtime publishes as a Ryzen 1 lead | The broker binds the source token; NATS receivers check presence machine == credential machine; Ryzen 1 identities live only under `ryzen1-bridge`; the gate refuses a NATS sender whose entry is on `allow.file` | none known |
-| T3 | A compromised NATS machine registers presence for a Ryzen 1 lead's or a seat's id under its own prefix | NATS receivers and the gate treat an id on two machines as ambiguous and refuse it; `machine` pins on `allow.nats` entries refuse a seat or moved lead seen on any other machine | **Availability:** that machine can make the id unroutable on NATS. **Integrity while the bridge does not mirror the id** (for example the Ryzen 1 lead is offline): NATS receivers may accept it as the lead; it still cannot cross to the file side (wrong list). This is a property of Path B presence today, not new here. |
-| T4 | The `ryzen1-bridge` credential is stolen | Standard template only; credential file 0600, ours (L5 preflight); the allow-list limits the honest link | **HIGH by design:** the holder can mint KV presence for any id under `ryzen1-bridge` and NATS receivers will accept commands from it. Proposed security-gap: let NATS receivers bound which ids a bridge machine may present (core change, not in A'). |
+| T3 | A compromised NATS machine registers presence for a Ryzen 1 lead's or a seat's id under its own prefix | NATS receivers and the gate treat an id on two machines as ambiguous and refuse it; every `allow.nats` entry is pinned to its machine (required), so a seat or moved lead seen on any other machine is refused, even while the real one is offline | **Availability:** that machine can make the id unroutable on NATS. **Integrity while the bridge does not mirror a Ryzen 1 id** (the Ryzen 1 lead is offline): NATS receivers may accept the forged id as that lead; it still cannot cross to the file side (it is on the wrong list). This is a property of Path B presence today, not new here. |
+| T4 | The `ryzen1-bridge` credential is stolen | Standard template only; credential file 0600, ours (L5 preflight); the allow-list limits the honest link | **HIGH by design:** the holder can mint KV presence for any id under `ryzen1-bridge` and NATS receivers will accept commands from it. Filed as security-gap smarty-dev#16633: let NATS receivers bound which ids a bridge machine may present (core change, not in A'). |
 | T5 | A sender fishes another sender's ask answer by reusing its commandId | R6 mapping; ACK returned to the claimed `replyTo` | none known |
 | T6 | Duplicate delivery after a crash, an uncertain PubAck or a redelivery | R7 claim before publish, deterministic ids, same bytes, receiver seen claims, ledger `seen` for deliveries | A command past the 24 h horizon is no longer deduped; receivers refuse it as expired |
 | T7 | A forged or misrouted ACK | R7 `verifyAck` | none known |
@@ -231,7 +232,8 @@ write or fsync failure stops all further appends until a restart.
 2. `bridge-nats-ledger.ts`: durability order (fsync before visible), load rules, fail-stop, lock takeover
    conditions, file modes, horizon.
 3. L2: the gate runs before every publish in both directions; a refusal becomes a `notRun` rejection ACK
-   (or a dropped event and a log line), never a publish; the crossing `from` is the verified identity;
+   (or a dropped event and a log line), never a publish; a `BridgeNatsNativePublisher` is built only for a
+   native, unbridged file event (verification `mesh`, no `data.bridge`); the crossing `from` is the verified identity;
    principal strip is applied; ACKs are mapped back through the ledger to the claimed `replyTo`; NATS
    deliveries are acked only after the durable file append.
 4. L1: publishes only as `ryzen1-bridge`; writes KV only under its own prefixes; `presenceView()` returns
@@ -244,9 +246,10 @@ write or fsync failure stops all further appends until a restart.
 
 ## 7. Residual risks to record
 
-- T4 (bridge credential speaks for any id it presents): propose a `security-gap` issue for receiver-side
+- T4 (bridge credential speaks for any id it presents): security-gap smarty-dev#16633, receiver-side
   bounds on bridge-machine identities.
-- T3 availability and the offline-lead window: recommend `machine` pins on every `allow.nats` entry.
+- T3 availability: a compromised NATS machine can make a pinned id unroutable; it cannot impersonate it
+  across the link.
 - The same-UID boundary on Ryzen 1 (T11, T12) is unchanged by the link.
 
 ## 8. Dry run and rollback

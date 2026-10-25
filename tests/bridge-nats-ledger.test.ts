@@ -47,7 +47,7 @@ const ledgerAt = async (where = dir(), minCompactLines?: number) => {
 
 /** File -> NATS: the lead sends a followUp to the moved lead. */
 const toNats = (original = "orig-1", fields: Partial<BridgeNatsClaimInput> = {}): BridgeNatsClaimInput => ({
-  direction: "toNats", originalCommandId: original, commandId: bridgeNatsMappedCommandId(LINK, "toNats", LEAD, original),
+  direction: "toNats", origin: "control", originalCommandId: original, commandId: bridgeNatsMappedCommandId(LINK, "toNats", LEAD, original),
   sourceEventId: `file-event-${original}`, envelopeId: bridgeNatsEnvelopeId(LINK, `file-event-${original}`),
   bodyDigest: "d".repeat(64), sourceMachine: "ryzen1-bridge", requesterId: LEAD, replyTo: "host-lead", targetId: MOVED,
   from: { id: LEAD, name: "lead", kind: "main", sessionId: LEAD.slice(8) }, principal: { id: "herdr:paul", binding: "herdr-client" },
@@ -57,7 +57,7 @@ const toNats = (original = "orig-1", fields: Partial<BridgeNatsClaimInput> = {})
 
 /** NATS -> file: the moved lead sends a followUp to the lead. */
 const toFile = (original = "orig-2", sender = MOVED, fields: Partial<BridgeNatsClaimInput> = {}): BridgeNatsClaimInput => ({
-  direction: "toFile", originalCommandId: original, commandId: bridgeNatsMappedCommandId(LINK, "toFile", sender, original),
+  direction: "toFile", origin: "control", originalCommandId: original, commandId: bridgeNatsMappedCommandId(LINK, "toFile", sender, original),
   sourceEventId: `nats-envelope-${original}`, bodyDigest: "e".repeat(64), sourceMachine: "lead-v2", requesterId: sender,
   from: { id: sender, name: "moved", kind: "main" },
   replyTo: "host-moved", targetId: LEAD, operation: "followUp", ownerHostId: "host-lead", ownerIdentityId: LEAD,
@@ -115,6 +115,13 @@ describe("claims: exactly once by mapped commandId", () => {
     await expect(ledger.claim(noBody)).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
     await expect(ledger.claim(toFile("w", MOVED, { envelopeId: "early" }))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
     await expect(ledger.claim(toFile("c", MOVED, { operation: "cancel" }))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
+    // A topic route (N3) is a followUp the link originates toward NATS; nothing else may claim that origin.
+    const topic = await ledger.claim(toNats("t", { origin: "topic", requesterId: "bridge:v2", replyTo: "bridge:v2",
+      from: { id: "bridge:v2", name: "mesh-bridge", kind: "main" } }));
+    expect(topic.record.origin).toBe("topic");
+    await expect(ledger.claim(toNats("t2", { origin: "topic", operation: "steer" }))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
+    await expect(ledger.claim(toFile("t3", MOVED, { origin: "topic" }))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
+    await expect(ledger.claim(toNats("o", { origin: "other" as never }))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
     await expect(ledger.claim(toFile("f", MOVED, { from: { id: MOVED, name: "m", kind: "bogus" } as never })))
       .rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
     await expect(ledger.claim(toFile("p", MOVED, { principal: { id: "x", binding: "root" } as never })))

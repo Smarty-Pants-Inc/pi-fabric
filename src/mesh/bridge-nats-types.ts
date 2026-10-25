@@ -173,7 +173,7 @@ interface BridgeNatsAllowCommonInput {
   readonly receiveTopics?: readonly string[];
   /** Fabric principal ids whose authority this sender may carry across; any other principal is stripped. */
   readonly principals?: readonly string[];
-  /** NATS list only: pin the machine this identity must be live on. */
+  /** The machine this identity must be live on: REQUIRED on every allow.nats entry, refused on allow.file. */
   readonly machine?: string;
   /** Operator note; never authority. */
   readonly note?: string;
@@ -534,6 +534,8 @@ export interface BridgeNatsCommandMapping {
 export type BridgeNatsCommandState = "claimed" | "uncertain" | "sent" | "acked" | "ackForwarded";
 
 export interface BridgeNatsClaimInput extends BridgeNatsCommandMapping {
+  /** control: a sender's command carried across; topic: a followUp the link originates for an N3 topic event (followUp only). */
+  readonly origin: "control" | "topic";
   /** controlBodyFingerprint of the command body + principal, as the destination will compute it. */
   readonly bodyDigest: string;
   /** NATS machine the command came from (toFile) or the bridge machine (toNats). */
@@ -551,7 +553,7 @@ export interface BridgeNatsClaimInput extends BridgeNatsCommandMapping {
   readonly ownerHostId: string;
   readonly ownerIdentityId: string;
   readonly ownerIncarnation?: string;
-  /** toNats: the target's NATS machine (required toward NATS; the owner's ACK must come from it). */
+  /** toNats: the target owner's NATS machine ("ownerMachine"; required toward NATS; the owner's ACK must come from it). */
   readonly targetMachine?: string;
   readonly deadlineAt: number;
   /** The exact body to (re)send: required toward NATS (the envelope body); toward the file mesh the published data, when kept. */

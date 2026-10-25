@@ -156,6 +156,11 @@ const parseEntry = (value: unknown, field: string, side: BridgeNatsSide, natsMac
   const principals = principalList(value.principals, `${field}.principals`);
   const note = noteOf(value.note, `${field}.note`);
   let machine: string | undefined;
+  // Every NATS identity is pinned to its machine (integrator note 8, threat T3): an unpinned seat or moved
+  // lead could be registered by another machine while the real one is offline.
+  if (side === "nats" && value.machine === undefined) {
+    throw new BridgeNatsAllowListError(`${field}.machine`, "is required on every allow.nats entry");
+  }
   if (value.machine !== undefined) {
     if (side !== "nats") throw new BridgeNatsAllowListError(`${field}.machine`, "is allowed only in allow.nats");
     if (!full(BRIDGE_NATS_MACHINE, value.machine) || full(OPERATOR_MACHINE, value.machine) || value.machine === natsMachine) {

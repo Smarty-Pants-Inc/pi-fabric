@@ -51,7 +51,7 @@ const ALLOW = {
     { kind: "actor", rootId: LEAD, name: "supervisor", send: ["steer", "followUp"], receive: [] },
   ],
   nats: [
-    { kind: "root", id: MOVED, send: ["followUp", "steer", "cancel"], receive: ["followUp", "steer"], receiveTopics: ["fleet.work.*", "ops.owner"] },
+    { kind: "root", id: MOVED, machine: "lead-v2", send: ["followUp", "steer", "cancel"], receive: ["followUp", "steer"], receiveTopics: ["fleet.work.*", "ops.owner"] },
     { kind: "root", id: KATE_SEAT, principal: "Kate", machine: "kate-v2", receive: ["followUp", "cancel"] },
   ],
 };
@@ -114,21 +114,24 @@ describe("parseBridgeNatsAllowSection", () => {
     ["a bare uuid", { file: [{ kind: "root", id: LEAD.slice(8) }] }, "allow.file[0].id"],
     ["a trailing newline", { file: [{ kind: "root", id: `${LEAD}\n` }] }, "allow.file[0].id"],
     ["a duplicate in one list", { file: [{ kind: "root", id: LEAD }, { kind: "root", id: LEAD }] }, "allow.file[1]"],
-    ["one identity on both sides", { file: [{ kind: "root", id: LEAD }], nats: [{ kind: "root", id: LEAD }] }, "allow.nats[0]"],
+    ["one identity on both sides", { file: [{ kind: "root", id: LEAD }], nats: [{ kind: "root", id: LEAD, machine: "lead-v2" }] }, "allow.nats[0]"],
+    ["a NATS root without a machine pin", { nats: [{ kind: "root", id: MOVED }] }, "allow.nats[0].machine"],
+    ["a NATS seat without a machine pin", { nats: [{ kind: "root", id: KATE_SEAT, principal: "Kate" }] }, "allow.nats[0].machine"],
+    ["a NATS actor without a machine pin", { nats: [{ kind: "actor", rootId: MOVED, name: "r", receive: [] }] }, "allow.nats[0].machine"],
     ["a duplicate actor id pin", { file: [{ kind: "actor", rootId: LEAD, name: "a", id: SUPERVISOR }, { kind: "actor", rootId: LEAD, name: "b", id: SUPERVISOR }] }, "allow.file[1]"],
     ["a machine pin in the file list", { file: [{ kind: "root", id: LEAD, machine: "x" }] }, "allow.file[0].machine"],
     ["a machine pin on the bridge machine", { nats: [{ kind: "root", id: MOVED, machine: BRIDGE }] }, "allow.nats[0].machine"],
-    ["a seat that may receive steer", { nats: [{ kind: "root", id: KATE_SEAT, principal: "Kate", receive: ["followUp", "steer"] }] }, "allow.nats[0].receive"],
+    ["a seat that may receive steer", { nats: [{ kind: "root", id: KATE_SEAT, principal: "Kate", machine: "kate-v2", receive: ["followUp", "steer"] }] }, "allow.nats[0].receive"],
     ["a file seat that may receive ask", { file: [{ kind: "root", id: PAUL_SEAT, principal: "Paul", receive: ["ask"] }] }, "allow.file[0].receive"],
-    ["a moved lead that may receive stop", { nats: [{ kind: "root", id: MOVED, receive: ["followUp", "stop"] }] }, "allow.nats[0].receive"],
+    ["a moved lead that may receive stop", { nats: [{ kind: "root", id: MOVED, machine: "lead-v2", receive: ["followUp", "stop"] }] }, "allow.nats[0].receive"],
     ["a file root that may receive setModel", { file: [{ kind: "root", id: LEAD, receive: ["setModel"] }] }, "allow.file[0].receive"],
     ["a file actor that may receive setThinking", { file: [{ kind: "actor", rootId: LEAD, name: "s", receive: ["setThinking"] }] }, "allow.file[0].receive"],
-    ["a NATS actor that may receive anything", { nats: [{ kind: "actor", rootId: MOVED, name: "r", receive: ["followUp"] }] }, "allow.nats[0].receive"],
+    ["a NATS actor that may receive anything", { nats: [{ kind: "actor", rootId: MOVED, name: "r", machine: "lead-v2", receive: ["followUp"] }] }, "allow.nats[0].receive"],
     ["topics on an actor", { file: [{ kind: "actor", rootId: LEAD, name: "s", receiveTopics: ["ops.owner"] }] }, "allow.file[0].receiveTopics"],
     ["a principal on an actor", { file: [{ kind: "actor", rootId: LEAD, name: "s", principal: "Paul" }] }, "allow.file[0]"],
     ["an unknown operation", { file: [{ kind: "root", id: LEAD, send: ["tell"] }] }, "allow.file[0].send"],
     ["a repeated operation", { file: [{ kind: "root", id: LEAD, send: ["followUp", "followUp"] }] }, "allow.file[0].send"],
-    ["a bad topic pattern", { nats: [{ kind: "root", id: MOVED, receiveTopics: ["fleet.*.x"] }] }, "allow.nats[0].receiveTopics"],
+    ["a bad topic pattern", { nats: [{ kind: "root", id: MOVED, machine: "lead-v2", receiveTopics: ["fleet.*.x"] }] }, "allow.nats[0].receiveTopics"],
     ["an unknown kind", { file: [{ kind: "agent", id: LEAD }] }, "allow.file[0].kind"],
   ])("refuses %s", (_name, raw, field) => {
     try {
@@ -166,19 +169,19 @@ describe("org.json seat pins", () => {
   });
 
   it("requires a seat entry to equal its principal's fabricSession exactly", () => {
-    const wrong = parseBridgeNatsAllowSection({ nats: [{ kind: "root", id: MOVED, principal: "Kate" }] }, { link: LINK, natsMachine: BRIDGE });
+    const wrong = parseBridgeNatsAllowSection({ nats: [{ kind: "root", id: MOVED, principal: "Kate", machine: "kate-v2" }] }, { link: LINK, natsMachine: BRIDGE });
     expect(() => checkBridgeNatsSeatPins(wrong, PINS)).toThrow(/orgInstance.fabricSession/);
-    const unknown = parseBridgeNatsAllowSection({ nats: [{ kind: "root", id: KATE_SEAT, principal: "Marisela" }] }, { link: LINK, natsMachine: BRIDGE });
+    const unknown = parseBridgeNatsAllowSection({ nats: [{ kind: "root", id: KATE_SEAT, principal: "Marisela", machine: "kate-v2" }] }, { link: LINK, natsMachine: BRIDGE });
     expect(() => checkBridgeNatsSeatPins(unknown, PINS)).toThrow(/not a principal/);
   });
 
   it("refuses a principal's bound session listed without declaring the principal, rotation included", () => {
     for (const id of [KATE_SEAT, KATE_ROTATION]) {
-      const undeclared = parseBridgeNatsAllowSection({ nats: [{ kind: "root", id }] }, { link: LINK, natsMachine: BRIDGE });
+      const undeclared = parseBridgeNatsAllowSection({ nats: [{ kind: "root", id, machine: "kate-v2" }] }, { link: LINK, natsMachine: BRIDGE });
       expect(() => createBridgeNatsIdentityGate(undeclared, { pins: PINS })).toThrow(/bound org session/);
     }
     // A rotation can never be a declared seat either: the seat is the static fabricSession only.
-    const rotation = parseBridgeNatsAllowSection({ nats: [{ kind: "root", id: KATE_ROTATION, principal: "Kate" }] }, { link: LINK, natsMachine: BRIDGE });
+    const rotation = parseBridgeNatsAllowSection({ nats: [{ kind: "root", id: KATE_ROTATION, principal: "Kate", machine: "kate-v2" }] }, { link: LINK, natsMachine: BRIDGE });
     expect(() => checkBridgeNatsSeatPins(rotation, PINS)).toThrow(/orgInstance.fabricSession/);
   });
 
@@ -274,7 +277,7 @@ describe("BridgeNatsIdentity: senders and targets come only from presence", () =
 
   it("refuses NATS actors whose root runs on another machine", () => {
     const gate = createBridgeNatsIdentityGate(parseBridgeNatsAllowSection({
-      nats: [{ kind: "root", id: MOVED }, { kind: "actor", rootId: MOVED, name: "review" }],
+      nats: [{ kind: "root", id: MOVED, machine: "lead-v2" }, { kind: "actor", rootId: MOVED, name: "review", machine: "other-v2" }],
     }, { link: LINK, natsMachine: BRIDGE }), { pins: PINS, clock: () => NOW });
     const actor = record("nats", { id: "a".repeat(32), name: "review", rootId: MOVED, kind: "actor", machine: "other-v2" });
     const views = natsView([record("nats", { id: MOVED, machine: "lead-v2" }), actor], false);
@@ -330,8 +333,8 @@ describe("BridgeNatsIdentity.allow", () => {
     const gate = createBridgeNatsIdentityGate(parseBridgeNatsAllowSection({
       file: [{ kind: "root", id: LEAD, send: ["followUp", "steer", "ask", "cancel", "stop", "setModel", "setThinking"] },
         { kind: "root", id: PAUL_SEAT, principal: "Paul", receive: ["followUp", "cancel"] }],
-      nats: [{ kind: "root", id: MOVED, send: ["followUp", "ask"], receive: ["followUp", "steer", "ask", "cancel"] },
-        { kind: "actor", rootId: MOVED, name: "review" }],
+      nats: [{ kind: "root", id: MOVED, machine: "lead-v2", send: ["followUp", "ask"], receive: ["followUp", "steer", "ask", "cancel"] },
+        { kind: "actor", rootId: MOVED, name: "review", machine: "lead-v2" }],
     }, { link: LINK, natsMachine: BRIDGE }), { pins: PINS, clock: () => NOW });
     const actor = record("nats", { id: "a".repeat(32), name: "review", rootId: MOVED, kind: "actor", machine: "lead-v2" });
     const nats = natsView([actor]);
@@ -408,7 +411,7 @@ describe("BridgeNatsIdentity.allow", () => {
 
 describe("BridgeNatsIdentity.verifyAck", () => {
   const claim = (fields: Partial<BridgeNatsCommandRecord> = {}): BridgeNatsCommandRecord => ({
-    v: 1, state: "sent", direction: "toNats", originalCommandId: "orig", commandId: "mapped", sourceEventId: "file-event",
+    v: 1, state: "sent", direction: "toNats", origin: "control", originalCommandId: "orig", commandId: "mapped", sourceEventId: "file-event",
     envelopeId: "bnf1-abc", bodyDigest: "d".repeat(64), sourceMachine: BRIDGE, requesterId: LEAD, replyTo: "host-001",
     from: { id: LEAD, name: "lead", kind: "main" },
     targetId: MOVED, operation: "followUp", ownerHostId: "host-002", ownerIdentityId: MOVED, ownerIncarnation: "inc-1",

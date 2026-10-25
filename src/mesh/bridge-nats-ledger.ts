@@ -102,6 +102,8 @@ const validCommand = (r: unknown): r is BridgeNatsCommandRecord => {
       !(BRIDGE_NATS_OPERATIONS as readonly unknown[]).includes(r.operation) || !text(r.ownerHostId) || !text(r.ownerIdentityId) ||
       !finite(r.deadlineAt) || !finite(r.claimedAt) || !finite(r.expiresAt)) return false;
   if (!validIdentity(r.from) || (r.principal !== undefined && !validPrincipal(r.principal))) return false;
+  if (r.origin !== "control" && r.origin !== "topic") return false;
+  if (r.origin === "topic" && (r.operation !== "followUp" || r.direction !== "toNats")) return false;
   if (r.envelopeId !== undefined && !text(r.envelopeId)) return false;
   if (r.direction === "toNats" && (r.envelopeId === undefined || !isObject(r.resolvedBody) || !text(r.targetMachine, 64))) return false;
   if (r.ownerIncarnation !== undefined && !text(r.ownerIncarnation, 128)) return false;
@@ -408,6 +410,10 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
     if (!text(input.sourceEventId)) invalid("sourceEventId");
     if (!DIGEST.test(String(input.bodyDigest))) invalid("bodyDigest");
     if (!(BRIDGE_NATS_OPERATIONS as readonly unknown[]).includes(input.operation)) invalid("operation");
+    if (input.origin !== "control" && input.origin !== "topic") invalid("origin");
+    if (input.origin === "topic" && (input.operation !== "followUp" || input.direction !== "toNats")) {
+      invalid("origin (a topic route is a followUp toward NATS)");
+    }
     if (!validIdentity(input.from)) invalid("from");
     if (input.principal !== undefined && !validPrincipal(input.principal)) invalid("principal");
     if (input.resolvedBody !== undefined && !isObject(input.resolvedBody)) invalid("resolvedBody");

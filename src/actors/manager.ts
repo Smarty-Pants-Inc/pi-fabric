@@ -197,6 +197,7 @@ interface ActorQueueItem {
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricPythonRuntime } from "../config.js";
 import { isMainSupervisorRequest } from "../interrupt-authority.js";
+import { assertMainInboxOpen } from "../main-drain/gate.js";
 
 interface ActorQueueRestoreInputs {
   own: unknown;
@@ -1706,6 +1707,8 @@ export class ActorManager {
       onCommit?: (id: string) => void;
     } = {},
   ): Promise<FabricActorInfo> {
+    // D3 seat drain (smarty-dev#15310): a draining root creates no new actor (rejects before any effect).
+    try { assertMainInboxOpen(this.#rootId, { path: "actors.create", text: request.name }); } catch (error) { return Promise.reject(error); }
     ++this.#pendingCreates;
     routerAdmission = routerAdmission && { ...routerAdmission, targetRootId: this.#rootId,
       targetHostId: this.agents.runtimeHostId ?? routerAdmission.targetHostId };
@@ -2215,6 +2218,43 @@ export class ActorManager {
       !this.#deferredHandoffs.get(actor.id)?.length && !this.#pendingHandoffConsumption.get(actor.id)?.size &&
       !this.#pendingResets.has(actor.id) && !this.#pendingRunArchives.get(actor.id)?.size &&
       !this.#deadLetterCount(actor.id) && !this.#childCompletionStore(actor).hasPendingReply();
+  }
+
+  /**
+   * D3 seat drain (smarty-dev#15310), read-only: why this OWNED actor is not quiesced; empty means a stop now drops
+   * nothing and abandons no run. Same evidence as #dormantIdleCandidate, for any residency. Throws when not owned here.
+   */
+  drainQuiescence(id: string): string[] {
+    const actor = this.#requireOwnedActor(id);
+    const running = this.#runningActor(actor.id) ?? actor;
+    const counts = this.#queuedWorkCounts(actor, running, actor.status === "stopped");
+    const reasons: string[] = [];
+    if (actor.status !== "idle") reasons.push(`status-${actor.status}`);
+    if (actor.draining || actor.abortController || this.#draining.has(actor.id)) reasons.push("run-active");
+    if (actor.inFlightRun || this.#inFlight.has(actor.id) || counts.inFlight) reasons.push("in-flight");
+    if (actor.preparing) reasons.push("preparing");
+    if (actor.removal) reasons.push("removal-pending");
+    if (counts.queued) reasons.push("queued");
+    if (counts.overflow) reasons.push("overflow");
+    if (counts.parked) reasons.push("parked");
+    if (counts.settled) reasons.push("settled-window");
+    if (counts.deadLetter) reasons.push("dead-letter");
+    if (this.#deferredHandoffs.get(actor.id)?.length || this.#pendingHandoffConsumption.get(actor.id)?.size) reasons.push("deferred-handoff");
+    if (this.#pendingResets.has(actor.id) || this.#pendingRunArchives.get(actor.id)?.size) reasons.push("pending-reset-or-archive");
+    if (this.#childCompletionStore(actor).hasPendingReply()) reasons.push("child-completion-custody");
+    return reasons;
+  }
+
+  /**
+   * D3 seat drain (smarty-dev#15310), read-only: the launched worker of this owned actor's last run, from this host's
+   * own launch record (pid and kernel start time read at spawn). null: no run recorded; undefined: no record here.
+   */
+  drainWorker(id: string): { runId: string; pid: number; startTime: string | undefined } | null | undefined {
+    const actor = this.#requireOwnedActor(id);
+    const runId = actor.inFlightRun?.id ?? actor.lastRunId;
+    if (!runId) return null;
+    const worker = this.agents.workerIdentity(runId);
+    return worker ? { runId, pid: worker.pid, startTime: worker.startTime } : undefined;
   }
 
   /** Dormancy releases runtime references, not identity, subscriptions or the durable transcript. */

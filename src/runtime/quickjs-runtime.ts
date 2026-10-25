@@ -51,6 +51,7 @@ const GUEST_FABRIC_ERROR_NAMES: Readonly<Record<string, string>> = Object.freeze
   FABRIC_CONTROL_STALE_INCARNATION: "FabricControlStaleIncarnationError",
   FABRIC_INTERRUPT_NOT_AUTHORIZED: "FabricInterruptNotAuthorizedError",
   FABRIC_INTERRUPT_RATE_LIMITED: "FabricInterruptRateLimitedError",
+  FABRIC_MAIN_DRAINING: "FabricMainDrainingError",
   FABRIC_PARTICIPANT_STALE: "FabricParticipantStaleError",
   FABRIC_RELAY_DESTINATION_UNAVAILABLE: "FabricRelayDestinationUnavailableError",
   FABRIC_IDEMPOTENCY_KEY_REUSED: "FabricIdempotencyKeyReusedError",

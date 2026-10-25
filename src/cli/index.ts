@@ -22,12 +22,16 @@ const commands: Record<string, () => Promise<FabricCliCommand>> = {
   session: async () => runSessionCli,
 };
 
-const SESSION_USAGE = "Usage: pi-fabric session pending <session-uuid | session:uuid> [--mesh <meshRoot>] [--json]";
+const SESSION_USAGE = [
+  "Usage: pi-fabric session pending <session-uuid | session:uuid> [--mesh <meshRoot>] [--json]",
+  "       pi-fabric session drain <session-uuid | session:uuid> --mesh <meshRoot> [--status | --exit | --reopen] [--deadline-s <1-600>]",
+].join("\n");
 
 /** `pi-fabric session pending`: read-only recorded pending-state inventory for one Main session. */
 async function runSessionCli(argv: string[]): Promise<number> {
   const [name, ...rest] = argv;
   if (name === "pending") return (await import("./session-pending.js")).runSessionPendingCli(rest);
+  if (name === "drain") return (await import("./session-drain.js")).runSessionDrainCli(rest);
   if (name === "--help" || name === "-h" || name === "help") {
     process.stdout.write(`${SESSION_USAGE}\n`);
     return 0;

@@ -1,4 +1,3 @@
-import { childProcessEnvironment } from "../core/atomic-write.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import type net from "node:net";
@@ -14,6 +13,13 @@ export interface PeerInfo { pid: number; uid: number; gid: number; cmdline?: str
 const PEERCRED = "import ctypes,struct; l=ctypes.CDLL(None,use_errno=True); b=ctypes.create_string_buffer(12); n=ctypes.c_uint32(12); "
   + "r=l.getsockopt(3,1,17,b,ctypes.byref(n)); print(*struct.unpack('3i', b.raw)) if r==0 else None";
 
+/**
+ * The helper is ALWAYS the fixed root-owned `/usr/bin/python3`, isolated (-I -B) with a minimal env: a `python3`
+ * planted earlier in the caller's PATH (a user-owned bin dir) must never answer for the kernel. Every caller (the
+ * records service, the bridge relay, the Main's drain channel) gets the same proof. No python3 there: undefined.
+ */
+export const PEERCRED_PYTHON = "/usr/bin/python3";
+
 export const peerCredentials = (socket: net.Socket, timeoutMs = 5_000): Promise<PeerInfo | undefined> =>
   new Promise((resolve) => {
     let out = "";
@@ -26,7 +32,8 @@ export const peerCredentials = (socket: net.Socket, timeoutMs = 5_000): Promise<
       return;
     }
     try {
-      child = spawn("python3", ["-c", PEERCRED], { env: childProcessEnvironment(), stdio: ["ignore", "pipe", "ignore", fd], timeout: timeoutMs });
+      child = spawn(PEERCRED_PYTHON, ["-I", "-B", "-c", PEERCRED], { env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+        stdio: ["ignore", "pipe", "ignore", fd], timeout: timeoutMs });
     } catch {
       resolve(undefined);
       return;

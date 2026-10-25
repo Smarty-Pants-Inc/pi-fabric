@@ -131,7 +131,7 @@ export const natsLinkMirrorAllowed = (allow: BridgeNatsAllowListConfig) =>
 export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsCarrierLedger => {
   const linkId = bridgeNatsLinkIdentity(link).id;
   const record = (stored: BridgeNatsCommandRecord): NatsCarrierRecord => ({
-    v: 1, direction: stored.direction, origin: stored.requesterId === linkId ? "topic" : "control", link,
+    v: 1, direction: stored.direction, origin: stored.origin ?? (stored.requesterId === linkId ? "topic" : "control"), link,
     operation: stored.operation, sourceCommandId: stored.originalCommandId, destinationCommandId: stored.commandId,
     // Toward the file mesh the destination id is the source envelope id (markSent's file event id is bookkeeping).
     sourceEventId: stored.sourceEventId,
@@ -150,7 +150,7 @@ export const natsCarrierLedger = (ledger: BridgeNatsLedger, link: string): NatsC
   return {
     async claim(input) {
       const result = await ledger.claim({
-        direction: input.direction, originalCommandId: input.sourceCommandId, commandId: input.destinationCommandId,
+        direction: input.direction, origin: input.origin, originalCommandId: input.sourceCommandId, commandId: input.destinationCommandId,
         sourceEventId: input.sourceEventId, ...(input.direction === "toNats" ? { envelopeId: input.destinationEventId } : {}),
         ...(input.cancelCommandId !== undefined ? { cancelCommandId: input.cancelCommandId } : {}),
         ...(input.sourceCancelCommandId !== undefined ? { originalCancelCommandId: input.sourceCancelCommandId } : {}),

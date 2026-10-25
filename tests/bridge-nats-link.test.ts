@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { NatsCarrierRecord } from "../src/mesh/bridge-nats-carrier.js";
 import { createNatsFileLink, type NatsCarrierSide } from "../src/mesh/bridge-nats-file.js";
 import { createBridgeNatsIdentityGate, parseBridgeNatsAllowSection, type BridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
-import { openBridgeNatsLedger, type FileBridgeNatsLedger } from "../src/mesh/bridge-nats-ledger.js";
+import { BRIDGE_NATS_LEDGER_LOCK, openBridgeNatsLedger, type FileBridgeNatsLedger } from "../src/mesh/bridge-nats-ledger.js";
 import type { NatsLinkConfig } from "../src/mesh/bridge-nats-config.js";
 import { natsCarrierLedger, natsLinkAuthorizers, natsLinkMirrorAllowed, startNatsLink } from "../src/mesh/bridge-nats-link.js";
 import { bridgeNatsMappedCommandId, type BridgeNatsAllowSection } from "../src/mesh/bridge-nats-types.js";
@@ -216,7 +216,10 @@ describe("startNatsLink composition with L3's allow gate", () => {
     await handle.closed;
     expect(port.closed).toBe(true);
     // The default ledger is L3's, in the state dir, and its writer lock was released on stop.
-    expect(fs.existsSync(path.join(root, "state", "ledger", "ledger.lock"))).toBe(false);
+    expect(fs.existsSync(path.join(root, "state", "ledger", BRIDGE_NATS_LEDGER_LOCK))).toBe(false);
+    // ...so the next start takes it again.
+    const again = await openBridgeNatsLedger({ dir: path.join(root, "state", "ledger") });
+    await again.close();
     // A bad allow-list never opens anything.
     await expect(startNatsLink({ ...config, allow: { nats: [{ kind: "root", id: "session:not-a-uuid" }] } },
       { signal: new AbortController().signal, log: () => undefined, factories: { openPort: async () => { throw new Error("opened"); },

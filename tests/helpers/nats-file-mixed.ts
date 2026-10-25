@@ -18,7 +18,8 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { pathToFileURL } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { ModelRegistry, ModelRuntime, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { fauxProvider } from "@earendil-works/pi-ai";
 import { vi } from "vitest";
 import { CapturedToolCatalog } from "../../src/capture/catalog.js";
 import { normalizeFabricConfig, type FabricConfig } from "../../src/config.js";
@@ -73,8 +74,25 @@ export async function loadNatsLink(): Promise<StartMixedLink | undefined> {
   return start as StartMixedLink;
 }
 
-/** Operations each allow-listed root may SEND across (receive caps are L3's, e.g. a seat gets followUp + cancel). */
+/** Integrator's destination-class table (coordination note 3): a moved lead or a Ryzen 1 root/actor. */
 export const ROOT_SEND_OPERATIONS: readonly FabricControlOperation[] = ["steer", "followUp", "ask", "cancel"];
+/** A principal seat receives followUp and cancel only (L3 BRIDGE_NATS_SEAT_RECEIVE). */
+export const SEAT_OPERATIONS: readonly FabricControlOperation[] = ["followUp", "cancel"];
+
+/**
+ * One root allow entry in the link config's schema. The single place that tracks the L5/L3 allow
+ * convergence (L5 812157f9 takes `operations`; L3 a5dcd430 BridgeNatsAllowEntryInput takes `send`/`receive`).
+ */
+export function allowRoot(id: string, operations: readonly FabricControlOperation[] = ROOT_SEND_OPERATIONS, principal?: string,
+  receiveTopics?: readonly string[]): NatsLinkAllowEntry {
+  return { kind: "root", id, operations: [...operations], ...(principal === undefined ? {} : { principal }),
+    ...(receiveTopics === undefined ? {} : { receiveTopics: [...receiveTopics] }) } as NatsLinkAllowEntry;
+}
+
+/** A file-side actor allow entry (owner root + name; the verified presence must match both). */
+export function allowActor(rootId: string, name: string, operations: readonly FabricControlOperation[] = ROOT_SEND_OPERATIONS): NatsLinkAllowEntry {
+  return { kind: "actor", rootId, name, operations: [...operations] };
+}
 
 // ---------------------------------------------------------------------------------------------
 // Mains
@@ -118,7 +136,20 @@ function delivered(messages: readonly CapturedMessage[]): Delivered[] {
   });
 }
 
-function makeMain(label: string, sessionId: string, cwd: string, config: FabricConfig): MixedMain {
+/** Fabric's fixture worker: an actor run answers "fake worker complete", or stays running on a HANG task until killed. */
+export const FIXTURE_WORKER = path.resolve(import.meta.dirname, "../fixtures/fake-worker.mjs");
+
+/** A keyless native model the Main's registry lists, so actor activations pass model admission (the fixture worker never calls it). */
+async function fixtureModelContext(agentDir: string): Promise<Record<string, unknown>> {
+  const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(agentDir, "auth.json") });
+  const faux = fauxProvider({ provider: "bridge-fixture", models: [{ id: "one-turn" }] });
+  modelRuntime.registerNativeProvider(faux.provider);
+  await modelRuntime.getAvailable("bridge-fixture");
+  return { model: faux.getModel(), modelRegistry: new ModelRegistry(modelRuntime) };
+}
+
+function makeMain(label: string, sessionId: string, cwd: string, config: FabricConfig, worker = path.join(cwd, "unused-worker.ts"),
+  contextExtra: Record<string, unknown> = {}): MixedMain {
   const messages: CapturedMessage[] = [];
   const build = () => {
     const pi = { on: () => () => {}, events: { emit() {}, on: () => () => {} }, getThinkingLevel: () => "off",
@@ -129,9 +160,10 @@ function makeMain(label: string, sessionId: string, cwd: string, config: FabricC
       modelRegistry: { getAvailable: () => [], find: () => undefined, getApiKeyAndHeaders: async () => undefined },
       sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined, getBranch: () => [], getLeafId: () => null, getEntries: () => [] },
       ui: { setStatus() {}, notify() {} },
+      ...contextExtra,
     } as unknown as ExtensionContext;
     const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { paths: {
-      extension: path.join(cwd, "unused-extension.ts"), worker: path.join(cwd, "unused-worker.ts"),
+      extension: path.join(cwd, "unused-extension.ts"), worker,
       residentHost: path.join(cwd, "unused-resident.ts"), skills: cwd,
     } });
     return { runtime, context };
@@ -165,10 +197,10 @@ function makeMain(label: string, sessionId: string, cwd: string, config: FabricC
   return main;
 }
 
-function baseConfig(mesh: Record<string, unknown>): FabricConfig {
+function baseConfig(mesh: Record<string, unknown>, agents: Record<string, unknown> = { enabled: false }): FabricConfig {
   return normalizeFabricConfig({ fullCodeMode: false,
     mesh: { enabled: true, actorPollMs: 20, ...mesh },
-    agents: { enabled: false }, residency: { enabled: false }, mcp: { enabled: false }, memory: { enabled: false },
+    agents, residency: { enabled: false }, mcp: { enabled: false }, memory: { enabled: false },
     jev: { enabled: false }, prewalk: { enabled: false, alwaysRearm: false },
   });
 }
@@ -262,6 +294,8 @@ export interface MixedHarnessOptions {
   readonly outsider?: boolean;
   /** Also boot a second allow-listed NATS root on machine-b. */
   readonly natsPeer?: boolean;
+  /** Create a persistent actor with this name, owned by the file Main (a Ryzen 1 actor, e.g. review-astra), and allow-list it. */
+  readonly fileActor?: string;
   /** Last-word edit of the allow-list before validation (e.g. mark a seat with `principal`). */
   readonly allow?: (allow: { file: NatsLinkAllowEntry[]; nats: NatsLinkAllowEntry[] }, ids: MixedIds) => void;
 }
@@ -279,6 +313,8 @@ export interface MixedHarness {
   readonly natsMain: MixedMain;
   readonly outsider?: MixedMain;
   readonly natsPeer?: MixedMain;
+  /** The file Main's actor (options.fileActor), as agents.create returned it. */
+  readonly actor?: { readonly id: string; readonly name: string } & Record<string, unknown>;
   readonly linkName: string;
   /** The exact L5 config the link runs with, already validated by parseNatsLinkConfig. */
   readonly linkConfig: NatsLinkConfig;
@@ -357,10 +393,12 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
       peer: path.join(root, "v2-peer"), agent: path.join(root, "agent") };
     for (const dir of Object.values(dirs)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const fileMeshRoot = path.join(root, "ryzen1-mesh");
-    const fileConfig = baseConfig({ transport: "file", hostTransport: "file", root: fileMeshRoot, announce: true });
+    const fileConfig = baseConfig({ transport: "file", hostTransport: "file", root: fileMeshRoot, announce: true },
+      options.fileActor ? { enabled: true, transport: "process", model: "", maxConcurrent: 2, timeoutMs: 60_000, nice: 0 } : undefined);
     const natsConfig = (cwd: string) => baseConfig({ transport: "nats", hostTransport: "nats", root: path.join(cwd, "mesh"), announce: true,
       nats: { ...broker.runtimeOptions(broker.users.machineB), operatorMachine: "fabric-ops" } });
-    const fileMain = makeMain("ryzen1-lead", FILE_MAIN_SESSION, dirs.file, fileConfig);
+    const fileMain = makeMain("ryzen1-lead", FILE_MAIN_SESSION, dirs.file, fileConfig, options.fileActor ? FIXTURE_WORKER : undefined,
+      options.fileActor ? await fixtureModelContext(dirs.agent) : {});
     const natsMain = makeMain("v2-lead", NATS_MAIN_SESSION, dirs.nats, natsConfig(dirs.nats));
     const outsider = options.outsider ? makeMain("ryzen1-outsider", FILE_OUTSIDER_SESSION, dirs.outsider, fileConfig) : undefined;
     const natsPeer = options.natsPeer ? makeMain("v2-peer", NATS_PEER_SESSION, dirs.peer, natsConfig(dirs.peer)) : undefined;
@@ -378,13 +416,14 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
       await main.start();
       cleanup.push(() => main.stop());
     }
+    const actor = options.fileActor ? await fileMain.invoke("agents.create", { name: options.fileActor, scope: "session",
+      instructions: "Answer each ask once.", responseMode: "text", coalesce: false }) as MixedHarness["actor"] : undefined;
 
     const linkName = options.linkName ?? DEFAULT_LINK_NAME;
     const ids: MixedIds = { fileMain: fileMain.id, natsMain: natsMain.id, outsider: rootId(FILE_OUTSIDER_SESSION), natsPeer: rootId(NATS_PEER_SESSION) };
     const allow = {
-      file: [{ kind: "root", id: fileMain.id, operations: [...ROOT_SEND_OPERATIONS] }] as NatsLinkAllowEntry[],
-      nats: [{ kind: "root", id: natsMain.id, operations: [...ROOT_SEND_OPERATIONS] },
-        ...(natsPeer ? [{ kind: "root", id: natsPeer.id, operations: [...ROOT_SEND_OPERATIONS] }] : [])] as NatsLinkAllowEntry[],
+      file: [allowRoot(fileMain.id), ...(actor ? [allowActor(fileMain.id, actor.name)] : [])],
+      nats: [allowRoot(natsMain.id), ...(natsPeer ? [allowRoot(natsPeer.id)] : [])],
     };
     options.allow?.(allow, ids);
     const linkConfig = parseNatsLinkConfig({
@@ -403,7 +442,7 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     let linkAbort: AbortController | undefined;
 
     const harness: MixedHarness = {
-      root, broker, faults, wire, fileMain, natsMain, ...(outsider ? { outsider } : {}), ...(natsPeer ? { natsPeer } : {}),
+      root, broker, faults, wire, fileMain, natsMain, ...(outsider ? { outsider } : {}), ...(natsPeer ? { natsPeer } : {}), ...(actor ? { actor } : {}),
       linkName, linkConfig, linkLog, fileMeshRoot, inspector, link: undefined, startLink,
       async startLinkNow() {
         if (!startLink) throw new Error("A' link entry (src/mesh/bridge-nats-link.ts startNatsLink) is not available");
@@ -448,6 +487,12 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
           const row = liveRow(natsMain, fileMain.id);
           return row?.machine === BRIDGE_MACHINE ? row : undefined;
         }, "file root mirrored live into NATS KV", timeoutMs);
+        if (actor) {
+          await waitFor(() => {
+            const row = liveRow(natsMain, actor.id);
+            return row?.machine === BRIDGE_MACHINE ? row : undefined;
+          }, "file actor mirrored live into NATS KV", timeoutMs);
+        }
         return { fileView, natsView };
       },
       async stop() {

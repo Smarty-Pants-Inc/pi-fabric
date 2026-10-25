@@ -5,6 +5,7 @@
 // that must never hand one sender another sender's outcome. Only the Pi UI/model boundary is a fixture.
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { bridgeNatsMappedCommandId } from "../src/mesh/bridge-nats-types.js";
 import type { MeshEvent } from "../src/mesh/store.js";
 import type { TransportEnvelope } from "../src/transport/types.js";
 import { resolveNatsBinary } from "./helpers/nats-cluster.js";
@@ -64,7 +65,8 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: FI
     expect(crossed[0]).toMatchObject({ sourceMachine: BRIDGE_MACHINE, attempt: 1,
       envelope: { from: { id: h.fileMain.id }, targetId: h.natsMain.id, operation: "followUp",
         body: { ownerIncarnation: selfRecord(h.natsMain)!.ownerIncarnation } } });
-    expect(bodyOf(crossed[0]!).commandId).not.toBe(dataOf(fileCommand).commandId);
+    // Per-hop mapping: distinct verified senders can never collide on the NATS owner's seen-claims.
+    expect(bodyOf(crossed[0]!).commandId).toBe(bridgeNatsMappedCommandId(h.linkName, "toNats", h.fileMain.id, String(dataOf(fileCommand).commandId)));
     // The owner's ACK returned into the file mesh to the sender.
     const acks = h.fileEvents({ topic: ACK, to: h.fileMain.id }).filter((event) => dataOf(event).commandId === dataOf(fileCommand).commandId);
     expect(acks.length).toBeGreaterThanOrEqual(1);
@@ -93,7 +95,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: FI
     expect(appended).toHaveLength(1);
     expect(appended[0]).toMatchObject({ from: { id: h.natsMain.id, kind: "main" },
       data: { ownerIncarnation: selfRecord(h.fileMain)!.ownerIncarnation, bridge: { from: h.linkName } } });
-    expect(dataOf(appended[0]!).commandId).not.toBe(bodyOf(sent).commandId);
+    expect(dataOf(appended[0]!).commandId).toBe(bridgeNatsMappedCommandId(h.linkName, "toFile", h.natsMain.id, String(bodyOf(sent).commandId)));
     // The file owner's ACK went back to the NATS sender as a credential-bound ACK from the bridge machine.
     const ack = h.wire.since(mark).find((event) => event.phase === "deliver" && event.hostId === h.natsMain.id &&
       event.envelope.kind === "ack" && bodyOf(event).commandId === bodyOf(sent).commandId);
@@ -135,9 +137,17 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: FI
     await expect(peer.invoke("agents.followUp", { id: h.fileMain.id, message: barrier, idempotencyKey: `b-${randomUUID()}` }))
       .resolves.toMatchObject({ acknowledged: true });
     const toPeer = h.wire.since(mark).filter((event) => event.phase === "deliver" && event.hostId === peer.id && event.envelope.kind === "ack");
-    // Whatever the peer got for the copied commandId, it is never the original sender's stored outcome.
+    // Whatever the peer got for the copied commandId, it is never the original sender's stored outcome:
+    // the two senders' commands map to different file-side ids.
+    expect(bridgeNatsMappedCommandId(h.linkName, "toFile", peer.id, String(bodyOf(sent).commandId)))
+      .not.toBe(bridgeNatsMappedCommandId(h.linkName, "toFile", h.natsMain.id, String(bodyOf(sent).commandId)));
     for (const ack of toPeer.filter((event) => bodyOf(event).commandId === bodyOf(sent).commandId)) {
       expect(bodyOf(ack).messageId).not.toBe(original.messageId);
+    }
+    const peerCopies = h.fileEvents({ topic: "fabric.control.command", to: h.fileMain.id })
+      .filter((event) => dataOf(event).message === token && event.from.id === peer.id);
+    for (const copy of peerCopies) {
+      expect(dataOf(copy).commandId).toBe(bridgeNatsMappedCommandId(h.linkName, "toFile", peer.id, String(bodyOf(sent).commandId)));
     }
     // The original sender's message was consumed once, from the original sender only.
     expect(mentions(h.fileMain, token).filter((row) => row.from?.id === h.natsMain.id)).toHaveLength(1);

@@ -15,7 +15,7 @@ if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUT
 
 describe.skipIf(!binary || process.platform !== "linux")("A' mixed FILE <-> NATS harness (no link)", () => {
   let h: MixedHarness;
-  beforeAll(async () => { h = await createMixedHarness({ binary: binary!, startLink: null }); }, 60_000);
+  beforeAll(async () => { h = await createMixedHarness({ binary: binary!, startLink: null, fileActor: "bridge-review" }); }, 60_000);
   afterAll(async () => { await h?.stop(); }, 60_000);
 
   it("boots a real FILE Main and a real NATS Main on one broker, each visible only on its own side", async () => {
@@ -40,10 +40,24 @@ describe.skipIf(!binary || process.platform !== "linux")("A' mixed FILE <-> NATS
     expect(h.fileMain.delivered()).toEqual([]);
   }, 20_000);
 
+  it("the file Main's fixture actor answers a local ask, and a HANG ask stays in flight until its caller aborts", async () => {
+    const actor = h.actor!;
+    expect(actor).toMatchObject({ name: "bridge-review" });
+    const answer = await h.fileMain.invoke("agents.ask", { id: actor.id, message: "BRIDGE_ASK_LOCAL_FIXTURE" });
+    expect(answer).toMatchObject({ actorId: actor.id, direction: "out", text: "fake worker complete" });
+    const abort = new AbortController();
+    const hung = h.fileMain.invoke("agents.ask", { id: actor.id, message: "HANG BRIDGE_ASK_LOCAL_HANG" }, abort.signal).then(() => "settled", () => "aborted");
+    await waitForValue(() => h.fileMain.runtime.actors.status(actor.id).inFlightRun, "HANG run in flight", 15_000);
+    abort.abort();
+    expect(await hung).toBe("aborted");
+    await waitForValue(() => h.fileMain.runtime.actors.status(actor.id).inFlightRun ? undefined : true, "HANG run ended after abort", 20_000);
+  }, 60_000);
+
   it("hands the link an L5 config that passes the real start preflight against these files", () => {
     expect(h.linkConfig).toMatchObject({ link: h.linkName, file: { mesh: h.fileMeshRoot },
       nats: { machine: BRIDGE_MACHINE, servers: [h.faults.url] },
-      allow: { file: [{ kind: "root", id: h.fileMain.id }], nats: [{ kind: "root", id: h.natsMain.id }] } });
+      allow: { file: [{ kind: "root", id: h.fileMain.id }, { kind: "actor", rootId: h.fileMain.id, name: "bridge-review" }],
+        nats: [{ kind: "root", id: h.natsMain.id }] } });
     expect(() => preflightNatsLinkConfig(h.linkConfig)).not.toThrow();
     expect(natsLinkStatePaths(h.linkConfig).ledger.startsWith(h.root)).toBe(true);
   });

@@ -76,9 +76,12 @@ export const assertMainInboxOpen = (rootId: string, admission?: MainDrainAdmissi
   if (!admission) throw new FabricMainDrainingError(rootId);
   const fromId = typeof admission.from?.id === "string" ? admission.from.id : null;
   const id = admission.deliveryId ?? admission.eventId ?? null;
-  const child = slot.children !== undefined && !slot.fence && (
-    (admission.deliveryId?.startsWith(AGENT_COMPLETION) === true && slot.children.runIds.has(admission.deliveryId.slice(AGENT_COMPLETION.length))) ||
-    (admission.from?.kind === "actor" && fromId !== null && slot.children.actorIds.has(fromId)));
+  // The sender identity is the verified envelope's (never a body field), and a completion counts only when its
+  // run IS that sender: a peer cannot borrow a child's run id through its own command id.
+  const runId = admission.deliveryId?.startsWith(AGENT_COMPLETION) === true ? admission.deliveryId.slice(AGENT_COMPLETION.length) : undefined;
+  const child = slot.children !== undefined && !slot.fence && fromId !== null && (
+    (runId !== undefined && admission.from?.kind === "agent" && fromId === runId && slot.children.runIds.has(runId)) ||
+    (admission.from?.kind === "actor" && slot.children.actorIds.has(fromId)));
   if (child) {
     appendBounded(slot.admitted ??= [], { at: Date.now(), path: admission.path, fromId, id });
     return;

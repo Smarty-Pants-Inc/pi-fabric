@@ -258,16 +258,19 @@ describe.skipIf(!linux)("children (B2/B3/B4, r2 N1/N2)", () => {
         catch { verdicts.push("child-refused"); }
         try { assertMainInboxOpen(ROOT, { path: "fabric-inbox", from: { id: "session:00000000-0000-4000-8000-0000000000cc", kind: "main" }, deliveryId: "cmd-1", text: "hello" }); verdicts.push("outside-admitted"); }
         catch (error) { verdicts.push((error as { code?: string }).code ?? "error"); }
+        // A peer cannot borrow the child's run id through its own command id.
+        try { assertMainInboxOpen(ROOT, { path: "fabric-inbox", from: { id: "session:00000000-0000-4000-8000-0000000000cc", kind: "main" }, deliveryId: `agent-completion:${runId}` }); verdicts.push("borrowed-admitted"); }
+        catch (error) { verdicts.push((error as { code?: string }).code ?? "error"); }
         target.agents[0]!.status = "completed";
       }
       await new Promise(resolve => setTimeout(resolve, Math.min(ms, 50)));
     };
     const result = await inProcess(target, "drain", {}, { deadlineMs: 8_000, sleep });
-    expect(verdicts).toEqual(["child-admitted", "FABRIC_MAIN_DRAINING"]);
+    expect(verdicts).toEqual(["child-admitted", "FABRIC_MAIN_DRAINING", "FABRIC_MAIN_DRAINING"]);
     expect(result.receipt?.result).toBe("pass");
     expect(outcome(target).admitted).toEqual([expect.objectContaining({ id: `agent-completion:${runId}`, path: "completion.journal" })]);
     expect(outcome(target).ledger).toEqual([expect.objectContaining({ id: "cmd-1", fromId: "session:00000000-0000-4000-8000-0000000000cc",
-      textSha256: sha("hello") })]);
+      textSha256: sha("hello") }), expect.objectContaining({ id: `agent-completion:${runId}`, textSha256: null })]);
   });
 });
 

@@ -41,8 +41,11 @@ const ALLOW = {
     republishTopics: ["fleet.work.*"] }],
 };
 
+/** The hub's configured spoke links. */
+const OPTIONS = { link: LINK, natsMachine: BRIDGE, spokes: [SPOKE, "ryzen3"] } as const;
+
 const gateAt = (allow: unknown = ALLOW, clock = { now: NOW }): BridgeNatsIdentity =>
-  createBridgeNatsIdentityGate(parseBridgeNatsAllowSection(allow, { link: LINK, natsMachine: BRIDGE }), { pins: PINS, clock: () => clock.now });
+  createBridgeNatsIdentityGate(parseBridgeNatsAllowSection(allow, OPTIONS), { pins: PINS, clock: () => clock.now });
 
 const record = (fields: Partial<BridgeNatsPresenceRecord> & { id: string }): BridgeNatsPresenceRecord => ({
   name: `root-${fields.id.slice(-2)}`, kind: "main", rootId: fields.id, ownerHostId: `host-${fields.id.slice(-2)}`,
@@ -69,8 +72,18 @@ const ok = (verified: BridgeNatsVerified): BridgeNatsVerifiedIdentity => {
 const code = (value: { ok: boolean; refuse?: string }): string | undefined => value.ok ? undefined : value.refuse;
 
 describe("allow-list: viaSpoke and republishTopics", () => {
+  it("refuses viaSpoke when no spoke links are configured, and a malformed spoke list", () => {
+    expect(() => parseBridgeNatsAllowSection({ file: [{ kind: "root", id: LANE, viaSpoke: SPOKE }] }, { link: LINK, natsMachine: BRIDGE }))
+      .toThrow(/configured spoke link/);
+    for (const spokes of [[LINK], ["bad name"], [SPOKE, SPOKE]]) {
+      expect(() => parseBridgeNatsAllowSection({}, { link: LINK, natsMachine: BRIDGE, spokes })).toThrow(BridgeNatsAllowListError);
+    }
+    expect(parseBridgeNatsAllowSection({ nats: [{ kind: "root", id: MOVED, machine: "lead-v2", republishTopics: ["ops.owner", "fleet.work.tasks"] }] },
+      OPTIONS).entries).toHaveLength(1);
+  });
+
   it("parses a spoke root and a republishing NATS root, and classes the spoke root", () => {
-    const parsed = parseBridgeNatsAllowSection(ALLOW, { link: LINK, natsMachine: BRIDGE });
+    const parsed = parseBridgeNatsAllowSection(ALLOW, OPTIONS);
     const lane = parsed.entries.find(entry => entry.kind === "root" && entry.id === LANE)!;
     expect(lane).toMatchObject({ side: "file", viaSpoke: SPOKE });
     expect(bridgeNatsDestinationClass(lane)).toBe("spokeRoot");
@@ -86,10 +99,14 @@ describe("allow-list: viaSpoke and republishTopics", () => {
     ["republishTopics on a file root", { file: [{ kind: "root", id: OTHER, republishTopics: ["fleet.work.*"] }] }, "allow.file[0].republishTopics"],
     ["republishTopics on an actor", { nats: [{ kind: "actor", rootId: MOVED, name: "a", machine: "lead-v2", receive: [], republishTopics: ["x"] }] }, "allow.nats[0]"],
     ["a bad republish pattern", { nats: [{ kind: "root", id: MOVED, machine: "lead-v2", republishTopics: ["fleet.>"] }] }, "allow.nats[0].republishTopics"],
+    ["an unconfigured spoke link", { file: [{ kind: "root", id: LANE, viaSpoke: "ryzen9" }] }, "allow.file[0].viaSpoke"],
+    ["a republish topic outside fleet.work and ops", { nats: [{ kind: "root", id: MOVED, machine: "lead-v2", republishTopics: ["github.*"] }] }, "allow.nats[0].republishTopics"],
+    ["a bare fleet prefix", { nats: [{ kind: "root", id: MOVED, machine: "lead-v2", republishTopics: ["fleet.*"] }] }, "allow.nats[0].republishTopics"],
+    ["fleet.work without a segment", { nats: [{ kind: "root", id: MOVED, machine: "lead-v2", republishTopics: ["fleet.work"] }] }, "allow.nats[0].republishTopics"],
     ["a spoke root that may receive stop", { file: [{ kind: "root", id: LANE, viaSpoke: SPOKE, receive: ["stop"] }] }, "allow.file[0].receive"],
   ])("refuses %s", (_name, raw, field) => {
     try {
-      parseBridgeNatsAllowSection(raw, { link: LINK, natsMachine: BRIDGE });
+      parseBridgeNatsAllowSection(raw, OPTIONS);
       expect.unreachable("parsed");
     } catch (error) {
       expect(error).toBeInstanceOf(BridgeNatsAllowListError);

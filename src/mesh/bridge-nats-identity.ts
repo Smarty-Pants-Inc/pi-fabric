@@ -153,7 +153,8 @@ const receiveList = (value: Record<string, unknown>, field: string, side: Bridge
   return receive;
 };
 
-const parseEntry = (value: unknown, field: string, side: BridgeNatsSide, natsMachine: string, link: string): BridgeNatsAllowEntry => {
+const parseEntry = (value: unknown, field: string, side: BridgeNatsSide, natsMachine: string, link: string,
+  spokes: readonly string[]): BridgeNatsAllowEntry => {
   if (!isPlainObject(value)) throw new BridgeNatsAllowListError(field, "must be a JSON object");
   const send = operationList(value.send, `${field}.send`);
   const receive = receiveList(value, field, side);
@@ -192,6 +193,9 @@ const parseEntry = (value: unknown, field: string, side: BridgeNatsSide, natsMac
       if (!full(BRIDGE_NAME, value.viaSpoke) || value.viaSpoke === link) {
         throw new BridgeNatsAllowListError(`${field}.viaSpoke`, "must be another bridge link's name");
       }
+      if (!spokes.includes(value.viaSpoke)) {
+        throw new BridgeNatsAllowListError(`${field}.viaSpoke`, "must name a configured spoke link");
+      }
       if (value.principal !== undefined) throw new BridgeNatsAllowListError(`${field}.viaSpoke`, "is not allowed on a principal seat");
     }
     if (value.republishTopics !== undefined && side !== "nats") {
@@ -199,6 +203,10 @@ const parseEntry = (value: unknown, field: string, side: BridgeNatsSide, natsMac
     }
     const receiveTopics = topicList(value.receiveTopics, `${field}.receiveTopics`);
     const republishTopics = topicList(value.republishTopics, `${field}.republishTopics`);
+    // Only the factory's families cross back: fleet.work.* and ops.* (never github.*, fabric.* or a bare prefix).
+    if (republishTopics?.some(pattern => !/^(?:fleet\.work|ops)\.[A-Za-z0-9_*-]/.test(pattern))) {
+      throw new BridgeNatsAllowListError(`${field}.republishTopics`, "must name fleet.work.* or ops.* topics only");
+    }
     return {
       kind: "root", id: value.id, ...common,
       ...(value.principal !== undefined ? { principal: value.principal as string } : {}),
@@ -235,11 +243,20 @@ export const bridgeNatsAllowKey = (entry: BridgeNatsAllowEntryInput): string =>
  * check needs a file read and runs at start (checkBridgeNatsSeatPins, or createBridgeNatsIdentityGate).
  */
 export const parseBridgeNatsAllowSection = (
-  raw: unknown, options: { readonly link: string; readonly natsMachine: string },
+  raw: unknown, options: {
+    readonly link: string;
+    readonly natsMachine: string;
+    /** PR 2 relay: the hub's spoke links (their `mesh-bridge run --remote` names); a viaSpoke must name one. */
+    readonly spokes?: readonly string[];
+  },
 ): BridgeNatsAllowListConfig => {
   if (!full(BRIDGE_NAME, options.link)) throw new BridgeNatsAllowListError("link", "must be a bridge name");
   if (!full(BRIDGE_NATS_MACHINE, options.natsMachine) || full(OPERATOR_MACHINE, options.natsMachine)) {
     throw new BridgeNatsAllowListError("nats.machine", "must be a Path B machine name, not an operator machine");
+  }
+  if (options.spokes !== undefined && (!Array.isArray(options.spokes) || new Set(options.spokes).size !== options.spokes.length ||
+      !options.spokes.every(spoke => full(BRIDGE_NAME, spoke) && spoke !== options.link))) {
+    throw new BridgeNatsAllowListError("spokes", "must be distinct bridge link names other than this link");
   }
   const section = raw === undefined ? {} : raw;
   if (!isPlainObject(section)) throw new BridgeNatsAllowListError("allow", "must be a JSON object");
@@ -254,7 +271,7 @@ export const parseBridgeNatsAllowSection = (
     }
     list.forEach((value, index) => {
       const field = `allow.${side}[${index}]`;
-      const entry = parseEntry(value, field, side, options.natsMachine, options.link);
+      const entry = parseEntry(value, field, side, options.natsMachine, options.link, options.spokes ?? []);
       // An identity lives on one side: naming it twice (or on both sides) would mirror it both ways and loop.
       for (const key of [bridgeNatsAllowKey(entry), ...(entry.kind === "actor" && entry.id ? [`actor-id:${entry.id}`] : [])]) {
         if (seen.has(key)) throw new BridgeNatsAllowListError(field, "names an identity already listed");

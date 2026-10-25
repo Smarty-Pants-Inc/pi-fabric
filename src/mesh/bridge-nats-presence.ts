@@ -489,12 +489,17 @@ export class NatsKvMirror {
 
   get fenced(): boolean { return this.#fenced; }
 
-  /** Whether this link holds a routable row for the id now (its lease is ours and renewable). */
+  /**
+   * Whether this link holds a routable row for the id now: its lease is ours, matches the row's
+   * incarnation, was confirmed within one TTL less the safety margin, and a claim is unexpired.
+   */
   holds(id: string): boolean {
+    if (typeof id !== "string" || id.length === 0) return false;
     const row = this.#rows.get(natsPresenceKey(this.machine, id));
     const lease = row && this.#owned.get(natsLeaseKey(this.machine, row.record.ownerHostId));
     const now = this.#monotonic();
-    return !!row && !!lease && sameSpec(lease.spec, specOf(row.record)) && [...row.claims.values()].some(until => until > now);
+    return !!row && !!lease && sameSpec(lease.spec, specOf(row.record)) &&
+      now - lease.writtenAt < KV_LEASE_TTL_MS - TRANSPORT_HOST_LEASE_SAFETY_MS && [...row.claims.values()].some(until => until > now);
   }
 
   /** The rows this link has written, with whether each is routable now. */
@@ -611,8 +616,9 @@ export class NatsKvMirror {
       current.ownerIncarnation === record.ownerIncarnation;
   }
 
+  /** `recreate`: a lease whose KV row lapsed may be created again (the key is per host, under this machine). */
   async #put(kv: TransportKv, key: string, owner: string, value: unknown, ifRevision: number,
-    adoptable: (entry: TransportKvEntry<unknown>) => boolean): Promise<number> {
+    adoptable: (entry: TransportKvEntry<unknown>) => boolean, recreate = false): Promise<number> {
     try { return await kv.put(key, owner, value, ifRevision, this.#signal()); }
     catch (error) {
       if (!isUncertain(error) && !isConflict(error)) throw error;
@@ -620,7 +626,9 @@ export class NatsKvMirror {
       // and process) is adopted at its current revision; anything else is not this link's row.
       const current = await kv.get<unknown>(key, this.#signal());
       if (!current) {
-        if (isConflict(error)) return await kv.put(key, owner, value, 0, this.#signal());
+        // A vanished presence row is not recreated here: only #hold may create one, after its
+        // another-machine check. A lapsed lease row is recreated (its own key, under this machine).
+        if (isConflict(error) && recreate) return await kv.put(key, owner, value, 0, this.#signal());
         throw error;
       }
       if (!adoptable(current)) throw error;
@@ -644,7 +652,7 @@ export class NatsKvMirror {
       if (current) {
         // The file host restarted: its newer incarnation replaces ours in one CAS, and the
         // superseded one is never accepted again (a stale claim cannot flip it back).
-        const revision = await this.#put(this.#leases, key, owner, value, current.revision, entry => this.#adoptableLease(entry, spec));
+        const revision = await this.#put(this.#leases, key, owner, value, current.revision, entry => this.#adoptableLease(entry, spec), true);
         const superseded = [...(this.#superseded.get(key) ?? []).filter(token => token !== current.spec.incarnation), current.spec.incarnation];
         this.#superseded.set(key, superseded.slice(-MAX_SUPERSEDED));
         Object.assign(current, { spec, owner, revision, writtenAt: startedAt });
@@ -766,7 +774,7 @@ export class NatsKvMirror {
         const startedAt = this.#monotonic();
         try {
           lease.revision = await this.#put(this.#leases, lease.key, lease.owner, this.#leaseValue(lease.spec), lease.revision,
-            entry => this.#adoptableLease(entry, lease.spec));
+            entry => this.#adoptableLease(entry, lease.spec), true);
           lease.writtenAt = startedAt;
         } catch (error) {
           if (isConflict(error)) {

@@ -390,6 +390,44 @@ describe("file roots -> KV presence under the bridge machine", () => {
     expect(w.presence.values.get(pKey(BRIDGE, FILE_ROOT))!.revision).toBeGreaterThan(revision);
   });
 
+  it("recreates its own lapsed lease on renewal, but a vanished presence row only through the full admission check", async () => {
+    const w = world();
+    const { side, clock } = bridge(w);
+    await side.whenReady();
+    await side.mirror(filePresence(clock, [fileRoot()]));
+    w.leases.expire(hKey(BRIDGE, FILE_ROOT));
+    advance(clock, 5_000);
+    await side.writer.renew();
+    expect(w.leases.values.get(hKey(BRIDGE, FILE_ROOT))?.owner).toBe(`${FILE_ROOT}#file-inc-1`);
+    expect(side.holds(FILE_ROOT)).toBe(true);
+    // The row vanishes and, meanwhile, another machine registers the same id: never recreate into ambiguity.
+    w.presence.expire(pKey(BRIDGE, FILE_ROOT));
+    seedNative(w, V2, natsRoot(FILE_ROOT, "v2-inc"), clock.wall);
+    await waitFor(() => expect(side.reader.machinesFor(FILE_ROOT)).toEqual([V2]));
+    const changed = await side.mirror(filePresence(clock, [fileRoot(FILE_ROOT, "file-inc-1", { status: "idle" })]));
+    expect(changed.refused).toEqual([{ id: FILE_ROOT, code: "FABRIC_KV_CONFLICT" }]);
+    const again = await side.mirror(filePresence(clock, [fileRoot()]));
+    expect(again.refused).toEqual([{ id: FILE_ROOT, code: "FABRIC_BRIDGE_NATS_ID_ON_ANOTHER_MACHINE" }]);
+    expect(w.presence.values.has(pKey(BRIDGE, FILE_ROOT))).toBe(false);
+  });
+
+  it("stops claiming to hold a root whose lease renewals keep failing", async () => {
+    const w = world();
+    const { side, clock } = bridge(w);
+    await side.whenReady();
+    await side.mirror(filePresence(clock, [fileRoot()]));
+    const put = w.leases.put.bind(w.leases);
+    w.leases.put = () => { throw Object.assign(new Error("broker down"), { code: "FABRIC_TRANSPORT_UNAVAILABLE" }); };
+    for (let step = 0; step < 2; step++) {
+      advance(clock, 5_000);
+      await expect(side.writer.renew()).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+      expect(side.holds(FILE_ROOT)).toBe(true);
+    }
+    advance(clock, 3_000);
+    expect(side.holds(FILE_ROOT)).toBe(false);
+    w.leases.put = put;
+  });
+
   it("stops renewing a lease another writer took, without deleting it", async () => {
     const w = world();
     const { side, clock } = bridge(w);

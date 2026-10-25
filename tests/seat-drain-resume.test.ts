@@ -78,7 +78,7 @@ describe.skipIf(!linux)("resume-drain through kubectl exec (M9)", () => {
     expect(calls().some(call => call.argv.includes("exec"))).toBe(false);
   });
 
-  it("production uses the image owner's confirmed CLI path (img-g9, 10-25), after the in-Pod test -x", async () => {
+  it("production uses the image owner's confirmed CLI path, after the in-Pod test -x", async () => {
     const { seat, kubectl, calls } = await kubeSeat({ line: exiting, terminate: true });
     expect((await resume(seat, kubectl, undefined)).receipt).toMatchObject({ result: "pass" });
     const execs = calls().filter(call => call.argv.includes("exec")).map(call => call.argv.slice(call.argv.indexOf("--") + 1, call.argv.indexOf("--") + 4));

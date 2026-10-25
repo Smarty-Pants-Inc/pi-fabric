@@ -34,8 +34,10 @@ export interface MainDrainSlot {
   /** N8: the refusal ledger of the current binding (bounded); ledgerOverflow counts entries that did not fit. */
   ledger?: MainDrainRefusal[];
   ledgerOverflow?: number;
-  /** N2: actors this operation stopped, with their recorded public spec. */
+  /** N2: actors this operation stopped (the stop resolved and the worker is proven gone), with their recorded public spec. */
   stopped?: Array<{ id: string; spec: Record<string, unknown>; stoppedAt: number }>;
+  /** Every actor this operation sent a stop for, recorded BEFORE the stop: proven, failed or unproven alike. */
+  stopAttempted?: Array<{ id: string; spec: Record<string, unknown>; stoppedAt: number }>;
   /** A clean exit was accepted (pod binding): it is final, and every later mutating op is refused. */
   exitingAt?: number;
 }
@@ -55,7 +57,7 @@ export const peekDrainSlot = (rootId: string): MainDrainSlot | undefined => slot
 /** Drop an empty slot (nothing closed, bound, held, or stopped by an operation and not yet restored). */
 export const pruneDrainSlot = (rootId: string): void => {
   const slot = slots().get(rootId);
-  if (slot && !slot.gate && !slot.binding && !slot.fence && !slot.stopped?.length) slots().delete(rootId);
+  if (slot && !slot.gate && !slot.binding && !slot.fence && !slot.stopped?.length && !slot.stopAttempted?.length) slots().delete(rootId);
 };
 
 const LEDGER_LIMIT = 1_000;

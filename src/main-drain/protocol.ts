@@ -104,6 +104,8 @@ export interface MainDrainReply {
   ledgerOverflow: number;
   /** N2: the session actors this operation stopped, each with its recorded public spec, and whether a stop was refused. */
   stopped: Array<{ id: string; spec: Record<string, unknown>; stoppedAt: number }>;
+  /** Every actor this operation sent a stop for (recorded before the stop), whether or not it was proven stopped. */
+  stopAttempted: Array<{ id: string; spec: Record<string, unknown>; stoppedAt: number }>;
   stopRefused: string | null;
   /** undo only. restartRequired: the fence could not be lifted through this process's handle; actorsRestored:
    * every actor this operation stopped is active again (stage 1 cannot recreate: false when any was stopped). */

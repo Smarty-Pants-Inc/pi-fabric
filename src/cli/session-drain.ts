@@ -133,7 +133,9 @@ export const runSessionDrainCli = async (
       await sleep(POLL_MS);
       // r2 N2: the raw Pod's session actors are stopped only as the last act, exactly as on the host.
       if (reply.native.inputsFenced && evaluation.reasons.length > 0 && evaluation.reasons.every(reason => reason.startsWith("children:live-actor:"))) {
-        await callBound("stop-actors");
+        const stop = await callBound("stop-actors");
+        // A failed, unproven or unknown stop is not retried: the Pod's Main undoes below (#1607 P1).
+        if (stop.stopRefused && !["NOT_FENCED", "NOT_DRAINED", "ACTORS_NOT_QUIESCED"].includes(stop.stopRefused)) break;
       }
       reply = await callBound("drain");
       evaluation = check(reply);

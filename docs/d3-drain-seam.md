@@ -30,7 +30,7 @@ The installer writes the pinned file once, mode 0500:
 
 The printed `sha256` is what goes in `seat-run.json` `seams.drain`. It differs per host.
 
-A user-owned interpreter is the accepted same-UID residual (SEAT.md §3 A6), and the evidence names it.
+A user-owned interpreter is the accepted same-UID residual (A6 in A's seat contract), and the evidence names it.
 
 ## What the live Main needs
 
@@ -45,12 +45,16 @@ Python 3 at `/usr/bin/python3` must be present on the seat host, for two things:
 - the seat-lock proof;
 - SO_PEERCRED.
 
+The Main and the seam always run that fixed interpreter, isolated (`-I`) with a minimal env. A `python3` placed earlier
+in `PATH` is never used.
+
 ## Evidence files under RUN (all 0600, O_EXCL, read back)
 
 | file | written |
 |---|---|
 | `fabric-v2-drain-intent.json` | before the first control call: `operationId`, the fence `generation`, the interpreter and seam hashes, the Main's owner record |
-| `fabric-v2-drain-outcome.json` | at the end of `drain`, containing:<br>• the result and reason;<br>• every sub-step (begin, fence, stop-actors, probes, undo);<br>• the measured inventory;<br>• the asserted Main replies;<br>• the dispositions;<br>• `stoppedActors` with each one's full registry row;<br>• the admitted and ledger lists |
+| `fabric-v2-drain-stop-<n>-intent.json` | before stop request `n`: each actor about to be stopped, with its full registry row |
+| `fabric-v2-drain-outcome.json` | at the end of `drain`, containing:<br>• the result and reason;<br>• `beginSent: false` when no drain request ever reached the Main;<br>• every sub-step (begin, fence, stop-actors, probes, undo);<br>• the measured inventory;<br>• the asserted Main replies;<br>• the dispositions;<br>• `stoppedActors` (proven or attempted) with each one's full registry row, and `stopIntended`;<br>• the admitted and ledger lists |
 | `fabric-v2-drain-undo-<n>-{intent,outcome}.json` | for each `drain-undo` attempt `n` |
 | `fabric-v2-drain-recheck-{intent,outcome}.json` | for `drain-recheck` |
 | `fabric-v2-resume-drain-{intent,outcome}.json` | for `resume-drain` |
@@ -60,6 +64,12 @@ Python 3 at `/usr/bin/python3` must be present on the seat host, for two things:
 A normally passes the stored `drain` receipt's sha. After a SIGKILLed seam there is no receipt. In that case the
 operator runs `drain-undo` with `drainReceiptSha256: null`, which is accepted only while `RUN/receipts/drain.json`
 is absent. The operator must hold the seat lock and pass the run's `operationId` with `attempt: 1`.
+
+`drain-undo` passes without contacting the Main when this operation never fenced anything (r2 N3). Two measured
+facts prove that:
+- `fabric-v2-drain-intent.json` is absent; or
+- the drain's outcome is a refusal with `beginSent: false`, bound to this intent's sha256. The drain wrote its intent,
+  then no drain request ever reached the Main (for example `main-unreachable`).
 
 Attempts are contiguous. Attempt `n + 1` is allowed only in two cases:
 - attempt `n` is UNKNOWN: it has an intent file and no outcome file;
@@ -74,9 +84,15 @@ is unreachable. Restart v1 (a new process starts unfenced), then run the next at
 The seam stops a session actor only as its last act. By then the fence is held, everything else is 0, and every
 actor is quiesced.
 
+Before each stop request, the seam writes `fabric-v2-drain-stop-<n>-intent.json` with every actor it is about to
+stop and its full registry row. A crash after the request still leaves those rows. The Main counts an actor as
+stopped only after the stop resolved AND its worker is proven gone. A failed, slow or unproven stop ends the drain:
+it refuses and undoes. Every attempted actor, proven or not, must be active again for `admissionRestored: true`.
+
 If anything fails afterwards, or A rejects the pass, the seam does NOT recreate the actor. `drain-undo` then
 returns `admissionRestored: false`. The operator recreates the actor by hand from the full row saved in
-`fabric-v2-drain-outcome.json` → `stoppedActors[].registryRow`:
+`fabric-v2-drain-outcome.json` → `stoppedActors[].registryRow`, or, when the outcome is missing, in
+`fabric-v2-drain-stop-<n>-intent.json` → `actors[].registryRow`:
 
 1. Read the row: `name`, `instructions`, `events`, `topics`, `delivery`, `responseMode`, `triggerTurn`, `coalesce`,
    `coalesceKey`, `dedupeKey`, `activation`, `activationFilter`, `residency`, `runner`, `model`, `thinking`, `tools`,
@@ -109,17 +125,16 @@ returns `admissionRestored: false`. The operator recreates the actor by hand fro
 4. Read back: the new actor's name, `principalScope`, `topics` and `events` must match the row. Record the new id
    next to the old one in the run's notes. The new actor has a new id and a fresh session.
 
-## Paul 10-28: session actors after a SUCCESSFUL drain
+## Session actors after a SUCCESSFUL drain
 
 The seam stops a session actor explicitly, and an explicit stop never revives. So after a successful move, any
-session actor the seam stopped is GONE on v2. Paul's seat has one: `supervisor`.
+session actor the seam stopped is GONE on v2. A seat with a session `supervisor` actor loses it this way.
 
 The operator recreates it from the RUN row, as described above, AFTER A's `activation` step. Then the operator
 reads back that the recreated actor's name, `principalScope` and `topics`/`events` match the row, and records the
 new id.
 
-If org's own start procedure re-creates the supervisor itself, the operator's step is only that read-back.
-principal-lead is confirming which of the two applies.
+If the org's own start procedure re-creates the supervisor itself, the operator's step is only that read-back.
 
 ## `resume-drain` (the raw Pod)
 
@@ -164,7 +179,7 @@ new base and must confirm it again.
   - The resident host, the completion journal and the completion inbox keep their records and deliver later.
   - Legacy `fabric.steer` relays are dropped, and the ledger records them.
 - **The feed's `herdr agent prompt`** cannot see a Pi refusal. Holding the feed is an A/runbook precondition for
-  Paul's move.
+  moving a seat that has a feed.
 - **No fence persists across a v1 restart.** `drain-recheck` is the post-stop recount, and the fence seam observes
   restarters.
 - **The dry-run canary** proves the gates' state, not end-to-end delivery.

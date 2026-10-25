@@ -21,8 +21,9 @@ go through `k ... exec`.
 ## 0. Variables and pins
 
 ```sh
-RUN=/abs/path/to/the/forward/RUN        # sealed by hosts-lead's preflight; move.py has not run on it yet
-REPO=/abs/path/to/A                     # the tree with A's rev-4 setup/org/golive/move.py
+RUN=/abs/path/to/the/forward/RUN        # sealed by the preflight seam; A has not run on it yet
+MOVE=/abs/path/to/A/move.py             # A's rev-4 entrypoint
+CUTOVER=/abs/path/to/A/cutover-module   # A's forward-step module (the file that calls the drain phases)
 PIF=/abs/path/to/pi-fabric/dist/cli/index.js   # the CLI of the pi-fabric release the v1 Main runs
 j() { python3 -I -c 'import json,sys
 d=json.load(open(sys.argv[1]))
@@ -48,7 +49,7 @@ uuid() { python3 -I -c 'import uuid; print(uuid.uuid4())'; }
 |---|---|---|---|
 | 0.1 seam pin | `sha256sum "$SEAM"; stat -c '%U %a' "$SEAM"; head -c 200 "$SEAM" \| head -1` | the sha equals `$SEAMSHA`; the seat user and `500`; `#!/abs/node` | another sha, mode or owner |
 | 0.2 v1 Main | `node "$PIF" session drain "$SID" --mesh "$MESH" --status` | exit 0 and one JSON line, described below | exit 1, or any other value |
-| 0.3 A is rev 4 | `grep -c drain-operation "$REPO/setup/org/golive/seat_cutover.py"; grep -c drain-recheck "$REPO/setup/org/golive/seat_cutover.py"` | both at least 1 | `0`: this A predates rev 4, and `drain` would stop on `GAP: operation-id-invalid` |
+| 0.3 A is rev 4 | `grep -c drain-operation "$CUTOVER"; grep -c drain-recheck "$CUTOVER"` | both at least 1 | `0`: this A predates rev 4, and `drain` would stop on `GAP: operation-id-invalid` |
 | 0.4 host python3 | `stat -c '%U %a %n' /usr/bin/python3` | `root 755 /usr/bin/python3` | missing, or not root-owned |
 | 0.5 host ptrace | `cat /proc/sys/kernel/yama/ptrace_scope` | record the value (`1` expected) | none; `0` is recorded as the A6-class residual |
 
@@ -105,7 +106,7 @@ k -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[?(@.name=="pi")].env[?(
 ```
 
 Expected, line by line:
-1. `Python 3.<minor>.<patch>` (img-g9 measured 3.12.3);
+1. `Python 3.<minor>.<patch>` (the image owner measured 3.12.3);
 2. `/usr/bin/python3`, then `root 755`;
 3. `test-x=0`;
 4. `/opt/pi-fabric/dist/cli/index.js`;
@@ -299,7 +300,7 @@ owner file. Removing the link leaves the real socket in place.
 Preconditions: §0 to §3 passed, and `probe open` shows `binding None`.
 
 ```sh
-(cd "$REPO" && python3 setup/org/golive/move.py cutover-seat --run-dir "$RUN" --run-sha256 "$RUNSHA" --inputs-sha256 "$INSHA" --execute); echo "exit=$?"
+python3 "$MOVE" cutover-seat --run-dir "$RUN" --run-sha256 "$RUNSHA" --inputs-sha256 "$INSHA" --execute; echo "exit=$?"
 ```
 
 Expected: `exit=0`, with A's step-14 message on stdout.
@@ -329,13 +330,14 @@ def receipt(seam, phase, owner):
 sid = sealed["sessionId"]
 d = receipt("drain", "drain", "fabric-v2")
 print("drain observed", "OK" if d == {"sessionId": sid, "inputAdmission": 1, "inputsFenced": True, "queued": 0, "admitted": 0, "childrenTerminal": True} else "FAIL")
-receipt("fence", "fence", "factory-lead")
+receipt("fence", "fence", sealed["seams"]["fence"]["owner"])
 rc = receipt("drain", "drain-recheck", "fabric-v2")
 zero = all(rc["totals"][k] == 0 for k in ("followUps", "queued", "inFlight", "settledWindows", "pendingDeliveryOutcomes", "childCompletionEntries"))
 print("drain-recheck observed", "OK" if rc["complete"] is True and rc["actorsNotStopped"] == 0 and zero else "FAIL")
 rd = receipt("drain", "resume-drain", "fabric-v2")
 print("resume-drain observed", "OK" if rd["inputsFenced"] is True and rd["exited"] is True else "FAIL", "podUid", rd["podUid"])
-names = sorted(n for n in os.listdir(run) if n.startswith("fabric-v2-"))
+names = sorted(n for n in os.listdir(run) if n.startswith("fabric-v2-") and not n.startswith("fabric-v2-drain-stop-"))
+print("stop intents", sorted(n for n in os.listdir(run) if n.startswith("fabric-v2-drain-stop-")))
 want = sorted("fabric-v2-" + n + ".json" for n in ("drain-intent", "drain-outcome", "drain-recheck-intent", "drain-recheck-outcome",
                                                      "resume-drain-intent", "resume-drain-outcome"))
 modes = {n: oct(stat.S_IMODE(os.lstat(os.path.join(run, n)).st_mode)) for n in names}
@@ -419,7 +421,7 @@ Post these on smarty-dev#15310 with the run id, the UTC time and the pass or FAI
 | seam path, sha256, mode, owner, shebang interpreter | 0.1 |
 | v1 Main pid, mesh root, native capability | 0.2 |
 | the host pi-fabric version | `j "$(dirname "$(dirname "$(dirname "$PIF")")")/package.json" version` |
-| A's `seat_cutover.py` sha256 | `sha256sum "$REPO/setup/org/golive/seat_cutover.py"` |
+| A's `move.py` and cutover module sha256 | `sha256sum "$MOVE" "$CUTOVER"` |
 | host and Pod `ptrace_scope` | 0.5, §2 |
 | `can-i` answers, kubeconfig server and CA sha, kubectl owner and mode | §1 |
 | Pod python3 version and owner, CLI `test -x`, Pod pi-fabric version, PPid of an exec'd process (`0`) and of an `sh` child | §2 |
@@ -433,17 +435,17 @@ Post these on smarty-dev#15310 with the run id, the UTC time and the pass or FAI
 
 | seen | meaning | owner |
 |---|---|---|
-| `GAP: lock-not-held` in §4 | A did not pass a held lock FD | principal-lead (A) |
-| `GAP: operation-id-invalid` | A predates rev 4 | principal-lead (A) |
-| `GAP: seat-run-*`, `seat-inputs-*`, `seat-journal-*` | the RUN does not match the request | hosts-lead (preflight) or A |
+| `GAP: lock-not-held` in §4 | A did not pass a held lock FD | A's owner |
+| `GAP: operation-id-invalid` | A predates rev 4 | A's owner |
+| `GAP: seat-run-*`, `seat-inputs-*`, `seat-journal-*` | the RUN does not match the request | the preflight seam's owner, or A's |
 | drain `refused`, `fence-unavailable` | the v1 Pi lacks pi#309, or a per-path denial probe did not refuse | fabric-v2 |
 | drain `refused`, `durable-actor-present` or `children-live` | the seat is not quiet: read `reasons` in `fabric-v2-drain-outcome.json` | operator |
 | drain `refused`, `main-unreachable` | no drain channel, or the owner record does not match the server | fabric-v2 |
-| `GAP: fence-receipt-invalid` at drain-recheck | the fence receipt is not a six-key factory-lead pass for this run | factory-lead |
+| `GAP: fence-receipt-invalid` at drain-recheck | the fence receipt is not a six-key pass from the fence seam's owner for this run | the fence seam's owner |
 | resume-drain `refused` | read `reason` and `asserted.podLine` in `fabric-v2-resume-drain-outcome.json` | the rows below |
-| `reason: pod-cli-missing` | `test -x` failed in the Pod | img-g9 |
-| `podLine` has `MAIN_DRAIN_REFUSED_PEER_UNVERIFIED` | no `/usr/bin/python3` in the Pod | img-g9 |
+| `reason: pod-cli-missing` | `test -x` failed in the Pod | the image owner |
+| `podLine` has `MAIN_DRAIN_REFUSED_PEER_UNVERIFIED` | no `/usr/bin/python3` in the Pod | the image owner |
 | `podLine` has `MAIN_DRAIN_REFUSED_POD_CALLER_NOT_EXEC` | on A's own exec, this runtime gives exec'd processes a parent in the Pod, and the caller proof does not hold | fabric-v2 (stop) |
 | `podLine` has `MAIN_DRAIN_SERVER_NOT_OWNER` | the Pod's owner record does not name the Pod Main | fabric-v2 |
 | `reason: pod-exit-unconfirmed` | the pi container did not terminate with exit code 0 in time | fabric-v2 |
-| `GAP: pod-node-mismatch` or `pod-uid-mismatch` | the Pod is not the sealed target | principal-lead (A) |
+| `GAP: pod-node-mismatch` or `pod-uid-mismatch` | the Pod is not the sealed target | A's owner |

@@ -95,7 +95,7 @@ export const createSeat = async (options: { fenceApi?: boolean; start?: boolean;
   const operationId = randomBytes(16).toString("hex");
   const runBytes = writeSealed(path.join(runDir, "seat-run.json"), {
     schema: "d3-seat-run-v1", run, org: "smarty-pants-inc", principal: "d3synth", instance: "org-d3synth", sessionId: SID,
-    plannedSeats: ["kate", "marisela", "paul"], context: "synthetic", namespace: "org-synthetic", namespaceUID: "00000000-0000-4000-8000-000000000001",
+    plannedSeats: ["alpha", "bravo", "charlie"], context: "synthetic", namespace: "org-synthetic", namespaceUID: "00000000-0000-4000-8000-000000000001",
     natsSecret: "org-d3synth-nats", source: { journal, journalSha256: "0".repeat(64), journalBytes: 1, leafId: "leaf", handoffs: null },
     target: { claim: "synthetic-claim", node: "synthetic-node" },
     seams: { drain: { owner: "fabric-v2", path: "/synthetic/drain", sha256: "1".repeat(64) } },

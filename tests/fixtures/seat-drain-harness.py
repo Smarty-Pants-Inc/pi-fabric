@@ -1,4 +1,4 @@
-"""Runs a seam exactly as A's SeatOp.seam does (seat.py:922-962): the verified executable by its open
+"""Runs a seam exactly as A's seam caller does: the verified executable by its open
 descriptor, the held seat lock passed as D3_SEAT_LOCK_FD, and the fixed minimal environment.
 
 usage: seat-drain-harness.py RUN EXE PHASE [nolock]   (request on stdin; one JSON result line on stdout)

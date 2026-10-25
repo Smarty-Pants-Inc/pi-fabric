@@ -1,5 +1,7 @@
+import fs from "node:fs";
+import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { bindOrMatch, clearBinding, currentBinding, podBindingAllowed, provePodCaller, proveHostBinding, sameOperation,
+import { bindOrMatch, clearBinding, currentBinding, podBindingAllowed, procStartTime, provePodCaller, proveHostBinding, sameOperation,
   type MainDrainBinding, type MainDrainBindingRequest } from "./binding.js";
 import { assertMainInboxOpen, closeMainInbox, mainInboxDrainGate, reopenMainInbox } from "./gate.js";
 import { fenceNativeInput, nativeFenceHeld, observeNativeInput, releaseNativeInput, type NativeInputObservation } from "./native-port.js";
@@ -18,9 +20,10 @@ export interface MainDrainHost {
   agents(): MainDrainAgents | undefined;
   /** The in-memory completion inbox's unconfirmed count (no residency); undefined when there is no inbox. */
   completions?(): number | undefined;
-  /** Tests only: the Main's own environment and /proc. */
+  /** Tests only: the Main's own environment and /proc, and the per-actor stop bound. */
   environment?: NodeJS.ProcessEnv;
   procRoot?: string;
+  stopWaitMs?: number;
 }
 export interface MainDrainMain {
   drainSnapshot(): { held: number; handed: number; heldIds: string[]; handedIds: string[]; journalOpen: boolean; halted: boolean; reloading: boolean };
@@ -51,7 +54,7 @@ const residency = (value: unknown): MainDrainActorRow["residency"] =>
  * - fabric-gate: MainAgentController.probeAdmission(), which runs deliverAgent's own gates
  *   (#admissionGates), or for spawn/create/composer the assertMainInboxOpen they call;
  * - native-fence: Pi's own fence state (getInputState().inputsFenced, the field _assertInputsOpen checks);
- * - both: the gate AND the fence; hold: code-lead's route hold, observed by A, never probed here.
+ * - both: the gate AND the fence; hold: the code route's hold, observed by A, never probed here.
  * `refusal` says what the producer sees: visible (a typed FABRIC_MAIN_DRAINING or Pi refusal), retried
  * (the record stays and is delivered later), dropped, or unknown. "Visible refusal", not "exactly once",
  * for every producer that does not retry.
@@ -212,12 +215,45 @@ export class MainDrainControl {
       let reasons: string[];
       try { reasons = actors.drainQuiescence(actor.id); } catch { return "ACTORS_UNKNOWN"; }
       if (reasons.length) return "ACTORS_NOT_QUIESCED";
-      (slot.stopped ??= []).push({ id: actor.id, spec: structuredClone(specs.get(actor.id) ?? { id: actor.id }), stoppedAt: Date.now() });
+      // Attempted first (an undo must find it active again, stopped or not); stopped only once proven (#1607 P1).
+      const entry = { id: actor.id, spec: structuredClone(specs.get(actor.id) ?? { id: actor.id }), stoppedAt: Date.now() };
+      if (!(slot.stopAttempted ??= []).some(known => known.id === actor.id)) slot.stopAttempted.push(entry);
       slot.children?.actorIds.delete(actor.id);
-      const stop = actors.stop(actor.id, undefined, true, "actors.stop", { explicit: true });
-      await Promise.race([stop.catch(() => undefined), new Promise(resolve => setTimeout(resolve, STOP_WAIT_MS))]);
+      const wait = this.host.stopWaitMs ?? STOP_WAIT_MS;
+      const deadline = Date.now() + wait;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([
+        actors.stop(actor.id, undefined, true, "actors.stop", { explicit: true }).then(() => "stopped" as const, () => "failed" as const),
+        new Promise<"timeout">(resolve => { timer = setTimeout(() => resolve("timeout"), wait); }),
+      ]);
+      if (timer) clearTimeout(timer);
+      // A failed or slow stop ends this request: no further actor is stopped, and the caller refuses and undoes.
+      if (outcome === "failed") return "ACTOR_STOP_FAILED";
+      if (outcome === "timeout") return "ACTOR_STOP_TIMEOUT";
+      if (!(await this.#workerGone(actor.id, deadline))) return "ACTOR_STOP_UNPROVEN";
+      entry.stoppedAt = Date.now();
+      (slot.stopped ??= []).push(entry);
     }
     return null;
+  }
+
+  /**
+   * The worker-death proof: the actor's last worker is gone (never launched, or its pid now has another start time
+   * or no /proc entry), polled until `deadline`. An unknown worker is never proven gone.
+   */
+  async #workerGone(id: string, deadline: number): Promise<boolean> {
+    const procRoot = this.host.procRoot ?? "/proc";
+    for (;;) {
+      let worker: ReturnType<MainDrainActors["drainWorker"]>;
+      try { worker = this.host.actors()?.drainWorker(id); } catch { worker = undefined; }
+      if (worker === null) return true;
+      if (worker !== undefined && worker.startTime !== undefined) {
+        const now = procStartTime(worker.pid, procRoot);
+        if (now !== undefined ? now !== worker.startTime : !fs.existsSync(path.join(procRoot, String(worker.pid)))) return true;
+      }
+      if (Date.now() >= deadline) return false;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
   }
 
   async #drain(): Promise<void> {
@@ -248,7 +284,8 @@ export class MainDrainControl {
     const restartRequired = native.capability && !(native.fenceApi && native.piInputsFenced === false);
     // Stage 1 does not recreate a stopped actor: every one this operation stopped must be active again.
     const owned = this.#owned();
-    const stopped = peekDrainSlot(rootId)?.stopped ?? [];
+    const slot = peekDrainSlot(rootId);
+    const stopped = [...(slot?.stopAttempted ?? []), ...(slot?.stopped ?? [])];
     const actorsRestored = owned !== undefined && stopped.every(entry => owned.some(actor => actor.id === entry.id && actor.status !== "stopped"));
     return { fenceReleased: held && !restartRequired, inboxReopened, restartRequired, actorsRestored };
   }
@@ -316,7 +353,7 @@ export class MainDrainControl {
       completions: { inboxPending: completions },
       admitted: [...(peekDrainSlot(rootId)?.admitted ?? [])], ledger: [...(peekDrainSlot(rootId)?.ledger ?? [])],
       ledgerOverflow: peekDrainSlot(rootId)?.ledgerOverflow ?? 0,
-      stopped: [...(peekDrainSlot(rootId)?.stopped ?? [])], stopRefused: null,
+      stopped: [...(peekDrainSlot(rootId)?.stopped ?? [])], stopAttempted: [...(peekDrainSlot(rootId)?.stopAttempted ?? [])], stopRefused: null,
       undo, exiting: false, exitRefused: [],
     };
   }

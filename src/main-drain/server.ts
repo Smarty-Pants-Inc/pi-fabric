@@ -173,10 +173,8 @@ export class MainDrainServer {
       if (!request) { this.#refuse(socket, null, "REQUEST_INVALID"); return; }
       if (request.sessionId !== this.control.host.sessionId) { this.#refuse(socket, request.op, "SESSION_MISMATCH"); return; }
       // Every binding needs the caller's kernel identity (SO_PEERCRED): the host lock proof and the pod caller proof.
-      // The helper is the fixed /usr/bin/python3, isolated: a python3 planted earlier in the Main's PATH (a
-      // user-owned node bin dir, ~/.local/bin) must not be able to answer for the kernel.
-      const peer = request.binding ? (this.options.peer ?? ((client: net.Socket) => peerCredentials(client, 5_000, "/usr/bin/python3")))(socket)
-        : Promise.resolve(undefined);
+      // peerCredentials always runs the fixed /usr/bin/python3, isolated (records/peer.ts).
+      const peer = request.binding ? (this.options.peer ?? peerCredentials)(socket) : Promise.resolve(undefined);
       // One op at a time, in arrival order: the fence and the actor stops never race.
       const run = this.#queue.then(async () => this.control.handle(request.op, request.binding, await peer.catch(() => undefined), uid));
       this.#queue = run.catch(() => undefined);

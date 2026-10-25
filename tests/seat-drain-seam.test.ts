@@ -199,18 +199,80 @@ describe.skipIf(!linux)("children (B2/B3/B4, r2 N1/N2)", () => {
     target.actors.listOwned = () => [{ id, name: "quiet", status: row.status, rootId: ROOT }];
     target.actors.drainQuiescence = () => row.status === "idle" ? [] : ["status-stopped"];
     target.actors.drainWorker = () => null;
+    const intentAtStop: unknown[] = [];
     target.actors.stop = async () => {
       fencedAtStop.push(target.native.state.fenced);
+      // #1607 P1: the stop-intent (with the full row) is durable BEFORE the stop request.
+      intentAtStop.push(JSON.parse(fs.readFileSync(path.join(target.runDir, "fabric-v2-drain-stop-1-intent.json"), "utf8")));
       target.actors.stops.push(id); row.status = "stopped"; target.writeActors([actorRow(id, "stopped", { stopReason: "explicit" })]); return {};
     };
     target.writeActors([actorRow(id, "idle", { instructions: "stay quiet" })]);
     const result = await inProcess(target, "drain", {}, { deadlineMs: 8_000 });
     expect(target.actors.stops).toEqual([id]);
     expect(fencedAtStop).toEqual([true]);
+    expect(intentAtStop).toEqual([expect.objectContaining({ schema: "fabric-v2-drain-stop-intent-v1", operationId: target.operationId,
+      actors: [expect.objectContaining({ id, registryRow: expect.objectContaining({ id, instructions: "stay quiet" }) })] })]);
     expect(result.receipt).toMatchObject({ result: "pass", observed: { childrenTerminal: true } });
     // The full registry row (instructions included) is captured from the file BEFORE the stop, for recreation.
     expect(outcome(target).stoppedActors).toEqual([expect.objectContaining({ id, spec: expect.objectContaining({ id, name: "quiet" }),
       registryRow: expect.objectContaining({ id, instructions: "stay quiet", status: "idle" }) })]);
+  });
+
+  it("#1607 P1: a failed stop is not swallowed or retried: the drain refuses, the actor is attempted but never 'stopped'", async () => {
+    const target = await seat();
+    const id = "5".repeat(32);
+    let calls = 0;
+    target.actors.listOwned = () => [{ id, name: "stuck", status: "idle", rootId: ROOT }];
+    target.actors.drainQuiescence = () => [];
+    target.actors.drainWorker = () => null;
+    target.actors.stop = async () => { calls += 1; throw new Error("synthetic stop failure"); };
+    target.writeActors([actorRow(id, "idle")]);
+    const result = await inProcess(target, "drain", {}, { deadlineMs: 8_000 });
+    expect(result.receipt?.observed).toMatchObject({ reason: "children-live" });
+    expect(calls).toBe(1);
+    const written = outcome(target);
+    expect(written.steps).toContainEqual(expect.objectContaining({ step: "stop-actors", detail: expect.objectContaining({ refused: "ACTOR_STOP_FAILED" }) }));
+    expect(written.asserted.reply.stopped).toEqual([]);
+    expect(written.asserted.reply.stopAttempted).toEqual([expect.objectContaining({ id })]);
+    expect(written.stopIntended).toEqual([id]);
+  });
+
+  it("#1607 P1: a stop whose worker is not proven gone is UNPROVEN, never recorded as stopped", async () => {
+    const target = await seat();
+    const id = "6".repeat(32);
+    const start = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8").split(") ")[1]!.split(" ")[19]!;
+    target.host.stopWaitMs = 300;
+    target.actors.listOwned = () => [{ id, name: "lingering", status: "idle", rootId: ROOT }];
+    target.actors.drainQuiescence = () => [];
+    // The worker is this very process: alive, same start time.
+    target.actors.drainWorker = () => ({ runId: "run-1", pid: process.pid, startTime: start });
+    target.actors.stop = async () => { target.writeActors([actorRow(id, "stopped", { stopReason: "explicit" })]); return {}; };
+    target.writeActors([actorRow(id, "idle")]);
+    await inProcess(target, "drain", {}, { deadlineMs: 8_000 });
+    const written = outcome(target);
+    expect(written.steps).toContainEqual(expect.objectContaining({ step: "stop-actors", detail: expect.objectContaining({ refused: "ACTOR_STOP_UNPROVEN" }) }));
+    expect(written.asserted.reply.stopped).toEqual([]);
+    expect(written.stoppedActors).toEqual([expect.objectContaining({ id })]);
+  });
+
+  it("#1607 P1: after a SIGKILLed seam, drain-undo still finds the actors it was about to stop (from the stop-intent)", async () => {
+    const target = await seat();
+    const id = "7".repeat(32);
+    const row = { status: "idle" };
+    target.actors.listOwned = () => [{ id, name: "quiet", status: row.status, rootId: ROOT }];
+    target.actors.drainQuiescence = () => row.status === "idle" ? [] : ["status-stopped"];
+    target.actors.drainWorker = () => null;
+    target.actors.stop = async () => { row.status = "stopped"; target.writeActors([actorRow(id, "stopped", { stopReason: "explicit" })]); return {}; };
+    target.writeActors([actorRow(id, "idle")]);
+    expect((await inProcess(target, "drain", {}, { deadlineMs: 8_000 })).receipt?.result).toBe("pass");
+    // A crash before the outcome: only the intent and the stop-intent survive.
+    fs.chmodSync(path.join(target.runDir, "fabric-v2-drain-outcome.json"), 0o600);
+    fs.renameSync(path.join(target.runDir, "fabric-v2-drain-outcome.json"), path.join(target.base, "outcome-moved-aside.json"));
+    // The Main's own memory of the stop is gone too (a reload of the slot is not assumed).
+    drainSlot(ROOT).stopped = []; drainSlot(ROOT).stopAttempted = [];
+    const undo = await inProcess(target, "drain-undo", undoInputs(1, null));
+    expect(undo.receipt).toMatchObject({ result: "refused", observed: { inputsFenced: false, admissionRestored: false } });
+    expect(outcome(target, "fabric-v2-drain-undo-1-intent.json").measured.stopIntents).toEqual([id]);
   });
 
   it("N2: a quiesced actor beside a Main that stays busy is NOT stopped; the refusal leaves it active", async () => {
@@ -445,6 +507,26 @@ describe.skipIf(!linux)("evidence, binding and undo (contract rev 4)", () => {
     drainSlot(ROOT).binding!.generation = "f".repeat(32);
     expect(await inProcess(target, "drain-undo", undoInputs(1, null))).toMatchObject({ code: 2, stdout: "" });
     expect(target.native.state.fenced).toBe(true);
+  });
+
+  it("#1607 B1: a drain refused main-unreachable (intent written, no request sent) passes drain-undo without the Main", async () => {
+    const target = await seat();
+    await target.server.close();
+    const refused = await inProcess(target, "drain", {}, { deadlineMs: 2_000 });
+    expect(refused.receipt).toMatchObject({ result: "refused", observed: { reason: "main-unreachable", inputsFenced: false } });
+    expect(fs.existsSync(path.join(target.runDir, "fabric-v2-drain-intent.json"))).toBe(true);
+    expect(outcome(target)).toMatchObject({ beginSent: false });
+    const undo = await inProcess(target, "drain-undo", undoInputs(1, storeReceipt(target, "drain", refused.stdout)));
+    expect(undo.receipt).toMatchObject({ result: "pass", observed: { sessionId: SID, inputsFenced: false, admissionRestored: true } });
+    expect(outcome(target, "fabric-v2-drain-undo-1-outcome.json")).toMatchObject({ neverFenced: true, evidence: "outcome-begin-never-sent" });
+  });
+
+  it("#1607 B1 counterexample: a drain that DID reach the Main is never 'never fenced'; an unreachable Main then is restart-required", async () => {
+    const target = await seat();
+    expect((await inProcess(target, "drain")).receipt?.result).toBe("pass");
+    await target.server.close();
+    const undo = await inProcess(target, "drain-undo", undoInputs(1, null), { undoBudgetMs: 1_500 });
+    expect(undo.receipt).toMatchObject({ result: "refused", observed: { inputsFenced: true, admissionRestored: false } });
   });
 
   it("N3: a drain refused before its intent passes drain-undo without contacting the Main", async () => {

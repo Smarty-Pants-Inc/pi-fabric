@@ -155,7 +155,7 @@ export const evaluateDrain = (input: {
     : native.promptPending === false && native.pendingMessages === false ? 0 : 1;
   const nativeRunActive = native?.idle !== true;
   const nativeBusy = native?.fenceApi === true && native.drained !== true;
-  // Every probed row (all but code-lead's route hold, which A observes) must refuse.
+  // Every probed row (all but the code route's hold, which A observes) must refuse.
   const probesRefused = reply !== undefined && reply.probes.length === MAIN_DRAIN_INGRESS.length &&
     MAIN_DRAIN_INGRESS.filter(row => row.mechanism !== "hold")
       .every(row => reply.probes.some(probe => probe.path === row.path && probe.mechanism === row.mechanism && probe.admits === false));

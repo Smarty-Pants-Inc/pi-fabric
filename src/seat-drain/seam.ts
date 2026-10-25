@@ -38,6 +38,10 @@ const POLL_MS = 1_000;
 const MAX_REQUEST = 64 * 1024;
 const PHASES = new Set(["drain", "drain-undo", "drain-recheck", "resume-drain"]);
 const INTENT = "fabric-v2-drain-intent.json";
+/** Stop requests per drain (one stop-intent file each). */
+const MAX_STOP_CALLS = 20;
+/** Stop refusals a later pass can clear by waiting; any other stop refusal ends the drain (refused, then undone). */
+const RETRYABLE_STOP = new Set(["NOT_FENCED", "NOT_DRAINED", "ACTORS_NOT_QUIESCED"]);
 const OUTCOME = "fabric-v2-drain-outcome.json";
 const HEX64 = /^[0-9a-f]{64}$/;
 export const DRAIN_REFUSAL_REASONS = ["pending-timeout", "children-live", "durable-actor-present", "inventory-incomplete",
@@ -46,7 +50,7 @@ export type DrainRefusalReason = typeof DRAIN_REFUSAL_REASONS[number];
 const RESIDUALS = [
   "SEAT.md §3 A6: a same-UID writer could alter this seam or its user-owned interpreter between hash and exec",
   "native input fence: fail-closed until Pi ships the extension-facing fence (PI-FENCE-API.md)",
-  "A-side (principal-lead): no persisted fence across a v1 restart; drain-recheck is the post-stop recount",
+  "A-side: no persisted fence across a v1 restart; drain-recheck is the post-stop recount",
   "non-retrying producers get a visible FABRIC_MAIN_DRAINING refusal, not exactly-once delivery",
   "ingress row 8 (feed herdr prompt): a Pi refusal is invisible to the feed; an A/runbook precondition",
 ];
@@ -296,8 +300,16 @@ const drain = async (context: Context): Promise<number> => {
   let fenced = false;
   let stopAsked = false;
   const specs = new Map<string, Record<string, unknown>>();
+  let stopCalls = 0;
+  const intendedStops = new Set<string>();
   const withSpecs = (stopped: MainDrainReply["stopped"]) => stopped.map(entry => ({ ...entry,
     registryRow: specs.get(entry.id) ?? null, basis: { spec: "asserted", registryRow: "measured" } }));
+  // Confirmed stops plus attempted ones (a stop sent but not proven): both must be recreated or active for an undo.
+  const touched = (reply: MainDrainReply | undefined): MainDrainReply["stopped"] => {
+    const all = new Map<string, MainDrainReply["stopped"][number]>();
+    for (const entry of [...(reply?.stopAttempted ?? []), ...(reply?.stopped ?? [])]) all.set(entry.id, entry);
+    return [...all.values()];
+  };
   // Whether any drain request reached the Main: if none did, nothing was closed or fenced.
   let everSent = false;
   const dispositions = new Map<string, string>();
@@ -343,10 +355,21 @@ const drain = async (context: Context): Promise<number> => {
           if (row) specs.set(actor.id, row);
         } catch { /* recorded as missing: the evidence then carries only the Main's public spec */ }
       }
+      // #1607 P1: the rows are durable BEFORE the stop request, so a crash after it still leaves them for drain-undo
+      // and the operator. One write-once file per stop request; past the cap, no further stop is asked.
+      if (stopCalls >= MAX_STOP_CALLS) break;
+      stopCalls += 1;
+      const toStop = (files?.actors ?? []).filter(actor => actor.rootId === rootId && actor.status !== "stopped");
+      for (const actor of toStop) intendedStops.add(actor.id);
+      evidence(context, `fabric-v2-drain-stop-${stopCalls}-intent.json`, { schema: "fabric-v2-drain-stop-intent-v1", generation,
+        actors: toStop.map(actor => ({ id: actor.id, registryRow: specs.get(actor.id) ?? null, basis: "measured" })) });
       const stop = await call(context, "stop-actors", binding(context, "drain", generation), context.deadline - context.now());
       step("stop-actors", { error: stop.error ?? null, refused: stop.reply?.stopRefused ?? null, stopped: stop.reply?.stopped ?? [] });
-      if (stop.reply?.stopRefused) stopAsked = false;                // not all quiesced yet: ask again on a later pass
       if (stop.reply) last = { ...last!, reply: stop.reply };
+      // Not all quiesced yet, or not fenced or drained at that moment: ask again on a later pass. A failed or unproven
+      // stop (or unknown actors) is not retried: the drain refuses and undoes (#1607 P1).
+      if (stop.reply?.stopRefused && RETRYABLE_STOP.has(stop.reply.stopRefused)) stopAsked = false;
+      else if (stop.error || stop.reply?.stopRefused) break;
       if (context.deadline - context.now() <= POLL_MS) break;
       await context.sleep(POLL_MS);
       continue;
@@ -364,7 +387,8 @@ const drain = async (context: Context): Promise<number> => {
       measured: { inventory: final.inventory ?? null, ...final.evaluation.parts.measured },
       asserted: { reply: final.reply ?? null, ...final.evaluation.parts.asserted }, passes,
       dispositions: [...dispositions].map(([id, disposition]) => ({ id, disposition, basis: "asserted" })),
-      stoppedActors: withSpecs(final.reply?.stopped ?? []), admitted: final.reply?.admitted ?? [], ledger: final.reply?.ledger ?? [],
+      stoppedActors: withSpecs(touched(final.reply)), stopIntended: [...intendedStops], admitted: final.reply?.admitted ?? [],
+      ledger: final.reply?.ledger ?? [],
       ingress: MAIN_DRAIN_INGRESS,
     });
     context.io.stdout(receipt(request, "pass", { ...final.evaluation.observed }));
@@ -373,7 +397,7 @@ const drain = async (context: Context): Promise<number> => {
   const reason = refusalReason(final.evaluation, bound || final.reply !== undefined);
   const ledger = final.reply?.ledger ?? [];
   const admitted = final.reply?.admitted ?? [];
-  const stoppedActors = final.reply?.stopped ?? [];
+  const stoppedActors = touched(final.reply);
   if (!everSent) {
     // begin never reached the Main (refused before the request was written): nothing to undo.
     evidence(context, OUTCOME, {
@@ -383,7 +407,7 @@ const drain = async (context: Context): Promise<number> => {
     });
     return refuse(context, reason, false);
   }
-  const undone = await undoAndProbe(context, generation, "drain", stoppedActors.map(entry => entry.id));
+  const undone = await undoAndProbe(context, generation, "drain", [...new Set([...stoppedActors.map(entry => entry.id), ...intendedStops])]);
   step("undo", { admissionRestored: undone.admissionRestored, restartRequired: undone.restartRequired, attempts: undone.attempts });
   evidence(context, OUTCOME, {
     schema: "fabric-v2-drain-outcome-v2", result: "refused", reason, intentSha256, reasons: final.evaluation.reasons,
@@ -392,7 +416,7 @@ const drain = async (context: Context): Promise<number> => {
       canary: { inboxOpen: undone.inboxOpen, inputsFenced: undone.inputsFenced } },
     asserted: { reply: final.reply ?? null, ...final.evaluation.parts.asserted, undo: undone.undo?.undo ?? null, probe: undone.probe ?? null },
     passes, dispositions: [...dispositions].map(([id, disposition]) => ({ id, disposition, basis: "asserted" })), ingress: MAIN_DRAIN_INGRESS,
-    stoppedActors: withSpecs(stoppedActors), actorsRestored: undone.actorsRestored, admitted, ledger,
+    stoppedActors: withSpecs(stoppedActors), stopIntended: [...intendedStops], actorsRestored: undone.actorsRestored, admitted, ledger,
     undo: { admissionRestored: undone.admissionRestored, restartRequired: undone.restartRequired, attempts: undone.attempts },
   });
   // inputsFenced is the state AFTER the undo: false only when the canary proved admission restored (or nothing was bound).
@@ -405,19 +429,44 @@ const present = (file: string): boolean => {
 };
 
 /** The drain intent (absent: no drain reached its intent in this run). Its operationId must be the request's. */
-const readIntent = (context: Context): { generation: string } | undefined => {
+const readIntent = (context: Context): { generation: string; sha256: string } | undefined => {
   const file = path.join(context.runDir, INTENT);
   if (!present(file)) return undefined;
   let value: Record<string, unknown>;
-  try { value = JSON.parse(readOwned(file, context.uid, 1024 * 1024, { mode: 0o600 }, "intent-unreadable").toString("utf8")) as Record<string, unknown>; }
-  catch { throw new SeamGap("intent-unreadable"); }
+  let bytes: Buffer;
+  try {
+    bytes = readOwned(file, context.uid, 1024 * 1024, { mode: 0o600 }, "intent-unreadable");
+    value = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+  } catch { throw new SeamGap("intent-unreadable"); }
   const measured = value.measured as Record<string, unknown> | undefined;
   if (value.schema !== "fabric-v2-drain-intent-v2" || value.run !== context.request.run || value.sessionId !== context.request.sessionId ||
     typeof value.generation !== "string" || !/^[0-9a-f]{32}$/.test(value.generation) || measured?.meshRoot !== context.meshRoot) {
     throw new SeamGap("intent-invalid");
   }
   if (value.operationId !== context.request.operationId) throw new SeamGap("operation-id-mismatch");
-  return { generation: value.generation };
+  return { generation: value.generation, sha256: sha256(bytes) };
+};
+
+/**
+ * The actors a drain was about to stop, from its stop-intent files (written O_EXCL BEFORE each stop request, so a
+ * SIGKILLed seam still leaves every row an operator may need). This operation's only; a foreign one is UNKNOWN.
+ */
+const stopIntents = (context: Context): Array<{ id: string; registryRow: unknown }> => {
+  const rows: Array<{ id: string; registryRow: unknown }> = [];
+  for (let index = 1; index <= MAX_STOP_CALLS; index++) {
+    const file = path.join(context.runDir, `fabric-v2-drain-stop-${index}-intent.json`);
+    if (!present(file)) break;
+    let value: Record<string, unknown>;
+    try { value = JSON.parse(readOwned(file, context.uid, 64 * 1024 * 1024, { mode: 0o600 }, "stop-intent-unreadable").toString("utf8")) as Record<string, unknown>; }
+    catch { throw new SeamGap("stop-intent-unreadable"); }
+    if (value.schema !== "fabric-v2-drain-stop-intent-v1" || value.operationId !== context.request.operationId || value.run !== context.request.run ||
+      !Array.isArray(value.actors)) throw new SeamGap("stop-intent-invalid");
+    for (const actor of value.actors as Array<Record<string, unknown>>) {
+      if (typeof actor?.id !== "string") throw new SeamGap("stop-intent-invalid");
+      rows.push({ id: actor.id, registryRow: actor.registryRow ?? null });
+    }
+  }
+  return rows;
 };
 
 /**
@@ -442,14 +491,15 @@ const verifyFenceReceipt = (context: Context): void => {
   const bytes = readOwned(path.join(context.runDir, "receipts", "fence.json"), context.uid, 4 * 1024 * 1024, undefined, "fence-receipt-missing");
   let value: Record<string, unknown>;
   try { value = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>; } catch { throw new SeamGap("fence-receipt-invalid"); }
-  // A's own acceptance shape (seat.py run_seam): exactly these six keys, owner factory-lead (seat.py SEAMS).
+  // A's own receipt acceptance shape: exactly these six keys, and the fence seam's owner value.
   if (typeof value !== "object" || value === null || Object.keys(value).sort().join(",") !== "observed,owner,phase,result,run,schema" ||
     value.schema !== "d3-seam-receipt-v1" || value.run !== context.request.run || value.phase !== "fence" || value.owner !== "factory-lead" ||
     value.result !== "pass" || typeof value.observed !== "object" || value.observed === null) throw new SeamGap("fence-receipt-invalid");
 };
 
 /** The drain outcome's records (absent: the drain never wrote one). */
-const drainOutcome = (context: Context): { dispositions: Array<{ id: string; disposition: string }>; stopped: string[]; result: string | null } | undefined => {
+const drainOutcome = (context: Context): { dispositions: Array<{ id: string; disposition: string }>; stopped: string[]; result: string | null;
+  beginSent: boolean; intentSha256: string | null } | undefined => {
   const file = path.join(context.runDir, OUTCOME);
   if (!present(file)) return undefined;
   let value: Record<string, unknown>;
@@ -467,7 +517,9 @@ const drainOutcome = (context: Context): { dispositions: Array<{ id: string; dis
   }
   const dispositions = Array.isArray(value.dispositions) ? value.dispositions as Array<{ id: string; disposition: string }> : [];
   const stopped = Array.isArray(value.stoppedActors) ? (value.stoppedActors as Array<{ id: string }>).map(entry => entry.id) : [];
-  return { dispositions, stopped, result: typeof value.result === "string" ? value.result : null };
+  // Only the explicit, measured `beginSent: false` (no drain request was ever written to the Main) counts as never sent.
+  return { dispositions, stopped, result: typeof value.result === "string" ? value.result : null, beginSent: value.beginSent !== false,
+    intentSha256: typeof value.intentSha256 === "string" ? value.intentSha256 : null };
 };
 
 /** The v1 Main's inbox owner record (pid and kernel start time), measured from main-followups/<sid>.owner.json. */
@@ -527,17 +579,24 @@ const drainUndo = async (context: Context): Promise<number> => {
   // A pass receipt proves the drain wrote its intent and fenced; a missing intent then contradicts it (finding 5).
   if (drainResult === "pass" && !intent) throw new SeamGap("drain-pass-without-intent");
   const outcome = drainOutcome(context);
+  // #1607 B1: a drain that refused before any drain request reached the Main (main-unreachable, a binding refused
+  // before it was written) wrote its intent, then an outcome saying so. That outcome, bound to THIS intent's bytes and
+  // a refused result, proves nothing was fenced, exactly as an absent intent does (r2 N3).
+  const neverSent = intent !== undefined && outcome !== undefined && outcome.result === "refused" && outcome.beginSent === false &&
+    outcome.intentSha256 === intent.sha256;
+  const attempted = stopIntents(context);
   const undoIntentSha256 = evidence(context, names.intent, { schema: "fabric-v2-drain-undo-intent-v2", attempt, drainReceiptSha256: sha,
     generation: intent?.generation ?? null, measured: { startedAt: new Date().toISOString(), interpreter: interpreterIdentity(),
-      drainIntentPresent: intent !== undefined } });
+      drainIntentPresent: intent !== undefined, drainBeginNeverSent: neverSent, stopIntents: attempted.map(entry => entry.id) } });
   let observed: { sessionId: string; inputsFenced: boolean; admissionRestored: boolean };
   let detail: Record<string, unknown>;
-  if (!intent) {
-    // r2 N3: the intent is written O_EXCL before `begin`; without it this operation never fenced anything.
+  if (!intent || neverSent) {
+    // r2 N3: the intent is written O_EXCL before `begin`; without it, or with the outcome above, nothing was fenced.
     observed = { sessionId: context.request.sessionId, inputsFenced: false, admissionRestored: true };
-    detail = { basis: "measured", neverFenced: true };
+    detail = { basis: "measured", neverFenced: true, evidence: intent ? "outcome-begin-never-sent" : "no-intent" };
   } else {
-    const undone = await undoAndProbe(context, intent.generation, "drain-undo", outcome?.stopped ?? []);
+    // Every actor this operation was about to stop counts, whether or not its stop was confirmed.
+    const undone = await undoAndProbe(context, intent.generation, "drain-undo", [...new Set([...(outcome?.stopped ?? []), ...attempted.map(entry => entry.id)])]);
     observed = { sessionId: context.request.sessionId, inputsFenced: undone.inputsFenced, admissionRestored: undone.admissionRestored };
     detail = { measured: { canary: { inboxOpen: undone.inboxOpen, inputsFenced: undone.inputsFenced } },
       asserted: { undo: undone.undo?.undo ?? null, probe: undone.probe ?? null },
@@ -586,7 +645,7 @@ const recheck = (context: Context): number => {
 
 /**
  * The in-image pi-fabric CLI that `kubectl exec` runs inside the raw Pod (fixed argv, ruling 10-25).
- * CONFIRMED 10-25 15:39Z by the image owner img-g9 (read-only, ab409c28 family): pi-fabric 0.112.0's CLI is
+ * CONFIRMED 10-25 by the seat image's owner (read-only, on the then-current image family): pi-fabric 0.112.0's CLI is
  * /opt/pi-fabric/dist/cli/index.js (mode 0555), with /usr/local/bin/pi-fabric pointing to it (DRAIN-DESIGN.r2 Q5).
  * The seam still checks `test -x` on it inside the Pod first: cut 2 builds a new base and must re-confirm it.
  * Tests inject SeamDeps.podCli (null: unconfirmed).

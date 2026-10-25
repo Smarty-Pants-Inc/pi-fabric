@@ -399,6 +399,8 @@ export interface BridgeSkip { id: string; sequence: number; topic: string; bytes
 export interface BridgeRead {
   /** Allow-listed events after the cursor, in sequence order. */
   events: MeshEvent[];
+  /** Read is retained in the remote worker; neither cursor is advanced. Not delivery evidence. */
+  busy?: boolean;
   /** Allow-listed events too large for one frame, passed over (the bridge logs each). */
   skipped?: BridgeSkip[];
   /** The last sequence read (the cursor to resume from). */
@@ -426,6 +428,8 @@ export interface BridgeSide {
   latestSequence(): Promise<number>;
   /** Remote heartbeat read with a non-fatal deadline; a missed probe suspends watchdog notifications only. */
   watchdogHead?(timeoutMs: number): Promise<number>;
+  /** Negotiated responsive agent liveness, independent of store/commit progress. */
+  watchdogPing?(timeoutMs: number): Promise<{ busy: boolean }>;
   read(after: number): Promise<BridgeRead>;
   /** Install before the first snapshot. Changes are latched during in-flight work.
    * Watch failure is fatal. undefined selects transitional legacy-remote polling only with
@@ -2587,9 +2591,9 @@ export const checkBridgePublish = (input: unknown): BridgePublish => {
 // ---------------------------------------------------------------------------------------------
 // Stdio transport: one JSON request or response per line.
 
-type RpcOp = "hello" | "latestSequence" | "latestCursor" | "tail" | "read" | "presence" | "publish" | "publishReceipt" | "publishBatch" | "publishReceiptTimes" | "mirror" | "bridgedIds";
+type RpcOp = "ping" | "hello" | "latestSequence" | "latestCursor" | "tail" | "read" | "presence" | "publish" | "publishReceipt" | "publishBatch" | "publishReceiptTimes" | "mirror" | "bridgedIds";
 
-interface RpcRequest { id: number; op: RpcOp; args?: unknown }
+export interface RpcRequest { id: number; op: RpcOp; args?: unknown }
 
 /** Diagnostic class only: never used to grant authority or bypass publication fences. */
 const rpcKind = (request: RpcRequest): string => {
@@ -2601,7 +2605,7 @@ const rpcKind = (request: RpcRequest): string => {
   return request.op === "mirror" || request.op === "presence" ? request.op : events.length ? "publish" : "read";
 };
 
-const lines = (input: Readable, onLine: (line: string) => void, onEnd: (error?: Error) => void): void => {
+export const bridgeRpcLines = (input: Readable, onLine: (line: string) => void, onEnd: (error?: Error) => void): void => {
   let buffered = "";
   input.setEncoding("utf8");
   input.on("data", (chunk: string) => {
@@ -2634,7 +2638,7 @@ const lines = (input: Readable, onLine: (line: string) => void, onEnd: (error?: 
  * pinned peer name to everything it is asked to write. Resolves when the input ends.
  */
 export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output: Writable,
-  debug?: (message: string) => void): Promise<void> =>
+  debug?: (message: string) => void, receiptTime: () => number = () => Date.now()): Promise<void> =>
   new Promise((resolve) => {
     // As with run()'s independent directions (#9751), serialize only related work.
     // hello fences later topology snapshots; all reads/publications retain one FIFO.
@@ -2672,10 +2676,10 @@ export const serveBridgeAgent = (side: StoreBridgeSide, input: Readable, output:
       try { output.write(`${JSON.stringify(value)}\n`); }
       catch (error) { outputClosed(error); }
     };
-    lines(
+    bridgeRpcLines(
       input,
       (line) => {
-        const receivedAt = Date.now(); // Receiver clock BEFORE either lane's dispatch/lock wait.
+        const receivedAt = receiptTime(); // Stdio receiver clock BEFORE worker/lane/lock waits.
         const queuedAt = debug ? performance.now() : 0;
         let request: RpcRequest;
         try {
@@ -2760,6 +2764,11 @@ const numberArg = (args: unknown, name: string): number => {
   return value;
 };
 
+export const bridgeTailBoundary = (args: unknown): { after: number; offset?: number } => ({
+  after: numberArg(args, "after"),
+  ...(isObject(args) && args.offset !== undefined ? { offset: numberArg(args, "offset") } : {}),
+});
+
 const presenceArg = (args: unknown, hub: string): BridgeMirrorPresence => {
   if (!isObject(args) || !Array.isArray(args.hosts) || !Array.isArray(args.participants)) {
     throw new Error("Bridge presence is invalid");
@@ -2814,8 +2823,10 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest, receivedAt: 
     };
     case "latestSequence": return side.latestSequence();
     case "latestCursor": return side.latestCursor();
-    case "tail": return side.tail(numberArg(request.args, "after"),
-      isObject(request.args) && request.args.offset !== undefined ? numberArg(request.args, "offset") : undefined);
+    case "tail": {
+      const { after, offset } = bridgeTailBoundary(request.args);
+      return side.tail(after, offset);
+    }
     case "read": return side.read(numberArg(request.args, "after"));
     case "presence": return { ...boundPresence(await side.presence()).presence, reserved: [] };
     case "publish": return side.publish(checkBridgePublish(request.args), [], true);
@@ -2865,6 +2876,7 @@ export class RemoteBridgeSide implements BridgeSide {
   #protocolVersion: number | undefined;
   #changesReady: Promise<void> | undefined;
   readonly #subscribers = new Set<{ changed: (kind: BridgeChange) => void; failed: (error: Error) => void }>();
+  watchdogPing?: NonNullable<BridgeSide["watchdogPing"]>;
   publishBatch?: NonNullable<BridgeSide["publishBatch"]>;
   publishWithReceipt?: NonNullable<BridgeSide["publishWithReceipt"]>;
   publishBatchWithReceipt?: NonNullable<BridgeSide["publishBatchWithReceipt"]>;
@@ -2883,7 +2895,7 @@ export class RemoteBridgeSide implements BridgeSide {
     let onClosed!: (error: Error) => void;
     this.closed = new Promise((resolve) => (onClosed = resolve));
     this.#onClosed = onClosed;
-    lines(
+    bridgeRpcLines(
       input,
       (line) => {
         let response: { id?: unknown; ok?: unknown; result?: unknown; error?: unknown; code?: unknown; notification?: unknown; kind?: unknown;
@@ -3034,7 +3046,7 @@ export class RemoteBridgeSide implements BridgeSide {
 
   async hello(changes = false, presenceOnly = false): Promise<void> {
     const reply = await this.#call<{ version?: unknown; tail?: unknown; publishBatch?: unknown; publishReceipts?: unknown; changes?: unknown;
-      independentRpc?: unknown; partialPresence?: unknown; nonRootHosts?: unknown }>("hello", {
+      independentRpc?: unknown; partialPresence?: unknown; nonRootHosts?: unknown; responsivePing?: unknown }>("hello", {
       version: BRIDGE_PROTOCOL_VERSION, ...(changes ? { changes: true } : {}),
     });
     if (reply?.version !== BRIDGE_PROTOCOL_VERSION && reply?.version !== LEGACY_BRIDGE_PROTOCOL_VERSION) {
@@ -3049,6 +3061,8 @@ export class RemoteBridgeSide implements BridgeSide {
     this.#supportsNonRootHosts = reply.nonRootHosts === true;
     // Both ordinary hello and automatic notification setup negotiate dispatch isolation.
     this.#independentRpc = reply.independentRpc === true;
+    if (reply.responsivePing === true) this.watchdogPing = timeoutMs => this.#call("ping", undefined, { timeoutMs, fatalTimeout: false });
+    else delete this.watchdogPing;
     // Notification setup must not silently switch a caller's chosen read/publication mode.
     // The CLI explicitly negotiates tail/batch; manual legacy users may have disabled them.
     if (!changes && !presenceOnly) {
@@ -3520,6 +3534,9 @@ export class MeshBridge {
   #sampledDeadlines = new Map<string, number>();
   /** At most one pending boundary per direction. Bodies stay in the durable source, before its cursor. */
   readonly #membershipRetryAt: Partial<Record<Direction, number>> = {};
+  /** Worker tail busy retains a drain, independently of topology/membership retries. */
+  readonly #tailRetryAt: Partial<Record<Direction, number>> = {};
+  readonly #tailSafetyDelay: Partial<Record<Direction, number>> = {};
   readonly #membershipSequence: Partial<Record<Direction, number>> = {};
   /** Events not addressed across since the last count line (smarty-dev#9352). */
   #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, topics: new Set<string>(), more: false };
@@ -3948,7 +3965,7 @@ export class MeshBridge {
     // A still-pending backlog restarts at actual cursor progress, not the next probe.
     // Crossing its last sampled head ends that backlog: later work must not inherit idle time.
     const head = this.#directionHeads[direction];
-    if (head !== undefined && this.#cursor && this.#cursor[direction].after < head) {
+    if ((head !== undefined && this.#cursor && this.#cursor[direction].after < head) || this.#tailRetryAt[direction] !== undefined) {
       this.#directionPendingSince[direction] = monotonicAt;
     } else delete this.#directionPendingSince[direction];
   }
@@ -4004,7 +4021,12 @@ export class MeshBridge {
     const timeoutMs = this.options.watchdogProbeTimeoutMs ?? BRIDGE_WATCHDOG_PROBE_TIMEOUT_MS;
     let direction: Direction | "both" = "both";
     try {
-      const remoteHead = await (this.options.remote.watchdogHead?.(timeoutMs) ?? this.options.remote.latestSequence());
+      const ping = await this.options.remote.watchdogPing?.(timeoutMs);
+      if (ping && typeof ping.busy !== "boolean") throw new Error("invalid bridge ping");
+      // A ping has no committed head. Keep only already-known pending work for the
+      // directional stall checks; never turn responsiveness into a delivery receipt.
+      const remoteHead = ping ? Math.max(cursor.toLocal.after, this.#directionHeads.toLocal ?? 0)
+        : await (this.options.remote.watchdogHead?.(timeoutMs) ?? this.options.remote.latestSequence());
       const localHead = await this.options.local.latestSequence();
       if (this.#stopped) return;
       if (!Number.isSafeInteger(remoteHead) || remoteHead < 0 || !Number.isSafeInteger(localHead) || localHead < 0) {
@@ -4014,13 +4036,15 @@ export class MeshBridge {
       const now = monotonicClock.now();
       this.#directionHeads = { toRemote: localHead, toLocal: remoteHead };
       const pendingToRemote = cursor.toRemote.after < localHead;
-      const pendingToLocal = cursor.toLocal.after < remoteHead;
+      const pendingToLocal = cursor.toLocal.after < remoteHead || this.#tailRetryAt.toLocal !== undefined;
       // Start the deadline when pending work is observed, not at the last success:
       // time spent idle (or awaiting this probe) is not time spent stalled.
       if (!pendingToRemote) this.#noteDirectionSuccess("toRemote", wallNow, now);
       else this.#directionPendingSince.toRemote ??= now;
-      if (!pendingToLocal) this.#noteDirectionSuccess("toLocal", wallNow, now);
-      else this.#directionPendingSince.toLocal ??= now;
+      if (!pendingToLocal) {
+        if (!ping) this.#noteDirectionSuccess("toLocal", wallNow, now);
+        else delete this.#directionPendingSince.toLocal;
+      } else this.#directionPendingSince.toLocal ??= now;
       // Probes observe heads only. Direction loops own forwarding wakes through notifications
       // and their bounded missed-notification safety timers; a probe must not trigger membership.
       const directionalAfter = this.options.directionStallAfterMs ?? BRIDGE_DIRECTION_STALL_AFTER_MS;
@@ -4037,6 +4061,11 @@ export class MeshBridge {
         return;
       }
 
+      if (ping) {
+        this.#lastRoundTripAt = now;
+        this.options.notifyWatchdog?.(); // Liveness only; the stall checks above still own delivery.
+        return;
+      }
       const progressFreshMs = Math.max((this.options.watchdogIntervalMs ?? BRIDGE_WATCHDOG_INTERVAL_MS) * 2, timeoutMs * 2);
       const toRemoteWorking = !pendingToRemote || now - (this.#lastOkToRemoteMono ?? Number.NEGATIVE_INFINITY) <= progressFreshMs;
       const toLocalWorking = !pendingToLocal || now - (this.#lastOkToLocalMono ?? Number.NEGATIVE_INFINITY) <= progressFreshMs;
@@ -4250,6 +4279,10 @@ export class MeshBridge {
   }
 
   #wakeRetainedMembership(direction: Direction): void {
+    if (this.#tailRetryAt[direction] !== undefined) {
+      this.#tailRetryAt[direction] = Date.now();
+      delete this.#tailSafetyDelay[direction];
+    }
     if (this.#membershipRetryAt[direction] === undefined && this.#membershipSequence[direction] === undefined) return;
     delete this.#membershipSafetyDelay[direction];
     this.#membershipRetryAt[direction] = Date.now();
@@ -4397,6 +4430,11 @@ export class MeshBridge {
           delay = Math.max(0, membershipRetryAt - Date.now());
           delayReason = "safety";
         }
+        const tailRetryAt = this.#tailRetryAt[direction];
+        if (tailRetryAt !== undefined) {
+          const tailDelay = Math.max(0, tailRetryAt - Date.now());
+          if (delay === undefined || tailDelay < delay) { delay = tailDelay; delayReason = "safety"; }
+        }
         if (direction === "toLocal" && this.#factoryWaiting) {
           const factoryDelay = Math.max(0, this.#factoryRetryAt - this.#now());
           if (delay === undefined || factoryDelay < delay) { delay = factoryDelay; delayReason = "other"; }
@@ -4496,6 +4534,7 @@ export class MeshBridge {
     let forwarded = 0;
     let dropped = 0;
     const retainedBoundary = this.#membershipSequence[direction];
+    if (Date.now() < (this.#tailRetryAt[direction] ?? -Infinity)) return { forwarded, dropped };
     let passRefreshed = false;
     if (cursor.relayGrace && Number.isSafeInteger(cursor.relayGrace.sequence) && cursor.relayGrace.sequence <= cursor.after) {
       delete cursor.relayGrace;
@@ -4531,6 +4570,20 @@ export class MeshBridge {
       const start = cursor.after;
       const startOffset = cursor.offset;
       const page = await (source.tail?.(start, startOffset) ?? source.read(start));
+      if (page.busy === true) {
+        if (page.events.length || page.through !== start || page.offset !== startOffset || page.skipped?.length)
+          throw new Error("Bridge busy tail advanced its boundary");
+        const initial = Math.min(this.options.membershipRetryMs ?? DEFAULT_MEMBERSHIP_RETRY_MS, MEMBERSHIP_RETRY_MAX_MS);
+        const previous = this.#tailSafetyDelay[direction];
+        const delay = previous === undefined ? initial : Math.min(previous * 2, MEMBERSHIP_RETRY_MAX_MS);
+        this.#tailSafetyDelay[direction] = delay;
+        this.#tailRetryAt[direction] = Date.now() + delay;
+        this.#directionPendingSince[direction] ??= monotonicClock.now();
+        return { forwarded, dropped }; // No cursor save, topology refresh, or caught-up inference.
+      }
+      delete this.#tailRetryAt[direction];
+      delete this.#tailSafetyDelay[direction];
+      this.#directionHeads[direction] = Math.max(this.#directionHeads[direction] ?? 0, page.through);
       const hasControlEvents = page.events.some(event => event.topic === "fabric.control.command" || event.topic === "fabric.control.ack");
       const sourceHead = hasControlEvents ? await source.latestSequence() : page.through;
       // Even filtered/skip-only reads can carry this drain past the mirrors' lease.

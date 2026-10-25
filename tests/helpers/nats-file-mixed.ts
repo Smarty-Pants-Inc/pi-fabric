@@ -31,6 +31,7 @@ import { openFabricTransport } from "../../src/transport/index.js";
 import { runTransportAdmin } from "../../src/transport/nats/admin.js";
 import { hashToken } from "../../src/transport/nats/subjects.js";
 import type { BridgeNatsAllowEntryInput } from "../../src/mesh/bridge-nats-types.js";
+import { parseBridgeNatsAllowSection } from "../../src/mesh/bridge-nats-identity.js";
 import type { FabricControlOperation } from "../../src/topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantRecord, FabricKvHostLease } from "../../src/topology/types.js";
 import type { FabricTransport, TransportEnvelope, TransportSent } from "../../src/transport/types.js";
@@ -139,12 +140,26 @@ export const SEAT_OPERATIONS: readonly FabricControlOperation[] = ["followUp", "
  * entry is pinned to its machine (L3 requires `machine` on every allow.nats entry; integrator note 8).
  */
 export function allowRoot(id: string, options: { operations?: readonly FabricControlOperation[]; principal?: string;
-  receiveTopics?: readonly string[]; machine?: string } = {}): BridgeNatsAllowEntryInput {
+  receiveTopics?: readonly string[]; machine?: string; republishTopics?: readonly string[]; viaSpoke?: string } = {}): BridgeNatsAllowEntryInput {
   const operations = options.operations ?? ROOT_SEND_OPERATIONS;
   return { kind: "root", id, send: [...operations], receive: [...operations],
     ...(options.principal === undefined ? {} : { principal: options.principal }),
     ...(options.receiveTopics === undefined ? {} : { receiveTopics: [...options.receiveTopics] }),
-    ...(options.machine === undefined ? {} : { machine: options.machine }) };
+    ...(options.machine === undefined ? {} : { machine: options.machine }),
+    // PR 2 fields (L3): N4 republish topics on a NATS entry; a spoke root's hub link on a file entry.
+    ...(options.republishTopics === undefined ? {} : { republishTopics: [...options.republishTopics] }),
+    ...(options.viaSpoke === undefined ? {} : { viaSpoke: options.viaSpoke }) } as BridgeNatsAllowEntryInput;
+}
+
+/**
+ * Whether this checkout's allow-list parser (L3) accepts one entry on `side`: the capability probe for PR 2
+ * fields (republishTopics, viaSpoke). Any refusal but an unknown key means the field exists.
+ */
+export function allowEntrySupported(side: "file" | "nats", entry: BridgeNatsAllowEntryInput): boolean {
+  try {
+    parseBridgeNatsAllowSection({ [side]: [entry] }, { link: DEFAULT_LINK_NAME, natsMachine: BRIDGE_MACHINE });
+    return true;
+  } catch (error) { return !/unknown key/i.test(String(error)); }
 }
 
 /** A file-side actor allow entry (owner root + name; the verified presence must match both). */
@@ -366,6 +381,8 @@ export interface MixedHarnessOptions {
    * ssh agent), whose relay hook and the A' link's meet in `harness.relays`.
    */
   readonly spoke?: boolean;
+  /** Override the link's own nats.events flag (default: options.events), e.g. to prove start refuses without the grant. */
+  readonly linkEvents?: boolean;
 }
 
 export interface MixedIds {
@@ -587,7 +604,8 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
       orgJson,
       nats: { servers: [faults.url], machine: BRIDGE_MACHINE, credentials: broker.users.machineA.credsPath, caFile: broker.tls!.caFile,
         custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream,
-        pathBMachines: [...PATH_B_MACHINES], operatorMachine: "fabric-ops", ...(org ? { org, events: true } : {}) },
+        pathBMachines: [...PATH_B_MACHINES], operatorMachine: "fabric-ops",
+        ...((options.linkEvents ?? Boolean(org)) ? { org: org ?? HARNESS_ORG, events: true } : {}) },
       allow,
     };
     const validatedConfig = await validateLinkConfig(linkConfig);

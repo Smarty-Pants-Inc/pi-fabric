@@ -38,12 +38,14 @@ at another file or unit.
 
 ## `resume` (read-only)
 
-Inputs: `{pod: {name, uid}, finalSeal: {journalSha256, journalBytes, leafId}}`.
+Inputs: `{pod: {name, uid}, finalSeal}`, where `finalSeal` is A's whole final seal, exactly seven keys:
+`{schema, run, journal, journalSha256, journalBytes, leafId, sealHasThinkingEntry}` (A at 7d2e09af or later).
 
 Observed: `{sessionId, journal, leafId, podUid, appendedSinceSeal, journalSha256, suffixBase64}`.
 
 1. A's final seal comes from RUN itself: `RUN/receipts/final-seal.json`. Its sha256 must be the journal's one
-   `final-seal` record. It must name this run and the sealed source journal, and equal the request's `finalSeal`.
+   `final-seal` record. It must have exactly the seven keys, schema `d3-seat-final-seal-v1`, this run and the sealed
+   source journal, and be identical to the request's `finalSeal`.
 2. The raw Pod is read through the API: the pinned UID, the sealed `target.node`, pi running, and its rendered
    `--session` argument.
 3. Through `kubectl exec`, the seam runs the in-image CLI read
@@ -72,7 +74,9 @@ A `refused` receipt when:
 - the Main's leaf differs from its file's last entry (`leaf-memory-file-mismatch`).
 
 Pi core appends one `thinking_level_change` entry on resume when the sealed branch has none. A judges
-`appendedSinceSeal` under its rule T-FIX3. The seam reports it exactly as found.
+`appendedSinceSeal` under its rule T-FIX3: it re-reads the host journal from its final seal, checks
+`sha256(sealed bytes + decoded suffix) == journalSha256`, and that the suffix parses to exactly `appendedSinceSeal`.
+The seam reports it exactly as found.
 
 ## `publish`
 
@@ -80,17 +84,22 @@ Inputs: `{owner: {template, claim, sandbox, pod: {name, uid}}}`.
 
 Observed: `{sessionId, incarnation, route}`, where `route` is `v2@<managed pod UID>:<config sha256, 12 hex>`.
 
-1. The seam reads the pinned link config and plans the one change (see "The A' config writer" below). The intent,
-   written before any effect, records that exact change, including the old and new bytes and the seat's old
-   file entry with its index.
-2. It reads the managed Pod's Main exactly as `resume` does: the API, then the `--identity` read inside the Pod. A
-   Pod or Main it cannot verify, or a missing owner incarnation, refuses before anything is written.
-3. It writes the config, then restarts the pinned unit. The link reads its allow-list only at start. The restart
-   counts as done only when a NEW process holds the link's lock (another pid or start time) and `nats-link status`
-   reports no problem.
+The seat's NATS machine is the sealed run's `natsMachine` (A's T-FIX6), never `instance`, which is the Herdr
+agent. A run without it stops at exit 2 (`seat-nats-machine-unpinned`).
+
+1. The seam reads the managed Pod's Main exactly as `resume` does: the API, then the `--identity` read inside the
+   Pod. A Pod or Main it cannot verify, a missing owner incarnation, or a Pod whose own `PI_FABRIC_MESH_NATS`
+   machine is not the run's `natsMachine`, refuses before anything is written.
+2. Under the config lock (see "The A' config writer" below) it reads the pinned link config, plans the one change,
+   and writes the intent: the exact change, and the rollback authority. A no-change publish records no rollback
+   authority. Then it swaps the file and reads it back.
+3. Every later step reads that post-write config, re-parsed from disk. The seam restarts the pinned unit; the
+   link reads its allow-list only at start. The restart counts as done only when a NEW process holds the link's
+   lock (another pid or start time) and `nats-link status` reports no problem.
 4. The read-back, polled for at most 120 s, needs:
-   - the seat's identity on the `nats` side;
-   - exactly ONE live NATS presence record, on the seat's own Path B machine (`run.instance`);
+   - the link's REAL identity gate (`nats-link dry-run`, with the org.json seat pins) to resolve the seat as `live`
+     on the `nats` side, on `natsMachine`. The gate refuses an id with a second record, live or not;
+   - exactly ONE NATS presence record for the id, on `natsMachine`, live;
    - the hub's mirror of it under this link, live;
    - both carrying the owner incarnation that the managed Pod's Main reported from inside that Pod.
 5. Every other route that `nats-link status` showed live before the restart must be live again.
@@ -111,9 +120,13 @@ Inputs: `{recoveryRun, parentRun, parentRunSha256, writer: {sessionId, pid, sess
 Observed: `{sessionId, route}`, where `route` is `v1@<pid>:<start ticks>`.
 
 1. The seat's mesh root, from the sealed journal and Fabric config, must be the link's `file.mesh`.
-2. The change to undo is the one publish recorded in this RUN. The nats entry must be exactly the entry publish
-   wrote, and the seat's old file entry goes back at its index. With no publish write in this RUN, nothing changes:
-   no write and no restart.
+2. The change to undo is publish's recorded rollback authority in this RUN, under the config lock:
+   - the file still holds publish's bytes: compare-and-swap back to the recorded old bytes, exactly;
+   - the file holds the old bytes: no change;
+   - anything else (another seat changed it since): an entry-level undo of exactly publish's entry, re-validated.
+     The seat's nats entry must be the one publish wrote, and its old file entry goes back at its index;
+   - no authority (publish wrote nothing): no change, no restart. A nats entry for the seat that publish did not
+     write refuses (`seat-entry-conflict`); the seam never removes it.
 3. Write, restart and reload as for publish. After a restore, the one status problem that still counts as
    reloaded is the removed seat's own old mirror row (`mirror not on allow.nats: session:<sid>`).
 4. Every other route comes back, as for publish.
@@ -122,8 +135,9 @@ Observed: `{sessionId, route}`, where `route` is `v1@<pid>:<start ticks>`.
    - that pid's start time is the owner record's;
    - its session file is `writer.sessionFile`;
    - it reports an owner incarnation.
-6. The hub's live record for the session is native (not a mirror) with that incarnation. When the seat's file entry
-   was restored, exactly one live NATS record exists for it, the link's mirror on the link's own machine.
+6. The hub's live record for the session is native (not a mirror) with that incarnation. When the seat is on
+   `allow.file` after the restore, the link's identity gate must resolve it `live`, and exactly one NATS record
+   exists for it, the link's mirror on the link's own machine.
 7. No live NATS record for the session remains on any other machine (`v2-presence-live`).
 
 ## The A' config writer (`src/seat-bridge/allow-writer.ts`)
@@ -131,10 +145,18 @@ Observed: `{sessionId, route}`, where `route` is `v1@<pid>:<start ticks>`.
 It changes exactly ONE allow-list entry of the pinned nats-link config, the moving seat's root. It never makes a
 free-form edit.
 
+- **The path** has no symlink in any component (its real path is itself). Every directory from `/` down is root's or
+  the seat user's and not group/other-writable; a sticky shared directory is allowed only above the config's own
+  directory. The file is regular, root's or the seat user's, one link, not group/other-writable, at most 1 MiB.
+  Every read, the temp file and the rename go through a descriptor of that verified directory, whose identity must
+  still be the one the plan read.
+- **One config-scoped lock** (`.<config name>.fabric-v2.lock`, an O_EXCL file beside the config) is held across
+  read, plan, intent, check, rename and read-back by every seam write, on any seat. A lock whose holder process is
+  gone (pid and start time) is removed only while it is the same file; a live holder is waited for, at most 30 s.
 - **The entry** has one fixed shape, built only from sealed values:
   - `id` is `session:<run sessionId>`;
   - `principal` is the org.json principal whose seat is that session;
-  - `machine` is `run.instance`, which must be in `nats.pathBMachines` and is never the link's own machine;
+  - `machine` is the run's `natsMachine`, which must be in `nats.pathBMachines` and is never the link's own machine;
   - `send` is `["followUp"]` and `receive` is `["followUp", "cancel"]`, both reviewed constants.
 - **The pre-state** decides the change:
   - the same nats entry already there means no change;
@@ -150,14 +172,15 @@ free-form edit.
   and just before the rename. The temp file is private and in the same directory. The temp file and the directory
   are fsynced, and the result is read back byte for byte. A failure before the rename leaves the old file as it was.
 
-The writer rewrites the file as indented JSON. Its values are the guarded property, and the bytes may differ in
-layout only.
+A publish rewrites the file as indented JSON: its values are the guarded property, and the bytes may differ in
+layout only. A rollback while the file still holds publish's bytes restores the old bytes exactly, layout included.
 
 ## Preconditions (each is checked live in the test-seat runbook)
 
 - The link runs as the seat user under the pinned `systemd --user` unit, with `Restart=on-failure`, and its
   `stateDir` is a durable path.
-- The seat's Path B machine is in the link config's `nats.pathBMachines`.
+- The sealed run names the seat's `natsMachine`, and that machine is in the link config's `nats.pathBMachines`.
+- The link config's path has no symlink component, so the installer must be given its real path.
 - The seat image carries a pi-fabric CLI with `session drain --identity`, which is this change, and
   `/usr/bin/python3`.
 - `/usr/bin/systemctl` is root-owned.

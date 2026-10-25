@@ -4,7 +4,7 @@ import path from "node:path";
 import type { NatsLinkConfig } from "../mesh/bridge-nats-config.js";
 import { natsLinkLockHolder, natsLinkRootsSource } from "../mesh/bridge-nats-ops.js";
 import { readNatsRoots, type NatsRootInfo } from "../mesh/bridge-nats-roots.js";
-import { natsLinkStatus, sessionReceipt } from "../mesh-bridge-nats-cli.js";
+import { natsLinkDryRun, natsLinkStatus, sessionReceipt } from "../mesh-bridge-nats-cli.js";
 import { SeamGap } from "../seat-drain/run.js";
 
 /**
@@ -20,7 +20,21 @@ export interface LinkDeps {
   receipt?: (config: NatsLinkConfig, session: string) => Promise<Record<string, unknown>>;
   roots?: (config: NatsLinkConfig) => Promise<NatsRootInfo[]>;
   holder?: (config: NatsLinkConfig) => { pid: number; startTime?: string | undefined; purpose: string } | undefined;
+  /** The link's REAL identity gate over both sides' presence (`nats-link dry-run`). */
+  dryRun?: (config: NatsLinkConfig) => Promise<{ rows: ReadonlyArray<Record<string, unknown>> }>;
 }
+
+/**
+ * The seat's row as the link's own identity gate resolves it right now (bridgeNatsDryRun, with the same org.json seat
+ * pins as `start`): `status` is `live`, or the gate's refusal code (an id with two records, live or not, is ambiguous).
+ */
+export const gateRow = async (config: NatsLinkConfig, sessionId: string, deps: LinkDeps): Promise<Record<string, unknown> | null> => {
+  try {
+    const report = await (deps.dryRun ?? (c => natsLinkDryRun(c)))(config);
+    const row = report.rows.find(entry => entry.key === `session:${sessionId}`);
+    return row ? { ...row } : null;
+  } catch (error) { return { status: "unreadable", reason: error instanceof Error ? error.message.slice(0, 300) : "dry-run failed" }; }
+};
 
 const SYSTEMCTL = "/usr/bin/systemctl";
 export const LINK_UNIT = /^[A-Za-z0-9][A-Za-z0-9@._-]{0,120}\.service$/;
@@ -136,15 +150,22 @@ export const otherRoutesBack = async (config: NatsLinkConfig, before: Record<str
   return { checked: wanted, down, after };
 };
 
-/** `nats-link receipt --session <sid> --nats`, polled until routable or the deadline. */
+/**
+ * The seat's route, polled until accepted or the deadline: the link's identity gate row for the seat AND
+ * `nats-link receipt --session <sid> --nats` (the records and incarnations on both sides), both read against the
+ * config ON DISK now (the caller passes the post-write config).
+ */
 export const awaitRoutable = async (config: NatsLinkConfig, sessionId: string, deps: LinkDeps,
-  clock: { now: () => number; sleep: (ms: number) => Promise<void>; deadline: number }, accept: (receipt: Record<string, unknown>) => boolean) => {
+  clock: { now: () => number; sleep: (ms: number) => Promise<void>; deadline: number },
+  accept: (gate: Record<string, unknown> | null, receipt: Record<string, unknown>) => boolean) => {
   let last: Record<string, unknown> | null = null;
+  let gate: Record<string, unknown> | null = null;
   for (;;) {
+    gate = await gateRow(config, sessionId, deps);
     try { last = await (deps.receipt ?? ((c, s) => sessionReceipt(c, s, { nats: true })))(config, sessionId); }
     catch (error) { last = { ok: false, problems: [error instanceof Error ? error.message.slice(0, 300) : "receipt failed"] }; }
-    if (last && accept(last)) return { ok: true, receipt: last };
-    if (clock.now() >= clock.deadline) return { ok: false, receipt: last };
+    if (last && accept(gate, last)) return { ok: true, gate, receipt: last };
+    if (clock.now() >= clock.deadline) return { ok: false, gate, receipt: last };
     await clock.sleep(1_000);
   }
 };

@@ -16,7 +16,7 @@ then:
 
 ```sh
 BRIDGE=$(j "$RUN/seat-run.json" seams bridge path); BRIDGESHA=$(j "$RUN/seat-run.json" seams bridge sha256)
-MACHINE=$(j "$RUN/seat-run.json" instance)
+MACHINE=$(j "$RUN/seat-run.json" natsMachine)          # A's T-FIX6; never the Herdr instance
 LINKCFG=/abs/path/to/the/nats-link/config.json      # the file the bridge seam was installed with
 UNIT=smarty-nats-link.service                         # the unit the bridge seam was installed with
 LINK() { node "$PIF" nats-link "$@" --config "$LINKCFG"; }
@@ -26,7 +26,8 @@ userctl() { systemctl --user "$@"; }
 | step | command | expected | FAIL |
 |---|---|---|---|
 | 0.1 seam pin | `sha256sum "$BRIDGE"; stat -c '%U %a' "$BRIDGE"; grep -c -F "\"$LINKCFG\"" "$BRIDGE"; grep -c -F "\"$UNIT\"" "$BRIDGE"` | the sha equals `$BRIDGESHA`; the seat user and `500`; `1`; `1` | another sha, mode or owner; a `0` (the seam is pinned to another config or unit) |
-| 0.2 machine | `j "$LINKCFG" nats pathBMachines` | a list that contains `$MACHINE`, and `$MACHINE` is not `j "$LINKCFG" nats machine` | missing: publish would stop on `GAP: seat-machine-not-path-b`. Add the machine to the link's inventory first (its own reviewed step) |
+| 0.2 machine | `echo "$MACHINE"; j "$LINKCFG" nats pathBMachines` | a machine name (the run has `natsMachine`), and a list that contains it, which is not `j "$LINKCFG" nats machine` | an empty `$MACHINE`: A predates T-FIX6 and publish stops on `GAP: seat-nats-machine-unpinned`. Not in the list: publish stops on `GAP: seat-machine-not-path-b`; add it to the link's inventory first (its own reviewed step) |
+| 0.2b real path | `realpath "$LINKCFG"` | exactly `$LINKCFG` | another path: a symlink component; install the seam with the real path |
 | 0.3 shared mesh | `realpath "$(j "$LINKCFG" file mesh)"; echo "$MESH"` (the drain runbook's `MESH`, realpath) | the same path twice | different: rc-restore-route would stop on `GAP: seat-mesh-not-link-mesh` |
 | 0.4 systemctl | `stat -c '%U %a %n' "$(readlink -f /usr/bin/systemctl)"` | `root 755 ...` | other owner or mode |
 | 0.5 durable link state | `j "$LINKCFG" stateDir` | a durable path, for example `~/.local/state/smarty/nats-link/v2` | a path in `/tmp`, `/var/tmp`, `/dev/shm`, `/run` or any agent's private temp store (`smarty-pi-tmp`): temp-store reaping could remove the link's cursor and ledger. Move it first; the seam's install and every phase refuse it (`link-state-dir-temporary`) |
@@ -61,10 +62,12 @@ On a running Pod of the seat image (any before §3; the managed Pod after it):
 POD="<pod name>"
 k -n "$NS" exec "$POD" -c pi -- /opt/pi-fabric/dist/cli/index.js session drain --help | grep -c -- --identity
 k -n "$NS" exec "$POD" -c pi -- /usr/bin/python3 -V
+k -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[?(@.name=="pi")].env[?(@.name=="PI_FABRIC_MESH_NATS")].value}'; echo
 ```
 
-Expected: at least `1` (this change's CLI), then `Python 3.<minor>.<patch>`. FAIL: `0` (the image's pi-fabric
-predates the identity read: both phases would refuse `pod-identity-unreadable`), or no python3.
+Expected: at least `1` (this change's CLI), then `Python 3.<minor>.<patch>`, then a JSON object whose `machine` is
+`$MACHINE`. FAIL: `0` (the image's pi-fabric predates the identity read: both phases would refuse
+`pod-identity-unreadable`), no python3, or another machine (publish refuses `pod-nats-machine-mismatch`).
 
 ## 3. The forward run: `resume` and `publish` (A runs them)
 
@@ -183,12 +186,15 @@ print("receipt", r["result"], json.dumps(r["observed"]))
 out = json.load(open(os.path.join(run, "fabric-v2-bridge-rc-restore-route-outcome.json")))
 print("reason", out["reason"], "reload", json.dumps(out["measured"]["reload"]), "v2Live", json.dumps(out["measured"]["v2Live"]))
 before, after = json.load(open(before_file)), json.load(open(cfg))
-print("allow back", "OK" if before.get("allow") == after.get("allow") else "CHECK")
+print("bytes back", "OK" if open(cfg, "rb").read() == open(before_file, "rb").read() else "CHECK",
+      "change", json.load(open(os.path.join(run, "fabric-v2-bridge-rc-restore-route-intent.json")))["plan"]["change"])
 EOF
 ```
 
 Expected: `receipt pass` with `route` = `v1@<relaunched pid>:<start ticks>`, `reason None`, `v2Live []`, and
-`allow back OK`. `CHECK` means another seat's entry changed in between: compare the seat's own entries by hand.
+`bytes back OK change revert`: the config is the pre-publish file, byte for byte. `CHECK` with change `restore` or
+`remove` means another seat changed the file in between, and the seam undid only its own entry: compare the seat's
+own entries by hand.
 Repeat §3.1's status read: every route from §1 live, the seat back under `file`, and no live NATS record on
 `$MACHINE`.
 
@@ -230,5 +236,10 @@ Post these on smarty-dev#15310 with the run id, the UTC time and the pass or FAI
 | `refused`, `pod-identity-unreadable` | the Pod's CLI lacks `--identity`, or its server check failed: read `asserted.podLine` | the image owner, or fabric-v2 |
 | `refused`, `link-not-reloaded` | no new lock holder, or a status problem: read `measured.reload` | the link's operator |
 | `refused`, `seat-not-routable` | no single live record on the seat's machine with the Pod Main's incarnation: read `measured.receipt` | fabric-v2 |
+| `refused`, `seat-route-refused-by-gate` | the link's identity gate does not resolve the seat (for example `BRIDGE_NATS_AMBIGUOUS`: an old presence record for the id, live or not): read `measured.gate`. A presence row expires within its 10-minute TTL | fabric-v2 |
+| `refused`, `pod-nats-machine-mismatch` or `-unknown` | the managed Pod's `PI_FABRIC_MESH_NATS` does not name the run's `natsMachine` | A's owner |
+| `GAP: seat-nats-machine-unpinned` | the sealed run has no `natsMachine` (A predates T-FIX6) | A's owner |
+| `GAP: link-config-path-unsafe` | a symlink or an unsafe directory on the config's path | the link's operator |
+| `GAP: link-config-busy` | another seam write held the config lock for over 30 s | rerun only after reconciling |
 | `refused`, `other-routes-down` | a route that shared the link did not come back: read `measured.otherRoutes.down` | fabric-v2, at once |
 | `refused`, `v1-*` or `v2-presence-live` | the relaunched v1 is not the live owner, or a v2 record is still live | A's owner, fabric-v2 |

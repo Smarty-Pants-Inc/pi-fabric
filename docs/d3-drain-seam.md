@@ -38,7 +38,17 @@ The v1 Main must run a pi-fabric release that has the owner-only drain channel, 
 a Unix socket in `<parent>/.<mesh>.main-drain/`, the mesh root's private sibling: a 0700 directory owned by the seat
 user, on the mesh root's own filesystem. It stays out of the mesh root, so no tool that walks the mesh meets a
 socket, and a copy of the mesh root never carries one. On a seat Pod it is `/var/lib/fabric/.mesh.main-drain/`, next
-to `/var/lib/fabric/mesh` on the seat volume. It is never reachable over the
+to `/var/lib/fabric/mesh` on the seat volume.
+
+What the channel creates in that directory, and nothing else (no temp, lock or pid file):
+- the directory itself, mode 0700, owned by the seat user (`src/main-drain/server.ts`, `pinDirectory`, its
+  `mkdirSync`);
+- one Unix socket per Main session, `<24 hex>.sock` (`mainDrainSocketName` in `protocol.ts`), created by the
+  server's `listen` and set to mode 0600;
+- removals: a stale socket of the same name that is ours and answers nobody, at start, and the socket itself on
+  close.
+
+Clients, the seams and the in-Pod CLI only stat and connect there. It is never reachable over the
 mesh, NATS or a bridge.
 
 The Main also needs a Pi that has the extension input fence (`pi.hostCapabilities.extensionInputFence === 1`,

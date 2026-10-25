@@ -34,7 +34,9 @@ elif rest[0] == "-n" and rest[2:4] == ["get", "pod"]:
     print(json.dumps({"metadata": {"name": pod["name"], "uid": pod["uid"]},
                       "spec": {"nodeName": pod.get("nodeName", "synthetic-node"),
                                "containers": [{"name": "pi", "args": pod.get("args", []),
-                                                "env": [{"name": "PI_FABRIC_MESH_ROOT", "value": pod["meshRoot"]}]}]},
+                                                "env": [{"name": "PI_FABRIC_MESH_ROOT", "value": pod["meshRoot"]}] +
+                                                ([{"name": "PI_FABRIC_MESH_NATS", "value": json.dumps({"machine": pod["natsMachine"],
+                                                   "servers": ["tls://nats.synthetic.invalid:4222"]})}] if pod.get("natsMachine") else [])}]},
                       "status": {"containerStatuses": [{"name": "pi", "state": status}]}}))
 elif rest[0] == "-n" and rest[2] == "exec" and rest[7:9] == ["test", "-x"]:
     sys.exit(0 if state.get("cliPresent", True) else 1)

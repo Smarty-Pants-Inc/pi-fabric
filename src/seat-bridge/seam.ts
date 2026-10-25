@@ -9,7 +9,9 @@ import { ENTRY_ID, entryFacts, SUFFIX_MAX, type AppendedEntry } from "../seat-dr
 import { fixedKubectl, kubectl, POD_FABRIC_CLI, readPod, verifyKubeconfig, type KubeAccess, type PodView } from "../seat-drain/kube.js";
 import { interpreterIdentity, parseRequest, proveSeatLock, readOwned, readSealedRun, resolveSeatMeshRoot, SeamGap, sha256,
   socketPeer, verifyRunDir, writeOnce, type SealedRun, type SeamRequest } from "../seat-drain/run.js";
-import { applyPlan, planPublish, planRestore, readLinkConfig, type SeatEntry, type WriterPlan } from "./allow-writer.js";
+import { natsLinkAllowListConfig } from "../mesh/bridge-nats-config.js";
+import { applyPlan, planPublish, planRestore, readLinkConfig, rollbackAuthority, withConfigLock, type LinkConfigFile, type RollbackAuthority,
+  type SeatEntry, type WriterPlan } from "./allow-writer.js";
 import { awaitRoutable, LINK_UNIT, natsRecords, otherRoutesBack, reloadLink, routeTable, type LinkDeps } from "./link.js";
 
 /**
@@ -227,9 +229,12 @@ const journalRead = (value: unknown): JournalRead | null => {
     suffixBytes: value.suffixBytes as number, suffixBase64: value.suffixBase64 as string | null };
 };
 
+/** A's final seal (A at 7d2e09af+, rule T-FIX3): exactly these seven keys. */
+const FINAL_SEAL_KEYS = "journal,journalBytes,journalSha256,leafId,run,schema,sealHasThinkingEntry";
+
 /**
  * A's final seal, from RUN itself: RUN/receipts/final-seal.json, whose sha256 is the journal's ONE `final-seal`
- * record, for this run and the sealed source journal, and equal to the request's finalSeal.
+ * record, for this run and the sealed source journal, and identical (all seven keys) to the request's finalSeal.
  */
 const finalSealOf = (context: Context, requested: Record<string, unknown>): { journalSha256: string; journalBytes: number; leafId: string } => {
   const bytes = readOwned(path.join(context.runDir, "receipts", "final-seal.json"), context.uid, 64 * 1024, undefined, "final-seal-unreadable");
@@ -239,13 +244,13 @@ const finalSealOf = (context: Context, requested: Record<string, unknown>): { jo
   if (records.length !== 1 || records[0]!.sha256 !== sha256(bytes)) throw new SeamGap("final-seal-unjournaled");
   let seal: Record<string, unknown>;
   try { seal = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>; } catch { throw new SeamGap("final-seal-invalid"); }
-  if (!object(seal) || keys(seal) !== "journal,journalBytes,journalSha256,leafId,run,schema" || seal.schema !== "d3-seat-final-seal-v1" ||
+  if (!object(seal) || keys(seal) !== FINAL_SEAL_KEYS || seal.schema !== "d3-seat-final-seal-v1" ||
     seal.run !== context.request.run || seal.journal !== context.sealed.journal || typeof seal.journalSha256 !== "string" ||
     !HEX64.test(seal.journalSha256) || !Number.isSafeInteger(seal.journalBytes) || (seal.journalBytes as number) <= 0 ||
-    typeof seal.leafId !== "string" || !ENTRY_ID.test(seal.leafId)) throw new SeamGap("final-seal-invalid");
-  if (seal.journalSha256 !== requested.journalSha256 || seal.journalBytes !== requested.journalBytes || seal.leafId !== requested.leafId) {
-    throw new SeamGap("final-seal-mismatch");
+    typeof seal.leafId !== "string" || !ENTRY_ID.test(seal.leafId) || typeof seal.sealHasThinkingEntry !== "boolean") {
+    throw new SeamGap("final-seal-invalid");
   }
+  if (!FINAL_SEAL_KEYS.split(",").every(key => requested[key] === seal[key])) throw new SeamGap("final-seal-mismatch");
   return { journalSha256: seal.journalSha256, journalBytes: seal.journalBytes as number, leafId: seal.leafId };
 };
 
@@ -259,7 +264,8 @@ const sessionArg = (pod: PodView | null): string | null => {
 
 const resume = async (context: Context): Promise<number> => {
   const { inputs, sessionId } = context.request;
-  if (keys(inputs) !== "finalSeal,pod" || !object(inputs.finalSeal) || keys(inputs.finalSeal) !== "journalBytes,journalSha256,leafId") {
+  // A sends its whole final seal (require_final_seal_unchanged): the seven keys, checked against RUN's own copy.
+  if (keys(inputs) !== "finalSeal,pod" || !object(inputs.finalSeal) || keys(inputs.finalSeal) !== FINAL_SEAL_KEYS) {
     throw new SeamGap("inputs-invalid");
   }
   const pin = podPin(inputs.pod);
@@ -323,30 +329,43 @@ const seatPins = (context: Context, orgJson: string | undefined): BridgeNatsSeat
   catch { throw new SeamGap("seat-pins-unreadable"); }
 };
 
+/**
+ * The seat's NATS machine, from the run-pinned principal NATS binding (A's T-FIX6: top-level `natsMachine` in the sealed
+ * run; never `instance`, which is the Herdr agent). Absent or malformed refuses.
+ */
 const seatMachine = (context: Context): string => {
-  const machine = context.sealed.run.instance;
-  if (typeof machine !== "string" || !MACHINE.test(machine)) throw new SeamGap("seat-machine-invalid");
+  const machine = context.sealed.run.natsMachine;
+  if (machine === undefined) throw new SeamGap("seat-nats-machine-unpinned");
+  if (typeof machine !== "string" || !MACHINE.test(machine)) throw new SeamGap("seat-nats-machine-invalid");
   return machine;
 };
 
+type Gate = Record<string, unknown> | null;
+
 /**
- * The route the receipt shows, judged here (not by its overall verdict, which also counts an old, non-live NATS key the
- * link left behind): the identity is on `side`; ONE live file-mesh record (native, or this link's mirror) and exactly
- * ONE live NATS record, on `natsMachine`, both with `incarnation`.
+ * The route, judged through the link's REAL identity gate plus the records it rests on: the gate resolves the seat on
+ * `side` as `live` (an id with a second record, live or not, is ambiguous there and refuses); the hub's record is the
+ * expected kind (native, or this link's mirror) and live; the NATS records for the id are exactly ONE, on
+ * `natsMachine`, live; and both carry `incarnation`.
  */
-const routedTo = (value: Record<string, unknown>, want: { side: "file" | "nats"; fileRemoteHost: string | null; natsMachine: string;
-  incarnation: string }): boolean => {
-  const file = object(value.file) ? value.file : undefined;
-  const nats = object(value.nats) && Array.isArray(value.nats.records) ? (value.nats.records as unknown[]).filter(object) : [];
-  const live = nats.filter(record => record.live === true);
-  return value.side === want.side && file !== undefined && (file.remoteHost ?? null) === want.fileRemoteHost && file.live === true &&
-    file.ownerIncarnation === want.incarnation && live.length === 1 && live[0]!.machine === want.natsMachine &&
-    live[0]!.ownerIncarnation === want.incarnation;
+const routeHolds = (gate: Gate, receiptValue: Record<string, unknown>, want: { side: "file" | "nats"; fileRemoteHost: string | null;
+  natsMachine: string; incarnation: string }): boolean => {
+  const file = object(receiptValue.file) ? receiptValue.file : undefined;
+  const nats = object(receiptValue.nats) && Array.isArray(receiptValue.nats.records) ? (receiptValue.nats.records as unknown[]).filter(object) : [];
+  return gate !== null && gate.status === "live" && gate.side === want.side &&
+    (want.side === "file" || gate.machine === want.natsMachine) &&
+    file !== undefined && (file.remoteHost ?? null) === want.fileRemoteHost && file.live === true && file.ownerIncarnation === want.incarnation &&
+    nats.length === 1 && nats[0]!.machine === want.natsMachine && nats[0]!.live === true && nats[0]!.ownerIncarnation === want.incarnation;
 };
 
 const planEvidence = (plan: WriterPlan) => ({ change: plan.change, beforeSha256: plan.before.sha256, afterSha256: plan.afterSha256,
-  natsEntry: plan.natsEntry, fileEntry: plan.fileEntry, beforeBytes: plan.before.bytes.toString("utf8"),
+  natsEntry: plan.natsEntry, fileEntry: plan.fileEntry, beforeHadNats: plan.beforeHadNats, beforeBytes: plan.before.bytes.toString("utf8"),
   afterBytes: plan.after?.toString("utf8") ?? null, file: plan.before.file });
+
+const authorityEvidence = (authority: RollbackAuthority | null) => authority === null ? null : {
+  beforeSha256: authority.beforeSha256, afterSha256: authority.afterSha256, beforeBytesBase64: authority.beforeBytes.toString("base64"),
+  natsEntry: authority.natsEntry, fileEntry: authority.fileEntry, beforeHadNats: authority.beforeHadNats,
+};
 
 const publish = async (context: Context): Promise<number> => {
   const { inputs, sessionId } = context.request;
@@ -355,73 +374,98 @@ const publish = async (context: Context): Promise<number> => {
   const machine = seatMachine(context);
   const access = kubeAccess(context);
   await verifyKubeconfig(access, Math.min(30_000, context.deadline - context.now()));
-  const config = readLinkConfig(context.pins.linkConfig);
-  const pins = seatPins(context, config.config.orgJson);
-  const plan = planPublish(config, pins, { sessionId, machine });
-  const routesBefore = await routeTable(config.config, context.deps);
+  // A first, unlocked read: the seat pins, a dry plan (refuses early) and the routes the link carries now.
+  const first = readLinkConfig(context.pins.linkConfig);
+  const pins = seatPins(context, first.config.orgJson);
+  planPublish(first, pins, { sessionId, machine });
+  const routesBefore = await routeTable(first.config, context.deps);
   if (!routesBefore) throw new SeamGap("link-status-unreadable");
-  // Durable BEFORE any effect: the exact write, so rc-restore-route can undo exactly this and nothing else.
-  const intentSha256 = evidence(context, "intent", { schema: "fabric-v2-bridge-publish-intent-v1", owner: inputs.owner, machine,
-    plan: planEvidence(plan), unit: context.pins.linkUnit, routesBefore,
-    measured: { kubectl: access.kubectl, server: access.server, interpreter: interpreterIdentity(), startedAt: new Date().toISOString() },
-    residuals: RESIDUALS });
+  // The managed Pod and its Main, read-only, BEFORE any write: the incarnation and the Pod's own NATS machine.
   const read = await podIdentity(context, access, pin);
   let reason = read.reason;
   if (!reason && !read.identity!.ownerIncarnation) reason = "pod-incarnation-unknown";
-  let written = false;
+  if (!reason && read.before?.natsMachine !== machine) reason = read.before?.natsMachine ? "pod-nats-machine-mismatch" : "pod-nats-machine-unknown";
+  const measuredPod = { kubectl: access.kubectl, server: access.server, interpreter: interpreterIdentity(), startedAt: new Date().toISOString() };
+  let plan: WriterPlan | null = null;
+  let post: LinkConfigFile | null = null;
+  let intentSha256: string;
+  if (reason) {
+    intentSha256 = evidence(context, "intent", { schema: "fabric-v2-bridge-publish-intent-v1", owner: inputs.owner, machine, plan: null,
+      rollback: null, unit: context.pins.linkUnit, routesBefore, measured: measuredPod, residuals: RESIDUALS });
+  } else {
+    // ONE config-scoped lock across read, plan, intent, check, rename and read-back.
+    const locked = await withConfigLock(context.pins.linkConfig, () => {
+      const current = readLinkConfig(context.pins.linkConfig);
+      const planned = planPublish(current, pins, { sessionId, machine });
+      // Durable BEFORE the write: the exact change, and the rollback authority (null when nothing is written).
+      const sha = evidence(context, "intent", { schema: "fabric-v2-bridge-publish-intent-v1", owner: inputs.owner, machine,
+        plan: planEvidence(planned), rollback: authorityEvidence(rollbackAuthority(planned)), unit: context.pins.linkUnit, routesBefore,
+        measured: measuredPod, residuals: RESIDUALS });
+      return { planned, sha, after: applyPlan(planned) };
+    }, { sleep: context.sleep, now: context.now });
+    plan = locked.planned;
+    intentSha256 = locked.sha;
+    post = locked.after;
+  }
+  const written = plan !== null && plan.change !== "none";
   let reload: Awaited<ReturnType<typeof reloadLink>> | null = null;
   let others: Awaited<ReturnType<typeof otherRoutesBack>> | null = null;
   let routed: Awaited<ReturnType<typeof awaitRoutable>> | null = null;
-  // The write happens only for a verified managed Pod whose Main reports its incarnation.
-  if (!reason) {
-    applyPlan(plan);
-    written = plan.change !== "none";
-    if (written) {
-      reload = await reloadLink(config.config, context.pins.linkUnit, context.sealed.seat, context.deps, clock(context, 120_000));
-      if (!reload.statusOk) reason = "link-not-reloaded";
-    }
+  // Everything after the write reads the config ON DISK now (re-read and re-validated by applyPlan).
+  if (!reason && written) {
+    reload = await reloadLink(post!.config, context.pins.linkUnit, context.sealed.seat, context.deps, clock(context, 120_000));
+    if (!reload.statusOk) reason = "link-not-reloaded";
   }
   if (!reason) {
-    const incarnation = read.identity!.ownerIncarnation;
-    routed = await awaitRoutable(config.config, sessionId, context.deps, clock(context, 120_000), value =>
-      routedTo(value, { side: "nats", fileRemoteHost: config.config.link, natsMachine: machine, incarnation: incarnation! }));
-    if (!routed.ok) reason = "seat-not-routable";
+    const incarnation = read.identity!.ownerIncarnation!;
+    routed = await awaitRoutable(post!.config, sessionId, context.deps, clock(context, 120_000), (gate, value) =>
+      routeHolds(gate, value, { side: "nats", fileRemoteHost: post!.config.link, natsMachine: machine, incarnation }));
+    if (!routed.ok) reason = routed.gate !== null && routed.gate.status !== "live" ? "seat-route-refused-by-gate" : "seat-not-routable";
   }
   if (written) {
     // Every other route the link carried live before the restart must be live again, whatever this seat's result.
-    others = await otherRoutesBack(config.config, routesBefore, `session:${sessionId}`, context.deps, clock(context, 120_000));
+    others = await otherRoutesBack(post!.config, routesBefore, `session:${sessionId}`, context.deps, clock(context, 120_000));
     if (!reason && others.down.length > 0) reason = "other-routes-down";
   }
   const final = await readPod(access, pin.name, Math.min(30_000, Math.max(1_000, context.deadline - context.now())));
   if (!reason && (!final || final.uid !== pin.uid || !final.piRunning)) reason = "pod-uid-changed";
-  const route = `v2@${pin.uid}:${(plan.afterSha256 ?? plan.before.sha256).slice(0, 12)}`;
+  const route = `v2@${pin.uid}:${(post?.sha256 ?? first.sha256).slice(0, 12)}`;
   const observed = { sessionId, incarnation: pin.uid, route };
   const passed = reason === null;
   evidence(context, "outcome", { schema: "fabric-v2-bridge-publish-outcome-v1", result: passed ? "pass" : "refused", reason, intentSha256,
-    observed, written, measured: { before: read.before, after: read.after, final: final ?? null, reload, otherRoutes: others,
-      receipt: routed?.receipt ?? null }, asserted: { identity: read.identity, podLine: read.line } });
+    observed, written, measured: { before: read.before, after: read.after, final: final ?? null, configSha256: post?.sha256 ?? null, reload,
+      otherRoutes: others, gate: routed?.gate ?? null, receipt: routed?.receipt ?? null }, asserted: { identity: read.identity, podLine: read.line } });
   context.io.stdout(receipt(context.request, passed ? "pass" : "refused", observed));
   return 0;
 };
 
 // ---------------------------------------------------------------- rc-restore-route
 
-/** What publish recorded it would write (its intent): the only change rc-restore-route may undo. */
-const publishedWrite = (context: Context): { natsEntry: SeatEntry | null; fileEntry: { index: number; entry: Record<string, unknown> } | null } => {
+/** What publish recorded it wrote (its intent's rollback authority): the only change rc-restore-route may undo. */
+const publishedAuthority = (context: Context): RollbackAuthority | null => {
   const file = path.join(context.runDir, "fabric-v2-bridge-publish-intent.json");
   let present: boolean;
   try { present = fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined; } catch { present = true; }
-  if (!present) return { natsEntry: null, fileEntry: null };
+  if (!present) return null;
   let value: Record<string, unknown>;
-  try { value = JSON.parse(readOwned(file, context.uid, 4 * 1024 * 1024, { mode: 0o600 }, "publish-intent-unreadable").toString("utf8")) as Record<string, unknown>; }
+  try { value = JSON.parse(readOwned(file, context.uid, 8 * 1024 * 1024, { mode: 0o600 }, "publish-intent-unreadable").toString("utf8")) as Record<string, unknown>; }
   catch { throw new SeamGap("publish-intent-unreadable"); }
-  const plan = object(value.plan) ? value.plan : undefined;
   if (value.schema !== "fabric-v2-bridge-publish-intent-v1" || value.run !== context.request.run || value.sessionId !== context.request.sessionId ||
-    !plan || !object(plan.natsEntry) || (plan.fileEntry !== null && !object(plan.fileEntry))) throw new SeamGap("publish-intent-invalid");
-  const fileEntry = plan.fileEntry as { index?: unknown; entry?: unknown } | null;
-  if (fileEntry && (!Number.isSafeInteger(fileEntry.index) || !object(fileEntry.entry))) throw new SeamGap("publish-intent-invalid");
-  return { natsEntry: plan.natsEntry as unknown as SeatEntry,
-    fileEntry: fileEntry ? { index: fileEntry.index as number, entry: fileEntry.entry as Record<string, unknown> } : null };
+    !Object.hasOwn(value, "rollback")) throw new SeamGap("publish-intent-invalid");
+  const rollback = value.rollback;
+  // A publish that wrote nothing (no change, or refused before the write) gives no rollback authority.
+  if (rollback === null) return null;
+  if (!object(rollback) || typeof rollback.beforeSha256 !== "string" || !HEX64.test(rollback.beforeSha256) ||
+    typeof rollback.afterSha256 !== "string" || !HEX64.test(rollback.afterSha256) || typeof rollback.beforeBytesBase64 !== "string" ||
+    !object(rollback.natsEntry) || typeof rollback.beforeHadNats !== "boolean" ||
+    (rollback.fileEntry !== null && (!object(rollback.fileEntry) || !Number.isSafeInteger(rollback.fileEntry.index) || !object(rollback.fileEntry.entry)))) {
+    throw new SeamGap("publish-intent-invalid");
+  }
+  const beforeBytes = Buffer.from(rollback.beforeBytesBase64, "base64");
+  if (sha256(beforeBytes) !== rollback.beforeSha256) throw new SeamGap("publish-intent-invalid");
+  return { beforeSha256: rollback.beforeSha256, afterSha256: rollback.afterSha256, beforeBytes,
+    natsEntry: rollback.natsEntry as unknown as SeatEntry, fileEntry: rollback.fileEntry as { index: number; entry: Record<string, unknown> } | null,
+    beforeHadNats: rollback.beforeHadNats };
 };
 
 /** The v1 Main on this host, read over its owner-only channel, the server checked against the session's owner record. */
@@ -459,32 +503,38 @@ const restoreRoute = async (context: Context): Promise<number> => {
     writer.sessionId !== sessionId || writer.singleWriter !== true || !Number.isSafeInteger(writer.pid) || (writer.pid as number) <= 1 ||
     typeof writer.sessionFile !== "string" || !path.isAbsolute(writer.sessionFile)) throw new SeamGap("inputs-invalid");
   if (inputs.parentRun !== context.request.run || inputs.parentRunSha256 !== context.request.runSha256) throw new SeamGap("inputs-invalid");
-  const config = readLinkConfig(context.pins.linkConfig);
+  const machine = seatMachine(context);
+  const first = readLinkConfig(context.pins.linkConfig);
   // The v1 Main must answer on the same mesh the link mirrors: the seat's mesh root IS the link's file mesh.
   const meshRoot = resolveSeatMeshRoot(context.sealed.journal, sessionId, context.uid);
   let linkMesh: string;
-  try { linkMesh = fs.realpathSync(config.config.file.mesh); } catch { throw new SeamGap("link-mesh-unreadable"); }
+  try { linkMesh = fs.realpathSync(first.config.file.mesh); } catch { throw new SeamGap("link-mesh-unreadable"); }
   if (linkMesh !== meshRoot) throw new SeamGap("seat-mesh-not-link-mesh");
-  const pins = seatPins(context, config.config.orgJson);
-  const published = publishedWrite(context);
-  const plan = planRestore(config, pins, { sessionId, ...published });
-  const routesBefore = await routeTable(config.config, context.deps);
+  const pins = seatPins(context, first.config.orgJson);
+  const authority = publishedAuthority(context);
+  planRestore(first, pins, sessionId, authority);
+  const routesBefore = await routeTable(first.config, context.deps);
   if (!routesBefore) throw new SeamGap("link-status-unreadable");
-  const machine = seatMachine(context);
-  const intentSha256 = evidence(context, "intent", { schema: "fabric-v2-bridge-rc-restore-route-intent-v1", writer, machine,
-    plan: planEvidence(plan), unit: context.pins.linkUnit, routesBefore,
-    measured: { meshRoot, interpreter: interpreterIdentity(), startedAt: new Date().toISOString() }, residuals: RESIDUALS });
+  // ONE config-scoped lock across read, plan, intent, check, rename and read-back.
+  const locked = await withConfigLock(context.pins.linkConfig, () => {
+    const current = readLinkConfig(context.pins.linkConfig);
+    const planned = planRestore(current, pins, sessionId, authority);
+    const sha = evidence(context, "intent", { schema: "fabric-v2-bridge-rc-restore-route-intent-v1", writer, machine,
+      plan: planEvidence(planned), unit: context.pins.linkUnit, routesBefore,
+      measured: { meshRoot, interpreter: interpreterIdentity(), startedAt: new Date().toISOString() }, residuals: RESIDUALS });
+    return { planned, sha, after: applyPlan(planned) };
+  }, { sleep: context.sleep, now: context.now });
+  const { planned: plan, sha: intentSha256, after: post } = locked;
   let reason: string | null = null;
-  applyPlan(plan);
   let reload: Awaited<ReturnType<typeof reloadLink>> | null = null;
   let others: Awaited<ReturnType<typeof otherRoutesBack>> | null = null;
   if (plan.change !== "none") {
     // The v2 seat's old mirror row on the hub is the one expected leftover once its entry is gone.
     const leftover = `mirror not on allow.nats: session:${sessionId}`;
-    reload = await reloadLink(config.config, context.pins.linkUnit, context.sealed.seat, context.deps, clock(context, 120_000),
+    reload = await reloadLink(post.config, context.pins.linkUnit, context.sealed.seat, context.deps, clock(context, 120_000),
       problem => problem === leftover);
     if (!reload.statusOk) reason = "link-not-reloaded";
-    others = await otherRoutesBack(config.config, routesBefore, `session:${sessionId}`, context.deps, clock(context, 120_000));
+    others = await otherRoutesBack(post.config, routesBefore, `session:${sessionId}`, context.deps, clock(context, 120_000));
     if (!reason && others.down.length > 0) reason = "other-routes-down";
   }
   // v1: the relaunched writer is this session's live inbox owner (pid + start time), with the session file A named.
@@ -497,18 +547,21 @@ const restoreRoute = async (context: Context): Promise<number> => {
   if (!reason && !v1!.session.ownerIncarnation) reason = "v1-incarnation-unknown";
   let routed: Awaited<ReturnType<typeof awaitRoutable>> | null = null;
   let v2Live: Array<Record<string, unknown>> = [];
+  // Whether the seat is on the post-state's allow.file (its v1 entry, put back or never moved).
+  const listed = natsLinkAllowListConfig(post.config).entries.some(entry => entry.side === "file" && entry.kind === "root" &&
+    entry.id === `session:${sessionId}`);
   if (!reason) {
     const incarnation = v1!.session.ownerIncarnation!;
-    routed = await awaitRoutable(config.config, sessionId, context.deps, clock(context, 120_000), value => {
-      // With the seat's file entry restored, the link mirrors v1 into NATS under its own machine: that must route too.
-      if (published.fileEntry) return routedTo(value, { side: "file", fileRemoteHost: null, natsMachine: config.config.nats.machine, incarnation });
+    routed = await awaitRoutable(post.config, sessionId, context.deps, clock(context, 120_000), (gate, value) => {
+      // Listed on allow.file: the gate must resolve it live, and the link mirror v1 into NATS under its own machine.
+      if (listed) return routeHolds(gate, value, { side: "file", fileRemoteHost: null, natsMachine: post.config.nats.machine, incarnation });
       const file = object(value.file) ? value.file : undefined;
       return file !== undefined && (file.remoteHost ?? null) === null && file.live === true && file.ownerIncarnation === incarnation;
     });
     if (!routed.ok) reason = "v1-not-routable";
     // No v2 left: no live NATS presence for the session on any machine but the link's own (its mirror of v1).
-    const records = await natsRecords(config.config, context.deps);
-    v2Live = records.filter(record => record.id === `session:${sessionId}` && record.live && record.machine !== config.config.nats.machine)
+    const records = await natsRecords(post.config, context.deps);
+    v2Live = records.filter(record => record.id === `session:${sessionId}` && record.live && record.machine !== post.config.nats.machine)
       .map(record => ({ machine: record.machine, ownerIncarnation: record.ownerIncarnation }));
     if (!reason && v2Live.length > 0) reason = "v2-presence-live";
   }
@@ -516,8 +569,8 @@ const restoreRoute = async (context: Context): Promise<number> => {
   const observed = { sessionId, route };
   const passed = reason === null;
   evidence(context, "outcome", { schema: "fabric-v2-bridge-rc-restore-route-outcome-v1", result: passed ? "pass" : "refused", reason,
-    intentSha256, observed, written: plan.change !== "none", measured: { reload, otherRoutes: others, receipt: routed?.receipt ?? null, v2Live,
-      writerStart: start, owner: local.owner }, asserted: { v1: v1 ? { pid: v1.pid, rootId: v1.rootId, session: v1.session } : null,
+    intentSha256, observed, written: plan.change !== "none", measured: { configSha256: post.sha256, reload, otherRoutes: others,
+      gate: routed?.gate ?? null, receipt: routed?.receipt ?? null, v2Live, writerStart: start, owner: local.owner }, asserted: { v1: v1 ? { pid: v1.pid, rootId: v1.rootId, session: v1.session } : null,
       error: "error" in local ? local.error : null } });
   context.io.stdout(receipt(context.request, passed ? "pass" : "refused", observed));
   return 0;

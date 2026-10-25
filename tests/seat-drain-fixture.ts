@@ -103,6 +103,8 @@ export const createSeat = async (options: { fenceApi?: boolean; start?: boolean;
     plannedSeats: ["alpha", "bravo", "charlie"], context: "synthetic", namespace: "org-synthetic", namespaceUID: "00000000-0000-4000-8000-000000000001",
     natsSecret: "org-d3synth-nats", source: { journal, journalSha256: "0".repeat(64), journalBytes: 1, leafId: "leaf", handoffs: null },
     target: { claim: "synthetic-claim", node: "synthetic-node" },
+    // A's T-FIX6: the seat's own NATS machine (the synthetic rehearsal machine), never the Herdr instance.
+    natsMachine: "sp-org-d3synth",
     seams: { drain: { owner: "fabric-v2", path: "/synthetic/drain", sha256: "1".repeat(64) },
       fence: { owner: "synthetic-fence-owner", path: "/synthetic/fence", sha256: "2".repeat(64) },
       bridge: { owner: "fabric-v2", path: "/synthetic/bridge", sha256: "3".repeat(64) } },

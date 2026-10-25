@@ -41,6 +41,10 @@ interface World {
   receipt: Record<string, unknown>; roots: Array<Record<string, unknown>>; holderStuck: boolean;
   /** What `nats-link status` reads once the unit was restarted (default: the same as before). */
   statusAfter?: World["status"];
+  /** The link's identity gate row for the seat (`nats-link dry-run`), or null for no row. */
+  gate: Record<string, unknown> | null;
+  /** Every config object the link readers were handed (#1609 review P0-1: the post-write config). */
+  seenConfigs: Array<{ allow: unknown }>;
 }
 
 const world = async (options: { podJournal?: string; machines?: string[]; allow?: Record<string, unknown> } = {}): Promise<World> => {
@@ -58,8 +62,7 @@ const world = async (options: { podJournal?: string; machines?: string[]; allow?
   records[1].sha256 = sha(fs.readFileSync(inputsFile));
   // A's final seal of the source journal (SEALED), journaled once.
   const sourceJournal = JSON.parse(fs.readFileSync(path.join(seat.runDir, "seat-run.json"), "utf8")).source.journal as string;
-  const seal = Buffer.from(`${JSON.stringify({ schema: "d3-seat-final-seal-v1", run: seat.run, journal: sourceJournal,
-    journalSha256: sha(SEALED), journalBytes: Buffer.byteLength(SEALED), leafId: "e2" })}\n`);
+  const seal = Buffer.from(`${JSON.stringify(finalSealFor(seat, sourceJournal))}\n`);
   fs.mkdirSync(path.join(seat.runDir, "receipts"), { mode: 0o700 });
   fs.writeFileSync(path.join(seat.runDir, "receipts", "final-seal.json"), seal, { mode: 0o400 });
   records.push({ event: "final-seal", sha256: sha(seal) });
@@ -78,7 +81,7 @@ const world = async (options: { podJournal?: string; machines?: string[]; allow?
   fs.writeFileSync(config, `${JSON.stringify({ version: 1, name: "hub-a", link: "v2", file: { mesh: seat.meshRoot, lockProtocol: 2 },
     stateDir: "/synthetic/link-state", nats: { servers: ["tls://nats.example.test:4222"], machine: "hub-a-bridge",
       credentials: "/synthetic/creds", caFile: "/synthetic/ca.pem", custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS",
-      pathBMachines: options.machines ?? ["hub-a-bridge", "sandbox1", "org-d3synth"], operatorMachine: "fabric-ops" },
+      pathBMachines: options.machines ?? ["hub-a-bridge", "sandbox1", "sp-org-d3synth"], operatorMachine: "fabric-ops" },
     allow: options.allow ?? { file: [leadEntry, seatFileEntry] } }, null, 2)}\n`, { mode: 0o600 });
   const marker = path.join(seat.base, "systemctl-calls");
   const systemctl = path.join(seat.base, "systemctl");
@@ -88,15 +91,41 @@ const world = async (options: { podJournal?: string; machines?: string[]; allow?
     calls: () => fs.existsSync(path.join(kube, "kube-calls.jsonl"))
       ? fs.readFileSync(path.join(kube, "kube-calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line)) : [],
     status: { ok: true, problems: [], allow: { file: [{ identity: LEAD, live: true }, { identity: `session:${SID}`, live: true }], nats: [] } },
-    receipt: {}, roots: [], holderStuck: false,
+    receipt: {}, roots: [], holderStuck: false, gate: null, seenConfigs: [],
   };
   return w;
+};
+
+/** A's final seal: exactly seven keys (A at 7d2e09af+, rule T-FIX3). */
+const finalSealFor = (seat: Seat, journal?: string) => ({ schema: "d3-seat-final-seal-v1", run: seat.run,
+  journal: journal ?? JSON.parse(fs.readFileSync(path.join(seat.runDir, "seat-run.json"), "utf8")).source.journal as string,
+  journalSha256: sha(SEALED), journalBytes: Buffer.byteLength(SEALED), leafId: "e2", sealHasThinkingEntry: false });
+
+/** Re-seal the run with a change (and every pin that names its sha256), as a different A packet would. */
+const resealRun = (w: World, mutate: (run: Record<string, unknown>) => void): void => {
+  const runFile = path.join(w.seat.runDir, "seat-run.json");
+  const value = JSON.parse(fs.readFileSync(runFile, "utf8")) as Record<string, unknown>;
+  mutate(value);
+  const bytes = Buffer.from(JSON.stringify(value));
+  fs.chmodSync(runFile, 0o600); fs.writeFileSync(runFile, bytes); fs.chmodSync(runFile, 0o400);
+  const runSha256 = sha(bytes);
+  const inputsFile = path.join(w.seat.runDir, "seat-inputs.json");
+  const inputs = JSON.parse(fs.readFileSync(inputsFile, "utf8"));
+  inputs.runSha256 = runSha256;
+  fs.chmodSync(inputsFile, 0o600); fs.writeFileSync(inputsFile, JSON.stringify(inputs)); fs.chmodSync(inputsFile, 0o400);
+  const journalPath = path.join(w.seat.runDir, "seat-journal.jsonl");
+  const records = fs.readFileSync(journalPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+  records[0].runSha256 = runSha256;
+  records[1].sha256 = sha(fs.readFileSync(inputsFile));
+  fs.writeFileSync(journalPath, records.map(record => `${JSON.stringify(record)}\n`).join(""));
+  (w.seat as { runSha256: string }).runSha256 = runSha256;
 };
 
 const setKube = (w: World, pod: { name: string; uid: string }, identity: { line: string; code?: number; changeUid?: string },
   podExtra: Record<string, unknown> = {}) => {
   fs.writeFileSync(path.join(w.kube, "kube-state.json"), JSON.stringify({ server: SERVER, caB64: CA.toString("base64"), cliPresent: true,
-    pod: { name: pod.name, uid: pod.uid, meshRoot: "/var/lib/fabric/mesh", running: true, terminated: null, args: ["--session", POD_JOURNAL], ...podExtra },
+    pod: { name: pod.name, uid: pod.uid, meshRoot: "/var/lib/fabric/mesh", running: true, terminated: null, args: ["--session", POD_JOURNAL],
+      natsMachine: "sp-org-d3synth", ...podExtra },
     exec: { line: "" }, identity }));
 };
 
@@ -112,7 +141,9 @@ const identityLine = (w: World, options: { leafId?: string; sessionFile?: string
 const request = (seat: Seat, phase: string, inputs: Record<string, unknown>) => JSON.stringify({ schema: "d3-seam-request-v1", run: seat.run,
   runSha256: seat.runSha256, phase, principal: "d3synth", sessionId: SID, inputs });
 
-const run = async (w: World, phase: string, inputs: Record<string, unknown>, extra: Partial<BridgeDeps> = {}) => {
+const run = async (w: World, phase: string, given: Record<string, unknown> | ((w: World) => Record<string, unknown>),
+  extra: Partial<BridgeDeps> = {}) => {
+  const inputs = typeof given === "function" ? given(w) : given;
   let stdout = ""; let stderr = "";
   let t = 0;
   const deps: BridgeDeps = {
@@ -120,8 +151,10 @@ const run = async (w: World, phase: string, inputs: Record<string, unknown>, ext
     seatPins: () => pins, now: () => t, sleep: async ms => { t += ms; }, deadlineMs: 600_000,
     holder: () => ({ pid: !w.holderStuck && fs.existsSync(w.marker) ? 101 + fs.readFileSync(w.marker, "utf8").split("\n").length : 100,
       startTime: "1", purpose: "start" }),
-    status: async () => structuredClone(w.statusAfter && fs.existsSync(w.marker) ? w.statusAfter : w.status),
-    receipt: async () => structuredClone(w.receipt),
+    status: async config => { w.seenConfigs.push({ allow: structuredClone(config.allow) });
+      return structuredClone(w.statusAfter && fs.existsSync(w.marker) ? w.statusAfter : w.status); },
+    receipt: async config => { w.seenConfigs.push({ allow: structuredClone(config.allow) }); return structuredClone(w.receipt); },
+    dryRun: async config => { w.seenConfigs.push({ allow: structuredClone(config.allow) }); return { rows: w.gate ? [structuredClone(w.gate)] : [] }; },
     roots: async () => structuredClone(w.roots) as never,
     onError: error => { if (!(error instanceof Error && error.name === "SeamGap")) throw error; },
     ...extra,
@@ -133,8 +166,7 @@ const run = async (w: World, phase: string, inputs: Record<string, unknown>, ext
   return { code, stdout, stderr, receipt: stdout ? JSON.parse(stdout) as Record<string, any> : undefined };
 };
 
-const finalSeal = { journalSha256: sha(SEALED), journalBytes: Buffer.byteLength(SEALED), leafId: "e2" };
-const resumeInputs = { pod: RAW, finalSeal };
+const resumeInputs = (w: World) => ({ pod: RAW, finalSeal: finalSealFor(w.seat) });
 const evidenceOf = (w: World, name: string) => JSON.parse(fs.readFileSync(path.join(w.seat.runDir, name), "utf8"));
 
 describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in the raw Pod", () => {
@@ -195,7 +227,12 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
   it("checks A's final seal from RUN itself: a request seal that differs, or an unjournaled seal file, is UNKNOWN", async () => {
     const w = await world();
     setKube(w, RAW, { line: identityLine(w) });
-    expect(await run(w, "resume", { pod: RAW, finalSeal: { ...finalSeal, leafId: "e1" } }))
+    // A's real input is its whole 7-key seal: the old 3-key subset, or a 6-key seal without sealHasThinkingEntry, is refused.
+    const { sealHasThinkingEntry: _drop, ...sixKeys } = finalSealFor(w.seat);
+    expect(await run(w, "resume", { pod: RAW, finalSeal: sixKeys })).toMatchObject({ code: 2, stderr: "GAP: inputs-invalid [owner: fabric-v2]\n" });
+    expect(await run(w, "resume", { pod: RAW, finalSeal: { ...finalSealFor(w.seat), sealHasThinkingEntry: true } }))
+      .toMatchObject({ code: 2, stderr: "GAP: final-seal-mismatch [owner: fabric-v2]\n" });
+    expect(await run(w, "resume", { pod: RAW, finalSeal: { ...finalSealFor(w.seat), leafId: "e1" } }))
       .toMatchObject({ code: 2, stderr: "GAP: final-seal-mismatch [owner: fabric-v2]\n" });
     const file = path.join(w.seat.runDir, "receipts", "final-seal.json");
     fs.chmodSync(file, 0o600); fs.appendFileSync(file, " ");
@@ -215,25 +252,68 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
 
 const owner = { template: { name: "t", uid: "00000000-0000-4000-8000-000000000101" }, claim: { name: "c", uid: "00000000-0000-4000-8000-000000000102" },
   sandbox: { name: "s", uid: "00000000-0000-4000-8000-000000000103" }, pod: MANAGED };
-// The link's own verdict also counts the old, no longer live NATS key of the v1 mirror; the seam judges live records.
-const routable = (incarnation = INCARNATION, machine = "org-d3synth") => ({ ok: false, verdict: "not-routable", side: "nats",
-  file: { remoteHost: "v2", live: true, ownerIncarnation: incarnation }, nats: { read: true, records: [
-    { machine: "hub-a-bridge", live: false, ownerIncarnation: V1_INCARNATION }, { machine, live: true, ownerIncarnation: incarnation }] } });
+const MACHINE = "sp-org-d3synth";
+const routable = (incarnation = INCARNATION, machine = MACHINE) => ({ ok: true, verdict: "routable", side: "nats",
+  file: { remoteHost: "v2", live: true, ownerIncarnation: incarnation }, nats: { read: true, records: [{ machine, live: true, ownerIncarnation: incarnation }] } });
+const gateLive = (side: "file" | "nats", machine?: string) => ({ side, key: `session:${SID}`, kind: "root", status: "live", id: `session:${SID}`,
+  ...(machine ? { machine } : {}) });
 
 describe.skipIf(!linux)("bridge publish: the seat's one allow-list entry, a link restart, and the read-backs", () => {
   it("moves the seat's entry, restarts the pinned unit, and passes on the proof chain (incarnation = the managed Pod UID)", async () => {
     const w = await world();
     setKube(w, MANAGED, { line: identityLine(w) });
     w.receipt = routable();
+    w.gate = gateLive("nats", MACHINE);
     const result = await run(w, "publish", { owner });
     const config = JSON.parse(fs.readFileSync(w.config, "utf8"));
-    expect(config.allow).toEqual({ file: [leadEntry], nats: [{ kind: "root", id: `session:${SID}`, principal: "Delta", machine: "org-d3synth",
+    expect(config.allow).toEqual({ file: [leadEntry], nats: [{ kind: "root", id: `session:${SID}`, principal: "Delta", machine: MACHINE,
       send: ["followUp"], receive: ["followUp", "cancel"] }] });
+    // #1609 review P0-1: every reader after the swap got the config ON DISK (the seat on allow.nats, gone from allow.file).
+    const last = w.seenConfigs.at(-1)!.allow as { file: Array<{ id: string }>; nats: Array<{ id: string }> };
+    expect(last.nats.map(entry => entry.id)).toEqual([`session:${SID}`]);
+    expect(last.file.map(entry => entry.id)).toEqual([LEAD]);
     expect(fs.readFileSync(w.marker, "utf8")).toBe("--user restart smarty-nats-link.service\n");
     expect(result.receipt).toEqual({ schema: "d3-seam-receipt-v1", run: w.seat.run, phase: "publish", owner: "fabric-v2", result: "pass",
       observed: { sessionId: SID, incarnation: MANAGED.uid, route: `v2@${MANAGED.uid}:${sha(fs.readFileSync(w.config)).slice(0, 12)}` } });
     const intent = evidenceOf(w, "fabric-v2-bridge-publish-intent.json");
     expect(intent.plan).toMatchObject({ change: "move", fileEntry: { index: 1, entry: seatFileEntry } });
+    expect(intent.rollback).toMatchObject({ beforeSha256: sha(Buffer.from(intent.plan.beforeBytes)), afterSha256: sha(fs.readFileSync(w.config)) });
+  });
+
+  it("#1609 review P1-4: a route the link's REAL identity gate refuses (an ambiguous id) is refused, never passed", async () => {
+    const w = await world();
+    setKube(w, MANAGED, { line: identityLine(w) });
+    w.receipt = routable();
+    w.gate = { ...gateLive("nats", MACHINE), status: "BRIDGE_NATS_AMBIGUOUS", reason: "answers on more than one machine" };
+    expect((await run(w, "publish", { owner })).receipt).toMatchObject({ result: "refused" });
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ reason: "seat-route-refused-by-gate",
+      measured: { gate: { status: "BRIDGE_NATS_AMBIGUOUS" } } });
+    // The same snapshot with a second NATS record (a stale one) is no single route either.
+    const two = await world();
+    setKube(two, MANAGED, { line: identityLine(two) });
+    two.gate = gateLive("nats", MACHINE);
+    two.receipt = { ...routable(), nats: { read: true, records: [{ machine: "hub-a-bridge", live: false, ownerIncarnation: V1_INCARNATION },
+      { machine: MACHINE, live: true, ownerIncarnation: INCARNATION }] } };
+    expect((await run(two, "publish", { owner })).receipt).toMatchObject({ result: "refused" });
+  });
+
+  it("#1609 review P1-3 / A T-FIX6: a run without natsMachine is UNKNOWN; the Herdr instance is never used as the machine", async () => {
+    const w = await world({ machines: ["hub-a-bridge", "sandbox1", "sp-org-d3synth", "org-d3synth"] });
+    resealRun(w, run => { delete run.natsMachine; });
+    setKube(w, MANAGED, { line: identityLine(w) }, { natsMachine: "org-d3synth" });
+    const before = fs.readFileSync(w.config);
+    expect(await run(w, "publish", { owner })).toMatchObject({ code: 2, stdout: "", stderr: "GAP: seat-nats-machine-unpinned [owner: fabric-v2]\n" });
+    expect(fs.readFileSync(w.config)).toEqual(before);
+  });
+
+  it("#1609 review P1-3: the machine is the run's natsMachine, and the managed Pod's own NATS config must name it", async () => {
+    const w = await world();
+    setKube(w, MANAGED, { line: identityLine(w) }, { natsMachine: "org-d3synth" });
+    const before = fs.readFileSync(w.config);
+    expect((await run(w, "publish", { owner })).receipt).toMatchObject({ result: "refused" });
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ reason: "pod-nats-machine-mismatch", written: false });
+    expect(fs.readFileSync(w.config)).toEqual(before);
+    expect(fs.existsSync(w.marker)).toBe(false);
   });
 
   it("a machine outside nats.pathBMachines is UNKNOWN before any write or restart", async () => {
@@ -257,11 +337,13 @@ describe.skipIf(!linux)("bridge publish: the seat's one allow-list entry, a link
   it("refuses when NATS or the hub mirror carries another incarnation, or the presence is on another machine", async () => {
     const w = await world();
     setKube(w, MANAGED, { line: identityLine(w) });
+    w.gate = gateLive("nats", MACHINE);
     w.receipt = routable("00000000-0000-4000-8000-0000000009ff");
     expect((await run(w, "publish", { owner })).receipt).toMatchObject({ result: "refused" });
     expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ reason: "seat-not-routable", written: true });
     const other = await world();
     setKube(other, MANAGED, { line: identityLine(other) });
+    other.gate = gateLive("nats", MACHINE);
     other.receipt = routable(INCARNATION, "sandbox1");
     expect((await run(other, "publish", { owner })).receipt).toMatchObject({ result: "refused" });
   });
@@ -269,12 +351,14 @@ describe.skipIf(!linux)("bridge publish: the seat's one allow-list entry, a link
   it("refuses when the link did not reload, or another route it carried is not back", async () => {
     const stuck = await world();
     setKube(stuck, MANAGED, { line: identityLine(stuck) });
+    stuck.gate = gateLive("nats", MACHINE);
     stuck.receipt = routable();
     stuck.holderStuck = true;
     expect((await run(stuck, "publish", { owner })).receipt).toMatchObject({ result: "refused" });
     expect(evidenceOf(stuck, "fabric-v2-bridge-publish-outcome.json").reason).toBe("link-not-reloaded");
     const down = await world();
     setKube(down, MANAGED, { line: identityLine(down) });
+    down.gate = gateLive("nats", MACHINE);
     down.receipt = routable();
     // Live before the restart; after it, the other seat's route stays down.
     down.statusAfter = { ok: true, problems: [], allow: { file: [{ identity: LEAD, live: false }], nats: [{ identity: `session:${SID}`, live: true }] } };
@@ -337,11 +421,12 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     const w = await world();
     setKube(w, MANAGED, { line: identityLine(w) });
     w.receipt = routable();
+    w.gate = gateLive("nats", MACHINE);
     expect((await run(w, "publish", { owner })).receipt?.result).toBe("pass");
     w.seat.native.state.sessionFile = "/synthetic/v1/session.jsonl";
-    w.receipt = { ok: false, verdict: "not-routable", side: "file", file: { remoteHost: null, live: true, ownerIncarnation: V1_INCARNATION },
-      nats: { read: true, records: [{ machine: "hub-a-bridge", live: true, ownerIncarnation: V1_INCARNATION },
-        { machine: "org-d3synth", live: false, ownerIncarnation: INCARNATION }] } };
+    w.receipt = { ok: true, verdict: "routable", side: "file", file: { remoteHost: null, live: true, ownerIncarnation: V1_INCARNATION },
+      nats: { read: true, records: [{ machine: "hub-a-bridge", live: true, ownerIncarnation: V1_INCARNATION }] } };
+    w.gate = gateLive("file");
     // After the restore, the hub still holds the v2 seat's old mirror row: the one tolerated status problem.
     w.statusAfter = { ok: false, problems: [`mirror not on allow.nats: session:${SID}`],
       allow: { file: [{ identity: LEAD, live: true }, { identity: `session:${SID}`, live: true }], nats: [] } };
@@ -351,16 +436,19 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
 
   it("puts the seat's file entry back exactly, restarts the link, and passes on the live v1 writer", async () => {
     const w = await published();
+    const original = evidenceOf(w, "fabric-v2-bridge-publish-intent.json").plan.beforeBytes as string;
     const result = await run(w, "rc-restore-route", writer(w));
     expect(result.receipt).toEqual({ schema: "d3-seam-receipt-v1", run: w.seat.run, phase: "rc-restore-route", owner: "fabric-v2", result: "pass",
       observed: { sessionId: SID, route: `v1@${process.pid}:${procStartTime(process.pid)}` } });
-    expect(JSON.parse(fs.readFileSync(w.config, "utf8")).allow).toEqual({ file: [leadEntry, seatFileEntry], nats: [] });
+    // #1609 review P1-6: the file is back byte for byte (it still held publish's bytes).
+    expect(fs.readFileSync(w.config, "utf8")).toBe(original);
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-intent.json").plan.change).toBe("revert");
     expect(fs.readFileSync(w.marker, "utf8").trim().split("\n")).toHaveLength(2);
   });
 
   it("refuses while a v2 presence for the session is still live, or when the writer is not the live owner", async () => {
     const live = await published();
-    live.roots = [...live.roots, { id: `session:${SID}`, machine: "org-d3synth", live: true, ownerIncarnation: INCARNATION }];
+    live.roots = [...live.roots, { id: `session:${SID}`, machine: MACHINE, live: true, ownerIncarnation: INCARNATION }];
     expect((await run(live, "rc-restore-route", writer(live))).receipt).toMatchObject({ result: "refused" });
     expect(evidenceOf(live, "fabric-v2-bridge-rc-restore-route-outcome.json").reason).toBe("v2-presence-live");
     const wrong = await published();
@@ -371,7 +459,10 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
   it("a rollback before any publish write changes nothing and restarts nothing", async () => {
     const w = await world();
     w.seat.native.state.sessionFile = "/synthetic/v1/session.jsonl";
-    w.receipt = { side: "file", file: { remoteHost: null, live: true, ownerIncarnation: V1_INCARNATION }, nats: { read: true, records: [] } };
+    // The seat's v1 file entry never moved: the gate resolves it live and the link mirrors v1 under its own machine.
+    w.gate = gateLive("file");
+    w.receipt = { side: "file", file: { remoteHost: null, live: true, ownerIncarnation: V1_INCARNATION },
+      nats: { read: true, records: [{ machine: "hub-a-bridge", live: true, ownerIncarnation: V1_INCARNATION }] } };
     const before = fs.readFileSync(w.config);
     expect((await run(w, "rc-restore-route", writer(w))).receipt).toMatchObject({ result: "pass" });
     expect(fs.readFileSync(w.config)).toEqual(before);
@@ -385,8 +476,23 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json").reason).toBe("link-not-reloaded");
   });
 
+  it("#1609 review P1-5: a no-op publish (the entry already there) gives the rollback nothing to remove", async () => {
+    const entryThere = { kind: "root", id: `session:${SID}`, principal: "Delta", machine: MACHINE, send: ["followUp"], receive: ["followUp", "cancel"] };
+    const w = await world({ allow: { file: [leadEntry], nats: [entryThere] } });
+    setKube(w, MANAGED, { line: identityLine(w) });
+    w.receipt = routable();
+    w.gate = gateLive("nats", MACHINE);
+    expect((await run(w, "publish", { owner })).receipt?.result).toBe("pass");
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-intent.json")).toMatchObject({ plan: { change: "none" }, rollback: null });
+    // The rollback must not remove that PRE-EXISTING entry: the seat's nats entry without our authority refuses.
+    w.seat.native.state.sessionFile = "/synthetic/v1/session.jsonl";
+    const before = fs.readFileSync(w.config);
+    expect(await run(w, "rc-restore-route", writer(w))).toMatchObject({ code: 2, stderr: "GAP: seat-entry-conflict [owner: fabric-v2]\n" });
+    expect(fs.readFileSync(w.config)).toEqual(before);
+  });
+
   it("never removes a seat entry that publish did not write in this RUN", async () => {
-    const w = await world({ allow: { file: [leadEntry], nats: [{ kind: "root", id: `session:${SID}`, principal: "Delta", machine: "org-d3synth",
+    const w = await world({ allow: { file: [leadEntry], nats: [{ kind: "root", id: `session:${SID}`, principal: "Delta", machine: MACHINE,
       send: ["followUp"], receive: ["followUp", "cancel"] }] } });
     const before = fs.readFileSync(w.config);
     expect(await run(w, "rc-restore-route", writer(w))).toMatchObject({ code: 2, stderr: "GAP: seat-entry-conflict [owner: fabric-v2]\n" });

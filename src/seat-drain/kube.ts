@@ -76,6 +76,8 @@ export interface PodView {
   uid: string; nodeName: string | null; piRunning: boolean; piTerminated: { exitCode: number } | null; meshRoot: string | null;
   /** The pi container's args as the API reports them (the `--session` path A rendered); null when absent. */
   piArgs: string[] | null;
+  /** The pi container's NATS machine, from its literal PI_FABRIC_MESH_NATS value (`machine`); null when not stated there. */
+  natsMachine: string | null;
 }
 
 /**
@@ -100,5 +102,8 @@ export const readPod = async (access: KubeAccess, name: string, timeoutMs: numbe
   const terminated = object(state.terminated) && Number.isSafeInteger(state.terminated.exitCode) ? { exitCode: state.terminated.exitCode as number } : null;
   const nodeName = object(pod.spec) && typeof pod.spec.nodeName === "string" ? pod.spec.nodeName : null;
   const piArgs = Array.isArray(pi?.args) && pi.args.every(arg => typeof arg === "string") ? [...pi.args as string[]] : null;
-  return { uid: pod.metadata.uid, nodeName, piRunning: object(state.running), piTerminated: terminated, meshRoot, piArgs };
+  const natsEnv = env.find(entry => entry.name === "PI_FABRIC_MESH_NATS");
+  const nats = typeof natsEnv?.value === "string" ? json(natsEnv.value) : undefined;
+  const natsMachine = object(nats) && typeof nats.machine === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(nats.machine) ? nats.machine : null;
+  return { uid: pod.metadata.uid, nodeName, piRunning: object(state.running), piTerminated: terminated, meshRoot, piArgs, natsMachine };
 };

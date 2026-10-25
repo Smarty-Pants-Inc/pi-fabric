@@ -3,7 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { readBridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
-import { applyPlan, planPublish, planRestore, readLinkConfig, sameJson, SEAT_RECEIVE, SEAT_SEND, type SeatEntry } from "../src/seat-bridge/allow-writer.js";
+import { applyPlan, planPublish, planRestore, readLinkConfig, rollbackAuthority, sameJson, SEAT_RECEIVE, SEAT_SEND, withConfigLock,
+  type SeatEntry } from "../src/seat-bridge/allow-writer.js";
 
 // Synthetic org and link only (smarty-dev#15310): no real principal, machine or session.
 export const SEAT_SID = "00000000-0000-4000-8000-0000000000a1";
@@ -17,66 +18,72 @@ export const orgDoc = {
   ],
 };
 export const pins = readBridgeNatsSeatPins(orgDoc);
-const lane = linkLane();
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
-function linkLane() {
-  return {
-    base: (allow: Record<string, unknown>) => ({
-      version: 1, name: "hub-a", link: "v2", file: { mesh: "/synthetic/mesh", lockProtocol: 2 }, stateDir: "/synthetic/state",
-      nats: { servers: ["tls://nats.example.test:4222"], machine: "hub-a-bridge", credentials: "/synthetic/creds", caFile: "/synthetic/ca.pem",
-        custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS", pathBMachines: ["hub-a-bridge", "sandbox1", "org-alpha"],
-        operatorMachine: "fabric-ops" },
-      allow,
-    }),
-  };
-}
+const base = (allow: Record<string, unknown> | undefined): Record<string, unknown> => ({
+  version: 1, name: "hub-a", link: "v2", file: { mesh: "/synthetic/mesh", lockProtocol: 2 }, stateDir: "/synthetic/state",
+  nats: { servers: ["tls://nats.example.test:4222"], machine: "hub-a-bridge", credentials: "/synthetic/creds", caFile: "/synthetic/ca.pem",
+    custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS", pathBMachines: ["hub-a-bridge", "sandbox1", "sp-alpha"],
+    operatorMachine: "fabric-ops" },
+  ...(allow === undefined ? {} : { allow }),
+});
 
-/** A synthetic link config on disk (0600, private dir), as the link's own loader requires. */
-export const writeLinkConfig = (allow: Record<string, unknown>, mutate: (value: Record<string, unknown>) => void = () => {}): string => {
+/** A synthetic link config on disk (0600, private real directory), as the writer requires. */
+export const writeLinkConfig = (allow: Record<string, unknown> | undefined, mutate: (value: Record<string, unknown>) => void = () => {},
+  layout = (value: Record<string, unknown>) => `${JSON.stringify(value, null, 2)}\n`): string => {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "link-config-")));
   dirs.push(dir);
   fs.chmodSync(dir, 0o700);
-  const value = lane.base(allow) as Record<string, unknown>;
+  const value = base(allow);
   mutate(value);
   const file = path.join(dir, "v2.json");
-  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  fs.writeFileSync(file, layout(value), { mode: 0o600 });
   return file;
 };
 
 const seatFileEntry = { kind: "root", id: `session:${SEAT_SID}`, principal: "Alpha", send: ["followUp"], receive: ["followUp", "cancel"],
   note: "the seat while on v1" };
+const otherFileEntry = { kind: "root", id: `session:${OTHER_SID}`, principal: "Bravo", send: ["followUp"], receive: ["followUp", "cancel"] };
 const leadEntry = { kind: "root", id: `session:${LEAD_SID}`, send: ["followUp"] };
 const supervisorEntry = { kind: "actor", rootId: `session:${LEAD_SID}`, name: "supervisor", send: ["followUp"] };
-const want: SeatEntry = { kind: "root", id: `session:${SEAT_SID}`, principal: "Alpha", machine: "org-alpha", send: [...SEAT_SEND],
+const want: SeatEntry = { kind: "root", id: `session:${SEAT_SID}`, principal: "Alpha", machine: "sp-alpha", send: [...SEAT_SEND],
   receive: [...SEAT_RECEIVE] };
+const seat = { sessionId: SEAT_SID, machine: "sp-alpha" };
 
 describe("the bridge seam's A' config writer (one entry, never a free-form edit)", () => {
-  it("MOVES the seat's own file entry to the fixed nats entry; every other value stays identical", () => {
+  it("MOVES the seat's own file entry to the fixed nats entry; every other value stays identical; returns the re-read post-state", () => {
     const file = writeLinkConfig({ file: [leadEntry, seatFileEntry, supervisorEntry] });
     const before = readLinkConfig(file);
-    const plan = planPublish(before, pins, { sessionId: SEAT_SID, machine: "org-alpha" });
+    const plan = planPublish(before, pins, seat);
     expect(plan).toMatchObject({ change: "move", natsEntry: want, fileEntry: { index: 1, entry: seatFileEntry } });
-    applyPlan(plan);
-    const after = readLinkConfig(file);
-    expect(after.sha256).toBe(plan.afterSha256);
-    expect(after.value.allow).toEqual({ file: [leadEntry, supervisorEntry], nats: [want] });
+    const post = applyPlan(plan);
+    expect(post.sha256).toBe(plan.afterSha256);
+    expect(post.value.allow).toEqual({ file: [leadEntry, supervisorEntry], nats: [want] });
+    // The post-state the seam reads for reload, route and receipt is the file ON DISK, parsed again.
+    expect(post.config.allow).toEqual({ file: [leadEntry, supervisorEntry], nats: [want] });
     const { allow: _a, ...restBefore } = before.value;
-    const { allow: _b, ...restAfter } = after.value;
+    const { allow: _b, ...restAfter } = post.value;
     expect(sameJson(restBefore, restAfter)).toBe(true);
     expect(fs.statSync(file).mode & 0o777).toBe(0o600);
-    // The leftover temp file is never there.
     expect(fs.readdirSync(path.dirname(file))).toEqual(["v2.json"]);
   });
 
-  it("ADDS the entry when the seat had none; the same entry already there is no change (idempotent)", () => {
+  it("ADDS the entry when the seat had none; the same entry already there is no change and gives NO rollback authority", () => {
     const file = writeLinkConfig({ file: [leadEntry] });
-    const plan = planPublish(readLinkConfig(file), pins, { sessionId: SEAT_SID, machine: "org-alpha" });
+    const plan = planPublish(readLinkConfig(file), pins, seat);
     expect(plan).toMatchObject({ change: "add", fileEntry: null });
+    expect(rollbackAuthority(plan)).not.toBeNull();
     applyPlan(plan);
-    const again = planPublish(readLinkConfig(file), pins, { sessionId: SEAT_SID, machine: "org-alpha" });
-    expect(again).toMatchObject({ change: "none", after: null });
+    const again = planPublish(readLinkConfig(file), pins, seat);
+    expect(again).toMatchObject({ change: "none", after: null, natsEntry: null });
+    // #1609 review P1-5: a no-op publish hands a rollback nothing to remove...
+    expect(rollbackAuthority(again)).toBeNull();
+    // ...so the rollback never removes that PRE-EXISTING entry: with no authority it refuses (the operator reconciles).
+    const before = fs.readFileSync(file);
+    expect(() => planRestore(readLinkConfig(file), pins, SEAT_SID, rollbackAuthority(again)))
+      .toThrow(expect.objectContaining({ code: "seat-entry-conflict" }));
+    expect(fs.readFileSync(file)).toEqual(before);
   });
 
   it("refuses a machine outside nats.pathBMachines, the link's own machine, or a session that is no principal's seat", () => {
@@ -84,21 +91,20 @@ describe("the bridge seam's A' config writer (one entry, never a free-form edit)
     const before = readLinkConfig(file);
     expect(() => planPublish(before, pins, { sessionId: SEAT_SID, machine: "org-charlie" })).toThrow(expect.objectContaining({ code: "seat-machine-not-path-b" }));
     expect(() => planPublish(before, pins, { sessionId: SEAT_SID, machine: "hub-a-bridge" })).toThrow(expect.objectContaining({ code: "seat-machine-not-path-b" }));
-    expect(() => planPublish(before, pins, { sessionId: LEAD_SID, machine: "org-alpha" })).toThrow(expect.objectContaining({ code: "seat-principal-unbound" }));
+    expect(() => planPublish(before, pins, { sessionId: LEAD_SID, machine: "sp-alpha" })).toThrow(expect.objectContaining({ code: "seat-principal-unbound" }));
   });
 
   it("refuses any other entry naming the seat: a different nats entry, or an actor under the seat's root", () => {
-    const other = { ...want, machine: "sandbox1" };
-    expect(() => planPublish(readLinkConfig(writeLinkConfig({ nats: [other] })), pins, { sessionId: SEAT_SID, machine: "org-alpha" }))
+    expect(() => planPublish(readLinkConfig(writeLinkConfig({ nats: [{ ...want, machine: "sandbox1" }] })), pins, seat))
       .toThrow(expect.objectContaining({ code: "seat-entry-conflict" }));
     const actor = { kind: "actor", rootId: `session:${SEAT_SID}`, name: "supervisor", send: ["followUp"] };
-    expect(() => planPublish(readLinkConfig(writeLinkConfig({ file: [seatFileEntry, actor] })), pins, { sessionId: SEAT_SID, machine: "org-alpha" }))
+    expect(() => planPublish(readLinkConfig(writeLinkConfig({ file: [seatFileEntry, actor] })), pins, seat))
       .toThrow(expect.objectContaining({ code: "seat-entry-conflict" }));
   });
 
   it("compare-and-swap: a config changed after the plan is never overwritten", () => {
     const file = writeLinkConfig({ file: [seatFileEntry] });
-    const plan = planPublish(readLinkConfig(file), pins, { sessionId: SEAT_SID, machine: "org-alpha" });
+    const plan = planPublish(readLinkConfig(file), pins, seat);
     const edited = `${fs.readFileSync(file, "utf8").trimEnd()} \n`;
     fs.writeFileSync(file, edited);
     expect(() => applyPlan(plan)).toThrow(expect.objectContaining({ code: "link-config-changed" }));
@@ -106,14 +112,70 @@ describe("the bridge seam's A' config writer (one entry, never a free-form edit)
     expect(fs.readdirSync(path.dirname(file))).toEqual(["v2.json"]);
   });
 
-  it("refuses an unsafe config (group-writable, or a symlink) before reading it", () => {
+  it("#1609 review P1-7: two writers on the shared config serialize on its lock; neither erases the other's entry", async () => {
+    const file = writeLinkConfig({ file: [leadEntry, seatFileEntry, otherFileEntry] });
+    const other = { sessionId: OTHER_SID, machine: "sandbox1" };
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const order: string[] = [];
+    // Writer A reads and plans, then waits at the barrier BEFORE its rename, holding the lock.
+    const a = withConfigLock(file, async () => {
+      const plan = planPublish(readLinkConfig(file), pins, seat);
+      order.push("a-planned");
+      await barrier;
+      applyPlan(plan);
+      order.push("a-renamed");
+    });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    // Writer B starts while A holds the lock: it can only read AFTER A's rename.
+    const b = withConfigLock(file, () => {
+      order.push("b-read");
+      applyPlan(planPublish(readLinkConfig(file), pins, other));
+      order.push("b-renamed");
+    }, { sleep: ms => new Promise(resolve => setTimeout(resolve, Math.min(ms, 20))) });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(order).toEqual(["a-planned"]);
+    release();
+    await Promise.all([a, b]);
+    expect(order).toEqual(["a-planned", "a-renamed", "b-read", "b-renamed"]);
+    const nats = readLinkConfig(file).value.allow as { nats: Array<{ id: string }> };
+    expect(nats.nats.map(entry => entry.id).sort()).toEqual([`session:${SEAT_SID}`, `session:${OTHER_SID}`].sort());
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["v2.json"]);
+  });
+
+  it("the lock of a dead holder is reclaimed; a live holder is waited for, bounded", async () => {
     const file = writeLinkConfig({ file: [seatFileEntry] });
-    fs.chmodSync(file, 0o620);
-    expect(() => readLinkConfig(file)).toThrow(expect.objectContaining({ code: "link-config-invalid" }));
-    fs.chmodSync(file, 0o600);
+    const lock = path.join(path.dirname(file), ".v2.json.fabric-v2.lock");
+    fs.writeFileSync(lock, JSON.stringify({ pid: 2 ** 22 + 7, startTime: "1", at: "t" }), { mode: 0o600 });
+    expect(await withConfigLock(file, () => "ran")).toBe("ran");
+    expect(fs.existsSync(lock)).toBe(false);
+    let t = 0;
+    const held = withConfigLock(file, () => new Promise(resolve => setTimeout(resolve, 200)));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await expect(withConfigLock(file, () => "never", { waitMs: 1_000, now: () => t, sleep: async ms => { t += ms; } }))
+      .rejects.toMatchObject({ code: "link-config-busy" });
+    await held;
+  });
+
+  it("#1609 review P1-8: refuses a symlink in ANY path component, an unsafe ancestor, or an unsafe file", () => {
+    const file = writeLinkConfig({ file: [seatFileEntry] });
+    // A symlinked ancestor.
+    const alias = path.join(path.dirname(path.dirname(file)), `alias-${path.basename(path.dirname(file))}`);
+    fs.symlinkSync(path.dirname(file), alias);
+    dirs.push(alias);
+    expect(() => readLinkConfig(path.join(alias, "v2.json"))).toThrow(expect.objectContaining({ code: "link-config-path-unsafe" }));
+    // The file itself a symlink.
     const link = path.join(path.dirname(file), "link.json");
     fs.symlinkSync(file, link);
-    expect(() => readLinkConfig(link)).toThrow(expect.objectContaining({ code: "link-config-invalid" }));
+    expect(() => readLinkConfig(link)).toThrow(expect.objectContaining({ code: "link-config-path-unsafe" }));
+    fs.unlinkSync(link);
+    // A group-writable directory.
+    fs.chmodSync(path.dirname(file), 0o770);
+    expect(() => readLinkConfig(file)).toThrow(expect.objectContaining({ code: "link-config-path-unsafe" }));
+    fs.chmodSync(path.dirname(file), 0o700);
+    // A group-writable file.
+    fs.chmodSync(file, 0o620);
+    expect(() => readLinkConfig(file)).toThrow(expect.objectContaining({ code: "link-config-unsafe" }));
   });
 
   it("refuses a link whose state lives in a temporary store (an agent's private temp store, /tmp, /run)", () => {
@@ -125,36 +187,53 @@ describe("the bridge seam's A' config writer (one entry, never a free-form edit)
       .config.stateDir).toBe("/home/synthetic/.local/state/nats-link/v2");
   });
 
-  it("a candidate the link itself would refuse (unknown key elsewhere) is never written", () => {
-    const file = writeLinkConfig({ file: [seatFileEntry] }, value => { (value.nats as Record<string, unknown>).pathBMachines = ["hub-a-bridge"]; });
-    expect(() => planPublish(readLinkConfig(file), pins, { sessionId: SEAT_SID, machine: "org-alpha" }))
-      .toThrow(expect.objectContaining({ code: "seat-machine-not-path-b" }));
-  });
-
-  it("restore undoes exactly what publish recorded: the nats entry out, the file entry back at its index", () => {
-    const file = writeLinkConfig({ file: [leadEntry, seatFileEntry, supervisorEntry] });
-    const original = readLinkConfig(file);
-    const published = planPublish(original, pins, { sessionId: SEAT_SID, machine: "org-alpha" });
+  it("#1609 review P1-6: a rollback while the file still holds publish's bytes puts back the old bytes EXACTLY", () => {
+    // An operator's layout (compact JSON, no allow.nats at all): the publish rewrites it; the rollback restores it byte for byte.
+    const file = writeLinkConfig({ file: [leadEntry, seatFileEntry, supervisorEntry] }, () => {}, value => `${JSON.stringify(value)}\n`);
+    const original = fs.readFileSync(file);
+    const published = planPublish(readLinkConfig(file), pins, seat);
     applyPlan(published);
-    const restore = planRestore(readLinkConfig(file), pins, { sessionId: SEAT_SID, natsEntry: published.natsEntry, fileEntry: published.fileEntry });
-    expect(restore.change).toBe("restore");
+    const restore = planRestore(readLinkConfig(file), pins, SEAT_SID, rollbackAuthority(published));
+    expect(restore.change).toBe("revert");
     applyPlan(restore);
-    expect(readLinkConfig(file).value.allow).toEqual({ file: [leadEntry, seatFileEntry, supervisorEntry], nats: [] });
+    expect(fs.readFileSync(file)).toEqual(original);
     // Already restored: no change.
-    expect(planRestore(readLinkConfig(file), pins, { sessionId: SEAT_SID, natsEntry: published.natsEntry, fileEntry: published.fileEntry }).change).toBe("none");
+    expect(planRestore(readLinkConfig(file), pins, SEAT_SID, rollbackAuthority(published)).change).toBe("none");
   });
 
-  it("restore refuses a nats entry for the seat that publish did not write (or with no publish record)", () => {
+  it("a rollback after other seats changed the file undoes exactly publish's entry (an add leaves allow.nats absent again)", () => {
+    const file = writeLinkConfig({ file: [leadEntry, otherFileEntry] });
+    const published = planPublish(readLinkConfig(file), pins, seat);
+    applyPlan(published);
+    // Another seat moved in between: the file no longer holds publish's bytes.
+    applyPlan(planPublish(readLinkConfig(file), pins, { sessionId: OTHER_SID, machine: "sandbox1" }));
+    const restore = planRestore(readLinkConfig(file), pins, SEAT_SID, rollbackAuthority(published));
+    expect(restore.change).toBe("remove");
+    applyPlan(restore);
+    expect((readLinkConfig(file).value.allow as { nats: Array<{ id: string }> }).nats.map(entry => entry.id)).toEqual([`session:${OTHER_SID}`]);
+    // A seat whose add was the only nats entry: removing it leaves no allow.nats key, as before the publish.
+    const lone = writeLinkConfig({ file: [leadEntry] });
+    const added = planPublish(readLinkConfig(lone), pins, seat);
+    applyPlan(added);
+    fs.writeFileSync(lone, `${JSON.stringify(readLinkConfig(lone).value)}\n`);
+    const undo = planRestore(readLinkConfig(lone), pins, SEAT_SID, rollbackAuthority(added));
+    expect(undo.change).toBe("remove");
+    expect(Object.keys(applyPlan(undo).value.allow as object)).toEqual(["file"]);
+  });
+
+  it("a rollback refuses a nats entry for the seat that publish did not write", () => {
     const file = writeLinkConfig({ nats: [want] });
-    expect(() => planRestore(readLinkConfig(file), pins, { sessionId: SEAT_SID, natsEntry: null, fileEntry: null }))
-      .toThrow(expect.objectContaining({ code: "seat-entry-conflict" }));
-    expect(() => planRestore(readLinkConfig(file), pins, { sessionId: SEAT_SID, natsEntry: { ...want, machine: "sandbox1" }, fileEntry: null }))
-      .toThrow(expect.objectContaining({ code: "seat-entry-conflict" }));
-    // No publish record and the seat on the file side only (v1 never moved): nothing to undo.
-    expect(planRestore(readLinkConfig(writeLinkConfig({ file: [seatFileEntry] })), pins, { sessionId: SEAT_SID, natsEntry: null, fileEntry: null })
-      .change).toBe("none");
-    // Publish's own entry with no file entry to put back: REMOVE.
-    const remove = planRestore(readLinkConfig(file), pins, { sessionId: SEAT_SID, natsEntry: want, fileEntry: null });
-    expect(remove.change).toBe("remove");
+    expect(() => planRestore(readLinkConfig(file), pins, SEAT_SID, null)).toThrow(expect.objectContaining({ code: "seat-entry-conflict" }));
+    const other = writeLinkConfig({ file: [leadEntry] });
+    const published = planPublish(readLinkConfig(other), pins, seat);
+    applyPlan(published);
+    const authority = rollbackAuthority(published)!;
+    // Someone changed the entry publish wrote: never remove a value publish did not write.
+    const changed = readLinkConfig(other).value;
+    (changed.allow as { nats: Array<Record<string, unknown>> }).nats[0]!.machine = "sandbox1";
+    fs.writeFileSync(other, `${JSON.stringify(changed)}\n`);
+    expect(() => planRestore(readLinkConfig(other), pins, SEAT_SID, authority)).toThrow(expect.objectContaining({ code: "seat-entry-conflict" }));
+    // No publish write and the seat on the file side only (v1 never moved): nothing to undo.
+    expect(planRestore(readLinkConfig(writeLinkConfig({ file: [seatFileEntry] })), pins, SEAT_SID, null).change).toBe("none");
   });
 });

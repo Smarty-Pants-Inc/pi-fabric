@@ -56,7 +56,6 @@ const PUBLISH_RETRY_WINDOW_SAFETY_MS = 30_000;
 const PUBLISH_RETRY_INITIAL_MS = 250;
 const PUBLISH_RETRY_MAX_MS = 5_000;
 const DEFAULT_EPHEMERAL_INACTIVE_SECONDS = 3_600;
-const RUNTIME_INACTIVE_THRESHOLD_NS = 60 * 60 * 1_000_000_000;
 const EPHEMERAL_DELETE_TIMEOUT_MS = 1_000;
 const utf8 = new TextEncoder();
 const validMessageId = (id: string): boolean => id.length > 0 && id === id.trim() && !/[\u0000-\u001f\u007f]/.test(id);
@@ -199,7 +198,7 @@ const transportConsumerPolicy = (options: ResolvedNatsOptions): TransportConsume
   maxAckPending: 128,
   ...(options.ephemeralHost
     ? { inactiveThresholdNs: options.ephemeralInactiveSeconds * 1_000_000_000 }
-    : options.hostId.startsWith("runtime:") ? { inactiveThresholdNs: RUNTIME_INACTIVE_THRESHOLD_NS } : {}),
+    : {}),
 });
 
 const isTransportEnvelope = (value: unknown): value is TransportEnvelope => {

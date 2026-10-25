@@ -136,7 +136,7 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
 
   it.each([
     { hostId: "session:bounded-inbox", seconds: 7 * 24 * 60 * 60 },
-    { hostId: "runtime:bounded-inbox", seconds: 60 * 60 },
+    { hostId: "runtime:bounded-inbox", seconds: 7 * 24 * 60 * 60 },
     { hostId: "runtime-without-colon", seconds: 7 * 24 * 60 * 60 },
   ])("creates $hostId with a bounded server-side idle lifetime", async ({ hostId, seconds }) => {
     const transport = await openNatsTransport({ ...shared.runtimeOptions(shared.users.machineA), hostId });
@@ -155,7 +155,7 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
 
   it.each([
     { hostId: "session:legacy-lifetime", legacyNs: 0, seconds: 7 * 24 * 60 * 60 },
-    { hostId: "runtime:legacy-lifetime", legacyNs: 2 * 60 * 60 * 1_000_000_000, seconds: 60 * 60 },
+    { hostId: "runtime:legacy-lifetime", legacyNs: 60 * 60 * 1_000_000_000, seconds: 7 * 24 * 60 * 60 },
   ])("heals $hostId with runtime credentials without resetting ACKs, pending records or unrelated config", async ({ hostId, legacyNs, seconds }) => {
     const inspector = await shared.connect(shared.users.bootstrap);
     const admin = await openJetStream(inspector);
@@ -305,7 +305,7 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
       const reopened = await openNatsTransport({ ...shared.runtimeOptions(shared.users.machineA), hostId });
       transports.push(reopened);
       const info = await admin.manager.consumers.info(stream, transportDurableName(hostId));
-      expect(info.config.inactive_threshold).toBe(60 * 60 * 1_000_000_000);
+      expect(info.config.inactive_threshold).toBe(7 * 24 * 60 * 60 * 1_000_000_000);
       expect(info.num_pending).toBe(1);
       const replaySignal = new AbortController();
       const replay = reopened.inbox(replaySignal.signal)[Symbol.asyncIterator]();
@@ -355,7 +355,7 @@ describe.skipIf(!binary)("real nats-server Path B module", () => {
       expect(result.value).toMatchObject({ sequence: sent.sequence, attempt: 1, payload: { id: sent.id } });
       await result.value!.ack();
       const info = await admin.manager.consumers.info(stream, transportDurableName(hostId));
-      expect(info.config.inactive_threshold).toBe(60 * 60 * 1_000_000_000);
+      expect(info.config.inactive_threshold).toBe(7 * 24 * 60 * 60 * 1_000_000_000);
       expect(await receiver.drainState()).toEqual({ pending: 0, ackPending: 0 });
       expect(relay.accepts).toBeGreaterThanOrEqual(2);
     } finally {

@@ -11,7 +11,7 @@ There are four creation statements and six durable naming families; the shared i
 
 | Consumer | Creation path | Previous lifetime | Policy in this change |
 | --- | --- | --- | --- |
-| Ordinary host `rt_<hash(hostId)>` | `src/transport/nats/inbox.ts:193–200,277–280` → `src/transport/nats/provision.ts:167` | Unlimited, even when never pulled | Seven days for session/other stable hosts; one hour for `runtime:` hosts |
+| Ordinary host `rt_<hash(hostId)>` | `src/transport/nats/inbox.ts:193–200,277–280` → `src/transport/nats/provision.ts:167` | Unlimited, even when never pulled | Seven days for session, `runtime:` and other ordinary hosts |
 | Temporary child/CLI `rt_<hash(hostId)>` | Same shared statement; `src/agents/child-env.ts:25–36`, `src/mesh/nats-auth/send-cli.ts:455–468` opt in | Default one hour; configured 300–86,400 seconds; best-effort deletion on clean close | Unchanged explicit temporary-host policy |
 | Bridge inbox `br_<hash(link identity)>` | `src/mesh/bridge-nats-port.ts:119–149` → same shared statement | Unlimited | Seven-day shared default |
 | Actor Fabric/GitHub `ev_<hash(actorId)>`, `gh_<hash(actorId)>` | `src/transport/nats/events-consume.ts:197–247`, create at 231 | Unlimited; mutable config also writes zero | Unchanged: independent durable delivery cursors |
@@ -26,10 +26,12 @@ Session channels are core NATS subscriptions, not JetStream consumers.
 
 ## Why these bounds
 
-Seven days lets a normal Main or inbox bridge survive a weekend and several offline days without losing its
-broker cursor. It matches the default inbox stream message age. Runtime identities are shorter-lived; one hour
-matches the existing temporary-child default. Explicit temporary-host settings still take precedence.
-These are supported inactivity windows, not a promise to preserve a broker cursor after a longer outage.
+Seven days lets an ordinary host or inbox bridge survive a weekend and several offline days without losing its
+broker cursor. It matches the default inbox stream message age. `runtime:` identities use this same default.
+A shorter runtime threshold waits for the reconnect-recovery fix: expiry can currently leave a paused or asleep
+host's inbox silently stopped after a consumer-not-found (404) response. Explicit temporary-host settings still
+take precedence and retain their existing behavior. These are supported inactivity windows, not a promise to
+preserve a broker cursor after a longer outage.
 
 The patch does not change stream retention, subject filters, durable names, envelope serialization, ACK behavior,
 USER.INFO verification or permissions. Reconnecting compatible legacy inbox consumers are updated **in place**,

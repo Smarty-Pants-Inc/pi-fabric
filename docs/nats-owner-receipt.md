@@ -14,6 +14,8 @@ uses the same policy source as `nats send`: `PI_FABRIC_MESH_NATS`, otherwise
 `PI_FABRIC_NATS_MACHINES`. Credentials must be the scoped **agent** credential for
 `--machine`; an operator credential is not a substitute. The machine may also be
 the owner's machine: the reader does not register an identity or acquire a lease.
+Give exactly one of `--mesh <dir>` (read the file-side handoff marker) or
+`--no-mesh` (an explicit NATS-only receipt, for a host without the hub mesh).
 
 Stdout is one JSON object:
 
@@ -27,7 +29,7 @@ Stdout is one JSON object:
   otherwise `null`.
 - `nats.rows`: the participant view's ownership rows, including stale rows,
   authenticated machine, presence revision and available lease evidence.
-- `file`: `null` unless `--mesh` is requested. Otherwise `{ meshRoot, handoff,
+- `file`: `null` with `--no-mesh`. Otherwise `{ meshRoot, handoff,
   mirror }`. The optional handoff is `{ link, handedOffAt, operator, hub,
   inForce }`; the optional mirror is `{ host, participant }`, with sanitized
   ownership/link fields and file-state versions. A returned native can void the

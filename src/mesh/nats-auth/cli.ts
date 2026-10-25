@@ -31,7 +31,7 @@ const USAGE = [
   "  send --to <id> --kind <followUp|steer> (--text <text>|--text-file <file>) ...",
   "       [--name <host-name>] [--await-reply-seconds <seconds>] [--org <org>] [--path-b-machines <csv>]",
   "  dispatch --run-id <runId> --task-file <f> --out <burst.jsonl> --creds --ca --servers --machine --org ...",
-  "  owner --session <uuid|session:uuid> --creds --ca --servers --machine [--org] [--path-b-machines] [--mesh <dir>]",
+  "  owner --session <uuid|session:uuid> --creds --ca --servers --machine (--mesh <dir> | --no-mesh) [--org] [--path-b-machines]",
   "       read-only ownership receipt: the session's NATS presence/lease owner and file-side handoff, as JSON",
   "",
   "send, dispatch and owner use org NATS policy from PI_FABRIC_MESH_NATS or the PI_FABRIC_NATS_* policy variables.",

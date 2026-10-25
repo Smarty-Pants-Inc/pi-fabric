@@ -312,7 +312,7 @@ describe("file-side handoff readback without opening MeshStore", () => {
   });
 });
 
-const validArgs = ["--session", SESSION, "--creds", "/unused/agent.creds", "--ca", "/unused/ca.pem", "--servers", "tls://localhost:4222", "--machine", MACHINE];
+const validArgs = ["--session", SESSION, "--creds", "/unused/agent.creds", "--ca", "/unused/ca.pem", "--servers", "tls://localhost:4222", "--machine", MACHINE, "--no-mesh"];
 async function cli(args: string[]) {
   let stdout = "", stderr = "";
   const code = await runNatsOwnerCli(args, { out: value => { stdout += value; }, err: value => { stderr += value; } });
@@ -326,6 +326,8 @@ describe("owner CLI input and failure output", () => {
     validArgs.map(value => value === "/unused/agent.creds" ? "relative.creds" : value),
     validArgs.map(value => value === "tls://localhost:4222" ? "nats://localhost:4222" : value),
     [...validArgs, "--timeout-ms", "0"], [...validArgs, "--org", "sys"], [...validArgs, "--path-b-machines", "machine-a,machine-a"],
+    // The file-side marker is requested unless skipping it is explicit: neither or both refuse.
+    validArgs.filter(value => value !== "--no-mesh"), [...validArgs, "--mesh", "/unused/mesh"], [...validArgs, "--no-mesh"],
   ].map(args => ({ args })))("returns usage/exit 2 without echoing raw arguments ($args)", async ({ args }) => {
     const result = await cli(args);
     expect(result.code).toBe(2); expect(result.lines).toHaveLength(1); expect(result.receipt).toHaveProperty("error");
@@ -420,7 +422,7 @@ describe.skipIf(!binary || process.platform !== "linux")("owner CLI with a real 
       expect(brokerPresence).toBeDefined(); expect(brokerLease).toBeDefined();
       const args = ["--session", id, "--creds", broker.users.machineA.credsPath, "--ca", broker.tls!.caFile,
         "--servers", `tls://localhost:${new URL(broker.serverUrl).port}`, "--machine", MACHINE, "--org", "tristar",
-        "--path-b-machines", PATH_B_MACHINES.join(","), "--timeout-ms", "5000"];
+        "--path-b-machines", PATH_B_MACHINES.join(","), "--timeout-ms", "5000", "--no-mesh"];
       const beforeDeletes = deletes.length;
       const result = await cli(args);
       expect(result, result.stdout).toMatchObject({ code: 0, stderr: "", receipt: { verdict: "owned", rootId: id, sessionId,
@@ -436,7 +438,7 @@ describe.skipIf(!binary || process.platform !== "linux")("owner CLI with a real 
       vi.stubEnv("PI_FABRIC_MESH_NATS", JSON.stringify(PATH_B_PERMISSION_POLICY));
       const mesh = tempRoot(), stateFile = path.join(mesh, "state.json");
       fs.writeFileSync(stateFile, JSON.stringify({ format: 1, entries: {} }));
-      const fileArgs = [...args.map(value => value === id ? sessionId : value), "--mesh", mesh];
+      const fileArgs = [...args.filter(value => value !== "--no-mesh").map(value => value === id ? sessionId : value), "--mesh", mesh];
       const fileBefore = treeSnapshot(mesh), withFile = await cli(fileArgs);
       expect(withFile).toMatchObject({ code: 0, receipt: { verdict: "owned", file: { meshRoot: mesh, handoff: null, mirror: null } } });
       expect(treeSnapshot(mesh)).toEqual(fileBefore);

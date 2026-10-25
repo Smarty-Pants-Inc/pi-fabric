@@ -16,7 +16,7 @@ import { policyConfig } from "./send-cli.js";
 const USAGE = [
   "Usage: pi-fabric nats owner --session <uuid | session:uuid>",
   "  --creds <absolute-file> --ca <absolute-file> --servers <tls://host:port[,tls://host:port...]>",
-  "  --machine <machine> [--org <org>] [--path-b-machines <csv>] [--mesh <absolute-mesh-root>] [--timeout-ms <ms>]",
+  "  --machine <machine> (--mesh <absolute-mesh-root> | --no-mesh) [--org <org>] [--path-b-machines <csv>] [--timeout-ms <ms>]",
   "Policy comes from PI_FABRIC_MESH_NATS or PI_FABRIC_NATS_CUSTODY_STREAM, PI_FABRIC_NATS_LIVENESS_STREAM, PI_FABRIC_NATS_MACHINES.",
   "Read-only JSON receipt; exit 0 only for an owned session and every requested source read; 1 unknown/not owned; 2 usage.",
 ].join("\n");
@@ -40,8 +40,10 @@ function parseOptions(argv: readonly string[]): OwnerOptions | "help" {
   if (argv.length === 1 && ["--help", "-h", "help"].includes(argv[0]!)) return "help";
   const flags = new Set(["--session", "--creds", "--ca", "--servers", "--machine", "--org", "--path-b-machines", "--mesh", "--timeout-ms"]);
   const values = new Map<string, string>();
+  let noMesh = false;
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]!;
+    if (flag === "--no-mesh" && !noMesh) { noMesh = true; continue; }
     if (!flags.has(flag) || values.has(flag) || !argv[i + 1] || argv[i + 1]!.startsWith("--")) throw new UsageError("invalid arguments; see usage");
     values.set(flag, argv[++i]!);
   }
@@ -50,6 +52,8 @@ function parseOptions(argv: readonly string[]): OwnerOptions | "help" {
     if (!value) throw new UsageError(`${flag} is required`);
     return value;
   };
+  // The file-side handoff marker is part of the receipt: skipping it must be an explicit choice.
+  if (noMesh === values.has("--mesh")) throw new UsageError("give exactly one of --mesh <dir> or --no-mesh");
   const session = required("--session").replace(/^session:/, "");
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(session)) throw new UsageError("--session must be a lowercase UUID or session:<uuid>");
   const machine = required("--machine");

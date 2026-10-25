@@ -284,6 +284,9 @@ const drain = async (context: Context): Promise<number> => {
   let bound = false;
   let fenced = false;
   let stopAsked = false;
+  const specs = new Map<string, Record<string, unknown>>();
+  const withSpecs = (stopped: MainDrainReply["stopped"]) => stopped.map(entry => ({ ...entry,
+    registryRow: specs.get(entry.id) ?? null, basis: { spec: "asserted", registryRow: "measured" } }));
   // Whether any drain request reached the Main: if none did, nothing was closed or fenced.
   let everSent = false;
   const dispositions = new Map<string, string>();
@@ -318,6 +321,17 @@ const drain = async (context: Context): Promise<number> => {
     // r2 N2: actors are stopped ONLY as the last act: the fence is held and nothing but live session actors remains.
     if (fenced && !stopAsked && evaluation.reasons.length > 0 && evaluation.reasons.every(reason => reason.startsWith("children:live-actor:"))) {
       stopAsked = true;
+      // Record each live actor's FULL registry row (instructions included) before the stop: the spec an operator
+      // (or a later recreation) needs, measured from the file, private to RUN.
+      for (const actor of files?.actors ?? []) {
+        if (actor.rootId !== rootId || actor.status === "stopped" || specs.has(actor.id)) continue;
+        try {
+          const registry = JSON.parse(readOwned(actor.registry, context.uid, 64 * 1024 * 1024, undefined, "registry-unreadable").toString("utf8")) as
+            { actors?: Array<Record<string, unknown>> };
+          const row = registry.actors?.find(entry => entry.id === actor.id);
+          if (row) specs.set(actor.id, row);
+        } catch { /* recorded as missing: the evidence then carries only the Main's public spec */ }
+      }
       const stop = await call(context, "stop-actors", binding(context, "drain", generation), context.deadline - context.now());
       step("stop-actors", { error: stop.error ?? null, refused: stop.reply?.stopRefused ?? null, stopped: stop.reply?.stopped ?? [] });
       if (stop.reply?.stopRefused) stopAsked = false;                // not all quiesced yet: ask again on a later pass
@@ -339,7 +353,7 @@ const drain = async (context: Context): Promise<number> => {
       measured: { inventory: final.inventory ?? null, ...final.evaluation.parts.measured },
       asserted: { reply: final.reply ?? null, ...final.evaluation.parts.asserted }, passes,
       dispositions: [...dispositions].map(([id, disposition]) => ({ id, disposition, basis: "asserted" })),
-      stoppedActors: final.reply?.stopped ?? [], admitted: final.reply?.admitted ?? [], ledger: final.reply?.ledger ?? [],
+      stoppedActors: withSpecs(final.reply?.stopped ?? []), admitted: final.reply?.admitted ?? [], ledger: final.reply?.ledger ?? [],
       ingress: MAIN_DRAIN_INGRESS,
     });
     context.io.stdout(receipt(request, "pass", { ...final.evaluation.observed }));
@@ -367,7 +381,7 @@ const drain = async (context: Context): Promise<number> => {
       canary: { inboxOpen: undone.inboxOpen, inputsFenced: undone.inputsFenced } },
     asserted: { reply: final.reply ?? null, ...final.evaluation.parts.asserted, undo: undone.undo?.undo ?? null, probe: undone.probe ?? null },
     passes, dispositions: [...dispositions].map(([id, disposition]) => ({ id, disposition, basis: "asserted" })), ingress: MAIN_DRAIN_INGRESS,
-    stoppedActors, actorsRestored: undone.actorsRestored, admitted, ledger,
+    stoppedActors: withSpecs(stoppedActors), actorsRestored: undone.actorsRestored, admitted, ledger,
     undo: { admissionRestored: undone.admissionRestored, restartRequired: undone.restartRequired, attempts: undone.attempts },
   });
   // inputsFenced is the state AFTER the undo: false only when the canary proved admission restored (or nothing was bound).

@@ -201,12 +201,14 @@ describe.skipIf(!linux)("children (B2/B3/B4, r2 N1/N2)", () => {
       fencedAtStop.push(target.native.state.fenced);
       target.actors.stops.push(id); row.status = "stopped"; target.writeActors([actorRow(id, "stopped", { stopReason: "explicit" })]); return {};
     };
-    target.writeActors([actorRow(id, "idle")]);
+    target.writeActors([actorRow(id, "idle", { instructions: "stay quiet" })]);
     const result = await inProcess(target, "drain", {}, { deadlineMs: 8_000 });
     expect(target.actors.stops).toEqual([id]);
     expect(fencedAtStop).toEqual([true]);
     expect(result.receipt).toMatchObject({ result: "pass", observed: { childrenTerminal: true } });
-    expect(outcome(target).stoppedActors).toEqual([expect.objectContaining({ id, spec: expect.objectContaining({ id, name: "quiet" }) })]);
+    // The full registry row (instructions included) is captured from the file BEFORE the stop, for recreation.
+    expect(outcome(target).stoppedActors).toEqual([expect.objectContaining({ id, spec: expect.objectContaining({ id, name: "quiet" }),
+      registryRow: expect.objectContaining({ id, instructions: "stay quiet", status: "idle" }) })]);
   });
 
   it("N2: a quiesced actor beside a Main that stays busy is NOT stopped; the refusal leaves it active", async () => {

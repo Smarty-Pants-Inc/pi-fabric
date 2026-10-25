@@ -10,6 +10,8 @@ const primaryEntryPoints = [
   "src/memory.ts",
   "src/mesh.ts",
   "src/mesh-bridge.ts",
+  // bin/nats-link and `pi-fabric nats-link` (smarty-dev#15310).
+  "src/mesh-bridge-nats-cli.ts",
   "src/participants-cli.ts",
   "src/actors-cli.ts",
   "src/resident-drain-cli.ts",

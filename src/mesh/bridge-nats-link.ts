@@ -242,9 +242,6 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     const ledgerDir = path.join(config.stateDir, "ledger");
     opened = await (factories.openLedger ? factories.openLedger(ledgerDir) : openBridgeNatsLedger({ dir: ledgerDir }));
     const ledger = natsCarrierLedger(opened, config.link);
-    // N4 (PR 2, lane L1): with nats.events, v2 work topics are republished into this file mesh. A missing
-    // consume grant refuses the start here, before MeshBridge links anything.
-    republish = await startNatsRepublishLink(config, { store, port, allow: allow.entries, ledger: opened, signal, log });
     let remote: NatsCarrierSide | undefined;
     const openedPort = port;
     const { authorize, authorizeTopic } = natsLinkAuthorizers(gate, {
@@ -269,6 +266,12 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     });
     remote = link.remote;
     const { bridge } = link;
+    // N4 (PR 2, lane L1): with nats.events, v2 work topics are republished into this file mesh, decided by
+    // L3's gate (verifyEventSender + allowRepublish) on both sides' presence. A missing consume grant
+    // refuses the start here, before MeshBridge links anything.
+    republish = await startNatsRepublishLink(config, { store, port, gate, ledger: opened, signal, log,
+      views: { refresh: () => remote!.filePresence.refresh(), nats: () => openedPort.presenceView(),
+        file: () => remote!.filePresence.view() } });
     await bridge.startWithBackoff();
     signal.throwIfAborted();
     log(`linked ${config.name} <-> ${config.link} (NATS machine ${port.machine})`);

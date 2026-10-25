@@ -8,6 +8,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { StoreBridgeSide } from "../src/mesh/bridge.js";
+import { FileCarrierPresence } from "../src/mesh/bridge-nats-file.js";
+import { createBridgeNatsIdentityGate, parseBridgeNatsAllowSection } from "../src/mesh/bridge-nats-identity.js";
 import { openNatsBridgeSide, type NatsBridgePort } from "../src/mesh/bridge-nats-port.js";
 import { natsRepublishStatePath, startNatsRepublishLink, type NatsRepublishHandle } from "../src/mesh/bridge-nats-republish.js";
 import { MeshStore } from "../src/mesh/store.js";
@@ -28,6 +31,12 @@ const BRIDGE = "machine-a";
 const V2 = "machine-b";
 const LINK = "v2";
 const NATS_ROOT = "session:22222222-2222-4222-8222-222222222222";
+const OTHER_ROOT = "session:33333333-3333-4333-8333-333333333333";
+// L3's gate, as the link builds it: NATS_ROOT may republish fleet.work.*, OTHER_ROOT nothing.
+const gate = createBridgeNatsIdentityGate(parseBridgeNatsAllowSection({ nats: [
+  { kind: "root", id: NATS_ROOT, machine: V2, republishTopics: ["fleet.work.*"] },
+  { kind: "root", id: OTHER_ROOT, machine: V2 },
+] }, { link: LINK, natsMachine: BRIDGE }), { pins: { seats: new Map(), bound: new Map() } });
 const key = (machine: string, kind: "p" | "h", id: string) => `${machine}.${kind}.${createHash("sha256").update(id).digest("hex").slice(0, 32)}`;
 
 let broker: PathBHarness;
@@ -70,10 +79,10 @@ const linkConfig = (server: PathBHarness, stateDir: string) => {
     pathBMachines: [...PATH_B_PERMISSION_POLICY.pathBMachines], org: ORG, events: true } };
 };
 
-const natsRoot = (now: number): FabricParticipantRecord => ({ format: 1, id: NATS_ROOT, kind: "root", rootId: NATS_ROOT,
-  ownerHostId: NATS_ROOT, ownerIdentityId: NATS_ROOT, ownerIncarnation: "nats-inc-1", name: "v2-lead", status: "idle", runner: "pi",
+const natsRoot = (now: number, id = NATS_ROOT): FabricParticipantRecord => ({ format: 1, id, kind: "root", rootId: id,
+  ownerHostId: id, ownerIdentityId: id, ownerIncarnation: "nats-inc-1", name: "v2-lead", status: "idle", runner: "pi",
   transport: "host", capabilities: ["steer", "followUp", "fabric"], controlProtocol: "v1", startedAt: now, updatedAt: now,
-  sessionId: NATS_ROOT.slice(8) });
+  sessionId: id.slice(8) });
 
 describe.skipIf(!binary)("A' N4 republish on a real Path B broker", () => {
   it("republishes a v2 Main's work event into the file mesh once, as the link, and never publishes into FABRIC_EV", async () => {
@@ -83,19 +92,25 @@ describe.skipIf(!binary)("A' N4 republish on a real Path B broker", () => {
     closers.push(async () => store.closeState());
     const config = linkConfig(broker, dir);
     const port: NatsBridgePort = await openNatsBridgeSide({ link: LINK, nats: config.nats,
-      allow: { file: [], nats: [{ kind: "root", id: NATS_ROOT, machine: V2 }] } }, { signal: AbortSignal.timeout(20_000) });
+      allow: { file: [], nats: [{ kind: "root", id: NATS_ROOT, machine: V2 }, { kind: "root", id: OTHER_ROOT, machine: V2 }] } },
+      { signal: AbortSignal.timeout(20_000) });
     closers.push(() => port.close());
+    // The hub's file presence, as the link's carrier reads it.
+    const filePresence = new FileCarrierPresence(new StoreBridgeSide(store, LINK));
 
     // The v2 Main on machine-b: live presence + lease in KV, and its own events publisher.
     const v2: FabricTransport = await openNatsTransport({ ...broker.runtimeOptions(broker.users.machineB), hostId: NATS_ROOT, org: ORG });
     closers.push(() => v2.close());
     const now = Date.now();
-    const owner = `${NATS_ROOT}#nats-inc-1`;
-    await v2.kv("leases").put(key(V2, "h", NATS_ROOT), owner, { id: NATS_ROOT, rootId: NATS_ROOT, identityId: NATS_ROOT,
-      incarnation: "nats-inc-1", incarnationToken: "nats-inc-1", pid: process.pid, pidStartTime: "1",
-      bootId: "12345678-1234-4234-8234-123456789abc", updatedAt: now, expiresAt: now + 15_000 }, 0);
-    await v2.kv("presence").put(key(V2, "p", NATS_ROOT), owner, natsRoot(now), 0);
-    await vi.waitFor(() => expect(port.resolve(NATS_ROOT)?.route.live).toBe(true), { timeout: 10_000, interval: 50 });
+    for (const id of [NATS_ROOT, OTHER_ROOT]) {
+      const owner = `${id}#nats-inc-1`;
+      await v2.kv("leases").put(key(V2, "h", id), owner, { id, rootId: id, identityId: id,
+        incarnation: "nats-inc-1", incarnationToken: "nats-inc-1", pid: process.pid, pidStartTime: "1",
+        bootId: "12345678-1234-4234-8234-123456789abc", updatedAt: now, expiresAt: now + 15_000 }, 0);
+      await v2.kv("presence").put(key(V2, "p", id), owner, natsRoot(now, id), 0);
+    }
+    await vi.waitFor(() => expect(port.resolve(OTHER_ROOT)?.route.live).toBe(true), { timeout: 10_000, interval: 50 });
+    expect(port.resolve(NATS_ROOT)?.route.live).toBe(true);
     const v2Connection = await openNatsConnection({ ...broker.runtimeOptions(broker.users.machineB), events: true, org: ORG, name: "v2-events" });
     closers.push(() => v2Connection.close());
     const publisher = await openNatsEventsPublisher(v2Connection, { org: ORG, provision: false, maxBytes: 4 * 1024 * 1024 });
@@ -115,8 +130,8 @@ describe.skipIf(!binary)("A' N4 republish on a real Path B broker", () => {
       return connection;
     };
     const counted: string[] = [];
-    const handle: NatsRepublishHandle | undefined = await startNatsRepublishLink(config, { store, port,
-      allow: [{ side: "nats", kind: "root", id: NATS_ROOT, machine: V2, republishTopics: ["fleet.work.*"] }],
+    const handle: NatsRepublishHandle | undefined = await startNatsRepublishLink(config, { store, port, gate,
+      views: { refresh: () => filePresence.refresh(), nats: () => port.presenceView(), file: () => filePresence.view() },
       signal: new AbortController().signal, log: () => undefined, connect, counters: { add: name => { counted.push(name); } } });
     expect(handle).toBeDefined();
     closers.push(() => handle!.stop());
@@ -128,9 +143,13 @@ describe.skipIf(!binary)("A' N4 republish on a real Path B broker", () => {
       data: { bridge: { from: "elsewhere", id: "x" } } });
     // The same message id again inside the dedupe window is a broker duplicate: one stream copy.
     await publisher.publish({ ...base, id: "v2-task-1", topic: "fleet.work.tasks", to: "factory", text: "task done", data: { task: 1 } });
+    // A live allow-listed root without fleet.work.* in its republishTopics: L3's gate refuses it.
+    await publisher.publish({ ...base, from: { id: OTHER_ROOT, name: "other", kind: "main" }, id: "v2-other-1",
+      topic: "fleet.work.tasks", to: "factory", text: "not mine to republish" });
     const crossed = () => store.read({ after: 0, topic: "fleet.work.tasks", limit: 100 });
-    await vi.waitFor(() => expect(counted).toEqual(expect.arrayContaining(["republish.accepted", "republish.refused"])),
+    await vi.waitFor(() => expect(counted.filter(name => name === "republish.refused")).toHaveLength(2),
       { timeout: 15_000, interval: 50 });
+    await vi.waitFor(() => expect(counted).toContain("republish.accepted"), { timeout: 15_000, interval: 50 });
     expect(crossed()).toHaveLength(1);
     expect(crossed()[0]).toMatchObject({ topic: "fleet.work.tasks", to: "factory", text: "task done",
       from: { id: `bridge:${LINK}`, name: "mesh-bridge", kind: "main" },
@@ -145,8 +164,10 @@ describe.skipIf(!binary)("A' N4 republish on a real Path B broker", () => {
     temps.push(dir);
     const store = new MeshStore(path.join(dir, "mesh"), 256 * 1024, 1_000);
     closers.push(async () => store.closeState());
+    const empty = () => ({ side: "file" as const, records: () => [] });
     await expect(startNatsRepublishLink(linkConfig(plain, dir), { store, port: { machine: BRIDGE, resolve: () => undefined },
-      allow: [], signal: AbortSignal.timeout(20_000), log: () => undefined }))
+      gate, views: { nats: () => ({ ...empty(), side: "nats" as const }), file: empty },
+      signal: AbortSignal.timeout(20_000), log: () => undefined }))
       .rejects.toMatchObject({ code: "FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING" });
     expect(JSON.parse(fs.readFileSync(natsRepublishStatePath(dir), "utf8"))).toMatchObject({ state: "refused",
       code: "FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING" });

@@ -9,16 +9,16 @@ import { JetStreamApiError } from "@nats-io/jetstream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   NATS_REPUBLISH_RATE,
-  natsRepublishAllowed,
   natsRepublishStatePath,
   runNatsRepublish,
   startNatsRepublishLink,
-  type NatsRepublishAllowEntry,
   type NatsRepublishRate,
+  type NatsRepublishViews,
 } from "../src/mesh/bridge-nats-republish.js";
 import { NATS_LINK_COUNTER_NAMES } from "../src/mesh/bridge-nats-counters.js";
 import type { NatsBridgeEventMessage, NatsBridgeEventSource } from "../src/mesh/bridge-nats-events.js";
-import type { BridgeNatsPortResolved } from "../src/mesh/bridge-nats-types.js";
+import { createBridgeNatsIdentityGate, parseBridgeNatsAllowSection } from "../src/mesh/bridge-nats-identity.js";
+import type { BridgeNatsPortResolved, BridgeNatsPresenceRecord } from "../src/mesh/bridge-nats-types.js";
 import type { MeshEvent, MeshPublishInput } from "../src/mesh/event-log.js";
 import type { NatsConnectionHandle } from "../src/transport/nats/connection.js";
 
@@ -84,24 +84,36 @@ const ledger = () => {
     markSeen: async (_direction: "toFile", id: string, receipt?: unknown) => { seen.set(id, receipt ?? true); } };
 };
 
-const ENTRIES: NatsRepublishAllowEntry[] = [
-  { side: "nats", kind: "root", id: LEAD, machine: V2, republishTopics: ["fleet.work.*"] },
-  { side: "nats", kind: "root", id: OTHER, machine: V2 },
-];
+// L3's real gate: the only sender and topic decision. LEAD may republish fleet.work.*; OTHER may not.
+const CLOCK = 1_000_000;
+const gate = createBridgeNatsIdentityGate(parseBridgeNatsAllowSection({ nats: [
+  { kind: "root", id: LEAD, machine: V2, republishTopics: ["fleet.work.*"] },
+  { kind: "root", id: OTHER, machine: V2 },
+] }, { link: LINK, natsMachine: BRIDGE }), { pins: { seats: new Map(), bound: new Map() }, clock: () => CLOCK });
+const natsRecord = (id: string, machine: string): BridgeNatsPresenceRecord => ({ id, name: "v2-lead", kind: "main", rootId: id,
+  sessionId: id.slice(8), ownerHostId: id, ownerIdentityId: id, ownerIncarnation: "inc", machine, live: true, observedAt: CLOCK });
+/** Presence as the port and the hub would read it now: the NATS root on `machineOf(id)`, a file native optionally. */
+const viewsFor = (machineOf: (id: string) => string | undefined, fileNative: string[] = []): NatsRepublishViews => ({
+  nats: () => ({ side: "nats", records: (id: string) => { const machine = machineOf(id); return machine ? [natsRecord(id, machine)] : []; } }),
+  file: () => ({ side: "file", records: (id: string) => fileNative.includes(id) ? [{ ...natsRecord(id, "x"), machine: undefined }] as never : [] }),
+});
+const onV2 = (id: string): string | undefined => id === LEAD || id === OTHER ? V2 : undefined;
 
 async function run(messages: FakeMessage[], options: { store?: FakeStore; ledger?: ReturnType<typeof ledger>;
-  rate?: NatsRepublishRate; topics?: string[]; resolve?: (id: string) => BridgeNatsPortResolved | undefined } = {}) {
+  rate?: NatsRepublishRate; topics?: string[]; machineOf?: (id: string) => string | undefined; fileNative?: string[] } = {}) {
   const store = options.store ?? new FakeStore();
   const counted: string[] = [];
+  const machineOf = options.machineOf ?? onV2;
   const leg = runNatsRepublish({
+    gate, views: viewsFor(machineOf, options.fileNative),
     counters: { add: name => {
       // L5's contract: an unknown counter name is a programming error.
       if (!(NATS_LINK_COUNTER_NAMES as readonly string[]).includes(name)) throw new Error(`unknown counter ${name}`);
       counted.push(name);
     } },
     link: LINK, org: ORG, machine: BRIDGE, store, source: new ScriptedEvents(messages),
-    resolve: options.resolve ?? (id => id === LEAD || id === OTHER ? resolved(id, V2) : undefined),
-    allow: natsRepublishAllowed(ENTRIES), ...(options.ledger ? { ledger: options.ledger } : {}),
+    resolve: id => { const machine = machineOf(id); return machine ? resolved(id, machine) : undefined; },
+    ...(options.ledger ? { ledger: options.ledger } : {}),
     ...(options.rate ? { rate: options.rate } : {}), ...(options.topics ? { topics: options.topics } : {}), now: () => 1_000,
   }, new AbortController().signal);
   await leg.done;
@@ -158,22 +170,38 @@ describe("N4 republish: v2 work topics into the hub file mesh", () => {
     const offMachine = eventMessage("fleet.work.a.2", {}, { msgId: "m-1" });
     const owner = eventMessage("ops.owner", { kind: "pr.wake" }, { msgId: "w-1" });
     const first = await run([unlisted], {});
-    const second = await run([offMachine], { resolve: id => id === LEAD ? resolved(LEAD, "machine-c") : undefined });
+    const second = await run([offMachine], { machineOf: id => id === LEAD ? "machine-c" : undefined });
     const third = await run([owner], { topics: ["ops.owner"] });
-    for (const [message, result] of [[unlisted, first], [offMachine, second], [owner, third]] as const) {
+    const both = eventMessage("fleet.work.a.3", {}, { msgId: "n-1" });
+    const fourth = await run([both], { fileNative: [LEAD] });
+    for (const [message, result] of [[unlisted, first], [offMachine, second], [owner, third], [both, fourth]] as const) {
       expect(result.store.inputs).toEqual([]);
       expect(message.calls).toEqual([expect.stringMatching(/^term:/)]);
     }
+    // L3's gate codes: not in republishTopics; not live on its pinned machine; native on both sides.
     expect(first.counters.refused).toEqual({ BRIDGE_NATS_TOPIC_NOT_ALLOWED: 1 });
-    expect(second.counters.refused).toEqual({ BRIDGE_NATS_TOPIC_NOT_ALLOWED: 1 });
+    expect(second.counters.refused).toEqual({ BRIDGE_NATS_SENDER_UNVERIFIED: 1 });
     expect(third.counters.refused).toEqual({ BRIDGE_NATS_NOT_A_WORK_TOPIC: 1 });
+    expect(fourth.counters.refused).toEqual({ BRIDGE_NATS_AMBIGUOUS: 1 });
+  });
+
+  it("retries (never refuses) while a side's presence is unknown", async () => {
+    const message = eventMessage("fleet.work.a.1", {}, { msgId: "u-1" });
+    const store = new FakeStore();
+    const leg = runNatsRepublish({ link: LINK, org: ORG, machine: BRIDGE, store, source: new ScriptedEvents([message]), gate,
+      resolve: id => resolved(id, V2), views: { ...viewsFor(onV2), nats: () => ({ side: "nats", records: () => {
+        throw Object.assign(new Error("not ready"), { code: "FABRIC_DIRECTORY_NOT_READY" });
+      } }) }, now: () => 1_000 }, new AbortController().signal);
+    await leg.done;
+    expect(store.inputs).toEqual([]);
+    expect(message.calls).toEqual([expect.stringMatching(/^nak:/)]);
   });
 
   it("never republishes what already crossed a bridge, or what claims one of this link's mirrors", async () => {
     const bridged = eventMessage("fleet.work.a.1", { data: { bridge: { from: "spoke", id: "x" } } }, { msgId: "b-1" });
     const mirror = eventMessage("fleet.work.a.2", {}, { msgId: "b-2" });
     const one = await run([bridged]);
-    const two = await run([mirror], { resolve: id => id === LEAD ? resolved(LEAD, BRIDGE) : undefined });
+    const two = await run([mirror], { machineOf: id => id === LEAD ? BRIDGE : undefined });
     expect(one.store.inputs).toEqual([]);
     expect(two.store.inputs).toEqual([]);
     expect(one.counters.refused).toEqual({ BRIDGE_NATS_BRIDGED_AGAIN: 1 });
@@ -195,15 +223,6 @@ describe("N4 republish: v2 work topics into the hub file mesh", () => {
     expect(c.calls).toEqual([expect.stringMatching(/^nak:/)]);
   });
 
-  it("matches republishTopics like L3's topic patterns: exact, or prefix.* below the prefix", () => {
-    const allow = natsRepublishAllowed([{ side: "nats", kind: "root", id: LEAD, machine: V2, republishTopics: ["fleet.work.tasks", "fleet.work.pi-fabric.*"] }]);
-    const sender = resolved(LEAD, V2);
-    expect(allow(sender, { topic: "fleet.work.tasks" })).toBe(true);
-    expect(allow(sender, { topic: "fleet.work.pi-fabric.7" })).toBe(true);
-    expect(allow(sender, { topic: "fleet.work.pi-fabric" })).toBe(false);
-    expect(allow(sender, { topic: "fleet.work.other.7" })).toBe(false);
-    expect(natsRepublishAllowed([{ side: "file", kind: "root", id: LEAD, republishTopics: ["fleet.work.*"] }])(sender, { topic: "fleet.work.tasks" })).toBe(false);
-  });
 });
 
 describe("N4 start: the consume grant, and nothing published into FABRIC_EV", () => {
@@ -257,7 +276,8 @@ describe("N4 start: the consume grant, and nothing published into FABRIC_EV", ()
   it("is off unless nats.events is set", async () => {
     const fake = fakeConnection();
     await expect(startNatsRepublishLink(config(stateDir(), false), { store: new FakeStore(), port: { machine: BRIDGE, resolve: () => undefined },
-      allow: ENTRIES, signal: new AbortController().signal, log: () => undefined, connect: async () => fake.connection })).resolves.toBeUndefined();
+      gate, views: viewsFor(onV2), signal: new AbortController().signal, log: () => undefined, connect: async () => fake.connection }))
+      .resolves.toBeUndefined();
   });
 
   it("consumes its own durable and republishes into the file mesh only; FABRIC_EV is never published to", async () => {
@@ -265,7 +285,7 @@ describe("N4 start: the consume grant, and nothing published into FABRIC_EV", ()
     const store = new FakeStore();
     const dir = stateDir();
     const handle = await startNatsRepublishLink(config(dir), { store, port: { machine: BRIDGE, resolve: id => id === LEAD ? resolved(LEAD, V2) : undefined },
-      allow: ENTRIES, signal: new AbortController().signal, log: () => undefined, connect: async () => fake.connection });
+      gate, views: viewsFor(onV2), signal: new AbortController().signal, log: () => undefined, connect: async () => fake.connection });
     expect([...fake.consumers.keys()]).toEqual(["bev_machine-a"]);
     const message = eventMessage("fleet.work.pi-fabric.15310", {}, { msgId: "s-1" });
     fake.push(message);
@@ -282,7 +302,7 @@ describe("N4 start: the consume grant, and nothing published into FABRIC_EV", ()
     const fake = fakeConnection({ refuse: true });
     const dir = stateDir();
     await expect(startNatsRepublishLink(config(dir), { store: new FakeStore(), port: { machine: BRIDGE, resolve: () => undefined },
-      allow: ENTRIES, signal: new AbortController().signal, log: () => undefined, connect: async () => fake.connection }))
+      gate, views: viewsFor(onV2), signal: new AbortController().signal, log: () => undefined, connect: async () => fake.connection }))
       .rejects.toMatchObject({ code: "FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING" });
     expect(JSON.parse(fs.readFileSync(natsRepublishStatePath(dir), "utf8"))).toMatchObject({ state: "refused",
       code: "FABRIC_BRIDGE_NATS_EVENTS_GRANT_MISSING", durable: "bev_machine-a" });
@@ -292,7 +312,7 @@ describe("N4 start: the consume grant, and nothing published into FABRIC_EV", ()
   it("needs the org to name the stream", async () => {
     const { org: _org, ...nats } = config(stateDir()).nats;
     await expect(startNatsRepublishLink({ link: LINK, stateDir: stateDir(), nats }, { store: new FakeStore(),
-      port: { machine: BRIDGE, resolve: () => undefined }, allow: ENTRIES, signal: new AbortController().signal, log: () => undefined }))
+      port: { machine: BRIDGE, resolve: () => undefined }, gate, views: viewsFor(onV2), signal: new AbortController().signal, log: () => undefined }))
       .rejects.toThrow(/nats.org/);
   });
 });

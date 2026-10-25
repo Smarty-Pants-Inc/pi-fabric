@@ -24,7 +24,7 @@ export const childMeshTransportEnvironment = (
   if (mesh.hostTransport !== undefined) child.PI_FABRIC_MESH_HOST_TRANSPORT = mesh.hostTransport;
   if (mesh.transport === "nats") {
     const { servers, credentials, machine, inboxLanes, operatorMachine, rollbackHoldUntil,
-      custodyStream, livenessStream, pathBMachines, tls, org, ephemeralInactiveSeconds, inboxMaxAgeMs } = mesh.nats;
+      custodyStream, livenessStream, pathBMachines, tls, org, ephemeralInactiveSeconds, inboxMaxAgeMs, inboxConsumerInactiveMs } = mesh.nats;
     child.PI_FABRIC_MESH_NATS = JSON.stringify({
       servers: servers === undefined ? undefined : typeof servers === "string" ? [servers] : [...servers],
       credentials, machine, inboxLanes: inboxLanes ?? 8, operatorMachine, rollbackHoldUntil,
@@ -34,6 +34,7 @@ export const childMeshTransportEnvironment = (
       ephemeralHost: true,
       ephemeralInactiveSeconds: ephemeralInactiveSeconds ?? 3_600,
       inboxMaxAgeMs: inboxMaxAgeMs ?? 7 * 24 * 60 * 60 * 1_000,
+      inboxConsumerInactiveMs: inboxConsumerInactiveMs ?? 7 * 24 * 60 * 60 * 1_000,
       events: mesh.nats.events === true ? true : undefined,
       tls: tls === undefined ? undefined : { ca: tls.ca, caFile: tls.caFile },
     });

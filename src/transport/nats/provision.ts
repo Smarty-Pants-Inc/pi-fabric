@@ -13,6 +13,8 @@ import {
   type StreamInfo,
 } from "@nats-io/jetstream";
 
+import { DEFAULT_INBOX_CONSUMER_INACTIVE_MS } from "./inbox-policy.js";
+
 const STREAM_NOT_FOUND = 10059;
 const STREAM_EXISTS = 10058;
 const CONSUMER_NOT_FOUND = 10014;
@@ -153,11 +155,16 @@ export interface TransportConsumerPolicy {
   readonly filterSubject: string;
   readonly description: string;
   readonly maxAckPending: number;
-  /** JetStream nanoseconds; omitted preserves the normal-host inactive_threshold: 0 policy. */
+  /** Positive JetStream nanoseconds; omitted defaults to 7 days. Low-level tests may use shorter bounds. */
   readonly inactiveThresholdNs?: number;
 }
 
 export const ensureTransportConsumer = async (api: ConsumerAPI, policy: TransportConsumerPolicy): Promise<ConsumerInfo> => {
+  const inactiveThresholdNs = policy.inactiveThresholdNs === undefined
+    ? nanos(DEFAULT_INBOX_CONSUMER_INACTIVE_MS) : policy.inactiveThresholdNs;
+  if (!Number.isSafeInteger(inactiveThresholdNs) || inactiveThresholdNs <= 0) {
+    throw new Error("NATS consumer inactiveThresholdNs must be a positive safe integer");
+  }
   const backoff = Array.from({ length: 5 }, () => nanos(30_000));
   let info: ConsumerInfo;
   try { info = await api.info(policy.stream, policy.durable); }
@@ -176,7 +183,7 @@ export const ensureTransportConsumer = async (api: ConsumerAPI, policy: Transpor
         backoff,
         max_ack_pending: policy.maxAckPending,
         max_waiting: 1,
-        inactive_threshold: policy.inactiveThresholdNs ?? 0,
+        inactive_threshold: inactiveThresholdNs,
       });
     } catch (createError) {
       // A concurrent opener may have won the create. Read it back only if the winner exists;
@@ -185,15 +192,28 @@ export const ensureTransportConsumer = async (api: ConsumerAPI, policy: Transpor
       catch { throw createError; }
     }
   }
-  const actual = info.config;
-  const inactiveThresholdMismatch = policy.inactiveThresholdNs === undefined
-    ? actual.inactive_threshold !== 0 && actual.inactive_threshold !== undefined
-    : actual.inactive_threshold !== policy.inactiveThresholdNs;
-  if (actual.durable_name !== policy.durable || actual.filter_subject !== policy.filterSubject || actual.filter_subjects?.length ||
-    actual.deliver_subject || actual.headers_only || actual.ack_policy !== AckPolicy.Explicit || actual.replay_policy !== ReplayPolicy.Instant ||
-    actual.max_waiting !== 1 || actual.deliver_policy !== DeliverPolicy.All || actual.ack_wait !== nanos(30_000) || actual.max_deliver !== 5 ||
-    actual.max_ack_pending !== policy.maxAckPending || inactiveThresholdMismatch ||
-    JSON.stringify(actual.backoff) !== JSON.stringify(backoff)) {
+  const assertNonThresholdFields = (candidate: ConsumerInfo): void => {
+    const actual = candidate.config;
+    if (actual.description !== policy.description) {
+      throw new Error(`NATS consumer configuration mismatch: ${policy.durable} (owner description)`);
+    }
+    if (actual.durable_name !== policy.durable || actual.filter_subject !== policy.filterSubject || actual.filter_subjects?.length ||
+      actual.deliver_subject || actual.headers_only || actual.ack_policy !== AckPolicy.Explicit || actual.replay_policy !== ReplayPolicy.Instant ||
+      actual.max_waiting !== 1 || actual.deliver_policy !== DeliverPolicy.All || actual.ack_wait !== nanos(30_000) || actual.max_deliver !== 5 ||
+      actual.max_ack_pending !== policy.maxAckPending || JSON.stringify(actual.backoff) !== JSON.stringify(backoff)) {
+      throw new Error(`NATS consumer configuration mismatch: ${policy.durable}`);
+    }
+  };
+  // Verify ownership and delivery policy BEFORE any mutation, including for concurrent-create winners.
+  assertNonThresholdFields(info);
+  if (info.config.inactive_threshold === 0 || info.config.inactive_threshold === undefined) {
+    // InactiveThreshold is editable. Patch only legacy unbounded consumers in place: never reset
+    // pending messages, ACK floors or delivery sequences by deleting/recreating the durable.
+    info = await api.update(policy.stream, policy.durable, { inactive_threshold: inactiveThresholdNs });
+    assertNonThresholdFields(info);
+  }
+  // A nonzero mismatch may be another host policy; refuse rather than silently change its lifetime.
+  if (info.config.inactive_threshold !== inactiveThresholdNs) {
     throw new Error(`NATS consumer configuration mismatch: ${policy.durable}`);
   }
   return info;

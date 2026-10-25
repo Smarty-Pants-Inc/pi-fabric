@@ -51,7 +51,7 @@ export type NatsConnectionOptions = NatsConnectionCredentials & NatsPermissionPo
   readonly role?: "agent" | "operator";
 };
 
-/** Bootstrap authority for admin provisioning only. Deliberately not exported from the package entry. */
+/** Explicit bootstrap authority for admin provisioning and stale-consumer reports. Not exported from the package entry. */
 export interface NatsBootstrapConnectionOptions extends NatsTransportSecurityOptions {
   readonly credentials: string;
 }
@@ -523,7 +523,7 @@ export const openNatsConnection = async (options: NatsConnectionOptions): Promis
   });
 };
 
-/** Separate bootstrap authority for `fabric-transport-admin provision` only; never used by the runtime. */
+/** Separate bootstrap authority for explicit `fabric-transport-admin provision` / `stale-consumers`; never used by the runtime. */
 export const openBootstrapNatsConnection = async (options: NatsBootstrapConnectionOptions): Promise<NatsConnectionHandle> => {
   options.signal?.throwIfAborted();
   refuseBypass(options);

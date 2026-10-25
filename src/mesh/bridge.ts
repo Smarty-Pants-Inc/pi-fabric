@@ -16,6 +16,7 @@ import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
 import { participantFilePresent, readParticipantFiles, withParticipantFileDirectoryCustody } from "../topology/participant-files.js";
 import { participantFromEntry } from "../topology/participant-directory.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshStateEntry, type MeshStore } from "./store.js";
+import { markSqliteBridgeProcess } from "./sqlite-holds.js";
 import { PresenceDropReasons, type PresenceDropCount } from "./presence-drop-reasons.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
@@ -874,6 +875,7 @@ export class StoreBridgeSide implements BridgeSide {
   ) {
     if (!validBridgeName(peer)) throw new Error(`Invalid bridge peer name: ${peer}`);
     assertBridgeStateBackend(store.root, store.stateBackend);
+    markSqliteBridgeProcess();
     // A skipped root's effects are deferred, not successful no-ops: CommitOutbox catches the
     // throw and retains the row for a later legitimate renewal/removal (or its superseding effect).
     const retainSkipped = (rootId?: string): void => {

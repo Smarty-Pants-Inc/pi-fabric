@@ -5,7 +5,7 @@
 // Deletes are RECORD ONLY: close/rollback never removes an entry, even from this fixture.
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
-import { KvParticipantDirectory, type ParticipantLeaseGate } from "../src/topology/participant-view.js";
+import { KvParticipantDirectory, PresenceOwnedElsewhereError, type ParticipantLeaseGate } from "../src/topology/participant-view.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import { KvConflictError, type FabricTransport, type TransportKv, type TransportKvEntry, type TransportKvEvent } from "../src/transport/types.js";
 
@@ -113,7 +113,7 @@ function fixture(hostId = ROOT) {
       lease: gate, identityId: "observer", rootId: "observer", ownerIncarnation: "observer-activation" });
     opened.push(value); value.start(); return value;
   };
-  return { presence, leases, view, observer, stale, lease, abort, lose: () => { live = false; } };
+  return { presence, leases, view, observer, stale, lease, abort, transport, gate, lose: () => { live = false; } };
 }
 async function ready(view: KvParticipantDirectory) {
   const signal = AbortSignal.timeout(1_000);
@@ -469,5 +469,204 @@ describe("durable resident actor presence succession", () => {
     expect(f.presence.mutations).toHaveLength(2);
     expect(f.presence.mutations[1]!.expected).toBe(f.presence.mutations[0]!.revision);
     expect(f.presence.deletes).toEqual([]);
+  });
+});
+
+// smarty-dev#15310 D3 (seat move): one NATS session root must not register on a second machine
+// while another machine still holds its live presence + lease. Before this, the second create
+// succeeded on its own machine key and left the id ambiguous and unroutable for every reader.
+describe("#15310 a live session root on another machine blocks a second registration", () => {
+  const OTHER = "machine-b", ELSEWHERE = "elsewhere-activation";
+  const otherKey = (kind: "p" | "h", id = ROOT) => `${OTHER}.${kind}.${token(id)}`;
+  /** The same session root, owned on machine-b; `lease: false` models a lapsed (crashed) owner. */
+  function elsewhere(f: ReturnType<typeof fixture>, options: { lease?: boolean; presence?: boolean; status?: string } = {}) {
+    const record = root(ELSEWHERE, { status: options.status ?? "idle", name: "other-machine-main" });
+    const presence = options.presence === false ? undefined : f.presence.seed(otherKey("p"), `${ROOT}#${ELSEWHERE}`, record);
+    const lease = options.lease === false ? undefined : f.leases.seed(otherKey("h"), `${ROOT}#${ELSEWHERE}`, hostLease(ELSEWHERE));
+    return { record, presence, lease };
+  }
+
+  it("refuses a fresh root create with a typed error and writes nothing", async () => {
+    const f = fixture(); f.lease(); const other = elsewhere(f);
+    const view = f.view();
+    const error: unknown = await view.publish(root()).then(() => undefined, (reason: unknown) => reason);
+    expect(error).toBeInstanceOf(PresenceOwnedElsewhereError);
+    expect(error).toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE", persisted: false, participantId: ROOT,
+      owners: [{ machine: OTHER, ownerHostId: ROOT, ownerIdentityId: ROOT, ownerIncarnation: ELSEWHERE, routable: true }] });
+    expect(f.presence.rows.has(pkey())).toBe(false);
+    expect(f.presence.mutations).toEqual([]);
+    expect(f.presence.rows.get(otherKey("p"))).toEqual(other.presence!);
+    // The live owner stays the one routable record for every reader.
+    expect(await liveRoute(f.observer())).toMatchObject({ machine: OTHER, live: true, ownerIncarnation: ELSEWHERE });
+    await view.close();
+    expect(f.presence.deletes).toEqual([]);
+  });
+
+  it("refuses prelaunch root admission the same way", async () => {
+    const f = fixture(); f.lease(); elsewhere(f);
+    await expect(f.view().publishBeforeLaunch(root())).rejects.toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE" });
+    expect(f.presence.mutations).toEqual([]);
+  });
+
+  it("refuses same-machine succession while another machine is live and leaves the predecessor intact", async () => {
+    const f = fixture(), previous = f.stale(); f.lease(); elsewhere(f);
+    await expect(f.view().publish(root())).rejects.toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE" });
+    expect(f.presence.rows.get(pkey())).toEqual(previous);
+    expect(f.presence.mutations).toEqual([]);
+    expect(f.presence.deletes).toEqual([]);
+  });
+
+  it("rechecks before the succession CAS when another machine goes live during the direct lease read", async () => {
+    const f = fixture(), previous = f.stale(); f.lease();
+    const view = f.view(); await ready(view);
+    expect(view.resolve(ROOT)).toMatchObject({ live: false, ownerIncarnation: OLD });
+    let raced = false;
+    f.leases.afterGet = async key => {
+      if (raced || key !== hkey()) return;
+      raced = true;
+      elsewhere(f);
+      // Wait for this view's own watches to deliver it: a watch event, not a timer.
+      const signal = AbortSignal.timeout(1_000);
+      while (!view.owners(ROOT).some(owner => owner.machine === OTHER && owner.live)) await view.whenChanged(ROOT, signal);
+    };
+    await expect(view.publish(root())).rejects.toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE" });
+    expect(raced, "the race must land after the succession's direct lease read").toBe(true);
+    expect(f.presence.rows.get(pkey())).toEqual(previous);
+    expect(f.presence.mutations).toEqual([]);
+  });
+
+  it.each([
+    ["a terminal record whose runtime still holds its lease", { status: "stopped" }],
+    ["a lease but no presence yet (a racing first registration)", { presence: false }],
+  ] as const)("refuses while another machine has %s", async (_label, options) => {
+    const f = fixture(); f.lease(); elsewhere(f, options);
+    await expect(f.view().publish(root())).rejects.toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE",
+      owners: [{ machine: OTHER, ownerHostId: ROOT, ownerIncarnation: ELSEWHERE, routable: false }] });
+    expect(f.presence.mutations).toEqual([]);
+  });
+
+  it("lets at most one of two machines register when their first registrations race", async () => {
+    const f = fixture(); f.lease(); elsewhere(f, { presence: false });
+    // Each racer wrote its own lease first; both views have seen both leases.
+    const mine = f.view();
+    const theirs = new KvParticipantDirectory({ transport: { ...f.transport, self: { machine: OTHER, hostId: ROOT } }, lease: f.gate,
+      identityId: ROOT, rootId: ROOT, ownerIncarnation: ELSEWHERE, operationTimeoutMs: 1_000 });
+    opened.push(theirs); theirs.start();
+    const results = await Promise.allSettled([mine.publish(root()), theirs.publish(root(ELSEWHERE))]);
+    expect(results.filter(result => result.status === "fulfilled").length).toBeLessThanOrEqual(1);
+    for (const result of results) if (result.status === "rejected") expect(result.reason).toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE" });
+    expect(f.presence.mutations.length).toBeLessThanOrEqual(1);
+  });
+
+  it("refuses a root registration until this view has observed its own owner lease", async () => {
+    const f = fixture(); const view = f.view(); await ready(view);
+    // The lease exists in KV, but this view's watch has not delivered it: an unordered read.
+    const value = hostLease(NEXT);
+    f.leases.rows.set(hkey(), { key: hkey(), machine: MACHINE, owner: `${ROOT}#${NEXT}`, value, revision: 99 });
+    await expect(view.publish(root())).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+    expect(f.presence.mutations).toEqual([]);
+  });
+
+  it("after a re-created owner lease, refuses the owned root if another machine registered during the gap", async () => {
+    const f = fixture(); f.lease(); const view = f.view();
+    await view.publish(root());
+    // Our lease expired; meanwhile machine-b registered (its check saw no lease here); then ours was re-created.
+    elsewhere(f);
+    const recreated = f.lease();
+    await expect(view.confirmSoleRoot(root(), recreated.revision)).rejects.toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE",
+      owners: [{ machine: OTHER, routable: true }] });
+    expect(f.presence.deletes).toEqual([]);
+  });
+
+  it("after a re-created owner lease, keeps the owned root when no other machine holds it, waiting for that revision", async () => {
+    const f = fixture(); const first = f.lease(); const view = f.view();
+    await view.publish(root());
+    const pending = view.confirmSoleRoot(root(), first.revision + 1);
+    let settled = false; void pending.finally(() => { settled = true; });
+    await ready(view); await Promise.resolve();
+    expect(settled, "must wait until this view observes the re-created revision").toBe(false);
+    f.lease();
+    await expect(pending).resolves.toBeUndefined();
+  });
+
+  it("routes nothing to a re-created lease awaiting its root re-check, yet it still holds the root against others", async () => {
+    const f = fixture(); f.lease();
+    const flagged = f.leases.seed(otherKey("h"), `${ROOT}#${ELSEWHERE}`, { ...hostLease(ELSEWHERE), rootRecheck: true });
+    f.presence.seed(otherKey("p"), `${ROOT}#${ELSEWHERE}`, root(ELSEWHERE));
+    const observer = f.observer(); await ready(observer);
+    expect(observer.owners(ROOT)).toMatchObject([{ machine: OTHER, live: false, lease: { revision: flagged.revision } }]);
+    expect(observer.resolve(ROOT)).toMatchObject({ live: false });
+    await expect(f.view().publish(root())).rejects.toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE",
+      owners: [{ machine: OTHER, routable: false }] });
+    expect(f.presence.mutations).toEqual([]);
+    // Cleared by its owner's next write: routable again.
+    f.leases.seed(otherKey("h"), `${ROOT}#${ELSEWHERE}`, hostLease(ELSEWHERE));
+    expect(await liveRoute(observer)).toMatchObject({ machine: OTHER, live: true });
+  });
+
+  it("allows registration when the other machine's lease has lapsed (crashed owner)", async () => {
+    const f = fixture(); f.lease(); elsewhere(f, { lease: false });
+    const view = f.view();
+    const receipt = await view.publish(root());
+    expect(f.presence.rows.get(pkey())).toMatchObject({ revision: receipt.revision, value: root() });
+    expect(view.owners(ROOT).map(owner => [owner.machine, owner.live])).toEqual([["machine-a", true], [OTHER, false]]);
+    // Unchanged backstop: two machines' rows for one id stay ambiguous for routing until the
+    // lapsed row expires (presence TTL 600 s) or is withdrawn.
+    expect(view.resolve(ROOT)).toBeUndefined();
+  });
+
+  it("keeps same-machine succession when the other machine's record has lapsed", async () => {
+    const f = fixture(), previous = f.stale(); f.lease(); elsewhere(f, { lease: false });
+    const receipt = await f.view().publish(root());
+    expect(f.presence.mutations).toEqual([{ key: pkey(), expected: previous.revision, revision: receipt.revision }]);
+    expect(f.presence.rows.get(pkey())?.value).toEqual(root());
+  });
+
+  it("fails closed with a typed not-ready error when the presence view never becomes ready", async () => {
+    const presence = new RecordOnlyKv(600_000), leases = new RecordOnlyKv(15_000);
+    // A watch that never delivers its snapshot: this view cannot know who else is live.
+    presence.watch = async function* <V>(_prefix: string, signal: AbortSignal): AsyncIterable<TransportKvEvent<V>> {
+      await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
+    };
+    const gate: ParticipantLeaseGate = { live: () => true, signal: new AbortController().signal };
+    const transport: FabricTransport = { kind: "nats", self: { machine: MACHINE, hostId: ROOT },
+      kv: bucket => bucket === "presence" ? presence : leases,
+      async send() { throw new Error("KV-only seam must not send"); }, async *inbox() { throw new Error("KV-only seam must not receive"); },
+      async drainState() { return { pending: 0, ackPending: 0 }; }, async close() {} };
+    const view = new KvParticipantDirectory({ transport, lease: gate, identityId: ROOT, rootId: ROOT,
+      ownerIncarnation: NEXT, operationTimeoutMs: 50 });
+    opened.push(view); view.start();
+    await expect(view.publish(root())).rejects.toMatchObject({ code: "FABRIC_DIRECTORY_NOT_READY" });
+    await expect(view.publishBeforeLaunch(root())).rejects.toMatchObject({ code: "FABRIC_DIRECTORY_NOT_READY" });
+    expect(presence.mutations).toEqual([]);
+  });
+
+  it("does not fence child agents or a refresh of a root this view already owns", async () => {
+    const f = fixture(); f.lease(); const view = f.view();
+    await view.publish(root());
+    elsewhere(f);
+    await ready(view);
+    // A refresh is not a registration; routing already refuses the ambiguous id.
+    await expect(view.publish(root(NEXT, { name: "changed-local-name" }))).resolves.toMatchObject({ key: pkey() });
+    const child = root(NEXT, { id: "child:shared", kind: "agent", parentId: ROOT });
+    f.presence.seed(otherKey("p", child.id), `${ROOT}#${ELSEWHERE}`, { ...child, ownerIncarnation: ELSEWHERE });
+    await expect(view.publishBeforeLaunch(child)).resolves.toMatchObject({ key: pkey(child.id) });
+  });
+
+  it("owners() reports every machine's row with its lease for read-only receipts", async () => {
+    const f = fixture(); f.lease(); const view = f.view();
+    const mine = await view.publish(root());
+    const other = elsewhere(f);
+    const signal = AbortSignal.timeout(1_000);
+    while (view.owners(ROOT).length < 2 || !view.owners(ROOT)[1]!.live) await view.whenChanged(ROOT, signal);
+    expect(view.owners(ROOT)).toEqual([
+      { machine: "machine-a", ownerHostId: ROOT, ownerIdentityId: ROOT, ownerIncarnation: NEXT, capabilities: ["steer", "followUp"],
+        live: true, kind: "root", status: "idle", rootId: ROOT, sessionId: SESSION, updatedAt: 2_100, presenceRevision: mine.revision,
+        lease: { revision: f.leases.rows.get(hkey())!.revision, incarnation: NEXT, updatedAt: 2_000, expiresAt: 17_000 } },
+      { machine: OTHER, ownerHostId: ROOT, ownerIdentityId: ROOT, ownerIncarnation: ELSEWHERE, capabilities: ["steer", "followUp"],
+        live: true, kind: "root", status: "idle", rootId: ROOT, sessionId: SESSION, updatedAt: 2_100, presenceRevision: other.presence!.revision,
+        lease: { revision: other.lease!.revision, incarnation: ELSEWHERE, updatedAt: 2_000, expiresAt: 17_000 } },
+    ]);
+    expect(view.resolve(ROOT)).toBeUndefined();
   });
 });

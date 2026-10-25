@@ -19,7 +19,22 @@ const commands: Record<string, () => Promise<FabricCliCommand>> = {
   // The NATS link CLI, also as bin/nats-link; images that link only pi-fabric reach `nats-link roots` here.
   "nats-link": async () => (await import("../mesh-bridge-nats-cli.js")).main,
   events: async () => runEventsCli,
+  session: async () => runSessionCli,
 };
+
+const SESSION_USAGE = "Usage: pi-fabric session pending <session-uuid | session:uuid> [--mesh <meshRoot>] [--json]";
+
+/** `pi-fabric session pending`: read-only recorded pending-state inventory for one Main session. */
+async function runSessionCli(argv: string[]): Promise<number> {
+  const [name, ...rest] = argv;
+  if (name === "pending") return (await import("./session-pending.js")).runSessionPendingCli(rest);
+  if (name === "--help" || name === "-h" || name === "help") {
+    process.stdout.write(`${SESSION_USAGE}\n`);
+    return 0;
+  }
+  process.stderr.write(`pi-fabric session: unknown subcommand ${JSON.stringify(name ?? "")}\n${SESSION_USAGE}\n`);
+  return 2;
+}
 
 const usage = (): string => [
   "Usage: pi-fabric <command> [options]",

@@ -17,7 +17,8 @@ import { openFabricTransport } from "../src/transport/index.js";
 import { NatsKvStore } from "../src/transport/nats/kv.js";
 import { runTransportAdmin } from "../src/transport/nats/admin.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
-import { readHostLease } from "../src/topology/host-leases.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { readHostLease, TransportHostLease } from "../src/topology/host-leases.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import type { FabricTransport, TransportKv, TransportKvEntry } from "../src/transport/types.js";
@@ -314,6 +315,235 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
       await inspector?.close(); vi.unstubAllEnvs();
     }
   }, 60_000);
+
+  // smarty-dev#15310 D3: a seat move must not leave one session registered on two machines.
+  // Each Main has its own project/mesh root, as on two hosts; only the broker is shared.
+  it("refuses a second machine's Main for a session that is live on another machine, then admits it after that lease lapses", async () => {
+    for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
+    vi.stubEnv("SMARTY_AGENT", undefined);
+    const rootA = fs.mkdtempSync(path.join(os.tmpdir(), "presence-seat-a-"));
+    const rootB = fs.mkdtempSync(path.join(os.tmpdir(), "presence-seat-b-"));
+    const sessionId = "15310aaa-bbbb-4000-8000-000000000001", id = `session:${sessionId}`;
+    const at = (root: string) => { vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent")); vi.stubEnv("PI_FABRIC_PROJECT_ROOT", root); };
+    const owner = main(rootA, sessionId, "seat-owner");
+    const moved = main(rootB, sessionId, "seat-owner");
+    const sender = main(rootB, "15310bbb-bbbb-4000-8000-000000000002", "seat-sender");
+    let inspector: FabricTransport | undefined;
+    try {
+      inspector = await openFabricTransport({ config: configFor(rootA, "machine-a").mesh, hostId: "seat-inspector",
+        mesh: new MeshStore(path.join(rootA, "inspector"), 65_536, 1_000) });
+      at(rootA);
+      await owner.runtime.initialize(owner.context, configFor(rootA, "machine-a"));
+      at(rootB);
+      await sender.runtime.initialize(sender.context, configFor(rootB, "machine-b"));
+      await vi.waitFor(() => expect(sender.runtime.participantInfos().find(row => row.id === id)).toMatchObject({ stale: false, machine: "machine-a" }), { timeout: 3_000 });
+      const before = await inspector.kv("presence").get<FabricParticipantRecord>(key("machine-a", "p", id));
+      expect(before?.value).toMatchObject({ id, kind: "root", sessionId });
+      const refused: unknown = await moved.runtime.initialize(moved.context, configFor(rootB, "machine-b")).then(() => undefined, (error: unknown) => error);
+      expect(refused).toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE", participantId: id,
+        owners: [{ machine: "machine-a", ownerIncarnation: before!.value.ownerIncarnation, routable: true }] });
+      expect(moved.runtime.initialized).toBe(false);
+      expect(await inspector.kv("presence").get(key("machine-b", "p", id)), "nothing registered on machine-b").toBeUndefined();
+      expect(await inspector.kv("presence").get(key("machine-a", "p", id))).toEqual(before);
+      // The live owner stays the only route: a real followUp reaches it, not the refused Main.
+      await expect(sender.invoke("agents.followUp", { id, message: "SEAT_OWNER_STILL_ROUTABLE" })).resolves.toMatchObject({ acknowledged: true });
+      await vi.waitFor(() => expect(JSON.stringify(owner.messages)).toContain("SEAT_OWNER_STILL_ROUTABLE"), { timeout: 3_000 });
+      expect(moved.messages).toEqual([]);
+      // Counterexample: once the old owner stopped and its broker lease expired, the move registers.
+      // Fixture deletes are record-only, so the refused Main's own machine-b lease must expire too.
+      const expiries = [key("machine-a", "h", id), key("machine-b", "h", id)].map(leaseKey => armLeaseGone(inspector!.kv("leases"), leaseKey));
+      await Promise.all(expiries.map(expiry => expiry.ready));
+      await moved.runtime.shutdown("exit");
+      await owner.runtime.shutdown("exit");
+      await Promise.all(expiries.map(expiry => expiry.gone));
+      const resumed = main(rootB, sessionId, "seat-owner");
+      try {
+        at(rootB);
+        await resumed.runtime.initialize(resumed.context, configFor(rootB, "machine-b"));
+        const registered = await inspector.kv("presence").get<FabricParticipantRecord>(key("machine-b", "p", id));
+        expect(registered?.value).toMatchObject({ id, kind: "root", sessionId });
+        expect(registered!.value.ownerIncarnation).not.toBe(before!.value.ownerIncarnation);
+      } finally { await resumed.runtime.shutdown("exit"); }
+    } finally {
+      await Promise.allSettled([sender.runtime.shutdown("exit"), moved.runtime.shutdown("exit"), owner.runtime.shutdown("exit")]);
+      await inspector?.close(); vi.unstubAllEnvs();
+    }
+  }, 60_000);
+
+  // smarty-dev#15310 G1: a live Main whose lease expires in the broker (renewals stalled) must not
+  // come back next to a Main that registered the session on another machine during the gap.
+  it("yields a root whose lease was re-created after expiring while another machine registered it", async () => {
+    for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
+    vi.stubEnv("SMARTY_AGENT", undefined);
+    const rootA = fs.mkdtempSync(path.join(os.tmpdir(), "presence-gap-a-"));
+    const rootB = fs.mkdtempSync(path.join(os.tmpdir(), "presence-gap-b-"));
+    const sessionId = "15310ddd-bbbb-4000-8000-000000000004", id = `session:${sessionId}`;
+    const at = (root: string) => { vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent")); vi.stubEnv("PI_FABRIC_PROJECT_ROOT", root); };
+    const leaseA = key("machine-a", "h", id), leaseB = key("machine-b", "h", id);
+    // Stall only machine-a's renewals for this session until released; then run them normally.
+    let release!: () => void;
+    const stalled = new Promise<void>(resolve => { release = resolve; });
+    let stalledCalls = 0;
+    const rawRenew = TransportHostLease.prototype.renew;
+    vi.spyOn(TransportHostLease.prototype, "renew").mockImplementation(function (this: TransportHostLease, signal?: AbortSignal) {
+      if (this.key !== leaseA) return rawRenew.call(this, signal);
+      stalledCalls++;
+      return stalled.then(() => rawRenew.call(this, AbortSignal.timeout(5_000)));
+    });
+    const owner = main(rootA, sessionId, "gap-owner"), taker = main(rootB, sessionId, "gap-owner");
+    let inspector: FabricTransport | undefined;
+    try {
+      inspector = await openFabricTransport({ config: configFor(rootB, "machine-b").mesh, hostId: "gap-inspector",
+        mesh: new MeshStore(path.join(rootB, "inspector"), 65_536, 1_000) });
+      const expiredA = armLeaseGone(inspector.kv("leases"), leaseA);
+      await expiredA.ready;
+      at(rootA);
+      await owner.runtime.initialize(owner.context, configFor(rootA, "machine-a"));
+      await expiredA.gone; // A's renewals are stalled: the broker expires its lease.
+      expect(stalledCalls).toBeGreaterThan(0);
+      at(rootB);
+      await taker.runtime.initialize(taker.context, configFor(rootB, "machine-b")); // A's lease is gone: B may register.
+      expect(await inspector.kv("presence").get(key("machine-b", "p", id))).toBeDefined();
+      // A's renewal now runs: it re-creates A's lease, re-checks, sees B, and yields for good.
+      // Watch from the live tail: the snapshot's expiry marker for the first lapse is not this one.
+      const stop = new AbortController();
+      let recreatedAt = 0, renewedAfter = 0;
+      const yieldedA = (async () => {
+        let live = false;
+        for await (const event of inspector!.kv("leases").watch(">", AbortSignal.any([stop.signal, AbortSignal.timeout(40_000)]))) {
+          if (event.type === "ready") { live = true; release(); continue; }
+          if (!live) continue;
+          if (event.type === "put" && event.entry.key === leaseA) { if (recreatedAt) renewedAfter++; else recreatedAt = performance.now(); }
+          if (event.type === "gone" && event.key === leaseA && recreatedAt) { expect(event.reason).toBe("expired"); return performance.now() - recreatedAt; }
+        }
+        throw new Error("machine-a's re-created lease never expired");
+      })();
+      try {
+        expect(await yieldedA, "a yielded runtime never renews its re-created lease").toBeGreaterThan(10_000);
+      } finally { stop.abort(); }
+      expect(renewedAfter).toBe(0);
+      expect(await inspector.kv("leases").get(leaseB), "the rightful machine-b owner keeps its lease").toBeDefined();
+    } finally {
+      release();
+      await Promise.allSettled([owner.runtime.shutdown("exit"), taker.runtime.shutdown("exit")]);
+      await inspector?.close(); vi.unstubAllEnvs();
+    }
+  }, 75_000);
+
+  // smarty-dev#15310 G1 (re-review): until the re-created lease's root re-check passes, no refresh
+  // path may publish presence, even though the lease itself is live again.
+  it("publishes no presence between a lease re-creation and its root re-check, then yields to the other machine", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "presence-recheck-"));
+    const id = `session:presence-recheck-${Date.now()}`;
+    const identity = { id, name: "recheck-owner", kind: "main" as const, sessionId: id.slice(8) };
+    const leaseA = key("machine-a", "h", id), presenceA = key("machine-a", "p", id);
+    let releaseRenew!: () => void, releaseCheck!: () => void, entered!: () => void;
+    const renewStalled = new Promise<void>(resolve => { releaseRenew = resolve; });
+    const checkHeld = new Promise<void>(resolve => { releaseCheck = resolve; });
+    const checkEntered = new Promise<void>(resolve => { entered = resolve; });
+    const rawRenew = TransportHostLease.prototype.renew;
+    vi.spyOn(TransportHostLease.prototype, "renew").mockImplementation(function (this: TransportHostLease, signal?: AbortSignal) {
+      return this.key === leaseA ? renewStalled.then(() => rawRenew.call(this, AbortSignal.timeout(5_000))) : rawRenew.call(this, signal);
+    });
+    const rawConfirm = KvParticipantDirectory.prototype.confirmSoleRoot;
+    vi.spyOn(KvParticipantDirectory.prototype, "confirmSoleRoot").mockImplementation(async function (this: KvParticipantDirectory, record, revision) {
+      entered(); await checkHeld; return rawConfirm.call(this, record, revision);
+    });
+    let holding = false;
+    const heldPresencePuts: string[] = [];
+    const hooks = installKvHooks(call => { if (holding && call.key === presenceA) heldPresencePuts.push(call.key); });
+    const transportA = await openFabricTransport({ config: configFor(root, "machine-a").mesh, hostId: id,
+      mesh: new MeshStore(path.join(root, "mesh-a"), 65_536, 1_000) });
+    const transportB = await openFabricTransport({ config: configFor(root, "machine-b").mesh, hostId: id,
+      mesh: new MeshStore(path.join(root, "mesh-b"), 65_536, 1_000) });
+    const stateDir = path.join(root, "transport-a"); fs.mkdirSync(stateDir, { mode: 0o700 });
+    const directory = new ParticipantDirectory(new MeshStore(path.join(root, "mesh-a"), 65_536, 1_000), {
+      enabled: true, transport: transportA, transportStateDir: stateDir, hostId: id, rootId: id, identity });
+    let name = "recheck-owner";
+    directory.registerSource(() => [{ ...participant(id, "source", name, Date.now()), sessionId: identity.sessionId }]);
+    // A remote reader on machine-b (its own authenticated user), as any sender would route.
+    const observerTransport = await openFabricTransport({ config: configFor(root, "machine-b").mesh, hostId: "recheck-observer",
+      mesh: new MeshStore(path.join(root, "mesh-observer"), 65_536, 1_000) });
+    const observer = new KvParticipantDirectory({ transport: observerTransport, lease: { live: () => true, signal: new AbortController().signal },
+      identityId: "recheck-observer", rootId: "recheck-observer", ownerIncarnation: "observer" });
+    try {
+      observer.start();
+      await directory.start();
+      expect((await transportA.kv("presence").get(presenceA))?.value).toMatchObject({ id, kind: "root" });
+      const expired = armLeaseGone(transportB.kv("leases"), leaseA);
+      await expired.ready;
+      await expired.gone; // machine-a's renewals are stalled until the broker expires its lease
+      // machine-b registers the session in that gap (its own fresh check would see no machine-a lease).
+      const now = Date.now();
+      await transportB.kv("leases").put(key("machine-b", "h", id), `${id}#taker`, hostLease(id, "taker", now), 0);
+      await transportB.kv("presence").put(key("machine-b", "p", id), `${id}#taker`, participant(id, "taker", "taker", now), 0);
+      releaseRenew();
+      await checkEntered; // machine-a re-created its lease and now awaits the root re-check
+      const recreated = await transportA.kv("leases").get<FabricKvHostLease>(leaseA);
+      expect(recreated?.value).toMatchObject({ rootRecheck: true });
+      // To the remote reader, machine-a's retained row is NOT live beside machine-b's during the check.
+      await vi.waitFor(() => expect(observer.owners(id).find(row => row.machine === "machine-a")?.lease?.revision).toBe(recreated!.revision), { timeout: 5_000 });
+      expect(observer.owners(id).map(row => [row.machine, row.live])).toEqual([["machine-a", false], ["machine-b", true]]);
+      holding = true;
+      name = "changed-while-recheck-pending";
+      directory.scheduleRefresh();
+      await expect(directory.refreshPresence()).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+      expect(directory.canConsumeMesh()).toBe(false);
+      expect(directory.heartbeatArmed, "still recovering, not yet yielded").toBe(true);
+      await new Promise(resolve => setTimeout(resolve, 1_500)); // let a scheduled change refresh fire, if one could
+      expect(heldPresencePuts, "no presence write while the root re-check is pending").toEqual([]);
+      holding = false;
+      releaseCheck();
+      // The re-check sees machine-b: machine-a yields for good (no heartbeat, no view, no admission).
+      await vi.waitFor(() => expect(directory.heartbeatArmed).toBe(false), { timeout: 10_000 });
+      expect((directory.participantView as KvParticipantDirectory | undefined)?.ready).toBe(false);
+      expect(directory.canConsumeMesh()).toBe(false);
+      expect(hooks.puts.filter(call => call.key === key("machine-b", "p", id))).toHaveLength(1);
+      // Yielding withdrew machine-a's row (fixture deletes are record-only) and never wrote it live again.
+      expect(deletes.some(item => item.key === presenceA)).toBe(true);
+      expect(observer.owners(id).find(row => row.machine === "machine-a")?.live).toBe(false);
+    } finally {
+      releaseRenew(); releaseCheck();
+      await directory.close().catch(() => undefined);
+      await observer.close().catch(() => undefined);
+      await Promise.allSettled([transportA.close(), transportB.close(), observerTransport.close()]);
+    }
+  }, 60_000);
+
+  // The carrier, on the real broker, with each machine's real authenticated user: both write their
+  // own host lease and register at once, as two hosts starting one session would. (Two full
+  // runtimes in one process would share the agent-dir lease receipt, which two hosts never do.)
+  it("lets at most one of two machines register a session when their first registrations race", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "presence-race-"));
+    const opened: FabricTransport[] = [], views: KvParticipantDirectory[] = [];
+    const gate = { live: () => true, signal: new AbortController().signal };
+    try {
+      for (let round = 0; round < 4; round++) {
+        const id = `session:presence-race-${round}-${Date.now()}`;
+        const results = await Promise.allSettled((["machine-a", "machine-b"] as const).map(async machine => {
+          const transport = await openFabricTransport({ config: configFor(root, machine).mesh, hostId: id,
+            mesh: new MeshStore(path.join(root, `${machine}-${round}`), 65_536, 1_000) });
+          opened.push(transport);
+          const incarnation = `${machine}-activation`;
+          await transport.kv("leases").put(key(machine, "h", id), `${id}#${incarnation}`, hostLease(id, incarnation, Date.now()), 0);
+          const view = new KvParticipantDirectory({ transport, lease: gate, identityId: id, rootId: id,
+            ownerIncarnation: incarnation, operationTimeoutMs: 10_000 });
+          views.push(view); view.start();
+          await directoryReady(view, id);
+          return view.publish(participant(id, incarnation, `racer-${machine}`, Date.now()));
+        }));
+        const won = results.filter(result => result.status === "fulfilled").length;
+        expect(won, JSON.stringify(results.map(result => result.status === "rejected" ? (result.reason as { code?: unknown }).code : "ok")))
+          .toBeLessThanOrEqual(1);
+        for (const result of results) if (result.status === "rejected") expect(result.reason).toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE" });
+        const rows = await Promise.all(["machine-a", "machine-b"].map(machine => opened[0]!.kv("presence").get(key(machine, "p", id))));
+        expect(rows.filter(Boolean)).toHaveLength(won);
+      }
+    } finally {
+      await Promise.allSettled(views.map(view => view.close()));
+      await Promise.allSettled(opened.map(transport => transport.close()));
+    }
+  }, 40_000);
 
   it("real broker CAS admits exactly one concurrent own-root resumer and leaves the winner live", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "presence-broker-cas-"));

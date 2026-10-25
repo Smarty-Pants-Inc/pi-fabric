@@ -97,6 +97,7 @@ import { pinImportRoot, type OwnedImportFiles, type RefusalCleanupReport } from 
 import { decodeMeshStateFile, encodeMeshStateFile, StateFile, type MeshStateEntry, type MeshStateFile } from "./state-file.js";
 import { filesystemRefusal, MeshStateUnsupportedError, openNodeSqlite, validateMeshStateKey, type SqliteConnection,
   type SqliteOpener, type SqliteRow } from "./state-sqlite.js";
+import { recordSqliteHolds } from "./sqlite-holds.js";
 import { assertPrivateStateRoot, createStateRoot, openPrivateStateDb } from "./state-gate.js";
 
 // The writer fence lives in a leaf module (state-file.ts calls it; this module imports state-file.ts).
@@ -446,6 +447,7 @@ class FenceDb {
       }
       throw error;
     }
+    db = recordSqliteHolds(db, root, "migration:transaction");
     try {
       db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(options.busyTimeoutMs ?? DEFAULT_BUSY_MS))}`);
       db.exec("PRAGMA trusted_schema = OFF");

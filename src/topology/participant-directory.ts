@@ -59,7 +59,7 @@ import {
 } from "./host-leases.js";
 import { HostLeaseLockBusyError, withHostLeaseLock } from "./host-lease-lock.js";
 import type { TransportHostLease } from "./host-leases.js";
-import type { KvParticipantDirectory, ParticipantView } from "./participant-view.js";
+import type { KvParticipantDirectory, ParticipantLeaseGate, ParticipantView } from "./participant-view.js";
 import type { NatsLocalProjection, NatsLocalProjectionMetrics } from "./nats-local-projection.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
@@ -759,6 +759,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #confirmedReconnectGeneration = 0;
   #natsConfirmedAt = 0;
   #transportRecovering = false;
+  /** The owner lease was re-created after expiring in KV; its root must be re-checked (confirmSoleRoot). */
+  #rootRecheckPending = false;
   #transportLost = false;
   readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh")
     .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.options.identity })));
@@ -943,7 +945,28 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const lease = this.#transportLease;
     if (!lease || this.#closed || this.#transportLost) return Promise.resolve();
     if (this.#transportRenewing) return this.#transportRenewing;
-    const work = Promise.resolve().then(() => lease.renew(AbortSignal.timeout(5_000))).then(() => {
+    const work = Promise.resolve().then(() => lease.renew(AbortSignal.timeout(5_000))).then(async () => {
+      // smarty-dev#15310: a lease that expired in KV and was created again may have let another
+      // machine register this root meanwhile. Re-check before admission resumes; yield if so.
+      if (lease.takeRecreated() || lease.rootRecheck) this.#rootRecheckPending = true;
+      if (this.#rootRecheckPending && lease.live()) {
+        const root = this.#natsPublished.get(this.options.rootId);
+        const view = this.#participantView;
+        if (root?.kind === "root" && view) {
+          try { await view.confirmSoleRoot(root, lease.revision); }
+          catch (error) {
+            if ((error as { code?: unknown } | null)?.code === "FABRIC_PRESENCE_OWNED_ELSEWHERE") {
+              this.#transportRecovering = false;
+              this.#transportLostNow(error);
+            }
+            throw error; // Otherwise admission stays suspended; the next renewal checks again.
+          }
+        }
+        this.#rootRecheckPending = false;
+        // The re-created lease was written with rootRecheck (routes nothing); write it routable again.
+        lease.clearRootRecheck();
+        await lease.renew(AbortSignal.timeout(5_000));
+      }
       if (this.#transportRecovering && lease.live()) {
         this.#transportRecovering = false;
         this.#refreshError = undefined;
@@ -1218,8 +1241,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
           this.#routingError = error;
         });
       });
+      // Presence writes stay closed while the lease recovers, including after a re-created lease
+      // until its root re-check (confirmSoleRoot) passes: a live lease alone is not enough there.
+      const gate: ParticipantLeaseGate = {
+        live: () => lease.live() && !this.#transportRecovering,
+        recovering: () => lease.recovering() || this.#transportRecovering,
+        get signal() { return lease.signal; },
+      };
       this.#participantView = new KvParticipantDirectory({
-        transport, lease, identityId: this.options.identity.id,
+        transport, lease: gate, identityId: this.options.identity.id,
         ownerIncarnation: this.ownerIncarnation, rootId: this.options.rootId,
         onError: error => { this.#refreshError = error; this.#routingError = error; },
       });
@@ -2816,14 +2846,17 @@ export class ParticipantDirectory implements FabricParticipantSource {
   async #refreshNats(full: boolean): Promise<void> {
     if (this.#closed) return;
     const lease = this.#transportLease, view = this.#natsView();
-    if (!lease?.live() || this.#transportLost) throw new TransportUnavailableError("NATS host lease is not live");
+    if (!lease?.live() || this.#transportLost || this.#transportRecovering) throw new TransportUnavailableError("NATS host lease is not live");
     if (this.#refreshing) {
       await this.#refreshing;
       return this.#refreshNats(full);
     }
     if (!full) this.#changeRefreshAt = Date.now();
+    // Recovering includes a re-created lease whose root re-check has not passed (smarty-dev#15310).
     const assertLive = (): void => {
-      if (this.#closed || this.#transportLost || !lease.live()) throw new TransportUnavailableError("NATS host lease is not live");
+      if (this.#closed || this.#transportLost || this.#transportRecovering || !lease.live()) {
+        throw new TransportUnavailableError("NATS host lease is not live");
+      }
     };
     const select = async (): Promise<void> => {
       assertLive();

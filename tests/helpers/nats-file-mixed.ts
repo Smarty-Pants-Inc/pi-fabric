@@ -465,7 +465,9 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     if (options.seat && !natsPeer) throw new Error("seat needs natsPeer");
     const allow = {
       file: [allowRoot(fileMain.id), ...(actor ? [allowActor(fileMain.id, actor.name)] : [])],
-      nats: [allowRoot(natsMain.id), ...(natsPeer ? [options.seat ? allowRoot(natsPeer.id, SEAT_OPERATIONS, SEAT_PRINCIPAL) : allowRoot(natsPeer.id)] : [])],
+      // L3 (audit): every allow.nats entry pins the machine its root must be live on.
+      nats: [allowRoot(natsMain.id), ...(natsPeer ? [options.seat ? allowRoot(natsPeer.id, SEAT_OPERATIONS, SEAT_PRINCIPAL) : allowRoot(natsPeer.id)] : [])]
+        .map(entry => ({ ...entry, machine: NATS_MAIN_MACHINE })),
     };
     // Seat pins come only from org.json (L3). The fixture binds the product owner to a session nobody runs,
     // and SEAT_PRINCIPAL to natsPeer only when the test asks for a seat.

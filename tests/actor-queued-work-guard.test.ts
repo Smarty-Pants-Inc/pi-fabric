@@ -1381,3 +1381,44 @@ describe("queued-work guard, round 9: coalesced history through requeueArchived 
     expect(task).toContain(`${omitted.count} older events summarized across sequence range ${omitted.firstSequence}..${omitted.lastSequence}`);
   }, 420_000);
 });
+
+// pi-fabric#1572 round 9, option B: the set-time guard counts a coalesced item as skipped only when every record matches.
+// A partial match is not refused or held: the drain drops the matching record with #1574's per-record filtered receipt.
+describe("queued-work guard, round 9: a partial coalesced match passes the filter guard (pi-fabric#1572 option B)", () => {
+  const CHECKS: FabricActorActivationFilter = [{ id: "checks", topic: [TOPIC], kind: ["check"] }];
+  const runTasks = (root: string, actors: ActorManager, id: string) => actors.messages(id, 200).flatMap(message => {
+    const runId = (message as { runId?: string }).runId;
+    const file = runId ? path.join(root, "actors", id, "runs", runId, "task.txt") : undefined;
+    return message.direction === "out" && file && fs.existsSync(file) ? [fs.readFileSync(file, "utf8")] : [];
+  });
+
+  it("a comment plus a newer check, then skipChecks: the check is dropped with a filtered receipt, the comment runs, nothing is held", async () => {
+    const { root, mesh, actors } = setup(10);
+    const actor = await actors.create({ name: "partial-filter", instructions: "Review.", topics: [TOPIC], coalesce: false, coalesceKey: "subject" });
+    const release = await holdWorker(actors, root, actor.id);
+    const comment = await mesh.publish({ topic: TOPIC, kind: "comment", from, data: { subject: "pr-1", marker: "comment-1" } });
+    const check = await mesh.publish({ topic: TOPIC, kind: "check", from, data: { subject: "pr-1", marker: "check-1" } });
+    type Item = { payload: MeshEvent; coalesced?: Array<{ id: string }> };
+    await waitFor(() => (meshRecords(root, actor.id) as unknown as Item[])[0]?.coalesced?.map(record => record.id).join() === `${comment.id},${check.id}`);
+    expect(meshRecords(root, actor.id)).toHaveLength(1);
+    expect(meshRecords(root, actor.id)[0]!.payload.id).toBe(check.id); // the newer check is the primary
+    // Not refused, nothing moved or held: only one of the item's two records matches.
+    const changed = await actors.setActivationFilter(actor.id, CHECKS);
+    expect(changed).not.toHaveProperty("movedToDeadLetter");
+    expect(changed).not.toHaveProperty("heldInDeadLetter");
+    expect(changed.queued).toBe(1);
+    expect(deadLetterLines(root, actor.id)).toEqual([]);
+    // The setter pruned the check at once: the queued item is now the promoted comment alone.
+    expect((meshRecords(root, actor.id) as unknown as Item[]).map(item => [item.payload.id, item.coalesced?.map(record => record.id)]))
+      .toEqual([[comment.id, [comment.id]]]);
+    release();
+    await waitFor(() => actors.status(actor.id).status === "idle" && runTasks(root, actors, actor.id).some(task => task.includes("comment-1")), 60_000);
+    const task = runTasks(root, actors, actor.id).find(task => task.includes("comment-1"))!;
+    expect(task).not.toContain("check-1");
+    expect(task).not.toContain(check.id);
+    const receipts = actors.messages(actor.id, 200).filter(message => message.reason === "filtered: checks");
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.data).toMatchObject({ filteredEventId: check.id, sequence: check.sequence, topic: TOPIC });
+    expect(deadLetterLines(root, actor.id)).toEqual([]);
+  }, 90_000);
+});

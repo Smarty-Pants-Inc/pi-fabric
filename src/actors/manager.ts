@@ -2624,6 +2624,8 @@ export class ActorManager {
     // Before anything changes, count what the NEW filter would skip with the re-filter's own
     // predicate; refuse unless dropQueued, which moves those items to the dead-letter queue.
     // Round 2 (pi-fabric#1572): the routed dead-letter backlog counts too; its next replay would filter it away the same way.
+    // Round 9 (option B): a coalesced item counts only when every record matches (#wholeItemFilterRule); a partial match
+    // stays queued, and the setter prunes its matching records below, each with a per-record filtered receipt.
     // A filter that is already expired when set skips nothing (it expires at its first check).
     const effective = filter.length > 0 && !(expiresAt !== undefined && Date.now() >= expiresAt);
     const { items: skipped, deadLetters: skippedDeadLetters } = effective
@@ -2651,8 +2653,11 @@ export class ActorManager {
     actor.filterSkipped = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
     if (!filter.length) this.#recordFilterClear(actor, "explicit");
     actor.updatedAt = Date.now();
-    // No #filterQueued here: the guard above already removed (moved) everything the new filter skips.
+    // No full #filterQueued here: the guard above already removed (moved) every whole item the new filter skips.
     if (skipped.length) this.#releaseFilterSkipped(actor, skipped);
+    // Round 9 (option B): a partially matching coalesced item stayed queued. Prune its matching records now, each with
+    // #1574's own filtered receipt, as the setter did before the guard; the survivors keep their place and run.
+    if (filter.length) this.#filterQueued(actor, true);
     if (skippedDeadLetters.length) {
       this.#recordMessage(actor, {
         id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "in", source: "actor:activation-filter", createdAt: Date.now(),
@@ -2685,8 +2690,8 @@ export class ActorManager {
       for (const item of items) {
         // Round 3 (fabric-store P2 2): an admitted interval agent_settled item counts too. #queuedFilterRule leaves it to
         // the head skip, which would drop it under the new filter at dequeue: the same silent loss as any queued item.
-        const ruleId = this.#filteredBy(actor, item, candidate);
-        if (ruleId && !(current && this.#filteredBy(actor, item, current))) skips.push({ item, ruleId, overflow });
+        const ruleId = this.#wholeItemFilterRule(actor, item, candidate);
+        if (ruleId && !(current && this.#wholeItemFilterRule(actor, item, current))) skips.push({ item, ruleId, overflow });
       }
     }
     const deadLetters: Array<{ entry: ActorDeadLetter; ruleId: string }> = [];
@@ -2695,11 +2700,35 @@ export class ActorManager {
       const cutoff = now - age;
       for (const entry of this.#readDeadLetters(actor.id)) {
         if (entry.heldBy || (age > 0 && Number.isFinite(entry.at) && entry.at < cutoff)) continue;
-        const ruleId = this.#filteredBy(actor, { source: entry.source, payload: entry.event }, candidate);
-        if (ruleId && !(current && this.#filteredBy(actor, { source: entry.source, payload: entry.event }, current))) deadLetters.push({ entry, ruleId });
+        // A coalesced dead letter is judged per record too; its replay prunes a partial match record by record.
+        const history = entry.source.startsWith("mesh:") && (entry.coalesced?.length || entry.omittedBefore) ? this.#deadLetterItem(actor, entry) : undefined;
+        const rule = (filter: FabricActorActivationFilter) => history ? this.#wholeItemFilterRule(actor, history, filter)
+          : this.#filteredBy(actor, { source: entry.source, payload: entry.event }, filter);
+        const ruleId = rule(candidate);
+        if (ruleId && !(current && rule(current))) deadLetters.push({ entry, ruleId });
       }
     }
     return { items: skips, deadLetters };
+  }
+
+  /**
+   * pi-fabric#1572 round 9, option B: the rule by which a filter would skip a WHOLE queued item, else undefined. A coalesced
+   * item (pi-fabric#1574) is skipped only if every record matches and it carries no unknown omitted history; a record
+   * whose data cannot be verified counts as not matching. A partial match is not a skip: setActivationFilter (and a replay
+   * or the drain, for later matches) prunes the matching records with #1574's per-record filtered receipts; survivors run. Records are judged on ephemeral copies, so
+   * the queued item's own wake-text hydration is untouched. No filter given: the actor's current one, as #filteredBy.
+   */
+  #wholeItemFilterRule(actor: ManagedActor, item: ActorQueueItem, filter?: FabricActorActivationFilter): string | undefined {
+    if (!item.source.startsWith("mesh:") || (!item.coalesced?.length && !item.omittedBefore)) return this.#filteredBy(actor, item, filter);
+    if (this.#meshOmission(item)) return undefined;
+    let ruleId: string | undefined;
+    for (const record of item.coalesced ?? []) {
+      const input = this.#meshRecordItem(item, record);
+      const matched = input ? this.#filteredBy(actor, input, filter) : undefined;
+      if (!matched) return undefined;
+      ruleId ??= matched;
+    }
+    return ruleId;
   }
 
   // Write the held items at the head of the dead-letter file (they are older than its backlog), and
@@ -7682,10 +7711,12 @@ export class ActorManager {
   // or fill a batch window, the filter's purpose (#10630). smarty-dev#16416 split the set-time
   // re-filter out: setActivationFilter refuses, or moves skipped work to the dead-letter queue,
   // instead of dropping pre-existing work here. Retain every non-match in FIFO order.
-  #filterQueued(actor: ManagedActor): void {
+  #filterQueued(actor: ManagedActor, coalescedOnly = false): void {
     if (!actor.activationFilter) return;
     let skipped = 0;
     const keep = (item: ActorQueueItem): boolean => {
+      // setActivationFilter's pass (round 9, option B) touches only items with coalesced or omitted history.
+      if (coalescedOnly && !(item.source.startsWith("mesh:") && (item.coalesced?.length || item.omittedBefore))) return true;
       // Same settled-interval exclusion as #queuedFilterRule; each coalesced record is judged on its own.
       if (item.source === "host:agent_settled" && (actor.activation?.minIntervalMs ?? 0) > 0) return true;
       const before = actor.filteredCount ?? 0;
@@ -8488,7 +8519,10 @@ export class ActorManager {
     const liveEntries = this.#readDeadLetters(actor.id).filter((entry) => {
       if (entry.heldBy) {
         // Round 3: the full filter verdict (an interval agent_settled item included), not the queue pass's rule.
-        if (this.#filteredBy(actor, { source: entry.source, payload: entry.heldBy.raw ? entry.payload : entry.event })) {
+        // Round 9 (option B): a held coalesced entry waits only while the filter still skips every record of it.
+        const coalesced = !entry.heldBy.raw && entry.source.startsWith("mesh:") && (entry.coalesced?.length || entry.omittedBefore);
+        if (coalesced ? this.#wholeItemFilterRule(actor, this.#deadLetterItem(actor, entry))
+          : this.#filteredBy(actor, { source: entry.source, payload: entry.heldBy.raw ? entry.payload : entry.event })) {
           retained.push(entry);
           return false;
         }

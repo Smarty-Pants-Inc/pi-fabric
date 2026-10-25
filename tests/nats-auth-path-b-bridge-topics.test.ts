@@ -41,7 +41,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: ad
     const mark = h.wire.mark();
     const event = await publish(REPORT_RELAY, "fleet.work.lanes", "report", h.natsMain.id, text);
     const row = await waitForValue(() => h.natsMain.delivered().find((entry) => entry.text.includes(text)),
-      `lane report delivered to the v2 lead\n${linkTail(h)}`, 20_000);
+      () => `lane report delivered to the v2 lead\n${linkTail(h)}`, 20_000);
     expect(row).toMatchObject({ deliverAs: "followUp", from: { id: link().id } });
     expect(row.text).toContain(`[mesh fleet.work.lanes/report from ${REPORT_RELAY.id}]`);
     // The link's own command: from its verified KV identity on the bridge machine, keyed by the event id.
@@ -64,7 +64,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: ad
     await publish(OWNER_INBOX, "ops.owner", "pr.wake", h.natsMain.id, wake);
     await publish(OWNER_INBOX, "ops.owner", "inbox.age.alarm", h.natsMain.id, notice);
     // Ordered barrier: the later allowed notice arrived, so every earlier event was already decided.
-    await waitForValue(() => h.natsMain.delivered().find((entry) => entry.text.includes(notice)), `ops.owner notice delivered\n${linkTail(h)}`, 20_000);
+    await waitForValue(() => h.natsMain.delivered().find((entry) => entry.text.includes(notice)), () => `ops.owner notice delivered\n${linkTail(h)}`, 20_000);
     expect(h.natsMain.delivered().filter((entry) => [github, broadcast, wake].some((token) => entry.text.includes(token)))).toEqual([]);
     expect(h.natsPeer!.delivered().filter((entry) => entry.text.includes(other))).toEqual([]);
     // Nothing for them was even published by the link (decided before the barrier, in file-log order).

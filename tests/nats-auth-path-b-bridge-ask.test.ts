@@ -46,7 +46,8 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: v2
     const added = actorMessages().slice(before);
     const inbound = added.filter((message) => message.direction === "in");
     expect(inbound).toHaveLength(1);
-    expect(inbound[0]!.text).toContain(token);
+    // An actor records an inbound ask as its payload (actors/manager.ts: data, no text), the same as a native ask.
+    expect(inbound[0]!.data).toMatchObject({ message: token });
     expect(added.filter((message) => message.direction === "out")).toEqual([result]);
     // Wire: v2 sent one ask to the actor's owner host on the bridge machine; the link appended one command
     // from v2's verified identity with the mapped commandId; the answer came back as v2's ACK result.
@@ -70,7 +71,12 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: v2
     const before = actorMessages().length;
     const abort = new AbortController();
     const asking = h.natsMain.invoke("agents.ask", { id: h.actor!.id, message: token }, abort.signal).then(() => "answered", () => "aborted");
-    const run = await waitForValue(() => h.fileMain.runtime.actors.status(h.actor!.id).inFlightRun, "the asked run is live on the file side", 30_000);
+    // THIS ask is admitted on the file side (its own inbound record) and its run is live: never an earlier run's state.
+    const run = await waitForValue(() => {
+      const admitted = actorMessages().slice(before).some((message) => message.direction === "in" &&
+        (message.data as { message?: string } | undefined)?.message === token);
+      return admitted ? h.fileMain.runtime.actors.status(h.actor!.id).inFlightRun : undefined;
+    }, () => `the asked run is live on the file side\n${linkTail(h)}`, 30_000);
     abort.abort();
     expect(await asking).toBe("aborted");
     // The cancel v2 published names the ask's NATS commandId; the link maps it exactly like the command.
@@ -82,7 +88,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: v2
     expect(bodyOf(cancel)).toMatchObject({ cancelCommandId: bodyOf(ask).commandId, targetId: h.actor!.id });
     const crossed = await waitForValue(() => h.fileEvents({ topic: CONTROL, to: h.fileMain.id }).find((event) => dataOf(event).operation === "cancel" &&
       dataOf(event).cancelCommandId === bridgeNatsMappedCommandId(h.linkName, "toFile", h.natsMain.id, String(bodyOf(ask).commandId))),
-      `mapped cancel appended to the file mesh\n${linkTail(h)}`, 20_000);
+      () => `mapped cancel appended to the file mesh\n${linkTail(h)}`, 20_000);
     expect(crossed).toMatchObject({ from: { id: h.natsMain.id } });
     // That run ends without an answer; the actor is idle again and nothing else ran.
     await waitForValue(() => h.fileMain.runtime.actors.status(h.actor!.id).inFlightRun ? undefined : true, "cancelled run ended", 30_000);

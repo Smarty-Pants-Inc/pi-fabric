@@ -387,7 +387,8 @@ export interface MixedHarness {
 
 const kvKey = (machine: string, kind: "p" | "h", id: string): string => `${machine}.${kind}.${hashToken(id)}`;
 
-async function waitFor<T>(read: () => T | undefined | Promise<T | undefined>, label: string, timeoutMs: number, everyMs = 50): Promise<T> {
+/** Poll `read` until it returns a value. `label` may be a thunk, evaluated only on timeout (e.g. a log tail). */
+async function waitFor<T>(read: () => T | undefined | Promise<T | undefined>, label: string | (() => string), timeoutMs: number, everyMs = 50): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   let last: unknown;
   for (;;) {
@@ -395,7 +396,9 @@ async function waitFor<T>(read: () => T | undefined | Promise<T | undefined>, la
       const value = await read();
       if (value !== undefined) return value;
     } catch (error) { last = error; }
-    if (Date.now() > deadline) throw new Error(`Timed out after ${timeoutMs}ms: ${label}${last ? ` (last error: ${String(last)})` : ""}`);
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out after ${timeoutMs}ms: ${typeof label === "function" ? label() : label}${last ? ` (last error: ${String(last)})` : ""}`);
+    }
     await new Promise((resolve) => setTimeout(resolve, everyMs));
   }
 }

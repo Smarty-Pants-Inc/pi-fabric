@@ -512,6 +512,10 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     const plan: NatsInbound = await this.carrier.inbound(carrierDeliveryFromPort(delivery));
     switch (plan.kind) {
       case "event": {
+        // Record the owner's answer BEFORE the file append that hands it to its sender: a same-key resend
+        // racing that append must find it recorded (replayAck), never wait for an ACK already consumed.
+        // The delivery is acked, and the answer marked forwarded, only after the append is durable.
+        if (plan.settle) await this.carrier.settle(plan.settle);
         held.sequence = ++this.#sequence;
         held.event = { ...plan.event, sequence: held.sequence };
         if (plan.settle) held.settle = plan.settle;

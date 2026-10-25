@@ -23,6 +23,7 @@ import {
   BRIDGE_NATS_SESSION_ID,
   BRIDGE_NATS_SOURCE_SIDE,
   bridgeNatsDestinationClass,
+  bridgeNatsLinkIdentity,
   type BridgeNatsAckCheck,
   type BridgeNatsAckSource,
   type BridgeNatsAllowDecision,
@@ -37,6 +38,8 @@ import {
   type BridgeNatsPresenceRecord,
   type BridgeNatsPresenceView,
   type BridgeNatsRefusalCode,
+  type BridgeNatsRepublishDecision,
+  type BridgeNatsRepublishRequest,
   type BridgeNatsSide,
   type BridgeNatsVerified,
   type BridgeNatsVerifiedIdentity,
@@ -137,7 +140,8 @@ const COMMON_KEYS = ["kind", "send", "receive", "receiveTopics", "principals", "
 /** The receive list within the entry's destination class: default followUp when the class allows it. */
 const receiveList = (value: Record<string, unknown>, field: string, side: BridgeNatsSide): BridgeNatsOperation[] => {
   const kind = value.kind === "root" || value.kind === "actor" ? value.kind : "actor";
-  const destination = bridgeNatsDestinationClass({ kind, side, ...(typeof value.principal === "string" ? { principal: value.principal } : {}) });
+  const destination = bridgeNatsDestinationClass({ kind, side, ...(typeof value.principal === "string" ? { principal: value.principal } : {}),
+    ...(kind === "root" && typeof value.viaSpoke === "string" ? { viaSpoke: value.viaSpoke } : {}) });
   const cap = BRIDGE_NATS_CLASS_RECEIVE[destination];
   if (value.receive === undefined) return cap.includes("followUp") ? ["followUp"] : [];
   const receive = operationList(value.receive, `${field}.receive`);
@@ -149,7 +153,7 @@ const receiveList = (value: Record<string, unknown>, field: string, side: Bridge
   return receive;
 };
 
-const parseEntry = (value: unknown, field: string, side: BridgeNatsSide, natsMachine: string): BridgeNatsAllowEntry => {
+const parseEntry = (value: unknown, field: string, side: BridgeNatsSide, natsMachine: string, link: string): BridgeNatsAllowEntry => {
   if (!isPlainObject(value)) throw new BridgeNatsAllowListError(field, "must be a JSON object");
   const send = operationList(value.send, `${field}.send`);
   const receive = receiveList(value, field, side);
@@ -175,18 +179,32 @@ const parseEntry = (value: unknown, field: string, side: BridgeNatsSide, natsMac
     ...(note !== undefined ? { note } : {}),
   };
   if (value.kind === "root") {
-    strictKeys(value, field, [...COMMON_KEYS, "id", "principal"]);
+    strictKeys(value, field, [...COMMON_KEYS, "id", "principal", "viaSpoke", "republishTopics"]);
     if (!full(BRIDGE_NATS_SESSION_ID, value.id)) {
       throw new BridgeNatsAllowListError(`${field}.id`, "must be a canonical root id, session:<lowercase uuid>");
     }
     if (value.principal !== undefined && !full(PRINCIPAL_NAME, value.principal)) {
       throw new BridgeNatsAllowListError(`${field}.principal`, "must be an org.json principal name");
     }
+    if (value.viaSpoke !== undefined) {
+      // A spoke root is a work-host lane reached through the hub's relay: never a principal seat, never NATS-side.
+      if (side !== "file") throw new BridgeNatsAllowListError(`${field}.viaSpoke`, "is allowed only in allow.file");
+      if (!full(BRIDGE_NAME, value.viaSpoke) || value.viaSpoke === link) {
+        throw new BridgeNatsAllowListError(`${field}.viaSpoke`, "must be another bridge link's name");
+      }
+      if (value.principal !== undefined) throw new BridgeNatsAllowListError(`${field}.viaSpoke`, "is not allowed on a principal seat");
+    }
+    if (value.republishTopics !== undefined && side !== "nats") {
+      throw new BridgeNatsAllowListError(`${field}.republishTopics`, "is allowed only in allow.nats");
+    }
     const receiveTopics = topicList(value.receiveTopics, `${field}.receiveTopics`);
+    const republishTopics = topicList(value.republishTopics, `${field}.republishTopics`);
     return {
       kind: "root", id: value.id, ...common,
       ...(value.principal !== undefined ? { principal: value.principal as string } : {}),
+      ...(value.viaSpoke !== undefined ? { viaSpoke: value.viaSpoke as string } : {}),
       ...(receiveTopics !== undefined ? { receiveTopics } : {}),
+      ...(republishTopics !== undefined ? { republishTopics } : {}),
     };
   }
   if (value.kind === "actor") {
@@ -236,7 +254,7 @@ export const parseBridgeNatsAllowSection = (
     }
     list.forEach((value, index) => {
       const field = `allow.${side}[${index}]`;
-      const entry = parseEntry(value, field, side, options.natsMachine);
+      const entry = parseEntry(value, field, side, options.natsMachine, options.link);
       // An identity lives on one side: naming it twice (or on both sides) would mirror it both ways and loop.
       for (const key of [bridgeNatsAllowKey(entry), ...(entry.kind === "actor" && entry.id ? [`actor-id:${entry.id}`] : [])]) {
         if (seen.has(key)) throw new BridgeNatsAllowListError(field, "names an identity already listed");
@@ -432,21 +450,32 @@ export class BridgeNatsIdentity implements BridgeNatsIdentityGate {
     return this.#verify(side, targetId, presence, other, "target");
   }
 
+  verifyEventSender(claimedId: string, presence: BridgeNatsPresenceView, other: BridgeNatsPresenceView): BridgeNatsVerified {
+    // No source machine exists for a FABRIC_EV event: the id must still resolve to ONE live, fresh KV root
+    // on its pinned machine (never the bridge's), allow-listed on NATS. That is all this can prove.
+    return this.#verify("nats", claimedId, presence, other, "event");
+  }
+
   #native(side: BridgeNatsSide, record: BridgeNatsPresenceRecord): boolean {
     return side === "nats" ? record.machine !== this.config.natsMachine : record.mirroredBy === undefined;
   }
 
   #verify(side: BridgeNatsSide, id: string, view: BridgeNatsPresenceView, other: BridgeNatsPresenceView,
-    role: "sender" | "target", sourceMachine?: string): BridgeNatsVerified {
+    role: "sender" | "target" | "event", sourceMachine?: string): BridgeNatsVerified {
     if (view.side !== side || other.side === side) throw new TypeError("presence views do not match the sides");
-    const missing = role === "sender" ? BRIDGE_NATS_REFUSAL.senderUnverified : BRIDGE_NATS_REFUSAL.targetUnavailable;
+    const missing = role === "target" ? BRIDGE_NATS_REFUSAL.targetUnavailable : BRIDGE_NATS_REFUSAL.senderUnverified;
     if (typeof id !== "string" || id.length === 0 || id.length > 256) return refuse(BRIDGE_NATS_REFUSAL.notAllowed, "malformed id");
     const records = [...view.records(id)].filter(record => record.id === id);
     if (side === "nats" && records.some(record => !full(BRIDGE_NATS_MACHINE, record.machine))) {
       return refuse(missing, `${id}: a NATS presence record without a valid machine`);
     }
-    const native = records.filter(record => this.#native(side, record));
-    const mirrored = records.filter(record => !this.#native(side, record));
+    // PR 2 relay: a spoke root's home is the hub's DIRECT mirror held by its spoke link, never a native record.
+    const listed = side === "file" ? this.#roots.get(id) : undefined;
+    const spoke = listed?.kind === "root" ? listed.viaSpoke : undefined;
+    const home = (record: BridgeNatsPresenceRecord): boolean => spoke !== undefined
+      ? record.mirroredBy === spoke && record.bridgeVia === undefined : this.#native(side, record);
+    const native = records.filter(home);
+    const mirrored = records.filter(record => !home(record));
     const ours = side === "nats" ? mirrored : mirrored.filter(record => record.mirroredBy === this.config.link);
     if (native.length === 0) {
       return ours.length > 0
@@ -506,6 +535,8 @@ export class BridgeNatsIdentity implements BridgeNatsIdentityGate {
       ...(record.ownerIncarnation !== undefined ? { ownerIncarnation: record.ownerIncarnation } : {}),
       ...(side === "nats" ? { machine: record.machine! } : {}),
       entry, verifiedAt: now,
+      ...(role === "event" ? { presenceOnly: true as const } : {}),
+      ...(spoke !== undefined ? { viaSpoke: spoke } : {}),
     });
     this.#issued.add(identity);
     return { ok: true, identity };
@@ -530,6 +561,11 @@ export class BridgeNatsIdentity implements BridgeNatsIdentityGate {
     }
     const native = isNativePublisher(sender);
     if (!native && !this.#current(sender)) return refuse(BRIDGE_NATS_REFUSAL.senderUnverified, "the sender was not verified by this gate just now");
+    // A presence-only identity (an event's claimed sender) is attribution, never control or topic authority.
+    if (!native && (sender as BridgeNatsVerifiedIdentity).presenceOnly) {
+      return refuse(BRIDGE_NATS_REFUSAL.senderUnverified, "an event's claimed sender is not bound to a credential");
+    }
+    if (target.presenceOnly) return refuse(BRIDGE_NATS_REFUSAL.targetUnavailable, "an event sender is never a target");
     if (sender.side !== BRIDGE_NATS_SOURCE_SIDE[direction]) {
       return refuse(BRIDGE_NATS_REFUSAL.sideMismatch, `the sender is not on the ${direction} source side`);
     }
@@ -582,6 +618,19 @@ export class BridgeNatsIdentity implements BridgeNatsIdentityGate {
       if (claim.envelopeId === undefined || ack.eventId !== `ack:${claim.envelopeId}`) return unbound("the ACK answers another envelope");
     }
     return { ok: true };
+  }
+
+  allowRepublish(request: BridgeNatsRepublishRequest): BridgeNatsRepublishDecision {
+    const { sender, topic, kind } = request;
+    if (!this.#current(sender) || sender.side !== "nats" || sender.presenceOnly !== true) {
+      return refuse(BRIDGE_NATS_REFUSAL.senderUnverified, "the event sender was not verified by verifyEventSender just now");
+    }
+    if (sender.entry.kind !== "root" || typeof topic !== "string" || typeof kind !== "string" ||
+        !(sender.entry.republishTopics ?? []).some(pattern => topicMatches(pattern, topic))) {
+      return refuse(BRIDGE_NATS_REFUSAL.topicNotAllowed, `${sender.id} may not have ${String(topic)} republished into the file mesh`);
+    }
+    // Authored as the link, never as the claimed sender: nothing bound the sender to the publisher.
+    return { ok: true, author: bridgeNatsLinkIdentity(this.config.link), sender };
   }
 }
 

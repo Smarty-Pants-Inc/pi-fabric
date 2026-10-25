@@ -97,12 +97,19 @@ export const runSessionDrainCli = async (
     while (!(evaluation.drained && previous) && !evaluation.haltedWithHeld && now() + POLL_MS < deadline) {
       previous = evaluation.drained;
       await sleep(POLL_MS);
+      // r2 N2: the raw Pod's session actors are stopped only as the last act, exactly as on the host.
+      if (reply.native.inputsFenced && evaluation.reasons.length > 0 && evaluation.reasons.every(reason => reason.startsWith("children:live-actor:"))) {
+        await callMainDrain(socket, sessionId, "stop-actors", binding);
+      }
       reply = await callMainDrain(socket, sessionId, "drain", binding);
       evaluation = check(reply);
     }
     if (!evaluation.drained) {
-      return emit({ op: "exit", drained: false, exiting: false, inputsFenced: evaluation.observed.inputsFenced, reasons: evaluation.reasons,
-        observed: evaluation.observed, reply }, false);
+      // Not drained: the Pod's Main undoes itself here (release, reopen); the seam reports refused.
+      const undo = await callMainDrain(socket, sessionId, "undo", binding).catch(() => undefined);
+      return emit({ op: "exit", drained: false, exiting: false,
+        inputsFenced: !undo || undo.undo?.restartRequired === true || (undo.native.fenceApi && undo.native.piInputsFenced !== false),
+        reasons: evaluation.reasons, observed: evaluation.observed, reply, undo: undo?.undo ?? null }, false);
     }
     const exit = await callMainDrain(socket, sessionId, "exit", binding);
     return emit({ op: "exit", drained: true, exiting: exit.exiting, inputsFenced: evaluation.observed.inputsFenced && exit.native.inputsFenced,

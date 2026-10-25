@@ -388,10 +388,9 @@ describe.skipIf(!linux)("evidence, binding and undo (contract rev 4)", () => {
         pendingDeliveryOutcomes: 0, childCompletionEntries: 0 }, actorsNotStopped: 0 } });
   });
 
-  it("resume-drain fails closed (refused) until the kubectl-exec channel exists", async () => {
+  it("resume-drain without a pinned kube packet is UNKNOWN (no receipt); the kubectl path is in seat-drain-resume.test.ts", async () => {
     const target = await seat();
     const result = await inProcess(target, "resume-drain", { pod: { name: "raw", uid: "00000000-0000-4000-8000-0000000000bb" } });
-    expect(result.receipt).toMatchObject({ result: "refused",
-      observed: { podUid: "00000000-0000-4000-8000-0000000000bb", inputsFenced: false, exited: false } });
+    expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: kube-unpinned [owner: fabric-v2]\n" });
   });
 });

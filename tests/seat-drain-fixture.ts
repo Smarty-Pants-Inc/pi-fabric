@@ -79,7 +79,8 @@ const writeSealed = (file: string, value: unknown): Buffer => {
   return bytes;
 };
 
-export const createSeat = async (options: { fenceApi?: boolean; start?: boolean } = {}): Promise<Seat> => {
+export const createSeat = async (options: { fenceApi?: boolean; start?: boolean;
+  kube?: { kubeconfig: string; server: string; caSha256: string } } = {}): Promise<Seat> => {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "seat-drain-")));
   fs.chmodSync(base, 0o700);
   const runDir = path.join(base, "run");
@@ -103,7 +104,7 @@ export const createSeat = async (options: { fenceApi?: boolean; start?: boolean 
   const runSha256 = sha(runBytes);
   const inputBytes = writeSealed(path.join(runDir, "seat-inputs.json"), {
     schema: "d3-seat-inputs-v1", run, runSha256, feed: null, restartGoRef: "synthetic", routeTool: null, relaunchTools: null, inputs: null,
-    profile: "rehearsal", seat: { uid: process.getuid!(), home: os.userInfo().homedir }, rehearsal: null, kube: null,
+    profile: "rehearsal", seat: { uid: process.getuid!(), home: os.userInfo().homedir }, rehearsal: null, kube: options.kube ?? null,
   });
   fs.writeFileSync(path.join(runDir, "seat-journal.jsonl"), [
     { event: "begin", run, runSha256 }, { event: "inputs", sha256: sha(inputBytes) }, { event: "source", sha256: "2".repeat(64) },

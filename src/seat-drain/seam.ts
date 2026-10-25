@@ -10,8 +10,9 @@ import { callMainDrain, mainDrainSocket, MainDrainClientError } from "../main-dr
 import { MAIN_DRAIN_INGRESS } from "../main-drain/control.js";
 import { mainDrainSocketPath, type MainDrainReply } from "../main-drain/protocol.js";
 import { evaluateDrain, scanCompletions, type DrainEvaluation } from "./evaluate.js";
+import { fixedKubectl, kubectl, readPod, verifyKubeconfig, type KubeAccess } from "./kube.js";
 import { interpreterIdentity, parseRequest, proveSeatLock, readOwned, readSealedRun, resolveSeatMeshRoot, SeamGap, sha256,
-  socketPeer, verifyRunDir, writeOnce, type SeamRequest } from "./run.js";
+  socketPeer, verifyRunDir, writeOnce, type SealedRun, type SeamRequest } from "./run.js";
 
 /**
  * fabric-v2's D3 `drain` seam (smarty-dev#15310 prep item 13). Contract: SEAT.md §3,
@@ -64,6 +65,11 @@ export interface SeamDeps {
   python?: string;
   procRoot?: string;
   uid?: number;
+  /** Tests only: the kubectl client (production uses the fixed root-owned one) and the in-image CLI path. */
+  kubectl?: string;
+  podCli?: string;
+  /** Tests only: see the error behind a fixed GAP code. */
+  onError?: (error: unknown) => void;
 }
 interface Context {
   runDir: string; request: SeamRequest; meshRoot: string; lockFd: number; uid: number; io: SeamIo; deps: SeamDeps;
@@ -114,7 +120,10 @@ export const main = async (argv: string[], io: SeamIo, deps: SeamDeps = {}): Pro
     verifyRunDir(runDir, uid);
     const sealed = readSealedRun(runDir, request, uid);
     const lockFd = proveSeatLock(runDir, io.env.D3_SEAT_LOCK_FD, uid, deps.python);
-    if (phase === "resume-drain") return resumeDrainUnavailable(runDir, request, io);
+    if (phase === "resume-drain") {
+      return await resumeDrain({ runDir, request, meshRoot: "", lockFd, uid, io, deps, now, sleep, deadline, started,
+        requestSha256: sha256(stdin) }, sealed);
+    }
     let meshRoot: string | undefined;
     try { meshRoot = resolveSeatMeshRoot(sealed.journal, request.sessionId, uid); }
     catch (error) {
@@ -133,6 +142,7 @@ export const main = async (argv: string[], io: SeamIo, deps: SeamDeps = {}): Pro
     return recheck(context);
   } catch (error) {
     const code = error instanceof SeamGap ? error.code : "seam-internal";
+    deps.onError?.(error);
     io.stderr(`GAP: ${code} [owner: ${OWNER}]\n`);
     return 2;
   }
@@ -486,18 +496,76 @@ const recheck = (context: Context): number => {
   return 0;
 };
 
-/** Stage 2 builds the kubectl-exec path (ruling 10-25); until then the raw Pod is never reported drained. */
-const resumeDrainUnavailable = (runDir: string, request: SeamRequest, io: SeamIo): number => {
+/**
+ * The in-image pi-fabric CLI that `kubectl exec` runs inside the raw Pod (fixed argv, ruling 10-25). The only
+ * in-tree evidence (setup/cluster-services/Dockerfile on an agent-org base) names /opt/pi-fabric/dist/cli/index.js.
+ * OPEN (DRAIN-DESIGN.r2 Q5): until the image owner confirms it, `confirmed` stays false and resume-drain is
+ * refused. Even when confirmed, the seam first checks `test -x` on it inside the Pod. Tests inject SeamDeps.podCli.
+ */
+const POD_FABRIC_CLI = { path: "/opt/pi-fabric/dist/cli/index.js", confirmed: false } as const;
+const POD_NAME = /^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$/;
+const POD_UID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * resume-drain (DRAIN-DESIGN.r1 §1.13, challenge r1 M9): drain the raw v2 Pod's Main through `kubectl exec`
+ * of the in-image `pi-fabric session drain --exit`, bound to the pod UID. The same zero and children checks
+ * run inside the Pod; a not-drained Main undoes itself there. `exited` is the pi container's own terminated
+ * exitCode 0, and the pod UID must match the input pin before and after. Truthful: pass only with all three.
+ */
+const resumeDrain = async (context: Context, sealed: SealedRun): Promise<number> => {
+  const { request } = context;
   const pod = request.inputs.pod as Record<string, unknown> | undefined;
   if (Object.keys(request.inputs).sort().join(",") !== "operationId,pod" || typeof pod !== "object" || pod === null ||
-    Object.keys(pod).sort().join(",") !== "name,uid" || typeof pod.uid !== "string" || typeof pod.name !== "string") {
-    throw new SeamGap("inputs-invalid");
+    Object.keys(pod).sort().join(",") !== "name,uid" || typeof pod.uid !== "string" || !POD_UID.test(pod.uid) ||
+    typeof pod.name !== "string" || !POD_NAME.test(pod.name)) throw new SeamGap("inputs-invalid");
+  const kube = sealed.inputs.kube as Record<string, unknown> | null | undefined;
+  if (typeof kube !== "object" || kube === null || typeof kube.kubeconfig !== "string" || !path.isAbsolute(kube.kubeconfig) ||
+    typeof kube.server !== "string" || typeof kube.caSha256 !== "string" || !HEX64.test(kube.caSha256)) throw new SeamGap("kube-unpinned");
+  const access: KubeAccess = { kubectl: context.deps.kubectl ?? fixedKubectl(), kubeconfig: kube.kubeconfig, context: sealed.run.context as string,
+    namespace: sealed.run.namespace as string, server: kube.server, caSha256: kube.caSha256, home: sealed.seat.home };
+  const remaining = (): number => Math.max(0, context.deadline - context.now());
+  await verifyKubeconfig(access, Math.min(30_000, remaining()));
+  const before = await readPod(access, pod.name, Math.min(30_000, remaining()));
+  if (before && before.uid !== pod.uid) throw new SeamGap("pod-uid-mismatch");
+  const generation = randomBytes(16).toString("hex");
+  const intentSha256 = evidence(context, "fabric-v2-resume-drain-intent.json", { schema: "fabric-v2-resume-drain-intent-v1", generation,
+    podUid: pod.uid, requestSha256: context.requestSha256, measured: { kubectl: access.kubectl, server: access.server, before: before ?? null,
+      interpreter: interpreterIdentity(), startedAt: new Date().toISOString() } });
+  const cli = context.deps.podCli ?? (POD_FABRIC_CLI.confirmed ? POD_FABRIC_CLI.path : null);
+  let reason: string | null = null;
+  let exec: Record<string, unknown> | undefined;
+  if (!before) reason = "pod-unreadable";
+  else if (!cli) reason = "pod-cli-unconfirmed";
+  else if (!before.piRunning || !before.meshRoot) reason = before.piRunning ? "pod-mesh-root-unknown" : "pod-not-running";
+  else if ((await kubectl(access, ["-n", access.namespace, "exec", pod.name, "-c", "pi", "--", "test", "-x", cli],
+    Math.min(30_000, remaining()))).code !== 0) reason = "pod-cli-missing";
+  else {
+    const deadlineS = Math.max(1, Math.min(540, Math.floor(remaining() / 1000) - 30));
+    const result = await kubectl(access, ["-n", access.namespace, "exec", pod.name, "-c", "pi", "--", cli, "session", "drain", request.sessionId,
+      "--mesh", before.meshRoot, "--exit", "--pod-uid", pod.uid, "--run", request.run, "--run-sha256", request.runSha256,
+      "--operation-id", request.operationId, "--generation", generation, "--deadline-s", String(deadlineS)], remaining());
+    const line = result.stdout.trim().split("\n").at(-1) ?? "";
+    try { exec = JSON.parse(line) as Record<string, unknown>; } catch { exec = undefined; }
+    if (!exec || exec.format !== 1 || exec.sessionId !== request.sessionId) { reason = "pod-drain-unreadable"; exec = undefined; }
+    else if (exec.exiting !== true) reason = "pod-not-drained";
   }
-  const observed = { podUid: pod.uid, inputsFenced: false, exited: false };
-  writeOnce(runDir, "fabric-v2-resume-drain-outcome.json", json({ schema: "fabric-v2-resume-drain-outcome-v1", owner: OWNER,
-    run: request.run, sessionId: request.sessionId, operationId: request.operationId, result: "refused",
-    reason: "resume-drain-channel-not-built", observed }));
-  io.stdout(receipt(request, "refused", observed));
+  // The pi container's own exit status, polled until it terminates or the bound ends; the UID must not change.
+  let after = before;
+  if (exec?.exiting === true) {
+    for (;;) {
+      after = await readPod(access, pod.name, Math.min(30_000, Math.max(1_000, remaining())));
+      if (!after || after.piTerminated || remaining() <= 2_000) break;
+      await context.sleep(2_000);
+    }
+  }
+  const exited = after?.uid === pod.uid && after.piTerminated?.exitCode === 0;
+  const inputsFenced = exec?.exiting === true && exec.inputsFenced === true;
+  if (!reason && !exited) reason = after?.uid === pod.uid ? "pod-exit-unconfirmed" : "pod-uid-changed";
+  const observed = { podUid: pod.uid, inputsFenced, exited };
+  const passed = inputsFenced && exited && reason === null;
+  evidence(context, "fabric-v2-resume-drain-outcome.json", { schema: "fabric-v2-resume-drain-outcome-v1", result: passed ? "pass" : "refused",
+    reason, intentSha256, observed, measured: { before: before ?? null, after: after ?? null }, asserted: { podDrain: exec ?? null } });
+  context.io.stdout(receipt(request, passed ? "pass" : "refused", observed));
   return 0;
 };
 

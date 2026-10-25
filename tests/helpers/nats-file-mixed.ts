@@ -485,6 +485,8 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     const home = fs.realpathSync.native(os.homedir());
     if (orgJson === home || orgJson.startsWith(`${home}${path.sep}`)) throw new Error(`fixture org.json must not be under $HOME: ${orgJson}`);
     options.allow?.(allow, ids);
+    // L3 (audit): every allow.nats entry pins the machine its root must be live on (after any test edit).
+    allow.nats = allow.nats.map(entry => entry.machine === undefined ? { ...entry, machine: NATS_MAIN_MACHINE } : entry);
     const linkConfig: MixedLinkConfig = {
       version: 1, name: "ryzen1", link: linkName,
       file: { mesh: fileMeshRoot },

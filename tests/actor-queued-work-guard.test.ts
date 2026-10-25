@@ -1423,6 +1423,50 @@ describe("queued-work guard, round 9: a partial coalesced match passes the filte
     expect(deadLetterLines(root, actor.id)).toEqual([]);
   }, 90_000);
 
+  // Round 11 (fabric-store P1, L-tell): another queue writer must not persist a setter's in-memory prune while
+  // the filter's registry commit is still waiting. Use a real second store's lock, not a mocked save.
+  it("a concurrent tell never checkpoints a pruned record before the filter commits (round 11)", async () => {
+    const { root, mesh, actors } = setup(10);
+    const actor = await actors.create({ name: "concurrent-filter", instructions: "Review.", topics: [TOPIC], coalesce: false, coalesceKey: "subject" });
+    await holdWorker(actors, root, actor.id);
+    const comment = await mesh.publish({ topic: TOPIC, kind: "comment", from, data: { subject: "pr-1", marker: "comment-1" } });
+    const check = await mesh.publish({ topic: TOPIC, kind: "check", from, data: { subject: "pr-1", marker: "check-1" } });
+    type Item = { payload: MeshEvent; coalesced?: Array<{ id: string }> };
+    const queuedIds = () => (meshRecords(root, actor.id) as unknown as Item[]).flatMap(item => item.coalesced?.map(record => record.id) ?? [item.payload.id]);
+    await waitFor(() => queuedIds().join() === `${comment.id},${check.id}`);
+    const registry = new ActorRegistryStore(path.join(root, "actors"));
+    const savedFilter = () => registry.records().find(record => record.id === actor.id)?.activationFilter;
+    const assertSafeCheckpoint = () => {
+      // A crash at any of these disk checkpoints must retain the check, or retain the filter that explains its removal.
+      expect(queuedIds().includes(check.id) || JSON.stringify(savedFilter()) === JSON.stringify(CHECKS)).toBe(true);
+    };
+    let unlock!: () => void;
+    let acquired!: () => void;
+    const acquiredLock = new Promise<void>(resolve => { acquired = resolve; });
+    const releaseLock = new Promise<void>(resolve => { unlock = resolve; });
+    const holding = registry.withLock(async () => { acquired(); await releaseLock; }, undefined, "queued-work-regression");
+    await acquiredLock;
+    const setting = actors.setActivationFilter(actor.id, CHECKS);
+    try {
+      expect(savedFilter()).toBeUndefined();
+      assertSafeCheckpoint();
+      actors.tell(actor.id, "persist while the filter commit waits");
+      expect(actors.status(actor.id).queued).toBe(2);
+      expect(savedFilter()).toBeUndefined(); // the real registry fence still prevents the filter commit
+      assertSafeCheckpoint(); // 5c46e329 loses the check here, with no filter or receipt on disk
+    } finally {
+      unlock();
+      await holding;
+      await setting;
+    }
+    expect(savedFilter()).toEqual(CHECKS);
+    assertSafeCheckpoint();
+    expect(queuedIds()).toEqual([comment.id]);
+    expect(filtered(actors, actor.id)).toContainEqual(expect.objectContaining({
+      reason: "filtered: checks", data: expect.objectContaining({ filteredEventId: check.id }),
+    }));
+  }, 120_000);
+
   // Round 10 (fabric-store P1, probe OB-crash): the setter rewrote the queue file without the pruned check BEFORE its
   // registry commit saved the new filter and the check's filtered receipt; a crash between them lost the check with no
   // receipt. The crash lands at the setter's registry commit: the disk is copied as it stands right before the commit, or

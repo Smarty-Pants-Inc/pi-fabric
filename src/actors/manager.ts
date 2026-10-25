@@ -2653,16 +2653,8 @@ export class ActorManager {
     actor.filterSkipped = { count: 0, lastKey: null, lastTopic: null, lastAt: null };
     if (!filter.length) this.#recordFilterClear(actor, "explicit");
     actor.updatedAt = Date.now();
-    // No full #filterQueued here: the guard above already removed (moved) every whole item the new filter skips.
+    // The guard above already removed (moved) every whole item the new filter skips.
     if (skipped.length) this.#releaseFilterSkipped(actor, skipped);
-    // Replay checkpoints the whole queue, so it runs before the in-memory prune below: no queue write before the
-    // commit may carry a pruned record whose receipt is not committed yet (pi-fabric#1572 round 10, probe OB-crash).
-    this.#replayDeadLetters(actor);
-    // Round 9 (option B): a partially matching coalesced item stayed queued. Prune its matching records now, each with
-    // #1574's own filtered receipt; the survivors keep their place and run. Round 10: in memory only. The queue file is
-    // rewritten after the registry commit holds the new filter and the receipts. A crash between the two leaves the
-    // record queued on disk, and the next drain prunes it under the saved filter, with its receipt (#filterInput).
-    const pruned = filter.length ? this.#filterQueued(actor, true, false) : false;
     if (skippedDeadLetters.length) {
       this.#recordMessage(actor, {
         id: randomUUID(), actorId: actor.id, actorName: actor.name, direction: "in", source: "actor:activation-filter", createdAt: Date.now(),
@@ -2671,7 +2663,13 @@ export class ActorManager {
       });
     }
     await this.#publishPresence(actor, true);
-    if (pruned) this.#queuePruned(actor);
+    // Round 11 (fabric-store P1): commit the filter BEFORE pruning even in memory. A concurrent tell, mesh delivery
+    // or run finish can checkpoint the queue while #publishPresence waits. A failed commit must leave these records
+    // intact too. Round 9 (option B): partial matches now prune with #1574's normal per-record receipts and checkpoint.
+    // A crash before this pass leaves the records queued under the saved filter for the next drain.
+    if (filter.length) this.#filterQueued(actor, true);
+    // Replay can prune partial coalesced dead letters and checkpoint the queue too; it needs the committed filter.
+    this.#replayDeadLetters(actor);
     return { ...this.#publicInfo(actor), ...(skipped.length ? { movedToDeadLetter: skipped.length } : {}),
       ...(skippedDeadLetters.length ? { heldInDeadLetter: skippedDeadLetters.length } : {}) };
   }
@@ -7716,8 +7714,8 @@ export class ActorManager {
   // or fill a batch window, the filter's purpose (#10630). smarty-dev#16416 split the set-time
   // re-filter out: setActivationFilter refuses, or moves skipped work to the dead-letter queue,
   // instead of dropping pre-existing work here. Retain every non-match in FIFO order.
-  // persist = false (the setter) leaves #queuePruned to the caller, after its registry commit; returns whether any record was pruned.
-  #filterQueued(actor: ManagedActor, coalescedOnly = false, persist = true): boolean {
+  // The setter's coalesced-only pass runs after the filter commits; returns whether any record was pruned.
+  #filterQueued(actor: ManagedActor, coalescedOnly = false): boolean {
     if (!actor.activationFilter) return false;
     let skipped = 0;
     const keep = (item: ActorQueueItem): boolean => {
@@ -7739,7 +7737,7 @@ export class ActorManager {
     if (!skipped) return false;
     this.#refill(actor);
     if (!this.#inFlight.has(actor.id) && actor.status !== "stopped") actor.status = actor.queue.length ? "queued" : "idle";
-    if (persist) this.#queuePruned(actor);
+    this.#queuePruned(actor);
     return true;
   }
 

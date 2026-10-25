@@ -743,10 +743,13 @@ describe("sandbox agent transport", () => {
     expect(() => buildSandboxIntent({ ...base, branch: "a..b" })).toThrow();
     expect(() => buildSandboxIntent({ ...base, branch: "has space" })).toThrow();
     expect(() => buildSandboxIntent({ ...base, branch: "a".repeat(256) })).toThrow();
-    expect(buildSandboxIntent({ ...base, branch: "ghp_" + "A".repeat(40) }).branch).toBe("ghp_" + "A".repeat(40));
+    expect(() => buildSandboxIntent({ ...base, branch: "ghp_" + "A".repeat(40) })).toThrow(/refused by policy/);
     expect(() => buildSandboxIntent({ ...base, branch: "https://example.test/branch" })).toThrow();
     expect(() => buildSandboxIntent({ ...base, branch: "name@example.test" })).toThrow();
-    expect(buildSandboxIntent({ ...base, branch: "encoded-" + "A".repeat(90) }).branch).toBe("encoded-" + "A".repeat(90));
+    // Token policy matches whole values, not substrings or path components.
+    for (const branch of ["feature/sk-calc", "feature/ghp_foo", "feature/xoxb-demo", "encoded-" + "A".repeat(90), "A".repeat(79), "AKIA" + "A".repeat(15), "AKIA" + "A".repeat(17)]) {
+      expect(buildSandboxIntent({ ...base, branch }).branch).toBe(branch);
+    }
     expect(() => buildSandboxIntent({ ...base, profile: "lead", branch: "main", sessionImport: { ...imported, extra: true } as never })).toThrow();
     expect(() => buildSandboxIntent({ ...base, profile: "lead", branch: "main", sessionImport: { session: imported.session } as never })).toThrow();
     expect(() => buildSandboxIntent({ ...base, profile: "lead", branch: "main", sessionImport: { ...imported, manifestSha256: "A".repeat(64) } })).toThrow();
@@ -784,8 +787,42 @@ describe("sandbox agent transport", () => {
     expect(() => wireIntent({ branch })).toThrow(/branch/);
   });
 
-  it.each(["A_1/topic.v2-fix", "a".repeat(255), "a.locked/topic", "0", "a./b"])("accepts valid ASCII wire branch %j", branch => {
+  it.each(["A_1/topic.v2-fix", "a".repeat(127) + "-" + "b".repeat(127), "a.locked/topic", "0", "a./b"])("accepts valid ASCII wire branch %j", branch => {
     expect(wireIntent({ branch }).branch).toBe(branch);
+  });
+
+  // Keep: credential policy and Git failures must not leak values across the Placement trust boundary.
+  it.each([
+    ["GitHub classic", ["ghp_foo", ...["ghp_", "gho_", "ghu_", "ghs_", "ghr_"].map(prefix => prefix + "A".repeat(40))]],
+    ["GitHub fine-grained", ["github_pat_" + "A".repeat(40)]],
+    ["OpenAI", ["sk-" + "A".repeat(40)]],
+    ["Anthropic", ["sk-ant-api03-" + "A".repeat(40)]],
+    ["Slack xox family", ["xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-"].map(prefix => prefix + "1234567890-ABCdef")],
+    ["AWS access key", ["AKIA0123456789ABCDEF"]],
+    ["GitLab", ["glpat-" + "A".repeat(20)]],
+    ["long base64", ["A".repeat(80), "Ab01".repeat(20), "A".repeat(78) + "+/", "A".repeat(80) + "==", "a".repeat(255)]],
+  ] as const)("refuses token-shaped %s values in branch and sessionImport.session by policy", (_family, values) => {
+    for (const value of values) {
+      for (const field of ["branch", "sessionImport.session"] as const) {
+        const overrides = field === "branch" ? { branch: value } : { profile: "lane" as const, branch: "main", sessionImport: { ...importPin, session: value } };
+        expect(() => wireIntent(overrides)).toThrowError(expect.objectContaining({
+          code: "sandbox.intent.credential_refused",
+          message: `Sandbox intent ${field} refused by policy: credential-looking values are not allowed`,
+        }));
+      }
+    }
+  });
+
+  it("wraps a real Git branch refusal without returning Git's message or raw value", () => {
+    // HEAD passes the ASCII prechecks but Git refuses it as a branch name.
+    let caught: unknown;
+    try { wireIntent({ branch: "HEAD" }); } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).toMatchObject({ code: "sandbox.intent.branch_invalid", message: "Invalid sandbox intent branch" });
+    expect(String(caught)).not.toContain("HEAD");
+    expect(String(caught)).not.toContain("fatal:");
+    expect(Object.keys(caught as Error)).toEqual(["code"]);
+    expect(caught).not.toHaveProperty("cause");
   });
 
   it("defaults an explicitly requested import to lane without changing the legacy task default", () => {

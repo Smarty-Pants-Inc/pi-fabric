@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
+import { performance as monotonicClock } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BRIDGE_PROTOCOL_VERSION, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../src/mesh/store.js";
@@ -25,10 +26,23 @@ afterEach(async () => {
 const key = (kind: string, id: string) => `topology/${kind}/${createHash("sha256").update(id).digest("hex")}`;
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 const settle = () => sleep(40);
+const realMonotonicNow = monotonicClock.now.bind(monotonicClock);
 const until = async (check: () => boolean) => {
-  const deadline = performance.now() + 3_000;
-  while (!check() && performance.now() < deadline) await sleep(5);
+  const deadline = realMonotonicNow() + 3_000;
+  while (!check() && realMonotonicNow() < deadline) await sleep(5);
   expect(check()).toBe(true);
+};
+const untilFakeClock = async (check: () => boolean) => {
+  const deadline = realMonotonicNow() + 3_000;
+  while (!check() && realMonotonicNow() < deadline) {
+    await vi.advanceTimersByTimeAsync(250);
+    await sleep(5);
+  }
+  expect(check()).toBe(true);
+};
+const useFakeClock = () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  vi.spyOn(monotonicClock, "now").mockImplementation(() => Date.now());
 };
 const events = (store: MeshStore) => {
   const result = [];
@@ -498,7 +512,7 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
   });
 
   it("keeps a 90 s silent origin's capped mirror live at 20 s and repairs external row/lease pruning", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    useFakeClock();
     const f = fixture(false);
     const lane = await native(f.far, "long-lane", 90_000);
     const live = await launch(f.bridge);
@@ -509,10 +523,10 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     expect(readHostLeases(f.hub.root).get(lane.id)!.expiresAt).toBeLessThanOrEqual(lane.host.expiresAt);
     await f.hub.delete({ key: lane.entry.key });
     await f.hub.delete({ key: key("hosts", lane.id) });
-    await until(() => !!f.hub.get(lane.entry.key) && f.local.holds(lane.id));
+    await untilFakeClock(() => !!f.hub.get(lane.entry.key) && f.local.holds(lane.id));
     const leaseDir = path.join(f.hub.root, "host-leases");
     for (const name of fs.readdirSync(leaseDir)) fs.rmSync(path.join(leaseDir, name));
-    await until(() => readHostLeases(f.hub.root).has(lane.id));
+    await untilFakeClock(() => readHostLeases(f.hub.root).has(lane.id));
     expect(f.local.holds(lane.id)).toBe(true);
     await settle();
     const mirrors = vi.spyOn(f.local, "mirror");
@@ -522,18 +536,22 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
   });
 
   it("coalesces 20 separate lane heartbeats into one half-lease flush, with no per-heartbeat locks", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    useFakeClock();
     const f = fixture();
     const lanes = [];
     for (let index = 0; index < 20; index++) lanes.push(await native(f.far, `batch-${index}`, 15_000));
     const live = await launch(f.bridge);
+    // Drain the startup mirror's own filesystem hint before measuring heartbeat coalescing.
+    await vi.advanceTimersByTimeAsync(250);
+    await settle();
     const hubBatch = vi.spyOn(f.hub, "writeBatch");
     const farBatch = vi.spyOn(f.far, "writeBatch");
     const mirrors = vi.spyOn(f.local, "mirror");
     await vi.advanceTimersByTimeAsync(5_000);
+    const renewedExpiresAt = Date.now() + 15_000;
     for (const lane of lanes) {
       writeHostLease(f.far.root, { id: lane.id, rootId: lane.id, identityId: lane.id, startedAt: lane.host.startedAt,
-        updatedAt: Date.now(), expiresAt: Date.now() + 15_000 });
+        updatedAt: Date.now(), expiresAt: renewedExpiresAt });
       await sleep(2); // separate native fs.watch deliveries, not one synchronous write burst
     }
     await settle();
@@ -547,7 +565,7 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     expect(farBatch).toHaveBeenCalledTimes(1);
     for (const lane of lanes) {
       expect(f.local.holds(lane.id)).toBe(true);
-      expect(readHostLeases(f.hub.root).get(lane.id)?.expiresAt).toBe(lane.host.expiresAt + 5_000);
+      expect(readHostLeases(f.hub.root).get(lane.id)?.expiresAt).toBe(renewedExpiresAt);
     }
     expect(live.failure()).toBeUndefined();
   });
@@ -557,7 +575,7 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
   // creates a sender-visible authority gap even though the origin has renewed.
   // Keep reason: recorded remote-owner trust boundary; never relax sender admission.
   it("flushes pending renewals against the sampled remaining life before a delayed commit", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    useFakeClock();
     const f = fixture(true, "sqlite");
     const lane = await native(f.far, "remaining-life", 10_000);
     const live = await launch(f.bridge);
@@ -723,12 +741,15 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
       raw.prepare("UPDATE kv SET value = ? WHERE key = ?").run(
         JSON.stringify({ ...lane.host, identity: { ...lane.identity, name: "committed-name" } }), key("hosts", lane.id));
       raw.exec("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE name = 'commit_no'");
+      // Match a real writer's committed change feed; otherwise a prefix cache cannot prove freshness.
+      raw.prepare("INSERT INTO changes(commit_no, key, version, deleted) SELECT CAST(meta.value AS INTEGER), kv.key, kv.version, 0 FROM meta, kv WHERE meta.name = 'commit_no' AND kv.key = ?")
+        .run(key("hosts", lane.id));
       // A pre-commit fs hint (the same race as a writer spilling WAL frames before COMMIT).
       const now = new Date();
       fs.utimesSync(path.join(f.far.root, "state.db"), now, now);
       await until(() => fence.mock.calls.length > 0);
-      await sleep(120);
-      expect(fence.mock.calls.length).toBeGreaterThanOrEqual(2);
+      // Retain the real busy retry proof without requiring it inside the new 250 ms scan floor.
+      await until(() => fence.mock.calls.length >= 2);
       expect(live.failure()).toBeUndefined();
       expect((f.hub.get(key("hosts", lane.id))!.value as { identity: MeshIdentity }).identity.name).toBe("main");
       raw.exec("COMMIT");

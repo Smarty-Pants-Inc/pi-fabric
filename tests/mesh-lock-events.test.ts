@@ -209,6 +209,24 @@ describe("lock events: timeout cgroup observation", () => {
     expect(record("0::/\n")).toHaveProperty("cgroup", "/");
   });
 
+  it.runIf(process.platform === "linux")("omits deleted cgroup memberships without erasing the sampled PID", () => {
+    const { record } = fixture();
+    for (const prefix of ["0::", "1:name=systemd:"]) {
+      for (const cgroup of ["/gone.service (deleted)", "/parent.service/child.scope (deleted)"]) {
+        const holder = record(`${prefix}${cgroup}\n`);
+        expect(holder.pid).toBe(process.pid);
+        expect(holder).not.toHaveProperty("cgroup");
+        expect(holder).not.toHaveProperty("unit");
+      }
+      expect(record(`${prefix}/parent.service/child.scope\n`)).toMatchObject({
+        pid: process.pid, cgroup: "/parent.service/child.scope", unit: "child.scope",
+      });
+      expect(record(`${prefix}/parent.service (deleted)/child.scope\n`)).toMatchObject({
+        pid: process.pid, cgroup: "/parent.service (deleted)/child.scope", unit: "child.scope",
+      });
+    }
+  });
+
   it.runIf(process.platform === "linux")("omits missing, malformed and oversized observations; caps reads and independently bounds cgroup/unit", () => {
     const { file, events, root, record, observed } = fixture();
     const read = vi.spyOn(fs, "readSync");

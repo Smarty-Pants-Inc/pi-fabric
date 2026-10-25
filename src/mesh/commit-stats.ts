@@ -699,7 +699,7 @@ const lockEventCgroup = (pid: number): Pick<LockEventHolder, "cgroup" | "unit"> 
     const selected = unified.length ? unified : rows.filter(row => /^[1-9]\d*:name=systemd:/.test(row));
     if (selected.length !== 1) return {};
     const cgroup = selected[0]!.replace(/^[^:]*:[^:]*:/, "");
-    if (Buffer.byteLength(cgroup) > 512 ||
+    if (cgroup.endsWith(" (deleted)") || Buffer.byteLength(cgroup) > 512 ||
       (cgroup !== "/" && cgroup.slice(1).split("/").some(part => !part || part === "." || part === ".."))) return {};
     const unit = cgroup.split("/").reverse().find(part => /.+\.(?:service|scope)$/.test(part));
     return { cgroup, ...(unit && Buffer.byteLength(unit) <= 256 ? { unit } : {}) };

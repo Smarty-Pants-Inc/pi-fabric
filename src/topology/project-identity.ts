@@ -264,6 +264,9 @@ interface ProjectRoot {
   startedAt: number;
   /** Set on a root mirrored from another host's mesh (smarty-dev#2045). */
   remoteHost?: string;
+  stale?: boolean;
+  /** The directory retains an attributed mirror during a bridge outage, but it cannot lead. */
+  bridgeStale?: boolean;
 }
 
 /**
@@ -299,21 +302,36 @@ export class FabricProjectAgentAmbiguousError extends Error {
 }
 
 /**
- * Repository identity survives a lane move. The launch-recorded id is authoritative only
- * within that repository; it also permits that exact mirror, not arbitrary remote lead claims
- * (smarty-dev#2045). Legacy native records retain path matching. Never choose by recency.
+ * The launch-recorded id is an exact return address, independent of repository. The directory
+ * admits live, non-colliding roots; an attributed but bridge-stale mirror cannot lead.
+ * Without a binding, elect only same-repository native roots (smarty-dev#2045).
+ * Legacy native records retain path matching. Never choose by recency.
  */
 export const resolveProjectAgent = <T extends ProjectRoot>(
   allRoots: readonly T[],
   project: string,
   options: { repository?: string; leadId?: string } = {},
 ): T => {
+  const eligible = (root: T): boolean => root.interactive !== false &&
+    (!root.capabilities || (root.capabilities.includes("steer") && root.capabilities.includes("followUp")));
+  if (options.leadId) {
+    const recorded = allRoots.find((root) => root.id === options.leadId);
+    if (!recorded || recorded.stale || recorded.bridgeStale) {
+      throw new FabricProjectAgentUnresolvedError(
+        `No live project agent for ${project}: recorded launch lead ${options.leadId} is absent or stale.`,
+      );
+    }
+    if (!eligible(recorded)) {
+      throw new FabricProjectAgentUnresolvedError(
+        `No live project agent for ${project}: recorded launch lead ${options.leadId} is non-interactive or lacks steer/followUp capabilities.`,
+      );
+    }
+    return recorded;
+  }
   const repository = options.repository ? normalizeOrigin(options.repository) : undefined;
   if (options.repository !== undefined && !repository) {
     throw new FabricProjectAgentUnresolvedError(`No live project agent for ${project}: invalid repository identity.`);
   }
-  const eligible = (root: T): boolean => root.interactive !== false &&
-    (!root.capabilities || (root.capabilities.includes("steer") && root.capabilities.includes("followUp")));
   const sameProject = (root: T): boolean => {
     if (repository && root.repository) return normalizeOrigin(root.repository) === repository;
     // Remote paths are neither locally meaningful nor authority to name this repository.
@@ -321,19 +339,18 @@ export const resolveProjectAgent = <T extends ProjectRoot>(
       (root.project ?? (root.cwd ? canonical(root.cwd) : undefined)) === project;
   };
   const roots = allRoots.filter((root) => eligible(root) && sameProject(root));
-  if (options.leadId) {
-    const recorded = roots.find((root) => root.id === options.leadId);
-    if (recorded) return recorded;
-    throw new FabricProjectAgentUnresolvedError(
-      `No live project agent for ${project}: recorded launch lead ${options.leadId} is unavailable, non-interactive, or belongs to another repository.`,
-    );
-  }
   const native = roots.filter((root) => root.remoteHost === undefined);
   const tagged = native.filter((root) => root.role === "project-agent");
   const untagged = native.filter((root) =>
     root.role === undefined && root.project === undefined && root.cwd !== undefined && canonical(root.cwd) === project);
   const candidates = tagged.length > 0 ? tagged : untagged;
   if (candidates.length === 0) {
+    if (repository && allRoots.some((root) => eligible(root) && root.remoteHost === undefined &&
+      root.repository && normalizeOrigin(root.repository) !== repository)) {
+      throw new FabricProjectAgentUnresolvedError(
+        `No live project agent for ${project}. No recorded launch lead; live native roots belong to another repository.`,
+      );
+    }
     const inProject = native.map((root) => `${root.id} (${root.role ?? "no role"})`);
     throw new FabricProjectAgentUnresolvedError(
       `No live project agent for ${project}. ` +

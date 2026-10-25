@@ -131,12 +131,15 @@ existing events and mirrors root presence. The additive publish-receipt hello ca
   can leave presence/mirror RPCs working, renewing `mirror.observedAt` and keeping the lease
   alarm quiet. If the whole peer stops answering presence/mirror calls, the observation stops
   renewing and the existing lease alarm can fire after its freshness deadline.
-- The bridge process independently probes both mesh heads every 15 s (remote probe deadline
-  5 s). It invokes `/usr/bin/systemd-notify WATCHDOG=1` only after a responsive probe and when
-  at least one direction is current or has recent cursor progress; a one-way pending direction
-  does not starve watchdog notifications while the other direction works. If neither direction
-  is current/progressing or the peer probe stops answering for 30 s, the bridge emits one
-  `fabric.alarm.bridge-stall` event and stops notifying systemd. A direction with no acknowledged
+- The bridge process probes the peer every 15 s (remote probe deadline 5 s). Agents advertising
+  `responsivePing: true` answer from memory, independently of their store worker; this liveness
+  reply permits `/usr/bin/systemd-notify WATCHDOG=1` but never counts as a delivery receipt or a
+  current remote head. Known pending work, including a busy tail, retains its directional progress
+  deadline. Older peers retain both-head probes, which permit watchdog notifications when at least
+  one direction is current or has recent cursor progress. If the peer probe stops answering for
+  30 s, or a legacy both-head probe finds neither direction current/progressing for that long,
+  the bridge emits one `fabric.alarm.bridge-stall` event and stops notifying systemd. A direction
+  with no acknowledged
   (`toRemote`) or received/handled (`toLocal`) cursor progress for 180 s while the other direction
   remains current/progressing emits the same alarm once and exits with status 1. The event is
   addressed only to the configured mesh-alarm session recipient.
@@ -286,10 +289,18 @@ existing events and mirrors root presence. The additive publish-receipt hello ca
   watches before any later topology snapshot. A held topology service cannot by itself hold
   traffic behind it; publications still retain FIFO order, including for the same target.
   Both lanes retain the same dispatch validation, mesh locks and ownership fences, so actual
-  store contention can still delay traffic. Input shutdown disposes watches, skips queued
-  work and settles both lanes before returning. Debug RPC timing is opt-in, contains no
-  event bodies, and reports `queueDepth` as the number of earlier requests in that request's
-  lane at admission, including its in-service request, not work in the independent lane.
+  store contention can still delay traffic. In `mesh-bridge agent`, one worker owns the store,
+  both lanes, directory watches and topology scans. The stdio thread never opens the store: it
+  answers `ping` from memory with a `busy` flag, and serves a bounded, exact-cursor tail mailbox.
+  A missing page replies immediately with `busy: true` and unchanged sequence/offset, coalesces
+  the worker read, and wakes the retained drain when ready. Busy pages are not caught-up or
+  delivery evidence; the hub uses notifications and a bounded safety retry without advancing its
+  durable cursor. Publication receipts still wait for durable writes, and their existing fatal
+  30 s default deadline is unchanged. Mirror arrival time is captured before the worker queue.
+  Input shutdown disposes watches and skips queued work; the stdio owner gives the worker two
+  seconds to settle before terminating it. Debug RPC timing is opt-in, contains no event bodies,
+  and reports `queueDepth` as the number of earlier requests in that request's worker lane at
+  admission, including its in-service request, not work in the independent lane.
 
 ## Control deadlines and retention
 

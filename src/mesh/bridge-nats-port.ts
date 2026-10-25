@@ -272,10 +272,14 @@ export class NatsBridgePort implements BridgeNatsPort {
       const id = this.identity.id;
       if (this.#selfRecord && this.kv.writer.holds(id)) return;
       const now = this.#now();
-      // A fresh incarnation whenever the row must be (re)created: an earlier one may be superseded.
+      // A restarted link finds its predecessor's row under this machine (a crash leaves it for up to the
+      // 600 s presence TTL). Reuse that incarnation so the row can be adopted; the lease is adopted only
+      // from this process or a provably exited predecessor, so a second live link on this machine is refused.
+      const previous = this.kv.reader.records(id).find(route => route.machine === this.machine && route.kind === "root" &&
+        route.rootId === id && route.ownerHostId === this.#transport.self.hostId && route.ownerIdentityId === id)?.ownerIncarnation;
       this.#selfRecord = {
         format: 1, id, kind: "root", rootId: id, ownerHostId: this.#transport.self.hostId, ownerIdentityId: id,
-        ownerIncarnation: randomUUID(), name: this.identity.name, status: "running", runner: "pi", transport: "host",
+        ownerIncarnation: previous ?? randomUUID(), name: this.identity.name, status: "running", runner: "pi", transport: "host",
         capabilities: [], startedAt: now, updatedAt: now, controlProtocol: "v1",
       };
       const outcome = await this.kv.writer.replace(SELF_GROUP, [{ record: this.#selfRecord, until: Number.POSITIVE_INFINITY }], true);

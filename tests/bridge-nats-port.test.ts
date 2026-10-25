@@ -83,7 +83,7 @@ const closers: Array<{ close(): Promise<void> }> = [];
 afterEach(async () => { await Promise.allSettled(closers.splice(0).map(item => item.close())); });
 
 function port(w: KvWorld, options: { send?: (envelope: TransportEnvelope) => Promise<TransportSent>; fileActors?: () => NatsFileActorRead;
-  allow?: Parameters<typeof natsBridgeAdmit>[0]; onClose?: () => Promise<void> } = {}) {
+  allow?: Parameters<typeof natsBridgeAdmit>[0]; onClose?: () => Promise<void>; proof?: typeof PROOF; predecessorExited?: () => boolean } = {}) {
   const clock = { wall: 1_000_000, mono: 50_000 };
   const sent: TransportEnvelope[] = [];
   const inbox = new ScriptedInbox();
@@ -93,8 +93,8 @@ function port(w: KvWorld, options: { send?: (envelope: TransportEnvelope) => Pro
     return { id: envelope.id, sequence: 41, duplicate: false, envelope: { ...envelope, createdAt: clock.wall } } as never;
   });
   const allow = options.allow ?? { file: [{ kind: "root" as const, id: FILE_ROOT }], nats: [{ kind: "root" as const, id: NATS_ROOT }] };
-  const instance = new NatsBridgePort({ transport, inbox, link: LINK, admit: natsBridgeAdmit(allow), processProof: PROOF,
-    predecessorExited: () => false, now: () => clock.wall, monotonic: () => clock.mono,
+  const instance = new NatsBridgePort({ transport, inbox, link: LINK, admit: natsBridgeAdmit(allow), processProof: options.proof ?? PROOF,
+    predecessorExited: options.predecessorExited ?? (() => false), now: () => clock.wall, monotonic: () => clock.mono,
     ...(options.fileActors ? { fileActors: options.fileActors } : {}), ...(options.onClose ? { onClose: options.onClose } : {}) });
   closers.push(instance);
   return { port: instance, inbox, sent, clock };
@@ -158,6 +158,23 @@ describe("NATS bridge port: link identity and presence", () => {
     expect((await receiver(w)).resolve(LINK_ID)).toMatchObject({ machine: BRIDGE, live: true, capabilities: [] });
     await p.withdraw();
     expect(w.presence.values.size + w.leases.values.size).toBe(0);
+  });
+
+  it("after a crash, takes over its own link identity only from a provably exited predecessor", async () => {
+    const w = kvWorld();
+    const first = port(w).port;
+    await first.start();
+    const incarnation = first.selfRecord!.ownerIncarnation;
+    await first.close(); // A crash leaves the rows: close only fences.
+    expect(w.presence.values.has(pKey(BRIDGE, LINK_ID))).toBe(true);
+    const next = { pid: 5151, pidStartTime: "888", bootId: PROOF.bootId };
+    const alive = port(w, { proof: next, predecessorExited: () => false }).port;
+    await expect(alive.start()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_NATS_LEASE_CONFLICT" });
+    const successor = port(w, { proof: next, predecessorExited: () => true }).port;
+    await successor.start();
+    expect(successor.selfRecord?.ownerIncarnation).toBe(incarnation);
+    expect(w.leases.values.get(hKey(BRIDGE, LINK_ID))?.value).toMatchObject({ pid: 5151 });
+    expect((await receiver(w)).resolve(LINK_ID)).toMatchObject({ machine: BRIDGE, live: true });
   });
 
   it("refuses to start when the link identity already has a row on another machine", async () => {

@@ -219,7 +219,8 @@ describe("nats-link CLI", () => {
       .toMatchObject({ allow: { file: [{ identity: PAUL }, { identity: SPOKE_ROOT, present: false }] } });
   });
 
-  it("dry-run takes a spoke root only as its spoke link's direct mirror, never a re-export (L3 audit P0)", async () => {
+  // Stated skip: dry-run refuses on Windows by design (nats-link is Linux/macOS only); that refusal is tested below.
+  it.skipIf(WINDOWS)("dry-run takes a spoke root only as its spoke link's direct mirror, never a re-export (L3 audit P0)", async () => {
     const kate: NatsRootInfo = { id: KATE, kind: "root", name: "main", sessionId: KATE.slice(8), rootId: KATE, machine: "sandbox1",
       ownerHostId: KATE, ownerIdentityId: KATE, ownerIncarnation: "inc-k", status: "idle", capabilities: ["followUp"], live: true };
     const spokeRow = async (options: { remoteHost: string; bridgeVia?: string }) => {

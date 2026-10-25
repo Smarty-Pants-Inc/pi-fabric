@@ -30,7 +30,8 @@ describe("nats-link counters", () => {
     const first = readNatsLinkCounters(dir)!;
     expect(first).toMatchObject({ v: 1, link: "v2", pid: process.pid, since: "2026-10-25T06:00:00.000Z" });
     expect(Object.values(first.counters).every((value) => value === 0)).toBe(true);
-    expect(fs.statSync(path.join(dir, NATS_LINK_COUNTERS_FILE)).mode & 0o777).toBe(0o600);
+    // POSIX only: Windows has no owner-only file modes (nats-link runs only on Linux and macOS).
+    if (process.platform !== "win32") expect(fs.statSync(path.join(dir, NATS_LINK_COUNTERS_FILE)).mode & 0o777).toBe(0o600);
 
     clock += 5;
     counters.add("republish.accepted");

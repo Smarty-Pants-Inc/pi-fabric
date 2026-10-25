@@ -295,7 +295,8 @@ describe("N4 start: the consume grant, and nothing published into FABRIC_EV", ()
     expect(fake.published).toEqual([]);
     expect(JSON.parse(fs.readFileSync(natsRepublishStatePath(dir), "utf8"))).toMatchObject({ v: 1, link: LINK, state: "stopped",
       durable: "bev_machine-a" });
-    expect(fs.statSync(natsRepublishStatePath(dir)).mode & 0o777).toBe(0o600);
+    // POSIX only: Windows has no owner-only file modes (nats-link runs only on Linux and macOS).
+    if (process.platform !== "win32") expect(fs.statSync(natsRepublishStatePath(dir)).mode & 0o777).toBe(0o600);
   });
 
   it("refuses the start without the consume grant, and records why for nats-link status", async () => {

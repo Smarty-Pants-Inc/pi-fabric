@@ -143,7 +143,14 @@ export interface NatsRoute {
   readonly ownerIdentityId: string;
   readonly ownerIncarnation: string;
   readonly capabilities: readonly string[];
+  /** Presence + matching unexpired owner lease, not terminal, and no pending root re-check. */
   readonly live: boolean;
+  /**
+   * The owner lease matches and is unexpired but carries `rootRecheck: true` (re-created after a KV
+   * lapse, host-leases.ts): not live, as native KV routing treats it, yet not gone either. Unknown
+   * until the owner rewrites the lease: never withdrawal evidence.
+   */
+  readonly rootRecheck: boolean;
   /** This process's monotonic clock: the latest the owner lease can still be live. */
   readonly liveUntil: number;
   readonly record: Readonly<FabricParticipantRecord>;
@@ -308,13 +315,16 @@ export class NatsPresenceReader {
     const host = this.#hosts.get(natsLeaseKey(machine, record.ownerHostId));
     const lease = host?.entry.value;
     const liveUntil = host ? this.#leaseUntil(host) : Number.NEGATIVE_INFINITY;
-    const live = !!lease && lease.id === record.ownerHostId && lease.identityId === record.ownerIdentityId &&
+    const leased = !!lease && lease.id === record.ownerHostId && lease.identityId === record.ownerIdentityId &&
       lease.rootId === record.rootId && lease.incarnation === record.ownerIncarnation && host!.entry.owner === seen.entry.owner &&
       !KV_TERMINAL.has(record.status) && liveUntil > this.#monotonic();
+    // Same rule as native KV routing (participant-view KvParticipantDirectory#route): a lease pending
+    // a root re-check routes nothing, while the record itself is kept.
+    const rootRecheck = leased && lease!.rootRecheck === true;
     return {
       id: record.id, kind: record.kind, machine, rootId: record.rootId, ownerHostId: record.ownerHostId,
       ownerIdentityId: record.ownerIdentityId, ownerIncarnation: record.ownerIncarnation!,
-      capabilities: [...record.capabilities], live, liveUntil, record,
+      capabilities: [...record.capabilities], live: leased && !rootRecheck, rootRecheck, liveUntil, record,
     };
   }
 
@@ -952,6 +962,7 @@ export class NatsBridgePresence {
   readonly #now: () => number;
   readonly #monotonic: () => number;
   readonly #ambiguous = new Set<string>();
+  readonly #rechecking = new Set<string>();
   readonly #skipped = new Set<string>();
 
   constructor(readonly options: NatsBridgePresenceOptions) {
@@ -980,6 +991,7 @@ export class NatsBridgePresence {
   /**
    * Live, unique, admitted canonical NATS roots on other machines, as sampled hosts. Before both
    * KV snapshots are ready the answer is an empty partial snapshot: it can never withdraw a mirror.
+   * A root whose owner lease awaits a root re-check is left out and makes the snapshot partial.
    */
   async presence(): Promise<BridgePresence> {
     if (!this.reader.ready) return { hosts: [], participants: [], reserved: [], partial: true };
@@ -994,12 +1006,23 @@ export class NatsBridgePresence {
       this.options.log?.(`nats presence: ${id} has rows on several machines; not routable, not mirrored`);
     }
     for (const id of [...this.#ambiguous]) if (!ambiguous.includes(id)) this.#ambiguous.delete(id);
+    const rechecking = new Set<string>();
     for (const route of routes) {
-      if (route.machine === this.reader.machine || !route.live || route.kind !== "root") continue;
+      if (route.machine === this.reader.machine || (!route.live && !route.rootRecheck) || route.kind !== "root") continue;
       const record = projectNatsMirrorRecord(route.record);
       if (!record || !isCanonicalRoot(record.id) || record.id !== record.rootId || record.id !== record.ownerHostId ||
         record.id !== record.ownerIdentityId) continue;
       if (!this.options.admit(record, "toFile", route.machine)) continue;
+      if (route.rootRecheck) {
+        // Its owner is re-checking the root: not routable, so not mirrored live, and not gone, so the
+        // snapshot is partial and the file side holds its mirror (to that mirror's own deadline).
+        rechecking.add(record.id);
+        if (!this.#rechecking.has(record.id) && this.#rechecking.size < MAX_REPORTED) {
+          this.#rechecking.add(record.id);
+          this.options.log?.(`nats presence: ${record.id} awaits a root re-check; not routable, mirror held`);
+        }
+        continue;
+      }
       const remaining = Math.min(MIRROR_FRESH_MS, route.liveUntil - monotonicNow);
       if (remaining <= 0) continue;
       const expiresAt = observedAt + remaining;
@@ -1014,8 +1037,10 @@ export class NatsBridgePresence {
       });
       participants.push(record);
     }
+    for (const id of [...this.#rechecking]) if (!rechecking.has(id)) this.#rechecking.delete(id);
     // During a reconnect gap a root that aged out is unknown, not gone: never withdrawal evidence.
-    return { hosts, participants, reserved: [], ...(this.reader.resyncing ? { partial: true } : {}) };
+    // So is a root whose lease awaits a root re-check.
+    return { hosts, participants, reserved: [], ...(this.reader.resyncing || rechecking.size > 0 ? { partial: true } : {}) };
   }
 
   /**

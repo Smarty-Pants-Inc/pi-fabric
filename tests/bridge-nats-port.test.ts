@@ -20,7 +20,7 @@ import type { BridgeHost } from "../src/mesh/bridge.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { hashToken } from "../src/transport/nats/subjects.js";
 import { TransportDeniedError, TransportUncertainError, type TransportEnvelope, type TransportSent } from "../src/transport/types.js";
-import { advance, hKey, kvWorld, pKey, seedNative, type KvWorld } from "./helpers/bridge-nats-kv.js";
+import { advance, hKey, kvWorld, natsLease, pKey, seedNative, type KvWorld } from "./helpers/bridge-nats-kv.js";
 
 const BRIDGE = "ryzen1-bridge";
 const V2 = "v2-org";
@@ -279,6 +279,45 @@ describe("NATS bridge port: with L3's identity gate", () => {
     expect(gate.verifySender("nats", NATS_ROOT, nats, fileView, "v3-org")).toMatchObject({ ok: false });
     expect(gate.verifyTarget("nats", NATS_ROOT, nats, fileView)).toMatchObject({ ok: true });
     expect(gate.verifySender("nats", FILE_ROOT, nats, fileView, V2)).toMatchObject({ ok: false, refuse: "BRIDGE_NATS_SIDE_MISMATCH" });
+  });
+
+  it("treats a v2 root whose lease awaits a root re-check as not live in resolve, presence and presenceView, until it is rewritten", async () => {
+    const w = kvWorld();
+    seedNative(w, V2, natsRoot(), 1_000_000);
+    const { port: p, clock } = port(w);
+    await p.start();
+    const config = parseBridgeNatsAllowSection({ file: [{ kind: "root", id: FILE_ROOT }], nats: [{ kind: "root", id: NATS_ROOT, machine: V2 }] },
+      { link: LINK, natsMachine: BRIDGE });
+    const gate = createBridgeNatsIdentityGate(config, { pins: { seats: new Map(), bound: new Map() }, clock: () => clock.wall });
+    const fileView = { side: "file" as const, records: () => [] };
+    expect(gate.verifyTarget("nats", NATS_ROOT, p.presenceView(), fileView)).toMatchObject({ ok: true });
+    // The v2 owner's lease lapsed in KV and was created again with rootRecheck (host-leases.ts).
+    const key = hKey(V2, NATS_ROOT);
+    const owner = `${NATS_ROOT}#nats-inc-1`;
+    w.leases.expire(key);
+    w.leases.put(key, owner, { ...natsLease(NATS_ROOT, "nats-inc-1", clock.wall), rootRecheck: true }, 0);
+    await vi.waitFor(() => expect(p.kv.reader.lease(V2, NATS_ROOT)?.entry.value.rootRecheck).toBe(true));
+    // Kept, not absent (resolve is a fact, never undefined here), but not routable: as native routing.
+    expect(p.resolve(NATS_ROOT)?.route).toMatchObject({ machine: V2, ownerIncarnation: "nats-inc-1", live: false });
+    expect((await receiver(w)).resolve(NATS_ROOT)).toMatchObject({ machine: V2, live: false });
+    const view = p.presenceView();
+    expect(view.records(NATS_ROOT)).toEqual([expect.objectContaining({ id: NATS_ROOT, machine: V2, live: false })]);
+    expect(view.list?.().find(record => record.id === NATS_ROOT)).toMatchObject({ live: false });
+    // The gate's live input is false: neither a sender nor a target.
+    expect(gate.verifySender("nats", NATS_ROOT, view, fileView, V2)).toMatchObject({ ok: false });
+    expect(gate.verifyTarget("nats", NATS_ROOT, view, fileView)).toMatchObject({ ok: false });
+    // Not mirrored as live, and the snapshot is partial: unknown is never withdrawal evidence.
+    const during = await p.presence();
+    expect(during.hosts).toEqual([]);
+    expect(during.partial).toBe(true);
+    // Rewritten without rootRecheck: routable again, and the snapshot is complete.
+    w.leases.put(key, owner, natsLease(NATS_ROOT, "nats-inc-1", clock.wall), w.leases.values.get(key)!.revision);
+    await vi.waitFor(() => expect(p.resolve(NATS_ROOT)?.route.live).toBe(true));
+    expect(gate.verifyTarget("nats", NATS_ROOT, p.presenceView(), fileView)).toMatchObject({ ok: true });
+    expect(gate.verifySender("nats", NATS_ROOT, p.presenceView(), fileView, V2)).toMatchObject({ ok: true });
+    const after = await p.presence();
+    expect(after.partial).toBeUndefined();
+    expect(after.hosts.map(host => host.record.id)).toEqual([NATS_ROOT]);
   });
 });
 

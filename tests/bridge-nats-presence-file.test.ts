@@ -11,7 +11,7 @@ import { admitPresence, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
-import { hKey, kvWorld, seedNative } from "./helpers/bridge-nats-kv.js";
+import { hKey, kvWorld, natsLease, seedNative } from "./helpers/bridge-nats-kv.js";
 
 const V2 = "v2-org";
 const LINK = "v2";
@@ -65,5 +65,54 @@ describe("NATS presence through the real file mirror", () => {
     expect(later.hosts).toEqual([]);
     await hub.mirror(admitPresence(later, new Set(later.reserved), LINK), Date.now());
     expect(reader.list({ scope: "project", kinds: ["root"], fresh: true }).some(participant => participant.id === NATS_ROOT)).toBe(false);
+  });
+
+  it("holds the hub's mirror of a v2 root whose re-created lease awaits a root re-check, and renews it once the flag is gone", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-presence-file-"));
+    temps.push(dir);
+    const mesh = new MeshStore(path.join(dir, "mesh"), 65_536, 1_000);
+    closers.push({ close: () => mesh.closeState() });
+    const w = kvWorld();
+    seedNative(w, V2, natsRoot(Date.now()), Date.now());
+    const side = new NatsBridgePresence({ transport: w.transport("ryzen1-bridge", "bridge:v2"), link: LINK,
+      admit: (record, direction) => direction === "toFile" && record.id === NATS_ROOT, processProof: PROOF });
+    closers.push(side);
+    side.start();
+    await side.whenReady();
+    const hub = new StoreBridgeSide(mesh, LINK);
+    const first = await side.presence();
+    await hub.mirror(admitPresence(first, new Set(first.reserved), LINK), Date.now());
+    expect((await hub.owned()).participants.map(participant => participant.id)).toEqual([NATS_ROOT]);
+
+    // The v2 lease lapsed in KV and its owner created it again with rootRecheck: not routable, not gone.
+    const key = hKey(V2, NATS_ROOT);
+    const owner = `${NATS_ROOT}#nats-inc-1`;
+    w.leases.expire(key);
+    w.leases.put(key, owner, { ...natsLease(NATS_ROOT, "nats-inc-1", Date.now()), rootRecheck: true }, 0);
+    await vi.waitFor(() => expect(side.reader.lease(V2, NATS_ROOT)?.entry.value.rootRecheck).toBe(true));
+    expect(side.resolve(NATS_ROOT)?.live).toBe(false);
+    const during = await side.presence();
+    expect(during.hosts).toEqual([]);
+    const admitted = admitPresence(during, new Set(during.reserved), LINK);
+    expect(admitted.partial).toBe(true);
+    const held = (await hub.owned()).hosts.find(host => host.record.id === NATS_ROOT)!;
+    await hub.mirror(admitted, Date.now());
+    // No withdrawal: the mirror stays, unrenewed (its own deadline still bounds it).
+    const kept = await hub.owned();
+    expect(kept.participants.map(participant => participant.id)).toEqual([NATS_ROOT]);
+    expect(kept.hosts.find(host => host.record.id === NATS_ROOT)?.expiresAt).toBe(held.expiresAt);
+
+    // The owner re-checked its root and rewrote the lease without the flag: mirrored live again.
+    await new Promise(resolve => setTimeout(resolve, 5));
+    w.leases.put(key, owner, natsLease(NATS_ROOT, "nats-inc-1", Date.now()), w.leases.values.get(key)!.revision);
+    await vi.waitFor(() => expect(side.resolve(NATS_ROOT)?.live).toBe(true));
+    const after = await side.presence();
+    expect(after.partial).toBeUndefined();
+    expect(after.hosts.map(host => host.record.id)).toEqual([NATS_ROOT]);
+    await hub.mirror(admitPresence(after, new Set(after.reserved), LINK), Date.now());
+    const reader = new ParticipantDirectory(mesh, { enabled: true, hostId: "reader", rootId: "reader",
+      identity: { id: "reader", name: "reader", kind: "main" }, reapDeadHosts: false });
+    expect(reader.list({ scope: "project", kinds: ["root"], fresh: true }).find(participant => participant.id === NATS_ROOT))
+      .toMatchObject({ id: NATS_ROOT, remoteHost: LINK, stale: false });
   });
 });

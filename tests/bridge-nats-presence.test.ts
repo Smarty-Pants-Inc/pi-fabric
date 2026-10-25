@@ -134,6 +134,51 @@ describe("NATS presence -> file mirror snapshot", () => {
     expect((await side.presence()).hosts).toEqual([]);
   });
 
+  it("neither routes nor mirrors a root whose re-created lease awaits its root re-check, and holds instead of withdrawing", async () => {
+    const w = world();
+    seedNative(w, V2, natsRoot(), 1_000_000);
+    // A root this link does not mirror (not admitted) never holds the snapshot, re-check or not.
+    const other = "session:33333333-3333-4333-8333-333333333333";
+    seedNative(w, V2, natsRoot(other, "inc-3"), 1_000_000);
+    const otherKey = hKey(V2, other);
+    w.leases.put(otherKey, `${other}#inc-3`, { ...natsLease(other, "inc-3", 1_000_000), rootRecheck: true },
+      w.leases.values.get(otherKey)!.revision);
+    const { side, clock } = bridge(w, { admit: record => record.id === NATS_ROOT });
+    await side.whenReady();
+    expect(side.resolve(other)).toMatchObject({ machine: V2, live: false });
+    const before = await side.presence();
+    expect(before.partial).toBeUndefined();
+    expect(before.hosts.map(host => host.record.id)).toEqual([NATS_ROOT]);
+    // The owner's lease lapsed in KV and was created again: it carries rootRecheck until the owner
+    // re-checks its root (host-leases.ts), and native routing does not route it meanwhile.
+    const key = hKey(V2, NATS_ROOT);
+    const owner = `${NATS_ROOT}#nats-inc-1`;
+    w.leases.expire(key);
+    w.leases.put(key, owner, { ...natsLease(NATS_ROOT, "nats-inc-1", clock.wall), rootRecheck: true }, 0);
+    await waitFor(() => expect(side.reader.lease(V2, NATS_ROOT)?.entry.value.rootRecheck).toBe(true));
+    const receiver = await receiverView(w);
+    expect(receiver.resolve(NATS_ROOT)).toMatchObject({ machine: V2, live: false });
+    // The same answer here: the record is kept (not absent), but it is not live.
+    expect(side.resolve(NATS_ROOT)).toMatchObject({ id: NATS_ROOT, machine: V2, live: false, rootRecheck: true });
+    expect(side.reader.records(NATS_ROOT)).toEqual([expect.objectContaining({ live: false, rootRecheck: true })]);
+    expect(side.verifySender(NATS_ROOT, V2)).toEqual({ ok: false, refuse: "FABRIC_SENDER_UNVERIFIED" });
+    const during = await side.presence();
+    expect(during.hosts).toEqual([]);
+    expect(during.participants).toEqual([]);
+    // Unknown, not gone: a partial snapshot, so the file side holds its mirror and never withdraws it.
+    expect(during.partial).toBe(true);
+    // The owner confirmed its root: its next write drops the flag, and the root routes again.
+    advance(clock, 1_000);
+    w.leases.put(key, owner, natsLease(NATS_ROOT, "nats-inc-1", clock.wall), w.leases.values.get(key)!.revision);
+    await waitFor(() => expect(side.resolve(NATS_ROOT)?.live).toBe(true));
+    expect(side.resolve(NATS_ROOT)?.rootRecheck).toBe(false);
+    expect(side.verifySender(NATS_ROOT, V2)).toMatchObject({ ok: true, route: { machine: V2 } });
+    const after = await side.presence();
+    expect(after.partial).toBeUndefined();
+    expect(after.hosts.map(host => host.record.id)).toEqual([NATS_ROOT]);
+    expect(after.participants).toEqual([projectNatsMirrorRecord(natsRoot())]);
+  });
+
   it("loses authority when lease renewals stop arriving, and when the owner's own expiry passed", async () => {
     const w = world();
     seedNative(w, V2, natsRoot(), 1_000_000);

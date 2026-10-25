@@ -102,11 +102,14 @@ export interface BridgeNatsPresenceRecord {
   /** NATS only: the machine of the KV key that holds the record (credential-bound writer), never a JSON field. */
   readonly machine?: string;
   /**
-   * File only: set when the record is a mirror (its `remoteHost`, the link that mirrored it). On NATS a
-   * mirror is a record under the bridge machine (KV presence refuses `remoteHost`), so this stays unset there.
+   * File only: set when the record is a mirror: the link that HOLDS it here (`bridgeVia ?? remoteHost`,
+   * as bridge.ts mirrorLinkOf). On NATS a mirror is a record under the bridge machine (KV presence refuses
+   * `remoteHost`), so this stays unset there. Build file records with bridgeNatsFilePresenceRecord.
    */
   readonly mirroredBy?: string;
-  /** File only: set when the mirror is itself a re-export (`bridgeVia`); a spoke root must be a DIRECT mirror. */
+  /** File only: the record's stored `remoteHost` (its origin link), unchanged. A spoke root needs it. */
+  readonly remoteHost?: string;
+  /** File only: the record's stored `bridgeVia` (a re-export hop); a spoke root must have none. */
   readonly bridgeVia?: string;
   /** Live by this side's lease rules at observation time (NATS: presence + lease pair, same incarnation). */
   readonly live: boolean;

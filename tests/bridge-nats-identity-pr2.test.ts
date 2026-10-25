@@ -3,6 +3,7 @@
 import { describe, expect, it } from "vitest";
 import {
   BridgeNatsAllowListError,
+  bridgeNatsFilePresenceRecord,
   createBridgeNatsIdentityGate,
   parseBridgeNatsAllowSection,
   readBridgeNatsSeatPins,
@@ -51,13 +52,20 @@ const record = (fields: Partial<BridgeNatsPresenceRecord> & { id: string }): Bri
   name: `root-${fields.id.slice(-2)}`, kind: "main", rootId: fields.id, ownerHostId: `host-${fields.id.slice(-2)}`,
   ownerIdentityId: fields.id, ownerIncarnation: "inc-1", live: true, observedAt: NOW, ...fields,
 });
+/** A stored participant row as the hub's mesh holds it. */
+const row = (id: string) => ({ id, kind: "root", name: `root-${id.slice(-2)}`, rootId: id, ownerHostId: `host-${id.slice(-2)}`,
+  ownerIdentityId: id, ownerIncarnation: "inc-1" });
+/** A spoke link's DIRECT hub mirror (stored remoteHost = spoke, no bridgeVia), through the shared builder. */
+const spokeMirror = (id: string, spoke: string, observation: { live?: boolean; observedAt?: number } = {}): BridgeNatsPresenceRecord =>
+  bridgeNatsFilePresenceRecord({ ...row(id), remoteHost: spoke }, { live: observation.live ?? true, observedAt: observation.observedAt ?? NOW });
+
 const view = (side: BridgeNatsSide, records: BridgeNatsPresenceRecord[]): BridgeNatsPresenceView =>
   ({ side, records: id => records.filter(entry => entry.id === id), list: () => records });
 
 /** The hub's file mesh: the lane as spoke ryzen2's direct mirror; the moved lead as this link's mirror. */
 const hub = (extra: BridgeNatsPresenceRecord[] = [], lane = true) => view("file", [
-  ...(lane ? [record({ id: LANE, mirroredBy: SPOKE })] : []),
-  record({ id: MOVED, mirroredBy: LINK }),
+  ...(lane ? [spokeMirror(LANE, SPOKE)] : []),
+  record({ id: MOVED, mirroredBy: LINK, remoteHost: LINK }),
   ...extra,
 ]);
 const nats = (extra: BridgeNatsPresenceRecord[] = [], base = true) => view("nats", [
@@ -124,12 +132,18 @@ describe("spoke roots: verified only as the hub's direct mirror held by their sp
 
   it.each([
     ["only a native hub record (no spoke mirror)", () => hub([record({ id: LANE })], false), BRIDGE_NATS_REFUSAL.senderUnverified],
-    ["a mirror held by another spoke link", () => hub([record({ id: LANE, mirroredBy: "ryzen3" })], false), BRIDGE_NATS_REFUSAL.senderUnverified],
-    ["a re-exported (bridgeVia) mirror", () => hub([record({ id: LANE, mirroredBy: SPOKE, bridgeVia: "hub" })], false), BRIDGE_NATS_REFUSAL.senderUnverified],
+    ["a mirror held by another spoke link", () => hub([spokeMirror(LANE, "ryzen3")], false), BRIDGE_NATS_REFUSAL.senderUnverified],
+    // The audit's P0 sequence: a re-export from ryzen3 HELD by the spoke link (stored remoteHost ryzen3,
+    // bridgeVia ryzen2), projected by the shared builder: held by ryzen2, but not its direct mirror.
+    ["a re-export held by the spoke link", () => hub([bridgeNatsFilePresenceRecord({ ...row(LANE), remoteHost: "ryzen3", bridgeVia: SPOKE },
+      { live: true, observedAt: NOW })], false), BRIDGE_NATS_REFUSAL.senderUnverified],
+    ["a record whose adapter dropped remoteHost", () => hub([record({ id: LANE, mirroredBy: SPOKE })], false), BRIDGE_NATS_REFUSAL.senderUnverified],
+    ["a direct-looking record that carries bridgeVia", () => hub([record({ id: LANE, mirroredBy: SPOKE, remoteHost: SPOKE, bridgeVia: "hub" })], false),
+      BRIDGE_NATS_REFUSAL.senderUnverified],
     ["the spoke mirror next to a native record", () => hub([record({ id: LANE })]), BRIDGE_NATS_REFUSAL.ambiguous],
-    ["the spoke mirror next to another link's mirror", () => hub([record({ id: LANE, mirroredBy: "ryzen3" })]), BRIDGE_NATS_REFUSAL.ambiguous],
-    ["a stale spoke mirror", () => hub([record({ id: LANE, mirroredBy: SPOKE, observedAt: NOW - 15_001 })], false), BRIDGE_NATS_REFUSAL.senderUnverified],
-    ["a spoke mirror that is not live", () => hub([record({ id: LANE, mirroredBy: SPOKE, live: false })], false), BRIDGE_NATS_REFUSAL.senderUnverified],
+    ["the spoke mirror next to another link's mirror", () => hub([spokeMirror(LANE, "ryzen3")]), BRIDGE_NATS_REFUSAL.ambiguous],
+    ["a stale spoke mirror", () => hub([spokeMirror(LANE, SPOKE, { observedAt: NOW - 15_001 })], false), BRIDGE_NATS_REFUSAL.senderUnverified],
+    ["a spoke mirror that is not live", () => hub([spokeMirror(LANE, SPOKE, { live: false })], false), BRIDGE_NATS_REFUSAL.senderUnverified],
   ])("refuses %s", (_name, presence, expected) => {
     expect(code(gateAt().verifySender("file", LANE, presence(), nats()))).toBe(expected);
   });
@@ -141,7 +155,7 @@ describe("spoke roots: verified only as the hub's direct mirror held by their sp
 
   it("keeps PR 1's rule for entries without viaSpoke: another link's mirror is no sender", () => {
     const gate = gateAt({ file: [{ kind: "root", id: OTHER }] });
-    expect(code(gate.verifySender("file", OTHER, view("file", [record({ id: OTHER, mirroredBy: SPOKE })]), nats([], false))))
+    expect(code(gate.verifySender("file", OTHER, view("file", [spokeMirror(OTHER, SPOKE)]), nats([], false))))
       .toBe(BRIDGE_NATS_REFUSAL.senderUnverified);
   });
 
@@ -210,6 +224,20 @@ describe("N4: an event's claimed sender is presence-checked only, and republishe
       .toBe(BRIDGE_NATS_REFUSAL.senderUnverified);
     expect(code(gate.allow({ direction: "toFile", sender, target: lane, subject: { type: "topic", topic: "fleet.work.x.1", kind: "wait" } })))
       .toBe(BRIDGE_NATS_REFUSAL.senderUnverified);
+  });
+});
+
+describe("bridgeNatsFilePresenceRecord", () => {
+  it("copies remoteHost and bridgeVia as stored and names the holding link as mirroredBy", () => {
+    const native = bridgeNatsFilePresenceRecord(row(LANE), { live: true, observedAt: NOW });
+    expect(native).toEqual({ ...row(LANE), kind: "main", live: true, observedAt: NOW });
+    expect(bridgeNatsFilePresenceRecord({ ...row(LANE), remoteHost: SPOKE }, { live: true, observedAt: NOW }))
+      .toMatchObject({ remoteHost: SPOKE, mirroredBy: SPOKE });
+    const reexport = bridgeNatsFilePresenceRecord({ ...row(LANE), remoteHost: "ryzen3", bridgeVia: SPOKE }, { live: false, observedAt: NOW });
+    expect(reexport).toMatchObject({ remoteHost: "ryzen3", bridgeVia: SPOKE, mirroredBy: SPOKE, live: false });
+    expect(bridgeNatsFilePresenceRecord({ ...row(LANE), kind: "actor" }, { live: true, observedAt: NOW }).kind).toBe("actor");
+    expect(bridgeNatsFilePresenceRecord({ ...row(LANE), kind: "agent" }, { live: true, observedAt: NOW }).kind).toBe("agent");
+    expect(Object.isFrozen(reexport)).toBe(true);
   });
 });
 

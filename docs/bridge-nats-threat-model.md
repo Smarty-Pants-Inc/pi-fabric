@@ -10,10 +10,13 @@ Status of the code it describes (PR 1):
   allow-list gate `src/mesh/bridge-nats-identity.ts`, and the durable ledger
   `src/mesh/bridge-nats-ledger.ts` (tests: `tests/bridge-nats-types.test.ts`,
   `tests/bridge-nats-identity.test.ts`, `tests/bridge-nats-ledger.test.ts`).
-- Written by other lanes, judged against the rules here: L1's raw NATS port (`BridgeNatsPort`), L2's
-  `NatsCarrierSide` and link (`src/mesh/bridge-nats-file.ts`, `src/mesh/bridge-nats-link.ts`), L5's
-  config and CLI (`src/mesh/bridge-nats-config.ts`). Where this page says "L1 must" or "L2 must", the
-  pass checks that code for it.
+- Written by other lanes, judged against the rules here: L1's raw NATS port `BridgeNatsPort`
+  (`src/mesh/bridge-nats-port.ts`, with `-presence.ts`, `-actors.ts`, `-roots.ts`), L2's
+  `NatsCarrierSide`, topic translators and link (`src/mesh/bridge-nats-carrier.ts`, `-file.ts`,
+  `-topics.ts`, `-link.ts`), L5's config, operations and CLI (`src/mesh/bridge-nats-config.ts`,
+  `-ops.ts`, `src/mesh-bridge-nats-cli.ts`, `bin/nats-link`, `docs/mesh-bridge-nats.md`). Where this
+  page says "L1 must" or "L2 must", the pass checks that code for it. L1's event-stream consumer
+  (`src/mesh/bridge-nats-events.ts`, N4) is PR 2 and not wired in PR 1.
 - Not in PR 1: the relay between bridges for work-host lanes (N2) and the v2 -> factory `fleet.work`
   republish (N4). Until PR 2, topic routes cross file -> NATS only.
 
@@ -212,6 +215,29 @@ line): appends are sequential and fail-stop, so a longer damaged suffix, or dama
 is corruption and refuses to open. A write or fsync failure, or an unconfirmed compaction rename, stops
 all further appends until a restart.
 
+### R12. A refused command always gets an answer, and only its verified sender gets it
+
+Integrator decision F (coordination notes 10 and 11). A command the link refuses before publishing
+(a gate refusal, or a ledger `refuse` from `bridgeNatsClaimAction`) is answered at once, so the sender
+never waits for its timeout:
+
+- **To a file sender:** a `fabric.control.ack` with `accepted: false`, `notRun: true`, the stable
+  `BRIDGE_NATS_*` code and the original commandId, addressed to the sender's `replyTo`. It is authored as
+  the mirrored owner identity of the refused target, with the link stamp `data.bridge.from == <link>`,
+  and it carries no `ownerIncarnation` (the link cannot attest an owner epoch). A file sender accepts a
+  mirrored owner's ACK only from that `ownerIdentityId` with that stamp
+  (`control-plane.ts` `#authenticatedAcknowledgement`); `bridge:<link>` is accepted only for relay
+  refusals with relay codes, so it would leave the sender waiting. L2 writes it through
+  `StoreBridgeSide.publish` under the held fence on that owner: it is published only while this link
+  holds that owner's mirror.
+- **To a NATS sender:** a rejection `ack:<envelope id>` with `notRun: true`, the stable code and the
+  sender's own body digest, from the targeted file identity's KV mirror (finding D).
+- **An unverified sender gets nothing:** the command is dropped (NATS: `term`) and logged. An answer
+  addressed to an unproven identity could deliver a refusal, and its `notRun` permission to resend, to
+  whoever claimed that id.
+- **Only before publish:** `notRun` tells the sender a resend cannot deliver twice. The link writes it
+  only for a command it never published; a command it carried is answered only by its owner's ACK (R7).
+
 ## 5. Threats
 
 | # | Threat | Mitigation | Residual |
@@ -232,6 +258,7 @@ all further appends until a restart.
 | T14 | Stale presence authorizes traffic | 15 s freshness on observations and issued identities | Within 15 s a just-stopped Main can still be targeted; its owner refuses a stale incarnation |
 | T15 | Topic injection into a moved lead | R10 receiveTopics, followUp only, rate bounds, never control | A file publisher can post allowed topics to a root that asked for them (as today on the file mesh) |
 | T16 | Flooding across the link | Topic routes spend the file bridge's factory rate buckets (L2); past 1,000,000 live records the ledger refuses new claims and drops none | Control commands from an allow-listed sender have no new per-sender rate bound in PR 1 |
+| T17 | The link answers in a mirrored owner's name | R12: only for a command it refused before any publish, with `notRun` and a `BRIDGE_NATS_*` code, no owner epoch, under the held fence on that owner, to a verified sender only | A link bug that refused after publishing would let the sender's resend deliver twice; L2's tests must show every refusal precedes the claim's publish |
 
 ## 6. Checklist for the pass
 
@@ -240,14 +267,16 @@ all further appends until a restart.
 2. `bridge-nats-ledger.ts`: durability order (fsync before visible), load rules, fail-stop, lock takeover
    conditions, file modes, horizon.
 3. L2: the gate runs before every publish in both directions; a refusal becomes a `notRun` rejection ACK
-   (or a dropped event and a log line), never a publish; a `BridgeNatsNativePublisher` is built only for a
+   as R12 states (or, for an unverified sender, a dropped event and a log line), never a publish; a
+   `BridgeNatsNativePublisher` is built only for a
    native, unbridged file event (verification `mesh`, no `data.bridge`); the crossing `from` is the verified identity;
    principal strip is applied; ACKs are mapped back through the ledger to the claimed `replyTo`; NATS
    deliveries are acked only after the durable file append.
 4. L1: publishes only as `ryzen1-bridge`; writes KV only under its own prefixes; `presenceView()` returns
    every record for an id on every machine (the gate's ambiguity rule depends on it); the machine comes
    from the KV key, never a JSON field.
-5. L5: config and credential file checks; org.json path; `--dry-run` writes nothing.
+5. L5: config and credential file checks; the org.json path; `dry-run` writes nothing and creates no state
+   directory; `withdraw` deletes only the bridge machine's own KV keys and this link's file mirrors.
 6. The real-broker E2E (L4): one keyed followUp each way, a dropped ACK and a forced disconnect give one
    consumption; a second sender reusing a commandId gets no answer; a seat refuses steer; an
    un-listed NATS root is refused.

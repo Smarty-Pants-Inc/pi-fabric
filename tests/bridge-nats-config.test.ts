@@ -192,6 +192,35 @@ describe.skipIf(process.platform === "win32")("nats-link config (Linux/macOS onl
     expect(natsLinkAllowListConfig(parseNatsLinkConfig(sample({ allow: undefined }))).entries).toEqual([]);
   });
 
+  it("takes PR 2's spoke roots (relay.spokes) and N4 republish topics (nats.events)", () => {
+    const SPOKE = "session:00000000-0000-7000-8000-00000000000e";
+    const spokeRoot = { kind: "root", id: SPOKE, viaSpoke: "ryzen4", send: ["followUp", "cancel"] };
+    const republisher = { ...NATS_ALLOW[1], republishTopics: ["fleet.work.*", "ops.owner"] };
+    const events = { ...NATS, events: true };
+    const config = parseNatsLinkConfig(sample({ nats: events, relay: { spokes: ["ryzen4", "epyc1"] },
+      allow: { file: [...FILE, spokeRoot], nats: [NATS_ALLOW[0], republisher] } }));
+    expect(config.relay).toEqual({ spokes: ["ryzen4", "epyc1"] });
+    const entries = natsLinkAllowListConfig(config).entries;
+    expect(entries.find((entry) => entry.kind === "root" && entry.id === SPOKE)).toMatchObject({ side: "file", viaSpoke: "ryzen4" });
+    expect(entries.find((entry) => entry.kind === "root" && entry.id === LEAD))
+      .toMatchObject({ republishTopics: ["fleet.work.*", "ops.owner"] });
+    expect(describeNatsLinkConfig(config)).toMatchObject({ relay: { spokes: ["ryzen4", "epyc1"] } });
+    expect(parseNatsLinkConfig(sample()).relay).toEqual({ spokes: [] });
+
+    // A viaSpoke must name a configured spoke link: with no relay.spokes, every spoke root is refused.
+    refused(sample({ allow: { file: [spokeRoot] } }), "allow.file[0].viaSpoke");
+    refused(sample({ relay: { spokes: ["epyc1"] }, allow: { file: [spokeRoot] } }), "allow.file[0].viaSpoke");
+    refused(sample({ relay: { spokes: ["ryzen4"] }, allow: { nats: [{ ...NATS_ALLOW[1], viaSpoke: "ryzen4" }] } }), "allow.nats[0].viaSpoke");
+    refused(sample({ relay: { spokes: ["v2"] } }), "relay.spokes");
+    refused(sample({ relay: { spokes: ["ryzen1"] } }), "relay.spokes");
+    refused(sample({ relay: { spokes: ["ryzen4", "ryzen4"] } }), "relay.spokes");
+    refused(sample({ relay: { spoke: ["ryzen4"] } }), "relay");
+    // republishTopics: allow.nats only, fleet.work.* or ops.* only, and only with nats.events.
+    refused(sample({ allow: { nats: [republisher] } }), "nats.events");
+    refused(sample({ nats: events, allow: { nats: [{ ...republisher, republishTopics: ["github.pr"] }] } }), "allow.nats[0].republishTopics");
+    refused(sample({ nats: events, allow: { file: [{ ...FILE[0], republishTopics: ["fleet.work.*"] }] } }), "allow.file[0].republishTopics");
+  });
+
   it("describes the config without reading a credential", () => {
     const description = describeNatsLinkConfig(parseNatsLinkConfig(sample()));
     expect(description).toMatchObject({ name: "ryzen1", link: "v2",

@@ -53,14 +53,17 @@ NATS root become one keyed `followUp` to it, from `bridge:<link>`, when the entr
 ### NATS events republished into the hub (N4)
 
 A Main on NATS publishes its topic events to the org's event stream (`FABRIC_EV_<ORG>`), not to any file
-mesh. With `nats.events: true`, the link reads that stream and republishes a `fleet.work.*` event into the
-hub's mesh on the same topic, so the hub factory and every file-mesh reader see it as they see a hub event.
+mesh. With `nats.events: true`, the link reads that stream and republishes a `fleet.work.*` or `ops.*`
+event into the hub's mesh on the same topic, so the hub factory and every file-mesh reader see it as they
+see a hub event.
 
-- Only events from an `allow.nats` entry that lists the topic in `republishTopics` (default none) cross.
-- The sender is the KV presence record its `from.id` resolves to: exactly one live root on an org machine
-  other than the link's own. An event subject names no source machine, so this is the only binding.
-- The republished event is authored as `bridge:<link>`. It keeps the verified sender and the source in
-  its `data.bridge` stamp.
+- Only events from an `allow.nats` root that lists the topic in `republishTopics` (exact or `prefix.*`,
+  `fleet.work.*` and `ops.*` only; default none) cross.
+- The sender is the KV presence record its `from.id` resolves to: exactly one live, fresh root on that
+  entry's pinned machine, never the link's own. An event subject names no source machine, so this binding
+  is weaker than for a control command: such an identity carries no control or topic-route authority.
+- The republished event is authored as `bridge:<link>`. The claimed sender is attribution only, recorded
+  beside the link stamp, never the event's `from`.
 - Exactly once by the stream sequence and the ledger: a redelivery after a crash is recognized and
   appended once. The stream message is acknowledged only after the durable file append.
 - No loops: an event that already crossed a bridge (`data.bridge`), or that claims an identity the link
@@ -76,9 +79,15 @@ gets its answers, through the hub's existing relay between bridge processes: the
 relay side.
 
 - The spoke root is listed in `allow.file` with `viaSpoke: "<spoke link>"`, the name of the hub's bridge
-  to that spoke. On the hub its record is that bridge's mirror (`remoteHost` = the spoke link), and its
-  identity comes only from that mirror's verified presence, never from the relayed message.
-- The same destination classes and operations apply as for a hub root.
+  to that spoke, which must be one of `relay.spokes`. It cannot be a principal seat.
+- Its identity comes only from the hub's DIRECT mirror held by that spoke link (`remoteHost` = the spoke
+  link, no `bridgeVia`), live and fresh, never from the relayed message. It is refused next to a native
+  record or another link's mirror of the same id, or when the same id answers on NATS.
+- It takes `followUp`, `steer`, `ask` (and its answer) and `cancel`, as a hub root.
+- The hub relay accepts the link as a relay peer only when it runs as `<release>/bin/nats-link start
+  --config FILE` from the same release as the hub's bridges, with FILE a regular file of ours with no group
+  or other bits (0600 or 0400) whose `name`, `link` and `file.mesh` match the peer it claims to be. `start`
+  refuses a looser file when `relay.spokes` is set. `pi-fabric nats-link start` is not a relay peer.
 
 The counters of both legs are in `nats-link status`.
 
@@ -120,14 +129,18 @@ at every level, so a misspelt field never falls back to a default.
     "custodyStream": "FABRIC_CUSTODY",
     "livenessStream": "FABRIC_LIVENESS",
     "pathBMachines": ["hub-a-bridge", "sandbox1"],
-    "operatorMachine": "fabric-ops"
+    "operatorMachine": "fabric-ops",
+    "events": true
   },
+  "relay": { "spokes": ["work-host-a"] },
   "allow": {
     "file": [
       { "kind": "root", "id": "session:00000000-0000-7000-8000-00000000000b", "principal": "Owner",
         "receive": ["followUp", "cancel"] },
       { "kind": "actor", "rootId": "session:00000000-0000-7000-8000-00000000000c", "name": "review",
-        "send": ["followUp", "steer"] }
+        "send": ["followUp", "steer"] },
+      { "kind": "root", "id": "session:00000000-0000-7000-8000-00000000000e", "viaSpoke": "work-host-a",
+        "send": ["followUp", "cancel"], "note": "a lane on a work host" }
     ],
     "nats": [
       { "kind": "root", "id": "session:00000000-0000-7000-8000-00000000000a", "principal": "Second",
@@ -135,7 +148,7 @@ at every level, so a misspelt field never falls back to a default.
         "receiveTopics": ["ops.owner"] },
       { "kind": "root", "id": "session:00000000-0000-7000-8000-00000000000d", "machine": "sandbox1",
         "send": ["followUp", "steer", "ask", "cancel"], "receive": ["followUp", "steer", "ask", "cancel"],
-        "receiveTopics": ["fleet.work.*"], "note": "a lead that moved to v2" }
+        "receiveTopics": ["fleet.work.*"], "republishTopics": ["fleet.work.*"], "note": "a lead that moved to v2" }
     ]
   }
 }
@@ -157,6 +170,7 @@ at every level, so a misspelt field never falls back to a default.
 | `nats.events` | Default false. True reads the org's event stream for N4 republishing; needs `org` and the events grant on the link's NATS user. |
 | `nats.inboxLanes` | Default 8. |
 | `allow.file`, `allow.nats` | Who may cross; see below. |
+| `relay.spokes` | PR 2: the hub's `mesh-bridge` links to work-host spokes (their `--remote` names). A `viaSpoke` root must name one. Default none. |
 | `callTimeoutMs` | Deadline of each NATS-side call (default 30,000; 1,000 to 300,000). |
 | `logLevel` | `info` (default) or `debug`. |
 
@@ -178,10 +192,11 @@ appears once, on one side.
 - `receive`: operations it may receive from across, within its destination class (default
   `["followUp"]` where the class takes it; a NATS actor receives nothing).
 - `receiveTopics`: roots only; exact topics or `prefix.*`.
-- `republishTopics`: `allow.nats` roots only (PR 2, N4); the `fleet.work.*` topics of this identity's
-  NATS-published events that the link republishes into the hub's mesh. Default none; needs
-  `nats.events: true`.
-- `viaSpoke`: `allow.file` roots only (PR 2); the hub's `mesh-bridge` link to the spoke this root lives on.
+- `republishTopics`: `allow.nats` roots only (PR 2, N4); the topics (exact or `prefix.*`, `fleet.work.*`
+  and `ops.*` only) of this identity's NATS-published events that the link republishes into the hub's mesh.
+  Default none; needs `nats.events: true`.
+- `viaSpoke`: `allow.file` roots only (PR 2), never a principal seat; the hub's `mesh-bridge` link to the
+  spoke this root lives on, one of `relay.spokes`.
 - `principals`: Fabric principal ids whose authority this sender may carry across; any other is stripped.
 - `machine`: required on every `allow.nats` entry, and only there; pins the identity to one org machine in
   `pathBMachines` (never the link's own). Without a pin, another machine could register that id while the

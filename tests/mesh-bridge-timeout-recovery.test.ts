@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isMeshLockTimeout, isMeshSnapshotRetriesExhausted } from "../src/core/atomic-write.js";
+import { isMeshLockTimeout, isMeshSnapshotRetriesExhausted, MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { BridgeOwnershipError, BridgeStaleIncarnationError, MeshBridge, RemoteBridgeSide,
   serveBridgeAgent, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshLockQueueExpiredError } from "../src/mesh/mesh-lock.js";
@@ -14,11 +14,12 @@ import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.
 import { writeHostLease } from "../src/topology/host-leases.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
-// KEEP: data safety / a failure path the CLI canary's sub-budget hold cannot reach.
+// Existing-behavior recovery guard, not a new retry or fairness fix.
+// The CLI canary's sub-budget hold cannot reach this full-budget failure path.
 // Same native-presence + PassThrough RPC fixture as mesh-bridge-busy-streak. No fake
 // clocks, timeout injection, admission changes, or extra production retry layer.
 // 500 ms is the COMPLETE configured store budget, not a withTryLock/zero-budget
-// refusal. This proves recovery policy, not fairness or the production 10 s tail.
+// refusal. This guards recovery policy, not fairness or the production 10 s tail.
 const BUDGET_MS = 500;
 const TOPIC = "fabric.control.ack";
 const WORK_TOPIC = "fleet.work.timeout-recovery";
@@ -276,9 +277,9 @@ describe("bridge recovery after a real complete lock budget", () => {
     expect(isMeshLockTimeout(error)).toBe(true);
     expect(isMeshRetryableBusy(error)).toBe(true);
     expect(elapsedMs).toBeGreaterThanOrEqual(BUDGET_MS); // Not an immediate/zero-budget outer refusal.
-    // At the retained deadline, either the next initial acquisition expires before probing or
-    // the helper rethrows its last real fence BUSY. Require the exact subtype AND matching outer
-    // label; the shared timeout code alone must not misattribute pre-lock expiry as contention.
+    // Existing retained-deadline exits: queued expiry, the last native fence BUSY, or a plain
+    // zero-probe timeout after short-budget admission closes at 80%. Require each exact subtype
+    // and deadline shape AND matching outer label; the shared timeout code alone is not enough.
     let label: string;
     if (error instanceof MeshLockQueueExpiredError) {
       expect(error).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED",
@@ -287,7 +288,14 @@ describe("bridge recovery after a real complete lock budget", () => {
       label = "mesh pre-lock queue expiry";
       expect(outerRetry).toContain("; retrying in 0 ms;");
     } else {
-      expect(error).toBe(nativeRefusals.at(-1)); // Only the observed, call-through native refusal is allowed.
+      if (error instanceof MeshStateBusyError) {
+        expect(error).toBe(nativeRefusals.at(-1)); // Only the observed, call-through native refusal is allowed.
+      } else {
+        expect(Object.getPrototypeOf(error)).toBe(MeshLockTimeoutError.prototype);
+        expect(error).toMatchObject({ name: "MeshLockTimeoutError", code: "FABRIC_MESH_LOCK_TIMEOUT",
+          attempts: 0, maxGapMs: 0, stalled: false, holder: " (lock directory has no owner record)" });
+        expect(error).not.toHaveProperty("busyCode");
+      }
       expect(error).not.toHaveProperty("preLockCode");
       label = "mesh lock timeout";
     }

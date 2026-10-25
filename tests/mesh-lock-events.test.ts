@@ -724,15 +724,11 @@ describe("lock events in one process", () => {
   });
 
   // smarty-dev#12036: pending incarnation is not contention. A shorter-budget cold acquisition
-  // has its own retry code before it ever tries .lock, with no event at all. Once ready, the same
-  // short-budget caller joins FIFO: expiry behind the holder's live receipt is still not contention.
+  // has its own retry code before it ever tries .lock, with no wait-timeout event.
   it("a cold protocol-2 pending acquisition records no wait-timeout event", async () => {
-    const { events, MeshLock } = await load();
+    const { MeshLock } = await load();
     const root = temp();
-    const holder = new MeshLock(root, { lockHeldEventMs: 0 }, () => undefined);
-    const waitTimeout = vi.spyOn(events, "waitTimeout");
-    const queueExpired = vi.spyOn(events, "queueExpired");
-    const operation = vi.fn(() => 1);
+    const holder = new MeshLock(root, {}, () => undefined);
     let release!: () => void;
     const released = new Promise<void>((resolve) => { release = resolve; });
     let entered!: () => void;
@@ -740,40 +736,18 @@ describe("lock events in one process", () => {
     const holding = holder.withLockAcrossAwait(async () => { entered(); await released; }, undefined, "custody");
     await inside;
     const cold = new MeshLock(root, { lockProtocol: 2 }, () => undefined);
-    try {
-      expect(cold.ownIncarnationReady).toBe(false);
-      await expect(cold.withLock(operation, 50, "publish")).rejects.toMatchObject({ code: "FABRIC_MESH_INCARNATION_PENDING" });
-      expect(operation).not.toHaveBeenCalled();
-      expect(waitTimeout).not.toHaveBeenCalled();
-      expect(queueExpired).not.toHaveBeenCalled();
-      expect(readEvents(eventsFile(root))).toEqual([]);
-    } finally { release(); await holding; }
+    expect(cold.ownIncarnationReady).toBe(false);
+    await expect(cold.withLock(() => 1, 50, "publish")).rejects.toMatchObject({ code: "FABRIC_MESH_INCARNATION_PENDING" });
+    release();
+    await holding;
+    expect(readEvents(eventsFile(root))).toEqual([]);
+    // Once ready, the same store tries .lock: a full-budget timeout is an event again.
     await cold.ownIncarnation;
-    expect(cold.ownIncarnationReady).toBe(true);
-    let releaseAgain!: () => void;
-    const releasedAgain = new Promise<void>((resolve) => { releaseAgain = resolve; });
-    let enteredAgain!: () => void;
-    const insideAgain = new Promise<void>((resolve) => { enteredAgain = resolve; });
-    const holdingAgain = holder.withLockAcrossAwait(async () => { enteredAgain(); await releasedAgain; }, undefined, "custody");
-    await insideAgain; // Real canonical custody AND its advisory receipt, not a sleep-based guess.
-    try {
-      const refusal = await cold.withLock(operation, 100, "publish").catch((error: unknown) => error);
-      expect(refusal).toMatchObject({ name: "MeshLockQueueExpiredError", code: "FABRIC_MESH_LOCK_TIMEOUT",
-        preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED", kind: "pre-lock", attempts: 0 });
-      expect((refusal as { waitersAhead: number }).waitersAhead).toBeGreaterThanOrEqual(1);
-      expect((refusal as { waitedMs: number }).waitedMs).toBeGreaterThanOrEqual(100);
-      expect(operation).not.toHaveBeenCalled();
-      expect(waitTimeout).not.toHaveBeenCalled();
-      expect(queueExpired).toHaveBeenCalledOnce();
-      const recorded = readEvents(eventsFile(root));
-      expect(recorded).toHaveLength(1);
-      expect(recorded[0]).toMatchObject({ kind: "pre-lock", preLockCode: "FABRIC_MESH_LOCK_QUEUE_EXPIRED",
-        store: "mesh-lock", class: "publish", holder: { pid: null, process: null, op: null },
-        waiter: { pid: process.pid, op: "publish" } });
-      expect(recorded[0]!.waitedMs).toBeGreaterThanOrEqual(100);
-      expect(recorded[0]!.waitersAhead).toBeGreaterThanOrEqual(1);
-      // The separate queue-blind legacy-holder test below still requires a real wait-timeout event.
-    } finally { releaseAgain(); await holdingAgain; }
+    const holdingAgain = holder.withLockAcrossAwait(async () => { await new Promise((resolve) => setTimeout(resolve, 300)); }, undefined, "custody");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await expect(cold.withLock(() => 1, 100, "publish")).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
+    await holdingAgain;
+    expect(readEvents(eventsFile(root)).map((event) => [event.kind, event.class])).toEqual([["wait-timeout", "publish"]]);
   });
 
   it("mesh .lock: held above the threshold, wait-timeout naming the owner record's pid, nothing for a bounded try", async () => {
@@ -787,12 +761,6 @@ describe("lock events in one process", () => {
     const inside = new Promise<void>((resolve) => { entered = resolve; });
     const holding = holder.withLockAcrossAwait(async () => { entered(); await released; spin(60); }, undefined, "custody");
     await inside;
-    // Model a queue-blind/legacy canonical holder: diagnostics must exercise actual .lock contention,
-    // not FIFO expiry behind a live receipt (short callers no longer abandon that queue).
-    const { meshLockQueueDirectory } = await import("../src/mesh/lock-queue.js");
-    const directory = meshLockQueueDirectory(root);
-    const [receipt] = fs.readdirSync(directory);
-    fs.renameSync(path.join(directory, receipt!), path.join(root, "legacy-holder-receipt"));
     // A fresh module graph (load): match the typed timeout by code, not by class identity.
     const timedOut = { code: "FABRIC_MESH_LOCK_TIMEOUT" };
     await expect(waiter.withLock(() => 1, 150, "publish")).rejects.toMatchObject(timedOut);

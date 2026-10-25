@@ -1,13 +1,16 @@
 #!/usr/bin/env node
-// Lab twin: N real StoreBridgeSide.mirror processes + one SqliteStateStore waiter; synthetic roots ONLY.
+// Non-reproducing lab harness: N real StoreBridgeSide.mirror processes + one SqliteStateStore waiter.
+// Synthetic roots ONLY; not a production-like busy-writer starvation reproduction or fix.
 // Node 24, run under the existing owned-job/CPU cap (e.g. .local/run-job.sh), never against a live mesh.
 // Smoke: node scripts/benchmark-sqlite-starvation.mjs --n=2 --seconds=0.2 --budgetMs=200
-// Real budget: node scripts/benchmark-sqlite-starvation.mjs --n=8 --seconds=15 --budgetMs=10000
+// 10 s budget (lab): node scripts/benchmark-sqlite-starvation.mjs --n=8 --seconds=15 --budgetMs=10000
 // Optional: --mode=both|probe-on|probe-off --label=main-before --out=/absolute/new-report.json
 // probe-on is unmodified source. probe-off disables ONLY probeEligible while bundling: a controlled
 // experiment, NOT an old release. Both modes repeat each peer's OWN unchanged, initially installed
 // snapshot (fixed source clock, no synthetic holds). Timed offered workload is identical; achieved
 // pass counts and scheduling/jitter are not deterministic. A waiter win means reproduction UNKNOWN.
+// The single initial waiter may encounter zero active SQL competition. Zero hot SQL commits
+// DURING its wait is not steady-state starvation exposure, regardless of total hot transactions.
 // One watchdog bounds each mode; only owned children are killed/joined. Scratch is private and this
 // script never deletes it, but wrappers may delete TMPDIR: only stdout / explicit --out are durable.
 import assert from "node:assert/strict";

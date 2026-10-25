@@ -14,6 +14,9 @@ export function meshLockQueueDirectory(root: string): string {
 }
 
 const TICKET = /^\d{24}-\d+-[a-f0-9-]+$/;
+// Budgets below this are short try-acquires (registry-fenced publication); they keep the
+// unconditional 80% fallback rather than waiting behind a long queue they cannot clear.
+const GATED_BUDGET_MS = 2000;
 // The head refreshes its receipt this often; the stall bound is at least four heartbeats.
 const HEARTBEAT_MS = 50;
 
@@ -26,7 +29,7 @@ const pidAlive = (name: string): boolean => {
  * Fair admission (smarty-dev#6477 L0b): each waiter watches only its predecessor's receipt and
  * is woken (inotify/FSEvents via fs.watch, short poll as the safety net) the moment it goes; the
  * head is woken when .lock is released. The holder keeps its receipt until it releases, so the
- * receipt order is the admission order. A waiter falls back to the plain contest after
+ * receipt order is the admission order. An ordinary waiter falls back to the plain contest after
  * 80% of its budget only when the head has stopped making progress (its receipt heartbeat is
  * older than the stall bound), so live queued waiters do not barge the head. Old releases ignore
  * this queue and still barge. The caller's acquisition deadline is never extended, and a live
@@ -39,6 +42,7 @@ export class MeshLockTicket {
   readonly #file: string;
   readonly #fallbackAt: number;
   readonly #staleMs: number;
+  readonly #gated: boolean;
   readonly #stallMs: number;
   readonly #passStalledHead: boolean;
   readonly #bypassLock: string | undefined;
@@ -77,6 +81,7 @@ export class MeshLockTicket {
     this.#file = path.join(this.#directory, this.#name);
     this.#fallbackAt = Date.now() + Math.min(10_000, Math.max(0, budgetMs * 0.8));
     this.#staleMs = Math.max(30_000, budgetMs * 2);
+    this.#gated = budgetMs >= GATED_BUDGET_MS;
     this.#stallMs = Math.min(2000, Math.max(4 * HEARTBEAT_MS, budgetMs * 0.1));
     this.#passStalledHead = options.passStalledHead === true;
     this.#bypassLock = options.stalledHeadBypassLock;
@@ -104,6 +109,8 @@ export class MeshLockTicket {
    * per heartbeat interval at any time) to judge the head's progress. */
   mayContend(): boolean {
     if (this.#closed) return true;
+    // Short (try) budgets keep the previous unconditional 80% fallback, head included.
+    if (!this.#gated && Date.now() >= this.#fallbackAt) { this.close(); return true; }
     if (this.#head) { this.#heartbeat(); return true; }
     // An earlier head can disappear while our immediate predecessor stays. Rediscover its promotion instead of
     // caching index > 1 until that predecessor leaves; it may itself now be the stalled head (#9805).
@@ -171,7 +178,7 @@ export class MeshLockTicket {
     return false;
   }
 
-  /** Past 80% of the budget (with `passStalledHead`, at any time), join the plain contest only if the head is
+  /** Past 80% of an ordinary budget (with `passStalledHead`, at any time), join the plain contest only if the head is
    * stalled: neither its heartbeat nor our first sight of it as head is within the stall bound. The second term
    * keeps a head that has only just taken over from being judged by its old creation time. Returns undefined when the
    * canonical-lock follower reaped its stalled head and the caller must rescan. */

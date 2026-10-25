@@ -130,16 +130,16 @@ describe("fair mesh lock admission", () => {
     expect(waiter.queued).toBe(true);
   });
 
-  it.each([1800, 2000])("%s ms budget: falls back past 80% when the live head stops making progress", budgetMs => {
+  it("falls back past 80% of the budget when the live head stops making progress", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const root = scratch();
     const head = ticket(root, 10_000);
-    const waiter = ticket(root, budgetMs);
+    const waiter = ticket(root, 2000);
     expect(head.mayContend()).toBe(true);
-    vi.advanceTimersByTime(budgetMs * 0.75);
+    vi.advanceTimersByTime(1500);
     expect(waiter.mayContend()).toBe(false); // before the fallback point: never
-    vi.advanceTimersByTime(budgetMs * 0.1);
-    // Past 80%: the old heartbeat is stalled, but this is our first sight of the head.
+    vi.advanceTimersByTime(200);
+    // Past 1600 ms: the head's heartbeat is 1700 ms old, but this is our first sight of it.
     expect(waiter.mayContend()).toBe(false);
     vi.advanceTimersByTime(250);
     // Still the same head and no heartbeat beyond the 200 ms stall bound: plain contest.
@@ -148,49 +148,16 @@ describe("fair mesh lock admission", () => {
     expect(names(root)).toHaveLength(1); // the live stalled head's receipt is never reaped early
   });
 
-  it.each([50, 1000])("%s ms try: does not barge a heartbeating head past 80%, then acquires after release", async budgetMs => {
-    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+  it("short try budgets keep the unconditional 80% fallback", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     const root = scratch();
     const head = ticket(root, 10_000);
+    const tryer = ticket(root, 50);
     expect(head.mayContend()).toBe(true);
-    const canonical = path.join(root, ".lock");
-    const owner = `live-holder\n${process.pid}\n${Date.now()}\n`;
-    fs.mkdirSync(canonical);
-    fs.writeFileSync(path.join(canonical, "owner"), owner);
-    const mkdir = vi.spyOn(fs, "mkdirSync");
-    const attempts = () => mkdir.mock.calls.filter(([file]) => String(file) === canonical).length;
-    const abort = new AbortController();
-    const lock = new MeshLock(root, { lockProtocol: 1, writeSignal: abort.signal }, () => undefined);
-    const deadline = Date.now() + budgetMs;
-    const operation = vi.fn(() => {
-      expect(Date.now()).toBeLessThanOrEqual(deadline);
-      expect(fs.existsSync(canonical)).toBe(true);
-      return "admitted";
-    });
-    const pending = lock.withTryLock(() => lock.withLock(operation), budgetMs).catch((error: unknown) => error);
-    try {
-      for (let elapsed = 0; elapsed < budgetMs * 0.9; elapsed += 5) {
-        await vi.advanceTimersByTimeAsync(5);
-        expect(head.mayContend()).toBe(true); // real receipt heartbeat, not mocked eligibility
-        expect(operation).not.toHaveBeenCalled();
-        expect(attempts()).toBe(0); // even a failed canonical probe would be a FIFO bypass
-      }
-      expect(names(root)).toHaveLength(2);
-      expect(fs.readFileSync(path.join(canonical, "owner"), "utf8")).toBe(owner);
-      head.close();
-      fs.renameSync(canonical, path.join(root, "released-fixture"));
-      await vi.advanceTimersByTimeAsync(budgetMs * 0.1);
-      expect(await pending).toBe("admitted");
-      expect(operation).toHaveBeenCalledOnce();
-      expect(attempts()).toBe(1);
-      expect(names(root)).toEqual([]);
-      expect(fs.existsSync(canonical)).toBe(false);
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      abort.abort(new Error("test cleanup"));
-      await vi.advanceTimersByTimeAsync(100);
-      await pending;
-    }
+    expect(tryer.mayContend()).toBe(false);
+    vi.advanceTimersByTime(40);
+    expect(head.mayContend()).toBe(true);
+    expect(tryer.mayContend()).toBe(true);
   });
 
   it("judges a head that has just taken over by first sight, not by its old creation time", () => {

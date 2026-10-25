@@ -6,6 +6,12 @@ import type { SandboxComplexity, SandboxProfile, SandboxSessionImport, SandboxSp
 
 const RUN_ID = /^[a-z0-9](?:[a-z0-9-]{0,55}[a-z0-9])?$/;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,255}$/;
+// Policy, not Git syntax: match the entire, case-sensitive value, never a substring
+// or path component (feature/sk-calc is safe). Known prefixes need a nonempty
+// base64url-alphabet body; xox[a-z]- covers the Slack family. AWS keys must be
+// AKIA + exactly 16 uppercase alphanumerics. Also refuse whole standard-base64
+// runs of >=80 characters, with optional 1-2 trailing '=' padding characters.
+const TOKEN_VALUE = /^(?:(?:gh[pousr]_|github_pat_|sk-(?:ant-)?|xox[a-z]-|glpat-)[A-Za-z0-9_-]+|AKIA[A-Z0-9]{16}|[A-Za-z0-9+/]{80,}={0,2})$/u;
 const THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const COMPLEXITIES = new Set<SandboxComplexity>(["simple", "normal", "complex", "delicate"]);
 const PROFILES = new Set<SandboxProfile>(["lead", "lane", "task", "org", "actor"]);
@@ -41,6 +47,23 @@ const argument = (args: readonly string[], name: string): string | undefined => 
 const name = (value: string, field: string): string => {
   if (!NAME.test(value)) throw new Error(`Invalid sandbox intent ${field}`);
   return value;
+};
+
+const refuseCredentialValue = (value: unknown, field: string): void => {
+  if (typeof value === "string" && TOKEN_VALUE.test(value)) {
+    throw Object.assign(new Error(`Sandbox intent ${field} refused by policy: credential-looking values are not allowed`), {
+      code: "sandbox.intent.credential_refused",
+    });
+  }
+};
+
+const isGitBranch = (branch: string): boolean => {
+  try {
+    return execFileSync("git", ["check-ref-format", "--branch", branch], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() === branch;
+  } catch {
+    // Child-process errors contain argv; never expose them or retain them as a cause.
+    return false;
+  }
 };
 
 const repositoryUrl = (remote: string): string => {
@@ -103,13 +126,14 @@ export const buildSandboxIntent = (input: SandboxIntentInput): SandboxSpawnInten
   const repository = (input.resolveRepository ?? resolveSandboxRepository)(input.cwd);
   let branch: string | undefined;
   if (input.branch !== undefined) {
+    refuseCredentialValue(input.branch, "branch");
     if (typeof input.branch !== "string" || input.branch.length < 1 || input.branch.length > 255 ||
       !/^[A-Za-z0-9]/u.test(input.branch) || /[^A-Za-z0-9._/-]/u.test(input.branch) ||
       input.branch.startsWith("refs/heads/") || input.branch.endsWith("/") || input.branch.endsWith(".") ||
       input.branch.includes("//") || input.branch.includes("..") || input.branch.includes("/.") ||
       input.branch.split("/").some(component => component.endsWith(".lock")) ||
-      execFileSync("git", ["check-ref-format", "--branch", input.branch], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() !== input.branch) {
-      throw new Error("Invalid sandbox intent branch");
+      !isGitBranch(input.branch)) {
+      throw Object.assign(new Error("Invalid sandbox intent branch"), { code: "sandbox.intent.branch_invalid" });
     }
     branch = input.branch;
   }
@@ -121,6 +145,7 @@ export const buildSandboxIntent = (input: SandboxIntentInput): SandboxSpawnInten
       throw new Error("Invalid sandbox intent sessionImport");
     }
     const imported = candidate as Record<string, unknown>;
+    refuseCredentialValue(imported.session, "sessionImport.session");
     if (typeof imported.session !== "string" || imported.session.length !== 36 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(imported.session) ||
       typeof imported.manifestSha256 !== "string" || imported.manifestSha256.length !== 64 || !/^[0-9a-f]{64}$/u.test(imported.manifestSha256) ||
       profile !== "lead" && profile !== "lane" || !branch) {

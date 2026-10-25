@@ -65,9 +65,9 @@ export interface SeamDeps {
   python?: string;
   procRoot?: string;
   uid?: number;
-  /** Tests only: the kubectl client (production uses the fixed root-owned one) and the in-image CLI path. */
+  /** Tests only: the kubectl client (production uses the fixed root-owned one) and the in-image CLI path (null: unconfirmed). */
   kubectl?: string;
-  podCli?: string;
+  podCli?: string | null;
   /** Tests only: see the error behind a fixed GAP code. */
   onError?: (error: unknown) => void;
 }
@@ -585,12 +585,13 @@ const recheck = (context: Context): number => {
 };
 
 /**
- * The in-image pi-fabric CLI that `kubectl exec` runs inside the raw Pod (fixed argv, ruling 10-25). The only
- * in-tree evidence (setup/cluster-services/Dockerfile on an agent-org base) names /opt/pi-fabric/dist/cli/index.js.
- * OPEN (DRAIN-DESIGN.r2 Q5): until the image owner confirms it, `confirmed` stays false and resume-drain is
- * refused. Even when confirmed, the seam first checks `test -x` on it inside the Pod. Tests inject SeamDeps.podCli.
+ * The in-image pi-fabric CLI that `kubectl exec` runs inside the raw Pod (fixed argv, ruling 10-25).
+ * CONFIRMED 10-25 15:39Z by the image owner img-g9 (read-only, ab409c28 family): pi-fabric 0.112.0's CLI is
+ * /opt/pi-fabric/dist/cli/index.js (mode 0555), with /usr/local/bin/pi-fabric pointing to it (DRAIN-DESIGN.r2 Q5).
+ * The seam still checks `test -x` on it inside the Pod first: cut 2 builds a new base and must re-confirm it.
+ * Tests inject SeamDeps.podCli (null: unconfirmed).
  */
-const POD_FABRIC_CLI = { path: "/opt/pi-fabric/dist/cli/index.js", confirmed: false } as const;
+const POD_FABRIC_CLI = { path: "/opt/pi-fabric/dist/cli/index.js", confirmed: true } as const;
 const POD_NAME = /^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$/;
 const POD_UID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -623,7 +624,7 @@ const resumeDrain = async (context: Context, sealed: SealedRun): Promise<number>
   const intentSha256 = evidence(context, "fabric-v2-resume-drain-intent.json", { schema: "fabric-v2-resume-drain-intent-v1", generation,
     podUid: pod.uid, requestSha256: context.requestSha256, measured: { kubectl: access.kubectl, server: access.server, before: before ?? null,
       interpreter: interpreterIdentity(), startedAt: new Date().toISOString() } });
-  const cli = context.deps.podCli ?? (POD_FABRIC_CLI.confirmed ? POD_FABRIC_CLI.path : null);
+  const cli = context.deps.podCli !== undefined ? context.deps.podCli : POD_FABRIC_CLI.confirmed ? POD_FABRIC_CLI.path : null;
   let reason: string | null = null;
   let exec: Record<string, unknown> | undefined;
   let execAttempted = false;

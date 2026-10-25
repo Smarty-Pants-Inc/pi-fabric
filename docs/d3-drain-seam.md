@@ -144,7 +144,9 @@ SO_PEERCRED needs `/usr/bin/python3` in the image. Without it, pod bindings refu
 `ptrace_scope`, because at scope 0 a same-UID ptrace of the exec'd CLI is the A6-class residual. Anyone with
 `pods/exec` RBAC on the Pod is authorized by design.
 
-`resume-drain` stays refused until the image owner confirms the in-image CLI path (`POD_FABRIC_CLI.confirmed`).
+The in-image CLI path is `/opt/pi-fabric/dist/cli/index.js`. The image owner confirmed it on 10-25 for pi-fabric
+0.112.0, the ab409c28 image family. The seam still runs `test -x` on it inside the Pod first, because cut 2 builds a
+new base and must confirm it again.
 
 ## Claims and residuals
 

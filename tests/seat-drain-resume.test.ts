@@ -43,13 +43,13 @@ const kubeSeat = async (exec: { line: string; terminate?: boolean; code?: number
     ? fs.readFileSync(path.join(kube, "kube-calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line) as { argv: string[]; env: string[] }) : [];
   return { seat, kubectl, calls };
 };
-const resume = async (seat: Seat, kubectl: string, podCli: string | undefined, deps: Record<string, unknown> = {}) => {
+const resume = async (seat: Seat, kubectl: string, podCli: string | null | undefined, deps: Record<string, unknown> = {}) => {
   let stdout = ""; let stderr = "";
   const code = await main(["--run-dir", seat.runDir, "--phase", "resume-drain"], {
     stdin: () => Buffer.from(seat.request("resume-drain", { pod: POD })),
     stdout: text => { stdout += text; }, stderr: text => { stderr += text; },
     env: { D3_SEAT_LOCK_FD: String(seat.lockFd()) },
-  }, { kubectl, ...(podCli ? { podCli } : {}), deadlineMs: 20_000, sleep: async () => {},
+  }, { kubectl, ...(podCli !== undefined ? { podCli } : {}), deadlineMs: 20_000, sleep: async () => {},
     onError: error => { if (!(error instanceof Error && error.name === "SeamGap")) throw error; }, ...deps });
   return { code, stdout, stderr, receipt: stdout ? JSON.parse(stdout) as Record<string, any> : undefined };
 };
@@ -71,11 +71,18 @@ describe.skipIf(!linux)("resume-drain through kubectl exec (M9)", () => {
     expect(calls()[0]!.argv.slice(4, 8)).toEqual(["config", "view", "--minify", "--raw"]);
   });
 
-  it("stays refused until the in-image CLI path is confirmed, and never execs without it", async () => {
+  it("stays refused while the in-image CLI path is unconfirmed, and never execs without it", async () => {
     const { seat, kubectl, calls } = await kubeSeat({ line: exiting, terminate: true });
-    const result = await resume(seat, kubectl, undefined);
+    const result = await resume(seat, kubectl, null);
     expect(result.receipt).toMatchObject({ result: "refused", observed: { podUid: POD.uid, inputsFenced: false, exited: false } });
     expect(calls().some(call => call.argv.includes("exec"))).toBe(false);
+  });
+
+  it("production uses the image owner's confirmed CLI path (img-g9, 10-25), after the in-Pod test -x", async () => {
+    const { seat, kubectl, calls } = await kubeSeat({ line: exiting, terminate: true });
+    expect((await resume(seat, kubectl, undefined)).receipt).toMatchObject({ result: "pass" });
+    const execs = calls().filter(call => call.argv.includes("exec")).map(call => call.argv.slice(call.argv.indexOf("--") + 1, call.argv.indexOf("--") + 4));
+    expect(execs).toEqual([["test", "-x", "/opt/pi-fabric/dist/cli/index.js"], ["/opt/pi-fabric/dist/cli/index.js", "session", "drain"]]);
   });
 
   it("checks the CLI exists in the Pod first (test -x), else refused without draining", async () => {

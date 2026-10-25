@@ -20,6 +20,22 @@ export interface WireFrame {
 
 export type FrameMatch = (frame: WireFrame) => boolean;
 
+/** Parsed JetStream ACK reply subject (v1 9-token or v2 12-token form). */
+export interface JsAckSubject { readonly stream: string; readonly consumer: string; readonly delivered: number; readonly streamSequence: number }
+
+export const parseJsAck = (subject: string): JsAckSubject | undefined => {
+  const tokens = subject.split(".");
+  if (tokens[0] !== "$JS" || tokens[1] !== "ACK") return undefined;
+  const at = tokens.length === 9 ? 2 : tokens.length >= 11 ? 4 : -1;
+  if (at < 0) return undefined;
+  const delivered = Number(tokens[at + 2]), streamSequence = Number(tokens[at + 3]);
+  if (!Number.isSafeInteger(delivered) || !Number.isSafeInteger(streamSequence)) return undefined;
+  return { stream: tokens[at]!, consumer: tokens[at + 1]!, delivered, streamSequence };
+};
+
+/** One JetStream message delivered to a relay client (inbound MSG with a `$JS.ACK` reply). */
+export interface JsDelivery extends JsAckSubject { readonly subject: string }
+
 interface Rule { readonly match: FrameMatch; remaining: number }
 
 const PAYLOAD_COMMANDS = new Set(["PUB", "HPUB", "MSG", "HMSG"]);
@@ -32,9 +48,13 @@ export class NatsWireFaults {
   /** Number of sever() calls that destroyed at least one live client. */
   severed = 0;
   ackDrops = 0;
+  /** The `+ACK`s this relay dropped, parsed. */
+  readonly droppedAcks: JsAckSubject[] = [];
   pubAckDrops = 0;
-  /** Outbound `+ACK` frames that reached the broker, by `$JS.ACK.<stream>.<consumer>` prefix. */
-  readonly acks = new Map<string, number>();
+  /** Outbound `+ACK` frames that reached the broker. */
+  readonly acks: JsAckSubject[] = [];
+  /** JetStream deliveries to relay clients; `delivered > 1` is a real broker redelivery. */
+  readonly deliveries: JsDelivery[] = [];
   /** Outbound publishes to `fabric.in.*` (commands and protocol ACKs crossing to an inbox). */
   readonly inboxPublishes: string[] = [];
   url = "";
@@ -65,6 +85,20 @@ export class NatsWireFaults {
   loseAcks(match: FrameMatch = () => true, count = 1): void {
     if (!Number.isSafeInteger(count) || count <= 0) throw new Error("ACK drop count must be a positive safe integer");
     this.ackRules.push({ match, remaining: count });
+  }
+
+  /** Drop the broker `+ACK` of the next delivery (to a relay client) that matches, e.g. by its original subject. */
+  loseAckOf(match: (delivery: JsDelivery) => boolean, count = 1): void {
+    this.loseAcks((frame) => {
+      const ack = parseJsAck(frame.subject);
+      const delivery = ack && this.deliveryOf(ack.stream, ack.streamSequence);
+      return delivery !== undefined && match(delivery);
+    }, count);
+  }
+
+  /** The latest delivery of one stored message to a relay client. */
+  deliveryOf(stream: string, streamSequence: number): JsDelivery | undefined {
+    return [...this.deliveries].reverse().find((delivery) => delivery.stream === stream && delivery.streamSequence === streamSequence);
   }
 
   /** Let the next `count` matching publishes reach the broker, then drop the broker's PubAck reply. */
@@ -154,16 +188,22 @@ export class NatsWireFaults {
   private forward(frame: WireFrame, outbound: boolean): boolean {
     if (outbound) {
       if (frame.subject.startsWith("$JS.ACK.") && frame.body.toString() === "+ACK") {
-        if (this.take(this.ackRules, frame)) { this.ackDrops += 1; return false; }
-        const consumer = frame.subject.split(".").slice(0, 4).join(".");
-        this.acks.set(consumer, (this.acks.get(consumer) ?? 0) + 1);
+        const ack = parseJsAck(frame.subject);
+        if (this.take(this.ackRules, frame)) {
+          this.ackDrops += 1;
+          if (ack) this.droppedAcks.push(ack);
+          return false;
+        }
+        if (ack) this.acks.push(ack);
       }
       if (frame.subject.startsWith("fabric.in.")) {
         this.inboxPublishes.push(frame.subject);
         if (frame.reply && this.take(this.pubAckRules, frame)) this.lostReplies.add(frame.reply);
       }
-    } else if (this.lostReplies.delete(frame.subject)) {
-      this.pubAckDrops += 1; return false;
+    } else {
+      if (this.lostReplies.delete(frame.subject)) { this.pubAckDrops += 1; return false; }
+      const delivery = frame.reply ? parseJsAck(frame.reply) : undefined;
+      if (delivery) this.deliveries.push({ ...delivery, subject: frame.subject });
     }
     return true;
   }
@@ -202,8 +242,15 @@ export class NatsWireFaults {
   }
 }
 
-/** `$JS.ACK.<stream>.<consumer>...`: the inbox stream a broker ACK settles. */
-export const ackOnStream = (stream: string): FrameMatch => (frame) => frame.subject.startsWith(`$JS.ACK.${stream}.`);
+/** A broker `+ACK` that settles a message of `stream`. */
+export const ackOnStream = (stream: string): FrameMatch => (frame) => parseJsAck(frame.subject)?.stream === stream;
+/** `fabric.in.<destinationMachine>.<host hash>.<cmd|ack>.<target hash>.<sourceMachine>` (src/transport/nats/subjects.ts). */
+export const parseInboxSubject = (subject: string) => {
+  const tokens = subject.split(".");
+  if (tokens.length !== 7 || tokens[0] !== "fabric" || tokens[1] !== "in" || (tokens[4] !== "cmd" && tokens[4] !== "ack")) return undefined;
+  return { machine: tokens[2]!, hostHash: tokens[3]!, kind: tokens[4] as "cmd" | "ack", targetHash: tokens[5]!, sourceMachine: tokens[6]! };
+};
+
 /** A publish into `fabric.in.<machine>.<host>.<kind>...` (command or protocol ACK). */
 export const publishTo = (machine: string, kind?: "cmd" | "ack"): FrameMatch => (frame) => {
   const tokens = frame.subject.split(".");

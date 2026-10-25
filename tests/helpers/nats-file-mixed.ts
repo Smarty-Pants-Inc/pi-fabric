@@ -9,14 +9,13 @@
 // Only the Pi host UI/model boundary is a fixture (pi.sendMessage is captured). Control, admission,
 // presence, leases, ACKs and the broker are the product's.
 //
-// The link contract (APRIME2 "Interface contracts"): `startNatsLink(config)` in src/mesh/bridge-nats-link.ts
-// (L2), config schema owned by L5, shared types in src/mesh/bridge-nats-types.ts (L3). Until those land,
-// this file codes against the local MixedLinkConfig/MixedLinkHandle stubs below and adapts them in
-// `adaptLinkConfig`, the one place to change when the real schema arrives.
+// The link contract: `startNatsLink(config, { signal, log }) -> { closed, stop }` in src/mesh/bridge-nats-link.ts
+// (L2), the config is L5's NatsLinkConfig (src/mesh/bridge-nats-config.ts, validated here with its own
+// parser), shared ids/types are L3's (src/mesh/bridge-nats-types.ts). Until L2 lands, `loadNatsLink()`
+// returns undefined and the link-dependent E2E files skip; `startLink` may also be injected.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { pathToFileURL } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -28,6 +27,8 @@ import { MeshStore, type MeshEvent, type MeshIdentity } from "../../src/mesh/sto
 import { openFabricTransport } from "../../src/transport/index.js";
 import { runTransportAdmin } from "../../src/transport/nats/admin.js";
 import { hashToken } from "../../src/transport/nats/subjects.js";
+import { parseNatsLinkConfig, type NatsLinkAllowEntry, type NatsLinkConfig } from "../../src/mesh/bridge-nats-config.js";
+import type { FabricControlOperation } from "../../src/topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantRecord, FabricKvHostLease } from "../../src/topology/types.js";
 import type { FabricTransport, TransportEnvelope, TransportSent } from "../../src/transport/types.js";
 import { createPathBHarness, PATH_B_MACHINES, PATH_B_PERMISSION_POLICY, teardownWithin, type PathBHarness } from "./nats-cluster.js";
@@ -41,64 +42,39 @@ export const FILE_MAIN_SESSION = "15310f11-aaaa-4000-8000-000000000001";
 export const NATS_MAIN_SESSION = "15310b22-bbbb-4000-8000-000000000002";
 /** A live file root the link does NOT allow-list. */
 export const FILE_OUTSIDER_SESSION = "15310f33-cccc-4000-8000-000000000003";
+/** A second allow-listed NATS root on the same machine as natsMain (commandId-collision and seat tests). */
+export const NATS_PEER_SESSION = "15310b44-dddd-4000-8000-000000000004";
 export const rootId = (session: string): string => `session:${session}`;
 
 // ---------------------------------------------------------------------------------------------
-// Link contract stubs (replace with src/mesh/bridge-nats-types.ts once L3 publishes it).
+// Link entry (L2). Config: L5's NatsLinkConfig. Handle: { closed, stop }.
 // ---------------------------------------------------------------------------------------------
-
-/** What the harness knows about the link; `adaptLinkConfig` maps it to the real L5 schema. */
-export interface MixedLinkConfig {
-  /** Link name: the `remoteHost` stamped on NATS roots mirrored into the hub file mesh. */
-  readonly name: string;
-  /** The hub's FILE mesh root (Ryzen 1). */
-  readonly meshRoot: string;
-  /** Link-owned durable state (cursor, ACK/dedupe ledger); kept across restarts. */
-  readonly stateDir: string;
-  /** The bridge machine's own NATS runtime options; `servers` is the fault relay. */
-  readonly nats: {
-    readonly servers: string;
-    readonly credentials: string;
-    readonly machine: string;
-    readonly custodyStream: string;
-    readonly livenessStream: string;
-    readonly pathBMachines: readonly string[];
-    readonly tls?: { readonly caFile: string };
-  };
-  /** Static allow-list (L3): canonical ids admitted per side; nothing else crosses. */
-  readonly allow: {
-    readonly fileRoots: readonly string[];
-    readonly natsRoots: readonly string[];
-    readonly fileActors?: readonly string[];
-  };
-}
 
 export interface MixedLinkHandle {
   /** Graceful stop: fences mirrors, joins in-flight work, closes NATS. */
   stop(): Promise<void>;
+  /** Settles when the link ends (stop or a fatal error). */
+  readonly closed?: Promise<unknown>;
 }
 
-export type StartMixedLink = (config: MixedLinkConfig) => Promise<MixedLinkHandle>;
+export type StartMixedLink = (config: NatsLinkConfig, options: { signal: AbortSignal; log: (line: string) => void }) => Promise<MixedLinkHandle>;
+
+const LINK_ENTRY = path.resolve(import.meta.dirname, "../../src/mesh/bridge-nats-link.ts");
+
+/** Whether the product link entry exists in this checkout (synchronous, for describe.skipIf). */
+export const natsLinkPresent = (): boolean => fs.existsSync(LINK_ENTRY);
 
 /** The product entry, absent until L2 lands. A missing module returns undefined; any other import error throws. */
 export async function loadNatsLink(): Promise<StartMixedLink | undefined> {
-  const file = path.resolve(import.meta.dirname, "../../src/mesh/bridge-nats-link.ts");
-  if (!fs.existsSync(file)) return undefined;
-  const module = await import(pathToFileURL(file).href) as Record<string, unknown>;
+  if (!natsLinkPresent()) return undefined;
+  const module = await import(pathToFileURL(LINK_ENTRY).href) as Record<string, unknown>;
   const start = module.startNatsLink;
   if (typeof start !== "function") throw new Error("src/mesh/bridge-nats-link.ts does not export startNatsLink");
-  return async (config) => {
-    const handle = await (start as (input: unknown) => Promise<unknown>)(adaptLinkConfig(config)) as Partial<MixedLinkHandle> & { close?: () => Promise<void> };
-    const stop = handle.stop ?? handle.close;
-    if (typeof stop !== "function") throw new Error("startNatsLink handle has no stop()");
-    return { stop: () => stop.call(handle) };
-  };
+  return start as StartMixedLink;
 }
 
-/** The single mapping point from the harness view to the L5 config schema. */
-export function adaptLinkConfig(config: MixedLinkConfig): unknown {
-  return config;
-}
+/** Operations each allow-listed root may SEND across (receive caps are L3's, e.g. a seat gets followUp + cancel). */
+export const ROOT_SEND_OPERATIONS: readonly FabricControlOperation[] = ["steer", "followUp", "ask", "cancel"];
 
 // ---------------------------------------------------------------------------------------------
 // Mains
@@ -212,20 +188,27 @@ export interface WireEvent {
   readonly duplicate?: boolean;
 }
 
-/** Records every in-process NatsTransport send/deliver/broker-ACK. Install per test (restoreMocks). */
+/**
+ * Records every in-process NatsTransport send/deliver/broker-ACK for the harness lifetime. It patches the
+ * shared prototype BEFORE any Main starts (an inbox iterator binds once at control-plane start), and is not
+ * a vi.spyOn, so vitest restoreMocks cannot drop it between tests. restore() puts the originals back.
+ * Record-only: every send, delivery and ACK is the product's own call.
+ */
 export class NatsWire {
   readonly events: WireEvent[] = [];
   private readonly changed = new EventEmitter();
-  constructor(prototype: FabricTransport) {
+  private readonly originals: Pick<FabricTransport, "send" | "inbox">;
+  constructor(private readonly prototype: FabricTransport) {
     const send = prototype.send, inbox = prototype.inbox;
+    this.originals = { send, inbox };
     const record = (event: WireEvent) => { this.events.push(event); this.changed.emit("change"); };
-    vi.spyOn(prototype, "send").mockImplementation(async function<T>(this: FabricTransport, envelope: TransportEnvelope<T>, signal?: AbortSignal) {
+    prototype.send = async function<T>(this: FabricTransport, envelope: TransportEnvelope<T>, signal?: AbortSignal) {
       const result = await send.call(this, envelope, signal) as TransportSent<T>;
       record({ phase: "send", machine: this.self.machine, hostId: this.self.hostId, envelope: result.envelope as TransportEnvelope,
         sequence: result.sequence, duplicate: result.duplicate });
       return result;
-    });
-    vi.spyOn(prototype, "inbox").mockImplementation(async function*(this: FabricTransport, signal: AbortSignal) {
+    };
+    prototype.inbox = async function*(this: FabricTransport, signal: AbortSignal) {
       const self = this.self;
       for await (const delivery of inbox.call(this, signal)) {
         record({ phase: "deliver", machine: self.machine, hostId: self.hostId, envelope: delivery.payload,
@@ -236,8 +219,17 @@ export class NatsWire {
             sequence: delivery.sequence, attempt: delivery.attempt, sourceMachine: delivery.sourceMachine });
         } };
       }
-    });
+    };
   }
+
+  restore(): void {
+    this.prototype.send = this.originals.send;
+    this.prototype.inbox = this.originals.inbox;
+  }
+
+  /** Index for a per-test slice: `since(mark)`. */
+  mark(): number { return this.events.length; }
+  since(mark: number): WireEvent[] { return this.events.slice(mark); }
 
   filter(predicate: (event: WireEvent) => boolean): WireEvent[] { return this.events.filter(predicate); }
 
@@ -261,37 +253,47 @@ export class NatsWire {
 
 export interface MixedHarnessOptions {
   readonly binary: string;
-  /** Link starter; default `loadNatsLink()`. `null` boots both Mains with no link (harness self-test). */
+  /** Link starter; default `loadNatsLink()`. `null` boots the Mains with no link (harness self-test). */
   readonly startLink?: StartMixedLink | null;
+  /** Start the link and wait for both mirrors before returning (default: true when a link is available). */
+  readonly autoStart?: boolean;
   readonly linkName?: string;
-  /** Also boot a live file root that the link does not allow-list. */
+  /** Also boot a live file root that the link does NOT allow-list. */
   readonly outsider?: boolean;
+  /** Also boot a second allow-listed NATS root on machine-b. */
+  readonly natsPeer?: boolean;
+  /** Last-word edit of the allow-list before validation (e.g. mark a seat with `principal`). */
+  readonly allow?: (allow: { file: NatsLinkAllowEntry[]; nats: NatsLinkAllowEntry[] }, ids: MixedIds) => void;
 }
+
+export interface MixedIds { readonly fileMain: string; readonly natsMain: string; readonly outsider: string; readonly natsPeer: string }
 
 export interface MixedHarness {
   readonly root: string;
   readonly broker: PathBHarness;
-  /** The link's path to the broker. Faults here touch the link only. */
+  /** The link's only path to the broker. Faults here touch the link only. */
   readonly faults: NatsWireFaults;
+  /** Every in-process NatsTransport send/deliver/broker-ACK (Mains, peers and an in-process link). */
+  readonly wire: NatsWire;
   readonly fileMain: MixedMain;
   readonly natsMain: MixedMain;
   readonly outsider?: MixedMain;
+  readonly natsPeer?: MixedMain;
   readonly linkName: string;
-  readonly linkConfig: MixedLinkConfig;
+  /** The exact L5 config the link runs with, already validated by parseNatsLinkConfig. */
+  readonly linkConfig: NatsLinkConfig;
+  /** Link log lines (all starts). */
+  readonly linkLog: string[];
   /** The file mesh the link bridges (Ryzen 1's): same root as fileMain's runtime mesh. */
   readonly fileMeshRoot: string;
   /** A raw product transport on machine-a with a test-only host id, for broker reads (KV presence/leases). */
   readonly inspector: FabricTransport;
-  /** Prototype shared by every in-process NatsTransport (Mains, inspector and an in-process link). */
-  readonly natsPrototype: FabricTransport;
   link: MixedLinkHandle | undefined;
   readonly startLink: StartMixedLink | undefined;
   startLinkNow(): Promise<MixedLinkHandle>;
   stopLink(): Promise<void>;
   /** Open a product NATS transport for a credential with an arbitrary host id (negative tests). */
   openPeer(machine: typeof BRIDGE_MACHINE | typeof NATS_MAIN_MACHINE, hostId: string, viaRelay?: boolean): Promise<FabricTransport>;
-  /** A fresh MeshStore on the hub file mesh (a separate reader/writer, like another local process). */
-  fileStore(): MeshStore;
   fileEvents(filter?: { topic?: string; to?: string }): MeshEvent[];
   /** NATS KV presence/lease for a root under a machine, or undefined. */
   kvRoot(machine: string, id: string): Promise<{ presence?: FabricParticipantRecord; presenceRevision?: number; lease?: FabricKvHostLease } | undefined>;
@@ -321,6 +323,11 @@ export function selfRecord(main: MixedMain): FabricParticipantInfo | undefined {
   return main.runtime.participantInfos({ fresh: true }).find((row) => row.id === main.id && row.local && !row.stale);
 }
 
+/** A live row for `id` as `viewer` routes it, or undefined. */
+export function liveRow(viewer: MixedMain, id: string): FabricParticipantInfo | undefined {
+  return viewer.runtime.participantInfos({ fresh: true }).find((row) => row.id === id && !row.stale);
+}
+
 export async function createMixedHarness(options: MixedHarnessOptions): Promise<MixedHarness> {
   for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
   vi.stubEnv("SMARTY_AGENT", undefined);
@@ -346,64 +353,83 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
     const faults = await NatsWireFaults.open(broker.serverUrl, broker.tls!);
     cleanup.push(() => faults.close());
 
-    const fileCwd = path.join(root, "ryzen1"), natsCwd = path.join(root, "v2"), outsiderCwd = path.join(root, "ryzen1-outsider");
-    for (const dir of [fileCwd, natsCwd, outsiderCwd, path.join(root, "agent")]) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const dirs = { file: path.join(root, "ryzen1"), nats: path.join(root, "v2"), outsider: path.join(root, "ryzen1-outsider"),
+      peer: path.join(root, "v2-peer"), agent: path.join(root, "agent") };
+    for (const dir of Object.values(dirs)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const fileMeshRoot = path.join(root, "ryzen1-mesh");
     const fileConfig = baseConfig({ transport: "file", hostTransport: "file", root: fileMeshRoot, announce: true });
-    const natsConfig = baseConfig({ transport: "nats", hostTransport: "nats", root: path.join(natsCwd, "mesh"), announce: true,
+    const natsConfig = (cwd: string) => baseConfig({ transport: "nats", hostTransport: "nats", root: path.join(cwd, "mesh"), announce: true,
       nats: { ...broker.runtimeOptions(broker.users.machineB), operatorMachine: "fabric-ops" } });
-    const fileMain = makeMain("ryzen1-lead", FILE_MAIN_SESSION, fileCwd, fileConfig);
-    const natsMain = makeMain("v2-lead", NATS_MAIN_SESSION, natsCwd, natsConfig);
-    const outsider = options.outsider ? makeMain("ryzen1-outsider", FILE_OUTSIDER_SESSION, outsiderCwd, fileConfig) : undefined;
+    const fileMain = makeMain("ryzen1-lead", FILE_MAIN_SESSION, dirs.file, fileConfig);
+    const natsMain = makeMain("v2-lead", NATS_MAIN_SESSION, dirs.nats, natsConfig(dirs.nats));
+    const outsider = options.outsider ? makeMain("ryzen1-outsider", FILE_OUTSIDER_SESSION, dirs.outsider, fileConfig) : undefined;
+    const natsPeer = options.natsPeer ? makeMain("v2-peer", NATS_PEER_SESSION, dirs.peer, natsConfig(dirs.peer)) : undefined;
 
     const inspector = await openFabricTransport({ config: baseConfig({ transport: "nats", hostTransport: "nats", root: path.join(root, "inspector-mesh"),
       nats: { ...broker.runtimeOptions(broker.users.machineA), operatorMachine: "fabric-ops" } }).mesh,
       hostId: "mixed-harness-inspector", mesh: new MeshStore(path.join(root, "inspector-mesh"), 65_536, 1_000) });
     cleanup.push(() => teardownWithin("inspector close", () => inspector.close(), 5_000));
-    const natsPrototype = Object.getPrototypeOf(inspector) as FabricTransport;
+    // Before any Main binds its inbox iterator: record the whole run, and restore last.
+    const wire = new NatsWire(Object.getPrototypeOf(inspector) as FabricTransport);
+    cleanup.push(async () => wire.restore());
 
-    await fileMain.start();
-    cleanup.push(() => fileMain.stop());
-    await natsMain.start();
-    cleanup.push(() => natsMain.stop());
-    if (outsider) { await outsider.start(); cleanup.push(() => outsider.stop()); }
+    for (const main of [fileMain, natsMain, outsider, natsPeer]) {
+      if (!main) continue;
+      await main.start();
+      cleanup.push(() => main.stop());
+    }
 
     const linkName = options.linkName ?? DEFAULT_LINK_NAME;
-    const linkConfig: MixedLinkConfig = {
-      name: linkName, meshRoot: fileMeshRoot, stateDir: path.join(root, "link-state"),
-      nats: { servers: faults.url, credentials: broker.users.machineA.credsPath, machine: BRIDGE_MACHINE,
-        custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream,
-        pathBMachines: [...PATH_B_MACHINES], tls: { caFile: broker.tls!.caFile } },
-      allow: { fileRoots: [fileMain.id], natsRoots: [natsMain.id] },
+    const ids: MixedIds = { fileMain: fileMain.id, natsMain: natsMain.id, outsider: rootId(FILE_OUTSIDER_SESSION), natsPeer: rootId(NATS_PEER_SESSION) };
+    const allow = {
+      file: [{ kind: "root", id: fileMain.id, operations: [...ROOT_SEND_OPERATIONS] }] as NatsLinkAllowEntry[],
+      nats: [{ kind: "root", id: natsMain.id, operations: [...ROOT_SEND_OPERATIONS] },
+        ...(natsPeer ? [{ kind: "root", id: natsPeer.id, operations: [...ROOT_SEND_OPERATIONS] }] : [])] as NatsLinkAllowEntry[],
     };
+    options.allow?.(allow, ids);
+    const linkConfig = parseNatsLinkConfig({
+      version: 1, name: "ryzen1", link: linkName,
+      file: { mesh: fileMeshRoot },
+      stateDir: path.join(root, "link-state"),
+      nats: { servers: [faults.url], machine: BRIDGE_MACHINE, credentials: broker.users.machineA.credsPath, caFile: broker.tls!.caFile,
+        custodyStream: PATH_B_PERMISSION_POLICY.custodyStream, livenessStream: PATH_B_PERMISSION_POLICY.livenessStream,
+        pathBMachines: [...PATH_B_MACHINES], operatorMachine: "fabric-ops" },
+      allow,
+    });
     const startLink = options.startLink === null ? undefined : options.startLink ?? await loadNatsLink();
     const peers: FabricTransport[] = [];
     cleanup.push(async () => { await Promise.allSettled(peers.splice(0).map((peer) => teardownWithin("peer close", () => peer.close(), 5_000))); });
+    const linkLog: string[] = [];
+    let linkAbort: AbortController | undefined;
 
     const harness: MixedHarness = {
-      root, broker, faults, fileMain, natsMain, ...(outsider ? { outsider } : {}), linkName, linkConfig, fileMeshRoot, inspector, natsPrototype,
-      link: undefined, startLink,
+      root, broker, faults, wire, fileMain, natsMain, ...(outsider ? { outsider } : {}), ...(natsPeer ? { natsPeer } : {}),
+      linkName, linkConfig, linkLog, fileMeshRoot, inspector, link: undefined, startLink,
       async startLinkNow() {
         if (!startLink) throw new Error("A' link entry (src/mesh/bridge-nats-link.ts startNatsLink) is not available");
         if (harness.link) throw new Error("link already running");
-        harness.link = await startLink(linkConfig);
+        linkAbort = new AbortController();
+        linkLog.push(`--- harness: link start ${new Date().toISOString()}`);
+        harness.link = await startLink(linkConfig, { signal: linkAbort.signal, log: (line) => { linkLog.push(line); } });
         return harness.link;
       },
       async stopLink() {
-        const link = harness.link;
-        harness.link = undefined;
-        if (link) await teardownWithin("link stop", () => link.stop(), 15_000);
+        const link = harness.link, abort = linkAbort;
+        harness.link = undefined; linkAbort = undefined;
+        if (!link) return;
+        linkLog.push(`--- harness: link stop ${new Date().toISOString()}`);
+        try { await teardownWithin("link stop", () => link.stop(), 15_000); }
+        finally { abort?.abort(); }
       },
       async openPeer(machine, hostId, viaRelay = false) {
         const user = machine === BRIDGE_MACHINE ? broker.users.machineA : broker.users.machineB;
-        const runtime = broker.runtimeOptions(user);
-        const config = baseConfig({ transport: "nats", hostTransport: "nats", root: path.join(root, `peer-${peers.length}`),
-          nats: { ...runtime, ...(viaRelay ? { servers: faults.url } : {}), operatorMachine: "fabric-ops" } });
-        const peer = await openFabricTransport({ config: config.mesh, hostId, mesh: new MeshStore(path.join(root, `peer-${peers.length}`), 65_536, 1_000) });
+        const dir = path.join(root, `peer-${peers.length}`);
+        const config = baseConfig({ transport: "nats", hostTransport: "nats", root: dir,
+          nats: { ...broker.runtimeOptions(user), ...(viaRelay ? { servers: faults.url } : {}), operatorMachine: "fabric-ops" } });
+        const peer = await openFabricTransport({ config: config.mesh, hostId, mesh: new MeshStore(dir, 65_536, 1_000) });
         peers.push(peer);
         return peer;
       },
-      fileStore: () => new MeshStore(fileMeshRoot, 65_536, 1_000),
       fileEvents(filter = {}) {
         return fileMain.runtime.mesh.read({ ...filter, limit: 10_000 });
       },
@@ -414,20 +440,32 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
         return { ...(presence ? { presence: presence.value, presenceRevision: presence.revision } : {}), ...(lease ? { lease: lease.value } : {}) };
       },
       async waitMirrored(timeoutMs = 20_000) {
-        const fileView = await waitFor(() => fileMain.runtime.participantInfos({ fresh: true })
-          .find((row) => row.id === natsMain.id && !row.stale && row.remoteHost === linkName), "NATS root mirrored live into the file mesh", timeoutMs);
-        const natsView = await waitFor(() => natsMain.runtime.participantInfos({ fresh: true })
-          .find((row) => row.id === fileMain.id && !row.stale && row.machine === BRIDGE_MACHINE), "file root mirrored live into NATS KV", timeoutMs);
+        const fileView = await waitFor(() => {
+          const row = liveRow(fileMain, natsMain.id);
+          return row?.remoteHost === linkName ? row : undefined;
+        }, "NATS root mirrored live into the file mesh", timeoutMs);
+        const natsView = await waitFor(() => {
+          const row = liveRow(natsMain, fileMain.id);
+          return row?.machine === BRIDGE_MACHINE ? row : undefined;
+        }, "file root mirrored live into NATS KV", timeoutMs);
         return { fileView, natsView };
       },
       async stop() {
-        try { await harness.stopLink(); } catch (error) { failures.push(error); }
         await unwind();
         vi.unstubAllEnvs();
         try { fs.rmSync(root, { recursive: true, force: true }); } catch (error) { failures.push(error); }
         if (failures.length) throw new AggregateError(failures, failures.map(String).join("; "));
       },
     };
+    cleanup.push(() => harness.stopLink()); // first to unwind: the link stops before the Mains and broker
+    if (startLink && options.autoStart !== false) {
+      try {
+        await harness.startLinkNow();
+        await harness.waitMirrored();
+      } catch (error) {
+        throw new Error(`A' link did not come up: ${String(error)}\n${linkLog.slice(-40).join("\n")}`, { cause: error });
+      }
+    }
     return harness;
   } catch (error) {
     await unwind();
@@ -437,8 +475,5 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
   }
 }
 
-/** sha256 of the logical command key, as both carriers derive it (control-plane.ts request paths). */
-export function expectedCommandId(senderHostId: string, ownerHostId: string, ownerIdentityId: string, targetId: string,
-  operation: string, idempotencyKey: string, notRunAttempt = 0): string {
-  return createHash("sha256").update(JSON.stringify([senderHostId, ownerHostId, ownerIdentityId, targetId, operation, idempotencyKey, notRunAttempt])).digest("hex");
-}
+/** The link's log tail, for a failing assertion's message. */
+export const linkTail = (h: MixedHarness, lines = 40): string => h.linkLog.slice(-lines).join("\n");

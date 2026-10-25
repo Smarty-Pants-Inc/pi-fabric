@@ -4,6 +4,7 @@
 // isolated with no link, and the link's fault relay really disconnects and really loses a PubAck.
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { natsLinkStatePaths, preflightNatsLinkConfig } from "../src/mesh/bridge-nats-config.js";
 import type { TransportEnvelope } from "../src/transport/types.js";
 import { resolveNatsBinary } from "./helpers/nats-cluster.js";
 import { BRIDGE_MACHINE, createMixedHarness, NATS_MAIN_MACHINE, selfRecord, waitForValue, type MixedHarness } from "./helpers/nats-file-mixed.js";
@@ -38,6 +39,14 @@ describe.skipIf(!binary || process.platform !== "linux")("A' mixed FILE <-> NATS
     expect(h.natsMain.delivered()).toEqual([]);
     expect(h.fileMain.delivered()).toEqual([]);
   }, 20_000);
+
+  it("hands the link an L5 config that passes the real start preflight against these files", () => {
+    expect(h.linkConfig).toMatchObject({ link: h.linkName, file: { mesh: h.fileMeshRoot },
+      nats: { machine: BRIDGE_MACHINE, servers: [h.faults.url] },
+      allow: { file: [{ kind: "root", id: h.fileMain.id }], nats: [{ kind: "root", id: h.natsMain.id }] } });
+    expect(() => preflightNatsLinkConfig(h.linkConfig)).not.toThrow();
+    expect(natsLinkStatePaths(h.linkConfig).ledger.startsWith(h.root)).toBe(true);
+  });
 
   it("the link's relay severs a real authenticated connection, which reconnects, and loses a real PubAck once", async () => {
     const sender = await h.openPeer(BRIDGE_MACHINE, `relay-probe-${randomUUID()}`, true);

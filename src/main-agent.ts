@@ -711,6 +711,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     from?: MeshIdentity, verification?: "mesh" | "bridge",
   ): FabricAgentMessageResult {
     if (!this.local) throw new Error(`Main agent ${this.id} is owned by another Fabric process`);
+    // D3 seat drain (smarty-dev#15310): dashboard/composer input is refused too, before Pi sees it.
+    assertMainInboxOpen(this.id);
     const text = message.trim();
     if (!text) throw new Error("Main agent message must not be empty");
     const messageId = randomUUID();

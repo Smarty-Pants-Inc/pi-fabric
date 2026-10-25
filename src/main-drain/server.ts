@@ -2,7 +2,8 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { diagnostics } from "../core/diagnostics.js";
-import type { MainDrainControl } from "./control.js";
+import { peerCredentials } from "../records/peer.js";
+import type { MainDrainControl, MainDrainPeer } from "./control.js";
 import { MAIN_DRAIN_DIRECTORY, MAIN_DRAIN_MAX_REQUEST_BYTES, MAIN_DRAIN_MAX_SOCKET_PATH, mainDrainSocketName,
   parseMainDrainRequest, type MainDrainOp } from "./protocol.js";
 
@@ -78,7 +79,11 @@ export class MainDrainServer {
   #queue: Promise<unknown> = Promise.resolve();
   #closed = false;
 
-  constructor(readonly control: MainDrainControl, readonly options: { platform?: NodeJS.Platform; uid?: number } = {}) {}
+  constructor(readonly control: MainDrainControl, readonly options: {
+    platform?: NodeJS.Platform; uid?: number;
+    /** Tests only: the SO_PEERCRED reader. */
+    peer?: (socket: net.Socket) => Promise<MainDrainPeer | undefined>;
+  } = {}) {}
 
   get socketPath(): string | undefined { return this.#pinned?.socket; }
 
@@ -86,7 +91,7 @@ export class MainDrainServer {
   async start(): Promise<string> {
     try {
       const platform = this.options.platform ?? process.platform;
-      const uid = this.options.uid ?? process.getuid?.();
+      const uid = this.options.uid ?? process.geteuid?.();
       if (platform !== "linux" || uid === undefined) return "MAIN_DRAIN_UNSUPPORTED_PLATFORM";
       const pinned = pinDirectory(this.control.host.meshRoot, uid);
       pinned.socket = path.join(pinned.directory, mainDrainSocketName(this.control.host.sessionId));
@@ -150,10 +155,13 @@ export class MainDrainServer {
       const request = newline <= MAIN_DRAIN_MAX_REQUEST_BYTES ? parseMainDrainRequest(buffer.subarray(0, newline).toString("utf8")) : undefined;
       if (!request) { this.#refuse(socket, null, "REQUEST_INVALID"); return; }
       if (request.sessionId !== this.control.host.sessionId) { this.#refuse(socket, request.op, "SESSION_MISMATCH"); return; }
+      // A host binding needs the caller's kernel identity (SO_PEERCRED) for its lock proof.
+      const peer = request.binding?.runDir ? (this.options.peer ?? peerCredentials)(socket) : Promise.resolve(undefined);
       // One op at a time, in arrival order: the fence and the actor stops never race.
-      const run = this.#queue.then(() => this.control.handle(request.op));
+      const run = this.#queue.then(async () => this.control.handle(request.op, request.binding, await peer.catch(() => undefined), uid));
       this.#queue = run.catch(() => undefined);
       run.then(reply => {
+        if (typeof reply === "string") { this.#refuse(socket, request.op, reply); return; }
         socket.end(`${JSON.stringify(reply)}\n`, () => { if (reply.exiting) this.control.commitExit(); });
       }, () => this.#refuse(socket, request.op, "INTERNAL"));
     });

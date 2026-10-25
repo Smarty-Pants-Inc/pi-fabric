@@ -190,6 +190,7 @@ const removeManagedRunRoot = async (root: string, managed: boolean): Promise<voi
   }
 };
 import { effectiveAgentNice, parseAgentNice } from "./priority.js";
+import { mainInboxDrainGate, FabricMainDrainingError } from "../main-drain/gate.js";
 import {
   isFabricLifecycleEventType,
   type FabricLifecycleEventType,
@@ -2360,6 +2361,9 @@ export class AgentManager {
       targetRootId: this.#mainAgentId ?? routerAdmission.targetRootId,
       targetHostId: this.#hostId ?? routerAdmission.targetHostId };
     if (this.#closing) return this.#recordSpawnRouterStartFailed(request, routerAdmission).then(() => { throw new Error("Fabric agent manager is closing"); });
+    // D3 seat drain (smarty-dev#15310): a draining root launches no new agent run.
+    const draining = this.#mainAgentId ? mainInboxDrainGate(this.#mainAgentId) : undefined;
+    if (draining) return this.#recordSpawnRouterStartFailed(request, routerAdmission).then(() => { throw new FabricMainDrainingError(draining.rootId); });
     // smarty-dev#9855: at admission, free the permits of launches now proven gone, before asking for one.
     this.#releaseProvenGone();
     // pi-fabric#939 P2-a: the 6 h re-alarm is also due on every admission attempt, where a stuck state is felt.

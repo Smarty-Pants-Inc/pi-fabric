@@ -26,8 +26,8 @@ export class FabricMainDrainingError extends Error {
   readonly retryable = true;
   readonly notRun = true;
   constructor(readonly rootId: string) {
-    super(`${FABRIC_MAIN_DRAINING}: Main ${rootId} is draining for a seat move and admits no new messages; ` +
-      "this message was not delivered or recorded. Retry later; after the move, address the same root again.");
+    super(`${FABRIC_MAIN_DRAINING}: Main ${rootId} is draining for a seat move and admits no new messages or work; ` +
+      "this request was not delivered, recorded or started. Retry later; after the move, address the same root again.");
   }
 }
 

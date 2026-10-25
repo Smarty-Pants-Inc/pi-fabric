@@ -32,6 +32,8 @@ export interface NativeInputObservation {
   fenceApi: boolean;
   /** This process holds the root's fence and Pi reads it back as fenced. */
   inputsFenced: boolean;
+  /** Pi's own fence state, whoever holds it (null without the API): what an undo's canary must see as false. */
+  piInputsFenced: boolean | null;
   /** Pi's exact counts, only with the fence API; otherwise null (unknown). */
   inputAdmissionCount: number | null;
   queued: number | null;
@@ -44,7 +46,9 @@ export interface NativeInputObservation {
   fenceError: string | null;
 }
 
-// Survives a live extension reload of this module (same process); a restart starts unfenced.
+// The release handle survives a live extension reload (same process; Pi keeps the fence across a
+// reload and the ORIGINAL release still reopens it); a restart starts unfenced. Only a lost handle
+// means restart required.
 const FENCES = Symbol.for("pi-fabric.main.drain-fences.v1");
 const fences = (): Map<string, ExtensionInputFence> =>
   ((globalThis as Record<symbol, unknown>)[FENCES] ??= new Map<string, ExtensionInputFence>()) as Map<string, ExtensionInputFence>;
@@ -84,6 +88,7 @@ export const observeNativeInput = (pi: ExtensionAPI, ctx: ExtensionContext | und
     inputAdmission: Number.isSafeInteger(admission) ? admission as number : null,
     fenceApi: api,
     inputsFenced: api && fences().has(rootId) && state?.inputsFenced === true,
+    piInputsFenced: state?.inputsFenced ?? null,
     inputAdmissionCount: state?.inputAdmissionCount ?? null,
     queued: state?.queued ?? null,
     drained: state?.drained ?? null,

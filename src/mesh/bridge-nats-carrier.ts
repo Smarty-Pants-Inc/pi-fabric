@@ -185,8 +185,23 @@ export class NatsCarrierUnavailable extends Error {
 /** Thrown for a permanent refusal. "not allowed" makes MeshBridge drop and log the event, never retry it. */
 export class NatsCarrierRefusal extends Error {
   override readonly name = "NatsCarrierRefusal";
-  constructor(readonly reason: string, readonly code?: string) { super(`Fabric NATS carrier refused: ${reason} (not allowed)`); }
+  constructor(readonly reason: string, readonly code?: string, readonly answer?: NatsCarrierFileAnswer) {
+    super(`Fabric NATS carrier refused: ${reason} (not allowed)`);
+  }
 }
+
+/**
+ * The answer a refused file -> NATS command gets, so its VERIFIED sender never waits for a timeout:
+ * a rejected ACK to the sender's own host, from the owner the link mirrors (the only author a file
+ * sender accepts for a mirrored owner's ACK, with the link's bridge stamp), notRun with the stable code.
+ */
+export interface NatsCarrierFileAnswer {
+  readonly to: string;
+  readonly from: MeshIdentity;
+  readonly refusedEventId: string;
+  readonly data: Record<string, unknown>;
+}
+
 
 export interface NatsCarrierSettle {
   readonly direction: NatsCarrierDirection;
@@ -393,7 +408,14 @@ export class NatsBridgeCarrier {
     const operation = data.operation as FabricControlOperation;
     const requesterId = sender.identity.id;
     const decision = this.#authorize({ direction: "toNats", senderId: requesterId, targetId, operation, principal: pub.principal });
-    if (!decision.ok) throw new NatsCarrierRefusal(decision.reason, decision.refuse);
+    // From here the sender is verified and the target is the NATS owner this link mirrors: a refusal is answered.
+    const answer = (code: string, reason: string): NatsCarrierFileAnswer => ({
+      to: data.replyTo as string, from: carrierIdentity(owner.identity), refusedEventId: pub.data.bridge.id,
+      data: { version: 1, commandId: data.commandId, targetId,
+        ...(typeof data.ownerIncarnation === "string" ? { ownerIncarnation: data.ownerIncarnation } : {}),
+        accepted: false, error: `Fabric NATS bridge refused the command: ${code}: ${reason}`, errorCode: code, notRun: true },
+    });
+    if (!decision.ok) throw new NatsCarrierRefusal(decision.reason, decision.refuse, answer(decision.refuse, decision.reason));
     const map = (id: string): string => mapNatsCommandId(this.link, "toNats", requesterId, id);
     const commandId = map(data.commandId as string);
     let cancelCommandId: string | undefined;
@@ -435,7 +457,8 @@ export class NatsBridgeCarrier {
     if (created) return { kind: "send", envelope, record };
     if (stored.direction !== "toNats" || stored.origin !== "control" || stored.bodyDigest !== bodyDigest ||
         stored.requesterId !== requesterId || stored.targetId !== targetId || !stored.body || !stored.ownerMachine) {
-      throw new NatsCarrierRefusal("command id reused with different input");
+      throw new NatsCarrierRefusal("command id reused with different input", "BRIDGE_NATS_ID_CONFLICT",
+        answer("BRIDGE_NATS_ID_CONFLICT", "command id reused with different input"));
     }
     // The same file event again (restart, uncertain PubAck): its first envelope, byte for byte.
     if (stored.sourceEventId === sourceEventId) {
@@ -533,7 +556,8 @@ export class NatsBridgeCarrier {
     const decision = this.#authorize({ direction: "toFile", senderId: requesterId, targetId, operation, principal, sourceMachine });
     if (!decision.ok) {
       // A verified sender to a target this link speaks for: a definite, notRun answer beats a timeout.
-      return refuse({ accepted: false, error: `Fabric NATS bridge refused the command: ${decision.refuse}`, notRun: true }, decision.reason);
+      return refuse({ accepted: false, error: `Fabric NATS bridge refused the command: ${decision.refuse}: ${decision.reason}`,
+        errorCode: decision.refuse, notRun: true }, decision.reason);
     }
     const map = (id: string): string => mapNatsCommandId(this.link, "toFile", requesterId, id);
     const commandId = map(body.commandId as string);

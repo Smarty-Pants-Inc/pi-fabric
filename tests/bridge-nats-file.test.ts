@@ -7,7 +7,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { BridgePresence } from "../src/mesh/bridge.js";
-import { createNatsFileLink } from "../src/mesh/bridge-nats-file.js";
+import { BridgeMirrorDeferredError } from "../src/mesh/bridge.js";
+import { createNatsFileLink, NatsCarrierDeferredError } from "../src/mesh/bridge-nats-file.js";
+import { TransportUnavailableError } from "../src/transport/types.js";
 import { bridgeNatsEnvelopeId, bridgeNatsMappedCommandId } from "../src/mesh/bridge-nats-types.js";
 import { controlBodyFingerprint } from "../src/mesh/control-idempotency.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
@@ -166,13 +168,33 @@ describe("NatsCarrierSide under MeshBridge", () => {
     const { store, port, link } = await fixture({ resendAttempts: 2 });
     await fileFollowUp(store);
     port.uncertain = 2;
-    await expect(link.bridge.step()).rejects.toThrow(/outcome is unknown/);
+    // MeshBridge's own retryable class: run() backs off and retries; it never ends the link.
+    const deferred = await link.bridge.step().catch((error: unknown) => error);
+    expect(deferred).toBeInstanceOf(BridgeMirrorDeferredError);
+    expect(deferred).toBeInstanceOf(NatsCarrierDeferredError);
+    expect((deferred as Error).message).toMatch(/outcome is unknown/);
     expect(port.sent).toHaveLength(0);
     expect(new Set(port.attempts).size).toBe(1);
     expect(port.attempts).toHaveLength(2);
     expect((await link.bridge.step()).toRemote).toBe(1);
     expect(port.sent).toHaveLength(1);
     expect(port.sent[0]!.id).toBe(port.attempts[0]);
+  });
+
+  it("a NATS outage (unavailable transport, a KV gap) defers the direction; the command crosses once it ends", async () => {
+    const { store, port, link } = await fixture();
+    await fileFollowUp(store);
+    const send = port.send.bind(port);
+    port.send = async () => { throw new TransportUnavailableError("NATS connection closed"); };
+    await expect(link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    // The target's KV route is gone for a moment as well: still a wait, never a drop.
+    const route = port.routes.get(natsLead.id)!;
+    port.routes.delete(natsLead.id);
+    await expect(link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    port.routes.set(natsLead.id, route);
+    port.send = send;
+    expect((await link.bridge.step()).toRemote).toBe(1);
+    expect(port.sent).toHaveLength(1);
   });
 
   it("a redelivery after a restart is appended once (dedupe receipt) and ACKed", async () => {

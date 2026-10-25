@@ -1,15 +1,18 @@
 import { participantFromEntry } from "../topology/participant-directory.js";
 import { readParticipantFiles } from "../topology/participant-files.js";
 import type { FabricParticipantRecord } from "../topology/types.js";
-import { TransportUncertainError, type TransportSent } from "../transport/types.js";
+import {
+  DirectoryNotReadyError, TransportUncertainError, TransportUnavailableError, type TransportSent,
+} from "../transport/types.js";
 import type { BridgeChange } from "./change-notifier.js";
 import {
-  BRIDGE_PROTOCOL_VERSION, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
+  BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
   type BridgeRead, type BridgeSide, type MeshBridgeOptions,
 } from "./bridge.js";
 import {
-  carrierDeliveryFromPort, NatsBridgeCarrier, type FilePresenceEntry, type NatsCarrierAuthorize, type NatsCarrierEnvelope,
-  type NatsCarrierLedger, type NatsCarrierPresence, type NatsCarrierSettle, type NatsInbound, type NatsPresenceEntry,
+  carrierDeliveryFromPort, NatsBridgeCarrier, NatsCarrierRefusal, NatsCarrierUnavailable, type FilePresenceEntry, type NatsCarrierAuthorize,
+  type NatsCarrierEnvelope, type NatsCarrierFileAnswer, type NatsCarrierLedger, type NatsCarrierPresence, type NatsCarrierSettle,
+  type NatsInbound, type NatsOutbound, type NatsPresenceEntry,
 } from "./bridge-nats-carrier.js";
 import { NatsTopicTranslator, type NatsTopicAuthorize } from "./bridge-nats-topics.js";
 import {
@@ -47,6 +50,35 @@ const WORKING_INTERVAL_MS = 5_000;
 /** In-hand deliveries this side holds before it stops pulling (backpressure, not loss). */
 const MAX_IN_HAND = 512;
 const PARTICIPANT_PREFIX = "topology/participants/";
+
+/**
+ * A transient NATS-side condition (an outage, a KV gap, an uncertain PubAck) as MeshBridge's own retryable
+ * error: the direction backs off and retries from its durable cursor instead of ending the link. Anything
+ * else a side throws is terminal for MeshBridge's run, which is right for real faults and wrong for these.
+ */
+export class NatsCarrierDeferredError extends BridgeMirrorDeferredError {
+  override readonly name = "NatsCarrierDeferredError";
+  constructor(readonly reason: unknown) {
+    super(false, 0);
+    this.message = `Fabric NATS side is temporarily unavailable; retrying with backoff: ${message(reason)}`;
+    this.cause = reason;
+  }
+}
+
+const TRANSIENT_CODES: ReadonlySet<unknown> = new Set([
+  "FABRIC_TRANSPORT_UNAVAILABLE", "FABRIC_TRANSPORT_UNCERTAIN", "FABRIC_TRANSPORT_CAPACITY", "FABRIC_DIRECTORY_NOT_READY",
+  // L1's port refuses a send from an identity it does not hold live in KV right now (a lease write missed in an outage).
+  "FABRIC_SENDER_UNVERIFIED", "FABRIC_NATS_CARRIER_TARGET_UNAVAILABLE",
+]);
+
+/** Whether an error is a NATS-side condition that clears by itself (retry), not a fault (end the link). */
+export const isNatsCarrierTransient = (error: unknown): boolean =>
+  error instanceof NatsCarrierUnavailable || error instanceof NatsCarrierUncertainError ||
+  error instanceof TransportUncertainError || error instanceof TransportUnavailableError || error instanceof DirectoryNotReadyError ||
+  (typeof error === "object" && error !== null && TRANSIENT_CODES.has((error as { code?: unknown }).code));
+
+const deferTransient = (error: unknown): unknown =>
+  error instanceof BridgeMirrorDeferredError || !isNatsCarrierTransient(error) ? error : new NatsCarrierDeferredError(error);
 
 export class NatsCarrierUncertainError extends Error {
   override readonly name = "NatsCarrierUncertainError";
@@ -208,6 +240,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   readonly carrier: NatsBridgeCarrier;
   readonly topics: NatsTopicTranslator;
   readonly filePresence: FileCarrierPresence;
+  readonly #file: StoreBridgeSide;
   readonly #link: string;
   readonly #now: () => number;
   readonly #log: (line: string) => void;
@@ -231,6 +264,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
 
   constructor(options: NatsCarrierSideOptions) {
     this.port = options.port;
+    this.#file = options.file;
     this.#link = options.link;
     this.#now = options.now ?? Date.now;
     this.filePresence = new FileCarrierPresence(options.file, this.#now, options.filePresenceTtlMs);
@@ -341,7 +375,9 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     };
   }
 
-  presence(): Promise<BridgePresence> { return this.port.presence(); }
+  async presence(): Promise<BridgePresence> {
+    try { return await this.port.presence(); } catch (error) { throw deferTransient(error); }
+  }
 
   /**
    * File roots (and allow-listed file actors) into KV under the bridge machine, plus the link's own
@@ -362,7 +398,9 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
       set = { hosts: [...hosts, ...this.#lastMirror.hosts.filter(host => !ids.has(host.record.id))],
         participants: [...participants, ...this.#lastMirror.participants.filter(participant => !pids.has(participant.id))] };
     }
-    await this.port.mirror({ ...set, linkIdentity: bridgeNatsLinkIdentity(this.#link) }, observedAt ?? this.#now());
+    try {
+      await this.port.mirror({ ...set, linkIdentity: bridgeNatsLinkIdentity(this.#link) }, observedAt ?? this.#now());
+    } catch (error) { throw deferTransient(error); }
     if (!partial) this.#lastMirror = set;
   }
 
@@ -389,17 +427,38 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   async publish(event: BridgePublish): Promise<{ sequence: number }> {
     // Identity and the allow gate read the file side's presence: at most one TTL old, never stale.
     await this.filePresence.refresh();
-    const plan = event.topic === BRIDGE_NATS_CONTROL_TOPIC || event.topic === BRIDGE_NATS_ACK_TOPIC
-      ? await this.carrier.outbound(event) : await this.topics.outbound(event);
+    let plan: NatsOutbound;
+    try {
+      plan = event.topic === BRIDGE_NATS_CONTROL_TOPIC || event.topic === BRIDGE_NATS_ACK_TOPIC
+        ? await this.carrier.outbound(event) : await this.topics.outbound(event);
+    } catch (error) {
+      // A refused command from a verified file sender is answered (notRun, stable code) before MeshBridge drops it.
+      if (error instanceof NatsCarrierRefusal && error.answer) await this.#answerFileSender(error.answer);
+      throw deferTransient(error);
+    }
     if (plan.kind === "absorb") {
       this.#log(`toNats: ${event.topic} ${event.data.bridge.id} needs no send: ${plan.reason}`);
       return { sequence: 0 };
     }
-    const sent = await this.#send(plan.envelope);
+    let sent: TransportSent<Record<string, unknown>>;
+    try { sent = await this.#send(plan.envelope); } catch (error) { throw deferTransient(error); }
     // An ACK going back to a NATS sender is that command's forward; a command is now sent.
     if (plan.settle) await this.carrier.settle(plan.settle, true);
     else if (plan.record?.direction === "toNats" && plan.envelope.kind === "command") await this.carrier.sent(plan.record, sent.sequence);
     return { sequence: sent.sequence };
+  }
+
+  /**
+   * The refusal ACK, through the local side's own bridged publication: durable, deduped by its stamp, and
+   * committed only while this link still holds the owner it speaks for (the held fence).
+   */
+  async #answerFileSender(answer: NatsCarrierFileAnswer): Promise<void> {
+    try {
+      await this.#file.publish({ topic: BRIDGE_NATS_ACK_TOPIC, kind: "rejected", from: answer.from, to: answer.to,
+        data: { ...answer.data, bridge: { from: this.#link, id: `refused:${answer.refusedEventId}` } } }, [answer.from.id]);
+    } catch (error) {
+      this.#log(`toNats: could not answer the refusal of ${answer.refusedEventId}: ${message(error)}`);
+    }
   }
 
   /**
@@ -422,7 +481,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
         else continue; // answered and settled here; its sequence is never shown
       } catch (error) {
         // Stop in order before the delivery that failed; it is retried on the next read.
-        if (!events.length) throw error;
+        if (!events.length) throw deferTransient(error);
         this.#log(`toFile: stopped before stream sequence ${stream}: ${message(error)}`);
         break;
       }

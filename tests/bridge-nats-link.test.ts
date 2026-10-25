@@ -121,6 +121,13 @@ describe("startNatsLink composition with L3's allow gate", () => {
     expect(step.dropped).toBe(1);
     expect(port.sent.map(envelope => envelope.operation)).toEqual(["followUp"]);
     expect(logs.some(line => /BRIDGE_NATS_DESTINATION_CLASS_REFUSED|never receives stop/.test(line))).toBe(true);
+    // The verified sender is answered at once (never a timeout): a rejected ACK from the owner the link
+    // mirrors, with the link's stamp, notRun and the stable code, matched to its original commandId.
+    const answer = store.read({ after: 0, limit: store.maxReadEvents }).find(event => event.topic === "fabric.control.ack" &&
+      (event.data as Record<string, unknown>).commandId === "c-stop");
+    expect(answer).toMatchObject({ kind: "rejected", to: fileLead.id, verification: "bridge", from: { id: natsLead.id },
+      data: { accepted: false, notRun: true, errorCode: "BRIDGE_NATS_DESTINATION_CLASS_REFUSED", targetId: natsLead.id,
+        ownerIncarnation: "inc-moved-lead", bridge: { from: LINK } } });
     // An off-list file root never sends, even to an allow-listed target.
     await store.publish({ topic: "fabric.control.command", kind: "followUp", from: offList, to: natsLead.id,
       data: { version: 1, commandId: "c-off", targetId: natsLead.id, operation: "followUp", replyTo: offList.id, message: "x",

@@ -340,7 +340,7 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
       expect(before?.value).toMatchObject({ id, kind: "root", sessionId });
       const refused: unknown = await moved.runtime.initialize(moved.context, configFor(rootB, "machine-b")).then(() => undefined, (error: unknown) => error);
       expect(refused).toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE", participantId: id,
-        owners: [{ machine: "machine-a", ownerIncarnation: before!.value.ownerIncarnation, live: true }] });
+        owners: [{ machine: "machine-a", ownerIncarnation: before!.value.ownerIncarnation, routable: true }] });
       expect(moved.runtime.initialized).toBe(false);
       expect(await inspector.kv("presence").get(key("machine-b", "p", id)), "nothing registered on machine-b").toBeUndefined();
       expect(await inspector.kv("presence").get(key("machine-a", "p", id))).toEqual(before);
@@ -368,6 +368,41 @@ describe.skipIf(!binary || process.platform !== "linux")("#14115 real authentica
       await inspector?.close(); vi.unstubAllEnvs();
     }
   }, 60_000);
+
+  // The carrier, on the real broker, with each machine's real authenticated user: both write their
+  // own host lease and register at once, as two hosts starting one session would. (Two full
+  // runtimes in one process would share the agent-dir lease receipt, which two hosts never do.)
+  it("lets at most one of two machines register a session when their first registrations race", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "presence-race-"));
+    const opened: FabricTransport[] = [], views: KvParticipantDirectory[] = [];
+    const gate = { live: () => true, signal: new AbortController().signal };
+    try {
+      for (let round = 0; round < 4; round++) {
+        const id = `session:presence-race-${round}-${Date.now()}`;
+        const results = await Promise.allSettled((["machine-a", "machine-b"] as const).map(async machine => {
+          const transport = await openFabricTransport({ config: configFor(root, machine).mesh, hostId: id,
+            mesh: new MeshStore(path.join(root, `${machine}-${round}`), 65_536, 1_000) });
+          opened.push(transport);
+          const incarnation = `${machine}-activation`;
+          await transport.kv("leases").put(key(machine, "h", id), `${id}#${incarnation}`, hostLease(id, incarnation, Date.now()), 0);
+          const view = new KvParticipantDirectory({ transport, lease: gate, identityId: id, rootId: id,
+            ownerIncarnation: incarnation, operationTimeoutMs: 10_000 });
+          views.push(view); view.start();
+          await directoryReady(view, id);
+          return view.publish(participant(id, incarnation, `racer-${machine}`, Date.now()));
+        }));
+        const won = results.filter(result => result.status === "fulfilled").length;
+        expect(won, JSON.stringify(results.map(result => result.status === "rejected" ? (result.reason as { code?: unknown }).code : "ok")))
+          .toBeLessThanOrEqual(1);
+        for (const result of results) if (result.status === "rejected") expect(result.reason).toMatchObject({ code: "FABRIC_PRESENCE_OWNED_ELSEWHERE" });
+        const rows = await Promise.all(["machine-a", "machine-b"].map(machine => opened[0]!.kv("presence").get(key(machine, "p", id))));
+        expect(rows.filter(Boolean)).toHaveLength(won);
+      }
+    } finally {
+      await Promise.allSettled(views.map(view => view.close()));
+      await Promise.allSettled(opened.map(transport => transport.close()));
+    }
+  }, 40_000);
 
   it("real broker CAS admits exactly one concurrent own-root resumer and leaves the winner live", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "presence-broker-cas-"));

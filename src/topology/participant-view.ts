@@ -47,18 +47,27 @@ export interface KvParticipantDirectoryOptions {
 
 /**
  * A new session-root presence registration was refused because another authenticated machine
- * holds a live record for the same root id (smarty-dev#15310 D3). Nothing was written. Two
- * machines presenting one id would leave it ambiguous and unroutable; the old owner must stop
- * (or its lease must lapse) before the session can register here.
+ * holds the same root id: a live record, or a live lease for its host (smarty-dev#15310 D3).
+ * Nothing was written. Two machines presenting one id would leave it ambiguous and unroutable;
+ * the old owner must stop (or its lease must lapse) before the session can register here.
  */
 export class PresenceOwnedElsewhereError extends Error {
   readonly code = "FABRIC_PRESENCE_OWNED_ELSEWHERE";
   readonly persisted = false;
-  readonly owners: readonly ParticipantRoute[];
-  constructor(readonly participantId: string, owners: readonly ParticipantRoute[]) {
-    super(`Participant ${participantId} is live on machine ${owners.map(owner => owner.machine).join(", ")}; refusing a second registration`);
-    this.owners = owners.map(owner => ({ ...owner, capabilities: [...owner.capabilities] }));
+  readonly owners: readonly PresenceHolder[];
+  constructor(readonly participantId: string, owners: readonly PresenceHolder[]) {
+    super(`Participant ${participantId} is held on machine ${owners.map(owner => owner.machine).join(", ")}; refusing a second registration`);
+    this.owners = owners.map(owner => ({ ...owner }));
   }
+}
+
+/** Another machine's hold on a root: `routable` when its presence record is live, else its lease alone. */
+export interface PresenceHolder {
+  readonly machine: string;
+  readonly ownerHostId: string;
+  readonly ownerIdentityId: string;
+  readonly ownerIncarnation: string;
+  readonly routable: boolean;
 }
 
 /** One authenticated machine's current record for an id, for read-only ownership receipts. */
@@ -379,23 +388,45 @@ export class KvParticipantDirectory implements ParticipantView {
     }).sort((a, b) => a.machine.localeCompare(b.machine));
   }
 
-  /** Live records for `id` on OTHER authenticated machines, from the ready snapshot. */
-  #liveElsewhere(id: string): ParticipantRoute[] {
+  /**
+   * OTHER machines holding this root, from the ready snapshot: a routable presence record, or
+   * any valid lease row for the root's host id (a runtime that is alive there, even before it
+   * publishes presence).
+   */
+  #heldElsewhere(record: FabricParticipantRecord): PresenceHolder[] {
     const self = this.options.transport.self.machine;
-    return [...this.#records.values()]
-      .filter(entry => entry.value.id === id && machineFromKey(entry.key, "p") !== self)
-      .map(entry => this.#route(entry)).filter(route => route.live);
+    const holders = new Map<string, PresenceHolder>();
+    for (const entry of this.#records.values()) {
+      const machine = machineFromKey(entry.key, "p")!;
+      if (entry.value.id !== record.id || machine === self) continue;
+      const route = this.#route(entry);
+      if (route.live) holders.set(machine, { machine, ownerHostId: route.ownerHostId, ownerIdentityId: route.ownerIdentityId,
+        ownerIncarnation: route.ownerIncarnation, routable: true });
+    }
+    const token = tokenFor(record.ownerHostId);
+    for (const host of this.#hosts.values()) {
+      const machine = machineFromKey(host.key, "h")!;
+      if (machine === self || host.key.split(".")[2] !== token || holders.has(machine)) continue;
+      holders.set(machine, { machine, ownerHostId: host.value.id, ownerIdentityId: host.value.identityId,
+        ownerIncarnation: host.value.incarnation, routable: false });
+    }
+    return [...holders.values()].sort((a, b) => a.machine.localeCompare(b.machine));
   }
 
   /**
    * A NEW registration of a session root (create or same-machine succession) first waits for
-   * both ready watches, then refuses while another machine holds a live record for that id. A
-   * view that cannot become ready refuses too: never register a root blind. Only roots are
-   * fenced: a root refusal fails that runtime's activation, while a refused child or actor row
-   * would stall the whole refresh pass for every other row. Refreshes of a row this view already
-   * owns are not registrations. KV has no cross-key transaction, so two first registrations
-   * racing on different machines can both pass; routing still treats that id as ambiguous
-   * (#entry) and resolves neither.
+   * both ready watches, then refuses while another machine holds that root (#heldElsewhere). A
+   * view that cannot become ready refuses too: never register a root blind.
+   *
+   * Racing first registrations: each runtime writes its own host lease, then registers only
+   * after its lease watch has observed that write (checked below). The leases bucket is one
+   * totally ordered stream, so of two machines racing for one root, at least one has already
+   * seen the other's lease and refuses; both may refuse, never both register.
+   *
+   * Only roots are fenced: a root refusal fails that runtime's activation, while a refused child
+   * or actor row would stall the whole refresh pass for every other row. Refreshes of a row this
+   * view already owns are not registrations. Routing still treats any id present on two
+   * machines as ambiguous (#entry) and resolves neither.
    */
   async #assertSoleRegistration(record: FabricParticipantRecord): Promise<void> {
     if (record.kind !== "root") return;
@@ -408,13 +439,19 @@ export class KvParticipantDirectory implements ParticipantView {
         throw new DirectoryNotReadyError("Presence view is not ready; refusing an unchecked registration", { cause: error });
       }
     }
-    this.#refuseLiveElsewhere(record);
+    const self = this.options.transport.self;
+    const own = this.#hosts.get(`${self.machine}.h.${tokenFor(self.hostId)}`);
+    if (!own || own.owner !== this.#owner() || own.value.id !== self.hostId ||
+      own.value.incarnation !== this.options.ownerIncarnation) {
+      throw new TransportUnavailableError("This view has not observed its own owner lease; refusing an unordered root registration");
+    }
+    this.#refuseHeldElsewhere(record);
   }
 
-  #refuseLiveElsewhere(record: FabricParticipantRecord): void {
+  #refuseHeldElsewhere(record: FabricParticipantRecord): void {
     if (record.kind !== "root") return;
-    const owners = this.#liveElsewhere(record.id);
-    if (owners.length) throw new PresenceOwnedElsewhereError(record.id, owners);
+    const holders = this.#heldElsewhere(record);
+    if (holders.length) throw new PresenceOwnedElsewhereError(record.id, holders);
   }
 
   #entry(id: string): TransportKvEntry<FabricParticipantRecord> | undefined {
@@ -610,7 +647,7 @@ export class KvParticipantDirectory implements ParticipantView {
           throw new TransportUnavailableError("Current owner lease does not authorize presence succession");
         }
         this.#assertWritable(); // Reads may outlive the monotonic lease window.
-        this.#refuseLiveElsewhere(copy); // The watch may have seen another machine register during those reads.
+        this.#refuseHeldElsewhere(copy); // The watch may have seen another machine register during those reads.
         revision = await this.#update(key, copy, current.revision); // One CAS; never retry/adopt a lost revision.
         try {
           // KV has no cross-bucket transaction. Validate the exact lease revision

@@ -16,6 +16,7 @@ import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
 import { participantFilePresent, readParticipantFiles, withParticipantFileDirectoryCustody } from "../topology/participant-files.js";
 import { participantFromEntry } from "../topology/participant-directory.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshStateEntry, type MeshStore } from "./store.js";
+import { PresenceDropReasons, type PresenceDropCount } from "./presence-drop-reasons.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
 import { MeshLockQueueExpiredError, withInitialMeshLockAdmission, type InitialMeshLockDiagnostics } from "./mesh-lock.js";
@@ -309,6 +310,8 @@ export interface BridgePresence {
   partial?: boolean;
   /** Number of malformed, conflicting, or otherwise dropped records observed in the raw scan. */
   droppedCount?: number;
+  /** Bounded, value-free key-family/reason counts; optional for older bridge peers. */
+  droppedReasons?: PresenceDropCount[];
   /**
    * Every id and identity id of native records, live or not: a peer may never claim them. Only a
    * hub handoff in force to this link waives a dead native's own ids (smarty-dev#9074).
@@ -316,7 +319,7 @@ export interface BridgePresence {
   reserved: string[];
 }
 
-type BridgeMirrorPresence = Pick<BridgePresence, "hosts" | "participants" | "dropped" | "partial" | "droppedCount">;
+type BridgeMirrorPresence = Pick<BridgePresence, "hosts" | "participants" | "dropped" | "partial" | "droppedCount" | "droppedReasons">;
 
 const validDroppedCount = (value: unknown): number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
@@ -1184,6 +1187,7 @@ export class StoreBridgeSide implements BridgeSide {
     const hosts: BridgeHost[] = [];
     const nonRootHosts: BridgeHost[] = [];
     let rawDroppedCount = 0;
+    const reasons = new PresenceDropReasons();
     // Every id not mirrored by this link is reserved: natives, live or not, and other links'
     // mirrors (security review F1/F2). Only natives are this side's presence.
     for (const entry of hostEntries) {
@@ -1191,13 +1195,15 @@ export class StoreBridgeSide implements BridgeSide {
       if (mirrorLinkOf(entry.value) === this.peer) continue;
       const host = presenceHostOf(entry.key, entry.value);
       if (!host) {
-        if (mark === undefined) rawDroppedCount += 1;
+        if (mark === undefined) { rawDroppedCount += 1; reasons.add("topology/hosts", "malformed"); }
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
         continue;
       }
       for (const id of [host.id, host.identity.id, host.rootId]) reserve(entry.value, id);
       if (mark !== undefined) continue;
-      if (entry.updatedBy.id !== host.identity.id) { rawDroppedCount += 1; continue; }
+      if (entry.updatedBy.id !== host.identity.id) {
+        rawDroppedCount += 1; reasons.add("topology/hosts", "writer-mismatch"); continue;
+      }
       if (isNativeNonRootHost(host)) {
         const liveness = hostLiveness(leases, host);
         if (liveness.expiresAt > now) nonRootHosts.push({ record: { ...host, ...liveness }, expiresAt: liveness.expiresAt, observedAt: now });
@@ -1205,6 +1211,7 @@ export class StoreBridgeSide implements BridgeSide {
       }
       if (!isAdmissibleRecord("host", host)) {
         rawDroppedCount += 1;
+        reasons.add("topology/hosts", "malformed");
         // Do not let effective file liveness normalize a bad native/bootstrap record into
         // renewable authority, or silently omit it and erase the peer's retained fence.
         hosts.push({ record: host, expiresAt: host.expiresAt, observedAt: now });
@@ -1224,13 +1231,15 @@ export class StoreBridgeSide implements BridgeSide {
       if (mirrorLinkOf(entry.value) === this.peer) continue;
       const participant = participantOf(entry.key, entry.value);
       if (!participant) {
-        if (mark === undefined) rawDroppedCount += 1;
+        if (mark === undefined) { rawDroppedCount += 1; reasons.add("topology/participants", "malformed"); }
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
         continue;
       }
       const copy = participantCopies.get(entry.key);
       if (copy && settled(copy.record as unknown as Record<string, unknown>) !==
-        settled(participant as unknown as Record<string, unknown>)) rawDroppedCount += 1;
+        settled(participant as unknown as Record<string, unknown>)) {
+        rawDroppedCount += 1; reasons.add("topology/participants", "conflicting-copy");
+      }
       if (!copy || copy.updatedAt <= entry.updatedAt) participantCopies.set(entry.key, { record: participant, updatedAt: entry.updatedAt });
       for (const id of [participant.id, participant.ownerIdentityId, participant.rootId]) reserve(entry.value, id);
       if (typeof participant.name === "string" && participant.name) reserve(entry.value, participant.name);
@@ -1245,10 +1254,13 @@ export class StoreBridgeSide implements BridgeSide {
         if (!previous || previous.updatedAt <= entry.updatedAt) {
           participants.set(participant.id, { record: participant, updatedAt: entry.updatedAt });
         }
-      } else if (mark === undefined && participant.kind === "root" && owner !== undefined) rawDroppedCount += 1;
+      } else if (mark === undefined && participant.kind === "root" && owner !== undefined) {
+        rawDroppedCount += 1;
+        reasons.add("topology/participants", entry.updatedBy.id !== participant.ownerIdentityId ? "writer-mismatch" : "owner-mismatch");
+      }
     }
     const admitted = admitPresence({ hosts, participants: [...participants.values()].map(({ record }) => record),
-      ...(rawDroppedCount > 0 ? { partial: true, droppedCount: rawDroppedCount } : {}) }, new Set());
+      ...(rawDroppedCount > 0 ? { partial: true, droppedCount: rawDroppedCount, droppedReasons: reasons.entries() } : {}) }, new Set());
     return {
       // Root admission exports canonical root hosts; valid resident/runtime rows travel separately
       // for remote directories and reapers, never as address authority. Reservations above still
@@ -2780,9 +2792,12 @@ const presenceArg = (args: unknown, hub: string): BridgeMirrorPresence => {
   const inheritedCount = Math.max(validDroppedCount(args.droppedCount), relevantDroppedCount(rawDropped));
   const droppedCount = inheritedCount + malformedHosts + malformedParticipants +
     (args.hosts.length - hosts.length) + (args.participants.length - participants.length);
+  const reasons = new PresenceDropReasons(args.droppedReasons, inheritedCount);
+  reasons.add("topology/hosts", "malformed", malformedHosts + args.hosts.length - hosts.length);
+  reasons.add("topology/participants", "malformed", malformedParticipants + args.participants.length - participants.length);
   const partial = args.partial === true || droppedCount > 0;
   return { hosts, participants, ...(dropped.length > 0 ? { dropped } : {}),
-    ...(partial ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) };
+    ...(partial ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount, droppedReasons: reasons.entries() } : {}) };
 };
 
 const dispatch = async (side: StoreBridgeSide, request: RpcRequest, receivedAt: number): Promise<unknown> => {
@@ -3297,6 +3312,9 @@ export const admitPresence = (
   // review round 4, F2): a host that splits them is refused, so one id names one owner.
   const rawDropped = Array.isArray(raw.dropped) ? raw.dropped : [];
   const dropped = uniqueDroppedPresence(rawDropped);
+  const reasons = new PresenceDropReasons(raw.droppedReasons, Math.max(validDroppedCount(raw.droppedCount), relevantDroppedCount(rawDropped)));
+  if (!Array.isArray(raw.hosts)) reasons.add("topology/hosts", "malformed");
+  if (!Array.isArray(raw.participants)) reasons.add("topology/participants", "malformed");
   let droppedCount = Math.max(validDroppedCount(raw.droppedCount), relevantDroppedCount(rawDropped)) +
     (Array.isArray(raw.hosts) ? 0 : 1) + (Array.isArray(raw.participants) ? 0 : 1);
   const hosts: BridgeHost[] = [];
@@ -3304,11 +3322,13 @@ export const admitPresence = (
   for (const value of rawHosts) {
     if (!isObject(value) || !isObject(value.record) || typeof value.record.id !== "string") {
       droppedCount += 1;
+      reasons.add("topology/hosts", "malformed");
       continue;
     }
     const record = presenceHostOf(keyFor(HOST_PREFIX, value.record.id), value.record, trustedBridgeVia);
     if (!record) {
       droppedCount += 1;
+      reasons.add("topology/hosts", "malformed");
       const attribution = droppedPresenceOf("host", value.record);
       if (attribution) dropped.push(attribution);
       continue;
@@ -3326,6 +3346,7 @@ export const admitPresence = (
     if (malformed || reservedConflict) {
       if (malformed) {
         droppedCount += 1;
+        reasons.add("topology/hosts", "malformed");
         const attribution = droppedPresenceOf("host", record, !reservedConflict);
         if (attribution) dropped.push(attribution);
       }
@@ -3335,9 +3356,11 @@ export const admitPresence = (
   const admitted = new Map(hosts.map(({ record }) => [record.id, record]));
   const participants: FabricParticipantRecord[] = [];
   for (const value of rawParticipants) {
-    if (!isObject(value) || typeof value.id !== "string") { droppedCount += 1; continue; }
+    if (!isObject(value) || typeof value.id !== "string") {
+      droppedCount += 1; reasons.add("topology/participants", "malformed"); continue;
+    }
     const participant = participantOf(keyFor(PARTICIPANT_PREFIX, value.id), value, trustedBridgeVia);
-    if (!participant) { droppedCount += 1; continue; }
+    if (!participant) { droppedCount += 1; reasons.add("topology/participants", "malformed"); continue; }
     const owner = admitted.get(participant.ownerHostId);
     const relayed = trustedRelayOf(participant, trustedBridgeVia);
     const canonicalParticipant = participant.kind === "root" && (relayed || participant.bridgeVia === undefined) &&
@@ -3350,6 +3373,7 @@ export const admitPresence = (
       const malformed = !canonicalParticipant || (owner !== undefined && !ownerMatches) || (!reservedConflict && owner === undefined);
       if (malformed) {
         droppedCount += 1;
+        reasons.add("topology/participants", !canonicalParticipant ? "malformed" : "owner-mismatch");
         const attribution = droppedPresenceOf("participant", participant, !reservedConflict);
         if (attribution) dropped.push(attribution);
       }
@@ -3358,7 +3382,7 @@ export const admitPresence = (
   const unique = uniqueDroppedPresence(dropped, true);
   const partial = !isObject(rawValue) || raw.partial === true || droppedCount > 0;
   return { hosts: [...hosts, ...nonRootHosts], participants, ...(unique.length > 0 ? { dropped: unique } : {}),
-    ...(partial ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) };
+    ...(partial ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount, droppedReasons: reasons.entries() } : {}) };
 };
 
 /**
@@ -3375,10 +3399,13 @@ export const boundPresence = (
   const rawHosts = Array.isArray(raw.hosts) ? raw.hosts : [];
   const rawParticipants = Array.isArray(raw.participants) ? raw.participants : [];
   const rawDropped = Array.isArray(raw.dropped) ? raw.dropped : [];
+  const reasons = new PresenceDropReasons(raw.droppedReasons, Math.max(validDroppedCount(raw.droppedCount), relevantDroppedCount(rawDropped)));
+  if (!Array.isArray(raw.hosts)) reasons.add("topology/hosts", "malformed");
+  if (!Array.isArray(raw.participants)) reasons.add("topology/participants", "malformed");
   const roots = new Map<string, FabricParticipantRecord[]>();
   let malformed = (Array.isArray(raw.hosts) ? 0 : 1) + (Array.isArray(raw.participants) ? 0 : 1);
   for (const value of rawParticipants) {
-    if (!isObject(value) || typeof value.ownerHostId !== "string") { malformed += 1; continue; }
+    if (!isObject(value) || typeof value.ownerHostId !== "string") { malformed += 1; reasons.add("topology/participants", "malformed"); continue; }
     roots.set(value.ownerHostId, [...(roots.get(value.ownerHostId) ?? []), value as unknown as FabricParticipantRecord]);
   }
   const hosts: BridgeHost[] = [];
@@ -3387,12 +3414,13 @@ export const boundPresence = (
   let dropped = 0;
   for (const value of rawHosts) {
     if (!isObject(value) || !isObject(value.record) || typeof value.record.id !== "string" ||
-      typeof value.expiresAt !== "number") { malformed += 1; continue; }
+      typeof value.expiresAt !== "number") { malformed += 1; reasons.add("topology/hosts", "malformed"); continue; }
     const host = value as unknown as BridgeHost;
     const own = roots.get(host.record.id) ?? [];
     const size = Buffer.byteLength(JSON.stringify([host, own]), "utf8");
     if (bytes + size > budget) {
       dropped += 1;
+      reasons.add("topology/hosts", "frame-budget");
       continue;
     }
     bytes += size;
@@ -3402,7 +3430,7 @@ export const boundPresence = (
   const droppedCount = Math.max(validDroppedCount(raw.droppedCount), relevantDroppedCount(rawDropped)) + malformed + dropped;
   const droppedPresence = uniqueDroppedPresence(rawDropped, true);
   return { presence: { hosts, participants, ...(droppedPresence.length > 0 ? { dropped: droppedPresence } : {}),
-    ...(raw.partial === true || droppedCount > 0 ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) }, dropped };
+    ...(raw.partial === true || droppedCount > 0 ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount, droppedReasons: reasons.entries() } : {}) }, dropped };
 };
 
 /**
@@ -4105,9 +4133,14 @@ export class MeshBridge {
       .filter(record => counts.get(record.rootId) === 1);
     const outboundAdmissionDrops = hosts.length - outboundHosts.length +
       native.participants.length + relays.participants.length - outboundParticipants.length;
+    const outboundReasons = new PresenceDropReasons(native.droppedReasons, presenceDroppedCount(native));
+    outboundReasons.add("topology/hosts", "conflicting-root", hosts.length - outboundHosts.length);
+    outboundReasons.add("topology/participants", "conflicting-root",
+      native.participants.length + relays.participants.length - outboundParticipants.length);
     const outbound = boundPresence({
       hosts: outboundHosts,
       participants: outboundParticipants,
+      droppedReasons: outboundReasons.entries(),
       ...(native.dropped?.length ? { dropped: native.dropped } : {}),
       ...(native.partial || outboundAdmissionDrops > 0 ? { partial: true } : {}),
       ...(presenceDroppedCount(native) + outboundAdmissionDrops > 0
@@ -4120,8 +4153,11 @@ export class MeshBridge {
       ...(partial ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) };
     const inboundPresence: BridgeMirrorPresence = { ...remote,
       ...(partial ? { partial: true } : {}), ...(droppedCount > 0 ? { droppedCount } : {}) };
+    const reasons = new PresenceDropReasons([
+      ...(remote.droppedReasons ?? []), ...(outbound.presence.droppedReasons ?? []),
+    ], droppedCount);
     if (partial) this.#log(`presence: ${droppedCount} dropped records; this sync is partial, omissions held${outbound.dropped
-      ? ` (${outbound.dropped} hosts pass the frame budget)` : ""}`);
+      ? ` (${outbound.dropped} hosts pass the frame budget)` : ""}; reasons: ${reasons.summary() || "none"}`);
     this.options.debug?.(`presence sync: inbound ${remote.hosts.length} hosts/${remote.participants.length} participants; outbound ${outbound.presence.hosts.length} hosts/${outbound.presence.participants.length} participants; partial=${partial} dropped=${droppedCount}`);
     // Both settle before a failure is reported, so no local write outlives this pass.
     const results = await Promise.allSettled([this.options.remote.mirror(outboundPresence), this.options.local.mirror(inboundPresence, inboundObservedAt)]);

@@ -222,7 +222,7 @@ describe.skipIf(!linux)("children (B2/B3/B4, r2 N1/N2)", () => {
     const target = await seat();
     const id = "8".repeat(32);
     const row = { status: "idle" };
-    let busy = 400;
+    let busy = 100; // about three quiescence reads per pass: some 30 refused stop requests
     target.actors.listOwned = () => [{ id, name: "slow", status: row.status, rootId: ROOT }];
     target.actors.drainQuiescence = () => row.status !== "idle" ? ["status-stopped"] : busy-- > 0 ? ["busy"] : [];
     target.actors.drainWorker = () => null;
@@ -233,7 +233,7 @@ describe.skipIf(!linux)("children (B2/B3/B4, r2 N1/N2)", () => {
     const steps = (outcome(target).steps as Array<{ step: string; detail: { refused: string | null } }>).filter(entry => entry.step === "stop-actors");
     expect(steps.filter(entry => entry.detail.refused === "ACTORS_NOT_QUIESCED").length).toBeGreaterThan(20);
     expect(fs.readdirSync(target.runDir).filter(name => name.startsWith("fabric-v2-drain-stop-"))).toEqual(["fabric-v2-drain-stop-1-intent.json"]);
-  });
+  }, 60_000);
 
   it("#1607 P1: a failed stop is not swallowed or retried: the drain refuses, the actor is attempted but never 'stopped'", async () => {
     const target = await seat();

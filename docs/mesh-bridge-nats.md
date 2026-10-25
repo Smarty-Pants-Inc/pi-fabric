@@ -307,6 +307,11 @@ variables, with the flags winning field by field. It opens a verified connection
 lease buckets only: no inbox, consumer, lease or presence of its own. It never prints `[]` without a
 complete snapshot of both buckets (exit 1, `FABRIC_NATS_ROOTS_UNAVAILABLE`).
 
+Every read the CLI makes as the link's machine (`roots --config`, `receipt --nats`, `dry-run`, `withdraw`)
+connects with the standard agent policy only, never `nats.events` or `nats.org`: these reads touch
+presence and lease KV, and a bridge credential that holds only the N4 consume grant passes, so the
+rollback works on an N4 config.
+
 Each row: `id`, `kind`, `name`, `sessionId`, `rootId`, `machine` (from the KV key, never the record),
 `ownerHostId`, `ownerIdentityId`, `ownerIncarnation`, `status`, `capabilities`, `live`.
 

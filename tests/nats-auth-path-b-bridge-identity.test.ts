@@ -103,8 +103,10 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link ide
     await waitForValue(() => liveRow(outsider, h.natsMain.id), "mirrored NATS root visible to the outsider", 10_000);
     const outsiderToken = `UNLISTED_FILE_ROOT_${randomUUID()}`;
     tokens.push(outsiderToken);
+    // A verified sender is ALWAYS answered (integrator note 10, F): a notRun refusal ACK from bridge:<link>
+    // with a stable BRIDGE_NATS_* code, well inside its 30 s bridge window. An abort at 15 s is no answer.
     const unlisted = outsider.invoke("agents.followUp", { id: h.natsMain.id, message: outsiderToken, idempotencyKey: `o-${randomUUID()}` },
-      AbortSignal.timeout(20_000)).then(() => "accepted", () => "refused");
+      AbortSignal.timeout(15_000)).then(() => "accepted", (error: unknown) => /BRIDGE_NATS_/.test(String(error)) ? "refused" : String(error));
     await fileToNatsBarrier();
     expect(await unlisted).toBe("refused");
     for (const token of tokens) {
@@ -146,8 +148,9 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link ide
     const seat = h.natsPeer!;
     await waitForValue(() => liveRow(h.fileMain, seat.id), "seat mirrored into the file mesh", 15_000);
     const steer = `SEAT_STEER_${randomUUID()}`, followUp = `SEAT_FOLLOWUP_${randomUUID()}`;
-    await expect(h.fileMain.invoke("agents.steer", { id: seat.id, message: steer, idempotencyKey: `s-${randomUUID()}` }, AbortSignal.timeout(40_000)))
-      .rejects.toThrow();
+    // Refused before publish by destination class and answered with the stable code, never left to time out.
+    await expect(h.fileMain.invoke("agents.steer", { id: seat.id, message: steer, idempotencyKey: `s-${randomUUID()}` }, AbortSignal.timeout(15_000)))
+      .rejects.toThrow(/BRIDGE_NATS_DESTINATION_CLASS_REFUSED/);
     await expect(h.fileMain.invoke("agents.followUp", { id: seat.id, message: followUp, idempotencyKey: `f-${randomUUID()}` }))
       .resolves.toMatchObject({ acknowledged: true });
     expect(mentions(seat, steer)).toEqual([]);

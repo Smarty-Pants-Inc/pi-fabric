@@ -144,7 +144,7 @@ directory. Nothing else on either side is written, so the rollback is:
    - Ryzen 1 stops routing to v2 identities within 15 s: a mirror authorizes traffic only while the
      bridge's observation is fresh (`MIRROR_FRESH_MS`). A sender gets `FABRIC_PEER_LEASE_STALE`, retryable,
      and nothing is published.
-2. **Remove the mirrors now instead of waiting for their TTL** (optional, same end state):
+2. **Remove the mirrors now, without waiting for their TTL** (optional, same end state):
 
    ```sh
    "$FABRIC/bin/nats-link" withdraw --config "$CONFIG"

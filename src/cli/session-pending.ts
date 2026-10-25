@@ -255,6 +255,18 @@ export const runSessionPendingCli = async (
       const registries: Array<{ file: string; scope: ActorInventory["scope"] }> = [{ file: path.join(actorRoot, "actors.json"), scope: "project" }];
       for (const name of names ?? []) {
         const directory = path.join(actorRoot, name);
+        if (ACTOR_ID.test(name)) {
+          // A project-scope actor directory: its actor keeps writing here, so do not track its metadata.
+          // Only an actors.json inside would make it a session registry root (an unusual session id).
+          try {
+            if (fs.lstatSync(path.join(directory, "actors.json"), { throwIfNoEntry: false })) {
+              registries.push({ file: path.join(directory, "actors.json"), scope: "session" });
+            }
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException)?.code !== "ENOTDIR") { observation.problem(directory, "unreadable actor namespace"); actorCoverage = false; }
+          }
+          continue;
+        }
         try {
           const stat = observation.stat(directory);
           if (stat?.isSymbolicLink()) { observation.problem(directory, "symlink in actor namespace"); actorCoverage = false; }
@@ -286,23 +298,30 @@ export const runSessionPendingCli = async (
       const lineages = new Set(["session", "durable"].map(residency =>
         `queue-${createHash("sha256").update([rootId, residency].join("\0")).digest("hex").slice(0, 16)}.json`));
       const inventoried = new Set(actors.map(entry => path.join(path.dirname(entry.registry), entry.id)));
-      // Other sessions' actors keep writing in a shared mesh: list them without change tracking,
-      // and stop only on this root's lineage file or a directory that cannot be listed.
-      const list = (directory: string): string[] | undefined => {
+      // Other sessions' actors keep writing in a shared mesh: list their directories without change
+      // tracking, but track this root's two expected checkpoint paths in each (present or absent), so
+      // one written during the scan is a change, not a silent zero. Registry roots are tracked too.
+      // null: not an actor directory (absent or not a directory); undefined: unreadable (unknown).
+      const list = (directory: string): string[] | null | undefined => {
         try { return fs.readdirSync(directory); }
         catch (error) {
-          if (absent(error) || (error as NodeJS.ErrnoException)?.code === "ENOTDIR") return [];
+          if (absent(error) || (error as NodeJS.ErrnoException)?.code === "ENOTDIR") return null;
           observation.problem(directory, "unreadable actor directory"); return undefined;
         }
       };
       for (const { file } of registries) {
         const registryRoot = path.dirname(file);
-        for (const name of (registryRoot === actorRoot ? names : list(registryRoot)) ?? []) {
+        const entries = registryRoot === actorRoot ? names : observation.names(registryRoot);
+        if (!entries) { actorCoverage = false; continue; }
+        for (const name of entries) {
           const directory = path.join(registryRoot, name);
           if (!ACTOR_ID.test(name) || inventoried.has(directory)) continue;
           const children = list(directory);
+          if (children === null) continue;
           if (!children) { actorCoverage = false; continue; }
-          if (children.some(entry => lineages.has(entry))) {
+          const found = [...lineages].filter(lineage => children.includes(lineage) ||
+            observation.stat(path.join(directory, lineage)) !== undefined);
+          if (found.length) {
             observation.problem(directory, "queue checkpoint for this root without an owned registry row; custody unknown");
             actorCoverage = false;
           }

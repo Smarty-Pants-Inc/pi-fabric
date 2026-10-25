@@ -249,6 +249,28 @@ describe("session pending CLI recorded-state inventory", () => {
     }
   });
 
+  it("refuses when this root's checkpoint appears in an unowned actor directory during the scan, not a foreign one", async () => {
+    const mesh = fixture(); const project = path.join(mesh, "actors");
+    json(queueFile(project, `session:${OTHER}`), { format: 1, items: [item("foreign")] });
+    const directory = path.join(project, ID), realReaddir = fs.readdirSync;
+    const during = async (write: () => void) => {
+      let fired = false;
+      const spy = vi.spyOn(fs, "readdirSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+        const listing = (realReaddir as (...args: unknown[]) => unknown)(target, ...rest);
+        if (!fired && String(target) === directory) { fired = true; write(); }
+        return listing;
+      }) as typeof fs.readdirSync);
+      try { return await run([SESSION, "--mesh", mesh]); } finally { spy.mockRestore(); expect(fired).toBe(true); }
+    };
+    // Another session's actor writing its own checkpoint during the scan is not this root's work.
+    const foreign = await during(() => json(queueFile(project, `session:${FOREIGN}`), { format: 1, items: [item("busy")] }));
+    expect(foreign.code).toBe(0); expect(foreign.value.complete).toBe(true);
+    // This root's checkpoint written right after the listing is caught by the tracked path, not missed.
+    const mine = await during(() => json(queueFile(project), { format: 1, items: [item("late", true)] }));
+    expect(mine.code).toBe(1);
+    expect(mine.value).toMatchObject({ complete: false, totals: { queued: null, inFlight: null } });
+  });
+
   it("is reachable as `pi-fabric session pending` through the standalone CLI entry", async () => {
     const mesh = fixture(); followUps(mesh, 2); const before = snapshot(mesh);
     const writes: string[] = [];

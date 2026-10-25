@@ -29,6 +29,26 @@ class Observation {
   readonly unknown: string[] = [];
   readonly seen = new Map<string, string | undefined>();
   problem(file: string, reason: string): void { this.unknown.push(`${file}: ${reason}`); }
+  /** Stop change-tracking a path that turned out not to hold this root's state (another session's). */
+  forget(file: string): void { this.seen.delete(file); }
+  /**
+   * List a shared namespace (mesh root, follow-up, route and actor roots) WITHOUT change tracking:
+   * every session writes there, so its metadata changing is not a change to this root's state.
+   */
+  quietNames(directory: string, optional = false): string[] | undefined {
+    try {
+      const stat = fs.lstatSync(directory, { throwIfNoEntry: false });
+      if (!stat) {
+        if (optional) return [];
+        throw new Error("missing directory");
+      }
+      if (!stat.isDirectory()) throw new Error("unsafe directory");
+      return fs.readdirSync(directory).sort();
+    } catch {
+      this.problem(directory, "missing, unreadable or non-directory namespace");
+      return undefined;
+    }
+  }
   stat(file: string): fs.BigIntStats | undefined {
     try {
       const stat = fs.lstatSync(file, { bigint: true });
@@ -188,11 +208,11 @@ export const runSessionPendingCli = async (
     const routing: { successorRootId: string | null; routes: number | null; unfinishedRoutes: number | null } =
       { successorRootId: null, routes: null, unfinishedRoutes: null };
     let actorCoverage = true;
-    const root = observation.names(meshRoot);
-    if (!root || observation.seen.get(meshRoot) === undefined) {
+    const root = observation.quietNames(meshRoot);
+    if (!root) {
       observation.problem(meshRoot, "missing or unreadable mesh root"); actorCoverage = false;
     } else {
-      observation.names(path.join(meshRoot, "main-followups"));
+      observation.quietNames(path.join(meshRoot, "main-followups"), true);
       const journal = observation.json(mailbox);
       followUps.present = journal.present;
       if (journal.present === false) followUps.count = 0;
@@ -233,12 +253,15 @@ export const runSessionPendingCli = async (
         } else routing.successorRootId = value.newRoot as string | undefined ?? null;
       }
       const routeDirectory = path.join(meshRoot, "main-followups", "routes");
-      const routes = observation.names(routeDirectory);
+      const routes = observation.quietNames(routeDirectory, true);
       routing.routes = routing.unfinishedRoutes = 0;
       let routesValid = routes !== undefined;
       for (const name of routes ?? []) {
         const file = path.join(routeDirectory, name);
-        const route = row(observation.json(file).value);
+        const read = observation.json(file);
+        if (read.present === false) { observation.forget(file); continue; } // removed after the listing
+        const route = row(read.value);
+        if (route && route.oldRoot !== rootId && route.newRoot !== rootId) observation.forget(file); // another root's route
         if (!/^[a-f0-9]{64}\.json$/.test(name) || !route || typeof route.oldRoot !== "string" ||
             typeof route.messageId !== "string" || (route.newRoot !== undefined && typeof route.newRoot !== "string") ||
             (route.done !== undefined && route.done !== true)) {
@@ -250,7 +273,7 @@ export const runSessionPendingCli = async (
       }
       if (!routesValid) routing.routes = routing.unfinishedRoutes = null;
       const actorRoot = path.join(meshRoot, "actors");
-      const names = observation.names(actorRoot);
+      const names = observation.quietNames(actorRoot, true);
       if (!names) actorCoverage = false;
       const registries: Array<{ file: string; scope: ActorInventory["scope"] }> = [{ file: path.join(actorRoot, "actors.json"), scope: "project" }];
       for (const name of names ?? []) {
@@ -268,18 +291,26 @@ export const runSessionPendingCli = async (
           continue;
         }
         try {
-          const stat = observation.stat(directory);
+          // Untracked: another session creating an actor changes its registry directory's metadata.
+          const stat = fs.lstatSync(directory, { throwIfNoEntry: false });
           if (stat?.isSymbolicLink()) { observation.problem(directory, "symlink in actor namespace"); actorCoverage = false; }
           else if (stat?.isDirectory()) registries.push({ file: path.join(directory, "actors.json"), scope: "session" });
         } catch { observation.problem(directory, "unreadable actor namespace"); actorCoverage = false; }
       }
+      // This session's own registry path is always read and tracked, even if absent when listed.
+      const ownRegistry = path.join(actorRoot, sessionId, "actors.json");
+      if (!registries.some(entry => entry.file === ownRegistry)) registries.push({ file: ownRegistry, scope: "session" });
       for (const { file, scope } of registries) {
+        // This session's own registry stays tracked (its appearance mid-scan is a change). Another
+        // registry is tracked only if it holds a row of this root.
+        const own = path.basename(path.dirname(file)) === sessionId;
         const registry = observation.json(file);
-        if (registry.present === false) continue;
+        if (registry.present === false) { if (!own) observation.forget(file); continue; }
         const saved = row(registry.value);
         if (!saved || saved.format !== 1 || !Array.isArray(saved.actors)) {
           observation.problem(file, "unknown actor registry shape"); actorCoverage = false; continue;
         }
+        if (!own && !saved.actors.some(candidate => row(candidate)?.rootId === rootId)) observation.forget(file);
         for (const candidate of saved.actors) {
           const value = row(candidate);
           if (!value || typeof value.rootId !== "string") {
@@ -300,7 +331,7 @@ export const runSessionPendingCli = async (
       const inventoried = new Set(actors.map(entry => path.join(path.dirname(entry.registry), entry.id)));
       // Other sessions' actors keep writing in a shared mesh: list their directories without change
       // tracking, but track this root's two expected checkpoint paths in each (present or absent), so
-      // one written during the scan is a change, not a silent zero. Registry roots are tracked too.
+      // one written during the scan is a change, not a silent zero.
       // null: not an actor directory (absent or not a directory); undefined: unreadable (unknown).
       const list = (directory: string): string[] | null | undefined => {
         try { return fs.readdirSync(directory); }
@@ -311,7 +342,7 @@ export const runSessionPendingCli = async (
       };
       for (const { file } of registries) {
         const registryRoot = path.dirname(file);
-        const entries = registryRoot === actorRoot ? names : observation.names(registryRoot);
+        const entries = registryRoot === actorRoot ? names : observation.quietNames(registryRoot, true);
         if (!entries) { actorCoverage = false; continue; }
         for (const name of entries) {
           const directory = path.join(registryRoot, name);

@@ -271,6 +271,37 @@ describe("session pending CLI recorded-state inventory", () => {
     expect(mine.value).toMatchObject({ complete: false, totals: { queued: null, inFlight: null } });
   });
 
+  it("ignores other sessions creating actors and rewriting routes during the scan, but not this session's registry", async () => {
+    const mesh = fixture(); const project = path.join(mesh, "actors");
+    const foreignSession = path.join(project, OTHER), ownSession = path.join(project, SESSION);
+    registry(foreignSession, [actor(FOREIGN, `session:${OTHER}`)]);
+    const routeFile = path.join(mesh, "main-followups", "routes", `${"c".repeat(64)}.json`);
+    json(routeFile, { oldRoot: `session:${OTHER}`, messageId: "m-1" });
+    const realReaddir = fs.readdirSync;
+    const during = async (target: string, write: () => void) => {
+      let fired = false;
+      const spy = vi.spyOn(fs, "readdirSync").mockImplementation(((dir: fs.PathLike, ...rest: unknown[]) => {
+        const listing = (realReaddir as (...args: unknown[]) => unknown)(dir, ...rest);
+        if (!fired && String(dir) === target) { fired = true; write(); }
+        return listing;
+      }) as typeof fs.readdirSync);
+      try { return await run([SESSION, "--mesh", mesh]); } finally { spy.mockRestore(); expect(fired).toBe(true); }
+    };
+    // Another session starts an actor (new actor directory, registry rewrite) and a foreign route is rewritten.
+    const busy = await during(project, () => {
+      registry(foreignSession, [actor(FOREIGN, `session:${OTHER}`), actor("d".repeat(32), `session:${OTHER}`)]);
+      json(path.join(foreignSession, "d".repeat(32), "queue-0000000000000000.json"), { format: 1, items: [] });
+      json(routeFile, { oldRoot: `session:${OTHER}`, messageId: "m-1", done: true });
+    });
+    expect(busy.code, JSON.stringify(busy.value?.unknown)).toBe(0); expect(busy.value.complete).toBe(true);
+    // This session's own registry appearing after it was read as absent is a change to this root's state.
+    const mine = await during(foreignSession, () => registry(ownSession, [actor(ID)]));
+    expect(mine.code).toBe(1); expect(mine.value.complete).toBe(false);
+    // Once present before the read, its actor is inventoried (complete, not zero).
+    const settled = await run([SESSION, "--mesh", mesh]);
+    expect(settled.code).toBe(0); expect(settled.value.actors.map((entry: { id: string }) => entry.id)).toEqual([ID]);
+  });
+
   it("is reachable as `pi-fabric session pending` through the standalone CLI entry", async () => {
     const mesh = fixture(); followUps(mesh, 2); const before = snapshot(mesh);
     const writes: string[] = [];

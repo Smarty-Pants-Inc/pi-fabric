@@ -69,8 +69,13 @@ Unknown/repeated flags, extra arguments, and non-UUID sessions are usage errors.
 **Read-only guarantee:** only filesystem stat/list/read operations are used.
 No store constructors, lock creation, mkdir, repairs, migrations, acknowledgments,
 rewrites, or deletion. Symlink state files/namespaces are refused. Observed
-metadata is checked again for changes; this is not a transactional snapshot.
-Quiesce writers before relying on a snapshot. Tests compare every fixture path,
+metadata of this root's state is checked again for changes: its journal, owner
+and successor files, its routes, its own and owning registries, its actors'
+directories and queues, and this root's checkpoint paths in every other actor
+directory. Shared namespaces (the mesh root, `main-followups/`, `routes/`,
+`actors/` and other sessions' registries) are listed without change tracking,
+so other sessions working in a shared mesh do not fail the inventory. This is
+not a transactional snapshot. Quiesce this session's writers before relying on it. Tests compare every fixture path,
 size, mode, and nanosecond mtime before/after, including refusal cases.
 
 **Not move authorization.** The tool cannot see in-memory Pi queues, undurable

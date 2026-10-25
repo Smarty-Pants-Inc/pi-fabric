@@ -85,19 +85,21 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link fau
   it("a lost broker +ACK after the durable file append, then a link restart: the real redelivery is not consumed again", async () => {
     const token = `LOST_ACK_${randomUUID()}`;
     const drops = h.faults.ackDrops;
-    // Drop the +ACK of the first NATS command delivered to the link (machine-b -> machine-a inbox).
+    // Drop every broker +ACK the running link sends for NATS commands delivered to it (machine-b -> machine-a
+    // inbox), its own re-ACK attempts included, until it is restarted: the broker must redeliver to the new link.
     h.faults.loseAckOf((delivery) => delivery.stream === LINK_INBOX && parseInboxSubject(delivery.subject)?.kind === "cmd" &&
-      parseInboxSubject(delivery.subject)?.sourceMachine === NATS_MAIN_MACHINE);
+      parseInboxSubject(delivery.subject)?.sourceMachine === NATS_MAIN_MACHINE, 1_000);
     const firstAt = Date.now();
     await expect(settle(h.natsMain.invoke("agents.followUp", { id: h.fileMain.id, message: token, idempotencyKey: `a-${randomUUID()}` })))
       .resolves.toMatchObject({ acknowledged: true });
     await waitForValue(() => h.faults.ackDrops > drops ? true : undefined, "the link's broker +ACK was sent and lost", 10_000);
-    const lost = h.faults.droppedAcks.at(-1)!;
+    const lost = h.faults.droppedAcks[drops]!;
     expect(lost).toMatchObject({ stream: LINK_INBOX, delivered: 1 });
     expect(mentions(h.fileMain, token)).toHaveLength(1);
     expect(fileCommandsFor(token)).toHaveLength(1);
     // Restart the link while the delivery is still pending in the broker (ack pending, not redelivered yet).
     await h.stopLink();
+    h.faults.clearFaults();
     await h.startLinkNow();
     await h.waitMirrored();
     // The broker redelivers the same stored message after AckWait; the new link must settle it without a re-append.

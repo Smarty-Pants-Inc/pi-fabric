@@ -372,7 +372,7 @@ const digest = (...parts: readonly string[]): string =>
  * cancel comes from the same verified sender as the command it cancels). 64 lowercase hex.
  */
 export const bridgeNatsMappedCommandId = (link: string, direction: BridgeNatsDirection, verifiedSenderId: string,
-  originalCommandId: string): string => digest("bridge-nats/command/v1", link, direction, verifiedSenderId, originalCommandId);
+  originalCommandId: string): string => digest("pi-fabric/bridge-nats/command/v1", link, direction, verifiedSenderId, originalCommandId);
 
 /** Prefix of NATS envelope ids the bridge mints for file -> NATS events. */
 export const BRIDGE_NATS_ENVELOPE_PREFIX = "bnf1-" as const;
@@ -540,6 +540,10 @@ export interface BridgeNatsClaimInput extends BridgeNatsCommandMapping {
   readonly sourceMachine: string;
   /** Verified sender identity id (the link identity for N3 commands). */
   readonly requesterId: string;
+  /** The crossing `from`: bridgeNatsMeshIdentity of the verified sender (or the link identity). A resend reuses it. */
+  readonly from: MeshIdentity;
+  /** The principal as published (after carry/strip), so a resend is the same bytes; absent when none crosses. */
+  readonly principal?: FabricPrincipal;
   /** The source's replyTo, where the mapped-back ACK goes. */
   readonly replyTo: string;
   readonly targetId: string;
@@ -550,7 +554,7 @@ export interface BridgeNatsClaimInput extends BridgeNatsCommandMapping {
   /** toNats: the target's NATS machine (required toward NATS; the owner's ACK must come from it). */
   readonly targetMachine?: string;
   readonly deadlineAt: number;
-  /** toNats: the exact body to (re)send (required toward NATS; a resend uses these bytes). */
+  /** The exact body to (re)send: required toward NATS (the envelope body); toward the file mesh the published data, when kept. */
   readonly resolvedBody?: Record<string, unknown>;
 }
 
@@ -579,15 +583,16 @@ export interface BridgeNatsAckRecord {
   readonly receivedAt: number;
 }
 
+/** `created` is true only for `new`: the one caller that may cross publish. */
 export type BridgeNatsClaimResult =
   /** First claim: cross publish it. */
-  | { readonly status: "new"; readonly record: BridgeNatsCommandRecord }
+  | { readonly status: "new"; readonly created: true; readonly record: BridgeNatsCommandRecord }
   /** Same mapped id, digest, source machine and replyTo: never publish again; replay the recorded state/ACK. */
-  | { readonly status: "duplicate"; readonly record: BridgeNatsCommandRecord }
+  | { readonly status: "duplicate"; readonly created: false; readonly record: BridgeNatsCommandRecord }
   /** Same mapped id, different digest: refuse (BRIDGE_NATS_ID_CONFLICT), never mutate the record. */
-  | { readonly status: "conflict"; readonly record: BridgeNatsCommandRecord }
+  | { readonly status: "conflict"; readonly created: false; readonly record: BridgeNatsCommandRecord }
   /** Same mapped id and digest, different source machine / replyTo / target: refuse (BRIDGE_NATS_CLAIM_MISMATCH). */
-  | { readonly status: "mismatch"; readonly record: BridgeNatsCommandRecord };
+  | { readonly status: "mismatch"; readonly created: false; readonly record: BridgeNatsCommandRecord };
 
 export interface BridgeNatsSeenRecord {
   readonly v: 1;
@@ -607,8 +612,8 @@ export interface BridgeNatsSeenRecord {
  */
 export interface BridgeNatsLedger {
   claim(input: BridgeNatsClaimInput): Promise<BridgeNatsClaimResult>;
-  /** By mapped commandId (what an owner's ACK carries). */
-  lookup(commandId: string): BridgeNatsCommandRecord | undefined;
+  /** By direction and mapped commandId (what an owner's ACK carries); undefined for the other direction's record. */
+  lookup(direction: BridgeNatsDirection, commandId: string): BridgeNatsCommandRecord | undefined;
   /** By the source's view: direction, verified requester and original commandId. */
   lookupOriginal(direction: BridgeNatsDirection, requesterId: string, originalCommandId: string): BridgeNatsCommandRecord | undefined;
   /** An attempt's outcome is unknown (TransportUncertainError, crash before receipt). */

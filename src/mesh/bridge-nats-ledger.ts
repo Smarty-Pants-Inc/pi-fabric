@@ -101,6 +101,7 @@ const validCommand = (r: unknown): r is BridgeNatsCommandRecord => {
       !text(r.sourceMachine, 64) || !text(r.requesterId) || !text(r.replyTo) || !text(r.targetId) ||
       !(BRIDGE_NATS_OPERATIONS as readonly unknown[]).includes(r.operation) || !text(r.ownerHostId) || !text(r.ownerIdentityId) ||
       !finite(r.deadlineAt) || !finite(r.claimedAt) || !finite(r.expiresAt)) return false;
+  if (!validIdentity(r.from) || (r.principal !== undefined && !validPrincipal(r.principal))) return false;
   if (r.envelopeId !== undefined && !text(r.envelopeId)) return false;
   if (r.direction === "toNats" && (r.envelopeId === undefined || !isObject(r.resolvedBody) || !text(r.targetMachine, 64))) return false;
   if (r.ownerIncarnation !== undefined && !text(r.ownerIncarnation, 128)) return false;
@@ -114,6 +115,18 @@ const validCommand = (r: unknown): r is BridgeNatsCommandRecord => {
   if (r.direction === "toFile" && r.state === "sent" && r.envelopeId === undefined) return false;
   return true;
 };
+
+function validIdentity(value: unknown): boolean {
+  return isObject(value) && text(value.id) && typeof value.name === "string" && value.name.length <= 512 &&
+    (value.kind === "main" || value.kind === "actor" || value.kind === "agent") &&
+    (value.sessionId === undefined || text(value.sessionId)) &&
+    Object.keys(value).every(key => key === "id" || key === "name" || key === "kind" || key === "sessionId");
+}
+
+function validPrincipal(value: unknown): boolean {
+  return isObject(value) && text(value.id, 256) && (value.binding === "herdr-client" || value.binding === "voice-call" ||
+    value.binding === "org-agent") && Object.keys(value).every(key => key === "id" || key === "binding");
+}
 
 const validAck = (ack: unknown, commandId: string): ack is BridgeNatsAckRecord =>
   isObject(ack) && ack.v === 1 && ack.commandId === commandId && typeof ack.accepted === "boolean" && text(ack.fromId) &&
@@ -395,6 +408,9 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
     if (!text(input.sourceEventId)) invalid("sourceEventId");
     if (!DIGEST.test(String(input.bodyDigest))) invalid("bodyDigest");
     if (!(BRIDGE_NATS_OPERATIONS as readonly unknown[]).includes(input.operation)) invalid("operation");
+    if (!validIdentity(input.from)) invalid("from");
+    if (input.principal !== undefined && !validPrincipal(input.principal)) invalid("principal");
+    if (input.resolvedBody !== undefined && !isObject(input.resolvedBody)) invalid("resolvedBody");
     if (input.direction === "toNats") {
       if (!text(input.envelopeId)) invalid("envelopeId (required toward NATS)");
       if (!isObject(input.resolvedBody)) invalid("resolvedBody (required toward NATS)");
@@ -414,13 +430,13 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
       this.#validateClaim(input);
       const existing = this.#commands.get(input.commandId);
       if (existing && this.#live(existing)) {
-        if (existing.bodyDigest !== input.bodyDigest) return { status: "conflict" as const, record: existing };
+        if (existing.bodyDigest !== input.bodyDigest) return { status: "conflict" as const, created: false as const, record: existing };
         if (existing.direction !== input.direction || existing.sourceMachine !== input.sourceMachine ||
             existing.requesterId !== input.requesterId || existing.originalCommandId !== input.originalCommandId ||
             existing.replyTo !== input.replyTo || existing.targetId !== input.targetId || existing.operation !== input.operation) {
-          return { status: "mismatch" as const, record: existing };
+          return { status: "mismatch" as const, created: false as const, record: existing };
         }
-        return { status: "duplicate" as const, record: existing };
+        return { status: "duplicate" as const, created: false as const, record: existing };
       }
       const live = [...this.#commands.values()].filter(record => this.#live(record)).length;
       if (live >= BRIDGE_NATS_LEDGER_MAX_RECORDS) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_FULL", "ledger holds its maximum of live commands");
@@ -429,22 +445,27 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
         expiresAt: Math.max(input.deadlineAt, claimedAt) + BRIDGE_NATS_HORIZON_MS }) as BridgeNatsCommandRecord;
       if (!validCommand(record)) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_INVALID", "claim does not form a valid record");
       this.#append({ t: "cmd", r: record });
-      return { status: "new" as const, record: this.#commands.get(record.commandId)! };
+      return { status: "new" as const, created: true as const, record: this.#commands.get(record.commandId)! };
     });
   }
 
-  lookup(commandId: string): BridgeNatsCommandRecord | undefined {
+  #get(commandId: string): BridgeNatsCommandRecord | undefined {
     const record = this.#commands.get(commandId);
     return record && this.#live(record) ? record : undefined;
   }
 
+  lookup(dir: BridgeNatsDirection, commandId: string): BridgeNatsCommandRecord | undefined {
+    const record = this.#get(commandId);
+    return record?.direction === dir ? record : undefined;
+  }
+
   lookupOriginal(dir: BridgeNatsDirection, requesterId: string, originalCommandId: string): BridgeNatsCommandRecord | undefined {
     const commandId = this.#originals.get(originalKey(dir, requesterId, originalCommandId));
-    return commandId === undefined ? undefined : this.lookup(commandId);
+    return commandId === undefined ? undefined : this.lookup(dir, commandId);
   }
 
   #require(commandId: string): BridgeNatsCommandRecord {
-    const record = this.lookup(commandId);
+    const record = this.#get(commandId);
     if (!record) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_UNKNOWN", "no live claim for that commandId");
     return record;
   }

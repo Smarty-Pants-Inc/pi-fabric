@@ -50,6 +50,7 @@ const toNats = (original = "orig-1", fields: Partial<BridgeNatsClaimInput> = {})
   direction: "toNats", originalCommandId: original, commandId: bridgeNatsMappedCommandId(LINK, "toNats", LEAD, original),
   sourceEventId: `file-event-${original}`, envelopeId: bridgeNatsEnvelopeId(LINK, `file-event-${original}`),
   bodyDigest: "d".repeat(64), sourceMachine: "ryzen1-bridge", requesterId: LEAD, replyTo: "host-lead", targetId: MOVED,
+  from: { id: LEAD, name: "lead", kind: "main", sessionId: LEAD.slice(8) }, principal: { id: "herdr:paul", binding: "herdr-client" },
   operation: "followUp", ownerHostId: "host-moved", ownerIdentityId: MOVED, ownerIncarnation: "inc-1", targetMachine: "lead-v2",
   deadlineAt: T0 + 30_000, resolvedBody: { version: 1, message: "hello", requestedAt: T0, deadlineAt: T0 + 30_000 }, ...fields,
 });
@@ -58,6 +59,7 @@ const toNats = (original = "orig-1", fields: Partial<BridgeNatsClaimInput> = {})
 const toFile = (original = "orig-2", sender = MOVED, fields: Partial<BridgeNatsClaimInput> = {}): BridgeNatsClaimInput => ({
   direction: "toFile", originalCommandId: original, commandId: bridgeNatsMappedCommandId(LINK, "toFile", sender, original),
   sourceEventId: `nats-envelope-${original}`, bodyDigest: "e".repeat(64), sourceMachine: "lead-v2", requesterId: sender,
+  from: { id: sender, name: "moved", kind: "main" },
   replyTo: "host-moved", targetId: LEAD, operation: "followUp", ownerHostId: "host-lead", ownerIdentityId: LEAD,
   deadlineAt: T0 + 30_000, ...fields,
 });
@@ -79,7 +81,10 @@ describe("claims: exactly once by mapped commandId", () => {
     expect((await ledger.claim(toNats("orig-1", { replyTo: "elsewhere" }))).status).toBe("mismatch");
     expect((await ledger.claim(toNats("orig-1", { sourceMachine: "other-bridge" }))).status).toBe("mismatch");
     expect(fs.statSync(path.join(dir(), BRIDGE_NATS_LEDGER_FILE)).size).toBe(bytes);
-    expect(ledger.lookup(first.record.commandId)?.replyTo).toBe("host-lead");
+    expect(ledger.lookup("toNats", first.record.commandId)?.replyTo).toBe("host-lead");
+    expect(ledger.lookup("toFile", first.record.commandId)).toBeUndefined(); // looked up by (direction, mapped id)
+    expect(first.created).toBe(true);
+    expect((await ledger.claim(toNats())).created).toBe(false);
   });
 
   it("keeps two senders that reuse one original id apart (the mapping, both ways)", async () => {
@@ -110,6 +115,10 @@ describe("claims: exactly once by mapped commandId", () => {
     await expect(ledger.claim(noBody)).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
     await expect(ledger.claim(toFile("w", MOVED, { envelopeId: "early" }))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
     await expect(ledger.claim(toFile("c", MOVED, { operation: "cancel" }))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
+    await expect(ledger.claim(toFile("f", MOVED, { from: { id: MOVED, name: "m", kind: "bogus" } as never })))
+      .rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
+    await expect(ledger.claim(toFile("p", MOVED, { principal: { id: "x", binding: "root" } as never })))
+      .rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_INVALID" });
     const cancel = await ledger.claim(toFile("c", MOVED, { operation: "cancel", originalCancelCommandId: "orig-2",
       cancelCommandId: bridgeNatsMappedCommandId(LINK, "toFile", MOVED, "orig-2") }));
     expect(cancel.record.cancelCommandId).toBe(bridgeNatsMappedCommandId(LINK, "toFile", MOVED, "orig-2"));
@@ -173,12 +182,12 @@ describe("crash durability", () => {
     await ledger.markSeen("toFile", "nats-envelope-c", { destinationId: "evt" });
     await ledger.close();
     ledger = await ledgerAt();
-    expect(ledger.lookup(sent)?.state).toBe("acked");
+    expect(ledger.lookup("toNats", sent)?.state).toBe("acked");
     expect(ledger.pendingAcks().map(record => record.commandId)).toEqual([sent]);
     // The resend after a restart uses the very same envelope id and bytes.
     const resend = ledger.pendingResends().find(record => record.commandId === uncertain)!;
     expect(resend).toMatchObject({ state: "uncertain", envelopeId: bridgeNatsEnvelopeId(LINK, "file-event-b"),
-      resolvedBody: toNats("b").resolvedBody });
+      resolvedBody: toNats("b").resolvedBody, from: toNats("b").from, principal: toNats("b").principal });
     expect(ledger.pendingResends().map(record => record.commandId)).toEqual([uncertain, back]);
     expect(ledger.lookupOriginal("toFile", MOVED, "c")?.commandId).toBe(back);
     expect(ledger.seen("toFile", "nats-envelope-c")?.destinationId).toBe("evt");
@@ -207,7 +216,7 @@ describe("crash durability", () => {
     fs.appendFileSync(file, '{"t":"cmd","r":{"v":1,"comm'); // torn: no newline
     ledger = await ledgerAt();
     expect(fs.statSync(file).size).toBe(good);
-    expect(ledger.lookup(bridgeNatsMappedCommandId(LINK, "toNats", LEAD, "a"))).toBeDefined();
+    expect(ledger.lookup("toNats", bridgeNatsMappedCommandId(LINK, "toNats", LEAD, "a"))).toBeDefined();
   });
 
   it("cuts a final line that fails its checksum (an append whose fsync never returned)", async () => {
@@ -246,11 +255,11 @@ describe("crash durability", () => {
     }) as unknown as typeof fs.writeSync);
     await expect(ledger.claim(toNats("b"))).rejects.toMatchObject({ code: "ENOSPC" });
     spy.mockRestore();
-    expect(ledger.lookup(bridgeNatsMappedCommandId(LINK, "toNats", LEAD, "b"))).toBeUndefined(); // never visible
+    expect(ledger.lookup("toNats", bridgeNatsMappedCommandId(LINK, "toNats", LEAD, "b"))).toBeUndefined(); // never visible
     await expect(ledger.claim(toNats("c"))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_CLOSED" });
     await ledger.close();
     ledger = await ledgerAt();
-    expect(ledger.lookup(kept)).toBeDefined();
+    expect(ledger.lookup("toNats", kept)).toBeDefined();
     expect((await ledger.claim(toNats("b"))).status).toBe("new");
   });
 
@@ -262,7 +271,7 @@ describe("crash durability", () => {
     fs.writeFileSync(stray, "partial", { mode: 0o600 });
     ledger = await ledgerAt();
     expect(fs.existsSync(stray)).toBe(false);
-    expect(ledger.lookup(bridgeNatsMappedCommandId(LINK, "toNats", LEAD, "a"))).toBeDefined();
+    expect(ledger.lookup("toNats", bridgeNatsMappedCommandId(LINK, "toNats", LEAD, "a"))).toBeDefined();
   });
 });
 
@@ -272,7 +281,7 @@ describe("horizon and compaction", () => {
     const old = (await ledger.claim(toNats("old"))).record.commandId;
     await ledger.markSeen("toFile", "old-event");
     clock.now = T0 + 30_000 + BRIDGE_NATS_HORIZON_MS + 1;
-    expect(ledger.lookup(old)).toBeUndefined();
+    expect(ledger.lookup("toNats", old)).toBeUndefined();
     expect(ledger.seen("toFile", "old-event")).toBeUndefined();
     const fresh = (await ledger.claim(toNats("fresh", { deadlineAt: clock.now + 30_000 }))).record.commandId;
     for (const state of ["markUncertain", "markSent"] as const) {
@@ -286,7 +295,7 @@ describe("horizon and compaction", () => {
     expect(lines.some(line => line.includes(old))).toBe(false);
     await ledger.close();
     ledger = await ledgerAt(dir(), 4);
-    expect(ledger.lookup(fresh)?.state).toBe("ackForwarded");
+    expect(ledger.lookup("toNats", fresh)?.state).toBe("ackForwarded");
     // An expired claim no longer blocks a new one with the same id (the destination's window is over too).
     expect((await ledger.claim(toNats("old", { deadlineAt: clock.now + 30_000 }))).status).toBe("new");
   });

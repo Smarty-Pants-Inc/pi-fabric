@@ -410,6 +410,7 @@ describe("BridgeNatsIdentity.verifyAck", () => {
   const claim = (fields: Partial<BridgeNatsCommandRecord> = {}): BridgeNatsCommandRecord => ({
     v: 1, state: "sent", direction: "toNats", originalCommandId: "orig", commandId: "mapped", sourceEventId: "file-event",
     envelopeId: "bnf1-abc", bodyDigest: "d".repeat(64), sourceMachine: BRIDGE, requesterId: LEAD, replyTo: "host-001",
+    from: { id: LEAD, name: "lead", kind: "main" },
     targetId: MOVED, operation: "followUp", ownerHostId: "host-002", ownerIdentityId: MOVED, ownerIncarnation: "inc-1",
     targetMachine: "lead-v2", deadlineAt: NOW + 30_000, claimedAt: NOW, expiresAt: NOW + 86_400_000 + 30_000, ...fields,
   });

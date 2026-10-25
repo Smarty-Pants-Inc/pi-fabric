@@ -56,6 +56,7 @@ import os from "node:os";
 import path from "node:path";
 import { writeFileAtomic } from "../core/atomic-write.js";
 import type { MeshIdentity } from "./event-log.js";
+import { recordSqliteHolds, sqliteHoldContext } from "./sqlite-holds.js";
 import { openPrivateStateDb } from "./state-gate.js";
 import { journalCursorOf, verifyStateJournalEndpoint, type JournalCursor } from "./read-journal.js";
 import type { StateDivergence } from "./state-backend.js";
@@ -565,6 +566,7 @@ export class StateProjector {
     // The L1 store creates the schema and WAL mode and refuses a non-local filesystem (R16) or a
     // retired database; the projector checkpoints through it (R10) and never writes through it.
     const store = await SqliteStateStore.open(databaseRoot, 64 * 1024, 1_000, {
+      holdMetricsRoot: options.root,
       checkpoint: "client", checkpointBytes: options.checkpointBytes ?? 64 * 1024 * 1024,
       lockTimeoutMs: options.busyBudgetMs ?? 5_000, ...(options.open ? { open: options.open } : {}),
       // shadow: its own copy, never the fence; sqlite: the mesh root, which only an import initialises (smarty-dev#6477).
@@ -572,7 +574,7 @@ export class StateProjector {
     });
     let db: SqliteConnection | undefined;
     try {
-      db = openPrivateStateDb(store.file, options.open ?? openNodeSqlite); // the one gate (smarty-dev#7548)
+      db = recordSqliteHolds(openPrivateStateDb(store.file, options.open ?? openNodeSqlite), options.root, "projector:transaction"); // the one gate (smarty-dev#7548)
       db.exec("PRAGMA busy_timeout = 2");
       db.exec("PRAGMA synchronous = NORMAL");
       db.exec("PRAGMA wal_autocheckpoint = 0");
@@ -798,7 +800,7 @@ export class StateProjector {
       try {
         await this.#transaction(() => {
           if (this.#readMeta().lease?.owner === this.owner) this.#sql.metaDelete.run(LEASE_META);
-        }, 250);
+        }, 250, "projector:release");
       } catch { /* expiry releases it */ }
     }
     this.#haltReason = reason;
@@ -813,9 +815,11 @@ export class StateProjector {
   // ---------------------------------------------------------------- database
 
   // BEGIN IMMEDIATE with an ASYNC retry (busy_timeout stays at 2 ms), the synchronous body, COMMIT.
-  async #transaction<T>(body: () => T, budgetMs = this.#busyBudgetMs): Promise<T> {
+  async #transaction<T>(body: () => T, budgetMs = this.#busyBudgetMs, tag = "projector:transaction"): Promise<T> {
+    const started = performance.now();
     const deadline = Date.now() + budgetMs;
     for (;;) {
+      sqliteHoldContext(this.#db, tag, started);
       try { this.#db.exec("BEGIN IMMEDIATE"); }
       catch (error) {
         if (!isBusy(error) || Date.now() >= deadline) throw error;
@@ -894,7 +898,7 @@ export class StateProjector {
         this.#sql.metaPut.run(LEASE_META, JSON.stringify({ owner: this.owner, expiresAt: at + this.#leaseMs, pid: process.pid, host: os.hostname() }));
         this.#leaseDeadline = at + this.#leaseMs / 2;
         return this.owner;
-      });
+      }, this.#busyBudgetMs, "projector:election");
       if (holder !== this.owner) {
         this.#setRole("standby", holder);
         return false;
@@ -1000,7 +1004,7 @@ export class StateProjector {
           this.#applyRecord(record, { generation: record.generation, hash: record.hash, identity: record.identity,
             cursor: { inode, offset: record.end }, commit: base.commit, appliedAt: Date.now() });
           this.#options.beforeCommit?.({ kind: "record", generation: record.generation, index });
-        });
+        }, this.#busyBudgetMs, "projector:record");
       } catch (error) {
         if (error instanceof ProjectorGap) return "broken";
         throw error;
@@ -1031,7 +1035,7 @@ export class StateProjector {
       this.#applySnapshot(snapshot, { generation: snapshot.generation, hash: snapshot.hash, identity: snapshot.identity,
         cursor: snapshot.cursor, commit: base.commit, appliedAt: Date.now() });
       this.#options.beforeCommit?.({ kind: "snapshot", generation: snapshot.generation ?? undefined, index: 0 });
-    });
+    }, this.#busyBudgetMs, "projector:snapshot");
     this.#stats.fullResyncs += 1;
     this.#lastApplyLagMs = Math.max(0, Date.now() - snapshot.mtimeMs);
     this.#lag = { revisions: 0, generations: 0, ms: 0 };

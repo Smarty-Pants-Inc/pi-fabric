@@ -35,7 +35,7 @@ export const withStateFence = async <T>(
   for (;;) {
     let entered = false;
     let outcome: { value: T } | undefined;
-    const fence = (): Promise<unknown> => mesh.writeBatch({ identity, ops: [], prepare: (view) => {
+    const fence = (): Promise<unknown> => mesh.writeBatch({ identity, ops: [], sqliteHoldTag: "outbox:fence", prepare: (view) => {
       entered = true;
       outcome = { value: body(view) };
       return [];
@@ -298,7 +298,7 @@ export class CommitOutbox {
         }).slice(0, EFFECT_BATCH_SIZE);
       if (pending.length === 0) break;
       let view: MeshBatchView | undefined = options.view;
-      if (!view) await this.mesh.writeBatch({ identity: this.identity, ops: [], prepare: current => { view = current; return []; } });
+      if (!view) await this.mesh.writeBatch({ sqliteHoldTag: "outbox:recover", identity: this.identity, ops: [], prepare: current => { view = current; return []; } });
       if (!view) break;
       for (const { entry, stored, stamp } of pending) {
         if (halted?.()) break;
@@ -321,6 +321,7 @@ export class CommitOutbox {
     for (let start = 0; start < done.length; start += RETIRE_BATCH_SIZE) {
       const batch = done.slice(start, start + RETIRE_BATCH_SIZE);
       await this.mesh.writeBatch({
+        sqliteHoldTag: "outbox:retire",
         identity: this.identity,
         ops: batch.map(([key, version]): MeshBatchOperation => ({ kind: "delete", key, ifVersion: version, onConflict: "skip" })),
       });

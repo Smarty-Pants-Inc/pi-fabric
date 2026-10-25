@@ -51,6 +51,11 @@ export const NATS_PEER_SESSION = "15310b44-dddd-4000-8000-000000000004";
 export const OWNER_SEAT_SESSION = "15310a55-eeee-4000-8000-000000000005";
 export const SEAT_PRINCIPAL = "Kate";
 export const rootId = (session: string): string => `session:${session}`;
+/**
+ * Deadline for one event-driven crossing wait (a barrier, never a sleep). It covers the CI nats-auth job,
+ * where every bridge E2E harness and the other real-broker suites run at once; a passing wait returns early.
+ */
+export const E2E_WAIT_MS = 60_000;
 
 // ---------------------------------------------------------------------------------------------
 // Link entry (L2). Config: L5's NatsLinkConfig JSON. Handle: { closed, stop }.
@@ -544,7 +549,7 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
         if (!presence && !lease) return undefined;
         return { ...(presence ? { presence: presence.value, presenceRevision: presence.revision } : {}), ...(lease ? { lease: lease.value } : {}) };
       },
-      async waitMirrored(timeoutMs = 20_000) {
+      async waitMirrored(timeoutMs = E2E_WAIT_MS) {
         const fileView = await waitFor(() => {
           const row = liveRow(fileMain, natsMain.id);
           return row?.remoteHost === linkName ? row : undefined;

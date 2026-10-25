@@ -203,6 +203,7 @@ const lazyEntryPoints = [
   "src/worker/session-export.ts",
   // smarty-dev#7504: the NATS state backend's official client, loaded only by openNatsStateBackend.
   "src/mesh/state-backend-nats-client.ts",
+  "src/mesh/bridge-agent-worker.ts",
   "src/config.ts",
   "src/core/agent-dir.ts",
 ];

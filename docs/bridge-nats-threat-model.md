@@ -198,11 +198,19 @@ A non-participant publisher never sends a control command across.
 ### R11. Ledger privacy and integrity
 
 The ledger directory is created 0700 and its file 0600; the link refuses a directory or file another
-user owns or that group/others can read. One writer: a lock pinned to pid, process incarnation, machine
-and boot; a lock is taken over only when its holder is provably gone (same machine and boot, pid dead or
-reused, or the machine rebooted); a foreign or unprovable holder is never displaced. Each line carries a
-checksum. Load cuts only an unfinished final append; damage before valid records refuses to open; a
-write or fsync failure stops all further appends until a restart.
+user owns or that group/others can read. Every created directory entry is made durable in its parent,
+and a failed directory fsync is an error, never success.
+
+One writer: the mesh's host-qualified custody lock (`src/mesh/custody-lock.ts`) inside the ledger
+directory, pinned to pid, process incarnation, machine and boot. A dead holder (same machine, pid dead or
+reused, or a previous boot) is recovered by renaming its lock to a name derived from that judged lock, so
+two recoverers cannot displace a live successor; a live, foreign or unprovable holder is never displaced.
+
+Each line carries a checksum, and every byte of every line is written (short writes are completed) before
+its fsync. Load cuts at most ONE unfinished append (one line without its newline, or one final damaged
+line): appends are sequential and fail-stop, so a longer damaged suffix, or damage before valid records,
+is corruption and refuses to open. A write or fsync failure, or an unconfirmed compaction rename, stops
+all further appends until a restart.
 
 ## 5. Threats
 
@@ -220,7 +228,7 @@ write or fsync failure stops all further appends until a restart.
 | T10 | steer, stop or setModel into a principal's org seat | R3 class cap (parse and before publish); R4 exact pins | none known |
 | T11 | The allow-list or org.json is edited by someone else | Owner and mode checks on both files; no runtime widening | Same-UID processes can edit them (the existing same-UID boundary) |
 | T12 | Ledger disclosure or tampering | R11 modes and owner checks; checksums | Checksums detect damage, not a same-UID forger |
-| T13 | Ledger crash inconsistency | R11 fsync before visible, tail cut, refusal on damage, fail-stop | A disk that loses fsync'd data is out of scope |
+| T13 | Ledger crash inconsistency | R11 fsync before visible, complete writes, namespace barriers, one-append tail cut, refusal on longer damage, fail-stop | A disk that loses fsync'd data is out of scope |
 | T14 | Stale presence authorizes traffic | 15 s freshness on observations and issued identities | Within 15 s a just-stopped Main can still be targeted; its owner refuses a stale incarnation |
 | T15 | Topic injection into a moved lead | R10 receiveTopics, followUp only, rate bounds, never control | A file publisher can post allowed topics to a root that asked for them (as today on the file mesh) |
 | T16 | Flooding across the link | Topic routes spend the file bridge's factory rate buckets (L2); the ledger refuses new claims past 1,000,000 live records instead of dropping any | Control commands from an allow-listed sender have no new per-sender rate bound in PR 1 |

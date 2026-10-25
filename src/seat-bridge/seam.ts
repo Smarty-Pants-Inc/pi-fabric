@@ -543,7 +543,10 @@ export const install = (argv: string[], io: BridgeIo, self: string): number => {
   if (!path.isAbsolute(out) || !path.isAbsolute(linkConfig) || path.normalize(linkConfig) !== linkConfig || !LINK_UNIT.test(linkUnit)) {
     io.stderr(usage); return 2;
   }
-  try { readLinkConfig(linkConfig); } catch { io.stderr("install: the link config is not a valid, safe nats-link config\n"); return 2; }
+  try { readLinkConfig(linkConfig); } catch (error) {
+    io.stderr(`install: ${error instanceof SeamGap ? error.code : "link-config-invalid"}\n`);
+    return 2;
+  }
   const source = fs.readFileSync(self, "utf8");
   let body = source.startsWith("#!") ? source.slice(source.indexOf("\n") + 1) : source;
   const node = interpreterIdentity();

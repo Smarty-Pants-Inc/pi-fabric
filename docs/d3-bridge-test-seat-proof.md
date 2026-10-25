@@ -29,6 +29,7 @@ userctl() { systemctl --user "$@"; }
 | 0.2 machine | `j "$LINKCFG" nats pathBMachines` | a list that contains `$MACHINE`, and `$MACHINE` is not `j "$LINKCFG" nats machine` | missing: publish would stop on `GAP: seat-machine-not-path-b`. Add the machine to the link's inventory first (its own reviewed step) |
 | 0.3 shared mesh | `realpath "$(j "$LINKCFG" file mesh)"; echo "$MESH"` (the drain runbook's `MESH`, realpath) | the same path twice | different: rc-restore-route would stop on `GAP: seat-mesh-not-link-mesh` |
 | 0.4 systemctl | `stat -c '%U %a %n' "$(readlink -f /usr/bin/systemctl)"` | `root 755 ...` | other owner or mode |
+| 0.5 durable link state | `j "$LINKCFG" stateDir` | a durable path, for example `~/.local/state/smarty/nats-link/v2` | a path in `/tmp`, `/var/tmp`, `/dev/shm`, `/run` or any agent's private temp store (`smarty-pi-tmp`): temp-store reaping could remove the link's cursor and ledger. Move it first; the seam's install and every phase refuse it (`link-state-dir-temporary`) |
 
 ## 1. The link unit and the routes that share it (precondition)
 
@@ -217,6 +218,7 @@ Post these on smarty-dev#15310 with the run id, the UTC time and the pass or FAI
 |---|---|---|
 | `GAP: seam-not-installed` | the bundle was run without `--install` | fabric-v2 |
 | `GAP: link-config-invalid` or `-unsafe` | the pinned config fails the link's own loader, or is not a safe file | the link's operator |
+| `GAP: link-state-dir-temporary` | the link's `stateDir` is in a temporary store | the link's operator |
 | `GAP: seat-machine-not-path-b` | the seat's machine is missing from `nats.pathBMachines` | the link's operator |
 | `GAP: seat-principal-unbound` | no org.json principal has this session as its seat | the org.json owner |
 | `GAP: seat-entry-conflict` | another entry already names the seat; the seam never edits it | the link's operator |

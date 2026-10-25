@@ -76,7 +76,7 @@ const world = async (options: { podJournal?: string; machines?: string[]; allow?
   fs.mkdirSync(linkDir, { mode: 0o700 });
   const config = path.join(linkDir, "v2.json");
   fs.writeFileSync(config, `${JSON.stringify({ version: 1, name: "hub-a", link: "v2", file: { mesh: seat.meshRoot, lockProtocol: 2 },
-    stateDir: path.join(seat.base, "link-state"), nats: { servers: ["tls://nats.example.test:4222"], machine: "hub-a-bridge",
+    stateDir: "/synthetic/link-state", nats: { servers: ["tls://nats.example.test:4222"], machine: "hub-a-bridge",
       credentials: "/synthetic/creds", caFile: "/synthetic/ca.pem", custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS",
       pathBMachines: options.machines ?? ["hub-a-bridge", "sandbox1", "org-d3synth"], operatorMachine: "fabric-ops" },
     allow: options.allow ?? { file: [leadEntry, seatFileEntry] } }, null, 2)}\n`, { mode: 0o600 });
@@ -307,8 +307,15 @@ describe.skipIf(!linux)("the REAL bridge bundle: built as scripts/build.mjs buil
     expect(bytes).toContain(JSON.stringify(w.config));
     expect(bytes).not.toContain("__FABRIC_SEAT_BRIDGE_");
     expect(fs.statSync(out).mode & 0o777).toBe(0o500);
-    // A bad unit name or an unsafe link config is refused at install.
+    // A bad unit name, or a link whose state lives in a temporary store, is refused at install.
     expect(spawnSync("node", [bundle, "--install", "--out", `${out}-2`, "--link-config", w.config, "--link-unit", "x;y"], { env }).status).toBe(2);
+    const temporary = path.join(path.dirname(w.config), "temporary.json");
+    fs.writeFileSync(temporary, JSON.stringify({ ...JSON.parse(fs.readFileSync(w.config, "utf8")),
+      stateDir: "/srv/scratch/agent/smarty-pi-tmp/pi-0000/nats-link-state/v2" }), { mode: 0o600 });
+    const refused = spawnSync("node", [bundle, "--install", "--out", `${out}-3`, "--link-config", temporary, "--link-unit", "smarty-nats-link.service"],
+      { env, encoding: "utf8" });
+    expect(refused).toMatchObject({ status: 2, stderr: "install: link-state-dir-temporary\n" });
+    expect(fs.existsSync(`${out}-3`)).toBe(false);
     const { runSeam } = await import("./seat-drain-fixture.js");
     const inputs = writerInputs(w);
     const body = request(w.seat, "rc-restore-route", inputs);

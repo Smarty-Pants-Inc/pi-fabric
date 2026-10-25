@@ -87,7 +87,20 @@ export const readLinkConfig = (file: string): LinkConfigFile => {
   if (!isObject(value)) throw new SeamGap("link-config-invalid");
   let config: NatsLinkConfig;
   try { config = parseNatsLinkConfig(value); } catch { throw new SeamGap("link-config-invalid"); }
+  if (temporaryStateDir(config.stateDir)) throw new SeamGap("link-state-dir-temporary");
   return { file, bytes, sha256: sha256(bytes), value, config };
+};
+
+/**
+ * The link's state (its cursor, ledger and lock) must live on a durable path: temp-store reaping must never be able to
+ * remove it under a running link. A path in a temporary root, or in any agent session's private temp store, refuses.
+ */
+const TEMPORARY_ROOTS = ["/tmp", "/var/tmp", "/dev/shm", "/run"];
+export const temporaryStateDir = (stateDir: string): boolean => {
+  const candidates = [stateDir];
+  try { candidates.push(fs.realpathSync(stateDir)); } catch { /* not created yet: the path as written */ }
+  return candidates.some(dir => dir.split(path.sep).includes("smarty-pi-tmp") ||
+    TEMPORARY_ROOTS.some(root => dir === root || dir.startsWith(`${root}${path.sep}`)));
 };
 
 /** The org.json principal whose org seat is exactly this session (the name the link's seat check accepts). */

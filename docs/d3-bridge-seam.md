@@ -29,8 +29,11 @@ Three values are written into the installed bytes, so the `sha256` that A pins i
 - the ONE nats-link config file the seam may change;
 - the link's systemd `--user` unit.
 
-The installer refuses a config the link's own loader refuses, and a unit name that is not `<name>.service`. An
-uninstalled bundle refuses every phase (`seam-not-installed`). Nothing in a request or a packet can point the seam
+The installer refuses a config the link's own loader refuses, and a unit name that is not `<name>.service`. The
+installer and every phase also refuse a link whose `stateDir` is in a temporary store (`link-state-dir-temporary`):
+`/tmp`, `/var/tmp`, `/dev/shm`, `/run`, or any agent's private temp store (a `smarty-pi-tmp` path). Temp-store
+reaping must never remove a running link's cursor and ledger. An uninstalled bundle refuses every phase
+(`seam-not-installed`). Nothing in a request or a packet can point the seam
 at another file or unit.
 
 ## `resume` (read-only)
@@ -152,7 +155,8 @@ layout only.
 
 ## Preconditions (each is checked live in the test-seat runbook)
 
-- The link runs as the seat user under the pinned `systemd --user` unit, with `Restart=on-failure`.
+- The link runs as the seat user under the pinned `systemd --user` unit, with `Restart=on-failure`, and its
+  `stateDir` is a durable path.
 - The seat's Path B machine is in the link config's `nats.pathBMachines`.
 - The seat image carries a pi-fabric CLI with `session drain --identity`, which is this change, and
   `/usr/bin/python3`.

@@ -116,6 +116,15 @@ describe("the bridge seam's A' config writer (one entry, never a free-form edit)
     expect(() => readLinkConfig(link)).toThrow(expect.objectContaining({ code: "link-config-invalid" }));
   });
 
+  it("refuses a link whose state lives in a temporary store (an agent's private temp store, /tmp, /run)", () => {
+    for (const stateDir of ["/srv/scratch/agent/smarty-pi-tmp/pi-0000/nats-link-state/v2", "/tmp/nats-link/v2", "/run/user/1000/link"]) {
+      expect(() => readLinkConfig(writeLinkConfig({ file: [seatFileEntry] }, value => { value.stateDir = stateDir; })))
+        .toThrow(expect.objectContaining({ code: "link-state-dir-temporary" }));
+    }
+    expect(readLinkConfig(writeLinkConfig({ file: [seatFileEntry] }, value => { value.stateDir = "/home/synthetic/.local/state/nats-link/v2"; }))
+      .config.stateDir).toBe("/home/synthetic/.local/state/nats-link/v2");
+  });
+
   it("a candidate the link itself would refuse (unknown key elsewhere) is never written", () => {
     const file = writeLinkConfig({ file: [seatFileEntry] }, value => { (value.nats as Record<string, unknown>).pathBMachines = ["hub-a-bridge"]; });
     expect(() => planPublish(readLinkConfig(file), pins, { sessionId: SEAT_SID, machine: "org-alpha" }))

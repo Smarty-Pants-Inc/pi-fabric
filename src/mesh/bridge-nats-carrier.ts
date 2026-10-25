@@ -229,7 +229,9 @@ export type NatsInbound =
     readonly record?: NatsCarrierRecord; readonly ack?: Readonly<Record<string, unknown>>;
   }
   /** Malformed or unauthorized: TERM the delivery; it never reaches the file mesh and gets no answer. */
-  | { readonly kind: "refused"; readonly reason: string };
+  | { readonly kind: "refused"; readonly reason: string }
+  /** Presence may still be converging: keep the delivery in hand and try again; refuse it after a bound. */
+  | { readonly kind: "wait"; readonly reason: string };
 
 /** One NATS inbox delivery, as a raw TransportDelivery or L1's BridgeNatsPortDelivery supplies it. */
 export interface NatsCarrierDelivery {
@@ -545,7 +547,12 @@ export class NatsBridgeCarrier {
     const target = this.#presence.nats(targetId);
     // The target must be one this bridge mirrors into KV, under the host the sender addressed.
     if (!target?.route.live || target.route.machine !== this.machine || target.route.ownerHostId !== input.hostId) {
-      return { kind: "refused", reason: "target is not a file participant this bridge carries" };
+      const why = !target ? "no live KV route" : !target.route.live ? "its KV route is not live"
+        : target.route.machine !== this.machine ? "its KV route is on another machine" : "the envelope names another owner host";
+      const reason = `target is not a file participant this bridge carries (${why})`;
+      // A live route elsewhere is never ours. A missing or lapsed one may be this link's own KV view lagging
+      // its watch (the sender resolved it a moment ago): wait a bounded time, never TERM on first sight.
+      return target?.route.live ? { kind: "refused", reason } : { kind: "wait", reason };
     }
     const principal = copyFabricPrincipal(input.envelope.principal);
     // The NATS sender's ACK check compares the digest of its own wire (body and principal as sent): digest that, unmapped.

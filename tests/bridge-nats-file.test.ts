@@ -197,6 +197,22 @@ describe("NatsCarrierSide under MeshBridge", () => {
     expect(port.sent).toHaveLength(1);
   });
 
+  it("an inbound command whose target this link's KV view does not show yet waits, then is TERMed after the bound", async () => {
+    const { port, link, events } = await fixture();
+    const route = port.routes.get(fileLead.id)!;
+    port.routes.delete(fileLead.id);
+    const waiting = port.deliver(natsAsk(), POD_MACHINE, 1);
+    await settle();
+    await expect(link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(waiting.termed).toEqual([]);
+    // The view catches up: the same delivery crosses.
+    port.routes.set(fileLead.id, route);
+    await link.bridge.step();
+    await link.bridge.step();
+    expect(events("fabric.control.command")).toHaveLength(1);
+    expect(waiting.acked).toBe(1);
+  });
+
   it("a redelivery after a restart is appended once (dedupe receipt) and ACKed", async () => {
     const { port, link, make, newPort, events } = await fixture();
     port.deliver(natsAsk(), POD_MACHINE, 1);

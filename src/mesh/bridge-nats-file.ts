@@ -47,6 +47,8 @@ const RESEND_ATTEMPTS = 3;
 const RESEND_DELAY_MS = 250;
 /** JetStream redelivers an in-hand message after its ack wait; extend well inside the shortest one. */
 const WORKING_INTERVAL_MS = 5_000;
+/** How long an inbound delivery may wait for this link's KV view to show its target (a watch lag), then TERM. */
+const PRESENCE_WAIT_MS = 15_000;
 /** In-hand deliveries this side holds before it stops pulling (backpressure, not loss). */
 const MAX_IN_HAND = 512;
 const PARTICIPANT_PREFIX = "topology/participants/";
@@ -222,6 +224,8 @@ export interface NatsCarrierSideOptions {
   readonly topicTimeoutMs?: number;
   readonly workingIntervalMs?: number;
   readonly maxInHand?: number;
+  /** Bound on an inbound delivery's wait for its target in this link's KV view (default 15 s). */
+  readonly presenceWaitMs?: number;
 }
 
 interface InHand {
@@ -231,6 +235,8 @@ interface InHand {
   /** The carrier's conversion, cached so a reread presents the same event. */
   event?: MeshEvent;
   settle?: NatsCarrierSettle;
+  /** When a presence wait for this delivery began (this side's clock). */
+  waitingSince?: number;
 }
 
 export class NatsCarrierSide implements NatsCarrierSideContract {
@@ -250,6 +256,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   readonly #resendDelayMs: number;
   readonly #workingIntervalMs: number;
   readonly #maxInHand: number;
+  readonly #presenceWaitMs: number;
   /** In-hand deliveries in stream order, by stream sequence. */
   readonly #inHand = new Map<number, InHand>();
   /** Highest sequence this side has given out; never below a cursor MeshBridge read from. */
@@ -284,6 +291,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     this.#resendDelayMs = Math.max(0, options.resendDelayMs ?? RESEND_DELAY_MS);
     this.#workingIntervalMs = Math.max(1, options.workingIntervalMs ?? WORKING_INTERVAL_MS);
     this.#maxInHand = Math.max(1, options.maxInHand ?? MAX_IN_HAND);
+    this.#presenceWaitMs = Math.max(0, options.presenceWaitMs ?? PRESENCE_WAIT_MS);
   }
 
   // -------------------------------------------------------------------------------------------
@@ -523,6 +531,14 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
           }
         }
         await delivery.ack();
+        this.#release(stream);
+        return undefined;
+      }
+      case "wait": {
+        const since = held.waitingSince ??= this.#now();
+        if (this.#now() - since < this.#presenceWaitMs) throw new NatsCarrierDeferredError(new Error(plan.reason));
+        this.#log(`toFile: refused ${envelopeId} from ${delivery.sourceMachine} after ${this.#presenceWaitMs} ms: ${plan.reason}`);
+        await delivery.term(plan.reason);
         this.#release(stream);
         return undefined;
       }

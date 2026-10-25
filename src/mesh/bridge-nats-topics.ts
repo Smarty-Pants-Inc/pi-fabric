@@ -30,11 +30,11 @@ import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, type MeshIdentity } 
  */
 
 /**
- * The ops.owner kinds MeshBridge itself carries (isBridgedTopic). Which of them a given root receives is the
- * allow-list's decision (receiveTopics), never a second list here.
+ * ops.owner kinds a root acts on, of those MeshBridge carries. pr.wake is a ci_wait registration addressed
+ * to the hub's github-factory root (setup/factory/ci_wait.py), never Main work: it does not become a turn.
  */
 const OWNER_KINDS: ReadonlySet<string> = new Set([
-  "pr.wake", "inbox.age.alarm", "bridge.lease.alarm", "bridge.lease.recovered", "bridge.delivery-age.alarm", "bridge.delivery-age.recovered",
+  "inbox.age.alarm", "bridge.lease.alarm", "bridge.lease.recovered", "bridge.delivery-age.alarm", "bridge.delivery-age.recovered",
   "bridge.legacy-baseline.alarm", "bridge.legacy-baseline.recovered",
 ]);
 /** Text over this is cut, with a marker: a followUp is a turn, and the full event stays in the file mesh. */

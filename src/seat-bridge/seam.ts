@@ -5,7 +5,7 @@ import path from "node:path";
 import { loadBridgeNatsSeatPins, type BridgeNatsSeatPins } from "../mesh/bridge-nats-identity.js";
 import { procStartTime } from "../main-drain/binding.js";
 import { callMainDrain, mainDrainSocket } from "../main-drain/client.js";
-import { ENTRY_ID, entryFacts, SUFFIX_MAX, type AppendedEntry } from "../seat-drain/journal-branch.js";
+import { ENTRY_ID, entryFacts, journalBranch, JournalBranchError, SUFFIX_MAX, type AppendedEntry } from "../seat-drain/journal-branch.js";
 import { fixedKubectl, kubectl, POD_FABRIC_CLI, readPod, verifyKubeconfig, type KubeAccess, type PodView } from "../seat-drain/kube.js";
 import { interpreterIdentity, parseRequest, proveSeatLock, readOwned, readSealedRun, resolveSeatMeshRoot, SeamGap, sha256,
   socketPeer, verifyRunDir, writeOnce, type SealedRun, type SeamRequest } from "../seat-drain/run.js";
@@ -167,6 +167,8 @@ const podIdentity = async (context: Context, access: KubeAccess, pin: { name: st
   let journal: JournalRead | null = null;
   let line: string | null = null;
   let execCode: number | null = null;
+  /** The CLI's own refusal of the session file's branch (it found a cycle or a missing parent), when it says so. */
+  let journalError: string | null = null;
   if (!before) reason = "pod-unreadable";
   else if (!cli) reason = "pod-cli-unconfirmed";
   else if (!before.piRunning) reason = "pod-not-running";
@@ -182,6 +184,8 @@ const podIdentity = async (context: Context, access: KubeAccess, pin: { name: st
     let parsed: Record<string, unknown> | undefined;
     try { parsed = JSON.parse(line) as Record<string, unknown>; } catch { parsed = undefined; }
     const value = parsed && object(parsed.identity) ? parsed.identity : undefined;
+    if (parsed && parsed.format === 1 && parsed.op === "identity" && parsed.sessionId === context.request.sessionId && object(parsed.journal) &&
+      typeof parsed.journal.error === "string" && /^[A-Z_]{1,64}$/.test(parsed.journal.error)) journalError = parsed.journal.error;
     if (result.code !== 0 || !parsed || parsed.format !== 1 || parsed.op !== "identity" || parsed.sessionId !== context.request.sessionId || !value ||
       value.rootId !== `session:${context.request.sessionId}` || !Number.isSafeInteger(value.pid) || typeof value.meshRoot !== "string") {
       reason = "pod-identity-unreadable";
@@ -199,7 +203,7 @@ const podIdentity = async (context: Context, access: KubeAccess, pin: { name: st
   const after = before ? await readPod(access, pin.name, Math.min(30_000, Math.max(1_000, remaining()))) : undefined;
   if (!reason && (!after || after.uid !== pin.uid)) reason = "pod-uid-changed";
   if (!reason && !after!.piRunning) reason = "pod-not-running";
-  return { before: before ?? null, after: after ?? null, identity, journal, reason, line, execCode, cli };
+  return { before: before ?? null, after: after ?? null, identity, journal, journalError, reason, line, execCode, cli };
 };
 
 interface JournalRead {
@@ -235,27 +239,34 @@ const journalRead = (value: unknown): JournalRead | null => {
 const FINAL_SEAL_KEYS = "journal,journalBytes,journalSha256,leafId,run,schema,sealHasThinkingEntry";
 
 /**
- * A's final seal, from RUN itself: RUN/receipts/final-seal.json, whose sha256 is the journal's ONE `final-seal`
- * record, for this run and the sealed source journal, and identical (all seven keys) to the request's finalSeal.
+ * One final seal's shape: exactly the seven keys, each of its type; `sealHasThinkingEntry` is true or false only
+ * (missing, a string, a number or null is invalid).
  */
-const finalSealOf = (context: Context, requested: Record<string, unknown>):
+const validSeal = (context: Context, seal: unknown): seal is Record<string, unknown> & { journalSha256: string; journalBytes: number;
+  leafId: string; sealHasThinkingEntry: boolean } =>
+  object(seal) && keys(seal) === FINAL_SEAL_KEYS && seal.schema === "d3-seat-final-seal-v1" && seal.run === context.request.run &&
+  seal.journal === context.sealed.journal && typeof seal.journalSha256 === "string" && HEX64.test(seal.journalSha256) &&
+  Number.isSafeInteger(seal.journalBytes) && (seal.journalBytes as number) > 0 && typeof seal.leafId === "string" &&
+  ENTRY_ID.test(seal.leafId) && (seal.sealHasThinkingEntry === true || seal.sealHasThinkingEntry === false);
+
+/**
+ * A's final seal, from RUN itself: RUN/receipts/final-seal.json, whose sha256 is the journal's ONE `final-seal`
+ * record, for this run and the sealed source journal, and identical (all seven keys) to the request's finalSeal. Both
+ * copies must be valid seals (`final-seal-invalid`) before they are compared (`final-seal-mismatch`).
+ */
+const finalSealOf = (context: Context, requested: unknown):
   { journalSha256: string; journalBytes: number; leafId: string; sealHasThinkingEntry: boolean } => {
   const bytes = readOwned(path.join(context.runDir, "receipts", "final-seal.json"), context.uid, 64 * 1024, undefined, "final-seal-unreadable");
   const records = readOwned(path.join(context.runDir, "seat-journal.jsonl"), context.uid, 64 * 1024 * 1024, undefined, "seat-journal-unreadable")
     .toString("utf8").split("\n").filter(line => line.trim()).map(line => { try { return JSON.parse(line) as Record<string, unknown>; } catch { return {}; } })
     .filter(record => record.event === "final-seal");
   if (records.length !== 1 || records[0]!.sha256 !== sha256(bytes)) throw new SeamGap("final-seal-unjournaled");
-  let seal: Record<string, unknown>;
-  try { seal = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>; } catch { throw new SeamGap("final-seal-invalid"); }
-  if (!object(seal) || keys(seal) !== FINAL_SEAL_KEYS || seal.schema !== "d3-seat-final-seal-v1" ||
-    seal.run !== context.request.run || seal.journal !== context.sealed.journal || typeof seal.journalSha256 !== "string" ||
-    !HEX64.test(seal.journalSha256) || !Number.isSafeInteger(seal.journalBytes) || (seal.journalBytes as number) <= 0 ||
-    typeof seal.leafId !== "string" || !ENTRY_ID.test(seal.leafId) || typeof seal.sealHasThinkingEntry !== "boolean") {
-    throw new SeamGap("final-seal-invalid");
-  }
+  let seal: unknown;
+  try { seal = JSON.parse(bytes.toString("utf8")); } catch { throw new SeamGap("final-seal-invalid"); }
+  if (!validSeal(context, seal) || !validSeal(context, requested)) throw new SeamGap("final-seal-invalid");
   if (!FINAL_SEAL_KEYS.split(",").every(key => requested[key] === seal[key])) throw new SeamGap("final-seal-mismatch");
-  return { journalSha256: seal.journalSha256, journalBytes: seal.journalBytes as number, leafId: seal.leafId,
-    sealHasThinkingEntry: seal.sealHasThinkingEntry as boolean };
+  return { journalSha256: seal.journalSha256, journalBytes: seal.journalBytes, leafId: seal.leafId,
+    sealHasThinkingEntry: seal.sealHasThinkingEntry };
 };
 
 /**
@@ -266,6 +277,24 @@ const finalSealOf = (context: Context, requested: Record<string, unknown>):
  */
 const APPEND_WAIT_MS = 120_000;
 const APPEND_POLL_MS = 2_000;
+
+/**
+ * Every entry id of the sealed journal, from the seat host's own sealed copy (the seal's `journal`). Its bytes must be
+ * the seal's (size, sha256, last line's id); the branch reader refuses a cycle or a missing parent in it.
+ */
+const sealedEntryIds = (context: Context, seal: { journalSha256: string; journalBytes: number; leafId: string }): Set<string> => {
+  const ids = new Set<string>();
+  let read: ReturnType<typeof journalBranch>;
+  try { read = journalBranch(context.sealed.journal, seal.leafId, seal.journalBytes, seal.journalBytes, ids); }
+  catch (error) {
+    if (error instanceof JournalBranchError && error.code === "JOURNAL_TOO_LARGE") throw new SeamGap("journal-prefix-mismatch");
+    throw new SeamGap("source-journal-unreadable");
+  }
+  if (read.journalBytes !== seal.journalBytes || read.journalSha256 !== seal.journalSha256 || read.leafId !== seal.leafId) {
+    throw new SeamGap("journal-prefix-mismatch");
+  }
+  return ids;
+};
 
 const sessionArg = (pod: PodView | null): string | null => {
   const args = pod?.piArgs;
@@ -278,9 +307,7 @@ const sessionArg = (pod: PodView | null): string | null => {
 const resume = async (context: Context): Promise<number> => {
   const { inputs, sessionId } = context.request;
   // A sends its whole final seal (require_final_seal_unchanged): the seven keys, checked against RUN's own copy.
-  if (keys(inputs) !== "finalSeal,pod" || !object(inputs.finalSeal) || keys(inputs.finalSeal) !== FINAL_SEAL_KEYS) {
-    throw new SeamGap("inputs-invalid");
-  }
+  if (keys(inputs) !== "finalSeal,pod") throw new SeamGap("inputs-invalid");
   const pin = podPin(inputs.pod);
   const seal = finalSealOf(context, inputs.finalSeal);
   const access = kubeAccess(context);
@@ -309,6 +336,10 @@ const resume = async (context: Context): Promise<number> => {
       asserted: { identity: read.identity, podLine: read.line } });
     throw new SeamGap(code);
   };
+  // The in-image reader found the resumed file's branch broken (a cycle or a missing parent). The sealed branch was
+  // whole when A sealed it, so an appended entry broke it: one reusing an id (Pi's index lets a later id win) or one
+  // that does not chain. Never a resume.
+  if (read.journalError === "JOURNAL_BRANCH_BROKEN") gap("resume-tail-id-reused");
   let reason = read.reason;
   let appended: AppendedEntry[] = [];
   if (!reason && journal) {
@@ -325,6 +356,17 @@ const resume = async (context: Context): Promise<number> => {
       appended = suffix.toString("utf8").split("\n").filter(line => line.trim()).map(line => entryFacts(line)!)
         .filter((entry): entry is AppendedEntry => entry !== null);
     } catch { gap("journal-suffix-invalid"); }
+    // Every appended entry is NEW: not an id of the sealed journal (read from the host's own sealed copy, never the
+    // Pod's report) and not repeated in the tail. A reused id can re-point a sealed entry under Pi's later-id-wins index.
+    if (appended.length > 0) {
+      const sealedIds = sealedEntryIds(context, seal);
+      const tail = new Set<string>();
+      for (const entry of appended) {
+        if (sealedIds.has(entry.id) || tail.has(entry.id)) gap("resume-tail-id-reused");
+        tail.add(entry.id);
+      }
+    }
+    // With new ids, a chain from the sealed leaf through the tail in order has no cycle and ends at the reported leaf.
     const chained = appended.every((entry, index) => entry.parentId === (index === 0 ? seal.leafId : appended[index - 1]!.id));
     if (!chained || !sameEntries(appended, journal.appendedSinceSeal ?? []) ||
       journal.leafId !== (appended.at(-1)?.id ?? seal.leafId)) gap("journal-suffix-not-the-branch");

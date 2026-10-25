@@ -54,7 +54,9 @@ export const entryFacts = (line: string): (AppendedEntry & { parentId: string | 
     thinkingLevel: value.type === "thinking_level_change" && typeof value.thinkingLevel === "string" ? value.thinkingLevel.slice(0, 64) : null };
 };
 
-export const journalBranch = (file: string, sealLeafId: string, sealedBytes = 0, maxBytes = 1024 * 1024 * 1024): JournalBranch => {
+/** `ids`, when given, collects every entry id in the file (the bridge seam's check that appended entries are new). */
+export const journalBranch = (file: string, sealLeafId: string, sealedBytes = 0, maxBytes = 1024 * 1024 * 1024,
+  ids?: Set<string>): JournalBranch => {
   const parents = new Map<string, string | null>();
   const facts = new Map<string, AppendedEntry>();
   let leafId: string | null = null;
@@ -69,6 +71,7 @@ export const journalBranch = (file: string, sealLeafId: string, sealedBytes = 0,
     const entry = entryFacts(line);
     if (!entry) return;
     entries += 1;
+    ids?.add(entry.id);
     parents.set(entry.id, entry.parentId);
     facts.set(entry.id, entry);
     leafId = entry.id;

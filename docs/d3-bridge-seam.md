@@ -44,8 +44,9 @@ Inputs: `{pod: {name, uid}, finalSeal}`, where `finalSeal` is A's whole final se
 Observed: `{sessionId, journal, leafId, podUid, appendedSinceSeal, journalSha256, suffixBase64}`.
 
 1. A's final seal comes from RUN itself: `RUN/receipts/final-seal.json`. Its sha256 must be the journal's one
-   `final-seal` record. It must have exactly the seven keys, schema `d3-seat-final-seal-v1`, this run and the sealed
-   source journal, and be identical to the request's `finalSeal`.
+   `final-seal` record. It and the request's `finalSeal` must each have exactly the seven keys, each of its type
+   (`sealHasThinkingEntry` true or false only), schema `d3-seat-final-seal-v1`, this run and the sealed source
+   journal (else `final-seal-invalid`). Then they must be identical (else `final-seal-mismatch`).
 2. The raw Pod is read through the API: the pinned UID, the sealed `target.node`, pi running, and its rendered
    `--session` argument.
 3. Through `kubectl exec`, the seam runs the in-image CLI read
@@ -70,6 +71,11 @@ No receipt (exit 2) when:
 - the suffix bytes, parsed by the seam, are not exactly the reported entries chained from the sealed leaf
   (`journal-suffix-not-the-branch`). This check means the seam verifies the CLI's branch read for the appended
   part;
+- an appended entry reuses an id of the sealed journal, or repeats one in the tail, or the CLI finds the resumed
+  file's branch broken, by a cycle or a missing parent (`resume-tail-id-reused`). Under Pi's later-id-wins index a
+  reused id can re-point a sealed entry. The sealed ids come from the seat host's own sealed copy, whose size,
+  sha256 and last id must be the seal's (else `journal-prefix-mismatch`), never from the Pod's report. With new ids
+  and the chain from the sealed leaf, the tail has no cycle and ends at the reported leaf;
 - the seal has no thinking entry and, after the wait in step 5, nothing was appended
   (`resume-thinking-append-missing`). That state is not a completed resume (see below).
 

@@ -70,8 +70,12 @@ const world = async (options: { podJournal?: string; machines?: string[]; allow?
   const journalPath = path.join(seat.runDir, "seat-journal.jsonl");
   const records = fs.readFileSync(journalPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
   records[1].sha256 = sha(fs.readFileSync(inputsFile));
-  // A's final seal of the source journal (the sealed text), journaled once.
+  // The host's sealed source journal holds exactly the sealed text, and A's final seal of it is journaled once. Its
+  // header names a synthetic cwd, so the seat's mesh root comes from the agent directory's Fabric config.
   const sourceJournal = JSON.parse(fs.readFileSync(path.join(seat.runDir, "seat-run.json"), "utf8")).source.journal as string;
+  fs.writeFileSync(sourceJournal, sealed);
+  fs.writeFileSync(path.join(path.dirname(path.dirname(path.dirname(sourceJournal))), "fabric.json"),
+    JSON.stringify({ mesh: { root: seat.meshRoot } }), { mode: 0o600 });
   const seal = Buffer.from(`${JSON.stringify(finalSealFor(seat, sourceJournal, sealed))}\n`);
   fs.mkdirSync(path.join(seat.runDir, "receipts"), { mode: 0o700 });
   fs.writeFileSync(path.join(seat.runDir, "receipts", "final-seal.json"), seal, { mode: 0o400 });
@@ -238,6 +242,69 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     expect(evidenceOf(sealedThinking, "fabric-v2-bridge-resume-outcome.json").measured.observations).toBe(1);
   });
 
+  /** A thinking_level_change line as Pi writes it (5 keys). */
+  const thinkingLine = (id: string, parentId: string) => `${JSON.stringify({ type: "thinking_level_change", id, parentId,
+    timestamp: "2026-10-25T00:00:02.000Z", thinkingLevel: "high" })}\n`;
+  /** A CLI report that calls `tail` a clean branch from the sealed leaf (what a wrong or hostile reader could say). */
+  const cleanReport = (sealed: string, tail: string, appended: Array<{ id: string; parentId: string }>) => ({
+    leafId: appended.at(-1)!.id, entries: 9, sealOnBranch: true, truncated: false,
+    appendedSinceSeal: appended.map(item => ({ ...item, type: "thinking_level_change", thinkingLevel: "high" })),
+    journalSha256: sha(sealed + tail), journalBytes: Buffer.byteLength(sealed + tail), sealedSha256: sha(sealed),
+    suffixBytes: Buffer.byteLength(tail), suffixBase64: Buffer.from(tail).toString("base64") });
+  const reused = { code: 2, stdout: "", stderr: "GAP: resume-tail-id-reused [owner: fabric-v2]\n" };
+
+  it("A70: an appended entry that REUSES a sealed id is never a resume, whatever the Pod's reader says", async () => {
+    // An off-branch sealed id reused by the tail: no cycle, so the in-image reader itself reports a clean branch.
+    const fork = `${header}\n${entry("e1", null)}\n${entry("b1", "e1")}\n${entry("e2", "e1")}\n`;
+    const off = await world({ sealed: fork, podJournal: fork + thinkingLine("b1", "e2") });
+    expect(journalBranch(off.journalFile, "e2", Buffer.byteLength(fork))).toMatchObject({ sealOnBranch: true, leafId: "b1",
+      appendedSinceSeal: [{ id: "b1", parentId: "e2" }] });
+    setKube(off, RAW, { line: identityLine(off) });
+    expect(await run(off, "resume", resumeInputs)).toMatchObject(reused);
+    expect(evidenceOf(off, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "unknown", gap: "resume-tail-id-reused" });
+    // An on-branch sealed id: a cycle under later-id-wins. The real reader refuses the branch, and the CLI says so.
+    const tail = thinkingLine("e1", "e2");
+    const cycle = await world({ sealed: SEALED_BARE, podJournal: SEALED_BARE + tail });
+    expect(() => journalBranch(cycle.journalFile, "e2", Buffer.byteLength(SEALED_BARE)))
+      .toThrow(expect.objectContaining({ code: "JOURNAL_BRANCH_BROKEN" }));
+    setKube(cycle, RAW, { line: identityLine(cycle, { leafId: "e1", journal: { error: "JOURNAL_BRANCH_BROKEN" } }), code: 1 });
+    expect(await run(cycle, "resume", resumeInputs)).toMatchObject(reused);
+    // The same tail with a reader that hides the cycle: the seam's own check (the HOST's sealed ids) refuses it.
+    const hidden = await world({ sealed: SEALED_BARE, podJournal: SEALED_BARE + tail });
+    setKube(hidden, RAW, { line: identityLine(hidden, { journal: cleanReport(SEALED_BARE, tail, [{ id: "e1", parentId: "e2" }]) }) });
+    expect(await run(hidden, "resume", resumeInputs)).toMatchObject(reused);
+  });
+
+  it("A70: a duplicate id within the tail is refused; so is a sealed copy that is not the seal's bytes", async () => {
+    const tail = thinkingLine("a1b2c3d4", "e2") + thinkingLine("a1b2c3d4", "a1b2c3d4");
+    // The real reader: a self-parent is a cycle.
+    const real = await world({ sealed: SEALED_BARE, podJournal: SEALED_BARE + tail });
+    expect(() => journalBranch(real.journalFile, "e2", Buffer.byteLength(SEALED_BARE)))
+      .toThrow(expect.objectContaining({ code: "JOURNAL_BRANCH_BROKEN" }));
+    // A reader that reports both entries as a clean chain: the seam's own tail check refuses the repeat.
+    const hidden = await world({ sealed: SEALED_BARE, podJournal: SEALED_BARE + tail });
+    setKube(hidden, RAW, { line: identityLine(hidden, { journal: cleanReport(SEALED_BARE, tail,
+      [{ id: "a1b2c3d4", parentId: "e2" }, { id: "a1b2c3d4", parentId: "a1b2c3d4" }]) }) });
+    expect(await run(hidden, "resume", resumeInputs)).toMatchObject(reused);
+    // The sealed ids come from the host's sealed copy only while it is exactly the sealed bytes.
+    const changed = await world({ sealed: SEALED_BARE, podJournal: SEALED_BARE + thinkingLine("a1b2c3d4", "e2") });
+    const source = JSON.parse(fs.readFileSync(path.join(changed.seat.runDir, "seat-run.json"), "utf8")).source.journal as string;
+    fs.appendFileSync(source, `${entry("e9", "e2")}\n`);
+    setKube(changed, RAW, { line: identityLine(changed) });
+    expect(await run(changed, "resume", resumeInputs)).toMatchObject({ code: 2, stderr: "GAP: journal-prefix-mismatch [owner: fabric-v2]\n" });
+  });
+
+  it("A70: a tail entry whose parent is a sealed entry other than the sealed leaf is not Pi's resume append", async () => {
+    // Pi appends with parentId = its current leaf, which on load is the last entry: the sealed leaf.
+    const w = await world({ sealed: SEALED_BARE, podJournal: SEALED_BARE + thinkingLine("a1b2c3d4", "e1") });
+    setKube(w, RAW, { line: identityLine(w) });
+    expect(await run(w, "resume", resumeInputs)).toMatchObject({ code: 2, stderr: "GAP: branch-diverged [owner: fabric-v2]\n" });
+    // The counterexample: Pi's real append (new id, parent = the sealed leaf) passes.
+    const ok = await world({ sealed: SEALED_BARE, podJournal: SEALED_BARE + thinkingLine("a1b2c3d4", "e2") });
+    setKube(ok, RAW, { line: identityLine(ok) });
+    expect((await run(ok, "resume", resumeInputs)).receipt).toMatchObject({ result: "pass", observed: { leafId: "a1b2c3d4" } });
+  });
+
   it("a diverged branch (the sealed leaf is no ancestor of the current leaf) is UNKNOWN: no receipt", async () => {
     const w = await world({ podJournal: `${SEALED}${entry("e3", "e1")}\n` });
     setKube(w, RAW, { line: identityLine(w) });
@@ -274,9 +341,9 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
   it("checks A's final seal from RUN itself: a request seal that differs, or an unjournaled seal file, is UNKNOWN", async () => {
     const w = await world();
     setKube(w, RAW, { line: identityLine(w) });
-    // A's real input is its whole 7-key seal: the old 3-key subset, or a 6-key seal without sealHasThinkingEntry, is refused.
+    // A's real input is its whole 7-key seal: a 6-key seal without sealHasThinkingEntry is refused.
     const { sealHasThinkingEntry: _drop, ...sixKeys } = finalSealFor(w.seat);
-    expect(await run(w, "resume", { pod: RAW, finalSeal: sixKeys })).toMatchObject({ code: 2, stderr: "GAP: inputs-invalid [owner: fabric-v2]\n" });
+    expect(await run(w, "resume", { pod: RAW, finalSeal: sixKeys })).toMatchObject({ code: 2, stderr: "GAP: final-seal-invalid [owner: fabric-v2]\n" });
     expect(await run(w, "resume", { pod: RAW, finalSeal: { ...finalSealFor(w.seat), sealHasThinkingEntry: !finalSealFor(w.seat).sealHasThinkingEntry } }))
       .toMatchObject({ code: 2, stderr: "GAP: final-seal-mismatch [owner: fabric-v2]\n" });
     expect(await run(w, "resume", { pod: RAW, finalSeal: { ...finalSealFor(w.seat), leafId: "e1" } }))
@@ -284,6 +351,36 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     const file = path.join(w.seat.runDir, "receipts", "final-seal.json");
     fs.chmodSync(file, 0o600); fs.appendFileSync(file, " ");
     expect(await run(w, "resume", resumeInputs)).toMatchObject({ code: 2, stderr: "GAP: final-seal-unjournaled [owner: fabric-v2]\n" });
+  });
+
+  it("#1609 review (seal P2): sealHasThinkingEntry is true or false only, in the request and in RUN's own seal", async () => {
+    const w = await world();
+    setKube(w, RAW, { line: identityLine(w) });
+    const good = finalSealFor(w.seat);
+    const { sealHasThinkingEntry: _drop, ...missing } = good;
+    const bad: Array<[string, Record<string, unknown>]> = [["missing", missing], ["a string", { ...good, sealHasThinkingEntry: "false" }],
+      ["a number", { ...good, sealHasThinkingEntry: 0 }], ["null", { ...good, sealHasThinkingEntry: null }]];
+    const invalid = { code: 2, stdout: "", stderr: "GAP: final-seal-invalid [owner: fabric-v2]\n" };
+    // The request's copy: each bad type refuses before any evidence or Pod read.
+    for (const [, seal] of bad) expect(await run(w, "resume", { pod: RAW, finalSeal: seal })).toMatchObject(invalid);
+    // RUN's own seal file (journaled, so only its shape can refuse it), with the request still the good seal.
+    const sealFile = path.join(w.seat.runDir, "receipts", "final-seal.json");
+    const journalPath = path.join(w.seat.runDir, "seat-journal.jsonl");
+    const original = fs.readFileSync(sealFile);
+    const rewrite = (bytes: Buffer) => {
+      fs.chmodSync(sealFile, 0o600); fs.writeFileSync(sealFile, bytes); fs.chmodSync(sealFile, 0o400);
+      fs.writeFileSync(journalPath, fs.readFileSync(journalPath, "utf8").trim().split("\n").map(line => JSON.parse(line) as Record<string, unknown>)
+        .map(record => record.event === "final-seal" ? { ...record, sha256: sha(bytes) } : record).map(record => `${JSON.stringify(record)}\n`).join(""));
+    };
+    for (const [, seal] of bad) {
+      rewrite(Buffer.from(`${JSON.stringify(seal)}\n`));
+      expect(await run(w, "resume", { pod: RAW, finalSeal: good })).toMatchObject(invalid);
+    }
+    expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-resume-intent.json"))).toBe(false);
+    expect(w.calls()).toEqual([]);
+    // The counterexample: both copies valid (true here) passes.
+    rewrite(original);
+    expect((await run(w, "resume", resumeInputs)).receipt).toMatchObject({ result: "pass" });
   });
 
   it("a Pod that is not the pin is UNKNOWN; a phase runs once per RUN", async () => {
@@ -319,7 +416,7 @@ describe.skipIf(!linux || !A_CONSUMER || !A_CODE)("the resume contract against A
   const contract = async (sealedEntries: string, appended: string) => {
     const w = await world();
     const source = JSON.parse(fs.readFileSync(path.join(w.seat.runDir, "seat-run.json"), "utf8")).source.journal as string;
-    const sealed = Buffer.concat([fs.readFileSync(source), Buffer.from(sealedEntries)]);
+    const sealed = Buffer.from(`${fs.readFileSync(source, "utf8").split("\n")[0]}\n${sealedEntries}`);
     fs.writeFileSync(source, sealed);
     fs.writeFileSync(w.journalFile, Buffer.concat([sealed, Buffer.from(appended)]));
     const sealBytes = await a("seal", { journal: source, sessionId: SID, run: w.seat.run });

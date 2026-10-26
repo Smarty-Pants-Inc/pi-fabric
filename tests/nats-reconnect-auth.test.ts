@@ -13,7 +13,7 @@ import * as connectionModule from "../src/transport/nats/connection.js";
 import { openNatsTransport } from "../src/transport/nats/inbox.js";
 import { openNatsKvForMachine } from "../src/transport/nats/kv.js";
 import { ensureTransportConsumer, ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS } from "../src/transport/nats/provision.js";
-import { TransportUnavailableError, type FabricTransport, type FabricTransportOptions, type TransportEnvelope } from "../src/transport/types.js";
+import { TransportInvalidError, TransportUnavailableError, type FabricTransport, type FabricTransportOptions, type TransportEnvelope } from "../src/transport/types.js";
 import { ADVISORY_CAPTURE_STREAM, transportAdvisoryStreamSubject, transportDurableName, transportInboxFilter, transportInboxStream, transportInboxStreamSubject, transportInboxSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, PATH_B_MACHINES, PATH_B_PERMISSION_POLICY, PATH_B_TEST_MESH, resolveNatsBinary, type PathBHarness, type PathBIdentity, type PathBUser } from "./helpers/nats-cluster.js";
 import { ReconnectRelay } from "./helpers/nats-reconnect-server.js";
@@ -309,13 +309,16 @@ describe.skipIf(!binary || process.platform === "win32")("verified transport reo
         relay.enabled = true;
         await bounded(relay.verification.promise, "owner's held reopen real USER.INFO");
       }
+      const abortStarted = performance.now();
       owner.abort();
       expect((await bounded(pending, "owner abort ends waiting inbox", 1_500)).done).toBe(true);
+      expect(performance.now() - abortStarted).toBeLessThan(1_500);
       expect(f.abort.signal.aborted).toBe(false);
       if (heldReopen) await bounded(relay.verificationClosed.promise, "owner cancels held reopen socket", 1_500);
       await bounded(relay.whenIdle(), "owner abort closes all relay sockets", 1_500);
       expect(relay.activeConnections).toBe(0);
-      expect(await outcome(() => f.runtime.send(command("aborted-owner-send")))).toBeInstanceOf(TransportUnavailableError);
+      // Explicit close is terminal: Unavailable would retry cancellation publication on a transport that cannot reopen.
+      expect(await outcome(() => f.runtime.send(command("aborted-owner-send")))).toBeInstanceOf(TransportInvalidError);
       expect(await outcome(() => kv.get("machine-a.h.reconnect"))).toBeInstanceOf(TransportUnavailableError);
       const connectionsAtClose = relay.connectionCount;
       const subjectsAtClose = [...relay.subjects];
@@ -335,7 +338,7 @@ describe.skipIf(!binary || process.platform === "win32")("verified transport reo
       expect(relay.subjects).toEqual(subjectsAtClose);
       expect(relay.commands).toEqual(commandsAtClose);
       expect((await bounded(iterator.next(), "closed inbox cannot receive post-abort command", 1_500)).done).toBe(true);
-      expect(await outcome(() => f.runtime.send(command("still-aborted-after-restart")))).toBeInstanceOf(TransportUnavailableError);
+      expect(await outcome(() => f.runtime.send(command("still-aborted-after-restart")))).toBeInstanceOf(TransportInvalidError);
       expect(await outcome(() => kv.get("machine-a.h.reconnect"))).toBeInstanceOf(TransportUnavailableError);
       const manager = await jetstreamManager(observer);
       const consumer = await manager.consumers.info(transportInboxStream("machine-a"), transportDurableName(HOST));

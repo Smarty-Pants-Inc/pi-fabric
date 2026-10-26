@@ -331,12 +331,13 @@ const HOSTED_UNSUPPORTED: readonly (keyof FabricRunnerCapabilities)[] = [
   "persistentSessions",
 ];
 
-const validateAdapter = (value: unknown): FabricRunnerAdapter => {
+const validateAdapter = (value: unknown): string => {
   if (!value || typeof value !== "object") throw new Error("Fabric runner adapter must be an object");
   const adapter = value as Record<string, unknown>;
   const id = adapter.id;
   if (!isFabricRunnerId(id)) throw new Error(`Invalid Fabric runner id: ${JSON.stringify(id)}`);
   if (BUILT_IN_RUNNER_IDS.has(id)) throw new Error(`Cannot replace built-in Fabric runner: ${id}`);
+  if (id === "native") throw new Error("Cannot register reserved Fabric runner: native");
   if (typeof adapter.label !== "string" || !adapter.label.trim() || adapter.label.length > MAX_LABEL_CHARS) {
     throw new Error(`Fabric runner ${id} needs a label of 1-${MAX_LABEL_CHARS} characters`);
   }
@@ -382,7 +383,7 @@ const validateAdapter = (value: unknown): FabricRunnerAdapter => {
       requireFunction(adapter, id, "wake");
     }
   }
-  return value as FabricRunnerAdapter;
+  return id;
 };
 
 const bound = <T>(adapter: Record<string, unknown>, name: string): T | undefined =>
@@ -396,27 +397,29 @@ const bound = <T>(adapter: Record<string, unknown>, name: string): T | undefined
  * Returns an unregister function.
  */
 export const registerAgentRunner = (adapter: FabricRunnerAdapter): (() => void) => {
-  const checked = validateAdapter(adapter);
-  if (adapters.has(checked.id)) throw new Error(`Fabric runner already registered: ${checked.id}`);
-  const source = checked as unknown as Record<string, unknown>;
-  const methods = checked.kind === "worker"
+  // Keep the validated identity: adapter.id may be mutable or getter-backed.
+  const id = validateAdapter(adapter);
+  if (id === "native") throw new Error("Cannot register reserved Fabric runner: native");
+  if (adapters.has(id)) throw new Error(`Fabric runner already registered: ${id}`);
+  const source = adapter as unknown as Record<string, unknown>;
+  const methods = adapter.kind === "worker"
     ? ["launch", "stop"]
     : ["prepare", "start", "attach", "liveness", "stop", "abort", "sleep", "wake", "steer", "followUp"];
   const registered = Object.freeze(Object.fromEntries([
-    ["kind", checked.kind],
-    ["id", checked.id],
-    ["label", checked.label],
+    ["kind", adapter.kind],
+    ["id", id],
+    ["label", adapter.label],
     ["capabilities", Object.freeze(Object.fromEntries(
-      FABRIC_RUNNER_CAPABILITY_NAMES.map((name) => [name, checked.capabilities[name]]),
+      FABRIC_RUNNER_CAPABILITY_NAMES.map((name) => [name, adapter.capabilities[name]]),
     ))],
-    ...(checked.residentModule ? [["residentModule", checked.residentModule]] : []),
+    ...(adapter.residentModule ? [["residentModule", adapter.residentModule]] : []),
     ...["models", "defaultModel", "normalizeModel", "mapTools", ...methods]
       .map((name) => [name, bound(source, name)])
       .filter(([, method]) => method !== undefined),
   ])) as unknown as FabricRunnerAdapter;
-  adapters.set(checked.id, registered);
+  adapters.set(id, registered);
   return () => {
-    if (adapters.get(checked.id) === registered) adapters.delete(checked.id);
+    if (adapters.get(id) === registered) adapters.delete(id);
   };
 };
 

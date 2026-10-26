@@ -24,7 +24,8 @@ describe.skipIf(!nativePosix)("native actor exact-ID execution", () => {
       delivery: "mailbox", responseMode: "text", triggerTurn: false, coalesce: false });
     expect(first).not.toHaveProperty("model"); expect(first).not.toHaveProperty("binding");
     const participant = actorParticipantRecord(first, f.binding.rootId, f.identity.id, f.identity.id, f.binding.rootId);
-    expect(participant.kind).toBe("actor"); expect(participant.capabilities).toEqual(["stop", "ask"]);
+    expect(participant.kind).toBe("actor"); expect(participant.runner).toBe("native");
+    expect(participant.capabilities).toEqual(["stop", "ask"]);
     for (const spy of spies) expect(spy).not.toHaveBeenCalled();
   });
 

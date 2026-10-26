@@ -151,6 +151,48 @@ describe("runner registration", () => {
     expect(getAgentRunner("veda")?.capabilities.steer).toBe(false);
   });
 
+  // Keep: trust boundary. Native actor attribution must not be obtainable through the public runner registry.
+  it.each(["worker", "hosted"] as const)("reserves native before %s adapter registration or execution", (kind) => {
+    const callback = vi.fn(() => { throw new Error("Reserved runner callback invoked"); });
+    const base = {
+      id: "native", label: "Native impersonator", capabilities: NONE,
+      models: callback, defaultModel: callback, normalizeModel: callback, mapTools: callback, stop: callback,
+    };
+    const adapter = kind === "worker"
+      ? { ...base, kind, launch: callback }
+      : { ...base, kind, prepare: callback, start: callback, attach: callback, liveness: callback,
+          abort: callback, sleep: callback, wake: callback, steer: callback, followUp: callback };
+    const before = listAgentRunners();
+    expect(() => register(adapter)).toThrow("Cannot register reserved Fabric runner: native");
+    expect(getAgentRunner("native")).toBeUndefined();
+    expect(listAgentRunners()).toEqual(before);
+    expect(listAgentRunners().some((runner) => runner.id === "native")).toBe(false);
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  it.each(["worker", "hosted"] as const)("pins a getter-backed %s ID through publication and disposal", (kind) => {
+    const id = `native-${kind}`;
+    const adapter = kind === "worker"
+      ? { kind, id, label: "Native-prefixed worker", capabilities: NONE,
+          launch: () => ({ workerPath: "/bin/true", workerArguments: [] }) }
+      : fakeHosted(id).adapter;
+    let idReads = 0;
+    Object.defineProperty(adapter, "id", { get: () => ++idReads === 1 ? id : "native" });
+    const unregister = registerAgentRunner(adapter);
+    cleanups.push(unregister);
+    const registered = getAgentRunner(id);
+    expect(idReads).toBe(1);
+    expect(registered?.id).toBe(id);
+    expect(Object.isFrozen(registered)).toBe(true);
+    expect(listAgentRunners()).toContain(registered);
+    expect(getAgentRunner("native")).toBeUndefined();
+    expect(listAgentRunners().some((runner) => runner.id === "native")).toBe(false);
+    unregister();
+    expect(idReads).toBe(1);
+    expect(getAgentRunner(id)).toBeUndefined();
+    expect(listAgentRunners().some((runner) => runner.id === id || runner.id === "native")).toBe(false);
+  });
+
   it("validates adapters fail closed", () => {
     const worker = {
       kind: "worker" as const,
@@ -177,8 +219,11 @@ describe("runner registration", () => {
     const unregister = registerAgentRunner(worker);
     expect(() => registerAgentRunner(worker)).toThrow(/already registered/);
     expect(getAgentRunner("acme")?.label).toBe("Acme");
+    worker.id = "native";
+    expect(getAgentRunner("acme")?.id).toBe("acme");
     unregister();
     expect(getAgentRunner("acme")).toBeUndefined();
+    expect(getAgentRunner("native")).toBeUndefined();
   });
 });
 

@@ -89,6 +89,7 @@ import { TmuxTransport } from "./transports/tmux-transport.js";
 import type { SandboxTransportDependencies } from "../transport/sandbox/types.js";
 import type { FabricParticipantSource } from "../topology/types.js";
 import { resolveAgentSpawner } from "./spawner.js";
+import { writeRunIdentity } from "./run-identity.js";
 import { senderAgent, senderHeaderValue } from "../guards/sender-headers.js";
 import { PlacementAdmissionError, makePlacementIntent, awaitPlacementAdmission, placementBindingMatches } from "../placement/spawn.js";
 import type { PlacementOutcome } from "../placement/client.js";
@@ -3226,6 +3227,18 @@ export class AgentManager {
           while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
           assertAuthorized();
         }
+        // A read-only launch receipt outside the child's grant. Both ownership models
+        // (and short scratch outside the run tree) share this contract.
+        writeRunIdentity({
+          runId: id, runRoot: this.#runRoot, runDirectory,
+          ...(tmpdir ? { temporaryDirectory: tmpdir } : {}),
+          ...(request.actorId ? { actorId: request.actorId } : {}),
+          ...(this.#mainAgentId ? { mainAgentId: this.#mainAgentId } : {}),
+          ...(request.meshRoot ?? this.#meshRoot ? { meshRoot: request.meshRoot ?? this.#meshRoot! } : {}),
+          owner: this.#hostId?.startsWith("resident:")
+            ? { kind: "residency", id: this.#hostId }
+            : this.#spawner ?? { kind: "process", id: this.#identityId ?? String(process.pid) },
+        });
         if (hostedAdapter) {
           const handle = await this.#startHosted(hostedAdapter, launchContext, {
             request,

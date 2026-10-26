@@ -39,6 +39,46 @@ const readText = (path: string): string | undefined => {
   try { return fs.readFileSync(path, "utf8"); } catch { return undefined; }
 };
 
+const PROC_LOCKS_CACHE_MS = 10_000;
+const PROC_LOCKS_DISABLED_PATH = `${process.env.HOME ?? ""}/.config/smarty/fabric-proc-locks.disabled`;
+
+/** Injectable process-wide diagnostics cache, exposed for deterministic cache tests. */
+export function createProcLocksDiagnostics(
+  read: () => string | undefined,
+  statFlag: () => boolean,
+  now: () => number = Date.now,
+): { locks: () => string | undefined; disabled: () => boolean } {
+  let locksAt = Number.NEGATIVE_INFINITY;
+  let locksValue: string | undefined;
+  let flagAt = Number.NEGATIVE_INFINITY;
+  let flagValue = false;
+  const disabled = (): boolean => {
+    const time = now();
+    if (time - flagAt >= PROC_LOCKS_CACHE_MS) {
+      flagValue = statFlag();
+      flagAt = time;
+    }
+    return flagValue;
+  };
+  return {
+    locks() {
+      if (disabled()) return undefined;
+      const time = now();
+      if (time - locksAt >= PROC_LOCKS_CACHE_MS) {
+        locksValue = read();
+        locksAt = time;
+      }
+      return locksValue;
+    },
+    disabled,
+  };
+}
+
+const procLocksDiagnostics = createProcLocksDiagnostics(
+  () => readText("/proc/locks"),
+  () => { try { fs.statSync(PROC_LOCKS_DISABLED_PATH); return true; } catch { return false; } },
+);
+
 /** Linux dev_t decoding (glibc gnu_dev_major/minor). */
 const devMajor = (dev: bigint): bigint => ((dev >> 8n) & 0xfffn) | ((dev >> 32n) & ~0xfffn);
 const devMinor = (dev: bigint): bigint => (dev & 0xffn) | ((dev >> 12n) & ~0xffn);
@@ -67,7 +107,8 @@ export function walReaderPids(dbPath: string): WalReader[] {
     const inode = st.ino;
     const major = devMajor(st.dev);
     const minor = devMinor(st.dev);
-    const locks = readText("/proc/locks");
+    if (procLocksDiagnostics.disabled()) return found;
+    const locks = procLocksDiagnostics.locks();
     if (locks === undefined) return found;
     const exact: { pid: number; slot: number }[] = [];
     const inodeOnly: { pid: number; slot: number }[] = [];
@@ -116,7 +157,8 @@ export function walWriterPid(dbPath: string): number | undefined {
     const st = fs.statSync(`${dbPath}-shm`, { bigint: true });
     const major = devMajor(st.dev);
     const minor = devMinor(st.dev);
-    const locks = readText("/proc/locks");
+    if (procLocksDiagnostics.disabled()) return undefined;
+    const locks = procLocksDiagnostics.locks();
     if (locks === undefined) return undefined;
     const exact = new Set<number>();
     const inodeOnly = new Set<number>();

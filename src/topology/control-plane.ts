@@ -2269,10 +2269,36 @@ export class FabricControlPlane {
       operation: "cancel", cancelCommandId: commandId, replyTo: this.options.hostId,
       ownerIncarnation: pending.ownerIncarnation, requestCreatedAt: pending.requestCreatedAt,
       requestedAt: now, deadlineAt: now + Math.min(NATS_HORIZON_MS, this.#bridgeTimeoutMs) };
-    await this.#backgroundCancellations.enqueue(async () => Date.now() > body.deadlineAt! ? undefined : this.#sendNats({
+    const envelope: TransportEnvelope<FabricControlCommand> = {
       id: cancelEventId, kind: "command", to: { machine: pending.ownerMachine!, hostId: pending.ownerHostId },
       targetId: pending.targetId, operation: "cancel", from: this.identity, body,
-    }));
+    };
+    await this.#backgroundCancellations.enqueue(async () => {
+      // The generic mesh queue cannot classify carrier outages. Retain this exact
+      // cancellation in its owned operation until PubAck or the ORIGINAL deadline;
+      // only a known no-write unavailable error permits another send. Uncertain,
+      // denied, invalid and programming failures still fail the queue closed.
+      let attempt = 0;
+      for (;;) {
+        if (Date.now() >= body.deadlineAt!) {
+          throw new TransportUnavailableError("NATS control cancellation expired without confirmed publication");
+        }
+        try { return await this.#sendNats(envelope); }
+        catch (error) { if (!(error instanceof TransportUnavailableError)) throw error; }
+        // Verified reconnect is the normal wake; bounded jitter is a safety net for
+        // a missed wake or a carrier without that optional notification. Close and
+        // pause do not abandon an already-published command's cancellation custody.
+        const remainingMs = body.deadlineAt! - Date.now();
+        if (remainingMs <= 0) continue;
+        await new Promise<void>(resolve => {
+          let stop: (() => void) | undefined;
+          const done = (): void => { clearTimeout(timer); stop?.(); resolve(); };
+          const timer = setTimeout(done, Math.max(1, retryDelayMs(attempt++, 100, 5_000, remainingMs)));
+          timer.unref();
+          stop = this.#transport.onVerifiedReconnect?.(done);
+        });
+      }
+    });
   }
 
   #natsSessionLive(session: AbortController): boolean {

@@ -729,7 +729,7 @@ export class KvParticipantDirectory implements ParticipantView {
     this.#timer.unref?.();
   }
 
-  /** One independently jittered deadline per owned row, 144–216 s after each successful write or failed refresh. */
+  /** Independent deadlines per row: successes spread over 144–216 s; failed retries stay at or below 180 s. */
   refreshOwned(): Promise<void> {
     if (this.#refreshPass) return this.#refreshPass;
     try { this.#assertWritable(); } catch (error) { return Promise.reject(error); }
@@ -741,8 +741,9 @@ export class KvParticipantDirectory implements ParticipantView {
         const revision = await this.#update(key, owned.record, owned.revision);
         this.#admitted(key, owned.record, revision);
       } catch (error) {
-        // A failed automatic refresh is not a hot-loop retry or a successful-write receipt.
-        if (this.#owned.get(key) === owned) owned.refreshAt = performance.now() + this.#refreshDelay();
+        // A failed refresh is not a successful-write receipt. Keep its fresh jitter sample,
+        // but never grow the old 180 s retry ceiling toward the 600 s presence TTL.
+        if (this.#owned.get(key) === owned) owned.refreshAt = performance.now() + Math.min(KV_PRESENCE_REFRESH_MS, this.#refreshDelay());
         throw error;
       }
     }))).then(results => {

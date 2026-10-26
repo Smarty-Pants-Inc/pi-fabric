@@ -82,24 +82,92 @@ describe("KV participant presence refresh jitter", () => {
     expect(f.revision("agent:late")).toBeGreaterThan(late!);
   });
 
-  it("samples a fresh bounded failure reschedule rather than spinning or pretending the failed write succeeded", async () => {
-    const random = vi.fn<() => number>().mockReturnValueOnce(0).mockReturnValueOnce(1).mockReturnValue(0);
+  it.each([[0, 144_000], [0.25, 162_000], [1, 180_000]])(
+    "independently samples failure retry %s without exceeding 180 s or spinning", async (sample, delay) => {
+      const random = vi.fn<() => number>().mockReturnValueOnce(0).mockReturnValueOnce(sample!).mockReturnValue(1);
+      const f = await fixture(random);
+      const rec = record("agent:failure");
+      await f.view.publishBeforeLaunch(rec);
+      const revision = f.revision(rec.id);
+      const failure = new TransportUnavailableError("broker unavailable");
+      const put = vi.spyOn(f.world.presence, "put").mockImplementationOnce(() => { throw failure; });
+      await vi.advanceTimersByTimeAsync(144_000);
+      expect(f.revision(rec.id)).toBe(revision);
+      expect(f.errors).toEqual([failure]);
+      expect(random).toHaveBeenCalledTimes(2);
+      await f.view.refreshOwned(); // A not-yet-due failed row must not hot-loop.
+      await vi.advanceTimersByTimeAsync(delay! - 1);
+      expect(put).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      const recovered = f.revision(rec.id);
+      expect(recovered).toBeGreaterThan(revision!);
+      expect(put.mock.calls.map(call => call[3])).toEqual([revision, revision]);
+      expect(random).toHaveBeenCalledTimes(3);
+      // Recovery resamples the full success spread, not the capped failure deadline.
+      await vi.advanceTimersByTimeAsync(215_999);
+      expect(f.revision(rec.id)).toBe(recovered);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(f.revision(rec.id)).toBeGreaterThan(recovered!);
+      const refreshed = f.revision(rec.id);
+      const changed = { ...rec, status: "idle" };
+      await f.view.publish(changed);
+      expect(f.revision(rec.id)).toBeGreaterThan(refreshed!);
+      expect(f.world.presence.values.get(pKey(MACHINE, rec.id))?.value).toEqual(changed);
+      expect(random).toHaveBeenCalledTimes(5);
+    });
+
+  it("R5: after an initial 216 s delay and two transient failures, the third attempt is inside the 600 s TTL", async () => {
+    const random = vi.fn<() => number>().mockReturnValueOnce(1).mockReturnValueOnce(1)
+      .mockReturnValueOnce(1).mockReturnValue(0);
     const f = await fixture(random);
-    await f.view.publishBeforeLaunch(record("agent:failure"));
-    const revision = f.revision("agent:failure");
+    const rec = record("agent:two-failures");
+    const admitted = await f.view.publishBeforeLaunch(rec);
+    const written = Date.now(), attempts: number[] = [], revisions: number[] = [];
+    const put = f.world.presence.put.bind(f.world.presence);
+    let failures = 2;
+    vi.spyOn(f.world.presence, "put").mockImplementation((...args) => {
+      attempts.push(Date.now() - written);
+      revisions.push(args[3]);
+      if (failures-- > 0) throw new TransportUnavailableError("transient presence failure");
+      return put(...args);
+    });
+    await vi.advanceTimersByTimeAsync(700_000);
+    expect(attempts).toEqual([216_000, 396_000, 576_000]);
+    expect(attempts[2]).toBeLessThan(600_000);
+    expect(revisions).toEqual([admitted.revision, admitted.revision, admitted.revision]);
+    const recovered = f.revision(rec.id);
+    expect(recovered).toBeGreaterThan(admitted.revision);
+    expect(f.errors).toHaveLength(2);
+    expect(random).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(f.revision(rec.id)).toBe(recovered);
+    await vi.advanceTimersByTimeAsync(1); // Recovery's independent low success sample: 576 + 144 s.
+    expect(attempts).toEqual([216_000, 396_000, 576_000, 720_000]);
+    expect(f.revision(rec.id)).toBeGreaterThan(recovered!);
+  });
+
+  it("does not advance successful-write evidence on failure or let a stale retry override a later publication", async () => {
+    const random = vi.fn<() => number>().mockReturnValueOnce(0).mockReturnValue(1);
+    const f = await fixture(random);
+    const rec = record("agent:write-evidence");
+    const admitted = await f.view.publishBeforeLaunch(rec);
     const failure = new TransportUnavailableError("broker unavailable");
-    vi.spyOn(f.world.presence, "put").mockImplementationOnce(() => { throw failure; });
+    const put = vi.spyOn(f.world.presence, "put").mockImplementationOnce(() => { throw failure; });
     await vi.advanceTimersByTimeAsync(144_000);
-    expect(f.revision("agent:failure")).toBe(revision);
+    expect(f.revision(rec.id)).toBe(admitted.revision);
     expect(f.errors).toEqual([failure]);
-    expect(random).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(215_999);
-    expect(f.revision("agent:failure")).toBe(revision);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(f.revision("agent:failure")).toBeGreaterThan(revision!);
+    await vi.advanceTimersByTimeAsync(36_000);
+    // Same content is now 180 s old from the last SUCCESS, not 36 s old from the failure.
+    const published = await f.view.publish(rec);
+    expect(published.revision).toBeGreaterThan(admitted.revision);
     expect(random).toHaveBeenCalledTimes(3);
-    // The failed refresh was not a successful-write receipt; a normal on-change publication still works.
-    await f.view.publish({ ...record("agent:failure"), status: "idle" });
+    await vi.advanceTimersByTimeAsync(144_000); // The failed attempt's old retry at 324 s is cancelled.
+    expect(f.revision(rec.id)).toBe(published.revision);
+    expect(put).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(71_999);
+    expect(f.revision(rec.id)).toBe(published.revision);
+    await vi.advanceTimersByTimeAsync(1); // New success deadline: 180 + 216 s.
+    expect(f.revision(rec.id)).toBeGreaterThan(published.revision);
     expect(random).toHaveBeenCalledTimes(4);
   });
 
@@ -115,16 +183,25 @@ describe("KV participant presence refresh jitter", () => {
     expect(f.revision("agent:default")).toBeGreaterThan(revision!);
   });
 
-  it.each(["close", "lease abort"] as const)("cancels pending refreshes on %s", async stop => {
+  it.each([
+    ["close", false], ["lease abort", false], ["close", true], ["lease abort", true],
+  ] as const)("cancels pending refreshes on %s (after failure: %s)", async (stop, fail) => {
     const random = vi.fn(() => 1);
     const f = await fixture(random);
     await f.view.publishBeforeLaunch(record("agent:stop"));
+    const put = vi.spyOn(f.world.presence, "put");
+    if (fail) {
+      put.mockImplementationOnce(() => { throw new TransportUnavailableError("broker unavailable"); });
+      await vi.advanceTimersByTimeAsync(216_000);
+      expect(f.errors).toHaveLength(1);
+    }
     if (stop === "close") await f.view.close();
     else f.abort.abort(new Error("owner fenced"));
     const writes = [...f.world.writes];
     await vi.advanceTimersByTimeAsync(600_000);
     expect(f.world.writes).toEqual(writes);
-    expect(random).toHaveBeenCalledTimes(1);
+    expect(put).toHaveBeenCalledTimes(fail ? 1 : 0);
+    expect(random).toHaveBeenCalledTimes(fail ? 2 : 1);
     expect(f.view.ready).toBe(false);
   });
 });

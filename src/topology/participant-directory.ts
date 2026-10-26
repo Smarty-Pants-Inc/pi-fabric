@@ -54,6 +54,7 @@ import {
   withOwnedHostLease,
   type FabricHostLease,
   STATE_LEASE_RENEW_MS,
+  TRANSPORT_HOST_LEASE_SAFETY_MS,
   renewHostLease,
   meshWriterLeaseRecord,
 } from "./host-leases.js";
@@ -759,6 +760,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #natsStarting: Promise<void> | undefined;
   #natsClosing: Promise<void> | undefined;
   #transportRenewing: Promise<void> | undefined;
+  /** Request-start expiry of the last confirmed KV lease write; sleep may stop performance.now(). */
+  #transportLeaseWallDeadline: number | undefined;
   #transportReconnectUnsubscribe: (() => void) | undefined;
   /** One reconnect deadline, retained across repeated notifications and the refresh it drives. */
   #reconnectRefresh: ReconnectRefresh | undefined;
@@ -792,6 +795,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   readonly #reportedCollisions = new Set<string>();
   readonly #reportedRootCollisions = new Set<string>();
   #timer: NodeJS.Timeout | undefined;
+  /** Keep the sampled cadence when a pending PubAck temporarily shortens the safety cap. */
+  #heartbeatDueAt: number | undefined;
   /** The heartbeat was stopped by suspend() (a retired owner lifecycle), not by close(). */
   #suspended = false;
   #closed = false;
@@ -941,6 +946,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#routingError = error;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    this.#heartbeatDueAt = undefined;
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;
@@ -953,7 +959,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const lease = this.#transportLease;
     if (!lease || this.#closed || this.#transportLost) return Promise.resolve();
     if (this.#transportRenewing) return this.#transportRenewing;
-    const work = Promise.resolve().then(() => lease.renew(AbortSignal.timeout(TRANSPORT_RENEW_BUDGET_MS))).then(async () => {
+    const work = Promise.resolve().then(() => lease.renew(AbortSignal.timeout(TRANSPORT_RENEW_BUDGET_MS))).then(async value => {
+      this.#transportLeaseWallDeadline = value.expiresAt - TRANSPORT_HOST_LEASE_SAFETY_MS;
       // smarty-dev#15310: a lease that expired in KV and was created again may have let another
       // machine register this root meanwhile. Re-check before admission resumes; yield if so.
       if (lease.takeRecreated() || lease.rootRecheck) this.#rootRecheckPending = true;
@@ -973,7 +980,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
         this.#rootRecheckPending = false;
         // The re-created lease was written with rootRecheck (routes nothing); write it routable again.
         lease.clearRootRecheck();
-        await lease.renew(AbortSignal.timeout(TRANSPORT_RENEW_BUDGET_MS));
+        const routable = await lease.renew(AbortSignal.timeout(TRANSPORT_RENEW_BUDGET_MS));
+        this.#transportLeaseWallDeadline = routable.expiresAt - TRANSPORT_HOST_LEASE_SAFETY_MS;
       }
       if (this.#transportRecovering && lease.live()) {
         this.#transportRecovering = false;
@@ -992,10 +1000,26 @@ export class ParticipantDirectory implements FabricParticipantSource {
       throw error;
     });
     this.#transportRenewing = work;
-    void work.finally(() => {
-      if (this.#transportRenewing === work) this.#transportRenewing = undefined;
-    }).catch(() => undefined);
+    const settled = (failed: boolean): void => {
+      if (this.#transportRenewing !== work) return;
+      this.#transportRenewing = undefined;
+      if (this.#closed || this.#suspended || this.#transportLost) return;
+      // Re-evaluate the cap after every PubAck, without resampling or losing a joined
+      // heartbeat turn. Fast failure must not spend another full jittered interval.
+      if (failed) this.#heartbeatDueAt = performance.now() + 1_000;
+      if (this.#timer) clearTimeout(this.#timer);
+      this.#timer = undefined;
+      this.#armHeartbeat();
+    };
+    void work.then(() => settled(false), () => settled(true));
     return work;
+  }
+
+  #remainingTransportLeaseMs(): number {
+    // Both clocks can only shorten the scheduling budget. A backwards wall correction
+    // cannot extend monotonic authority; host sleep cannot extend the broker's TTL.
+    return Math.min(this.#transportLease?.remainingMs() ?? 0,
+      Math.max(0, (this.#transportLeaseWallDeadline ?? 0) - Date.now()));
   }
 
   #cancelReconnectRefresh(preserveDeadline = false): void {
@@ -1019,9 +1043,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#reconnectRefresh ??= { dueAt: undefined };
       return;
     }
-    // remainingMs already subtracts the lease's existing safety margin (13s admission).
-    // Leave the full renewal operation budget strictly inside that cutoff, not just before KV expiry.
-    const window = Math.min(this.#heartbeatMs, Math.max(0, lease.remainingMs() - TRANSPORT_RENEW_BUDGET_MS - 1));
+    // Reserve the first full operation AND one full retry, strictly inside the
+    // existing 13s admission cutoff. Heartbeats renew independently during this wait.
+    const window = Math.min(this.#heartbeatMs, Math.max(0, this.#remainingTransportLeaseMs() - 2 * TRANSPORT_RENEW_BUDGET_MS - 1));
     if (this.#closed || this.#transportLost) return; // remainingMs can latch terminal loss.
     const now = performance.now();
     const pending: ReconnectRefresh = this.#reconnectRefresh ?? { dueAt: undefined };
@@ -1038,11 +1062,6 @@ export class ParticipantDirectory implements FabricParticipantSource {
       try {
         if (!active()) return;
         pending.running = true;
-        // The old heartbeat must not bypass the delay. Restart its cadence at the renewal
-        // request, so even a slow PubAck cannot leave the next renewal a whole interval late.
-        if (this.#timer) clearTimeout(this.#timer);
-        this.#timer = undefined;
-        this.#armHeartbeat();
         await this.#renewTransportLease();
         // Renewal alone can leave cached presence looking fresh after a JetStream restart.
         // Repeated notifications during publication share this work, with no further delay.
@@ -1055,7 +1074,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
           this.#routingError = error;
         }
       } finally {
-        if (this.#reconnectRefresh === pending) this.#reconnectRefresh = undefined;
+        if (this.#reconnectRefresh === pending) {
+          // Failed or unready publication is still unconfirmed evidence. Keep its
+          // elapsed deadline, but let the next heartbeat retry (never a hot loop).
+          this.#reconnectRefresh = this.#confirmedReconnectGeneration < this.#verifiedReconnectGeneration
+            ? { dueAt: pending.dueAt } : undefined;
+        }
       }
     };
     if (delay <= 0) void run();
@@ -1069,8 +1093,21 @@ export class ParticipantDirectory implements FabricParticipantSource {
   // retired; the background work itself runs through #runBackground (smarty-dev#5962/#10004).
   #armHeartbeat(): void {
     if (this.#timer || this.#closed || this.#suspended || this.#transportLost) return;
+    const now = performance.now();
+    let delay = this.#heartbeatDueAt === undefined
+      ? this.#heartbeatMs * (0.8 + 0.4 * (this.options.random ?? Math.random)())
+      : Math.max(0, this.#heartbeatDueAt - now);
+    this.#heartbeatDueAt ??= now + delay;
+    if (this.#isNats() && this.#transportLease?.revision) {
+      const budget = Math.max(0, Math.floor(this.#remainingTransportLeaseMs() - TRANSPORT_RENEW_BUDGET_MS - 1));
+      if (this.#closed || this.#transportLost) return; // Budget read can latch terminal loss.
+      // No full operation fits once exhausted. Use a bounded recovery tick, not
+      // a zero-delay rearm storm while a failed/slow broker request settles.
+      delay = budget > 0 ? Math.min(delay, budget) : 1_000;
+    }
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
+      this.#heartbeatDueAt = undefined;
       if (this.#closed || this.#suspended || this.#transportLost) return;
       // Arm before work so suspend/close during the tick can cancel its successor.
       // Renewals keep their existing coalescing; a slow write does not shift the cadence.
@@ -1080,20 +1117,17 @@ export class ParticipantDirectory implements FabricParticipantSource {
         this.#lifecycleTick(live);
         // A notification can arrive while the lifecycle is retired but not yet
         // suspended. Once live again, arm its retained deadline rather than losing it.
-        if (live && this.#reconnectRefresh && !this.#reconnectRefresh.timer && !this.#reconnectRefresh.running) {
-          this.#scheduleReconnectRefresh();
-          return; // The reconnect owns this renewal turn, including a zero-delay start.
-        }
-        if (live && !this.#reconnectRefresh?.timer) {
+        const renewing = this.#transportRenewing;
+        if (live) this.#scheduleReconnectRefresh();
+        if (live) {
           // A 4s tick can join a 5s PubAck. Do not lose that renewal turn: the next
           // random interval could be 6s, too late for another 5s operation at the old
           // request-start cutoff. Joined ticks coalesce one fresh CAS after it settles.
-          const renewing = this.#transportRenewing;
-          void (renewing ? renewing.then(() => {
-            if (!this.#closed && !this.#suspended && !this.#transportLost && !this.#reconnectRefresh?.timer && this.#live()) {
-              return this.#renewTransportLease();
-            }
-          }) : this.#renewTransportLease()).catch(() => undefined);
+          const retry = (): Promise<void> | undefined => {
+            if (!this.#closed && !this.#suspended && !this.#transportLost && this.#live()) return this.#renewTransportLease();
+            return undefined;
+          };
+          void (renewing ? renewing.then(retry, retry) : retry())?.catch(() => undefined);
           if (!this.#quiescing && !this.#transportRecovering && !this.#reconnectRefresh) void this.#refreshNats(true).catch(error => { this.#refreshError = error; });
         }
         return;
@@ -1115,7 +1149,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (this.#refreshing && this.#fileWork > 0) return;
       }
       if (!this.#publicationRetryTimer && !this.#publicationRetrying) this.#runBackground(() => this.refresh());
-    }, this.#heartbeatMs * (0.8 + 0.4 * (this.options.random ?? Math.random)()));
+    }, Math.max(1, Math.floor(delay)));
     this.#timer.unref();
   }
 
@@ -1169,6 +1203,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#suspended = true;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    this.#heartbeatDueAt = undefined;
     this.#cancelReconnectRefresh(true);
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
@@ -1347,7 +1382,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (!lease || !view) throw new Error("NATS participant carrier is incomplete");
     if (this.#closed) throw new TransportUnavailableError("Closed NATS directories require a new activation");
     try {
-      await lease.acquire(AbortSignal.timeout(5_000));
+      const acquired = await lease.acquire(AbortSignal.timeout(5_000));
+      this.#transportLeaseWallDeadline = acquired.expiresAt - TRANSPORT_HOST_LEASE_SAFETY_MS;
       if (this.#closed) throw new TransportUnavailableError("Participant directory closed during acquisition");
       view.start();
       this.#localProjection?.start();
@@ -2692,6 +2728,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#cancelReconnectRefresh();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    this.#heartbeatDueAt = undefined;
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;
@@ -2822,6 +2859,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     await this.#publicationRetrying;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    this.#heartbeatDueAt = undefined;
     this.#suspended = false;
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
@@ -3673,6 +3711,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#routingReadAt = 0;
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    this.#heartbeatDueAt = undefined;
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;

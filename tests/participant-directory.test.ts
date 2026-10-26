@@ -1621,21 +1621,29 @@ describe("ParticipantDirectory", () => {
       const source = vi.fn(() => [rootRecord(identity.id, identity.id, "busy")]);
       const directory = new ParticipantDirectory(mesh, {
         enabled: true, hostId: identity.id, rootId: identity.id, identity,
-        heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false,
+        heartbeatMs: 60_000, leaseMs: 180_000, reapDeadHosts: false, random: () => 0.5,
       });
       directory.registerSource(source);
       directories.push(directory);
-      const intervals = vi.spyOn(globalThis, "setInterval");
+      const timeouts = vi.spyOn(globalThis, "setTimeout");
       const lockPath = path.join(mesh.root, ".lock");
       try {
         await directory.start();
-        // Drive the real heartbeat callback without incidental ticks during backoff.
-        const heartbeat = intervals.mock.calls[0]![0] as () => void;
+        // Drive the real heartbeat timeout without incidental ticks or queued successors.
+        const heartbeatIndex = timeouts.mock.calls.findIndex(([, delay]) => delay === 60_000);
+        const heartbeat = timeouts.mock.calls[heartbeatIndex]![0] as () => void;
+        const heartbeatTimer = timeouts.mock.results[heartbeatIndex]!.value;
         const runs = vi.spyOn(MeshBackgroundRetry.prototype, "run");
         const confirmations = vi.spyOn(mesh, "confirmWritable");
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
         const tick = async () => {
+          clearTimeout(heartbeatTimer);
+          const callsBefore = timeouts.mock.calls.length;
           heartbeat();
+          const successorIndex = timeouts.mock.calls.findIndex(
+            (call, index) => index >= callsBefore && call[1] === 60_000,
+          );
+          clearTimeout(timeouts.mock.results[successorIndex]!.value);
           const result = runs.mock.results.at(-1)!.value;
           await vi.advanceTimersByTimeAsync(200); // acquisition times out after 100 ms
           return await result;

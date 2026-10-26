@@ -154,14 +154,15 @@ class Fixture {
     whenChanged: async () => { throw new Error("No directory watch expected"); },
   };
   constructor() { fixtures.push(this); }
-  runtime(hostId: string, id: string, machine: string, incarnation: string) {
+  runtime(hostId: string, id: string, machine: string, incarnation: string, bridgeControlTimeoutMs?: number) {
     const transport = this.carrier.endpoint({ hostId, machine });
     this.endpoints.push(transport);
     const mesh = new MeshStore(this.root, 64 * 1024, 1_000, { stateBackend: "file" });
     this.stores.push(mesh);
     const plane = new FabricControlPlane(mesh, identity(id), { enabled: true, hostId,
       ownerIncarnation: incarnation, participants: this.participants, transport,
-      relayOperatorMachine: "fabric-ops", pollMs: 20, acknowledgementTimeoutMs: 1_000 });
+      relayOperatorMachine: "fabric-ops", pollMs: 20, acknowledgementTimeoutMs: 1_000,
+      ...(bridgeControlTimeoutMs === undefined ? {} : { bridgeTimeoutMs: bridgeControlTimeoutMs }) });
     this.planes.push(plane);
     return { plane, transport };
   }
@@ -176,8 +177,8 @@ class Fixture {
     });
     return owner;
   }
-  caller() {
-    const caller = this.runtime(CALLER_HOST, CALLER_ID, "cancel-caller", "cancel:caller");
+  caller(bridgeControlTimeoutMs?: number) {
+    const caller = this.runtime(CALLER_HOST, CALLER_ID, "cancel-caller", "cancel:caller", bridgeControlTimeoutMs);
     this.routes.set(CALLER_ID, { machine: "cancel-caller", ownerHostId: CALLER_HOST,
       ownerIdentityId: CALLER_ID, ownerIncarnation: "cancel:caller", capabilities: [], live: true });
     caller.plane.start(() => { throw new Error("Caller must never execute this command"); });
@@ -200,7 +201,7 @@ class Fixture {
 }
 afterEach(async () => {
   try { for (const fixture of fixtures.splice(0)) await fixture.dispose(); }
-  finally { vi.restoreAllMocks(); }
+  finally { vi.useRealTimers(); vi.restoreAllMocks(); }
 });
 async function delivered(carrier: Carrier, ack: Publication, endpoint?: Endpoint) {
   expect(await carrier.deliver(ack, endpoint)).toBe("ack");
@@ -243,6 +244,98 @@ async function cancelled(f: Fixture, owner: ReturnType<Fixture["owner"]>, caller
 }
 
 describe("public NATS control cancellation recovery", () => {
+  it.each([30_000, 300_000])("caps close cancellation grace at 5s total, not the %sms deadline", async timeout => {
+    const f = new Fixture(), owner = f.owner(), caller = f.caller(timeout);
+    const failure = cancellationFailure(caller, new TransportUnavailableError("outage"));
+    await cancelled(f, owner, caller);
+    const first = await failure.attempts.required(); await nextTurn();
+    const deadlineAt = (first.body as { deadlineAt: number }).deadlineAt;
+    await cancelled(f, owner, caller); // A second queued cancel shares the same total close grace.
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    caller.plane.pause();
+    const closing = observe(caller.plane.close());
+    try {
+      await nextTurn(); caller.transport.reconnect(); await nextTurn();
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(closing.result.state).toBe("pending");
+      await vi.advanceTimersByTimeAsync(1); await nextTurn();
+      expect(closing.result).toMatchObject({ state: "rejected", error: {
+        message: "Background mesh release has unconfirmed publication obligations" } });
+      const attempts = failure.attempts.values.length;
+      await vi.advanceTimersByTimeAsync(10_000); caller.transport.reconnect(); await nextTurn();
+      expect(failure.attempts.values).toHaveLength(attempts);
+      expect(caller.transport.reconnectListeners.size).toBe(0);
+      await expect(caller.plane.checkpointForRelease()).rejects.toThrow("unconfirmed publication obligations");
+    } finally {
+      // Also finish the deliberately unfixed implementation during RED runs.
+      vi.setSystemTime(deadlineAt + timeout); caller.transport.reconnect(); await nextTurn();
+      await closing.settled; vi.useRealTimers();
+    }
+  });
+
+  it("checkpoint alone keeps the full deadline and reports an expired unpublished cancel", async () => {
+    const errors: unknown[] = [], enqueue = MeshBackgroundQueue.prototype.enqueue;
+    vi.spyOn(MeshBackgroundQueue.prototype, "enqueue").mockImplementation(function (this: MeshBackgroundQueue, operation) {
+      return enqueue.call(this, async () => {
+        try { return await operation(); } catch (error) { errors.push(error); throw error; }
+      });
+    });
+    const f = new Fixture(), owner = f.owner(), caller = f.caller();
+    const failure = cancellationFailure(caller, new TransportUnavailableError("outage"));
+    await cancelled(f, owner, caller);
+    const first = await failure.attempts.required(); await nextTurn();
+    const deadlineAt = (first.body as { deadlineAt: number }).deadlineAt;
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    caller.plane.pause(); const checkpoint = observe(caller.plane.checkpointForRelease());
+    try {
+      caller.transport.reconnect(); await nextTurn();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(checkpoint.result.state).toBe("pending");
+      vi.setSystemTime(deadlineAt - 1); caller.transport.reconnect(); await nextTurn();
+      expect(checkpoint.result.state).toBe("pending");
+      vi.setSystemTime(deadlineAt); caller.transport.reconnect(); await checkpoint.settled;
+      expect(checkpoint.result).toMatchObject({ state: "rejected", error: {
+        message: "Background mesh release has unconfirmed publication obligations" } });
+      expect(errors).toEqual([expect.objectContaining({ message: "NATS control cancellation expired unpublished" })]);
+    } finally {
+      vi.setSystemTime(deadlineAt); caller.transport.reconnect(); await checkpoint.settled;
+      vi.useRealTimers(); await observe(caller.plane.close()).settled;
+    }
+  });
+
+  it("saves retained owner outcomes before throwing a cancellation checkpoint failure on close", async () => {
+    const f = new Fixture(), owner = f.owner();
+    const peer = f.runtime(CALLER_HOST, CALLER_ID, "cancel-caller", "cancel:caller");
+    f.routes.set(CALLER_ID, { machine: "cancel-caller", ownerHostId: CALLER_HOST, ownerIdentityId: CALLER_ID,
+      ownerIncarnation: "cancel:caller", capabilities: ["followUp"], live: true });
+    peer.plane.start(() => ({ accepted: true }));
+    cancellationFailure(owner, new TransportInvalidError("permanent cancellation failure"));
+    const abort = new AbortController();
+    const outbound = observe(owner.plane.request(CALLER_HOST, CALLER_ID, "followUp", { message: "outbound" },
+      CALLER_ID, { signal: abort.signal }));
+    await owner.transport.commands.required(); await peer.transport.acknowledgements.required(); await nextTurn();
+    abort.abort(); await outbound.settled; await nextTurn();
+    const writeBatch = MeshStore.prototype.writeBatch, saveFailed = deferred<void>();
+    let ownerWrites = 0, failSave = true;
+    const prefix = "topology/control-seen/";
+    vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(function (this: MeshStore, input) {
+      if (input.identity.id === OWNER_ID && input.ops.some(op => op.key.startsWith(prefix)) && ++ownerWrites > 1 && failSave) {
+        saveFailed.resolve(); return Promise.reject(new Error("injected outcome save failure"));
+      }
+      return writeBatch.call(this, input);
+    });
+    const inboundAbort = new AbortController();
+    const inbound = observe(peer.plane.request(OWNER_HOST, TARGET, "followUp", { message: "owner result" },
+      OWNER_ID, { signal: inboundAbort.signal }));
+    const publication = await peer.transport.commands.required(); await saveFailed.promise; await nextTurn();
+    expect(f.retained(publication)?.value).not.toHaveProperty("acceptance");
+    failSave = false;
+    try {
+      await expect(owner.plane.close()).rejects.toThrow("unconfirmed publication obligations");
+      expect(f.retained(publication)?.value).toMatchObject({ acceptance: { accepted: true, messageId: MESSAGE_ID } });
+      expect(f.executions).toBe(1);
+    } finally { inboundAbort.abort(); await inbound.settled; }
+  });
   it.each([false, true])("closes with a usable carrier (injected cancellation failure: %s)", async fail => {
     const f = new Fixture(), owner = f.owner(), caller = f.caller();
     const attempted = deferred<void>(), send = caller.transport.send.bind(caller.transport);

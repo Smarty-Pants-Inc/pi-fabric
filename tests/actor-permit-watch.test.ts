@@ -278,9 +278,10 @@ function joinGate() {
 
 // Decorate the EXISTING launch fake, not another manager/queue harness. Native
 // close and the admitted scope's tree-empty receipt are independent, as in
-// process-transport.ts. waitForClose joins native close ONLY; scoped stop joins
-// checked cleanup too. No real process, scope, daemon, signal or deletion exists.
-function scopedExitReceipts(rejectMonitor = false) {
+// process-transport.ts. Windows has native close plus checked legacy liveness,
+// NOT treeClosed/event liveness. waitForClose joins native close ONLY; scoped
+// stop joins checked cleanup too. No real process, scope, signal or deletion exists.
+function scopedExitReceipts(rejectMonitor = false, windows = false) {
   const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
   const tree = joinGate(), cleanup = joinGate(), monitor = joinGate();
   const calls: string[] = [];
@@ -292,7 +293,7 @@ function scopedExitReceipts(rejectMonitor = false) {
     firstId ??= request.id;
     if (request.id !== firstId) return handle;
     const worker = workers.get(Number(handle.sessionId))!;
-    return { ...handle, liveness: "events", treeClosed: tree.promise,
+    return { ...handle, ...(!windows ? { liveness: "events" as const, treeClosed: tree.promise } : {}),
       waitForClose: async () => {
         worker.closeStarted = true;
         calls.push("native-join-started");
@@ -313,6 +314,12 @@ function scopedExitReceipts(rejectMonitor = false) {
         return handle.isAlive();
       },
       stop: async () => {
+        if (windows) {
+          calls.push("native-stop-started");
+          await handle.stop();
+          calls.push("native-stop-joined");
+          return;
+        }
         calls.push("scope-stop-started");
         await cleanup.promise;
         worker.descendants = false; // Recorded owned-scope cleanup, never a signal.
@@ -1358,20 +1365,25 @@ describe("actor worker permit release (#9031)", () => {
   });
 
   it.each(["completed", "failed"] as const)("terminal %s result cleans its surviving scope before settling and drains two same-actor successors without replay (#16970)", async status => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     const trace = scopedExitReceipts();
     const settlements: AgentRunResult[] = [];
     const f = fixture(result => { settlements.push(result); });
-    const actor = await create(f, "terminal-scope-daemon");
-    await f.actors.tell(actor.id, "unique terminal event with a surviving cache daemon");
-    const first = await launched(f, actor.id);
-    await f.actors.tell(actor.id, "scope successor one");
-    await f.actors.tell(actor.id, "scope successor two");
-    await eventually(() => expect(f.actors.status(actor.id).queued).toBe(2));
-    const before = queueEvidence(f, actor.id);
-    expect(before.items.map(item => item.executionStarted)).toEqual([true, false, false]);
-    let settled = false;
-    const result = f.agents.wait(first.launch.id).then(value => { settled = true; return value; });
+    let first: Worker | undefined;
     try {
+      // Case A exercises POSIX bounded scope cleanup. Windows intentionally
+      // publishes normal terminal actor results before its native close join.
+      Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+      const actor = await create(f, "terminal-scope-daemon");
+      await f.actors.tell(actor.id, "unique terminal event with a surviving cache daemon");
+      first = await launched(f, actor.id);
+      await f.actors.tell(actor.id, "scope successor one");
+      await f.actors.tell(actor.id, "scope successor two");
+      await eventually(() => expect(f.actors.status(actor.id).queued).toBe(2));
+      const before = queueEvidence(f, actor.id);
+      expect(before.items.map(item => item.executionStarted)).toEqual([true, false, false]);
+      let settled = false;
+      const result = f.agents.wait(first.launch.id).then(value => { settled = true; return value; });
       first.alive = false; // Host-owned launch identity now proves primary ESRCH.
       first.descendants = true; // e.g. op daemon; scope is still populated.
       save(first, { status, text: "terminal answer", turns: 2, toolCalls: 1,
@@ -1380,7 +1392,7 @@ describe("actor worker permit release (#9031)", () => {
       first.nativeClose();
       await eventually(() => expect(trace.calls, "terminal verdict must reach bounded owned-scope cleanup").toContain("scope-stop-started"));
       expect(first.primaryProofScans).toBeGreaterThan(0);
-      expect(() => process.kill(first.pid, 0)).toThrow("ESRCH");
+      expect(() => process.kill(first!.pid, 0)).toThrow("ESRCH");
       expect(first.descendants).toBe(true);
       expect(settled, "a terminal file plus primary close cannot bypass checked cleanup").toBe(false);
       expect(settlements).toEqual([]);
@@ -1409,7 +1421,143 @@ describe("actor worker permit release (#9031)", () => {
       // RED also unblocks a pending checked stop; afterEach completes any fake
       // successor launched during failure unwinding, with deletion probes intact.
       trace.drain();
-      complete(first);
+      if (first) complete(first);
+      Object.defineProperty(process, "platform", platform);
+    }
+  }, 20_000);
+
+  it("Windows normal terminal result publishes with a surviving descendant but retains admission until checked native exit without scope-stop or replay (#16970)", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const trace = scopedExitReceipts(false, true);
+    const settlements: AgentRunResult[] = [];
+    const f = fixture(result => { settlements.push(result); });
+    let first: Worker | undefined;
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      const actor = await create(f, "windows-terminal-descendant");
+      await f.actors.tell(actor.id, "unique normal terminal event with a surviving descendant");
+      first = await launched(f, actor.id);
+      await f.actors.tell(actor.id, "scope successor one");
+      await f.actors.tell(actor.id, "scope successor two");
+      await eventually(() => expect(f.actors.status(actor.id).queued).toBe(2));
+      first.descendants = true;
+      save(first, { status: "completed", text: "terminal answer", turns: 2, toolCalls: 1,
+        finishedAt: Date.now(), updatedAt: Date.now(), exitCode: 0 });
+      // No stop request: this must reach #monitor's normal Windows terminal
+      // path, then #settle's early publication/captured native admission join.
+      await expect(f.agents.wait(first.launch.id)).resolves.toMatchObject({ status: "completed", text: "terminal answer" });
+      await eventually(() => {
+        expect(trace.calls).toContain("native-join-started");
+        expect(snapshot(f).waiting).toHaveLength(1);
+      });
+      expect(settlements.filter(result => result.id === first!.launch.id)).toHaveLength(1);
+      expect(first.alive).toBe(true);
+      expect(first.descendants).toBe(true);
+      expect(first.closeJoined).toBe(false);
+      expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+      expect(workers.size).toBe(1);
+      expect(trace.calls).not.toContain("scope-stop-started");
+      expect(trace.calls).not.toContain("native-stop-started");
+
+      first.alive = false; // Primary absence alone is not captured native close.
+      await observe();
+      expect(first.descendants).toBe(true);
+      expect(first.closeJoined).toBe(false);
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+      expect(snapshot(f).waiting).toHaveLength(1);
+      expect(workers.size).toBe(1);
+      const probes = trace.calls.filter(call => call === "scope-probe").length;
+      first.descendants = false; // Natural exit, never an owned-scope stop.
+      first.nativeClose();
+      await eventually(() => expect(trace.calls).toContain("native-joined"));
+      await eventually(() => expect(trace.calls.filter(call => call === "scope-probe").length).toBeGreaterThan(probes));
+      expect(trace.calls).not.toContain("scope-stop-started");
+      expect(trace.calls).not.toContain("native-stop-started");
+      // The Windows handle has no treeClosed: leave that independent POSIX
+      // gate unresolved while checked legacy liveness authorizes admission.
+      await drainTwoSameActorSuccessors(f, actor.id, first, settlements);
+    } finally {
+      trace.drain();
+      if (first) complete(first);
+      Object.defineProperty(process, "platform", platform);
+    }
+  }, 20_000);
+
+  it.each(["checked", "unconfirmed"] as const)("Windows rejected monitor waits for late native close and %s legacy exit proof without polling (#16970)", async proof => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const trace = scopedExitReceipts(true, true);
+    const settlements: AgentRunResult[] = [];
+    const f = fixture(result => { settlements.push(result); });
+    let first: Worker | undefined;
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+      const actor = await create(f, "windows-rejected-monitor");
+      await f.actors.tell(actor.id, "unique completed event before Windows monitor rejection");
+      first = await launched(f, actor.id);
+      await f.actors.tell(actor.id, "scope successor one");
+      await f.actors.tell(actor.id, "scope successor two");
+      await eventually(() => {
+        expect(trace.calls).toContain("monitor-held");
+        expect(f.actors.status(actor.id).queued).toBe(2);
+      });
+      const before = queueEvidence(f, actor.id);
+      let settled = false;
+      const result = f.agents.wait(first.launch.id).then(value => { settled = true; return value; });
+      first.alive = false;
+      first.descendants = false;
+      save(first, { status: "completed", text: "terminal answer", turns: 2, toolCalls: 1,
+        finishedAt: Date.now(), updatedAt: Date.now(), exitCode: 0 });
+      trace.monitor.reject(new Error("recorded Windows monitor liveness rejection before native close"));
+      const marker = path.join(path.dirname(first.statusFile), "unresolved-worker.json");
+      await eventually(() => {
+        expect(fs.existsSync(marker)).toBe(true);
+        expect(JSON.parse(fs.readFileSync(marker, "utf8")).reason).toContain("recorded Windows monitor liveness rejection");
+      });
+      expect(() => process.kill(first!.pid, 0)).toThrow("ESRCH");
+      expect(settled, "even on Windows a rejected monitor must not publish without exact native close").toBe(false);
+      expect(settlements).toEqual([]);
+      expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+      await observe();
+      const probes = trace.calls.filter(call => call === "scope-probe").length;
+      const primaryScans = first.primaryProofScans;
+      await observe();
+      expect(trace.calls.filter(call => call === "scope-probe"), "no replacement liveness poller while native close is pending").toHaveLength(probes);
+      expect(first.primaryProofScans, "no primary-proof polling after rejection").toBe(primaryScans);
+      expect(settled).toBe(false);
+      expect(workers.size).toBe(1);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+
+      if (proof === "unconfirmed") first.debt = "recorded Windows native exit remains unconfirmed";
+      first.nativeClose(); // The only new receipt; no treeClosed on Windows.
+      await trace.nativeDelivered();
+      if (proof === "unconfirmed") {
+        await eventually(() => expect(JSON.parse(fs.readFileSync(marker, "utf8")).reason).toBe(first!.debt));
+        await observe();
+        const afterClose = trace.calls.filter(call => call === "scope-probe").length;
+        const afterCloseScans = first.primaryProofScans;
+        await observe();
+        expect(trace.calls.filter(call => call === "scope-probe"), "uncertain native proof must not start a retry loop").toHaveLength(afterClose);
+        expect(first.primaryProofScans).toBe(afterCloseScans);
+        expect(settled, "native notification plus PID absence cannot erase unconfirmed custody").toBe(false);
+        expect(settlements).toEqual([]);
+        expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+        expect(queueEvidence(f, actor.id)).toEqual(before);
+        expect(workers.size).toBe(1);
+      } else {
+        await expect(result).resolves.toMatchObject({ id: first.launch.id, status: "completed", text: "terminal answer" });
+        expect(trace.calls.filter(call => call === "scope-probe")).toHaveLength(probes + 1);
+        expect(trace.calls.filter(call => call === "native-delivered")).toHaveLength(1);
+        expect(fs.existsSync(marker)).toBe(false);
+        expect(trace.calls).not.toContain("scope-stop-started");
+        expect(trace.calls).not.toContain("native-stop-started");
+        await drainTwoSameActorSuccessors(f, actor.id, first, settlements);
+      }
+    } finally {
+      trace.drain();
+      if (first) complete(first);
+      Object.defineProperty(process, "platform", platform);
     }
   }, 20_000);
 

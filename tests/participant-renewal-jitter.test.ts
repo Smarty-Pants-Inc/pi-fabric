@@ -205,7 +205,7 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     if (!ready) {
       f.world.presence.gap();
       await vi.advanceTimersByTimeAsync(0);
-      expect(f.directory.participantView?.ready).toBe(false);
+      expect((f.directory.participantView as KvParticipantDirectory)?.ready).toBe(false);
     }
     const sampledDraws = draws, mono = performance.now();
     time.jumpWall(120_000);

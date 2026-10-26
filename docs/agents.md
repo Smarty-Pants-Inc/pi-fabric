@@ -1262,8 +1262,30 @@ Fabric children may read these environment variables. They are stable and versio
 | `PI_FABRIC_SCOPE` | JSON `FabricScope` `{ version: 1, principal, grants, digest, parentDigest? }`. Present only when the parent is scoped: the inherited or narrowed scope. The worker always clears `PI_FABRIC_SCOPE_FILE`. A child Fabric reads it as its root scope and fails closed when it is malformed. See [principal and scope](providers.md#principal-and-scope). |
 | `PI_FABRIC_DEPTH` | Recursion depth of the child (the root is 0). |
 | `PI_FABRIC_AGENT_NAME` | The child's display name. |
+| `PI_FABRIC_RUN_IDENTITY` | Absolute path to the manager-owned [run identity receipt](#run-identity-format-1), not writable scratch. |
 
 [Model-guidance components](components.md#model-facing-guidance-components) can target participants by canonical provider/model. Direct agents and actors retain their role prompt and receive matching append guidance after it. Recursive Pi children load the project components and resolve their own replaceable Fabric execution slot, so the parent does not duplicate guidance. Durable owners use the latest atomically committed guidance snapshot for each launch. Guidance changes prompts only; it cannot widen tools, approvals, or committed capabilities. Task text, message envelopes, run IDs, and timestamps stay out of the guidance system prompt, so repeated runs with the same role, model, and component projection retain a byte-stable prefix.
+
+### Run identity (format 1)
+
+Before launch, every manager writes 0600, single-link `run-identity.json` outside the child's
+scratch. Pi children export `PI_FABRIC_RUN_IDENTITY` plus `PI_FABRIC_AGENT_RUN_DIR` and
+`PI_FABRIC_PARENT_RUN`. Format 1 contains `runId`, canonical `runRoot`, `runDirectory`, optional
+`temporaryDirectory`, `actorId`, `mainAgentId`, `meshRoot`, `owner: {kind, id}`,
+`supervisor: {pid, processStartTime?}`, and millisecond `createdAt`. Owner kind is `residency`
+for resident hosts, else the immediate `main`/`actor`/`agent` spawner (`process` if unbound).
+Main and residency share this contract, including short scratch **outside** the run tree.
+
+This is metadata, not a capability. Consumers must check native pins, realpath containment
+`runDirectory == runRoot/runId`, no symlink ancestry, current UID, 0700 run/scratch and 0600
+single-link identity; bind to this mesh and live `status.json` (run/actor/Main IDs, `logFile`
+under this run, current `runnerSessionId`, and scratch; absent status `temporaryDirectory`
+means `runDirectory/tmp`). Require running, no finishing/finished/lost-contact marker, live
+supervisor/worker PID incarnations, and the worker as consumer ancestor (or self). Linux birth
+identity is `/proc/PID/stat` field 22; unknown refuses. Other platforms need a native verifier.
+Keep existing actor/claim/head authorization. Never hard-link, touch or modify manager files.
+This does not defend against unconfined same-UID code. Upgrade runtimes before activating
+receipt-requiring consumers; never fall back to a guessed residency layout.
 
 ### Session-bound launch roles
 

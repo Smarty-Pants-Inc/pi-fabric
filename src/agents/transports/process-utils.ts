@@ -3,7 +3,7 @@ import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { AgentTransportLaunch } from "../types.js";
+import type { AgentScopeCleanupRecord, AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
 import { spawnDetached as spawnDetachedLegacy } from "./process-utils-legacy.js";
@@ -306,11 +306,11 @@ export const spawnDetached = async (
   authority?: Pick<AgentTransportLaunch, "signal" | "authorize" | "onUnconfirmedExit">,
   environment?: NodeJS.ProcessEnv,
   /** memoryMaxBytes present: capped `fabric-task-*.scope` with an owned cgroup kill boundary (#8257). */
-  scope?: { executable: string; slice: string; warn: (reason: string) => void; memoryMaxBytes?: number },
+  scope?: { executable: string; slice: string; warn: (reason: string) => void; memoryMaxBytes?: number; cleanupLog?: (entry: Omit<AgentScopeCleanupRecord, "id" | "ts">) => void },
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; primaryExit?: Promise<void>; treeClosed?: Promise<void>; cgroup?: string; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; primaryExit?: Promise<void>; treeClosed?: Promise<void>; terminalScopeCleanup?: () => void; cgroup?: string; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
   // No PR observer or timer is created on the unscoped/unsupported path.
   const scopedLinux = Boolean(scope && process.platform === "linux");
   if (!scopedLinux) {
@@ -333,6 +333,7 @@ export const spawnDetached = async (
   // Capped task scopes get their own unit name; uncapped explicit scopes keep the old one.
   const memoryMaxBytes = scope?.memoryMaxBytes === undefined ? undefined : assertMemoryMaxBytes(scope.memoryMaxBytes);
   const capped = memoryMaxBytes !== undefined;
+  const cleanupLog = scope?.cleanupLog;
   const scopeUnit = scopeRoot
     ? capped ? `${TASK_SCOPE_PREFIX}${process.pid}-${randomBytes(8).toString("hex")}.scope` : `${path.basename(scopeRoot)}.scope`
     : undefined;
@@ -387,6 +388,33 @@ export const spawnDetached = async (
   gate?.on("error", () => undefined); // EPIPE: the shim already exited without executing the worker
   let gateReleased = false;
   let boundary: TaskCgroupBoundary | undefined;
+  // Uncapped scope authority is deliberately separate from the capped stop
+  // boundary: it must never select the capped proof/uncertainty shortcut.
+  type RetainedScope = { readonly fd: number; readonly dev: number; readonly ino: number; readonly bootstrap: { readonly pid: number; readonly started: string; readonly cgroup: string } };
+  let retainedScope: RetainedScope | undefined;
+  let scopeCleanupState: "unavailable" | "armed" | "attempted" | "retired" = "unavailable";
+  let terminalScopeCleanup: (() => void) | undefined;
+  let scopeCleanupBorrowed = false;
+  let scopeReleasePending = false;
+  const scopeDirectoryMatches = (held: RetainedScope): boolean => {
+    try {
+      const stat = fs.fstatSync(held.fd);
+      if (stat.isDirectory() && stat.dev === held.dev && stat.ino === held.ino) return true;
+    } catch { /* unknown descriptor identity is not retained-object authority */ }
+    if (retainedScope === held) {
+      retainedScope = undefined; // a known foreign/reused descriptor is not ours to close
+      scopeCleanupState = "retired";
+    }
+    return false;
+  };
+  const releaseRetainedScope = (): void => {
+    if (scopeCleanupBorrowed) { scopeReleasePending = true; return; }
+    const held = retainedScope;
+    retainedScope = undefined; // revoke descriptor ownership before any close
+    if (held && scopeDirectoryMatches(held)) {
+      try { fs.closeSync(held.fd); } catch { /* never retry a possibly reused descriptor */ }
+    }
+  };
   let cappedRefusal: string | undefined;
   if (!child.pid) {
     gate?.destroy();
@@ -607,11 +635,40 @@ export const spawnDetached = async (
   let scopeWatcher: fs.FSWatcher | undefined;
   let scopeEvents: string | undefined;
   let scopeEventsFd: number | undefined;
+  let scopeEventsIdentity: { dev: number; ino: number } | undefined;
+  let scopeObservation: object | undefined;
+  const releaseScopeEvents = (): void => {
+    if (scopeCleanupBorrowed) { scopeReleasePending = true; return; }
+    const fd = scopeEventsFd;
+    const identity = scopeEventsIdentity;
+    scopeEventsFd = undefined;
+    scopeEventsIdentity = undefined;
+    if (fd === undefined) return;
+    try {
+      if (identity) {
+        const held = fs.fstatSync(fd);
+        if (held.dev !== identity.dev || held.ino !== identity.ino) return;
+      }
+      fs.closeSync(fd);
+    } catch { /* unavailable/foreign descriptors are never closed again */ }
+  };
   let observingTree = false;
   let censusStarted = false;
   let censusDeadlineReached = false;
   const scopeIsEmpty = (): boolean => {
     if (scopeEventsFd === undefined) throw new Error("Owned scope events were not opened");
+    if (scopeEventsIdentity) {
+      try {
+        const held = fs.fstatSync(scopeEventsFd);
+        if (held.dev !== scopeEventsIdentity.dev || held.ino !== scopeEventsIdentity.ino) {
+          throw new Error("Owned scope events descriptor identity changed");
+        }
+      } catch (error) {
+        scopeEventsFd = undefined; // never read or close a detected foreign/reused fd
+        scopeEventsIdentity = undefined;
+        throw error;
+      }
+    }
     const buffer = Buffer.alloc(4096);
     // Positioned reads keep a retained descriptor useful after scope removal,
     // and never consume the next populated notification's file offset.
@@ -634,10 +691,14 @@ export const spawnDetached = async (
   const finishTree = (error?: unknown): void => {
     if (treeFinished) return;
     treeFinished = true;
+    scopeCleanupState = "retired"; // stale callbacks lose authority BEFORE close
+    scopeObservation = undefined;
     clearTimeout(censusTimer);
-    scopeWatcher?.close();
-    if (scopeEventsFd !== undefined) fs.closeSync(scopeEventsFd);
-    scopeEventsFd = undefined;
+    const watcher = scopeWatcher;
+    scopeWatcher = undefined;
+    watcher?.close();
+    releaseScopeEvents();
+    releaseRetainedScope();
     scopeEvents = undefined;
     if (error !== undefined) rejectTree(error);
     else {
@@ -685,6 +746,91 @@ export const spawnDetached = async (
     } catch (error) { unconfirmed(`Owned scope observation failed: ${String(error)}`); finishTree(error); }
     finally { observingTree = false; }
   };
+  const makeTerminalScopeCleanup = (
+    held: RetainedScope,
+    log: (entry: Omit<AgentScopeCleanupRecord, "id" | "ts">) => void,
+  ): (() => void) => () => {
+    if (scopeCleanupState !== "armed" || retainedScope !== held) return;
+    // Consume before ANY I/O, including diagnostics. Manager supplies terminal
+    // authorization; this independent backend guard supplies native/lifetime debt.
+    scopeCleanupState = "attempted";
+    if (!nativeClosed || !treeObservationReady || treeFinished || lost !== undefined || stopFailed) return;
+    scopeCleanupBorrowed = true;
+    const stillHeld = (): boolean => retainedScope === held && scopeDirectoryMatches(held);
+    try {
+      if (!stillHeld()) return;
+      try {
+        if (scopeIsEmpty()) { void observeTree(); return; }
+      } catch (error) {
+        unconfirmed(`Owned scope observation failed: ${String(error)}`);
+        finishTree(error);
+        return;
+      }
+      const entry: Omit<AgentScopeCleanupRecord, "id" | "ts"> = {
+        type: "scope.cleanup", members: [], note: "shared per-user services may be interrupted",
+        truncated: false, unreadable: false,
+      };
+      // Diagnostics are an observed ROOT sample, never a census or authority.
+      // One positioned read per file; never read an unbounded file then slice.
+      const readBounded = (file: string, limit: number): string => {
+        const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+        try {
+          const buffer = Buffer.alloc(limit);
+          const size = fs.readSync(fd, buffer, 0, limit, 0);
+          if (size === limit) entry.truncated = true;
+          return buffer.toString("utf8", 0, size);
+        } finally { fs.closeSync(fd); }
+      };
+      try {
+        let procs = readBounded(`/proc/self/fd/${held.fd}/cgroup.procs`, 16 * 1024);
+        // A bounded read may end in a partial PID: do not report that prefix.
+        if (entry.truncated && !/\s$/.test(procs)) procs = procs.slice(0, procs.lastIndexOf("\n") + 1);
+        const seen = new Set<number>();
+        for (const value of procs.split(/\s+/)) {
+          if (!value) continue;
+          const member = Number(value);
+          if (!/^\d+$/.test(value) || !Number.isSafeInteger(member) || member <= 0) { entry.unreadable = true; continue; }
+          if (seen.has(member)) continue;
+          if (seen.size === 64) { entry.truncated = true; break; }
+          seen.add(member);
+          let comm = "<unreadable>";
+          try {
+            comm = readBounded(`/proc/${member}/comm`, 64).replace(/\n$/, "");
+            // UTF-8 replacement at a partial codepoint must also fit the byte cap.
+            while (Buffer.byteLength(comm) > 64) comm = comm.slice(0, -1);
+          } catch { entry.unreadable = true; }
+          entry.members.push({ pid: member, comm });
+        }
+      } catch { entry.unreadable = true; }
+      try {
+        // Reserve envelope space for the host's exact id/timestamp. Escaping
+        // hostile names can expand their bytes, even with the 64-byte read cap.
+        const diagnosticBytes = (): number => Buffer.byteLength(JSON.stringify(entry).replace(/[\u007f-\u009f\u2028\u2029]/g,
+          character => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`));
+        while (diagnosticBytes() > 6 * 1024 && entry.members.length) { entry.members.pop(); entry.truncated = true; }
+        log(entry);
+      } catch { /* diagnostic/log failure must NOT veto valid cleanup */ }
+      // No await between this final lifetime/dev+ino check and fd-relative
+      // control open/write. Kill acknowledgment never resolves a receipt.
+      if (scopeCleanupState !== "attempted" || !nativeClosed || !treeObservationReady || treeFinished
+        || lost !== undefined || stopFailed || !stillHeld()) return;
+      let control: number | undefined;
+      try {
+        control = fs.openSync(`/proc/self/fd/${held.fd}/cgroup.kill`, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
+        fs.writeSync(control, "1");
+      } catch { /* no PID/unit fallback, no fabricated emptiness and no retry */ }
+      finally { if (control !== undefined) { try { fs.closeSync(control); } catch { /* one owned control close */ } } }
+    } finally {
+      scopeCleanupBorrowed = false;
+      // A synchronous watcher wake during the write can finish the receipt.
+      // Retire immediately, but keep borrowed descriptors until this turn ends.
+      if (scopeReleasePending) {
+        scopeReleasePending = false;
+        releaseScopeEvents();
+        releaseRetainedScope();
+      }
+    }
+  };
   const armTreeObservation = async (): Promise<boolean> => {
     if (treeObservationReady) return true;
     if (!posix || !scopeUnit || !marker || !scope) return false;
@@ -704,14 +850,12 @@ export const spawnDetached = async (
         || path.posix.basename(path.posix.dirname(cgroup)) !== scope.slice) {
         throw new Error("Cgroup receipt does not match the launched scope/slice");
       }
-      if (!birth || linuxGroupMember(pid)?.started !== birth.started) throw new Error("Scope worker birth is unverified");
+      if (!birth || (!capped && !/^\d+$/.test(birth.started)) || linuxGroupMember(pid)?.started !== birth.started) throw new Error("Scope worker birth is unverified");
       const directory = path.resolve("/sys/fs/cgroup", `.${cgroup}`);
       if (!directory.startsWith("/sys/fs/cgroup/")) throw new Error("Owned scope cgroup path escaped its mount");
-      const ownedDirectory = (): boolean => {
-        const stat = fs.lstatSync(directory);
-        return stat.isDirectory() && stat.uid === process.getuid?.();
-      };
-      if (!ownedDirectory() || fs.statfsSync(directory).type !== 0x63677270) throw new Error("Scope is not our UID-owned cgroup-v2 directory");
+      const ownedDirectory = (stat = fs.lstatSync(directory)): boolean => stat.isDirectory() && stat.uid === process.getuid?.();
+      const directoryIdentity = fs.lstatSync(directory);
+      if (!ownedDirectory(directoryIdentity) || fs.statfsSync(directory).type !== 0x63677270) throw new Error("Scope is not our UID-owned cgroup-v2 directory");
       if (capped) {
         // Retain the admitted leaf by descriptor: later limit reads, kills and
         // membership walks never re-authorize a same-UID pathname.
@@ -727,10 +871,28 @@ export const spawnDetached = async (
           boundary = { relative: cgroup, fd: leafFd, memoryMax };
         } catch (error) { fs.closeSync(leafFd); throw error; }
       }
-      scopeEvents = path.join(directory, "cgroup.events");
+      if (!capped) {
+        const fd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+        try {
+          const held = fs.fstatSync(fd);
+          if (!held.isDirectory() || held.uid !== directoryIdentity.uid
+            || held.dev !== directoryIdentity.dev || held.ino !== directoryIdentity.ino
+            || fs.statfsSync(`/proc/self/fd/${fd}`).type !== 0x63677270) {
+            throw new Error("Uncapped scope directory changed during admission");
+          }
+          retainedScope = { fd, dev: held.dev, ino: held.ino, bootstrap: { pid, started: birth.started, cgroup } };
+        } catch (error) { fs.closeSync(fd); throw error; }
+      }
+      scopeEvents = retainedScope ? `/proc/self/fd/${retainedScope.fd}/cgroup.events` : path.join(directory, "cgroup.events");
       scopeEventsFd = fs.openSync(scopeEvents, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      if (retainedScope) {
+        const held = fs.fstatSync(scopeEventsFd);
+        scopeEventsIdentity = { dev: held.dev, ino: held.ino };
+      }
+      const observation = {};
+      scopeObservation = observation;
       const changed = (): void => {
-        if (!treeObservationReady || treeFinished) return;
+        if (!treeObservationReady || treeFinished || scopeObservation !== observation) return;
         try { scopeIsEmpty(); void observeTree(); }
         catch (error) { unconfirmed(`Owned scope observation failed: ${String(error)}`); finishTree(error); }
       };
@@ -738,6 +900,7 @@ export const spawnDetached = async (
       // A constructor failure or queued arm error yields no public receipt.
       scopeWatcher = fs.watch(scopeEvents, { persistent: false }, changed);
       scopeWatcher.on("error", error => {
+        if (treeFinished || scopeObservation !== observation) return;
         if (!treeObservationReady) armError = error;
         else { unconfirmed(`Owned scope watcher failed: ${String(error)}`); finishTree(error); }
       });
@@ -746,22 +909,43 @@ export const spawnDetached = async (
       if (armError !== undefined) throw armError;
       if (!ownedDirectory() || unifiedPath(fs.readFileSync(`/proc/${pid}/cgroup`, "utf8")) !== cgroup
         || linuxGroupMember(pid)?.started !== birth.started) throw new Error("Scope identity changed during watcher admission");
+      if (retainedScope) {
+        const byPath = fs.lstatSync(directory);
+        if (!scopeDirectoryMatches(retainedScope) || byPath.dev !== retainedScope.dev || byPath.ino !== retainedScope.ino
+          || fs.statfsSync(`/proc/self/fd/${retainedScope.fd}`).type !== 0x63677270
+          || retainedScope.bootstrap.pid !== pid || retainedScope.bootstrap.started !== birth.started
+          || retainedScope.bootstrap.cgroup !== cgroup) throw new Error("Retained scope identity changed during watcher admission");
+      }
       scopeIsEmpty(); // Revalidate after the asynchronous arm boundary, before publishing any receipt.
       treeClosed = new Promise<void>((resolve, reject) => { resolveTree = resolve; rejectTree = reject; });
       // Preserve failures for the subscriber without an admission-gap rejection.
       void treeClosed.catch(() => undefined);
       treeObservationReady = true;
+      // Probe availability without mutation. Unsupported/denied controls keep
+      // the independent passive receipt, but never gain a cleanup capability.
+      const held = retainedScope;
+      if (held && cleanupLog) {
+        try {
+          const control = fs.openSync(`/proc/self/fd/${held.fd}/cgroup.kill`, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
+          fs.closeSync(control);
+          scopeCleanupState = "armed";
+          terminalScopeCleanup = makeTerminalScopeCleanup(held, cleanupLog);
+        } catch { /* passive custody remains armed */ }
+      }
       void observeTree();
       return true;
     } catch (error) {
       cappedRefusal = String(error);
+      scopeCleanupState = "retired";
+      scopeObservation = undefined;
       if (boundary) { releaseBoundary(); boundary = undefined; }
+      releaseRetainedScope();
       // Scope launch is not replayed. This SAME worker keeps legacy checked
       // monitoring, with no treeClosed receipt and no event census deadline.
-      scopeWatcher?.close();
+      const watcher = scopeWatcher;
       scopeWatcher = undefined;
-      if (scopeEventsFd !== undefined) fs.closeSync(scopeEventsFd);
-      scopeEventsFd = undefined;
+      watcher?.close();
+      releaseScopeEvents();
       scopeEvents = undefined;
       return false;
     }
@@ -920,7 +1104,8 @@ export const spawnDetached = async (
   if (scope && marker) {
     // Only a verified arm may publish event custody. Validation failure keeps
     // this same worker on checked legacy monitoring, without replay or receipt.
-    const admittedHandle = async () => await armTreeObservation() ? { ...handle, treeClosed: treeClosed! } : handle;
+    const admittedHandle = async () => await armTreeObservation()
+      ? { ...handle, treeClosed: treeClosed!, ...(terminalScopeCleanup ? { terminalScopeCleanup } : {}) } : handle;
     try {
       let admissionFailureReason = "scope admission timed out before an authenticated marker";
       const admitted = await (async (): Promise<boolean> => {

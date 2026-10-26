@@ -608,6 +608,19 @@ export type AgentTransportObservation =
   | { state: "alive" | "absent" }
   | { state: "unknown"; reason: string };
 
+/** Host-only, bounded diagnostics of a held-scope cleanup attempt, not exit proof. */
+export type AgentScopeCleanupRecord = {
+  type: "scope.cleanup";
+  id: string;
+  ts: number;
+  /** Observed root members, not a complete subtree census or a set proved killed. */
+  members: { pid: number; comm: string }[];
+  note: "shared per-user services may be interrupted";
+  unit?: string;
+  truncated?: boolean;
+  unreadable?: boolean;
+};
+
 export interface AgentTransportHandle {
   /** Actual worker release, not the parent manager's loaded generation. */
   fabricRelease?: string;
@@ -656,6 +669,9 @@ export interface AgentTransportHandle {
    * observation failure rejects, never authorizes collection/replacement.
    * Unverified scopes and unscoped workers omit this field entirely. */
   treeClosed?: Promise<void>;
+  /** Host-internal, synchronous one-shot cleanup of this launch's admitted uncapped
+   * scope. No caller-selected target; acknowledgment is never native/tree exit proof. */
+  terminalScopeCleanup?: () => void;
   /** Admitted, memory-capped task cgroup path (smarty-dev#8257). Present only after the
    * launcher verified the capped scope receipt; uncapped/fallback launches omit it. */
   cgroup?: string;

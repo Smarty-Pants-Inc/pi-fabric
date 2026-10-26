@@ -37,7 +37,8 @@ interface Worker {
   identityAlive?: boolean;
   birth?: string;
   probeError?: string;
-  descendants: boolean;
+  descendants: boolean; // Birth-sampled members targeted by ordinary stop.
+  unsampledScope?: boolean; // In-scope daemon in a never-sampled, dead-leader group.
   debt?: string;
   record: AgentRunRecord;
   statusFile: string;
@@ -126,12 +127,12 @@ beforeEach(() => {
         worker.closeStarted = true;
         await closed;
         if (worker.closeJoin) await worker.closeJoin;
-        if (worker.alive || worker.descendants || worker.debt) throw new Error("Native custody still open");
+        if (worker.alive || worker.descendants || worker.unsampledScope || worker.debt) throw new Error("Native custody still open");
         worker.closeJoined = true;
       },
-      isAlive: async () => !worker.contactLost && (worker.alive || worker.descendants),
+      isAlive: async () => !worker.contactLost && (worker.alive || worker.descendants || !!worker.unsampledScope),
       stop: async () => {
-        if (worker.alive || worker.descendants || worker.debt) throw new Error("Owned tree exit unconfirmed");
+        if (worker.alive || worker.descendants || worker.unsampledScope || worker.debt) throw new Error("Owned tree exit unconfirmed");
         await closed;
         if (worker.stopJoin) await worker.stopJoin;
       },
@@ -202,6 +203,7 @@ const save = (worker: Worker, patch: Partial<AgentRunRecord> & Record<string, un
 function complete(worker: Worker) {
   worker.alive = false;
   worker.descendants = false;
+  worker.unsampledScope = false; // Fixture teardown only, never an ordinary stop receipt.
   delete worker.debt;
   delete worker.contactLost;
   delete worker.probeError;
@@ -278,22 +280,53 @@ function joinGate() {
 
 // Decorate the EXISTING launch fake, not another manager/queue harness. Native
 // close and the admitted scope's tree-empty receipt are independent, as in
-// process-transport.ts. Windows has native close plus checked legacy liveness,
-// NOT treeClosed/event liveness. waitForClose joins native close ONLY; scoped
-// stop joins checked cleanup too. No real process, scope, signal or deletion exists.
-function scopedExitReceipts(rejectMonitor = false, windows = false) {
+// process-transport.ts. Windows keeps its original native/legacy route. Ordinary
+// POSIX stop targets ONLY sampled members, then joins native close, never scope
+// emptiness: waiting for tree here would circularly prevent post-stop cleanup.
+// Keep the richer handle structural so this test compiles on the production base.
+interface ScopeCleanupEvent {
+  type: "scope.cleanup";
+  id: string;
+  ts: number;
+  members: Array<{ pid: number; comm: string }>;
+  note: "shared per-user services may be interrupted";
+}
+function scopedExitReceipts(rejectMonitor = false, windows = false, capability = true) {
   const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
   const tree = joinGate(), cleanup = joinGate(), monitor = joinGate();
   const calls: string[] = [];
   let firstId: string | undefined;
   let monitorHeld = false;
+  let draining = false;
+  let attempted = false;
+  let logFile: string | undefined;
+  let daemonPid: number | undefined;
   let nativeDelivered: Promise<void> | undefined;
   vi.mocked(ProcessTransport.prototype.launch).mockImplementation(async request => {
     const handle = await launch(request);
     firstId ??= request.id;
     if (request.id !== firstId) return handle;
     const worker = workers.get(Number(handle.sessionId))!;
-    return { ...handle, ...(!windows ? { liveness: "events" as const, treeClosed: tree.promise } : {}),
+    logFile = request.workerArguments[request.workerArguments.indexOf("--log-file") + 1]!;
+    daemonPid = worker.pid + 10_000_000;
+    const terminalScopeCleanup = (): void => {
+      calls.push("terminal-scope-cleanup-attempt");
+      if (attempted || !worker.unsampledScope) return;
+      attempted = true;
+      const event: ScopeCleanupEvent = { type: "scope.cleanup", id: request.id, ts: Date.now(),
+        members: [{ pid: daemonPid!, comm: "fixturedaemon" }],
+        note: "shared per-user services may be interrupted" };
+      // Synchronous run log BEFORE the simulated cgroup.kill write. No new
+      // production type/import is needed; manager on HEAD simply ignores this.
+      fs.appendFileSync(logFile!, `${JSON.stringify(event)}\n`);
+      calls.push("scope.cleanup");
+      calls.push("scope-kill-write");
+      worker.unsampledScope = false;
+      calls.push("unsampled-cleared");
+      // Deliberately do NOT resolve tree: mutation acknowledgment is not proof.
+    };
+    return { ...handle, ...(!windows ? { liveness: "events" as const, treeClosed: tree.promise,
+      ...(capability ? { terminalScopeCleanup } : {}) } : {}),
       waitForClose: async () => {
         worker.closeStarted = true;
         calls.push("native-join-started");
@@ -321,18 +354,25 @@ function scopedExitReceipts(rejectMonitor = false, windows = false) {
           return;
         }
         calls.push("scope-stop-started");
-        await cleanup.promise;
-        worker.descendants = false; // Recorded owned-scope cleanup, never a signal.
-        calls.push("scope-cleanup-ack");
-        await handle.stop();
-        await tree.promise; // ACK/path absence is not the checked tree-empty join.
+        calls.push("sampled-TERM");
+        if (!draining) await cleanup.promise; // Existing cooperative sampled-stop gate.
+        worker.descendants = false; // Only this sampled target, NOT the daemon.
+        worker.alive = false; // In alive-on-TERM mode, the captured primary exits here.
+        calls.push("sampled-exited");
+        worker.nativeClose();
+        await handle.closed;
+        calls.push("native-stop-closed");
         calls.push("scope-stop-joined");
       },
     };
   });
-  const drain = () => { monitor.resolve(); cleanup.resolve(); tree.resolve(); };
+  const events = (): ScopeCleanupEvent[] => logFile && fs.existsSync(logFile)
+    ? fs.readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean)
+      .map(line => JSON.parse(line) as ScopeCleanupEvent).filter(event => event.type === "scope.cleanup") : [];
+  const drain = () => { draining = true; monitor.resolve(); cleanup.resolve(); tree.resolve(); };
   receiptDrains.push(drain);
-  return { tree, cleanup, monitor, calls, nativeDelivered: () => nativeDelivered, drain };
+  return { tree, cleanup, monitor, calls, events, daemonPid: () => daemonPid,
+    nativeDelivered: () => nativeDelivered, drain };
 }
 
 // Real same-actor drain and durable queue restore must consume each activation
@@ -426,6 +466,9 @@ function nativeJoinClock() {
   });
   return {
     beforeBound: () => { now = started + nativeJoinBoundMs - 1; },
+    // A legitimate sampled stop may exceed 7 s without concluding its phase.
+    // Advance wall time only: do not fabricate delivery of a phase timeout.
+    longOpenStop: () => { now = started + nativeJoinBoundMs + 2_000; },
     expire: () => {
       now = started + nativeJoinBoundMs;
       // Snapshot: callbacks may schedule other work, which is NOT auto-fired.
@@ -1364,15 +1407,20 @@ describe("actor worker permit release (#9031)", () => {
     }
   });
 
-  it.each(["completed", "failed"] as const)("terminal %s result cleans its surviving scope before settling and drains two same-actor successors without replay (#16970)", async status => {
+  it.each([
+    { status: "completed", primary: "already-gone", slow: false },
+    { status: "failed", primary: "already-gone", slow: false },
+    { status: "completed", primary: "exits-on-TERM", slow: false },
+    { status: "failed", primary: "exits-on-TERM", slow: false },
+    { status: "completed", primary: "exits-on-TERM", slow: true },
+  ] as const)("P2 custody T1/T10 $status primary=$primary long-open-stop=$slow cleans unsampled scope before settlement (#16970)", async ({ status, primary, slow }) => {
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     const trace = scopedExitReceipts();
     const settlements: AgentRunResult[] = [];
     const f = fixture(result => { settlements.push(result); });
     let first: Worker | undefined;
+    let clock: ReturnType<typeof nativeJoinClock> | undefined;
     try {
-      // Case A exercises POSIX bounded scope cleanup. Windows intentionally
-      // publishes normal terminal actor results before its native close join.
       Object.defineProperty(process, "platform", { ...platform, value: "linux" });
       const actor = await create(f, "terminal-scope-daemon");
       await f.actors.tell(actor.id, "unique terminal event with a surviving cache daemon");
@@ -1384,47 +1432,412 @@ describe("actor worker permit release (#9031)", () => {
       expect(before.items.map(item => item.executionStarted)).toEqual([true, false, false]);
       let settled = false;
       const result = f.agents.wait(first.launch.id).then(value => { settled = true; return value; });
-      first.alive = false; // Host-owned launch identity now proves primary ESRCH.
-      first.descendants = true; // e.g. op daemon; scope is still populated.
+      first.alive = primary !== "already-gone";
+      first.descendants = true; // A sampled child must get its ordinary TERM window.
+      first.unsampledScope = true; // Separate never-sampled, still-in-scope daemon.
       save(first, { status, text: "terminal answer", turns: 2, toolCalls: 1,
         ...(status === "failed" ? { error: "Permanent worker task failure" } : {}),
         finishedAt: Date.now(), updatedAt: Date.now(), exitCode: status === "completed" ? 0 : 1 });
-      first.nativeClose();
-      await eventually(() => expect(trace.calls, "terminal verdict must reach bounded owned-scope cleanup").toContain("scope-stop-started"));
-      expect(first.primaryProofScans).toBeGreaterThan(0);
-      expect(() => process.kill(first!.pid, 0)).toThrow("ESRCH");
+      if (primary === "already-gone") first.nativeClose();
+      await eventually(() => expect(trace.calls, "terminal verdict must reach ordinary sampled stop").toContain("sampled-TERM"));
+      expect(first.alive).toBe(primary !== "already-gone");
       expect(first.descendants).toBe(true);
-      expect(settled, "a terminal file plus primary close cannot bypass checked cleanup").toBe(false);
+      expect(first.unsampledScope).toBe(true);
+      expect(trace.calls).not.toContain("scope-kill-write");
+      expect(trace.events()).toEqual([]);
+      expect(settled, "result file cannot publish before sampled/native/tree proof").toBe(false);
       expect(settlements).toEqual([]);
       expect(workers.size).toBe(1);
       expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
       expect(queueEvidence(f, actor.id)).toEqual(before);
 
+      if (slow) {
+        clock = nativeJoinClock();
+        clock.longOpenStop(); // >9 s wall time, no phase conclusion; no real 9 s sleep.
+      }
       trace.cleanup.resolve();
-      await eventually(() => expect(trace.calls).toContain("scope-cleanup-ack"));
-      await observe(); // A stop ACK/scope-like absence still owes captured tree proof.
-      expect(first.descendants).toBe(false);
-      expect(trace.calls).not.toContain("scope-stop-joined");
+      await eventually(() => expect(trace.calls).toContain("native-stop-closed"));
+      expect(first.descendants, "ordinary TERM targets the sampled child only").toBe(false);
+      // Intended HEAD RED: ordinary sampled/native stop has completed, but no
+      // production caller invokes the structural capability to clear the daemon.
+      await eventually(() => expect(trace.calls, "T1: native stop must be followed by terminal-only unsampled cleanup").toContain("scope-kill-write"));
+      clock?.restore(); clock = undefined;
+      expect(first.unsampledScope).toBe(false);
+      expect(first.primaryProofScans).toBeGreaterThan(0);
+      expect(() => process.kill(first!.pid, 0)).toThrow("ESRCH");
+      const ordered = ["sampled-TERM", "sampled-exited", "native-stop-closed", "scope-stop-joined",
+        "scope.cleanup", "scope-kill-write", "unsampled-cleared"].map(call => trace.calls.indexOf(call));
+      expect(ordered.every((index, i) => index >= 0 && (i === 0 || index > ordered[i - 1]!))).toBe(true);
+      expect(trace.events(), "T10: one typed root-member record on --log-file before write/clear").toEqual([
+        { type: "scope.cleanup", id: first.launch.id, ts: expect.any(Number),
+          members: [{ pid: trace.daemonPid(), comm: "fixturedaemon" }],
+          note: "shared per-user services may be interrupted" },
+      ]);
+      await observe(); // Kernel write ACK still owes the independent tree receipt.
       expect(settled).toBe(false);
       expect(settlements).toEqual([]);
       expect(workers.size).toBe(1);
       expect(queueEvidence(f, actor.id)).toEqual(before);
       trace.tree.resolve();
-      await eventually(() => expect(settled, "checked scope exit must settle the terminal activation").toBe(true));
+      await eventually(() => expect(settled, "full native AND tree proof must settle original result").toBe(true));
       await expect(result).resolves.toMatchObject({ id: first.launch.id, status, text: "terminal answer",
         ...(status === "failed" ? { error: "Permanent worker task failure" } : {}) });
       expect(trace.calls.filter(call => call === "scope-stop-started")).toHaveLength(1);
-      expect(trace.calls.filter(call => call === "scope-stop-joined")).toHaveLength(1);
-      trace.tree.resolve(); // Duplicate receipt delivery cannot discharge RUN twice.
+      expect(trace.calls.filter(call => call === "terminal-scope-cleanup-attempt")).toHaveLength(1);
+      expect(trace.calls.filter(call => call === "scope-kill-write")).toHaveLength(1);
+      trace.tree.resolve();
       await drainTwoSameActorSuccessors(f, actor.id, first, settlements);
+      expect(trace.events()).toHaveLength(1);
+      expect(trace.calls.filter(call => call === "terminal-scope-cleanup-attempt")).toHaveLength(1);
     } finally {
-      // RED also unblocks a pending checked stop; afterEach completes any fake
-      // successor launched during failure unwinding, with deletion probes intact.
+      clock?.restore();
       trace.drain();
       if (first) complete(first);
       Object.defineProperty(process, "platform", platform);
     }
   }, 20_000);
+
+  it.each([
+    { status: "completed", rejected: false, rejection: "none" },
+    { status: "failed", rejected: false, rejection: "none" },
+    { status: "completed", rejected: true, rejection: "immutable-debt" },
+    { status: "completed", rejected: true, rejection: "real-EPERM" },
+  ] as const)("P2 prior generic stop $status rejected=$rejected $rejection rejoins only the same terminal handle (#16970)", async ({ status, rejected, rejection }) => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const trace = scopedExitReceipts();
+    const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
+    const handles: Awaited<ReturnType<ProcessTransport["launch"]>>[] = [];
+    const stopSnapshots: AgentRunRecord[] = [];
+    const realEperm = rejection === "real-EPERM";
+    const nativeState = { stopFailed: false, stopPending: false };
+    const sampledFailures: unknown[] = [];
+    let terminalDrainReason: string | undefined;
+    const sampledEperm = Object.assign(new Error("recorded prior generic sampled EPERM rejection"), { code: "EPERM" });
+    vi.mocked(ProcessTransport.prototype.launch).mockImplementation(async request => {
+      const handle = await launch(request);
+      handles.push(handle);
+      if (handles.length === 1) {
+        const worker = workers.get(Number(handle.sessionId))!;
+        const stop = handle.stop;
+        handle.stop = async () => {
+          stopSnapshots.push(JSON.parse(fs.readFileSync(worker.statusFile, "utf8")) as AgentRunRecord);
+          // Each actual call reaches the sampled TERM fake, including retries
+          // after rejection. Do not cache the rejected promise and hide a TERM.
+          nativeState.stopFailed = false;
+          nativeState.stopPending = true;
+          try { await stop(); }
+          catch (error) {
+            nativeState.stopFailed = true;
+            sampledFailures.push(error);
+            throw error;
+          } finally {
+            nativeState.stopPending = false;
+            trace.calls.push("prior-generic-stop-concluded");
+          }
+        };
+      }
+      return handle; // The manager receives this exact object, not a replacement adapter.
+    });
+    const settlements: AgentRunResult[] = [];
+    const f = fixture(result => { settlements.push(result); });
+    let first: Worker | undefined;
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+      const actor = await create(f, `prior-generic-stop-${status}-${rejected}`);
+      await f.actors.tell(actor.id, "unique activation whose startup retry owns ordinary stop");
+      first = await launched(f, actor.id);
+      await f.actors.tell(actor.id, "scope successor one");
+      await f.actors.tell(actor.id, "scope successor two");
+      await eventually(() => expect(f.actors.status(actor.id).queued).toBe(2));
+      const before = queueEvidence(f, actor.id);
+      expect(before.items.map(item => item.executionStarted)).toEqual([true, false, false]);
+      const original = handles[0]!;
+      const closed = original.closed, treeClosed = original.treeClosed;
+      let capturedNativeClosed = false;
+      void closed!.then(() => { capturedNativeClosed = true; });
+      const identity = f.agents.workerIdentity(first.launch.id);
+      let settled = false;
+      const result = f.agents.wait(first.launch.id).then(value => { settled = true; return value; });
+      const runDirectory = path.dirname(first.statusFile);
+      const noStopIntent = () => {
+        const receipt = path.join(runDirectory, "archive-pending.json");
+        expect(fs.existsSync(receipt) ? JSON.parse(fs.readFileSync(receipt, "utf8")).stopIntent : undefined).toBeUndefined();
+        expect(JSON.parse(fs.readFileSync(first!.statusFile, "utf8")).stopIntent).toBeUndefined();
+      };
+      first.descendants = true;
+      first.unsampledScope = true;
+      // Real #retryStartup -> #relaunchAttempt owns this UNAUTHORIZED stop.
+      // Keep host identity alive through retry admission. A populated scoped
+      // backend truthfully reports alive throughout its existing 7 s wait;
+      // do not fake false liveness or call public stop (which sets intent).
+      save(first, { status: "failed", error: "Agent transport exited without a result", updatedAt: Date.now() });
+      await vi.waitFor(() => expect(trace.calls).toContain("sampled-TERM"), { timeout: nativeJoinBoundMs + 5_000, interval: 20 });
+      expect(stopSnapshots).toMatchObject([{ id: first.launch.id, status: "failed",
+        error: "Agent transport exited without a result", turns: 0, toolCalls: 0, exitCode: null }]);
+      expect(f.agents.workerIdentity(first.launch.id)).toEqual(identity);
+      expect(first.alive).toBe(true);
+      expect(trace.calls).not.toContain("prior-generic-stop-concluded");
+      noStopIntent();
+      expect(trace.events()).toEqual([]);
+      expect(settled).toBe(false);
+      expect(handles).toHaveLength(1);
+
+      if (rejected && !realEperm) {
+        // Keep immutable native debt separate from the real EPERM representation.
+        first.debt = "recorded sampled EPERM stop debt";
+        trace.cleanup.reject(sampledEperm);
+        trace.calls.push("prior-generic-stop-rejected");
+      }
+      // Publish genuine output and captured native close while the ordinary
+      // owner is STILL HELD (except the separate immutable-debt case). Host
+      // primary death then cancels relaunch after its stop await, before the
+      // relaunch-failed writer can overwrite this same attempt's genuine result.
+      // Publishing only AFTER rejection can instead strand a stale startup
+      // snapshot; that unqualified GREEN never exercised terminal drain.
+      if (status === "completed") delete first.record.error;
+      save(first, { status, text: "new genuine terminal answer", turns: 2, toolCalls: 1,
+        ...(status === "failed" ? { error: "Permanent worker task failure" } : {}),
+        finishedAt: Date.now(), updatedAt: Date.now(), exitCode: status === "completed" ? 0 : 1 });
+      trace.calls.push("new-genuine-result");
+      first.alive = false;
+      first.nativeClose();
+      await closed;
+      trace.calls.push("prior-generic-native-delivered");
+      if (realEperm) {
+        expect(capturedNativeClosed).toBe(true);
+        expect(f.agents.workerIdentity(first.launch.id)).toMatchObject({ pid: identity!.pid, startTime: identity!.startTime, open: false });
+        expect(first.descendants).toBe(true);
+        expect(first.unsampledScope).toBe(true);
+        expect(nativeState).toEqual({ stopFailed: false, stopPending: true });
+        expect(trace.calls).not.toContain("prior-generic-stop-concluded");
+        // The existing gate models TERM's cooperative wait, NOT a suspended
+        // synchronous signal syscall. With the custodian now exited, a surviving
+        // sampled group's escalation may throw EPERM without process-utils'
+        // live-custodian unconfirmed latch. No lostContact/stopDebt is invented.
+        trace.cleanup.reject(sampledEperm);
+        trace.calls.push("prior-generic-stop-rejected");
+        await eventually(() => expect(nativeState).toEqual({ stopFailed: true, stopPending: false }));
+        expect(sampledFailures[0]).toBe(sampledEperm);
+        expect(sampledFailures[0]).toMatchObject({ code: "EPERM" });
+        expect(original.lostContact!()).toBeUndefined();
+        expect(original.stopDebt!()).toBeUndefined();
+        expect(first.debt).toBeUndefined();
+      }
+      await observe();
+      expect(first.unsampledScope).toBe(true);
+      expect(trace.calls).not.toContain("terminal-scope-cleanup-attempt");
+      expect(trace.events()).toEqual([]);
+      expect(settled).toBe(false);
+      expect(settlements).toEqual([]);
+      expect(handles).toEqual([original]);
+      expect(original.closed).toBe(closed);
+      expect(original.treeClosed).toBe(treeClosed);
+      expect(workers.size).toBe(1);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+      if (!rejected) expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+      noStopIntent();
+
+      if (rejected) {
+        const marker = path.join(runDirectory, "unresolved-worker.json");
+        await eventually(() => expect(fs.existsSync(marker)).toBe(true));
+        if (realEperm) {
+          // Qualification, not a sleep or the already-existing EPERM marker:
+          // listForUi uses the monitor's populated projection, not status()'s
+          // disk refresh. The new drain-wrapper reason is emitted only AFTER
+          // terminal #drainExecution rejects. Both the first guarded stop branch
+          // and #stopUnregisteredTransport's wrapped stop must refuse another
+          // TERM; skipping only the former is insufficient. A fixed refusal
+          // still reaches this witness without calling the transport again.
+          await vi.waitFor(() => {
+            expect(f.agents.listForUi().find(record => record.id === first!.launch.id)).toMatchObject({
+              id: first!.launch.id, status, text: "new genuine terminal answer", turns: 2, toolCalls: 1,
+            });
+            const retained = JSON.parse(fs.readFileSync(marker, "utf8"));
+            expect(retained).toMatchObject({ runId: first!.launch.id,
+              reason: expect.stringContaining("execution exit unconfirmed; custody retained") });
+            terminalDrainReason = retained.reason;
+          }, { timeout: nativeJoinBoundMs + 5_000, interval: 20 });
+          trace.calls.push("terminal-monitor-reread-and-drain-qualified");
+          const ordered = ["sampled-TERM", "new-genuine-result", "prior-generic-native-delivered",
+            "prior-generic-stop-rejected", "prior-generic-stop-concluded", "terminal-monitor-reread-and-drain-qualified"]
+            .map(call => trace.calls.indexOf(call));
+          expect(ordered.every((index, i) => index >= 0 && (i === 0 || index > ordered[i - 1]!))).toBe(true);
+          expect(nativeState).toEqual({ stopFailed: true, stopPending: false });
+          expect(original.lostContact!()).toBeUndefined();
+          expect(original.stopDebt!()).toBeUndefined();
+          expect(first.debt).toBeUndefined();
+          expect(capturedNativeClosed).toBe(true);
+          expect(f.agents.workerIdentity(first.launch.id)).toMatchObject({ pid: identity!.pid, startTime: identity!.startTime, open: false });
+          expect(JSON.parse(fs.readFileSync(first.statusFile, "utf8"))).toMatchObject({
+            id: first.launch.id, status, text: "new genuine terminal answer", turns: 2, toolCalls: 1, exitCode: 0,
+          });
+        } else expect(first.debt).toBe("recorded sampled EPERM stop debt");
+        // Repeat the exact native notification and leave BOTH sampled/unsampled
+        // custody outstanding until fixture teardown. No rejected-stop upgrade.
+        first.nativeClose();
+        await observe();
+        expect(trace.calls).not.toContain("terminal-scope-cleanup-attempt");
+        expect(trace.calls).not.toContain("scope-kill-write");
+        expect(trace.events()).toEqual([]);
+        expect(first.unsampledScope).toBe(true);
+        expect(first.descendants).toBe(true);
+        expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+        expect(settled).toBe(false);
+        expect(settlements).toEqual([]);
+        expect(handles).toEqual([original]);
+        expect(workers.size).toBe(1);
+        expect(queueEvidence(f, actor.id)).toEqual(before);
+        expect(f.actors.status(actor.id).inFlightRun?.id).toBe(first.launch.id);
+        noStopIntent();
+        console.info("P2 prior generic stop rejected evidence", JSON.stringify({ rejection, calls: trace.calls,
+          admission: snapshot(f), debt: first.debt, nativeState, sampledFailures: sampledFailures.map(error =>
+            error instanceof Error ? { message: error.message, code: Object.getOwnPropertyDescriptor(error, "code")?.value } : error),
+          stopSnapshots, capturedNativeClosed, terminalDrainReason }));
+        // All custody/cleanup refusals above must hold independently of raw RUN:
+        // host-primary-gone may release RUN, never this actor's execution/FIFO.
+        expect(trace.calls.filter(call => call === "sampled-TERM"), "rejected sampled EPERM must not trigger a SECOND TERM").toHaveLength(1);
+        expect(stopSnapshots, "no SECOND transport.stop on the original handle").toHaveLength(1);
+        expect(trace.calls.filter(call => call === "prior-generic-stop-concluded")).toHaveLength(1);
+        expect(sampledFailures).toEqual([sampledEperm]);
+        return;
+      }
+
+      trace.cleanup.resolve();
+      await eventually(() => expect(trace.calls).toContain("scope-kill-write"));
+      expect(first.descendants).toBe(false);
+      expect(first.unsampledScope).toBe(false);
+      expect(first.primaryProofScans).toBeGreaterThan(0);
+      expect(f.agents.workerIdentity(first.launch.id)).toMatchObject({ pid: identity!.pid, startTime: identity!.startTime, open: false });
+      const ordered = ["sampled-TERM", "new-genuine-result", "prior-generic-native-delivered",
+        "scope-stop-joined", "prior-generic-stop-concluded", "terminal-scope-cleanup-attempt", "scope.cleanup", "scope-kill-write"]
+        .map(call => trace.calls.indexOf(call));
+      expect(ordered.every((index, i) => index >= 0 && (i === 0 || index > ordered[i - 1]!))).toBe(true);
+      await observe(); // One cleanup ACK/native close still cannot substitute for treeClosed.
+      expect(settled).toBe(false);
+      expect(settlements).toEqual([]);
+      expect(workers.size).toBe(1);
+      expect(handles).toEqual([original]);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+      expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+      expect(trace.events()).toEqual([{ type: "scope.cleanup", id: first.launch.id, ts: expect.any(Number),
+        members: [{ pid: trace.daemonPid(), comm: "fixturedaemon" }], note: "shared per-user services may be interrupted" }]);
+      trace.tree.resolve();
+      await expect(result).resolves.toMatchObject({ id: first.launch.id, status, text: "new genuine terminal answer",
+        ...(status === "failed" ? { error: "Permanent worker task failure" } : {}) });
+      await drainTwoSameActorSuccessors(f, actor.id, first, settlements);
+      expect(stopSnapshots).toHaveLength(1);
+      expect(trace.calls.filter(call => call === "sampled-TERM")).toHaveLength(1);
+      expect(trace.calls.filter(call => call === "terminal-scope-cleanup-attempt")).toHaveLength(1);
+      expect(trace.calls.filter(call => call === "scope-kill-write")).toHaveLength(1);
+      expect(trace.events()).toHaveLength(1);
+      expect(handles).toHaveLength(3); // Original plus exactly two FIFO successors, never a replacement.
+      console.info("P2 prior generic stop rejoin evidence", JSON.stringify({ status, calls: trace.calls, settlements: settlements.map(value => ({ id: value.id, status: value.status })) }));
+    } finally {
+      trace.drain();
+      if (first) complete(first);
+      Object.defineProperty(process, "platform", platform);
+    }
+  }, 30_000);
+
+  it.each(["nonterminal", "mismatched", "live", "EPERM", "unknown-birth", "no-capability"] as const)(
+    "P2 custody refuses unsampled cleanup for %s and retains the same-actor fence (#16970)", async mode => {
+      const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+      // Hold the mismatched record at the existing rejected-monitor boundary:
+      // normal HEAD settlement otherwise captures its forged id through teardown.
+      const trace = scopedExitReceipts(mode === "mismatched", false, mode !== "no-capability");
+      const settlements: AgentRunResult[] = [];
+      const f = fixture(result => { settlements.push(result); });
+      let first: Worker | undefined;
+      try {
+        Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+        const actor = await create(f, `terminal-authority-${mode}`);
+        await f.actors.tell(actor.id, "one fenced event with a never-sampled daemon");
+        first = await launched(f, actor.id);
+        await f.actors.tell(actor.id, "scope successor one");
+        await eventually(() => expect(f.actors.status(actor.id).queued).toBe(1));
+        const before = queueEvidence(f, actor.id);
+        let settled = false;
+        void f.agents.wait(first.launch.id).then(() => { settled = true; });
+        first.alive = false;
+        first.unsampledScope = true;
+        if (["live", "EPERM", "unknown-birth"].includes(mode)) first.identityAlive = true;
+        if (mode === "EPERM") first.probeError = "EPERM";
+        if (mode === "unknown-birth") delete first.birth;
+        if (mode !== "nonterminal") save(first, { status: "completed", text: "do not publish yet", turns: 2,
+          ...(mode === "mismatched" ? { id: "worker-forged-other-run", sessionId: String(claimedGonePid) } : {}),
+          finishedAt: Date.now(), updatedAt: Date.now(), exitCode: 0 });
+        trace.cleanup.resolve();
+        first.nativeClose();
+        if (mode === "mismatched") {
+          await eventually(() => expect(trace.calls).toContain("monitor-held"));
+          trace.monitor.reject(new Error("recorded mismatched terminal monitor rejection"));
+          await eventually(() => expect(fs.existsSync(path.join(path.dirname(first!.statusFile), "unresolved-worker.json"))).toBe(true));
+        }
+        if (mode !== "nonterminal" && mode !== "mismatched") {
+          await eventually(() => expect(trace.calls).toContain("native-stop-closed"));
+        }
+        await observe();
+        expect(first.unsampledScope, "ordinary stop must not erase the unsampled counterexample").toBe(true);
+        expect(trace.calls).not.toContain("terminal-scope-cleanup-attempt");
+        expect(trace.events()).toEqual([]);
+        expect(settled).toBe(false);
+        expect(settlements).toEqual([]);
+        expect(workers.size).toBe(1);
+        expect(queueEvidence(f, actor.id)).toEqual(before);
+        expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+      } finally {
+        // Restore the fixture-owned id before delivering teardown receipts. This
+        // is not a worker result or cleanup permission used by any assertion.
+        if (first) { save(first, { id: first.launch.id }); complete(first); }
+        trace.drain();
+        Object.defineProperty(process, "platform", platform);
+      }
+    }, 15_000,
+  );
+
+  it("P2 custody N3 delayed native receipt after rejected stop phase never starts cleanup (#16970)", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const trace = scopedExitReceipts();
+    const settlements: AgentRunResult[] = [];
+    const f = fixture(result => { settlements.push(result); });
+    let first: Worker | undefined;
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+      const actor = await create(f, "rejected-phase-late-native");
+      await f.actors.tell(actor.id, "terminal result precedes a failed sampled stop");
+      first = await launched(f, actor.id);
+      await f.actors.tell(actor.id, "scope successor one");
+      await eventually(() => expect(f.actors.status(actor.id).queued).toBe(1));
+      const before = queueEvidence(f, actor.id);
+      first.descendants = true;
+      first.unsampledScope = true;
+      save(first, { status: "completed", text: "original terminal answer", turns: 2,
+        finishedAt: Date.now(), updatedAt: Date.now(), exitCode: 0 });
+      await eventually(() => expect(trace.calls).toContain("sampled-TERM"));
+      trace.cleanup.reject(new Error("recorded sampled EPERM stop rejection"));
+      const marker = path.join(path.dirname(first.statusFile), "unresolved-worker.json");
+      await eventually(() => {
+        expect(fs.existsSync(marker)).toBe(true);
+        expect(JSON.parse(fs.readFileSync(marker, "utf8")).reason).toContain("recorded sampled EPERM");
+      });
+      first.alive = false;
+      first.descendants = false;
+      first.nativeClose(); // Positive close only AFTER the stop phase concluded/rejected.
+      await observe();
+      first.nativeClose();
+      await observe();
+      expect(trace.calls).not.toContain("terminal-scope-cleanup-attempt");
+      expect(trace.events()).toEqual([]);
+      expect(first.unsampledScope).toBe(true);
+      expect(settlements).toEqual([]);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+      expect(workers.size).toBe(1);
+    } finally {
+      trace.drain();
+      if (first) complete(first);
+      Object.defineProperty(process, "platform", platform);
+    }
+  }, 15_000);
 
   it("Windows normal terminal result publishes with a surviving descendant but retains admission until checked native exit without scope-stop or replay (#16970)", async () => {
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;

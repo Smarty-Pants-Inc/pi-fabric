@@ -4,6 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
 import type {
+  AgentScopeCleanupRecord,
   AgentTransportAdapter,
   AgentTransportHandle,
   AgentTransportLaunch,
@@ -402,9 +403,35 @@ export class ProcessTransport implements AgentTransportAdapter {
     } : process.env;
     const executable = slice && process.platform === "linux" ? findExecutableStrict("systemd-run", backendEnvironment) : undefined;
     if (this.processSlice && process.platform === "linux" && !executable) this.#warnScope("systemd-run unavailable");
-    const scope: { executable: string; slice: string; warn: (reason: string) => void; memoryMaxBytes?: number } | undefined =
+    // Capture the host-selected sink independently of Placement. No sink means
+    // passive scope custody only, never a reconstructed log/cleanup capability.
+    let cleanupLog: ((entry: Omit<AgentScopeCleanupRecord, "id" | "ts">) => void) | undefined;
+    if (executable && slice && !capEligible) {
+      let log: string | undefined;
+      for (let index = 0; index < request.workerArguments.length; index += 2) {
+        if (request.workerArguments[index] === "--log-file") log = request.workerArguments[index + 1];
+      }
+      const sink = log;
+      const id = request.id;
+      if (sink) cleanupLog = entry => {
+        const record: AgentScopeCleanupRecord = { ...entry, id, ts: Date.now(), members: [...entry.members] };
+        // JSON escapes C0/ESC; also escape C1 and Unicode line separators so a
+        // hostile comm cannot inject terminal controls into the JSONL stream.
+        const serialize = (): string => JSON.stringify(record).replace(/[\u007f-\u009f\u2028\u2029]/g,
+          character => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+        let line = serialize();
+        while (Buffer.byteLength(line + "\n") > 8 * 1024 && record.members.length) {
+          record.members.pop();
+          record.truncated = true;
+          line = serialize();
+        }
+        if (Buffer.byteLength(line + "\n") > 8 * 1024) throw new Error("Scope cleanup log envelope exceeds its bound");
+        fs.appendFileSync(sink, line + "\n", { mode: 0o600 });
+      };
+    }
+    const scope: { executable: string; slice: string; warn: (reason: string) => void; memoryMaxBytes?: number; cleanupLog?: (entry: Omit<AgentScopeCleanupRecord, "id" | "ts">) => void } | undefined =
       executable && slice
-        ? { executable, slice, warn: this.#warnScope, ...(capEligible ? { memoryMaxBytes: this.#memoryMaxBytes } : {}) }
+        ? { executable, slice, warn: this.#warnScope, ...(capEligible ? { memoryMaxBytes: this.#memoryMaxBytes } : {}), ...(cleanupLog ? { cleanupLog } : {}) }
         : undefined;
     const selected = selectWorkerRelease(request.workerPath);
     const workerArguments = [...request.workerArguments];
@@ -474,6 +501,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       closed: processHandle.closed,
       ...(processHandle.primaryExit ? { primaryExit: processHandle.primaryExit } : {}),
       ...(processHandle.treeClosed ? { treeClosed: processHandle.treeClosed } : {}),
+      ...(processHandle.terminalScopeCleanup ? { terminalScopeCleanup: processHandle.terminalScopeCleanup } : {}),
       stop: processHandle.stop,
     };
   }

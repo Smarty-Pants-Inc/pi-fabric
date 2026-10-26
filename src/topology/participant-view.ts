@@ -42,6 +42,8 @@ export interface KvParticipantDirectoryOptions {
   rootId: string;
   /** Bounds each KV operation, including reconciliation and best-effort cleanup. */
   operationTimeoutMs?: number;
+  /** Independent refresh jitter samples; defaults to Math.random. */
+  random?: () => number;
   onError?: (error: unknown) => void;
 }
 
@@ -569,9 +571,12 @@ export class KvParticipantDirectory implements ParticipantView {
     void result.finally(() => { if (this.#writes.get(key) === result) this.#writes.delete(key); }).catch(() => undefined);
     return result;
   }
+  #refreshDelay(): number {
+    return KV_PRESENCE_REFRESH_MS * 0.8 + KV_PRESENCE_REFRESH_MS * 0.4 * (this.options.random ?? Math.random)();
+  }
   #remember(key: string, record: FabricParticipantRecord, revision: number): KvPresencePublication {
     const now = performance.now();
-    this.#owned.set(key, { record, revision, writtenAt: now, refreshAt: now + KV_PRESENCE_REFRESH_MS });
+    this.#owned.set(key, { record, revision, writtenAt: now, refreshAt: now + this.#refreshDelay() });
     this.#armRefresh();
     return { key, revision, rollback: () => this.#serial(key, () => this.#removeRevision(key, revision)) };
   }
@@ -713,7 +718,9 @@ export class KvParticipantDirectory implements ParticipantView {
   }
 
   #armRefresh(): void {
-    if (this.#closed || this.#timer || this.#refreshPass || this.#owned.size === 0) return;
+    if (this.#closed || this.#refreshPass || this.#owned.size === 0) return;
+    // A later publication may sample an earlier deadline than the currently armed row.
+    if (this.#timer) clearTimeout(this.#timer);
     const due = Math.min(...[...this.#owned.values()].map(owned => owned.refreshAt));
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
@@ -722,7 +729,7 @@ export class KvParticipantDirectory implements ParticipantView {
     this.#timer.unref?.();
   }
 
-  /** One deadline per owned row, three minutes after its last successful change/refresh. */
+  /** Independent deadlines per row: successes spread over 144–216 s; failed retries stay at or below 180 s. */
   refreshOwned(): Promise<void> {
     if (this.#refreshPass) return this.#refreshPass;
     try { this.#assertWritable(); } catch (error) { return Promise.reject(error); }
@@ -734,8 +741,9 @@ export class KvParticipantDirectory implements ParticipantView {
         const revision = await this.#update(key, owned.record, owned.revision);
         this.#admitted(key, owned.record, revision);
       } catch (error) {
-        // A failed automatic refresh is not a hot-loop retry or a successful-write receipt.
-        if (this.#owned.get(key) === owned) owned.refreshAt = performance.now() + KV_PRESENCE_REFRESH_MS;
+        // A failed refresh is not a successful-write receipt. Keep its fresh jitter sample,
+        // but never grow the old 180 s retry ceiling toward the 600 s presence TTL.
+        if (this.#owned.get(key) === owned) owned.refreshAt = performance.now() + Math.min(KV_PRESENCE_REFRESH_MS, this.#refreshDelay());
         throw error;
       }
     }))).then(results => {

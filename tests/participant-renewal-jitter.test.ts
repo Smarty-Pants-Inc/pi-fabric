@@ -9,7 +9,7 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import { LIVENESS_POLICY_KEY, readHostLeaseCurrent, TransportHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
-import { TransportUnavailableError, type FabricTransport } from "../src/transport/types.js";
+import { TransportUnavailableError, TransportUncertainError, type FabricTransport } from "../src/transport/types.js";
 import { hKey, kvWorld, pKey } from "./helpers/bridge-nats-kv.js";
 
 // Keep: #6477's synchronized renewals and the admission failure path. Real directory,
@@ -54,6 +54,7 @@ async function nats(id: string, random: () => number, live?: () => boolean, reco
   const renewals: number[] = [];
   let renewalDelay = 0;
   const renewalPlan: Array<{ delay: number; fail?: boolean }> = [];
+  const fault = { down: false, presenceDelay: 0, sampleSourceTime: false };
   const transport: FabricTransport = { ...base,
     onVerifiedReconnect(listener) {
       listeners.add(listener);
@@ -61,10 +62,27 @@ async function nats(id: string, random: () => number, live?: () => boolean, reco
       return () => { listeners.delete(listener); };
     },
     kv(bucket) {
-      if (bucket === "presence") return presenceKv;
-      if (bucket !== "leases") return base.kv(bucket);
-      return { ttlMs: leases.ttlMs, get: leases.get.bind(leases), delete: leases.delete.bind(leases), watch: leases.watch.bind(leases),
+      if (bucket === "presence") return {
+        ttlMs: presenceKv.ttlMs, delete: presenceKv.delete.bind(presenceKv), watch: presenceKv.watch.bind(presenceKv),
+        async get(key, signal) {
+          if (fault.down) throw new TransportUnavailableError("disconnected presence read");
+          return presenceKv.get(key, signal);
+        },
         async put(key, owner, value, revision, signal) {
+          if (fault.down) throw new TransportUnavailableError("disconnected before presence write");
+          if (fault.presenceDelay) await new Promise<void>(resolve => setTimeout(resolve, fault.presenceDelay));
+          if (fault.down) throw new TransportUncertainError(key, { owner, value });
+          return presenceKv.put(key, owner, value, revision, signal);
+        },
+      };
+      if (bucket !== "leases") return base.kv(bucket);
+      return { ttlMs: leases.ttlMs, delete: leases.delete.bind(leases), watch: leases.watch.bind(leases),
+        async get(key, signal) {
+          if (fault.down) throw new TransportUnavailableError("disconnected lease read");
+          return leases.get(key, signal);
+        },
+        async put(key, owner, value, revision, signal) {
+          if (fault.down) throw new TransportUnavailableError("disconnected lease write");
           if (revision > 0) {
             renewals.push(Date.now());
             const step = renewalPlan.shift();
@@ -83,9 +101,10 @@ async function nats(id: string, random: () => number, live?: () => boolean, reco
     reapDeadHosts: false, ...(live ? { live } : {}) });
   directories.push(directory);
   const rootRecord = record(id);
-  directory.registerSource(() => [rootRecord]);
+  directory.registerSource(() => fault.sampleSourceTime
+    ? [{ ...rootRecord, startedAt: Date.now(), updatedAt: Date.now() }] : [rootRecord]);
   await directory.start();
-  return { directory, world, renewals, rootRecord, presenceKv,
+  return { directory, world, renewals, rootRecord, presenceKv, fault,
     reconnect() { for (const listener of listeners) listener(); },
     delayRenewal(ms: number) { renewalDelay = ms; },
     planRenewals(...steps: Array<{ delay: number; fail?: boolean }>) { renewalPlan.push(...steps); },
@@ -114,6 +133,29 @@ async function expectContinuedAdmission(f: Awaited<ReturnType<typeof nats>>) {
 
 // Native local successor proof requires /proc. FILE coverage runs on every platform.
 describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", () => {
+  // Keep: the real restart test regenerates startedAt on every snapshot. Jitter makes
+  // an ordinary presence CAS cross the broker stop where base's 5s write has settled.
+  it("P1-a: recovers an uncertain in-flight heartbeat after a full broker lease expiry", async () => {
+    clock();
+    const f = await nats("restart-receipt-loss", () => 1);
+    f.fault.sampleSourceTime = true;
+    await vi.advanceTimersByTimeAsync(5_500);
+    f.fault.presenceDelay = 200;
+    await vi.advanceTimersByTimeAsync(600); // The jittered 6s presence write is awaiting its PubAck.
+    f.fault.down = true;
+    f.world.presence.gap(); f.world.leases.gap();
+    await vi.advanceTimersByTimeAsync(17_000);
+    f.world.leases.expire(hKey("machine-a", f.rootRecord.id));
+    f.fault.down = false; f.fault.presenceDelay = 0;
+    f.world.presence.resnapshot(); f.world.leases.resnapshot();
+    f.reconnect();
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(f.directory.canConsumeMesh()).toBe(true);
+    await expect(f.directory.refresh()).resolves.toBeUndefined();
+    expect(f.directory.participantView?.resolve(f.rootRecord.id)?.live).toBe(true);
+    expect(f.presence().value).toMatchObject({ ownerIncarnation: f.directory.ownerIncarnation, startedAt: Date.now() });
+  });
+
   it("samples the low and high heartbeat bounds anew on every arm", async () => {
     clock();
     let sample = 0;

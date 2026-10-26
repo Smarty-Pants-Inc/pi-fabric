@@ -166,6 +166,7 @@ export function leaseValue(entry: TransportKvEntry<unknown>): FabricKvHostLease 
 }
 
 type OwnedPresence = { record: FabricParticipantRecord; revision: number; writtenAt: number; refreshAt: number };
+type PendingPresenceCleanup = { record: FabricParticipantRecord; previous?: OwnedPresence };
 type PresenceWaiter = { id: string; changed(): void; fail(error: unknown): void };
 
 /**
@@ -182,7 +183,7 @@ export class KvParticipantDirectory implements ParticipantView {
   readonly #presenceRevisions = new Map<string, number>();
   readonly #leaseRevisions = new Map<string, number>();
   readonly #owned = new Map<string, OwnedPresence>();
-  readonly #pendingCleanup = new Map<string, FabricParticipantRecord>();
+  readonly #pendingCleanup = new Map<string, PendingPresenceCleanup>();
   readonly #writes = new Map<string, Promise<unknown>>();
   readonly #waiters = new Set<PresenceWaiter>();
   readonly #timeoutMs: number;
@@ -710,9 +711,9 @@ export class KvParticipantDirectory implements ParticipantView {
         const current = await this.#presence.get(key, this.#signal());
         if (current && this.#same(current, record)) return current.revision;
       } catch (readError) { this.#report(readError); }
-      // Never allow a later refresh to adopt an unknown CAS revision.
-      this.#owned.delete(key);
-      this.#queueCleanup(key, record);
+      // Retire the CAS receipt while the outcome is unknown, but retain its exact
+      // confirmed predecessor for reconciliation. Never adopt a read revision.
+      this.#queueCleanup(key, record, this.#owned.get(key));
       throw error;
     }
   }
@@ -780,8 +781,10 @@ export class KvParticipantDirectory implements ParticipantView {
     });
   }
 
-  #queueCleanup(key: string, record: FabricParticipantRecord): void {
-    this.#pendingCleanup.set(key, record);
+  #queueCleanup(key: string, record: FabricParticipantRecord, previous?: OwnedPresence): void {
+    // A confirmed write that outlived its lease also invalidates the older receipt.
+    this.#owned.delete(key);
+    this.#pendingCleanup.set(key, { record, ...(previous ? { previous } : {}) });
     this.#requestCleanup();
   }
   #requestCleanup(): void {
@@ -797,16 +800,27 @@ export class KvParticipantDirectory implements ParticipantView {
   }
 
   /** Event-driven reconnect cleanup; the parent may also call once after transport recovery.
-   * Unavailable reads retain the intent. Once readable, at most one exact-record CAS delete is attempted. */
+   * Unavailable reads retain the intent. Restore only an exact confirmed predecessor receipt;
+   * otherwise attempt at most one exact-record CAS delete, never adopting an unknown revision. */
   async reconcilePendingCleanup(): Promise<void> {
-    await Promise.all([...this.#pendingCleanup].map(([key, record]) => this.#serial(key, async () => {
-      if (this.#pendingCleanup.get(key) !== record) return;
+    await Promise.all([...this.#pendingCleanup].map(([key, intent]) => this.#serial(key, async () => {
+      if (this.#pendingCleanup.get(key) !== intent) return;
+      const { record, previous } = intent;
       let current: TransportKvEntry<unknown> | undefined;
       try { current = await this.#presence.get(key, this.#signal(true)); }
       catch (error) { this.#report(error); return; }
       if (!current) return; // A delayed uncertain write may still appear on the watch.
       this.#pendingCleanup.delete(key);
-      if (!this.#same(current, record)) return;
+      const confirmed = previous && current.revision === previous.revision && this.#same(current, previous.record);
+      if (confirmed && !this.#closed) {
+        // The uncertain update did not replace this exact confirmed revision. A late
+        // write still has to win its original CAS; no unknown revision is authority.
+        this.#owned.set(key, previous);
+        this.#armRefresh();
+        return;
+      }
+      // Close withdraws a confirmed predecessor too; it must not restore ownership.
+      if (!confirmed && !this.#same(current, record)) return;
       try { await this.#presence.delete(key, current.revision, this.#signal(true)); }
       catch (error) { this.#report(error); } // One eventual attempt, never an unfenced retry.
     })));

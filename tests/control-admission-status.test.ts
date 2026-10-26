@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
+import { createHash } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agents/manager.js";
@@ -15,7 +16,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { readHostLeases } from "../src/topology/host-leases.js";
-import { ParticipantDirectory, type ParticipantDirectoryOptions } from "../src/topology/participant-directory.js";
+import { ParticipantDirectory, type ParticipantDirectoryOptions, type ParticipantSnapshotSource } from "../src/topology/participant-directory.js";
 import { kvWorld } from "./helpers/bridge-nats-kv.js";
 import { takeMainPublicationFence } from "../src/topology/main-publication-fence.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
@@ -42,8 +43,10 @@ const fixture = (options: Partial<ParticipantDirectoryOptions> = {}) => {
   });
   directories.push(directory);
   let failure: Error | undefined;
+  let rootPresent = true;
   directory.registerSource((): FabricParticipantRecord[] => {
     if (failure) throw failure;
+    if (!rootPresent) return [];
     return [{ format: 1, id: identity.id, kind: "root", rootId: identity.id,
       ownerHostId: identity.id, ownerIdentityId: identity.id, name: "Main",
       status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp", "fabric"],
@@ -62,7 +65,8 @@ const fixture = (options: Partial<ParticipantDirectoryOptions> = {}) => {
   const status = (id = "main") => provider.invoke("status", { id }, invocation);
   const alarms = () => mesh.read({ topic: "ops.owner", limit: 100 })
     .filter(event => event.kind === "fabric.control-admission.alarm");
-  return { directory, mesh, identity, status, alarms, fail: (error?: Error) => { failure = error; } };
+  return { directory, mesh, identity, status, alarms, fail: (error?: Error) => { failure = error; },
+    rootPresent: (value: boolean) => { rootPresent = value; } };
 };
 
 describe("Main agents.status exposes effective control admission (#17018)", () => {
@@ -248,7 +252,7 @@ describe("host control-admission alarm on the existing heartbeat (#17018)", () =
   });
 });
 
-const registerIsolated = (directory: ParticipantDirectory, source: () => FabricParticipantRecord[]) =>
+const registerIsolated = (directory: ParticipantDirectory, source: ParticipantSnapshotSource) =>
   directory.registerSource(source, { isolateErrors: true });
 
 describe("explicit operational snapshot isolation, never root/publication isolation (#17018 requirement 3)", () => {
@@ -298,9 +302,9 @@ describe("explicit operational snapshot isolation, never root/publication isolat
   it("deduplicates isolated source diagnostics and rearms them after source recovery", async () => {
     const s = fixture();
     const warning = vi.spyOn(diagnostics, "warn");
-    let broken = true;
+    let broken = true, attempt = 0;
     const remove = registerIsolated(s.directory, () => {
-      if (broken) throw new Error("isolated diagnostic episode");
+      if (broken) throw new Error(`isolated diagnostic episode ${++attempt}`);
       return [];
     });
     const count = () => warning.mock.calls.filter(args => args.some(value => String(value).includes("isolated diagnostic episode"))).length;
@@ -322,6 +326,15 @@ describe("explicit operational snapshot isolation, never root/publication isolat
     s.directory.registerSource(() => { throw new Error("default operational source failed"); });
     await expect(s.directory.refresh()).rejects.toThrow("default operational source failed");
     expect(s.directory.canConsumeMesh()).toBe(false);
+  });
+
+  it("keeps per-item failure reports fatal when the source did not opt in", async () => {
+    const s = fixture();
+    const failure = new Error("non-isolated item authorization failed");
+    s.directory.registerSource(reportFailure => { reportFailure(failure, "actor:one"); return []; });
+    await expect(s.directory.refresh()).rejects.toBe(failure);
+    expect(s.directory.canConsumeMesh()).toBe(false);
+    expect(s.directory.isolatedSourceFailures()).toEqual([]);
   });
 
   it("never catches actor renewal authorization outside an isolated source callback", async () => {
@@ -369,6 +382,112 @@ describe("explicit operational snapshot isolation, never root/publication isolat
   });
 });
 
+describe("isolated source diagnostics are local health, not admission authority (#17018 audit P2-1)", () => {
+  it("reports source/since/fixed reason while admitted; alarms strictly after 60s, clears and rearms", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const s = fixture();
+    let broken = true, attempt = 0;
+    const secret = "RAW_SOURCE_DETAIL_MUST_STAY_LOCAL";
+    const warnings = vi.spyOn(diagnostics, "warn");
+    s.directory.registerSource(reportFailure => {
+      if (broken) reportFailure(new Error(`${secret} ${++attempt}`), "actor:one");
+      return [];
+    }, { isolateErrors: true, name: "actors" });
+    const since = Date.now();
+    await s.directory.refresh();
+    await s.directory.refresh();
+    const expected = { source: "actors", since, reason: "participant snapshot source failed", participantId: "actor:one" };
+    for (const id of ["main", ROOT]) await expect(s.status(id)).resolves.toMatchObject({
+      controlAdmission: "admitted", isolatedSourceFailures: [expected],
+    });
+    expect(warnings.mock.calls.filter(args => String(args).includes(secret))).toHaveLength(1);
+    const alarms = () => s.mesh.read({ topic: "ops.owner", limit: 100 }).filter(event => event.kind === "fabric.participant-source.alarm");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(alarms()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(alarms()).toHaveLength(1));
+    expect(alarms()[0]).toMatchObject({ to: ROOT, from: { id: ROOT }, data: { ...expected, hostId: ROOT, rootId: ROOT } });
+    expect(JSON.stringify(alarms())).not.toContain(secret);
+    expect(s.alarms()).toHaveLength(0); // No control-admission alarm for operational health.
+    expect(s.directory.canConsumeMesh()).toBe(true);
+    broken = false;
+    await s.directory.refresh();
+    await expect(s.status()).resolves.toMatchObject({ controlAdmission: "admitted", isolatedSourceFailures: [] });
+    broken = true;
+    const secondSince = Date.now();
+    await s.directory.refresh();
+    await vi.advanceTimersByTimeAsync(60_001);
+    await vi.waitFor(() => expect(alarms()).toHaveLength(2));
+    expect(alarms()[1]!.data).toMatchObject({ since: secondSince });
+    expect(alarms()[1]!.dedupeKey).not.toBe(alarms()[0]!.dedupeKey);
+    expect(warnings.mock.calls.filter(args => String(args).includes(secret))).toHaveLength(2);
+  });
+
+  it("keeps sources independent, clears only recovered diagnostics, and bounds the local array", async () => {
+    const s = fixture();
+    let firstBroken = true;
+    s.directory.registerSource(() => { if (firstBroken) throw new Error("first"); return []; }, { isolateErrors: true, name: "first" });
+    const remove = s.directory.registerSource(() => { throw new Error("second"); }, { isolateErrors: true, name: "second" });
+    await s.directory.refresh();
+    expect(s.directory.isolatedSourceFailures().map(failure => failure.source)).toEqual(["first", "second"]);
+    firstBroken = false;
+    await s.directory.refresh();
+    expect(s.directory.isolatedSourceFailures().map(failure => failure.source)).toEqual(["second"]);
+    remove();
+    expect(s.directory.isolatedSourceFailures()).toEqual([]);
+    vi.spyOn(diagnostics, "warn").mockImplementation(() => {});
+    for (let i = 0; i < 101; i++) s.directory.registerSource(() => { throw new Error("outage"); }, { isolateErrors: true, name: `source-${i}` });
+    await s.directory.refresh();
+    expect(s.directory.isolatedSourceFailures()).toHaveLength(100);
+    expect(s.directory.canConsumeMesh()).toBe(true);
+  });
+
+  it.each(["close", "suspend", "quiesce", "unregister", "recover"] as const)("cancels pending isolated-source threshold publication on %s", async action => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const s = fixture();
+    let broken = true;
+    const remove = s.directory.registerSource(() => { if (broken) throw new Error("pending failure"); return []; }, { isolateErrors: true, name: "actors" });
+    await s.directory.refresh();
+    if (action === "close") await s.directory.close();
+    else if (action === "suspend") s.directory.suspend();
+    else if (action === "quiesce") await s.directory.quiesce();
+    else if (action === "unregister") remove();
+    else { broken = false; await s.directory.refresh(); }
+    await vi.advanceTimersByTimeAsync(60_001);
+    expect(s.mesh.read({ topic: "ops.owner", limit: 100 }).filter(event => event.kind === "fabric.participant-source.alarm")).toHaveLength(0);
+  });
+});
+
+it("never lets a stale root erase lineage death proof; the actual current owner can resume", async () => {
+  const s = fixture();
+  // Construct before the current owner claims: this stale activation has no successor grant.
+  const stale = new ParticipantDirectory(s.mesh, { ...s.directory.options });
+  directories.push(stale);
+  stale.registerSource(() => [{ format: 1, id: ROOT, kind: "root", rootId: ROOT,
+    ownerHostId: ROOT, ownerIdentityId: ROOT, name: "stale root", status: "idle", runner: "pi", transport: "host",
+    capabilities: ["steer", "followUp"], startedAt: 1, updatedAt: Date.now(), controlProtocol: "v1" }]);
+  registerIsolated(stale, () => { throw new Error("unrelated operational failure"); });
+  await s.directory.refresh();
+  s.rootPresent(false);
+  await s.directory.refresh();
+  const key = "topology/lineage-closures/" + createHash("sha256").update(ROOT).digest("hex");
+  await s.mesh.put({ key, identity: s.identity, value: { format: 1, rootId: ROOT, ownerHostId: ROOT,
+    ownerIdentityId: ROOT, closedAt: Date.now() } });
+  const proof = s.mesh.get(key, { fresh: true });
+  expect(s.directory.lineageAlive(ROOT)).toBe(false);
+  await expect(stale.resumeLineage()).rejects.toMatchObject({ code: "FABRIC_HOST_LEASE_SUPERSEDED" });
+  await expect(stale.refresh()).rejects.toMatchObject({ code: "FABRIC_HOST_LEASE_SUPERSEDED" });
+  expect(stale.canConsumeMesh()).toBe(false);
+  expect(s.mesh.get(key, { fresh: true })).toEqual(proof);
+  expect(s.directory.get(ROOT)).toBeUndefined();
+  // A valid current owner reactivates through refresh -> resumeLineage -> fenced proof removal.
+  s.rootPresent(true);
+  await s.directory.refresh();
+  expect(s.mesh.get(key, { fresh: true })).toBeUndefined();
+  expect(s.directory.get(ROOT)).toMatchObject({ kind: "root", stale: false });
+  expect(s.directory.canConsumeMesh()).toBe(true);
+});
+
 // Keep: carrier-specific trust/failure paths. The real NATS directory/lease/view
 // run against the existing KV/CAS/watch fixture; no broker or native worker is launched.
 const natsFixture = async () => {
@@ -379,7 +498,7 @@ const natsFixture = async () => {
   return { ...s, world };
 };
 
-describe.skipIf(process.platform !== "linux")("NATS control admission preserves native gate semantics (#17018)", () => {
+describe("NATS control admission preserves native gate semantics (#17018)", () => {
   it("isolates only opted-in callbacks, removes their old records, and leaves a default refresh error non-gating", async () => {
     const s = await natsFixture();
     let broken = false;
@@ -400,6 +519,34 @@ describe.skipIf(process.platform !== "linux")("NATS control admission preserves 
     // NATS admission is lease/view/recovery based, not refreshError based.
     expect(s.directory.canConsumeMesh()).toBe(true);
     await expect(s.status()).resolves.toMatchObject({ controlAdmission: "admitted" });
+  });
+
+  it("reports and alarms an isolated source while the real NATS lease keeps control admitted", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const epoch = Date.now();
+    vi.spyOn(performance, "now").mockImplementation(() => Date.now() - epoch);
+    const s = await natsFixture();
+    let broken = true;
+    s.directory.registerSource(reportFailure => {
+      if (broken) reportFailure(new Error("NATS private item detail"), "actor:nats-failed");
+      return [];
+    }, { isolateErrors: true, name: "actors" });
+    const since = Date.now();
+    await s.directory.refresh();
+    const expected = { source: "actors", since, reason: "participant snapshot source failed", participantId: "actor:nats-failed" };
+    await expect(s.status()).resolves.toMatchObject({ controlAdmission: "admitted", isolatedSourceFailures: [expected] });
+    const alarms = () => s.mesh.read({ topic: "ops.owner", limit: 100 }).filter(event => event.kind === "fabric.participant-source.alarm");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(alarms()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(alarms()).toHaveLength(1));
+    expect(alarms()[0]!.data).toMatchObject(expected);
+    expect(JSON.stringify(alarms())).not.toContain("NATS private item detail");
+    expect(s.alarms()).toHaveLength(0);
+    expect(s.directory.canConsumeMesh()).toBe(true);
+    broken = false;
+    await s.directory.refresh();
+    await expect(s.status()).resolves.toMatchObject({ controlAdmission: "admitted", isolatedSourceFailures: [] });
   });
 
   it("alarms once after terminal transport loss disarms the heartbeat", async () => {

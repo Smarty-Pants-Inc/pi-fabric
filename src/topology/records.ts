@@ -15,10 +15,6 @@ export const SETTLED_AGENT_PUBLISH_MS = 60 * 60 * 1000;
 
 type AgentParticipantInput = AgentPresenceInfo | AgentRunRecord | AgentHandleInfo;
 
-const isAgentRunRecord = (
-  record: AgentParticipantInput,
-): record is AgentRunRecord => "usage" in record;
-
 export const agentParticipantRecords = (
   records: AgentParticipantInput[],
   rootId: string,
@@ -36,7 +32,7 @@ export const agentParticipantRecords = (
     const observedAt = firstSeen.get(record.id) ?? Date.now();
     firstSeen.set(record.id, observedAt);
     const metadata = "startedAt" in record ? record : undefined;
-    const run = isAgentRunRecord(record) ? record : undefined;
+    const progress = "usage" in record ? record : undefined;
     const parent = record.actorId ?? semanticParentId;
     if (record.actorId) return;
     const settledAt = metadata?.finishedAt ?? metadata?.updatedAt ?? observedAt;
@@ -76,8 +72,8 @@ export const agentParticipantRecords = (
       updatedAt: metadata?.updatedAt ?? observedAt,
       ...(metadata?.finishedAt !== undefined ? { finishedAt: metadata.finishedAt } : {}),
       ...(record.finalAnswerReceipt ? { finalAnswerReceiptId: record.finalAnswerReceipt.id } : {}),
-      ...(run?.currentTool ? { currentTool: run.currentTool } : {}),
-      ...(run ? { turns: run.turns, toolCalls: run.toolCalls, usage: { ...run.usage } } : {}),
+      ...(progress?.currentTool ? { currentTool: progress.currentTool } : {}),
+      ...(progress ? { turns: progress.turns, toolCalls: progress.toolCalls, usage: { ...progress.usage } } : {}),
       controlProtocol: "v1",
     });
   };

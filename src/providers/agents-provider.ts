@@ -1124,6 +1124,7 @@ export class AgentsProvider implements FabricProvider {
           if (this.mainAgent.local) return {
             ...this.mainAgent.info(context.extensionContext),
             ...this.participants.controlAdmission?.(),
+            ...(this.participants.isolatedSourceFailures ? { isolatedSourceFailures: this.participants.isolatedSourceFailures() } : {}),
           };
           const root = await this.#router.resolveParticipantFresh(this.mainAgent.id, context.signal);
           if (!root) throw this.participants.writeStalled?.() ?? unknownParticipant(this.participants, this.mainAgent.id, "Fabric Main participant");

@@ -7,7 +7,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { readHostLeases } from "../src/topology/host-leases.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { ParticipantDirectory, type ParticipantSnapshotSource } from "../src/topology/participant-directory.js";
 import { fakeManagerHeapWorker } from "./fixtures/manager-heap-probe.js";
 
 // Keep reason: smarty-dev#17018, a recorded cross-component trust-boundary failure.
@@ -76,9 +76,13 @@ const runtimeFixture = async () => {
     residentHost: path.join(base, "unused.mjs"), skills: base,
   } });
   let directory: ParticipantDirectory | undefined;
+  const sources = new Map<string, ParticipantSnapshotSource>();
   const registerSource = ParticipantDirectory.prototype.registerSource;
   vi.spyOn(ParticipantDirectory.prototype, "registerSource").mockImplementation(function (this: ParticipantDirectory, source, options) {
-    if (this.options.hostId === ownerId) directory = this;
+    if (this.options.hostId === ownerId) {
+      directory = this;
+      if (options?.name) sources.set(options.name, source);
+    }
     return registerSource.call(this, source, options); // Preserve real sources AND their isolation policy.
   });
   let control: FabricControlPlane | undefined;
@@ -104,7 +108,7 @@ const runtimeFixture = async () => {
     cwd: base, signal: undefined, parentToolCallId: "17018", nestedToolCallId: "agents.status",
     extensionContext: liveContext, update() {}, approve: async () => {}, audits: [], maxResultChars: 100_000,
   });
-  return { base, meshRoot, runRoot, ownerId, runtime, manager, directory: directory!, control: control!, sendMessage, status,
+  return { base, meshRoot, runRoot, ownerId, runtime, manager, directory: directory!, control: control!, sendMessage, status, sources,
     dispose: () => { disposed = true; }, rebind: () => runtime.bindLifecycle(liveContext, () => true) };
 };
 
@@ -288,6 +292,127 @@ it("the real runtime isolates only independent task/actor/provider source faults
   // canConsumeMesh starts real recovery on a fatal FILE refresh. Drain any selection made before restore.
   await observe(() => directory.refresh());
   await assertHealthy();
+}, 30_000);
+
+it.each(["project", "session"] as const)("one %s actor's strict preparing-result fault preserves healthy actors, reports its id, and recovers (#17018 P2-1)", async (scope) => {
+  const { base, runRoot, ownerId, runtime, manager, directory, control, status, sources, sendMessage } = await runtimeFixture();
+  const deferred = () => {
+    let resolve!: () => void;
+    const promise = new Promise<void>(done => { resolve = done; });
+    return { promise, resolve };
+  };
+  const blockerExit = deferred(), queued = deferred(), terminal = deferred(), handoff = deferred();
+  let blockerAlive = true;
+  vi.mocked(ProcessTransport.prototype.launch).mockImplementation(request => fakeManagerHeapWorker(request, 0, false,
+    request.name === "hold actor permit" ? {
+      closed: blockerExit.promise, alive: () => blockerAlive,
+      stop: async () => { blockerAlive = false; blockerExit.resolve(); },
+    } : undefined));
+  const actors = runtime.actors;
+  const damaged = await actors.create({ name: "damaged preparing actor", instructions: "Reply.", responseMode: "text",
+    transport: "process", scope });
+  const healthy = await actors.create({ name: "healthy peer actor", instructions: "Wait.", scope });
+  const otherScope = await actors.create({ name: "healthy other-scope actor", instructions: "Wait.", scope: scope === "project" ? "session" : "project" });
+  const blocker = await manager.spawn({ name: "hold actor permit", task: "hold the only permit", transport: "process", extensions: false });
+  let activationId: string | undefined;
+  const run = manager.run;
+  // Make the brief stale-preparing window deterministic: defer delivery of native
+  // launch notifications and the result to this actor, NOT execution/settlement.
+  // onQueued is real; the same actual queued run then completes and authenticates
+  // its own manager-result.json. No actor private fields or synthetic records.
+  const delayed = vi.spyOn(manager, "run").mockImplementation(async function (this: AgentManager, ...args) {
+    if (args[0].actorId !== damaged.id) return run.apply(this, args);
+    const [request, signal, onSpawned, authorize, downgrade, onQueued, preparation] = args;
+    if (!preparation) throw new Error("Actor activation must supply launch preparation options");
+    const notifications: Array<() => void> = [];
+    const result = await run.call(this, request, signal,
+      handle => { notifications.push(() => onSpawned?.(handle)); }, authorize, downgrade,
+      handle => { activationId = handle.id; onQueued?.(handle); queued.resolve(); },
+      { ...preparation, onPreparing: () => { notifications.push(() => preparation?.onPreparing?.()); } });
+    terminal.resolve();
+    await handoff.promise;
+    for (const notify of notifications) notify();
+    return result;
+  });
+  const activation = actors.ask(damaged.id, "complete this real queued activation");
+  // Attach the observer immediately so a failing test cannot leak a rejection.
+  const outcome = observe(() => activation);
+  cleanup.push(async () => {
+    blockerAlive = false; blockerExit.resolve(); handoff.resolve();
+    await outcome;
+  });
+  try {
+    await queued.promise;
+    expect(activationId).toBeTypeOf("string");
+    expect(actors.status(damaged.id)).toMatchObject({ status: "waiting", preparing: { runId: activationId } });
+    blockerAlive = false; blockerExit.resolve();
+    await expect(manager.wait(blocker.id)).resolves.toMatchObject({ status: "completed" });
+    await terminal.promise;
+    expect(manager.isSettled(activationId!)).toBe(true);
+    expect(actors.status(damaged.id)).toMatchObject({ preparing: { runId: activationId } });
+    await directory.refresh();
+    for (const actor of [damaged, healthy, otherScope]) expect(directory.get(actor.id, undefined, { fresh: true }))
+      .toMatchObject({ id: actor.id, kind: "actor" });
+    expect([...sources.keys()].sort()).toEqual(["actors", "agents", "providers"]);
+
+    const resultFile = path.join(runRoot, activationId!, "manager-result.json");
+    const bytes = fs.readFileSync(resultFile);
+    const preserved = path.join(base, "preserved-actor-result.json");
+    expect(fs.statSync(resultFile).nlink).toBe(1);
+    fs.linkSync(resultFile, preserved);
+    expect(fs.statSync(resultFile).nlink).toBe(2);
+    expect(fs.readFileSync(resultFile)).toEqual(bytes);
+    const strictError = (await observe(() => actors.listOwned(true))).error;
+    expect(strictError).toMatchObject({ code: "FABRIC_MISSING_RESULT" });
+    expect((await observe(() => actors.listOwned())).error).toEqual(strictError);
+    expect((await observe(() => actors.list())).error).toEqual(strictError);
+    expect((await observe(() => actors.status(damaged.id))).error).toEqual(strictError);
+    const reportFailure = vi.fn();
+    const records = sources.get("actors")!(reportFailure);
+    expect(records.map(record => record.id).sort()).toEqual([healthy.id, otherScope.id].sort());
+    expect(reportFailure).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ code: "FABRIC_MISSING_RESULT" }), damaged.id);
+    await expect(directory.refresh()).resolves.toBeUndefined();
+    expect(directory.isolatedSourceFailures()).toContainEqual({ source: "actors", participantId: damaged.id,
+      reason: "participant snapshot source failed", since: expect.any(Number) });
+    expect(directory.get(damaged.id, undefined, { fresh: true })).toBeUndefined();
+    for (const actor of [healthy, otherScope]) expect(directory.get(actor.id, undefined, { fresh: true }))
+      .toMatchObject({ id: actor.id, kind: "actor" });
+    expect(directory.get(ownerId, undefined, { fresh: true })).toMatchObject({ id: ownerId, kind: "root" });
+    expect(control.options.canConsumeMesh?.()).toBe(true);
+    await expect(status()).resolves.toMatchObject({ controlAdmission: "admitted" });
+    const senderId = "session:actor-integrity-observer";
+    const sender = new FabricControlPlane(runtime.mesh, { id: senderId, name: "observer", kind: "main" },
+      { enabled: true, hostId: senderId, pollMs: 20, acknowledgementTimeoutMs: 1_000 });
+    sender.start(() => ({ accepted: false }));
+    cleanup.push(() => sender.close());
+    const root = directory.get(ownerId, undefined, { fresh: true })!;
+    await expect(sender.request(root.ownerHostId, root.id, "followUp", {
+      message: "control survives one damaged actor", ownerIncarnation: root.ownerIncarnation, triggerTurn: false,
+    }, root.ownerIdentityId, { routedRemoteHost: null, timeoutMs: 1_000, idempotencyKey: `17018-actor-${scope}` }))
+      .resolves.toMatchObject({ acknowledged: true });
+    expect(sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+      content: expect.stringContaining("control survives one damaged actor"),
+    }), expect.objectContaining({ deliverAs: "followUp", triggerTurn: false }));
+    expect((await observe(() => manager.status(activationId!))).error).toEqual(strictError);
+    // Recovery is actor lifecycle progress, NOT unlink/rewrite of an authenticated
+    // file (unlink cannot restore ctime). Native archival may then retire its handle.
+    handoff.resolve();
+    expect((await outcome).error).toBeNull();
+    expect(actors.status(damaged.id)).not.toHaveProperty("preparing");
+    await directory.refresh();
+    expect(directory.get(damaged.id, undefined, { fresh: true })).toMatchObject({ id: damaged.id, kind: "actor" });
+    expect(directory.isolatedSourceFailures()).toEqual([]);
+    reportFailure.mockClear();
+    expect(sources.get("actors")!(reportFailure).map(record => record.id)).toContain(damaged.id);
+    expect(reportFailure).not.toHaveBeenCalled();
+    // Archival can report Unknown instead of MISSING_RESULT after consumption,
+    // but must never make an unauthenticated result readable again.
+    expect(await observe(() => manager.status(activationId!))).toMatchObject({ value: undefined, error: expect.any(Object) });
+  } finally {
+    blockerAlive = false; blockerExit.resolve(); handoff.resolve();
+    await outcome;
+    delayed.mockRestore();
+  }
 }, 30_000);
 
 it("local Main status includes the real runtime's disposed-binding gate even with a confirmed FILE directory", async () => {

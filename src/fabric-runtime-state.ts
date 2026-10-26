@@ -1743,7 +1743,7 @@ export class FabricRuntimeState {
           identity.id,
           firstSeenAgents,
         ),
-        { isolateErrors: true },
+        { isolateErrors: true, name: "agents" },
       );
     };
     // FILE keeps source registration before start. NATS waits for native recovery.
@@ -1762,18 +1762,18 @@ export class FabricRuntimeState {
       registerMainSource();
       registerAgentSource();
     }
-    this.#participants.registerSource(() =>
-      (transport ? actors : this.#actors!).listOwned(true).map((actor) =>
+    this.#participants.registerSource((reportFailure) =>
+      (transport ? actors : this.#actors!).listOwned(true, (id, error) => reportFailure(error, id)).map((actor) =>
         actorParticipantRecord(actor, mainAgentId, hostId, identity.id, identity.id),
       ),
-      { isolateErrors: true },
+      { isolateErrors: true, name: "actors" },
     );
     (transport ? agents : this.#agents).subscribeUi(() => (transport ? participants : this.#participants)?.scheduleRefresh());
     (transport ? actors : this.#actors).subscribe(() => (transport ? participants : this.#participants)?.scheduleRefresh());
     let routeOwner: { client: import("./jev/client.js").JevClient; signal: AbortSignal; pending: Set<Promise<unknown>> } | undefined;
     const providerParticipants = this.#providerParticipants;
     this.#participants.registerSource(() =>
-      providerParticipants.records(mainAgentId, hostId, identity.id), { isolateErrors: true });
+      providerParticipants.records(mainAgentId, hostId, identity.id), { isolateErrors: true, name: "providers" });
     providerParticipants.subscribe(() => (transport ? participants : this.#participants)?.scheduleRefresh());
     const agentsProvider = new AgentsProvider(
       this.#agents,

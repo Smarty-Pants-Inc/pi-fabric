@@ -151,14 +151,14 @@ const waitForResultWithProgress = <T>(
   });
 
 const actorWorker = (
-  manager: Pick<AgentManager, "list">,
+  manager: Pick<AgentManager, "listForUi">,
   actorId: string,
   includeTerminal: boolean,
-): ReturnType<AgentManager["list"]>[number] | undefined => {
-  const candidates = manager.list().filter((candidate) => candidate.actorId === actorId);
+): ReturnType<AgentManager["listForUi"]>[number] | undefined => {
+  const candidates = manager.listForUi().filter((candidate) => candidate.actorId === actorId);
   const active = candidates.find((candidate) => candidate.status === "running" || candidate.status === "finishing");
   if (active || !includeTerminal) return active;
-  // AgentManager.list() preserves run insertion order; the last actor run
+  // AgentManager.listForUi() preserves selected run insertion order; the last actor run
   // is therefore the terminal snapshot for the ask that just settled.
   return candidates.at(-1);
 };
@@ -228,7 +228,7 @@ export const waitWithProgress = async (
 };
 
 export const waitWithActorProgress = async (
-  manager: Pick<AgentManager, "list">,
+  manager: Pick<AgentManager, "listForUi">,
   transcripts: Pick<AgentTranscriptReader, "read">,
   actorId: string,
   actorName: string,

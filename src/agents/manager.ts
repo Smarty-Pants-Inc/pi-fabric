@@ -921,7 +921,7 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   questionDecisionId?: string;
   /** Fixed-size lifecycle facts survive preview eviction, independently of result authentication. */
   presence: Pick<AgentPresenceInfo, "status" | "startedAt" | "updatedAt" | "finishedAt" | "finishingAt" |
-    "model" | "thinking" | "runnerSessionId">;
+    "model" | "thinking" | "runnerSessionId" | "currentTool">;
   latestRecord?: AgentRunRecord;
   latestUiRecord?: AgentRunRecord;
   /** Keep the full completion only while its terminal-result save needs retrying. */
@@ -4622,12 +4622,6 @@ export class AgentManager {
   #observeProgress(managed: ManagedAgent, record: AgentRunRecord): void {
     this.#observePresence(managed, record);
     this.#observeAdmissionStatus(managed.id, record);
-    const seen = managed.observedProgress;
-    if (record.turns > seen.turns) seen.turns = record.turns;
-    if (record.toolCalls > seen.toolCalls) seen.toolCalls = record.toolCalls;
-    for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const) {
-      if (record.usage[key] > seen.usage[key]) seen.usage[key] = record.usage[key];
-    }
   }
 
   status(id: string): AgentRunRecord | AgentHandleInfo {
@@ -4668,7 +4662,20 @@ export class AgentManager {
   }
 
   list(): Array<AgentRunRecord | AgentHandleInfo> {
-    return [...this.#runs.keys(), ...this.#queued.keys()].map((id) => this.status(id));
+    return [
+      ...[...this.#runs.values()].map(managed => {
+        try { return this.status(managed.id); }
+        catch (error) { return this.#resultReadErrorHandle(managed, error); }
+      }),
+      ...[...this.#queued.keys()].map(id => this.status(id)),
+    ];
+  }
+
+  /** Presentation failure only: preserve lifecycle/custody and never synthesize a result. */
+  #resultReadErrorHandle(managed: ManagedAgent, error: unknown): AgentHandleInfo {
+    const code = (error as { code?: unknown } | null)?.code;
+    return { ...this.#handleInfo(managed, this.#presenceInfo(managed).status),
+      error: `${typeof code === "string" ? uiText(code, 80) : "FABRIC_RESULT_READ_ERROR"}: result unavailable or unauthenticated (authentication/integrity failure): ${uiText(error instanceof Error ? error.message : String(error), 1_024)}` };
   }
 
   /** Result-free, I/O-free projection of retained manager ownership, including active native-close debts.
@@ -4680,6 +4687,8 @@ export class AgentManager {
       const info = queued.info, terminal = queued.terminal;
       records.push({
         ...this.#presenceMetadata(info),
+        turns: terminal?.turns ?? 0, toolCalls: terminal?.toolCalls ?? 0,
+        usage: terminal ? { ...terminal.usage } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
         status: terminal?.status ?? info.status,
         startedAt: terminal?.startedAt ?? queued.enqueuedAt,
         updatedAt: terminal?.updatedAt ?? queued.enqueuedAt,
@@ -4707,9 +4716,7 @@ export class AgentManager {
       catch (error) {
         // A result authentication/rehydration failure is local to this task, never a
         // fabricated failed run or a reason to lose the rest of the dashboard.
-        const code = (error as { code?: unknown } | null)?.code;
-        return { ...this.#handleInfo(managed, this.#presenceInfo(managed).status),
-          error: `${typeof code === "string" ? uiText(code, 80) : "FABRIC_RESULT_READ_ERROR"}: result unavailable or unauthenticated (authentication/integrity failure): ${uiText(error instanceof Error ? error.message : String(error), 1_024)}` };
+        return this.#resultReadErrorHandle(managed, error);
       }
     };
     const projectResult = (managed: ManagedAgent): AgentRunRecord | AgentHandleInfo => {
@@ -8147,6 +8154,14 @@ export class AgentManager {
   }
 
   #observePresence(managed: ManagedAgent, record: AgentRunRecord): void {
+    // Retain only fixed-size observed counters, even when the detailed preview is
+    // evicted. Status and settlement observations also close gaps between polls.
+    const seen = managed.observedProgress;
+    if (record.turns > seen.turns) seen.turns = record.turns;
+    if (record.toolCalls > seen.toolCalls) seen.toolCalls = record.toolCalls;
+    for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const) {
+      if (record.usage[key] > seen.usage[key]) seen.usage[key] = record.usage[key];
+    }
     const model = record.model ?? managed.presence.model;
     const thinking = record.thinking ?? managed.presence.thinking;
     const runnerSessionId = record.runnerSessionId ?? managed.presence.runnerSessionId;
@@ -8159,11 +8174,12 @@ export class AgentManager {
       ...(model ? { model } : {}),
       ...(thinking ? { thinking } : {}),
       ...(runnerSessionId ? { runnerSessionId } : {}),
+      ...(record.currentTool ? { currentTool: uiText(record.currentTool, 256) } : {}),
     };
   }
 
   /** Explicit whitelist: adding a result/diagnostic field to a handle must not enlarge presence. */
-  #presenceMetadata(info: AgentHandleInfo): Omit<AgentPresenceInfo, "startedAt" | "updatedAt"> {
+  #presenceMetadata(info: AgentHandleInfo): Omit<AgentPresenceInfo, "startedAt" | "updatedAt" | "turns" | "toolCalls" | "usage"> {
     return {
       id: info.id, name: info.name, status: info.status, runner: info.runner, transport: info.transport, cwd: info.cwd,
       ...(info.kernel ? { kernel: info.kernel } : {}),
@@ -8210,6 +8226,8 @@ export class AgentManager {
       ...(managed.branch ? { branch: managed.branch } : {}),
       ...(managed.worktree ? { worktree: managed.worktree } : {}),
       ...(finishing ? { ...pending, status: "finishing" as const } : observed),
+      turns: managed.observedProgress.turns, toolCalls: managed.observedProgress.toolCalls,
+      usage: { ...managed.observedProgress.usage },
       ...(managed.finalAnswer ? { finalAnswerReceipt: { id: managed.finalAnswer.id, recordedAt: managed.finalAnswer.recordedAt } } : {}),
       ...(managed.mainAgentId ? { mainAgentId: managed.mainAgentId } : {}),
       ...(managed.fabricSessionId ? { fabricSessionId: managed.fabricSessionId } : {}),

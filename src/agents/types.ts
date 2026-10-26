@@ -398,8 +398,8 @@ export interface AgentRunResult extends AgentRunRecord {
   status: "completed" | "failed" | "stopped" | "timed_out";
 }
 
-/** Detached operational metadata for task presence. No result, prompt, counters or usage;
- * available from manager memory even when the authenticated result is unreadable. */
+/** Detached operational metadata and bounded observed progress for task presence.
+ * No result/prompt payload or I/O; available even when the authenticated result is unreadable. */
 export interface AgentPresenceInfo extends Pick<AgentRunRecord,
   "id" | "name" | "status" | "runner" | "kernel" | "transport" | "cwd" |
   "startedAt" | "updatedAt" | "finishedAt" | "finishingAt" | "finalAnswerReceipt" |
@@ -407,6 +407,7 @@ export interface AgentPresenceInfo extends Pick<AgentRunRecord,
   "capabilityRequirements" | "capabilityDigest" | "recursive" | "residency" |
   "sessionId" | "runnerSessionId" | "mainAgentId" | "fabricSessionId" |
   "attachCommand" | "branch" | "worktree" | "queuePosition" |
+  "turns" | "toolCalls" | "usage" | "currentTool" |
   "placementRunId" | "placementKind" | "placementHost" | "expectedSeconds"> {}
 
 export interface AgentHandleInfo {

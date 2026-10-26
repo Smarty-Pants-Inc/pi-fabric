@@ -975,10 +975,10 @@ export class ResidentHost {
           this.config.rootId,
           firstSeenAgents,
         ),
-        { isolateErrors: true },
+        { isolateErrors: true, name: "agents" },
       );
-      this.participants.registerSource(() =>
-        this.actors.listOwned(true).map((actor) =>
+      this.participants.registerSource((reportFailure) =>
+        this.actors.listOwned(true, (id, error) => reportFailure(error, id)).map((actor) =>
           actorParticipantRecord(
             actor,
             this.config.rootId,
@@ -987,7 +987,7 @@ export class ResidentHost {
             this.config.rootId,
           ),
         ),
-        { isolateErrors: true },
+        { isolateErrors: true, name: "actors" },
       );
       this.agents.subscribeUi(() => { this.participants.scheduleRefresh(); this.#scheduleIdleCheck(); });
       this.actors.subscribe(() => this.participants.scheduleRefresh());

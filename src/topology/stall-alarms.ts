@@ -9,7 +9,7 @@ import { processStartTime, residentProcessAlive } from "../residency/process-ide
 import { bridgeLeaseAlarms } from "./bridge-alarms.js";
 import type { HeldAgentMessage, MainAgentController } from "../main-agent.js";
 import type { MeshIdentity, MeshStore } from "../mesh/store.js";
-import type { FabricParticipantInfo, FabricParticipantSource } from "./types.js";
+import type { FabricIsolatedSourceFailure, FabricParticipantInfo, FabricParticipantSource } from "./types.js";
 
 export interface StallAlarmOptions {
   rootPresenceAlarmMs: number;
@@ -240,6 +240,18 @@ export const controlAdmissionAlarm = async (mesh: MeshStore, identity: MeshIdent
     dedupeKey: incident.dedupeKey,
     text: `Control admission for ${rootId} gated since ${new Date(incident.since).toISOString()}: ${incident.reason}`,
     data: { rootId, hostId, controlAdmission: "gated", since: incident.since, reason: incident.reason } });
+};
+
+/** An operational source outage is host health, not a control-admission gate. */
+export const isolatedParticipantSourceAlarm = async (mesh: MeshStore, identity: MeshIdentity, rootId: string,
+  hostId: string, incident: FabricIsolatedSourceFailure & { dedupeKey: string }): Promise<void> => {
+  const to = admissionAlarmRecipient(rootId, undefined);
+  if (!to) return;
+  const { source, since, reason, participantId } = incident;
+  await mesh.publish({ topic: "ops.owner", kind: "fabric.participant-source.alarm", from: identity, to,
+    dedupeKey: incident.dedupeKey,
+    text: `Participant source ${source} on ${hostId} failed since ${new Date(since).toISOString()}: ${reason}`,
+    data: { rootId, hostId, source, since, reason, ...(participantId ? { participantId } : {}) } });
 };
 
 /** The mesh envelope of an AgentManager alarm. A named run's failed recovery save is an ops.owner `actor.alarm`

@@ -746,7 +746,8 @@ const main = async (): Promise<void> => {
       PI_FABRIC_TERMINAL_TASK: persistentPiTask && piRetrySdk ? "1" : "",
       PI_FABRIC_TASK_RESUMING: persistentPiTask && taskResuming ? "1" : "",
       // Own run only, never the shared parent/nested run root.
-      PI_FABRIC_AGENT_RUN_DIR: path.dirname(options.statusFile),
+      PI_FABRIC_AGENT_RUN_DIR: fs.realpathSync(path.dirname(options.statusFile)),
+      PI_FABRIC_RUN_IDENTITY: path.join(fs.realpathSync(path.dirname(options.statusFile)), "run-identity.json"),
       PI_FABRIC_DEPTH: String(options.depth),
       PI_FABRIC_PARENT_RUN: options.id,
       // A child Fabric intersects its own thinking.bounds with these.

@@ -7,7 +7,7 @@ import { ActorManager } from "../src/actors/manager.js";
 import { ActorLogStore } from "../src/actors/log-store.js";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
-import type { AgentRunRecord, AgentTransportLaunch } from "../src/agents/types.js";
+import type { AgentRunRecord, AgentRunResult, AgentTransportLaunch } from "../src/agents/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import * as processIdentity from "../src/residency/process-identity.js";
@@ -23,6 +23,7 @@ const observe = () => new Promise(resolve => setTimeout(resolve, 1_500));
 const deletionCalls: string[] = [];
 const fixtures: Fixture[] = [];
 const fixtureRoots: string[] = [];
+const receiptDrains: Array<() => void> = [];
 const workers = new Map<number, Worker>();
 const claimedGonePid = 899_999_999;
 let nextPid = 900_000_000;
@@ -61,6 +62,7 @@ beforeEach(() => {
   workers.clear();
   fixtureRoots.length = 0;
   deletionCalls.length = 0;
+  receiptDrains.length = 0;
   for (const key of ["PI_FABRIC_DEPTH", "PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID",
     "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"]) vi.stubEnv(key, undefined);
   vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
@@ -139,6 +141,9 @@ beforeEach(() => {
 
 afterEach(async () => {
   closing = true;
+  // Release synthetic native/tree joins even when fixture preparation asserts
+  // before a test's try/finally. Never strand custody or contaminate later cases.
+  for (const drain of receiptDrains) drain();
   for (const worker of workers.values()) complete(worker);
   // Keep deletion probes installed until every manager has relinquished custody.
   for (const f of [...fixtures].reverse()) {
@@ -157,7 +162,7 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-function fixture(): Fixture {
+function fixture(onSettled?: (result: AgentRunResult) => void): Fixture {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-permit-watch-"));
   fixtureRoots.push(root); // Constructors can release metadata locks before fixture() returns.
   const admission = path.join(root, "actors", "admission.json");
@@ -165,7 +170,7 @@ function fixture(): Fixture {
     enabled: true, runner: "pi", transport: "process", maxConcurrent: 1, budgetUsd: 0,
     deniedModels: [], timeoutMs: 24 * 60 * 60_000, retainRuns: true, sessionExport: false }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
-    meshRoot: path.join(root, "mesh"), admissionSnapshotPath: admission,
+    meshRoot: path.join(root, "mesh"), admissionSnapshotPath: admission, ...(onSettled ? { onSettled } : {}),
   });
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const identity: MeshIdentity = { id: "session:permit-test", name: "main", kind: "main", sessionId: "permit-test" };
@@ -269,6 +274,126 @@ function joinGate() {
   let reject!: (error: Error) => void;
   const promise = new Promise<void>((done, fail) => { resolve = done; reject = fail; });
   return { promise, resolve, reject };
+}
+
+// Decorate the EXISTING launch fake, not another manager/queue harness. Native
+// close and the admitted scope's tree-empty receipt are independent, as in
+// process-transport.ts. waitForClose joins native close ONLY; scoped stop joins
+// checked cleanup too. No real process, scope, daemon, signal or deletion exists.
+function scopedExitReceipts(rejectMonitor = false) {
+  const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
+  const tree = joinGate(), cleanup = joinGate(), monitor = joinGate();
+  const calls: string[] = [];
+  let firstId: string | undefined;
+  let monitorHeld = false;
+  let nativeDelivered: Promise<void> | undefined;
+  vi.mocked(ProcessTransport.prototype.launch).mockImplementation(async request => {
+    const handle = await launch(request);
+    firstId ??= request.id;
+    if (request.id !== firstId) return handle;
+    const worker = workers.get(Number(handle.sessionId))!;
+    return { ...handle, liveness: "events", treeClosed: tree.promise,
+      waitForClose: async () => {
+        worker.closeStarted = true;
+        calls.push("native-join-started");
+        await handle.closed;
+        worker.closeJoined = true;
+        calls.push("native-joined");
+      },
+      isAlive: async () => {
+        calls.push("scope-probe");
+        if (rejectMonitor && !monitorHeld) {
+          monitorHeld = true;
+          calls.push("monitor-held");
+          // Registered during the monitor's liveness await, AFTER its real
+          // closed callback. This receipt proves that callback was delivered.
+          nativeDelivered = handle.closed!.then(() => { calls.push("native-delivered"); });
+          await monitor.promise;
+        }
+        return handle.isAlive();
+      },
+      stop: async () => {
+        calls.push("scope-stop-started");
+        await cleanup.promise;
+        worker.descendants = false; // Recorded owned-scope cleanup, never a signal.
+        calls.push("scope-cleanup-ack");
+        await handle.stop();
+        await tree.promise; // ACK/path absence is not the checked tree-empty join.
+        calls.push("scope-stop-joined");
+      },
+    };
+  });
+  const drain = () => { monitor.resolve(); cleanup.resolve(); tree.resolve(); };
+  receiptDrains.push(drain);
+  return { tree, cleanup, monitor, calls, nativeDelivered: () => nativeDelivered, drain };
+}
+
+// Real same-actor drain and durable queue restore must consume each activation
+// once. Keep the second successor queued while late old-run events/stop joins
+// exercise the real once-only admission release, not just a promise counter.
+async function drainTwoSameActorSuccessors(
+  f: Fixture, actorId: string, first: Worker, settlements: AgentRunResult[],
+) {
+  await eventually(() => {
+    expect(f.actors.status(actorId).inFlightRun).toBeDefined();
+    expect(f.actors.status(actorId).inFlightRun?.id).not.toBe(first.launch.id);
+  });
+  const second = await launched(f, actorId);
+  expect(second.launch.id).not.toBe(first.launch.id);
+  expect(second.record.task).toContain("scope successor one");
+  expect(workers.size).toBe(2);
+  expect(f.actors.status(actorId).queued).toBe(1);
+  expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+  expect(settlements.filter(result => result.id === first.launch.id)).toHaveLength(1);
+  const firstStatus = f.agents.status(first.launch.id).status;
+  // Same-actor single-flight alone could hide a duplicate raw semaphore release.
+  // Queue an independent admission probe while successor one owns RUN; cancel
+  // its receipt afterwards, without ever creating another worker on the good path.
+  const guard = await create(f, "once-only-admission-probe");
+  const guardAnswer = f.actors.ask(guard.id, "must not launch through a duplicate old RUN release");
+  void guardAnswer.catch(() => undefined);
+  await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
+  const guardRunId = snapshot(f).waiting[0]!.runId;
+  const settledActivations = () => settlements.filter(result => result.id !== guardRunId).map(result => result.id);
+  first.nativeClose(); first.nativeClose();
+  await f.agents.stop(first.launch.id, { consume: false });
+  await f.agents.stop(first.launch.id, { consume: false });
+  await observe();
+  expect(workers.size, "late old-run joins cannot admit the second queued activation").toBe(2);
+  expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+  expect(f.actors.status(actorId).queued).toBe(1);
+  expect(f.agents.status(first.launch.id).status).toBe(firstStatus);
+  expect(settlements.filter(result => result.id === first.launch.id)).toHaveLength(1);
+  expect(snapshot(f).waiting, "old settlement/stop cannot admit the independent guard").toHaveLength(1);
+  await f.actors.stop(guard.id);
+  await eventually(() => expect(snapshot(f).waiting).toEqual([]));
+
+  complete(second);
+  await expect(f.agents.wait(second.launch.id)).resolves.toMatchObject({ status: "completed", text: "finished" });
+  await eventually(() => {
+    expect(f.actors.status(actorId).inFlightRun).toBeDefined();
+    expect(f.actors.status(actorId).inFlightRun?.id).not.toBe(second.launch.id);
+  });
+  const third = await launched(f, actorId);
+  expect(third.launch.id).not.toBe(second.launch.id);
+  expect(third.record.task).toContain("scope successor two");
+  expect(workers.size).toBe(3);
+  complete(third);
+  await expect(f.agents.wait(third.launch.id)).resolves.toMatchObject({ status: "completed", text: "finished" });
+  await eventually(() => {
+    expect(f.actors.inFlightCount()).toBe(0);
+    expect(snapshot(f).held).toEqual([]);
+    expect(snapshot(f).waiting).toEqual([]);
+  });
+  expect(settledActivations()).toEqual([first.launch.id, second.launch.id, third.launch.id]);
+  expect([...workers.values()].filter(worker => worker.record.task === first.record.task)).toHaveLength(1);
+  await f.actors.close();
+  f.actors = f.createActors();
+  await observe();
+  expect(workers.size, "the completed activation must not replay on durable queue restore").toBe(3);
+  expect(f.actors.status(actorId).queued).toBe(0);
+  expect(f.actors.status(actorId).inFlightRun).toBeUndefined();
+  expect(settledActivations()).toEqual([first.launch.id, second.launch.id, third.launch.id]);
 }
 
 // Leave polling, snapshot I/O and vi.waitFor on REAL timers. Only the exact
@@ -1231,6 +1356,168 @@ describe("actor worker permit release (#9031)", () => {
       } finally { Object.defineProperty(process, "platform", platform); }
     }
   });
+
+  it.each(["completed", "failed"] as const)("terminal %s result cleans its surviving scope before settling and drains two same-actor successors without replay (#16970)", async status => {
+    const trace = scopedExitReceipts();
+    const settlements: AgentRunResult[] = [];
+    const f = fixture(result => { settlements.push(result); });
+    const actor = await create(f, "terminal-scope-daemon");
+    await f.actors.tell(actor.id, "unique terminal event with a surviving cache daemon");
+    const first = await launched(f, actor.id);
+    await f.actors.tell(actor.id, "scope successor one");
+    await f.actors.tell(actor.id, "scope successor two");
+    await eventually(() => expect(f.actors.status(actor.id).queued).toBe(2));
+    const before = queueEvidence(f, actor.id);
+    expect(before.items.map(item => item.executionStarted)).toEqual([true, false, false]);
+    let settled = false;
+    const result = f.agents.wait(first.launch.id).then(value => { settled = true; return value; });
+    try {
+      first.alive = false; // Host-owned launch identity now proves primary ESRCH.
+      first.descendants = true; // e.g. op daemon; scope is still populated.
+      save(first, { status, text: "terminal answer", turns: 2, toolCalls: 1,
+        ...(status === "failed" ? { error: "Permanent worker task failure" } : {}),
+        finishedAt: Date.now(), updatedAt: Date.now(), exitCode: status === "completed" ? 0 : 1 });
+      first.nativeClose();
+      await eventually(() => expect(trace.calls, "terminal verdict must reach bounded owned-scope cleanup").toContain("scope-stop-started"));
+      expect(first.primaryProofScans).toBeGreaterThan(0);
+      expect(() => process.kill(first.pid, 0)).toThrow("ESRCH");
+      expect(first.descendants).toBe(true);
+      expect(settled, "a terminal file plus primary close cannot bypass checked cleanup").toBe(false);
+      expect(settlements).toEqual([]);
+      expect(workers.size).toBe(1);
+      expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+
+      trace.cleanup.resolve();
+      await eventually(() => expect(trace.calls).toContain("scope-cleanup-ack"));
+      await observe(); // A stop ACK/scope-like absence still owes captured tree proof.
+      expect(first.descendants).toBe(false);
+      expect(trace.calls).not.toContain("scope-stop-joined");
+      expect(settled).toBe(false);
+      expect(settlements).toEqual([]);
+      expect(workers.size).toBe(1);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+      trace.tree.resolve();
+      await eventually(() => expect(settled, "checked scope exit must settle the terminal activation").toBe(true));
+      await expect(result).resolves.toMatchObject({ id: first.launch.id, status, text: "terminal answer",
+        ...(status === "failed" ? { error: "Permanent worker task failure" } : {}) });
+      expect(trace.calls.filter(call => call === "scope-stop-started")).toHaveLength(1);
+      expect(trace.calls.filter(call => call === "scope-stop-joined")).toHaveLength(1);
+      trace.tree.resolve(); // Duplicate receipt delivery cannot discharge RUN twice.
+      await drainTwoSameActorSuccessors(f, actor.id, first, settlements);
+    } finally {
+      // RED also unblocks a pending checked stop; afterEach completes any fake
+      // successor launched during failure unwinding, with deletion probes intact.
+      trace.drain();
+      complete(first);
+    }
+  }, 20_000);
+
+  it("rejected monitor with native close already delivered settles once on a later checked tree exit and drains two same-actor successors (#16970)", async () => {
+    const trace = scopedExitReceipts(true);
+    trace.cleanup.resolve();
+    const settlements: AgentRunResult[] = [];
+    const f = fixture(result => { settlements.push(result); });
+    const actor = await create(f, "late-tree-after-monitor-failure");
+    await f.actors.tell(actor.id, "unique completed event before monitor rejection");
+    const first = await launched(f, actor.id);
+    await f.actors.tell(actor.id, "scope successor one");
+    await f.actors.tell(actor.id, "scope successor two");
+    await eventually(() => {
+      expect(trace.calls).toContain("monitor-held");
+      expect(f.actors.status(actor.id).queued).toBe(2);
+    });
+    const before = queueEvidence(f, actor.id);
+    let settled = false;
+    const result = f.agents.wait(first.launch.id).then(value => { settled = true; return value; });
+    try {
+      first.alive = false;
+      save(first, { status: "completed", text: "terminal answer", turns: 2, toolCalls: 1,
+        finishedAt: Date.now(), updatedAt: Date.now(), exitCode: 0 });
+      first.nativeClose();
+      await trace.nativeDelivered();
+      expect(trace.calls).toContain("native-delivered");
+      trace.monitor.reject(new Error("recorded monitor liveness rejection after native close"));
+      const marker = path.join(path.dirname(first.statusFile), "unresolved-worker.json");
+      await eventually(() => {
+        expect(fs.existsSync(marker)).toBe(true);
+        expect(JSON.parse(fs.readFileSync(marker, "utf8")).reason).toContain("recorded monitor liveness rejection");
+      });
+      expect(() => process.kill(first.pid, 0)).toThrow("ESRCH");
+      expect(first.descendants).toBe(false); // Scope/path absence is not treeClosed.
+      expect(settled).toBe(false);
+      expect(settlements).toEqual([]);
+      expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+      await observe();
+      const probes = trace.calls.filter(call => call === "scope-probe").length;
+      const primaryScans = first.primaryProofScans;
+      await observe();
+      expect(trace.calls.filter(call => call === "scope-probe"), "failed monitor continuation must be event-driven, not a new liveness loop").toHaveLength(probes);
+      expect(first.primaryProofScans, "no self-rescheduled primary-proof loop").toBe(primaryScans);
+      expect(settled).toBe(false);
+      expect(workers.size).toBe(1);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+
+      // The already-delivered native close cannot wake this failed monitor.
+      // This independent, exact admitted-scope receipt is the ONLY new event.
+      trace.tree.resolve();
+      await eventually(() => expect(settled, "late tree exit must re-drive settlement after monitor rejection").toBe(true));
+      await expect(result).resolves.toMatchObject({ id: first.launch.id, status: "completed", text: "terminal answer" });
+      expect(trace.calls.filter(call => call === "native-delivered")).toHaveLength(1);
+      expect(fs.existsSync(marker), "checked late exit clears unresolved custody").toBe(false);
+      trace.tree.resolve();
+      await drainTwoSameActorSuccessors(f, actor.id, first, settlements);
+    } finally {
+      trace.drain();
+      complete(first);
+    }
+  }, 20_000);
+
+  it.each(["neither", "native-only", "tree-only"] as const)("unconfirmed exit stays fenced with %s captured receipt despite primary and scope absence (#16970)", async receipt => {
+    const trace = scopedExitReceipts(true);
+    trace.cleanup.resolve();
+    const settlements: AgentRunResult[] = [];
+    const f = fixture(result => { settlements.push(result); });
+    const actor = await create(f, "unconfirmed-scope-exit");
+    await f.actors.tell(actor.id, "unconfirmed execution must retain same-session custody");
+    const first = await launched(f, actor.id);
+    await f.actors.tell(actor.id, "same-session successor stays queued");
+    await eventually(() => {
+      expect(trace.calls).toContain("monitor-held");
+      expect(f.actors.status(actor.id).queued).toBe(1);
+    });
+    const before = queueEvidence(f, actor.id);
+    let settled = false;
+    void f.agents.wait(first.launch.id).then(() => { settled = true; });
+    try {
+      first.alive = false;
+      first.descendants = false; // isAlive=false models missing PID AND empty/missing scope.
+      if (receipt === "native-only") {
+        first.nativeClose();
+        await trace.nativeDelivered();
+      }
+      if (receipt === "tree-only") trace.tree.resolve();
+      trace.monitor.reject(new Error("recorded monitor rejection without whole-execution proof"));
+      await eventually(() => expect(fs.existsSync(path.join(path.dirname(first.statusFile), "unresolved-worker.json"))).toBe(true));
+      expect(() => process.kill(first.pid, 0)).toThrow("ESRCH");
+      first.launch.onUnconfirmedExit!("recorded PID and scope absent, exit still unconfirmed");
+      await observe();
+      const probes = trace.calls.filter(call => call === "scope-probe").length;
+      await observe();
+      expect(trace.calls.filter(call => call === "scope-probe"), "missing proof must not start another polling loop").toHaveLength(probes);
+      expect(settled, "PID/scope absence and one receipt cannot certify whole-execution exit").toBe(false);
+      expect(settlements).toEqual([]);
+      expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+      expect(f.actors.status(actor.id).inFlightRun?.id).toBe(first.launch.id);
+      expect(f.actors.status(actor.id).queued).toBe(1);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+      expect(workers.size).toBe(1);
+    } finally {
+      trace.drain();
+      complete(first); // Supply BOTH receipts only for safe fixture teardown.
+    }
+  }, 15_000);
 
   it("lost-contact alive worker retains actual RUN despite forged primary-death claims", async () => {
     const f = fixture();

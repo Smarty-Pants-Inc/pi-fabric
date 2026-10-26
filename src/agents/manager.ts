@@ -1010,6 +1010,11 @@ const terminalWorkerResult = (candidate: AgentRunRecord | undefined): boolean =>
       /Context exceeds window:/i.test(candidate.error ?? "") ||
       (!recoverableStop(candidate) && !transportExitedWithoutResult(candidate.error) && !retryablePiStartupError(candidate.error)));
 
+/** Only this run's genuine completed/failed verdict can authorize actor-scope cleanup. */
+const genuineActorWorkerResult = (candidate: AgentRunRecord | undefined, id: string): candidate is AgentRunRecord & { status: "completed" | "failed" } =>
+  candidate !== undefined && candidate.id === id &&
+    (candidate.status === "completed" || candidate.status === "failed") && terminalWorkerResult(candidate);
+
 const MAX_RESUME_NOTE_CHARS = 2_000;
 
 const setWorkerArgument = (args: string[], name: string, value: string): void => {
@@ -3545,11 +3550,17 @@ export class AgentManager {
           }
           // Ordinary publication and execution custody are independent: a
           // failed drain resolves wait/join without releasing native custody.
-          const candidate = readRecord(managed.statusFile) ?? managed.latestRecord;
-          this.#settle(managed, {
-            ...failedRecord(managed, "failed", String(error)),
-            ...(candidate ?? {}), status: "failed",
-          });
+          const snapshot = readRecord(managed.statusFile) ?? managed.latestRecord;
+          const candidate = managed.actorId && snapshot?.id !== managed.id ? undefined : snapshot;
+          const workerResult = genuineActorWorkerResult(candidate, managed.id) ? candidate : undefined;
+          const result: AgentRunResult = managed.actorId && workerResult
+            ? this.#withTransportMetadata(workerResult, managed) as AgentRunResult
+            : { ...failedRecord(managed, "failed", String(error)), ...(candidate ?? {}), status: "failed" };
+          if (managed.actorId && !managed.executionExited) {
+            this.#continueRejectedActorMonitor(managed, result, workerResult);
+            return;
+          }
+          this.#settle(managed, result);
         });
         const handle = this.#handleInfo(managed, "running");
         this.#emitLifecycle(managed, "run.spawned", Date.now(), { status: "running", data: {
@@ -6973,9 +6984,12 @@ export class AgentManager {
     // Lifecycle close/abort has no durable operator intent, but its own teardown
     // still cannot manufacture a pre-existing actor-loss verdict.
     if ((managed.stopRequested && managed.workerGoneBeforeStop !== managed.transport) || !this.#actorWorkerGone(managed)) return false;
-    // Preserve genuine terminal results; only missing/recoverable transport outcomes become loss.
-    // Like #retryStartup, a window refusal outranks incidental auth/transport diagnostics.
-    if (this.#fenceNativeTerminalAdmission(managed, record)) return false;
+    // A matching genuine completed/failed verdict may clean its remaining owned
+    // scope through the normal bounded drain; the verdict itself is not exit proof.
+    if (genuineActorWorkerResult(record, managed.id)) {
+      this.#fenceNativeTerminalAdmission(managed, record);
+      return false;
+    }
     // Nonterminal primary loss releases only RUN, even while its tree remains live.
     this.#releaseProvenGone();
     // Primary loss is not a stop request: descendants may still own the native
@@ -7005,6 +7019,37 @@ export class AgentManager {
     if (!terminalWorkerResult(joined)) writeRecord(managed.statusFile, result);
     this.#settle(managed, result);
     return true;
+  }
+
+  /** A rejected monitor leaves one exact exit-receipt continuation, never another monitor. */
+  #continueRejectedActorMonitor(managed: ManagedAgent, result: AgentRunResult, workerResult: AgentRunRecord | undefined): void {
+    const transport = managed.transport;
+    const ownProcess = managed.ownProcess;
+    const identity = this.#workerIdentities.get(transport);
+    if (!managed.actorId || transport.kind !== "process" || !transport.closed ||
+        !ownProcess || ownProcess.pid !== identity?.pid) return;
+    const current = (): boolean => this.#runs.get(managed.id) === managed && managed.transport === transport &&
+      managed.ownProcess === ownProcess && !managed.relaunchPending && !managed.launchCancelled && !managed.settled;
+    const check = (): void => {
+      if (!current()) throw new Error("Actor exit receipt belongs to an inactive attempt");
+    };
+    void Promise.all([transport.closed, ...(transport.treeClosed ? [transport.treeClosed] : [])]).then(async () => {
+      if (!current()) return;
+      await managed.executionDrain?.catch(() => undefined);
+      check();
+      await managed.processStop;
+      check();
+      // Full native+tree proof does not depend on the failed liveness observer.
+      // Native-close-only adapters still owe their successful checked tree probe.
+      await this.#noteUnconfirmedExit(managed, transport.treeClosed !== undefined, false, check);
+      if (!current() || !managed.executionExited) return;
+      this.#releaseHeldPermit(managed);
+      await this.#captureWorktree(managed);
+      if (!current()) return;
+      const candidate = workerResult ?? readRecord(managed.statusFile);
+      this.#settle(managed, genuineActorWorkerResult(candidate, managed.id)
+        ? this.#withTransportMetadata(candidate, managed) as AgentRunResult : result);
+    }).catch(() => { /* Failed/stale receipts or stop joins retain the existing custody fence. */ });
   }
 
   async #monitor(managed: ManagedAgent, timeoutMs: number, deadline = Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS): Promise<void> {

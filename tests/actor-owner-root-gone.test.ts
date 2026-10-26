@@ -1,5 +1,5 @@
-// Keep: #12785 real registry/mesh trust boundary and data-safety regression.
-// All history-removal routes below are recorded/throwing seams, never executed.
+// Keep: #12785 registry/mesh trust and data-safety boundary; #16919 reproduces per-heartbeat no-op SQLite cost.
+// Tests use throwaway native fixtures, prove stored terminals/history, and execute no history-removal route.
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -36,9 +36,10 @@ const missingPid = () => {
   }
   throw new Error("No absent PID for fixture");
 };
-const fixture = async (authenticatedSuccessor = true) => {
+type FixtureOptions = { stateBackend?: "file" | "sqlite"; orphanCount?: number; advertisements?: boolean };
+const fixture = async (authenticatedSuccessor = true, options: FixtureOptions = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "owner-root-gone-"));
-  const mesh = new MeshStore(root, 65536, 100);
+  const mesh = new MeshStore(root, 65536, 100, options.stateBackend ? { stateBackend: options.stateBackend } : {});
   const old: MeshIdentity = { id: "session:old", sessionId: "old", kind: "main", name: "same display" };
   const current: MeshIdentity = { id: "session:new", sessionId: "new", kind: "main", name: "same display" };
   const at = Date.now() - 300000;
@@ -46,7 +47,10 @@ const fixture = async (authenticatedSuccessor = true) => {
   const store = new ActorRegistryStore(path.join(root, "actors", "old"));
   const actor = { id, name: "supervisor", rootId: old.id, project: "trusted-project", residency: "session",
     instructions: "Observe only", runner: "pi", status: "running", createdAt: at - 1000, updatedAt: at, messages: [] };
-  store.write([actor]);
+  const orphanCount = Math.max(1, Math.floor(options.orphanCount ?? 1));
+  const actors = Array.from({ length: orphanCount }, (_, index) => index === 0 ? actor :
+    { ...actor, id: index.toString(16).padStart(32, "0"), name: `supervisor-${index}` });
+  store.write(actors);
   const oldOwner = path.join(root, "main-followups", "old.owner.json");
   const newOwner = path.join(root, "main-followups", "new.owner.json");
   // This native receiver operation, not mesh.put, is the launch grant source.
@@ -66,20 +70,24 @@ const fixture = async (authenticatedSuccessor = true) => {
   const legacy = `actors/old/${id}`;
   const clock = vi.spyOn(Date, "now").mockReturnValue(at);
   try {
-    await mesh.put({ identity: old, key: legacy, value: { ...actor, queued: 7, inFlightRun: { id: "run" }, preparing: { id: "prep" } } });
-    await mesh.put({ identity: old, key: keyOf(id), value: { format: 1, id, kind: "actor", rootId: old.id,
-      ownerHostId: old.id, ownerIdentityId: old.id, name: actor.name, runner: "pi", residency: "session", transport: "host",
-      capabilities: ["steer", "followUp", "fabric", "stop"], status: "running", controlProtocol: "v1",
-      startedAt: actor.createdAt, updatedAt: at, actorQueued: 7, actorRun: { id: "run", startedAt: at } } });
-    writeParticipantFile(root, mesh.get(keyOf(id))!);
+    if (options.advertisements !== false) for (const orphan of actors) {
+      await mesh.put({ identity: old, key: `actors/old/${orphan.id}`,
+        value: { ...orphan, queued: 7, inFlightRun: { id: "run" }, preparing: { id: "prep" } } });
+      await mesh.put({ identity: old, key: keyOf(orphan.id), value: { format: 1, id: orphan.id, kind: "actor", rootId: old.id,
+        ownerHostId: old.id, ownerIdentityId: old.id, name: orphan.name, runner: "pi", residency: "session", transport: "host",
+        capabilities: ["steer", "followUp", "fabric", "stop"], status: "running", controlProtocol: "v1",
+        startedAt: orphan.createdAt, updatedAt: at, actorQueued: 7, actorRun: { id: "run", startedAt: at } } });
+      writeParticipantFile(root, mesh.get(keyOf(orphan.id))!);
+    }
   } finally { clock.mockRestore(); }
   const history = path.join(root, "actors", "old", id, "session.jsonl");
   fs.mkdirSync(path.dirname(history), { recursive: true }); fs.writeFileSync(history, "private history sentinel\n");
   const repair = new SessionActorOrphans(mesh, current, "new", path.join(root, "actors"), () => true);
   const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: current.id, rootId: current.id, identity: current,
     reapDeadHosts: false, terminalActor: entry => repair.validateTombstone(entry) });
-  cleanups.push(async () => { await directory.close(); await repair.close(); fs.rmSync(root, { recursive: true, force: true }); });
-  return { root, mesh, old, current, id, actor, store, lease, oldOwner, newOwner, legacy, history, repair, directory };
+  cleanups.push(async () => { await directory.close(); await repair.close(); mesh.closeState(); fs.rmSync(root, { recursive: true, force: true }); });
+  return { root, mesh, old, current, id, orphanIds: actors.map(orphan => orphan.id), actor, store, lease, oldOwner, newOwner,
+    legacy, history, repair, directory };
 };
 
 const observer = (f: Awaited<ReturnType<typeof fixture>>, sessionId: string) => {
@@ -94,6 +102,11 @@ const observer = (f: Awaited<ReturnType<typeof fixture>>, sessionId: string) => 
 const persisted = (f: Awaited<ReturnType<typeof fixture>>) => [f.mesh.get(f.legacy, { fresh: true })!,
   f.mesh.get(keyOf(f.id), { fresh: true })!,
   JSON.parse(fs.readFileSync(path.join(f.root, "participants", `${hash(f.id)}.json`), "utf8"))];
+const persistedFor = (f: Awaited<ReturnType<typeof fixture>>, id: string) => {
+  const file = path.join(f.root, "participants", `${hash(id)}.json`);
+  return [f.mesh.get(`actors/old/${id}`, { fresh: true }), f.mesh.get(keyOf(id), { fresh: true }),
+    fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : undefined];
+};
 
 const invokeContext: FabricInvocationContext = { cwd: process.cwd(), signal: undefined, parentToolCallId: "record-only",
   nestedToolCallId: "record-only", extensionContext: {} as FabricInvocationContext["extensionContext"], update() {}, activity() {} };
@@ -136,6 +149,86 @@ describe("persistent old-root settlement (#12785)", () => {
     } finally { Object.defineProperty(process, "platform", original); }
   });
 
+  it("makes a settled unchanged orphan's next reconcile free of state writes and participant custody", async () => {
+    const f = await fixture();
+    await f.repair.reconcile();
+    const copies = persisted(f), registry = f.store.snapshot().bytes;
+    for (const copy of copies) {
+      expect(f.repair.validateTombstone(copy)).toEqual(copy.value);
+      expect(copy.value).toMatchObject({ status: "stopped", stopReason: "owner-root-gone", capabilities: [] });
+    }
+    const batches = vi.spyOn(f.mesh, "writeBatch");
+    const custody = vi.spyOn(participantFiles, "withParticipantFilesTryLock");
+    expect(await f.repair.reconcile()).toBe(0);
+    expect(batches).not.toHaveBeenCalled();
+    expect(custody).not.toHaveBeenCalled();
+    expect(f.store.snapshot().bytes).toBe(registry);
+    expect(persisted(f)).toEqual(copies);
+    expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
+
+    const retiredResult = { removed: true, retired: true, id: f.id, historyPreserved: true } as const;
+    expect(await f.repair.retire(f.id, () => {})).toEqual(retiredResult);
+    const retiredCopies = persisted(f), retiredRegistry = f.store.snapshot().bytes;
+    expect((f.store.records()[0]!.sessionOrphan as any).directorySettlement).toMatchObject({
+      retiredAt: expect.any(Number), retiredBy: f.current.id });
+    for (const copy of retiredCopies) {
+      expect(f.repair.validateTombstone(copy)).toEqual(copy.value);
+      expect(copy.value).toMatchObject({ retiredAt: expect.any(Number), retiredBy: f.current.id });
+    }
+    batches.mockClear(); custody.mockClear();
+    expect(await f.repair.retire(f.id, () => {})).toEqual(retiredResult);
+    expect(batches).toHaveBeenCalledTimes(1); // Unchanged retirement still takes the commit proof path.
+    expect(custody).toHaveBeenCalled();
+    expect(f.store.snapshot().bytes).toBe(retiredRegistry);
+    expect(persisted(f)).toEqual(retiredCopies);
+    expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
+  });
+
+  it("repairs a stopped private orphan whose settlement receipt was never published", async () => {
+    const f = await fixture();
+    const orphanedAt = f.actor.updatedAt + 1;
+    const marker = { oldHost: "test-host", reason: "Main owner process is dead", oldRoot: f.old.id,
+      lastUpdated: f.actor.updatedAt, orphanedAt };
+    f.store.write([{ ...f.actor, status: "stopped", stopReason: "host-exit", lastError: "root-gone",
+      sessionOrphan: marker, updatedAt: orphanedAt }]);
+    const originalCopies = persistedFor(f, f.id);
+    expect(originalCopies.every(copy => copy !== undefined)).toBe(true);
+    expect((f.store.records()[0]!.sessionOrphan as any)).not.toHaveProperty("directorySettlement");
+
+    await f.repair.reconcile();
+
+    const row = f.store.records()[0]!, receipt = (row.sessionOrphan as any).directorySettlement;
+    expect(receipt).toMatchObject({ by: f.current.id, at: expect.any(Number), settledAt: expect.any(Number) });
+    const copies = persistedFor(f, f.id);
+    expect(copies.every(copy => copy !== undefined)).toBe(true);
+    for (const copy of copies) {
+      expect(f.repair.validateTombstone(copy!)).toEqual(copy!.value);
+      expect(copy!.value).toMatchObject({ status: "stopped", stopReason: "owner-root-gone", ownerRootGoneAt: orphanedAt,
+        ownerRootGoneBy: f.current.id, settledAt: receipt.settledAt, capabilities: [] });
+    }
+    expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
+  });
+
+  it("does not invent absent actor advertisements while settling a private orphan", async () => {
+    const f = await fixture(true, { advertisements: false });
+    expect(persistedFor(f, f.id)).toEqual([undefined, undefined, undefined]);
+
+    await f.repair.reconcile();
+
+    expect(f.store.records()[0]).toMatchObject({ status: "stopped", stopReason: "host-exit",
+      sessionOrphan: { directorySettlement: { by: f.current.id } } });
+    expect(persistedFor(f, f.id)).toEqual([undefined, undefined, undefined]);
+    const registry = f.store.snapshot().bytes;
+    const batches = vi.spyOn(f.mesh, "writeBatch");
+    const custody = vi.spyOn(participantFiles, "withParticipantFilesTryLock");
+    expect(await f.repair.reconcile()).toBe(0);
+    expect(batches).not.toHaveBeenCalled();
+    expect(custody).not.toHaveBeenCalled();
+    expect(f.store.snapshot().bytes).toBe(registry);
+    expect(persistedFor(f, f.id)).toEqual([undefined, undefined, undefined]);
+    expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
+  });
+
   it("refuses an observer-forged tombstone for a LIVE owner; normal live ownership stays unchanged", async () => {
     const f = await fixture();
     writeHostLease(f.root, { ...f.lease, updatedAt: Date.now(), expiresAt: Date.now() + 60000,
@@ -176,6 +269,38 @@ describe("persistent old-root settlement (#12785)", () => {
       expect(f.mesh.get(entry.key, { fresh: true })?.value).toMatchObject({ capabilities: [] });
       expect(f.mesh.get(entry.key)?.value).not.toHaveProperty("actorRun");
     } finally { Object.defineProperty(process, "platform", original); }
+  });
+
+  it("re-settles a changed private orphan generation without losing terminal history", async () => {
+    const f = await fixture(), originalCopies = persistedFor(f, f.id);
+    await f.repair.reconcile();
+    const before = f.store.records()[0]!, oldMarker = before.sessionOrphan as any;
+    const oldReceipt = oldMarker.directorySettlement;
+    const orphanedAt = oldMarker.orphanedAt + 1;
+    f.store.write([{ ...before, updatedAt: orphanedAt,
+      sessionOrphan: { ...oldMarker, orphanedAt } }]);
+
+    // Re-present the generation's original stale owner copies: a private-generation change alone
+    // cannot turn the observer's old terminal bytes into new evidence, but those present copies need repair.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(f.actor.updatedAt);
+    try {
+      await f.mesh.put({ identity: f.old, key: f.legacy, value: originalCopies[0]!.value });
+      await f.mesh.put({ identity: f.old, key: keyOf(f.id), value: originalCopies[1]!.value });
+      writeParticipantFile(f.root, f.mesh.get(keyOf(f.id), { fresh: true })!);
+    } finally { clock.mockRestore(); }
+
+    await f.repair.reconcile();
+
+    const row = f.store.records()[0]!, receipt = (row.sessionOrphan as any).directorySettlement;
+    expect((row.sessionOrphan as any).orphanedAt).toBe(orphanedAt);
+    expect(receipt.at).toBeGreaterThan(oldReceipt.at);
+    expect(receipt.settledAt).toBe(oldReceipt.settledAt);
+    for (const copy of persisted(f)) {
+      expect(f.repair.validateTombstone(copy)).toEqual(copy.value);
+      expect(copy.value).toMatchObject({ status: "stopped", stopReason: "owner-root-gone", ownerRootGoneAt: orphanedAt,
+        ownerRootGoneBy: f.current.id, settledAt: receipt.settledAt, capabilities: [] });
+    }
+    expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
   });
 
   it("does not trust a public orphan marker or observer attribution without its private receipt", async () => {
@@ -622,6 +747,54 @@ describe("persistent old-root settlement (#12785)", () => {
     for (const entry of persisted(f)) expect(c.validateTombstone(entry)).toMatchObject({ settledAt, capabilities: [] });
     expect((f.store.records()[0]!.sessionOrphan as any).directorySettlement).toMatchObject({ by: "session:observer-c", settledAt });
     expect(fs.readFileSync(f.history, "utf8")).toBe("private history sentinel\n");
+  });
+
+  it("keeps N settled orphans write-free across K real SQLite heartbeat reconciles (red/green probe)", async () => {
+    const N = 4, K = 3;
+    // Start with actual settled history: this probe measures repeat reconciliation, not the
+    // separate initial-settlement path. Seed those exact receipts/copies into the real SQLite store.
+    const settled = await fixture(true, { orphanCount: N });
+    await settled.repair.reconcile();
+    const f = await fixture(true, { stateBackend: "sqlite", orphanCount: N, advertisements: false });
+    f.store.write(settled.store.records());
+    for (const id of f.orphanIds) {
+      const [legacy, participant, native] = persistedFor(settled, id);
+      for (const copy of [legacy, participant, native]) {
+        expect(copy).toBeDefined();
+        expect(settled.repair.validateTombstone(copy!)).toEqual(copy!.value);
+      }
+      for (const entry of [legacy!, participant!]) await f.mesh.put({ identity: entry.updatedBy, key: entry.key, value: entry.value });
+      writeParticipantFile(f.root, native!);
+    }
+    expect(f.mesh.stateBackend).toBe("sqlite");
+    const copies = f.orphanIds.map(id => persistedFor(f, id));
+    for (const set of copies) for (const copy of set) {
+      expect(copy).toBeDefined();
+      expect(f.repair.validateTombstone(copy!)).toEqual(copy!.value);
+    }
+    const registry = f.store.snapshot().bytes, history = fs.readFileSync(f.history, "utf8");
+    const sqlite = (f.mesh.stateBackendHandle as unknown as { store: { stats(): { transactions: number; totalHoldMs: number } } }).store;
+    const before = sqlite.stats();
+    const batches = vi.spyOn(f.mesh, "writeBatch");
+    const custody = vi.spyOn(participantFiles, "withParticipantFilesTryLock");
+    for (let heartbeat = 0; heartbeat < K; heartbeat++) await f.repair.reconcile();
+    const after = sqlite.stats();
+    const writeBatches = batches.mock.calls.length;
+    const transactionDelta = after.transactions - before.transactions;
+    const holdDeltaMs = after.totalHoldMs - before.totalHoldMs;
+    const custodyReceipts = custody.mock.calls.length;
+    const configured = process.env.PI_ORPHAN_NOOP_EXPECT_WRITE_BATCHES;
+    const expectedWriteBatches = configured === undefined ? 0 : Number(configured);
+    expect(Number.isSafeInteger(expectedWriteBatches) && expectedWriteBatches >= 0).toBe(true);
+    expect([0, N * K]).toContain(expectedWriteBatches);
+    console.log(JSON.stringify({ probe: "settled-session-orphan-heartbeats", backend: f.mesh.stateBackend, N, K,
+      expectedWriteBatches, writeBatches, transactionDelta, holdDeltaMs, custodyReceipts }));
+    expect(writeBatches).toBe(expectedWriteBatches);
+    expect(transactionDelta).toBe(expectedWriteBatches);
+    if (expectedWriteBatches === 0) expect(custodyReceipts).toBe(0);
+    expect(f.store.snapshot().bytes).toBe(registry);
+    expect(f.orphanIds.map(id => persistedFor(f, id))).toEqual(copies);
+    expect(fs.readFileSync(f.history, "utf8")).toBe(history);
   });
 
   it("the ordinary committed presence pass repairs raw advertisements without actors/list/status reads", async () => {

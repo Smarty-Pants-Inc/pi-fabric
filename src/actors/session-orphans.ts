@@ -451,6 +451,9 @@ export class SessionActorOrphans {
       JSON.stringify(entry.value) !== JSON.stringify(beforeTerminal)));
     // An observer change alone is NOT a new settlement or writer generation.
     const changed = !beforeReceipt || (retire && !time(beforeReceipt.retiredAt)) || needsRepair;
+    // Unchanged reconciliation needs no write fence or participant custody fsyncs.
+    // Retirement must still recheck its authority under the original commit custody.
+    if (!retire && !changed) return true;
     const settledAt = time(beforeReceipt?.settledAt) ? beforeReceipt.settledAt :
       receipts.length ? Math.min(...receipts.map(receipt => receipt.at as number)) : Date.now();
     // At most the three actual copies supply predecessors. Failed private intents

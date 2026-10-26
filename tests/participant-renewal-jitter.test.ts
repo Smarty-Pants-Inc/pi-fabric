@@ -45,14 +45,18 @@ function record(id: string): FabricParticipantRecord {
     name: id, status: "idle", runner: "pi", transport: "host", capabilities: ["followUp"],
     controlProtocol: "v1", startedAt: Date.now(), updatedAt: Date.now() };
 }
-async function nats(id: string, random: () => number, live?: () => boolean) {
+async function nats(id: string, random: () => number, live?: () => boolean, reconnectOnSubscribe = false) {
   const { root, mesh } = scratch(), world = kvWorld();
   const listeners = new Set<() => void>();
   const base = world.transport("machine-a", id), leases = base.kv("leases");
   const renewals: number[] = [];
   let renewalDelay = 0;
   const transport: FabricTransport = { ...base,
-    onVerifiedReconnect(listener) { listeners.add(listener); return () => { listeners.delete(listener); }; },
+    onVerifiedReconnect(listener) {
+      listeners.add(listener);
+      if (reconnectOnSubscribe) listener();
+      return () => { listeners.delete(listener); };
+    },
     kv(bucket) {
       if (bucket !== "leases") return base.kv(bucket);
       return { ttlMs: leases.ttlMs, get: leases.get.bind(leases), delete: leases.delete.bind(leases), watch: leases.watch.bind(leases),
@@ -74,7 +78,7 @@ async function nats(id: string, random: () => number, live?: () => boolean) {
   const rootRecord = record(id);
   directory.registerSource(() => [rootRecord]);
   await directory.start();
-  return { directory, world, renewals,
+  return { directory, world, renewals, rootRecord,
     reconnect() { for (const listener of listeners) listener(); },
     delayRenewal(ms: number) { renewalDelay = ms; },
     lease() { return world.leases.values.get(hKey("machine-a", id))!; },
@@ -163,6 +167,191 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     }
   });
 
+  it("keeps the original reconnect presence deadline across suspend/resume (F1)", async () => {
+    clock();
+    let draws = 0;
+    const f = await nats("jitter-resume-deadline", () => { draws++; return 1; });
+    const at = Date.now(), before = f.presence().revision;
+    f.reconnect(); // Samples a 5s deadline.
+    await vi.advanceTimersByTimeAsync(1_000);
+    f.directory.suspend();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const pausedDraws = draws;
+    f.directory.resume();
+    f.directory.resume();
+    expect(draws).toBe(pausedDraws + 1); // Heartbeat only, never resample reconnect.
+    f.directory.scheduleRefresh();
+    await vi.advanceTimersByTimeAsync(1_000); // Ordinary 0–1s refresh must not force presence.
+    expect(f.presence().revision).toBe(before);
+    expect(f.renewals).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(f.presence().revision).toBe(before);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.renewals).toEqual([at + 5_000]);
+    expect(f.presence().revision).toBeGreaterThan(before);
+  });
+
+  it("retains a reconnect received during suspension without publishing before its sampled due time", async () => {
+    clock();
+    const f = await nats("jitter-suspended-receiver", () => 1);
+    const at = Date.now(), before = f.presence().revision;
+    f.directory.suspend();
+    f.reconnect();
+    await vi.advanceTimersByTimeAsync(2_000);
+    f.directory.resume();
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(f.renewals).toEqual([]);
+    expect(f.presence().revision).toBe(before);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.renewals).toEqual([at + 5_000]);
+    expect(f.presence().revision).toBeGreaterThan(before);
+  });
+
+  it("retains bootstrap reconnect evidence until the lease and view are ready", async () => {
+    clock();
+    const f = await nats("jitter-bootstrap-receiver", () => 1, undefined, true);
+    const at = Date.now(), before = f.presence().revision;
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(f.renewals).toEqual([]);
+    expect(f.presence().revision).toBe(before);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.renewals).toEqual([at + 5_000]);
+    expect(f.presence().revision).toBeGreaterThan(before);
+  });
+
+  it("publishes genuine changes during a reconnect wait without confirming forced refresh early", async () => {
+    clock();
+    const f = await nats("jitter-changed-during-wait", () => 1);
+    const before = f.presence().revision;
+    f.reconnect();
+    f.rootRecord.status = "working";
+    f.directory.scheduleRefresh();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.presence().revision).toBeGreaterThan(before);
+    expect(f.presence().value).toMatchObject({ status: "working" });
+    const changed = f.presence().revision;
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(f.presence().revision).toBe(changed);
+    expect(f.renewals).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.presence().revision).toBeGreaterThan(changed);
+    expect(f.renewals).toHaveLength(1);
+  });
+
+  it("does not attribute a reconnect received during forced publication to the older generation", async () => {
+    clock();
+    const f = await nats("jitter-publication-generation", () => 1);
+    const before = f.presence().revision;
+    const put = f.world.presence.put.bind(f.world.presence);
+    const writes = vi.spyOn(f.world.presence, "put").mockImplementationOnce((...args) => {
+      f.reconnect(); // Commit already captured the first generation, not this second one.
+      return put(...args);
+    });
+    f.reconnect();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(writes).toHaveBeenCalledTimes(2);
+    expect(f.presence().revision).toBe(before + 2);
+    expect(f.renewals).toHaveLength(1); // Shared reconnect work, not another sampled renewal.
+    f.directory.scheduleRefresh();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(writes).toHaveBeenCalledTimes(2);
+  });
+
+  it("arms retained reconnect evidence when an unsuspended owner becomes live again", async () => {
+    clock();
+    let live = true;
+    const f = await nats("jitter-receiver-retired", () => 1, () => live);
+    const before = f.presence().revision;
+    live = false;
+    f.reconnect();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.presence().revision).toBe(before);
+    live = true;
+    await vi.advanceTimersByTimeAsync(1_000); // Existing heartbeat observes the rebound owner.
+    expect(f.renewals).toHaveLength(1);
+    expect(f.presence().revision).toBeGreaterThan(before);
+  });
+
+  it("fences a cancelled async reconnect preparation from replacement work", async () => {
+    clock();
+    const f = await nats("jitter-cancelled-continuation", () => 1);
+    const at = Date.now(), before = f.presence().revision;
+    let release!: () => void, entered = false;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    f.directory.options.beforePublication = async () => {
+      if (!entered) { entered = true; await gate; }
+    };
+    f.reconnect();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(entered).toBe(true);
+    expect(f.presence().revision).toBe(before);
+    f.directory.suspend();
+    f.delayRenewal(1_000);
+    f.directory.resume(); // Same elapsed deadline, fresh token; renewal still in flight.
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    f.directory.scheduleRefresh();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.presence().revision).toBe(before);
+    expect(f.renewals).toEqual([at + 5_000, at + 5_000]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.presence().revision).toBeGreaterThan(before);
+    const confirmed = f.presence().revision;
+    f.directory.scheduleRefresh();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.presence().revision).toBe(confirmed); // Old continuation did not leave a generation outstanding.
+    expect(f.directory.canConsumeMesh()).toBe(true);
+    f.delayRenewal(0);
+  });
+
+  it("resumes ordinary changed publication immediately without a reconnect", async () => {
+    clock();
+    const f = await nats("jitter-resume-normal", () => 1);
+    const before = f.presence().revision;
+    f.directory.suspend();
+    f.rootRecord.status = "working";
+    f.directory.resume();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.presence().revision).toBeGreaterThan(before);
+    expect(f.presence().value).toMatchObject({ status: "working" });
+    expect(f.renewals).toEqual([]);
+  });
+
+  it("does not resample a reconnect whose original due time elapsed while suspended", async () => {
+    clock();
+    const f = await nats("jitter-resume-overdue", () => 1);
+    const at = Date.now(), before = f.presence().revision;
+    f.reconnect();
+    f.directory.suspend();
+    await vi.advanceTimersByTimeAsync(5_500);
+    f.directory.resume();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.renewals).toEqual([at + 5_500]);
+    expect(f.presence().revision).toBeGreaterThan(before);
+  });
+
+  it("caps resumed reconnect work by the aged monotonic lease budget with 5s reserve", async () => {
+    const time = clock();
+    const f = await nats("jitter-resume-cap", () => 1);
+    const at = Date.now(), before = f.presence().revision;
+    time.age(5_000); // Original reconnect sample is capped at 2,999ms, not 5s.
+    f.reconnect();
+    f.directory.suspend();
+    time.age(2_000); // Only 6s admission remains; resume has at most 999ms before the 5s reserve.
+    time.jumpWall(86_400_000); // Neither the retained due time nor the lease cap follows wall time.
+    f.delayRenewal(5_000);
+    f.directory.resume();
+    await vi.advanceTimersByTimeAsync(998);
+    expect(f.renewals).toEqual([]);
+    expect(f.presence().revision).toBe(before);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.renewals).toEqual([at + 86_400_000 + 999]);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.directory.canConsumeMesh()).toBe(true);
+    expect(f.presence().revision).toBeGreaterThan(before);
+    f.delayRenewal(0);
+  });
+
   it("caps an aged reconnect with strict operation slack using monotonic, not wall time", async () => {
     const time = clock();
     const f = await nats("jitter-aged-reconnect", () => 1);
@@ -200,9 +389,14 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     if (action === "suspend") {
       expect(f.presence().revision).toBe(before);
       f.directory.resume();
-      f.directory.resume(); // Exactly one rearmed heartbeat.
-      await vi.advanceTimersByTimeAsync(6_000);
+      f.directory.resume(); // Exactly one rearmed heartbeat; elapsed reconnect is immediately eligible.
+      await vi.advanceTimersByTimeAsync(0);
       expect(f.renewals).toHaveLength(1);
+      expect(f.presence().revision).toBeGreaterThan(before);
+      await vi.advanceTimersByTimeAsync(5_999);
+      expect(f.renewals).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(f.renewals).toHaveLength(2);
       expect(f.directory.canConsumeMesh()).toBe(true);
     } else expect(f.world.presence.values.size).toBe(0);
   });
@@ -241,7 +435,11 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     expect(f.directory.canConsumeMesh()).toBe(false);
     expect(f.directory.transportLeaseSignal?.aborted).toBe(true);
     expect(f.directory.heartbeatArmed).toBe(false);
+    f.directory.suspend();
+    f.directory.resume();
+    f.reconnect();
     await vi.advanceTimersByTimeAsync(6_000);
+    expect(f.directory.heartbeatArmed).toBe(false);
     expect(f.renewals).toEqual([]);
   });
 

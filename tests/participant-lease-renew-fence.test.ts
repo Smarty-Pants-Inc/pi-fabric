@@ -47,7 +47,7 @@ describe.each(["file", "sqlite"] as const)("%s host-lease owner fence (smarty-de
     const mesh = new MeshStore(root, 65_536, 100, { stateBackend }); stores.push(mesh);
     const directory = new ParticipantDirectory(mesh, { enabled: true, hostId, rootId: "7313-root",
       identity: { id: "7313-owner", name: "owner", kind: "agent" }, reapDeadHosts: false,
-      live: () => false, heartbeatMs: 100 });
+      live: () => false, heartbeatMs: 100, random: () => 0.5 });
     directories.push(directory);
     let entered!: () => void, release!: () => void;
     const waiting = new Promise<void>(resolve => { entered = resolve; });
@@ -64,7 +64,16 @@ describe.each(["file", "sqlite"] as const)("%s host-lease owner fence (smarty-de
       // including additions): a first lease is an addition, so its one attempt takes the additions gate,
       // then the contended host gate, once each. No retry of either, even across the preparation budget.
       expect(attempts.mock.calls.map(([file]) => file)).toEqual([hostLeaseAdditionsGatePath(root), hostLeasePath(root, hostId)]);
-      expect(timers).not.toHaveBeenCalled();
+      // Startup arms one 100ms heartbeat; each retired-lifecycle tick only rearms
+      // that heartbeat. No custody/publication retry may hide among those timers.
+      expect(timers.mock.calls.map(([, delay]) => delay)).toEqual(Array(11).fill(100));
+      expect(directory.heartbeatArmed).toBe(true);
+      directory.suspend();
+      expect(directory.heartbeatArmed).toBe(false);
+      const timerCount = timers.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(timers).toHaveBeenCalledTimes(timerCount);
+      expect(attempts.mock.calls.map(([file]) => file)).toEqual([hostLeaseAdditionsGatePath(root), hostLeasePath(root, hostId)]);
     } finally { release(); await holder; }
 
   });

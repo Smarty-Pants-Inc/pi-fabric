@@ -115,6 +115,7 @@ const lazy = [
   "worker/retry-profile.js",
   "worker/profile-extensions.js",
   "worker/task-entry.js",
+  "worker/native-owner-entry.js",
   "worker/run-log.js",
   "worker/result.js",
   "worker/run-record.js",
@@ -279,12 +280,24 @@ for (const [entry, allowDeclared] of [["worker.js", true], ["durable/worker.js",
     }
   }
 }
+// Import-light fence exports must not evaluate task-entry/SDK before acquisition.
+const nativeOwnerFiles = staticClosure([join(dist, "worker/native-owner-entry.js")]);
+for (const file of nativeOwnerFiles) {
+  for (const match of readFileSync(file, "utf8").matchAll(staticImport)) {
+    if (!match[1].startsWith("node:")) throw new Error(`Native owner fence has a non-builtin static import: ${match[1]}`);
+  }
+}
+const nativeOwnerSource = readFileSync(join(dist, "worker/native-owner-entry.js"), "utf8");
+if (!/import\(["']\.\/task-entry\.js["']\)/.test(nativeOwnerSource)) {
+  throw new Error("Native owner must delegate to the stable compiled task-entry");
+}
 const validator = readFileSync(join(dist, "worker/result.js"), "utf8");
 if ([...validator.matchAll(staticImport)].length || /\bimport\s*\(/.test(validator)) {
   throw new Error("Worker validator must be self-contained");
 }
 // Measure the entry Pi actually loads, including every shared static chunk.
 const startupFiles = staticClosure(ownExtensions.map(file => resolve(root, file)));
+if ([...nativeOwnerFiles].some(file => startupFiles.has(file))) throw new Error("Native owner entry escaped into extension startup");
 const startupBytes = [...startupFiles].reduce((sum, file) => sum + Buffer.byteLength(readFileSync(file)), 0);
 // 45 files: src/topology/participant-files.ts is eager (the directory and the dashboard) and also
 // imported by the lazy mesh bridge, so it is a shared chunk instead of part of index.js; the bytes

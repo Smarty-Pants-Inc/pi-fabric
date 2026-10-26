@@ -2,37 +2,23 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { assertApprovedNativeSdk } from "../helpers/native-sdk-no-model.ts";
 
-// Same supported POSIX open-description flock facility as residency/file-lock.
-// Node's own fd stays CLOEXEC: ONLY flock's fd 3 gets an explicit duplicate.
-// No resident or arbitrary descendant inherits/retains the Main's lifetime lock.
-export function takeNativeOwnerSessionFence(file) {
-  if (process.platform !== "linux" || !path.isAbsolute(file)) throw new Error("Native Main requires an absolute Linux session fence");
-  const lock = `${file}.main.lock`;
-  const fd = fs.openSync(lock, fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
-  try {
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.uid !== process.geteuid() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600) {
-      throw new Error("Unsafe native Main session fence");
-    }
-    const result = spawnSync("flock", ["-x", "-n", "3"], { stdio: ["ignore", "ignore", "pipe", fd], timeout: 5_000 });
-    if (result.error) throw result.error;
-    if (result.status === 1) throw new Error("NATIVE_OWNER_SESSION_BUSY: another Main holds the session fence");
-    if (result.status !== 0) throw new Error(`Native Main flock failed (${result.status}): ${result.stderr}`);
-    return fd; // Kernel descriptor lifetime, never a PID/timestamp record.
-  } catch (error) { fs.closeSync(fd); throw error; }
-}
+// Fence implementation lives ONLY in the actual compiled product entry. Import
+// is side-effect-free; the standalone CLI below acquires BEFORE calling any SDK.
+const productFence = async entry => {
+  if (!entry || !path.isAbsolute(entry) || fs.realpathSync(entry) !== entry) throw new Error("Compiled native owner entry required");
+  return import(pathToFileURL(entry).href);
+};
 
-export async function nativeOwnerSession(mode, sdkDirectory, file, cwd, pinFile, fenceFd) {
+export async function nativeOwnerSession(mode, sdkDirectory, file, cwd, pinFile, fenceFd, entry) {
 if (!["provision", "verify"].includes(mode) || ![sdkDirectory, file, cwd, pinFile].every(value => value && path.isAbsolute(value))) {
   throw new Error("Explicit absolute native session inputs required");
 }
-const held = fs.fstatSync(fenceFd), named = fs.lstatSync(`${file}.main.lock`);
-if (held.dev !== named.dev || held.ino !== named.ino) throw new Error("Native Main session fence replaced");
+const { assertNativeOwnerSessionFence } = await productFence(entry);
+assertNativeOwnerSessionFence(file, fenceFd);
 assertApprovedNativeSdk(sdkDirectory);
-const { SessionManager } = await import(pathToFileURL(path.join(sdkDirectory, "core/session-manager.js")).href);
 const pinned = fs.existsSync(pinFile) ? JSON.parse(fs.readFileSync(pinFile, "utf8")) : undefined;
 if (mode === "verify" && !pinned) throw new Error("Native owner session pin missing");
 let stat = fs.lstatSync(file, { throwIfNoEntry: false });
@@ -42,10 +28,11 @@ if (!stat) {
   const fd = fs.openSync(file, "wx", 0o600); fs.closeSync(fd);
   stat = fs.lstatSync(file);
 }
-if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.geteuid() || (stat.mode & 0o077) !== 0) {
+if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.uid !== process.geteuid() || (stat.mode & 0o7777) !== 0o600) {
   throw new Error("Unsafe native session file");
 }
 // Existing empty file is the inspected native SDK _setSessionFile initialization branch.
+const { SessionManager } = await import(pathToFileURL(path.join(sdkDirectory, "core/session-manager.js")).href);
 const manager = SessionManager.open(file, path.dirname(file), cwd);
 const header = manager.getHeader();
 const sessionId = manager.getSessionId();
@@ -75,10 +62,14 @@ return value;
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   process.umask(0o077);
-  const [mode, sdkDirectory, file, cwd, pinFile] = process.argv.slice(2);
-  // Provision and standalone verify also fence BEFORE any SDK import, session
-  // stat/read/open or pin read. There is no unfenced parent-side preflight.
+  const [mode, sdkDirectory, file, cwd, pinFile, entry, expectedHash] = process.argv.slice(2);
+  if (!/^[0-9a-f]{64}$/.test(expectedHash ?? "") || createHash("sha256").update(fs.readFileSync(entry)).digest("hex") !== expectedHash) {
+    throw new Error("Native session fixture compiled product generation changed");
+  }
+  const { takeNativeOwnerSessionFence } = await productFence(entry);
+  // Product fence FIRST, including before nativeOwnerSession's SDK import and
+  // session/pin access. No duplicate fixture-only locking implementation.
   const fd = takeNativeOwnerSessionFence(file);
-  try { process.stdout.write(JSON.stringify(await nativeOwnerSession(mode, sdkDirectory, file, cwd, pinFile, fd)) + "\n"); }
+  try { process.stdout.write(JSON.stringify(await nativeOwnerSession(mode, sdkDirectory, file, cwd, pinFile, fd, entry)) + "\n"); }
   finally { fs.closeSync(fd); }
 }

@@ -52,10 +52,12 @@ export async function loadFrozenCa4Ledger(directory: string, repoRoot = path.res
   }
   if (fs.readdirSync(sourceRoot).length) throw new Error("N12 old source destination must be empty");
 
-  // Match the existing frozen-client prerequisite even though this smaller reader shares NO packages.
+  // Pin the OLD lock as archived evidence, not as a dependency on the candidate lock.
+  // This SOURCE-only reader shares NO packages; unrelated current bun.lock changes are allowed.
+  // Full-history checkout/local pinned objects remain required; never fetch or fall back here.
   const oldLock = git("show", `${FROZEN_CA4_LEDGER.commit}:bun.lock`);
-  if (sha256(oldLock) !== FROZEN_CA4_LEDGER.lockSha256 || !oldLock.equals(fs.readFileSync(path.join(repo, "bun.lock")))) {
-    throw new Error("N12 exact-ca4 SOURCE-reader requires pinned old/current bun.lock parity; no dependency fallback");
+  if (sha256(oldLock) !== FROZEN_CA4_LEDGER.lockSha256) {
+    throw new Error("N12 exact-ca4 SOURCE-reader old bun.lock hash mismatch; no dependency fallback");
   }
   const archive = git("archive", "--format=tar", FROZEN_CA4_LEDGER.commit, "--", ...ARCHIVE_PATHS);
   if (sha256(archive) !== FROZEN_CA4_LEDGER.archiveSha256) throw new Error("N12 ca4 source archive SHA-256 mismatch");
@@ -67,7 +69,6 @@ export async function loadFrozenCa4Ledger(directory: string, repoRoot = path.res
   ] as const) {
     if (sha256(fs.readFileSync(path.join(sourceRoot, file))) !== expected) throw new Error(`N12 extracted ca4 hash mismatch: ${file}`);
   }
-  if (!oldLock.equals(fs.readFileSync(path.join(repo, "bun.lock")))) throw new Error("N12 bun.lock changed during materialization");
   // No source file is patched (including .js specifiers). Vitest resolves them within OLD src,
   // just as the existing frozen-f3393715 helper does. Missing old files must fail the import.
   const loaded = await import(/* @vite-ignore */ pathToFileURL(path.join(sourceRoot, "src/mesh/bridge-nats-ledger.ts")).href) as typeof LedgerModule;

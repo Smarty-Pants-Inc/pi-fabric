@@ -199,6 +199,8 @@ const lazyEntryPoints = [
   "src/worker/retry-profile.ts",
   "src/worker/profile-extensions.ts",
   "src/worker/task-entry.ts",
+  // Opt-in fenced native Main adapter; delegates only after kernel custody.
+  "src/worker/native-owner-entry.ts",
   "src/worker/release-entry.ts",
   "src/worker/run-log.ts",
   "src/worker/result.ts",

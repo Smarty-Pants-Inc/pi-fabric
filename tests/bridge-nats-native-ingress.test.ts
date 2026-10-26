@@ -2,12 +2,16 @@
 // StoreBridgeSide publication and persisted MeshStore readback. KV/delivery fixtures are NOT a real
 // broker, full MeshBridge, control plane or native callback; parent owns that decisive integration.
 // Expected platform gap: receipts require POSIX no-follow + namespace durability, not Windows.
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { NativeActorBinding } from "../src/actors/native-handler.js";
+import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
 import { residentHostId } from "../src/residency/protocol.js";
+import { issueRootScope, sealRootScope } from "../src/scope.js";
+import * as ingressRecipe from "../src/mesh/bridge-nats-ingress.js";
 import { StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
 import { NatsBridgeCarrier, type NatsCarrierLedger, type NatsInbound } from "../src/mesh/bridge-nats-carrier.js";
 import { NatsCarrierSide } from "../src/mesh/bridge-nats-file.js";
@@ -16,8 +20,8 @@ import {
   claimNativeAskAdmission, consumeNativeAskAdmission, createNativeActorIngress, encodeNativeIngressReceipt, NATIVE_INGRESS_DIRECTORY,
   NATIVE_INGRESS_MAX_BYTES, readNativeIngressReceipt, type NativeControlAdmission,
 } from "../src/mesh/bridge-nats-ingress.js";
-import { openBridgeNatsLedger, type FileBridgeNatsLedger } from "../src/mesh/bridge-nats-ledger.js";
-import { natsCarrierLedger, natsLinkAuthorizers } from "../src/mesh/bridge-nats-link.js";
+import { BRIDGE_NATS_LEDGER_FILE, openBridgeNatsLedger, type FileBridgeNatsLedger } from "../src/mesh/bridge-nats-ledger.js";
+import { natsCarrierLedger, natsLinkAuthorizers, startNatsLink, type NatsLinkHandle, type NatsLinkStartConfig } from "../src/mesh/bridge-nats-link.js";
 import {
   BRIDGE_NATS_HORIZON_MS, bridgeNatsMappedCommandId, type BridgeNatsPresenceRecord, type BridgeNatsPresenceView,
 } from "../src/mesh/bridge-nats-types.js";
@@ -35,7 +39,9 @@ const roots: string[] = [];
 const ledgers: FileBridgeNatsLedger[] = [];
 const stores: MeshStore[] = [];
 const sides: NatsCarrierSide[] = [];
+const links: NatsLinkHandle[] = [];
 afterEach(async () => {
+  for (const link of links.splice(0)) await link.stop();
   vi.restoreAllMocks();
   for (const side of sides.splice(0)) side.close();
   for (const ledger of ledgers.splice(0)) await ledger.close();
@@ -118,6 +124,212 @@ const fixture = async () => {
   return { root, dir, clock, ledger, store, file, presence, rootRecord, actorRecord, authorize, authorizeTopic,
     binding, verifier, envelope, deliver, persist, request, carrier, carrierFor, port };
 };
+
+/** R4 ordinary-traffic boundary: actual startNatsLink, MeshBridge loops, file store and ledger.
+ * Only the NATS port/KV presence is fake. No owner reply, native context, ACK or callback is minted.
+ * PREPARED/UNRUN: these cases are not covered by the historical N12 11 + ledger 24 receipt.
+ */
+const ordinaryLinkFixture = async (ledgerClock?: () => number) => {
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r4-ordinary-link-")); roots.push(root);
+  const now = Date.now(), mesh = path.join(root, "mesh"), stateDir = path.join(root, "state");
+  const store = new MeshStore(mesh, 256 * 1024, 500); stores.push(store);
+  await store.prepareLock();
+  const key = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
+  const host = (identity: MeshIdentity): FabricHostRecord => ({ format: 1, id: identity.id, rootId: identity.id, identity,
+    startedAt: now - 1_000, updatedAt: now, expiresAt: now + 3_600_000 });
+  const participant = (identity: MeshIdentity): FabricParticipantRecord => ({ format: 1, id: identity.id, kind: "root",
+    rootId: identity.id, ownerHostId: identity.id, ownerIdentityId: identity.id, ownerIncarnation: `inc-${identity.name}`,
+    name: identity.name, label: identity.name, status: "idle", runner: "pi", transport: "host" as const,
+    capabilities: ["steer", "followUp"], sessionId: identity.id.slice(8), startedAt: now - 1_000, updatedAt: now,
+    controlProtocol: "v1" as const });
+  await store.put({ key: key("topology/hosts/", fileLead.id), identity: fileLead, value: host(fileLead) });
+  await store.put({ key: key("topology/participants/", fileLead.id), identity: fileLead, value: participant(fileLead) });
+  const config: NatsLinkStartConfig = { name: "r4-fixture", link: LINK, file: { mesh, lockProtocol: 1 }, stateDir,
+    allow: { file: [{ kind: "root", id: fileLead.id, send: ["ask", "cancel"], receive: ["ask", "cancel"] }],
+      nats: [{ kind: "root", id: natsLead.id, machine: POD_MACHINE, send: ["ask", "cancel"], receive: ["ask", "cancel"] }] },
+    nats: { servers: ["tls://nats.invalid:4222"], machine: BRIDGE_MACHINE, credentials: path.join(root, "unused.creds"),
+      caFile: path.join(root, "unused.pem"), custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS",
+      pathBMachines: [BRIDGE_MACHINE, POD_MACHINE] } };
+  const ports: FakePort[] = [];
+  const start = async () => {
+    const port = new FakePort(); ports.push(port);
+    for (const [identity, machine] of [[natsLead, POD_MACHINE], [fileLead, BRIDGE_MACHINE]] as const) {
+      port.routes.set(identity.id, route(identity, machine, `inc-${identity.name}`));
+    }
+    port.natsPresence = { hosts: [{ record: host(natsLead), expiresAt: now + 3_600_000, observedAt: now }],
+      participants: [participant(natsLead)], reserved: [natsLead.id] };
+    let ledger: FileBridgeNatsLedger | undefined;
+    const handle = await startNatsLink(config, { signal: new AbortController().signal, log: () => undefined, factories: {
+      openPort: async () => port, seatPins: () => ({ seats: new Map(), bound: new Map() }),
+      // Ledger bookkeeping only: carrier/presence/deadlines and real wall timers stay unchanged.
+      openLedger: async dir => { ledger = await openBridgeNatsLedger({ dir, minCompactLines: 1,
+        ...(ledgerClock ? { clock: ledgerClock } : {}) }); ledgers.push(ledger); return ledger; },
+    } });
+    links.push(handle);
+    return { port, handle, ledger: ledger! };
+  };
+  const envelope = (source: string, operation: "ask" | "cancel" = "ask") => ({ id: `r4-envelope-${source}`, kind: "command",
+    from: natsLead, to: { machine: BRIDGE_MACHINE, hostId: fileLead.id }, targetId: fileLead.id, operation,
+    body: { version: 1, commandId: source, targetId: fileLead.id, operation, ownerIncarnation: `inc-${fileLead.name}`,
+      replyTo: natsLead.id, message: "ordinary non-native command", requestedAt: now, deadlineAt: now + 60_000,
+      ...(operation === "cancel" ? { cancelCommandId: "ordinary-ask" } : {}) } });
+  const accepted = async (port: FakePort, source: string, operation: "ask" | "cancel" = "ask") => {
+    let delivery!: ReturnType<FakePort["deliver"]>;
+    await new Promise<void>(resolve => { delivery = port.deliver(envelope(source, operation), POD_MACHINE, undefined, resolve); });
+    expect(delivery.acked).toBe(1); expect(delivery.termed).toEqual([]);
+    const id = commandId(source), receipt = readNativeIngressReceipt(path.join(stateDir, "ledger"), id);
+    expect(receipt).toMatchObject({ targetId: fileLead.id, operation, commandId: id });
+    expect(store.read({ after: 0, limit: 500 }).filter(event => bodyOf(event)?.commandId === id)).toHaveLength(1);
+    return receipt;
+  };
+  return { root, now, store, ports, start, envelope, accepted, dir: path.join(stateDir, "ledger") };
+};
+
+describe.skipIf(!POSIX)("R4 ordinary receipt faults stop the WHOLE real link (fake NATS port only)", () => {
+  it.each(["mode", "uid"] as const)("OPEN directory %s drift refuses start for ordinary traffic, then valid custody reopens", async defect => {
+    const f = await ordinaryLinkFixture(), first = await f.start();
+    await f.accepted(first.port, "ordinary-ask"); await first.handle.stop(); await first.handle.closed;
+    const directory = path.join(f.dir, NATIVE_INGRESS_DIRECTORY), realLstat = fs.lstatSync.bind(fs);
+    if (defect === "mode") fs.chmodSync(directory, 0o750);
+    const stat = vi.spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof fs.lstatSync>) => {
+      const result = realLstat(...args);
+      return defect === "uid" && String(args[0]) === directory && result
+        ? new Proxy(result, { get: (target, property) => property === "uid" ? process.geteuid!() + 1 : Reflect.get(target, property) }) : result;
+    }) as typeof fs.lstatSync);
+    try {
+      await expect(f.start()).rejects.toThrow(/unsafe receipt directory/);
+      expect(f.ports.at(-1)!.closed).toBe(true);
+    } finally { stat.mockRestore(); if (defect === "mode") fs.chmodSync(directory, 0o700); }
+    const valid = await f.start();
+    await f.accepted(valid.port, "ordinary-cancel", "cancel");
+    expect(valid.port.sent).toHaveLength(0); // No synthetic owner reply/notRun.
+  }, 15_000);
+
+  it.each(["mode", "uid"] as const)("post-rename compaction directory %s drift fail-stops the active WHOLE link", async defect => {
+    const clock = { now: Date.now() - BRIDGE_NATS_HORIZON_MS - 1 };
+    const f = await ordinaryLinkFixture(() => clock.now), first = await f.start();
+    await f.accepted(first.port, "ordinary-ask");
+    const directory = path.join(f.dir, NATIVE_INGRESS_DIRECTORY), before = f.store.read({ after: 0, limit: 500 });
+    const original = clone(first.ledger.lookup("toFile", commandId("ordinary-ask"))!);
+    const receiptFile = path.join(directory, `${original.commandId}.json`), receiptBytes = fs.readFileSync(receiptFile);
+    const file = path.join(f.dir, BRIDGE_NATS_LEDGER_FILE), inode = fs.statSync(file);
+    const lineCount = () => fs.readFileSync(file, "utf8").trimEnd().split("\n").length;
+    const originalLines = lineCount();
+    // One retained claim + the fresh trigger will be live. These DISTINCT public writes are
+    // live while seeded, then strictly expired after ONE monotonic bookkeeping-clock advance.
+    // This is component maintenance coverage, not wall-clock liveness/idle/600s evidence.
+    const pressure = Array.from({ length: 4 * (1 + 1) }, (_, index) => `r4-active-expired-${index}`);
+    for (const id of pressure) expect((await first.ledger.markSeen("toFile", id)).expiresAt).toBeLessThan(f.now);
+    expect(lineCount()).toBe(originalLines + pressure.length);
+    expect(fs.statSync(file).ino).toBe(inode.ino); // Seeding itself did not compact.
+    clock.now = f.now;
+    expect(first.ledger.lookup("toFile", original.commandId)).toEqual(original);
+    expect(readNativeIngressReceipt(f.dir, original.commandId).expiresAt).toBeGreaterThan(clock.now);
+    const realLstat = fs.lstatSync.bind(fs);
+    if (defect === "mode") fs.chmodSync(directory, 0o750);
+    const stat = vi.spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof fs.lstatSync>) => {
+      const result = realLstat(...args);
+      return defect === "uid" && String(args[0]) === directory && result
+        ? new Proxy(result, { get: (target, property) => property === "uid" ? process.geteuid!() + 1 : Reflect.get(target, property) }) : result;
+    }) as typeof fs.lstatSync);
+    try {
+      // Existing lines + expired pressure + this append exceed 4 * two live records.
+      // The real normal compactor replaces the inode, then receipt pruning faults.
+      await first.ledger.markSeen("toFile", "r4-active-compaction");
+      const compacted = fs.statSync(file);
+      expect(compacted.dev).toBe(inode.dev); expect(compacted.ino).not.toBe(inode.ino);
+      expect(lineCount()).toBe(2); // Original claim + fresh seen record, no expired pressure.
+      for (const id of pressure) expect(first.ledger.seen("toFile", id)).toBeUndefined();
+      expect(first.ledger.lookup("toFile", original.commandId)).toEqual(original);
+      expect(fs.readFileSync(receiptFile)).toEqual(receiptBytes);
+      // The triggering mutation can resolve with the post-rename failure latched. A subsequent
+      // PUBLIC mutation must be CLOSED, even when its key already exists (dedupe is no bypass).
+      let stopped = false;
+      try { await first.ledger.markSeen("toFile", "r4-active-compaction"); }
+      catch (error) { expect(error).toMatchObject({ code: "BRIDGE_NATS_LEDGER_CLOSED" }); stopped = true; }
+      expect(stopped).toBe(true);
+      // Observe the ACTUAL running composition's next carrier mutation propagate the latch.
+      const failure = expect(first.handle.closed).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_CLOSED" });
+      const delivery = first.port.deliver(f.envelope("after-compaction"), POD_MACHINE);
+      await failure;
+      expect(first.port.closed).toBe(true); expect(first.port.sent).toHaveLength(0);
+      expect(delivery.acked).toBe(0); expect(delivery.termed).toEqual([]);
+      expect(f.store.read({ after: 0, limit: 500 })).toEqual(before);
+    } finally { stat.mockRestore(); if (defect === "mode") fs.chmodSync(directory, 0o700); }
+    const valid = await f.start(); await f.accepted(valid.port, "after-compaction");
+    expect(valid.ledger.lookup("toFile", commandId("ordinary-ask"))).toBeDefined();
+    expect(valid.ledger.lookup("toFile", original.commandId)).toEqual(original);
+    expect(fs.readFileSync(receiptFile)).toEqual(receiptBytes);
+    expect(valid.ledger.seen("toFile", "r4-active-compaction")).toBeDefined();
+    for (const id of pressure) expect(valid.ledger.seen("toFile", id)).toBeUndefined();
+    await valid.handle.stop(); await valid.handle.closed;
+  }, 15_000);
+
+  describe.each(["ask", "cancel"] as const)("duplicate ordinary %s", operation => {
+    it.each(["recipe", "issued-scope", "fsync", "namespace"] as const)(
+      "%s fault rejects link.closed without ACK/exposure; stable recipe/scope permits retained replay", async defect => {
+        // Fresh-process scope issuance is simulated only by resetting this test's process-wide holder,
+        // as tests/scope.test.ts does. Actual issueRootScope/seal/processSender run; no sender mock.
+        const symbol = Symbol.for("pi-fabric:scope:v1"), saved = Object.getOwnPropertyDescriptor(globalThis, symbol);
+        const issue = (id: string) => {
+          Reflect.deleteProperty(globalThis, symbol);
+          issueRootScope({ principal: { id }, grants: [{ resource: "mesh:*", actions: ["read", "write"] }] });
+          sealRootScope({});
+        };
+        let restoreFault: () => void = () => undefined;
+        try {
+          issue("test:r4-original-link");
+          const f = await ordinaryLinkFixture(), first = await f.start();
+          await f.accepted(first.port, "ordinary-ask");
+          if (operation === "cancel") await f.accepted(first.port, "ordinary-cancel", "cancel");
+          const source = `ordinary-${operation}`, file = path.join(f.dir, NATIVE_INGRESS_DIRECTORY, `${commandId(source)}.json`);
+          const before = fs.readFileSync(file), events = f.store.read({ after: 0, limit: 500 });
+          await first.handle.stop(); await first.handle.closed;
+          if (defect === "issued-scope") issue("test:r4-changed-link");
+          if (defect === "recipe") {
+            const recipe = ingressRecipe.nativeIngressReceiptForClaim;
+            const spy = vi.spyOn(ingressRecipe, "nativeIngressReceiptForClaim").mockImplementation((record, link) => {
+              const receipt = recipe(record, link);
+              // Counterexample at the actual producer recipe seam, never a positive forged receipt.
+              return { ...receipt, eventDigest: (receipt.eventDigest[0] === "0" ? "1" : "0") + receipt.eventDigest.slice(1) };
+            });
+            restoreFault = () => spy.mockRestore();
+          }
+          if (defect === "fsync" || defect === "namespace") {
+            const inode = fs.statSync(defect === "fsync" ? file : path.dirname(file)), fsync = fs.fsyncSync.bind(fs);
+            const spy = vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+              const stat = fs.fstatSync(fd);
+              if (stat.dev === inode.dev && stat.ino === inode.ino) throw Object.assign(new Error(`R4 ${defect} fault`), { code: "EIO" });
+              fsync(fd);
+            });
+            restoreFault = () => spy.mockRestore();
+          }
+          // In-horizon resend still fails after a restart: no per-delivery exception or automatic repair.
+          for (let attempt = 0; attempt < 2; attempt++) {
+            const current = await f.start();
+            const failure = expect(current.handle.closed).rejects.toThrow(defect === "recipe" || defect === "issued-scope" ? /conflicts/ : /R4 .* fault/);
+            const delivery = current.port.deliver(f.envelope(source, operation), POD_MACHINE);
+            await failure;
+            expect(delivery.acked).toBe(0); expect(delivery.termed).toEqual([]);
+            expect(current.port.closed).toBe(true); expect(current.port.sent).toHaveLength(0);
+            await expect(current.ledger.markSeen("toFile", "after-link-stop")).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_CLOSED" });
+            expect(f.store.read({ after: 0, limit: 500 })).toEqual(events);
+            expect(fs.readFileSync(file)).toEqual(before);
+          }
+          restoreFault(); restoreFault = () => undefined; issue("test:r4-original-link");
+          const valid = await f.start();
+          await f.accepted(valid.port, source, operation);
+          expect(fs.readFileSync(file)).toEqual(before);
+          expect(valid.port.sent).toHaveLength(0);
+          expect(f.store.read({ after: 0, limit: 500 })).toEqual(events); // Actual file dedupe, not another command/effect.
+          await valid.handle.stop(); await valid.handle.closed;
+        } finally {
+          restoreFault(); Reflect.deleteProperty(globalThis, symbol);
+          if (saved) Object.defineProperty(globalThis, symbol, saved);
+        }
+      }, 20_000);
+  });
+});
 
 describe.skipIf(!POSIX)("native ingress: genuine durable claims, not public event authority", () => {
   it("admits a genuine persisted event after verifier reconstruction, absent optional old-pod sid, with exact opaque bytes", async () => {

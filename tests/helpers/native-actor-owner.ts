@@ -10,7 +10,7 @@ import type { NativeActorBinding } from "../../src/actors/native-handler.js";
 import { MeshStore } from "../../src/mesh/store.js";
 import { residentRoot, type ResidentHostOwner } from "../../src/residency/protocol.js";
 import { watchResidentChild } from "../../src/residency/child-lifetime.js";
-import { launchLog, stopAllOwned } from "./owned-processes.js";
+import { launchLog, startTime, stopAllOwned } from "./owned-processes.js";
 import { residentDrainTemp } from "./resident-drain-temp.js";
 import { assertApprovedNativeSdk, isNativeSdkUnconfigured, NATIVE_SDK_RELEASE, NATIVE_SDK_SOURCE_PINS } from "./native-sdk-no-model.js";
 import { testTempOwnerMarker, testTempProcessIdentity, testTempRunEnvironment } from "../../scripts/test-temp.js";
@@ -89,8 +89,28 @@ export interface NativeActorOwnerOptions {
   readonly actorId: string;
   readonly residentIdleExitMs?: number;
   readonly module?: string;
+  /** New actual-entry cases install compiled bytes, never source/fixture aliases. */
+  readonly installCandidate?: boolean;
+  readonly mainLaunch?: "adapter" | "direct" | "launcher";
+}
+interface NativeAuxiliaryResult {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  pid: number | undefined;
+  stdout: string;
+  stderr: string;
+  started?: string;
+  launcherPid?: number;
+  launcherCode?: number | null;
+  processIds?: number[];
 }
 interface NativeSessionPin { sessionFile: string; rootId: string; sessionId: string }
+interface NativeOwnerDeadline { startedNs: bigint; boundMs: number }
+const remainingNativeOwnerMs = (deadline: NativeOwnerDeadline): number => {
+  const remaining = deadline.boundMs - Number(process.hrtime.bigint() - deadline.startedNs) / 1_000_000;
+  if (!Number.isFinite(remaining) || remaining <= 0) throw new Error("Actual Main EOF/death/product-fence verification exceeded its signal-relative bound");
+  return remaining;
+};
 interface RpcRecord { type?: string; id?: string; success?: boolean; error?: string; data?: Record<string, unknown>; [key: string]: unknown }
 
 export const createNativeActorOwner = async (options: NativeActorOwnerOptions) => {
@@ -99,14 +119,11 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
     throw new Error("N7 candidate and installed SDK require explicit absolute generation paths");
   }
   const custody = nativeEvidenceCustody();
-  const candidateRoot = fs.realpathSync(options.candidateRoot);
+  const sourceCandidateRoot = fs.realpathSync(options.candidateRoot);
   const sdkDirectory = fs.realpathSync(options.sdkDirectory);
   assertApprovedNativeSdk(sdkDirectory);
   const nodeBinary = absoluteFile(options.nodeBinary, "Node runtime");
-  const taskEntry = absoluteFile(path.join(candidateRoot, "dist/worker/task-entry.js"), "Built candidate SDK/RPC entry");
-  const nativeApi = absoluteFile(path.join(candidateRoot, "dist/native-actors.js"), "Built candidate native registration API");
-  absoluteFile(path.join(candidateRoot, "dist/index.js"), "Built candidate extension");
-  absoluteFile(path.join(candidateRoot, "dist/residency/pi-entry.js"), "Built candidate resident entry");
+  absoluteFile(path.join(sourceCandidateRoot, "dist/worker/native-owner-entry.js"), "Built PRODUCT native owner entry");
   absoluteFile(path.join(sdkDirectory, "index.js"), "Pinned Pi SDK");
   absoluteFile(path.join(sdkDirectory, "core/session-manager.js"), "Pinned native session manager");
   const privateTemp = residentDrainTemp("native-actor-owner-");
@@ -115,6 +132,37 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
   if (relativeRoot === ".." || relativeRoot.startsWith(`..${path.sep}`) || path.isAbsolute(relativeRoot)) {
     throw new Error("N7 BLOCKED: native session root escaped live launcher custody");
   }
+  let candidateRoot = sourceCandidateRoot;
+  if (options.installCandidate) {
+    candidateRoot = path.join(root, "candidate-install");
+    fs.mkdirSync(candidateRoot, { mode: 0o700 });
+    const installed: { path: string; sha256: string; bytes: number }[] = [];
+    const copy = (relative: string): void => {
+      const source = path.join(sourceCandidateRoot, relative), target = path.join(candidateRoot, relative), stat = fs.lstatSync(source);
+      if (stat.isSymbolicLink() || stat.uid !== process.geteuid!() || (stat.mode & 0o022) !== 0) throw new Error(`Unsafe candidate install input: ${relative}`);
+      if (stat.isDirectory()) {
+        fs.mkdirSync(target, { mode: 0o700 });
+        for (const name of fs.readdirSync(source).sort()) copy(path.join(relative, name));
+      } else if (stat.isFile()) {
+        fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL); fs.chmodSync(target, stat.mode & 0o755);
+        if (fs.realpathSync(target) !== target || digest(source) !== digest(target)) throw new Error(`Candidate install readback mismatch: ${relative}`);
+        installed.push({ path: relative, sha256: digest(target), bytes: fs.statSync(target).size });
+      } else throw new Error(`Nonregular candidate install input: ${relative}`);
+    };
+    copy("dist"); copy("package.json");
+    fs.mkdirSync(path.join(candidateRoot, "config"), { mode: 0o700 });
+    copy("config/landlock-roles.json");
+    // Only third-party dependency resolution is shared. ALL executable product
+    // dist/chunks are actual copied compiled files under the owned private prefix.
+    fs.symlinkSync(path.join(sourceCandidateRoot, "node_modules"), path.join(candidateRoot, "node_modules"), "dir");
+    fs.writeFileSync(path.join(root, "candidate-install.json"), JSON.stringify({ version: 1, sourceCandidateRoot, candidateRoot,
+      dependencyDirectory: fs.realpathSync(path.join(candidateRoot, "node_modules")), files: installed }, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+  }
+  const taskEntry = absoluteFile(path.join(candidateRoot, "dist/worker/task-entry.js"), "Built candidate SDK/RPC entry");
+  const nativeOwnerEntry = absoluteFile(path.join(candidateRoot, "dist/worker/native-owner-entry.js"), "Compiled PRODUCT native owner entry");
+  const nativeApi = absoluteFile(path.join(candidateRoot, "dist/native-actors.js"), "Built candidate native registration API");
+  absoluteFile(path.join(candidateRoot, "dist/index.js"), "Built candidate extension");
+  absoluteFile(path.join(candidateRoot, "dist/residency/pi-entry.js"), "Built candidate resident entry");
   fs.writeFileSync(path.join(root, "retention-custody.json"), JSON.stringify({ ...custody,
     archiveRequiredBeforeCleanup: true, rawSessionDeletionAuthorized: false }), { mode: 0o600 });
   const retainManifest = (): void => {
@@ -168,7 +216,10 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
     PI_FABRIC_MESH_ROOT: meshRoot, PI_FABRIC_PROJECT_ROOT: cwd,
     PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_AGENT_DIR: path.join(root, "exports"),
     PI_FABRIC_PI_BINARY: adapter, PI_FABRIC_NODE_BINARY: nodeBinary, FABRIC_NATIVE_OWNER_PINS: pinsPath,
+    FABRIC_NATIVE_TEST_SDK_DIRECTORY: sdkDirectory, FABRIC_NATIVE_TEST_SDK_IMPORTS: path.join(root, "sdk-imports.jsonl"),
   });
+  // Native loader observes and delegates unchanged; never substitutes an SDK.
+  env.NODE_OPTIONS = `${env.NODE_OPTIONS ?? ""} --import=${new URL("../fixtures/native-owner-launcher.mjs?observe-sdk", import.meta.url).href}`;
   fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ enableInstallTelemetry: false,
     // Empty auth alone does not exclude credential-free/native provider defaults.
     // This supported SDK request policy denies ALL models, without a dummy provider.
@@ -191,7 +242,8 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
   }), { mode: 0o600 });
 
   let auxiliarySequence = 0;
-  const runAuxiliary = (label: string, args: string[]): Promise<{ code: number | null; signal: NodeJS.Signals | null; pid: number | undefined; stdout: string; stderr: string }> => new Promise((resolve, reject) => {
+  const runAuxiliary = (label: string, args: string[], deadline?: NativeOwnerDeadline): Promise<NativeAuxiliaryResult> => new Promise((resolve, reject) => {
+    if (deadline) remainingNativeOwnerMs(deadline); // Refuse even to spawn after the original signal-relative deadline.
     const name = `${label}-${++auxiliarySequence}`;
     const child = spawn(nodeBinary, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     const lifetime = watchResidentChild(child);
@@ -199,15 +251,20 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
     child.stdout.on("data", chunk => { fs.appendFileSync(path.join(root, `${name}.stdout`), chunk, { mode: 0o600 }); stdout = `${stdout}${chunk}`.slice(-128_000); });
     child.stderr.on("data", chunk => { fs.appendFileSync(path.join(root, `${name}.stderr`), chunk, { mode: 0o600 }); stderr = `${stderr}${chunk}`.slice(-32_000); });
     child.once("error", reject);
-    const timer = setTimeout(() => { expired = true; void lifetime.stop().catch(reject); }, 30_000);
+    const timer = setTimeout(() => { expired = true; void lifetime.stop().catch(reject); }, deadline
+      ? Math.max(0, deadline.boundMs - Number(process.hrtime.bigint() - deadline.startedNs) / 1_000_000) : 30_000);
     child.once("close", (code, signal) => {
       clearTimeout(timer);
-      fs.writeFileSync(path.join(root, `${name}.exit.json`), JSON.stringify({ pid: child.pid, code, signal, expired }), { mode: 0o600 });
+      // A delayed timer or deadline cleanup can NEVER turn a late verifier into success.
+      if (deadline && Number(process.hrtime.bigint() - deadline.startedNs) / 1_000_000 >= deadline.boundMs) expired = true;
+      fs.writeFileSync(path.join(root, `${name}.exit.json`), JSON.stringify({ pid: child.pid, code, signal, expired,
+        stdoutClosed: child.stdout.destroyed, stderrClosed: child.stderr.destroyed }), { mode: 0o600 });
       if (expired) reject(new Error(`Native auxiliary ${label} did not terminate: ${stderr}`));
       else resolve({ code, signal, pid: child.pid, stdout, stderr });
     });
   });
-  const sessionArgs = (mode: "provision" | "verify") => [path.join(fixtureRoot, "native-owner-session.mjs"), mode, sdkDirectory, sessionFile, cwd, sessionPin];
+  const sessionArgs = (mode: "provision" | "verify") => [path.join(fixtureRoot, "native-owner-session.mjs"), mode, sdkDirectory, sessionFile, cwd, sessionPin,
+    nativeOwnerEntry, digest(nativeOwnerEntry)];
   const provision = async (): Promise<NativeSessionPin> => {
     const result = await runAuxiliary("session-provision", sessionArgs("provision"));
     if (result.code !== 0) throw new Error(`Native session provision refused: ${result.stderr}`);
@@ -217,8 +274,9 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
   let pin: NativeSessionPin;
   try { pin = await provision(); }
   catch (error) {
-    try { await stopAllOwned(owned.owned()); }
-    finally { observations.close(); privateTemp.assertNoOutsideDeletion(); retainManifest(); }
+    let terminal = false;
+    try { await stopAllOwned(owned.owned()); terminal = true; }
+    finally { observations.close(); privateTemp.assertNoOutsideDeletion(); if (terminal) retainManifest(); }
     throw error;
   }
   const binding: NativeActorBinding = Object.freeze({ actorId: options.actorId, rootId: pin.rootId, scope: "session",
@@ -226,26 +284,50 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
     residentModule: options.module ?? path.join(fixtureRoot, "native-resident-handler.mjs"),
     ingress: Object.freeze({ link: "native-residency", ledgerDir }) });
   const callbacks = path.join(root, "callbacks.jsonl"), observerFile = path.join(root, "observations.jsonl");
-  const pins = { nodeBinary, sdkDirectory, taskEntry, taskEntrySha256: digest(taskEntry), sdkIndexSha256: digest(path.join(sdkDirectory, "index.js")),
+  const pins = { nodeBinary, sdkDirectory, taskEntry, taskEntrySha256: digest(taskEntry),
+    nativeOwnerEntry, nativeOwnerEntrySha256: digest(nativeOwnerEntry), sdkIndexSha256: digest(path.join(sdkDirectory, "index.js")),
     nativeApi, binding, sessionFile, sessionPin, meshRoot, observer: path.join(fixtureRoot, "native-owner-observer.mjs"), callbacks, observations: observerFile };
   fs.writeFileSync(pinsPath, JSON.stringify(pins), { mode: 0o600 });
   fs.writeFileSync(path.join(root, "generation-evidence.json"), JSON.stringify({ candidateRoot, nodeBinary, nodeBinarySha256: digest(nodeBinary),
-    sdkDirectory, taskEntrySha256: pins.taskEntrySha256, sdkIndexSha256: pins.sdkIndexSha256,
+    sdkDirectory, taskEntrySha256: pins.taskEntrySha256, nativeOwnerEntry, nativeOwnerEntrySha256: pins.nativeOwnerEntrySha256, sdkIndexSha256: pins.sdkIndexSha256,
     sdkRelease: NATIVE_SDK_RELEASE, approvedSdkSources: NATIVE_SDK_SOURCE_PINS,
     adapterSha256: digest(adapter), nativeApiSha256: digest(nativeApi), binding }), { mode: 0o600 });
   const mesh = new MeshStore(meshRoot, 256 * 1024, 1_000);
   const residencyRoot = residentRoot(meshRoot, pin.rootId);
   let main: ChildProcessWithoutNullStreams | undefined;
   let mainClosed: Promise<void> | undefined;
+  let mainClosedNs: bigint | undefined;
+  let launcherExited: Promise<void> | undefined;
+  let mainIdentity: { pid: number; started: string } | undefined;
+  let mainPaused = false;
+  // Positive Linux death evidence, not launcher exit/EOF/kill acknowledgement.
+  const death = (identity: { pid: number; started: string }): "absent" | "reused" | "zombie" | undefined => {
+    let stat: string;
+    try { stat = fs.readFileSync(`/proc/${identity.pid}/stat`, "utf8"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent"; throw error; }
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+    if (!/^\d+$/.test(fields[19] ?? "")) throw new Error("Unknown owned Main birth at death boundary");
+    if (fields[19] !== identity.started) return "reused";
+    return fields[0] === "Z" || fields[0] === "X" ? "zombie" : undefined;
+  };
+  const recordDeath = (generation: number, identity: { pid: number; started: string }): bigint => {
+    const evidence = death(identity);
+    if (!evidence) throw new Error("Main still live; pipe/launcher close is not death proof");
+    const observedNs = process.hrtime.bigint();
+    fs.writeFileSync(path.join(root, `main-${generation}.death.json`), JSON.stringify({ ...identity, evidence }), { mode: 0o600, flag: "wx" });
+    return observedNs;
+  };
   let lastError = "";
   const pending = new Map<string, { resolve: (value: RpcRecord) => void; reject: (error: unknown) => void }>();
   const rpcEvents: RpcRecord[] = [];
   let sequence = 0, mainGeneration = 0;
-  const mainArgs = () => [adapter, "--mode", "rpc", "--session", sessionFile,
+  const mainArgs = () => [...(options.mainLaunch && options.mainLaunch !== "adapter"
+    ? [nativeOwnerEntry, sdkDirectory, "1", "--extension", pins.observer] : [adapter]),
+    "--mode", "rpc", "--session", sessionFile,
     "--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
     "--extension", path.join(fixtureRoot, "native-owner-bootstrap.mjs"), "--extension", path.join(candidateRoot, "dist/index.js")];
   const request = (type: "get_state" | "get_messages" | "prompt" | "steer" | "follow_up", message?: string): Promise<RpcRecord> => {
-    if (!main || main.exitCode !== null || main.signalCode !== null || main.stdin.destroyed) return Promise.reject(new Error("Actual owner Main is not running"));
+    if (!main || !mainIdentity || death(mainIdentity) || main.stdin.destroyed) return Promise.reject(new Error("Actual owner Main is not running"));
     const id = `native-owner-${++sequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { pending.delete(id); reject(new Error(`Owner RPC ${type} deadline: ${lastError}`)); }, 60_000);
@@ -260,10 +342,29 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
     // No parent verify/provision here: the actual Main takes its nonblocking
     // fence FIRST, then verifies the pinned file before SDK/task-entry can open it.
     const generation = ++mainGeneration;
-    const child = spawn(nodeBinary, mainArgs(), { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    const launcherReceipt = path.join(root, `launcher-${generation}.custody.json`);
+    const args = options.mainLaunch === "launcher"
+      ? [path.join(fixtureRoot, "native-owner-launcher.mjs"), pinsPath, launcherReceipt, "--", ...mainArgs()] : mainArgs();
+    const child = spawn(nodeBinary, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
     main = child;
+    if (options.mainLaunch !== "launcher") {
+      if (!child.pid) throw new Error("Main spawn has no owned pid");
+      const started = startTime(child.pid);
+      if (!started) throw new Error("Main spawn has no native birth identity");
+      mainIdentity = { pid: child.pid, started };
+    }
+    launcherExited = new Promise<void>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => {
+        if (options.mainLaunch === "launcher") fs.writeFileSync(path.join(root, `launcher-${generation}.exit.json`), JSON.stringify({ pid: child.pid, code, signal }), { mode: 0o600 });
+        resolve();
+      });
+    });
     let buffer = "";
-    mainClosed = new Promise<void>((resolve, reject) => { child.once("error", reject); child.once("close", () => resolve()); });
+    mainClosedNs = undefined;
+    mainClosed = new Promise<void>((resolve, reject) => {
+      child.once("error", reject); child.once("close", () => { mainClosedNs = process.hrtime.bigint(); resolve(); });
+    });
     child.on("error", error => { lastError = error.message; observations.wake(); });
     child.stderr.on("data", chunk => {
       fs.appendFileSync(path.join(root, `main-${generation}.stderr`), chunk, { mode: 0o600 });
@@ -287,20 +388,37 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
       observations.wake();
     });
     child.once("close", (code, signal) => {
-      fs.writeFileSync(path.join(root, `main-${generation}.exit.json`), JSON.stringify({ pid: child.pid, code, signal }), { mode: 0o600 });
+      const receipt = JSON.stringify({ pid: child.pid, code, signal,
+        stdoutClosed: child.stdout.destroyed, stderrClosed: child.stderr.destroyed });
+      fs.writeFileSync(path.join(root, `${options.mainLaunch === "launcher" ? "launcher" : "main"}-${generation}.close.json`), receipt, { mode: 0o600 });
+      if (options.mainLaunch !== "launcher") fs.writeFileSync(path.join(root, `main-${generation}.exit.json`), receipt, { mode: 0o600 });
       // Only this isolated fixture's bounded, non-secret lifecycle observations;
       // retain the actual SDK state that caused a fail-closed startup exit.
       const observed = fs.existsSync(observerFile) ? fs.readFileSync(observerFile, "utf8").slice(-12_000) : "no lifecycle observations";
       for (const waiter of pending.values()) waiter.reject(new Error(`Actual owner Main exited (${code}): ${lastError}\n${observed}`));
       pending.clear(); observations.wake();
     });
+    if (options.mainLaunch === "launcher") {
+      await observations.until(() => {
+        if (!fs.existsSync(launcherReceipt)) {
+          if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Test launcher exited before Main custody: ${lastError}`);
+          return false;
+        }
+        const receipt = json<{ launcherPid: number; mainPid: number; mainStarted: string; entry: string; entrySha256: string; stdinCustody: string }>(launcherReceipt);
+        if (receipt.stdinCustody !== "launcher-owned-pipe" || receipt.launcherPid !== child.pid || !Number.isSafeInteger(receipt.mainPid) || receipt.mainPid <= 1 ||
+            receipt.mainPid === child.pid || receipt.entry !== nativeOwnerEntry || receipt.entrySha256 !== pins.nativeOwnerEntrySha256 ||
+            startTime(receipt.mainPid) !== receipt.mainStarted) throw new Error("Test launcher has no matching real Main birth/custody");
+        mainIdentity = { pid: receipt.mainPid, started: receipt.mainStarted };
+        return true;
+      }, "actual test launcher/Main birth receipt");
+    }
     const state = await request("get_state");
     if (!state.success || !isNativeSdkUnconfigured(state.data?.model, sdkDirectory) || state.data?.sessionId !== pin.sessionId ||
         state.data?.sessionFile !== sessionFile || (state.data?.capabilities as { inputAdmission?: unknown })?.inputAdmission !== 1) {
       throw new Error("Actual pinned SDK Main failed model-free/native-session readback");
     }
     await observations.until(() => {
-      if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Owner Main startup failed: ${lastError}`);
+      if (!mainIdentity || death(mainIdentity)) throw new Error(`Owner Main startup failed: ${lastError}`);
       if (!fs.existsSync(path.join(residencyRoot, "owner.json"))) return false;
       const owner = json<ResidentHostOwner>(path.join(residencyRoot, "owner.json"));
       const ready = path.join(residencyRoot, "maintenance-ready.json");
@@ -308,9 +426,41 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
         fs.existsSync(ready) && json<{ token: string }>(ready).token === owner.token;
     }, "native module + actor + resident maintenance readiness");
   };
+  const ownedLiveMain = (): { pid: number; started: string } => {
+    const identity = mainIdentity;
+    if (!identity || !owned.owned().some(value => value.pid === identity.pid && value.started === identity.started) ||
+        startTime(identity.pid) !== identity.started || death(identity)) throw new Error("Lost actual test Main signal custody");
+    return { ...identity };
+  };
+  const resumeMain = (): void => {
+    if (!mainPaused) return;
+    const identity = ownedLiveMain();
+    process.kill(identity.pid, "SIGCONT"); mainPaused = false;
+    fs.appendFileSync(path.join(root, `main-${mainGeneration}.test-scheduling.jsonl`), JSON.stringify({ kind: "TEST_SCHEDULING",
+      ...identity, signal: "SIGCONT", evidence: "signal delivered only; NOT Main death" }) + "\n", { mode: 0o600 });
+  };
+  const joinMainDeath = async (deadline?: NativeOwnerDeadline): Promise<{ stdioClosedNs: bigint; positiveDeathNs: bigint }> => {
+    const child = main, closed = mainClosed, identity = mainIdentity;
+    if (!child || !closed || !identity) throw new Error("No actual Main awaiting death join");
+    // The clock belongs to the signal/resume boundary, NOT entry into this join.
+    const remaining = deadline ? remainingNativeOwnerMs(deadline) : 30_000;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([closed, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Actual Main death/stdio close not observed within bound; a live old Main cannot pass")), remaining);
+      })]);
+      if (deadline) remainingNativeOwnerMs(deadline);
+      if (mainClosedNs === undefined || !child.stdout.destroyed || !child.stderr.destroyed) throw new Error("Actual Main has no complete stdio close observation");
+      const positiveDeathNs = recordDeath(mainGeneration, identity); // close/EOF/launcher exit alone NEVER suffice
+      main = undefined; mainIdentity = undefined; mainPaused = false;
+      if (deadline) remainingNativeOwnerMs(deadline); // Late death stays a failure, without recording it twice in cleanup.
+      return { stdioClosedNs: mainClosedNs, positiveDeathNs };
+    } finally { if (timer) clearTimeout(timer); }
+  };
   const stopMain = async (): Promise<void> => {
     const child = main;
     if (!child) return;
+    if (mainPaused && mainIdentity && !death(mainIdentity)) resumeMain();
     child.stdin.end(); // Held-open stdin is the lifetime owner; EOF requests native shutdown.
     let deadline: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -318,28 +468,98 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
         deadline = setTimeout(() => reject(new Error("Native owner orderly shutdown incomplete")), 60_000);
       })]);
     } finally { if (deadline) clearTimeout(deadline); }
-    main = undefined;
+    if (mainIdentity) recordDeath(mainGeneration, mainIdentity);
+    main = undefined; mainIdentity = undefined; mainPaused = false;
   };
   const crashMain = async (): Promise<void> => {
     const child = main, closed = mainClosed;
-    if (!child || !closed || child.exitCode !== null || child.signalCode !== null) throw new Error("No actual running Main to crash");
-    // Exact owned ChildProcess ONLY. Never by PID lookup, name or process group;
-    // the detached resident stays alive and must not retain this Main's lock fd.
-    if (!child.kill("SIGKILL")) throw new Error("Actual Main SIGKILL was not delivered");
+    if (!child || !closed || !mainIdentity || death(mainIdentity)) throw new Error("No actual running Main to crash");
+    const identity = mainIdentity;
+    // Direct Main: exact ChildProcess. Orphan Main: exact launch-recorded birth
+    // below. Never name/group signalling; resident retains its separate custody.
+    if (options.mainLaunch === "launcher") {
+      // An orphan remains OUR launch-recorded child, not an arbitrary PID. Recheck
+      // exact birth and launch attribution immediately before this test-only kill.
+      ownedLiveMain();
+      process.kill(identity.pid, "SIGKILL");
+    } else if (!child.kill("SIGKILL")) throw new Error("Actual Main SIGKILL was not delivered");
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([closed, new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error("Actual Main crash lacks terminal close")), 30_000);
       })]);
-      if (child.signalCode !== "SIGKILL") throw new Error("Actual Main crash has no SIGKILL terminal receipt");
-      main = undefined;
+      if (options.mainLaunch !== "launcher" && child.signalCode !== "SIGKILL") throw new Error("Actual Main crash has no SIGKILL terminal receipt");
+      recordDeath(mainGeneration, identity);
+      main = undefined; mainIdentity = undefined; mainPaused = false;
     } finally { if (timer) clearTimeout(timer); }
   };
-  return { root, cwd, candidateRoot, binding, sessionFile, sessionPin, pin, mesh, meshRoot, ledgerDir, residencyRoot, idleExitMs,
-    until: observations.until, wake: observations.wake, start, stopMain, crashMain, request, rpcEvents,
-    mainPid: () => main?.pid,
-    attemptSecondMain: () => runAuxiliary("second-main", mainArgs()),
-    attemptSessionAccess: (mode: "provision" | "verify") => runAuxiliary(`contending-${mode}`, sessionArgs(mode)),
+  return { root, cwd, candidateRoot, sourceCandidateRoot, nativeOwnerEntry, binding, sessionFile, sessionPin, pin, mesh, meshRoot, ledgerDir, residencyRoot, idleExitMs,
+    async crashLauncher(deadline?: NativeOwnerDeadline): Promise<void> {
+      const child = main, exited = launcherExited;
+      if (options.mainLaunch !== "launcher" || !child || !exited || child.exitCode !== null || child.signalCode !== null || !mainIdentity) throw new Error("No owned running test launcher");
+      const identity = { ...mainIdentity };
+      if (deadline) remainingNativeOwnerMs(deadline);
+      if (!child.kill("SIGKILL")) throw new Error("Test launcher SIGKILL not delivered");
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([exited, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("No actual launcher exit receipt")), deadline ? remainingNativeOwnerMs(deadline) : 30_000); })]);
+        if (deadline) remainingNativeOwnerMs(deadline);
+        if (child.signalCode !== "SIGKILL") throw new Error("No actual test launcher SIGKILL terminal receipt");
+        fs.writeFileSync(path.join(root, `launcher-${mainGeneration}.main-observation.json`), JSON.stringify({ ...identity,
+          launcherPid: child.pid, launcherSignal: child.signalCode, mainDeath: death(identity) ?? "live",
+          mainBirthReadback: startTime(identity.pid), stdinCustody: "launcher-owned-pipe" }), { mode: 0o600, flag: "wx" });
+      } finally { if (timer) clearTimeout(timer); }
+    },
+    sdkImports: () => fs.existsSync(env.FABRIC_NATIVE_TEST_SDK_IMPORTS!) ? fs.readFileSync(env.FABRIC_NATIVE_TEST_SDK_IMPORTS!, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as { pid: number; event: string; url: string }) : [],
+    ownedProcesses: () => owned.owned(),
+    mainIdentity: () => mainIdentity ? { ...mainIdentity } : undefined,
+    mainLive: () => !!mainIdentity && !death(mainIdentity) && startTime(mainIdentity.pid) === mainIdentity.started,
+    async pauseMain(): Promise<void> {
+      if (options.mainLaunch !== "launcher" || mainPaused) throw new Error("Test scheduling requires one live launcher-owned Main");
+      const identity = ownedLiveMain();
+      process.kill(identity.pid, "SIGSTOP"); mainPaused = true;
+      const deadline = Date.now() + 5_000;
+      for (;;) {
+        ownedLiveMain();
+        const stat = await fs.promises.readFile(`/proc/${identity.pid}/stat`, "utf8");
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+        if (fields[19] !== identity.started) throw new Error("Main birth changed at test scheduling boundary");
+        if (fields[0] === "T") {
+          fs.appendFileSync(path.join(root, `main-${mainGeneration}.test-scheduling.jsonl`), JSON.stringify({ kind: "TEST_SCHEDULING",
+            ...identity, signal: "SIGSTOP", state: fields[0], evidence: "actual owned Main stopped; NOT deployment/N6 proof" }) + "\n", { mode: 0o600 });
+          return;
+        }
+        if (Date.now() >= deadline) throw new Error("Actual owned Main stop was not observed");
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+    },
+    until: observations.until, wake: observations.wake, start, stopMain, crashMain, joinMainDeath, resumeMain, request, rpcEvents,
+    mainPid: () => mainIdentity?.pid,
+    async attemptSecondMain() {
+      const launchedBefore = new Set(owned.owned().map(value => `${value.pid}:${value.started}`));
+      const name = `second-main-${auxiliarySequence + 1}`, receiptFile = path.join(root, `${name}.custody.json`);
+      const launched = options.mainLaunch === "launcher";
+      const result = await runAuxiliary("second-main", launched
+        ? [path.join(fixtureRoot, "native-owner-launcher.mjs"), pinsPath, receiptFile, "--", ...mainArgs()] : mainArgs());
+      const processes = owned.owned().filter(value => !launchedBefore.has(`${value.pid}:${value.started}`));
+      let pid = result.pid, started: string | undefined, code = result.code, signal = result.signal;
+      if (launched) {
+        const receipt = json<{ launcherPid: number; mainPid: number; mainStarted: string; entry: string; entrySha256: string; stdinCustody: string }>(receiptFile);
+        const terminal = json<{ pid: number; code: number | null; signal: NodeJS.Signals | null }>(`${receiptFile}.main-close.json`);
+        if (receipt.launcherPid !== result.pid || receipt.mainPid === result.pid || receipt.entry !== nativeOwnerEntry ||
+            receipt.entrySha256 !== pins.nativeOwnerEntrySha256 || receipt.stdinCustody !== "launcher-owned-pipe" ||
+            !processes.some(value => value.pid === receipt.mainPid && value.started === receipt.mainStarted && value.argv[0] === nativeOwnerEntry) ||
+            terminal.pid !== receipt.mainPid || !death({ pid: receipt.mainPid, started: receipt.mainStarted })) {
+          throw new Error("Contender lacks actual compiled Main birth/death/launcher attribution");
+        }
+        pid = receipt.mainPid; started = receipt.mainStarted; code = terminal.code; signal = terminal.signal;
+      }
+      const attributed = { ...result, pid, started, code, signal, launcherPid: launched ? result.pid : undefined,
+        launcherCode: launched ? result.code : undefined, processIds: processes.map(value => value.pid) };
+      fs.writeFileSync(path.join(root, `${name}.attribution.json`), JSON.stringify(attributed), { mode: 0o600, flag: "wx" });
+      return attributed;
+    },
+    attemptSessionAccess: (mode: "provision" | "verify", deadline?: NativeOwnerDeadline) => runAuxiliary(`contending-${mode}`, sessionArgs(mode), deadline),
     async probeModelPolicy(): Promise<Record<string, unknown>> {
       const result = await runAuxiliary("model-policy", [path.join(fixtureRoot, "native-owner-model-policy-probe.mjs")]);
       if (result.code !== 0) throw new Error(`Actual SDK no-model proof refused: ${result.stderr}`);
@@ -351,8 +571,20 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
     async close(): Promise<void> {
       try { await stopMain(); }
       finally {
-        try { await stopAllOwned(owned.owned(), 2_000, 5_000); }
-        finally { observations.close(); mesh.closeState(); privateTemp.assertNoOutsideDeletion(); retainManifest(); }
+        let terminal = false;
+        try {
+          await stopAllOwned(owned.owned().filter(value => !death(value)), 2_000, 5_000);
+          const processes = owned.owned().map(value => ({ ...value, death: death(value) ?? "UNKNOWN_OR_LIVE" }));
+          fs.writeFileSync(path.join(root, "owned-terminal-evidence.json"), JSON.stringify(processes, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+          if (processes.some(value => value.death === "UNKNOWN_OR_LIVE")) throw new Error("Native fixture still has an unconfirmed owned process");
+          terminal = true;
+        }
+        finally {
+          observations.close(); mesh.closeState(); privateTemp.assertNoOutsideDeletion();
+          // LAST: never seal a manifest while a known writer is still live or
+          // unconfirmed. On failure the launcher retains the entire unsealed root.
+          if (terminal) retainManifest();
+        }
       }
     },
   };

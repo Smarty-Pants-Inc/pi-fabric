@@ -3,7 +3,8 @@
 // synthetic KV/delivery + synthetic owner ACKs, NO broker, native callback, SDK, app or installed
 // ca4 artifact. Corruption refusal proves safety, NOT restored traffic. Parent owns execution.
 // Platform gap: native receipt production needs POSIX modes/no-follow/directory fsync; Windows
-// skips this coverage, never counts as rollback proof. Missing local old history/locks FAIL loudly.
+// skips this coverage, never counts as rollback proof. Missing pinned old history/archive FAIL loudly.
+// R4 additions below are PREPARED/UNRUN; historical 11-case SOURCE receipt does not cover them.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -505,6 +506,101 @@ describe.skipIf(!POSIX)("N12 exact-ca4 SOURCE-reader (installed compiled-artifac
       expect(fs.readFileSync(path.join(sealedTail, BRIDGE_NATS_LEDGER_FILE))).toEqual(damaged);
       expect(evidence(working).native).toEqual(pristine.native);
       unchangedOriginals();
+    });
+
+  it.each(["mode", "uid"] as const)(
+    "R4: candidate OPEN refuses receipt-directory %s drift; ca4 SOURCE ignores it without changing evidence", async defect => {
+      const working = ownCopy(`directory-open-${defect}`), directory = path.join(working, NATIVE_INGRESS_DIRECTORY);
+      const before = evidence(working), realLstat = fs.lstatSync.bind(fs);
+      // Mode fault is real on the test-owned directory. UID is injected only at its stat boundary:
+      // no privileged chown or claim that this is an installed-filesystem ownership-drift probe.
+      if (defect === "mode") fs.chmodSync(directory, 0o750);
+      const stat = vi.spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof fs.lstatSync>) => {
+        const result = realLstat(...args);
+        if (defect === "uid" && String(args[0]) === directory && result) {
+          return new Proxy(result, { get: (target, property) => property === "uid" ? process.geteuid!() + 1 : Reflect.get(target, property) });
+        }
+        return result;
+      }) as typeof fs.lstatSync);
+      try {
+        await expect(openBridgeNatsLedger({ dir: working, clock: () => candidate.now })).rejects.toThrow(/unsafe receipt directory/);
+        noLock(working);
+        const old = await source.openBridgeNatsLedger({ dir: working, clock: () => candidate.now });
+        try {
+          expect(snapshot(old, candidate.commands, candidate.seen)).toEqual(candidate.expected);
+          expect(evidence(working)).toEqual(before);
+        } finally { await old.close(); }
+      } finally { stat.mockRestore(); if (defect === "mode") fs.chmodSync(directory, 0o700); }
+      // Explicit fault removal is TEST setup, never an automatic production repair policy.
+      const reopened = await openBridgeNatsLedger({ dir: working, clock: () => candidate.now });
+      try { expect(snapshot(reopened, candidate.commands, candidate.seen)).toEqual(candidate.expected); }
+      finally { await reopened.close(); }
+      noLock(working); unchangedOriginals();
+    });
+
+  it.each(["mode", "uid"] as const)(
+    "R4: receipt-directory %s drift after compaction rename fail-stops later mutations until valid reopen", async defect => {
+      const working = ownCopy(`directory-compact-${defect}`), directory = path.join(working, NATIVE_INGRESS_DIRECTORY);
+      const clock = { now: candidate.now - BRIDGE_NATS_HORIZON_MS - 1 };
+      const ledger = await openBridgeNatsLedger({ dir: working, clock: () => clock.now, minCompactLines: 1 });
+      const receipts = evidence(working).native, realLstat = fs.lstatSync.bind(fs);
+      const file = path.join(working, BRIDGE_NATS_LEDGER_FILE), inode = fs.statSync(file);
+      const lineCount = () => fs.readFileSync(file, "utf8").trimEnd().split("\n").length;
+      const originalLines = lineCount(), retainedCount = candidate.commands.length + candidate.seen.length;
+      // Bound DISTINCT durable writes by the complete known fixture, including the fresh trigger.
+      // At the past bookkeeping clock every pressure record is live, so seeding cannot compact.
+      // Advance only forward to candidate.now: all ORIGINAL claims/seen/receipts remain live and
+      // unchanged. This component clock is not wall-clock liveness/idle/600s evidence.
+      const pressure = Array.from({ length: 4 * (retainedCount + 1) }, (_, index) => `r4-expired-pressure-${index}`);
+      try {
+        expect(snapshot(ledger, candidate.commands, candidate.seen)).toEqual(candidate.expected);
+        for (const id of pressure) expect((await ledger.markSeen("toFile", id)).expiresAt).toBeLessThan(candidate.now);
+        expect(lineCount()).toBe(originalLines + pressure.length);
+        expect(fs.statSync(file).ino).toBe(inode.ino);
+        clock.now = candidate.now;
+        expect(snapshot(ledger, candidate.commands, candidate.seen)).toEqual(candidate.expected);
+      } catch (error) { await ledger.close(); throw error; }
+      if (defect === "mode") fs.chmodSync(directory, 0o750);
+      const stat = vi.spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof fs.lstatSync>) => {
+        const result = realLstat(...args);
+        if (defect === "uid" && String(args[0]) === directory && result) {
+          return new Proxy(result, { get: (target, property) => property === "uid" ? process.geteuid!() + 1 : Reflect.get(target, property) });
+        }
+        return result;
+      }) as typeof fs.lstatSync);
+      try {
+        // Normal append crosses the STRICT lines > 4*live threshold with expired pressure.
+        // A changed real inode + exact retained line count prove actual replacement, not a
+        // private compactor call, mocked rename success or a source-text assertion.
+        await ledger.markSeen("toFile", "r4-compaction-trigger");
+        const compacted = fs.statSync(file);
+        expect(compacted.dev).toBe(inode.dev); expect(compacted.ino).not.toBe(inode.ino);
+        expect(lineCount()).toBe(retainedCount + 1);
+        for (const id of pressure) expect(ledger.seen("toFile", id)).toBeUndefined();
+        expect(snapshot(ledger, candidate.commands, candidate.seen)).toEqual(candidate.expected);
+        // The rename-triggering mutation may resolve; its post-rename prune fault latches #failed.
+        // Probe the NEXT public mutation: an existing-key dedupe must not bypass CLOSED either.
+        let stopped = false;
+        try { await ledger.markSeen("toFile", "r4-compaction-trigger"); }
+        catch (error) { expect(error).toMatchObject({ code: "BRIDGE_NATS_LEDGER_CLOSED" }); stopped = true; }
+        expect(stopped).toBe(true);
+        await expect(ledger.markSeen("toFile", "r4-after-fail-stop")).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_CLOSED" });
+        expect(ledger.seen("toFile", "r4-after-fail-stop")).toBeUndefined();
+        expect(evidence(working).native).toEqual(receipts);
+      } finally {
+        stat.mockRestore(); if (defect === "mode") fs.chmodSync(directory, 0o700);
+        await ledger.close();
+      }
+      noLock(working);
+      const reopened = await openBridgeNatsLedger({ dir: working, clock: () => candidate.now });
+      try {
+        expect(snapshot(reopened, candidate.commands, candidate.seen)).toEqual(candidate.expected);
+        expect(reopened.seen("toFile", "r4-compaction-trigger")).toBeDefined();
+        expect(reopened.seen("toFile", "r4-after-fail-stop")).toBeUndefined();
+        for (const id of pressure) expect(reopened.seen("toFile", id)).toBeUndefined();
+        expect(evidence(working).native).toEqual(receipts);
+      } finally { await reopened.close(); }
+      noLock(working); unchangedOriginals();
     });
 
   it("refuses TWO damaged suffix appends instead of labelling arbitrary evidence loss a crash tail", async () => {

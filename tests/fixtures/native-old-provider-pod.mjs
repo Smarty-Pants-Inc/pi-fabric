@@ -5,9 +5,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { createHash } from "node:crypto";
 import { createJiti } from "jiti";
 import { assertApprovedNativeSdk, isNativeSdkUnconfigured } from "../helpers/native-sdk-no-model.ts";
-import { nativeOwnerSession, takeNativeOwnerSessionFence } from "./native-owner-session.mjs";
+import { nativeOwnerSession } from "./native-owner-session.mjs";
 
 process.umask(0o077);
 const pinsFile = process.env.FABRIC_NATIVE_OLD_POD_PINS;
@@ -32,8 +33,14 @@ process.once("exit", code => trace({ event: "native-exit", code, outsideDeletion
 
 // FIRST native session touch is behind this actual process's kernel lifetime fence.
 // fd stays open until process death, never an early session-disposal unlock.
+assert.ok(typeof pins.nativeOwnerEntry === "string" && path.isAbsolute(pins.nativeOwnerEntry) &&
+  fs.realpathSync(pins.nativeOwnerEntry) === pins.nativeOwnerEntry, "Explicit canonical compiled native owner entry required");
+assert.match(pins.nativeOwnerEntrySha256 ?? "", /^[0-9a-f]{64}$/);
+assert.equal(createHash("sha256").update(fs.readFileSync(pins.nativeOwnerEntry)).digest("hex"), pins.nativeOwnerEntrySha256,
+  "Old-pod compiled product generation changed");
+const { takeNativeOwnerSessionFence } = await import(pathToFileURL(pins.nativeOwnerEntry).href);
 const fence = takeNativeOwnerSessionFence(pins.sessionFile);
-const pin = await nativeOwnerSession("provision", pins.sdkDirectory, pins.sessionFile, pins.cwd, pins.sessionPin, fence);
+const pin = await nativeOwnerSession("provision", pins.sdkDirectory, pins.sessionFile, pins.cwd, pins.sessionPin, fence, pins.nativeOwnerEntry);
 assertApprovedNativeSdk(pins.sdkDirectory);
 const sdk = await import(pathToFileURL(path.join(pins.sdkDirectory, "index.js")).href);
 const jiti = createJiti(import.meta.url, { tryNative: false, fsCache: path.join(root, "jiti-cache") });

@@ -61,6 +61,7 @@ function oldPod(owner: NativeActorOwner, broker: PathBHarness, actorId: string, 
   save(path.join(agentDir, "trust.json"), { [fs.realpathSync(cwd)]: true });
   const pins = path.join(root, "pod-pins.json");
   save(pins, { cwd, agentDir, sourceDirectory, sdkDirectory, nodeBinary, repoRoot: repo, actorId,
+    nativeOwnerEntry: owner.nativeOwnerEntry, nativeOwnerEntrySha256: digest(owner.nativeOwnerEntry),
     sessionFile: path.join(sessions, "pod.jsonl"), sessionPin: path.join(root, "session-pin.json"),
     policyEnv: broker.policyEnv, nats: { ...broker.runtimeOptions(broker.users.machineB), operatorMachine: "fabric-ops" } });
   const owned = launchLog(root);

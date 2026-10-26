@@ -36,7 +36,7 @@ import {
   type TransportHostLeaseProcessProof,
 } from "../topology/host-leases.js";
 import type { FabricKvHostLease, FabricParticipantCapability, FabricParticipantKind, FabricParticipantRecord } from "../topology/types.js";
-import type { FabricTransport, TransportKv, TransportKvEntry } from "../transport/types.js";
+import { KvConflictError, type FabricTransport, type TransportKv, type TransportKvEntry } from "../transport/types.js";
 
 /** Same refresh cadence as native KV presence (participant-view KV_PRESENCE_REFRESH_MS). */
 export const NATS_MIRROR_PRESENCE_REFRESH_MS = 180_000;
@@ -640,7 +640,7 @@ export class NatsKvMirror {
 
   #report(error: unknown): void { try { this.options.onError?.(error); } catch { /* diagnostic only */ } }
 
-  #signal(): AbortSignal { return AbortSignal.timeout(this.#timeoutMs); }
+  #signal(timeoutMs = this.#timeoutMs): AbortSignal { return AbortSignal.timeout(timeoutMs); }
 
   #serial<T>(key: string, work: () => Promise<T>): Promise<T> {
     const previous = this.#queues.get(key) ?? Promise.resolve();
@@ -689,21 +689,31 @@ export class NatsKvMirror {
   /** `recreate`: a lease whose KV row lapsed may be created again (the key is per host, under this machine). */
   async #put(kv: TransportKv, key: string, owner: string, value: unknown, ifRevision: number,
     adoptable: (entry: TransportKvEntry<unknown>) => boolean, recreate = false): Promise<number> {
-    try { return await kv.put(key, owner, value, ifRevision, this.#signal()); }
-    catch (error) {
-      if (!isUncertain(error) && !isConflict(error)) throw error;
-      // An uncertain write or a lost revision is settled by one read: ours (same owner, identity
-      // and process) is adopted at its current revision; anything else is not this link's row.
-      const current = await kv.get<unknown>(key, this.#signal());
-      if (!current) {
-        // A vanished presence row is not recreated here: only #hold may create one, after its
-        // another-machine check. A lapsed lease row is recreated (its own key, under this machine).
-        if (isConflict(error) && recreate) return await kv.put(key, owner, value, 0, this.#signal());
-        throw error;
+    // One budget for the write AND all recovery, leaving room for the renewal cadence inside
+    // the 13 s freshness window, even when operationTimeoutMs is configured above the default.
+    const signal = this.#signal(Math.min(this.#timeoutMs,
+      KV_LEASE_TTL_MS - TRANSPORT_HOST_LEASE_SAFETY_MS - this.#renewMs - 1));
+    let revision = ifRevision;
+    for (;;) {
+      signal.throwIfAborted();
+      try { return await kv.put(key, owner, value, revision, signal); }
+      catch (error) {
+        signal.throwIfAborted();
+        if (!isUncertain(error) && !isConflict(error)) throw error;
+        // Settle each lost revision by reading: only a verified foreign row means lost ownership.
+        // Our row may expire again between this read and the retry; keep recovery in this budget.
+        const current = await kv.get<unknown>(key, signal);
+        signal.throwIfAborted();
+        if (!current) {
+          // Presence needs #hold's another-machine check; only leases may be re-created here.
+          if (!isConflict(error) || !recreate) throw error;
+          revision = 0; // create-if-absent also handles the broker's expiry marker.
+          continue;
+        }
+        if (!adoptable(current)) throw new KvConflictError(key, revision);
+        if (canonicalJson(current.value) === canonicalJson(value) && current.owner === owner) return current.revision;
+        revision = current.revision;
       }
-      if (!adoptable(current)) throw error;
-      if (canonicalJson(current.value) === canonicalJson(value) && current.owner === owner) return current.revision;
-      return await kv.put(key, owner, value, current.revision, this.#signal());
     }
   }
 
@@ -717,7 +727,6 @@ export class NatsKvMirror {
       if (current && sameSpec(current.spec, spec)) return current;
       if (this.#fenced) throw new NatsMirrorFencedError();
       const owner = ownerOf(spec);
-      const startedAt = this.#monotonic();
       const value = this.#leaseValue(spec);
       if (current) {
         // The file host restarted: its newer incarnation replaces ours in one CAS, and the
@@ -725,7 +734,7 @@ export class NatsKvMirror {
         const revision = await this.#put(this.#leases, key, owner, value, current.revision, entry => this.#adoptableLease(entry, spec), true);
         const superseded = [...(this.#superseded.get(key) ?? []).filter(token => token !== current.spec.incarnation), current.spec.incarnation];
         this.#superseded.set(key, superseded.slice(-MAX_SUPERSEDED));
-        Object.assign(current, { spec, owner, revision, writtenAt: startedAt });
+        Object.assign(current, { spec, owner, revision, writtenAt: this.#monotonic() });
         return current;
       }
       let revision: number;
@@ -735,7 +744,7 @@ export class NatsKvMirror {
         if (isConflict(error)) throw new NatsMirrorRefusedError("FABRIC_BRIDGE_NATS_LEASE_CONFLICT", id, { cause: error });
         throw error;
       }
-      const lease: OwnedLease = { key, spec, owner, revision, writtenAt: startedAt };
+      const lease: OwnedLease = { key, spec, owner, revision, writtenAt: this.#monotonic() };
       this.#owned.set(key, lease);
       return lease;
     });
@@ -771,7 +780,7 @@ export class NatsKvMirror {
         existing.revision = await this.#putRow(key, owner, record, existing.revision);
         existing.record = record;
         existing.owner = owner;
-        existing.writtenAt = startedAt;
+        existing.writtenAt = this.#monotonic();
       }
       existing.claims.set(group, claim.until);
       return;
@@ -783,7 +792,7 @@ export class NatsKvMirror {
       if (isConflict(error)) throw new NatsMirrorRefusedError("FABRIC_BRIDGE_NATS_PRESENCE_CONFLICT", record.id, { cause: error });
       throw error;
     }
-    this.#rows.set(key, { key, id: record.id, record, owner, revision, writtenAt: startedAt, claims: new Map([[group, claim.until]]) });
+    this.#rows.set(key, { key, id: record.id, record, owner, revision, writtenAt: this.#monotonic(), claims: new Map([[group, claim.until]]) });
   }
 
   #putRow(key: string, owner: string, record: FabricParticipantRecord, ifRevision: number): Promise<number> {
@@ -822,12 +831,13 @@ export class NatsKvMirror {
     }
   }
 
-  #arm(): void {
-    if (this.#fenced || this.#timer || (this.#owned.size === 0 && this.#rows.size === 0)) return;
+  #arm(scheduledAt = this.#monotonic()): void {
+    if (this.#fenced || this.#timer || this.#renewing || (this.#owned.size === 0 && this.#rows.size === 0)) return;
+    const next = scheduledAt + this.#renewMs;
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
-      void this.renew().catch(error => this.#report(error)).finally(() => this.#arm());
-    }, this.#renewMs);
+      void this.renew().catch(error => this.#report(error)).finally(() => this.#arm(next));
+    }, Math.max(0, next - this.#monotonic()));
     this.#timer.unref?.();
   }
 
@@ -841,11 +851,10 @@ export class NatsKvMirror {
       await Promise.all([...this.#owned.values()].map(lease => this.#serial(lease.key, async () => {
         if (this.#fenced || this.#owned.get(lease.key) !== lease) return;
         if (this.#leaseUntil(lease) <= this.#monotonic()) { await this.#dropLease(lease); return; }
-        const startedAt = this.#monotonic();
         try {
           lease.revision = await this.#put(this.#leases, lease.key, lease.owner, this.#leaseValue(lease.spec), lease.revision,
             entry => this.#adoptableLease(entry, lease.spec), true);
-          lease.writtenAt = startedAt;
+          lease.writtenAt = this.#monotonic();
         } catch (error) {
           if (isConflict(error)) {
             // Another writer owns the key now: stop renewing; never fight it.
@@ -858,10 +867,9 @@ export class NatsKvMirror {
       await Promise.all([...this.#rows.values()].map(row => this.#serial(row.key, async () => {
         if (this.#fenced || this.#rows.get(row.key) !== row || now - row.writtenAt < NATS_MIRROR_PRESENCE_REFRESH_MS) return;
         if (![...row.claims.values()].some(until => until > this.#monotonic())) return;
-        const startedAt = this.#monotonic();
         try {
           row.revision = await this.#putRow(row.key, row.owner, row.record, row.revision);
-          row.writtenAt = startedAt;
+          row.writtenAt = this.#monotonic();
         } catch (error) {
           if (isConflict(error)) this.#rows.delete(row.key);
           throw error;

@@ -12,7 +12,7 @@ import { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import type { TransportHostLeaseProcessProof } from "../src/topology/host-leases.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import { advance, hKey, kvWorld as world, natsLease, pKey, seedNative, type Clock } from "./helpers/bridge-nats-kv.js";
-import { TransportDeniedError, type FabricTransport } from "../src/transport/types.js";
+import { TransportDeniedError, TransportUncertainError, type FabricTransport, type TransportKv } from "../src/transport/types.js";
 
 const BRIDGE = "ryzen1-bridge";
 const V2 = "v2-org";
@@ -22,15 +22,23 @@ const PROOF: TransportHostLeaseProcessProof = { pid: 4242, pidStartTime: "777", 
 const OTHER_PROOF: TransportHostLeaseProcessProof = { pid: 999, pidStartTime: "555", bootId: PROOF.bootId };
 
 const openers: Array<{ close(): Promise<void> }> = [];
-afterEach(async () => { await Promise.allSettled(openers.splice(0).map(item => item.close())); });
+afterEach(async () => {
+  const closing = Promise.allSettled(openers.splice(0).map(item => item.close()));
+  if (vi.isFakeTimers()) await vi.runAllTimersAsync();
+  await closing;
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 function bridge(w: ReturnType<typeof world>, options: { admit?: (record: FabricParticipantRecord, direction: string) => boolean;
-  predecessorExited?: (proof: TransportHostLeaseProcessProof) => boolean; clock?: Clock; log?: string[] } = {}) {
+  predecessorExited?: (proof: TransportHostLeaseProcessProof) => boolean; clock?: Clock; log?: string[];
+  transport?: FabricTransport; operationTimeoutMs?: number } = {}) {
   const clock = options.clock ?? { wall: 1_000_000, mono: 50_000 };
   const side = new NatsBridgePresence({
-    transport: w.transport(BRIDGE, "bridge:ryzen1"), link: "nats", admit: options.admit ?? (() => true),
+    transport: options.transport ?? w.transport(BRIDGE, "bridge:ryzen1"), link: "nats", admit: options.admit ?? (() => true),
     processProof: PROOF, predecessorExited: options.predecessorExited ?? (() => false),
     now: () => clock.wall, monotonic: () => clock.mono, renewMs: 5_000,
+    ...(options.operationTimeoutMs !== undefined ? { operationTimeoutMs: options.operationTimeoutMs } : {}),
     ...(options.log ? { log: (line: string) => { options.log!.push(line); } } : {}),
   });
   openers.push(side);
@@ -559,6 +567,10 @@ describe("file roots -> KV presence under the bridge machine", () => {
     await expect(side.writer.renew()).rejects.toMatchObject({ code: "FABRIC_KV_CONFLICT" });
     expect(side.holds(FILE_ROOT)).toBe(false);
     expect((w.leases.values.get(key)!.value as FabricKvHostLease).pid).toBe(OTHER_PROOF.pid);
+    const foreign = w.leases.values.get(key);
+    await side.writer.renew();
+    expect(side.writer.holdState(FILE_ROOT)).toBe("absent");
+    expect(w.leases.values.get(key)).toBe(foreign);
   });
 
   it("fences writes, then withdraws its own rows leases first", async () => {
@@ -578,5 +590,151 @@ describe("file roots -> KV presence under the bridge machine", () => {
     await side.withdraw();
     expect(order).toEqual(["lease", "presence"]);
     expect(w.leases.values.size + w.presence.values.size).toBe(0);
+  });
+});
+
+// Keep: smarty-dev#16958, a recorded admission loss on slow/recovering lease writes.
+describe("bridge lease renewal freshness (smarty-dev#16958)", () => {
+  async function timedBridge(operationTimeoutMs?: number) {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const w = world();
+    const base = w.transport(BRIDGE, "bridge:ryzen1");
+    const leases = base.kv("leases");
+    const transport: FabricTransport = { ...base, kv: bucket => bucket === "leases" ? leases : base.kv(bucket) };
+    const clock: Clock = { get wall() { return Date.now(); }, get mono() { return Date.now(); } };
+    const { side } = bridge(w, { clock, transport, ...(operationTimeoutMs !== undefined ? { operationTimeoutMs } : {}) });
+    await side.whenReady();
+    // The bridge's own identity is claimed until fenced, independent of file-sample expiry.
+    await side.writer.replace("self", [{ record: projectNatsMirrorRecord(fileRoot())!, until: Infinity }], true);
+    return { w, side, clock, leases, key: hKey(BRIDGE, FILE_ROOT) };
+  }
+
+  const delay = (ms: number, signal?: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
+    const abort = (): void => { clearTimeout(timer); reject(signal!.reason); };
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, ms);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+  });
+
+  it("keeps admission through two 4 s writes and renews from the previous scheduled time", async () => {
+    const { side, leases } = await timedBridge();
+    const put = leases.put.bind(leases);
+    const starts: number[] = [], admitted: boolean[] = [];
+    vi.spyOn(leases, "put").mockImplementation(async (...args) => {
+      starts.push(Date.now());
+      if (starts.length <= 2) {
+        await delay(4_000, args[4]);
+        admitted.push(side.holds(FILE_ROOT));
+      }
+      return put(...args);
+    });
+    await vi.advanceTimersByTimeAsync(18_000);
+    expect(admitted).toEqual([true, true]);
+    expect(starts.slice(0, 2)).toEqual([1_005_000, 1_010_000]);
+    expect(side.writer.holdState(FILE_ROOT)).toBe("live");
+  });
+
+  it("records a successful put/get/put recovery at its ack, leaving the row fresh", async () => {
+    const { side, leases } = await timedBridge();
+    const put = leases.put.bind(leases), get = leases.get.bind(leases);
+    let attempts = 0;
+    vi.spyOn(leases, "put").mockImplementation(async (...args) => {
+      await delay(++attempts === 1 ? 2_000 : 1_000, args[4]);
+      if (attempts === 1) throw new TransportUncertainError(args[0], { owner: args[1], value: args[2] });
+      return put(...args);
+    });
+    vi.spyOn(leases, "get").mockImplementation((async (...args) => {
+      await delay(1_000, args[1]);
+      return get(...args);
+    }) as TransportKv["get"]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const recovery = side.writer.renew();
+    await vi.advanceTimersByTimeAsync(4_000);
+    await recovery;
+    expect(attempts).toBe(2);
+    await side.fence();
+    await vi.advanceTimersByTimeAsync(9_000);
+    expect(side.writer.holdState(FILE_ROOT)).toBe("live");
+  });
+
+  it("recreates a lease that expires between recovery's get and put, then keeps renewing", async () => {
+    const { w, side, leases, key, clock } = await timedBridge();
+    const original = w.leases.values.get(key)!;
+    const moved = w.leases.put(key, original.owner, original.value, original.revision);
+    const put = leases.put.bind(leases);
+    const revisions: number[] = [];
+    vi.spyOn(leases, "put").mockImplementation(async (...args) => {
+      revisions.push(args[3]);
+      if (revisions.length === 2) w.leases.expire(key);
+      return put(...args);
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(side.writer.renew()).resolves.toBeUndefined();
+    expect(revisions).toEqual([original.revision, moved, 0]);
+    expect(side.holds(FILE_ROOT)).toBe(true);
+    const recreated = w.leases.values.get(key)!;
+    expect(recreated.owner).toBe(original.owner);
+    expect((recreated.value as FabricKvHostLease).updatedAt).toBe(clock.wall);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await side.writer.renew();
+    expect(w.leases.values.get(key)!.revision).toBeGreaterThan(recreated.revision);
+    expect(side.writer.holdState(FILE_ROOT)).toBe("live");
+  });
+
+  it("does not overwrite a foreign writer that wins the expiry/recreate race", async () => {
+    const { w, side, leases, key, clock } = await timedBridge();
+    const original = w.leases.values.get(key)!;
+    w.leases.put(key, original.owner, original.value, original.revision);
+    const put = leases.put.bind(leases);
+    let attempts = 0;
+    vi.spyOn(leases, "put").mockImplementation(async (...args) => {
+      if (++attempts === 2) {
+        w.leases.expire(key);
+        w.leases.put(key, original.owner, { ...natsLease(FILE_ROOT, "file-inc-1", clock.wall), ...OTHER_PROOF }, 0);
+      }
+      return put(...args);
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(side.writer.renew()).rejects.toMatchObject({ code: "FABRIC_KV_CONFLICT" });
+    const foreign = w.leases.values.get(key)!;
+    expect((foreign.value as FabricKvHostLease).pid).toBe(OTHER_PROOF.pid);
+    expect(side.writer.holdState(FILE_ROOT)).toBe("absent");
+    await side.writer.renew();
+    expect(w.leases.values.get(key)).toBe(foreign);
+  });
+
+  it.each([5_000, 30_000])("gives the entire recovery one bounded budget (configured %i ms)", async operationTimeoutMs => {
+    const { side, leases } = await timedBridge(operationTimeoutMs);
+    // Node's native AbortSignal.timeout uses real time; drive it with this test's fake clock.
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("budget expired", "TimeoutError")), ms);
+      return controller.signal;
+    });
+    const put = leases.put.bind(leases), get = leases.get.bind(leases);
+    let attempts = 0;
+    const signals: Array<AbortSignal | undefined> = [];
+    vi.spyOn(leases, "put").mockImplementation(async (...args) => {
+      signals.push(args[4]);
+      await delay(4_000, args[4]);
+      if (++attempts === 1) throw new TransportUncertainError(args[0], { owner: args[1], value: args[2] });
+      return put(...args);
+    });
+    vi.spyOn(leases, "get").mockImplementation((async (...args) => {
+      signals.push(args[1]);
+      await delay(4_000, args[1]);
+      return get(...args);
+    }) as TransportKv["get"]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    let settled = false, failure: unknown;
+    void side.writer.renew().then(() => { settled = true; }, error => { settled = true; failure = error; });
+    // Even a large configured timeout must finish before the previous ack reaches 13 s.
+    await vi.advanceTimersByTimeAsync(operationTimeoutMs === 5_000 ? 5_000 : 7_999);
+    expect(settled).toBe(true);
+    expect(failure).toMatchObject({ name: "TimeoutError" });
+    expect(new Set(signals).size).toBe(1);
+    expect(timeout).toHaveBeenCalledTimes(1);
+    expect(side.writer.holdState(FILE_ROOT)).toBe("live");
   });
 });

@@ -4,8 +4,8 @@ import { performance } from "node:perf_hooks";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
-import { TransportUnavailableError } from "../src/transport/types.js";
-import { kvWorld, pKey } from "./helpers/bridge-nats-kv.js";
+import { TransportUnavailableError, TransportUncertainError } from "../src/transport/types.js";
+import { hKey, kvWorld, natsLease, pKey } from "./helpers/bridge-nats-kv.js";
 
 const MACHINE = "test-machine";
 const ROOT = "session:jitter-root";
@@ -203,5 +203,129 @@ describe("KV participant presence refresh jitter", () => {
     expect(put).toHaveBeenCalledTimes(fail ? 1 : 0);
     expect(random).toHaveBeenCalledTimes(fail ? 2 : 1);
     expect(f.view.ready).toBe(false);
+  });
+});
+
+// Keep: PR #1624's real restart exposed a lost confirmed receipt after an uncertain
+// heartbeat update. Recovery must not turn a read revision into takeover authority.
+async function restartPresence() {
+  const f = await fixture(() => 1);
+  f.world.leases.put(hKey(MACHINE, ROOT), `${ROOT}#inc-1`, natsLease(ROOT, "inc-1", Date.now()), 0);
+  await vi.advanceTimersByTimeAsync(0);
+  const initial: FabricParticipantRecord = { ...record(ROOT), kind: "root", transport: "host" };
+  const first = await f.view.publish(initial);
+  const attempted = { ...initial, status: "idle" };
+  return { ...f, initial, first, attempted, key: pKey(MACHINE, ROOT) };
+}
+
+async function interruptPresence(f: Awaited<ReturnType<typeof restartPresence>>, committed: boolean) {
+  let readable = true;
+  const get = f.world.presence.values.get.bind(f.world.presence.values);
+  vi.spyOn(f.world.presence.values, "get").mockImplementation(key => {
+    if (!readable) throw new TransportUnavailableError("broker disconnected during presence reconciliation");
+    return get(key);
+  });
+  const put = f.world.presence.put.bind(f.world.presence);
+  vi.spyOn(f.world.presence, "put").mockImplementationOnce((...args) => {
+    if (committed) put(...args);
+    readable = false;
+    throw new TransportUncertainError(args[0], { owner: args[1], value: args[2] });
+  });
+  await expect(f.view.publish(f.attempted)).rejects.toBeInstanceOf(TransportUncertainError);
+  await vi.advanceTimersByTimeAsync(0); // The event-driven cleanup read is unavailable too.
+  readable = true;
+  return put;
+}
+
+describe("restart presence receipt recovery #1624", () => {
+  it("restores only the exact previously confirmed receipt when the uncertain update did not commit", async () => {
+    const f = await restartPresence();
+    await interruptPresence(f, false);
+    await f.view.reconcilePendingCleanup();
+    expect(f.revision(ROOT)).toBe(f.first.revision);
+    const put = vi.spyOn(f.world.presence, "put");
+    await expect(f.view.publish(f.attempted)).resolves.toHaveProperty("revision");
+    expect(put.mock.calls.at(-1)?.[3]).toBe(f.first.revision);
+    expect(f.world.presence.values.get(f.key)?.value).toEqual(f.attempted);
+  });
+
+  it("cleans an uncertain committed attempt, then creates safely instead of adopting its unknown revision", async () => {
+    const f = await restartPresence();
+    await interruptPresence(f, true);
+    const uncertainRevision = f.revision(ROOT)!;
+    expect(uncertainRevision).toBeGreaterThan(f.first.revision);
+    const remove = vi.spyOn(f.world.presence, "delete");
+    await f.view.reconcilePendingCleanup();
+    expect(remove.mock.calls).toEqual([[f.key, uncertainRevision]]);
+    expect(f.revision(ROOT)).toBeUndefined();
+    const put = vi.spyOn(f.world.presence, "put");
+    await expect(f.view.publish(f.attempted)).resolves.toHaveProperty("revision");
+    expect(put.mock.calls.at(-1)?.[3]).toBe(0);
+  });
+
+  it.each(["foreign owner", "same-incarnation unknown revision", "new generation"] as const)(
+    "does not restore, overwrite or delete a %s observed during reconciliation", async winnerKind => {
+      const f = await restartPresence();
+      const put = await interruptPresence(f, false);
+      const winner = winnerKind === "foreign owner"
+        ? { ...f.initial, ownerHostId: "other-host", ownerIdentityId: "other-host", ownerIncarnation: "other-inc" }
+        : winnerKind === "new generation" ? { ...f.initial, ownerIncarnation: "inc-2" } : f.initial;
+      const revision = put(f.key, `${winner.ownerHostId}#${winner.ownerIncarnation}`, winner, f.first.revision);
+      if (winnerKind === "new generation") {
+        const leaseKey = hKey(MACHINE, ROOT);
+        f.world.leases.put(leaseKey, `${ROOT}#inc-2`, natsLease(ROOT, "inc-2", Date.now()),
+          f.world.leases.values.get(leaseKey)!.revision);
+      }
+      const remove = vi.spyOn(f.world.presence, "delete");
+      await f.view.reconcilePendingCleanup();
+      await expect(f.view.publish(f.attempted)).rejects.toThrow();
+      await expect(f.view.publish(f.attempted, { force: true })).rejects.toThrow();
+      expect(remove).not.toHaveBeenCalled();
+      expect(f.world.presence.values.get(f.key)).toMatchObject({ revision, value: winner });
+    });
+
+  it("does not delete a new generation that wins the cleanup CAS", async () => {
+    const f = await restartPresence();
+    const put = await interruptPresence(f, true);
+    const remove = f.world.presence.delete.bind(f.world.presence);
+    const winner = { ...f.initial, ownerIncarnation: "inc-2" };
+    let winnerRevision = 0;
+    vi.spyOn(f.world.presence, "delete").mockImplementationOnce((key, revision) => {
+      winnerRevision = put(key, `${ROOT}#inc-2`, winner, revision);
+      const leaseKey = hKey(MACHINE, ROOT);
+      f.world.leases.put(leaseKey, `${ROOT}#inc-2`, natsLease(ROOT, "inc-2", Date.now()),
+        f.world.leases.values.get(leaseKey)!.revision);
+      return remove(key, revision);
+    });
+    await f.view.reconcilePendingCleanup();
+    await expect(f.view.publish(f.attempted)).rejects.toThrow();
+    expect(winnerRevision).toBeGreaterThan(0);
+    expect(f.world.presence.values.get(f.key)).toMatchObject({ revision: winnerRevision, value: winner });
+  });
+
+  it("withdraws the confirmed predecessor on close instead of restoring a closed owner", async () => {
+    const f = await restartPresence();
+    await interruptPresence(f, false);
+    await f.view.close();
+    expect(f.revision(ROOT)).toBeUndefined();
+    const writes = [...f.world.writes];
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(f.world.writes).toEqual(writes);
+  });
+
+  it("retires the stale receipt when a confirmed refresh settles after its lease gate closes", async () => {
+    const f = await restartPresence();
+    let live = true;
+    f.view.options.lease.live = () => live;
+    const put = f.world.presence.put.bind(f.world.presence);
+    vi.spyOn(f.world.presence, "put").mockImplementationOnce((...args) => {
+      const revision = put(...args);
+      live = false;
+      return revision;
+    });
+    await expect(f.view.publish(f.attempted)).rejects.toThrow("Owner lease lost before launch admission settled");
+    await f.view.reconcilePendingCleanup();
+    live = true;
+    await expect(f.view.publish(f.attempted)).resolves.toHaveProperty("revision");
   });
 });

@@ -9,8 +9,8 @@ import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import { LIVENESS_POLICY_KEY, readHostLeaseCurrent, TransportHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
-import { TransportUnavailableError, type FabricTransport } from "../src/transport/types.js";
-import { hKey, kvWorld, pKey } from "./helpers/bridge-nats-kv.js";
+import { TransportUnavailableError, TransportUncertainError, type FabricTransport } from "../src/transport/types.js";
+import { hKey, kvWorld, natsLease, pKey, seedNative } from "./helpers/bridge-nats-kv.js";
 
 // Keep: #6477's synchronized renewals and the admission failure path. Real directory,
 // lease, carrier and projection; only the broker and elapsed time are fixtures.
@@ -54,6 +54,8 @@ async function nats(id: string, random: () => number, live?: () => boolean, reco
   const renewals: number[] = [];
   let renewalDelay = 0;
   const renewalPlan: Array<{ delay: number; fail?: boolean }> = [];
+  const fault = { down: false, presenceDelay: 0, sampleSourceTime: false,
+    presenceWrites: [] as number[], uncertainWrites: 0, unavailableReads: 0, failedRenewals: 0 };
   const transport: FabricTransport = { ...base,
     onVerifiedReconnect(listener) {
       listeners.add(listener);
@@ -61,16 +63,43 @@ async function nats(id: string, random: () => number, live?: () => boolean, reco
       return () => { listeners.delete(listener); };
     },
     kv(bucket) {
-      if (bucket === "presence") return presenceKv;
-      if (bucket !== "leases") return base.kv(bucket);
-      return { ttlMs: leases.ttlMs, get: leases.get.bind(leases), delete: leases.delete.bind(leases), watch: leases.watch.bind(leases),
+      if (bucket === "presence") return {
+        ttlMs: presenceKv.ttlMs, delete: presenceKv.delete.bind(presenceKv), watch: presenceKv.watch.bind(presenceKv),
+        async get(key, signal) {
+          if (fault.down) {
+            fault.unavailableReads++;
+            throw new TransportUnavailableError("disconnected presence read");
+          }
+          return presenceKv.get(key, signal);
+        },
         async put(key, owner, value, revision, signal) {
+          if (fault.down) throw new TransportUnavailableError("disconnected before presence write");
+          fault.presenceWrites.push(Date.now());
+          if (fault.presenceDelay) await new Promise<void>(resolve => setTimeout(resolve, fault.presenceDelay));
+          if (fault.down) {
+            fault.uncertainWrites++;
+            throw new TransportUncertainError(key, { owner, value });
+          }
+          return presenceKv.put(key, owner, value, revision, signal);
+        },
+      };
+      if (bucket !== "leases") return base.kv(bucket);
+      return { ttlMs: leases.ttlMs, delete: leases.delete.bind(leases), watch: leases.watch.bind(leases),
+        async get(key, signal) {
+          if (fault.down) throw new TransportUnavailableError("disconnected lease read");
+          return leases.get(key, signal);
+        },
+        async put(key, owner, value, revision, signal) {
+          if (fault.down) throw new TransportUnavailableError("disconnected lease write");
           if (revision > 0) {
             renewals.push(Date.now());
             const step = renewalPlan.shift();
             const delay = step?.delay ?? renewalDelay;
             if (delay) await new Promise<void>(resolve => setTimeout(resolve, delay));
-            if (step?.fail) throw new TransportUnavailableError("injected renewal failure");
+            if (step?.fail) {
+              fault.failedRenewals++;
+              throw new TransportUnavailableError("injected renewal failure");
+            }
           }
           return leases.put(key, owner, value, revision, signal);
         } };
@@ -83,9 +112,10 @@ async function nats(id: string, random: () => number, live?: () => boolean, reco
     reapDeadHosts: false, ...(live ? { live } : {}) });
   directories.push(directory);
   const rootRecord = record(id);
-  directory.registerSource(() => [rootRecord]);
+  directory.registerSource(() => fault.sampleSourceTime
+    ? [{ ...rootRecord, startedAt: Date.now(), updatedAt: Date.now() }] : [rootRecord]);
   await directory.start();
-  return { directory, world, renewals, rootRecord, presenceKv,
+  return { directory, world, renewals, rootRecord, presenceKv, fault,
     reconnect() { for (const listener of listeners) listener(); },
     delayRenewal(ms: number) { renewalDelay = ms; },
     planRenewals(...steps: Array<{ delay: number; fail?: boolean }>) { renewalPlan.push(...steps); },
@@ -108,12 +138,58 @@ async function expectContinuedAdmission(f: Awaited<ReturnType<typeof nats>>) {
   // Immediate fixture PubAcks: these request-start gaps also bound every lease age,
   // not just the sampled admission checks above. No cutoff/recovery gap is allowed.
   for (let i = 1; i < f.renewals.length; i++) {
-    expect(f.renewals[i]! - f.renewals[i - 1]!).toBeLessThanOrEqual(6_100);
+    expect(f.renewals[i]! - f.renewals[i - 1]!).toBeLessThanOrEqual(5_100);
   }
 }
 
 // Native local successor proof requires /proc. FILE coverage runs on every platform.
 describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", () => {
+  // Keep: the real restart test regenerates startedAt on every snapshot. An actual
+  // timer-driven presence CAS crosses the broker stop; retime it with the safe 5s cap.
+  it("P1-a: recovers an uncertain in-flight heartbeat after a full broker lease expiry", async () => {
+    clock();
+    const f = await nats("restart-receipt-loss", () => 1);
+    f.fault.sampleSourceTime = true;
+    const at = Date.now(), previous = structuredClone(f.presence());
+    await vi.advanceTimersByTimeAsync(4_500);
+    f.fault.presenceDelay = 200;
+    await vi.advanceTimersByTimeAsync(600); // The 5s heartbeat CAS is awaiting its PubAck.
+    expect(f.fault.presenceWrites.at(-1)).toBe(at + 5_000);
+    expect(f.presence()).toEqual(previous); // Attempt not stored before disconnect.
+    f.fault.down = true;
+    f.world.presence.gap(); f.world.leases.gap();
+    await vi.advanceTimersByTimeAsync(17_000);
+    expect(f.fault.uncertainWrites).toBe(1);
+    expect(f.fault.unavailableReads).toBeGreaterThan(0); // Actual failed reconciliation, not an avoided write.
+    expect(f.presence()).toEqual(previous); // The exact confirmed predecessor survived.
+    f.world.leases.expire(hKey("machine-a", f.rootRecord.id));
+    f.fault.down = false; f.fault.presenceDelay = 0;
+    f.world.presence.resnapshot(); f.world.leases.resnapshot();
+    f.reconnect();
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(f.directory.canConsumeMesh()).toBe(true);
+    await expect(f.directory.refresh()).resolves.toBeUndefined();
+    expect(f.directory.participantView?.resolve(f.rootRecord.id)?.live).toBe(true);
+    expect(f.presence().value).toMatchObject({ ownerIncarnation: f.directory.ownerIncarnation, startedAt: Date.now() });
+  });
+
+  // Keep: round-2 P1-b's slow failure must exercise the failed turn AND its retry,
+  // including the exact RNG endpoints, without a transient admission/recovery gap.
+  it.each([0, 1].flatMap(random => [4_900, 5_000].map(delay => ({ random, delay }))))(
+    "keeps admission through a $delay ms failure and 2.5s retry (random $random)", async ({ random, delay }) => {
+      clock();
+      const f = await nats(`slow-retry-${random}-${delay}`, () => random);
+      f.planRenewals({ delay: 0 }, { delay, fail: true }, { delay: 2_500 });
+      for (let elapsed = 0; elapsed < 25_000; elapsed += 100) {
+        await vi.advanceTimersByTimeAsync(100);
+        expect(f.directory.canConsumeMesh()).toBe(true);
+        expect(f.directory.transportLeaseSignal?.aborted).toBe(false);
+        expect(f.directory.participantView?.resolve(f.rootRecord.id)?.live).toBe(true);
+      }
+      expect(f.fault.failedRenewals).toBe(1);
+      expect(f.renewals.length).toBeGreaterThanOrEqual(4);
+    });
+
   it("samples the low and high heartbeat bounds anew on every arm", async () => {
     clock();
     let sample = 0;
@@ -125,12 +201,12 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     await vi.advanceTimersByTimeAsync(1);
     expect(f.renewals).toEqual([at + 4_000]);
     sample = 0;
-    await vi.advanceTimersByTimeAsync(5_999);
+    await vi.advanceTimersByTimeAsync(4_999);
     expect(f.renewals).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(1);
-    expect(f.renewals).toEqual([at + 4_000, at + 10_000]);
+    expect(f.renewals).toEqual([at + 4_000, at + 9_000]);
     await vi.advanceTimersByTimeAsync(4_000);
-    expect(f.renewals).toEqual([at + 4_000, at + 10_000, at + 14_000]);
+    expect(f.renewals).toEqual([at + 4_000, at + 9_000, at + 13_000]);
     expect(f.directory.canConsumeMesh()).toBe(true);
   });
 
@@ -139,13 +215,13 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     const f = await nats("jitter-slow-heartbeat", () => 1);
     const at = Date.now();
     f.planRenewals({ delay: 5_000 }, { delay: 5_000 });
-    await vi.advanceTimersByTimeAsync(10_999);
-    expect(f.renewals).toEqual([at + 6_000]);
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(f.renewals).toEqual([at + 5_000]);
     expect(f.directory.canConsumeMesh()).toBe(true);
     await vi.advanceTimersByTimeAsync(1);
-    expect(f.lease().value).toMatchObject({ updatedAt: at + 6_000, expiresAt: at + 21_000 });
+    expect(f.lease().value).toMatchObject({ updatedAt: at + 5_000, expiresAt: at + 20_000 });
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(f.renewals).toEqual([at + 6_000, at + 11_000, at + 16_000]);
+    expect(f.renewals).toEqual([at + 5_000, at + 10_000, at + 15_000]);
     expect(f.directory.canConsumeMesh()).toBe(true);
     expect(f.directory.transportLeaseSignal?.aborted).toBe(false);
   });
@@ -159,7 +235,7 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     await vi.advanceTimersByTimeAsync(4_000);
     expect(f.renewals).toEqual([at + 4_000]);
     sample = 1;
-    await vi.advanceTimersByTimeAsync(4_000); // Joins the first renewal; next tick is not until 14s.
+    await vi.advanceTimersByTimeAsync(4_000); // Joins the first renewal; its retry must not wait for the next draw.
     expect(f.renewals).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(f.renewals).toEqual([at + 4_000, at + 9_000]);
@@ -221,6 +297,205 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     expect(cleared).toHaveBeenCalledWith(originalTimer);
     expect(draws).toBe(sampledDraws);
     expect(f.directory.canConsumeMesh()).toBe(ready);
+  });
+
+  // Keep: PA's real view reset used to strand unarmed reconnect evidence. No local
+  // monotonic lease may admit while host sleep has expired the actual broker row.
+  it("rearms on actual READY after sleep, keeping admission closed through the missing row and root recheck", async () => {
+    const time = clock();
+    let draws = 0;
+    const f = await nats("ready-after-sleep", () => { draws++; return 1; });
+    const view = f.directory.participantView as KvParticipantDirectory;
+    view.options.random = () => 1;
+    const publish = view.publish.bind(view), forced: number[] = [];
+    vi.spyOn(view, "publish").mockImplementation((rec, options) => {
+      if (options?.force) forced.push(Date.now());
+      return publish(rec, options);
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    f.world.presence.gap();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(view.ready).toBe(false);
+    time.jumpWall(120_000);
+    f.world.leases.expire(hKey("machine-a", f.rootRecord.id));
+    f.delayRenewal(500);
+    f.reconnect(); f.reconnect();
+    const sampled = draws;
+    expect(f.lease()).toBeUndefined();
+    expect(f.directory.canConsumeMesh()).toBe(false);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(f.renewals).toEqual([]);
+    f.world.presence.resnapshot(); f.world.presence.resnapshot();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(view.ready).toBe(true);
+    expect(draws).toBe(sampled); // READY tightened the original deadline, never resampled it.
+    expect(f.renewals).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(499);
+    expect(f.lease()).toBeUndefined();
+    expect(f.directory.canConsumeMesh()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.lease()).toBeDefined();
+    expect(f.lease().value).toMatchObject({ rootRecheck: true });
+    expect(f.directory.canConsumeMesh()).toBe(false);
+    await vi.advanceTimersByTimeAsync(500);
+    await vi.advanceTimersByTimeAsync(1); // Deliver the recovery's queued change-refresh timer.
+    expect(f.directory.canConsumeMesh()).toBe(true);
+    expect(f.directory.participantView?.resolve(f.rootRecord.id)?.live).toBe(true);
+    expect(forced).toHaveLength(1);
+    f.delayRenewal(0);
+    f.world.presence.resnapshot();
+    f.directory.scheduleRefresh();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(forced).toHaveLength(1); // READY did not invent a reconnect generation.
+  });
+
+  it("tightens an already-armed deadline on READY when wall-only sleep happened after reconnect notification", async () => {
+    const time = clock();
+    const f = await nats("ready-armed-sleep", () => 1);
+    f.reconnect(); // Original monotonic due time is 2,999ms.
+    f.world.presence.gap();
+    await vi.advanceTimersByTimeAsync(0);
+    f.reconnect(); // Still unready, same budget and original deadline.
+    time.jumpWall(120_000); // No second verified reconnect arrives after waking.
+    const wokeAt = Date.now();
+    f.world.leases.expire(hKey("machine-a", f.rootRecord.id));
+    expect(f.directory.canConsumeMesh()).toBe(false);
+    f.world.presence.resnapshot();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(f.lease()).toBeDefined(); // READY must reconsider the now-expired wall cap too.
+    expect(f.directory.canConsumeMesh()).toBe(true);
+    expect(f.renewals[0]! - wokeAt).toBeGreaterThanOrEqual(0);
+    expect(f.renewals[0]! - wokeAt).toBeLessThanOrEqual(250);
+  });
+
+  it("retains READY observation after a failed armed renewal, cancelling the retired waiter's token", async () => {
+    clock();
+    const f = await nats("ready-after-armed-failure", () => 1);
+    const view = f.directory.participantView as KvParticipantDirectory;
+    const whenChanged = view.whenChanged.bind(view), signals: AbortSignal[] = [];
+    vi.spyOn(view, "whenChanged").mockImplementation((id, signal) => {
+      signals.push(signal);
+      return whenChanged(id, signal);
+    });
+    const at = Date.now(), before = f.presence().revision;
+    f.reconnect();
+    f.world.presence.gap();
+    await vi.advanceTimersByTimeAsync(0);
+    f.reconnect();
+    f.planRenewals({ delay: 0, fail: true });
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(f.fault.failedRenewals).toBe(1);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals.some(signal => !signal.aborted)).toBe(true); // The replacement still observes READY.
+    expect(f.presence().revision).toBe(before);
+    await vi.advanceTimersByTimeAsync(1);
+    f.world.presence.resnapshot();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.renewals).toEqual([at + 2_999, at + 3_000]);
+    expect(f.presence().revision).toBe(before + 1);
+    expect(f.directory.canConsumeMesh()).toBe(true);
+    f.directory.scheduleRefresh();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.presence().revision).toBe(before + 1);
+  });
+
+  it("never extends or resamples a READY-wait deadline through suspension, repeated snapshots or backwards wall time", async () => {
+    const time = clock();
+    let draws = 0;
+    const f = await nats("ready-deadline", () => { draws++; return 1; });
+    (f.directory.participantView as KvParticipantDirectory).options.random = () => 1;
+    const at = Date.now(), before = f.presence().revision;
+    f.world.presence.gap();
+    await vi.advanceTimersByTimeAsync(0);
+    f.reconnect(); // Unready: retain the sampled 2,999ms deadline without a timer.
+    f.directory.suspend();
+    time.age(500);
+    f.directory.resume(); // Heartbeat draw only; reconnect retains and tightens to 2,499ms.
+    const sampled = draws;
+    time.jumpWall(-86_400_000);
+    f.world.presence.resnapshot();
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < 3; i++) { f.world.presence.resnapshot(); f.reconnect(); }
+    await vi.advanceTimersByTimeAsync(2_498);
+    expect(draws).toBe(sampled);
+    expect(f.renewals).toEqual([]);
+    expect(f.presence().revision).toBe(before);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.renewals).toEqual([at - 86_400_000 + 2_499]);
+    expect(f.presence().revision).toBe(before + 1);
+    f.directory.scheduleRefresh();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.presence().revision).toBe(before + 1);
+  });
+
+  it.each(["close", "suspend"] as const)("cancels a READY waiter on %s without publishing its obsolete token", async action => {
+    clock();
+    const f = await nats(`ready-cancel-${action}`, () => 1);
+    const before = f.presence().revision;
+    f.world.presence.gap();
+    await vi.advanceTimersByTimeAsync(0);
+    f.reconnect();
+    if (action === "close") await f.directory.close();
+    else f.directory.suspend();
+    f.world.presence.resnapshot();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(f.renewals).toEqual([]);
+    expect(f.directory.heartbeatArmed).toBe(false);
+    if (action === "suspend") {
+      expect(f.presence().revision).toBe(before);
+      f.directory.resume();
+      await vi.advanceTimersByTimeAsync(998);
+      expect(f.renewals).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(f.renewals).toHaveLength(1);
+      expect(f.presence().revision).toBe(before + 1);
+    } else expect(f.world.presence.values.size).toBe(0);
+  });
+
+  it.each(["foreign owner", "new incarnation", "other machine root"] as const)(
+    "READY recovery refuses a %s rather than adopting or publishing over it", async kind => {
+      const time = clock();
+      const f = await nats(`ready-foreign-${kind.replaceAll(" ", "-")}`, () => 1);
+      f.world.presence.gap();
+      await vi.advanceTimersByTimeAsync(0);
+      time.jumpWall(120_000);
+      const key = hKey("machine-a", f.rootRecord.id);
+      f.world.leases.expire(key);
+      const foreignKey = kind === "other machine root" ? hKey("machine-b", f.rootRecord.id) : key;
+      if (kind === "other machine root") seedNative(f.world, "machine-b",
+        { ...f.rootRecord, ownerIncarnation: "foreign-generation" }, Date.now());
+      else f.world.leases.put(key, kind === "foreign owner" ? "unrelated-owner" : `${f.rootRecord.id}#new-generation`,
+        natsLease(f.rootRecord.id, "new-generation", Date.now()), 0);
+      const foreign = structuredClone(f.world.leases.values.get(foreignKey));
+      f.reconnect();
+      f.world.presence.resnapshot();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(f.directory.canConsumeMesh()).toBe(false);
+      expect(f.directory.heartbeatArmed).toBe(false);
+      expect(f.world.leases.values.get(foreignKey)).toEqual(foreign);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(f.directory.canConsumeMesh()).toBe(false);
+      expect(f.world.leases.values.get(foreignKey)).toEqual(foreign);
+    });
+
+  it("renews independently throughout an unready presence watch and its reconnect wait", async () => {
+    clock();
+    const f = await nats("unready-independent-renewals", () => 1);
+    const before = f.presence().revision;
+    f.world.presence.gap();
+    await vi.advanceTimersByTimeAsync(0);
+    f.reconnect();
+    for (let elapsed = 0; elapsed < 20_000; elapsed += 1_000) {
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(f.directory.canConsumeMesh()).toBe(false); // Readiness, never stopped lease renewal.
+      expect(f.directory.transportLeaseSignal?.aborted).toBe(false);
+    }
+    expect(f.renewals.length).toBeGreaterThanOrEqual(4);
+    expect(f.presence().revision).toBe(before);
+    f.world.presence.resnapshot();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.directory.canConsumeMesh()).toBe(true);
+    expect(f.presence().revision).toBe(before + 1);
   });
 
   it("keeps one pending reconnect timer and its original due time across unchanged-budget notifications", async () => {
@@ -353,8 +628,8 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     expect(f.directory.participantView?.resolve(f.rootRecord.id)?.live).toBe(true);
     f.directory.resume();
     expect(f.directory.canConsumeMesh()).toBe(true);
-    await vi.advanceTimersByTimeAsync(6_000);
-    expect(f.renewals).toEqual([at + 2_999, at + 9_099]);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.renewals).toEqual([at + 2_999, at + 8_099]);
     expect(f.presence().revision).toBe(confirmed); // No outstanding forced refresh.
     await expectContinuedAdmission(f);
   });
@@ -522,10 +797,10 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     const before = f.presence().revision;
     live = false;
     f.reconnect();
-    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(4_999);
     expect(f.presence().revision).toBe(before);
     live = true;
-    await vi.advanceTimersByTimeAsync(1_000); // Existing heartbeat observes the rebound owner.
+    await vi.advanceTimersByTimeAsync(1); // Existing heartbeat observes the rebound owner.
     expect(f.renewals).toHaveLength(1);
     expect(f.presence().revision).toBeGreaterThan(before);
   });
@@ -627,7 +902,7 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     await vi.advanceTimersByTimeAsync(5_000);
     expect(f.directory.canConsumeMesh()).toBe(true);
     expect(f.presence().revision).toBeGreaterThan(before);
-    expect(f.renewals).toHaveLength(1);
+    expect(f.renewals).toEqual([at + wallOffset + 999, at + wallOffset + 5_999]); // A joined heartbeat retries immediately.
     await vi.advanceTimersByTimeAsync(1_000);
     expect(f.renewals).toHaveLength(2);
     expect(f.directory.canConsumeMesh()).toBe(true);
@@ -654,7 +929,7 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
       await vi.advanceTimersByTimeAsync(0);
       expect(f.renewals).toHaveLength(1);
       expect(f.presence().revision).toBeGreaterThan(before);
-      await vi.advanceTimersByTimeAsync(5_999);
+      await vi.advanceTimersByTimeAsync(4_999);
       expect(f.renewals).toHaveLength(1);
       await vi.advanceTimersByTimeAsync(1);
       expect(f.renewals).toHaveLength(2);
@@ -681,9 +956,9 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     f.reconnect();
     time.age(13_000);
     expect(f.directory.canConsumeMesh()).toBe(false); // Triggers onSuspended and cancels the timer.
-    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(4_999);
     expect(f.renewals).toEqual([]);
-    await vi.advanceTimersByTimeAsync(1_000); // Independent normal heartbeat recovers the lease.
+    await vi.advanceTimersByTimeAsync(1); // Independent normal heartbeat recovers the lease.
     expect(f.renewals).toHaveLength(1);
     expect(f.directory.canConsumeMesh()).toBe(true);
   });
@@ -717,7 +992,7 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
       expect(f.directory.transportLeaseSignal?.aborted).toBe(false);
       expect(f.directory.heartbeatArmed).toBe(true);
     }
-    expect(f.renewals.slice(0, 3)).toEqual([at + 6_000, at + 12_000, at + 13_000]);
+    expect(f.renewals.slice(0, 3)).toEqual([at + 5_000, at + 10_000, at + 12_999]);
     expect(f.lease().value).toMatchObject({ id: f.rootRecord.id });
   });
 
@@ -766,7 +1041,7 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     expect(f.presence().revision).toBeGreaterThan(before);
     expect(f.presence().value).toMatchObject({ status: "working" });
     const changed = f.presence().revision;
-    await vi.advanceTimersByTimeAsync(2_500); // The ordinary heartbeat at 6s joins the pending renewal.
+    await vi.advanceTimersByTimeAsync(2_500); // The ordinary heartbeat at 5s joins the pending renewal.
     expect(f.directory.heartbeatArmed).toBe(true);
     expect(f.renewals).toEqual([at + 2_999]);
     expect(forcedAt).toEqual([]);
@@ -780,13 +1055,110 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     await expectContinuedAdmission(f);
   });
 
+  // Keep: PC/PD only bounded requests loosely and accepted any nonzero spread.
+  // Prove actual independently sampled recovery deadlines, both RNG edges and
+  // changing draws, while using real failed lease CASes and no interval timer.
+  it("does not let a sampled recovery wait postpone an earlier unconfirmed reconnect deadline", async () => {
+    clock();
+    let draws = 0;
+    const f = await nats("recovery-retained-reconnect", () => { draws++; return 1; });
+    (f.directory.participantView as KvParticipantDirectory).options.random = () => 1;
+    const at = Date.now(), before = f.presence().revision;
+    f.planRenewals({ delay: 0, fail: true });
+    f.reconnect();
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(f.fault.failedRenewals).toBe(1);
+    expect(f.presence().revision).toBe(before);
+    const sampled = draws;
+    await vi.advanceTimersByTimeAsync(1);
+    f.reconnect(); // Retained 2,999ms deadline is already due, despite a fresh 5s recovery draw.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(draws).toBe(sampled);
+    expect(f.renewals).toEqual([at + 2_999, at + 3_000]);
+    expect(f.presence().revision).toBe(before + 1);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(f.presence().revision).toBe(before + 1);
+    expect(f.directory.canConsumeMesh()).toBe(true);
+  });
+
+  it("samples fresh 1–5s recovery deadlines, including RNG 0/1, rather than a constant tick", async () => {
+    const time = clock();
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    let sample = 0;
+    const f = await nats("recovery-changing-draws", () => sample);
+    (f.directory.participantView as KvParticipantDirectory).options.random = () => 0.5;
+    const at = Date.now();
+    f.planRenewals(...Array.from({ length: 100 }, () => ({ delay: 0, fail: true })));
+    time.age(13_000);
+    expect(f.directory.canConsumeMesh()).toBe(false);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(f.renewals).toEqual([at + 4_000]);
+    for (const [nextSample, wait] of [[1, 1_000], [0.25, 5_000], [0.75, 2_000], [0, 4_000]] as const) {
+      sample = nextSample;
+      const count = f.renewals.length, last = f.renewals.at(-1)!;
+      await vi.advanceTimersByTimeAsync(wait - 1);
+      expect(f.renewals).toHaveLength(count);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(f.renewals.at(-1)! - last).toBe(wait);
+      expect(f.fault.failedRenewals).toBe(count + 1);
+      expect(f.directory.canConsumeMesh()).toBe(false);
+    }
+    expect(intervals).not.toHaveBeenCalled();
+  });
+
+  it("spreads recovery deadlines across simultaneously failing runtimes with independent draws", async () => {
+    const time = clock();
+    const fleet = [] as Array<Awaited<ReturnType<typeof nats>>>;
+    const samples = Array(6).fill(0) as number[];
+    const at = Date.now();
+    for (let i = 0; i < samples.length; i++) {
+      const f = await nats(`recovery-spread-${i}`, () => samples[i]!);
+      (f.directory.participantView as KvParticipantDirectory).options.random = () => 0.5;
+      f.planRenewals(...Array.from({ length: 100 }, () => ({ delay: 0, fail: true })));
+      fleet.push(f);
+      samples[i] = i / 5;
+    }
+    time.age(13_000);
+    await vi.advanceTimersByTimeAsync(4_000);
+    for (const f of fleet) expect(f.renewals).toEqual([at + 4_000]); // A truly shared outage/first turn.
+    await vi.advanceTimersByTimeAsync(5_000);
+    const next = fleet.map(f => f.renewals[1]! - at);
+    expect(next).toEqual([5_000, 5_800, 6_600, 7_400, 8_200, 9_000]);
+    expect(new Set(next).size).toBe(fleet.length);
+    expect(Math.max(...next) - Math.min(...next)).toBe(4_000);
+  });
+
+  it.each([0, 1])("bounds exhausted fast-failure attempts and cancels every recovery at RNG %s", async random => {
+    const time = clock();
+    const f = await nats(`recovery-edge-${random}`, () => random);
+    f.planRenewals(...Array.from({ length: 100 }, () => ({ delay: 0, fail: true })));
+    time.age(13_000);
+    expect(f.directory.canConsumeMesh()).toBe(false);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(f.renewals.length).toBeGreaterThanOrEqual(6);
+    expect(f.renewals.length).toBeLessThanOrEqual(27);
+    const gaps = f.renewals.slice(1).map((at, i) => at - f.renewals[i]!);
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(1_000);
+    expect(Math.max(...gaps)).toBeLessThanOrEqual(5_000);
+    expect(f.directory.transportLeaseSignal?.aborted).toBe(false);
+    const attempts = f.renewals.length;
+    await f.directory.close();
+    f.reconnect(); f.directory.suspend(); f.directory.resume();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(f.renewals).toHaveLength(attempts);
+    expect(f.directory.heartbeatArmed).toBe(false);
+  });
+
   it("bounds retries after repeated fast failures even once the lease budget is exhausted, and close never rearms", async () => {
     clock();
     const f = await nats("jitter-exhausted-retry", () => 1);
     f.planRenewals(...Array.from({ length: 100 }, () => ({ delay: 0, fail: true })));
     await vi.advanceTimersByTimeAsync(30_000);
-    expect(f.renewals.length).toBeGreaterThan(10);
-    expect(f.renewals.length).toBeLessThanOrEqual(30); // One bounded recovery turn/second, never a 1ms hot loop.
+    expect(f.renewals.length).toBeGreaterThanOrEqual(6); // Recovery continues after cutoff, not force-suppressed.
+    expect(f.renewals.length).toBeLessThanOrEqual(8); // Max-draw outage: bounded 5s turns, not a synchronized 1s tick.
+    const late = f.renewals.filter(at => at >= f.rootRecord.startedAt + 13_000);
+    expect(late.length).toBeGreaterThanOrEqual(3);
+    expect(late.slice(1).map((at, i) => at - late[i]!)).toEqual(Array(late.length - 1).fill(5_000));
     expect(f.directory.canConsumeMesh()).toBe(false);
     await f.directory.close();
     const attempts = f.renewals.length;

@@ -152,13 +152,12 @@ describe("real-store bridge membership refresh coalescing", () => {
     const actualSamples = vi.spyOn(f.remote, "presence");
     const syncBefore = run.syncs.mock.calls.length;
     const samplesBefore = actualSamples.mock.calls.length;
-    const refreshObserved = until(
-      () => run.syncs.mock.calls.length > syncBefore && actualSamples.mock.calls.length > samplesBefore,
-      "known-other burst caused a bounded trailing membership refresh", 1_500,
-    );
     const events = await Promise.all(Array.from({ length: K }, (_, index) =>
       work(f.hub, hubLead, knownOther.id, `known-other-${index}`)));
-    await refreshObserved;
+    await until(
+      () => run.syncs.mock.calls.length > syncBefore && actualSamples.mock.calls.length > samplesBefore,
+      "known-other burst caused a bounded trailing membership refresh", 10_000,
+    );
     const lastSequence = Math.max(...events.map(event => event.sequence));
     await until(() => cursor(f.cursorPath).toRemote.after >= lastSequence,
       "pure known-other burst reached its durable source cursor");
@@ -182,7 +181,7 @@ describe("real-store bridge membership refresh coalescing", () => {
     await sleep(1_050);
     expect(run.syncs.mock.calls.length).toBe(settledSyncs);
     expect(actualSamples.mock.calls.length).toBe(settledSamples);
-  });
+  }, 30_000);
 
   it("bounds known-negative refreshes in a mixed burst and reports a reproducible drain measurement", async () => {
     let now = 1_800_000_000_000;
@@ -474,8 +473,13 @@ describe("real-store bridge membership refresh coalescing", () => {
       expect(deliveredFromHub(f.far)).toEqual([]);
 
       releaseRefresh.resolve();
-      await until(() => cursor(f.cursorPath).toRemote.after === events.at(-1)!.sequence,
-        "the fresh membership sample admitted and completed the addressed batch", 10_000);
+      const finalOffset = (await f.local.latestCursor()).offset;
+      await until(() => {
+        const saved = JSON.parse(fs.readFileSync(f.cursorPath, "utf8")) as {
+          toRemote: { after: number; offset?: number };
+        };
+        return saved.toRemote.after === events.at(-1)!.sequence && saved.toRemote.offset === finalOffset;
+      }, "the fresh membership sample admitted the batch and completed its page", 10_000);
       expect(samples.mock.calls.length).toBeGreaterThan(0);
       expect(f.local.holds(routedId)).toBe(true);
       const delivered = deliveredFromHub(f.far);

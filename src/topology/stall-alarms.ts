@@ -230,6 +230,18 @@ const SESSION_ADDRESS = /^session:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4
 export const admissionAlarmRecipient = (ownerIdentityId: string | undefined, identity: MeshIdentity | undefined): string | undefined =>
   [ownerIdentityId?.trim(), identity?.kind === "main" ? identity.id : undefined]
     .find((candidate): candidate is string => typeof candidate === "string" && SESSION_ADDRESS.test(candidate));
+/** Local admission diagnostics retain raw failure detail; callers supply only a fixed,
+ * payload-free gate classification here. The directory owns episode timing and retries. */
+export const controlAdmissionAlarm = async (mesh: MeshStore, identity: MeshIdentity, rootId: string,
+  hostId: string, incident: { since: number; dedupeKey: string; reason: string }): Promise<void> => {
+  const to = admissionAlarmRecipient(rootId, undefined);
+  if (!to) return; // Never substitute a name, broadcast, or an unrelated owner.
+  await mesh.publish({ topic: "ops.owner", kind: "fabric.control-admission.alarm", from: identity, to,
+    dedupeKey: incident.dedupeKey,
+    text: `Control admission for ${rootId} gated since ${new Date(incident.since).toISOString()}: ${incident.reason}`,
+    data: { rootId, hostId, controlAdmission: "gated", since: incident.since, reason: incident.reason } });
+};
+
 /** The mesh envelope of an AgentManager alarm. A named run's failed recovery save is an ops.owner `actor.alarm`
  * (pi-fabric#939 round 4). The held-permit count and a child launched without a short TMPDIR that fits the fleet bash
  * guard (pi-fabric#1554, a host condition) are fabric.alarm.agent-admission events of their own kinds. */

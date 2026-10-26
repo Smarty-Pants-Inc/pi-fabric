@@ -1,6 +1,6 @@
 import type { FabricActorInfo } from "../actors/types.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
-import type { AgentHandleInfo, AgentRunRecord } from "../agents/types.js";
+import type { AgentHandleInfo, AgentPresenceInfo, AgentRunRecord } from "../agents/types.js";
 import { getAgentRunner } from "../agents/runner-registry.js";
 import type { FabricParticipantRecord } from "./types.js";
 
@@ -13,12 +13,14 @@ import type { FabricParticipantRecord } from "./types.js";
  */
 export const SETTLED_AGENT_PUBLISH_MS = 60 * 60 * 1000;
 
+type AgentParticipantInput = AgentPresenceInfo | AgentRunRecord | AgentHandleInfo;
+
 const isAgentRunRecord = (
-  record: AgentRunRecord | AgentHandleInfo,
-): record is AgentRunRecord => "startedAt" in record;
+  record: AgentParticipantInput,
+): record is AgentRunRecord => "usage" in record;
 
 export const agentParticipantRecords = (
-  records: Array<AgentRunRecord | AgentHandleInfo>,
+  records: AgentParticipantInput[],
   rootId: string,
   ownerHostId: string,
   ownerIdentityId: string,
@@ -28,19 +30,20 @@ export const agentParticipantRecords = (
 ): FabricParticipantRecord[] => {
   const participants: FabricParticipantRecord[] = [];
   const append = (
-    record: AgentRunRecord | AgentHandleInfo,
+    record: AgentParticipantInput,
     semanticParentId: string,
   ): void => {
     const observedAt = firstSeen.get(record.id) ?? Date.now();
     firstSeen.set(record.id, observedAt);
+    const metadata = "startedAt" in record ? record : undefined;
     const run = isAgentRunRecord(record) ? record : undefined;
     const parent = record.actorId ?? semanticParentId;
     if (record.actorId) return;
-    const settledAt = run?.finishedAt ?? run?.updatedAt ?? observedAt;
+    const settledAt = metadata?.finishedAt ?? metadata?.updatedAt ?? observedAt;
     if (terminalAgentStatuses.has(record.status) && now - settledAt > SETTLED_AGENT_PUBLISH_MS) return;
     const active = record.status === "queued" || record.status === "running";
-    const placement = run?.placementRunId !== undefined && run.placementKind !== undefined &&
-      run.placementHost !== undefined && run.expectedSeconds !== undefined;
+    const placement = metadata?.placementRunId !== undefined && metadata.placementKind !== undefined &&
+      metadata.placementHost !== undefined && metadata.expectedSeconds !== undefined;
     // Unregistered runners keep the historical surface; control fails closed later.
     const runner = getAgentRunner(record.runner)?.capabilities;
     participants.push({
@@ -65,14 +68,14 @@ export const agentParticipantRecords = (
       ],
       cwd: record.cwd,
       ...(record.sessionId ? { sessionId: record.sessionId } : {}),
-      ...(placement ? { placementRunId: run!.placementRunId, placementKind: run!.placementKind,
-        placementHost: run!.placementHost, expectedSeconds: run!.expectedSeconds } : {}),
+      ...(placement ? { placementRunId: metadata!.placementRunId, placementKind: metadata!.placementKind,
+        placementHost: metadata!.placementHost, expectedSeconds: metadata!.expectedSeconds } : {}),
       ...(record.model ? { model: record.model } : {}),
       ...(record.thinking ? { thinking: record.thinking } : {}),
-      startedAt: run?.startedAt ?? observedAt,
-      updatedAt: run?.updatedAt ?? observedAt,
-      ...(run?.finishedAt !== undefined ? { finishedAt: run.finishedAt } : {}),
-      ...(run?.finalAnswerReceipt ? { finalAnswerReceiptId: run.finalAnswerReceipt.id } : {}),
+      startedAt: metadata?.startedAt ?? observedAt,
+      updatedAt: metadata?.updatedAt ?? observedAt,
+      ...(metadata?.finishedAt !== undefined ? { finishedAt: metadata.finishedAt } : {}),
+      ...(record.finalAnswerReceipt ? { finalAnswerReceiptId: record.finalAnswerReceipt.id } : {}),
       ...(run?.currentTool ? { currentTool: run.currentTool } : {}),
       ...(run ? { turns: run.turns, toolCalls: run.toolCalls, usage: { ...run.usage } } : {}),
       controlProtocol: "v1",

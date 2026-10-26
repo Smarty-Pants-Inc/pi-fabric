@@ -12,6 +12,7 @@ import type { FabricMainAgentInfo } from "../main-agent.js";
 import { DirectoryNotReadyError, TransportUnavailableError, type FabricTransport } from "../transport/types.js";
 import { assertMeshStateReadable, MeshStore, meshOutageAlarmSink, meshProcessStartedAt, type MeshBatchOperation, type MeshIdentity, type MeshStateEntry, type MeshReadOptions } from "../mesh/store.js";
 import type {
+  FabricControlAdmission,
   FabricHostRecord,
   FabricParticipantInfo,
   FabricParticipantKind,
@@ -64,6 +65,7 @@ import type { KvParticipantDirectory, ParticipantLeaseGate, ParticipantView } fr
 import type { NatsLocalProjection, NatsLocalProjectionMetrics } from "./nats-local-projection.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
+import { controlAdmissionAlarm } from "./stall-alarms.js";
 import { knownOwnProcessIncarnation, ownProcessIncarnation } from "../core/atomic-write.js";
 import {
   ParticipantFileLockBusyError,
@@ -711,6 +713,9 @@ export interface ParticipantDirectoryOptions {
   /** Stall checks share the committed heartbeat; secondary/resident hosts can participate. */
   presencePass?: () => Promise<void>;
   presencePassMs?: number;
+  /** ADDITIONAL host/composition gate only. Undefined admits; a nonempty reason gates
+   * diagnostics/alarms, not canConsumeMesh(). Must not call back into this directory. */
+  controlAdmissionReason?: () => string | undefined;
   /** Lazy host validator: PRIVATE actor outbox plus independent raw-root death evidence.
    * Returns a closed, zero-capability terminal record, never caller envelope fields. */
   terminalActor?: (entry: MeshStateEntry) => FabricParticipantRecord | undefined;
@@ -776,6 +781,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.options.identity })));
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
+  readonly #isolatedSources = new Set<ParticipantSnapshotSource>();
+  readonly #sourceFailures = new Map<ParticipantSnapshotSource, string>();
+  #controlAdmissionIncident: { since: number; dedupeKey: string; alarmed: boolean } | undefined;
+  #controlAdmissionTimer: NodeJS.Timeout | undefined;
   #startedAt = Date.now();
   #incarnationToken = randomUUID();
   #leasePredecessor: FabricHostLease | undefined;
@@ -937,6 +946,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#natsConfirmedAt = 0;
       this.#refreshError = error;
       this.#routingError = error;
+      this.controlAdmission();
       return;
     }
     this.#transportLost = true;
@@ -953,6 +963,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try { this.#leaseAbort.abort(error); } catch { /* already aborted */ }
     const view = this.#participantView;
     if (view) void view.close().catch(() => undefined);
+    this.controlAdmission(); // Terminal loss disarms heartbeats, but not its one-shot alarm.
   }
 
   #renewTransportLease(): Promise<void> {
@@ -1118,6 +1129,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (this.#isNats()) {
         const live = this.#live();
         this.#lifecycleTick(live);
+        this.controlAdmission();
         // A notification can arrive while the lifecycle is retired but not yet
         // suspended. Once live again, arm its retained deadline rather than losing it.
         const renewing = this.#transportRenewing;
@@ -1137,7 +1149,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       const live = this.#live();
       this.#lifecycleTick(live);
-      if (!live) return;
+      if (!live) { this.controlAdmission(); return; }
       // The retry runner coalesces shared publication, not independent liveness.
       // An admitted resident stays live during registry/key waits without rewriting
       // its actor files. This does not certify shared admission or advance confirmation.
@@ -1148,10 +1160,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
           this.#routingReadAt = 0;
           if (this.#retiredDuring(error)) return;
           this.#backgroundRefresh.failure(error);
+          this.controlAdmission();
         });
-        if (this.#refreshing && this.#fileWork > 0) return;
+        if (this.#refreshing && this.#fileWork > 0) { this.controlAdmission(); return; }
       }
       if (!this.#publicationRetryTimer && !this.#publicationRetrying) this.#runBackground(() => this.refresh());
+      else this.controlAdmission();
     }, Math.max(1, Math.floor(delay)));
     this.#timer.unref();
   }
@@ -1168,7 +1182,11 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (this.#retiredDuring(error)) return;
         throw error;
       }
-    }, false);
+    }, false).finally(() => {
+      // Observe even a backed-off/skipped heartbeat. A completed recovery clears its
+      // episode before this check; the independent threshold covers in-flight work.
+      this.controlAdmission();
+    });
   }
 
   #retiredDuring(error: unknown): boolean {
@@ -1204,6 +1222,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   suspend(): void {
     if (this.#closed) return;
     this.#suspended = true;
+    this.#cancelControlAdmissionTimer();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
     this.#heartbeatDueAt = undefined;
@@ -1239,13 +1258,34 @@ export class ParticipantDirectory implements FabricParticipantSource {
     try { this.options.onLifecycleLost?.(this.#retiredTicks); } catch { /* the warning above already surfaced it */ }
   }
 
-  registerSource(source: ParticipantSnapshotSource): () => void {
+  registerSource(source: ParticipantSnapshotSource, options?: { isolateErrors?: boolean }): () => void {
     this.#sources.add(source);
+    // Root/authority sources must remain fatal; only independent operational sources opt in.
+    if (options?.isolateErrors) this.#isolatedSources.add(source);
+    else this.#isolatedSources.delete(source);
     if (this.#timer) this.scheduleRefresh();
     return () => {
       this.#sources.delete(source);
+      this.#isolatedSources.delete(source);
+      this.#sourceFailures.delete(source);
       if (this.#timer) this.scheduleRefresh();
     };
+  }
+
+  #snapshot(source: ParticipantSnapshotSource): FabricParticipantRecord[] {
+    let records: FabricParticipantRecord[];
+    try { records = source(); } // Only the direct callback is eligible for isolation.
+    catch (error) {
+      if (!this.#isolatedSources.has(source)) throw error;
+      const reason = error instanceof Error ? error.message : String(error);
+      if (this.#sourceFailures.get(source) !== reason) {
+        this.#sourceFailures.set(source, reason);
+        diagnostics.warn("src/topology/participant-directory.ts", `[pi-fabric] isolated participant snapshot source failed; omitting its records: ${reason}`);
+      }
+      return []; // Never reuse a prior source snapshot as current presence.
+    }
+    this.#sourceFailures.delete(source);
+    return records;
   }
 
   publishBeforeLaunch(record: FabricParticipantRecord): Promise<void> {
@@ -1714,6 +1754,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         if (!writeDeferred) this.scheduleRefresh();
       }
       if (writeDeferred) this.#schedulePublicationRetry();
+      this.controlAdmission();
     }
   }
 
@@ -2525,11 +2566,17 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   /** Resident consumers fail closed on failed/overdue renewal, not just peer visibility.
    * A file-only liveness write is not confirmation that the mesh is writable. */
-  canConsumeMesh(now = Date.now()): boolean {
+  #meshAdmitted(now: number): boolean {
     if (this.#isNats()) return !this.#closed && !this.#suspended && !this.#quiescing && !this.#transportRecovering && !this.#transportLost &&
       !!this.#transportLease?.live() && !!this.#participantView?.ready;
-    const confirmed = !this.options.enabled || (!this.#closed && !this.#quiescing && this.#leaseConfirmed &&
+    return !this.options.enabled || (!this.#closed && !this.#quiescing && this.#leaseConfirmed &&
       this.#refreshError === undefined && now - this.#refreshedAt < this.#heartbeatMs * 2);
+  }
+
+  canConsumeMesh(now = Date.now()): boolean {
+    const confirmed = this.#meshAdmitted(now);
+    this.controlAdmission(now);
+    if (this.#isNats()) return confirmed;
     // A resumed/suspended process (or a forward wall-clock adjustment) must not
     // wait a full heartbeat interval before trying to confirm its lapsed lease.
     // This never grants admission: refresh still needs the real mesh lock.
@@ -2539,6 +2586,89 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#runBackground(() => this.refresh());
     }
     return confirmed;
+  }
+
+  /** Inspect the actual directory gate plus explicitly supplied host gates. Routing-only
+   * reads and NATS refreshError do not acquire admission authority here. */
+  controlAdmission(now = Date.now()): FabricControlAdmission {
+    const failure = this.#controlAdmissionFailure(now);
+    this.#observeControlAdmission(failure, now);
+    return failure ? { controlAdmission: "gated", controlAdmissionReason: failure.reason }
+      : { controlAdmission: "admitted" };
+  }
+
+  #controlAdmissionFailure(now: number): { reason: string; alarmReason: string } | undefined {
+    if (this.#meshAdmitted(now)) {
+      try {
+        const reason = this.options.controlAdmissionReason?.()?.trim();
+        return reason ? { reason, alarmReason: "additional host control admission gate" } : undefined;
+      } catch (error) {
+        return { reason: `host control admission inspection failed: ${error instanceof Error ? error.message : String(error)}`,
+          alarmReason: "host control admission inspection failed" };
+      }
+    }
+    if (this.#closed) return { reason: "participant directory is closed", alarmReason: "participant directory is closed" };
+    if (this.#quiescing) return { reason: "participant directory is quiescing", alarmReason: "participant directory is quiescing" };
+    if (this.#isNats()) {
+      const reason = this.#suspended ? "participant directory lifecycle is suspended"
+        : this.#transportLost ? "transport host lease was lost"
+        : this.#transportRecovering ? "transport host lease is recovering"
+        : !this.#transportLease?.live() ? "transport host lease is not live"
+        : "participant directory snapshots are not ready";
+      return { reason, alarmReason: reason };
+    }
+    if (this.#refreshError !== undefined) return {
+      reason: `participant heartbeat refresh failed: ${this.#refreshError instanceof Error ? this.#refreshError.message : String(this.#refreshError)}`,
+      alarmReason: "participant heartbeat refresh failed",
+    };
+    const reason = !this.#leaseConfirmed ? "participant directory has no confirmed heartbeat publication"
+      : `participant heartbeat confirmation is overdue (${now - this.#refreshedAt} ms old)`;
+    return { reason, alarmReason: !this.#leaseConfirmed ? "participant heartbeat publication is unconfirmed"
+      : "participant heartbeat confirmation is overdue" };
+  }
+
+  #cancelControlAdmissionTimer(): void {
+    if (this.#controlAdmissionTimer) clearTimeout(this.#controlAdmissionTimer);
+    this.#controlAdmissionTimer = undefined;
+  }
+
+  #controlAlarmOwnerLive(): boolean {
+    return this.options.enabled && !this.#closed && !this.#suspended && !this.#quiescing && !this.#superseded && this.#live();
+  }
+
+  #observeControlAdmission(failure: { reason: string; alarmReason: string } | undefined, now: number): void {
+    if (!this.#controlAlarmOwnerLive()) {
+      this.#cancelControlAdmissionTimer();
+      return; // Retirement is not admission recovery and cannot rearm an episode.
+    }
+    if (!failure) {
+      this.#controlAdmissionIncident = undefined;
+      this.#cancelControlAdmissionTimer();
+      return;
+    }
+    const incident = this.#controlAdmissionIncident ??= {
+      since: now, dedupeKey: `control-admission:${this.options.rootId}:${this.ownerIncarnation}:${randomUUID()}`, alarmed: false,
+    };
+    if (incident.alarmed) return;
+    if (now - incident.since > 60_000) {
+      incident.alarmed = true;
+      this.#cancelControlAdmissionTimer();
+      diagnostics.warn("src/topology/participant-directory.ts", `[pi-fabric] control admission gated for more than 60s on ${this.options.hostId}: ${failure.reason}`);
+      void this.#notifications.enqueue(async () => {
+        const active = (): boolean => this.#controlAlarmOwnerLive() && this.#controlAdmissionIncident === incident &&
+          this.controlAdmission().controlAdmission === "gated";
+        if (!active()) return;
+        await controlAdmissionAlarm(this.mesh, this.options.identity, this.options.rootId, this.options.hostId,
+          { since: incident.since, dedupeKey: incident.dedupeKey, reason: failure.alarmReason });
+      });
+    } else if (!this.#controlAdmissionTimer) {
+      // One threshold deadline, not polling. NATS terminal lease loss stops its heartbeat.
+      this.#controlAdmissionTimer = setTimeout(() => {
+        this.#controlAdmissionTimer = undefined;
+        this.controlAdmission();
+      }, Math.max(1, 60_001 - (now - incident.since)));
+      this.#controlAdmissionTimer.unref?.();
+    }
   }
 
   /** When this host last committed its heartbeat: lapses before it happened on a working mesh. */
@@ -2710,6 +2840,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#closed || this.#quiescing) return;
     if (!this.#transportLease?.live()) throw new TransportUnavailableError("NATS host lease is not live");
     this.#quiescing = true;
+    this.#cancelControlAdmissionTimer();
     this.#cancelReconnectRefresh();
     if (reason === "reload" && this.options.identity.kind === "main" && this.options.hostId === this.options.rootId) {
       this.#reloadUntil = Date.now() + MAIN_RELOAD_LEASE_MS;
@@ -2727,6 +2858,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     // Admission closes before the view withdraws and before the lease writes its clean marker.
     this.#quiescing = true;
     this.#closed = true;
+    this.#cancelControlAdmissionTimer();
     this.#leaseAbort.abort();
     this.#cancelReconnectRefresh();
     if (this.#timer) clearTimeout(this.#timer);
@@ -2740,6 +2872,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     await this.#transportRenewing?.catch(() => undefined);
     this.#transportReconnectUnsubscribe?.();
     this.#transportReconnectUnsubscribe = undefined;
+    await this.#notifications.close();
     if (this.#participantView) await this.#participantView.close().catch(error => { this.#refreshError = error; });
     if (this.#transportLease) await this.#transportLease.release(AbortSignal.timeout(5_000)).catch(error => { this.#refreshError = error; });
     if (this.#localProjection) await this.#localProjection.close().catch(error => { this.#refreshError = error; });
@@ -2757,6 +2890,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#closed || this.#quiescing) return;
     this.#assertLeaseActive();
     this.#quiescing = true;
+    this.#cancelControlAdmissionTimer();
     this.#cancelPublicationRetry();
     await this.#publicationRetrying;
     if (reason === "reload" && this.options.identity.kind === "main" && this.options.hostId === this.options.rootId) {
@@ -2856,6 +2990,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     if (this.#closed) return;
     this.#closed = true;
+    this.#cancelControlAdmissionTimer();
     this.#leaseAbort.abort();
     this.#withdrawalPending = true;
     this.#cancelPublicationRetry();
@@ -2996,7 +3131,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       const desired = new Map<string, FabricParticipantRecord>();
       const terminal = new Set<string>();
       for (const snapshot of this.#sources) {
-        for (const candidate of snapshot()) {
+        for (const candidate of this.#snapshot(snapshot)) {
           if (this.#natsPending.has(candidate.id)) continue;
           // Settlement is taken BEFORE quiesce replaces operational status.
           if (NATS_TERMINAL_STATUSES.has(candidate.status) || candidate.stopReason !== undefined) {
@@ -3092,6 +3227,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         this.#refreshAgain = false;
         this.scheduleRefresh();
       }
+      this.controlAdmission();
     }
   }
 
@@ -3108,7 +3244,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     if (this.options.enabled && !this.#claimedPeerLabel && !this.#localRecords.get(this.options.rootId)?.label) {
       for (const source of this.#sources) {
-        const root = source().find(record => record.kind === "root" && record.id === this.options.rootId);
+        const root = this.#snapshot(source).find(record => record.kind === "root" && record.id === this.options.rootId);
         if (root) { await this.#ensurePeerLabels(new Map([[root.id, { ...root }]])); break; }
       }
     }
@@ -3116,7 +3252,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const now = Date.now();
     const desired = new Map<string, FabricParticipantRecord>();
     for (const source of this.#sources) {
-      for (const candidate of source()) {
+      for (const candidate of this.#snapshot(source)) {
         const {
           task: _task,
           text: _text,
@@ -3720,6 +3856,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#refreshScheduled = false;
     this.#refreshAgain = false;
     this.#cancelPublicationRetry();
+    this.#cancelControlAdmissionTimer();
   }
 
   #leaseOwner(): FabricHostLease {

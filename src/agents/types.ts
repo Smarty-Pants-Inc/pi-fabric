@@ -398,7 +398,20 @@ export interface AgentRunResult extends AgentRunRecord {
   status: "completed" | "failed" | "stopped" | "timed_out";
 }
 
+/** Detached operational metadata for task presence. No result, prompt, counters or usage;
+ * available from manager memory even when the authenticated result is unreadable. */
+export interface AgentPresenceInfo extends Pick<AgentRunRecord,
+  "id" | "name" | "status" | "runner" | "kernel" | "transport" | "cwd" |
+  "startedAt" | "updatedAt" | "finishedAt" | "finishingAt" | "finalAnswerReceipt" |
+  "model" | "thinking" | "actorId" | "actorName" | "spawner" |
+  "capabilityRequirements" | "capabilityDigest" | "recursive" | "residency" |
+  "sessionId" | "runnerSessionId" | "mainAgentId" | "fabricSessionId" |
+  "attachCommand" | "branch" | "worktree" | "queuePosition" |
+  "placementRunId" | "placementKind" | "placementHost" | "expectedSeconds"> {}
+
 export interface AgentHandleInfo {
+  /** Presentation-only result read failure; never changes the lifecycle status or supplies a result. */
+  error?: string;
   /** A tiny explicit shortening was ignored to protect real work. */
   timeoutNote?: AgentTimeoutIgnoredNote;
   /** Policy switch/audit diagnostics are present on receipts and final results. */

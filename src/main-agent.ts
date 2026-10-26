@@ -45,6 +45,9 @@ export interface FabricMainAgentInfo {
   name: "Main";
   kind: "main";
   status: "idle" | "running" | "remote";
+  /** Local control admission is independent of Pi's idle/running activity. */
+  controlAdmission?: "admitted" | "gated";
+  controlAdmissionReason?: string;
   runner: "pi";
   transport: "host";
   cwd?: string;

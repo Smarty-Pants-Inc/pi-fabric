@@ -103,6 +103,7 @@ import type {
   FabricSteeringMode,
   FabricAgentLog,
   AgentHandleInfo,
+  AgentPresenceInfo,
   AgentRunCarryOver,
   AgentRunRecord,
   AgentRunRequest,
@@ -918,6 +919,9 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Routed child dialogs in flight; aborted at settlement. */
   questions?: AbortController;
   questionDecisionId?: string;
+  /** Fixed-size lifecycle facts survive preview eviction, independently of result authentication. */
+  presence: Pick<AgentPresenceInfo, "status" | "startedAt" | "updatedAt" | "finishedAt" | "finishingAt" |
+    "model" | "thinking" | "runnerSessionId">;
   latestRecord?: AgentRunRecord;
   latestUiRecord?: AgentRunRecord;
   /** Keep the full completion only while its terminal-result save needs retrying. */
@@ -3445,7 +3449,9 @@ export class AgentManager {
           try { launchCancelled = !authorize(); } catch { launchCancelled = true; }
         }
         if (launchCancelled) queued?.abort.abort();
+        const presenceAt = Date.now();
         const managed: ManagedAgent = {
+          presence: { status: "running", startedAt: presenceAt, updatedAt: presenceAt },
           runRoute,
           id,
           name,
@@ -4130,6 +4136,7 @@ export class AgentManager {
     const record = hosted.record;
     const recovered = options.recovered;
     const managed: ManagedAgent = {
+      presence: { status: record.status, startedAt: record.startedAt, updatedAt: record.updatedAt },
       // Route classification has no hosted transport; a hosted run classifies like a process task.
       runRoute: createRunRouteMetadata({
         runner: record.runner,
@@ -4420,7 +4427,7 @@ export class AgentManager {
     if (managed.settlementSaveFailure) return structuredClone(managed.settlementSaveFailure.result);
     if (!managed.settledResultFile) {
       if (!managed.settled) return readRecord(managed.statusFile);
-      throw Object.assign(new Error(`Fabric agent ${managed.id} has no published terminal result`),
+      throw Object.assign(new Error(`Fabric agent ${managed.id} has no published terminal result; result unavailable or unauthenticated (authentication/integrity failure)`),
         { code: "FABRIC_MISSING_RESULT" as const });
     }
     const expectedFile = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
@@ -4432,7 +4439,7 @@ export class AgentManager {
     // An unexpected absence, dangling entry, corrupt or foreign file still fails loudly.
     if (!result && this.#closing && managed.executionExited && managed.settledSummary && managed.resultCollected &&
         pathAbsentNoFollow(managed.settledResultFile)) return this.#collectedResult(managed, managed.settledSummary);
-    throw Object.assign(new Error(`Fabric agent ${managed.id} has no saved terminal result at ${managed.settledResultFile}`),
+    throw Object.assign(new Error(`Fabric agent ${managed.id} has no saved terminal result at ${managed.settledResultFile}; result unavailable or unauthenticated (authentication/integrity failure)`),
       { code: "FABRIC_MISSING_RESULT" as const });
   }
 
@@ -4613,6 +4620,7 @@ export class AgentManager {
    * host-synthesized stop or transport-death record resets the counters to zero.
    */
   #observeProgress(managed: ManagedAgent, record: AgentRunRecord): void {
+    this.#observePresence(managed, record);
     this.#observeAdmissionStatus(managed.id, record);
     const seen = managed.observedProgress;
     if (record.turns > seen.turns) seen.turns = record.turns;
@@ -4640,6 +4648,7 @@ export class AgentManager {
       if (deliveries.length) info.followUpDeliveries = deliveries;
       return info;
     }
+    this.#observePresence(managed, record);
     this.#observeAdmissionStatus(managed.id, record);
     const compact = compactUiRecord(record);
     const ui = managed.latestUiRecord;
@@ -4662,6 +4671,27 @@ export class AgentManager {
     return [...this.#runs.keys(), ...this.#queued.keys()].map((id) => this.status(id));
   }
 
+  /** Result-free, I/O-free projection of retained manager ownership, including active native-close debts.
+   * Handle retention supplies the row bound; no preview/result read or nested discovery is permitted here. */
+  listForPresence(): AgentPresenceInfo[] {
+    const records = [...this.#runs.values()].map(managed => this.#presenceInfo(managed));
+    let queuePosition = 0;
+    for (const queued of this.#queued.values()) {
+      const info = queued.info, terminal = queued.terminal;
+      records.push({
+        ...this.#presenceMetadata(info),
+        status: terminal?.status ?? info.status,
+        startedAt: terminal?.startedAt ?? queued.enqueuedAt,
+        updatedAt: terminal?.updatedAt ?? queued.enqueuedAt,
+        ...(terminal?.finishedAt !== undefined ? { finishedAt: terminal.finishedAt } : {}),
+        ...(!terminal && !queued.preparing ? { queuePosition: ++queuePosition } : {}),
+        ...(this.#mainAgentId ? { mainAgentId: this.#mainAgentId } : {}),
+        ...(this.#fabricSessionId ? { fabricSessionId: this.#fabricSessionId } : {}),
+      });
+    }
+    return structuredClone(records);
+  }
+
   listForUi(): Array<AgentRunRecord | AgentHandleInfo> {
     if (this.#uiListCache?.revision === this.#uiListRevision) {
       return this.#uiListCache.value;
@@ -4673,12 +4703,22 @@ export class AgentManager {
     const selected = new Map<string, AgentRunRecord | AgentHandleInfo>();
     let bytes = 4;
     const projection = (managed: ManagedAgent): AgentRunRecord | AgentHandleInfo => {
+      try { return projectResult(managed); }
+      catch (error) {
+        // A result authentication/rehydration failure is local to this task, never a
+        // fabricated failed run or a reason to lose the rest of the dashboard.
+        const code = (error as { code?: unknown } | null)?.code;
+        return { ...this.#handleInfo(managed, this.#presenceInfo(managed).status),
+          error: `${typeof code === "string" ? uiText(code, 80) : "FABRIC_RESULT_READ_ERROR"}: result unavailable or unauthenticated (authentication/integrity failure): ${uiText(error instanceof Error ? error.message : String(error), 1_024)}` };
+      }
+    };
+    const projectResult = (managed: ManagedAgent): AgentRunRecord | AgentHandleInfo => {
       let record = managed.latestUiRecord;
       if (!record) {
         // A finishing task whose preview was byte-evicted remains visible as a
         // handle. Rehydrating every full answer here defeats the UI byte budget
         // and makes each refresh read all native-close obligations' payloads.
-        if (!managed.settled && managed.finalAnswerStatus && !managed.latestRecord) return this.#handleInfo(managed, "finishing");
+        if (!managed.settled && managed.finalAnswerStatus && !managed.latestRecord) return this.#handleInfo(managed, this.#presenceInfo(managed).status);
         const latest = managed.latestRecord ?? this.#readResult(managed);
         if (!latest) return this.#handleInfo(managed, "running");
         record = compactUiRecord(latest);
@@ -4691,7 +4731,8 @@ export class AgentManager {
     // display the handle; never omit an active agent in favour of old results.
     for (const managed of active) {
       let record = projection(managed);
-      if (bytes + uiPayloadBytes(record) + 2 > listBudget) record = this.#handleInfo(managed, "running");
+      if (bytes + uiPayloadBytes(record) + 2 > listBudget) record = { ...this.#handleInfo(managed, this.#presenceInfo(managed).status),
+        ...(record.error ? { error: record.error } : {}) };
       selected.set(managed.id, record);
       bytes += uiPayloadBytes(record) + 2;
     }
@@ -5218,7 +5259,7 @@ export class AgentManager {
     if (!previous) return undefined;
     const record = readAuthenticatedRecord(previous.resultFile, previous.resultFile, previous.fingerprint);
     if (!record || record.id !== id || !terminalStatuses.has(record.status)) {
-      throw Object.assign(new Error(`Fabric agent ${id} has no saved terminal result at ${previous.resultFile}`),
+      throw Object.assign(new Error(`Fabric agent ${id} has no saved terminal result at ${previous.resultFile}; result unavailable or unauthenticated (authentication/integrity failure)`),
         { code: "FABRIC_MISSING_RESULT" as const });
     }
     return record as AgentRunResult;
@@ -6828,6 +6869,7 @@ export class AgentManager {
         };
       }
       managed.finalAnswerStatus = record.status;
+      this.#observePresence(managed, record);
       managed.latestRecord = compactUiRecord(record);
       managed.latestUiRecord = managed.latestRecord;
       snapshot = undefined;
@@ -7487,6 +7529,7 @@ export class AgentManager {
       const summary = this.#budgetSummary();
       if (summary) result.budget = summary;
     }
+    this.#observePresence(managed, result);
     const compactResult = compactUiRecord(result);
     managed.latestRecord = compactResult;
     managed.latestUiRecord = compactResult;
@@ -7668,6 +7711,7 @@ export class AgentManager {
   }
 
   #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
+    this.#observePresence(managed, result);
     try {
       const full = this.#withTransportMetadata(result, managed, false) as AgentRunResult;
       // The worker can still rewrite status.json during native teardown. Publish
@@ -8100,6 +8144,82 @@ export class AgentManager {
       throw new Error(`Unknown Fabric agent: ${id}`);
     }
     return managed;
+  }
+
+  #observePresence(managed: ManagedAgent, record: AgentRunRecord): void {
+    const model = record.model ?? managed.presence.model;
+    const thinking = record.thinking ?? managed.presence.thinking;
+    const runnerSessionId = record.runnerSessionId ?? managed.presence.runnerSessionId;
+    managed.presence = {
+      status: record.status,
+      // A supervisor-synthesized stop/failure or a retry must not restart the presence clock.
+      startedAt: Math.min(managed.presence.startedAt, record.startedAt), updatedAt: record.updatedAt,
+      ...(record.finishedAt !== undefined ? { finishedAt: record.finishedAt } : {}),
+      ...(record.finishingAt !== undefined ? { finishingAt: record.finishingAt } : {}),
+      ...(model ? { model } : {}),
+      ...(thinking ? { thinking } : {}),
+      ...(runnerSessionId ? { runnerSessionId } : {}),
+    };
+  }
+
+  /** Explicit whitelist: adding a result/diagnostic field to a handle must not enlarge presence. */
+  #presenceMetadata(info: AgentHandleInfo): Omit<AgentPresenceInfo, "startedAt" | "updatedAt"> {
+    return {
+      id: info.id, name: info.name, status: info.status, runner: info.runner, transport: info.transport, cwd: info.cwd,
+      ...(info.kernel ? { kernel: info.kernel } : {}),
+      ...(info.model ? { model: info.model } : {}),
+      ...(info.thinking ? { thinking: info.thinking } : {}),
+      ...(info.actorId ? { actorId: info.actorId } : {}),
+      ...(info.actorName ? { actorName: info.actorName } : {}),
+      ...(info.spawner ? { spawner: info.spawner } : {}),
+      ...(info.capabilityRequirements ? { capabilityRequirements: [...info.capabilityRequirements] } : {}),
+      ...(info.capabilityDigest ? { capabilityDigest: info.capabilityDigest } : {}),
+      ...(info.recursive ? { recursive: true } : {}),
+      ...(info.residency ? { residency: info.residency } : {}),
+      ...(info.sessionId ? { sessionId: info.sessionId } : {}),
+      ...(info.runnerSessionId ? { runnerSessionId: info.runnerSessionId } : {}),
+      ...(info.attachCommand ? { attachCommand: info.attachCommand } : {}),
+      ...(info.branch ? { branch: info.branch } : {}),
+      ...(info.worktree ? { worktree: info.worktree } : {}),
+      ...(info.finalAnswerReceipt ? { finalAnswerReceipt: { ...info.finalAnswerReceipt } } : {}),
+    };
+  }
+
+  #presenceInfo(managed: ManagedAgent): AgentPresenceInfo {
+    const observed = managed.presence;
+    const finishing = !managed.settled && !managed.actorId && managed.transport.kind === "process" &&
+      (managed.finalAnswer !== undefined || terminalStatuses.has(observed.status) ||
+        (observed.status === "running" && observed.finishingAt !== undefined));
+    // Worker terminal time is not supervisor settlement time while native close is owed.
+    const { finishedAt: _finishedAt, ...pending } = observed;
+    return {
+      id: managed.id, name: managed.name, runner: managed.runner, transport: managed.transport.kind, cwd: managed.cwd,
+      ...(managed.kernel ? { kernel: managed.kernel } : {}),
+      residency: managed.residency,
+      ...(managed.model ? { model: managed.model } : {}),
+      ...(managed.thinking ? { thinking: managed.thinking } : {}),
+      ...(managed.actorId ? { actorId: managed.actorId } : {}),
+      ...(managed.actorName ? { actorName: managed.actorName } : {}),
+      ...(managed.spawner ? { spawner: managed.spawner } : {}),
+      ...(managed.capabilityRequirements ? { capabilityRequirements: [...managed.capabilityRequirements] } : {}),
+      ...(managed.capabilityDigest ? { capabilityDigest: managed.capabilityDigest } : {}),
+      ...(managed.recursive ? { recursive: true } : {}),
+      ...(managed.runnerSessionId ? { runnerSessionId: managed.runnerSessionId } : {}),
+      ...(managed.transport.sessionId ? { sessionId: managed.transport.sessionId } : {}),
+      ...(managed.transport.attachCommand ? { attachCommand: managed.transport.attachCommand } : {}),
+      ...(managed.branch ? { branch: managed.branch } : {}),
+      ...(managed.worktree ? { worktree: managed.worktree } : {}),
+      ...(finishing ? { ...pending, status: "finishing" as const } : observed),
+      ...(managed.finalAnswer ? { finalAnswerReceipt: { id: managed.finalAnswer.id, recordedAt: managed.finalAnswer.recordedAt } } : {}),
+      ...(managed.mainAgentId ? { mainAgentId: managed.mainAgentId } : {}),
+      ...(managed.fabricSessionId ? { fabricSessionId: managed.fabricSessionId } : {}),
+      ...(managed.launch.placementAdmission ? {
+        placementRunId: managed.launch.placementAdmission.placementRunId,
+        placementKind: managed.launch.placementAdmission.placementKind,
+        placementHost: managed.launch.placementAdmission.placementHost,
+        expectedSeconds: managed.launch.placementAdmission.expectedSeconds,
+      } : {}),
+    };
   }
 
   #handleInfo(managed: ManagedAgent, status: AgentHandleInfo["status"]): AgentHandleInfo {

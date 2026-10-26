@@ -4,7 +4,8 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
-import type { AgentRunRecord } from "../src/agents/types.js";
+import type { AgentPresenceInfo, AgentRunRecord } from "../src/agents/types.js";
+import { agentParticipantRecords, SETTLED_AGENT_PUBLISH_MS } from "../src/topology/records.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
@@ -24,10 +25,11 @@ const recordRemoval = (file: fs.PathLike): void => {
 };
 const releases: Array<() => void> = [];
 const root = () => fs.mkdtempSync(path.join(os.tmpdir(), "manager-result-auth-"));
-const createManager = (runRoot: string, retainRuns = true): AgentManager => {
+const createManager = (runRoot: string, retainRuns = true,
+  options: NonNullable<ConstructorParameters<typeof AgentManager>[2]> = {}): AgentManager => {
   const manager = new AgentManager(process.cwd(), {
     ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, maxConcurrent: 1, retainRuns, sessionExport: false,
-  }, { runRoot, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fullCodeMode: false });
+  }, { runRoot, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fullCodeMode: false, ...options });
   managers.push(manager);
   return manager;
 };
@@ -52,6 +54,44 @@ const refuses = async (manager: AgentManager, id: string) => {
   catch (error) { status = (error as { code?: string }).code; }
   const wait = await manager.wait(id).then(result => result.status, error => error.code);
   expect({ status, wait }).toEqual({ status: "FABRIC_MISSING_RESULT", wait: "FABRIC_MISSING_RESULT" });
+};
+
+// #17018 keep reason: a real manager publication with a hold hard-link must
+// fail result authentication without taking task presence or the whole UI down.
+const listForPresence = (manager: AgentManager): AgentPresenceInfo[] => manager.listForPresence();
+
+const hardLinkedEvictedResult = async () => {
+  vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+    const handle = await fakeManagerHeapWorker(request, 64);
+    if (request.name === "evicted result") {
+      const file = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      const record = JSON.parse(fs.readFileSync(file, "utf8"));
+      // Public byte-pressure eviction, not private-field mutation or count
+      // overflow. This single large preview cannot fit the snapshot budget.
+      writeJsonAtomic(file, { ...record, nestedAgents: Array.from({ length: 12 }, (_, index) =>
+        heapRunResult(`nested-${index}`, 64_000)) });
+    }
+    return handle;
+  });
+  const runRoot = root(), manager = createManager(runRoot);
+  const result = await manager.run({ name: "evicted result", task: "private result payload", transport: "process", extensions: false });
+  const directory = path.join(runRoot, result.id), file = path.join(directory, "manager-result.json");
+  expect(result.nestedAgents).toHaveLength(12);
+  const opened = vi.spyOn(fs, "openSync");
+  // An authenticated backing open proves the completed run's preview was
+  // byte-evicted before the attack. It is too large for the UI list as well.
+  expect(manager.listForUi().some(record => record.id === result.id)).toBe(false);
+  expect(opened.mock.calls.some(([read]) => String(read) === file)).toBe(true);
+  opened.mockRestore();
+  const hold = fs.mkdtempSync(path.join(runRoot, "trace-hold-"));
+  fs.linkSync(file, path.join(hold, "manager-result.json"));
+  fs.linkSync(path.join(directory, "status.json"), path.join(hold, "status.json"));
+  expect(fs.statSync(file).nlink).toBe(2);
+  // A new public run invalidates any UI-list cache after the hard-link. It is
+  // also the healthy neighbour whose visibility an unreadable task must not kill.
+  const healthy = await manager.run({ name: "healthy neighbour", task: "healthy task", transport: "process", extensions: false });
+  await refuses(manager, result.id);
+  return { manager, result, healthy, file };
 };
 
 const enodevFixture = () => {
@@ -108,6 +148,211 @@ afterEach(async () => {
 });
 
 describe("authenticated manager terminal results", () => {
+  it("isolates presence metadata from a hard-linked byte-evicted result and all result-bearing readers (#17018)", async () => {
+    const { manager, result, healthy } = await hardLinkedEvictedResult();
+    const forbidden = () => { throw new Error("presence entered a result-bearing reader"); };
+    vi.spyOn(manager, "status").mockImplementation(forbidden);
+    vi.spyOn(manager, "list").mockImplementation(forbidden);
+    vi.spyOn(manager, "listForUi").mockImplementation(forbidden);
+    vi.mocked(fs.readFileSync).mockClear();
+    vi.mocked(fs.readFileSync).mockImplementation(forbidden);
+    vi.mocked(fs.lstatSync).mockClear();
+    vi.mocked(fs.lstatSync).mockImplementation(forbidden);
+    const opened = vi.spyOn(fs, "openSync").mockImplementation(forbidden);
+    const directories = vi.spyOn(fs, "readdirSync").mockImplementation(forbidden);
+    const directoryHandles = vi.spyOn(fs, "opendirSync").mockImplementation(forbidden);
+    const stats = vi.spyOn(fs, "statSync").mockImplementation(forbidden);
+    const descriptorStats = vi.spyOn(fs, "fstatSync").mockImplementation(forbidden);
+    const descriptorReads = vi.spyOn(fs, "readSync").mockImplementation(forbidden);
+    let records: AgentPresenceInfo[];
+    try {
+      records = listForPresence(manager);
+      expect(fs.readFileSync).not.toHaveBeenCalled();
+      expect(fs.lstatSync).not.toHaveBeenCalled();
+      expect(opened).not.toHaveBeenCalled();
+      expect(directories).not.toHaveBeenCalled();
+      expect(directoryHandles).not.toHaveBeenCalled();
+      expect(stats).not.toHaveBeenCalled();
+      expect(descriptorStats).not.toHaveBeenCalled();
+      expect(descriptorReads).not.toHaveBeenCalled();
+    } finally {
+      // afterEach must still close the genuine manager through ordinary I/O.
+      vi.mocked(fs.readFileSync).mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+        if (recordedMissing.has(String(file))) throw missing();
+        return Reflect.apply(filesystem.readFileSync, fs, [file, ...args]);
+      }) as typeof fs.readFileSync);
+      vi.mocked(fs.lstatSync).mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+        if (recordedMissing.has(String(file))) throw missing();
+        return Reflect.apply(filesystem.lstatSync, fs, [file, ...args]);
+      }) as typeof fs.lstatSync);
+      opened.mockRestore();
+      directories.mockRestore();
+      directoryHandles.mockRestore();
+      stats.mockRestore();
+      descriptorStats.mockRestore();
+      descriptorReads.mockRestore();
+    }
+    expect(records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: result.id, name: result.name, status: "completed", runner: result.runner,
+        transport: result.transport, startedAt: result.startedAt, updatedAt: result.updatedAt, finishedAt: result.finishedAt }),
+      expect.objectContaining({ id: healthy.id, status: "completed" }),
+    ]));
+    for (const record of records) {
+      for (const field of ["task", "text", "value", "error", "warnings", "partialText", "lastCompleteText", "nestedAgents", "turns", "toolCalls", "usage"]) {
+        expect(record).not.toHaveProperty(field);
+      }
+    }
+    expect(JSON.stringify(records).length).toBeLessThan(8_192);
+    const publish = (now: number) => agentParticipantRecords(records, "root", "host", "identity", "main", new Map(), now);
+    expect(publish(result.finishedAt!).map(record => record.id)).toContain(result.id);
+    expect(publish(result.finishedAt! + SETTLED_AGENT_PUBLISH_MS + 1).map(record => record.id)).not.toContain(result.id);
+    records.find(record => record.id === result.id)!.name = "caller mutation";
+    expect(listForPresence(manager).find(record => record.id === result.id)?.name).toBe(result.name);
+  });
+
+  it("retains active and queued lifecycle metadata, actor filtering and detached owner facts (#17018)", async () => {
+    let alive = true, release!: () => void;
+    const closed = new Promise<void>(resolve => { release = () => { alive = false; resolve(); }; });
+    releases.push(release);
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const handle = await fakeManagerHeapWorker(request, 64, false, { closed, alive: () => alive, stop: async () => release() });
+      const file = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      const record = JSON.parse(fs.readFileSync(file, "utf8"));
+      writeJsonAtomic(file, { ...record, status: "running", finishedAt: undefined,
+        startedAt: 101, updatedAt: 202, model: "observed-model", runnerSessionId: "native-session" });
+      return handle;
+    });
+    const manager = createManager(root(), true, { mainAgentId: "main:presence", fabricSessionId: "session:presence" });
+    const active = await manager.spawn({ task: "active metadata", transport: "process", extensions: false,
+      residency: "durable", capabilityRequirements: ["files"], capabilityDigest: "capability-digest" });
+    // Observe real worker progress once, then presence must retain these facts without polling.
+    manager.status(active.id);
+    const queued = await manager.spawn({ task: "queued metadata", actorId: "actor:presence", actorName: "Actor presence",
+      transport: "process", extensions: false });
+    const records = manager.listForPresence();
+    expect(records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: active.id, status: "running", startedAt: 101, updatedAt: 202, residency: "durable",
+        model: "observed-model", runnerSessionId: "native-session", mainAgentId: "main:presence", fabricSessionId: "session:presence",
+        capabilityRequirements: ["files"], capabilityDigest: "capability-digest", spawner: active.spawner }),
+      expect.objectContaining({ id: queued.id, status: "queued", queuePosition: 1, actorId: "actor:presence", actorName: "Actor presence",
+        mainAgentId: "main:presence", fabricSessionId: "session:presence" }),
+    ]));
+    const waiting = records.find(record => record.id === queued.id)!;
+    expect(waiting.startedAt).toBe(waiting.updatedAt);
+    expect(waiting).not.toHaveProperty("finishedAt");
+    const projected = agentParticipantRecords(records, "root", "host", "identity", "main", new Map());
+    expect(projected.map(record => record.id)).toEqual([active.id]);
+    expect(projected[0]).toMatchObject({ startedAt: 101, updatedAt: 202, residency: "durable", capabilities: ["steer", "followUp", "stop"] });
+    const running = records.find(record => record.id === active.id)!;
+    running.capabilityRequirements!.push("caller mutation");
+    if (running.spawner) running.spawner.id = "caller mutation";
+    expect(manager.listForPresence().find(record => record.id === active.id)).toMatchObject({
+      startedAt: 101, updatedAt: 202, capabilityRequirements: ["files"], spawner: active.spawner,
+    });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + SETTLED_AGENT_PUBLISH_MS + 1);
+    try {
+      const later = manager.listForPresence();
+      expect(later.find(record => record.id === active.id)).toMatchObject({ startedAt: 101, updatedAt: 202 });
+      expect(later.find(record => record.id === queued.id)).toMatchObject({ startedAt: waiting.startedAt, updatedAt: waiting.updatedAt });
+    } finally { clock.mockRestore(); }
+    const stopped = await manager.stop(queued.id);
+    expect(manager.listForPresence().find(record => record.id === queued.id)).toMatchObject({
+      status: "stopped", startedAt: stopped.startedAt, updatedAt: stopped.updatedAt, finishedAt: stopped.finishedAt,
+    });
+    const statusFile = path.join(manager.runDirectory(active.id)!, "status.json");
+    const progress = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+    writeJsonAtomic(statusFile, { ...progress, updatedAt: 304, finishingAt: 303 });
+    expect(manager.status(active.id).status).toBe("finishing");
+    const finishing = manager.listForPresence().find(record => record.id === active.id)!;
+    expect(finishing).toMatchObject({ status: "finishing", startedAt: 101, updatedAt: 304, finishingAt: 303 });
+    expect(finishing).not.toHaveProperty("finishedAt");
+    // This raw-finishing fixture has no final-answer receipt: native supervision may
+    // fail it during stop. Presence must preserve that actual outcome, not normalize it.
+    const stoppedActive = await manager.stop(active.id);
+    expect(["stopped", "failed"]).toContain(stoppedActive.status);
+    expect(manager.listForPresence().find(record => record.id === active.id)).toMatchObject({
+      status: stoppedActive.status, startedAt: 101, updatedAt: stoppedActive.updatedAt, finishedAt: stoppedActive.finishedAt,
+    });
+  });
+
+  it("projects result-free placement and finish/update expiry without assuming usage exists (#17018)", () => {
+    const finishedAt = 1_000;
+    const record: AgentPresenceInfo = { id: "presence-placement", name: "placement", status: "completed", runner: "pi",
+      transport: "process", cwd: "/work", startedAt: 100, updatedAt: finishedAt, finishedAt,
+      placementRunId: "placement-run", placementKind: "remote", placementHost: "placement-host", expectedSeconds: 300,
+      recursive: true, sessionId: "transport-session", finalAnswerReceipt: { id: "receipt", recordedAt: finishedAt } };
+    const project = (records: AgentPresenceInfo[], now: number) =>
+      agentParticipantRecords(records, "root", "host", "identity", "main", new Map(), now);
+    const [participant] = project([record], finishedAt + SETTLED_AGENT_PUBLISH_MS);
+    expect(participant).toMatchObject({ id: record.id, rootId: "root", ownerHostId: "host", ownerIdentityId: "identity", parentId: "main",
+      startedAt: 100, updatedAt: finishedAt, finishedAt, placementRunId: "placement-run", placementKind: "remote",
+      placementHost: "placement-host", expectedSeconds: 300, sessionId: "transport-session", capabilities: ["fabric"], finalAnswerReceiptId: "receipt" });
+    for (const field of ["turns", "toolCalls", "usage", "task", "text", "value"]) expect(participant).not.toHaveProperty(field);
+    expect(project([record], finishedAt + SETTLED_AGENT_PUBLISH_MS + 1)).toEqual([]);
+    const { finishedAt: _finishedAt, ...withoutFinish } = record;
+    expect(project([withoutFinish], finishedAt + SETTLED_AGENT_PUBLISH_MS + 1)).toEqual([]);
+  });
+
+  it("keeps byte-evicted finishing metadata and native custody separate from an unreadable answer (#17018)", async () => {
+    let alive = true, release!: () => void;
+    const closed = new Promise<void>(resolve => { release = () => { alive = false; resolve(); }; });
+    releases.push(release);
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const handle = await fakeManagerHeapWorker(request, 64, true, { closed, alive: () => alive, stop: () => closed });
+      const file = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      const record = JSON.parse(fs.readFileSync(file, "utf8"));
+      writeJsonAtomic(file, { ...record, nestedAgents: Array.from({ length: 12 }, (_, index) => heapRunResult(`finishing-${index}`, 64_000)) });
+      return handle;
+    });
+    const runRoot = root(), manager = createManager(runRoot);
+    const handle = await manager.spawn({ task: "large finishing metadata", transport: "process", extensions: false });
+    const file = path.join(runRoot, handle.id, "manager-result.json");
+    await vi.waitFor(() => expect(fs.existsSync(file)).toBe(true));
+    const sealed = JSON.parse(fs.readFileSync(file, "utf8"));
+    const opened = vi.spyOn(fs, "openSync");
+    expect(manager.listForUi()).toEqual([expect.objectContaining({ id: handle.id, status: "finishing" })]);
+    expect(opened.mock.calls.some(([read]) => String(read) === file)).toBe(false); // evicted preview is a handle
+    const before = manager.listForPresence();
+    expect(before).toEqual([expect.objectContaining({ id: handle.id, status: "finishing", startedAt: sealed.startedAt,
+      updatedAt: sealed.updatedAt, finalAnswerReceipt: sealed.finalAnswerReceipt })]);
+    expect(before[0]?.finishedAt).toBeUndefined();
+    fs.linkSync(file, path.join(runRoot, "finishing-hold.json"));
+    expect(fs.statSync(file).nlink).toBe(2);
+    opened.mockClear();
+    expect(manager.listForPresence()).toEqual(before);
+    expect(opened).not.toHaveBeenCalled();
+    opened.mockRestore();
+    expect(manager.isSettled(handle.id)).toBe(false);
+    expect(manager.hasRunCustody(handle.id)).toBe(true);
+    expect(() => manager.status(handle.id)).toThrow(expect.objectContaining({ code: "FABRIC_MISSING_RESULT" }));
+    const [participant] = agentParticipantRecords(before, "root", "host", "identity", "main", new Map());
+    expect(participant).toMatchObject({ status: "finishing", capabilities: ["stop"], finalAnswerReceiptId: sealed.finalAnswerReceipt.id });
+    expect(participant).not.toHaveProperty("usage");
+    release();
+    const terminal = await manager.wait(handle.id, { timeoutMs: 2_000 });
+    expect(terminal.status).toBe("failed");
+    expect(terminal.error).toMatch(/no saved terminal result.*authentication\/integrity failure/);
+    expect(manager.listForPresence()[0]).toMatchObject({ status: "failed", startedAt: sealed.startedAt, finishedAt: terminal.finishedAt });
+  });
+
+  it("keeps a hard-linked byte-evicted result visible as a per-task UI integrity error, not a fabricated result (#17018)", async () => {
+    const { manager, result, healthy } = await hardLinkedEvictedResult();
+    let records: ReturnType<AgentManager["listForUi"]> | undefined, failure: unknown;
+    try { records = manager.listForUi(); } catch (error) { failure = error; }
+    expect(failure, "one task integrity failure must not throw the entire UI list").toBeUndefined();
+    expect(records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: healthy.id, status: "completed" }),
+      expect.objectContaining({ id: result.id, status: "completed", error: expect.stringMatching(/FABRIC_MISSING_RESULT.*no saved terminal result/) }),
+    ]));
+    const unreadable = records!.find(record => record.id === result.id)!;
+    expect((unreadable as { error?: string }).error).toMatch(/authenticat|integrity/i);
+    for (const field of ["task", "text", "value", "nestedAgents", "usage"]) expect(unreadable).not.toHaveProperty(field);
+    expect(manager.listForUi()).toEqual(records); // Cached error remains visible.
+    // Presentation isolation must not turn status/wait into a successful result.
+    await refuses(manager, result.id);
+    expect(await manager.wait(healthy.id)).toMatchObject(healthy);
+  });
+
   it("still returns the genuine full manager-published result through status/wait/stop", async () => {
     vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(request => fakeManagerHeapWorker(request, 32_000));
     const manager = createManager(root());

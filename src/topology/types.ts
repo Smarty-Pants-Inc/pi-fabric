@@ -198,6 +198,10 @@ export interface FabricPeerInfo {
   host?: string;
 }
 
+export type FabricControlAdmission =
+  | { controlAdmission: "admitted" }
+  | { controlAdmission: "gated"; controlAdmissionReason: string };
+
 export interface FabricParticipantSource {
   list(options?: FabricParticipantListOptions, now?: number): FabricParticipantInfo[];
   get(id: string, now?: number, options?: { fresh?: boolean }): FabricParticipantInfo | undefined;
@@ -214,6 +218,8 @@ export interface FabricParticipantSource {
   peers(now?: number): FabricPeerInfo[];
   /** The reason peer visibility is unknown (a stalled mesh writer), or undefined when healthy. */
   writeStalled?(now?: number): Error | undefined;
+  /** Effective local control gate, not routing-read freshness or ordinary Main activity. */
+  controlAdmission?(now?: number): FabricControlAdmission;
   /** Why a negative routing lookup is not authoritative (unjoined, overdue or failed view). */
   routingUnavailable?(now?: number): string | undefined;
   /** Wait for a briefly late native lease (file) or remote mirror (notifications).

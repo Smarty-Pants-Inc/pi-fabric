@@ -11,7 +11,8 @@ import { createJiti } from "jiti";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshStateEntry } from "../src/mesh/store.js";
 import { StoreBridgeSide } from "../src/mesh/bridge.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { FileCarrierPresence } from "../src/mesh/bridge-nats-file.js";
+import { ParticipantDirectory, participantFromEntry } from "../src/topology/participant-directory.js";
 import { presenceValue } from "../src/topology/participant-view.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { NatsBridgePresence } from "../src/mesh/bridge-nats-presence.js";
@@ -191,11 +192,26 @@ describe.skipIf(process.platform !== "linux")("f339 native participant SHAPE exp
         actualSession: owner.pin, warning: "Subsequent runner variants are controlled component experiments, NOT live receiver proof" });
       return true;
     }, "unique real idle native participant + real epoch/root");
-    expect(native).not.toHaveProperty("runner");
+    expect(native.runner).toBe("native");
     expect(native.rootId).toBe(owner.pin.rootId);
     expect(native.ownerHostId).toBe(owner.owner().hostId);
     expect(native.ownerIdentityId).toBe(owner.owner().hostId);
     expect(native.capabilities).toEqual(["stop", "ask"]);
+    const file = new StoreBridgeSide(owner.mesh, owner.binding.ingress.link);
+    const snapshot = await file.presence(), carrier = new FileCarrierPresence(file);
+    await carrier.refresh(true); // Actual FILE parser + live StoreBridgeSide owner sample, not raw-record fallback.
+    const generated = carrier.actors().filter(record => record.id === ACTOR);
+    const records = carrier.view().records(ACTOR);
+    expect(snapshot.hosts.some(host => host.record.id === native.ownerHostId)).toBe(true);
+    expect(generated).toHaveLength(1);
+    expect(generated[0]).toMatchObject({ runner: "native", capabilities: ["stop", "ask"],
+      rootId: native.rootId, ownerHostId: native.ownerHostId, ownerIdentityId: native.ownerIdentityId,
+      ownerIncarnation: native.ownerIncarnation });
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ kind: "actor", rootId: native.rootId, ownerHostId: native.ownerHostId,
+      ownerIdentityId: native.ownerIdentityId, ownerIncarnation: native.ownerIncarnation, live: true });
+    expect(carrier.file(ACTOR)?.hostId).toBe(native.ownerHostId);
+    evidence("shape-generated-file-presence.json", { native, snapshot, generated, records });
     // ORDINARY model-actor metadata control only. NEVER a candidate encoding of native.
     ordinary = { ...copy(native), id: ORDINARY, name: "ordinary-shape-control", runner: "pi" };
     const source = path.join(owner.root, "shape-frozen-source"); fs.mkdirSync(source, { mode: 0o700 });
@@ -228,7 +244,7 @@ describe.skipIf(process.platform !== "linux")("f339 native participant SHAPE exp
       "src/topology/nats-local-projection.ts": "f61475456ba7572b227a26691b8479e8dd7d70a19a2e55b5714d99240270a212",
     };
     for (const [file, hash] of Object.entries(pins)) expect(digest(path.join(source, file))).toBe(hash);
-    evidence("shape-source-provenance.json", { featureSourceHead: null, reason: "Parent-held docs HEAD over dirty feature source",
+    evidence("shape-source-provenance.json", { featureSourceHead: null, reason: "Committed feature-dependency HEAD plus potentially uncommitted S1/N8 preparation; source hashes bind actual bytes, not a claim that the dependency contains S1",
       frozen: frozen.provenance, additionalFrozenPins: pins, producerSha256: digest(producer),
       current: Object.fromEntries(["src/topology/participant-directory.ts", "src/topology/participant-view.ts", "src/topology/records.ts",
         "src/mesh/bridge-nats-presence.ts", "src/mesh/bridge-nats-port.ts"].map(file => [file, digest(path.join(repo, file))])) });
@@ -264,12 +280,15 @@ describe.skipIf(process.platform !== "linux")("f339 native participant SHAPE exp
         for (const value of [rootRecord, ordinary, record]) await mesh.put({ key: localKey(value.id), value,
           identity: { id: value.ownerIdentityId, name: "controlled parser metadata", kind: "agent" } });
         const listed = directory.list({ scope: "project", includeStale: true, fresh: true });
+        const entry = mesh.listAll("topology/participants/", { fresh: true }).find(entry => entry.key === localKey(ACTOR))!;
         const row = { label, input: record, oldFile: listed.find(value => value.id === ACTOR) ?? null,
+          currentFile: participantFromEntry(entry) ?? null,
           oldKv: oldPresenceValue(kvEntry(record)) ?? null, currentKv: presenceValue(kvEntry(record)) ?? null,
           controls: listed.filter(value => value.id === ORDINARY || value.id === rootRecord.id) };
         observations.push(row); evidence(`shape-parser-${label}.json`, row);
         expect(row.controls.map(value => value.id).sort()).toEqual([ORDINARY, rootRecord.id].sort());
         expect(row.oldFile !== null).toBe(accepted);
+        expect(row.currentFile !== null).toBe(accepted);
         expect(row.oldKv !== null).toBe(accepted);
         expect(row.currentKv !== null).toBe(accepted);
         if (accepted) expect(row.oldFile).toMatchObject({ runner: "native", capabilities: ["stop", "ask"] });
@@ -278,18 +297,22 @@ describe.skipIf(process.platform !== "linux")("f339 native participant SHAPE exp
     // Missing runner on an ordinary root/agent remains malformed; no generic permissive repair.
     for (const kind of ["root", "agent"] as const) {
       const bad = { ...copy(rootRecord), kind }; delete bad.runner;
+      expect(participantFromEntry({ key: localKey(bad.id), value: bad, version: 1, updatedAt: bad.updatedAt,
+        updatedBy: { id: bad.ownerIdentityId, name: bad.name, kind: "main" } })).toBeUndefined();
       expect(presenceValue(kvEntry(bad))).toBeUndefined(); expect(oldPresenceValue(kvEntry(bad))).toBeUndefined();
     }
     evidence("shape-parser-summary.json", observations);
   }, 30_000);
 
   it("measures CURRENT full directory publish-batch prefix abort versus bridge partial publication, exact PUT count/order (unit KV only)", async () => {
-    const rows = { root: rootRecord, ordinary, native };
+    const rows = { root: rootRecord, ordinary, invalidNative: form(undefined), native };
     const results: unknown[] = [];
     // Actual ParticipantDirectory start -> refreshNats -> KvParticipantDirectory.publish -> ownRecord.
+    // Preserve the measured missing-runner counterexample explicitly after fixing the producer.
     // Existing unit KV, NOT a broker/native-callback acceptance substitute. Ordering is source order.
-    const orders: ReadonlyArray<ReadonlyArray<keyof typeof rows>> = [["native", "root", "ordinary"],
-      ["root", "native", "ordinary"], ["root", "ordinary", "native"], ["root", "ordinary"]];
+    const orders: ReadonlyArray<ReadonlyArray<keyof typeof rows>> = [["invalidNative", "root", "ordinary"],
+      ["root", "invalidNative", "ordinary"], ["root", "ordinary", "invalidNative"], ["root", "ordinary"],
+      ["native", "root", "ordinary"]];
     for (const order of orders) {
       const label = order.join("-");
       const w = kvWorld(), mesh = new MeshStore(path.join(owner.root, `shape-batch-${label}`, "mesh"), 256 * 1024, 1_000);
@@ -301,18 +324,24 @@ describe.skipIf(process.platform !== "linux")("f339 native participant SHAPE exp
       try {
         const result = await outcome(() => directory.start());
         const puts = [...w.writes];
-        const expectedIds = order.slice(0, order.indexOf("native") < 0 ? order.length : order.indexOf("native"))
+        const expectedIds = order.slice(0, order.indexOf("invalidNative") < 0 ? order.length : order.indexOf("invalidNative"))
           .map(kind => rows[kind].id);
         const observation = { scope: "unit KV actual directory lifecycle", order, result, puts,
           presencePutIds: puts.filter(key => key.includes(".p.")).map(key => Object.values(rows).find(row => pKey(MACHINE, row.id) === key)?.id) };
         evidence(`shape-publish-batch-${label}.json`, observation); results.push(observation);
-        expect(result.ok).toBe(!order.includes("native"));
+        expect(result.ok).toBe(!order.includes("invalidNative"));
         if (!result.ok) expect(result.error).toContain("Invalid owned KV participant record");
         expect(puts).toEqual([hKey(MACHINE, rootRecord.id), ...expectedIds.map(id => pKey(MACHINE, id))]);
+        if (order.includes("native")) {
+          const committed = w.presence.values.get(pKey(MACHINE, ACTOR))!;
+          expect(presenceValue(committed)).toMatchObject({ runner: "native", capabilities: ["stop", "ask"],
+            ownerHostId: rootRecord.id, ownerIdentityId: rootRecord.id, ownerIncarnation: directory.ownerIncarnation });
+        }
       } finally { await directory.close(); mesh.closeState(); }
     }
-    // Actual bridge writer isolates a refused actor instead of aborting the later ordinary actor.
-    for (const actors of [[native, ordinary], [ordinary, native]]) {
+    // Actual bridge writer still isolates an explicitly malformed actor; generated native now succeeds.
+    for (const actors of [[form(undefined), ordinary], [ordinary, form(undefined)], [native, ordinary]]) {
+      const validNative = actors.some(record => record.id === ACTOR && record.runner === "native");
       const w = kvWorld(), now = Date.now();
       const side = new NatsBridgePresence({ transport: w.transport(MACHINE, "shape-unit-bridge"), link: owner.binding.ingress.link,
         admit: (record, direction) => direction === "toNats" && [rootRecord.id, ACTOR, ORDINARY].includes(record.id) });
@@ -324,13 +353,18 @@ describe.skipIf(process.platform !== "linux")("f339 native participant SHAPE exp
         const roots = await side.mirror({ hosts: [host], participants: [rootRecord] }, now);
         const actorResult = await side.mirrorActors(actors, { sampledAt: now, complete: true });
         const observation = { scope: "unit KV actual bridge writer", order: actors.map(row => row.id), roots, actorResult, puts: [...w.writes] };
-        evidence(`shape-bridge-partial-${actors[0]!.id}.json`, observation); results.push(observation);
-        expect(roots.held).toEqual([rootRecord.id]); expect(actorResult.held).toEqual([ORDINARY]);
-        expect(actorResult.refused).toEqual([{ id: ACTOR, code: "FABRIC_BRIDGE_NATS_RECORD_INVALID" }]);
+        evidence(validNative ? "shape-bridge-valid-native.json" : `shape-bridge-partial-${actors[0]!.id}.json`, observation); results.push(observation);
+        const held = validNative ? [ACTOR, ORDINARY] : [ORDINARY];
+        expect(roots.held).toEqual([rootRecord.id]); expect(roots.refused).toEqual([]);
+        expect(actorResult.held).toEqual(held);
+        expect(actorResult.refused).toEqual(validNative ? [] : [{ id: ACTOR, code: "FABRIC_BRIDGE_NATS_RECORD_INVALID" }]);
         expect(w.writes).toEqual([hKey(MACHINE, rootRecord.id), pKey(MACHINE, rootRecord.id),
-          hKey(MACHINE, ordinary.ownerHostId), pKey(MACHINE, ORDINARY)]);
-        expect(w.presence.values.has(pKey(MACHINE, ACTOR))).toBe(false);
+          hKey(MACHINE, ordinary.ownerHostId), ...held.map(id => pKey(MACHINE, id))]);
+        expect(w.presence.values.has(pKey(MACHINE, ACTOR))).toBe(validNative);
         expect(w.presence.values.has(pKey(MACHINE, ORDINARY))).toBe(true);
+        if (validNative) expect(presenceValue(w.presence.values.get(pKey(MACHINE, ACTOR))!)).toMatchObject({
+          runner: "native", ownerHostId: native.ownerHostId, ownerIdentityId: native.ownerIdentityId,
+          ownerIncarnation: native.ownerIncarnation, capabilities: ["stop", "ask"] });
       } finally { await side.close(); }
     }
     evidence("shape-current-batch-summary.json", results);
@@ -368,7 +402,7 @@ describe.skipIf(process.platform !== "linux")("f339 native participant SHAPE exp
           { kind: "actor", rootId: ordinary.rootId, name: ordinary.name, id: ORDINARY }], nats: [] } },
       { signal: inboxAbort.signal, log: line => fs.appendFileSync(path.join(owner.root, "shape-real-port.log"), line + "\n", { mode: 0o600 }) }), 20_000);
       const fileSide = new StoreBridgeSide(owner.mesh, link);
-      const refreshMirror = async (label: string): Promise<void> => {
+      const refreshMirror = async (label: string, nativeInput: FabricParticipantRecord = native): Promise<void> => {
         // Sample the ACTUAL live FILE root/host deadlines. No invented source lease/epoch,
         // periodic sampler or widened freshness bound. Each new shape starts from a fresh sample.
         const snapshot = await fileSide.presence(), sampledAt = Date.now();
@@ -381,14 +415,20 @@ describe.skipIf(process.platform !== "linux")("f339 native participant SHAPE exp
         expect((actualNative[0]!.value as FabricParticipantRecord).ownerIncarnation).toBe(native.ownerIncarnation);
         expect((actualNative[0]!.value as FabricParticipantRecord).status).toBe("idle");
         evidence(`shape-real-source-sample-${label}.json`, { snapshot, actualNativeEntry: actualNative[0],
-          actualOwner: owner.owner(), controlledOrdinary: ordinary, sampledAt });
-        await port!.mirror({ hosts: snapshot.hosts, participants: [actualRoot, native, ordinary],
+          actualOwner: owner.owner(), nativeInput, controlledOrdinary: ordinary, sampledAt });
+        await port!.mirror({ hosts: snapshot.hosts, participants: [actualRoot, nativeInput, ordinary],
           linkIdentity: bridgeNatsLinkIdentity(link) }, sampledAt);
       };
       await refreshMirror("ordinary-control");
       inspector = await openNatsTransport({ ...runtime, hostId: "shape-committed-record-inspector", events: false, provision: false });
       const presence = inspector.kv("presence");
-      expect(await presence.get(pKey(MACHINE, ACTOR))).toBeUndefined(); // Actual mirror refused just the native row.
+      expect(presenceValue((await presence.get(pKey(MACHINE, ACTOR)))!)).toMatchObject({ runner: "native",
+        ownerHostId: native.ownerHostId, ownerIdentityId: native.ownerIdentityId, ownerIncarnation: native.ownerIncarnation,
+        capabilities: ["stop", "ask"] });
+      expect(await presence.get(pKey(MACHINE, rootRecord.id))).toBeDefined();
+      expect(await presence.get(pKey(MACHINE, ORDINARY))).toBeDefined();
+      await refreshMirror("explicit-malformed-native-control", form(undefined));
+      expect(await presence.get(pKey(MACHINE, ACTOR))).toBeUndefined(); // Explicit malformed row still refused/withdrawn.
       expect(await presence.get(pKey(MACHINE, ORDINARY))).toBeDefined();
       inboxTask = (async () => {
         for await (const delivery of port!.inbox(inboxAbort.signal)) {
@@ -442,11 +482,13 @@ describe.skipIf(process.platform !== "linux")("f339 native participant SHAPE exp
       if (ordinaryAsk.asks.length !== 1) throw new Error(`BLOCKED: ordinary public agents.ask did not reach broker; ${JSON.stringify(ordinaryAsk.result)}`);
       await control.stop();
       for (const [label, runner, accepted] of nativeForms().filter(([label]) => ["omitted", "literal-native", "malformed-token"].includes(label))) {
-        await refreshMirror(label);
+        // Release any generated-native mirror claim BEFORE controlled KV writes; otherwise
+        // refreshing the now-fixed producer would mask the omitted-runner counterexample.
+        await refreshMirror(label, form(undefined));
         const record = form(runner), key = pKey(MACHINE, ACTOR);
         const previousEntry = await presence.get(key);
         // EXPLICIT controlled-shape input via real own-machine authenticated KV, NOT a product
-        // mirror fix/auth bypass. Required because current mirror refuses the omitted form.
+        // mirror fix/auth bypass. The current mirror still refuses this explicit omitted form.
         // The actual port holds the same real native owner epoch/lease via the ordinary control.
         const revision = await presence.put(key, `${record.ownerHostId}#${record.ownerIncarnation}`, record, previousEntry?.revision ?? 0);
         const committed = await presence.get(key);
@@ -482,7 +524,7 @@ describe.skipIf(process.platform !== "linux")("f339 native participant SHAPE exp
         if (label === "malformed-token") continue; // Parser/projection negative, not another costly ask timeout.
         const pod = oldPod(owner, broker, ACTOR, label, sdkDirectory, nodeBinary); pods.push(pod);
         checkReady(await pod.ready); // Any SDK/broker/config/action failure is BLOCKED, never "unsupported".
-        await refreshMirror(`${label}-public-ready`);
+        await refreshMirror(`${label}-public-ready`, form(undefined));
         if (accepted) {
           const discovered = await pod.call("discover", { actorId: ACTOR }); evidence(`shape-old-discovery-${label}.json`, discovered);
           expect(discovered.ok).toBe(true);

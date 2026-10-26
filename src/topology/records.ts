@@ -99,7 +99,7 @@ export const actorParticipantRecord = (
   name: actor.name,
   status: actor.status,
   residency: actor.residency ?? "session",
-  ...(actor.runner !== "native" ? { runner: actor.runner } : {}),
+  runner: actor.runner,
   transport: "host",
   capabilities: [
     ...(actor.status === "stopped"

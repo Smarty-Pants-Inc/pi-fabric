@@ -28,6 +28,7 @@ import { createBridgeNatsIdentityGate, parseBridgeNatsAllowSection } from "../sr
 import { BRIDGE_NATS_ACK_TOPIC, type BridgeNatsPresenceView } from "../src/mesh/bridge-nats-types.js";
 import type { MeshIdentity } from "../src/mesh/store.js";
 import { hostLeasePath, readHostLease } from "../src/topology/host-leases.js";
+import { participantFromEntry } from "../src/topology/participant-directory.js";
 import { FileLockBusy, lockFile } from "../src/residency/file-lock.js";
 import type { FabricControlAcceptance } from "../src/topology/control-plane.js";
 import { createNativeActorOwner, type NativeActorOwner } from "./helpers/native-actor-owner.js";
@@ -279,6 +280,24 @@ describe.skipIf(process.platform !== "linux")("N7 actual credential-free Pi SDK 
     expect((await owner.request("get_messages")).data?.messages).toEqual([]);
     const crossing = await residentIngress(owner);
     try {
+      // READY precedes the existing coalesced participant publication. Observe a real,
+      // uniquely parsed idle native row and its same FILE-view epoch, never invent one.
+      await owner.until(async () => {
+        const entries = owner.mesh.listAll("topology/participants/", { fresh: true })
+          .filter(entry => (entry.value as { id?: unknown } | undefined)?.id === ACTOR);
+        if (entries.length !== 1) return false;
+        const participant = participantFromEntry(entries[0]!);
+        if (!participant || participant.kind !== "actor" || participant.runner !== "native" || participant.status !== "idle" ||
+            participant.rootId !== owner.pin.rootId || participant.name !== owner.binding.name ||
+            participant.ownerHostId !== initialOwner.hostId || participant.ownerIdentityId !== initialOwner.hostId ||
+            !participant.ownerIncarnation) return false;
+        await crossing.presence.refresh(true);
+        const records = crossing.presence.view().records(ACTOR);
+        return records.length === 1 && records[0]!.kind === "actor" && records[0]!.live &&
+          records[0]!.rootId === participant.rootId && records[0]!.name === participant.name &&
+          records[0]!.ownerHostId === participant.ownerHostId && records[0]!.ownerIdentityId === participant.ownerIdentityId &&
+          records[0]!.ownerIncarnation === participant.ownerIncarnation;
+      }, "unique committed native participant + actual FILE owner epoch before first ask", 60_000);
       const first = await crossing.ask({ request: "after-READY" });
       expect(first.accepted).toBe(true);
       expect((first.result as { data: unknown } | undefined)?.data).toEqual({ echo: { request: "after-READY" }, sender: "session:22222222-2222-4222-8222-222222222222", actorId: ACTOR });

@@ -317,22 +317,36 @@ describe("crash durability", () => {
     void ledger;
   });
 
-  it("fails stop on a write error, leaves no torn line, and a reopen recovers", async () => {
-    let ledger = await ledgerAt();
-    const kept = (await ledger.claim(toNats("a"))).record.commandId;
-    const real = fs.writeSync;
-    const spy = vi.spyOn(fs, "writeSync").mockImplementationOnce(((fd: number, buffer: Buffer, offset?: number) => {
-      real(fd, buffer, offset ?? 0, 10); // a partial write, then the disk is full
-      throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
-    }) as unknown as typeof fs.writeSync);
-    await expect(ledger.claim(toNats("b"))).rejects.toMatchObject({ code: "ENOSPC" });
-    spy.mockRestore();
-    expect(ledger.lookup("toNats", bridgeNatsMappedCommandId(LINK, "toNats", LEAD, "b"))).toBeUndefined(); // never visible
-    await expect(ledger.claim(toNats("c"))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_CLOSED" });
-    await ledger.close();
-    ledger = await ledgerAt();
-    expect(ledger.lookup("toNats", kept)).toBeDefined();
-    expect((await ledger.claim(toNats("b"))).status).toBe("new");
+  it("fails stop after an actual partial write without a second write, rolls back the durable prefix, and preserves available errno/cause", async () => {
+    for (const mode of ["short-count", "errno"] as const) {
+      let ledger = await ledgerAt(path.join(root, mode));
+      const file = path.join(root, mode, BRIDGE_NATS_LEDGER_FILE);
+      const kept = (await ledger.claim(toNats("a"))).record.commandId, prefix = fs.readFileSync(file);
+      const cause = new Error("storage capacity exhausted"), failure = Object.assign(new Error("ENOSPC: no space left on device", { cause }),
+        { code: "ENOSPC", errno: -28 });
+      const real = fs.writeSync;
+      const spy = vi.spyOn(fs, "writeSync").mockImplementationOnce(((fd: number, buffer: Buffer, offset?: number) => {
+        const written = real(fd, buffer, offset ?? 0, 10); // actual bytes, not a fabricated count
+        if (mode === "errno") throw failure;
+        return written; // writeAll would wrongly issue another write and make this claim visible
+      }) as unknown as typeof fs.writeSync);
+      try {
+        const attempt = ledger.claim(toNats("b"));
+        if (mode === "errno") await expect(attempt).rejects.toBe(failure);
+        else await expect(attempt).rejects.toThrow(/append was short .*errno unavailable/);
+        expect(spy).toHaveBeenCalledOnce();
+        expect(fs.readFileSync(file)).toEqual(prefix);
+        expect(ledger.lookup("toNats", bridgeNatsMappedCommandId(LINK, "toNats", LEAD, "b"))).toBeUndefined();
+        await expect(ledger.claim(toNats("c"))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_CLOSED" });
+        expect(spy).toHaveBeenCalledOnce(); // fail-stop: neither a continuation nor a later append
+        if (mode === "errno") { expect(failure.errno).toBe(-28); expect(failure.cause).toBe(cause); }
+      } finally { spy.mockRestore(); }
+      await ledger.close();
+      ledger = await ledgerAt(path.join(root, mode));
+      expect(fs.readFileSync(file)).toEqual(prefix); // durable rollback survives close/reopen
+      expect(ledger.lookup("toNats", kept)).toBeDefined();
+      expect((await ledger.claim(toNats("b"))).status).toBe("new");
+    }
   });
 
   it("refuses to open over a damaged suffix longer than one unfinished append", async () => {

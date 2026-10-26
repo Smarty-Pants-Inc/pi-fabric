@@ -9,6 +9,79 @@ import { FabricControlPlane, type FabricControlAcceptance } from "../src/topolog
 
 // Keep reason: #9751 data-safety/teardown boundary. Real Main admission, real outcome/log
 // stores and public runtime lifecycle; only supplied Pi APIs and ACK failure are simulated.
+it("ordinary actor close rejection stays cached and releases its read cache without acquiring native retry semantics", async () => {
+  const { createNativeActorFixture } = await import("./helpers/native-actor-ingress.js");
+  const { MeshBackgroundQueue } = await import("../src/core/atomic-write.js");
+  const { ActorRegistryStore } = await import("../src/actors/registry-store.js");
+  const f = await createNativeActorFixture({ ensure: false }); // no native actors/callbacks
+  const failure = new Error("ordinary notification teardown failed");
+  const release = vi.spyOn(ActorRegistryStore.prototype, "releaseReadCache");
+  const close = vi.spyOn(MeshBackgroundQueue.prototype, "close").mockRejectedValueOnce(failure);
+  try {
+    const first = f.actors.close();
+    await expect(first).rejects.toBe(failure);
+    expect(release.mock.contexts.filter(store => (store as InstanceType<typeof ActorRegistryStore>).sameLocation(new ActorRegistryStore(f.actorRoot)))).toHaveLength(1);
+    const second = f.actors.close();
+    await expect(second).rejects.toBe(failure); expect(second).toBe(first);
+    expect(close).toHaveBeenCalledOnce();
+  } finally {
+    vi.restoreAllMocks();
+    // The failed ordinary manager is terminal/cached. Its watchers/timers were
+    // already joined before the injected notification failure; close other owners.
+    f.managers.splice(0); await f.close();
+  }
+});
+
+// Expected platform gap: this ordinary-failure counterexample pins a real Linux
+// host flock; it is not a native callback/release qualification.
+it.skipIf(process.platform !== "linux")("ordinary resident failed close does not retry or release a retained fence on the second call", async () => {
+  const { ResidentHost } = await import("../src/residency/host.js");
+  const { ResidentRequestRetention } = await import("../src/residency/retention.js");
+  const { DEFAULT_FABRIC_CONFIG } = await import("../src/config.js");
+  const { RESIDENT_HOST_FORMAT } = await import("../src/residency/protocol.js");
+  const locks = await import("../src/residency/file-lock.js");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ordinary-resident-close-"));
+  const residencyRoot = path.join(root, "resident"), lockPath = path.join(residencyRoot, "host.lock");
+  const lock = vi.spyOn(locks, "lockFile"); // real kernel acquisition; capture ONLY this fixture's returned fd
+  const host = new ResidentHost({ format: RESIDENT_HOST_FORMAT, rootId: "session:ordinary-close", sessionId: "ordinary-close",
+    cwd: root, projectRoot: root, meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"), residencyRoot,
+    fullCodeMode: false, agents: DEFAULT_FABRIC_CONFIG.agents, mesh: DEFAULT_FABRIC_CONFIG.mesh,
+    retention: DEFAULT_FABRIC_CONFIG.retention, workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+    fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda" });
+  let fd: number | undefined, pinned: { dev: number; ino: number } | undefined;
+  try {
+    await host.start();
+    fd = await lock.mock.results[lock.mock.calls.findIndex(([file]) => file === lockPath)]!.value;
+    const stat = fs.fstatSync(fd!); pinned = { dev: stat.dev, ino: stat.ino };
+    const ownerFile = path.join(residencyRoot, "owner.json"), owner = fs.readFileSync(ownerFile);
+    const failure = new Error("ordinary retention teardown failed");
+    const realClose = ResidentRequestRetention.prototype.close;
+    const retention = vi.spyOn(ResidentRequestRetention.prototype, "close").mockImplementationOnce(function (this: InstanceType<typeof ResidentRequestRetention>) {
+      realClose.call(this); throw failure; // stop its timer first; this is NOT native-busy settlement
+    });
+    await expect(host.close()).rejects.toBe(failure);
+    await expect(host.close()).resolves.toBeUndefined();
+    expect(retention).toHaveBeenCalledOnce(); // predependency behavior: no new retry after ordinary failure
+    expect(fs.readFileSync(ownerFile)).toEqual(owner);
+    expect({ dev: fs.fstatSync(fd!).dev, ino: fs.fstatSync(fd!).ino }).toEqual(pinned);
+  } finally {
+    vi.restoreAllMocks();
+    // Explicit fixture-owner cleanup is NOT another host.close/release receipt.
+    // Join each still-live component before closing our captured descriptor/root.
+    await host.actors?.close().catch(() => undefined);
+    await host.lifecycle?.close().catch(() => undefined);
+    await host.control?.close().catch(() => undefined);
+    await host.agents?.close().catch(() => undefined);
+    await host.participants?.close().catch(() => undefined);
+    host.mesh?.closeState();
+    if (fd !== undefined && pinned) {
+      try { const stat = fs.fstatSync(fd); if (stat.dev === pinned.dev && stat.ino === pinned.ino) fs.closeSync(fd); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EBADF") throw error; }
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 const cases = [
   { flow: "exit", failure: "post-append" },
   { flow: "reload", failure: "post-append" },

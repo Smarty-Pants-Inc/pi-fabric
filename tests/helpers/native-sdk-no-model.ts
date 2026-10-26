@@ -31,6 +31,51 @@ export function assertApprovedNativeSdk(sdkDirectory: string): void {
   }
 }
 
+/** Ordinary CI declares missing native coverage; the explicit native gate may never skip.
+ * Validate any supplied SDK first, even if another prerequisite is absent: an
+ * unapproved path or changed readable source is a failure, not an expected gap.
+ */
+export function nativeSdkTestPrerequisite(): string | undefined {
+  const sdkDirectory = process.env.FABRIC_NATIVE_TEST_PI_SDK_DIST;
+  const nodeBinary = process.env.FABRIC_NATIVE_TEST_NODE;
+  let missingSdk = false;
+  if (sdkDirectory) {
+    if (sdkDirectory !== NATIVE_SDK_DIRECTORY) assertApprovedNativeSdk(sdkDirectory);
+    try {
+      if (fs.realpathSync(sdkDirectory) !== NATIVE_SDK_DIRECTORY) throw new Error("N7 BLOCKED: unapproved SDK realpath");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      missingSdk = true;
+    }
+    // Check every existing pinned source before declaring absent files skippable.
+    for (const [relative, expected] of Object.entries(NATIVE_SDK_SOURCE_PINS)) {
+      try {
+        const actual = createHash("sha256").update(fs.readFileSync(path.join(sdkDirectory, relative))).digest("hex");
+        if (actual !== expected) throw new Error(`N7 BLOCKED: approved SDK source changed: ${relative}`);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        missingSdk = true;
+      }
+    }
+    if (!missingSdk) assertApprovedNativeSdk(sdkDirectory);
+  }
+  let missingNode = !nodeBinary;
+  if (nodeBinary) {
+    if (!path.isAbsolute(nodeBinary)) throw new Error("N7 BLOCKED: native test Node must be an explicit absolute path");
+    try { fs.accessSync(nodeBinary, fs.constants.X_OK); missingNode = !fs.statSync(nodeBinary).isFile(); }
+    catch (error) {
+      if (!["ENOENT", "EACCES"].includes(String((error as NodeJS.ErrnoException).code))) throw error;
+      missingNode = true;
+    }
+  }
+  const gaps = [process.platform !== "linux" && "Linux kernel coverage", !sdkDirectory && "FABRIC_NATIVE_TEST_PI_SDK_DIST",
+    missingSdk && "approved SDK files", missingNode && "executable FABRIC_NATIVE_TEST_NODE"].filter(Boolean);
+  if (!gaps.length) return undefined;
+  const reason = `native prerequisites absent: ${gaps.join(", ")}; run the approved Linux native gate for coverage`;
+  if (process.env.FABRIC_NATIVE_TEST_REQUIRED === "1") throw new Error(`NATIVE_TEST_REQUIRED: ${reason}`);
+  return reason;
+}
+
 // Literal copied from the APPROVED pi-agent-core/dist/agent.js:18-30. Kept
 // private and mutable-descriptor-shaped, matching both live SDK and RPC JSON.
 const unconfigured = {

@@ -1242,11 +1242,12 @@ export class ResidentHost {
   }
 
   async close(): Promise<void> {
+    const retryNativeClose = this.#nativeCloseFailure !== undefined;
     if (this.#nativeCloseFailure) {
       if (this.actors.inFlightActorIds().some(id => this.actors.isNativeActor(id))) throw this.#nativeCloseFailure;
       this.#nativeCloseFailure = undefined; // A fresh close may release only AFTER actual settlement.
     }
-    if (!this.#started || (this.#closed && !this.#closePending && this.#lockFd === undefined)) return;
+    if (!this.#started || (this.#closed && !this.#closePending && !retryNativeClose)) return;
     this.#closePending ??= this.#closeWithTransport().finally(() => { this.#closePending = undefined; });
     return this.#closePending;
   }

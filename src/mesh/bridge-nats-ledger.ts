@@ -348,7 +348,7 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
     const run = this.#queue.then(() => {
       if (this.#closed) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_CLOSED", "ledger is closed");
       if (this.#failed !== undefined) {
-        throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_CLOSED", "ledger stopped after a write failure; restart the link");
+        throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_CLOSED", "ledger stopped after a write failure; inspect the original failure and storage before reopening");
       }
       return work();
     });
@@ -362,11 +362,13 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
     if (fd === undefined) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_CLOSED", "ledger is closed");
     const bytes = Buffer.from(encoded, "utf8");
     try {
-      // One append syscall for one fully encoded line. Never finish a short append with another
-      // write: stop and roll it back so a crash can leave only ONE incomplete final record.
-      // This is not a disk/power atomicity guarantee; load still recovers that single torn tail.
+      // One writeSync API call for one fully encoded line; Node may internally issue
+      // multiple syscalls. Never retry a returned short count here: stop and roll back.
+      // This is not disk/power atomicity; load still recovers one torn final record.
+      // A thrown write error is rethrown unchanged (including errno/cause); a returned
+      // short count supplies no errno and cannot diagnose ENOSPC/EFBIG by itself.
       const written = fs.writeSync(fd, bytes, 0, bytes.length);
-      if (written !== bytes.length) throw new Error(`ledger append was short (${written}/${bytes.length} bytes); restart the link`);
+      if (written !== bytes.length) throw new Error(`ledger append was short (${written}/${bytes.length} bytes; errno unavailable); inspect storage before reopening`);
       fs.fsyncSync(fd);
     } catch (error) {
       // Never leave a torn line in front of later ones (load would refuse it as corruption). After a

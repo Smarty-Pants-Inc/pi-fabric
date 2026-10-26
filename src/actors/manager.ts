@@ -5508,7 +5508,11 @@ export class ActorManager {
       }
       this.#closing = true;
       this.#closePromise = this.#close().then(() => this.#registry.releaseReadCache(), error => {
-        this.#closePromise = undefined; // busy native close is retryable; NEVER a successful custody release
+        if (error instanceof NativeActorBusyError) {
+          this.#closePromise = undefined; // retry only after actual native settlement; retain custody/cache
+        } else {
+          this.#registry.releaseReadCache(); // ordinary failures keep the cached rejection and original cleanup
+        }
         throw error;
       });
       // Retention/presence joins may yield before #close reaches its owned rows.

@@ -1997,6 +1997,8 @@ export class FabricControlPlane {
     }, event => {
       if (event.topic === CONTROL_TOPIC && this.#acknowledgementsFull()) {
         const command = commandFromEvent(event);
+        // Lookup failures must escape this prefilter too: drain never commits
+        // the event, and recovery retries it before inspecting owned state.
         if (command && command.operation !== "cancel" &&
             (this.options.nativeActorIngress?.requiresNativeAdmission(command.targetId) ||
               !this.#ownedCommands.has(controlSeenKey(this.options.hostId, command.commandId)))) {
@@ -2933,13 +2935,16 @@ export class FabricControlPlane {
     // stale-owner ACKs or the shared claim. Public bridge/context labels are not proof.
     // Refusals have no trusted return address: drop without replying or poisoning dedupe.
     let nativeAdmission: NativeControlAdmission | undefined;
-    try {
-      if (this.options.nativeActorIngress?.requiresNativeAdmission(command.targetId)) {
+    // Directory failures are not authentication refusals: propagate them so the
+    // reader retains this event for replay instead of silently committing a drop.
+    if (this.options.nativeActorIngress?.requiresNativeAdmission(command.targetId)) {
+      try {
         nativeAdmission = this.options.nativeActorIngress.admitNativeControl(event);
+      } catch (error) {
+        if (error instanceof MeshConsumptionPausedError) throw error;
+        diagnostics.warn("src/topology/control-plane.ts", "[pi-fabric] Native actor control ingress refused");
+        return;
       }
-    } catch {
-      diagnostics.warn("src/topology/control-plane.ts", "[pi-fabric] Native actor control ingress refused");
-      return;
     }
     const ownedKey = controlSeenKey(this.options.hostId, command.commandId);
     const owned = this.#ownedCommands.get(ownedKey);

@@ -1,6 +1,6 @@
 // Keep: real session-writer trust boundary + kernel/custody crash counterexamples.
 // Linux-only kernel coverage. Explicit approved SDK + Node and a FRESH compiled
-// candidate are prerequisites, NOT missing-input success/skips. No model/SDK mocks.
+// candidate are prerequisites. Ordinary CI declares missing-input skips; REQUIRED=1 fails them. No model/SDK mocks.
 // Parent MUST run via its live launcherTestTemp owner and archive the WHOLE root.
 import fs from "node:fs";
 import path from "node:path";
@@ -8,7 +8,10 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { createNativeActorOwner, type NativeActorOwner } from "./helpers/native-actor-owner.js";
-import { NATIVE_SDK_DIRECTORY, assertApprovedNativeSdk } from "./helpers/native-sdk-no-model.js";
+import { NATIVE_SDK_DIRECTORY, assertApprovedNativeSdk, nativeSdkTestPrerequisite } from "./helpers/native-sdk-no-model.js";
+
+// Expected skip: missing Linux/approved SDK files/executable Node/env in ordinary CI only.
+const nativeSkipReason = nativeSdkTestPrerequisite();
 import { residentProcessAlive } from "../src/residency/process-identity.js";
 
 const repo = fileURLToPath(new URL("../", import.meta.url));
@@ -107,7 +110,7 @@ const exactRestartAppend = (owner: NativeActorOwner, before: Buffer, started: nu
   expect(append).toEqual(Buffer.from(`${JSON.stringify(entry)}\n`));
 };
 
-describe.skipIf(process.platform !== "linux")("F1(b) actual candidate-installed native owner entry", () => {
+describe.skipIf(!!nativeSkipReason)(`F1(b) actual candidate-installed native owner entry${nativeSkipReason ? ` [SKIP: ${nativeSkipReason}]` : ""}`, () => {
   it("fences the ACTUAL executable before all SDK/session work; kernel Main death alone permits same-file restart", async () => {
     const owner = await realOwner(); assertInstalled(owner); await owner.start();
     const identity = owner.mainIdentity()!, resident = owner.owner(), before = snapshot(owner);

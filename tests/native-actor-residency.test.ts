@@ -245,6 +245,26 @@ const residentIngress = async (owner: NativeActorOwner) => {
   return { ask, deliver, presence, close: () => ledger.close() };
 };
 
+// READY precedes the existing coalesced participant publication. Observe a real,
+// uniquely parsed idle native row and its same FILE-view epoch, never invent one.
+const untilNativeIngressReady = (owner: NativeActorOwner, presence: FileCarrierPresence, ownerHostId: string): Promise<void> =>
+  owner.until(async () => {
+    const entries = owner.mesh.listAll("topology/participants/", { fresh: true })
+      .filter(entry => (entry.value as { id?: unknown } | undefined)?.id === ACTOR);
+    if (entries.length !== 1) return false;
+    const participant = participantFromEntry(entries[0]!);
+    if (!participant || participant.id !== ACTOR || participant.kind !== "actor" || participant.runner !== "native" || participant.status !== "idle" ||
+        participant.rootId !== owner.pin.rootId || participant.name !== owner.binding.name ||
+        participant.ownerHostId !== ownerHostId || participant.ownerIdentityId !== ownerHostId ||
+        !participant.ownerIncarnation) return false;
+    await presence.refresh(true);
+    const records = presence.view().records(ACTOR);
+    return records.length === 1 && records[0]!.id === participant.id && records[0]!.kind === "actor" && records[0]!.live &&
+      records[0]!.rootId === participant.rootId && records[0]!.name === participant.name &&
+      records[0]!.ownerHostId === participant.ownerHostId && records[0]!.ownerIdentityId === participant.ownerIdentityId &&
+      records[0]!.ownerIncarnation === participant.ownerIncarnation;
+  }, "unique committed native participant + actual FILE owner epoch before first ask", 60_000);
+
 const realOwner = async (): Promise<NativeActorOwner> => {
   const sdkDirectory = process.env.FABRIC_NATIVE_TEST_PI_SDK_DIST;
   const nodeBinary = process.env.FABRIC_NATIVE_TEST_NODE;
@@ -280,24 +300,7 @@ describe.skipIf(process.platform !== "linux")("N7 actual credential-free Pi SDK 
     expect((await owner.request("get_messages")).data?.messages).toEqual([]);
     const crossing = await residentIngress(owner);
     try {
-      // READY precedes the existing coalesced participant publication. Observe a real,
-      // uniquely parsed idle native row and its same FILE-view epoch, never invent one.
-      await owner.until(async () => {
-        const entries = owner.mesh.listAll("topology/participants/", { fresh: true })
-          .filter(entry => (entry.value as { id?: unknown } | undefined)?.id === ACTOR);
-        if (entries.length !== 1) return false;
-        const participant = participantFromEntry(entries[0]!);
-        if (!participant || participant.kind !== "actor" || participant.runner !== "native" || participant.status !== "idle" ||
-            participant.rootId !== owner.pin.rootId || participant.name !== owner.binding.name ||
-            participant.ownerHostId !== initialOwner.hostId || participant.ownerIdentityId !== initialOwner.hostId ||
-            !participant.ownerIncarnation) return false;
-        await crossing.presence.refresh(true);
-        const records = crossing.presence.view().records(ACTOR);
-        return records.length === 1 && records[0]!.kind === "actor" && records[0]!.live &&
-          records[0]!.rootId === participant.rootId && records[0]!.name === participant.name &&
-          records[0]!.ownerHostId === participant.ownerHostId && records[0]!.ownerIdentityId === participant.ownerIdentityId &&
-          records[0]!.ownerIncarnation === participant.ownerIncarnation;
-      }, "unique committed native participant + actual FILE owner epoch before first ask", 60_000);
+      await untilNativeIngressReady(owner, crossing.presence, initialOwner.hostId);
       const first = await crossing.ask({ request: "after-READY" });
       expect(first.accepted).toBe(true);
       expect((first.result as { data: unknown } | undefined)?.data).toEqual({ echo: { request: "after-READY" }, sender: "session:22222222-2222-4222-8222-222222222222", actorId: ACTOR });
@@ -363,6 +366,9 @@ describe.skipIf(process.platform !== "linux")("N7 actual credential-free Pi SDK 
     expect(firstMain).toBeGreaterThan(1);
     expect(firstMain).not.toBe(resident.pid);
     const bytes = fs.readFileSync(owner.sessionFile), sessionPin = fs.readFileSync(owner.sessionPin);
+    const sessionPath = fs.realpathSync(owner.sessionFile), sessionStat = fs.lstatSync(owner.sessionFile);
+    expect(sessionPath).toBe(owner.pin.sessionFile);
+    expect(sessionStat.isFile()).toBe(true);
     for (const attempt of [() => owner.attemptSecondMain(),
       () => owner.attemptSessionAccess("verify"), () => owner.attemptSessionAccess("provision")]) {
       const refused = await attempt();
@@ -389,13 +395,42 @@ describe.skipIf(process.platform !== "linux")("N7 actual credential-free Pi SDK 
     const afterCrash = await owner.attemptSessionAccess("verify");
     expect(afterCrash.code).toBe(0); expect(afterCrash.signal).toBeNull();
     expect(JSON.parse(afterCrash.stdout)).toEqual(owner.pin);
+    const restartStartedAt = Date.now();
     await owner.start();
+    const restartReadyAt = Date.now();
     expectTrustedMain(owner);
     expect(owner.mainPid()).not.toBe(firstMain);
     expect(owner.owner().pid).toBe(resident.pid);
     expect(owner.owner().token).toBe(resident.token);
     expect(owner.observations().filter(event => event.event === "module-loaded")).toHaveLength(1);
-    expect(fs.readFileSync(owner.sessionFile)).toEqual(bytes);
+    const restartedStat = fs.lstatSync(owner.sessionFile), restartedBytes = fs.readFileSync(owner.sessionFile);
+    expect(restartedStat.isFile()).toBe(true);
+    expect(fs.realpathSync(owner.sessionFile)).toBe(sessionPath);
+    expect({ dev: restartedStat.dev, ino: restartedStat.ino }).toEqual({ dev: sessionStat.dev, ino: sessionStat.ino });
+    expect(fs.readFileSync(owner.sessionPin)).toEqual(sessionPin);
+    expect(restartedBytes.subarray(0, bytes.length)).toEqual(bytes); // exact header + prior-entry byte prefix
+    const prior = bytes.toString("utf8").trimEnd().split("\n").map(line => JSON.parse(line) as Record<string, unknown>);
+    expect(prior[0]).toMatchObject({ type: "session", id: owner.pin.sessionId, cwd: owner.cwd });
+    expect(owner.pin.rootId).toBe(`session:${owner.pin.sessionId}`);
+    expect(bytes.at(-1)).toBe(0x0a);
+    // Pinned sdk.js:133-135,351-356 treats this message-free session as new:
+    // the ONLY legitimate append is one session-manager.js thinking/off entry.
+    const appendedBytes = restartedBytes.subarray(bytes.length), appendedLines = appendedBytes.toString("utf8").split("\n");
+    expect(appendedLines).toHaveLength(2);
+    expect(appendedLines[1]).toBe("");
+    const metadata = JSON.parse(appendedLines[0]!) as { type: unknown; id: string; parentId: unknown; timestamp: string; thinkingLevel: unknown };
+    expect(Object.keys(metadata)).toEqual(["type", "id", "parentId", "timestamp", "thinkingLevel"]);
+    expect(metadata.type).toBe("thinking_level_change");
+    expect(metadata.thinkingLevel).toBe("off");
+    expect(typeof metadata.id).toBe("string");
+    expect(metadata.id).toMatch(/^(?:[0-9a-f]{8}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/);
+    expect(prior.some(entry => entry.id === metadata.id)).toBe(false);
+    expect(metadata.parentId).toBe(prior.at(-1)!.id);
+    expect(typeof metadata.timestamp).toBe("string");
+    expect(metadata.timestamp).toBe(new Date(metadata.timestamp).toISOString());
+    expect(Date.parse(metadata.timestamp)).toBeGreaterThanOrEqual(restartStartedAt);
+    expect(Date.parse(metadata.timestamp)).toBeLessThanOrEqual(restartReadyAt);
+    expect(appendedBytes).toEqual(Buffer.from(`${JSON.stringify(metadata)}\n`)); // no extra/duplicate keys, whitespace or bytes
     expect(owner.callbacks()).toHaveLength(0);
     expect(owner.observations().filter(event => String(event.event).startsWith("FORBIDDEN-"))).toHaveLength(0);
   }, 180_000);
@@ -405,6 +440,7 @@ describe.skipIf(process.platform !== "linux")("N7 actual credential-free Pi SDK 
     expectTrustedMain(owner);
     const initial = owner.owner(), crossing = await residentIngress(owner);
     try {
+      await untilNativeIngressReady(owner, crossing.presence, initial.hostId);
       const leaseFile = hostLeasePath(owner.meshRoot, initial.hostId);
       const answer = crossing.ask({ mode: "stall", phaseLeaseFile: leaseFile });
       // Observe rejection immediately too: it cannot leak an unhandled rejection while stalled.

@@ -183,18 +183,20 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
       // Already recovered or replaced: never delete a successor.
     }
   };
-  const pin = pinFenceLock(lock, record);
-  // ponytail: fence-lock.ts stays main's code, so its verdicts are split here. On Linux the pin must hold:
-  // FOREIGN_LOCK also comes from a failed open (EMFILE, EACCES...) and undefined from an unreadable
-  // /proc/self/fd/<fd>/owner. Still OUR record: we hold the lock we just published (no successor can acquire
-  // while it is there), so release it by name and fail retryably; never hand out an unpinned custody on Linux.
+  let pinWriteDenied = false;
+  const pin = pinFenceLock(lock, record, () => { pinWriteDenied = true; });
+  // On Linux only an explicit Node write-permission denial permits unpinned entry/release. FOREIGN_LOCK
+  // also comes from a failed open (EMFILE, EACCES...) and undefined from an unreadable proc-fd owner.
+  // Those operational failures still release OUR record by name and fail retryably, never enter.
   // Not ours: reclaimed before entry, so release nothing.
-  if (pin === FOREIGN_LOCK || (pin === undefined && process.platform === "linux")) {
+  if (pin === FOREIGN_LOCK || (pin === undefined && process.platform === "linux" && !pinWriteDenied)) {
     let ours = false;
     try { ours = readOwner() === record; } catch { /* unreadable: not provably ours */ }
     if (ours) releaseByName();
     throw new MeshLockTimeoutError(` (custody lock ${lock} could not be pinned or was reclaimed before entry)`, attempts, maxGapMs);
   }
+  // Node's deliberate opt-out uses the fence's existing real-path protocol, not verifiedRemove's proc writes.
+  if (pinWriteDenied) return () => { releaseFenceLock(lock, record); };
   // The pinned release closes its fd, so it runs once; main's release may be called again after a failure.
   let done = false;
   return () => {

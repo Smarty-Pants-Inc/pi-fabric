@@ -56,6 +56,8 @@ export const BRIDGE_LEASE_MS = MIRROR_FRESH_MS;
 const DEFAULT_PRESENCE_MS = 5_000;
 /** A retained source event revalidates after this delay; this is NOT an event/authority TTL. */
 const DEFAULT_MEMBERSHIP_RETRY_MS = 1_000;
+/** Known-elsewhere outbound misses share one bounded trailing sample, never an idle poll. */
+const UNADDRESSED_REFRESH_MS = 1_000;
 /** A missed change notification is only a safety net: its retry backs off to this bound. */
 const MEMBERSHIP_RETRY_MAX_MS = 30_000;
 /** Transitional mixed-version exception only: remove after all fleet agents support changes. */
@@ -3499,6 +3501,9 @@ export class MeshBridge {
   #seen = { toRemote: new Set<string>(), toLocal: new Set<string>() };
   #presenceAt = Number.NEGATIVE_INFINITY;
   #presenceSync: Promise<void> | undefined;
+  /** One trailing refresh obligation; a sample begun before its latest miss cannot clear it. */
+  #unaddressedRefreshAt: number | undefined;
+  #unaddressedRefreshVersion = 0;
   #staleAdmission: BridgeStaleIncarnationError | undefined;
   #stopped = false;
   #stopTask: Promise<void> | undefined;
@@ -4131,7 +4136,20 @@ export class MeshBridge {
     if (joined) await this.syncPresence();
   }
 
+  #unaddressedRefreshDue(): boolean {
+    return this.#unaddressedRefreshAt !== undefined && Date.now() >= this.#unaddressedRefreshAt;
+  }
+
+  #deferUnaddressedRefresh(): void {
+    if (this.#stopped) return;
+    this.#unaddressedRefreshVersion++;
+    if (this.#unaddressedRefreshAt !== undefined) return;
+    this.#unaddressedRefreshAt = Date.now() + UNADDRESSED_REFRESH_MS;
+    this.#wake?.();
+  }
+
   async #syncPresence(): Promise<void> {
+    const unaddressedRefreshVersion = this.#unaddressedRefreshVersion;
     const legacyRemote = this.options.remote instanceof RemoteBridgeSide ? this.options.remote : undefined;
     const hadLegacyNoBaseline = (legacyRemote?.legacyNoBaselineCycles ?? 0) > 0;
     const syncedAt = Date.now();
@@ -4214,6 +4232,7 @@ export class MeshBridge {
     this.#presenceAt = syncedAt;
     this.#syncedPresenceVersion = presenceVersion;
     this.#syncedLeaseVersion = leaseVersion;
+    if (this.#unaddressedRefreshVersion === unaddressedRefreshVersion) this.#unaddressedRefreshAt = undefined;
     // Origin updates normally renew mirrors. A source with a long lease and no heartbeat
     // still needs its capped, held projection to remain live: one lease deadline, 1 s before
     // the 15 s mirror cap (transport/commit headroom), not an unconditional 5 s presence loop.
@@ -4322,7 +4341,8 @@ export class MeshBridge {
   /** One pass: presence when due, then every new event in both directions. */
   async step(): Promise<BridgeStepResult> {
     if (!this.#cursor) await this.start();
-    if (this.#presenceDue()) await this.syncPresence();
+    if (this.#unaddressedRefreshDue()) await this.#refreshMembership();
+    else if (this.#presenceDue()) await this.syncPresence();
     if (this.#stopped) return { toRemote: 0, toLocal: 0, dropped: 0 };
     const toRemote = await this.#direction("toRemote");
     const toLocal = await this.#direction("toLocal");
@@ -4590,7 +4610,10 @@ export class MeshBridge {
       // Reconcile latched origin changes/expiry even on a filtered page.
       const retainedRefresh = passRefreshed && retainedBoundary !== undefined && cursor.after < retainedBoundary &&
         this.#presenceVersion === this.#syncedPresenceVersion && this.#leaseVersion === this.#syncedLeaseVersion;
-      if (!retainedRefresh && !this.#deferPreemptivePresence() && this.#presenceDue()) {
+      if (direction === "toRemote" && this.#unaddressedRefreshDue()) {
+        await this.#refreshMembership();
+        passRefreshed = true;
+      } else if (!retainedRefresh && !this.#deferPreemptivePresence() && this.#presenceDue()) {
         await this.syncPresence();
         passRefreshed = true;
       }
@@ -4608,6 +4631,15 @@ export class MeshBridge {
         const event = page.events[index]!;
         if (event.sequence <= cursor.after) continue;
         if (this.#stopped) return { forwarded, dropped };
+        // A suppressed miss is not permission to publish from the page's old rules. Flush
+        // before batch admission too, even if its notification is still queued or a prior
+        // sample is in flight; #refreshMembership requires a sample after the obligation.
+        if (direction === "toRemote" && this.#unaddressedRefreshAt !== undefined && !this.#refusal(event, rules, direction)) {
+          await this.#refreshMembership();
+          passRefreshed = true;
+          rules = await authority(false);
+          if (this.#stopped) return { forwarded, dropped };
+        }
         // Publishes and the other direction's saves can also checkpoint this consumed prefix.
         if (cursor.after === this.#lastCursorAfter[direction]) {
           discardedSinceCheckpoint = 0;
@@ -4708,10 +4740,29 @@ export class MeshBridge {
         const lapsedId = reason === "sender is not a live participant of the remote" ? event.from.id
           : reason === "ack target is not bound to this link" && isObject(event.data) && typeof event.data.targetId === "string" ? event.data.targetId
           : reason === "not addressed across" && direction === "toRemote" ? event.to : undefined;
+        let coalesced = false;
+        if (!refreshed && this.#notificationMode && direction === "toRemote" && reason === "not addressed across" &&
+          typeof event.to === "string" && CANONICAL_ID.test(event.to) && rules.reservedRecipients?.has(event.to)) {
+          const presenceVersion = this.#presenceVersion;
+          const leaseVersion = this.#leaseVersion;
+          // Reservations in page rules may predate a handoff whose fs notification is
+          // delayed. Read current authority before proving elsewhere; absence alone (even
+          // a canonical id) is UNKNOWN and retains the immediate refresh below.
+          rules = await authority(false);
+          reason = this.#refusal(event, rules, direction);
+          if (reason === "not addressed across" && rules.reservedRecipients?.has(event.to) &&
+            presenceVersion === this.#presenceVersion && leaseVersion === this.#leaseVersion &&
+            this.#presenceVersion === this.#syncedPresenceVersion && this.#leaseVersion === this.#syncedLeaseVersion &&
+            !this.#presenceDue() && !this.#unaddressedRefreshDue() && !this.#deferPreemptivePresence() &&
+            this.options.local.mirrored?.(event.to) === false && this.options.local.holds?.(event.to) === false) {
+            this.#deferUnaddressedRefresh();
+            coalesced = true;
+          }
+        }
         // A file notification may still be queued when a later event append is already
         // readable. Refresh a newly observed canonical address once before dropping it;
         // admission/holds still use the committed projection, never the sender's claim.
-        if (!refreshed && lapsedId && (this.options.local.mirrored?.(lapsedId) ||
+        if (!refreshed && !coalesced && lapsedId && (this.options.local.mirrored?.(lapsedId) ||
           (this.#notificationMode && CANONICAL_ID.test(lapsedId)))) {
           await refresh();
           reason = this.#refusal(event, rules, direction);
@@ -5057,6 +5108,7 @@ export class MeshBridge {
   /** Follow notifications until stop() or failure. No timer is armed for empty idle.
    * Timer inventory: source/held-mirror expiry and pending half-lease flush (one shot);
    * retained stale-membership safety net (1 s..30 s backoff), plus exact persisted relay grace;
+   * known-elsewhere outbound misses (one trailing sample within 1 s);
    * actual lock/SQLite busy, including WAL notification commit settlement (100 ms..2 s);
    * WAL-cap refusal (1 s..30 s); explicitly negotiated legacy-only 250 ms polling.
    * Held-publication fence retries, RPC deadlines and stop
@@ -5141,7 +5193,8 @@ export class MeshBridge {
               await this.#reconcileSeen();
               await this.syncPresence();
             }
-          } else if (this.#presenceDue()) await this.syncPresence();
+          } else if (this.#unaddressedRefreshDue()) await this.#refreshMembership();
+          else if (this.#presenceDue()) await this.syncPresence();
         })();
         // stop() needs a settlement fence, not a second rejection of a failed pass.
         this.#running = pass.then(() => undefined, () => undefined);
@@ -5167,7 +5220,7 @@ export class MeshBridge {
           const noBaselineAlarmAt = remote && supportsLegacyBaselineAlarm(remote.supportsPartialPresence) &&
             remote.legacyNoBaselineCycles > 0 && remote.legacyNoBaselineSinceMonotonic !== undefined && this.options.publishLegacyBaselineAlarm
             ? this.#legacyBaselineAlarm.nextAttemptAt(remote.legacyNoBaselineSinceMonotonic) ?? Infinity : Infinity;
-          const deadline = Math.min(this.#expiryAt,
+          const deadline = Math.min(this.#expiryAt, this.#unaddressedRefreshAt ?? Infinity,
             this.#leaseVersion !== this.#syncedLeaseVersion ? this.#leaseRenewAt : Infinity, legacyInfoAt);
           if (Number.isFinite(deadline)) delay = Math.max(0, deadline - Date.now());
           if (Number.isFinite(noBaselineAlarmAt)) {
@@ -5248,6 +5301,7 @@ export class MeshBridge {
     };
     this.#stopped = true;
     this.#ready = false;
+    this.#unaddressedRefreshAt = undefined;
     this.#wake?.();
     this.#startBackoffWake?.();
     this.#watchdogWake?.();

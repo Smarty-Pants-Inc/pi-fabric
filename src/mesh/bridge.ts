@@ -4602,10 +4602,17 @@ export class MeshBridge {
         this.#log(`${direction}: skipped ${skip.topic} ${skip.id} (sequence ${skip.sequence}): ${skip.bytes} bytes pass the ${BRIDGE_PAGE_BYTES}-byte frame budget`);
       }
       let fallbackBatchThrough = cursor.after;
+      let discardedSinceCheckpoint = 0;
+      let discardCheckpointAt = monotonicClock.now();
       for (let index = 0; index < page.events.length; index++) {
         const event = page.events[index]!;
         if (event.sequence <= cursor.after) continue;
         if (this.#stopped) return { forwarded, dropped };
+        // Publishes and the other direction's saves can also checkpoint this consumed prefix.
+        if (cursor.after === this.#lastCursorAfter[direction]) {
+          discardedSinceCheckpoint = 0;
+          discardCheckpointAt = monotonicClock.now();
+        }
         // Keep receipt-backed controls in their own batches: a command conflict can leave a
         // committed prefix only when every prefix event has its own destination receipt.
         const batchUsesReceipt = event.topic === "fabric.control.command" || event.topic === "fabric.control.ack";
@@ -4849,6 +4856,13 @@ export class MeshBridge {
           }
         }
         cursor.after = event.sequence;
+        // Discard-only pages can outlast the directional watchdog. Save only a consumed
+        // prefix, at 64 events or the first completed event after 1 s; the byte offset
+        // stays at the page start until every event has been consumed below.
+        if (cursor.after > (this.#lastCursorAfter[direction] ?? start) &&
+          (++discardedSinceCheckpoint >= 64 || monotonicClock.now() - discardCheckpointAt >= 1_000)) {
+          this.#save(); // Records directional progress only after the durable checkpoint.
+        }
       }
       // The page may end in events the allow-list filtered out; a page that moved may have more.
       cursor.after = Math.max(cursor.after, page.through);

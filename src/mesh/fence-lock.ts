@@ -69,21 +69,32 @@ const PIN_ROOT = "/proc/self/fd";
 /**
  * Pin the lock DIRECTORY we just created (pi-fabric#694 P1, smarty-dev#6477): an fd on it, verified to hold our
  * record through `/proc/self/fd/<fd>/owner`. The fd follows the directory inode, never the shared name, so every
- * later step on `<pin>/owner` can only touch the file inside OUR directory. Returns the fd; `undefined` where
- * `/proc/self/fd` cannot traverse a directory (not Linux): the release falls back to the shared path;
- * FOREIGN_LOCK when the directory at the name does not hold our record (then we never held it).
+ * later step on `<pin>/owner` can only touch the file inside OUR directory. Returns the fd; `undefined` off Linux,
+ * on a proc-fd read failure, or when Node denies writes through it. Only the last calls `onWriteDenied`, letting
+ * callers distinguish a deliberate real-path release opt-out from an operational pin failure. FOREIGN_LOCK
+ * means the directory could not be opened or does not hold our record (then we cannot prove we hold it).
  */
-export const pinFenceLock = (lock: string, record: string): number | undefined => {
+export const pinFenceLock = (lock: string, record: string, onWriteDenied?: () => void): number | undefined => {
   if (process.platform !== "linux") return undefined;
   let fd: number;
   try { fd = fs.openSync(lock, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0)); } catch { return FOREIGN_LOCK; }
-  let owner: string | undefined;
-  try { owner = fs.readFileSync(path.join(PIN_ROOT, String(fd), "owner"), "utf8"); } catch (error) {
-    if (codeOf(error) !== "ENOENT" || !fs.existsSync(path.join(PIN_ROOT, String(fd)))) { fs.closeSync(fd); return undefined; }
-  }
-  if (owner === record) return fd;
-  fs.closeSync(fd);
-  return FOREIGN_LOCK;
+  let retained = false;
+  try {
+    const ownerPath = path.join(PIN_ROOT, String(fd), "owner");
+    let owner: string | undefined;
+    try { owner = fs.readFileSync(ownerPath, "utf8"); } catch (error) {
+      if (codeOf(error) !== "ENOENT" || !fs.existsSync(path.join(PIN_ROOT, String(fd)))) return undefined;
+    }
+    if (owner !== record) return FOREIGN_LOCK;
+    // Node authorizes the path string, not the writable real directory behind this proc-fd path.
+    // Check only after a successful pin/owner read: operational failures must not opt callers into fallback.
+    if (process.permission?.has?.("fs.write", ownerPath) === false) {
+      onWriteDenied?.();
+      return undefined;
+    }
+    retained = true;
+    return fd;
+  } finally { if (!retained) fs.closeSync(fd); }
 };
 
 const sameInode = (a: fs.Stats | undefined, b: fs.Stats): boolean => a !== undefined && a.isDirectory() && a.dev === b.dev && a.ino === b.ino;
@@ -108,7 +119,7 @@ const sameInode = (a: fs.Stats | undefined, b: fs.Stats): boolean => a !== undef
  * 343-413, custody-lock.ts:107-134, proven by tests/mesh-fence-lock.test.ts for both trees). Even then it
  * empties our own receipt; it never touches a successor's record.
  *
- * Unpinned (no `/proc/self/fd`): the owner is taken INSIDE `<lock>` (rename to `owner.released.<token>`, never
+ * Unpinned (no writable `/proc/self/fd`): the owner is taken INSIDE `<lock>` (rename to `owner.released.<token>`, never
  * out of the directory), verified, and either removed with an rmdir or linked back without clobbering; a foreign
  * record that cannot go back stays in `<lock>`, so the directory stays non-empty and nobody else can mkdir,
  * publish into or rmdir it. Residual there: only after a live owner's lock was replaced (the same precondition)

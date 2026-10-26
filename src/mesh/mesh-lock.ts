@@ -287,12 +287,14 @@ export class MeshLock {
     const blocked: StaleLockNote = {};
     // smarty-dev#8777: release through the directory this holder pinned at acquisition (the publication
     // fence's fd-pinned release). A check-then-rename by name let a holder that stalled past staleMs, and was
-    // reclaimed, remove its successor's lock. Before a pin exists, and off Linux, the release is main's below.
+    // reclaimed, remove its successor's lock. A deliberate Node write-permission opt-out uses the fence's
+    // existing unpinned protocol; before a pin exists, and off Linux, the release is main's below.
     let pin: number | undefined;
+    let pinWriteDenied = false;
     const releaseOwned = (): void => {
       const held = pin;
       pin = undefined;
-      if (held !== undefined) { releaseFenceLock(this.#lockPath, ownerRecord, {}, held); return; }
+      if (held !== undefined || pinWriteDenied) { releaseFenceLock(this.#lockPath, ownerRecord, {}, held); return; }
       // Non-Linux keeps main's release; the stalled-holder race there is tracked in smarty-dev#9569.
       try {
         // smarty-dev#8907: the directory judged by its owner record, stat captured before that read; only that inode
@@ -440,13 +442,12 @@ export class MeshLock {
             : retryDelayMs(retryAttempt++, 20, 250, deadline - Date.now()));
         }
       }
-      pin = pinFenceLock(this.#lockPath, ownerRecord);
-      // ponytail: fence-lock.ts stays main's code, so its verdicts are split here. On Linux the pin must hold:
-      // FOREIGN_LOCK also comes from a failed open (EMFILE, EACCES...) and undefined from an unreadable
-      // /proc/self/fd/<fd>/owner. If `<lock>/owner` is still OUR record we hold the lock we just created (no
-      // successor can acquire while it is there): release it by name (main's release) and fail retryably; never
-      // run the section unpinned on Linux. Not ours: reclaimed before entry, so release nothing.
-      if (pin === FOREIGN_LOCK || (pin === undefined && process.platform === "linux")) {
+      pin = pinFenceLock(this.#lockPath, ownerRecord, () => { pinWriteDenied = true; });
+      // On Linux only an explicit Node write-permission denial permits unpinned entry/release. FOREIGN_LOCK
+      // also comes from a failed open (EMFILE, EACCES...) and undefined from an unreadable proc-fd owner.
+      // Those operational failures still release OUR record by name and fail retryably, never enter.
+      // Not ours: reclaimed before entry, so release nothing.
+      if (pin === FOREIGN_LOCK || (pin === undefined && process.platform === "linux" && !pinWriteDenied)) {
         pin = undefined;
         let ours = false;
         try { ours = fs.readFileSync(ownerPath, "utf8") === ownerRecord; } catch { /* unreadable: not provably ours */ }

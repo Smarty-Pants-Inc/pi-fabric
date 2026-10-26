@@ -48,7 +48,7 @@ function record(id: string): FabricParticipantRecord {
 async function nats(id: string, random: () => number, live?: () => boolean, reconnectOnSubscribe = false) {
   const { root, mesh } = scratch(), world = kvWorld();
   const listeners = new Set<() => void>();
-  const base = world.transport("machine-a", id), leases = base.kv("leases");
+  const base = world.transport("machine-a", id), leases = base.kv("leases"), presenceKv = base.kv("presence");
   const renewals: number[] = [];
   let renewalDelay = 0;
   const transport: FabricTransport = { ...base,
@@ -58,6 +58,7 @@ async function nats(id: string, random: () => number, live?: () => boolean, reco
       return () => { listeners.delete(listener); };
     },
     kv(bucket) {
+      if (bucket === "presence") return presenceKv;
       if (bucket !== "leases") return base.kv(bucket);
       return { ttlMs: leases.ttlMs, get: leases.get.bind(leases), delete: leases.delete.bind(leases), watch: leases.watch.bind(leases),
         async put(key, owner, value, revision, signal) {
@@ -78,12 +79,30 @@ async function nats(id: string, random: () => number, live?: () => boolean, reco
   const rootRecord = record(id);
   directory.registerSource(() => [rootRecord]);
   await directory.start();
-  return { directory, world, renewals, rootRecord,
+  return { directory, world, renewals, rootRecord, presenceKv,
     reconnect() { for (const listener of listeners) listener(); },
     delayRenewal(ms: number) { renewalDelay = ms; },
     lease() { return world.leases.values.get(hKey("machine-a", id))!; },
     presence() { return world.presence.values.get(pKey("machine-a", id))!; },
   };
+}
+
+async function expectContinuedAdmission(f: Awaited<ReturnType<typeof nats>>) {
+  const before = f.renewals.length;
+  // Cross several heartbeat turns and the last reconnect renewal's 13s cutoff.
+  for (let elapsed = 0; elapsed < 20_000; elapsed += 1_000) {
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.directory.canConsumeMesh()).toBe(true);
+    expect(f.directory.participantView?.resolve(f.rootRecord.id)?.live).toBe(true);
+    expect(f.directory.transportLeaseSignal?.aborted).toBe(false);
+    expect(f.directory.heartbeatArmed).toBe(true);
+  }
+  expect(f.renewals.length).toBeGreaterThanOrEqual(before + 3);
+  // Immediate fixture PubAcks: these request-start gaps also bound every lease age,
+  // not just the sampled admission checks above. No cutoff/recovery gap is allowed.
+  for (let i = 1; i < f.renewals.length; i++) {
+    expect(f.renewals[i]! - f.renewals[i - 1]!).toBeLessThanOrEqual(6_100);
+  }
 }
 
 // Native local successor proof requires /proc. FILE coverage runs on every platform.
@@ -189,6 +208,126 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     await vi.advanceTimersByTimeAsync(1);
     expect(f.renewals).toEqual([at + 5_000]);
     expect(f.presence().revision).toBeGreaterThan(before);
+  });
+
+  it("renews after suspension immediately following a successful reconnect commit (F2)", async () => {
+    clock();
+    const f = await nats("jitter-postcommit-suspend", () => 1);
+    const at = Date.now(), before = f.presence().revision;
+    let suspendAfterCommit = true;
+    f.directory.options.preparePublicationFence = () => () => true;
+    f.directory.options.withPublicationFence = async publish => {
+      const result = await publish();
+      if (suspendAfterCommit) {
+        suspendAfterCommit = false;
+        f.directory.suspend(); // Confirmed, but the reconnect runner has not reached finally.
+      }
+      return result;
+    };
+    f.reconnect();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.directory.heartbeatArmed).toBe(false);
+    expect(f.renewals).toEqual([at + 5_000]);
+    expect(f.presence().revision).toBeGreaterThan(before);
+    const confirmed = f.presence().revision;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(f.directory.participantView?.resolve(f.rootRecord.id)?.live).toBe(true);
+    f.directory.resume();
+    expect(f.directory.canConsumeMesh()).toBe(true);
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(f.renewals).toEqual([at + 5_000, at + 11_100]);
+    expect(f.presence().revision).toBe(confirmed); // No outstanding forced refresh.
+    await expectContinuedAdmission(f);
+  });
+
+  it.each([
+    "before preparation", "before forced commit", "during forced commit",
+    "after commit before finally", "after runner cleanup",
+  ] as const)("keeps the lease admitted across short suspend/resume %s", async phase => {
+    clock();
+    const f = await nats(`jitter-phase-${phase.replaceAll(" ", "-")}`, () => 1);
+    const before = f.presence().revision;
+    let entered = false, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const pause = async () => {
+      if (entered) return;
+      entered = true;
+      f.directory.suspend();
+      await gate;
+    };
+    f.directory.options.preparePublicationFence = () => () => true;
+    if (phase === "before preparation") f.directory.options.beforePublication = pause;
+    f.directory.options.withPublicationFence = async publish => {
+      if (phase === "before forced commit") await pause();
+      const result = await publish();
+      if (phase === "after commit before finally") await pause();
+      return result;
+    };
+    if (phase === "during forced commit") {
+      const put = f.presenceKv.put.bind(f.presenceKv);
+      vi.spyOn(f.presenceKv, "put").mockImplementationOnce(async (...args) => {
+        await pause(); // CAS is in flight; the old token must not confirm the replacement.
+        return put(...args);
+      });
+    }
+    try {
+      f.reconnect();
+      await vi.advanceTimersByTimeAsync(5_000);
+      if (phase === "after runner cleanup") {
+        entered = true; // Timer advancement has drained the reconnect runner's microtasks.
+        f.directory.suspend();
+      }
+      expect(entered).toBe(true);
+      expect(f.directory.heartbeatArmed).toBe(false);
+      expect(f.directory.canConsumeMesh()).toBe(false); // Lifecycle hold, not a lease lapse.
+      await vi.advanceTimersByTimeAsync(100);
+      expect(f.directory.participantView?.resolve(f.rootRecord.id)?.live).toBe(true);
+      expect(f.directory.transportLeaseSignal?.aborted).toBe(false);
+      f.directory.resume();
+      f.directory.resume();
+      expect(f.directory.canConsumeMesh()).toBe(true);
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.presence().revision).toBeGreaterThan(before);
+      const confirmed = f.presence().revision;
+      f.directory.scheduleRefresh();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(f.presence().revision).toBe(confirmed); // Cancelled continuations left no false generation.
+      await expectContinuedAdmission(f);
+    } finally {
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+    }
+  });
+
+  it("retains a new reconnect received after the old commit but before suspension", async () => {
+    clock();
+    const f = await nats("jitter-postcommit-new-generation", () => 1);
+    const at = Date.now(), before = f.presence().revision;
+    let reconnectAfterCommit = true;
+    f.directory.options.preparePublicationFence = () => () => true;
+    f.directory.options.withPublicationFence = async publish => {
+      const result = await publish();
+      if (reconnectAfterCommit) {
+        reconnectAfterCommit = false;
+        f.reconnect(); // New evidence is NOT covered by the commit that just succeeded.
+        f.directory.suspend();
+      }
+      return result;
+    };
+    f.reconnect();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(f.presence().revision).toBe(before + 1);
+    expect(f.renewals).toEqual([at + 5_000]);
+    await vi.advanceTimersByTimeAsync(100);
+    f.directory.resume();
+    await vi.advanceTimersByTimeAsync(0); // Retained elapsed deadline: do not sample a new wait.
+    expect(f.renewals).toEqual([at + 5_000, at + 5_100]);
+    expect(f.presence().revision).toBe(before + 2); // The new generation got its own forced refresh.
+    f.directory.scheduleRefresh();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.presence().revision).toBe(before + 2);
+    await expectContinuedAdmission(f);
   });
 
   it("retains a reconnect received during suspension without publishing before its sampled due time", async () => {
@@ -381,7 +520,11 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     const f = await nats(`jitter-cancel-${action}`, () => 1);
     const before = f.presence().revision;
     f.reconnect();
-    if (action === "close") await f.directory.close(); else f.directory.suspend();
+    if (action === "close") {
+      await f.directory.close();
+      f.directory.suspend();
+      f.directory.resume(); // A terminal close cannot be rebound into another heartbeat.
+    } else f.directory.suspend();
     expect(f.directory.heartbeatArmed).toBe(false);
     f.reconnect();
     await vi.advanceTimersByTimeAsync(6_000);

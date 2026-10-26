@@ -1002,8 +1002,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const pending = this.#reconnectRefresh;
     if (pending?.timer) clearTimeout(pending.timer);
     // A new identity fences even an already-running async continuation. Suspension keeps
-    // the sampled monotonic deadline, not its timer or its permission to publish.
-    this.#reconnectRefresh = preserveDeadline && pending ? { dueAt: pending.dueAt } : undefined;
+    // the sampled deadline only for unconfirmed evidence, including a newer reconnect
+    // received after the running commit. A confirmed token must not block heartbeats.
+    this.#reconnectRefresh = preserveDeadline && pending &&
+      this.#confirmedReconnectGeneration < this.#verifiedReconnectGeneration ? { dueAt: pending.dueAt } : undefined;
   }
 
   #scheduleReconnectRefresh(): void {

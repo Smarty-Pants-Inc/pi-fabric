@@ -801,6 +801,8 @@ export class FabricControlPlane {
   readonly #natsWork = new Set<Promise<void>>();
   readonly #natsPublishes = new Set<Promise<unknown>>();
   readonly #natsOutcomes = new Map<string, NatsRetainedOutcome>();
+  readonly #natsCancellationClose = new AbortController();
+  #natsCancellationCloseDeadline = Infinity;
   readonly #natsCapacityWaiters = new Set<() => void>();
   #natsActiveLanes = 0;
   #natsSession: AbortController | undefined;
@@ -2275,27 +2277,31 @@ export class FabricControlPlane {
     };
     await this.#backgroundCancellations.enqueue(async () => {
       // The generic mesh queue cannot classify carrier outages. Retain this exact
-      // cancellation in its owned operation until PubAck or the ORIGINAL deadline;
+      // cancellation in its owned operation until PubAck or the original deadline
+      // (capped by one total 5s grace once close begins);
       // only a known no-write unavailable error permits another send. Uncertain,
       // denied, invalid and programming failures still fail the queue closed.
       let attempt = 0;
       for (;;) {
-        if (Date.now() >= body.deadlineAt!) {
-          throw new TransportUnavailableError("NATS control cancellation expired without confirmed publication");
+        if (Date.now() >= Math.min(body.deadlineAt!, this.#natsCancellationCloseDeadline) || this.#natsCancellationClose.signal.aborted) {
+          throw new TransportUnavailableError("NATS control cancellation expired unpublished");
         }
-        try { return await this.#sendNats(envelope); }
+        try { return await this.#sendNats(envelope, this.#natsCancellationClose.signal); }
         catch (error) { if (!(error instanceof TransportUnavailableError)) throw error; }
         // Verified reconnect is the normal wake; bounded jitter is a safety net for
         // a missed wake or a carrier without that optional notification. Close and
         // pause do not abandon an already-published command's cancellation custody.
-        const remainingMs = body.deadlineAt! - Date.now();
+        const remainingMs = Math.min(body.deadlineAt!, this.#natsCancellationCloseDeadline) - Date.now();
         if (remainingMs <= 0) continue;
         await new Promise<void>(resolve => {
           let stop: (() => void) | undefined;
-          const done = (): void => { clearTimeout(timer); stop?.(); resolve(); };
+          const closing = this.#natsCancellationClose.signal;
+          const done = (): void => { clearTimeout(timer); stop?.(); closing.removeEventListener("abort", done); resolve(); };
           const timer = setTimeout(done, Math.max(1, retryDelayMs(attempt++, 100, 5_000, remainingMs)));
           timer.unref();
           stop = this.#transport.onVerifiedReconnect?.(done);
+          closing.addEventListener("abort", done, { once: true });
+          if (closing.aborted) done();
         });
       }
     });
@@ -2904,31 +2910,39 @@ export class FabricControlPlane {
   }
 
   async #closeNats(): Promise<void> {
-    this.#closed = true; this.#started = false;
-    this.#stopVerifiedReconnect?.();
-    this.#stopVerifiedReconnect = undefined;
-    clearTimeout(this.#natsInboxRetryTimer); this.#natsInboxRetryTimer = undefined;
-    for (const cancel of this.#resendWaits) cancel();
-    clearInterval(this.#natsWorkingTimer); this.#natsWorkingTimer = undefined;
-    clearTimeout(this.#natsCleanupTimer); this.#natsCleanupTimer = undefined;
-    clearTimeout(this.#natsOutcomeRetryTimer); this.#natsOutcomeRetryTimer = undefined;
-    this.#stopNatsInbox();
-    await this.#natsInbox;
-    const cancellations: Promise<void>[] = [];
-    for (const id of [...this.#pending.keys()]) {
-      const pending = this.#clearPending(id);
-      if (!pending) continue;
-      cancellations.push(this.#publishCancellation(id, pending));
-      pending.resolve({ accepted: false, error: "Fabric control plane closed" });
-    }
-    await Promise.allSettled(cancellations);
-    await Promise.allSettled([...this.#natsWork]);
-    // Joining publishes may enqueue the cancellation of a command that committed after close.
-    while (this.#natsPublishes.size) await Promise.allSettled([...this.#natsPublishes]);
-    await this.#backgroundCancellations.checkpointForRelease();
-    for (const [key, outcome] of this.#natsOutcomes) await this.#persistNatsOutcome(key, outcome);
-    this.#handler = undefined;
-    // The composition root owns transport.close(); no file drain/readback/cleanup here.
+    // One close-wide grace, not 5s per retry/queued cancellation. Abort wakes both
+    // reconnect waits and an adapter still retrying its in-flight cancellation.
+    this.#natsCancellationCloseDeadline = Date.now() + 5_000;
+    const grace = setTimeout(() => this.#natsCancellationClose.abort(
+      new TransportUnavailableError("NATS control cancellation expired unpublished")), 5_000);
+    grace.unref();
+    try {
+      this.#closed = true; this.#started = false;
+      this.#stopVerifiedReconnect?.();
+      this.#stopVerifiedReconnect = undefined;
+      clearTimeout(this.#natsInboxRetryTimer); this.#natsInboxRetryTimer = undefined;
+      for (const cancel of this.#resendWaits) cancel();
+      clearInterval(this.#natsWorkingTimer); this.#natsWorkingTimer = undefined;
+      clearTimeout(this.#natsCleanupTimer); this.#natsCleanupTimer = undefined;
+      clearTimeout(this.#natsOutcomeRetryTimer); this.#natsOutcomeRetryTimer = undefined;
+      this.#stopNatsInbox();
+      await this.#natsInbox;
+      const cancellations: Promise<void>[] = [];
+      for (const id of [...this.#pending.keys()]) {
+        const pending = this.#clearPending(id);
+        if (!pending) continue;
+        cancellations.push(this.#publishCancellation(id, pending));
+        pending.resolve({ accepted: false, error: "Fabric control plane closed" });
+      }
+      await Promise.allSettled(cancellations);
+      await Promise.allSettled([...this.#natsWork]);
+      // Joining publishes may enqueue the cancellation of a command that committed after close.
+      while (this.#natsPublishes.size) await Promise.allSettled([...this.#natsPublishes]);
+      for (const [key, outcome] of this.#natsOutcomes) await this.#persistNatsOutcome(key, outcome);
+      this.#handler = undefined;
+      await this.#backgroundCancellations.checkpointForRelease();
+      // The composition root owns transport.close(); no file drain/readback/cleanup here.
+    } finally { clearTimeout(grace); }
   }
 
   // smarty-dev#2004: an owner mirrored from remote host R answers only through R's mesh bridge,

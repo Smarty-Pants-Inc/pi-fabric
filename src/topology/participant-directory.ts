@@ -1035,7 +1035,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #scheduleReconnectRefresh(): void {
     if (this.#closed || this.#quiescing || this.#transportLost ||
       this.#confirmedReconnectGeneration >= this.#verifiedReconnectGeneration) return;
-    if (this.#reconnectRefresh?.timer || this.#reconnectRefresh?.running) return;
+    if (this.#reconnectRefresh?.running) return;
     const lease = this.#transportLease;
     if (!lease?.revision) {
       // Bootstrap has no lease budget to sample yet, but ordinary publication must
@@ -1050,11 +1050,14 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const now = performance.now();
     const pending: ReconnectRefresh = this.#reconnectRefresh ?? { dueAt: undefined };
     pending.dueAt ??= now + window * (this.options.random ?? Math.random)();
+    // Resume and repeated notifications never resample or extend the deadline. Retain
+    // tighter caps so a backwards wall correction or renewed lease cannot undo them.
+    pending.dueAt = Math.min(pending.dueAt, now + window);
     this.#reconnectRefresh = pending;
-    if (this.#suspended || !this.#live() || !this.#participantView?.ready) return;
-    // Resume never samples again or extends the original deadline. A lease that aged
-    // while suspended can only shorten the remaining wait, preserving the operation reserve.
-    const delay = Math.min(Math.max(0, pending.dueAt - now), window);
+    // Readiness gates first arming, not an already-armed renewal's tighter budget.
+    if (this.#suspended || !this.#live() || !pending.timer && !this.#participantView?.ready) return;
+    const delay = Math.max(0, pending.dueAt - now);
+    if (pending.timer) clearTimeout(pending.timer);
     const active = (): boolean => this.#reconnectRefresh === pending && !this.#closed &&
       !this.#suspended && !this.#quiescing && !this.#transportLost && this.#live();
     const run = async (): Promise<void> => {

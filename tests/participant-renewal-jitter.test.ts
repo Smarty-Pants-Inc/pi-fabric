@@ -191,6 +191,120 @@ describe.skipIf(process.platform !== "linux")("NATS directory renewal jitter", (
     }
   });
 
+  // Keep: PR #1624 R4's already-armed timer survived host sleep and delayed lease re-creation.
+  it.each([true, false])("expedites an already-armed reconnect after wall-only sleep expires the broker lease (R4, view ready: %s)", async ready => {
+    const time = clock();
+    let draws = 0;
+    const f = await nats(`jitter-pending-sleep-${ready}`, () => { draws++; return 1; });
+    // Presence publication independently samples its own TTL refresh; count directory draws only.
+    (f.directory.participantView as KvParticipantDirectory).options.random = () => 1;
+    const timers = vi.spyOn(globalThis, "setTimeout"), cleared = vi.spyOn(globalThis, "clearTimeout");
+    f.reconnect();
+    expect(timers.mock.calls.at(-1)?.[1]).toBe(2_999);
+    const originalTimer = timers.mock.results.at(-1)!.value;
+    if (!ready) {
+      f.world.presence.gap();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.directory.participantView?.ready).toBe(false);
+    }
+    const sampledDraws = draws, mono = performance.now();
+    time.jumpWall(120_000);
+    f.world.leases.expire(hKey("machine-a", f.rootRecord.id));
+    expect(performance.now()).toBe(mono);
+    expect(f.lease()).toBeUndefined();
+    const wokeAt = Date.now();
+    f.reconnect(); // The verified receiver must reconsider the timer it already owns.
+    expect(draws).toBe(sampledDraws);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.lease()).toBeDefined(); // Actual broker row, not just a notification or timer spy.
+    expect(f.renewals[0]! - wokeAt).toBeLessThanOrEqual(1_000);
+    expect(cleared).toHaveBeenCalledWith(originalTimer);
+    expect(draws).toBe(sampledDraws);
+    expect(f.directory.canConsumeMesh()).toBe(ready);
+  });
+
+  it("keeps one pending reconnect timer and its original due time across unchanged-budget notifications", async () => {
+    clock();
+    let draws = 0;
+    const f = await nats("jitter-pending-repeats", () => { draws++; return 1; });
+    const at = Date.now(), idleTimers = vi.getTimerCount();
+    f.reconnect();
+    const sampledDraws = draws;
+    for (let i = 0; i < 4; i++) {
+      f.reconnect();
+      expect(vi.getTimerCount()).toBe(idleTimers + 1);
+      expect(draws).toBe(sampledDraws);
+      await vi.advanceTimersByTimeAsync(500);
+    }
+    f.reconnect();
+    await vi.advanceTimersByTimeAsync(998);
+    expect(f.renewals).toEqual([]);
+    expect(draws).toBe(sampledDraws);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.renewals).toEqual([at + 2_999]);
+    expect(vi.getTimerCount()).toBe(idleTimers);
+  });
+
+  it.each(["wall", "monotonic"] as const)("only pulls an armed reconnect earlier as the %s cap shrinks", async kind => {
+    const time = clock();
+    let draws = 0;
+    const f = await nats(`jitter-pending-cap-${kind}`, () => { draws++; return 1; });
+    const timers = vi.spyOn(globalThis, "setTimeout"), cleared = vi.spyOn(globalThis, "clearTimeout");
+    const idleTimers = vi.getTimerCount();
+    f.reconnect();
+    const sampledDraws = draws;
+    let previousTimer = timers.mock.results.at(-1)!.value;
+    for (const wait of [2_499, 1_999, 1_499]) {
+      if (kind === "wall") time.jumpWall(500);
+      else time.age(500); // Starved event loop: the old timer has not delivered.
+      f.reconnect();
+      expect(cleared).toHaveBeenCalledWith(previousTimer);
+      expect(timers.mock.calls.at(-1)?.[1]).toBe(wait);
+      previousTimer = timers.mock.results.at(-1)!.value;
+      expect(vi.getTimerCount()).toBe(idleTimers + 1);
+      expect(draws).toBe(sampledDraws);
+      f.reconnect(); // Same reduced budget must not accumulate timers or draw again.
+      expect(vi.getTimerCount()).toBe(idleTimers + 1);
+      expect(draws).toBe(sampledDraws);
+      previousTimer = timers.mock.results.at(-1)!.value;
+    }
+    time.jumpWall(-86_400_000); // A growing wall budget must not undo any shortening.
+    const at = Date.now();
+    f.reconnect();
+    await vi.advanceTimersByTimeAsync(1_498);
+    expect(f.renewals).toEqual([]);
+    expect(draws).toBe(sampledDraws);
+    f.reconnect();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.renewals).toEqual([at + 1_499]);
+    expect(vi.getTimerCount()).toBe(idleTimers);
+  });
+
+  it.each([false, true])("a real lease renewal cannot extend an armed reconnect (previously shortened: %s)", async shortened => {
+    const time = clock();
+    let draws = 0;
+    const f = await nats(`jitter-pending-renewed-${shortened}`, () => { draws++; return 1; });
+    const budgets = vi.spyOn(TransportHostLease.prototype, "remainingMs");
+    f.reconnect();
+    const lease = budgets.mock.contexts[0] as TransportHostLease;
+    const sampledDraws = draws;
+    if (shortened) { time.jumpWall(2_000); f.reconnect(); }
+    const due = shortened ? 999 : 2_999;
+    await vi.advanceTimersByTimeAsync(100);
+    const beforeRenewal = lease.remainingMs();
+    await lease.renew(); // Real confirmed CAS increases the monotonic budget, not a stubbed getter.
+    expect(lease.remainingMs()).toBeGreaterThan(beforeRenewal);
+    expect(f.renewals).toHaveLength(1);
+    time.jumpWall(-86_400_000); // Remove the wall cap too; neither increase can extend the timer.
+    const at = Date.now();
+    f.reconnect(); f.reconnect();
+    expect(draws).toBe(sampledDraws);
+    await vi.advanceTimersByTimeAsync(due - 101);
+    expect(f.renewals).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.renewals).toEqual([expect.any(Number), at + due - 100]);
+  });
+
   it("keeps the original reconnect presence deadline across suspend/resume (F1)", async () => {
     clock();
     let draws = 0;

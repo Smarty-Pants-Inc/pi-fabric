@@ -334,3 +334,117 @@ describe("P2: READY watch, failed cleanup read and autonomous bounded recovery",
     expect(f.view.ready).toBe(false);
   });
 });
+
+// R4-P1-01: the original uncertain CAS is still in flight after withdrawal.
+// Keep the original 29 cases above unchanged; exercise the GET/delete boundary
+// on the same stable KV bucket captured by the real participant view.
+describe("R4-P1-01: delayed original CAS wins the withdrawal delete", () => {
+  it.each(["manual", "watch"] as const)("retains withdrawal after predecessor GET/delete CAS loss (%s)", async driver => {
+    const f = await fixture();
+    const put = vi.spyOn(f.world.presence, "put");
+    const attempted = await interrupt(f, false);
+    const original = put.mock.calls.at(-1)!;
+    expect(original).toEqual([f.key, `${ROOT}#inc-1`, attempted, f.first.revision]);
+    expect(await f.view.remove(ID)).toBe(false); // The public terminal/disappearance path.
+    expect(f.row()).toMatchObject({ revision: f.first.revision, value: f.initial });
+    const remove = f.world.presence.delete.bind(f.world.presence);
+    const deletes = vi.spyOn(f.world.presence, "delete");
+    let delayedRevision = 0;
+    deletes.mockImplementationOnce((key, expected) => {
+      expect([key, expected]).toEqual([f.key, f.first.revision]); // GET observed R.
+      delayedRevision = f.world.presence.put(...original); // Exact original CAS R -> R+1.
+      return remove(key, expected); // Cleanup delete(R) must lose, not delete R+1.
+    });
+    await recover(f, driver);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(delayedRevision).toBeGreaterThan(f.first.revision);
+    expect(deletes.mock.results[0]?.value).toBe(false);
+    await absentAndReadmittable(f); // Actual absence, nonlive, no refresh, same-id admission.
+  });
+
+  it.each(["unknown revision", "new generation", "new incarnation", "foreign owner"] as const)(
+    "CONTROL: a %s winner between GET and delete is never acquired", async kind => {
+      const f = await fixture();
+      await interrupt(f, false);
+      expect(await f.view.remove(ID)).toBe(false);
+      const winner = kind === "unknown revision" ? f.initial : kind === "new generation"
+        ? { ...f.initial, startedAt: Date.now() + 1, sessionId: "generation-2" }
+        : kind === "new incarnation" ? { ...f.initial, ownerIncarnation: "inc-2" }
+        : { ...f.initial, ownerHostId: "session:foreign", ownerIdentityId: "session:foreign", ownerIncarnation: "foreign-inc" };
+      const remove = f.world.presence.delete.bind(f.world.presence);
+      const deletes = vi.spyOn(f.world.presence, "delete");
+      let revision = 0;
+      deletes.mockImplementationOnce((key, expected) => {
+        expect(expected).toBe(f.first.revision);
+        revision = f.world.presence.put(key, `${winner.ownerHostId}#${winner.ownerIncarnation}`, winner, expected);
+        return remove(key, expected);
+      });
+      await recover(f, "manual");
+      await vi.advanceTimersByTimeAsync(216_001);
+      expect(deletes.mock.results[0]?.value).toBe(false);
+      expect(deletes.mock.calls.every(([, expected]) => expected === f.first.revision)).toBe(true);
+      expect(f.row()).toMatchObject({ revision, value: winner });
+      expect(await f.first.rollback()).toBe(false);
+      await expect(f.view.publishBeforeLaunch(f.initial)).rejects.toThrow();
+      expect(f.row()).toMatchObject({ revision, value: winner });
+    });
+
+  it("retains intent through CAS loss and repeated failed reads without overlapping or hot-looping", async () => {
+    const f = await fixture(() => 0);
+    const put = vi.spyOn(f.world.presence, "put");
+    await interrupt(f, false);
+    const original = put.mock.calls.at(-1)!;
+    await f.view.remove(ID);
+    const remove = f.world.presence.delete.bind(f.world.presence);
+    vi.spyOn(f.world.presence, "delete").mockImplementationOnce((key, expected) => {
+      f.world.presence.put(...original);
+      f.readable(false); // The put wake cannot complete its recovery read.
+      return remove(key, expected);
+    });
+    await recover(f, "manual");
+    const before = f.reads.length;
+    await vi.advanceTimersByTimeAsync(999);
+    expect(f.reads).toHaveLength(before);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.reads).toHaveLength(before + 1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(f.reads).toHaveLength(before + 2);
+    const release = f.holdReads();
+    try {
+      await vi.advanceTimersByTimeAsync(1_000);
+      const held = f.reads.length;
+      expect(held).toBe(before + 3);
+      await vi.advanceTimersByTimeAsync(3_000); // Still within the existing operation budget.
+      expect(f.reads).toHaveLength(held);
+      f.readable(true);
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      await absentAndReadmittable(f);
+    } finally { release(); }
+  });
+
+  it.each(["close", "lease abort"] as const)("CONTROL: %s cancels a retained losing-CAS retry", async stop => {
+    const f = await fixture(() => 0);
+    const put = vi.spyOn(f.world.presence, "put");
+    await interrupt(f, false);
+    const original = put.mock.calls.at(-1)!;
+    await f.view.remove(ID);
+    const remove = f.world.presence.delete.bind(f.world.presence);
+    vi.spyOn(f.world.presence, "delete").mockImplementationOnce((key, expected) => {
+      f.world.presence.put(...original);
+      f.readable(false);
+      return remove(key, expected);
+    });
+    await recover(f, "manual");
+    if (stop === "close") await f.view.close();
+    else f.abort.abort(new Error("owner lease fenced after cleanup CAS loss"));
+    await vi.advanceTimersByTimeAsync(0);
+    const before = f.reads.length, writes = [...f.world.writes];
+    f.readable(true);
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(f.reads).toHaveLength(before);
+    expect(f.world.writes).toEqual(writes);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(f.view.ready).toBe(false);
+  });
+});

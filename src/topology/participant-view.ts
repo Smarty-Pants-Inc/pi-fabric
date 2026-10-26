@@ -818,8 +818,8 @@ export class KvParticipantDirectory implements ParticipantView {
   }
   #armCleanupRetry(): void {
     if (this.#closed || this.#cleanupTimer || this.#pendingCleanup.size === 0) return;
-    // Watch put/READY remains primary. Only a failed read needs this bounded safety
-    // net; event bursts must not resample or postpone an already armed deadline.
+    // Watch put/READY remains primary. A failed read or unsettled delete needs this
+    // bounded safety net; bursts must not resample or postpone an armed deadline.
     this.#cleanupTimer = setTimeout(() => {
       this.#cleanupTimer = undefined;
       this.#requestCleanup();
@@ -828,21 +828,21 @@ export class KvParticipantDirectory implements ParticipantView {
   }
 
   /** Event-driven reconnect cleanup; the parent may also call once after transport recovery.
-   * Unavailable reads retain the intent and arm one jittered safety-net retry. Restore only an
-   * exact, nonwithdrawn predecessor; otherwise attempt one exact-record CAS delete. */
+   * Failed reads/deletes retain intent and share one jittered safety-net retry. Restore only an
+   * exact, nonwithdrawn predecessor; otherwise attempt one exact-record CAS delete per pass. */
   reconcilePendingCleanup(): Promise<void> {
     if (this.#flushing) return this.#flushing;
-    let readFailed = false;
+    let retryNeeded = false;
     const flushing = Promise.all([...this.#pendingCleanup].map(([key, intent]) => this.#serial(key, async () => {
       if (this.#pendingCleanup.get(key) !== intent) return;
       const { record, previous } = intent;
       let current: TransportKvEntry<unknown> | undefined;
       try { current = await this.#presence.get(key, this.#signal(true)); }
-      catch (error) { readFailed = true; this.#report(error); return; }
+      catch (error) { retryNeeded = true; this.#report(error); return; }
       if (!current) return; // A delayed uncertain write may still appear on the watch.
-      this.#pendingCleanup.delete(key);
       const confirmed = previous && current.revision === previous.revision && this.#same(current, previous.record);
       if (confirmed && !intent.withdrawn && !this.#closed) {
+        this.#pendingCleanup.delete(key);
         // The uncertain update did not replace this exact confirmed revision. A late
         // write still has to win its original CAS; no unknown revision is authority.
         this.#owned.set(key, previous);
@@ -850,14 +850,18 @@ export class KvParticipantDirectory implements ParticipantView {
         return;
       }
       // Withdrawal/close forbids restoration, not the exact predecessor CAS delete.
-      if (!confirmed && !this.#same(current, record)) return;
-      try { await this.#presence.delete(key, current.revision, this.#signal(true)); }
-      catch (error) { this.#report(error); } // One eventual attempt, never an unfenced retry.
+      if (!confirmed && !this.#same(current, record)) { this.#pendingCleanup.delete(key); return; }
+      try {
+        // A delayed original CAS may win after GET. Retain the obligation until
+        // deletion wins; the next pass must recheck exact owner/body/revision.
+        if (await this.#presence.delete(key, current.revision, this.#signal(true))) this.#pendingCleanup.delete(key);
+        else retryNeeded = true;
+      } catch (error) { retryNeeded = true; this.#report(error); }
     }))).then(() => undefined);
     this.#flushing = flushing;
     void flushing.finally(() => {
       if (this.#flushing === flushing) this.#flushing = undefined;
-      if (readFailed) this.#armCleanupRetry();
+      if (retryNeeded) this.#armCleanupRetry();
       else this.#clearCleanupRetry(); // Successful absence retains late-write protection without polling.
       // A watch event during any pass (including a manual one) gets one serial follow-up.
       if (this.#cleanupAgain) { this.#cleanupAgain = false; this.#requestCleanup(); }

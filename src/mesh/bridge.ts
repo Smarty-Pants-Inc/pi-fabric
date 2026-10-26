@@ -3046,8 +3046,8 @@ export class RemoteBridgeSide implements BridgeSide {
 
   async hello(changes = false, presenceOnly = false): Promise<void> {
     const reply = await this.#call<{ version?: unknown; tail?: unknown; publishBatch?: unknown; publishReceipts?: unknown; changes?: unknown;
-      independentRpc?: unknown; partialPresence?: unknown; nonRootHosts?: unknown; responsivePing?: unknown }>("hello", {
-      version: BRIDGE_PROTOCOL_VERSION, ...(changes ? { changes: true } : {}),
+      independentRpc?: unknown; partialPresence?: unknown; nonRootHosts?: unknown; responsivePing?: unknown; busyTail?: unknown }>("hello", {
+      version: BRIDGE_PROTOCOL_VERSION, busyTail: true, ...(changes ? { changes: true } : {}),
     });
     if (reply?.version !== BRIDGE_PROTOCOL_VERSION && reply?.version !== LEGACY_BRIDGE_PROTOCOL_VERSION) {
       throw new Error(`Bridge agent speaks unsupported protocol ${String(reply?.version)}`);

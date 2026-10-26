@@ -254,6 +254,24 @@ const publishNative = (agent: AgentHarness, text: string) => agent.nativeStore.p
   topic: "fleet.work.test", kind: "probe", from: FROM, to: PEER, text, durable: true,
 });
 
+function invalidateParticipantDirectoryCache(agent: AgentHarness): void {
+  const directory = path.join(agent.root, "participants");
+  const before = fs.statSync(directory);
+  const futureMtimeMs = Math.max(Date.now(), before.mtimeMs) + 1_000;
+  fs.utimesSync(directory, before.atime, futureMtimeMs / 1_000);
+  expect(fs.statSync(directory).mtimeMs).toBeGreaterThan(before.mtimeMs);
+}
+
+async function holdWorkerAtParticipantScan(agent: AgentHarness): Promise<{ presence: Promise<Outcome<BridgePresence>> }> {
+  fs.writeFileSync(agent.armPath, "armed\n");
+  invalidateParticipantDirectoryCache(agent);
+  const presence = observe(agent.remote.presence());
+  const entry = await waitForJsonFile<{ threadId: number }>(agent.enteredPath, 5_000,
+    "worker participant-directory scan barrier");
+  expect(entry.threadId).toBeGreaterThan(0);
+  return { presence };
+}
+
 const mirrorSample = (at: number, startedAt = at): BridgePresence => {
   const identity: MeshIdentity = { id: "session:receipt-clock-00000000", name: "receipt clock", kind: "main" };
   const record = { format: 1 as const, id: identity.id, rootId: identity.id, identity,
@@ -433,7 +451,7 @@ describe("worker-backed bridge agent responsiveness (#16874)", () => {
     } finally { remote.close(); }
   });
 
-  it("answers tail and ping during a real 35s synchronous SQLite commit, then drains ordered durable writes", async () => {
+  it("answers tail and ping while JS Atomics.wait holds a write transaction before COMMIT, then drains ordered durable writes", async () => {
     const agent = await startAgent({ mode: "commit", delayMs: 35_000, callTimeoutMs: 60_000 });
     await publishNative(agent, "tail-anchor");
     const initial = await agent.remote.latestCursor();
@@ -445,7 +463,7 @@ describe("worker-backed bridge agent responsiveness (#16874)", () => {
 
     const first = observe(agent.remote.publish(publish("ordered-1")));
     const commitEntry = await waitForJsonFile<{ startedAt: number; threadId: number; writeChanges: number }>(agent.enteredPath,
-      5_000, "SQLite COMMIT entry");
+      5_000, "JS Atomics.wait entry before SQLite COMMIT");
     expect(commitEntry.threadId).toBeGreaterThan(0);
     expect(commitEntry.writeChanges).toBeGreaterThan(0);
     let queuedWriteSettled = false;
@@ -472,7 +490,7 @@ describe("worker-backed bridge agent responsiveness (#16874)", () => {
 
     const outcomes = await withTimeout(Promise.all([first, second, third]), 45_000, "three queued durable publish receipts");
     const receipts = outcomes.map(valueOf);
-    const commitDone = await waitForJsonFile<{ blockedMs: number }>(agent.completedPath, 2_000, "SQLite COMMIT release");
+    const commitDone = await waitForJsonFile<{ blockedMs: number }>(agent.completedPath, 2_000, "JS Atomics.wait release before SQLite COMMIT");
     expect(commitDone.blockedMs).toBeGreaterThanOrEqual(34_000);
     expect(receipts.map(receipt => receipt.sequence)).toEqual([
       outgoing[2]!.sequence + 1, outgoing[2]!.sequence + 2, outgoing[2]!.sequence + 3,
@@ -503,7 +521,7 @@ describe("worker-backed bridge agent responsiveness (#16874)", () => {
         .toEqual({ ordinal: 3, text: "ordered-3" });
     } finally { verifier.closeState(); }
 
-    console.info(`[bridge-worker-35s] blocked=${commitDone.blockedMs}ms tail=${tailMs.toFixed(1)}ms ` +
+    console.info(`[bridge-worker-js-wait-35s] held=${commitDone.blockedMs}ms tail=${tailMs.toFixed(1)}ms ` +
       `ping=${pingMs.toFixed(1)}ms inboundOrdered=${receipts.length} nativeExported=${drained.events.length}`);
   }, 70_000);
 
@@ -511,12 +529,12 @@ describe("worker-backed bridge agent responsiveness (#16874)", () => {
     expect(DEFAULT_CALL_TIMEOUT_MS).toBe(30_000);
     const agent = await startAgent({ mode: "commit", delayMs: 35_000 });
     fs.writeFileSync(agent.armPath, "armed\n");
-    // A valid mirror mutation enters a real SQLite COMMIT first. Its timeout is
-    // nonfatal; the following publication really queues behind the blocked worker
+    // A valid mirror mutation enters the fixture's JS Atomics.wait before its SQLite
+    // COMMIT. Its timeout is nonfatal; the following publication queues behind the worker
     // and owns the fatal default 30 s deadline measured below.
     const blockingMirror = observe(agent.remote.mirror(mirrorSample(Date.now())));
     const commitEntry = await waitForJsonFile<{ threadId: number; writeChanges: number }>(agent.enteredPath, 5_000,
-      "SQLite COMMIT entry before queuing the publication");
+      "JS Atomics.wait entry before queuing the publication");
     expect(commitEntry.threadId).toBeGreaterThan(0);
     expect(commitEntry.writeChanges).toBeGreaterThan(0);
     const startedAt = performance.now();
@@ -535,21 +553,25 @@ describe("worker-backed bridge agent responsiveness (#16874)", () => {
     expect(agent.wire.countRequests("mirror")).toBe(1);
     expect((await blockingMirror).ok).toBe(false);
     expect(agent.nativeStore.read().filter(event => event.text === "deadline-residual")).toEqual([]);
-    expect(fs.existsSync(agent.completedPath)).toBe(false); // runner terminates the blocked worker at its stop bound
+    // These assertions exercise shutdown with the fixture stalled in JS Atomics.wait;
+    // they do not establish a hard termination bound for a native SQLite call.
+    expect(fs.existsSync(agent.completedPath)).toBe(false);
     await withTimeout(agent.serving.then(() => undefined, error => { throw error; }), 5_000,
-      "transport close and bounded worker termination");
+      "transport close and worker shutdown from the JS Atomics.wait fixture");
 
     console.info(`[bridge-worker-default-deadline] close=${elapsedMs.toFixed(0)}ms ` +
-      `publishRequests=${agent.wire.countRequests("publish")} stopped=true replayed=false`);
+      `publishRequests=${agent.wire.countRequests("publish")} jsWaitCompletionMarkerAbsent=true replayed=false`);
   }, 42_000);
 
   it("invalidates a completed empty page on a real append and preserves a cached nonempty prefix", async () => {
-    const emptyAgent = await startAgent({ maxReadEvents: 1 });
+    const emptyAgent = await startAgent({ mode: "scan", delayMs: 1_500, maxReadEvents: 1 });
     const emptyBoundary = await emptyAgent.remote.latestCursor();
+    const { presence: emptyScan } = await holdWorkerAtParticipantScan(emptyAgent);
     const emptyReadyAfter = emptyAgent.wire.eventChanges + 1;
     const emptyBusy = await emptyAgent.remote.tail(emptyBoundary.through, emptyBoundary.offset);
     expect(emptyBusy).toMatchObject({ events: [], through: emptyBoundary.through, busy: true });
     await emptyAgent.wire.waitForEventChanges(emptyReadyAfter);
+    valueOf(await emptyScan);
 
     const appendChangedAfter = emptyAgent.wire.eventChanges + 1;
     await publishNative(emptyAgent, "after-empty");
@@ -557,13 +579,17 @@ describe("worker-backed bridge agent responsiveness (#16874)", () => {
     const refreshed = await tailWhenReady(emptyAgent, emptyBoundary.through, emptyBoundary.offset);
     expect(refreshed.events.map(event => event.text)).toEqual(["after-empty"]);
 
-    const prefixAgent = await startAgent({ maxReadEvents: 1 });
+    const prefixAgent = await startAgent({ mode: "scan", delayMs: 1_500, maxReadEvents: 1 });
     const prefixBoundary = await prefixAgent.remote.latestCursor();
+    const prefixObservedAfter = prefixAgent.wire.eventChanges + 1;
     await publishNative(prefixAgent, "prefix");
+    await prefixAgent.wire.waitForEventChanges(prefixObservedAfter);
+    const { presence: prefixScan } = await holdWorkerAtParticipantScan(prefixAgent);
     const prefixReadyAfter = prefixAgent.wire.eventChanges + 1;
     const prefixBusy = await prefixAgent.remote.tail(prefixBoundary.through, prefixBoundary.offset);
     expect(prefixBusy.busy).toBe(true);
     await prefixAgent.wire.waitForEventChanges(prefixReadyAfter);
+    valueOf(await prefixScan);
 
     const followingChangedAfter = prefixAgent.wire.eventChanges + 1;
     await publishNative(prefixAgent, "following");
@@ -580,6 +606,7 @@ describe("worker-backed bridge agent responsiveness (#16874)", () => {
     const agent = await startAgent({ mode: "scan", delayMs: 1_500 });
     const cursor = await agent.remote.latestCursor();
     fs.writeFileSync(agent.armPath, "armed\n");
+    invalidateParticipantDirectoryCache(agent);
     const scanning = agent.remote.presence();
     const scanEntry = await waitForJsonFile<{ threadId: number }>(agent.enteredPath, 5_000,
       "topology directory scan entry");

@@ -1,9 +1,9 @@
 // Transparent loopback NATS fault relay for one client population (smarty-dev#15310, A' L4).
 // Generalized from the private WireFaults class in tests/nats-inbox-faults.test.ts: frame boundaries,
 // not chunk boundaries. Authentication, permissions, streams and consumers stay the real server's.
-// It never logs or retains credential frames: only subjects, reply tokens and the bodies of
-// `$JS.ACK.*` frames are inspected. Every fault is explicit, counted and confined to the clients
-// that dial `url` (the bridge link in the mixed harness); the two Mains dial the broker directly.
+// It never logs or retains credential frames: only subjects, reply tokens, broker ACK bodies and
+// synthetic TEST inbox envelope bodies are inspected. Every fault is explicit, counted and confined
+// to clients that dial `url` (the bridge link in the mixed harness); the two Mains dial the broker directly.
 import { Buffer } from "node:buffer";
 import fs from "node:fs";
 import { createConnection, createServer, type AddressInfo, type Socket } from "node:net";
@@ -51,6 +51,10 @@ export class NatsWireFaults {
   /** The `+ACK`s this relay dropped, parsed. */
   readonly droppedAcks: JsAckSubject[] = [];
   pubAckDrops = 0;
+  /** Application response envelopes suppressed before the broker (not PubAcks or consumer `+ACK`s). */
+  responseEnvelopeDrops = 0;
+  /** The dropped synthetic TEST inbox frames; also included in inboxFrames as outbound attempts. */
+  readonly droppedResponseEnvelopes: Array<{ readonly subject: string; readonly body: string }> = [];
   /** Outbound `+ACK` frames that reached the broker. */
   readonly acks: JsAckSubject[] = [];
   /** JetStream deliveries to relay clients; `delivered > 1` is a real broker redelivery. */
@@ -70,6 +74,7 @@ export class NatsWireFaults {
   private readonly clients = new Set<Socket>();
   private readonly ackRules: Rule[] = [];
   private readonly pubAckRules: Rule[] = [];
+  private readonly responseEnvelopeRules: Rule[] = [];
   private readonly lostReplies = new Set<string>();
   private readonly listener = createServer((client) => this.accept(client));
   private constructor(private readonly upstream: URL, private readonly tls: PathBTlsFiles) {}
@@ -114,10 +119,23 @@ export class NatsWireFaults {
     this.pubAckRules.push({ match, remaining: count });
   }
 
-  /** Remove every pending ACK/PubAck drop rule (frames already dropped stay dropped). */
+  /**
+   * Suppress the next `count` matching outbound PUB/HPUB frames to a protocol ACK inbox, BEFORE
+   * broker delivery. The existing subject parser gates this to `fabric.in.*.*.ack.*.*`; commands,
+   * credentials, PubAcks and consumer `+ACK`s cannot consume a rule. Match synthetic TEST payload
+   * correlation through FrameMatch if needed. The real publisher receives no fabricated PubAck:
+   * its ordinary same-id retry can deliver after count exhaustion or clearFaults().
+   */
+  loseResponseEnvelopes(match: FrameMatch = () => true, count = 1): void {
+    if (!Number.isSafeInteger(count) || count <= 0 || count > 1_000) throw new Error("Response envelope drop count must be an integer from 1 to 1000");
+    this.responseEnvelopeRules.push({ match, remaining: count });
+  }
+
+  /** Remove every pending ACK/PubAck/response-envelope drop rule (evidence/counters remain). */
   clearFaults(): void {
     this.ackRules.length = 0;
     this.pubAckRules.length = 0;
+    this.responseEnvelopeRules.length = 0;
   }
 
   /** A forced disconnect: destroy every live client connection now. Reconnects are accepted. */
@@ -211,7 +229,14 @@ export class NatsWireFaults {
       }
       if (frame.subject.startsWith("fabric.in.")) {
         this.inboxPublishes.push(frame.subject);
-        this.inboxFrames.push({ subject: frame.subject, body: frame.body.toString("utf8") });
+        const published = { subject: frame.subject, body: frame.body.toString("utf8") };
+        this.inboxFrames.push(published);
+        if ((frame.command === "PUB" || frame.command === "HPUB") && parseInboxSubject(frame.subject)?.kind === "ack" &&
+          this.take(this.responseEnvelopeRules, frame)) {
+          this.responseEnvelopeDrops += 1;
+          this.droppedResponseEnvelopes.push(published);
+          return false;
+        }
         if (frame.reply && this.take(this.pubAckRules, frame)) this.lostReplies.add(frame.reply);
       }
     } else {

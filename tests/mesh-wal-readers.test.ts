@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { formatWalReaders, walReaderPids } from "../src/mesh/wal-readers.js";
+import { createProcLocksDiagnostics, formatWalReaders, walReaderPids } from "../src/mesh/wal-readers.js";
 
 const CHILD = `
 import { DatabaseSync } from "node:sqlite";
@@ -23,6 +23,40 @@ afterEach(() => {
   child = undefined;
   if (dir) fs.rmSync(dir, { recursive: true, force: true });
   dir = undefined;
+});
+
+describe("proc-locks diagnostics cache", () => {
+  it("caches lock text and the disable flag for at most ten seconds", () => {
+    let now = 0;
+    let disabled = false;
+    let reads = 0;
+    let stats = 0;
+    const diagnostics = createProcLocksDiagnostics(
+      () => `locks-${++reads}`,
+      () => { stats++; return disabled; },
+      () => now,
+    );
+
+    expect(diagnostics.locks()).toBe("locks-1");
+    expect(diagnostics.locks()).toBe("locks-1");
+    expect(reads).toBe(1);
+    expect(stats).toBe(1);
+
+    now = 9_999;
+    disabled = true;
+    expect(diagnostics.locks()).toBe("locks-1");
+    expect(stats).toBe(1);
+    now = 10_000;
+    expect(diagnostics.locks()).toBeUndefined();
+    expect(stats).toBe(2);
+    expect(reads).toBe(1);
+
+    disabled = false;
+    now = 20_000;
+    expect(diagnostics.locks()).toBe("locks-2");
+    expect(stats).toBe(3);
+    expect(reads).toBe(2);
+  });
 });
 
 describe.skipIf(process.platform !== "linux")("walReaderPids", () => {

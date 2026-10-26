@@ -39,7 +39,7 @@ const HANDOFF_USAGE: ReadonlyMap<string, string> = new Map([
 ]);
 
 const USAGE = `usage:
-  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--max-state-bytes BYTES] [--call-timeout-ms MS] [--log-level info|debug] [--factory-rate PER_MINUTE] [--factory-burst N] [--factory-bytes BYTES_PER_MINUTE] [--factory-byte-burst BYTES] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
+  mesh-bridge run --mesh ROOT --name LOCAL --remote NAME --cursor FILE [--lock-protocol 1|2] [--max-state-bytes BYTES] [--call-timeout-ms MS] [--log-level info|debug] [--factory-rate PER_MINUTE] [--factory-burst N] [--factory-bytes BYTES_PER_MINUTE] [--factory-byte-burst BYTES] [--partial-probe-after-baseline[=N]] [--emit-expected-roots] (--ssh HOST [--ssh-key KEY] [--ssh-port N] [--ssh-known-hosts FILE] | -- COMMAND...)
   mesh-bridge agent --mesh ROOT --peer NAME [--lock-protocol 1|2] [--max-state-bytes BYTES] [--log-level info|debug]
 ${[...HANDOFF_USAGE.values()].map((line) => `  ${line}`).join("\n")}`;
 
@@ -57,11 +57,21 @@ const parseArgs = (argv: string[], usage: UsageFault = cliUsage): { mode: string
   const flags = new Map<string, string>();
   const split = rest.indexOf("--");
   const own = split >= 0 ? rest.slice(0, split) : rest;
-  for (let index = 0; index < own.length; index += 2) {
+  for (let index = 0; index < own.length; index += 1) {
     const flag = own[index]!;
+    if (flag === "--emit-expected-roots") {
+      if (mode !== "run") throw usage("--emit-expected-roots is only supported in run mode");
+      flags.set("emit-expected-roots", "true");
+      continue;
+    }
+    if (mode === "run" && (flag === "--partial-probe-after-baseline" || flag.startsWith("--partial-probe-after-baseline="))) {
+      flags.set("partial-probe-after-baseline", flag === "--partial-probe-after-baseline" ? "30" : flag.slice(flag.indexOf("=") + 1));
+      continue;
+    }
     const value = own[index + 1];
     if (!flag.startsWith("--") || value === undefined) throw usage(`Bad argument: ${flag}`);
     flags.set(flag.slice(2), value);
+    index += 1;
   }
   return { mode, flags, command: split >= 0 ? rest.slice(split + 1) : [] };
 };
@@ -153,6 +163,12 @@ export const runBridge = async (
   const callTimeoutMs = Number(flags.get("call-timeout-ms") ?? DEFAULT_CALL_TIMEOUT_MS);
   if (!Number.isSafeInteger(callTimeoutMs) || callTimeoutMs <= 0) throw new Error("--call-timeout-ms must be a positive integer");
   const cursorPath = required(flags, "cursor");
+  const probeValue = flags.get("partial-probe-after-baseline");
+  const partialProbeAfterBaseline = probeValue === undefined ? undefined : Number(probeValue);
+  if (probeValue !== undefined && (!/^[0-9]+$/.test(probeValue) ||
+    !Number.isSafeInteger(partialProbeAfterBaseline) || partialProbeAfterBaseline! < 1 || partialProbeAfterBaseline! > 50)) {
+    throw new Error("--partial-probe-after-baseline must be an integer between 1 and 50");
+  }
   const logLevel = flags.get("log-level") ?? "info";
   if (logLevel !== "info" && logLevel !== "debug") throw new Error("--log-level must be info or debug");
   // The per-link bound on events crossing only as addressed to the hub factory (default 30/min,
@@ -255,6 +271,8 @@ export const runBridge = async (
       localName, remoteName, local, remote: linked, cursorPath,
       publishLegacyBaselineAlarm: (alarm: BridgeLegacyBaselineAlarm) => publishBridgeLegacyBaselineAlarm(local.store,
         { id: `bridge:${localName}`, name: "mesh-bridge", kind: "main" }, alarm),
+      ...(partialProbeAfterBaseline === undefined ? {} : { partialProbeAfterBaseline }),
+      ...(flags.has("emit-expected-roots") ? { emitExpectedRoots: true } : {}),
       relay: async (destinationRemote, event) => {
         if (!relay || signal.aborted) throw new BridgeRelayUnavailableError();
         await relay.send(destinationRemote, event);

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, Transform } from "node:stream";
 import { buildSync } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
@@ -35,7 +35,7 @@ import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.
 import { MeshStateWalCapError } from "../src/mesh/state-sqlite.js";
 import { isMeshRetryableBusy } from "../src/mesh/state-backend.js";
 import { MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
-import { runBridge, transportCommand } from "../src/mesh-bridge.js";
+import { main as bridgeMain, runBridge, transportCommand } from "../src/mesh-bridge.js";
 import { LIVENESS_POLICY_KEY, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { RootInbox } from "../src/topology/root-inbox.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
@@ -119,6 +119,11 @@ interface SetupOptions {
   maxEventBytes?: number;
   /** Carry the agent's replies through a real OS pipe (a relay child), as ssh does. */
   realPipe?: boolean;
+  /** Exercise negotiated old-agent behavior without replacing RemoteBridgeSide. */
+  legacyPeer?: boolean;
+  wire?: string[];
+  /** Runtime-only future options let RED acceptance tests compile before the feature exists. */
+  bridgeOptions?: Record<string, unknown>;
   callTimeoutMs?: number;
   stopMs?: number;
   /** Wrap the hub's view of the remote (to hold or fail its calls). */
@@ -144,13 +149,32 @@ const setup = (cursorPath?: string, options: SetupOptions = {}) => {
   const gate = { silent: false };
   const toGate = new PassThrough();
   toGate.on("data", (chunk) => {
+    options.wire?.push(String(chunk));
     if (!gate.silent) toAgent.write(chunk);
   });
   void serveBridgeAgent(options.agent?.(far) ?? new StoreBridgeSide(far, "dev1"), toAgent, fromAgent);
+  fromAgent.on("data", chunk => options.wire?.push(String(chunk)));
   let replies: NodeJS.ReadableStream & import("node:stream").Readable = fromAgent;
+  if (options.legacyPeer) {
+    let pending = "";
+    replies = fromAgent.pipe(new Transform({ transform(chunk, _encoding, done) {
+      pending += String(chunk);
+      let newline: number;
+      while ((newline = pending.indexOf("\n")) >= 0) {
+        const frame = JSON.parse(pending.slice(0, newline));
+        pending = pending.slice(newline + 1);
+        // Only hello has a version field; all presence and mirror RPCs remain real.
+        if (frame.ok && frame.result?.version !== undefined) {
+          frame.result = { ...frame.result, version: 1, partialPresence: false, nonRootHosts: false };
+        }
+        this.push(`${JSON.stringify(frame)}\n`);
+      }
+      done();
+    } }));
+  }
   if (options.realPipe) {
     const relay = spawn(process.execPath, ["-e", "process.stdin.pipe(process.stdout)"], { stdio: ["pipe", "pipe", "inherit"] });
-    fromAgent.pipe(relay.stdin);
+    replies.pipe(relay.stdin);
     replies = relay.stdout;
     const exited = new Promise<void>((resolve) => relay.once("close", () => resolve()));
     cleanups.push(async () => { relay.kill("SIGKILL"); await exited; });
@@ -172,6 +196,7 @@ const setup = (cursorPath?: string, options: SetupOptions = {}) => {
     ...(options.clock ? { clock: options.clock } : {}),
     ...(options.factoryRate ? { factoryRate: options.factoryRate } : {}),
     ...(options.walCapRetryMinMs === undefined ? {} : { walCapRetryMinMs: options.walCapRetryMinMs }),
+    ...options.bridgeOptions,
   });
   return { hub, far, remote, bridge, logs, debugs, gate };
 };
@@ -281,6 +306,502 @@ describe("safe WAL-cap diagnostics through bridge transport", () => {
       await running;
     }
     expect(failure).toBeUndefined();
+  });
+});
+
+// Trust-boundary acceptance: a diagnostic must pass through admission and the real legacy RPC
+// adapter, without minting authority or putting its malformed row on disk/the transport.
+describe("partial probe after baseline", () => {
+  const flag = "partial-probe-after-baseline";
+  const probeLines = (logs: string[]) => logs.filter(line => line.includes("presence PROBE"));
+  const expectedRoots = [sid("hub-z"), sid("hub-a"), sid("hub-m")].sort();
+  const expectedDigest = createHash("sha256").update(JSON.stringify(expectedRoots)).digest("hex");
+  const seed = async (store: MeshStore) => {
+    for (const name of ["hub-z", "hub-a", "hub-m"]) await addRoot(store, name, 180_000);
+  };
+  const mirroredRoots = (store: MeshStore) => store.listAll("topology/participants/", { fresh: true })
+    .map(entry => (entry.value as { id: string }).id).sort();
+  const assertClean = (store: MeshStore, wire: string[]) => {
+    expect(mirroredRoots(store)).toEqual(expectedRoots);
+    expect(store.listAll("topology/hosts/", { fresh: true })
+      .map(entry => (entry.value as { id: string }).id).sort()).toEqual(expectedRoots);
+    expect([...readHostLeases(store.root).keys()].sort()).toEqual(expectedRoots);
+    // This fixture's natives live in shared state; any participant files must still be real roots.
+    for (const entry of readParticipantFiles(store.root, { maxAgeMs: 0 })) {
+      expect(expectedRoots).toContain((entry.value as { id: string }).id);
+    }
+    // No marker identifier/property, even on a row that a receiver would subsequently reject.
+    expect(wire.join("")).not.toMatch(/probe|malformed/i);
+    expect(JSON.stringify(store.listAll("topology/", { fresh: true }))).not.toMatch(/probe|malformed/i);
+    expect(JSON.stringify(readParticipantFiles(store.root, { maxAgeMs: 0 }))).not.toMatch(/probe|malformed/i);
+    expect(JSON.stringify([...readHostLeases(store.root).values()])).not.toMatch(/probe|malformed/i);
+  };
+  const assertReceipt = (line: string, completed: number) => {
+    expect(line).toMatch(/\bpartial=true\b/);
+    expect(line).toMatch(/\backed=true\b/);
+    expect(line).toMatch(new RegExp(`\\blegacyCompletedPartials=${completed}\\b`));
+    expect(line).toMatch(new RegExp(`\\bcycle=${completed}\\b`));
+    expect(line).toContain(expectedDigest);
+    // Follow the actual logged artifact, rather than assuming its cursor-relative location.
+    const match = line.match(/\brootsFile=([^\s"]*probe-roots\.json)(?:\s|$)/);
+    expect(match, line).not.toBeNull();
+    const file = JSON.parse(fs.readFileSync(match![1]!, "utf8")) as {
+      cycleTime: string;
+      cycles: Array<{ cycle: number; roots: string[]; digest: string }>;
+    };
+    expect(file).toMatchObject({ roots: expectedRoots, count: expectedRoots.length, digest: expectedDigest, partial: true });
+    expect(new Date(file.cycleTime).toISOString()).toBe(file.cycleTime);
+    // This is an accumulated per-peer receipt, not an overwritten latest-snapshot file.
+    expect(file.cycles.map(record => record.cycle)).toEqual(Array.from({ length: completed }, (_, index) => index + 1));
+    for (const record of file.cycles) {
+      expect(record.roots).toEqual(expectedRoots);
+      expect(record.digest).toBe(expectedDigest);
+    }
+    return match![1]!;
+  };
+
+  it("leaves flag-absent legacy presence complete with no PROBE logs or artifacts", async () => {
+    const wire: string[] = [];
+    const { hub, far, bridge, remote, logs } = setup(undefined, { realPipe: true, legacyPeer: true, wire });
+    await seed(hub);
+    const offered = vi.spyOn(remote, "mirror");
+    const rootReads = vi.spyOn(remote, "acknowledgedPresenceRoots", "get");
+    try {
+      await bridge.start();
+      for (let cycle = 0; cycle < 3; cycle++) await bridge.syncPresence();
+      expect(remote.supportsPartialPresence).toBe(false);
+      expect(remote.legacyCompletedPartials).toBe(0);
+      expect(offered.mock.calls.every(([presence]) => presence.partial !== true && !presence.droppedCount)).toBe(true);
+      expect(probeLines(logs)).toEqual([]);
+      expect(rootReads).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(path.dirname(bridge.options.cursorPath), "forge", "probe-roots.json"))).toBe(false);
+      assertClean(far, wire);
+    } finally { await bridge.stop(); }
+  });
+
+  it("does not inject a malformed participant before the first complete baseline ACK", async () => {
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    const wire: string[] = [];
+    const { hub, bridge, remote, logs } = setup(undefined, {
+      legacyPeer: true, wire, bridgeOptions: { partialProbeAfterBaseline: 20 },
+      agent: store => {
+        const side = new StoreBridgeSide(store, "dev1");
+        const mirror = side.mirror.bind(side);
+        vi.spyOn(side, "mirror").mockImplementationOnce(async (...args) => {
+          entered(); await held; return mirror(...args);
+        });
+        return side;
+      },
+    });
+    await seed(hub);
+    const offered = vi.spyOn(remote, "mirror");
+    const starting = bridge.start();
+    try {
+      await Promise.race([waiting, starting.then(() => { throw new Error("No complete baseline mirror was sent"); })]);
+      expect(Number.isFinite(remote.lastPresenceRenewalAt)).toBe(false);
+      expect(remote.legacyCompletedPartials).toBe(0);
+      expect(offered).toHaveBeenCalledOnce();
+      expect(offered.mock.calls[0]![0].partial).not.toBe(true);
+      expect(offered.mock.calls[0]![0].droppedCount ?? 0).toBe(0);
+      expect(offered.mock.calls[0]![0].participants.map(row => row.id).sort()).toEqual(expectedRoots);
+      expect(probeLines(logs)).toEqual([]);
+      expect(logs.filter(line => line.includes("waiting for complete baseline ACK"))).toHaveLength(1);
+      expect(fs.existsSync(path.join(path.dirname(bridge.options.cursorPath), "forge", "probe-roots.json"))).toBe(false);
+      expect(wire.join("")).not.toMatch(/probe|malformed/i);
+    } finally { release(); await starting; await bridge.stop(); }
+  });
+
+  it.each([false, true])("ACKs 20 consecutive classifier-dropped partial cycles and retains all receipts (emitter=%s)", async (emitExpectedRoots) => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const wire: string[] = [];
+    const { hub, far, bridge, remote, logs } = setup(undefined, {
+      realPipe: true, legacyPeer: true, wire, bridgeOptions: { partialProbeAfterBaseline: 20, emitExpectedRoots },
+    });
+    await seed(hub);
+    const offered = vi.spyOn(remote, "mirror");
+    const renamed = vi.spyOn(fs, "renameSync");
+    try {
+      await bridge.start();
+      expect(remote.supportsPartialPresence).toBe(false);
+      expect(remote.legacyCompletedPartials).toBe(0);
+      expect(probeLines(logs)).toEqual([]);
+      const receiptPaths = new Set<string>();
+      let expiries = new Map([...readHostLeases(far.root)].map(([id, lease]) => [id, lease.expiresAt]));
+      for (let cycle = 1; cycle <= 20; cycle++) {
+        now += 1_000;
+        offered.mockClear();
+        await bridge.syncPresence();
+        expect(offered).toHaveBeenCalledOnce();
+        const partial = offered.mock.calls[0]![0];
+        expect(partial.partial).toBe(true);
+        expect(partial.droppedCount).toBe(1); // Exactly one admission rule dropped the injected row; partial was not forced.
+        expect(partial.participants.map(row => row.id).sort()).toEqual(expectedRoots);
+        expect(partial.hosts.map(host => host.record.id).sort()).toEqual(expectedRoots);
+        expect(remote.legacyCompletedPartials).toBe(cycle);
+        expect(remote.lastPresenceRenewalAt).toBe(now);
+        expect(probeLines(logs)).toHaveLength(cycle);
+        receiptPaths.add(assertReceipt(probeLines(logs)[cycle - 1]!, cycle));
+        assertClean(far, wire);
+        expect(JSON.stringify(hub.listAll("topology/", { fresh: true }))).not.toMatch(/probe|malformed/i);
+        expect(JSON.stringify(readParticipantFiles(hub.root, { maxAgeMs: 0 }))).not.toMatch(/probe|malformed/i);
+        const next = readHostLeases(far.root);
+        for (const id of expectedRoots) {
+          expect(next.get(id)!.expiresAt).toBeGreaterThan(expiries.get(id)!);
+          expect(next.get(id)!.expiresAt).toBeGreaterThan(now);
+          expect(far.get(`topology/participants/${hash(id)}`)?.value).toMatchObject({ id, remoteHost: "dev1" });
+        }
+        expiries = new Map([...next].map(([id, lease]) => [id, lease.expiresAt]));
+      }
+      // The configured budget is exhausted: subsequent syncs really are complete, not merely unlogged.
+      for (let following = 0; following < 2; following++) {
+        now += 1_000;
+        offered.mockClear();
+        await bridge.syncPresence();
+        expect(offered).toHaveBeenCalledOnce();
+        expect(offered.mock.calls[0]![0].partial).not.toBe(true);
+        expect(offered.mock.calls[0]![0].droppedCount ?? 0).toBe(0);
+        expect(remote.legacyCompletedPartials).toBe(20);
+        expect(probeLines(logs)).toHaveLength(20);
+        assertClean(far, wire);
+      }
+      expect(new Set(probeLines(logs)).size).toBe(20);
+      expect(logs.some(line => /probe disabled/i.test(line) && line.includes("20"))).toBe(true);
+      expect(receiptPaths.size).toBe(1); // All cycles are retained together in the per-peer JSON.
+      // Baseline emission plus exactly one write per probe cycle, never two with both flags.
+      expect(renamed.mock.calls.filter(([, target]) => String(target).endsWith("probe-roots.json")))
+        .toHaveLength(20 + Number(emitExpectedRoots));
+      if (emitExpectedRoots) {
+        now += 30_000;
+        await bridge.syncPresence(); // Later emitter updates must preserve the entire probe history.
+        const latest = JSON.parse(fs.readFileSync([...receiptPaths][0]!, "utf8"));
+        expect(latest).toMatchObject({ roots: expectedRoots, count: 3, digest: expectedDigest, partial: false });
+        expect(latest.cycleTime).toBe(new Date(now).toISOString());
+      }
+      await bridge.stop();
+      // The external checker runs AFTER the run, so validate every earlier receipt from final bytes.
+      const retained = JSON.parse(fs.readFileSync([...receiptPaths][0]!, "utf8")) as {
+        cycles: Array<{ cycle: number; roots: string[]; digest: string }>;
+      };
+      expect(retained.cycles).toHaveLength(20);
+      expect(retained.cycles.map(record => record.cycle)).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
+      for (const record of retained.cycles) {
+        expect(record.roots).toEqual(expectedRoots);
+        expect(record.digest).toBe(expectedDigest);
+        expect(probeLines(logs)[record.cycle - 1]).toContain(record.digest);
+        expect(probeLines(logs)[record.cycle - 1]).toMatch(new RegExp(`\\bcycle=${record.cycle}\\b`));
+      }
+    } finally { await bridge.stop(); }
+  }, 15_000);
+
+  it("parses CLI default, bare flag and equal N through the real legacy stdio link, stopping after N", async () => {
+    const root = scratch();
+    fs.symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "dir");
+    const agent = path.join(root, "legacy-agent.mjs");
+    buildSync({ stdin: { resolveDir: process.cwd(), contents: `
+      import { Transform } from "node:stream";
+      import { MeshStore } from ${JSON.stringify(path.resolve("src/mesh/store.ts"))};
+      import { StoreBridgeSide, serveBridgeAgent } from ${JSON.stringify(path.resolve("src/mesh/bridge.ts"))};
+      const store = new MeshStore(process.argv[2], 256 * 1024, 100);
+      let pending = "";
+      const replies = new Transform({ transform(chunk, encoding, done) {
+        pending += String(chunk);
+        let newline;
+        while ((newline = pending.indexOf("\\n")) >= 0) {
+          const frame = JSON.parse(pending.slice(0, newline)); pending = pending.slice(newline + 1);
+          if (frame.ok && frame.result?.version !== undefined)
+            frame.result = { ...frame.result, version: 1, partialPresence: false, nonRootHosts: false };
+          this.push(JSON.stringify(frame) + "\\n");
+        }
+        done();
+      } });
+      replies.pipe(process.stdout);
+      try { await serveBridgeAgent(new StoreBridgeSide(store, "dev1"), process.stdin, replies); }
+      finally { replies.end(); store.closeState(); }
+    ` }, outfile: agent, bundle: true, platform: "node", format: "esm", packages: "external" });
+    const stderr: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => { stderr.push(String(chunk)); return true; }) as typeof process.stderr.write);
+    const budgets: number[] = [];
+    vi.spyOn(MeshBridge.prototype, "run").mockImplementation(async function (this: MeshBridge) {
+      const remote = this.options.remote as RemoteBridgeSide;
+      const expected = budgets.at(-1)!;
+      expect(remote.supportsPartialPresence).toBe(false);
+      expect(remote.legacyCompletedPartials).toBe(0);
+      for (let cycle = 1; cycle <= expected + 2; cycle++) {
+        await this.syncPresence();
+        expect(remote.legacyCompletedPartials).toBe(Math.min(cycle, expected));
+      }
+    });
+    for (const [args, budget, emit] of [[[], 0, false], [[`--${flag}`], 30, false], [[`--${flag}=2`], 2, false],
+      [["--emit-expected-roots"], 0, true], [[`--${flag}=2`, "--emit-expected-roots"], 2, true]] as const) {
+      const hub = new MeshStore(scratch(), 256 * 1024, 100);
+      await seed(hub);
+      const before = probeLines(stderr).length;
+      const cursorPath = path.join(scratch(), "c.json");
+      budgets.push(budget);
+      try {
+        await expect(bridgeMain(["run", "--mesh", hub.root, "--name", "dev1", "--remote", "forge",
+          "--cursor", cursorPath, "--call-timeout-ms", "1000", ...args,
+          "--", process.execPath, agent, scratch()])).resolves.toBe(0);
+        expect(probeLines(stderr).length - before).toBe(budget);
+        const rootsFile = path.join(path.dirname(cursorPath), "forge", "probe-roots.json");
+        expect(fs.existsSync(rootsFile)).toBe(emit || budget > 0);
+        if (emit) expect(JSON.parse(fs.readFileSync(rootsFile, "utf8"))).toMatchObject({ roots: expectedRoots, count: 3 });
+      } finally { hub.closeState(); }
+    }
+  }, 20_000);
+
+  it("refuses invalid and over-50 CLI probe budgets before starting a transport", async () => {
+    const base = ["run", "--mesh", scratch(), "--name", "dev1", "--remote", "forge", "--cursor", path.join(scratch(), "c.json")];
+    const command = [path.join(scratch(), "must-not-spawn")];
+    for (const value of ["", "0", "-1", "1.5", "abc", "NaN", "Infinity", "51", "1000000"]) {
+      await expect(bridgeMain([...base, `--${flag}=${value}`, "--", ...command]), value)
+        .rejects.toThrow(/(?:integer|range|between|1[^\n]*50)/i);
+      const spawned: Array<number | undefined> = [];
+      await expect(runBridge(new Map([["mesh", base[2]!], ["name", "dev1"], ["remote", "forge"],
+        ["cursor", base[8]!], [flag, value]]), command, new AbortController().signal, pid => spawned.push(pid)), value)
+        .rejects.toThrow(/(?:integer|range|between|1[^\n]*50)/i);
+      expect(spawned).toEqual([]);
+    }
+  });
+});
+
+// Data-safety/failure-path acceptance: use real stdio ACKs, including the legacy completion adapter.
+describe("expected roots emission", () => {
+  const receiptPath = (bridge: MeshBridge) => path.join(path.dirname(bridge.options.cursorPath), bridge.options.remoteName, "probe-roots.json");
+  const receipt = (bridge: MeshBridge) => JSON.parse(fs.readFileSync(receiptPath(bridge), "utf8")) as {
+    version: number; peer: string; roots: string[]; count: number; digest: string; cycleTime: string; partial: boolean;
+    cycles: Array<{ cycle: number; roots: string[]; digest: string }>;
+  };
+  const mirrored = (store: MeshStore) => store.listAll("topology/hosts/", { fresh: true })
+    .map(entry => (entry.value as { id: string; remoteHost?: string }))
+    .filter(host => host.remoteHost === "dev1").map(host => host.id).sort();
+  const checkReceipt = (bridge: MeshBridge, roots: string[], partial: boolean) => {
+    const file = receipt(bridge);
+    expect(file).toMatchObject({ version: 1, peer: "forge", roots, count: roots.length, partial,
+      digest: createHash("sha256").update(JSON.stringify(roots)).digest("hex") });
+    expect(new Date(file.cycleTime).toISOString()).toBe(file.cycleTime);
+    expect(file.cycles).toEqual([]);
+    return file;
+  };
+
+  it("emits without injection, atomically replaces a private receipt, and rate-limits across syncs", async () => {
+    let now = 0;
+    const { hub, far, bridge, remote, logs } = setup(undefined, {
+      realPipe: true, legacyPeer: true, clock: () => now, bridgeOptions: { emitExpectedRoots: true },
+    });
+    await addRoot(hub, "emit-z", 180_000);
+    await addRoot(hub, "emit-a", 180_000);
+    const ids = [sid("emit-a"), sid("emit-z")];
+    const rootsFile = receiptPath(bridge);
+    const rename = fs.renameSync.bind(fs);
+    const replacements: Array<string | undefined> = [];
+    fs.mkdirSync(path.dirname(rootsFile), { recursive: true, mode: 0o755 });
+    if (process.platform !== "win32") fs.chmodSync(path.dirname(rootsFile), 0o755);
+    vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      if (String(target) === rootsFile) {
+        expect(String(source)).not.toBe(rootsFile);
+        expect(path.dirname(String(source))).toBe(path.dirname(rootsFile));
+        // Inspect the complete replacement BEFORE publishing it, and the still-intact previous file.
+        const next = JSON.parse(fs.readFileSync(source, "utf8"));
+        expect(next.count).toBe(next.roots.length);
+        replacements.push(fs.existsSync(rootsFile) ? fs.readFileSync(rootsFile, "utf8") : undefined);
+        if (process.platform !== "win32") expect(fs.statSync(source).mode & 0o777).toBe(0o600);
+      }
+      return rename(source, target);
+    });
+    const offered = vi.spyOn(remote, "mirror");
+    try {
+      await bridge.start();
+      checkReceipt(bridge, ids, false);
+      expect(mirrored(far)).toEqual(ids);
+      expect(replacements).toEqual([undefined]);
+      const initial = fs.readFileSync(rootsFile, "utf8");
+      await addRoot(hub, "emit-m", 180_000);
+      for (const time of [0, 1, 15_000, 29_999]) {
+        now = time;
+        await bridge.syncPresence();
+        expect(fs.readFileSync(rootsFile, "utf8")).toBe(initial);
+        expect(replacements).toHaveLength(1);
+      }
+      ids.push(sid("emit-m")); ids.sort();
+      expect(mirrored(far)).toEqual(ids); // Emission never throttles mirroring itself.
+      now = 30_000;
+      await bridge.syncPresence();
+      checkReceipt(bridge, ids, false);
+      expect(replacements).toEqual([undefined, initial]);
+      await bridge.syncPresence();
+      expect(replacements).toHaveLength(2);
+      expect(fs.readdirSync(path.dirname(rootsFile))).toEqual(["probe-roots.json"]);
+      if (process.platform !== "win32") {
+        expect(fs.statSync(rootsFile).mode & 0o777).toBe(0o600);
+        expect(fs.statSync(path.dirname(rootsFile)).mode & 0o777).toBe(0o700);
+      }
+      expect(offered.mock.calls.every(([presence]) => !presence.partial && !presence.droppedCount)).toBe(true);
+      expect(remote.legacyCompletedPartials).toBe(0);
+      expect(logs.some(line => line.includes("PROBE"))).toBe(false);
+    } finally { await bridge.stop(); }
+  });
+
+  it.each([true, false])("emits the exact ACKed complete and partial wire projection (legacy=%s)", async (legacyPeer) => {
+    let now = 0;
+    const wire: string[] = [];
+    const { hub, bridge, remote, logs } = setup(undefined, {
+      realPipe: true, legacyPeer, wire, clock: () => now, bridgeOptions: { emitExpectedRoots: true },
+    });
+    await addRoot(hub, "emit-a", 180_000);
+    await addRoot(hub, "emit-z", 180_000);
+    const local = bridge.options.local;
+    const presence = local.presence.bind(local);
+    let incomplete = false;
+    vi.spyOn(local, "presence").mockImplementation(async () => {
+      const sample = await presence();
+      return incomplete ? { ...sample,
+        hosts: sample.hosts.filter(host => host.record.id !== sid("emit-a")),
+        participants: [...sample.participants.filter(row => row.id !== sid("emit-a")),
+          { id: 0 } as unknown as (typeof sample.participants)[number]],
+      } : sample;
+    });
+    const wireRoots = () => {
+      const requests = wire.join("").trim().split("\n").map(line => JSON.parse(line))
+        .filter(frame => frame.op === "mirror");
+      return requests.at(-1).args.hosts.map((host: { record: { id: string } }) => host.record.id).sort();
+    };
+    try {
+      await bridge.start();
+      const completeRoots = [sid("emit-a"), sid("emit-z")];
+      checkReceipt(bridge, completeRoots, false);
+      expect(receipt(bridge).roots).toEqual(wireRoots());
+      incomplete = true;
+      now = 30_000;
+      await bridge.syncPresence();
+      const expected = legacyPeer ? completeRoots : [sid("emit-z")];
+      checkReceipt(bridge, expected, true);
+      expect(receipt(bridge).roots).toEqual(wireRoots());
+      expect(receipt(bridge).roots).toEqual(remote.acknowledgedPresenceRoots);
+      expect(remote.legacyCompletedPartials).toBe(Number(legacyPeer));
+      incomplete = false;
+      now = 60_000;
+      await bridge.syncPresence();
+      checkReceipt(bridge, completeRoots, false);
+      expect(receipt(bridge).roots).toEqual(wireRoots());
+      expect(logs.some(line => line.includes("PROBE"))).toBe(false);
+    } finally { await bridge.stop(); }
+  });
+
+  it("does not emit a skipped legacy partial before any baseline ACK", async () => {
+    const { hub, bridge, remote } = setup(undefined, { legacyPeer: true, bridgeOptions: { emitExpectedRoots: true } });
+    await addRoot(hub, "emit-a", 180_000);
+    const local = bridge.options.local;
+    const presence = local.presence.bind(local);
+    vi.spyOn(local, "presence").mockImplementation(async () => ({ ...await presence(), partial: true }));
+    try {
+      await bridge.start();
+      expect(remote.hasCompletePresenceBaseline).toBe(false);
+      expect(remote.legacyNoBaselineCycles).toBeGreaterThan(0);
+      expect(fs.existsSync(receiptPath(bridge))).toBe(false);
+    } finally { await bridge.stop(); }
+  });
+
+  it("rate-limits failed attempts and warnings while ACKs, the loop and event delivery continue", async () => {
+    let now = 0;
+    const { hub, far, bridge, remote, logs } = setup(undefined, {
+      realPipe: true, legacyPeer: true, clock: () => now, bridgeOptions: { emitExpectedRoots: true },
+    });
+    const sender = await addRoot(hub, "emit-a", 180_000);
+    const target = await addRoot(far, "emit-target", 180_000);
+    const rootsFile = receiptPath(bridge);
+    const rename = fs.renameSync.bind(fs);
+    let attempts = 0;
+    let failing = true;
+    vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (String(destination) === rootsFile) {
+        attempts++;
+        if (failing) throw Object.assign(new Error("simulated receipt I/O failure"), { code: "EIO" });
+      }
+      return rename(source, destination);
+    });
+    let running: Promise<void> | undefined;
+    let settled = false;
+    let loopError: unknown;
+    const warnings = () => logs.filter(line => line.includes("could not write expected roots receipt"));
+    try {
+      await expect(bridge.start()).resolves.toBeUndefined();
+      expect(attempts).toBe(1);
+      expect(warnings()).toHaveLength(1);
+      expect(mirrored(far)).toEqual([sender.hostId]);
+      running = bridge.run().then(() => { settled = true; }, error => { settled = true; loopError = error; });
+      for (const [time, count, warningCount] of [[1, 1, 1], [29_999, 1, 1], [30_000, 2, 1],
+        [59_999, 2, 1], [60_000, 3, 2], [90_000, 4, 2]] as const) {
+        now = time;
+        await expect(bridge.syncPresence()).resolves.toBeUndefined();
+        expect(attempts).toBe(count);
+        expect(warnings()).toHaveLength(warningCount);
+        expect(mirrored(far)).toEqual([sender.hostId]);
+        expect(Number.isFinite(remote.lastPresenceRenewalAt)).toBe(true);
+        expect(settled).toBe(false);
+      }
+      expect(fs.existsSync(rootsFile)).toBe(false);
+      await hub.publish({ topic: "fleet.work.emitter", kind: "ask", from: sender.identity, to: target.hostId, text: "still live" });
+      await waitFor(() => on(far, "fleet.work.emitter").some(event => event.text === "still live"));
+      expect(loopError).toBeUndefined();
+      failing = false;
+      now = 120_000;
+      await bridge.syncPresence();
+      checkReceipt(bridge, [sender.hostId], false);
+      expect(attempts).toBe(5);
+      expect(warnings()).toHaveLength(2);
+    } finally { await bridge.stop(); await running; }
+    expect(loopError).toBeUndefined();
+  });
+
+  it("disables probe injection after a lost receipt without claiming the ACKed cycle or failing mirroring", async () => {
+    let now = 0;
+    const { hub, far, bridge, remote, logs } = setup(undefined, {
+      realPipe: true, legacyPeer: true, clock: () => now,
+      bridgeOptions: { emitExpectedRoots: true, partialProbeAfterBaseline: 20 },
+    });
+    await addRoot(hub, "emit-a", 180_000);
+    const rootsFile = receiptPath(bridge);
+    const rename = fs.renameSync.bind(fs);
+    let failing = false;
+    let attempts = 0;
+    vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (String(destination) === rootsFile) {
+        attempts++;
+        if (failing) throw Object.assign(new Error("simulated probe receipt I/O failure"), { code: "EIO" });
+      }
+      return rename(source, destination);
+    });
+    try {
+      await bridge.start();
+      const baseline = fs.readFileSync(rootsFile, "utf8");
+      failing = true;
+      now = 1_000;
+      await expect(bridge.syncPresence()).resolves.toBeUndefined();
+      expect(remote.legacyCompletedPartials).toBe(1);
+      expect(mirrored(far)).toEqual([sid("emit-a")]);
+      expect(fs.readFileSync(rootsFile, "utf8")).toBe(baseline); // Atomic failure preserves the previous receipt.
+      expect(logs.filter(line => line.includes("presence PROBE"))).toEqual([]);
+      expect(logs.filter(line => line.includes("could not write expected roots receipt"))).toHaveLength(1);
+      expect(logs.some(line => line.includes("partial probe disabled for process lifetime"))).toBe(true);
+      for (let cycle = 0; cycle < 3; cycle++) await bridge.syncPresence();
+      expect(remote.legacyCompletedPartials).toBe(1); // No more injection or claimed cycles.
+      expect(attempts).toBe(2); // Failed probe attempt also starts the emitter limit.
+      failing = false;
+      now = 31_000;
+      await bridge.syncPresence();
+      checkReceipt(bridge, [sid("emit-a")], false);
+      expect(attempts).toBe(3);
+    } finally { await bridge.stop(); }
+  });
+
+  it("rejects the emitter flag in agent mode", async () => {
+    await expect(bridgeMain(["agent", "--emit-expected-roots"]))
+      .rejects.toThrow(/only supported in run mode/);
   });
 });
 

@@ -2871,6 +2871,8 @@ export class RemoteBridgeSide implements BridgeSide {
   #legacyNoBaselineSince: number | undefined;
   #legacyNoBaselineSinceMonotonic: number | undefined;
   #legacyMirrorSnapshot: LegacyMirrorSnapshot | undefined;
+  /** Modern partial ACKs need their own projection; they must not replace the complete baseline. */
+  #acknowledgedPartialPresence: BridgeMirrorPresence | undefined;
   #lastPresenceRenewalAt = Number.NEGATIVE_INFINITY;
   #independentRpc = false;
   #protocolVersion: number | undefined;
@@ -3027,6 +3029,13 @@ export class RemoteBridgeSide implements BridgeSide {
   get protocolVersion(): number | undefined { return this.#protocolVersion; }
   /** Cumulative partial cycles completed as full snapshots for this legacy peer. */
   get legacyCompletedPartials(): number { return this.#legacyCompletedPartials; }
+  /** This transport's peer has ACKed a complete baseline, not merely answered presence. */
+  get hasCompletePresenceBaseline(): boolean { return this.#legacyMirrorSnapshot !== undefined; }
+  /** Exact roots of the last ACKed outbound projection, including legacy-held omissions. */
+  get acknowledgedPresenceRoots(): string[] {
+    return (this.#acknowledgedPartialPresence?.hosts ?? this.#legacyMirrorSnapshot?.presence.hosts ?? []).filter(({ record }) => isRootAuthorityHost(record))
+      .map(({ record }) => record.id).sort();
+  }
   /** Consecutive partial cycles skipped because no legacy complete baseline exists. */
   get legacyNoBaselineCycles(): number { return this.#legacyNoBaselineCycles; }
   get legacyNoBaselineSince(): number | undefined { return this.#legacyNoBaselineSince; }
@@ -3146,6 +3155,7 @@ export class RemoteBridgeSide implements BridgeSide {
     }
     await this.#call("mirror", outbound);
     this.#lastPresenceRenewalAt = Date.now();
+    this.#acknowledgedPartialPresence = partial ? outbound : undefined;
     if (!partial) {
       this.#legacyMirrorSnapshot = copyLegacySnapshot(outbound);
       this.#legacyNoBaselineCycles = 0;
@@ -3195,6 +3205,10 @@ export interface MeshBridgeOptions {
   local: BridgeSide;
   remote: BridgeSide;
   cursorPath: string;
+  /** Default-off hub diagnostic: inject one classifier drop after a legacy baseline ACK, for 1..50 cycles. */
+  partialProbeAfterBaseline?: number;
+  /** Independent default-off outbound ACK receipt, at most one attempt per peer every 30 s. No injection. */
+  emitExpectedRoots?: boolean;
   /** Delivery-only hub-link IPC. Missing/unavailable fails closed for cross-spoke commands. */
   relay?: (destinationRemote: string, event: BridgePublish) => Promise<void>;
   /** Transitional legacy-remote polling only; new/new run() never polls. */
@@ -3546,6 +3560,11 @@ export class MeshBridge {
   #legacyNoBaselineOverdueReported = false;
   // Owner-page episode and retry state is separate from the informational hold deadline.
   readonly #legacyBaselineAlarm = new BridgeLegacyBaselineAlarmEpisode();
+  #partialProbeWaitingLogged = false;
+  #partialProbeDisabled = false;
+  readonly #partialProbeCycles: Array<{ cycle: number; roots: string[]; digest: string }> = [];
+  #expectedRootsAttemptedAt = Number.NEGATIVE_INFINITY;
+  #expectedRootsWarnedAt = Number.NEGATIVE_INFINITY;
   /** The factory exception's token buckets (pi-fabric#876 review, P1-2; security pass, (c)). */
   readonly #factoryRate: Required<FactoryRate>;
   #factoryTokens: number;
@@ -3581,6 +3600,10 @@ export class MeshBridge {
       if (!validBridgeName(name)) throw new Error(`Invalid bridge name: ${name}`);
     }
     if (options.localName === options.remoteName) throw new Error("Bridge side names must differ");
+    if (options.partialProbeAfterBaseline !== undefined && (!Number.isSafeInteger(options.partialProbeAfterBaseline) ||
+      options.partialProbeAfterBaseline < 1 || options.partialProbeAfterBaseline > 50)) {
+      throw new Error("partialProbeAfterBaseline needs an integer between 1 and 50");
+    }
     if (options.membershipRetryMs !== undefined && !(Number.isSafeInteger(options.membershipRetryMs) && options.membershipRetryMs > 0)) {
       throw new Error("membershipRetryMs needs a positive integer");
     }
@@ -4131,6 +4154,51 @@ export class MeshBridge {
     if (joined) await this.syncPresence();
   }
 
+  /** Only ACKed projections are receipts. Probe cycles bypass the emitter's attempt limit. */
+  #recordExpectedRoots(outbound: BridgeMirrorPresence, syncedAt: number, probe: boolean, dropped: number): void {
+    const now = this.#now();
+    if (!probe && now - this.#expectedRootsAttemptedAt < 30_000) return;
+    // Rate-limit attempts, including failed writes; probe writes also postpone emitter-only writes.
+    this.#expectedRootsAttemptedAt = now;
+    const peer = this.options.remote instanceof RemoteBridgeSide ? this.options.remote : undefined;
+    const budget = this.options.partialProbeAfterBaseline;
+    const cycle = this.#partialProbeCycles.length + 1;
+    try {
+      const roots = peer ? peer.acknowledgedPresenceRoots : outbound.hosts
+        .filter(({ record }) => isRootAuthorityHost(record)).map(({ record }) => record.id).sort();
+      const digest = createHash("sha256").update(JSON.stringify(roots)).digest("hex");
+      const record = { cycle, roots, digest };
+      const cycles = probe ? [...this.#partialProbeCycles, record] : this.#partialProbeCycles;
+      const rootsFile = path.resolve(path.dirname(this.options.cursorPath), this.options.remoteName, "probe-roots.json");
+      const serialized = JSON.stringify({ version: 1, peer: this.options.remoteName, roots, count: roots.length,
+        digest, cycleTime: new Date(syncedAt).toISOString(), partial: presenceIsPartial(outbound), cycles });
+      if (cycles.length > (budget ?? 50) || Buffer.byteLength(serialized, "utf8") > 8 * 1024 * 1024) {
+        throw new Error("Presence roots receipt exceeds its cycle or 8 MiB byte bound");
+      }
+      const directory = path.dirname(rootsFile);
+      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      fs.chmodSync(directory, 0o700); // Also restrict an existing per-peer diagnostic directory.
+      writeFileAtomic(rootsFile, serialized, { mode: 0o600, dirMode: 0o700, durable: true });
+      if (!probe) return;
+      // A failed write must never claim a cycle or allow another injected cycle.
+      this.#partialProbeCycles.push(record);
+      this.#log(`presence PROBE: peer=${this.options.remoteName} cycle=${cycle}/${budget} partial=true dropped=${dropped} ` +
+        `legacyCompletedPartials=${peer!.legacyCompletedPartials} acked=true roots=${roots.length} rootsDigest=${digest} rootsFile=${rootsFile}`);
+      if (cycle === budget) {
+        this.#partialProbeDisabled = true;
+        this.#log(`presence probe disabled: peer=${this.options.remoteName} completed ${cycle}/${budget} ACK-backed cycles; disabled for process lifetime`);
+      }
+    } catch {
+      if (probe) this.#partialProbeDisabled = true;
+      // Diagnostics must never fail presence mirroring or stop the bridge loop. No error payloads.
+      if (now - this.#expectedRootsWarnedAt >= 60_000) {
+        this.#expectedRootsWarnedAt = now;
+        this.#log(`presence WARN: peer=${this.options.remoteName} could not write expected roots receipt; mirroring continues` +
+          (probe ? "; partial probe disabled for process lifetime" : ""));
+      }
+    }
+  }
+
   async #syncPresence(): Promise<void> {
     const legacyRemote = this.options.remote instanceof RemoteBridgeSide ? this.options.remote : undefined;
     const hadLegacyNoBaseline = (legacyRemote?.legacyNoBaselineCycles ?? 0) > 0;
@@ -4150,6 +4218,20 @@ export class MeshBridge {
     if (this.#stopped) return;
     const relays = await this.options.local.relayPresence?.() ?? { hosts: [], participants: [] };
     const localRoots = { ...local, hosts: local.hosts.filter(({ record }) => !isNativeNonRootHost(record)) };
+    const probePeer = this.options.partialProbeAfterBaseline !== undefined && !this.#partialProbeDisabled &&
+      this.options.remote instanceof RemoteBridgeSide ? this.options.remote : undefined;
+    const probeActive = probePeer !== undefined && probePeer.supportsPartialPresence === false && probePeer.hasCompletePresenceBaseline;
+    if (probePeer && !probePeer.hasCompletePresenceBaseline && probePeer.supportsPartialPresence !== true && !this.#partialProbeWaitingLogged) {
+      this.#partialProbeWaitingLogged = true;
+      this.#log(`presence probe: peer=${this.options.remoteName} waiting for complete baseline ACK`);
+    }
+    const completedBeforeProbe = probeActive ? probePeer.legacyCompletedPartials : undefined;
+    if (probeActive) {
+      // admitPresence's participant loop (originally around line 2737) increments droppedCount
+      // and continues for a non-string id. Only this fresh in-memory copy sees the malformed row;
+      // the classifier, not a forced partial flag, creates the partial and removes it before mirror.
+      localRoots.participants = [...localRoots.participants, { id: 0 } as unknown as FabricParticipantRecord];
+    }
     const native = admitPresence(localRoots, new Set());
     const nativeNonRootHosts = local.hosts.filter(({ record }) => isNativeNonRootHost(record));
     const hosts = [...native.hosts, ...nativeNonRootHosts,
@@ -4200,6 +4282,14 @@ export class MeshBridge {
       this.#ready = false;
     }
     const failure = failures.find((result) => !isBridgeRetryable(result.reason)) ?? failures[0];
+    if (results[0].status === "fulfilled" && (probeActive || this.options.emitExpectedRoots)) {
+      const peer = this.options.remote instanceof RemoteBridgeSide ? this.options.remote : undefined;
+      // A legacy partial without a baseline returns without sending a mirror: it has no ACK to emit.
+      if (!peer || peer.supportsPartialPresence !== false || peer.hasCompletePresenceBaseline) {
+        const recordProbe = probeActive && probePeer.legacyCompletedPartials === completedBeforeProbe! + 1;
+        if (recordProbe || this.options.emitExpectedRoots) this.#recordExpectedRoots(outboundPresence, syncedAt, recordProbe, droppedCount);
+      }
+    }
     // Propagate once to the CLI's existing permanent-error log; never continue routing from
     // refused presence. stop() must fence this link without withdrawing newer authority.
     if (failure) throw failure.reason;

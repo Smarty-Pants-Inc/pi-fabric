@@ -26,13 +26,13 @@ afterEach(async () => {
   finally { vi.restoreAllMocks(); vi.useRealTimers(); }
 });
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
-const native = async (store: MeshStore, name: string) => {
+const native = async (store: MeshStore, name: string, ttl = 120_000) => {
   const now = Date.now(), id = `session:busy-streak-${name}`;
   const identity: MeshIdentity = { id, name: "main", kind: "main", sessionId: name };
   await store.put({ key: `topology/hosts/${hash(id)}`, identity, value: {
-    format: 1, id, rootId: id, identity, startedAt: now, updatedAt: now, expiresAt: now + 120_000,
+    format: 1, id, rootId: id, identity, startedAt: now, updatedAt: now, expiresAt: now + ttl,
   } });
-  writeHostLease(store.root, { id, rootId: id, identityId: id, startedAt: now, updatedAt: now, expiresAt: now + 120_000 });
+  writeHostLease(store.root, { id, rootId: id, identityId: id, startedAt: now, updatedAt: now, expiresAt: now + ttl });
   writeParticipantFile(store.root, { key: `topology/participants/${hash(id)}`, version: 1, updatedAt: now, updatedBy: identity,
     value: { format: 1, id, kind: "root", rootId: id, ownerHostId: id, ownerIdentityId: id, name, label: name,
       status: "idle", runner: "pi", transport: "host", capabilities: ["steer"], startedAt: now, updatedAt: now, controlProtocol: "v1" } });
@@ -54,7 +54,7 @@ const pending = () => withUntrustedDiagnostics(new MeshIncarnationPendingError()
 const queueExpired = () => withUntrustedDiagnostics(new MeshLockQueueExpiredError("fixture/.lock", 1, 1_000));
 const TOPIC = "fleet.work.busy-streak.1";
 
-const fixture = async (fail: (attempt: number) => Error | undefined, log?: (message: string) => void, overRpc = false) => {
+const fixture = async (fail: (attempt: number) => Error | undefined | Promise<Error | undefined>, log?: (message: string) => void, overRpc = false, ttl = 120_000) => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-bridge-busy-streak-"));
   const hub = new MeshStore(path.join(base, "hub"), 65_536, 100, { stateBackend: "file" });
   const far = new MeshStore(path.join(base, "far"), 65_536, 100, { stateBackend: "file" });
@@ -65,7 +65,7 @@ const fixture = async (fail: (attempt: number) => Error | undefined, log?: (mess
   const now = () => Date.now() - wallCorrection;
   vi.spyOn(monotonicClock, "now").mockImplementation(now);
   vi.spyOn(Math, "random").mockReturnValue(0); // deterministic equal-jitter lower edge
-  const sender = await native(hub, "hub"), receiver = await native(far, "far");
+  const sender = await native(hub, "hub", ttl), receiver = await native(far, "far", ttl);
   const local = new StoreBridgeSide(hub, "far", now), agent = new StoreBridgeSide(far, "hub", now);
   // As in membership-defer's scheduler fixture, withhold unrelated topology
   // notifications: retry timers must be sufficient; no fake read/publish results.
@@ -101,12 +101,12 @@ const fixture = async (fail: (attempt: number) => Error | undefined, log?: (mess
   const attempts: number[] = [], tail = source.tail.bind(source);
   vi.spyOn(source, "tail").mockImplementation(async (...args) => {
     attempts.push(now() - epoch);
-    const error = fail(attempts.length);
+    const error = await fail(attempts.length);
     if (error) throw error;
     return tail(...args);
   });
   return {
-    bridge, hub, far, remote, sent, attempts, recovered, logs,
+    bridge, hub, far, local, agent, remote, sent, attempts, recovered, logs,
     launch: async () => {
       running = bridge.run().catch(error => { failure = error; });
       await vi.advanceTimersByTimeAsync(0);
@@ -186,6 +186,60 @@ const sameFile = (fd: number, file: string) => {
 };
 
 describe("real MeshBridge direction busy streaks", () => {
+  // KEEP: the recorded mixed-refusal failure path needs minutes of virtual time;
+  // real stores, routing fences, durable delivery and cursor saves remain in use.
+  it("re-samples on a lock-to-mirror failure change and bounds repeated degraded streaks without restarting", async () => {
+    let blocked = true;
+    const f = await fixture(attempt => attempt === 1 ? timeout() : blocked ?
+      withUntrustedDiagnostics(new BridgeMirrorDeferredError(true, 30_000)) : undefined, undefined, false, 600_000);
+    const samples: number[] = [], presence = f.agent.presence.bind(f.agent);
+    vi.spyOn(f.agent, "presence").mockImplementation(() => { samples.push(monotonicClock.now()); return presence(); });
+    const started = monotonicClock.now();
+    await f.launch();
+    await vi.advanceTimersByTimeAsync(1_200);
+    expect(samples.map(at => at - started)).toContain(200); // a NEW sample after the changed failure
+    expect(f.logs.some(({ message }) => message.includes("failure class changed") &&
+      message.includes("mesh lock timeout") && message.includes("bridge mirror degraded"))).toBe(true);
+    expect(f.received()).toEqual([]);
+    expect(f.cursor()).toBeLessThan(f.sent.sequence);
+    await vi.advanceTimersByTimeAsync(149_000);
+    const alarm = f.logs.find(({ message }) => message.includes("alarm: bridge busy streak") && message.includes("toRemote"));
+    expect(alarm).toMatchObject({ at: 150_200 });
+    expect(alarm!.message).toContain("150000 ms bound");
+    expect(alarm!.message).toContain("bridge mirror degraded");
+    expect(samples.map(at => at - started)).toContain(150_200);
+    expect(f.failure()).toBeUndefined();
+    expect(f.received()).toEqual([]);
+    blocked = false;
+    await vi.advanceTimersByTimeAsync(1_000);
+    await f.recovered;
+    assertDelivered(f);
+    await f.bridge.stop();
+    assertSafeLogs(f.logs);
+  });
+
+  it("alarms at the streak deadline during an in-flight attempt without abandoning its fence", async () => {
+    const gate = deferred(), entered = deferred();
+    const f = await fixture(async attempt => {
+      if (attempt === 1) return timeout();
+      if (attempt === 2) { entered.resolve(); await gate.promise; }
+      return undefined;
+    }, undefined, false, 600_000);
+    cleanups.push(async () => { gate.resolve(); });
+    await f.launch();
+    await vi.advanceTimersByTimeAsync(200);
+    await entered.promise;
+    await vi.advanceTimersByTimeAsync(149_800);
+    expect(f.logs.find(({ message }) => message.includes("alarm: bridge busy streak"))).toMatchObject({ at: 150_000 });
+    expect(f.attempts).toHaveLength(2); // never start a competing drain while a fenced attempt is pending
+    expect(f.received()).toEqual([]);
+    gate.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assertDelivered(f);
+    await f.bridge.stop();
+  });
+
   it.each([
     { name: "timeout", error: timeout, label: "mesh lock timeout", delay: 200 },
     { name: "incarnation pending", error: pending, label: "mesh incarnation pending", delay: 200 },
@@ -587,7 +641,7 @@ describe("real MeshBridge direction busy streaks", () => {
       ingressStreakLogs: 0, retainedOffLockCostInvented: false }));
   });
   it("counts failed direction attempts, caps progress at 10 s, and recovers with monotonic duration despite backward Date", async () => {
-    const f = await fixture(attempt => attempt <= 13 ? attempt === 1 ? timeout() : pending() : undefined);
+    const f = await fixture(attempt => attempt <= 13 ? timeout() : undefined);
     await f.launch();
     expect(f.streak()).toHaveLength(1);
     expect(f.streak()[0]!.message).toContain("mesh lock timeout (toRemote); retrying in 200 ms" +
@@ -600,7 +654,7 @@ describe("real MeshBridge direction busy streaks", () => {
     expect(f.cursor()).toBeLessThan(f.sent.sequence);
     await vi.advanceTimersByTimeAsync(1);
     expect(f.streak()).toHaveLength(2);
-    expect(f.streak()[1]!.message).toContain(summary(13, 10_400, "mesh lock timeout", "mesh incarnation pending"));
+    expect(f.streak()[1]!.message).toContain(summary(13, 10_400, "mesh lock timeout", "mesh lock timeout"));
     const progress = f.streak().filter(({ message }) => message.includes("retrying"));
     expect(progress[1]!.at - progress[0]!.at).toBeGreaterThanOrEqual(10_000);
     await vi.advanceTimersByTimeAsync(1_000);
@@ -608,7 +662,7 @@ describe("real MeshBridge direction busy streaks", () => {
     assertDelivered(f);
     expect(f.streak()).toHaveLength(3);
     expect(f.streak()[2]!.message).toBe("bridge busy streak recovered (toRemote)" +
-      summary(13, 11_400, "mesh lock timeout", "mesh incarnation pending"));
+      summary(13, 11_400, "mesh lock timeout", "mesh lock timeout"));
     await f.bridge.stop();
     expect(f.streak().some(({ message }) => /terminal|stopped/.test(message))).toBe(false);
     assertSafeLogs(f.logs); // first, progress and recovery all saw post-construction unsafe messages
@@ -622,12 +676,14 @@ describe("real MeshBridge direction busy streaks", () => {
     expect(f.failure()).toBe(terminal);
     expect(f.streak().map(({ message }) => message)).toEqual([
       expect.stringContaining(summary(1, 0, "mesh lock timeout", "mesh lock timeout")),
-      "bridge busy streak terminal (toRemote)" + summary(2, 600, "mesh lock timeout", "mesh incarnation pending"),
+      "bridge busy streak resampling (toRemote)" + summary(1, 200, "mesh lock timeout", "mesh lock timeout"),
+      expect.stringContaining(summary(1, 0, "mesh incarnation pending", "mesh incarnation pending")),
+      "bridge busy streak terminal (toRemote)" + summary(1, 200, "mesh incarnation pending", "mesh incarnation pending"),
     ]);
     expect(f.received()).toEqual([]);
     expect(f.cursor()).toBeLessThan(f.sent.sequence);
     await f.bridge.stop();
-    expect(f.streak()).toHaveLength(2);
+    expect(f.streak()).toHaveLength(4);
     assertSafeLogs(f.logs);
   });
 
@@ -659,9 +715,10 @@ describe("real MeshBridge direction busy streaks", () => {
     expect(at[4]! - at[3]!).toBe(200); // three queue refusals did NOT double the contention retry
     expect(f.streak()[0]!.message).toContain("mesh pre-lock queue expiry (toRemote); retrying in 0 ms" +
       summary(1, 0, "mesh pre-lock queue expiry", "mesh pre-lock queue expiry"));
-    expect(f.streak().at(-1)!.message).toBe("bridge busy streak recovered (toRemote)" +
-      summary(4, 210, "mesh pre-lock queue expiry", "mesh lock timeout"));
-    expect(f.streak()).toHaveLength(2);
+    const recovery = f.streak().at(-1)!;
+    expect(recovery.message).toBe("bridge busy streak recovered (toRemote)" +
+      summary(1, recovery.at - at[3]!, "mesh lock timeout", "mesh lock timeout"));
+    expect(f.streak()).toHaveLength(4); // queue-expiry streak ends when contention becomes the failure class
     assertSafeLogs(f.logs);
   });
 });

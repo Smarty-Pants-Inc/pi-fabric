@@ -523,20 +523,28 @@ describe.skipIf(process.platform !== "linux")("mirrored lease bridge alarms via 
   }, 10_000);
 
   it("does not treat a quiet but healthy direction as a stall while outbound events are acknowledged", async () => {
-    const f = await fixture(true, { intervalMs: 20, probeTimeoutMs: 60, stallAfterMs: 150, directionStallAfterMs: 150 });
+    // This is a directional-idleness check, not a sub-60 ms cross-process RTT budget.
+    // Keep the short directional window, but allow real IPC/store work to settle.
+    const directionStallAfterMs = 150;
+    const f = await fixture(true, { intervalMs: 20, probeTimeoutMs: 1_000, stallAfterMs: 5_000, directionStallAfterMs });
     await changed(f.hubRoot, () => f.sample());
     await f.mesh.publish({ topic: "ops.owner", kind: "pr.wake", from: owner, to: remoteId, data: { path: "outbound" } });
     await waitFor(() => f.farMesh.read({ topic: "ops.owner", after: 0 }).some(event => (event.data as { path?: string } | undefined)?.path === "outbound"));
-    await sleep(250);
+    const watchdogs = () => f.bridgeMessages.receipts.filter(item => item.kind === "watchdog").length;
+    await waitFor(() => watchdogs() >= 3, 5_000);
+    const before = watchdogs();
+    await sleep(directionStallAfterMs * 2 + 50);
+    await waitFor(() => watchdogs() > before, 5_000);
     expect(f.stallAlarms()).toEqual([]);
     expect(f.bridge.exitCode).toBeNull();
     expect(f.agent.exitCode).toBeNull();
-    expect(f.bridgeMessages.receipts.filter(item => item.kind === "watchdog").length).toBeGreaterThanOrEqual(3);
-  }, 10_000);
+  }, 20_000);
 
   it("alarms on a 65-second source-cursor backlog without stalling or withholding the watchdog", async () => {
     vi.stubEnv("PI_FABRIC_MESH_ALARM_TO", owner.id);
-    const f = await fixture(true, { intervalMs: 1_000, probeTimeoutMs: 500, stallAfterMs: 1_500,
+    // Delivery age is the subject, not a 500 ms real-process RTT budget. Missing
+    // one probe during the 65 s hold must not itself manufacture a liveness outage.
+    const f = await fixture(true, { intervalMs: 1_000, probeTimeoutMs: 2_000, stallAfterMs: 10_000,
       directionStallAfterMs: 180_000, stopBridgeOnShutdown: true });
     await changed(f.hubRoot, () => f.sample()); // ready precedes the async cursor initialization in this fixture
     const now = Date.now(), ownerIncarnation = `fixture:${owner.id}`;

@@ -809,6 +809,11 @@ export const bridgeHandoffScope = (
 const settled = (value: Record<string, unknown>): string =>
   contentDigest({ ...value, updatedAt: undefined, expiresAt: undefined });
 
+/** Only duplicate participant scans ignore quiet activity; identity/routing fields still conflict. */
+const participantCopyDigest = (value: FabricParticipantRecord): string =>
+  contentDigest({ ...value, updatedAt: undefined, expiresAt: undefined,
+    turns: undefined, toolCalls: undefined, usage: undefined, currentTool: undefined });
+
 /**
  * A bridge side over a mesh store on this host. `peer` names the other side: it is the
  * `remoteHost` mark on mirrored records and the `bridge.from` of events it bridges in.
@@ -1280,8 +1285,7 @@ export class StoreBridgeSide implements BridgeSide {
         continue;
       }
       const copy = participantCopies.get(entry.key);
-      if (copy && settled(copy.record as unknown as Record<string, unknown>) !==
-        settled(participant as unknown as Record<string, unknown>)) {
+      if (copy && participantCopyDigest(copy.record) !== participantCopyDigest(participant)) {
         rawDroppedCount += 1; reasons.add("topology/participants", "conflicting-copy");
       }
       if (!copy || copy.updatedAt <= entry.updatedAt) participantCopies.set(entry.key, { record: participant, updatedAt: entry.updatedAt });

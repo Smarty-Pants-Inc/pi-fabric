@@ -3516,6 +3516,8 @@ export class MeshBridge {
   #unaddressedRefreshVersion = 0;
   /** An unknown outbound recipient retains its source boundary until the trailing sample lands. */
   #unaddressedSequence: number | undefined;
+  /** Only source events already present before the successful sample may trust its absence. */
+  #unaddressedSampleThrough: number | undefined;
   #staleAdmission: BridgeStaleIncarnationError | undefined;
   #stopped = false;
   #stopTask: Promise<void> | undefined;
@@ -4171,6 +4173,11 @@ export class MeshBridge {
 
   async #syncPresence(): Promise<void> {
     const unaddressedRefreshVersion = this.#unaddressedRefreshVersion;
+    // Capture BEFORE starting either presence read. Every successful post-miss sample can
+    // release a hold (including a joined/notification sample), so bind its own source head
+    // here, not after joining syncPresence() or after the remote snapshot has been taken.
+    const unaddressedSampleThrough = this.#unaddressedRefreshAt !== undefined
+      ? await this.options.local.latestSequence() : undefined;
     const legacyRemote = this.options.remote instanceof RemoteBridgeSide ? this.options.remote : undefined;
     const hadLegacyNoBaseline = (legacyRemote?.legacyNoBaselineCycles ?? 0) > 0;
     const syncedAt = Date.now();
@@ -4253,7 +4260,10 @@ export class MeshBridge {
     this.#presenceAt = syncedAt;
     this.#syncedPresenceVersion = presenceVersion;
     this.#syncedLeaseVersion = leaseVersion;
-    if (this.#unaddressedRefreshVersion === unaddressedRefreshVersion) this.#unaddressedRefreshAt = undefined;
+    if (this.#unaddressedRefreshVersion === unaddressedRefreshVersion) {
+      this.#unaddressedRefreshAt = undefined;
+      this.#unaddressedSampleThrough = unaddressedSampleThrough;
+    }
     // Origin updates normally renew mirrors. A source with a long lease and no heartbeat
     // still needs its capped, held projection to remain live: one lease deadline, 1 s before
     // the 15 s mirror cap (transport/commit headroom), not an unconditional 5 s presence loop.
@@ -4608,6 +4618,7 @@ export class MeshBridge {
     }
     const unaddressedRefreshed = direction === "toRemote" && this.#unaddressedSequence !== undefined &&
       this.#unaddressedRefreshAt === undefined;
+    const unaddressedRefreshedThrough = unaddressedRefreshed ? this.#unaddressedSampleThrough ?? -Infinity : -Infinity;
     if (direction === "toRemote" && this.#unaddressedSequence !== undefined) {
       if (!unaddressedRefreshed) {
         // The coordinator owns this sample. Do not race its timer with an inline refresh
@@ -4797,8 +4808,15 @@ export class MeshBridge {
         const lapsedId = reason === "sender is not a live participant of the remote" ? event.from.id
           : reason === "ack target is not bound to this link" && isObject(event.data) && typeof event.data.targetId === "string" ? event.data.targetId
           : reason === "not addressed across" && direction === "toRemote" ? event.to : undefined;
+        if (reason === "not addressed across" && direction === "toRemote" &&
+          typeof event.to === "string" && CANONICAL_ID.test(event.to) && rules.reservedRecipients?.has(event.to)) {
+          // A page reservation can predate a handoff whose notification is still queued.
+          // This is a local authority read, not a remote membership sample.
+          rules = await authority(false);
+          reason = this.#refusal(event, rules, direction);
+        }
         const coalesced = direction === "toRemote" && reason === "not addressed across";
-        if (coalesced && !unaddressedRefreshed) {
+        if (coalesced && event.sequence > unaddressedRefreshedThrough) {
           this.#deferUnaddressedRefresh();
           // Current native/other-link reservations still skip as before. Unknown canonical
           // recipients retain the existing retry boundary until a post-miss sample commits;

@@ -440,6 +440,57 @@ describe("real-store bridge membership refresh coalescing", () => {
     expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual(events.map(event => event.id));
   }, 90_000);
 
+  // Keep reason: #1651 delivery loss; the release pass may read beyond the source head
+  // covered by its sample. Real stores and delivery receipts must retain that later event.
+  it.each(["same page", "later page"] as const)("delivers a post-sample newcomer event read on the %s of the release pass", async pageKind => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = await fixture(() => now);
+    const hubLead = await addNative(f.hub, "hub-lead", now + 120_000);
+    const bridge = bridgeFor(f);
+    await bridge.start();
+    cleanups.push(() => bridge.stop());
+    const samples = vi.spyOn(f.remote, "presence");
+    const held = await work(f.hub, hubLead, sid("still-absent"), "first-held-miss");
+    expect(await bridge.step()).toMatchObject({ toRemote: 0, dropped: 0 });
+    expect(cursor(f.cursorPath).toRemote.after).toBeLessThan(held.sequence);
+    expect(samples).not.toHaveBeenCalled();
+
+    const tail = f.local.tail.bind(f.local);
+    let later!: MeshEvent;
+    let joined = false;
+    vi.spyOn(f.local, "tail").mockImplementation(async (...args) => {
+      if (!joined) {
+        joined = true;
+        // The coalesced sample has COMPLETED, but its release pass has not read yet.
+        expect(samples).toHaveBeenCalledTimes(1);
+        expect(f.local.holds(sid("post-sample-member"))).toBe(false);
+        const recipient = await addNative(f.far, "post-sample-member", now + 120_000);
+        later = await work(f.hub, hubLead, recipient.id, "must-not-be-consumed-as-absent");
+        if (pageKind === "later page") return { events: [held], through: held.sequence };
+      }
+      return tail(...args);
+    });
+    now += 15_000;
+    expect(await bridge.step()).toMatchObject({ toRemote: 0, dropped: 0 });
+    expect(samples).toHaveBeenCalledTimes(1); // No inline sample for the new unknown recipient.
+    expect(cursor(f.cursorPath).toRemote.after).toBe(held.sequence);
+    expect(cursor(f.cursorPath).toRemote.after).toBeLessThan(later.sequence);
+    expect(deliveredFromHub(f.far)).toEqual([]);
+
+    now += 14_999;
+    await bridge.step();
+    expect(samples).toHaveBeenCalledTimes(1);
+    expect(cursor(f.cursorPath).toRemote.after).toBeLessThan(later.sequence);
+    now += 1;
+    expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });
+    expect(samples).toHaveBeenCalledTimes(2);
+    expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual([later.id]);
+    expect(cursor(f.cursorPath).toRemote.after).toBe(later.sequence);
+    await bridge.step();
+    expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual([later.id]);
+  });
+
   it("waits out an in-flight pre-change sample, then routes after a delayed membership notice", async () => {
     const f = await fixture();
     const hubLead = await addNative(f.hub, "hub-lead", Date.now() + 120_000);

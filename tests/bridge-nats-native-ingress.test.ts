@@ -31,7 +31,7 @@ import {
   BRIDGE_MACHINE, FakePort, FakePresence, LINK, POD_MACHINE, fileLead, natsLead, otherNats, route, settle,
 } from "./helpers/bridge-nats-l2-fakes.js";
 
-const ACTOR = "5027cfd59b1247b6bb4666970c481cc4";
+const ACTOR = "34200000000000000000000000000001";
 const OWNER = residentHostId(fileLead.id);
 const ACTOR_IDENTITY: MeshIdentity = { id: ACTOR, name: "native-inbox", kind: "actor" };
 const principal = { id: "herdr:principal-a", binding: "herdr-client" as const };

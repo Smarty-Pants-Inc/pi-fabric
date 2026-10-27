@@ -30,7 +30,7 @@ import { CONTROL_STALE_INCARNATION, FabricControlPlane, controlActorBindingOptio
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { BRIDGE_MACHINE, POD_MACHINE, LINK, FakePresence, fileLead, natsLead, otherNats, route } from "./helpers/bridge-nats-l2-fakes.js";
 
-const ACTOR = "5027cfd59b1247b6bb4666970c481cc4";
+const ACTOR = "34200000000000000000000000000001";
 const OWNER = residentHostId(fileLead.id);
 const INCARNATION = "native-control-owner";
 const MESSAGE = " \nsmarty-inbox.rpc.v1\t ";

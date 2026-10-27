@@ -97,12 +97,78 @@ export const observeNativeOwner = (root: string) => {
   const listeners = new Set<() => void>(), cancellations = new Set<() => void>();
   let watchFailure: Error | undefined, closed = false;
   const wake = (): void => { for (const listener of [...listeners]) listener(); };
-  const watcher = fs.watch(root, { recursive: true, persistent: false }, wake);
-  watcher.on("error", error => { watchFailure = error; wake(); });
+  let watcher: fs.FSWatcher | undefined, rearm: ReturnType<typeof setImmediate> | undefined;
+  let pendingClose: { watcher: fs.FSWatcher; handle: ReturnType<typeof setImmediate> } | undefined;
+  const cancelClose = (): void => {
+    if (pendingClose) clearImmediate(pendingClose.handle);
+    pendingClose = undefined;
+  };
+  let attempts = 0;
+  const transient = (error: unknown): boolean => {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    return code === "ENOENT" || code === "ENOTDIR";
+  };
+  const fail = (error: unknown): void => {
+    watchFailure ??= error instanceof Error ? error : new Error(String(error));
+    if (rearm) clearImmediate(rearm); rearm = undefined;
+    cancelClose();
+    const previous = watcher; watcher = undefined; previous?.close(); wake();
+  };
+  const retry = (): void => {
+    if (closed || watchFailure || rearm) return;
+    rearm = setImmediate(() => { rearm = undefined; arm(); });
+  };
+  const arm = (): void => {
+    if (closed || watchFailure || watcher) return;
+    // Bound a recovery burst, including synchronous attachment races. Only a
+    // real file event resets it; a vanished root must never cause an idle loop.
+    if (++attempts > 8) { fail(new Error("Native owner watcher could not re-arm after transient errors")); return; }
+    try {
+      const current: fs.FSWatcher = fs.watch(root, { recursive: true, persistent: false }, () => {
+        if (closed || watcher !== current) return;
+        attempts = 0; wake();
+      });
+      watcher = current;
+      current.on("error", error => {
+        if (closed) return;
+        // Fatal errors remain sticky even if delivered by a retired watcher.
+        if (!transient(error)) { fail(error); return; }
+        if (pendingClose?.watcher === current) {
+          cancelClose(); retry();
+        } else if (watcher === current) {
+          watcher = undefined; current.close(); retry();
+        }
+        wake();
+      });
+      current.on("close", () => {
+        if (closed || watcher !== current) return;
+        watcher = undefined;
+        // Pair a same-turn transient with this retired handle before failing.
+        pendingClose = { watcher: current, handle: setImmediate(() => {
+          if (closed || watchFailure || pendingClose?.watcher !== current) return;
+          pendingClose = undefined;
+          fail(new Error("Native owner watcher closed unexpectedly"));
+        }) };
+      });
+      // close() can be requested while an attachment is in progress.
+      if (closed || watchFailure) { watcher = undefined; current.close(); }
+      else wake(); // Read after subscribing, covering commits during replacement.
+    } catch (error) {
+      if (!transient(error)) { fail(error); return; }
+      try {
+        if (!fs.statSync(root).isDirectory()) { fail(new Error("Native owner watch root is not a directory")); return; }
+      } catch (rootError) { fail(rootError); return; }
+      retry(); wake();
+    }
+  };
+  arm();
   return {
     wake,
     close: (): void => {
-      closed = true; watcher.close();
+      closed = true;
+      if (rearm) clearImmediate(rearm); rearm = undefined;
+      cancelClose();
+      const previous = watcher; watcher = undefined; previous?.close();
       for (const cancel of [...cancellations]) cancel();
     },
     until: (predicate: () => boolean | Promise<boolean>, label: string, ms = 60_000,
@@ -130,7 +196,9 @@ export const observeNativeOwner = (root: string) => {
             dirty = false;
             const final = expired;
             if (watchFailure) throw watchFailure;
-            if (await predicate()) { finish(); return; }
+            const matched = await predicate();
+            if (watchFailure) throw watchFailure;
+            if (matched && !pendingClose) { finish(); return; }
             if (final) { finish(deadlineError); return; }
           } while (dirty && !finished);
         })().catch(finish).finally(() => { checking = false; if (dirty && !finished) check(); });
@@ -169,6 +237,12 @@ interface NativeAuxiliaryResult {
   launcherCode?: number | null;
   processIds?: number[];
 }
+export type NativeOwnerCliShape = "continue-native" | "short-continue-native" | "resume-native" | "long-resume-native" |
+  "short-unknown-native" |
+  "duplicate-native" | "relative-native" | "dotdot-native" | "symlink-native" | "unknown-native" |
+  "inline-session-native" | "ordinary-continue" | "ordinary-resume" | "duplicate-ordinary" |
+  "unknown-ordinary" | "ordinary-relative" | "ordinary-symlink" | "ordinary-flag-value" | "name-native" |
+  "task-prefix-ordinary" | "cli-prefix-ordinary" | "task-exact-native-id";
 interface NativeSessionPin { sessionFile: string; rootId: string; sessionId: string }
 interface NativeOwnerDeadline { startedNs: bigint; boundMs: number }
 const remainingNativeOwnerMs = (deadline: NativeOwnerDeadline): number => {
@@ -819,6 +893,101 @@ finally:
         });
       });
       return result;
+    },
+    async attemptRealCli(shape: NativeOwnerCliShape): Promise<NativeAuxiliaryResult & {
+      ordinary?: NativeSessionPin; startedAt: number; closedAt: number;
+    }> {
+      const label = `real-cli-${shape}-${++auxiliarySequence}`;
+      // Actual CLI defaults, not the native owner's isolated discovery override.
+      const cliEnv = { ...env, PI_CODING_AGENT_SESSION_DIR: undefined };
+      let ordinary: NativeSessionPin | undefined;
+      if (shape.includes("ordinary") || shape === "duplicate-native") {
+        const prepare = path.join(root, `${label}.prepare.mjs`);
+        // SDK owns both the header and requested synthetic test ID. In the
+        // prefix case ONLY the ordinary ID shares the native eight-char prefix.
+        fs.writeFileSync(prepare, `import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
+const [sdk, cwd, nativeId] = process.argv.slice(2);
+const { SessionManager } = await import(pathToFileURL(path.join(sdk, "core/session-manager.js")).href);
+const id = nativeId.slice(0, 8) + randomUUID().slice(8);
+const manager = SessionManager.create(cwd, undefined, { id });
+// The real SDK serializer persists this ordinary header-only discovery control;
+// no hand-built header, native history, user message, or model turn is seeded.
+manager._rewriteFile();
+process.stdout.write(JSON.stringify({ sessionId: manager.getSessionId(), sessionFile: manager.getSessionFile(), rootId: "session:" + manager.getSessionId() }) + "\\n");
+`, { mode: 0o600, flag: "wx" });
+        const prepared = await runAuxiliary(`${label}-prepare`, [prepare, sdkDirectory, cwd, pin.sessionId], undefined, nodeBinary, cliEnv);
+        if (prepared.code !== 0 || prepared.signal) throw new Error(`Real CLI ordinary preparation refused: ${prepared.stderr}`);
+        ordinary = JSON.parse(prepared.stdout) as NativeSessionPin;
+        if (ordinary.sessionId === pin.sessionId || ordinary.sessionFile === sessionFile ||
+            !ordinary.sessionId.startsWith(pin.sessionId.slice(0, 8))) throw new Error("Ordinary prefix control lost its distinct SDK identity");
+      }
+      // Owned aliases exercise the exact reviewed spelling from the trusted
+      // service cwd; the native file/pin/inodes and custody remain untouched.
+      if (shape === "relative-native") fs.symlinkSync(path.dirname(sessionFile), path.join(cwd, "native"), "dir");
+      if (shape === "dotdot-native") fs.symlinkSync(path.dirname(sessionFile), path.join(root, "native"), "dir");
+      const link = path.join(cwd, `${label}.jsonl`);
+      if (shape === "symlink-native" || shape === "ordinary-symlink") fs.symlinkSync(ordinary?.sessionFile ?? sessionFile, link);
+      let selection: string[];
+      switch (shape) {
+        case "continue-native": selection = ["--continue", "--session", sessionFile]; break;
+        case "short-continue-native": selection = ["-c", "--session", sessionFile]; break;
+        case "resume-native": selection = ["-r", "--session", sessionFile]; break;
+        case "long-resume-native": selection = ["--resume", "--session", sessionFile]; break;
+        case "duplicate-native": selection = ["--session", ordinary!.sessionFile, "--session", sessionFile]; break;
+        case "relative-native": selection = ["--session", "native/owner.jsonl"]; break;
+        case "dotdot-native": selection = ["--session", `${cwd}/../native/owner.jsonl`]; break;
+        case "symlink-native": selection = ["--session", link]; break;
+        case "unknown-native": selection = ["--frobnicate", "--session", sessionFile]; break;
+        case "short-unknown-native": selection = ["-z", "--session", sessionFile]; break;
+        case "inline-session-native": selection = [`--session=${sessionFile}`, "--session", sessionFile]; break;
+        case "ordinary-continue": selection = ["-c", "--session", ordinary!.sessionFile]; break;
+        case "ordinary-resume": selection = ["--resume", "--session", ordinary!.sessionFile]; break;
+        case "duplicate-ordinary": selection = ["--session", sessionFile, "--session", ordinary!.sessionFile]; break;
+        case "unknown-ordinary": selection = ["--frobnicate", "--session", ordinary!.sessionFile]; break;
+        case "ordinary-relative": selection = ["--session", path.relative(cwd, ordinary!.sessionFile)]; break;
+        case "ordinary-symlink": selection = ["--session", link]; break;
+        case "ordinary-flag-value": selection = ["--name", "--frobnicate", "--session", ordinary!.sessionFile]; break;
+        case "name-native": selection = ["--session", sessionFile, "--name", "  native-name-residual  "]; break;
+        case "task-prefix-ordinary": case "cli-prefix-ordinary": selection = ["--session", pin.sessionId.slice(0, 8)]; break;
+        case "task-exact-native-id": selection = ["--session", pin.sessionId]; break;
+      }
+      const task = shape.startsWith("task-");
+      const positive = ["ordinary-relative", "ordinary-symlink", "ordinary-flag-value", "task-prefix-ordinary", "cli-prefix-ordinary"].includes(shape);
+      const args = [...(task ? [taskEntry, sdkDirectory, "1"] : [path.join(sdkDirectory, "cli.js")]), ...selection,
+        "--mode", "rpc", "--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
+        "--extension", pins.observer, "--extension", path.join(candidateRoot, "dist/index.js")];
+      // No bootstrap fixture or substitute registration gate. Native refusal
+      // must come from candidate Fabric itself, with real SDK parser/loading.
+      const startedAt = Date.now();
+      const child = spawn(nodeBinary, args, { cwd, env: cliEnv, stdio: ["pipe", "pipe", "pipe"] });
+      const started = child.pid ? startTime(child.pid) : undefined, lifetime = watchResidentChild(child);
+      let stdout = "", stderr = "", expired = false, ended = false;
+      child.stdin.on("error", error => { if ((error as NodeJS.ErrnoException).code !== "EPIPE") throw error; });
+      child.stdin.write(JSON.stringify(positive ? { type: "get_state", id: "ordinary-readback" } :
+        { type: "prompt", id: "must-not-admit", message: "Must refuse before this input." }) + "\n");
+      child.stdout.on("data", chunk => {
+        stdout += chunk; fs.appendFileSync(path.join(root, `${label}.stdout`), chunk, { mode: 0o600 });
+        if (positive && !ended && stdout.split("\n").some(line => {
+          try { const value = JSON.parse(line) as RpcRecord; return value.type === "response" && value.id === "ordinary-readback"; }
+          catch { return false; }
+        })) { ended = true; child.stdin.end(); } // Ordinary EOF only AFTER actual RPC readback, never a native refusal.
+      });
+      child.stderr.on("data", chunk => { stderr += chunk; fs.appendFileSync(path.join(root, `${label}.stderr`), chunk, { mode: 0o600 }); });
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { expired = true; void lifetime.stop().catch(reject); }, 30_000);
+        child.once("error", reject);
+        child.once("close", (code, signal) => {
+          clearTimeout(timer);
+          const evidence = death({ pid: child.pid!, started: started! }), closedAt = Date.now();
+          const value = { pid: child.pid, started, code, signal, stdout, stderr, startedAt, closedAt, ...(ordinary ? { ordinary } : {}) };
+          fs.writeFileSync(path.join(root, `${label}.exit.json`), JSON.stringify({ ...value, args, executable: nodeBinary,
+            expired, death: evidence, stdinEndedByParent: ended, stdoutClosed: child.stdout.destroyed, stderrClosed: child.stderr.destroyed }), { mode: 0o600, flag: "wx" });
+          if (expired || !evidence || (positive && !ended)) reject(new Error(`Actual ${shape} failed terminal/readback boundary: ${stderr}`));
+          else resolve(value);
+        });
+      });
     },
     async probeModelPolicy(): Promise<Record<string, unknown>> {
       const result = await runAuxiliary("model-policy", [path.join(fixtureRoot, "native-owner-model-policy-probe.mjs")]);

@@ -341,7 +341,9 @@ export class NatsBridgePort implements BridgeNatsPort {
     const kind = route && meshKind(route.kind);
     if (!route || !kind) return undefined;
     return {
-      route: { machine: route.machine, ownerHostId: route.ownerHostId, ownerIdentityId: route.ownerIdentityId,
+      leaseLapsed: route.leaseLapsed,
+      ...(route.presenceFailure ? { presenceFailure: route.presenceFailure } : {}),
+      ...(route.remainingAuthorityMs !== undefined ? { remainingAuthorityMs: route.remainingAuthorityMs } : {}),      route: { machine: route.machine, ownerHostId: route.ownerHostId, ownerIdentityId: route.ownerIdentityId,
         ownerIncarnation: route.ownerIncarnation, capabilities: [...route.capabilities], live: route.live },
       identity: { id: route.id, name: route.record.name, kind,
         ...(route.record.sessionId !== undefined ? { sessionId: route.record.sessionId } : {}) },

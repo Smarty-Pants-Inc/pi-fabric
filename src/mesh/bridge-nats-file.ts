@@ -1,3 +1,4 @@
+import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import { participantFromEntry } from "../topology/participant-directory.js";
 import { readParticipantFiles } from "../topology/participant-files.js";
 import type { FabricParticipantRecord } from "../topology/types.js";
@@ -6,7 +7,7 @@ import {
 } from "../transport/types.js";
 import type { BridgeChange } from "./change-notifier.js";
 import {
-  admitPresence, BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
+  admitPresence, BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, LEASE_LAPSE_DEFER_MS, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
   type BridgeRead, type BridgeSide, type MeshBridgeOptions,
 } from "./bridge.js";
 import {
@@ -48,8 +49,6 @@ const RESEND_ATTEMPTS = 3;
 const RESEND_DELAY_MS = 250;
 /** JetStream redelivers an in-hand message after its ack wait; extend well inside the shortest one. */
 const WORKING_INTERVAL_MS = 5_000;
-/** How long an inbound delivery may wait for this link's KV view to show its target (a watch lag), then TERM. */
-const PRESENCE_WAIT_MS = 15_000;
 /** In-hand deliveries this side holds before it stops pulling (backpressure, not loss). */
 const MAX_IN_HAND = 512;
 const PARTICIPANT_PREFIX = "topology/participants/";
@@ -94,7 +93,7 @@ export class NatsCarrierUncertainError extends Error {
 export const natsPresenceEntry = (port: Pick<BridgeNatsPort, "resolve">, id: string): NatsPresenceEntry | undefined => {
   const resolved = port.resolve(id);
   if (!resolved?.route.live || !resolved.route.machine || !resolved.route.ownerIncarnation || resolved.identity.id !== id) return undefined;
-  return { identity: copy(resolved.identity), route: { ...resolved.route, capabilities: [...resolved.route.capabilities] } };
+  return { ...resolved, identity: copy(resolved.identity), route: { ...resolved.route, capabilities: [...resolved.route.capabilities] } };
 };
 
 const copy = (identity: MeshIdentity): MeshIdentity => ({
@@ -204,6 +203,8 @@ const delay = (ms: number): Promise<void> => new Promise(resolve => { setTimeout
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 export interface NatsCarrierSideOptions {
+  /** The link-local cursor; its sender-lapse sidecar uses the same atomic, durable write as MeshBridge. */
+  readonly cursorPath: string;
   /** Lane L1's raw NATS port. */
   readonly port: BridgeNatsPort;
   /** The hub's file side (MeshBridge `local`): native presence for outbound identity and actor mirrors. */
@@ -225,10 +226,18 @@ export interface NatsCarrierSideOptions {
   readonly topicTimeoutMs?: number;
   readonly workingIntervalMs?: number;
   readonly maxInHand?: number;
-  /** Bound on an inbound delivery's wait for its target in this link's KV view (default 15 s). */
+  /** Bound on an inbound target's KV wait (default/shared maximum 30 s from the event's FIRST lapse). */
   readonly presenceWaitMs?: number;
   /** Only these inbound targets (allow.file) may wait for KV visibility; any other is refused at once. */
   readonly waitForTarget?: (targetId: string) => boolean;
+}
+
+interface SenderLeaseLapse {
+  readonly sequence: number;
+  readonly id: string;
+  readonly sourceMachine: string;
+  readonly senderId: string;
+  readonly startedAt: number;
 }
 
 interface InHand {
@@ -238,8 +247,8 @@ interface InHand {
   /** The carrier's conversion, cached so a reread presents the same event. */
   event?: MeshEvent;
   settle?: NatsCarrierSettle;
-  /** When a presence wait for this delivery began (this side's clock). */
-  waitingSince?: number;
+  /** Coalesce an unchanged failed predicate while the delivery is held. */
+  senderFailure?: string;
 }
 
 export class NatsCarrierSide implements NatsCarrierSideContract {
@@ -260,6 +269,8 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   readonly #workingIntervalMs: number;
   readonly #maxInHand: number;
   readonly #presenceWaitMs: number;
+  readonly #senderLapsePath: string;
+  #senderLeaseLapses: SenderLeaseLapse[] = [];
   /** In-hand deliveries in stream order, by stream sequence. */
   readonly #inHand = new Map<number, InHand>();
   /** Highest sequence this side has given out; never below a cursor MeshBridge read from. */
@@ -283,6 +294,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     this.filePresence = new FileCarrierPresence(options.file, this.#now, options.filePresenceTtlMs);
     const presence: NatsCarrierPresence = {
       nats: id => natsPresenceEntry(this.port, id),
+      natsInbound: id => this.port.resolve(id),
       file: id => this.filePresence.file(id),
     };
     this.carrier = new NatsBridgeCarrier({ link: options.link, machine: options.port.machine, presence, ledger: options.ledger,
@@ -297,7 +309,20 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     this.#resendDelayMs = Math.max(0, options.resendDelayMs ?? RESEND_DELAY_MS);
     this.#workingIntervalMs = Math.max(1, options.workingIntervalMs ?? WORKING_INTERVAL_MS);
     this.#maxInHand = Math.max(1, options.maxInHand ?? MAX_IN_HAND);
-    this.#presenceWaitMs = Math.max(0, options.presenceWaitMs ?? PRESENCE_WAIT_MS);
+    this.#presenceWaitMs = Math.min(LEASE_LAPSE_DEFER_MS, Math.max(0, options.presenceWaitMs ?? LEASE_LAPSE_DEFER_MS));
+    this.#senderLapsePath = `${options.cursorPath}.sender-lease-lapse`;
+    try {
+      const saved = JSON.parse(readFileRetrying(this.#senderLapsePath)) as { v: number; lapses: SenderLeaseLapse[] };
+      if (saved?.v !== 1 || !Array.isArray(saved.lapses) || saved.lapses.length > this.#maxInHand ||
+          !saved.lapses.every(lapse => lapse && Number.isSafeInteger(lapse.sequence) && lapse.sequence > 0 &&
+            typeof lapse.id === "string" && lapse.id && typeof lapse.sourceMachine === "string" && lapse.sourceMachine &&
+            typeof lapse.senderId === "string" && lapse.senderId && Number.isFinite(lapse.startedAt))) {
+        throw new Error("Invalid NATS sender lease-lapse metadata");
+      }
+      this.#senderLeaseLapses = saved.lapses;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; // Never restart a corrupt window.
+    }
   }
 
   // -------------------------------------------------------------------------------------------
@@ -541,7 +566,10 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
       try {
         const event = await this.#inbound(stream, held);
         if (event) events.push(event);
-        else continue; // answered and settled here; its sequence is never shown
+        else {
+          through = Math.max(through, held.sequence ?? after); // A rechecked cached event may now be deliberately refused.
+          continue;
+        }
       } catch (error) {
         // Stop in order before the delivery that failed; it is retried on the next read.
         if (!events.length) throw deferTransient(error);
@@ -554,13 +582,30 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   }
 
   async #inbound(stream: number, held: InHand): Promise<MeshEvent | undefined> {
-    if (held.event) return held.event;
+    // Even a converted event must re-check LIVE source presence when the bridge retries it.
     await this.filePresence.refresh();
     const delivery = held.delivery;
     const envelopeId = typeof delivery.envelope?.id === "string" ? delivery.envelope.id : `stream:${stream}`;
-    const plan: NatsInbound = await this.carrier.inbound(carrierDeliveryFromPort(delivery));
+    let plan: NatsInbound;
+    try { plan = await this.carrier.inbound(carrierDeliveryFromPort(delivery)); }
+    catch (error) {
+      if ((error as { code?: unknown })?.code === "FABRIC_DIRECTORY_NOT_READY" && held.senderFailure !== "not-ready") {
+        this.#log("toFile: sender-live wait predicate=not-ready remainingAuthorityMs=unknown");
+        held.senderFailure = "not-ready";
+      }
+      throw error;
+    }
+    const diagnostic = plan.kind === "wait" || plan.kind === "refused" ? plan.senderDiagnostic : undefined;
+    const detail = diagnostic ? `; predicate=${diagnostic.failure}` +
+      (diagnostic.senderId ? ` sender=${diagnostic.senderId}` : "") +
+      ` remainingAuthorityMs=${diagnostic.remainingAuthorityMs ?? "unknown"}` : "";
+    if (diagnostic && plan.kind === "wait" && held.senderFailure !== diagnostic.failure) {
+      this.#log(`toFile: sender-live defer${detail}`);
+      held.senderFailure = diagnostic.failure;
+    }
     switch (plan.kind) {
       case "event": {
+        if (held.event) return held.event; // Keep its original cursor sequence and conversion.
         // Record the owner's answer BEFORE the file append that hands it to its sender: a same-key resend
         // racing that append must find it recorded (replayAck), never wait for an ACK already consumed.
         // The delivery is acked, and the answer marked forwarded, only after the append is durable.
@@ -594,19 +639,49 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
         return undefined;
       }
       case "wait": {
-        const since = held.waitingSince ??= this.#now();
-        if (this.#now() - since < this.#presenceWaitMs) throw new NatsCarrierDeferredError(new Error(plan.reason));
-        this.#log(`toFile: refused ${envelopeId} from ${delivery.sourceMachine} after ${this.#presenceWaitMs} ms: ${plan.reason}`);
+        const budget = plan.senderLeaseLapse ? LEASE_LAPSE_DEFER_MS : this.#presenceWaitMs;
+        const since = this.#senderLapseSince(delivery);
+        const now = this.#now();
+        if (since <= now && now - since < budget) throw new NatsCarrierDeferredError(new Error(plan.reason));
+        this.#log(`toFile: refused ${envelopeId} from ${delivery.sourceMachine} after ${budget} ms: ${plan.reason}${detail}`);
         await delivery.term(plan.reason);
         this.#release(stream);
         return undefined;
       }
       case "refused":
-        this.#log(`toFile: refused ${envelopeId} from ${delivery.sourceMachine}: ${plan.reason}`);
+        this.#log(`toFile: refused ${envelopeId} from ${delivery.sourceMachine}: ${plan.reason}${detail}`);
         await delivery.term(plan.reason);
         this.#release(stream);
         return undefined;
     }
+  }
+
+  /** Bounded link-local retention metadata, not a spool. Write ONCE per first-lapsed event,
+   * never take the mesh state lock. Keep later boundaries too: read() can return a prefix
+   * before a carrier wait, then that prefix can itself hit the local append fence. */
+  #senderLapseSince(delivery: BridgeNatsPortDelivery, startedAt = this.#now()): number {
+    const saved = this.#senderLeaseLapses.find(lapse => lapse.sequence === delivery.streamSequence && lapse.id === delivery.envelope.id &&
+      lapse.sourceMachine === delivery.sourceMachine && lapse.senderId === delivery.envelope.from.id);
+    if (saved) return saved.startedAt;
+    const lapse: SenderLeaseLapse = { sequence: delivery.streamSequence, id: delivery.envelope.id,
+      sourceMachine: delivery.sourceMachine, senderId: delivery.envelope.from.id, startedAt: Math.min(startedAt, this.#now()) };
+    // Only forget an earlier, released boundary; never evict an active or not-yet-redelivered later one.
+    const lapses = this.#senderLeaseLapses.filter(saved => saved.sequence >= delivery.streamSequence || this.#inHand.has(saved.sequence));
+    if (lapses.length >= this.#maxInHand) throw new NatsCarrierDeferredError("sender lapse metadata is at its in-hand bound");
+    lapses.push(lapse);
+    writeJsonAtomic(this.#senderLapsePath, { v: 1, lapses }, { mode: 0o600, durable: true });
+    this.#senderLeaseLapses = lapses;
+    return lapse.startedAt;
+  }
+
+  /** Share the first-lapse time in either order: carrier -> append fence, or append fence -> carrier.
+   * This is retention metadata only, never authority, and the matching record is not rewritten. */
+  retainLeaseLapse(event: MeshEvent, startedAt?: number): number | undefined {
+    const held = [...this.#inHand.values()].find(held => held.event?.id === event.id && held.sequence === event.sequence);
+    if (!held) return startedAt;
+    if (startedAt !== undefined) return this.#senderLapseSince(held.delivery, startedAt);
+    return this.#senderLeaseLapses.find(lapse => lapse.sequence === held.delivery.streamSequence && lapse.id === held.delivery.envelope.id &&
+      lapse.sourceMachine === held.delivery.sourceMachine && lapse.senderId === held.delivery.envelope.from.id)?.startedAt;
   }
 
   /** Broker ACK after the durable append: every in-hand delivery whose sequence MeshBridge read past. */

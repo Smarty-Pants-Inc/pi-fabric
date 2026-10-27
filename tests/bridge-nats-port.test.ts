@@ -212,14 +212,17 @@ describe("NATS bridge port: link identity and presence", () => {
   it("resolves the one KV record for an id with the identity from that record", async () => {
     const w = kvWorld();
     seedNative(w, V2, natsRoot(), 1_000_000);
-    const { port: p } = port(w);
+    const { port: p, clock } = port(w);
     await p.start();
     expect(p.resolve(NATS_ROOT)).toEqual({
+      leaseLapsed: false, remainingAuthorityMs: 13_000,
       route: { machine: V2, ownerHostId: NATS_ROOT, ownerIdentityId: NATS_ROOT, ownerIncarnation: "nats-inc-1",
         capabilities: ["steer", "followUp", "fabric"], live: true },
       identity: { id: NATS_ROOT, name: "v2-main", kind: "main", sessionId: NATS_ROOT.slice(8) },
     });
     expect(p.resolve("session:absent-0000")).toBeUndefined();
+    clock.mono += 13_000;
+    expect(p.resolve(NATS_ROOT)).toMatchObject({ leaseLapsed: true, presenceFailure: "expired", remainingAuthorityMs: 0, route: { live: false } });
   });
 
   it("lists every record for an id, on every machine, for the identity gate", async () => {

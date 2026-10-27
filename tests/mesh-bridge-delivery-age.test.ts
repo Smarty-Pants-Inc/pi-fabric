@@ -1,4 +1,9 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MeshBridge, type BridgeSide } from "../src/mesh/bridge.js";
 import { BridgeDeliveryAgeMonitor, type BridgeDeliveryAgeAlarm } from "../src/mesh/bridge-delivery-age.js";
 
 const baseEvent = (createdAt: number, data: Record<string, unknown> = {}) => ({
@@ -6,7 +11,42 @@ const baseEvent = (createdAt: number, data: Record<string, unknown> = {}) => ({
 });
 
 describe("bridge per-direction delivery age", () => {
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+
+  // Keep: the reported slow membership failure path cannot be reached cheaply in a live flow.
+  it("attributes a slow refresh on a not-addressed event, with exclusive totals matching wall time", async () => {
+    vi.useFakeTimers({ now: 1_800_000_000_000 });
+    const start = Date.now(), lines: string[] = [];
+    vi.spyOn(performance, "now").mockImplementation(() => Date.now() - start);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-drain-time-"));
+    const empty = { hosts: [], participants: [], reserved: [] };
+    const side = (): BridgeSide => ({ latestSequence: async () => 0, read: async () => ({ events: [], through: 0 }),
+      presence: async () => empty, owned: async () => empty, mirror: async () => {}, mirrored: () => true,
+      publish: async () => ({ sequence: 1 }), bridgedIds: async () => ({ ids: [], through: 0, done: true }) });
+    const local = side(), bridge = new MeshBridge({ localName: "hub", remoteName: "far", local, remote: side(),
+      cursorPath: path.join(root, "cursor.json"), presenceMs: 1_000_000, log: line => lines.push(line) });
+    try {
+      await bridge.start();
+      local.read = async after => ({ events: after ? [] : [{ ...baseEvent(start), id: "event", kind: "followUp", sequence: 1,
+        from: { id: "session:sender", name: "main", kind: "main" }, to: "session:unknown" }], through: 1 });
+      vi.spyOn(bridge, "syncPresence").mockImplementation(() => new Promise(resolve => setTimeout(resolve, 60_125)));
+      const draining = bridge.step();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(lines.some(line => line.includes("membershipWaitMs=60000"))).toBe(true); // Even before the await settles.
+      await vi.advanceTimersByTimeAsync(125);
+      expect(await draining).toEqual({ toRemote: 0, toLocal: 0, dropped: 0 });
+      await bridge.stop();
+      const values: Record<string, number> = {};
+      for (const line of lines.filter(line => line.startsWith("bridge drain-time v1 peer=far dir=toRemote "))) {
+        for (const [, key, value] of line.matchAll(/(\w+)=(\d+)/g)) values[key!] = key!.endsWith("MaxMs")
+          ? Math.max(values[key!] ?? 0, Number(value)) : (values[key!] ?? 0) + Number(value);
+      }
+      expect(values).toMatchObject({ pages: 2, events: 1, membershipWaitMs: 60_125, membershipWaitCount: 1, membershipWaitMaxMs: 60_125 });
+      const sum = ["readMs", "resolveMs", "membershipWaitMs", "filterMs", "publishMs", "checkpointMs", "idleMs"]
+        .reduce((total, key) => total + values[key]!, 0);
+      expect(sum).toBeCloseTo(Date.now() - start, 0);
+    } finally { await bridge.stop(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
 
   it("alarms once for a backlogged command, records both ages and cursor lag, then recovers", async () => {
     vi.useFakeTimers({ now: 1_800_000_000_000 });

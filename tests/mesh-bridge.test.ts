@@ -2210,7 +2210,7 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     expect(on(hub, "ops.owner")).toEqual([expect.objectContaining({ kind: "pr.wake", to: "factory", data: { rootId: spoke.identity.id, bridge: { from: "forge", id: wake.id } } })]);
     expect(hub.read({ after: 0, limit: 100 }).some((event) => event.to === "nobody")).toBe(false);
     expect(notAddressedDebugs(debugs)).toEqual([`toLocal: not addressed across: fleet.work.smarty-dev.1 ${nobody.id} from ${spoke.identity.id} to nobody`]);
-    expect(countLines(logs)).toEqual(["bridge: 1 events not addressed across (topics: fleet.work.smarty-dev.1; toRemote 0, toLocal 1 (to factory 0))"]);
+    expect(countLines(logs)).toEqual(["bridge: 1 events not addressed across (topics: fleet.work.smarty-dev.1; toRemote 0, toLocal 1 (to factory 0); suppressed miss samples 0)"]);
     // Once across, never again: the cursor and the stamp keep a second pass from repeating it.
     expect(await bridge.step()).toMatchObject({ toLocal: 0 });
     expect(on(hub, "fleet.work.smarty-dev.1")).toHaveLength(1);
@@ -2256,7 +2256,7 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     const send = (topic: string, to: string) => far.publish({ topic, kind: "ask", from: spoke.identity, to, text: to });
     await send("fleet.work.a.1", "nobody");
     await bridge.step();
-    expect(countLines(logs)).toEqual(["bridge: 1 events not addressed across (topics: fleet.work.a.1; toRemote 0, toLocal 1 (to factory 0))"]);
+    expect(countLines(logs)).toEqual(["bridge: 1 events not addressed across (topics: fleet.work.a.1; toRemote 0, toLocal 1 (to factory 0); suppressed miss samples 0)"]);
     await send("fleet.work.a.2", "nobody");
     await send("fleet.work.a.3", "nobody");
     await send("fleet.work.a.2", "nobody");
@@ -2269,8 +2269,8 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     await send("fleet.work.smarty-dev.1", "factory"); // the next forward reports
     expect(await bridge.step()).toMatchObject({ toLocal: 1 });
     expect(countLines(logs)).toEqual([
-      "bridge: 1 events not addressed across (topics: fleet.work.a.1; toRemote 0, toLocal 1 (to factory 0))",
-      "bridge: 3 events not addressed across (topics: fleet.work.a.2, fleet.work.a.3; toRemote 0, toLocal 3 (to factory 0))",
+      "bridge: 1 events not addressed across (topics: fleet.work.a.1; toRemote 0, toLocal 1 (to factory 0); suppressed miss samples 0)",
+      "bridge: 3 events not addressed across (topics: fleet.work.a.2, fleet.work.a.3; toRemote 0, toLocal 3 (to factory 0); suppressed miss samples 0)",
     ]);
     for (let index = 0; index < 12; index++) await send(`fleet.work.b.${index}`, "nobody");
     await bridge.step();
@@ -2278,8 +2278,9 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     now += 60_000;
     await send("fleet.work.b.12", "nobody"); // the next drop reports, topics capped at ten
     await bridge.step();
+    // The twelve-event burst emits five miss samples and suppresses seven; the next minute reopens sampling.
     expect(countLines(logs).at(-1)).toBe(`bridge: 13 events not addressed across (topics: ${
-      Array.from({ length: 10 }, (_, index) => `fleet.work.b.${index}`).join(", ")}, ...; toRemote 0, toLocal 13 (to factory 0))`);
+      Array.from({ length: 10 }, (_, index) => `fleet.work.b.${index}`).join(", ")}, ...; toRemote 0, toLocal 13 (to factory 0); suppressed miss samples 7)`);
   });
 
   // pi-fabric#876 review, P1-1: the exception needs a parsed fleet.work.<repo>.<n> and the exact name.
@@ -2365,11 +2366,12 @@ describe("work events for the hub factory (smarty-dev#9352)", () => {
     expect(logs.some((line) => /dropped|refused/.test(line))).toBe(false);
     // The INFO count names drops addressed to the factory (the post-install revert trigger reads it).
     const counts = (): string[] => logs.filter((line) => line.includes("not addressed across"));
-    expect(counts()).toEqual(["bridge: 1 events not addressed across (topics: fleet.work.smarty-dev; toRemote 0, toLocal 1 (to factory 1))"]);
+    expect(counts()).toEqual(["bridge: 1 events not addressed across (topics: fleet.work.smarty-dev; toRemote 0, toLocal 1 (to factory 1); suppressed miss samples 0)"]);
     now += 60_000;
     await send("fleet.work.smarty-dev.5", "nobody");
     await bridge.step();
-    expect(counts().at(-1)).toMatch(/^bridge: 9 events not addressed across \(topics: .*; toRemote 0, toLocal 9 \(to factory 5\)\)$/);
+    // Nine initial misses emit five samples and suppress four; the next minute's miss is sampled again.
+    expect(counts().at(-1)).toMatch(/^bridge: 9 events not addressed across \(topics: .*; toRemote 0, toLocal 9 \(to factory 5\); suppressed miss samples 4\)$/);
   });
 
   // pi-fabric#876 review, P1-2: a work host cannot flood the factory; over the bound, work waits.

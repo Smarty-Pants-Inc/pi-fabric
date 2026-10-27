@@ -38,11 +38,12 @@ for (const entry of allowlist) assert(entry.callsite && entry.reason && entry.is
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), `idle-wakes-${mode}-`));
 const wakeOut = path.join(root, "wakes.json");
+const readyOut = path.join(root, "child-ready");
 const preload = path.join(repo, "scripts/idle-wake-preload.cjs");
 const env = { PATH: process.env.PATH, HOME: path.join(root, "home"), TMPDIR: root, PI_CODING_AGENT_DIR: path.join(root, "profile"),
   PI_OFFLINE: "1", PI_FABRIC_MESH_ROOT: path.join(root, "mesh"), PI_FABRIC_PROJECT_ROOT: root,
   PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_AGENT_DIR: path.join(root, "exports"),
-  IDLE_WAKE_OUT: wakeOut, IDLE_WAKE_ROOT: repo };
+  IDLE_WAKE_OUT: wakeOut, IDLE_WAKE_READY_OUT: readyOut, IDLE_WAKE_ROOT: repo };
 const write = (file, text) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, text); };
 
 function start(args) {
@@ -149,8 +150,11 @@ let child, exitCode = 2;
 try {
   if (mode !== "script") for (const name of ["index.js", "residency/host.js"]) assert(fs.existsSync(path.join(repo, "dist", name)), `dist/${name} is missing: run bun run build`);
   if (mode === "main") child = await startMain();
-  else if (mode === "script") child = start([path.resolve(option("--script"))]);
-  else child = await startResident();
+  else if (mode === "script") {
+    child = start([path.resolve(option("--script"))]);
+    for (let i = 0; i < 200 && !fs.existsSync(readyOut); i++) await sleep(10);
+    assert(fs.existsSync(readyOut), "script child preload start timed out; see child.log");
+  } else child = await startResident();
   await sleep(warmup * 1000);
   assert(child.exitCode === null, `${mode} exited during warm-up; see ${root}/child.log`);
   child.kill("SIGUSR2");

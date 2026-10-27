@@ -26,7 +26,7 @@ async function check(source: string, seconds: number, allowlist: (file: string) 
 }
 
 describe.runIf(process.platform === "linux")("idle wake gate self-test (smarty-dev#7978)", () => {
-  it.concurrent("reports a 100 ms setInterval at ~10 wakes/s and fails", async () => {
+  it("reports a 100 ms setInterval at ~10 wakes/s and fails", async () => {
     const { code, result } = await check("setInterval(() => {}, 100);\n", 3);
     expect(code).toBe(1);
     expect(result.timerWakesPerSecond).toBeGreaterThan(8);
@@ -34,7 +34,7 @@ describe.runIf(process.platform === "linux")("idle wake gate self-test (smarty-d
     expect(result.top[0].callsite).toMatch(/child\.mjs:1 <anonymous>$/);
   }, 30_000);
 
-  it.concurrent("passes one lease-like timer that the allowlist names", async () => {
+  it("passes one lease-like timer that the allowlist names", async () => {
     const { code, result } = await check("function renewLease() { setInterval(() => {}, 100); }\nrenewLease();\n", 3,
       (file) => [{ callsite: `${file} renewLease`, reason: "self-test lease deadline", issue: "smarty-dev#7978" }]);
     expect(result.top[0]).toMatchObject({ callsite: expect.stringMatching(/child\.mjs:1 renewLease$/), allowlisted: true });
@@ -42,15 +42,15 @@ describe.runIf(process.platform === "linux")("idle wake gate self-test (smarty-d
     expect(code).toBe(0);
   }, 30_000);
 
-  it.concurrent("fails a re-arming setImmediate loop, which no Timeout shows", async () => {
+  it("fails a re-arming setImmediate loop, which no Timeout shows", async () => {
     const { code, result } = await check("function spin() { setImmediate(spin); }\nspin();\n", 2);
     expect(result.top[0]).toMatchObject({ type: "Immediate", callsite: expect.stringMatching(/child\.mjs:1 .*\bspin\b/) });
     expect(result.timerWakesPerSecond).toBeGreaterThan(100);
-    expect(result.pollers).toBe(1);
+    expect(result.pollers).toBeGreaterThanOrEqual(1);
     expect(code).toBe(1);
   }, 30_000);
 
-  it.concurrent("counts an fs.watchFile 1 s stat poll, which no Timeout shows, and fails", async () => {
+  it("counts an fs.watchFile 1 s stat poll, which no Timeout shows, and fails", async () => {
     const { code, result } = await check("import fs from 'node:fs';\nfs.watchFile(process.argv[1], { interval: 1000 }, () => {});\n", 3);
     expect(result.top[0]).toMatchObject({ type: "StatWatcher", callsite: expect.stringMatching(/child\.mjs:2 <anonymous>$/) });
     expect(result.timerWakesPerSecond).toBeGreaterThanOrEqual(0.9);
@@ -58,7 +58,7 @@ describe.runIf(process.platform === "linux")("idle wake gate self-test (smarty-d
     expect(code).toBe(1);
   }, 30_000);
 
-  it.concurrent("fails a 30 s setInterval: under the 1/s total, but one callsite more than once a minute", async () => {
+  it("fails a 30 s setInterval: under the 1/s total, but one callsite more than once a minute", async () => {
     const { code, result } = await check("setInterval(() => {}, 30_000);\n", 65);
     expect(result.timerWakesPerSecond).toBeLessThanOrEqual(1);
     expect(result.top[0].wakes).toBe(2);

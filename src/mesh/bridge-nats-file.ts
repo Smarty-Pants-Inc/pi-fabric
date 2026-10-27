@@ -6,7 +6,7 @@ import {
 } from "../transport/types.js";
 import type { BridgeChange } from "./change-notifier.js";
 import {
-  BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
+  admitPresence, BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
   type BridgeRead, type BridgeSide, type MeshBridgeOptions,
 } from "./bridge.js";
 import {
@@ -20,6 +20,7 @@ import {
   type BridgeNatsPresenceRecord, type BridgeNatsPresenceView, type NatsCarrierSideContract,
 } from "./bridge-nats-types.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "./store.js";
+import { isMeshRetryableBusy } from "./state-backend.js";
 
 /**
  * The file-mesh half of the A' carrier (smarty-dev#15310, lane L2): the BridgeSide MeshBridge uses
@@ -270,6 +271,9 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   #working: ReturnType<typeof setInterval> | undefined;
   readonly #listeners = new Set<{ changed: (kind: BridgeChange) => void; failed: (error: Error) => void }>();
   #lastMirror: { hosts: BridgePresence["hosts"]; participants: BridgePresence["participants"] } | undefined;
+  #fileRenewal: Promise<void> | undefined;
+  #fileRenewalPending = false;
+  #fenced = false;
 
   constructor(options: NatsCarrierSideOptions) {
     this.port = options.port;
@@ -376,13 +380,48 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   subscribeChanges(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): () => void {
     const listener = { changed, failed };
     this.#listeners.add(listener);
-    const unwatch = this.port.watchPresence(() => changed("presence"), failed);
+    const unwatch = this.port.watchPresence(() => {
+      changed("presence");
+      this.#fileRenewalPending = true;
+      this.#renewFileMirror();
+    }, failed);
     this.#start();
     if (this.#pumpError) queueMicrotask(() => failed(this.#pumpError!));
     return () => {
       this.#listeners.delete(listener);
       unwatch();
     };
+  }
+
+  /** The live KV watch renews inbound leases independently of a slow bidirectional pass or
+   * drain. Coalesce bursts, but resample after changes during a write. Never restamp a cached
+   * snapshot or change membership here: only the ordinary full sync installs/removes owners. */
+  #renewFileMirror(): void {
+    if (this.#fileRenewal || this.#fenced || this.#listeners.size === 0) return;
+    this.#fileRenewal = (async () => {
+      while (this.#fileRenewalPending && !this.#fenced && this.#listeners.size > 0) {
+        this.#fileRenewalPending = false;
+        const local = await this.#file.presence();
+        // Anchor before the NATS read/queue/write, exactly as MeshBridge's inbound sample does.
+        const observedAt = this.#now();
+        const claimed = await this.presence();
+        if (this.#fenced || this.#listeners.size === 0) return;
+        const admitted = admitPresence(claimed, new Set(local.reserved), this.#link);
+        await this.#file.renewMirroredLeases(admitted.hosts, observedAt);
+      }
+    })().catch(error => {
+      if (this.#fenced || this.#listeners.size === 0) return;
+      if (error instanceof BridgeMirrorDeferredError || isMeshRetryableBusy(error)) {
+        // No new authority on failure. The normal sync and the next KV update may retry.
+        this.#log(`NATS file mirror renewal deferred: ${message(error)}`);
+      } else {
+        const failure = error instanceof Error ? error : new Error(message(error));
+        for (const listener of this.#listeners) listener.failed(failure);
+      }
+    }).finally(() => {
+      this.#fileRenewal = undefined;
+      if (this.#fileRenewalPending) this.#renewFileMirror();
+    });
   }
 
   async presence(): Promise<BridgePresence> {
@@ -421,10 +460,18 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
    */
   async bridgedIds(after: number): Promise<BridgedIds> { return { ids: [], through: after, done: true }; }
 
-  async fence(): Promise<void> { await this.port.fence(); }
-  async withdraw(): Promise<void> { await this.port.withdraw(); }
+  async fence(): Promise<void> {
+    this.#fenced = true;
+    await this.#fileRenewal;
+    await this.port.fence();
+  }
+  async withdraw(): Promise<void> {
+    await this.fence();
+    await this.port.withdraw();
+  }
 
   close(_error?: Error): void {
+    this.#fenced = true;
     this.#abort.abort();
     clearInterval(this.#working);
     this.#room?.();

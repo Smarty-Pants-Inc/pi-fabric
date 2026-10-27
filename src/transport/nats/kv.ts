@@ -310,6 +310,7 @@ export class NatsKvStore implements TransportKv {
         if (disconnected) await reconnect;
         if (signal.aborted || closed) return;
         const queue = new Readable({ objectMode: true, read() {} });
+        let consumer: PushConsumer | undefined;
         let messages: ConsumerMessages | undefined;
         let statusTask: Promise<void> | undefined;
         let closedTask: Promise<void> | undefined;
@@ -318,11 +319,37 @@ export class NatsKvStore implements TransportKv {
         let ended = false;
         let failure: unknown = flowControlFailure;
         let delivered = 0;
+        let deleteTask: Promise<void> | undefined;
+        const deleteConsumer = (): Promise<void> | undefined => {
+          const owned = consumer;
+          if (!owned) return;
+          return deleteTask ??= (async () => {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              const deleted = await Promise.race([
+                owned.delete(),
+                new Promise<never>((_, reject) => {
+                  timer = setTimeout(() => reject(new TimeoutError()), 2_000);
+                }),
+              ]);
+              if (!deleted) diagnostic("consumer-delete-failed", "NOT_DELETED");
+            } catch (error) {
+              const code = apiCode(error);
+              if (![10014, 10059].includes(code ?? -1)) {
+                diagnostic("consumer-delete-failed", code === undefined
+                  ? error instanceof Error ? error.name : "UNKNOWN" : `JS_API_${code}`);
+              }
+            } finally { clearTimeout(timer); }
+          })();
+        };
         const emit = (event: TransportKvEvent<V>): void => { if (!ended && !queue.destroyed) queue.push(event); };
         const end = (): void => {
           messages?.stop();
           if (!ended && !queue.destroyed) queue.push(null);
           ended = true;
+          // An abort may arrive while the generator is paused at yield. Do not
+          // require another next()/return() to release its server state.
+          void deleteConsumer();
         };
         const gap = (): void => {
           if (reset || signal.aborted || ended) return;
@@ -350,7 +377,6 @@ export class NatsKvStore implements TransportKv {
               deliver_policy: DeliverPolicy.LastPerSubject,
               mem_storage: true,
             };
-            let consumer: PushConsumer;
             try {
               consumer = await this.#js.consumers.getPushConsumer(stream, options);
             } catch (error) {
@@ -399,7 +425,14 @@ export class NatsKvStore implements TransportKv {
             };
             if (initial.num_pending === 0) markReady();
             if (!reset && !signal.aborted && !closed) {
-              messages = await consumer.consume({ callback: apply });
+              // Fabric owns sequence validation and full-snapshot resets. Consume
+              // through a non-ordered binding so SDK 3.4 cannot race shutdown with
+              // an unawaited ordered reset/add, leaking a later server generation.
+              const delivery = await this.#js.consumers.getBoundPushConsumer({
+                deliver_subject: initial.config.deliver_subject!,
+                ...(initial.config.idle_heartbeat === undefined ? {} : { idle_heartbeat: initial.config.idle_heartbeat }),
+              });
+              messages = await delivery.consume({ callback: apply });
               if (failure || flowControlFailure) messages.stop();
               statusTask = (async () => {
                 for await (const status of messages!.status()) {
@@ -462,9 +495,15 @@ export class NatsKvStore implements TransportKv {
         } finally {
           invalidate = undefined;
           endEpoch = undefined;
-          await messages?.close();
-          await Promise.all([statusTask, closedTask]);
-          queue.destroy();
+          try {
+            await messages?.close();
+            await Promise.all([statusTask, closedTask]);
+          } finally {
+            queue.destroy();
+            // Only the creation handle owns server state, never the delivery
+            // binding. Also cover setup failures, for either storage backend.
+            await deleteConsumer();
+          }
         }
       }
     } catch (error) {

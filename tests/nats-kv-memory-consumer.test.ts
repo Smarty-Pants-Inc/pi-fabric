@@ -16,27 +16,33 @@ const fixture = (bucket: string, failure?: unknown, fileFailure?: unknown) => {
     status: () => (async function* () { await closed; })(), closed: () => closed,
     stop: () => finish(), close: async () => { finish(); },
   } as unknown as ConsumerMessages;
-  const deliver = (n: number) => callback?.({
+  const deliver = (n: number, gap = 0) => callback?.({
     subject: `$KV.${bucket}.machine-a.p.record`,
     data: new TextEncoder().encode(JSON.stringify({ owner: "watch-test", value: { n } })),
-    info: { consumer: "watch-consumer", deliverySequence: ++sequence, streamSequence: sequence, pending: 0 },
+    info: { consumer: "watch-consumer", deliverySequence: sequence += gap + 1, streamSequence: sequence, pending: 0 },
   } as JsMsg);
   const consumer = {
-    info: async () => ({ name: "watch-consumer", num_pending: 1 }),
+    info: async () => ({ name: "watch-consumer", num_pending: 1,
+      config: { deliver_subject: "watch-inbox", idle_heartbeat: 30_000_000_000 } }),
+    delete: vi.fn(async () => true),
+    consume: vi.fn(() => { throw new Error("ordered delivery would race cleanup with SDK resets"); }),
+  } as unknown as PushConsumer;
+  const delivery = {
     consume: async (options: { callback: (msg: JsMsg) => void }) => {
       callback = options.callback;
       deliver(1);
       return messages;
     },
   } as unknown as PushConsumer;
+  const getBoundPushConsumer = vi.fn(async () => delivery);
   const getPushConsumer = vi.fn(async (_stream: string, config: Partial<ConsumerConfig>) => {
     if (config.mem_storage && failure) throw failure;
     if (!config.mem_storage && fileFailure) throw fileFailure;
     return consumer;
   });
-  const js = { consumers: { getPushConsumer } } as unknown as JetStreamClient;
+  const js = { consumers: { getPushConsumer, getBoundPushConsumer } } as unknown as JetStreamClient;
   const store = () => new NatsKvStore({} as KV, { bucket, ttlMs: 15_000, markerTtlMs: 300_000 }, js);
-  return { getPushConsumer, store, deliver };
+  return { getPushConsumer, getBoundPushConsumer, store, deliver, consumer, delivery, messages };
 };
 const exercise = async (f: ReturnType<typeof fixture>) => {
   const controller = new AbortController();
@@ -56,9 +62,144 @@ const creationFailure = async (f: ReturnType<typeof fixture>, error: unknown) =>
 };
 
 describe("KV watch memory consumer storage", () => {
+  // Keep: smarty-dev#17172 — a watch owned server state past its delivery lifetime.
+  it.each([false, true])("deletes its owned consumer on return (file fallback=%s)", async (fallback) => {
+    const f = fixture(`cleanup_return_${fallback}`, fallback ? quota(10028) : undefined);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await exercise(f);
+      expect(f.consumer.delete).toHaveBeenCalledTimes(1);
+    } finally { warning.mockRestore(); }
+  });
+
+  it.each(["closed", "sequence gap"])("deletes the old consumer before a %s restart and leaves other watches alone", async (cause) => {
+    const old = fixture("cleanup_restart"), replacement = fixture("cleanup_restart"), other = fixture("cleanup_other");
+    old.getPushConsumer.mockResolvedValueOnce(old.consumer).mockResolvedValueOnce(replacement.consumer);
+    old.getBoundPushConsumer.mockResolvedValueOnce(old.delivery).mockResolvedValueOnce(replacement.delivery);
+    const controller = new AbortController(), otherController = new AbortController();
+    const watch = old.store().watch("machine-a.p.*", controller.signal)[Symbol.asyncIterator]();
+    const otherWatch = other.store().watch("machine-a.p.*", otherController.signal)[Symbol.asyncIterator]();
+    try {
+      expect((await watch.next()).value?.type).toBe("put");
+      expect((await watch.next()).value?.type).toBe("ready");
+      await otherWatch.next();
+      if (cause === "closed") old.messages.stop();
+      else old.deliver(2, 1);
+      expect((await watch.next()).value).toEqual({ type: "reset" });
+      expect((await watch.next()).value?.type).toBe("put");
+      expect(old.consumer.delete).toHaveBeenCalledTimes(1);
+      expect(replacement.consumer.delete).not.toHaveBeenCalled();
+      expect(other.consumer.delete).not.toHaveBeenCalled();
+    } finally {
+      controller.abort(); otherController.abort();
+      await watch.return?.(); await otherWatch.return?.();
+    }
+    expect(replacement.consumer.delete).toHaveBeenCalledTimes(1);
+    expect(other.consumer.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["info", "consume"] as const)("deletes after a post-creation %s failure without masking it", async (stage) => {
+    const f = fixture(`cleanup_setup_${stage}`), error = new Error(`injected ${stage} failure`);
+    if (stage === "info") vi.spyOn(f.consumer, "info").mockRejectedValueOnce(error);
+    else vi.spyOn(f.delivery, "consume").mockRejectedValueOnce(error);
+    await creationFailure(f, error);
+    expect(f.consumer.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["return", "abort"] as const)("deletes on %s without another event", async (end) => {
+    const f = fixture(`cleanup_${end}`), controller = new AbortController();
+    const watch = f.store().watch("machine-a.p.*", controller.signal)[Symbol.asyncIterator]();
+    try {
+      await watch.next(); await watch.next();
+      if (end === "abort") {
+        const pending = watch.next();
+        controller.abort();
+        expect((await pending).done).toBe(true);
+      } else expect((await watch.return?.())?.done).toBe(true);
+      expect(f.consumer.delete).toHaveBeenCalledTimes(1);
+    } finally { controller.abort(); await watch.return?.(); }
+  });
+
+  it("deletes on abort even while the caller is paused at a yielded event", async () => {
+    const f = fixture("cleanup_paused_abort"), controller = new AbortController();
+    const watch = f.store().watch("machine-a.p.*", controller.signal)[Symbol.asyncIterator]();
+    try {
+      await watch.next(); await watch.next();
+      controller.abort();
+      await vi.waitFor(() => expect(f.consumer.delete).toHaveBeenCalledTimes(1));
+    } finally { controller.abort(); await watch.return?.(); }
+    expect(f.consumer.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it("deletes when cancellation overtakes creation, without starting delivery", async () => {
+    const f = fixture("cleanup_creation_abort"), controller = new AbortController();
+    const info = f.consumer.info.bind(f.consumer);
+    vi.spyOn(f.consumer, "info").mockImplementation(async (...args) => {
+      controller.abort();
+      return info(...args);
+    });
+    const watch = f.store().watch("machine-a.p.*", controller.signal)[Symbol.asyncIterator]();
+    expect((await watch.next()).done).toBe(true);
+    expect(f.getBoundPushConsumer).not.toHaveBeenCalled();
+    expect(f.consumer.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([10014, 10059])("treats missing consumer/stream (%i) as cleanup success", async (err_code) => {
+    const f = fixture(`cleanup_missing_${err_code}`);
+    vi.mocked(f.consumer.delete).mockRejectedValueOnce(new JetStreamApiError({
+      code: 404, err_code, description: "already removed",
+    }));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try { await exercise(f); expect(warning).not.toHaveBeenCalled(); }
+    finally { warning.mockRestore(); }
+  });
+
+  it("bounds a stuck consumer deletion and logs once", async () => {
+    vi.useFakeTimers();
+    const f = fixture("cleanup_timeout"), controller = new AbortController();
+    vi.mocked(f.consumer.delete).mockImplementation(() => new Promise(() => {}));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const watch = f.store().watch("machine-a.p.*", controller.signal)[Symbol.asyncIterator]();
+    try {
+      await watch.next(); await watch.next();
+      const ending = watch.return?.();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect((await ending)?.done).toBe(true);
+      expect(warning.mock.calls).toHaveLength(1);
+      expect(warning.mock.calls[0]![0]).toContain('"outcome":"consumer-delete-failed"');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      controller.abort(); await watch.return?.();
+      warning.mockRestore(); vi.useRealTimers();
+    }
+  });
+
+  it("retains the primary setup error when deletion also fails", async () => {
+    const f = fixture("cleanup_primary_error"), error = new Error("injected info failure");
+    vi.spyOn(f.consumer, "info").mockRejectedValueOnce(error);
+    vi.mocked(f.consumer.delete).mockRejectedValueOnce(new Error("injected delete failure"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try { await creationFailure(f, error); expect(warning).toHaveBeenCalledTimes(1); }
+    finally { warning.mockRestore(); }
+  });
+
+  it("logs a delete failure once without throwing into the caller", async () => {
+    const f = fixture("cleanup_delete_failure");
+    vi.mocked(f.consumer.delete).mockRejectedValueOnce(new Error("injected delete failure"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await exercise(f);
+      expect(f.consumer.delete).toHaveBeenCalledTimes(1);
+      expect(warning.mock.calls).toHaveLength(1);
+      expect(warning.mock.calls[0]![0]).toContain('"outcome":"consumer-delete-failed"');
+    } finally { warning.mockRestore(); }
+  });
+
   it("requests in-memory state without changing snapshot or live delivery", async () => {
     const f = fixture("memory_watch");
     await exercise(f);
+    expect(f.consumer.consume).not.toHaveBeenCalled();
+    expect(f.getBoundPushConsumer).toHaveBeenCalledWith({ deliver_subject: "watch-inbox", idle_heartbeat: 30_000_000_000 });
     expect(f.getPushConsumer.mock.calls).toEqual([["KV_memory_watch", {
       filter_subjects: "$KV.memory_watch.machine-a.p.*", deliver_policy: DeliverPolicy.LastPerSubject, mem_storage: true,
     }]]);

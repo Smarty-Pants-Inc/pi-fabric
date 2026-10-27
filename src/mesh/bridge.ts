@@ -56,8 +56,17 @@ export const BRIDGE_LEASE_MS = MIRROR_FRESH_MS;
 const DEFAULT_PRESENCE_MS = 5_000;
 /** A retained source event revalidates after this delay; this is NOT an event/authority TTL. */
 const DEFAULT_MEMBERSHIP_RETRY_MS = 1_000;
-/** Known-elsewhere outbound misses share one bounded trailing sample, never an idle poll. */
+/** Outbound misses share one bounded trailing sample, never an idle poll.
+ * The hold also delays addressed events behind a miss by up to 15 s by default;
+ * that head-of-line delay is accepted (an operator override changes the bound). */
 const UNADDRESSED_REFRESH_MS = 15_000;
+
+/** Parse an integer millisecond override; malformed/unset values keep the default. */
+export const parseBridgeUnaddressedRefreshMs = (value: string | undefined): number => {
+  if (value === undefined || !/^[+-]?\d+$/.test(value.trim())) return UNADDRESSED_REFRESH_MS;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? Math.max(5_000, Math.min(300_000, parsed)) : UNADDRESSED_REFRESH_MS;
+};
 /** A missed change notification is only a safety net: its retry backs off to this bound. */
 const MEMBERSHIP_RETRY_MAX_MS = 30_000;
 /** Transitional mixed-version exception only: remove after all fleet agents support changes. */
@@ -3503,6 +3512,7 @@ export class MeshBridge {
   #presenceSync: Promise<void> | undefined;
   /** One trailing refresh obligation; a sample begun before its latest miss cannot clear it. */
   #unaddressedRefreshAt: number | undefined;
+  #unaddressedRefreshMs = UNADDRESSED_REFRESH_MS;
   #unaddressedRefreshVersion = 0;
   /** An unknown outbound recipient retains its source boundary until the trailing sample lands. */
   #unaddressedSequence: number | undefined;
@@ -3815,6 +3825,8 @@ export class MeshBridge {
   async start(): Promise<void> {
     if (this.#stopped) throw relayUnavailable();
     this.#ready = false;
+    this.#unaddressedRefreshMs = parseBridgeUnaddressedRefreshMs(process.env.FABRIC_BRIDGE_UNADDRESSED_REFRESH_MS);
+    this.#log(`bridge: unaddressed membership refresh ${this.#unaddressedRefreshMs} ms`);
     // Cursors recover events, not presence. A reconnect may follow lease expiry or pruning,
     // even when this instance's previous presence pass would not yet be due (#5036).
     this.#presenceAt = Number.NEGATIVE_INFINITY;
@@ -4145,7 +4157,7 @@ export class MeshBridge {
   /** Only the coordinator/step boundary runs miss-triggered presence work, never an event.
    * Join at most one pass: an older in-flight sample leaves the versioned obligation pending. */
   async #refreshUnaddressedMembership(): Promise<void> {
-    this.#unaddressedRefreshAt = Date.now() + UNADDRESSED_REFRESH_MS;
+    this.#unaddressedRefreshAt = Date.now() + this.#unaddressedRefreshMs;
     await this.syncPresence();
   }
 
@@ -4153,7 +4165,7 @@ export class MeshBridge {
     if (this.#stopped) return;
     this.#unaddressedRefreshVersion++;
     if (this.#unaddressedRefreshAt !== undefined) return;
-    this.#unaddressedRefreshAt = Date.now() + UNADDRESSED_REFRESH_MS;
+    this.#unaddressedRefreshAt = Date.now() + this.#unaddressedRefreshMs;
     this.#wake?.();
   }
 
@@ -4600,7 +4612,7 @@ export class MeshBridge {
       if (!unaddressedRefreshed) {
         // The coordinator owns this sample. Do not race its timer with an inline refresh
         // or spin on an expired retry deadline while its mirror is still settling.
-        this.#membershipRetryAt[direction] = Math.max(this.#unaddressedRefreshAt ?? 0, Date.now() + UNADDRESSED_REFRESH_MS);
+        this.#membershipRetryAt[direction] = Math.max(this.#unaddressedRefreshAt ?? 0, Date.now() + this.#unaddressedRefreshMs);
         return { forwarded, dropped };
       }
       this.#unaddressedSequence = undefined;

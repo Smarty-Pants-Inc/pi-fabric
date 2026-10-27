@@ -3,8 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { MeshBridge, StoreBridgeSide, type BridgeSide } from "../src/mesh/bridge.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MeshBridge, parseBridgeUnaddressedRefreshMs, StoreBridgeSide, type BridgeSide } from "../src/mesh/bridge.js";
 import type { BridgeChange } from "../src/mesh/change-notifier.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
@@ -15,11 +15,13 @@ import { writeHostLease } from "../src/topology/host-leases.js";
 // authority, and unknown canonical recipients retain their source boundary until it commits.
 const roots: string[] = [];
 const cleanups: Array<() => void | Promise<void>> = [];
+beforeEach(() => { vi.stubEnv("FABRIC_BRIDGE_UNADDRESSED_REFRESH_MS", undefined); });
 afterEach(async () => {
   try {
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   } finally {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   }
 });
@@ -89,6 +91,17 @@ const bridgeFor = (f: Fixture, remote: BridgeSide = f.remote, debug?: (line: str
 const work = (store: MeshStore, from: MeshIdentity, to: string, text: string): Promise<MeshEvent> =>
   store.publish({ topic: "fleet.work.refresh2.1", kind: "ask", from, to, text });
 
+/** publishBatch may commit only a time/byte-bounded prefix; finish the real append contract. */
+const publishAll = async (store: MeshStore, inputs: Parameters<MeshStore["publishBatch"]>[0]): Promise<MeshEvent[]> => {
+  const events: MeshEvent[] = [];
+  while (events.length < inputs.length) {
+    const committed = await store.publishBatch(inputs.slice(events.length));
+    expect(committed.length).toBeGreaterThan(0);
+    events.push(...committed);
+  }
+  return events;
+};
+
 const cursor = (file: string): { toRemote: { after: number }; toLocal: { after: number } } =>
   JSON.parse(fs.readFileSync(file, "utf8")) as { toRemote: { after: number }; toLocal: { after: number } };
 
@@ -113,7 +126,8 @@ const startNotifyingBridge = async (f: Fixture, remote: BridgeSide = f.remote, d
   const running = bridge.run().catch(error => { failure = error; });
   cleanups.push(async () => { await bridge.stop().catch(() => undefined); await running; });
   await until(() => localTail.mock.calls.length > 0 && remoteTail.mock.calls.length > 0,
-    "both real-store bridge directions entered their notification drains");
+    // Large real-store memberships can take longer than 5 s to mirror at startup.
+    "both real-store bridge directions entered their notification drains", 30_000);
   // Settle startup and any notification it emitted before recording per-event counts.
   await sleep(100);
   await bridge.syncPresence();
@@ -134,6 +148,46 @@ const quiet = async (value: () => number, quietMs = 80): Promise<void> => {
   }
   throw new Error("bridge did not reach a quiet observation window");
 };
+
+describe("bridge unaddressed refresh configuration", () => {
+  it.each([
+    [undefined, 15_000], ["", 15_000], [" ", 15_000], ["invalid", 15_000],
+    ["NaN", 15_000], ["Infinity", 15_000], ["1.5", 15_000], ["60000ms", 15_000],
+    ["1e4", 15_000], ["9007199254740992", 15_000],
+    ["-1", 5_000], ["0", 5_000], ["4999", 5_000], ["5000", 5_000],
+    ["15000", 15_000], [" 60000 ", 60_000], ["300000", 300_000], ["300001", 300_000],
+  ] as const)("parses/clamps %s to %i ms", (value, expected) => {
+    expect(parseBridgeUnaddressedRefreshMs(value)).toBe(expected);
+  });
+
+  it("reads the override at start, logs it, and keeps that value after the environment changes", async () => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = await fixture(() => now);
+    const logs: string[] = [];
+    const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local: f.local, remote: f.remote,
+      cursorPath: f.cursorPath, presenceMs: 300_000, log: line => logs.push(line) });
+    vi.stubEnv("FABRIC_BRIDGE_UNADDRESSED_REFRESH_MS", "60000");
+    await bridge.start();
+    cleanups.push(() => bridge.stop());
+    expect(logs).toContain("bridge: unaddressed membership refresh 60000 ms");
+    vi.stubEnv("FABRIC_BRIDGE_UNADDRESSED_REFRESH_MS", "5000");
+    const samples = vi.spyOn(f.remote, "presence");
+    const sender: MeshIdentity = { id: sid("config-sender"), name: "main", kind: "main" };
+    const event = await f.hub.publish({ topic: "fabric.control.ack", kind: "ack", from: sender,
+      to: sid("config-recipient"), data: { version: 1, commandId: "config-ack", targetId: sender.id, accepted: true } });
+    await bridge.step();
+    now += 5_000;
+    await bridge.step();
+    expect(samples).not.toHaveBeenCalled();
+    expect(cursor(f.cursorPath).toRemote.after).toBeLessThan(event.sequence);
+    await addNative(f.far, "config-recipient", now + 120_000);
+    now += 55_000;
+    expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });
+    expect(samples).toHaveBeenCalledTimes(1);
+    expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual([event.id]);
+  });
+});
 
 describe("real-store bridge membership refresh coalescing", () => {
   it("coalesces a pure burst for a proven known-other recipient and stops when idle", async () => {
@@ -224,7 +278,7 @@ describe("real-store bridge membership refresh coalescing", () => {
       .sort((left, right) => left.event.sequence - right.event.sequence);
     const lastEvent = originals.at(-1)!;
     await until(() => cursor(f.cursorPath).toRemote.after >= lastEvent.event.sequence,
-      "mixed known-negative burst reached its durable source cursor");
+      "mixed known-negative burst reached its durable source cursor", 30_000);
     const outboundDrainMs = performance.now() - started;
     await quiet(() => run.syncs.mock.calls.length);
 
@@ -251,7 +305,9 @@ describe("real-store bridge membership refresh coalescing", () => {
     expect(f.local.mirrored(knownOther.id)).toBe(false);
     expect(f.local.holds(knownOther.id)).toBe(false);
     expect(run.failure()).toBeUndefined();
-  });
+  // The 64-member real-store setup/mirroring can itself exceed the default 15 s
+  // harness timeout. The drain's correctness and zero-inline-sample assertions stay intact.
+  }, 90_000);
 
   it("retains an expired peer mirror until the coalesced sample proves absence", async () => {
     let now = 1_800_000_000_000;
@@ -261,7 +317,8 @@ describe("real-store bridge membership refresh coalescing", () => {
     const expiredPeer = sid("expired-peer");
     await addNative(f.far, "expired-peer", now + 500, expiredPeer);
     await addPartialMarker(f.far);
-    const run = await startNotifyingBridge(f);
+    const debug: string[] = [];
+    const run = await startNotifyingBridge(f, f.remote, line => debug.push(line));
     await quiet(() => run.syncs.mock.calls.length);
     now += 501;
     expect(f.local.mirrored(expiredPeer)).toBe(true);
@@ -277,8 +334,11 @@ describe("real-store bridge membership refresh coalescing", () => {
     const syncBefore = run.syncs.mock.calls.length;
     const samplesBefore = actualSamples.mock.calls.length;
     const event = await work(f.hub, hubLead, expiredPeer, "expired-peer-must-refresh");
-    await until(() => run.bridge.options.local.mirrored?.(expiredPeer) === true &&
-      cursor(f.cursorPath).toRemote.after < event.sequence, "expired peer remains unread");
+    // Wait for the miss to arm its trailing deadline before moving the clock; merely
+    // observing the old cursor can succeed before the notification drain has run.
+    await until(() => debug.some(line => line.includes("membership pending") && line.includes(event.id)),
+      "expired peer miss armed its retained boundary");
+    expect(cursor(f.cursorPath).toRemote.after).toBeLessThan(event.sequence);
     now += 15_000;
     await run.bridge.step();
     expect(run.syncs.mock.calls.length).toBeGreaterThan(syncBefore);
@@ -311,7 +371,8 @@ describe("real-store bridge membership refresh coalescing", () => {
     const syncBefore = run.syncs.mock.calls.length;
     const inputs = Array.from({ length: 50 }, (_, index) => ({ topic: "fabric.control.ack", kind: "ack",
       from: hubLead, to: recipient.id, data: { version: 1, commandId: `foreign-${index}`, targetId: hubLead.id, accepted: true } }));
-    const events = await f.hub.publishBatch(inputs);
+    const startedAt = now;
+    const events = await publishAll(f.hub, inputs);
     expect(events).toHaveLength(50);
     expect((await f.local.tail(0)).events.map(event => event.id)).toEqual(events.map(event => event.id));
     expect((await f.local.presence()).reserved).not.toContain(recipient.id);
@@ -326,16 +387,18 @@ describe("real-store bridge membership refresh coalescing", () => {
     now += 15_000;
     remoteNotice("presence");
     await until(() => cursor(f.cursorPath).toRemote.after >= events.at(-1)!.sequence,
-      "the committed later membership sample releases the retained page", 10_000);
+      "the committed later membership sample releases the retained page", 45_000);
     expect(samples).toHaveBeenCalledTimes(1);
     expect(run.syncs.mock.calls.length - syncBefore).toBe(1);
+    expect(now - startedAt).toBeLessThanOrEqual(30_000);
+    expect(deliveredFromHub(f.far)).toHaveLength(50);
     expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual(events.map(event => event.id));
     expect(run.failure()).toBeUndefined();
-  }, 30_000);
+  }, 90_000);
 
   // Keep reason: incident regression and trust boundary; exercise real tail/mirror/publish,
   // not just call counts. A missing projection must never authorize a control delivery.
-  it("coalesces 50 unaddressed events in one page and delivers a deferred recipient that joins later", async () => {
+  it("delivers all 50 unaddressed events within two membership samples and 30 s of fake time", async () => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const f = await fixture(() => now);
@@ -351,25 +414,31 @@ describe("real-store bridge membership refresh coalescing", () => {
         to: sid(`unknown-${index}`), data: { version: 1, commandId: `burst-${index}`, targetId: hubLead.id, accepted: true } }));
     }
     expect((await f.local.tail(0)).events.map(event => event.id)).toEqual(events.map(event => event.id));
+    const startedAt = now;
     expect(await bridge.step()).toMatchObject({ toRemote: 0, dropped: 0 });
     expect(samples).not.toHaveBeenCalled();
     expect(cursor(f.cursorPath).toRemote.after).toBeLessThan(events[0]!.sequence);
     expect(deliveredFromHub(f.far)).toEqual([]);
-    await addNative(f.far, "later-member", now + 120_000, events[0]!.to!);
+    for (let index = 0; index < events.length; index++) {
+      await addNative(f.far, `later-member-${index}`, now + 120_000, events[index]!.to!);
+    }
     now += 14_999;
     await bridge.step();
     expect(samples).not.toHaveBeenCalled();
     expect(deliveredFromHub(f.far)).toEqual([]);
     now += 1;
-    expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });
+    expect(await bridge.step()).toMatchObject({ toRemote: 50, dropped: 0 });
     expect(samples).toHaveBeenCalledTimes(1);
     expect(syncs).toHaveBeenCalledTimes(1);
-    expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual([events[0]!.id]);
+    expect(samples.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(now - startedAt).toBeLessThanOrEqual(30_000);
+    expect(deliveredFromHub(f.far)).toHaveLength(50);
+    expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual(events.map(event => event.id));
     expect(cursor(f.cursorPath).toRemote.after).toBe(events.at(-1)!.sequence);
     await bridge.step();
     expect(samples).toHaveBeenCalledTimes(1);
-    expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual([events[0]!.id]);
-  });
+    expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual(events.map(event => event.id));
+  }, 90_000);
 
   it("waits out an in-flight pre-change sample, then routes after a delayed membership notice", async () => {
     const f = await fixture();

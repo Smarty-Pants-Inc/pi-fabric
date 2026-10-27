@@ -2008,7 +2008,24 @@ export class StoreBridgeSide implements BridgeSide {
         }
         // A handoff a native voided goes in this commit: the void lasts if that native leaves again.
         if (!partial) for (const entry of scan.voided) ops.push({ kind: "delete", key: entry.key, ifVersion: entry.version, onConflict: "skip" });
-        return { ops, leases, removed, judged: livenessSensitive
+        const changedKeys = new Set(ops.map(op => op.key));
+        const leaseContent = ({ mirror, ...fields }: FabricHostLease): string => settled({ ...fields,
+          // A newer observation alone does not require a replacement while the held one is healthy.
+          mirror: mirror && { remoteHost: mirror.remoteHost, bridgeProcess: mirror.bridgeProcess } });
+        const renewals = leases.filter(lease => {
+          // Participant activity is row content too: refresh its owner's lease in the same pass.
+          if (changedKeys.has(keyFor(HOST_PREFIX, lease.id)) || changedKeys.has(keyFor(PARTICIPANT_PREFIX, lease.id))) return true;
+          const held = scan.leases.get(lease.id);
+          if (!held) return true;
+          const deadline = held.mirror ? Math.min(held.expiresAt, held.mirror.observedAt +
+            Math.min(BRIDGE_LEASE_MS, held.mirror.sourceExpiresAt - held.mirror.sourceObservedAt)) : held.expiresAt;
+          // Keep short/shortened samples, missing authority, history repair and takeovers on the
+          // existing fenced effect path. Skipping never extends a silent peer's stored deadline.
+          if (deadline - this.now() <= BRIDGE_LEASE_MS / 2 || deadline !== held.expiresAt || lease.expiresAt < deadline) return true;
+          const { historySeenFloor: _floor, ...next } = lease;
+          return leaseContent(held) !== leaseContent(next);
+        });
+        return { ops, leases: renewals, removed, judged: livenessSensitive
           ? { livenessWindow: leaseLivenessWindow(scan.leases, scan.now) } : {} };
     };
     // Cap sampled authority at its ORIGINAL translated source deadline after any wait. A sample

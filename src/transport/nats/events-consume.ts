@@ -64,6 +64,8 @@ export interface NatsActorEventsConsumerOptions {
   readonly directoryReady?: () => boolean;
   /** Shared readiness recheck cadence; tests may shorten it. Production defaults to one check per minute. */
   readonly directoryReadyRecheckMs?: number;
+  /** Wake a gated consumer when the participant directory changes; the timer remains a fallback. */
+  readonly directoryReadyChanged?: (signal: AbortSignal) => Promise<void>;
   /** Called once per prolonged not-ready episode when JetStream reports pending deliveries. */
   readonly onDirectoryStall?: (stall: { stream: string; durable: string; pendingCount: number; since: number }) => void | Promise<void>;
   /** Test seam for the bounded stall alarm; defaults to 120 seconds. */
@@ -196,6 +198,7 @@ interface DeliveryRun {
   messages: ConsumerMessages | undefined;
   iterator?: AsyncIterator<JsMsg>;
   stopping: boolean;
+  iteratorStarted: boolean;
   stopWaiters: Set<() => void>;
   stop(): void;
 }
@@ -203,28 +206,32 @@ interface ReadinessWaiter {
   readonly ready: () => boolean;
   readonly stopping: () => boolean;
   readonly intervalMs: number;
-  dueAt: number;
   finish: (ready: boolean) => void;
 }
 const readinessWaiters = new Set<ReadinessWaiter>();
 let readinessTimer: ReturnType<typeof setTimeout> | undefined;
+let readinessTimerIntervalMs: number | undefined;
 const scheduleReadinessCheck = (): void => {
+  if (readinessWaiters.size === 0) {
+    if (readinessTimer) clearTimeout(readinessTimer);
+    readinessTimer = undefined;
+    readinessTimerIntervalMs = undefined;
+    return;
+  }
+  let intervalMs = Number.POSITIVE_INFINITY;
+  for (const waiter of readinessWaiters) intervalMs = Math.min(intervalMs, waiter.intervalMs);
+  if (readinessTimer && readinessTimerIntervalMs !== undefined && readinessTimerIntervalMs <= intervalMs) return;
   if (readinessTimer) clearTimeout(readinessTimer);
-  readinessTimer = undefined;
-  if (readinessWaiters.size === 0) return;
-  let dueAt = Number.POSITIVE_INFINITY;
-  for (const waiter of readinessWaiters) dueAt = Math.min(dueAt, waiter.dueAt);
+  readinessTimerIntervalMs = intervalMs;
   readinessTimer = setTimeout(() => {
     readinessTimer = undefined;
-    const now = Date.now();
+    readinessTimerIntervalMs = undefined;
     for (const waiter of [...readinessWaiters]) {
-      if (waiter.dueAt > now) continue;
       if (waiter.stopping()) waiter.finish(false);
       else if (waiter.ready()) waiter.finish(true);
-      else waiter.dueAt = now + waiter.intervalMs;
     }
     scheduleReadinessCheck();
-  }, Math.max(1, dueAt - Date.now()));
+  }, intervalMs);
   readinessTimer.unref();
 };
 const waitForReadinessOrStop = (
@@ -232,25 +239,35 @@ const waitForReadinessOrStop = (
   ready: () => boolean,
   stopping: () => boolean,
   intervalMs: number,
+  directoryReadyChanged?: (signal: AbortSignal) => Promise<void>,
 ): Promise<boolean> => {
   if (run.stopping || stopping()) return Promise.resolve(false);
   if (ready()) return Promise.resolve(true);
   return new Promise(resolve => {
     let settled = false;
     let waiter: ReadinessWaiter;
+    const changed = new AbortController();
     const finish = (isReady: boolean): void => {
       if (settled) return;
       settled = true;
       readinessWaiters.delete(waiter);
       run.stopWaiters.delete(onStop);
+      changed.abort();
       scheduleReadinessCheck();
       resolve(isReady);
     };
     const onStop = (): void => finish(false);
-    waiter = { ready, stopping, intervalMs, dueAt: Date.now() + intervalMs, finish };
+    waiter = { ready, stopping, intervalMs, finish };
     run.stopWaiters.add(onStop);
     readinessWaiters.add(waiter);
     scheduleReadinessCheck();
+    if (directoryReadyChanged) {
+      try {
+        void directoryReadyChanged(changed.signal).then(() => finish(ready()), () => {
+          // The shared timer remains the fallback if a directory watch fails.
+        });
+      } catch { /* The shared timer remains the fallback if a directory watch fails. */ }
+    }
   });
 };
 const watchReadinessWhilePulling = (run: DeliveryRun, observe: () => boolean, intervalMs: number): (() => void) => {
@@ -268,7 +285,6 @@ const watchReadinessWhilePulling = (run: DeliveryRun, observe: () => boolean, in
     ready: () => { observe(); return false; },
     stopping: () => run.stopping,
     intervalMs,
-    dueAt: Date.now() + intervalMs,
     finish: () => finish(),
   };
   run.stopWaiters.add(onStop);
@@ -307,10 +323,12 @@ const startGroup = async (
     catch (cause) { throw setupFailure(cause, stream, durable); }
   };
   const retryBackoff = consumerBackoffNs(retryDelayScheduleMs);
+  const expectedAckWait = retryBackoff[0] ?? ACK_WAIT_NS;
   const mutableConfig = (filters: string[]) => ({
     filter_subject: "",
     filter_subjects: filters,
-    ack_wait: ACK_WAIT_NS,
+    // nats-server enforces AckWait = BackOff[0] whenever BackOff is configured.
+    ack_wait: expectedAckWait,
     max_deliver: -1,
     max_ack_pending: MAX_ACK_PENDING,
     backoff: retryBackoff,
@@ -356,13 +374,13 @@ const startGroup = async (
       // Actor-event durables intentionally never expire (inactive_threshold: 0); the seven-day
       // default in provision.ts applies to bounded transport inbox durables, not these cursors.
       const config = info.config;
-      const boundedPolicyDrift = config.ack_wait !== ACK_WAIT_NS || config.max_ack_pending !== MAX_ACK_PENDING || config.inactive_threshold !== 0;
+      const boundedPolicyDrift = config.ack_wait !== expectedAckWait || config.max_ack_pending !== MAX_ACK_PENDING || (config.inactive_threshold ?? 0) !== 0;
       const retryPolicyDrift = config.max_deliver !== -1 || JSON.stringify(config.backoff) !== JSON.stringify(retryBackoff);
       if (boundedPolicyDrift) {
         // These settings are required to preserve the durable's lease and delivery bounds; do not
         // start pulling if JetStream refuses to repair them.
         await api.update(stream, durable, {
-          ack_wait: ACK_WAIT_NS, max_ack_pending: MAX_ACK_PENDING, inactive_threshold: 0,
+          ack_wait: expectedAckWait, max_ack_pending: MAX_ACK_PENDING, inactive_threshold: 0,
           max_deliver: -1, backoff: retryBackoff,
         });
       } else if (retryPolicyDrift) {
@@ -462,7 +480,7 @@ const startGroup = async (
     const initialMessages = observeReadiness() ? await openMessages() : undefined;
     const allowed = new Set(subjects);
     const run: DeliveryRun = {
-      messages: initialMessages, stopping: false, stopWaiters: new Set(),
+      messages: initialMessages, stopping: false, iteratorStarted: false, stopWaiters: new Set(),
       stop() {
         if (this.stopping) return;
         this.stopping = true;
@@ -474,19 +492,20 @@ const startGroup = async (
       try {
         while (!run.stopping && !closing) {
           if (!observeReadiness()) {
-            await waitForReadinessOrStop(run, observeReadiness, () => run.stopping || closing, readyRecheckMs);
+            await waitForReadinessOrStop(run, observeReadiness, () => run.stopping || closing, readyRecheckMs, options.directoryReadyChanged);
             continue;
           }
           const messages = run.messages ??= await openMessages();
           const iterator = run.iterator ??= messages[Symbol.asyncIterator]();
           while (!run.stopping && !closing) {
             if (!observeReadiness()) {
-              await waitForReadinessOrStop(run, observeReadiness, () => run.stopping || closing, readyRecheckMs);
+              await waitForReadinessOrStop(run, observeReadiness, () => run.stopping || closing, readyRecheckMs, options.directoryReadyChanged);
               continue;
             }
-            // The JetStream pull owns its idle expiry/heartbeat. Do not install a
-            // per-pull polling timer; readiness is rechecked when the pull yields.
+            // All active pulls share one readiness timer, rather than each installing
+            // a 60-second wake; yielded messages still recheck before admission.
             const stopWatchingReadiness = watchReadinessWhilePulling(run, observeReadiness, readyRecheckMs);
+            run.iteratorStarted = true;
             const pulled = await raceDeliveryStop(iterator.next(), run).finally(stopWatchingReadiness);
             if (pulled.stopped) break;
             const next = pulled.value;
@@ -533,6 +552,7 @@ const startGroup = async (
               continue;
             }
           }
+          if (run.stopping || closing) break;
           const error = await messages.closed();
           run.messages = undefined;
           if (error) throw error;
@@ -551,20 +571,16 @@ const startGroup = async (
     clearDirectoryAlarm();
     run.stop();
     const messages = run.messages;
-    let closingMessages: Promise<unknown> | undefined;
-    try { if (messages) closingMessages = Promise.resolve(messages.close()); }
-    catch (error) { closingMessages = Promise.reject(error); }
-    try {
-      // Closing the source wakes a pending next(); return resumes a yielded iterator
-      // (for example while onMessage is still running) so messages.closed() can settle.
-      try { await run.iterator?.return?.(); }
-      finally {
-        try { await closingMessages; }
-        finally { await messages?.closed(); }
-      }
-    } finally {
-      if (active === run) active = undefined;
+    // ConsumerMessages.close() queues its stop; with an unstarted iterator there is
+    // nobody to consume that queue, and nats.js may never settle closed(). Start the
+    // stop directly and detach its completion so every readiness/open interleaving closes.
+    try { if (messages) void Promise.resolve(messages.close()).catch(() => undefined); }
+    catch { /* The local run is stopped even if the source close hook throws. */ }
+    if (run.iteratorStarted) {
+      try { void Promise.resolve(run.iterator?.return?.()).catch(() => undefined); }
+      catch { /* Closing the source remains authoritative. */ }
     }
+    if (active === run) active = undefined;
   };
   const removeDurable = (): Promise<void> => {
     if (!removeTask) {

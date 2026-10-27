@@ -106,8 +106,8 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
     new JetStreamApiError({ code: status, err_code: code, description });
   const statusError = (code: number) => Object.assign(new JetStreamError("private status detail"), { name: "JetStreamStatusError", code });
   const wrapper = (cause?: unknown) => Object.assign(new Error("private request detail", { cause }), { name: "JetStreamNotEnabled" });
-  const fakeJs = ({ kind = "ev", missing = false, recoverCreate = false, incompatible = false, oldRetryPolicy = false, pending = 0, hold = false, deliver }: {
-    kind?: Kind; missing?: boolean; recoverCreate?: boolean; incompatible?: boolean; oldRetryPolicy?: boolean; pending?: number; hold?: boolean; deliver?: JsMsg;
+  const fakeJs = ({ kind = "ev", missing = false, recoverCreate = false, incompatible = false, oldRetryPolicy = false, pending = 0, hold = false, deliver, openMessages }: {
+    kind?: Kind; missing?: boolean; recoverCreate?: boolean; incompatible?: boolean; oldRetryPolicy?: boolean; pending?: number; hold?: boolean; deliver?: JsMsg; openMessages?: Promise<void>;
   } = {}) => {
     const target = resources(kind);
     const calls: Array<{ step: SetupStep | "close" | "delete"; stream: string; durable: string }> = [];
@@ -122,7 +122,7 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
     const info = (durable: string) => ({
       config: { durable_name: incompatible && durable === target.durable ? "wrong-durable" : durable,
         ack_policy: AckPolicy.Explicit, replay_policy: ReplayPolicy.Instant,
-        ack_wait: oldRetryPolicy && durable === target.durable ? 30_000_000_000 : 60_000_000_000,
+        ack_wait: oldRetryPolicy && durable === target.durable ? 30_000_000_000 : 1_000_000_000,
         max_ack_pending: oldRetryPolicy && durable === target.durable ? 1 : 128,
         inactive_threshold: oldRetryPolicy && durable === target.durable ? 604_800_000_000_000 : 0,
         ...(oldRetryPolicy && durable === target.durable ? { max_deliver: 5 } : {
@@ -157,6 +157,7 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
         checkpoint("get", stream, durable);
         return { consume: async () => {
           checkpoint("consume", stream, durable);
+          await openMessages;
           if (deliver) {
             let sent = false;
             let releaseNext!: (result: IteratorResult<JsMsg>) => void;
@@ -284,13 +285,24 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
     const consumer = await start(fake.connection);
     try {
       expect(fake.updates[0]).toEqual({
-        ack_wait: 60_000_000_000, max_ack_pending: 128, inactive_threshold: 0,
+        ack_wait: 1_000_000_000, max_ack_pending: 128, inactive_threshold: 0,
         max_deliver: -1,
         backoff: [1_000_000_000, 5_000_000_000, 15_000_000_000, 30_000_000_000, 30_000_000_000],
       });
       expect(fake.calls.some(call => call.step === "delete")).toBe(false);
       expect(fake.calls.filter(call => call.stream === resources("ev").stream).map(call => call.step))
         .toEqual(["info", "update", "update", "get", "consume"]);
+    } finally { await consumer.close(false); }
+  });
+
+  it("does not reapply AckWait drift that nats-server resolves from BackOff[0]", async () => {
+    const fake = fakeJs();
+    const consumer = await start(fake.connection);
+    try {
+      expect(fake.updates).toEqual([
+        { filter_subject: "", filter_subjects: [`fabric.ev.${org}.mail.inbound`, `fabric.ev.${org}.wake.${actorId}`].sort() },
+        { filter_subject: "", filter_subjects: [`github.${org}.repo.pulls.shard1of1`] },
+      ]);
     } finally { await consumer.close(false); }
   });
 
@@ -379,6 +391,52 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
       if (!stall) throw new Error("directory stall alarm was not recorded");
       expect(stall.since).toBeGreaterThanOrEqual(firstNotReadyAt);
       expect(stall.since).toBeLessThan(firstNotReadyAt + 100);
+    } finally { await consumer.close(false); }
+  });
+
+  it("closes when readiness drops across openMessages without starting the iterator", async () => {
+    let ready = false;
+    let releaseOpen!: () => void;
+    const openMessages = new Promise<void>(resolve => { releaseOpen = resolve; });
+    const fake = fakeJs({ openMessages });
+    const consumer = await startNatsActorEventsConsumer(fake.connection, {
+      org, actorId, topics: ["mail.before"], directoryReady: () => ready, directoryReadyRecheckMs: 60_000,
+      onMessage: async () => "accepted",
+    });
+    try {
+      ready = true;
+      const updating = consumer.updateTopics(["mail.after"]);
+      await waitFor(() => fake.calls.some(call => call.step === "consume"));
+      ready = false;
+      releaseOpen();
+      await resolvesWithin(updating);
+      await resolvesWithin(consumer.close(false));
+    } finally {
+      releaseOpen();
+      await consumer.close(false);
+    }
+  });
+
+  it("resumes a not-ready consumer on directory change instead of waiting for the fallback timer", async () => {
+    let ready = false;
+    let signalChange!: () => void;
+    let waiting!: () => void;
+    const watchStarted = new Promise<void>(resolve => { waiting = resolve; });
+    const fake = fakeJs();
+    const consumer = await startNatsActorEventsConsumer(fake.connection, {
+      org, actorId, topics: ["mail.inbound"], directoryReady: () => ready, directoryReadyRecheckMs: 60_000,
+      directoryReadyChanged: signal => new Promise<void>(resolve => {
+        signalChange = resolve;
+        signal.addEventListener("abort", () => resolve(), { once: true });
+        waiting();
+      }),
+      onMessage: async () => "accepted",
+    });
+    try {
+      await watchStarted;
+      ready = true;
+      signalChange();
+      await waitFor(() => fake.calls.some(call => call.step === "consume"), 1_000);
     } finally { await consumer.close(false); }
   });
 
@@ -579,8 +637,9 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
         org, actorId, topics: ["mail.legacy"], onMessage: async () => "accepted",
       });
       const repaired = await connection.manager.consumers.info(stream, durable);
+      expect(repaired.config.inactive_threshold ?? 0).toBe(0);
       expect(repaired.config).toMatchObject({
-        ack_wait: 60_000_000_000, max_ack_pending: 128, inactive_threshold: 0, max_deliver: -1,
+        ack_wait: 1_000_000_000, max_ack_pending: 128, max_deliver: -1,
         backoff: [1_000_000_000, 5_000_000_000, 15_000_000_000, 30_000_000_000, 30_000_000_000],
         filter_subjects: [`fabric.ev.${org}.mail.legacy`, `fabric.ev.${org}.wake.${actorId}`].sort(),
       });

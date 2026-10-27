@@ -1102,6 +1102,7 @@ export class ActorManager {
   readonly #registryRowEncodings = new Map<string, { instructions: unknown; metadata: string; encoded: string }>();
   #lastRegistrySaveAt = 0;
   readonly #canConsumeMesh: (() => boolean) | undefined;
+  readonly #waitForMeshReadyChange: ((signal: AbortSignal) => Promise<void>) | undefined;
   readonly #slots: ReturnType<typeof slotAdmissionFor>;
   readonly #slotRecovery: ActorSlotRecovery;
   readonly #slotNameRegistries: readonly ActorRegistryStore[];
@@ -1162,6 +1163,8 @@ export class ActorManager {
       meshCursorPath?: string;
       /** Host publication/lease fence, also defers archive retention until initial publication. */
       canConsumeMesh?: () => boolean;
+      /** Optional participant-directory change signal for promptly resuming gated NATS event consumers. */
+      waitForMeshReadyChange?: (signal: AbortSignal) => Promise<void>;
       /** Delegate resident presence to the host heartbeat; never start per-actor retries. */
       presencePublisher?: { refresh: () => Promise<void>; schedule: () => void };
       /** Retry delay for failed presence writes (tests use a short one). */
@@ -1239,6 +1242,7 @@ export class ActorManager {
     this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
     this.#deadSessionReap = options.reapDeadSessionPresence ?? true;
     this.#canConsumeMesh = options.canConsumeMesh;
+    this.#waitForMeshReadyChange = options.waitForMeshReadyChange;
     this.#presencePublisher = options.presencePublisher;
     this.#logs = new ActorLogStore(
       mesh,
@@ -1501,6 +1505,7 @@ export class ActorManager {
         ...(actor.eventsStartAt !== undefined ? { eventsStartAt: actor.eventsStartAt } : {}),
         provision: false,
         directoryReady: () => this.#canConsumeMesh?.() !== false,
+        ...(this.#waitForMeshReadyChange ? { directoryReadyChanged: this.#waitForMeshReadyChange } : {}),
         onDirectoryStall: ({ stream, durable, pendingCount, since }) => {
           const current = this.#actors.get(actorId);
           if (!current || this.#closing) return;

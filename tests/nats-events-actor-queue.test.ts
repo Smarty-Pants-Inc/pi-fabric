@@ -89,7 +89,7 @@ const setupManager = async (count: number, canManageActor: () => boolean = () =>
       residency: "durable", extensions: false }));
   }
   meshConfig.nats.events = true;
-  return { actors, created, start: () => actors.setTopics(created[0]!.id, ["mail.inbound"]) };
+  return { actors, created, mesh, start: () => actors.setTopics(created[0]!.id, ["mail.inbound"]) };
 };
 
 describe("NATS actor event queue admission", () => {
@@ -128,6 +128,9 @@ describe("NATS actor event queue admission", () => {
     const healthyId = created.find(actor => !pending.has(actor.id))!.id;
     await actors.setTopics(healthyId, ["mail.updated"]);
     expect(consumers.get(healthyId)!.updateTopics).toHaveBeenCalledWith(["mail.updated"], true);
+    const consumerOptions = mocks.startConsumer.mock.calls.find(([, options]) => options.actorId === healthyId)?.[1];
+    expect(consumerOptions?.directoryReady?.()).toBe(false);
+    expect(consumerOptions?.onDirectoryStall).toBeTypeOf("function");
 
     vi.useFakeTimers();
     const jitter = vi.spyOn(Math, "random");
@@ -164,6 +167,24 @@ describe("NATS actor event queue admission", () => {
     await actors.remove(healthyId);
     expect(consumers.get(healthyId)!.close).toHaveBeenCalledExactlyOnceWith(true);
   }, 30_000);
+
+  it("publishes the directory-stall alarm through the actor activation alarm path", async () => {
+    let options: NatsActorEventsConsumerOptions | undefined;
+    mocks.startConsumer.mockImplementation(async (_connection, received) => {
+      options = received;
+      return fakeConsumer();
+    });
+    const { actors, created, mesh, start } = await setupManager(1);
+    const publish = vi.spyOn(mesh, "publish");
+    await start();
+    await waitFor(() => options !== undefined);
+    await options!.onDirectoryStall?.({ stream: "FABRIC_EV_TEST_ORG", durable: "ev_actor", pendingCount: 2, since: 123 });
+    expect(publish).toHaveBeenCalledWith(expect.objectContaining({
+      topic: "fabric.alarm.actor-activation", kind: "actor-events-directory-not-ready", to: created[0]!.rootId,
+      data: expect.objectContaining({ actorId: created[0]!.id, stream: "FABRIC_EV_TEST_ORG", durable: "ev_actor", pendingCount: 2, since: 123 }),
+    }));
+    await actors.close();
+  });
 
   it("keeps retrying transient failures with per-actor attempts and a 30 second jitter cap until success", async () => {
     let rejectFirst!: (error: Error) => void;

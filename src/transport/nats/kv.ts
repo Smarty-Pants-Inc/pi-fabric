@@ -502,7 +502,10 @@ export class NatsKvStore implements TransportKv {
             queue.destroy();
             // Only the creation handle owns server state, never the delivery
             // binding. Also cover setup failures, for either storage backend.
-            await deleteConsumer();
+            // On close, wait for the delete; on a reset or retry, fire it and
+            // move on so a slow delete never delays the replacement watch.
+            if (closed || signal.aborted) await deleteConsumer();
+            else void deleteConsumer();
           }
         }
       }

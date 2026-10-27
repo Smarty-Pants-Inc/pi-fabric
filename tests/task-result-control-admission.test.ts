@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
@@ -113,6 +113,8 @@ const runtimeFixture = async () => {
     dispose: () => { disposed = true; }, rebind: () => runtime.bindLifecycle(liveContext, () => true) };
 };
 
+// #17018 hard-link fingerprint scenario is Linux-only; Windows temp-root ownership refuses CI's D:\\ (src/storage/windows-temp-root.ts).
+describe.skipIf(process.platform !== "linux")("task result control admission", () => {
 it("a hard-linked, UI-evicted task result cannot block a real Main heartbeat or exactly-once remote followUp (#17018)", async () => {
   const { base, meshRoot, runRoot, ownerId, runtime, manager, directory, sendMessage, status } = await runtimeFixture();
   const senderId = "session:integrity-observer";
@@ -435,3 +437,4 @@ it("local Main status includes the real runtime's disposed-binding gate even wit
   expect(directory.heartbeatArmed).toBe(true);
   await expect(status()).resolves.toMatchObject({ controlAdmission: "admitted" });
 }, 30_000);
+});

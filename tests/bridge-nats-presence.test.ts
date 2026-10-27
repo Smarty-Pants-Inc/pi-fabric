@@ -581,6 +581,33 @@ describe("file roots -> KV presence under the bridge machine", () => {
     expect(records.map(record => w.leases.values.get(hKey(BRIDGE, record.id))!.revision)).not.toEqual(revisions);
   });
 
+  // Keep: error metadata is an untrusted logging boundary, even when it looks like an identifier.
+  it.each([
+    "sk_live_AbCdEf0123456789_secret_token",
+    "12345678-1234-4234-8234-123456789abc",
+    "ETIMEDOUT-secret",
+    "constructor",
+    "__proto__",
+  ])("maps unknown error names and codes to OTHER (%s)", value => {
+    const summary = natsBridgeErrorSummary({ name: value, code: value, message: "PRIVATE-body" });
+    expect(JSON.parse(summary)).toEqual({ operation: "port", errors: [{ name: "OTHER", code: "OTHER" }] });
+    expect(summary).not.toContain(value);
+    expect(summary).not.toContain("PRIVATE-body");
+  });
+
+  it.each([
+    ["TimeoutError", "ETIMEDOUT", "ETIMEDOUT"],
+    ["NatsError", "503", "503"],
+    ["JetStreamStatusError", 503, "503"],
+    ["Error", "FABRIC_TRANSPORT_DENIED", "FABRIC_TRANSPORT_DENIED"],
+    ["Error", "FABRIC_TRANSPORT_UNAVAILABLE", "FABRIC_TRANSPORT_UNAVAILABLE"],
+    ["Error", "FABRIC_KV_CONFLICT", "FABRIC_KV_CONFLICT"],
+    ["NatsAuthorizationError", "FABRIC_NATS_AUTHORIZATION", "FABRIC_NATS_AUTHORIZATION"],
+  ])("preserves fixed known diagnostic labels (%s, %s)", (name, code, label) => {
+    expect(JSON.parse(natsBridgeErrorSummary({ name, code }))).toEqual({ operation: "port",
+      errors: [{ name, code: label }] });
+  });
+
   it("attributes a singleton presence refresh without wrapping the original failure or changing lease ownership", async () => {
     const w = world();
     const { side, clock } = bridge(w);

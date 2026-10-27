@@ -461,6 +461,10 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
     const info = await consumer.info(true);
     expect(info.config.deliver_policy).toBe(DeliverPolicy.LastPerSubject);
     expect(info.config.ack_policy).toBe("none");
+    // This authenticated fixture grants zero account memory storage. Consumer
+    // state is not stream-data quota; the disposable cursor stays in memory.
+    expect(info.config.mem_storage).toBe(true);
+    expect(info.config.durable_name).toBeUndefined();
     expect(info.config.flow_control).toBe(true);
     await manager.consumers.delete(STREAM, info.name);
     // The official ordered push consumer reports deletion after two missed 30s heartbeats.

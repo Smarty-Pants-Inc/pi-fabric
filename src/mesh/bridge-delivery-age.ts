@@ -2,6 +2,9 @@ import { performance } from "node:perf_hooks";
 import type { MeshEvent } from "./store.js";
 
 export type BridgeDeliveryDirection = "toRemote" | "toLocal";
+export type BridgeDrainPhase = "readMs" | "resolveMs" | "membershipWaitMs" | "filterMs" | "publishMs" | "checkpointMs" | "idleMs";
+const drainTotals = () => ({ pages: 0, events: 0, readMs: 0, resolveMs: 0, membershipWaitMs: 0,
+  membershipWaitCount: 0, membershipWaitMaxMs: 0, filterMs: 0, publishMs: 0, checkpointMs: 0, idleMs: 0 });
 export type BridgeDeliveryAgeReason = "delivery-age" | "ack-age" | "command-deadline";
 export interface BridgeDeliveryAgeAlarm {
   v: 1;
@@ -84,6 +87,9 @@ export class BridgeDeliveryAgeMonitor {
   readonly #samples: Record<BridgeDeliveryDirection, Array<{ deliveryMs: number; ackMs: number; lagSequences: number; lagSeconds: number }>> = {
     toRemote: [], toLocal: [],
   };
+  readonly #drain = new Map<BridgeDeliveryDirection, {
+    phase: BridgeDrainPhase; since: number; totals: ReturnType<typeof drainTotals>; membershipSince?: number;
+  }>();
   #nextPendingId = 0;
   #bucketStart: number | undefined;
   #flushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -96,6 +102,44 @@ export class BridgeDeliveryAgeMonitor {
     this.#windowMs = options.windowMs ?? BRIDGE_DELIVERY_AGE_WINDOW_MS;
     if (!(Number.isSafeInteger(this.#thresholdMs) && this.#thresholdMs > 0)) throw new Error("delivery-age threshold must be a positive integer");
     if (!(Number.isSafeInteger(this.#windowMs) && this.#windowMs > 0)) throw new Error("delivery-age window must be a positive integer");
+  }
+
+  /** Exclusive phases; membership count records starts, max includes in-flight waits across windows. */
+  drainPhase(direction: BridgeDeliveryDirection, phase: BridgeDrainPhase): () => void {
+    this.#openWindow();
+    const now = this.#monotonic();
+    let state = this.#drain.get(direction);
+    if (!state) {
+      state = { phase: "idleMs", since: now, totals: drainTotals() };
+      this.#drain.set(direction, state);
+    }
+    const previous = state.phase;
+    this.#accrueDrain(direction);
+    state.phase = phase;
+    if (phase === "membershipWaitMs") {
+      state.totals.membershipWaitCount++;
+      state.membershipSince = now;
+    }
+    return () => {
+      this.#accrueDrain(direction);
+      state.phase = previous;
+      if (phase === "membershipWaitMs") delete state.membershipSince;
+    };
+  }
+
+  drainPage(direction: BridgeDeliveryDirection, events: number): void {
+    const totals = this.#drain.get(direction)!.totals;
+    totals.pages++;
+    totals.events += events;
+  }
+
+  #accrueDrain(direction: BridgeDeliveryDirection): void {
+    const state = this.#drain.get(direction)!;
+    const now = this.#monotonic();
+    state.totals[state.phase] += Math.max(0, now - state.since);
+    if (state.membershipSince !== undefined) state.totals.membershipWaitMaxMs =
+      Math.max(state.totals.membershipWaitMaxMs, now - state.membershipSince);
+    state.since = now;
   }
 
   /** Start before the destination append; the returned receipt must be completed or canceled. */
@@ -239,15 +283,24 @@ export class BridgeDeliveryAgeMonitor {
   }
 
   #record(direction: BridgeDeliveryDirection, deliveryMs: number, ackMs: number, pending: Pending): void {
+    this.#openWindow();
+    this.#samples[direction].push({ deliveryMs, ackMs, lagSequences: pending.cursorLagSequences, lagSeconds: pending.cursorLagSeconds });
+  }
+
+  #openWindow(): void {
+    if (this.#closed) return;
     const now = this.#clock();
     const bucket = Math.floor(now / this.#windowMs) * this.#windowMs;
     if (this.#bucketStart !== undefined && this.#bucketStart !== bucket) this.#flush();
-    if (this.#bucketStart === undefined) this.#bucketStart = bucket;
-    this.#samples[direction].push({ deliveryMs, ackMs, lagSequences: pending.cursorLagSequences, lagSeconds: pending.cursorLagSeconds });
+    if (this.#bucketStart === undefined) {
+      this.#bucketStart = bucket;
+      for (const state of this.#drain.values()) if (state.phase === "idleMs") state.since = this.#monotonic();
+    }
     if (this.#flushTimer === undefined) {
       this.#flushTimer = setTimeout(() => {
         this.#flushTimer = undefined;
         this.#flush();
+        if ([...this.#drain.values()].some(state => state.phase !== "idleMs")) this.#openWindow();
       }, Math.max(0, this.#bucketStart + this.#windowMs - now));
       this.#flushTimer.unref?.();
     }
@@ -271,6 +324,12 @@ export class BridgeDeliveryAgeMonitor {
     if (this.#samples.toRemote.length || this.#samples.toLocal.length) {
       this.options.log?.(`bridge delivery-age v1 peer=${this.options.peer} minute=${new Date(bucketStart).toISOString()} ` +
         `${describe("toRemote")} ${describe("toLocal")}`);
+    }
+    for (const [direction, state] of this.#drain) {
+      this.#accrueDrain(direction);
+      try { this.options.log?.(`bridge drain-time v1 peer=${this.options.peer} dir=${direction} minute=${new Date(bucketStart).toISOString()} ` +
+        Object.entries(state.totals).map(([key, value]) => `${key}=${Math.round(value)}`).join(" ")); } catch { /* Diagnostics only. */ }
+      state.totals = drainTotals();
     }
     this.#samples.toRemote.length = 0;
     this.#samples.toLocal.length = 0;

@@ -913,6 +913,8 @@ export class StoreBridgeSide implements BridgeSide {
   #skippedRoots: ReadonlySet<string> | undefined;
   #leaseProcess: Promise<BridgeLeaseProcess | undefined> | undefined;
   readonly #reportedUnreadable = new Set<string>();
+  /** Logical event bytes inspected by the last recovery page, not archive I/O bytes. */
+  recoveryReadCost: { events: number; eventBytes: number; maxSliceMs: number } | undefined;
 
   constructor(
     readonly store: MeshStore,
@@ -2602,28 +2604,37 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   async bridgedIds(after: number): Promise<BridgedIds> {
-    // At the saved mark there is usually no recovery work. Do not seed sequence hints
-    // by scanning a large log just to discover that its committed head is already covered.
-    if (after >= (await this.latestCursor()).through) return { ids: [], through: after, done: true };
+    this.recoveryReadCost = undefined;
+    this.#ingressAbort.signal.throwIfAborted();
+    // Bound inspected events, not matching IDs. The wire/cursor shape stays protocol-2:
+    // even a page with no IDs advances through, and is not EOF until the head is covered.
+    const horizon = (await this.latestCursor()).through;
+    if (after >= horizon) return { ids: [], through: after, done: true };
+    await new Promise<void>(resolve => setImmediate(resolve));
+    this.#ingressAbort.signal.throwIfAborted();
     const ids: string[] = [];
-    let cursor = after;
-    while (true) {
-      const page = await this.store.readAsync({ after: cursor, limit: this.store.maxReadEvents });
-      for (const event of page) {
-        const stamp = bridgeStampOf(event);
-        if ((stamp?.via ?? stamp?.from) === this.peer) ids.push(stamp!.id);
-        else if (isRelayReceipt(event)) {
-          const prefix = `${RELAY_RECEIPT_PREFIX}${encodeURIComponent(this.peer)}:`;
-          const key = event.id.startsWith(prefix) ? event.id : event.dedupeKey;
-          if (key?.startsWith(prefix)) {
-            try { ids.push(decodeURIComponent(key.slice(prefix.length))); } catch { /* malformed receipt grants no recovery */ }
-          }
+    // Larger than a delivery frame to avoid reparsing an archive day once per 500
+    // events; still below the existing 50k matching-ID/wire cap even if ALL match.
+    const limit = Math.min(10_000, BRIDGED_IDS_PAGE);
+    const sliceStarted = monotonicClock.now();
+    const page = this.store.readRecovery(after, limit);
+    const prefix = `${RELAY_RECEIPT_PREFIX}${encodeURIComponent(this.peer)}:`;
+    for (const event of page) {
+      if (event.sequence > horizon) break;
+      const stamp = bridgeStampOf(event);
+      if ((stamp?.via ?? stamp?.from) === this.peer) ids.push(stamp!.id);
+      else if (isRelayReceipt(event)) {
+        const key = event.id.startsWith(prefix) ? event.id : event.dedupeKey;
+        if (key?.startsWith(prefix)) {
+          try { ids.push(decodeURIComponent(key.slice(prefix.length))); } catch { /* malformed receipt grants no recovery */ }
         }
       }
-      if (page.length < this.store.maxReadEvents) return { ids, through: page.at(-1)?.sequence ?? cursor, done: true };
-      cursor = page.at(-1)!.sequence;
-      if (ids.length >= BRIDGED_IDS_PAGE) return { ids, through: cursor, done: false };
     }
+    this.recoveryReadCost = { events: page.length,
+      eventBytes: page.reduce((bytes, event) => bytes + Buffer.byteLength(JSON.stringify(event)) + 1, 0),
+      maxSliceMs: monotonicClock.now() - sliceStarted };
+    const through = Math.min(horizon, page.at(-1)?.sequence ?? horizon);
+    return { ids, through, done: through >= horizon || page.length < limit };
   }
 
 }
@@ -3913,17 +3924,27 @@ export class MeshBridge {
         unaddressed.safety > 0 ? `; safety wakes advancing retained boundaries ${unaddressed.safety}` : ""})`);
   }
 
-  async #reconcileSeen(): Promise<void> {
+  async #reconcileSeen(budgetMs = this.options.startDeadlineMs ?? BRIDGE_START_DEADLINE_MS): Promise<void> {
     const cursor = this.#cursor!; // start() initialized it, or run() already observed readiness.
-    const [toRemote, toLocal] = await Promise.all([
-      allBridgedIds(this.options.remote, cursor.toRemote.mark),
-      allBridgedIds(this.options.local, cursor.toLocal.mark),
-    ]);
-    this.#seen = { toRemote, toLocal };
+    const started = monotonicClock.now();
+    let failed = false;
+    const check = (): void => {
+      if (this.#stopped || failed) throw new Error("Bridge recovery cancelled");
+      if (this.#notificationError) throw this.#notificationError;
+      if (monotonicClock.now() - started >= budgetMs) throw new Error(`Bridge recovery exceeded ${budgetMs} ms startup budget`);
+    };
+    try {
+      const [toRemote, toLocal] = await Promise.all([
+        allBridgedIds(this.options.remote, cursor.toRemote.mark, check, line => this.#log(`recovery (toRemote): ${line}`)),
+        allBridgedIds(this.options.local, cursor.toLocal.mark, check, line => this.#log(`recovery (toLocal): ${line}`)),
+      ]);
+      check();
+      this.#seen = { toRemote, toLocal };
+    } finally { failed = true; }
   }
 
   /** Restore event recovery and reconcile live participants on every (re)connect. */
-  async start(): Promise<void> {
+  async start(recoveryBudgetMs = this.options.startDeadlineMs ?? BRIDGE_START_DEADLINE_MS): Promise<void> {
     if (this.#stopped) throw relayUnavailable();
     this.#ready = false;
     this.#unaddressedRefreshMs = parseBridgeUnaddressedRefreshMs(process.env.FABRIC_BRIDGE_UNADDRESSED_REFRESH_MS);
@@ -3957,7 +3978,7 @@ export class MeshBridge {
       };
       this.#save();
     }
-    await this.#reconcileSeen();
+    await this.#reconcileSeen(recoveryBudgetMs);
     // Read CURRENT natives (including participants/ files), never a saved projection set.
     // Reconcile against the destination under its lock: unchanged digests skip state writes,
     // but lost records must be recreated and missing sources must not have their lease renewed.
@@ -3990,7 +4011,7 @@ export class MeshBridge {
     let loggedKind: string | undefined;
     for (;;) {
       attempts += 1;
-      try { return await this.start(); }
+      try { return await this.start(Math.max(0, deadlineMs - Math.max(0, this.#now() - startedAt))); }
       catch (error) {
         if (this.#stopped || !isBridgeRetryable(error)) throw error;
         const now = this.#now();
@@ -5556,15 +5577,37 @@ export class MeshBridge {
   }
 }
 
-const allBridgedIds = async (side: BridgeSide, after: number): Promise<Set<string>> => {
+const allBridgedIds = async (side: BridgeSide, after: number, check: () => void, log: (line: string) => void): Promise<Set<string>> => {
   const ids = new Set<string>();
-  let cursor = after;
-  for (;;) {
-    const page = await side.bridgedIds(cursor);
-    if (!page || !Array.isArray(page.ids) || typeof page.through !== "number") throw new Error("Bridge ids page is invalid");
-    for (const id of page.ids) if (typeof id === "string") ids.add(id);
-    if (page.done || page.through <= cursor) return ids;
-    cursor = page.through;
+  let cursor = after, pages = 0, events = 0, eventBytes = 0, maxSliceMs = 0;
+  const started = monotonicClock.now();
+  check();
+  const horizon = (await (side.latestCursor?.() ?? side.latestSequence().then(through => ({ through })))).through;
+  check();
+  if (after >= horizon) return ids;
+  let completed = false;
+  try {
+    for (;;) {
+      check();
+      const page = await side.bridgedIds(cursor);
+      pages++;
+      const cost = side instanceof StoreBridgeSide ? side.recoveryReadCost : undefined;
+      if (cost) { events += cost.events; eventBytes += cost.eventBytes; maxSliceMs = Math.max(maxSliceMs, cost.maxSliceMs); }
+      check();
+      if (!page || !Array.isArray(page.ids) || !Number.isSafeInteger(page.through) || page.through < cursor) throw new Error("Bridge ids page is invalid");
+      for (const id of page.ids) if (typeof id === "string") ids.add(id);
+      if (page.done || page.through >= horizon) { completed = true; return ids; }
+      // An incomplete, nonadvancing response must not silently grant an incomplete recovery set.
+      if (page.through <= cursor) throw new Error("Bridge ids page did not advance");
+      cursor = page.through;
+      // Also yield with old agents/adapters whose async methods resolve synchronously.
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  } finally {
+    const cost = side instanceof StoreBridgeSide
+      ? `inspectedEvents=${events} eventBytes=${eventBytes} maxSliceMs=${Math.ceil(maxSliceMs)}`
+      : "inspectedEvents=unavailable eventBytes=unavailable maxSliceMs=unavailable";
+    log(`mark=${after} horizon=${horizon} pages=${pages} ${cost} matchingIds=${ids.size} elapsedMs=${Math.ceil(monotonicClock.now() - started)} completed=${completed} cancelled=${!completed}`);
   }
 };
 

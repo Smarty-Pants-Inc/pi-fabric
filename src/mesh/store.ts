@@ -860,6 +860,11 @@ export class MeshStore {
     return this.#events.readAsync(input);
   }
 
+  /** Internal recovery scan: bounded independently of normal delivery page/frame sizes. */
+  readRecovery(after: number, limit: number): MeshEvent[] {
+    return this.#events.readRecovery(after, limit);
+  }
+
   /**
    * Durability barrier (smarty-dev#9313): resolves once every event AND every keyed-state commit
    * made on this root before the call, by any process, is on disk; otherwise it throws, for SQLite

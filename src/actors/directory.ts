@@ -200,7 +200,9 @@ export class ActorDirectory extends ActorManager {
     for (const orphan of this.#sessionOrphans?.list() ?? []) actors.set(orphan.id, orphan);
     return [...actors.values()];
   }
-  override listOwned(registryView = false): FabricActorInfo[] { return [...super.listOwned(registryView), ...this.#secondary.listOwned(registryView)]; }
+  override listOwned(registryView = false, onError?: (id: string, error: unknown) => void): FabricActorInfo[] {
+    return [...super.listOwned(registryView, onError), ...this.#secondary.listOwned(registryView, onError)];
+  }
   override drainQuiescence(id: string): string[] { return this.#isPrimary(id) ? super.drainQuiescence(id) : this.#secondary.drainQuiescence(id); }
   override drainWorker(id: string): ReturnType<ActorManager["drainWorker"]> { return this.#isPrimary(id) ? super.drainWorker(id) : this.#secondary.drainWorker(id); }
   override hasOwnedActors(): boolean { return super.hasOwnedActors() || this.#secondary.hasOwnedActors(); }

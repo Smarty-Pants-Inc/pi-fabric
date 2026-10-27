@@ -88,7 +88,7 @@ describe("agents provider progress service boundaries", () => {
     vi.useFakeTimers();
     const sink = { update: vi.fn(), attachPreview: vi.fn() };
     const read = vi.fn(() => { throw new Error("log removed"); });
-    await waitWithActorProgress({ list: () => [
+    await waitWithActorProgress({ listForUi: () => [
       { ...record("old"), actorId: "actor" },
       { ...record("new"), actorId: "actor", logFile: "/removed" },
     ] }, { read }, "actor", "Actor", Promise.resolve(message), sink, () => true);

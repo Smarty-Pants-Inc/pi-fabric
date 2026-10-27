@@ -178,6 +178,7 @@ export const createDashboardSnapshot = (
       runner: record.runner,
       transport: record.transport,
       cwd: record.cwd,
+      ...(record.error ? { error: record.error } : {}),
       ...(!isRunRecord(record) && linked ? { startedAt: linked.call.startedAt } : {}),
       ...(record.model ? { model: record.model } : {}),
       ...(record.thinking ? { thinking: record.thinking } : {}),
@@ -209,7 +210,6 @@ export const createDashboardSnapshot = (
       usage: { ...record.usage },
       ...(record.text ? { text: record.text } : {}),
       ...(record.value !== undefined ? { value: structuredClone(record.value) } : {}),
-      ...(record.error ? { error: record.error } : {}),
     };
   };
   const allAgents: FabricUiAgent[] = [];

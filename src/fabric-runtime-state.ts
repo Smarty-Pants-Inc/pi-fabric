@@ -1085,6 +1085,12 @@ export class FabricRuntimeState {
     const rootInbox = this.#rootInbox;
     let initialMeshError: unknown;
     let inboxMaintenance: MainInboxMaintenance | undefined;
+    let meshActivationReady = false;
+    let natsPublicationReady = !transport;
+    let participantView: ParticipantDirectory["participantView"];
+    // Shared with diagnostics; no directory calls here. Captured gates/view belong to this activation.
+    const hostControlReady = (): boolean => meshActivationReady && (!transport || natsPublicationReady) && this.#bindingFresh() &&
+      (!transport || live.current() && participantView?.leaseLive() === true);
     this.#participantsEpoch = epoch;
     this.#participants = new ParticipantDirectory(this.#mesh, {
       ...(transport ? { transport } : {}),
@@ -1123,6 +1129,7 @@ export class FabricRuntimeState {
         live.read(ctx => { if (ctx.hasUI) notifyDiagnostic(ctx, "src/fabric-runtime-state.ts", warning, "warning"); });
       },
       live: live.current,
+      controlAdmissionReason: () => hostControlReady() ? undefined : "host control not ready",
       // No live ctx to rebind to (smarty-dev#5962/#4313): the lease lapses, so say it on the fleet
       // ops topic instead of vanishing from the directory in silence. The UI ctx is retired too.
       // Non-Main runtimes (actors, agents) heartbeat their own host lease too, so they report
@@ -1142,9 +1149,7 @@ export class FabricRuntimeState {
     });
     const participants = this.#participants;
     const sessionFile = context.sessionManager.getSessionFile?.();
-    let meshActivationReady = false;
     // NATS consumers stay closed until native recovery and source publication commit.
-    let natsPublicationReady = !transport;
     this.#meshActivationReady = () => meshActivationReady && live.current() &&
       (!transport || natsPublicationReady && participants.canConsumeMesh());
     const initializeMeshActivation = async (): Promise<void> => {
@@ -1239,7 +1244,7 @@ export class FabricRuntimeState {
         nativeActors: snapshotNativeActorHandlers(mainAgentId, "session").map(({ binding }) => binding) })
       : Object.freeze([]);
     if (nativeBindings.length && !ownsPersistentActorRegistry) throw new Error("Native actors require the owning persistent Main");
-    const participantView = transport ? participants.participantView : undefined;
+    participantView = transport ? participants.participantView : undefined;
     if (transport && !participantView) throw new Error("Fabric NATS participant view unavailable");
     let controlInboxBound = false;
     this.#control = new FabricControlPlane(this.#mesh, identity, {
@@ -1259,8 +1264,7 @@ export class FabricRuntimeState {
       // directory epoch is committed under a live, renewed lease (#709).
       // smarty-dev#8881: plus bound-ctx freshness, so a disposed Main stops admitting before its
       // first heartbeat would notice.
-      canConsumeMesh: () => meshActivationReady && (!transport || natsPublicationReady) && this.#bindingFresh() &&
-        (!transport || live.current() && participantView?.leaseLive() === true) && controlParticipants.canConsumeMesh(),
+      canConsumeMesh: () => hostControlReady() && controlParticipants.canConsumeMesh(),
       enabled: this.#config.mesh.enabled,
       hostId,
       pollMs: this.#config.mesh.actorPollMs,
@@ -1768,13 +1772,14 @@ export class FabricRuntimeState {
     const registerAgentSource = (): void => {
       this.#participants!.registerSource(() =>
         agentParticipantRecords(
-          (transport ? agents : this.#agents!).listForUi(),
+          (transport ? agents : this.#agents!).listForPresence(),
           mainAgentId,
           hostId,
           identity.id,
           identity.id,
           firstSeenAgents,
         ),
+        { isolateErrors: true, name: "agents" },
       );
     };
     // FILE keeps source registration before start. NATS waits for native recovery.
@@ -1793,17 +1798,18 @@ export class FabricRuntimeState {
       registerMainSource();
       registerAgentSource();
     }
-    this.#participants.registerSource(() =>
-      (transport ? actors : this.#actors!).listOwned(true).map((actor) =>
+    this.#participants.registerSource((reportFailure) =>
+      (transport ? actors : this.#actors!).listOwned(true, (id, error) => reportFailure(error, id)).map((actor) =>
         actorParticipantRecord(actor, mainAgentId, hostId, identity.id, identity.id),
       ),
+      { isolateErrors: true, name: "actors" },
     );
     (transport ? agents : this.#agents).subscribeUi(() => (transport ? participants : this.#participants)?.scheduleRefresh());
     (transport ? actors : this.#actors).subscribe(() => (transport ? participants : this.#participants)?.scheduleRefresh());
     let routeOwner: { client: import("./jev/client.js").JevClient; signal: AbortSignal; pending: Set<Promise<unknown>> } | undefined;
     const providerParticipants = this.#providerParticipants;
     this.#participants.registerSource(() =>
-      providerParticipants.records(mainAgentId, hostId, identity.id));
+      providerParticipants.records(mainAgentId, hostId, identity.id), { isolateErrors: true, name: "providers" });
     providerParticipants.subscribe(() => (transport ? participants : this.#participants)?.scheduleRefresh());
     const agentsProvider = new AgentsProvider(
       this.#agents,

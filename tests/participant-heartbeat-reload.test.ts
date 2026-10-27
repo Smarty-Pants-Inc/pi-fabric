@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { ParticipantDirectory, type ParticipantSnapshotSource } from "../src/topology/participant-directory.js";
 import { readHostLeases } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -199,12 +199,12 @@ describe("participant heartbeat across ctx.reload() (smarty-dev#5962)", () => {
     } });
     cleanup.push(() => runtime.shutdown("exit").catch(() => undefined));
     const directories: ParticipantDirectory[] = [];
-    const sources = new Map<ParticipantDirectory, Array<() => FabricParticipantRecord[]>>();
+    const sources = new Map<ParticipantDirectory, ParticipantSnapshotSource[]>();
     const register = ParticipantDirectory.prototype.registerSource;
-    vi.spyOn(ParticipantDirectory.prototype, "registerSource").mockImplementation(function (this: ParticipantDirectory, source) {
+    vi.spyOn(ParticipantDirectory.prototype, "registerSource").mockImplementation(function (this: ParticipantDirectory, source, options) {
       if (!sources.has(this)) { directories.push(this); sources.set(this, []); }
       sources.get(this)!.push(source);
-      return register.call(this, source);
+      return register.call(this, source, options);
     });
     const quiesce = ParticipantDirectory.prototype.quiesce;
     vi.spyOn(ParticipantDirectory.prototype, "quiesce").mockImplementation(async function (this: ParticipantDirectory, reason) {
@@ -221,8 +221,9 @@ describe("participant heartbeat across ctx.reload() (smarty-dev#5962)", () => {
     await runtime.initialize(first as unknown as ExtensionContext, config(), { lifecycle: () => generation === 1 });
     const [old] = directories;
     expect(old).toBeDefined();
+    const reportUnexpectedFailure = (error: unknown): never => { throw error; };
     const oldRoot = (): FabricParticipantRecord | undefined =>
-      sources.get(old!)!.flatMap((source) => source()).find((record) => record.kind === "root");
+      sources.get(old!)!.flatMap((source) => source(reportUnexpectedFailure)).find((record) => record.kind === "root");
     expect(oldRoot()).toMatchObject({ name: "first-main", model: "faux/m1" });
 
     // Session replacement: the successor lease is current before the old runtime is torn down.
@@ -245,7 +246,7 @@ describe("participant heartbeat across ctx.reload() (smarty-dev#5962)", () => {
     expect(nameReads).toEqual([]);
     expect(late).toMatchObject({ name: "first-main", model: "faux/m1" });
     // The successor's own source does read its live ctx.
-    const successorRoot = sources.get(directories.at(-1)!)!.flatMap((source) => source()).find((record) => record.kind === "root");
+    const successorRoot = sources.get(directories.at(-1)!)!.flatMap((source) => source(reportUnexpectedFailure)).find((record) => record.kind === "root");
     expect(successorRoot).toMatchObject({ name: "second-main", model: "faux/m2" });
   }, 30_000);
 });

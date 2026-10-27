@@ -57,7 +57,7 @@ const DEFAULT_PRESENCE_MS = 5_000;
 /** A retained source event revalidates after this delay; this is NOT an event/authority TTL. */
 const DEFAULT_MEMBERSHIP_RETRY_MS = 1_000;
 /** Known-elsewhere outbound misses share one bounded trailing sample, never an idle poll. */
-const UNADDRESSED_REFRESH_MS = 1_000;
+const UNADDRESSED_REFRESH_MS = 15_000;
 /** A missed change notification is only a safety net: its retry backs off to this bound. */
 const MEMBERSHIP_RETRY_MAX_MS = 30_000;
 /** Transitional mixed-version exception only: remove after all fleet agents support changes. */
@@ -3504,6 +3504,8 @@ export class MeshBridge {
   /** One trailing refresh obligation; a sample begun before its latest miss cannot clear it. */
   #unaddressedRefreshAt: number | undefined;
   #unaddressedRefreshVersion = 0;
+  /** An unknown outbound recipient retains its source boundary until the trailing sample lands. */
+  #unaddressedSequence: number | undefined;
   #staleAdmission: BridgeStaleIncarnationError | undefined;
   #stopped = false;
   #stopTask: Promise<void> | undefined;
@@ -4140,6 +4142,13 @@ export class MeshBridge {
     return this.#unaddressedRefreshAt !== undefined && Date.now() >= this.#unaddressedRefreshAt;
   }
 
+  /** Only the coordinator/step boundary runs miss-triggered presence work, never an event.
+   * Join at most one pass: an older in-flight sample leaves the versioned obligation pending. */
+  async #refreshUnaddressedMembership(): Promise<void> {
+    this.#unaddressedRefreshAt = Date.now() + UNADDRESSED_REFRESH_MS;
+    await this.syncPresence();
+  }
+
   #deferUnaddressedRefresh(): void {
     if (this.#stopped) return;
     this.#unaddressedRefreshVersion++;
@@ -4344,7 +4353,7 @@ export class MeshBridge {
   /** One pass: presence when due, then every new event in both directions. */
   async step(): Promise<BridgeStepResult> {
     if (!this.#cursor) await this.start();
-    if (this.#unaddressedRefreshDue()) await this.#refreshMembership();
+    if (this.#unaddressedRefreshDue()) await this.#refreshUnaddressedMembership();
     else if (this.#presenceDue()) await this.syncPresence();
     if (this.#stopped) return { toRemote: 0, toLocal: 0, dropped: 0 };
     let toRemote: { forwarded: number; dropped: number };
@@ -4585,6 +4594,19 @@ export class MeshBridge {
       delete this.#membershipRetryAt[direction];
       delete this.#membershipSafetyDelay[direction];
     }
+    const unaddressedRefreshed = direction === "toRemote" && this.#unaddressedSequence !== undefined &&
+      this.#unaddressedRefreshAt === undefined;
+    if (direction === "toRemote" && this.#unaddressedSequence !== undefined) {
+      if (!unaddressedRefreshed) {
+        // The coordinator owns this sample. Do not race its timer with an inline refresh
+        // or spin on an expired retry deadline while its mirror is still settling.
+        this.#membershipRetryAt[direction] = Math.max(this.#unaddressedRefreshAt ?? 0, Date.now() + UNADDRESSED_REFRESH_MS);
+        return { forwarded, dropped };
+      }
+      this.#unaddressedSequence = undefined;
+      delete this.#membershipRetryAt[direction];
+      passRefreshed = true;
+    }
     const membershipRetryAt = this.#membershipRetryAt[direction];
     if (membershipRetryAt !== undefined) {
       const graceDue = this.#relayGraceExpired(direction);
@@ -4638,11 +4660,7 @@ export class MeshBridge {
       // Reconcile latched origin changes/expiry even on a filtered page.
       const retainedRefresh = passRefreshed && retainedBoundary !== undefined && cursor.after < retainedBoundary &&
         this.#presenceVersion === this.#syncedPresenceVersion && this.#leaseVersion === this.#syncedLeaseVersion;
-      if (direction === "toRemote" && this.#unaddressedRefreshDue()) {
-        const end = phase("membershipWaitMs");
-        try { await this.#refreshMembership(); } finally { end(); }
-        passRefreshed = true;
-      } else if (!retainedRefresh && !this.#deferPreemptivePresence() && this.#presenceDue()) {
+      if (!retainedRefresh && !this.#deferPreemptivePresence() && this.#presenceDue()) {
         const end = phase("membershipWaitMs");
         try { await this.syncPresence(); } finally { end(); }
         passRefreshed = true;
@@ -4661,16 +4679,6 @@ export class MeshBridge {
         const event = page.events[index]!;
         if (event.sequence <= cursor.after) continue;
         if (this.#stopped) return { forwarded, dropped };
-        // A suppressed miss is not permission to publish from the page's old rules. Flush
-        // before batch admission too, even if its notification is still queued or a prior
-        // sample is in flight; #refreshMembership requires a sample after the obligation.
-        if (direction === "toRemote" && this.#unaddressedRefreshAt !== undefined && !this.#refusal(event, rules, direction)) {
-          const end = phase("membershipWaitMs");
-          try { await this.#refreshMembership(); } finally { end(); }
-          passRefreshed = true;
-          rules = await authority(false);
-          if (this.#stopped) return { forwarded, dropped };
-        }
         // Publishes and the other direction's saves can also checkpoint this consumed prefix.
         if (cursor.after === this.#lastCursorAfter[direction]) {
           discardedSinceCheckpoint = 0;
@@ -4777,23 +4785,20 @@ export class MeshBridge {
         const lapsedId = reason === "sender is not a live participant of the remote" ? event.from.id
           : reason === "ack target is not bound to this link" && isObject(event.data) && typeof event.data.targetId === "string" ? event.data.targetId
           : reason === "not addressed across" && direction === "toRemote" ? event.to : undefined;
-        let coalesced = false;
-        if (!refreshed && this.#notificationMode && direction === "toRemote" && reason === "not addressed across" &&
-          typeof event.to === "string" && CANONICAL_ID.test(event.to) && rules.reservedRecipients?.has(event.to)) {
-          const presenceVersion = this.#presenceVersion;
-          const leaseVersion = this.#leaseVersion;
-          // Reservations in page rules may predate a handoff whose fs notification is
-          // delayed. Read current authority before proving elsewhere; absence alone (even
-          // a canonical id) is UNKNOWN and retains the immediate refresh below.
-          rules = await authority(false);
-          reason = this.#refusal(event, rules, direction);
-          if (reason === "not addressed across" && rules.reservedRecipients?.has(event.to) &&
-            presenceVersion === this.#presenceVersion && leaseVersion === this.#leaseVersion &&
-            this.#presenceVersion === this.#syncedPresenceVersion && this.#leaseVersion === this.#syncedLeaseVersion &&
-            !this.#presenceDue() && !this.#unaddressedRefreshDue() && !this.#deferPreemptivePresence() &&
-            this.options.local.mirrored?.(event.to) === false && this.options.local.holds?.(event.to) === false) {
-            this.#deferUnaddressedRefresh();
-            coalesced = true;
+        const coalesced = direction === "toRemote" && reason === "not addressed across";
+        if (coalesced && !unaddressedRefreshed) {
+          this.#deferUnaddressedRefresh();
+          // Current native/other-link reservations still skip as before. Unknown canonical
+          // recipients retain the existing retry boundary until a post-miss sample commits;
+          // neither the event nor the pending sample is authority to forward.
+          if (typeof event.to === "string" && CANONICAL_ID.test(event.to) &&
+            !rules.reservedRecipients?.has(event.to) && isIdentity(event.from) &&
+            (event.data === undefined || isObject(event.data)) && !this.#destinationRefusal(event, direction)) {
+            this.#unaddressedSequence = event.sequence;
+            this.#deferMembership(direction, event);
+            this.#membershipRetryAt[direction] = this.#unaddressedRefreshAt;
+            if (cursor.after > start) this.#save();
+            return { forwarded, dropped };
           }
         }
         // A file notification may still be queued when a later event append is already
@@ -5154,7 +5159,7 @@ export class MeshBridge {
   /** Follow notifications until stop() or failure. No timer is armed for empty idle.
    * Timer inventory: source/held-mirror expiry and pending half-lease flush (one shot);
    * retained stale-membership safety net (1 s..30 s backoff), plus exact persisted relay grace;
-   * known-elsewhere outbound misses (one trailing sample within 1 s);
+   * outbound misses (one trailing sample per 15 s, shared by both directions);
    * actual lock/SQLite busy, including WAL notification commit settlement (100 ms..2 s);
    * WAL-cap refusal (1 s..30 s); explicitly negotiated legacy-only 250 ms polling.
    * Held-publication fence retries, RPC deadlines and stop
@@ -5239,7 +5244,7 @@ export class MeshBridge {
               await this.#reconcileSeen();
               await this.syncPresence();
             }
-          } else if (this.#unaddressedRefreshDue()) await this.#refreshMembership();
+          } else if (this.#unaddressedRefreshDue()) await this.#refreshUnaddressedMembership();
           else if (this.#presenceDue()) await this.syncPresence();
         })();
         // stop() needs a settlement fence, not a second rejection of a failed pass.

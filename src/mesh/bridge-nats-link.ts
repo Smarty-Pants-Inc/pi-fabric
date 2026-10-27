@@ -1,4 +1,5 @@
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import type { FabricParticipantRecord } from "../topology/types.js";
 import { assertNatsLinkPlatform } from "./bridge-nats-config.js";
 import { BRIDGE_STALL_ALARM_TOPIC, type BridgeStallAlarm } from "./bridge.js";
@@ -35,6 +36,62 @@ import { systemdWatchdogNotify } from "./systemd-watchdog.js";
 const MAX_EVENT_BYTES = 256 * 1024;
 const MAX_READ_EVENTS = 500;
 const STOP_MS = 5_000;
+const RENEWAL_FAILURE = "NATS bridge mirror renewal failed";
+const RENEWAL_SUMMARY_MS = 60_000;
+const MAX_RENEWAL_ERRORS = 128;
+const MAX_RENEWAL_ERROR_CODES = 16;
+
+// Error fields are not trusted log text. Never stringify messages, values, keys or ids here.
+const renewalErrorToken = (error: unknown, field: "code" | "name"): string | undefined => {
+  try {
+    if (typeof error !== "object" || error === null) return undefined;
+    const value = (error as Record<string, unknown>)[field];
+    const token = typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? String(value) : value;
+    return typeof token === "string" && /^[A-Za-z0-9][A-Za-z0-9_]{0,63}$/.test(token) ? token : undefined;
+  } catch { return undefined; } // A diagnostic accessor must not break error reporting.
+};
+const addRenewalErrorCount = (counts: Record<string, number>, code: string, count = 1): void => {
+  const key = Object.hasOwn(counts, code) || Object.keys(counts).filter(key => key !== "OTHER_ERRORS").length < MAX_RENEWAL_ERROR_CODES
+    ? code : "OTHER_ERRORS";
+  counts[key] = (counts[key] ?? 0) + count;
+};
+
+/**
+ * The shared port callback can identify only multi-failure outbound renewal passes, not successes
+ * or single failures. Count direct child codes/classes (nested aggregates stay AggregateError).
+ * The summary is event-driven: no new timer, at most once/minute, on the next such failure.
+ */
+export const natsLinkPortErrorLogger = (log: (line: string) => void, monotonic = (): number => performance.now()):
+  ((error: unknown) => void) => {
+  let since = monotonic(), aggregateFailures = 0, omittedErrors = 0;
+  let totals: Record<string, number> = Object.create(null);
+  return error => {
+    if (!(error instanceof AggregateError) || error.message !== RENEWAL_FAILURE) {
+      log(`NATS port: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    const counts: Record<string, number> = Object.create(null);
+    const errors: unknown[] = Array.isArray(error.errors) ? error.errors : [undefined];
+    const inspected = Math.min(errors.length, MAX_RENEWAL_ERRORS);
+    for (let index = 0; index < inspected; index++) {
+      const child = errors[index];
+      addRenewalErrorCount(counts, renewalErrorToken(child, "code") ?? renewalErrorToken(child, "name") ?? "UNKNOWN_ERROR");
+    }
+    const omitted = errors.length - inspected;
+    aggregateFailures++;
+    omittedErrors += omitted;
+    for (const [code, count] of Object.entries(counts)) addRenewalErrorCount(totals, code, count);
+    log(`NATS port: ${RENEWAL_FAILURE} codes=${JSON.stringify(counts)} omittedErrors=${omitted}`);
+    const now = monotonic(), windowMs = now - since;
+    if (windowMs < RENEWAL_SUMMARY_MS) return;
+    log(`NATS renewal summary direction=toKV scope=aggregate-only windowMs=${Math.round(windowMs)} aggregateFailures=${aggregateFailures}` +
+      ` codes=${JSON.stringify(totals)} omittedErrors=${omittedErrors}`);
+    since = now;
+    aggregateFailures = 0;
+    omittedErrors = 0;
+    totals = Object.create(null);
+  };
+};
 
 /** What startNatsLink reads from the link config (L5's parsed NatsLinkConfig is assignable to it). */
 export interface NatsLinkStartConfig {
@@ -235,8 +292,7 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
     signal.throwIfAborted();
     port = factories.openPort
       ? await factories.openPort(portConfig, { signal, log, fileStore: store })
-      : await openNatsBridgeSide(portConfig, { signal, log, fileStore: store, onError: error =>
-        log(`NATS port: ${error instanceof Error ? error.message : String(error)}`) });
+      : await openNatsBridgeSide(portConfig, { signal, log, fileStore: store, onError: natsLinkPortErrorLogger(log) });
     const ledgerDir = path.join(config.stateDir, "ledger");
     opened = await (factories.openLedger ? factories.openLedger(ledgerDir) : openBridgeNatsLedger({ dir: ledgerDir }));
     const ledger = natsCarrierLedger(opened, config.link);

@@ -87,7 +87,10 @@ describe.each(["file", "sqlite"] as const)("%s Round 3", backend => {
     fs.writeFileSync(path.join(lock, "owner"), `busy\n${process.pid}\n1\n\n${physical.machineId}\n${physical.bootId}\n`);
     const timer = vi.spyOn(globalThis, "setTimeout");
     await expect(directory.refresh()).rejects.toBeInstanceOf(HostLeaseLockBusyError);
-    expect(timer).not.toHaveBeenCalled(); expect(directory.options.waitForPublicationRetry).not.toHaveBeenCalled();
+    // #17018 adds a separate 60s control-admission diagnostic timer; this test guards
+    // only against the jittered publication-retry timer on a no-source lock-busy result.
+    expect(timer.mock.calls.every(([, delay]) => Number(delay) > 60_000)).toBe(true);
+    expect(directory.options.waitForPublicationRetry).not.toHaveBeenCalled();
     fs.rmSync(lock, { recursive: true, force: true });
   });
 

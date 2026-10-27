@@ -535,6 +535,7 @@ export class ResidentHost {
       ...(transport ? { transport } : {}),
       ...(transportStateDir ? { transportStateDir } : {}),
       enabled: true,
+      controlAdmissionReason: () => this.#ready ? undefined : "resident host not ready",
       actorRenewalAllowed,
       preparePublicationFence: () => {
         const generations = registries.map(store => store.fingerprint());
@@ -967,16 +968,17 @@ export class ResidentHost {
       const firstSeenAgents = new Map<string, number>();
       this.participants.registerSource(() =>
         agentParticipantRecords(
-          this.agents.listForUi(),
+          this.agents.listForPresence(),
           this.config.rootId,
           this.hostId,
           this.identity.id,
           this.config.rootId,
           firstSeenAgents,
         ),
+        { isolateErrors: true, name: "agents" },
       );
-      this.participants.registerSource(() =>
-        this.actors.listOwned(true).map((actor) =>
+      this.participants.registerSource((reportFailure) =>
+        this.actors.listOwned(true, (id, error) => reportFailure(error, id)).map((actor) =>
           actorParticipantRecord(
             actor,
             this.config.rootId,
@@ -985,6 +987,7 @@ export class ResidentHost {
             this.config.rootId,
           ),
         ),
+        { isolateErrors: true, name: "actors" },
       );
       this.agents.subscribeUi(() => { this.participants.scheduleRefresh(); this.#scheduleIdleCheck(); });
       this.actors.subscribe(() => this.participants.scheduleRefresh());

@@ -177,7 +177,7 @@ interface AfterUnlock {
   /** Set with `finish` when `finish` is the live barrier followed by this receipt step: a batch
    * runs one barrier for all its events, then each receipt step in order (smarty-dev#6729). */
   receipt?: (() => Promise<void> | void) | undefined;
-  /** Keyed publish(): the receipt namespace prepared before `.lock` (fresh leaf barriers inside). */
+  /** Keyed publish/publishBatch: namespace prepared before `.lock` (fresh leaf barriers inside). */
   namespace?: ReceiptNamespace | undefined;
 }
 
@@ -492,7 +492,7 @@ export class EventLog {
       catch (error) { if (errorCode(error) === "ENOENT") return; throw error; }
       if (intent.dedupeKey !== event.dedupeKey || intent.eventId !== event.id ||
           intent.reservedSequence !== event.sequence) return;
-      // Unprepared (batch, win32): exactly the previous writeFileAtomic + syncPathNamespace barriers.
+      // Unprepared (e.g. win32): exactly the previous writeFileAtomic + syncPathNamespace barriers.
       const syncDirectory = after.namespace && receiptDirectoryBarrier(after.namespace);
       writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true, ...(syncDirectory ? { syncDirectory } : {}) });
       this.#removeDedupeIntent(intentPath, syncDirectory);
@@ -866,8 +866,9 @@ export class EventLog {
           archive.installDigestRepair(digestRepair);
         }
       }
-      // Only a new single archived keyed append gets this publish's proof. Recovery above,
-      // batch, prior receipts and changed off-lock archive selection retain their defaults.
+      // Only a new archived keyed append gets this invocation's proof. Each batch event
+      // revalidates it independently; recovery, prior receipts and changed archive selection
+      // retain their defaults.
       let publishNamespace: ReturnType<KeyedPublishPrefix["forArchive"]>;
       const append = (): { event: MeshEvent; line: string; bytes: number } => {
         // Unknown admission/data/outbox errors and possible partial appends must never replay.
@@ -876,7 +877,7 @@ export class EventLog {
         const createdAt = Date.now();
         const eventData = stamp ? jsonClone(stamp(createdAt)) : fixedData;
         const sequence = Math.max(this.#readSequence(), this.#readLastEventSequence()) + 1;
-        publishNamespace = input.dedupeKey && !batch && archive?.meshRoot === this.root && archive.dir === prefixArchiveDir
+        publishNamespace = input.dedupeKey && archive?.meshRoot === this.root && archive.dir === prefixArchiveDir
           ? prefixScope?.forArchive(archive.dir, sequence) : undefined;
         const verification = encoded ? encoded.verification : verificationOf(eventData);
         const event: MeshEvent = {
@@ -971,8 +972,8 @@ export class EventLog {
       } else if (receiptPath) {
         // Archive-coupled receipts keep their locked protocol (smarty-dev#6000).
         this.#confirmEventFile(this.#eventsPath, false, publishNamespace?.syncLiveNamespace);
-        // publish() only: the checked prepared-namespace leaf barrier (as for its intent);
-        // batch/unprepared keep writeFileAtomic's default chain + syncPathNamespace.
+        // The checked prepared-namespace leaf barrier (as for this event's intent);
+        // unprepared or changed namespaces keep the complete default barriers.
         const syncDirectory = after?.namespace && receiptDirectoryBarrier(after.namespace);
         writeFileAtomic(receiptPath, JSON.stringify(event), { durable: true, ...(syncDirectory ? { syncDirectory } : {}) });
         if (intentPath) this.#removeDedupeIntent(intentPath, syncDirectory);
@@ -1038,6 +1039,10 @@ export class EventLog {
     if (!inputs.length || inputs.length > 256) throw new Error("Mesh publish batch must contain 1..256 events");
     inputs = inputs.map(input => this.#capturePublication(input));
     const recoveryDeadline = Date.now() + this.#lock.lockTimeoutMs;
+    // One off-lock proof for this invocation, never a process-lifetime cache. Every event's
+    // barriers revalidate its exact namespace identity; a changed proof pays the full chain.
+    // No sequence reservation, archive intent or admission decision moves out of the hold.
+    const preparation = inputs.some(input => input.dedupeKey) ? prepareKeyedPublishNamespace(this.root) : undefined;
     for (;;) {
       // The after-release work of each event the hold committed, in commit order.
       const committed: AfterUnlock[] = [];
@@ -1045,8 +1050,10 @@ export class EventLog {
       try {
         const prepared: Array<{ commit: () => MeshEvent; outcome: { appendStarted: boolean; bytes: number }; after: AfterUnlock }> = [];
         for (const input of inputs) {
-          const outcome = { appendStarted: false, bytes: 0 }, after: AfterUnlock = {};
-          try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, after), outcome, after }); }
+          const outcome = { appendStarted: false, bytes: 0 };
+          const after: AfterUnlock = { namespace: input.dedupeKey ? preparation?.receiptNamespace : undefined };
+          try { prepared.push({ commit: this.#preparePublish({ ...input, durable: false }, outcome, after,
+            input.dedupeKey ? preparation?.prefixScope : undefined), outcome, after }); }
           catch (error) { if (error instanceof FabricIdempotencyKeyReusedError || !prepared.length) throw error; break; }
         }
         events = await withInitialMeshLockAcquisition(this.root, () => this.#lock.withLock(() => {

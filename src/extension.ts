@@ -264,6 +264,11 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // A different Fabric requested explicitly with -e (a worker's parent Fabric) wins over
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
+  // Refuse a selected private native pin before the SDK can append startup metadata.
+  if (!options.managedHost && process.env.PI_FABRIC_NATIVE_OWNER_CONFIG !== undefined &&
+      process.argv.some((arg, i) => arg === "--session" && path.isAbsolute(process.argv[i + 1] ?? ""))) {
+    (await import("./worker/native-owner-entry.js")).guardNativeOwnerRegistration();
+  }
   registerFabricPrincipalCapture(pi);
   // smarty-dev#6207: the Main names its sender; a Fabric worker child loads the same hook with -e.
   // First-use import of the standalone hook file (a stable package-local path, as the worker's -e),

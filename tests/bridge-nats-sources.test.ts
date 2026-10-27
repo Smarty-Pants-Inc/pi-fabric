@@ -97,9 +97,9 @@ describe("natsBridgeInboxSource", () => {
   });
 
   it("refuses a durable of the same name with another owner or filter", async () => {
-    const fake = fakeConnection({ durable_name: `br_${hashToken("bridge:v2")}`, filter_subject: "fabric.in.ryzen1-bridge.x.>",
+    const fake = fakeConnection({ durable_name: `br_${hashToken("bridge:v2")}`, filter_subject: "fabric.in.fleet-bridge.x.>",
       description: "{}", ack_policy: AckPolicy.Explicit });
-    const source = natsBridgeInboxSource(fake.connection, { machine: "ryzen1-bridge", link: "v2" });
+    const source = natsBridgeInboxSource(fake.connection, { machine: "fleet-bridge", link: "v2" });
     await expect(source.consume(new AbortController().signal)[Symbol.asyncIterator]().next()).rejects.toBeTruthy();
   });
 });

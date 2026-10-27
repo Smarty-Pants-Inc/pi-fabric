@@ -243,6 +243,22 @@ export class FabricState {
   }
 
   async bootstrap(context: ExtensionContext): Promise<void> {
+    // Select only a registered native owner using the actual SDK session ID.
+    // Ordinary bootstrap stays synchronous/cheap; native policy loads at this
+    // first use, before role/config/lifecycle mutation, identity or any append.
+    if (!this.#managedHost) {
+      const sessionId = context.sessionManager.getSessionId();
+      // Existing sealed host registrations select policy; they do not prove custody.
+      const nativeHandlers = (globalThis as unknown as Record<symbol, ReadonlyMap<string, {
+        readonly binding: { readonly rootId: string; readonly scope: "session" };
+      }> | undefined>)[Symbol.for("pi-fabric.nativeActorHandlers.v1")];
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(sessionId) &&
+          nativeHandlers && [...nativeHandlers.values()].some(({ binding }) =>
+            binding.rootId === `session:${sessionId}` && binding.scope === "session")) {
+        const { guardNativeOwnerBootstrap } = await import("./worker/native-owner-entry.js");
+        guardNativeOwnerBootstrap(context);
+      }
+    }
     if (!this.#managedHost) configureFabricDiagnostics(context.sessionManager?.getSessionId?.() ?? "");
     this.#shutDown = false;
     const generation = ++this.#generation;

@@ -15,6 +15,51 @@ import { residentDrainTemp } from "./resident-drain-temp.js";
 import { assertApprovedNativeSdk, isNativeSdkUnconfigured, NATIVE_SDK_RELEASE, NATIVE_SDK_SOURCE_PINS } from "./native-sdk-no-model.js";
 import { testTempOwnerMarker, testTempProcessIdentity, testTempRunEnvironment } from "../../scripts/test-temp.js";
 
+// TEST ONLY: libc write boundary on this owned Main. The approved SDK calls
+// appendFileSync unchanged. Delegate a positive short write to the REAL syscall,
+// record its fd/inode/count, then stop before returning so Node cannot finish it.
+// No SDK patch/clone, generated session line, simulated crash, or alternate writer.
+const startupShortWriteSource = String.raw`
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static int stopped;
+ssize_t write(int fd, const void *data, size_t count) {
+  ssize_t (*real_write)(int,const void*,size_t) = dlsym(RTLD_NEXT,"write");
+  const char *target = getenv("FABRIC_NATIVE_STARTUP_SESSION");
+  const char *receipt = getenv("FABRIC_NATIVE_STARTUP_RECEIPT");
+  struct stat held, named;
+  if (!stopped && target && receipt && count > 32 &&
+      !memcmp(data,"{\"type\":\"thinking_level_change\"",31) &&
+      !fstat(fd,&held) && !stat(target,&named) && held.st_dev == named.st_dev && held.st_ino == named.st_ino) {
+    stopped = 1;
+    size_t partial = count / 2;
+    ssize_t result = real_write(fd,data,partial);
+    if (result <= 0 || (size_t)result >= count) _exit(97);
+    struct stat after; if (fstat(fd,&after)) _exit(96);
+    char out[1024];
+    int length = snprintf(out,sizeof(out),"{\"event\":\"real-libc-write-short-return\",\"pid\":%d,\"fd\":%d,\"dev\":%llu,\"ino\":%llu,\"beforeSize\":%lld,\"afterSize\":%lld,\"requested\":%zu,\"delegated\":%zu,\"written\":%zd}\n",getpid(),fd,(unsigned long long)held.st_dev,(unsigned long long)held.st_ino,(long long)held.st_size,(long long)after.st_size,count,partial,result);
+    int output = open(receipt,O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,0600);
+    if (output < 0 || syscall(SYS_write,output,out,length) != length || fsync(output) || close(output)) _exit(95);
+    raise(SIGSTOP);
+    _exit(94); /* Never fabricate completion if erroneously resumed. */
+  }
+  return real_write(fd,data,count);
+}
+ssize_t writev(int fd, const struct iovec *vectors, int n) {
+  if (n == 1) return write(fd,vectors[0].iov_base,vectors[0].iov_len);
+  ssize_t (*real_writev)(int,const struct iovec*,int) = dlsym(RTLD_NEXT,"writev");
+  return real_writev(fd,vectors,n);
+}
+`;
 const fixtureRoot = fileURLToPath(new URL("../fixtures/", import.meta.url));
 const json = <T>(file: string): T => JSON.parse(fs.readFileSync(file, "utf8")) as T;
 const digest = (file: string): string => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
@@ -47,23 +92,35 @@ const nativeEvidenceCustody = () => {
   return { root, version: owner.version, pid: owner.pid, startIdentity: owner.startIdentity };
 };
 
-/** Commits wake observation; one deadline is only the failure bound, never a poll interval. */
+/** File commits drive the normal path; kernel-only transitions may opt into a bounded safety net. */
 export const observeNativeOwner = (root: string) => {
-  const listeners = new Set<() => void>();
-  let watchFailure: Error | undefined;
+  const listeners = new Set<() => void>(), cancellations = new Set<() => void>();
+  let watchFailure: Error | undefined, closed = false;
   const wake = (): void => { for (const listener of [...listeners]) listener(); };
   const watcher = fs.watch(root, { recursive: true, persistent: false }, wake);
   watcher.on("error", error => { watchFailure = error; wake(); });
   return {
     wake,
-    close: () => watcher.close(),
-    until: (predicate: () => boolean | Promise<boolean>, label: string, ms = 60_000): Promise<void> => new Promise((resolve, reject) => {
-      let finished = false, checking = false, dirty = false;
+    close: (): void => {
+      closed = true; watcher.close();
+      for (const cancel of [...cancellations]) cancel();
+    },
+    until: (predicate: () => boolean | Promise<boolean>, label: string, ms = 60_000,
+      safety?: { pollMs: number }): Promise<void> => new Promise((resolve, reject) => {
+      if (closed) { reject(new Error("Native owner observation closed")); return; }
+      if (safety && (!Number.isFinite(safety.pollMs) || safety.pollMs <= 0)) {
+        reject(new Error("Native owner safety poll must be positive")); return;
+      }
+      let finished = false, checking = false, dirty = false, expired = false;
+      let poll: ReturnType<typeof setInterval> | undefined;
+      const deadlineError = new Error(`Native owner observation deadline: ${label}`);
       const finish = (error?: unknown): void => {
         if (finished) return;
-        finished = true; clearTimeout(timer); listeners.delete(check);
+        finished = true; clearTimeout(timer); if (poll) clearInterval(poll);
+        listeners.delete(check); cancellations.delete(cancel);
         if (error) reject(error); else resolve();
       };
+      const cancel = (): void => finish(new Error("Native owner observation closed"));
       const check = (): void => {
         if (finished) return;
         if (checking) { dirty = true; return; }
@@ -71,13 +128,21 @@ export const observeNativeOwner = (root: string) => {
         void (async () => {
           do {
             dirty = false;
+            const final = expired;
             if (watchFailure) throw watchFailure;
             if (await predicate()) { finish(); return; }
+            if (final) { finish(deadlineError); return; }
           } while (dirty && !finished);
         })().catch(finish).finally(() => { checking = false; if (dirty && !finished) check(); });
       };
-      const timer = setTimeout(() => finish(new Error(`Native owner observation deadline: ${label}`)), ms);
-      listeners.add(check); check();
+      // Never reset the original deadline. Only opted-in kernel observations
+      // serialize one final predicate behind any in-flight check at expiry.
+      const timer = setTimeout(() => {
+        if (!safety) { finish(deadlineError); return; }
+        expired = true; if (poll) clearInterval(poll); check();
+      }, ms);
+      if (safety) poll = setInterval(check, safety.pollMs);
+      listeners.add(check); cancellations.add(cancel); check();
     }),
   };
 };
@@ -99,7 +164,7 @@ interface NativeAuxiliaryResult {
   pid: number | undefined;
   stdout: string;
   stderr: string;
-  started?: string;
+  started?: string | undefined;
   launcherPid?: number;
   launcherCode?: number | null;
   processIds?: number[];
@@ -216,6 +281,9 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
     PI_FABRIC_MESH_ROOT: meshRoot, PI_FABRIC_PROJECT_ROOT: cwd,
     PI_FABRIC_RUN_ROOT: path.join(root, "runs"), PI_FABRIC_AGENT_DIR: path.join(root, "exports"),
     PI_FABRIC_PI_BINARY: adapter, PI_FABRIC_NODE_BINARY: nodeBinary, FABRIC_NATIVE_OWNER_PINS: pinsPath,
+    // Actual product selector, not the fixture's generation/observer envelope.
+    // The existing SDK-written identity tuple selects a gate, never lock proof.
+    PI_FABRIC_NATIVE_OWNER_CONFIG: sessionPin,
     FABRIC_NATIVE_TEST_SDK_DIRECTORY: sdkDirectory, FABRIC_NATIVE_TEST_SDK_IMPORTS: path.join(root, "sdk-imports.jsonl"),
   });
   // Native loader observes and delegates unchanged; never substitutes an SDK.
@@ -242,10 +310,11 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
   }), { mode: 0o600 });
 
   let auxiliarySequence = 0;
-  const runAuxiliary = (label: string, args: string[], deadline?: NativeOwnerDeadline): Promise<NativeAuxiliaryResult> => new Promise((resolve, reject) => {
+  const runAuxiliary = (label: string, args: string[], deadline?: NativeOwnerDeadline, executable = nodeBinary, environment: NodeJS.ProcessEnv = env): Promise<NativeAuxiliaryResult> => new Promise((resolve, reject) => {
     if (deadline) remainingNativeOwnerMs(deadline); // Refuse even to spawn after the original signal-relative deadline.
     const name = `${label}-${++auxiliarySequence}`;
-    const child = spawn(nodeBinary, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(executable, args, { cwd, env: environment, stdio: ["ignore", "pipe", "pipe"] });
+    const started = child.pid ? startTime(child.pid) : undefined;
     const lifetime = watchResidentChild(child);
     let stdout = "", stderr = "", expired = false;
     child.stdout.on("data", chunk => { fs.appendFileSync(path.join(root, `${name}.stdout`), chunk, { mode: 0o600 }); stdout = `${stdout}${chunk}`.slice(-128_000); });
@@ -257,10 +326,10 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
       clearTimeout(timer);
       // A delayed timer or deadline cleanup can NEVER turn a late verifier into success.
       if (deadline && Number(process.hrtime.bigint() - deadline.startedNs) / 1_000_000 >= deadline.boundMs) expired = true;
-      fs.writeFileSync(path.join(root, `${name}.exit.json`), JSON.stringify({ pid: child.pid, code, signal, expired,
+      fs.writeFileSync(path.join(root, `${name}.exit.json`), JSON.stringify({ pid: child.pid, started, executable, args, code, signal, expired,
         stdoutClosed: child.stdout.destroyed, stderrClosed: child.stderr.destroyed }), { mode: 0o600 });
       if (expired) reject(new Error(`Native auxiliary ${label} did not terminate: ${stderr}`));
-      else resolve({ code, signal, pid: child.pid, stdout, stderr });
+      else resolve({ code, signal, pid: child.pid, started, stdout, stderr });
     });
   });
   const sessionArgs = (mode: "provision" | "verify") => [path.join(fixtureRoot, "native-owner-session.mjs"), mode, sdkDirectory, sessionFile, cwd, sessionPin,
@@ -300,6 +369,7 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
   let launcherExited: Promise<void> | undefined;
   let mainIdentity: { pid: number; started: string } | undefined;
   let mainPaused = false;
+  let startupCleanupFailure: Error | undefined;
   // Positive Linux death evidence, not launcher exit/EOF/kill acknowledgement.
   const death = (identity: { pid: number; started: string }): "absent" | "reused" | "zombie" | undefined => {
     let stat: string;
@@ -316,6 +386,68 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
     const observedNs = process.hrtime.bigint();
     fs.writeFileSync(path.join(root, `main-${generation}.death.json`), JSON.stringify({ ...identity, evidence }), { mode: 0o600, flag: "wx" });
     return observedNs;
+  };
+  // Failed startup must finish its own cleanup, not outlive an afterEach timeout.
+  // Only startup direct Mains are detached; all other launch/death bounds stay unchanged.
+  const cleanupFailedStartup = async (generation: number): Promise<void> => {
+    const child = main, identity = mainIdentity, closed = mainClosed;
+    const signals: NodeJS.Signals[] = [];
+    let childClosed = false, members: number[] | undefined, evidence: ReturnType<typeof death>;
+    const fields = (pid: number): string[] => {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const value = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+      if (value.length < 20 || !/^\d+$/.test(value[19]!)) throw new Error("Unknown startup cleanup process identity");
+      return value;
+    };
+    const groupMembers = (pgid: number): number[] => fs.readdirSync("/proc").filter(name => /^\d+$/.test(name)).flatMap(name => {
+      try { return Number(fields(Number(name))[2]) === pgid ? [Number(name)] : []; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+    });
+    const receipt = (confirmed: boolean, error?: unknown): void => {
+      fs.writeFileSync(path.join(root, `startup-${generation}.cleanup.json`), JSON.stringify({ kind: "TEST_CLEANUP",
+        phase: "failed-startup", identity, pgid: identity?.pid, signals, childClosed, death: evidence ?? "UNCONFIRMED",
+        groupMembers: members ?? "UNCONFIRMED", stdoutClosed: child?.stdout.destroyed ?? false,
+        stderrClosed: child?.stderr.destroyed ?? false, confirmed, ...(error ? { error: String(error) } : {}) }), { mode: 0o600, flag: "wx" });
+    };
+    try {
+      if (!child || !identity || !closed || options.mainLaunch !== "direct" || child.pid !== identity.pid ||
+          identity.pid <= 1 || identity.pid === process.pid || identity.pid === process.ppid) {
+        throw new Error("No exact direct startup Main custody; group cleanup refused");
+      }
+      evidence = death(identity);
+      if (!evidence) {
+        const recorded = owned.owned().some(value => value.pid === identity.pid && value.started === identity.started && value.argv[0] === nativeOwnerEntry);
+        const selfStat = fields(process.pid), parentStat = fields(process.ppid), mainStat = fields(identity.pid);
+        if (!recorded || child.exitCode !== null || child.signalCode !== null || mainStat[19] !== identity.started ||
+            Number(mainStat[1]) !== process.pid || Number(mainStat[2]) !== identity.pid || Number(mainStat[3]) !== identity.pid ||
+            Number(selfStat[2]) === identity.pid || Number(parentStat[2]) === identity.pid) {
+          throw new Error("Startup Main birth/direct-child/exclusive-group proof failed; group cleanup refused");
+        }
+        // No await between validation and BOTH signals. This direct child cannot
+        // be reaped/reused by the event loop between SIGCONT and SIGKILL.
+        process.kill(-identity.pid, "SIGCONT"); signals.push("SIGCONT");
+        process.kill(-identity.pid, "SIGKILL"); signals.push("SIGKILL");
+      }
+      let closeError: unknown;
+      void closed.then(() => { childClosed = true; observations.wake(); }, error => { closeError = error; observations.wake(); });
+      await observations.until(() => {
+        if (closeError) throw closeError;
+        evidence = death(identity); members = groupMembers(identity.pid);
+        return childClosed && child.stdout.destroyed && child.stderr.destroyed && !!evidence && members.length === 0;
+      }, "failed-startup actual child close/death/exclusive group empty", 10_000, { pollMs: 25 });
+      const retainedDeath = path.join(root, `main-${generation}.death.json`);
+      if (fs.existsSync(retainedDeath)) {
+        const retained = json<{ pid: number; started: string; evidence: string }>(retainedDeath);
+        if (retained.pid !== identity.pid || retained.started !== identity.started || !["absent", "reused", "zombie"].includes(retained.evidence)) {
+          throw new Error("Retained Main death evidence does not match startup custody");
+        }
+      } else recordDeath(generation, identity);
+      receipt(true);
+      main = undefined; mainIdentity = undefined; mainPaused = false;
+    } catch (error) {
+      receipt(false, error);
+      throw error;
+    }
   };
   let lastError = "";
   const pending = new Map<string, { resolve: (value: RpcRecord) => void; reject: (error: unknown) => void }>();
@@ -337,7 +469,7 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
       });
     });
   };
-  const start = async (): Promise<void> => {
+  const start = async (startup?: { barrier: "pre-ready" | "sdk-append" }): Promise<void> => {
     if (main) throw new Error("Native owner Main already running or awaiting terminal join");
     // No parent verify/provision here: the actual Main takes its nonblocking
     // fence FIRST, then verifies the pinned file before SDK/task-entry can open it.
@@ -345,7 +477,25 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
     const launcherReceipt = path.join(root, `launcher-${generation}.custody.json`);
     const args = options.mainLaunch === "launcher"
       ? [path.join(fixtureRoot, "native-owner-launcher.mjs"), pinsPath, launcherReceipt, "--", ...mainArgs()] : mainArgs();
-    const child = spawn(nodeBinary, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+    let launchEnv = env;
+    if (startup) {
+      if (options.mainLaunch !== "direct") throw new Error("Startup crash requires the actual direct product Main");
+      const receipt = path.join(root, `startup-${generation}.barrier.json`);
+      launchEnv = { ...env, FABRIC_NATIVE_STARTUP_PHASE: startup.barrier, FABRIC_NATIVE_STARTUP_SESSION: sessionFile,
+        FABRIC_NATIVE_STARTUP_RECEIPT: receipt,
+        NODE_OPTIONS: `${env.NODE_OPTIONS ?? ""} --import=${new URL("../fixtures/native-owner-observer.mjs?startup-io", import.meta.url).href}` };
+      if (startup.barrier === "sdk-append") {
+        const source = path.join(root, `startup-${generation}.c`), library = path.join(root, `startup-${generation}.so`);
+        fs.writeFileSync(source, startupShortWriteSource, { mode: 0o600, flag: "wx" });
+        const result = await runAuxiliary("startup-interposer-compile", ["-shared", "-fPIC", "-Wall", "-Werror", "-o", library, source, "-ldl"], undefined, "/usr/bin/cc");
+        fs.writeFileSync(path.join(root, `startup-${generation}.compiler.json`), JSON.stringify({ ...result,
+          compiler: fs.realpathSync("/usr/bin/cc"), compilerSha256: digest("/usr/bin/cc"), sourceSha256: digest(source),
+          librarySha256: result.code === 0 ? digest(library) : null, approval: "UNPINNED host compiler; test barrier only" }), { mode: 0o600, flag: "wx" });
+        if (result.code !== 0 || result.signal) throw new Error(`Cannot compile actual startup short-write barrier: ${result.stderr}`);
+        launchEnv.LD_PRELOAD = library;
+      }
+    }
+    const child = spawn(nodeBinary, args, { cwd, env: launchEnv, detached: !!startup, stdio: ["pipe", "pipe", "pipe"] });
     main = child;
     if (options.mainLaunch !== "launcher") {
       if (!child.pid) throw new Error("Main spawn has no owned pid");
@@ -412,6 +562,26 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
         return true;
       }, "actual test launcher/Main birth receipt");
     }
+    if (startup) {
+      try {
+        await observations.until(async () => {
+          if (!mainIdentity || death(mainIdentity)) throw new Error(`Actual startup barrier exited: ${lastError}`);
+          if (!fs.existsSync(path.join(root, `startup-${generation}.barrier.json`))) return false;
+          const stat = await fs.promises.readFile(`/proc/${mainIdentity.pid}/stat`, "utf8");
+          const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+          return fields[19] === mainIdentity.started && fields[0] === "T";
+        }, `actual ${startup.barrier} Main stopped with kernel/byte evidence`, 60_000, { pollMs: 25 });
+        mainPaused = true; // cleanup can resume this exact owned stopped child
+        return; // NOT READY. No get_state, no model/user turn, no second Main.
+      } catch (error) {
+        try { await cleanupFailedStartup(generation); }
+        catch (cleanupError) {
+          startupCleanupFailure = cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError));
+          throw new AggregateError([error, cleanupError], "Actual startup observation failed; owned group cleanup UNCONFIRMED", { cause: error });
+        }
+        throw error; // Successful cleanup never turns failed observation into acceptance.
+      }
+    }
     const state = await request("get_state");
     if (!state.success || !isNativeSdkUnconfigured(state.data?.model, sdkDirectory) || state.data?.sessionId !== pin.sessionId ||
         state.data?.sessionFile !== sessionFile || (state.data?.capabilities as { inputAdmission?: unknown })?.inputAdmission !== 1) {
@@ -458,6 +628,7 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
     } finally { if (timer) clearTimeout(timer); }
   };
   const stopMain = async (): Promise<void> => {
+    if (startupCleanupFailure) throw startupCleanupFailure;
     const child = main;
     if (!child) return;
     if (mainPaused && mainIdentity && !death(mainIdentity)) resumeMain();
@@ -560,6 +731,95 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
       return attributed;
     },
     attemptSessionAccess: (mode: "provision" | "verify", deadline?: NativeOwnerDeadline) => runAuxiliary(`contending-${mode}`, sessionArgs(mode), deadline),
+    async probeDiscovery(): Promise<Record<string, unknown>> {
+      // The ordinary selected profile has NO native session-dir selector. Native
+      // file/path pins are explicit and remain outside this profile's defaults.
+      const ordinaryEnv = { ...env, PI_CODING_AGENT_SESSION_DIR: undefined, TERM: "xterm-256color" };
+      const args = (mode: string) => [path.join(fixtureRoot, "native-owner-session.mjs"), mode, sdkDirectory, sessionFile, cwd, sessionPin,
+        nativeOwnerEntry, digest(nativeOwnerEntry)];
+      const listed = await runAuxiliary("ordinary-discovery", args("discovery"), undefined, nodeBinary, ordinaryEnv);
+      if (listed.code !== 0 || listed.signal) throw new Error(`Real ordinary discovery refused: ${listed.stderr}`);
+      const value = JSON.parse(listed.stdout) as Record<string, unknown>;
+      const bare = await runAuxiliary("ordinary-bare-native", args("discovery-bare-native"), undefined, nodeBinary, ordinaryEnv);
+      const driver = path.join(root, "ordinary-resume-pty.py");
+      fs.writeFileSync(driver, String.raw`import errno, fcntl, json, os, pty, select, struct, subprocess, sys, termios, time
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 120, 0, 0))
+child = subprocess.Popen(sys.argv[1:], stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+os.close(slave)
+output = bytearray(); sent = False; deadline = time.monotonic() + 25
+try:
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([master], [], [], max(0, deadline-time.monotonic()))
+        if not ready: raise RuntimeError('real resume picker deadline')
+        try: data = os.read(master, 65536)
+        except OSError as error:
+            if error.errno == errno.EIO: break
+            raise
+        if not data: break
+        output.extend(data)
+        if not sent and b'ordinary-discovery-positive-control' in output:
+            os.write(master, b'\r'); sent = True
+    else: raise RuntimeError('real resume picker deadline')
+    code = child.wait(timeout=2)
+    sys.stdout.buffer.write(output); sys.stdout.buffer.flush()
+    print(json.dumps({'realResumeChild': child.pid, 'code': code, 'selectedViaActualPicker': sent}))
+    sys.exit(code)
+finally:
+    os.close(master)
+    if child.poll() is None:
+        child.kill(); child.wait(timeout=5)
+`, { mode: 0o600, flag: "wx" });
+      const resume = await runAuxiliary("ordinary-real-resume", [driver, nodeBinary, ...args("discovery-resume")], undefined, "/usr/bin/python3", ordinaryEnv);
+      const match = /NATIVE_DISCOVERY_RESUME_RESULT:(\{[^\r\n]+\})/.exec(resume.stdout);
+      const receipt = { ...value, bareNative: bare, resume, resumeSelection: match ? JSON.parse(match[1]!) : null,
+        pathPinChanged: false, schemaChanged: false, migrationPerformed: false };
+      fs.writeFileSync(path.join(root, "ordinary-discovery-isolation.json"), JSON.stringify(receipt, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+      return receipt;
+    },
+    async attemptOrdinaryTask(): Promise<NativeAuxiliaryResult> {
+      const prepared = await runAuxiliary("ordinary-custom-session", [path.join(fixtureRoot, "native-owner-session.mjs"), "ordinary-custom-session",
+        sdkDirectory, sessionFile, cwd, sessionPin, nativeOwnerEntry, digest(nativeOwnerEntry)]);
+      if (prepared.code !== 0 || prepared.signal) throw new Error(`Ordinary session preparation refused: ${prepared.stderr}`);
+      const ordinary = JSON.parse(prepared.stdout) as { sessionFile: string; sessionId: string };
+      if (ordinary.sessionFile === sessionFile || ordinary.sessionId === pin.sessionId) throw new Error("Ordinary positive reused native identity");
+      return runAuxiliary("ordinary-bare-task", [taskEntry, sdkDirectory, "1", "--mode", "rpc", "--session", ordinary.sessionFile,
+        "--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes", "--no-mcp"]);
+    },
+    attemptFenceProof: (mode: "unlocked-proof" | "replaced-holder" | "clean-cli-session" | "inspect-cli-session") =>
+      runAuxiliary(mode, [path.join(fixtureRoot, "native-owner-session.mjs"), mode, sdkDirectory, sessionFile, cwd, sessionPin,
+        nativeOwnerEntry, digest(nativeOwnerEntry)]),
+    async attemptUnfencedRoute(route: "plain-cli" | "bare-task"): Promise<NativeAuxiliaryResult> {
+      const args = route === "plain-cli" ? [path.join(sdkDirectory, "cli.js")] : [taskEntry, sdkDirectory, "1"];
+      args.push("--mode", "rpc", "--session", sessionFile, "--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
+        "--extension", pins.observer, "--extension", path.join(fixtureRoot, "native-owner-bootstrap.mjs"), "--extension", path.join(candidateRoot, "dist/index.js"));
+      const child = spawn(nodeBinary, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+      const started = child.pid ? startTime(child.pid) : undefined;
+      const lifetime = watchResidentChild(child);
+      const label = `unfenced-${route}-${++auxiliarySequence}`;
+      let stdout = "", stderr = "", expired = false;
+      child.stdin.on("error", error => { if ((error as NodeJS.ErrnoException).code !== "EPIPE") throw error; });
+      // Leave the ACTUAL stdin pipe open. Only product refusal may terminate it;
+      // do not manufacture EOF/death to disguise a swallowed hook exception.
+      child.stdin.write(JSON.stringify({ type: "prompt", id: "must-not-admit", message: "Must refuse before this input." }) + "\n");
+      child.stdout.on("data", value => { stdout += value; fs.appendFileSync(path.join(root, `${label}.stdout`), value, { mode: 0o600 }); });
+      child.stderr.on("data", value => { stderr += value; fs.appendFileSync(path.join(root, `${label}.stderr`), value, { mode: 0o600 }); });
+      const result = await new Promise<NativeAuxiliaryResult>((resolve, reject) => {
+        const timer = setTimeout(() => { expired = true; void lifetime.stop().catch(reject); }, 30_000);
+        child.once("error", reject);
+        child.once("close", (code, signal) => {
+          clearTimeout(timer);
+          const identity = { pid: child.pid!, started: started! };
+          const evidence = death(identity);
+          const value = { pid: child.pid, started, code, signal, stdout, stderr };
+          fs.writeFileSync(path.join(root, `${label}.exit.json`), JSON.stringify({ ...value, args, executable: nodeBinary,
+            expired, death: evidence, stdinEndedByParent: false, stdoutClosed: child.stdout.destroyed, stderrClosed: child.stderr.destroyed }), { mode: 0o600, flag: "wx" });
+          if (expired || !evidence) reject(new Error(`Actual ${route} did not refuse/terminate: ${stderr}`));
+          else resolve(value);
+        });
+      });
+      return result;
+    },
     async probeModelPolicy(): Promise<Record<string, unknown>> {
       const result = await runAuxiliary("model-policy", [path.join(fixtureRoot, "native-owner-model-policy-probe.mjs")]);
       if (result.code !== 0) throw new Error(`Actual SDK no-model proof refused: ${result.stderr}`);
@@ -569,6 +829,10 @@ export const createNativeActorOwner = async (options: NativeActorOwnerOptions) =
     observations: () => fs.existsSync(observerFile) ? fs.readFileSync(observerFile, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>) : [],
     callbacks: () => fs.existsSync(callbacks) ? fs.readFileSync(callbacks, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>) : [],
     async close(): Promise<void> {
+      if (startupCleanupFailure) {
+        observations.close(); mesh.closeState(); privateTemp.assertNoOutsideDeletion();
+        throw startupCleanupFailure; // Keep unconfirmed custody unsealed for the parent; no fallback signals.
+      }
       try { await stopMain(); }
       finally {
         let terminal = false;

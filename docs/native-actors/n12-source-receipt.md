@@ -4,18 +4,18 @@ For [smarty-inbox #342](https://github.com/Smarty-Pants-Inc/smarty-inbox/issues/
 
 ## Canonical command and terminal result
 
-Retained repository-relative evidence: `.local/342-evidence/tmp.GeYhccIwEc/{terminal.json,stdout,stderr,owned.json,verify-n12.mjs,native-fixture-evidence.manifest.json}`. At execution the job directory was `/srv/scratch/paul/smarty-pi-tmp/pi-936bdbe33251/p.G97vYi/tmp.GeYhccIwEc`.
+Retained private receipt identity: **job `tmp.GeYhccIwEc`**, with terminal/stdout/stderr/owned record, driver and archive manifest. Their hashes below bind the original files; private absolute paths are deliberately not public authority links.
 
-Exact terminal command (argv order preserved):
+**Portable command rendering**, not a byte-exact raw transcript. `TEST_ENV` means the approved test-environment executable, `NODE` the selected Node executable, `JOB` the retained job directory and `REPO` the extracted candidate repository. Argv order and flags are preserved; these variables substitute private paths:
 
 ```sh
-systemd-run --user --scope -p CPUQuota=400% nice -n 10 /home/paul/smarty/smarty-pants/bin/smarty-test-env -- /opt/node-v24.19.0-linux-x64/bin/node /srv/scratch/paul/smarty-pi-tmp/pi-936bdbe33251/p.G97vYi/tmp.GeYhccIwEc/verify-n12.mjs
+systemd-run --user --scope -p CPUQuota=400% nice -n 10 "$TEST_ENV" -- "$NODE" "$JOB/verify-n12.mjs"
 ```
 
-The retained `verify-n12.mjs` selected launcher-owned test temp state and ran this child command with inherited streams, cwd `/home/paul/lanes/fs-342hub`, timeout 420,000 ms:
+The retained `verify-n12.mjs` selected launcher-owned test temp state and ran this child command with inherited streams, cwd `REPO`, timeout 420,000 ms (same portable substitutions):
 
 ```sh
-/opt/node-v24.19.0-linux-x64/bin/node /home/paul/lanes/fs-342hub/node_modules/vitest/vitest.mjs run tests/bridge-nats-ledger.test.ts tests/nats-auth-path-b-bridge-ledger-rollback.test.ts --retry=0
+"$NODE" "$REPO/node_modules/vitest/vitest.mjs" run tests/bridge-nats-ledger.test.ts tests/nats-auth-path-b-bridge-ledger-rollback.test.ts --retry=0
 ```
 
 | Terminal field | Actual value |
@@ -59,7 +59,7 @@ The R4 writer hash-read the retained extracted old ledger/custody/lock and candi
 
 Candidate-generated native **and ordinary** ask/cancel claims, receipts, identity/principal/retained bodies, outcomes and event dedupe survive exact-old-SOURCE open, old append, compaction and reopen. One real candidate append crash is recovered by the old reader's built-in single-tail cut, with prior claims/dedupe preserved. Short/zero/write/fsync append faults fail-stop without a later queued append. Corrupt middle records (with and without a tail) and two damaged suffix records refuse. Originals and ambiguous outcomes are retained; no unknown work is dispatched.
 
-The delivery/KV source and owner ACKs are synthetic. This is **no real broker, SDK/Main/native callback, production app/dedupe, installed old binary or traffic-restoration proof**. It does not cover R4 directory drift / recipe / issued-scope / whole-link additions. All R4 checks are **UNRUN** in prep.
+The delivery/KV source and owner ACKs are synthetic. This is **no real broker, SDK/Main/native callback, production app/dedupe, installed old binary or traffic-restoration proof**. It does not cover R4 directory drift / recipe / issued-scope / whole-link additions. At that historical prep snapshot all R4 checks were **UNRUN**. Later R4 SOURCE/component receipts are separately recorded in [r5-final-receipt.md](r5-final-receipt.md); none is the installed-artifact gate.
 
 ## Evidence hashes read during prep
 

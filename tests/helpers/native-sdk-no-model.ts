@@ -6,7 +6,9 @@ import { createHash } from "node:crypto";
 import { types } from "node:util";
 
 export const NATIVE_SDK_RELEASE = "031c749962972b0cb966e443e921d64654627b20";
-export const NATIVE_SDK_DIRECTORY = `/home/paul/.local/share/smarty-dev/pi-runtime/releases/${NATIVE_SDK_RELEASE}/node/node_modules/@earendil-works/pi-coding-agent/dist`;
+// Private proof resources are caller-supplied, never host path allow-lists.
+// Approval remains the reviewed release and ALL ten source/package hashes below.
+export const NATIVE_SDK_DIRECTORY = process.env.FABRIC_NATIVE_TEST_PI_SDK_DIST ?? "";
 export const NATIVE_SDK_SOURCE_PINS: Readonly<Record<string, string>> = Object.freeze({
   "../package.json": "a87892a2985221d6c80a921a5016341117ebf8223f5f49eac12c79b3ac43719c",
   "../../pi-agent-core/package.json": "541f131cd43832f75a9c64ee886c367c219c0772da7047c66053d7cc80db98b9",
@@ -22,7 +24,7 @@ export const NATIVE_SDK_SOURCE_PINS: Readonly<Record<string, string>> = Object.f
 
 /** Do not learn approval by hashing the environment and trusting those new hashes. */
 export function assertApprovedNativeSdk(sdkDirectory: string): void {
-  if (sdkDirectory !== NATIVE_SDK_DIRECTORY || fs.realpathSync(sdkDirectory) !== NATIVE_SDK_DIRECTORY) {
+  if (!path.isAbsolute(sdkDirectory) || path.resolve(sdkDirectory) !== sdkDirectory || fs.realpathSync(sdkDirectory) !== sdkDirectory) {
     throw new Error(`N7 BLOCKED: unapproved SDK release; required ${NATIVE_SDK_RELEASE}`);
   }
   for (const [relative, expected] of Object.entries(NATIVE_SDK_SOURCE_PINS)) {
@@ -40,9 +42,9 @@ export function nativeSdkTestPrerequisite(): string | undefined {
   const nodeBinary = process.env.FABRIC_NATIVE_TEST_NODE;
   let missingSdk = false;
   if (sdkDirectory) {
-    if (sdkDirectory !== NATIVE_SDK_DIRECTORY) assertApprovedNativeSdk(sdkDirectory);
+    if (!path.isAbsolute(sdkDirectory) || path.resolve(sdkDirectory) !== sdkDirectory) throw new Error("N7 BLOCKED: unapproved SDK path");
     try {
-      if (fs.realpathSync(sdkDirectory) !== NATIVE_SDK_DIRECTORY) throw new Error("N7 BLOCKED: unapproved SDK realpath");
+      if (fs.realpathSync(sdkDirectory) !== sdkDirectory) throw new Error("N7 BLOCKED: unapproved SDK realpath");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       missingSdk = true;

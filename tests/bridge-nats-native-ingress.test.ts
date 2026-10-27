@@ -34,7 +34,7 @@ import {
 const ACTOR = "5027cfd59b1247b6bb4666970c481cc4";
 const OWNER = residentHostId(fileLead.id);
 const ACTOR_IDENTITY: MeshIdentity = { id: ACTOR, name: "native-inbox", kind: "actor" };
-const principal = { id: "herdr:paul", binding: "herdr-client" as const };
+const principal = { id: "herdr:principal-a", binding: "herdr-client" as const };
 const roots: string[] = [];
 const ledgers: FileBridgeNatsLedger[] = [];
 const stores: MeshStore[] = [];
@@ -127,7 +127,8 @@ const fixture = async () => {
 
 /** R4 ordinary-traffic boundary: actual startNatsLink, MeshBridge loops, file store and ledger.
  * Only the NATS port/KV presence is fake. No owner reply, native context, ACK or callback is minted.
- * PREPARED/UNRUN: these cases are not covered by the historical N12 11 + ledger 24 receipt.
+ * Historical R4 SOURCE/component runs are transcribed in docs/native-actors/r5-final-receipt.md;
+ * distinct from the earlier N12 11 + ledger 24 receipt, and never installed-artifact proof.
  */
 const ordinaryLinkFixture = async (ledgerClock?: () => number) => {
   const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "r4-ordinary-link-")); roots.push(root);
@@ -419,7 +420,7 @@ describe.skipIf(!POSIX)("native ingress: genuine durable claims, not public even
       e => { bodyOf(e).requestedAt = f.clock.now - 1; }, e => { bodyOf(e).requestCreatedAt = 1; },
       e => { bodyOf(e).ownerIncarnation = "another-owner"; }, e => { e.to = "another-host"; },
       e => { e.from = { ...e.from, id: otherNats.id, sessionId: otherNats.id.slice(8) }; },
-      e => { e.from.kind = "actor"; }, e => { e.principal = { id: "herdr:kate", binding: "herdr-client" }; },
+      e => { e.from.kind = "actor"; }, e => { e.principal = { id: "herdr:principal-b", binding: "herdr-client" }; },
       e => { (bodyOf(e).bridge as Record<string, unknown>).id = "another-source-envelope"; },
       e => { (bodyOf(e).bridge as Record<string, unknown>).from = "stdio-peer"; },
       e => { bodyOf(e).binding = { model: "not-a-model-route" }; }, e => { bodyOf(e).wakeCause = { changed: true }; },

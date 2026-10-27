@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { createNativeActorOwner, type NativeActorOwner } from "./helpers/native-actor-owner.js";
+import { residentDrainTemp } from "./helpers/resident-drain-temp.js";
 import { NATIVE_SDK_DIRECTORY, assertApprovedNativeSdk, nativeSdkTestPrerequisite } from "./helpers/native-sdk-no-model.js";
 
 // Expected skip: missing Linux/approved SDK files/executable Node/env in ordinary CI only.
@@ -17,7 +18,7 @@ import { residentProcessAlive } from "../src/residency/process-identity.js";
 const repo = fileURLToPath(new URL("../", import.meta.url));
 const actorId = "88888888888848888888888888888888"; // synthetic test actor, never production
 const owners: NativeActorOwner[] = [];
-afterEach(async () => { for (const owner of owners.splice(0)) await owner.close(); });
+afterEach(async () => { for (const owner of owners.splice(0)) await owner.close(); }, 90_000);
 const hash = (file: string): string => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 const realOwner = async (mainLaunch: "direct" | "launcher" = "direct"): Promise<NativeActorOwner> => {
   const sdkDirectory = process.env.FABRIC_NATIVE_TEST_PI_SDK_DIST, nodeBinary = process.env.FABRIC_NATIVE_TEST_NODE;
@@ -102,7 +103,7 @@ const exactRestartAppend = (owner: NativeActorOwner, before: Buffer, started: nu
   expect(entry.type).toBe("thinking_level_change"); expect(entry.thinkingLevel).toBe("off");
   expect(entry.id).toMatch(/^(?:[0-9a-f]{8}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/);
   expect(prior.some(value => value.id === entry.id)).toBe(false);
-  expect(entry.parentId).toBe(prior.at(-1)!.id);
+  expect(entry.parentId).toBe(prior.filter(value => value.type !== "session").at(-1)?.id ?? null);
   expect(typeof entry.timestamp).toBe("string");
   const timestamp = entry.timestamp as string;
   expect(timestamp).toBe(new Date(timestamp).toISOString());
@@ -111,6 +112,88 @@ const exactRestartAppend = (owner: NativeActorOwner, before: Buffer, started: nu
 };
 
 describe.skipIf(!!nativeSkipReason)(`F1(b) actual candidate-installed native owner entry${nativeSkipReason ? ` [SKIP: ${nativeSkipReason}]` : ""}`, () => {
+  it.each(["pre-ready", "sdk-append"] as const)("Q1 SIGKILL of actual Main at %s releases its proven fence; same pinned inode survives actual SDK parser/restart", async barrier => {
+    const owner = await realOwner(); assertInstalled(owner);
+    const before = snapshot(owner), lock = inode(`${owner.sessionFile}.main.lock`);
+    await owner.start({ barrier }); // Returns at observed kernel T, explicitly NOT READY.
+    const identity = owner.mainIdentity()!;
+    expect(owner.mainLive()).toBe(true); expect(fenceDescriptors(owner, identity.pid)).toHaveLength(1);
+    expect(fs.existsSync(path.join(owner.residencyRoot, "maintenance-ready.json"))).toBe(false);
+    expect(owner.observations()).toEqual([]); expect(owner.callbacks()).toEqual([]);
+    const receipt = JSON.parse(fs.readFileSync(path.join(owner.root, "startup-1.barrier.json"), "utf8"));
+    expect(receipt.pid).toBe(identity.pid);
+    let partial = Buffer.alloc(0);
+    if (barrier === "pre-ready") {
+      expect(receipt.event).toBe("before-first-sdk-load");
+      expect(receipt.proof).toMatchObject(lock);
+      expect(receipt.proof.info).toMatch(/^lock:\s+\d+:\s+FLOCK\s+ADVISORY\s+WRITE\s/m);
+      unchanged(owner, before);
+    } else {
+      const call = JSON.parse(fs.readFileSync(path.join(owner.root, "startup-1.barrier.json.sdk-call.json"), "utf8"));
+      expect(call.pid).toBe(identity.pid); expect(call.event).toBe("actual-sdk-appendFileSync-invocation");
+      expect(call.stack).toContain(`${NATIVE_SDK_DIRECTORY}/core/session-manager.js`);
+      expect(call.proof).toMatchObject(lock); expect(call.proof.info).toMatch(/FLOCK\s+ADVISORY\s+WRITE/);
+      const requested = Buffer.from(call.dataBase64, "base64");
+      const line = JSON.parse(requested.toString("utf8"));
+      expect(Object.keys(line)).toEqual(["type", "id", "parentId", "timestamp", "thinkingLevel"]);
+      expect(line).toMatchObject({ type: "thinking_level_change", thinkingLevel: "off" });
+      expect(receipt).toMatchObject({ event: "real-libc-write-short-return", ...before.sessionInode,
+        beforeSize: before.session.length, requested: requested.length });
+      expect(receipt.written).toBeGreaterThan(0); expect(receipt.written).toBeLessThan(requested.length);
+      expect(receipt.delegated).toBe(receipt.written);
+      partial = requested.subarray(0, receipt.written);
+      expect(fs.readFileSync(owner.sessionFile)).toEqual(Buffer.concat([before.session, partial]));
+      expect(receipt.afterSize).toBe(before.session.length + partial.length);
+      expect(partial.at(-1)).not.toBe(0x0a);
+      expect(() => JSON.parse(partial.toString("utf8"))).toThrow();
+    }
+    const atBarrier = snapshot(owner);
+    // While the actual stopped writer retains its OFD, no verify or Main can write.
+    for (const attempt of [() => owner.attemptSecondMain(), () => owner.attemptSessionAccess("verify")]) {
+      const result = await attempt(); expect(result.code).not.toBe(0); expect(result.signal).toBeNull();
+      expect(result.stderr).toContain("NATIVE_OWNER_SESSION_BUSY");
+      expect(owner.sdkImports().filter(value => value.pid === result.pid)).toEqual([]);
+      unchanged(owner, atBarrier);
+    }
+    const startedNs = process.hrtime.bigint(), boundMs = 2000;
+    await owner.crashMain(); // Exact recorded ChildProcess, positive death + closed stdout/stderr.
+    const death = JSON.parse(fs.readFileSync(path.join(owner.root, "main-1.death.json"), "utf8"));
+    const closed = JSON.parse(fs.readFileSync(path.join(owner.root, "main-1.close.json"), "utf8"));
+    expect(death).toMatchObject(identity); expect(["absent", "reused", "zombie"]).toContain(death.evidence);
+    expect(closed).toMatchObject({ pid: identity.pid, signal: "SIGKILL", stdoutClosed: true, stderrClosed: true });
+    const verify = await owner.attemptSessionAccess("verify", { startedNs, boundMs });
+    expect(verify.code).toBe(0); expect(JSON.parse(verify.stdout)).toEqual(owner.pin);
+    const releaseVerifiedMs = Number(process.hrtime.bigint() - startedNs) / 1_000_000;
+    expect(releaseVerifiedMs).toBeLessThanOrEqual(boundMs);
+    const parsedBytes = fs.readFileSync(owner.sessionFile);
+    // Real 031c parser skips the malformed final record and repairs ONLY its
+    // missing newline. This pre-hook SDK write is a named residual, not Fabric.
+    expect(parsedBytes).toEqual(Buffer.concat([before.session, partial, ...(partial.length ? [Buffer.from("\n")] : [])]));
+    const start = Date.now(); await owner.start(); const ready = Date.now();
+    expect(owner.mainPid()).not.toBe(identity.pid); expect(fenceDescriptors(owner, owner.mainPid()!)).toHaveLength(1);
+    expect(inode(`${owner.sessionFile}.main.lock`)).toEqual(lock);
+    expect(inode(owner.sessionFile)).toEqual(before.sessionInode); expect(inode(owner.sessionPin)).toEqual(before.pinInode);
+    expect(fs.readFileSync(owner.sessionPin)).toEqual(before.pin); expect(owner.binding.rootId).toBe(owner.pin.rootId);
+    if (!partial.length) exactRestartAppend(owner, before.session, start, ready);
+    else {
+      const bytes = fs.readFileSync(owner.sessionFile);
+      expect(bytes.subarray(0, parsedBytes.length)).toEqual(parsedBytes);
+      const lines = bytes.subarray(parsedBytes.length).toString("utf8").split("\n");
+      expect(lines).toHaveLength(2); expect(lines[1]).toBe("");
+      const line = JSON.parse(lines[0]!);
+      expect(Object.keys(line)).toEqual(["type", "id", "parentId", "timestamp", "thinkingLevel"]);
+      expect(line).toMatchObject({ type: "thinking_level_change", thinkingLevel: "off",
+        parentId: before.session.toString("utf8").trimEnd().split("\n")
+          .map(value => JSON.parse(value) as Record<string, unknown>)
+          .filter(value => value.type !== "session").at(-1)?.id ?? null });
+      expect(Date.parse(line.timestamp)).toBeGreaterThanOrEqual(start); expect(Date.parse(line.timestamp)).toBeLessThanOrEqual(ready);
+    }
+    noModel(owner);
+    fs.writeFileSync(path.join(owner.root, "q1-crash-restart.json"), JSON.stringify({ barrier, identity, death, closed, lock,
+      pin: owner.pin, beforeBytes: before.session.length, partialBytes: partial.length, releaseVerifiedMs, boundMs,
+      verification: verify, restartPid: owner.mainPid(), start, ready }), { mode: 0o600, flag: "wx" });
+  }, 180_000);
+
   it("fences the ACTUAL executable before all SDK/session work; kernel Main death alone permits same-file restart", async () => {
     const owner = await realOwner(); assertInstalled(owner); await owner.start();
     const identity = owner.mainIdentity()!, resident = owner.owner(), before = snapshot(owner);
@@ -146,10 +229,9 @@ describe.skipIf(!!nativeSkipReason)(`F1(b) actual candidate-installed native own
       const owner = await realOwner("launcher"); assertInstalled(owner); await owner.start();
       const identity = owner.mainIdentity()!, resident = owner.owner(), before = snapshot(owner);
       const lock = inode(`${owner.sessionFile}.main.lock`), pin = { ...owner.pin }, rootId = owner.binding.rootId;
-      // Frozen Step1 wall traces conservatively enclose terminal + verified
-      // release by 324ms. This is a 1676ms margin, NOT a fresh measurement.
-      const measuredUpperMs = 324, marginMs = 1676, boundMs = 2000;
-      expect(measuredUpperMs + marginMs).toBe(boundMs);
+      // Regression deadline for natural EOF + positive Main death/stdio + actual
+      // fenced verifier. Not an N6 production/hung-Main or host-load guarantee.
+      const boundMs = 2000;
       let step = 0;
       const trace = (event: string, evidence: unknown): void => fs.appendFileSync(path.join(owner.root, "launcher-handover.jsonl"),
         JSON.stringify({ order, step: ++step, at: Date.now(), monotonicNs: process.hrtime.bigint().toString(), event, evidence }) + "\n", { mode: 0o600 });
@@ -236,7 +318,7 @@ describe.skipIf(!!nativeSkipReason)(`F1(b) actual candidate-installed native own
       expect(releaseVerifiedMs).toBeGreaterThanOrEqual(positiveDeathMs); expect(releaseVerifiedMs).toBeLessThanOrEqual(boundMs);
       trace("old-Main-EOF-bound-and-product-fence-verified", { clock: "process.hrtime.bigint", startEvent, startedAt,
         startedNs: startedNs.toString(), launcherSignalAt, launcherSignalNs: launcherSignalNs.toString(),
-        holdMs, launcherEofHeldMs, holdStartedNs: holdStartedNs?.toString(), measuredUpperMs, marginMs, boundMs,
+        holdMs, launcherEofHeldMs, holdStartedNs: holdStartedNs?.toString(), boundMs,
         stdioClosedNs: joined.stdioClosedNs.toString(), stdioClosedMs, positiveDeathNs: joined.positiveDeathNs.toString(), positiveDeathMs,
         releaseVerifiedAt, releaseVerifiedNs: releaseVerifiedNs.toString(), releaseVerifiedMs, identity, death, closed, verify, lock, pin, rootId });
       const start = Date.now(); await owner.start(); const ready = Date.now();
@@ -262,6 +344,119 @@ describe.skipIf(!!nativeSkipReason)(`F1(b) actual candidate-installed native own
     }
   }, 180_000);
 
+  it("rejects an unlocked SAME-inode fd before SDK open and rechecks an old holder's actual SDK open/append after public lock replacement", async () => {
+    const owner = await realOwner(); assertInstalled(owner);
+    const before = snapshot(owner);
+    const unlocked = await owner.attemptFenceProof("unlocked-proof");
+    expect(unlocked.code).not.toBe(0); expect(unlocked.signal).toBeNull();
+    expect(unlocked.stderr).toContain("NATIVE_OWNER_FENCE_REQUIRED");
+    expect(unlocked.stderr).toContain("no whole-file WRITE FLOCK");
+    expect(owner.sdkImports().filter(value => value.pid === unlocked.pid)).toEqual([]); unchanged(owner, before);
+    const replaced = await owner.attemptFenceProof("replaced-holder");
+    expect(replaced.code).toBe(0); expect(replaced.signal).toBeNull();
+    expect(JSON.parse(replaced.stdout).refusals).toEqual(["open", "append"].map(operation => expect.objectContaining({
+      operation, name: "NativeOwnerFenceError", code: "NATIVE_OWNER_FENCE_REQUIRED" })));
+    expect(owner.sdkImports().some(value => value.pid === replaced.pid && value.url.endsWith("/core/session-manager.js"))).toBe(true);
+    unchanged(owner, before);
+    // Do NOT claim a fresh same-UID/new-inode contender is excluded. The retained
+    // old holder's next real I/O refuses; check-to-write TOCTOU remains explicit.
+  }, 180_000);
+
+  it("missing-lock native config selection refuses bare task before SDK work without reading or changing native bytes; ordinary custom session still opens", async () => {
+    const owner = await realOwner(); assertInstalled(owner);
+    const before = snapshot(owner), lock = `${owner.sessionFile}.main.lock`;
+    fs.renameSync(lock, `${lock}.retained-missing-lock-control`);
+    expect(fs.existsSync(lock)).toBe(false);
+    for (const attempt of [() => owner.attemptUnfencedRoute("bare-task"), () => owner.attemptSecondMain()]) {
+      const result = await attempt();
+      expect(result.code).toBe(1); expect(result.signal).toBeNull();
+      expect(result.stderr).toContain("NativeOwnerFenceError: NATIVE_OWNER_FENCE_REQUIRED");
+      expect(owner.sdkImports().filter(value => value.pid === result.pid)).toEqual([]);
+      expect(owner.observations().filter(value => value.pid === result.pid)).toEqual([]);
+      unchanged(owner, before); expect(fs.existsSync(lock)).toBe(false);
+    }
+    const ordinary = await owner.attemptOrdinaryTask();
+    expect(ordinary.code).toBe(0); expect(ordinary.signal).toBeNull();
+    expect(ordinary.stderr).not.toContain("NATIVE_OWNER_FENCE_REQUIRED");
+    expect(owner.sdkImports().some(value => value.pid === ordinary.pid && value.url.endsWith("/core/session-manager.js"))).toBe(true);
+    unchanged(owner, before); expect(owner.callbacks()).toEqual([]);
+    expect(owner.mesh.listAll("topology/participants/", { fresh: true })).toEqual([]);
+    expect(fs.existsSync(lock)).toBe(false); // Never create a new anchor to hide the missing-lock case.
+  }, 180_000);
+
+  it.each(["unseeded-empty-context", "seeded-control"] as const)("REAL plain SDK CLI WITH candidate Fabric must refuse native identity/input/Fabric append AND preserve clean-tail bytes: %s", async contextCase => {
+    const owner = await realOwner(); assertInstalled(owner);
+    const beforeSeed = snapshot(owner);
+    const bare = await owner.attemptUnfencedRoute("bare-task");
+    expect(bare.code).not.toBe(0); expect(bare.signal).toBeNull();
+    expect(bare.stderr).toContain("NATIVE_OWNER_FENCE_REQUIRED");
+    expect(owner.sdkImports().filter(value => value.pid === bare.pid)).toEqual([]); unchanged(owner, beforeSeed);
+    const inspected = await owner.attemptFenceProof("inspect-cli-session");
+    expect(inspected.code).toBe(0); expect(inspected.signal).toBeNull();
+    expect(JSON.parse(inspected.stdout)).toEqual({ sessionId: owner.pin.sessionId, sessionFile: owner.sessionFile, messages: 0 });
+    expect(owner.sdkImports().some(value => value.pid === inspected.pid && value.url.endsWith("/core/session-manager.js"))).toBe(true);
+    unchanged(owner, beforeSeed); // Actual holder positive; inspection did not seed history.
+    if (contextCase === "seeded-control") {
+      const seeded = await owner.attemptFenceProof("clean-cli-session");
+      expect(seeded.code).toBe(0); expect(JSON.parse(seeded.stdout)).toMatchObject({ sessionId: owner.pin.sessionId, sessionFile: owner.sessionFile });
+      expect(JSON.parse(seeded.stdout).messages).toBeGreaterThan(0);
+    }
+    const before = snapshot(owner);
+    expect(before.session.at(-1)).toBe(0x0a);
+    const files = (directory: string): unknown[] => fs.existsSync(directory) ? fs.readdirSync(directory).sort().flatMap(name => {
+      const file = path.join(directory, name), stat = fs.lstatSync(file);
+      return stat.isDirectory() ? files(file) : [{ file, sha256: hash(file), bytes: stat.size }];
+    }) : [];
+    const meshBefore = files(owner.meshRoot);
+    const result = await owner.attemptUnfencedRoute("plain-cli");
+    const after = fs.readFileSync(owner.sessionFile);
+    // Retain the unseeded counterexample EVEN IF unchanged() fails. Pinned SDK
+    // core/sdk.js can append thinking metadata for empty context before hooks;
+    // that is NOT torn-newline repair or an authorized new residual ruling.
+    fs.writeFileSync(path.join(owner.root, "real-plain-cli-refusal.json"), JSON.stringify({ contextCase, result,
+      cleanTailBytes: before.session.length, beforeBase64: before.session.toString("base64"), afterBase64: after.toString("base64"),
+      byteEquality: after.equals(before.session), sessionSha256: hash(owner.sessionFile), meshBefore, meshAfter: files(owner.meshRoot),
+      boundary: "upstream open/read accepted; typed terminal refusal/no identity/no Fabric append AND clean-tail byte equality required" }), { mode: 0o600, flag: "wx" });
+    expect(result.code).toBe(1); expect(result.signal).toBeNull();
+    expect(result.stderr).toContain("NativeOwnerFenceError: NATIVE_OWNER_FENCE_REQUIRED");
+    expect(result.stderr).not.toMatch(/role.*(?:refus|invalid)|model.*policy.*(?:refus|denied)/i);
+    expect(owner.sdkImports().some(value => value.pid === result.pid && value.url.endsWith("/cli.js"))).toBe(true);
+    expect(owner.sdkImports().some(value => value.pid === result.pid && value.url.endsWith("/core/session-manager.js"))).toBe(true);
+    // Actual candidate Fabric must have executed: only its product bootstrap
+    // produces that terminal typed refusal; no fixture native-fence guard runs.
+    expect(owner.observations().filter(value => value.pid === result.pid)).toEqual([]);
+    expect(owner.callbacks()).toEqual([]); unchanged(owner, before);
+    expect(files(owner.meshRoot)).toEqual(meshBefore);
+    expect(owner.mesh.listAll("topology/participants/", { fresh: true })).toEqual([]);
+    expect(fs.existsSync(path.join(owner.residencyRoot, "owner.json"))).toBe(false);
+    // The seeded control is NOT sole proof of the real native empty-context
+    // starting state. Both cases keep the identical unchanged-byte requirement.
+  }, 180_000);
+
+  it("keeps the pinned native file outside REAL ordinary SDK listing/resume/continue/bare-ID resolution, with an ordinary positive control", async () => {
+    const owner = await realOwner(); assertInstalled(owner);
+    const before = snapshot(owner), proof = await owner.probeDiscovery();
+    expect(proof).toMatchObject({ sessionDir: null, envSessionDir: null, pathPinChanged: false, schemaChanged: false, migrationPerformed: false });
+    const globalRoot = proof.globalRoot as string, ordinaryFile = proof.ordinaryFile as string, ordinaryId = proof.ordinaryId as string;
+    expect(globalRoot).toBe(path.join(owner.root, "profile", "sessions"));
+    expect(path.relative(globalRoot, owner.sessionFile).startsWith(`..${path.sep}`)).toBe(true);
+    expect(proof.native).toEqual(owner.pin);
+    expect(proof.samples).toHaveLength(2);
+    for (const sample of proof.samples as Array<Record<string, unknown>>) {
+      expect(sample.listed).toEqual([{ id: ordinaryId, path: ordinaryFile }]);
+      expect(sample.all).toEqual([{ id: ordinaryId, path: ordinaryFile }]);
+      expect(sample.nativeExact).toBeNull(); expect(sample.ordinaryExact).toBe(ordinaryFile);
+      expect(sample.continued).toBe(ordinaryFile); expect(sample.bareOrdinary).toBe(ordinaryFile);
+    }
+    expect(proof.bareNative).toMatchObject({ code: 1, signal: null });
+    expect((proof.bareNative as { stderr: string }).stderr).toContain(`No session found matching '${owner.pin.sessionId}'`);
+    expect(proof.resume).toMatchObject({ code: 0, signal: null });
+    expect(proof.resumeSelection).toEqual({ sessionId: ordinaryId, sessionFile: ordinaryFile });
+    expect((proof.resume as { stdout: string }).stdout).toContain('"selectedViaActualPicker": true');
+    unchanged(owner, before); expect(owner.callbacks()).toEqual([]);
+    expect(owner.observations()).toEqual([]); // resolver-only; not a user/model/Fabric turn
+  }, 180_000);
+
   it("fails closed on unsafe fence mode/symlink and multiply-linked native file, with no SDK loading or pin/session mutation", async () => {
     const owner = await realOwner(); assertInstalled(owner);
     const before = snapshot(owner), lock = `${owner.sessionFile}.main.lock`;
@@ -281,4 +476,82 @@ describe.skipIf(!!nativeSkipReason)(`F1(b) actual candidate-installed native own
     await refuse(/unsafe|Unsafe/);
     expect(fs.lstatSync(owner.sessionFile).nlink).toBe(2);
   }, 180_000);
+});
+
+describe("restart parent expectation regression", () => {
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  const appendTimestamp = "2026-10-26T00:00:00.000Z";
+  const fixtureTimestamp = "2026-10-25T23:59:30.000Z";
+  const headerTimestamp = "2026-10-25T23:59:00.000Z";
+  const staleEntryId = "00000001";
+  const latestEntryId = "00000002";
+  const entryHistory: Record<string, unknown>[] = [
+    { type: "thinking_level_change", id: staleEntryId, parentId: null, timestamp: fixtureTimestamp, thinkingLevel: "off" },
+    { type: "thinking_level_change", id: latestEntryId, parentId: staleEntryId, timestamp: fixtureTimestamp, thinkingLevel: "off" },
+  ];
+
+  // These are assertion-only byte fixtures under the parent-owned private temp
+  // guard. They are never seeded into genuine native history or used as
+  // custody proof; no SDK, SessionManager, native owner, or Main is opened.
+  const assertionBytes = (
+    entries: readonly Record<string, unknown>[],
+    parentId: string | null | undefined,
+    includeParent: boolean,
+  ): { owner: NativeActorOwner; before: Buffer; started: number; ready: number } => {
+    const temp = residentDrainTemp("restart-parent-expectation-");
+    const cwd = path.join(temp.root, "service");
+    fs.mkdirSync(cwd, { mode: 0o700 });
+    const sessionFile = path.join(temp.root, "assertion-bytes.jsonl");
+    const header = { type: "session", version: 3, id: sessionId, timestamp: headerTimestamp, cwd };
+    const before = Buffer.from(`${[header, ...entries].map(value => JSON.stringify(value)).join("\n")}\n`);
+    const appended: Record<string, unknown> = {
+      type: "thinking_level_change",
+      id: entries.length ? "00000003" : "00000001",
+      ...(includeParent ? { parentId } : {}),
+      timestamp: appendTimestamp,
+      thinkingLevel: "off",
+    };
+    fs.writeFileSync(sessionFile, Buffer.concat([before, Buffer.from(`${JSON.stringify(appended)}\n`)]),
+      { mode: 0o600, flag: "wx" });
+    temp.assertNoOutsideDeletion();
+    // The actual assertion reads only these fields; this is not a fake native
+    // owner, SessionManager, SDK, Main, or source of custody evidence.
+    const owner = {
+      sessionFile,
+      pin: { sessionId },
+      cwd,
+      binding: { rootId: `session:${sessionId}` },
+    } as NativeActorOwner;
+    const started = Date.parse(appendTimestamp);
+    return { owner, before, started, ready: started };
+  };
+
+  it("accepts a null parent for header-only assertion bytes", () => {
+    const fixture = assertionBytes([], null, true);
+    expect(() => exactRestartAppend(fixture.owner, fixture.before, fixture.started, fixture.ready)).not.toThrow();
+  });
+
+  it.each([
+    { label: "header ID", parentId: sessionId, includeParent: true },
+    { label: "arbitrary ID", parentId: "deadbeef", includeParent: true },
+    { label: "missing parent", parentId: undefined, includeParent: false },
+  ])("rejects $label for header-only assertion bytes", ({ parentId, includeParent }) => {
+    const fixture = assertionBytes([], parentId, includeParent);
+    expect(() => exactRestartAppend(fixture.owner, fixture.before, fixture.started, fixture.ready)).toThrow();
+  });
+
+  it("accepts the exact latest non-header entry ID for nonempty assertion bytes", () => {
+    const fixture = assertionBytes(entryHistory, latestEntryId, true);
+    expect(() => exactRestartAppend(fixture.owner, fixture.before, fixture.started, fixture.ready)).not.toThrow();
+  });
+
+  it.each([
+    { label: "null", parentId: null, includeParent: true },
+    { label: "stale entry ID", parentId: staleEntryId, includeParent: true },
+    { label: "header ID", parentId: sessionId, includeParent: true },
+    { label: "missing parent", parentId: undefined, includeParent: false },
+  ])("rejects $label for nonempty assertion bytes", ({ parentId, includeParent }) => {
+    const fixture = assertionBytes(entryHistory, parentId, includeParent);
+    expect(() => exactRestartAppend(fixture.owner, fixture.before, fixture.started, fixture.ready)).toThrow();
+  });
 });

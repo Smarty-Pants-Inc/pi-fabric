@@ -1,7 +1,7 @@
 // Keep: trust boundary + native-promise/identity custody; N7 needs real native sessions/processes.
 // Expected platform gap: Linux-only process/fence cases; no portable kernel OWNER bootstrap proof.
 // Built candidate + explicit FABRIC_NATIVE_TEST_PI_SDK_DIST and FABRIC_NATIVE_TEST_NODE are required,
-// not a silent missing-input skip. N7 substitutes NATS delivery/KV only; N8 broker/frozen-provider
+// ordinary CI declares missing-prerequisite coverage; REQUIRED=1 fails absence. N7 substitutes NATS delivery/KV only; N8 broker/frozen-provider
 // proof remains the parent's separate gate. No provider credentials/model/dummy provider are used.
 import fs from "node:fs";
 import os from "node:os";
@@ -33,6 +33,10 @@ import { FileLockBusy, lockFile } from "../src/residency/file-lock.js";
 import type { FabricControlAcceptance } from "../src/topology/control-plane.js";
 import { createNativeActorOwner, type NativeActorOwner } from "./helpers/native-actor-owner.js";
 import { route } from "./helpers/bridge-nats-l2-fakes.js";
+import { nativeSdkTestPrerequisite } from "./helpers/native-sdk-no-model.js";
+
+// Expected skip: absent Linux/explicit approved SDK/executable Node in ordinary CI.
+const nativeSkipReason = nativeSdkTestPrerequisite();
 
 // Synthetic N7 identity only; never reuse the production actor ID, even in a private mesh.
 const ACTOR = "77777777777747778777777777777777";
@@ -280,7 +284,7 @@ const expectTrustedMain = (owner: NativeActorOwner): void => {
   }));
 };
 
-describe.skipIf(process.platform !== "linux")("N7 actual credential-free Pi SDK Main and detached resident", () => {
+describe.skipIf(!!nativeSkipReason)(`N7 actual credential-free Pi SDK Main and detached resident${nativeSkipReason ? ` [SKIP: ${nativeSkipReason}]` : ""}`, () => {
   it("refuses root input, keeps resident idle/alive, refuses Main-down ingress, restarts the SAME native file/actor", async () => {
     const owner = await realOwner();
     await owner.start();

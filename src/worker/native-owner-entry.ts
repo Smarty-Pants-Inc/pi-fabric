@@ -5,10 +5,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const absolute = (file: string): boolean => !!file && path.isAbsolute(file) && path.resolve(file) === file && !/[\x00-\x1f\x7f]/.test(file);
-const refused = (reason: string): never => { throw new Error(`Native owner entry refused: ${reason}`); };
+export class NativeOwnerFenceError extends Error {
+  readonly code = "NATIVE_OWNER_FENCE_REQUIRED";
+  constructor(reason: string) { super(`NATIVE_OWNER_FENCE_REQUIRED: ${reason}`); this.name = "NativeOwnerFenceError"; }
+}
+const refused = (reason: string): never => { throw new NativeOwnerFenceError(reason); };
 // Same fail-closed local-filesystem policy as core/pid-namespace. In particular,
 // overlay's backing store is unknown; NFS/CIFS/FUSE/9p/unknown are NOT local proof.
 const localFilesystems = new Set([0xEF53, 0x58465342, 0x9123683E, 0x01021994, 0x2FC12FC1, 0xF2F52010]);
@@ -48,12 +54,189 @@ const fenceIdentity = (file: string, fd: number): void => {
       named.nlink !== 1 || named.uid !== held.uid || named.mode !== held.mode) refused("unsafe or replaced Main session fence");
 };
 
-/** Recheck the descriptor/path while doing fenced standalone provision/verify.
- * This checks custody invariants, not authentication of an arbitrary caller's fd.
+/** A FLOCK in THIS fdinfo is evidence for this open description, not a PID
+ * attribution: Linux may show the already-exited helper as flock's holder.
+ * An independently opened, unlocked fd to the SAME inode is not such evidence.
  */
 export function assertNativeOwnerSessionFence(file: string, fd: number): void {
-  const parent = privateParent(file);
-  try { fenceIdentity(file, fd); } finally { fs.closeSync(parent); }
+  let parent: number | undefined;
+  try {
+    if (!Number.isSafeInteger(fd) || fd < 0) refused("missing self fence descriptor");
+    parent = privateParent(file);
+    fenceIdentity(file, fd);
+    const held = fs.fstatSync(fd), info = fs.readFileSync(`/proc/self/fdinfo/${fd}`, "utf8");
+    const locks = [...info.matchAll(/^lock:\s+\d+:\s+FLOCK\s+ADVISORY\s+WRITE\s+-?\d+\s+[0-9a-f]+:[0-9a-f]+:(\d+)\s+0\s+EOF\s*$/gm)];
+    if (!locks.some(lock => BigInt(lock[1]!) === BigInt(held.ino))) refused("self open description has no whole-file WRITE FLOCK");
+    fenceIdentity(file, fd); // public name must still denote the held inode
+  } catch (error) {
+    if (error instanceof NativeOwnerFenceError) throw error;
+    refused(`missing, unsafe or replaced self fence (${error instanceof Error ? error.message : String(error)})`);
+  } finally { if (parent !== undefined) fs.closeSync(parent); }
+}
+
+// Share only numeric custody across compiled entry/chunk copies. No extra fd,
+// hidden lifetime anchor, disk protocol, caller env assertion or PID heuristic.
+const custodyKey = Symbol.for("pi-fabric.nativeOwnerSessionFence.v1");
+interface NativeFenceCustody { fd: number; dev: number; ino: number }
+const host = globalThis as unknown as Record<symbol, Map<string, NativeFenceCustody> | undefined>;
+const custody = host[custodyKey] ?? (host[custodyKey] = new Map());
+
+/** Require actual process-local custody. A retained old holder is NEVER rebound
+ * to a replacement public lock inode. Trusted-host check-to-write races remain.
+ */
+export function requireNativeOwnerSessionFence(file: string): number {
+  const retained = custody.get(file);
+  if (retained) {
+    assertNativeOwnerSessionFence(file, retained.fd);
+    const held = fs.fstatSync(retained.fd);
+    if (held.dev !== retained.dev || held.ino !== retained.ino) refused("original self fence descriptor replaced");
+    return retained.fd;
+  }
+  if (process.platform !== "linux" || !absolute(file)) refused("canonical Linux native session required");
+  for (const name of fs.readdirSync("/proc/self/fd")) {
+    const fd = Number(name);
+    try { assertNativeOwnerSessionFence(file, fd); }
+    catch (error) { if (error instanceof NativeOwnerFenceError) continue; throw error; }
+    const held = fs.fstatSync(fd);
+    custody.set(file, { fd, dev: held.dev, ino: held.ino });
+    return fd;
+  }
+  return refused("this process does not hold the pinned native session fence");
+}
+
+/** Host-side I/O admission, not an SDK source patch. Install before SDK loading
+ * on the product route; syncBuiltinESMExports also gates already-captured named
+ * fs bindings on plain CLI. Cover path AND fd opens/appends/writes. Recheck the
+ * ORIGINAL self fd against the public name at each operation, never a new inode.
+ * This is cooperative same-UID fencing, not OS mandatory access control.
+ */
+export function guardNativeOwnerSessionIo(file: string): void {
+  requireNativeOwnerSessionFence(file);
+  if (ioTargets.has(file)) return;
+  const held = fs.lstatSync(file);
+  ioTargets.set(file, { dev: held.dev, ino: held.ino });
+  if (ioInstalled) return;
+  ioInstalled = true;
+  const check = (value: unknown): void => {
+    for (const [target, pin] of ioTargets) {
+      let matches = false;
+      if (typeof value === "number") {
+        try { const stat = fs.fstatSync(value); matches = stat.dev === pin.dev && stat.ino === pin.ino; }
+        catch { /* the original fs operation diagnoses invalid descriptors */ }
+      } else {
+        const text = value instanceof URL ? fileURLToPath(value) : Buffer.isBuffer(value) ? value.toString() : value;
+        matches = typeof text === "string" && path.resolve(text) === target;
+      }
+      if (matches) {
+        requireNativeOwnerSessionFence(target);
+        const named = fs.lstatSync(target);
+        if (!named.isFile() || named.isSymbolicLink() || named.dev !== pin.dev || named.ino !== pin.ino) refused("pinned session inode replaced");
+      }
+    }
+  };
+  const wrap = (object: object, names: readonly string[]): void => {
+    const methods = object as Record<string, (...args: unknown[]) => unknown>;
+    for (const name of names) {
+      const original = methods[name];
+      if (typeof original !== "function") continue;
+      methods[name] = function(...args: unknown[]) { check(args[0]); return Reflect.apply(original, this, args); };
+    }
+  };
+  wrap(fs, ["open", "openSync", "appendFile", "appendFileSync", "writeFile", "writeFileSync", "write", "writeSync", "writev", "writevSync", "truncate", "truncateSync", "ftruncate", "ftruncateSync"]);
+  wrap(fs.promises, ["open", "appendFile", "writeFile", "truncate"]);
+  syncBuiltinESMExports();
+}
+const ioTargets = new Map<string, { dev: number; ino: number }>();
+let ioInstalled = false;
+
+interface NativeOwnerConfig { sessionFile: string; sessionId: string; rootId: string }
+/** Deployment-supplied SDK identity tuple, independent of the removable lock.
+ * This private config selects a gate; neither it nor its environment selector
+ * proves custody. Do not open/read the native JSONL to discover its identity.
+ */
+const nativeOwnerConfig = (): NativeOwnerConfig | undefined => {
+  const configFile = process.env.PI_FABRIC_NATIVE_OWNER_CONFIG;
+  if (configFile === undefined) return undefined;
+  let parent: number | undefined, fd: number | undefined;
+  try {
+    parent = privateParent(configFile);
+    fd = fs.openSync(configFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const held = fs.fstatSync(fd), named = fs.lstatSync(configFile);
+    if (!held.isFile() || held.uid !== process.geteuid!() || held.nlink !== 1 || (held.mode & 0o7777) !== 0o600 ||
+        named.isSymbolicLink() || named.dev !== held.dev || named.ino !== held.ino || held.size > 16_384) refused("unsafe native identity config");
+    const value = JSON.parse(fs.readFileSync(fd, "utf8")) as NativeOwnerConfig | null;
+    if (!value || typeof value !== "object" || !absolute(value.sessionFile) ||
+        typeof value.sessionId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value.sessionId) ||
+        value.rootId !== `session:${value.sessionId}`) refused("invalid native identity config tuple");
+    return { sessionFile: value!.sessionFile, sessionId: value!.sessionId, rootId: value!.rootId };
+  } catch (error) {
+    if (error instanceof NativeOwnerFenceError) throw error;
+    return refused(`native identity config unavailable (${error instanceof Error ? error.message : String(error)})`);
+  } finally { if (fd !== undefined) fs.closeSync(fd); if (parent !== undefined) fs.closeSync(parent); }
+};
+
+/** Config selects policy, never custody. Registration admits only an exact
+ * absolute config pin; task-entry retains its existing canonical/prefix and
+ * adjacent-lock hints. Both routes use the same actual open-description proof.
+ */
+const guardNativeOwnerSelection = (file: string | undefined, cwd: string, exactConfigPin = false): void => {
+  if (!file || (exactConfigPin && !absolute(file))) return;
+  const config = nativeOwnerConfig();
+  if (exactConfigPin && file !== config?.sessionFile) return;
+  const selected = path.resolve(cwd, file);
+  const canonical = fs.existsSync(selected) ? fs.realpathSync(selected) : selected;
+  const native = config && (selected === config.sessionFile || canonical === config.sessionFile ||
+    (/^[0-9a-f-]+$/.test(file) && config.sessionId.startsWith(file)));
+  if (!native && !fs.lstatSync(`${canonical}.main.lock`, { throwIfNoEntry: false })) return;
+  if (selected !== canonical || (native && selected !== config.sessionFile)) refused("native session selection must use its canonical pin");
+  guardNativeOwnerSessionIo(canonical);
+};
+
+/** task-entry also serves ordinary custom sessions. The explicit product config
+ * selects the native pin even if its lock name is gone; the adjacent lock remains
+ * a conservative additional hint for older callers. Neither is kernel proof.
+ */
+export function guardNativeOwnerSessionSelection(file: string | undefined, cwd: string): void {
+  guardNativeOwnerSelection(file, cwd);
+}
+
+const nativeOwnerFailStop = (error: unknown): never => {
+  const typed = error instanceof NativeOwnerFenceError ? error : new NativeOwnerFenceError(error instanceof Error ? error.message : String(error));
+  // SDK extension loading and hook dispatch isolate ordinary throws. Refusal
+  // must terminate synchronously, without shutdown hooks that could append.
+  fs.writeSync(2, `${typed.name}: ${typed.message}\n`);
+  process.exit(1);
+};
+
+/** Registration has no SDK context or identity. Recognize only an unambiguous
+ * absolute CLI --session, before startup metadata is appended. Unknown options
+ * and competing selection modes remain the SDK's decision; no bare-ID resolver.
+ */
+export function guardNativeOwnerRegistration(): void {
+  const args = process.argv.slice(2);
+  const values = new Set(["--mode", "--provider", "--model", "--api-key", "--system-prompt", "--append-system-prompt",
+    "--name", "-n", "--max-provider-requests", "--session-dir", "--models", "--tools", "-t", "--exclude-tools", "-xt",
+    "--thinking", "--export", "--extension", "-e", "--skill", "--prompt-template", "--theme", "--use-theme", "--tui-mode"]);
+  const switches = new Set(["--no-auto-compaction", "--no-tools", "-nt", "--no-builtin-tools", "-nbt", "--print", "-p",
+    "--no-extensions", "-ne", "--no-mcp", "--no-skills", "-ns", "--no-prompt-templates", "-np", "--no-themes",
+    "--no-context-files", "-nc", "--verbose", "--approve", "-a", "--no-approve", "-na", "--offline"]);
+  let file: string | undefined;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === "--") break;
+    if (["--no-session", "--continue", "-c", "--resume", "-r", "--fork", "--session-id", "--help", "-h", "--version", "-v", "--list-models"].includes(arg)) return;
+    if (arg === "--session") {
+      if (file !== undefined) return;
+      file = args[++index];
+      if (!file || !absolute(file)) return;
+    } else if (values.has(arg)) {
+      const value = args[++index];
+      if (value === undefined || value.startsWith("-")) return;
+    } else if (!switches.has(arg) && arg.startsWith("-")) return;
+  }
+  if (!file) return;
+  try { guardNativeOwnerSelection(file, process.cwd(), true); }
+  catch (error) { nativeOwnerFailStop(error); }
 }
 
 /** Nonblocking real flock on the open description retained by THIS process.
@@ -79,10 +262,31 @@ export function takeNativeOwnerSessionFence(file: string): number {
     const held = fs.fstatSync(parent), named = fs.lstatSync(path.dirname(file));
     parentChain(path.dirname(file));
     if (held.dev !== named.dev || held.ino !== named.ino || named.isSymbolicLink()) refused("session directory replaced while fencing");
-    fenceIdentity(file, fd);
+    assertNativeOwnerSessionFence(file, fd);
+    const original = fs.fstatSync(fd);
+    custody.set(file, { fd, dev: original.dev, ino: original.ino });
     return fd;
   } catch (error) { if (fd !== undefined) fs.closeSync(fd); throw error; }
   finally { fs.closeSync(parent); }
+}
+
+/** Call only for the native root pinned by a registered application declaration.
+ * The actual SDK header/id selects identity, never an envelope or env-asserted ID.
+ * Fail-stop before Fabric activation; an ordinary hook throw is caught by Pi and
+ * is NOT a refusal. No shutdown hooks can append after this synchronous refusal.
+ * Upstream plain CLI pre-hook reads/repair are outside this cooperative boundary.
+ */
+export function guardNativeOwnerBootstrap(context: ExtensionContext): void {
+  try {
+    const manager = context.sessionManager, header = manager.getHeader();
+    const file = manager.getSessionFile();
+    if (!header || header.type !== "session" || header.id !== manager.getSessionId() || !file || !absolute(file) || fs.realpathSync(file) !== file) {
+      refused("native bootstrap requires its pinned actual SDK header/session and canonical file");
+    }
+    const config = nativeOwnerConfig();
+    if (config && (file !== config.sessionFile || header!.id !== config.sessionId)) refused("actual SDK session differs from native identity config");
+    guardNativeOwnerSessionIo(file!);
+  } catch (error) { nativeOwnerFailStop(error); }
 }
 
 const assertSessionFile = (file: string): void => {
@@ -133,20 +337,31 @@ export async function runNativeOwnerEntry(options: {
     if (!absolute(residentConfig) || !values.has("--no-session") || sessionFile) refused("resident skip requires --no-session and no Main session");
   } else {
     if (!sessionFile || !absolute(sessionFile) || values.has("--no-session")) refused("Main requires exactly one persisted absolute --session");
+    const config = nativeOwnerConfig();
+    if (!config || config.sessionFile !== sessionFile) refused("Main requires its explicit pinned native identity config");
+    // Provisioning creates the original fence. A pinned Main must not silently
+    // replace a missing one and thereby adopt a different open description.
+    if (!fs.lstatSync(`${sessionFile}.main.lock`, { throwIfNoEntry: false })) refused("configured native Main fence is missing");
     const fd = takeNativeOwnerSessionFence(sessionFile!);
     // Intentionally NO finally/close, including on hook/delegation failure. The
     // kernel, after ALL SDK exit handlers, is the Main's only release boundary.
+    assertNativeOwnerSessionFence(sessionFile!, fd);
+    guardNativeOwnerSessionIo(sessionFile!);
     assertSessionFile(sessionFile!);
     await options.onMainFence?.(sessionFile!, fd);
     assertNativeOwnerSessionFence(sessionFile!, fd);
     assertSessionFile(sessionFile!);
   }
-  const taskEntry = fileURLToPath(new URL("./task-entry.js", import.meta.url));
+  // A shared compiled gate may live under dist/chunks rather than dist/worker.
+  // Both are siblings: retain the stable package-local executable path.
+  const taskEntry = fileURLToPath(new URL("../worker/task-entry.js", import.meta.url));
   process.argv = [process.execPath, taskEntry, sdkDirectory!, scale!, ...args];
   await import("./task-entry.js");
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+if (process.argv[1] && new URL("../worker/native-owner-entry.js", import.meta.url).href === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
   process.umask(0o077);
-  await runNativeOwnerEntry();
+  // Do not keep this module's evaluation pending while task-entry imports the
+  // shared gate: task-entry is the delegated runtime, not a second CLI entry.
+  void runNativeOwnerEntry().catch(error => { console.error(error); process.exitCode = 1; });
 }

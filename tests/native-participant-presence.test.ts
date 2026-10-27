@@ -1,4 +1,4 @@
-// expected-skip: non-Linux: actual SDK Main/resident + kernel session custody required.
+// Expected skip: absent Linux/explicit approved SDK/executable Node in ordinary CI; REQUIRED=1 fails absence.
 // Keep: #342 cross-version presence/control trust boundary and recorded N7 discovery failure.
 // Shape/component experiments ONLY: not N7/N8 acceptance, callback delivery, or a product fix.
 // Parent runs this file ONLY inside its existing live launcher/archive-before-cleanup driver.
@@ -26,6 +26,9 @@ import { FROZEN_F3393715_COMMIT, FROZEN_F3393715_SHA256, type FrozenF3393715 } f
 import { launchLog } from "./helpers/owned-processes.js";
 import { kvWorld, pKey, hKey } from "./helpers/bridge-nats-kv.js";
 import { createPathBHarness, resolveNatsBinary, teardownWithin, type PathBHarness } from "./helpers/nats-cluster.js";
+
+import { nativeSdkTestPrerequisite } from "./helpers/native-sdk-no-model.js";
+const nativeSkipReason = nativeSdkTestPrerequisite();
 
 const repo = fileURLToPath(new URL("../", import.meta.url));
 const producer = fileURLToPath(new URL("./fixtures/native-old-provider-pod.mjs", import.meta.url));
@@ -171,7 +174,7 @@ async function retainBroker(broker: PathBHarness, child: ChildProcess): Promise<
   await broker.stop();
 }
 
-describe.skipIf(process.platform !== "linux")("f339 native participant SHAPE experiments (not callback acceptance)", () => {
+describe.skipIf(!!nativeSkipReason)(`f339 native participant SHAPE experiments (not callback acceptance)${nativeSkipReason ? ` [SKIP: ${nativeSkipReason}]` : ""}`, () => {
   beforeAll(async () => {
     sdkDirectory = process.env.FABRIC_NATIVE_TEST_PI_SDK_DIST ?? "";
     const explicitNode = process.env.FABRIC_NATIVE_TEST_NODE;

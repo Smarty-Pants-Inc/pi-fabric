@@ -199,6 +199,18 @@ const inheritedCapabilityRequirements = (): string[] => {
 const escapeXmlText = (value: string): string =>
   value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
+// As in FabricState.bootstrap, sealed host registrations select native policy;
+// they never prove custody. Ordinary roots must not enter strict native queries.
+const hasRegisteredNativeActorBindings = (rootId: string | undefined): boolean => {
+  if (typeof rootId !== "string" || rootId.length !== 44 ||
+      !/^session:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(rootId)) return false;
+  const nativeHandlers = (globalThis as unknown as Record<symbol, ReadonlyMap<string, {
+    readonly binding: { readonly rootId: string; readonly scope: "session" };
+  }> | undefined>)[Symbol.for("pi-fabric.nativeActorHandlers.v1")];
+  return nativeHandlers !== undefined && [...nativeHandlers.values()].some(({ binding }) =>
+    binding.rootId === rootId && binding.scope === "session");
+};
+
 
 import type { FabricManagedHost } from "./managed-host.js";
 import { captureLoadedFileIdentity, type FabricLoadedFileIdentity } from "./build-identity.js";
@@ -720,6 +732,15 @@ export class FabricRuntimeState {
     bootstrapConfig?: FabricConfig,
     options: { lifecycle?: () => boolean } = {},
   ): Promise<void> {
+    // Native identity must not reach teardown, mesh construction/publication or
+    // appends without this process's actual self-open-description kernel proof.
+    if (!this.#managedHost) {
+      const sessionId = context.sessionManager.getSessionId();
+      if (hasRegisteredNativeActorBindings(`session:${sessionId}`)) {
+        const { guardNativeOwnerBootstrap } = await import("./worker/native-owner-entry.js");
+        guardNativeOwnerBootstrap(context);
+      }
+    }
     // FabricState passes its activation lease; direct callers (tests, standalone hosts) keep a
     // lease bound to this same ctx, else bind for the runtime's life.
     const successor = {
@@ -1199,9 +1220,10 @@ export class FabricRuntimeState {
     const controlParticipants = participants;
     // Capture only immutable declarations. Main never retains/exposes the registered
     // callbacks as manager executors, nor imports their resident application module.
-    const nativeBindings = copyResidentNativeActorBindings({ rootId: mainAgentId, sessionId, mesh: meshConfig,
-      nativeActors: identity.kind === "main"
-        ? snapshotNativeActorHandlers(mainAgentId, "session").map(({ binding }) => binding) : [] });
+    const nativeBindings = identity.kind === "main" && hasRegisteredNativeActorBindings(mainAgentId)
+      ? copyResidentNativeActorBindings({ rootId: mainAgentId, sessionId, mesh: meshConfig,
+        nativeActors: snapshotNativeActorHandlers(mainAgentId, "session").map(({ binding }) => binding) })
+      : Object.freeze([]);
     if (nativeBindings.length && !ownsPersistentActorRegistry) throw new Error("Native actors require the owning persistent Main");
     const participantView = transport ? participants.participantView : undefined;
     if (transport && !participantView) throw new Error("Fabric NATS participant view unavailable");

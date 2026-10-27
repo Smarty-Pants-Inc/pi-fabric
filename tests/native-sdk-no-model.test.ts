@@ -9,7 +9,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import { createNativeActorOwner } from "./helpers/native-actor-owner.js";
-import { NATIVE_SDK_RELEASE, NATIVE_SDK_DIRECTORY, NATIVE_SDK_SOURCE_PINS, nativeSdkTestPrerequisite } from "./helpers/native-sdk-no-model.js";
+import { NATIVE_SDK_RELEASE, NATIVE_SDK_DIRECTORY, NATIVE_SDK_SOURCE_PINS, nativeSdkTestPrerequisite, assertApprovedNativeSdk } from "./helpers/native-sdk-no-model.js";
 
 // Expected skip: missing Linux/approved SDK files/executable Node/env in ordinary CI only.
 const nativeSkipReason = nativeSdkTestPrerequisite();
@@ -31,11 +31,12 @@ describe("native prerequisite gate (no sessions)", () => {
     });
     vi.stubEnv("FABRIC_NATIVE_TEST_REQUIRED", "0");
     vi.stubEnv("FABRIC_NATIVE_TEST_NODE", undefined);
-    vi.stubEnv("FABRIC_NATIVE_TEST_PI_SDK_DIST", "/unapproved-sdk");
+    vi.stubEnv("FABRIC_NATIVE_TEST_PI_SDK_DIST", "relative-unapproved-sdk");
     try {
       expect(() => nativeSdkTestPrerequisite()).toThrow(/unapproved SDK/);
-      vi.stubEnv("FABRIC_NATIVE_TEST_PI_SDK_DIST", NATIVE_SDK_DIRECTORY);
-      vi.spyOn(fs, "realpathSync").mockReturnValue(NATIVE_SDK_DIRECTORY);
+      const alternate = path.resolve(os.tmpdir(), "alternate-reviewed-sdk", "dist");
+      vi.stubEnv("FABRIC_NATIVE_TEST_PI_SDK_DIST", alternate);
+      vi.spyOn(fs, "realpathSync").mockReturnValue(alternate);
       vi.spyOn(fs, "readFileSync").mockReturnValue(Buffer.from("tampered approved SDK bytes"));
       expect(() => nativeSdkTestPrerequisite()).toThrow(/approved SDK source changed/);
       vi.mocked(fs.readFileSync).mockImplementation(() => { throw Object.assign(new Error("absent"), { code: "ENOENT" }); });
@@ -45,15 +46,35 @@ describe("native prerequisite gate (no sessions)", () => {
     } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
   });
 
-  it.each(["native-sdk-no-model", "native-owner-entry"])("%s declares an ordinary absent-env skip and REQUIRED makes it fail in actual subprocess collection", file => {
+  it.skipIf(!!nativeSkipReason)("accepts ALL ten approved hashes at an alternate canonical directory and still diagnoses absent Node", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-portable-sdk-"));
+    const alternate = path.join(root, "coding-agent", "dist");
+    try {
+      for (const relative of Object.keys(NATIVE_SDK_SOURCE_PINS)) {
+        const target = path.join(alternate, relative);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.copyFileSync(path.join(NATIVE_SDK_DIRECTORY, relative), target);
+      }
+      expect(() => assertApprovedNativeSdk(alternate)).not.toThrow();
+      vi.stubEnv("FABRIC_NATIVE_TEST_PI_SDK_DIST", alternate);
+      vi.stubEnv("FABRIC_NATIVE_TEST_NODE", undefined); vi.stubEnv("FABRIC_NATIVE_TEST_REQUIRED", "0");
+      expect(nativeSdkTestPrerequisite()).toContain("executable FABRIC_NATIVE_TEST_NODE");
+      fs.appendFileSync(path.join(alternate, "core/session-manager.js"), "\n// tampered\n");
+      expect(() => nativeSdkTestPrerequisite()).toThrow(/approved SDK source changed/);
+    } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["native-sdk-no-model", "native-owner-entry", "native-actor-residency", "native-participant-presence"])("%s declares an ordinary absent-env skip and REQUIRED makes it fail in actual subprocess collection", file => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-prerequisite-probe-"));
     const env: NodeJS.ProcessEnv = { ...process.env, CI: "false" };
     delete env.FABRIC_NATIVE_TEST_PI_SDK_DIST; delete env.FABRIC_NATIVE_TEST_NODE;
     try {
       for (const required of ["0", "1"]) {
         const report = path.join(root, `${required}.json`);
+        const title = { "native-sdk-no-model": "N7 approved SDK UNCONFIGURED contract", "native-owner-entry": "F1\\(b\\) actual candidate-installed native owner entry",
+          "native-actor-residency": "N7 actual credential-free Pi SDK Main and detached resident", "native-participant-presence": "f339 native participant SHAPE experiments" }[file]!;
         const args = [fileURLToPath(new URL("../node_modules/vitest/vitest.mjs", import.meta.url)), "run", `tests/${file}.test.ts`,
-          "--reporter=json", `--outputFile=${report}`, "-t", file === "native-sdk-no-model" ? "N7 approved SDK UNCONFIGURED contract" : "F1\\(b\\) actual candidate-installed native owner entry"];
+          "--reporter=json", `--outputFile=${report}`, "-t", title];
         const result = spawnSync(process.execPath, args, { cwd: fileURLToPath(new URL("../", import.meta.url)),
           env: { ...env, FABRIC_NATIVE_TEST_REQUIRED: required }, encoding: "utf8", timeout: 45_000 });
         console.info(JSON.stringify({ nativePrerequisiteProbe: file, required, command: [process.execPath, ...args],

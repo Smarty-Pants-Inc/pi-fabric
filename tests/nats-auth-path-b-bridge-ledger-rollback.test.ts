@@ -4,7 +4,8 @@
 // ca4 artifact. Corruption refusal proves safety, NOT restored traffic. Parent owns execution.
 // Platform gap: native receipt production needs POSIX modes/no-follow/directory fsync; Windows
 // skips this coverage, never counts as rollback proof. Missing pinned old history/archive FAIL loudly.
-// R4 additions below are PREPARED/UNRUN; historical 11-case SOURCE receipt does not cover them.
+// R4 SOURCE/component run receipts: docs/native-actors/r5-final-receipt.md; separate from historical
+// 11-case SOURCE coverage, and NOT the installed compiled-artifact gate.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";

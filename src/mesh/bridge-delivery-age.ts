@@ -127,11 +127,6 @@ export class BridgeDeliveryAgeMonitor {
     };
   }
 
-  async drainWait<T>(direction: BridgeDeliveryDirection, phase: BridgeDrainPhase, action: () => Promise<T>): Promise<T> {
-    const end = this.drainPhase(direction, phase);
-    try { return await action(); } finally { end(); }
-  }
-
   drainPage(direction: BridgeDeliveryDirection, events: number): void {
     const totals = this.#drain.get(direction)!.totals;
     totals.pages++;

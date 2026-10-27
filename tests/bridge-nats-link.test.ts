@@ -153,7 +153,7 @@ describe("startNatsLink composition with L3's allow gate", () => {
     expect(logs.filter(line => line.startsWith("bridge miss:"))).toEqual(samples);
   });
 
-  it("bounds INFO miss samples to five in any rolling minute and resumes on the next event", async () => {
+  it("bounds INFO miss samples to five in any rolling minute and reports suppressed samples per period", async () => {
     let now = 10_000;
     const { store, link, logs } = await gatedFixture(() => now);
     const publish = () => store.publish({ topic: "fleet.work.tasks", kind: "answer", from: fileLead, to: offList.id, text: "PRIVATE-body" });
@@ -168,6 +168,12 @@ describe("startNatsLink composition with L3's allow gate", () => {
     await publish();
     await link.bridge.step();
     expect(logs.filter(line => line.startsWith("bridge miss:"))).toHaveLength(6);
+    const reports = () => logs.filter(line => line.startsWith("bridge:"));
+    expect(reports().at(-1)).toContain("suppressed miss samples 4");
+    now += 60_000;
+    await publish();
+    await link.bridge.step();
+    expect(reports().at(-1)).toContain("suppressed miss samples 0");
     expect(logs.join("\n")).not.toContain("PRIVATE-body");
   });
 

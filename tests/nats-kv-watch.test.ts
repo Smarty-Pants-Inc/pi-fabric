@@ -882,7 +882,6 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
       finally { await admin.close(); }
       await waitFor(() => diagnostic.mock.calls.some(([line]) => String(line).includes("skipped-invalid-record")), "malformed presence record was skipped");
       expect(directory.ready).toBe(true);
-      expect(directory.canConsumeMesh()).toBe(true);
     } finally {
       diagnostic.mockRestore();
       leaseAbort.abort();

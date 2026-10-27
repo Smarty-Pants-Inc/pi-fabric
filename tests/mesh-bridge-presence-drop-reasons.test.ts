@@ -87,7 +87,8 @@ describe("value-free presence drop diagnostics", () => {
       updatedAt: root.participant.updatedAt + 1, updatedBy: root.identity,
       value: { ...root.participant, name: "PRIVATE-other-name", updatedAt: root.participant.updatedAt + 1 } });
     const result = await new StoreBridgeSide(store, "PRIVATE-peer").presence();
-    expect(result.droppedReasons).toEqual([{ keyClass: "topology/participants", reason: "conflicting-copy", count: 1 }]);
+    expect(result.droppedReasons).toEqual([{ keyClass: "topology/participants", reason: "conflicting-copy", count: 1,
+      copies: [{ id: root.identity.id, fields: ["name"] }] }]);
   });
 
   it("reports raw participant/owner mismatches", async () => {

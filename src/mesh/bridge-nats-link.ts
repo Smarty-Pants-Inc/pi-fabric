@@ -112,6 +112,8 @@ export interface NatsLinkStartConfig {
   readonly allow: BridgeNatsAllowListConfig | BridgeNatsAllowSection;
   /** The org.json whose principal seats pin the allow-list; absent = L3's default candidates. */
   readonly orgJson?: string;
+  /** Pending direction without cursor progress, ms; absent keeps MeshBridge's 180 s default. */
+  readonly directionStallAfterMs?: number;
 }
 
 const parsedAllow = (value: BridgeNatsAllowListConfig | BridgeNatsAllowSection): value is BridgeNatsAllowListConfig =>
@@ -310,6 +312,7 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
       waitForTarget: natsLinkFileTargetAllowed(allow, () => remote!.filePresence.view()),
       bridge: {
         stopMs: STOP_MS, notifyWatchdog: systemdWatchdogNotify,
+        ...(config.directionStallAfterMs === undefined ? {} : { directionStallAfterMs: config.directionStallAfterMs }),
         publishStallAlarm: async (alarm: BridgeStallAlarm) => {
           const to = meshAlarmRecipient();
           if (!to) { log("stall alarm has no configured mesh alarm session recipient"); return; }

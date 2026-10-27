@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { normalizeFabricConfig } from "../src/config.js";
-import { validBridgeName } from "../src/mesh/bridge.js";
+import { BRIDGE_DIRECTION_STALL_AFTER_MS, validBridgeName } from "../src/mesh/bridge.js";
 import {
   describeNatsLinkConfig,
   loadNatsLinkConfig,
@@ -103,6 +103,18 @@ describe.skipIf(process.platform === "win32")("nats-link config (Linux/macOS onl
       stallReason: "/srv/nats-link/v2/cursor.json.last-stall-reason",
       ledger: "/srv/nats-link/v2/ledger",
     });
+  });
+
+  it("defaults the direction stall deadline to 180 s and accepts bounded safe integers", () => {
+    expect(BRIDGE_DIRECTION_STALL_AFTER_MS).toBe(180_000);
+    expect(parseNatsLinkConfig(sample()).directionStallAfterMs).toBe(180_000);
+    for (const directionStallAfterMs of [60_000, 300_000, 3_600_000]) {
+      expect(parseNatsLinkConfig(sample({ directionStallAfterMs })).directionStallAfterMs).toBe(directionStallAfterMs);
+    }
+    for (const directionStallAfterMs of [0, -1, 59_999, 3_600_001, 180_000.5, Number.MAX_SAFE_INTEGER + 1,
+      NaN, Infinity, "300000", null, true]) {
+      refused(sample({ directionStallAfterMs }), "directionStallAfterMs");
+    }
   });
 
   it("refuses unknown keys at every level, so a misspelt field never falls back to a default", () => {

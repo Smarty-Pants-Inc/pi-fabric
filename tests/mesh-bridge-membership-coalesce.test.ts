@@ -466,6 +466,35 @@ describe("real-store bridge membership refresh coalescing", () => {
     expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual(events.map(event => event.id));
   }, 90_000);
 
+  // Keep reason: #1651 control head-of-line delay. A second successful presence pass
+  // must not erase the sample that already resolved an unknown predecessor's hold.
+  it("preserves a completed absence sample across another sync before the release drain", async () => {
+    let now = 1_800_000_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = await fixture(() => now);
+    const hubLead = await addNative(f.hub, "hub-lead", now + 120_000);
+    const routed = await addNative(f.far, "routed-member", now + 120_000);
+    const bridge = bridgeFor(f);
+    await bridge.start();
+    cleanups.push(() => bridge.stop());
+    const absent = await work(f.hub, hubLead, sid("still-absent"), "unknown-predecessor");
+    const command = await f.hub.publish({ topic: "fabric.control.command", kind: "followUp", from: hubLead,
+      to: routed.id, data: { version: 1, commandId: "after-absence-sample", targetId: routed.id,
+        operation: "followUp", replyTo: hubLead.id, requestedAt: now, deadlineAt: now + 60_000,
+        message: "must-not-wait-for-the-same-absence-again" } });
+    expect(await bridge.step()).toMatchObject({ toRemote: 0, dropped: 0 });
+    expect(cursor(f.cursorPath).toRemote.after).toBeLessThan(absent.sequence);
+
+    now += 15_000;
+    await bridge.syncPresence(); // The post-miss sample covers both events.
+    await bridge.syncPresence(); // A notification/resample can finish before the drain runs.
+    expect(await bridge.step()).toMatchObject({ toRemote: 1, dropped: 0 });
+    expect(cursor(f.cursorPath).toRemote.after).toBe(command.sequence);
+    expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual([command.id]);
+    await bridge.step();
+    expect(deliveredFromHub(f.far).map(bridgeStampId)).toEqual([command.id]);
+  });
+
   // Keep reason: #1651 delivery loss; the release pass may read beyond the source head
   // covered by its sample. Real stores and delivery receipts must retain that later event.
   it.each(["same page", "later page"] as const)("delivers a post-sample newcomer event read on the %s of the release pass", async pageKind => {
@@ -668,7 +697,10 @@ describe("real-store bridge membership refresh coalescing", () => {
       releaseTail.resolve();
       await until(() => publishEntered, "addressed batch admission reached its commit seam without a presence sample");
       const gatedCursor = cursor(f.cursorPath).toRemote.after;
-      expect(gatedCursor).toBe(prefix.at(-1)!.sequence);
+      // Discards checkpoint every 64 events OR 1 s. A timed checkpoint can split
+      // this prefix, so batch admission need not coincide with its final event.
+      expect(gatedCursor).toBeGreaterThanOrEqual(prefix.at(-64)!.sequence);
+      expect(gatedCursor).toBeLessThanOrEqual(prefix.at(-1)!.sequence);
       expect(gatedCursor).toBeLessThan(addressed[0]!.sequence);
       expect(samples.mock.calls).toHaveLength(0); // A pending miss is not a pre-publication flush.
       expect(deliveredFromHub(f.far)).toEqual([]);

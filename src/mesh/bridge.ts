@@ -4275,7 +4275,9 @@ export class MeshBridge {
     this.#syncedLeaseVersion = leaseVersion;
     if (this.#unaddressedRefreshVersion === unaddressedRefreshVersion) {
       this.#unaddressedRefreshAt = undefined;
-      this.#unaddressedSampleThrough = unaddressedSampleThrough;
+      // A later notification/resample can finish before the release drain. It did
+      // not capture a new source bound, so keep the completed post-miss sample.
+      if (unaddressedSampleThrough !== undefined) this.#unaddressedSampleThrough = unaddressedSampleThrough;
     }
     // Origin updates normally renew mirrors. A source with a long lease and no heartbeat
     // still needs its capped, held projection to remain live: one lease deadline, 1 s before

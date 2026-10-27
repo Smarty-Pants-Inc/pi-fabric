@@ -4,9 +4,12 @@ import {
   JetStreamApiError,
   JetStreamError,
   StorageType,
+  type ConsumerConfig,
   type ConsumerMessages,
   type JetStreamClient,
   type JsMsg,
+  type OrderedPushConsumerOptions,
+  type PushConsumer,
 } from "@nats-io/jetstream";
 import { Kvm, type KV, type KvEntry } from "@nats-io/kv";
 import { NoRespondersError, PermissionViolationError, RequestError, TimeoutError } from "@nats-io/transport-node";
@@ -30,6 +33,7 @@ export type { TransportKvEntry as NatsKvEntry, TransportKvEvent as NatsKvEvent }
 const MACHINE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const KEY_TOKEN = /^[A-Za-z0-9_-]{1,128}$/;
 const CONFLICT_CODES = new Set([10071, 10164]);
+const WATCH_STORAGE_FALLBACK_WARNED = new Set<string>();
 
 export interface NatsKvPolicy {
   readonly bucket: string;
@@ -338,10 +342,31 @@ export class NatsKvStore implements TransportKv {
             // Official ordered push API: creation metadata covers an empty snapshot;
             // pending=0 or an in-order heartbeat covers the last snapshot delivery.
             // Do not count the initial pending entries: deletes/expiry can remove them.
-            const consumer = await this.#js.consumers.getPushConsumer(stream, {
+            // Ordered watchers replay from the file-backed stream; persisting their
+            // disposable cursors only adds synced consumer-state writes. SDK 3.4
+            // forwards ConsumerConfig fields omitted by OrderedPushConsumerOptions.
+            const options: Partial<OrderedPushConsumerOptions> & Pick<ConsumerConfig, "mem_storage"> = {
               filter_subjects: `${subjectPrefix}${prefix}`,
               deliver_policy: DeliverPolicy.LastPerSubject,
-            });
+              mem_storage: true,
+            };
+            let consumer: PushConsumer;
+            try {
+              consumer = await this.#js.consumers.getPushConsumer(stream, options);
+            } catch (error) {
+              // Compatibility only: memory/account quota refusals, never auth,
+              // invalid config, consumer-count limits or disk-specific failures.
+              if (!(error instanceof JetStreamApiError) || [401, 403].includes(error.apiError().code) ||
+                ![10028, 10002].includes(error.apiError().err_code)) throw error;
+              if (signal.aborted || closed) return;
+              if (!WATCH_STORAGE_FALLBACK_WARNED.has(this.#policy.bucket)) {
+                WATCH_STORAGE_FALLBACK_WARNED.add(this.#policy.bucket);
+                console.warn(`[fabric:nats:kv-watch] ${JSON.stringify({ outcome: "file-storage-fallback",
+                  code: `JS_API_${error.apiError().err_code}`, bucket: this.#policy.bucket })}`);
+              }
+              const fileOptions = { ...options, mem_storage: false };
+              consumer = await this.#js.consumers.getPushConsumer(stream, fileOptions);
+            }
             const initial = await consumer.info(true);
             const apply = (msg: JsMsg): void => {
               if (reset || signal.aborted || ended) return;

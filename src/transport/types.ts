@@ -137,4 +137,7 @@ export class KvConflictError extends Error {
   readonly code = "FABRIC_KV_CONFLICT";
   constructor(readonly key: string, readonly expected: number) { super(`KV revision conflict on ${key}`); }
 }
-export class DirectoryNotReadyError extends Error { readonly code = "FABRIC_DIRECTORY_NOT_READY"; }
+export class DirectoryNotReadyError extends Error {
+  readonly code = "FABRIC_DIRECTORY_NOT_READY";
+  constructor(message = "Fabric participant directory is not ready", options?: ErrorOptions) { super(message, options); }
+}

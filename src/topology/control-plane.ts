@@ -2259,7 +2259,13 @@ export class FabricControlPlane {
     if (session.signal.aborted || this.#natsSession !== session || this.#closed || this.#paused || !this.options.enabled) return false;
     try {
       if (!this.options.participants!.leaseLive()) {
-        // E11: actual lease loss is latched, never a retry or auto-resume.
+        if (this.options.participants!.leaseRecovering?.()) {
+          // A local cutoff holds admission until the directory's fenced reacquisition.
+          this.#stopNatsInbox(session);
+          this.#bindNatsInbox(true);
+          return false;
+        }
+        // Conflicting/aborted ownership is terminal, never an automatic resume.
         this.pause(new MeshConsumptionPausedError());
         return false;
       }
@@ -2321,6 +2327,7 @@ export class FabricControlPlane {
     if (this.#natsOutcomes.size) { this.#scheduleNatsOutcomeRetry(); return; }
     try {
       if (!this.options.participants!.leaseLive()) {
+        if (this.options.participants!.leaseRecovering?.()) { this.#bindNatsInbox(true); return; }
         this.pause(new MeshConsumptionPausedError()); return;
       }
       if (this.options.canConsumeMesh?.() === false) { this.#bindNatsInbox(true); return; }

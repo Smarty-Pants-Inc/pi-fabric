@@ -122,6 +122,11 @@ export interface FabricKvHostLease extends FabricHostLease {
   pid: number;
   pidStartTime: string;
   bootId: string;
+  /**
+   * Set while a lease that expired in KV and was created again awaits its owner's root re-check
+   * (smarty-dev#15310): it still holds the host against other machines, but routes nothing.
+   */
+  rootRecheck?: true;
 }
 
 export interface FabricParticipantInfo extends FabricParticipantRecord {

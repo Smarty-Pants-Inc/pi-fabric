@@ -6,13 +6,14 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { diagnostics } from "../src/core/diagnostics.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { FabricTargetTerminalError } from "../src/agents/terminal-target.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { FabricControlPlane, type FabricControlCommand } from "../src/topology/control-plane.js";
 import { TransportHostLease } from "../src/topology/host-leases.js";
 import type { ParticipantView } from "../src/topology/participant-view.js";
-import { TransportUnavailableError, type FabricTransport, type TransportDelivery, type TransportEnvelope, type TransportKv } from "../src/transport/types.js";
+import { TransportUnavailableError, type FabricTransport, type TransportDelivery, type TransportEnvelope, type TransportKv, type TransportKvEntry } from "../src/transport/types.js";
 
 const owner = { machine: "machine-a", hostId: "retry-owner" };
 const identity = { id: "retry-owner", name: "owner", kind: "main" as const };
@@ -121,10 +122,25 @@ describe("A2 callers across verified NATS reopen", () => {
     } finally { await plane.close(); }
   });
 
-  it.skipIf(process.platform !== "linux")("never rebinds after actual lease loss, even when transport availability returns", async () => {
-    let monotonic = 0, inboxEntries = 0, handlerCalls = 0;
+  it.skipIf(process.platform !== "linux")("never rebinds after a foreign owner takes an expired lease", async () => {
+    let monotonic = 0, inboxEntries = 0, handlerCalls = 0, revision = 0;
     let plane: FabricControlPlane | undefined;
-    const kv: TransportKv = { ...unusedKv, async put() { return 1; }, async delete() { return true; } };
+    let current: TransportKvEntry<unknown> | undefined;
+    const kv: TransportKv = { ...unusedKv,
+      async get<V>() { return current as TransportKvEntry<V> | undefined; },
+      async put<V>(key: string, ownerId: string, value: V, ifRevision: number) {
+        if (ifRevision === 0) {
+          current = { key, machine: owner.machine, owner: ownerId, value, revision: ++revision };
+          return revision;
+        }
+        current = { key, machine: owner.machine, owner: "successor#foreign", value: {}, revision: ++revision };
+        throw Object.assign(new Error("KV revision conflict"), { code: "FABRIC_KV_CONFLICT" });
+      },
+      async delete(_key, ifRevision) {
+        if (current?.revision !== ifRevision) return false;
+        current = undefined; return true;
+      },
+    };
     const lease = new TransportHostLease({ kv, self: owner, rootId: identity.id, identityId: identity.id,
       incarnation: epoch, localStateDir: temporary(), monotonic: () => monotonic,
       onLost: error => plane?.pause(error) }); // The public composition-owned E11 path.
@@ -150,8 +166,11 @@ describe("A2 callers across verified NATS reopen", () => {
       await vi.advanceTimersByTimeAsync(0); // First failed entry has armed its one-shot.
       expect(inboxEntries).toBe(1);
       monotonic = 13_000;
-      expect(lease.live()).toBe(false); // Real monotonic cutoff, not a false readiness flag.
-      expect(lease.signal.aborted).toBe(true);
+      expect(lease.live()).toBe(false); // A local cutoff holds admission until ownership is checked.
+      expect(lease.recovering()).toBe(true);
+      expect(lease.signal.aborted).toBe(false);
+      await expect(lease.renew()).rejects.toMatchObject({ code: "FABRIC_HOST_LEASE_LOST", reason: "conflict" });
+      expect(lease.signal.aborted).toBe(true); // The observed foreign owner is terminal.
       unavailable = false;
       await vi.advanceTimersByTimeAsync(31_000);
       expect(inboxEntries).toBe(1);
@@ -160,6 +179,7 @@ describe("A2 callers across verified NATS reopen", () => {
     } finally {
       try { await plane?.close(); await lease.release(); } finally { vi.useRealTimers(); }
     }
+    expect(current?.owner).toBe("successor#foreign"); // Old-revision release cannot delete its successor.
   });
 
   it("does not permanently pause when a live watch reset holds the ACK fence", async () => {
@@ -319,15 +339,25 @@ describe("A2 callers across verified NATS reopen", () => {
     } finally { try { await plane.close(); } finally { vi.useRealTimers(); } }
   });
 
-  it.skipIf(process.platform !== "linux")("retries renewal only inside the original 13s cutoff and never revives the lost lease", async () => {
+  it.skipIf(process.platform !== "linux")("suspends at the original 13s cutoff and recovers by same-owner CAS", async () => {
     let monotonic = 0, unavailable = false, revision = 0;
+    let current: TransportKvEntry<unknown> | undefined;
     const deletes: Array<{ key: string; revision: number }> = [];
     const kv: TransportKv = { ...unusedKv,
-      async put() { if (unavailable) throw new TransportUnavailableError("reverification pending"); return ++revision; },
+      async get<V>() { return current as TransportKvEntry<V> | undefined; },
+      async put<V>(key: string, ownerId: string, value: V, ifRevision: number) {
+        if (unavailable) throw new TransportUnavailableError("reverification pending");
+        if (ifRevision === 0 ? current !== undefined : current?.revision !== ifRevision) {
+          throw Object.assign(new Error("KV revision conflict"), { code: "FABRIC_KV_CONFLICT" });
+        }
+        current = { key, machine: owner.machine, owner: ownerId, value, revision: ++revision };
+        return revision;
+      },
       async delete(key, ifRevision) { deletes.push({ key, revision: ifRevision }); return true; },
     };
     const lease = new TransportHostLease({ kv, self: owner, rootId: identity.id, identityId: identity.id,
       incarnation: epoch, localStateDir: temporary(), monotonic: () => monotonic });
+    const warning = vi.spyOn(diagnostics, "warn").mockImplementation(() => undefined);
     try {
       await lease.acquire();
       monotonic = 5_000;
@@ -339,13 +369,21 @@ describe("A2 callers across verified NATS reopen", () => {
       expect(lease.live()).toBe(true); // Failure has not moved the acquisition's deadline.
       monotonic = 13_000;
       expect(lease.live()).toBe(false);
-      expect(lease.signal.aborted).toBe(true);
-      unavailable = false; // A verified transport recovery is NOT lease reacquisition.
-      expect(() => lease.renew()).toThrow();
+      expect(lease.recovering()).toBe(true);
+      expect(lease.signal.aborted).toBe(false);
+      expect(lease.live()).toBe(false); // Repeated reads do not repeat the suspend warning.
+      expect(warning.mock.calls).toEqual([["src/topology/host-leases.ts",
+        "[pi-fabric] NATS host lease suspended: reason=timeout elapsedMs=13000"]]);
+      // The raw "reverification pending" renewal error above must not enter the warning.
+      unavailable = false;
+      await lease.renew(); // Only a receipt-verified, current-revision CAS restores admission.
+      expect(lease.live()).toBe(true);
+      expect(lease.recovering()).toBe(false);
+      expect(lease.signal.aborted).toBe(false);
       expect(() => lease.acquire()).toThrow();
-      expect(revision).toBe(1);
-    } finally { await lease.release(); }
-    expect(deletes).toEqual([{ key: lease.key, revision: 1 }]); // Recorded adapter only; no KV deletion.
+      expect(revision).toBe(2);
+    } finally { await lease.release(); warning.mockRestore(); }
+    expect(deletes).toEqual([{ key: lease.key, revision: 2 }]); // Recorded adapter only; no KV deletion.
   });
 
   it("keeps a real manager's final answer terminal rather than replaying input into a finished task", async () => {

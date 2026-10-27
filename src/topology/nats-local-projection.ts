@@ -118,6 +118,8 @@ export class NatsLocalProjection {
   #started = false;
   #closed = false;
   #initialReadyResolved = false;
+  #resumingAfterLeaseRecovery: Promise<void> | undefined;
+  readonly #pendingEntries = new Map<string, { bucket: BucketKind; entry: TransportKvEntry<unknown> }>();
 
   constructor(readonly options: NatsLocalProjectionOptions) {
     if (options.transport.kind !== "nats") throw new TypeError("NATS local projection requires mesh.transport=nats");
@@ -177,6 +179,7 @@ export class NatsLocalProjection {
           if (this.#closed) return;
           if (event.type === "reset") {
             observed = new Set();
+            for (const [key, pending] of this.#pendingEntries) if (pending.bucket === bucket) this.#pendingEntries.delete(key);
             this.#ready.delete(bucket);
             continue;
           }
@@ -235,18 +238,44 @@ export class NatsLocalProjection {
   async #put(bucket: BucketKind, entry: TransportKvEntry<unknown>): Promise<void> {
     if (entry.machine !== this.options.transport.self.machine) return;
     const value = bucket === "presence" ? presenceValue(entry) : leaseValue(entry);
+    const pendingKey = `${bucket}:${entry.key}`;
     if (!value) {
+      this.#pendingEntries.delete(pendingKey);
       await this.#remove(bucket, entry.key, entry.revision);
       return;
     }
+    const pending = { bucket, entry };
+    this.#pendingEntries.set(pendingKey, pending);
     if (!this.options.leaseLive()) return;
     if (bucket === "presence") await this.#writeParticipant(entry, value as FabricParticipantRecord);
     else await this.#writeHostLease(entry, value as FabricKvHostLease);
+    if (this.options.leaseLive() && this.#pendingEntries.get(pendingKey) === pending) this.#pendingEntries.delete(pendingKey);
   }
 
   async #gone(bucket: BucketKind, key: string, revision: number): Promise<void> {
     if (!key.startsWith(`${this.options.transport.self.machine}.${bucket === "presence" ? "p" : "h"}.`)) return;
+    this.#pendingEntries.delete(`${bucket}:${key}`);
     await this.#remove(bucket, key, revision);
+  }
+
+  /** Replay snapshot rows deferred while this process's own NATS lease was suspended. */
+  resumeAfterLeaseRecovery(): Promise<void> {
+    if (this.#closed || !this.options.leaseLive()) return Promise.resolve();
+    if (this.#resumingAfterLeaseRecovery) return this.#resumingAfterLeaseRecovery;
+    const work = (async () => {
+      const failures: unknown[] = [];
+      for (const [key, pending] of [...this.#pendingEntries]) {
+        if (this.#closed || !this.options.leaseLive()) break;
+        if (this.#pendingEntries.get(key) !== pending) continue;
+        try { await this.#put(pending.bucket, pending.entry); }
+        catch (error) { failures.push(error); }
+      }
+      if (failures.length) throw new AggregateError(failures, "NATS local projection lease recovery failed");
+    })().finally(() => {
+      if (this.#resumingAfterLeaseRecovery === work) this.#resumingAfterLeaseRecovery = undefined;
+    });
+    this.#resumingAfterLeaseRecovery = work;
+    return work;
   }
 
   async #writeParticipant(entry: TransportKvEntry<unknown>, record: FabricParticipantRecord): Promise<void> {
@@ -482,6 +511,8 @@ export class NatsLocalProjection {
     this.#closed = true;
     this.#abort.abort();
     await Promise.allSettled(this.#watchTasks);
+    await this.#resumingAfterLeaseRecovery?.catch(() => undefined);
+    this.#pendingEntries.clear();
     // Shutdown follows KV withdrawal. Re-read before cleanup because an abort can overtake
     // queued tombstones; a failed get retains the local file rather than guessing absence.
     await Promise.all([this.#reconcile("presence", new Set()), this.#reconcile("leases", new Set())]);

@@ -8,6 +8,8 @@ export interface ParticipantView {
   whenChanged(participantId: string, signal: AbortSignal): Promise<void>;
   /** The host lease is live by the local monotonic window (§4.2). */
   leaseLive(): boolean;
+  /** False admission during a recoverable local expiry; terminal loss aborts the lease signal. */
+  leaseRecovering?(): boolean;
 }
 
 import { createHash } from "node:crypto";
@@ -27,6 +29,7 @@ import { isPlacementRunId } from "./placement-run-id.js";
 /** The lease task owns acquisition, monotonic expiry, successor evidence and release. */
 export interface ParticipantLeaseGate {
   live(): boolean;
+  recovering?(): boolean;
   readonly signal: AbortSignal;
 }
 
@@ -39,6 +42,31 @@ export interface KvParticipantDirectoryOptions {
   /** Bounds each KV operation, including reconciliation and best-effort cleanup. */
   operationTimeoutMs?: number;
   onError?: (error: unknown) => void;
+}
+
+/**
+ * A new session-root presence registration was refused because another authenticated machine
+ * holds the same root id: a live record, or a live lease for its host (smarty-dev#15310 D3).
+ * Nothing was written. Two machines presenting one id would leave it ambiguous and unroutable;
+ * the old owner must stop (or its lease must lapse) before the session can register here.
+ */
+export class PresenceOwnedElsewhereError extends Error {
+  readonly code = "FABRIC_PRESENCE_OWNED_ELSEWHERE";
+  readonly persisted = false;
+  readonly owners: readonly PresenceHolder[];
+  constructor(readonly participantId: string, owners: readonly PresenceHolder[]) {
+    super(`Participant ${participantId} is held on machine ${owners.map(owner => owner.machine).join(", ")}; refusing a second registration`);
+    this.owners = owners.map(owner => ({ ...owner }));
+  }
+}
+
+/** Another machine's hold on a root: `routable` when its presence record is live, else its lease alone. */
+export interface PresenceHolder {
+  readonly machine: string;
+  readonly ownerHostId: string;
+  readonly ownerIdentityId: string;
+  readonly ownerIncarnation: string;
+  readonly routable: boolean;
 }
 
 /** Only this exact admission revision may be rolled back; a later change is never deleted. */
@@ -117,6 +145,7 @@ export function leaseValue(entry: TransportKvEntry<unknown>): FabricKvHostLease 
     !Number.isSafeInteger(value.pid) || (value.pid as number) <= 0 ||
     !textValue(value.pidStartTime) || !textValue(value.bootId) ||
     !finiteValue(value.updatedAt) || !finiteValue(value.expiresAt) ||
+    (value.rootRecheck !== undefined && value.rootRecheck !== true) ||
     value.mirror !== undefined || value.mirrorLease !== undefined) return undefined;
   return value as unknown as FabricKvHostLease;
 }
@@ -188,6 +217,11 @@ export class KvParticipantDirectory implements ParticipantView {
 
   leaseLive(): boolean {
     try { return !this.#closed && !this.options.lease.signal.aborted && this.options.lease.live(); }
+    catch { return false; }
+  }
+
+  leaseRecovering(): boolean {
+    try { return !this.#closed && !this.options.lease.signal.aborted && this.options.lease.recovering?.() === true; }
     catch { return false; }
   }
 
@@ -279,6 +313,63 @@ export class KvParticipantDirectory implements ParticipantView {
     return `${machineFromKey(entry.key, "p")!}.h.${tokenFor(entry.value.ownerHostId)}`;
   }
 
+  /**
+   * OTHER machines holding this root, from the ready snapshot: a routable presence record, or
+   * any valid lease row for the root's host id (a runtime that is alive there, even before it
+   * publishes presence).
+   */
+  #heldElsewhere(record: FabricParticipantRecord): PresenceHolder[] {
+    const self = this.options.transport.self.machine;
+    const holders = new Map<string, PresenceHolder>();
+    for (const entry of this.#records.values()) {
+      const machine = machineFromKey(entry.key, "p")!;
+      if (entry.value.id !== record.id || machine === self) continue;
+      const route = this.#route(entry);
+      if (route.live) holders.set(machine, { machine, ownerHostId: route.ownerHostId, ownerIdentityId: route.ownerIdentityId,
+        ownerIncarnation: route.ownerIncarnation, routable: true });
+    }
+    const token = tokenFor(record.ownerHostId);
+    for (const host of this.#hosts.values()) {
+      const machine = machineFromKey(host.key, "h")!;
+      if (machine === self || host.key.split(".")[2] !== token || holders.has(machine)) continue;
+      holders.set(machine, { machine, ownerHostId: host.value.id, ownerIdentityId: host.value.identityId,
+        ownerIncarnation: host.value.incarnation, routable: false });
+    }
+    return [...holders.values()].sort((a, b) => a.machine.localeCompare(b.machine));
+  }
+
+  /**
+   * After the owner lease expired in KV and was created again, this view's root is checked like a
+   * first registration: another machine may have registered it during the gap (its own fresh
+   * check saw no lease here). Waits until this view has observed the re-created lease revision,
+   * so every lease written before it is in the snapshot, then refuses if another machine holds
+   * the root. The caller must stop using this view's presence on refusal.
+   */
+  async confirmSoleRoot(record: FabricParticipantRecord, leaseRevision: number, signal?: AbortSignal): Promise<void> {
+    if (record.kind !== "root") return;
+    const self = this.options.transport.self;
+    const key = `${self.machine}.h.${tokenFor(self.hostId)}`;
+    const bounded = signal ? AbortSignal.any([signal, this.#signal()]) : this.#signal();
+    try {
+      bounded.throwIfAborted();
+      while (!this.ready || (this.#hosts.get(key)?.revision ?? 0) < leaseRevision) await this.whenChanged(record.id, bounded);
+    } catch (error) {
+      if (errorCode(error) === "FABRIC_DIRECTORY_NOT_READY") throw error;
+      throw new DirectoryNotReadyError("Presence view has not observed the recovered owner lease", { cause: error });
+    }
+    const own = this.#hosts.get(key)!;
+    if (own.owner !== this.#owner() || own.value.id !== self.hostId || own.value.incarnation !== this.options.ownerIncarnation) {
+      throw new TransportUnavailableError("The recovered owner lease is not this view's");
+    }
+    this.#refuseHeldElsewhere(record);
+  }
+
+  #refuseHeldElsewhere(record: FabricParticipantRecord): void {
+    if (record.kind !== "root") return;
+    const holders = this.#heldElsewhere(record);
+    if (holders.length) throw new PresenceOwnedElsewhereError(record.id, holders);
+  }
+
   #entry(id: string): TransportKvEntry<FabricParticipantRecord> | undefined {
     // The same id on multiple authenticated machines is ambiguous, never source authority.
     const matches = [...this.#records.values()].filter(entry => entry.value.id === id);
@@ -297,7 +388,7 @@ export class KvParticipantDirectory implements ParticipantView {
       live: !!lease && machineFromKey(host!.key, "h") === machine &&
         lease.id === record.ownerHostId && lease.identityId === record.ownerIdentityId &&
         lease.rootId === record.rootId && lease.incarnation === record.ownerIncarnation &&
-        host!.owner === entry.owner && !KV_TERMINAL.has(record.status) &&
+        host!.owner === entry.owner && !KV_TERMINAL.has(record.status) && lease.rootRecheck !== true &&
         (!ownHost || record.ownerIncarnation === this.options.ownerIncarnation && this.leaseLive()),
     };
   }
@@ -414,12 +505,23 @@ export class KvParticipantDirectory implements ParticipantView {
   }
 
   /** On-change publication; only roots, same-lineage participants, or participants with a dead owner may replace a predecessor. */
-  publish(record: FabricParticipantRecord): Promise<KvPresencePublication> {
+  publish(record: FabricParticipantRecord, options: { force?: boolean } = {}): Promise<KvPresencePublication> {
     const copy = this.#ownRecord(record), key = this.#key(copy.id);
     return this.#serial(key, async () => {
       this.#assertWritable();
       if (this.#pendingCleanup.has(key)) throw new TransportUnavailableError("Presence awaits uncertain admission cleanup");
       const owned = this.#owned.get(key);
+      if (options.force) {
+        // Recovery invalidates the local freshness shortcut. Only an exact owned value
+        // authorizes adopting a current revision; a foreign/newer value is never overwritten.
+        const current = await this.#presence.get<unknown>(key, this.#signal());
+        if (current && !this.#same(current, copy) && (!owned || !this.#same(current, owned.record))) {
+          throw new TransportInvalidError("Recovered presence refresh does not own the current KV record");
+        }
+        this.#assertWritable();
+        const revision = await this.#update(key, copy, current?.revision ?? 0);
+        return this.#admitted(key, copy, revision);
+      }
       if (owned && canonicalJson(owned.record) === canonicalJson(copy) &&
         performance.now() - owned.writtenAt < KV_PRESENCE_REFRESH_MS) {
         return { key, revision: owned.revision, rollback: () => this.#serial(key, () => this.#removeRevision(key, owned.revision)) };

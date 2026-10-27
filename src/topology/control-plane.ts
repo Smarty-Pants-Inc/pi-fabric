@@ -3235,7 +3235,9 @@ export class FabricControlPlane {
         }
         else if (this.#handler) {
           this.#warnUnfencedSenderDelivery(command, from);
-          acceptance = await this.#handler(command, from, controller.signal, verification, owned.nativeAdmission);
+          acceptance = owned.nativeAdmission === undefined
+            ? await this.#handler(command, from, controller.signal, verification)
+            : await this.#handler(command, from, controller.signal, verification, owned.nativeAdmission);
         } else acceptance = { accepted: false, error: "Fabric owner has no control handler" };
       } catch (error) {
         if (error instanceof MeshConsumptionPausedError) throw error;

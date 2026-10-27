@@ -520,6 +520,72 @@ describe.skipIf(!!nativeSkipReason)(`F1(b) actual candidate-installed native own
       // SDK consumes it as data; treating that value as an unknown flag is wrong.
     }, 180_000);
 
+  it.each(["ordinary-new", "ordinary-new-parent-symlink", "task-new", "task-new-parent-symlink",
+    "task-new-owner-host-profile"] satisfies NativeOwnerCliShape[])(
+    "P2 actual configured SDK opens a NEW ordinary session leaf without prior header or history: %s", async shape => {
+      const owner = await realOwner(); assertInstalled(owner);
+      const before = snapshot(owner), lock = inode(`${owner.sessionFile}.main.lock`);
+      const result = await owner.attemptRealCli(shape);
+      expect(result.missingAtLaunch).toBe(true); expect(result.selectedFile).toBeDefined();
+      expect(result.code).toBe(0); expect(result.signal).toBeNull();
+      expect(result.stderr).not.toContain("NATIVE_OWNER_FENCE_REQUIRED");
+      const ordinary = result.ordinary!; expect(ordinary).toBeDefined();
+      expect(ordinary.sessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+      expect(ordinary.sessionId).not.toBe(owner.pin.sessionId);
+      expect(ordinary.sessionFile).toBe(result.selectedFile);
+      const selectedParent = fs.realpathSync(path.dirname(ordinary.sessionFile));
+      expect(path.join(selectedParent, path.basename(ordinary.sessionFile))).not.toBe(owner.sessionFile);
+      expect(fs.lstatSync(path.dirname(ordinary.sessionFile)).isSymbolicLink()).toBe(shape.endsWith("parent-symlink"));
+      const records = result.stdout.split("\n").filter(Boolean).map(line => JSON.parse(line));
+      expect(records).toContainEqual(expect.objectContaining({ type: "response", id: "ordinary-readback", success: true,
+        data: expect.objectContaining({ sessionId: ordinary.sessionId, sessionFile: ordinary.sessionFile }) }));
+      expect(owner.sdkImports().some(value => value.pid === result.pid && value.url.endsWith("/core/session-manager.js"))).toBe(true);
+      if (!shape.startsWith("task-")) expect(owner.sdkImports().some(value => value.pid === result.pid && value.url.endsWith("/cli.js"))).toBe(true);
+      expect(owner.observations().filter(value => value.pid === result.pid && value.event === "session-start")).toEqual([
+        expect.objectContaining({ selectedModel: false, unconfigured: true, rootId: ordinary.rootId, sessionFile: ordinary.sessionFile }),
+      ]);
+      expect(owner.observations().filter(value => String(value.event).startsWith("FORBIDDEN-") || value.event === "input-handled")).toEqual([]);
+      expect(owner.callbacks()).toEqual([]); unchanged(owner, before);
+      expect(inode(`${owner.sessionFile}.main.lock`)).toEqual(lock);
+      // Missing NEW leaves need not be flushed without a turn. The real SDK's
+      // RPC/session_start identity and selected path, not a fixture header, prove admission.
+    }, 180_000);
+
+  it.each(["task-new-missing-parent", "task-new-missing-pin"] satisfies NativeOwnerCliShape[])(
+    "P2 bare task selection failures are typed and occur before SDK load: %s", async shape => {
+      const owner = await realOwner(); assertInstalled(owner);
+      const before = snapshot(owner), lock = inode(`${owner.sessionFile}.main.lock`);
+      const result = await owner.attemptRealCli(shape);
+      expect(result.missingAtLaunch).toBe(true);
+      expect(result.code).toBe(1); expect(result.signal).toBeNull();
+      expect(result.stderr).toContain("NativeOwnerFenceError: NATIVE_OWNER_FENCE_REQUIRED");
+      expect(result.stdout).toBe("");
+      expect(owner.sdkImports().filter(value => value.pid === result.pid)).toEqual([]);
+      expect(owner.observations().filter(value => value.pid === result.pid)).toEqual([]);
+      expect(owner.callbacks()).toEqual([]); unchanged(owner, before);
+      expect(inode(`${owner.sessionFile}.main.lock`)).toEqual(lock);
+      expect(fs.existsSync(result.selectedFile!)).toBe(false);
+    }, 180_000);
+
+  it.each(["hardlink-native", "task-hardlink-native"] satisfies NativeOwnerCliShape[])(
+    "P3 same-dev+ino native hardlink alias is typed-refused without native SDK writes: %s", async shape => {
+      const owner = await realOwner(); assertInstalled(owner);
+      const before = snapshot(owner), lock = inode(`${owner.sessionFile}.main.lock`);
+      const result = await owner.attemptRealCli(shape);
+      expect(result.code).toBe(1); expect(result.signal).toBeNull();
+      expect(result.stderr).toContain("NativeOwnerFenceError: NATIVE_OWNER_FENCE_REQUIRED");
+      expect(result.stderr).toContain("native session inode alias"); expect(result.stdout).toBe("");
+      if (shape.startsWith("task-")) expect(owner.sdkImports().filter(value => value.pid === result.pid)).toEqual([]);
+      else expect(owner.sdkImports().some(value => value.pid === result.pid && value.url.endsWith("/cli.js"))).toBe(true);
+      expect(owner.observations().filter(value => value.pid === result.pid)).toEqual([]);
+      expect(owner.callbacks()).toEqual([]); unchanged(owner, before);
+      expect(inode(`${owner.sessionFile}.main.lock`)).toEqual(lock);
+      expect(fs.lstatSync(owner.sessionFile).nlink).toBe(2);
+      const alias = fs.readdirSync(owner.cwd).find(name => name.startsWith(`real-cli-${shape}-`) && name.endsWith(".jsonl"));
+      expect(alias).toBeDefined(); expect(inode(path.join(owner.cwd, alias!))).toEqual(before.sessionInode);
+      expect(fs.realpathSync(path.join(owner.cwd, alias!))).not.toBe(owner.sessionFile);
+    }, 180_000);
+
   it.each(["task-prefix-ordinary", "cli-prefix-ordinary"] satisfies NativeOwnerCliShape[])(
     "P3.1 actual SDK parser opens distinct ordinary native-ID-prefix control: %s", async shape => {
       const owner = await realOwner(); assertInstalled(owner);

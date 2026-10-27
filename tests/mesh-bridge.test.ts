@@ -61,8 +61,43 @@ const scratch = (): string => {
 const hash = (id: string): string => createHash("sha256").update(id).digest("hex");
 
 const isProcessAlive = (pid: number): boolean => {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  try { process.kill(pid, 0); } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+  if (process.platform === "linux") {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const end = stat.lastIndexOf(")");
+      const state = end < 0 ? undefined : stat.slice(end + 2).trim().split(/\s+/)[0];
+      // kill(pid, 0) succeeds for an exited, not-yet-reaped child too.
+      if (state === "Z" || state === "X" || state === "x") return false;
+    } catch { /* Unknown state is not evidence of termination; retain the original bound. */ }
+  }
+  return true;
 };
+
+describe.skipIf(process.platform !== "linux")("transport termination probe", () => {
+  // Keep: the real two-signal regression must distinguish execution from a dead PID entry.
+  it.each(["Z", "X", "x"])("treats terminal proc state %s as dead even when kill(0) succeeds", state => {
+    vi.spyOn(process, "kill").mockReturnValue(true);
+    vi.spyOn(fs, "readFileSync").mockReturnValue(`342 (name with a ) delimiter) ${state} 1 2 3\n`);
+    expect(isProcessAlive(342)).toBe(false);
+  });
+  it.each(["R", "S", "D", "T"])("keeps live/stopped proc state %s alive", state => {
+    vi.spyOn(process, "kill").mockReturnValue(true);
+    vi.spyOn(fs, "readFileSync").mockReturnValue(`342 (transport) ${state} 1 2 3\n`);
+    expect(isProcessAlive(342)).toBe(true);
+  });
+  it("does not mistake inaccessible state or EPERM for death", () => {
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    vi.spyOn(fs, "readFileSync").mockImplementation(() => { throw new Error("unavailable proc state"); });
+    expect(isProcessAlive(342)).toBe(true);
+    kill.mockImplementation(() => { throw Object.assign(new Error("not permitted"), { code: "EPERM" }); });
+    expect(isProcessAlive(342)).toBe(true);
+    kill.mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
+    expect(isProcessAlive(342)).toBe(false);
+  });
+});
 
 const waitForCondition = async (predicate: () => boolean, timeoutMs: number, what: string): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
@@ -774,6 +809,18 @@ describe("presence mirror under contention (smarty-dev#2761)", () => {
 });
 
 describe("cross-host Main delivery semantics (#3015)", () => {
+  // Adapter contract only; actual registry-native refusal remains covered by native-actor-sources.
+  it.each(["steer", "followUp"] as const)("keeps the native relay refusal on a complete borrowed receiver (%s)", async kind => {
+    const targetId = "34200000000000000000000000000001";
+    const publish = vi.fn();
+    const isNativeActor = vi.fn((id: string) => id === targetId);
+    const receiver = { mesh: { publish }, meshConfig: { enabled: true }, isNativeActor } as unknown as ActorManager;
+    await expect(ActorManager.prototype.steerRemote.call(receiver, targetId, "must not publish", kind))
+      .rejects.toMatchObject({ code: "FABRIC_NATIVE_ACTOR_UNSUPPORTED_OPERATION" });
+    expect(isNativeActor).toHaveBeenCalledExactlyOnceWith(targetId);
+    expect(publish).not.toHaveBeenCalled();
+  });
+
   it.each(["legacy", "v1"] as const)("preserves an old %s Main legacy route without adding an epoch", async controlProtocol => {
     const { hub, far, bridge } = setup(undefined, { realPipe: true });
     const source = await addRoot(hub, "fenced-source");
@@ -785,8 +832,11 @@ describe("cross-host Main delivery semantics (#3015)", () => {
     const directory = new ParticipantDirectory(hub, { enabled: true, hostId: source.hostId, rootId: source.identity.id, identity: source.identity });
     const sender = new FabricControlPlane(hub, source.identity, { enabled: true, hostId: source.hostId, pollMs: 20,
       readMirroredOwner: (...args) => directory.mirroredControlOwner(...args) });
+    // This fixture contains only ordinary Main roots. Supply the classifier required
+    // by steerRemote's receiver instead of weakening the real ActorManager guard.
+    const isNativeActor = vi.fn((_id: string) => false);
     const steerRemote = vi.fn((...args: Parameters<ActorManager["steerRemote"]>) =>
-      ActorManager.prototype.steerRemote.apply({ mesh: hub, identity: source.identity, meshConfig: { enabled: true } } as ActorManager, args));
+      ActorManager.prototype.steerRemote.apply({ mesh: hub, identity: source.identity, meshConfig: { enabled: true }, isNativeActor } as ActorManager, args));
     const sending = new AgentsProvider({ cwd: os.tmpdir() } as any, { identity: source.identity, steerRemote } as any, {} as any,
       { local: true, id: source.identity.id, matches: (id: string) => id === source.identity.id } as any,
       directory, sender, {} as any, () => false, undefined, false);
@@ -808,6 +858,9 @@ describe("cross-host Main delivery semantics (#3015)", () => {
         }
         expect(warn).toHaveBeenCalledTimes(2);
         expect(steerRemote).toHaveBeenCalledTimes(2);
+        expect(isNativeActor).toHaveBeenCalledTimes(2);
+        expect(isNativeActor).toHaveBeenNthCalledWith(1, target.identity.id);
+        expect(isNativeActor).toHaveBeenNthCalledWith(2, target.identity.id);
         expect(on(hub, "fabric.control.command")).toEqual([]);
         return;
       }

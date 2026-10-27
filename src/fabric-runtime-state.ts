@@ -739,7 +739,7 @@ export class FabricRuntimeState {
     // Native identity must not reach teardown, mesh construction/publication or
     // appends without this process's actual self-open-description kernel proof.
     if (!this.#managedHost) {
-      const sessionId = context.sessionManager.getSessionId();
+      const sessionId = context.sessionManager?.getSessionId?.();
       if (hasRegisteredNativeActorBindings(`session:${sessionId}`)) {
         const { guardNativeOwnerBootstrap } = await import("./worker/native-owner-entry.js");
         guardNativeOwnerBootstrap(context);

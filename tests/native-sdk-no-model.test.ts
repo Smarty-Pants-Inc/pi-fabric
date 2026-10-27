@@ -99,7 +99,7 @@ describe.skipIf(!!nativeSkipReason)(`N7 approved SDK UNCONFIGURED contract${nati
     const sdkDirectory = process.env.FABRIC_NATIVE_TEST_PI_SDK_DIST, nodeBinary = process.env.FABRIC_NATIVE_TEST_NODE;
     if (!sdkDirectory || !nodeBinary) throw new Error("N7 BLOCKED: explicit FABRIC_NATIVE_TEST_PI_SDK_DIST + FABRIC_NATIVE_TEST_NODE required");
     const owner = await createNativeActorOwner({ candidateRoot: fileURLToPath(new URL("../", import.meta.url)),
-      sdkDirectory, nodeBinary, actorId: "6027cfd59b1247b6bb4666970c481cc4" });
+      sdkDirectory, nodeBinary, actorId: "34200000000000000000000000000001" });
     try {
       const result = await owner.probeModelPolicy();
       expect(result.sdkRelease).toBe(NATIVE_SDK_RELEASE);

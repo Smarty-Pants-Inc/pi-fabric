@@ -101,6 +101,16 @@ const freeze = <T>(value: T): T => {
 };
 const cloneJson = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
+/** Ordinary control retries get fresh attempt times. Ask/cancel can mint native ingress evidence,
+ * so their COMPLETE first body remains the comparison authority, even for non-native recipients.
+ * Never normalize the stored body or a receipt: only compare ordinary retry attempts this way.
+ */
+const claimBodySemantics = (input: BridgeNatsClaimInput): unknown => {
+  if (!input.resolvedBody || input.operation === "ask" || input.operation === "cancel") return input.resolvedBody;
+  const { requestCreatedAt: _created, requestedAt: _requested, deadlineAt: _deadline, ...body } = input.resolvedBody;
+  return body;
+};
+
 /** Shape check of a command record read back from disk or built from a claim. */
 const validCommand = (r: unknown): r is BridgeNatsCommandRecord => {
   if (!isObject(r) || r.v !== 1 || !STATES.includes(r.state as BridgeNatsCommandState) || !direction(r.direction)) return false;
@@ -493,18 +503,19 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
             existing.replyTo !== input.replyTo || existing.targetId !== input.targetId || existing.operation !== input.operation) {
           return { status: "mismatch" as const, created: false as const, record: existing };
         }
-        // The old wire digest intentionally omits route/deadline/timestamp fields. Retained toFile
-        // evidence is stricter: a receipt repair/resend must reuse the complete FIRST forwarded body,
-        // sender and principal. Never backfill a pre-upgrade claim lacking that historical evidence.
+        // The wire digest pins semantic input, not per-attempt times. Ordinary retries may vary
+        // those times, but still reuse the FIRST stored body/sender/principal and original horizon.
+        // Ask/cancel keep exact body/deadline matching for native receipt repair. Never backfill a
+        // pre-upgrade claim lacking historical evidence or relax route/identity/principal checks.
         if (existing.direction === "toFile" && existing.resolvedBody !== undefined &&
-            (input.resolvedBody === undefined || canonical(existing.resolvedBody) !== canonical(input.resolvedBody) ||
+            (input.resolvedBody === undefined || canonical(claimBodySemantics(existing)) !== canonical(claimBodySemantics(input)) ||
              canonical(existing.principal ?? null) !== canonical(input.principal ?? null) ||
              existing.from.id !== input.from.id || existing.from.kind !== input.from.kind ||
              // Optional Main sid/name are not credentials; the verified canonical id fixes its sid.
              (!(existing.from.kind === "main" && BRIDGE_NATS_SESSION_ID.test(existing.from.id)) &&
                existing.from.sessionId !== input.from.sessionId) || existing.ownerHostId !== input.ownerHostId ||
              existing.ownerIdentityId !== input.ownerIdentityId || existing.ownerIncarnation !== input.ownerIncarnation ||
-             existing.deadlineAt !== input.deadlineAt)) {
+             ((existing.operation === "ask" || existing.operation === "cancel") && existing.deadlineAt !== input.deadlineAt))) {
           return { status: "mismatch" as const, created: false as const, record: existing };
         }
         return { status: "duplicate" as const, created: false as const, record: existing };

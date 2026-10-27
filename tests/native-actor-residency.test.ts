@@ -90,7 +90,7 @@ describe("native resident declarations and module boundary", () => {
     expect(copied[0]!.ingress.ledgerDir).toBe(path.join(root, "ledger"));
     expect(residentNativeActorBindingsMatch(config, roundtrip)).toBe(false);
     for (const change of [{ residentModule: path.join(root, "other.mjs") }, { handlerKey: "other.v1" },
-      { actorId: "6027cfd59b1247b6bb4666970c481cc4" }, { ingress: { link: "other", ledgerDir: path.join(root, "ledger") } }]) {
+      { actorId: "34200000000000000000000000000001" }, { ingress: { link: "other", ledgerDir: path.join(root, "ledger") } }]) {
       expect(residentNativeActorBindingsMatch(roundtrip, { ...roundtrip, nativeActors: [{ ...roundtrip.nativeActors![0]!, ...change }] })).toBe(false);
     }
   });

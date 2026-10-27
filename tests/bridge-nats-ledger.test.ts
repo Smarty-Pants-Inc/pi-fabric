@@ -2,9 +2,9 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NATIVE_INGRESS_DIRECTORY, readNativeIngressReceipt } from "../src/mesh/bridge-nats-ingress.js";
+import { controlBodyFingerprint } from "../src/mesh/control-idempotency.js";
 import {
   BRIDGE_NATS_LEDGER_FILE,
   BRIDGE_NATS_LEDGER_LOCK,
@@ -43,10 +43,11 @@ afterEach(async () => {
 
 const dir = () => path.join(root, "ledger");
 
-/** A real crash needs a separate process and machine evidence (the custody lock's dead-holder proof). */
-const realCrash = process.platform === "linux" && fs.existsSync("/etc/machine-id") &&
-  spawnSync("bun", ["--version"], { encoding: "utf8" }).status === 0;
-const LEDGER_MODULE = fileURLToPath(new URL("../src/mesh/bridge-nats-ledger.ts", import.meta.url));
+/** A real crash needs Bun and a separate process. Custody proves this host using its machine id
+ * or its existing host-label fallback (Windows/macOS); age alone never proves the holder dead. */
+const realCrash = spawnSync("bun", ["--version"], { encoding: "utf8" }).status === 0;
+// A file URL is a portable module specifier, unlike a Windows drive-letter filesystem path.
+const LEDGER_MODULE = new URL("../src/mesh/bridge-nats-ledger.ts", import.meta.url).href;
 
 /** Open the ledger in another process (bun runs the TypeScript module), optionally claim, and hold it until killed. */
 const holdInChild = async (where: string, claim?: BridgeNatsClaimInput): Promise<{ kill(): Promise<void> }> => {
@@ -54,7 +55,7 @@ const holdInChild = async (where: string, claim?: BridgeNatsClaimInput): Promise
   fs.writeFileSync(script, [
     `import { openBridgeNatsLedger } from ${JSON.stringify(LEDGER_MODULE)};`,
     "const [where, claim] = process.argv.slice(2);",
-    "const ledger = await openBridgeNatsLedger({ dir: where });",
+    `const ledger = await openBridgeNatsLedger({ dir: where, clock: () => ${T0} });`,
     "if (claim) await ledger.claim(JSON.parse(claim));",
     "process.stdout.write('ready\\n');",
     "setInterval(() => {}, 1 << 30);",
@@ -63,11 +64,14 @@ const holdInChild = async (where: string, claim?: BridgeNatsClaimInput): Promise
   let stderr = "";
   child.stderr.on("data", chunk => { stderr += String(chunk); });
   await new Promise<void>((resolve, reject) => {
-    child.stdout.on("data", chunk => { if (String(chunk).includes("ready")) resolve(); });
-    child.once("exit", code => reject(new Error(`holder exited ${code}: ${stderr}`)));
+    let stdout = "";
+    child.stdout.on("data", chunk => { stdout += String(chunk); if (stdout.includes("ready\n")) resolve(); });
+    child.once("error", reject);
+    child.once("close", (code, signal) => reject(new Error(`holder closed ${code}/${signal}: ${stderr}`)));
   });
   return {
-    kill: () => new Promise<void>(resolve => { child.once("exit", () => resolve()); child.kill("SIGKILL"); }),
+    // Join terminal close (including stdio), not just a successful signal submission.
+    kill: () => new Promise<void>(resolve => { child.once("close", () => resolve()); child.kill("SIGKILL"); }),
   };
 };
 const ledgerAt = async (where = dir(), minCompactLines?: number) => {
@@ -116,6 +120,73 @@ describe("claims: exactly once by mapped commandId", () => {
     expect(ledger.lookup("toFile", first.record.commandId)).toBeUndefined(); // looked up by (direction, mapped id)
     expect(first.created).toBe(true);
     expect((await ledger.claim(toNats())).created).toBe(false);
+  });
+
+  it.each(["followUp", "steer", "stop", "setModel", "setThinking"] as const)("ordinary %s retries vary only attempt times and keep the first bytes/horizon in every state", async operation => {
+    const ledger = await ledgerAt();
+    const input = toFile(`ordinary-${operation}`, MOVED, { operation });
+    const body = { version: 1, commandId: input.commandId, targetId: input.targetId, operation, replyTo: input.replyTo,
+      message: "same payload", requestCreatedAt: T0, requestedAt: T0, deadlineAt: input.deadlineAt };
+    const original = { ...input, resolvedBody: body, bodyDigest: controlBodyFingerprint(body) };
+    const first = (await ledger.claim(original)).record;
+    const retry = { ...original, sourceEventId: "later-envelope", deadlineAt: original.deadlineAt + 7,
+      resolvedBody: { ...body, requestCreatedAt: T0 + 7, requestedAt: T0 + 7, deadlineAt: body.deadlineAt + 7 } };
+    expect(controlBodyFingerprint(retry.resolvedBody)).toBe(original.bodyDigest);
+    const duplicate = async (action: string) => {
+      const before = fs.readFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_FILE));
+      const claim = await ledger.claim(retry);
+      expect(claim.status).toBe("duplicate");
+      expect(bridgeNatsClaimAction(claim).action).toBe(action);
+      expect(claim.record).toMatchObject({ sourceEventId: first.sourceEventId, resolvedBody: body,
+        deadlineAt: first.deadlineAt, expiresAt: first.expiresAt });
+      expect(fs.readFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_FILE))).toEqual(before);
+    };
+    await duplicate("resend");
+    await ledger.markUncertain(input.commandId); await duplicate("resend");
+    await ledger.markSent(input.commandId, { envelopeId: "first-file-append" }); await duplicate("awaitAck");
+    await ledger.settle(input.commandId, { ...ack(input.commandId), fromId: LEAD }); await duplicate("replayAck");
+    await ledger.markAckForwarded(input.commandId); await duplicate("replayAck");
+  });
+
+  it("ordinary timing compatibility never accepts changed payload, address, sender, principal or retained semantics", async () => {
+    const ledger = await ledgerAt(), input = toFile("ordinary-conflicts");
+    const body = { version: 1, message: "same", requestedAt: T0, deadlineAt: input.deadlineAt };
+    const original = { ...input, resolvedBody: body, bodyDigest: controlBodyFingerprint(body) };
+    await ledger.claim(original);
+    const bytes = fs.readFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_FILE));
+    const changed = { ...body, message: "different" };
+    expect((await ledger.claim({ ...original, resolvedBody: changed, bodyDigest: controlBodyFingerprint(changed) })).status).toBe("conflict");
+    const changes: Partial<BridgeNatsClaimInput>[] = [
+      { replyTo: "other-reply" }, { sourceMachine: "other-source" }, { targetId: OTHER },
+      { ownerHostId: "other-owner" }, { ownerIdentityId: OTHER }, { ownerIncarnation: "other-incarnation" },
+      { from: { ...original.from, id: OTHER } }, { from: { ...original.from, kind: "actor" } },
+      { principal: { id: "principal:3420-test", binding: "herdr-client" } },
+      // Deliberately lie about the wire digest: retained-body comparison must still catch these.
+      { resolvedBody: changed }, { resolvedBody: { ...body, binding: {} } },
+      { resolvedBody: { ...body, version: 2 } }, { resolvedBody: undefined },
+    ];
+    for (const change of changes) expect((await ledger.claim({ ...original, ...change })).status).toBe("mismatch");
+    expect(fs.readFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_FILE))).toEqual(bytes);
+  });
+
+  it.each(["ask", "cancel"] as const)("%s keeps exact native-capable timing and body evidence, not the ordinary retry exception", async operation => {
+    const ledger = await ledgerAt(), input = toFile(`strict-${operation}`, MOVED, { operation,
+      ...(operation === "cancel" ? { originalCancelCommandId: "original-ask",
+        cancelCommandId: bridgeNatsMappedCommandId(LINK, "toFile", MOVED, "original-ask") } : {}) });
+    const body = { version: 1, commandId: input.commandId, targetId: input.targetId, operation, replyTo: input.replyTo,
+      message: "rpc", requestCreatedAt: T0, requestedAt: T0, deadlineAt: input.deadlineAt,
+      ...(input.cancelCommandId ? { cancelCommandId: input.cancelCommandId } : {}) };
+    const original = { ...input, resolvedBody: body, bodyDigest: controlBodyFingerprint(body) };
+    await ledger.claim(original);
+    const bytes = fs.readFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_FILE));
+    for (const change of [{ requestCreatedAt: T0 + 1 }, { requestedAt: T0 + 1 }, { deadlineAt: body.deadlineAt + 1 },
+      { ownerIncarnation: "different" }, { binding: {} }, { bindingProvenance: { kind: "owner-defaults", rootId: OTHER } }]) {
+      const resolvedBody = { ...body, ...change };
+      expect((await ledger.claim({ ...original, resolvedBody })).status).toBe("mismatch");
+    }
+    expect((await ledger.claim({ ...original, deadlineAt: original.deadlineAt + 1 })).status).toBe("mismatch");
+    expect((await ledger.claim({ ...original, sourceEventId: "new-envelope-same-exact-body" })).status).toBe("duplicate");
+    expect(fs.readFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_FILE))).toEqual(bytes);
   });
 
   it("keeps two senders that reuse one original id apart (the mapping, both ways)", async () => {
@@ -318,12 +389,17 @@ describe("crash durability", () => {
   });
 
   it("fails stop after an actual partial write without a second write, rolls back the durable prefix, and preserves available errno/cause", async () => {
-    for (const mode of ["short-count", "errno"] as const) {
+    for (const mode of ["short-count", "errno", "rollback-unavailable"] as const) {
       let ledger = await ledgerAt(path.join(root, mode));
       const file = path.join(root, mode, BRIDGE_NATS_LEDGER_FILE);
       const kept = (await ledger.claim(toNats("a"))).record.commandId, prefix = fs.readFileSync(file);
       const cause = new Error("storage capacity exhausted"), failure = Object.assign(new Error("ENOSPC: no space left on device", { cause }),
         { code: "ENOSPC", errno: -28 });
+      // Only this explicit fault prevents the existing rollback attempt. Normal short/errno
+      // cases still require immediate exact-prefix rollback on every supported test host.
+      const truncate = mode === "rollback-unavailable" ? vi.spyOn(fs, "ftruncateSync").mockImplementationOnce(() => {
+        throw Object.assign(new Error("rollback unavailable"), { code: "EACCES" });
+      }) : undefined;
       const real = fs.writeSync;
       const spy = vi.spyOn(fs, "writeSync").mockImplementationOnce(((fd: number, buffer: Buffer, offset?: number) => {
         const written = real(fd, buffer, offset ?? 0, 10); // actual bytes, not a fabricated count
@@ -335,12 +411,18 @@ describe("crash durability", () => {
         if (mode === "errno") await expect(attempt).rejects.toBe(failure);
         else await expect(attempt).rejects.toThrow(/append was short .*errno unavailable/);
         expect(spy).toHaveBeenCalledOnce();
-        expect(fs.readFileSync(file)).toEqual(prefix);
+        const afterFailure = fs.readFileSync(file);
+        expect(afterFailure.subarray(0, prefix.length)).toEqual(prefix);
+        const tail = afterFailure.subarray(prefix.length);
+        expect(tail.includes(0x0a)).toBe(false);
+        if (mode === "rollback-unavailable") expect(tail).toHaveLength(10);
+        else expect(afterFailure).toEqual(prefix);
         expect(ledger.lookup("toNats", bridgeNatsMappedCommandId(LINK, "toNats", LEAD, "b"))).toBeUndefined();
         await expect(ledger.claim(toNats("c"))).rejects.toMatchObject({ code: "BRIDGE_NATS_LEDGER_CLOSED" });
+        expect(fs.readFileSync(file)).toEqual(afterFailure);
         expect(spy).toHaveBeenCalledOnce(); // fail-stop: neither a continuation nor a later append
         if (mode === "errno") { expect(failure.errno).toBe(-28); expect(failure.cause).toBe(cause); }
-      } finally { spy.mockRestore(); }
+      } finally { spy.mockRestore(); truncate?.mockRestore(); }
       await ledger.close();
       ledger = await ledgerAt(path.join(root, mode));
       expect(fs.readFileSync(file)).toEqual(prefix); // durable rollback survives close/reopen

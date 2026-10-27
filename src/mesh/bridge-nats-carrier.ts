@@ -669,7 +669,8 @@ export class NatsBridgeCarrier {
           originalOwnerIncarnation: typeof answer.ownerIncarnation === "string" ? answer.ownerIncarnation : null },
       }) };
     }
-    // publish, or resend (unconfirmed): present the event; the file store's receipt makes a repeat one append.
+    // publish, or resend (unconfirmed): present the FIRST event; the file store's receipt makes a repeat one append.
+    // Ordinary retry attempt times may differ, but never replace retained bytes or extend their deadline.
     const retained = stored.body;
     const event: MeshEvent = {
       id: retained ? stored.sourceEventId : input.id, sequence: delivery.sequence,

@@ -4,14 +4,16 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { NatsCarrierRecord } from "../src/mesh/bridge-nats-carrier.js";
 import { createNatsFileLink, NatsCarrierDeferredError, type NatsCarrierSide } from "../src/mesh/bridge-nats-file.js";
 import { createBridgeNatsIdentityGate, parseBridgeNatsAllowSection, type BridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
+import { createNativeActorIngress, NATIVE_INGRESS_DIRECTORY, readNativeIngressReceipt } from "../src/mesh/bridge-nats-ingress.js";
 import { BRIDGE_NATS_LEDGER_LOCK, openBridgeNatsLedger, type FileBridgeNatsLedger } from "../src/mesh/bridge-nats-ledger.js";
 import type { NatsLinkConfig } from "../src/mesh/bridge-nats-config.js";
 import { natsCarrierLedger, natsLinkAuthorizers, natsLinkFileTargetAllowed, natsLinkMirrorAllowed, startNatsLink } from "../src/mesh/bridge-nats-link.js";
 import { bridgeNatsMappedCommandId, type BridgeNatsAllowSection } from "../src/mesh/bridge-nats-types.js";
+import { controlBodyFingerprint } from "../src/mesh/control-idempotency.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
 import {
@@ -23,6 +25,7 @@ const stores: MeshStore[] = [];
 const closers: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
   for (const close of closers.splice(0)) await close();
+  vi.restoreAllMocks();
   for (const store of stores.splice(0)) store.closeState();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -71,7 +74,7 @@ const fakePort = (): FakePort => {
   return port;
 };
 
-const gatedFixture = async () => {
+const gatedFixture = async (adapterPlatform?: NodeJS.Platform) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-link-"));
   roots.push(root);
   const store = await meshRoot(root);
@@ -82,15 +85,19 @@ const gatedFixture = async () => {
   const { authorize, authorizeTopic } = natsLinkAuthorizers(gate, { file: () => remote!.filePresence.view(), nats: () => port.presenceView() });
   const logs: string[] = [];
   const ledger = await ledgerIn(root);
+  // Simulate ONLY capability composition, not Windows filesystem/lock/ACL semantics.
+  // With no override, every component runs on the real host (including Windows CI).
+  const carrierLedger = adapterPlatform === undefined ? natsCarrierLedger(ledger, LINK)
+    : await onPlatform(adapterPlatform, async () => natsCarrierLedger(ledger, LINK));
   const link = createNatsFileLink({ store, localName: "ryzen1", link: LINK, cursorPath: path.join(root, "cursor.json"), port,
-    ledger: natsCarrierLedger(ledger, LINK), authorize, authorizeTopic, mirrorAllowed: natsLinkMirrorAllowed(allow),
+    ledger: carrierLedger, authorize, authorizeTopic, mirrorAllowed: natsLinkMirrorAllowed(allow),
     waitForTarget: natsLinkFileTargetAllowed(allow, () => remote!.filePresence.view()),
     log: line => logs.push(line), resendDelayMs: 0, bridge: { presenceMs: 60_000 } });
   remote = link.remote;
   closers.push(() => link.bridge.stop());
   await link.bridge.start();
   const events = (topic: string): MeshEvent[] => store.read({ after: 0, limit: store.maxReadEvents }).filter(event => event.topic === topic);
-  return { root, store, port, link, logs, ledger, events };
+  return { root, store, port, link, logs, ledger, carrierLedger, events };
 };
 
 const fileCommand = (store: MeshStore, operation: string, commandId: string, extra: Record<string, unknown> = {}) => store.publish({
@@ -160,6 +167,87 @@ describe("startNatsLink composition with L3's allow gate", () => {
     expect(steer.acked).toBe(1);
     expect(port.sent.find(envelope => envelope.id === "ack:env-steer")).toMatchObject({ kind: "ack", operation: "rejected",
       to: { machine: POD_MACHINE, hostId: natsLead.id }, body: { accepted: false, notRun: true, commandId: "n-steer" } });
+  });
+
+  // Keep: the reported ordinary-traffic compatibility regression + native trust boundary.
+  // Real durable ledger, real MeshBridge/FileMesh, real gate; fake NATS, not a Windows/broker proof.
+  it("simulated Windows adapter: ordinary ask appends/ACKs and exact redelivery dedupes without a native receipt", async () => {
+    const { root, ledger, carrierLedger, port, link, events } = await gatedFixture("win32");
+    expect(carrierLedger).not.toHaveProperty("projectNativeIngress");
+    const input = natsCommand("env-windows-ask", "ask", "windows-ask");
+    const first = port.deliver(input, POD_MACHINE, 1);
+    await settle();
+    expect(first.acked).toBe(0);
+    expect(events("fabric.control.command")).toHaveLength(0);
+    await link.bridge.step();
+    await link.bridge.step();
+    const id = bridgeNatsMappedCommandId(LINK, "toFile", natsLead.id, "windows-ask");
+    expect(events("fabric.control.command")).toHaveLength(1);
+    expect(events("fabric.control.command")[0]).toMatchObject({ kind: "ask", verification: "bridge",
+      from: { id: natsLead.id }, to: fileLead.id, data: { commandId: id, targetId: fileLead.id } });
+    expect(first.acked).toBe(1);
+    expect(first.termed).toEqual([]);
+    const retained = ledger.lookup("toFile", id)!;
+    expect(retained.resolvedBody).toMatchObject({ commandId: id, message: input.body.message });
+    expect(fs.existsSync(path.join(root, "ledger", NATIVE_INGRESS_DIRECTORY))).toBe(false);
+    // Same-byte ask retry under a fresh source envelope: still one file append, first retained bytes.
+    const retry = port.deliver({ ...input, id: "env-windows-ask-retry" }, POD_MACHINE, 2);
+    await settle();
+    await link.bridge.step();
+    await link.bridge.step();
+    expect(retry.acked).toBe(1);
+    expect(retry.termed).toEqual([]);
+    expect(events("fabric.control.command")).toHaveLength(1);
+    expect(ledger.lookup("toFile", id)).toEqual(retained);
+    expect(fs.existsSync(path.join(root, "ledger", NATIVE_INGRESS_DIRECTORY))).toBe(false);
+    expect(port.sent).toHaveLength(0); // Source-delivery ACK, not an invented owner/native result.
+    // NEGATIVE fixture: even semantically consistent public bridge labels targeting a pinned
+    // native actor cannot replace the missing receipt. No positive admission/context is forged.
+    const nativeId = "34200000000000000000000000000061";
+    const ingress = createNativeActorIngress({ bindings: [{ actorId: nativeId, rootId: fileLead.id, scope: "session",
+      name: "windows-native-negative", handlerKey: "test.windows-native.v1", residentModule: path.join(root, "not-loaded.mjs"),
+      ingress: { link: LINK, ledgerDir: path.join(root, "ledger") } }] });
+    const ordinary = events("fabric.control.command")[0]!;
+    const negative: MeshEvent = { ...ordinary, data: { ...(ordinary.data as Record<string, unknown>), targetId: nativeId } };
+    negative.dedupeFingerprint = controlBodyFingerprint(negative.data, negative.principal);
+    expect(ingress.requiresNativeAdmission(nativeId)).toBe(true);
+    expect(() => ingress.admitNativeControl(negative)).toThrow(/receipt path is not a real directory|unsupported or unpinned receipt directory/);
+  });
+
+  // Keep: supported-platform faults must propagate, never fall back to ordinary exposure/ACK.
+  // Expected platform gap: automatic native projection is deliberately unavailable on Windows.
+  it.skipIf(WINDOWS)("POSIX adapter propagates native projection failure before ordinary event exposure or source ACK", async () => {
+    const { ledger, carrierLedger, port, link, events } = await gatedFixture();
+    expect(carrierLedger.projectNativeIngress).toBeTypeOf("function");
+    const failure = new Error("native projection must propagate");
+    const projection = vi.spyOn(ledger, "projectNativeIngress").mockRejectedValue(failure);
+    const delivery = port.deliver(natsCommand("env-projection-fault", "ask", "projection-fault"), POD_MACHINE, 1);
+    await settle();
+    await expect(link.bridge.step()).rejects.toBe(failure);
+    const id = bridgeNatsMappedCommandId(LINK, "toFile", natsLead.id, "projection-fault");
+    expect(projection).toHaveBeenCalledWith(id, LINK);
+    expect(ledger.lookup("toFile", id)?.resolvedBody).toBeDefined(); // Claim was durable first.
+    expect(delivery.acked).toBe(0);
+    expect(delivery.termed).toEqual([]);
+    expect(events("fabric.control.command")).toHaveLength(0);
+    expect(port.sent).toHaveLength(0);
+  });
+
+  // Actual Windows only: simulation on Linux cannot prove missing native filesystem primitives.
+  // Expected skip elsewhere; the ordinary allowed-ask test above remains unskipped on Windows.
+  it.skipIf(!WINDOWS)("actual Windows keeps direct native projection and receipt reading fail-closed", async () => {
+    const { root, ledger, carrierLedger, port, link, events } = await gatedFixture();
+    expect(carrierLedger).not.toHaveProperty("projectNativeIngress");
+    const delivery = port.deliver(natsCommand("env-windows-direct", "ask", "windows-direct"), POD_MACHINE, 1);
+    await settle();
+    await link.bridge.step();
+    await link.bridge.step();
+    expect(delivery.acked).toBe(1);
+    expect(events("fabric.control.command")).toHaveLength(1);
+    const id = bridgeNatsMappedCommandId(LINK, "toFile", natsLead.id, "windows-direct");
+    await expect(ledger.projectNativeIngress(id, LINK)).rejects.toThrow(/unsupported or unpinned receipt directory|receipt namespace is not durable/);
+    expect(() => readNativeIngressReceipt(path.join(root, "ledger"), id)).toThrow(/unsupported or unpinned receipt directory/);
+    expect(fs.existsSync(path.join(root, "ledger", NATIVE_INGRESS_DIRECTORY, `${id}.json`))).toBe(false);
   });
 
   it("N3 topics cross only into the target's receiveTopics", async () => {

@@ -503,6 +503,38 @@ describe("upstream owner incarnation cases", () => {
     );
   });
 
+  // Keep: PR #1646 ordinary-control ABI regression and trust boundary. A configured
+  // native verifier must not add an undefined fifth argument or hydrate wire labels.
+  it("keeps the ordinary four-argument handler ABI with native ingress configured", async () => {
+    const mesh = upStore(upMesh());
+    const requiresNativeAdmission = vi.fn(() => false);
+    const admitNativeControl = vi.fn((): never => { throw new Error("ordinary command must not request native proof"); });
+    const owner = new FabricControlPlane(mesh, identity("host:owner"), {
+      enabled: true, hostId: "host:owner", pollMs: 20,
+      nativeActorIngress: { requiresNativeAdmission, admitNativeControl },
+    });
+    planes.push(owner);
+    const handler = vi.fn((..._args: unknown[]) => ({ accepted: true, messageId: "ordinary" }));
+    owner.start(handler);
+    await mesh.publish({
+      topic: "fabric.control.command", kind: "steer", from: identity("host:sender"), to: "host:owner",
+      data: { version: 1, commandId: "ordinary-with-native-labels", targetId: "agent:ordinary", operation: "steer",
+        replyTo: "host:sender", ownerIncarnation: owner.incarnation, message: "ordinary",
+        requestedAt: Date.now(), deadlineAt: Date.now() + 5_000, nativeAdmission: {},
+        nativeContext: { sourceMachine: "forged" }, sourceMachine: "forged", sessionId: "forged" },
+    });
+    await vi.waitFor(() => expect(mesh.read({ topic: "fabric.control.ack", limit: 10 })).toHaveLength(1));
+    expect(handler).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ targetId: "agent:ordinary", message: "ordinary" }),
+      expect.objectContaining({ id: "host:sender" }), expect.any(AbortSignal), "mesh",
+    );
+    for (const key of ["nativeAdmission", "nativeContext", "sourceMachine", "sessionId"]) {
+      expect(handler.mock.calls[0]![0]).not.toHaveProperty(key);
+    }
+    expect(requiresNativeAdmission).toHaveBeenCalledWith("agent:ordinary");
+    expect(admitNativeControl).not.toHaveBeenCalled();
+  });
+
   it("refuses a replayed command naming a previous incarnation without executing it", async () => {
     const meshRoot = upMesh();
     const mesh = upStore(meshRoot);

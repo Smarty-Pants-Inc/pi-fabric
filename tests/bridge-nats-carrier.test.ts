@@ -1,5 +1,10 @@
 // Lane L2 (smarty-dev#15310): the file <-> NATS control carrier, every op, both directions.
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { openBridgeNatsLedger } from "../src/mesh/bridge-nats-ledger.js";
+import { natsCarrierLedger } from "../src/mesh/bridge-nats-link.js";
 import type { BridgePublish } from "../src/mesh/bridge.js";
 import {
   NatsBridgeCarrier, NatsCarrierRefusal, NatsCarrierUnavailable, boundNatsAck, type NatsCarrierAuthorize, type NatsInbound,
@@ -323,6 +328,37 @@ describe("NATS -> file commands", () => {
     const foreign = await carrier.inbound(delivery(natsCommand({ operation: "cancel", commandId: "nats-cancel-2",
       cancelCommandId: "nats-cmd-1", replyTo: otherNats.id, message: undefined }, { id: "nats-env-cancel-2", from: otherNats })));
     expect(foreign).toMatchObject({ kind: "settled" });
+  });
+});
+
+describe("ordinary resend through the REAL durable ledger adapter (presence fixture, not broker proof)", () => {
+  it("resends FIRST followUp bytes before ACK and replays the outcome after ACK despite fresh attempt times", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "carrier-real-ledger-"));
+    const ledger = await openBridgeNatsLedger({ dir: path.join(root, "ledger"), clock: () => T });
+    try {
+      const carrier = new NatsBridgeCarrier({ link: LINK, machine: BRIDGE_MACHINE, presence: new FakePresence(),
+        ledger: natsCarrierLedger(ledger, LINK), authorize: allow, now: () => T });
+      const initial = natsCommand({ operation: "followUp" }, { principal });
+      const first = await carrier.inbound(delivery(initial));
+      if (first.kind !== "event") throw new Error(`expected first event, got ${first.kind}`);
+      const retry = natsCommand({ operation: "followUp", requestCreatedAt: T + 5, requestedAt: T + 5, deadlineAt: T + 60_005 },
+        { id: "ordinary-later-envelope", principal });
+      const again = await carrier.inbound(delivery(retry));
+      expect(again).toMatchObject({ kind: "event", event: { id: first.event.id, data: first.event.data,
+        from: first.event.from, principal, to: first.event.to } });
+      const mapped = bridgeNatsMappedCommandId(LINK, "toFile", natsLead.id, "nats-cmd-1");
+      await ledger.markSent(mapped, { envelopeId: "durable-file-event" });
+      expect(await carrier.inbound(delivery(retry))).toMatchObject({ kind: "settled" });
+      const answer = sendOf(await carrier.outbound({ topic: "fabric.control.ack", kind: "accepted", from: fileLead, to: natsLead.id,
+        data: { version: 1, commandId: mapped, targetId: fileLead.id, ownerIncarnation: "inc-file-lead", accepted: true,
+          messageId: "ordinary-first-message", bridge: { from: "ryzen1", id: "ordinary-file-ack" } } as BridgePublish["data"] }));
+      await carrier.settle(answer.settle!, true);
+      expect(await carrier.inbound(delivery(retry))).toMatchObject({ kind: "reply", envelope: { id: "ack:ordinary-later-envelope",
+        body: { accepted: true, messageId: "ordinary-first-message", bodyDigest: answer.envelope.body.bodyDigest } } });
+      expect(ledger.lookup("toFile", mapped)).toMatchObject({ resolvedBody: first.event.data, deadlineAt: T + 60_000 });
+      expect(await carrier.inbound(delivery({ ...retry, id: "changed-payload", body: { ...retry.body, message: "changed" } })))
+        .toMatchObject({ kind: "reply", envelope: { body: { accepted: false, notRun: true, errorCode: "FABRIC_CONTROL_ID_CONFLICT" } } });
+    } finally { await ledger.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 });
 

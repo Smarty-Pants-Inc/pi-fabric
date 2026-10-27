@@ -176,6 +176,18 @@ const nativeOwnerConfig = (): NativeOwnerConfig | undefined => {
   } finally { if (fd !== undefined) fs.closeSync(fd); if (parent !== undefined) fs.closeSync(parent); }
 };
 
+/** Resolve an existing leaf, or prove a genuinely new leaf by its existing
+ * canonical parent. A dangling symlink, unresolved parent or other I/O error is
+ * NOT evidence that an ordinary new session is separate from the native pin.
+ */
+const canonicalSelectionPath = (file: string): string => {
+  try { return fs.realpathSync(file); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || fs.lstatSync(file, { throwIfNoEntry: false })) throw error;
+    return path.join(fs.realpathSync(path.dirname(file)), path.basename(file));
+  }
+};
+
 /** Match 031c main.resolveSessionPath/utils.resolvePath without importing the
  * SDK or reading history. Bare IDs are discovery, NOT cwd-relative filenames.
  * Config selects policy, never custody; both routes reuse the same OFD proof.
@@ -188,11 +200,17 @@ const guardNativeOwnerSelection = (file: string | undefined, cwd: string): void 
   const normalized = file === "~" ? homedir() : file.startsWith("~/") ? path.join(homedir(), file.slice(2)) :
     /^file:\/\//.test(file) ? fileURLToPath(file) : file;
   const selected = path.resolve(cwd, normalized);
-  // Configured selection must be provable, not a textual non-match or a failed
-  // realpath treated as permission. No native JSONL is opened to discover ID.
-  const canonical = config ? fs.realpathSync(selected) : fs.existsSync(selected) ? fs.realpathSync(selected) : selected;
+  // The native pin MUST exist and remain canonical even for an ordinary new
+  // selection. Only the selected leaf may be absent; never open native history.
   const pinned = config ? fs.realpathSync(config.sessionFile) : undefined;
-  const native = pinned !== undefined && canonical === pinned;
+  if (config && pinned !== config.sessionFile) refused("native session selection must use its canonical pin");
+  const pinStat = pinned === undefined ? undefined : fs.statSync(pinned);
+  if (pinStat && !pinStat.isFile()) refused("native session pin is not a regular file");
+  const canonical = config ? canonicalSelectionPath(selected) : fs.existsSync(selected) ? fs.realpathSync(selected) : selected;
+  const selectedStat = config ? fs.statSync(canonical, { throwIfNoEntry: false }) : undefined;
+  const native = pinned !== undefined && (canonical === pinned ||
+    (selectedStat !== undefined && selectedStat.dev === pinStat!.dev && selectedStat.ino === pinStat!.ino));
+  if (native && canonical !== pinned) refused("native session inode alias must use its canonical pin");
   if (!native && !fs.lstatSync(`${canonical}.main.lock`, { throwIfNoEntry: false })) return;
   if (native ? pinned !== config!.sessionFile : selected !== canonical) refused("native session selection must use its canonical pin");
   guardNativeOwnerSessionIo(canonical);
@@ -201,9 +219,14 @@ const guardNativeOwnerSelection = (file: string | undefined, cwd: string): void 
 /** task-entry also serves ordinary custom sessions. The explicit product config
  * selects the native pin even if its lock name is gone; the adjacent lock remains
  * a conservative additional hint for older callers. Neither is kernel proof.
+ * Keep filesystem/config failures typed on the pre-SDK task-entry route too.
  */
 export function guardNativeOwnerSessionSelection(file: string | undefined, cwd: string): void {
-  guardNativeOwnerSelection(file, cwd);
+  try { guardNativeOwnerSelection(file, cwd); }
+  catch (error) {
+    if (error instanceof NativeOwnerFenceError) throw error;
+    refused(`native session selection unavailable (${error instanceof Error ? error.message : String(error)})`);
+  }
 }
 
 const nativeOwnerFailStop = (error: unknown): never => {
@@ -224,12 +247,12 @@ export function guardNativeOwnerRegistration(): void {
   try {
     const args = process.argv.slice(2);
     const values = new Set(["--mode", "--provider", "--model", "--api-key", "--system-prompt", "--append-system-prompt",
-      "--name", "-n", "--max-provider-requests", "--session-dir", "--models", "--tools", "-t", "--exclude-tools", "-xt",
+      "--name", "-n", "--max-provider-requests", "--session-dir", "--owner-host-profile", "--models", "--tools", "-t", "--exclude-tools", "-xt",
       "--thinking", "--extension", "-e", "--skill", "--prompt-template", "--theme", "--use-theme", "--tui-mode"]);
     const switches = new Set(["--no-auto-compaction", "--no-tools", "-nt", "--no-builtin-tools", "-nbt",
       "--no-extensions", "-ne", "--no-mcp", "--no-skills", "-ns", "--no-prompt-templates", "-np", "--no-themes",
       "--no-context-files", "-nc", "--verbose", "--approve", "-a", "--no-approve", "-na", "--offline"]);
-    let file: string | undefined, neverNative = false;
+    let file: string | undefined, neverNative = false, ownerHostProfile = false;
     for (let index = 0; index < args.length; index++) {
       const arg = args[index]!;
       if (arg === "--") break;
@@ -242,6 +265,12 @@ export function guardNativeOwnerRegistration(): void {
         const value = args[++index];
         if (value === undefined || (["--mode", "--use-theme", "--max-provider-requests", "--tui-mode"].includes(arg) && value.startsWith("-"))) {
           refused(`missing ${arg} value`);
+        }
+        if (arg === "--owner-host-profile") {
+          // 031c consumes exactly one separate canonical absolute path. The SDK
+          // still owns receiving/qualifying that profile; this is only argv shape.
+          if (ownerHostProfile || !absolute(value) || value === "/" || value.includes("@")) refused("invalid or duplicate --owner-host-profile value");
+          ownerHostProfile = true;
         }
         if (["--fork", "--session-id", "--export"].includes(arg)) neverNative = true;
       } else if (["--no-session", "--help", "-h", "--version", "-v", "--list-models"].includes(arg)) {

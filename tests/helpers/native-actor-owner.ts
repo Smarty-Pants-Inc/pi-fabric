@@ -242,7 +242,10 @@ export type NativeOwnerCliShape = "continue-native" | "short-continue-native" | 
   "duplicate-native" | "relative-native" | "dotdot-native" | "symlink-native" | "unknown-native" |
   "inline-session-native" | "ordinary-continue" | "ordinary-resume" | "duplicate-ordinary" |
   "unknown-ordinary" | "ordinary-relative" | "ordinary-symlink" | "ordinary-flag-value" | "name-native" |
-  "task-prefix-ordinary" | "cli-prefix-ordinary" | "task-exact-native-id";
+  "task-prefix-ordinary" | "cli-prefix-ordinary" | "task-exact-native-id" |
+  "ordinary-new" | "ordinary-new-parent-symlink" | "task-new" | "task-new-parent-symlink" |
+  "task-new-owner-host-profile" | "task-new-missing-parent" | "task-new-missing-pin" |
+  "hardlink-native" | "task-hardlink-native";
 interface NativeSessionPin { sessionFile: string; rootId: string; sessionId: string }
 interface NativeOwnerDeadline { startedNs: bigint; boundMs: number }
 const remainingNativeOwnerMs = (deadline: NativeOwnerDeadline): number => {
@@ -896,12 +899,34 @@ finally:
     },
     async attemptRealCli(shape: NativeOwnerCliShape): Promise<NativeAuxiliaryResult & {
       ordinary?: NativeSessionPin; startedAt: number; closedAt: number;
+      selectedFile?: string; missingAtLaunch?: boolean;
     }> {
       const label = `real-cli-${shape}-${++auxiliarySequence}`;
       // Actual CLI defaults, not the native owner's isolated discovery override.
       const cliEnv = { ...env, PI_CODING_AGENT_SESSION_DIR: undefined };
+      const newSession = ["ordinary-new", "ordinary-new-parent-symlink", "task-new", "task-new-parent-symlink",
+        "task-new-owner-host-profile", "task-new-missing-parent", "task-new-missing-pin"].includes(shape);
+      let selectedFile: string | undefined, missingAtLaunch: boolean | undefined;
       let ordinary: NativeSessionPin | undefined;
-      if (shape.includes("ordinary") || shape === "duplicate-native") {
+      if (newSession) {
+        const directory = path.join(cwd, `${label}.sessions`);
+        fs.mkdirSync(directory, { mode: 0o700 });
+        let selectedDirectory = directory;
+        if (shape.endsWith("parent-symlink")) {
+          selectedDirectory = path.join(cwd, `${label}.parent-link`);
+          fs.symlinkSync(directory, selectedDirectory, "dir");
+        }
+        if (shape === "task-new-missing-parent") selectedDirectory = path.join(directory, "absent-parent");
+        selectedFile = path.join(selectedDirectory, "session.jsonl");
+        missingAtLaunch = !fs.existsSync(selectedFile);
+        if (!missingAtLaunch) throw new Error("New-session control already exists");
+        if (shape === "task-new-missing-pin") {
+          const invalidPin = path.join(root, `${label}.invalid-pin.json`);
+          fs.writeFileSync(invalidPin, JSON.stringify({ ...pin, sessionFile: `${sessionFile}.absent` }), { mode: 0o600, flag: "wx" });
+          cliEnv.PI_FABRIC_NATIVE_OWNER_CONFIG = invalidPin;
+        }
+      }
+      if ((!newSession && shape.includes("ordinary")) || shape === "duplicate-native") {
         const prepare = path.join(root, `${label}.prepare.mjs`);
         // SDK owns both the header and requested synthetic test ID. In the
         // prefix case ONLY the ordinary ID shares the native eight-char prefix.
@@ -929,6 +954,7 @@ process.stdout.write(JSON.stringify({ sessionId: manager.getSessionId(), session
       if (shape === "dotdot-native") fs.symlinkSync(path.dirname(sessionFile), path.join(root, "native"), "dir");
       const link = path.join(cwd, `${label}.jsonl`);
       if (shape === "symlink-native" || shape === "ordinary-symlink") fs.symlinkSync(ordinary?.sessionFile ?? sessionFile, link);
+      if (shape === "hardlink-native" || shape === "task-hardlink-native") fs.linkSync(sessionFile, link);
       let selection: string[];
       switch (shape) {
         case "continue-native": selection = ["--continue", "--session", sessionFile]; break;
@@ -952,9 +978,17 @@ process.stdout.write(JSON.stringify({ sessionId: manager.getSessionId(), session
         case "name-native": selection = ["--session", sessionFile, "--name", "  native-name-residual  "]; break;
         case "task-prefix-ordinary": case "cli-prefix-ordinary": selection = ["--session", pin.sessionId.slice(0, 8)]; break;
         case "task-exact-native-id": selection = ["--session", pin.sessionId]; break;
+        case "ordinary-new": case "ordinary-new-parent-symlink": case "task-new": case "task-new-parent-symlink":
+        case "task-new-missing-parent": case "task-new-missing-pin": selection = ["--session", selectedFile!]; break;
+        case "task-new-owner-host-profile":
+          // Exercise known-flag value arity through the real task SDK parser
+          // and Fabric registration, NOT the SDK main's interactive owner mode.
+          selection = ["--owner-host-profile", sessionPin, "--session", selectedFile!]; break;
+        case "hardlink-native": case "task-hardlink-native": selection = ["--session", link]; break;
       }
       const task = shape.startsWith("task-");
-      const positive = ["ordinary-relative", "ordinary-symlink", "ordinary-flag-value", "task-prefix-ordinary", "cli-prefix-ordinary"].includes(shape);
+      const positive = ["ordinary-relative", "ordinary-symlink", "ordinary-flag-value", "task-prefix-ordinary", "cli-prefix-ordinary",
+        "ordinary-new", "ordinary-new-parent-symlink", "task-new", "task-new-parent-symlink", "task-new-owner-host-profile"].includes(shape);
       const args = [...(task ? [taskEntry, sdkDirectory, "1"] : [path.join(sdkDirectory, "cli.js")]), ...selection,
         "--mode", "rpc", "--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
         "--extension", pins.observer, "--extension", path.join(candidateRoot, "dist/index.js")];
@@ -970,7 +1004,14 @@ process.stdout.write(JSON.stringify({ sessionId: manager.getSessionId(), session
       child.stdout.on("data", chunk => {
         stdout += chunk; fs.appendFileSync(path.join(root, `${label}.stdout`), chunk, { mode: 0o600 });
         if (positive && !ended && stdout.split("\n").some(line => {
-          try { const value = JSON.parse(line) as RpcRecord; return value.type === "response" && value.id === "ordinary-readback"; }
+          try {
+            const value = JSON.parse(line) as RpcRecord;
+            if (value.type !== "response" || value.id !== "ordinary-readback") return false;
+            if (newSession && value.success && typeof value.data?.sessionId === "string" && typeof value.data.sessionFile === "string") {
+              ordinary = { sessionId: value.data.sessionId, sessionFile: value.data.sessionFile, rootId: `session:${value.data.sessionId}` };
+            }
+            return true;
+          }
           catch { return false; }
         })) { ended = true; child.stdin.end(); } // Ordinary EOF only AFTER actual RPC readback, never a native refusal.
       });
@@ -981,7 +1022,8 @@ process.stdout.write(JSON.stringify({ sessionId: manager.getSessionId(), session
         child.once("close", (code, signal) => {
           clearTimeout(timer);
           const evidence = death({ pid: child.pid!, started: started! }), closedAt = Date.now();
-          const value = { pid: child.pid, started, code, signal, stdout, stderr, startedAt, closedAt, ...(ordinary ? { ordinary } : {}) };
+          const value = { pid: child.pid, started, code, signal, stdout, stderr, startedAt, closedAt, ...(ordinary ? { ordinary } : {}),
+            ...(selectedFile ? { selectedFile, missingAtLaunch } : {}) };
           fs.writeFileSync(path.join(root, `${label}.exit.json`), JSON.stringify({ ...value, args, executable: nodeBinary,
             expired, death: evidence, stdinEndedByParent: ended, stdoutClosed: child.stdout.destroyed, stderrClosed: child.stderr.destroyed }), { mode: 0o600, flag: "wx" });
           if (expired || !evidence || (positive && !ended)) reject(new Error(`Actual ${shape} failed terminal/readback boundary: ${stderr}`));

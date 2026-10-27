@@ -461,13 +461,14 @@ export class KvParticipantDirectory implements ParticipantView {
    * so every lease written before it is in the snapshot, then refuses if another machine holds
    * the root. The caller must stop using this view's presence on refusal.
    */
-  async confirmSoleRoot(record: FabricParticipantRecord, leaseRevision: number): Promise<void> {
+  async confirmSoleRoot(record: FabricParticipantRecord, leaseRevision: number, signal?: AbortSignal): Promise<void> {
     if (record.kind !== "root") return;
     const self = this.options.transport.self;
     const key = `${self.machine}.h.${tokenFor(self.hostId)}`;
-    const signal = this.#signal();
+    const bounded = signal ? AbortSignal.any([signal, this.#signal()]) : this.#signal();
     try {
-      while (!this.ready || (this.#hosts.get(key)?.revision ?? 0) < leaseRevision) await this.whenChanged(record.id, signal);
+      bounded.throwIfAborted();
+      while (!this.ready || (this.#hosts.get(key)?.revision ?? 0) < leaseRevision) await this.whenChanged(record.id, bounded);
     } catch (error) {
       if (errorCode(error) === "FABRIC_DIRECTORY_NOT_READY") throw error;
       throw new DirectoryNotReadyError("Presence view has not observed the recovered owner lease", { cause: error });

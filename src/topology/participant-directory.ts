@@ -981,16 +981,21 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const lease = this.#transportLease;
     if (!lease || this.#closed || this.#transportLost) return Promise.resolve();
     if (this.#transportRenewing) return this.#transportRenewing;
-    const work = Promise.resolve().then(() => lease.renew(AbortSignal.timeout(TRANSPORT_RENEW_BUDGET_MS))).then(async value => {
+    const signal = () => AbortSignal.any([this.#leaseAbort.signal, AbortSignal.timeout(TRANSPORT_RENEW_BUDGET_MS)]);
+    const work = Promise.resolve().then(() => lease.renew(signal())).then(async value => {
       this.#transportLeaseWallDeadline = value.expiresAt - TRANSPORT_HOST_LEASE_SAFETY_MS;
       // smarty-dev#15310: a lease that expired in KV and was created again may have let another
       // machine register this root meanwhile. Re-check before admission resumes; yield if so.
-      if (lease.takeRecreated() || lease.rootRecheck) this.#rootRecheckPending = true;
-      if (this.#rootRecheckPending && lease.live()) {
+      for (let attempt = 0; attempt <= 3; attempt++) {
+        if (this.#closed) return;
+        if (lease.takeRecreated() || lease.rootRecheck) this.#rootRecheckPending = true;
+        if (!this.#rootRecheckPending || !lease.live()) break;
+        // At most three re-checks per heartbeat; leave admission closed for the next tick.
+        if (attempt === 3) return;
         const root = this.#natsPublished.get(this.options.rootId);
         const view = this.#participantView;
         if (root?.kind === "root" && view) {
-          try { await view.confirmSoleRoot(root, lease.revision); }
+          try { await view.confirmSoleRoot(root, lease.revision, signal()); }
           catch (error) {
             if ((error as { code?: unknown } | null)?.code === "FABRIC_PRESENCE_OWNED_ELSEWHERE") {
               this.#transportRecovering = false;
@@ -999,10 +1004,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
             throw error; // Otherwise admission stays suspended; the next renewal checks again.
           }
         }
+        if (this.#closed) return;
         this.#rootRecheckPending = false;
         // The re-created lease was written with rootRecheck (routes nothing); write it routable again.
+        // That write may re-create it again: loop before opening recovery/publication.
         lease.clearRootRecheck();
-        const routable = await lease.renew(AbortSignal.timeout(TRANSPORT_RENEW_BUDGET_MS));
+        const routable = await lease.renew(signal());
         this.#transportLeaseWallDeadline = routable.expiresAt - TRANSPORT_HOST_LEASE_SAFETY_MS;
       }
       if (this.#transportRecovering && lease.live()) {

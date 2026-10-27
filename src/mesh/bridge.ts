@@ -70,6 +70,10 @@ export const parseBridgeUnaddressedRefreshMs = (value: string | undefined): numb
 };
 /** A missed change notification is only a safety net: its retry backs off to this bound. */
 const MEMBERSHIP_RETRY_MAX_MS = 30_000;
+/** Retry state is only an observation: re-sample after five maximum backoffs. */
+const BRIDGE_BUSY_STREAK_MAX_MS = 5 * MEMBERSHIP_RETRY_MAX_MS;
+/** Grace AFTER a mirror's RPC deadline for a late reply before recycling its channel. */
+const BRIDGE_MIRROR_PENDING_MAX_MS = 5 * MEMBERSHIP_RETRY_MAX_MS;
 /** Transitional mixed-version exception only: remove after all fleet agents support changes. */
 const LEGACY_POLL_MS = 250;
 // Keep health sampling independent of caller fake timers and wall-clock adjustments.
@@ -2893,14 +2897,14 @@ export class RemoteBridgeSide implements BridgeSide {
   publishWithReceipt?: NonNullable<BridgeSide["publishWithReceipt"]>;
   publishBatchWithReceipt?: NonNullable<BridgeSide["publishBatchWithReceipt"]>;
   #closed: Error | undefined;
-  #mirrorPending: { id: number; error: BridgeMirrorDeferredError } | undefined;
+  #mirrorPending: { id: number; error: BridgeMirrorDeferredError; recycle?: ReturnType<typeof setTimeout> } | undefined;
   readonly #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   readonly #onClosed: (error: Error) => void;
   readonly closed: Promise<Error>;
 
   /**
    * Every call has a deadline. A slow mirror degrades this host without closing the transport;
-   * exactly one mirror remains in flight until its late answer or close(). Other RPC deadlines
+   * exactly one mirror remains in flight until its late answer or bounded channel recycle. Other RPC deadlines
    * remain fatal. stop() still bounds its waits and closes the transport (security review F3).
    */
   constructor(readonly input: Readable, readonly output: Writable, readonly callTimeoutMs = DEFAULT_CALL_TIMEOUT_MS) {
@@ -2938,6 +2942,7 @@ export class RemoteBridgeSide implements BridgeSide {
         const mirrorPending = this.#mirrorPending;
         if (mirrorPending && mirrorPending.id === response.id) {
           const late = mirrorPending.error.timedOut;
+          if (mirrorPending.recycle !== undefined) clearTimeout(mirrorPending.recycle);
           this.#mirrorPending = undefined;
           if (late && response.ok !== true && response.code !== MESH_LOCK_TIMEOUT_CODE &&
             response.code !== MESH_INCARNATION_PENDING_CODE && response.code !== MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE) {
@@ -2982,6 +2987,7 @@ export class RemoteBridgeSide implements BridgeSide {
     this.#closed = error;
     for (const pending of this.#pending.values()) pending.reject(error);
     this.#pending.clear();
+    if (this.#mirrorPending?.recycle !== undefined) clearTimeout(this.#mirrorPending.recycle);
     this.#mirrorPending = undefined;
     this.#onClosed(error);
     for (const subscriber of this.#subscribers) subscriber.failed(error);
@@ -3005,7 +3011,11 @@ export class RemoteBridgeSide implements BridgeSide {
       const timer = setTimeout(() => {
         if (op === "mirror") {
           const error = new BridgeMirrorDeferredError(true, timeoutMs);
-          this.#mirrorPending = { id, error };
+          // A late reply is the normal release event. This one-shot safety bound closes
+          // only this RPC channel through the existing CLI/supervisor reconnect path.
+          const recycle = setTimeout(() => this.close(new Error(
+            `Bridge mirror remained pending ${BRIDGE_MIRROR_PENDING_MAX_MS} ms after timeout; recycling transport`)), BRIDGE_MIRROR_PENDING_MAX_MS);
+          this.#mirrorPending = { id, error, recycle };
           // Keep this one response slot: its late ACK releases the gate, but never renews a
           // hub observation. The loop retries a NEW presence snapshot after backoff.
           reject(error);
@@ -4424,6 +4434,8 @@ export class MeshBridge {
   async #directionLoop(direction: Direction, running: () => boolean): Promise<void> {
     let retryMs = LOCK_RETRY_MIN_MS;
     let walCapDelay: number | undefined;
+    let resample = false;
+    let streakTimer: ReturnType<typeof setTimeout> | undefined;
     let busy: { count: number; started: number; reportedAt: number; first: string; last: string;
       retainedOffLockMs: number } | undefined;
     let recoveredIngress = { fenceRefusals: 0, retainedOffLockMs: 0 };
@@ -4440,7 +4452,9 @@ export class MeshBridge {
       recoveredIngress = { fenceRefusals: 0, retainedOffLockMs: 0 };
       ingressReportedAt = now;
     };
-    const finishBusy = (outcome: "recovered" | "terminal" | "stopped", failedIngress?: InitialMeshLockDiagnostics): void => {
+    const finishBusy = (outcome: "recovered" | "terminal" | "stopped" | "resampling", failedIngress?: InitialMeshLockDiagnostics): void => {
+      if (streakTimer !== undefined) clearTimeout(streakTimer);
+      streakTimer = undefined;
       if (!busy) {
         if (failedIngress?.fenceRefusals) logBusy(`bridge ingress busy streak ${outcome} (toLocal); ` +
           `${failedIngress.fenceRefusals} fence refusals; retainedOffLockMs=${Math.max(0, Math.round(failedIngress.retainedOffLockMs))}`);
@@ -4450,6 +4464,22 @@ export class MeshBridge {
         `elapsed ${Math.max(0, Math.round(monotonicClock.now() - busy.started))} ms; first=${busy.first}; last=${busy.last}; ` +
         `retainedOffLockMs=${Math.max(0, Math.round(busy.retainedOffLockMs))}`);
       busy = undefined;
+    };
+    const resetStreak = (reason: string): void => {
+      logBusy(`${reason}; re-sampling (${direction}); first=${busy!.first}; last=${busy!.last}`);
+      finishBusy("resampling");
+      retryMs = LOCK_RETRY_MIN_MS;
+      walCapDelay = undefined;
+      resample = true;
+      // Invalidate freshness, not durable ownership, fences, cursors or relay grace.
+      // A joined old pass must settle before #refreshMembership takes a NEW sample.
+      this.#presenceVersion++;
+      this.#presenceAt = -Infinity;
+      delete this.#membershipRetryAt[direction];
+      delete this.#membershipSafetyDelay[direction];
+      delete this.#tailRetryAt[direction];
+      delete this.#tailSafetyDelay[direction];
+      this.#directionPending[direction] = true;
     };
     while (running()) {
       const wakeReason = this.#directionWakeReason[direction];
@@ -4479,6 +4509,12 @@ export class MeshBridge {
       try {
         const end = this.#deliveryAge.drainPhase(direction, "filterMs");
         try {
+          while (resample) {
+            resample = false;
+            try { await this.#refreshMembership(); }
+            catch (error) { resample = true; throw error; }
+            if (!running()) { finishBusy("stopped"); return; }
+          }
           if (direction === "toLocal") await bridgeIngressDiagnostics.run(diagnostics, () => this.#direction(direction));
           else await this.#direction(direction);
         } finally { end(); diagnostics.active = false; }
@@ -4522,6 +4558,9 @@ export class MeshBridge {
           this.#wake?.();
           return;
         }
+        const now = monotonicClock.now();
+        const label = error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error);
+        if (busy && busy.last !== label) resetStreak(`bridge busy streak failure class changed from ${busy.last} to ${label}`);
         this.#directionMirrorBackoff[direction] = error instanceof BridgeMirrorDeferredError;
         // A late ACK may arrive while the other half of syncPresence is still settling.
         // Its already-latched wake must also bypass the mirror backoff installed here.
@@ -4536,10 +4575,17 @@ export class MeshBridge {
           delay = Math.floor(cap / 2 + Math.random() * cap / 2);
         }
         if (!isMeshQueueExpiry(error)) retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
-        const now = monotonicClock.now();
-        const label = error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error);
-        busy ??= { count: 0, started: now, reportedAt: -Infinity, first: label, last: label,
-          retainedOffLockMs: ingress.retainedOffLockMs };
+        if (!busy) {
+          busy = { count: 0, started: now, reportedAt: -Infinity, first: label, last: label,
+            retainedOffLockMs: ingress.retainedOffLockMs };
+          // Failure-driven safety timer, never an idle poll. It also alarms while a
+          // subsequent attempt awaits custody; never race/abandon that fenced write.
+          streakTimer = setTimeout(() => {
+            if (!running()) { finishBusy("stopped"); return; }
+            resetStreak(`alarm: bridge busy streak (${direction}) hit ${BRIDGE_BUSY_STREAK_MAX_MS} ms bound`);
+            this.#directionWake[direction]?.();
+          }, BRIDGE_BUSY_STREAK_MAX_MS);
+        }
         busy.count += 1;
         busy.last = label;
         if (now - busy.reportedAt >= (isMeshStateWalCap(error) ? WAL_CAP_LOG_MS : 10_000)) {
@@ -5129,7 +5175,14 @@ export class MeshBridge {
       if (!(error instanceof BridgeOwnershipError)) throw error;
       const { local: presence, remote: owned } = await this.#authority(false);
       const current = { ...rules, senders: senders(owned), identities: senderIdentities(owned), reserved: new Set(presence.reserved) };
-      if (!this.#staleMembership(event, current, "toLocal", this.#refusal(event, current, "toLocal"))) throw error;
+      if (!this.#staleMembership(event, current, "toLocal", this.#refusal(event, current, "toLocal"))) {
+        // A proven sender takeover refuses this session's hub receipt, not the link.
+        // The destination already confirmed delivery; never weaken/retry the refused fence.
+        // Without proof of binding loss, ownership errors still fail the link.
+        if (this.#stopped || local.holds?.(pub.from.id, pub.from) !== false) throw error;
+        this.#log(`toLocal: refused relay receipt for ${event.topic} ${event.id}: ${pub.from.id} is no longer bound to bridge link ${remoteName}`);
+        return { delivered: true };
+      }
       // Destination dedupe covers retry after delivery but before the fenced hub receipt.
       return { delivered: false, pending: true };
     }

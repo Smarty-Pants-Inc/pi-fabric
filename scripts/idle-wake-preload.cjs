@@ -88,3 +88,7 @@ process.on("SIGUSR1", () => {
     statWatchers: { watchedFiles, liveResources: statWatcherIds.size } }));
   fs.renameSync(out + ".tmp", out);
 });
+
+// The script-mode self-test sends SIGUSR2 immediately after startup; signal readiness only
+// after its handler is installed so the signal cannot take Node's default terminating action.
+if (process.env.IDLE_WAKE_READY_OUT) fs.writeFileSync(process.env.IDLE_WAKE_READY_OUT, `${process.pid}\n`);

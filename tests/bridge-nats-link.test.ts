@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { NatsCarrierRecord } from "../src/mesh/bridge-nats-carrier.js";
 import { createNatsFileLink, NatsCarrierDeferredError, type NatsCarrierSide } from "../src/mesh/bridge-nats-file.js";
 import { createBridgeNatsIdentityGate, parseBridgeNatsAllowSection, type BridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
@@ -71,7 +71,7 @@ const fakePort = (): FakePort => {
   return port;
 };
 
-const gatedFixture = async () => {
+const gatedFixture = async (clock?: () => number) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-link-"));
   roots.push(root);
   const store = await meshRoot(root);
@@ -85,7 +85,10 @@ const gatedFixture = async () => {
   const link = createNatsFileLink({ store, localName: "ryzen1", link: LINK, cursorPath: path.join(root, "cursor.json"), port,
     ledger: natsCarrierLedger(ledger, LINK), authorize, authorizeTopic, mirrorAllowed: natsLinkMirrorAllowed(allow),
     waitForTarget: natsLinkFileTargetAllowed(allow, () => remote!.filePresence.view()),
-    log: line => logs.push(line), resendDelayMs: 0, bridge: { presenceMs: 60_000 } });
+    log: line => logs.push(line), resendDelayMs: 0, bridge: { presenceMs: 60_000,
+      ...(clock ? { clock } : {}),
+      diagnosticTargetAdmitted: (id, direction) => allow.entries.some(entry =>
+        entry.side === (direction === "toRemote" ? "nats" : "file") && entry.id === id) } });
   remote = link.remote;
   closers.push(() => link.bridge.stop());
   await link.bridge.start();
@@ -120,6 +123,52 @@ describe("startNatsLink composition with L3's allow gate", () => {
     const ids = port.mirrors.at(-1)!.participants.map(entry => entry.id);
     expect(ids).toContain(fileLead.id);
     expect(ids).not.toContain(offList.id);
+  });
+
+  // Keep: incident receipts must distinguish native misses from absent allowed remote roots, without bodies.
+  it("samples local, not-admitted and missing admitted remote misses at INFO without a debug callback", async () => {
+    const { store, port, link, logs } = await gatedFixture();
+    port.natsPresence = { hosts: [], participants: [], reserved: [] };
+    port.routes.delete(natsLead.id);
+    await link.bridge.syncPresence();
+    const publish = (to: string) => store.publish({ topic: "fleet.work.tasks", kind: "answer", from: fileLead, to,
+      text: "PRIVATE-message-body", data: { message: "PRIVATE-data-body" } });
+    const local = await publish(fileLead.id);
+    const remote = await publish(natsLead.id);
+    const foreign = await publish("session:99999999-9999-4999-8999-999999999999");
+    const step = await link.bridge.step();
+    expect(step.toRemote).toBe(0);
+    expect(port.sent).toEqual([]);
+    const samples = logs.filter(line => line.startsWith("bridge miss:"));
+    expect(samples).toEqual([
+      `bridge miss: direction=toRemote event="${local.id}" recipient="${fileLead.id}" classification=local stage=filter`,
+      `bridge miss: direction=toRemote event="${remote.id}" recipient="${natsLead.id}" classification=stale stage=filter`,
+      `bridge miss: direction=toRemote event="${foreign.id}" recipient="${foreign.to}" classification=not-admitted stage=filter`,
+    ]);
+    expect(logs.join("\n")).not.toMatch(/PRIVATE-message-body|PRIVATE-data-body/);
+    // Observability does not retain an otherwise consumed miss or publish it on the next step.
+    const cursor = JSON.parse(fs.readFileSync(link.bridge.options.cursorPath, "utf8"));
+    expect(cursor.toRemote.after).toBeGreaterThanOrEqual(foreign.sequence);
+    expect((await link.bridge.step()).toRemote).toBe(0);
+    expect(logs.filter(line => line.startsWith("bridge miss:"))).toEqual(samples);
+  });
+
+  it("bounds INFO miss samples to five in any rolling minute and resumes on the next event", async () => {
+    let now = 10_000;
+    const { store, link, logs } = await gatedFixture(() => now);
+    const publish = () => store.publish({ topic: "fleet.work.tasks", kind: "answer", from: fileLead, to: offList.id, text: "PRIVATE-body" });
+    for (let i = 0; i < 8; i++) await publish();
+    await link.bridge.step();
+    expect(logs.filter(line => line.startsWith("bridge miss:"))).toHaveLength(5);
+    now += 59_999;
+    await publish();
+    await link.bridge.step();
+    expect(logs.filter(line => line.startsWith("bridge miss:"))).toHaveLength(5);
+    now += 1;
+    await publish();
+    await link.bridge.step();
+    expect(logs.filter(line => line.startsWith("bridge miss:"))).toHaveLength(6);
+    expect(logs.join("\n")).not.toContain("PRIVATE-body");
   });
 
   it("file -> NATS: the gate verifies both sides from presence; stop never crosses (destination class)", async () => {
@@ -246,8 +295,10 @@ describe("startNatsLink composition with L3's allow gate", () => {
     roots.push(root);
     (await meshRoot(root)).closeState();
     stores.pop();
+    const absentRoot = "session:99999999-9999-4999-8999-999999999999";
     const config: NatsLinkConfig = { version: 1, name: "ryzen1", link: LINK, file: { mesh: path.join(root, "hub"), lockProtocol: 1 },
-      stateDir: path.join(root, "state"), allow: ALLOW, callTimeoutMs: 30_000, logLevel: "info",
+      stateDir: path.join(root, "state"), allow: { ...ALLOW, nats: [...ALLOW.nats!, { kind: "root", id: absentRoot, machine: POD_MACHINE }] },
+      callTimeoutMs: 30_000, logLevel: "info",
       nats: { servers: ["tls://nats.invalid:4222"], machine: BRIDGE_MACHINE, credentials: path.join(root, "user.creds"),
         caFile: path.join(root, "ca.pem"), custodyStream: "FABRIC_CUSTODY", livenessStream: "FABRIC_LIVENESS",
         pathBMachines: [BRIDGE_MACHINE, POD_MACHINE], operatorMachine: "fabric-ops", events: false, inboxLanes: 8 } };
@@ -256,11 +307,30 @@ describe("startNatsLink composition with L3's allow gate", () => {
     const port = fakePort();
     let handedStore: MeshStore | undefined;
     const handle = await startNatsLink(config, { signal: controller.signal, log: line => logs.push(line), factories: {
-      openPort: async (_config, options) => { handedStore = options.fileStore; return port; }, seatPins: () => pins,
+      openPort: async (_config, options) => {
+        handedStore = options.fileStore;
+        options.onError(new AggregateError([
+          Object.assign(new Error("PRIVATE credential body"), { code: "ETIMEDOUT" }),
+          Object.assign(new Error("PRIVATE record body"), { code: "503" }),
+        ], "PRIVATE aggregate body"));
+        return port;
+      }, seatPins: () => pins,
     } });
     expect(handedStore?.root).toBe(path.join(root, "hub"));
+    expect(logs).toContain('NATS port: {"operation":"port","errors":[{"name":"Error","code":"ETIMEDOUT"},{"name":"Error","code":"503"}]}');
+    expect(logs.join("\n")).not.toContain("PRIVATE");
     expect(logs).toContain(`linked ryzen1 <-> ${LINK} (NATS machine ${BRIDGE_MACHINE})`);
     expect(port.mirrors.at(-1)!.participants.map(entry => entry.id)).toEqual([fileLead.id]);
+    const localMiss = await handedStore!.publish({ topic: "fleet.work.tasks", kind: "answer", from: fileLead, to: fileLead.id,
+      text: "PRIVATE-start-body" });
+    const remoteMiss = await handedStore!.publish({ topic: "fleet.work.tasks", kind: "answer", from: fileLead, to: absentRoot,
+      data: { message: "PRIVATE-start-data" } });
+    await vi.waitFor(() => {
+      expect(logs).toContain(`bridge miss: direction=toRemote event="${localMiss.id}" recipient="${fileLead.id}" classification=local stage=filter`);
+      expect(logs).toContain(`bridge miss: direction=toRemote event="${remoteMiss.id}" recipient="${absentRoot}" classification=stale stage=filter`);
+    }, { timeout: 10_000 });
+    expect(logs.join("\n")).not.toContain("PRIVATE");
+    expect(port.sent).toEqual([]);
     controller.abort();
     await handle.closed;
     expect(port.closed).toBe(true);

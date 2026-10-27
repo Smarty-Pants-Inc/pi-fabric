@@ -397,17 +397,19 @@ describe("#3662 ParticipantDirectory lineage liveness", () => {
 });
 describe("ParticipantDirectory.mirroredControlOwner", () => {
   const keyFor = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
-  const setup = async () => {
+  const setup = async (localKind: MeshIdentity["kind"] = "main", localRoot = "local-root") => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mirror-owner-"));
     roots.push(root);
     const meshRoot = path.join(root, "mesh");
     const writer = new MeshStore(meshRoot, 64 * 1024, 1_000);
     const reader = new MeshStore(meshRoot, 64 * 1024, 1_000, { readCacheMs: 60_000 });
-    const localIdentity: MeshIdentity = { id: "local-identity", name: "main", kind: "main" };
+    const localIdentity: MeshIdentity = { id: "local-identity", name: "main", kind: localKind };
     const identity: MeshIdentity = { id: "remote-identity", name: "main", kind: "main" };
     const directory = new ParticipantDirectory(reader, {
-      enabled: true, hostId: "local-host", rootId: "local-root", identity: localIdentity,
+      enabled: true, hostId: "local-host", rootId: localRoot, identity: localIdentity,
+      ...steadyLease,
     });
+    directories.push(directory);
     const participant = {
       ...rootRecord("remote-root", "remote-host", "remote-session"),
       ownerIdentityId: identity.id, remoteHost: "forge",
@@ -429,6 +431,77 @@ describe("ParticipantDirectory.mirroredControlOwner", () => {
     const read = () => directory.mirroredControlOwner(host.id, identity.id, participant.id);
     return { meshRoot, writer, reader, directory, identity, participant, host, participantKey, hostKey, putParticipant, putHost, read };
   };
+
+  // Keep reason: mirror/local-ownership trust boundary and the recorded smarty-dev#17198 catch.
+  it.each(["agent", "actor"] as const)("resolves a mirrored Main from its native %s child's inherited lineage", async (kind) => {
+    const { directory, participant, host, read } = await setup(kind, "remote-root");
+    const identity = directory.options.identity;
+    directory.registerSource(() => [{
+      ...agentRecord(identity.id, participant.id, directory.options.hostId, participant.id),
+      kind, ownerIdentityId: identity.id,
+    }]);
+    await directory.refresh(); // Publishes the child's own native participant and host, not a Main.
+    expect(directory.get(participant.id, Date.now(), { fresh: true }))
+      .toMatchObject({ id: participant.id, remoteHost: "forge", stale: false });
+    expect(directory.list({ scope: "project", kinds: ["root"], fresh: true }).map(record => record.id))
+      .toContain(participant.id);
+    expect(read()).toEqual({ remoteHost: "forge", expiresAt: host.expiresAt });
+    expect(directory.lastKnown(participant.id)).toBeUndefined(); // A live Main has no lapsed-lease result.
+  });
+
+  it.each([
+    ["agent", false], ["agent", true], ["actor", false], ["actor", true],
+  ] as const)("does not let another native %s's lineage hide a mirrored Main (expired: %s)", async (kind, expired) => {
+    const { writer, directory, participant, host, read } = await setup();
+    const identity: MeshIdentity = { id: "native-child", name: "child", kind };
+    await writer.put({
+      key: keyFor("topology/hosts/", "native-child-host"), identity,
+      value: { ...host, id: "native-child-host", identity, remoteHost: undefined,
+        expiresAt: Date.now() + (expired ? -60_000 : 120_000) },
+    });
+    expect(directory.get(participant.id, Date.now(), { fresh: true }))
+      .toMatchObject({ id: participant.id, remoteHost: "forge", stale: false });
+    expect(directory.list({ scope: "project", kinds: ["root"], fresh: true }).map(record => record.id))
+      .toContain(participant.id);
+    expect(read()).toEqual({ remoteHost: "forge", expiresAt: host.expiresAt });
+  });
+
+  it("still refuses a mirror of this process's own native Main", async () => {
+    const { directory, participant, read } = await setup("main", "remote-root");
+    directory.options.identity = { ...directory.options.identity, id: participant.id };
+    expect(read()).toBeUndefined();
+    expect(directory.get(participant.id, Date.now(), { fresh: true })).toBeUndefined();
+    expect(directory.list({ scope: "project", kinds: ["root"], fresh: true })).toEqual([]);
+  });
+
+  it.each(["id", "identity", "published"] as const)("still protects a child's actual local %s claim", async (claim) => {
+    const { writer, directory, participant, host, read } = await setup("agent", "remote-root");
+    if (claim === "published") {
+      const identity = directory.options.identity;
+      directory.registerSource(() => [{ ...rootRecord(participant.id, directory.options.hostId, "local-session"),
+        ownerIdentityId: identity.id }]);
+      await directory.refresh();
+    } else {
+      const identity: MeshIdentity = { id: claim === "identity" ? participant.id : "native-child", name: "child", kind: "agent" };
+      const id = claim === "id" ? participant.id : "native-child-host";
+      await writer.put({ key: keyFor("topology/hosts/", id), identity,
+        value: { ...host, id, identity, remoteHost: undefined } });
+    }
+    expect(read()).toBeUndefined();
+    expect(directory.get(participant.id, Date.now(), { fresh: true })?.remoteHost).not.toBe("forge");
+  });
+
+  it.each(["participant-author", "host-author", "provenance"] as const)("does not trust a forged Main from a child with matching lineage (%s)", async (forgery) => {
+    const { directory, identity, participant, putParticipant, putHost, read } = await setup("agent", "remote-root");
+    // Prove there is no collision masking a provenance failure once the regression is fixed.
+    expect(read()).toBeDefined();
+    const stranger = { ...identity, id: "stranger" };
+    if (forgery === "participant-author") await putParticipant({}, stranger);
+    else if (forgery === "host-author") await putHost({}, stranger);
+    else await putParticipant({ bridgeVia: "relay" }); // Must match the companion host's provenance.
+    expect(read()).toBeUndefined();
+    expect(directory.get(participant.id, Date.now(), { fresh: true })).toBeUndefined();
+  });
 
   it("exposes the exact public read port and retains fresh expiry knowledge from first send through lapse", async () => {
     const { directory, reader, host, putHost, read, meshRoot } = await setup();

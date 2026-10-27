@@ -2104,20 +2104,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return mirroredOwnerRoutingStatus({ ...owner, remoteHost: owner.remoteHost! }, now);
   }
 
-  // A mirrored record never shadows a local target (smarty-dev#2004): it is refused when its id
-  // or root is a participant this host publishes, this host's own root or identity, or any
-  // unmirrored host's id, root or identity on this mesh.
+  // A mirrored record never shadows a local target (smarty-dev#2004): published participant IDs,
+  // own identity and native host IDs/identities are claims, even after a host lease expires.
+  // Only a Main claims its root; an agent/actor's rootId is lineage membership (smarty-dev#17198).
   // ponytail: a mirror that overwrote another local host's child agent is not detectable here;
   // that host's next heartbeat takes its key back, and the bridge never overwrites unmirrored keys.
   #collides(participant: FabricParticipantRecord, hosts: ReadonlyMap<string, FabricHostRecord>, report = true): boolean {
     if (participant.remoteHost === undefined) return false;
     const ids = new Set([participant.id, participant.rootId]);
     let collides = [...ids].some((id) =>
-      this.#localRecords.has(id) || id === this.options.rootId || id === this.options.identity.id);
+      this.#localRecords.has(id) || id === this.options.identity.id ||
+      (this.options.identity.kind === "main" && id === this.options.rootId));
     for (const host of hosts.values()) {
       if (collides) break;
       collides = host.remoteHost === undefined &&
-        (ids.has(host.id) || ids.has(host.rootId) || ids.has(host.identity.id));
+        (ids.has(host.id) || ids.has(host.identity.id) ||
+          (host.identity.kind === "main" && ids.has(host.rootId)));
     }
     if (collides && report) this.#reportCollision(participant);
     return collides;

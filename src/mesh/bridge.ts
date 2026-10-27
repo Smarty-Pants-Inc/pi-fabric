@@ -569,6 +569,29 @@ const participantOf = (key: string, value: unknown, trustedBridgeVia?: string): 
   return participant;
 };
 
+/** Reserve ownership, not ancestry. Only a validated native non-root may omit its rootId;
+ * malformed claims and other links keep the conservative held-event reservation rules.
+ * Liveness is deliberately irrelevant: retained child rows never own their remote parent. */
+const reserveBridgeOwnership = (entry: MeshStateEntry, reserved: Set<string>, handoffs: BridgeHandoffScope): void => {
+  if (!isObject(entry.value)) return;
+  const value = entry.value;
+  const host = hostOf(entry.key, value);
+  const participant = participantOf(entry.key, value);
+  const nativeChild = (host !== undefined && isNativeNonRootHost(host) && entry.updatedBy.id === host.identity.id) ||
+    (participant !== undefined && remoteHostOf(participant) === undefined && participant.bridgeVia === undefined &&
+      participant.kind !== "root" && isNonRootHostId(participant.ownerHostId, participant.rootId) && participant.id !== participant.rootId &&
+      entry.updatedBy.id === participant.ownerIdentityId);
+  // Labels are minted per mesh and collide by design; they are never addresses across.
+  const fields = ["id", ...(nativeChild ? [] : ["rootId"]), "ownerHostId", "ownerIdentityId", "sessionId", "name"];
+  const ids = fields.map(field => value[field]);
+  if (isIdentity(value.identity)) ids.push(value.identity.id);
+  for (const id of ids) {
+    if (typeof id !== "string" || !id) continue;
+    // An unparseable record's own id is never waived, as in presence admission.
+    if ((!host && !participant && id === value.id) || !handoffs.waived(value, id)) reserved.add(id);
+  }
+};
+
 /** Fields from participant files that affect mirror admission; heartbeat-only updates do not. */
 const participantAuthorityStamp = (files: ReturnType<typeof participantFileSnapshot>): string | undefined => files.keys === undefined
   ? undefined
@@ -1204,24 +1227,22 @@ export class StoreBridgeSide implements BridgeSide {
     const leases = capturedLeases ?? readHostLeases(this.store.root);
     const handoffs = bridgeHandoffScope(handoffEntries, hostEntries, participantEntries, () => leases, now, this.peer);
     const reserved = new Set<string>(handoffs.reserved);
-    // Only a handoff in force to this link waives a (dead) native's own ids (smarty-dev#9074).
-    const reserve = (value: unknown, id: string): void => { if (!handoffs.waived(value, id)) reserved.add(id); };
     const hosts: BridgeHost[] = [];
     const nonRootHosts: BridgeHost[] = [];
     let rawDroppedCount = 0;
     const reasons = new PresenceDropReasons();
-    // Every id not mirrored by this link is reserved: natives, live or not, and other links'
-    // mirrors (security review F1/F2). Only natives are this side's presence.
+    // Reserve native ownership (live or not) and other links' claims, never a validated
+    // native child's ancestry (security review F1/F2). Only natives are this side's presence.
     for (const entry of hostEntries) {
       const mark = remoteHostOf(entry.value);
       if (mirrorLinkOf(entry.value) === this.peer) continue;
+      reserveBridgeOwnership(entry, reserved, handoffs);
       const host = presenceHostOf(entry.key, entry.value);
       if (!host) {
         if (mark === undefined) { rawDroppedCount += 1; reasons.add("topology/hosts", "malformed"); }
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
         continue;
       }
-      for (const id of [host.id, host.identity.id, host.rootId]) reserve(entry.value, id);
       if (mark !== undefined) continue;
       if (entry.updatedBy.id !== host.identity.id) {
         rawDroppedCount += 1; reasons.add("topology/hosts", "writer-mismatch"); continue;
@@ -1251,6 +1272,7 @@ export class StoreBridgeSide implements BridgeSide {
     for (const entry of participantEntries) {
       const mark = remoteHostOf(entry.value);
       if (mirrorLinkOf(entry.value) === this.peer) continue;
+      reserveBridgeOwnership(entry, reserved, handoffs);
       const participant = participantOf(entry.key, entry.value);
       if (!participant) {
         if (mark === undefined) { rawDroppedCount += 1; reasons.add("topology/participants", "malformed"); }
@@ -1263,10 +1285,6 @@ export class StoreBridgeSide implements BridgeSide {
         rawDroppedCount += 1; reasons.add("topology/participants", "conflicting-copy");
       }
       if (!copy || copy.updatedAt <= entry.updatedAt) participantCopies.set(entry.key, { record: participant, updatedAt: entry.updatedAt });
-      for (const id of [participant.id, participant.ownerIdentityId, participant.rootId]) reserve(entry.value, id);
-      if (typeof participant.name === "string" && participant.name) reserve(entry.value, participant.name);
-      // Labels are minted per mesh and collide by design; they are never addresses across.
-      if (typeof participant.sessionId === "string" && participant.sessionId) reserve(entry.value, participant.sessionId);
       const owner = live.get(participant.ownerHostId);
       if (mark === undefined && participant.kind === "root" && owner && entry.updatedBy.id === participant.ownerIdentityId &&
         owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId) {
@@ -1571,11 +1589,8 @@ export class StoreBridgeSide implements BridgeSide {
     const reserved = new Set<string>(handoffs.reserved);
     for (const entries of [hostEntries, participantEntries]) {
       for (const entry of entries) {
-        if (mirrorLinkOf(entry.value) === this.peer || !isObject(entry.value)) continue;
-        const value = entry.value;
-        const ids = ["id", "rootId", "ownerHostId", "ownerIdentityId", "sessionId", "name"].map((field) => value[field]);
-        if (isIdentity(value.identity)) ids.push(value.identity.id);
-        for (const id of ids) if (typeof id === "string" && id && !handoffs.waived(value, id)) reserved.add(id);
+        if (mirrorLinkOf(entry.value) === this.peer) continue;
+        reserveBridgeOwnership(entry, reserved, handoffs);
       }
     }
     return reserved;

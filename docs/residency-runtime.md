@@ -82,6 +82,25 @@ This is alarm-only: actor ownership, queue bytes and ordinary owner-pinned outpu
 are unchanged. Dual org + chief-of-staff delivery, any-mesh-host detection,
 adoption and owner-incarnation/depth-growth dedupe remain outside this increment.
 
+## Restoring a checkpoint
+
+A file backup preserves actor definitions, queues and history, not live processes
+or kernel locks. On Linux, the original Main's normal startup reconciles its
+runtime generation even when the restored owner is dead. Existing durable-work
+recovery starts the launcher; the host loads the original registry and publishes
+its actor source before reporting readiness. It does not create replacement
+actors or treat a copied `owner.json` as evidence of a live host.
+
+Copying `host.lock` changes its device/inode identity. While holding both startup
+locks, recovery can rebind a valid prior `host-fence.json` to that copied inode
+only when the retained diagnostics agree on a token and every recorded PID/start
+incarnation is provably gone. A reused PID with a different start time is stale;
+a live or unreadable incarnation, missing birth evidence, conflicting tokens, or
+an unproven legacy fence is not permission to take ownership. A genuine live
+owner is attached to normally. No manual owner/lock deletion or actor recreation
+is part of this recovery path. Retained task bytes do not imply that a killed
+process continued executing.
+
 ## Dormant actors and delivery-owned wake (#6782 / #7299)
 
 A durable actor with no in-flight activation, queued/overflow/parked/dead-letter

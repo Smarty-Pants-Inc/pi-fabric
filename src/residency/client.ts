@@ -495,7 +495,10 @@ export class ResidencyClient {
     const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
     // A new runtime must invalidate the old nonce even after A exited or while
     // B is staged. Business readiness is not the Main generation boundary.
-    if (!owner && !handoverActive(state)) return;
+    // Restored residency files retain a previous (possibly closed) Main nonce
+    // even when no host survived. Re-arm this runtime's generation without
+    // starting an empty root or treating the old nonce as current authority.
+    if (!owner && !handoverActive(state) && !fs.existsSync(this.options.config.residencyRoot)) return;
     const self = this.options.participants.self();
     if (self.kind !== "root" || self.id !== this.options.config.rootId || self.sessionId !== this.options.config.sessionId) throw new ResidentActorAuthorizationError();
     const releaseRoot = path.resolve(path.dirname(this.#hostPath), "../..");

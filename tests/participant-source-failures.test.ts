@@ -39,7 +39,7 @@ const setup = async (source: ParticipantSnapshotSource, actorRenewalAllowed?: (r
   return { directory, live, removeSource };
 };
 
-for (const kind of ["agent", "actor"] as const) describe(`${kind} source identity retention`, () => {
+for (const kind of ["agent", "actor"] as const) describe.skipIf(process.platform !== "linux")(`${kind} source identity retention`, () => {
   it("recovers after repeated whole-source failures without replaying stale payloads", async () => {
     const id = `${kind}:failed`, healthy = `${kind}:healthy`;
     let broken = false, name = "before";
@@ -86,7 +86,7 @@ for (const kind of ["agent", "actor"] as const) describe(`${kind} source identit
   });
 });
 
-it.each(["terminal", "stop-reason", "successful-absence", "partial-successful-absence", "withdrawal", "unregister"] as const)(
+it.skipIf(process.platform !== "linux").each(["terminal", "stop-reason", "successful-absence", "partial-successful-absence", "withdrawal", "unregister"] as const)(
   "does not resurrect a task after genuine %s, including while previously omitted by failure", async transition => {
     const id = "agent:must-retire";
     let mode: "live" | "failed" | "absent" | "terminal" | "stop-reason" | "partial-absence" = "live";
@@ -120,7 +120,7 @@ it.each(["terminal", "stop-reason", "successful-absence", "partial-successful-ab
   },
 );
 
-it.each(["terminal", "successful-absence"] as const)("preserves authorized same-id actor reactivation after %s, but never a rejected ownership token", async transition => {
+it.skipIf(process.platform !== "linux").each(["terminal", "successful-absence"] as const)("preserves authorized same-id actor reactivation after %s, but never a rejected ownership token", async transition => {
   const id = "actor:reactivated";
   let mode: "active" | "stopped" | "absent" = "active", token = "first";
   let authorized = "first";

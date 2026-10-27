@@ -38,12 +38,13 @@ const runtimeFixture = async () => {
   const { normalizeFabricConfig } = await import("../src/config.js");
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "task-result-control-")));
   roots.push(base);
-  const meshRoot = path.join(base, "mesh"), runRoot = path.join(base, "runs");
+  const meshRoot = path.join(base, "mesh"), runRoot = path.join(base, "runs"), tmpRoot = path.join(base, "tmp");
   fs.mkdirSync(runRoot, { mode: 0o700 });
+  fs.mkdirSync(tmpRoot, { mode: 0o700 });
   for (const name of Object.keys(process.env)) if (name.startsWith("PI_FABRIC_")) vi.stubEnv(name, undefined);
   vi.stubEnv("PI_FABRIC_PROJECT_ROOT", base);
   vi.stubEnv("PI_FABRIC_RUN_ROOT", runRoot);
-  vi.stubEnv("PI_FABRIC_TMPDIR", path.join(base, "tmp"));
+  vi.stubEnv("PI_FABRIC_TMPDIR", tmpRoot);
   vi.stubEnv("PI_CODING_AGENT_DIR", path.join(base, "agent"));
   const sessionId = "17018aaa-bbbb-cccc-dddd-eeeeeeeeeeee", ownerId = `session:${sessionId}`;
   const model = { provider: "faux", id: "m1", name: "fixture-only model" };

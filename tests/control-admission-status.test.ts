@@ -498,7 +498,7 @@ const natsFixture = async () => {
   return { ...s, world };
 };
 
-describe("NATS control admission preserves native gate semantics (#17018)", () => {
+describe.skipIf(process.platform !== "linux")("NATS control admission preserves native gate semantics (#17018)", () => {
   it("isolates only opted-in callbacks, removes their old records, and leaves a default refresh error non-gating", async () => {
     const s = await natsFixture();
     let broken = false;

@@ -160,6 +160,49 @@ const relaySender = (f: Awaited<ReturnType<typeof fixture>>) => {
 };
 
 describe("spoke-to-spoke roots and addressed control through the hub", () => {
+  // KEEP: a real sender takeover between destination delivery and the hub's
+  // fenced receipt must refuse only that receipt, not terminate the source link.
+  it("keeps run alive for other sessions when a relay sender loses its binding before the hub receipt", async () => {
+    let takeOver = false;
+    const f = await fixture(60_000, undefined, async () => {
+      if (!takeOver) return;
+      takeOver = false;
+      await native(f.stores.ryzen1!, "ryzen3");
+    });
+    const hub = f.stores.ryzen1!, sourceStore = f.stores.ryzen3!, destination = f.stores.ryzen2!;
+    const source = f.mains.ryzen3!, target = f.mains.ryzen2!, recipient = f.mains.ryzen1!;
+    const other = await native(sourceStore, "surviving-session");
+    const link = f.links.find(item => item.bridge.options.remoteName === "ryzen3")!;
+    await link.bridge.syncPresence();
+    const logs: string[] = [];
+    link.bridge.options.log = line => logs.push(line);
+    const tail = vi.spyOn(link.remote, "tail");
+    let failure: unknown, ended = false;
+    const running = link.bridge.run().then(() => { ended = true; }, error => { failure = error; ended = true; });
+    closers.unshift(async () => { await link.bridge.stop(); await running; });
+    await vi.waitFor(() => expect(tail).toHaveBeenCalled(), { timeout: 5_000 });
+    takeOver = true;
+    const sent = await sourceStore.publish({ topic: "fabric.control.command", kind: "followUp", from: source.identity,
+      to: target.identity.id, data: { version: 1, commandId: "binding-loss-at-receipt", targetId: target.identity.id,
+        operation: "followUp", replyTo: source.identity.id, destinationRemoteHost: "ryzen2", message: "already delivered",
+        requestedAt: Date.now(), deadlineAt: Date.now() + 60_000, ownerIncarnation: target.ownerIncarnation } });
+    await vi.waitFor(() => expect(ended || sourceCursor(link.bridge) >= sent.sequence).toBe(true), { timeout: 10_000 });
+    expect(failure).toBeUndefined();
+    expect(ended).toBe(false);
+    expect(events(destination, "fabric.control.command")).toHaveLength(1);
+    expect(events(hub, "fabric.control.command")).toEqual([]); // the sender fence still refused the hub receipt
+    expect(link.bridge.options.local.holds!(source.identity.id, source.identity)).toBe(false);
+    expect(logs.join("\n")).toMatch(/refused relay receipt.*no longer bound to bridge link/);
+    const healthy = await sourceStore.publish({ topic: "fleet.work.binding-survivor.1", kind: "ask", from: other.identity,
+      to: recipient.identity.id, text: "same run, different session" });
+    await vi.waitFor(() => expect(sourceCursor(link.bridge)).toBeGreaterThanOrEqual(healthy.sequence), { timeout: 5_000 });
+    expect(events(hub, "fleet.work.binding-survivor.1")).toMatchObject([{ text: "same run, different session",
+      verification: "bridge", data: { bridge: { id: healthy.id } } }]);
+    expect(events(destination, "fabric.control.command")).toHaveLength(1);
+    expect(ended).toBe(false);
+    expect(failure).toBeUndefined();
+  }, 30_000);
+
   it("RELAY-1 retains A's cursor while live B's mirror is held and expired, then executes and ACKs once across retries/restart", async () => {
     const f = await fixture();
     const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!;

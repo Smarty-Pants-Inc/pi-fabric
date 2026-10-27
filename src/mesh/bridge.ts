@@ -5087,7 +5087,14 @@ export class MeshBridge {
       if (!(error instanceof BridgeOwnershipError)) throw error;
       const { local: presence, remote: owned } = await this.#authority(false);
       const current = { ...rules, senders: senders(owned), identities: senderIdentities(owned), reserved: new Set(presence.reserved) };
-      if (!this.#staleMembership(event, current, "toLocal", this.#refusal(event, current, "toLocal"))) throw error;
+      if (!this.#staleMembership(event, current, "toLocal", this.#refusal(event, current, "toLocal"))) {
+        // A proven sender takeover refuses this session's hub receipt, not the link.
+        // The destination already confirmed delivery; never weaken/retry the refused fence.
+        // Without proof of binding loss, ownership errors still fail the link.
+        if (this.#stopped || local.holds?.(pub.from.id, pub.from) !== false) throw error;
+        this.#log(`toLocal: refused relay receipt for ${event.topic} ${event.id}: ${pub.from.id} is no longer bound to bridge link ${remoteName}`);
+        return { delivered: true };
+      }
       // Destination dedupe covers retry after delivery but before the fenced hub receipt.
       return { delivered: false, pending: true };
     }

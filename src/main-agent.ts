@@ -8,6 +8,7 @@ import { readFileRetrying, writeFileAtomic } from "./core/atomic-write.js";
 import { withConfirmedSessionFile } from "./core/session-receipts.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MeshIdentity } from "./mesh/store.js";
+import type { FabricIsolatedSourceFailure } from "./topology/types.js";
 import { takeCompactionDecline } from "./compaction/cancellation.js";
 import { fabricProvenanceOptions, fabricProvenanceSupported, fabricTurnProvenance, fabricWakeCause, copyFabricProvenance, fabricWakeMessage, admittedFabricWakeCauses, sendFabricMessage, sendFabricUserMessage, type FabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "./fabric-provenance.js";
 import { classifyModelRefusal, classifyProviderError, hasRecordedModelRefusal, type ProviderErrorClass } from "./provider-error-class.js";
@@ -45,6 +46,10 @@ export interface FabricMainAgentInfo {
   name: "Main";
   kind: "main";
   status: "idle" | "running" | "remote";
+  /** Local control admission is independent of Pi's idle/running activity. */
+  controlAdmission?: "admitted" | "gated";
+  controlAdmissionReason?: string;
+  isolatedSourceFailures?: FabricIsolatedSourceFailure[];
   runner: "pi";
   transport: "host";
   cwd?: string;

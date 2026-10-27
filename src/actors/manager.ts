@@ -2188,13 +2188,18 @@ export class ActorManager {
     );
   }
 
-  /** Registry publishers report the resolved binding, not this reader's private overlay. */
-  listOwned(registryView = false): FabricActorInfo[] {
+  /** Registry publishers report the resolved binding, not this reader's private overlay.
+   * Only an explicit reporter isolates per-actor presentation faults; selection stays strict. */
+  listOwned(registryView = false, onError?: (id: string, error: unknown) => void): FabricActorInfo[] {
     this.#syncActorsFromRegistry();
     this.#refreshOwnership(undefined, false);
-    return [...this.#actors.values()]
-      .filter((actor) => this.#canManageCached(actor.id) && this.#slotCurrent(actor))
-      .map((actor) => this.#publicInfo(actor, true, registryView));
+    const owned = [...this.#actors.values()]
+      .filter((actor) => this.#canManageCached(actor.id) && this.#slotCurrent(actor));
+    if (!onError) return owned.map((actor) => this.#publicInfo(actor, true, registryView));
+    return owned.flatMap((actor) => {
+      try { return [this.#publicInfo(actor, true, registryView)]; }
+      catch (error) { onError(actor.id, error); return []; }
+    });
   }
 
   /** Whether at least one owned durable actor can be made dormant right now. */

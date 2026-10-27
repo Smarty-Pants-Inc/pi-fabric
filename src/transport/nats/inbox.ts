@@ -82,7 +82,7 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   readonly duplicateWindowMs?: number;
   readonly requestTimeoutMs?: number;
   readonly provision?: boolean;
-  /** Host-only opt-in to expiring this host's own inbox durable. */
+  /** Host-only opt-in to a custom idle lifetime and best-effort durable deletion on close. */
   readonly ephemeralHost?: boolean;
   /** Idle expiration in seconds when ephemeralHost is enabled (300..86400). */
   readonly ephemeralInactiveSeconds?: number;
@@ -196,7 +196,9 @@ const transportConsumerPolicy = (options: ResolvedNatsOptions): TransportConsume
   filterSubject: transportInboxFilter(options.machine, options.hostId),
   description: JSON.stringify({ fabricHostId: options.hostId, machine: options.machine }),
   maxAckPending: 128,
-  ...(options.ephemeralHost ? { inactiveThresholdNs: options.ephemeralInactiveSeconds * 1_000_000_000 } : {}),
+  ...(options.ephemeralHost
+    ? { inactiveThresholdNs: options.ephemeralInactiveSeconds * 1_000_000_000 }
+    : {}),
 });
 
 const isTransportEnvelope = (value: unknown): value is TransportEnvelope => {
@@ -657,7 +659,8 @@ class NatsTransportImpl implements FabricTransport {
 
   #assertOpen(): NatsSession {
     if (this.#terminalError) throw this.#terminalError;
-    if (this.#closed) throw new TransportUnavailableError("NATS transport is closed");
+    // Explicit close is final, unlike a temporarily unverified/reopening session.
+    if (this.#closed) throw new TransportInvalidError("NATS transport is closed");
     const session = this.#session;
     if (!session || !session.connection.isVerified() || session.connection.nc.isClosed() || session.connection.nc.isDraining()) {
       if (session && (session.connection.nc.isClosed() || session.connection.nc.isDraining())) this.#loseSession(session);
@@ -717,7 +720,7 @@ class NatsTransportImpl implements FabricTransport {
       } catch (error) {
         if (lastFailure && retryablePublishFailure(error)) {
           if (Date.now() >= retryDeadline) throw retryHorizonFailure(uncertainFailure ?? lastFailure);
-          await this.#waitForPublishRetry(retrySignal, delayMs, retryDeadline, lastFailure, signal);
+          await this.#waitForPublishRetry(retrySignal, delayMs, retryDeadline, uncertainFailure ?? lastFailure, signal);
           delayMs = Math.min(PUBLISH_RETRY_MAX_MS, delayMs * 2);
           continue;
         }
@@ -743,7 +746,7 @@ class NatsTransportImpl implements FabricTransport {
         lastFailure = failure;
         if (!retryablePublishFailure(failure)) throw uncertainFailure ?? failure;
         if (Date.now() >= retryDeadline) throw retryHorizonFailure(uncertainFailure ?? failure);
-        await this.#waitForPublishRetry(retrySignal, delayMs, retryDeadline, failure, signal);
+        await this.#waitForPublishRetry(retrySignal, delayMs, retryDeadline, uncertainFailure ?? failure, signal);
         delayMs = Math.min(PUBLISH_RETRY_MAX_MS, delayMs * 2);
       }
     }

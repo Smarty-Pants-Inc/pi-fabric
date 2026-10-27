@@ -328,7 +328,7 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
       for (const line of String(chunk).trim().split("\n")) {
         const request = JSON.parse(line);
         operations.push(request.op);
-        expect(request.args).toEqual({ version: BRIDGE_PROTOCOL_VERSION, changes: true });
+        expect(request.args).toEqual({ version: BRIDGE_PROTOCOL_VERSION, busyTail: true, changes: true });
         output.write(JSON.stringify({ id: request.id, ok: true, result: { version: BRIDGE_PROTOCOL_VERSION, ...(changes === undefined ? {} : { changes }) } }) + "\n");
       }
     });

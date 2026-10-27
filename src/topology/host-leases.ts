@@ -1033,6 +1033,12 @@ export class TransportHostLease {
     try { this.#checkCutoff(); return this.#state === "held"; } catch { return false; }
   }
 
+  /** Remaining local admission budget, using the same monotonic cutoff as live(). */
+  remainingMs(): number {
+    if (this.#state !== "held") return 0;
+    try { return Math.max(0, (this.#deadline ?? 0) - this.#checkCutoff()); } catch { return 0; }
+  }
+
   /** A TTL lapse stops admission but does not prove a different owner took the lease. */
   recovering(): boolean { return this.#state === "suspended"; }
 

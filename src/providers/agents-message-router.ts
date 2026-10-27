@@ -1,6 +1,7 @@
 import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { captureSandboxFinalAnswer } from "../agents/completion-inbox.js";
 import { interruptErrorCode } from "../interrupt-authority.js";
+import { FabricMainDrainingError } from "../main-drain/gate.js";
 import { boundAgentSpawner } from "../agents/spawner.js";
 import { FabricTargetTerminalError, terminalRejectionFields } from "../agents/terminal-target.js";
 import { terminalAgentStatuses } from "../agents/lifecycle.js";
@@ -1225,8 +1226,8 @@ export class AgentMessageRouter {
         ...(command.data === undefined ? {} : { data: command.data }),
         }));
       } catch (error) {
-        // Admission refusals retain their typed code across verified mesh/bridge ACKs.
-        const errorCode = interruptErrorCode(error);
+        // Admission refusals retain their typed code across verified mesh/bridge ACKs; a draining Main's too (smarty-dev#15310 N7).
+        const errorCode = interruptErrorCode(error) ?? (error instanceof FabricMainDrainingError ? error.code : undefined);
         return { accepted: false, error: error instanceof Error ? error.message : String(error),
           ...(errorCode ? { errorCode, notRun: true } : {}) };
       }

@@ -201,6 +201,8 @@ export class ActorDirectory extends ActorManager {
     return [...actors.values()];
   }
   override listOwned(registryView = false): FabricActorInfo[] { return [...super.listOwned(registryView), ...this.#secondary.listOwned(registryView)]; }
+  override drainQuiescence(id: string): string[] { return this.#isPrimary(id) ? super.drainQuiescence(id) : this.#secondary.drainQuiescence(id); }
+  override drainWorker(id: string): ReturnType<ActorManager["drainWorker"]> { return this.#isPrimary(id) ? super.drainWorker(id) : this.#secondary.drainWorker(id); }
   override hasOwnedActors(): boolean { return super.hasOwnedActors() || this.#secondary.hasOwnedActors(); }
   override hasDurableActor(): boolean { return super.hasDurableActor() || this.#secondary.hasDurableActor(); }
   override hasActiveDurableActor(): boolean { return super.hasActiveDurableActor() || this.#secondary.hasActiveDurableActor(); }

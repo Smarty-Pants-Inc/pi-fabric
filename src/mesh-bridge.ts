@@ -15,9 +15,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
+import { serveBridgeAgentWorker, type BridgeAgentWorkerData } from "./mesh/bridge-agent.js";
 import { readMeshStateMovedMarker } from "./mesh/backend-fence.js";
 import { BRIDGE_STALL_ALARM_TOPIC, bridgeStartDeadlineMs, DEFAULT_CALL_TIMEOUT_MS, DEFAULT_FACTORY_RATE, MeshBridge, RemoteBridgeSide,
-  serveBridgeAgent, StoreBridgeSide, validBridgeName, type BridgeStallAlarm } from "./mesh/bridge.js";
+  StoreBridgeSide, validBridgeName, type BridgeStallAlarm } from "./mesh/bridge.js";
 import { BridgeRelayUnavailableError, startBridgeRelay } from "./mesh/bridge-relay.js";
 import { BRIDGE_DELIVERY_AGE_ALERT_MS, type BridgeDeliveryAgeAlarm } from "./mesh/bridge-delivery-age.js";
 import { publishBridgeLegacyBaselineAlarm, type BridgeLegacyBaselineAlarm } from "./mesh/bridge-baseline-alarms.js";
@@ -91,12 +93,7 @@ export const transportCommand = (flags: Map<string, string>, command: string[]):
   ];
 };
 
-export const openBridgeStore = (
-  root: string,
-  flags: Map<string, string>,
-  options: Pick<MeshStoreOptions, "stateBackend"> = {},
-  usage: UsageFault = (message) => new Error(message),
-): MeshStore => {
+const bridgeStoreOptions = (flags: Map<string, string>, usage: UsageFault): BridgeAgentWorkerData["storeOptions"] => {
   const selected = flags.get("lock-protocol") ?? "1";
   if (selected !== "1" && selected !== "2" && selected !== "3") throw usage("--lock-protocol must be 1, 2 or 3");
   const capacity = flags.get("max-state-bytes");
@@ -104,21 +101,31 @@ export const openBridgeStore = (
   if (maxStateBytes !== undefined && (!Number.isSafeInteger(maxStateBytes) || maxStateBytes < MAX_EVENT_BYTES * 2)) {
     throw usage(`--max-state-bytes must be a safe integer of at least ${MAX_EVENT_BYTES * 2}`);
   }
-  return new MeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS, {
-    lockProtocol: selected === "1" ? 1 : selected === "2" ? 2 : 3,
-    ...(maxStateBytes === undefined ? {} : { maxStateBytes }),
-    ...options,
-  });
+  return { lockProtocol: selected === "1" ? 1 : selected === "2" ? 2 : 3,
+    ...(maxStateBytes === undefined ? {} : { maxStateBytes }) };
 };
+
+export const openBridgeStore = (
+  root: string,
+  flags: Map<string, string>,
+  options: Pick<MeshStoreOptions, "stateBackend"> = {},
+  usage: UsageFault = (message) => new Error(message),
+): MeshStore => new MeshStore(root, MAX_EVENT_BYTES, MAX_READ_EVENTS, { ...bridgeStoreOptions(flags, usage), ...options });
 const log = (message: string): void => void process.stderr.write(`mesh-bridge: ${message}\n`);
 
 const runAgent = async (flags: Map<string, string>): Promise<void> => {
   const peer = required(flags, "peer");
-  const side = new StoreBridgeSide(openBridgeStore(required(flags, "mesh"), flags), peer, Date.now, true);
+  if (!validBridgeName(peer)) throw new Error("Invalid bridge name");
+  const root = required(flags, "mesh");
+  const storeOptions = bridgeStoreOptions(flags, (message) => new Error(message));
   const logLevel = flags.get("log-level") ?? "info";
   if (logLevel !== "info" && logLevel !== "debug") throw new Error("--log-level must be info or debug");
-  await side.store.prepareLock();
-  await serveBridgeAgent(side, process.stdin, process.stdout, logLevel === "debug" ? log : undefined);
+  const workerData: BridgeAgentWorkerData = { root, peer, storeOptions, maxEventBytes: MAX_EVENT_BYTES,
+    maxReadEvents: MAX_READ_EVENTS, debug: logLevel === "debug" };
+  // Resolve at this CLI entry, not a shared chunk or a mutable installed-generation alias.
+  const worker = new Worker(new URL(import.meta.url.endsWith(".ts")
+    ? "./mesh/bridge-agent-worker.ts" : "./mesh/bridge-agent-worker.js", import.meta.url), { workerData });
+  await serveBridgeAgentWorker(worker, process.stdin, process.stdout);
 };
 
 /** Grace period after clean stdin EOF before terminating a stuck transport child. */

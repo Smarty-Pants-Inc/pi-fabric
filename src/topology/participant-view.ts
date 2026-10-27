@@ -42,6 +42,8 @@ export interface KvParticipantDirectoryOptions {
   rootId: string;
   /** Bounds each KV operation, including reconciliation and best-effort cleanup. */
   operationTimeoutMs?: number;
+  /** Independent refresh and cleanup-retry jitter samples; defaults to Math.random. */
+  random?: () => number;
   onError?: (error: unknown) => void;
 }
 
@@ -164,6 +166,7 @@ export function leaseValue(entry: TransportKvEntry<unknown>): FabricKvHostLease 
 }
 
 type OwnedPresence = { record: FabricParticipantRecord; revision: number; writtenAt: number; refreshAt: number };
+type PendingPresenceCleanup = { record: FabricParticipantRecord; previous?: OwnedPresence; withdrawn?: boolean };
 type PresenceWaiter = { id: string; changed(): void; fail(error: unknown): void };
 
 /**
@@ -180,7 +183,7 @@ export class KvParticipantDirectory implements ParticipantView {
   readonly #presenceRevisions = new Map<string, number>();
   readonly #leaseRevisions = new Map<string, number>();
   readonly #owned = new Map<string, OwnedPresence>();
-  readonly #pendingCleanup = new Map<string, FabricParticipantRecord>();
+  readonly #pendingCleanup = new Map<string, PendingPresenceCleanup>();
   readonly #writes = new Map<string, Promise<unknown>>();
   readonly #waiters = new Set<PresenceWaiter>();
   readonly #timeoutMs: number;
@@ -196,6 +199,7 @@ export class KvParticipantDirectory implements ParticipantView {
   #refreshPass: Promise<void> | undefined;
   #closing: Promise<void> | undefined;
   #flushing: Promise<void> | undefined;
+  #cleanupTimer: ReturnType<typeof setTimeout> | undefined;
   #cleanupAgain = false;
   readonly #leaseLost = (): void => this.#stop(this.options.lease.signal.reason ?? new DirectoryNotReadyError());
 
@@ -281,6 +285,7 @@ export class KvParticipantDirectory implements ParticipantView {
     this.#hosts.clear();
     if (this.#timer) clearTimeout(this.#timer);
     this.#timer = undefined;
+    this.#clearCleanupRetry();
     this.options.lease.signal.removeEventListener("abort", this.#leaseLost);
     this.#stopVerifiedReconnect?.();
     this.#stopVerifiedReconnect = undefined;
@@ -569,9 +574,12 @@ export class KvParticipantDirectory implements ParticipantView {
     void result.finally(() => { if (this.#writes.get(key) === result) this.#writes.delete(key); }).catch(() => undefined);
     return result;
   }
+  #refreshDelay(): number {
+    return KV_PRESENCE_REFRESH_MS * 0.8 + KV_PRESENCE_REFRESH_MS * 0.4 * (this.options.random ?? Math.random)();
+  }
   #remember(key: string, record: FabricParticipantRecord, revision: number): KvPresencePublication {
     const now = performance.now();
-    this.#owned.set(key, { record, revision, writtenAt: now, refreshAt: now + KV_PRESENCE_REFRESH_MS });
+    this.#owned.set(key, { record, revision, writtenAt: now, refreshAt: now + this.#refreshDelay() });
     this.#armRefresh();
     return { key, revision, rollback: () => this.#serial(key, () => this.#removeRevision(key, revision)) };
   }
@@ -705,15 +713,17 @@ export class KvParticipantDirectory implements ParticipantView {
         const current = await this.#presence.get(key, this.#signal());
         if (current && this.#same(current, record)) return current.revision;
       } catch (readError) { this.#report(readError); }
-      // Never allow a later refresh to adopt an unknown CAS revision.
-      this.#owned.delete(key);
-      this.#queueCleanup(key, record);
+      // Retire the CAS receipt while the outcome is unknown, but retain its exact
+      // confirmed predecessor for reconciliation. Never adopt a read revision.
+      this.#queueCleanup(key, record, this.#owned.get(key));
       throw error;
     }
   }
 
   #armRefresh(): void {
-    if (this.#closed || this.#timer || this.#refreshPass || this.#owned.size === 0) return;
+    if (this.#closed || this.#refreshPass || this.#owned.size === 0) return;
+    // A later publication may sample an earlier deadline than the currently armed row.
+    if (this.#timer) clearTimeout(this.#timer);
     const due = Math.min(...[...this.#owned.values()].map(owned => owned.refreshAt));
     this.#timer = setTimeout(() => {
       this.#timer = undefined;
@@ -722,7 +732,7 @@ export class KvParticipantDirectory implements ParticipantView {
     this.#timer.unref?.();
   }
 
-  /** One deadline per owned row, three minutes after its last successful change/refresh. */
+  /** Independent deadlines per row: successes spread over 144–216 s; failed retries stay at or below 180 s. */
   refreshOwned(): Promise<void> {
     if (this.#refreshPass) return this.#refreshPass;
     try { this.#assertWritable(); } catch (error) { return Promise.reject(error); }
@@ -734,8 +744,9 @@ export class KvParticipantDirectory implements ParticipantView {
         const revision = await this.#update(key, owned.record, owned.revision);
         this.#admitted(key, owned.record, revision);
       } catch (error) {
-        // A failed automatic refresh is not a hot-loop retry or a successful-write receipt.
-        if (this.#owned.get(key) === owned) owned.refreshAt = performance.now() + KV_PRESENCE_REFRESH_MS;
+        // A failed refresh is not a successful-write receipt. Keep its fresh jitter sample,
+        // but never grow the old 180 s retry ceiling toward the 600 s presence TTL.
+        if (this.#owned.get(key) === owned) owned.refreshAt = performance.now() + Math.min(KV_PRESENCE_REFRESH_MS, this.#refreshDelay());
         throw error;
       }
     }))).then(results => {
@@ -754,7 +765,20 @@ export class KvParticipantDirectory implements ParticipantView {
     // Stop renewal even if the deletion is uncertain or a foreign revision already won.
     const owned = this.#owned.get(key);
     if (owned?.revision === revision) this.#owned.delete(key);
-    try { return await this.#presence.delete(key, revision, this.#signal(true)); }
+    const pending = this.#pendingCleanup.get(key);
+    // Only this generation's receipt can withdraw its uncertain successor. Retain
+    // the predecessor as exact delete authority, never as permission to restore it.
+    const withdrawsPending = pending?.previous?.revision === revision;
+    if (withdrawsPending) pending.withdrawn = true;
+    try {
+      const deleted = await this.#presence.delete(key, revision, this.#signal(true));
+      if (deleted && withdrawsPending && this.#pendingCleanup.get(key) === pending) {
+        // A successful predecessor CAS delete also fences its delayed update.
+        this.#pendingCleanup.delete(key);
+        if (this.#pendingCleanup.size === 0) this.#clearCleanupRetry();
+      }
+      return deleted;
+    }
     catch (error) {
       // remove() cannot retry after #owned was retired. Preserve the exact-record
       // cleanup intent instead of leaving a terminal row routable until its TTL.
@@ -768,40 +792,81 @@ export class KvParticipantDirectory implements ParticipantView {
     const key = this.#key(id);
     return this.#serial(key, async () => {
       const owned = this.#owned.get(key);
+      const pending = this.#pendingCleanup.get(key);
+      if (pending) {
+        pending.withdrawn = true;
+        this.#requestCleanup();
+      }
       return owned ? this.#removeRevision(key, owned.revision) : false;
     });
   }
 
-  #queueCleanup(key: string, record: FabricParticipantRecord): void {
-    this.#pendingCleanup.set(key, record);
+  #queueCleanup(key: string, record: FabricParticipantRecord, previous?: OwnedPresence): void {
+    // A confirmed write that outlived its lease also invalidates the older receipt.
+    this.#owned.delete(key);
+    this.#pendingCleanup.set(key, { record, ...(previous ? { previous } : {}) });
     this.#requestCleanup();
   }
   #requestCleanup(): void {
     if (this.#closed || this.#pendingCleanup.size === 0) return;
     if (this.#flushing) { this.#cleanupAgain = true; return; }
-    const flushing = this.reconcilePendingCleanup();
-    this.#flushing = flushing;
-    void flushing.finally(() => {
-      if (this.#flushing === flushing) this.#flushing = undefined;
-      // Preserve a recovery/put event received during a read. This is event-driven, never polling.
-      if (this.#cleanupAgain) { this.#cleanupAgain = false; this.#requestCleanup(); }
-    }).catch(error => this.#report(error));
+    void this.reconcilePendingCleanup().catch(error => this.#report(error));
+  }
+  #clearCleanupRetry(): void {
+    if (this.#cleanupTimer) clearTimeout(this.#cleanupTimer);
+    this.#cleanupTimer = undefined;
+  }
+  #armCleanupRetry(): void {
+    if (this.#closed || this.#cleanupTimer || this.#pendingCleanup.size === 0) return;
+    // Watch put/READY remains primary. A failed read or unsettled delete needs this
+    // bounded safety net; bursts must not resample or postpone an armed deadline.
+    this.#cleanupTimer = setTimeout(() => {
+      this.#cleanupTimer = undefined;
+      this.#requestCleanup();
+    }, 1_000 + 4_000 * (this.options.random ?? Math.random)());
+    this.#cleanupTimer.unref?.();
   }
 
   /** Event-driven reconnect cleanup; the parent may also call once after transport recovery.
-   * Unavailable reads retain the intent. Once readable, at most one exact-record CAS delete is attempted. */
-  async reconcilePendingCleanup(): Promise<void> {
-    await Promise.all([...this.#pendingCleanup].map(([key, record]) => this.#serial(key, async () => {
-      if (this.#pendingCleanup.get(key) !== record) return;
+   * Failed reads/deletes retain intent and share one jittered safety-net retry. Restore only an
+   * exact, nonwithdrawn predecessor; otherwise attempt one exact-record CAS delete per pass. */
+  reconcilePendingCleanup(): Promise<void> {
+    if (this.#flushing) return this.#flushing;
+    let retryNeeded = false;
+    const flushing = Promise.all([...this.#pendingCleanup].map(([key, intent]) => this.#serial(key, async () => {
+      if (this.#pendingCleanup.get(key) !== intent) return;
+      const { record, previous } = intent;
       let current: TransportKvEntry<unknown> | undefined;
       try { current = await this.#presence.get(key, this.#signal(true)); }
-      catch (error) { this.#report(error); return; }
+      catch (error) { retryNeeded = true; this.#report(error); return; }
       if (!current) return; // A delayed uncertain write may still appear on the watch.
-      this.#pendingCleanup.delete(key);
-      if (!this.#same(current, record)) return;
-      try { await this.#presence.delete(key, current.revision, this.#signal(true)); }
-      catch (error) { this.#report(error); } // One eventual attempt, never an unfenced retry.
-    })));
+      const confirmed = previous && current.revision === previous.revision && this.#same(current, previous.record);
+      if (confirmed && !intent.withdrawn && !this.#closed) {
+        this.#pendingCleanup.delete(key);
+        // The uncertain update did not replace this exact confirmed revision. A late
+        // write still has to win its original CAS; no unknown revision is authority.
+        this.#owned.set(key, previous);
+        this.#armRefresh();
+        return;
+      }
+      // Withdrawal/close forbids restoration, not the exact predecessor CAS delete.
+      if (!confirmed && !this.#same(current, record)) { this.#pendingCleanup.delete(key); return; }
+      try {
+        // A delayed original CAS may win after GET. Retain the obligation until
+        // deletion wins; the next pass must recheck exact owner/body/revision.
+        if (await this.#presence.delete(key, current.revision, this.#signal(true))) this.#pendingCleanup.delete(key);
+        else retryNeeded = true;
+      } catch (error) { retryNeeded = true; this.#report(error); }
+    }))).then(() => undefined);
+    this.#flushing = flushing;
+    void flushing.finally(() => {
+      if (this.#flushing === flushing) this.#flushing = undefined;
+      if (retryNeeded) this.#armCleanupRetry();
+      else this.#clearCleanupRetry(); // Successful absence retains late-write protection without polling.
+      // A watch event during any pass (including a manual one) gets one serial follow-up.
+      if (this.#cleanupAgain) { this.#cleanupAgain = false; this.#requestCleanup(); }
+    }).catch(() => undefined);
+    return flushing;
   }
 
   /** Stops watches/refreshes, joins in-flight writes, then CAS-withdraws only this helper's receipts. */

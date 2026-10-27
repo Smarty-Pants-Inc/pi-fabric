@@ -110,6 +110,19 @@ never a mesh publish: publishing would need the very lock that is contended. One
   `withTryLock` scopes, zero-wait callers, the single-attempt R20 fence) fail by design while the
   lock is busy; they stay `tries` in the minute files and emit no event. Nor does a protocol-2
   store that fails closed before its process incarnation is ready: it never tried `.lock`.
+- SQLite `wait-timeout` events may additionally carry `holder.cgroup` and `holder.unit`. These are
+  **current local procfs observations for the kernel-sampled PID**, not proof that the same process
+  held the lock throughout the wait. Only `/proc/PID/cgroup` is read, at most 4097 bytes; a file over
+  4096 bytes, malformed UTF-8/records/paths, control or format characters, or an unreadable entry
+  produces no membership fields. Unified `0::` membership is preferred, otherwise v1 `name=systemd`.
+  The absolute cgroup path is limited to 512 UTF-8 bytes (oversize is omitted, never truncated).
+  `unit` is the nearest `.service` or `.scope` path component, at most 256 UTF-8 bytes; a `.slice`
+  is not a unit, and a path component does not establish that a systemd unit is active. An overlong
+  unit is omitted independently. Missing data and non-Linux observations remain unknown; no command
+  line, environment, subprocess, periodic scan or new stream is involved. Canonical `.lock` owner
+  PIDs receive no membership enrichment: their namespace/incarnation may be foreign or unproven.
+  These fields stay in this private local event log, never timeout messages or bridge RPC payloads,
+  and never influence admission, reclamation or retry decisions.
 - `class` (and `waiter.op`) is the caller class from the table above. SQLite writes use the same
   classes: `put`/`delete` `put/delete`, `writeBatch` `writeBatch` (or `bridge`), `confirmWritable`
   `heartbeat/confirm`, `exclusive` `custody`, the write fence, `retire` and imports `other`.
@@ -132,6 +145,11 @@ symlink, in the same private `lock-stats` directory as the minute files (same sa
 the minute-file reader and pruner ignore it. An I/O error is never thrown into, and never waits in,
 the lock path: it is counted and reported at most once a minute in the profile's private
 `fabric-lock-stats.log`. `PI_FABRIC_LOCK_STATS=0` turns events off together with the minute files.
+
+On module/release reload, newly captured recorders use the current timeout implementation without
+appending twice or enabling a singleton that was originally disabled. Existing hold/queue recorders
+and append-error counts are retained. Already-captured older timeout functions may keep writing the
+older valid shape until restart.
 
 To consume it, tail `events.jsonl` by name, not by descriptor: when its inode changes or its size
 drops below the read offset, finish reading `events.jsonl.1` from the old offset if needed, then

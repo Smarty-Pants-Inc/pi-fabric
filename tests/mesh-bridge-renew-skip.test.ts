@@ -68,9 +68,7 @@ describe.each(["file", "sqlite"] as const)("mirror lease renewal budget (%s)", b
       locks.push(f.counts().locks);
     }
     expect(waves).toEqual([114, 0, 0]);
-    // SQLite's existing lease-only probe takes no gate for skipped effects. The file
-    // backend deliberately retains its existing directory custody in this change.
-    if (backend === "sqlite") expect(locks.slice(1)).toEqual([0, 0]);
+    expect(locks.slice(1)).toEqual([0, 0]);
     for (const host of f.hosts) {
       expect(readHostLeaseCurrent(f.store.root, host.id)).toMatchObject({
         incarnationToken: host.incarnationToken, expiresAt: NOW + BRIDGE_LEASE_MS,
@@ -85,11 +83,10 @@ describe.each(["file", "sqlite"] as const)("mirror lease renewal budget (%s)", b
     f.setTime(NOW + BRIDGE_LEASE_MS / 2 + 1);
     f.reset();
     await f.side.mirror(f.presence());
-    expect(f.counts().renames).toBe(0);
-    if (backend === "sqlite") expect(f.counts().locks).toBe(0);
+    expect(f.counts()).toEqual({ renames: 0, locks: 0 });
   }, 60_000);
 
-  it.each(["host", "participant"] as const)("renews a changed %s immediately without rewriting the 113 unchanged leases", async kind => {
+  it.each(["host", "participant"] as const)("renews a changed %s immediately without locking the 113 unchanged leases", async kind => {
     const f = fixture(backend);
     await f.side.mirror(f.presence());
     const changed = f.hosts[0]!;
@@ -99,6 +96,8 @@ describe.each(["file", "sqlite"] as const)("mirror lease renewal budget (%s)", b
     f.reset();
     await f.side.mirror(f.presence());
     expect(f.counts().renames).toBe(1);
+    // One receipt for the changed row's commit and one for its lease effect; no fleet sweep.
+    expect(f.counts().locks).toBeLessThanOrEqual(2);
     expect(readHostLeaseCurrent(f.store.root, changed.id)).toMatchObject({
       expiresAt: NOW + 1_000 + BRIDGE_LEASE_MS, mirror: { observedAt: NOW + 1_000 },
     });

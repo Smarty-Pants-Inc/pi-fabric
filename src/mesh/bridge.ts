@@ -9,7 +9,7 @@ import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
 import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, hostLeaseDirectoryStamp, readHostLease, readHostLeaseCurrent, readHostLeases, removeHostLeaseIf, sameHostLeaseVersion, STATE_LEASE_RENEW_MS, withHostLeaseDirectoryCustody, writeHostLeaseVersionIf } from "../topology/host-leases.js";
-import { withHostLeaseFileCustody } from "../topology/host-lease-lock.js";
+import { hostLeaseAdditionsGatePath, withHostLeaseFileCustody } from "../topology/host-lease-lock.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
@@ -2181,18 +2181,32 @@ export class StoreBridgeSide implements BridgeSide {
     let effectBusy: { error: unknown } | undefined;
     let retiredRecovery = false;
     const custodyAuthorityIds = new Set(incomingAuthorityIds);
-    for (const entry of lockFreeView ? lockFreeView.listAll(BRIDGE_HANDOFF_PREFIX) : this.store.listAll(BRIDGE_HANDOFF_PREFIX)) {
+    const custodyHandoffs = lockFreeView ? lockFreeView.listAll(BRIDGE_HANDOFF_PREFIX) : this.store.listAll(BRIDGE_HANDOFF_PREFIX);
+    for (const entry of custodyHandoffs) {
       const handoff = bridgeHandoffOf(entry);
       if (handoff) custodyAuthorityIds.add(handoff.id);
     }
-    // Hold only the additions gates and file receipts that can affect these incoming identities.
-    // Unrelated native heartbeat files remain writable while all mirror batches share this plan.
-    // A pass with no incoming id and no handoff row (an empty presence: this link's own omissions)
-    // reads no participant file or lease for any decision, so it takes no directory custody, as main
-    // took none; its unlease effects still run under their own host gates.
+    // Keep participant/additions custody, but take per-host receipts only for rows the batch
+    // changes, below. Unchanged lease renewals take only their effect's gate, and healthy leases
+    // take none. Handoff decisions retain the existing broader, liveness-sensitive custody.
     const withMirrorCustody = (operation: () => Promise<void>): Promise<void> => custodyAuthorityIds.size === 0 ? operation()
-      : withParticipantFileDirectoryCustody(this.store,
-        () => withHostLeaseDirectoryCustody(this.store, operation, custodyAuthorityIds), custodyAuthorityIds);
+      : withParticipantFileDirectoryCustody(this.store, () => custodyHandoffs.length > 0
+        ? withHostLeaseDirectoryCustody(this.store, operation, custodyAuthorityIds)
+        : this.store.leaseCustody(hostLeaseAdditionsGatePath(this.store.root), operation), custodyAuthorityIds);
+    const rowLeaseIds = (ops: readonly MeshBatchOperation[], renewals: readonly BridgeLease[], gone: readonly BridgeUnlease[]): Set<string> => {
+      const keys = new Set(ops.map(op => op.key));
+      return new Set([
+        ...renewals.filter(lease => keys.has(keyFor(HOST_PREFIX, lease.id)) || keys.has(keyFor(PARTICIPANT_PREFIX, lease.id))).map(lease => lease.id),
+        ...gone.filter(lease => keys.has(lease.key)).map(lease => lease.id),
+      ]);
+    };
+    const withRowLeaseCustody = (ids: ReadonlySet<string>, operation: () => Promise<void>): Promise<void> => {
+      if (custodyHandoffs.length > 0) return operation(); // Already held in the stable namespace order.
+      const files = [...ids].map(id => hostLeasePath(this.store.root, id)).sort();
+      const acquire = (index: number): Promise<void> => index === files.length ? operation()
+        : this.store.leaseCustody(files[index]!, () => acquire(index + 1));
+      return acquire(0);
+    };
     await withMirrorCustody(async () => {
     for (;;) {
       let retries = 0;
@@ -2296,7 +2310,14 @@ export class StoreBridgeSide implements BridgeSide {
               return stamp !== undefined && (stamp === planned.leaseStamp ||
                 hostLeaseAuthorityStamp(this.store.root, planned.leaseAuthorityIds, planned.leaseJudgedAt) === planned.leaseAuthorityStamp);
             };
-            await this.store.writeBatch({
+            // File backends recompute under their writer lock, so select receipts on a fresh
+            // preliminary view and reject/retry below if that locked plan needs another receipt.
+            const rowPlan = activePlan ?? (() => {
+              const result = compute(committedStateView(this.store), files ?? participantFileSnapshot(this.store.root), false);
+              return result && { remainingOps: result.ops, leases: result.leases, removed: result.removed };
+            })();
+            const lockedLeaseIds = rowPlan ? rowLeaseIds(rowPlan.remainingOps.slice(0, mirrorStateBatchSize), rowPlan.leases, rowPlan.removed) : new Set<string>();
+            await withRowLeaseCustody(lockedLeaseIds, () => this.store.writeBatch({
               identity: this.#identity(),
               lockClass: "bridge",
               lockTiming: planRevision !== undefined
@@ -2331,6 +2352,9 @@ export class StoreBridgeSide implements BridgeSide {
                 removed = current.removed;
                 const fullOps = current.remainingOps;
                 const stateOps = fullOps.slice(0, mirrorStateBatchSize);
+                if (custodyHandoffs.length === 0 && [...rowLeaseIds(stateOps, leases, removed)].some(id => !lockedLeaseIds.has(id))) {
+                  throw new MirrorPlanStale();
+                }
                 batchStateOps = stateOps;
                 const stateKeys = new Set(stateOps.map(op => op.key));
                 let batchLeases = leases.filter(lease => stateKeys.has(keyFor(HOST_PREFIX, lease.id)) &&
@@ -2375,7 +2399,7 @@ export class StoreBridgeSide implements BridgeSide {
                 });
               },
               ...(planRevision !== undefined && activePlan ? { beforeCommit: () => {
-                if (leaseStamp === undefined ||
+                if (leaseStamp === undefined || !consultedLeasesUnchanged(activePlan!) ||
                   (judgesLeaseLiveness && !leaseLivenessUnchanged(activePlan!.livenessWindow, this.now()))) throw new MirrorPlanStale();
               } } : {}),
               commitOutbox: ({ view, results }) => {
@@ -2387,7 +2411,7 @@ export class StoreBridgeSide implements BridgeSide {
                   if (version !== undefined) activePlan.ownVersions.set(op.key, version);
                 }
               },
-            });
+            }).then(() => undefined));
             if (activePlan && planRevision !== undefined) {
               const committedRevision = this.store.stateRevision();
               if (committedRevision === undefined || !this.store.stateUnchangedSince(

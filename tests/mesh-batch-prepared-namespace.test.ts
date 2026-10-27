@@ -5,6 +5,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshArchive, MESH_ARCHIVE_CONFIG } from "../src/mesh/archive.js";
 import { FabricIdempotencyKeyReusedError } from "../src/mesh/control-idempotency.js";
+import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
+import { MeshLock } from "../src/mesh/mesh-lock.js";
+import * as receiptNamespace from "../src/mesh/receipt-namespace.js";
 import { MeshStore, type MeshEvent, type MeshPublishInput } from "../src/mesh/store.js";
 
 // Keep reason: data safety. Independent before-implementation regression checks at the real
@@ -23,6 +26,11 @@ const chain = (directory: string): string[] => {
   }
 };
 const sorted = (values: string[]) => [...values].sort();
+const deferred = () => {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+};
 const physical = (file: fs.PathLike | number): string => {
   const name = typeof file === "number" ? fs.readlinkSync(`/proc/self/fd/${file}`) : String(file);
   try { return path.join(fs.realpathSync(path.dirname(name)), path.basename(name)); }
@@ -237,6 +245,119 @@ describe.skipIf(process.platform !== "linux")("MeshStore.publishBatch: prepared 
       expect(sorted(dirs(ownLive))).toEqual(sorted(liveChain));
     }
     assertStored(f, result); preparedBeforeLock(f, ops);
+  });
+
+  it("interleaved batch publishers revalidate a conflicting namespace before committing exactly once in lock order", async () => {
+    const f = await fixture();
+    const competitor = new MeshStore(f.root, 65536, 1000, { canWakeResidents: () => false }); stores.push(competitor);
+    const ops = observe(f), prepared: Array<ReturnType<typeof receiptNamespace.prepareKeyedPublishNamespace>> = [];
+    const prepare = receiptNamespace.prepareKeyedPublishNamespace;
+    vi.spyOn(receiptNamespace, "prepareKeyedPublishNamespace").mockImplementation(root => {
+      const proof = prepare(root); expect(proof.receiptNamespace).toBeDefined(); prepared.push(proof); return proof;
+    });
+    // Pause only at the acquisition boundary, forwarding the real lock/commit/release after
+    // each gate opens. Both invocations finish off-lock preparation before either may acquire.
+    const gates = [deferred(), deferred()];
+    const ready = deferred(), boundaries: number[] = [];
+    const withLock = MeshLock.prototype.withLock;
+    const locks = vi.spyOn(MeshLock.prototype, "withLock").mockImplementation(async function<T>(
+      this: MeshLock, operation: () => T, timeout?: number, lockClass?: Parameters<MeshLock["withLock"]>[2],
+      bounded?: boolean, timing?: Parameters<MeshLock["withLock"]>[4],
+    ): Promise<T> {
+      if (this.root === f.root && boundaries.length < 2) {
+        const turn = boundaries.length; boundaries.push(ops.length);
+        expect(fs.existsSync(path.join(f.root, ".lock"))).toBe(false);
+        if (boundaries.length === 2) ready.resolve();
+        await gates[turn]!.promise;
+      }
+      return withLock.call(this, operation, timeout, lockClass, bounded, timing) as Promise<T>;
+    });
+    const firstInputs = [keyed("competing-a"), keyed("competing-b")];
+    const secondInputs = [keyed("competing-c"), keyed("competing-d")];
+    const first = f.mesh.publishBatch(firstInputs), second = competitor.publishBatch(secondInputs);
+    try {
+      await ready.promise;
+      expect(prepared).toHaveLength(2);
+      expect(prepared[0]!.receiptNamespace!.key).toBe(prepared[1]!.receiptNamespace!.key);
+      for (const [start, end] of [[0, boundaries[0]!], [boundaries[0]!, boundaries[1]!]]) {
+        const preparation = ops.slice(start, end);
+        expect(preparation.every(o => !o.held)).toBe(true);
+        expect(sorted(dirs(preparation))).toEqual(sorted(fullReceiptChain(f)));
+        expect(preparation.some(o => ["lock", "append", "rename"].includes(o.kind))).toBe(false);
+      }
+      gates[0]!.resolve();
+      const winner = await first;
+      expect(winner.map(e => e.sequence)).toEqual([2, 3]); assertStored(f, winner);
+      for (const event of winner) strictProtocol(f, ops, event);
+      // Change identity while the other publisher still holds its old proof, preserving every
+      // winner receipt. Keeping the old directory alive excludes accidental inode reuse.
+      expect(fs.existsSync(path.join(f.root, ".lock"))).toBe(false);
+      const oldIdentity = fs.statSync(f.receipts);
+      fs.renameSync(f.receipts, `${f.receipts}-old`); fs.mkdirSync(f.receipts);
+      for (const name of fs.readdirSync(`${f.receipts}-old`)) fs.renameSync(path.join(`${f.receipts}-old`, name), path.join(f.receipts, name));
+      expect(fs.statSync(f.receipts).ino).not.toBe(oldIdentity.ino);
+      const delayedStart = ops.length;
+      gates[1]!.resolve();
+      const delayed = await second, delayedOps = ops.slice(delayedStart);
+      expect(delayed.map(e => e.sequence)).toEqual([4, 5]);
+      expect(prepared).toHaveLength(2); // No new proof hides the stale-proof fallback.
+      expect(ops.filter(o => o.kind === "lock")).toHaveLength(2);
+      for (const event of delayed) {
+        strictProtocol(f, delayedOps, event);
+        for (const phase of [0, 1, 2]) expect(sorted(indexDirs(delayedOps, event.sequence, phase))).toEqual(sorted(chain(f.leaf)));
+        expect(sorted(dirs(delayedOps.filter(o => o.held && o.operation === "live" && o.sequence === event.sequence)))).toEqual(sorted(chain(f.real)));
+        for (const action of ["intent", "receipt", "unlink"]) {
+          expect(sorted(dirs(delayedOps.filter(o => o.held && o.sequence === event.sequence && o.action === action)))).toEqual(sorted(fullReceiptChain(f)));
+        }
+      }
+      const all = [...winner, ...delayed]; assertStored(f, all);
+      expect(liveEvents(f).slice(1)).toEqual(all); expect(f.mesh.latestSequence()).toBe(5);
+      expect(fs.existsSync(path.join(f.root, ".lock"))).toBe(false);
+      locks.mockRestore();
+      const bytes = fs.readFileSync(f.live, "utf8");
+      expect(await f.mesh.publishBatch(firstInputs)).toEqual(winner);
+      expect(await competitor.publishBatch(secondInputs)).toEqual(delayed);
+      expect(fs.readFileSync(f.live, "utf8")).toBe(bytes); assertStored(f, all);
+    } finally {
+      for (const gate of gates) gate.resolve();
+      await Promise.allSettled([first, second]);
+    }
+  });
+
+  it("an abort after successful namespace preparation throws before locking without partial state or leaked intent; following publish works", async () => {
+    const f = await fixture(), ops = observe(f), controller = new AbortController();
+    const inputs = [keyed("after-preparation-a"), keyed("after-preparation-b")];
+    const sequence = f.mesh.latestSequence();
+    const snapshot = () => [f.real, f.archive].map(directory => fs.readdirSync(directory, { recursive: true })
+      .map(name => String(name)).sort().filter(name => fs.statSync(path.join(directory, name)).isFile())
+      .map(name => [name, fs.readFileSync(path.join(directory, name), "hex")]));
+    const before = snapshot(), prepare = receiptNamespace.prepareKeyedPublishNamespace;
+    const failure = new Error("batch-aborted-after-preparation");
+    const preparation = vi.spyOn(receiptNamespace, "prepareKeyedPublishNamespace").mockImplementationOnce(root => {
+      const proof = prepare(root);
+      expect(proof.receiptNamespace).toBeDefined();
+      expect(fs.existsSync(path.join(f.root, ".lock"))).toBe(false);
+      expect(sorted(dirs(ops))).toEqual(sorted(fullReceiptChain(f)));
+      // Return the genuine completed proof; the real pre-lock input check throws next.
+      controller.abort(failure); return proof;
+    });
+    await expect(f.mesh.publishBatch(inputs.map(input => ({ ...input, signal: controller.signal })))).rejects.toBe(failure);
+    expect(preparation).toHaveBeenCalledTimes(1);
+    expect(ops.every(o => !o.held)).toBe(true);
+    expect(ops.some(o => ["lock", "append", "rename"].includes(o.kind))).toBe(false);
+    expect(fs.existsSync(path.join(f.root, ".lock"))).toBe(false);
+    expect(fs.readdirSync(meshLockQueueDirectory(f.root))).toEqual([]);
+    expect(snapshot()).toEqual(before); expect(f.mesh.latestSequence()).toBe(sequence);
+    for (const input of inputs) for (const pending of [false, true]) expect(fs.existsSync(receipt(f, input.dedupeKey!, pending))).toBe(false);
+    const result = await f.mesh.publishBatch(inputs);
+    expect(preparation).toHaveBeenCalledTimes(2); // A fresh invocation prepares again, not a leaked proof.
+    expect(result.map(e => e.sequence)).toEqual([sequence + 1, sequence + 2]);
+    for (const event of result) strictProtocol(f, ops, event);
+    assertStored(f, result);
+    const bytes = fs.readFileSync(f.live, "utf8");
+    expect(await f.mesh.publishBatch(inputs)).toEqual(result);
+    expect(fs.readFileSync(f.live, "utf8")).toBe(bytes); assertStored(f, result);
+    expect(fs.existsSync(path.join(f.root, ".lock"))).toBe(false);
   });
 
   it("off-lock preparation fsync EIO rejects before lock, reservation, archive writes, or append; retry is exact-once", async () => {

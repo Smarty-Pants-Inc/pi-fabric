@@ -130,12 +130,13 @@ const fixture = async () => {
     await vi.waitFor(() => expect(port.resolve(POD)?.route.live).toBe(false));
     expect(port.resolve(POD)).toMatchObject({ leaseLapsed: true, presenceFailure: "expired", remainingAuthorityMs: expect.any(Number) });
   };
-  const restart = async () => {
+  const restart = async (accelerate = true) => {
     // A real broker NAK accelerates crash redelivery, without changing its ID/sequence or dedupe.
-    for (const delivery of deliveries) delivery.nak(250);
+    if (accelerate) for (const delivery of deliveries) delivery.nak(250);
     await link.bridge.stop(); await port.close(); await ledger.close();
     ledger = await openBridgeNatsLedger({ dir: path.join(dir, "ledger") });
-    port = await openPort(); link = make(); await link.bridge.start(); await pending();
+    port = await openPort(); link = make(); await link.bridge.start();
+    if (accelerate) await pending();
   };
   const close = async () => {
     abort.abort(); await reading;
@@ -378,6 +379,85 @@ describe.skipIf(!binary)("NATS carrier sender lease-lapse", () => {
       expect(f.events()).toEqual([]);
     } finally { await f.close(); }
   }, 30_000);
+
+  it("restart with later-before-earlier redelivery keeps the original deadline and refuses at it", async () => {
+    const f = await fixture();
+    let refresh: ReturnType<typeof setInterval> | undefined;
+    try {
+      const original = f.envelope();
+      await f.pod.send(original); await f.pending(); await f.lapse();
+      await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+      refresh = setInterval(() => { void f.lease(POD, true); }, 5_000);
+      const saved = () => JSON.parse(fs.readFileSync(f.lapsePath, "utf8")).lapses as Array<{ id: string; startedAt: number }>;
+      const first = saved().find(lapse => lapse.id === original.id)!.startedAt;
+      // Reuse the review's real delayed NAK: B arrives while A is still pending at the broker.
+      const originalDelivery = f.deliveries.find(delivery => delivery.envelope.id === original.id)!;
+      originalDelivery.nak(20_000);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      await f.restart(false); await f.link.remote.latestSequence();
+      f.advance(10_000); f.hideTarget(true); await f.lease(OTHER);
+      await vi.waitFor(() => expect(f.port.resolve(OTHER)?.route.live).toBe(true));
+      const later = f.envelope(randomUUID(), OTHER, FILE, "later-wait");
+      await f.pod.send(later);
+      await vi.waitFor(() => expect(f.deliveries.some(delivery => delivery.envelope.id === later.id)).toBe(true), { timeout: 10_000 });
+      expect(f.deliveries.filter(delivery => delivery.envelope.id === original.id)).toHaveLength(1);
+      await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+      // Continue through redelivery even on the broken base, to observe its renewed window too.
+      expect.soft(saved().find(lapse => lapse.id === original.id)?.startedAt).toBe(first);
+      await vi.waitFor(() => expect(f.deliveries.filter(delivery => delivery.envelope.id === original.id)).toHaveLength(2), { timeout: 25_000 });
+      const redelivered = f.deliveries.filter(delivery => delivery.envelope.id === original.id)[1]!;
+      await f.lease(OTHER);
+      await vi.waitFor(() => expect(f.port.resolve(OTHER)?.route.live).toBe(true));
+      expect(redelivered.streamSequence).toBe(originalDelivery.streamSequence);
+      const term = vi.spyOn(redelivered, "term");
+      f.advance(WINDOW - 1 - (f.clock() - first));
+      await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+      expect.soft(saved().find(lapse => lapse.id === original.id)?.startedAt).toBe(first);
+      expect(term).not.toHaveBeenCalled();
+      f.advance(1);
+      // B still waits; A must nevertheless be terminal at its own original deadline.
+      await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+      expect(term).toHaveBeenCalledExactlyOnceWith(REFUSAL);
+      expect(f.clock() - first).toBe(WINDOW);
+      expect(f.logs.filter(line => line.includes(original.id) && line.includes("refused"))).toHaveLength(1);
+      expect(f.events()).toEqual([]); expect(f.receive).not.toHaveBeenCalled();
+    } finally { clearInterval(refresh); await f.close(); }
+  }, 60_000);
+
+  it("directory-not-ready uses the same deadline, including a first gap and a restarted established lapse", async () => {
+    for (const established of [true, false]) {
+      const f = await fixture();
+      let unavailable: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        const original = f.envelope(); await f.pod.send(original); await f.pending();
+        if (established) {
+          await f.lapse();
+          await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+          await f.restart();
+        }
+        unavailable = vi.spyOn(f.port, "resolve").mockImplementation(() => { throw new DirectoryNotReadyError("watch gap"); });
+        await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+        expect(fs.existsSync(f.lapsePath), "an initial directory gap must persist its first lapse too").toBe(true);
+        const retained = fs.readFileSync(f.lapsePath, "utf8");
+        const first = JSON.parse(retained).lapses[0].startedAt as number;
+        const delivery = f.deliveries.filter(delivery => delivery.envelope.id === original.id).at(-1)!;
+        const term = vi.spyOn(delivery, "term");
+        f.advance(WINDOW - 1 - (f.clock() - first));
+        await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+        expect(term).not.toHaveBeenCalled();
+        expect(fs.readFileSync(f.lapsePath, "utf8")).toBe(retained);
+        f.advance(1);
+        await expect(f.link.remote.read(0)).resolves.toMatchObject({ events: [] });
+        expect(term).toHaveBeenCalledOnce();
+        expect(f.clock() - first).toBe(WINDOW);
+        expect(f.logs.filter(line => line.includes(original.id) && line.includes("refused") && line.includes("predicate=not-ready"))).toHaveLength(1);
+        f.advance(60_000);
+        await expect(f.link.remote.read(0)).resolves.toMatchObject({ events: [] });
+        expect(term).toHaveBeenCalledOnce();
+        expect(f.events()).toEqual([]); expect(f.receive).not.toHaveBeenCalled();
+      } finally { unavailable?.mockRestore(); await f.close(); }
+    }
+  }, 60_000);
 
   it("working-extends beyond AckWait without exhausting MaxDeliver; expiry TERMs once with no redelivery loop", async () => {
     const f = await fixture();

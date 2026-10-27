@@ -363,7 +363,11 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     for (const listener of this.#listeners) listener.changed(kind);
   }
 
-  #release(stream: number): void {
+  #release(stream: number, acknowledged = false): void {
+    // Only a broker-confirmed ACK proves completion. A missing process-local handle (including
+    // after restart), or an unconfirmed TERM, must never erase a delivery's original deadline.
+    // Persist this safe reclamation with the next first-lapse write, not on unchanged retries.
+    if (acknowledged) this.#senderLeaseLapses = this.#senderLeaseLapses.filter(lapse => lapse.sequence !== stream);
     this.#inHand.delete(stream);
     if (this.#inHand.size < this.#maxInHand && this.#room) {
       const room = this.#room;
@@ -589,11 +593,15 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     let plan: NatsInbound;
     try { plan = await this.carrier.inbound(carrierDeliveryFromPort(delivery)); }
     catch (error) {
-      if ((error as { code?: unknown })?.code === "FABRIC_DIRECTORY_NOT_READY" && held.senderFailure !== "not-ready") {
+      if ((error as { code?: unknown })?.code !== "FABRIC_DIRECTORY_NOT_READY") throw error;
+      if (held.senderFailure !== "not-ready") {
         this.#log("toFile: sender-live wait predicate=not-ready remainingAuthorityMs=unknown");
         held.senderFailure = "not-ready";
       }
-      throw error;
+      // Directory readiness is another lapse, not an unbounded escape around the event's
+      // durable first-lapse deadline. No unverified sender identity belongs in this diagnostic.
+      plan = { kind: "wait", reason: "directory is not ready", senderLeaseLapse: true,
+        senderDiagnostic: { failure: "not-ready" } };
     }
     const diagnostic = plan.kind === "wait" || plan.kind === "refused" ? plan.senderDiagnostic : undefined;
     const detail = diagnostic ? `; predicate=${diagnostic.failure}` +
@@ -619,7 +627,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
         await this.#send(plan.envelope);
         this.#log(`toFile: answered ${envelopeId} for the hop: ${plan.reason}`);
         await delivery.ack();
-        this.#release(stream);
+        this.#release(stream, true);
         return undefined;
       case "settled": {
         if (plan.settle) await this.carrier.settle(plan.settle);
@@ -635,7 +643,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
           }
         }
         await delivery.ack();
-        this.#release(stream);
+        this.#release(stream, true);
         return undefined;
       }
       case "wait": {
@@ -665,8 +673,9 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     if (saved) return saved.startedAt;
     const lapse: SenderLeaseLapse = { sequence: delivery.streamSequence, id: delivery.envelope.id,
       sourceMachine: delivery.sourceMachine, senderId: delivery.envelope.from.id, startedAt: Math.min(startedAt, this.#now()) };
-    // Only forget an earlier, released boundary; never evict an active or not-yet-redelivered later one.
-    const lapses = this.#senderLeaseLapses.filter(saved => saved.sequence >= delivery.streamSequence || this.#inHand.has(saved.sequence));
+    // Redelivery order says nothing about settlement: keep every unconfirmed boundary,
+    // earlier or later, even when it has not yet reappeared in this process after restart.
+    const lapses = [...this.#senderLeaseLapses];
     if (lapses.length >= this.#maxInHand) throw new NatsCarrierDeferredError("sender lapse metadata is at its in-hand bound");
     lapses.push(lapse);
     writeJsonAtomic(this.#senderLapsePath, { v: 1, lapses }, { mode: 0o600, durable: true });
@@ -699,7 +708,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
         try { await this.carrier.settle(held.settle, true); }
         catch (error) { this.#log(`toFile: ledger settle for stream sequence ${stream} failed: ${message(error)}`); }
       }
-      this.#release(stream);
+      this.#release(stream, true);
     }
   }
 

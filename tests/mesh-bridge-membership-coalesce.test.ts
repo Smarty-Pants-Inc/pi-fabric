@@ -320,7 +320,7 @@ describe("real-store bridge membership refresh coalescing", () => {
   // harness timeout. The drain's correctness and zero-inline-sample assertions stay intact.
   }, 90_000);
 
-  it("retains an expired peer mirror until the coalesced sample proves absence", async () => {
+  it("retains an expired peer mirror behind an unknown miss until the coalesced sample proves absence", async () => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const f = await fixture(() => now);
@@ -328,41 +328,55 @@ describe("real-store bridge membership refresh coalescing", () => {
     const expiredPeer = sid("expired-peer");
     await addNative(f.far, "expired-peer", now + 500, expiredPeer);
     await addPartialMarker(f.far);
-    const debug: string[] = [];
-    const run = await startNotifyingBridge(f, f.remote, line => debug.push(line));
-    await quiet(() => run.syncs.mock.calls.length);
+    const bridge = bridgeFor(f);
+    await bridge.start();
+    cleanups.push(() => bridge.stop());
     now += 501;
+    // Settle the ordinary expiry sample first. The old run()+step() fixture raced
+    // watcher/expiry samples, any of which could correctly release its boundary.
+    await bridge.syncPresence();
     expect(f.local.mirrored(expiredPeer)).toBe(true);
     expect(f.local.holds(expiredPeer)).toBe(false);
     expect((await f.local.owned()).hosts.map(host => host.record.id)).not.toContain(expiredPeer);
 
+    // #2761 keeps a known mirror's refresh inline; an UNKNOWN predecessor owns this
+    // coalesced hold. Drive only step(), and gate the actual sample, not a debug line.
+    const held = await work(f.hub, hubLead, sid("unknown-before-expired"), "unknown-retained-boundary");
+    const event = await work(f.hub, hubLead, expiredPeer, "expired-peer-must-refresh");
+    const sampled = deferred<void>();
+    const releaseSample = deferred<void>();
+    cleanups.push(() => releaseSample.resolve());
     const cursorAtSample: number[] = [];
     const originalPresence = f.remote.presence.bind(f.remote);
     const actualSamples = vi.spyOn(f.remote, "presence").mockImplementation(async () => {
       cursorAtSample.push(cursor(f.cursorPath).toRemote.after);
-      return originalPresence();
+      const snapshot = await originalPresence();
+      sampled.resolve();
+      await releaseSample.promise;
+      return snapshot;
     });
-    const syncBefore = run.syncs.mock.calls.length;
-    const samplesBefore = actualSamples.mock.calls.length;
-    const event = await work(f.hub, hubLead, expiredPeer, "expired-peer-must-refresh");
-    // Wait for the miss to arm its trailing deadline before moving the clock; merely
-    // observing the old cursor can succeed before the notification drain has run.
-    await until(() => debug.some(line => line.includes("membership pending") && line.includes(event.id)),
-      "expired peer miss armed its retained boundary");
-    expect(cursor(f.cursorPath).toRemote.after).toBeLessThan(event.sequence);
+    expect(await bridge.step()).toMatchObject({ toRemote: 0, dropped: 0 });
+    expect(actualSamples).not.toHaveBeenCalled();
+    expect(cursor(f.cursorPath).toRemote.after).toBeLessThan(held.sequence);
     now += 15_000;
-    await run.bridge.step();
-    expect(run.syncs.mock.calls.length).toBeGreaterThan(syncBefore);
-    expect(actualSamples.mock.calls.length).toBeGreaterThan(samplesBefore);
-    await until(() => cursor(f.cursorPath).toRemote.after >= event.sequence,
-      "expired-peer event reached its durable source cursor");
+    const draining = bridge.step();
+    try {
+      await sampled.promise;
+      expect(cursor(f.cursorPath).toRemote.after).toBeLessThan(held.sequence);
+      expect(cursor(f.cursorPath).toRemote.after).toBeLessThan(event.sequence);
+      expect(f.local.mirrored(expiredPeer)).toBe(true);
+      expect(deliveredFromHub(f.far)).toEqual([]);
+    } finally { releaseSample.resolve(); }
+    expect(await draining).toMatchObject({ toRemote: 0, dropped: 0 });
 
-    expect(cursorAtSample.some(after => after < event.sequence)).toBe(true);
-    expect(deliveredFromHub(f.far).some(delivered => bridgeStampId(delivered) === event.id)).toBe(false);
+    expect(actualSamples).toHaveBeenCalledTimes(2); // Coalesced unknown, then inline known mirror.
+    expect(cursorAtSample.every(after => after < event.sequence)).toBe(true);
+    expect(deliveredFromHub(f.far)).toEqual([]);
     expect(cursor(f.cursorPath).toRemote.after).toBe(event.sequence);
     expect(f.local.mirrored(expiredPeer)).toBe(true);
     expect(f.local.holds(expiredPeer)).toBe(false);
-    expect(run.failure()).toBeUndefined();
+    await bridge.step();
+    expect(actualSamples).toHaveBeenCalledTimes(2);
   });
 
   it("coalesces a 50-event notification-mode page for a foreign session and delivers after it joins this link", async () => {

@@ -937,8 +937,8 @@ describe("ParticipantDirectory host leases", () => {
   it("all-new peers need no periodic shared record renewal, even under the old policy", async () => {
     const { hostEntry, alpha, meshRoot } = await setup(true);
     const shared = hostEntry()!;
-    const now = Date.now;
-    const clock = vi.spyOn(Date, "now").mockImplementation(() => now() + STATE_LEASE_RENEW_MS);
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + STATE_LEASE_RENEW_MS);
     try {
       await alpha.refresh();
       expect(hostEntry()).toEqual(shared);
@@ -1328,7 +1328,7 @@ describe("ParticipantDirectory", () => {
     const directory = createDirectory(path.join(root, "mesh"), identity, identity.id, () => [
       rootRecord(identity.id, identity.id, "quiesce"),
       agentRecord("agent:quiesce", identity.id, identity.id, identity.id),
-    ]);
+    ], steadyLease);
 
     await directory.start();
     await directory.quiesce();
@@ -1344,7 +1344,7 @@ describe("ParticipantDirectory", () => {
     const observerIdentity: MeshIdentity = { id: "session:observer", name: "main", kind: "main", sessionId: "observer" };
     const observer = createDirectory(path.join(root, "mesh"), observerIdentity, observerIdentity.id, () => [
       rootRecord(observerIdentity.id, observerIdentity.id, "observer"),
-    ]);
+    ], steadyLease);
     await observer.start();
     expect(observer.peers().map((peer) => peer.id)).toContain(identity.id);
     await observer.close();
@@ -1742,7 +1742,8 @@ describe("ParticipantDirectory", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
     roots.push(root);
     const identity: MeshIdentity = { id: "session:alpha", name: "main", kind: "main", sessionId: "alpha" };
-    const directory = createDirectory(path.join(root, "mesh"), identity, identity.id, () => [rootRecord(identity.id, identity.id, "alpha")]);
+    const directory = createDirectory(path.join(root, "mesh"), identity, identity.id, () => [rootRecord(identity.id, identity.id, "alpha")],
+      { heartbeatMs: 5_000, leaseMs: 15_000 });
     await directory.start();
     await vi.waitFor(() => expect(directory.list({ scope: "project" })).toHaveLength(1), { timeout: 5_000, interval: 50 });
     expect(directory.lastKnown(identity.id)).toBeUndefined();                     // live
@@ -1941,12 +1942,13 @@ describe("ParticipantDirectory", () => {
   };
   const seesPeer = (directory: ParticipantDirectory) => directory.peers().some((peer) => peer.id === "session:peer");
 
-  it("never settles a peer that lapsed behind a stalled lock, and reports it before the lock timeout", async () => {
+  it("never settles a stalled peer behind a stalled lock, and reports it before the lock timeout", async () => {
     const { reader, peer, hold, release } = meshPair({ heartbeatMs: 600, leaseMs: 20_000 }, { heartbeatMs: 100, leaseMs: 400 });
     await Promise.all([reader.start(), peer.start()]);
     await vi.waitFor(() => expect(seesPeer(reader)).toBe(true), { timeout: 5_000, interval: 20 });
     await vi.waitFor(() => expect(Date.now() - reader.confirmedAt()).toBeLessThan(40), { timeout: 5_000, interval: 5 });
     hold();                                                    // right after the reader's last commit
+    peer.suspend(); // A genuinely stalled renewer lapses; mesh contention alone must no longer expire it.
     const started = Date.now();
     let result: PeerSettleResult | undefined;
     void awaitPeerSettle({
@@ -1980,6 +1982,7 @@ describe("ParticipantDirectory", () => {
     await vi.waitFor(() => expect(late).toEqual({ ok: false, error: expect.stringMatching(/peer lease lapsed/) }), { timeout: 2_000, interval: 20 });
     expect(Date.now() - started).toBeLessThan(5_000);          // long before the 10 s lock timeout
     release();
+    peer.resume();
     await vi.waitFor(() => expect(seesPeer(reader)).toBe(true), { timeout: 5_000, interval: 20 });
     await vi.waitFor(() => expect(reader.writeStalled()).toBeUndefined(), { timeout: 5_000, interval: 20 });
   }, 20_000);
@@ -1988,7 +1991,7 @@ describe("ParticipantDirectory", () => {
     const { reader, peer } = meshPair({ heartbeatMs: 100, leaseMs: 2_000 }, { heartbeatMs: 100, leaseMs: 400 });
     await Promise.all([reader.start(), peer.start()]);
     await vi.waitFor(() => expect(seesPeer(reader)).toBe(true), { timeout: 5_000, interval: 20 });
-    vi.spyOn(peer, "refresh").mockResolvedValue(undefined);    // the peer crashes: no renewals, no cleanup
+    peer.suspend();                                        // the peer crashes: no renewals, no cleanup
     let flagged = false;
     const settled = awaitPeerSettle({
       poll: () => { if (reader.writeStalled()) flagged = true; return reader.peers(); },

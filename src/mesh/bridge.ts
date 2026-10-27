@@ -1571,6 +1571,7 @@ export class StoreBridgeSide implements BridgeSide {
   #fenced = false;
   #staleAdmission: BridgeStaleIncarnationError | undefined;
   #inflight: Promise<void> = Promise.resolve();
+  #leaseRenewal: Promise<void> = Promise.resolve();
   #hasCommittedPass = false;
   /** A lease effect under its host gate found newer lease authority on disk than its plan saw. */
   #leaseAuthorityAhead = false;
@@ -1597,10 +1598,49 @@ export class StoreBridgeSide implements BridgeSide {
     return run;
   }
 
+  /** Refresh only already-installed direct root leases, never membership or incarnations.
+   * A live watch may call this while a full mirror/drain is waiting. The existing per-host
+   * custody, current-row checks and exact file-version CAS still own every lease write. */
+  renewMirroredLeases(hosts: readonly BridgeHost[], observedAt: number): Promise<void> {
+    const run = this.#leaseRenewal.then(async () => {
+      if (this.#staleAdmission) throw this.#staleAdmission;
+      if (this.#fenced || !Number.isFinite(observedAt) || observedAt > this.now()) return;
+      for (const { record, expiresAt, observedAt: sourceObservedAt } of hosts) {
+        if (this.#fenced) return;
+        if (!isAdmissibleRecord("host", record) || remoteHostOf(record) !== undefined ||
+          record.id !== record.rootId || record.identity.id !== record.id ||
+          !Number.isFinite(sourceObservedAt) || !Number.isFinite(expiresAt) || expiresAt <= sourceObservedAt!) continue;
+        const until = observedAt + Math.min(BRIDGE_LEASE_MS, expiresAt - sourceObservedAt!);
+        if (until <= this.now() || this.now() - observedAt >= MIRROR_FRESH_MS) continue;
+        await withHostLeaseFileCustody(this.store, hostLeasePath(this.store.root, record.id), () => {
+          if (this.#fenced || until <= this.now()) return;
+          const entry = this.store.get(keyFor(HOST_PREFIX, record.id), { fresh: true });
+          const held = entry && mirrorLinkOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
+          // New/changed owners belong to full reconciliation, never this lease-only path.
+          if (!held || held.remoteHost !== this.peer || held.bridgeVia !== undefined || entry!.updatedBy.id !== record.id ||
+            held.rootId !== record.rootId || !sameIdentity(held.identity, record.identity) ||
+            held.incarnationToken === undefined || held.incarnationToken !== record.incarnationToken ||
+            participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, record.id)) || this.#reservedNow().has(record.id)) return;
+          const prior = readHostLeaseCurrent(this.store.root, record.id);
+          this.#applyLease({ id: record.id, rootId: held.rootId, identityId: held.identity.id, ...incarnationOf(held),
+            ...(held.bridgeSupersededTokens ? { bridgeSupersededTokens: held.bridgeSupersededTokens } : {}),
+            ...(held.bridgeSupersededTokenSeen ? { bridgeSupersededTokenSeen: held.bridgeSupersededTokenSeen } : {}),
+            updatedAt: record.updatedAt, expiresAt: until, mirrorLease: 1,
+            mirror: { remoteHost: this.peer, observedAt, sourceObservedAt: sourceObservedAt!,
+              sourceUpdatedAt: record.updatedAt, sourceExpiresAt: expiresAt,
+              ...(prior?.mirror?.bridgeProcess ? { bridgeProcess: prior.mirror.bridgeProcess } : {}) },
+          }, false, false);
+        });
+      }
+    });
+    this.#leaseRenewal = run.catch(() => undefined);
+    return run;
+  }
+
   async fence(): Promise<void> {
     this.#fenced = true;
     this.#ingressAbort.abort(new BridgeOwnershipError(`Bridge link ${this.peer} is fenced`));
-    await this.#inflight;
+    await Promise.all([this.#inflight, this.#leaseRenewal]);
   }
 
   async withdraw(): Promise<void> {
@@ -2435,7 +2475,8 @@ export class StoreBridgeSide implements BridgeSide {
     if (effectBusy && !halted()) throw effectBusy.error;
   }
 
-  #applyLease(lease: BridgeLease, replay: boolean): void {
+  // Independent watch renewals must not mutate a full mirror pass's authority-recheck latch.
+  #applyLease(lease: BridgeLease, replay: boolean, markAuthorityAhead = true): void {
     // The target lease gate is held by CommitOutbox. This fresh row/version and the staged row
     // stamp are checked after custody, never on the pre-commit snapshot.
     const key = keyFor(HOST_PREFIX, lease.id);
@@ -2467,7 +2508,7 @@ export class StoreBridgeSide implements BridgeSide {
     if (onDisk && (nativeLeaseLive(onDisk, this.now()) || (!isNonRootHostId(lease.id, lease.rootId) &&
       onDisk.incarnationToken !== undefined && onDisk.incarnationToken !== lease.incarnationToken &&
       !bridgeSupersededTokensOf(lease.bridgeSupersededTokens).includes(onDisk.incarnationToken)))) {
-      this.#leaseAuthorityAhead = true;
+      if (markAuthorityAhead) this.#leaseAuthorityAhead = true;
       return;
     }
     // Recovery must not erase newer file authority while its state row is still catching up.
@@ -2475,7 +2516,7 @@ export class StoreBridgeSide implements BridgeSide {
       // Disk history is local proof that this outbox token was superseded. An old recovery
       // effect must not restore it over newer on-disk authority.
       if (olderBridgeIncarnation(lease, bridgeSupersededTokensOf(onDisk.bridgeSupersededTokens))) {
-        this.#leaseAuthorityAhead = true;
+        if (markAuthorityAhead) this.#leaseAuthorityAhead = true;
         return;
       }
       // A pending same-token effect may predate the disk's age floor even when it still

@@ -61,11 +61,12 @@ const DEFAULT_MEMBERSHIP_RETRY_MS = 1_000;
  * that head-of-line delay is accepted (an operator override changes the bound). */
 const UNADDRESSED_REFRESH_MS = 15_000;
 
-/** Parse an integer millisecond override; malformed/unset values keep the default. */
+/** Parse an integer millisecond override, clamped to 5,000–150,000 ms (below the
+ * 180,000 ms directional stall bound); malformed/unset values keep the default. */
 export const parseBridgeUnaddressedRefreshMs = (value: string | undefined): number => {
   if (value === undefined || !/^[+-]?\d+$/.test(value.trim())) return UNADDRESSED_REFRESH_MS;
   const parsed = Number(value);
-  return Number.isSafeInteger(parsed) ? Math.max(5_000, Math.min(300_000, parsed)) : UNADDRESSED_REFRESH_MS;
+  return Number.isSafeInteger(parsed) ? Math.max(5_000, Math.min(150_000, parsed)) : UNADDRESSED_REFRESH_MS;
 };
 /** A missed change notification is only a safety net: its retry backs off to this bound. */
 const MEMBERSHIP_RETRY_MAX_MS = 30_000;

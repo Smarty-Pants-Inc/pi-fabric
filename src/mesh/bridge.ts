@@ -4808,7 +4808,7 @@ export class MeshBridge {
             (event.data === undefined || isObject(event.data)) && !this.#destinationRefusal(event, direction)) {
             this.#unaddressedSequence = event.sequence;
             this.#deferMembership(direction, event);
-            this.#membershipRetryAt[direction] = this.#unaddressedRefreshAt;
+            this.#membershipRetryAt[direction] = this.#unaddressedRefreshAt ?? Date.now() + this.#unaddressedRefreshMs;
             if (cursor.after > start) this.#save();
             return { forwarded, dropped };
           }

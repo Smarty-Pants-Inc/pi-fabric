@@ -942,6 +942,23 @@ export class ResidentHost {
           binding: { launchAttestation: this.#trustedLaunchAttestation, launcher: this.launch.launcher,
             child: { pid: process.pid, processStartTime: birth }, generation: this.#token } });
       }
+      // Actor managers load their queues during initialization. Register custom
+      // runners first, before any recovered activation can become runnable.
+      const actorModules = new Set<string>();
+      for (const root of new Set(Object.values(residentActorRoots(this.config)))) {
+        for (const actor of new ActorRegistryStore(root).snapshot().actors) {
+          if (actor.residency === "durable" && actor.rootId === this.config.rootId && typeof actor.runnerModule === "string") {
+            actorModules.add(actor.runnerModule);
+          }
+        }
+      }
+      for (const module of actorModules) {
+        await loadRunnerModule(module).catch(error => {
+          // Retain identity and queued work; never substitute Pi for a runner
+          // that cannot be loaded. Activation reports the unavailable adapter.
+          diagnostics.warn("src/residency/host.ts", `[pi-fabric] Actor runner module ${module}: ${errorMessage(error)}`);
+        });
+      }
       if (this.config.mesh.transport === "nats") {
         const transportStateDir = await this.#prepareNatsTransport();
         await this.#initialize(transportStateDir);
@@ -2810,6 +2827,7 @@ export class ResidentHost {
         if (command.request.residency !== "durable") {
           throw new Error("Resident host createActor only supports durable residency");
         }
+        if (command.runnerModule) await loadRunnerModule(command.runnerModule);
         // This handler already runs inside the authoritative durable host.
         // Keep the new actor locally owned; ceding it here created a needless
         // self-transfer window that blocked the next recruitment request.

@@ -34,6 +34,7 @@ import type { FabricParticipantRecord, FabricParticipantResidency } from "../top
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
 import { AgentLaunchPreparationTimeoutError, AgentManager, validAgentExceptionLane, type AgentAdmittedExceptionLane, type AgentExceptionLane } from "../agents/manager.js";
 import { FabricModelExceptionDeniedError } from "../agents/model-policy-log.js";
+import { isFabricRunnerId, requireActorRunner } from "../agents/runner-registry.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult, AgentRunStopCaller, AgentRunStopPath } from "../agents/types.js";
 import { isRecoveredDurableStop } from "../agents/enodev-recovery.js";
 import type { ModelRouteDecision } from "../agents/model-route.js";
@@ -250,6 +251,8 @@ interface ManagedActor extends FabricActorBatching {
   lastFilteredAt?: number;
   residency: FabricParticipantResidency;
   runner: FabricAgentRunner;
+  /** Host-derived registration module, retained for durable owner restarts. */
+  runnerModule?: string;
   kernel?: FabricKernel;
   pythonRuntime?: FabricPythonRuntime;
   runnerSessionId?: string;
@@ -1772,9 +1775,7 @@ export class ActorManager {
     const records = normalizeActorRecords(request.records);
     await validateActorValidWhile(request.validWhile);
     const runner = request.runner ?? this.agents.config.runner;
-    if (runner !== "pi" && runner !== "pi-durable" && runner !== "claude") {
-      throw new Error(`Invalid Fabric actor runner: ${String(request.runner)}`);
-    }
+    const runnerAdapter = requireActorRunner(runner, residency);
     validateActorInferenceContext(request.inferenceContext, runner);
     validateActorCoalesceKey(request.coalesceKey);
     validateActorDedupeKey(request.dedupeKey);
@@ -1851,6 +1852,7 @@ export class ActorManager {
       ...(deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs } : {}),
       residency,
       runner,
+      ...(residency === "durable" && runnerAdapter.residentModule ? { runnerModule: runnerAdapter.residentModule } : {}),
       ...(kernel ? { kernel } : {}),
       ...(pythonRuntime ? { pythonRuntime } : {}),
       ...(model ? { model } : {}),
@@ -7307,6 +7309,7 @@ export class ActorManager {
     capabilityRequirements?: string[],
     capabilityDigest?: string,
   ): AgentRunRequest {
+    requireActorRunner(actor.runner, actor.residency);
     const items = this.#batchItems(actor.id, item);
     // Neither a mixed batch nor collapsed history can borrow the primary sender's authority.
     const provenance = this.#runProvenance(actor, items);
@@ -7390,7 +7393,9 @@ export class ActorManager {
         ? "The Fabric host manages your mailbox, subscriptions, delivery, and lifecycle. You do not have fabric_exec or direct agents/mesh APIs; reply with your analysis and the host delivers it. Do not attempt to call fabric_exec, agents, or mesh tools."
         : actor.runner === "pi" || actor.runner === "pi-durable"
           ? "You may use Fabric for tools and durable coordination. In fabric_exec, agents.main() discovers the user-facing Main target; agents.steer() and agents.followUp() message Main or other known agents, while mesh.self(), mesh.members(), mesh.publish(), mesh.read(), mesh.get(), and mesh.put() support durable coordination. Use addressed messages or shared versioned state when useful."
-          : "The Fabric host manages your mailbox, subscriptions, delivery, and lifecycle. This Claude runner has Claude Code tools but not fabric_exec or direct mesh APIs; coordinate through the messages the host delivers.";
+          : actor.runner === "claude"
+            ? "The Fabric host manages your mailbox, subscriptions, delivery, and lifecycle. This Claude runner has Claude Code tools but not fabric_exec or direct mesh APIs; coordinate through the messages the host delivers."
+            : "The Fabric host manages your mailbox, subscriptions, delivery, and lifecycle. Use the tools supplied by your runner and coordinate through the messages the host delivers.";
     const capabilityInstruction = actor.requirements.length > 0
       ? `Your Fabric execution surface is closed to the committed capability refs: ${actor.requirements.map((requirement) => requirement.ref).join(", ")}. The host records and verifies a portable descriptor digest before each run.`
       : undefined;
@@ -9436,6 +9441,7 @@ export class ActorManager {
       coalesce: actor.coalesce,
       residency: actor.residency,
       runner: actor.runner,
+      ...(actor.runnerModule ? { runnerModule: actor.runnerModule } : {}),
       ...(actor.kernel ? { kernel: actor.kernel } : {}),
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
@@ -9985,6 +9991,7 @@ export class ActorManager {
       let principalScope: FabricScope | undefined;
       try {
         records = normalizeActorRecords(record.records);
+        if (record.runner !== undefined && !isFabricRunnerId(record.runner)) continue;
         validateActorInferenceContext(record.inferenceContext, record.runner ?? "pi");
         requirements = normalizeCapabilityRequirements(
           Array.isArray(record.requirements) ? record.requirements : [],
@@ -10022,10 +10029,11 @@ export class ActorManager {
         triggerTurn,
         coalesce: record.coalesce !== false,
         residency: record.residency === "durable" ? "durable" : "session",
-        runner: record.runner === "claude" || record.runner === "pi-durable" ? record.runner : "pi",
+        runner: typeof record.runner === "string" ? record.runner : "pi",
+        ...(typeof record.runnerModule === "string" ? { runnerModule: record.runnerModule } : {}),
         // Legacy Pi sessions were TypeScript-only. Do not change their language
         // when the current host happens to select Python after a restart.
-        ...(record.runner !== "claude" && record.extensions !== false
+        ...((record.runner === undefined || record.runner === "pi" || record.runner === "pi-durable") && record.extensions !== false
           ? {
               kernel: record.kernel === "python" ? "python" as const : "typescript" as const,
               pythonRuntime: record.pythonRuntime === "cpython" ? "cpython" as const : "monty" as const,

@@ -4815,7 +4815,10 @@ export class MeshBridge {
           rules = await authority(false);
           reason = this.#refusal(event, rules, direction);
         }
-        const coalesced = direction === "toRemote" && reason === "not addressed across";
+        // Known mirrors keep #2761's immediate lapsed-recipient refresh. Only unknown
+        // recipients share the trailing sample; a coalesced hold must not delay renewal.
+        const coalesced = direction === "toRemote" && reason === "not addressed across" &&
+          !(lapsedId && this.options.local.mirrored?.(lapsedId));
         if (coalesced && event.sequence > unaddressedRefreshedThrough) {
           this.#deferUnaddressedRefresh();
           // Current native/other-link reservations still skip as before. Unknown canonical

@@ -11,6 +11,7 @@ import {
 } from "@nats-io/jetstream";
 import { NoRespondersError, RequestError, TimeoutError } from "@nats-io/transport-node";
 import type { MeshEvent } from "../../mesh/event-log.js";
+import { diagnostics } from "../../core/diagnostics.js";
 import type { NatsConnectionHandle } from "./connection.js";
 import { ensureFabricEventsStream, natsEventsStreamName, natsGithubStreamName } from "./provision.js";
 import { hashToken } from "./subjects.js";
@@ -19,6 +20,9 @@ import { TransportUnavailableError } from "../types.js";
 const CONSUMER_NOT_FOUND = 10014;
 const ACK_WAIT_NS = 60_000 * 1_000_000;
 const MAX_RETRY_DELAY_MS = 30_000;
+const DIRECTORY_READY_RECHECK_MS = 100;
+const DIRECTORY_STALL_RECHECK_MS = 30_000;
+export const NATS_DIRECTORY_NOT_READY_ALARM_MS = 120_000;
 export const NATS_EVENT_RETRY_DELAY_SCHEDULE_MS = [1_000, 5_000, 15_000, MAX_RETRY_DELAY_MS] as const;
 const MAX_ACK_PENDING = 128;
 type StreamKind = "ev" | "gh";
@@ -45,6 +49,25 @@ const nakTransiently = (message: JsMsg, schedule: readonly number[]): void => {
   // Consumer backoff paces AckWait expiry, not NAK; schedule transient retries explicitly.
   message.nak(transientNakDelay(message.info.deliveryCount, schedule));
 };
+const awaitPullAndObserveReadiness = <T>(pull: Promise<T>, observe: () => boolean, stopping: () => boolean): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const finish = (result: { value: T } | { error: unknown }): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if ("error" in result) reject(result.error);
+      else resolve(result.value);
+    };
+    const check = (): void => {
+      if (settled || stopping()) return;
+      observe();
+      timer = setTimeout(check, DIRECTORY_READY_RECHECK_MS);
+    };
+    pull.then(value => finish({ value }), error => finish({ error }));
+    check();
+  });
 
 export interface NatsActorEventsConsumerOptions {
   readonly org: string;
@@ -57,6 +80,12 @@ export interface NatsActorEventsConsumerOptions {
   readonly provision?: boolean;
   /** Transient NAK delays in milliseconds; defaults to 1s, 5s, 15s, then 30s (capped and repeated). */
   readonly retryDelayScheduleMs?: readonly number[];
+  /** False while the participant directory cannot safely authorize actor event admission. */
+  readonly directoryReady?: () => boolean;
+  /** Called once per prolonged not-ready episode when JetStream reports pending deliveries. */
+  readonly onDirectoryStall?: (stall: { stream: string; durable: string; pendingCount: number; since: number }) => void | Promise<void>;
+  /** Test seam for the bounded stall alarm; defaults to 120 seconds. */
+  readonly directoryStallAlarmMs?: number;
   /** Persist the actor queue and message-ID receipt before ACK; non-accepted outcomes are retried. */
   readonly onMessage: (event: MeshEvent, messageId: string, ack: () => Promise<void>) => Promise<NatsActorEventDisposition>;
 }
@@ -181,7 +210,7 @@ const decodeEvent = (message: JsMsg, org: string): { event: MeshEvent; messageId
   return { event, messageId };
 };
 
-interface DeliveryRun { messages: ConsumerMessages; done: Promise<void>; stopping: boolean }
+interface DeliveryRun { messages?: ConsumerMessages; done: Promise<void>; stopping: boolean }
 interface ManagedGroup {
   update(subjects: string[]): Promise<void>;
   close(remove: boolean): Promise<void>;
@@ -201,15 +230,17 @@ const startGroup = async (
     try { return await operation(); }
     catch (cause) { throw setupFailure(cause, stream, durable); }
   };
+  const retryBackoff = consumerBackoffNs(retryDelayScheduleMs);
   const mutableConfig = (filters: string[]) => ({
     filter_subject: "",
     filter_subjects: filters,
     ack_wait: ACK_WAIT_NS,
     max_deliver: -1,
     max_ack_pending: MAX_ACK_PENDING,
-    backoff: consumerBackoffNs(retryDelayScheduleMs),
+    backoff: retryBackoff,
     inactive_threshold: 0,
   });
+  const filterConfig = (filters: string[]) => ({ filter_subject: "", filter_subjects: filters });
   const assertCompatible = (info: ConsumerInfo): void => {
     const config = info.config;
     if (config.durable_name !== durable || config.deliver_subject || config.headers_only ||
@@ -244,7 +275,18 @@ const startGroup = async (
       }
     }
     assertCompatible(info);
-    if (!created && subjects.length > 0) await api.update(stream, durable, mutableConfig(subjects));
+    if (!created) {
+      // Repair legacy durables in place. The cursor and pending messages are preserved, and
+      // only retry policy fields are changed; inability to update is recorded and delayed NAKs
+      // below remain the safe fallback.
+      if (info.config.max_deliver !== -1 || JSON.stringify(info.config.backoff) !== JSON.stringify(retryBackoff)) {
+        try { await api.update(stream, durable, { max_deliver: -1, backoff: retryBackoff }); }
+        catch {
+          diagnostics.warn("src/transport/nats/events-consume.ts", "[pi-fabric] NATS actor event retry policy update deferred", { stream, durable });
+        }
+      }
+      if (subjects.length > 0) await api.update(stream, durable, filterConfig(subjects));
+    }
     return true;
   });
   if (!opened) return undefined;
@@ -252,6 +294,67 @@ const startGroup = async (
   let active: DeliveryRun | undefined;
   let failure: Error | undefined;
   let closing = false;
+  let notReadySince: number | undefined;
+  let directoryAlarm: ReturnType<typeof setTimeout> | undefined;
+  let directoryAlarmSent = false;
+  const ready = (): boolean => {
+    try { return options.directoryReady?.() !== false; }
+    catch { return false; }
+  };
+  const alarmMs = options.directoryStallAlarmMs ?? NATS_DIRECTORY_NOT_READY_ALARM_MS;
+  if (!Number.isSafeInteger(alarmMs) || alarmMs < 1) throw new Error("NATS directory stall alarm delay must be a positive integer");
+  const clearDirectoryAlarm = (): void => {
+    if (directoryAlarm) clearTimeout(directoryAlarm);
+    directoryAlarm = undefined;
+  };
+  const scheduleDirectoryAlarm = (delayMs: number): void => {
+    if (!options.onDirectoryStall || directoryAlarm || notReadySince === undefined) return;
+    directoryAlarm = setTimeout(() => {
+      directoryAlarm = undefined;
+      void (async () => {
+        if (closing || active?.stopping) return;
+        if (ready()) {
+          notReadySince = undefined;
+          directoryAlarmSent = false;
+          return;
+        }
+        const since = notReadySince;
+        if (since === undefined) return;
+        if (Date.now() - since < alarmMs) {
+          scheduleDirectoryAlarm(since + alarmMs - Date.now());
+          return;
+        }
+        try {
+          const info = await api.info(stream, durable);
+          const count = (value: number): number => Number.isSafeInteger(value) && value > 0 ? value : 0;
+          const pendingCount = count(info.num_pending) + count(info.num_ack_pending);
+          if (closing || active?.stopping || ready() || notReadySince !== since) return;
+          if (pendingCount > 0 && !directoryAlarmSent) {
+            await options.onDirectoryStall!({ stream, durable, pendingCount, since });
+            directoryAlarmSent = true;
+          }
+        } catch { /* A later bounded check can report the still-pending stall. */ }
+        if (!directoryAlarmSent && notReadySince === since) scheduleDirectoryAlarm(DIRECTORY_STALL_RECHECK_MS);
+      })();
+    }, delayMs);
+    directoryAlarm.unref();
+  };
+  const observeReadiness = (): boolean => {
+    if (ready()) {
+      if (notReadySince !== undefined) {
+        clearDirectoryAlarm();
+        notReadySince = undefined;
+        directoryAlarmSent = false;
+      }
+      return true;
+    }
+    if (notReadySince === undefined) {
+      notReadySince = Date.now();
+      directoryAlarmSent = false;
+      scheduleDirectoryAlarm(alarmMs);
+    }
+    return false;
+  };
   let operations = Promise.resolve();
   let closeTask: Promise<void> | undefined;
   let removeTask: Promise<void> | undefined;
@@ -262,53 +365,83 @@ const startGroup = async (
   };
   const startDelivery = async (): Promise<void> => {
     if (subjects.length === 0 || closing) return;
-    const messages = await setup(async () => {
+    const openMessages = async (): Promise<ConsumerMessages> => setup(async () => {
       const consumer = await connection.js.consumers.get(stream, durable);
       // The connection's inboxPrefix (`_INBOX.<user pubkey>`) is honored by consumer.consume's request/reply path.
       return consumer.consume({ max_messages: 1, abort_on_missing_resource: true });
     });
+    const initialMessages = observeReadiness() ? await openMessages() : undefined;
     const allowed = new Set(subjects);
-    const run: DeliveryRun = { messages, stopping: false, done: Promise.resolve() };
+    const run: DeliveryRun = { messages: initialMessages, stopping: false, done: Promise.resolve() };
     active = run;
     run.done = (async () => {
       try {
-        for await (const message of messages) {
-          if (run.stopping || closing) {
-            if (connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
-            break;
-          }
-          if (!connection.isVerified()) continue; // Do not admit buffered deliveries while USER.INFO is pending.
-          if (!allowed.has(message.subject)) {
-            nakTransiently(message, retryDelayScheduleMs);
+        while (!run.stopping && !closing) {
+          if (!observeReadiness()) {
+            await new Promise(resolve => setTimeout(resolve, DIRECTORY_READY_RECHECK_MS));
             continue;
           }
-          let acknowledged = false;
-          const ack = async (): Promise<void> => {
-            if (acknowledged) return;
-            if (!connection.isVerified()) throw new TransportUnavailableError("NATS event ACK is suspended until USER.INFO re-verifies");
-            const confirmed = await message.ackAck();
-            if (!confirmed) throw new Error("NATS actor event ACK was not confirmed");
-            acknowledged = true;
-          };
-          let decoded: ReturnType<typeof decodeEvent>;
-          try { decoded = decodeEvent(message, options.org); }
-          catch {
-            message.term("invalid NATS MeshEvent envelope");
-            continue;
+          const messages = run.messages ??= await openMessages();
+          const iterator = messages[Symbol.asyncIterator]();
+          while (!run.stopping && !closing) {
+            if (!observeReadiness()) {
+              await new Promise(resolve => setTimeout(resolve, DIRECTORY_READY_RECHECK_MS));
+              continue;
+            }
+            // One pull can already be outstanding when readiness changes. Observe the
+            // directory while it waits; do not issue another pull until it is ready.
+            const next = await awaitPullAndObserveReadiness(iterator.next(), observeReadiness, () => run.stopping || closing);
+            if (next.done) break;
+            const message = next.value;
+            if (run.stopping || closing) {
+              if (connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
+              break;
+            }
+            // Readiness can change after a pull was issued. NAK the held delivery with
+            // backoff, and the next iteration makes no further pull while the gate is closed.
+            if (!observeReadiness()) {
+              if (connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
+              continue;
+            }
+            if (!connection.isVerified()) continue; // Do not admit buffered deliveries while USER.INFO is pending.
+            if (!allowed.has(message.subject)) {
+              nakTransiently(message, retryDelayScheduleMs);
+              continue;
+            }
+            let acknowledged = false;
+            const ack = async (): Promise<void> => {
+              if (acknowledged) return;
+              if (!connection.isVerified()) throw new TransportUnavailableError("NATS event ACK is suspended until USER.INFO re-verifies");
+              const confirmed = await message.ackAck();
+              if (!confirmed) throw new Error("NATS actor event ACK was not confirmed");
+              acknowledged = true;
+            };
+            let decoded: ReturnType<typeof decodeEvent>;
+            try { decoded = decodeEvent(message, options.org); }
+            catch {
+              message.term("invalid NATS MeshEvent envelope");
+              continue;
+            }
+            try {
+              const disposition = await options.onMessage(decoded.event, decoded.messageId, ack);
+              if (disposition === "accepted") await ack();
+              else if (!acknowledged && connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
+            } catch {
+              if (!acknowledged && connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
+              observeReadiness();
+              continue;
+            }
           }
-          try {
-            const disposition = await options.onMessage(decoded.event, decoded.messageId, ack);
-            if (disposition === "accepted") await ack();
-            else if (!acknowledged && connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
-          } catch {
-            if (!acknowledged && connection.isVerified()) nakTransiently(message, retryDelayScheduleMs);
-            continue;
-          }
+          const error = await messages.closed();
+          run.messages = undefined;
+          if (error) throw error;
+          break;
         }
-        const error = await messages.closed();
-        if (error) throw error;
       } catch (error) {
         if (!run.stopping && !closing) failure = error instanceof Error ? error : new Error("NATS actor events delivery failed", { cause: error });
+      } finally {
+        clearDirectoryAlarm();
+        notReadySince = undefined;
       }
     })();
   };
@@ -316,7 +449,7 @@ const startGroup = async (
     const run = active;
     if (!run) return;
     run.stopping = true;
-    try { await run.messages.close(); }
+    try { await run.messages?.close(); }
     finally { await run.done; active = undefined; }
   };
   const removeDurable = (): Promise<void> => {
@@ -339,12 +472,13 @@ const startGroup = async (
         if (closing) throw new Error("NATS actor events consumer is closed");
         if (failure) throw failure;
         await stopDelivery();
-        if (captured.length > 0) await setup(() => api.update(stream, durable, mutableConfig(captured)));
+        if (captured.length > 0) await setup(() => api.update(stream, durable, filterConfig(captured)));
         subjects = captured;
         await startDelivery();
       });
     },
     close(remove) {
+      clearDirectoryAlarm();
       closing = true;
       if (!closeTask) closeTask = serialize(stopDelivery);
       return serialize(async () => {
@@ -368,6 +502,9 @@ export const startNatsActorEventsConsumer = async (
   if (typeof options.actorId !== "string" || options.actorId.length === 0) throw new Error("NATS event actorId is required");
   if (typeof options.onMessage !== "function") throw new Error("NATS event onMessage callback is required");
   const retryDelayScheduleMs = normalizeRetryDelaySchedule(options.retryDelayScheduleMs);
+  if (options.directoryStallAlarmMs !== undefined && (!Number.isSafeInteger(options.directoryStallAlarmMs) || options.directoryStallAlarmMs < 1)) {
+    throw new Error("NATS directory stall alarm delay must be a positive integer");
+  }
   if (options.provision === true) await ensureFabricEventsStream(connection.manager, options.org, true);
   const planned = topicPlans(options.org, options.actorId, options.topics);
   const groups = new Map<StreamKind, ManagedGroup>();

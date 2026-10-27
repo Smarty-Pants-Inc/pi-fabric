@@ -1360,6 +1360,10 @@ export class ActorManager {
   #scheduleNatsEventsSync(): void {
     if (!this.#natsEventsEnabled() || !this.#persistent || this.#closing) return;
     void this.#syncNatsEventConsumers().catch(error => {
+      const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+      // The directory-ready gate suspends pulls and the consumer raises a bounded stall alarm.
+      // This expected condition is retried by the existing monitor; it is not a deferred setup warning.
+      if (code === "FABRIC_DIRECTORY_NOT_READY") return;
       diagnostics.warn("src/actors/manager.ts", `[pi-fabric] NATS actor event setup deferred: ${errorText(error)}`);
     });
   }
@@ -1490,34 +1494,53 @@ export class ActorManager {
       attempt: (this.#natsEventSetupFailures.get(actorId)?.attempt ?? 0) + 1, retryable: true,
     };
     this.#natsEventSetupFailures.set(actorId, failure);
+    let openedConsumer: Awaited<ReturnType<NatsActorEventsSession["startConsumer"]>> | undefined;
     try {
-      const consumer = await session.startConsumer(session.connection, {
+      const consumer = openedConsumer = await session.startConsumer(session.connection, {
         org: this.meshConfig.nats.org!, actorId, topics,
         ...(actor.eventsStartAt !== undefined ? { eventsStartAt: actor.eventsStartAt } : {}),
         provision: false,
+        directoryReady: () => this.#canConsumeMesh?.() !== false,
+        onDirectoryStall: ({ stream, durable, pendingCount, since }) => {
+          const current = this.#actors.get(actorId);
+          if (!current || this.#closing) return;
+          return this.#publishNotification({
+            topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC,
+            kind: "actor-events-directory-not-ready",
+            from: this.identity,
+            to: current.rootId,
+            data: { actorId, actorName: current.name, ownerRoot: current.rootId, stream, durable, pendingCount, since },
+          });
+        },
         onMessage: (event, messageId, ack) => this.#acceptNatsActorEvent(actorId, event, messageId, ack),
       });
-      this.#refreshOwnership(actorId);
+      // A readiness loss after setup began may make a fresh directory read throw. The
+      // consumer itself remains gated, and the callback rechecks ownership per delivery.
+      if (this.#canConsumeMesh?.() !== false) this.#refreshOwnership(actorId);
       const current = this.#actors.get(actorId);
       // Setup may outlive ownership, slot custody, removal, or the entire session.
       if (this.#closing || this.#natsEventsSession !== session || !current || current.status === "stopped" || current.removal ||
           !this.#canManageCached(actorId) || !this.#slotCurrent(current)) {
         await consumer.close(!this.#closing && (!current || !!current.removal));
+        openedConsumer = undefined;
       } else {
         // Publish each success immediately, without waiting for any other setup.
         this.#natsEventConsumers.set(actorId, consumer);
         this.#natsEventConsumerTopics.set(actorId, topics);
         this.#natsEventConsumerActive.add(actorId);
+        openedConsumer = undefined;
       }
       if (this.#natsEventSetupFailures.get(actorId) === failure) this.#natsEventSetupFailures.delete(actorId);
     } catch (error) {
+      await openedConsumer?.close(false).catch(() => undefined);
       // Consume the lazy transport's setup contract structurally. Never log the
       // underlying Error/message: server replies can contain credentials or URLs.
       const setup = error instanceof Error && "setup" in error ? error.setup as {
         stream?: unknown; durable?: unknown; code?: unknown; retryable?: unknown;
       } | undefined : undefined;
       const safe = (value: unknown): string => typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value) ? value : "unknown";
-      failure.retryable = setup?.retryable === true;
+      const directoryNotReady = typeof error === "object" && error !== null && "code" in error && error.code === "FABRIC_DIRECTORY_NOT_READY";
+      failure.retryable = setup?.retryable === true || directoryNotReady;
       diagnostics.warn("src/actors/manager.ts", "[pi-fabric] NATS actor event setup failed", {
         stream: safe(setup?.stream), durable: safe(setup?.durable), code: safe(setup?.code), attempt: failure.attempt,
       });

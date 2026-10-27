@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { openBootstrapNatsConnection, openNatsConnection } from "../src/transport/nats/connection.js";
 import { NatsEventsIdConflictError, openNatsEventsPublisher } from "../src/transport/nats/events-publish.js";
 import { NATS_EVENT_RETRY_DELAY_SCHEDULE_MS, startNatsActorEventsConsumer, type NatsActorEventsSetupFailure } from "../src/transport/nats/events-consume.js";
@@ -8,7 +8,7 @@ import type { MeshEvent } from "../src/mesh/event-log.js";
 import { ensureNatsEventsStream, ensureTransportStream, natsEventsStreamName, natsGithubStreamName, transportStreamConfig } from "../src/transport/nats/provision.js";
 import { hashToken } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, PATH_B_PERMISSION_POLICY, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
-import { AckPolicy, DeliverPolicy, DiscardPolicy, JetStreamApiError, JetStreamError, ReplayPolicy, RetentionPolicy, StorageType, type ConsumerInfo, type StreamConfig, type StreamInfo } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, DiscardPolicy, JetStreamApiError, JetStreamError, ReplayPolicy, RetentionPolicy, StorageType, type ConsumerInfo, type JsMsg, type StreamConfig, type StreamInfo } from "@nats-io/jetstream";
 import { AuthorizationError, InvalidArgumentError, NoRespondersError, PermissionViolationError, RequestError, TimeoutError } from "@nats-io/transport-node";
 
 const binary = resolveNatsBinary() ?? "";
@@ -98,11 +98,12 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
     new JetStreamApiError({ code: status, err_code: code, description });
   const statusError = (code: number) => Object.assign(new JetStreamError("private status detail"), { name: "JetStreamStatusError", code });
   const wrapper = (cause?: unknown) => Object.assign(new Error("private request detail", { cause }), { name: "JetStreamNotEnabled" });
-  const fakeJs = ({ kind = "ev", missing = false, recoverCreate = false, incompatible = false }: {
-    kind?: Kind; missing?: boolean; recoverCreate?: boolean; incompatible?: boolean;
+  const fakeJs = ({ kind = "ev", missing = false, recoverCreate = false, incompatible = false, oldRetryPolicy = false, pending = 0, hold = false }: {
+    kind?: Kind; missing?: boolean; recoverCreate?: boolean; incompatible?: boolean; oldRetryPolicy?: boolean; pending?: number; hold?: boolean;
   } = {}) => {
     const target = resources(kind);
     const calls: Array<{ step: SetupStep | "close" | "delete"; stream: string; durable: string }> = [];
+    const updates: Array<Record<string, unknown>> = [];
     let failureStep: SetupStep | undefined;
     let failureCause: unknown;
     let created = false;
@@ -112,7 +113,13 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
     };
     const info = (durable: string) => ({
       config: { durable_name: incompatible && durable === target.durable ? "wrong-durable" : durable,
-        ack_policy: AckPolicy.Explicit, replay_policy: ReplayPolicy.Instant },
+        ack_policy: AckPolicy.Explicit, replay_policy: ReplayPolicy.Instant,
+        ...(oldRetryPolicy && durable === target.durable ? { max_deliver: 5 } : {
+          max_deliver: -1,
+          backoff: [1_000_000_000, 5_000_000_000, 15_000_000_000, 30_000_000_000, 30_000_000_000],
+        }) },
+      num_pending: pending,
+      num_ack_pending: 0,
     }) as ConsumerInfo;
     const connection = {
       isVerified: () => true,
@@ -128,7 +135,8 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
           created = true;
           return info(config.durable_name);
         },
-        update: async (stream: string, durable: string) => {
+        update: async (stream: string, durable: string, config: Record<string, unknown>) => {
+          updates.push(config);
           checkpoint("update", stream, durable);
           return info(durable);
         },
@@ -138,6 +146,15 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
         checkpoint("get", stream, durable);
         return { consume: async () => {
           checkpoint("consume", stream, durable);
+          if (hold) {
+            let release!: () => void;
+            const pending = new Promise<void>(resolve => { release = resolve; });
+            return {
+              async *[Symbol.asyncIterator]() { await pending; },
+              closed: async () => undefined,
+              close: async () => { calls.push({ step: "close", stream, durable }); release(); },
+            };
+          }
           return {
             async *[Symbol.asyncIterator]() { /* No deliveries are needed to exercise setup. */ },
             closed: async () => undefined,
@@ -146,7 +163,7 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
         } };
       } } },
     } as unknown as Parameters<typeof startNatsActorEventsConsumer>[0];
-    return { connection, calls, setFailure(step: SetupStep, cause: unknown) { failureStep = step; failureCause = cause; } };
+    return { connection, calls, updates, setFailure(step: SetupStep, cause: unknown) { failureStep = step; failureCause = cause; } };
   };
   const start = (connection: Parameters<typeof startNatsActorEventsConsumer>[0]) =>
     startNatsActorEventsConsumer(connection, { org, actorId, topics, onMessage: async () => "accepted" });
@@ -232,6 +249,110 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
     expect((error?.cause as Error).message).toContain("Incompatible NATS actor events consumer");
     expect(error?.setup).toEqual({ ...resources("ev"), code: "UNKNOWN", retryable: false });
     expect(fake.calls.map(call => call.step)).toEqual(["info"]);
+  });
+
+  it("repairs an old durable's retry policy in place with only backoff and max_deliver", async () => {
+    const fake = fakeJs({ oldRetryPolicy: true, pending: 4 });
+    const consumer = await start(fake.connection);
+    try {
+      expect(fake.updates[0]).toEqual({
+        max_deliver: -1,
+        backoff: [1_000_000_000, 5_000_000_000, 15_000_000_000, 30_000_000_000, 30_000_000_000],
+      });
+      expect(fake.calls.some(call => call.step === "delete")).toBe(false);
+      expect(fake.calls.filter(call => call.stream === resources("ev").stream).map(call => call.step))
+        .toEqual(["info", "update", "update", "get", "consume"]);
+    } finally { await consumer.close(false); }
+  });
+
+  it("does not pull while the directory is unready, NAKs an in-hand message with delay, and resumes it", async () => {
+    let directoryReady = false;
+    let pullCount = 0;
+    let queuedRetry = false;
+    let resolveFirst!: (result: IteratorResult<JsMsg>) => void;
+    const received: string[] = [];
+    const nakDelays: number[] = [];
+    const ackAck = vi.fn(async () => true);
+    const rawEvent = event("directory-retry", "mail.retry");
+    const message = {
+      data: Buffer.from(JSON.stringify(rawEvent)), subject: `fabric.ev.${org}.mail.retry`,
+      info: { deliveryCount: 1, streamSequence: 1 }, ackAck,
+      nak: (delay?: number) => { nakDelays.push(delay ?? 0); queuedRetry = true; },
+      term: vi.fn(),
+    } as unknown as JsMsg;
+    const messages = {
+      [Symbol.asyncIterator]() { return this; },
+      next: () => {
+        pullCount++;
+        if (queuedRetry) { queuedRetry = false; return Promise.resolve({ done: false, value: message } as IteratorResult<JsMsg>); }
+        return new Promise<IteratorResult<JsMsg>>(resolve => { resolveFirst = resolve; });
+      },
+      closed: async () => undefined,
+      close: async () => { resolveFirst?.({ done: true, value: undefined as never }); },
+    };
+    const connection = {
+      isVerified: () => true,
+      manager: { consumers: {
+        info: async (_stream: string, durable: string) => ({ config: {
+          durable_name: durable, ack_policy: AckPolicy.Explicit, replay_policy: ReplayPolicy.Instant,
+          max_deliver: -1, backoff: [1_000_000_000, 5_000_000_000, 15_000_000_000, 30_000_000_000, 30_000_000_000],
+        }, num_pending: 1, num_ack_pending: 0 }) as ConsumerInfo,
+        add: async (_stream: string, config: { durable_name: string }) => ({ config: {
+          durable_name: config.durable_name, ack_policy: AckPolicy.Explicit, replay_policy: ReplayPolicy.Instant,
+          max_deliver: -1, backoff: [1_000_000_000, 5_000_000_000, 15_000_000_000, 30_000_000_000, 30_000_000_000],
+        } }) as ConsumerInfo,
+        update: async (_stream: string, durable: string) => ({ config: {
+          durable_name: durable, ack_policy: AckPolicy.Explicit, replay_policy: ReplayPolicy.Instant,
+          max_deliver: -1, backoff: [1_000_000_000, 5_000_000_000, 15_000_000_000, 30_000_000_000, 30_000_000_000],
+        } }) as ConsumerInfo,
+      } },
+      js: { consumers: { get: async () => ({ consume: async () => messages }) } },
+    } as unknown as Parameters<typeof startNatsActorEventsConsumer>[0];
+    const consumer = await startNatsActorEventsConsumer(connection, {
+      org, actorId, topics: ["mail.retry"], directoryReady: () => directoryReady,
+      onMessage: async receivedEvent => { received.push(receivedEvent.id); return "accepted"; },
+    });
+    try {
+      await new Promise(resolve => setTimeout(resolve, 150));
+      expect(pullCount).toBe(0);
+      directoryReady = true;
+      await waitFor(() => pullCount === 1);
+      directoryReady = false;
+      resolveFirst({ done: false, value: message });
+      await waitFor(() => nakDelays.length === 1);
+      expect(nakDelays[0]).toBeGreaterThan(0);
+      await new Promise(resolve => setTimeout(resolve, 150));
+      expect(pullCount).toBe(1);
+      expect(received).toEqual([]);
+      directoryReady = true;
+      await waitFor(() => received.length === 1);
+      expect(received).toEqual(["directory-retry"]);
+      expect(ackAck).toHaveBeenCalledOnce();
+    } finally { await consumer.close(false); }
+  });
+
+  it("alarms once after a prolonged not-ready episode and re-arms after recovery", async () => {
+    const fake = fakeJs({ pending: 3, hold: true });
+    let directoryReady = false;
+    const alarm = vi.fn();
+    const consumer = await startNatsActorEventsConsumer(fake.connection, {
+      org, actorId, topics: ["mail.inbound"], directoryReady: () => directoryReady,
+      directoryStallAlarmMs: 25, onDirectoryStall: alarm,
+      onMessage: async () => "accepted",
+    });
+    try {
+      await waitFor(() => alarm.mock.calls.length === 1);
+      expect(alarm).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        ...resources("ev"), pendingCount: 3, since: expect.any(Number),
+      }));
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(alarm).toHaveBeenCalledOnce();
+      directoryReady = true;
+      await new Promise(resolve => setTimeout(resolve, 150));
+      directoryReady = false;
+      await waitFor(() => alarm.mock.calls.length === 2);
+      expect(alarm).toHaveBeenCalledTimes(2);
+    } finally { await consumer.close(false); }
   });
 
   it("recovers an expected 404 by creating the same durable without updating its new cursor", async () => {
@@ -476,7 +597,7 @@ describe.skipIf(!binary)("NATS Mesh events on a real JetStream server", () => {
       });
       const initial = await connection.manager.consumers.info(stream, durable);
       expect(initial.config.max_deliver).toBe(-1);
-      expect(initial.config.backoff).toEqual([50, 50].map(ms => ms * 1_000_000));
+      expect(initial.config.backoff).toEqual([1_000_000_000, 5_000_000_000, 15_000_000_000, 30_000_000_000, 30_000_000_000]);
       await publisher.publish(event("ownership-blip", "mail.retry"));
       await waitFor(() => attempts.length >= 6, 8_000);
       expect(accepted).toEqual([]);

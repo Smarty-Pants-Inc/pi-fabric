@@ -4809,7 +4809,8 @@ export class MeshBridge {
             this.#unaddressedSequence = event.sequence;
             this.#deferMembership(direction, event);
             this.#membershipRetryAt[direction] = this.#unaddressedRefreshAt ?? Date.now() + this.#unaddressedRefreshMs;
-            if (cursor.after > start) this.#save();
+            // Persist only the consumed prefix; the held event and page-end offset stay unread.
+            if (cursor.after > start) checkpoint();
             return { forwarded, dropped };
           }
         }

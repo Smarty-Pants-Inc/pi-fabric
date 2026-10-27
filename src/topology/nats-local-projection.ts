@@ -219,7 +219,7 @@ export class NatsLocalProjection {
             continue;
           }
           if (event.type === "ready") {
-            await this.#reconcile(bucket, observed);
+            await this.#retryWatchOperation(() => this.#reconcile(bucket, observed));
             this.#ready.add(bucket);
             this.#retryPendingAfterWatchEvent();
             if (this.#ready.size === 2 && !this.#initialReadyResolved) {
@@ -230,10 +230,12 @@ export class NatsLocalProjection {
           }
           if (event.type === "put") {
             observed.add(event.entry.key);
-            await this.#serializeProjectionKey(`${bucket}:${event.entry.key}`, () => this.#put(bucket, event.entry));
+            await this.#serializeProjectionKey(`${bucket}:${event.entry.key}`,
+              () => this.#retryWatchOperation(() => this.#put(bucket, event.entry)));
           } else {
             observed.delete(event.key);
-            await this.#serializeProjectionKey(`${bucket}:${event.key}`, () => this.#gone(bucket, event.key, event.revision));
+            await this.#serializeProjectionKey(`${bucket}:${event.key}`,
+              () => this.#retryWatchOperation(() => this.#gone(bucket, event.key, event.revision)));
           }
           this.#retryPendingAfterWatchEvent();
         }
@@ -241,6 +243,12 @@ export class NatsLocalProjection {
         throw new Error(`NATS ${bucket} projection watch ended`);
       } catch (error) {
         if (this.#closed) return;
+        const code = object(error) ? error.code : undefined;
+        console.warn(`[fabric:nats:local-projection] ${JSON.stringify({
+          outcome: this.#initialReadyResolved ? "retry" : "failed", bucket,
+          code: typeof code === "string" || typeof code === "number" ? code : "UNKNOWN",
+          message: error instanceof Error ? error.message : String(error),
+        })}`);
         try { this.options.onError?.(error); } catch { /* diagnostic only */ }
         if (!this.#initialReadyResolved) {
           this.#rejectInitial(error);
@@ -272,13 +280,34 @@ export class NatsLocalProjection {
     });
   }
 
-  async #withHostLeaseLock<T>(file: string, operation: () => T, options: HostLeaseLockOptions = {}): Promise<T> {
+  async #retryWatchOperation<T>(operation: () => Promise<T>): Promise<T> {
     let attempt = 0;
     for (;;) {
-      if (!this.#closed) this.#abort.signal.throwIfAborted();
+      this.#abort.signal.throwIfAborted();
+      try { return await operation(); }
+      catch (error) {
+        // Initial readiness keeps its existing bounded lock budget. Afterwards,
+        // retain the event and its key's serialization until custody is available;
+        // a busy commit must not replace an otherwise healthy KV watch.
+        if (!this.#initialReadyResolved || !(error instanceof HostLeaseLockBusyError)) throw error;
+        const backoff = HOST_LEASE_LOCK_RETRY_BASE_MS * 2 ** Math.min(attempt++, 5);
+        // Commit-gate custody has no release event: capped, abortable backoff is
+        // its safety net. Retry the operation so authoritative reads run again.
+        await this.#waitBeforeRetry(Math.min(HOST_LEASE_LOCK_RETRY_MAX_MS, Math.floor(backoff * (0.5 + Math.random()))));
+      }
+    }
+  }
+
+  async #withHostLeaseLock<T>(file: string, operation: () => T, options: HostLeaseLockOptions = {}): Promise<T> {
+    let attempt = 0;
+    // Capture the active operation's cancellation even if close() starts while
+    // it waits. Shutdown reconciliation itself still gets its single attempt.
+    const signal = this.#closed ? undefined : this.#abort.signal;
+    for (;;) {
+      signal?.throwIfAborted();
       try {
         return await withHostLeaseLock(this.options.mesh as unknown as HostLeaseMesh, file, operation,
-          { ...options, ...(this.#closed ? {} : { signal: this.#abort.signal }) });
+          { ...options, ...(signal ? { signal } : {}) });
       } catch (error) {
         if (this.#closed || this.#initialReadyResolved && this.#recoveryLockRetryDeadline === undefined ||
           !(error instanceof HostLeaseLockBusyError)) throw error;
@@ -288,7 +317,7 @@ export class NatsLocalProjection {
         if (remaining <= 0) throw error;
         const backoff = Math.min(HOST_LEASE_LOCK_RETRY_MAX_MS,
           HOST_LEASE_LOCK_RETRY_BASE_MS * 2 ** Math.min(attempt, 5));
-        const delay = Math.min(remaining, Math.floor(backoff * (0.5 + Math.random())));
+        const delay = Math.min(remaining, HOST_LEASE_LOCK_RETRY_MAX_MS, Math.floor(backoff * (0.5 + Math.random())));
         attempt += 1;
         await this.#waitBeforeRetry(delay);
       }

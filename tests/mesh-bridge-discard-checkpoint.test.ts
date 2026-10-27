@@ -287,7 +287,7 @@ describe("durable discard checkpoints (smarty-dev#16879)", () => {
 
       await addRoot(f.destination, "joined", held.to!);
       const restarted = { ...f, local: new StoreBridgeSide(f.source, "far"), remote: new StoreBridgeSide(f.destination, "hub") };
-      const reads: Array<{ after: number; offset?: number; ids: string[] }> = [];
+      const reads: Array<{ after: number; offset?: number | undefined; ids: string[] }> = [];
       const tail = restarted.local.tail.bind(restarted.local);
       restarted.local.tail = async (after, offset, pageBytes) => {
         const page = await tail(after, offset, pageBytes);

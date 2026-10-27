@@ -40,10 +40,10 @@ const fixture = (stateBackend: "file" | "sqlite", count = 114) => {
     format: 1, id: host.id, kind: "root", rootId: host.rootId, ownerHostId: host.id,
     ownerIdentityId: host.identity.id, name: host.identity.name, label: host.identity.name,
     status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp"],
-    sessionId: host.identity.sessionId, startedAt: host.startedAt, updatedAt: NOW, controlProtocol: "v1",
+    sessionId: host.identity.sessionId!, startedAt: host.startedAt, updatedAt: NOW, controlProtocol: "v1",
   }));
   const presence = (): BridgePresence => ({ hosts: hosts.map(record => ({ record: { ...record, updatedAt: now },
-    observedAt: now, expiresAt: now + 60_000 })), participants });
+    observedAt: now, expiresAt: now + 60_000 })), participants, reserved: [] });
   const files = new Set(hosts.map(host => hostLeasePath(store.root, host.id)));
   const renames = vi.spyOn(fs, "renameSync");
   const custody = vi.spyOn(store, "leaseCustody");

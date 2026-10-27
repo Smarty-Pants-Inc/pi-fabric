@@ -495,7 +495,15 @@ const startGroup = async (
             await waitForReadinessOrStop(run, observeReadiness, () => run.stopping || closing, readyRecheckMs, options.directoryReadyChanged);
             continue;
           }
-          const messages = run.messages ??= await openMessages();
+          const messages = run.messages ?? await openMessages();
+          if (run.stopping || closing) {
+            // stopDelivery cannot see a consume that is still opening. Close it here
+            // without storing it or starting its iterator.
+            try { void Promise.resolve(messages.close()).catch(() => undefined); }
+            catch { /* The local run is stopped even if the source close hook throws. */ }
+            break;
+          }
+          run.messages ??= messages;
           const iterator = run.iterator ??= messages[Symbol.asyncIterator]();
           while (!run.stopping && !closing) {
             if (!observeReadiness()) {

@@ -106,15 +106,22 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
     new JetStreamApiError({ code: status, err_code: code, description });
   const statusError = (code: number) => Object.assign(new JetStreamError("private status detail"), { name: "JetStreamStatusError", code });
   const wrapper = (cause?: unknown) => Object.assign(new Error("private request detail", { cause }), { name: "JetStreamNotEnabled" });
-  const fakeJs = ({ kind = "ev", missing = false, recoverCreate = false, incompatible = false, oldRetryPolicy = false, pending = 0, hold = false, deliver, openMessages }: {
-    kind?: Kind; missing?: boolean; recoverCreate?: boolean; incompatible?: boolean; oldRetryPolicy?: boolean; pending?: number; hold?: boolean; deliver?: JsMsg; openMessages?: Promise<void>;
+  const fakeJs = ({ kind = "ev", missing = false, recoverCreate = false, incompatible = false, oldRetryPolicy = false, pending = 0, hold = false, deliver, openMessages, monitorConsume = false }: {
+    kind?: Kind; missing?: boolean; recoverCreate?: boolean; incompatible?: boolean; oldRetryPolicy?: boolean; pending?: number; hold?: boolean; deliver?: JsMsg; openMessages?: Promise<void>; monitorConsume?: boolean;
   } = {}) => {
     const target = resources(kind);
     const calls: Array<{ step: SetupStep | "close" | "delete"; stream: string; durable: string }> = [];
     const updates: Array<Record<string, unknown>> = [];
+    let monitorInterval: ReturnType<typeof setInterval> | undefined;
+    let monitorInfoCalls = 0;
     let failureStep: SetupStep | undefined;
     let failureCause: unknown;
     let created = false;
+    const closeMessages = (stream: string, durable: string): void => {
+      calls.push({ step: "close", stream, durable });
+      if (monitorInterval !== undefined) clearInterval(monitorInterval);
+      monitorInterval = undefined;
+    };
     const checkpoint = (step: SetupStep, stream: string, durable: string) => {
       calls.push({ step, stream, durable });
       if (stream === target.stream && step === failureStep) throw failureCause;
@@ -157,6 +164,10 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
         checkpoint("get", stream, durable);
         return { consume: async () => {
           checkpoint("consume", stream, durable);
+          if (monitorConsume) monitorInterval = setInterval(() => {
+            monitorInfoCalls++;
+            checkpoint("info", stream, durable);
+          }, 10);
           await openMessages;
           if (deliver) {
             let sent = false;
@@ -172,7 +183,7 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
             return {
               [Symbol.asyncIterator]: () => iterator,
               closed: async () => undefined,
-              close: async () => { calls.push({ step: "close", stream, durable }); releaseNext?.(done); },
+              close: async () => { closeMessages(stream, durable); releaseNext?.(done); },
             };
           }
           if (hold) {
@@ -181,18 +192,24 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
             return {
               async *[Symbol.asyncIterator]() { await pending; },
               closed: async () => undefined,
-              close: async () => { calls.push({ step: "close", stream, durable }); release(); },
+              close: async () => { closeMessages(stream, durable); release(); },
             };
           }
           return {
             async *[Symbol.asyncIterator]() { /* No deliveries are needed to exercise setup. */ },
             closed: async () => undefined,
-            close: async () => { calls.push({ step: "close", stream, durable }); },
+            close: async () => { closeMessages(stream, durable); },
           };
         } };
       } } },
     } as unknown as Parameters<typeof startNatsActorEventsConsumer>[0];
-    return { connection, calls, updates, setFailure(step: SetupStep, cause: unknown) { failureStep = step; failureCause = cause; } };
+    return {
+      connection, calls, updates,
+      monitorInfoCalls: () => monitorInfoCalls,
+      monitorActive: () => monitorInterval !== undefined,
+      stopMonitor: () => { if (monitorInterval !== undefined) clearInterval(monitorInterval); monitorInterval = undefined; },
+      setFailure(step: SetupStep, cause: unknown) { failureStep = step; failureCause = cause; },
+    };
   };
   const start = (connection: Parameters<typeof startNatsActorEventsConsumer>[0]) =>
     startNatsActorEventsConsumer(connection, { org, actorId, topics, onMessage: async () => "accepted" });
@@ -394,25 +411,29 @@ describe("NATS event consumer setup failures with fake JetStream", () => {
     } finally { await consumer.close(false); }
   });
 
-  it("closes when readiness drops across openMessages without starting the iterator", async () => {
+  it("closes a consume opened after delivery stops before starting its iterator", async () => {
     let ready = false;
     let releaseOpen!: () => void;
     const openMessages = new Promise<void>(resolve => { releaseOpen = resolve; });
-    const fake = fakeJs({ openMessages });
+    const fake = fakeJs({ openMessages, monitorConsume: true });
     const consumer = await startNatsActorEventsConsumer(fake.connection, {
-      org, actorId, topics: ["mail.before"], directoryReady: () => ready, directoryReadyRecheckMs: 60_000,
+      org, actorId, topics: ["mail.before"], directoryReady: () => ready, directoryReadyRecheckMs: 20,
       onMessage: async () => "accepted",
     });
     try {
       ready = true;
-      const updating = consumer.updateTopics(["mail.after"]);
       await waitFor(() => fake.calls.some(call => call.step === "consume"));
-      ready = false;
-      releaseOpen();
-      await resolvesWithin(updating);
+      await waitFor(() => fake.monitorInfoCalls() > 0);
       await resolvesWithin(consumer.close(false));
+      releaseOpen();
+      await waitFor(() => fake.calls.some(call => call.step === "close"));
+      expect(fake.monitorActive()).toBe(false);
+      const monitorInfoCallsAtClose = fake.monitorInfoCalls();
+      await new Promise(resolve => setTimeout(resolve, 40));
+      expect(fake.monitorInfoCalls()).toBe(monitorInfoCallsAtClose);
     } finally {
       releaseOpen();
+      fake.stopMonitor();
       await consumer.close(false);
     }
   });

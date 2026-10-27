@@ -685,7 +685,7 @@ describe("ParticipantDirectory host leases", () => {
 
   // review/astra F1 on #68: a file-only renewal must not certify that the shared state is
   // writable; otherwise a live peer blocked behind a held lock reads as departed (#24).
-  it("under the policy, never settle a peer that lapsed behind a held lock, and report the stall", async () => {
+  it("under the policy, never settle a stalled peer behind a held lock, and report the stall", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-topology-"));
     roots.push(root);
     const meshRoot = path.join(root, "mesh");
@@ -714,6 +714,7 @@ describe("ParticipantDirectory host leases", () => {
     try {
       peerStatus = "running";
       void peer.refresh().catch(() => undefined);                 // renews its file, then blocks
+      peer.suspend(); // A stalled renewer lapses; mesh contention alone must not expire it.
       let result: PeerSettleResult | undefined;
       void awaitPeerSettle({
         poll: () => reader.peers(),

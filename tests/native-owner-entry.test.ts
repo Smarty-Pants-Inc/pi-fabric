@@ -7,7 +7,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { createNativeActorOwner, type NativeActorOwner } from "./helpers/native-actor-owner.js";
+import { createNativeActorOwner, type NativeActorOwner, type NativeOwnerCliShape } from "./helpers/native-actor-owner.js";
 import { residentDrainTemp } from "./helpers/resident-drain-temp.js";
 import { NATIVE_SDK_DIRECTORY, assertApprovedNativeSdk, nativeSdkTestPrerequisite } from "./helpers/native-sdk-no-model.js";
 
@@ -431,6 +431,157 @@ describe.skipIf(!!nativeSkipReason)(`F1(b) actual candidate-installed native own
     expect(fs.existsSync(path.join(owner.residencyRoot, "owner.json"))).toBe(false);
     // The seeded control is NOT sole proof of the real native empty-context
     // starting state. Both cases keep the identical unchanged-byte requirement.
+  }, 180_000);
+
+  it.each([
+    "continue-native", "short-continue-native", "resume-native", "long-resume-native", "duplicate-native",
+    "relative-native", "dotdot-native", "symlink-native", "unknown-native", "inline-session-native",
+    "ordinary-continue", "ordinary-resume", "duplicate-ordinary", "unknown-ordinary",
+  ] satisfies NativeOwnerCliShape[])("P1 REAL plain SDK CLI configured fail-closed refusal preserves header-only native bytes: %s", async shape => {
+    const owner = await realOwner(); assertInstalled(owner);
+    const before = snapshot(owner), lock = inode(`${owner.sessionFile}.main.lock`);
+    const header = before.session.toString("utf8").split("\n");
+    expect(header).toHaveLength(2); expect(header[1]).toBe("");
+    expect(JSON.parse(header[0]!)).toMatchObject({ type: "session", id: owner.pin.sessionId, cwd: owner.cwd });
+    expect(owner.mainIdentity()).toBeUndefined(); // No native fence holder or seeded context.
+    const files = (directory: string): unknown[] => fs.existsSync(directory) ? fs.readdirSync(directory).sort().flatMap(name => {
+      const file = path.join(directory, name), stat = fs.lstatSync(file);
+      return stat.isDirectory() ? files(file) : [{ file, sha256: hash(file), bytes: stat.size }];
+    }) : [];
+    const meshBefore = files(owner.meshRoot);
+    const result = await owner.attemptRealCli(shape);
+    const after = fs.readFileSync(owner.sessionFile);
+    fs.writeFileSync(path.join(owner.root, "p1-real-cli-refusal.json"), JSON.stringify({ shape, result,
+      beforeBase64: before.session.toString("base64"), afterBase64: after.toString("base64"), byteEquality: after.equals(before.session),
+      before, after: snapshot(owner), lock, meshBefore, meshAfter: files(owner.meshRoot) }), { mode: 0o600, flag: "wx" });
+    expect(result.code).toBe(1); expect(result.signal).toBeNull();
+    expect(result.stderr).toContain("NativeOwnerFenceError: NATIVE_OWNER_FENCE_REQUIRED");
+    expect(result.stderr).not.toMatch(/role.*(?:refus|invalid)|model.*policy.*(?:refus|denied)/i);
+    expect(result.stdout).toBe(""); // Queued negative input never reaches RPC/admission.
+    expect(owner.sdkImports().some(value => value.pid === result.pid && value.url.endsWith("/cli.js"))).toBe(true);
+    expect(owner.sdkImports().some(value => value.pid === result.pid && value.url.endsWith("/core/session-manager.js"))).toBe(true);
+    expect(owner.observations().filter(value => value.pid === result.pid)).toEqual([]); // Includes session_start and input.
+    expect(owner.callbacks()).toEqual([]); unchanged(owner, before);
+    expect(inode(`${owner.sessionFile}.main.lock`)).toEqual(lock);
+    expect(files(owner.meshRoot)).toEqual(meshBefore);
+    expect(owner.mesh.listAll("topology/participants/", { fresh: true })).toEqual([]);
+    expect(fs.existsSync(path.join(owner.residencyRoot, "owner.json"))).toBe(false);
+    expect(owner.mainIdentity()).toBeUndefined();
+  }, 180_000);
+
+  it("P1 REAL plain SDK CLI unsupported short option -z exits before selection and preserves header-only native bytes", async () => {
+    const owner = await realOwner(); assertInstalled(owner);
+    const before = snapshot(owner), lock = inode(`${owner.sessionFile}.main.lock`);
+    const header = before.session.toString("utf8").split("\n");
+    expect(header).toHaveLength(2); expect(header[1]).toBe("");
+    expect(JSON.parse(header[0]!)).toMatchObject({ type: "session", id: owner.pin.sessionId, cwd: owner.cwd });
+    expect(owner.mainIdentity()).toBeUndefined(); // No native Main holder or seeded context.
+    const files = (directory: string): unknown[] => fs.existsSync(directory) ? fs.readdirSync(directory).sort().flatMap(name => {
+      const file = path.join(directory, name), stat = fs.lstatSync(file);
+      return stat.isDirectory() ? files(file) : [{ file, sha256: hash(file), bytes: stat.size }];
+    }) : [];
+    const meshBefore = files(owner.meshRoot);
+    const result = await owner.attemptRealCli("short-unknown-native");
+    expect(result.code).toBe(1); expect(result.signal).toBeNull();
+    expect(result.stderr).toContain("Unknown option: -z");
+    expect(result.stderr).not.toContain("NativeOwnerFenceError"); // The pinned SDK exits before Fabric registration.
+    expect(result.stdout).toBe(""); // Queued negative input never reaches RPC/admission.
+    expect(owner.sdkImports().some(value => value.pid === result.pid && value.url.endsWith("/cli.js"))).toBe(true);
+    expect(owner.observations().filter(value => value.pid === result.pid)).toEqual([]);
+    expect(owner.callbacks()).toEqual([]); unchanged(owner, before);
+    expect(inode(`${owner.sessionFile}.main.lock`)).toEqual(lock);
+    expect(files(owner.meshRoot)).toEqual(meshBefore);
+    expect(owner.mesh.listAll("topology/participants/", { fresh: true })).toEqual([]);
+    expect(fs.existsSync(path.join(owner.residencyRoot, "owner.json"))).toBe(false);
+    expect(owner.mainIdentity()).toBeUndefined();
+  }, 180_000);
+
+  it.each(["ordinary-relative", "ordinary-symlink", "ordinary-flag-value"] satisfies NativeOwnerCliShape[])(
+    "P1 REAL plain SDK CLI configured single ordinary selection reaches model-free RPC: %s", async shape => {
+      const owner = await realOwner(); assertInstalled(owner);
+      const before = snapshot(owner), lock = inode(`${owner.sessionFile}.main.lock`);
+      const result = await owner.attemptRealCli(shape), ordinary = result.ordinary!;
+      expect(result.code).toBe(0); expect(result.signal).toBeNull();
+      expect(result.stderr).not.toContain("NATIVE_OWNER_FENCE_REQUIRED");
+      expect(ordinary.sessionId).not.toBe(owner.pin.sessionId);
+      expect(fs.realpathSync(ordinary.sessionFile)).not.toBe(owner.sessionFile);
+      const records = result.stdout.split("\n").filter(Boolean).map(line => JSON.parse(line));
+      expect(records).toContainEqual(expect.objectContaining({ type: "response", id: "ordinary-readback", success: true,
+        data: expect.objectContaining({ sessionId: ordinary.sessionId }) }));
+      expect(owner.observations().filter(value => value.pid === result.pid && value.event === "session-start")).toEqual([
+        expect.objectContaining({ selectedModel: false, unconfigured: true, rootId: ordinary.rootId }),
+      ]);
+      expect(owner.observations().filter(value => value.pid === result.pid &&
+        (String(value.event).startsWith("FORBIDDEN-") || value.event === "input-handled"))).toEqual([]);
+      expect(owner.callbacks()).toEqual([]); unchanged(owner, before);
+      expect(inode(`${owner.sessionFile}.main.lock`)).toEqual(lock);
+      expect(owner.observations().some(value => value.rootId === owner.pin.rootId)).toBe(false);
+      // --name's value is literally --frobnicate in the flag-value case. The
+      // SDK consumes it as data; treating that value as an unknown flag is wrong.
+    }, 180_000);
+
+  it.each(["task-prefix-ordinary", "cli-prefix-ordinary"] satisfies NativeOwnerCliShape[])(
+    "P3.1 actual SDK parser opens distinct ordinary native-ID-prefix control: %s", async shape => {
+      const owner = await realOwner(); assertInstalled(owner);
+      const before = snapshot(owner), lock = inode(`${owner.sessionFile}.main.lock`);
+      const result = await owner.attemptRealCli(shape), ordinary = result.ordinary!;
+      expect(ordinary.sessionId.slice(0, 8)).toBe(owner.pin.sessionId.slice(0, 8));
+      expect(ordinary.sessionId).not.toBe(owner.pin.sessionId);
+      expect(result.code).toBe(0); expect(result.signal).toBeNull();
+      expect(result.stderr).not.toContain("NATIVE_OWNER_FENCE_REQUIRED");
+      const records = result.stdout.split("\n").filter(Boolean).map(line => JSON.parse(line));
+      expect(records).toContainEqual(expect.objectContaining({ type: "response", id: "ordinary-readback", success: true,
+        data: expect.objectContaining({ sessionId: ordinary.sessionId, sessionFile: ordinary.sessionFile }) }));
+      expect(owner.observations().filter(value => value.pid === result.pid && value.event === "session-start")).toEqual([
+        expect.objectContaining({ selectedModel: false, unconfigured: true, rootId: ordinary.rootId, sessionFile: ordinary.sessionFile }),
+      ]);
+      expect(owner.observations().filter(value => String(value.event).startsWith("FORBIDDEN-") || value.event === "input-handled")).toEqual([]);
+      unchanged(owner, before); expect(inode(`${owner.sessionFile}.main.lock`)).toEqual(lock);
+      const exact = await owner.attemptRealCli("task-exact-native-id");
+      expect(exact.code).toBe(1); expect(exact.signal).toBeNull();
+      expect(exact.stderr).toContain("NativeOwnerFenceError: NATIVE_OWNER_FENCE_REQUIRED");
+      expect(owner.sdkImports().filter(value => value.pid === exact.pid)).toEqual([]);
+      expect(owner.observations().filter(value => value.pid === exact.pid)).toEqual([]);
+      expect(owner.callbacks()).toEqual([]); unchanged(owner, before);
+    }, 180_000);
+
+  it("P2.1 REAL plain SDK CLI --name residual is exactly one canonical SDK session_info before typed registration refusal", async () => {
+    const owner = await realOwner(); assertInstalled(owner);
+    const before = snapshot(owner), lock = inode(`${owner.sessionFile}.main.lock`);
+    expect(before.session.toString("utf8").split("\n")).toHaveLength(2);
+    expect(before.session.at(-1)).toBe(0x0a);
+    const files = (directory: string): unknown[] => fs.existsSync(directory) ? fs.readdirSync(directory).sort().flatMap(name => {
+      const file = path.join(directory, name), stat = fs.lstatSync(file);
+      return stat.isDirectory() ? files(file) : [{ file, sha256: hash(file), bytes: stat.size }];
+    }) : [];
+    const meshBefore = files(owner.meshRoot);
+    const result = await owner.attemptRealCli("name-native"), after = fs.readFileSync(owner.sessionFile);
+    fs.writeFileSync(path.join(owner.root, "p2-name-residual.json"), JSON.stringify({ result,
+      beforeBase64: before.session.toString("base64"), afterBase64: after.toString("base64"),
+      meshBefore, meshAfter: files(owner.meshRoot) }), { mode: 0o600, flag: "wx" });
+    expect(result.code).toBe(1); expect(result.signal).toBeNull();
+    expect(result.stderr).toContain("NativeOwnerFenceError: NATIVE_OWNER_FENCE_REQUIRED");
+    expect(result.stdout).toBe("");
+    expect(after.subarray(0, before.session.length)).toEqual(before.session);
+    const append = after.subarray(before.session.length), lines = append.toString("utf8").split("\n");
+    expect(lines).toHaveLength(2); expect(lines[1]).toBe("");
+    const entry = JSON.parse(lines[0]!) as Record<string, unknown>;
+    expect(Object.keys(entry)).toEqual(["type", "id", "parentId", "timestamp", "name"]);
+    expect(entry).toMatchObject({ type: "session_info", parentId: null, name: "native-name-residual" });
+    expect(entry.id).toMatch(/^[0-9a-f]{8}$/); expect(entry.id).not.toBe(owner.pin.sessionId);
+    expect(typeof entry.timestamp).toBe("string");
+    expect(entry.timestamp).toBe(new Date(entry.timestamp as string).toISOString());
+    expect(Date.parse(entry.timestamp as string)).toBeGreaterThanOrEqual(result.startedAt);
+    expect(Date.parse(entry.timestamp as string)).toBeLessThanOrEqual(result.closedAt);
+    expect(append).toEqual(Buffer.from(`${JSON.stringify(entry)}\n`)); // Full prefix + exactly one LF-terminated SDK record.
+    expect(inode(owner.sessionFile)).toEqual(before.sessionInode); expect(inode(owner.sessionPin)).toEqual(before.pinInode);
+    expect(fs.readFileSync(owner.sessionPin)).toEqual(before.pin); expect(fs.realpathSync(owner.sessionFile)).toBe(before.file);
+    expect(inode(`${owner.sessionFile}.main.lock`)).toEqual(lock);
+    expect(owner.sdkImports().some(value => value.pid === result.pid && value.url.endsWith("/cli.js"))).toBe(true);
+    expect(owner.observations().filter(value => value.pid === result.pid)).toEqual([]);
+    expect(owner.callbacks()).toEqual([]); expect(files(owner.meshRoot)).toEqual(meshBefore);
+    expect(owner.mesh.listAll("topology/participants/", { fresh: true })).toEqual([]);
+    expect(fs.existsSync(path.join(owner.residencyRoot, "owner.json"))).toBe(false);
   }, 180_000);
 
   it("keeps the pinned native file outside REAL ordinary SDK listing/resume/continue/bare-ID resolution, with an ordinary positive control", async () => {

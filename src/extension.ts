@@ -265,8 +265,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
   // Refuse a selected private native pin before the SDK can append startup metadata.
-  if (!options.managedHost && process.env.PI_FABRIC_NATIVE_OWNER_CONFIG !== undefined &&
-      process.argv.some((arg, i) => arg === "--session" && path.isAbsolute(process.argv[i + 1] ?? ""))) {
+  if (!options.managedHost && process.env.PI_FABRIC_NATIVE_OWNER_CONFIG !== undefined) {
     (await import("./worker/native-owner-entry.js")).guardNativeOwnerRegistration();
   }
   registerFabricPrincipalCapture(pi);

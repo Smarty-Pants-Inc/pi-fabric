@@ -20,7 +20,7 @@ import { MeshStore, type MeshIdentity } from "../../src/mesh/store.js";
 import { residentHostId } from "../../src/residency/protocol.js";
 import { BRIDGE_MACHINE, FakePresence, LINK, POD_MACHINE, fileLead, natsLead, route } from "./bridge-nats-l2-fakes.js";
 
-export const NATIVE_ACTOR_ID = "5027cfd59b1247b6bb4666970c481cc4";
+export const NATIVE_ACTOR_ID = "34200000000000000000000000000001";
 export const nativePosix = process.platform !== "win32" && !!fs.constants.O_NOFOLLOW && !!fs.constants.O_DIRECTORY && !!process.geteuid;
 export const deferred = <T>() => {
   let resolve!: (value: T | PromiseLike<T>) => void;

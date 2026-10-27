@@ -4,6 +4,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -175,20 +176,25 @@ const nativeOwnerConfig = (): NativeOwnerConfig | undefined => {
   } finally { if (fd !== undefined) fs.closeSync(fd); if (parent !== undefined) fs.closeSync(parent); }
 };
 
-/** Config selects policy, never custody. Registration admits only an exact
- * absolute config pin; task-entry retains its existing canonical/prefix and
- * adjacent-lock hints. Both routes use the same actual open-description proof.
+/** Match 031c main.resolveSessionPath/utils.resolvePath without importing the
+ * SDK or reading history. Bare IDs are discovery, NOT cwd-relative filenames.
+ * Config selects policy, never custody; both routes reuse the same OFD proof.
  */
-const guardNativeOwnerSelection = (file: string | undefined, cwd: string, exactConfigPin = false): void => {
-  if (!file || (exactConfigPin && !absolute(file))) return;
+const guardNativeOwnerSelection = (file: string | undefined, cwd: string): void => {
+  if (!file) return;
   const config = nativeOwnerConfig();
-  if (exactConfigPin && file !== config?.sessionFile) return;
-  const selected = path.resolve(cwd, file);
-  const canonical = fs.existsSync(selected) ? fs.realpathSync(selected) : selected;
-  const native = config && (selected === config.sessionFile || canonical === config.sessionFile ||
-    (/^[0-9a-f-]+$/.test(file) && config.sessionId.startsWith(file)));
+  if (config && file === config.sessionId) refused("native session selection must use its canonical pin");
+  if (!file.includes("/") && !file.includes("\\") && !file.endsWith(".jsonl")) return;
+  const normalized = file === "~" ? homedir() : file.startsWith("~/") ? path.join(homedir(), file.slice(2)) :
+    /^file:\/\//.test(file) ? fileURLToPath(file) : file;
+  const selected = path.resolve(cwd, normalized);
+  // Configured selection must be provable, not a textual non-match or a failed
+  // realpath treated as permission. No native JSONL is opened to discover ID.
+  const canonical = config ? fs.realpathSync(selected) : fs.existsSync(selected) ? fs.realpathSync(selected) : selected;
+  const pinned = config ? fs.realpathSync(config.sessionFile) : undefined;
+  const native = pinned !== undefined && canonical === pinned;
   if (!native && !fs.lstatSync(`${canonical}.main.lock`, { throwIfNoEntry: false })) return;
-  if (selected !== canonical || (native && selected !== config.sessionFile)) refused("native session selection must use its canonical pin");
+  if (native ? pinned !== config!.sessionFile : selected !== canonical) refused("native session selection must use its canonical pin");
   guardNativeOwnerSessionIo(canonical);
 };
 
@@ -208,35 +214,48 @@ const nativeOwnerFailStop = (error: unknown): never => {
   process.exit(1);
 };
 
-/** Registration has no SDK context or identity. Recognize only an unambiguous
- * absolute CLI --session, before startup metadata is appended. Unknown options
- * and competing selection modes remain the SDK's decision; no bare-ID resolver.
+/** Registration precedes SDK thinking metadata but has no SDK identity. With
+ * config set, ambiguous selectors/unknown flags ALWAYS fail-stop, even for an
+ * ordinary target. Consume known values exactly as 031c does, never treating a
+ * value as another option. No last-session-wins or native bare-prefix resolver.
  */
 export function guardNativeOwnerRegistration(): void {
-  const args = process.argv.slice(2);
-  const values = new Set(["--mode", "--provider", "--model", "--api-key", "--system-prompt", "--append-system-prompt",
-    "--name", "-n", "--max-provider-requests", "--session-dir", "--models", "--tools", "-t", "--exclude-tools", "-xt",
-    "--thinking", "--export", "--extension", "-e", "--skill", "--prompt-template", "--theme", "--use-theme", "--tui-mode"]);
-  const switches = new Set(["--no-auto-compaction", "--no-tools", "-nt", "--no-builtin-tools", "-nbt", "--print", "-p",
-    "--no-extensions", "-ne", "--no-mcp", "--no-skills", "-ns", "--no-prompt-templates", "-np", "--no-themes",
-    "--no-context-files", "-nc", "--verbose", "--approve", "-a", "--no-approve", "-na", "--offline"]);
-  let file: string | undefined;
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index]!;
-    if (arg === "--") break;
-    if (["--no-session", "--continue", "-c", "--resume", "-r", "--fork", "--session-id", "--help", "-h", "--version", "-v", "--list-models"].includes(arg)) return;
-    if (arg === "--session") {
-      if (file !== undefined) return;
-      file = args[++index];
-      if (!file || !absolute(file)) return;
-    } else if (values.has(arg)) {
-      const value = args[++index];
-      if (value === undefined || value.startsWith("-")) return;
-    } else if (!switches.has(arg) && arg.startsWith("-")) return;
-  }
-  if (!file) return;
-  try { guardNativeOwnerSelection(file, process.cwd(), true); }
-  catch (error) { nativeOwnerFailStop(error); }
+  if (process.env.PI_FABRIC_NATIVE_OWNER_CONFIG === undefined) return;
+  try {
+    const args = process.argv.slice(2);
+    const values = new Set(["--mode", "--provider", "--model", "--api-key", "--system-prompt", "--append-system-prompt",
+      "--name", "-n", "--max-provider-requests", "--session-dir", "--models", "--tools", "-t", "--exclude-tools", "-xt",
+      "--thinking", "--extension", "-e", "--skill", "--prompt-template", "--theme", "--use-theme", "--tui-mode"]);
+    const switches = new Set(["--no-auto-compaction", "--no-tools", "-nt", "--no-builtin-tools", "-nbt",
+      "--no-extensions", "-ne", "--no-mcp", "--no-skills", "-ns", "--no-prompt-templates", "-np", "--no-themes",
+      "--no-context-files", "-nc", "--verbose", "--approve", "-a", "--no-approve", "-na", "--offline"]);
+    let file: string | undefined, neverNative = false;
+    for (let index = 0; index < args.length; index++) {
+      const arg = args[index]!;
+      if (arg === "--") break;
+      if (["--continue", "-c", "--resume", "-r"].includes(arg)) refused(`ambiguous native session selector ${arg}`);
+      if (arg === "--session") {
+        if (file !== undefined) refused("duplicate --session");
+        file = args[++index];
+        if (!file) refused("missing --session value");
+      } else if (["--fork", "--session-id", "--export"].includes(arg) || values.has(arg)) {
+        const value = args[++index];
+        if (value === undefined || (["--mode", "--use-theme", "--max-provider-requests", "--tui-mode"].includes(arg) && value.startsWith("-"))) {
+          refused(`missing ${arg} value`);
+        }
+        if (["--fork", "--session-id", "--export"].includes(arg)) neverNative = true;
+      } else if (["--no-session", "--help", "-h", "--version", "-v", "--list-models"].includes(arg)) {
+        neverNative = true;
+        if (arg === "--list-models" && args[index + 1] !== undefined && !args[index + 1]!.startsWith("-") && !args[index + 1]!.startsWith("@")) index++;
+      } else if (arg === "--print" || arg === "-p") {
+        const next = args[index + 1];
+        if (next !== undefined && !next.startsWith("@") && (!next.startsWith("-") || next.startsWith("---"))) index++;
+      } else if (/^--max-provider-requests=[1-9][0-9]*$/.test(arg)) {
+        // The only supported inline-value spelling in 031c's safe flag set.
+      } else if (!switches.has(arg) && arg.startsWith("-")) refused(`unknown native owner option ${arg}`);
+    }
+    if (!neverNative) guardNativeOwnerSelection(file, process.cwd());
+  } catch (error) { nativeOwnerFailStop(error); }
 }
 
 /** Nonblocking real flock on the open description retained by THIS process.

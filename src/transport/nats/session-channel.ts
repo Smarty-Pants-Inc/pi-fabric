@@ -119,7 +119,12 @@ export class NatsSessionChannelManager {
       closed: false,
     };
     this.#channels.set(record.service, record);
-    this.#bind(record);
+    try {
+      this.#bind(record);
+    } catch (cause) {
+      this.#closeChannel(record);
+      throw cause;
+    }
     const connection = this.#connection;
     if (!connection || connection.isClosed() || connection.isDraining()) {
       this.#closeChannel(record);

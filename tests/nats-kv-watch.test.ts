@@ -91,19 +91,23 @@ const gateConsumer = (js: JetStreamClient) => {
   const getPushConsumer: JetStreamClient["consumers"]["getPushConsumer"] = async (...args) => {
     const consumer = await js.consumers.getPushConsumer(...args);
     created.resolve(consumer);
+    return consumer;
+  };
+  const getBoundPushConsumer: JetStreamClient["consumers"]["getBoundPushConsumer"] = async (options) => {
+    const delivery = await js.consumers.getBoundPushConsumer(options);
     return {
-      info: (cached) => consumer.info(cached),
-      delete: () => consumer.delete(),
-      isPullConsumer: () => consumer.isPullConsumer(),
-      isPushConsumer: () => consumer.isPushConsumer(),
+      info: (cached) => delivery.info(cached),
+      delete: () => delivery.delete(),
+      isPullConsumer: () => delivery.isPullConsumer(),
+      isPushConsumer: () => delivery.isPushConsumer(),
       consume: async (options) => {
         await release.promise;
-        return consumer.consume(options);
+        return delivery.consume(options);
       },
     };
   };
   const client = Object.create(js) as JetStreamClient;
-  Object.defineProperty(client, "consumers", { value: { getPushConsumer } });
+  Object.defineProperty(client, "consumers", { value: { getPushConsumer, getBoundPushConsumer } });
   return { client, created: created.promise, release: () => release.resolve() };
 };
 
@@ -304,16 +308,27 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
         delete: () => consumer.delete(),
         isPullConsumer: () => consumer.isPullConsumer(),
         isPushConsumer: () => consumer.isPushConsumer(),
+        consume: (options) => consumer.consume(options),
+      };
+    };
+    const getBoundPushConsumer: JetStreamClient["consumers"]["getBoundPushConsumer"] = async (options) => {
+      const first = attempts === 1;
+      const delivery = await connection.js.consumers.getBoundPushConsumer(options);
+      return {
+        info: (cached) => delivery.info(cached),
+        delete: () => delivery.delete(),
+        isPullConsumer: () => delivery.isPullConsumer(),
+        isPushConsumer: () => delivery.isPushConsumer(),
         consume: async (options) => {
           if (first && stage === "consume") throw new RequestError("request failed", { cause: new TimeoutError() });
-          const messages = await consumer.consume(options);
+          const messages = await delivery.consume(options);
           if (first) consumed.resolve(messages);
           return messages;
         },
       };
     };
     const client = Object.create(connection.js) as JetStreamClient;
-    Object.defineProperty(client, "consumers", { value: { getPushConsumer } });
+    Object.defineProperty(client, "consumers", { value: { getPushConsumer, getBoundPushConsumer } });
     const recoveringStore = await openNatsKv(client, { bucket: "fabric_presence" }, false, connection.onStatus);
     const diagnostic = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const { iterator, controller } = watch(recoveringStore, key);
@@ -467,7 +482,7 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
     expect(info.config.durable_name).toBeUndefined();
     expect(info.config.flow_control).toBe(true);
     await manager.consumers.delete(STREAM, info.name);
-    // The official ordered push consumer reports deletion after two missed 30s heartbeats.
+    // The push binding reports deletion after two missed 30s heartbeats.
     // Wait on that broker event with a bounded margin for the server/event loop under CI load.
     expect(await next(iterator, 120_000)).toEqual({ type: "reset" });
     expect(await convergedSnapshot(iterator)).toEqual([{ type: "put", entry: { key, machine: A, owner: OWNER, value: { n: 1 }, revision } }]);

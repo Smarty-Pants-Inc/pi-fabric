@@ -287,8 +287,9 @@ describe("NATS local presence projection", () => {
     const initialGeneration = f.presence.watchGeneration;
     const write = participantFiles.writeParticipantFileIf;
     let failed = false;
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     vi.spyOn(participantFiles, "writeParticipantFileIf").mockImplementation(async (...args) => {
-      if (!failed) { failed = true; throw new Error("injected participant writer failure"); }
+      if (!failed) { failed = true; throw Object.assign(new Error("injected participant writer failure"), { code: "EIO" }); }
       return write(...args);
     });
 
@@ -297,12 +298,66 @@ describe("NATS local presence projection", () => {
     await waitUntil(() => expect(f.presence.watchGeneration).toBeGreaterThan(initialGeneration));
     await waitUntil(() => expect(projectedParticipantRevision(f.mesh.root, f.id)).toBe(revision));
     expect(failed).toBe(true);
+    expect(warning.mock.calls).toEqual([[`[fabric:nats:local-projection] ${JSON.stringify({
+      outcome: "retry", bucket: "presence", code: "EIO", message: "injected participant writer failure",
+    })}`]]);
 
     const later = participant(f.id, INCARNATION, "Later participant renewal", first.updatedAt + 1);
     revision = await f.presence.put(participantKvKey(f.id), owner, later, revision);
     await waitUntil(() => expect(projectedParticipantRevision(f.mesh.root, f.id)).toBe(revision));
     expect(await f.presence.delete(participantKvKey(f.id), revision)).toBe(true);
     await waitUntil(() => expect(readParticipantFile(f.mesh.root, localParticipantKey(f.id))).toBeUndefined());
+  });
+
+  // Keep: smarty-dev#17172 — local custody contention must not replace a healthy KV watch.
+  it.each(["put", "gone", "reconcile"] as const)("retries custody contention during %s without reopening the watch", async (operation) => {
+    const f = fixture();
+    await start(f);
+    const initialGeneration = f.leases.watchGeneration;
+    const lock = hostLeaseLock.withHostLeaseLock;
+    let failures = 0;
+    vi.spyOn(hostLeaseLock, "withHostLeaseLock").mockImplementation(async (...args) => {
+      if (failures++ < 2) throw new hostLeaseLock.HostLeaseLockBusyError(args[1]);
+      return lock(...args);
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    if (operation === "put") {
+      fs.rmSync(hostLeasePath(f.mesh.root, f.id)); // Bypass the stat-only renewal path.
+      const revision = await f.leases.put(leaseKvKey(f.id), owner,
+        lease(f.id, INCARNATION, f.hostLease.updatedAt + 1), f.leaseEntry!.revision);
+      await waitUntil(() => expect(projectedHostLeaseRevision(f.mesh.root, f.id)).toBe(revision));
+    } else {
+      if (operation === "reconcile") f.leases.pause(0);
+      expect(await f.leases.delete(leaseKvKey(f.id), f.leaseEntry!.revision)).toBe(true);
+      if (operation === "reconcile") {
+        f.leases.pause(0, false);
+        f.leases.deliverTo(0, { type: "reset" });
+      }
+      await waitUntil(() => expect(readHostLease(f.mesh.root, f.id)).toBeUndefined());
+    }
+    expect(failures).toBe(3);
+    expect(f.leases.watchGeneration).toBe(initialGeneration);
+    expect(warning).not.toHaveBeenCalled();
+  });
+
+  it("cancels a contended event retry on close without reopening the watch", async () => {
+    const f = fixture();
+    await start(f);
+    const entered = deferred<void>();
+    const lock = hostLeaseLock.withHostLeaseLock;
+    let busy = true;
+    vi.spyOn(hostLeaseLock, "withHostLeaseLock").mockImplementation(async (...args) => {
+      if (busy) { entered.resolve(); throw new hostLeaseLock.HostLeaseLockBusyError(args[1]); }
+      return lock(...args);
+    });
+    await f.leases.delete(leaseKvKey(f.id), f.leaseEntry!.revision);
+    await entered.promise;
+    // Shutdown reconciliation can succeed; the already waiting event must cancel.
+    busy = false;
+    await f.projection.close();
+    expect(f.leases.watchGeneration).toBe(1);
+    expect(f.leases.watchers).toHaveLength(0);
+    expect(readHostLease(f.mesh.root, f.id)).toBeUndefined();
   });
 
   it("resnapshots and continues after a host lease lock failure", async () => {

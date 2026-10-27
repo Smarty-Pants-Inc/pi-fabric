@@ -30,6 +30,8 @@ export type { TransportKvEntry as NatsKvEntry, TransportKvEvent as NatsKvEvent }
 const MACHINE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const KEY_TOKEN = /^[A-Za-z0-9_-]{1,128}$/;
 const CONFLICT_CODES = new Set([10071, 10164]);
+const warnedInvalidWatchRecords = new Set<string>();
+let skippedInvalidWatchRecords = 0;
 
 export interface NatsKvPolicy {
   readonly bucket: string;
@@ -107,6 +109,32 @@ const decodeValue = <V>(key: string, value: Uint8Array, revision: number): Trans
   return { key, machine, owner: parsed.owner, value: parsed.value as V, revision };
 };
 const decode = <V>(entry: KvEntry): TransportKvEntry<V> => decodeValue(entry.key, entry.value, entry.revision);
+
+const invalidWatchRecordReason = (error: unknown): string | undefined =>
+  error instanceof TransportInvalidError && (error.message === "invalid KV key" || error.message === "invalid KV value")
+    ? error.message : undefined;
+
+const diagnosticToken = (value: string, maxLength: number): string =>
+  value.replace(/[^A-Za-z0-9_.:@/-]/g, "?").slice(0, maxLength);
+
+const parsedOwner = (value: Uint8Array): string | undefined => {
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(value)) as { owner?: unknown };
+    return parsed && typeof parsed.owner === "string" ? parsed.owner : undefined;
+  } catch { return undefined; }
+};
+
+const warnSkippedInvalidRecord = (bucket: string, key: string, value: Uint8Array, reason: string, revision: number): void => {
+  const count = ++skippedInvalidWatchRecords;
+  const warningKey = `${bucket}\0${key}`;
+  if (warnedInvalidWatchRecords.has(warningKey)) return;
+  warnedInvalidWatchRecords.add(warningKey);
+  const owner = parsedOwner(value);
+  try {
+    console.warn(`[fabric:nats:kv-watch] ${JSON.stringify({ outcome: "skipped-invalid-record", bucket,
+      key: diagnosticToken(key, 256), reason, ...(owner === undefined ? {} : { owner }), revision, count })}`);
+  } catch { /* diagnostics must not fail a watch */ }
+};
 
 const assertPolicy = async (bucket: KV, policy: Required<NatsKvPolicy>): Promise<void> => {
   const status = await bucket.status();
@@ -359,13 +387,22 @@ export class NatsKvStore implements TransportKv {
                 const operation = msg.headers?.get("KV-Operation");
                 // Server-generated expiry markers have no KV-Operation header.
                 const expired = msg.headers?.get("Nats-Marker-Reason") === "MaxAge";
-                if (expired || operation === "DEL" || operation === "PURGE") {
-                  const [machine] = splitKey(key);
-                  emit({ type: "gone", key, machine, revision: info.streamSequence,
-                    reason: expired ? "expired" : "deleted" });
-                } else {
-                  emit({ type: "put", entry: decodeValue<V>(key, msg.data, info.streamSequence) });
+                // Decode first; only a malformed record is skipped. Consumer errors from emit() still propagate.
+                let event: TransportKvEvent<V> | undefined;
+                try {
+                  if (expired || operation === "DEL" || operation === "PURGE") {
+                    const [machine] = splitKey(key);
+                    event = { type: "gone", key, machine, revision: info.streamSequence,
+                      reason: expired ? "expired" : "deleted" };
+                  } else {
+                    event = { type: "put", entry: decodeValue<V>(key, msg.data, info.streamSequence) };
+                  }
+                } catch (error) {
+                  const reason = invalidWatchRecordReason(error);
+                  if (!reason) throw error;
+                  warnSkippedInvalidRecord(this.#policy.bucket, key, msg.data, reason, info.streamSequence);
                 }
+                if (event) emit(event);
                 if (info.pending === 0) markReady();
               } catch (error) {
                 failure = error;

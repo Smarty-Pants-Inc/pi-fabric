@@ -288,6 +288,18 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
     expect(await bounded(iterator.next(), "aborted empty watch")).toEqual({ done: true, value: undefined });
   });
 
+  it("keeps bucket configuration mismatches terminal", async () => {
+    const { connection } = await presence(A);
+    await expect(openNatsKv(connection.js, { bucket: "fabric_presence", ttlMs: 1 }, false, connection.onStatus))
+      .rejects.toThrow("NATS KV configuration mismatch: fabric_presence");
+  });
+
+  it("keeps invalid watch prefixes terminal", async () => {
+    const { store } = await presence(A);
+    const iterator = store.watch("not a prefix", new AbortController().signal)[Symbol.asyncIterator]();
+    await expect(iterator.next()).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID" });
+  });
+
   it.each(["create", "info", "consume", "closed"] as const)("retries a transient %s failure without a core reconnect, then emits reset/snapshot/ready", async (stage) => {
     const { connection, store } = await presence(A);
     const key = `${A}.p.retry-${stage}`;
@@ -793,28 +805,68 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
     } })));
   });
 
-  it.each([{ name: "shape", wire: "{}" }, { name: "syntax", wire: "not-json" }])("fails on malformed broker data instead of hiding it behind reset/retry: $name", async ({ name, wire }) => {
+  it.each([
+    { name: "shape", wire: JSON.stringify({ owner: OWNER }) },
+    { name: "syntax", wire: "not-json" },
+  ])("skips and warns on malformed broker data, then continues the watch: $name", async ({ name, wire }) => {
     const { store } = await presence(A);
     const key = `${A}.p.malformed-${name}`;
     const { iterator } = watch(store, key);
     expect(await next(iterator)).toEqual({ type: "ready" });
+    const diagnostic = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const bootstrap = await harness.connect(harness.users.bootstrap);
     let revision = 0;
     try {
-      revision = (await jetstream(bootstrap).publish(`$KV.fabric_presence.${key}`, wire)).seq;
-      await expect(bounded(iterator.next(), "malformed entry failure")).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID" });
+      const js = jetstream(bootstrap);
+      revision = (await js.publish(`$KV.fabric_presence.${key}`, wire)).seq;
+      revision = (await js.publish(`$KV.fabric_presence.${key}`, wire)).seq;
+      await expect(store.get(key)).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_INVALID" });
+      const validRevision = await store.put(key, OWNER, { n: 1 }, revision);
+      expect(await next(iterator)).toEqual({ type: "put", entry: { key, machine: A, owner: OWNER, value: { n: 1 }, revision: validRevision } });
+      expect(diagnostic).toHaveBeenCalledTimes(1);
+      const warning = JSON.parse(String(diagnostic.mock.calls[0]![0]).slice("[fabric:nats:kv-watch] ".length));
+      expect(warning).toMatchObject({ outcome: "skipped-invalid-record", bucket: "fabric_presence", key,
+        reason: "invalid KV value", revision: expect.any(Number), count: expect.any(Number) });
+      if (name === "shape") expect(warning.owner).toBe(OWNER);
+      else expect(warning).not.toHaveProperty("owner");
+      revision = validRevision;
     } finally {
       try { if (revision) await store.delete(key, revision); }
-      finally { await bootstrap.close(); }
+      finally { await bootstrap.close(); diagnostic.mockRestore(); }
     }
   });
 
-  it("restarts a failed participant watch after verified reconnect and clears failure after replay", async () => {
-    const id = "session:watch-failed-recovery";
+  it("skips a malformed key and still delivers later valid records", async () => {
+    const { store } = await presence(A);
+    const { iterator } = watch(store, "*.p.bad-key");
+    await snapshot(iterator);
+    const diagnostic = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const bootstrap = await harness.connect(harness.users.bootstrap);
+    const malformedKey = `${A}!.p.bad-key`;
+    const validKey = `${A}.p.bad-key`;
+    let revision = 0;
+    try {
+      revision = (await jetstream(bootstrap).publish(`$KV.fabric_presence.${malformedKey}`, JSON.stringify({ owner: OWNER, value: { n: 0 } }))).seq;
+      const validRevision = await store.put(validKey, OWNER, { n: 1 }, 0);
+      expect(await next(iterator)).toEqual({ type: "put", entry: { key: validKey, machine: A, owner: OWNER, value: { n: 1 }, revision: validRevision } });
+      expect(diagnostic).toHaveBeenCalledTimes(1);
+      const warning = JSON.parse(String(diagnostic.mock.calls[0]![0]).slice("[fabric:nats:kv-watch] ".length));
+      expect(warning).toMatchObject({ outcome: "skipped-invalid-record", bucket: "fabric_presence",
+        key: `${A}?.p.bad-key`, owner: OWNER, reason: "invalid KV key", revision, count: expect.any(Number) });
+      await store.delete(validKey, validRevision);
+    } finally {
+      await bootstrap.close();
+      diagnostic.mockRestore();
+    }
+  });
+
+  it("keeps the participant directory ready when its presence watch skips a malformed row", async () => {
+    const id = "session:watch-malformed-presence";
     const transport = await openNatsTransport({ ...harness.runtimeOptions(harness.users.machineA), hostId: id });
     const leaseAbort = new AbortController();
     const directory = new KvParticipantDirectory({ transport, lease: { live: () => true, signal: leaseAbort.signal },
-      identityId: id, rootId: id, ownerIncarnation: "watch-failed-recovery" });
+      identityId: id, rootId: id, ownerIncarnation: "watch-malformed-presence" });
+    const diagnostic = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const waitFor = async (predicate: () => boolean, label: string, ms = 8_000): Promise<void> => {
       const deadline = Date.now() + ms;
       while (Date.now() < deadline) { if (predicate()) return; await wait(20); }
@@ -823,24 +875,21 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
     try {
       directory.start();
       await waitFor(() => directory.ready, "initial empty snapshots");
-      const token = createHash("sha256").update("malformed-watch-recovery").digest("hex").slice(0, 32);
+      const token = createHash("sha256").update("malformed-presence-does-not-break-readiness").digest("hex").slice(0, 32);
       const key = `${A}.p.${token}`;
       const admin = await harness.connect(harness.users.bootstrap);
-      let revision: number;
-      try { revision = (await jetstream(admin).publish(`$KV.fabric_presence.${key}`, "{}")).seq; }
+      try { await jetstream(admin).publish(`$KV.fabric_presence.${key}`, "{}"); }
       finally { await admin.close(); }
-      await waitFor(() => !directory.ready, "malformed row stops participant readiness");
-      expect(directory.ready).toBe(false);
-      expect(await transport.kv("presence").delete(key, revision)).toBe(true);
-      await bounded(harness.restart(), "verified NATS reconnect after malformed row", 25_000);
-      await waitFor(() => directory.ready, "watch snapshot replay clears the prior failure", 15_000);
+      await waitFor(() => diagnostic.mock.calls.some(([line]) => String(line).includes("skipped-invalid-record")), "malformed presence record was skipped");
       expect(directory.ready).toBe(true);
+      expect(directory.canConsumeMesh()).toBe(true);
     } finally {
+      diagnostic.mockRestore();
       leaseAbort.abort();
       await directory.close();
       await transport.close();
     }
-  }, 50_000);
+  }, 20_000);
 
   it("refuses non-serializable values before storing an unreadable record", async () => {
     const { store } = await presence(A);

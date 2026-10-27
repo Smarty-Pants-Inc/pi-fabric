@@ -160,6 +160,17 @@ describe("bridge unaddressed refresh configuration", () => {
     expect(parseBridgeUnaddressedRefreshMs(value)).toBe(expected);
   });
 
+  it.each([undefined, "", "invalid", "15000"])("does not log the default refresh interval for %s", async value => {
+    vi.stubEnv("FABRIC_BRIDGE_UNADDRESSED_REFRESH_MS", value);
+    const f = await fixture();
+    const logs: string[] = [];
+    const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local: f.local, remote: f.remote,
+      cursorPath: f.cursorPath, log: line => logs.push(line) });
+    await bridge.start();
+    cleanups.push(() => bridge.stop());
+    expect(logs).toEqual([]);
+  });
+
   it("reads the override at start, logs it, and keeps that value after the environment changes", async () => {
     let now = 1_800_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);

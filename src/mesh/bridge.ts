@@ -3828,7 +3828,9 @@ export class MeshBridge {
     if (this.#stopped) throw relayUnavailable();
     this.#ready = false;
     this.#unaddressedRefreshMs = parseBridgeUnaddressedRefreshMs(process.env.FABRIC_BRIDGE_UNADDRESSED_REFRESH_MS);
-    this.#log(`bridge: unaddressed membership refresh ${this.#unaddressedRefreshMs} ms`);
+    if (this.#unaddressedRefreshMs !== UNADDRESSED_REFRESH_MS) {
+      this.#log(`bridge: unaddressed membership refresh ${this.#unaddressedRefreshMs} ms`);
+    }
     // Cursors recover events, not presence. A reconnect may follow lease expiry or pruning,
     // even when this instance's previous presence pass would not yet be due (#5036).
     this.#presenceAt = Number.NEGATIVE_INFINITY;

@@ -126,6 +126,7 @@ at every level, so a misspelt field never falls back to a default.
 | `nats.inboxLanes` | Default 8. |
 | `allow.file`, `allow.nats` | Who may cross; see below. |
 | `callTimeoutMs` | Deadline of each NATS-side call (default 30,000; 1,000 to 300,000). |
+| `directionStallAfterMs` | Optional safe integer in milliseconds, 60,000 to 3,600,000 (inclusive). Default 180,000, unchanged when absent. The watchdog closes a link whose pending work in either direction makes no cursor progress for this long, even if the other direction is healthy. Sampled every 15 seconds; idle or advancing directions do not count as stalled. For example, `"directionStallAfterMs": 300000` allows five minutes. |
 | `logLevel` | `info` (default) or `debug`. |
 
 The NATS settings are taken from this file only. `PI_FABRIC_MESH_NATS` and `fabric.json` are never

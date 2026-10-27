@@ -1117,8 +1117,16 @@ export class EventLog {
       limit?: number;
     } = {},
   ): MeshEvent[] {
+    return this.#readPage(input, Math.max(1, Math.min(Math.floor(input.limit ?? 100), this.maxReadEvents)));
+  }
+
+  /** Recovery has its own inspected-event bound, independent of the small delivery frame. */
+  readRecovery(after: number, limit: number): MeshEvent[] {
+    return this.#readPage({ after }, Math.max(1, Math.min(Math.floor(limit), 10_000)));
+  }
+
+  #readPage(input: { after?: number; topic?: string; to?: string }, limit: number): MeshEvent[] {
     if (input.topic !== undefined) this.#validateTopic(input.topic);
-    const limit = Math.max(1, Math.min(Math.floor(input.limit ?? 100), this.maxReadEvents));
     const after = input.after === undefined ? undefined : Math.max(0, Math.floor(input.after));
     const events =
       after === undefined

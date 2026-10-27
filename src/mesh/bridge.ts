@@ -786,6 +786,11 @@ export const bridgeHandoffScope = (
 const settled = (value: Record<string, unknown>): string =>
   contentDigest({ ...value, updatedAt: undefined, expiresAt: undefined });
 
+/** Only duplicate participant scans ignore quiet activity; identity/routing fields still conflict. */
+const participantCopyDigest = (value: FabricParticipantRecord): string =>
+  contentDigest({ ...value, updatedAt: undefined, expiresAt: undefined,
+    turns: undefined, toolCalls: undefined, usage: undefined, currentTool: undefined });
+
 /**
  * A bridge side over a mesh store on this host. `peer` names the other side: it is the
  * `remoteHost` mark on mirrored records and the `bridge.from` of events it bridges in.
@@ -1258,8 +1263,7 @@ export class StoreBridgeSide implements BridgeSide {
         continue;
       }
       const copy = participantCopies.get(entry.key);
-      if (copy && settled(copy.record as unknown as Record<string, unknown>) !==
-        settled(participant as unknown as Record<string, unknown>)) {
+      if (copy && participantCopyDigest(copy.record) !== participantCopyDigest(participant)) {
         rawDroppedCount += 1; reasons.add("topology/participants", "conflicting-copy");
       }
       if (!copy || copy.updatedAt <= entry.updatedAt) participantCopies.set(entry.key, { record: participant, updatedAt: entry.updatedAt });
@@ -3234,6 +3238,8 @@ export interface MeshBridgeOptions {
   log?: (message: string) => void;
   /** Debug lines (each event not addressed across); off when absent. */
   debug?: (message: string) => void;
+  /** Diagnostic only: static admission can distinguish an absent allowed target from a foreign one. */
+  diagnosticTargetAdmitted?: (id: string, direction: "toRemote" | "toLocal") => boolean;
   /**
    * The per-link bound on remote events that cross only through the hub factory exception
    * (default DEFAULT_FACTORY_RATE). Over it, the inbound drain stops at that event with the cursor
@@ -3569,8 +3575,11 @@ export class MeshBridge {
   readonly #tailSafetyDelay: Partial<Record<Direction, number>> = {};
   readonly #membershipSequence: Partial<Record<Direction, number>> = {};
   /** Events not addressed across since the last count line (smarty-dev#9352). */
-  #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, topics: new Set<string>(), more: false };
+  #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, suppressedMissSamples: 0,
+    topics: new Set<string>(), more: false };
   #unaddressedLoggedAt = Number.NEGATIVE_INFINITY;
+  /** Shared rolling-minute sample across directions/stages, with no timer or unbounded id cache. */
+  #missSamples: Array<{ at: number; eventId: string; direction: Direction; stage: string }> = [];
   #presenceInfoLoggedAt = Number.NEGATIVE_INFINITY;
   #legacyNoBaselineWarned = false;
   #legacyNoBaselineOverdueReported = false;
@@ -3790,11 +3799,33 @@ export class MeshBridge {
     this.#log(`${direction}: dropped idempotency conflict sequence ${event.sequence} event ${event.id} key ${key}`);
   }
 
-  /**
-   * An event neither addressed to the peer nor admitted to it: one debug line each, and a count
-   * for the INFO line (smarty-dev#9352: these drops were silent).
-   */
-  #notAddressed(direction: "toRemote" | "toLocal", event: MeshEvent): void {
+  /** Bounded INFO samples never inspect/log a message body and cannot change delivery policy. */
+  #reportMiss(direction: Direction, event: MeshEvent, rules: BridgeRules,
+    stage: "filter" | "membership-retained" | "commit", stale = false): void {
+    try {
+      const now = this.#now();
+      this.#missSamples = this.#missSamples.filter(sample => now - sample.at < UNADDRESSED_LOG_MS);
+      if (this.#missSamples.length >= 5 || this.#missSamples.some(sample =>
+        sample.eventId === event.id && sample.direction === direction && sample.stage === stage)) {
+        this.#unaddressed.suppressedMissSamples = Math.min(Number.MAX_SAFE_INTEGER, this.#unaddressed.suppressedMissSamples + 1);
+      } else {
+        const to = typeof event.to === "string" ? event.to : "(none)";
+        const local = direction === "toRemote" && rules.reservedRecipients?.has(to) && !rules.relayOrigins?.has(to);
+        const held = direction === "toRemote" ? this.options.local.holds?.(to) : rules.recipients.has(to);
+        const classification = local ? "local" : stale ? "stale" : held ? "held"
+          : this.options.local.mirrored?.(to) || this.options.diagnosticTargetAdmitted?.(to, direction) ? "stale" : "not-admitted";
+        this.#missSamples.push({ at: now, eventId: event.id, direction, stage });
+        this.#log(`bridge miss: direction=${direction} event=${JSON.stringify(event.id.slice(0, 160))} ` +
+          `recipient=${JSON.stringify(to.slice(0, 160))} classification=${classification} stage=${stage}`);
+      }
+      // Filter misses report after adding their aggregate; retained/commit misses have no such caller.
+      if (stage !== "filter") this.#reportUnaddressed();
+    } catch { /* Diagnostics must not affect cursor, admission or retry decisions. */ }
+  }
+
+  /** An unaddressed event: sampled INFO detail, existing debug detail and aggregate INFO count. */
+  #notAddressed(direction: "toRemote" | "toLocal", event: MeshEvent, rules: BridgeRules): void {
+    this.#reportMiss(direction, event, rules, "filter");
     const unaddressed = this.#unaddressed;
     unaddressed.count += 1;
     unaddressed[direction] += 1;
@@ -3815,13 +3846,14 @@ export class MeshBridge {
    */
   #reportUnaddressed(): void {
     const unaddressed = this.#unaddressed;
-    if (unaddressed.count === 0 && unaddressed.safety === 0) return;
+    if (unaddressed.count === 0 && unaddressed.safety === 0 && unaddressed.suppressedMissSamples === 0) return;
     const now = this.#now();
     if (now - this.#unaddressedLoggedAt < UNADDRESSED_LOG_MS) return;
     this.#unaddressedLoggedAt = now;
-    this.#unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, topics: new Set<string>(), more: false };
+    this.#unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, suppressedMissSamples: 0,
+      topics: new Set<string>(), more: false };
     this.#log(`bridge: ${unaddressed.count} events not addressed across (topics: ${[...unaddressed.topics].join(", ")}${
-      unaddressed.more ? ", ..." : ""}; toRemote ${unaddressed.toRemote}, toLocal ${unaddressed.toLocal} (to factory ${unaddressed.factory})${
+      unaddressed.more ? ", ..." : ""}; toRemote ${unaddressed.toRemote}, toLocal ${unaddressed.toLocal} (to factory ${unaddressed.factory}); suppressed miss samples ${unaddressed.suppressedMissSamples}${
         unaddressed.safety > 0 ? `; safety wakes advancing retained boundaries ${unaddressed.safety}` : ""})`);
   }
 
@@ -4895,6 +4927,7 @@ export class MeshBridge {
           reason = this.#refusal(event, rules, direction);
         }
         if (reason && this.#staleMembership(event, rules, direction, reason)) {
+          this.#reportMiss(direction, event, rules, "membership-retained", true);
           this.#deferMembership(direction, event);
           if (cursor.after > start) checkpoint();
           return { forwarded, dropped };
@@ -4940,7 +4973,7 @@ export class MeshBridge {
           if (reason !== "not addressed across") {
             dropped += 1;
             this.#log(`${direction}: dropped ${event.topic} ${event.id} from ${event.from.id}: ${reason}`);
-          } else this.#notAddressed(direction, event);
+          } else this.#notAddressed(direction, event, rules);
         } else if (this.#stopped) {
           return { forwarded, dropped };
         } else if (!seen.has(event.id)) {
@@ -5024,6 +5057,7 @@ export class MeshBridge {
               // a proven takeover still refuses, and otherwise retry from the durable cursor.
               rules = await authority(false);
               const currentReason = this.#refusal(event, rules, direction);
+              this.#reportMiss(direction, event, rules, "commit");
               if (this.#staleMembership(event, rules, direction, currentReason)) {
                 this.#deferMembership(direction, event);
                 if (cursor.after > start) checkpoint();

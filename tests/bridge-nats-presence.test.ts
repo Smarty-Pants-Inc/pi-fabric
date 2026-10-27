@@ -1,6 +1,7 @@
 // L1 (smarty-dev#15310): NATS side of the A' bridge, presence both ways, against an in-memory
 // multi-machine KV with the broker's CAS/watch semantics and the real KV participant directory.
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { natsBridgeErrorSummary } from "../src/mesh/bridge-nats-diagnostics.js";
 import {
   NatsBridgePresence,
   NatsMirrorFencedError,
@@ -32,13 +33,14 @@ afterEach(async () => {
 
 function bridge(w: ReturnType<typeof world>, options: { admit?: (record: FabricParticipantRecord, direction: string) => boolean;
   predecessorExited?: (proof: TransportHostLeaseProcessProof) => boolean; clock?: Clock; log?: string[];
-  transport?: FabricTransport; operationTimeoutMs?: number } = {}) {
+  transport?: FabricTransport; operationTimeoutMs?: number; onError?: (error: unknown) => void } = {}) {
   const clock = options.clock ?? { wall: 1_000_000, mono: 50_000 };
   const side = new NatsBridgePresence({
     transport: options.transport ?? w.transport(BRIDGE, "bridge:ryzen1"), link: "nats", admit: options.admit ?? (() => true),
     processProof: PROOF, predecessorExited: options.predecessorExited ?? (() => false),
     now: () => clock.wall, monotonic: () => clock.mono, renewMs: 5_000,
     ...(options.operationTimeoutMs !== undefined ? { operationTimeoutMs: options.operationTimeoutMs } : {}),
+    ...(options.onError ? { onError: options.onError } : {}),
     ...(options.log ? { log: (line: string) => { options.log!.push(line); } } : {}),
   });
   openers.push(side);
@@ -537,6 +539,97 @@ describe("file roots -> KV presence under the bridge machine", () => {
     const again = await side.mirror(filePresence(clock, [fileRoot()]));
     expect(again.refused).toEqual([{ id: FILE_ROOT, code: "FABRIC_BRIDGE_NATS_ID_ON_ANOTHER_MACHINE" }]);
     expect(w.presence.values.has(pKey(BRIDGE, FILE_ROOT))).toBe(false);
+  });
+
+  // Keep: the incident's aggregate callback discarded distinct renewal causes; no real outage needed.
+  it.each([2, 7])("keeps sanitized child codes and bounded renewal attribution in the timer callback (%i failures)", async count => {
+    vi.useFakeTimers();
+    const w = world(), reports: unknown[] = [], logs: string[] = [];
+    const { side, clock } = bridge(w, { onError: error => { reports.push(error); logs.push(natsBridgeErrorSummary(error)); } });
+    await side.whenReady();
+    const records = Array.from({ length: count }, (_, i) => fileRoot(`session:00000000-0000-4000-8000-${String(i).padStart(12, "0")}`));
+    await side.mirror(filePresence(clock, records));
+    const revisions = records.map(record => w.leases.values.get(hKey(BRIDGE, record.id))!.revision);
+    const put = w.leases.put.bind(w.leases);
+    const errors = records.map((_, i) => Object.assign(new Error("PRIVATE credentials=/tmp/user.creds record-body"), {
+      name: i === 0 ? "TimeoutError" : i === 1 ? "NatsError" : "PRIVATE\nunsafe-name",
+      code: i === 0 ? "ETIMEDOUT" : i === 1 ? "503" : "PRIVATE unsafe-code",
+    }));
+    w.leases.put = key => { advance(clock, 3); throw errors[records.findIndex(record => key === hKey(BRIDGE, record.id))]!; };
+    advance(clock, 5_000);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toBeInstanceOf(AggregateError);
+    expect((reports[0] as AggregateError).errors).toEqual(errors);
+    const summary = JSON.parse(logs[0]!);
+    expect(summary.operation).toBe("mirror-renewal");
+    expect(summary.failures).toHaveLength(Math.min(count, 5));
+    expect(summary.failures.slice(0, 2).map((failure: { errors: unknown }) => failure.errors)).toEqual([
+      [{ name: "TimeoutError", code: "ETIMEDOUT" }], [{ name: "NatsError", code: "503" }],
+    ]);
+    for (const failure of summary.failures) {
+      expect(failure).toMatchObject({ operation: "lease-renewal", elapsedMs: expect.any(Number), keyHash: expect.stringMatching(/^[a-f0-9]{16}$/) });
+      expect(failure.elapsedMs).toBeGreaterThan(0);
+      expect(failure.errors).toHaveLength(1);
+    }
+    expect(logs[0]).not.toMatch(/PRIVATE|credentials|user\.creds|record-body|session:|ryzen1-bridge/);
+    expect(records.map(record => side.holds(record.id))).toEqual(records.map(() => true));
+    expect(records.map(record => w.leases.values.get(hKey(BRIDGE, record.id))!.revision)).toEqual(revisions);
+    w.leases.put = put;
+    await side.writer.renew();
+    expect(records.map(record => side.holds(record.id))).toEqual(records.map(() => true));
+    expect(records.map(record => w.leases.values.get(hKey(BRIDGE, record.id))!.revision)).not.toEqual(revisions);
+  });
+
+  // Keep: error metadata is an untrusted logging boundary, even when it looks like an identifier.
+  it.each([
+    "sk_live_AbCdEf0123456789_secret_token",
+    "12345678-1234-4234-8234-123456789abc",
+    "ETIMEDOUT-secret",
+    "constructor",
+    "__proto__",
+  ])("maps unknown error names and codes to OTHER (%s)", value => {
+    const summary = natsBridgeErrorSummary({ name: value, code: value, message: "PRIVATE-body" });
+    expect(JSON.parse(summary)).toEqual({ operation: "port", errors: [{ name: "OTHER", code: "OTHER" }] });
+    expect(summary).not.toContain(value);
+    expect(summary).not.toContain("PRIVATE-body");
+  });
+
+  it.each([
+    ["TimeoutError", "ETIMEDOUT", "ETIMEDOUT"],
+    ["NatsError", "503", "503"],
+    ["JetStreamStatusError", 503, "503"],
+    ["Error", "FABRIC_TRANSPORT_DENIED", "FABRIC_TRANSPORT_DENIED"],
+    ["Error", "FABRIC_TRANSPORT_UNAVAILABLE", "FABRIC_TRANSPORT_UNAVAILABLE"],
+    ["Error", "FABRIC_KV_CONFLICT", "FABRIC_KV_CONFLICT"],
+    ["NatsAuthorizationError", "FABRIC_NATS_AUTHORIZATION", "FABRIC_NATS_AUTHORIZATION"],
+  ])("preserves fixed known diagnostic labels (%s, %s)", (name, code, label) => {
+    expect(JSON.parse(natsBridgeErrorSummary({ name, code }))).toEqual({ operation: "port",
+      errors: [{ name, code: label }] });
+  });
+
+  it("attributes a singleton presence refresh without wrapping the original failure or changing lease ownership", async () => {
+    const w = world();
+    const { side, clock } = bridge(w);
+    await side.whenReady();
+    await side.mirror(filePresence(clock, [fileRoot()]));
+    // Extend the file claim just before the old presence row reaches its refresh age.
+    advance(clock, 179_999);
+    await side.mirror(filePresence(clock, [fileRoot()]));
+    advance(clock, 1);
+    const put = w.presence.put.bind(w.presence);
+    const failure = Object.assign(new Error("PRIVATE presence-body credentials"), { code: "FABRIC_TRANSPORT_DENIED" });
+    w.presence.put = () => { advance(clock, 2); throw failure; };
+    await expect(side.writer.renew()).rejects.toBe(failure);
+    expect(JSON.parse(natsBridgeErrorSummary(failure))).toMatchObject({ operation: "mirror-renewal", failures: [
+      { operation: "presence-refresh", elapsedMs: 2, keyHash: expect.stringMatching(/^[a-f0-9]{16}$/),
+        errors: [{ name: "Error", code: "FABRIC_TRANSPORT_DENIED" }] },
+    ] });
+    expect(natsBridgeErrorSummary(failure)).not.toMatch(/PRIVATE|credentials|presence-body|session:|ryzen1-bridge/);
+    expect(side.holds(FILE_ROOT)).toBe(true);
+    w.presence.put = put;
+    await side.writer.renew();
+    expect(side.holds(FILE_ROOT)).toBe(true);
   });
 
   it("stops claiming to hold a root whose lease renewals keep failing", async () => {

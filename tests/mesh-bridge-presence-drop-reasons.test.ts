@@ -28,9 +28,9 @@ const open = () => {
   stores.push(store);
   return store;
 };
-const rootRecord = () => {
+const rootRecord = (id = "session:PRIVATE-session-000001") => {
   const now = Date.now();
-  const identity: MeshIdentity = { id: "session:PRIVATE-session-000001", name: "PRIVATE-actor", kind: "main", sessionId: "PRIVATE-session" };
+  const identity: MeshIdentity = { id, name: "PRIVATE-actor", kind: "main", sessionId: "PRIVATE-session" };
   const host: FabricHostRecord = { format: 1, id: identity.id, rootId: identity.id, identity,
     startedAt: now, updatedAt: now, expiresAt: now + 120_000 };
   const participant: FabricParticipantRecord = { format: 1, id: identity.id, kind: "root", rootId: identity.id,
@@ -80,14 +80,55 @@ describe("value-free presence drop diagnostics", () => {
     expect(JSON.stringify(result.droppedReasons)).not.toContain("PRIVATE");
   });
 
-  it("reports conflicting shared-state/participant-file copies", async () => {
-    const store = open(), root = rootRecord();
-    await install(store, root);
-    writeParticipantFile(store.root, { key: key("participants", root.identity.id), version: 1,
-      updatedAt: root.participant.updatedAt + 1, updatedBy: root.identity,
-      value: { ...root.participant, name: "PRIVATE-other-name", updatedAt: root.participant.updatedAt + 1 } });
-    const result = await new StoreBridgeSide(store, "PRIVATE-peer").presence();
-    expect(result.droppedReasons).toEqual([{ keyClass: "topology/participants", reason: "conflicting-copy", count: 1 }]);
+  it.each(["file-newer", "state-newer", "file-tie"])("ignores activity-only copies, keeping the %s root addressable", async winner => {
+    const f = link(), root = rootRecord();
+    await install(f.far, root);
+    const state = f.far.get(key("participants", root.identity.id))!;
+    const active = { ...root.participant, turns: 7, toolCalls: 11, currentTool: "read",
+      usage: { input: 10, output: 20, cacheRead: 30, cacheWrite: 40, cost: 0.1 }, updatedAt: root.participant.updatedAt + 1 };
+    writeParticipantFile(f.far.root, { key: state.key, version: 1,
+      updatedAt: state.updatedAt + (winner === "file-newer" ? 1 : winner === "state-newer" ? -1 : 0),
+      updatedBy: root.identity, value: active });
+    // The observed false positives were child agents, which never become root addresses.
+    const child = { ...root.participant, id: "PRIVATE-child", kind: "agent" as const, name: "PRIVATE-child-name" };
+    await f.far.put({ key: key("participants", child.id), identity: root.identity, value: child });
+    writeParticipantFile(f.far.root, { key: key("participants", child.id), version: 1,
+      updatedAt: state.updatedAt + 1, updatedBy: root.identity, value: { ...child, ...active, id: child.id, kind: child.kind, name: child.name } });
+    const result = await f.agent.presence();
+    expect(result.partial).not.toBe(true);
+    expect(result.droppedReasons).toBeUndefined();
+    expect(result.participants).toEqual([winner === "state-newer" ? root.participant : active]);
+    expect(result.reserved).toEqual(expect.arrayContaining([root.identity.id, child.id, child.name]));
+    await f.bridge.syncPresence();
+    expect(f.local.holds(root.identity.id)).toBe(true);
+    expect((await f.local.owned()).participants).toMatchObject([{ id: root.identity.id,
+      ...(winner === "state-newer" ? {} : { turns: 7, toolCalls: 11 }) }]);
+  });
+
+  it.each([
+    { name: "PRIVATE-other-name" },
+    { ownerIncarnation: "PRIVATE-other-incarnation" },
+    { ownerIdentityId: "session:PRIVATE-other-owner" },
+    { ownerHostId: "session:PRIVATE-other-host" },
+    { rootId: "session:PRIVATE-other-root" },
+    { remoteHost: "PRIVATE-other-link" },
+  ])("keeps real copy conflicts partial and holds mirror omissions (%j)", async difference => {
+    const f = link(), root = rootRecord(), omitted = rootRecord("session:PRIVATE-omitted-000002");
+    await install(f.far, root);
+    await install(f.far, omitted);
+    await f.bridge.syncPresence();
+    expect(f.local.holds(omitted.identity.id)).toBe(true);
+    await f.far.delete({ key: key("hosts", omitted.identity.id) });
+    await f.far.delete({ key: key("participants", omitted.identity.id) });
+    const state = f.far.get(key("participants", root.identity.id))!;
+    writeParticipantFile(f.far.root, { key: state.key, version: 1,
+      updatedAt: state.updatedAt + 1, updatedBy: root.identity,
+      value: { ...root.participant, ...difference, updatedAt: root.participant.updatedAt + 1 } });
+    const result = await f.agent.presence();
+    expect(result.partial).toBe(true);
+    expect(result.droppedReasons).toContainEqual({ keyClass: "topology/participants", reason: "conflicting-copy", count: 1 });
+    await f.bridge.syncPresence();
+    expect(f.local.holds(omitted.identity.id)).toBe(true);
   });
 
   it("reports raw participant/owner mismatches", async () => {

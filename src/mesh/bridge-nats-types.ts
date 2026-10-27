@@ -418,8 +418,16 @@ export const bridgeNatsTopicIdempotencyKey = (link: string, fileEventId: string)
 // L1 -> L2: the raw NATS port (L1 provides it; L2's NatsCarrierSide consumes it)
 // ---------------------------------------------------------------------------------------------
 
+/** Bounded diagnostic labels only; never raw lease/owner/machine values or authority. */
+export type BridgeNatsPresenceFailure = "no-route" | "not-ready" | "machine-mismatch" | "identity-mismatch" |
+  "incarnation-mismatch" | "binding-mismatch" | "root-recheck" | "terminal" | "expired" | "not-live";
+
 /** One KV presence record resolved for an id: the route plus the identity from the KV record itself. */
 export interface BridgeNatsPortResolved {
+  /** Classification only: a matching, nonterminal record/lease whose only failed check is expiry. */
+  readonly leaseLapsed?: boolean;
+  readonly presenceFailure?: BridgeNatsPresenceFailure;
+  readonly remainingAuthorityMs?: number;
   /** ParticipantRoute semantics (participant-view.ts): machine from the KV key, presence + lease liveness. */
   readonly route: ParticipantRoute;
   /** From the KV presence record (id, name, kind, sessionId), never from an envelope. */

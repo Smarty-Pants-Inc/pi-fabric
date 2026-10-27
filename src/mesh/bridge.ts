@@ -54,7 +54,7 @@ const PARTICIPANT_PREFIX = "topology/participants/";
 /** Freshness bound for an observation from one physical bridge peer. */
 export const BRIDGE_LEASE_MS = MIRROR_FRESH_MS;
 // Two full mirror TTLs for renewal/reconciliation; never extend an event's first-lapse window.
-const LEASE_LAPSE_DEFER_MS = 2 * BRIDGE_LEASE_MS;
+export const LEASE_LAPSE_DEFER_MS = 2 * BRIDGE_LEASE_MS;
 const DEFAULT_PRESENCE_MS = 5_000;
 /** A retained source event revalidates after this delay; this is NOT an event/authority TTL. */
 const DEFAULT_MEMBERSHIP_RETRY_MS = 1_000;
@@ -481,6 +481,8 @@ export interface BridgeSide {
   holds?(id: string, identity?: MeshIdentity): boolean;
   /** Hub-local only: all ownership checks pass except lease expiry. Not admission authority. */
   leaseLapsed?(id: string, identity?: MeshIdentity): boolean;
+  /** A carrier may already hold this event for a lapse. Share its FIRST durable deadline with the append fence. */
+  retainLeaseLapse?(event: MeshEvent, startedAt?: number): number | undefined;
   /** Hub-local only: a fenced/stale link cannot defer an ownership refusal. */
   readonly ingressFenced?: boolean;
   /** Whether this link has a mirror record for the id, even if its lease lapsed (hub only). */
@@ -4392,9 +4394,15 @@ export class MeshBridge {
       ids.every(id => local.holds?.(id as string, id === event.from.id ? event.from : undefined) ||
         local.leaseLapsed?.(id as string, id === event.from.id ? event.from : undefined));
     const cursor = this.#cursor![direction];
-    if (lapsed && (cursor.leaseLapse?.sequence !== event.sequence || cursor.leaseLapse.id !== event.id)) {
-      cursor.leaseLapse = { sequence: event.sequence, id: event.id, startedAt: Date.now() };
-      this.#save(); // Also persist an unchanged cursor: reconnect cannot renew this window.
+    if (direction === "toLocal" && (cursor.leaseLapse?.sequence !== event.sequence || cursor.leaseLapse.id !== event.id)) {
+      // Import an earlier carrier boundary even when this layer only sees a stale projection.
+      // Otherwise initialize only a proven local lease lapse; never renew on retry/restart.
+      const startedAt = this.options.remote.retainLeaseLapse?.(event, lapsed ? Date.now() : undefined) ??
+        (lapsed ? Date.now() : undefined);
+      if (startedAt !== undefined) {
+        cursor.leaseLapse = { sequence: event.sequence, id: event.id, startedAt };
+        this.#save(); // Also persist an unchanged cursor: reconnect cannot renew this window.
+      }
     }
     // Once a lease lapse starts a window, stale-sample reclassification cannot evade it.
     const deadline = this.#leaseLapseAt(direction, event);

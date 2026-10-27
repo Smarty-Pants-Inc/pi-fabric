@@ -3294,6 +3294,8 @@ export interface MeshBridgeOptions {
   log?: (message: string) => void;
   /** Debug lines (each event not addressed across); off when absent. */
   debug?: (message: string) => void;
+  /** Diagnostic only: static admission can distinguish an absent allowed target from a foreign one. */
+  diagnosticTargetAdmitted?: (id: string, direction: "toRemote" | "toLocal") => boolean;
   /**
    * The per-link bound on remote events that cross only through the hub factory exception
    * (default DEFAULT_FACTORY_RATE). Over it, the inbound drain stops at that event with the cursor
@@ -3631,6 +3633,8 @@ export class MeshBridge {
   /** Events not addressed across since the last count line (smarty-dev#9352). */
   #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, topics: new Set<string>(), more: false };
   #unaddressedLoggedAt = Number.NEGATIVE_INFINITY;
+  /** Shared rolling-minute sample across directions/stages, with no timer or unbounded id cache. */
+  #missSamples: Array<{ at: number; eventId: string; direction: Direction; stage: string }> = [];
   #presenceInfoLoggedAt = Number.NEGATIVE_INFINITY;
   #legacyNoBaselineWarned = false;
   #legacyNoBaselineOverdueReported = false;
@@ -3850,11 +3854,28 @@ export class MeshBridge {
     this.#log(`${direction}: dropped idempotency conflict sequence ${event.sequence} event ${event.id} key ${key}`);
   }
 
-  /**
-   * An event neither addressed to the peer nor admitted to it: one debug line each, and a count
-   * for the INFO line (smarty-dev#9352: these drops were silent).
-   */
-  #notAddressed(direction: "toRemote" | "toLocal", event: MeshEvent): void {
+  /** Bounded INFO samples never inspect/log a message body and cannot change delivery policy. */
+  #reportMiss(direction: Direction, event: MeshEvent, rules: BridgeRules,
+    stage: "filter" | "membership-retained" | "commit", stale = false): void {
+    try {
+      const now = this.#now();
+      this.#missSamples = this.#missSamples.filter(sample => now - sample.at < UNADDRESSED_LOG_MS);
+      if (this.#missSamples.length >= 5 || this.#missSamples.some(sample =>
+        sample.eventId === event.id && sample.direction === direction && sample.stage === stage)) return;
+      const to = typeof event.to === "string" ? event.to : "(none)";
+      const local = direction === "toRemote" && rules.reservedRecipients?.has(to) && !rules.relayOrigins?.has(to);
+      const held = direction === "toRemote" ? this.options.local.holds?.(to) : rules.recipients.has(to);
+      const classification = local ? "local" : stale ? "stale" : held ? "held"
+        : this.options.local.mirrored?.(to) || this.options.diagnosticTargetAdmitted?.(to, direction) ? "stale" : "not-admitted";
+      this.#missSamples.push({ at: now, eventId: event.id, direction, stage });
+      this.#log(`bridge miss: direction=${direction} event=${JSON.stringify(event.id.slice(0, 160))} ` +
+        `recipient=${JSON.stringify(to.slice(0, 160))} classification=${classification} stage=${stage}`);
+    } catch { /* Diagnostics must not affect cursor, admission or retry decisions. */ }
+  }
+
+  /** An unaddressed event: sampled INFO detail, existing debug detail and aggregate INFO count. */
+  #notAddressed(direction: "toRemote" | "toLocal", event: MeshEvent, rules: BridgeRules): void {
+    this.#reportMiss(direction, event, rules, "filter");
     const unaddressed = this.#unaddressed;
     unaddressed.count += 1;
     unaddressed[direction] += 1;
@@ -4955,6 +4976,7 @@ export class MeshBridge {
           reason = this.#refusal(event, rules, direction);
         }
         if (reason && this.#staleMembership(event, rules, direction, reason)) {
+          this.#reportMiss(direction, event, rules, "membership-retained", true);
           this.#deferMembership(direction, event);
           if (cursor.after > start) checkpoint();
           return { forwarded, dropped };
@@ -5000,7 +5022,7 @@ export class MeshBridge {
           if (reason !== "not addressed across") {
             dropped += 1;
             this.#log(`${direction}: dropped ${event.topic} ${event.id} from ${event.from.id}: ${reason}`);
-          } else this.#notAddressed(direction, event);
+          } else this.#notAddressed(direction, event, rules);
         } else if (this.#stopped) {
           return { forwarded, dropped };
         } else if (!seen.has(event.id)) {
@@ -5084,6 +5106,7 @@ export class MeshBridge {
               // a proven takeover still refuses, and otherwise retry from the durable cursor.
               rules = await authority(false);
               const currentReason = this.#refusal(event, rules, direction);
+              this.#reportMiss(direction, event, rules, "commit");
               if (this.#staleMembership(event, rules, direction, currentReason)) {
                 this.#deferMembership(direction, event);
                 if (cursor.after > start) checkpoint();

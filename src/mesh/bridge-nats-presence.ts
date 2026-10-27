@@ -23,6 +23,7 @@
 //   a provably exited predecessor's.
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
+import { natsRenewalFailure, noteNatsRenewalFailures, type NatsRenewalFailure } from "./bridge-nats-diagnostics.js";
 import type { BridgeChange } from "./change-notifier.js";
 import type { BridgeHost, BridgePresence } from "./bridge.js";
 import { ROOT_ID_PREFIX } from "../topology/root-inbox-shared.js";
@@ -848,35 +849,50 @@ export class NatsKvMirror {
       if (this.#fenced) return;
       const now = this.#monotonic();
       const failures: unknown[] = [];
-      await Promise.all([...this.#owned.values()].map(lease => this.#serial(lease.key, async () => {
-        if (this.#fenced || this.#owned.get(lease.key) !== lease) return;
-        if (this.#leaseUntil(lease) <= this.#monotonic()) { await this.#dropLease(lease); return; }
-        try {
-          lease.revision = await this.#put(this.#leases, lease.key, lease.owner, this.#leaseValue(lease.spec), lease.revision,
-            entry => this.#adoptableLease(entry, lease.spec), true);
-          lease.writtenAt = this.#monotonic();
-        } catch (error) {
-          if (isConflict(error)) {
-            // Another writer owns the key now: stop renewing; never fight it.
-            this.#owned.delete(lease.key);
-            this.options.log?.(`nats mirror: lost lease ${lease.spec.id} to another writer`);
+      const diagnostics: NatsRenewalFailure[] = [];
+      const failed = (error: unknown, operation: NatsRenewalFailure["operation"], key: string, started: number): void => {
+        failures.push(error);
+        if (diagnostics.length < 5) diagnostics.push(natsRenewalFailure(error, operation, key, this.#monotonic() - started));
+      };
+      await Promise.all([...this.#owned.values()].map(lease => {
+        const started = this.#monotonic();
+        let operation: NatsRenewalFailure["operation"] = "lease-renewal";
+        return this.#serial(lease.key, async () => {
+          if (this.#fenced || this.#owned.get(lease.key) !== lease) return;
+          if (this.#leaseUntil(lease) <= this.#monotonic()) { operation = "lease-drop"; await this.#dropLease(lease); return; }
+          try {
+            lease.revision = await this.#put(this.#leases, lease.key, lease.owner, this.#leaseValue(lease.spec), lease.revision,
+              entry => this.#adoptableLease(entry, lease.spec), true);
+            lease.writtenAt = this.#monotonic();
+          } catch (error) {
+            if (isConflict(error)) {
+              // Another writer owns the key now: stop renewing; never fight it.
+              this.#owned.delete(lease.key);
+              this.options.log?.(`nats mirror: lost lease ${lease.spec.id} to another writer`);
+            }
+            throw error;
           }
-          throw error;
-        }
-      }).catch(error => { failures.push(error); })));
-      await Promise.all([...this.#rows.values()].map(row => this.#serial(row.key, async () => {
-        if (this.#fenced || this.#rows.get(row.key) !== row || now - row.writtenAt < NATS_MIRROR_PRESENCE_REFRESH_MS) return;
-        if (![...row.claims.values()].some(until => until > this.#monotonic())) return;
-        try {
-          row.revision = await this.#putRow(row.key, row.owner, row.record, row.revision);
-          row.writtenAt = this.#monotonic();
-        } catch (error) {
-          if (isConflict(error)) this.#rows.delete(row.key);
-          throw error;
-        }
-      }).catch(error => { failures.push(error); })));
-      if (failures.length === 1) throw failures[0];
-      if (failures.length > 1) throw new AggregateError(failures, "NATS bridge mirror renewal failed");
+        }).catch(error => { failed(error, operation, lease.key, started); });
+      }));
+      await Promise.all([...this.#rows.values()].map(row => {
+        const started = this.#monotonic();
+        return this.#serial(row.key, async () => {
+          if (this.#fenced || this.#rows.get(row.key) !== row || now - row.writtenAt < NATS_MIRROR_PRESENCE_REFRESH_MS) return;
+          if (![...row.claims.values()].some(until => until > this.#monotonic())) return;
+          try {
+            row.revision = await this.#putRow(row.key, row.owner, row.record, row.revision);
+            row.writtenAt = this.#monotonic();
+          } catch (error) {
+            if (isConflict(error)) this.#rows.delete(row.key);
+            throw error;
+          }
+        }).catch(error => { failed(error, "presence-refresh", row.key, started); });
+      }));
+      if (failures.length > 0) {
+        const error = failures.length === 1 ? failures[0] : new AggregateError(failures, "NATS bridge mirror renewal failed");
+        noteNatsRenewalFailures(error, diagnostics);
+        throw error;
+      }
     })();
     this.#renewing = pass;
     void pass.finally(() => { if (this.#renewing === pass) this.#renewing = undefined; }).catch(() => undefined);

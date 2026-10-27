@@ -13,6 +13,12 @@ against `src/`, so green tests alone are not enough: without a build the
 change is invisible in the TUI and unpublished. Rebuild so the user can
 verify immediately.
 
+Exception: if your task brief or the host's operator forbids local builds
+(for example, a host short on disk), do not build there, not even a
+cancelled attempt. Say "not built locally" in your handoff; CI builds the
+exact commit. This applies to every "finish with `bun run build`" line in
+this file.
+
 ## Startup: budget the transitive graph, not just the entrypoint
 
 A warm jiti filesystem cache avoids transpilation, **not V8 compilation** in a

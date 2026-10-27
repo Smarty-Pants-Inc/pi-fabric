@@ -193,7 +193,7 @@ const retainedRun = async () => {
     // BEFORE the direction starts its late membership sample. Otherwise its normal
     // source-expiry timer, rather than the retained-work scheduler, would own this probe.
     await vi.advanceTimersByTimeAsync(0);
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(1); // Drain telemetry window only; no source-expiry or retry timer.
     readRelease.resolve();
     await boundary.promise;
     await vi.advanceTimersByTimeAsync(0);

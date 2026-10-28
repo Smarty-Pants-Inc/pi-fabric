@@ -9,7 +9,7 @@ import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import { observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildExit, type ResidentChildLifetime } from "./child-lifetime.js";
-import { prepareResidentOwnerIdentity, processStartTime, residentHostOwnerAlive } from "./process-identity.js";
+import { prepareResidentOwnerObservation, processStartTime, residentHostOwnerAlive } from "./process-identity.js";
 import { assertResidentWakeConfig, canonicalResidentWakeConfig, retainedRoutesAt, ResidentWakeConfigMismatch } from "./wake-index.js";
 import { readWakeJson, residentOwnerLive, residentOwnerSleeping, residentSleepingPath, residentWakeRequestPath, residentWakeIntentLockPath, waitResidentChange, ResidentWakePending } from "./wake.js";
 import { FileLockBusy } from "./file-lock.js";
@@ -484,10 +484,14 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
     trace("launcher-idle", { reason: "root dead, no actors; waiting for an explicit spawn request" });
     return;
   }
-  await prepareResidentOwnerIdentity();
+  await prepareResidentOwnerObservation(root);
   // Cancellation may arrive while native identity is prepared, before the stop listener exists.
   // Never create a child after that abort (an AbortSignal does not replay an earlier event).
   if (options.signal?.aborted) return;
+  assertNoWatchdogCustody(root);
+  if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(root)))) return;
+  config = options.wakeOnly ? assertResidentWakeConfig(root, config) : readConfig(configPath);
+  if (readResidentIdleExit(root, config.rootId)) return;
   // Windows has no POSIX birth/session evidence or report-signal recovery.
   // Keep ordinary native child supervision/shutdown, but never enter watchdog custody.
   const watchdogSupported = process.platform !== "win32";
@@ -964,7 +968,7 @@ export interface ResidentWakePendingResult { status: "wake-pending"; root: strin
 export async function superviseWake(configPath: string, run: (configPath: string) => Promise<void> = file => supervise(file, { wakeOnly: true }),
   options: { wakeOnly?: boolean; beforeFinalRelease?: () => Promise<void> } = {}): Promise<void | ResidentWakePendingResult> {
   const root = path.dirname(configPath);
-  await prepareResidentOwnerIdentity();
+  await prepareResidentOwnerObservation(root);
   let fd: number | undefined;
   try { fd = await lockFile(path.join(root, "wake.lock"), 0, process.platform === "linux"); }
   catch (error) { if (error instanceof FileLockBusy) return; throw error; }

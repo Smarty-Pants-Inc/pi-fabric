@@ -17,6 +17,7 @@ vi.mock("cross-spawn", () => ({ default: mocks.spawn }));
 vi.mock("../src/residency/process-identity.js", () => ({
   processStartTime: (pid: number) => mocks.births.get(pid) ?? "fixture-birth", residentProcessAlive: (pid: number) => mocks.alive.has(pid),
   prepareResidentOwnerIdentity: mocks.prepare,
+  prepareResidentOwnerObservation: mocks.prepare,
   residentHostOwnerAlive: (owner: { pid: number }) => mocks.alive.has(owner.pid),
 }));
 vi.mock("../src/residency/file-lock.js", () => ({ lockFile: async (file: string) => {

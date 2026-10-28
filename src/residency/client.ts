@@ -24,7 +24,7 @@ import { BUILT_IN_RUNNER_IDS, requireAgentRunner, requireActorRunner } from "../
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
 import { executeFile, spawnDetached, resolveScriptRuntime } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
-import { prepareResidentOwnerIdentity, processStartTime, residentHostOwnerAlive, residentProcessAlive } from "./process-identity.js";
+import { prepareResidentOwnerObservation, processStartTime, residentHostOwnerAlive, residentProcessAlive } from "./process-identity.js";
 import {
   RESIDENT_HANDOVER_ABI, residentLaunchSpec, handoverActive, handoverPath, handoverOutcomePath,
   mainGenerationPath, readHandoverJson, type ResidentMainGeneration, type ResidentHandoverState,
@@ -391,7 +391,7 @@ export class ResidencyClient {
   async #startHost(): Promise<ResidentHostOwner> {
     if (this.#closed) throw new Error("Fabric residency client is closed");
     await this.#stopStartingLauncher();
-    await prepareResidentOwnerIdentity();
+    await prepareResidentOwnerObservation(this.options.config.residencyRoot);
     if (this.#closed) throw new Error("Fabric residency client is closed");
     this.#refreshPiModels();
     atomicWrite(this.#configPath, this.options.config);
@@ -493,8 +493,7 @@ export class ResidencyClient {
   /** Host-only Main lifecycle hook; not a guest-selected release path. */
   async reconcileRelease(): Promise<void> {
     if (this.#closed || !this.options.mainAgent.local || this.options.mainAgent.id !== this.options.config.rootId) return;
-    const observed = readJson<ResidentHostOwner>(this.#ownerPath);
-    if (observed?.bootId || observed?.pidNamespace) await prepareResidentOwnerIdentity();
+    await prepareResidentOwnerObservation(this.options.config.residencyRoot);
     if (this.#closed) return;
     const owner = this.#liveOwner();
     const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
@@ -549,7 +548,6 @@ export class ResidencyClient {
 
   /** Read the selected live resident's actual native store; do not start a host. */
   async slotStatus(signal?: AbortSignal): Promise<ResidentSlotStatus> {
-    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
     const response = await this.#command({
       format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "slotStatus", requestId: randomUUID(),
       rootId: this.options.config.rootId, createdAt: Date.now(),
@@ -617,7 +615,6 @@ export class ResidencyClient {
     assertResidentActorMain(caller, this.options.config.rootId);
     if (this.#inheritedToolAllowlist !== undefined) caller = { ...caller, toolCeiling: [...this.#inheritedToolAllowlist] };
     if (mutation.operation === "setTools") assertResidentActorToolCeiling(mutation.tools, caller.toolCeiling);
-    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
     return this.#command({
       ...mutation, caller, format: RESIDENT_ACTOR_COMMAND_FORMAT, requestId: randomUUID(),
       rootId: this.options.config.rootId, createdAt: Date.now(),
@@ -625,7 +622,6 @@ export class ResidencyClient {
   }
 
   async actorStatus(id: string, signal?: AbortSignal): Promise<FabricActorInfo> {
-    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
     const response = await this.#command({
       format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actorStatus", id,
       requestId: randomUUID(), rootId: this.options.config.rootId, createdAt: Date.now(),
@@ -635,7 +631,6 @@ export class ResidencyClient {
   }
 
   async actors(signal?: AbortSignal): Promise<FabricActorInfo[]> {
-    if (!this.#liveOwner()) throw new Error("Root resident host is not live");
     const response = await this.#command({
       format: RESIDENT_ACTOR_COMMAND_FORMAT, operation: "actors", requestId: randomUUID(),
       rootId: this.options.config.rootId, createdAt: Date.now(),
@@ -802,6 +797,9 @@ export class ResidencyClient {
   }
 
   async waitAgent(id: string, signal?: AbortSignal, deferConsumption?: (consume: () => void, abandon?: () => void) => void): Promise<AgentRunResult | CompletionSummary> {
+    throwIfAborted(signal);
+    if (process.platform !== "linux") await prepareResidentOwnerObservation(this.options.config.residencyRoot);
+    throwIfAborted(signal);
     while (true) {
       if (signal?.aborted) throw new Error(`Waiting for durable Fabric agent ${id} was aborted`);
       const status = this.statusAgent(id);
@@ -856,6 +854,8 @@ export class ResidencyClient {
     throwIfAborted(signal);
     const metadata = this.#metadata(id);
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
+    if (process.platform !== "linux") await prepareResidentOwnerObservation(this.options.config.residencyRoot);
+    throwIfAborted(signal);
     if (!this.#liveOwner()) return this.#cleanupTerminalFiles(metadata, deleteBranch, signal);
     let response: ResidentCommandResponse;
     try {
@@ -951,6 +951,16 @@ export class ResidencyClient {
   }
 
   async #command(command: ResidentCommand, signal?: AbortSignal, onDispatched?: () => void): Promise<ResidentCommandResponse> {
+    throwIfAborted(signal);
+    // Preserve synchronous Linux/legacy dispatch. Only complete native owners
+    // need an async observation before the first command liveness veto.
+    if (process.platform !== "linux") {
+      const observed = readJson<ResidentHostOwner>(this.#ownerPath);
+      if (observed?.bootId && observed.pidNamespace && observed.processStartTime)
+        await prepareResidentOwnerObservation(this.options.config.residencyRoot);
+      throwIfAborted(signal);
+    }
+    if (this.#closed) throw new Error("Fabric residency client is closed");
     const owner = this.#liveOwner();
     if (!owner) throw new Error("Root resident host is not live");
     assertResidentCommandSupported(owner, command.operation);
@@ -1255,8 +1265,7 @@ export class ResidencyClient {
   async #watchdog(): Promise<void> {
     this.#watchdogDeadline = undefined;
     if (this.#closed || this.#startingHost || !kernelFenceAvailable()) return;
-    const observed = readJson<ResidentHostOwner>(this.#ownerPath);
-    if (observed?.bootId || observed?.pidNamespace) await prepareResidentOwnerIdentity();
+    await prepareResidentOwnerObservation(this.options.config.residencyRoot);
     if (this.#closed || this.#startingHost) return;
     const live = this.#liveOwner();
     if (live) {

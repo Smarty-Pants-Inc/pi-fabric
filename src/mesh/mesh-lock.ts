@@ -11,7 +11,7 @@ import {
 } from "../core/atomic-write.js";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock, type FenceLockRelease } from "./fence-lock.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
-import { completeLockIdentity, formatLockOwner, isIdentityLockOwner, legacyLockOwnerFields, lockIdentityVerdict, parseIdentityLockOwner, readLockIdentity,
+import { completeLockIdentity, formatLockOwner, isIdentityLockOwner, legacyLockOwnerFields, lockIdentityVerdict, parseIdentityLockOwner, readLockIdentity, readLockIdentitySync,
   retainIdentityStaleLock, warnLegacyLockOwner } from "../core/lock-identity.js";
 
 // The mesh `.lock` domain (smarty-dev#6477 L0): acquisition (withLock, withTryLock), lock tickets,
@@ -386,7 +386,10 @@ export class MeshLock {
     const token = randomUUID();
     // Every protocol writes restart identity. Optional namespace readers load at first acquisition, not import.
     // Unknown evidence stays explicit in the new wire format; it must never fall back to a local-PID-only record.
-    const identity = await readLockIdentity({ ...(this.#lockProtocol >= 2 ? { start: startTime } : {}),
+    // Protocol 1 on Linux has all native evidence in procfs: preserve synchronous first entry.
+    // Prepared protocol-2/3 births (including explicit UNKNOWN) must still go through the async reader.
+    const identity = process.platform === "linux" && this.#lockProtocol === 1 ? readLockIdentitySync()
+      : await readLockIdentity({ ...(this.#lockProtocol >= 2 ? { start: startTime } : {}),
       // Protocol 3 already prepared its namespace, even when UNKNOWN. Do not restart that read after failure.
       // Protocol 1's first Linux try may read procfs (no native command); other bounded callers only use known data.
       prepared: this.#lockProtocol === 3 || (process.platform !== "linux" && Boolean(bounded || scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) });

@@ -1,6 +1,7 @@
 import fs from "node:fs";
+import path from "node:path";
 import { processIsAlive } from "../agents/transports/process-utils.js";
-import { validProcessIncarnation } from "../core/atomic-write.js";
+import { processIncarnation, validProcessIncarnation } from "../core/atomic-write.js";
 import { diagnostics } from "../core/diagnostics.js";
 import { ownPidNamespace, ownPidNamespaceSync, wellFormedPidNamespace } from "../core/pid-namespace.js";
 import type { ResidentHostOwner } from "./protocol.js";
@@ -47,30 +48,79 @@ const warnLegacyOwner = (owner: ResidentOwnerIdentity, source: string): void => 
   catch { /* Diagnostics never authorize recovery. */ }
 };
 
-type ResidentOwnerIdentity = Pick<ResidentHostOwner, "pid" | "processStartTime" | "bootId" | "pidNamespace">;
-/** Owner records, NOT generic child/launcher identities. A foreign boot/namespace
- * cannot be made live by a colliding local PID and start tick. UNKNOWN stays live;
- * incomplete/legacy owners retain exactly the old process predicate, with warning.
- * Linux birth checks use the existing proc reader; other platforms remain conservative. */
-export const residentHostOwnerAlive = (owner: ResidentOwnerIdentity, source = "owner.json"): boolean => {
-  if (typeof owner.bootId !== "string" || !owner.bootId ||
-      typeof owner.pidNamespace !== "string" || !owner.pidNamespace ||
-      typeof owner.processStartTime !== "string" || !owner.processStartTime) {
-    warnLegacyOwner(owner, source);
-    return residentProcessAlive(owner.pid, owner.processStartTime);
-  }
+type ResidentOwnerIdentity = Pick<ResidentHostOwner, "pid" | "processStartTime" | "bootId" | "pidNamespace"> & Partial<ResidentHostOwner>;
+const completeOwnerIdentity = (owner: ResidentOwnerIdentity): boolean => {
+  if (typeof owner.bootId !== "string" || !owner.bootId || typeof owner.pidNamespace !== "string" ||
+      typeof owner.processStartTime !== "string") return false;
   const platform = owner.pidNamespace.split(":")[0];
-  const complete = Number.isSafeInteger(owner.pid) && owner.pid > 0 &&
-    wellFormedPidNamespace(owner.pidNamespace) &&
+  return Number.isSafeInteger(owner.pid) && owner.pid > 0 && wellFormedPidNamespace(owner.pidNamespace) &&
     owner.bootId === owner.pidNamespace.split(":")[2] &&
     (platform === "linux" || platform === "darwin" || platform === "win32") &&
     validProcessIncarnation(owner.processStartTime, platform);
-  if (!complete) {
+};
+
+// Pin the WHOLE record, including token, host, launch attempt and timestamps, not
+// merely pid/birth. A verdict at one owner path never applies at another path.
+const ownerGeneration = (owner: ResidentOwnerIdentity): string => {
+  const sort = (value: unknown): unknown => Array.isArray(value) ? value.map(sort) :
+    value !== null && typeof value === "object" ? Object.fromEntries(Object.entries(value)
+      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, field]) => [key, sort(field)])) : value;
+  return JSON.stringify(sort(owner));
+};
+const nativeOwnerObservations = new Map<string, { generation: string; birth: string | undefined }>();
+const readObservationOwner = (source: string): ResidentHostOwner | undefined => {
+  let fd: number | undefined;
+  try {
+    // O_NONBLOCK also refuses a FIFO without hanging before the regular-file check.
+    fd = fs.openSync(source, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+    const stat = fs.fstatSync(fd), named = fs.lstatSync(source);
+    if (!stat.isFile() || !named.isFile() || stat.dev !== named.dev || stat.ino !== named.ino ||
+        (process.getuid && stat.uid !== process.getuid())) return undefined;
+    const owner: unknown = JSON.parse(fs.readFileSync(fd, "utf8"));
+    return owner !== null && typeof owner === "object" && !Array.isArray(owner) ? owner as ResidentHostOwner : undefined;
+  } catch { return undefined; }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* Observation never authorizes on an I/O failure. */ } } }
+};
+
+/** Actual async use only, before any publication/wake custody or synchronous veto.
+ * Linux keeps its cheap synchronous procfs path. Native UNKNOWN never authorizes
+ * recovery. Every await is followed by a fresh owner read; a late result cannot
+ * condemn a replacement, even one reusing the pid, birth or token independently. */
+export const prepareResidentOwnerObservation = async (root: string): Promise<void> => {
+  if (process.platform === "linux") return;
+  const source = path.resolve(root, "owner.json");
+  let owner = readObservationOwner(source);
+  if (!owner || !completeOwnerIdentity(owner)) return;
+  let own: string | undefined;
+  try { own = await ownPidNamespace(); } catch { return; }
+  owner = readObservationOwner(source);
+  if (!owner || !completeOwnerIdentity(owner) || !own || !wellFormedPidNamespace(own) ||
+      owner.pidNamespace !== own || own.split(":")[0] !== process.platform) return;
+  const generation = ownerGeneration(owner);
+  let birth: string | undefined;
+  try { birth = await processIncarnation(owner.pid); } catch { /* Unavailable native evidence is UNKNOWN. */ }
+  const current = readObservationOwner(source);
+  if (!current || ownerGeneration(current) !== generation || ownPidNamespaceSync() !== own) return;
+  if (birth !== undefined && !validProcessIncarnation(birth)) birth = undefined;
+  if (nativeOwnerObservations.size >= 256) nativeOwnerObservations.delete(nativeOwnerObservations.keys().next().value!);
+  nativeOwnerObservations.set(source, { generation, birth });
+};
+
+/** Owner records, NOT generic child/launcher identities. A foreign boot/namespace
+ * cannot be made live by a colliding local PID and start tick. UNKNOWN stays live;
+ * incomplete/legacy owners retain exactly the old process predicate, with warning.
+ * NEVER starts native commands: async entry points prepare exact-generation evidence. */
+export const residentHostOwnerAlive = (owner: ResidentOwnerIdentity, source = "owner.json"): boolean => {
+  if (!completeOwnerIdentity(owner)) {
     warnLegacyOwner(owner, source);
     return residentProcessAlive(owner.pid, owner.processStartTime);
   }
   const own = ownPidNamespaceSync();
   if (!own || !wellFormedPidNamespace(own)) return true;
   if (owner.bootId !== own.split(":")[2] || owner.pidNamespace !== own) return false;
-  return residentProcessAlive(owner.pid, owner.processStartTime);
+  if (!residentProcessAlive(owner.pid, owner.processStartTime)) return false;
+  if (process.platform === "linux") return true;
+  const observed = nativeOwnerObservations.get(path.resolve(source));
+  return !observed || observed.generation !== ownerGeneration(owner) || observed.birth === undefined ||
+    observed.birth === owner.processStartTime;
 };

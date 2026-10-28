@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { isHostedOnlyAllowed } from "../scripts/hosted-only.mjs";
 import { MESH_ARCHIVE_CONFIG, MeshArchive } from "../src/mesh/archive.js";
 import { meshLockQueueDirectory } from "../src/mesh/lock-queue.js";
 import {
@@ -51,6 +52,25 @@ const createArchivedStore = (): { store: MeshStore; archiveDir: string } => {
   return { store: new MeshStore(root, 64 * 1024, 100), archiveDir };
 };
 
+// Ignore only the single, fixed local harness preamble, never product stderr or repeated notices.
+const GUARD_NOTICE = /^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/;
+
+const expectCompleteNativeOwner = async (owner: string, pid: number): Promise<void> => {
+  const { processIncarnation } = await import("../src/core/atomic-write.js");
+  const { createPidNamespaceReader, validPidNamespace } = await import("../src/core/pid-namespace.js");
+  const start = await processIncarnation(pid);
+  // Independent native evidence, not a module-wide cache left by simulated-platform tests.
+  const namespace = await createPidNamespaceReader({ platform: process.platform, systemRoot: process.env.SystemRoot }).own();
+  expect(start).toBeDefined();
+  expect(validPidNamespace(namespace)).toBe(true);
+  expect(owner.split("\n")).toEqual([
+    expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/),
+    String(pid), expect.stringMatching(/^\d+$/), start, "", namespace!.split(":")[2], namespace,
+    "fabric-lock-owner-v1", "",
+  ]);
+  expect(Number.isSafeInteger(Number(owner.split("\n")[2]))).toBe(true);
+};
+
 // A real child death bypasses rollback catches at either side of the live append.
 const crashPublisher = async (store: MeshStore, packet: Parameters<MeshStore["publish"]>[0], fence = "PI_FABRIC_TEST_CRASH_AFTER_ARCHIVE_BEGIN"): Promise<void> => {
   const child = spawn(process.execPath, [path.resolve("tests/fixtures/mesh-archive-before-live-crash.mjs"), store.root, JSON.stringify(packet)], {
@@ -68,7 +88,7 @@ const crashPublisher = async (store: MeshStore, packet: Parameters<MeshStore["pu
   try {
     const result = await closed;
     expect(timedOut, stderr).toBe(false);
-    expect(stderr).toBe("");
+    expect(isHostedOnlyAllowed(process.env) ? stderr : stderr.replace(GUARD_NOTICE, "")).toBe("");
     expect(result.code).not.toBe(0);
     if (process.platform !== "win32") expect(result.signal).toBe("SIGKILL");
   } finally {
@@ -1262,7 +1282,7 @@ describe("MeshStore lock recovery", () => {
       child.stderr.on("data", chunk => { stderr += chunk; });
       const closed = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
       closed.catch(() => undefined);
-      const captured = { closed, output: () => ({ stdout, stderr }) };
+      const captured = { pid: child.pid!, closed, output: () => ({ stdout, stderr }) };
       children.push(captured);
       return captured;
     };
@@ -1285,7 +1305,7 @@ describe("MeshStore lock recovery", () => {
       signal("initializer.go");
       await ready("initializer.entered"); // actual acquisition validation succeeded; operation remains live
       const held = JSON.parse(fs.readFileSync(path.join(store.root, "initializer.entered"), "utf8")) as { owner: string; ino: number; dev: number };
-      expect(held.owner.trim().split("\n")).toHaveLength(3); // default wire did not change
+      await expectCompleteNativeOwner(held.owner, initializer.pid);
       signal("recoverer.go");
       expect(await recoverer.closed, recoverer.output().stderr).toBe(0);
       // Still inside the initializer's synchronous critical section. Baseline detaches
@@ -1471,8 +1491,7 @@ describe("MeshStore lock recovery", () => {
         fs.writeFileSync(go, "");
         await vi.waitFor(() => expect(fs.existsSync(entered)).toBe(true), { timeout: 10_000, interval: 20 });
         const held = JSON.parse(fs.readFileSync(entered, "utf8")) as { owner: string; ino: number; dev: number };
-        expect(held.owner.trim().split("\n")).toHaveLength(3);
-        expect(held.owner.split("\n")[1]).toBe(String(child.pid));
+        await expectCompleteNativeOwner(held.owner, child.pid!);
         const operation = vi.fn();
         await expect(store.exclusive(operation)).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
         expect(operation).not.toHaveBeenCalled();
@@ -1593,6 +1612,29 @@ describe("MeshStore lock recovery", () => {
     expect(operation).toHaveBeenCalledOnce();
     expect(timers).not.toHaveBeenCalled();
     await expect(result).resolves.toBe("done");
+  });
+
+  it.each([2, 3] as const)("a prepared protocol-%s UNKNOWN birth is not reread during bounded acquisition", async (lockProtocol) => {
+    vi.resetModules();
+    const atomic = await import("../src/core/atomic-write.js");
+    const own = vi.spyOn(atomic, "ownProcessIncarnation").mockResolvedValue(undefined);
+    const { MeshLock } = await import("../src/mesh/mesh-lock.js");
+    const store = createStore();
+    const lock = new MeshLock(store.root, { lockProtocol }, () => {});
+    await lock.ownIncarnation;
+    const commands = vi.spyOn(childProcess, "execFile");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await lock.withTryLock(() => lock.withLock(() => {
+        const fields = fs.readFileSync(path.join(store.root, ".lock", "owner"), "utf8").split("\n");
+        expect(fields).toHaveLength(9);
+        expect(fields[1]).toBe(String(process.pid));
+        expect(fields[3]).toBe(""); // explicit UNKNOWN, not replaced by a procfs/native birth
+        expect(fields[7]).toBe("fabric-lock-owner-v1");
+        expect(fields[8]).toBe("");
+      }), 0);
+    }
+    expect(own).toHaveBeenCalledOnce();
+    expect(commands).not.toHaveBeenCalled();
   });
 
   it("the FIFO head uses a prompt capped polling cadence", async () => {
@@ -1764,7 +1806,25 @@ describe("MeshStore lock recovery", () => {
         expect(fs.readFileSync(path.join(store.root, ".lock", "owner"), "utf8").split("\n")[3]).toBe(`${platform}:${start}`);
       });
     }
-    expect(command).toHaveBeenCalledTimes(2); // one old read, one memoized isolated read
+    const calls = command.mock.calls.map(([executable, args]) => [executable, args]);
+    const powershell = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    const birthCommand = platform === "darwin"
+      ? ["/bin/ps", ["-p", String(process.pid), "-o", "lstart="]]
+      : [powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+        `(Get-Process -Id ${process.pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks.ToString([System.Globalization.CultureInfo]::InvariantCulture)`]];
+    // One old birth read and one isolated birth read, memoized across both publications.
+    const births = calls.filter(([, args]) => platform === "darwin"
+      ? (args as string[]).includes("lstart=") : (args as string[]).at(-1)?.startsWith("(Get-Process -Id "));
+    expect(births).toEqual([birthCommand, birthCommand]);
+    expect(calls.filter(call => !births.includes(call))).toEqual(platform === "darwin" ? [
+      ["/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"]],
+      ["/usr/sbin/ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]],
+    ] : [
+      [powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+        "$g=(Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid;" +
+        "$b=(Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime().Ticks;" +
+        "\"$g`:$($b.ToString([System.Globalization.CultureInfo]::InvariantCulture))\""]],
+    ]);
   });
 
   it.each(["darwin", "win32"] as const)("publishes native %s incarnation and recovers a reused PID", async (platform) => {
@@ -1808,14 +1868,16 @@ describe("MeshStore lock recovery", () => {
   });
 
   it.skipIf(process.platform !== "linux" || !fs.existsSync(`/proc/${process.pid}/stat`))("publishes Linux start time and distinguishes a reused PID from its live incarnation", async () => {
-    const store = createStore({ lockProtocol: 2 });
+    // Simulated native tests reset modules under a mocked platform. Isolate this real writer too,
+    // so its lazy namespace import cannot reuse the preceding simulated Windows reader.
+    vi.resetModules();
+    const { MeshStore: Store } = await import("../src/mesh/store.js");
+    const store = createStore({ lockProtocol: 2 }, Store);
     const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
     const startTime = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]!;
-    await store.exclusive(() => {
-      const owner = fs.readFileSync(path.join(store.root, ".lock", "owner"), "utf8").trim().split("\n");
-      expect(owner).toHaveLength(4);
-      expect(owner[3]).toBe(startTime);
-    });
+    const owner = await store.exclusive(() => fs.readFileSync(path.join(store.root, ".lock", "owner"), "utf8"));
+    await expectCompleteNativeOwner(owner, process.pid);
+    expect(owner.split("\n")[3]).toBe(startTime);
     holdLock(store, `reused-pid\n${process.pid}\n${Date.now()}\n${BigInt(startTime) + 1n}\n`);
     const operation = vi.fn();
     await store.exclusive(operation);

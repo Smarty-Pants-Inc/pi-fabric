@@ -7,6 +7,7 @@ import type { MeshEvent, MeshStore } from "../mesh/store.js";
 import { childProcessEnvironment, writeJsonAtomic } from "../core/atomic-write.js";
 import { MeshArchive, MESH_ARCHIVE_CONFIG } from "../mesh/archive.js";
 import { lockFile } from "./file-lock.js";
+import { prepareResidentOwnerObservation } from "./process-identity.js";
 import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import type { FabricParticipantInfo, FabricParticipantRecord } from "../topology/types.js";
@@ -390,6 +391,8 @@ export async function requestResidentWake(root: string, delivery: { id: string; 
   onIntentWritten: ((request: ResidentWakeRequest) => Promise<void>) | undefined, admission: ResidentWakeAdmission): Promise<void> {
   const assertAdmission = (): void => { if (!admission.allowed()) throw new ResidentWakeAdmissionClosed(); };
   assertAdmission();
+  await prepareResidentOwnerObservation(root);
+  assertAdmission();
   const configPath = path.join(root, "config.json");
   const config = assertResidentWakeConfig(root);
   // Short lock shared with the launcher's final snapshot AND release of lifetime wake.lock.
@@ -399,11 +402,9 @@ export async function requestResidentWake(root: string, delivery: { id: string; 
   const fd = process.platform === "win32" ? undefined :
     await lockFile(residentWakeIntentLockPath(root), 90, process.platform === "linux");
   let written: ResidentWakeRequest | undefined;
-  let warm = false;
   try {
     assertAdmission();
     assertResidentWakeConfig(root, config);
-    warm = residentOwnerLive(root) && !residentOwnerSleeping(root);
     const previous = readWakeJson<ResidentWakeRequest>(residentWakeRequestPath(root));
     const request = previous?.sequence !== undefined && delivery.sequence !== undefined && previous.sequence > delivery.sequence
       ? previous : { format: 1 as const, ...delivery, requestedAt: Date.now() };
@@ -417,15 +418,21 @@ export async function requestResidentWake(root: string, delivery: { id: string; 
   } finally { if (fd !== undefined) fs.closeSync(fd); }
   if (written) await onIntentWritten?.(written);
   assertAdmission();
-  if (warm && residentOwnerLive(root) && !residentOwnerSleeping(root)) return; // Recheck after the mesh wait.
+  // The selected generation may have been replaced during intent/mesh custody.
+  // A newly live owner serves the intent too; never launch from an old cold verdict.
+  if (residentOwnerLive(root) && !residentOwnerSleeping(root)) return;
   // Spawn is outside the short transaction. A busy contender is covered by the holder's final check.
   assertResidentWakeConfig(root, config);
   if (launch) return launch(configPath, config);
   const { scriptSpawnArgs } = await import("../agents/transports/process-utils.js");
+  assertAdmission();
+  assertResidentWakeConfig(root, config);
+  if (residentOwnerLive(root) && !residentOwnerSleeping(root)) return;
   const [runtime, ...args] = await scriptSpawnArgs(path.join(path.dirname(config.fabricExtensionPath), "residency", "launcher.js"),
     ["--config", configPath, "--wake"]);
   assertAdmission(); // Runtime preparation may have yielded to staging, drain, handover or close.
   assertResidentWakeConfig(root, config); // the async runtime lookup may have yielded to a config rewrite
+  if (residentOwnerLive(root) && !residentOwnerSleeping(root)) return;
   const child = spawn(runtime!, args, { cwd: config.cwd, detached: process.platform !== "win32",
     env: childProcessEnvironment(), stdio: ["ignore", "ignore", "ignore", "ipc"] });
   try {
@@ -525,6 +532,9 @@ export async function wakeResidentActors(mesh: Pick<MeshStore, "root" | "listAll
     try {
       // Reject foreign paths before opening their retained config or route files.
       if (recovery && root !== recovery.config.residencyRoot) { recovery.ignored++; continue; }
+      await prepareResidentOwnerObservation(root);
+      if (!canWake()) return;
+      // Re-read routes and owner after native preparation; discovery is not admission.
       const routes = retainedRoutesAt(root);
       if (recovery && (!routes || !recoveryDeliveryPending(mesh.root, root, routes, pending.get(root), recovery,
           mesh.listAll("topology/subscriptions/", { fresh: true }).map(entry => entry.value as { from?: string; to?: string; events?: string[] })))) {
@@ -707,6 +717,11 @@ export async function wakeDormantActor(meshRoot: string, id: string, admission?:
   });
   if (candidates.length !== 1) return false;
   const { root } = candidates[0]!;
+  if (admission && !admission.allowed()) throw new ResidentWakeAdmissionClosed();
+  await prepareResidentOwnerObservation(root);
+  if (admission && !admission.allowed()) throw new ResidentWakeAdmissionClosed();
+  const routes = retainedRoutesAt(root);
+  if (!routes?.actors.some(actor => actor.id === id || actor.name === id || actor.id.startsWith(id))) return false;
   if (residentOwnerLive(root) && !residentOwnerSleeping(root)) return false;
   // A root path alone carries no live owner authority. Legacy no-match probes
   // remain harmless, but an actual direct wake requires the caller's mesh gate.

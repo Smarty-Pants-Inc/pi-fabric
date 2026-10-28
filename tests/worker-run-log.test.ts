@@ -243,12 +243,15 @@ process.stdin.on("end", () => {
 });
 `);
     const launch = ProcessTransport.prototype.launch;
+    let hostWorkerTransportId: string | undefined;
     const spy = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async (request) => {
       // #monitor starts immediately AFTER launch returns, with timeoutMs + 1s
       // grace. Finish 0.5s before the earlier observed launch-based bound; do
       // not substitute worker.startedAt or a fresh compaction-start timeout.
       fs.writeFileSync(clockFile, JSON.stringify({ finishAt: Date.now() + timeoutMs - 500 }));
-      return launch.call(new ProcessTransport(), request);
+      const transport = await launch.call(new ProcessTransport(), request);
+      hostWorkerTransportId = transport.sessionId;
+      return transport;
     });
     const manager = new AgentManager(directory, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs, retainRuns: true }, {
       workerPath, piBinary: binary, runRoot,
@@ -268,8 +271,35 @@ process.stdin.on("end", () => {
         expect(result.compactionSkipped).toContain("MAX_TERMINAL_LOG_BYTES");
         expect(manager.listForUi()[0]?.compactionSkipped).toBe(result.compactionSkipped);
         expect(fs.statSync(file).ino).toBe(receipt.ino);
-        expect(bytes.length).toBe(receipt.bytes);
-        expect(createHash("sha256").update(bytes).digest("hex")).toBe(receipt.sha256);
+        expect(receipt.bytes).toBe(MAX_TERMINAL_LOG_BYTES + 1);
+        const originalPrefix = bytes.subarray(0, receipt.bytes);
+        expect(originalPrefix.byteLength).toBe(receipt.bytes);
+        expect(createHash("sha256").update(originalPrefix).digest("hex")).toBe(receipt.sha256);
+        const diagnosticSuffix = bytes.subarray(receipt.bytes).toString("utf8");
+        expect(diagnosticSuffix.endsWith("\n")).toBe(true);
+        const diagnosticLines = diagnosticSuffix.split("\n");
+        expect(diagnosticLines.at(-1)).toBe("");
+        const diagnosticRecords = diagnosticLines.slice(0, -1);
+        expect(diagnosticRecords).toHaveLength(1);
+        const diagnostic = JSON.parse(diagnosticRecords[0]!) as Record<string, unknown>;
+        expect(`${JSON.stringify(diagnostic)}\n`).toBe(diagnosticSuffix);
+        expect(diagnostic).toMatchObject({ type: "run.native_exit", ts: expect.any(Number), id: result.id,
+          scope: "primary", pid: expect.any(Number), code: 0, signal: null, exitedAt: expect.any(Number) });
+        expect(Number.isSafeInteger(diagnostic.pid) && Number(diagnostic.pid) > 1).toBe(true);
+        expect(hostWorkerTransportId).toBe(String(diagnostic.pid));
+        expect(diagnostic.ts).toBe(diagnostic.exitedAt);
+        if ("processStartTime" in diagnostic) expect(diagnostic.processStartTime).toMatch(/^\d+$/);
+        const diagnosticKeys = ["type", "ts", "id", "scope", "pid", "code", "signal", "exitedAt", "cgroup",
+          ...("processStartTime" in diagnostic ? ["processStartTime"] : [])];
+        expect(Object.keys(diagnostic).sort()).toEqual(diagnosticKeys.sort());
+        const cgroup = diagnostic.cgroup as Record<string, unknown>;
+        if (cgroup.state === "observed") {
+          expect(Object.keys(cgroup).sort()).toEqual(["state", "source", "observedAt", "membership"].sort());
+          expect(cgroup).toMatchObject({ source: "procfs", observedAt: expect.any(Number), membership: expect.any(String) });
+        } else {
+          expect(Object.keys(cgroup).sort()).toEqual(["state", "reason"].sort());
+          expect(cgroup).toMatchObject({ state: expect.stringMatching(/^(unavailable|unsupported)$/), reason: expect.any(String) });
+        }
       } else {
         expect(result.compactionSkipped).toBeUndefined();
         expect(fs.statSync(file).ino).not.toBe(receipt.ino);

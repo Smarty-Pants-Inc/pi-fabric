@@ -123,7 +123,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     if (attempts > 0) maxGapMs = Math.max(maxGapMs, now - lastAttemptAt);
     attempts += 1;
     lastAttemptAt = now;
-    // Publish a complete owner by rename: the canonical name is never ownerless.
+    // Publish a complete owner by rename, without an ownerless acquisition window.
     const staging = fs.mkdtempSync(`${lock}.p.${pathToken}.`);
     try {
       fs.writeFileSync(path.join(staging, "owner"), record, { encoding: "utf8", flag: "wx", mode: 0o600 });
@@ -219,7 +219,9 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     const stat = fs.lstatSync(lock);
     if (!stat.isDirectory()) return false;
     const owner = readOwner();
-    const fields = owner?.split("\n") ?? [];
+    // A missing receipt can be a release window: keep it busy, never recover it.
+    if (owner === undefined) return false;
+    const fields = owner.split("\n");
     const [token, pidText, createdText, recordedStart] = fields;
     const pid = Number(pidText);
     if (hostQualified && (!pidText?.trim() || !Number.isSafeInteger(pid) || pid <= 0)) {
@@ -229,7 +231,7 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
       if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== owner) return false;
       throw new MeshCustodyUnrecoverableError(lock);
     }
-    if (owner === undefined || !owner.endsWith("\n")) return false;    // never ownerless by protocol
+    if (!owner.endsWith("\n")) return false; // Never recover an incomplete receipt.
     // A host-lease commit gate is never recovered by a foreign/unknown PID. Matching
     // machine evidence is still mandatory when boot/process identity is unavailable.
     const physical = hostQualified ? readPhysicalHostIdentity() : undefined;

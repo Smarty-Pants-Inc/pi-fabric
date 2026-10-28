@@ -45,13 +45,14 @@ const native = async (store: MeshStore, who: MeshIdentity) => {
   } });
 };
 
-async function fixture() {
+async function fixture(options: { liveLane?: boolean; mirrorDelayMs?: number } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-stalled-membership-"));
   const hub = new MeshStore(path.join(root, "hub"), 64 * 1024, 100, { stateBackend: "file" });
   const far = new MeshStore(path.join(root, "far"), 64 * 1024, 100, { stateBackend: "file" });
   const local = new StoreBridgeSide(hub, "far"), remote = new StoreBridgeSide(far, "hub");
   const lead = identity("lead-root"), lane = identity("lane-root");
   await native(hub, lead);
+  if (options.liveLane) await native(far, lane);
   // Explicit notices supplement the real filesystem subscription; neither grants authority.
   type Notice = Parameters<NonNullable<BridgeSide["subscribeChanges"]>>[0];
   let notice!: Notice;
@@ -64,6 +65,26 @@ async function fixture() {
   const cursorPath = path.join(root, "cursor.json");
   const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local, remote, cursorPath,
     membershipRetryMs: 25, stopMs: 200, log: line => logs.push(line), debug: line => logs.push(line) });
+  const mirrorCalls: Array<{ startedAt: number; settledAt?: number; result: "pending" | "fulfilled" | "rejected" }> = [];
+  const mirrorWrites: Promise<unknown>[] = [];
+  const mirrorDelayMs = options.mirrorDelayMs;
+  if (mirrorDelayMs !== undefined) {
+    const mirror = remote.mirror.bind(remote);
+    vi.spyOn(remote, "mirror").mockImplementation((...args) => {
+      const call: (typeof mirrorCalls)[number] = { startedAt: performance.now(), result: "pending" };
+      mirrorCalls.push(call);
+      const write = (async () => {
+        try {
+          await sleep(mirrorDelayMs); // Every call, including startup and all retries, stays slow.
+          await mirror(...args);
+          call.result = "fulfilled";
+        } catch (error) { call.result = "rejected"; throw error; }
+        finally { call.settledAt = performance.now(); }
+      })();
+      mirrorWrites.push(write.catch(error => error));
+      return write;
+    });
+  }
   let failure: unknown;
   const read = vi.spyOn(remote, "tail");
   const running = bridge.run().catch(error => { failure = error; });
@@ -74,6 +95,7 @@ async function fixture() {
     await Promise.all(passes);
     await bridge.stop();
     await running;
+    await Promise.all(mirrorWrites); // Settle owned delayed/gated writes before closing either real store.
     hub.closeState(); far.closeState();
   });
   await until(() => read.mock.calls.length > 0 || failure !== undefined, "notification drains started");
@@ -87,10 +109,10 @@ async function fixture() {
     expect(local.holds(lane.id)).toBe(true);
     notice("lease");
   };
-  const send = async (ack = false, sender = lane) => {
+  const send = async (ack = false, sender = lane, targetId = sender.id) => {
     const event = await far.publish(ack ? {
       topic: "fabric.control.ack", kind: "ack", from: sender, to: lead.id,
-      data: { version: 1, commandId: "stalled-ack", targetId: sender.id, accepted: true },
+      data: { version: 1, commandId: "stalled-ack", targetId, accepted: true },
     } : {
       topic: "fabric.control.command", kind: "followUp", from: sender, to: lead.id,
       data: { version: 1, commandId: "stalled-command", targetId: lead.id, replyTo: sender.id,
@@ -128,7 +150,24 @@ async function fixture() {
       expect(calls).toBe(1); expect(returned).toBe(false);
     } };
   };
-  return { bridge, hub, far, local, remote, lead, lane, logs, events, cursor, recover, send, stall,
+  const holdInbound = (error?: Error) => {
+    const release = gate(), mirror = local.mirror.bind(local);
+    let entered = false, completed = false;
+    releases.push(release.resolve);
+    vi.spyOn(local, "mirror").mockImplementation((...args) => {
+      const write = (async () => {
+        entered = true;
+        await release.promise;
+        if (error) throw error;
+        await mirror(...args);
+        completed = true;
+      })();
+      mirrorWrites.push(write.catch(failure => failure));
+      return write;
+    });
+    return { release: release.resolve, entered: () => entered, completed: () => completed };
+  };
+  return { bridge, hub, far, local, remote, lead, lane, logs, events, cursor, recover, send, stall, holdInbound, mirrorCalls,
     notice: (kind: Parameters<Notice>[0]) => notice(kind), failure: () => failure };
 }
 
@@ -357,5 +396,169 @@ describe("notification forwarding through an unresolved shared membership pass",
     expect(f.failure()).toBeUndefined();
     held.outbound.resolve();
     expect(await held.pass).toBe(error); // strict callers still receive the retryable original
+  }, 12_000);
+
+  it.each([false, true])("refuses a never-installed canonical sender and releases later valid events with every mirror slow (ACK=%s)", async ack => {
+    const f = await fixture({ liveLane: true, mirrorDelayMs: 1_200 });
+    const absent = identity(ack ? "never-installed-ack" : "never-installed-command");
+    expect(f.local.holds(f.lane.id)).toBe(true);
+    expect(f.local.holds(absent.id)).toBe(false);
+    expect((await f.remote.presence()).hosts.some(host => host.record.id === absent.id)).toBe(false);
+    const completedBefore = f.mirrorCalls.filter(call => call.result === "fulfilled").length;
+    const refused = await f.send(ack, absent);
+    const command = await f.send();
+    const validAck = await f.send(true);
+    await until(() => f.logs.some(line => line.includes(refused.id) && line.includes("membership pending")), "slow sample retains the absent sender at the first cap");
+    expect(f.cursor().toLocal.after).toBeLessThan(refused.sequence);
+    expect(f.events()).toEqual([]);
+    expect(f.mirrorCalls.some(call => call.result === "pending")).toBe(true);
+    const sourceEvent = f.far.read({ after: 0, limit: 100 }).find(event => event.id === refused.id);
+    expect(sourceEvent).toMatchObject({
+      from: absent, data: ack ? { targetId: absent.id, accepted: true } : { replyTo: absent.id, message: "retained body" },
+    });
+    await until(() => f.cursor().toLocal.after >= validAck.sequence, "successful slow absence sample refuses the head and drains the valid suffix");
+    expect(f.events().map(event => (event.data as { bridge: { id: string } }).bridge.id)).toEqual([command.id, validAck.id]);
+    expect(f.events()[0]!.data).toMatchObject({ message: "retained body" });
+    expect(f.events()[1]!.data).toMatchObject({ targetId: f.lane.id, accepted: true });
+    expect(f.logs.some(line => line.includes(refused.id) && line.includes("not a live participant"))).toBe(true);
+    const completed = f.mirrorCalls.filter(call => call.result === "fulfilled");
+    expect(completed.length).toBeGreaterThan(completedBefore);
+    expect(completed.every(call => call.settledAt! - call.startedAt >= 1_100), "no fast retry can supply the negative sample").toBe(true);
+    expect(f.mirrorCalls.some(call => call.result === "rejected")).toBe(false);
+    expect(f.local.holds(f.lane.id)).toBe(true);
+    expect(f.local.holds(absent.id)).toBe(false);
+    expect(f.far.read({ after: 0, limit: 100 }).find(event => event.id === refused.id)).toEqual(sourceEvent);
+    expect(f.failure()).toBeUndefined();
+  }, 12_000);
+
+  it.each([false, true])("refuses an absent sender despite recurring lease notices during every slow mirror (ACK=%s)", async ack => {
+    const f = await fixture({ liveLane: true, mirrorDelayMs: 1_200 });
+    const absent = identity(ack ? "renewing-never-installed-ack" : "renewing-never-installed-command");
+    expect(f.local.holds(f.lane.id)).toBe(true);
+    expect(f.local.holds(absent.id)).toBe(false);
+    expect((await f.remote.presence()).hosts.some(host => host.record.id === absent.id)).toBe(false);
+    const completedBefore = f.mirrorCalls.filter(call => call.result === "fulfilled").length;
+    // This pass has sampled before the event exists; only its successor can prove post-miss absence.
+    const preMissPass = f.bridge.syncPresence().catch(error => error);
+    await until(() => f.mirrorCalls.some(call => call.result === "pending"), "pre-miss slow mirror started");
+    const preMissMirror = f.mirrorCalls.find(call => call.result === "pending")!;
+    const leaseNotices: number[] = [];
+    // The subscription callback is the event source; this interval is lease stimulus, not retry polling.
+    const renewal = setInterval(() => { f.notice("lease"); leaseNotices.push(performance.now()); }, 300);
+    try {
+      const refused = await f.send(ack, absent);
+      const command = await f.send();
+      const validAck = await f.send(true);
+      await until(() => f.logs.some(line => line.includes(refused.id) && line.includes("membership pending")), "renewing slow sample retains the absent sender at the first cap");
+      expect(f.cursor().toLocal.after).toBeLessThan(refused.sequence);
+      expect(f.events()).toEqual([]);
+      expect(f.mirrorCalls.some(call => call.result === "pending")).toBe(true);
+      const sourceEvent = f.far.read({ after: 0, limit: 100 }).find(event => event.id === refused.id);
+      expect(sourceEvent).toMatchObject({
+        from: absent, data: ack ? { targetId: absent.id, accepted: true } : { replyTo: absent.id, message: "retained body" },
+      });
+      await until(() => f.cursor().toLocal.after >= validAck.sequence, "post-miss slow absence sample refuses the head and drains the valid suffix despite lease notices");
+      expect(await preMissPass).toBeUndefined();
+      expect(f.events().map(event => (event.data as { bridge: { id: string } }).bridge.id)).toEqual([command.id, validAck.id]);
+      expect(f.events()[0]!.data).toMatchObject({ message: "retained body" });
+      expect(f.events()[1]!.data).toMatchObject({ targetId: f.lane.id, accepted: true });
+      expect(f.logs.some(line => line.includes(refused.id) && line.includes("not a live participant"))).toBe(true);
+      const completed = f.mirrorCalls.filter(call => call.result === "fulfilled");
+      expect(completed.length).toBeGreaterThan(completedBefore);
+      expect(completed.every(call => call.settledAt! - call.startedAt >= 1_100), "no fast retry can supply the negative sample during renewals").toBe(true);
+      const postMissMirror = completed.find(call => call.startedAt > preMissMirror.startedAt);
+      expect(postMissMirror, "a distinct post-miss mirror completed").toBeDefined();
+      const noticesDuringPostMiss = leaseNotices.filter(at => at >= postMissMirror!.startedAt && at <= postMissMirror!.settledAt!);
+      expect(noticesDuringPostMiss.length, "lease interval fired repeatedly inside the first completed slow post-miss mirror").toBeGreaterThanOrEqual(3);
+      expect(f.mirrorCalls.some(call => call.result === "rejected")).toBe(false);
+      expect(f.local.holds(f.lane.id)).toBe(true);
+      expect(f.local.holds(absent.id)).toBe(false);
+      expect(f.far.read({ after: 0, limit: 100 }).find(event => event.id === refused.id)).toEqual(sourceEvent);
+      expect(f.failure()).toBeUndefined();
+    } finally { clearInterval(renewal); }
+  }, 12_000);
+
+  it("refuses a never-installed canonical ACK target from a live sender and releases later valid events with every mirror slow", async () => {
+    const f = await fixture({ liveLane: true, mirrorDelayMs: 1_200 });
+    const absent = identity("never-installed-ack-target");
+    expect(absent.id).not.toBe(f.lane.id);
+    expect(f.local.holds(f.lane.id)).toBe(true);
+    expect(f.local.holds(absent.id)).toBe(false);
+    expect((await f.remote.presence()).hosts.some(host => host.record.id === absent.id)).toBe(false);
+    const completedBefore = f.mirrorCalls.filter(call => call.result === "fulfilled").length;
+    const refused = await f.send(true, f.lane, absent.id);
+    const command = await f.send();
+    const validAck = await f.send(true);
+    await until(() => f.logs.some(line => line.includes(refused.id) && line.includes("membership pending")), "slow sample retains the absent ACK target at the first cap");
+    expect(f.cursor().toLocal.after).toBeLessThan(refused.sequence);
+    expect(f.events()).toEqual([]);
+    expect(f.local.holds(f.lane.id)).toBe(true);
+    expect(f.local.holds(absent.id)).toBe(false);
+    expect(f.mirrorCalls.some(call => call.result === "pending")).toBe(true);
+    const sourceEvent = f.far.read({ after: 0, limit: 100 }).find(event => event.id === refused.id);
+    expect(sourceEvent).toMatchObject({
+      topic: "fabric.control.ack", from: f.lane, to: f.lead.id, data: { targetId: absent.id, accepted: true },
+    });
+    await until(() => f.cursor().toLocal.after >= validAck.sequence, "successful slow absence sample refuses the ACK target and drains the valid suffix");
+    expect(f.events().map(event => (event.data as { bridge: { id: string } }).bridge.id)).toEqual([command.id, validAck.id]);
+    expect(f.events()[0]!.data).toMatchObject({ message: "retained body" });
+    expect(f.events()[1]!.data).toMatchObject({ targetId: f.lane.id, accepted: true });
+    expect(f.logs.some(line => line.includes(refused.id) && line.includes(": dropped ") && line.includes("ack target is not bound to this link"))).toBe(true);
+    expect(f.logs.some(line => line.includes(refused.id) && line.includes("sender is not a live participant"))).toBe(false);
+    const completed = f.mirrorCalls.filter(call => call.result === "fulfilled");
+    expect(completed.length).toBeGreaterThan(completedBefore);
+    expect(completed.every(call => call.settledAt! - call.startedAt >= 1_100), "no fast retry can supply the negative ACK-target sample").toBe(true);
+    expect(f.mirrorCalls.some(call => call.result === "rejected")).toBe(false);
+    expect(f.local.holds(f.lane.id)).toBe(true);
+    expect(f.local.holds(absent.id)).toBe(false);
+    expect((await f.remote.presence()).hosts.some(host => host.record.id === absent.id)).toBe(false);
+    expect((await f.local.presence()).hosts.some(host => host.record.id === absent.id)).toBe(false);
+    expect(f.far.read({ after: 0, limit: 100 }).find(event => event.id === refused.id)).toEqual(sourceEvent);
+    expect(f.failure()).toBeUndefined();
+  }, 12_000);
+
+  it("does not refuse a newly live sender using a successful absence sample taken before its membership miss", async () => {
+    const f = await fixture(), old = await f.stall(); // Old snapshot has no lane; outbound completion is held.
+    const fresh = f.holdInbound();
+    await native(f.far, f.lane);
+    const command = await f.send();
+    await until(() => f.logs.some(line => line.includes(command.id) && line.includes("membership pending")), "new sender missed while the old absence sample was unfinished");
+    expect(f.local.holds(f.lane.id)).toBe(false);
+    old.outbound.resolve();
+    expect(await old.pass).toBeUndefined();
+    await until(fresh.entered, "a genuinely post-miss sample reaches the real inbound installer");
+    await sleep(1_150); // Cross the new sample's cap while its canonical COMMIT remains held.
+    expect(fresh.completed()).toBe(false);
+    expect(f.local.holds(f.lane.id)).toBe(false);
+    expect(f.cursor().toLocal.after).toBeLessThan(command.sequence);
+    expect(f.events()).toEqual([]);
+    fresh.release();
+    await until(() => f.events().length === 1 && f.cursor().toLocal.after >= command.sequence, "fresh canonical install delivers rather than dropping the retained command");
+    expect(f.local.holds(f.lane.id)).toBe(true);
+    expect(f.events()[0]!.data).toMatchObject({ message: "retained body", bridge: { id: command.id } });
+    expect(f.logs.some(line => line.includes(command.id) && line.includes(": dropped "))).toBe(false);
+    expect(f.failure()).toBeUndefined();
+  }, 12_000);
+
+  it.each(["retryable", "permanent", "stale"] as const)("does not consume an absent sender after a late %s membership failure", async kind => {
+    const f = await fixture({ mirrorDelayMs: 1_200 });
+    const error = kind === "retryable" ? new BridgeMirrorDeferredError(false, 100)
+      : kind === "stale" ? new BridgeStaleIncarnationError(f.lane.id) : new Error("permanent mirror refusal");
+    const inbound = f.holdInbound(error);
+    const command = await f.send(); // Never installed: a failed sample still cannot establish absence.
+    await until(inbound.entered, "membership sample reaches the held failing mirror");
+    await until(() => f.logs.some(line => line.includes(command.id) && line.includes("membership pending")), "the forward cap expires before the mirror rejection");
+    const failedPass = f.bridge.syncPresence().catch(failure => failure); // Observe the shared public result, not just one half.
+    inbound.release();
+    expect(await failedPass).toBe(error);
+    if (kind === "retryable") {
+      await sleep(1_150); // A completion wake/retry must not reinterpret rejection as fresh absence.
+      expect(f.failure()).toBeUndefined();
+    } else await until(() => f.failure() === error, "notification failure preserves the original refusal");
+    expect(f.cursor().toLocal.after).toBeLessThan(command.sequence);
+    expect(f.events()).toEqual([]);
+    expect(f.local.holds(f.lane.id)).toBe(false);
+    expect(f.far.read({ after: 0, limit: 100 }).find(event => event.id === command.id)?.data).toMatchObject({ message: "retained body" });
+    expect(f.logs.some(line => line.includes(command.id) && line.includes(": dropped "))).toBe(false);
   }, 12_000);
 });

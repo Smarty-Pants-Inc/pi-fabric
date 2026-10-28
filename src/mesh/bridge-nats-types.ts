@@ -451,6 +451,9 @@ export interface BridgeNatsPortDelivery {
   readonly streamSequence: number;
   /** JetStream num_delivered. */
   readonly attempt: number;
+  /** Broker publish timestamp in ms, immutable across redelivery; never envelope.createdAt.
+   * Older adapters may omit it; an unknown redelivery then expires only if it is currently lapsed. */
+  readonly publishedAt?: number;
   /** Final ack. L2 calls it only after MeshBridge read past this delivery (durable file append) or a ledger replay. */
   ack(): Promise<void>;
   /** Never redeliver (malformed, refused). */
@@ -463,6 +466,9 @@ export interface BridgeNatsPortDelivery {
 export interface BridgeNatsPort {
   /** The bridge's credential-bound NATS machine (== allow-list natsMachine). */
   readonly machine: string;
+  /** Broker-confirmed stream sequence through which this consumer has settled all deliveries.
+   * Optional on older adapters. Failure/absence never authorizes terminal-history reclamation. */
+  ackFloor?(): Promise<number>;
   /** Current KV presence: NATS roots and actors, in MeshBridge's shape (records under the bridge machine excluded). */
   presence(): Promise<BridgePresence>;
   /** Presence change hints; failure is fatal for the link. Returns the unsubscribe. */

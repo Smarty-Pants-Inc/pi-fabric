@@ -47,7 +47,7 @@ beforeAll(async () => {
 }, 60_000);
 afterAll(async () => { await broker?.stop(); });
 
-const fixture = async () => {
+const fixture = async (maxInHand?: number) => {
   // Isolate this fixture from retained Limits-stream history, not the delivery being tested.
   const admin = await broker.connect(broker.users.bootstrap);
   try {
@@ -106,7 +106,8 @@ const fixture = async () => {
   let port = await openPort();
   const logs: string[] = [];
   const make = () => createNatsFileLink({ store, port, localName: "file", link: linkName, cursorPath,
-    now: clock, ledger: natsCarrierLedger(ledger, linkName), authorize: () => ({ ok: true, principal: "carry" }),
+    now: clock, ledger: natsCarrierLedger(ledger, linkName), ...(maxInHand === undefined ? {} : { maxInHand }),
+    authorize: () => ({ ok: true, principal: "carry" }),
     authorizeTopic: () => ({ ok: true, principal: "none" }), mirrorAllowed: () => true, log: line => logs.push(line),
   });
   let link = make();
@@ -158,6 +159,30 @@ const fixture = async () => {
 };
 
 describe.skipIf(!binary)("NATS carrier sender lease-lapse", () => {
+  it("broker ack-floor reclaims terminal history at capacity across a real link restart", async () => {
+    const f = await fixture(2);
+    const ids: string[] = [];
+    try {
+      for (let index = 0; index < 4; index++) {
+        if (index === 2) { await f.restart(false); await f.link.remote.latestSequence(); }
+        await f.lease(POD); await vi.waitFor(() => expect(f.port.resolve(POD)?.route.live).toBe(true));
+        const original = f.envelope(); ids.push(original.id);
+        await f.pod.send(original); await f.pending(); await f.lapse();
+        const delivery = f.deliveries.find(item => item.envelope.id === original.id)!;
+        expect(delivery.publishedAt).toEqual(expect.any(Number));
+        await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+        f.advance(WINDOW); await expect(f.link.remote.read(0)).resolves.toMatchObject({ events: [] });
+        // Unlike term()'s void result, the consumer floor is broker evidence of settlement.
+        await vi.waitFor(async () => expect(await f.port.ackFloor()).toBeGreaterThanOrEqual(delivery.streamSequence));
+        const saved = JSON.parse(fs.readFileSync(f.lapsePath, "utf8")).lapses as Array<{ id: string }>;
+        expect(saved.length).toBeLessThanOrEqual(2);
+        if (index >= 2) expect(saved.some(lapse => lapse.id === ids[0])).toBe(false);
+      }
+      expect(f.events()).toEqual([]); expect(f.receive).not.toHaveBeenCalled();
+      expect(f.logs.filter(line => line.includes("retaining this lapse in memory only"))).toEqual([]);
+    } finally { await f.close(); }
+  }, 60_000);
+
   it.each([false, true])("holds the original, survives restart=%s, then admits same-key retry exactly once from LIVE presence", async restart => {
     const f = await fixture();
     const writes = vi.spyOn(atomic, "writeJsonAtomic");

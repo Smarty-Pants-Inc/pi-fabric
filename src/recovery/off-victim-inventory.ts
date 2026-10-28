@@ -205,7 +205,12 @@ export async function buildRecoveryOffVictimInventory(options: {
   }
   const manifestByKey = new Map<string, { readonly seq: number; readonly key: string; readonly sha256: string }>();
   const manifestSeqs = new Set<number>();
+  let previousManifestSeq = 0;
   if (manifest) for (const entry of manifest.entries) {
+    if (entry.seq !== previousManifestSeq + 1) {
+      issues.push(`Noncontiguous source manifest sequence: expected ${previousManifestSeq + 1}, received ${entry.seq}`); authoritative = false;
+    }
+    previousManifestSeq = entry.seq;
     if (!validText(entry.key) || !Number.isSafeInteger(entry.seq) || entry.seq < 0 || !validDigest(entry.sha256) || manifestByKey.has(entry.key) || manifestSeqs.has(entry.seq)) {
       issues.push("Source manifest has invalid/repeated record identity"); authoritative = false;
     }
@@ -221,8 +226,11 @@ export async function buildRecoveryOffVictimInventory(options: {
     manifestTraces.set(key, entry);
   }
   const returnedKeys = new Set<string>(), returnedSeqs = new Set<number>();
-  let previousSeq = -1;
+  let previousSeq = 0;
   for (const record of records) {
+    if (record.seq !== previousSeq + 1) {
+      issues.push(`Noncontiguous journal sequence: expected ${previousSeq + 1}, received ${record.seq}`); authoritative = false;
+    }
     if (returnedKeys.has(record.key) || returnedSeqs.has(record.seq) || !Number.isSafeInteger(record.seq) || record.seq <= previousSeq) {
       issues.push(`Repeated, unordered or invalid journal record ${record.key}`); authoritative = false;
     }

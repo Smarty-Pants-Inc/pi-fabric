@@ -108,7 +108,95 @@ async function fixture(extraUnknown = false) {
   return { source, expected, external, records: records!, calls, prefixes, completed, inventory };
 }
 
+// B6-A1's exact real-journal shape: attempt 1, foreign namespace 2, committed event 3.
+async function sequenceFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "b6-inventory-sequences-"));
+  const raw = Buffer.from("immutable raw attempt trace\n");
+  storeFile(path.join(root, "raw-trace.bin"), raw);
+  const trace: RecoveryAttemptTraceReference = { traceId: "trace-1", storage: { storeId: "trace-store", objectKey: "trace-1.bin",
+    writerHostId: "victim-host", receipt: "fixture-commit" }, retainedFrom: 0, byteLength: raw.length, ...evidence(raw), interrupted: false };
+  const expected: RecoveryInventoryCohort = { cohortId: "frozen", frozenAt: 1, sessions: [{ sessionId: "s", attempts: [
+    { attemptId: "a", eventIds: ["done"], traceIds: ["trace-1"] },
+  ] }] };
+  const journal = await openRecoveryJournal({ directory: path.join(root, "journal"), storeId: "evidence-store" });
+  let records: readonly RecoveryJournalRecord[];
+  try {
+    const ledger = createRecoveryAttemptLedger(journal);
+    const request: RecoveryAttemptRequest = {
+      identity: { sessionId: "s", acceptedInputId: "input", toolCallId: "call", effectKey: "effect", attemptId: "a", attemptNumber: 1,
+        hostId: "victim-host", podId: "pod", bootId: "boot", ownerIncarnation: "owner", authorityRevision: "rev" },
+      toolVersion: "tool-v1", intent: evidence("intent"), payload: evidence("payload"), destination: { kind: "file", target: "target" }, observedAt: 1, traces: [trace],
+    };
+    await ledger.recordAttempt(request, bounds());
+    await journal.append("foreign:interior-record", Buffer.from("retained non-attempt namespace"), bounds());
+    await ledger.appendEvent({ identity: request.identity, eventId: "done", observedAt: 2, state: "committed",
+      result: evidence("result"), receipt: evidence("sink receipt"), traces: [trace] }, bounds());
+    records = journal.entries();
+  } finally { await journal.close(); }
+  const inventory = async (manifestRecords = records, snapshotRecords = records) => {
+    const manifest: RecoveryInventorySourceManifest = {
+      cohortSha256: recoveryInventoryCohortSha256(expected), sealed: true, sealReceipt: "fixture-closed-enumeration",
+      entries: manifestRecords.map(row => ({ seq: row.seq, key: row.key, sha256: sha(row.bytes) })),
+      traces: [{ sessionId: "s", attemptId: "a", traceId: "trace-1", storeId: "trace-store", objectKey: "trace-1.bin", byteLength: raw.length, sha256: sha(raw) }],
+    };
+    storeFile(path.join(root, "source-manifest.json"), Buffer.from(JSON.stringify(manifest)));
+    storeFile(path.join(root, "source-snapshot.json"), Buffer.from(JSON.stringify(snapshotRecords)));
+    const source: RecoveryOffVictimSource = {
+      sourceHostId: "survivor-host", sourceId: "external-source",
+      readManifest: async () => ({ status: "present", value: manifest, provenance: provenance() }),
+      readJournal: async () => ({ status: "present", value: { complete: true, records: snapshotRecords }, provenance: provenance() }),
+      readTrace: async () => ({ status: "present", value: fs.readFileSync(path.join(root, "raw-trace.bin")), provenance: provenance("trace-store") }),
+    };
+    const result = await buildRecoveryOffVictimInventory({ observerHostId: "observer-host", victimHostId: "victim-host", cohort: expected, source });
+    storeFile(path.join(root, "inventory-result.json"), Buffer.from(JSON.stringify(result)));
+    console.info(JSON.stringify({ fixture: root, manifestSequences: manifestRecords.map(row => row.seq), journalSequences: snapshotRecords.map(row => row.seq), complete: result.complete, issues: result.issues }));
+    return result;
+  };
+  return { expected, records: records!, raw, inventory };
+}
+
 describe("off-victim recovery inventory", () => {
+  it("accepts and retains the audit's contiguous [1,2,3] journal including its foreign interior row", async () => {
+    const f = await sequenceFixture(), result = await f.inventory();
+    expect(f.records.map(row => row.seq)).toEqual([1, 2, 3]);
+    expect(result.complete).toBe(true); expect(result.issues).toEqual([]);
+    expect(result.manifest!.entries.map(row => row.seq)).toEqual([1, 2, 3]);
+    expect(result.journalRecords).toEqual(f.records);
+    expect(result.journalRecords[1]).toMatchObject({ key: "foreign:interior-record", bytes: Uint8Array.from(Buffer.from("retained non-attempt namespace")) });
+    expect(result.unknownRecords).toEqual([]);
+    expect(result.attempts[0]!.availability).toBe("present"); expect(result.events[0]!.availability).toBe("present");
+    expect(result.traces.every(row => row.availability === "present" && Buffer.from(row.bytes!).equals(f.raw))).toBe(true);
+  });
+
+  it.each(["manifest", "journal", "both"] as const)("rejects the audit's [1,3] omission from %s without discarding evidence or the denominator", async target => {
+    const f = await sequenceFixture(), omitted = f.records.filter(row => row.seq !== 2);
+    const manifestRecords = target === "journal" ? f.records : omitted, snapshotRecords = target === "manifest" ? f.records : omitted;
+    const result = await f.inventory(manifestRecords, snapshotRecords);
+    expect(omitted.map(row => row.seq)).toEqual([1, 3]);
+    expect(result.cohort).toEqual(f.expected); expect(result.journalRecords).toEqual(snapshotRecords);
+    expect(result.manifest!.entries.map(row => row.seq)).toEqual(manifestRecords.map(row => row.seq));
+    expect(result.attempts).toHaveLength(1); expect(result.events).toHaveLength(1); expect(result.traces).toHaveLength(2);
+    expect(result.attempts[0]!.availability).toBe("present"); expect(result.events[0]!.availability).toBe("present");
+    expect(result.traces.every(row => row.availability === "present" && Buffer.from(row.bytes!).equals(f.raw))).toBe(true);
+    expect(result.complete).toBe(false);
+    expect(result.issues.some(issue => issue.startsWith("Noncontiguous source manifest sequence:"))).toBe(target !== "journal");
+    expect(result.issues.some(issue => issue.startsWith("Noncontiguous journal sequence:"))).toBe(target !== "manifest");
+  });
+
+  it.each((["manifest", "journal", "both"] as const).flatMap(target => [0, 2].map(start => ({ target, start }))))(
+    "rejects a non-one start of $start in $target independently of namespace decoding", async ({ target, start }) => {
+      const f = await sequenceFixture(), shifted = f.records.map(row => ({ ...row, seq: row.seq + start - 1 }));
+      const manifestRecords = target === "journal" ? f.records : shifted, snapshotRecords = target === "manifest" ? f.records : shifted;
+      const result = await f.inventory(manifestRecords, snapshotRecords);
+      expect(result.cohort).toEqual(f.expected); expect(result.journalRecords).toEqual(snapshotRecords);
+      expect(result.manifest!.entries.map(row => row.seq)).toEqual(manifestRecords.map(row => row.seq));
+      expect(result.attempts).toHaveLength(1); expect(result.events).toHaveLength(1); expect(result.traces).toHaveLength(2);
+      expect(result.traces.every(row => row.availability === "present" && Buffer.from(row.bytes!).equals(f.raw))).toBe(true);
+      expect(result.complete).toBe(false);
+      expect(result.issues.some(issue => issue.startsWith("Noncontiguous source manifest sequence:"))).toBe(target !== "journal");
+      expect(result.issues.some(issue => issue.startsWith("Noncontiguous journal sequence:"))).toBe(target !== "manifest");
+    },
+  );
   it("recovers every frozen retry/event/full interrupted prefix through external filesystem reads with the victim path inaccessible", async () => {
     const f = await fixture(), result = await f.inventory();
     expect(result.complete).toBe(true);
@@ -159,9 +247,10 @@ describe("off-victim recovery inventory", () => {
     const omittedFromBoth: RecoveryOffVictimSource = { ...source, readManifest: async () => ({ status: "present", value: sealedManifest(f.expected, missing), provenance: provenance() }) };
     const both = await f.inventory(omittedFromBoth);
     expect(both.complete).toBe(false);
-    expect(both.attempts.find(row => row.attemptId === "try-2")).toMatchObject({ availability: "missing" });
-    expect(both.events.find(row => row.attemptId === "try-2")).toMatchObject({ availability: "missing" });
-    expect(both.traces.find(row => row.attemptId === "try-2")).toMatchObject({ availability: "missing" });
+    // A whole-history gap removes evidence authority: absent expected rows stay unknown.
+    expect(both.attempts.find(row => row.attemptId === "try-2")).toMatchObject({ availability: "unknown" });
+    expect(both.events.find(row => row.attemptId === "try-2")).toMatchObject({ availability: "unknown" });
+    expect(both.traces.find(row => row.attemptId === "try-2")).toMatchObject({ availability: "unknown" });
   });
 
   it("lists a completely missing expected session rather than deriving sessions from successes", async () => {

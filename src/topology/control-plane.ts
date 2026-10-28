@@ -1229,6 +1229,9 @@ export class FabricControlPlane {
     // In particular, the 30s bridge floor must not erase the spent retry budget.
     const timeoutMs = Math.max(this.#pollMs * 4, originalTimeoutMs - retryBudgetSpentMs);
     const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
+    // Each proven-notRun attempt gets its own bounded sender wait. The immutable
+    // logical origin can predate this admission by a fully spent attempt and grace.
+    const admissionDeadlineAt = Date.now() + timeoutMs + ackGraceMs;
     let pendingRequest: PendingControlRequest;
     let skipPublication = false;
     let publishedEvent: MeshEvent | undefined;
@@ -1285,7 +1288,7 @@ export class FabricControlPlane {
         if (messageRequest && (operation === "steer" || operation === "followUp")) {
           // The finite admission budget includes the bridge window and return-leg ACK grace.
           // It is not refreshed by lease renewal, nor reset by a late publish.
-          pending.timer = setTimeout(() => this.#timeoutPending(commandId), timeoutMs + ackGraceMs);
+          pending.timer = setTimeout(() => this.#timeoutPending(commandId), Math.max(0, admissionDeadlineAt - Date.now()));
           pending.timer.unref();
         }
         this.#startLeaseWatchdog();
@@ -1367,8 +1370,9 @@ export class FabricControlPlane {
           pending.signal.addEventListener("abort", pending.onAbort, { once: true });
           if (pending.signal.aborted) { pending.onAbort(); pending.signal.throwIfAborted(); }
         }
-        // Keep the original admission/ACK bound, rather than restarting it after renewal.
-        const remaining = Math.max(0, timeoutMs + ackGraceMs - (Date.now() - requestCreatedAt));
+        // Preserve this attempt's admission/ACK bound, charging time spent waiting
+        // for the publication lock and renewal, not the earlier logical attempt.
+        const remaining = Math.max(0, admissionDeadlineAt - Date.now());
         pending.timer = setTimeout(() => this.#timeoutPending(commandId), remaining);
         pending.timer.unref();
         this.#startLeaseWatchdog();

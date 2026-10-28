@@ -488,7 +488,10 @@ describe("late bridged message confirmation", () => {
     return { local, remote, owner, sender, receive, operation, senderId, ownerId, startedAt, advanceTo, step, messages, send, holdClaims, resendLogs };
   };
 
-  it.each(["steer", "followUp"] as const)("late notRun resends %s exactly once with a fresh deadline and one handler delivery", async operation => {
+  it.each([
+    { operation: "steer", renew: false }, { operation: "steer", renew: true },
+    { operation: "followUp", renew: false }, { operation: "followUp", renew: true },
+  ] as const)("late notRun resends $operation exactly once with a fresh deadline and one handler delivery (commit renewal=$renew)", async ({ operation, renew }) => {
     const f = await setup(operation), claims = f.holdClaims(1);
     f.owner.start(f.receive);
     const request = f.send();
@@ -505,9 +508,21 @@ describe("late bridged message confirmation", () => {
       await until(() => expect(acks(f.remote)).toHaveLength(1));
       expect(acks(f.remote)[0]!.data).toMatchObject({ accepted: false, notRun: true, error: "Fabric control command expired" });
       expect(f.receive).not.toHaveBeenCalled(); // The post-CAS owner deadline fence really ran.
+      // The retry passes admission, then sees a lapsed mirror under the publication
+      // lock. Renewal of the same route/epoch must retain THIS attempt's wait budget,
+      // not inherit the logical origin's already exhausted admission/ACK window.
+      const readMirror = f.sender.options.readMirroredOwner!;
+      let mirrorReads = 0;
+      f.sender.options.readMirroredOwner = (...args) => {
+        const current = readMirror(...args)!;
+        return ++mirrorReads === 2 && renew ? { ...current, expiresAt: Date.now() - 1 } : current;
+      };
       await f.step(); await vi.advanceTimersByTimeAsync(100);
       await until(() => expect(f.messages()).toHaveLength(2));
       const second = f.messages()[1]!.data as FabricControlCommand;
+      expect(mirrorReads).toBeGreaterThanOrEqual(renew ? 4 : 2);
+      expect(second.deadlineAt! - Date.now()).toBeGreaterThan(29_000);
+      expect(request.settled()).toBe(false);
       expect(second.requestedAt).toBeGreaterThan(first.deadlineAt!);
       expect(second.deadlineAt! - second.requestedAt).toBe(29_950);
       expect(second).toMatchObject({ requestCreatedAt: first.requestCreatedAt, ownerIncarnation: first.ownerIncarnation,

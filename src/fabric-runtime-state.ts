@@ -1560,7 +1560,9 @@ export class FabricRuntimeState {
     // Capture this generation's directory: replacement/quiesce must veto old
     // deferred slices, and new actors cannot maintain archives before publication.
     const actorParticipants = participants;
-    const canConsumeActorMesh = () => (!transport || natsPublicationReady && meshActivationReady && this.#bindingFresh() && live.current()) && actorParticipants.canConsumeMesh();
+    const canConsumeActorMesh = (options?: { refresh?: boolean }) =>
+      (!transport || natsPublicationReady && meshActivationReady && this.#bindingFresh() && live.current()) &&
+      actorParticipants.canConsumeMesh(undefined, options);
     const lineageAlive = (rootId: string): boolean =>
       (transport ? actorParticipants : this.#participants)?.lineageAlive(rootId) ?? true;
     const actorRoots = {

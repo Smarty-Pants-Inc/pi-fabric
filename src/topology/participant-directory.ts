@@ -1908,7 +1908,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
   }
 
-  /** Reads may classify refused mirrors without publishing maintenance notifications. */
+  /** Synchronous reads classify state without directory maintenance or notifications. */
   observe<T>(read: () => T): T {
     this.#observationDepth++;
     try { return read(); }
@@ -2679,8 +2679,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
       this.#refreshError === undefined && now - this.#refreshedAt < this.#heartbeatMs * 2);
   }
 
-  canConsumeMesh(now = Date.now()): boolean {
+  /** With refresh:false or inside observe(), this is a pure admission read:
+   * no renewal, incident bookkeeping, diagnostic timers, or notifications. Ordinary consumers retain
+   * the existing recovery/maintenance path. */
+  canConsumeMesh(now = Date.now(), options?: { refresh?: boolean }): boolean {
     const confirmed = this.#meshAdmitted(now);
+    if (options?.refresh === false || this.#observationDepth > 0) return confirmed;
     this.controlAdmission(now);
     if (this.#isNats()) return confirmed;
     // A resumed/suspended process (or a forward wall-clock adjustment) must not

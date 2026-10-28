@@ -1102,7 +1102,7 @@ export class ActorManager {
   readonly #registrySaveControllers = new Set<AbortController>();
   readonly #registryRowEncodings = new Map<string, { instructions: unknown; metadata: string; encoded: string }>();
   #lastRegistrySaveAt = 0;
-  readonly #canConsumeMesh: (() => boolean) | undefined;
+  readonly #canConsumeMesh: ((options?: { refresh?: boolean }) => boolean) | undefined;
   readonly #waitForMeshReadyChange: ((signal: AbortSignal) => Promise<void>) | undefined;
   readonly #slots: ReturnType<typeof slotAdmissionFor>;
   readonly #slotRecovery: ActorSlotRecovery;
@@ -1162,8 +1162,9 @@ export class ActorManager {
       project?: string | undefined;
       role?: string | undefined;
       meshCursorPath?: string;
-      /** Host publication/lease fence, also defers archive retention until initial publication. */
-      canConsumeMesh?: () => boolean;
+      /** Host publication/lease fence, also defers archive retention until initial publication.
+       * refresh:false must only inspect admission, without lease or diagnostic maintenance. */
+      canConsumeMesh?: (options?: { refresh?: boolean }) => boolean;
       /** Optional participant-directory change signal for promptly resuming gated NATS event consumers. */
       waitForMeshReadyChange?: (signal: AbortSignal) => Promise<void>;
       /** Delegate resident presence to the host heartbeat; never start per-actor retries. */
@@ -11232,7 +11233,7 @@ export class ActorManager {
     const health: FabricActorHealth = { state: "unknown", lastProgressAt: evidence.lastProgressAt };
     try {
       // A cached registry row is not a live-owner assertion. Keep publication/release fences observational.
-      if (this.#closing || this.#releasePaused || this.#canConsumeMesh?.() === false ||
+      if (this.#closing || this.#releasePaused || this.#canConsumeMesh?.({ refresh: false }) === false ||
         !this.#ownershipDecision(actor.id, true, true)) return health;
       if (actor.removal || (actor.activationBlocked && !blockExpired) || status === "stopped" ||
         status === "failed" || status === "failing-preparation" || status === "dormant") {

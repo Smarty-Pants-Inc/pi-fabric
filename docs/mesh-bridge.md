@@ -223,14 +223,14 @@ existing events and mirrors root presence. The additive publish-receipt hello ca
   not bound to this link is dropped. Before refusing a lapsed mirror (including expiry while
   waiting for publication), one bounded, single-flight presence pass refreshes and revalidates
   authority. During notification-driven `run()`, traffic with live committed ownership does not
-  join an already-running presence pass merely because a preemptive refresh is due. This also
-  applies after the mirror deadline while an open transport retains that mirror's response slot
-  and has negotiated `independentRpc`: the failed pass may have settled, but live committed
-  traffic still uses the independent lane. Page, batch and relay checks still reread canonical
-  ownership; a missing/new or expired member and a commit-time ownership refusal still take the
-  existing blocking refresh and revalidation path, even while that slot remains pending. If
-  that explicit refresh joins a pass already in flight, it settles that pass and requests or
-  joins one new snapshot before revalidating: an older sample cannot establish
+  join an already-running presence pass merely because a preemptive refresh is due. An actually
+  dispatched request may use the agent's independent traffic lane, but `independentRpc` does not
+  bypass the hub's admission gate: while that mirror response slot is pending, protected calls
+  refuse unsent, including after the mirror's nonfatal deadline. Page, batch and relay checks
+  still reread canonical ownership; a missing/new or expired member and a commit-time ownership
+  refusal still take the existing blocking refresh and revalidation path, even while that slot
+  remains pending. If that explicit refresh joins a pass already in flight, it settles that pass
+  and requests or joins one new snapshot before revalidating: an older sample cannot establish
   fresh absence for a newly observed event. The same bound applies to retained-membership
   retries: at most the old pass plus one new pass, with no polling or deadline increase.
   Manual `step()`, startup and shutdown keep their blocking presence behavior. This is
@@ -248,15 +248,40 @@ existing events and mirrors root presence. The additive publish-receipt hello ca
   degrades that link and keeps the bridge open. One mirror response slot stays in flight;
   the bridge queues no additional mirror or presence RPCs behind it and retries with 1 s to
   30 s exponential backoff. New agents advertise the additive hello capability
-  `independentRpc: true` (with either hello mode/version). Once negotiated, traffic/read RPCs
-  may proceed while a mirror remains pending, including after its deadline. A peer without
-  that capability retains the old global pending-mirror gate for every RPC. Hello/subscription
-  requests are also refused while that slot is occupied, because they share the topology lane.
-  A late answer opens the gate for a new presence snapshot; it does not renew the old snapshot's
-  freshness. The agent stamps mirror arrival time before either lane's dispatch wait.
-  Non-mirror timeouts, transport/watch failures and permanent late mirror rejections remain
-  fatal. On stop, the bridge fences future local mirror writes and ends remote stdin cleanly.
-  Persisted mirrors expire by lease TTL. The hub reaps a transport
+  `independentRpc: true` (with either hello mode/version). It separates the agent's worker lanes,
+  but does not authorize hub traffic/read dispatch while a mirror is pending. At the hub, mirror
+  and protected RPC dispatch are reciprocal and non-queuing: a protected RPC is refused before
+  wire dispatch while the mirror response slot is pending, and a mirror is refused before
+  dispatch while a protected RPC is outstanding. This withdraws traffic/read-while-mirror
+  behavior for every pending mirror, including healthy asynchronous custody or lock waits when
+  the worker would otherwise be free. Protected calls include publications, receipt lookups and
+  other worker RPCs; only positively negotiated responsive `ping` and busy `tail` are exempt.
+  Refusal leaves the request unsent. Retained bridge drains use the existing 100 ms..2 s
+  pending-work retry, so a retry may remain asleep up to 2 s after release; the pending mirror
+  slot may persist through its existing window (about 180 s). Log
+  `measurement=observed-dispatch preReadHol=unmeasured` with `schedulingDelayMs` per message.
+  This measures the interval from the first local UNSENT refusal of an already-read retained
+  message to accepted dispatch; pre-read head-of-line delay, including unread pages/messages, is
+  unmeasured and outside this population. A healthy `schedulingDelayMs=0` means no observed
+  refusal, not zero added or end-to-end delay. Keep delivery-age metrics separate; this is not
+  full added scheduling delay ([follow-up #17287](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/17287)
+  covers source/protocol timestamps and clock observability). With no mirror conflict, calls
+  retain the immediate path with no added wait. A legacy peer without `independentRpc` retains
+  the old global pending-mirror gate for protected calls but may still negotiate the separate
+  responsive-`ping` and busy-`tail` exceptions (`responsivePing: true`; `busyTail: true` with
+  `tail: true`). Without the corresponding positive capability flags, those controls remain
+  gated. Hello/subscription requests are also refused while that slot is occupied, because they
+  share the topology lane.
+  The existing mirror timeout (30 s by default) remains a nonfatal deferral and does not release
+  its pending response slot. A late answer releases that slot for a new presence snapshot; it
+  does not renew the old snapshot's freshness. Every sent RPC keeps its existing deadline from
+  actual dispatch (30 s by default); an unsent refusal starts no RPC timer and extends no sent
+  deadline. A sent timeout or lost response remains fatal/unknown; it is never recast as unsent
+  or automatically replayed.
+  The agent stamps mirror arrival time before either lane's dispatch wait. Non-mirror timeouts,
+  transport/watch failures and permanent late mirror rejections remain fatal. On stop, the
+  bridge fences future local mirror writes and ends remote stdin cleanly. Persisted mirrors
+  expire by lease TTL. The hub reaps a transport
   child after clean EOF grace (SIGTERM after 2 s, then SIGKILL 500 ms later if needed).
 - An allow-listed event that is not addressed across (its recipient is not on the other side) is
   not forwarded. Each one is a debug line (`--log-level debug`), and the bridge logs at most one
@@ -287,9 +312,11 @@ existing events and mirrors root presence. The additive publish-receipt hello ca
   scheduling in smarty-dev#9751: hello/subscription, presence and mirror share the topology
   lane; all reads, recovery queries and publications share the traffic lane. Hello installs
   watches before any later topology snapshot. A held topology service cannot by itself hold
-  traffic behind it; publications still retain FIFO order, including for the same target.
-  Both lanes retain the same dispatch validation, mesh locks and ownership fences, so actual
-  store contention can still delay traffic. In `mesh-bridge agent`, one worker owns the store,
+  traffic behind it in the worker; publications still retain FIFO order, including for the same
+  target. The hub's reciprocal admission gate can nevertheless refuse protected calls before
+  they reach the worker while a mirror is pending. Both lanes retain the same dispatch validation,
+  mesh locks and ownership fences, so actual store contention can still delay traffic. In
+  `mesh-bridge agent`, one worker owns the store,
   both lanes, directory watches and topology scans. The stdio thread never opens the store: it
   answers `ping` from memory with a `busy` flag, and serves a bounded, exact-cursor tail mailbox.
   A hub opts into busy-tail replies with `busyTail: true` in hello; a successful negotiation
@@ -306,7 +333,13 @@ existing events and mirrors root presence. The additive publish-receipt hello ca
   promise settlement and process exit until that call returns; the grace is not a hard shutdown
   bound. Debug RPC timing is opt-in, contains no event bodies, and reports `queueDepth` as the
   number of earlier requests in that request's worker lane at
-  admission, including its in-service request, not work in the independent lane.
+  admission, including its in-service request, not work in the independent lane. This admission
+  change covers the remote worker's mirror-versus-protected-RPC window only. It does not prevent
+  a hub-local synchronous SQLite COMMIT from blocking orchestration and reply I/O, or cover the
+  worker's post-reply scheduled synchronous WAL reset/TRUNCATE. The gate tracks RPC/composite
+  settlement, not completion of later WAL work; a receipt lookup after a publication ACK can
+  still wait behind that work. Both remain outside this fix; it makes no blanket COMMIT/WAL
+  coverage claim.
 
 ## Control deadlines and retention
 
@@ -325,6 +358,17 @@ covers a publication already handed to the store whose result is still pending: 
 after the local request settles, so the sender retains its captured destination and issues the
 existing best-effort cancellation, never a lookup replay. Only an authenticated owner's explicit
 `notRun` rejection permits the existing bounded message retry.
+
+A bridged relay keeps its authenticated 4 s IPC deadline and cancellation. If destination
+publication is refused only because the exact mirror response slot is pending, it may wait once,
+bounded by that IPC's remaining time and cancellation, for that mirror to settle. It then reruns
+readiness, identity, route/origin, refusal and held-fence checks at the final dispatch seam and
+sends once through the normal gate. The wait does not restart the 4 s budget, queue a payload,
+wait through a 31 s hold or authorize replay after a sent/unknown result. If the wait cannot fit,
+cancellation occurs, or the final gate/authority check refuses, the existing negative/unknown
+ACK applies. Every emitted relay NAK is logged with a fixed reason and no body. An observed
+canary NAK rate above 1% calls for follow-up; no canary rate or log format is asserted here.
+This does not add automatic sender retry.
 
 The live `events.jsonl` already compacts after a publish takes it past 64 MiB, retaining up to
 16 MiB of complete recent lines and incrementing `generation`. This is not an age-based sweep:

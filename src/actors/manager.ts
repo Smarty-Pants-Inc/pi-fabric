@@ -2222,14 +2222,20 @@ export class ActorManager {
    * Only an explicit reporter isolates per-actor presentation faults; selection stays strict. */
   listOwned(registryView = false, onError?: (id: string, error: unknown) => void): FabricActorInfo[] {
     this.#syncActorsFromRegistry();
-    this.#refreshOwnership(undefined, false);
-    const owned = [...this.#actors.values()]
-      .filter((actor) => this.#canManageCached(actor.id) && this.#slotCurrent(actor));
-    if (!onError) return owned.map((actor) => this.#publicInfo(actor, true, registryView));
-    return owned.flatMap((actor) => {
-      try { return [this.#publicInfo(actor, true, registryView)]; }
-      catch (error) { onError(actor.id, error); return []; }
-    });
+    if (this.#actors.size === 0) return [];
+    // Keep the poll ownership view through health rendering too. Otherwise each
+    // publicInfo performs another canonical lookup after refresh drops its map.
+    // This synchronous scope ends before direct delivery or explicit health reads.
+    return this.#withOwnershipRead(() => {
+      this.#refreshOwnership(undefined, false);
+      const owned = [...this.#actors.values()]
+        .filter((actor) => this.#canManageCached(actor.id) && this.#slotCurrent(actor));
+      if (!onError) return owned.map((actor) => this.#publicInfo(actor, true, registryView));
+      return owned.flatMap((actor) => {
+        try { return [this.#publicInfo(actor, true, registryView)]; }
+        catch (error) { onError(actor.id, error); return []; }
+      });
+    }, false);
   }
 
   /** Whether at least one owned durable actor can be made dormant right now. */

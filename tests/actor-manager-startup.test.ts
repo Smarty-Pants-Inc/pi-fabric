@@ -229,6 +229,20 @@ describe("ActorManager bounded startup (#4250 item 4)", () => {
     expect(f.agents.list()).toEqual([]);
   });
 
+  it("does not retain the idle snapshot for an explicit health read or delivery", () => {
+    // PR #1692: health rendering must share the idle list slice, not add N fresh
+    // owner reads or leave that poll view installed for later authority checks.
+    const f = fixture(2);
+    let canonical = true;
+    const manager = f.make({ canManageActor: () => canonical,
+      snapshotActorOwnership: () => new Map(f.records.map(record => [record.id, canonical])) });
+    expect(manager.listOwned().map(actor => actor.health?.state)).toEqual(["stale", "stale"]);
+    canonical = false;
+    expect(manager.readHealth(f.records[0]!.id)).toEqual([{ id: f.records[0]!.id, removing: false }]);
+    expect(() => manager.tell(f.records[0]!.id, "must not be delivered")).toThrow("owned by another host");
+    expect(f.agents.list()).toEqual([]);
+  });
+
   it("rechecks lease/cede/ownership after the initial yield and preserves live/unknown workers", async () => {
     const f = fixture(3);
     const ownership = new Map(f.records.map((record) => [record.id, true]));

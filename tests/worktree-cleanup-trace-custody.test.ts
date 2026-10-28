@@ -56,6 +56,7 @@ const moved = (root: string, source: string): Receipt => {
 const ownedFixtures: string[] = [];
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   const evidence = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
   for (const root of ownedFixtures.splice(0)) {
     if (!evidence) continue;
@@ -81,10 +82,15 @@ afterEach(() => {
       umask: process.umask(), userBus: process.env.DBUS_SESSION_BUS_ADDRESS ?? null, runtimeDirectory: process.env.XDG_RUNTIME_DIR ?? null, manifest }, null, 2));
   }
 });
-const fixture = () => {
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-minimal-custody-")));
-  ownedFixtures.push(root);
-  console.info(`retained cleanup fixture: ${root}`);
+const fixture = (checkoutMode?: number) => {
+  const owned = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-minimal-custody-")));
+  ownedFixtures.push(owned);
+  const root = checkoutMode === undefined ? owned : path.join(owned, "checkout");
+  if (checkoutMode !== undefined) { fs.mkdirSync(root, { mode: 0o700 }); fs.chmodSync(root, checkoutMode); }
+  vi.stubEnv("HOME", path.join(owned, "home")); vi.stubEnv("USERPROFILE", path.join(owned, "home"));
+  vi.stubEnv("XDG_STATE_HOME", path.join(owned, "state")); vi.stubEnv("LOCALAPPDATA", path.join(owned, "local-app-data"));
+  vi.stubEnv("TMPDIR", owned); vi.stubEnv("TMP", owned); vi.stubEnv("TEMP", owned);
+  console.info(`retained cleanup fixture: ${owned}`);
   const gitCalls: string[][] = [];
   const created: string[] = [];
   const manager = new WorktreeManager();
@@ -152,6 +158,46 @@ const faultAfterRename = (source: string, fault: "destination" | "source" | "mov
 };
 
 describe("common worktree cleanup whole-root trace custody", () => {
+  it.skipIf(process.platform === "win32").each([0o775, 0o777, 0o1777, 0o700])(
+    "P1 archive ancestor manager create-to-cleanup native mode %s settles the lease only after durable whole-root custody", async mode => {
+      const f = fixture(mode), lease = await f.create(), ino = fs.lstatSync(lease.path).ino;
+      const file = path.join(lease.path, "sessions/raw.JSONL"), fileIno = fs.lstatSync(file).ino, fd = fs.openSync(file, "a");
+      const unsafe = mode === 0o775 || mode === 0o777;
+      const expected = unsafe ? path.join(process.env.XDG_STATE_HOME!, "pi-fabric", "trace-archive")
+        : path.join(f.root, ".pi", "fabric", "worktrees.trace-archive");
+      const write = atomicWrites.writeJsonAtomic;
+      let row: (Receipt & { archiveRefusals?: unknown[] }) | undefined, receiptFile: string | undefined;
+      vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, data, options) => {
+        write(file, data, options);
+        if ((data as Receipt).source === lease.path && (data as Receipt).state === "moved") {
+          // The lease is live through publication's real durability barriers.
+          expect(f.manager.get("same-id")).toEqual(lease);
+          row = data as typeof row; receiptFile = String(file);
+        }
+      });
+      try {
+        expect(f.manager.get("same-id")).toEqual(lease);
+        await expect(f.manager.cleanup("same-id", true)).resolves.toBe(true);
+        expect(row).toBeDefined(); expect(receiptFile).toBeDefined();
+        expect(path.dirname(path.dirname(row!.destination))).toBe(expected);
+        expect(JSON.parse(fs.readFileSync(receiptFile!, "utf8"))).toMatchObject({ state: "moved", source: lease.path });
+        expect(JSON.parse(fs.readFileSync(path.join(path.dirname(receiptFile!), "custody.prepared.json"), "utf8"))).toMatchObject({ state: "prepared", source: lease.path });
+        expect(fs.lstatSync(row!.destination).ino).toBe(ino); verify(row!.destination);
+        expect(fs.lstatSync(path.join(row!.destination, "sessions/raw.JSONL")).ino).toBe(fileIno);
+        expect(fs.lstatSync(path.dirname(row!.destination)).mode & 0o777).toBe(0o700);
+        expect(fs.lstatSync(f.root).mode & 0o7777).toBe(mode);
+        if (unsafe) {
+          expect(row!.archiveRefusals).toHaveLength(2);
+          expect(fs.existsSync(path.join(f.root, ".pi", "fabric", "worktrees.trace-archive"))).toBe(false);
+        }
+        fs.writeSync(fd, "late-original-tail");
+        expect(fs.readFileSync(path.join(row!.destination, "sessions/raw.JSONL"))).toEqual(Buffer.concat([payloads.get("sessions/raw.JSONL")!, Buffer.from("late-original-tail")]));
+        expect(fs.fstatSync(fd).ino).toBe(fileIno);
+        expect(fs.existsSync(lease.path)).toBe(false); expect(f.manager.get("same-id")).toBeUndefined();
+        f.noGitDelete();
+      } finally { fs.closeSync(fd); }
+    });
+
   it("renames the entire root, preserving inode/raw bytes and leaving Git debt visible", async () => {
     const f = fixture(); const lease = await f.create();
     const ino = fs.statSync(lease.path).ino;

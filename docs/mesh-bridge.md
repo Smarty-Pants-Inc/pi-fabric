@@ -264,7 +264,7 @@ existing events and mirrors root presence. The additive publish-receipt hello ca
   message to accepted dispatch; pre-read head-of-line delay, including unread pages/messages, is
   unmeasured and outside this population. A healthy `schedulingDelayMs=0` means no observed
   refusal, not zero added or end-to-end delay. Keep delivery-age metrics separate; this is not
-  full added scheduling delay ([follow-up #17287](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/17287)
+  full added scheduling delay (a separate follow-up
   covers source/protocol timestamps and clock observability). With no mirror conflict, calls
   retain the immediate path with no added wait. A legacy peer without `independentRpc` retains
   the old global pending-mirror gate for protected calls but may still negotiate the separate

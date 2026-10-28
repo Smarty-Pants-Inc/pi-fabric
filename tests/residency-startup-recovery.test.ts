@@ -155,19 +155,42 @@ const fixture = () => {
   return f;
 };
 
+const timeoutFailure = "Timed out after 1000ms starting Fabric resident host";
+const canReadGenerationError = (process.platform === "linux" || process.platform === "darwin") &&
+  fs.constants.O_NOFOLLOW !== undefined;
+const startupFailureCases = [
+  {
+    failure: "a generation error when readable",
+    writeGenerationError: true,
+    expectedCause: canReadGenerationError
+      ? "Fabric resident host failed to start: fixture resident startup refused"
+      : timeoutFailure,
+  },
+  { failure: "the bounded startup timeout", writeGenerationError: false, expectedCause: timeoutFailure },
+] as const;
+
 describe("Main's bounded resident startup recovery", () => {
-  it("keeps providers usable after a failed host start, and the existing watchdog restores the actor", async () => {
+  it.each(startupFailureCases)("keeps providers usable after $failure, and the existing watchdog restores the actor", async ({
+    writeGenerationError, expectedCause,
+  }) => {
     const f = fixture();
     vi.mocked(spawnDetached).mockImplementation(async (_file, args) => {
-      const token = args[args.indexOf("--launch-token") + 1]!;
-      const file = residentGenerationErrorPath(f.client!.options.config.residencyRoot, token);
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, JSON.stringify({ format: 1, generation: token, writer: "host", pid: process.pid,
-        error: "fixture resident startup refused", occurredAt: Date.now() }));
+      if (writeGenerationError) {
+        const token = args[args.indexOf("--launch-token") + 1]!;
+        const file = residentGenerationErrorPath(f.client!.options.config.residencyRoot, token);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify({ format: 1, generation: token, writer: "host", pid: process.pid,
+          error: "fixture resident startup refused", occurredAt: Date.now() }));
+      }
       return f.handle;
     });
     await f.main.initialize(f.context);
-    expect(f.warning.mock.calls.flat().join("\n")).toContain("Resident startup recovery incomplete (Fabric resident host failed to start: fixture resident startup refused)");
+    const recoveryWarning = f.warning.mock.calls
+      .map(call => call.join("\n"))
+      .find(message => message.includes("Resident startup recovery incomplete ("));
+    expect(recoveryWarning).toBeDefined();
+    expect(recoveryWarning).toContain(`Resident startup recovery incomplete (${expectedCause}`);
+    expect(recoveryWarning).toContain("continuing Fabric activation with unavailable actors left offline and background recovery still active.");
     expect(f.handle.stop).toHaveBeenCalled();
     await f.usable();
     await expect(f.invoke("agents.members", { scope: "lineage", kinds: ["actor"] })).resolves.toEqual([]);

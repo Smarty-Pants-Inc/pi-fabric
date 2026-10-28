@@ -230,11 +230,25 @@ const copyCleanupShadow = (source: string, destination: string): Array<{ path: s
   return manifest;
 };
 
+// Identity-mismatch diagnostics never grant custody authority. Keep this process's
+// refusal before optional-absence checks so callers cannot bless a missing or
+// replaced canonical path on retry. This is not a cross-process tombstone.
+const cleanupRootFailures = new Map<string, Error>();
+
 /** Whole-object rename when possible; a verified EXDEV shadow always defers cleanup. */
 export const retainCleanupRoot = (
   source: string, archive: string, id: string, reason = "agent cleanup whole-root custody",
 ): CleanupRootCustody | undefined => {
-  if (!fs.lstatSync(source, { throwIfNoEntry: false })) return undefined;
+  const sourceKey = path.resolve(source), priorFailure = cleanupRootFailures.get(sourceKey);
+  if (priorFailure) throw priorFailure;
+  const sourceStat = fs.lstatSync(source, { throwIfNoEntry: false });
+  if (!sourceStat) return undefined;
+  // Extract link bytes without resolving the referent (live, dangling or denied).
+  const rootLink = sourceStat.isSymbolicLink() ? fs.readlinkSync(source, { encoding: "buffer" }) : undefined;
+  const sameRoot = (file: string): boolean => {
+    const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+    return !!stat && !stat.isSymbolicLink() && stat.dev === sourceStat.dev && stat.ino === sourceStat.ino;
+  };
   const relative = path.relative(path.resolve(source), path.resolve(archive));
   if (relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))) {
     throw new Error(`Cleanup custody archive must be outside source: ${source} -> ${archive}`);
@@ -262,7 +276,8 @@ export const retainCleanupRoot = (
   const container = fs.mkdtempSync(path.join(archive, "cleanup-"));
   protectCleanupContainer(container);
   const move = { source, destination: path.join(container, "tree"), receipt: path.join(container, "custody.json") };
-  const prepared = { format: 1, id, reason, source, destination: move.destination, time: Date.now(), state: "prepared" };
+  const prepared = { format: 1, id, reason: rootLink ? "root-is-symlink" : reason, source, destination: move.destination, time: Date.now(), state: "prepared",
+    ...(rootLink ? { requestedReason: reason, entryPath: source, readlink: { encoding: "base64", bytes: rootLink.toString("base64") } } : {}) };
   const save = (state: string, error?: unknown): void => writeJsonAtomic(move.receipt, {
     ...prepared, time: Date.now(), state, ...(error === undefined ? {} : { error: String(error) }),
   }, { durable: true, newline: true });
@@ -271,7 +286,20 @@ export const retainCleanupRoot = (
   // the existing parent/root (Windows skips unsupported directory barriers).
   writeJsonAtomic(path.join(container, "custody.prepared.json"), prepared, { durable: true, newline: true });
   save("prepared");
+  if (rootLink) {
+    // A dangling target may become live; never move even the link entry. Status
+    // exists only AFTER the held-in-place receipt's real durability barriers.
+    const current = fs.lstatSync(source);
+    if (!current.isSymbolicLink() || current.dev !== sourceStat.dev || current.ino !== sourceStat.ino ||
+      !fs.readlinkSync(source, { encoding: "buffer" }).equals(rootLink)) throw new Error(`Cleanup root changed before symlink refusal: ${source}`);
+    writeJsonAtomic(move.receipt, { ...prepared, time: Date.now(), state: "held-in-place", originalRetained: true }, { durable: true, newline: true });
+    const refusal = new CleanupCustodyDeferredError({ ...move, state: "held-in-place", originalRetained: true });
+    refusal.message += "; root symlink (root-is-symlink), entry and referent untouched, NOT cleaned";
+    console.warn(`[pi-fabric] ${refusal.message}`); throw refusal;
+  }
   try {
+    // Preparation may race a replacement. Never intentionally capture it.
+    if (!sameRoot(source)) throw new Error(`Cleanup root changed before rename: ${source}`);
     // A fresh container's never-used child cannot clobber earlier custody.
     fs.renameSync(source, move.destination);
   } catch (error) {
@@ -299,15 +327,25 @@ export const retainCleanupRoot = (
     console.warn(`[pi-fabric] ${refusal.message}`);
     throw refusal;
   }
+  let originalHeld = false;
   try {
+    originalHeld = sameRoot(move.destination);
     // Make the held entry durable BEFORE the separate source unlink barrier
     // or a fallible moved-receipt publication. A failure never rolls back.
     syncDirectoryChain(path.dirname(move.destination));
     syncDirectoryChain(path.dirname(source));
+    // rename is path-based, not an inode-conditional operation. A last-instant
+    // replacement must not publish whole-root success, even if now dangling.
+    const initiallyHeld = originalHeld; originalHeld = false;
+    originalHeld = initiallyHeld && sameRoot(move.destination);
+    if (!originalHeld) throw new Error(`Cleanup root changed during rename: ${source}; original custody unproven`);
     save("moved");
   } catch (error) {
     // No rollback, unlink, or canonical-path retry after the move committed.
-    const failure = Object.assign(new Error(`Cleanup root retained at ${move.destination} (from ${source}); custody receipt update failed: ${String(error)}`, { cause: error }), { retainedRoot: move });
+    const unproven = !originalHeld;
+    const failure = Object.assign(new Error(`Cleanup entry retained at ${move.destination} (from ${source}); custody verification or receipt update failed: ${String(error)}`, { cause: error }),
+      unproven ? { movedEntry: move, cleanupRootUnproven: true } : { retainedRoot: move });
+    if (unproven) cleanupRootFailures.set(sourceKey, failure);
     console.warn(`[pi-fabric] ${failure.message}; prepared receipt: ${path.join(container, "custody.prepared.json")}`);
     throw failure;
   }
@@ -378,6 +416,9 @@ const worktreePrefixParts = (prefix: string): string[] | undefined => {
 export class WorktreeManager {
   readonly #leases = new Map<string, WorktreeLease>();
   readonly #archives = new Map<string, string>();
+  // A committed replacement entry is not custody of the leased root. Keep its
+  // terminal refusal instead of retrying/forgetting/adopting a new occupant.
+  readonly #cleanupFailures = new Map<string, unknown>();
 
   async create(
     id: string,
@@ -385,6 +426,7 @@ export class WorktreeManager {
     name: string,
     preserveSourceSubdirectory = false,
   ): Promise<WorktreeLease> {
+    if (this.#cleanupFailures.has(id)) throw this.#cleanupFailures.get(id);
     let gitRoot: string;
     let sourcePrefix = "";
     try {
@@ -500,6 +542,7 @@ export class WorktreeManager {
   }
 
   async cleanup(id: string, deleteBranch = false): Promise<boolean> {
+    if (this.#cleanupFailures.has(id)) throw this.#cleanupFailures.get(id);
     const lease = this.#leases.get(id);
     if (!lease) return false;
     // Common to explicit cleanup AND automatic prelaunch/setup rollback. Never
@@ -512,7 +555,8 @@ export class WorktreeManager {
     } catch (error) {
       // A post-move receipt failure ends path ownership too: a retry must not
       // capture a new canonical occupant. A pre-move refusal keeps the lease.
-      if (error instanceof Error && "retainedRoot" in error) { this.#leases.delete(id); this.#archives.delete(id); }
+      if (error instanceof Error && "cleanupRootUnproven" in error) this.#cleanupFailures.set(id, error);
+      else if (error instanceof Error && "retainedRoot" in error) { this.#leases.delete(id); this.#archives.delete(id); }
       // Automatic rollback catches exceptions; keep refusal and Git debt visible.
       console.warn(`[pi-fabric] worktree cleanup refused for ${id}: ${String(error)}; ${deferred}`);
       throw error;

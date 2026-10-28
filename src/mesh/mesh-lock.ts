@@ -382,6 +382,7 @@ export class MeshLock {
     const startTime = this.#lockProtocol >= 2
       ? this.#ownIncarnationReady ? this.#ownStartTime : await this.#ownIncarnation
       : undefined;
+    const acquisitionStarted = performance.now();
     const waitMs = Math.min(this.#lockTimeoutMs, Math.max(0, budget));
     const token = randomUUID();
     // Protocol 3 (smarty-dev#9569): the start line is always present (empty: unknown) and the PID namespace follows
@@ -501,7 +502,8 @@ export class MeshLock {
           alarmForeignHolder(refused);
           return refused;
         }
-        return new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+        return new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs,
+          Math.max(0, performance.now() - acquisitionStarted));
       };
       while (true) {
         signal?.throwIfAborted();
@@ -610,7 +612,8 @@ export class MeshLock {
         let ours = false;
         try { ours = fs.readFileSync(ownerPath, "utf8") === ownerRecord; } catch { /* unreadable: not provably ours */ }
         if (ours) releaseOwned();
-        throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs);
+        throw new MeshLockTimeoutError(describeLockHolder(ownerPath), attempts, maxGapMs,
+          Math.max(0, performance.now() - acquisitionStarted));
       }
       if (timed) lockHeldAt = performance.now();
       try {

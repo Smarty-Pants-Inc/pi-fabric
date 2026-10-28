@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import { participantFromEntry } from "../topology/participant-directory.js";
 import { readParticipantFiles } from "../topology/participant-files.js";
@@ -8,7 +9,7 @@ import {
 import type { BridgeChange } from "./change-notifier.js";
 import {
   admitPresence, BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, LEASE_LAPSE_DEFER_MS, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
-  type BridgeRead, type BridgeSide, type MeshBridgeOptions,
+  type BridgeRead, type BridgeSide, type MeshBridgeOptions, type BridgeMirrorDeferReason,
 } from "./bridge.js";
 import {
   carrierDeliveryFromPort, NatsBridgeCarrier, NatsCarrierRefusal, NatsCarrierUnavailable, type FilePresenceEntry, type NatsCarrierAuthorize,
@@ -20,6 +21,7 @@ import {
   BRIDGE_NATS_ACK_TOPIC, BRIDGE_NATS_CONTROL_TOPIC, bridgeNatsLinkIdentity, type BridgeNatsPort, type BridgeNatsPortDelivery,
   type BridgeNatsPresenceRecord, type BridgeNatsPresenceView, type NatsCarrierSideContract,
 } from "./bridge-nats-types.js";
+import type { FabricHostRecord } from "../topology/types.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "./store.js";
 import { isMeshRetryableBusy } from "./state-backend.js";
 
@@ -51,6 +53,8 @@ const RESEND_DELAY_MS = 250;
 const WORKING_INTERVAL_MS = 5_000;
 /** In-hand deliveries this side holds before it stops pulling (backpressure, not loss). */
 const MAX_IN_HAND = 512;
+/** Target-only retention, never sender authority or a command/ledger deadline. */
+const TARGET_WAIT_CAP_MS = 120_000;
 const PARTICIPANT_PREFIX = "topology/participants/";
 
 /**
@@ -60,8 +64,10 @@ const PARTICIPANT_PREFIX = "topology/participants/";
  */
 export class NatsCarrierDeferredError extends BridgeMirrorDeferredError {
   override readonly name = "NatsCarrierDeferredError";
-  constructor(readonly reason: unknown) {
-    super(false, 0);
+  constructor(readonly reason: unknown, diagnosticReason: BridgeMirrorDeferReason =
+    reason instanceof DirectoryNotReadyError ? "directory-not-ready" :
+      reason instanceof NatsCarrierUncertainError || reason instanceof TransportUncertainError ? "publish-uncertain" : "carrier-unavailable") {
+    super(false, 0, diagnosticReason);
     this.message = `Fabric NATS side is temporarily unavailable; retrying with backoff: ${message(reason)}`;
     this.cause = reason;
   }
@@ -96,6 +102,9 @@ export const natsPresenceEntry = (port: Pick<BridgeNatsPort, "resolve">, id: str
   return { ...resolved, identity: copy(resolved.identity), route: { ...resolved.route, capabilities: [...resolved.route.capabilities] } };
 };
 
+const sameCarrierIdentity = (a: MeshIdentity, b: MeshIdentity): boolean =>
+  a.id === b.id && a.name === b.name && a.kind === b.kind && a.sessionId === b.sessionId;
+
 const copy = (identity: MeshIdentity): MeshIdentity => ({
   id: identity.id, name: identity.name, kind: identity.kind,
   ...(typeof identity.sessionId === "string" ? { sessionId: identity.sessionId } : {}),
@@ -123,12 +132,15 @@ export class FileCarrierPresence {
     const presence = await this.side.presence();
     const entries = new Map<string, FilePresenceEntry>();
     const hosts = new Map<string, MeshIdentity>();
+    const hostExpiries = new Map<string, number>();
     for (const host of presence.hosts) {
       const record = host.record;
       if (record.remoteHost !== undefined || record.bridgeVia !== undefined || !(host.expiresAt > now)) continue;
       hosts.set(record.id, record.identity);
+      hostExpiries.set(record.id, host.expiresAt);
       // A Main root: its id, host id and identity id are one; it replies from its own host.
-      if (record.identity.id === record.id) entries.set(record.id, { identity: copy(record.identity), hostId: record.id });
+      if (record.identity.id === record.id) entries.set(record.id, { identity: copy(record.identity), hostId: record.id, expiresAt: host.expiresAt,
+        ...(record.incarnationToken ? { ownerIncarnation: record.incarnationToken } : {}) });
     }
     const actors = new Map<string, FabricParticipantRecord | null>();
     const records = new Map<string, BridgeNatsPresenceRecord[]>();
@@ -175,7 +187,9 @@ export class FileCarrierPresence {
     const live: FabricParticipantRecord[] = [];
     for (const [id, participant] of actors) {
       if (!participant || entries.has(id)) continue;
-      entries.set(id, { identity: { id, name: participant.name, kind: "actor" }, hostId: participant.ownerHostId });
+      entries.set(id, { identity: { id, name: participant.name, kind: "actor" }, hostId: participant.ownerHostId,
+        expiresAt: hostExpiries.get(participant.ownerHostId)!,
+        ...(participant.ownerIncarnation ? { ownerIncarnation: participant.ownerIncarnation } : {}) });
       live.push(participant);
     }
     this.#entries = entries;
@@ -192,7 +206,7 @@ export class FileCarrierPresence {
 
   file(id: string): FilePresenceEntry | undefined {
     const entry = this.#entries.get(id);
-    return entry && { identity: copy(entry.identity), hostId: entry.hostId };
+    return entry && (entry.expiresAt ?? 0) > this.now() ? { ...entry, identity: copy(entry.identity) } : undefined;
   }
 
   /** Live native file actors from the last refresh (candidates for the KV mirror, filtered by the allow-list). */
@@ -226,10 +240,20 @@ export interface NatsCarrierSideOptions {
   readonly topicTimeoutMs?: number;
   readonly workingIntervalMs?: number;
   readonly maxInHand?: number;
-  /** Bound on an inbound target's KV wait (default/shared maximum 30 s from the event's FIRST lapse). */
+  /** Chargeable target-unavailability budget (default/max 30 s); independently observed own-mirror
+   * lag pauses this budget, never the immutable 120 s total wait cap or a sender's 30 s deadline. */
   readonly presenceWaitMs?: number;
   /** Only these inbound targets (allow.file) may wait for KV visibility; any other is refused at once. */
   readonly waitForTarget?: (targetId: string) => boolean;
+}
+
+interface TargetWait {
+  readonly firstSeenAt: number;
+  readonly activeMs: number;
+  readonly accountedAt: number;
+  readonly budgetMs: number;
+  readonly kind: "target" | "projection";
+  readonly complete?: true;
 }
 
 interface SenderLeaseLapse {
@@ -238,6 +262,10 @@ interface SenderLeaseLapse {
   readonly sourceMachine: string;
   readonly senderId: string;
   readonly startedAt: number;
+  /** Absent on legacy v1 records: their original, unpaused 30 s deadline remains binding. */
+  readonly separate?: true;
+  readonly senderStartedAt?: number;
+  readonly target?: TargetWait;
   readonly budgetMs?: number;
   readonly reason?: string;
   readonly detail?: string;
@@ -257,6 +285,8 @@ interface InHand {
   /** First observation survives a failed write or a temporarily full journal. */
   lapse?: SenderLeaseLapse;
   lapseUnrecorded?: boolean;
+  /** Sampled lag covers only this process's next observation interval, never a restart gap. */
+  targetLag?: boolean;
 }
 
 export class NatsCarrierSide implements NatsCarrierSideContract {
@@ -277,6 +307,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   readonly #workingIntervalMs: number;
   readonly #maxInHand: number;
   readonly #presenceWaitMs: number;
+  readonly #waitForTarget: (id: string) => boolean;
   readonly #senderLapsePath: string;
   #senderLeaseLapses: SenderLeaseLapse[] = [];
   #senderLapsesDirty = false;
@@ -319,13 +350,19 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     this.#workingIntervalMs = Math.max(1, options.workingIntervalMs ?? WORKING_INTERVAL_MS);
     this.#maxInHand = Math.max(1, options.maxInHand ?? MAX_IN_HAND);
     this.#presenceWaitMs = Math.min(LEASE_LAPSE_DEFER_MS, Math.max(0, options.presenceWaitMs ?? LEASE_LAPSE_DEFER_MS));
+    this.#waitForTarget = options.waitForTarget ?? (() => true);
     this.#senderLapsePath = `${options.cursorPath}.sender-lease-lapse`;
     try {
       const saved = JSON.parse(readFileRetrying(this.#senderLapsePath)) as { v: number; lapses: SenderLeaseLapse[] };
-      if (saved?.v !== 1 || !Array.isArray(saved.lapses) || saved.lapses.length > this.#maxInHand ||
+      if ((saved?.v !== 1 && saved?.v !== 2) || !Array.isArray(saved.lapses) || saved.lapses.length > this.#maxInHand ||
           !saved.lapses.every(lapse => lapse && Number.isSafeInteger(lapse.sequence) && lapse.sequence > 0 &&
             typeof lapse.id === "string" && lapse.id && typeof lapse.sourceMachine === "string" && lapse.sourceMachine &&
-            typeof lapse.senderId === "string" && lapse.senderId && Number.isFinite(lapse.startedAt) &&
+            typeof lapse.senderId === "string" && lapse.senderId && Number.isFinite(lapse.startedAt) && lapse.startedAt >= 0 &&
+            (lapse.separate === undefined || (saved.v === 2 && lapse.separate === true)) &&
+            (lapse.senderStartedAt === undefined || (lapse.separate === true && Number.isFinite(lapse.senderStartedAt) &&
+              lapse.senderStartedAt >= lapse.startedAt)) &&
+            (lapse.target === undefined || (lapse.separate === true && this.#validTargetWait(lapse.target) &&
+              lapse.target.firstSeenAt >= lapse.startedAt)) &&
             (lapse.budgetMs === undefined || (Number.isFinite(lapse.budgetMs) && lapse.budgetMs >= 0 && lapse.budgetMs <= LEASE_LAPSE_DEFER_MS)) &&
             (lapse.reason === undefined || typeof lapse.reason === "string") &&
             (lapse.detail === undefined || typeof lapse.detail === "string") &&
@@ -601,18 +638,33 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   async #inbound(stream: number, held: InHand): Promise<MeshEvent | undefined> {
     const delivery = held.delivery;
     const envelopeId = typeof delivery.envelope?.id === "string" ? delivery.envelope.id : `stream:${stream}`;
-    const retained = held.lapse ?? this.#savedLapse(delivery);
+    let retained = held.lapse ?? this.#savedLapse(delivery);
     const now = this.#now();
-    if (retained) this.#saveSenderLapses(); // Retry an uncertain write before ANY admission.
-    // Check BEFORE conversion/ledger claim, independently of recovered source/target health.
-    // A cached event already belongs to MeshBridge's append-fence/cursor deadline path.
-    if (retained && (retained.terminalReason || (!held.event && this.#lapseExpired(retained, now)))) {
-      this.#senderLapseSince(delivery);
+    if (retained) { held.lapse = retained; this.#saveSenderLapses(); } // Retry uncertain writes before admission.
+    // The immutable cap/terminal decision wins even over route recovery and a cached conversion.
+    if (retained && (retained.terminalReason || this.#targetCapExpired(retained, now) ||
+      (!held.event && this.#lapseExpired(retained, now)))) {
       await this.#termLapse(stream, held, retained);
       return undefined;
     }
     // Even a converted event must re-check LIVE source presence when the bridge retries it.
-    await this.filePresence.refresh();
+    try {
+      await this.filePresence.refresh(!!retained?.target);
+      if (retained?.target) {
+        const lag = retained.target.kind === "target" ? this.#ownTargetLag(delivery) : this.#ownProjectionLag(held);
+        this.#accountTarget(held, lag);
+        retained = held.lapse!;
+        if (this.#lapseExpired(retained, this.#now())) {
+          await this.#termLapse(stream, held, retained);
+          return undefined;
+        }
+      }
+    } catch (error) {
+      // A failed snapshot is unknown, not positive health evidence for an unmeasured interval.
+      if (held.lapse?.target) this.#accountTarget(held, false, true);
+      held.targetLag = false;
+      throw error;
+    }
     let plan: NatsInbound;
     try { plan = await this.carrier.inbound(carrierDeliveryFromPort(delivery)); }
     catch (error) {
@@ -636,6 +688,9 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     }
     switch (plan.kind) {
       case "event": {
+        if (held.lapse?.target?.kind === "target" && !held.lapse.target.complete) {
+          this.#keepLapse(delivery, { ...held.lapse, target: { ...held.lapse.target, complete: true } });
+        }
         if (held.event) return held.event; // Keep its original cursor sequence and conversion.
         // Record the owner's answer BEFORE the file append that hands it to its sender: a same-key resend
         // racing that append must find it recorded (replayAck), never wait for an ACK already consumed.
@@ -673,9 +728,15 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
         const budget = plan.senderLeaseLapse ? LEASE_LAPSE_DEFER_MS : this.#presenceWaitMs;
         const startedAt = this.#now(); // Anchor before the optional broker reclamation lookup.
         const ackFloor = this.#savedLapse(delivery) ? 0 : await this.#senderLapseAckFloor();
-        this.#senderLapseSince(delivery, startedAt, { budgetMs: budget, reason: plan.reason, detail }, ackFloor);
+        this.#senderLapseSince(delivery, startedAt, { budgetMs: budget, reason: plan.reason, detail }, ackFloor,
+          plan.senderLeaseLapse ? undefined : "target");
+        if (!plan.senderLeaseLapse) {
+          // This is independent native/KV evidence, NOT WAIT or the direction's degraded flag.
+          held.targetLag = this.#ownTargetLag(delivery);
+        }
         const lapse = held.lapse!;
-        if (!this.#lapseExpired(lapse, this.#now())) throw new NatsCarrierDeferredError(new Error(plan.reason));
+        if (!this.#lapseExpired(lapse, this.#now())) throw new NatsCarrierDeferredError(new Error(plan.reason),
+          plan.senderLeaseLapse ? plan.senderDiagnostic?.failure === "not-ready" ? "directory-not-ready" : "sender-lease-lapse" : "target-kv-wait");
         await this.#termLapse(stream, held, lapse);
         return undefined;
       }
@@ -692,13 +753,99 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
       lapse.sourceMachine === delivery.sourceMachine && lapse.senderId === delivery.envelope.from.id);
   }
 
+  #validTargetWait(wait: TargetWait): boolean {
+    return wait !== null && (wait.kind === "target" || wait.kind === "projection") &&
+      Number.isFinite(wait.firstSeenAt) && wait.firstSeenAt >= 0 &&
+      Number.isFinite(wait.accountedAt) && wait.accountedAt >= wait.firstSeenAt &&
+      Number.isFinite(wait.activeMs) && wait.activeMs >= 0 && wait.activeMs <= TARGET_WAIT_CAP_MS &&
+      Number.isFinite(wait.budgetMs) && wait.budgetMs >= 0 && wait.budgetMs <= LEASE_LAPSE_DEFER_MS &&
+      (wait.complete === undefined || wait.complete === true);
+  }
+
+  #targetCapExpired(lapse: SenderLeaseLapse, now: number): boolean {
+    const wait = lapse.target;
+    return !!wait && (wait.firstSeenAt > now || wait.accountedAt > now || now - wait.firstSeenAt >= TARGET_WAIT_CAP_MS);
+  }
+
   #lapseExpired(lapse: SenderLeaseLapse, now: number): boolean {
-    return lapse.startedAt > now || now - lapse.startedAt >= (lapse.budgetMs ?? LEASE_LAPSE_DEFER_MS);
+    if (!lapse.separate) return lapse.startedAt > now || now - lapse.startedAt >= (lapse.budgetMs ?? LEASE_LAPSE_DEFER_MS);
+    const sender = lapse.senderStartedAt;
+    return (sender !== undefined && (sender > now || now - sender >= LEASE_LAPSE_DEFER_MS)) ||
+      this.#targetCapExpired(lapse, now) || (!!lapse.target && !lapse.target.complete && lapse.target.activeMs >= lapse.target.budgetMs);
+  }
+
+  /** Missing own KV route + refreshed, exact live native target. Conflicts/other owners are not lag. */
+  #ownTargetLag(delivery: BridgeNatsPortDelivery): boolean {
+    const envelope = delivery.envelope, id = envelope.targetId;
+    if (envelope.kind !== "command" || !this.#waitForTarget(id)) return false;
+    const native = this.filePresence.file(id);
+    if (!native || native.hostId !== envelope.to.hostId) return false;
+    const records = this.filePresence.view().records(id);
+    if (records.length > 1 || records.some(row => !row.live || row.mirroredBy !== undefined ||
+      row.ownerHostId !== native.hostId || row.name !== native.identity.name || row.kind !== native.identity.kind)) return false;
+    const incarnation = native.ownerIncarnation ?? records[0]?.ownerIncarnation;
+    const expected = (envelope.body as Record<string, unknown>).ownerIncarnation;
+    if (!incarnation || (typeof expected === "string" && expected !== incarnation)) return false;
+    const rows = this.port.presenceView().records(id);
+    if (rows.length > 1 || rows.some(row => row.machine !== this.port.machine || row.ownerHostId !== native.hostId ||
+      row.ownerIdentityId !== native.hostId || row.ownerIncarnation !== incarnation || row.name !== native.identity.name ||
+      row.kind !== native.identity.kind)) return false;
+    const kv = this.port.resolve(id);
+    return !kv || (!kv.route.live && sameCarrierIdentity(kv.identity, native.identity) &&
+      kv.route.machine === this.port.machine && kv.route.ownerHostId === native.hostId && kv.route.ownerIncarnation === incarnation);
+  }
+
+  /** #126: exact LIVE KV source + a lease-only expired own FILE projection, never a takeover. */
+  #ownProjectionLag(held: InHand): boolean {
+    const event = held.event, delivery = held.delivery;
+    if (!event || event.topic !== BRIDGE_NATS_CONTROL_TOPIC || !this.#file.leaseLapsed(event.from.id, event.from)) return false;
+    const kv = this.port.resolve(event.from.id);
+    if (!kv?.route.live || kv.route.machine !== delivery.sourceMachine || !sameCarrierIdentity(kv.identity, event.from) ||
+      kv.route.ownerHostId !== event.from.id || kv.route.ownerIdentityId !== event.from.id || !kv.route.ownerIncarnation) return false;
+    const host = this.#file.store.get("topology/hosts/" + createHash("sha256").update(event.from.id).digest("hex"), { fresh: true })?.value as
+      Partial<FabricHostRecord> | undefined;
+    return host?.remoteHost === this.#link && host.bridgeVia === undefined && host.incarnationToken === kv.route.ownerIncarnation;
+  }
+
+  #accountTarget(held: InHand, lag: boolean, unknown = false): void {
+    const lapse = held.lapse!, wait = lapse.target;
+    if (!wait || wait.complete) return;
+    const now = this.#now(), delta = Math.max(0, now - wait.accountedAt);
+    // Sample-and-hold only between observations in the SAME process. On restart, or a failed
+    // snapshot, the entire unknown gap consumes budget. Nothing can move firstSeenAt.
+    const activeMs = Math.min(TARGET_WAIT_CAP_MS, wait.activeMs + (held.targetLag && !unknown ? 0 : delta));
+    this.#keepLapse(held.delivery, { ...lapse, target: { ...wait, accountedAt: now, activeMs } });
+    held.targetLag = lag;
+  }
+
+  /** Recheck at the actual file append, after any lock wait. A retryable refusal leaves the
+   * cursor/ACK untouched; the next read persists terminal metadata and TERMs off the lock. */
+  assertWaitDeadline(event: BridgePublish): void {
+    const held = [...this.#inHand.values()].find(item => item.event?.id === event.data.bridge.id);
+    const lapse = held && (held.lapse ?? this.#savedLapse(held.delivery));
+    if (lapse && this.#lapseExpired(lapse, this.#now())) {
+      throw new NatsCarrierDeferredError(new Error("retained delivery expired before file append"),
+        this.#targetCapExpired(lapse, this.#now()) ? "target-wait-cap" : "sender-lease-lapse");
+    }
+  }
+
+  async deferOwnMirror(event: MeshEvent): Promise<boolean | undefined> {
+    const held = [...this.#inHand.values()].find(item => item.event?.id === event.id && item.sequence === event.sequence);
+    if (!held || !this.#ownProjectionLag(held)) return undefined;
+    const startedAt = this.#now();
+    const floor = this.#savedLapse(held.delivery) ? 0 : await this.#senderLapseAckFloor();
+    this.#senderLapseSince(held.delivery, startedAt, { reason: "live KV sender's own FILE mirror lease is lagging" }, floor, "projection");
+    this.#accountTarget(held, true);
+    if (this.#lapseExpired(held.lapse!, this.#now())) {
+      await this.#termLapse(held.delivery.streamSequence, held, held.lapse!);
+      return false;
+    }
+    return true; // Retention only: normal authority/identity/append fences still run on recovery.
   }
 
   #saveSenderLapses(): void {
     if (!this.#senderLapsesDirty) return;
-    writeJsonAtomic(this.#senderLapsePath, { v: 1, lapses: this.#senderLeaseLapses }, { mode: 0o600, durable: true });
+    writeJsonAtomic(this.#senderLapsePath, { v: 2, lapses: this.#senderLeaseLapses }, { mode: 0o600, durable: true });
     this.#senderLapsesDirty = false; // A failed post-rename barrier is NOT a durable receipt.
   }
 
@@ -714,8 +861,10 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
       }
     }
     this.#saveSenderLapses(); // Durable terminal disposition BEFORE TERM, unless the cap forced memory-only retention.
+    const elapsed = Math.max(0, this.#now() - (lapse.target?.firstSeenAt ?? lapse.senderStartedAt ?? lapse.startedAt));
+    const accounting = lapse.target ? `; activeMs=${Math.round(lapse.target.activeMs)} pausedMs=${Math.max(0, Math.round(elapsed - lapse.target.activeMs))} capMs=${TARGET_WAIT_CAP_MS}` : "";
     this.#log(`toFile: refused ${held.delivery.envelope.id} from ${held.delivery.sourceMachine} after ` +
-      `${lapse.budgetMs ?? LEASE_LAPSE_DEFER_MS} ms: ${reason}${lapse.detail ?? ""}`);
+      `${Math.round(elapsed)} ms${accounting}: ${reason}${lapse.detail ?? ""}`);
     await held.delivery.term(reason);
     this.#release(stream);
   }
@@ -738,16 +887,11 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
    * Recovery without its tombstone checks live presence normally; only a renewed WAIT
    * uses the immutable broker publish time, so healthy old redeliveries are never aged out. */
   #senderLapseSince(delivery: BridgeNatsPortDelivery, startedAt = this.#now(),
-    context: Pick<SenderLeaseLapse, "budgetMs" | "reason" | "detail"> = {}, ackFloor = 0): number {
+    context: Pick<SenderLeaseLapse, "budgetMs" | "reason" | "detail"> = {}, ackFloor = 0,
+    targetKind?: TargetWait["kind"]): number {
     const held = this.#inHand.get(delivery.streamSequence)!;
-    const saved = this.#savedLapse(delivery);
-    if (saved) {
-      // Diagnostics may change (sender -> directory gap) without renewing or rewriting
-      // the first timestamp. Persist the latest reason only when marking terminal.
-      held.lapse = { ...saved, ...context };
-      this.#saveSenderLapses();
-      return saved.startedAt;
-    }
+    const saved = held.lapse ?? this.#savedLapse(delivery);
+    if (saved) held.lapse = { ...saved, ...context };
     const now = this.#now();
     // Only a proven WAIT/append lapse enters here. Never age out the healthy path.
     // Broker time may shorten, never extend, the local first-seen window. Clamp a
@@ -760,7 +904,32 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     const lapse = held.lapse ?? { sequence: delivery.streamSequence, id: delivery.envelope.id,
       sourceMachine: delivery.sourceMachine, senderId: delivery.envelope.from.id,
       startedAt: Math.min(startedAt, now, anchor), ...context };
+    let next: SenderLeaseLapse = saved ? lapse : { ...lapse, separate: true };
+    if (next.separate) {
+      // A newly observed sender lapse must not inherit earlier target-only waiting time.
+      const first = saved ? Math.min(startedAt, now) : next.startedAt;
+      if (!targetKind && next.senderStartedAt === undefined) next = { ...next, senderStartedAt: first };
+      if (targetKind && !next.target) {
+        next = { ...next, target: { firstSeenAt: first, activeMs: Math.min(TARGET_WAIT_CAP_MS, Math.max(0, now - first)),
+          accountedAt: now, budgetMs: this.#presenceWaitMs, kind: targetKind } };
+      }
+    }
+    this.#keepLapse(delivery, next, ackFloor);
+    return next.separate ? next.senderStartedAt ?? next.startedAt : next.startedAt;
+  }
+
+  #keepLapse(delivery: BridgeNatsPortDelivery, lapse: SenderLeaseLapse, ackFloor = 0): void {
+    const held = this.#inHand.get(delivery.streamSequence)!;
     held.lapse = lapse; // Keep the SAME first timestamp even if the write/barrier/cap fails.
+    const saved = this.#savedLapse(delivery);
+    if (saved) {
+      if (JSON.stringify(saved) !== JSON.stringify(lapse)) {
+        this.#senderLeaseLapses = this.#senderLeaseLapses.map(entry => entry === saved ? lapse : entry);
+        this.#senderLapsesDirty = true;
+      }
+      this.#saveSenderLapses();
+      return;
+    }
     const lapses = [...this.#senderLeaseLapses];
     if (lapses.length >= this.#maxInHand) {
       const reclaimable = lapses.filter(entry => entry.terminalReason && entry.sequence <= ackFloor)
@@ -771,14 +940,13 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
           "retaining this lapse in memory only; restart uses live presence and broker publish time");
         held.lapseUnrecorded = true;
         this.#saveSenderLapses();
-        return lapse.startedAt;
+        return;
       }
     }
     held.lapseUnrecorded = false;
     this.#senderLeaseLapses = [...lapses, lapse];
     this.#senderLapsesDirty = true;
     this.#saveSenderLapses();
-    return lapse.startedAt;
   }
 
   /** Share the first-lapse time in either order: carrier -> append fence, or append fence -> carrier.
@@ -787,7 +955,8 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     const held = [...this.#inHand.values()].find(held => held.event?.id === event.id && held.sequence === event.sequence);
     if (!held) return startedAt;
     if (startedAt !== undefined) return this.#senderLapseSince(held.delivery, startedAt);
-    return (held.lapse ?? this.#savedLapse(held.delivery))?.startedAt;
+    const lapse = held.lapse ?? this.#savedLapse(held.delivery);
+    return lapse?.separate ? lapse.senderStartedAt : lapse?.startedAt;
   }
 
   /** Broker ACK after the durable append: every in-hand delivery whose sequence MeshBridge read past. */
@@ -841,8 +1010,10 @@ export interface NatsFileLinkOptions extends Omit<NatsCarrierSideOptions, "file"
  * missing hook fails cross-spoke commands closed in MeshBridge.
  */
 export const createNatsFileLink = (options: NatsFileLinkOptions): { bridge: MeshBridge; local: StoreBridgeSide; remote: NatsCarrierSide } => {
-  const local = new StoreBridgeSide(options.store, options.link, options.now ?? Date.now, true);
-  const remote = new NatsCarrierSide({ ...options, file: local });
+  let remote: NatsCarrierSide;
+  const local = new StoreBridgeSide(options.store, options.link, options.now ?? Date.now, true,
+    event => remote.assertWaitDeadline(event));
+  remote = new NatsCarrierSide({ ...options, file: local });
   const bridge = new MeshBridge({
     ...options.bridge, localName: options.localName, remoteName: options.link, local, remote, cursorPath: options.cursorPath,
     ...(options.log ? { log: options.log } : {}),

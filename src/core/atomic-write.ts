@@ -769,7 +769,9 @@ export class MeshLockTimeoutError extends Error {
   readonly code = MESH_LOCK_TIMEOUT_CODE;
   /** smarty-dev#10072: the waiter stalled (largest gap >= 1 s), so this timeout may not be contention; meters count it apart. */
   readonly stalled: boolean;
-  constructor(readonly holder: string, readonly attempts: number, readonly maxGapMs: number) {
+  constructor(readonly holder: string, readonly attempts: number, readonly maxGapMs: number,
+    /** Measured acquisition wait, excluding the protected operation; absent on legacy/RPC errors. */
+    readonly lockWaitMs?: number) {
     const stalled = maxGapMs >= MESH_LOCK_STALLED_GAP_MS;
     super(`${MESH_LOCK_TIMEOUT_CODE}: Timed out waiting for the Fabric mesh lock${holder} after ${attempts} attempts, largest gap between attempts ${maxGapMs} ms${stalled ? `, waiter stalled ${maxGapMs} ms` : ""}`);
     this.name = "MeshLockTimeoutError";

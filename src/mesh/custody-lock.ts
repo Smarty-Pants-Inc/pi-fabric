@@ -114,6 +114,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   const blocked: StaleLockNote = {};
   // The relative wait budget starts at the first acquisition attempt, after setup (incarnation and PID-namespace
   // reads): slow setup must not spend it before the lock was tried.
+  const waitStarted = performance.now();
   const deadline = Date.now() + Math.max(0, timeoutMs);
   let attempts = 0;
   let maxGapMs = 0;
@@ -159,7 +160,7 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
         alarmForeignHolder(refused);
         throw refused;
       }
-      throw new MeshLockTimeoutError(holder, attempts, maxGapMs);
+      throw new MeshLockTimeoutError(holder, attempts, maxGapMs, Math.max(0, performance.now() - waitStarted));
     }
     await delay(Math.min(Math.max(0, deadline - Date.now()), 5 + Math.floor(Math.random() * 20)));
   }
@@ -193,7 +194,8 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     let ours = false;
     try { ours = readOwner() === record; } catch { /* unreadable: not provably ours */ }
     if (ours) releaseByName();
-    throw new MeshLockTimeoutError(` (custody lock ${lock} could not be pinned or was reclaimed before entry)`, attempts, maxGapMs);
+    throw new MeshLockTimeoutError(` (custody lock ${lock} could not be pinned or was reclaimed before entry)`, attempts, maxGapMs,
+      Math.max(0, performance.now() - waitStarted));
   }
   // The pinned release closes its fd, so it runs once; main's release may be called again after a failure.
   let done = false;

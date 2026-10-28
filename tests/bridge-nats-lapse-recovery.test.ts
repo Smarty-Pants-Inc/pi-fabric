@@ -36,7 +36,8 @@ const fixture = async (maxInHand = 2) => {
   let port = newPort();
   const make = () => {
     const l = createNatsFileLink({ store, port, localName: "file", link: LINK, cursorPath, ledger, now: () => time,
-      maxInHand, filePresenceTtlMs: 0, authorize: () => ({ ok: true, principal: "carry" }),
+      maxInHand, filePresenceTtlMs: 0, waitForTarget: id => id === fileLead.id,
+      authorize: () => ({ ok: true, principal: "carry" }),
       authorizeTopic: () => ({ ok: true, principal: "none" }), log: line => logs.push(line) });
     cleanup.push(() => l.remote.close()); return l;
   };
@@ -65,6 +66,132 @@ const fixture = async (maxInHand = 2) => {
 };
 
 describe("NATS carrier bounded lapse recovery", () => {
+  it("preserves paused target accounting/cap across restart, but charges the unknown restart gap", async () => {
+    const f = await fixture(); f.port.routes.delete(fileLead.id);
+    await f.deliver("restart-target", 1);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    f.advance(35_000);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    await f.restart(); f.port.routes.delete(fileLead.id); f.advance(10_000);
+    const again = await f.deliver("restart-target", 1, f.initial, 2);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    const saved = JSON.parse(fs.readFileSync(f.lapsePath, "utf8")).lapses[0];
+    expect(saved.target).toMatchObject({ firstSeenAt: f.initial, activeMs: 10_000 });
+    f.advance(74_999);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(again.termed).toEqual([]);
+    f.advance(1); await f.link.remote.read(0);
+    expect(again.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
+    await f.restart();
+    const terminal = await f.deliver("restart-target", 1, f.initial, 3);
+    await f.link.remote.read(0); expect(terminal.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
+  });
+
+  it("does not pause an unobserved restart interval even if both views show lag again", async () => {
+    const f = await fixture(); f.port.routes.delete(fileLead.id);
+    await f.deliver("unknown-gap", 1);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    f.advance(35_000); await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    await f.restart(); f.port.routes.delete(fileLead.id); f.advance(WINDOW);
+    const again = await f.deliver("unknown-gap", 1, f.initial, 2);
+    expect((await f.link.remote.read(0)).events).toEqual([]);
+    expect(again.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
+  });
+
+  it("keeps legacy untagged v1 target waits on their original unpaused 30 s deadline", async () => {
+    const f = await fixture(); f.port.routes.delete(fileLead.id);
+    await f.deliver("legacy-target", 1);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    const entry = JSON.parse(fs.readFileSync(f.lapsePath, "utf8")).lapses[0];
+    delete entry.separate; delete entry.target; delete entry.senderStartedAt;
+    fs.writeFileSync(f.lapsePath, JSON.stringify({ v: 1, lapses: [entry] }));
+    f.advance(WINDOW); await f.restart();
+    const again = await f.deliver("legacy-target", 1, f.initial, 2);
+    await f.link.remote.read(0); expect(again.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
+  });
+
+  it("lost target history cannot grant retroactive pause credit from broker publish time", async () => {
+    const f = await fixture(); f.port.routes.delete(fileLead.id);
+    await f.deliver("lost-target", 1);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    f.link.remote.close(); fs.renameSync(f.lapsePath, `${f.lapsePath}.saved`);
+    f.advance(35_000); await f.restart(); f.port.routes.delete(fileLead.id);
+    const again = await f.deliver("lost-target", 1, f.initial, 2);
+    await f.link.remote.read(0); expect(again.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
+  });
+
+  it.each(["before-write", "after-rename"])("target accounting survives a %s durability failure without restarting either clock", async mode => {
+    const f = await fixture(); f.port.routes.delete(fileLead.id); const d = await f.deliver("target-write", 1);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    f.advance(35_000);
+    const realWrite = atomic.writeJsonAtomic, realSync = fs.fsyncSync;
+    const fault = mode === "before-write" ? vi.spyOn(atomic, "writeJsonAtomic").mockImplementation((file, value, options) => {
+      if (file === f.lapsePath) throw Object.assign(new Error("injected write fault"), { code: "ENOSPC" });
+      return realWrite(file, value, options);
+    }) : vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fs.fstatSync(fd).isDirectory()) throw Object.assign(new Error("injected barrier fault"), { code: "EIO" });
+      return realSync(fd);
+    });
+    await expect(f.link.remote.read(0)).rejects.toMatchObject({ code: mode === "before-write" ? "ENOSPC" : "EIO" });
+    fault.mockRestore(); expect(d.acked).toBe(0); expect(d.termed).toEqual([]);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    f.advance(85_000); await f.link.remote.read(0);
+    expect(d.termed).toHaveLength(1); expect(f.saved()[0]!.startedAt).toBe(f.initial);
+  });
+
+  it("fails closed on target clock rollback and rejects corrupt target counters", async () => {
+    const f = await fixture(); f.port.routes.delete(fileLead.id);
+    const d = await f.deliver("target-rollback", 1);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    f.advance(10_000); await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    f.advance(-1); await f.link.remote.read(0); expect(d.termed).toHaveLength(1);
+    const journal = JSON.parse(fs.readFileSync(f.lapsePath, "utf8")); journal.lapses[0].target.activeMs = -1;
+    fs.writeFileSync(f.lapsePath, JSON.stringify(journal));
+    await expect(f.restart()).rejects.toThrow("Invalid NATS sender lease-lapse metadata");
+  });
+
+  it("does not credit a failed native snapshot as measured pause time", async () => {
+    const f = await fixture(); f.port.routes.delete(fileLead.id);
+    const d = await f.deliver("unknown-snapshot", 1);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    f.advance(10_000);
+    const failed = vi.spyOn(f.link.remote.filePresence, "refresh").mockRejectedValue(new Error("native snapshot unavailable"));
+    await expect(f.link.remote.read(0)).rejects.toThrow("native snapshot unavailable");
+    failed.mockRestore();
+    f.advance(20_000);
+    await f.link.remote.read(0);
+    expect(d.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
+  });
+
+  it("a full journal cannot restart a memory-only target pause after redelivery", async () => {
+    const f = await fixture();
+    const sender = f.port.routes.get(natsLead.id)!;
+    for (let i = 1; i <= 2; i++) {
+      f.lapse(); await f.deliver(`fill-${i}`, i);
+      await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+      f.advance(WINDOW); await f.link.remote.read(0);
+    }
+    f.port.routes.set(natsLead.id, sender); f.port.routes.delete(fileLead.id);
+    const published = f.now(), d = await f.deliver("overflow-target", 3);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    f.advance(35_000); await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(d.termed).toEqual([]); expect(f.saved()).toHaveLength(2);
+    await f.restart(); f.port.routes.delete(fileLead.id);
+    const again = await f.deliver("overflow-target", 3, published, 2);
+    await f.link.remote.read(0); expect(again.termed).toHaveLength(1); expect(f.saved()).toHaveLength(2);
+  });
+
+  it("an earlier real sender lapse still expires at 30 s after the reason changes to target lag", async () => {
+    const f = await fixture(); const sender = f.port.routes.get(natsLead.id)!; f.lapse();
+    const d = await f.deliver("sender-then-target", 1);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    f.advance(10_000); f.port.routes.set(natsLead.id, sender); f.port.routes.delete(fileLead.id);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    f.advance(19_999); await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(d.termed).toEqual([]);
+    f.advance(1); await f.link.remote.read(0); expect(d.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
+  });
+
   it.each(["sender", "directory"])("bounds retained history across restart without wedging later %s gaps", async mode => {
     const f = await fixture(); f.lapse();
     for (let i = 1; i <= 4; i++) {

@@ -61,7 +61,7 @@ export class ParticipantFileLockBusyError extends MeshLockTimeoutError {
 /** A bounded (LOCK_WAIT_MS) key or namespace wait that ran out. A plain Error, so participant
  * writers keep their existing handling; directory custody converts it (below). */
 class ParticipantFileLockWaitTimeout extends Error {
-  constructor(readonly lock: string, readonly attempts: number, readonly maxGapMs: number) {
+  constructor(readonly lock: string, readonly attempts: number, readonly maxGapMs: number, readonly lockWaitMs: number) {
     super(`Timed out waiting for the participant file lock ${lock}`);
   }
 }
@@ -71,8 +71,11 @@ class ParticipantFileLockWaitTimeout extends Error {
  * is contention, not a permanent refusal: a MeshLockTimeoutError, so the bridge backs off and retries
  * instead of stopping the link. */
 export class ParticipantFileCustodyTimeoutError extends MeshLockTimeoutError {
-  constructor(readonly lock: string, attempts: number, maxGapMs: number) {
-    super(` participant file lock ${lock}`, attempts, maxGapMs);
+  constructor(readonly lock: string, attempts: number, maxGapMs: number, lockWaitMs?: number) {
+    super(` participant file lock ${lock}`, attempts, maxGapMs, lockWaitMs);
+    if (typeof lockWaitMs === "number" && Number.isFinite(lockWaitMs) && lockWaitMs >= 0) {
+      this.message += `; lockWaitMs=${Math.round(lockWaitMs)}`;
+    }
     this.name = "ParticipantFileCustodyTimeoutError";
   }
 }
@@ -306,7 +309,7 @@ export const withParticipantFileDirectoryCustody = async <T>(mesh: ParticipantFi
     return await participantFileDirectoryCustody(mesh, () => { entered = true; return operation(); }, relevantIds);
   } catch (error) {
     if (!entered && error instanceof ParticipantFileLockWaitTimeout) {
-      throw new ParticipantFileCustodyTimeoutError(error.lock, error.attempts, error.maxGapMs);
+      throw new ParticipantFileCustodyTimeoutError(error.lock, error.attempts, error.maxGapMs, error.lockWaitMs);
     }
     throw error;
   }
@@ -374,6 +377,7 @@ const withKeyLock = async <T>(
   if (options.registryFenced && !prepared) throw new ParticipantFileLockBusyError(file);
   const incarnation = prepared ? options.ownIncarnation : await ownProcessIncarnation();
   const receipt = keyReceipt(mesh, file, incarnation);
+  const waitStarted = performance.now();
   const deadline = Date.now() + LOCK_WAIT_MS;
   let attempts = 0;
   let maxGapMs = 0;
@@ -390,7 +394,7 @@ const withKeyLock = async <T>(
       if (options.tryOnly) throw new ParticipantFileLockBusyError(receipt.lock);
       await recoverDeadKeyLock(mesh, receipt.lock, options.registryFenced);
       if (options.registryFenced && fs.existsSync(receipt.lock)) throw new ParticipantFileLockBusyError(receipt.lock);
-      if (Date.now() >= deadline) throw new ParticipantFileLockWaitTimeout(receipt.lock, attempts, maxGapMs);
+      if (Date.now() >= deadline) throw new ParticipantFileLockWaitTimeout(receipt.lock, attempts, maxGapMs, Math.max(0, performance.now() - waitStarted));
       await new Promise(resolve => setTimeout(resolve, 5));
     }
   }

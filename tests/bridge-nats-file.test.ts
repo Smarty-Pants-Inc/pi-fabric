@@ -5,7 +5,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import type { BridgePresence } from "../src/mesh/bridge.js";
 import { BridgeMirrorDeferredError } from "../src/mesh/bridge.js";
 import { createNatsFileLink, NatsCarrierDeferredError } from "../src/mesh/bridge-nats-file.js";
@@ -22,6 +23,7 @@ const roots: string[] = [];
 const stores: MeshStore[] = [];
 const closers: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const close of closers.splice(0)) await close();
   for (const store of stores.splice(0)) store.closeState();
   // Only this test's own mkdtemp fixtures.
@@ -31,7 +33,9 @@ afterEach(async () => {
 const key = (prefix: string, id: string): string => prefix + createHash("sha256").update(id).digest("hex");
 const NOW = Date.now();
 const host = (identity: MeshIdentity): FabricHostRecord => ({
-  format: 1, id: identity.id, rootId: identity.id, identity, startedAt: NOW - 1_000, updatedAt: NOW, expiresAt: NOW + 86_400_000,
+  format: 1, id: identity.id, rootId: identity.id, identity,
+  incarnationToken: identity.id === fileLead.id ? "inc-file-lead" : "inc-moved-lead",
+  startedAt: NOW - 1_000, updatedAt: NOW, expiresAt: NOW + 86_400_000,
 });
 const participant = (identity: MeshIdentity, ownerIncarnation: string): FabricParticipantRecord => ({
   format: 1, id: identity.id, kind: "root", rootId: identity.id, ownerHostId: identity.id, ownerIdentityId: identity.id,
@@ -40,7 +44,7 @@ const participant = (identity: MeshIdentity, ownerIncarnation: string): FabricPa
   controlProtocol: "v1",
 });
 
-const fixture = async (options: { resendAttempts?: number } = {}) => {
+const fixture = async (options: { resendAttempts?: number; now?: () => number } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-file-"));
   roots.push(root);
   const store = new MeshStore(path.join(root, "hub"), 256 * 1024, 1_000);
@@ -53,6 +57,8 @@ const fixture = async (options: { resendAttempts?: number } = {}) => {
       participants: [participant(natsLead, "inc-moved-lead")], reserved: [natsLead.id] } satisfies BridgePresence;
     for (const [identity, machine, incarnation] of [[natsLead, POD_MACHINE, "inc-moved-lead"], [fileLead, BRIDGE_MACHINE, "inc-file-lead"],
       [linkIdentity, BRIDGE_MACHINE, "inc-link"]] as const) port.routes.set(identity.id, route(identity, machine, incarnation));
+    if (options.now) port.presence = async () => ({ ...port.natsPresence,
+      hosts: port.natsPresence.hosts.map(entry => ({ ...entry, observedAt: options.now!() })) });
     return port;
   };
   const port = newPort();
@@ -62,6 +68,8 @@ const fixture = async (options: { resendAttempts?: number } = {}) => {
     store, localName: "ryzen1", link: LINK, cursorPath: path.join(root, "cursor.json"), port, ledger,
     authorize: () => ({ ok: true, principal: "carry" }), authorizeTopic: () => ({ ok: true, principal: "none" }),
     mirrorAllowed: () => true, log: line => logs.push(line), resendDelayMs: 0,
+    ...(options.now ? { now: options.now, filePresenceTtlMs: 0 } : {}),
+    waitForTarget: id => id === fileLead.id,
     ...(options.resendAttempts !== undefined ? { resendAttempts: options.resendAttempts } : {}),
     bridge: { presenceMs: 60_000 },
   });
@@ -211,6 +219,188 @@ describe("NatsCarrierSide under MeshBridge", () => {
     await link.bridge.step();
     expect(events("fabric.control.command")).toHaveLength(1);
     expect(waiting.acked).toBe(1);
+  });
+
+  // Keep: incidents #120/#126, command loss at the KV/file ownership boundary. Advance only
+  // the clock; use the real carrier, local mirror fences, journal, append and ACK ordering.
+  it("retains a missing own KV target for 35 s, then appends once without importing target time into the sender fence", async () => {
+    let time = NOW;
+    vi.spyOn(Date, "now").mockImplementation(() => time);
+    const f = await fixture({ now: () => time });
+    const target = f.port.routes.get(fileLead.id)!;
+    f.port.routes.delete(fileLead.id);
+    const delivery = f.port.deliver(natsAsk("lag-35s"), POD_MACHINE, 1);
+    await settle();
+    await expect(f.link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    time += 35_000;
+    await expect(f.link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(delivery.termed).toEqual([]); expect(delivery.acked).toBe(0);
+    expect(f.ledger.records.size).toBe(0); expect(f.events("fabric.control.command")).toEqual([]);
+    f.port.routes.set(fileLead.id, target);
+    expect((await f.link.bridge.step()).toLocal).toBe(1);
+    await f.link.bridge.step();
+    expect(f.events("fabric.control.command")).toHaveLength(1);
+    expect(delivery.acked).toBe(1); expect(delivery.termed).toEqual([]);
+  });
+
+  it("refuses a genuinely absent target at 30 s, without a blanket 120 s extension", async () => {
+    let time = NOW;
+    vi.spyOn(Date, "now").mockImplementation(() => time);
+    const f = await fixture({ now: () => time });
+    f.port.routes.delete(fileLead.id);
+    await f.store.put({ key: key("topology/hosts/", fileLead.id), identity: fileLead,
+      value: { ...host(fileLead), expiresAt: time - 1 } });
+    const delivery = f.port.deliver(natsAsk("gone-30s"), POD_MACHINE, 1);
+    await settle();
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    time += 29_999;
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    time += 1;
+    expect((await f.link.remote.read(0)).events).toEqual([]);
+    expect(delivery.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
+  });
+
+  it("charges only the remaining active target budget after independently sampled lag ends", async () => {
+    let time = NOW;
+    vi.spyOn(Date, "now").mockImplementation(() => time);
+    const f = await fixture({ now: () => time });
+    f.port.routes.delete(fileLead.id);
+    // A missing native target is not mirror lag. Restore it after 20 s of chargeable wait.
+    await f.store.put({ key: key("topology/hosts/", fileLead.id), identity: fileLead,
+      value: { ...host(fileLead), expiresAt: time - 1 } });
+    const delivery = f.port.deliver(natsAsk("active-budget"), POD_MACHINE, 1);
+    await settle();
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    time += 20_000;
+    await f.store.put({ key: key("topology/hosts/", fileLead.id), identity: fileLead, value: host(fileLead) });
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    time += 40_000;
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    await f.store.put({ key: key("topology/hosts/", fileLead.id), identity: fileLead,
+      value: { ...host(fileLead), expiresAt: time - 1 } });
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    time += 9_999;
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(delivery.termed).toEqual([]);
+    time += 1; await f.link.remote.read(0);
+    expect(delivery.termed).toHaveLength(1);
+  });
+
+  it("enforces an immutable 120 s cap before route recovery or a ledger claim, including redelivery", async () => {
+    let time = NOW;
+    vi.spyOn(Date, "now").mockImplementation(() => time);
+    const f = await fixture({ now: () => time });
+    const target = f.port.routes.get(fileLead.id)!; f.port.routes.delete(fileLead.id);
+    const delivery = f.port.deliver(natsAsk("cap-120s"), POD_MACHINE, 1);
+    await settle();
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    time += 119_999;
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(delivery.termed).toEqual([]);
+    time += 1; f.port.routes.set(fileLead.id, target);
+    expect((await f.link.remote.read(0)).events).toEqual([]);
+    expect(delivery.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
+    const again = f.port.deliver(natsAsk("cap-120s"), POD_MACHINE, 1);
+    await settle(); await f.link.remote.read(0);
+    expect(again.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
+  });
+
+  it("keeps a real sender's 30 s lapse independent of a paused target wait", async () => {
+    let time = NOW;
+    vi.spyOn(Date, "now").mockImplementation(() => time);
+    const f = await fixture({ now: () => time });
+    const target = f.port.routes.get(fileLead.id)!, sender = f.port.routes.get(natsLead.id)!;
+    f.port.routes.delete(fileLead.id);
+    const delivery = f.port.deliver(natsAsk("sender-during-lag"), POD_MACHINE, 1);
+    await settle(); await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    time += 35_000;
+    f.port.routes.set(natsLead.id, { ...sender, route: { ...sender.route, live: false }, leaseLapsed: true });
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    time += 29_999;
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(delivery.termed).toEqual([]);
+    time += 1; f.port.routes.set(natsLead.id, sender); f.port.routes.set(fileLead.id, target);
+    expect((await f.link.remote.read(0)).events).toEqual([]);
+    expect(delivery.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
+  });
+
+  it("#126 retries an expired own FILE sender mirror beyond 30 s while exact KV authority is live", async () => {
+    let time = NOW;
+    vi.spyOn(Date, "now").mockImplementation(() => time);
+    const f = await fixture({ now: () => time });
+    const publish = f.link.local.publish.bind(f.link.local);
+    let lag = true;
+    vi.spyOn(f.link.local, "publish").mockImplementation(async (...args) => {
+      if (lag && args[0].topic === "fabric.control.command") {
+        const lease = readHostLease(f.store.root, natsLead.id)!;
+        writeHostLease(f.store.root, { ...lease, expiresAt: time - 1 });
+      }
+      return publish(...args);
+    });
+    const delivery = f.port.deliver(natsAsk("projection-lag"), POD_MACHINE, 1);
+    await settle();
+    expect(await f.link.bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
+    time += 35_000;
+    expect(await f.link.bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
+    expect(delivery.acked).toBe(0); expect(delivery.termed).toEqual([]);
+    expect(f.events("fabric.control.command")).toEqual([]);
+    lag = false; time += 1; await f.link.bridge.syncPresence();
+    expect((await f.link.bridge.step()).toLocal).toBe(1);
+    await f.link.bridge.step();
+    expect(f.events("fabric.control.command")).toHaveLength(1); expect(delivery.acked).toBe(1);
+    expect(f.logs.filter(line => line.includes("projection-lag") && /refused|dropped/.test(line))).toEqual([]);
+  });
+
+  it("rechecks the immutable cap under the append fence after a lock wait crosses it", async () => {
+    let time = NOW;
+    vi.spyOn(Date, "now").mockImplementation(() => time);
+    const f = await fixture({ now: () => time });
+    const target = f.port.routes.get(fileLead.id)!; f.port.routes.delete(fileLead.id);
+    const d = f.port.deliver(natsAsk("cap-at-append"), POD_MACHINE, 1);
+    await settle(); await expect(f.link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    time += 119_999; f.port.routes.set(fileLead.id, target);
+    const publish = f.link.local.publish.bind(f.link.local);
+    vi.spyOn(f.link.local, "publish").mockImplementation(async (...args) => {
+      time = NOW + 120_000; // The next continuation is the real store admission/append.
+      return publish(...args);
+    });
+    await expect(f.link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(f.events("fabric.control.command")).toEqual([]); expect(d.acked).toBe(0); expect(d.termed).toEqual([]);
+    await f.link.bridge.step();
+    expect(d.termed).toHaveLength(1); expect(f.events("fabric.control.command")).toEqual([]);
+  });
+
+  it("#126's own FILE projection pause has the same immutable 120 s cap", async () => {
+    let time = NOW;
+    vi.spyOn(Date, "now").mockImplementation(() => time);
+    const f = await fixture({ now: () => time });
+    const publish = f.link.local.publish.bind(f.link.local);
+    let lag = true;
+    vi.spyOn(f.link.local, "publish").mockImplementation(async (...args) => {
+      if (lag) writeHostLease(f.store.root, { ...readHostLease(f.store.root, natsLead.id)!, expiresAt: time - 1 });
+      return publish(...args);
+    });
+    const d = f.port.deliver(natsAsk("projection-cap"), POD_MACHINE, 1); await settle();
+    expect(await f.link.bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
+    time += 119_999;
+    expect(await f.link.bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 }); expect(d.termed).toEqual([]);
+    time += 1; lag = false; await f.link.bridge.syncPresence();
+    expect((await f.link.bridge.step()).toLocal).toBe(0);
+    expect(f.events("fabric.control.command")).toEqual([]); expect(d.termed).toHaveLength(1); expect(d.acked).toBe(0);
+  });
+
+  it("never treats a known foreign target owner as own-mirror lag", async () => {
+    let time = NOW;
+    vi.spyOn(Date, "now").mockImplementation(() => time);
+    const f = await fixture({ now: () => time });
+    const original = f.port.routes.get(fileLead.id)!;
+    f.port.routes.set(fileLead.id, { ...original, route: { ...original.route, ownerHostId: natsLead.id } });
+    const d = f.port.deliver(natsAsk("foreign-target"), POD_MACHINE, 1); await settle();
+    await f.link.remote.read(0);
+    expect(d.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
+    time += 35_000; f.port.routes.set(fileLead.id, original);
+    const again = f.port.deliver(natsAsk("foreign-target-2"), POD_MACHINE, 2); await settle();
+    expect((await f.link.remote.read(0)).events).toHaveLength(1); expect(again.termed).toEqual([]);
   });
 
   it("a redelivery after a restart is appended once (dedupe receipt) and ACKed", async () => {

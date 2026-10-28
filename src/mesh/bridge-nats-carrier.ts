@@ -67,7 +67,12 @@ export interface NatsCarrierSenderDiagnostic {
   readonly remainingAuthorityMs?: number;
 }
 /** A live native file participant: its directory identity and the host id its runtime replies from. */
-export interface FilePresenceEntry { readonly identity: MeshIdentity; readonly hostId: string }
+export interface FilePresenceEntry {
+  readonly identity: MeshIdentity;
+  readonly hostId: string;
+  readonly ownerIncarnation?: string;
+  readonly expiresAt?: number;
+}
 
 export interface NatsCarrierPresence {
   /** Live KV presence only (L1's verified view); undefined when unknown, lapsed or ambiguous. */

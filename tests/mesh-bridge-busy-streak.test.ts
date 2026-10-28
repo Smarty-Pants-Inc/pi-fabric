@@ -54,7 +54,7 @@ const pending = () => withUntrustedDiagnostics(new MeshIncarnationPendingError()
 const queueExpired = () => withUntrustedDiagnostics(new MeshLockQueueExpiredError("fixture/.lock", 1, 1_000));
 const TOPIC = "fleet.work.busy-streak.1";
 
-const fixture = async (fail: (attempt: number) => Error | undefined, log?: (message: string) => void, overRpc = false) => {
+const fixture = async (fail: (attempt: number) => Error | undefined, log?: (message: string) => void, overRpc = false, inbound = false) => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-bridge-busy-streak-"));
   const hub = new MeshStore(path.join(base, "hub"), 65_536, 100, { stateBackend: "file" });
   const far = new MeshStore(path.join(base, "far"), 65_536, 100, { stateBackend: "file" });
@@ -81,7 +81,7 @@ const fixture = async (fail: (attempt: number) => Error | undefined, log?: (mess
     closeTransport = async () => { rpc.close(); await served; };
     await rpc.hello(); // Negotiate tail so the refusal traverses the agent's real source page operation.
   }
-  const direction = overRpc ? "toLocal" : "toRemote";
+  const direction = overRpc || inbound ? "toLocal" : "toRemote";
   const logs: Array<{ message: string; at: number }> = [];
   let didRecover!: () => void;
   const recovered = new Promise<void>(done => { didRecover = done; });
@@ -95,9 +95,9 @@ const fixture = async (fail: (attempt: number) => Error | undefined, log?: (mess
   let running: Promise<void> | undefined, failure: unknown;
   cleanups.push(async () => { await bridge.stop(); await running; await closeTransport?.(); hub.closeState(); far.closeState(); });
   await bridge.start();
-  const sent = await (overRpc ? far : hub).publish({ topic: TOPIC, kind: "ask", from: overRpc ? receiver : sender,
-    to: overRpc ? sender.id : receiver.id, text: "deliver once" });
-  const source = overRpc ? agent : local;
+  const sent = await (direction === "toLocal" ? far : hub).publish({ topic: TOPIC, kind: "ask", from: direction === "toLocal" ? receiver : sender,
+    to: direction === "toLocal" ? sender.id : receiver.id, text: "deliver once" });
+  const source = direction === "toLocal" ? agent : local;
   const attempts: number[] = [], tail = source.tail.bind(source);
   vi.spyOn(source, "tail").mockImplementation(async (...args) => {
     attempts.push(now() - epoch);
@@ -116,7 +116,7 @@ const fixture = async (fail: (attempt: number) => Error | undefined, log?: (mess
     failure: () => failure,
     streak: () => logs.filter(({ message }) => message.includes(`(${direction})`) && message.includes("failed direction attempts")),
     cursor: () => (JSON.parse(fs.readFileSync(cursorPath, "utf8")) as Record<typeof direction, { after: number }>)[direction].after,
-    received: () => (overRpc ? hub : far).read({ topic: TOPIC, after: 0 }),
+    received: () => (direction === "toLocal" ? hub : far).read({ topic: TOPIC, after: 0 }),
   };
 };
 type Fixture = Awaited<ReturnType<typeof fixture>>;
@@ -186,6 +186,33 @@ const sameFile = (fd: number, file: string) => {
 };
 
 describe("real MeshBridge direction busy streaks", () => {
+  it("logs each failed toLocal mirror attempt with its own typed reason and measured elapsed time", async () => {
+    const errors = [new BridgeMirrorDeferredError(false, 0, "target-kv-wait"),
+      new BridgeMirrorDeferredError(true, 1_000), new BridgeMirrorDeferredError(false, 0, "sender-lease-lapse")];
+    const f = await fixture(attempt => errors[attempt - 1], undefined, false, true);
+    await f.launch();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(2_000);
+    const failures = f.streak().filter(line => line.message.includes("retrying"));
+    expect(failures).toHaveLength(3);
+    expect(failures.map(line => /reason=([^;]+)/.exec(line.message)?.[1])).toEqual([
+      "target-kv-wait", "mirror-timeout", "sender-lease-lapse"]);
+    expect(failures.every(line => line.message.includes("attemptMs=0") && !line.message.includes("\n"))).toBe(true);
+    expect(failures.map(line => line.at)).toEqual([0, 1_000, 3_000]);
+    await vi.advanceTimersByTimeAsync(4_000); await f.recovered;
+    assertDelivered(f);
+  });
+
+  it("logs the lock's acquisition wait on toRemote timeouts, separately from the zero-age streak", async () => {
+    const refused = withUntrustedDiagnostics(new MeshLockTimeoutError("private holder", 22, 1_786, 2_789));
+    const f = await fixture(attempt => attempt === 1 ? refused : undefined);
+    await f.launch();
+    expect(f.streak()[0]!.message).toContain("elapsed 0 ms");
+    expect(f.streak()[0]!.message).toContain("lockWaitMs=2789");
+    assertSafeLogs(f.logs);
+    await vi.advanceTimersByTimeAsync(200); await f.recovered; assertDelivered(f);
+  });
+
   it.each([
     { name: "timeout", error: timeout, label: "mesh lock timeout", delay: 200 },
     { name: "incarnation pending", error: pending, label: "mesh incarnation pending", delay: 200 },

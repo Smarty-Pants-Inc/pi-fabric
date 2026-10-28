@@ -469,6 +469,9 @@ export interface BridgeSide {
   leaseLapsed?(id: string, identity?: MeshIdentity): boolean;
   /** A carrier may already hold this event for a lapse. Share its FIRST durable deadline with the append fence. */
   retainLeaseLapse?(event: MeshEvent, startedAt?: number): number | undefined;
+  /** Link-local retention for an independently verified own projection lag. Not authority:
+   * true retains, false is expired, undefined uses the ordinary sender-lapse policy. */
+  deferOwnMirror?(event: MeshEvent): Promise<boolean | undefined>;
   /** Hub-local only: a fenced/stale link cannot defer an ownership refusal. */
   readonly ingressFenced?: boolean;
   /** Whether this link has a mirror record for the id, even if its lease lapsed (hub only). */
@@ -886,6 +889,8 @@ export class StoreBridgeSide implements BridgeSide {
     readonly now: () => number = Date.now,
     /** CLI link/agent processes opt in; reference/manual adapters keep their existing lease shape. */
     readonly monitorLease = false,
+    /** Optional link-local retention fence. Synchronous, admission-only; never writes metadata. */
+    readonly admitPublication?: (event: BridgePublish) => void,
   ) {
     if (!validBridgeName(peer)) throw new Error(`Invalid bridge peer name: ${peer}`);
     assertBridgeStateBackend(store.root, store.stateBackend);
@@ -1380,6 +1385,7 @@ export class StoreBridgeSide implements BridgeSide {
     // Capture caller-owned bytes once, before any admission/retry wait.
     const data = JSON.parse(JSON.stringify({ ...checked.data, bridge: fromHub && stamp.via === this.peer
       ? stamp : { from: this.peer, id: stamp.id } })) as BridgePublish["data"];
+    const heldFence = held.length > 0 ? this.#heldFence(held, checked.from) : undefined;
     return {
       ...checked,
       // The cursor advances only after the destination confirms its append durably.
@@ -1410,7 +1416,8 @@ export class StoreBridgeSide implements BridgeSide {
       // acquired asynchronously). Under the participants-files policy a native's first file is
       // written without it; its host record, which reserves the root id, still goes through the
       // lock, and a mirror never outranks a native file (#142 S2).
-      ...(held.length > 0 ? this.#heldFence(held, checked.from) : {}),
+      ...heldFence,
+      ...(this.admitPublication ? { admit: () => { heldFence?.admit?.(); this.admitPublication!({ ...checked, data }); } } : {}),
       data,
     };
   }
@@ -2909,9 +2916,12 @@ const dispatch = async (side: StoreBridgeSide, request: RpcRequest, receivedAt: 
 class BridgeLegacyNotificationsError extends Error {}
 
 /** One mirror stays in flight after its deadline; retries must not queue more RPCs behind it. */
+export type BridgeMirrorDeferReason = "mirror-pending" | "mirror-timeout" | "target-kv-wait" | "target-wait-cap" |
+  "sender-lease-lapse" | "directory-not-ready" | "carrier-unavailable" | "publish-uncertain";
 export class BridgeMirrorDeferredError extends Error {
   readonly code: string;
-  constructor(readonly timedOut: boolean, timeoutMs: number) {
+  constructor(readonly timedOut: boolean, timeoutMs: number,
+    readonly diagnosticReason: BridgeMirrorDeferReason = timedOut ? "mirror-timeout" : "mirror-pending") {
     super(timedOut ? `Fabric bridge-stale: Bridge agent did not answer mirror within ${timeoutMs} ms; retrying with backoff` :
       "Bridge mirror is still in flight; retrying with backoff");
     this.name = "BridgeMirrorDeferredError";
@@ -4329,7 +4339,7 @@ export class MeshBridge {
   }
 
   /** Expired samples or an own-root lease-only lapse can retain a membership boundary. */
-  #staleMembership(event: MeshEvent, rules: BridgeRules, direction: Direction, reason?: string): boolean {
+  async #staleMembership(event: MeshEvent, rules: BridgeRules, direction: Direction, reason?: string): Promise<boolean> {
     if (direction === "toLocal" && this.options.local.ingressFenced) return false;
     if (reason !== undefined && reason !== "sender is not a live participant of the remote" &&
       reason !== "ack target is not bound to this link" && !(reason === "not addressed across" && direction === "toRemote")) return false;
@@ -4348,6 +4358,13 @@ export class MeshBridge {
       ids.every(id => local.holds?.(id as string, id === event.from.id ? event.from : undefined) ||
         local.leaseLapsed?.(id as string, id === event.from.id ? event.from : undefined));
     const cursor = this.#cursor![direction];
+    // A real sender/legacy append deadline, once retained, is never enlarged by projection lag.
+    const existingDeadline = this.#leaseLapseAt(direction, event);
+    if (existingDeadline !== undefined && Date.now() >= existingDeadline) return false;
+    if (lapsed && this.options.remote.deferOwnMirror) {
+      const retained = await this.options.remote.deferOwnMirror(event);
+      if (retained !== undefined) return retained;
+    }
     if (direction === "toLocal" && (cursor.leaseLapse?.sequence !== event.sequence || cursor.leaseLapse.id !== event.id)) {
       // Import an earlier carrier boundary even when this layer only sees a stale projection.
       // Otherwise initialize only a proven local lease lapse; never renew on retry/restart.
@@ -4530,6 +4547,7 @@ export class MeshBridge {
       this.#directionBackoff[direction] = false;
       this.#directionMirrorBackoff[direction] = false;
       const presenceVersion = this.#presenceVersion;
+      const attemptStarted = monotonicClock.now();
       let delay: number | undefined;
       let delayReason: DirectionWakeReason = "other";
       const ingress = { retainedOffLockMs: 0, fenceRefusals: 0, recovered: false };
@@ -4606,7 +4624,10 @@ export class MeshBridge {
           retainedOffLockMs: ingress.retainedOffLockMs };
         busy.count += 1;
         busy.last = label;
-        if (now - busy.reportedAt >= (isMeshStateWalCap(error) ? WAL_CAP_LOG_MS : 10_000)) {
+        // A toLocal retry is already backoff-limited (normally 1/2/4/8 s). Report every
+        // failed mirror attempt, not just attempts 1 and 3 of a short loss streak.
+        if ((direction === "toLocal" && error instanceof BridgeMirrorDeferredError) ||
+          now - busy.reportedAt >= (isMeshStateWalCap(error) ? WAL_CAP_LOG_MS : 10_000)) {
           // The shared helper projects typed WAL facts, but passes other errors' free text through.
           // Never retain owner, fence, recovery or path text in this streak's diagnostics.
           let detail = label;
@@ -4624,9 +4645,19 @@ export class MeshBridge {
                 walBytes: Number(wal[1]), capBytes: Number(wal[2]), readerCount: Number(wal[3]) }));
             }
           } catch { /* projection is diagnostic-only; retain the fixed label on failure */ }
+          let measured = "";
+          if (direction === "toLocal" && error instanceof BridgeMirrorDeferredError) {
+            measured = `; reason=${error.diagnosticReason}; attemptMs=${Math.max(0, Math.round(now - attemptStarted))}`;
+          } else if (isMeshLockTimeout(error) && !isMeshQueueExpiry(error)) {
+            // Acquisition time comes from the lock, not streak age, phase totals or retry sleep.
+            // Legacy RPC does not carry it: omit the field, never invent a duration.
+            const facts = error as { lockWaitMs?: unknown; waitedMs?: unknown };
+            const wait = facts.lockWaitMs ?? facts.waitedMs;
+            if (typeof wait === "number" && Number.isFinite(wait) && wait >= 0) measured = `; lockWaitMs=${Math.round(wait)}`;
+          }
           logBusy(`${label} (${direction}); retrying in ${delay} ms; ${busy.count} failed direction attempts, ` +
             `elapsed ${Math.max(0, Math.round(now - busy.started))} ms; first=${busy.first}; last=${busy.last}; ` +
-            `retainedOffLockMs=${Math.max(0, Math.round(busy.retainedOffLockMs))}: ${detail}`);
+            `retainedOffLockMs=${Math.max(0, Math.round(busy.retainedOffLockMs))}${measured}: ${detail}`);
           busy.reportedAt = now;
         }
       }
@@ -4902,7 +4933,7 @@ export class MeshBridge {
           await refresh();
           reason = this.#refusal(event, rules, direction);
         }
-        if (reason && this.#staleMembership(event, rules, direction, reason)) {
+        if (reason && await this.#staleMembership(event, rules, direction, reason)) {
           this.#deferMembership(direction, event);
           if (cursor.after > start) checkpoint();
           return { forwarded, dropped };
@@ -5032,7 +5063,7 @@ export class MeshBridge {
               // a proven takeover still refuses, and otherwise retry from the durable cursor.
               rules = await authority(false);
               const currentReason = this.#refusal(event, rules, direction);
-              if (this.#staleMembership(event, rules, direction, currentReason)) {
+              if (await this.#staleMembership(event, rules, direction, currentReason)) {
                 this.#deferMembership(direction, event);
                 if (cursor.after > start) checkpoint();
                 return { forwarded, dropped };
@@ -5145,7 +5176,7 @@ export class MeshBridge {
     // Do not turn a source sender's expired sampled projection into an unavailable ACK
     // and consume its command. This is a wait, not permission to bypass the sender fence.
     if (!senderHeld &&
-      (this.#staleMembership(event, rules, "toLocal", this.#refusal(event, rules, "toLocal")) ||
+      (await this.#staleMembership(event, rules, "toLocal", this.#refusal(event, rules, "toLocal")) ||
         (this.#relayDestinationStale(event, rules) && this.#staleRelaySender(event, rules)))) return { delivered: false, pending: true };
     const staleDestination = this.#relayDestinationStale(event, rules);
     if (staleDestination && this.#relayGracePending(event)) return { delivered: false, pending: true };
@@ -5185,7 +5216,7 @@ export class MeshBridge {
       if (!(error instanceof BridgeOwnershipError)) throw error;
       const { local: presence, remote: owned } = await this.#authority(false);
       const current = { ...rules, senders: senders(owned), identities: senderIdentities(owned), reserved: new Set(presence.reserved) };
-      if (!this.#staleMembership(event, current, "toLocal", this.#refusal(event, current, "toLocal"))) throw error;
+      if (!await this.#staleMembership(event, current, "toLocal", this.#refusal(event, current, "toLocal"))) throw error;
       // Destination dedupe covers retry after delivery but before the fenced hub receipt.
       return { delivered: false, pending: true };
     }

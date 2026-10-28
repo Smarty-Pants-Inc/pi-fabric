@@ -325,7 +325,7 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
       "fallbackThinking": "high"
     },
     "thinking": "medium",
-    "maxConcurrent": 4,
+    "maxConcurrent": 20,
     "maxPerExecution": 100,
     "maxDepth": 2,
     "timeoutMs": 86400000,
@@ -818,7 +818,7 @@ Other agent settings:
 - `modelPolicy.fallbackModel` is optional and host/profile-only; when set, it is the model used for an indirect fallback, paired with `fallbackThinking` (default `high`). It is not a package-wide default. If no usable configured fallback exists, an inherited Claude binding is refused with `agents.modelPolicy.fallbackModel` named. Fabric does not silently select an uninstalled provider. Successful fallback receipts/results identify the transition as `model: inherited <old> -> <new> <thinking> (#11863)`. Allowed exception and inherited-switch records append one JSON object to `~/.local/state/smarty/route/opus-exceptions.jsonl` using one `O_APPEND` write: `{ts, role, model, ref, reason, launcher, host}` where `ts` is ISO UTC, `role` is `task` or `actor:<name>`, `model` is the original Claude model, `ref` is an issue reference or `null`, `reason` is supplied text or `inherited-switch`, `launcher` is `fabric`, and `host` is the host name. A logging failure is surfaced but does not block the run.
 
 - `thinking`: default reasoning effort (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`), default `medium`.
-- `maxConcurrent`: child concurrency semaphore. A session spawn beyond this limit returns a `queued` handle immediately. Queued children start in FIFO order as slots become free; `queuePosition` in list/status is one-based. Queued receipts are session-only for now: saturated durable spawns cancel their queue entry, safely reject, and return no queued handle.
+- `maxConcurrent` (default 20, range 1–32): child concurrency semaphore. A session spawn beyond this limit returns a `queued` handle immediately. Queued children start in FIFO order as slots become free; `queuePosition` in list/status is one-based. Queued receipts are session-only for now: saturated durable spawns cancel their queue entry, safely reject, and return no queued handle.
 - `maxPerExecution`: hard cap on accepted child launches per `fabric_exec` invocation, including queued spawns. Cancelling a queued child does not refund that invocation's launch count.
 - `maxDepth`: nesting bound for child agent calls, including `rlm.query()`. It accepts any non-negative safe integer. A value of `0` disables child spawning. `/fabric settings` provides free-form numeric entry.
 - `timeoutMs`: default wall-clock budget per child (24 hours by default, also the policy ceiling). An explicit one-shot task timeout can shorten that default when it is at least `300000` ms (5 minutes), for lane and audit timeboxes. Smaller shortenings are ignored to protect real work from tiny model-chosen budgets; the handle and terminal result carry `timeoutNote` with code `AGENT_TIMEOUT_BELOW_SHORTENING_FLOOR`, the requested/effective values and the minimum. The event log records `run.timeout_ignored`. Longer overrides remain capped at 24 hours. Unset values keep the configured default; persistent actor overrides still only extend it. The default also remains the whole-program deadline floor for orchestration outside interactive Main. A run deadline stops the owned native process tree and returns `timed_out`, preserving partial text and the write receipt; it does not delete completed work.

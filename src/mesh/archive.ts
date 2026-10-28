@@ -141,7 +141,13 @@ const ARCHIVE_RANGE_MAX_BLOCKS = 1024;
 // Names only, never segment identities. Bound both count and serialized name bytes.
 const ARCHIVE_DAY_NAMES_CACHE_ENTRIES = 128;
 const ARCHIVE_DAY_NAMES_CACHE_BYTES = 4 * 1024 * 1024;
-const dayNamesCache = new Map<string, { identity: string; names: string[]; bytes: number }>();
+interface ArchiveDayNamesSnapshot { identity: string; names: string[]; readAt: number }
+// Multiple name changes can share one coarse directory timestamp. A listing must be
+// outside that tick both when read and when reused; merely aging a recent entry is unsafe.
+const ARCHIVE_DAY_NAMES_SETTLE_MS = 2000;
+const dayNamesSettled = (stat: fs.Stats, readAt: number): boolean =>
+  Math.max(stat.mtimeMs, stat.ctimeMs) < Math.min(readAt, Date.now()) - ARCHIVE_DAY_NAMES_SETTLE_MS;
+const dayNamesCache = new Map<string, ArchiveDayNamesSnapshot & { bytes: number }>();
 let dayNamesCacheBytes = 0;
 const forgetDayNames = (directory: string): void => {
   const cached = dayNamesCache.get(directory);
@@ -955,7 +961,7 @@ export class MeshArchive {
       }
       const currentAborted = fs.statSync(abortedPath, { throwIfNoEntry: false });
       if (abortedIdentity !== (currentAborted ? fileIdentity(currentAborted) : "missing")) throw new MeshArchiveRecoveryChanged();
-      if (nameSnapshot && nameSnapshot.identity !== fileIdentity(fs.statSync(directory))) throw new MeshArchiveRecoveryChanged();
+      if (nameSnapshot) this.#validateDayNames(directory, nameSnapshot);
       // Defer our own directory-changing metadata installs until the snapshot is fenced.
       // Never relabel a pre-write name list with the post-write directory generation.
       for (const { file, index } of pendingIndexes) {
@@ -973,26 +979,38 @@ export class MeshArchive {
     return found.slice(0, limit);
   }
 
-  #readDayNames(directory: string): { identity: string; names: string[] } {
-    const identity = fileIdentity(fs.statSync(directory));
+  #validateDayNames(directory: string, snapshot: ArchiveDayNamesSnapshot): void {
+    const stat = fs.statSync(directory);
+    if (fileIdentity(stat) !== snapshot.identity) throw new MeshArchiveRecoveryChanged();
+    if (dayNamesSettled(stat, snapshot.readAt)) return;
+    // Stat equality cannot fence names within a coarse tick. Compare the actual set at
+    // bootstrap and at the final fence, retaining the original enumeration's tie order.
+    const current = fs.readdirSync(directory).filter(name => name.endsWith(".jsonl"));
+    const present = new Set(current);
+    if (current.length !== snapshot.names.length || snapshot.names.some(name => !present.has(name)) ||
+        fileIdentity(fs.statSync(directory)) !== snapshot.identity) throw new MeshArchiveRecoveryChanged();
+  }
+
+  #readDayNames(directory: string): ArchiveDayNamesSnapshot {
+    const readAt = Date.now(), stat = fs.statSync(directory), identity = fileIdentity(stat);
     const cached = dayNamesCache.get(directory);
-    if (cached?.identity === identity) {
+    if (cached?.identity === identity && dayNamesSettled(stat, cached.readAt)) {
       dayNamesCache.delete(directory); dayNamesCache.set(directory, cached);
       return cached;
     }
     forgetDayNames(directory);
-    // A real enumeration belongs only to the generation observed on BOTH sides of it.
     const names = fs.readdirSync(directory).filter(name => name.endsWith(".jsonl"));
-    if (fileIdentity(fs.statSync(directory)) !== identity) throw new MeshArchiveRecoveryChanged();
+    const snapshot = { identity, names, readAt };
+    this.#validateDayNames(directory, snapshot);
     const bytes = Buffer.byteLength(JSON.stringify(names));
     if (bytes <= ARCHIVE_DAY_NAMES_CACHE_BYTES) {
       while (dayNamesCache.size >= ARCHIVE_DAY_NAMES_CACHE_ENTRIES || dayNamesCacheBytes + bytes > ARCHIVE_DAY_NAMES_CACHE_BYTES) {
         forgetDayNames(dayNamesCache.keys().next().value!);
       }
-      dayNamesCache.set(directory, { identity, names, bytes });
+      dayNamesCache.set(directory, { ...snapshot, bytes });
       dayNamesCacheBytes += bytes;
     }
-    return { identity, names };
+    return snapshot;
   }
 
   #readRangeCatalog(day: string): Map<string, ArchiveRangeCatalogEntry> {

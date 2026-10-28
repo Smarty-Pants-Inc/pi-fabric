@@ -295,7 +295,8 @@ describe("lossless archived-history catch-up", () => {
       return readdir(...args);
     }) as typeof fs.readdirSync);
     exact(await read(), [event(10, "fleet.work.a")]);
-    expect(dayReads).toBe(0); // The real reader, not a helper-only cache assertion.
+    // Restoring mtime still leaves a recent ctime: settled reuse is checked separately
+    // with a controlled clock, rather than depending on filesystem timestamp precision.
     const beforeAdd = fs.statSync(directory);
     const b = segment(f.dir, day, "fleet.work.b", [event(50, "fleet.work.b"), event(200, "fleet.work.b")]);
     fs.utimesSync(directory, beforeAdd.atime, beforeAdd.mtime);
@@ -320,6 +321,121 @@ describe("lossless archived-history catch-up", () => {
     expect(fs.statSync(directory).mtimeMs).toBe(beforeRename.mtimeMs);
     exact(await read(40), [event(70, "fleet.work.a")]);
     expect(dayReads).toBeGreaterThanOrEqual(3);
+  });
+
+  it.each([
+    ["warm", "sync"], ["reopened", "sync"], ["warm", "async"], ["reopened", "async"],
+  ] as const)("relists same-tick day names without losing small-page events, then reuses a settled listing (%s %s)", async (state, mode) => {
+    const f = setup(), day = "2026/01/01";
+    const a = segment(f.dir, day, "fleet.work.a", [event(90, "fleet.work.a")]);
+    const directory = path.dirname(a), stat = fs.statSync, readdir = fs.readdirSync;
+    const frozen = stat(directory), tick = Math.floor(Date.now() / 2000) * 2000;
+    let now = tick + 100;
+    frozen.mtimeMs = frozen.ctimeMs = tick;
+    const trace: string[] = [];
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    vi.spyOn(fs, "statSync").mockImplementation(((...args: Parameters<typeof fs.statSync>) => {
+      if (String(args[0]) !== directory) return stat(...args);
+      trace.push("stat");
+      return frozen; // Force dev/ino/size/mtime/ctime to survive real additions unchanged.
+    }) as typeof fs.statSync);
+    vi.spyOn(fs, "readdirSync").mockImplementation(((...args: Parameters<typeof fs.readdirSync>) => {
+      if (String(args[0]) === directory) trace.push("names");
+      return readdir(...args);
+    }) as typeof fs.readdirSync);
+    const read = async (after = 40, limit = 1) => {
+      const archive = state === "reopened" ? new MeshArchive(f.dir, f.root) : f.archive;
+      return mode === "sync" ? archive.readAfter(after, 100, all, limit) : archive.readAfterAsync(after, 100, all, limit);
+    };
+    exact(await read(), [event(90, "fleet.work.a")]);
+    trace.length = 0;
+    segment(f.dir, day, "fleet.work.b", [event(50, "fleet.work.b"), event(200, "fleet.work.b")]);
+    exact(await read(), [event(50, "fleet.work.b")]); // Returning 90 would jump the cursor over 50.
+    expect(trace[0]).toBe("stat"); // Lookup must not trust the unchanged recent identity.
+    expect(trace.filter(step => step === "names").length).toBeGreaterThanOrEqual(2);
+
+    // Aging now alone cannot rehabilitate a listing read inside the ambiguous tick.
+    now += 3000;
+    trace.length = 0;
+    segment(f.dir, day, "fleet.work.c", [event(45, "fleet.work.c")]);
+    exact(await read(), [event(45, "fleet.work.c")]);
+    expect(trace).toContain("names");
+    trace.length = 0;
+    const pages = [...await read(), ...await read(45), ...await read(50)];
+    exact(pages, [event(45, "fleet.work.c"), event(50, "fleet.work.b"), event(90, "fleet.work.a")]);
+    exact(await read(90), []); // Nothing beyond through, and no duplicate final page.
+    expect(trace).toContain("stat");
+    expect(trace).not.toContain("names"); // Both timestamps and the new listing are settled.
+  });
+
+  it.each([
+    ["enumeration", "sync"], ["fence", "sync"], ["enumeration", "async"], ["fence", "async"],
+  ] as const)("retries a forced same-tick addition at the day-name %s boundary (%s)", async (boundary, mode) => {
+    const f = setup(), day = "2026/01/01";
+    const a = segment(f.dir, day, "fleet.work.a", [event(90, "fleet.work.a")]);
+    const directory = path.dirname(a), stat = fs.statSync, readdir = fs.readdirSync;
+    const frozen = stat(directory), now = Date.now();
+    // Either recent timestamp must disable identity-only validation, independently.
+    frozen.mtimeMs = boundary === "enumeration" ? now : now - 10_000;
+    frozen.ctimeMs = boundary === "fence" ? now : now - 10_000;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    vi.spyOn(fs, "statSync").mockImplementation(((...args: Parameters<typeof fs.statSync>) =>
+      String(args[0]) === directory ? frozen : stat(...args)) as typeof fs.statSync);
+    const trace: string[] = [];
+    let additions = 0;
+    const add = () => {
+      if (additions) return;
+      additions++;
+      trace.push("add");
+      segment(f.dir, day, "fleet.work.b", [event(50, "fleet.work.b"), event(200, "fleet.work.b")]);
+    };
+    vi.spyOn(fs, "readdirSync").mockImplementation(((...args: Parameters<typeof fs.readdirSync>) => {
+      const names = readdir(...args);
+      if (String(args[0]) === directory) {
+        trace.push("names");
+        if (boundary === "enumeration") add(); // Return the pre-add listing with unchanged stats.
+      }
+      return names;
+    }) as typeof fs.readdirSync);
+    const matches = () => { trace.push("event"); if (boundary === "fence") add(); return true; };
+    const archive = new MeshArchive(f.dir, f.root);
+    const actual = mode === "sync" ? archive.readAfter(40, 100, matches, 1) : await archive.readAfterAsync(40, 100, matches, 1);
+    exact(actual, [event(50, "fleet.work.b")]);
+    expect(additions).toBe(1);
+    expect(trace[0]).toBe("names");
+    expect(trace.indexOf("add")).toBeGreaterThan(trace.indexOf("names"));
+    expect(trace.slice(trace.indexOf("add") + 1)).toContain("names");
+    if (boundary === "enumeration") expect(trace.slice(0, trace.indexOf("event")).filter(step => step === "names").length).toBeGreaterThanOrEqual(3);
+    else expect(trace.indexOf("add")).toBeGreaterThan(trace.indexOf("event"));
+    const reopened = new MeshArchive(f.dir, f.root);
+    exact(mode === "sync" ? reopened.readAfter(50, 100, all, 1) : await reopened.readAfterAsync(50, 100, all, 1), [event(90, "fleet.work.a")]);
+  });
+
+  it.each(["sync", "async"] as const)("fails closed after repeated same-tick name changes instead of returning a cursor-skipping page (%s)", async mode => {
+    const f = setup(), day = "2026/01/01";
+    const a = segment(f.dir, day, "fleet.work.a", [event(90, "fleet.work.a")]);
+    const directory = path.dirname(a), stat = fs.statSync, readdir = fs.readdirSync;
+    const frozen = stat(directory), now = Date.now();
+    frozen.mtimeMs = frozen.ctimeMs = now;
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    vi.spyOn(fs, "statSync").mockImplementation(((...args: Parameters<typeof fs.statSync>) =>
+      String(args[0]) === directory ? frozen : stat(...args)) as typeof fs.statSync);
+    let additions = 0, busy = true;
+    vi.spyOn(fs, "readdirSync").mockImplementation(((...args: Parameters<typeof fs.readdirSync>) => {
+      const names = readdir(...args);
+      if (busy && String(args[0]) === directory) {
+        const topic = `fleet.work.added${additions}`;
+        segment(f.dir, day, topic, [event(50 + additions++, topic)]);
+      }
+      return names;
+    }) as typeof fs.readdirSync);
+    const archive = new MeshArchive(f.dir, f.root);
+    if (mode === "sync") expect(() => archive.readAfter(40, 100, all, 1)).toThrow(MeshSnapshotRetriesExhaustedError);
+    else await expect(archive.readAfterAsync(40, 100, all, 1)).rejects.toThrow(MeshSnapshotRetriesExhaustedError);
+    expect(additions).toBeGreaterThan(1);
+    busy = false;
+    const reopened = new MeshArchive(f.dir, f.root);
+    exact(mode === "sync" ? reopened.readAfter(40, 100, all, 1) : await reopened.readAfterAsync(40, 100, all, 1), [event(50, "fleet.work.added0")]);
   });
 
   it.each([
@@ -354,9 +470,9 @@ describe("lossless archived-history catch-up", () => {
       }) as typeof fs.statSync);
     }
     const actual = mode === "sync" ? f.archive.readAfter(40, 100, all, 2) : await f.archive.readAfterAsync(40, 100, all, 2);
+    exact(actual, [event(50, "fleet.work.b"), event(90, "fleet.work.a")]);
     expect(mutations).toBe(1);
     expect(observations).toBeGreaterThanOrEqual(state === "cached" ? 4 : 2);
-    exact(actual, [event(50, "fleet.work.b"), event(90, "fleet.work.a")]);
     exact(actual, legacyReadAfter(f.dir, 40, 100, all, 2));
   });
 

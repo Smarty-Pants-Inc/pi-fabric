@@ -83,12 +83,13 @@ Expected: `exit=0`. FAIL: exit 2 with `[owner: fabric-v2]` (use §8), or another
 Record the seam's invocation time separately from Pod launch/startupProbe time. `resume` has a 600 s phase clock
 from seam entry, including all initial reads. For a valid identity whose journal is still the exact seal and whose
 seal has no thinking entry, the missing-append wait now uses that same 600 s ceiling (not the former 120 s window,
-and not an additional 600 s). A seal with a thinking entry needs no append wait. Inspect `elapsedMs` and
-`measured.observations` in `fabric-v2-bridge-resume-outcome.json` when available.
+and not an additional 600 s). Polling stops when another complete identity read would consume the remaining
+phase budget, leaving time to write the missing-append outcome. A seal with a thinking entry needs no append
+wait. Inspect `elapsedMs` and `measured.observations` in `fabric-v2-bridge-resume-outcome.json` when available.
 
 This is **not** a first-NATS-contact probe: pinned Pi writes its thinking append before `session_start`; Fabric
 then awaits NATS activation before opening the identity socket. If the seam calls before that socket is available,
-`pod-identity-unreadable` still refuses immediately rather than entering the append wait. The 600 s startupProbe
+`pod-identity-unreadable` still refuses immediately without entering the append wait. The 600 s startupProbe
 window and A's 900 s outer cap are separate clocks; this change neither guarantees the former nor extends the latter.
 
 Then check the bridge receipts, the evidence and the config change:

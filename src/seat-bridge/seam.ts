@@ -285,6 +285,8 @@ const finalSealOf = (context: Context, requested: unknown):
  */
 const APPEND_WAIT_MS = DEADLINE_MS;
 const APPEND_POLL_MS = 2_000;
+// podIdentity's two API reads, executable check and identity exec; leave time to record the last coherent read.
+const APPEND_READ_MS = 30_000 + 30_000 + 120_000 + 30_000;
 
 /**
  * Every entry id of the sealed journal, from the seat host's own sealed copy (the seal's `journal`). Its bytes must be
@@ -339,8 +341,9 @@ const resume = async (context: Context): Promise<number> => {
   const wait = clock(context, APPEND_WAIT_MS);
   while (awaitingAppend() && wait.now() < wait.deadline) {
     await wait.sleep(Math.min(APPEND_POLL_MS, wait.deadline - wait.now()));
-    // A late wake or kubectl's 1 s minimum must not extend the phase or start a read after its cap.
-    if (wait.deadline - wait.now() < 1_000) continue;
+    // Do not let another full identity read consume the phase's last budget and bypass the missing-append outcome.
+    // A late wake also stops polling; the last coherent observation still gets its normal checks below.
+    if (wait.deadline - wait.now() <= APPEND_READ_MS) break;
     read = await podIdentity(context, access, pin, seal);
     observations += 1;
   }

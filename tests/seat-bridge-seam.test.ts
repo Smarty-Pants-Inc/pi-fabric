@@ -211,7 +211,10 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
       appendedSinceSeal: [{ id: "e3", parentId: "e2", type: "thinking_level_change", thinkingLevel: "high" }] } });
   });
 
-  it.each([5_000, 600_000])("a missing thinking append refuses at the %i ms phase cap, with no extra startup window", async phaseCap => {
+  it.each([
+    { phaseCap: 5_000, elapsedMs: 2_000, observations: 1 },
+    { phaseCap: 600_000, elapsedMs: 400_000, observations: 2 },
+  ])("a missing thinking append records its outcome before the $phaseCap ms phase cap", async ({ phaseCap, elapsedMs, observations }) => {
     const w = await world({ sealed: SEALED_BARE });
     setKube(w, RAW, { line: identityLine(w) });
     let t = 0;
@@ -221,25 +224,26 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     } });
     expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: resume-thinking-append-missing [owner: fabric-v2]\n" });
     const outcome = evidenceOf(w, "fabric-v2-bridge-resume-outcome.json");
-    expect(outcome).toMatchObject({ result: "unknown", gap: "resume-thinking-append-missing", elapsedMs: phaseCap,
-      measured: { observations: 3, finalSeal: { sealHasThinkingEntry: false }, journal: { appendedSinceSeal: [], suffixBytes: 0 } } });
-    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(3);
-    expect(t).toBe(phaseCap);
+    expect(outcome).toMatchObject({ result: "unknown", gap: "resume-thinking-append-missing", elapsedMs,
+      measured: { observations, finalSeal: { sealHasThinkingEntry: false }, journal: { appendedSinceSeal: [], suffixBytes: 0 } } });
+    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(observations);
+    expect(t).toBe(elapsedMs);
+    expect(t).toBeLessThan(phaseCap);
   });
 
-  it("Pi's first append after 150 s (>120 s, <600 s) passes, with the new leaf", async () => {
+  it.each([150_000, 388_000])("Pi's first append after %i ms passes, including near the last full-read budget", async appendAt => {
     const w = await world({ sealed: SEALED_BARE });
     setKube(w, RAW, { line: identityLine(w) });
     let t = 0;
     const result = await run(w, "resume", resumeInputs, { now: () => t, sleep: async () => {
-      t += 30_000; // A delayed scheduler wake, still inside the original phase clock.
-      if (t === 150_000) { fs.appendFileSync(w.journalFile, THINKING); setKube(w, RAW, { line: identityLine(w) }); }
+      t = Math.min(t + 30_000, appendAt); // Delayed scheduler wakes inside the original phase clock.
+      if (t === appendAt) { fs.appendFileSync(w.journalFile, THINKING); setKube(w, RAW, { line: identityLine(w) }); }
     } });
     expect(result).toMatchObject({ code: 0, stderr: "" });
     expect(result.receipt).toMatchObject({ result: "pass", observed: { leafId: "e3",
       appendedSinceSeal: [{ id: "e3", parentId: "e2", type: "thinking_level_change", thinkingLevel: "high" }] } });
-    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ elapsedMs: 150_000,
-      measured: { observations: 6 } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ elapsedMs: appendAt,
+      measured: { observations: Math.ceil(appendAt / 30_000) + 1 } });
   });
 
   it("a seal WITH a thinking entry needs one observation and no wait", async () => {
@@ -324,7 +328,20 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     expect(t).toBe(0);
   });
 
-  it("slow per-read calls share the phase cap: no floored 1 s read starts after it expires", async () => {
+  it("an unreadable identity during append polling is not misclassified as a missing append", async () => {
+    const w = await world({ sealed: SEALED_BARE });
+    setKube(w, RAW, { line: identityLine(w) });
+    let t = 0;
+    const result = await run(w, "resume", resumeInputs, { now: () => t, sleep: async ms => {
+      t += ms;
+      setKube(w, RAW, { line: "unreadable", code: 1 });
+    } });
+    expect(result).toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused",
+      reason: "pod-identity-unreadable", elapsedMs: 2_000, measured: { observations: 2 } });
+  });
+
+  it.each([200_000, 600_000])("slow per-read calls preserve the %i ms cap and distinguish initial identity from missing append", async phaseCap => {
     const w = await world({ sealed: SEALED_BARE });
     setKube(w, RAW, { line: identityLine(w) });
     let t = 0;
@@ -341,10 +358,21 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
       budgets.push(timeout); t += timeout;
       return value;
     });
-    expect(await run(w, "resume", resumeInputs, { now: () => t, sleep: async ms => { t += ms; } }))
-      .toMatchObject({ code: 2, stdout: "", stderr: "GAP: phase-deadline [owner: fabric-v2]\n" });
-    expect(budgets).toEqual([30_000, 30_000, 120_000, 30_000, 30_000, 30_000, 120_000, 30_000, 30_000, 30_000, 116_000]);
-    expect(t).toBe(600_000);
+    const result = await run(w, "resume", resumeInputs, { deadlineMs: phaseCap, now: () => t, sleep: async ms => { t += ms; } });
+    if (phaseCap === 200_000) {
+      // No coherent initial identity was established: this is not a missing-append diagnosis.
+      expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: phase-deadline [owner: fabric-v2]\n" });
+      expect(budgets).toEqual([30_000, 30_000, 120_000, 20_000]);
+      expect(t).toBe(phaseCap);
+      expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-resume-outcome.json"))).toBe(false);
+    } else {
+      expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: resume-thinking-append-missing [owner: fabric-v2]\n" });
+      expect(budgets).toEqual([30_000, 30_000, 120_000, 30_000, 30_000, 30_000, 120_000, 30_000]);
+      expect(t).toBe(424_000);
+      expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "unknown",
+        gap: "resume-thinking-append-missing", elapsedMs: 424_000, measured: { observations: 2 } });
+      expect(t).toBeLessThan(phaseCap);
+    }
   });
 
   /** A thinking_level_change line as Pi writes it (5 keys). */

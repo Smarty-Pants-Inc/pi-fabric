@@ -95,6 +95,13 @@ const evidence = (context: Context, name: string, value: Record<string, unknown>
 const clock = (context: Context, budgetMs = Number.POSITIVE_INFINITY) => ({
   now: context.now, sleep: context.sleep, deadline: Math.min(context.deadline, context.now() + budgetMs) });
 
+/** kubectl floors its timeout at 1 s: never start another read with less phase time left than that. */
+const podReadBudget = (context: Context, maximum: number): number => {
+  const remaining = context.deadline - context.now();
+  if (remaining < 1_000) throw new SeamGap("phase-deadline");
+  return Math.min(maximum, remaining);
+};
+
 export const main = async (argv: string[], io: BridgeIo, pins: BridgePins | undefined, deps: BridgeDeps = {}): Promise<number> => {
   const now = deps.now ?? (() => performance.now());
   const started = now();
@@ -157,8 +164,7 @@ export interface PodIdentity {
  */
 const podIdentity = async (context: Context, access: KubeAccess, pin: { name: string; uid: string },
   seal?: { leafId: string; journalBytes: number }) => {
-  const remaining = (): number => Math.max(0, context.deadline - context.now());
-  const before = await readPod(access, pin.name, Math.min(30_000, remaining()));
+  const before = await readPod(access, pin.name, podReadBudget(context, 30_000));
   if (before && before.uid !== pin.uid) throw new SeamGap("pod-uid-mismatch");
   if (before && before.nodeName !== targetNode(context)) throw new SeamGap("pod-node-mismatch");
   const cli = context.deps.podCli !== undefined ? context.deps.podCli : POD_FABRIC_CLI.confirmed ? POD_FABRIC_CLI.path : null;
@@ -174,11 +180,11 @@ const podIdentity = async (context: Context, access: KubeAccess, pin: { name: st
   else if (!before.piRunning) reason = "pod-not-running";
   else if (!before.meshRoot) reason = "pod-mesh-root-unknown";
   else if ((await kubectl(access, ["-n", access.namespace, "exec", pin.name, "-c", "pi", "--", "test", "-x", cli],
-    Math.min(30_000, remaining()))).code !== 0) reason = "pod-cli-missing";
+    podReadBudget(context, 30_000))).code !== 0) reason = "pod-cli-missing";
   else {
     const result = await kubectl(access, ["-n", access.namespace, "exec", pin.name, "-c", "pi", "--", cli, "session", "drain",
       context.request.sessionId, "--mesh", before.meshRoot, "--identity",
-      ...(seal ? ["--since", seal.leafId, "--sealed-bytes", String(seal.journalBytes)] : [])], Math.min(120_000, remaining()));
+      ...(seal ? ["--since", seal.leafId, "--sealed-bytes", String(seal.journalBytes)] : [])], podReadBudget(context, 120_000));
     execCode = result.code;
     line = (result.stdout.trim().split("\n").at(-1) ?? "").slice(0, 1024 * 1024);
     let parsed: Record<string, unknown> | undefined;
@@ -200,7 +206,8 @@ const podIdentity = async (context: Context, access: KubeAccess, pin: { name: st
       }
     }
   }
-  const after = before ? await readPod(access, pin.name, Math.min(30_000, Math.max(1_000, remaining()))) : undefined;
+  const after = before ? await readPod(access, pin.name, podReadBudget(context, 30_000)) : undefined;
+  if (context.now() >= context.deadline) throw new SeamGap("phase-deadline");
   if (!reason && (!after || after.uid !== pin.uid)) reason = "pod-uid-changed";
   if (!reason && !after!.piRunning) reason = "pod-not-running";
   return { before: before ?? null, after: after ?? null, identity, journal, journalError, reason, line, execCode, cli };
@@ -270,12 +277,13 @@ const finalSealOf = (context: Context, requested: unknown):
 };
 
 /**
- * Pi (031c7499 sdk.js:135, :346-349) appends exactly one thinking_level_change when it opens an existing session whose
- * branch has none, at session creation, before any prompt; the file gets it at once (session-manager #persistEntry).
- * So for a seal without one, zero appended entries means Pi has not created the session on the target yet: not a
- * completed resume. The seam re-observes for at most this long (within the phase deadline), then refuses.
+ * Pi (031c7499 sdk.js:135, :346-349) appends exactly one thinking_level_change for an existing conversation whose
+ * branch has none, before AgentSession construction and session_start; the file gets it at once. Fabric's first
+ * NATS connect is later, during activation, before its identity socket opens (fabric-runtime-state.ts). This is
+ * ONLY a missing-append wait after a readable identity, not a retry of unavailable identity or NATS startup.
+ * Give that existing wait the 600 s startup allowance, sharing the phase's original deadline, never adding to it.
  */
-const APPEND_WAIT_MS = 120_000;
+const APPEND_WAIT_MS = DEADLINE_MS;
 const APPEND_POLL_MS = 2_000;
 
 /**
@@ -311,7 +319,7 @@ const resume = async (context: Context): Promise<number> => {
   const pin = podPin(inputs.pod);
   const seal = finalSealOf(context, inputs.finalSeal);
   const access = kubeAccess(context);
-  await verifyKubeconfig(access, Math.min(30_000, context.deadline - context.now()));
+  await verifyKubeconfig(access, podReadBudget(context, 30_000));
   const intentSha256 = evidence(context, "intent", { schema: "fabric-v2-bridge-resume-intent-v1", pod: pin, finalSeal: inputs.finalSeal,
     measured: { kubectl: access.kubectl, server: access.server, interpreter: interpreterIdentity(), startedAt: new Date().toISOString() },
     residuals: RESIDUALS });
@@ -322,8 +330,10 @@ const resume = async (context: Context): Promise<number> => {
     read.journal.sealedSha256 === seal.journalSha256 && read.journal.sealOnBranch && read.journal.suffixBytes === 0 &&
     (read.journal.appendedSinceSeal ?? []).length === 0;
   const wait = clock(context, APPEND_WAIT_MS);
-  while (awaitingAppend() && wait.now() + APPEND_POLL_MS < wait.deadline) {
-    await wait.sleep(APPEND_POLL_MS);
+  while (awaitingAppend() && wait.now() < wait.deadline) {
+    await wait.sleep(Math.min(APPEND_POLL_MS, wait.deadline - wait.now()));
+    // A late wake or kubectl's 1 s minimum must not extend the phase or start a read after its cap.
+    if (wait.deadline - wait.now() < 1_000) continue;
     read = await podIdentity(context, access, pin, seal);
     observations += 1;
   }

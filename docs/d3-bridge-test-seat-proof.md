@@ -80,6 +80,17 @@ python3 "$MOVE" cutover-seat --run-dir "$RUN" --run-sha256 "$RUNSHA" --inputs-sh
 
 Expected: `exit=0`. FAIL: exit 2 with `[owner: fabric-v2]` (use §8), or another owner's GAP.
 
+Record the seam's invocation time separately from Pod launch/startupProbe time. `resume` has a 600 s phase clock
+from seam entry, including all initial reads. For a valid identity whose journal is still the exact seal and whose
+seal has no thinking entry, the missing-append wait now uses that same 600 s ceiling (not the former 120 s window,
+and not an additional 600 s). A seal with a thinking entry needs no append wait. Inspect `elapsedMs` and
+`measured.observations` in `fabric-v2-bridge-resume-outcome.json` when available.
+
+This is **not** a first-NATS-contact probe: pinned Pi writes its thinking append before `session_start`; Fabric
+then awaits NATS activation before opening the identity socket. If the seam calls before that socket is available,
+`pod-identity-unreadable` still refuses immediately rather than entering the append wait. The 600 s startupProbe
+window and A's 900 s outer cap are separate clocks; this change neither guarantees the former nor extends the latter.
+
 Then check the bridge receipts, the evidence and the config change:
 
 ```sh
@@ -233,9 +244,10 @@ Post these on smarty-dev#15310 with the run id, the UTC time and the pass or FAI
 | `GAP: journal-prefix-mismatch` | the Pod's journal no longer starts with the sealed bytes | stop: the copy is not the sealed journal |
 | `GAP: branch-diverged` or `journal-suffix-*` | the resumed session moved off the sealed branch, or grew too much | stop |
 | `GAP: resume-tail-id-reused` | an entry appended after the seal reuses an id of the sealed journal or of the tail, or the resumed file's branch is broken (a cycle or a missing parent). Pi's own startup append always has a new id; this is never a resume | stop |
-| `GAP: resume-thinking-append-missing` | the seal has no thinking entry and, after 120 s of re-reads, the Pod's journal still holds only the sealed bytes: Pi has not opened the session (a real resume appends exactly one `thinking_level_change` at start). Check that pi runs with the rendered `--session` and has started; this is not a completed resume | fabric-v2 |
+| `GAP: resume-thinking-append-missing` | the seal has no thinking entry and the readable journal still holds only the sealed bytes after the append wait, capped by the original 600 s phase clock. The expected Pi startup append was not observed; this is not a NATS-connect timeout. Check the rendered `--session` and the startup trace | fabric-v2 |
+| `GAP: phase-deadline` | the phase has insufficient time for another Pod/exec read (kubectl's minimum is 1 s), or its last observation finished at/after the phase deadline. Initial reads and append polling share the same 600 s cap; inspect the intent and any retained command evidence | fabric-v2 |
 | `GAP: seat-mesh-not-link-mesh` | the v1 seat's mesh is not the link's file mesh | fabric-v2 |
-| `refused`, `pod-identity-unreadable` | the Pod's CLI lacks `--identity`, or its server check failed: read `asserted.podLine` | the image owner, or fabric-v2 |
+| `refused`, `pod-identity-unreadable` | the Pod's CLI lacks `--identity`, its server check failed, or NATS activation has not yet exposed the local MainDrainServer socket. This state is not retried by the missing-append wait; read `asserted.podLine` and the Pod startup trace | the image owner, or fabric-v2 |
 | `refused`, `link-not-reloaded` | no new lock holder, or a status problem: read `measured.reload` | the link's operator |
 | `refused`, `seat-not-routable` | no single live record on the seat's machine with the Pod Main's incarnation: read `measured.receipt` | fabric-v2 |
 | `refused`, `seat-route-refused-by-gate` | the link's identity gate does not resolve the seat: read `measured.gate`. An old presence row for the id on a second machine (for example a mirror row a killed link left), live or not, hides the id from the NATS directory, so the gate says `BRIDGE_NATS_TARGET_UNAVAILABLE`, "has no nats presence", even though the seat's live row is there. Check for an extra row before anything else; a presence row expires within its 10-minute TTL. The seam waits 120 s for the route and then refuses; the config change it made STAYS (it is not rolled back automatically), so roll back with `rc-restore-route` or rerun once the row is gone | fabric-v2 |

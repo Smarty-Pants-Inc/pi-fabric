@@ -60,9 +60,10 @@ Observed: `{sessionId, journal, leafId, podUid, appendedSinceSeal, journalSha256
    - the file's sha256 and the sha256 of its first `<n>` bytes;
    - the bytes after them, base64, when they are at most 64 KiB.
 4. The Pod is read again: same UID, pi still running.
-5. If the seal has no thinking entry (`sealHasThinkingEntry: false`) and the file is still exactly the sealed bytes,
-   Pi has not opened the session yet: steps 2-4 are repeated every 2 s for at most 120 s, within the phase
-   deadline.
+5. If the seal has no thinking entry (`sealHasThinkingEntry: false`), the identity read is valid, and the file is
+   still exactly the sealed bytes, the required startup append has not been observed: steps 2-4 are repeated every
+   2 s for up to 600 s (`APPEND_WAIT_MS = DEADLINE_MS`), capped by the phase's original deadline. No other state
+   is retried; an unreadable identity still refuses immediately.
 
 No receipt (exit 2) when:
 - the first `<n>` bytes do not hash to the final seal (`journal-prefix-mismatch`);
@@ -84,13 +85,37 @@ A `refused` receipt when:
 - the Main runs another session file than the rendered `--session` (`journal-mismatch`);
 - the Main's leaf differs from its file's last entry (`leaf-memory-file-mismatch`).
 
-Pi core appends one `thinking_level_change` entry on resume when the sealed branch has none: at session creation,
-before any prompt, written to the file at once (pinned Pi 031c7499: `sdk.js:135`, `sdk.js:346-349`). So a seal
-without a thinking entry and zero appended entries means Pi has not resumed yet. A seal without one is still valid
-(older sessions). A judges `appendedSinceSeal` under its rule T-FIX3: it re-reads the host journal from its final
-seal, checks `sha256(sealed bytes + decoded suffix) == journalSha256`, and that the suffix parses to exactly
+Pi core appends one `thinking_level_change` entry for an existing conversation whose branch has none: before
+`AgentSession` construction and `session_start`, not after NATS contact (pinned Pi 031c7499:
+`dist/core/sdk.js:135,346-349,377`). Its session manager generates a new id, parents it to the current leaf and
+persists it synchronously (`dist/core/session-manager.js:1592-1600,1346-1396`). A seal without one is still valid
+(older sessions), but zero appended entries does not satisfy the seam's completed-resume proof.
+
+**Append is not first NATS contact.** Pi later binds extensions and emits `session_start`
+(`dist/core/agent-session.js:5129`). Fabric's handler bootstraps and ensures the runtime (`src/extension.ts`),
+which awaits `openFabricTransport` and NATS activation before `initializeMeshActivation` opens `MainDrainServer`
+(`src/fabric-runtime-state.ts`). The seam's `podIdentity` calls the in-Pod `session drain --identity` CLI, which
+gets the file and in-memory leaf from that local socket and reads the journal itself (`src/cli/session-drain.ts`,
+`src/main-drain/control.ts`). A call before NATS activation has exposed the socket can therefore get
+`pod-identity-unreadable` and refuse immediately. The missing-append retry does **not** wait for that socket or
+for first NATS connect, and this window change does not fix that separate startup-readiness hazard.
+
+**Phase cap versus startup window.** The phase clock starts at seam entry and is capped at 600 s; validation,
+initial reads and every later read consume it. The append wait shares that clock: it is not another 600 s after
+the first observation, nor a guarantee of 600 s from Pod launch. Each Pod/exec read recomputes its timeout from
+the remaining phase time; no new read starts with less than kubectl's 1 s minimum, and an observation finishing at
+or after the deadline cannot pass (`phase-deadline`, exit 2). An unchanged readable journal with the required
+append still missing at the wait cap gives `resume-thinking-append-missing`. These are deadline checks and child
+process timeout budgets, not an OS-level preemption guarantee for synchronous filesystem work or process teardown.
+A's separate 900 s cap is not extended.
+
+A judges `appendedSinceSeal` under its rule T-FIX3: it re-reads the host journal from its final seal, checks
+`sha256(sealed bytes + decoded suffix) == journalSha256`, and that the suffix parses to exactly
 `appendedSinceSeal`. The seam reports the append exactly as found. A test runs the real pinned Pi CLI on a sealed
-session and checks the one append and the seam's pass over it (`D3_PINNED_PI`, skipped without it).
+session and checks the one append and the seam's pass over it (`D3_PINNED_PI`, skipped without it). Fake-clock
+regressions cover an append at 150 s (past the old 120 s window), missing appends at the default and a shorter
+phase cap, no wait for a seal with thinking metadata, and slow reads consuming the shared cap. Existing divergence
+and reused-id cases still require refusal.
 
 ## `publish`
 

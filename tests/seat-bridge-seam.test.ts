@@ -2,10 +2,11 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { procStartTime } from "../src/main-drain/binding.js";
 import { readBridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
 import { journalBranch } from "../src/seat-drain/journal-branch.js";
+import * as kube from "../src/seat-drain/kube.js";
 import { main, type BridgeDeps } from "../src/seat-bridge/seam.js";
 import { createSeat, SID, type Seat } from "./seat-drain-fixture.js";
 
@@ -210,36 +211,66 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
       appendedSinceSeal: [{ id: "e3", parentId: "e2", type: "thinking_level_change", thinkingLevel: "high" }] } });
   });
 
-  it("a seal WITHOUT a thinking entry and no append is not a completed resume: re-observed, bounded, then UNKNOWN", async () => {
+  it.each([5_000, 600_000])("a missing thinking append refuses at the %i ms phase cap, with no extra startup window", async phaseCap => {
     const w = await world({ sealed: SEALED_BARE });
     setKube(w, RAW, { line: identityLine(w) });
-    expect(await run(w, "resume", resumeInputs)).toMatchObject({ code: 2, stdout: "",
-      stderr: "GAP: resume-thinking-append-missing [owner: fabric-v2]\n" });
-    const outcome = evidenceOf(w, "fabric-v2-bridge-resume-outcome.json");
-    expect(outcome).toMatchObject({ result: "unknown", gap: "resume-thinking-append-missing",
-      measured: { finalSeal: { sealHasThinkingEntry: false }, journal: { appendedSinceSeal: [], suffixBytes: 0 } } });
-    // It waited, bounded (120 s at one observation per 2 s, on the test's clock), re-reading the Pod each time.
-    expect(outcome.measured.observations).toBe(60);
-    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(60);
-    expect(outcome.elapsedMs).toBeLessThanOrEqual(120_000);
-  }, 60_000);
-
-  it("the counterexample: Pi's one append arriving DURING the wait passes, with the new leaf", async () => {
-    const w = await world({ sealed: SEALED_BARE });
-    setKube(w, RAW, { line: identityLine(w) });
-    let sleeps = 0;
-    const result = await run(w, "resume", resumeInputs, { sleep: async () => {
-      sleeps += 1;
-      if (sleeps === 3) { fs.appendFileSync(w.journalFile, THINKING); setKube(w, RAW, { line: identityLine(w) }); }
+    let t = 0;
+    const result = await run(w, "resume", resumeInputs, { deadlineMs: phaseCap, now: () => t, sleep: async ms => {
+      // Late timer wakes consume phase time too; cover the full default cap without hundreds of subprocess reads.
+      t += phaseCap === 600_000 ? 200_000 : ms;
     } });
+    expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: resume-thinking-append-missing [owner: fabric-v2]\n" });
+    const outcome = evidenceOf(w, "fabric-v2-bridge-resume-outcome.json");
+    expect(outcome).toMatchObject({ result: "unknown", gap: "resume-thinking-append-missing", elapsedMs: phaseCap,
+      measured: { observations: 3, finalSeal: { sealHasThinkingEntry: false }, journal: { appendedSinceSeal: [], suffixBytes: 0 } } });
+    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(3);
+    expect(t).toBe(phaseCap);
+  });
+
+  it("Pi's first append after 150 s (>120 s, <600 s) passes, with the new leaf", async () => {
+    const w = await world({ sealed: SEALED_BARE });
+    setKube(w, RAW, { line: identityLine(w) });
+    let t = 0;
+    const result = await run(w, "resume", resumeInputs, { now: () => t, sleep: async () => {
+      t += 30_000; // A delayed scheduler wake, still inside the original phase clock.
+      if (t === 150_000) { fs.appendFileSync(w.journalFile, THINKING); setKube(w, RAW, { line: identityLine(w) }); }
+    } });
+    expect(result).toMatchObject({ code: 0, stderr: "" });
     expect(result.receipt).toMatchObject({ result: "pass", observed: { leafId: "e3",
       appendedSinceSeal: [{ id: "e3", parentId: "e2", type: "thinking_level_change", thinkingLevel: "high" }] } });
-    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json").measured.observations).toBe(4);
-    // A seal WITH a thinking entry is not waited on: one observation, and no append passes.
-    const sealedThinking = await world();
-    setKube(sealedThinking, RAW, { line: identityLine(sealedThinking) });
-    expect((await run(sealedThinking, "resume", resumeInputs)).receipt).toMatchObject({ result: "pass" });
-    expect(evidenceOf(sealedThinking, "fabric-v2-bridge-resume-outcome.json").measured.observations).toBe(1);
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ elapsedMs: 150_000,
+      measured: { observations: 6 } });
+  });
+
+  it("a seal WITH a thinking entry needs one observation and no wait", async () => {
+    const w = await world();
+    setKube(w, RAW, { line: identityLine(w) });
+    expect((await run(w, "resume", resumeInputs, { sleep: async () => { throw new Error("unexpected append wait"); } })).receipt)
+      .toMatchObject({ result: "pass" });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ elapsedMs: 0, measured: { observations: 1 } });
+  });
+
+  it("slow per-read calls share the phase cap: no floored 1 s read starts after it expires", async () => {
+    const w = await world({ sealed: SEALED_BARE });
+    setKube(w, RAW, { line: identityLine(w) });
+    let t = 0;
+    const budgets: number[] = [];
+    const actualReadPod = kube.readPod;
+    const actualKubectl = kube.kubectl;
+    vi.spyOn(kube, "readPod").mockImplementation(async (access, name, timeout) => {
+      const value = await actualReadPod(access, name, timeout);
+      budgets.push(timeout); t += timeout;
+      return value;
+    });
+    vi.spyOn(kube, "kubectl").mockImplementation(async (access, args, timeout) => {
+      const value = await actualKubectl(access, args, timeout);
+      budgets.push(timeout); t += timeout;
+      return value;
+    });
+    expect(await run(w, "resume", resumeInputs, { now: () => t, sleep: async ms => { t += ms; } }))
+      .toMatchObject({ code: 2, stdout: "", stderr: "GAP: phase-deadline [owner: fabric-v2]\n" });
+    expect(budgets).toEqual([30_000, 30_000, 120_000, 30_000, 30_000, 30_000, 120_000, 30_000, 30_000, 30_000, 116_000]);
+    expect(t).toBe(600_000);
   });
 
   /** A thinking_level_change line as Pi writes it (5 keys). */

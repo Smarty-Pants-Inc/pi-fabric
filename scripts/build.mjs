@@ -379,6 +379,23 @@ const seatDrainForeign = [
 ];
 if (seatDrainForeign.length > 0) throw new Error(`The seat drain seam must be self-contained:\n${seatDrainForeign.join("\n")}`);
 
+// The D3 bridge seam is pinned the same way: ONE file. It reads NATS presence as the link does, so the NATS client
+// is inlined too; nothing may stay an external import, or the pin would not cover it.
+const seatBridge = await build({
+  entryPoints: ["src/seat-bridge/entry.ts"],
+  outfile: "dist/seat-bridge/fabric-seat-bridge.cjs",
+  bundle: true,
+  platform: "node",
+  format: "cjs",
+  target: "node24",
+  metafile: true,
+  logLevel: "info",
+});
+const { builtinModules } = await import("node:module");
+const seatBridgeForeign = Object.values(seatBridge.metafile.outputs).flatMap((output) =>
+  output.imports.map((entry) => entry.path).filter((name) => !name.startsWith("node:") && !builtinModules.includes(name)));
+if (seatBridgeForeign.length > 0) throw new Error(`The seat bridge seam must be self-contained:\n${seatBridgeForeign.join("\n")}`);
+
 // tsc does not copy input .d.ts files; ship the generated kernel ABI and receipt.
 mkdirSync("dist/verified/generated", { recursive: true });
 const receiptPath = "src/verified/generated/manifest.json";

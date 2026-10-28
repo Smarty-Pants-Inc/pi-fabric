@@ -10,7 +10,7 @@ import { callMainDrain, mainDrainSocket, MainDrainClientError } from "../main-dr
 import { MAIN_DRAIN_INGRESS } from "../main-drain/control.js";
 import { mainDrainSocketPath, type MainDrainReply } from "../main-drain/protocol.js";
 import { evaluateDrain, scanCompletions, type DrainEvaluation } from "./evaluate.js";
-import { fixedKubectl, kubectl, readPod, verifyKubeconfig, type KubeAccess } from "./kube.js";
+import { fixedKubectl, kubectl, POD_FABRIC_CLI, readPod, verifyKubeconfig, type KubeAccess } from "./kube.js";
 import { interpreterIdentity, parseRequest, proveSeatLock, readOwned, readSealedRun, resolveSeatMeshRoot, SeamGap, sha256,
   socketPeer, verifyRunDir, writeOnce, type SealedRun, type SeamRequest } from "./run.js";
 
@@ -652,14 +652,9 @@ const recheck = (context: Context): number => {
   return 0;
 };
 
-/**
- * The in-image pi-fabric CLI that `kubectl exec` runs inside the raw Pod (fixed argv, ruling 10-25).
- * CONFIRMED 10-25 by the seat image's owner (read-only, on the then-current image family): pi-fabric 0.112.0's CLI is
- * /opt/pi-fabric/dist/cli/index.js (mode 0555), with /usr/local/bin/pi-fabric pointing to it (DRAIN-DESIGN.r2 Q5).
- * The seam still checks `test -x` on it inside the Pod first: cut 2 builds a new base and must re-confirm it.
- * Tests inject SeamDeps.podCli (null: unconfirmed).
- */
-const POD_FABRIC_CLI = { path: "/opt/pi-fabric/dist/cli/index.js", confirmed: true } as const;
+// POD_FABRIC_CLI (kube.ts): /opt/pi-fabric/dist/cli/index.js (mode 0555), with /usr/local/bin/pi-fabric pointing to
+// it (DRAIN-DESIGN.r2 Q5). The seam still checks `test -x` on it inside the Pod first: cut 2 builds a new base and must
+// re-confirm it. Tests inject SeamDeps.podCli (null: unconfirmed).
 const POD_NAME = /^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$/;
 const POD_UID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 

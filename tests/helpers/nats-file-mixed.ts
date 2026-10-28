@@ -380,6 +380,10 @@ export interface MixedHarness {
   readonly startLink: StartMixedLink | undefined;
   startLinkNow(): Promise<MixedLinkHandle>;
   stopLink(): Promise<void>;
+  /** Stop the running link and start it again with `config` (a parsed NatsLinkConfig): a unit restart stand-in. */
+  restartLink(config: unknown): Promise<MixedLinkHandle>;
+  /** Boot one more FILE Main on the hub mesh (e.g. a relaunched v1 seat); `context` overrides its Pi context fields. */
+  addFileMain(label: string, sessionId: string, context?: Record<string, unknown>): Promise<MixedMain>;
   /** Open a product NATS transport for a credential with an arbitrary host id (negative tests). */
   openPeer(machine: typeof BRIDGE_MACHINE | typeof NATS_MAIN_MACHINE, hostId: string, viaRelay?: boolean): Promise<FabricTransport>;
   fileEvents(filter?: { topic?: string; to?: string }): MeshEvent[];
@@ -530,6 +534,22 @@ export async function createMixedHarness(options: MixedHarnessOptions): Promise<
         linkLog.push(`--- harness: link stop ${new Date().toISOString()}`);
         try { await teardownWithin("link stop", () => link.stop(), 15_000); }
         finally { abort?.abort(); }
+      },
+      async restartLink(config) {
+        if (!startLink) throw new Error("A' link entry (src/mesh/bridge-nats-link.ts startNatsLink) is not available");
+        await harness.stopLink();
+        linkAbort = new AbortController();
+        linkLog.push(`--- harness: link restart ${new Date().toISOString()}`);
+        harness.link = await startLink(config, { signal: linkAbort.signal, log: (line) => { linkLog.push(line); } });
+        return harness.link;
+      },
+      async addFileMain(label, sessionId, context = {}) {
+        const dir = path.join(root, `file-${label}`);
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+        const main = makeMain(label, sessionId, dir, fileConfig, undefined, context);
+        await main.start();
+        cleanup.push(() => main.stop());
+        return main;
       },
       async openPeer(machine, hostId, viaRelay = false) {
         const user = machine === BRIDGE_MACHINE ? broker.users.machineA : broker.users.machineB;

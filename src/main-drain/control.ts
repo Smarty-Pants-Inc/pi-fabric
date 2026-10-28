@@ -20,6 +20,8 @@ export interface MainDrainHost {
   agents(): MainDrainAgents | undefined;
   /** The in-memory completion inbox's unconfirmed count (no residency); undefined when there is no inbox. */
   completions?(): number | undefined;
+  /** The owner incarnation this Main's presence records carry (ParticipantDirectory.ownerIncarnation). */
+  ownerIncarnation?(): string | undefined;
   /** Tests only: the Main's own environment and /proc, and the per-actor stop bound. */
   environment?: NodeJS.ProcessEnv;
   procRoot?: string;
@@ -326,6 +328,25 @@ export class MainDrainControl {
     } catch { return undefined; }
   }
 
+  /** Read-only: the live session's file and leaf (Pi's ReadonlySessionManager) and the presence owner incarnation. */
+  #session(): MainDrainReply["session"] {
+    let file: string | null = null;
+    let leafId: string | null = null;
+    let ownerIncarnation: string | null = null;
+    try {
+      const manager = this.host.context()?.sessionManager;
+      const sessionFile = manager?.getSessionFile();
+      file = typeof sessionFile === "string" && sessionFile ? sessionFile : null;
+      const leaf = manager?.getLeafId();
+      leafId = typeof leaf === "string" && leaf ? leaf : null;
+    } catch { file = null; leafId = null; }
+    try {
+      const incarnation = this.host.ownerIncarnation?.();
+      ownerIncarnation = typeof incarnation === "string" && incarnation ? incarnation : null;
+    } catch { ownerIncarnation = null; }
+    return { file, leafId, ownerIncarnation };
+  }
+
   #reply(op: MainDrainOp, undo: MainDrainReply["undo"]): MainDrainReply {
     const { rootId, sessionId, meshRoot } = this.host;
     const gate = mainInboxDrainGate(rootId);
@@ -339,7 +360,7 @@ export class MainDrainControl {
     let completions: number | null;
     try { completions = this.host.completions ? this.host.completions() ?? 0 : null; } catch { completions = null; }
     return {
-      v: 1, ok: true, op, error: null, sessionId, rootId, meshRoot, pid: process.pid,
+      v: 1, ok: true, op, error: null, sessionId, rootId, meshRoot, pid: process.pid, session: this.#session(),
       binding: binding ? { kind: binding.kind, run: binding.run, operationId: binding.operationId, generation: binding.generation,
         phase: binding.phase, podUid: binding.podUid, boundAt: binding.boundAt, lock: binding.lock } : null,
       inbox: { closed: gate !== undefined, closedAt: gate?.closedAt ?? null, held: fabric?.held ?? null, handed: fabric?.handed ?? null,

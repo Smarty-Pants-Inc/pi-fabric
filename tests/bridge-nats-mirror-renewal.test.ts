@@ -1,5 +1,5 @@
 // expected-skip: no NATS_BIN/PATH executable: an authenticated loopback broker is required.
-// Keep reason: source-lease trust boundary and smarty-dev#16876's omission/re-import regression.
+// Keep reason: aged lease evidence was treated as complete omission, deleting a live root before fresh evidence could restore it.
 // Real KV watches, file custody/leases, directory routing and NATS delivery; deterministic barriers
 // hold outbound work or the receiver before custody without granting any source authority.
 import { createHash } from "node:crypto";

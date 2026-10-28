@@ -84,7 +84,7 @@ import { FabricActorQueuedWorkError } from "../actors/types.js";
 import type { AgentRunRecord } from "../agents/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager, rootRecordLastSeenMs } from "../agents/manager.js";
-import { retainCleanupRoot } from "../agents/worktree-manager.js";
+import { retainCleanupRoot, type CleanupRootCustody } from "../agents/worktree-manager.js";
 import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 import { FabricTargetTerminalError, terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
 import { launchScope } from "../scope.js";
@@ -313,6 +313,9 @@ export class ResidentHost {
   readonly #processingPath: string;
   readonly #responsesPath: string;
   readonly #agentsPath: string;
+  // Only helper-returned custody (including a committed move's receipt error)
+  // ends canonical ownership. Never capture a late replacement on retry.
+  readonly #cleanupResidentCustody = new Map<string, Map<string, CleanupRootCustody | undefined>>();
   readonly #removalsPath: string;
   readonly #deliveryOutboxPath: string;
   readonly #deliveryRetry = new MeshBackgroundRetry("resident completion/actor delivery")
@@ -2715,6 +2718,24 @@ export class ResidentHost {
     } catch { return undefined; } // Attribution never supplies launch authority or a new launch veto.
   }
 
+  #retainAgentCleanupTraces(id: string): void {
+    let custody = this.#cleanupResidentCustody.get(id);
+    if (!custody) { custody = new Map(); this.#cleanupResidentCustody.set(id, custody); }
+    const archive = `${this.config.residencyRoot}.trace-archive`;
+    for (const [source, reason] of [
+      // Keep the live client's routing metadata until saved-result custody succeeds.
+      [residentResultPath(this.config.residencyRoot, id), "resident cleanup saved result"],
+      [path.join(this.#agentsPath, `${id}.json`), "resident cleanup agent metadata"],
+    ] as const) {
+      if (custody.has(source)) continue;
+      try { custody.set(source, retainCleanupRoot(source, archive, id, reason)); }
+      catch (error) {
+        if (error instanceof Error && "retainedRoot" in error) custody.set(source, error.retainedRoot as CleanupRootCustody);
+        throw error;
+      }
+    }
+  }
+
   async #executeRequest(command: ResidentCommand, boundaryAdmitted?: () => void): Promise<ResidentCommandResponse> {
     const requestId = command.requestId;
     let response: ResidentCommandResponse;
@@ -2799,10 +2820,11 @@ export class ResidentHost {
         // must preserve the background completion notification as well as files.
         await this.agents.join(command.id);
         commit(command.id);
-        await this.agents.cleanup(command.id, command.deleteBranch);
-        const archive = `${this.config.residencyRoot}.trace-archive`;
-        retainCleanupRoot(path.join(this.#agentsPath, `${command.id}.json`), archive, command.id, "resident cleanup agent metadata");
-        retainCleanupRoot(residentResultPath(this.config.residencyRoot, command.id), archive, command.id, "resident cleanup saved result");
+        // The manager's queued/managed exit and result-authentication gates run
+        // FIRST. Only then may resident trace custody prepare final consumption.
+        // A failure keeps the manager's run, signal and original-held result map.
+        await this.agents.cleanup(command.id, command.deleteBranch, () => this.#retainAgentCleanupTraces(command.id));
+        this.#cleanupResidentCustody.delete(command.id);
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,

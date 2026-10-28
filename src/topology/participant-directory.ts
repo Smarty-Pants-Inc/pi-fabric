@@ -2112,11 +2112,23 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return hosts;
   }
 
-  #leasesForHosts(entries: readonly MeshStateEntry[]): Map<string, FabricHostLease> {
-    return readHostLeasesForIds(this.mesh.root, entries.flatMap(entry => {
+  #leasesForHosts(entries: readonly MeshStateEntry[], sessions: readonly MeshStateEntry[] = []): Map<string, FabricHostLease> {
+    const ids = entries.flatMap(entry => {
       const host = hostFromEntry(entry);
       return host ? [host.id] : [];
-    }));
+    });
+    // A legacy session may name a lease-only host with no topology/hosts row. Track
+    // the exact ID sessionLiveness reads too, or a file-only renewal could revive a
+    // colliding root without invalidating the collision pass. These are dependencies,
+    // not a complete lease authority map (root/identity alias discovery stays complete
+    // at the bridge's synchronous handoff/collision/incarnation boundaries).
+    for (const entry of sessions) {
+      const value = entry.value;
+      if (isObject(value) && value.livenessLeaseFiles === 1 && typeof value.id === "string" &&
+        typeof value.sessionId === "string" && entry.key === `${LEGACY_SESSION_PREFIX}${value.sessionId}` &&
+        entry.updatedBy.id === value.id) ids.push(typeof value.livenessHostId === "string" ? value.livenessHostId : value.id);
+    }
+    return readHostLeasesForIds(this.mesh.root, ids);
   }
 
   #mirrorStatus(owner: FabricHostRecord & { mirror?: FabricMirrorLease; bridgeStale?: true }, now: number) {
@@ -4079,15 +4091,19 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const read = { fresh: false };
     const token = this.mesh.stateToken(read);
     const files = this.#participantFiles(read, this.options.listReadCacheMs);
-    const leases = this.#leasesForHosts(this.mesh.listAllShared(HOST_PREFIX, { snapshot: token }));
+    const last = this.#rootCollisionPass;
+    // The saved selections belong to this exact snapshot. Do not select the fleet
+    // just to recover known lease IDs on an unchanged heartbeat. A moved snapshot
+    // MUST select again before reading leases, including newly referenced hosts.
+    const entries = last?.token === token ? last.entries : this.#peerEntries(token, ROOT_COLLISION_PREFIXES);
+    const leases = this.#leasesForHosts(entries[0]!, entries[2]!);
     const local = JSON.stringify([root.id, root.name, root.sessionId, ...[...this.#localRecords.values()].map(record =>
       [record.id, record.kind, record.rootId, record.name, record.sessionId, record.status, record.reloadUntil, record.remoteHost])]);
-    const last = this.#rootCollisionPass;
     if (last && last.files === files && last.local === local &&
       samePeerLeases(last.leases, leases, this.options.hostId) && now >= last.at &&
       checkedAt >= last.checkedAt && checkedAt - last.checkedAt < this.#leaseMs &&
-      this.#samePeerState(last, token, ROOT_COLLISION_PREFIXES)) return undefined;
-    return { token, entries: this.#peerEntries(token, ROOT_COLLISION_PREFIXES), files, leases, local, at: now, checkedAt };
+      this.#samePeerState(last, token, entries)) return undefined;
+    return { token, entries, files, leases, local, at: now, checkedAt };
   }
 
   /**
@@ -4110,18 +4126,18 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const token = snapshot ?? this.mesh.stateToken();
     const read = { snapshot: token };
     const files = this.#participantFiles(read);
-    const leases = this.#leasesForHosts(this.mesh.listAllShared(HOST_PREFIX, read));
-    const checkedAt = Date.now();
     const memo = this.#legacyRenewals;
+    const entries = memo?.token === token ? memo.entries : this.#peerEntries(token, LEGACY_RENEWAL_PREFIXES);
+    const leases = this.#leasesForHosts(entries[0]!, entries[1]!);
+    const checkedAt = Date.now();
     if (memo && memo.files === files && samePeerLeases(memo.leases, leases, this.options.hostId) &&
       checkedAt >= memo.checkedAt && checkedAt - memo.checkedAt < this.#leaseMs &&
       (memo.required ? now <= memo.until : now >= memo.at) &&
-      this.#samePeerState(memo, token, LEGACY_RENEWAL_PREFIXES)) return memo.required;
+      this.#samePeerState(memo, token, entries)) return memo.required;
     // Read-only: hostFromEntry/participantFromEntry/isLiveLegacyRootEntry only inspect the entries, and
     // #liveHosts and mergeParticipantEntries build new containers, so the shared entries need no copy.
     const result = this.#legacyRenewalsScan(now, leases, (prefix) => this.mesh.listAllShared(prefix, read), files);
-    this.#legacyRenewals = { token, entries: this.#peerEntries(token, LEGACY_RENEWAL_PREFIXES), files, leases,
-      at: now, checkedAt, ...result };
+    this.#legacyRenewals = { token, entries, files, leases, at: now, checkedAt, ...result };
     return result.required;
   }
 
@@ -4137,9 +4153,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
    * entries by identity. Unchanged, the signals move to the newer token, so the next call is the fast
    * path again and the older snapshot is released.
    */
-  #samePeerState(signals: PeerSignals, token: object, prefixes: readonly string[]): boolean {
+  #samePeerState(signals: PeerSignals, token: object, entries: PeerSignals["entries"]): boolean {
     if (signals.token === token) return true;
-    const entries = this.#peerEntries(token, prefixes);
     if (!sameEntrySelections(signals.entries, entries)) return false;
     signals.token = token;
     signals.entries = entries;

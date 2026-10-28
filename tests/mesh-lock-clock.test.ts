@@ -17,13 +17,15 @@ afterEach(() => {
 // pi-fabric#1249: wall-clock lease time can move independently of a relative acquisition budget.
 // Exercise actual acquisition, notification/poll waits and cleanup, not mocked admission decisions.
 describe.each([1, 2, 3] as const)("protocol %s: relative lock wait clock", protocol => {
-  const fixture = async (queued: boolean) => {
+  const fixture = async (queued: boolean, retryRandom = 0.5) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "mesh-lock-clock-"));
     roots.push(root);
     // Prepare native identity before installing a deterministic timer clock.
     const lock = new MeshLock(root, { lockProtocol: protocol }, () => undefined);
     await lock.ownIncarnation;
     vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
+    // A positive plain retry stays pending through the fixture's zero-time preparation turn.
+    vi.spyOn(Math, "random").mockReturnValue(retryRandom);
     const canonical = path.join(root, ".lock");
     fs.mkdirSync(canonical);
     fs.writeFileSync(path.join(canonical, "owner"), `live-holder\n${process.pid}\n${Date.now()}\n`);
@@ -35,6 +37,7 @@ describe.each([1, 2, 3] as const)("protocol %s: relative lock wait clock", proto
     }) as unknown as typeof fs.watch);
     if (!queued) vi.spyOn(MeshLockTicket.prototype, "queued", "get").mockReturnValue(false);
     const operation = vi.fn(() => "acquired within budget");
+    const failedProbes = vi.spyOn(lock, "clearStaleLock"); // Observe real failed acquisitions; do not mock recovery.
     const pending = lock.withLock(operation, 2_000).catch((error: unknown) => error);
     await vi.advanceTimersByTimeAsync(0);
     expect(operation).not.toHaveBeenCalled();
@@ -48,7 +51,7 @@ describe.each([1, 2, 3] as const)("protocol %s: relative lock wait clock", proto
       expect(vi.getTimerCount()).toBe(0);
       if (queued) expect(watcher.close).toHaveBeenCalled();
     };
-    return { operation, pending, release, clean };
+    return { operation, pending, release, clean, failedProbes };
   };
 
   it.each([true, false])("wall-clock jump during asynchronous wait does not spend the budget (queued=%s)", async queued => {
@@ -74,6 +77,25 @@ describe.each([1, 2, 3] as const)("protocol %s: relative lock wait clock", proto
     expect(result).toBeInstanceOf(MeshLockTimeoutError);
     expect(result).not.toBeInstanceOf(MeshLockQueueExpiredError);
     expect(result).toMatchObject({ attempts: 1 });
+    expect(operation).not.toHaveBeenCalled();
+    clean();
+  });
+
+  it("a zero-jitter plain retry may probe twice before the stall, but never enters after timer expiry", async () => {
+    const { operation, pending, release, clean, failedProbes } = await fixture(false, 0.01);
+    // Full jitter permits floor(0.01 * 20) = 0 ms: fixture preparation already resumed this retry.
+    expect(performance.now()).toBe(0);
+    expect(failedProbes).toHaveBeenCalledTimes(2);
+    const wall = Date.now();
+    vi.advanceTimersByTime(2_001); // Fire the authoritative budget timer without resuming the retry continuation.
+    vi.setSystemTime(wall - 60_000);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    const result = await pending;
+    expect(result).toBeInstanceOf(MeshLockTimeoutError);
+    expect(result).not.toBeInstanceOf(MeshLockQueueExpiredError);
+    expect(result).toMatchObject({ attempts: 2 });
+    expect(failedProbes).toHaveBeenCalledTimes(2); // Neither an extra late probe nor operation entry is allowed.
     expect(operation).not.toHaveBeenCalled();
     clean();
   });

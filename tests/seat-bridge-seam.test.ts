@@ -250,6 +250,80 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
     expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ elapsedMs: 0, measured: { observations: 1 } });
   });
 
+  // F1: a readable but mismatched identity is a refusal, not a candidate for the missing-append wait. The Main's
+  // reported file is a real, byte-identical copy here: content equality cannot substitute for rendered --session.
+  it.each([
+    { name: "missing rendered --session", args: [], sessionFile: POD_JOURNAL, leafId: "e2", reason: "pod-session-arg-unknown" },
+    { name: "changed rendered --session", args: ["--session", "/var/lib/fabric/sessions/changed.jsonl"],
+      sessionFile: POD_JOURNAL, leafId: "e2", reason: "journal-mismatch" },
+    { name: "Main on another byte-identical file", args: ["--session", POD_JOURNAL],
+      sessionFile: "/var/lib/fabric/sessions/other.jsonl", leafId: "e2", reason: "journal-mismatch" },
+    { name: "Main memory leaf differs from its file", args: ["--session", POD_JOURNAL],
+      sessionFile: POD_JOURNAL, leafId: "e1", reason: "leaf-memory-file-mismatch" },
+  ])("F1: $name refuses immediately with a no-thinking seal", async ({ args, sessionFile, leafId, reason }) => {
+    const w = await world({ sealed: SEALED_BARE });
+    const mainFile = path.join(w.seat.base, "main-journal-copy.jsonl");
+    fs.copyFileSync(w.journalFile, mainFile);
+    const journal = journalBranch(mainFile, "e2", Buffer.byteLength(SEALED_BARE));
+    expect(journal).toMatchObject({ journalSha256: sha(SEALED_BARE), journalBytes: Buffer.byteLength(SEALED_BARE),
+      leafId: "e2", appendedSinceSeal: [], suffixBytes: 0 });
+    setKube(w, RAW, { line: identityLine(w, { sessionFile, leafId, journal }) }, { args });
+    let t = 0;
+    const sleep = vi.fn(async (ms: number) => { t += ms; throw new Error("F1: unexpected append wait for mismatched identity"); });
+    const result = await run(w, "resume", resumeInputs, { now: () => t, sleep });
+    expect(result).toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason, elapsedMs: 0,
+      measured: { observations: 1 } });
+    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(1);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(t).toBe(0);
+  });
+
+  it.each([
+    { name: "Main file changes", sessionFile: "/var/lib/fabric/sessions/other.jsonl", leafId: "e2", reason: "journal-mismatch" },
+    { name: "Main memory leaf changes", sessionFile: POD_JOURNAL, leafId: "e1", reason: "leaf-memory-file-mismatch" },
+  ])("F1: $name after a coherent observation stops polling at the next observation", async ({ sessionFile, leafId, reason }) => {
+    const w = await world({ sealed: SEALED_BARE });
+    setKube(w, RAW, { line: identityLine(w) });
+    let t = 0;
+    const sleep = vi.fn(async (ms: number) => {
+      t += ms;
+      if (t !== 2_000) throw new Error("F1: unexpected second wait after identity mismatch");
+      // The journal stays byte-for-byte sealed; only the live Main's identity changes on the next read.
+      setKube(w, RAW, { line: identityLine(w, { sessionFile, leafId }) });
+    });
+    const result = await run(w, "resume", resumeInputs, { now: () => t, sleep });
+    expect(result).toMatchObject({ code: 0, stderr: "", receipt: { result: "refused" } });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "refused", reason, elapsedMs: 2_000,
+      measured: { observations: 2, journal: { journalSha256: sha(SEALED_BARE), journalBytes: Buffer.byteLength(SEALED_BARE),
+        leafId: "e2", appendedSinceSeal: [], suffixBytes: 0 } } });
+    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(2);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(sleep).toHaveBeenCalledWith(2_000);
+    expect(t).toBe(2_000);
+  });
+
+  it.each([
+    { field: "journalBytes", value: Buffer.byteLength(SEALED_BARE) + 1, gap: "journal-suffix-inconsistent" },
+    { field: "journalSha256", value: sha("not the sealed journal"), gap: "journal-suffix-inconsistent" },
+    { field: "leafId", value: "e1", gap: "journal-suffix-not-the-branch" },
+    { field: "truncated", value: true, gap: "journal-suffix-not-the-branch" },
+    { field: "suffixBase64", value: "Cg==", gap: "journal-suffix-inconsistent" },
+  ])("F1: an unchanged-journal claim with incoherent $field is an immediate GAP", async ({ field, value, gap }) => {
+    const w = await world({ sealed: SEALED_BARE });
+    const journal = { ...journalBranch(w.journalFile, "e2", Buffer.byteLength(SEALED_BARE)), [field]: value };
+    setKube(w, RAW, { line: identityLine(w, { journal }) });
+    let t = 0;
+    const sleep = vi.fn(async (ms: number) => { t += ms; throw new Error("F1: unexpected append wait for incoherent journal"); });
+    expect(await run(w, "resume", resumeInputs, { now: () => t, sleep })).toMatchObject({ code: 2, stdout: "",
+      stderr: `GAP: ${gap} [owner: fabric-v2]\n` });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "unknown", gap, elapsedMs: 0,
+      measured: { observations: 1 } });
+    expect(w.calls().filter(call => call.argv.includes("--identity"))).toHaveLength(1);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(t).toBe(0);
+  });
+
   it("slow per-read calls share the phase cap: no floored 1 s read starts after it expires", async () => {
     const w = await world({ sealed: SEALED_BARE });
     setKube(w, RAW, { line: identityLine(w) });

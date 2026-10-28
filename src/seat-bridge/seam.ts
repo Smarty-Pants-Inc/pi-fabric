@@ -326,9 +326,16 @@ const resume = async (context: Context): Promise<number> => {
   let read = await podIdentity(context, access, pin, seal);
   let observations = 1;
   // Only the one state that Pi's startup append ends is re-observed: the exact sealed bytes, nothing after them.
-  const awaitingAppend = (): boolean => !seal.sealHasThinkingEntry && read.reason === null && read.journal !== null &&
-    read.journal.sealedSha256 === seal.journalSha256 && read.journal.sealOnBranch && read.journal.suffixBytes === 0 &&
-    (read.journal.appendedSinceSeal ?? []).length === 0;
+  const awaitingAppend = (): boolean => {
+    const rendered = sessionArg(read.before);
+    const journal = read.journal;
+    return !seal.sealHasThinkingEntry && read.reason === null && rendered !== null &&
+      read.identity !== null && read.identity.sessionFile === rendered && journal !== null &&
+      read.identity.leafId === journal.leafId && journal.leafId === seal.leafId &&
+      journal.journalBytes === seal.journalBytes && journal.journalSha256 === seal.journalSha256 &&
+      journal.sealedSha256 === seal.journalSha256 && journal.sealOnBranch && !journal.truncated &&
+      journal.suffixBytes === 0 && journal.suffixBase64 === "" && journal.appendedSinceSeal?.length === 0;
+  };
   const wait = clock(context, APPEND_WAIT_MS);
   while (awaitingAppend() && wait.now() < wait.deadline) {
     await wait.sleep(Math.min(APPEND_POLL_MS, wait.deadline - wait.now()));
@@ -361,7 +368,8 @@ const resume = async (context: Context): Promise<number> => {
     // The seam's own measure of the suffix: its bytes are the size the CLI reports, and its entries ARE the appended
     // branch entries, in order, the first one's parent the sealed leaf (so the CLI's branch read is checked here).
     const suffix = Buffer.from(journal.suffixBase64!, "base64");
-    if (suffix.length !== journal.suffixBytes || journal.journalBytes !== seal.journalBytes + suffix.length) gap("journal-suffix-inconsistent");
+    if (suffix.length !== journal.suffixBytes || journal.journalBytes !== seal.journalBytes + suffix.length ||
+      (suffix.length === 0 && journal.journalSha256 !== seal.journalSha256)) gap("journal-suffix-inconsistent");
     try {
       appended = suffix.toString("utf8").split("\n").filter(line => line.trim()).map(line => entryFacts(line)!)
         .filter((entry): entry is AppendedEntry => entry !== null);
@@ -378,15 +386,16 @@ const resume = async (context: Context): Promise<number> => {
     }
     // With new ids, a chain from the sealed leaf through the tail in order has no cycle and ends at the reported leaf.
     const chained = appended.every((entry, index) => entry.parentId === (index === 0 ? seal.leafId : appended[index - 1]!.id));
-    if (!chained || !sameEntries(appended, journal.appendedSinceSeal ?? []) ||
+    if (journal.truncated || !chained || !sameEntries(appended, journal.appendedSinceSeal ?? []) ||
       journal.leafId !== (appended.at(-1)?.id ?? seal.leafId)) gap("journal-suffix-not-the-branch");
-    // A seal without a thinking entry and still no append after the bounded wait: Pi has not resumed this session.
-    if (!seal.sealHasThinkingEntry && appended.length === 0) gap("resume-thinking-append-missing");
   }
   if (!reason && !rendered) reason = "pod-session-arg-unknown";
   if (!reason && read.identity!.sessionFile !== rendered) reason = "journal-mismatch";
   // Rule T-FIX3: the TRUE current leaf, read from the session file; the Main's own leaf must agree with it.
   if (!reason && read.identity!.leafId !== journal!.leafId) reason = "leaf-memory-file-mismatch";
+  // Only a coherent identity and unchanged journal can mean the startup append is still missing. Do not mask a
+  // readable Main's session/leaf mismatch with this GAP, even when its journal is a byte-identical sealed copy.
+  if (!reason && !seal.sealHasThinkingEntry && appended.length === 0) gap("resume-thinking-append-missing");
   const observed = { sessionId, journal: read.identity?.sessionFile ?? "", leafId: journal?.leafId ?? "", podUid: pin.uid,
     appendedSinceSeal: appended, journalSha256: journal?.journalSha256 ?? "", suffixBase64: journal?.suffixBase64 ?? "" };
   const passed = reason === null;

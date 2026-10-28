@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { requireActorRunner } from "../agents/runner-registry.js";
 import type { ResidentDrainIntent } from "./drain.js";
 import { ResidentRequestExpiredError } from "./request-expiry.js";
 import { FabricModelDeniedError } from "../core/model-policy.js";
@@ -141,6 +142,9 @@ export class ResidentActorClient {
 
   async createActor(request: FabricActorCreateRequest, signal?: AbortSignal, caller?: ResidentActorCaller, onDispatched?: () => void, routerCaller?: ResidentRouterCaller): Promise<FabricActorInfo> {
     const { idempotencyKey, ...creationRequest } = request;
+    // Providers pin the runner before forwarding. Legacy unpinned callers use
+    // the resident's configured default, which it validates at creation.
+    const runnerModule = request.runner === undefined ? undefined : requireActorRunner(request.runner, "durable").residentModule;
     const response = await this.#send({
       format: RESIDENT_HOST_FORMAT,
       operation: "createActor",
@@ -148,6 +152,7 @@ export class ResidentActorClient {
       requestId: randomUUID(),
       rootId: this.#rootId,
       request: creationRequest,
+      ...(runnerModule ? { runnerModule } : {}),
       ...(caller ? { caller } : {}),
       ...(routerCaller ? { routerCaller: { ...routerCaller } } : {}),
       createdAt: Date.now(),

@@ -544,6 +544,8 @@ interface ResidentCreateActorCommand {
   requestId: string;
   rootId: string;
   request: FabricActorCreateRequest;
+  /** Host-captured registration module; never part of the public actor definition. */
+  runnerModule?: string;
   /** Optional verified owning Main; old/non-Main creators mint no interrupt delegation. */
   caller?: ResidentActorCaller;
   /** Attribution only: never grants creation, mutation or supervisor authority. */

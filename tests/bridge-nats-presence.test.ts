@@ -216,9 +216,8 @@ describe("NATS presence -> file mirror snapshot", () => {
     expect(await side.presence()).toMatchObject({ hosts: [], participants: [], partial: true });
   });
 
-  // Keep: smarty-dev#16876 / CAUSE3 reproduced an aged lease becoming complete omission and
-  // deleting a live root's canonical file records. Exercise the real admission/mirror boundary.
-  it("replays CAUSE3 without withdrawing or renewing an aged mirror, including an aged rootRecheck", async () => {
+  // Keep: an aged lease receipt must not appear as a complete omission that deletes a live root's records.
+  it("replays an aged-lease omission without withdrawing or renewing an aged mirror, including a root awaiting re-check", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-omit-"));
     const mesh = new MeshStore(path.join(dir, "mesh"), 65_536, 1_000, { stateBackend: "file" });
     const clock = { wall: Date.now(), mono: 50_000 };

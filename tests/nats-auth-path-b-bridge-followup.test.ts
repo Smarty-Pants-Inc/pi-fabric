@@ -139,7 +139,7 @@ const expectMissing = (h: MixedHarness, probe: ReturnType<typeof omissionProbe>,
   expect(probe.local.holds(h.natsMain.id)).toBe(false);
 };
 
-// OMIT-VERIFY-002 / CAUSE3: unlike the renewal-only fixture, both ends here are real root
+// Aged-lease omission regression: unlike the renewal-only fixture, both ends here are real root
 // runtimes, with the production link's notification drains, identity gates and durable ledger.
 describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' real followUp/ACK across the omission gap and outbound presence stall", () => {
   it("retains expired membership, refuses stale traffic, then reinstalls and delivers once each way before the SAME outbound mirror returns", async () => {
@@ -268,7 +268,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' real fol
         appended: crossingToken ? h.fileEvents({ topic: CONTROL, to: h.fileMain.id }).filter(event => dataOf(event).message === crossingToken) : [],
         syncJoins: probe.syncJoins };
       probe.assertStalled();
-      throw new Error(`${String(error)}\nOMIT-VERIFY-002 pre-teardown evidence: ${JSON.stringify(diagnostic)}\n${linkTail(h, 100)}`, { cause: error });
+      throw new Error(`${String(error)}\nstalled-membership failure pre-teardown evidence: ${JSON.stringify(diagnostic)}\n${linkTail(h, 100)}`, { cause: error });
     }
     finally {
       // Release only for teardown, after the last delivery/ACK assertion (or a recorded failure).

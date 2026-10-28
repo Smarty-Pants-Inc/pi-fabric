@@ -1,4 +1,4 @@
-// Keep reason: OMIT-VERIFY-002 / CAUSE3 recorded real catch and membership trust boundary.
+// Keep reason: stalled forwarding must not remain blocked after live membership is restored.
 // Production notification run + real stores/installers; only mirror completion is gated.
 // No scratch/session deletion: retain fixture evidence, close only owned subscriptions/stores.
 import { createHash } from "node:crypto";

@@ -65,12 +65,78 @@ const recordQueuedRollback = (directory: string): void => {
     remove(target, options);
   });
 };
+const custodyMoves = vi.hoisted(() => [] as Array<{ source: string; destination: string; receipt: string }>);
+vi.mock("../src/agents/worktree-manager.js", async original => {
+  const actual = await original<typeof import("../src/agents/worktree-manager.js")>();
+  return { ...actual, retainCleanupRoot: (...args: Parameters<typeof actual.retainCleanupRoot>) => {
+    const move = actual.retainCleanupRoot(...args);
+    if (move) custodyMoves.push(move);
+    return move;
+  } };
+});
+const heldRoot = (source: string): string => {
+  const move = custodyMoves.find(move => move.source === source)!;
+  expect(move).toBeDefined();
+  const row = { container: path.dirname(move.receipt), ...JSON.parse(fs.readFileSync(move.receipt, "utf8")) };
+  expect(row).toMatchObject({ source, destination: expect.any(String), id: path.basename(source), reason: expect.any(String), time: expect.any(Number) });
+  expect(JSON.parse(fs.readFileSync(path.join(row.container, "custody.prepared.json"), "utf8"))).toMatchObject({ source, destination: row.destination, id: row.id, state: "prepared" });
+  if (process.platform !== "win32") expect(fs.statSync(row.container).mode & 0o777).toBe(0o700);
+  expect(fs.existsSync(source)).toBe(false);
+  return row.destination;
+};
 const hash = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
-const rawStatus = (promptPath: string): string => fs.readFileSync(path.join(path.dirname(promptPath), "status.json"), "utf8");
+const retainedPath = (file: string): string => {
+  const move = custodyMoves.find(move => move.source === path.dirname(file));
+  return move ? path.join(move.destination, path.basename(file)) : file;
+};
+const rawStatus = (promptPath: string): string => fs.readFileSync(retainedPath(path.join(path.dirname(promptPath), "status.json")), "utf8");
 const savedStatus = (promptPath: string): AgentRunRecord => JSON.parse(rawStatus(promptPath)) as AgentRunRecord;
-const expectNoRetainedTasks = (record: AgentRunRecord): void => {
-  expect(Object.hasOwn(record, "task")).toBe(false);
-  for (const nested of record.nestedAgents ?? []) expectNoRetainedTasks(nested);
+const expectWholeRun = (source: string, files: Map<string, Buffer>, inode: number): string => {
+  const held = heldRoot(source);
+  expect(fs.statSync(held).ino).toBe(inode);
+  for (const [name, bytes] of files) expect(fs.readFileSync(path.join(held, name)), name).toEqual(bytes);
+  return held;
+};
+const seedRawTrace = (directory: string): Map<string, Buffer> => {
+  const files = new Map<string, Buffer>();
+  for (const [name, bytes] of [
+    ["session.NdJsOn.backup", Buffer.from('session raw π\n{"torn":')],
+    ["logs/stderr.log", Buffer.from("stderr raw\u0000tail")],
+    ["tmp/opaque.bin", Buffer.from([0, 255, 13, 10])],
+  ] as const) {
+    fs.mkdirSync(path.dirname(path.join(directory, name)), { recursive: true });
+    fs.writeFileSync(path.join(directory, name), bytes);
+    files.set(name, bytes);
+  }
+  for (const name of ["task.txt", "status.json", "manager-result.json", "events.jsonl"]) {
+    if (fs.existsSync(path.join(directory, name))) files.set(name, fs.readFileSync(path.join(directory, name)));
+  }
+  return files;
+};
+
+/** Opt-in owned-fixture COPY before any command/global teardown, never inode custody. */
+const exportOwnedFixtures = (): void => {
+  const evidence = process.env.PI_TEST_EVIDENCE_DIR;
+  if (!evidence) return;
+  fs.mkdirSync(evidence, { recursive: true });
+  for (const source of roots) {
+    let bytes = 0;
+    const inventory = (base: string): Array<{ path: string; sha256?: string }> => {
+      const rows: Array<{ path: string; sha256?: string }> = [];
+      const walk = (relative: string): void => {
+        const file = path.join(base, relative), stat = fs.lstatSync(file);
+        if (rows.length >= 5_000 || stat.isSymbolicLink() || (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1))) throw new Error(`Unsafe prompt fixture export: ${file}`);
+        if (stat.isDirectory()) { rows.push({ path: relative }); for (const name of fs.readdirSync(file).sort()) walk(path.join(relative, name)); }
+        else { if ((bytes += stat.size) > 96 * 1024 * 1024) throw new Error("Prompt fixture export bound exceeded"); rows.push({ path: relative, sha256: hash(fs.readFileSync(file)) }); }
+      };
+      walk(""); return rows;
+    };
+    const before = inventory(source), destination = fs.mkdtempSync(path.join(evidence, "prompt-"));
+    fs.cpSync(source, path.join(destination, "tree"), { recursive: true, dereference: false });
+    expect(inventory(source)).toEqual(before);
+    expect(inventory(path.join(destination, "tree"))).toEqual(before);
+    fs.writeFileSync(path.join(destination, "export.json"), JSON.stringify({ source, destination: path.join(destination, "tree"), method: "pre-teardown copy; SHA256 independent readback; no inode claim", entries: before }));
+  }
 };
 
 afterEach(async () => {
@@ -82,7 +148,9 @@ afterEach(async () => {
   }));
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  exportOwnedFixtures();
+  // Raw originals still remain owned by the command's inherited test-temp owner.
+  roots.splice(0);
   removalIntents.splice(0);
   sweepIntents.splice(0);
   queuedRollbackIntents.splice(0);
@@ -90,7 +158,7 @@ afterEach(async () => {
 });
 
 describe("Agent prompt retention at manager close (#11663)", () => {
-  it("retains failed prompt metadata and plans removal only for the successful tree", async () => {
+  it("archives whole failed and successful trees without rewriting prompt or outcome bytes", async () => {
     const { root, manager } = fixture();
     const prompt = "FAIL_DIRECTIVE\nprivate brief with exact bytes: π\n";
     const failed = await manager.spawn({ name: "failed control", task: prompt, transport: "process" });
@@ -111,9 +179,12 @@ describe("Agent prompt retention at manager close (#11663)", () => {
       expect(fs.statSync(failedDirectory).mode & 0o777).toBe(0o700);
     }
 
+    const files = seedRawTrace(failedDirectory), inode = fs.statSync(failedDirectory).ino;
     removalIntents.splice(0);
     await manager.close();
-    expect(removalIntents).toContain(successDirectory);
+    expectWholeRun(failedDirectory, files, inode);
+    expect(fs.readFileSync(path.join(heldRoot(successDirectory), "task.txt"), "utf8")).toBe("successful task");
+    expect(removalIntents).not.toContain(successDirectory);
     expect(removalIntents).not.toContain(failedDirectory);
     expect(removalIntents).not.toContain(path.join(failedDirectory, "status.json"));
     expect(removalIntents).not.toContain(taskPath);
@@ -121,16 +192,14 @@ describe("Agent prompt retention at manager close (#11663)", () => {
       status: "failed", promptSha256: hash(prompt), promptBytes: Buffer.byteLength(prompt), promptPath: taskPath,
       inputSha256: hash(prompt), inputBytes: Buffer.byteLength(prompt),
     });
-    expectNoRetainedTasks(savedStatus(taskPath));
-    expect(rawStatus(taskPath)).not.toContain("private brief with exact bytes");
-    expect(rawStatus(taskPath)).not.toContain(JSON.stringify(prompt));
+    expect(savedStatus(taskPath).task).toBe(prompt);
     expect(manager.readLog(failed.id).status?.task).toBe("");
     expect(() => manager.listForUi()).not.toThrow();
   });
 
   // Stop, AbortSignal cancellation and deadline all use the same managed
   // terminal retention path; the real prompt verifier is never mocked.
-  it.each(["stopped", "cancelled", "timed_out"] as const)("retains the verified current prompt after %s", async (outcome) => {
+  it.each(["stopped", "cancelled", "timed_out"] as const)("archives the whole verified current run after %s", async (outcome) => {
     const { manager } = fixture(outcome === "timed_out" ? { timeoutMs: 1_500 } : {});
     const controller = new AbortController();
     const prompt = `HANG until ${outcome}: current brief π\n`;
@@ -143,17 +212,20 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     }
     const directory = manager.runDirectory(handle.id)!;
     const taskPath = path.join(directory, "task.txt");
-
+    const files = seedRawTrace(directory), inode = fs.statSync(directory).ino;
+    const fd = fs.openSync(path.join(directory, "session.NdJsOn.backup"), "a");
     removalIntents.splice(0);
     await manager.close();
+    try { fs.writeSync(fd, "late FD tail"); } finally { fs.closeSync(fd); }
+    files.set("session.NdJsOn.backup", Buffer.concat([files.get("session.NdJsOn.backup")!, Buffer.from("late FD tail")]));
+    expectWholeRun(directory, files, inode);
     expect(removalIntents).not.toContain(directory);
     expect(removalIntents).not.toContain(taskPath);
     expect(removalIntents).not.toContain(path.join(directory, "status.json"));
-    expect(fs.readFileSync(taskPath, "utf8")).toBe(prompt);
+    expect(fs.readFileSync(retainedPath(taskPath), "utf8")).toBe(prompt);
     expect(savedStatus(taskPath)).toMatchObject({ status: terminal, promptSha256: hash(prompt), promptBytes: Buffer.byteLength(prompt), inputSha256: hash(prompt), inputBytes: Buffer.byteLength(prompt) });
     expect(savedStatus(taskPath).promptRetentionDropped).toBeUndefined();
-    expectNoRetainedTasks(savedStatus(taskPath));
-    expect(rawStatus(taskPath)).not.toContain("current brief π");
+    expect(savedStatus(taskPath).task).toBe(prompt);
   });
 
   // A live worker closes with checked ESRCH and a retained pair. Never-admitted
@@ -167,6 +239,7 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     expect(Number.isSafeInteger(pid) && pid > 0 && processAlive(pid)).toBe(true);
     const directory = manager.runDirectory(active.id)!;
     const taskPath = path.join(directory, "task.txt");
+    const files = seedRawTrace(directory), inode = fs.statSync(directory).ino;
     const launchSpy = vi.spyOn(ProcessTransport.prototype, "launch"); // observer only: passes through
     try {
       const queued = await manager.spawn({ name: "queued control", task: "queued successful task", transport: "process" });
@@ -184,20 +257,22 @@ describe("Agent prompt retention at manager close (#11663)", () => {
       expect(removalIntents).not.toContain(directory);
       expect(removalIntents).not.toContain(taskPath);
       expect(removalIntents).not.toContain(path.join(directory, "status.json"));
-      expect(fs.readFileSync(taskPath, "utf8")).toBe(prompt);
+      // Running status/result files legitimately settle at close; raw trace bytes must not change.
+      files.delete("status.json"); files.delete("manager-result.json"); files.delete("events.jsonl");
+      expectWholeRun(directory, files, inode);
+      expect(fs.readFileSync(retainedPath(taskPath), "utf8")).toBe(prompt);
       expect(savedStatus(taskPath)).toMatchObject({ status: "stopped", promptSha256: hash(prompt), inputSha256: hash(prompt), inputBytes: Buffer.byteLength(prompt) });
-      expectNoRetainedTasks(savedStatus(taskPath));
       expect(queuedRollbackIntents).toEqual([path.join(queuedDirectory, "queued-result.json"), queuedDirectory]);
-      expect(removalIntents).toContain(queuedDirectory);
-      expect(fs.existsSync(path.join(queuedDirectory, "task.txt"))).toBe(false);
-      // The recorded rollback deliberately leaves the fixture directory present.
-      expect(savedStatus(path.join(queuedDirectory, "task.txt"))).toMatchObject({ status: "stopped", queuedArchiveCommitted: true });
+      expect(removalIntents).not.toContain(queuedDirectory);
+      const heldQueued = heldRoot(queuedDirectory);
+      expect(fs.existsSync(path.join(heldQueued, "task.txt"))).toBe(false);
+      expect(savedStatus(path.join(heldQueued, "task.txt"))).toMatchObject({ status: "stopped", queuedArchiveCommitted: true });
     } finally {
       launchSpy.mockRestore();
     }
   });
 
-  it.each(["failed", "stopped", "timed_out", "completed"] as const)("keeps whole-tree removal for an explicit-root %s run", async (terminal) => {
+  it.each(["failed", "stopped", "timed_out", "completed"] as const)("archives the whole tree for an explicit-root %s run", async (terminal) => {
     const { root, manager } = fixture(terminal === "timed_out" ? { timeoutMs: 1_500 } : {}, true);
     const prompt = terminal === "failed" ? "FAIL_DIRECTIVE\nexplicit failure" : terminal === "completed" ? "explicit success" : "HANG explicit terminal";
     const handle = await manager.spawn({ name: "explicit root control", task: prompt, transport: "process" });
@@ -207,12 +282,14 @@ describe("Agent prompt retention at manager close (#11663)", () => {
 
     removalIntents.splice(0);
     await manager.close();
-    expect(removalIntents.filter(target => target === directory || target.startsWith(directory + path.sep))).toEqual([directory]);
-    expect(savedStatus(path.join(directory, "task.txt")).promptRetentionDropped).toBeUndefined();
-    expect(fs.existsSync(directory)).toBe(true); // Whole-tree intent only, not physical deletion.
+    expect(removalIntents.filter(target => target === directory || target.startsWith(directory + path.sep))).toEqual([]);
+    const held = heldRoot(directory);
+    expect(savedStatus(path.join(held, "task.txt")).promptRetentionDropped).toBeUndefined();
+    expect(fs.readFileSync(path.join(held, "task.txt"), "utf8")).toBe(prompt);
+    expect(JSON.parse(fs.readFileSync(path.join(held, "manager-result.json"), "utf8"))).toMatchObject({ id: handle.id, status: terminal });
   });
 
-  it("omits nested task fields on disk and normalizes them only when read", async () => {
+  it("archives original nested task fields and late raw status without adopting late outcome authority", async () => {
     const { manager } = fixture();
     const prompt = "FAIL_DIRECTIVE\nparent-task-sentinel-π\n";
     vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
@@ -242,27 +319,23 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     fs.mkdirSync(late);
     fs.writeFileSync(path.join(late, "status.json"), JSON.stringify({ ...record, id: "late-child", task: "late-task-sentinel", text: "late diagnostic" }));
 
+    const run = path.dirname(record.promptPath!);
+    const originalResult = fs.readFileSync(path.join(run, "manager-result.json"));
+    const lateStatus = fs.readFileSync(path.join(child, "status.json"));
     await manager.close();
-    const retained = savedStatus(record.promptPath!);
-    expect(retained.nestedAgents).toHaveLength(1);
-    expect(retained.nestedAgents![0]!.nestedAgents).toHaveLength(1);
-    expectNoRetainedTasks(retained);
-    for (const sentinel of ["parent-task-sentinel-π", "nested-task-sentinel-λ", "grandchild-task-sentinel-δ"]) expect(rawStatus(record.promptPath!)).not.toContain(sentinel);
-    expect(rawStatus(record.promptPath!)).toContain("preserved nested diagnostic");
-    expect(rawStatus(record.promptPath!)).not.toContain("late diagnostic");
-    expect(rawStatus(record.promptPath!)).not.toContain("late-task-sentinel");
-    expect(retained.nestedAgents?.map(record => record.id)).toEqual(["child"]);
-    const published = JSON.parse(fs.readFileSync(path.join(path.dirname(record.promptPath!), "manager-result.json"), "utf8"));
-    expectNoRetainedTasks(published);
-    expect(published.nestedAgents).toEqual(retained.nestedAgents);
-    const reopened = manager.readLog(handle.id).status!;
-    expect(reopened.task).toBe("");
-    expect(reopened.nestedAgents![0]!.task).toBe("");
-    expect(reopened.nestedAgents![0]!.nestedAgents![0]!.task).toBe("");
+    const held = heldRoot(run);
+    expect(fs.readFileSync(path.join(held, "manager-result.json"))).toEqual(originalResult);
+    const published = JSON.parse(originalResult.toString());
+    expect(published.nestedAgents).toHaveLength(1);
+    expect(published.nestedAgents[0].task).toBe("nested-task-sentinel-λ");
+    expect(published.nestedAgents[0].nestedAgents[0].task).toBe("grandchild-task-sentinel-δ");
+    expect(fs.readFileSync(path.join(held, "nested", "child", "status.json"))).toEqual(lateStatus);
+    expect(fs.readFileSync(path.join(held, "nested", "late-child", "status.json"), "utf8")).toContain("late-task-sentinel");
+    expect(manager.readLog(handle.id).status!.task).toBe("");
     expect(() => manager.listForUi()).not.toThrow();
   });
 
-  it("records task.txt drop on tamper and persists mismatch metadata", async () => {
+  it("archives tampered task bytes unchanged without rewriting the authenticated outcome", async () => {
     const { manager } = fixture();
     const original = "FAIL_DIRECTIVE\noriginal-task-sentinel-π\n";
     const tampered = "tampered-task-sentinel-λ\n";
@@ -272,16 +345,13 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     const failedDirectory = path.dirname(taskPath);
     fs.writeFileSync(taskPath, tampered, { mode: 0o600 });
 
+    const files = seedRawTrace(failedDirectory), inode = fs.statSync(failedDirectory).ino;
     removalIntents.splice(0);
     await manager.close();
-    expect(removalIntents).toContain(taskPath);
-    expect(removalIntents).not.toContain(path.join(failedDirectory, "status.json"));
-    expect(savedStatus(taskPath)).toMatchObject({ promptRetentionDropped: true, promptRetentionMismatch: true, promptSha256: hash(original), inputSha256: hash(original), inputBytes: Buffer.byteLength(original) });
-    expectNoRetainedTasks(savedStatus(taskPath));
-    for (const sentinel of ["original-task-sentinel-π", "tampered-task-sentinel-λ", JSON.stringify(original), JSON.stringify(tampered)]) {
-      expect(rawStatus(taskPath)).not.toContain(sentinel);
-    }
-    expect(fs.readFileSync(taskPath, "utf8")).toBe(tampered); // Drop was recorded, not executed.
+    expectWholeRun(failedDirectory, files, inode);
+    expect(removalIntents).not.toContain(taskPath);
+    expect(savedStatus(taskPath)).toMatchObject({ task: original, promptSha256: hash(original), inputSha256: hash(original), inputBytes: Buffer.byteLength(original) });
+    expect(fs.readFileSync(retainedPath(taskPath), "utf8")).toBe(tampered);
   });
 
   it("retains the current failed continuation bytes while preserving the original prompt digest", async () => {
@@ -308,10 +378,8 @@ describe("Agent prompt retention at manager close (#11663)", () => {
       inputBytes: beforeClose.inputBytes,
     });
     expect(savedStatus(taskPath).promptRetentionDropped).toBeUndefined();
-    expectNoRetainedTasks(savedStatus(taskPath));
-    expect(rawStatus(taskPath)).not.toContain("original brief π");
-    expect(rawStatus(taskPath)).not.toContain("[Fabric continuation]");
-    expect(fs.readFileSync(taskPath)).toEqual(bytes);
+    expect(savedStatus(taskPath).task).toContain("[Fabric continuation]");
+    expect(fs.readFileSync(retainedPath(taskPath))).toEqual(bytes);
   });
 
   it("persists the rewritten current digest when a continuation launch fails before manager close", async () => {
@@ -358,7 +426,7 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     }
   });
 
-  it("drops a byte-oversized multibyte prompt without leaving fallback task text in status", async () => {
+  it("archives a byte-oversized multibyte prompt and full status unchanged", async () => {
     const { manager } = fixture();
     const prompt = `FAIL_DIRECTIVE\noversize-task-sentinel-π\n${"π".repeat(8_000)}`;
     expect(prompt.length).toBeLessThan(16_000);
@@ -368,20 +436,16 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
     const failedDirectory = path.dirname(taskPath);
 
+    const files = seedRawTrace(failedDirectory), inode = fs.statSync(failedDirectory).ino;
     removalIntents.splice(0);
     await manager.close();
-    expect(removalIntents).toContain(taskPath);
-    expect(removalIntents).not.toContain(path.join(failedDirectory, "status.json"));
-    expect(savedStatus(taskPath)).toMatchObject({ promptRetentionDropped: true, promptSha256: hash(prompt), promptBytes: Buffer.byteLength(prompt), inputSha256: hash(prompt), inputBytes: Buffer.byteLength(prompt) });
-    expectNoRetainedTasks(savedStatus(taskPath));
-    expect(rawStatus(taskPath)).not.toContain("oversize-task-sentinel-π");
-    expect(rawStatus(taskPath)).not.toContain("π".repeat(40));
-    expect(rawStatus(taskPath)).not.toContain(JSON.stringify(prompt));
-    expect(savedStatus(taskPath).promptRetentionMismatch).toBeUndefined();
-    expect(Buffer.byteLength(rawStatus(taskPath))).toBeLessThan(16_000);
+    expectWholeRun(failedDirectory, files, inode);
+    expect(removalIntents).not.toContain(taskPath);
+    expect(savedStatus(taskPath)).toMatchObject({ task: prompt, promptSha256: hash(prompt), promptBytes: Buffer.byteLength(prompt), inputSha256: hash(prompt), inputBytes: Buffer.byteLength(prompt) });
+    expect(savedStatus(taskPath).promptRetentionDropped).toBeUndefined();
   });
 
-  it.each(["failed", "stopped", "timed_out"] as const)("hands a closed managed %s run to the configured one-shot sweep without deleting it", async (terminal) => {
+  it.each(["failed", "stopped", "timed_out"] as const)("archives the whole managed %s run before an empty-root sweep", async (terminal) => {
     const { root: managedRoot, tempRoot, manager } = fixture(terminal === "timed_out" ? { timeoutMs: 1_500 } : {});
     const prompt = terminal === "failed" ? "FAIL_DIRECTIVE\nsweep-task-sentinel-π\n" : "HANG sweep-task-sentinel-π\n";
     const handle = await manager.spawn({ name: "sweep control", task: prompt, transport: "process" });
@@ -391,17 +455,15 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     const directory = path.dirname(taskPath), runRoot = path.dirname(directory);
     expect(path.dirname(runRoot)).toBe(tempRoot);
     expect(runRoot).toBe(managedRoot);
+    const files = seedRawTrace(directory), inode = fs.statSync(directory).ino;
     await manager.close();
-    expectNoRetainedTasks(savedStatus(taskPath));
-    expect(rawStatus(taskPath)).not.toContain("sweep-task-sentinel-π");
-    expect(savedStatus(taskPath)).toMatchObject({ status: terminal, inputSha256: hash(prompt), inputBytes: Buffer.byteLength(prompt) });
-    const owner = JSON.parse(fs.readFileSync(path.join(runRoot, ".fabric-owner.json"), "utf8"));
-    expect(owner.closedAt).toBeTypeOf("number");
+    expectWholeRun(directory, files, inode);
+    expect(savedStatus(taskPath)).toMatchObject({ status: terminal, task: prompt, inputSha256: hash(prompt), inputBytes: Buffer.byteLength(prompt) });
     const options = { tempRoot, orphanedTempRunRetentionMs: 1, oneShotRunRetentionMs: 24 * 60 * 60 * 1_000 };
     expect(sweepTempRunRoots({ ...options, now: result.finishedAt! + options.oneShotRunRetentionMs - 1 }).removedRuns).toEqual([]);
     expect(sweepIntents).not.toContain(directory);
-    expect(sweepTempRunRoots({ ...options, now: result.finishedAt! + options.oneShotRunRetentionMs + 1 }).removedRuns).toContain(directory);
-    expect(sweepIntents).toContain(directory);
-    expect(fs.existsSync(taskPath)).toBe(true); // Recorded intent only; no product deletion executed.
+    expect(sweepTempRunRoots({ ...options, now: result.finishedAt! + options.oneShotRunRetentionMs + 1 }).removedRuns).not.toContain(directory);
+    expect(sweepIntents).not.toContain(directory);
+    expect(fs.readFileSync(retainedPath(taskPath), "utf8")).toBe(prompt);
   });
 });

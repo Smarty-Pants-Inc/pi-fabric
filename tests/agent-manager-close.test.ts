@@ -13,6 +13,25 @@ import { processAlive } from "../src/storage/scratch.js";
 import * as agentRemoval from "../src/agents/rm.js";
 import * as retention from "../src/storage/retention.js";
 
+const custodyMoves = vi.hoisted(() => [] as Array<{ source: string; destination: string; receipt: string }>);
+vi.mock("../src/agents/worktree-manager.js", async original => {
+  const actual = await original<typeof import("../src/agents/worktree-manager.js")>();
+  return { ...actual, retainCleanupRoot: (...args: Parameters<typeof actual.retainCleanupRoot>) => {
+    const move = actual.retainCleanupRoot(...args);
+    if (move) custodyMoves.push(move);
+    return move;
+  } };
+});
+const heldRoot = (source: string): string => {
+  const move = custodyMoves.find(move => move.source === source)!;
+  expect(move).toBeDefined();
+  const row = { container: path.dirname(move.receipt), ...JSON.parse(fs.readFileSync(move.receipt, "utf8")) };
+  expect(row).toMatchObject({ source, destination: expect.any(String), id: path.basename(source), reason: expect.any(String), time: expect.any(Number) });
+  expect(JSON.parse(fs.readFileSync(path.join(row.container, "custody.prepared.json"), "utf8"))).toMatchObject({ source, destination: row.destination, id: row.id, state: "prepared" });
+  if (process.platform !== "win32") expect(fs.statSync(row.container).mode & 0o777).toBe(0o700);
+  expect(fs.existsSync(source)).toBe(false);
+  return row.destination;
+};
 const hostedDelete = hostedOnly("AgentManager close deletion");
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -35,7 +54,8 @@ afterEach(async () => {
   await Promise.allSettled(managers.splice(0).map((manager) => manager.close()));
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  // Preserve raw fixtures for the inherited test owner.
+  roots.splice(0);
 });
 
 describe("AgentManager close storage", () => {
@@ -108,27 +128,26 @@ describe("AgentManager close storage", () => {
     await expect(manager.spawn({ task: "late" })).rejects.toThrow("closing");
   });
 
-  it("retains a stopped prompt and closed managed root with retainRuns:false", async () => {
+  it("archives a whole stopped run with retainRuns:false before releasing the managed root", async () => {
     const { manager, root } = setup(false);
     const task = "HANG";
     const handle = await manager.spawn({ task, runner: "pi", extensions: false });
     expect(fs.readdirSync(root).length).toBeGreaterThan(1);
     await manager.close();
     await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "stopped" });
-    expect(fs.readdirSync(root).sort()).toEqual([".fabric-owner.json", handle.id].sort());
-    expect(JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8"))).toMatchObject({ childrenStopped: true, closedAt: expect.any(Number) });
-    const run = path.join(root, handle.id);
-    const taskPath = path.join(run, "task.txt");
-    expect(fs.readdirSync(run).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+    const source = path.join(root, handle.id);
+    const run = heldRoot(source);
+    const taskPath = path.join(source, "task.txt");
+    expect(fs.readdirSync(run)).toEqual(expect.arrayContaining(["manager-result.json", "status.json", "task.txt", "events.jsonl", "tmp"]));
     expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).toMatchObject({ id: handle.id, status: "stopped" });
-    expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).not.toHaveProperty("task");
-    expect(fs.readFileSync(taskPath)).toEqual(Buffer.from(task, "utf8"));
+    expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).toHaveProperty("task", task);
+    expect(fs.readFileSync(path.join(run, "task.txt"))).toEqual(Buffer.from(task, "utf8"));
     const digest = createHash("sha256").update(Buffer.from(task, "utf8")).digest("hex");
     const persisted = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
     expect(persisted).toMatchObject({ id: handle.id, status: "stopped", promptPath: taskPath,
       promptSha256: digest, promptBytes: Buffer.byteLength(task, "utf8"),
       inputSha256: digest, inputBytes: Buffer.byteLength(task, "utf8") });
-    expect(persisted).not.toHaveProperty("task");
+    expect(persisted).toHaveProperty("task", task);
     expect(hasUnresolvedWorker(run)).toBe(false);
   });
 
@@ -184,9 +203,8 @@ describe("AgentManager close storage", () => {
     expect(fs.readFileSync(path.join(root, "unrelated"), "utf8")).toBe("not an agent artifact");
   });
 
-  it("records durable-journal close collection without deleting the run (#11199)", async () => {
-    // Exercise the actual close decision, but record its removal request. The
-    // existing real-delete tests below belong to hosted CI, not a fleet lane.
+  it("archives durable-journal close collection with held bytes and a real receipt (#11199)", async () => {
+    // Exercise actual rename custody; product deletion remains recorded.
     vi.spyOn(retention, "claimTempRunSweep").mockReturnValue(false);
     const remove = vi.spyOn(agentRemoval, "removeTree").mockResolvedValue(undefined);
     const { manager, root } = setup(false);
@@ -198,12 +216,11 @@ describe("AgentManager close storage", () => {
     fs.writeFileSync(path.join(store, "main.jsonl"), "{}\n");
     expect(retention.canRemoveTerminalRun(directory)).toBe(true);
     await manager.close();
-    expect(remove).toHaveBeenCalledWith(directory);
-    expect(fs.readFileSync(path.join(store, "main.jsonl"), "utf8")).toBe("{}\n");
-    expect(fs.existsSync(root)).toBe(true);
+    expect(remove).not.toHaveBeenCalledWith(directory);
+    expect(fs.readFileSync(path.join(heldRoot(directory), path.relative(directory, store), "main.jsonl"), "utf8")).toBe("{}\n");
   });
 
-  it.runIf(hostedDelete)("removes a managed root holding a finished run's pi-durable journal (#229)", async () => {
+  it.runIf(hostedDelete)("archives a finished run's pi-durable journal before releasing its empty managed root (#229)", async () => {
     const { manager, root } = setup(false);
     const result = await manager.run({ task: "hello", runner: "pi", extensions: false });
     // The pi-durable runner journals beside status.json in the run directory.
@@ -213,6 +230,7 @@ describe("AgentManager close storage", () => {
     fs.writeFileSync(path.join(store, "main.jsonl"), "{}\n");
     await manager.close();
     expect(fs.existsSync(root)).toBe(false);
+    expect(fs.readFileSync(path.join(heldRoot(path.join(root, result.id)), "durable", "initial", "store", "main.jsonl"), "utf8")).toBe("{}\n");
   });
 
   it("retains closed managed run artifacts by default", async () => {
@@ -275,7 +293,7 @@ describe("AgentManager close storage", () => {
     await vi.waitFor(() => expect(fs.existsSync(sentinel)).toBe(false), { timeout: 20_000 });
   });
 
-  it.runIf(hostedDelete)("removes an explicit caller root after stopping a worker with retainRuns:false", async () => {
+  it.runIf(hostedDelete)("archives an explicit caller run after stopping a worker with retainRuns:false", async () => {
     const caller = fs.mkdtempSync(path.join(os.tmpdir(), "caller-stopped-root-"));
     roots.push(caller);
     const { manager, root } = setup(false, { runRoot: caller });
@@ -287,7 +305,7 @@ describe("AgentManager close storage", () => {
     expect(fs.readFileSync(path.join(run, "task.txt"), "utf8")).toBe("HANG");
     await manager.close();
     await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: "stopped" });
-    expect(fs.existsSync(run)).toBe(false);
+    expect(fs.readFileSync(path.join(heldRoot(run), "task.txt"), "utf8")).toBe("HANG");
     expect(fs.existsSync(root)).toBe(false);
   });
 
@@ -392,22 +410,21 @@ describe("AgentManager close storage", () => {
       await expect(manager.wait(queued.id)).resolves.toMatchObject({ status: "stopped" });
       expect(launch).not.toHaveBeenCalled();
       // The queued admission never reached startPrepared, so it never wrote a
-      // verified task file. Its recordless rollback still leaves no run tree.
+      // verified task file. The active run instead moves whole, before its now
+      // empty root can retire; no status/task/result-only pruning is allowed.
       expect(fs.existsSync(path.join(root, queued.id))).toBe(false);
-      expect(fs.readdirSync(root).sort()).toEqual([".fabric-owner.json", active.id].sort());
-      expect(JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8"))).toMatchObject({ childrenStopped: true, closedAt: expect.any(Number) });
-      const run = path.join(root, active.id);
-      const taskPath = path.join(run, "task.txt");
-      expect(fs.readdirSync(run).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+      const source = path.join(root, active.id), run = heldRoot(source);
+      const taskPath = path.join(source, "task.txt");
+      expect(fs.readdirSync(run)).toEqual(expect.arrayContaining(["manager-result.json", "status.json", "task.txt", "events.jsonl", "tmp"]));
       expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).toMatchObject({ id: active.id, status: "stopped" });
-      expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).not.toHaveProperty("task");
-      expect(fs.readFileSync(taskPath, "utf8")).toBe("HANG");
+      expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).toHaveProperty("task", "HANG");
+      expect(fs.readFileSync(path.join(run, "task.txt"), "utf8")).toBe("HANG");
       const digest = createHash("sha256").update("HANG", "utf8").digest("hex");
       const persisted = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
       expect(persisted).toMatchObject({ id: active.id, status: "stopped", promptPath: taskPath,
         promptSha256: digest, promptBytes: Buffer.byteLength("HANG", "utf8"),
         inputSha256: digest, inputBytes: Buffer.byteLength("HANG", "utf8") });
-      expect(persisted).not.toHaveProperty("task");
+      expect(persisted).toHaveProperty("task", "HANG");
       expect(hasUnresolvedWorker(run)).toBe(false);
     } finally { launch.mockRestore(); }
   });

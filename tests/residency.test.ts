@@ -1,4 +1,6 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
+import * as cleanupCustody from "../src/agents/worktree-manager.js";
+import { diagnostics } from "../src/core/diagnostics.js";
 import { hasUnresolvedWorker, markUnresolvedWorker } from "../src/storage/retention.js";
 import { beforeEach } from "vitest";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
@@ -86,6 +88,23 @@ const git = (cwd: string, ...args: string[]): string =>
 // short names resolved), while Node never expands the short form from
 // os.tmpdir(), so path text can never match there. Assert the worktree's
 // branch registration instead — that is what these checks mean.
+// Transparent observer: discover authentic external custody paths, never predict an archive.
+const observeCleanupCustody = () => {
+  const moves: cleanupCustody.CleanupRootCustody[] = [];
+  const retain = cleanupCustody.retainCleanupRoot;
+  const observer = vi.spyOn(cleanupCustody, "retainCleanupRoot").mockImplementation((...args) => {
+    const move = retain(...args); if (move) moves.push(move); return move;
+  });
+  return { moves, restore: () => observer.mockRestore() };
+};
+const expectHeldSources = (moves: cleanupCustody.CleanupRootCustody[], sources: Array<{ source: string; stat: fs.Stats; file: string; bytes: Buffer }>) => {
+  for (const { source, stat, file, bytes } of sources) {
+    const move = moves.find(row => row.source === source); expect(move, source).toBeDefined();
+    expect(JSON.parse(fs.readFileSync(move!.receipt, "utf8"))).toMatchObject({ source, destination: move!.destination, state: "moved", reason: expect.any(String), time: expect.any(Number) });
+    expect(fs.statSync(move!.destination)).toMatchObject({ dev: stat.dev, ino: stat.ino });
+    expect(fs.readFileSync(path.join(move!.destination, path.relative(source, file)))).toEqual(bytes);
+  }
+};
 const worktreeBranches = (repository: string): string[] =>
   git(repository, "worktree", "list", "--porcelain")
     .split("\n")
@@ -1482,15 +1501,18 @@ describe("durable completion receipts", () => {
     const state = await rootHarness("offline-cleanup-failure");
     const seeded = await seedCompletion(state, "completed");
     const client = new ResidencyClient({ config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent });
-    const original = fs.rmSync;
+    const original = fs.renameSync;
     const failure = new Error("injected cleanup filesystem failure");
-    const remove = vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
-      if (String(target) === seeded.runDirectory) throw failure;
-      return original(target, options);
+    const remove = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (String(source) === seeded.runDirectory) throw failure;
+      return original(source, destination);
     });
     try {
       const error = await client.cleanupAgent(seeded.id).catch((error: Error) => error);
-      expect(error).toMatchObject({ name: "ResidentOutcomeUnknownError", id: seeded.id, operation: "cleanup", cause: failure });
+      expect(error).toMatchObject({ name: "ResidentOutcomeUnknownError", id: seeded.id, operation: "cleanup" });
+      let cause: unknown = error; const causes: unknown[] = [];
+      while (cause instanceof Error && !causes.includes(cause)) { causes.push(cause); cause = cause.cause; }
+      expect(causes).toContain(failure);
       expect((error as Error).message).toContain("Do not retry or reassign");
       expect(fs.existsSync(seeded.metadataPath)).toBe(true);
       const decisions = fs.readdirSync(path.join(state.config.residencyRoot, "decisions"));
@@ -1612,10 +1634,19 @@ describe("durable completion receipts", () => {
         await child.stop();
         if (childState !== "terminal-live") await expect(invoke()).rejects.toThrow(/exit.*unconfirmed/);
         child.confirmExit();
-        expect(await invoke()).toEqual({ cleaned: true });
-        for (const file of [seeded.runDirectory, seeded.metadataPath, resultPath, worktree]) expect(fs.existsSync(file)).toBe(false);
-        expect(worktreeBranches(source)).not.toContain(branch);
-        expect(git(source, "branch", "--list", branch)).toBe("");
+        const sources = [seeded.runDirectory, seeded.metadataPath, resultPath, worktree].map(source => {
+          const file = source === seeded.runDirectory ? child!.statusFile : source === worktree ? path.join(worktree, ".git") : source;
+          return { source, file, bytes: fs.readFileSync(file), stat: fs.statSync(source) };
+        });
+        const custody = observeCleanupCustody(); const warning = vi.spyOn(console, "warn");
+        try {
+          expect(await invoke()).toEqual({ cleaned: true });
+          for (const { source } of sources) expect(fs.existsSync(source)).toBe(false);
+          expectHeldSources(custody.moves, sources);
+          expect(worktreeBranches(source)).toContain(branch);
+          expect(git(source, "branch", "--list", branch)).toContain(branch);
+          expect(warning.mock.calls.flat().join(" ")).toContain("deferred");
+        } finally { custody.restore(); warning.mockRestore(); }
       } finally {
         await child?.stop(); cleanup.mockRestore(); join.mockRestore();
         await client.close(); await host.close(); await actors.close(); await agents.close(); await lifecycle.close(); await state.participants.close();
@@ -3339,21 +3370,21 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(worktreeBranches(source)).toContain(branch);
       expect(git(source, "branch", "--list", branch)).toContain(branch);
       expect(fs.existsSync(runDirectory)).toBe(true); expect(fs.existsSync(metadataPath)).toBe(true);
-      await expect(client.cleanupAgent(id, true)).resolves.toEqual({ cleaned: true });
-      expect(worktreeBranches(source)).not.toContain(branch);
-      expect(git(source, "branch", "--list", branch)).toBe("");
-      expect(fs.existsSync(runDirectory)).toBe(false);
+      const sources = [runDirectory, metadataPath, worktree].map(source => {
+        const file = source === runDirectory ? path.join(source, "status.json") : source === worktree ? path.join(source, ".git") : source;
+        return { source, file, bytes: fs.readFileSync(file), stat: fs.statSync(source) };
+      });
+      const custody = observeCleanupCustody(); const warning = vi.spyOn(diagnostics, "warn");
+      try {
+        await expect(client.cleanupAgent(id, true)).resolves.toEqual({ cleaned: true });
+        expectHeldSources(custody.moves, sources);
+        expect(worktreeBranches(source)).toContain(branch);
+        expect(git(source, "branch", "--list", branch)).toContain(branch);
+        expect(fs.existsSync(runDirectory)).toBe(false);
+        expect(warning.mock.calls.flat().join(" ")).toContain("deferred");
+      } finally { custody.restore(); warning.mockRestore(); }
     } finally {
-      try {
-        git(source, "worktree", "remove", "--force", worktree);
-      } catch {
-        // A failed assertion may follow an implementation that already removed it.
-      }
-      try {
-        git(source, "branch", "-D", branch);
-      } catch {
-        // The worktree removal may already have removed its branch.
-      }
+      // Git registration and branch are intentional deferred debt, not teardown authority.
       await client.close();
       await state.participants.close();
     }

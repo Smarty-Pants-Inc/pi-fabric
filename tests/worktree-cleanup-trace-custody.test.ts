@@ -45,9 +45,37 @@ const moved = (root: string, source: string): Receipt => {
   verify(receipt!.destination);
   return receipt!;
 };
-afterEach(() => vi.restoreAllMocks());
+const ownedFixtures: string[] = [];
+afterEach(() => {
+  vi.restoreAllMocks();
+  const evidence = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
+  for (const root of ownedFixtures.splice(0)) {
+    if (!evidence) continue;
+    const target = path.join(evidence, path.basename(root));
+    fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+    const manifest: unknown[] = []; let count = 0, bytes = 0;
+    const exportOwned = (file: string, relative: string): void => {
+      if (++count > 4096) throw new Error("Owned custody evidence entry bound exceeded");
+      const stat = fs.lstatSync(file, { bigint: true });
+      const type = stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "directory" : stat.isFile() ? "file" : "special";
+      manifest.push({ path: relative, type, dev: String(stat.dev), ino: String(stat.ino), mode: String(stat.mode), size: String(stat.size),
+        ...(stat.isSymbolicLink() ? { link: fs.readlinkSync(file) } : {}) });
+      if (type === "directory") {
+        fs.mkdirSync(path.join(target, "raw", relative), { recursive: true, mode: 0o700 });
+        for (const name of fs.readdirSync(file).sort()) exportOwned(path.join(file, name), path.join(relative, name));
+      } else if (type === "file") {
+        bytes += Number(stat.size); if (bytes > 64 * 1024 * 1024) throw new Error("Owned custody evidence byte bound exceeded");
+        fs.writeFileSync(path.join(target, "raw", relative), fs.readFileSync(file), { mode: 0o600, flag: "wx" });
+      }
+    };
+    exportOwned(root, "");
+    fs.writeFileSync(path.join(target, "manifest.json"), JSON.stringify({ root, TMPDIR: process.env.TMPDIR,
+      umask: process.umask(), userBus: process.env.DBUS_SESSION_BUS_ADDRESS ?? null, runtimeDirectory: process.env.XDG_RUNTIME_DIR ?? null, manifest }, null, 2));
+  }
+});
 const fixture = () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-minimal-custody-")));
+  ownedFixtures.push(root);
   console.info(`retained cleanup fixture: ${root}`);
   const gitCalls: string[][] = [];
   const created: string[] = [];
@@ -169,6 +197,26 @@ describe("common worktree cleanup whole-root trace custody", () => {
     expect(warnings.mock.calls.flat().join("\n")).toMatch(/EXDEV/);
     expect(copy).not.toHaveBeenCalled();
     expect(remove.mock.calls.some(([target, options]) => String(target) === lease.path || options?.recursive)).toBe(false); f.noGitDelete();
+  });
+
+  it("confirmed cross-device shadow is deferred, keeps the lease and original, and never reports cleaned", async () => {
+    const f = fixture(); const lease = await f.create(); const ino = fs.lstatSync(lease.path).ino;
+    const lstat = fs.lstatSync, rename = fs.renameSync;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: { bigint?: boolean; throwIfNoEntry?: boolean }) => {
+      const stat = lstat(file, options as { bigint: false; throwIfNoEntry: false });
+      return String(file) === lease.path && !options?.bigint && stat
+        ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { dev: stat.dev + 1 }) : stat;
+    }) as typeof fs.lstatSync);
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(from) === lease.path) throw Object.assign(new Error("EXDEV mounted worktree"), { code: "EXDEV" });
+      rename(from, to);
+    });
+    await expect(f.manager.cleanup("same-id", true)).rejects.toMatchObject({ code: "CLEANUP_CUSTODY_DEFERRED",
+      cleanupStatus: { state: process.platform === "linux" ? "held-in-place" : "copy-failed", originalRetained: true, source: lease.path } });
+    expect(f.manager.get("same-id")).toEqual(lease); expect(fs.lstatSync(lease.path).ino).toBe(ino); verify(lease.path); f.noGitDelete();
+    const rows = receipts(f.root); expect(rows).toHaveLength(1);
+    expect(rows[0]!.state).not.toBe("moved");
+    if (process.platform === "linux") verify(rows[0]!.destination);
   });
 
   it("fresh container allocation failure leaves the original untouched", async () => {

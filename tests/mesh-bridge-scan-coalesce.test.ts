@@ -47,8 +47,8 @@ const subscribe = async () => {
   const failures: Error[] = [];
   const unsubscribe = side.subscribeChanges(kind => changes.push(kind), error => failures.push(error));
   cleanups.push(unsubscribe);
-  // One stateRevision() per fenced capture attempt: each scan that proves its pre-lock snapshot.
-  const scans = vi.spyOn(store, "stateRevision");
+  // One committed-prefix proof per unchanged observation tick, including cache hits.
+  const scans = vi.spyOn(store, "stateUnchangedSince");
   const fire = notify.current!;
   expect(fire).toBeTypeOf("function");
   // Let the real watcher deliver the store setup's own notifications before counting.
@@ -65,7 +65,7 @@ const burst = async (fire: (kind: BridgeChange) => void, n: number) => {
   for (let i = 0; i < n; i += 1) { fire("presence"); await Promise.resolve(); await Promise.resolve(); }
 };
 
-describe("pre-lock scan coalescing per notification burst", () => {
+describe("observation coalescing per notification burst", () => {
   it("scans once for N separate notifications of one burst, and observes the next burst", async () => {
     const f = await subscribe();
     await burst(f.fire, 20);
@@ -81,9 +81,9 @@ describe("pre-lock scan coalescing per notification burst", () => {
     const f = await subscribe();
     const revision = f.scans.getMockImplementation();
     let inside = 0;
-    f.scans.mockImplementation(function (this: typeof f.store) {
+    f.scans.mockImplementation(function (this: typeof f.store, ...args) {
       if (inside++ === 0) for (let i = 0; i < 10; i += 1) f.fire("presence");
-      return revision ? revision.call(this) : (Object.getPrototypeOf(f.store) as typeof f.store).stateRevision.call(this);
+      return revision ? revision.apply(this, args) : MeshStore.prototype.stateUnchangedSince.apply(this, args);
     });
     await burst(f.fire, 10);
     await macrotasks();
@@ -131,11 +131,11 @@ describe("pre-lock scan coalescing per notification burst", () => {
 
   it("does not hold events behind a busy scan's backoff", async () => {
     const f = await subscribe();
-    const real = (Object.getPrototypeOf(f.store) as typeof f.store).stateRevision;
+    const real = MeshStore.prototype.stateUnchangedSince;
     let busy = true;
-    f.scans.mockImplementation(function (this: typeof f.store) {
+    f.scans.mockImplementation(function (this: typeof f.store, ...args) {
       if (busy) throw meshStateBusyFrom("state.db", new Error("SQLITE_BUSY"));
-      return real.call(this);
+      return real.apply(this, args);
     });
     f.fire("presence");
     await macrotasks();
@@ -161,10 +161,10 @@ describe("pre-lock scan coalescing per notification burst", () => {
   it("keeps busy retry to one backoff timer while a burst arrives during the wait", async () => {
     const f = await subscribe();
     let busy = true;
-    const real = (Object.getPrototypeOf(f.store) as typeof f.store).stateRevision;
-    f.scans.mockImplementation(function (this: typeof f.store) {
+    const real = MeshStore.prototype.stateUnchangedSince;
+    f.scans.mockImplementation(function (this: typeof f.store, ...args) {
       if (busy) throw meshStateBusyFrom("state.db", new Error("SQLITE_BUSY"));
-      return real.call(this);
+      return real.apply(this, args);
     });
     const timers = vi.spyOn(globalThis, "setTimeout");
     f.fire("presence");

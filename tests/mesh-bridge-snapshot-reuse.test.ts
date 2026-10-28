@@ -135,11 +135,12 @@ const measure = (f: Fixture) => {
   });
   // listAllShared can materialize a complete SQLite snapshot instead of the three ranges.
   const shared = vi.spyOn(SqliteStateBackend.prototype, "listAllShared");
-  const fence = f.store.withStateWriteFence.bind(f.store);
-  const fences = vi.spyOn(f.store, "withStateWriteFence").mockImplementation(operation => fence(() => {
+  const fence = f.store.withStateReadSnapshot.bind(f.store);
+  const fences = vi.spyOn(f.store, "withStateReadSnapshot").mockImplementation(operation => fence(() => {
     fenced = true;
     try { return operation(); } finally { fenced = false; }
   }));
+  const writers = vi.spyOn(f.store, "withStateWriteFence");
   const revisions = vi.spyOn(f.store, "stateRevision");
   const proofs = vi.spyOn(f.store, "stateUnchangedSince");
   const expectAttempts = (inside: boolean[]) => {
@@ -151,12 +152,12 @@ const measure = (f: Fixture) => {
     expect(vi.mocked(readHostLeases).mock.calls).toEqual(inside.map(() => [f.root]));
     expect(frames()).toHaveLength(inside.length);
   };
-  return { fences, revisions, proofs, expectAttempts };
+  return { fences, writers, revisions, proofs, expectAttempts };
 };
 
 // Keep: trust-boundary/freshness fences, and the recorded snapshot CPU/read amplification
 // incident. Gate mechanisms/counts, not noisy elapsed-time thresholds.
-describe("SQLite bridge snapshot reuse is capture-local", () => {
+describe("SQLite bridge snapshots reuse only proven unchanged observations", () => {
   it("reads each fresh backend prefix and scans leases once for all three projections", async () => {
     const f = await fixture();
     clearInputs();
@@ -169,20 +170,23 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
     expect(JSON.parse(initial.content).mirrored).toHaveLength(2);
     expect(JSON.parse(initial.content).relays).toHaveLength(2);
     expect(f.changes).toEqual([]);
-    m.expectAttempts([false]);
+    m.expectAttempts([true]);
     expect(m.fences).toHaveBeenCalledTimes(1);
-    expect(m.proofs.mock.results.map(result => result.value)).toEqual([true]);
+    expect(m.writers).toHaveBeenCalledTimes(1);
+    expect(m.proofs).not.toHaveBeenCalled();
     expect(m.revisions).toHaveBeenCalledTimes(1);
   });
 
-  it("re-reads on later captures, retaining unchanged/lease/presence classification", async () => {
+  it("skips unchanged captures and retains lease/presence classification on invalidation", async () => {
     const f = await fixture();
     f.subscribe();
     const initial = frames().at(-1)!;
     clearInputs();
     const m = measure(f);
     await f.fire();
-    expect(frames()[0]).toEqual(initial);
+    expect(frames()).toEqual([]);
+    expect(m.fences).not.toHaveBeenCalled();
+    expect(m.writers).not.toHaveBeenCalled();
     expect(f.changes).toEqual([]);
     // A new SQLite version with reordered JSON properties is semantically unchanged.
     await f.store.put({ key: key("participants", f.participant.id), identity: f.identity,
@@ -221,47 +225,37 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
       expect.objectContaining({ value: expect.objectContaining({ id: relayParticipant.id, status: "running" }) }),
     ]));
     expect(f.changes.splice(0)).toEqual(["presence"]);
-    m.expectAttempts(Array<boolean>(7).fill(false));
+    m.expectAttempts(Array<boolean>(6).fill(true));
   });
 
-  it("rejects two obsolete SQLite captures and accepts only the fenced third", async () => {
+  it("settles once before taking the current consistent read snapshot outside writer custody", async () => {
     const f = await fixture();
     f.subscribe();
     const baseline = frames().at(-1)!;
-    // A second real SQLite connection commits exactly between observation and validation.
-    // Its lower-level put has no MeshStore async-open yield before the synchronous transaction.
     const writer = await SqliteStateStore.open(f.root, 64 * 1024, 100);
     cleanup.push(() => writer.close());
-    const pending: Array<Promise<unknown>> = [];
-    const setStatus = (status: string) => {
-      pending.push(writer.put({ key: key("participants", f.participant.id), identity: f.identity,
-        value: { ...f.participant, status } }));
-      // Writes are uncontended and commit synchronously before returning their promise.
-      expect(writer.get(key("participants", f.participant.id), { fresh: true })!.value).toMatchObject({ status });
-    };
-    setStatus("obsolete-0");
+    await writer.put({ key: key("participants", f.participant.id), identity: f.identity,
+      value: { ...f.participant, status: "obsolete" } });
     clearInputs();
     const m = measure(f);
-    const fence = m.fences.getMockImplementation()!;
-    let entered = 0;
-    m.fences.mockImplementation(operation => {
-      entered += 1;
-      if (entered <= 2) setStatus(entered === 1 ? "obsolete-1" : "idle");
+    const fence = MeshStore.prototype.withStateWriteFence.bind(f.store);
+    const pending: Array<Promise<unknown>> = [];
+    m.writers.mockImplementation(operation => {
+      pending.push(writer.put({ key: key("participants", f.participant.id), identity: f.identity,
+        value: f.participant }));
       return fence(operation);
     });
     await f.fire();
     await Promise.all(pending);
-    expect(frames().map(frame => JSON.parse(frame.content).native.participants[0].status))
-      .toEqual(["obsolete-0", "obsolete-1", "idle"]);
-    expect(frames().at(-1)).toEqual(baseline);
-    expect(f.changes).toEqual([]); // Discarded captures cannot become the subscriber's baseline.
-    expect(m.proofs.mock.results.map(result => result.value)).toEqual([false, false]);
-    expect(m.revisions).toHaveBeenCalledTimes(2);
-    expect(m.fences).toHaveBeenCalledTimes(3);
-    m.expectAttempts([false, false, true]);
+    expect(frames()).toEqual([baseline]);
+    expect(f.changes).toEqual([]);
+    expect(m.writers).toHaveBeenCalledTimes(1);
+    expect(m.fences).toHaveBeenCalledTimes(1);
+    expect(m.revisions).toHaveBeenCalledTimes(1);
+    m.expectAttempts([true]);
   });
 
-  it.each(["participants", "host-leases"] as const)("rejects directory-only %s churn even when the state revision still proves unchanged", async directory => {
+  it.each(["participants", "host-leases"] as const)("retries directory-only %s churn on the next tick, without repeated writer custody", async directory => {
     const f = await fixture();
     let fileEntry: MeshStateEntry | undefined;
     if (directory === "participants") {
@@ -274,7 +268,7 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
     const revision = f.store.stateRevision();
     const mutate = (step: number) => {
       if (fileEntry) writeParticipantFile(f.root, { ...fileEntry,
-        value: { ...f.participant, status: step < 2 ? `obsolete-${step}` : "idle" } });
+        value: { ...f.participant, status: step === 0 ? "obsolete-0" : "idle" } });
       else f.renew(NOW + 70_000 + step * 10_000);
     };
     mutate(0);
@@ -283,30 +277,35 @@ describe("SQLite bridge snapshot reuse is capture-local", () => {
     const fence = m.fences.getMockImplementation()!;
     let entered = 0;
     m.fences.mockImplementation(operation => {
-      entered += 1;
-      if (entered <= 2) {
+      const value = fence(operation);
+      if (entered++ === 0) {
         const stamp = meshDirectoryStamp(f.root, directory);
-        mutate(entered);
+        mutate(1);
         expect(meshDirectoryStamp(f.root, directory)).not.toBe(stamp);
       }
-      return fence(operation);
+      return value;
     });
     await f.fire();
+    expect(m.fences).toHaveBeenCalledTimes(1);
+    expect(f.changes).toEqual([]);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    await turn();
     expect(f.store.stateRevision()).toBe(revision);
-    expect(m.proofs.mock.results.map(result => result.value)).toEqual([true, true]);
-    expect(m.fences).toHaveBeenCalledTimes(3);
+    expect(m.proofs.mock.results.every(result => result.value === true)).toBe(true);
+    expect(m.fences).toHaveBeenCalledTimes(2);
+    expect(m.writers).not.toHaveBeenCalled();
     if (fileEntry) {
       expect(frames().map(frame => JSON.parse(frame.content).native.participants[0].status))
-        .toEqual(["obsolete-0", "obsolete-1", "idle"]);
+        .toEqual(["obsolete-0", "idle"]);
       expect(frames().at(-1)).toEqual(baseline);
       expect(f.changes).toEqual([]);
     } else {
       expect(frames().map(frame => JSON.parse(frame.content).native.hosts[0].expiresAt))
-        .toEqual([NOW + 70_000, NOW + 80_000, NOW + 90_000]);
+        .toEqual([NOW + 70_000, NOW + 80_000]);
       expect(frames().at(-1)!.topology).toBe(baseline.topology);
       expect(f.changes).toEqual(["lease"]);
     }
-    m.expectAttempts([false, false, true]);
+    m.expectAttempts([true, true]);
   });
 
   it.each(["hosts", "participants", "lease"] as const)("detects externally removed mirror %s and repairs real held authority", async removed => {

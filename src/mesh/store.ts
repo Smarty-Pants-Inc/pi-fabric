@@ -999,6 +999,20 @@ export class MeshStore {
     return this.#state.withWriteFence(operation, timing);
   }
 
+  /**
+   * Runs synchronous validation against one live state snapshot. SQLite uses a WAL read
+   * transaction: concurrent writers may commit, but every callback read sees the pinned state.
+   * This does NOT exclude ownership takeovers or settle pending-writer/file-watch hints; event
+   * appends requiring that exclusion must keep withStateWriteFence. Other backends retain their
+   * existing write-fence contract, including its caller-held custody requirement.
+   * The callback must not return a thenable or call state writers.
+   */
+  withStateReadSnapshot<T>(operation: () => T): T {
+    return this.#state.withReadSnapshot
+      ? this.#state.withReadSnapshot(operation)
+      : this.#state.withWriteFence(operation);
+  }
+
   stateStamp(): string | undefined {
     return this.#state.stateStamp();
   }

@@ -9,6 +9,14 @@ import { retainCleanupRoot, WorktreeManager } from "../src/agents/worktree-manag
 import * as atomicWrites from "../src/core/atomic-write.js";
 import * as processUtils from "../src/agents/transports/process-utils.js";
 import * as cloneFirst from "../src/agents/clone-first-worktree.js";
+import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { fakeManagerHeapWorker, heapRunResult } from "./fixtures/manager-heap-probe.js";
+import { ResidencyClient } from "../src/residency/client.js";
+import { residentResultPath, residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { MeshStore } from "../src/mesh/store.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import type { FabricMainAgentTarget } from "../src/main-agent.js";
+import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
 // Data-safety keep reason: real filesystem custody and the real AgentManager
 // setup-failure rollback. Git creation/destruction is recorded, NEVER executed.
@@ -347,13 +355,162 @@ describe("common worktree cleanup whole-root trace custody", () => {
     verify(lease.path); expect(rename.mock.calls.some(([source]) => String(source) === lease.path)).toBe(false); f.noGitDelete();
   });
 
-  it.skipIf(process.platform === "win32")("preserves a dangling root symlink itself rather than following or deleting it", () => {
-    const f = fixture(); const source = path.join(f.root, "raw-link");
-    fs.symlinkSync("absent-target.JSONL", source);
-    const row = retainCleanupRoot(source, path.join(f.root, "held"), "symlink-agent");
-    expect(fs.lstatSync(row!.destination).isSymbolicLink()).toBe(true);
-    expect(fs.readlinkSync(row!.destination)).toBe("absent-target.JSONL");
-    expect(fs.lstatSync(source, { throwIfNoEntry: false })).toBeUndefined(); f.noGitDelete();
+  it.skipIf(process.platform === "win32")("refuses even a dangling root symlink without resolving, moving or deleting its entry", () => {
+    const f = fixture(); const source = path.join(f.root, "raw-link"), archive = path.join(f.root, "held");
+    fs.symlinkSync("absent-target.JSONL", source); const ino = fs.lstatSync(source).ino;
+    // A dangling target may become live before rename; moving its link alone is
+    // not referent custody. Nested links inside an ordinary root remain allowed.
+    const link = fs.readlinkSync(source, { encoding: "buffer" });
+    let failure: { cleanupStatus?: { receipt: string; destination: string } } | undefined;
+    try { retainCleanupRoot(source, archive, "symlink-agent"); } catch (error) { failure = error as typeof failure; }
+    expect(failure).toMatchObject({ code: "CLEANUP_CUSTODY_DEFERRED", cleanupStatus: { state: "held-in-place", originalRetained: true, source } });
+    const row = JSON.parse(fs.readFileSync(failure!.cleanupStatus!.receipt, "utf8"));
+    expect(row).toMatchObject({ state: "held-in-place", reason: "root-is-symlink", entryPath: source, readlink: { encoding: "base64", bytes: link.toString("base64") } });
+    expect(row.verifiedCopyPath).toBeUndefined(); expect(fs.existsSync(failure!.cleanupStatus!.destination)).toBe(false);
+    expect(fs.lstatSync(source).ino).toBe(ino);
+    expect(fs.readlinkSync(source, { encoding: "buffer" })).toEqual(link); f.noGitDelete();
+  });
+
+  it("refuses a live root symlink to Git-reachable raw trees without consuming the lease or touching the referent", async () => {
+    const f = fixture(); const lease = await f.create();
+    fs.mkdirSync(path.join(f.root, ".git"));
+    const target = path.join(f.root, "untracked-live-raw"); fs.renameSync(lease.path, target);
+    fs.symlinkSync(target, lease.path, process.platform === "win32" ? "junction" : "dir");
+    const rootIno = fs.lstatSync(lease.path).ino, targetIno = fs.statSync(target).ino;
+    const file = path.join(target, "sessions/raw.JSONL"), fileIno = fs.statSync(file).ino;
+    const fd = fs.openSync(file, "a"), warnings = vi.spyOn(console, "warn");
+    const rename = vi.spyOn(fs, "renameSync"), copy = vi.spyOn(fs, "cpSync"), remove = vi.spyOn(fs, "rmSync");
+    try {
+      const link = fs.readlinkSync(lease.path, { encoding: "buffer" });
+      const failure = await f.manager.cleanup("same-id", true).catch(error => error);
+      expect(failure).toMatchObject({ code: "CLEANUP_CUSTODY_DEFERRED", cleanupStatus: { state: "held-in-place", originalRetained: true, source: lease.path } });
+      const row = JSON.parse(fs.readFileSync(failure.cleanupStatus.receipt, "utf8"));
+      expect(row).toMatchObject({ state: "held-in-place", reason: "root-is-symlink", entryPath: lease.path, readlink: { encoding: "base64", bytes: link.toString("base64") } });
+      expect(failure.cleanupStatus.verifiedCopyPath).toBeUndefined(); expect(fs.existsSync(failure.cleanupStatus.destination)).toBe(false);
+      expect(f.manager.get("same-id")).toEqual(lease); expect(receipts(f.root)).toEqual([]);
+      expect(fs.realpathSync(lease.path)).toBe(target); verify(target); verify(lease.path);
+      expect(fs.lstatSync(lease.path).ino).toBe(rootIno); expect(fs.statSync(target).ino).toBe(targetIno);
+      expect(fs.statSync(file).ino).toBe(fileIno); expect(fs.fstatSync(fd).ino).toBe(fileIno);
+      expect(path.relative(f.root, fs.realpathSync(lease.path))).toBe("untracked-live-raw");
+      expect(warnings.mock.calls.flat().join("\n")).toMatch(/cleanup refused.*root symlink/);
+      expect(warnings.mock.calls.flat().join("\n")).not.toMatch(/cleanup retained whole root/);
+      expect(rename.mock.calls.some(([from]) => String(from) === lease.path)).toBe(false);
+      expect(copy).not.toHaveBeenCalled();
+      expect(remove.mock.calls.some(([file, options]) => String(file) === lease.path || String(file).startsWith(target) || options?.recursive)).toBe(false); f.noGitDelete();
+      fs.writeSync(fd, "late-original-tail");
+      expect(fs.readFileSync(file)).toEqual(Buffer.concat([payloads.get("sessions/raw.JSONL")!, Buffer.from("late-original-tail")]));
+      await expect(f.manager.cleanup("same-id", true)).rejects.toThrow(/root symlink/);
+      expect(f.manager.get("same-id")).toEqual(lease); f.noGitDelete();
+    } finally { fs.closeSync(fd); }
+  });
+
+  it("refuses a root replaced by a live symlink during durable preparation and keeps lease and immutable receipt", async () => {
+    const f = fixture(); const lease = await f.create(); const ino = fs.lstatSync(lease.path).ino;
+    const target = path.join(f.root, "replacement-referent"), write = atomicWrites.writeJsonAtomic;
+    let prepared: Buffer | undefined;
+    vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, data, options) => {
+      write(file, data, options);
+      if (String(file).endsWith(`${path.sep}custody.json`) && (data as Receipt).state === "prepared") {
+        prepared = fs.readFileSync(path.join(path.dirname(String(file)), "custody.prepared.json"));
+        fs.renameSync(lease.path, target);
+        fs.symlinkSync(target, lease.path, process.platform === "win32" ? "junction" : "dir");
+      }
+    });
+    await expect(f.manager.cleanup("same-id", true)).rejects.toThrow(/changed before rename/);
+    const row = receipts(f.root)[0]!; expect(row.state).toBe("rename-failed");
+    expect(fs.readFileSync(path.join(path.dirname(row.destination), "custody.prepared.json"))).toEqual(prepared);
+    expect(fs.lstatSync(row.destination, { throwIfNoEntry: false })).toBeUndefined();
+    expect(fs.lstatSync(target).ino).toBe(ino); verify(target); verify(lease.path);
+    expect(f.manager.get("same-id")).toEqual(lease); f.noGitDelete();
+  });
+
+  it("a committed root substitution never forgets the lease or reports cleaned on retry or ID reuse", async () => {
+    const f = fixture(); const lease = await f.create(); const ino = fs.lstatSync(lease.path).ino;
+    const target = path.join(f.root, "uncaptured-original"), rename = fs.renameSync;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(from) === lease.path) {
+        rename(lease.path, target);
+        fs.symlinkSync(target, lease.path, process.platform === "win32" ? "junction" : "dir");
+      }
+      rename(from, to);
+    });
+    let failure: (Error & { movedEntry?: NonNullable<ReturnType<typeof retainCleanupRoot>> }) | undefined;
+    try { await f.manager.cleanup("same-id", true); } catch (error) { failure = error as typeof failure; }
+    expect(failure?.message).toMatch(/changed during rename.*custody unproven/);
+    expect("retainedRoot" in failure!).toBe(false); expect("cleanupStatus" in failure!).toBe(false);
+    expect(f.manager.get("same-id")).toEqual(lease);
+    const row = failure!.movedEntry!;
+    expect(fs.lstatSync(row.destination).isSymbolicLink()).toBe(true);
+    expect(JSON.parse(fs.readFileSync(row.receipt, "utf8")).state).toBe("prepared");
+    expect(fs.lstatSync(target).ino).toBe(ino); verify(target);
+    fs.mkdirSync(lease.path); fs.writeFileSync(path.join(lease.path, "new-owner.JSONL"), "new owner\n");
+    await expect(f.manager.cleanup("same-id", true)).rejects.toBe(failure);
+    await expect(f.create()).rejects.toBe(failure);
+    expect(f.manager.get("same-id")).toEqual(lease); verify(target);
+    expect(fs.readFileSync(path.join(lease.path, "new-owner.JSONL"), "utf8")).toBe("new owner\n"); f.noGitDelete();
+  });
+
+  it.each((["manager", "resident"] as const).flatMap(owner => (["substitution", "receipt-eio"] as const).map(fault => ({ owner, fault }))))("actual $owner cleanup first failure and same-id retry preserve the custody boundary ($fault)", async ({ owner, fault }) => {
+    const f = fixture(), consumed = vi.fn(); installInProcessResidentFence();
+    fs.mkdirSync(path.join(f.root, ".git")); // Original raw target stays Git-reachable on the substitution failure.
+    let source: string, id: string, cleanup: () => Promise<unknown>, close: () => Promise<void>;
+    if (owner === "manager") {
+      vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(request => fakeManagerHeapWorker(request, 64));
+      const manager = new AgentManager(f.root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false, budgetUsd: 0, sessionExport: false }, {
+        runRoot: path.join(f.root, "runs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), onResultConsumed: consumed,
+      });
+      const result = await manager.run({ task: "F1 real manager custody", transport: "process", extensions: false });
+      id = result.id; source = manager.runDirectory(id)!;
+      cleanup = () => manager.cleanup(id); close = async () => { manager.config.retainRuns = true; await manager.close(); };
+    } else {
+      const rootId = "session:F1-custody", meshRoot = path.join(f.root, "mesh");
+      const config: ResidentHostConfig = { format: 1, rootId, sessionId: "F1-custody", cwd: f.root, projectRoot: f.root,
+        meshRoot, actorRoot: path.join(f.root, "actors"), residencyRoot: residentRoot(meshRoot, rootId), fullCodeMode: true,
+        agents: { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, mesh: DEFAULT_FABRIC_CONFIG.mesh, retention: DEFAULT_FABRIC_CONFIG.retention,
+        workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda" };
+      const mesh = new MeshStore(meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+      const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: rootId, rootId,
+        identity: { id: rootId, name: "F1 fixture Main", kind: "main", sessionId: config.sessionId }, reapDeadHosts: false });
+      const client = new ResidencyClient({ config, mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget, onResultConsumed: consumed });
+      id = "f".repeat(32); source = path.join(config.residencyRoot, "runs", id);
+      const record = heapRunResult(id, 64); fs.mkdirSync(source, { recursive: true });
+      fs.writeFileSync(path.join(source, "status.json"), JSON.stringify(record));
+      const metadata = path.join(config.residencyRoot, "agents", `${id}.json`); fs.mkdirSync(path.dirname(metadata), { recursive: true });
+      fs.writeFileSync(metadata, JSON.stringify({ format: 1, rootId, id, runDirectory: source, createdAt: 1, updatedAt: 2, handle: record }));
+      const result = residentResultPath(config.residencyRoot, id); fs.mkdirSync(path.dirname(result), { recursive: true }); fs.writeFileSync(result, JSON.stringify(record));
+      cleanup = () => client.cleanupAgent(id); close = async () => { await client.close(); await participants.close(); };
+    }
+    seed(source); consumed.mockClear(); const ino = fs.lstatSync(source).ino, original = path.join(f.root, "original-raw");
+    const rename = fs.renameSync, write = atomicWrites.writeJsonAtomic; let destination = "", once = false;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(from) === source) {
+        if (fault === "substitution") { rename(source, original); fs.symlinkSync(original, source, process.platform === "win32" ? "junction" : "dir"); }
+        destination = String(to);
+      }
+      rename(from, to);
+    });
+    vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, data, options) => {
+      if (fault === "receipt-eio" && !once && (data as Receipt).source === source && (data as Receipt).state === "moved") {
+        once = true; throw Object.assign(new Error("F1 ordinary moved receipt EIO"), { code: "EIO" });
+      }
+      write(file, data, options);
+    });
+    try {
+      await expect(cleanup()).rejects.toThrow(fault === "substitution" ? /custody unproven/ : /receipt EIO/);
+      expect(consumed).not.toHaveBeenCalled();
+      expect(JSON.parse(fs.readFileSync(path.join(path.dirname(destination), "custody.prepared.json"), "utf8")).state).toBe("prepared");
+      if (fault === "substitution") {
+        verify(original); expect(fs.lstatSync(original).ino).toBe(ino);
+        await expect(cleanup()).rejects.toThrow(); expect(consumed).not.toHaveBeenCalled(); verify(original);
+        fs.mkdirSync(source); fs.writeFileSync(path.join(source, "replacement.JSONL"), "new canonical owner\n");
+        await expect(cleanup()).rejects.toThrow(); expect(consumed).not.toHaveBeenCalled();
+        expect(fs.readFileSync(path.join(source, "replacement.JSONL"), "utf8")).toBe("new canonical owner\n"); verify(original);
+      } else {
+        verify(destination); expect(fs.lstatSync(destination).ino).toBe(ino);
+        await expect(cleanup()).resolves.toMatchObject({ cleaned: true }); verify(destination);
+      }
+      f.noGitDelete();
+    } finally { await close(); }
   });
 
   it.each([false, true])("actual AgentManager setup-failure rollback calls common cleanup without public cleanup (EXDEV=%s)", async exdev => {

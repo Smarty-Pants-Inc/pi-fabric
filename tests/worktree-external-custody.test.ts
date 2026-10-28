@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as custody from "../src/agents/worktree-manager.js";
+import * as atomicWrites from "../src/core/atomic-write.js";
 import { hostedOnly } from "../scripts/hosted-only.mjs";
 import * as windowsCommands from "../src/storage/windows-powershell-command.js";
 import { addCloneFirstWorktree } from "../src/agents/clone-first-worktree.js";
@@ -127,6 +128,59 @@ describe("external custody outside every Git root", () => {
     expect(fs.readFileSync(path.join(source, "raw.JSONL"))).toEqual(Buffer.from([0, 255, 13, 10, 123]));
   });
 
+  it.each([false, true])("refuses a live root symlink through physical parent aliases without inspecting its target (resolution denied=%s)", denied => {
+    const root = fixture(), repo = marker(path.join(root, "repo")), target = sourceAt(repo);
+    const parent = mkdir(path.join(repo, "roots")), alias = path.join(root, "parent-alias");
+    fs.symlinkSync(parent, alias, process.platform === "win32" ? "junction" : "dir");
+    const source = path.join(alias, "live-root"), archive = path.join(root, "archive");
+    fs.symlinkSync(target, source, process.platform === "win32" ? "junction" : "dir");
+    const ino = fs.lstatSync(target).ino, bytes = fs.readFileSync(path.join(target, "raw.JSONL"));
+    const stat = fs.statSync;
+    const resolveTarget = vi.spyOn(fs, "statSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+      if (String(file) === source) throw Object.assign(new Error(denied ? "referent EACCES" : "referent resolution forbidden"), { code: denied ? "EACCES" : "EIO" });
+      return stat(file, options as { bigint: false; throwIfNoEntry: false });
+    }) as typeof fs.statSync);
+    const link = fs.readlinkSync(source, { encoding: "buffer" });
+    const failure = result(() => custody.retainCleanupRoot(source, archive, "live-root-alias"));
+    expect(failure.cleanupStatus).toMatchObject({ state: "held-in-place", source, originalRetained: true });
+    expect(failure.cleanupStatus.verifiedCopyPath).toBeUndefined();
+    const receipt = JSON.parse(fs.readFileSync(failure.cleanupStatus!.receipt as string, "utf8"));
+    expect(receipt).toMatchObject({ reason: "root-is-symlink", entryPath: source, readlink: { encoding: "base64", bytes: link.toString("base64") } });
+    expect(resolveTarget.mock.calls.some(([file]) => String(file) === source)).toBe(false);
+    expect(fs.existsSync(failure.cleanupStatus!.destination as string)).toBe(false); expect(fs.lstatSync(source).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(source)).toBe(target); expect(fs.lstatSync(target).ino).toBe(ino);
+    expect(fs.readFileSync(path.join(target, "raw.JSONL"))).toEqual(bytes);
+  });
+
+  it.each(["prepared", "held-in-place"])("root-symlink receipt EIO exposes no held status and leaves source/referent untouched (%s)", state => {
+    const root = fixture(), target = sourceAt(root), source = path.join(root, "root-link"), archive = path.join(root, "archive");
+    fs.symlinkSync(target, source, process.platform === "win32" ? "junction" : "dir");
+    const link = fs.readlinkSync(source, { encoding: "buffer" }), ino = fs.lstatSync(source).ino, original = fs.readFileSync(path.join(target, "raw.JSONL"));
+    const write = atomicWrites.writeJsonAtomic, rename = vi.spyOn(fs, "renameSync");
+    vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, data, options) => {
+      if ((data as { state?: string }).state === state) throw Object.assign(new Error(`root-link ${state} EIO`), { code: "EIO" });
+      write(file, data, options);
+    });
+    const failure = result(() => custody.retainCleanupRoot(source, archive, "root-link-eio"));
+    expect(failure).toMatchObject({ code: "EIO" }); expect("cleanupStatus" in failure).toBe(false); expect("retainedRoot" in failure).toBe(false);
+    expect(fs.lstatSync(source).ino).toBe(ino); expect(fs.readlinkSync(source, { encoding: "buffer" })).toEqual(link);
+    expect(fs.readFileSync(path.join(target, "raw.JSONL"))).toEqual(original);
+    expect(rename.mock.calls.some(([from]) => String(from) === source)).toBe(false);
+    if (state === "held-in-place") {
+      const container = path.join(archive, fs.readdirSync(archive)[0]!);
+      expect(JSON.parse(fs.readFileSync(path.join(container, "custody.prepared.json"), "utf8"))).toMatchObject({ state: "prepared", reason: "root-is-symlink", entryPath: source, readlink: { encoding: "base64", bytes: link.toString("base64") } });
+    }
+  });
+
+  it("an ordinary root reached through a parent alias still receives whole-object external custody", () => {
+    const root = fixture(), repo = marker(path.join(root, "repo")), source = sourceAt(repo), alias = path.join(root, "repo-alias");
+    fs.symlinkSync(repo, alias, process.platform === "win32" ? "junction" : "dir");
+    const ino = fs.lstatSync(source).ino;
+    const row = custody.retainCleanupRoot(path.join(alias, "source"), path.join(alias, "archive"), "parent-alias")!;
+    outside(row.destination, [repo]); expect(fs.lstatSync(row.destination).ino).toBe(ino);
+    expect(fs.readFileSync(path.join(row.destination, "raw.JSONL"))).toEqual(Buffer.from([0, 255, 13, 10, 123]));
+  });
+
   it("same-device safe sibling wins over a different-device requested area; allocation is still fresh/private", () => {
     const root = fixture(), source = sourceAt(root), requested = mkdir(path.join(root, "remote"));
     const stat = fs.statSync;
@@ -208,6 +262,34 @@ describe("custody protection and no-inventory rename", () => {
     const read = vi.spyOn(fs, "readdirSync").mockImplementation(() => { throw new Error("payload inventory forbidden on rename path"); });
     const row = custody.retainCleanupRoot(source, archive, "rename-no-inventory")!;
     expect(read).not.toHaveBeenCalled(); expect(fs.readFileSync(path.join(row.destination, "raw.JSONL"))).toEqual(Buffer.from([0, 255, 13, 10, 123]));
+  });
+
+  it("a live link substituted inside rename cannot publish moved custody or touch the original referent", () => {
+    const root = fixture(), repo = marker(path.join(root, "repo")), source = sourceAt(repo), original = path.join(repo, "original");
+    const ino = fs.lstatSync(source).ino, bytes = fs.readFileSync(path.join(source, "raw.JSONL")), rename = fs.renameSync;
+    let prepared: Buffer | undefined;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(from) === source) {
+        prepared = fs.readFileSync(path.join(path.dirname(String(to)), "custody.prepared.json"));
+        rename(source, original);
+        fs.symlinkSync(original, source, process.platform === "win32" ? "junction" : "dir");
+      }
+      rename(from, to);
+    });
+    let failure: (Error & { movedEntry?: custody.CleanupRootCustody }) | undefined;
+    try { custody.retainCleanupRoot(source, path.join(repo, "archive"), "rename-race"); } catch (error) { failure = error as typeof failure; }
+    expect(failure?.message).toMatch(/changed during rename.*custody unproven/);
+    expect("retainedRoot" in failure!).toBe(false);
+    const row = failure!.movedEntry!; expect(row.source).toBe(source);
+    expect(fs.lstatSync(row.destination).isSymbolicLink()).toBe(true);
+    expect(fs.realpathSync(row.destination)).toBe(original); expect(fs.lstatSync(original).ino).toBe(ino);
+    expect(fs.readFileSync(path.join(original, "raw.JSONL"))).toEqual(bytes);
+    expect(fs.lstatSync(source, { throwIfNoEntry: false })).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(row.receipt, "utf8")).state).toBe("prepared");
+    expect(fs.readFileSync(path.join(path.dirname(row.receipt), "custody.prepared.json"))).toEqual(prepared);
+    expect("cleanupStatus" in failure!).toBe(false); // A committed link move is not held-in-place custody.
+    expect(() => custody.retainCleanupRoot(source, path.join(repo, "archive"), "rename-race")).toThrow(failure);
+    expect(fs.readFileSync(path.join(original, "raw.JSONL"))).toEqual(bytes);
   });
 
   it("fresh-container protection failure is visible before rename, with original inode and bytes intact", () => {

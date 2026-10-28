@@ -23,9 +23,69 @@ const inside = (parent: string, child: string): boolean => {
 };
 
 const managers: AgentManager[] = [];
+const custodyMoves = vi.hoisted(() => [] as Array<{ source: string; destination: string; receipt: string }>);
+vi.mock("../src/agents/worktree-manager.js", async original => {
+  const actual = await original<typeof import("../src/agents/worktree-manager.js")>();
+  return { ...actual, retainCleanupRoot: (...args: Parameters<typeof actual.retainCleanupRoot>) => {
+    const move = actual.retainCleanupRoot(...args);
+    if (move) custodyMoves.push(move);
+    return move;
+  } };
+});
+const rawRoots = new Set<string>();
+type CustodyEntry = { name: string; kind: "file" | "directory"; dev: string; ino: string; bytes?: Buffer };
+const inventory = (root: string): CustodyEntry[] => {
+  const rows: CustodyEntry[] = [];
+  let bytes = 0;
+  const walk = (name: string): void => {
+    const file = path.join(root, name), stat = fs.lstatSync(file, { bigint: true });
+    if (rows.length >= 5_000 || stat.isSymbolicLink() || (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1n))) throw new Error("Unsupported short-TMPDIR custody fixture entry");
+    const row: CustodyEntry = { name, kind: stat.isDirectory() ? "directory" : "file", dev: String(stat.dev), ino: String(stat.ino) };
+    if (stat.isFile()) {
+      if ((bytes += Number(stat.size)) > 96 * 1024 * 1024) throw new Error("Short-TMPDIR fixture byte bound exceeded");
+      row.bytes = fs.readFileSync(file);
+    }
+    rows.push(row);
+    if (stat.isDirectory()) for (const child of fs.readdirSync(file).sort()) walk(path.join(name, child));
+  };
+  walk(""); return rows;
+};
+const expectHeld = (source: string, before: CustodyEntry[], id: string, reason: string): string => {
+  const moves = custodyMoves.filter(move => move.source === source);
+  expect(moves).toHaveLength(1);
+  const move = moves[0]!;
+  const prepared = JSON.parse(fs.readFileSync(path.join(path.dirname(move.receipt), "custody.prepared.json"), "utf8"));
+  const final = JSON.parse(fs.readFileSync(move.receipt, "utf8"));
+  expect(prepared).toMatchObject({ format: 1, source, destination: move.destination, id, reason, state: "prepared", time: expect.any(Number) });
+  expect(final).toEqual({ ...prepared, state: "moved", time: expect.any(Number) });
+  expect(final.time).toBeGreaterThanOrEqual(prepared.time);
+  expect(inside(source, move.destination)).toBe(false);
+  for (let ancestor = move.destination; ; ancestor = path.dirname(ancestor)) {
+    expect(fs.existsSync(path.join(ancestor, ".git"))).toBe(false);
+    if (path.dirname(ancestor) === ancestor) break;
+  }
+  expect(inventory(move.destination)).toEqual(before);
+  expect(fs.existsSync(source)).toBe(false);
+  rawRoots.add(path.dirname(move.receipt));
+  return move.destination;
+};
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.unstubAllEnvs();
+  const evidence = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
+  if (evidence) {
+    fs.mkdirSync(evidence, { recursive: true });
+    const content = (root: string) => inventory(root).map(({ name, kind, bytes }) => ({ name, kind, ...(bytes ? { bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") } : {}) }));
+    for (const source of rawRoots) {
+      const before = content(source), destination = fs.mkdtempSync(path.join(evidence, "short-tmpdir-"));
+      fs.cpSync(source, path.join(destination, "tree"), { recursive: true, dereference: false });
+      expect(content(source)).toEqual(before);
+      expect(content(path.join(destination, "tree"))).toEqual(before);
+      fs.writeFileSync(path.join(destination, "export.json"), JSON.stringify({ source, destination: path.join(destination, "tree"), method: "COPY with independent SHA256 readback; not inode custody", entries: before }));
+    }
+  }
+  rawRoots.clear();
+  custodyMoves.splice(0);
 });
 
 type Layout = "native-pi /tmp/p.XXXXXX" | "role-pi /srv/scratch/paul/smarty-pi-tmp/pi-<12hex>/p.XXXXXX";
@@ -240,11 +300,12 @@ describe.skipIf(process.platform === "win32")("short private child TMPDIR (smart
     expect(fs.readFileSync(target, "utf8")).toBe("must survive");
   });
 
-  // pi-fabric#1554 P1: a failed, stopped or timed-out run in a managed (sweep-owned) temp root keeps only its prompt
-  // record at close. Before the short TMPDIR, that pruning removed <run>/tmp; on fd533e62 the short TMPDIR outside the
-  // run tree stayed, and with more than 64 entries every later sweep refused the run (and its root) forever.
-  it("prunes a retained failed run's short TMPDIR of 70 entries at close, so the sweep collects the run and its root", async () => {
+  // Whole-root custody is independent of the sweeper's bounded 64-entry admission.
+  // The real child reports the actual run-hashed out-of-run TMPDIR; neither root
+  // may be pruned to make it collectible. This suite remains POSIX-only.
+  it("archives the whole managed failed run and its recorded 70-entry short TMPDIR without pruning", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-short-retained-")));
+    rawRoots.add(root);
     const cwd = path.join(root, "cwd");
     fs.mkdirSync(cwd);
     const parent = path.join(root, "p.mN2CJ9");
@@ -270,22 +331,51 @@ fs.writeFileSync(args.get('--status-file'), JSON.stringify({
     vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
     const manager = new AgentManager(cwd, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, deniedModels: [], timeoutMs: 8_000 },
       { workerPath: worker, fullCodeMode: false, shortTmpdirSource: () => ({ tmpdir: parent, budgetBytes: 4096 }) });
+    managers.push(manager);
     const result = await manager.run({ task: "probe", transport: "process" });
     expect(result.status).toBe("failed");
     const tmp = (JSON.parse(result.text) as { tmp: string }).tmp;
     const run = manager.runDirectory(result.id)!;
     expect(tmp).toBe(path.join(parent, shortName(result.id)));
-    expect(fs.readdirSync(tmp)).toHaveLength(70);
-    await manager.close();
+    expect(fs.realpathSync(tmp)).toBe(tmp);
+    expect(inside(run, tmp)).toBe(false);
+    expect(fs.readdirSync(tmp).sort()).toEqual(Array.from({ length: 70 }, (_, index) => `scratch-${index}`).sort());
+    expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8")).temporaryDirectory).toBe(tmp);
+    for (const [name, bytes] of [["session.NdJsOn.backup", Buffer.from('raw π\n{"torn":')], ["logs/stderr.log", Buffer.from("stderr\u0000tail")], ["tmp/opaque.bin", Buffer.from([0, 255, 13, 10])]] as const) {
+      fs.mkdirSync(path.dirname(path.join(run, name)), { recursive: true });
+      fs.writeFileSync(path.join(run, name), bytes);
+    }
+    const runBefore = inventory(run), tmpBefore = inventory(tmp);
+    expect(tmpBefore.filter(row => row.kind === "file")).toHaveLength(70);
+    for (const row of tmpBefore.filter(row => row.kind === "file")) expect(row.bytes).toEqual(Buffer.from("x"));
+    const fd = fs.openSync(path.join(tmp, "scratch-0"), "a");
+    let heldRun: string, heldTmp: string;
+    try {
+      const original = fs.fstatSync(fd, { bigint: true });
+      const pin = tmpBefore.find(row => row.name === "scratch-0")!;
+      expect([String(original.dev), String(original.ino)]).toEqual([pin.dev, pin.ino]);
+      await manager.close();
+      heldRun = expectHeld(run, runBefore, result.id, "agent cleanup run directory");
+      heldTmp = expectHeld(tmp, tmpBefore, result.id, "agent cleanup private TMPDIR");
+      expect(heldTmp).not.toBe(heldRun);
+      expect(custodyMoves.filter(move => move.source === run || move.source === tmp)).toHaveLength(2);
+      fs.writeSync(fd, "\nlate FD tail π\u0000");
+      const after = fs.fstatSync(fd, { bigint: true }), named = fs.statSync(path.join(heldTmp, "scratch-0"), { bigint: true });
+      expect([after.dev, after.ino, named.dev, named.ino]).toEqual([original.dev, original.ino, original.dev, original.ino]);
+      expect(fs.readFileSync(path.join(heldTmp, "scratch-0"))).toEqual(Buffer.from("x\nlate FD tail π\u0000"));
+    } finally { fs.closeSync(fd); }
     vi.unstubAllEnvs();
-    // The retained prompt record stays; the short TMPDIR went with the pruned artifacts.
-    expect(fs.readdirSync(run).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
-    expect(fs.existsSync(tmp)).toBe(false);
-    // So retention no longer refuses the run: it collects the record and then the empty root.
-    const swept = sweepTempRunRoots({ tempRoot: parent, now: Date.now() + 365 * 86_400_000, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 });
-    expect(swept.removedRuns).toEqual([run]);
-    expect(swept.removedRoots).toEqual([path.dirname(run)]);
-    expect(fs.existsSync(run)).toBe(false);
+    const heldRunBeforeSweep = inventory(heldRun!), heldTmpBeforeSweep = inventory(heldTmp!);
+    expect(fs.existsSync(path.dirname(run))).toBe(false); // Only the empty owner root goes.
+    for (const now of [result.finishedAt! + DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs - 1, Date.now() + 365 * 86_400_000]) {
+      expect(sweepTempRunRoots({ tempRoot: parent, now, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs }))
+        .toEqual({ removedRuns: [], removedRoots: [] });
+      expect(inventory(heldRun!)).toEqual(heldRunBeforeSweep);
+      expect(inventory(heldTmp!)).toEqual(heldTmpBeforeSweep);
+    }
+    const rawResult = JSON.parse(fs.readFileSync(path.join(heldRun!, "manager-result.json"), "utf8"));
+    expect(rawResult).toMatchObject({ id: result.id, status: "failed", task: "probe" });
+    expect(manager.status(result.id)).toMatchObject({ status: "failed", task: "", text: "" });
   });
 
   it("measures the real native-pi and role-pi parents against the guard's 60 bytes", async () => {

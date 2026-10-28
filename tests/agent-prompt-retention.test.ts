@@ -33,7 +33,7 @@ const workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
 const nativeTempRoot = os.tmpdir();
 const queuedRollbackIntents: string[] = [];
 
-const fixture = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, explicitRoot = false) => {
+const fixture = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, explicitRoot = false, onResultConsumed?: (id: string) => void) => {
   const tempRoot = fs.mkdtempSync(path.join(nativeTempRoot, "agent-prompt-retention-"));
   roots.push(tempRoot);
   // Keep the real managed ownership/sweep path inside this fixture on every host.
@@ -44,7 +44,7 @@ const fixture = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, expl
   for (const key of ["PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID"]) vi.stubEnv(key, undefined);
   const runRoot = explicitRoot ? path.join(tempRoot, "explicit-runs") : undefined;
   const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, sessionExport: false, ...agents, retainRuns: false }, {
-    workerPath, ...(runRoot ? { runRoot } : {}),
+    workerPath, ...(runRoot ? { runRoot } : {}), ...(onResultConsumed ? { onResultConsumed } : {}),
   });
   managers.push(manager);
   const root = runRoot ?? path.join(tempRoot, fs.readdirSync(tempRoot).find(name => name.startsWith("pi-fabric-runs-"))!);
@@ -78,7 +78,7 @@ const heldRoot = (source: string): string => {
   const move = custodyMoves.find(move => move.source === source)!;
   expect(move).toBeDefined();
   const row = { container: path.dirname(move.receipt), ...JSON.parse(fs.readFileSync(move.receipt, "utf8")) };
-  expect(row).toMatchObject({ source, destination: expect.any(String), id: path.basename(source), reason: expect.any(String), time: expect.any(Number) });
+  expect(row).toMatchObject({ source, destination: move.destination, id: path.basename(source), reason: expect.any(String), time: expect.any(Number), state: "moved" });
   expect(JSON.parse(fs.readFileSync(path.join(row.container, "custody.prepared.json"), "utf8"))).toMatchObject({ source, destination: row.destination, id: row.id, state: "prepared" });
   if (process.platform !== "win32") expect(fs.statSync(row.container).mode & 0o777).toBe(0o700);
   expect(fs.existsSync(source)).toBe(false);
@@ -114,29 +114,220 @@ const seedRawTrace = (directory: string): Map<string, Buffer> => {
   return files;
 };
 
-/** Opt-in owned-fixture COPY before any command/global teardown, never inode custody. */
-const exportOwnedFixtures = (): void => {
-  const evidence = process.env.PI_TEST_EVIDENCE_DIR;
-  if (!evidence) return;
-  fs.mkdirSync(evidence, { recursive: true });
-  for (const source of roots) {
-    let bytes = 0;
-    const inventory = (base: string): Array<{ path: string; sha256?: string }> => {
-      const rows: Array<{ path: string; sha256?: string }> = [];
-      const walk = (relative: string): void => {
-        const file = path.join(base, relative), stat = fs.lstatSync(file);
-        if (rows.length >= 5_000 || stat.isSymbolicLink() || (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1))) throw new Error(`Unsafe prompt fixture export: ${file}`);
-        if (stat.isDirectory()) { rows.push({ path: relative }); for (const name of fs.readdirSync(file).sort()) walk(path.join(relative, name)); }
-        else { if ((bytes += stat.size) > 96 * 1024 * 1024) throw new Error("Prompt fixture export bound exceeded"); rows.push({ path: relative, sha256: hash(fs.readFileSync(file)) }); }
-      };
-      walk(""); return rows;
-    };
-    const before = inventory(source), destination = fs.mkdtempSync(path.join(evidence, "prompt-"));
-    fs.cpSync(source, path.join(destination, "tree"), { recursive: true, dereference: false });
-    expect(inventory(source)).toEqual(before);
-    expect(inventory(path.join(destination, "tree"))).toEqual(before);
-    fs.writeFileSync(path.join(destination, "export.json"), JSON.stringify({ source, destination: path.join(destination, "tree"), method: "pre-teardown copy; SHA256 independent readback; no inode claim", entries: before }));
+type TerminalControl = "stopped" | "cancelled" | "timed_out";
+type RawEntry = { kind: "directory" | "file"; dev: bigint; ino: bigint; mode: number; bytes?: Buffer };
+type RawTree = Map<string, RawEntry>;
+
+// Full inventory, including empty directories and every opaque/raw artifact.
+// Native identity is asserted here, not inferred from an exported evidence COPY.
+const snapshotRawTree = (directory: string): RawTree => {
+  expect(fs.realpathSync(directory)).toBe(path.resolve(directory));
+  const entries: RawTree = new Map();
+  const walk = (relative: string): void => {
+    const file = path.join(directory, relative), stat = fs.lstatSync(file, { bigint: true });
+    expect(stat.isSymbolicLink(), relative).toBe(false);
+    expect(stat.isDirectory() || (stat.isFile() && stat.nlink === 1n), relative).toBe(true);
+    entries.set(relative, { kind: stat.isDirectory() ? "directory" : "file", dev: stat.dev, ino: stat.ino,
+      mode: Number(stat.mode & 0o777n), ...(stat.isFile() ? { bytes: fs.readFileSync(file) } : {}) });
+    if (stat.isDirectory()) for (const name of fs.readdirSync(file).sort()) walk(path.join(relative, name));
+  };
+  walk("");
+  return entries;
+};
+// close re-joins explicit/deadline stop intent and may atomically republish
+// byte-identical status before custody. Bind that actual publication's stage
+// inode to its destination; never exempt status bytes or identity at the move.
+const observeStatusPublication = (directory: string, raw: RawTree, rename: typeof fs.renameSync) => {
+  const observations: Array<{ previous: RawEntry; stage: fs.BigIntStats; bytes: Buffer; published: fs.BigIntStats }> = [];
+  const errors: unknown[] = [];
+  const observedRename: typeof fs.renameSync = (source, destination) => {
+    if (String(destination) !== path.join(directory, "status.json")) return rename(source, destination);
+    try {
+      const previous = raw.get("status.json")!, stage = fs.lstatSync(source, { bigint: true }), bytes = fs.readFileSync(source);
+      rename(source, destination);
+      const published = fs.lstatSync(destination, { bigint: true });
+      observations.push({ previous, stage, bytes, published });
+      raw.set("status.json", { ...previous, dev: stage.dev, ino: stage.ino });
+    } catch (error) { errors.push(error); throw error; }
+  };
+  return { rename: observedRename, verify: () => {
+    // Assert OUTSIDE product close's allSettled/catch paths: an observer failure
+    // must never disappear into a swallowed shutdown error.
+    expect(errors).toEqual([]);
+    for (const { previous, stage, bytes, published } of observations) {
+      expect(stage.isFile() && !stage.isSymbolicLink() && stage.nlink === 1n).toBe(true);
+      expect(bytes).toEqual(previous.bytes);
+      expect(Number(stage.mode & 0o777n)).toBe(previous.mode);
+      expect(stage.dev).toBe(previous.dev);
+      expect({ dev: published.dev, ino: published.ino }).toEqual({ dev: stage.dev, ino: stage.ino });
+    }
+  } };
+};
+const expectRawTree = (directory: string, expected: RawTree): void => {
+  const actual = snapshotRawTree(directory);
+  expect([...actual.keys()]).toEqual([...expected.keys()]);
+  for (const [relative, entry] of expected) expect(actual.get(relative), relative).toEqual(entry);
+};
+const expectArchivedRaw = (source: string, raw: RawTree): string => {
+  const held = heldRoot(source);
+  expectRawTree(held, raw);
+  expect(path.relative(source, held).startsWith(`..${path.sep}`)).toBe(true);
+  // Independently walk real ancestors, rather than trusting a mocked archive path.
+  for (let current = held; ; current = path.dirname(current)) {
+    expect(fs.existsSync(path.join(current, ".git")), current).toBe(false);
+    if (path.dirname(current) === current) break;
   }
+  return held;
+};
+const expectNoRemoval = (directory: string): void => {
+  const within = (target: string) => target === directory || target.startsWith(directory + path.sep);
+  expect(removalIntents.filter(within)).toEqual([]);
+  expect(sweepIntents.filter(within)).toEqual([]);
+};
+const expectTerminalPrompt = (manager: AgentManager, id: string, directory: string, prompt: string, terminal: string): void => {
+  const taskPath = path.join(directory, "task.txt");
+  expect(fs.readFileSync(retainedPath(taskPath), "utf8")).toBe(prompt);
+  expect(savedStatus(taskPath)).toMatchObject({ id, status: terminal, task: prompt,
+    promptSha256: hash(prompt), promptBytes: Buffer.byteLength(prompt), inputSha256: hash(prompt), inputBytes: Buffer.byteLength(prompt) });
+  expect(savedStatus(taskPath).promptRetentionDropped).toBeUndefined();
+  expect(JSON.parse(fs.readFileSync(retainedPath(path.join(directory, "manager-result.json")), "utf8"))).toMatchObject({ id, status: terminal, task: prompt });
+  expect(manager.status(id)).toMatchObject({ id, status: terminal });
+  expect(manager.listForUi().some(record => record.id === id)).toBe(true);
+};
+const terminalFixture = async (outcome: TerminalControl) => {
+  const consumed = vi.fn();
+  const { manager } = fixture(outcome === "timed_out" ? { timeoutMs: 1_500 } : {}, false, consumed);
+  const controller = new AbortController();
+  const prompt = `HANG until ${outcome}: current brief π\n`;
+  const handle = await manager.spawn({ name: "terminal control", task: prompt, transport: "process" }, controller.signal);
+  const terminal = outcome === "timed_out" ? "timed_out" : "stopped";
+  if (outcome === "stopped") await expect(manager.stop(handle.id)).resolves.toMatchObject({ status: terminal });
+  else {
+    if (outcome === "cancelled") controller.abort(new Error("cancel terminal control"));
+    await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: terminal });
+  }
+  const directory = manager.runDirectory(handle.id)!;
+  seedRawTrace(directory);
+  // Keep a lifecycle byte control even if this worker emitted no lifecycle rows.
+  if (!fs.existsSync(path.join(directory, "lifecycle.jsonl"))) fs.writeFileSync(path.join(directory, "lifecycle.jsonl"), '{"rawLifecycleControl":true}\n', { mode: 0o600 });
+  for (const name of ["task.txt", "status.json", "manager-result.json", "events.jsonl", "lifecycle.jsonl", "session.NdJsOn.backup"]) {
+    expect(fs.lstatSync(path.join(directory, name)).isFile(), name).toBe(true);
+  }
+  consumed.mockClear(); // Observation above is not cleanup consumption.
+  return { manager, handle, directory, prompt, terminal, consumed };
+};
+
+const openDescriptorCustody = async (outcome: TerminalControl, injected: boolean): Promise<void> => {
+  const { manager, handle, directory, prompt, terminal, consumed } = await terminalFixture(outcome);
+  const traceName = "session.NdJsOn.backup", trace = path.join(directory, traceName);
+  const raw = snapshotRawTree(directory), descriptor = fs.openSync(trace, "a");
+  const pin = fs.fstatSync(descriptor, { bigint: true });
+  expect({ dev: pin.dev, ino: pin.ino }).toEqual({ dev: raw.get(traceName)!.dev, ino: raw.get(traceName)!.ino });
+  const statusPublication = observeStatusPublication(directory, raw, fs.renameSync.bind(fs));
+  const rename = statusPublication.rename;
+  let blocked = injected, fdOpen = true;
+  const attempts: Array<{ destination: string; error?: unknown }> = [];
+  // Native case is a pass-through observer. Fault injection changes ONLY the
+  // exact admitted source rename, never preparation, result auth, or retry.
+  const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+    if (String(source) !== directory) return rename(source, destination);
+    const attempt: { destination: string; error?: unknown } = { destination: String(destination) };
+    attempts.push(attempt);
+    try {
+      if (blocked) throw Object.assign(new Error("injected open-FD custody refusal"), { code: "EPERM" });
+      rename(source, destination);
+    } catch (error) { attempt.error = error; throw error; }
+  });
+  try {
+    removalIntents.splice(0);
+    await expect(manager.close()).resolves.toBeUndefined(); // NOT a cleaned receipt.
+    statusPublication.verify();
+    expect(attempts).toHaveLength(1);
+    const attempt = attempts[0]!;
+    const tail = Buffer.from("late FD tail");
+    fs.writeSync(descriptor, tail);
+    expect({ dev: fs.fstatSync(descriptor, { bigint: true }).dev, ino: fs.fstatSync(descriptor, { bigint: true }).ino }).toEqual({ dev: pin.dev, ino: pin.ino });
+    raw.get(traceName)!.bytes = Buffer.concat([raw.get(traceName)!.bytes!, tail]);
+    if (attempt.error === undefined) {
+      expect(injected).toBe(false);
+      const held = expectArchivedRaw(directory, raw);
+      expect(path.join(held, traceName)).toBe(fs.realpathSync(path.join(held, traceName)));
+      expect(fs.readFileSync(path.join(held, traceName))).toEqual(raw.get(traceName)!.bytes);
+      expectTerminalPrompt(manager, handle.id, directory, prompt, terminal);
+    } else {
+      // No OS assumption: only an actual observed EPERM can enter this branch.
+      expect(attempt.error).toMatchObject({ code: "EPERM" });
+      expect(custodyMoves.filter(move => move.source === directory)).toEqual([]);
+      const container = path.dirname(attempt.destination);
+      const prepared = JSON.parse(fs.readFileSync(path.join(container, "custody.prepared.json"), "utf8"));
+      const failed = JSON.parse(fs.readFileSync(path.join(container, "custody.json"), "utf8"));
+      expect(prepared).toMatchObject({ format: 1, id: handle.id, source: directory, destination: attempt.destination, state: "prepared", reason: expect.any(String), time: expect.any(Number) });
+      expect(failed).toMatchObject({ ...prepared, time: expect.any(Number), state: "rename-failed", error: expect.stringContaining(injected ? "injected open-FD custody refusal" : "EPERM") });
+      expect(fs.existsSync(attempt.destination)).toBe(false); // No copied shadow.
+      expectRawTree(directory, raw); // Full original + live-FD tail, not a shadow.
+      expectTerminalPrompt(manager, handle.id, directory, prompt, terminal);
+      expect(manager.readLog(handle.id).status).toMatchObject({ id: handle.id, status: terminal, task: prompt });
+      expect(consumed).not.toHaveBeenCalled();
+      expectNoRemoval(directory);
+      exportRawTree(directory, `failed-${outcome}`);
+      exportRawTree(container, `refusal-receipts-${outcome}`);
+
+      // close() is cached. The explicitly authorized retry is public cleanup,
+      // and it must archive the SAME original after the fixture FD is released.
+      fs.closeSync(descriptor); fdOpen = false; blocked = false;
+      const beforeConsume = vi.fn(() => {
+        expectArchivedRaw(directory, raw);
+        expectTerminalPrompt(manager, handle.id, directory, prompt, terminal);
+      });
+      await expect(manager.cleanup(handle.id, false, beforeConsume)).resolves.toEqual({ cleaned: true });
+      statusPublication.verify();
+      expect(attempts).toHaveLength(2);
+      expect(attempts[1]!.error).toBeUndefined();
+      expect(beforeConsume).toHaveBeenCalledTimes(1);
+      expectArchivedRaw(directory, raw);
+      // Earlier refusal preparation remains immutable after retry succeeds.
+      expect(JSON.parse(fs.readFileSync(path.join(container, "custody.prepared.json"), "utf8"))).toEqual(prepared);
+      expect(JSON.parse(fs.readFileSync(path.join(container, "custody.json"), "utf8"))).toEqual(failed);
+      expect(consumed).toHaveBeenCalledTimes(1);
+    }
+    expectNoRemoval(directory);
+    exportRawTree(path.dirname(retainedPath(path.join(directory, "task.txt"))), `complete-${outcome}`);
+  } finally {
+    if (fdOpen) fs.closeSync(descriptor);
+    renameSpy.mockRestore();
+  }
+};
+
+/** Opt-in owned-fixture COPY before any command/global teardown, never inode custody. */
+const exportRawTree = (source: string, label: string): void => {
+  const evidence = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
+  if (!evidence) return;
+  const relative = path.relative(nativeTempRoot, evidence);
+  if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw new Error("Prompt evidence must stage inside inherited owned TMPDIR");
+  fs.mkdirSync(evidence, { recursive: true });
+  const inventory = (base: string): Array<{ path: string; kind: string; sha256?: string }> => {
+    let bytes = 0;
+    const rows: Array<{ path: string; kind: string; sha256?: string }> = [];
+    const walk = (relative: string): void => {
+      const file = path.join(base, relative), stat = fs.lstatSync(file);
+      if (rows.length >= 5_000 || stat.isSymbolicLink() || (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1))) throw new Error(`Unsafe prompt fixture export: ${file}`);
+      if (stat.isDirectory()) { rows.push({ path: relative, kind: "directory" }); for (const name of fs.readdirSync(file).sort()) walk(path.join(relative, name)); }
+      else { if ((bytes += stat.size) > 96 * 1024 * 1024) throw new Error("Prompt fixture export bound exceeded"); rows.push({ path: relative, kind: "file", sha256: hash(fs.readFileSync(file)) }); }
+    };
+    walk(""); return rows;
+  };
+  const before = inventory(source), destination = fs.mkdtempSync(path.join(evidence, `${label}-`));
+  const identities = before.map(row => {
+    const stat = fs.lstatSync(path.join(source, row.path), { bigint: true });
+    return { path: row.path, dev: String(stat.dev), ino: String(stat.ino), mode: Number(stat.mode & 0o777n) };
+  });
+  fs.cpSync(source, path.join(destination, "tree"), { recursive: true, dereference: false });
+  expect(inventory(source)).toEqual(before);
+  expect(inventory(path.join(destination, "tree"))).toEqual(before);
+  fs.writeFileSync(path.join(destination, "export.json"), JSON.stringify({ source, destination: path.join(destination, "tree"), test: expect.getState().currentTestName, platform: process.platform, method: "pre-teardown copy; SHA256 independent readback; no inode claim", entries: before, sourceNativeIdentities: identities }));
+};
+const exportOwnedFixtures = (): void => {
+  for (const source of roots) exportRawTree(source, "prompt");
 };
 
 afterEach(async () => {
@@ -197,35 +388,32 @@ describe("Agent prompt retention at manager close (#11663)", () => {
     expect(() => manager.listForUi()).not.toThrow();
   });
 
-  // Stop, AbortSignal cancellation and deadline all use the same managed
-  // terminal retention path; the real prompt verifier is never mocked.
-  it.each(["stopped", "cancelled", "timed_out"] as const)("archives the whole verified current run after %s", async (outcome) => {
-    const { manager } = fixture(outcome === "timed_out" ? { timeoutMs: 1_500 } : {});
-    const controller = new AbortController();
-    const prompt = `HANG until ${outcome}: current brief π\n`;
-    const handle = await manager.spawn({ name: "terminal control", task: prompt, transport: "process" }, controller.signal);
-    const terminal = outcome === "timed_out" ? "timed_out" : "stopped";
-    if (outcome === "stopped") await expect(manager.stop(handle.id)).resolves.toMatchObject({ status: terminal });
-    else {
-      if (outcome === "cancelled") controller.abort(new Error("cancel terminal control"));
-      await expect(manager.wait(handle.id)).resolves.toMatchObject({ status: terminal });
-    }
-    const directory = manager.runDirectory(handle.id)!;
-    const taskPath = path.join(directory, "task.txt");
-    const files = seedRawTrace(directory), inode = fs.statSync(directory).ino;
-    const fd = fs.openSync(path.join(directory, "session.NdJsOn.backup"), "a");
+  // Separate unconditional whole-root success from the native open-handle
+  // boundary. A native refusal is retained evidence, NEVER a successful move.
+  it.each(["stopped", "cancelled", "timed_out"] as const)("archives the whole verified current run after %s with fixture descriptors closed", async outcome => {
+    const { manager, handle, directory, prompt, terminal } = await terminalFixture(outcome);
+    const trace = path.join(directory, "session.NdJsOn.backup");
+    const fd = fs.openSync(trace, "a");
+    try { fs.writeSync(fd, "closed FD control tail"); } finally { fs.closeSync(fd); }
+    const raw = snapshotRawTree(directory);
+    const statusPublication = observeStatusPublication(directory, raw, fs.renameSync.bind(fs));
+    const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation(statusPublication.rename);
     removalIntents.splice(0);
-    await manager.close();
-    try { fs.writeSync(fd, "late FD tail"); } finally { fs.closeSync(fd); }
-    files.set("session.NdJsOn.backup", Buffer.concat([files.get("session.NdJsOn.backup")!, Buffer.from("late FD tail")]));
-    expectWholeRun(directory, files, inode);
-    expect(removalIntents).not.toContain(directory);
-    expect(removalIntents).not.toContain(taskPath);
-    expect(removalIntents).not.toContain(path.join(directory, "status.json"));
-    expect(fs.readFileSync(retainedPath(taskPath), "utf8")).toBe(prompt);
-    expect(savedStatus(taskPath)).toMatchObject({ status: terminal, promptSha256: hash(prompt), promptBytes: Buffer.byteLength(prompt), inputSha256: hash(prompt), inputBytes: Buffer.byteLength(prompt) });
-    expect(savedStatus(taskPath).promptRetentionDropped).toBeUndefined();
-    expect(savedStatus(taskPath).task).toBe(prompt);
+    try { await expect(manager.close()).resolves.toBeUndefined(); } finally { renameSpy.mockRestore(); }
+    statusPublication.verify();
+    expectArchivedRaw(directory, raw);
+    expectTerminalPrompt(manager, handle.id, directory, prompt, terminal);
+    expectNoRemoval(directory);
+  });
+
+  it.each(["stopped", "cancelled", "timed_out"] as const)("preserves native open-FD custody after %s without copy or deletion", async outcome => {
+    await openDescriptorCustody(outcome, false);
+  });
+
+  // Labeled nonnative fault injection: the real helper still prepares receipts,
+  // refuses, and explicitly retries through public manager.cleanup on every OS.
+  it.each(["stopped", "cancelled", "timed_out"] as const)("retains injected EPERM evidence after %s until explicit closed-FD cleanup retry", async outcome => {
+    await openDescriptorCustody(outcome, true);
   });
 
   // A live worker closes with checked ESRCH and a retained pair. Never-admitted

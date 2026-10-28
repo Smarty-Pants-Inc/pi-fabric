@@ -120,6 +120,9 @@ const MAX_CONTROL_TIMEOUT_MS = 24 * 60 * 60 * 1_000 + 60_000;
 // without this grace a delivered command was reported as timed out and then retried
 // (smarty-dev#367). A command not admitted by the deadline is acknowledged as expired.
 const MAX_CONTROL_ACK_GRACE_MS = 15_000;
+// Published cross-machine messages get one final proof-only observation window. Ordinary
+// late outcomes remain unknown; only an authenticated notRun rejection can authorize resend.
+const LATE_CONTROL_CONFIRMATION_GRACE_MS = 5_000;
 // A bridged request must cover queueing on both hosts and the transport, not just a local poll.
 const MIN_BRIDGE_CONTROL_TIMEOUT_MS = 30_000;
 // Records other hosts left in the shared state before smarty-dev#643 are checked this often.
@@ -550,6 +553,7 @@ interface PendingControlRequest {
   readonly relayHub?: string;
   cancellationRequested?: boolean;
   cancellationPublished?: boolean;
+  lateConfirmation?: "eligible" | "waiting";
   mirroredOwner?: MirroredControlOwner;
   signal?: AbortSignal;
   onAbort?: () => void;
@@ -995,7 +999,20 @@ export class FabricControlPlane {
       // Attempt 1 has a stable sub-key, and is reachable only after proof attempt 0
       // never ran. An external same-key retry re-observes 0, then the same 1 claim.
       notRunAttempt = 1;
-      sent = await send(delayMs);
+      const logResend = (outcome: string): void => {
+        if (this.#transport.kind === "nats" ? natsOwner?.machine === this.#transport.self.machine : typeof destination.remoteHost !== "string") return;
+        try {
+          diagnostics.warn("src/topology/control-plane.ts", `[pi-fabric] Control notRun resend operation=${operation} target=${JSON.stringify(targetId)} attempt=1 outcome=${outcome}`);
+        } catch { /* Diagnostics cannot change delivery or retry custody. */ }
+      };
+      logResend("retry");
+      try {
+        sent = await send(delayMs);
+        logResend("accepted");
+      } catch (retryError) {
+        logResend(retryError instanceof FabricControlRejection ? retryError.notRun ? "not-run" : "rejected" : "unknown");
+        throw retryError;
+      }
     }
     const { commandId, acceptance } = sent;
     return {
@@ -1065,7 +1082,7 @@ export class FabricControlPlane {
   ): Promise<{ commandId: string; acceptance: FabricControlAcceptance }> {
     if (this.#transport.kind === "nats") {
       return this.#requestNatsAcceptance(ownerHostId, targetId, operation, input, ownerIdentityId,
-        options, retryBudgetSpentMs, notRunAttempt, requestCreatedAt, natsOwner);
+        options, retryBudgetSpentMs, notRunAttempt, requestCreatedAt, natsOwner, messageRequest);
     }
     if (this.#closed) throw new Error("Fabric control plane closed");
     if (!this.options.enabled) {
@@ -1212,6 +1229,9 @@ export class FabricControlPlane {
     // In particular, the 30s bridge floor must not erase the spent retry budget.
     const timeoutMs = Math.max(this.#pollMs * 4, originalTimeoutMs - retryBudgetSpentMs);
     const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
+    // Each proven-notRun attempt gets its own bounded sender wait. The immutable
+    // logical origin can predate this admission by a fully spent attempt and grace.
+    const admissionDeadlineAt = Date.now() + timeoutMs + ackGraceMs;
     let pendingRequest: PendingControlRequest;
     let skipPublication = false;
     let publishedEvent: MeshEvent | undefined;
@@ -1240,6 +1260,8 @@ export class FabricControlPlane {
         ...(readOwnerExpiry && messageRequest ? { readOwnerExpiry } : {}),
         ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
         ...(mirroredOwner ? { mirroredOwner: { ...mirroredOwner } } : {}),
+        ...(messageRequest && mirroredOwner && typeof destinationRemoteHost === "string" &&
+          (operation === "steer" || operation === "followUp") ? { lateConfirmation: "eligible" as const } : {}),
       };
       pendingRequest = pending;
       this.#pending.set(commandId, pending);
@@ -1266,7 +1288,7 @@ export class FabricControlPlane {
         if (messageRequest && (operation === "steer" || operation === "followUp")) {
           // The finite admission budget includes the bridge window and return-leg ACK grace.
           // It is not refreshed by lease renewal, nor reset by a late publish.
-          pending.timer = setTimeout(() => this.#timeoutPending(commandId), timeoutMs + ackGraceMs);
+          pending.timer = setTimeout(() => this.#timeoutPending(commandId), Math.max(0, admissionDeadlineAt - Date.now()));
           pending.timer.unref();
         }
         this.#startLeaseWatchdog();
@@ -1348,8 +1370,9 @@ export class FabricControlPlane {
           pending.signal.addEventListener("abort", pending.onAbort, { once: true });
           if (pending.signal.aborted) { pending.onAbort(); pending.signal.throwIfAborted(); }
         }
-        // Keep the original admission/ACK bound, rather than restarting it after renewal.
-        const remaining = Math.max(0, timeoutMs + ackGraceMs - (Date.now() - requestCreatedAt));
+        // Preserve this attempt's admission/ACK bound, charging time spent waiting
+        // for the publication lock and renewal, not the earlier logical attempt.
+        const remaining = Math.max(0, admissionDeadlineAt - Date.now());
         pending.timer = setTimeout(() => this.#timeoutPending(commandId), remaining);
         pending.timer.unref();
         this.#startLeaseWatchdog();
@@ -1406,6 +1429,15 @@ export class FabricControlPlane {
   }
 
   #timeoutPending(commandId: string): void {
+    const pending = this.#pending.get(commandId);
+    if (pending?.lateConfirmation === "eligible" && pending.commandPublished) {
+      // Keep the original authority, abort listener and lease watchdog. This one-shot
+      // grace observes proof only; neither renewal nor an ordinary ACK restarts it.
+      pending.lateConfirmation = "waiting";
+      pending.timer = setTimeout(() => this.#timeoutPending(commandId), LATE_CONTROL_CONFIRMATION_GRACE_MS);
+      pending.timer.unref();
+      return;
+    }
     const timedOut = this.#clearPending(commandId);
     if (!timedOut) return;
     if (timedOut.readOwnerExpiry) {
@@ -2105,6 +2137,12 @@ export class FabricControlPlane {
 
   #settleAcknowledgement(commandId: string, pending: PendingControlRequest, data: Record<string, unknown>): void {
     if (this.#pending.get(commandId) !== pending) return;
+    if (pending.lateConfirmation === "waiting" && !(data.accepted === false && data.notRun === true)) {
+      // Crossing the ordinary ACK bound already made this attempt unknown. A late
+      // executed outcome is not proof of non-delivery and must never rescue or resend it.
+      this.#timeoutPending(commandId);
+      return;
+    }
     this.#clearPending(commandId);
     pending.resolve(this.#acknowledgementAcceptance(data, pending));
   }
@@ -2161,7 +2199,7 @@ export class FabricControlPlane {
   async #requestNatsAcceptance(
     ownerHostId: string, targetId: string, operation: FabricControlOperation, input: FabricControlInput,
     ownerIdentityId: string, options: FabricControlRequestOptions, retryBudgetSpentMs: number,
-    notRunAttempt: number, requestCreatedAt: number, captured?: Readonly<ParticipantRoute>,
+    notRunAttempt: number, requestCreatedAt: number, captured?: Readonly<ParticipantRoute>, messageRequest = false,
   ): Promise<{ commandId: string; acceptance: FabricControlAcceptance }> {
     assertSteerPriority(input.priority, operation);
     if (this.#closed) throw new Error("Fabric control plane closed");
@@ -2201,7 +2239,9 @@ export class FabricControlPlane {
     const acceptance = new Promise<FabricControlAcceptance>((resolve, reject) => {
       pending = { resolve, reject, ownerHostId: owner.ownerHostId, ownerIdentityId: owner.ownerIdentityId,
         ownerMachine: owner.machine, ownerIncarnation: owner.ownerIncarnation, operation, targetId,
-        commandPublished: false, requestCreatedAt, idempotencyKey, bodyFingerprint, commandEventId };
+        commandPublished: false, requestCreatedAt, idempotencyKey, bodyFingerprint, commandEventId,
+        ...(messageRequest && owner.machine !== this.#transport.self.machine &&
+          (operation === "steer" || operation === "followUp") ? { lateConfirmation: "eligible" as const } : {}) };
       this.#pending.set(commandId, pending);
       pending.timer = setTimeout(() => this.#timeoutPending(commandId), timeoutMs + ackGraceMs);
       pending.timer.unref();

@@ -11227,14 +11227,20 @@ export class ActorManager {
       ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status;
   }
 
-  #health(actor: ManagedActor, status: FabricActorStatus, blockExpired: boolean): FabricActorHealth {
+  #health(actor: ManagedActor, status: FabricActorStatus, blockExpired: boolean, forPublication = false): FabricActorHealth {
     const run = actor.inFlightRun;
-    const evidence = this.agents.actorHealthEvidence(actor.id, run?.id);
-    const health: FabricActorHealth = { state: "unknown", lastProgressAt: evidence.lastProgressAt };
+    const health: FabricActorHealth = { state: "unknown", lastProgressAt: null };
     try {
-      // A cached registry row is not a live-owner assertion. Keep publication/release fences observational.
-      if (this.#closing || this.#releasePaused || this.#canConsumeMesh?.({ refresh: false }) === false ||
-        !this.#ownershipDecision(actor.id, true, true)) return health;
+      const evidence = this.agents.actorHealthEvidence(actor.id, run?.id);
+      health.lastProgressAt = evidence.lastProgressAt;
+      // Reads need current admission and live ownership. Publication instead carries
+      // execution evidence under its registry/host fence: its successful commit
+      // renews admission, and readers must validate that owner lease. Feeding the
+      // previous heartbeat/release gate into its own payload makes unchanged actors
+      // oscillate between healthy/stale and unknown on renewal or recovery.
+      if (this.#closing || (!forPublication && (this.#releasePaused ||
+        this.#canConsumeMesh?.({ refresh: false }) === false)) ||
+        !this.#ownershipDecision(actor.id, true, !forPublication)) return health;
       if (actor.removal || (actor.activationBlocked && !blockExpired) || status === "stopped" ||
         status === "failed" || status === "failing-preparation" || status === "dormant") {
         health.state = "stale";
@@ -11278,7 +11284,7 @@ export class ActorManager {
       // Failed is a routing view, not a destructive stop: retained events and
       // explicit repair/probe asks can still run. Success clears the durable streak.
       status,
-      health: this.#health(actor, status, blockExpired),
+      health: this.#health(actor, status, blockExpired, registryView),
       ...(actor.status === "stopped" && actor.stopReason ? { stopReason: actor.stopReason } : {}),
       ...(actor.preparing ? { preparing: { ...actor.preparing,
         ageS: Math.max(0, Math.round((Date.now() - actor.preparing.startedAt) / 1_000)),

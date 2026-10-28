@@ -823,7 +823,7 @@ export class ResidentHost {
       {
         // Restoration must not launch queued work until owner and readiness publication commit.
         releasePaused: true,
-        canConsumeMesh: () => this.#ready && (transport ? participants : this.participants).canConsumeMesh(),
+        canConsumeMesh: options => this.#ready && (transport ? participants : this.participants).canConsumeMesh(undefined, options),
         presencePublisher: { refresh: async () => {
           try {
             await (transport ? participants : this.participants).refreshPresence();

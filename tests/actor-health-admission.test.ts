@@ -81,6 +81,13 @@ it("reads lapsed owner admission without maintenance while ordinary consumption 
     expect(participants.confirmedAt()).toBe(before);
     expect(mesh.tail(0, 100).events).toEqual(eventsBefore);
 
+    // Publication carries execution evidence for its next fenced commit, not
+    // the previous heartbeat's admission. It must not renew while preparing it.
+    expect(actors.listOwned(true)[0]?.health).toEqual({ state: "healthy", lastProgressAt: null });
+    expect(refresh).not.toHaveBeenCalled();
+    expect(admission).not.toHaveBeenCalled();
+    expect(await provider.invoke("actorHealth", { id: actor.id }, context)).toEqual(result);
+
     // The explicit read option is pure even outside the provider's observation
     // scope. Inside that scope even an older callback that ignores the option
     // must not start admission maintenance.

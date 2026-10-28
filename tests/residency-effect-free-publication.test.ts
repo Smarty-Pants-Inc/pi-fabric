@@ -365,6 +365,22 @@ describe("effect-free resident publication (#8526)", () => {
     } finally { await f.close(); }
   });
 
+  it.each(modes)("resident health inspects lapsed admission without starting maintenance ($backend files=$files)", async ({ files, backend }) => {
+    const f = await fixture(files, backend);
+    try {
+      const actor = await f.host.actors.create({ name: "health-read", instructions: "wait", residency: "durable" });
+      await f.host.participants.refresh();
+      const before = f.host.participants.confirmedAt();
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + 10_001);
+      const refresh = vi.spyOn(f.host.participants, "refresh");
+      const admission = vi.spyOn(f.host.participants, "controlAdmission");
+      expect(f.host.actors.readHealth(actor.id)[0]?.health).toEqual({ state: "unknown", lastProgressAt: null });
+      expect(refresh).not.toHaveBeenCalled();
+      expect(admission).not.toHaveBeenCalled();
+      expect(f.host.participants.confirmedAt()).toBe(before);
+    } finally { await f.close(); }
+  });
+
   it.each(modes)("the first hourly heartbeat leaves stopped actor envelopes unchanged ($backend files=$files)", async ({ files, backend }) => {
     const f = await fixture(files, backend);
     try {

@@ -121,6 +121,15 @@ const statusRecord = (file: string): Record<string, unknown> =>
   JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
 
 describe("owner-derived actor health", () => {
+  it("keeps actor creation and status usable when health evidence is unavailable", async () => {
+    const state = setup();
+    vi.spyOn(state.agents, "actorHealthEvidence").mockImplementation(() => { throw new Error("unreadable evidence"); });
+    const actor = await createActor(state, "unavailable health evidence");
+    expect(actor.health).toEqual({ state: "unknown", lastProgressAt: null });
+    expect(state.actors.status(actor.id)).toMatchObject({ id: actor.id, status: "idle", health: actor.health });
+    expect(state.actors.listOwned()).toHaveLength(1);
+  });
+
   it("keeps a silent live worker healthy without advancing progress on reads or config edits", async () => {
     const state = setup();
     const actor = await createActor(state, "silent health probe");

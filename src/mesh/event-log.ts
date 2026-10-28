@@ -1171,6 +1171,20 @@ export class EventLog {
     return this.#cloned(archive.readAfter(Math.max(after, first - 1), this.#readLastEventSequence(), () => true, 1)[0]);
   }
 
+  /** Archive-authoritative next-event lookup, yielding during archived-history scans. */
+  async nextEventAfterAsync(after: number): Promise<MeshEvent | undefined> {
+    const archive = MeshArchive.fromRoot(this.root);
+    const first = archive?.firstSequence();
+    if (!archive || first === undefined) return this.#cloned(this.#readEventsAfter(after, {}, 1)[0]);
+    if (after + 1 < first) {
+      const live = this.#readEventsAfter(after, {}, 1)[0];
+      if (live && live.sequence < first) return this.#cloned(live);
+    }
+    return this.#cloned((await archive.readAfterAsync(
+      Math.max(after, first - 1), this.#readLastEventSequence(), () => true, 1,
+    ))[0]);
+  }
+
   #cloned(event: MeshEvent | undefined): MeshEvent | undefined {
     return event ? jsonClone(event) : undefined;
   }

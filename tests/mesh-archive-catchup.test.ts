@@ -737,6 +737,73 @@ describe("real MeshStore → StoreBridgeSide archived catch-up", () => {
     if (method === "tail") expect(offset).toBe(f.store.latestOffset());
   });
 
+  it.each(["stale", "same"] as const)("cold saved-offset tail yields and preserves every archived event across a %s generation rename", async generation => {
+    const f = archivedStore();
+    const live = path.join(f.root, "events.jsonl");
+    // Persist a real byte boundary after 2037 in the pre-compaction live log.
+    fs.writeFileSync(live, f.events.slice(2036).map(value => JSON.stringify(value) + "\n").join(""));
+    const saved = { after: 2037, offset: f.store.tail(0, 1).nextOffset };
+    const cursor = path.join(f.root, "saved-tail.json");
+    fs.writeFileSync(cursor, JSON.stringify(saved));
+    exact(await f.store.readAsync({ after: saved.after, limit: 1 }), [f.events[2037]!]);
+    // Actual compaction rename; the same-generation case pauses before the gen write.
+    const replacement = `${live}.compacted`;
+    fs.writeFileSync(replacement, f.events.slice(-8).map(value => JSON.stringify(value) + "\n").join(""));
+    fs.renameSync(replacement, live);
+    if (generation === "stale") fs.writeFileSync(path.join(f.root, "generation"), "1");
+    expect(saved.offset).toBeLessThan(fs.statSync(live).size); // no truncation-only escape
+    vi.spyOn(MeshArchive.prototype, "readAfter").mockImplementation(() => { throw new Error("saved-offset tail cold-scanned synchronously"); });
+    vi.spyOn(f.store, "nextEventAfter").mockImplementation(() => { throw new Error("tail used sync lookup"); });
+    const lookup = vi.spyOn(f.store, "nextEventAfterAsync");
+    // Independent inbound progress can be at head: startup does not warm this archive.
+    expect(await f.side.bridgedIds(f.through)).toEqual({ ids: [], through: f.through, done: true });
+    let { after, offset } = JSON.parse(fs.readFileSync(cursor, "utf8")) as typeof saved;
+    let yielded = false;
+    const heartbeat = new Promise<void>(resolve => setImmediate(() => { yielded = true; resolve(); }));
+    const first = await f.side.tail(after, offset);
+    expect(yielded).toBe(true);
+    await heartbeat;
+    expect(lookup).toHaveBeenCalledWith(saved.after);
+    expect(first.offset).toBeUndefined(); // never adopt the live suffix's byte cursor across the gap
+    const found: MeshEvent[] = [];
+    let page = first;
+    for (let pageNo = 0; pageNo < 60; pageNo++) {
+      const expected = f.events.slice(after, after + f.store.maxReadEvents);
+      exact(page.events, expected);
+      expect(page.skipped ?? []).toEqual([]);
+      expect(page.through).toBe(expected.at(-1)?.sequence ?? after);
+      found.push(...page.events);
+      after = page.through;
+      if (after === f.through) break;
+      page = await f.side.tail(after, page.offset);
+    }
+    exact(found, f.events.slice(saved.after));
+    expect(after).toBe(f.through);
+    expect(page.offset).toBe(f.store.latestOffset());
+  });
+
+  it.each(["absent", "empty", "starts-above-live"] as const)("async next-event lookup preserves sync authority and live fallback (%s archive)", async mode => {
+    const f = setup();
+    const live = [event(1), event(5), event(7)];
+    fs.writeFileSync(path.join(f.root, "events.jsonl"), live.map(value => JSON.stringify(value) + "\n").join(""));
+    fs.writeFileSync(path.join(f.root, "sequence"), "7");
+    if (mode !== "absent") fs.writeFileSync(path.join(f.root, MESH_ARCHIVE_CONFIG), JSON.stringify({ version: 1, dir: f.dir }));
+    if (mode === "starts-above-live") {
+      fs.writeFileSync(path.join(f.dir, "MESH.json"), JSON.stringify({ version: 1, firstSequence: 3, meshRoot: f.root }));
+      segment(f.dir, "2026/01/01", "fleet.work.catchup", [event(3), event(7)]);
+    }
+    const store = new MeshStore(f.root, 64 * 1024, 47, { stateBackend: "file" });
+    stores.push(store);
+    const cursors = [0, 1, 3, 5, 7];
+    const expected = cursors.map(after => store.nextEventAfter(after));
+    if (mode === "starts-above-live") expect(expected.map(value => value?.sequence)).toEqual([1, 3, 7, 7, undefined]);
+    vi.spyOn(MeshArchive.prototype, "readAfter").mockImplementation(() => { throw new Error("async lookup used sync archive"); });
+    for (const [index, after] of cursors.entries()) expect(await store.nextEventAfterAsync(after)).toEqual(expected[index]);
+    const detached = await store.nextEventAfterAsync(0);
+    detached!.text = "caller mutation";
+    expect(await store.nextEventAfterAsync(0)).toEqual(expected[0]);
+  });
+
   it("startup bridgedIds scans all archived pages asynchronously and returns exact origin/via ids", async () => {
     const f = archivedStore(true);
     const expected = legacyReadAfter(f.dir, 0, f.through, all, 5000).flatMap(value => {

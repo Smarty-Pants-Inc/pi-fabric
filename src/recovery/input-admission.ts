@@ -5,6 +5,7 @@ import { requireNamespaceBarrier, syncPathNamespaceDurable, writeJsonAtomic } fr
 import { copyFabricPrincipal, type FabricPrincipal } from "../host-compatibility.js";
 import type { FabricAgentMessageDelivery, FabricAgentMessageResult, FabricMainAgentDeliveryRequest, FabricSteerPriority, MainAgentController } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
+import type { MaintenanceLedgerEntry, RecoveryEpoch, RepairRef } from "./maintenance-admission.js";
 
 /** Opt-in wire metadata. deadlineAt is the ORIGINAL absolute Unix-millisecond deadline. */
 export interface ScriptedInput {
@@ -33,7 +34,11 @@ export interface PendingScriptedInput extends PreparedScriptedInput {
   targetId: string;
   published: boolean;
 }
-interface Binding { sessionId: string; root: string; mainAgent: InputAdmissionMainAgent }
+export interface Binding {
+  sessionId: string; root: string; mainAgent: InputAdmissionMainAgent;
+  /** REQUIRED-only owner supplied after B2/native positive single-writer exclusion. */
+  recovery?: RecoveryAdmissionOwner;
+}
 interface DeliveryPolicy {
   /** Required; no delivery default. triggerTurn alone defaults to true, as in native Main. */
   delivery: FabricAgentMessageDelivery;
@@ -319,6 +324,11 @@ export function admitScriptedInput(options: Binding & { request: FabricMainAgent
   if (metadata.sessionId !== options.sessionId) return fail("INVALID", "scriptedInput.sessionId does not match the receiving session");
   if (options.request.delivery !== "steer" && options.request.delivery !== "followUp") return fail("INVALID", "Scripted input delivery must be steer or followUp");
   const round = makeRound({ ...options.request, delivery: options.request.delivery, targetId: `session:${options.sessionId}`, data: options.request.data });
+  const recoveryBinding = bindings.get(options.sessionId);
+  if (recoveryBinding?.recovery) {
+    if (path.resolve(options.root) !== recoveryBinding.root || options.mainAgent !== recoveryBinding.mainAgent) return fail("INVALID", "Recovery admission must use the current bound root and Main");
+    return admitRecoveryRound(recoveryBinding, round);
+  }
   const file = recordPath(options.root, "receiver", round);
   const previous = load(file, "receiver");
   if (previous) sameRound(previous, round); // Conflict MUST precede the deadline check.
@@ -338,6 +348,10 @@ const bindings = new Map<string, Binding>();
 export function bindInputAdmission(options: Binding): () => void {
   validateBinding(options);
   if (bindings.has(options.sessionId)) return fail("ALREADY_BOUND", `Input admission already bound for session ${options.sessionId}`);
+  if (options.recovery) validateRecoveryOwner(options.recovery);
+  // This trusted native port may have prototype methods and a live epoch getter.
+  // Do not spread/snapshot it into a stale identity; only accepted capabilities carry
+  // detached full-epoch values. Each gate rereads the current native identity.
   const binding = { ...options, root: path.resolve(options.root) };
   bindings.set(options.sessionId, binding);
   return () => { if (bindings.get(binding.sessionId) === binding) bindings.delete(binding.sessionId); };
@@ -377,6 +391,7 @@ const admittedOriginal = (binding: Binding, originalInputId: string): RecordPayl
 export function findScriptedInputAdmission(options: { sessionId: string; request: FabricMainAgentDeliveryRequest }): FabricAgentMessageResult | undefined {
   const binding = bound(options.sessionId);
   validateBinding(binding);
+  if (binding.recovery) return findRecoveryRound(binding, options.request);
   const metadata = readScriptedInput(options.request.data) ?? fail("INVALID", "data.scriptedInput is required for admission lookup");
   if (metadata.sessionId !== binding.sessionId) return fail("INVALID", "scriptedInput.sessionId does not match the receiving session");
   if (options.request.delivery !== "steer" && options.request.delivery !== "followUp") return fail("INVALID", "Scripted input delivery must be steer or followUp");
@@ -402,6 +417,7 @@ export async function admitContinuation(options: {
 }): Promise<{ admissionId: string; existing: boolean }> {
   const binding = bound(options.sessionId);
   identifier(options.originalInputId, "originalInputId"); identifier(options.recoveryGeneration, "recoveryGeneration");
+  if (binding.recovery) return admitRecoveryContinuation(binding, options);
   const original = admittedOriginal(binding, options.originalInputId);
   const inputId = `scripted-continuation:v1:${hash(canonical([1, options.sessionId, options.originalInputId, options.recoveryGeneration]))}`;
   const data = {
@@ -414,4 +430,474 @@ export async function admitContinuation(options: {
   };
   const result = admitScriptedInput({ ...binding, request });
   return { admissionId: deliveryIdFor(request.from.id, binding.sessionId, inputId), existing: result.duplicate === true };
+}
+
+// REQUIRED admission/history. The existing external positive single-writer exclusion is a
+// prerequisite, NOT something writeJsonAtomic supplies. One synchronous owner below orders
+// accept/select/delivery/outcome/maintenance/retry revisions; never await in its callback.
+export interface RecoveryIo { readonly deadlineMs?: number; readonly signal?: AbortSignal }
+export interface RecoveryAdmissionOwner {
+  /** Native's current full identity; a getter supports in-control epoch revocation. */
+  readonly epoch: RecoveryEpoch;
+  readonly podId: string;
+  readonly bootId: string;
+  /** Explicit native evidence that input/outcome capture covered the session from admission.
+   * Legacy receiver records cannot be promoted to complete history by absence of a cancel. */
+  readonly historyComplete: boolean;
+  /** Synchronous positive exclusion/current-binding check, repeated before durable save. */
+  assertCurrent(): void;
+  /** Existing B3 event path, invoked once AFTER actual join/reconciliation, outside the owner. */
+  reconsiderInput(): void | Promise<void>;
+  /** Validates the retained B3 repair receipt; never a public-JSON permission grant. */
+  validateRepair?(ref: RepairRef): void;
+}
+export interface AcceptedRecoveryInput {
+  readonly admissionKind: "input";
+  readonly sessionId: string; readonly originalInputId: string; readonly inputId: string;
+  readonly admissionId: string; readonly deliveryId: string; readonly text: string;
+  readonly epoch: RecoveryEpoch; readonly deadlineMs: number; readonly revision: number;
+  readonly recoveryGeneration?: string;
+  readonly executionBranchEntryId?: string;
+}
+export interface RecoveryInputDelivery {
+  readonly entryId: string; readonly bytesSha256: string; readonly seq: number;
+  readonly executionBranchEntryId: string;
+}
+export interface RecoveryInputRecord {
+  readonly kind: "round" | "continuation"; readonly originalInputId: string;
+  readonly admissionId: string; readonly round: Round; readonly deadlineAt: number;
+  readonly podId: string; readonly bootId: string; readonly acceptedRevision: number;
+  readonly recoveryGeneration?: string;
+  delivery?: RecoveryInputDelivery;
+}
+export interface RecoveryTerminalEvidence {
+  readonly entryId: string; readonly bytesSha256: string; readonly seq: number;
+  readonly inputEntryId: string; readonly runId: string; readonly executionBranchEntryId: string;
+  readonly finalEntryIds: readonly string[];
+}
+export interface RecoveryInputOutcomePayload {
+  readonly sessionId: string; readonly requestId: string; readonly originalInputId: string;
+  readonly kind: "user-cancel" | "lifecycle-interrupt" | "settled";
+  readonly at: number; readonly bootId: string; readonly terminalEvidence?: RecoveryTerminalEvidence;
+}
+export interface RecoveryInputOutcomeRequest extends RecoveryInputOutcomePayload {
+  readonly deadlineMs: number; readonly signal?: AbortSignal;
+}
+export interface RecoveryInputOutcomeRecord extends RecoveryInputOutcomePayload { readonly revision: number }
+export type RecoveryInputOutcomeResult =
+  | { readonly durable: true; readonly status: "recorded" | "existing"; readonly revision: number }
+  | { readonly durable: true; readonly status: "already-terminal"; readonly revision: number; readonly kind: "user-cancel" | "settled" }
+  | { readonly durable: false; readonly reason: "conflict" | "deadline" | "aborted" | "store-unavailable" | "incomplete-history" | "superseded" };
+export interface RecoveryTaskAbort {
+  readonly requestId: string; readonly at: number; readonly bootId: string;
+  readonly originalInputIds: readonly string[]; readonly maintenanceRequestId: string;
+  committed: boolean;
+}
+export interface RecoverySessionLedger {
+  readonly version: 1; readonly sessionId: string;
+  revision: number; complete: boolean;
+  inputs: RecoveryInputRecord[];
+  outcomes: RecoveryInputOutcomeRecord[];
+  /** One open logical input, distinct from a selected live native occurrence. */
+  currentInputId?: string;
+  reservation?: { kind: "input"; originalInputId: string; admissionId: string; epoch: RecoveryEpoch; revision: number } | { kind: "maintenance"; requestId: string };
+  maintenance: MaintenanceLedgerEntry[];
+  retrySlots: Array<{ anchor: string; requestId: string }>;
+  repairs: RepairRef[];
+  taskAborts: RecoveryTaskAbort[];
+  driveReceipts: string[];
+}
+export interface RecoveryInputSnapshot {
+  readonly sessionId: string; readonly complete: boolean; readonly revision: number;
+  readonly accepted?: {
+    readonly inputId: string; readonly text: string; readonly podId: string; readonly bootId: string;
+    readonly settlement: "open" | "completed" | "cancelled";
+    readonly cancellation: "not-cancelled" | "cancelled" | "unknown";
+    readonly deadlineMs: number; readonly admissionId: string;
+    readonly delivery?: RecoveryInputDelivery; readonly lastOutcome?: RecoveryInputOutcomeRecord;
+  };
+  readonly queued: readonly { readonly inputId: string; readonly admissionId: string; readonly deadlineMs: number }[];
+  readonly outcomes: readonly RecoveryInputOutcomeRecord[];
+}
+export type RecoveryInputSelectionResult =
+  | { readonly selected: true; readonly input: AcceptedRecoveryInput; readonly revision: number; readonly existing: boolean }
+  | { readonly selected: false; readonly code: "RECOVERY_MAINTENANCE_BUSY" | "RECOVERY_INPUT_BUSY" | "RECOVERY_INPUT_TERMINAL" | "RECOVERY_REVISION_CONFLICT"; readonly revision: number };
+export interface RecoveryInputSelectionRequest extends RecoveryIo {
+  readonly sessionId: string; readonly originalInputId: string; readonly epoch: RecoveryEpoch;
+  readonly expectedRevision: number; readonly admissionId?: string;
+}
+export interface RecoveryInputAdapter {
+  readRecoveryInput(sessionId: string, io?: RecoveryIo): Promise<RecoveryInputSnapshot>;
+  admitContinuation(request: { sessionId: string; originalInputId: string; recoveryGeneration: string; text: string }): Promise<{ admissionId: string; existing: boolean }>;
+  recordInputOutcome(request: RecoveryInputOutcomeRequest): Promise<RecoveryInputOutcomeResult>;
+  selectRecoveryInput(request: RecoveryInputSelectionRequest): Promise<RecoveryInputSelectionResult>;
+  commitRecoveryInputDelivery(input: AcceptedRecoveryInput, evidence: RecoveryInputDelivery, io?: RecoveryIo): Promise<void>;
+  releaseRecoveryInputAfterJoin(input: AcceptedRecoveryInput, joined: Promise<void>, reconcile: () => Promise<void>, io?: RecoveryIo): Promise<void>;
+}
+export class RecoveryAdmissionError extends Error {
+  override readonly name = "RecoveryAdmissionError";
+  constructor(readonly code: string, message: string) { super(message); }
+}
+const recoveryFail = (code: string, message: string): never => { throw new RecoveryAdmissionError(code, message); };
+export const recoveryCanonical = canonical;
+export const recoveryHash = hash;
+const validEpoch = (epoch: unknown): epoch is RecoveryEpoch => object(epoch) && exactKeys(epoch, ["processIncarnationId", "bindingId", "epoch"]) &&
+  nonempty(epoch.processIncarnationId) && nonempty(epoch.bindingId) && Number.isSafeInteger(epoch.epoch) && (epoch.epoch as number) >= 0;
+const validHash = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+const validTime = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+function validateRecoveryOwner(owner: RecoveryAdmissionOwner): void {
+  if (!validEpoch(owner.epoch) || !nonempty(owner.podId) || !nonempty(owner.bootId) || typeof owner.historyComplete !== "boolean" ||
+      typeof owner.assertCurrent !== "function" || typeof owner.reconsiderInput !== "function") recoveryFail("RECOVERY_INVALID", "Malformed native recovery admission owner");
+  checkOwner(owner);
+}
+function checkOwner(owner: RecoveryAdmissionOwner): void {
+  const returned: unknown = owner.assertCurrent();
+  if (returned !== undefined) recoveryFail("RECOVERY_EPOCH_REVOKED", "Positive exclusion/current-binding check must be synchronous");
+}
+export function recoveryOwner(sessionId: string): RecoveryAdmissionOwner {
+  const owner = bindings.get(sessionId)?.recovery;
+  if (!owner) return recoveryFail("RECOVERY_NOT_BOUND", "No REQUIRED admission owner is bound to this session");
+  checkOwner(owner);
+  return owner;
+}
+export function assertRecoveryEpoch(sessionId: string, epoch: RecoveryEpoch): void {
+  if (!validEpoch(epoch) || canonical(recoveryOwner(sessionId).epoch) !== canonical(epoch)) recoveryFail("RECOVERY_EPOCH_REVOKED", "Full process/binding/epoch identity was revoked");
+}
+function checkIo(io?: RecoveryIo): void {
+  if (io?.signal?.aborted) recoveryFail("RECOVERY_ABORTED", "Recovery I/O was aborted");
+  if (io?.deadlineMs !== undefined && (!validTime(io.deadlineMs) || Date.now() >= io.deadlineMs)) recoveryFail("RECOVERY_DEADLINE", "Recovery I/O deadline expired");
+}
+const ledgerPath = (binding: Binding): string => path.join(base(binding.root), "session", `${hash(binding.sessionId)}.json`);
+const emptyLedger = (binding: Binding): RecoverySessionLedger => ({ version: 1, sessionId: binding.sessionId, revision: 0,
+  complete: binding.recovery!.historyComplete && files(binding.root, "receiver", binding.sessionId).length === 0,
+  inputs: [], outcomes: [], maintenance: [], retrySlots: [], repairs: [], taskAborts: [], driveReceipts: [] });
+const checkedLedger = (value: unknown, sessionId: string): RecoverySessionLedger => {
+  if (!object(value) || value.version !== 1 || value.sessionId !== sessionId || !Number.isSafeInteger(value.revision) || (value.revision as number) < 0 ||
+      typeof value.complete !== "boolean" || !exactKeys(value, ["version", "sessionId", "revision", "complete", "inputs", "outcomes", "currentInputId", "reservation", "maintenance", "retrySlots", "repairs", "taskAborts", "driveReceipts"]) ||
+      ["inputs", "outcomes", "maintenance", "retrySlots", "repairs", "taskAborts", "driveReceipts"].some(key => !Array.isArray(value[key]))) {
+    return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Corrupt serialized session revision/history");
+  }
+  const s = value as unknown as RecoverySessionLedger;
+  const ids = new Set<string>();
+  for (const i of s.inputs) {
+    if (!object(i) || !["round", "continuation"].includes(i.kind) || !nonempty(i.originalInputId) || !nonempty(i.admissionId) || ids.has(i.admissionId) ||
+        !nonempty(i.podId) || !nonempty(i.bootId) || !validTime(i.deadlineAt) || !Number.isSafeInteger(i.acceptedRevision) || i.acceptedRevision > s.revision ||
+        i.admissionId.startsWith("pi-native-entry:v1:")) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Corrupt input occurrence history");
+    const round = makeRound(i.round);
+    if (canonical(round) !== canonical(i.round) || metadataOf(round).sessionId !== sessionId || metadataOf(round).deadlineAt !== i.deadlineAt || roundId(round) !== i.admissionId) {
+      return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Corrupt immutable accepted input");
+    }
+    ids.add(i.admissionId);
+  }
+  if (s.currentInputId && !s.inputs.some(i => i.kind === "round" && i.originalInputId === s.currentInputId)) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Missing selected original history");
+  const requestIds = new Set<string>();
+  for (const e of s.maintenance) {
+    if (!object(e) || typeof e.settlementOnly !== "boolean" || typeof e.cancelRequested !== "boolean" || !object(e.record) ||
+        !object(e.record.request) || e.record.request.sessionId !== sessionId || !nonempty(e.record.request.requestId) || requestIds.has(e.record.request.requestId) ||
+        !["ADMITTED", "ACTIVE", "PREPARED", "CONSUMED"].includes(e.record.state) || !validEpoch(e.record.activeEpoch) ||
+        !Number.isSafeInteger(e.record.permitRevision) || e.record.permitRevision < 0 || !Number.isSafeInteger(e.record.revision) || e.record.revision > s.revision ||
+        !validHash(e.record.operationSha256) || e.record.operationSha256 !== hash(canonical(e.record.request.operation)) ||
+        (["PREPARED", "CONSUMED"].includes(e.record.state) && !e.record.plan) || (e.record.state === "CONSUMED" && !e.record.completion)) {
+      return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Corrupt maintenance state/plan history");
+    }
+    requestIds.add(e.record.request.requestId);
+  }
+  if (s.reservation && (s.reservation.kind === "maintenance" ? !requestIds.has(s.reservation.requestId) : s.reservation.kind !== "input" || !ids.has(s.reservation.admissionId) || !validEpoch(s.reservation.epoch) || !Number.isSafeInteger(s.reservation.revision) || s.reservation.revision < 1 || s.reservation.revision > s.revision)) {
+    return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Corrupt session reservation");
+  }
+  return s;
+};
+function loadLedger(binding: Binding): RecoverySessionLedger {
+  requireNamespaceBarrier(notDurable);
+  const file = ledgerPath(binding);
+  let fd: number;
+  try { fd = fs.openSync(file, "r"); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyLedger(binding); throw error; }
+  let envelope: unknown;
+  try {
+    const stat = fs.fstatSync(fd);
+    if (stat.size > 64 * 1024 * 1024) recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Bounded session ledger read would truncate history");
+    const bytes = fs.readFileSync(fd, "utf8");
+    fs.fsyncSync(fd); syncPathNamespaceDurable(file, stat, notDurable);
+    try { envelope = JSON.parse(bytes); } catch { recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Corrupt session ledger JSON"); }
+  } finally { fs.closeSync(fd); }
+  if (!object(envelope) || !exactKeys(envelope, ["version", "payload", "sha256"]) || envelope.version !== 1 || !validHash(envelope.sha256) ||
+      hash(canonical(envelope.payload)) !== envelope.sha256) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Session ledger checksum conflict");
+  return checkedLedger(envelope.payload, binding.sessionId);
+}
+const commitOwners = new Set<string>();
+/** Internal shared short transaction used by maintenance-admission. No async callbacks:
+ * every load/check/save is synchronous under the existing positively excluded writer.
+ * Every operation rereads + barriers, so unknown ACK/rename visibility must reconcile
+ * before either dispatcher can act. No second maintenance mutex or cached CAS exists. */
+export function commitRecoverySession<T>(sessionId: string, change: (state: RecoverySessionLedger, nextRevision: number) => T, io?: RecoveryIo): T {
+  io = { deadlineMs: io?.deadlineMs ?? Date.now() + 10_000, ...(io?.signal ? { signal: io.signal } : {}) };
+  checkIo(io);
+  const binding = bindings.get(sessionId);
+  const owner = recoveryOwner(sessionId);
+  if (!binding) return recoveryFail("RECOVERY_NOT_BOUND", "Missing bound session");
+  const key = ledgerPath(binding);
+  if (commitOwners.has(key)) return recoveryFail("RECOVERY_REVISION_CONFLICT", "Reentrant session commit owner");
+  commitOwners.add(key);
+  try {
+    const s = loadLedger(binding); checkIo(io); checkOwner(owner);
+    const previous = canonical(s);
+    const next = s.revision + 1;
+    if (!Number.isSafeInteger(next)) recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Session revision exhausted");
+    const output = change(s, next);
+    if (output !== null && typeof output === "object" && "then" in output) recoveryFail("RECOVERY_REVISION_CONFLICT", "A session transaction cannot await");
+    checkOwner(owner); checkIo(io);
+    if (canonical(s) !== previous) {
+      s.revision = next;
+      requireNamespaceBarrier(notDurable);
+      writeJsonAtomic(key, { version: 1, payload: s, sha256: hash(canonical(s)) }, { durable: true });
+      // A deadline/abort after the commit is unknown-ACK, not absence. A retry rereads it.
+      checkOwner(owner); checkIo(io);
+    }
+    return output;
+  } finally { commitOwners.delete(key); }
+}
+export function readRecoverySession(sessionId: string, io?: RecoveryIo): RecoverySessionLedger {
+  return commitRecoverySession(sessionId, state => snapshot(state), io);
+}
+const terminalFor = (s: RecoverySessionLedger, originalInputId: string): RecoveryInputOutcomeRecord | undefined =>
+  s.outcomes.find(o => o.originalInputId === originalInputId && o.kind !== "lifecycle-interrupt");
+const originalFor = (s: RecoverySessionLedger, originalInputId: string): RecoveryInputRecord =>
+  s.inputs.find(i => i.kind === "round" && i.originalInputId === originalInputId) ?? recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Original input is absent from retained accepted history");
+const queuedReceipt = (record: RecoveryInputRecord, existing: boolean): FabricAgentMessageResult => ({
+  queued: true, routed: "main", messageId: record.admissionId, deadlineAt: record.deadlineAt,
+  ...(existing ? { duplicate: true, triggered: false } : {}),
+});
+/** REQUIRED receiver ACK is durable B5 QUEUE admission, not native carrier commitment.
+ * Only the selected controlled native occurrence may append/deliver after recovery.
+ * Ordinary native Main admission/receipt semantics above are intentionally unchanged. */
+function admitRecoveryRound(binding: Binding, round: Round): FabricAgentMessageResult {
+  const m = metadataOf(round);
+  const receipt = commitRecoverySession(binding.sessionId, (s, revision) => {
+    const admissionId = roundId(round);
+    const old = s.inputs.find(i => i.admissionId === admissionId);
+    if (old) {
+      if (canonical(old.round) !== canonical(round)) fail("CONFLICT", "Changed immutable recovery input");
+      return queuedReceipt(old, true);
+    }
+    if (s.inputs.some(i => i.kind === "round" && i.originalInputId === m.inputId)) fail("AMBIGUOUS", "Original inputId is already owned by another sender");
+    if (Date.now() >= m.deadlineAt) fail("EXPIRED", "Original input deadline expired before durable admission");
+    const owner = recoveryOwner(binding.sessionId);
+    const record: RecoveryInputRecord = { kind: "round", originalInputId: m.inputId, admissionId, round: snapshot(round), deadlineAt: m.deadlineAt,
+      podId: owner.podId, bootId: owner.bootId, acceptedRevision: revision };
+    s.inputs.push(record);
+    return queuedReceipt(record, false);
+  });
+  return receipt;
+}
+function findRecoveryRound(binding: Binding, request: FabricMainAgentDeliveryRequest): FabricAgentMessageResult | undefined {
+  if (request.delivery !== "steer" && request.delivery !== "followUp") return fail("INVALID", "Recovery input lookup needs a delivery kind");
+  const round = makeRound({ ...request, data: request.data, delivery: request.delivery, targetId: `session:${binding.sessionId}` });
+  const record = readRecoverySession(binding.sessionId).inputs.find(i => i.admissionId === roundId(round));
+  if (!record) return undefined;
+  if (canonical(record.round) !== canonical(round)) return fail("CONFLICT", "Changed immutable recovery input lookup");
+  return queuedReceipt(record, true);
+}
+function admitRecoveryContinuation(binding: Binding, request: { originalInputId: string; recoveryGeneration: string; text: string }): { admissionId: string; existing: boolean } {
+  if (!nonempty(request.text)) return fail("INVALID", "Continuation text is required");
+  return commitRecoverySession(binding.sessionId, (s, revision) => {
+    if (!s.complete) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Continuation requires complete original/outcome history");
+    const original = originalFor(s, request.originalInputId);
+    const inputId = `scripted-continuation:v1:${hash(canonical([1, binding.sessionId, request.originalInputId, request.recoveryGeneration]))}`;
+    const from: MeshIdentity = { id: `session:${binding.sessionId}`, name: "Main", kind: "main", sessionId: binding.sessionId };
+    const round = makeRound({ from, targetId: `session:${binding.sessionId}`, message: request.text, delivery: "followUp", triggerTurn: true,
+      data: { scriptedInput: { version: 1, inputId, sessionId: binding.sessionId, deadlineAt: original.deadlineAt },
+        scriptedContinuation: { version: 1, originalInputId: request.originalInputId, recoveryGeneration: request.recoveryGeneration } } });
+    const admissionId = roundId(round);
+    const old = s.inputs.find(i => i.admissionId === admissionId);
+    if (old) {
+      if (canonical(old.round) !== canonical(round)) fail("CONFLICT", "Changed continuation under the same generation");
+      return { admissionId, existing: true };
+    }
+    if (terminalFor(s, request.originalInputId)) return recoveryFail("RECOVERY_INPUT_TERMINAL", "A terminal input cannot receive a new continuation");
+    if (Date.now() >= original.deadlineAt) return fail("EXPIRED", "Continuation cannot renew its original deadline");
+    s.inputs.push({ kind: "continuation", originalInputId: request.originalInputId, admissionId, round, deadlineAt: original.deadlineAt,
+      podId: original.podId, bootId: original.bootId, acceptedRevision: revision, recoveryGeneration: request.recoveryGeneration });
+    return { admissionId, existing: false };
+  });
+}
+const outcomePayload = (request: RecoveryInputOutcomeRequest | RecoveryInputOutcomePayload): RecoveryInputOutcomePayload => ({
+  sessionId: request.sessionId, requestId: request.requestId, originalInputId: request.originalInputId, kind: request.kind, at: request.at, bootId: request.bootId,
+  ...(request.terminalEvidence === undefined ? {} : { terminalEvidence: snapshot(request.terminalEvidence) }),
+});
+function validateOutcome(request: RecoveryInputOutcomePayload): void {
+  if (!nonempty(request.sessionId) || !nonempty(request.requestId) || !nonempty(request.originalInputId) || !validTime(request.at) || !nonempty(request.bootId) ||
+      !["user-cancel", "lifecycle-interrupt", "settled"].includes(request.kind)) recoveryFail("RECOVERY_CONFLICT", "Malformed immutable input outcome");
+  const e = request.terminalEvidence;
+  if (request.kind === "settled" && (!e || !nonempty(e.entryId) || !validHash(e.bytesSha256) || !Number.isSafeInteger(e.seq) || e.seq < 0 ||
+      !nonempty(e.inputEntryId) || !nonempty(e.runId) || !nonempty(e.executionBranchEntryId) || !Array.isArray(e.finalEntryIds) || !e.finalEntryIds.length || e.finalEntryIds.some(id => !nonempty(id)))) {
+    recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Settlement requires validated native terminal witness/B6 references");
+  }
+  if (request.kind !== "settled" && e !== undefined) recoveryFail("RECOVERY_CONFLICT", "Only settled outcomes carry terminal evidence");
+}
+/** Same transaction primitive used by E+maintenance consumption. Never invoke externally
+ * without the session revision owner; outcome at is evidence, revision orders winners. */
+export function applyInputOutcome(s: RecoverySessionLedger, revision: number, payload: RecoveryInputOutcomePayload): RecoveryInputOutcomeResult {
+  validateOutcome(payload);
+  if (!s.complete || payload.sessionId !== s.sessionId) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Complete session input history is required");
+  originalFor(s, payload.originalInputId);
+  if (payload.kind === "settled" && !s.inputs.some(i => i.originalInputId === payload.originalInputId && i.delivery?.entryId === payload.terminalEvidence!.inputEntryId &&
+      i.delivery.executionBranchEntryId === payload.terminalEvidence!.executionBranchEntryId)) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Terminal witness does not match a committed native input/branch");
+  const old = s.outcomes.find(o => o.requestId === payload.requestId);
+  if (old) {
+    const { revision: oldRevision, ...oldPayload } = old;
+    if (canonical(oldPayload) !== canonical(payload)) return recoveryFail("RECOVERY_CONFLICT", "Changed outcome under the same requestId");
+    return { durable: true, status: "existing", revision: oldRevision };
+  }
+  const terminal = terminalFor(s, payload.originalInputId);
+  if (terminal) return { durable: true, status: "already-terminal", revision: terminal.revision, kind: terminal.kind as "user-cancel" | "settled" };
+  s.outcomes.push({ ...snapshot(payload), revision });
+  if (payload.kind !== "lifecycle-interrupt" && s.currentInputId === payload.originalInputId) delete s.currentInputId;
+  // This does NOT release the live native occurrence. Only its actual-join edge does.
+  return { durable: true, status: "recorded", revision };
+}
+export async function recordInputOutcome(request: RecoveryInputOutcomeRequest): Promise<RecoveryInputOutcomeResult> {
+  try {
+    if (!object(request) || !exactKeys(request, ["sessionId", "requestId", "originalInputId", "kind", "at", "bootId", "terminalEvidence", "deadlineMs", "signal"]) ||
+        Object.values(Object.getOwnPropertyDescriptors(request)).some(d => !d.enumerable || !("value" in d))) return { durable: false, reason: "conflict" };
+    const payload = outcomePayload(request); validateOutcome(payload);
+    if (!validTime(request.deadlineMs)) return { durable: false, reason: "deadline" };
+    return commitRecoverySession(request.sessionId, (s, revision) => {
+      const original = originalFor(s, request.originalInputId);
+      // No new computation is authorized by a late recovery-I/O outcome write.
+      if (Date.now() < original.deadlineAt && request.deadlineMs > original.deadlineAt) return recoveryFail("RECOVERY_DEADLINE", "Outcome attempt cannot extend its original input deadline");
+      return applyInputOutcome(s, revision, payload);
+    }, request);
+  } catch (error) {
+    const code = error instanceof RecoveryAdmissionError ? error.code : undefined;
+    const reason = code === "RECOVERY_CONFLICT" ? "conflict" : code === "RECOVERY_DEADLINE" ? "deadline" : code === "RECOVERY_ABORTED" ? "aborted" :
+      code === "RECOVERY_HISTORY_INCOMPLETE" ? "incomplete-history" : ["RECOVERY_EPOCH_REVOKED", "RECOVERY_NOT_BOUND"].includes(code ?? "") ? "superseded" : "store-unavailable";
+    return { durable: false, reason };
+  }
+}
+export async function readRecoveryInput(sessionId: string, io?: RecoveryIo): Promise<RecoveryInputSnapshot> {
+  try {
+    const s = readRecoverySession(sessionId, io);
+    const id = s.currentInputId ?? (s.reservation?.kind === "input" ? s.reservation.originalInputId : undefined);
+    const selected = id ? originalFor(s, id) : undefined;
+    const terminal = id ? terminalFor(s, id) : undefined;
+    const last = id ? s.outcomes.filter(o => o.originalInputId === id).at(-1) : undefined;
+    return {
+      sessionId, complete: s.complete, revision: s.revision,
+      ...(selected ? { accepted: { inputId: selected.originalInputId, text: selected.round.message, podId: selected.podId, bootId: selected.bootId,
+        settlement: terminal?.kind === "settled" ? "completed" as const : terminal?.kind === "user-cancel" ? "cancelled" as const : "open" as const,
+        cancellation: terminal?.kind === "user-cancel" ? "cancelled" as const : s.complete ? "not-cancelled" as const : "unknown" as const,
+        deadlineMs: selected.deadlineAt, admissionId: selected.admissionId,
+        ...(selected.delivery ? { delivery: snapshot(selected.delivery) } : {}), ...(last ? { lastOutcome: snapshot(last) } : {}) } } : {}),
+      queued: s.inputs.filter(i => i.kind === "round" && i.originalInputId !== id && !terminalFor(s, i.originalInputId)).map(i => ({ inputId: i.originalInputId, admissionId: i.admissionId, deadlineMs: i.deadlineAt })),
+      outcomes: snapshot(s.outcomes),
+    };
+  } catch (error) {
+    // Incomplete/corrupt history is never treated as clean/no-cancel. Deadline/exclusion
+    // errors still propagate, so the caller cannot mistake a stale binding for a read.
+    if (error instanceof RecoveryAdmissionError && error.code === "RECOVERY_HISTORY_INCOMPLETE") return { sessionId, complete: false, revision: 0, queued: [], outcomes: [] };
+    throw error;
+  }
+}
+export async function selectRecoveryInput(request: RecoveryInputSelectionRequest): Promise<RecoveryInputSelectionResult> {
+  return commitRecoverySession(request.sessionId, (s, revision) => {
+    assertRecoveryEpoch(request.sessionId, request.epoch);
+    if (!s.complete) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Cannot select from incomplete history");
+    // Deliberately NON-BLOCKING. The native/B5 race is decided only by this durable owner.
+    if (s.reservation?.kind === "maintenance") return { selected: false, code: "RECOVERY_MAINTENANCE_BUSY", revision: s.revision };
+    if (s.reservation?.kind === "input" && s.reservation.originalInputId !== request.originalInputId || s.currentInputId && s.currentInputId !== request.originalInputId) {
+      return { selected: false, code: "RECOVERY_INPUT_BUSY", revision: s.revision };
+    }
+    if (terminalFor(s, request.originalInputId)) return { selected: false, code: "RECOVERY_INPUT_TERMINAL", revision: s.revision };
+    const firstOpen = s.currentInputId ?? s.inputs.find(i => i.kind === "round" && !terminalFor(s, i.originalInputId))?.originalInputId;
+    if (firstOpen !== request.originalInputId) return { selected: false, code: "RECOVERY_INPUT_BUSY", revision: s.revision };
+    const original = originalFor(s, request.originalInputId);
+    const occurrence = request.admissionId ? s.inputs.find(i => i.admissionId === request.admissionId && i.originalInputId === request.originalInputId) :
+      s.inputs.filter(i => i.originalInputId === request.originalInputId).at(-1)!;
+    if (!occurrence) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Selected occurrence is absent from history");
+    const existing = s.reservation?.kind === "input" && s.reservation.admissionId === occurrence.admissionId && canonical(s.reservation.epoch) === canonical(request.epoch);
+    if (!existing && s.reservation?.kind === "input" && canonical(s.reservation.epoch) === canonical(request.epoch)) return { selected: false, code: "RECOVERY_INPUT_BUSY", revision: s.revision };
+    if (!existing && s.revision !== request.expectedRevision) return { selected: false, code: "RECOVERY_REVISION_CONFLICT", revision: s.revision };
+    // Selection may finalize/settle expired work. Provider permission separately enforces deadline.
+    if (!existing) {
+      s.currentInputId = original.originalInputId;
+      s.reservation = { kind: "input", originalInputId: original.originalInputId, admissionId: occurrence.admissionId, epoch: snapshot(request.epoch), revision };
+    }
+    const input: AcceptedRecoveryInput = { admissionKind: "input", sessionId: s.sessionId, originalInputId: original.originalInputId,
+      inputId: metadataOf(occurrence.round).inputId, admissionId: occurrence.admissionId, deliveryId: occurrence.admissionId, text: occurrence.round.message,
+      epoch: snapshot(request.epoch), deadlineMs: original.deadlineAt, revision: existing && s.reservation?.kind === "input" ? s.reservation.revision : revision,
+      ...(occurrence.recoveryGeneration ? { recoveryGeneration: occurrence.recoveryGeneration } : {}),
+      ...(original.delivery ? { executionBranchEntryId: original.delivery.executionBranchEntryId } : {}) };
+    return { selected: true, input, revision: existing ? s.revision : revision, existing: !!existing };
+  }, request);
+}
+function selectedOccurrence(s: RecoverySessionLedger, input: AcceptedRecoveryInput): RecoveryInputRecord {
+  assertRecoveryEpoch(input.sessionId, input.epoch);
+  const r = s.reservation;
+  if (r?.kind !== "input" || r.admissionId !== input.admissionId || r.originalInputId !== input.originalInputId || canonical(r.epoch) !== canonical(input.epoch) || r.revision !== input.revision) {
+    return recoveryFail("RECOVERY_EPOCH_REVOKED", "Input does not own the current durable native reservation");
+  }
+  return s.inputs.find(i => i.admissionId === input.admissionId) ?? recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Missing occurrence history");
+}
+export async function commitRecoveryInputDelivery(input: AcceptedRecoveryInput, evidence: RecoveryInputDelivery, io?: RecoveryIo): Promise<void> {
+  if (!nonempty(evidence.entryId) || !validHash(evidence.bytesSha256) || !Number.isSafeInteger(evidence.seq) || evidence.seq < 0 || !nonempty(evidence.executionBranchEntryId)) {
+    return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Native delivery requires exact entry/hash/branch/B6 references");
+  }
+  commitRecoverySession(input.sessionId, s => {
+    const occurrence = selectedOccurrence(s, input);
+    if (occurrence.delivery && canonical(occurrence.delivery) !== canonical(evidence)) return recoveryFail("RECOVERY_CONFLICT", "Changed native delivery commitment");
+    if (!occurrence.delivery) occurrence.delivery = snapshot(evidence);
+  }, io);
+}
+export function assertRecoveryInputPermission(input: AcceptedRecoveryInput): void {
+  const s = readRecoverySession(input.sessionId);
+  const occurrence = selectedOccurrence(s, input);
+  if (!occurrence.delivery || terminalFor(s, input.originalInputId)) recoveryFail("RECOVERY_INPUT_TERMINAL", "No committed open native occurrence permits inference");
+  if (Date.now() >= input.deadlineMs) recoveryFail("RECOVERY_DEADLINE", "Original input deadline expired");
+}
+const inputEdges = new WeakMap<RecoveryAdmissionOwner, Map<string, Promise<void>>>();
+export async function releaseRecoveryInputAfterJoin(input: AcceptedRecoveryInput, joined: Promise<void>, reconcile: () => Promise<void>, io?: RecoveryIo): Promise<void> {
+  const owner = recoveryOwner(input.sessionId);
+  let memo = inputEdges.get(owner); if (!memo) { memo = new Map(); inputEdges.set(owner, memo); }
+  const key = canonical([input.sessionId, input.admissionId, input.epoch]);
+  const prior = memo.get(key); if (prior) return prior;
+  const edge = Promise.resolve().then(async () => {
+    await joined;
+    const s = readRecoverySession(input.sessionId, io); selectedOccurrence(s, input);
+    if (!s.outcomes.some(o => o.originalInputId === input.originalInputId)) recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Actual join is not a durable input outcome");
+    // Release this native occurrence only after actual join, while logical L work stays open.
+    commitRecoverySession(input.sessionId, state => { selectedOccurrence(state, input); delete state.reservation; }, io);
+    await reconcile();
+    assertRecoveryEpoch(input.sessionId, input.epoch);
+    await driveRecoveryInputOnce(input.sessionId, `input-release:${key}`, io);
+  });
+  memo.set(key, edge);
+  return edge;
+}
+export async function driveRecoveryInputOnce(sessionId: string, key: string, io?: RecoveryIo): Promise<void> {
+  const owner = recoveryOwner(sessionId);
+  const drive = commitRecoverySession(sessionId, s => {
+    if (s.driveReceipts.includes(key)) return false;
+    s.driveReceipts.push(key);
+    return true;
+  }, io);
+  if (drive) await owner.reconsiderInput();
+}
+export async function recordRecoveryRepair(sessionId: string, ref: RepairRef, io?: RecoveryIo): Promise<void> {
+  const owner = recoveryOwner(sessionId);
+  if (!owner.validateRepair) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "No native repair receipt validator is bound");
+  if (!nonempty(ref.originalInputId) || !nonempty(ref.recoveryGeneration) || !nonempty(ref.executionBranchEntryId) || !validHash(ref.repairReceiptSha256)) return recoveryFail("RECOVERY_CONFLICT", "Invalid repair reference");
+  const verified: unknown = owner.validateRepair(snapshot(ref));
+  if (verified !== undefined) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Repair receipt validation must complete synchronously before admission");
+  commitRecoverySession(sessionId, s => {
+    const original = originalFor(s, ref.originalInputId);
+    if (terminalFor(s, ref.originalInputId) || s.currentInputId !== ref.originalInputId || s.reservation?.kind === "input" ||
+        !original.delivery || original.delivery.executionBranchEntryId !== ref.executionBranchEntryId) return recoveryFail("RECOVERY_CONFLICT", "Repair must belong to the joined open original execution branch");
+    const old = s.repairs.find(r => r.originalInputId === ref.originalInputId && r.recoveryGeneration === ref.recoveryGeneration);
+    if (old && canonical(old) !== canonical(ref)) return recoveryFail("RECOVERY_CONFLICT", "Changed repair receipt under the same generation");
+    if (!old) s.repairs.push(snapshot(ref));
+  }, io);
+}
+export function createRecoveryInputAdapter(): RecoveryInputAdapter {
+  return { readRecoveryInput, admitContinuation, recordInputOutcome, selectRecoveryInput, commitRecoveryInputDelivery, releaseRecoveryInputAfterJoin };
 }

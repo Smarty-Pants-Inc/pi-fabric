@@ -325,6 +325,214 @@ it("closes an archive handle acquired during fencing and permits fresh-side reco
   });
 });
 
+it.each(["missing", "null"] as const)(
+  "rejects a seal with %s files without exposing a partial page or reaching readiness",
+  async fileShape => {
+    const earlier = event(1, "earlier-archive-identity", "fixture.earlier");
+    const required = event(2, "required-archive-identity", "fixture.required");
+    const liveHead = event(3, "live-head-identity", "fixture.live");
+    const f = fixture([], [liveHead]);
+    const earlierDay = "2000/01/01", malformedDay = "2000/01/02";
+    f.appendArchive([earlier], earlierDay);
+    f.appendArchive([required], malformedDay);
+    const requiredFile = path.join(f.archive, malformedDay, archiveFileName(required.topic));
+    expect(fs.readFileSync(requiredFile, "utf8")).toBe(line(required));
+    expect(required.data).toMatchObject({ bridge: { from: "spoke", id: "required-archive-identity" } });
+    expect(required.sequence).toBeLessThan(liveHead.sequence);
+    fs.writeFileSync(path.join(f.archive, malformedDay, "SEAL.json"),
+      JSON.stringify(fileShape === "missing" ? {} : { files: null }));
+
+    let page: BridgedIds | undefined, failure: unknown;
+    try { page = await f.side.bridgedIds(0); }
+    catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(TypeError);
+    expect(page).toBeUndefined();
+    // A prior archive day was read, but the failed call publishes no partial page.
+    expect(f.side.recoveryReadCost?.events).toBe(1);
+
+    const remote = new StoreBridgeSide(new MeshStore(scratch(), 64 * 1024, 500), "hub");
+    const cursorPath = path.join(f.root, "cursor.json");
+    fs.writeFileSync(cursorPath, JSON.stringify({ format: 1, local: "hub", remote: "spoke",
+      toLocal: { after: 0, mark: 0 }, toRemote: { after: 0, mark: 0 } }));
+    const bridge = new MeshBridge({ localName: "hub", remoteName: "spoke", local: f.side, remote, cursorPath });
+    try {
+      await expect(bridge.start()).rejects.toBeInstanceOf(TypeError);
+      await expect(bridge.deliverRelay("another-spoke", {
+        topic: "fabric.control.command", kind: "command", from, to: "session:recipient",
+        data: { bridge: { from: "another-spoke", id: "not-ready" } },
+      })).rejects.toMatchObject({ code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE" });
+    } finally { await bridge.stop(); }
+  },
+);
+
+it("preserves all IDs and the page shape with a valid seal on a fresh side", async () => {
+  const first = event(1, "archive-identity-one", "fixture.archive.one");
+  const second = event(2, "archive-identity-two", "fixture.archive.two");
+  const liveHead = event(3, "live-head-identity", "fixture.live");
+  const f = fixture([first, second], [liveHead]);
+  const files = {
+    [path.basename(f.file(first.topic))]: { lastSequence: first.sequence },
+    [path.basename(f.file(second.topic))]: { lastSequence: second.sequence },
+  };
+  fs.writeFileSync(path.join(f.archive, day, "SEAL.json"), JSON.stringify({ files }));
+  const freshSide = new StoreBridgeSide(f.store, "spoke");
+
+  expect(await freshSide.bridgedIds(0)).toEqual({
+    ids: ["archive-identity-one", "archive-identity-two", "live-head-identity"], through: 3, done: true,
+  });
+});
+
+// Measure the real public call's metadata, synchronous event probes and all JSON.parse
+// attempts. A readFile is one read, not also its internal readSync calls. Async event
+// FileHandle.read is observed separately by the race tests below.
+const observeBoundaryWork = (
+  onMetadataRead?: (file: unknown, bytes: string | Buffer) => void,
+  onParse?: (text: string) => void,
+) => {
+  const cost = { metadataReadCalls: 0, metadataReadBytes: 0, probeReadCalls: 0, probeReadBytes: 0, parseAttempts: 0 };
+  const readFileSync = fs.readFileSync, readSync = fs.readSync, readFile = fs.promises.readFile, parse = JSON.parse;
+  let nested = 0;
+  const syncFiles = vi.spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof readFileSync>) => {
+    cost.metadataReadCalls++;
+    nested++;
+    try {
+      const result = Reflect.apply(readFileSync, fs, args) as string | Buffer;
+      cost.metadataReadBytes += Buffer.byteLength(result);
+      return result;
+    } finally { nested--; }
+  }) as typeof readFileSync);
+  const syncReads = vi.spyOn(fs, "readSync").mockImplementation(((...args: Parameters<typeof readSync>) => {
+    if (!nested) cost.probeReadCalls++;
+    const bytes = Reflect.apply(readSync, fs, args) as number;
+    if (!nested) cost.probeReadBytes += bytes;
+    return bytes;
+  }) as typeof readSync);
+  const asyncFiles = vi.spyOn(fs.promises, "readFile").mockImplementation((async (...args: Parameters<typeof readFile>) => {
+    cost.metadataReadCalls++;
+    const result = await Reflect.apply(readFile, fs.promises, args) as string | Buffer;
+    cost.metadataReadBytes += Buffer.byteLength(result);
+    onMetadataRead?.(args[0], result);
+    return result;
+  }) as typeof readFile);
+  const parses = vi.spyOn(JSON, "parse").mockImplementation((...args: Parameters<typeof parse>) => {
+    cost.parseAttempts++;
+    onParse?.(args[0]);
+    return parse(...args);
+  });
+  return () => {
+    syncFiles.mockRestore(); syncReads.mockRestore(); asyncFiles.mockRestore(); parses.mockRestore();
+    syncBuiltinESMExports();
+    return { ...cost };
+  };
+};
+
+// Data safety: an optional hint's byte ceiling must change only pruning work, never
+// archive coverage, sequence ordering, the public page shape, or actual I/O accounting.
+it.each(["small", "oversized"] as const)(
+  "preserves ordered after>0 recovery with a %s valid seal hint", async size => {
+    const covered = event(2, "already-covered", "fixture.archive.covered");
+    const first = event(4, "archive-first", "fixture.archive.outer");
+    const middle = event(6, "archive-middle", "fixture.archive.inner");
+    const last = event(8, "archive-last", first.topic);
+    const liveHead = event(10, "live-head", "fixture.live");
+    const f = fixture([covered, first, middle, last], [liveHead]);
+    const oversized = size === "oversized", ceiling = 1024 * 1024;
+    const files = {
+      [path.basename(f.file(covered.topic))]: { lastSequence: covered.sequence },
+      [path.basename(f.file(first.topic))]: { lastSequence: last.sequence },
+      [path.basename(f.file(middle.topic))]: { lastSequence: middle.sequence },
+    };
+    // Padding changes no topic metadata. Multibyte text also distinguishes the
+    // raw-byte ceiling from a decoded-character limit.
+    const sealText = JSON.stringify({ files, padding: oversized ? "é".repeat(ceiling / 2) : "" });
+    const sealBytes = Buffer.byteLength(sealText);
+    expect(sealBytes > ceiling).toBe(oversized);
+    expect(sealText.length).toBeLessThan(ceiling);
+    const sealFile = path.join(f.archive, day, "SEAL.json");
+    fs.writeFileSync(sealFile, sealText);
+
+    const open = vi.spyOn(fs.promises, "open");
+    let sealReads = 0, sealReadBytes = 0, sealDecodes = 0, sealParses = 0;
+    const stopBoundary = observeBoundaryWork((file, bytes) => {
+      if (file !== sealFile) return;
+      sealReads++;
+      sealReadBytes += Buffer.byteLength(bytes);
+      expect(Buffer.isBuffer(bytes)).toBe(true);
+      if (Buffer.isBuffer(bytes)) {
+        const toString = bytes.toString.bind(bytes);
+        vi.spyOn(bytes, "toString").mockImplementation((...args) => {
+          sealDecodes++;
+          return toString(...args);
+        });
+      }
+    }, text => { if (text === sealText) sealParses++; });
+    syncBuiltinESMExports();
+    const page = await f.side.bridgedIds(covered.sequence);
+    const boundary = stopBoundary();
+
+    expect(page).toEqual({ ids: ["archive-first", "archive-middle", "archive-last", "live-head"], through: 10, done: true });
+    const opened = open.mock.calls.map(([file]) => file);
+    expect(opened).toContain(f.file(first.topic));
+    expect(opened).toContain(f.file(middle.topic));
+    // The small seal still prunes a wholly covered topic. An oversized seal is
+    // UNSEALED, not an empty complete seal: even that topic is read and filtered.
+    expect(opened.includes(f.file(covered.topic))).toBe(oversized);
+    expect(sealReads).toBe(1);
+    expect(sealReadBytes).toBe(sealBytes);
+    expect(sealDecodes).toBe(oversized ? 0 : 1);
+    expect(sealParses).toBe(oversized ? 0 : 1);
+    const cost = f.side.recoveryReadCost!;
+    expect(cost.events).toBe(4);
+    expect(cost.metadataReadCalls).toBe(boundary.metadataReadCalls);
+    expect(cost.metadataReadBytes).toBe(boundary.metadataReadBytes);
+    expect(cost.metadataReadBytes).toBeGreaterThanOrEqual(sealBytes);
+    expect(cost.archiveParseAttempts + cost.liveParseAttempts + cost.probeParseAttempts + cost.metadataParseAttempts)
+      .toBe(boundary.parseAttempts);
+  },
+);
+
+it("retains an oversized seal's completed native bytes on cancellation without parsing or publishing a page", async () => {
+  const archived = event(1), f = fixture([archived], [event(2)]);
+  const sealFile = path.join(f.archive, day, "SEAL.json");
+  const sealText = JSON.stringify({ files: {
+    [path.basename(f.file(archived.topic))]: { lastSequence: archived.sequence },
+  }, padding: "é".repeat(512 * 1024) });
+  const sealBytes = Buffer.byteLength(sealText);
+  expect(sealBytes).toBeGreaterThan(1024 * 1024);
+  fs.writeFileSync(sealFile, sealText);
+  const open = vi.spyOn(fs.promises, "open");
+  let sealReadBytes = 0, sealReads = 0, sealParses = 0;
+  let fence: Promise<void> | undefined;
+  const stopBoundary = observeBoundaryWork((file, bytes) => {
+    if (file !== sealFile) return;
+    sealReads++;
+    sealReadBytes += Buffer.byteLength(bytes);
+    // The native read returned real bytes; its caller has not resumed yet.
+    fence = f.side.fence();
+  }, text => { if (text === sealText) sealParses++; });
+  syncBuiltinESMExports();
+  let page: BridgedIds | undefined, failure: unknown;
+  try { page = await f.side.bridgedIds(0); }
+  catch (error) { failure = error; }
+  await fence;
+  const boundary = stopBoundary();
+
+  expect(fence).toBeDefined();
+  expect(failure).toBeInstanceOf(Error);
+  expect((failure as Error).message).toMatch(/fenced|cancelled/i);
+  expect(page).toBeUndefined();
+  expect(sealReads).toBe(1);
+  expect(sealReadBytes).toBe(sealBytes);
+  expect(sealParses).toBe(0);
+  expect(open.mock.calls.some(([file]) => typeof file === "string" && file.startsWith(f.archive + path.sep))).toBe(false);
+  const cost = f.side.recoveryReadCost!;
+  expect(cost).toMatchObject({ events: 0, eventBytes: 0, archiveReadCalls: 0, archiveParseAttempts: 0,
+    metadataReadCalls: boundary.metadataReadCalls, metadataReadBytes: boundary.metadataReadBytes });
+  expect(cost.metadataReadBytes).toBeGreaterThanOrEqual(sealBytes);
+  expect(cost.archiveParseAttempts + cost.liveParseAttempts + cost.probeParseAttempts + cost.metadataParseAttempts)
+    .toBe(boundary.parseAttempts);
+});
+
 // Data safety / native-I/O race: fence after the real read completes but before Work.io
 // resumes. Frontier initialization can already have parsed a head without popping any position.
 it.each(["archive", "frontier", "live", "probe", "hint"] as const)(
@@ -336,7 +544,7 @@ it.each(["archive", "frontier", "live", "probe", "hint"] as const)(
     if (kind === "hint") expect(f.store.read({ after: 0, limit: 2 }).map(row => row.sequence)).toEqual([1, 2]);
     const nativeOpen = fs.promises.open;
     const handles: Array<Awaited<ReturnType<typeof nativeOpen>>> = [];
-    let nativeBytes = 0, nativeCalls = 0, closeCalls = 0;
+    let nativeBytes = 0, nativeCalls = 0, closeCalls = 0, otherProbeCalls = 0, otherProbeBytes = 0;
     let fence: Promise<void> | undefined;
     const cancelAt = kind === "frontier" ? 2 : 1;
     const archiveRead = kind === "archive" || kind === "frontier";
@@ -348,23 +556,28 @@ it.each(["archive", "frontier", "live", "probe", "hint"] as const)(
       const target = typeof args[0] === "string" && (archiveRead
         ? args[0].startsWith(f.archive + path.sep) && args[0].endsWith(".jsonl")
         : args[0] === path.join(f.root, "events.jsonl"));
-      if (target) {
-        const read = handle.read;
-        handle.read = (async (...readArgs: Parameters<typeof read>) => {
-          const result = await Reflect.apply(read, handle, readArgs) as Awaited<ReturnType<typeof read>>;
+      const read = handle.read;
+      handle.read = (async (...readArgs: Parameters<typeof read>) => {
+        const result = await Reflect.apply(read, handle, readArgs) as Awaited<ReturnType<typeof read>>;
+        if (target) {
           nativeCalls++;
           nativeBytes += result.bytesRead;
           if (nativeCalls === cancelAt) fence = f.side.fence();
-          return result;
-        }) as typeof handle.read;
-      }
+        } else {
+          otherProbeCalls++;
+          otherProbeBytes += result.bytesRead;
+        }
+        return result;
+      }) as typeof handle.read;
       return handle;
     });
+    const stopBoundary = observeBoundaryWork();
     syncBuiltinESMExports();
     let page: BridgedIds | undefined, failure: unknown;
     try { page = await f.side.bridgedIds(after); }
     catch (error) { failure = error; }
     await fence;
+    const boundary = stopBoundary();
     expect(fence).toBeDefined();
     expect(failure).toBeInstanceOf(Error);
     expect((failure as Error).message).toMatch(/fenced|cancelled/i);
@@ -372,8 +585,14 @@ it.each(["archive", "frontier", "live", "probe", "hint"] as const)(
     const cost = f.side.recoveryReadCost;
     expect(cost).toBeDefined();
     const category = archiveRead ? "archive" : kind === "live" ? "live" : "probe";
-    expect(cost![`${category}ReadCalls`]).toBe(nativeCalls);
-    expect(cost![`${category}ReadBytes`]).toBe(nativeBytes);
+    expect(cost![`${category}ReadCalls`]).toBe(nativeCalls + (category === "probe" ? boundary.probeReadCalls : 0));
+    expect(cost![`${category}ReadBytes`]).toBe(nativeBytes + (category === "probe" ? boundary.probeReadBytes : 0));
+    expect(cost!.probeReadCalls).toBe(boundary.probeReadCalls + otherProbeCalls + (category === "probe" ? nativeCalls : 0));
+    expect(cost!.probeReadBytes).toBe(boundary.probeReadBytes + otherProbeBytes + (category === "probe" ? nativeBytes : 0));
+    expect(cost!.metadataReadCalls).toBe(boundary.metadataReadCalls);
+    expect(cost!.metadataReadBytes).toBe(boundary.metadataReadBytes);
+    expect(cost!.archiveParseAttempts + cost!.liveParseAttempts + cost!.probeParseAttempts + cost!.metadataParseAttempts)
+      .toBe(boundary.parseAttempts);
     expect(nativeCalls).toBe(cancelAt);
     expect(nativeBytes).toBeGreaterThan(0);
     expect(cost!.events).toBe(0);
@@ -391,28 +610,74 @@ it.each(["archive", "frontier", "live", "probe", "hint"] as const)(
   },
 );
 
-it("retains metadata bytes completed before cancellation without parsing or opening data", async () => {
+it("retains metadata bytes completed before cancellation without parsing that file or opening archive data", async () => {
   const f = fixture([event(1)], [event(2)]);
-  const nativeRead = fs.promises.readFile;
+  // Malformed generation metadata is still a real parse attempt; its invalid UTF-8
+  // also distinguishes native byte length from the decoded string's byte length.
+  fs.writeFileSync(path.join(f.root, "generation"), Buffer.from([0xff]));
+  const open = vi.spyOn(fs.promises, "open");
   let nativeBytes = 0;
   let fence: Promise<void> | undefined;
-  vi.spyOn(fs.promises, "readFile").mockImplementation((async (...args: Parameters<typeof nativeRead>) => {
-    const result = await nativeRead(...args);
-    if (args[0] === path.join(f.root, MESH_ARCHIVE_CONFIG)) {
-      nativeBytes += Buffer.byteLength(result);
+  const stopBoundary = observeBoundaryWork((file, bytes) => {
+    if (file === path.join(f.root, MESH_ARCHIVE_CONFIG)) {
+      nativeBytes += Buffer.byteLength(bytes);
       fence = f.side.fence();
     }
-    return result;
-  }) as typeof nativeRead);
+  });
   syncBuiltinESMExports();
-  await expect(f.side.bridgedIds(0)).rejects.toThrow(/fenced|cancelled/i);
+  let failure: unknown;
+  try { await f.side.bridgedIds(0); }
+  catch (error) { failure = error; }
   await fence;
+  const boundary = stopBoundary();
+  expect(failure).toBeInstanceOf(Error);
+  expect((failure as Error).message).toMatch(/fenced|cancelled/i);
   expect(fence).toBeDefined();
   expect(nativeBytes).toBeGreaterThan(0);
   expect(f.side.recoveryReadCost).toMatchObject({
-    events: 0, eventBytes: 0, metadataReadCalls: 1, metadataReadBytes: nativeBytes,
-    archiveReadCalls: 0, archiveParseAttempts: 0, liveReadCalls: 0, probeReadCalls: 0,
+    events: 0, eventBytes: 0, metadataReadCalls: boundary.metadataReadCalls, metadataReadBytes: boundary.metadataReadBytes,
+    metadataParseAttempts: 1, archiveReadCalls: 0, archiveParseAttempts: 0, liveReadCalls: 0,
+    probeReadCalls: boundary.probeReadCalls, probeReadBytes: boundary.probeReadBytes, probeParseAttempts: 1,
   });
+  expect(boundary.metadataReadBytes).toBe(nativeBytes + 1);
+  expect(open).not.toHaveBeenCalled();
+  const cost = f.side.recoveryReadCost!;
+  expect(cost.archiveParseAttempts + cost.liveParseAttempts + cost.probeParseAttempts + cost.metadataParseAttempts)
+    .toBe(boundary.parseAttempts);
+});
+
+it("counts a rejected native archive read attempt with no known bytes and preserves its error", async () => {
+  const f = fixture([event(1)], [event(2)]);
+  const nativeOpen = fs.promises.open;
+  const handles: Array<Awaited<ReturnType<typeof nativeOpen>>> = [];
+  let attempts = 0, nativeError: unknown, failure: unknown, page: BridgedIds | undefined;
+  vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+    const handle = await nativeOpen(...args);
+    handles.push(handle);
+    if (typeof args[0] === "string" && args[0].startsWith(f.archive + path.sep) && args[0].endsWith(".jsonl")) {
+      const read = handle.read, close = handle.close.bind(handle);
+      handle.read = (async (...readArgs: Parameters<typeof read>) => {
+        // Invoke the real FileHandle.read on a closed handle, not a fabricated rejection.
+        await close();
+        attempts++;
+        try { return await Reflect.apply(read, handle, readArgs); }
+        catch (error) { nativeError = error; throw error; }
+      }) as typeof handle.read;
+    }
+    return handle;
+  });
+  syncBuiltinESMExports();
+  try { page = await f.side.bridgedIds(0); }
+  catch (error) { failure = error; }
+  expect(attempts).toBe(1);
+  expect(nativeError).toBeInstanceOf(Error);
+  expect(failure).toBe(nativeError);
+  expect(page).toBeUndefined();
+  expect(f.side.recoveryReadCost).toMatchObject({
+    events: 0, eventBytes: 0, archiveReadCalls: attempts, archiveReadBytes: 0, archiveParseAttempts: 0,
+  });
+  expect(handles.length).toBeGreaterThan(0);
+  expect(handles.every(handle => handle.fd === -1)).toBe(true);
 });
 
 it("yields inside a live-only page, not just once before a 25k-row recovery", async () => {
@@ -434,7 +699,7 @@ it("yields inside a live-only page, not just once before a 25k-row recovery", as
   expect([...first.ids, ...second.ids, ...last.ids]).toEqual(rows.map((_, index) => `original-${index + 1}`));
 });
 
-it.each(["replacement", "shrink"] as const)("rejects %s of an archive file with a retained in-horizon head", async damage => {
+it.each(["replacement", "shrink", "missing"] as const)("rejects %s of an archive file with a retained in-horizon head", async damage => {
   const prefix = Array.from({ length: 10_000 }, (_, index) => event(index + 1, `prefix-${index}`, "fixture.prefix"));
   const buffered = [event(10_001, "buffered", "fixture.lookahead"), event(12_000, "later", "fixture.lookahead")];
   const f = fixture([...prefix, ...buffered], [event(20_000)]);
@@ -446,8 +711,17 @@ it.each(["replacement", "shrink"] as const)("rejects %s of an archive file with 
     const replacement = target + ".replacement";
     fs.writeFileSync(replacement, line(event(10_001, "replacement-must-not-be-a-successful-continuation", "fixture.lookahead")));
     fs.renameSync(replacement, target);
-  } else fs.truncateSync(target, 0);
+  } else if (damage === "shrink") fs.truncateSync(target, 0);
+  else fs.renameSync(target, target + ".held");
+  const nativeStat = fs.promises.stat;
+  let statAttempts = 0;
+  vi.spyOn(fs.promises, "stat").mockImplementation(((...args: Parameters<typeof nativeStat>) => {
+    statAttempts++;
+    return Reflect.apply(nativeStat, fs.promises, args);
+  }) as typeof nativeStat);
   await expect(f.side.bridgedIds(first.through)).rejects.toThrow();
+  expect(statAttempts).toBeGreaterThan(0);
+  expect(f.side.recoveryReadCost?.sourceValidationCalls).toBe(statAttempts);
 });
 
 // Fabric's global writer maximum is 4 MiB. Gate both record shapes here;

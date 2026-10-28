@@ -5623,10 +5623,10 @@ const allBridgedIds = async (side: BridgeSide, after: number, check: () => void,
       : "inspectedEvents=unavailable eventBytes=unavailable maxSliceMs=unavailable";
     const attemptedCost = side instanceof StoreBridgeSide
       ? ` attemptedPages=${attemptedPages} poppedEvents=${totalCost?.events ?? 0}` +
-        ` parseAttempts=${(totalCost?.archiveParseAttempts ?? 0) + (totalCost?.liveParseAttempts ?? 0) + (totalCost?.probeParseAttempts ?? 0)} ` +
+        ` parseAttempts=${(totalCost?.archiveParseAttempts ?? 0) + (totalCost?.liveParseAttempts ?? 0) + (totalCost?.probeParseAttempts ?? 0) + (totalCost?.metadataParseAttempts ?? 0)} ` +
         (["archiveReadBytes", "archiveReadCalls", "archiveParseAttempts", "liveReadBytes", "liveReadCalls", "liveParseAttempts",
           "probeReadBytes", "probeReadCalls", "probeParseAttempts", "metadataReadBytes", "metadataReadCalls", "discoveryReadCalls",
-          "generationProbes", "horizonMs", "stages", "skippedRecords"] as const)
+          "generationProbes", "horizonMs", "stages", "skippedRecords", "metadataParseAttempts", "sourceValidationCalls"] as const)
           .map(key => `${key}=${totalCost?.[key] ?? 0}`).join(" ")
       : ` attemptedPages=${attemptedPages}`;
     log(`mark=${after} horizon=${horizon} pages=${pages} ${cost} matchingIds=${ids.size} elapsedMs=${Math.ceil(monotonicClock.now() - started)} completed=${completed} cancelled=${!completed}${attemptedCost}`);

@@ -5,6 +5,10 @@ import { performance } from "node:perf_hooks";
 import type { MeshEvent } from "./event-log.js";
 import { MESH_ARCHIVE_CONFIG } from "./archive.js";
 
+/** Calls count native attempts (including rejection); bytes count only returned bytes.
+ * readFile is one attempt, not also its nested native reads. Parse counters include failures.
+ * Popped events/bytes exclude discovery and retained frontier work, which have separate totals.
+ */
 export interface RecoveryReadCost {
   events: number;
   eventBytes: number;
@@ -15,12 +19,18 @@ export interface RecoveryReadCost {
   liveReadBytes: number;
   liveReadCalls: number;
   liveParseAttempts: number;
+  // Oldest-live/hint probes plus synchronous committed-boundary/horizon event reads.
   probeReadBytes: number;
   probeReadCalls: number;
   probeParseAttempts: number;
+  // Archive configuration, seals, abort maps, and synchronous generation metadata.
   metadataReadBytes: number;
   metadataReadCalls: number;
+  metadataParseAttempts: number;
   discoveryReadCalls: number;
+  // #validate path-stat attempts only, not FileHandle.stat/open or discovery.
+  sourceValidationCalls: number;
+  // Explicit generation accessor checks; horizon's generation I/O is also in metadata totals.
   generationProbes: number;
   horizonMs: number;
   stages: number;
@@ -42,8 +52,9 @@ export interface RecoveryHint { sequence: number; offset: number }
 export interface RecoveryReaderAccess {
   root: string;
   maxEventBytes: number;
-  horizon(): number;
-  generation(): number;
+  // Recovery-only optional attempt sink; ordinary consumers need not supply one.
+  horizon(cost?: RecoveryReadCost): number;
+  generation(cost?: RecoveryReadCost): number;
   hint(after: number, generation: number, inode: number): RecoveryHint | undefined;
   remember(after: number, generation: number, inode: number, lines: RecoveryHint[], boundary?: RecoveryHint): void;
 }
@@ -99,6 +110,7 @@ const codeOf = (error: unknown): unknown =>
 const changed = (): Error => new Error("Mesh recovery source changed during read");
 const PAGE_POSITIONS = 10_000;
 const CHUNK_MAX = 256 * 1024;
+const SEAL_HINT_PARSE_MAX_BYTES = 1024 * 1024;
 
 /** One call's work clock. Resolved helper promises do not reset the active-work quantum. */
 class Work {
@@ -108,8 +120,8 @@ class Work {
     archiveReadBytes: 0, archiveReadCalls: 0, archiveParseAttempts: 0,
     liveReadBytes: 0, liveReadCalls: 0, liveParseAttempts: 0,
     probeReadBytes: 0, probeReadCalls: 0, probeParseAttempts: 0,
-    metadataReadBytes: 0, metadataReadCalls: 0, discoveryReadCalls: 0,
-    generationProbes: 0, horizonMs: 0, stages: 0, skippedRecords: 0,
+    metadataReadBytes: 0, metadataReadCalls: 0, metadataParseAttempts: 0, discoveryReadCalls: 0,
+    sourceValidationCalls: 0, generationProbes: 0, horizonMs: 0, stages: 0, skippedRecords: 0,
   };
   #started = performance.now();
   #records = 0;
@@ -186,8 +198,9 @@ export class RecoveryReader {
       const started = performance.now();
       // The adapter uses latestCursor's last anchor, or complete committed live lines, never
       // the reservation counter. Capture once, before any discovery, and do not chase writes.
-      const horizon = this.access.horizon();
-      work.cost.horizonMs = performance.now() - started;
+      let horizon: number;
+      try { horizon = this.access.horizon(work.cost); }
+      finally { work.cost.horizonMs = performance.now() - started; }
       const pause = work.checkpoint();
       if (pause) await work.wait(() => pause);
       if (after >= horizon) {
@@ -203,6 +216,9 @@ export class RecoveryReader {
         const stage = this.#slot.stage;
         for (const source of stage.day?.streams ?? (stage.live ? [stage.live] : [])) {
           await work.wait(() => this.#validate(source, work));
+          // Sources missing at discovery may have no identity/native stat to yield on.
+          const pause = work.checkpoint(1);
+          if (pause) await work.wait(() => pause);
         }
       }
       const ids: string[] = [];
@@ -231,6 +247,8 @@ export class RecoveryReader {
         if (source.kind === "live" && source.identity && source.generation !== undefined) {
           this.access.remember(source.hintAfter!, source.generation, source.identity.ino, source.hints, source.boundary);
         }
+        const pause = work.checkpoint(1);
+        if (pause) await work.wait(() => pause);
       }
       const done = through >= horizon;
       if (done) this.#slot = undefined;
@@ -245,13 +263,19 @@ export class RecoveryReader {
     }
   }
 
-  async #readJson<T>(file: string, work: Work): Promise<T | undefined> {
+  async #readJson<T>(file: string, work: Work, optionalHintParseByteCeiling?: number): Promise<T | undefined> {
     work.check();
-    work.cost.metadataReadCalls++;
     let bytes: Buffer;
     try {
-      bytes = await work.io(() => fs.promises.readFile(file), result => { work.cost.metadataReadBytes += result.length; });
+      bytes = await work.io(() => {
+        work.cost.metadataReadCalls++;
+        return fs.promises.readFile(file);
+      }, result => { work.cost.metadataReadBytes += result.length; });
     } catch (error) { work.check(); if (codeOf(error) === "ENOENT") return undefined; throw error; }
+    // Optional pruning hints may fall back to full discovery, but their entire native
+    // read still counts. Check raw bytes before decoding or attempting JSON.parse.
+    if (optionalHintParseByteCeiling !== undefined && bytes.length > optionalHintParseByteCeiling) return undefined;
+    work.cost.metadataParseAttempts++;
     const value = JSON.parse(bytes.toString("utf8")) as T;
     const pause = work.checkpoint();
     if (pause) await work.wait(() => pause);
@@ -259,8 +283,10 @@ export class RecoveryReader {
   }
 
   async #names(directory: string, work: Work): Promise<string[]> {
-    work.cost.discoveryReadCalls++;
-    try { return await work.io(() => fs.promises.readdir(directory)); }
+    try { return await work.io(() => {
+      work.cost.discoveryReadCalls++;
+      return fs.promises.readdir(directory);
+    }); }
     catch (error) { work.check(); if (codeOf(error) === "ENOENT") return []; throw error; }
   }
 
@@ -310,7 +336,7 @@ export class RecoveryReader {
   #generation(work: Work): number {
     work.check();
     work.cost.generationProbes++;
-    return this.access.generation();
+    return this.access.generation(work.cost);
   }
 
   #assertStat(source: Source, stat: fs.Stats): void {
@@ -324,7 +350,10 @@ export class RecoveryReader {
     work.check();
     if (!source.identity) return;
     work.used.add(source);
-    const stat = await work.io(() => fs.promises.stat(source.file));
+    const stat = await work.io(() => {
+      work.cost.sourceValidationCalls++;
+      return fs.promises.stat(source.file);
+    });
     this.#assertStat(source, stat);
     if (source.generation !== undefined && this.#generation(work) !== source.generation) throw changed();
     return stat;
@@ -352,10 +381,10 @@ export class RecoveryReader {
           const hint = this.access.hint(source.hintAfter, generation, stat.ino);
           if (hint && hint.offset > 0 && hint.offset <= stat.size) {
             const byte = Buffer.allocUnsafe(1);
-            const result = await work.io(() => handle!.read(byte, 0, 1, hint.offset - 1), read => {
+            const result = await work.io(() => {
               work.cost.probeReadCalls++;
-              work.cost.probeReadBytes += read.bytesRead;
-            });
+              return handle!.read(byte, 0, 1, hint.offset - 1);
+            }, read => { work.cost.probeReadBytes += read.bytesRead; });
             if (result.bytesRead === 1 && byte[0] === 0x0a) {
               source.physical = source.lineStart = source.requiredEnd = hint.offset;
               source.lastSequence = hint.sequence;
@@ -373,15 +402,10 @@ export class RecoveryReader {
         source.observedEnd = Math.max(source.observedEnd, current!.size);
       }
       const bytes = Buffer.allocUnsafe(Math.min(source.quantum, end - source.physical));
-      const result = await work.io(() => handle!.read(bytes, 0, bytes.length, source.physical), read => {
-        if (source.kind === "archive") {
-          work.cost.archiveReadCalls++; work.cost.archiveReadBytes += read.bytesRead;
-        } else if (source.kind === "live") {
-          work.cost.liveReadCalls++; work.cost.liveReadBytes += read.bytesRead;
-        } else {
-          work.cost.probeReadCalls++; work.cost.probeReadBytes += read.bytesRead;
-        }
-      });
+      const result = await work.io(() => {
+        work.cost[`${source.kind}ReadCalls`]++;
+        return handle!.read(bytes, 0, bytes.length, source.physical);
+      }, read => { work.cost[`${source.kind}ReadBytes`] += read.bytesRead; });
       if (result.bytesRead === 0) {
         // Zero before an observed end is not EOF. Revalidate, then fail without publishing
         // coverage; a disappearing unclassified suffix cannot turn this into successful done.
@@ -585,11 +609,16 @@ export class RecoveryReader {
     while (stage.nextDay < stage.days.length) {
       const directory = path.join(stage.archive!, stage.days[stage.nextDay++]!);
       const aborted = await work.wait(() => this.#readJson<Record<string, string>>(path.join(directory, "ABORTED.json"), work));
-      const seal = await work.wait(() => this.#readJson<{ files: Record<string, { lastSequence: number }> }>(path.join(directory, "SEAL.json"), work));
+      const seal = await work.wait(() => this.#readJson<{ files?: Record<string, { lastSequence: number }> | null }>(
+        path.join(directory, "SEAL.json"), work, SEAL_HINT_PARSE_MAX_BYTES));
       let maximum = 0;
       if (seal) {
-        for (const file of Object.values(seal.files)) {
-          maximum = Math.max(maximum, file.lastSequence);
+        if (seal.files === undefined || seal.files === null) {
+          throw new TypeError("Cannot convert undefined or null to object");
+        }
+        for (const name in seal.files) {
+          if (!Object.hasOwn(seal.files, name)) continue;
+          maximum = Math.max(maximum, seal.files[name]!.lastSequence);
           const pause = work.checkpoint(1);
           if (pause) await work.wait(() => pause);
         }
@@ -597,7 +626,8 @@ export class RecoveryReader {
       }
       const names: string[] = [];
       for (const name of await work.wait(() => this.#names(directory, work))) {
-        if (name.endsWith(".jsonl") && !(seal?.files[name] && seal.files[name].lastSequence <= stage.after)) names.push(name);
+        const sealedFile = seal?.files?.[name];
+        if (name.endsWith(".jsonl") && !(sealedFile && sealedFile.lastSequence <= stage.after)) names.push(name);
         const pause = work.checkpoint(1);
         if (pause) await work.wait(() => pause);
       }

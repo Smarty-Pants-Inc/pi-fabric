@@ -4,7 +4,7 @@
 // Hosted CI logs TEST_DELETION_REPORT: per outside operand, then delegates. Children inherit NODE_OPTIONS.
 // ponytail: a JS seam, not native race protection; helpers deleting through their own syscalls are out of reach.
 import fs from "node:fs";
-import { hostedOnly } from "../scripts/hosted-only.mjs";
+import { isHostedOnlyAllowed } from "../scripts/hosted-only.mjs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, sep } from "node:path";
@@ -123,7 +123,7 @@ function callerFrame() {
 }
 
 function install() {
-  const report = hostedOnly("outside-temp deletion reporting");
+  const report = isHostedOnlyAllowed(process.env);
   const state = { report, root: pinRoot(), count: 0 };
 
   /** An Error to refuse with, or undefined to delegate. */

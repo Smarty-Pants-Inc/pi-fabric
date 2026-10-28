@@ -207,7 +207,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     cleanup.push(() => fs.rmSync(dir, { recursive: true, force: true }));
     const far = new MeshStore(path.join(dir, "mesh"), 64 * 1024, 1_000);
     const received: Array<[string, string, string | undefined, string]> = [];
-    const owner = new FabricControlPlane(far, remote, { enabled: true, hostId: remote.id, pollMs: 20, ownerIncarnation: fixtureOwnerIncarnation });
+    const owner = new FabricControlPlane(far, remote, { enabled: true, hostId: remote.id, pollMs: relayMs, ownerIncarnation: fixtureOwnerIncarnation });
     owner.start((command, from) => {
       received.push([command.operation, command.targetId, command.message, from.id]);
       return { accepted: true, messageId: `m-${received.length}` };
@@ -345,7 +345,9 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
       // Keep the lease live beyond the bridge/ACK window and the bounded late
       // confirmation grace. Drive the actual relay, handler and sender with the clock.
       await mirror({ expiresAt: Date.now() + 120_000 });
-      vi.useFakeTimers();
+      // Fake deadlines, not I/O: MeshStore publish/sync completes its fsync barrier
+      // in setImmediate, including work queued by the final clock tick.
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
       // A one-second fixture cadence still traverses both real meshes and the lease
       // watchdog, without thousands of redundant reads during this fake-clock jump.
       const { received } = await remoteOwner(mesh, local, remote, forged, false, 1_000);
@@ -363,8 +365,8 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
         await vi.advanceTimersByTimeAsync(1);
         await expect(observation).rejects.toThrow("Fabric mesh bridge to remote host forge is not responding");
       } finally {
-        await sender.close();
         vi.useRealTimers();
+        await sender.close();
       }
       expect(received.length).toBeGreaterThan(0);                                               // it ran; the forged answer was ignored
     }

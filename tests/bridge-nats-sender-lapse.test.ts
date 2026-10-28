@@ -290,38 +290,58 @@ describe.skipIf(!binary)("NATS carrier sender lease-lapse", () => {
     } finally { await f.close(); }
   }, 30_000);
 
-  it.each([false, true])("allowed-target KV wait shares the durable deadline across restart=%s", async restart => {
+  it.each([false, true])("allowed-target own-KV lag retains its immutable cap across restart=%s", async restart => {
     const f = await fixture();
     const now = vi.spyOn(Date, "now").mockImplementation(f.clock);
     try {
       const original = f.envelope(); await f.pod.send(original); await f.pending(); f.hideTarget(true);
       await expect(f.link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
-      const retained = fs.readFileSync(f.lapsePath, "utf8");
+      const retained = JSON.parse(fs.readFileSync(f.lapsePath, "utf8")).lapses[0];
+      expect(retained.target).toMatchObject({ activeMs: 0, budgetMs: WINDOW, kind: "target" });
+      expect(retained.senderStartedAt).toBeUndefined();
       if (restart) await f.restart();
-      f.advance(29_999); await f.lease(POD);
+      // Unknown restart gaps consume budget; only observed same-process lag is paused.
+      f.advance(restart ? 20_000 : 35_000); await f.lease(POD);
       await vi.waitFor(() => expect(f.port.resolve(POD)?.route.live).toBe(true), { timeout: 10_000 });
       await expect(f.link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
-      expect(fs.readFileSync(f.lapsePath, "utf8")).toBe(retained);
+      const observed = JSON.parse(fs.readFileSync(f.lapsePath, "utf8")).lapses[0];
+      expect(observed.startedAt).toBe(retained.startedAt);
+      expect(observed.target).toMatchObject({ firstSeenAt: retained.target.firstSeenAt, budgetMs: WINDOW,
+        activeMs: restart ? 20_000 : 0 });
+      expect(observed.senderStartedAt).toBeUndefined(); expect(observed.terminalReason).toBeUndefined();
+      expect(f.events()).toEqual([]); expect(f.receive).not.toHaveBeenCalled();
+      // The cap is immutable even when the source and native target remain independently live.
+      f.advance(119_999 - (f.clock() - retained.target.firstSeenAt)); await f.lease(POD);
+      await vi.waitFor(() => expect(f.port.resolve(POD)?.route.live).toBe(true), { timeout: 10_000 });
+      await expect(f.link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+      expect(f.logs.filter(line => line.includes(original.id) && line.includes("refused"))).toEqual([]);
       f.advance(1); await f.link.bridge.step();
-      expect(f.events()).toEqual([]);
+      const terminal = JSON.parse(fs.readFileSync(f.lapsePath, "utf8")).lapses[0];
+      expect(terminal.target.firstSeenAt).toBe(retained.target.firstSeenAt);
+      expect(terminal.terminalReason).toEqual(expect.any(String));
+      expect(f.events()).toEqual([]); expect(f.receive).not.toHaveBeenCalled();
       expect(f.logs.filter(line => line.includes(original.id) && line.includes("refused"))).toHaveLength(1);
       expect(f.deliveries.every(delivery => delivery.streamSequence === f.deliveries[0]!.streamSequence)).toBe(true);
     } finally { now.mockRestore(); await f.close(); }
   }, 30_000);
 
-  it("an allowed target absent from this link's KV view reappears within the original deadline", async () => {
+  it("an independently live native target recovers its own KV route after 35 s and appends once", async () => {
     const f = await fixture();
     const now = vi.spyOn(Date, "now").mockImplementation(f.clock);
     try {
       const original = f.envelope(); await f.pod.send(original); await f.pending(); f.hideTarget(true);
       await expect(f.link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
-      const retained = fs.readFileSync(f.lapsePath, "utf8");
+      const retained = JSON.parse(fs.readFileSync(f.lapsePath, "utf8")).lapses[0];
+      expect(retained.target).toMatchObject({ activeMs: 0, budgetMs: WINDOW, kind: "target" });
       expect(f.events()).toEqual([]);
-      f.advance(10_000); f.hideTarget(false); await f.lease(POD);
+      f.advance(35_000); f.hideTarget(false); await f.lease(POD);
       await f.link.bridge.syncPresence();
       await vi.waitFor(async () => { await f.link.bridge.step(); expect(f.receive).toHaveBeenCalledOnce(); }, { timeout: 10_000 });
       expect(f.events()).toHaveLength(1); expect(f.events()[0]!.data).toMatchObject({ bridge: { id: original.id } });
-      expect(fs.readFileSync(f.lapsePath, "utf8")).toBe(retained);
+      const recovered = JSON.parse(fs.readFileSync(f.lapsePath, "utf8")).lapses[0];
+      expect(recovered.startedAt).toBe(retained.startedAt);
+      expect(recovered.target).toMatchObject({ firstSeenAt: retained.target.firstSeenAt, activeMs: 0, budgetMs: WINDOW, complete: true });
+      expect(recovered.senderStartedAt).toBeUndefined(); expect(recovered.terminalReason).toBeUndefined();
       expect(f.logs.filter(line => line.includes(original.id) && line.includes("refused"))).toEqual([]);
     } finally { now.mockRestore(); await f.close(); }
   }, 30_000);
@@ -332,11 +352,15 @@ describe.skipIf(!binary)("NATS carrier sender lease-lapse", () => {
     try {
       const original = f.envelope(); await f.pod.send(original); await f.pending(); await f.lapse();
       await expect(f.link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
-      const retained = fs.readFileSync(f.lapsePath, "utf8");
+      const retained = JSON.parse(fs.readFileSync(f.lapsePath, "utf8")).lapses[0];
+      expect(retained.senderStartedAt).toBe(retained.startedAt);
       f.advance(20_000); f.hideTarget(true); await f.lease(POD);
       await vi.waitFor(() => expect(f.port.resolve(POD)?.route.live).toBe(true), { timeout: 10_000 });
       await expect(f.link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
-      expect(fs.readFileSync(f.lapsePath, "utf8")).toBe(retained);
+      const waiting = JSON.parse(fs.readFileSync(f.lapsePath, "utf8")).lapses[0];
+      expect(waiting.startedAt).toBe(retained.startedAt); expect(waiting.senderStartedAt).toBe(retained.senderStartedAt);
+      expect(waiting.target).toMatchObject({ firstSeenAt: f.clock(), activeMs: 0, budgetMs: WINDOW });
+      expect(waiting.terminalReason).toBeUndefined();
       f.advance(10_000); await f.link.bridge.step();
       expect(f.events()).toEqual([]);
       expect(f.logs.filter(line => line.includes(original.id) && line.includes("refused"))).toHaveLength(1);

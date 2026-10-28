@@ -1,6 +1,6 @@
 import { appendDeliveryOutcome, deliverySend, hasDeliveryOutcome, type DeliverySend, type DeliveryOutcome, type DeliveryOutcomeRecord } from "../mesh/delivery-outcomes.js";
 import { childProcessEnvironment } from "../core/atomic-write.js";
-import { diagnostics } from "../core/diagnostics.js";
+import { diagnostics, logDiagnostic } from "../core/diagnostics.js";
 import { copyFabricProvenance, fabricTurnProvenance, fabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import { eventReceipts, workKey } from "../topology/root-inbox-shared.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
@@ -2224,8 +2224,11 @@ export class ActorManager {
     const owned = [...this.#actors.values()]
       .filter((actor) => this.#canManageCached(actor.id) && this.#slotCurrent(actor));
     if (!onError) return owned.map((actor) => this.#publicInfo(actor, true, registryView));
+    // Load queue metadata lazily inside each actor's isolation boundary, once per
+    // inventory. Explicit status/list readers still authenticate terminal results.
+    const preparingRuns = registryView ? {} : undefined;
     return owned.flatMap((actor) => {
-      try { return [this.#publicInfo(actor, true, registryView)]; }
+      try { return [this.#publicInfo(actor, true, registryView, preparingRuns)]; }
       catch (error) { onError(actor.id, error); return []; }
     });
   }
@@ -9266,7 +9269,7 @@ export class ActorManager {
       // A restored transient block needs its expiry wake too (smarty-dev#8487).
       this.#armActivationBlockExpiry(actor);
       // Exclude our own diagnostic so a repaired value can fit again.
-      const { ownershipToken: _token, ...legacy } = this.#publicInfo(actor, false, true);
+      const { ownershipToken: _token, ...legacy } = this.#publicInfo(actor, false, true, {});
       value = legacy;
       this.#assertPresenceValue(value);
     } catch (error) {
@@ -9275,7 +9278,7 @@ export class ActorManager {
         actor.presenceError = diagnostic;
         this.#scheduleRegistrySave(true);
         this.#emitChange();
-        diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor ${actor.id}: ${diagnostic}`);
+        logDiagnostic("src/actors/manager.ts", `[pi-fabric] actor ${actor.id}: ${diagnostic}`);
       }
       return undefined;
     }
@@ -11195,13 +11198,18 @@ export class ActorManager {
       ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status;
   }
 
-  #publicInfo(actor: ManagedActor, includePresenceError = true, registryView = false): FabricActorInfo {
+  #publicInfo(actor: ManagedActor, includePresenceError = true, registryView = false,
+    preparingRuns?: { value?: ReadonlyMap<string, number | undefined> }): FabricActorInfo {
     const session = registryView ? undefined : this.#bindings.get(actor.id);
     // Shared observers cannot know a legacy row's last admitted binding. An
     // omitted model/thinking means unknown, not this reader's session overlay.
     const effective = registryView ? actor.resolvedBinding ?? this.#restoredBinding(actor) ?? {} : this.#runBinding(actor);
     // An expired transient block no longer gates routing; its history stays visible (smarty-dev#8487).
     const blockExpired = activationBlockExpired(actor.activationBlocked);
+    const queuePosition = actor.preparing?.runId
+      ? preparingRuns ? (preparingRuns.value ??= new Map(this.agents.listForPresence().map(run => [run.id, run.queuePosition])))
+        .get(actor.preparing.runId) : this.agents.status(actor.preparing.runId).queuePosition
+      : undefined;
     return {
       id: actor.id,
       scope: this.#actorScope,
@@ -11223,7 +11231,7 @@ export class ActorManager {
       ...(actor.status === "stopped" && actor.stopReason ? { stopReason: actor.stopReason } : {}),
       ...(actor.preparing ? { preparing: { ...actor.preparing,
         ageS: Math.max(0, Math.round((Date.now() - actor.preparing.startedAt) / 1_000)),
-        ...(actor.preparing.runId ? { queuePosition: this.agents.status(actor.preparing.runId).queuePosition } : {}),
+        ...(queuePosition === undefined ? {} : { queuePosition }),
       } } : {}),
       runner: actor.runner,
       ...(actor.kernel ? { kernel: actor.kernel } : {}),

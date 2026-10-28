@@ -1,13 +1,13 @@
 import type { Usage } from "@earendil-works/pi-ai";
-import { randomUUID } from "node:crypto";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
-import { configureFabricDiagnostics, diagnostics, isPrincipalDiagnostics, notifyDiagnostic, setPrewalkStatus } from "./core/diagnostics.js";
+import { configureFabricDiagnostics, diagnostics, isPrincipalDiagnostics, logDiagnostic, notifyDiagnostic, setPrewalkStatus } from "./core/diagnostics.js";
 import { extensionContextLive } from "./session-liveness.js";
 import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
 import {
-  rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, rootInboxCarrierDigest, ROOT_INBOX_CUSTOM_TYPE,
-  type RootInboxBatch, type RootInboxReceiptSnapshot, type RootInboxReceiptVerifier, type RootInboxReconcileOptions,
+  rootInboxMessage, confirmedRootInboxSession, rootInboxSummary, ROOT_INBOX_CUSTOM_TYPE,
+  rootInboxReceiptIssuer, registerRootInboxReceipt, verifyRootInboxReceipt,
+  type RootInboxBatch, type RootInboxReceiptVerifier, type RootInboxReconcileOptions,
 } from "./topology/root-inbox-shared.js";
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
@@ -819,48 +819,15 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // Queueing is not a receipt. A lease suppresses duplicates while Pi holds the followUp,
   // but expires after one further turn without queue evidence, so a lost queue cannot wedge
   // the durable batch. Canonical session receipts remain the only cursor-commit authority.
-  let rootInboxTurn = 0;
+  let inboxIssuer = rootInboxReceiptIssuer();
   // Older Pi drops ctx.signal before agent_settled and omits its outcome. Retain the
   // host signal so a cancel after turn_end still invalidates the unreceived queue.
   let rootInboxRunSignal: AbortSignal | undefined;
-  const queuedRootInboxIds = new Map<string, number>();
-  // Native Pi preserves details by reference from sendMessage / the legacy hook result to
-  // message_end. Serialized fields, queue leases and wake metadata are not consumption authority.
-  // Bind shown-only ids/receipts to rendered content; public nonce/receipt copies grant no new proof.
-  // The nonce registry is private to this extension instance: readers authenticate the exact content
-  // before consuming a nonce in their own traversal, never for its lifetime. Eviction fails open and
-  // causes a duplicate, never a lost event.
-  const MAX_ISSUED_ROOT_INBOX_RECEIPTS = 2_048;
-  let issuedRootInboxDetails = new WeakMap<object, RootInboxReceiptSnapshot>();
-  const issuedRootInboxReceipts = new Map<string, RootInboxReceiptSnapshot>();
-  const inboxStrings = (value: unknown): string[] => Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string") : [];
-  const verifyIssuedInbox: RootInboxReceiptVerifier = (details, carrier, accepted) => {
-    if (!details || typeof details !== "object") return undefined;
-    const nonce = (details as { nonce?: unknown }).nonce;
-    if (typeof nonce !== "string" || accepted.has(nonce)) return undefined;
-    const snapshot = issuedRootInboxReceipts.get(nonce);
-    if (!snapshot || snapshot.digest !== rootInboxCarrierDigest(carrier)) return undefined;
-    accepted.add(nonce);
-    return snapshot;
-  };
-  const registerIssuedInbox = (details: object, content: unknown): void => {
-    const fields = details as { ids?: unknown; receipts?: unknown; nonce?: unknown };
-    const snapshot: RootInboxReceiptSnapshot = Object.freeze({
-      ids: Object.freeze(inboxStrings(fields.ids)),
-      receipts: Object.freeze(inboxStrings(fields.receipts)),
-      digest: rootInboxCarrierDigest({ content }),
-    });
-    const nonce = randomUUID();
-    fields.nonce = nonce;
-    issuedRootInboxReceipts.set(nonce, snapshot);
-    while (issuedRootInboxReceipts.size > MAX_ISSUED_ROOT_INBOX_RECEIPTS) {
-      const oldest = issuedRootInboxReceipts.keys().next().value;
-      if (typeof oldest !== "string") break;
-      issuedRootInboxReceipts.delete(oldest);
-    }
-    issuedRootInboxDetails.set(details, snapshot);
-  };
+  // Native drafts authenticate nonce + content, not identity. Only same-manager reloads retain custody.
+  const verifyIssuedInbox: RootInboxReceiptVerifier = (details, carrier, accepted) =>
+    verifyRootInboxReceipt(inboxIssuer, details, carrier, accepted);
+  const registerIssuedInbox = (details: object, content: unknown): void =>
+    registerRootInboxReceipt(inboxIssuer, details, content);
   type InboxQueueMessage = { role?: string; customType?: string; details?: unknown };
   const inboxEventsToQueue = (inbox: RootInboxBatch, pendingMessages?: readonly InboxQueueMessage[]) => {
     const pending = new Set(inbox.events.map(event => event.id));
@@ -876,29 +843,35 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       const ids = (message.details as { ids?: unknown } | undefined)?.ids;
       if (Array.isArray(ids)) for (const id of ids) if (typeof id === "string") queued.add(id);
     }
-    for (const [id, queuedAt] of queuedRootInboxIds) {
-      if (!pending.has(id)) queuedRootInboxIds.delete(id);
-      else if (queued.has(id) || hiddenBySteer) queuedRootInboxIds.set(id, rootInboxTurn);
-      else if (rootInboxTurn - queuedAt > 1) queuedRootInboxIds.delete(id);
+    for (const [id, queuedAt] of inboxIssuer.queued) {
+      if (!pending.has(id)) inboxIssuer.queued.delete(id);
+      else if (queued.has(id) || hiddenBySteer) inboxIssuer.queued.set(id, inboxIssuer.turn);
+      else if (inboxIssuer.turn - queuedAt > 1) inboxIssuer.queued.delete(id);
     }
-    return inbox.events.filter(event => !queuedRootInboxIds.has(event.id));
+    return inbox.events.filter(event => !inboxIssuer.queued.has(event.id));
   };
   const consumeInjectedInbox = async (details: unknown, carrier: unknown): Promise<void> => {
-    if (!details || typeof details !== "object") return;
-    const issued = issuedRootInboxDetails.get(details);
-    if (!issued || issued.digest !== rootInboxCarrierDigest(carrier)) {
-      diagnostics.warn("src/extension.ts", "pi-fabric: ignored unissued root-inbox carrier");
+    const issued = verifyIssuedInbox(details, carrier, new Set());
+    const fields = details as { ids?: unknown; receipts?: unknown } | undefined;
+    const exact = (value: unknown, expected: readonly string[]): boolean => Array.isArray(value) &&
+      value.length === expected.length && value.every((item, index) => item === expected[index]);
+    // Detachment preserves claims; reject modified callback metadata too.
+    if (!issued || !exact(fields?.ids, issued.ids) || !exact(fields?.receipts, issued.receipts)) {
+      logDiagnostic("src/extension.ts", "pi-fabric: ignored unissued root-inbox carrier");
       return;
     }
-    issuedRootInboxDetails.delete(details); // One rendered carrier authorizes consumption once.
-    if (!state.initialized) return;
-    if (issued.ids.length) await state.consumeRootInbox(issued.ids, issued.receipts).catch(() => undefined);
+    if (!state.initialized || inboxIssuer.consumed.has(issued)) return;
+    const issuer = inboxIssuer;
+    issuer.consumed.add(issued); // Fence replay across I/O; failed acks remain retryable.
+    try {
+      if (issued.ids.length) await state.consumeRootInbox(issued.ids, issued.receipts);
+    } catch { issuer.consumed.delete(issued); }
   };
   const reconcileRootInbox = async (
     context: ExtensionContext, options: RootInboxReconcileOptions, pendingMessages?: readonly InboxQueueMessage[],
   ): Promise<void> => {
     // Invalidate cancelled/unreceived leases even if the durable cursor read fails.
-    if (options.commitOnly) queuedRootInboxIds.clear();
+    if (options.commitOnly) inboxIssuer.queued.clear();
     if (!state.initialized) return;
     const inbox = await state.nextRootInbox(await inboxHeldBy(context, verifyIssuedInbox), undefined, options).catch(() => undefined);
     reportInboxExpiry(pi, inbox);
@@ -908,16 +881,15 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     const events = inboxEventsToQueue(inbox, pendingMessages);
     if (options.commitOnly) return;
     if (!events.length) return;
-    for (const id of deliverRootInbox(pi, events, undefined, registerIssuedInbox)) queuedRootInboxIds.set(id, rootInboxTurn);
+    for (const id of deliverRootInbox(pi, events, undefined, registerIssuedInbox)) inboxIssuer.queued.set(id, inboxIssuer.turn);
   };
   const stopInboxWake = (): void => {
     // Closes the runtime's mesh-root watch and deadline timer; session_start arms them anew.
     state.setRootInboxWake(undefined);
     inboxWake.context = undefined;
     inboxWake.again = false;
-    queuedRootInboxIds.clear();
-    issuedRootInboxDetails = new WeakMap();
-    issuedRootInboxReceipts.clear();
+    // Keep resident custody for /reload.
+    inboxIssuer = rootInboxReceiptIssuer();
     rootInboxRunSignal = undefined;
   };
   // A busy, settling, preflight or cancelled Main is owned by its boundary, never timer-polled.
@@ -943,7 +915,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       await reportInboxExpiry(pi, inbox);
       // A turn that started meanwhile takes the pending batch at its own start: never a second run.
       if (inbox?.events.length && idle()) {
-        for (const id of deliverRootInbox(pi, inbox.events, undefined, registerIssuedInbox)) queuedRootInboxIds.set(id, rootInboxTurn);
+        for (const id of deliverRootInbox(pi, inbox.events, undefined, registerIssuedInbox)) inboxIssuer.queued.set(id, inboxIssuer.turn);
         return undefined;
       }
       // Records: the same gate, re-checked after the read (F21).
@@ -977,14 +949,16 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   };
 
   pi.on("session_start", async (event, context) => {
-    configureFabricDiagnostics(context.sessionManager?.getSessionId?.() ?? "");
+    const sessionId = context.sessionManager?.getSessionId?.() ?? "";
+    configureFabricDiagnostics(sessionId);
     await sealScope();
     // Retire the previous session's delayed work, then reopen entropy for this one.
     retireSessionTimers();
+    inboxIssuer = rootInboxReceiptIssuer(context.sessionManager, sessionId, event?.reason === "reload");
     entropyStopping = false;
     fabricPrewarm = undefined;
     // The pre-reload warning leaves with the redraw; say it again where the user can read it (smarty-dev#1882).
-    const reloadNotice = takeReloadStoppedNotice(context.sessionManager?.getSessionId?.() ?? "", event?.reason ?? "");
+    const reloadNotice = takeReloadStoppedNotice(sessionId, event?.reason ?? "");
     if (reloadNotice && context.hasUI) notifyDiagnostic(context, "src/extension.ts", reloadNotice, "warning");
     inboxWake.context = context;
     inboxWake.armed = true;
@@ -1148,7 +1122,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     } finally {
       // Pi awaits this boundary before consuming queued followUps in the same running loop.
       // Never start a retry when this turn failed or the owner cancelled it.
-      rootInboxTurn++;
+      inboxIssuer.turn++;
       await reconcileRootInbox(context, { turnEnd: true, commitOnly: context.signal?.aborted ||
         (event?.message?.role === "assistant" && (event.message.stopReason === "aborted" || event.message.stopReason === "error")) }, event?.context?.pendingMessages);
     }
@@ -1716,16 +1690,15 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     if (!fabricProvenanceSupported(pi)) {
       const message = rootInboxMessage(events);
       registerIssuedInbox(message.details, message.content);
-      for (const id of message.details.ids) queuedRootInboxIds.set(id, rootInboxTurn);
+      for (const id of message.details.ids) inboxIssuer.queued.set(id, inboxIssuer.turn);
       return { message };
     }
     for (const id of deliverRootInbox(pi, events, { deliverAs: "nextTurn", triggerTurn: false }, registerIssuedInbox)) {
-      queuedRootInboxIds.set(id, rootInboxTurn);
+      inboxIssuer.queued.set(id, inboxIssuer.turn);
     }
   });
 
-  // An inbox message that entered a turn is consumed (R-token-waste): its events are never
-  // injected again, even while the canonical session file has not confirmed the message.
+  // Consume authenticated native deliveries once, including detached/reloaded queues.
   pi.on("message_end", async (event) => {
     const message = event.message as unknown as { role?: string; customType?: string; details?: unknown };
     if (message.role !== "custom" || message.customType !== "pi-fabric-inbox") return undefined;
@@ -1751,9 +1724,10 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   pi.on("session_shutdown", async (event, context) => {
     retireSessionTimers();
     const reason = event?.reason ?? "exit";
+    if (reason !== "reload") rootInboxReceiptIssuer(context?.sessionManager);
     let stopping = 0;
     try { stopping = state.initialized ? state.agents.runningCount() : 0; } catch { /* not initialized */ }
-    if (stopping > 0 && context.hasUI) {
+    if (stopping > 0 && context?.hasUI) {
       notifyDiagnostic(context, "src/extension.ts",
         `${reason === "reload" ? "Reload" : "Shutdown"} stops ${stopping} running task agent${stopping === 1 ? "" : "s"}; ` +
           'each spawner gets a stopped result. Spawn with residency: "durable" to keep an agent across reloads.',

@@ -314,9 +314,12 @@ describe("the context hook shows each inbox event to the model once (smarty-dev#
       expect(independent.details.nonce).not.toBe(genuine.details.nonce);
       expect(exactCopy).toEqual(genuine);
       expect(exactCopy.details).not.toBe(genuine.details);
+      // Current native Pi isolates each message_end handler draft. Its authentic detached draft
+      // is indistinguishable from this exact JSON copy: nonce AND issued body authorize the same
+      // private shown-only snapshot once, never extra work or extra suppression authority.
       for (const message of [exactCopy, repeatedCopy]) await hooks.emit("message_end", { message });
-      expect(consume.mock.calls).toEqual([]);
-      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(false);
+      expect(consume.mock.calls).toEqual([[[event.id], genuine.details.receipts]]);
+      expect(main.runtime.rootInboxAcked(event.id, event.sequence)).toBe(true);
       // One nonce cannot gain extra suppression authority by appearing twice, nor exhaust a later scan.
       for (let scan = 0; scan < 2; scan++) {
         const context = await hooks.modelContext([exactCopy, repeatedCopy, genuine]);

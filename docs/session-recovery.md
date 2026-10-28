@@ -142,6 +142,15 @@ fenced. Its receipt is not a native carrier commit. B5 owns subsequent native dr
 and restart lookup, with B6's post-append durable receipt; B3 must not call
 `sendMessage` or replay a whole tool program as a substitute.
 
+`RecoveryDurabilityAdapter` in `l7-interfaces.ts` is B6's bounded post-append port
+for `control-seen` and native `carrier` records. It preserves the original absolute
+`deadlineMs` and optional abort signal. A successful receipt means the record is
+**written and fsynced** (or the store's equivalent commit), never merely enqueued.
+Repeated `(sessionId, deliveryId, recordKind)` requests return the same sequence
+without appending twice. The closed failure reasons are `deadline`, `aborted`,
+`store-unavailable`, `superseded` and `not-found`. This defines the provider contract;
+it does not implement B6 storage or turn a pre-append `message_end` into a commit.
+
 The inspected Pi 1.2.0 runtime does not expose an atomic, fail-closed startup
 recovery transaction/fence handoff. Cold startup has no `session_ready`; replacement
 `session_start` is already fenced, and `ctx.fenceInputs()` cannot adopt that fence.

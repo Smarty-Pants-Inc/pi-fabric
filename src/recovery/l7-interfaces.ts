@@ -83,6 +83,28 @@ export interface RecoveryInputAdapter {
   admitContinuation(request: ContinuationRequest): Promise<ContinuationAdmission>;
 }
 
+export interface RecoveryDurableAppendRequest {
+  readonly sessionId: string;
+  readonly deliveryId: string;
+  readonly recordKind: "control-seen" | "carrier";
+  /** Original absolute Unix-epoch deadline in milliseconds; retries do not restamp it. */
+  readonly deadlineMs: number;
+  readonly signal?: AbortSignal;
+}
+
+export type RecoveryDurableAppendResult =
+  | { readonly durable: true; readonly seq: number }
+  | { readonly durable: false; readonly reason: "deadline" | "aborted" | "store-unavailable" | "superseded" | "not-found" };
+
+/** B6's bounded post-append barrier, before application/broker ACK or carrier commitment.
+ * durable:true means WRITTEN AND FSYNCED (or the store's equivalent commit), not merely
+ * enqueued. Idempotent per (sessionId, deliveryId, recordKind): return the same seq and
+ * never append twice. Expired deadlines return deadline; an aborted signal returns aborted.
+ * Carrier correlation is post-append: a message_end observation is not a commit receipt. */
+export interface RecoveryDurabilityAdapter {
+  awaitDurableAppend(request: RecoveryDurableAppendRequest): Promise<RecoveryDurableAppendResult>;
+}
+
 export interface SettledRecoveryEffect {
   readonly toolCallId: string;
   readonly key: string;

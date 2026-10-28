@@ -15,7 +15,7 @@ afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursiv
 const write = (file: string, data: string) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, data); };
 const run = (directory: string, finishedAt: number) => {
   write(path.join(directory, "status.json"), JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647", finishedAt }));
-  write(path.join(directory, "events.jsonl"), '{"sequence":1}\n');
+  write(path.join(directory, "task.txt"), "generic retention fixture\n");
   write(path.join(directory, "reply.json"), '{"text":"done"}');
 };
 const fleet = () => {
@@ -48,7 +48,8 @@ describe.skipIf(process.platform !== "linux")("mesh retention at fleet scale (sm
     const dryMs = performance.now() - started;
     expect(plan.summary.registries).toEqual({ count: REGISTRIES, parses: REGISTRIES, maxParsesPerRegistry: 1, rootRewalks: 0 });
     expect(plan.removedRuns).toHaveLength(REGISTRIES);
-    expect(plan.summary.deleters.pruneActorRunArchives?.removed).toBe(REGISTRIES);
+    // Each fully collected fixture plans its three allowlisted files (status.json, task.txt, reply.json).
+    expect(plan.summary.deleters.pruneActorRunArchives?.removed).toBe(3 * REGISTRIES);
     expect(plan.summary.deleters.pruneActorSessionBackups?.removed).toBe(REGISTRIES);
     // Apply is disabled at the public boundary (pi-fabric#1014 SEC P2-1): it rejects before any registry or mesh read.
     const reads: string[] = [];

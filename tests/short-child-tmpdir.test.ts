@@ -21,6 +21,25 @@ const inside = (parent: string, child: string): boolean => {
   const relative = path.relative(parent, child);
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 };
+const jsonlTraces = (directory: string): Array<{ relative: string; bytes: Buffer }> => {
+  const traces: Array<{ relative: string; bytes: Buffer }> = [];
+  const visit = (current: string): void => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const file = path.join(current, entry.name);
+      if (entry.isDirectory()) visit(file);
+      else if (entry.isFile() && /\.jsonl/i.test(entry.name)) {
+        traces.push({ relative: path.relative(directory, file), bytes: fs.readFileSync(file) });
+      }
+    }
+  };
+  visit(directory);
+  return traces.sort((left, right) => left.relative.localeCompare(right.relative));
+};
+const expectJsonlTracesUnchanged = (directory: string, before: ReturnType<typeof jsonlTraces>): void => {
+  const after = jsonlTraces(directory);
+  expect(after.map(trace => trace.relative)).toEqual(before.map(trace => trace.relative));
+  before.forEach((trace, index) => expect(after[index]!.bytes, trace.relative).toEqual(trace.bytes));
+};
 
 const managers: AgentManager[] = [];
 afterEach(async () => {
@@ -108,7 +127,7 @@ describe.skipIf(process.platform === "win32")("short private child TMPDIR (smart
       expect(inside(run, tmp)).toBe(false);
     };
 
-    it("gives a process task a short 0700 TMPDIR inside its write grant and removes it with the run", async () => {
+    it("keeps the trace-bearing run while releasing the process task's trace-free short TMPDIR", async () => {
       const f = fixture(layout);
       const { result, run, value } = await report(f);
       expectShort(f, result.id, run, value.tmp);
@@ -123,13 +142,16 @@ describe.skipIf(process.platform === "win32")("short private child TMPDIR (smart
       expect(result.temporaryDirectory).toBe(value.tmp);
       expect(events(run).filter(event => event.type === UNAVAILABLE)).toEqual([]);
       expect(f.alarms).toEqual([]);
-      // (b) Removed with the run.
+      const traces = jsonlTraces(run);
+      expect(traces.map(trace => trace.relative)).toContain("events.jsonl");
       await f.manager.cleanup(result.id);
-      expect(fs.existsSync(run)).toBe(false);
+      expect(fs.existsSync(run)).toBe(true);
+      expectJsonlTracesUnchanged(run, traces);
       expect(fs.existsSync(value.tmp)).toBe(false);
+      expect(fs.existsSync(path.join(run, "task.txt"))).toBe(false);
     });
 
-    it("gives an actor run a short 0700 TMPDIR as its only write grant and removes it with the run", async () => {
+    it("keeps the actor run's traces while releasing its trace-free short TMPDIR", async () => {
       const f = fixture(layout);
       const { result, run, value } = await report(f, { runner: "pi", actorId: "actor" });
       expectShort(f, result.id, run, value.tmp);
@@ -138,9 +160,13 @@ describe.skipIf(process.platform === "win32")("short private child TMPDIR (smart
       // (c) Actor writes are private scratch only.
       expect(value.policy).toEqual({ readOnly: false, writableRoots: [value.tmp], shell: "unconfined" });
       expect(fs.readFileSync(value.probe, "utf8")).toBe("probe");
+      const traces = jsonlTraces(run);
+      expect(traces.map(trace => trace.relative)).toContain("events.jsonl");
       await f.manager.cleanup(result.id);
-      expect(fs.existsSync(run)).toBe(false);
+      expect(fs.existsSync(run)).toBe(true);
+      expectJsonlTracesUnchanged(run, traces);
       expect(fs.existsSync(value.tmp)).toBe(false);
+      expect(fs.existsSync(path.join(run, "task.txt"))).toBe(false);
     });
 
     it("falls back to the old run-tree TMPDIR when nothing fits (no lockout), with a named warning and one operator alarm", async () => {
@@ -163,8 +189,12 @@ describe.skipIf(process.platform === "win32")("short private child TMPDIR (smart
         expect(warnings[0]!.warning).toContain(`over its ${f.budget}`);
         expect(warnings[0]!.warning).toContain("smarty-dev#15878");
         expect(fs.readdirSync(f.storeRoot ?? f.parent).filter(name => name.startsWith("r."))).toEqual([]);
+        const traces = jsonlTraces(run);
+        expect(traces.map(trace => trace.relative)).toContain("events.jsonl");
         await f.manager.cleanup(result.id);
-        expect(fs.existsSync(run)).toBe(false);
+        expect(fs.existsSync(run)).toBe(true);
+        expectJsonlTracesUnchanged(run, traces);
+        expect(fs.existsSync(path.join(run, "tmp"))).toBe(false);
       }
       // The operator alarm: one stderr diagnostics line and one manager alarm naming the first run, not one per spawn.
       expect(f.alarms).toEqual([expect.objectContaining({ kind: "short-tmpdir-unavailable", runId: ids[0],
@@ -201,7 +231,7 @@ describe.skipIf(process.platform === "win32")("short private child TMPDIR (smart
     });
   });
 
-  it("retention removes a retained run's short TMPDIR only with its run tree", async () => {
+  it("retention removes trace-free short TMPDIR scratch while keeping its trace-bearing run", async () => {
     const f = fixture("native-pi /tmp/p.XXXXXX", { retainRuns: true });
     const { result, run, value } = await report(f);
     expect(path.basename(value.tmp)).toBe(shortName(result.id));
@@ -211,8 +241,13 @@ describe.skipIf(process.platform === "win32")("short private child TMPDIR (smart
     expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8")).temporaryDirectory).toBe(value.tmp);
     markRunRootActive(f.runRoot, 1);
     markRunRootClosed(f.runRoot, 1, true);
+    const traces = jsonlTraces(run);
+    expect(traces.map(trace => trace.relative)).toContain("events.jsonl");
     const swept = sweepTempRunRoots({ tempRoot: f.parent, now: Date.now() + 1_000, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 });
-    expect(swept).toEqual({ removedRuns: [run], removedRoots: [f.runRoot] });
+    expect(swept).toEqual({ removedRuns: [], removedRoots: [] });
+    expect(fs.existsSync(run)).toBe(true);
+    expect(fs.existsSync(f.runRoot)).toBe(true);
+    expectJsonlTracesUnchanged(run, traces);
     expect(fs.existsSync(value.tmp)).toBe(false);
   });
 
@@ -240,10 +275,9 @@ describe.skipIf(process.platform === "win32")("short private child TMPDIR (smart
     expect(fs.readFileSync(target, "utf8")).toBe("must survive");
   });
 
-  // pi-fabric#1554 P1: a failed, stopped or timed-out run in a managed (sweep-owned) temp root keeps only its prompt
-  // record at close. Before the short TMPDIR, that pruning removed <run>/tmp; on fd533e62 the short TMPDIR outside the
-  // run tree stayed, and with more than 64 entries every later sweep refused the run (and its root) forever.
-  it("prunes a retained failed run's short TMPDIR of 70 entries at close, so the sweep collects the run and its root", async () => {
+  // A failed managed run still prunes its 70-entry external short TMPDIR, but raw traces and custody anchors keep
+  // the run and its managed root for a later retention decision.
+  it("prunes eligible short-TMPDIR bloat while retaining a trace-bearing failed run", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fabric-short-retained-")));
     const cwd = path.join(root, "cwd");
     fs.mkdirSync(cwd);
@@ -278,14 +312,18 @@ fs.writeFileSync(args.get('--status-file'), JSON.stringify({
     expect(fs.readdirSync(tmp)).toHaveLength(70);
     await manager.close();
     vi.unstubAllEnvs();
-    // The retained prompt record stays; the short TMPDIR went with the pruned artifacts.
-    expect(fs.readdirSync(run).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+    expect(fs.readdirSync(run).sort()).toEqual(["events.jsonl", "manager-result.json", "run-identity.json", "status.json", "task.txt"]);
+    const traces = jsonlTraces(run);
+    expect(traces.map(trace => trace.relative)).toContain("events.jsonl");
+    const statusBeforeSweep = fs.readFileSync(path.join(run, "status.json"));
     expect(fs.existsSync(tmp)).toBe(false);
-    // So retention no longer refuses the run: it collects the record and then the empty root.
     const swept = sweepTempRunRoots({ tempRoot: parent, now: Date.now() + 365 * 86_400_000, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 });
-    expect(swept.removedRuns).toEqual([run]);
-    expect(swept.removedRoots).toEqual([path.dirname(run)]);
-    expect(fs.existsSync(run)).toBe(false);
+    expect(swept).toEqual({ removedRuns: [], removedRoots: [] });
+    expect(fs.existsSync(run)).toBe(true);
+    expect(fs.existsSync(path.dirname(run))).toBe(true);
+    expect(fs.readFileSync(path.join(run, "status.json"))).toEqual(statusBeforeSweep);
+    expectJsonlTracesUnchanged(run, traces);
+    expect(fs.existsSync(tmp)).toBe(false);
   });
 
   it("measures the real native-pi and role-pi parents against the guard's 60 bytes", async () => {

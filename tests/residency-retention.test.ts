@@ -34,6 +34,24 @@ const seed = (root: string, time: number, acknowledged = true) => {
 };
 const sweep = (root: string, now: number, live = new Set<string>()) => new ResidentRequestRetention(root).sweep(now, live, 10_000);
 const exists = (root: string, dir: string, id: string) => fs.existsSync(path.join(root, dir, `${id}.json`));
+const traceSnapshot = (directory: string): Array<[string, Buffer]> => {
+  const files: string[] = [];
+  const visit = (current: string, relative = "") => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const child = path.join(relative, entry.name);
+      const file = path.join(current, entry.name);
+      if (entry.isDirectory()) visit(file, child);
+      else if (entry.isFile() && /\.jsonl/i.test(entry.name)) files.push(child);
+    }
+  };
+  visit(directory);
+  return files.sort().map(file => [file, fs.readFileSync(path.join(directory, file))]);
+};
+const expectTraceSnapshot = (directory: string, before: Array<[string, Buffer]>) => {
+  const after = traceSnapshot(directory);
+  expect(after.map(([file]) => file)).toEqual(before.map(([file]) => file));
+  for (const [index, [, bytes]] of before.entries()) expect(after[index]![1].equals(bytes)).toBe(true);
+};
 
 describe("resident terminal event retention", () => {
   const day = 24 * 60 * 60 * 1000;
@@ -217,7 +235,11 @@ describe("resident terminal event retention", () => {
     expect(fs.existsSync(path.join(old, "status.json"))).toBe(true);
     expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
     fs.utimesSync(old, day / 1000, day / 1000);
-    expect(sweepResidentRuns(runs, now, 10000, { actorRoots: [actorRoot] })).toEqual([old]);
+    const oldTraces = traceSnapshot(old);
+    expect(oldTraces.some(([, bytes]) => bytes.equals(log))).toBe(true); // Full original moved to session-archive.
+    expect(sweepResidentRuns(runs, now, 10000, { actorRoots: [actorRoot] })).toEqual([]);
+    expect(fs.existsSync(old)).toBe(true); // A trace-bearing run is not reported as removed.
+    expectTraceSnapshot(old, oldTraces);
     expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
   });
 

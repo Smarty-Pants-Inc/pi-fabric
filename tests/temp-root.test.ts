@@ -28,6 +28,25 @@ const sandbox = () => {
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
   return { root, short, disk };
 };
+const jsonlTraces = (directory: string): Array<{ relative: string; bytes: Buffer }> => {
+  const traces: Array<{ relative: string; bytes: Buffer }> = [];
+  const visit = (current: string): void => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const file = path.join(current, entry.name);
+      if (entry.isDirectory()) visit(file);
+      else if (entry.isFile() && /\.jsonl/i.test(entry.name)) {
+        traces.push({ relative: path.relative(directory, file), bytes: fs.readFileSync(file) });
+      }
+    }
+  };
+  visit(directory);
+  return traces.sort((left, right) => left.relative.localeCompare(right.relative));
+};
+const expectJsonlTracesUnchanged = (directory: string, before: ReturnType<typeof jsonlTraces>): void => {
+  const after = jsonlTraces(directory);
+  expect(after.map(trace => trace.relative)).toEqual(before.map(trace => trace.relative));
+  before.forEach((trace, index) => expect(after[index]!.bytes, trace.relative).toEqual(trace.bytes));
+};
 const manager = (retainRuns = false) => {
   const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 1, retainRuns, transport: "process", sessionExport: false }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
@@ -57,7 +76,7 @@ describe.skipIf(process.platform === "win32")("Fabric file root override", () =>
     expect(fabricDataRoot()).toBe(short);
   });
 
-  it("places run, actor, budget, shell and output roots on disk and releases them after shutdown", async () => {
+  it("releases scratch roots but keeps accounting journals and run traces after shutdown", async () => {
     const { root, short, disk } = sandbox();
     const agents = manager();
     const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
@@ -76,7 +95,13 @@ describe.skipIf(process.platform === "win32")("Fabric file root override", () =>
     const run = await agents.run({ task: "hello", runner: "pi", extensions: false });
     expect(run.status).toBe("completed");
     const budget = activeBudgetState()!;
-    for (const file of [agents.readLog(run.id).runDirectory, budget.file, log, output.artifactPath!]) expect(file.startsWith(disk + path.sep)).toBe(true);
+    const runDirectory = agents.readLog(run.id).runDirectory;
+    const runRoot = path.dirname(runDirectory);
+    const budgetDirectory = path.dirname(budget.file);
+    const runTraces = jsonlTraces(runDirectory);
+    const budgetBytes = fs.readFileSync(budget.file);
+    expect(runTraces.length).toBeGreaterThan(0);
+    for (const file of [runDirectory, budget.file, log, output.artifactPath!]) expect(file.startsWith(disk + path.sep)).toBe(true);
     for (const prefix of ["runs", "actors", "budget", "shell", "output"]) expect(fs.readdirSync(disk).some(name => name.startsWith(`pi-fabric-${prefix}-`))).toBe(true);
     expect(fs.readdirSync(short)).toEqual([]);
     // Finished logs/artifacts are still readable for the live session.
@@ -86,7 +111,14 @@ describe.skipIf(process.platform === "win32")("Fabric file root override", () =>
     await agents.close();
     await jobs.close();
     await outputs.close();
-    expect(fs.readdirSync(disk).filter(name => name.startsWith("pi-fabric-"))).toEqual([]);
+    expect(fs.existsSync(runDirectory)).toBe(true);
+    expect(fs.existsSync(path.join(runDirectory, "status.json"))).toBe(true);
+    expectJsonlTracesUnchanged(runDirectory, runTraces);
+    expect(fs.readFileSync(budget.file)).toEqual(budgetBytes);
+    expect(fs.readdirSync(budgetDirectory)).toEqual(["cost.jsonl"]);
+    expect(fs.readdirSync(disk).filter(name => name.startsWith("pi-fabric-")).sort()).toEqual([
+      path.basename(budgetDirectory), path.basename(runRoot),
+    ].sort());
     expect(fs.readdirSync(short)).toEqual([]);
   });
 

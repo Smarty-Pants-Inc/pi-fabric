@@ -13,6 +13,22 @@ import { markTerminalControlForwarded, settleTerminalControl, trackTerminalContr
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+const snapshotTree = (root: string): [string, string][] => {
+  const entries: [string, string][] = [];
+  const visit = (directory: string, relative = ""): void => {
+    for (const name of fs.readdirSync(directory).sort()) {
+      const file = path.join(directory, name);
+      const child = path.join(relative, name);
+      const stat = fs.lstatSync(file);
+      if (stat.isDirectory()) {
+        entries.push([child, "directory"]);
+        visit(file, child);
+      } else entries.push([child, `file:${fs.readFileSync(file).toString("base64")}`]);
+    }
+  };
+  visit(root);
+  return entries;
+};
 const fixture = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "terminal-retention-")); roots.push(root);
   const run = path.join(root, "run"); fs.mkdirSync(run);
@@ -54,17 +70,36 @@ describe("terminal-answer retention custody", () => {
     expect(Number(pid)).toBe(child.pid);
     // Advance only the saved timestamp, not a sleep or the live-process fence.
     fs.writeFileSync(owner, `${token}\n${pid}\n${Date.now() - 60_000}\n`);
+    const controlFile = path.join(f.run, "terminal-controls", `${f.id}.json`);
+    writeJsonAtomic(controlFile, { ...f.control, state: "delivered" });
+    const bloat = path.join(f.run, "reply.json");
+    fs.writeFileSync(bloat, "eligible disposable reply bloat\n");
+    const anchorFiles = [path.join(f.run, "steer.jsonl"), controlFile, path.join(f.run, "status.json")];
+    const anchorBytes = anchorFiles.map(file => fs.readFileSync(file, "utf8"));
     expect(canRemoveTerminalRun(f.run)).toBe(true);
+    const beforeDryRun = snapshotTree(f.run);
     const collected = pruneActorRunArchives({ runsDirectory: f.root, retentionMs: 0, now: Date.now() + 1, dryRun: true });
-    expect(collected).toEqual([f.run]);
+    expect(collected).toEqual([]);
+    expect(snapshotTree(f.run)).toEqual(beforeDryRun);
+    anchorFiles.forEach((file, index) => expect(fs.readFileSync(file, "utf8")).toBe(anchorBytes[index]));
     expect(fs.existsSync(f.run)).toBe(true);
+
+    const applied = pruneActorRunArchives({ runsDirectory: f.root, retentionMs: 0, now: Date.now() + 1 });
+    expect(applied).toEqual([]);
+    expect(fs.existsSync(f.run)).toBe(true);
+    expect(fs.existsSync(bloat)).toBe(false);
+    expect(fs.existsSync(path.dirname(owner))).toBe(false);
+    expect(canRemoveTerminalRun(f.run)).toBe(true);
+    anchorFiles.forEach((file, index) => expect(fs.readFileSync(file, "utf8")).toBe(anchorBytes[index]));
   });
   it("keeps a live old lock and fails closed for ownerless, malformed, extra, and linked lock contents", () => {
     const live = fixture();
     acknowledgeFinalNotice(live);
     finalAnswerLock(live.run, `11111111-1111-4111-8111-111111111111\n${process.pid}\n${Date.now() - 60_000}\n`);
     expect(canRemoveTerminalRun(live.run)).toBe(false);
+    const beforeDryRun = snapshotTree(live.run);
     expect(pruneActorRunArchives({ runsDirectory: live.root, retentionMs: 0, now: Date.now() + 1, dryRun: true })).toEqual([]);
+    expect(snapshotTree(live.run)).toEqual(beforeDryRun);
 
     for (const kind of ["ownerless", "malformed", "extra", "linked"] as const) {
       const f = fixture();
@@ -335,7 +370,9 @@ describe("terminal-answer retention custody", () => {
     expect(JSON.parse(fs.readFileSync(path.join(f.run, "terminal-controls", `${f.id}.json`), "utf8"))).toEqual(JSON.parse(JSON.stringify(control)));
     expect(readTerminalAdmission(f.run, f.id)).toEqual({ id: f.id, delivery: "steer", sender });
     expect(canRemoveTerminalRun(f.run)).toBe(false);
+    const beforeDryRun = snapshotTree(f.run);
     expect(pruneActorRunArchives({ runsDirectory: f.root, retentionMs: 0, now: Date.now() + 1, dryRun: true })).toEqual([]);
+    expect(snapshotTree(f.run)).toEqual(beforeDryRun);
     expect(fs.existsSync(f.run)).toBe(true);
   });
   it.each(["delivery", "sender", "kind", "name", "verified"])("does not discharge a mismatched row with an incorrectly attributed refusal %s", mismatch => {

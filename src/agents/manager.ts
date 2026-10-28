@@ -77,7 +77,6 @@ import {
 import { tokenUsagePayloadFromValue } from "../lifecycle/types.js";
 import type { FabricTokenUsagePayload } from "../lifecycle/types.js";
 import { AgentAdmission, assertAgentTask, beginAgentSettlement, createAgentLifecycle, finishAgentSettlement, terminalAgentStatuses, type AgentLifecycleState } from "./lifecycle.js";
-import { removeTree } from "./rm.js";
 import { ARCHIVE_PENDING_FILE, ACTOR_RUN_ARCHIVE_PENDING_FILE, stageRunArchive, commitRunArchive, readPendingRunArchives, parsePendingRunArchives, persistRunStopIntent, readRunStopIntent, clearRunStopIntent, type PendingRunArchive } from "./archive-custody.js";
 import { ActorChildCompletionStore } from "../actors/child-completions.js";
 import { HerdrTransport } from "./transports/herdr-transport.js";
@@ -164,6 +163,7 @@ import {
   markRunRootClosed,
   claimTempRunSweep,
   removeEmptyRunRoot,
+  removeRunArtifacts,
   type TempRunSweepRequest,
 } from "../storage/retention.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
@@ -243,7 +243,7 @@ const uncheckedExternalExit = (transport: Pick<AgentTransportHandle, "kind">): b
   transport.kind === "tmux" || transport.kind === "screen";
 /** smarty-dev#15878: a run's recorded short TMPDIR outside its run tree, removed only while it is a real directory of ours. */
 const removeOwnedShortTmpdir = async (temporary: string | undefined): Promise<void> => {
-  if (temporary && ownedShortTmpdir(temporary)) await removeTree(temporary).catch(() => undefined);
+  if (temporary && ownedShortTmpdir(temporary)) removeRunArtifacts(temporary, { deleter: "agentShortTmpdirRetention" });
 };
 // agents.childQuestionTimeoutMs default: routed child dialogs cancel after 10 minutes.
 const DEFAULT_CHILD_QUESTION_TIMEOUT_MS = 600_000;
@@ -3634,7 +3634,7 @@ export class AgentManager {
         }
         // smarty-dev#15878: a confirmed non-launch never used its short TMPDIR; an unknown launch keeps it above.
         if (shortTmpdir && !this.#runs.has(id) && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json"))) &&
-          ownedShortTmpdir(shortTmpdir)) await removeTree(shortTmpdir).catch(() => undefined);
+          ownedShortTmpdir(shortTmpdir)) await removeOwnedShortTmpdir(shortTmpdir);
         throw error;
       }
     };
@@ -4028,10 +4028,8 @@ export class AgentManager {
             (readRecord(path.join(directory, "status.json")) as AgentRunRecord & { queuedArchiveCommitted?: boolean } | undefined)?.queuedArchiveCommitted) && !runTreeExitVeto(directory)) {
           writeJsonAtomic(path.join(directory, "status.json"), { id: queued.info.id, status: queued.terminal.status, queuedArchiveCommitted: true,
             startedAt: queued.terminal.startedAt, updatedAt: queued.terminal.updatedAt, finishedAt: queued.terminal.finishedAt }, { durable: true });
-          try {
-            fs.rmSync(path.join(directory, "queued-result.json"), { force: true });
-            fs.rmSync(directory, { recursive: true, force: true });
-          } catch { /* Its committed terminal state is collectible later. */ }
+          try { removeRunArtifacts(directory, { deleter: "queuedRunRetention" }); }
+          catch { /* Its committed terminal state and raw traces remain collectible later. */ }
         }
         queued.outcomeSaved = true;
         return true;
@@ -5026,11 +5024,10 @@ export class AgentManager {
     if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await this.#removeRunTree(directory, runId);
   }
 
-  /** Remove a run tree, then (only once it is gone) its recorded short TMPDIR outside it (smarty-dev#15878). */
+  /** Collect nontrace artifacts under the caller's existing worker/archive custody proof. */
   async #removeRunTree(runDirectory: string, id: string, known?: string): Promise<void> {
     const temporary = recordedShortTmpdir(runDirectory, id, known);
-    await removeTree(runDirectory);
-    if (!fs.existsSync(runDirectory)) await removeOwnedShortTmpdir(temporary);
+    removeRunArtifacts(runDirectory, { deleter: "agentRunRetention", ...(temporary ? { temporaryDirectory: temporary } : {}) });
   }
 
   /**
@@ -5974,7 +5971,7 @@ export class AgentManager {
             const directory = path.join(this.#runRoot, result.id);
             this.#commitArchive(directory, result, "shutdown");
             if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure &&
-                !fs.existsSync(path.join(directory, "status.json")) && !runTreeExitVeto(directory)) fs.rmSync(directory, { recursive: true, force: true });
+                !fs.existsSync(path.join(directory, "status.json")) && !runTreeExitVeto(directory)) removeRunArtifacts(directory, { deleter: "queuedCloseRetention" });
           }
           break;
         }
@@ -6050,7 +6047,7 @@ export class AgentManager {
         removeEmptyRunRoot(this.#runRoot);
       }
       if (storageSafe && this.#budgetOwned && this.#budget) {
-        await removeTree(path.dirname(this.#budget.file)).catch(() => undefined);
+        removeRunArtifacts(path.dirname(this.#budget.file), { deleter: "agentBudgetRetention" });
       }
     }
     if (this.#budgetOwned) clearOwnedBudgetEnv();
@@ -7791,20 +7788,16 @@ export class AgentManager {
       // Keep the mismatch visible in status.json, but drop the unverified bytes.
       managed.promptRetentionMismatch = !oversized;
     }
-    // Persist the manager's authoritative metadata before removing every other
-    // artifact. A verified current task.txt and status.json are the complete
-    // retained proof; a mismatch drops task.txt. The manager's exact outcome stays
-    // beside status.json with only its task fields removed; every other field is
-    // kept uncompacted. status.json stays compact and taskless.
+    // Persist the manager's authoritative metadata before pruning nontrace artifacts.
+    // Raw journals/session traces and their custody anchors always survive. A verified
+    // current task.txt stays too; a mismatch drops only the unverified prompt bytes.
+    // The manager's exact outcome stays beside compact, taskless status.json.
     if (keepResult && resultFile) managed.resultFingerprint = writePrivateJsonAtomic(resultFile, omitRetainedTasks(record));
     writeJsonAtomic(managed.statusFile, omitRetainedTasks(compactUiRecord(this.#withTransportMetadata(record, managed, false))), { space: 2 });
-    for (const entry of fs.readdirSync(managed.runDirectory)) {
-      if (entry === "status.json" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
-      await removeTree(path.join(managed.runDirectory, entry));
-    }
-    // pi-fabric#1554 P1 (smarty-dev#15878): the loop above prunes the in-tree tmp/ such a run used before. Its short
-    // TMPDIR outside the run tree goes the same way here, or a scratch of more than 64 entries vetoes every later sweep.
-    await removeOwnedShortTmpdir(recordedShortTmpdir(managed.runDirectory, managed.id, managed.temporaryDirectory));
+    const temporary = recordedShortTmpdir(managed.runDirectory, managed.id, managed.temporaryDirectory);
+    removeRunArtifacts(managed.runDirectory, { deleter: "terminalPromptRetention",
+      keep: ["status.json", ...(currentMatches ? ["task.txt"] : []), ...(keepResult ? [MANAGER_RESULT_FILE] : [])],
+      ...(temporary ? { temporaryDirectory: temporary } : {}) });
     // Once an unsuccessful run has a retained status, never fall back to deleting its
     // whole tree. Any cleanup error propagates to the close custody fence.
     return true;

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
-import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { boundedRunTree } from "./reference-scan.js";
 import { countRefusal, countRemoval, removalTallyOn, verifiedRemove } from "./verified-remove.js";
@@ -258,7 +258,9 @@ const runFiles = new Set([
   // without it no such run was ever collected (smarty-dev#9855).
   "settlement.json",
 ]);
-const runFile = (name: string): boolean => runFiles.has(name) ||
+/** Backups/reclaims and unfamiliar JSONL journals are traces too, at every depth. */
+const retentionTrace = (name: string): boolean => /\.jsonl/i.test(name);
+const runFile = (name: string): boolean => retentionTrace(name) || runFiles.has(name) ||
   /^manager-restored-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/.test(name) ||
   /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
 const followUpName = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$/;
@@ -441,9 +443,13 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         if (!boundedRunTree(file, expired)) return false;
         continue;
       }
+      if (stat.isDirectory() && name === SESSION_ARCHIVE_DIR) {
+        if (!boundedRunTree(file, expired)) return false;
+        continue;
+      }
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
-        if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
+        if (fs.readdirSync(file).some((child) => !retentionTrace(child) || !ownedStat(path.join(file, child))?.isFile())) return false;
         continue;
       }
       if (stat.isDirectory() && name === "follow-ups") {
@@ -540,28 +546,112 @@ export const canRemoveManagedRunRoot = (root: string): boolean => {
 const recoverEnodevTask = (directory: string): void => {
   try { recoverEnodevTaskRun(directory); } catch { /* the marker stays: the run stays vetoed */ }
 };
-/** Main's path-based recursive removal: the non-Linux fallback of verifiedRemove only (smarty-dev#7858). */
-const rmTree = (target: string) => (): boolean => { fs.rmSync(target, { recursive: true, force: true }); return true; };
-/** smarty-dev#15878: after its run tree, a run's recorded short TMPDIR outside it, by the same verified removal. */
-const removeShortTmpdirAfterRun = (temporary: string | undefined, deleter: string): void => {
-  const judged = temporary ? ownedShortTmpdir(temporary) : undefined;
-  if (temporary && judged) verifiedRemove(temporary, judged, { deleter, fallback: rmTree(temporary) });
+type ArtifactEntry = { file: string; relative: string; stat: fs.Stats };
+type ArtifactPlan = { directory: string; stat: fs.Stats; entries: ArtifactEntry[]; traces: boolean };
+const TRACE_ANCHORS = new Set([RUN_ROOT_OWNER_FILE, "status.json", "final-answer.json", "run-identity.json", "manager-result.json", "manager-nested.json", "queued-result.json"]);
+const closedArtifact = (stat: fs.Stats): boolean => process.platform === "win32" || (stat.mode & 0o022) === 0;
+const TRACE_ANCHOR_DIRECTORIES = new Set(["terminal-controls", "terminal-notices", "follow-ups", "deliveries"]);
+/** Snapshot only bounded, owned regular files/directories, using cursors rather than an unbounded readdir.
+ * An incomplete/unsafe plan grants no deletion authority. Large scratch cleanup remains a separate concern. */
+const artifactPlan = (directory: string, expired: Deadline): ArtifactPlan | undefined => {
+  const stat = ownedStat(directory);
+  if (!stat?.isDirectory() || !closedArtifact(stat)) return undefined;
+  const plan: ArtifactPlan = { directory, stat, entries: [], traces: false };
+  const walk = (current: string, relative: string, depth: number): boolean => {
+    if (expired() || depth > 32) return false;
+    const cursor = fs.opendirSync(current);
+    try {
+      let entry: fs.Dirent | null;
+      while ((entry = cursor.readSync())) {
+        if (expired() || plan.entries.length >= 4096) return false;
+        const file = path.join(current, entry.name), child = path.join(relative, entry.name), judged = ownedStat(file);
+        if (!judged || (!judged.isFile() && !judged.isDirectory()) || !closedArtifact(judged)) return false;
+        plan.entries.push({ file, relative: child, stat: judged });
+        if (judged.isFile() && retentionTrace(entry.name)) plan.traces = true;
+        if (judged.isDirectory() && !walk(file, child, depth + 1)) return false;
+      }
+      return !expired();
+    } finally { cursor.closeSync(); }
+  };
+  try { return walk(directory, "", 0) ? plan : undefined; } catch { return undefined; }
 };
-/** pi-fabric#1554 P2-2: verifiedRemove of a run tree named by its run id, then (only once that removed it) its recorded
- * short TMPDIR outside it. For deleters that hold their own safety proof, such as resident run retention. */
+const sameArtifact = (current: fs.Stats | undefined, judged: fs.Stats): boolean => !!current &&
+  current.dev === judged.dev && current.ino === judged.ino && current.isDirectory() === judged.isDirectory() && current.isFile() === judged.isFile();
+/** Never hand a directory to recursive deletion: even a trace created after inspection must survive.
+ * rmdir is empty-only; per-file verifiedRemove retains its inode/ownership/final-reference checks. */
+const pruneArtifactPlan = (plan: ArtifactPlan, options: {
+  deleter: string; dryRun?: boolean; retainMetadata: boolean; keep?: readonly string[]; proceed: () => boolean; expired: Deadline;
+}): boolean => {
+  const protectedEntry = (entry: ArtifactEntry): boolean => retentionTrace(path.basename(entry.file)) ||
+    options.keep?.includes(entry.relative) === true || (options.retainMetadata &&
+      (TRACE_ANCHORS.has(path.basename(entry.file)) || entry.relative.split(path.sep).some(part => TRACE_ANCHOR_DIRECTORIES.has(part))));
+  for (const entry of plan.entries) {
+    if (options.expired() || !options.proceed()) return false;
+    if (!entry.stat.isFile() || protectedEntry(entry)) continue;
+    const unlink = (): boolean => {
+      const current = ownedStat(entry.file), parent = ownedStat(path.dirname(entry.file));
+      if (!current || !sameArtifact(current, entry.stat) || current.mtimeMs !== entry.stat.mtimeMs || !closedArtifact(current) ||
+          !parent?.isDirectory() || !closedArtifact(parent) || !options.proceed()) return false;
+      fs.unlinkSync(entry.file); return true;
+    };
+    if (!verifiedRemove(entry.file, entry.stat, { deleter: options.deleter, ...(options.dryRun ? { dryRun: true } : {}),
+      proceed: options.proceed, fallback: unlink }).removed) return false;
+  }
+  if (options.dryRun) return !plan.entries.some(protectedEntry);
+  for (const entry of [...plan.entries].reverse().concat({ file: plan.directory, relative: "", stat: plan.stat })) {
+    if (options.expired() || !options.proceed()) return false;
+    if (!entry.stat.isDirectory() || protectedEntry(entry)) continue;
+    const current = ownedStat(entry.file), parent = ownedStat(path.dirname(entry.file));
+    if (!sameArtifact(current, entry.stat) || !closedArtifact(current!) || !parent?.isDirectory() || !closedArtifact(parent)) return false;
+    try { fs.rmdirSync(entry.file); }
+    catch (error) { if (!["ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) return false; }
+  }
+  return !fs.existsSync(plan.directory);
+};
+/** Artifact collection for callers that already hold worker/archive custody. Raw JSONL (including every
+ * backup/reclaim) stays in place at every depth. Status and admission/receipt anchors stay whenever either
+ * the run or its recorded external scratch contains traces, so another sweep can recheck custody. */
+export const removeRunArtifacts = (directory: string, options: {
+  deleter: string; judged?: fs.Stats; temporaryDirectory?: string; keep?: readonly string[]; referenced?: () => boolean; dryRun?: boolean; expired?: Deadline;
+}): boolean => {
+  const started = performance.now(), expired = (): boolean => options.expired?.() === true || performance.now() - started >= 250;
+  const proceed = (): boolean => { try { return !options.referenced?.(); } catch { return false; } };
+  if (!proceed()) return false;
+  const plan = artifactPlan(directory, expired);
+  if (!plan || (options.judged && (!sameArtifact(plan.stat, options.judged) || plan.stat.mtimeMs !== options.judged.mtimeMs))) return false;
+  const temporary = recordedShortTmpdir(directory, path.basename(directory), options.temporaryDirectory);
+  let scratch: ArtifactPlan | undefined;
+  if (temporary && fs.existsSync(temporary)) {
+    if (!ownedShortTmpdir(temporary) || !(scratch = artifactPlan(temporary, expired))) return false;
+  }
+  const retainMetadata = plan.traces || scratch?.traces === true;
+  const common = { deleter: options.deleter, ...(options.dryRun ? { dryRun: true } : {}), retainMetadata, proceed, expired };
+  try {
+    const removed = pruneArtifactPlan(plan, { ...common, ...(options.keep ? { keep: options.keep } : {}) });
+    // A trace-bearing run intentionally remains; its saved status still names the scratch we may prune.
+    if (scratch && (removed || retainMetadata || options.keep?.length)) pruneArtifactPlan(scratch, common);
+    return removed;
+  } finally {
+    if (!options.dryRun) for (const tree of scratch ? [plan, scratch] : [plan]) {
+      for (const entry of [{ file: tree.directory, stat: tree.stat }, ...tree.entries]) {
+        if (!entry.stat.isDirectory() || !sameArtifact(ownedStat(entry.file), entry.stat)) continue;
+        // Partial artifact pruning must not restart legacy mtime-based retention on retained anchors.
+        try { fs.utimesSync(entry.file, entry.stat.atimeMs / 1000, entry.stat.mtimeMs / 1000); } catch { /* delays collection only */ }
+      }
+    }
+  }
+};
+/** Compatibility entrypoint for resident/actor callers with their own custody proof. The old recursive
+ * fallback is deliberately not called: it could erase a trace admitted after the safety walk. */
 export const removeRunTreeAndShortTmpdir = (directory: string, judged: fs.Stats | undefined,
-  options: { deleter: string; fallback: () => boolean }): boolean => {
-  const temporary = recordedShortTmpdir(directory, path.basename(directory));
-  const removed = verifiedRemove(directory, judged, options).removed;
-  if (removed) removeShortTmpdirAfterRun(temporary, options.deleter);
-  return removed;
-};
+  options: { deleter: string; fallback: () => boolean }): boolean =>
+  !!judged && removeRunArtifacts(directory, { deleter: options.deleter, judged });
 export const removeEmptyRunRoot = (root: string): boolean => {
   try {
     const judged = ownedStat(root);
     if (!judged?.isDirectory() || !validOwner(readJson<RunRootOwner>(ownerPath(root)))) return false;
     if (fs.readdirSync(root).some((name) => name !== RUN_ROOT_OWNER_FILE)) return false;
-    return verifiedRemove(root, judged, { deleter: "removeEmptyRunRoot", fallback: rmTree(root) }).removed;
+    return removeRunArtifacts(root, { deleter: "removeEmptyRunRoot", judged });
   } catch { return false; }
 };
 const pruneClosedRunRoot = (
@@ -590,11 +680,8 @@ const pruneClosedRunRoot = (
     // The judged stat: taken after recovery, before the safety walk; the removal requires it unchanged.
     const judged = ownedStat(directory);
     if (!safeRunTree(directory, owner.childrenStopped === true, 0, expired)) { countRefusal("pruneClosedRunRoot", "run tree is not proven safe", directory); continue; }
-    const temporary = recordedShortTmpdir(directory, entry.name, record?.temporaryDirectory ?? null);
-    if (verifiedRemove(directory, judged, { deleter: "pruneClosedRunRoot", fallback: rmTree(directory) }).removed) {
-      removed.push(directory);
-      removeShortTmpdirAfterRun(temporary, "pruneClosedRunRoot");
-    }
+    if (judged && removeRunArtifacts(directory, { deleter: "pruneClosedRunRoot", judged, expired,
+      ...(record?.temporaryDirectory ? { temporaryDirectory: record.temporaryDirectory } : {}) })) removed.push(directory);
   }
   return removed;
 };
@@ -767,10 +854,7 @@ export const sweepTempRunRoots = (options: TempRunSweepRequest & {
       const judged = ownedStat(directory);
       if (!safeRunTree(directory, false, 0, expired)) { countRefusal("sweepTempRunRoots", "run tree is not proven safe", directory); continue; }
       // Reported as the root's removal once it is empty, as before.
-      const temporary = recordedShortTmpdir(directory, run.name);
-      if (verifiedRemove(directory, judged, { deleter: "sweepTempRunRoots", fallback: rmTree(directory) }).removed) {
-        removeShortTmpdirAfterRun(temporary, "sweepTempRunRoots");
-      }
+      if (judged) removeRunArtifacts(directory, { deleter: "sweepTempRunRoots", judged, expired });
     }
     if (removeEmptyRunRoot(root)) result.removedRoots.push(root);
   }
@@ -973,16 +1057,28 @@ export const compactTerminalRunEvents = (
         checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
         runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired) ||
         expired() || options.isRetained?.()) return false;
+    if (!artifactPlan(directory, expired)) return false;
     const next = Buffer.concat([EVENT_TAIL_MARKER, retained]);
     let replaced = false;
     try {
-      // The judged events.jsonl goes through the one verified removal (smarty-dev#7916): verified, moved into the
-      // graveyard and verified again; the new tail then takes the free name (link fails on EEXIST), and only then
-      // is the judged inode removed. A failed publish moves it back.
-      replaced = verifiedRemove(file, stat, { deleter: "compactTerminalRunEvents", freed: stat.size - next.length,
-        ...(options.dryRun ? { dryRun: true } : {}),
-        proceed: () => publishExclusive(file, next),
-        fallback: () => { writeFileAtomic(file, next); return true; } }).removed;
+      // Retain the COMPLETE original by the existing same-filesystem archive rename before publishing a tail.
+      // An archive failure never truncates the source. No original inode goes through verifiedRemove.
+      if (options.dryRun) { countRemoval("compactTerminalRunEvents", 0); replaced = true; }
+      else {
+        const move = archiveSessionTrace(file, path.join(directory, SESSION_ARCHIVE_DIR),
+          { reason: "terminal run event retention", deleter: "compactTerminalRunEvents" }, stat);
+        if (move.manifest === false) {
+          // The rename succeeded but durable manifest settlement failed. Restore the original name exclusively;
+          // keep the archived link too rather than risk losing either recovery location.
+          try { fs.linkSync(move.to, file); } catch { /* the full original remains in the archive */ }
+          return false;
+        }
+        replaced = publishExclusive(file, next);
+        if (!replaced) {
+          try { fs.linkSync(move.to, file); } catch { /* the archive retains the full original regardless */ }
+        }
+        if (replaced) countRemoval("compactTerminalRunEvents", 0);
+      }
     } finally {
       if (!options.dryRun) {
         // Residency expiry (and legacy timestamp fallback) uses directory mtime.
@@ -1135,39 +1231,14 @@ export const pruneActorRunArchives = (options: {
   return removed;
 };
 
-/** The final pre-delete check and the delete, back to back (pi-fabric#645 review round 4), through the one verified
- * removal (smarty-dev#7916): check; verify the judged inode and its tree; move it into the graveyard and verify it
- * again; check again (`proceed`); then delete it, or move it back when the re-check finds a reference (a throwing
- * check counts as a reference). A dry run takes the first check and the full verification, with no move or delete.
- * Returns whether the run was (or would be) removed. Off Linux main's tombstone path below runs (smarty-dev#7858).
- * ponytail: no fence excludes registry writers. ActorRegistryStore's lock is an exclusive, async mkdir
- * lock with no shared mode; holding every registry's lock across each delete would stall every actor's
- * saves, and these sweeps are synchronous. The tombstone narrows the remaining window to a reference
- * written after the re-check, which names a run already renamed away: its writer finds the run missing,
- * exactly as after any completed deletion. A tombstone left by a crash is a run proven unreferenced; the
- * next sweep treats it as an ordinary run entry. */
+/** Recheck references before every artifact removal, including verifiedRemove's final check. A throwing
+ * reference check vetoes collection. Trace-bearing runs remain, with custody metadata, after nontrace cleanup;
+ * true means the directory was (or in a dry run could be) removed, not just that some artifacts were pruned. */
 export const removeUnreferencedRun = (
   directory: string, judged: fs.Stats | undefined, referenced?: () => boolean, dryRun = false, deleter = "removeUnreferencedRun",
   bytes = 0,
 ): boolean => {
   const check = (): boolean => { try { return !!referenced?.(); } catch { return true; } };
   if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
-  const temporary = dryRun ? undefined : recordedShortTmpdir(directory, path.basename(directory));
-  const removed = verifiedRemove(directory, judged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(),
-    fallback: () => mainRemoveUnreferencedRun(directory, referenced, check) }).removed;
-  if (removed) removeShortTmpdirAfterRun(temporary, deleter);
-  return removed;
-};
-/** Main's path-based tombstone removal, unchanged: the non-Linux fallback only (smarty-dev#7858). */
-const mainRemoveUnreferencedRun = (directory: string, referenced: (() => boolean) | undefined, check: () => boolean): boolean => {
-  if (!referenced) {
-    try { fs.rmSync(directory, { recursive: true, force: true }); return true; } catch { return false; }
-  }
-  const tombstone = path.join(path.dirname(directory), `.retention-tombstone-${path.basename(directory)}`);
-  try { fs.renameSync(directory, tombstone); } catch { return false; }
-  if (check()) {
-    try { fs.renameSync(tombstone, directory); } catch { /* Kept under the tombstone name; never deleted while referenced. */ }
-    return false;
-  }
-  try { fs.rmSync(tombstone, { recursive: true, force: true }); return true; } catch { return false; }
+  return !!judged && removeRunArtifacts(directory, { deleter, judged, referenced: check, ...(dryRun ? { dryRun: true } : {}) });
 };

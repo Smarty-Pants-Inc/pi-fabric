@@ -79,7 +79,10 @@ describe.skipIf(process.platform === "win32")("resident run age pruning (no real
     const before = snapshot();
     const rm = vi.spyOn(fs, "rmSync"), rename = vi.spyOn(fs, "renameSync");
     expect(sweepResidentRuns(runs, now, 10_000, { actorRoots: [actorRoot], dryRun: true })).toEqual([run.old]);
-    expect(recorded).toEqual([{ target: run.old, deleter: "sweepResidentRuns", dryRun: true }]);
+    expect(recorded.map(call => call.target).sort()).toEqual([
+      path.join(run.old, "reply.json"), path.join(run.old, "status.json"),
+    ].sort());
+    expect(recorded.every(call => call.deleter === "sweepResidentRuns" && call.dryRun)).toBe(true);
     expect(rm).not.toHaveBeenCalled(); expect(rename).not.toHaveBeenCalled();
     expect(snapshot()).toEqual(before);
 
@@ -105,9 +108,10 @@ describe.skipIf(process.platform === "win32")("resident run age pruning (no real
     try {
       for (let slice = 0; slice < 50 && collector.due(now); slice++) collector.sweep(now, new Set(), 10_000);
     } finally { collector.close(); }
-    expect(recorded.filter(call => call.deleter === "residentRunRetention")).toEqual([
-      { target: run.old, deleter: "residentRunRetention", dryRun: false },
-    ]);
+    const fileOps = recorded.filter(call => call.deleter === "residentRunRetention");
+    expect(fileOps).toHaveLength(1);
+    expect([path.join(run.old, "status.json"), path.join(run.old, "reply.json")]).toContain(fileOps[0]!.target);
+    expect(fileOps[0]).toMatchObject({ deleter: "residentRunRetention", dryRun: false });
     // Only atomic-write temp files of the collector's own health/expiry records.
     expect(rm.mock.calls.filter(([target]) => String(target).startsWith(path.join(dir, "runs")))).toEqual([]);
     expect(snapshot()).toEqual(before);

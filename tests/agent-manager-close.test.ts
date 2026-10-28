@@ -10,12 +10,30 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { activeBudgetState, appendBudgetLedger, readBudgetLedger } from "../src/agents/budget-ledger.js";
 import { hasUnresolvedWorker, runTreeExitVeto } from "../src/storage/retention.js";
 import { processAlive } from "../src/storage/scratch.js";
-import * as agentRemoval from "../src/agents/rm.js";
 import * as retention from "../src/storage/retention.js";
 
 const hostedDelete = hostedOnly("AgentManager close deletion");
 const managers: AgentManager[] = [];
 const roots: string[] = [];
+const jsonlTraces = (directory: string): Array<{ relative: string; bytes: Buffer }> => {
+  const traces: Array<{ relative: string; bytes: Buffer }> = [];
+  const visit = (current: string): void => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const file = path.join(current, entry.name);
+      if (entry.isDirectory()) visit(file);
+      else if (entry.isFile() && /\.jsonl/i.test(entry.name)) {
+        traces.push({ relative: path.relative(directory, file), bytes: fs.readFileSync(file) });
+      }
+    }
+  };
+  visit(directory);
+  return traces.sort((left, right) => left.relative.localeCompare(right.relative));
+};
+const expectJsonlTracesUnchanged = (directory: string, before: ReturnType<typeof jsonlTraces>): void => {
+  const after = jsonlTraces(directory);
+  expect(after.map(trace => trace.relative)).toEqual(before.map(trace => trace.relative));
+  before.forEach((trace, index) => expect(after[index]!.bytes, trace.relative).toEqual(trace.bytes));
+};
 const setup = (retainRuns = true, extra: ConstructorParameters<typeof AgentManager>[2] = {}) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "manager-close-test-"));
   roots.push(tempRoot);
@@ -119,7 +137,9 @@ describe("AgentManager close storage", () => {
     expect(JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8"))).toMatchObject({ childrenStopped: true, closedAt: expect.any(Number) });
     const run = path.join(root, handle.id);
     const taskPath = path.join(run, "task.txt");
-    expect(fs.readdirSync(run).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+    expect(fs.readdirSync(run).sort()).toEqual(["events.jsonl", "manager-result.json", "run-identity.json", "status.json", "task.txt"]);
+    const retainedTraces = jsonlTraces(run);
+    expect(retainedTraces.map(trace => trace.relative)).toContain("events.jsonl");
     expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).toMatchObject({ id: handle.id, status: "stopped" });
     expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).not.toHaveProperty("task");
     expect(fs.readFileSync(taskPath)).toEqual(Buffer.from(task, "utf8"));
@@ -130,6 +150,8 @@ describe("AgentManager close storage", () => {
       inputSha256: digest, inputBytes: Buffer.byteLength(task, "utf8") });
     expect(persisted).not.toHaveProperty("task");
     expect(hasUnresolvedWorker(run)).toBe(false);
+    await manager.close();
+    expectJsonlTracesUnchanged(run, retainedTraces);
   });
 
   it.runIf(hostedDelete).each(["EBUSY", "EPERM"])("retries transient %s when removing an owned empty root", async (code) => {
@@ -184,23 +206,28 @@ describe("AgentManager close storage", () => {
     expect(fs.readFileSync(path.join(root, "unrelated"), "utf8")).toBe("not an agent artifact");
   });
 
-  it("records durable-journal close collection without deleting the run (#11199)", async () => {
-    // Exercise the actual close decision, but record its removal request. The
-    // existing real-delete tests below belong to hosted CI, not a fleet lane.
+  it("prunes close bloat but preserves durable journal traces (#11199)", async () => {
     vi.spyOn(retention, "claimTempRunSweep").mockReturnValue(false);
-    const remove = vi.spyOn(agentRemoval, "removeTree").mockResolvedValue(undefined);
     const { manager, root } = setup(false);
     const result = await manager.run({ task: "hello", runner: "pi", extensions: false });
     const directory = path.join(root, result.id);
     const store = path.join(directory, "durable", "initial", "store");
     fs.mkdirSync(store, { recursive: true });
     fs.writeFileSync(path.join(store, "..", "lease.sqlite"), "");
-    fs.writeFileSync(path.join(store, "main.jsonl"), "{}\n");
+    const journal = path.join(store, "main.jsonl");
+    fs.writeFileSync(journal, "{}\n");
+    const journalBytes = fs.readFileSync(journal);
+    const traces = jsonlTraces(directory);
     expect(retention.canRemoveTerminalRun(directory)).toBe(true);
     await manager.close();
-    expect(remove).toHaveBeenCalledWith(directory);
-    expect(fs.readFileSync(path.join(store, "main.jsonl"), "utf8")).toBe("{}\n");
     expect(fs.existsSync(root)).toBe(true);
+    expect(fs.existsSync(directory)).toBe(true);
+    expect(fs.readFileSync(journal)).toEqual(journalBytes);
+    expectJsonlTracesUnchanged(directory, traces);
+    expect(fs.existsSync(path.join(store, "..", "lease.sqlite"))).toBe(false);
+    expect(fs.existsSync(path.join(directory, "status.json"))).toBe(true);
+    expect(fs.existsSync(path.join(directory, "run-identity.json"))).toBe(true);
+    expect(fs.existsSync(path.join(directory, "task.txt"))).toBe(false);
   });
 
   it.runIf(hostedDelete)("removes a managed root holding a finished run's pi-durable journal (#229)", async () => {
@@ -398,7 +425,9 @@ describe("AgentManager close storage", () => {
       expect(JSON.parse(fs.readFileSync(path.join(root, ".fabric-owner.json"), "utf8"))).toMatchObject({ childrenStopped: true, closedAt: expect.any(Number) });
       const run = path.join(root, active.id);
       const taskPath = path.join(run, "task.txt");
-      expect(fs.readdirSync(run).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+      expect(fs.readdirSync(run).sort()).toEqual(["events.jsonl", "manager-result.json", "run-identity.json", "status.json", "task.txt"]);
+      const retainedTraces = jsonlTraces(run);
+      expect(retainedTraces.map(trace => trace.relative)).toContain("events.jsonl");
       expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).toMatchObject({ id: active.id, status: "stopped" });
       expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8"))).not.toHaveProperty("task");
       expect(fs.readFileSync(taskPath, "utf8")).toBe("HANG");
@@ -409,6 +438,8 @@ describe("AgentManager close storage", () => {
         inputSha256: digest, inputBytes: Buffer.byteLength("HANG", "utf8") });
       expect(persisted).not.toHaveProperty("task");
       expect(hasUnresolvedWorker(run)).toBe(false);
+      await manager.close();
+      expectJsonlTracesUnchanged(run, retainedTraces);
     } finally { launch.mockRestore(); }
   });
 

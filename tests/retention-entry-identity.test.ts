@@ -14,7 +14,7 @@ const write = (file: string, data: string) => { fs.mkdirSync(path.dirname(file),
 const tmp = (prefix: string) => { const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(root); return root; };
 const run = (directory: string, finishedAt: number) => {
   write(path.join(directory, "status.json"), JSON.stringify({ transport: "process", sessionId: "2147483647", status: "completed", finishedAt }));
-  write(path.join(directory, "events.jsonl"), '{"sequence":1}\n');
+  write(path.join(directory, "task.txt"), "generic retention fixture\n");
   write(path.join(directory, "reply.json"), '{"text":"done"}');
   return directory;
 };

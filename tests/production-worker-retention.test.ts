@@ -108,8 +108,12 @@ const productionRun = async (principal: boolean, retainRuns = true, nestedRunRoo
     const rows = fs.readFileSync(path.join(agent, "fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(rows.map(row => row.type)).toEqual(["decision", "outcome"]);
   }
+  const reply = path.join(run, "reply.json");
+  if (!fs.existsSync(reply)) fs.writeFileSync(reply, '{"text":"fixture reply"}', { mode: 0o600 });
+  const traces = traceSnapshot(run);
+  expect(traces.length).toBeGreaterThan(0);
   console.info("production artifact tree", JSON.stringify({ principal, run, files: fs.readdirSync(run).sort(), deliveries: fs.readdirSync(path.join(run, "deliveries")), status: result.status }));
-  return { manager, result, run, runRoot };
+  return { manager, result, run, runRoot, traces };
 };
 
 const unsafeKinds = ["unknown-delivery", "pending-delivery", "delivery-link", "sidecar-link", "directory-link", "hardlink", "pending-outcome", "live", "unresolved", "unknown-json", "unknown-directory"] as const;
@@ -140,6 +144,26 @@ const makeUnsafe = (run: string, kind: UnsafeKind) => {
 
 // Copy the entire emitted tree, including native session and delivery artifacts.
 const copyRun = (source: string, destination: string) => { fs.cpSync(source, destination, { recursive: true }); return destination; };
+const traceSnapshot = (directory: string): Array<[string, Buffer]> => {
+  const files: string[] = [];
+  const visit = (current: string, relative = "") => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const child = path.join(relative, entry.name);
+      const file = path.join(current, entry.name);
+      if (entry.isDirectory()) visit(file, child);
+      else if (entry.isFile() && /\.jsonl/i.test(entry.name)) files.push(child);
+    }
+  };
+  visit(directory);
+  return files.sort().map(file => [file, fs.readFileSync(path.join(directory, file))]);
+};
+const expectTraceSnapshot = (directory: string, before: Array<[string, Buffer]>) => {
+  const after = traceSnapshot(directory);
+  expect(after.map(([file]) => file)).toEqual(before.map(([file]) => file));
+  for (const [index, [, bytes]] of before.entries()) {
+    expect(after[index]![1].equals(bytes), `${after[index]![0]} remains byte-identical`).toBe(true);
+  }
+};
 
 describe("I-2 production-worker ingress retention", () => {
   it("a completed native descendant persists its process identity and releases a retained failed parent's ownership debt", async () => {
@@ -183,27 +207,43 @@ describe("I-2 production-worker ingress retention", () => {
       expect(complete.has("native-descendant-actor")).toBe(false);
       expect(complete.has("*")).toBe(false);
     } finally { clock.mockRestore(); }
+    const traces = traceSnapshot(parent);
+    expect(traces.some(([relative]) => relative.endsWith("session.jsonl"))).toBe(true);
     const aged = new Date(Date.now() - RESIDENT_RUN_RETENTION_MS - 60_000);
     fs.utimesSync(parent, aged, aged);
-    // Strict resident startup collection still accepts this checked-exited native tree.
-    expect(sweepResidentRuns(runs, Date.now(), 10_000)).toEqual([parent]);
-    expect(fs.existsSync(parent)).toBe(false);
+    // Checked worker exit permits nontrace cleanup, but its native session stays byte-identical.
+    expect(sweepResidentRuns(runs, Date.now(), 10_000)).toEqual([]);
+    expect(fs.existsSync(parent)).toBe(true);
+    expect(fs.existsSync(child.run)).toBe(true);
+    expectTraceSnapshot(parent, traces);
+    expect(fs.existsSync(path.join(child.run, "task.txt"))).toBe(false);
+    expect(fs.existsSync(path.join(child.run, "reply.json"))).toBe(false);
   }, 45000);
-  it.each([false, true])("collects default-root close with principal provenance=%s", async principal => {
-    const { manager, runRoot } = await productionRun(principal, false);
+  it.each([false, true])("retains byte-identical production traces on default-root close with principal provenance=%s", async principal => {
+    const { manager, run, runRoot, traces } = await productionRun(principal, false);
+    const reply = path.join(run, "reply.json");
+    expect(fs.existsSync(path.join(run, "task.txt"))).toBe(true);
     await manager.close();
-    expect(fs.existsSync(runRoot)).toBe(false);
+    expect(fs.existsSync(runRoot)).toBe(true);
+    expect(fs.existsSync(run)).toBe(true);
+    expectTraceSnapshot(run, traces);
+    expect(fs.existsSync(path.join(run, "task.txt"))).toBe(false);
+    expect(fs.existsSync(reply)).toBe(false);
+    expect(fs.existsSync(path.join(run, "status.json"))).toBe(true);
   }, 45000);
 
-  it("default-root close preserves unknown, pending-delivery and symlink controls", async () => {
-    const { manager, run, runRoot } = await productionRun(true, false);
+  it("default-root close preserves production traces and unknown, pending-delivery and symlink controls", async () => {
+    const { manager, run, runRoot, traces } = await productionRun(true, false);
     for (const kind of ["unknown-delivery", "pending-delivery", "delivery-link"] as const) makeUnsafe(copyRun(run, path.join(runRoot, kind)), kind);
     await manager.close();
     expect(fs.existsSync(runRoot)).toBe(true);
+    expect(fs.existsSync(run)).toBe(true);
+    expectTraceSnapshot(run, traces);
+    expect(fs.existsSync(path.join(run, "task.txt"))).toBe(false);
     for (const kind of ["unknown-delivery", "pending-delivery", "delivery-link"]) expect(fs.existsSync(path.join(runRoot, kind))).toBe(true);
   }, 45000);
 
-  it.each(["closed", "orphan"])("expires the complete %s emitted tree but retains unsafe controls", async state => {
+  it.each(["closed", "orphan"])("prunes expired %s nontrace artifacts while retaining traces and unsafe controls", async state => {
     const plain = await productionRun(false); const attributed = await productionRun(true);
     const tempRoot = temporary(); const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + state);
     const base = Math.max(plain.result.finishedAt!, attributed.result.finishedAt!);
@@ -212,16 +252,28 @@ describe("I-2 production-worker ingress retention", () => {
     for (const kind of unsafeKinds) makeUnsafe(copyRun(attributed.run, path.join(root, kind)), kind);
     if (state === "closed") markRunRootClosed(root, base, true);
     else fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: base, heartbeatAt: base, orphanedAt: base }));
+    const plainTraces = traceSnapshot(path.join(root, "plain"));
+    const attributedTraces = traceSnapshot(path.join(root, "attributed"));
     const sweep = (now: number) => sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 200, oneShotRunRetentionMs: 200 });
     expect(sweep(base + 99).removedRuns).toEqual([]);
     for (const name of ["plain", "attributed", ...unsafeKinds]) expect(fs.existsSync(path.join(root, name))).toBe(true);
-    sweep(base + 201);
+    const expired = sweep(base + 201);
+    // Traces keep their run directories; the report counts only actual directory removals.
+    expect(expired.removedRuns).toEqual([]);
+    expect(expired.removedRoots).toEqual([]);
     // Check the negative controls first so they are exercised on the pre-fix tree too.
     for (const kind of unsafeKinds) expect(fs.existsSync(path.join(root, kind)), kind).toBe(true);
-    for (const name of ["plain", "attributed"]) expect(fs.existsSync(path.join(root, name)), name).toBe(false);
+    for (const name of ["plain", "attributed"]) expect(fs.existsSync(path.join(root, name)), name).toBe(true);
+    expectTraceSnapshot(path.join(root, "plain"), plainTraces);
+    expectTraceSnapshot(path.join(root, "attributed"), attributedTraces);
+    for (const name of ["plain", "attributed"]) {
+      const run = path.join(root, name);
+      expect(fs.existsSync(path.join(run, "task.txt"))).toBe(false);
+      expect(fs.existsSync(path.join(run, "reply.json"))).toBe(false);
+    }
   }, 90000);
 
-  it("expires actor archives with copied nested production runs but retains unsafe descendants and latest", async () => {
+  it("prunes actor-archive nontraces with copied nested production runs but retains traces, unsafe descendants and latest", async () => {
     const plain = await productionRun(false); const attributed = await productionRun(true);
     const root = temporary(); const actor = { sessionFile: path.join(root, "actor.jsonl"), lastRunId: "latest" };
     const base = Math.max(plain.result.finishedAt!, attributed.result.finishedAt!);
@@ -257,14 +309,22 @@ describe("I-2 production-worker ingress retention", () => {
       // an actual multiply-linked file in the archive to test the collector veto.
       if (kind === "hardlink") makeUnsafe(path.join(archive, "nested", "attributed"), kind);
     }
+    const successfulArchive = path.join(root, "runs", "successful");
+    const successfulTraces = traceSnapshot(successfulArchive);
+    expect(successfulTraces.length).toBeGreaterThan(0);
     store.pruneRuns(actor, base + 99);
     expect(store.retainedRunIds(actor)).toContain("successful");
     store.pruneRuns(actor, base + 60_001);
+    expect(store.retainedRunIds(actor)).toContain("successful");
+    expectTraceSnapshot(successfulArchive, successfulTraces);
+    expect(fs.existsSync(path.join(successfulArchive, "task.txt"))).toBe(false);
+    expect(fs.existsSync(path.join(successfulArchive, "reply.json"))).toBe(false);
+    expect(fs.existsSync(path.join(successfulArchive, "nested", "plain", "task.txt"))).toBe(false);
+    expect(fs.existsSync(path.join(successfulArchive, "nested", "plain", "reply.json"))).toBe(false);
     for (const kind of ["latest", ...unsafeKinds]) {
       if (kind === "delivery-link" || kind === "sidecar-link" || kind === "directory-link") {
         expect(fs.existsSync(path.join(root, "sources", kind, "nested", "attributed", "events.jsonl"))).toBe(true);
       } else expect(store.retainedRunIds(actor), kind).toContain(kind);
     }
-    expect(store.retainedRunIds(actor)).not.toContain("successful");
   }, 90000);
 });

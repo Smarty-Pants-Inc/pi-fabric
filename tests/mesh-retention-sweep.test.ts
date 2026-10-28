@@ -21,7 +21,7 @@ const write = (file: string, data: string) => { fs.mkdirSync(path.dirname(file),
 const tmp = (prefix: string) => { const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(root); return root; };
 const run = (directory: string, status: Record<string, unknown>) => {
   write(path.join(directory, "status.json"), JSON.stringify({ transport: "process", sessionId: "2147483647", ...status }));
-  write(path.join(directory, "events.jsonl"), '{"sequence":1}\n');
+  write(path.join(directory, "task.txt"), "generic retention fixture\n");
   write(path.join(directory, "reply.json"), '{"text":"done"}');
   return directory;
 };
@@ -69,6 +69,29 @@ describe("mesh-wide age-based run retention", () => {
 
   // pi-fabric#850: the live dry run reported 7627 runs as "not terminal or run tree not proven safe". The report now
   // names the check that refused each run, and the bytes each refusal class holds.
+  it("plans pruning nontrace artifacts while preserving trace bytes in an eligible run", async () => {
+    const root = tmp("fabric-mesh-trace-retention-");
+    const registry = path.join(root, "actors", "01a0cd9c-dead-session");
+    const actor = path.join(registry, "actor");
+    write(path.join(registry, "actors.json"), JSON.stringify({ actors: [{
+      id: "actor", rootId: "session:01a0cd9c-dead-session", status: "idle", sessionFile: path.join(actor, "session.jsonl"), lastRunId: "latest",
+    }] }));
+    const latest = run(path.join(actor, "runs", "latest"), { status: "completed", finishedAt: NOW - 9 * DAY });
+    const candidate = run(path.join(actor, "runs", "old"), { status: "completed", finishedAt: NOW - 8 * DAY });
+    const tracePath = path.join(candidate, "events.jsonl");
+    const traceBytes = Buffer.from('{"sequence":1,"text":"preserve exact bytes"}\r\n');
+    fs.writeFileSync(tracePath, traceBytes);
+
+    const plan = await sweepMeshRetention(root, { now: NOW, dryRun: true, runRetentionMs: 7 * DAY });
+
+    expect(plan.removedRuns).not.toContain(candidate); // The trace keeps its run directory; it is not a whole-run removal.
+    expect(plan.removedRuns).not.toContain(latest);
+    expect(plan.summary.deleters.pruneActorRunArchives?.removed).toBe(2); // task.txt and reply.json are eligible artifacts.
+    expect(fs.readFileSync(tracePath)).toEqual(traceBytes);
+    expect(fs.existsSync(path.join(candidate, "task.txt"))).toBe(true); // Dry run plans pruning without mutating.
+    expect(fs.existsSync(path.join(candidate, "reply.json"))).toBe(true);
+  });
+
   it("reports which check refused each expired run, with the bytes it holds", async () => {
     const mesh = deadRootMesh();
     write(path.join(mesh.old, "status.json"), JSON.stringify({ status: "completed", finishedAt: NOW - 8 * DAY }));

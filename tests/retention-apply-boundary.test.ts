@@ -73,7 +73,7 @@ const fixture = () => {
   const run = (id: string, finishedAt: number) => {
     const directory = path.join(actor, "runs", id);
     write(path.join(directory, "status.json"), JSON.stringify({ transport: "process", sessionId: "2147483647", status: "completed", finishedAt }));
-    write(path.join(directory, "events.jsonl"), '{"sequence":1}\n');
+    write(path.join(directory, "task.txt"), "generic retention fixture\n");
     write(path.join(directory, "reply.json"), '{"text":"done"}');
     return directory;
   };

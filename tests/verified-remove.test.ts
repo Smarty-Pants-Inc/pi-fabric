@@ -30,7 +30,6 @@ const write = (file: string, data: string) => { fs.mkdirSync(path.dirname(file),
 const LOG = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
 const run = (directory: string, status: Record<string, unknown> = { status: "completed", finishedAt: 1 }) => {
   write(path.join(directory, "status.json"), JSON.stringify({ transport: "process", sessionId: DEAD, ...status }));
-  write(path.join(directory, "events.jsonl"), LOG);
   write(path.join(directory, "reply.json"), '{"text":"done"}');
   return directory;
 };
@@ -47,7 +46,7 @@ const shape = (file: string): unknown => {
 type Swap = "symlink" | "replaced inode" | "foreign owner" | "refreshed mtime";
 const SWAPS: Swap[] = ["symlink", "replaced inode", "foreign owner", "refreshed mtime"];
 /** Apply `swap` to `target` once, right before the removal; returns what must still exist afterwards. */
-const armSwap = async (target: string, swap: Swap): Promise<() => Record<string, unknown>> => {
+const armSwap = async (target: string, swap: Swap, hookTarget = target): Promise<() => Record<string, unknown>> => {
   const outside = tmp("fabric-swap-outside-");
   const moved = path.join(outside, "moved");
   let fired = false;
@@ -65,15 +64,16 @@ const armSwap = async (target: string, swap: Swap): Promise<() => Record<string,
     }
   };
   const hooks = await import("../src/storage/verified-remove.js").then(module => module.verifiedRemoveTestHooks).catch(() => undefined);
+  let hookFired = false;
   if (hooks) {
-    hooks.beforeOpen = (file) => { if (file === target) doSwap(); };
+    hooks.beforeOpen = (file) => { if (file === hookTarget) { hookFired = true; doSwap(); } };
     restores.push(() => { delete hooks.beforeOpen; });
   } else {
     // main: swap inside main's own removal call on the target, before it runs.
     const intercept = <K extends "rmSync" | "unlinkSync" | "renameSync">(name: K) => {
       const original = fs[name] as (...args: unknown[]) => unknown;
       vi.spyOn(fs, name).mockImplementation(((...args: unknown[]) => {
-        if (args[0] === target || (name === "renameSync" && args[1] === target)) doSwap();
+        if (args[0] === target || args[0] === hookTarget || (name === "renameSync" && (args[1] === target || args[1] === hookTarget))) doSwap();
         return original(...args);
       }) as never);
     };
@@ -81,45 +81,40 @@ const armSwap = async (target: string, swap: Swap): Promise<() => Record<string,
     const rm = fs.promises.rm;
     vi.spyOn(fs.promises, "rm").mockImplementation(((file: fs.PathLike, options?: fs.RmOptions) => { if (file === target) doSwap(); return rm(file, options); }) as never);
   }
-  return () => ({ target: shape(target), outside: shape(outside) });
+  return () => ({ target: shape(target), outside: shape(outside), moved, hookFired });
 };
 
-interface Fixture { target: string; act: () => unknown }
+interface Fixture { target: string; hookTarget: string; act: () => unknown }
 const FIXTURES: Record<string, () => Fixture> = {
   pruneActorRunArchives: () => {
     const runs = tmp("fabric-vr-archives-");
     const target = run(path.join(runs, "old"));
-    return { target, act: () => pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW }) };
+    return { target, hookTarget: path.join(target, "status.json"), act: () => pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW }) };
   },
   sweepResidentRuns: () => {
     const residency = tmp("fabric-vr-resident-");
     const target = old(run(path.join(residency, "runs", "old")));
-    return { target, act: () => sweepResidentRuns(path.join(residency, "runs"), NOW, 10_000, { retentionMs: DAY }) };
+    return { target, hookTarget: path.join(target, "status.json"), act: () => sweepResidentRuns(path.join(residency, "runs"), NOW, 10_000, { retentionMs: DAY }) };
   },
   "pruneClosedRunRoot (sweepTempRunRoots)": () => {
     const tempRoot = tmp("fabric-vr-closed-");
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "closed");
     const target = run(path.join(root, "old"));
     write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }));
-    return { target, act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
+    return { target, hookTarget: path.join(target, "status.json"), act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
   },
   "sweepTempRunRoots (orphaned root)": () => {
     const tempRoot = tmp("fabric-vr-orphan-");
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "orphan");
     const target = run(path.join(root, "old"));
     write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
-    return { target, act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
+    return { target, hookTarget: path.join(target, "status.json"), act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
   },
   removeEmptyRunRoot: () => {
     const tempRoot = tmp("fabric-vr-empty-");
     const target = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "empty");
     write(path.join(target, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, closedAt: 1 }));
-    return { target, act: () => removeEmptyRunRoot(target) };
-  },
-  compactTerminalRunEvents: () => {
-    const directory = run(path.join(tmp("fabric-vr-compact-"), "old"));
-    const target = path.join(directory, "events.jsonl");
-    return { target, act: () => compactTerminalRunEvents(directory, { now: NOW, terminalRunEventsMaxBytes: 1024 }) };
+    return { target, hookTarget: path.join(target, ".fabric-owner.json"), act: () => removeEmptyRunRoot(target) };
   },
   // smarty-dev#16444: pruneActorSessionBackups is no longer a deleter (it moves older backups into session-archive/,
   // tests/actor-session-trace-archive.test.ts), so it left this deletion matrix.
@@ -128,14 +123,14 @@ const FIXTURES: Record<string, () => Fixture> = {
     const target = createScratch("output", tempRoot);
     write(path.join(target, "output.txt"), "x");
     closeScratch(target);
-    return { target, act: () => sweepScratch({ tempRoot, now: Date.now() + 2 * DAY }) };
+    return { target, hookTarget: target, act: () => sweepScratch({ tempRoot, now: Date.now() + 2 * DAY }) };
   },
   claimMeshRetentionSweep: () => {
     const meshRoot = tmp("fabric-vr-claim-");
     const hour = 3600_000;
     claimMeshRetentionSweep(meshRoot, hour, 10 * hour);
     const target = path.join(meshRoot, ".mesh-retention-sweep-10.json");
-    return { target, act: () => claimMeshRetentionSweep(meshRoot, hour, 12 * hour) };
+    return { target, hookTarget: target, act: () => claimMeshRetentionSweep(meshRoot, hour, 12 * hour) };
   },
 };
 // The public mesh pass is not in FIXTURES: its apply rejects at the boundary until smarty-dev#10678 (pi-fabric#1014 SEC
@@ -153,28 +148,131 @@ const meshPass = () => {
 };
 
 describe.skipIf(process.platform !== "linux")("verified removal: every routed retention deleter (smarty-dev#7916)", () => {
-  it.each(Object.keys(FIXTURES))("%s removes its expired target when nothing changes (control)", async name => {
+  it("keeps run artifacts when the judged root mtime changes before the first per-file removal", async () => {
+    const runs = tmp("fabric-vr-root-mtime-");
+    const target = run(path.join(runs, "old"));
+    const status = path.join(target, "status.json");
+    const hooks = (await import("../src/storage/verified-remove.js")).verifiedRemoveTestHooks;
+    let fired = false;
+    hooks.beforeOpen = file => {
+      if (file !== status || fired) return;
+      fired = true;
+      const refreshed = Date.now() / 1_000 + 5;
+      fs.utimesSync(target, refreshed, refreshed);
+    };
+    restores.push(() => { delete hooks.beforeOpen; });
+    const deletionCalls: string[] = [];
+    vi.spyOn(fs, "unlinkSync").mockImplementation((file => { deletionCalls.push(`unlink:${String(file)}`); }) as typeof fs.unlinkSync);
+    vi.spyOn(fs, "rmdirSync").mockImplementation((file => { deletionCalls.push(`rmdir:${String(file)}`); }) as typeof fs.rmdirSync);
+    try {
+      pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW });
+      expect(fired).toBe(true);
+      expect({ status: fs.existsSync(status), reply: fs.existsSync(path.join(target, "reply.json")) }).toEqual({ status: true, reply: true });
+      expect(deletionCalls).toEqual([]);
+      expect(fs.readFileSync(status, "utf8")).toContain('"status":"completed"');
+      expect(fs.readFileSync(path.join(target, "reply.json"), "utf8")).toBe('{"text":"done"}');
+    } finally { vi.restoreAllMocks(); }
+  });
+
+  it.each(Object.keys(FIXTURES))("%s removes its expired NONTRACE target when nothing changes (control)", async name => {
     const { target, act } = FIXTURES[name]!();
     await act();
-    expect(fs.existsSync(target) && name !== "compactTerminalRunEvents").toBe(false);
-    if (name === "compactTerminalRunEvents") expect(fs.statSync(target).size).toBeLessThan(LOG.length);
+    expect(fs.existsSync(target)).toBe(false);
+  });
+
+  it("paired trace control: leaves JSONL byte-identical and prunes a nontrace artifact", () => {
+    const runs = tmp("fabric-vr-trace-pair-");
+    const target = run(path.join(runs, "old"));
+    const status = path.join(target, "status.json"), reply = path.join(target, "reply.json"), trace = path.join(target, "events.jsonl");
+    write(trace, LOG);
+    const originalStatus = fs.readFileSync(status), originalTrace = fs.readFileSync(trace);
+    const deletionCalls: string[] = [];
+    vi.spyOn(fs, "unlinkSync").mockImplementation((file => { deletionCalls.push(String(file)); }) as typeof fs.unlinkSync);
+    vi.spyOn(fs, "rmdirSync").mockImplementation((file => { deletionCalls.push(String(file)); }) as typeof fs.rmdirSync);
+    expect(pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW })).toEqual([]);
+    expect(fs.readFileSync(status)).toEqual(originalStatus);
+    expect(fs.readFileSync(trace)).toEqual(originalTrace);
+    expect(fs.existsSync(reply)).toBe(false);
+    expect(deletionCalls.filter(file => file.includes("reply.json."))).toHaveLength(1);
+    const grave = path.join(target, `.retention-graveyard-${process.pid}`);
+    const moved = fs.readdirSync(grave);
+    expect(moved).toHaveLength(1);
+    expect(moved[0]).toMatch(/^reply\.json\.[0-9a-f-]{36}$/);
+    expect(fs.readFileSync(path.join(grave, moved[0]!))).toEqual(Buffer.from('{"text":"done"}'));
+  });
+
+  it("compaction archives the full original trace before publishing a tail", () => {
+    const directory = run(path.join(tmp("fabric-vr-compact-control-"), "old"));
+    const events = path.join(directory, "events.jsonl");
+    write(events, LOG);
+    const original = fs.readFileSync(events);
+    expect(compactTerminalRunEvents(directory, { now: NOW, terminalRunEventsMaxBytes: 1024 })).toBe(true);
+    expect(fs.statSync(events).size).toBeLessThan(original.length);
+    const archive = path.join(directory, "session-archive");
+    const archived = fs.readdirSync(archive).filter(name => name.endsWith(".jsonl"));
+    expect(archived).toHaveLength(1);
+    expect(fs.readFileSync(path.join(archive, archived[0]!))).toEqual(original);
+  });
+
+  it("keeps the source trace byte-identical when archive rename fails", () => {
+    const directory = run(path.join(tmp("fabric-vr-compact-rename-failure-"), "old"));
+    const events = path.join(directory, "events.jsonl");
+    write(events, LOG);
+    const original = fs.readFileSync(events);
+    const rename = fs.renameSync;
+    vi.spyOn(fs, "renameSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+      if (String(from) === events) throw Object.assign(new Error("archive rename failed"), { code: "ENOSPC" });
+      return rename(from, to);
+    }) as typeof fs.renameSync);
+    expect(compactTerminalRunEvents(directory, { now: NOW, terminalRunEventsMaxBytes: 1024 })).toBe(false);
+    vi.restoreAllMocks();
+    expect(fs.readFileSync(events)).toEqual(original);
+    expect(fs.readFileSync(path.join(directory, "session-archive", "MANIFEST.jsonl"), "utf8")).toContain("MOVE-FAILED");
+  });
+
+  it("refuses an archive pre-rename identity recheck after the trace inode changes", () => {
+    const directory = run(path.join(tmp("fabric-vr-compact-recheck-"), "old"));
+    const events = path.join(directory, "events.jsonl"), displaced = path.join(directory, "events.original");
+    write(events, LOG);
+    const original = fs.readFileSync(events);
+    const open = fs.openSync;
+    let traceOpens = 0;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags: string | number, mode?: number) => {
+      if (String(file) === events && ++traceOpens === 2) {
+        fs.renameSync(events, displaced);
+        fs.writeFileSync(events, "replacement\n");
+      }
+      return open(file, flags as never, mode);
+    }) as typeof fs.openSync);
+    expect(compactTerminalRunEvents(directory, { now: NOW, terminalRunEventsMaxBytes: 1024 })).toBe(false);
+    vi.restoreAllMocks();
+    expect(traceOpens).toBe(2);
+    expect(fs.readFileSync(displaced)).toEqual(original);
+    expect(fs.readFileSync(events, "utf8")).toBe("replacement\n");
+    expect(fs.existsSync(path.join(directory, "session-archive"))).toBe(false);
   });
 
   const cases = Object.keys(FIXTURES).flatMap(name => SWAPS.map(swap => [name, swap] as const));
-  it.each(cases)("%s deletes nothing after a swap to a %s between judgment and delete", async (name, swap) => {
-    const { target, act } = FIXTURES[name]!();
-    const observe = await armSwap(target, swap);
+  it.each(cases)("%s deletes nothing after a swap to a %s between judgment and per-file removal", async (name, swap) => {
+    const { target, hookTarget, act } = FIXTURES[name]!();
+    const observe = await armSwap(target, swap, hookTarget);
+    const deletionCalls: string[] = [];
+    vi.spyOn(fs, "unlinkSync").mockImplementation((file => { deletionCalls.push(`unlink:${String(file)}`); }) as typeof fs.unlinkSync);
+    vi.spyOn(fs, "rmdirSync").mockImplementation((file => { deletionCalls.push(`rmdir:${String(file)}`); }) as typeof fs.rmdirSync);
+    vi.spyOn(fs, "rmSync").mockImplementation((file => { deletionCalls.push(`rm:${String(file)}`); }) as typeof fs.rmSync);
     await act();
     const after = observe();
     for (const restore of restores.splice(0).reverse()) restore();
-    // The swapped-in object is still at the path, and the judged original (if moved away by the swap) is intact.
+    vi.restoreAllMocks();
+    expect(after.hookFired, `${name} / ${swap}: per-file hook`).toBe(true);
     expect(after.target, `${name} / ${swap}: target path`).not.toBeNull();
-    if (swap === "symlink") expect(after.target).toEqual(["link", path.join(path.dirname(String((after.target as string[])[1])), "moved")]);
+    if (swap === "symlink") expect(after.target).toEqual(["link", after.moved]);
     if (swap === "symlink" || swap === "replaced inode") {
       const outside = after.outside as Record<string, unknown>;
       expect(Object.values(outside).every(value => value !== null), `${name} / ${swap}: moved original`).toBe(true);
     }
-    if (name === "compactTerminalRunEvents" && swap !== "symlink") expect(fs.readFileSync(target, "utf8")).toBe(LOG);
+    if (swap === "refreshed mtime") expect(fs.existsSync(hookTarget), `${name}: artifact under refreshed root`).toBe(true);
+    expect(deletionCalls, `${name} / ${swap}: no deletion operation`).toEqual([]);
   });
 
   it.each(Object.keys(FIXTURES))("%s deletes nothing without getuid", async name => {
@@ -259,6 +357,7 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
   it("off Linux, a dry run counts main's removal with its bytes and changes nothing", async () => {
     const { verifiedRemove, startRemovalTally, stopRemovalTally } = await import("../src/storage/verified-remove.js");
     const target = run(path.join(tmp("fabric-vr-darwin-"), "old"));
+    write(path.join(target, "events.jsonl"), LOG);
     const before = shape(target);
     const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     Object.defineProperty(process, "platform", { value: "darwin" });
@@ -278,6 +377,7 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     const { verifiedRemove } = await import("../src/storage/verified-remove.js");
     const target = run(path.join(tmp("fabric-vr-dry-"), "old"));
     const before = shape(path.dirname(target));
+    write(path.join(target, "events.jsonl"), LOG);
     const result = verifiedRemove(target, fs.lstatSync(target), { deleter: "test", dryRun: true });
     expect(result).toEqual({ removed: true, bytes: LOG.length + 15 + fs.statSync(path.join(target, "status.json")).size });
     expect(shape(path.dirname(target))).toEqual(before);

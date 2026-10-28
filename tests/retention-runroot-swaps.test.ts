@@ -38,7 +38,9 @@ const protect = (): void => {
   vi.spyOn(fs.promises, "unlink").mockImplementation(recordAsync("promises.unlink"));
   vi.spyOn(fs.promises, "rmdir").mockImplementation(recordAsync("promises.rmdir"));
   vi.spyOn(fs, "renameSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
-    const graveyardMove = /^\/proc\/self\/fd\/\d+\/run$/.test(String(from)) && /^\/proc\/self\/fd\/\d+\/run\.[0-9a-f-]{36}$/.test(String(to));
+    const source = /^\/proc\/self\/fd\/\d+\/([^/]+)$/.exec(String(from));
+    const destination = /^\/proc\/self\/fd\/\d+\/([^/]+)\.([0-9a-f-]{36})$/.exec(String(to));
+    const graveyardMove = !!source && !!destination && source[1] === destination[1];
     calls.push({ op: graveyardMove ? "renameSync(graveyard move, called through)" : "renameSync(suppressed)", args: [String(from), String(to)] });
     if (graveyardMove) real.renameSync(from, to);
   }) as typeof fs.renameSync);
@@ -56,7 +58,7 @@ const shape = (file: string): unknown => {
 type Kind = "closed" | "orphan";
 const DELETER: Record<Kind, string> = { closed: "pruneClosedRunRoot", orphan: "sweepTempRunRoots" };
 /** An owned, closed (0700) temp root with one expired, terminal process run whose saved worker PID is dead. */
-const fixture = (kind: Kind) => {
+const fixture = (kind: Kind, withTrace = false) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-runroot-swaps-"));
   roots.push(tempRoot);
   const root = path.join(tempRoot, `${FABRIC_RUN_ROOT_PREFIX}${kind}`);
@@ -64,22 +66,24 @@ const fixture = (kind: Kind) => {
   fs.mkdirSync(run, { recursive: true, mode: 0o700 });
   fs.chmodSync(root, 0o700); fs.chmodSync(run, 0o700);
   fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ id: "run", status: "completed", finishedAt: 1, transport: "process", sessionId: String(DEAD_PID) }), { mode: 0o600 });
-  fs.writeFileSync(path.join(run, "events.jsonl"), '{"sequence":0}\n', { mode: 0o600 });
+  fs.writeFileSync(path.join(run, "reply.json"), '{"text":"done"}', { mode: 0o600 });
+  if (withTrace) fs.writeFileSync(path.join(run, "events.jsonl"), '{"sequence":0}\n', { mode: 0o600 });
   fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: DEAD_PID, startedAt: 1, heartbeatAt: 1,
     ...(kind === "closed" ? { closedAt: 1, childrenStopped: true } : { orphanedAt: 1 }) }), { mode: 0o600 });
   // Old enough that only the judged mtime (not a fresh one) is eligible either way.
   const old = new Date(Date.now() - 30 * DAY);
   fs.utimesSync(run, old, old);
   const sweep = () => sweepTempRunRoots({ tempRoot, now: NOW, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
-  return { tempRoot, root, run, sweep, judged: shape(run), ino: fs.lstatSync(run).ino };
+  return { tempRoot, root, run, hookTarget: path.join(run, "status.json"), reply: path.join(run, "reply.json"), sweep,
+    judged: shape(run), ino: fs.lstatSync(run).ino, artifactIno: fs.lstatSync(path.join(run, "status.json")).ino };
 };
 
 type Swap = "replaced inode" | "symlink" | "foreign owner" | "refreshed mtime";
 const SWAPS: Swap[] = ["replaced inode", "symlink", "foreign owner", "refreshed mtime"];
 const REASON: Record<Swap, RegExp> = {
   "replaced inode": /^target inode was replaced since judgment$/,
-  // O_PATH|O_NOFOLLOW|O_DIRECTORY on a symbolic link fails ENOTDIR: refused before any open succeeds.
-  symlink: /^type changed since judgment$/,
+  // The run-root parent itself is a symlink, so the no-follow parent open fails before the file is opened.
+  symlink: /^parent open failed/,
   "foreign owner": /^target is not owned by this user$/,
   "refreshed mtime": /^target was modified since judgment$/,
 };
@@ -96,27 +100,24 @@ describe.skipIf(process.platform !== "linux")("run-root deleters remove only the
       protect();
       const result = f.sweep();
       vi.restoreAllMocks();
-      expect(hooked).toEqual([f.run]);
-      expect(tally[deleter]).toMatchObject({ removed: 1, refused: {} });
+      expect(hooked.sort()).toEqual([path.join(f.run, "status.json"), f.reply].sort());
+      expect(tally[deleter]).toMatchObject({ removed: 2, refused: {} });
       expect(Object.keys(tally)).toEqual([deleter]);
-      expect(result.removedRuns).toEqual(kind === "closed" ? [f.run] : []);
-      // The recorders never deleted: the root still holds the graveyard, so it is not reported removed.
-      expect(result.removedRoots).toEqual([]);
+      expect(result).toEqual({ removedRoots: [], removedRuns: [] });
       const renames = calls.filter(call => call.op.startsWith("renameSync"));
-      expect(renames.map(call => call.op)).toEqual(["renameSync(graveyard move, called through)"]);
-      const unlinks = deletions().filter(call => call.op === "unlinkSync").map(call => path.basename(call.args[0]!)).sort();
+      expect(renames.map(call => call.op)).toEqual(["renameSync(graveyard move, called through)", "renameSync(graveyard move, called through)"]);
+      const unlinks = deletions().filter(call => call.op === "unlinkSync").map(call => path.basename(call.args[0]!).replace(/\.[0-9a-f-]{36}$/, "")).sort();
       const rmdirs = deletions().filter(call => call.op === "rmdirSync").map(call => path.basename(call.args[0]!));
-      expect(unlinks).toEqual(["events.jsonl", "status.json"]);
-      expect(rmdirs).toHaveLength(2);
-      expect(rmdirs[0]).toMatch(/^run\.[0-9a-f-]{36}$/);
-      expect(rmdirs[1]).toBe(`.retention-graveyard-${process.pid}`);
+      expect(unlinks).toEqual(["reply.json", "status.json"]);
+      expect(rmdirs).toEqual([`.retention-graveyard-${process.pid}`, `.retention-graveyard-${process.pid}`, "run"]);
       expect(deletions().filter(call => !["unlinkSync", "rmdirSync"].includes(call.op))).toEqual([]);
-      // Physically intact (moved into the graveyard, nothing deleted).
+      // The recorders never deleted: eligible files were moved into the graveyard and remain byte-identical.
       const grave = path.join(f.root, `.retention-graveyard-${process.pid}`);
-      const moved = fs.readdirSync(grave);
-      expect(moved).toEqual([rmdirs[0]]);
-      expect(shape(path.join(grave, moved[0]!))).toEqual(f.judged);
-      expect(fs.existsSync(f.run)).toBe(false);
+      const moved = fs.readdirSync(grave).sort();
+      expect(moved.map(name => name.replace(/\.[0-9a-f-]{36}$/, "")).sort()).toEqual(["reply.json", "status.json"]);
+      expect(fs.readFileSync(path.join(grave, moved.find(name => name.startsWith("status.json."))!), "utf8")).toContain('"status":"completed"');
+      expect(fs.readFileSync(path.join(grave, moved.find(name => name.startsWith("reply.json."))!), "utf8")).toBe('{"text":"done"}');
+      expect(fs.existsSync(f.run)).toBe(true);
     });
 
     it.each(SWAPS)(`${deleter}: a %s swap after judgment deletes no tree entry`, (swap) => {
@@ -127,22 +128,28 @@ describe.skipIf(process.platform !== "linux")("run-root deleters remove only the
       fs.writeFileSync(path.join(outside, "keep"), "outside");
       let swapped = 0;
       verifiedRemoveTestHooks.beforeOpen = (target) => {
-        if (target !== f.run) return;
+        if (target !== f.hookTarget) return;
         swapped++;
         if (swap === "refreshed mtime") { fs.utimesSync(f.run, new Date(), new Date()); return; }
         if (swap === "foreign owner") {
           vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, ...rest: unknown[]) => {
             const stat = (real.fstatSync as (...args: unknown[]) => fs.Stats)(fd, ...rest);
-            if (stat.ino !== f.ino) return stat;
+            if (stat.ino !== f.artifactIno) return stat;
             return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: stat.uid + 1 });
           }) as typeof fs.fstatSync);
           return;
         }
-        // The judged tree moves aside intact (no deletion); the replacement exists before, so no inode reuse.
+        // Swap the root itself; no product deletion is called through.
+        if (swap === "symlink") {
+          real.renameSync(f.run, aside);
+          fs.symlinkSync(outside, f.run);
+          return;
+        }
+        const replacement = path.join(outside, "replacement");
+        fs.cpSync(f.run, replacement, { recursive: true });
         real.renameSync(f.run, aside);
-        if (swap === "symlink") { fs.symlinkSync(outside, f.run); return; }
-        fs.mkdirSync(f.run, { mode: 0o700 });
-        fs.writeFileSync(path.join(f.run, "status.json"), "fresh", { mode: 0o600 });
+        real.renameSync(replacement, f.run);
+        fs.writeFileSync(f.hookTarget, "fresh", { mode: 0o600 });
       };
       const tally = startRemovalTally();
       const before = { outside: shape(outside), run: swap === "foreign owner" || swap === "refreshed mtime" ? f.judged : undefined };
@@ -153,17 +160,42 @@ describe.skipIf(process.platform !== "linux")("run-root deleters remove only the
       expect(calls).toEqual([]); // no unlink/rmdir/rm/promises.rm and no rename at all
       expect(result).toEqual({ removedRoots: [], removedRuns: [] });
       expect(tally[deleter]?.removed ?? 0).toBe(0);
-      const refused = Object.keys(tally[deleter]?.refused ?? {});
-      expect(refused).toHaveLength(1);
-      expect(refused[0]).toMatch(REASON[swap]);
+      if (swap === "refreshed mtime") expect(fs.existsSync(f.hookTarget)).toBe(true);
+      else {
+        const refused = Object.keys(tally[deleter]?.refused ?? {});
+        expect(refused).toHaveLength(1);
+        expect(refused[0]).toMatch(REASON[swap]);
+      }
       expect(tally[deleter]?.graveyards).toBeUndefined();
       // The target is at its path, untouched; no graveyard was created.
       expect(fs.readdirSync(f.root).filter(name => name.startsWith(".retention-graveyard-"))).toEqual([]);
       expect(shape(outside)).toEqual(before.outside);
       if (swap === "symlink") expect(shape(f.run)).toEqual(["link", outside]);
-      else if (swap === "replaced inode") expect(shape(f.run)).toEqual({ "status.json": "fresh" });
+      else if (swap === "replaced inode") expect(shape(f.run)).toEqual({ "reply.json": '{"text":"done"}', "status.json": "fresh" });
       else expect(shape(f.run)).toEqual(before.run);
       if (swap === "symlink" || swap === "replaced inode") expect(shape(aside)).toEqual(f.judged);
+    });
+
+    it("paired trace control: preserves trace bytes and prunes the nontrace reply", () => {
+      const f = fixture(kind, true);
+      const eventFile = path.join(f.run, "events.jsonl");
+      const originalTrace = fs.readFileSync(eventFile);
+      const originalStatus = fs.readFileSync(f.hookTarget);
+      const tally = startRemovalTally();
+      protect();
+      const result = f.sweep();
+      vi.restoreAllMocks();
+      expect(fs.readFileSync(eventFile)).toEqual(originalTrace);
+      expect(fs.readFileSync(f.hookTarget)).toEqual(originalStatus);
+      expect(fs.existsSync(f.reply)).toBe(false);
+      expect(result).toEqual({ removedRoots: [], removedRuns: [] });
+      expect(tally[deleter]).toMatchObject({ removed: 1, refused: {} });
+      const grave = path.join(f.run, `.retention-graveyard-${process.pid}`);
+      const moved = fs.readdirSync(grave);
+      expect(moved).toHaveLength(1);
+      expect(moved[0]).toMatch(/^reply\.json\.[0-9a-f-]{36}$/);
+      expect(fs.readFileSync(path.join(grave, moved[0]!))).toEqual(Buffer.from('{"text":"done"}'));
+      expect(deletions().filter(call => call.op === "unlinkSync")).toHaveLength(1);
     });
   });
 });

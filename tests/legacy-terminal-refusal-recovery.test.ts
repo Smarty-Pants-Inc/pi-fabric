@@ -62,6 +62,22 @@ const waitUntil = async (condition: () => boolean) => {
   expect(condition()).toBe(true);
 };
 const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+const snapshotTree = (root: string): [string, string][] => {
+  const entries: [string, string][] = [];
+  const visit = (directory: string, relative = ""): void => {
+    for (const name of fs.readdirSync(directory).sort()) {
+      const file = path.join(directory, name);
+      const child = path.join(relative, name);
+      const stat = fs.lstatSync(file);
+      if (stat.isDirectory()) {
+        entries.push([child, "directory"]);
+        visit(file, child);
+      } else entries.push([child, `file:${fs.readFileSync(file).toString("base64")}`]);
+    }
+  };
+  visit(root);
+  return entries;
+};
 
 const finishAndJoin = async (f: ReturnType<typeof harness>, id: string) => {
   const receipt = f.finish(id);
@@ -146,10 +162,25 @@ describe("legacy terminal refusal rows across manager, restart recovery and coll
     expect(fs.existsSync(`${pending}.delivered`)).toBe(routed);
     expect(fs.readFileSync(registry, "utf8")).toBe(persisted); // Evidence is never rewritten.
     expect(readTerminalAdmission(directory, sent.messageId)).toEqual({ id: sent.messageId, delivery: "steer", sender });
+    const bloat = path.join(directory, "reply.json");
+    fs.writeFileSync(bloat, "eligible disposable reply bloat\n");
+    const anchorFiles = [registry, path.join(directory, "status.json"), path.join(directory, "steer.jsonl")];
+    const anchorBytes = anchorFiles.map(file => fs.readFileSync(file, "utf8"));
     expect(canRemoveTerminalRun(directory)).toBe(collectible);
+    const beforeDryRun = snapshotTree(root);
     const swept = pruneActorRunArchives({ runsDirectory: root, retentionMs: 0, now: Date.now() + 1_000, dryRun: true });
-    expect(swept.includes(directory)).toBe(collectible);
+    expect(swept).not.toContain(directory);
+    expect(snapshotTree(root)).toEqual(beforeDryRun);
+    anchorFiles.forEach((file, index) => expect(fs.readFileSync(file, "utf8")).toBe(anchorBytes[index]));
     expect(fs.existsSync(directory)).toBe(true);
+    if (collectible) {
+      const applied = pruneActorRunArchives({ runsDirectory: root, retentionMs: 0, now: Date.now() + 1_000 });
+      expect(applied).not.toContain(directory);
+      expect(fs.existsSync(directory)).toBe(true);
+      expect(fs.existsSync(bloat)).toBe(false);
+      expect(canRemoveTerminalRun(directory)).toBe(true);
+      anchorFiles.forEach((file, index) => expect(fs.readFileSync(file, "utf8")).toBe(anchorBytes[index]));
+    }
   });
 
   it("a stale pending notice for a legacy refused row is never routed, and an old route receipt cannot retire it", async () => {
@@ -180,6 +211,9 @@ describe("legacy terminal refusal rows across manager, restart recovery and coll
     // Even an old route receipt (sender already told) does not discharge the uncertain row.
     writeJsonAtomic(`${pending}.delivered`, notice);
     expect(canRemoveTerminalRun(directory)).toBe(false);
+    const beforeDryRun = snapshotTree(root);
     expect(pruneActorRunArchives({ runsDirectory: root, retentionMs: 0, now: Date.now() + 1_000, dryRun: true })).not.toContain(directory);
+    expect(snapshotTree(root)).toEqual(beforeDryRun);
+    expect(fs.existsSync(directory)).toBe(true);
   });
 });

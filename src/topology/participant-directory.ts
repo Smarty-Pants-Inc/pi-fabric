@@ -813,6 +813,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /** fv2-11107: the last poll ownership map, reusable only while its observation of the managed actors holds. */
   #pollOwnership: { hostId: string; ids: ReadonlySet<string>; map: ReadonlyMap<string, boolean>; observation: ActorOwnershipObservation } | undefined;
   readonly #reportedCollisions = new Set<string>();
+  #observationDepth = 0;
   readonly #reportedRootCollisions = new Set<string>();
   #timer: NodeJS.Timeout | undefined;
   /** Keep the sampled cadence when a pending PubAck temporarily shortens the safety cap. */
@@ -1907,6 +1908,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
   }
 
+  /** Reads may classify refused mirrors without publishing maintenance notifications. */
+  observe<T>(read: () => T): T {
+    this.#observationDepth++;
+    try { return read(); }
+    finally { this.#observationDepth--; }
+  }
+
   list(
     options: FabricParticipantListOptions = {},
     now = Date.now(),
@@ -2176,6 +2184,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   #reportRefusal(id: string, remoteHost: string | undefined, reason: string, data: Record<string, unknown>): void {
+    if (this.#observationDepth > 0) return;
     const key = `${id}\0${remoteHost}\0${reason}`;
     if (this.#reportedCollisions.has(key) || this.#reportedCollisions.size >= 1_000) return;
     this.#reportedCollisions.add(key);

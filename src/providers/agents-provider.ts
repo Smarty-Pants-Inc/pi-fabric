@@ -1678,9 +1678,10 @@ export class AgentsProvider implements FabricProvider {
       case "actorHealth": {
         context.signal?.throwIfAborted();
         try {
-          const actor = await this.#readActorStatus(String(args.id), context.signal);
+          const read = () => this.#readActorHealth(String(args.id));
+          const health = this.participants.observe ? this.participants.observe(read) : read();
           context.signal?.throwIfAborted();
-          return actorHealthSnapshot(actor.health);
+          return health;
         } catch (error) {
           context.signal?.throwIfAborted();
           if (!actorHealthUnavailable(error)) throw error;
@@ -2262,7 +2263,36 @@ export class AgentsProvider implements FabricProvider {
     }
   }
 
-  /** Shared read-only status/health route: no actor activation or resident startup. */
+  /** No status/owns calls, routing recovery, refresh/publication, or resident RPC writes. */
+  #readActorHealth(id: string): FabricActorHealth {
+    const ownActor = actorActivationIdentityFromEnvironment();
+    if (process.env[FABRIC_ACTOR_SELF_ENV] !== undefined) {
+      if (!ownActor) throw new Error("Fabric actor activation identity is unavailable");
+      if (id !== ownActor.actorId) throw new Error(`Unknown Fabric actor: ${id}`);
+    }
+    const candidates = ownActor ? [] : this.actorManager.readHealth(id);
+    const exact = candidates.find(actor => actor.id === id);
+    const current = candidates.length > 1 ? candidates.filter(actor => !actor.removing) : candidates;
+    if (!exact && candidates.length > 1 && current.length !== 1) throw new Error(`Ambiguous Fabric actor: ${id}`);
+    const actor = exact ?? current[0];
+    if (actor?.health) return actorHealthSnapshot(actor.health);
+
+    // Fresh owner publications are sufficient for foreign execution health.
+    // Missing evidence is unknown; do not repair/recover an owner to answer a read.
+    let owner = this.participants.get(actor?.id ?? id, undefined, { fresh: true });
+    if (!actor && !owner) {
+      const matches = this.participants.list({ kinds: ["actor"], fresh: true })
+        .filter(participant => participant.id.startsWith(id) || participant.name === id);
+      if (matches.length > 1) throw new Error(`Ambiguous Fabric actor: ${id}`);
+      owner = matches[0];
+    }
+    const matchesActivation = !ownActor || (owner?.rootId === ownActor.rootId && owner.name === ownActor.name &&
+      owner.actorOwnershipToken === ownActor.ownershipToken);
+    return actorHealthSnapshot(owner && matchesActivation && !owner.stale && !owner.bridgeStale && owner.kind === "actor" &&
+      owner.controlProtocol !== "legacy" ? owner.actorHealth : undefined);
+  }
+
+  /** Status retains its existing orphan maintenance; health uses a separate observational path. */
   async #readActorStatus(id: string, signal?: AbortSignal): Promise<FabricActorReadInfo | FabricActorSelfReadInfo> {
     signal?.throwIfAborted();
     const ownActor = actorActivationIdentityFromEnvironment();

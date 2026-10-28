@@ -13,7 +13,7 @@ import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
-import { ParticipantDirectory } from "../src/topology/participant-directory.js";
+import { MIRROR_COLLISION_TOPIC, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { FabricParticipantInfo } from "../src/topology/types.js";
 
 const UNKNOWN_HEALTH: FabricActorHealth = { state: "unknown", lastProgressAt: null };
@@ -139,6 +139,8 @@ const makeFixture = async () => {
       get,
       owner,
       passiveActors,
+      participants,
+      mesh,
       provider,
       setOwner: (value: FabricParticipantInfo | undefined) => { live = value; },
       close,
@@ -210,6 +212,33 @@ describe("actor health provider", () => {
     }
   });
 
+  it("classifies malformed directory evidence without writing refusal events or consuming their later notification", async () => {
+    const state = await makeFixture();
+    // Enable real directory reads after installing malformed remote evidence.
+    // No status/ownership/provider methods are mocked for this regression.
+    state.get.mockRestore();
+    state.participants.options.enabled = true;
+    await state.mesh.put({ key: "topology/participants/malformed-health-owner",
+      identity: { id: "session:malformed-health-owner", name: "mirror", kind: "main" },
+      value: { id: "malformed-health-owner", remoteHost: "example", sessionId: 42 } });
+    const before = state.mesh.tail(0, 100).events;
+    const publish = vi.spyOn(state.mesh, "publish");
+    await expect(state.provider.invoke("actorHealth", { id: "missing-health-actor" }, state.context)).resolves.toEqual(UNKNOWN_HEALTH);
+    expect(publish).not.toHaveBeenCalled();
+    expect(state.mesh.tail(0, 100).events).toEqual(before);
+    // Observation did not mark the refusal as already notified. Its existing
+    // ordinary directory path still reports it later, once, as before.
+    state.participants.list({ fresh: true });
+    await expect.poll(() => state.mesh.tail(0, 100).events.filter(event => event.topic === MIRROR_COLLISION_TOPIC).length,
+      { timeout: 5_000, interval: 20 }).toBe(1);
+  });
+
+  it("does not use retained health from a stale bridge publication", async () => {
+    const state = await makeFixture();
+    state.setOwner({ ...state.owner, bridgeStale: true });
+    await expect(state.provider.invoke("actorHealth", { id: state.actor.id }, state.context)).resolves.toEqual(UNKNOWN_HEALTH);
+  });
+
   it("returns unknown for a missing actor while actorStatus keeps throwing", async () => {
     const state = await makeFixture();
     await expect(state.provider.invoke("actorHealth", { id: "missing-health-actor" }, state.context))
@@ -226,13 +255,12 @@ describe("actor health provider", () => {
     await expect(state.provider.invoke("actorHealth", { id: state.actor.id }, { ...state.context, signal: controller.signal }))
       .rejects.toBe(cancellation);
 
-    const reconcile = vi.spyOn(state.passiveActors, "reconcileSessionOrphans");
     const programmingError = new TypeError("fixture programming failure");
-    reconcile.mockRejectedValueOnce(programmingError);
+    state.get.mockImplementationOnce(() => { throw programmingError; });
     await expect(state.provider.invoke("actorHealth", { id: state.actor.id }, state.context)).rejects.toBe(programmingError);
 
     const bridgeUnavailable = Object.assign(new Error("owner bridge is stale"), { code: "FABRIC_BRIDGE_STALE" });
-    reconcile.mockRejectedValueOnce(bridgeUnavailable);
+    state.get.mockImplementationOnce(() => { throw bridgeUnavailable; });
     await expect(state.provider.invoke("actorHealth", { id: state.actor.id }, state.context)).resolves.toEqual(UNKNOWN_HEALTH);
   });
 });

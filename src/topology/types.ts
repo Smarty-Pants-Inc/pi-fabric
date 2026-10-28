@@ -214,6 +214,8 @@ export type FabricControlAdmission =
   | { controlAdmission: "gated"; controlAdmissionReason: string };
 
 export interface FabricParticipantSource {
+  /** Synchronous observation scope: suppress advisory publications from nested reads. */
+  observe?<T>(read: () => T): T;
   list(options?: FabricParticipantListOptions, now?: number): FabricParticipantInfo[];
   get(id: string, now?: number, options?: { fresh?: boolean }): FabricParticipantInfo | undefined;
   /**

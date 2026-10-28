@@ -2030,10 +2030,10 @@ export class ActorManager {
     return this.#slots.requiresEnforcement(topics, this.#actorRoot, this.#rootId);
   }
 
-  #slotCurrent(actor: Pick<ManagedActor, "id" | "topics">): boolean {
+  #slotCurrent(actor: Pick<ManagedActor, "id" | "topics">, readOnly = false): boolean {
     try {
       return !this.#slotEnforced(actor.topics) || (this.#slotRecovery.ready && this.#slotEnabled.has(actor.id) &&
-        this.#slots.isCurrent(actor.id, actor.topics, this.#actorRoot));
+        this.#slots.isCurrent(actor.id, actor.topics, this.#actorRoot, { readOnly }));
     } catch { return false; } // An unreadable/mismatched authority is never runnable.
   }
 
@@ -2436,6 +2436,22 @@ export class ActorManager {
     this.#ownership.set(actor.id, true);
     this.#emitChange();
     return this.#publicInfo(actor);
+  }
+
+  /** Health observes current execution custody, never registry reload/ownership maintenance. */
+  readHealth(id: string): Array<{ id: string; removing: boolean; health?: FabricActorHealth }> {
+    return [...this.#actors.values()]
+      .filter(actor => actor.id === id || actor.id.startsWith(id) || actor.name === id)
+      .map(actor => {
+        const owned = this.#ownershipDecision(actor.id, true, true);
+        // A changed registry needs lifecycle reconciliation, not a reload (which
+        // can abort/park work) during a read. Refuse a stale local assertion.
+        const unchanged = !this.#persistent || this.#registry.fingerprint() === this.#registryFingerprint;
+        const blockExpired = activationBlockExpired(actor.activationBlocked);
+        return { id: actor.id, removing: actor.removal !== undefined,
+          ...(owned ? { health: unchanged ? this.#health(actor, this.#routingStatus(actor, blockExpired), blockExpired)
+            : { state: "unknown" as const, lastProgressAt: null } } : {}) };
+      });
   }
 
   status(id: string): FabricActorInfo {
@@ -11230,7 +11246,7 @@ export class ActorManager {
           const gone = this.#runGone(run.id, true);
           health.state = gone === undefined ? "healthy" : gone === "worker-unverified" ? "unknown" : "stale";
         }
-      } else if (this.#slotCurrent(actor)) health.state = "healthy";
+      } else if (this.#slotCurrent(actor, true)) health.state = "healthy";
     } catch { /* Unreadable owner or worker evidence is unknown, never healthy. */ }
     return health;
   }

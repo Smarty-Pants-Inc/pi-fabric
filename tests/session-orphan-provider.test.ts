@@ -139,6 +139,9 @@ const retainedRunning = (actor: FabricActorInfo): FabricParticipantInfo => ({
 const status = (provider: AgentsProvider, id: string) => provider.invoke("actorStatus", { id }, context) as Promise<FabricActorReadInfo>;
 const actors = (provider: AgentsProvider) => provider.invoke("actors", {}, context) as Promise<FabricActorReadInfo[]>;
 const alarms = (mesh: MeshStore) => mesh.read({ topic: "ops.owner", limit: 100 }).filter(event => event.kind === "actor.session.orphaned");
+const actorFiles = (root: string) => fs.readdirSync(root, { recursive: true }).map(String).sort()
+  .filter(file => fs.statSync(path.join(root, file)).isFile())
+  .map(file => [file, fs.readFileSync(path.join(root, file)).toString("hex")]);
 const expectOrphan = (actor: FabricActorReadInfo, id: string, oldRoot: string) => {
   expect(actor).toMatchObject({ id, rootId: oldRoot, status: "stopped", lastError: expect.stringContaining("root-gone:") });
   expect(actor.lastError).toContain("re-run activation.py in the new Main");
@@ -146,6 +149,60 @@ const expectOrphan = (actor: FabricActorReadInfo, id: string, oldRoot: string) =
 };
 
 describe("public session-orphan provider reads (#7227)", () => {
+  // Regression from #1692's independent results review: a health read for a
+  // missing ID stopped an unrelated actor and published an orphan alarm.
+  it.each(["missing", "orphan", "owned"] as const)("actorHealth leaves unrelated orphan state and files untouched when reading %s", async target => {
+    const root = tmp();
+    const { actor, store, mesh } = await seed(root, "old-health");
+    const lease = oldLease(mesh.root, "old-health");
+    const reader = open(root, "health-reader");
+    const owned = await reader.directory.create({ scope: "session", name: "health-owned", instructions: "Observe only." });
+    const leaseFile = hostLeasePath(mesh.root, lease.id);
+    const before = store.snapshot();
+    const leaseBytes = fs.readFileSync(leaseFile);
+    const files = actorFiles(reader.actorRoots.project);
+    expect(before.actors.find(row => row.id === actor.id)?.status).toBe("running");
+    expect(alarms(mesh)).toHaveLength(0);
+
+    const id = target === "missing" ? "missing-health-id" : target === "orphan" ? actor.id : owned.id;
+    const result = await reader.provider.invoke("actorHealth", { id }, context);
+
+    expect(result).toEqual({ state: target === "owned" ? "healthy" : "unknown", lastProgressAt: null });
+    expect(store.snapshot().bytes, "actorHealth must not rewrite another actor registry").toBe(before.bytes);
+    expect(store.snapshot().actors.find(row => row.id === actor.id)?.status).toBe("running");
+    expect(fs.readFileSync(leaseFile)).toEqual(leaseBytes);
+    expect(actorFiles(reader.actorRoots.project)).toEqual(files);
+    expect(alarms(mesh), "actorHealth must not publish orphan alarms").toHaveLength(0);
+  });
+
+  it("actorHealth preserves a live unrelated worker while an orphan is present", async () => {
+    const root = tmp();
+    const { actor, store, mesh } = await seed(root, "old-worker-health");
+    oldLease(mesh.root, "old-worker-health");
+    const reader = open(root, "worker-health-reader");
+    const handle = await reader.manager.spawn({ task: "HANG silent health read sentinel", transport: "process" });
+    const worker = reader.manager.workerIdentity(handle.id)!;
+    const statusFile = path.join(reader.manager.runDirectory(handle.id)!, "status.json");
+    // Worker status-file publication drives readiness; bounded polling is only
+    // this fake-worker fixture's observation adapter, not a runtime scheduler.
+    await expect.poll(() => fs.existsSync(statusFile) && JSON.parse(fs.readFileSync(statusFile, "utf8")).status,
+      { timeout: 10_000, interval: 20 }).toBe("running");
+    const workerBytes = fs.readFileSync(statusFile);
+    const before = store.snapshot();
+    expect(worker).toMatchObject({ pid: expect.any(Number), open: true });
+    expect(() => process.kill(worker.pid, 0)).not.toThrow();
+
+    expect(await reader.provider.invoke("actorHealth", { id: "missing-worker-health-id" }, context))
+      .toEqual({ state: "unknown", lastProgressAt: null });
+
+    expect(store.snapshot().actors.find(row => row.id === actor.id)?.status).toBe("running");
+    expect(store.snapshot().bytes).toBe(before.bytes);
+    expect(alarms(mesh)).toHaveLength(0);
+    expect(reader.manager.workerIdentity(handle.id)).toEqual(worker);
+    expect(() => process.kill(worker.pid, 0)).not.toThrow();
+    expect(fs.readFileSync(statusFile)).toEqual(workerBytes);
+  }, 30_000);
+
   it.each(["absent", "retained-running"] as const)("actorStatus/actors reconcile an old session with %s participant once across concurrent readers", async visibility => {
     const root = tmp();
     const { actor, store, mesh } = await seed(root, "old");

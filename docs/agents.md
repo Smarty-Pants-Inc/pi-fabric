@@ -1610,6 +1610,8 @@ The mailbox, history, and runner session remain shared. Host events and mesh sub
 
 `lastProgressAt` is the time of actually observed worker status/lifecycle progress, or `null` when unavailable. Reads, configuration edits, and lease heartbeats do not advance it. A quiet but live worker can remain healthy: this is not an elapsed-progress timeout. Passive health uses existing participant publication and is usable only with a fresh owner lease; cross-process updates are not instantaneous. This contract is for actor runtime health, not native Main session residency.
 
+`actorHealth` is purely observational: it does not reconcile or stop orphan actors, reload actor registries, recover routing leases, start residents, or write status RPC files. Local health uses current execution evidence; foreign health uses existing fresh owner publications. If a local registry has changed and lifecycle reconciliation is still pending, health is `unknown` rather than performing that reconciliation during the read.
+
 Health reporting does not repair a stuck drain. Recovery follow-up: bound and diagnose post-run capability-release, run-log archival, and run-cleanup waits, then reconcile completed retained activations without admitting another run before native and same-session execution custody is released.
 
 Use `scope: "session"` when one root Pi session needs its own definition, mailbox, history, and runtime; use `scope: "project"` for repository-wide guardians. Both run concurrently. Session identity propagates to recursive participant agents in the same lineage. Under project scope, every trusted session can read shared actor definitions, mailbox history, and logs. Do not store secrets in them.

@@ -207,6 +207,11 @@ export class ActorDirectory extends ActorManager {
   }
   override cede(...args: Parameters<ActorManager["cede"]>): ReturnType<ActorManager["cede"]> { return this.#isPrimary(args[0]) ? super.cede(...args) : this.#secondary.cede(...args); }
   override reclaim(...args: Parameters<ActorManager["reclaim"]>): ReturnType<ActorManager["reclaim"]> { return this.#isPrimary(args[0]) ? super.reclaim(...args) : this.#secondary.reclaim(...args); }
+  override readHealth(id: string): ReturnType<ActorManager["readHealth"]> {
+    // Neither status/list nor #isPrimary is observational: they may reconcile
+    // or reload registries. Combine only cached execution candidates here.
+    return [...super.readHealth(id), ...this.#secondary.readHealth(id)];
+  }
   override status(...args: Parameters<ActorManager["status"]>): ReturnType<ActorManager["status"]> {
     void this.reconcileSessionOrphans().catch(() => undefined);
     try { return this.#isPrimary(args[0]) ? super.status(...args) : this.#secondary.status(...args); }

@@ -1,5 +1,6 @@
 import * as realFs from "node:fs";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { jetstream, jetstreamManager } from "@nats-io/jetstream";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { NatsAuthorizationError, openNatsConnection } from "../src/transport/nats/connection.js";
@@ -31,6 +32,44 @@ if (!binary && process.env.NATS_AUTH_REQUIRED === "1") throw new Error("NATS_AUT
 const MACHINE_A = "machine-a";
 const MACHINE_B = "machine-b";
 let harness: PathBHarness;
+let refusalSequence = 0;
+
+// Native waitOnFirstConnect intentionally retries TLS errors indefinitely. Prove a real
+// failed security attempt (specific native TLS code), not merely AbortError from a timer.
+async function expectNetworkRefusal(root: string, start: (signal: AbortSignal, readyFile: string) => Promise<{ close(): Promise<void> }>, code: RegExp): Promise<void> {
+  const owner = new AbortController();
+  const file = path.join(root, `security-refusal-ready-${++refusalSequence}`);
+  let failed!: (line: string) => void;
+  const failure = new Promise<string>(resolve => { failed = resolve; });
+  const warning = vi.spyOn(console, "warn").mockImplementation((message: unknown) => {
+    const line = String(message);
+    if (line.startsWith("NATS connection attempt failed ")) failed(line);
+  });
+  let state = "pending";
+  const settled = start(owner.signal, file).then(async connection => {
+    state = "connected";
+    await connection.close();
+    return undefined;
+  }, (cause: unknown) => { state = "rejected"; return cause; });
+  try {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let line: string;
+    try {
+      line = await Promise.race([failure, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("no native failed security attempt observed")), 5_000);
+      })]);
+    } finally { clearTimeout(timer); }
+    expect(line).toMatch(code);
+    expect(state).toBe("pending");
+    expect(realFs.existsSync(file)).toBe(false);
+    const reason = new Error("cancel after proven security refusal");
+    owner.abort(reason);
+    expect(await Promise.race([settled, delay(1_000).then(() => "abort did not settle")])).toBe(reason);
+    expect(realFs.existsSync(file)).toBe(false);
+  } finally { owner.abort(); warning.mockRestore(); await settled; }
+}
+
+const WRONG_TLS_IDENTITY = /phase=TLS code=ERR_TLS_CERT_ALTNAME_INVALID/;
 
 describe.skipIf(!binary)("authenticated Path B transport", () => {
   beforeAll(async () => { harness = await createPathBHarness({ binary: binary!, tls: {} }); });
@@ -354,7 +393,7 @@ describe.skipIf(!binary)("authenticated Path B transport over verified TLS", () 
       abort.abort();
       await bInbox.return?.();
       // Counterexample: the same runtime against a trusted-CA but wrong-identity server is refused.
-      await expect(openNatsTransport({ ...tlsOptions(wrongIdentity, "localhost"), hostId: "runtime-tls-wrong", provision: false })).rejects.toThrow();
+      await expectNetworkRefusal(wrongIdentity.root, (signal, readyFile) => openNatsTransport({ ...tlsOptions(wrongIdentity, "localhost"), hostId: "runtime-tls-wrong", provision: false, retryFirstConnect: true, signal, readyFile }), WRONG_TLS_IDENTITY);
     } finally {
       abort.abort();
       await Promise.all(runtimes.map((runtime) => runtime.close()));

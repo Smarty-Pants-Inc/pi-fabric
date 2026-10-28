@@ -94,6 +94,8 @@ export class FabricState {
   #runtime: FabricRuntimeState | undefined;
   #activatingRuntime: FabricRuntimeState | undefined;
   #activation: Promise<FabricRuntimeState> | undefined;
+  #activationAbort: AbortController | undefined;
+  #runtimeGeneration: number | undefined;
   #recordsWake: (() => Promise<void>) | undefined;
   #rootInboxWake: (() => Promise<void>) | undefined;
   #activationGeneration: number | undefined;
@@ -242,10 +244,11 @@ export class FabricState {
     this.#deactivationHook = onDeactivate;
   }
 
-  async bootstrap(context: ExtensionContext): Promise<void> {
+  async bootstrap(context: ExtensionContext, options: { deferNatsActivation?: boolean } = {}): Promise<void> {
     if (!this.#managedHost) configureFabricDiagnostics(context.sessionManager?.getSessionId?.() ?? "");
     this.#shutDown = false;
     const generation = ++this.#generation;
+    this.#activationAbort?.abort(new Error("Pi Fabric activation was superseded by a session change"));
     this.#cwd = context.cwd;
     // Bind at session_start, not first tool use: an idle /new must not consume the launch grant.
     if (!this.#managedHost) this.#roleGrant.roleFor(context.sessionManager.getSessionId(), context.cwd, process.env, true);
@@ -271,7 +274,11 @@ export class FabricState {
     const pending = this.#activation;
     if (pending) await pending.catch(() => undefined);
     if (generation !== this.#generation) return;
-    if (this.#everActivated) await this.#activate(context, true);
+    // Ordinary NATS session_start must return even when the first broker is absent. Its
+    // caller starts ensure() with diagnostics; the generation forces predecessor reinitialization.
+    if (this.#everActivated && !(options.deferNatsActivation && config.mesh.transport === "nats")) {
+      await this.#activate(context, true);
+    }
   }
 
   async initialize(context: ExtensionContext): Promise<void> {
@@ -279,6 +286,10 @@ export class FabricState {
     if (!this.#config || this.#cwd !== context.cwd) {
       await this.bootstrap(context);
     } else {
+      if (this.#activation) {
+        ++this.#generation;
+        this.#activationAbort?.abort(new Error("Pi Fabric activation was superseded by reinitialization"));
+      }
       const next = this.#managedHost?.config() ?? loadFabricConfig({
         cwd: context.cwd,
         agentDir: resolveAgentDir(),
@@ -609,6 +620,9 @@ export class FabricState {
     if (this.#runtime) this.#runtime.rootInboxWake = undefined;
     this.#deactivationHook?.();
     const generation = ++this.#generation;
+    // Only a pending activation owns this controller. Established runtimes keep the
+    // carrier alive until shutdown has withdrawn their directory/custody records.
+    this.#activationAbort?.abort(new Error("Pi Fabric activation was superseded by shutdown"));
     const activation = this.#activation;
     if (activation) await activation.catch(() => undefined);
     if (generation !== this.#generation) return;
@@ -640,7 +654,7 @@ export class FabricState {
       await this.#activation.catch(() => undefined);
       return this.#activate(context, reinitialize);
     }
-    if (this.#runtime?.initialized && !reinitialize) return this.#runtime;
+    if (this.#runtime?.initialized && !reinitialize && this.#runtimeGeneration === this.#generation) return this.#runtime;
     this.#assertOpen();
 
     const generation = this.#generation;
@@ -654,6 +668,8 @@ export class FabricState {
     if (existing) existing.rootInboxWake = undefined;
     this.#runtime = undefined;
     let candidate: FabricRuntimeState | undefined;
+    const activationAbort = new AbortController();
+    this.#activationAbort = activationAbort;
     const assertCurrent = (): void => {
       if (generation !== this.#generation) {
         throw new Error("Pi Fabric activation was superseded by a session change");
@@ -664,6 +680,19 @@ export class FabricState {
         throw new Error("Pi Fabric activation's session was disposed");
       }
     };
+    // Shutdown/replacement abort synchronously through their event paths. SDK dispose has no
+    // callback: only while NATS activation is pending, probe its ctx every 250ms as a backstop.
+    // This is not a connect deadline or retry loop; live sessions keep native retries indefinitely.
+    // initialize() links this signal only to successor acquisition, never a predecessor carrier.
+    const pendingLiveness = config.mesh.enabled && config.mesh.transport === "nats"
+      ? setInterval(() => {
+        if (!extensionContextLive(context)) {
+          clearInterval(pendingLiveness);
+          activationAbort.abort(new Error("Pi Fabric activation's session was disposed"));
+        }
+      }, 250)
+      : undefined;
+    pendingLiveness?.unref();
     const activation = (async () => {
       try {
         await orphan?.shutdown("reload").catch(() => undefined);
@@ -694,6 +723,7 @@ export class FabricState {
         // runtime installs it only after the predecessor's teardown: old sources never see
         // the successor ctx during session replacement (smarty-dev#5962).
         await candidate.initialize(context, config, {
+          signal: activationAbort.signal,
           lifecycle: () => generation === this.#generation && !this.#shutDown && extensionContextLive(context),
         });
         assertCurrent();
@@ -708,6 +738,7 @@ export class FabricState {
         await this.#activationHook?.(context);
         assertCurrent();
         this.#runtime = candidate;
+        this.#runtimeGeneration = generation;
         this.#activatingRuntime = undefined;
         this.#everActivated = true;
         // Armed only now that the runtime is current; its first read covers work published before.
@@ -729,6 +760,9 @@ export class FabricState {
         if (candidate) await candidate.shutdown("reload").catch(() => undefined);
         if (this.#runtime === candidate) this.#runtime = undefined;
         throw error;
+      } finally {
+        // No disposal watchdog survives success, failure, shutdown or replacement.
+        clearInterval(pendingLiveness);
       }
     })();
     this.#activation = activation;
@@ -737,6 +771,7 @@ export class FabricState {
       if (this.#activation === activation) {
         this.#activation = undefined;
         this.#activationGeneration = undefined;
+        this.#activationAbort = undefined;
       }
     }).catch(() => undefined);
     return activation;

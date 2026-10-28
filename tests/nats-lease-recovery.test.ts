@@ -159,7 +159,7 @@ process.on("SIGTERM", () => process.exit(0));
         expect(fs.readFileSync(received, "utf8")).toContain('"type":"prompt"');
         expect(sender.runtime.participantInfos().find(row => row.id === child.id)).toMatchObject({ stale: false });
       }, { timeout: 10_000 });
-      await owner.runtime.publishHostLifecycle("pi.turn_start", { turnIndex: 1 });
+      await owner.runtime.publishHostLifecycle("pi.agent_start", {});
       const beforeHost = publications.get(key("h", id))!.revision;
       const beforeRoot = publications.get(key("p", id))!.revision;
       const beforeChild = publications.get(key("p", child.id))!.revision;

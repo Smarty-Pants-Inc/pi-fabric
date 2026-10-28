@@ -73,15 +73,20 @@ export interface NatsTransportOptions extends NatsPermissionPolicy {
   /** Opt-in actor-topic publishing, using this transport's verified connection. */
   readonly events?: boolean;
   readonly mesh?: MeshStore;
+  /** Native initial retries are opt-in for long-lived runtime owners; default false. */
+  readonly retryFirstConnect?: boolean;
+  /** Optional owning-process readiness path, managed only by the verified connection. */
+  readonly readyFile?: string;
   readonly signal?: AbortSignal;
 }
 
 type OpenOptions = NatsTransportOptions | FabricTransportOptions;
-type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "events">> & {
+type ResolvedNatsOptions = Required<Pick<NatsTransportOptions, "servers" | "machine" | "hostId" | "credentials" | "custodyStream" | "livenessStream" | "pathBMachines" | "maxBytes" | "maxMessageBytes" | "duplicateWindowMs" | "requestTimeoutMs" | "provision" | "ephemeralHost" | "ephemeralInactiveSeconds" | "events" | "retryFirstConnect">> & {
   readonly org?: string;
   readonly name?: string;
   readonly tls?: TlsOptions;
   readonly mesh?: MeshStore;
+  readonly readyFile?: string;
   readonly signal?: AbortSignal;
 };
 
@@ -117,7 +122,9 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
       ephemeralHost: options.ephemeralHost ?? false,
       ephemeralInactiveSeconds: options.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
       events: options.events ?? false,
+      retryFirstConnect: options.retryFirstConnect ?? false,
       ...(options.mesh === undefined ? {} : { mesh: options.mesh }),
+      ...(options.readyFile === undefined ? {} : { readyFile: options.readyFile }),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     } as ResolvedNatsOptions;
   }
@@ -155,7 +162,9 @@ const normalizeOptions = (options: OpenOptions): ResolvedNatsOptions => {
     ephemeralHost: nats?.ephemeralHost ?? false,
     ephemeralInactiveSeconds: nats?.ephemeralInactiveSeconds ?? DEFAULT_EPHEMERAL_INACTIVE_SECONDS,
     events: nats?.events ?? false,
+    retryFirstConnect: options.retryFirstConnect ?? false,
     mesh: options.mesh,
+    ...(options.readyFile === undefined ? {} : { readyFile: options.readyFile }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   } as ResolvedNatsOptions;
 };
@@ -222,6 +231,8 @@ const openNatsSession = async (options: ResolvedNatsOptions, signal?: AbortSigna
     ...(options.events ? { events: true, org: options.org! } : options.org === undefined ? {} : { org: options.org }),
     ...(options.tls === undefined ? {} : { tls: options.tls }),
     timeoutMs: options.requestTimeoutMs,
+    retryFirstConnect: options.retryFirstConnect,
+    ...(options.readyFile === undefined ? {} : { readyFile: options.readyFile }),
     ...(signal === undefined ? {} : { signal }),
   });
   const assertAlive = (): void => signal?.throwIfAborted();

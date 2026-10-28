@@ -711,8 +711,9 @@ export class FabricRuntimeState {
   async initialize(
     context: ExtensionContext,
     bootstrapConfig?: FabricConfig,
-    options: { lifecycle?: () => boolean } = {},
+    options: { lifecycle?: () => boolean; signal?: AbortSignal } = {},
   ): Promise<void> {
+    options.signal?.throwIfAborted();
     // FabricState passes its activation lease; direct callers (tests, standalone hosts) keep a
     // lease bound to this same ctx, else bind for the runtime's life.
     const successor = {
@@ -748,6 +749,9 @@ export class FabricRuntimeState {
     } finally {
       this.#suppressResidentGuidanceSync = false;
     }
+    // Cancellation while withdrawing the predecessor must not abort its established carrier.
+    // Only the successor's transport acquisition below is linked to the activation signal.
+    options.signal?.throwIfAborted();
     // A newer initialize() owns the binding now; this superseded one must not install its ctx.
     if (epoch === this.#epoch) this.#binding = successor;
     for (const name of this.#builtinComponentNames) this.componentCatalog.unregister(name);
@@ -1022,8 +1026,20 @@ export class FabricRuntimeState {
       const { mkdirPrivate } = await import("./storage/private-dir.js");
       mkdirPrivate(transportStateDir);
       const { openFabricTransport } = await import("./transport/index.js");
+      // Link cancellation only while acquiring the successor carrier. Once acquired, directory
+      // custody may be published; teardown must withdraw it before aborting the transport owner.
+      const cancelOpening = (): void => transportAbort!.abort(options.signal?.reason);
+      options.signal?.addEventListener("abort", cancelOpening, { once: true });
+      if (options.signal?.aborted) cancelOpening();
       // NatsTransport.open awaits ensureTransportConsumer before returning (inbox.ts).
-      const opened = await openFabricTransport({ config: structuredClone(meshConfig), hostId, mesh, signal: transportAbort!.signal });
+      let opened: FabricTransport;
+      try {
+        opened = await openFabricTransport({ config: structuredClone(meshConfig), hostId, mesh,
+          retryFirstConnect: true,
+          readyFile: path.join(transportStateDir, `nats-ready-${process.pid}`), signal: transportAbort!.signal });
+      } finally {
+        options.signal?.removeEventListener("abort", cancelOpening);
+      }
       // A teardown may have completed while the factory was still opening.
       if (transportAbort!.signal.aborted) {
         await opened.close();

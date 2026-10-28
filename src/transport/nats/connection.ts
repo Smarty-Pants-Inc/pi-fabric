@@ -1,9 +1,11 @@
-import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { isIP } from "node:net";
 import { credsAuthenticator, type Msg, type NatsConnection, type Subscription } from "@nats-io/nats-core";
 import { jetstream, jetstreamManager, type JetStreamClient, type JetStreamManager } from "@nats-io/jetstream";
-import { AuthorizationError, PermissionViolationError, connect, type NodeConnectionOptions, type Status, type TlsOptions } from "@nats-io/transport-node";
+import { AuthorizationError, PermissionViolationError, type NodeConnectionOptions, type Status, type TlsOptions } from "@nats-io/transport-node";
+import { connectFirstNats } from "./first-connect.js";
 import { pathBMachines } from "../../mesh/nats-auth/mint.js";
 import { legacyRoleTemplateWithPathB, PATH_B_OPERATOR_MACHINE_PATTERN, roleTemplateWithPathB } from "../../mesh/nats-auth/permissions.js";
 import { validateMachine } from "./subjects.js";
@@ -35,7 +37,11 @@ interface NatsTransportSecurityOptions {
   readonly tls?: TlsOptions;
   readonly name?: string;
   readonly timeoutMs?: number;
+  /** Runtime owners opt in to native initial retries. One-shot/admin opens retain fail-fast by default. */
+  readonly retryFirstConnect?: boolean;
   readonly signal?: AbortSignal;
+  /** Optional process-local verified-connection probe. No default; auxiliary connections must omit it. */
+  readonly readyFile?: string;
 }
 
 interface NatsConnectionCredentials extends NatsTransportSecurityOptions {
@@ -334,6 +340,33 @@ const refuseBypass = (options: object): void => {
   for (const key of ["verifyMachine", "inboxPrefix", "allowInsecureLoopback"]) if (key in options) throw new Error(`NATS connection option ${key} is not supported`);
 };
 
+// An older activation must neither recreate nor unlink its successor's probe.
+const readinessOwners = new Map<string, symbol>();
+const readySignal = (file: string | undefined) => {
+  const owner = Symbol();
+  const token = `${process.pid}:${randomUUID()}\n`;
+  if (file !== undefined) {
+    if (typeof file !== "string" || file.length === 0) throw new Error("NATS readyFile must be a nonempty path");
+    try { unlinkSync(file); } catch (cause) { if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause; }
+    readinessOwners.set(file, owner);
+  }
+  const clear = (): void => {
+    if (file === undefined || readinessOwners.get(file) !== owner) return;
+    try { if (readFileSync(file, "utf8") === token) unlinkSync(file); }
+    catch (cause) { if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause; }
+  };
+  return {
+    clear,
+    mark: (): void => {
+      if (file !== undefined && readinessOwners.get(file) === owner) writeFileSync(file, token, { mode: 0o600 });
+    },
+    release: (): void => {
+      clear();
+      if (file !== undefined && readinessOwners.get(file) === owner) readinessOwners.delete(file);
+    },
+  };
+};
+
 const open = async (
   options: NatsTransportSecurityOptions & { readonly credentials: string },
   verify: ((nc: NatsConnection, timeoutMs: number, auth: ReturnType<typeof readNatsCredentials>) => Promise<unknown>) | undefined,
@@ -346,15 +379,19 @@ const open = async (
   const security = transportSecurity(options);
   const auth = readNatsCredentials(options.credentials);
   prepare(auth);
+  // Bootstrap/admin connections never publish the runtime's verified readiness, even if misconfigured.
+  const ready = readySignal(verify ? options.readyFile : undefined);
   let verified = false;
   let initialVerificationComplete = false;
+  let verificationEpoch = 0;
   let reconnectAttempt = 0;
   const reconnectDelayHandler = (): number => {
-    if (initialVerificationComplete) verified = false;
+    verificationEpoch += 1;
+    if (initialVerificationComplete) { verified = false; ready.clear(); }
     const base = Math.min(5_000, 500 * 2 ** Math.min(reconnectAttempt++, 4));
     return base + Math.floor(Math.random() * 250);
   };
-  const nc = await connect({
+  const nc = await connectFirstNats({
     ...security,
     ...(options.name ? { name: options.name } : {}),
     timeout: timeoutMs,
@@ -363,6 +400,7 @@ const open = async (
     // USER.INFO passes. This client version has no reconnectBufSize option: prepare() resets
     // its outbound DataBuffer before dial, so pre-disconnect PUBs are not replayed.
     reconnect: true,
+    waitOnFirstConnect: options.retryFirstConnect ?? false,
     maxReconnectAttempts: -1,
     reconnectTimeWait: 500,
     reconnectJitter: 250,
@@ -370,19 +408,25 @@ const open = async (
     reconnectDelayHandler,
     authenticator: credsAuthenticator(auth.bytes),
     inboxPrefix: `_INBOX.${auth.subject}`,
-  }).catch((cause: unknown) => {
+  }, signal).catch((cause: unknown) => {
+    ready.release();
     signal?.throwIfAborted();
     throw connectionFailure(cause, "NATS connection failed");
   });
-  // Official connect has no signal option: its timeout bounds dialing. Once a handle exists,
-  // cancellation closes it immediately, including during USER.INFO and provisioning awaits.
-  const onAbort = (): void => { void nc.close().catch(() => undefined); };
+  // The adapter owns cancellation before native connect returns; keep the same ownership
+  // through verification, provisioning, and all established/reconnecting lifetimes.
+  const onAbort = (): void => {
+    verified = false;
+    try { ready.release(); } finally { void nc.close().catch(() => undefined); }
+  };
   const removeAbort = (): void => signal?.removeEventListener("abort", onAbort);
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
     signal?.throwIfAborted();
+    const initialEpoch = verificationEpoch;
     const userInfo = verify ? await verify(nc, timeoutMs, auth) : undefined;
     signal?.throwIfAborted();
+    if (initialEpoch !== verificationEpoch || nc.isClosed()) throw new TransportUnavailableError("NATS disconnected during USER.INFO verification");
     verified = true;
     initialVerificationComplete = true;
     reconnectAttempt = 0;
@@ -419,11 +463,14 @@ const open = async (
     const manager = await jetstreamManager(guardedNc, { timeout: timeoutMs });
     signal?.throwIfAborted();
     const js = jetstream(guardedNc, { timeout: timeoutMs });
+    if (verified && !nc.isClosed()) ready.mark();
     const listeners = new Set<NatsStatusListener>();
     let closing = false;
     let authFailure!: (error: NatsAuthorizationError) => void;
     const authFailurePromise = new Promise<Error>((resolve) => { authFailure = resolve; });
     const nativeClosed = nc.closed().then((cause) => {
+      verified = false;
+      ready.release();
       removeAbort();
       if (closing) return undefined;
       if (cause) return connectionFailure(cause, "NATS connection lost; native reconnect ended");
@@ -444,23 +491,36 @@ const open = async (
       if (closing) return statusTask ?? Promise.resolve();
       closing = true;
       verified = false;
+      ready.release();
       removeAbort();
       const task = (async () => { await nc.close(); await statusTask; listeners.clear(); })();
       return task;
     };
     statusTask = (async () => {
       for await (const status of nc.status()) {
-        if (status.type === "disconnect") verified = false;
+        if (status.type === "disconnect") { verified = false; ready.clear(); }
         if (status.type === "reconnect") {
+          const epoch = verificationEpoch;
           try {
             if (verify) await verify(nc, timeoutMs, auth);
+            signal?.throwIfAborted();
+            if (epoch !== verificationEpoch) continue; // A newer dial must be verified on its own.
             if (nc.isClosed() || nc.isDraining()) throw new TransportUnavailableError("NATS closed during USER.INFO re-verification");
             verified = true;
             reconnectAttempt = 0;
+            ready.mark();
           } catch (cause) {
+            verified = false;
+            ready.clear();
+            // Owner cancellation/explicit close is not an authentication revocation.
+            // Closing the native mux rejects a held USER.INFO as part of normal teardown.
+            if (closing || signal?.aborted) {
+              void close().catch(() => undefined);
+              return;
+            }
+            if (epoch !== verificationEpoch) continue;
             const error = cause instanceof NatsAuthorizationError ? cause :
               new NatsAuthorizationError("NATS USER.INFO re-verification failed", { cause });
-            verified = false;
             authFailure(error);
             notify({ type: "close" });
             void close().catch(() => undefined);
@@ -481,6 +541,7 @@ const open = async (
       close,
     };
   } catch (error) {
+    ready.release();
     removeAbort();
     await nc.close().catch(() => undefined);
     signal?.throwIfAborted();
@@ -515,5 +576,5 @@ export const openNatsConnection = async (options: NatsConnectionOptions): Promis
 export const openBootstrapNatsConnection = async (options: NatsBootstrapConnectionOptions): Promise<NatsConnectionHandle> => {
   options.signal?.throwIfAborted();
   refuseBypass(options);
-  return open(options, undefined);
+  return open({ ...options, retryFirstConnect: options.retryFirstConnect ?? false }, undefined);
 };

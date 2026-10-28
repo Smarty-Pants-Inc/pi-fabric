@@ -118,6 +118,10 @@ export interface FabricTransportOptions {
   readonly config: import("../config.js").FabricMeshConfig;
   readonly hostId: string;
   readonly mesh: import("../mesh/store.js").MeshStore;
+  /** NATS only: runtime owners opt in to native initial retries; one-shot opens default to false. */
+  readonly retryFirstConnect?: boolean;
+  /** Optional process-owned readiness probe path; only the verified connection writes/removes it. */
+  readonly readyFile?: string;
   readonly signal?: AbortSignal;
 }
 export type FabricTransportFactory = (options: FabricTransportOptions) => Promise<FabricTransport>;

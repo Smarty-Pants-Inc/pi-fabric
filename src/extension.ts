@@ -1006,7 +1006,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     }
     state.thinking.invalidate();
     programRunContext = context;
-    await state.bootstrap(context);
+    context.ui.setStatus("fabric-nats", undefined);
+    await state.bootstrap(context, { deferNatsActivation: true });
     state.resetRecordsInboxCursor(context.sessionManager);
     // Re-derive the inbox receipt cursor once at session_start; file-backed sessions cache their
     // confirmed prefix and in-memory sessions use SessionManager's point-lookup active-branch walk.
@@ -1046,7 +1047,32 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       if (residentProbe && (context.mode !== "rpc" || !process.env.PI_FABRIC_PARENT_RUN)) {
         throw new Error("resident startup probe requires a bound RPC worker");
       }
-      if (residentProbe || stoppedUndelivered || selfReloaded || state.shouldEagerlyActivate(context)) await state.ensure(context);
+      if (residentProbe || stoppedUndelivered || selfReloaded) {
+        // These flows promise activation before native ACKs, task-result replay or reload reporting.
+        await state.ensure(context);
+      } else if (state.activated || state.shouldEagerlyActivate(context)) {
+        const startupConfig = state.config;
+        if (startupConfig.mesh.enabled && startupConfig.mesh.transport === "nats") {
+          // Native waitOnFirstConnect can wait indefinitely. Keep ordinary session_start usable;
+          // the connection alone owns the PID-scoped readiness file, after verified USER.INFO.
+          const current = (): boolean => inboxWake.context === context && state.bootstrapped &&
+            state.config === startupConfig && extensionContextLive(context);
+          const waiting = "NATS: NOT CONNECTED (waiting for initial broker connection)";
+          context.ui.setStatus("fabric-nats", waiting);
+          diagnostics.warn("src/extension.ts", `[pi-fabric] ${waiting}; pid=${process.pid}`);
+          void state.ensure(context).then(lease => {
+            if (lease.current() && current()) context.ui.setStatus("fabric-nats", undefined);
+          }).catch(error => {
+            if (!current()) return; // Shutdown/replacement cancellation belongs to the retired session.
+            const failure = `NATS: NOT CONNECTED (${error instanceof Error ? error.message : String(error)})`;
+            diagnostics.error("src/extension.ts", `[pi-fabric] ${failure}`);
+            context.ui.setStatus("fabric-nats", failure);
+            if (context.hasUI) notifyDiagnostic(context, "src/extension.ts", failure, "error");
+          });
+        } else {
+          await state.ensure(context);
+        }
+      }
       if (residentProbe) {
         // Positive native ACK is published only after this generation activated.
         writeSync(1, `${JSON.stringify({ type: "fabric_resident_extension_ready", protocol: 1,

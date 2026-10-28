@@ -1874,7 +1874,15 @@ export class FabricRuntimeState {
     }
     this.#lifecycle.start();
     this.#residency?.start();
-    await this.#residency?.waitForStartupRecovery();
+    try {
+      await this.#residency?.waitForStartupRecovery();
+    } catch (error) {
+      // Restored actors may be unavailable (e.g. parked protected slots), but
+      // must not take Main's unrelated providers or the recovery watchdog down.
+      const detail = error instanceof Error ? error.message : String(error);
+      diagnostics.warn("src/fabric-runtime-state.ts",
+        `[pi-fabric] Resident startup recovery incomplete (${detail}); continuing Fabric activation with unavailable actors left offline and background recovery still active.`);
+    }
     await builtins.install(createProviderComponent({
       provider: "agents",
       description: "Agents, actors, lifecycle delivery, and residency control",

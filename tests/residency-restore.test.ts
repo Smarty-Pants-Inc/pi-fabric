@@ -43,6 +43,25 @@ const manifest = (root: string): Record<string, string> => {
   walk(root); return files;
 };
 
+const expectNativeTurn = (file: string, prefix: string, prompt: string): void => {
+  const transcript = fs.readFileSync(file, "utf8");
+  expect(transcript.startsWith(prefix), "the original native transcript must remain byte-for-byte").toBe(true);
+  // A longer file alone could be just metadata. Prove the ordinary ask appended
+  // its user turn and native model reply to THIS retained session, exactly once.
+  const messages = transcript.slice(prefix.length).trim().split("\n").filter(Boolean)
+    .map(line => JSON.parse(line) as { type: string; message?: {
+      role: string; content: string | Array<{ type: string; text?: string }>;
+    } })
+    .filter(entry => entry.type === "message")
+    .map(entry => ({ role: entry.message!.role, text: typeof entry.message!.content === "string"
+      ? entry.message!.content
+      : entry.message!.content.filter(part => part.type === "text").map(part => part.text ?? "").join("") }));
+  expect(messages).toEqual([
+    { role: "user", text: expect.stringContaining(prompt) },
+    { role: "assistant", text: ack },
+  ]);
+};
+
 async function main(root: string, config: FabricConfig) {
   const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false, authPath: path.join(root, "agent/auth.json") });
   const faux = fauxProvider({ provider: "l8-restore-faux", models: [{ id: "one-turn" }] });
@@ -148,14 +167,35 @@ faux.setResponses([fauxAssistantMessage(${JSON.stringify(ack)})]); pi.registerPr
       const oldFence = read<{ dev: string; ino: string }>(path.join(resident, "host-fence.json"));
       // Counterexample: a new Main runtime attaches to a genuine live owner.
       // It refreshes its own generation, but must not replace the host/actor.
+      const initialHistory = oldHistory;
+      const initialTranscript = fs.readFileSync(sessionFile, "utf8");
       await first.runtime.shutdown("exit"); first = undefined;
       first = await main(work, config);
+      // Same-owner attachment must admit the very first ordinary ask too. Do
+      // not prime its route with messages/status or an explicit recovery call.
+      const attached = await first.invoke("agents.ask", { id: actor.id, message: "after live-owner attach" }) as FabricActorMessage;
+      expect(attached).toMatchObject({ actorId: actor.id, direction: "out", text: ack });
       expect(read<ResidentHostOwner>(ownerPath).token).toBe(oldOwner.token);
       const currentMain = read<ResidentMainGeneration>(mainGenerationPath(resident));
       expect(currentMain.nonce).not.toMatch(/^closed:/);
-      expect(await first.invoke("agents.messages", { id: actor.id, limit: 100 })).toEqual(oldHistory);
+      await vi.waitFor(async () => {
+        oldHistory = await first!.invoke("agents.messages", { id: actor.id, limit: 100 }) as FabricActorMessage[];
+        expect(oldHistory).toHaveLength(initialHistory.length + 2);
+      });
+      expect(oldHistory.slice(0, initialHistory.length)).toEqual(initialHistory);
+      expect(oldHistory.slice(initialHistory.length)).toMatchObject([
+        { actorId: actor.id, direction: "in", source: "direct", data: { message: "after live-owner attach" } },
+        { id: attached.id, actorId: actor.id, direction: "out", text: ack },
+      ]);
+      expectNativeTurn(sessionFile, initialTranscript, "after live-owner attach");
+      const attachedPresence = await presence.get<FabricParticipantRecord>(actorKey);
+      expect(presenceValue(attachedPresence!)).toMatchObject({ id: actor.id, rootId,
+        ownerHostId: oldOwner.hostId, ownerIncarnation: originalPresence.value.ownerIncarnation,
+        capabilities: expect.arrayContaining(["ask"]) });
       expect(read(mainGenerationPath(resident))).toEqual(currentMain);
       expect(read<ResidentHostOwner>(ownerPath).token).toBe(oldOwner.token);
+      console.log("L8_LIVE_OWNER_ACK", JSON.stringify({ stale, actorId: actor.id, owner: oldOwner.pid,
+        incarnation: attachedPresence!.value.ownerIncarnation, historyBefore: initialHistory.length, historyAfter: oldHistory.length }));
       await first.runtime.shutdown("exit"); first = undefined;
       const closedMain = read<ResidentMainGeneration>(mainGenerationPath(resident));
       expect(closedMain.nonce).toMatch(/^closed:/);
@@ -213,18 +253,35 @@ faux.setResponses([fauxAssistantMessage(${JSON.stringify(ack)})]); pi.registerPr
         { actorId: actor.id, direction: "in", source: "direct", data: { message: "after restore" } },
         { id: after.id, actorId: actor.id, direction: "out", text: ack },
       ]);
-      expect(fs.readFileSync(sessionFile, "utf8").startsWith(transcript)).toBe(true);
+      expectNativeTurn(sessionFile, transcript, "after restore");
       expect(restored.runtime.participantInfos().find(row => row.id === actor.id)).toMatchObject({ id: actor.id, rootId, ownerHostId: oldOwner.hostId });
       const newOwner = read<ResidentHostOwner>(ownerPath);
       expect(newOwner.token).not.toBe(oldOwner.token);
+      expect(newOwner.pid).not.toBe(process.pid);
+      expect(newOwner.processStartTime).toBeTruthy();
+      expect(processStartTime(newOwner.pid)).toBe(newOwner.processStartTime);
+      // Inspect only AFTER the immediate ordinary ask: the proof must not wait
+      // on KV or repair the route before exercising the user's first call.
+      const recoveredPresence = await presence.get<FabricParticipantRecord>(actorKey);
+      const recoveredLease = await leases.get<FabricKvHostLease>(leaseKey);
+      expect(presenceValue(recoveredPresence!)).toMatchObject({ id: actor.id, kind: "actor", rootId,
+        residency: "durable", ownerHostId: oldOwner.hostId, capabilities: expect.arrayContaining(["ask"]) });
+      expect(recoveredPresence!.value.ownerIncarnation).toBeTruthy();
+      expect(recoveredPresence!.value.ownerIncarnation).not.toBe(stoppingPresence.ownerIncarnation);
+      expect(leaseValue(recoveredLease!)).toMatchObject({ id: oldOwner.hostId, rootId,
+        identityId: recoveredPresence!.value.ownerIdentityId, incarnation: recoveredPresence!.value.ownerIncarnation,
+        pid: newOwner.pid });
+      expect(recoveredLease!.owner).toBe(recoveredPresence!.owner);
       expect(read<ResidentMainGeneration>(mainGenerationPath(resident))).toMatchObject({ pid: process.pid, processStartTime: processStartTime(process.pid), rootId, sessionId });
       expect(read<ResidentMainGeneration>(mainGenerationPath(resident)).nonce).not.toBe(closedMain.nonce);
-      const registry = read<{ actors: Array<{ id: string }> }>(path.join(meshRoot, "actors", sessionId, "actors.json"));
+      const registry = read<{ actors: Array<{ id: string; sessionFile: string }> }>(path.join(meshRoot, "actors", sessionId, "actors.json"));
       expect(registry.actors.map(row => row.id)).toEqual([actor.id]);
+      expect(registry.actors[0]!.sessionFile).toBe(sessionFile);
       console.log("L8_RESTORE_ACK", JSON.stringify({ stale, actorId: actor.id, historyBefore: oldHistory.length, historyAfter: history.length, oldOwner: oldOwner.pid, newOwner: newOwner.pid }));
     } catch (error) {
       const resident = residentRoot(path.join(work, "mesh"), rootId);
-      for (const name of ["launcher.log", "child-stderr.log", "handover-deferred.json", ...(
+      for (const name of ["owner.json", "host.lock", "host-fence.json", "main-generation.json",
+        "launcher.log", "child-stderr.log", "handover-deferred.json", ...(
         fs.existsSync(path.join(resident, "generations")) ? fs.readdirSync(path.join(resident, "generations"))
           .filter(name => name.endsWith(".error.json")).map(name => `generations/${name}`) : [])]) {
         const file = path.join(resident, name);

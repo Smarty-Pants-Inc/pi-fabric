@@ -90,7 +90,10 @@ runtime generation even when the restored owner is dead. Main initialization
 awaits own-root durable-work recovery and usable ask/control publication in its
 own participant directory before the first ordinary `agents.ask`. Recovery and
 publication share the existing bounded host-start budget, including retries of
-a retained predecessor's NATS lease conflict. The host loads the original registry;
+a retained predecessor's NATS lease conflict. If startup or publication fails,
+Main logs the recovery diagnostic and still activates Fabric; only the unavailable
+actor remains unavailable. The resident recovery watchdog continues retrying in
+the background. The host loads the original registry;
 retained quiescing presence or the same resident host ID does not prove that a
 replacement incarnation has published. Empty/dormant roots stay lazy, intentional
 idle exits stay stopped, and genuine live owners are attached to normally. Recovery

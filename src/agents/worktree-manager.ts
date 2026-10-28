@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { windowsSecurityPowerShell } from "../storage/windows-powershell-command.js";
 import path from "node:path";
+import { homedir, tmpdir } from "node:os";
 import { syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
 import { addCloneFirstWorktree } from "./clone-first-worktree.js";
 import { executeFile } from "./transports/process-utils.js";
@@ -81,29 +82,54 @@ const existingDirectory = (directory: string): string => {
   }
 };
 
-/** Cheap filesystem metadata only; no mkdir, native command, engine or timer.
- * Prefer an external same-device namespace, including a safe source sibling and
- * the configured state area. Recheck at actual custody; mounts can change. */
-export const cleanupArchiveOutsideGit = (requested: string, source?: string): string => {
-  const first = externalArchive(requested);
-  if (!source) return first;
-  const parent = physicalArchive(path.dirname(source));
-  const sourceDevice = fs.lstatSync(source, { throwIfNoEntry: false })?.dev ?? fs.statSync(existingDirectory(parent)).dev;
-  const state = process.env.XDG_STATE_HOME ?? process.env.LOCALAPPDATA;
-  const candidates = [first, path.join(parent, ".pi-fabric-trace-archive"),
-    ...(state ? [path.join(state, "pi-fabric", "trace-archive")] : [])];
-  for (const candidate of candidates) {
-    try {
-      const external = externalArchive(candidate);
-      if (fs.statSync(existingDirectory(external)).dev === sourceDevice) return external;
-    } catch (error) {
-      // A refused optional sibling/state location cannot make the requested
-      // external evidence location unsafe or authorize deleting the original.
-      if (candidate === first) throw error;
+const archiveDevice = (archive: string): number => {
+  if (outermostGitRoot(physicalArchive(archive))) throw new Error("Custody archive acquired a Git ancestor");
+  const existing = existingDirectory(archive);
+  if (process.platform !== "win32") {
+    const uid = process.getuid?.();
+    for (let current = existing; ; current = path.dirname(current)) {
+      const stat = fs.lstatSync(current);
+      // Sticky temp ancestors are safe; nonsticky group-write is NEVER safe.
+      if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.uid !== uid && stat.uid !== 0) ||
+        ((stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0)) {
+        throw new Error(`Custody archive ancestor is not owner-controlled: ${current}`);
+      }
+      if (path.dirname(current) === current) break;
     }
   }
-  return first;
+  return fs.statSync(existing).dev;
 };
+type ArchiveRefusal = { candidate: string; reason: string };
+
+/** Metadata only. Validate EACH physical chain before preferring its device.
+ * Keep a safe other-device alternative: EXDEV never authorizes deletion. */
+const selectCleanupArchive = (requested: string, source?: string, refused: ArchiveRefusal[] = []): string => {
+  const first = externalArchive(requested);
+  if (!source) return first;
+  const parent = physicalArchive(path.dirname(source)), physicalSource = path.join(parent, path.basename(source));
+  const outside = (archive: string): void => {
+    if (isInside(physicalSource, archive)) throw new Error(`Cleanup custody archive must be physically outside source: ${source} -> ${archive}`);
+  };
+  // Invalid explicit paths are refusals, not permission to silently adopt another.
+  outside(first);
+  const sourceDevice = fs.lstatSync(source, { throwIfNoEntry: false })?.dev ?? fs.statSync(existingDirectory(parent)).dev;
+  const states = [process.env.XDG_STATE_HOME, process.env.LOCALAPPDATA,
+    path.join(homedir(), process.platform === "win32" ? "AppData/Local" : ".local/state")];
+  let fallback: string | undefined;
+  for (const candidate of [first, path.join(parent, ".pi-fabric-trace-archive"),
+    ...states.filter((state): state is string => !!state).map(state => path.join(state, "pi-fabric", "trace-archive"))]) {
+    try {
+      const external = externalArchive(candidate);
+      outside(external);
+      const device = archiveDevice(external);
+      fallback ??= external;
+      if (device === sourceDevice) return external;
+    } catch (error) { refused.push({ candidate, reason: String(error) }); }
+  }
+  if (fallback) return fallback;
+  throw new Error(`No owner-controlled external custody archive; original retained: ${JSON.stringify(refused)}`);
+};
+export const cleanupArchiveOutsideGit: (requested: string, source?: string) => string = selectCleanupArchive;
 
 const protectCleanupContainer = (container: string): void => {
   if (process.platform !== "win32") {
@@ -230,6 +256,16 @@ const copyCleanupShadow = (source: string, destination: string): Array<{ path: s
   return manifest;
 };
 
+const receiptOptions = { durable: true, newline: true };
+const cleanupContainer = (archive: string): string => {
+  archiveDevice(archive);
+  fs.mkdirSync(archive, { recursive: true, mode: 0o700 });
+  archiveDevice(archive);
+  const container = fs.mkdtempSync(path.join(archive, "cleanup-"));
+  protectCleanupContainer(container);
+  return container;
+};
+
 // Identity-mismatch diagnostics never grant custody authority. Keep this process's
 // refusal before optional-absence checks so callers cannot bless a missing or
 // replaced canonical path on retry. This is not a cross-process tombstone.
@@ -249,42 +285,35 @@ export const retainCleanupRoot = (
     const stat = fs.lstatSync(file, { throwIfNoEntry: false });
     return !!stat && !stat.isSymbolicLink() && stat.dev === sourceStat.dev && stat.ino === sourceStat.ino;
   };
-  const relative = path.relative(path.resolve(source), path.resolve(archive));
-  if (relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))) {
+  if (isInside(path.resolve(source), path.resolve(archive))) {
     throw new Error(`Cleanup custody archive must be outside source: ${source} -> ${archive}`);
   }
-  archive = cleanupArchiveOutsideGit(archive, source);
-  const physicalSource = path.join(physicalArchive(path.dirname(source)), path.basename(source));
-  const physicalRelative = path.relative(physicalSource, archive);
-  if (physicalRelative === "" || (physicalRelative !== ".." && !physicalRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(physicalRelative))) {
-    throw new Error(`Cleanup custody archive must be physically outside source: ${source} -> ${archive}`);
-  }
-  fs.mkdirSync(archive, { recursive: true, mode: 0o700 });
-  if (outermostGitRoot(physicalArchive(archive))) throw new Error("Custody archive acquired a Git ancestor");
-  if (process.platform !== "win32") {
-    const uid = process.getuid?.();
-    for (let current = archive; ; current = path.dirname(current)) {
-      const stat = fs.lstatSync(current);
-      // A trusted sticky temp parent cannot replace another owner's entry.
-      if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.uid !== uid && stat.uid !== 0) ||
-        ((stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0)) {
-        throw new Error(`Custody archive ancestor is not owner-controlled: ${current}`);
-      }
-      if (path.dirname(current) === current) break;
-    }
-  }
-  const container = fs.mkdtempSync(path.join(archive, "cleanup-"));
-  protectCleanupContainer(container);
-  const move = { source, destination: path.join(container, "tree"), receipt: path.join(container, "custody.json") };
-  const prepared = { format: 1, id, reason: rootLink ? "root-is-symlink" : reason, source, destination: move.destination, time: Date.now(), state: "prepared",
+  const archiveRefusals: ArchiveRefusal[] = [];
+  const evidence = { format: 1, id, reason: rootLink ? "root-is-symlink" : reason, source,
     ...(rootLink ? { requestedReason: reason, entryPath: source, readlink: { encoding: "base64", bytes: rootLink.toString("base64") } } : {}) };
+  try { archive = selectCleanupArchive(archive, source, archiveRefusals); }
+  catch (error) {
+    if (!archiveRefusals.length) throw error;
+    let receipt: string;
+    try {
+      // Diagnostic ONLY: no payload destination and no custody/held authority.
+      receipt = path.join(cleanupContainer(cleanupArchiveOutsideGit(tmpdir(), source)), "custody.json");
+      writeJsonAtomic(receipt, { ...evidence, time: Date.now(), state: "refused", originalRetained: true,
+        archiveRefusals, error: String(error) }, receiptOptions);
+    } catch (failure) { throw new Error(`${String(error)}; diagnostic refusal receipt unavailable: ${String(failure)}`, { cause: failure }); }
+    throw Object.assign(new Error(`${String(error)}; diagnostic-only refusal receipt: ${receipt}`, { cause: error }), { refusalReceipt: receipt });
+  }
+  const container = cleanupContainer(archive);
+  const move = { source, destination: path.join(container, "tree"), receipt: path.join(container, "custody.json") };
+  const prepared = { ...evidence, destination: move.destination, time: Date.now(), state: "prepared",
+    ...(archiveRefusals.length ? { archiveRefusals } : {}) };
   const save = (state: string, error?: unknown): void => writeJsonAtomic(move.receipt, {
     ...prepared, time: Date.now(), state, ...(error === undefined ? {} : { error: String(error) }),
-  }, { durable: true, newline: true });
+  }, receiptOptions);
   // Keep an immutable prepared receipt even if publication of a later state fails.
   // Durable writes sync the file AND all containing directory entries through
   // the existing parent/root (Windows skips unsupported directory barriers).
-  writeJsonAtomic(path.join(container, "custody.prepared.json"), prepared, { durable: true, newline: true });
+  writeJsonAtomic(path.join(container, "custody.prepared.json"), prepared, receiptOptions);
   save("prepared");
   if (rootLink) {
     // A dangling target may become live; never move even the link entry. Status
@@ -292,12 +321,14 @@ export const retainCleanupRoot = (
     const current = fs.lstatSync(source);
     if (!current.isSymbolicLink() || current.dev !== sourceStat.dev || current.ino !== sourceStat.ino ||
       !fs.readlinkSync(source, { encoding: "buffer" }).equals(rootLink)) throw new Error(`Cleanup root changed before symlink refusal: ${source}`);
-    writeJsonAtomic(move.receipt, { ...prepared, time: Date.now(), state: "held-in-place", originalRetained: true }, { durable: true, newline: true });
+    writeJsonAtomic(move.receipt, { ...prepared, time: Date.now(), state: "held-in-place", originalRetained: true }, receiptOptions);
     const refusal = new CleanupCustodyDeferredError({ ...move, state: "held-in-place", originalRetained: true });
     refusal.message += "; root symlink (root-is-symlink), entry and referent untouched, NOT cleaned";
     console.warn(`[pi-fabric] ${refusal.message}`); throw refusal;
   }
   try {
+    // Revalidate created ancestors too; preflight metadata can become stale.
+    archiveDevice(container);
     // Preparation may race a replacement. Never intentionally capture it.
     if (!sameRoot(source)) throw new Error(`Cleanup root changed before rename: ${source}`);
     // A fresh container's never-used child cannot clobber earlier custody.
@@ -312,10 +343,10 @@ export const retainCleanupRoot = (
         const manifest = copyCleanupShadow(source, move.destination);
         writeJsonAtomic(move.receipt, { ...prepared, time: Date.now(), state: "held-in-place",
           originalRetained: true, verifiedCopyPath: move.destination, manifest,
-          copyBoundary: "linux-owned-regular-tree; private-byte-shadow; no inode/ACL/snapshot guarantee" }, { durable: true, newline: true });
+          copyBoundary: "linux-owned-regular-tree; private-byte-shadow; no inode/ACL/snapshot guarantee" }, receiptOptions);
         status = { ...move, state: "held-in-place", originalRetained: true, verifiedCopyPath: move.destination };
       } catch (copyError) {
-        try { writeJsonAtomic(move.receipt, { ...prepared, time: Date.now(), ...status, error: String(copyError) }, { durable: true, newline: true }); } catch { /* Keep immutable preparation and partial evidence. */ }
+        try { writeJsonAtomic(move.receipt, { ...prepared, time: Date.now(), ...status, error: String(copyError) }, receiptOptions); } catch { /* Keep immutable preparation and partial evidence. */ }
         const failure = new CleanupCustodyDeferredError(status, copyError);
         console.warn(`[pi-fabric] ${failure.message}; ${String(copyError)}`); throw failure;
       }
@@ -446,7 +477,8 @@ export class WorktreeManager {
     const branch = `pi-fabric/${safeLabel(name)}-${id.slice(0, 8)}`;
     const worktreePath = fabricWorktreePath(gitRoot, id);
     // Initialization preflight is metadata-only; no eager PowerShell or engines.
-    const archive = cleanupArchiveOutsideGit(`${path.dirname(worktreePath)}.trace-archive`, worktreePath);
+    const archive = `${path.dirname(worktreePath)}.trace-archive`;
+    cleanupArchiveOutsideGit(archive, worktreePath); // Retain the request so cleanup receipts its refusals.
     await addCloneFirstWorktree({
       gitRoot,
       dest: worktreePath,

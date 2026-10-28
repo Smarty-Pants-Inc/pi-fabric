@@ -16,6 +16,13 @@ const ownedFixtures: string[] = [];
 const fixture = () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "external-custody-")));
   ownedFixtures.push(root);
+  // Every fallback, including the default user-state location, stays owned by
+  // this retained fixture. afterEach restores the caller's exact environment.
+  vi.stubEnv("HOME", path.join(root, "home"));
+  vi.stubEnv("USERPROFILE", path.join(root, "home"));
+  vi.stubEnv("XDG_STATE_HOME", path.join(root, "state"));
+  vi.stubEnv("LOCALAPPDATA", path.join(root, "local-app-data"));
+  vi.stubEnv("TMPDIR", root); vi.stubEnv("TMP", root); vi.stubEnv("TEMP", root);
   console.info(`retained external custody fixture: ${root}`);
   return root;
 };
@@ -57,6 +64,7 @@ const crossDevice = (source: string, wrongOwner = false) => {
 };
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   const evidence = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
   for (const root of ownedFixtures.splice(0)) {
     if (!evidence) continue;
@@ -253,6 +261,175 @@ describe("external custody outside every Git root", () => {
     expect(fs.readFileSync(row.receipt)).toEqual(receipt); expect(fs.readFileSync(path.join(row.destination, "raw.JSONL"))).toEqual(bytes);
     expect(fs.lstatSync(row.destination).ino).toBe(ino);
     console.info(actualGit ? "actual hosted Git proof" : "recorded local Git calls only; actual hosted coverage pending");
+  });
+});
+
+describe.skipIf(process.platform === "win32")("POSIX archive candidate ancestry", () => {
+  it.each([0o775, 0o777, 0o1777, 0o700])("P1 archive ancestor native mode %s selects only a controlled chain and preserves whole-object custody", mode => {
+    const root = fixture(), parent = mkdir(path.join(root, "checkouts"));
+    fs.chmodSync(parent, mode); // Explicit native modes, independent of the runner's umask.
+    const repo = marker(path.join(parent, "project")), source = sourceAt(repo);
+    // An already-private leaf must not hide its writable physical parent.
+    const requested = mkdir(`${repo}.trace-archive`), state = path.join(root, "state", "pi-fabric", "trace-archive");
+    const unsafe = mode === 0o775 || mode === 0o777, expected = unsafe ? state : requested;
+    const file = path.join(source, "raw.JSONL"), original = fs.readFileSync(file);
+    const rootStat = fs.lstatSync(source), fileStat = fs.lstatSync(file), fd = fs.openSync(file, "a");
+    try {
+      const allocate = vi.spyOn(fs, "mkdirSync"), fresh = vi.spyOn(fs, "mkdtempSync"), chmod = vi.spyOn(fs, "chmodSync");
+      expect(custody.cleanupArchiveOutsideGit(requested, source)).toBe(expected);
+      expect(allocate).not.toHaveBeenCalled(); expect(fresh).not.toHaveBeenCalled(); expect(chmod).not.toHaveBeenCalled();
+      allocate.mockRestore(); fresh.mockRestore(); chmod.mockRestore();
+      const row = custody.retainCleanupRoot(source, requested, `native-mode-${mode.toString(8)}`)!;
+      expect(path.dirname(path.dirname(row.destination))).toBe(expected);
+      outside(row.destination, [repo]);
+      expect(fs.lstatSync(row.destination)).toMatchObject({ dev: rootStat.dev, ino: rootStat.ino });
+      const held = path.join(row.destination, "raw.JSONL");
+      expect(fs.lstatSync(held)).toMatchObject({ dev: fileStat.dev, ino: fileStat.ino });
+      expect(fs.readFileSync(held)).toEqual(original);
+      fs.writeSync(fd, Buffer.from([0, 254, 13, 10]));
+      expect(fs.readFileSync(held)).toEqual(Buffer.concat([original, Buffer.from([0, 254, 13, 10])]));
+      expect(fs.fstatSync(fd)).toMatchObject({ dev: fileStat.dev, ino: fileStat.ino });
+      expect(fs.lstatSync(path.dirname(row.destination)).mode & 0o777).toBe(0o700);
+      // No chmod loophole: the unsafe ancestor and unused requested leaf stay as found.
+      expect(fs.lstatSync(parent).mode & 0o7777).toBe(mode);
+      expect(fs.lstatSync(requested).mode & 0o777).toBe(0o700);
+      expect(fs.existsSync(source)).toBe(false);
+      const receipt = JSON.parse(fs.readFileSync(row.receipt, "utf8"));
+      const prepared = JSON.parse(fs.readFileSync(path.join(path.dirname(row.receipt), "custody.prepared.json"), "utf8"));
+      expect(receipt).toMatchObject({ state: "moved", source, destination: row.destination });
+      expect(prepared).toMatchObject({ state: "prepared", source, destination: row.destination });
+      if (unsafe) {
+        expect(fs.readdirSync(requested)).toEqual([]);
+        expect(receipt.archiveRefusals).toHaveLength(2);
+        expect(receipt.archiveRefusals[0]).toEqual({ candidate: requested, reason: expect.stringContaining(parent) });
+        for (const refusal of receipt.archiveRefusals) expect(refusal.reason).toMatch(/ancestor is not owner-controlled/);
+        expect(prepared.archiveRefusals).toEqual(receipt.archiveRefusals);
+      } else expect(receipt.archiveRefusals).toBeUndefined();
+    } finally { fs.closeSync(fd); }
+  });
+
+  it.each(["local-app-data", "default-home"])("P1 archive ancestor falls through to confined %s state when XDG is unset", location => {
+    const root = fixture(), parent = mkdir(path.join(root, "checkouts")); fs.chmodSync(parent, 0o775);
+    const source = sourceAt(parent), requested = path.join(parent, "requested");
+    vi.stubEnv("XDG_STATE_HOME", undefined);
+    if (location === "default-home") vi.stubEnv("LOCALAPPDATA", undefined);
+    const state = location === "default-home" ? path.join(root, "home", ".local", "state") : path.join(root, "local-app-data");
+    const expected = path.join(state, "pi-fabric", "trace-archive");
+    expect(custody.cleanupArchiveOutsideGit(requested, source)).toBe(expected);
+    const row = custody.retainCleanupRoot(source, requested, location)!;
+    expect(path.dirname(path.dirname(row.destination))).toBe(expected);
+    expect(fs.lstatSync(path.dirname(row.destination)).mode & 0o777).toBe(0o700);
+    expect(JSON.parse(fs.readFileSync(row.receipt, "utf8"))).toMatchObject({ state: "moved", archiveRefusals: expect.any(Array) });
+    expect(fs.lstatSync(parent).mode & 0o7777).toBe(0o775);
+  });
+
+  it("P1 archive ancestor rejects unsafe configured XDG ancestry and still tries independent default HOME state", () => {
+    const root = fixture(), parent = mkdir(path.join(root, "checkouts")); fs.chmodSync(parent, 0o775);
+    const source = sourceAt(parent), requested = path.join(parent, "requested");
+    vi.stubEnv("XDG_STATE_HOME", path.join(parent, "configured-state")); vi.stubEnv("LOCALAPPDATA", undefined);
+    const expected = path.join(root, "home", ".local", "state", "pi-fabric", "trace-archive");
+    expect(custody.cleanupArchiveOutsideGit(requested, source)).toBe(expected);
+    const row = custody.retainCleanupRoot(source, requested, "unsafe-xdg")!;
+    expect(path.dirname(path.dirname(row.destination))).toBe(expected);
+    expect(fs.lstatSync(expected).mode & 0o777).toBe(0o700);
+    expect(fs.lstatSync(path.dirname(row.destination)).mode & 0o777).toBe(0o700);
+    const receipt = JSON.parse(fs.readFileSync(row.receipt, "utf8"));
+    expect(receipt).toMatchObject({ state: "moved", archiveRefusals: expect.arrayContaining([
+      { candidate: path.join(parent, "configured-state", "pi-fabric", "trace-archive"), reason: expect.stringContaining(parent) },
+    ]) });
+    expect(fs.existsSync(path.join(parent, "configured-state"))).toBe(false);
+  });
+
+  it("P1 archive ancestor keeps a safe other-device fallback when every same-device chain is unsafe", () => {
+    const root = fixture(), parent = mkdir(path.join(root, "checkouts")); fs.chmodSync(parent, 0o775);
+    const source = sourceAt(parent), original = fs.readFileSync(path.join(source, "raw.JSONL")), ino = fs.lstatSync(source).ino;
+    crossDevice(source); // Mount/device seam only; modes, payload I/O and receipts are native.
+    const expected = path.join(root, "state", "pi-fabric", "trace-archive"), requested = path.join(parent, "requested");
+    expect(custody.cleanupArchiveOutsideGit(requested, source)).toBe(expected);
+    const failure = result(() => custody.retainCleanupRoot(source, requested, "other-device-fallback"));
+    expect(failure.cleanupStatus).toMatchObject({ originalRetained: true, source });
+    expect(path.dirname(path.dirname(failure.cleanupStatus.destination))).toBe(expected);
+    expect(fs.lstatSync(source).ino).toBe(ino); expect(fs.readFileSync(path.join(source, "raw.JSONL"))).toEqual(original);
+    const receipt = JSON.parse(fs.readFileSync(failure.cleanupStatus.receipt, "utf8"));
+    expect(receipt.archiveRefusals).toHaveLength(2);
+    expect(receipt.state).toBe(process.platform === "linux" ? "held-in-place" : "copy-failed");
+  });
+
+  it("P1 archive ancestor revalidates newly created physical ancestors before rename", () => {
+    const root = fixture(), source = sourceAt(root), requested = path.join(root, "archive"), ino = fs.lstatSync(source).ino;
+    const mkdirReal = fs.mkdirSync;
+    vi.spyOn(fs, "mkdirSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
+      const value = mkdirReal(file, options as fs.MakeDirectoryOptions);
+      if (String(file) === requested) fs.chmodSync(requested, 0o775);
+      return value;
+    }) as typeof fs.mkdirSync);
+    const rename = vi.spyOn(fs, "renameSync");
+    expect(() => custody.retainCleanupRoot(source, requested, "creation-race")).toThrow(/ancestor is not owner-controlled/);
+    expect(rename.mock.calls.some(([from]) => String(from) === source)).toBe(false);
+    expect(fs.lstatSync(source).ino).toBe(ino); expect(fs.readFileSync(path.join(source, "raw.JSONL"))).toEqual(Buffer.from([0, 255, 13, 10, 123]));
+    expect(fs.lstatSync(requested).mode & 0o7777).toBe(0o775);
+  });
+
+  it("P1 archive ancestor late protection change keeps the reason in the prepared container receipt", () => {
+    const root = fixture(), source = sourceAt(root), requested = path.join(root, "archive"), ino = fs.lstatSync(source).ino;
+    const write = atomicWrites.writeJsonAtomic;
+    let receipt: string | undefined;
+    vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, data, options) => {
+      write(file, data, options);
+      if (path.basename(String(file)) === "custody.json" && (data as { state?: string }).state === "prepared") {
+        receipt = String(file); fs.chmodSync(requested, 0o775);
+      }
+    });
+    const failure = result(() => custody.retainCleanupRoot(source, requested, "late-ancestor-change"));
+    expect(failure.message).toMatch(/ancestor is not owner-controlled/);
+    expect(JSON.parse(fs.readFileSync(receipt!, "utf8"))).toMatchObject({ state: "rename-failed", error: expect.stringContaining(requested) });
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(receipt!), "custody.prepared.json"), "utf8"))).toMatchObject({ state: "prepared", source });
+    expect("cleanupStatus" in failure).toBe(false); expect("retainedRoot" in failure).toBe(false);
+    expect(fs.lstatSync(source).ino).toBe(ino); expect(fs.readFileSync(path.join(source, "raw.JSONL"))).toEqual(Buffer.from([0, 255, 13, 10, 123]));
+    expect(fs.lstatSync(requested).mode & 0o7777).toBe(0o775);
+  });
+
+  it.each(["durable", "receipt-eio", "unsafe-temp"])("P1 archive ancestor all-candidates-unusable has diagnostic-only durable refusal or exact publication limitation (%s)", fault => {
+    const root = fixture(), parent = mkdir(path.join(root, "checkouts")); fs.chmodSync(parent, 0o775);
+    const source = sourceAt(parent), requested = path.join(parent, "archive"), ino = fs.lstatSync(source).ino;
+    vi.stubEnv("HOME", path.join(parent, "home")); vi.stubEnv("USERPROFILE", path.join(parent, "home"));
+    vi.stubEnv("XDG_STATE_HOME", path.join(parent, "state")); vi.stubEnv("LOCALAPPDATA", path.join(parent, "local-app-data"));
+    if (fault === "unsafe-temp") vi.stubEnv("TMPDIR", parent);
+    if (fault === "receipt-eio") {
+      const write = atomicWrites.writeJsonAtomic;
+      vi.spyOn(atomicWrites, "writeJsonAtomic").mockImplementation((file, data, options) => {
+        if ((data as { state?: string }).state === "refused") throw Object.assign(new Error("diagnostic receipt EIO"), { code: "EIO" });
+        write(file, data, options);
+      });
+    }
+    const allocate = vi.spyOn(fs, "mkdirSync"), rename = vi.spyOn(fs, "renameSync");
+    const barriers: boolean[] = [], sync = fs.fsyncSync;
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => { sync(fd); barriers.push(fs.fstatSync(fd).isDirectory()); });
+    const failure = result(() => custody.retainCleanupRoot(source, requested, "all-unsafe")) as Error & { refusalReceipt?: string };
+    expect(failure.message).toMatch(/No owner-controlled external custody archive; original retained/);
+    const candidates = [requested, path.join(parent, ".pi-fabric-trace-archive"),
+      ...["state", "local-app-data", path.join("home", ".local", "state")].map(state => path.join(parent, state, "pi-fabric", "trace-archive"))];
+    for (const candidate of candidates) expect(failure.message).toContain(candidate);
+    expect(failure.message).toContain(`ancestor is not owner-controlled: ${parent}`);
+    expect("cleanupStatus" in failure).toBe(false); expect("retainedRoot" in failure).toBe(false);
+    expect(allocate.mock.calls.some(([file]) => String(file).startsWith(parent))).toBe(false);
+    expect(rename.mock.calls.some(([from]) => String(from) === source)).toBe(false);
+    if (fault === "durable") {
+      expect(failure.refusalReceipt).toBeDefined();
+      const receipt = JSON.parse(fs.readFileSync(failure.refusalReceipt!, "utf8"));
+      expect(receipt).toMatchObject({ state: "refused", source, originalRetained: true });
+      expect(receipt.destination).toBeUndefined(); expect(receipt.verifiedCopyPath).toBeUndefined();
+      expect(receipt.archiveRefusals.map((entry: { candidate: string }) => entry.candidate)).toEqual(candidates);
+      expect(fs.readdirSync(path.dirname(failure.refusalReceipt!))).toEqual(["custody.json"]);
+      expect(fs.lstatSync(path.dirname(failure.refusalReceipt!)).mode & 0o777).toBe(0o700);
+      expect(barriers).toContain(false); expect(barriers).toContain(true);
+    } else {
+      expect(failure.refusalReceipt).toBeUndefined();
+      expect(failure.message).toMatch(/diagnostic refusal receipt unavailable/);
+      expect(failure.message).toContain(fault === "receipt-eio" ? "diagnostic receipt EIO" : `ancestor is not owner-controlled: ${parent}`);
+    }
+    expect(fs.lstatSync(source).ino).toBe(ino); expect(fs.readFileSync(path.join(source, "raw.JSONL"))).toEqual(Buffer.from([0, 255, 13, 10, 123]));
+    expect(fs.lstatSync(parent).mode & 0o7777).toBe(0o775);
   });
 });
 

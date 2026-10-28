@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { FabricPrincipal } from "../src/host-compatibility.js";
 import { MainAgentController, type FabricMainAgentDeliveryRequest } from "../src/main-agent.js";
 import {
   acknowledgeScriptedInput, admitBoundScriptedInput, admitContinuation, admitScriptedInput,
@@ -19,6 +21,7 @@ const roots: string[] = [];
 const controllers: MainAgentController[] = [];
 const bindings: Array<() => void> = [];
 const from = { id: "script-driver", name: "Script driver", kind: "main" as const };
+const principal: FabricPrincipal = { id: "principal:paul", binding: "herdr-client" };
 const temp = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-scripted-input-"));
   roots.push(root);
@@ -66,7 +69,8 @@ const prepare = (root: string, request: FabricMainAgentDeliveryRequest, targetId
   prepareScriptedInput({ root, from: request.from, targetId, message: request.message, data: request.data,
     delivery: request.delivery as "steer" | "followUp",
     ...(request.priority === undefined ? {} : { priority: request.priority }),
-    ...(request.triggerTurn === undefined ? {} : { triggerTurn: request.triggerTurn }) });
+    ...(request.triggerTurn === undefined ? {} : { triggerTurn: request.triggerTurn }),
+    ...(request.principal === undefined ? {} : { principal: request.principal }) });
 const identityOf = (request: FabricMainAgentDeliveryRequest) => ({ from: request.from, ...readScriptedInput(request.data)! });
 afterEach(() => {
   vi.restoreAllMocks();
@@ -123,6 +127,72 @@ describe.skipIf(process.platform === "win32")("immutable scripted sender outbox"
     acknowledged.result!.messageId = "caller mutation";
     expect(prepare(root, requestFor("recipient", "round-1", prepared.deadlineAt)).result!.messageId).toBe("native-receipt");
     expect(() => acknowledgeScriptedInput({ root, ...identity, result: { queued: true, messageId: "different", routed: "main" } })).toThrow(/conflict/i);
+  });
+
+  it("durably snapshots the native principal across restart and pending scans without driver input", async () => {
+    const root = temp(); const captured = { ...principal, id: "  principal:paul  " };
+    const original = { ...captured };
+    const request = { ...requestFor("recipient"), principal: captured };
+    const first = prepare(root, request);
+    expect(first.principal).toEqual(original);
+    expect(first.principal).not.toBe(captured);
+    expect(Object.isFrozen(first.principal)).toBe(true);
+    expect(Reflect.set(first.principal!, "id", "caller mutation")).toBe(false);
+    captured.id = "principal:later"; captured.binding = "voice-call";
+    vi.resetModules();
+    const restarted = await import("../src/recovery/input-admission.js");
+    const pending = restarted.listPendingScriptedInputs({ root, from })[0]!;
+    expect(pending).toEqual({ ...first, principal: original, from, targetId: "session:recipient", published: false });
+    expect(Object.isFrozen(pending.principal)).toBe(true);
+    expect(pending.principal).not.toBe(first.principal);
+    markScriptedInputPublished({ root, ...identityOf(request) });
+    expect(restarted.listPendingScriptedInputs({ root, from })[0]!.principal).toEqual(original);
+    expect(prepare(root, { ...request, principal: original })).toEqual(first);
+    expect(() => prepare(root, request)).toThrow(/conflict/i);
+  });
+
+  it("binds the exact native principal id and binding, including absence", () => {
+    const root = temp(); const request = { ...requestFor("recipient"), principal };
+    prepare(root, request);
+    for (const changed of [undefined, { ...principal, id: "principal:other" },
+      { ...principal, binding: "voice-call" as const }]) {
+      expect(() => prepare(root, { ...request, principal: changed })).toThrow(/conflict/i);
+    }
+    const legacyRoot = temp(); const legacy = requestFor("recipient");
+    prepare(legacyRoot, legacy);
+    expect(() => prepare(legacyRoot, { ...legacy, principal })).toThrow(/conflict/i);
+  });
+
+  it.each([null, "principal:paul", [], {}, { id: "", binding: "herdr-client" },
+    { id: " ", binding: "herdr-client" }, { id: "a".repeat(257), binding: "herdr-client" },
+    { id: "principal:paul", binding: "unknown" }, { ...principal, extra: true },
+  ].map(invalid => ({ invalid })))("refuses an invalid supplied native principal before saving any sender intent ($invalid)", ({ invalid }) => {
+    const root = temp();
+    expect(() => prepare(root, { ...requestFor("recipient"), principal: invalid as FabricPrincipal })).toThrow(/principal/i);
+    expect(jsonFiles(root)).toEqual([]);
+  });
+
+  it("keeps the legacy no-principal envelope and canonical checksum bytes unchanged", () => {
+    const root = temp(); const request = requestFor("recipient", "legacy", 2_000_000_000_000);
+    const first = prepare(root, request);
+    const payload = { role: "sender", deliveryId: first.idempotencyKey, round: {
+      from: { id: from.id, kind: from.kind, name: from.name }, targetId: "session:recipient", message: request.message,
+      data: { manifest: { slot: 1 }, scriptedInput: { deadlineAt: 2_000_000_000_000, inputId: "legacy", sessionId: "recipient", version: 1 } },
+      delivery: "followUp", triggerTurn: true,
+    } };
+    // Independently spell the pre-principal canonical payload/key order. Adding even
+    // principal:null/{} would change these legacy checksum bytes.
+    const canonicalPayload = JSON.stringify({ deliveryId: first.idempotencyKey, role: "sender", round: {
+      data: { manifest: { slot: 1 }, scriptedInput: { deadlineAt: 2_000_000_000_000, inputId: "legacy", sessionId: "recipient", version: 1 } },
+      delivery: "followUp", from: { id: from.id, kind: from.kind, name: from.name }, message: request.message,
+      targetId: "session:recipient", triggerTurn: true,
+    } });
+    const legacyBytes = JSON.stringify({ version: 1, payload, sha256: createHash("sha256").update(canonicalPayload).digest("hex") });
+    expect(fs.readFileSync(jsonFiles(root)[0]!, "utf8")).toBe(legacyBytes);
+    expect(first).not.toHaveProperty("principal");
+    expect(listPendingScriptedInputs({ root, from })[0]).not.toHaveProperty("principal");
+    expect(prepare(root, { ...request, principal: undefined })).toEqual(first);
+    expect(fs.readFileSync(jsonFiles(root)[0]!, "utf8")).toBe(legacyBytes);
   });
 
   it("binds exact text, sender, recipient and all metadata, but not object key order", () => {
@@ -188,6 +258,61 @@ describe.skipIf(process.platform === "win32")("native receiver admission and res
     expect(state.sent.map(message => message.details.deliveryId)[0]).not.toBe("new-command-on-a-new-host");
     expect(() => admit(state, { ...request, message: "changed prompt" })).toThrow(/conflict/i);
     expect(state.carriers()).toHaveLength(2);
+  });
+
+  it.each([principal, undefined])("native admission uses the stored original principal, not a late request or data claim (%j)", original => {
+    const state = receiver(undefined, undefined, false);
+    const request = { ...requestFor(state.sessionId), principal: original };
+    request.data = { ...(request.data as object), principal: { id: "principal:spoof", binding: "org-agent" } };
+    const rename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, "renameSync").mockImplementation((source, target) => {
+      rename(source, target);
+      if (String(target).includes("input-admission")) request.principal = { id: "principal:later", binding: "voice-call" };
+    });
+    const native = vi.spyOn(state.mainAgent, "deliverAgent");
+    expect(admit(state, request)).toMatchObject({ queued: true });
+    expect(native.mock.calls[0]![0].principal).toEqual(original);
+    expect(JSON.parse(fs.readFileSync(state.journal, "utf8")).items[0].provenance.principal).toEqual(original);
+    expect(state.sent[0]!.details.data).toEqual(request.data); // The spoof remains inert payload data.
+    const saved = JSON.parse(fs.readFileSync(jsonFiles(path.join(state.root, "input-admission"))[0]!, "utf8"));
+    expect(saved.payload.round.principal).toEqual(original);
+    if (!original) expect(saved.payload.round).not.toHaveProperty("principal");
+  });
+
+  it("replays a principal-attributed pending sender round into a pending receiver after both restart", async () => {
+    const state = receiver(undefined, undefined, false); const senderRoot = temp();
+    const request = { ...requestFor(state.sessionId), principal };
+    prepare(senderRoot, request);
+    vi.spyOn(state.mainAgent, "deliverAgent").mockImplementation(() => { throw new Error("before native append"); });
+    expect(() => admit(state, request)).toThrow("before native append");
+    expect(state.sent).toHaveLength(0);
+    vi.resetModules();
+    const restarted = await import("../src/recovery/input-admission.js");
+    const pending = restarted.listPendingScriptedInputs({ root: senderRoot, from })[0]!;
+    const next = receiver(state.root, state.file, false);
+    const native = vi.spyOn(next.mainAgent, "deliverAgent");
+    expect(restarted.admitScriptedInput({ ...next, request: {
+      from: pending.from, message: pending.message, data: pending.data, delivery: pending.delivery,
+      triggerTurn: pending.triggerTurn, principal: pending.principal, verification: "mesh",
+    } })).toMatchObject({ queued: true });
+    expect(native.mock.calls[0]![0].principal).toEqual(principal);
+    expect(JSON.parse(fs.readFileSync(next.journal, "utf8")).items[0].provenance.principal).toEqual(principal);
+    expect(next.sent).toHaveLength(1);
+    for (const changed of [undefined, { ...principal, id: "principal:other" },
+      { ...principal, binding: "voice-call" as const }]) {
+      expect(() => restarted.admitScriptedInput({ ...next, request: { ...request, principal: changed } })).toThrow(/conflict/i);
+    }
+    expect(next.sent).toHaveLength(1);
+  });
+
+  it("refuses an invalid receiver principal without saving intent or touching native Main", () => {
+    const state = receiver(); const native = vi.spyOn(state.mainAgent, "deliverAgent");
+    for (const invalid of [null, {}, { ...principal, binding: "unknown" }]) {
+      expect(() => admit(state, { ...requestFor(state.sessionId), principal: invalid as FabricPrincipal })).toThrow(/principal/i);
+    }
+    expect(jsonFiles(path.join(state.root, "input-admission"))).toEqual([]);
+    expect(native).not.toHaveBeenCalled();
+    expect(state.carriers()).toHaveLength(0);
   });
 
   it("receiver dies after native append before response: a fresh controller on another machine processes only one carrier", async () => {
@@ -427,6 +552,36 @@ describe.skipIf(process.platform === "win32")("durability and fail-closed histor
     expect(() => admit(state, nativeRequest)).toThrow(/corrupt|checksum|digest/i);
     await expect(admitContinuation({ sessionId: state.sessionId, originalInputId: "round-1", recoveryGeneration: "g1", text: "resume" })).rejects.toThrow(/corrupt|checksum|digest/i);
     expect(state.carriers()).toHaveLength(1);
+  });
+
+  it.each([null, "principal:paul", { binding: "unknown", id: "principal:paul" },
+    { binding: "herdr-client", id: "" }, { binding: "herdr-client", extra: true, id: "principal:paul" },
+  ])("refuses checksummed records with a noncanonical or invalid native principal (%j)", invalid => {
+    const root = temp(); const request = requestFor("recipient");
+    const first = prepare(root, { ...request, principal });
+    const file = jsonFiles(root)[0]!;
+    const envelope = JSON.parse(fs.readFileSync(file, "utf8"));
+    envelope.payload.round.principal = invalid;
+    const metadata = readScriptedInput(request.data)!;
+    // Sorted payload keys, including the offered invalid field: this is a valid
+    // checksum of invalid typed storage, not just a checksum-mismatch test.
+    const canonicalPayload = JSON.stringify({ deliveryId: first.idempotencyKey, role: "sender", round: {
+      data: { manifest: { slot: 1 }, scriptedInput: { deadlineAt: metadata.deadlineAt, inputId: metadata.inputId, sessionId: metadata.sessionId, version: 1 } },
+      delivery: "followUp", from: { id: from.id, kind: from.kind, name: from.name }, message: request.message,
+      principal: invalid, targetId: "session:recipient", triggerTurn: true,
+    } });
+    envelope.sha256 = createHash("sha256").update(canonicalPayload).digest("hex");
+    fs.writeFileSync(file, JSON.stringify(envelope));
+    expect(() => listPendingScriptedInputs({ root, from })).toThrow(/corrupt/i);
+    expect(() => prepare(root, { ...request, principal })).toThrow(/corrupt/i);
+  });
+
+  it("checksums the durable native principal, not just the original message/data", () => {
+    const root = temp(); const request = { ...requestFor("recipient"), principal };
+    prepare(root, request);
+    const file = jsonFiles(root)[0]!;
+    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("principal:paul", "principal:other"));
+    expect(() => listPendingScriptedInputs({ root, from })).toThrow(/corrupt|checksum/i);
   });
 
   it("a receiver-result write failure is reconciled against native delivery, never a mark-before-effect loss", () => {

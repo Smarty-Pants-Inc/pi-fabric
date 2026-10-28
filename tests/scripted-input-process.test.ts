@@ -153,7 +153,7 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform === "win32")("scripted input native process recovery", () => {
-  it("recovers the prepared offer across sender/receiver SIGKILL, physical move, and ACK without a duplicate carrier or outcome", async () => {
+  it("recovers the prepared offer across sender/receiver SIGKILL, a changed machine label, and ACK without a duplicate carrier or outcome", async () => {
     const root = tempRoot();
     const senderRoot = path.join(root, "sender-state");
     const receiverRoot = path.join(root, "retained-receiver-state");

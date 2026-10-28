@@ -148,6 +148,17 @@ interface RouterWaitBudget extends MirrorLeaseWaitBudget {
   presenceAuthority?: { targetId: string; route: ParticipantRoute };
 }
 
+interface AgentMessageOptions {
+  principal?: FabricPrincipal | undefined;
+  from?: MeshIdentity;
+  wakeCause?: FabricWakeCause | undefined;
+  triggerTurn?: boolean;
+  priority?: FabricSteerPriority;
+  binding?: FabricActorRunBinding;
+  deadlineMs?: number;
+  idempotencyKey?: string;
+}
+
 const snapshotRoute = (route: ParticipantRoute): ParticipantRoute => ({ ...route, capabilities: [...route.capabilities] });
 const samePresenceOwner = (left: ParticipantRoute, right: ParticipantRoute): boolean =>
   left.machine === right.machine && left.ownerHostId === right.ownerHostId &&
@@ -627,16 +638,25 @@ export class AgentMessageRouter {
     data: unknown,
     kind: "steer" | "followUp",
     context?: FabricInvocationContext,
-    options: {
-      principal?: FabricPrincipal | undefined;
-      from?: MeshIdentity;
-      wakeCause?: FabricWakeCause | undefined;
-      triggerTurn?: boolean;
-      priority?: FabricSteerPriority;
-      binding?: FabricActorRunBinding;
-      deadlineMs?: number;
-      idempotencyKey?: string;
-    } = {},
+    options: AgentMessageOptions = {},
+  ): Promise<FabricAgentMessageResult> {
+    // Only the native invocation capture can attribute a new send. Caller options
+    // and data are not authority; capture before any routing operation can yield.
+    if (context) context = snapshotFabricInvocation(context);
+    return this.#routeWithPrincipal(id, message, data, kind,
+      context ? invocationFabricPrincipal(context) : undefined, context, options);
+  }
+
+  /** New sends use native capture; finite recovery uses only its retained snapshot.
+   * A saved undefined principal is UNKNOWN, never permission to sample a live turn. */
+  async #routeWithPrincipal(
+    id: string,
+    message: string,
+    data: unknown,
+    kind: "steer" | "followUp",
+    principal: FabricPrincipal | undefined,
+    context?: FabricInvocationContext,
+    options: AgentMessageOptions = {},
   ): Promise<FabricAgentMessageResult> {
     assertSteerPriority(options.priority, kind);
     const scripted = readScriptedInput(data);
@@ -650,21 +670,20 @@ export class AgentMessageRouter {
       if (!this.spawner) throw new Error("This worker has no bound Fabric spawner; specify an explicit reply target");
       id = this.spawner.id;
     }
-    // Capture before routing yields; a queued incoming turn cannot change this send.
-    if (context) context = snapshotFabricInvocation(context);
-    options = copyFabricWakeAdmission(options, { ...options, wakeCause: copyFabricWakeCause(options.wakeCause), principal: context ? invocationFabricPrincipal(context) : undefined });
+    options = copyFabricWakeAdmission(options, { ...options, wakeCause: copyFabricWakeCause(options.wakeCause), principal });
     if (scripted) {
       if (!root) throw new Error("Scripted input requires a retained mesh root");
       // Freeze Main's effective default once, before either local/remote routing.
       options.triggerTurn ??= true;
       // This synchronous immutable outbox commit precedes the first publication/await.
       const prepared = prepareScriptedInput({ root, from: options.from ?? this.actorManager.identity, targetId: id, message, data,
-        delivery: kind, ...(options.priority === undefined ? {} : { priority: options.priority }),
+        principal, delivery: kind, ...(options.priority === undefined ? {} : { priority: options.priority }),
         ...(options.triggerTurn === undefined ? {} : { triggerTurn: options.triggerTurn }) });
       if (options.idempotencyKey !== undefined && options.idempotencyKey !== prepared.idempotencyKey) {
         throw new Error("Scripted input idempotencyKey conflicts with its durable round key");
       }
       message = prepared.message; data = prepared.data;
+      options.principal = prepared.principal;
       options.idempotencyKey = prepared.idempotencyKey;
       options.triggerTurn = prepared.triggerTurn ?? true;
       if (prepared.result) return prepared.result; // Immutable ACK replay, even after the original deadline.
@@ -742,7 +761,7 @@ export class AgentMessageRouter {
       const metadata = readScriptedInput(round.data)!;
       if (Date.now() >= round.deadlineAt) { outcomes.push({ inputId: metadata.inputId, status: "expired" }); continue; }
       try {
-        await this.routeMessage(round.targetId, round.message, round.data, round.delivery, context, {
+        await this.#routeWithPrincipal(round.targetId, round.message, round.data, round.delivery, round.principal, context, {
           from: round.from, idempotencyKey: round.idempotencyKey,
           ...(round.priority === undefined ? {} : { priority: round.priority }),
           ...(round.triggerTurn === undefined ? {} : { triggerTurn: round.triggerTurn }),

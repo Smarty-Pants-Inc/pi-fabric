@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { requireNamespaceBarrier, syncPathNamespaceDurable, writeJsonAtomic } from "../core/atomic-write.js";
+import { copyFabricPrincipal, type FabricPrincipal } from "../host-compatibility.js";
 import type { FabricAgentMessageDelivery, FabricAgentMessageResult, FabricMainAgentDeliveryRequest, FabricSteerPriority, MainAgentController } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
 
@@ -17,6 +18,8 @@ export interface PreparedScriptedInput {
   idempotencyKey: string;
   message: string;
   data: unknown;
+  /** Immutable host-captured attribution; never recovered from data or other metadata. */
+  readonly principal?: FabricPrincipal | undefined;
   deadlineAt: number;
   delivery: FabricAgentMessageDelivery;
   priority?: FabricSteerPriority;
@@ -37,7 +40,10 @@ interface DeliveryPolicy {
   priority?: FabricSteerPriority;
   triggerTurn?: boolean;
 }
-interface Round extends DeliveryPolicy { from: MeshIdentity; targetId: string; message: string; data: unknown; triggerTurn: boolean }
+interface Round extends DeliveryPolicy {
+  from: MeshIdentity; targetId: string; message: string; data: unknown; triggerTurn: boolean;
+  readonly principal?: FabricPrincipal | undefined;
+}
 interface RecordPayload {
   role: "sender" | "receiver";
   deliveryId: string;
@@ -122,7 +128,15 @@ const sender = (from: MeshIdentity): MeshIdentity => {
   }
   return copy;
 };
-const makeRound = (options: { from: MeshIdentity; targetId: string; message: string; data: unknown } & DeliveryPolicy): Round => {
+/** The native host field is optional, but an invalid supplied claim must never become UNKNOWN. */
+const principalSnapshot = (value: unknown): FabricPrincipal | undefined => {
+  if (value === undefined) return undefined;
+  const copy = snapshot(value);
+  if (!object(copy) || !exactKeys(copy, ["id", "binding"])) return fail("INVALID", "Scripted input needs a valid native principal id and binding");
+  return copyFabricPrincipal(copy) ?? fail("INVALID", "Scripted input needs a valid native principal id and binding");
+};
+const makeRound = (options: { from: MeshIdentity; targetId: string; message: string; data: unknown; principal?: FabricPrincipal | undefined } & DeliveryPolicy): Round => {
+  const principal = principalSnapshot(options.principal);
   const data = snapshot(options.data);
   const metadata = readScriptedInput(data) ?? fail("INVALID", "data.scriptedInput is required");
   const targetId = `session:${metadata.sessionId}`;
@@ -135,6 +149,7 @@ const makeRound = (options: { from: MeshIdentity; targetId: string; message: str
   if (options.triggerTurn !== undefined && typeof options.triggerTurn !== "boolean") return fail("INVALID", "Scripted input triggerTurn must be boolean");
   // Keep the EXACT offered text and delivery policy, not Main's presentation-time trim/defaults.
   return { from: sender(options.from), targetId, message: options.message, data, delivery: options.delivery,
+    ...(principal === undefined ? {} : { principal }),
     ...(options.priority === undefined ? {} : { priority: options.priority }),
     triggerTurn: options.triggerTurn ?? true };
 };
@@ -187,7 +202,7 @@ const load = (file: string, role: RecordPayload["role"]): RecordPayload | undefi
     }
     const payload = value.payload;
     if (payload.role !== role || !exactKeys(payload, ["role", "deliveryId", "round", "published", "result"]) ||
-        !object(payload.round) || !exactKeys(payload.round, ["from", "targetId", "message", "data", "delivery", "priority", "triggerTurn"]) ||
+        !object(payload.round) || !exactKeys(payload.round, ["from", "targetId", "message", "data", "delivery", "priority", "triggerTurn", "principal"]) ||
         (payload.published !== undefined && (role !== "sender" || payload.published !== true))) {
       return fail("CORRUPT", `Corrupt scripted input record: ${file}`);
     }
@@ -213,13 +228,14 @@ const sameRound = (saved: RecordPayload, round: Round): void => {
 const prepared = (payload: RecordPayload): PreparedScriptedInput => ({
   idempotencyKey: payload.deliveryId, message: payload.round.message, data: snapshot(payload.round.data), deadlineAt: metadataOf(payload.round).deadlineAt,
   delivery: payload.round.delivery,
+  ...(payload.round.principal === undefined ? {} : { principal: principalSnapshot(payload.round.principal) }),
   ...(payload.round.priority === undefined ? {} : { priority: payload.round.priority }),
   triggerTurn: payload.round.triggerTurn,
   ...(payload.result === undefined ? {} : { result: duplicate(payload.result) }),
 });
 
 /** Persist the immutable outbox intent BEFORE the caller can publish. No driver replay is needed. */
-export function prepareScriptedInput(options: { root: string; from: MeshIdentity; targetId: string; message: string; data: unknown } & DeliveryPolicy): PreparedScriptedInput {
+export function prepareScriptedInput(options: { root: string; from: MeshIdentity; targetId: string; message: string; data: unknown; principal?: FabricPrincipal | undefined } & DeliveryPolicy): PreparedScriptedInput {
   const round = makeRound(options);
   const file = recordPath(options.root, "sender", round);
   const previous = load(file, "sender");
@@ -283,8 +299,10 @@ const deliverNative = (mainAgent: InputAdmissionMainAgent, payload: RecordPayloa
   request: FabricMainAgentDeliveryRequest, lookupOnly = false): FabricAgentMessageResult => {
   const metadata = metadataOf(payload.round);
   // Spreading retains the router's private symbol-keyed native wake admission as well
-  // as its host-hydrated verification/principal/source/outcome fields. Data grants none.
+  // as its host-hydrated verification/source/outcome fields. Principal comes only from
+  // the immutable round, including UNKNOWN on legacy records. Data grants none.
   const native: FabricMainAgentDeliveryRequest = { ...request, from: snapshot(payload.round.from), message: payload.round.message,
+    principal: principalSnapshot(payload.round.principal),
     delivery: payload.round.delivery, triggerTurn: payload.round.triggerTurn, deliveryId: payload.deliveryId };
   Object.defineProperty(native, "data", { enumerable: true, get: () => {
     if (lookupOnly) return fail("NOT_ADMITTED", "Original scripted input is not admitted in native Main history");

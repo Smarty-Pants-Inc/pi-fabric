@@ -10,6 +10,9 @@ import { prepareScriptedInput, listPendingScriptedInputs } from "../src/recovery
 import type { FabricParticipantInfo } from "../src/topology/types.js";
 import { FabricControlPlane, type FabricControlCommand } from "../src/topology/control-plane.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { controlBodyFingerprint } from "../src/mesh/control-idempotency.js";
+import { registerFabricPrincipalCapture, type FabricPrincipal, type FabricTurnProvenance } from "../src/fabric-provenance.js";
+import type { FabricInvocationContext } from "../src/protocol.js";
 
 // Data safety/trust boundary: real router -> native Main journal, not a call-count-only
 // admission fake. No model, child process, live NATS broker or physical fencing claim.
@@ -22,6 +25,7 @@ const drains: Array<() => void> = [];
 const planes: FabricControlPlane[] = [];
 const stores: MeshStore[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(planes.splice(0).map(plane => plane.close()));
   for (const store of stores.splice(0)) store.closeState();
   for (const close of drains.splice(0)) close();
@@ -36,19 +40,37 @@ function router(meshRoot: string, main: Ports[2], control?: Ports[4], participan
   const participants = { get: (id: string) => participant?.id === id ? participant : undefined, scheduleRefresh() {}, lastKnown: () => undefined };
   return new AgentMessageRouter(unknown, actors, main, participants, control, b => b);
 }
+// The sender's attribution enters through Pi's host event hook, never router options.
+const ORIGINAL_PRINCIPAL = { id: "original-requester", binding: "voice-call" as const };
+const NEXT_PRINCIPAL = { id: "next-requester", binding: "voice-call" as const };
+const FORGED_PRINCIPAL = { id: "payload-requester", binding: "herdr-client" as const };
+function invocation(principal?: FabricPrincipal): FabricInvocationContext {
+  const handlers = new Map<string, (event: any, context: ExtensionContext) => unknown>();
+  registerFabricPrincipalCapture({ on: (name: string, handler: any) => { handlers.set(name, handler); return () => {}; } } as unknown as ExtensionAPI);
+  const extensionContext = { sessionManager: { getSessionId: () => FROM.id.slice("session:".length) } } as unknown as ExtensionContext;
+  handlers.get("before_agent_start")!({}, extensionContext);
+  handlers.get("context")!({ messages: [{ role: "user", content: "original request", provenance: principal ? {
+    v: 1, channel: "voice", turnId: "host-original-turn", receivedAt: "2026-10-01T00:00:00Z", principal,
+  } : undefined }] }, extensionContext);
+  return { extensionContext, cwd: process.cwd(), signal: undefined,
+    parentToolCallId: "scripted-input-parent", nestedToolCallId: "scripted-input-route", update() {}, activity() {} };
+}
 function native(meshRoot: string, entries: unknown[] = []) {
   const sent: Array<{ customType: string; content: string; details: Record<string, any> }> = [];
+  const deliveryOptions: Array<{ provenance?: FabricTurnProvenance }> = [];
   const handlers = new Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>();
-  const pi = { on: (name: string, fn: (event: unknown, ctx: ExtensionContext) => unknown) => {
+  const pi = { hostCapabilities: { turnProvenance: 1 }, on: (name: string, fn: (event: unknown, ctx: ExtensionContext) => unknown) => {
     handlers.set(name, [...(handlers.get(name) ?? []), fn]); return () => {};
-  }, sendMessage: (message: typeof sent[number]) => sent.push(message), sendUserMessage() {}, getThinkingLevel: () => "off" } as unknown as ExtensionAPI;
+  }, sendMessage: (message: typeof sent[number], options: typeof deliveryOptions[number]) => {
+    sent.push(message); deliveryOptions.push(options);
+  }, sendUserMessage() {}, getThinkingLevel: () => "off" } as unknown as ExtensionAPI;
   const ctx = { isIdle: () => true, hasPendingMessages: () => false, signal: { aborted: false },
     sessionManager: { getEntries: () => entries, getSessionId: () => SESSION } } as unknown as ExtensionContext;
   const main = new MainAgentController(pi, TARGET, true, process.cwd(), SESSION);
   const journal = path.join(meshRoot, "main-followups", "receiver.json");
   main.attachFollowUpDrain(ctx, 60_000, journal);
   drains.push(() => main.closeFollowUpDrain());
-  return { main, sent, journal, entries, confirm() {
+  return { main, sent, deliveryOptions, journal, entries, confirm() {
     for (const message of sent) entries.push({ type: "custom_message", customType: message.customType, details: message.details });
     for (const fn of handlers.get("agent_settled") ?? []) fn({ outcome: "completed" }, ctx);
     main.confirmInbox();
@@ -136,6 +158,84 @@ describe("opt-in scripted input on the existing agents sender/receiver path", ()
     // Same key but a genuinely different policy is NOT an equivalent default.
     await expect(router(senderRoot, noMain, sender, remote("new-epoch")).routeMessage(TARGET, "unchanged", offered, "followUp", undefined, { triggerTurn: false }))
       .rejects.toThrow(/conflict/i);
+  });
+
+  it.skipIf(process.platform === "win32").each([
+    { label: "original principal without context", original: ORIGINAL_PRINCIPAL, resumed: undefined },
+    { label: "original principal despite a different live turn", original: ORIGINAL_PRINCIPAL, resumed: NEXT_PRINCIPAL },
+    { label: "UNKNOWN despite caller/data claims and a new live turn", original: undefined, resumed: NEXT_PRINCIPAL },
+  ])("replays $label after a real remote native admission whose reply was lost", async ({ original, resumed }) => {
+    const senderRoot = root(), receiverRoot = root(), n = native(receiverRoot);
+    const offered = { ...data(), principal: FORGED_PRINCIPAL, provenance: { principal: FORGED_PRINCIPAL } };
+    const text = "  immutable attributed input\n";
+    const makePlane = (who: typeof FROM | { id: string; name: string; kind: "main" }, hostId: string) => {
+      const mesh = new MeshStore(receiverRoot, 65_536, 1_000, { stateBackend: "file" }); stores.push(mesh);
+      const plane = new FabricControlPlane(mesh, who, { enabled: true, hostId, ownerIncarnation: "receiver-epoch",
+        pollMs: 20, acknowledgementTimeoutMs: 2_000 });
+      planes.push(plane); return plane;
+    };
+    const owner = makePlane({ id: TARGET, name: "Receiver", kind: "main" }, "runtime:receiver");
+    let receiver = router(receiverRoot, n.main);
+    owner.start((...args) => receiver.acceptControl(...args));
+    const sender = makePlane(FROM, "runtime:sender"); sender.start(() => ({ accepted: false }));
+    const publish = owner.mesh.publish.bind(owner.mesh);
+    let replyLost!: () => void;
+    const lost = new Promise<void>(resolve => { replyLost = resolve; });
+    // The real owner has journalled, saved its native result and constructed its ACK.
+    // Lose only its return leg; do not manufacture an acceptance at the sender seam.
+    const dropReply = vi.spyOn(owner.mesh, "publish").mockImplementation(async input => {
+      const event = await publish(input.topic === "fabric.control.ack" ? { ...input, to: "runtime:lost-reply" } : input);
+      if (input.topic === "fabric.control.ack") replyLost();
+      return event;
+    });
+    const first = router(senderRoot, noMain, sender, remote("receiver-epoch"))
+      .routeMessage(TARGET, text, offered, "steer", invocation(original), { principal: FORGED_PRINCIPAL });
+    const observed = first.catch(error => error);
+    await lost;
+    expect(n.sent).toHaveLength(1);
+    expect(n.deliveryOptions[0]!.provenance).toMatchObject({ sender: { id: FROM.id, verified: "mesh" } });
+    expect(n.deliveryOptions[0]!.provenance?.principal).toEqual(original);
+    const initial = sender.mesh.read({ topic: "fabric.control.command" }).find(event => event.kind === "steer")!;
+    expect(initial.principal).toEqual(original);
+    expect((owner.mesh.read({ topic: "fabric.control.ack" })[0]!.data as any).accepted).toBe(true);
+    // End the old sender with its actual request still unacknowledged, then reopen
+    // native Main from stable session history, not from an in-memory result fake.
+    await sender.close();
+    expect(await observed).toBeInstanceOf(Error);
+    const pending = listPendingScriptedInputs({ root: senderRoot, from: FROM });
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.principal).toEqual(original);
+    n.confirm(); n.main.closeFollowUpDrain();
+    expect(n.entries).toEqual([expect.objectContaining({ details: expect.objectContaining({ deliveryId: n.sent[0]!.details.deliveryId }) })]);
+    const successor = native(receiverRoot, n.entries);
+    receiver = router(receiverRoot, successor.main);
+    dropReply.mockRestore();
+    const restarted = makePlane(FROM, "runtime:sender"); restarted.start(() => ({ accepted: false }));
+    const outcomes = await router(senderRoot, noMain, restarted, remote("receiver-epoch"))
+      .resumeScriptedInputs(FROM, resumed ? invocation(resumed) : undefined);
+    const attempts = restarted.mesh.read({ topic: "fabric.control.command" }).filter(event => event.kind === "steer");
+    expect(attempts).toHaveLength(2);
+    expect(attempts[1]!.principal).toEqual(original);
+    expect(controlBodyFingerprint(attempts[1]!.data, attempts[1]!.principal))
+      .toBe(controlBodyFingerprint(initial.data, initial.principal));
+    expect(attempts[1]!.data).toMatchObject({ commandId: (initial.data as FabricControlCommand).commandId,
+      message: text, data: offered, triggerTurn: true });
+    expect(outcomes).toEqual([{ inputId: "round-1", status: "acknowledged" }]);
+    expect(listPendingScriptedInputs({ root: senderRoot, from: FROM })).toEqual([]);
+    // A fresh physical control id must still reconcile through the native receiver's
+    // immutable round and stable Main history, without another carrier to Pi.
+    expect(await receiver.acceptControl({ ...(initial.data as FabricControlCommand), commandId: "new-physical-id",
+      principal: original }, FROM, undefined, "mesh")).toMatchObject({ accepted: true, messageId: n.sent[0]!.details.id });
+    expect(n.sent).toHaveLength(1); expect(successor.sent).toHaveLength(0);
+  });
+
+  it.skipIf(process.platform === "win32")("conflicts when the same immutable input is offered by a different host-captured principal", async () => {
+    const r = root(), n = native(r), offered = data(), sender = router(r, n.main);
+    await sender.routeMessage(TARGET, "original", offered, "steer", invocation(ORIGINAL_PRINCIPAL));
+    await expect(sender.routeMessage(TARGET, "original", offered, "steer", invocation(NEXT_PRINCIPAL)))
+      .rejects.toThrow(/conflict|immutable/i);
+    expect(n.sent).toHaveLength(1);
+    expect(n.deliveryOptions[0]!.provenance?.principal).toEqual(ORIGINAL_PRINCIPAL);
   });
 
   it.skipIf(process.platform === "win32")("returns a saved sender native ACK after restart and deadline without publication", async () => {

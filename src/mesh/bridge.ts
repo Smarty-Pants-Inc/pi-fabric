@@ -3566,11 +3566,17 @@ const senders = (presence: Pick<BridgePresence, "hosts" | "participants">): Set<
   return ids;
 };
 
+type MembershipTimingStep = "refreshMembership.syncPresence" | "refreshMembership.freshSyncPresence" |
+  "syncPresence.local.presence" | "syncPresence.remote.presence" | "syncPresence.presence.all" |
+  "syncPresence.local.relayPresence" | "syncPresence.remote.mirror" | "syncPresence.local.mirror" |
+  "syncPresence.mirror.allSettled";
+
 export class MeshBridge {
   #cursor: CursorFile | undefined;
   #seen = { toRemote: new Set<string>(), toLocal: new Set<string>() };
   #presenceAt = Number.NEGATIVE_INFINITY;
   #presenceSync: Promise<void> | undefined;
+  #presenceSyncStartedAt = 0;
   /** One trailing refresh obligation; a sample begun before its latest miss cannot clear it. */
   #unaddressedRefreshAt: number | undefined;
   #unaddressedRefreshVersion = 0;
@@ -4189,17 +4195,41 @@ export class MeshBridge {
     }
   }
 
+  /** Invoke immediately: presence() can scan synchronously before returning its promise. */
+  #timeMembershipStep<T>(step: MembershipTimingStep, work: () => T | Promise<T>): Promise<T> {
+    const startedAt = monotonicClock.now();
+    const settled = (status: "fulfilled" | "rejected"): void => {
+      const elapsedMs = monotonicClock.now() - startedAt;
+      if (elapsedMs <= 1_000) return;
+      try { this.#log(`membership timing: step=${step} elapsedMs=${Math.round(elapsedMs)} status=${status}`); }
+      catch { /* Diagnostics must not change membership or mask its original failure. */ }
+    };
+    let pending: T | Promise<T>;
+    try { pending = work(); }
+    catch (error) { settled("rejected"); throw error; }
+    return Promise.resolve(pending).then(value => {
+      settled("fulfilled");
+      return value;
+    }, error => {
+      settled("rejected");
+      throw error;
+    });
+  }
+
   /** Mirror each side's live roots into the other; concurrent callers share one pass. */
   syncPresence(): Promise<void> {
     if (this.#staleAdmission) return Promise.reject(this.#staleAdmission);
     if (this.#presenceSync) {
+      try { this.#log(`presence sync: joined in-flight pass ageMs=${Math.max(0, Math.round(monotonicClock.now() - this.#presenceSyncStartedAt))}`); }
+      catch { /* Diagnostics must not prevent sharing the current pass. */ }
       this.options.debug?.("presence sync: joined in-flight pass");
       return this.#presenceSync;
     }
-    const startedAt = this.options.debug ? performance.now() : 0;
+    const startedAt = monotonicClock.now();
+    this.#presenceSyncStartedAt = startedAt;
     return this.#presenceSync = this.#syncPresence().finally(() => {
       this.#presenceSync = undefined;
-      this.options.debug?.(`presence sync: settled after ${performance.now() - startedAt} ms`);
+      this.options.debug?.(`presence sync: settled after ${monotonicClock.now() - startedAt} ms`);
     });
   }
 
@@ -4208,8 +4238,8 @@ export class MeshBridge {
    * Failures still propagate; no polling or extra retry loop. */
   async #refreshMembership(): Promise<void> {
     const joined = this.#presenceSync !== undefined;
-    await this.syncPresence();
-    if (joined) await this.syncPresence();
+    await this.#timeMembershipStep("refreshMembership.syncPresence", () => this.syncPresence());
+    if (joined) await this.#timeMembershipStep("refreshMembership.freshSyncPresence", () => this.syncPresence());
   }
 
   #unaddressedRefreshDue(): boolean {
@@ -4231,18 +4261,20 @@ export class MeshBridge {
     const syncedAt = Date.now();
     const presenceVersion = this.#presenceVersion;
     const leaseVersion = this.#leaseVersion;
-    const localPresence = this.options.local.presence();
+    const localPresence = this.#timeMembershipStep("syncPresence.local.presence", () => this.options.local.presence());
     // StoreBridgeSide.presence() scans synchronously before returning its promise. That
     // hub work precedes the remote request; do not charge it to the inbound sample's
     // 15 s lease. Still anchor BEFORE the RPC, never after its reply or mirror commit.
     const inboundObservedAt = Date.now();
-    const [local, claimed] = await Promise.all([localPresence, this.options.remote.presence()]);
+    const [local, claimed] = await this.#timeMembershipStep("syncPresence.presence.all", () => Promise.all([
+      localPresence, this.#timeMembershipStep("syncPresence.remote.presence", () => this.options.remote.presence()),
+    ]));
     const claimedValue: unknown = claimed;
     const claimedHosts = isObject(claimedValue) && Array.isArray(claimedValue.hosts)
       ? claimedValue.hosts.filter((host): host is BridgeHost => isObject(host)) : [];
     const remote = admitPresence(claimed, new Set(local.reserved), this.options.remoteName);
     if (this.#stopped) return;
-    const relays = await this.options.local.relayPresence?.() ?? { hosts: [], participants: [] };
+    const relays = await this.#timeMembershipStep("syncPresence.local.relayPresence", () => this.options.local.relayPresence?.()) ?? { hosts: [], participants: [] };
     const localRoots = { ...local, hosts: local.hosts.filter(({ record }) => !isNativeNonRootHost(record)) };
     const native = admitPresence(localRoots, new Set());
     const nativeNonRootHosts = local.hosts.filter(({ record }) => isNativeNonRootHost(record));
@@ -4285,7 +4317,10 @@ export class MeshBridge {
       ? ` (${outbound.dropped} hosts pass the frame budget)` : ""}; reasons: ${reasons.summary() || "none"}`);
     this.options.debug?.(`presence sync: inbound ${remote.hosts.length} hosts/${remote.participants.length} participants; outbound ${outbound.presence.hosts.length} hosts/${outbound.presence.participants.length} participants; partial=${partial} dropped=${droppedCount}`);
     // Both settle before a failure is reported, so no local write outlives this pass.
-    const results = await Promise.allSettled([this.options.remote.mirror(outboundPresence), this.options.local.mirror(inboundPresence, inboundObservedAt)]);
+    const results = await this.#timeMembershipStep("syncPresence.mirror.allSettled", () => Promise.allSettled([
+      this.#timeMembershipStep("syncPresence.remote.mirror", () => this.options.remote.mirror(outboundPresence)),
+      this.#timeMembershipStep("syncPresence.local.mirror", () => this.options.local.mirror(inboundPresence, inboundObservedAt)),
+    ]));
     // A transient failure must not hide a simultaneous permanent/transport failure.
     const failures = results.filter((result) => result.status === "rejected");
     const stale = failures.find(result => result.reason instanceof BridgeStaleIncarnationError);

@@ -141,6 +141,9 @@ const readJson = <T>(filePath: string): T | undefined => {
   }
 };
 
+// Internal response provenance; message text alone must not authorize fallback.
+class ResidentCleanupUnknownAgentError extends Error {}
+
 const terminal = (status: string): status is AgentRunResult["status"] =>
   status === "completed" || status === "failed" || status === "stopped" || status === "timed_out";
 
@@ -885,8 +888,16 @@ export class ResidencyClient {
         createdAt: Date.now(),
       }, signal, () => this.#cleanupRoutes.set(id, route), route.owner);
     } catch (error) {
-      if (!prior && !(error instanceof ResidentOutcomeUnknownError) && error instanceof Error && /Unknown Fabric agent/.test(error.message)) {
-        return this.#cleanupTerminalFiles(metadata, deleteBranch, signal);
+      if (!prior && error instanceof ResidentCleanupUnknownAgentError) {
+        try {
+          return await this.#cleanupTerminalFiles(metadata, deleteBranch, signal);
+        } catch (fallbackError) {
+          // A pre-commit tree veto must not pin a rejected host request forever.
+          // Partial/uncertain offline custody still owns the original route.
+          if (!(fallbackError instanceof ResidentOutcomeUnknownError) && !this.#terminalCleanup.has(id) &&
+              this.#cleanupRoutes.get(id) === route) this.#cleanupRoutes.delete(id);
+          throw fallbackError;
+        }
       }
       throw error;
     }
@@ -1053,6 +1064,15 @@ export class ResidencyClient {
             }
             const cleanupFailure = command.operation === "cleanup"
               ? residentCleanupErrorFields({ code: response.errorCode, cleanupStatus: response.cleanupStatus }) : {};
+            if (cleanupOwner && command.operation === "cleanup" && response.error === `Unknown Fabric agent: ${command.id}` &&
+                response.errorCode === undefined && response.outcome === undefined && response.cleanupStatus === undefined) {
+              const responseOwner = this.#liveOwner();
+              if (responseOwner && responseOwner.token === cleanupOwner.token && responseOwner.pid === cleanupOwner.pid &&
+                  responseOwner.processStartTime === cleanupOwner.processStartTime) {
+                // The catch below must also prove abandonment before this tag escapes.
+                throw new ResidentCleanupUnknownAgentError(response.error);
+              }
+            }
             throw Object.assign(new Error(response.error ?? "Fabric resident host rejected request"),
               cleanupFailure.cleanupStatus ? { code: cleanupFailure.errorCode, cleanupStatus: cleanupFailure.cleanupStatus } : {});
           }

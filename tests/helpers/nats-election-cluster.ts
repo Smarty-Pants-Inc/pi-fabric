@@ -2,7 +2,23 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { waitForNatsCluster } from "../../scripts/nats-cluster-readiness.mjs";
+import { waitForNatsCluster, type NatsReadinessNode, type NatsReadinessOptions } from "../../scripts/nats-cluster-readiness.mjs";
+
+/** Match the backend's /varz-only durability gate, not the shared monitor gate's /jsz fallback.
+ * Reuse its single 60s deadline and bounded request polling; never retry a failed backend open. */
+export const waitForNatsElectionReadiness = (nodes: NatsReadinessNode[], options: NatsReadinessOptions = {}) => {
+  const fetchMonitor = options.fetch ?? globalThis.fetch;
+  return waitForNatsCluster(nodes, { ...options, fetch: async (input, init) => {
+    const response = await fetchMonitor(input, init);
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (response.ok && url.pathname === "/varz") {
+      const body = await response.clone().json() as { jetstream?: { config?: { sync_always?: unknown } } };
+      const syncAlways = body.jetstream?.config?.sync_always;
+      if (syncAlways !== true) throw new Error(`/varz must report jetstream.config.sync_always=true before a backend open (got ${String(syncAlways)})`);
+    }
+    return response;
+  } });
+};
 const reservePorts = async (count: number): Promise<{ ports: number[]; release(): Promise<void> }> => {
   const servers: net.Server[] = [];
   try {
@@ -121,7 +137,7 @@ export const startNatsElectionCluster = async (binary: string): Promise<NatsElec
     }
     let readiness;
     try {
-      readiness = await waitForNatsCluster(nodes.map(node => ({ name: node.name, monitorUrl: node.monitorUrl })));
+      readiness = await waitForNatsElectionReadiness(nodes.map(node => ({ name: node.name, monitorUrl: node.monitorUrl })));
     } catch (error) {
       const childDiagnostics = nodes.map(node => {
         const child = node.child as ChildProcess & { electionStderr?: () => string };

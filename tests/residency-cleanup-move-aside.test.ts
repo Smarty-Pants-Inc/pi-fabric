@@ -408,9 +408,36 @@ describe("public resident cleanup moves aside all four evidence roots", () => {
   });
 
   it("archive failure leaves all sources intact and preserves known-ID commitment", async () => {
-    const f = fixture({ worktree: true }); f.addTraces(); f.recordGit(); write(f.proposedArchive, "not a directory");
-    await expect(f.client.cleanupAgent(f.id, true)).rejects.toMatchObject({ name: "ResidentOutcomeUnknownError", id: f.id });
+    const f = fixture({ worktree: true }); f.addTraces(); f.add("ignored/raw.JSONL.backup", f.worktree); f.recordGit();
+    const sources = f.sources(), originals = new Map(sources.map(source => [source, rawTree(source)]));
+    const acknowledgements = path.join(f.config.residencyRoot, "acknowledgements"), signal = new AbortController().signal;
+    const nativeRename = fs.renameSync.bind(fs), refused: string[] = [];
+    // An unusable candidate can legitimately fall back (see the native 0775/0777
+    // controls below). Refuse real prepared-receipt publication instead, before
+    // the first payload rename, regardless of the selected archive/platform.
+    const rename = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (path.basename(String(destination)) === "custody.prepared.json") {
+        f.expectCommitted(); f.expectUnconsumed();
+        expect(JSON.parse(fs.readFileSync(source, "utf8"))).toMatchObject({ id: f.id, source: f.run, state: "prepared" });
+        refused.push(String(destination));
+        throw Object.assign(new Error("injected prepared custody receipt EIO"), { code: "EIO" });
+      }
+      nativeRename(source, destination);
+    });
+    const error = await f.client.cleanupAgent(f.id, true, signal).catch((error: unknown) => error);
+    expect(error).toMatchObject({ name: "ResidentOutcomeUnknownError", id: f.id, operation: "cleanup",
+      residentOutcome: { id: f.id, state: "committed", operation: "cleanup", ownerHostId: f.client.hostId } });
+    expect((error as Error).message).toContain("injected prepared custody receipt EIO");
+    expect((error as Error).message).toContain("Do not retry or reassign");
+    expect(refused).toHaveLength(1); expect(fs.existsSync(refused[0]!)).toBe(false);
+    expect(rename.mock.calls.some(([source]) => sources.includes(String(source)))).toBe(false);
+    for (const source of sources) expect(rawTree(source)).toEqual(originals.get(source));
     f.expectBytes(); f.expectUnconsumed(); f.expectCommitted();
+    expect(f.client.hasAgent(f.id)).toBe(true); expect(f.client.settledAgent(f.id)).toMatchObject(f.record);
+    expect(receipts(f.archive)).toEqual([]); expect(fs.existsSync(acknowledgements)).toBe(false);
+    expect(preserveCancellationOutcome({ value: undefined, terminationReason: "runtime_error" as const }, signal)).toMatchObject({
+      residentOutcomes: [expect.objectContaining({ id: f.id, state: "committed", operation: "cleanup" })],
+    });
     expect(vi.mocked(executeFile).mock.calls.map(([, args]) => args)).toEqual([["worktree", "list", "--porcelain"]]);
   });
 

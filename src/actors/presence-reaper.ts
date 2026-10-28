@@ -135,6 +135,7 @@ export const reapDeadSessionPresence = async (
           });
       const results = await gated(() => mesh.writeBatch({
         identity,
+        lockTiming: { operation: "presence-reap" },
         ops: batch.map(entry => {
           const session = sessionOf(entry);
           const key = LEGACY_SESSION_PREFIX + session;

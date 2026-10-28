@@ -13,7 +13,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { privateDirTestHooks } from "../src/storage/private-dir.js";
 import { hasUnresolvedWorker } from "../src/storage/retention.js";
 
-// The cases below mock process.platform to probe the manager's product branch. Run directories are still made on
+// The transport-contract cases below mock process.platform to probe the manager's product branch. Run directories are still made on
 // the real host, so the private-dir fallback must see the real platform: a mocked "linux" on a Windows runner
 // would otherwise demand /proc/self/fd (pi-fabric#875).
 const hostPlatform = process.platform;
@@ -159,13 +159,11 @@ describe.skipIf(process.platform !== "linux")("absent native worker stop fence",
 // Inject only the parent's product branch. These are deterministic contract
 // probes, not native Windows process-tree certification.
 describe.each(["linux", "win32"] as const)("merge stop custody (%s)", platform => {
-  beforeEach(async context => {
+  beforeEach(async () => {
     observeCustody();
-    // Fake-OS probes and the 1005-handle stress contract record ONLY the ACL
-    // subprocess. Real filesystem rename and receipt/object proofs stay active.
-    if (platform !== hostPlatform || context.task.name === "releases confirmed custom process admission and evicts settled handles") {
-      await recordSecuritySubprocess();
-    }
+    // Fake-OS probes record ONLY the ACL subprocess. Real filesystem rename
+    // and receipt/object proofs stay active.
+    if (platform !== hostPlatform) await recordSecuritySubprocess();
   });
   it.each([false, true])("does not publish unchecked terminal success or release custody (close hook=%s)", async closeHook => {
     vi.useFakeTimers(); vi.spyOn(process, "platform", "get").mockReturnValue(platform);
@@ -219,34 +217,6 @@ describe.each(["linux", "win32"] as const)("merge stop custody (%s)", platform =
     }
   });
 
-  it("releases confirmed custom process admission and evicts settled handles", async () => {
-    vi.spyOn(process, "platform", "get").mockReturnValue(platform);
-    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
-      terminal(request);
-      return { kind: "process", sessionId: "2147483647", stop: async () => {}, isAlive: async () => false };
-    });
-    const manager = setup();
-    let first: string | undefined;
-    let firstRoot: string | undefined;
-    let firstInventory: unknown[] | undefined;
-    stressPhases = { started: performance.now() };
-    try {
-      for (let index = 0; index < 1_005; index++) {
-        const result = await manager.run({ task: `eviction pressure ${index}` });
-        if (!first) {
-          first = result.id; firstRoot = manager.runDirectory(first)!;
-          firstInventory = inventory(firstRoot);
-        }
-        expect(result.status).toBe("completed");
-      }
-      expect(manager.runDirectory(first!), "checked dead execution may evict a handle, never its raw root").toBeUndefined();
-      stressPhases.loopFinished = performance.now();
-    } finally { await manager.close(); stressPhases.closeFinished = performance.now(); }
-    expect(inventory(firstRoot!)).toEqual(firstInventory);
-    expect(movedRoots.size, "all 1000 retained handles require whole-root prepared+moved receipts").toBe(1_000);
-    expect(securityContainers.length).toBe(platform === "win32" ? 1_000 : 0);
-  }, 20_000);
-
   it("retains a failed release observation after execution was already confirmed", async () => {
     vi.useFakeTimers(); vi.spyOn(process, "platform", "get").mockReturnValue(platform);
     let hung = false; let finish!: () => void;
@@ -271,4 +241,44 @@ describe.each(["linux", "win32"] as const)("merge stop custody (%s)", platform =
       expect(hasUnresolvedWorker(run)).toBe(true);
     } finally { finish(); hung = false; await manager.close(); }
   });
+});
+
+// Archive admission must interpret real filesystem metadata using the native
+// platform, not a transport-branch mock (Windows libuv mode bits are not POSIX
+// permissions). Only the Windows ACL subprocess is recorded, NOT certified.
+describe("native filesystem stop custody stress", () => {
+  beforeEach(async () => {
+    observeCustody();
+    if (hostPlatform === "win32") await recordSecuritySubprocess();
+  });
+
+  it("releases confirmed custom process admission and evicts settled handles", async () => {
+    expect(vi.isMockFunction(Object.getOwnPropertyDescriptor(process, "platform")?.get),
+      "native filesystem custody must not use a mocked process.platform").toBe(false);
+    expect(process.platform).toBe(hostPlatform);
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      terminal(request);
+      return { kind: "process", sessionId: "2147483647", stop: async () => {}, isAlive: async () => false };
+    });
+    const manager = setup();
+    let first: string | undefined;
+    let firstRoot: string | undefined;
+    let firstInventory: unknown[] | undefined;
+    stressPhases = { started: performance.now() };
+    try {
+      for (let index = 0; index < 1_005; index++) {
+        const result = await manager.run({ task: `eviction pressure ${index}` });
+        if (!first) {
+          first = result.id; firstRoot = manager.runDirectory(first)!;
+          firstInventory = inventory(firstRoot);
+        }
+        expect(result.status).toBe("completed");
+      }
+      expect(manager.runDirectory(first!), "checked dead execution may evict a handle, never its raw root").toBeUndefined();
+      stressPhases.loopFinished = performance.now();
+    } finally { await manager.close(); stressPhases.closeFinished = performance.now(); }
+    expect(inventory(firstRoot!)).toEqual(firstInventory);
+    expect(movedRoots.size, "all 1000 retained handles require whole-root prepared+moved receipts").toBe(1_000);
+    expect(securityContainers.length).toBe(hostPlatform === "win32" ? 1_000 : 0);
+  }, 20_000);
 });

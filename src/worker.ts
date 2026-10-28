@@ -30,9 +30,21 @@ import { createCrashFinisher } from "./worker/crash-finish.js";
 // ProcessTransport's native channel transfers the execution cleanup obligation
 // before spawning. Other transports have no channel and retain normal signals.
 let externalStopRequested = false;
+let spawnerDisconnected = false;
 let externalStop = () => { externalStopRequested = true; };
 const custodyReady = new Promise<void>((resolve) => {
   if (process.platform === "win32" || !process.send) { resolve(); return; }
+  // A detached process group/systemd scope is resource containment, not durable
+  // residency. IPC EOF is the owning spawner's death signal even when its
+  // session_shutdown hook times out before reaching AgentManager.close (#16691).
+  const disconnected = (): void => {
+    spawnerDisconnected = true;
+    externalStopRequested = true;
+    externalStop(); // existing bounded native-tree drain, status and journal path
+    resolve(); // also release a worker whose spawner died before custody ACK
+  };
+  process.once("disconnect", disconnected);
+  if (!process.connected) { disconnected(); return; }
   process.on("message", (message: unknown) => {
     if (!message || typeof message !== "object" || !("type" in message)) return;
     if (message.type === "fabric-execution-custody-ack") { process.channel?.unref?.(); resolve(); }
@@ -701,8 +713,10 @@ const main = async (): Promise<void> => {
   // smarty-dev#2088: ordinary process children write as task agents, not as their parent's role.
   // The fleet governor derives the lane from cwd; explicit actors keep their own role environment.
   if (externalStopRequested) {
-    record.status = "stopped"; record.error = "Agent stopped before execution launch";
+    record.status = "stopped"; record.error = spawnerDisconnected
+      ? "Agent stopped before execution launch: spawner disconnected" : "Agent stopped before execution launch";
     record.finishedAt = Date.now(); record.updatedAt = record.finishedAt;
+    saveWorkerCompletion(options.statusFile, record);
     writeRunRecord(options.statusFile, record); terminalWritten = true;
     await executionSettled();
     await new Promise<void>(resolve => sessionStream ? sessionStream.end(resolve) : resolve());
@@ -2578,7 +2592,7 @@ const main = async (): Promise<void> => {
   const stop = (): void => {
     if (terminalStatus) return;
     terminalStatus = "stopped";
-    terminalError = "Agent stopped";
+    terminalError = spawnerDisconnected ? "Agent stopped: spawner disconnected" : "Agent stopped";
     killChild();
   };
   externalStop = stop;

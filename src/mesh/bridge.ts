@@ -3646,6 +3646,10 @@ export class MeshBridge {
   readonly #tailRetryAt: Partial<Record<Direction, number>> = {};
   readonly #tailSafetyDelay: Partial<Record<Direction, number>> = {};
   readonly #membershipSequence: Partial<Record<Direction, number>> = {};
+  /** One post-miss completion per boundary: denial evidence only, never routing authority. */
+  readonly #membershipRefresh: Partial<Record<Direction, {
+    sequence: number; beforeMiss: Promise<void> | undefined; completed: boolean;
+  }>> = {};
   /** Events not addressed across since the last count line (smarty-dev#9352). */
   #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, suppressedMissSamples: 0,
     topics: new Set<string>(), more: false };
@@ -4272,7 +4276,13 @@ export class MeshBridge {
       return this.#presenceSync;
     }
     const startedAt = this.options.debug ? performance.now() : 0;
-    const pending = this.#presenceSync = this.#syncPresence().finally(() => {
+    const pending = this.#presenceSync = this.#syncPresence().then(() => {
+      // Keep completed post-miss evidence before clearing the shared pass, even after a cap.
+      for (const direction of ["toRemote", "toLocal"] as const) {
+        const sample = this.#membershipRefresh[direction];
+        if (sample && pending !== sample.beforeMiss) sample.completed = true;
+      }
+    }).finally(() => {
       this.#presenceSync = undefined;
       this.options.debug?.(`presence sync: settled after ${performance.now() - startedAt} ms`);
     });
@@ -4295,7 +4305,10 @@ export class MeshBridge {
    * miss may wait at most 1 s for unrelated shared mirror I/O; timeout is UNKNOWN,
    * never absence or authority. Race each pass separately so a timed-out old pass
    * cannot later launch an unowned trailing refresh. Public sync/step stay strict. */
-  async #refreshForwardMembership(): Promise<boolean> {
+  async #refreshForwardMembership(direction: Direction, sequence: number): Promise<boolean> {
+    const previous = this.#membershipRefresh[direction];
+    const sample = previous?.sequence === sequence ? previous
+      : (this.#membershipRefresh[direction] = { sequence, beforeMiss: this.#presenceSync, completed: false });
     const deadline = monotonicClock.now() + 1_000;
     const wait = async (): Promise<boolean> => {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -4306,9 +4319,13 @@ export class MeshBridge {
         ]);
       } finally { if (timer !== undefined) clearTimeout(timer); }
     };
-    const joined = this.#presenceSync !== undefined;
-    if (!await wait()) return false;
-    return !joined || await wait();
+    if (!sample.completed) {
+      if (!await wait()) return false;
+      // Only a pre-miss pass needs a second wait; a fulfilled post-miss call is already fresh.
+      if (sample.beforeMiss !== undefined && !sample.completed && !await wait()) return false;
+    }
+    delete this.#membershipRefresh[direction];
+    return true;
   }
 
   #unaddressedRefreshDue(): boolean {
@@ -4803,8 +4820,8 @@ export class MeshBridge {
     authority: (refreshIfStale?: boolean) => Promise<BridgeRules>,
     notificationForward = false,
   ): Promise<{ forwarded: number; dropped: number }> {
-    const refreshMembership = async (): Promise<boolean> => {
-      if (notificationForward) return this.#refreshForwardMembership();
+    const refreshMembership = async (sequence: number): Promise<boolean> => {
+      if (notificationForward) return this.#refreshForwardMembership(direction, sequence);
       await this.#refreshMembership();
       return true;
     };
@@ -4827,6 +4844,7 @@ export class MeshBridge {
       delete cursor.relayGrace;
       checkpoint();
     }
+    if ((this.#membershipRefresh[direction]?.sequence ?? Infinity) <= cursor.after) delete this.#membershipRefresh[direction];
     if ((this.#membershipSequence[direction] ?? Infinity) <= cursor.after) {
       delete this.#membershipSequence[direction];
       delete this.#membershipRetryAt[direction];
@@ -4856,7 +4874,7 @@ export class MeshBridge {
       // Failed/deferred mirrors retain that boundary too.
       const end = phase("membershipWaitMs");
       passRefreshAttempted = true;
-      try { passRefreshed = await refreshMembership(); } finally { end(); }
+      try { passRefreshed = await refreshMembership(retainedBoundary!); } finally { end(); }
       passRefreshPending = !passRefreshed;
     }
     if (direction === "toLocal" && this.#factoryWaiting) {
@@ -5021,7 +5039,7 @@ export class MeshBridge {
         const refresh = async (): Promise<void> => {
           refreshed = true; // Attempt bound, not a claim of completed negative evidence.
           const end = phase("membershipWaitMs");
-          try { passRefreshed = await refreshMembership(); } finally { end(); }
+          try { passRefreshed = await refreshMembership(event.sequence); } finally { end(); }
           refreshPending = !passRefreshed;
           // Only current canonical authority can admit after an unfinished sample.
           rules = await authority(false);

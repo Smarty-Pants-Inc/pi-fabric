@@ -6,6 +6,14 @@ export default createFabricExtension(import.meta.url);
 export * from "./audit/index.js";
 export * from "./entropy/index.js";
 export * from "./protocol.js";
+export { registerSessionRecoveryAdapters, SESSION_RECOVERY_ADAPTERS_GET } from "./recovery/l7-interfaces.js";
+export type {
+  PortableIdentityEvidence, PortableSessionBinding, PortableIdentityAdapter,
+  SessionRecoveryActivation, TransportHostLeasePredecessorSnapshot,
+  RecoveryAcceptedInput, RecoveryInputSnapshot, ContinuationRequest, ContinuationAdmission,
+  RecoveryInputAdapter, SettledRecoveryEffect, RecoveryEffectsSettlement, RecoveryToolResult,
+  RecoveryEffectAdapter, SessionRecoveryAdapters,
+} from "./recovery/l7-interfaces.js";
 export { requestSessionChannelApi, SESSION_CHANNEL_API_GET, SESSION_CHANNEL_API_READY } from "./transport/nats/session-channel-api.js";
 export type { FabricSessionChannelApi } from "./transport/nats/session-channel-api.js";
 export { FabricModelDeniedError } from "./core/model-policy.js";

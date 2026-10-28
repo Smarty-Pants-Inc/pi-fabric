@@ -895,16 +895,32 @@ export interface TransportHostLeaseReceipt {
   readonly releasedAt?: number;
 }
 
+/** Exact native receipt observation. Absence is explicit, not a fresh-session permission.
+ * bytes is the original valid UTF-8 file, NEVER JSON reserialization. */
+export interface TransportHostLeasePredecessorSnapshot {
+  readonly receipt: TransportHostLeaseReceipt | undefined;
+  readonly bytes: string | undefined;
+}
+
+/** Composition supplies B2's higher-level native identity/state/old-writer handoff validator.
+ * Neither another physical boot nor local /proc can prove a portable predecessor exited. */
+export interface TransportHostLeaseStartupSuccessor {
+  verifyPredecessor(previous: TransportHostLeasePredecessorSnapshot, signal: AbortSignal): Promise<void>;
+}
+
 export interface TransportHostLeaseOptions {
   readonly kv: TransportKv;
   readonly self: TransportOwner;
   readonly rootId: string;
   readonly identityId: string;
   readonly incarnation: string;
-  /** EXISTING, private, machine-local runtime state directory, NEVER the shared mesh root.
-   * Every incarnation/parallel successor of this hostId MUST use the same stable directory.
-   * Composition owns this placement; deleting/moving the receipt loses successor evidence. */
+  /** EXISTING, private runtime state directory, NEVER the shared mesh root. Machine-local
+   * unless startupSuccessor supplies native portable handoff validation. Every incarnation/
+   * parallel successor of this hostId MUST use the same stable directory and retain its receipt. */
   readonly localStateDir: string;
+  /** Optional portable startup only. Always validates the exact receipt (including absence)
+   * under custody before reservation/admission. No boolean bypass of local exit proof. */
+  readonly startupSuccessor?: TransportHostLeaseStartupSuccessor;
   /** Synchronous notification; called at most once for a terminal ownership loss. */
   readonly onLost?: (error: TransportHostLeaseLostError) => void;
   /** Synchronous notification; called once per recoverable local TTL lapse. */
@@ -970,6 +986,17 @@ export const transportHostLeasePredecessorExited = (proof: TransportHostLeasePro
 const transportLeaseConflict = (error: unknown): boolean =>
   typeof error === "object" && error !== null && "code" in error && error.code === "FABRIC_KV_CONFLICT";
 
+/** Bound external startup work even when a validator/read ignores cancellation. A late
+ * completion cannot continue the acquisition; callers still retain durable reservations. */
+const transportLeaseAbortable = <T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    signal.throwIfAborted();
+    const abort = (): void => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    void Promise.resolve().then(() => { signal.throwIfAborted(); return operation(); }).then(resolve, reject)
+      .finally(() => signal.removeEventListener("abort", abort));
+  });
+
 /** One activation incarnation. The directory drives renew() every RENEW_MS; there is no heartbeat
  * loop here. The unreferenced cutoff alarm suspends admission even if nobody calls live(). Every
  * custody/claim fence must still call live(): a paused event loop can delay that alarm. Successful
@@ -989,6 +1016,7 @@ export class TransportHostLease {
   readonly #monotonic: () => number;
   readonly #onLost: TransportHostLeaseOptions["onLost"];
   readonly #onSuspended: TransportHostLeaseOptions["onSuspended"];
+  readonly #startupSuccessor: TransportHostLeaseOptions["startupSuccessor"];
   readonly #abort = new AbortController();
   #state: "idle" | "acquiring" | "held" | "suspended" | "lost" | "released" = "idle";
   #loss: TransportHostLeaseLostError | undefined;
@@ -1024,6 +1052,10 @@ export class TransportHostLease {
     this.#monotonic = options.monotonic ?? (() => performance.now());
     this.#onLost = options.onLost;
     this.#onSuspended = options.onSuspended;
+    if (options.startupSuccessor !== undefined && typeof options.startupSuccessor?.verifyPredecessor !== "function") {
+      throw new TypeError("Transport startup successor requires verifyPredecessor");
+    }
+    this.#startupSuccessor = options.startupSuccessor;
   }
 
   get signal(): AbortSignal { return this.#abort.signal; }
@@ -1114,6 +1146,7 @@ export class TransportHostLease {
     try {
       operationSignal.throwIfAborted();
       this.#processProof = readLocalHostLeaseProcessProof();
+      if (this.#startupSuccessor) return await this.#acquireSuccessor(operationSignal);
       return await this.#withReceiptCustody(async () => {
         operationSignal.throwIfAborted();
         const predecessor = this.#readReceipt();
@@ -1145,6 +1178,135 @@ export class TransportHostLease {
       if (this.#state !== "released") this.#lose(transportLeaseConflict(cause) ? "conflict" : "acquire-failed", cause);
       throw this.#loss?.reason === "acquire-failed" ? cause : this.#loss ?? cause;
     }
+  }
+
+  async #acquireSuccessor(signal: AbortSignal): Promise<TransportHostLeaseValue> {
+    // One acquisition object, one total startup budget. TTL bounds residual broker ownership;
+    // safety allows expiry observation, never permission to overwrite an existing key.
+    const budget = TRANSPORT_HOST_LEASE_TTL_MS + TRANSPORT_HOST_LEASE_SAFETY_MS;
+    const deadline = this.#clock() + budget;
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(new TransportHostLeaseProofError("timeout")), budget);
+    const operationSignal = AbortSignal.any([signal, timeout.signal]);
+    const check = (): void => {
+      operationSignal.throwIfAborted();
+      if (this.#clock() >= deadline) throw new TransportHostLeaseProofError("timeout");
+    };
+    try {
+      const predecessor = await this.#withReceiptCustody(async () => {
+        check();
+        const snapshot = this.#readReceiptSnapshot();
+        if (snapshot.receipt?.incarnation === this.#incarnation) throw new TransportHostLeaseProofError("invalid");
+        await this.#verifyStartupReceipt(snapshot, operationSignal);
+        check();
+        return snapshot;
+      }, operationSignal);
+      // Do not hold file custody while waiting: the old owner must be able to durably mark
+      // clean and CAS-delete its own KV lease. No successor receipt is written during wait.
+      if (predecessor.receipt) await this.#waitForStartupAbsence(predecessor.receipt, operationSignal);
+      return await this.#withReceiptCustody(async () => {
+        check();
+        const current = this.#readReceiptSnapshot();
+        if (current.bytes !== predecessor.bytes) {
+          // The only permitted change is the exact old owner's clean release. A competing
+          // reservation (even before its PubAck) belongs to another startup, not this proof.
+          if (!predecessor.receipt || !current.receipt || predecessor.receipt.releasedCleanly ||
+            !current.receipt.releasedCleanly || !this.#sameReceiptOwner(current.receipt, predecessor.receipt)) {
+            throw this.#lose("conflict");
+          }
+          await this.#verifyStartupReceipt(current, operationSignal);
+        }
+        const entry = await transportLeaseAbortable(() => this.#kv.get<unknown>(this.key, operationSignal), operationSignal);
+        check();
+        if (entry) throw this.#lose("conflict"); // An authoritative absence, never a watch hint/TTL calculation.
+        const proof = this.#processProof!;
+        const receipt: TransportHostLeaseReceipt = Object.freeze({ ownerHostId: this.self.hostId,
+          incarnation: this.#incarnation, pid: proof.pid, processStartTime: proof.pidStartTime,
+          bootId: proof.bootId, acquiredAt: Date.now(), releasedCleanly: false });
+        this.#writeReceipt(receipt); // Reserve durably BEFORE create/PubAck, holding custody through admission.
+        this.#receipt = receipt;
+        check();
+        const started = this.#clock();
+        this.#deadline = started + TRANSPORT_HOST_LEASE_TTL_MS - TRANSPORT_HOST_LEASE_SAFETY_MS;
+        this.#armCutoff();
+        const value = this.#value();
+        await transportLeaseAbortable(async () => {
+          const revision = await this.#kv.put(this.key, this.owner, value, 0, operationSignal);
+          this.#confirmRevision(revision); // Retain even a late confirmation for CAS-only cleanup.
+        }, operationSignal);
+        this.#checkCutoff();
+        check();
+        this.#state = "held";
+        return value;
+      }, operationSignal);
+    } finally { clearTimeout(timer); }
+  }
+
+  async #verifyStartupReceipt(snapshot: TransportHostLeasePredecessorSnapshot, signal: AbortSignal): Promise<void> {
+    await transportLeaseAbortable(() => this.#startupSuccessor!.verifyPredecessor(snapshot, signal), signal);
+    signal.throwIfAborted();
+    // Compare actual bytes under the same custody, including formatting/unknown changes.
+    if (this.#readReceiptSnapshot().bytes !== snapshot.bytes) throw new TransportHostLeaseProofError("invalid");
+  }
+
+  async #waitForStartupAbsence(predecessor: TransportHostLeaseReceipt, signal: AbortSignal): Promise<void> {
+    const watch = new AbortController();
+    const watchSignal = AbortSignal.any([signal, watch.signal]);
+    let generation = 0, wake: (() => void) | undefined;
+    let failure: unknown;
+    let failed = false;
+    const notify = (): void => { generation++; wake?.(); };
+    // Arm the existing KV event source BEFORE the authoritative read. Prefix matches are
+    // not identity matches: unrelated key events cannot authorize admission (or prolong it).
+    const watching = (async () => {
+      try {
+        for await (const event of this.#kv.watch<unknown>(this.key, watchSignal)) {
+          if (watchSignal.aborted) break;
+          if (event.type === "ready" || event.type === "reset" ||
+            (event.type === "put" ? event.entry.key === this.key : event.key === this.key)) notify();
+        }
+        if (!watchSignal.aborted) { failed = true; failure = new TransportUnavailableError("Transport host lease watch ended"); notify(); }
+      } catch (error) { if (!watchSignal.aborted) { failed = true; failure = error; notify(); } }
+    })();
+    // Normal path: watch notification + authoritative reread. ONE TTL wake is the safety net
+    // for missing expiry notifications; a separate total TTL+safety deadline fails closed.
+    const timer = setTimeout(notify, TRANSPORT_HOST_LEASE_TTL_MS);
+    let observedRevision: number | undefined;
+    try {
+      for (;;) {
+        signal.throwIfAborted();
+        const observed = generation;
+        const current = await transportLeaseAbortable(() => this.#kv.get<unknown>(this.key, signal), signal);
+        if (!current) return;
+        if (!this.#isStartupPredecessor(current, predecessor) ||
+          (observedRevision !== undefined && current.revision !== observedRevision)) throw this.#lose("conflict");
+        observedRevision = current.revision;
+        if (failed) throw failure;
+        await transportLeaseAbortable(() => new Promise<void>(resolve => {
+          wake = resolve;
+          if (observed !== generation) resolve();
+        }), signal);
+        wake = undefined;
+      }
+    } finally {
+      clearTimeout(timer);
+      watch.abort();
+      wake = undefined;
+      void watching; // The signal closes the native iterator; it has its own bounded cleanup.
+    }
+  }
+
+  #isStartupPredecessor(entry: TransportKvEntry<unknown>, receipt: TransportHostLeaseReceipt): boolean {
+    if (typeof entry.value !== "object" || entry.value === null || Array.isArray(entry.value)) return false;
+    const value = entry.value as Record<string, unknown>;
+    return entry.key === this.key && entry.machine === this.self.machine &&
+      Number.isSafeInteger(entry.revision) && entry.revision > 0 &&
+      entry.owner === `${receipt.ownerHostId}#${receipt.incarnation}` &&
+      value.id === this.self.hostId && value.rootId === this.#rootId && value.identityId === this.#identityId &&
+      value.incarnation === receipt.incarnation && value.incarnationToken === receipt.incarnation &&
+      value.pid === receipt.pid && value.pidStartTime === receipt.processStartTime && value.bootId === receipt.bootId &&
+      typeof value.updatedAt === "number" && Number.isFinite(value.updatedAt) &&
+      typeof value.expiresAt === "number" && Number.isFinite(value.expiresAt);
   }
 
   async #renew(signal?: AbortSignal): Promise<TransportHostLeaseValue> {
@@ -1307,7 +1469,7 @@ export class TransportHostLease {
     return this.#loss;
   }
 
-  async #withReceiptCustody<T>(operation: () => Promise<T>): Promise<T> {
+  async #withReceiptCustody<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     if (!this.#processProof) throw new TransportHostLeaseProofError("missing");
     // The runtime directory must already exist: never silently substitute a shared mesh root.
     try {
@@ -1319,8 +1481,14 @@ export class TransportHostLease {
     // First-use only; no new static startup edge. This is the SAME primitive used by
     // MeshStore.leaseCustody, scoped here to a private receipt, never MeshStore or its locks.
     const { acquireMeshCustodyLock } = await import("../mesh/custody-lock.js");
-    const unlock = await acquireMeshCustodyLock(`${this.#receiptFile}.custody`, TRANSPORT_HOST_LEASE_CUSTODY_TIMEOUT_MS,
-      { hostQualified: true, ownIncarnation: this.#processProof.pidStartTime, lockProtocol: 2 });
+    const acquire = async (): Promise<() => void> => {
+      const unlock = await acquireMeshCustodyLock(`${this.#receiptFile}.custody`, TRANSPORT_HOST_LEASE_CUSTODY_TIMEOUT_MS,
+        { hostQualified: true, ownIncarnation: this.#processProof!.pidStartTime, lockProtocol: 2 });
+      // A portable startup may have timed out while lock acquisition was in flight.
+      if (signal?.aborted) { unlock(); signal.throwIfAborted(); }
+      return unlock;
+    };
+    const unlock = signal ? await transportLeaseAbortable(acquire, signal) : await acquire();
     try { return await operation(); } finally { unlock(); }
   }
 
@@ -1331,18 +1499,23 @@ export class TransportHostLease {
     writeJsonAtomic(this.#receiptFile, receipt, { durable: true });
   }
 
-  #readReceipt(): TransportHostLeaseReceipt | undefined {
+  #readReceipt(): TransportHostLeaseReceipt | undefined { return this.#readReceiptSnapshot().receipt; }
+
+  #readReceiptSnapshot(): TransportHostLeasePredecessorSnapshot {
     let fd: number;
     try { fd = fs.openSync(this.#receiptFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); }
     catch (cause) {
-      if ((cause as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+      if ((cause as NodeJS.ErrnoException)?.code === "ENOENT") return Object.freeze({ receipt: undefined, bytes: undefined });
       throw new TransportHostLeaseProofError("unreadable", { cause });
     }
     try {
       const stat = fs.fstatSync(fd);
       if (!stat.isFile() || stat.size > TRANSPORT_HOST_LEASE_RECEIPT_MAX_BYTES) throw new TransportHostLeaseProofError("invalid");
-      const text = fs.readFileSync(fd, "utf8");
-      if (Buffer.byteLength(text) > TRANSPORT_HOST_LEASE_RECEIPT_MAX_BYTES) throw new TransportHostLeaseProofError("invalid");
+      const bytes = fs.readFileSync(fd);
+      const text = bytes.toString("utf8");
+      if (bytes.length > TRANSPORT_HOST_LEASE_RECEIPT_MAX_BYTES || !bytes.equals(Buffer.from(text, "utf8"))) {
+        throw new TransportHostLeaseProofError("invalid");
+      }
       const value: unknown = JSON.parse(text);
       if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TransportHostLeaseProofError("invalid");
       const receipt = value as Record<string, unknown>;
@@ -1356,7 +1529,7 @@ export class TransportHostLease {
         (receipt.releasedAt !== undefined && (!receipt.releasedCleanly || !Number.isSafeInteger(receipt.releasedAt) || (receipt.releasedAt as number) <= 0))) {
         throw new TransportHostLeaseProofError("invalid");
       }
-      return value as TransportHostLeaseReceipt;
+      return Object.freeze({ receipt: Object.freeze(value as TransportHostLeaseReceipt), bytes: text });
     } catch (cause) {
       if (cause instanceof TransportHostLeaseProofError) throw cause;
       throw new TransportHostLeaseProofError(cause instanceof SyntaxError ? "invalid" : "unreadable", { cause });

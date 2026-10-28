@@ -4269,6 +4269,24 @@ export class MeshBridge {
     });
   }
 
+  /** Observe each failed mirror independently: the other half may never settle. The
+   * aggregate still owns both writes and retryable failure selection. */
+  #membershipFailed(error: unknown): void {
+    if (this.#stopped) return;
+    if (error instanceof BridgeStaleIncarnationError) {
+      this.#staleAdmission = error;
+      this.#ready = false;
+    }
+    if (!this.#notificationMode || isBridgeRetryable(error)) return;
+    this.#notificationError ??= error instanceof Error ? error : new Error(String(error));
+    this.#wake?.();
+  }
+
+  #checkAdmission(): void {
+    if (this.#staleAdmission) throw this.#staleAdmission;
+    if (this.#notificationError) throw this.#notificationError;
+  }
+
   /** Mirror each side's live roots into the other; concurrent callers share one pass. */
   syncPresence(): Promise<void> {
     if (this.#staleAdmission) return Promise.reject(this.#staleAdmission);
@@ -4280,10 +4298,14 @@ export class MeshBridge {
     }
     const startedAt = monotonicClock.now();
     this.#presenceSyncStartedAt = startedAt;
-    return this.#presenceSync = this.#syncPresence().finally(() => {
+    const pending = this.#presenceSync = this.#syncPresence().finally(() => {
       this.#presenceSync = undefined;
       this.options.debug?.(`presence sync: settled after ${monotonicClock.now() - startedAt} ms`);
     });
+    // One policy observer per shared pass, including failures after a forward stops
+    // waiting. Do not replace the rejecting promise returned to strict callers.
+    void pending.catch(error => { this.#membershipFailed(error); });
+    return pending;
   }
 
   /** A pass already in flight may have sampled before this membership miss.
@@ -4293,6 +4315,26 @@ export class MeshBridge {
     const joined = this.#presenceSync !== undefined;
     await this.#timeMembershipStep("refreshMembership.syncPresence", () => this.syncPresence());
     if (joined) await this.#timeMembershipStep("refreshMembership.freshSyncPresence", () => this.syncPresence());
+  }
+
+  /** Notifications/watch installation normally restore canonical authority. A foreground
+   * miss may wait at most 1 s for unrelated shared mirror I/O; timeout is UNKNOWN,
+   * never absence or authority. Race each pass separately so a timed-out old pass
+   * cannot later launch an unowned trailing refresh. Public sync/step stay strict. */
+  async #refreshForwardMembership(): Promise<boolean> {
+    const deadline = monotonicClock.now() + 1_000;
+    const wait = async (step: MembershipTimingStep): Promise<boolean> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          this.#timeMembershipStep(step, () => this.syncPresence()).then(() => true),
+          new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), Math.max(0, deadline - monotonicClock.now())); }),
+        ]);
+      } finally { if (timer !== undefined) clearTimeout(timer); }
+    };
+    const joined = this.#presenceSync !== undefined;
+    if (!await wait("refreshMembership.syncPresence")) return false;
+    return !joined || await wait("refreshMembership.freshSyncPresence");
   }
 
   #unaddressedRefreshDue(): boolean {
@@ -4369,10 +4411,17 @@ export class MeshBridge {
     if (partial) this.#log(`presence: ${droppedCount} dropped records; this sync is partial, omissions held${outbound.dropped
       ? ` (${outbound.dropped} hosts pass the frame budget)` : ""}; reasons: ${reasons.summary() || "none"}`);
     this.options.debug?.(`presence sync: inbound ${remote.hosts.length} hosts/${remote.participants.length} participants; outbound ${outbound.presence.hosts.length} hosts/${outbound.presence.participants.length} participants; partial=${partial} dropped=${droppedCount}`);
-    // Both settle before a failure is reported, so no local write outlives this pass.
+    // Both settle before this pass reports failure, so no write outlives it. But
+    // escaped notification forwards must see a permanent/stale half-failure now,
+    // not only after an unrelated stalled half finishes.
+    const mirror = (step: MembershipTimingStep, work: () => Promise<void>): Promise<void> => {
+      const failed = (error: unknown): never => { this.#membershipFailed(error); throw error; };
+      try { return this.#timeMembershipStep(step, work).catch(failed); }
+      catch (error) { this.#membershipFailed(error); return Promise.reject(error); }
+    };
     const results = await this.#timeMembershipStep("syncPresence.mirror.allSettled", () => Promise.allSettled([
-      this.#timeMembershipStep("syncPresence.remote.mirror", () => this.options.remote.mirror(outboundPresence)),
-      this.#timeMembershipStep("syncPresence.local.mirror", () => this.options.local.mirror(inboundPresence, inboundObservedAt)),
+      mirror("syncPresence.remote.mirror", () => this.options.remote.mirror(outboundPresence)),
+      mirror("syncPresence.local.mirror", () => this.options.local.mirror(inboundPresence, inboundObservedAt)),
     ]));
     // A transient failure must not hide a simultaneous permanent/transport failure.
     const failures = results.filter((result) => result.status === "rejected");
@@ -4427,7 +4476,7 @@ export class MeshBridge {
   }
 
   /** Expired samples or an own-root lease-only lapse can retain a membership boundary. */
-  #staleMembership(event: MeshEvent, rules: BridgeRules, direction: Direction, reason?: string): boolean {
+  #staleMembership(event: MeshEvent, rules: BridgeRules, direction: Direction, reason?: string, pending = false): boolean {
     if (direction === "toLocal" && this.options.local.ingressFenced) return false;
     if (reason !== undefined && reason !== "sender is not a live participant of the remote" &&
       reason !== "ack target is not bound to this link" && !(reason === "not addressed across" && direction === "toRemote")) return false;
@@ -4459,7 +4508,7 @@ export class MeshBridge {
     // Once a lease lapse starts a window, stale-sample reclassification cannot evade it.
     const deadline = this.#leaseLapseAt(direction, event);
     if (deadline !== undefined && Date.now() >= deadline) return false;
-    return lapsed || ids.some(id => (this.#sampledDeadlines.get(id as string) ?? Infinity) <= Date.now());
+    return pending || lapsed || ids.some(id => (this.#sampledDeadlines.get(id as string) ?? Infinity) <= Date.now());
   }
 
   #leaseLapseAt(direction: Direction, event?: MeshEvent): number | undefined {
@@ -4522,7 +4571,7 @@ export class MeshBridge {
    * claim refused or lost in this pass is never trusted (security review round 2, F1/F2).
    */
   async #authority(refreshIfStale = true, direction?: Direction): Promise<{ local: BridgePresence; remote: Pick<BridgePresence, "hosts" | "participants"> }> {
-    if (this.#staleAdmission) throw this.#staleAdmission;
+    this.#checkAdmission();
     const { local } = this.options;
     if (!local.owned) throw new Error("The hub side of a bridge must report the records it holds");
     // A page/read/write can wait on the mesh lock longer than a mirrored lease.
@@ -4534,6 +4583,7 @@ export class MeshBridge {
       try { await this.syncPresence(); } finally { if (end) end(); }
     }
     const [presence, owned] = await Promise.all([local.presence(), local.owned()]);
+    this.#checkAdmission();
     return { local: presence, remote: admitPresence(owned, new Set(presence.reserved)) };
   }
 
@@ -4552,7 +4602,7 @@ export class MeshBridge {
     return { toRemote: toRemote.forwarded, toLocal: toLocal.forwarded, dropped: toRemote.dropped + toLocal.dropped };
   }
 
-  #direction(direction: Direction): Promise<{ forwarded: number; dropped: number }> {
+  #direction(direction: Direction, notificationForward = false): Promise<{ forwarded: number; dropped: number }> {
     return direction === "toRemote"
       ? this.#forward("toRemote", this.options.local, this.options.remote, async (refreshIfStale = true) => {
         const end = this.#deliveryAge.drainPhase(direction, "resolveMs");
@@ -4562,7 +4612,7 @@ export class MeshBridge {
           return { recipients: remoteAddresses(remote), reservedRecipients: new Set(local.reserved),
             relayOrigins: new Map(relays?.hosts.map(host => [host.record.id, host.record.remoteHost!])) };
         } finally { end(); }
-      })
+      }, notificationForward)
       : this.#forward("toLocal", this.options.remote, this.options.local, async (refreshIfStale = true) => {
         const end = this.#deliveryAge.drainPhase(direction, "resolveMs");
         try {
@@ -4573,7 +4623,7 @@ export class MeshBridge {
             senders: senders(remote), identities: senderIdentities(remote), reserved: new Set(local.reserved),
             relayOrigins: new Map(relays?.hosts.map(host => [host.record.id, host.record.remoteHost!])) };
         } finally { end(); }
-      });
+      }, notificationForward);
   }
 
   /**
@@ -4641,8 +4691,8 @@ export class MeshBridge {
       try {
         const end = this.#deliveryAge.drainPhase(direction, "filterMs");
         try {
-          if (direction === "toLocal") await bridgeIngressDiagnostics.run(diagnostics, () => this.#direction(direction));
-          else await this.#direction(direction);
+          if (direction === "toLocal") await bridgeIngressDiagnostics.run(diagnostics, () => this.#direction(direction, true));
+          else await this.#direction(direction, true);
         } finally { end(); diagnostics.active = false; }
         reportRecoveredIngress();
         if (busy) busy.retainedOffLockMs += ingress.retainedOffLockMs;
@@ -4758,7 +4808,13 @@ export class MeshBridge {
     source: BridgeSide,
     target: BridgeSide,
     authority: (refreshIfStale?: boolean) => Promise<BridgeRules>,
+    notificationForward = false,
   ): Promise<{ forwarded: number; dropped: number }> {
+    const refreshMembership = async (): Promise<boolean> => {
+      if (notificationForward) return this.#refreshForwardMembership();
+      await this.#refreshMembership();
+      return true;
+    };
     // Accounting stays in the existing continuations: never wrap a drain await in a promise.
     const phase = (name: BridgeDrainPhase) => this.#deliveryAge.drainPhase(direction, name);
     const checkpoint = () => {
@@ -4772,6 +4828,8 @@ export class MeshBridge {
     const retainedBoundary = this.#membershipSequence[direction];
     if (Date.now() < (this.#tailRetryAt[direction] ?? -Infinity)) return { forwarded, dropped };
     let passRefreshed = false;
+    let passRefreshAttempted = false;
+    let passRefreshPending = false;
     if (cursor.relayGrace && Number.isSafeInteger(cursor.relayGrace.sequence) && cursor.relayGrace.sequence <= cursor.after) {
       delete cursor.relayGrace;
       checkpoint();
@@ -4790,8 +4848,9 @@ export class MeshBridge {
       // its unchanged source boundary. A pre-existing pass alone cannot prove fresh absence.
       // Failed/deferred mirrors retain that boundary too.
       const end = phase("membershipWaitMs");
-      try { await this.#refreshMembership(); } finally { end(); }
-      passRefreshed = true;
+      passRefreshAttempted = true;
+      try { passRefreshed = await refreshMembership(); } finally { end(); }
+      passRefreshPending = !passRefreshed;
     }
     if (direction === "toLocal" && this.#factoryWaiting) {
       // A factory-rate deferral holds this link's inbound drain, in order, until its token is due;
@@ -4923,13 +4982,17 @@ export class MeshBridge {
               const end = phase("publishMs");
               try {
                 committed = await this.#deliveryAge.trackBatch(direction, page.events.slice(index, index + candidates.length),
-                  () => target.publishBatchWithReceipt ? target.publishBatchWithReceipt(candidates) : target.publishBatch!(candidates),
+                  () => {
+                    this.#checkAdmission();
+                    return target.publishBatchWithReceipt ? target.publishBatchWithReceipt(candidates) : target.publishBatch!(candidates);
+                  },
                   Math.max(0, sourceHead - cursor.after));
               } finally { end(); }
             }
             catch (error) {
               // A key conflict falls through to per-event handling for this whole batch. Its
               // receipt-backed control prefix is safe to replay; do not retry overlapping suffix batches.
+              this.#checkAdmission();
               if (isIdempotencyKeyReused(error)) fallbackBatchThrough = page.events[index + candidates.length - 1]!.sequence;
               else if (!(error instanceof BridgeOwnershipError) && !isPermanent(error)) throw error;
             }
@@ -4960,13 +5023,14 @@ export class MeshBridge {
             }
           }
         }
-        let refreshed = passRefreshed && retainedBoundary === event.sequence;
+        let refreshed = (passRefreshed || passRefreshAttempted) && retainedBoundary === event.sequence;
+        let refreshPending = passRefreshPending && !passRefreshed && retainedBoundary === event.sequence;
         const refresh = async (): Promise<void> => {
-          refreshed = true;
-          passRefreshed = true;
+          refreshed = true; // Attempt bound, not a claim of completed negative evidence.
           const end = phase("membershipWaitMs");
-          try { await this.#refreshMembership(); } finally { end(); }
-          // At most the pre-existing pass plus one new snapshot; then canonical authority.
+          try { passRefreshed = await refreshMembership(); } finally { end(); }
+          refreshPending = !passRefreshed;
+          // Only current canonical authority can admit after an unfinished sample.
           rules = await authority(false);
         };
         let reason = this.#refusal(event, rules, direction);
@@ -5000,7 +5064,7 @@ export class MeshBridge {
           await refresh();
           reason = this.#refusal(event, rules, direction);
         }
-        if (reason && this.#staleMembership(event, rules, direction, reason)) {
+        if (reason && this.#staleMembership(event, rules, direction, reason, refreshPending)) {
           this.#deferMembership(direction, event);
           if (cursor.after > start) checkpoint();
           return { forwarded, dropped };
@@ -5079,6 +5143,7 @@ export class MeshBridge {
               ? [event.from.id, ...(event.topic === "fabric.control.ack" && isObject(event.data) && typeof event.data.targetId === "string" ? [event.data.targetId] : [])]
               : [];
             const publish = async (): Promise<BridgePublishReceipt> => {
+              this.#checkAdmission();
               if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(event.to!)) {
                 throw new BridgeOwnershipError(`${event.to} is no longer bound to bridge link ${this.options.remoteName}`);
               }
@@ -5124,13 +5189,14 @@ export class MeshBridge {
             const end = phase("idleMs");
             try { await new Promise<void>(resolve => setImmediate(resolve)); } finally { end(); }
           } catch (error) {
+            this.#checkAdmission();
             if (error instanceof BridgeOwnershipError) {
               // Keep the two-attempt/one-refresh bound. An origin can renew throughout BOTH
               // lock waits; expiry is not a foreign identity. Recheck current reservations so
               // a proven takeover still refuses, and otherwise retry from the durable cursor.
               rules = await authority(false);
               const currentReason = this.#refusal(event, rules, direction);
-              if (this.#staleMembership(event, rules, direction, currentReason)) {
+              if (this.#staleMembership(event, rules, direction, currentReason, refreshPending)) {
                 this.#deferMembership(direction, event);
                 if (cursor.after > start) checkpoint();
                 return { forwarded, dropped };

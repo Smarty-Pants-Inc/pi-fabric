@@ -51,6 +51,7 @@ import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { residentHostId, residentRoot, ResidentOutcomeUnknownError } from "../src/residency/protocol.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import { AgentManager } from "../src/agents/manager.js";
+import * as worktreeCustody from "../src/agents/worktree-manager.js";
 import { parseWorkerOptions } from "../src/worker/options.js";
 import { createRunningRecord, writeRunRecord } from "../src/worker/run-record.js";
 import { resolvePiModel } from "../src/core/model-refresh.js";
@@ -69,7 +70,7 @@ import type { FabricThinking } from "../src/thinking.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
-  return { ...actual, spawn: vi.fn(actual.spawn) };
+  return { ...actual, spawn: vi.fn(actual.spawn), execFileSync: vi.fn(actual.execFileSync) };
 });
 
 const roots: string[] = [];
@@ -3750,6 +3751,67 @@ describe("AgentsProvider runner support", () => {
   it.each([["run", false], ["run", true], ["spawn", false], ["spawn", true]] as const)(
     "joins successful Windows %s -> public cleanup (worktree=%s)", async (method, worktree) => {
       const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+      // A fake Windows event branch on another kernel is a contract probe, not
+      // native Windows ACL certification. Only that security subprocess is recorded.
+      const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+      const security = vi.mocked(execFileSync);
+      if (process.platform !== "win32") {
+        vi.stubEnv("SystemRoot", "C:\\Windows");
+        security.mockImplementation(((file: string, args: string[], options: any) => {
+          if (!options?.env?.PI_FABRIC_CLEANUP_CONTAINER) return actual.execFileSync(file, args, options);
+          expect(file).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+          expect(Buffer.from(args[4]!, "base64").toString("utf16le")).toContain("Get-Acl -LiteralPath $directory");
+          expect(fs.realpathSync(options.env.PI_FABRIC_CLEANUP_CONTAINER)).toBe(options.env.PI_FABRIC_CLEANUP_CONTAINER);
+          return Buffer.alloc(0);
+        }) as typeof execFileSync);
+      }
+      const inventory = (root: string): unknown[] => {
+        const rows: unknown[] = [];
+        const walk = (relative: string): void => {
+          const file = path.join(root, relative), stat = fs.lstatSync(file, { bigint: true });
+          expect(stat.isSymbolicLink()).toBe(false);
+          expect(stat.isFile() || stat.isDirectory()).toBe(true);
+          rows.push({ relative, dev: String(stat.dev), ino: String(stat.ino), directory: stat.isDirectory(),
+            ...(stat.isFile() ? { bytes: fs.readFileSync(file).toString("base64") } : {}) });
+          if (stat.isDirectory()) for (const name of fs.readdirSync(file).sort()) walk(path.join(relative, name));
+        };
+        walk(""); return rows;
+      };
+      const movedSources = new Set<string>();
+      const retain = worktreeCustody.retainCleanupRoot;
+      const observer = vi.spyOn(worktreeCustody, "retainCleanupRoot").mockImplementation((source, ...args) => {
+        const tailName = ".contract-custody.bin", raw = Buffer.from([0, 255, 10, 195, 169]);
+        fs.writeFileSync(path.join(source, tailName), raw, { flag: "wx" });
+        const before = inventory(source);
+        // Windows uses a closed-fixture-FD positive control; this actual POSIX
+        // append descriptor proves same-object custody, not a copied shadow.
+        const fd = platform.value === "win32" ? undefined : fs.openSync(path.join(source, tailName), "a");
+        let moved: ReturnType<typeof retain>;
+        try {
+          moved = retain(source, ...args);
+          expect(moved).toBeDefined();
+          expect(inventory(moved!.destination)).toEqual(before);
+          if (fd !== undefined) {
+            const held = fs.lstatSync(path.join(moved!.destination, tailName), { bigint: true });
+            expect(fs.fstatSync(fd, { bigint: true }).ino).toBe(held.ino);
+            expect(fs.fstatSync(fd, { bigint: true }).dev).toBe(held.dev);
+            fs.writeSync(fd, Buffer.from([10, 70, 68]));
+            expect(fs.readFileSync(path.join(moved!.destination, tailName))).toEqual(Buffer.concat([raw, Buffer.from([10, 70, 68])]));
+          }
+        } finally { if (fd !== undefined) fs.closeSync(fd); }
+        const prepared = JSON.parse(fs.readFileSync(path.join(path.dirname(moved!.receipt), "custody.prepared.json"), "utf8"));
+        expect(prepared).toMatchObject({ id: args[1], source, destination: moved!.destination, state: "prepared" });
+        expect(JSON.parse(fs.readFileSync(moved!.receipt, "utf8"))).toMatchObject({ ...prepared, time: expect.any(Number), state: "moved" });
+        movedSources.add(path.resolve(source));
+        const stage = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
+        if (stage) {
+          fs.mkdirSync(stage, { recursive: true });
+          const out = fs.mkdtempSync(path.join(stage, "provider-contract-"));
+          fs.cpSync(path.dirname(moved!.receipt), path.join(out, "container"), { recursive: true, dereference: false });
+          fs.writeFileSync(path.join(out, "native-inventory.json"), JSON.stringify(before));
+        }
+        return moved;
+      });
       const repository = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-public-win-close-"));
       roots.push(repository);
       if (worktree) {
@@ -3763,7 +3825,7 @@ describe("AgentsProvider runner support", () => {
       }
       const { provider, agents } = setup([], [], undefined, { cwd: repository, agentsConfig: { retainRuns: false, budgetUsd: 0 } });
       try {
-        // Force the real Windows settlement path even on a Linux test host.
+        // Force the Windows settlement contract while retaining the real host filesystem.
         Object.defineProperty(process, "platform", { ...platform, value: "win32" });
         const handle = await provider.invoke(method, {
           task: "successful public cleanup", transport: "process", worktree,
@@ -3779,10 +3841,17 @@ describe("AgentsProvider runner support", () => {
           expect(fs.existsSync(result.worktree!)).toBe(true);
         }
         await expect(provider.invoke("cleanup", { id: handle.id, deleteBranch: true }, context)).resolves.toEqual({ cleaned: true });
+        expect(movedSources.has(path.resolve(run)), "run has complete native-object custody, not deletion").toBe(true);
         expect(fs.existsSync(run)).toBe(false);
-        if (worktree) expect(fs.existsSync(result.worktree!)).toBe(false);
+        if (worktree) {
+          expect(movedSources.has(path.resolve(result.worktree!)), "worktree has whole-root custody").toBe(true);
+          expect(fs.existsSync(result.worktree!)).toBe(false);
+        }
       } finally {
         await agents.close();
+        observer.mockRestore();
+        security.mockImplementation(actual.execFileSync);
+        vi.unstubAllEnvs();
         Object.defineProperty(process, "platform", platform);
       }
     },

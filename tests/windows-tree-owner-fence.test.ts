@@ -1,11 +1,12 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { AgentManager } from "../src/agents/manager.js";
+import * as worktreeCustody from "../src/agents/worktree-manager.js";
 import principalDelivery from "../src/worker/principal-delivery.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
@@ -13,10 +14,83 @@ import { canRemoveTerminalRun, hasUnresolvedWorker } from "../src/storage/retent
 
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
-  return { ...actual, spawn: vi.fn() };
+  return { ...actual, spawn: vi.fn(), execFileSync: vi.fn(actual.execFileSync) };
 });
 
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+const hostPlatform = process.platform;
+const archived = new Map<string, string>();
+const inventory = (root: string): unknown[] => {
+  const rows: unknown[] = [];
+  const walk = (relative: string): void => {
+    const file = path.join(root, relative), stat = fs.lstatSync(file, { bigint: true });
+    expect(stat.isSymbolicLink(), "contract fixtures contain no links").toBe(false);
+    expect(stat.isFile() || stat.isDirectory()).toBe(true);
+    rows.push({ relative, dev: String(stat.dev), ino: String(stat.ino), directory: stat.isDirectory(),
+      ...(stat.isFile() ? { bytes: fs.readFileSync(file).toString("base64") } : {}) });
+    if (stat.isDirectory()) for (const name of fs.readdirSync(file).sort()) walk(path.join(relative, name));
+  };
+  walk(""); return rows;
+};
+const expectArchived = (source: string): void => {
+  expect(archived.has(source), "absence alone is not whole-root custody").toBe(true);
+  expect(fs.realpathSync(archived.get(source)!)).toBe(archived.get(source));
+};
+
+// Only fake-OS ACL subprocesses are recorded. Native Windows probes elsewhere
+// still execute the real command; this suite certifies event/admission contracts.
+const observeContractCustody = async (): Promise<void> => {
+  archived.clear();
+  if (hostPlatform !== "win32") {
+    vi.stubEnv("SystemRoot", "C:\\Windows");
+    const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    vi.mocked(execFileSync).mockImplementation(((file: string, args: string[], options: any) => {
+      const container = options?.env?.PI_FABRIC_CLEANUP_CONTAINER;
+      if (!container) return actual.execFileSync(file, args, options);
+      expect(file).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+      expect(args.slice(0, 4)).toEqual(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+      expect(Buffer.from(args[4]!, "base64").toString("utf16le")).toContain("Get-Acl -LiteralPath $directory");
+      expect(fs.realpathSync(container)).toBe(container);
+      return Buffer.alloc(0); // NONNATIVE security-subprocess contract, not DACL proof.
+    }) as typeof execFileSync);
+  }
+  const retain = worktreeCustody.retainCleanupRoot;
+  vi.spyOn(worktreeCustody, "retainCleanupRoot").mockImplementation((source, ...args) => {
+    const tailName = ".contract-custody.bin", raw = Buffer.from([0, 255, 10, 195, 169]);
+    fs.writeFileSync(path.join(source, tailName), raw, { flag: "wx" });
+    const before = inventory(source);
+    // Closed-FD positive control on Windows; actual POSIX descriptor follows
+    // the same object across rename. Native Windows open-FD probes are separate.
+    const fd = hostPlatform === "win32" ? undefined : fs.openSync(path.join(source, tailName), "a");
+    let moved: ReturnType<typeof retain>;
+    try {
+      moved = retain(source, ...args);
+      expect(moved).toBeDefined();
+      expect(inventory(moved!.destination)).toEqual(before);
+      if (fd !== undefined) {
+        const held = fs.lstatSync(path.join(moved!.destination, tailName), { bigint: true });
+        expect(fs.fstatSync(fd, { bigint: true }).ino).toBe(held.ino);
+        expect(fs.fstatSync(fd, { bigint: true }).dev).toBe(held.dev);
+        fs.writeSync(fd, Buffer.from("late FD tail\n"));
+        expect(fs.readFileSync(path.join(moved!.destination, tailName))).toEqual(Buffer.concat([raw, Buffer.from("late FD tail\n")]));
+      }
+    } finally { if (fd !== undefined) fs.closeSync(fd); }
+    const { destination, receipt } = moved!;
+    const prepared = JSON.parse(fs.readFileSync(path.join(path.dirname(receipt), "custody.prepared.json"), "utf8"));
+    expect(prepared).toMatchObject({ id: args[1], source, destination, state: "prepared" });
+    expect(JSON.parse(fs.readFileSync(receipt, "utf8"))).toMatchObject({ ...prepared, time: expect.any(Number), state: "moved" });
+    expect(path.relative(source, destination)).toMatch(/^\.\./);
+    archived.set(source, destination);
+    const stage = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
+    if (stage) {
+      fs.mkdirSync(stage, { recursive: true });
+      const out = fs.mkdtempSync(path.join(stage, "tree-contract-"));
+      fs.cpSync(path.dirname(receipt), path.join(out, "container"), { recursive: true, dereference: false });
+      fs.writeFileSync(path.join(out, "native-inventory.json"), JSON.stringify(before));
+    }
+    return moved;
+  });
+};
 
 async function joinTreeStopEntry(killer: EventEmitter): Promise<void> {
   // Public stop first joins a possible relaunch. Flush that join without
@@ -36,6 +110,7 @@ afterEach(() => {
 // No real workers or descendants: taskkill and the captured worker are native-event mocks.
 // The unconfirmed native descendant intentionally has no Fabric status/identity file.
 describe("Windows tree-stop owner custody (#360 security R1)", () => {
+  beforeEach(observeContractCustody);
   it.each((["delivered", "cancelled", "queued"] as const).flatMap(state =>
     [false, true].map(leftover => ({ state, leftover })),
   ))("checks release immediately after proven stop with $state follow-up (leftover envelope: $leftover)", async ({ state, leftover }) => {
@@ -174,6 +249,7 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
         const uncertain = outcome === "timeout" || outcome === "stop-failure";
         expect(collected).toBe(!uncertain);
         expect(fs.existsSync(run)).toBe(uncertain);
+        if (!uncertain) expectArchived(run);
         if (uncertain) {
           expect(cleanupError).toBeInstanceOf(Error);
           expect((cleanupError as Error).message).toMatch(/lost track/);
@@ -290,6 +366,7 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
       await vi.advanceTimersByTimeAsync(10_000);
       await closing;
       expect(fs.existsSync(run)).toBe(uncertain);
+      if (!uncertain) expectArchived(run);
     } finally {
       exited = true; killer.emit("close", 0); worker.emit("exit", 0); worker.emit("close", 0);
       await vi.advanceTimersByTimeAsync(30_000);
@@ -376,7 +453,7 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
         expect(canRemoveTerminalRun(run)).toBe(false);
         await expect(manager.cleanup(handle.id)).rejects.toThrow(/lost track/);
         expect(fs.existsSync(run)).toBe(true);
-      } else expect(fs.existsSync(run)).toBe(false);
+      } else { expectArchived(run); expect(fs.existsSync(run)).toBe(false); }
     } finally {
       timerSpy?.mockRestore();
       helperTimeout?.(); killer.emit("close", 0); worker.emit("exit", 0); worker.emit("close", 0);
@@ -497,6 +574,7 @@ describe("Windows tree-stop owner custody (#360 security R1)", () => {
         } else expect(next.status).toBe("queued");
         await manager.close();
         expect(fs.existsSync(run)).toBe(outcome !== "confirmed");
+        if (outcome === "confirmed") expectArchived(run);
       } finally {
         Object.defineProperty(process, "platform", platform);
         // Finish every mock helper's timer; never leave an owned native process running.

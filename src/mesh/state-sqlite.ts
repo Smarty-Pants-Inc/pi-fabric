@@ -1389,6 +1389,35 @@ export class SqliteStateStore {
     });
   }
 
+  /**
+   * One synchronous WAL read snapshot, without writer custody. The first metadata read pins the
+   * deferred transaction and validates its backend/epoch before any caller code runs. Writers on
+   * other connections may commit while it runs; this is NOT an append/ownership write fence.
+   */
+  readSnapshotSync<T>(operation: () => T): T {
+    this.#assertOpen();
+    if (this.#inTransaction) throw new Error("Fabric mesh state callbacks must not nest state snapshots or call store writers");
+    this.#db.exec("BEGIN DEFERRED");
+    this.#inTransaction = true;
+    try {
+      this.#assertLiveMeta(this.#stampMeta());
+      const result = operation();
+      if (result !== null && (typeof result === "object" || typeof result === "function")
+        && typeof (result as { then?: unknown }).then === "function") {
+        throw new Error("Fabric mesh state read snapshots must be synchronous");
+      }
+      return result;
+    } finally {
+      try { if (this.#db.isTransaction) this.#db.exec("ROLLBACK"); }
+      finally {
+        this.#inTransaction = false;
+        // data_version inside a read transaction describes its pinned snapshot, not commits
+        // arriving during it. Never let a cached liveness check authorize a later retired read.
+        this.#dataVersion = -1;
+      }
+    }
+  }
+
   /** Runs a synchronous operation excluded from every state commit (review-opus P1-2 group (a)). */
   async exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T> {
     return this.#write("custody", () => operation(), lockTimeoutMs);

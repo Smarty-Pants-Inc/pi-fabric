@@ -246,6 +246,8 @@ export interface StateBackend {
    * before `operation` runs (nothing happened: retry after releasing `.lock`).
    */
   withWriteFence<T>(operation: () => T, timing?: LockTimingContext): T;
+  /** Optional synchronous, live read snapshot. Unlike withWriteFence, concurrent commits are allowed. */
+  withReadSnapshot?<T>(operation: () => T): T;
 
   /**
    * Durability barrier (smarty-dev#9313): resolves once every state commit made before the call, by
@@ -640,6 +642,7 @@ export class SqliteStateBackend implements StateBackend {
   #busyTimeouts = 0;
   #closed = false;
   #slotClaimGuard: (() => void) | undefined;
+  #readSnapshotActive = false;
 
   constructor(context: MeshStoreContext, options: CreateStateBackendOptions = {}, root = context.root,
     storeOptions: SqliteStateStoreOptions = sqliteOptions(options)) {
@@ -736,14 +739,25 @@ export class SqliteStateBackend implements StateBackend {
     if (current === stamp) return true;
     const lineage = lineageOf(stamp);
     const after = Number(stamp.slice(lineage.length + 1));
-    if (lineageOf(current) !== lineage || !Number.isSafeInteger(after)) return false;
+    if (lineageOf(current) !== lineage || !Number.isSafeInteger(after) || after < 0) return false;
     const feed = this.#read(() => store.changesSince(after));
+    if (!feed.complete) return false;
+    // The retention floor alone cannot prove coverage: metadata-only or raw SQL commits can
+    // advance commit_no without change rows. Every intervening commit must be represented,
+    // in order, before an absence of relevant keys is evidence of unchanged authority.
+    let covered = after;
+    for (const change of feed.changes) {
+      if (change.commit === covered) continue;
+      if (change.commit !== covered + 1) return false;
+      covered = change.commit;
+    }
+    if (covered !== feed.commit) return false;
     const pair = exceptKeys !== undefined && "ignore" in exceptKeys && "versions" in exceptKeys ? exceptKeys : undefined;
     const expectedVersions: ReadonlyMap<string, number> | undefined = pair ? pair.versions
       : exceptKeys instanceof Map ? exceptKeys : undefined;
     const ignored: ReadonlySet<string> | undefined = pair ? pair.ignore
       : exceptKeys instanceof Set ? exceptKeys : undefined;
-    return feed.complete && !feed.changes.some(change => prefixes.some(prefix => change.key.startsWith(prefix)) &&
+    return !feed.changes.some(change => prefixes.some(prefix => change.key.startsWith(prefix)) &&
       !ignored?.has(change.key) && (!expectedVersions || change.version > (expectedVersions.get(change.key) ?? -1)));
   }
 
@@ -760,6 +774,7 @@ export class SqliteStateBackend implements StateBackend {
   }
 
   async writeBatch(input: StateBackendBatchInput): Promise<MeshBatchResult[]> {
+    if (this.#readSnapshotActive) throw new Error("Fabric mesh state callbacks must not call store writers");
     for (const op of input.ops) validateMeshStateKey(op.key);
     if (input.ops.length === 0 && !input.prepare && !input.afterCommit && !input.commitOutbox && !input.beforeCommit) return [];
     const fileRead = input.fileRead;
@@ -815,6 +830,17 @@ export class SqliteStateBackend implements StateBackend {
     await this.#write((store) => store.confirmWritable(onAcquired));
   }
 
+  withReadSnapshot<T>(operation: () => T): T {
+    const store = this.#read(() => this.#open());
+    if (this.#readSnapshotActive) throw new Error("Fabric mesh state callbacks must not nest state snapshots");
+    this.#readSnapshotActive = true;
+    try {
+      // Do not retry caller code: only opening the connection above is retryable. #current()
+      // compares cached views to this transaction's stamp before reusing or advancing them.
+      return store.readSnapshotSync(operation);
+    } finally { this.#readSnapshotActive = false; }
+  }
+
   withWriteFence<T>(operation: () => T, timing?: LockTimingContext): T {
     const store = this.#read(() => this.#open());
     let entered = false;
@@ -863,6 +889,8 @@ export class SqliteStateBackend implements StateBackend {
   }
 
   #pinned(options: MeshReadOptions): SqliteSnapshot | undefined {
+    // An explicit historical token must not override the live transaction's authority snapshot.
+    if (this.#readSnapshotActive) return undefined;
     const token = options.snapshot;
     if (token === undefined || options.fresh === true || !this.#tokens.has(token)) return undefined;
     // A pin repeats a captured snapshot, but never one of a database retired since (round 3).
@@ -979,6 +1007,9 @@ export class SqliteStateBackend implements StateBackend {
   // The caller's budget: the mesh store's withTryLock scope (registry-fenced tries) bounds the
   // SQLite acquisition exactly as it bounds `.lock`; lockTimeoutMs and writeSignal are store options.
   async #write<T>(operation: (store: SqliteStateStore) => Promise<T>): Promise<T> {
+    // Check before the first await: otherwise a callback's write could resume after its read
+    // transaction has ended and silently acquire writer custody outside the protected scope.
+    if (this.#readSnapshotActive) throw new Error("Fabric mesh state callbacks must not call store writers");
     const started = performance.now();
     const scope = this.#context.lock.tryLockScope.getStore();
     // A bounded try spends ONE caller budget on the whole write, first open included.

@@ -3739,7 +3739,7 @@ export class AgentManager {
 
   /** True while retained execution custody or its admission permit remains unresolved. */
   hasRetainedCustody(): boolean {
-    return this.heldPermits() > 0 ||
+    return this.heldPermits() > 0 || this.#cleanupFinalizationPending.size > 0 ||
       [...this.#queued.values()].some(queued => queued.cleanupPending !== undefined) ||
       [...this.#runs.values()].some(managed => managed.transport.kind === "process" && (
         // Normal finishing still owns its tree until exact exit and settlement.
@@ -4984,6 +4984,20 @@ export class AgentManager {
   readonly #cleanupRunCustody = new Map<string, { temporary: string | undefined; runRetained: boolean; temporaryRetained: boolean; run?: CleanupRootCustody; temporaryRoot?: CleanupRootCustody }>();
 
   readonly #cleanupDeferred = new Map<string, CleanupCustodyDeferredStatus>();
+  // Resident trace finalization is part of cleanup, not permission to forget
+  // the manager's authenticated result/notification custody on partial failure.
+  readonly #cleanupFinalizationPending = new Set<string>();
+
+  async #finalizeCleanup(id: string, beforeConsume?: () => void | Promise<void>): Promise<void> {
+    if (!beforeConsume) {
+      if (this.#cleanupFinalizationPending.has(id)) throw new Error(`Cannot clean up agent ${id}: trace finalization is pending`);
+      return;
+    }
+    this.#cleanupFinalizationPending.add(id);
+    try { await beforeConsume(); }
+    catch (error) { this.#recordCleanupFailure(id, error); throw error; }
+    this.#cleanupFinalizationPending.delete(id);
+  }
 
   #recordCleanupFailure(id: string, error: unknown): void {
     if (error instanceof Error && "code" in error && error.code === "CLEANUP_CUSTODY_DEFERRED" && "cleanupStatus" in error) {
@@ -5473,19 +5487,21 @@ export class AgentManager {
     return this.#settledResult(managed);
   }
 
-  async cleanup(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
+  async cleanup(id: string, deleteBranch = false, beforeConsume?: () => void | Promise<void>): Promise<{ cleaned: boolean }> {
     const queued = this.#queued.get(id);
     if (queued) {
       if (!queued.terminal) throw new Error("Cannot clean up a queued agent");
       const runDirectory = path.join(this.#runRoot, id);
-      if (queued.cleanupPending || hasUnresolvedWorker(runDirectory)) {
+      const ownedRunDirectory = this.#cleanupRunCustody.get(runDirectory)?.run?.destination ?? runDirectory;
+      if (queued.cleanupPending || hasUnresolvedWorker(ownedRunDirectory)) {
         throw new Error(`Cannot clean up agent ${id}: Fabric lost track of its worker; check ${runDirectory} before removing its files`);
       }
       if (!this.#saveQueuedRouteOutcome(queued)) throw new Error(`Cannot clean up agent ${id}: ${queued.routeSaveFailure}`);
-      const exitVeto = runTreeExitVeto(runDirectory);
+      const exitVeto = runTreeExitVeto(ownedRunDirectory);
       if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
       const cleaned = await this.#cleanupWorktree(id, deleteBranch);
       if (!this.config.retainRuns) await this.#removeRunTree(runDirectory, id);
+      await this.#finalizeCleanup(id, beforeConsume);
       this.#onResultConsumed?.(id);
       this.#queued.delete(id);
       this.#forgetRunMetadata(id);
@@ -5525,6 +5541,7 @@ export class AgentManager {
     if (!this.config.retainRuns) {
       await this.#removeRunTree(managed.runDirectory, id, managed.temporaryDirectory);
     }
+    await this.#finalizeCleanup(id, beforeConsume);
     this.markForeground(id);
     this.#runs.delete(id);
     this.#forgetRunMetadata(id);
@@ -6032,7 +6049,7 @@ export class AgentManager {
     // Primary transport exit cannot release a surviving descendant's files or
     // shared budget. Keep the persistent run tree (and its owning actor ID) for
     // the next fenced owner whenever tree-wide exit evidence is incomplete.
-    const unresolved = all.some((managed) => managed.processStopPending || (managed.actorId && managed.nativeReleasePending) ||
+    const unresolved = this.#cleanupFinalizationPending.size > 0 || all.some((managed) => managed.processStopPending || (managed.actorId && managed.nativeReleasePending) ||
         managed.lostContact || runTreeResourceVeto(this.#ownedRunDirectory(managed), 0, undefined, true)) ||
       [...this.#queued.values()].some((queued) => queued.cleanupPending) ||
       runRootHasExitVeto(this.#runRoot, new Set([...this.#queued.values()].filter(queued => queued.terminal && !queued.cleanupPending).map(queued => queued.info.id)));
@@ -6041,7 +6058,7 @@ export class AgentManager {
     // Nested run artifacts belong to the enclosing run (upstream lineage): its
     // owner removes them on cleanup/retention/root shutdown, not this child.
     if (!this.config.retainRuns && !this.#parentOwnedRunRoot) {
-      await Promise.all(all.filter(managed => this.#canCollect(managed))
+      await Promise.all(all.filter(managed => !this.#cleanupFinalizationPending.has(managed.id) && this.#canCollect(managed))
         .map(async (managed) => {
           // Every terminal outcome keeps its WHOLE original tree. Never rewrite
           // failed/stopped/timed_out raw records into a task/status-only residue.
@@ -6143,7 +6160,7 @@ export class AgentManager {
       await this.#startTempRunSweep();
     }
     const expired = [...this.#runs.values()].filter((managed) => {
-      if (!managed.settled || !managed.executionExited || managed.actorId || managed.processStopPending ||
+      if (this.#cleanupFinalizationPending.has(managed.id) || !managed.settled || !managed.executionExited || managed.actorId || managed.processStopPending ||
           (managed.actorId && managed.nativeReleasePending) || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
       const record = readRecord(managed.statusFile) ?? managed.latestRecord;
       const finishedAt = record?.finishedAt ?? record?.updatedAt;
@@ -8083,7 +8100,7 @@ export class AgentManager {
     let handlesChanged = false;
     for (const managed of settled.slice(0, -MAX_RETAINED_RUN_HANDLES)) {
       if (managed.executionExited && !managed.settlementSaveFailure && !managed.processStopPending &&
-          !this.#cleanupRunCustody.has(managed.runDirectory) && !this.#cleanupDeferred.has(managed.id) &&
+          !this.#cleanupFinalizationPending.has(managed.id) && !this.#cleanupRunCustody.has(managed.runDirectory) && !this.#cleanupDeferred.has(managed.id) &&
           !(managed.actorId && managed.nativeReleasePending) && !managed.lostContact && !hasUnresolvedWorker(this.#ownedRunDirectory(managed)) &&
           !this.#terminalNoticeOutbox.hasPending(this.#ownedRunDirectory(managed)) &&
           !this.#pendingAbandonment.has(managed.id) &&

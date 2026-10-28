@@ -147,23 +147,27 @@ const fixture = async (retainRuns = false) => {
   };
   const noGitDelete = () => expect(gitCalls.filter(args => args[0] === "worktree" && args[1] === "remove" || args[0] === "branch" || args.includes("prune"))).toEqual([]);
   const dispose = async () => {
-    // Export before host teardown as well as the wrapper/global cleanup owner.
+    // Stage inside the launcher's owned TMPDIR before host/wrapper teardown.
+    // The outer runner copies and independently hashes this stage before cleanup;
+    // these copies do not establish inode custody (the test assertions do).
     try {
-      const evidence = process.env.PI_FABRIC_CUSTODY_EVIDENCE_DIR;
+      const evidence = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
       if (evidence) {
-        fs.mkdirSync(evidence, { recursive: true }); const destination = path.join(evidence, path.basename(root));
-        if (process.platform === "win32") fs.cpSync(root, destination, { recursive: true });
-        else execFileSync("cp", ["-a", "--", root, destination]);
+        fs.mkdirSync(evidence, { recursive: true });
+        const exports: Array<{ source: string; destination: string }> = [];
+        const exportRoot = (source: string, destination: string): void => {
+          if (process.platform === "win32") fs.cpSync(source, destination, { recursive: true });
+          else execFileSync("cp", ["-a", "--", source, destination]);
+          exports.push({ source, destination });
+        };
+        exportRoot(root, path.join(evidence, path.basename(root)));
         for (const temporary of temporaryDirectories) if (!temporary.startsWith(root + path.sep) && fs.existsSync(temporary)) {
-          const target = path.join(evidence, `${path.basename(root)}-${path.basename(temporary)}`);
-          if (process.platform === "win32") fs.cpSync(temporary, target, { recursive: true });
-          else execFileSync("cp", ["-a", "--", temporary, target]);
+          exportRoot(temporary, path.join(evidence, `${path.basename(root)}-${path.basename(temporary)}`));
         }
         for (const receipt of receipts(root)) if (!receipt.destination.startsWith(root + path.sep) && fs.existsSync(receipt.destination)) {
-          const target = path.join(evidence, `${path.basename(root)}-${path.basename(path.dirname(receipt.destination))}`);
-          if (process.platform === "win32") fs.cpSync(path.dirname(receipt.destination), target, { recursive: true });
-          else execFileSync("cp", ["-a", "--", path.dirname(receipt.destination), target]);
+          exportRoot(path.dirname(receipt.destination), path.join(evidence, `${path.basename(root)}-${path.basename(path.dirname(receipt.destination))}`));
         }
+        fs.writeFileSync(path.join(evidence, `${path.basename(root)}-export.json`), JSON.stringify({ exports, method: "pre-teardown staging copy; no inode claim" }));
       }
     } finally { await client.close(); await host.close(); await participants.close(); vi.restoreAllMocks(); }
     console.log(`retained live cleanup fixture: ${root}`);

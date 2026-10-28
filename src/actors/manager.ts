@@ -9070,7 +9070,7 @@ export class ActorManager {
       // Decide and compare-and-swap on one locked snapshot. Its version includes a retained
       // tombstone, so a claim removed when an earlier block cleared can be taken again.
       let previous: MeshStateEntry | undefined;
-      const results = await this.mesh.writeBatch({ identity: this.identity, ops: [], prepare: (view) => {
+      const results = await this.mesh.writeBatch({ identity: this.identity, lockTiming: { operation: "actor-alarm-claim" }, ops: [], prepare: (view) => {
         const current = view.get(key);
         if (covers(current)) return [];
         previous = current;

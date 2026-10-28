@@ -490,6 +490,7 @@ export class SessionActorOrphans {
     try {
       await ActorRegistryStore.withLocks([store], () => this.mesh.leaseCustody(leases[0]!,
         () => this.mesh.leaseCustody(leases[1]!, () => this.mesh.withTryLock(() => this.mesh.writeBatch({ identity: this.identity, ops: [],
+          lockTiming: { operation: "session-orphan-settle" },
           prepare: view => {
             const ops: MeshBatchOperation[] = [];
             for (const key of [`actors/${sessionId}/${row.id}`, participantKey(row.id)]) {

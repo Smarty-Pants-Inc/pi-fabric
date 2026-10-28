@@ -70,6 +70,41 @@ describe("MeshStore lock-timing hook", () => {
     expect(fs.readdirSync(path.join(root, "lock-stats"))).toEqual([path.basename(file)]);
   });
 
+  it.each(["file", "sqlite"] as const)("records internal fence/recovery/retirement operations through the %s backend", async (stateBackend) => {
+    // Keep reason: crash-recovery data safety. Exercise the actual internal call sites and
+    // backend forwarding, not just a recorder fed hand-written labels or mocked batches.
+    const root = temp();
+    const mesh = new store.MeshStore(root, 64 * 1024, 100, { stateBackend });
+    const { CommitOutbox, withStateFence } = await import("../src/mesh/commit-outbox.js");
+    const replayed: unknown[] = [];
+    const outbox = new CommitOutbox(mesh, "user-derived-scope", identity, {
+      touch: (payload, view, replay) => {
+        expect(replay).toBe(true);
+        expect(view.get("subject/value")?.value).toBe(7);
+        replayed.push(payload);
+      },
+    });
+    try {
+      // Commit an effect but omit its post-commit execution, as a crashed writer would.
+      const plan = outbox.plan();
+      await mesh.writeBatch({ identity, ops: [], prepare: () => plan.stage([
+        { kind: "put", key: "subject/value", value: 7 },
+      ], [{ kind: "touch", key: "user-derived-key", payload: { value: 7 } }]) });
+      expect(await withStateFence(mesh, identity, view => view.get("subject/value")?.value)).toBe(7);
+      expect(await outbox.recover()).toBe(1);
+      expect(replayed).toEqual([{ value: 7 }]);
+      expect(mesh.listAll(outbox.prefix, { fresh: true })).toEqual([]);
+      expect(mesh.get("subject/value", { fresh: true })?.value).toBe(7);
+      registry[lockKey]!.flush();
+      const summary = summarizeLockStats(root, readLockStats(root), { minutes: 3, now: Date.now() + 120_000 });
+      expect(Object.fromEntries(summary.operations.map(row => [row.operation, row.n]))).toEqual({
+        "state-fence": 1, "outbox-recover": 1, "outbox-retire": 1,
+      });
+    } finally {
+      mesh.closeState();
+    }
+  });
+
   it("counts a full-budget timeout apart from a failed bounded try, and a throwing operation as a hold", async () => {
     const root = temp();
     const mesh = new store.MeshStore(root, 64 * 1024, 100, { lockTimeoutMs: 100 });

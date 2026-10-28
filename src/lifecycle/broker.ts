@@ -237,7 +237,7 @@ export class LifecycleBroker {
       updatedAt: now,
       createdBy: structuredClone(this.identity),
     };
-    await this.mesh.writeBatch({ identity: this.identity,
+    await this.mesh.writeBatch({ identity: this.identity, lockTiming: { operation: "lifecycle-subscribe" },
       ops: [{ kind: "put", key: subscriptionKey(subscription.id), value: subscription, ifVersion: 0 }],
       beforeCommit: () => this.#assertSubscriptionAdmission() });
     this.#wake();
@@ -265,7 +265,7 @@ export class LifecycleBroker {
     const key = subscriptionKey(id.trim());
     const entry = this.mesh.get(key, { fresh: true });
     if (!entry || !lifecycleSubscriptionFromValue(entry.value)) return { removed: false };
-    const [result] = await this.mesh.writeBatch({ identity: this.identity,
+    const [result] = await this.mesh.writeBatch({ identity: this.identity, lockTiming: { operation: "lifecycle-unsubscribe" },
       ops: [{ kind: "delete", key, ifVersion: entry.version }],
       beforeCommit: () => this.#assertSubscriptionAdmission() });
     return { removed: result?.applied === true };
@@ -629,7 +629,8 @@ export class LifecycleBroker {
     if (subscription.once) {
       if (!current || current.version !== entry.version) throw new Error("Lifecycle once deletion receipt is unconfirmed");
       const deleted = this.options.canConsumeMesh || check
-        ? (await this.mesh.writeBatch({ identity: this.identity, ops: [{ kind: "delete", key: entry.key,
+        ? (await this.mesh.writeBatch({ identity: this.identity, lockTiming: { operation: "lifecycle-once-retire" },
+            ops: [{ kind: "delete", key: entry.key,
             ifVersion: current.version, condition: () => { check?.(); return this.options.canConsumeMesh?.() !== false; } }] }))[0]?.applied
         : (await this.mesh.delete({ key: entry.key, ifVersion: current.version })).deleted;
       if (!deleted) throw new Error("Lifecycle once deletion is unconfirmed");
@@ -660,7 +661,7 @@ export class LifecycleBroker {
       key: entry.key, value: subscription, identity: this.identity, ifVersion: entry.version,
     });
     let committedAt = 0;
-    const [result] = await this.mesh.writeBatch({ identity: this.identity, ops: [{
+    const [result] = await this.mesh.writeBatch({ identity: this.identity, lockTiming: { operation: "lifecycle-cursor" }, ops: [{
       kind: "put", key: entry.key, ifVersion: entry.version,
       // The lock wait may outlast renewal. Fence the actual commit, not just polling.
       value: (now: number) => {

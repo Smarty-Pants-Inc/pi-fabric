@@ -254,7 +254,7 @@ export class SlotAdmissionCoordinator {
         const early = attempt < ADMISSION_PLAN_ATTEMPTS - 1 ? this.mesh.stateView() : undefined;
         const planned = early ? prepare(early.view) : undefined;
         try {
-          await this.mesh.writeBatch({ identity: input.caller, ops: [], prepare: view => {
+          await this.mesh.writeBatch({ identity: input.caller, lockTiming: { operation: "slot-admission" }, ops: [], prepare: view => {
             if (!early) return prepare(view);
             if (!this.mesh.stateUnchangedSince(early.revision, [addr.key, SLOT_ADMISSION_PREFIX])) throw ADMISSION_PLAN_STALE;
             // Prefix feeds do not name evicted tombstones. Presence/content is validated,
@@ -330,7 +330,8 @@ export class SlotAdmissionCoordinator {
     if (!this.#authority.forOperation(registryRoot)) return [];
     const binding = this.#authority.assert(registryRoot);
     let entries: MeshStateEntry[] = [];
-    await this.mesh.writeBatch({ identity: { id: binding.hubRootId, name: "slot-recovery", kind: "main" }, ops: [], prepare: view => {
+    await this.mesh.writeBatch({ identity: { id: binding.hubRootId, name: "slot-recovery", kind: "main" },
+      lockTiming: { operation: "slot-recovery" }, ops: [], prepare: view => {
       entries = view.listAll(SLOT_ADMISSION_PREFIX);
       return [];
     }, beforeCommit: () => { this.#authority.assert(registryRoot); } });
@@ -364,7 +365,8 @@ export class SlotAdmissionCoordinator {
     let boundaryEntered = false;
     let found: { pair: Pair; role: Role; entry: MeshStateEntry } | undefined;
     try {
-      await this.mesh.writeBatch({ identity: { id: binding.hubRootId, name: "slot-removal", kind: "main" }, ops: [], prepare: view => {
+      await this.mesh.writeBatch({ identity: { id: binding.hubRootId, name: "slot-removal", kind: "main" },
+        lockTiming: { operation: state === "revoking" ? "slot-revoke" : "slot-retire" }, ops: [], prepare: view => {
         found = this.#find(actorId, registryRoot, view.listAll(SLOT_ADMISSION_PREFIX));
         if (!found || !topics.includes(found.pair.topic)) refuse("occupied", "No exact matching native slot incarnation to retire");
         if (found.role.state === "retired" || found.role.state === state) return [];

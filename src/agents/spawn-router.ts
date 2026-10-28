@@ -128,7 +128,7 @@ const issueAdmission = async (decisionId: string, admission: SpawnRouterAdmissio
   kind: "spawn" | "actor", request: AdmissionRequest | undefined, cwd: string): Promise<void> => {
   if (!admissionValid(admission) || !request) return;
   const binding = admissionDigest(admission, kind, request, cwd);
-  await admission.mesh.writeBatch({ identity: admissionIdentity, ops: [], prepare: view => {
+  await admission.mesh.writeBatch({ identity: admissionIdentity, lockTiming: { operation: "spawn-admission-issue" }, ops: [], prepare: view => {
     const now = Date.now();
     const entries = view.listAll(ADMISSION_PREFIX);
     const expired = entries.filter(entry => {
@@ -155,7 +155,7 @@ const consumeAdmission = async (options: Pick<SpawnRouterStartOptions, "meshRoot
   try {
     let expiresAt = 0;
     let refusal: AttributionRefusal = "decision-unknown";
-    const results = await admission.mesh.writeBatch({ identity: admissionIdentity, ops: [], prepare: view => {
+    const results = await admission.mesh.writeBatch({ identity: admissionIdentity, lockTiming: { operation: "spawn-admission-consume" }, ops: [], prepare: view => {
       expiresAt = 0;
       refusal = "decision-unknown";
       const key = `${ADMISSION_PREFIX}${decisionId}`;

@@ -58,6 +58,30 @@ const held = (archive: string, source: string): string => {
   if (process.platform !== "win32") expect(fs.statSync(path.dirname(receipt!.destination)).mode & 0o777).toBe(0o700);
   return receipt!.destination;
 };
+// Complete raw inventory plus native object identity, not a suffix allowlist.
+const rawTree = (root: string) => {
+  const rows: Array<{ relative: string; dev: number; ino: number; kind: string; bytes?: Buffer }> = [];
+  const walk = (relative: string): void => {
+    const file = path.join(root, relative), stat = fs.lstatSync(file);
+    expect(stat.isSymbolicLink()).toBe(false);
+    expect(stat.isDirectory() || stat.isFile()).toBe(true);
+    if (stat.isFile()) expect(stat.nlink).toBe(1);
+    rows.push({ relative, dev: stat.dev, ino: stat.ino, kind: stat.isDirectory() ? "directory" : "file",
+      ...(stat.isFile() ? { bytes: fs.readFileSync(file) } : {}) });
+    if (stat.isDirectory()) for (const name of fs.readdirSync(file).sort()) walk(path.join(relative, name));
+  };
+  walk(""); return rows;
+};
+const expectWhole = (namespace: string, source: string, id: string, original: ReturnType<typeof rawTree>): string => {
+  const destination = held(namespace, source);
+  const current = receipts(namespace).find(row => row.source === source && row.state === "moved")!;
+  expect(current).toMatchObject({ id, source, destination, reason: expect.any(String), time: expect.any(Number) });
+  const prepared = JSON.parse(fs.readFileSync(path.join(path.dirname(destination), "custody.prepared.json"), "utf8"));
+  expect(prepared).toMatchObject({ source, destination, id, reason: current.reason, state: "prepared" });
+  expect(prepared.time).toBeGreaterThan(0); expect(prepared.time).toBeLessThanOrEqual(current.time);
+  expect(rawTree(destination)).toEqual(original);
+  return destination;
+};
 const fixture = (options: { absent?: boolean; worktree?: boolean; retainRuns?: boolean; noResult?: boolean; temporary?: boolean } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-resident-move-aside-"));
   ownedRoots.add(root);
@@ -270,7 +294,9 @@ describe("public resident cleanup moves aside all four evidence roots", () => {
       ...(crossDevice ? { cleanupStatus } : {}),
     })] });
     for (const source of moved) {
-      expect((error as Error).message).toContain(held(f.archive, source));
+      // Custody paths are JSON, not raw Windows path substrings. Keep the
+      // separate raw failing-target check above and match this exact scalar.
+      expect((error as Error).message).toContain(JSON.stringify(held(f.archive, source)));
       expect(fs.readFileSync(source === f.run || source === f.worktree ? path.join(source, "new.jsonl") : source)).toEqual(replacement);
     }
     expect(warn.mock.calls.flat().join(" ")).toContain(target);
@@ -378,21 +404,67 @@ describe("public resident cleanup moves aside all four evidence roots", () => {
     expect(fs.readFileSync(lower)).toEqual(f.originals.get(lower)!.bytes); expect(fs.readFileSync(upper)).toEqual(f.originals.get(upper)!.bytes);
   });
 
-  it("retains the authenticated recorded private TMPDIR, including late-FD tails and replacement occupants", async () => {
+  it.each(["closed-FD", "native-open-FD", "injected-EPERM"] as const)("retains authenticated recorded private TMPDIR whole-root custody: %s", async mode => {
+    // This offline fixture intentionally records an EXTERNAL TMPDIR on every
+    // platform. It is not a claim about native Windows worker TMPDIR layout.
     const f = fixture({ temporary: true }); f.addTraces(); f.add("scratch/raw.NDJSON", f.temporary);
-    const file = path.join(f.temporary, "scratch/raw.NDJSON"), original = fs.readFileSync(file), inode = fs.statSync(f.temporary).ino;
-    const fd = fs.openSync(file, "a"), rename = fs.renameSync.bind(fs);
+    const sources = f.sources(), originals = new Map(sources.map(source => [source, rawTree(source)]));
+    const copy = vi.spyOn(fs, "copyFileSync"), rm = vi.spyOn(fs, "rmSync"), unlink = vi.spyOn(fs, "unlinkSync");
+    const signal = new AbortController().signal;
+    const file = path.join(f.temporary, "scratch/raw.NDJSON"), fd = fs.openSync(file, "a");
+    const fdIdentity = fs.fstatSync(fd), rename = fs.renameSync.bind(fs);
+    let open = true, inject = mode === "injected-EPERM";
+    let refusal: { destination: string; code: unknown } | undefined;
+    if (mode === "closed-FD") { fs.closeSync(fd); open = false; }
     vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
-      rename(source, destination);
-      if (String(source) === f.temporary) { write(path.join(f.temporary, "replacement.JSONL"), "new scratch occupant"); fs.writeSync(fd, "late tail"); }
+      if (String(source) === f.temporary) {
+        try {
+          if (inject) throw Object.assign(new Error("deterministic TMPDIR native-boundary EPERM (not native OS proof)"), { code: "EPERM" });
+          rename(source, destination);
+        } catch (error) { refusal = { destination: String(destination), code: (error as NodeJS.ErrnoException).code }; throw error; }
+        write(path.join(f.temporary, "replacement.JSONL"), "new scratch occupant");
+      } else rename(source, destination);
     });
     try {
-      await expect(f.client.cleanupAgent(f.id)).resolves.toEqual({ cleaned: true });
-      const moved = held(f.archive, f.temporary); expect(fs.statSync(moved).ino).toBe(inode);
-      expect(fs.readFileSync(path.join(moved, "scratch/raw.NDJSON"))).toEqual(Buffer.concat([original, Buffer.from("late tail")]));
+      const outcome = await f.client.cleanupAgent(f.id, false, signal).catch((error: unknown) => error);
+      if (refusal) {
+        expect(mode).not.toBe("closed-FD"); expect(refusal.code).toBe("EPERM");
+        expect(outcome).toMatchObject({ name: "ResidentOutcomeUnknownError", id: f.id, operation: "cleanup" });
+        expect((outcome as Error).message).toContain("Do not retry or reassign");
+        expect((outcome as Error).message).toContain(f.temporary);
+        expect((outcome as Error & { cleanupStatus?: unknown }).cleanupStatus).toBeUndefined();
+        expect(outcome).not.toHaveProperty("cleaned", true);
+        expect(preserveCancellationOutcome({ value: undefined, terminationReason: "runtime_error" as const }, signal)).toMatchObject({ residentOutcomes: [expect.objectContaining({ id: f.id, operation: "cleanup", state: "committed" })] });
+        f.expectCommitted(); f.expectUnconsumed(); expect(f.client.hasAgent(f.id)).toBe(true);
+        expect(f.client.statusAgent(f.id)).toMatchObject({ id: f.id, status: "completed" });
+        const failed = JSON.parse(fs.readFileSync(path.join(path.dirname(refusal.destination), "custody.json"), "utf8"));
+        expect(failed).toMatchObject({ source: f.temporary, destination: refusal.destination, id: f.id, state: "rename-failed" });
+        expect(JSON.parse(fs.readFileSync(path.join(path.dirname(refusal.destination), "custody.prepared.json"), "utf8"))).toMatchObject({ source: f.temporary, destination: refusal.destination, id: f.id, state: "prepared" });
+        expect(fs.existsSync(refusal.destination)).toBe(false);
+        expectWhole(f.archive, f.run, f.id, originals.get(f.run)!);
+        for (const source of [f.temporary, f.metadata, f.result]) expect(rawTree(source)).toEqual(originals.get(source));
+        expect(receipts(f.archive).filter(row => row.state === "moved")).toHaveLength(1);
+      } else { expect(outcome).toEqual({ cleaned: true }); expect(mode).not.toBe("injected-EPERM"); }
+      if (open) {
+        const current = refusal ? file : path.join(held(f.archive, f.temporary), "scratch/raw.NDJSON");
+        expect(fs.statSync(current)).toMatchObject({ dev: fdIdentity.dev, ino: fdIdentity.ino });
+        fs.writeSync(fd, "late tail");
+        const entry = originals.get(f.temporary)!.find(row => row.relative === path.join("scratch", "raw.NDJSON"))!;
+        entry.bytes = Buffer.concat([entry.bytes!, Buffer.from("late tail")]);
+        expect(fs.readFileSync(current)).toEqual(entry.bytes);
+        fs.closeSync(fd); open = false;
+      }
+      if (refusal) {
+        inject = false; // Descriptor released; explicit NEW cleanup, never close() replay.
+        await expect(f.client.cleanupAgent(f.id)).resolves.toEqual({ cleaned: true });
+      }
+      for (const source of sources) expectWhole(f.archive, source, f.id, originals.get(source)!);
       expect(fs.readFileSync(path.join(f.temporary, "replacement.JSONL"), "utf8")).toBe("new scratch occupant");
-      expect(receipts(f.archive)).toHaveLength(4); expect(f.consumed).toHaveBeenCalledExactlyOnceWith(f.id);
-    } finally { fs.closeSync(fd); }
+      expect(receipts(f.archive).filter(row => row.state === "moved")).toHaveLength(4);
+      expect(f.consumed).toHaveBeenCalledExactlyOnceWith(f.id);
+      expect(copy).not.toHaveBeenCalled();
+      for (const calls of [rm.mock.calls, unlink.mock.calls]) expect(calls.some(([file]) => sources.some(source => String(file) === source || String(file).startsWith(source + path.sep)))).toBe(false);
+    } finally { if (open) fs.closeSync(fd); }
   });
 
   it.each(["absent", "unrecorded", "wrong-name", "in-run", "symlink"] as const)("does not manufacture or adopt an unauthenticated optional TMPDIR: %s", async kind => {

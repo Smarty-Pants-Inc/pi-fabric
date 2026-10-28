@@ -682,6 +682,16 @@ export const hostLeaseDirectoryStamp = (meshRoot: string): string | undefined =>
 export const readHostLease = (meshRoot: string, hostId: string): FabricHostLease | undefined =>
   readHostLeaseSnapshot(meshRoot, hostId)?.lease;
 
+/** Selected hosts' file leases, without listing the directory or filtering expired records. */
+export const readHostLeasesFor = (meshRoot: string, hostIds: Iterable<string>): Map<string, FabricHostLease> => {
+  const leases = new Map<string, FabricHostLease>();
+  for (const id of new Set(hostIds)) {
+    const lease = readHostLease(meshRoot, id);
+    if (lease) leases.set(lease.id, lease);
+  }
+  return leases;
+};
+
 /** Strict current read for destructive operator checks: never consult/update the
  * peer cache or return its last answer when current bytes are unreadable/invalid.
  * Callers must distinguish an absent file from an existing but invalid one. */

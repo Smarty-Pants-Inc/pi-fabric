@@ -8,7 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
-import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, hostLeaseDirectoryStamp, readHostLease, readHostLeaseCurrent, readHostLeases, removeHostLeaseIf, sameHostLeaseVersion, STATE_LEASE_RENEW_MS, withHostLeaseDirectoryCustody, writeHostLeaseVersionIf } from "../topology/host-leases.js";
+import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, hostLeaseDirectoryStamp, readHostLease, readHostLeaseCurrent, readHostLeases, readHostLeasesFor, removeHostLeaseIf, sameHostLeaseVersion, STATE_LEASE_RENEW_MS, withHostLeaseDirectoryCustody, writeHostLeaseVersionIf } from "../topology/host-leases.js";
 import { withHostLeaseFileCustody } from "../topology/host-lease-lock.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
@@ -1017,18 +1017,19 @@ export class StoreBridgeSide implements BridgeSide {
 
   relayOrigin(id: string): string | undefined {
     const host = this.#relayProjection(id);
-    return host && hostLeaseExpiry(readHostLeases(this.store.root), host) > this.now() ? host.remoteHost : undefined;
+    return host && hostLeaseExpiry(readHostLeasesFor(this.store.root, [host.id]), host) > this.now() ? host.remoteHost : undefined;
   }
 
   relayStaleOrigin(id: string): string | undefined {
     const host = this.#relayProjection(id);
-    return host && hostLeaseExpiry(readHostLeases(this.store.root), host) <= this.now() ? host.remoteHost : undefined;
+    return host && hostLeaseExpiry(readHostLeasesFor(this.store.root, [host.id]), host) <= this.now() ? host.remoteHost : undefined;
   }
 
   async relayPresence(): Promise<Pick<BridgePresence, "hosts" | "participants">> {
     const hosts: BridgeHost[] = [];
-    const leases = readHostLeases(this.store.root);
-    for (const entry of this.store.listAll(HOST_PREFIX, { fresh: true })) {
+    const hostEntries = this.store.listAll(HOST_PREFIX, { fresh: true });
+    const leases = this.#presenceLeases(hostEntries, []);
+    for (const entry of hostEntries) {
       const host = hostOf(entry.key, entry.value);
       if (!host || host.remoteHost === undefined || host.remoteHost === this.peer || host.bridgeVia !== undefined ||
           !CANONICAL_ID.test(host.id) || host.rootId !== host.id || host.identity.id !== host.id ||
@@ -1074,11 +1075,13 @@ export class StoreBridgeSide implements BridgeSide {
       return digest;
     };
     const snapshot = () => {
-      const leases = readHostLeases(this.store.root);
       const hostEntries = fileState ? this.store.listAllShared(HOST_PREFIX, { fresh: true })
         : this.store.listAll(HOST_PREFIX, { fresh: true });
       const participantEntries = fileState ? this.store.listAllShared(PARTICIPANT_PREFIX, { fresh: true })
         : this.store.listAll(PARTICIPANT_PREFIX, { fresh: true });
+      const handoffEntries = fileState ? this.store.listAllShared(BRIDGE_HANDOFF_PREFIX, { fresh: true })
+        : this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true });
+      const leases = this.#presenceLeases(hostEntries, handoffEntries);
       // Include held projection existence/content, so an external prune/lease removal repairs
       // without waiting for traffic. Exclude our renewal fields: our own mirror writes then
       // cause at most one settling pass, never a self-sustaining lease-write feedback loop.
@@ -1094,9 +1097,7 @@ export class StoreBridgeSide implements BridgeSide {
               startedAt: lease.startedAt, incarnationToken: lease.incarnationToken } : null } : {}) };
         }).sort((a, b) => a.key.localeCompare(b.key));
       const native = this.#presence(hostEntries,
-        [...participantEntries, ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })],
-        fileState ? this.store.listAllShared(BRIDGE_HANDOFF_PREFIX, { fresh: true })
-          : this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true }), leases);
+        [...participantEntries, ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })], handoffEntries, leases);
       // Other links' mirror additions/removals must wake the hub's exporting links.
       const relays = [...hostEntries, ...participantEntries]
         .filter(entry => remoteHostOf(entry.value) !== undefined && mirrorLinkOf(entry.value) !== this.peer)
@@ -1188,11 +1189,23 @@ export class StoreBridgeSide implements BridgeSide {
     };
   }
 
+  /** Liveness consults only each host's own file, including non-root and held projections.
+   * Handoffs are global authority: an orphan lease's root/identity alias can void one. */
+  #presenceLeases(hostEntries: readonly MeshStateEntry[], handoffEntries: readonly MeshStateEntry[]): ReadonlyMap<string, FabricHostLease> {
+    if (handoffEntries.length > 0) return readHostLeases(this.store.root);
+    return readHostLeasesFor(this.store.root, hostEntries.flatMap(entry => {
+      const host = presenceHostOf(entry.key, entry.value);
+      return host ? [host.id] : [];
+    }));
+  }
+
   #presence(
     hostEntries: readonly MeshStateEntry[], participantEntries: readonly MeshStateEntry[], handoffEntries: readonly MeshStateEntry[],
     leases?: ReadonlyMap<string, FabricHostLease>,
   ): BridgePresence {
-    return this.#scan(hostEntries, participantEntries, handoffEntries, leases).presence;
+    // #scan's default stays complete: mirror collision/history consumers use its lease map.
+    return this.#scan(hostEntries, participantEntries, handoffEntries,
+      leases ?? this.#presenceLeases(hostEntries, handoffEntries)).presence;
   }
 
   #scan(
@@ -1675,9 +1688,10 @@ export class StoreBridgeSide implements BridgeSide {
 
   async owned(): Promise<Pick<BridgePresence, "hosts" | "participants">> {
     const now = this.now();
-    const leases = readHostLeases(this.store.root);
+    const hostEntries = this.store.listAll(HOST_PREFIX, { fresh: true });
+    const leases = this.#presenceLeases(hostEntries, []);
     const hosts: BridgeHost[] = [];
-    for (const entry of this.store.listAll(HOST_PREFIX, { fresh: true })) {
+    for (const entry of hostEntries) {
       if (mirrorLinkOf(entry.value) !== this.peer) continue;
       const host = hostOf(entry.key, entry.value);
       if (!host || entry.updatedBy.id !== host.identity.id) continue;

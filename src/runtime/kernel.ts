@@ -19,6 +19,8 @@ export interface FabricResidentOutcomeReceipt {
   readonly entityKind: "agent" | "actor";
   readonly id?: string;
   readonly ownerHostId?: string;
+  /** Native cleanup refusal; original stays owned in place, never cleaned. */
+  readonly cleanupStatus?: import("../agents/worktree-manager.js").CleanupCustodyDeferredStatus;
 }
 
 export interface FabricSandboxResult {

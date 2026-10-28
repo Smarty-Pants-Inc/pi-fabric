@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { FabricControlPlane, type FabricControlResult } from "../src/topology/control-plane.js";
 import type { ParticipantRoute, ParticipantView } from "../src/topology/participant-view.js";
@@ -113,6 +113,7 @@ class Endpoint implements FabricTransport {
   readonly acknowledgements = new Queue<Publication>();
   readonly refusedAcknowledgement = deferred<void>();
   refuseAcknowledgements = false;
+  holdCommands = false;
   publishedAckCount = 0;
   #closed = new AbortController();
   constructor(readonly carrier: Carrier, readonly self: TransportOwner) {}
@@ -137,7 +138,7 @@ class Endpoint implements FabricTransport {
       sourceMachine: this.self.machine, sequence, destination };
     if (envelope.kind === "command") {
       this.commands.push(publication);
-      void this.carrier.deliver(publication);
+      if (!this.holdCommands) void this.carrier.deliver(publication);
     } else {
       this.publishedAckCount++;
       this.acknowledgements.push(publication); // PubAck succeeds; delivery is held separately.
@@ -244,7 +245,10 @@ class Fixture {
   }
 }
 
-afterEach(async () => { for (const fixture of fixtures.splice(0)) await fixture.dispose(); });
+afterEach(async () => {
+  for (const fixture of fixtures.splice(0)) await fixture.dispose();
+  vi.restoreAllMocks(); vi.useRealTimers();
+});
 
 async function delivered(carrier: Carrier, ack: Publication, endpoint?: Endpoint) {
   expect(await carrier.deliver(ack, endpoint)).toBe("ack");
@@ -265,6 +269,116 @@ function expectSameLogicalRequest(first: Publication, retry: Publication) {
   expect(retry.envelope.body.ownerIncarnation).toBe(CURRENT);
   expect(retry.envelope.from).toEqual(first.envelope.from);
 }
+
+// Keep reason: cross-machine late confirmations must preserve proof-only resend and ACK authenticity.
+describe("late cross-machine NATS message confirmation", () => {
+  it.each([false, true])("late notRun permits only one resend (second expires=%s)", async secondExpires => {
+    const f = new Fixture(), owner = f.owner(OLD), caller = f.caller();
+    caller.transport.holdCommands = true;
+    const resume = deferred<void>(), claimed = deferred<void>();
+    const ownRoot = path.join(f.root, "control-seen", createHash("sha256").update(OWNER_HOST).digest("hex").slice(0, 32));
+    const writeBatch = MeshStore.prototype.writeBatch;
+    let held = false;
+    vi.spyOn(MeshStore.prototype, "writeBatch").mockImplementation(async function (this: MeshStore, input) {
+      const result = await writeBatch.call(this, input);
+      if (!held && this.root === ownRoot && input.ops.some(op => op.kind === "put" && op.ifVersion === 0)) {
+        held = true; claimed.resolve(); await resume.promise;
+      }
+      return result;
+    });
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const start = Date.now(), request = f.send(caller);
+    try {
+      const first = await caller.transport.commands.required();
+      expect(Number(first.envelope.body.deadlineAt) - Number(first.envelope.body.requestedAt)).toBe(30_000);
+      await vi.advanceTimersByTimeAsync(29_700);
+      const firstDelivery = f.carrier.deliver(first);
+      await claimed.promise;
+      await vi.advanceTimersByTimeAsync(301);
+      resume.resolve();
+      expect(await firstDelivery).toBe("ack");
+      const expired = await owner.transport.acknowledgements.required();
+      expect(expired.envelope.body).toMatchObject({ accepted: false, notRun: true, error: "Fabric control command expired" });
+      expect(f.executions).toBe(0);
+      await vi.advanceTimersByTimeAsync(start + 45_000 - Date.now());
+      expect(request.result.state).toBe("pending");
+      await vi.advanceTimersByTimeAsync(1_000);
+      const envelope = expired.envelope;
+      for (const forged of [
+        { ...expired, sourceMachine: "unrelated" },
+        { ...expired, envelope: { ...envelope, from: identity("session:unrelated") } },
+        ...[{ ownerIncarnation: "unrelated" }, { targetId: "session:unrelated" }, { bodyDigest: "unrelated" }].map(body =>
+          ({ ...expired, envelope: { ...envelope, body: { ...envelope.body, ...body } } })),
+      ]) {
+        await delivered(f.carrier, forged);
+        expect(request.result.state).toBe("pending");
+      }
+      await delivered(f.carrier, expired);
+      await vi.advanceTimersByTimeAsync(50);
+      const second = await caller.transport.commands.required();
+      expect(second.envelope.body).toMatchObject({ requestCreatedAt: first.envelope.body.requestCreatedAt,
+        ownerIncarnation: OLD, message: first.envelope.body.message });
+      expect(second.envelope.to).toEqual(first.envelope.to);
+      expect(second.envelope.body.commandId).not.toBe(first.envelope.body.commandId);
+      expect(Number(second.envelope.body.deadlineAt) - Number(second.envelope.body.requestedAt)).toBe(29_950);
+      if (secondExpires) await vi.advanceTimersByTimeAsync(30_001);
+      expect(await f.carrier.deliver(second)).toBe("ack");
+      const result = await owner.transport.acknowledgements.required();
+      if (secondExpires) await vi.advanceTimersByTimeAsync(Number(second.envelope.body.requestedAt) + 46_000 - Date.now());
+      await delivered(f.carrier, result); await request.settled;
+      if (secondExpires) expect(request.result).toMatchObject({ state: "rejected", error: { notRun: true } });
+      else expectAccepted(request);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(caller.transport.commands.values).toHaveLength(0);
+      expect(f.executions).toBe(secondExpires ? 0 : 1);
+    } finally { resume.resolve(); await nextTurn(); }
+  });
+
+  it.each([true, false])("late executed outcome (accepted=%s) stays unknown without retry", async accepted => {
+    const f = new Fixture(), owner = f.owner(OLD), caller = f.caller();
+    owner.plane.start(() => {
+      f.executions++;
+      return accepted ? { accepted: true, messageId: MESSAGE_ID } : { accepted: false, error: "executed rejection" };
+    });
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const request = f.send(caller), first = await caller.transport.commands.required();
+    const ack = await owner.transport.acknowledgements.required();
+    expect(ack.envelope.body).not.toHaveProperty("notRun");
+    await vi.advanceTimersByTimeAsync(45_000); expect(request.result.state).toBe("pending");
+    await vi.advanceTimersByTimeAsync(1_000); await delivered(f.carrier, ack); await request.settled;
+    expect(request.result).toMatchObject({ state: "rejected", error: { message: expect.stringContaining("the outcome is unknown") } });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(caller.transport.commands.values.filter(item => item.envelope.operation === first.envelope.operation)).toHaveLength(0);
+    expect(f.executions).toBe(1);
+  });
+
+  it.each(["same-machine", "stop", "ask", "result-message"] as const)("does not extend the ordinary NATS bound for %s", async mode => {
+    const f = new Fixture(); f.owner(OLD, mode === "same-machine" ? "e24-caller" : "e24-owner");
+    const caller = f.caller();
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const request = mode === "ask" || mode === "result-message"
+      ? observe(caller.plane.requestResult(OWNER_HOST, TARGET, mode === "ask" ? "ask" : "followUp", {}, OWNER_ID, { timeoutMs: 30_000 }))
+      : mode === "stop" ? observe(caller.plane.request(OWNER_HOST, TARGET, "stop", {}, OWNER_ID)) : f.send(caller);
+    await caller.transport.commands.required();
+    await vi.advanceTimersByTimeAsync(44_999); expect(request.result.state).toBe("pending");
+    await vi.advanceTimersByTimeAsync(1); await request.settled;
+    expect(request.result).toMatchObject({ state: "rejected", error: { message: expect.stringContaining("the outcome is unknown") } });
+  });
+
+  it("no ACK is bounded unknown without resend", async () => {
+    const f = new Fixture(); f.owner(OLD); const caller = f.caller();
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const request = f.send(caller), first = await caller.transport.commands.required();
+    await vi.advanceTimersByTimeAsync(45_000); expect(request.result.state).toBe("pending");
+    await vi.advanceTimersByTimeAsync(4_999); expect(request.result.state).toBe("pending");
+    await vi.advanceTimersByTimeAsync(1); await request.settled;
+    expect(request.result).toMatchObject({ state: "rejected", error: { message: expect.stringContaining("the outcome is unknown") } });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(caller.transport.commands.values.filter(item => item.envelope.operation === first.envelope.operation)).toHaveLength(0);
+    expect(f.executions).toBe(1);
+  });
+});
 
 describe("E24 NATS retained outcome replay across owner restart (Decision C)", () => {
   it("binds a caller key to semantic input while retaining identical-retry dedupe", async () => {

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { MeshLockTimeoutError } from "../core/atomic-write.js";
+import { formatLockOwner, readLockIdentitySync, warnLegacyLockOwner } from "../core/lock-identity.js";
 import { acquireMeshCustodyLock, MESH_CUSTODY_LOCK_NAME } from "./custody-lock.js";
 import { MeshLock } from "./mesh-lock.js";
 import { deferSqliteHoldWrites } from "./sqlite-holds.js";
@@ -208,7 +209,8 @@ export const holdMeshFenceSync = <T>(root: string, timeoutMs: number, operation:
   const deadline = Date.now() + Math.max(0, timeoutMs);
   const acquire = (lock: string, attempt: (token: string, record: string) => boolean): (() => void) => {
     const token = randomUUID();
-    const record = `${token}\n${process.pid}\n${Date.now()}\n`;
+    const identity = readLockIdentitySync();
+    const record = formatLockOwner(token, Date.now(), identity);
     let attempts = 0;
     let maxGapMs = 0;
     let last = Date.now();
@@ -219,7 +221,10 @@ export const holdMeshFenceSync = <T>(root: string, timeoutMs: number, operation:
       last = now;
       if (attempt(token, record)) {
         const pin = pinFenceLock(lock, record);
-        if (pin !== FOREIGN_LOCK) return () => releaseFenceLock(lock, record, {}, pin);
+        if (pin !== FOREIGN_LOCK) {
+          if (!identity.start || !identity.bootId || !identity.namespace) warnLegacyLockOwner(lock, record);
+          return () => releaseFenceLock(lock, record, {}, pin);
+        }
       }
       if (Date.now() >= deadline) {
         let pid = NaN;

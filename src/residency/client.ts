@@ -24,7 +24,7 @@ import { BUILT_IN_RUNNER_IDS, requireAgentRunner, requireActorRunner } from "../
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
 import { executeFile, spawnDetached, resolveScriptRuntime } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
-import { processStartTime, residentProcessAlive } from "./process-identity.js";
+import { prepareResidentOwnerIdentity, processStartTime, residentHostOwnerAlive, residentProcessAlive } from "./process-identity.js";
 import {
   RESIDENT_HANDOVER_ABI, residentLaunchSpec, handoverActive, handoverPath, handoverOutcomePath,
   mainGenerationPath, readHandoverJson, type ResidentMainGeneration, type ResidentHandoverState,
@@ -391,6 +391,8 @@ export class ResidencyClient {
   async #startHost(): Promise<ResidentHostOwner> {
     if (this.#closed) throw new Error("Fabric residency client is closed");
     await this.#stopStartingLauncher();
+    await prepareResidentOwnerIdentity();
+    if (this.#closed) throw new Error("Fabric residency client is closed");
     this.#refreshPiModels();
     atomicWrite(this.#configPath, this.options.config);
     const existing = this.#readyOwner();
@@ -491,6 +493,9 @@ export class ResidencyClient {
   /** Host-only Main lifecycle hook; not a guest-selected release path. */
   async reconcileRelease(): Promise<void> {
     if (this.#closed || !this.options.mainAgent.local || this.options.mainAgent.id !== this.options.config.rootId) return;
+    const observed = readJson<ResidentHostOwner>(this.#ownerPath);
+    if (observed?.bootId || observed?.pidNamespace) await prepareResidentOwnerIdentity();
+    if (this.#closed) return;
     const owner = this.#liveOwner();
     const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
     // A new runtime must invalidate the old nonce even after A exited or while
@@ -1177,7 +1182,7 @@ export class ResidencyClient {
       owner?.format !== RESIDENT_HOST_FORMAT ||
       owner.hostId !== this.hostId ||
       !Number.isSafeInteger(owner.pid) ||
-      !residentProcessAlive(owner.pid, owner.processStartTime)
+      !residentHostOwnerAlive(owner, this.#ownerPath)
     ) {
       return undefined;
     }
@@ -1250,6 +1255,9 @@ export class ResidencyClient {
   async #watchdog(): Promise<void> {
     this.#watchdogDeadline = undefined;
     if (this.#closed || this.#startingHost || !kernelFenceAvailable()) return;
+    const observed = readJson<ResidentHostOwner>(this.#ownerPath);
+    if (observed?.bootId || observed?.pidNamespace) await prepareResidentOwnerIdentity();
+    if (this.#closed || this.#startingHost) return;
     const live = this.#liveOwner();
     if (live) {
       this.#watchdogDeadline = this.#ownerDeadline(live);

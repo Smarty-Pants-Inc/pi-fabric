@@ -11,6 +11,8 @@ import {
 } from "../core/atomic-write.js";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock, type FenceLockRelease } from "./fence-lock.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
+import { completeLockIdentity, formatLockOwner, isIdentityLockOwner, legacyLockOwnerFields, lockIdentityVerdict, parseIdentityLockOwner, readLockIdentity,
+  retainIdentityStaleLock, warnLegacyLockOwner } from "../core/lock-identity.js";
 
 // The mesh `.lock` domain (smarty-dev#6477 L0): acquisition (withLock, withTryLock), lock tickets,
 // timeouts, the L8 timing hook and recovery of stale owners. State (state-file.ts) and events
@@ -280,7 +282,6 @@ export class MeshLock {
   readonly #ownIncarnation: Promise<string | undefined> | undefined;
   #ownIncarnationReady = false;
   #ownStartTime: string | undefined;
-  #ownNamespace: string | undefined;
   readonly #tryLockScope = new AsyncLocalStorage<{ active: boolean; timeoutMs: number }>();
   readonly #lockTimeoutMs: number;
   readonly #writeAbortSignal: AbortSignal | undefined;
@@ -297,14 +298,13 @@ export class MeshLock {
     // Prepare this immutable process identity once, at store construction rather
     // than inside a registry-fenced acquisition. A cold bounded try fails closed
     // until preparation finishes; the ordinary outside-custody recovery lane can
-    // wait for it. UNKNOWN still publishes the conservative three-line receipt.
+    // wait for it. UNKNOWN remains explicit in the restart-aware receipt and keeps legacy degraded recovery.
     // Protocol 3 also prepares this process's PID namespace (smarty-dev#9569).
     if (lockProtocol >= 2) {
       // The namespace reader is a lazy module (startup graph budget): loaded only by a protocol-3 store.
       const namespace = lockProtocol === 3 ? import("../core/pid-namespace.js").then(module => module.ownPidNamespace()) : undefined;
-      this.#ownIncarnation = Promise.all([ownProcessIncarnation(), namespace]).then(([start, ns]) => {
+      this.#ownIncarnation = Promise.all([ownProcessIncarnation(), namespace]).then(([start]) => {
         this.#ownStartTime = start;
-        this.#ownNamespace = ns;
         this.#ownIncarnationReady = true;
         return start;
       }, () => { this.#ownIncarnationReady = true; return undefined; });
@@ -384,12 +384,13 @@ export class MeshLock {
       : undefined;
     const waitMs = Math.min(this.#lockTimeoutMs, Math.max(0, budget));
     const token = randomUUID();
-    // Protocol 3 (smarty-dev#9569): the start line is always present (empty: unknown) and the PID namespace follows
-    // on its own line (empty: unknown, which no reclaimer may treat as its own). Six fields: a reader from before
-    // protocol 3 accepts only 4 or 5, so it can never reclaim this record.
-    const ownerRecord = this.#lockProtocol === 3
-      ? `${token}\n${process.pid}\n${Date.now()}\n${startTime ?? ""}\n${this.#ownNamespace ?? ""}\n`
-      : `${token}\n${process.pid}\n${Date.now()}\n${startTime ? `${startTime}\n` : ""}`;
+    // Every protocol writes restart identity. Optional namespace readers load at first acquisition, not import.
+    // Unknown evidence stays explicit in the new wire format; it must never fall back to a local-PID-only record.
+    const identity = await readLockIdentity({ ...(this.#lockProtocol >= 2 ? { start: startTime } : {}),
+      // Protocol 3 already prepared its namespace, even when UNKNOWN. Do not restart that read after failure.
+      // Protocol 1's first Linux try may read procfs (no native command); other bounded callers only use known data.
+      prepared: this.#lockProtocol === 3 || (process.platform !== "linux" && Boolean(bounded || scope?.active || lockTimeoutMs < this.#lockTimeoutMs)) });
+    const ownerRecord = formatLockOwner(token, Date.now(), identity);
     const blocked: StaleLockNote = {};
     // smarty-dev#8777: release through the directory this holder pinned at acquisition (the publication
     // fence's fd-pinned release). A check-then-rename by name let a holder that stalled past staleMs, and was
@@ -533,8 +534,8 @@ export class MeshLock {
         lastAttemptAt = attemptAt;
         try {
           if (this.#lockProtocol === 1) {
-            // Keep the B68 three-line wire, but never overwrite an owner published by a
-            // successor while this initializer was stopped after canonical mkdir.
+            // Keep protocol 1's initializer fencing, but write the complete restart-aware owner too.
+            // Never overwrite a successor published while this initializer was stopped after canonical mkdir.
             fs.mkdirSync(this.#lockPath, { mode: 0o700 });
             acquiredCanonical();
             const ownershipLost = () => Object.assign(new Error("Fabric mesh lock ownership lost during acquisition"), {
@@ -674,8 +675,9 @@ export class MeshLock {
   }
 
   // A dead/other-incarnation complete receipt recovers at once, an empty ownerless directory after the grace (atomic
-  // rmdir: a late owner fails it closed); torn receipts and nonempty unrecorded directories stay. smarty-dev#9569: pid
-  // evidence only for OUR PID namespace (foreign/unprovable: `note`). smarty-dev#9501: `expected` = exact owner bytes
+  // rmdir: a late owner fails it closed); torn receipts and nonempty unrecorded directories stay. OLD namespace
+  // receipts keep smarty-dev#9569 policy; complete new owners follow the explicit boot/namespace restart policy.
+  // smarty-dev#9501: `expected` = exact owner bytes
   // after the read; its namespace must come from the owner, never a mutable receipt.
   // `beforeRename` is synchronous, restartable retirement of that exact owner's dependent receipt, not another death
   // proof. It runs only AFTER the sole death/namespace/root proof and BEFORE detaching the canonical owner. A throw
@@ -713,7 +715,26 @@ export class MeshLock {
         catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
         return true;
       }
-      const fields = owner.split("\n");
+      // Complete new owners follow the explicit restart policy even on PV/overlay. Unavailable identity keeps
+      // this protocol's legacy degraded behavior (and warning); malformed/torn new owners never downgrade.
+      let fields = owner.split("\n");
+      let restartOwner: Awaited<ReturnType<typeof parseIdentityLockOwner>> = undefined;
+      if (isIdentityLockOwner(owner)) {
+        const parsed = restartOwner = await parseIdentityLockOwner(owner);
+        if (!parsed) { note.verdict = "unproven"; note.namespace = ""; note.token = fields[0] ?? ""; return false; }
+        if (await completeLockIdentity(parsed.identity)) {
+          if (expected && parsed.identity.namespace !== expected.namespace) {
+            note.verdict = "unproven"; note.namespace = parsed.identity.namespace ?? ""; note.token = parsed.token; return false;
+          }
+          const verdict = await lockIdentityVerdict(parsed.identity, deadline, Boolean(this.#tryLockScope.getStore()?.active));
+          if (verdict === "live") return false;
+          if (verdict === "unknown") {
+            note.verdict = "unproven"; note.namespace = parsed.identity.namespace ?? ""; note.token = parsed.token; return false;
+          }
+          return retainIdentityStaleLock(this.#lockPath, stat, owner, parsed.createdAt, verdict, parsed.identity, expected?.beforeRename);
+        }
+        fields = legacyLockOwnerFields(owner, this.#lockProtocol);
+      }
       const [token, pidText, createdText, startText] = fields;
       // An in-flight/torn fourth line is not evidence of PID reuse. Protocol 3's start line may be empty (unknown).
       const recordedStart = owner?.endsWith("\n") && startText ? startText : undefined;
@@ -723,6 +744,7 @@ export class MeshLock {
         !!token && validPid && createdText !== undefined &&
         createdText.trim() !== "" && Number.isFinite(Number(createdText));
       if (!validOwner) return false;
+      warnLegacyLockOwner(this.#lockPath, owner);
       const recordNamespace = fields.length === 6 ? fields[4]! : null;
       // pi-fabric#923: under protocol 3 a record without a namespace (v1/v2 holder) is UNPROVEN (its pid may be alive in
       // another namespace); no previous-boot inference (VM clones share a machine id): operator recovery only.
@@ -741,6 +763,7 @@ export class MeshLock {
         pin = result.pin;
         if (result.verdict !== "pid") { note.verdict = result.verdict; note.namespace = ns; note.token = token!; return false; }
       }
+      let recoveryReason: "dead-pid" | "reused-pid" = "dead-pid";
       if (processAlive(pid)) {
         if (!validProcessIncarnation(recordedStart)) return false;
         // Registry-fenced publication cannot start even a bounded native read.
@@ -761,6 +784,7 @@ export class MeshLock {
           ]);
         } finally { clearTimeout(timer); }
         if (Date.now() >= deadline || !actualStart || actualStart === recordedStart) return false;
+        recoveryReason = "reused-pid";
       }
       const unchanged = (): boolean => {
         const current = fs.lstatSync(this.#lockPath);
@@ -776,6 +800,12 @@ export class MeshLock {
         if (!unchanged()) return false;
         if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = ns ?? ""; note.token = token!; return false; }
       }
+      // Incomplete NEW owners keep the legacy death decision, but MUST share the new dated destination with
+      // operator recovery. Different destinations for the same owner/inode would reopen the paused-cleaner ABA race.
+      if (restartOwner) return retainIdentityStaleLock(this.#lockPath, stat, owner, restartOwner.createdAt,
+        recoveryReason, restartOwner.identity, () => {
+          if (pin && !pin.unchanged()) throw new Error("Fabric mesh lock root changed before recovery");
+        });
       const fence = `${this.#lockPath}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
       // ponytail: retain this tiny nonempty directory permanently. A paused old cleaner
       // cannot rename a successor over the same fence (native EEXIST/ENOTEMPTY). Deleting

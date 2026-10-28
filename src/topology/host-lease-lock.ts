@@ -5,6 +5,8 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { isMeshLockTimeout, MeshLockTimeoutError, renameAtomic, readPhysicalHostIdentity, validBootId,
   type PhysicalHostIdentity } from "../core/atomic-write.js";
+import { completeLockIdentity, lockIdentityVerdict, readLockIdentity, readLockIdentitySync, retainIdentityStaleLock, warnLegacyLockOwner,
+  type LockIdentity } from "../core/lock-identity.js";
 
 export interface HostLeaseMesh {
   readonly root: string;
@@ -64,6 +66,9 @@ interface LockOwner {
   token: string;
   host: string;
   pid: number;
+  start?: string | undefined;
+  bootId?: string | undefined;
+  namespace?: string | undefined;
   incarnationToken?: string;
   expiresAt?: number;
   physical?: PhysicalHostIdentity;
@@ -127,15 +132,22 @@ export const withHostLeaseLock = async <T>(mesh: HostLeaseMesh, file: string,
   const lock = path.join(directory, path.basename(file, ".json"));
   const host = os.hostname();
   const physical = readPhysicalHostIdentity();
-  const owner = JSON.stringify({ token: randomUUID(), host, pid: process.pid, ...(physical ? { physical } : {}), ...options.lease } satisfies LockOwner);
   const budget = options.timeoutMs ?? 0;
+  const prepared = Object.hasOwn(options, "ownIncarnation");
+  // A cold Linux zero-budget publisher can read its own procfs identity synchronously; it must not
+  // accidentally mark an ABSENT caller birth as explicitly prepared UNKNOWN. Other platforms never
+  // start native commands on a zero-budget publication, while an ordinary wait can prepare them.
+  const identity = !prepared && process.platform === "linux" ? readLockIdentitySync() : await readLockIdentity({
+    ...(prepared ? { start: options.ownIncarnation } : {}),
+    prepared: prepared || !Number.isFinite(budget) || budget <= 0 });
+  const owner = JSON.stringify({ token: randomUUID(), host, ...identity, ...(physical ? { physical } : {}), ...options.lease } satisfies LockOwner);
   const deadline = performance.now() + (Number.isFinite(budget) ? Math.max(0, budget) : 0);
   for (;;) {
     options.signal?.throwIfAborted();
-    let acquired = false, enteredCustody = false, seen: string | undefined;
+    let acquired = false, enteredCustody = false, seenComplete = false, seen: string | undefined;
     let value!: T;
     try {
-      await withHostLeaseFileCustody(mesh, file, () => {
+      await withHostLeaseFileCustody(mesh, file, async () => {
         enteredCustody = true;
         options.signal?.throwIfAborted();
         const staging = fs.mkdtempSync(`${lock}.pending-`);
@@ -150,10 +162,26 @@ export const withHostLeaseLock = async <T>(mesh: HostLeaseMesh, file: string,
         }
         if (!acquired) {
           seen = ownerOf(lock);
-          if (performance.now() < deadline && recoverable(seen, physical) && ownerOf(lock) === seen) {
-            const aside = `${lock}.dead-${randomUUID()}`;
-            renameAtomic(lock, aside);
-            fs.rmSync(aside, { recursive: true, force: true });
+          const incumbent = receipt(seen);
+          const identity: LockIdentity | undefined = incumbent ? { pid: incumbent.pid,
+            start: typeof incumbent.start === "string" ? incumbent.start : undefined,
+            bootId: typeof incumbent.bootId === "string" ? incumbent.bootId : undefined,
+            namespace: typeof incumbent.namespace === "string" ? incumbent.namespace : undefined } : undefined;
+          seenComplete = identity !== undefined && await completeLockIdentity(identity);
+          if (seen !== undefined && !seenComplete) warnLegacyLockOwner(lock, seen);
+          if (seen === undefined || !identity || performance.now() >= deadline) return;
+          const stat = fs.lstatSync(lock);
+          if (!stat.isDirectory()) return;
+          // Keep custody across the asynchronous identity read and the retained rename. Complete receipts
+          // NEVER fall back to lease expiry; incomplete/legacy receipts keep their existing locality rules.
+          const reason = seenComplete
+            ? await lockIdentityVerdict(identity, Date.now() + Math.max(0, deadline - performance.now()))
+            : recoverable(seen, physical) ? "unknown" : undefined;
+          options.signal?.throwIfAborted();
+          if (reason !== undefined && reason !== "live" && !(seenComplete && reason === "unknown") && performance.now() < deadline) {
+            // JSON owners have no creation timestamp; the pinned directory mtime supplies a stable date.
+            retainIdentityStaleLock(lock, stat, seen, Math.max(0, Math.trunc(stat.mtimeMs)), reason, identity,
+              () => options.signal?.throwIfAborted());
           }
           return;
         }
@@ -185,7 +213,7 @@ export const withHostLeaseLock = async <T>(mesh: HostLeaseMesh, file: string,
     if (enteredCustody) {
       if (ownerOf(lock) !== seen) continue; // Our recovery (or a release) needs no wait.
       const incumbent = receipt(seen);
-      const untilExpiry = (!physical || incumbent?.physical?.machineId !== physical.machineId ||
+      const untilExpiry = !seenComplete && (!physical || incumbent?.physical?.machineId !== physical.machineId ||
         !validBootId(incumbent?.physical?.bootId)) && incumbent?.incarnationToken !== undefined && incumbent.expiresAt !== undefined
         ? incumbent.expiresAt - Date.now() : remaining;
       if (untilExpiry <= 0) throw new HostLeaseLockBusyError(lock);

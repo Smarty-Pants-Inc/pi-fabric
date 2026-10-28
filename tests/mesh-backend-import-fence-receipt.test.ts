@@ -107,7 +107,8 @@ const deadPid = (): Promise<number> => new Promise((resolve, reject) => {
 const lockOwner = (root: string, lock = ".lock"): string | undefined => {
   try { return fs.readFileSync(path.join(root, lock, "owner"), "utf8"); } catch { return undefined; }
 };
-const deadFences = (root: string): string[] => fs.readdirSync(root).filter(name => name.startsWith(".lock.dead."));
+const deadFences = (root: string): string[] => fs.readdirSync(root, { withFileTypes: true })
+  .filter(entry => entry.isDirectory() && entry.name.startsWith(".lock.dead.")).map(entry => entry.name);
 const queueNames = (root: string): string[] => { try { return fs.readdirSync(meshLockQueueDirectory(root)).sort(); } catch { return []; } };
 const MESH_TOKEN = "11111111-2222-4333-8444-555555555555";
 /** FIFO tickets as lock-queue.ts names them: the forged holder's own, and an unrelated waiter's. */
@@ -148,8 +149,12 @@ describe.skipIf(!linuxIdentity)("smarty-dev#9501 killed import fence receipt", (
     expect(killed.signal, killed.stderr).toBe("SIGKILL");
     // The killed import's own residue, and the receipt it wrote under the fence before beforeOpen.
     const mesh = lockOwner(root)!;
-    expect(mesh.split("\n")[1]).toBe(String(killed.pid));
-    expect(mesh.split("\n")[4]).toBe(await ownPidNamespace());
+    const namespace = await ownPidNamespace() ?? "";
+    expect(mesh.split("\n")).toEqual([
+      expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
+      String(killed.pid), expect.stringMatching(/^\d+$/), expect.any(String), "", namespace ? namespace.split(":")[2] : "",
+      namespace, "fabric-lock-owner-v1", "",
+    ]);
     expect(lockOwner(root, "custody.lock")!.split("\n")[1]).toBe(String(killed.pid));
     const receipt = JSON.parse(fs.readFileSync(path.join(root, IMPORT_FENCE_RECEIPT), "utf8")) as Record<string, unknown>;
     expect(receipt).toMatchObject({ format: 1, pid: killed.pid, mesh, custody: lockOwner(root, "custody.lock") });
@@ -170,6 +175,11 @@ describe.skipIf(!linuxIdentity)("smarty-dev#9501 killed import fence receipt", (
     expect((await meshBackendStatus(root)).backend).toBe("sqlite");
     // Recovery renamed the dead owner's directory into a retained receipt; the fence's own recovery took custody.lock.
     expect(deadFences(root)).toHaveLength(1);
+    const preserved = path.join(root, deadFences(root)[0]!);
+    expect(fs.readFileSync(path.join(preserved, "owner"), "utf8")).toBe(mesh);
+    expect(JSON.parse(fs.readFileSync(`${preserved}.recovery.json`, "utf8"))).toMatchObject({
+      kind: "stale-lock-observation", source: path.join(root, ".lock"), aside: preserved, owner: mesh,
+    });
     expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
     expect(fs.existsSync(path.join(root, "custody.lock"))).toBe(false);
   }, 60_000);

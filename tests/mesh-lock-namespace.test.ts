@@ -88,7 +88,7 @@ describe("PID namespace verdicts (smarty-dev#9569)", () => {
 });
 
 describe("the mesh .lock under protocol 3 (smarty-dev#9569)", () => {
-  it("writes a six-field record naming its namespace, which a reader from before protocol 3 never reclaims", async () => {
+  it("writes a nine-field identity owner naming its namespace, which a reader from before protocol 3 never reclaims", async () => {
     const own = ns();
     pidNamespaceTestHooks.set(own);
     const root = tempRoot();
@@ -96,9 +96,10 @@ describe("the mesh .lock under protocol 3 (smarty-dev#9569)", () => {
     await new MeshLock(root, { lockProtocol: 3, lockTimeoutMs: 1_000 }, () => undefined)
       .withLock(() => { record = fs.readFileSync(path.join(root, ".lock", "owner"), "utf8"); });
     const fields = record.split("\n");
-    expect(fields).toHaveLength(6);
-    expect(fields[1]).toBe(String(process.pid));
-    expect(fields[4]).toBe(own);
+    expect(fields).toEqual([
+      expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
+      String(process.pid), expect.stringMatching(/^\d+$/), expect.any(String), "", BOOT, own, "fabric-lock-owner-v1", "",
+    ]);
     // main's validOwner (mesh-lock.ts before protocol 3), verbatim: only 4 or 5 fields may be reclaimed.
     const oldValidOwner = (owner: string): boolean => {
       const old = owner.split("\n");
@@ -373,15 +374,18 @@ describe("custody.lock under protocol 3 (smarty-dev#9569): plain and host-qualif
     await expect(acquireMeshCustodyLock(plain, 300, { lockProtocol: 3, ownIncarnation: undefined })).rejects.toThrow(/FABRIC_MESH_LOCK_UNPROVEN_HOLDER/);
   });
 
-  it("writes the namespace line in both shapes (6 and 8 fields)", async () => {
+  it("writes the nine-field identity owner with namespace at field 6 for both shapes", async () => {
     const own = ns();
     pidNamespaceTestHooks.set(own);
     for (const hostQualified of [false, true]) {
       const root = tempRoot();
       const release = await acquireMeshCustodyLock(root, 1_000, { lockProtocol: 3, hostQualified, ownIncarnation: undefined });
       const fields = fs.readFileSync(path.join(root, MESH_CUSTODY_LOCK_NAME, "owner"), "utf8").split("\n");
-      expect(fields).toHaveLength(hostQualified ? 8 : 6);
-      expect(fields[hostQualified ? 6 : 4]).toBe(own);
+      const machine = hostQualified ? readPhysicalMachineId() ?? `host:${encodeURIComponent(os.hostname().trim().toLowerCase())}` : "";
+      expect(fields).toEqual([
+        expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
+        String(process.pid), expect.stringMatching(/^\d+$/), expect.any(String), machine, BOOT, own, "fabric-lock-owner-v1", "",
+      ]);
       release();
     }
   });

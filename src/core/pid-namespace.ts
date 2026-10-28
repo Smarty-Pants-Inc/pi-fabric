@@ -1,6 +1,6 @@
-// The PID namespace of this process, and the reclaim verdict that uses it (smarty-dev#9569). A lazy entry point: the
-// mesh and custody locks load it only when they write a protocol-3 record or check one, so the startup graph is
-// unchanged.
+// The PID namespace of this process, and the reclaim verdict that uses it (smarty-dev#9569). Native reads are lazy:
+// defining/importing this module does not probe the host. Synchronous and asynchronous restart-aware lock writers
+// share the same immutable first-use namespace cache.
 //
 // A lock holder's pid means something only inside its own PID namespace: a container or VM sharing a mesh root (Docker
 // Desktop, WSL2, another host on a shared folder) sees ESRCH, or an unrelated process, for a LIVE foreign holder. Lock
@@ -117,6 +117,8 @@ export const ownNamespaceForReclaim = async (deadline: number, tryScope: boolean
 export const pidNamespaceTestHooks = {
   set: (value: string | undefined): void => { namespaceOverride = { value }; },
   reset: (): void => { namespaceOverride = undefined; },
+  /** Simulate a fresh process's first native read without mixing module instances. */
+  resetReader: (): void => { namespaceOverride = undefined; namespaceReader = undefined; },
 };
 
 /**

@@ -10,7 +10,7 @@ import * as kube from "../src/seat-drain/kube.js";
 import { main, type BridgeDeps } from "../src/seat-bridge/seam.js";
 import { createSeat, SID, type Seat } from "./seat-drain-fixture.js";
 
-// The D3 bridge seam (smarty-dev#15310), synthetic only: a fake kubectl (no cluster), a fake systemctl, fake link
+// The D3 bridge seam (principal-seat move), synthetic only: a fake kubectl (no cluster), a fake systemctl, fake link
 // readers, a synthetic org (principal "Delta", seat = the fixture's session) and a synthetic nats-link config.
 const linux = process.platform === "linux" && typeof process.getuid === "function";
 const sha = (bytes: Buffer | string): string => createHash("sha256").update(bytes).digest("hex");

@@ -7,7 +7,7 @@ import { readBridgeNatsSeatPins } from "../src/mesh/bridge-nats-identity.js";
 import { applyPlan, planPublish, planRestore, readLinkConfig, rollbackAuthority, sameJson, SEAT_RECEIVE, SEAT_SEND, withConfigLock,
   type SeatEntry } from "../src/seat-bridge/allow-writer.js";
 
-// Synthetic org and link only (smarty-dev#15310): no real principal, machine or session.
+// Synthetic org and link only (principal-seat move): no real principal, machine or session.
 export const SEAT_SID = "00000000-0000-4000-8000-0000000000a1";
 export const OTHER_SID = "00000000-0000-4000-8000-0000000000b2";
 export const LEAD_SID = "00000000-0000-4000-8000-0000000000c3";

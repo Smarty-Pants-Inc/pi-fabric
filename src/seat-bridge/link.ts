@@ -8,7 +8,7 @@ import { natsLinkDryRun, natsLinkStatus, sessionReceipt } from "../mesh-bridge-n
 import { SeamGap } from "../seat-drain/run.js";
 
 /**
- * The bridge seam's reload and read-backs (smarty-dev#15310). The allow-list is read only when the link starts (it is
+ * The bridge seam's reload and read-backs (principal-seat move). The allow-list is read only when the link starts (it is
  * never widened at run time), so a reload is a restart of the link's own service-manager unit, pinned into the
  * installed seam. Every read here is the link's own read-only view: `nats-link status`, `receipt --session --nats`
  * and `roots`, as the link's machine.

@@ -1,6 +1,6 @@
 # D3 bridge seam (`fabric-seat-bridge`): design and operator notes
 
-This is fabric-v2's `bridge` seam for the D3 principal-seat move (smarty-dev#15310). It has three phases:
+This is fabric-v2's `bridge` seam for the D3 principal-seat move. It has three phases:
 `resume`, `publish` and `rc-restore-route`. A runs it the same way as the drain seam
 ([d3-drain-seam.md](d3-drain-seam.md)):
 

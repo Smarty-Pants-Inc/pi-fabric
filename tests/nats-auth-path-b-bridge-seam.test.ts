@@ -1,4 +1,4 @@
-// The D3 bridge seam (smarty-dev#15310) on the REAL path short of Kubernetes and systemd: a real authenticated
+// The D3 bridge seam (principal-seat move) on the REAL path short of Kubernetes and systemd: a real authenticated
 // nats-server (pinned in CI), the real A' link in-process (tests/helpers/nats-file-mixed.ts), real FILE and NATS
 // Mains, the link's real readers (status, receipt, roots) and its REAL identity gate (dry-run). Stand-ins, all
 // test-only deps the installed bundle cannot reach (seat-bridge-seam.test.ts asserts it):
@@ -6,7 +6,7 @@
 //   real NATS Main's own presence;
 // - the unit restart: the in-process link is restarted with the config the seam wrote; the lock holder is that
 //   restart's generation (the in-process link takes no CLI lock);
-// - the link's state directory: the test deletion guard (smarty-dev#11145) confines renames to the private TMPDIR,
+// - the link's state directory: the test deletion guard confines renames to the private TMPDIR,
 //   which the production rule refuses as temporary; the seam counts that ONE exact directory as durable, and the
 //   first test shows the rule still refuses it without that exemption.
 // Synthetic ids only; the seat's pins come from the harness's fixture org.json.

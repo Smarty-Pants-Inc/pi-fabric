@@ -1,7 +1,7 @@
 # D3 bridge seam: test-seat proof runbook
 
 Status: NOT RUN. fabric-v2 runs this on the synthetic test seat (`d3synth`) with the real nats-link (A') and the
-island Pods, after the seat image is built from this change (smarty-dev#15310). Nothing here touches a real
+island Pods, after the seat image is built from this change. Nothing here touches a real
 principal's seat. The design is in [d3-bridge-seam.md](d3-bridge-seam.md); the drain seam's runbook is
 [d3-drain-test-seat-proof.md](d3-drain-test-seat-proof.md), and this one reuses its §0 helpers (`j`, `k`, `hex`,
 `req`, `seam`).
@@ -219,7 +219,7 @@ runs. Record its result next to this run's `reload.waitedMs`.
 
 ## 7. Read-backs to record
 
-Post these on smarty-dev#15310 with the run id, the UTC time and the pass or FAIL of each step:
+Post these with the owning principal-seat move record, including the run id, the UTC time and the pass or FAIL of each step:
 - the bridge seam's path, sha256, mode and pins (0.1);
 - the link config sha before, after publish and after rollback;
 - the unit's state and restart count (§1, §3.1);

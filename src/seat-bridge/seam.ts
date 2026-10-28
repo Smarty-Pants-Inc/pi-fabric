@@ -15,7 +15,7 @@ import { applyPlan, planPublish, planRestore, readLinkConfig, rollbackAuthority,
 import { awaitRoutable, LINK_UNIT, natsRecords, otherRoutesBack, reloadLink, routeTable, type LinkDeps } from "./link.js";
 
 /**
- * fabric-v2's D3 `bridge` seam (smarty-dev#15310): phases `resume`, `publish` and `rc-restore-route`. A runs it as a
+ * fabric-v2's D3 `bridge` seam (principal-seat move): phases `resume`, `publish` and `rc-restore-route`. A runs it as a
  * pinned executable with the drain seam's envelope: `--run-dir RUN --phase P`, the request on stdin, the held seat
  * lock in D3_SEAT_LOCK_FD (the same three-step proof), ONE receipt on stdout with exit 0 and empty stderr. A lock or
  * binding failure prints no receipt and exits 2 with one `GAP: <code> [owner: fabric-v2]` line (UNKNOWN).

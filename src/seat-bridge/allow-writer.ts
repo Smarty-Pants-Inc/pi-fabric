@@ -7,7 +7,7 @@ import { createBridgeNatsIdentityGate, type BridgeNatsSeatPins } from "../mesh/b
 import { SeamGap, sha256 } from "../seat-drain/run.js";
 
 /**
- * The D3 bridge seam's A' config writer (smarty-dev#15310): it changes exactly ONE allow-list entry of the nats-link
+ * The D3 bridge seam's A' config writer (principal-seat move): it changes exactly ONE allow-list entry of the nats-link
  * config, the moving seat's root, and nothing else. It is never a free-form edit:
  * - the file is the one pinned into the installed seam (never a request or packet value);
  * - the path has no symlink in any component, and every ancestor is root's or ours and not group/other-writable;

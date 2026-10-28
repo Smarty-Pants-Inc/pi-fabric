@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -60,6 +61,30 @@ const receipts = (root: string): Move[] => {
   return [...observed].map(file => JSON.parse(fs.readFileSync(file, "utf8")) as Move)
     .filter(move => move.source.startsWith(root + path.sep) || namespaces.get(root)?.has(move.id));
 };
+// Independent QUERY bootstrap, not the product's DACL setter or policy helper.
+const aclProbeCommand = (container: string, inherited: NodeJS.ProcessEnv = process.env) => {
+  const systemRoot = Object.entries(inherited).find(([key]) => key.toLowerCase() === "systemroot")?.[1];
+  if (!systemRoot || !path.win32.isAbsolute(systemRoot)) throw new Error("Native ACL probe requires absolute SystemRoot");
+  const home = path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0");
+  const env = Object.fromEntries(Object.entries(inherited).filter(([key]) => !["psmodulepath", "fabric_acl_probe", "fabric_acl_module"].includes(key.toLowerCase())));
+  env.PSModulePath = path.win32.join(home, "Modules");
+  env.FABRIC_ACL_MODULE = path.win32.join(home, "Modules", "Microsoft.PowerShell.Security", "Microsoft.PowerShell.Security.psd1");
+  env.FABRIC_ACL_PROBE = container;
+  const script = "$ErrorActionPreference='Stop'; Import-Module -Name $env:FABRIC_ACL_MODULE -ErrorAction Stop; $a=Get-Acl -LiteralPath $env:FABRIC_ACL_PROBE; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; [pscustomobject]@{protected=$a.AreAccessRulesProtected;owner=([System.Security.Principal.NTAccount]$a.Owner).Translate([System.Security.Principal.SecurityIdentifier]).Value;current=$sid;rules=@($a.Access|%{[pscustomobject]@{sid=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value;allow=$_.AccessControlType.ToString();inherited=$_.IsInherited}})}|ConvertTo-Json -Depth 5 -Compress";
+  return { file: path.win32.join(home, "powershell.exe"), env,
+    args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")] };
+};
+const rawTree = (root: string) => {
+  const rows: Array<{ relative: string; dev: number; ino: number; kind: string; bytes?: Buffer }> = [];
+  const walk = (relative: string): void => {
+    const file = path.join(root, relative), stat = fs.lstatSync(file);
+    expect(stat.isSymbolicLink()).toBe(false); expect(stat.isDirectory() || stat.isFile()).toBe(true);
+    if (stat.isFile()) expect(stat.nlink).toBe(1);
+    rows.push({ relative, dev: stat.dev, ino: stat.ino, kind: stat.isDirectory() ? "directory" : "file", ...(stat.isFile() ? { bytes: fs.readFileSync(file) } : {}) });
+    if (stat.isDirectory()) for (const name of fs.readdirSync(file).sort()) walk(path.join(relative, name));
+  };
+  walk(""); return rows;
+};
 const held = (root: string, source: string, id: string): Move => {
   const receipt = receipts(root).find(row => row.source === source && row.state === "moved");
   expect(receipt, `missing custody for ${source}`).toBeDefined();
@@ -70,9 +95,8 @@ const held = (root: string, source: string, id: string): Move => {
   if (process.platform !== "win32") expect(fs.statSync(container).mode & 0o777).toBe(0o700);
   else {
     // Independent native ACL readback: Unix mode bits cannot establish Windows privacy.
-    const script = "$a=Get-Acl -LiteralPath $env:FABRIC_ACL_PROBE; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; [pscustomobject]@{protected=$a.AreAccessRulesProtected;owner=([System.Security.Principal.NTAccount]$a.Owner).Translate([System.Security.Principal.SecurityIdentifier]).Value;current=$sid;rules=@($a.Access|%{[pscustomobject]@{sid=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value;allow=$_.AccessControlType.ToString();inherited=$_.IsInherited}})}|ConvertTo-Json -Depth 5 -Compress";
-    const acl = JSON.parse(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
-      { encoding: "utf8", env: { ...process.env, FABRIC_ACL_PROBE: container } }));
+    const probe = aclProbeCommand(container);
+    const acl = JSON.parse(execFileSync(probe.file, probe.args, { encoding: "utf8", env: probe.env }));
     expect(acl.protected).toBe(true); expect(acl.owner).toBe(acl.current);
     expect(acl.rules.length).toBeGreaterThan(0);
     for (const rule of acl.rules) { expect([acl.current, "S-1-5-18", "S-1-5-32-544"]).toContain(rule.sid); expect(rule.allow).toBe("Allow"); expect(rule.inherited).toBe(false); }
@@ -121,7 +145,8 @@ const fixture = async (retainRuns = false) => {
   const host = new ResidentHost(config, () => {});
   await participants.start(); await host.start();
   const main = { id: rootId, local: false } as FabricMainAgentTarget;
-  const client = new ResidencyClient({ config, mesh, participants, mainAgent: main, commandTimeoutMs: 5_000 });
+  const consumed = vi.fn();
+  const client = new ResidencyClient({ config, mesh, participants, mainAgent: main, commandTimeoutMs: 5_000, onResultConsumed: consumed });
   const provider = new AgentsProvider(host.agents, host.actors as unknown as ActorManager,
     new GlobalActorRegistry(path.join(root, "global-actors"), 64 * 1024), main, participants, undefined, host.lifecycle, undefined, client, false);
   const context: FabricInvocationContext = { cwd: root, signal: undefined, extensionContext: {} as FabricInvocationContext["extensionContext"],
@@ -154,11 +179,24 @@ const fixture = async (retainRuns = false) => {
       const evidence = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
       if (evidence) {
         fs.mkdirSync(evidence, { recursive: true });
-        const exports: Array<{ source: string; destination: string }> = [];
+        const inventory = (base: string): Array<{ path: string; sha256: string }> => {
+          const rows: Array<{ path: string; sha256: string }> = [];
+          const walk = (relative: string): void => {
+            const file = path.join(base, relative), stat = fs.lstatSync(file);
+            if (stat.isSymbolicLink() || (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1))) throw new Error(`Unsafe live fixture export: ${file}`);
+            if (stat.isDirectory()) for (const name of fs.readdirSync(file).sort()) walk(path.join(relative, name));
+            else rows.push({ path: relative, sha256: createHash("sha256").update(fs.readFileSync(file)).digest("hex") });
+          };
+          walk(""); return rows;
+        };
+        const exports: Array<{ source: string; destination: string; entries: ReturnType<typeof inventory> }> = [];
         const exportRoot = (source: string, destination: string): void => {
+          const original = inventory(source);
           if (process.platform === "win32") fs.cpSync(source, destination, { recursive: true });
           else execFileSync("cp", ["-a", "--", source, destination]);
-          exports.push({ source, destination });
+          expect(inventory(source)).toEqual(original);
+          expect(inventory(destination)).toEqual(original);
+          exports.push({ source, destination, entries: original });
         };
         exportRoot(root, path.join(evidence, path.basename(root)));
         for (const temporary of temporaryDirectories) if (!temporary.startsWith(root + path.sep) && fs.existsSync(temporary)) {
@@ -167,37 +205,101 @@ const fixture = async (retainRuns = false) => {
         for (const receipt of receipts(root)) if (!receipt.destination.startsWith(root + path.sep) && fs.existsSync(receipt.destination)) {
           exportRoot(path.dirname(receipt.destination), path.join(evidence, `${path.basename(root)}-${path.basename(path.dirname(receipt.destination))}`));
         }
-        fs.writeFileSync(path.join(evidence, `${path.basename(root)}-export.json`), JSON.stringify({ exports, method: "pre-teardown staging copy; no inode claim" }));
+        fs.writeFileSync(path.join(evidence, `${path.basename(root)}-export.json`), JSON.stringify({ exports, method: "pre-teardown staging copy; SHA256 source stability and independent destination readback; no inode claim" }));
       }
     } finally { await client.close(); await host.close(); await participants.close(); vi.restoreAllMocks(); }
     console.log(`retained live cleanup fixture: ${root}`);
   };
-  return { root, config, host, client, provider, context, launch, dispose, noGitDelete, failSetup: () => { rejectSetup = true; } };
+  return { root, config, host, client, provider, context, launch, dispose, noGitDelete, consumed, failSetup: () => { rejectSetup = true; } };
 };
 
 describe("live cleanup move-aside custody", () => {
-  it("actual provider/live host retains worktree, run, recorded TMPDIR, metadata and result with bytes/inodes/receipts and open-FD tails", async () => {
+  it("pins independent native ACL query bootstrap despite contaminated module environment (nonnative command contract)", () => {
+    const probe = aclProbeCommand("D:\\fixture\\archive", { SystemRoot: "C:\\Windows", PSModulePath: "foreign", pSmOdUlEpAtH: "also foreign" });
+    expect(probe.file).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    expect(Object.keys(probe.env).filter(key => key.toLowerCase() === "psmodulepath")).toEqual(["PSModulePath"]);
+    expect(probe.env.PSModulePath).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules");
+    expect(probe.env.FABRIC_ACL_MODULE).toBe(path.win32.join(probe.env.PSModulePath!, "Microsoft.PowerShell.Security", "Microsoft.PowerShell.Security.psd1"));
+    const script = Buffer.from(probe.args.at(-1)!, "base64").toString("utf16le");
+    expect(script).toContain("Import-Module -Name $env:FABRIC_ACL_MODULE -ErrorAction Stop");
+    expect(script).toContain("Get-Acl -LiteralPath $env:FABRIC_ACL_PROBE");
+    expect(() => aclProbeCommand("D:\\fixture", {})).toThrow(/absolute SystemRoot/);
+    expect(() => aclProbeCommand("D:\\fixture", { SystemRoot: "relative" })).toThrow(/absolute SystemRoot/);
+  });
+
+  it.each(["closed-FD", "native-open-FD", "injected-EPERM"] as const)("actual provider/live host preserves whole-root custody and native FD outcome: %s", async mode => {
     const f = await fixture(); const fds: number[] = [];
     try {
       const run = await f.launch();
       const roots = [run.worktree!, run.run, ...(run.externalTemporary ? [run.temporary] : []), run.metadata, run.result];
-      const inodes = roots.map(source => fs.statSync(source).ino);
       const directories = new Set([run.worktree!, run.run, ...(run.externalTemporary ? [run.temporary] : [])]);
+      const originals = new Map(roots.map(source => [source, rawTree(source)]));
       const files = roots.map(source => directories.has(source) ? path.join(source, "sessions/raw.JSONL") : source);
-      const bytes = files.map(file => fs.readFileSync(file));
       for (const file of files) fds.push(fs.openSync(file, "a"));
-      await expect(f.provider.invoke("cleanup", { id: run.id, deleteBranch: true }, f.context)).resolves.toEqual({ cleaned: true });
+      const identities = fds.map(fd => fs.fstatSync(fd));
+      if (mode === "closed-FD") for (const fd of fds.splice(0)) fs.closeSync(fd);
+      const foreground = vi.spyOn(f.host.agents, "markForeground");
+      const copy = vi.spyOn(fs, "copyFileSync"), rm = vi.spyOn(fs, "rmSync"), unlink = vi.spyOn(fs, "unlinkSync");
+      const signal = new AbortController().signal;
+      const rename = fs.renameSync.bind(fs); let inject = mode === "injected-EPERM";
+      let refusal: { source: string; destination: string; code: unknown } | undefined;
+      vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+        try {
+          if (inject && String(source) === run.worktree) throw Object.assign(new Error("deterministic live native-boundary EPERM (not native OS proof)"), { code: "EPERM" });
+          rename(source, destination);
+        } catch (error) {
+          if (roots.includes(String(source))) refusal = { source: String(source), destination: String(destination), code: (error as NodeJS.ErrnoException).code };
+          throw error;
+        }
+      });
+      const outcome = await f.provider.invoke("cleanup", { id: run.id, deleteBranch: true }, { ...f.context, signal }).catch((error: unknown) => error);
+      if (refusal) {
+        expect(mode).not.toBe("closed-FD"); expect(refusal.code).toBe("EPERM");
+        expect(outcome).toMatchObject({ residentOutcome: { id: run.id, state: "committed", operation: "cleanup" } });
+        expect((outcome as Error).message).toContain("Do not retry or reassign");
+        expect((outcome as Error & { cleanupStatus?: unknown }).cleanupStatus).toBeUndefined();
+        expect(outcome).not.toHaveProperty("cleaned", true);
+        expect(preserveCancellationOutcome({ value: undefined, terminationReason: "runtime_error" as const }, signal)).toMatchObject({ residentOutcomes: [expect.objectContaining({ id: run.id, operation: "cleanup", state: "committed" })] });
+        expect(foreground).not.toHaveBeenCalled(); expect(f.consumed).not.toHaveBeenCalled();
+        expect(f.host.agents.hasRunCustody(run.id)).toBe(true); expect(f.client.hasAgent(run.id)).toBe(true);
+        expect(f.host.agents.status(run.id)).toMatchObject({ id: run.id, status: "completed" });
+        const container = path.dirname(refusal.destination);
+        expect(JSON.parse(fs.readFileSync(path.join(container, "custody.prepared.json"), "utf8"))).toMatchObject({ source: refusal.source, destination: refusal.destination, id: run.id, state: "prepared" });
+        expect(JSON.parse(fs.readFileSync(path.join(container, "custody.json"), "utf8"))).toMatchObject({ source: refusal.source, destination: refusal.destination, id: run.id, state: "rename-failed" });
+        expect(fs.existsSync(refusal.destination)).toBe(false);
+      } else { expect(outcome).toEqual({ cleaned: true }); expect(mode).not.toBe("injected-EPERM"); }
       for (const [index, source] of roots.entries()) {
+        const move = receipts(f.root).find(row => row.source === source && row.state === "moved");
+        const current = move?.destination ?? source;
+        expect(rawTree(current)).toEqual(originals.get(source));
+        if (fds.length) {
+          const relative = path.relative(source, files[index]!), file = path.join(current, relative);
+          expect(fs.statSync(file)).toMatchObject({ dev: identities[index]!.dev, ino: identities[index]!.ino });
+          // Whitespace keeps metadata/result JSON valid for the explicit retry.
+          const tail = directories.has(source) ? "late-open-FD-tail" : "\n \t";
+          fs.writeSync(fds[index]!, tail);
+          const entry = originals.get(source)!.find(row => row.relative === relative)!;
+          entry.bytes = Buffer.concat([entry.bytes!, Buffer.from(tail)]);
+          expect(fs.readFileSync(file)).toEqual(entry.bytes);
+        }
+      }
+      for (const fd of fds.splice(0)) fs.closeSync(fd);
+      if (refusal) {
+        inject = false;
+        await expect(f.provider.invoke("cleanup", { id: run.id, deleteBranch: true }, f.context)).resolves.toEqual({ cleaned: true });
+      }
+      for (const source of roots) {
         const receipt = held(f.root, source, run.id);
-        expect(fs.existsSync(source)).toBe(false); expect(fs.statSync(receipt.destination).ino).toBe(inodes[index]);
-        if (directories.has(source)) verify(receipt.destination);
-        const file = directories.has(source) ? path.join(receipt.destination, "sessions/raw.JSONL") : receipt.destination;
-        expect(fs.readFileSync(file)).toEqual(bytes[index]);
-        fs.writeSync(fds[index]!, "late-open-FD-tail");
-        expect(fs.readFileSync(file)).toEqual(Buffer.concat([bytes[index]!, Buffer.from("late-open-FD-tail")]));
+        const prepared = JSON.parse(fs.readFileSync(path.join(path.dirname(receipt.destination), "custody.prepared.json"), "utf8"));
+        expect(prepared).toMatchObject({ source, destination: receipt.destination, id: run.id, reason: receipt.reason, state: "prepared" });
+        expect(prepared.time).toBeGreaterThan(0); expect(prepared.time).toBeLessThanOrEqual(receipt.time);
+        expect(rawTree(receipt.destination)).toEqual(originals.get(source)); expect(fs.existsSync(source)).toBe(false);
       }
       if (!run.externalTemporary) verify(path.join(held(f.root, run.run, run.id).destination, path.relative(run.run, run.temporary)));
-      expect(receipts(f.root)).toHaveLength(run.externalTemporary ? 5 : 4); f.noGitDelete();
+      expect(receipts(f.root).filter(row => row.state === "moved")).toHaveLength(run.externalTemporary ? 5 : 4); f.noGitDelete();
+      expect(foreground).toHaveBeenCalledExactlyOnceWith(run.id); expect(f.consumed).toHaveBeenCalledExactlyOnceWith(run.id);
+      expect(copy).not.toHaveBeenCalled();
+      for (const calls of [rm.mock.calls, unlink.mock.calls]) expect(calls.some(([file]) => roots.some(source => String(file) === source || String(file).startsWith(source + path.sep)))).toBe(false);
       const decisions = fs.readdirSync(path.join(f.config.residencyRoot, "decisions"))
         .map(name => readResidentRequestDecision(f.config.residencyRoot, name.slice(0, -5)));
       expect(decisions).toContainEqual(expect.objectContaining({ operation: "cleanup", id: run.id, state: "committed" }));
@@ -244,6 +346,7 @@ describe("live cleanup move-aside custody", () => {
     const f = await fixture();
     try {
       const run = await f.launch(); const target = run[kind]!;
+      const foreground = vi.spyOn(f.host.agents, "markForeground");
       const raw = fs.statSync(target).isDirectory() ? undefined : fs.readFileSync(target);
       const rename = fs.renameSync; const lstat = fs.lstatSync.bind(fs); let deviceProbe = false;
       vi.spyOn(fs, "lstatSync").mockImplementation(((file, options) => {
@@ -279,8 +382,11 @@ describe("live cleanup move-aside custody", () => {
       if (kind !== "worktree" && kind !== "run") verify(held(f.root, run.run, run.id).destination);
       if (kind === "metadata" || kind === "result") verify(run.externalTemporary ? held(f.root, run.temporary, run.id).destination
         : path.join(held(f.root, run.run, run.id).destination, path.relative(run.run, run.temporary)));
-      if (kind === "result") held(f.root, run.metadata, run.id);
-      expect(f.host.agents.hasRunCustody(run.id)).toBe(kind === "worktree" || kind === "run" || kind === "temporary"); f.noGitDelete();
+      if (kind === "metadata") held(f.root, run.result, run.id);
+      expect(f.host.agents.hasRunCustody(run.id)).toBe(true);
+      expect(f.host.agents.status(run.id)).toMatchObject({ id: run.id, status: "completed" });
+      expect(foreground).not.toHaveBeenCalled();
+      expect(f.client.hasAgent(run.id)).toBe(true); f.noGitDelete();
     } finally { await f.dispose(); }
   });
 
@@ -290,10 +396,12 @@ describe("live cleanup move-aside custody", () => {
       const run = await f.launch(); const target = run[kind]; const inode = fs.statSync(target).ino;
       const original = fs.statSync(target).isDirectory() ? undefined : fs.readFileSync(target);
       let destination: string | undefined; const rename = fs.renameSync;
+      const foreground = vi.spyOn(f.host.agents, "markForeground");
+      let failing = true, moves = 0;
       vi.spyOn(fs, "renameSync").mockImplementation((source, dest) => {
-        if (destination && String(dest) === path.join(path.dirname(destination), "custody.json")) throw new Error("fixture moved receipt publication failed");
+        if (failing && destination && String(dest) === path.join(path.dirname(destination), "custody.json")) throw new Error("fixture moved receipt publication failed");
         rename(source, dest);
-        if (String(source) === target) destination = String(dest);
+        if (String(source) === target) { destination = String(dest); moves++; }
       });
       const error = await f.client.cleanupAgent(run.id, true).catch((error: Error) => error);
       expect(error).toBeInstanceOf(Error); expect((error as Error).message).toMatch(/receipt update failed/);
@@ -303,7 +411,45 @@ describe("live cleanup move-aside custody", () => {
       if (original) expect(fs.readFileSync(destination!)).toEqual(original); else verify(destination!);
       const prepared = JSON.parse(fs.readFileSync(path.join(path.dirname(destination!), "custody.prepared.json"), "utf8"));
       expect(prepared).toMatchObject({ source: target, destination, id: run.id, state: "prepared", reason: expect.any(String), time: expect.any(Number) });
+      expect((error as Error & { cleanupStatus?: unknown }).cleanupStatus).toBeUndefined();
+      expect(f.host.agents.hasRunCustody(run.id)).toBe(true);
+      expect(foreground).not.toHaveBeenCalled();
+      const exact = f.host.agents.status(run.id);
+      if (!("text" in exact)) throw new Error("Expected retained exact terminal result");
+      // A retry must finish ORIGINAL custody, not recapture this late occupant.
+      if (original) fs.writeFileSync(target, JSON.stringify({ ...JSON.parse(original.toString()), replacement: "late canonical occupant" }));
+      else { fs.mkdirSync(target); fs.writeFileSync(path.join(target, "foreign.JSONL"), "late canonical occupant"); }
+      const replacement = fs.readFileSync(original ? target : path.join(target, "foreign.JSONL"));
+      expect(f.host.agents.status(run.id)).toMatchObject({ id: run.id, text: exact.text });
+      failing = false;
+      await expect(f.client.cleanupAgent(run.id, true)).resolves.toEqual({ cleaned: true });
+      expect(f.host.agents.hasRunCustody(run.id)).toBe(false);
+      expect(foreground).toHaveBeenCalledExactlyOnceWith(run.id);
+      expect(moves).toBe(1);
+      expect(fs.readFileSync(original ? target : path.join(target, "foreign.JSONL"))).toEqual(replacement);
+      expect(fs.statSync(destination!).ino).toBe(inode);
+      if (original) expect(fs.readFileSync(destination!)).toEqual(original); else verify(destination!);
+      expect(JSON.parse(fs.readFileSync(path.join(path.dirname(destination!), "custody.prepared.json"), "utf8"))).toEqual(prepared);
       f.noGitDelete();
+    } finally { await f.dispose(); }
+  });
+
+  it("LIVE liveness and pre-aborted cancellation leave metadata/result and every custody root untouched", async () => {
+    const f = await fixture();
+    try {
+      const run = await f.launch();
+      const metadata = fs.readFileSync(run.metadata), result = fs.readFileSync(run.result);
+      const foreground = vi.spyOn(f.host.agents, "markForeground");
+      const descendant = path.join(run.run, "nested", "live-child");
+      fs.mkdirSync(descendant, { recursive: true });
+      fs.writeFileSync(path.join(descendant, "status.json"), JSON.stringify({ status: "running", transport: "process", sessionId: String(process.pid) }));
+      await expect(f.client.cleanupAgent(run.id)).rejects.toThrow(/descendant worker may still be running/);
+      expect(receipts(f.root)).toEqual([]);
+      const cancelled = new AbortController(); cancelled.abort(new Error("cancel before cleanup"));
+      await expect(f.client.cleanupAgent(run.id, false, cancelled.signal)).rejects.toThrow("cancel before cleanup");
+      expect(receipts(f.root)).toEqual([]);
+      expect(fs.readFileSync(run.metadata)).toEqual(metadata); expect(fs.readFileSync(run.result)).toEqual(result);
+      expect(foreground).not.toHaveBeenCalled(); expect(f.host.agents.hasRunCustody(run.id)).toBe(true); f.noGitDelete();
     } finally { await f.dispose(); }
   });
 
@@ -316,6 +462,73 @@ describe("live cleanup move-aside custody", () => {
       const move = receipts(f.root).find(row => row.source.includes(`${path.sep}worktrees${path.sep}`));
       expect(move).toMatchObject({ state: "moved", reason: expect.any(String), time: expect.any(Number) });
       verify(move!.destination); f.noGitDelete();
+    } finally { await f.dispose(); }
+  });
+});
+
+describe("A3 admitted original client cleanup routing", () => {
+  it.each(["absent", "replacement", "earlier-result"] as const)("public provider retry retains original admission after %s metadata custody", async variant => {
+    const f = await fixture();
+    try {
+      const run = await f.launch();
+      const metadata = fs.readFileSync(run.metadata), result = fs.readFileSync(run.result);
+      const target = variant === "earlier-result" ? run.result : run.metadata;
+      const inode = fs.statSync(target).ino;
+      const foreground = vi.spyOn(f.host.agents, "markForeground");
+      let destination: string | undefined, failing = true, moves = 0;
+      const rename = fs.renameSync;
+      vi.spyOn(fs, "renameSync").mockImplementation((source, dest) => {
+        if (failing && destination && String(dest) === path.join(path.dirname(destination), "custody.json")) throw Object.assign(new Error("probe metadata MOVED receipt EIO"), { code: "EIO" });
+        rename(source, dest);
+        if (String(source) === target) { destination = String(dest); moves++; }
+      });
+      const first = await f.provider.invoke("cleanup", { id: run.id }, f.context).catch((error: Error) => error);
+      expect(first).toBeInstanceOf(Error);
+      expect(first).toMatchObject({ residentOutcome: { id: run.id, state: "committed", operation: "cleanup" } });
+      expect((first as Error).message).toMatch(/receipt update failed/);
+      expect(destination).toBeDefined(); expect(fs.existsSync(target)).toBe(false);
+      expect(fs.statSync(destination!).ino).toBe(inode);
+      expect(f.host.agents.hasRunCustody(run.id)).toBe(true); expect(foreground).not.toHaveBeenCalled();
+      expect(f.consumed).not.toHaveBeenCalled();
+      const preparedFile = path.join(path.dirname(destination!), "custody.prepared.json");
+      const prepared = fs.readFileSync(preparedFile);
+      const exact = f.host.agents.status(run.id);
+      let replacement: Buffer | undefined;
+      if (variant === "replacement") {
+        const changed = JSON.parse(metadata.toString()); changed.createdAt++; changed.updatedAt++;
+        changed.handle = { ...changed.handle, ownerHostId: "replacement-owner", sessionId: "replacement-generation", name: "replacement" };
+        replacement = Buffer.from(JSON.stringify(changed)); fs.writeFileSync(run.metadata, replacement);
+        // A replacement valid owner generation must not become the retry destination.
+        const ownerFile = path.join(f.config.residencyRoot, "owner.json"), owner = fs.readFileSync(ownerFile);
+        const other = JSON.parse(owner.toString()); other.token = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        fs.writeFileSync(ownerFile, JSON.stringify(other)); failing = false;
+        await expect(f.client.cleanupAgent(run.id)).rejects.toThrow(/owner.*changed|generation.*changed/i);
+        expect(f.host.agents.hasRunCustody(run.id)).toBe(true); expect(foreground).not.toHaveBeenCalled();
+        expect(f.consumed).not.toHaveBeenCalled();
+        fs.writeFileSync(ownerFile, owner);
+      }
+      if (variant === "absent") {
+        expect(fs.existsSync(run.metadata)).toBe(false);
+        const fresh = new ResidencyClient(f.client.options);
+        try { await expect(fresh.cleanupAgent(run.id)).rejects.toThrow(`Unknown durable Fabric agent: ${run.id}`); }
+        finally { await fresh.close(); }
+        expect(foreground).not.toHaveBeenCalled(); expect(f.consumed).not.toHaveBeenCalled();
+      }
+      const cancelled = new AbortController(); cancelled.abort(new Error("probe retry cancelled"));
+      await expect(f.client.cleanupAgent(run.id, false, cancelled.signal)).rejects.toThrow("probe retry cancelled");
+      expect(foreground).not.toHaveBeenCalled(); expect(f.host.agents.status(run.id)).toEqual(exact);
+      expect(f.consumed).not.toHaveBeenCalled();
+      failing = false;
+      // Real provider chooses ResidencyClient. No adapter or direct manager retry.
+      await expect(f.provider.invoke("cleanup", { id: run.id }, f.context)).resolves.toEqual({ cleaned: true });
+      expect(f.host.agents.hasRunCustody(run.id)).toBe(false);
+      expect(foreground).toHaveBeenCalledExactlyOnceWith(run.id); expect(moves).toBe(1);
+      expect(f.consumed).toHaveBeenCalledExactlyOnceWith(run.id);
+      expect(fs.readFileSync(destination!)).toEqual(variant === "earlier-result" ? result : metadata);
+      expect(fs.statSync(destination!).ino).toBe(inode); expect(fs.readFileSync(preparedFile)).toEqual(prepared);
+      if (replacement) expect(fs.readFileSync(run.metadata)).toEqual(replacement);
+      else expect(f.client.ownsAgent(run.id)).toBe(false);
+      f.noGitDelete();
     } finally { await f.dispose(); }
   });
 });

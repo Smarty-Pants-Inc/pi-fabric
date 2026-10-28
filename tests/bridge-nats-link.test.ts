@@ -139,9 +139,23 @@ describe("startNatsLink composition with L3's allow gate", () => {
     const step = await link.bridge.step();
     expect(step.toRemote).toBe(0);
     expect(port.sent).toEqual([]);
+    const retainedSamples = [
+      `bridge miss: direction=toRemote event="${local.id}" recipient="${fileLead.id}" classification=local stage=filter`,
+      `bridge miss: direction=toRemote event="${remote.id}" recipient="${natsLead.id}" classification=stale stage=membership-retained`,
+    ];
+    expect(logs.filter(line => line.startsWith("bridge miss:"))).toEqual(retainedSamples);
+    // Main retains unknown canonical recipients until a post-miss sample. Logging must
+    // neither advance that boundary nor let the later foreign event bypass it.
+    const retainedCursor = JSON.parse(fs.readFileSync(link.bridge.options.cursorPath, "utf8"));
+    expect(retainedCursor.toRemote.after).toBe(local.sequence);
+    expect((await link.bridge.step()).toRemote).toBe(0);
+    expect(logs.filter(line => line.startsWith("bridge miss:"))).toEqual(retainedSamples);
+    await link.bridge.syncPresence();
+    expect((await link.bridge.step()).toRemote).toBe(0);
+    expect(port.sent).toEqual([]);
     const samples = logs.filter(line => line.startsWith("bridge miss:"));
     expect(samples).toEqual([
-      `bridge miss: direction=toRemote event="${local.id}" recipient="${fileLead.id}" classification=local stage=filter`,
+      ...retainedSamples,
       `bridge miss: direction=toRemote event="${remote.id}" recipient="${natsLead.id}" classification=stale stage=filter`,
       `bridge miss: direction=toRemote event="${foreign.id}" recipient="${foreign.to}" classification=not-admitted stage=filter`,
     ]);
@@ -322,6 +336,7 @@ describe("startNatsLink composition with L3's allow gate", () => {
         return port;
       }, seatPins: () => pins,
     } });
+    closers.push(async () => { controller.abort(); await handle.closed; });
     expect(handedStore?.root).toBe(path.join(root, "hub"));
     expect(logs).toContain('NATS port: {"operation":"port","errors":[{"name":"Error","code":"ETIMEDOUT"},{"name":"Error","code":"503"}]}');
     expect(logs.join("\n")).not.toContain("PRIVATE");
@@ -333,7 +348,7 @@ describe("startNatsLink composition with L3's allow gate", () => {
       data: { message: "PRIVATE-start-data" } });
     await vi.waitFor(() => {
       expect(logs).toContain(`bridge miss: direction=toRemote event="${localMiss.id}" recipient="${fileLead.id}" classification=local stage=filter`);
-      expect(logs).toContain(`bridge miss: direction=toRemote event="${remoteMiss.id}" recipient="${absentRoot}" classification=stale stage=filter`);
+      expect(logs).toContain(`bridge miss: direction=toRemote event="${remoteMiss.id}" recipient="${absentRoot}" classification=stale stage=membership-retained`);
     }, { timeout: 10_000 });
     expect(logs.join("\n")).not.toContain("PRIVATE");
     expect(port.sent).toEqual([]);

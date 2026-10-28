@@ -26,6 +26,9 @@ it.each(["filter", "commit"] as const)("reports every suppressed %s sample and r
     read: async after => ({ events: [], through: after }), presence: empty, mirror: async () => undefined,
     publish: async () => ({ sequence: 1 }), bridgedIds: async after => ({ ids: [], through: after, done: true }) });
   const local: BridgeSide = { ...side(),
+    // A native reservation is a definitive filter miss. Unknown canonical recipients
+    // now retain their cursor until a post-miss membership sample (covered by the link tests).
+    presence: async () => stage === "filter" ? { ...presence, reserved: [peer.id] } : empty(),
     read: async after => ({ events: queue.filter(event => event.sequence > after), through: queue.at(-1)?.sequence ?? after }),
     owned: async () => stage === "commit" ? presence : empty(),
   };

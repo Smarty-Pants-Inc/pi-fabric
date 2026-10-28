@@ -572,7 +572,8 @@ describe("file roots -> KV presence under the bridge machine", () => {
       expect(failure.elapsedMs).toBeGreaterThan(0);
       expect(failure.errors).toHaveLength(1);
     }
-    expect(logs[0]).not.toMatch(/PRIVATE|credentials|user\.creds|record-body|session:|ryzen1-bridge/);
+    expect(logs[0]).not.toMatch(/PRIVATE|credentials|user\.creds|record-body|session:/);
+    expect(logs[0]).not.toContain(BRIDGE);
     expect(records.map(record => side.holds(record.id))).toEqual(records.map(() => true));
     expect(records.map(record => w.leases.values.get(hKey(BRIDGE, record.id))!.revision)).toEqual(revisions);
     w.leases.put = put;
@@ -625,7 +626,8 @@ describe("file roots -> KV presence under the bridge machine", () => {
       { operation: "presence-refresh", elapsedMs: 2, keyHash: expect.stringMatching(/^[a-f0-9]{16}$/),
         errors: [{ name: "Error", code: "FABRIC_TRANSPORT_DENIED" }] },
     ] });
-    expect(natsBridgeErrorSummary(failure)).not.toMatch(/PRIVATE|credentials|presence-body|session:|ryzen1-bridge/);
+    expect(natsBridgeErrorSummary(failure)).not.toMatch(/PRIVATE|credentials|presence-body|session:/);
+    expect(natsBridgeErrorSummary(failure)).not.toContain(BRIDGE);
     expect(side.holds(FILE_ROOT)).toBe(true);
     w.presence.put = put;
     await side.writer.renew();

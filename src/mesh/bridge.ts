@@ -4966,6 +4966,9 @@ export class MeshBridge {
           if (typeof event.to === "string" && CANONICAL_ID.test(event.to) &&
             !rules.reservedRecipients?.has(event.to) && isIdentity(event.from) &&
             (event.data === undefined || isObject(event.data)) && !this.#destinationRefusal(event, direction)) {
+            // The coalesced hold returns before the ordinary refusal path below.
+            // Report the miss here without consuming it or treating a sample as authority.
+            this.#reportMiss(direction, event, rules, "membership-retained");
             this.#unaddressedSequence = event.sequence;
             this.#deferMembership(direction, event);
             this.#membershipRetryAt[direction] = this.#unaddressedRefreshAt ?? Date.now() + this.#unaddressedRefreshMs;

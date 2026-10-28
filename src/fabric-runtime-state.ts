@@ -1189,6 +1189,7 @@ export class FabricRuntimeState {
           rootId: mainAgent.id, sessionId, meshRoot, pi: this.pi, context: () => live.read(ctx => ctx),
           main: () => mainAgent, actors: () => this.#actors, agents: () => this.#agents,
           completions: () => this.#completionInbox?.drainPending(),
+          ownerIncarnation: () => participants.ownerIncarnation,
         }));
         this.#mainDrain = drain;
         void drain.start();

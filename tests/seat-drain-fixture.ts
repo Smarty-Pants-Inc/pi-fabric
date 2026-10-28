@@ -25,9 +25,13 @@ export interface FakeNative {
   idle: boolean;
   releases: number;
   shutdown: ReturnType<typeof vi.fn>;
+  /** The live session's file and leaf, as Pi's ReadonlySessionManager reports them. */
+  sessionFile: string | undefined;
+  leafId: string | null;
 }
 export const fakeNative = (fenceApi: boolean): { pi: ExtensionAPI; ctx: () => ExtensionContext; state: FakeNative } => {
-  const state: FakeNative = { fenceApi, fenced: false, busy: false, queued: 0, admissions: 0, idle: true, releases: 0, shutdown: vi.fn() };
+  const state: FakeNative = { fenceApi, fenced: false, busy: false, queued: 0, admissions: 0, idle: true, releases: 0, shutdown: vi.fn(),
+    sessionFile: undefined, leafId: null };
   const pi = { hostCapabilities: { inputAdmission: 1, ...(fenceApi ? { extensionInputFence: 1 } : {}) } } as unknown as ExtensionAPI;
   // A fresh ctx object per call, as Pi hands each handler; the native session state is shared (a reload keeps the fence).
   const ctx = (): ExtensionContext => ({
@@ -35,6 +39,7 @@ export const fakeNative = (fenceApi: boolean): { pi: ExtensionAPI; ctx: () => Ex
     isPromptPending: () => state.admissions > 0,
     hasPendingMessages: () => state.queued + state.admissions > 0,
     shutdown: state.shutdown,
+    sessionManager: { getSessionFile: () => state.sessionFile, getLeafId: () => state.leafId },
     ...(fenceApi ? {
       fenceInputs: async () => {
         if (state.fenced) throw Object.assign(new Error("fenced"), { code: "INPUT_ADMISSION_FENCED" });
@@ -98,8 +103,11 @@ export const createSeat = async (options: { fenceApi?: boolean; start?: boolean;
     plannedSeats: ["alpha", "bravo", "charlie"], context: "synthetic", namespace: "org-synthetic", namespaceUID: "00000000-0000-4000-8000-000000000001",
     natsSecret: "org-d3synth-nats", source: { journal, journalSha256: "0".repeat(64), journalBytes: 1, leafId: "leaf", handoffs: null },
     target: { claim: "synthetic-claim", node: "synthetic-node" },
+    // A's T-FIX6: the seat's own NATS machine (the synthetic rehearsal machine), never the Herdr instance.
+    natsMachine: "sp-org-d3synth",
     seams: { drain: { owner: "fabric-v2", path: "/synthetic/drain", sha256: "1".repeat(64) },
-      fence: { owner: "synthetic-fence-owner", path: "/synthetic/fence", sha256: "2".repeat(64) } },
+      fence: { owner: "synthetic-fence-owner", path: "/synthetic/fence", sha256: "2".repeat(64) },
+      bridge: { owner: "fabric-v2", path: "/synthetic/bridge", sha256: "3".repeat(64) } },
     recoveryRoot: "/synthetic/recovery", createdAt: "2026-10-25T00:00:00Z",
   });
   const runSha256 = sha(runBytes);
@@ -130,6 +138,7 @@ export const createSeat = async (options: { fenceApi?: boolean; start?: boolean;
       probeAdmission: () => { try { assertMainInboxOpen(ROOT); return true; } catch { return false; } },
     }),
     actors: () => actors, agents: () => ({ list: () => agents }), completions: () => completionsPending.count,
+    ownerIncarnation: () => "00000000-0000-4000-8000-0000000001c1",
   };
   const control = new MainDrainControl(host);
   const server = new MainDrainServer(control);
@@ -206,9 +215,10 @@ export const installedSeam = async (directory: string): Promise<string> => {
 };
 
 /** Run the installed seam the way A does (tests/fixtures/seat-drain-harness.py), without blocking this event loop. */
-export const runSeam = (seat: Seat, exe: string, phase: string, request: string, nolock = false):
+export const runSeam = (seat: Seat, exe: string, phase: string, request: string, nolock = false, home?: string):
   Promise<{ code: number | null; stdout: string; stderr: string }> => new Promise((resolve, reject) => {
-  const child = spawn("python3", [path.join("tests", "fixtures", "seat-drain-harness.py"), seat.runDir, exe, phase, ...(nolock ? ["nolock"] : [])],
+  const child = spawn("python3", [path.join("tests", "fixtures", "seat-drain-harness.py"), seat.runDir, exe, phase, ...(nolock ? ["nolock"] : []),
+    ...(home === undefined ? [] : [`home=${home}`])],
     { stdio: ["pipe", "pipe", "pipe"] });
   let out = "";
   let err = "";

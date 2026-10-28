@@ -8,12 +8,14 @@ import { terminalAgentStatuses } from "../agents/lifecycle.js";
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricTurnProvenance, copyFabricWakeCause, copyFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import type { AgentManager } from "../agents/manager.js";
 import { DEFAULT_FOLLOW_UP_DEADLINE_MS } from "../agents/follow-up-delivery.js";
+import { readScriptedInput, prepareScriptedInput, admitScriptedInput, listPendingScriptedInputs,
+  acknowledgeScriptedInput } from "../recovery/input-admission.js";
 import type { ActorManager } from "../actors/manager.js";
 import type { FabricActorInfo, FabricActorRunBinding } from "../actors/types.js";
 import { assertSteerPriority, type FabricSteerPriority, type FabricAgentMessageResult, type FabricMainAgentTarget } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { FabricInvocationContext } from "../protocol.js";
-import { controlOwnerIncarnation, warnUnfencedControlDelivery, controlActorBindingOptions, FabricControlStaleIncarnationError, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
+import { scriptedInputControlRequest, scriptedInputControlAcceptance, controlOwnerIncarnation, warnUnfencedControlDelivery, controlActorBindingOptions, FabricControlStaleIncarnationError, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
 import type { ParticipantRoute, ParticipantView } from "../topology/participant-view.js";
 import type { FabricAgentRunner } from "../config.js";
@@ -146,6 +148,17 @@ interface RouterWaitBudget extends MirrorLeaseWaitBudget {
   presenceAuthority?: { targetId: string; route: ParticipantRoute };
 }
 
+interface AgentMessageOptions {
+  principal?: FabricPrincipal | undefined;
+  from?: MeshIdentity;
+  wakeCause?: FabricWakeCause | undefined;
+  triggerTurn?: boolean;
+  priority?: FabricSteerPriority;
+  binding?: FabricActorRunBinding;
+  deadlineMs?: number;
+  idempotencyKey?: string;
+}
+
 const snapshotRoute = (route: ParticipantRoute): ParticipantRoute => ({ ...route, capabilities: [...route.capabilities] });
 const samePresenceOwner = (left: ParticipantRoute, right: ParticipantRoute): boolean =>
   left.machine === right.machine && left.ownerHostId === right.ownerHostId &&
@@ -192,7 +205,7 @@ export class AgentMessageRouter {
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
     readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; mesh?: { root: string } },
-    readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive" | "stop" | "bindingContext">,
+    readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive" | "stop" | "bindingContext"> & { readonly sessionId?: string | undefined },
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "retainedRouteAllowed">> & {
       resolveRoutingLease?: (id: string, signal?: AbortSignal, budget?: MirrorLeaseWaitBudget) => Promise<boolean>;
     },
@@ -625,36 +638,81 @@ export class AgentMessageRouter {
     data: unknown,
     kind: "steer" | "followUp",
     context?: FabricInvocationContext,
-    options: {
-      principal?: FabricPrincipal | undefined;
-      from?: MeshIdentity;
-      wakeCause?: FabricWakeCause | undefined;
-      triggerTurn?: boolean;
-      priority?: FabricSteerPriority;
-      binding?: FabricActorRunBinding;
-      deadlineMs?: number;
-      idempotencyKey?: string;
-    } = {},
+    options: AgentMessageOptions = {},
+  ): Promise<FabricAgentMessageResult> {
+    // Only the native invocation capture can attribute a new send. Caller options
+    // and data are not authority; capture before any routing operation can yield.
+    if (context) context = snapshotFabricInvocation(context);
+    return this.#routeWithPrincipal(id, message, data, kind,
+      context ? invocationFabricPrincipal(context) : undefined, context, options);
+  }
+
+  /** New sends use native capture; finite recovery uses only its retained snapshot.
+   * A saved undefined principal is UNKNOWN, never permission to sample a live turn. */
+  async #routeWithPrincipal(
+    id: string,
+    message: string,
+    data: unknown,
+    kind: "steer" | "followUp",
+    principal: FabricPrincipal | undefined,
+    context?: FabricInvocationContext,
+    options: AgentMessageOptions = {},
   ): Promise<FabricAgentMessageResult> {
     assertSteerPriority(options.priority, kind);
+    const scripted = readScriptedInput(data);
+    const root = this.actorManager.mesh?.root ?? this.residency?.options.config.meshRoot;
+    // Opt-in is deliberately exact, before aliases, directory reads, publication or awaits.
+    if (scripted && (!SESSION_UUID.test(scripted.sessionId) || id !== `session:${scripted.sessionId}`)) throw new Error("Scripted input requires an exact session UUID target");
+    if (scripted && options.deadlineMs !== undefined) throw new Error("Scripted input uses its original absolute deadline, not deadlineMs");
     // Resolve the child's bound target before recovery so retries retain the same
     // actor ownership/fence checks rather than trying to recover the alias itself.
     if (id === "spawner") {
       if (!this.spawner) throw new Error("This worker has no bound Fabric spawner; specify an explicit reply target");
       id = this.spawner.id;
     }
-    // Capture before routing yields; a queued incoming turn cannot change this send.
-    if (context) context = snapshotFabricInvocation(context);
-    options = { ...options, wakeCause: copyFabricWakeCause(options.wakeCause), idempotencyKey: options.idempotencyKey ?? randomUUID(), principal: context ? invocationFabricPrincipal(context) : undefined };
+    options = copyFabricWakeAdmission(options, { ...options, wakeCause: copyFabricWakeCause(options.wakeCause), principal });
+    if (scripted) {
+      if (!root) throw new Error("Scripted input requires a retained mesh root");
+      // Freeze Main's effective default once, before either local/remote routing.
+      options.triggerTurn ??= true;
+      // This synchronous immutable outbox commit precedes the first publication/await.
+      const prepared = prepareScriptedInput({ root, from: options.from ?? this.actorManager.identity, targetId: id, message, data,
+        principal, delivery: kind, ...(options.priority === undefined ? {} : { priority: options.priority }),
+        ...(options.triggerTurn === undefined ? {} : { triggerTurn: options.triggerTurn }) });
+      if (options.idempotencyKey !== undefined && options.idempotencyKey !== prepared.idempotencyKey) {
+        throw new Error("Scripted input idempotencyKey conflicts with its durable round key");
+      }
+      message = prepared.message; data = prepared.data;
+      options.principal = prepared.principal;
+      options.idempotencyKey = prepared.idempotencyKey;
+      options.triggerTurn = prepared.triggerTurn ?? true;
+      if (prepared.result) return prepared.result; // Immutable ACK replay, even after the original deadline.
+    } else options.idempotencyKey ??= randomUUID();
+    const deadlineController = scripted ? new AbortController() : undefined;
+    const deadlineTimer = scripted ? setTimeout(() => deadlineController!.abort(new Error("Scripted input deadline expired")),
+      Math.max(1, Math.min(2_147_483_647, scripted.deadlineAt - Date.now()))) : undefined;
+    deadlineTimer?.unref();
+    const signal = deadlineController ? (context?.signal ? AbortSignal.any([context.signal, deadlineController.signal]) : deadlineController.signal) : context?.signal;
+    const routingOptions = copyFabricWakeAdmission(options, { ...options, ...(signal ? { signal } : {}) });
     // Task-local `main` remains its immutable immediate return address.
     if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
     const provenLocal = this.isProcessOwnedTarget(id);
     let result: FabricAgentMessageResult;
     try {
+      if (scripted && Date.now() >= scripted.deadlineAt) throw new Error("Scripted input deadline expired");
       result = provenLocal
-        ? await this.#route(id, message, data, kind, context, options, true)
-        : await this.#withDurableRecovery(id, recovering =>
-          this.#withDirectory((authority, budget) => this.#route(id, message, data, kind, context, options, false, !recovering, authority, budget), id, !recovering, context?.signal));
+        ? await this.#route(id, message, data, kind, context, routingOptions, true)
+        : scripted
+          ? await this.#withDirectory((authority, budget) => this.#route(id, message, data, kind, context, routingOptions, false, true, authority, budget), id, true, signal)
+          : await this.#withDurableRecovery(id, recovering =>
+            this.#withDirectory((authority, budget) => this.#route(id, message, data, kind, context, routingOptions, false, !recovering, authority, budget), id, !recovering, signal));
+      if (scripted) {
+        // Only the in-process native receipt or an authenticated owner ACK retires
+        // the outbox. Broker publication alone never reaches this branch.
+        if (result.routed !== "main" && result.acknowledged !== true) throw new Error("Scripted input requires an authenticated native admission ACK");
+        acknowledgeScriptedInput({ root: root!, from: options.from ?? this.actorManager.identity,
+          sessionId: scripted.sessionId, inputId: scripted.inputId, result: { ...result, routed: "main", deadlineAt: scripted.deadlineAt } });
+      }
     } catch (error) {
       context?.signal?.throwIfAborted();
       const reason = error instanceof Error ? error.message : String(error);
@@ -669,6 +727,8 @@ export class AgentMessageRouter {
         throw new FabricParticipantStaleError(error.targetId, error.lapsedMs, options.idempotencyKey);
       }
       throw error;
+    } finally {
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
     }
     if (kind === "followUp" && result?.stalled && result.reason?.startsWith("provider-")) {
       throw new Error(
@@ -687,6 +747,41 @@ export class AgentMessageRouter {
       );
     }
     return result;
+  }
+
+  /** One finite boot/event-driven outbox pass. Call after portable ownership, native
+   * binding and routing readiness. Failed/expired offers stay visible; no timer,
+   * reconnect prompt, fresh key, fresh deadline, or generic-effect replay is created. */
+  async resumeScriptedInputs(from: MeshIdentity = this.actorManager.identity, context?: FabricInvocationContext): Promise<Array<{ inputId: string; status: "acknowledged" | "expired" | "pending"; error?: string }>> {
+    const root = this.actorManager.mesh?.root ?? this.residency?.options.config.meshRoot;
+    if (!root) throw new Error("Scripted input recovery requires a retained mesh root");
+    const pending = listPendingScriptedInputs({ root, from });
+    const outcomes: Array<{ inputId: string; status: "acknowledged" | "expired" | "pending"; error?: string }> = [];
+    for (const round of pending) {
+      const metadata = readScriptedInput(round.data)!;
+      if (Date.now() >= round.deadlineAt) { outcomes.push({ inputId: metadata.inputId, status: "expired" }); continue; }
+      try {
+        await this.#routeWithPrincipal(round.targetId, round.message, round.data, round.delivery, round.principal, context, {
+          from: round.from, idempotencyKey: round.idempotencyKey,
+          ...(round.priority === undefined ? {} : { priority: round.priority }),
+          ...(round.triggerTurn === undefined ? {} : { triggerTurn: round.triggerTurn }),
+        });
+        outcomes.push({ inputId: metadata.inputId, status: "acknowledged" });
+      } catch (error) {
+        outcomes.push({ inputId: metadata.inputId, status: Date.now() >= round.deadlineAt ? "expired" : "pending",
+          error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    return outcomes;
+  }
+
+  #admitScripted(sessionId: string, request: Parameters<typeof admitScriptedInput>[0]["request"]): FabricAgentMessageResult {
+    const root = this.actorManager.mesh?.root ?? this.residency?.options.config.meshRoot;
+    if (!root || !this.mainAgent.local || this.mainAgent.id !== `session:${sessionId}` || this.mainAgent.sessionId !== sessionId) {
+      throw new Error("Scripted input requires a retained root and exact native Main session binding");
+    }
+    return admitScriptedInput({ root, sessionId,
+      mainAgent: this.mainAgent as Parameters<typeof admitScriptedInput>[0]["mainAgent"], request });
   }
 
   /** Only this root's non-owned durable actors can wait out a dead or ownerless local lock.
@@ -773,13 +868,17 @@ export class AgentMessageRouter {
       binding?: FabricActorRunBinding;
       deadlineMs?: number;
       idempotencyKey?: string;
+      signal?: AbortSignal;
     } = {},
     provenLocal = false,
     recoverLease = true,
     authority?: FabricParticipantInfo,
     budget?: RouterWaitBudget,
   ): Promise<FabricAgentMessageResult> {
-    context?.signal?.throwIfAborted();
+    const signal = options.signal ?? context?.signal;
+    signal?.throwIfAborted();
+    const scripted = readScriptedInput(data);
+    if (scripted && Date.now() >= scripted.deadlineAt) throw new Error("Scripted input deadline expired");
     const provenance = fabricTurnProvenance(options.from ?? this.actorManager.identity, kind, "mesh", options.principal);
     // In a task child, main is the immutable immediate return address, not a role lookup.
     if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
@@ -810,9 +909,9 @@ export class AgentMessageRouter {
           kind: "agent",
           name: "Main",
         });
-        return this.mainAgent.deliverAgent(copyFabricWakeAdmission(options, {
+        const request = copyFabricWakeAdmission(options, {
           from: options.from ?? this.actorManager.identity,
-          verification: "mesh", // In-process registered producer, not a received command.
+          verification: "mesh" as const, // In-process registered producer, not a received command.
           principal: options.principal,
           ...(options.wakeCause ? { wakeCause: options.wakeCause } : {}),
           message,
@@ -823,14 +922,16 @@ export class AgentMessageRouter {
             ? { triggerTurn: options.triggerTurn }
             : {}),
           ...(data === undefined ? {} : { data }),
-        }));
+        });
+        if (scripted) return this.#admitScripted(scripted.sessionId, request);
+        return this.mainAgent.deliverAgent(request);
       }
       let participant = remoteRoot ?? this.#rootRouteSnapshot(this.mainAgent.id, authority);
       if (!participant) {
         throw (!this.#nats ? this.participants.writeStalled?.() : undefined) ?? this.#unknownParticipant(this.mainAgent.id, "Fabric Main participant");
       }
       if (!this.#nats && participant.stale && this.participants.resolveRoutingLease) {
-        if (!await this.#resolveRoutingLease(participant.id, context?.signal, budget)) throw this.#unknownParticipant(participant.id);
+        if (!await this.#resolveRoutingLease(participant.id, signal, budget)) throw this.#unknownParticipant(participant.id);
         const refreshed = this.#rootRouteSnapshot(participant.id, participant);
         if (!refreshed || refreshed.ownerHostId !== participant.ownerHostId || refreshed.ownerIdentityId !== participant.ownerIdentityId) {
           throw new FabricRouteAuthorityError(participant.id);
@@ -843,7 +944,7 @@ export class AgentMessageRouter {
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
       const ownerIncarnation = controlOwnerIncarnation(participant);
       if (ownerIncarnation === undefined && (!this.control || participant.controlProtocol === "legacy")) {
-        if (this.#nats) throw new FabricRouteAuthorityError(participant.id);
+        if (scripted || this.#nats) throw new FabricRouteAuthorityError(participant.id);
         if (options.priority) throw new Error("interrupt priority requires the Fabric Main control protocol");
         warnUnfencedControlDelivery(kind, participant.id, ++this.#legacyDeliveryCount);
         return context?.signal || options.principal
@@ -852,6 +953,8 @@ export class AgentMessageRouter {
       }
       if (!this.control) throw new Error("Fabric control plane is unavailable");
       this.#validatePresence(participant, budget, kind);
+      signal?.throwIfAborted();
+      if (scripted && ownerIncarnation === undefined) throw new FabricRouteAuthorityError(participant.id);
       return this.control.request(
         participant.ownerHostId,
         participant.id,
@@ -864,13 +967,13 @@ export class AgentMessageRouter {
           data,
           ...(options.priority ? { priority: options.priority } : {}),
           // Carry the local Main default across runtime generations (#3015).
-          ...(kind === "followUp"
+          ...(!scripted && kind === "followUp"
             ? { triggerTurn: options.triggerTurn ?? true }
             : typeof options.triggerTurn === "boolean" ? { triggerTurn: options.triggerTurn } : {}),
         },
         participant.ownerIdentityId,
         {
-          ...(context?.signal ? { signal: context.signal } : {}),
+          ...(signal ? { signal } : {}),
           ...(!this.#nats ? { routedRemoteHost: participant.remoteHost ?? null } : {}),
           ...(budget?.waited ? { mirrorLeaseWaitBudget: budget } : {}),
           ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
@@ -880,6 +983,7 @@ export class AgentMessageRouter {
       );
     }
 
+    if (scripted) throw new Error("Scripted input requires an exact native Main session target");
     if (options.priority) throw new Error("interrupt priority is supported only for a Main target");
 
     // Explicit Main addresses never reach task/actor resolution, even when absent.
@@ -1077,6 +1181,13 @@ export class AgentMessageRouter {
     verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
     try {
+      const scripted = scriptedInputControlRequest(command, from, verification);
+      if (scripted) {
+        if (!this.mainAgent.local || this.mainAgent.id !== command.targetId || this.#localMainNonInteractive()) {
+          return { accepted: false, error: "Scripted input requires this exact live native Main session" };
+        }
+        return scriptedInputControlAcceptance(this.#admitScripted(scripted.sessionId, scripted.request));
+      }
       assertSteerPriority(command.priority, command.operation);
       if (command.priority && !(this.mainAgent.local && this.mainAgent.matches(command.targetId))) {
         throw new Error("interrupt priority is supported only for a Main target");

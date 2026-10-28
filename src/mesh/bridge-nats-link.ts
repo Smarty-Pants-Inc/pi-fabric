@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { FabricParticipantRecord } from "../topology/types.js";
 import { assertNatsLinkPlatform } from "./bridge-nats-config.js";
+import { natsBridgeErrorSummary } from "./bridge-nats-diagnostics.js";
 import { BRIDGE_STALL_ALARM_TOPIC, type BridgeStallAlarm } from "./bridge.js";
 import type {
   NatsCarrierAuthorize, NatsCarrierDecision, NatsCarrierLedger, NatsCarrierRecord,
@@ -65,6 +66,8 @@ export interface NatsLinkPortOptions {
   readonly log: (line: string) => void;
   /** The hub store the link opened: the port's native file-actor listing (N1) reads it. */
   readonly fileStore: MeshStore;
+  /** Sanitized INFO error reporting, shared by the default and injected ports. */
+  readonly onError: (error: unknown) => void;
 }
 
 /** The factories the link composes (L1's and L3's by default); tests inject fakes. */
@@ -233,10 +236,11 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
   try {
     await store.prepareLock();
     signal.throwIfAborted();
+    const portOptions: NatsLinkPortOptions = { signal, log, fileStore: store,
+      onError: error => log(`NATS port: ${natsBridgeErrorSummary(error)}`) };
     port = factories.openPort
-      ? await factories.openPort(portConfig, { signal, log, fileStore: store })
-      : await openNatsBridgeSide(portConfig, { signal, log, fileStore: store, onError: error =>
-        log(`NATS port: ${error instanceof Error ? error.message : String(error)}`) });
+      ? await factories.openPort(portConfig, portOptions)
+      : await openNatsBridgeSide(portConfig, portOptions);
     const ledgerDir = path.join(config.stateDir, "ledger");
     opened = await (factories.openLedger ? factories.openLedger(ledgerDir) : openBridgeNatsLedger({ dir: ledgerDir }));
     const ledger = natsCarrierLedger(opened, config.link);
@@ -254,6 +258,8 @@ export const startNatsLink = async (config: NatsLinkStartConfig, options: NatsLi
       waitForTarget: natsLinkFileTargetAllowed(allow, () => remote!.filePresence.view()),
       bridge: {
         stopMs: STOP_MS, notifyWatchdog: systemdWatchdogNotify,
+        diagnosticTargetAdmitted: (id, direction) => allow.entries.some(entry =>
+          entry.side === (direction === "toRemote" ? "nats" : "file") && entry.id === id),
         publishStallAlarm: async (alarm: BridgeStallAlarm) => {
           const to = meshAlarmRecipient();
           if (!to) { log("stall alarm has no configured mesh alarm session recipient"); return; }

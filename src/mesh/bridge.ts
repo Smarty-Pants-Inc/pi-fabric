@@ -966,7 +966,7 @@ export class StoreBridgeSide implements BridgeSide {
   // pass the byte budget, and `through` stays at the last event it covers. One event that alone
   // passes the budget is skipped with evidence, never a stall of the cursor.
   async read(after: number, pageBytes = BRIDGE_PAGE_BYTES): Promise<BridgeRead> {
-    return this.#page(this.store.read({ after, limit: this.store.maxReadEvents }), after, pageBytes);
+    return this.#page(await this.store.readAsync({ after, limit: this.store.maxReadEvents }), after, pageBytes);
   }
 
   async latestCursor(): Promise<BridgeHead> {
@@ -985,7 +985,7 @@ export class StoreBridgeSide implements BridgeSide {
       // is harmless unless the store actually holds an event inside the gap.
       const first = page.events.find(event => event.sequence > after);
       const gap = first !== undefined && first.sequence > after + 1 &&
-        (this.store.nextEventAfter(after)?.sequence ?? Infinity) < first.sequence;
+        ((await this.store.nextEventAfterAsync(after))?.sequence ?? Infinity) < first.sequence;
       if (!gap && meshCursorGeneration(page.nextOffset) === meshCursorGeneration(offset) && page.nextOffset >= offset) {
         return this.#page(page.events, after, pageBytes, { start: offset, cursors: page.cursors ?? [], end: page.nextOffset });
       }
@@ -1355,7 +1355,7 @@ export class StoreBridgeSide implements BridgeSide {
 
   async publishWithReceipt(event: BridgePublish, held: string[] = [], fromHub = false): Promise<BridgePublishReceipt> {
     const { sequence } = await this.publish(event, held, fromHub);
-    const appended = this.store.read({ after: sequence - 1, limit: 1 })[0];
+    const appended = (await this.store.readAsync({ after: sequence - 1, limit: 1 }))[0];
     return { sequence, ...(appended?.sequence === sequence ? { createdAt: appended.createdAt } : {}) };
   }
 
@@ -2608,7 +2608,7 @@ export class StoreBridgeSide implements BridgeSide {
     const ids: string[] = [];
     let cursor = after;
     while (true) {
-      const page = this.store.read({ after: cursor, limit: this.store.maxReadEvents });
+      const page = await this.store.readAsync({ after: cursor, limit: this.store.maxReadEvents });
       for (const event of page) {
         const stamp = bridgeStampOf(event);
         if ((stamp?.via ?? stamp?.from) === this.peer) ids.push(stamp!.id);

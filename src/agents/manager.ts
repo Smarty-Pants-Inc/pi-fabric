@@ -1446,6 +1446,8 @@ export class AgentManager {
     actorId: string | null; actorName: string | null; runId: string;
     acquiredAt: number; lastProgressAt: number; statusStamp?: string;
   }>();
+  /** One bounded progress fact per actor, independent of snapshot publication and run-handle retention. */
+  readonly #actorProgress = new Map<string, { lastProgressAt: number; finishedRunId?: string }>();
   readonly #admissionWaiting = new Map<string, {
     actorId: string | null; actorName: string | null; runId: string; since: number;
   }>();
@@ -1829,7 +1831,6 @@ export class AgentManager {
     info: { id: string; actorId?: string | undefined; actorName?: string | undefined },
     release: () => void,
   ): () => void {
-    if (!this.#admissionSnapshotPath) return release;
     const now = Date.now();
     this.#admissionWaiting.delete(info.id);
     this.#admissionOwners.set(info.id, {
@@ -1847,23 +1848,42 @@ export class AgentManager {
     });
   }
 
-  #noteAdmissionProgress(id: string): void {
+  #noteAdmissionProgress(id: string, occurredAt: number): void {
+    if (!Number.isFinite(occurredAt) || occurredAt < 0) return;
     const owner = this.#admissionOwners.get(id);
+    const actorId = owner?.actorId ?? this.#runs.get(id)?.actorId;
+    if (actorId) {
+      const previous = this.#actorProgress.get(actorId);
+      this.#actorProgress.set(actorId, { ...previous,
+        lastProgressAt: Math.max(previous?.lastProgressAt ?? 0, occurredAt) });
+    }
     if (!owner) return;
-    owner.lastProgressAt = Math.max(owner.lastProgressAt, Date.now());
+    owner.lastProgressAt = Math.max(owner.lastProgressAt, occurredAt);
     this.#scheduleAdmissionSnapshot();
   }
 
   #observeAdmissionStatus(id: string, record: AgentRunRecord): void {
     const owner = this.#admissionOwners.get(id);
     if (!owner) return;
-    // Bounded metadata only: no prompt/output retention, and no polling-time stamp.
-    const stamp = JSON.stringify([record.updatedAt, record.status, record.turns, record.toolCalls,
+    // Bounded progress metadata only: updatedAt alone may be a heartbeat, not work.
+    const stamp = JSON.stringify([record.status, record.turns, record.toolCalls, record.text?.length,
+      record.inferenceStarted, record.finishingAt, record.finishedAt,
       record.currentTool, record.currentToolStartedAt, record.runnerSessionId,
       record.usage.input, record.usage.output, record.usage.cacheRead, record.usage.cacheWrite, record.usage.cost]);
     if (owner.statusStamp === stamp) return;
     owner.statusStamp = stamp;
-    this.#noteAdmissionProgress(id);
+    this.#noteAdmissionProgress(id, record.updatedAt);
+  }
+
+  /** Internal, read-only health evidence; reads never create progress or release execution custody. */
+  actorHealthEvidence(actorId: string, runId?: string): { lastProgressAt: number | null; runFinished: boolean } {
+    const progress = this.#actorProgress.get(actorId);
+    const managed = runId ? this.#runs.get(runId) : undefined;
+    const record = managed?.latestRecord;
+    return { lastProgressAt: progress?.lastProgressAt ?? null,
+      runFinished: runId !== undefined && (progress?.finishedRunId === runId ||
+        (managed?.actorId === actorId && (managed.settled || record?.finishedAt !== undefined ||
+          (record !== undefined && terminalStatuses.has(record.status))))) };
   }
 
   /** This runtime's creation host, not a child participant's upstream owner. */
@@ -6829,7 +6849,7 @@ export class AgentManager {
     const receipt = readFinalAnswerReceipt(managed.runDirectory, managed.id);
     if (!receipt) return false;
     managed.finalAnswer = { ...receipt, text: "" }; // Fence ingress; the receipt's full text stays on disk.
-    this.#noteAdmissionProgress(managed.id);
+    this.#noteAdmissionProgress(managed.id, receipt.recordedAt);
     managed.finalAnswerCompletion = (async () => {
       let snapshot = readRecord(managed.statusFile) ?? managed.latestRecord;
       {
@@ -7526,6 +7546,9 @@ export class AgentManager {
       };
     }
     if (!beginAgentSettlement(managed)) return;
+    this.#noteAdmissionProgress(managed.id, result.finishedAt ?? result.updatedAt);
+    const progress = managed.actorId ? this.#actorProgress.get(managed.actorId) : undefined;
+    if (progress) progress.finishedRunId = managed.id;
     managed.questions?.abort(new Error("Agent run settled"));
     delete managed.taskCustodyIndex;
     managed.hosted?.close();
@@ -7873,12 +7896,12 @@ export class AgentManager {
         const parsed = JSON.parse(line) as Record<string, unknown>;
         if (parsed.version !== 1 || typeof parsed.occurredAt !== "number") continue;
         if (parsed.event === "message.refused") {
-          this.#noteAdmissionProgress(managed.id);
+          this.#noteAdmissionProgress(managed.id, parsed.occurredAt);
           this.#retainTerminalNotice(managed, parsed.data);
           continue;
         }
         if (parsed.event === "question") {
-          this.#noteAdmissionProgress(managed.id);
+          this.#noteAdmissionProgress(managed.id, parsed.occurredAt);
           this.#routeChildQuestion(managed, parsed.data);
           continue;
         }
@@ -7886,7 +7909,7 @@ export class AgentManager {
           if (!Object.prototype.hasOwnProperty.call(parsed, "data")) continue;
           const usage = tokenUsagePayloadFromValue(parsed.data);
           if (usage) {
-            this.#noteAdmissionProgress(managed.id);
+            this.#noteAdmissionProgress(managed.id, parsed.occurredAt);
             this.#onTokenUsage(managed, usage, parsed.occurredAt);
           }
           continue;
@@ -7895,7 +7918,7 @@ export class AgentManager {
           !isFabricLifecycleEventType(parsed.event) ||
           !parsed.event.startsWith("pi.")
         ) continue;
-        this.#noteAdmissionProgress(managed.id);
+        this.#noteAdmissionProgress(managed.id, parsed.occurredAt);
         this.#emitLifecycle(
           managed,
           parsed.event,
@@ -8007,7 +8030,7 @@ export class AgentManager {
     occurredAt: number,
     options: { status?: string; data?: unknown } = {},
   ): void {
-    if (event === "run.spawned" || event === "run.resumed") this.#noteAdmissionProgress(managed.id);
+    if (event === "run.spawned" || event === "run.resumed") this.#noteAdmissionProgress(managed.id, occurredAt);
     if (!this.#onLifecycle) return;
     try {
       this.#onLifecycle({

@@ -503,6 +503,13 @@ export interface FabricActorSessionOrphan {
     persisted?: Array<{ by: string; at: number; settledAt?: number; retiredAt?: number; retiredBy?: string }> };
 }
 
+/** Owner-derived runtime health; dormant actors are intentionally not resident. */
+export interface FabricActorHealth {
+  state: "healthy" | "stale" | "unknown";
+  /** Last observed worker/lifecycle progress, retained after completion; null when not known. */
+  lastProgressAt: number | null;
+}
+
 export interface FabricActorInfo extends FabricActorBatching {
   id: string;
   /** Only on an agents.stop({ dropQueued: true }) result that archived work (smarty-dev#16416). */
@@ -527,6 +534,8 @@ export interface FabricActorInfo extends FabricActorBatching {
   /** The creating root's project; its project agent receives the actor's work (smarty-dev#878). */
   project?: string;
   status: FabricActorStatus;
+  /** Always emitted by the managing owner; optional only for legacy snapshots. */
+  health?: FabricActorHealth;
   /** Present only while stopped; missing on a legacy stop means explicit. */
   stopReason?: FabricActorStopReason;
   /** Terminal foreign session-root record, not authority to adopt it. Its own session's restart revives it. */

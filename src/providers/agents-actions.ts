@@ -791,6 +791,12 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "read",
   },
   {
+    name: "actorHealth",
+    description: "Read compact owner-observed actor health: state and lastProgressAt only. Missing actors, unavailable owners, and legacy snapshots report unknown; never starts or wakes an actor.",
+    inputSchema: idSchema,
+    risk: "read",
+  },
+  {
     name: "instructions",
     description:
       "Read a live actor's current instruction text with its sha256 instructionsDigest and instructionsLength. Use it to check the text before and after agents.setInstructions. Writes nothing.",

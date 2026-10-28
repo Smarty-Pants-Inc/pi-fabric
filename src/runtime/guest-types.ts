@@ -237,6 +237,8 @@ interface FabricParticipantInfo {
   usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
   actorQueued?: number;
   actorMessages?: number;
+  /** Owner-observed health; unavailable once this actor participant's lease is stale. */
+  actorHealth?: FabricActorHealth;
   /** Accepted actor activation without a launched worker. */
   actorPreparing?: FabricActorInfo["preparing"];
   controlProtocol: "v1" | "legacy";
@@ -881,6 +883,11 @@ type FabricActorTemplate = Omit<FabricActorRequestBase, "validWhile" | "timeout_
 };
 // Mirror actors/types.ts: guest programs use the same live actor states and diagnostics.
 type FabricActorStatus = "dormant" | "idle" | "queued" | "preparing" | "waiting" | "running" | "stopped" | "failed" | "failing-preparation";
+/** Fresh owner-observed worker progress, independent of the actor's running status. */
+interface FabricActorHealth {
+  state: "healthy" | "stale" | "unknown";
+  lastProgressAt: number | null;
+}
 interface FabricActorActivationIdentity {
   actorId: string;
   name: string;
@@ -929,6 +936,8 @@ interface FabricActorInfo extends FabricActorBatching {
   /** The session that owns and runs the actor, whoever reads it; binding.sessionId is the reading session. */
   ownerSessionId?: string;
   status: FabricActorStatus;
+  /** Missing only on legacy snapshots/fixtures; consumers must treat absence as unknown. */
+  health?: FabricActorHealth;
   runner: FabricAgentRunner;
   events: FabricActorHostEvent[];
   topics: string[];
@@ -1255,6 +1264,8 @@ interface FabricAgentsApi {
   /** Advisory compaction of a running Pi-runner child at its next safe turn boundary. */
   compact(args: { id: string; instructions?: string }): Promise<{ queued: true; messageId: string }>;
   actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorReadInfo | FabricActorSelfReadInfo>;
+  /** Exactly state and lastProgressAt. Missing actors/owners and legacy health are unknown; never activates an actor. */
+  actorHealth(args: FabricAgentTargetArgs): Promise<FabricActorHealth>;
   /** Inspect session (default) or the selected live durable host without changing authority. */
   slotStatus(args?: FabricSlotStatusOptions): Promise<FabricSlotStatus>;
   /** Read a live actor's instruction text and its sha256 digest. Writes nothing. */

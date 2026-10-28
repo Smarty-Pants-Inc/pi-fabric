@@ -65,6 +65,7 @@ import type {
   FabricActorDeliveryRequest,
   FabricActorDirective,
   FabricActorHostEvent,
+  FabricActorHealth,
   FabricActorInfo,
   FabricActorLog,
   FabricActorMessage,
@@ -8947,10 +8948,20 @@ export class ActorManager {
    * this host cannot prove (no live handle, no local process, no start time, an unreadable /proc) is
    * "worker-unverified" (pi-fabric#944 round 1).
    */
-  #runGone(runId: string): string | undefined {
+  #runGone(runId: string, forHealth = false): string | undefined {
     const directory = this.agents.runDirectory(runId);
     if (!directory) return "worker-unverified";
-    if (!fs.existsSync(directory)) return "run-dir-missing";
+    if (forHealth) {
+      try { if (!fs.statSync(directory).isDirectory()) return "run-dir-missing"; }
+      catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        return code === "ENOENT" || code === "ENOTDIR" ? "run-dir-missing" : "worker-unverified";
+      }
+    } else if (!fs.existsSync(directory)) return "run-dir-missing";
+    const record = forHealth ? readRunRecord(path.join(directory, "status.json")) : undefined;
+    // A finished activation is stale even if native teardown still holds a live process/handle.
+    if (record?.id === runId && (Number.isFinite(record.finishedAt) ||
+      (RUN_STATUSES.has(record.status) && record.status !== "running" && record.status !== "queued"))) return "run-finished";
     // TODO(pi-fabric#939): use its OwnedProcess {pid, /proc start time} once it lands; this is the same field-22
     // comparison, done locally.
     const worker = this.agents.workerIdentity(runId);
@@ -8964,6 +8975,10 @@ export class ActorManager {
     } else if (current !== worker.startTime) return "worker-pid-reused";
     // The launched worker is alive. Past the threshold (far beyond any startup window) it must also have written a
     // readable status record; an absent or corrupt one fails toward the alarm. A readable one never clears a dead worker.
+    if (forHealth) {
+      return worker.open && record?.id === runId && record.status === "running" &&
+        Number.isFinite(record.startedAt) && Number.isFinite(record.updatedAt) ? undefined : "worker-unverified";
+    }
     return readRunRecord(path.join(directory, "status.json")) ? undefined : "worker-unverified";
   }
 
@@ -11195,6 +11210,31 @@ export class ActorManager {
       ? actor.preparing.phase === "waiting" ? "waiting" : "preparing" : actor.status;
   }
 
+  #health(actor: ManagedActor, status: FabricActorStatus, blockExpired: boolean): FabricActorHealth {
+    const run = actor.inFlightRun;
+    const evidence = this.agents.actorHealthEvidence(actor.id, run?.id);
+    const health: FabricActorHealth = { state: "unknown", lastProgressAt: evidence.lastProgressAt };
+    try {
+      // A cached registry row is not a live-owner assertion. Keep publication/release fences observational.
+      if (this.#closing || this.#releasePaused || this.#canConsumeMesh?.() === false ||
+        !this.#ownershipDecision(actor.id, true, true)) return health;
+      if (actor.removal || (actor.activationBlocked && !blockExpired) || status === "stopped" ||
+        status === "failed" || status === "failing-preparation" || status === "dormant") {
+        health.state = "stale";
+      } else if (run || status === "running") {
+        if (!run) return health;
+        // Logical completion wins over PID liveness: cleanup may lag the returned result indefinitely.
+        if (evidence.runFinished || actor.lastRunId === run.id) health.state = "stale";
+        else {
+          // Reuse stuck-run proof immediately, without its alarm's 30-minute age gate.
+          const gone = this.#runGone(run.id, true);
+          health.state = gone === undefined ? "healthy" : gone === "worker-unverified" ? "unknown" : "stale";
+        }
+      } else if (this.#slotCurrent(actor)) health.state = "healthy";
+    } catch { /* Unreadable owner or worker evidence is unknown, never healthy. */ }
+    return health;
+  }
+
   #publicInfo(actor: ManagedActor, includePresenceError = true, registryView = false): FabricActorInfo {
     const session = registryView ? undefined : this.#bindings.get(actor.id);
     // Shared observers cannot know a legacy row's last admitted binding. An
@@ -11202,6 +11242,7 @@ export class ActorManager {
     const effective = registryView ? actor.resolvedBinding ?? this.#restoredBinding(actor) ?? {} : this.#runBinding(actor);
     // An expired transient block no longer gates routing; its history stays visible (smarty-dev#8487).
     const blockExpired = activationBlockExpired(actor.activationBlocked);
+    const status = this.#routingStatus(actor, blockExpired);
     return {
       id: actor.id,
       scope: this.#actorScope,
@@ -11219,7 +11260,8 @@ export class ActorManager {
       instructionsLength: actor.instructions.length,
       // Failed is a routing view, not a destructive stop: retained events and
       // explicit repair/probe asks can still run. Success clears the durable streak.
-      status: this.#routingStatus(actor, blockExpired),
+      status,
+      health: this.#health(actor, status, blockExpired),
       ...(actor.status === "stopped" && actor.stopReason ? { stopReason: actor.stopReason } : {}),
       ...(actor.preparing ? { preparing: { ...actor.preparing,
         ageS: Math.max(0, Math.round((Date.now() - actor.preparing.startedAt) / 1_000)),
@@ -11336,7 +11378,7 @@ export class ActorManager {
     finally { this.#directoryOwnership = undefined; this.#directoryOwnershipScope = undefined; this.#directoryLineages = undefined; }
   }
 
-  #ownershipDecision(id: string, fresh = true): boolean {
+  #ownershipDecision(id: string, fresh = true, requireLive = false): boolean {
     if (this.#ceded.has(id)) return false;
     const actor = this.#actors.get(id);
     const lineage = this.#persistedLineages.get(id);
@@ -11358,6 +11400,9 @@ export class ActorManager {
     // The participant directory is authoritative when it has a live opinion.
     if (decision === false) return false;
     if (decision === true) return true;
+
+    // Health cannot turn an unknown directory opinion into a live-owner assertion.
+    if (requireLive && (this.#canManageActor || this.#snapshotActorOwnership)) return false;
 
     // No live directory signal.
     if (actor && this.#claimResidency && actor.rootId !== this.#rootId) {

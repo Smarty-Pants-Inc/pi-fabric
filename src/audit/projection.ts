@@ -143,6 +143,7 @@ const idOnlyAgentActions = new Set([
   "agents.setFollowUpMode",
   "agents.compact",
   "agents.actorStatus",
+  "agents.actorHealth",
   "agents.instructions",
   "agents.setModel",
   "agents.setThinking",

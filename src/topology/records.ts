@@ -115,6 +115,7 @@ export const actorParticipantRecord = (
   ...(actor.ownershipToken !== undefined ? { actorOwnershipToken: actor.ownershipToken } : {}),
   actorQueued: actor.queued,
   actorMessages: actor.messages,
+  ...(actor.health ? { actorHealth: { state: actor.health.state, lastProgressAt: actor.health.lastProgressAt } } : {}),
   ...(actor.preparing ? { actorPreparing: { ...actor.preparing } } : {}),
   ...(actor.inFlightRun ? { actorRun: { id: actor.inFlightRun.id, startedAt: actor.inFlightRun.startedAt } } : {}),
   ...(actor.removal

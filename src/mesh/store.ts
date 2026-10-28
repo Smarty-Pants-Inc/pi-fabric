@@ -1079,7 +1079,8 @@ export class MeshStore {
    * or now another process (another native incarnation) permits it; one with no or an invalid
    * incarnation (a failed or not yet settled native read) only when its PID is gone (pi-fabric#1562; custody-lock.ts
    * clearDeadCustodyLock);
-   * a missing owner pid is an alarmed typed refusal, never an ordinary busy timeout. */
+   * a present receipt with a missing or invalid owner PID is an alarmed typed refusal;
+   * an absent receipt remains ordinary busy contention, never proof authorizing recovery. */
   async leaseCustody<T>(file: string, operation: () => T | Promise<T>, lockTimeoutMs = 0,
     options: { ownIncarnation?: string | undefined } = {}): Promise<T> {
     const hash = createHash("sha256").update(path.basename(file)).digest("hex");

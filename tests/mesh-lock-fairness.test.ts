@@ -16,6 +16,12 @@ const scratch = () => {
   return root;
 };
 const queue = meshLockQueueDirectory;
+const elapsedClock = () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
+  // Keep native within-tick receipt order; only genuinely elapsed fixture intervals are added.
+  const hostNow = process.hrtime.bigint.bind(process.hrtime);
+  vi.spyOn(process.hrtime, "bigint").mockImplementation(() => hostNow() + BigInt(Math.round(performance.now() * 1_000_000)));
+};
 const held = (root: string) => {
   const lock = path.join(root, ".lock");
   fs.mkdirSync(lock);
@@ -23,7 +29,7 @@ const held = (root: string) => {
   return lock;
 };
 const oldTicket = (root: string, pid: number, age = 0) => {
-  fs.mkdirSync(queue(root), { recursive: true });
+  fs.mkdirSync(queue(root), { recursive: true, mode: 0o700 }); // a valid private admission namespace even when this case runs alone
   const file = path.join(queue(root), `${"0".repeat(24)}-${pid}-${randomUUID()}`);
   fs.writeFileSync(file, "");
   if (age) fs.utimesSync(file, new Date(Date.now() - age), new Date(Date.now() - age));
@@ -156,16 +162,33 @@ describe("bounded FIFO mesh admission", () => {
   });
 
   it.each(["dead", "stale"])("removes an oldest %s ticket without removing an actual lock", async (kind) => {
+    elapsedClock();
     const root = scratch();
     const stale = oldTicket(root, kind === "dead" ? 999999999 : process.pid, kind === "stale" ? 31000 : 0);
+    const judged = fs.lstatSync(stale);
     const store = new MeshStore(root, 65536, 100);
-    await expect(store.exclusive(() => "done")).resolves.toBe("done");
+    const pending = store.exclusive(() => "done"); // retain the actual MeshStore -> MeshLock -> ticket cleanup path
+    await vi.advanceTimersByTimeAsync(0); // drain setup continuations without granting any elapsed observation age
+    if (kind === "stale") {
+      expect(fs.lstatSync(stale).ino).toBe(judged.ino); // old persisted wall time grants no removal on first sight
+      expect(fs.lstatSync(stale).mtimeMs).toBe(judged.mtimeMs);
+      expect(fs.readdirSync(queue(root))).toHaveLength(2);
+      expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
+      await vi.advanceTimersByTimeAsync(1000); // default 10s budget: exactly the 1s stall bound is not enough
+      expect(fs.lstatSync(stale).ino).toBe(judged.ino);
+      await vi.advanceTimersByTimeAsync(20); // next real elapsed observation reaps the same receipt and promotes FIFO
+    } else {
+      expect(() => process.kill(999999999, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+      expect(fs.existsSync(stale)).toBe(false); // proven dead PID cleans immediately, before advancing any clock
+      expect(performance.now()).toBe(0);
+    }
+    await expect(pending).resolves.toBe("done");
     expect(fs.existsSync(stale)).toBe(false);
     expect(fs.readdirSync(queue(root))).toEqual([]);
   });
 
   it("falls back after 80% of the budget even behind a live stalled ticket", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    elapsedClock();
     const root = scratch();
     const first = oldTicket(root, process.pid);
     const store = new MeshStore(root, 65536, 100, { lockTimeoutMs: 100 });

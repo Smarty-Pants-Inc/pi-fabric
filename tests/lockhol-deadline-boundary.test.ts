@@ -30,21 +30,31 @@ const scratch = (): string => {
 };
 const receipts = (root: string): string[] => fs.readdirSync(meshLockQueueDirectory(root))
   .filter(name => /^\d{24}-\d+-/.test(name)).sort();
-const clock = () => {
+const clock = (observePolling = false) => {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
-  vi.spyOn(performance, "now").mockReturnValue(0);
+  let observationMs = 0;
+  vi.spyOn(performance, "now").mockImplementation(() => observationMs);
   const wall = Date.now(), base = process.hrtime.bigint();
   let elapsed = 0n;
-  vi.spyOn(process.hrtime, "bigint").mockImplementation(() => base + elapsed);
+  const hostReads: bigint[] = [];
+  vi.spyOn(process.hrtime, "bigint").mockImplementation(() => {
+    hostReads.push(elapsed);
+    return base + elapsed;
+  });
   // Polling is the existing <=20 ms safety net; suppress real native watch scheduling.
   vi.spyOn(fs, "watch").mockImplementation((() => Object.assign(new EventEmitter(), {
     close() { /* no native watch opened */ },
   })) as unknown as typeof fs.watch);
   return {
-    wall,
+    wall, hostReads,
     get elapsedMs() { return Number(elapsed) / 1_000_000; },
     setElapsed(ns: bigint) { elapsed = ns; },
-    async advance(ms: number) { elapsed += BigInt(ms) * 1_000_000n; await vi.advanceTimersByTimeAsync(ms); },
+    freezeObservations() { observePolling = false; },
+    async advance(ms: number) {
+      elapsed += BigInt(ms) * 1_000_000n;
+      if (observePolling) observationMs += ms;
+      await vi.advanceTimersByTimeAsync(ms);
+    },
   };
 };
 const entry = (root: string, elapsedMs: number): string => {
@@ -77,14 +87,32 @@ describe.each([1, 2, 3] as const)("protocol %s: lockhol post-admission deadline"
     const original = receipts(root);
     expect(original).toHaveLength(2);
     const blockedFile = path.join(meshLockQueueDirectory(root), original[1]!);
-    const time = clock();
+    // Receipt construction above used the real host clock, preserving strict FIFO prefixes.
+    // Only pre-stall polling advances the local observation clock; the other cases keep it frozen.
+    const time = clock(true);
+    const timers: Array<{ ms: number | undefined; fired: boolean }> = [];
+    const setTimer = globalThis.setTimeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: () => void, ms?: number) => {
+      const timer = { ms, fired: false };
+      timers.push(timer);
+      return setTimer(() => { timer.fired = true; callback(); }, ms);
+    }) as typeof setTimeout);
+    const snapshot = () => ({ performanceMs: performance.now(), hostElapsedMs: time.elapsedMs,
+      wallElapsedMs: Date.now() - time.wall, timersFired: timers.filter(timer => timer.fired).length,
+      pendingTimers: vi.getTimerCount() });
+    const verified: Array<{ file: string; performanceMs: number; hostElapsedMs: number }> = [];
+    let stall: { before: ReturnType<typeof snapshot>; after: ReturnType<typeof snapshot> } | undefined;
     let blocked = false;
     verifiedRemoveTestHooks.beforeOpen = file => {
+      verified.push({ file, performanceMs: performance.now(), hostElapsedMs: time.elapsedMs });
       if (file !== blockedFile || blocked) return;
       blocked = true;
-      // No timer advancement here: model the recorded synchronous verifier stall exactly.
+      time.freezeObservations();
+      const before = snapshot();
+      // No timer/performance advancement here: model the recorded synchronous verifier stall exactly.
       time.setElapsed(2_512_000_000n);
       vi.setSystemTime(time.wall + (correction === "forward" ? 2512 : -60_000));
+      stall = { before, after: snapshot() };
     };
     const mkdir = vi.spyOn(fs, "mkdirSync");
     const operation = vi.fn(() => entry(root, time.elapsedMs));
@@ -93,8 +121,29 @@ describe.each([1, 2, 3] as const)("protocol %s: lockhol post-admission deadline"
     const result = await pending;
     const attempts = mkdir.mock.calls.filter(([file]) => String(file) === path.join(root, ".lock")).length;
     report(root, { case: "synchronous-admission", protocol, correction, budgetMs: 2000,
-      elapsedMs: time.elapsedMs, original, blocked, attempts, entered: operation.mock.calls.length,
+      elapsedMs: time.elapsedMs, original, blocked, verified, stall,
+      budgetTimers: timers.filter(timer => timer.ms === 2001),
+      hostGuardConsulted: time.hostReads.includes(2_512_000_000n),
+      attempts, entered: operation.mock.calls.length,
       outcome: result instanceof Error ? { name: result.name, message: result.message } : result });
+    expect(BigInt(original[1]!.split("-")[0]!)).toBeGreaterThan(BigInt(original[0]!.split("-")[0]!));
+    expect(verified.map(item => item.file)).toEqual(original.map(name => path.join(meshLockQueueDirectory(root), name)));
+    expect(verified[0]!.performanceMs).toBeGreaterThan(200);
+    expect(verified[1]!.performanceMs - verified[0]!.performanceMs).toBeGreaterThan(200);
+    expect(verified.every(item => item.performanceMs === item.hostElapsedMs)).toBe(true);
+    expect(stall).toBeDefined();
+    expect(stall!.before.performanceMs).toBe(stall!.before.hostElapsedMs);
+    expect(stall!.before.wallElapsedMs).toBe(stall!.before.hostElapsedMs);
+    expect(stall!.before.timersFired).toBeGreaterThan(0);
+    expect(stall!.after.performanceMs).toBe(stall!.before.performanceMs);
+    expect(performance.now()).toBe(stall!.before.performanceMs);
+    expect(stall!.after.timersFired).toBe(stall!.before.timersFired);
+    expect(timers.filter(timer => timer.fired)).toHaveLength(stall!.before.timersFired);
+    expect(stall!.after.pendingTimers).toBe(stall!.before.pendingTimers);
+    expect(stall!.after.hostElapsedMs).toBe(2512);
+    expect(stall!.after.wallElapsedMs).toBe(correction === "forward" ? 2512 : -60_000);
+    expect(timers.filter(timer => timer.ms === 2001)).toEqual([{ ms: 2001, fired: false }]);
+    expect(time.hostReads).toContain(2_512_000_000n);
     expect(blocked).toBe(true);
     expect(time.elapsedMs).toBe(2512);
     expect(result).toBeInstanceOf(MeshLockQueueExpiredError);

@@ -48,6 +48,8 @@ export class MeshLockTicket {
   readonly #bypassLock: string | undefined;
   #queueHead: string | undefined;
   #predecessorStat: fs.Stats | undefined;
+  #observedPredecessor: string | undefined;
+  #predecessorSeenAt = 0;
   #observedBeat: string | undefined;
   #beatSeenAt = 0;
   #headCheckedAt = 0;
@@ -55,8 +57,6 @@ export class MeshLockTicket {
   #head = false;
   #predecessor: string | undefined;
   #touchedAt = 0;
-  #observedHead: string | undefined;
-  #observedAt = 0;
   #rootWatcher: fs.FSWatcher | undefined;
   #predecessorWatcher: fs.FSWatcher | undefined;
   #watched: string | undefined;
@@ -79,7 +79,7 @@ export class MeshLockTicket {
     // hrtime is a host-wide monotonic clock, unlike a wall clock that can step backwards.
     this.#name = `${process.hrtime.bigint().toString().padStart(24, "0")}-${process.pid}-${token}`;
     this.#file = path.join(this.#directory, this.#name);
-    this.#fallbackAt = Date.now() + Math.min(10_000, Math.max(0, budgetMs * 0.8));
+    this.#fallbackAt = performance.now() + Math.min(10_000, Math.max(0, budgetMs * 0.8));
     this.#staleMs = Math.max(30_000, budgetMs * 2);
     this.#gated = budgetMs >= GATED_BUDGET_MS;
     this.#stallMs = Math.min(2000, Math.max(4 * HEARTBEAT_MS, budgetMs * 0.1));
@@ -110,7 +110,7 @@ export class MeshLockTicket {
   mayContend(): boolean {
     if (this.#closed) return true;
     // Short (try) budgets keep the previous unconditional 80% fallback, head included.
-    if (!this.#gated && Date.now() >= this.#fallbackAt) { this.close(); return true; }
+    if (!this.#gated && performance.now() >= this.#fallbackAt) { this.close(); return true; }
     if (this.#head) { this.#heartbeat(); return true; }
     if (this.#predecessor !== undefined && this.#waitingOn(this.#predecessor)) {
       const held = this.#holdBack();
@@ -148,7 +148,15 @@ export class MeshLockTicket {
     const file = path.join(this.#directory, name);
     try {
       const stat = fs.lstatSync(file);
-      if (pidAlive(name) && Date.now() - stat.mtimeMs <= this.#staleMs) {
+      const now = performance.now();
+      // mtime is another process's persisted wall clock, not an elapsed-time origin. Age only our own
+      // unchanged (name, dev, ino, mtime) observation; first sight and any identity/heartbeat change reset it.
+      const beat = `${name}:${stat.dev}:${stat.ino}:${stat.mtimeMs}`;
+      if (beat !== this.#observedPredecessor) {
+        this.#observedPredecessor = beat;
+        this.#predecessorSeenAt = now;
+      }
+      if (pidAlive(name) && now - this.#predecessorSeenAt <= this.#staleMs) {
         this.#predecessorStat = stat;
         return true;
       }
@@ -159,11 +167,12 @@ export class MeshLockTicket {
       // A receipt is a regular file (main unlinked it; an unlink never removes a directory): anything else is kept and
       // waited on, never handed to a recursive removal. verifiedRemove's `.retention-graveyard-*` never matches TICKET.
       if (!stat.isFile()) return true;
-      if (!verifiedRemove(file, stat, { deleter: "meshLockQueueReceipt", fallback: () => {
+      if (!verifiedRemove(file, stat, { deleter: "meshLockQueueReceipt", proceed: () => this.#canonicalLockAbsent(), fallback: () => {
         if (this.#bypassLock !== undefined && !this.#canonicalLockAbsent()) return false;
         fs.unlinkSync(file);
         return true;
       } }).removed) {
+        this.#predecessorSeenAt = now; // a verification refusal gets another full observation bound
         return fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined;
       }
     } catch (error) {
@@ -173,14 +182,14 @@ export class MeshLockTicket {
   }
 
   /** Past 80% of an ordinary budget (with `passStalledHead`, at any time), join the plain contest only if the head is
-   * stalled: neither its heartbeat nor our first sight of it as head is within the stall bound. The second term
-   * keeps a head that has only just taken over from being judged by its old creation time. Returns undefined when the
+   * stalled: its exact identity/heartbeat has stayed unchanged for a full local monotonic observation bound.
+   * A head that has only just taken over cannot be judged by its old creation time. Returns undefined when the
    * canonical-lock waiter reaped its stalled head and the caller must rescan. */
   #holdBack(): boolean | undefined {
     if (this.#reapStalledHead()) return undefined;
     // Keep the late plain-contest fallback, even for canonical queues: a dead canonical owner can leave .lock
     // present behind an alive stalled head. Only the acquisition path can prove/recover that dead owner.
-    const now = Date.now();
+    const now = performance.now();
     if (now < this.#fallbackAt) {
       // smarty-dev#10516: a stalled head otherwise holds every waiter to 80% of its budget, and most then time out in
       // the last 20%. One queue listing per heartbeat interval at most, not one per poll.
@@ -189,16 +198,27 @@ export class MeshLockTicket {
     }
     const head = fs.readdirSync(this.#directory).filter(name => TICKET.test(name)).sort()[0];
     if (head === undefined || head === this.#name) return false; // the next scan makes us head
-    if (head !== this.#observedHead) { this.#observedHead = head; this.#observedAt = now; }
     try {
-      const heartbeat = Math.max(fs.statSync(path.join(this.#directory, head)).mtimeMs, this.#observedAt);
-      if (now - heartbeat <= this.#stallMs) return false;
+      const stat = fs.lstatSync(path.join(this.#directory, head));
+      if (!stat.isFile() || !this.#headStalled(head, stat, now)) return false;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
       throw error;
     }
     this.close();
     return true;
+  }
+
+  /** Both early reaping and legacy fallback use the same local observation, never a wall-clock mtime age.
+   * Include the head's name so promotion, inode replacement and heartbeat changes each get a full stall bound. */
+  #headStalled(name: string, stat: fs.Stats, now: number): boolean {
+    const beat = `${name}:${stat.dev}:${stat.ino}:${stat.mtimeMs}`;
+    if (beat !== this.#observedBeat) {
+      this.#observedBeat = beat;
+      this.#beatSeenAt = now;
+      return false;
+    }
+    return now - this.#beatSeenAt > this.#stallMs;
   }
 
   /** smarty-dev#9805: any live waiter can recover a stalled head, even if its immediate successor is stalled too.
@@ -217,14 +237,8 @@ export class MeshLockTicket {
       throw error;
     }
     if (judged === undefined || !judged.isFile()) return false;
-    const now = Date.now();
-    const beat = `${this.#queueHead}:${judged.dev}:${judged.ino}:${judged.mtimeMs}`;
-    if (beat !== this.#observedBeat) {
-      this.#observedBeat = beat;
-      this.#beatSeenAt = now;
-      return false;
-    }
-    if (now - this.#beatSeenAt <= this.#stallMs) return false;
+    const now = performance.now();
+    if (!this.#headStalled(this.#queueHead, judged, now)) return false;
     if (!this.#canonicalLockAbsent()) return false;
     try {
       const removed = verifiedRemove(file, judged, { deleter: "meshLockQueueReceipt", proceed: () => this.#canonicalLockAbsent(), fallback: () => {
@@ -255,10 +269,13 @@ export class MeshLockTicket {
 
   /** The head (and the holder, until it releases) proves progress by its receipt's mtime. */
   #heartbeat(force = false): void {
-    const now = Date.now();
+    const now = performance.now();
     if (!force && now - this.#touchedAt < HEARTBEAT_MS) return;
     this.#touchedAt = now;
-    try { fs.utimesSync(this.#file, now / 1000, now / 1000); }
+    // Persist wall time in the filesystem: other processes/releases read this mtime. It is a freshness
+    // token here, never subtracted from our local monotonic clock to infer elapsed age.
+    const wall = Date.now() / 1000;
+    try { fs.utimesSync(this.#file, wall, wall); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   }
 
@@ -275,6 +292,9 @@ export class MeshLockTicket {
     }
     signal?.throwIfAborted();
     if (this.#signalled) { this.#signalled = false; return Promise.resolve(); }
+    // MeshLock's existing absolute Date-based API supplies a local caller deadline, not observation aging.
+    // A forward wall step may end this wait early; a backward step may lengthen it, but the caller's
+    // already-armed monotonic guard still bounds admission. Never use this deadline to age receipts.
     const sleepMs = deadline === undefined ? ms : Math.min(ms, deadline - Date.now());
     if (deadline !== undefined && sleepMs <= 0) return Promise.resolve();
     return new Promise((resolve, reject) => {

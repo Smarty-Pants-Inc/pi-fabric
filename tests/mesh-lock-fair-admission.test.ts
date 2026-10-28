@@ -27,6 +27,14 @@ const ticket = (root: string, budgetMs: number) => {
 const names = (root: string) => fs.readdirSync(meshLockQueueDirectory(root)).sort();
 const mtime = (root: string, name: string) => fs.statSync(path.join(meshLockQueueDirectory(root), name)).mtimeMs;
 
+const elapsedClock = () => {
+  vi.useFakeTimers({ toFake: ["Date", "performance"] });
+  // Add the controlled elapsed interval to the real host clock, rather than resetting hrtime:
+  // synchronous receipt construction still has strictly ordered native prefixes, not UUID order.
+  const hostNow = process.hrtime.bigint.bind(process.hrtime);
+  vi.spyOn(process.hrtime, "bigint").mockImplementation(() => hostNow() + BigInt(Math.round(performance.now() * 1_000_000)));
+};
+
 // Real admission and filesystem receipts; only notification delivery/setup and the clock are controlled.
 class WatchHandle extends EventEmitter {
   readonly close = vi.fn();
@@ -117,21 +125,25 @@ describe("fair mesh lock admission", () => {
   });
 
   it("does not fall back while the head is alive and making progress, even past 80% of the budget", () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
+    elapsedClock();
     const root = scratch();
     const head = ticket(root, 10_000);
     const waiter = ticket(root, 2000); // fallback point 1600 ms, stall bound 200 ms
     expect(head.mayContend()).toBe(true);
+    const headName = names(root)[0]!;
+    const firstBeat = mtime(root, headName);
     for (let elapsed = 0; elapsed < 2000; elapsed += 20) {
       vi.advanceTimersByTime(20);
       expect(head.mayContend()).toBe(true); // the head probes, and its receipt heartbeat stays fresh
       expect(waiter.mayContend()).toBe(false);
     }
     expect(waiter.queued).toBe(true);
+    expect(performance.now()).toBe(2000);
+    expect(mtime(root, headName)).toBeGreaterThan(firstBeat); // genuinely advancing heartbeats, not a frozen observer
   });
 
   it("falls back past 80% of the budget when the live head stops making progress", () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
+    elapsedClock();
     const root = scratch();
     const head = ticket(root, 10_000);
     const waiter = ticket(root, 2000);
@@ -149,7 +161,7 @@ describe("fair mesh lock admission", () => {
   });
 
   it("short try budgets keep the unconditional 80% fallback", () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
+    elapsedClock();
     const root = scratch();
     const head = ticket(root, 10_000);
     const tryer = ticket(root, 50);
@@ -161,7 +173,7 @@ describe("fair mesh lock admission", () => {
   });
 
   it("judges a head that has just taken over by first sight, not by its old creation time", () => {
-    vi.useFakeTimers({ toFake: ["Date"] });
+    elapsedClock();
     const root = scratch();
     const head = ticket(root, 10_000);
     const next = ticket(root, 10_000);

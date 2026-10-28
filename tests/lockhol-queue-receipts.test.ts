@@ -9,6 +9,7 @@ import { verifiedRemoveTestHooks } from "../src/storage/verified-remove.js";
 
 // Recorded catch: smarty-dev#9805's head + immediate successor share one stalled event loop.
 // Real receipts, verifier and canonical acquisition; only time and the exact judgment/open race are controlled.
+// Advance performance with timers as well as Date: unchanged observations measure monotonic elapsed time.
 const parents: string[] = [];
 const tickets: MeshLockTicket[] = [];
 const scratch = (): string => {
@@ -37,7 +38,7 @@ afterEach(() => {
 describe.skipIf(process.platform !== "linux")("lockhol: deeper waiter verifies stalled-head identity", () => {
   it.each(["refreshed", "replaced"] as const)("keeps a head %s between judgment and open, then acquires healthy followers in FIFO order", async change => {
     const root = scratch();
-    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
     const head = ticket(root);
     const successor = ticket(root); // the deeper waiter's predecessor is NOT the stalled head
     expect(head.mayContend()).toBe(true);
@@ -96,7 +97,7 @@ describe.skipIf(process.platform !== "linux")("lockhol: deeper waiter verifies s
 
   it("a replacement with unchanged mtime gets its own full observation bound", () => {
     const root = scratch();
-    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
     ticket(root);
     ticket(root);
     const rescuer = ticket(root);
@@ -124,7 +125,7 @@ describe.skipIf(process.platform !== "linux")("lockhol: deeper waiter verifies s
 
   it("a canonical holder appearing at the verifier boundary vetoes reaping", () => {
     const root = scratch();
-    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
     ticket(root);
     ticket(root);
     const rescuer = ticket(root);
@@ -152,7 +153,7 @@ describe.skipIf(process.platform !== "linux")("lockhol: deeper waiter verifies s
 describe("lockhol: retained FIFO budget", () => {
   it("retains late fallback to recover a dead canonical owner behind an alive stalled head AND successor", async () => {
     const root = scratch();
-    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
     ticket(root);
     ticket(root); // both tickets name this live PID, but neither is being polled
     const original = receipts(root);
@@ -186,7 +187,7 @@ describe("lockhol: retained FIFO budget", () => {
 
   it("a deeper waiter expires at its fixed deadline behind a healthy head without probing or reaping", async () => {
     const root = scratch();
-    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
     const head = ticket(root);
     ticket(root);
     const original = receipts(root);

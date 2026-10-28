@@ -397,14 +397,14 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "spawner",
-    description: "Return this child's immediate spawning participant and activation run. Use id: 'spawner' with agents.followUp/steer to reply to it. An actor spawner is NOT the lineage root returned by agents.main; no root fallback when the binding is absent.",
+    description: "Return this child's immediate spawning participant and activation run. Use id: 'spawner' with agents.followUp/steer to reply to it. An absent binding does not fall back to the lineage root.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     risk: "read",
   },
   {
     name: "main",
     description:
-      "Return the root user-facing Main Pi agent target. The stable alias main is also accepted by agents.steer and agents.followUp.",
+      "Return this runtime's Main target; process tasks with a return address use the exact immediate spawner and native session. The stable alias main is also accepted by agents.steer and agents.followUp.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     risk: "read",
   },
@@ -422,7 +422,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   },
   {
     name: "projectAgent",
-    description: "Return this session's interactive project lead by normalized repository origin, using the lead id recorded at launch (SMARTY_LEAD_SESSION or .local/lead) to resolve ambiguity and moved lanes. Unrecorded bridge mirrors cannot claim leadership. Throws a named error when unresolved or ambiguous.",
+    description: "Resolve the exact incoming Main-spawner binding, or read .local/lead at call time from the provider's actual root lane. Missing, stale, noninteractive, or unsupported targets throw FABRIC_PROJECT_AGENT_UNRESOLVED; no repository/path/role election or ancestor fallback.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     risk: "read",
   },

@@ -1179,12 +1179,13 @@ interface FabricAgentsApi {
     version: 1; rootSessionId: string; parentSessionId?: string; parentRunId?: string;
     runId: string; depth: number; childIndex: number; worker: true;
   } }>;
+  /** Main target; process tasks with a return address use the exact immediate spawner and native session. */
   main(): Promise<FabricMainAgentInfo>;
-  /** Immediate spawning participant; main is the root, not an actor spawner. Address it with id: "spawner". */
+  /** Immediate spawning participant and optional run; absence never falls back to lineage Main. Address it with id: "spawner". */
   spawner(): Promise<{ id: string; kind: "main" | "agent" | "actor"; runId?: string }>;
   sessions(): Promise<FabricParticipantInfo[]>;
   peers(): Promise<FabricPeerInfo[]>;
-  /** Resolve by normalized repository origin and launch-recorded lead id; throws if unresolved or ambiguous. */
+  /** Resolve the incoming Main spawner or, for root lanes, the actual lane's .local/lead at call time; no repo/path/role election or ancestor fallback. Throws FABRIC_PROJECT_AGENT_UNRESOLVED for missing or unsupported targets. */
   projectAgent(): Promise<FabricParticipantInfo>;
   subscribe(args: {
     from: string;

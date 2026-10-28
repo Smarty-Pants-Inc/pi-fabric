@@ -80,7 +80,7 @@ async function fixture() {
   expect(failure).toBeUndefined();
   await sleep(60);
   const events = () => hub.read({ after: 0, limit: 100 });
-  const cursor = () => JSON.parse(fs.readFileSync(cursorPath, "utf8")) as { toLocal: { after: number } };
+  const cursor = () => JSON.parse(fs.readFileSync(cursorPath, "utf8")) as { toLocal: { after: number }; toRemote: { after: number } };
   const mirrorLocal = local.mirror.bind(local);
   const recover = async () => {
     await mirrorLocal(await remote.presence(), Date.now()); // real admission, leases, custody and COMMIT
@@ -133,6 +133,97 @@ async function fixture() {
 }
 
 describe("notification forwarding through an unresolved shared membership pass", () => {
+  it.each([
+    ["toLocal", false], ["toLocal", true], ["toRemote", false], ["toRemote", true],
+  ] as const)("releases absent %s membership and later work with every mirror taking 1.2 s (ACK=%s)", async (direction, ack) => {
+    const f = await fixture();
+    await native(f.far, f.lane);
+    await f.bridge.syncPresence();
+    const mirror = f.remote.mirror.bind(f.remote);
+    vi.spyOn(f.remote, "mirror").mockImplementation(async (...args) => {
+      await sleep(1_200);
+      return mirror(...args);
+    });
+    const missing = identity("never-installed");
+    const outbound = async (to: string) => f.hub.publish(ack ? {
+      topic: "fabric.control.ack", kind: "ack", from: f.lead, to,
+      data: { version: 1, commandId: `outbound-${to}`, targetId: f.lead.id, accepted: true },
+    } : {
+      topic: "fabric.control.command", kind: "followUp", from: f.lead, to,
+      data: { version: 1, commandId: `outbound-${to}`, targetId: to, replyTo: f.lead.id,
+        operation: "followUp", destinationRemoteHost: "far", message: "later work" },
+    });
+    const first = direction === "toLocal" ? await f.send(ack, missing) : await outbound(missing.id);
+    const later = direction === "toLocal" ? await f.send(ack) : await outbound(f.lane.id);
+    f.notice("events");
+    const destination = direction === "toLocal" ? f.hub : f.far;
+    await until(() => f.cursor()[direction].after >= later.sequence, "absent event refused and later cursor unblocked");
+    const delivered = destination.read({ after: 0, limit: 100 }).filter(event =>
+      (event.data as { bridge?: { id?: string } })?.bridge?.id === later.id);
+    expect(delivered).toHaveLength(1);
+    expect(destination.read({ after: 0, limit: 100 }).some(event =>
+      (event.data as { bridge?: { id?: string } })?.bridge?.id === first.id)).toBe(false);
+    expect(f.cursor()[direction].after).toBeGreaterThanOrEqual(first.sequence);
+    expect(f.failure()).toBeUndefined();
+  }, 15_000);
+
+  it("does not use a pre-miss absence to drop a sender that appears before the next sample", async () => {
+    const f = await fixture(), held = await f.stall();
+    const event = await f.send();
+    await until(() => f.logs.some(line => line.includes("membership pending")), "old sample timed out at the retained event");
+    await native(f.far, f.lane);
+    expect(f.local.holds(f.lane.id)).toBe(false);
+    held.outbound.resolve();
+    await held.pass;
+    await until(() => f.events().length === 1, "a later sample admits the newly appeared sender");
+    expect((f.events()[0]!.data as { bridge: { id: string } }).bridge.id).toBe(event.id);
+    expect(f.logs.some(line => line.includes(event.id) && line.includes(": dropped "))).toBe(false);
+  }, 12_000);
+
+  it("keeps a never-installed sender pending when every delayed aggregate fails", async () => {
+    const f = await fixture();
+    let failures = 0;
+    vi.spyOn(f.remote, "mirror").mockImplementation(async () => {
+      await sleep(1_200);
+      failures++;
+      throw new BridgeMirrorDeferredError(false, 25);
+    });
+    const event = await f.send();
+    await until(() => failures >= 2, "multiple delayed passes failed rather than supplying absence evidence");
+    expect(f.cursor().toLocal.after).toBeLessThan(event.sequence);
+    expect(f.events()).toEqual([]);
+    expect(f.failure()).toBeUndefined();
+  }, 12_000);
+
+  it("does not reuse a completed absence for a different event boundary", async () => {
+    const f = await fixture();
+    const mirrorRemote = f.remote.mirror.bind(f.remote);
+    vi.spyOn(f.remote, "mirror").mockImplementation(async (...args) => {
+      await sleep(1_200);
+      return mirrorRemote(...args);
+    });
+    const first = await f.send();
+    await until(() => f.cursor().toLocal.after >= first.sequence, "first absent boundary consumed");
+    const entered = gate(), release = gate();
+    const mirrorLocal = f.local.mirror.bind(f.local);
+    vi.spyOn(f.local, "mirror").mockImplementation(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return mirrorLocal(...args);
+    });
+    const next = identity("later-sender");
+    await native(f.far, next);
+    const later = await f.send(false, next);
+    try {
+      await entered.promise;
+      await sleep(1_250);
+      expect(f.cursor().toLocal.after).toBeLessThan(later.sequence);
+      expect(f.events()).toEqual([]);
+    } finally { release.resolve(); }
+    await until(() => f.events().length === 1, "new boundary waits for its own current authority");
+    expect((f.events()[0]!.data as { bridge: { id: string } }).bridge.id).toBe(later.id);
+  }, 15_000);
+
   it.each([false, true])("uses real canonical recovery %s after entering the wait, without completing public sync", async late => {
     const f = await fixture(), held = await f.stall();
     await native(f.far, f.lane);

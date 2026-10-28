@@ -3624,6 +3624,16 @@ type MembershipTimingStep = "refreshMembership.syncPresence" | "refreshMembershi
   "syncPresence.local.relayPresence" | "syncPresence.remote.mirror" | "syncPresence.local.mirror" |
   "syncPresence.mirror.allSettled";
 
+interface ForwardMembershipSample {
+  sequence: number;
+  id: string;
+  pending: Promise<void>;
+  fresh: boolean;
+  complete: boolean;
+  presenceVersion: number;
+  leaseVersion: number;
+}
+
 export class MeshBridge {
   #cursor: CursorFile | undefined;
   #seen = { toRemote: new Set<string>(), toLocal: new Set<string>() };
@@ -3672,6 +3682,8 @@ export class MeshBridge {
   readonly #tailRetryAt: Partial<Record<Direction, number>> = {};
   readonly #tailSafetyDelay: Partial<Record<Direction, number>> = {};
   readonly #membershipSequence: Partial<Record<Direction, number>> = {};
+  /** Only the sample requested for this exact held event may settle its timed-out refresh. */
+  readonly #forwardMembershipSample: Partial<Record<Direction, ForwardMembershipSample>> = {};
   /** Events not addressed across since the last count line (smarty-dev#9352). */
   #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, topics: new Set<string>(), more: false };
   #unaddressedLoggedAt = Number.NEGATIVE_INFINITY;
@@ -4321,20 +4333,47 @@ export class MeshBridge {
    * miss may wait at most 1 s for unrelated shared mirror I/O; timeout is UNKNOWN,
    * never absence or authority. Race each pass separately so a timed-out old pass
    * cannot later launch an unowned trailing refresh. Public sync/step stay strict. */
-  async #refreshForwardMembership(): Promise<boolean> {
+  async #refreshForwardMembership(direction: Direction, event: Pick<MeshEvent, "sequence" | "id">): Promise<boolean> {
     const deadline = monotonicClock.now() + 1_000;
-    const wait = async (step: MembershipTimingStep): Promise<boolean> => {
+    const current = (sample: ForwardMembershipSample): boolean =>
+      sample.presenceVersion === this.#presenceVersion && sample.leaseVersion === this.#leaseVersion &&
+      Date.now() - this.#presenceAt <= DEFAULT_PRESENCE_MS && !this.#presenceDue();
+    const start = (fresh: boolean, step: MembershipTimingStep): ForwardMembershipSample => {
+      const sample: ForwardMembershipSample = { sequence: event.sequence, id: event.id, fresh, complete: false,
+        presenceVersion: this.#presenceVersion, leaseVersion: this.#leaseVersion,
+        pending: this.#timeMembershipStep(step, () => this.syncPresence()) };
+      this.#forwardMembershipSample[direction] = sample;
+      // Observe settlement only; a timeout never starts a trailing sample. A failed aggregate
+      // cannot supply absence evidence, even if its other mirror committed successfully.
+      void sample.pending.then(() => { sample.complete = true; }, () => {
+        if (this.#forwardMembershipSample[direction] === sample) delete this.#forwardMembershipSample[direction];
+      });
+      return sample;
+    };
+    const wait = async (sample: ForwardMembershipSample): Promise<boolean> => {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         return await Promise.race([
-          this.#timeMembershipStep(step, () => this.syncPresence()).then(() => true),
+          sample.pending.then(() => true),
           new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), Math.max(0, deadline - monotonicClock.now())); }),
         ]);
       } finally { if (timer !== undefined) clearTimeout(timer); }
     };
-    const joined = this.#presenceSync !== undefined;
-    if (!await wait("refreshMembership.syncPresence")) return false;
-    return !joined || await wait("refreshMembership.freshSyncPresence");
+    let sample = this.#forwardMembershipSample[direction];
+    if (!sample || sample.sequence !== event.sequence || sample.id !== event.id || (sample.complete && !current(sample))) {
+      sample = start(this.#presenceSync === undefined, "refreshMembership.syncPresence");
+    } else if (!sample.complete && this.#presenceSync) {
+      // Rejoin without new I/O; keep the original post-miss classification attached.
+      this.syncPresence();
+    }
+    if (!await wait(sample)) return false;
+    // Joining a pass sampled before the miss is not negative evidence. Only a foreground
+    // retry, after that pass settles, may start/join the required post-miss sample.
+    if (!sample.fresh) {
+      sample = start(true, "refreshMembership.freshSyncPresence");
+      if (!await wait(sample)) return false;
+    }
+    return current(sample);
   }
 
   #unaddressedRefreshDue(): boolean {
@@ -4810,8 +4849,11 @@ export class MeshBridge {
     authority: (refreshIfStale?: boolean) => Promise<BridgeRules>,
     notificationForward = false,
   ): Promise<{ forwarded: number; dropped: number }> {
-    const refreshMembership = async (): Promise<boolean> => {
-      if (notificationForward) return this.#refreshForwardMembership();
+    const refreshMembership = async (event?: Pick<MeshEvent, "sequence" | "id">): Promise<boolean> => {
+      if (notificationForward) {
+        const boundary = event ?? this.#forwardMembershipSample[direction];
+        return boundary ? this.#refreshForwardMembership(direction, boundary) : false;
+      }
       await this.#refreshMembership();
       return true;
     };
@@ -4819,7 +4861,11 @@ export class MeshBridge {
     const phase = (name: BridgeDrainPhase) => this.#deliveryAge.drainPhase(direction, name);
     const checkpoint = () => {
       const end = this.#deliveryAge.drainPhase(direction, "checkpointMs");
-      try { this.#save(); } finally { end(); }
+      try {
+        this.#save();
+        if ((this.#forwardMembershipSample[direction]?.sequence ?? Infinity) <= this.#cursor![direction].after)
+          delete this.#forwardMembershipSample[direction];
+      } finally { end(); }
     };
     const cursor = this.#cursor![direction];
     const seen = this.#seen[direction];
@@ -4847,10 +4893,12 @@ export class MeshBridge {
       // Expiration invalidates the observation, never the event: sample again before rereading
       // its unchanged source boundary. A pre-existing pass alone cannot prove fresh absence.
       // Failed/deferred mirrors retain that boundary too.
-      const end = phase("membershipWaitMs");
-      passRefreshAttempted = true;
-      try { passRefreshed = await refreshMembership(); } finally { end(); }
-      passRefreshPending = !passRefreshed;
+      if (!notificationForward || this.#forwardMembershipSample[direction]) {
+        const end = phase("membershipWaitMs");
+        passRefreshAttempted = true;
+        try { passRefreshed = await refreshMembership(); } finally { end(); }
+        passRefreshPending = !passRefreshed;
+      }
     }
     if (direction === "toLocal" && this.#factoryWaiting) {
       // A factory-rate deferral holds this link's inbound drain, in order, until its token is due;
@@ -4891,7 +4939,7 @@ export class MeshBridge {
       }
       // Even filtered/skip-only reads can carry this drain past the mirrors' lease.
       // Reconcile latched origin changes/expiry even on a filtered page.
-      const retainedRefresh = passRefreshed && retainedBoundary !== undefined && cursor.after < retainedBoundary &&
+      const retainedRefresh = (passRefreshed || passRefreshAttempted) && retainedBoundary !== undefined && cursor.after < retainedBoundary &&
         this.#presenceVersion === this.#syncedPresenceVersion && this.#leaseVersion === this.#syncedLeaseVersion;
       if (direction === "toRemote" && this.#unaddressedRefreshDue()) {
         const end = phase("membershipWaitMs");
@@ -5028,7 +5076,7 @@ export class MeshBridge {
         const refresh = async (): Promise<void> => {
           refreshed = true; // Attempt bound, not a claim of completed negative evidence.
           const end = phase("membershipWaitMs");
-          try { passRefreshed = await refreshMembership(); } finally { end(); }
+          try { passRefreshed = await refreshMembership(event); } finally { end(); }
           refreshPending = !passRefreshed;
           // Only current canonical authority can admit after an unfinished sample.
           rules = await authority(false);

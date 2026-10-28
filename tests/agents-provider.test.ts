@@ -51,7 +51,6 @@ import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { residentHostId, residentRoot, ResidentOutcomeUnknownError } from "../src/residency/protocol.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import { AgentManager } from "../src/agents/manager.js";
-import * as worktreeCustody from "../src/agents/worktree-manager.js";
 import { parseWorkerOptions } from "../src/worker/options.js";
 import { createRunningRecord, writeRunRecord } from "../src/worker/run-record.js";
 import { resolvePiModel } from "../src/core/model-refresh.js";
@@ -3777,40 +3776,47 @@ describe("AgentsProvider runner support", () => {
         };
         walk(""); return rows;
       };
-      const movedSources = new Set<string>();
-      const retain = worktreeCustody.retainCleanupRoot;
-      const observer = vi.spyOn(worktreeCustody, "retainCleanupRoot").mockImplementation((source, ...args) => {
-        const tailName = ".contract-custody.bin", raw = Buffer.from([0, 255, 10, 195, 169]);
+      const movedSources = new Map<string, { receipt: string; prepared: Record<string, unknown>; before: unknown[] }>();
+      const probes = new Map<string, { before: unknown[]; fd?: number }>();
+      const tailName = ".contract-custody.bin", raw = Buffer.from([0, 255, 10, 195, 169]);
+      const probeSource = (source: string): { before: unknown[]; fd?: number } => {
         fs.writeFileSync(path.join(source, tailName), raw, { flag: "wx" });
         const before = inventory(source);
         // Windows uses a closed-fixture-FD positive control; this actual POSIX
         // append descriptor proves same-object custody, not a copied shadow.
         const fd = platform.value === "win32" ? undefined : fs.openSync(path.join(source, tailName), "a");
-        let moved: ReturnType<typeof retain>;
+        const probe: { before: unknown[]; fd?: number } = { before, ...(fd === undefined ? {} : { fd }) };
+        probes.set(path.resolve(source), probe);
+        return probe;
+      };
+      let cleanupId: string | undefined;
+      const rename = fs.renameSync;
+      // Observe the real filesystem seam: WorktreeManager's same-module retain
+      // call bypasses an export spy. Every rename still calls the native operation.
+      const observer = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+        if (!cleanupId || typeof source !== "string" || typeof destination !== "string" ||
+          path.basename(destination) !== "tree" || !path.basename(path.dirname(destination)).startsWith("cleanup-")) {
+          return rename(source, destination);
+        }
+        const container = path.dirname(destination), receipt = path.join(container, "custody.json");
+        const prepared = JSON.parse(fs.readFileSync(path.join(container, "custody.prepared.json"), "utf8"));
+        expect(prepared).toMatchObject({ id: cleanupId, source, destination, state: "prepared" });
+        const probe = probes.get(path.resolve(source)) ?? probeSource(source);
+        const { before, fd } = probe;
         try {
-          moved = retain(source, ...args);
-          expect(moved).toBeDefined();
-          expect(inventory(moved!.destination)).toEqual(before);
+          rename(source, destination);
+          expect(inventory(destination)).toEqual(before);
           if (fd !== undefined) {
-            const held = fs.lstatSync(path.join(moved!.destination, tailName), { bigint: true });
+            const held = fs.lstatSync(path.join(destination, tailName), { bigint: true });
             expect(fs.fstatSync(fd, { bigint: true }).ino).toBe(held.ino);
             expect(fs.fstatSync(fd, { bigint: true }).dev).toBe(held.dev);
             fs.writeSync(fd, Buffer.from([10, 70, 68]));
-            expect(fs.readFileSync(path.join(moved!.destination, tailName))).toEqual(Buffer.concat([raw, Buffer.from([10, 70, 68])]));
+            expect(fs.readFileSync(path.join(destination, tailName))).toEqual(Buffer.concat([raw, Buffer.from([10, 70, 68])]));
           }
-        } finally { if (fd !== undefined) fs.closeSync(fd); }
-        const prepared = JSON.parse(fs.readFileSync(path.join(path.dirname(moved!.receipt), "custody.prepared.json"), "utf8"));
-        expect(prepared).toMatchObject({ id: args[1], source, destination: moved!.destination, state: "prepared" });
-        expect(JSON.parse(fs.readFileSync(moved!.receipt, "utf8"))).toMatchObject({ ...prepared, time: expect.any(Number), state: "moved" });
-        movedSources.add(path.resolve(source));
-        const stage = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
-        if (stage) {
-          fs.mkdirSync(stage, { recursive: true });
-          const out = fs.mkdtempSync(path.join(stage, "provider-contract-"));
-          fs.cpSync(path.dirname(moved!.receipt), path.join(out, "container"), { recursive: true, dereference: false });
-          fs.writeFileSync(path.join(out, "native-inventory.json"), JSON.stringify(before));
+        } finally {
+          if (fd !== undefined) { fs.closeSync(fd); delete probe.fd; }
         }
-        return moved;
+        movedSources.set(path.resolve(source), { receipt, prepared, before });
       });
       const repository = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-public-win-close-"));
       roots.push(repository);
@@ -3840,7 +3846,41 @@ describe("AgentsProvider runner support", () => {
           expect(result.worktree).toBeTypeOf("string");
           expect(fs.existsSync(result.worktree!)).toBe(true);
         }
+        // Snapshot both public roots before cleanup, not after an earlier
+        // cleanup step could have discarded bytes or replaced native objects.
+        probeSource(run);
+        if (worktree) probeSource(result.worktree!);
+        cleanupId = handle.id;
         await expect(provider.invoke("cleanup", { id: handle.id, deleteBranch: true }, context)).resolves.toEqual({ cleaned: true });
+        for (const moved of movedSources.values()) {
+          const container = path.dirname(moved.receipt), stat = fs.lstatSync(container);
+          expect(JSON.parse(fs.readFileSync(path.join(container, "custody.prepared.json"), "utf8"))).toEqual(moved.prepared);
+          expect(JSON.parse(fs.readFileSync(moved.receipt, "utf8"))).toMatchObject({ ...moved.prepared, time: expect.any(Number), state: "moved" });
+          expect(stat.isDirectory()).toBe(true);
+          expect(stat.isSymbolicLink()).toBe(false);
+          expect(fs.realpathSync(container)).toBe(container);
+          if (platform.value !== "win32") {
+            expect(stat.uid).toBe(process.getuid!());
+            expect(stat.mode & 0o777).toBe(0o700);
+          }
+          // Native Windows executes the real DACL read-back. Elsewhere the
+          // recorded PowerShell call above is contract coverage only.
+          expect(security.mock.calls.some(([, , options]) =>
+            (options as { env?: NodeJS.ProcessEnv } | undefined)?.env?.PI_FABRIC_CLEANUP_CONTAINER === container)).toBe(true);
+          for (let current = container; ; current = path.dirname(current)) {
+            expect(fs.existsSync(path.join(current, ".git")), "custody is outside every Git worktree").toBe(false);
+            const bare = fs.existsSync(path.join(current, "HEAD")) && fs.existsSync(path.join(current, "objects")) && fs.existsSync(path.join(current, "refs"));
+            expect(bare, "custody is outside every bare Git root").toBe(false);
+            if (path.dirname(current) === current) break;
+          }
+          const stage = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
+          if (stage) {
+            fs.mkdirSync(stage, { recursive: true });
+            const out = fs.mkdtempSync(path.join(stage, "provider-contract-"));
+            fs.cpSync(container, path.join(out, "container"), { recursive: true, dereference: false });
+            fs.writeFileSync(path.join(out, "native-inventory.json"), JSON.stringify(moved.before));
+          }
+        }
         expect(movedSources.has(path.resolve(run)), "run has complete native-object custody, not deletion").toBe(true);
         expect(fs.existsSync(run)).toBe(false);
         if (worktree) {
@@ -3848,6 +3888,7 @@ describe("AgentsProvider runner support", () => {
           expect(fs.existsSync(result.worktree!)).toBe(false);
         }
       } finally {
+        for (const probe of probes.values()) if (probe.fd !== undefined) fs.closeSync(probe.fd);
         await agents.close();
         observer.mockRestore();
         security.mockImplementation(actual.execFileSync);

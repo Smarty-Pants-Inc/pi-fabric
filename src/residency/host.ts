@@ -127,6 +127,7 @@ import {
   type ResidentCommand,
   type ResidentCommandResponse,
   residentSlotErrorFields,
+  residentCleanupErrorFields,
   residentCreateMayBeProtected,
   type ResidentDeliveryRecord,
   type ResidentHostConfig,
@@ -2975,6 +2976,9 @@ export class ResidentHost {
           } catch { /* Attribution is advisory, not a replacement for the native error. */ }
         }
       }
+      const cleanupFailure = command.operation === "cleanup" ? residentCleanupErrorFields(error) : {};
+      if (command.operation === "cleanup" && cleanupFailure.cleanupStatus) diagnostics.warn("src/residency/host.ts",
+        `[pi-fabric] resident cleanup ${command.id}: original retained in place; ${JSON.stringify(cleanupFailure.cleanupStatus)}; ${errorMessage(error)}`);
       const drain = command.operation === "releaseDrain" ? this.#drainRefusal(command, error) : undefined;
       let slotFailure = residentSlotErrorFields(error);
       if (command.operation === "createActor" && (residentCreateMayBeProtected(command) ||
@@ -3009,6 +3013,7 @@ export class ResidentHost {
           errorCode: error.code, modelDenied: { model: error.model, ...(error.replacement ? { replacement: error.replacement } : {}) },
         } : {}),
         ...slotFailure,
+        ...cleanupFailure,
         completedAt: Date.now(),
       };
     }

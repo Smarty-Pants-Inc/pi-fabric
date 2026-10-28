@@ -181,6 +181,51 @@ describe("foreign session actor registry truth", () => {
       expect(alarms(mesh)).toEqual([]);
     });
 
+  it.each(["lease", "session-expiry", "reload-expiry", "inbox", "participant-file", "participant-shared", "participant-reload", "participant-owner-renewal", "legacy", "closure"] as const)(
+    "a longer nonmutating root-death bound honors recent %s evidence without changing the two-minute default", async mode => {
+      const { root, mesh, lease } = fixture();
+      const now = Date.now(), bound = 12 * 60_000, old = now - bound - 10_000, recent = now - 10 * 60_000;
+      const owner: MeshIdentity = { id: lease.id, name: "old Main", kind: "main" };
+      const current = { ...lease, updatedAt: old, expiresAt: old };
+      writeHostLease(root, current);
+      if (mode === "lease") writeHostLease(root, { ...current, updatedAt: recent, expiresAt: recent });
+      if (mode === "session-expiry") writeHostLease(root, { ...current,
+        session: { id: "old", startedAt: old - 1_000, updatedAt: recent, expiresAt: recent } });
+      if (mode === "reload-expiry") writeHostLease(root, { ...current, reloadUntil: recent });
+      if (mode === "inbox") staleInbox(root, { ...current, updatedAt: recent });
+      if (mode === "participant-file") staleRootPresence(root, { ...current, updatedAt: recent });
+      if (mode === "participant-reload") staleRootPresence(root, current, { reloadUntil: recent });
+      if (mode === "participant-owner-renewal") {
+        staleRootPresence(root, current);
+        const file = path.join(root, "participants", `${createHash("sha256").update(lease.id).digest("hex")}.json`);
+        const read = fs.readFileSync.bind(fs);
+        vi.spyOn(fs, "readFileSync").mockImplementation(((input: fs.PathOrFileDescriptor, options?: unknown) => {
+          if (input === file) writeHostLease(root, { ...current, updatedAt: recent, expiresAt: recent });
+          return read(input, options as never);
+        }) as typeof fs.readFileSync);
+      }
+      if (mode === "participant-shared" || mode === "legacy") {
+        const clock = vi.spyOn(Date, "now").mockReturnValue(recent);
+        try {
+          await mesh.put({ identity: owner,
+            key: mode === "legacy" ? "sessions/old" : `topology/participants/${createHash("sha256").update(lease.id).digest("hex")}`,
+            value: mode === "legacy" ? { id: lease.id, sessionId: "old", cwd: "/project", startedAt: old - 1_000, status: "idle" }
+              : { id: lease.id, kind: "root", rootId: lease.id, ownerHostId: lease.id, ownerIdentityId: lease.id } });
+        } finally { clock.mockRestore(); }
+      }
+      if (mode === "closure") {
+        const withoutWriter = { ...current };
+        delete withoutWriter.writer;
+        writeHostLease(root, withoutWriter);
+        await mesh.put({ identity: owner, key: `topology/lineage-closures/${createHash("sha256").update(lease.id).digest("hex")}`,
+          value: { format: 1, rootId: lease.id, ownerHostId: lease.id, ownerIdentityId: lease.id, closedAt: recent } });
+      }
+      const lineage = () => mode !== "closure";
+      expect(sessionActorRootGone(mesh, lease.id, lineage, now, bound)).toBeUndefined();
+      expect(sessionActorRootGone(mesh, lease.id, lineage, now)).toBeDefined();
+      expect(sessionActorRootGone(mesh, lease.id, lineage, now + bound, bound)).toBeDefined();
+    });
+
   it("still retires a matched dead lease and inbox with stale root presence", async () => {
     const { root, lease, store, mesh, repair } = fixture();
     staleInbox(root, lease);

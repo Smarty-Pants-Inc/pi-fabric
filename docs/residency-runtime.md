@@ -69,6 +69,19 @@ runner session. Shared work must use mesh state, files, or an explicit external
 channel. Residency only keeps the execution owner available for later control
 and reconnection.
 
+On the existing retention maintenance pass (normally every 15 minutes), an owned
+durable actor with held queued work or routed dead letters raises an addressed
+`fleet.work.actor-alarms` P0 when conservative local evidence proves its Main
+owner gone, with no newer liveness evidence within **12 minutes** (10-minute
+replay window plus two-minute margin). A healthy resident may outlive that Main. The single fallback is
+resolved at send time by `meshAlarmRecipient()` (`PI_FABRIC_MESH_ALARM_TO`, then
+`SMARTY_LEAD_SESSION`); absent or same-as-dead-owner targets leave the alarm
+retryable. Existing shared alarm claims and durable publication dedupe suppress
+duplicates within creation-anchored six-hour slots, including across restart.
+This is alarm-only: actor ownership, queue bytes and ordinary owner-pinned output
+are unchanged. Dual org + chief-of-staff delivery, any-mesh-host detection,
+adoption and owner-incarnation/depth-growth dedupe remain outside this increment.
+
 ## Dormant actors and delivery-owned wake (#6782 / #7299)
 
 A durable actor with no in-flight activation, queued/overflow/parked/dead-letter

@@ -16,6 +16,7 @@ import { MeshBackgroundQueue, MeshBackgroundRetry, ownProcessIncarnation } from 
 import { prepareParticipantFileLock, withParticipantFileTryLock } from "../topology/participant-files.js";
 import { isMeshLockTimeout, isMeshWriteDeferred } from "../core/atomic-write.js";
 import { reapDeadSessionPresence } from "./presence-reaper.js";
+import { sessionActorRootGone } from "./session-orphans.js";
 import { fabricDataRoot } from "../storage/temp-root.js";
 import path from "node:path";
 import type { FabricCapabilityRequirement } from "../components/types.js";
@@ -28,12 +29,13 @@ import {
   type FabricMeshConfig,
   type FabricRetentionConfig,
 } from "../config.js";
-import { MeshStore, meshOutageAlarmSink, type MeshBatchOperation, type MeshBatchResult, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
+import { MeshStore, meshAlarmRecipient, meshOutageAlarmSink, type MeshBatchOperation, type MeshBatchResult, type MeshEvent, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import type { FabricParticipantRecord, FabricParticipantResidency } from "../topology/types.js";
 import { PARTICIPANT_NAME_PATTERN as ACTOR_NAME_PATTERN } from "../topology/participant-name.js";
 import { AgentLaunchPreparationTimeoutError, AgentManager, validAgentExceptionLane, type AgentAdmittedExceptionLane, type AgentExceptionLane } from "../agents/manager.js";
 import { FabricModelExceptionDeniedError } from "../agents/model-policy-log.js";
+import { isFabricRunnerId, requireActorRunner } from "../agents/runner-registry.js";
 import type { AgentRunRecord, AgentRunRequest, AgentRunResult, AgentRunStopCaller, AgentRunStopPath } from "../agents/types.js";
 import { isRecoveredDurableStop } from "../agents/enodev-recovery.js";
 import type { ModelRouteDecision } from "../agents/model-route.js";
@@ -250,6 +252,8 @@ interface ManagedActor extends FabricActorBatching {
   lastFilteredAt?: number;
   residency: FabricParticipantResidency;
   runner: FabricAgentRunner;
+  /** Host-derived registration module, retained for durable owner restarts. */
+  runnerModule?: string;
   kernel?: FabricKernel;
   pythonRuntime?: FabricPythonRuntime;
   runnerSessionId?: string;
@@ -599,9 +603,9 @@ export const actorEventRef = (item: { id: string; source: string; payload: unkno
 };
 /** Mesh key of an actor's repeat activation-block alarm claim (smarty-dev#7782). */
 export const actorRealarmKey = (actorId: string): string => `actors/realarm/${actorId}`;
-/** The kinds of fabric.alarm.actor-activation: a blocked activation (pi-fabric#735) and the states that cannot act (smarty-dev#9332). */
-export type ActorAlarmKind = "actor-activation-blocked" | "actor-stopped" | "actor-event-dropped" | "actor-run-stuck";
-export const ACTOR_ALARM_KINDS: readonly ActorAlarmKind[] = ["actor-activation-blocked", "actor-stopped", "actor-event-dropped", "actor-run-stuck"];
+/** Shared alarm claim kinds. Orphan-owner P0s use addressed fleet work; other kinds use fabric.alarm.actor-activation. */
+export type ActorAlarmKind = "actor-activation-blocked" | "actor-stopped" | "actor-event-dropped" | "actor-run-stuck" | "actor-owner-orphaned";
+export const ACTOR_ALARM_KINDS: readonly ActorAlarmKind[] = ["actor-activation-blocked", "actor-stopped", "actor-event-dropped", "actor-run-stuck", "actor-owner-orphaned"];
 /** Public alarm reasons are closed codes, including when an episode was restored from disk. */
 const actorAlarmReason = (reason: unknown): string => typeof reason === "string" && [
   "unknown", "context-overflow", "auth", "permission", "security-policy", "quota", "invalid-request",
@@ -630,6 +634,8 @@ const restoredEventsDropped = (value: unknown): { eventsDropped?: NonNullable<Ma
 export const actorAlarmDedupeKey = (kind: ActorAlarmKind, actorId: string, since: number, slot: number): string =>
   `actor-alarm:${createHash("sha256").update([kind, actorId, String(since), String(slot)].join("\0")).digest("hex")}`;
 const RUN_STATUSES: ReadonlySet<string> = new Set(["queued", "running", "completed", "failed", "stopped", "timed_out"]);
+/** Main replay (10 min) plus reload margin (2 min), independent of a healthy resident's lease. */
+const ACTOR_ORPHAN_OWNER_AFTER_MS = 12 * 60 * 1000;
 /** A durable or supervisor actor stopped for longer than this alarms (smarty-dev#9332). */
 export const ACTOR_STOPPED_ALARM_AFTER_MS = 10 * 60 * 1000;
 /** An activation block with an unclassified cause (code "unknown") alarms once it is this old, after one failure. */
@@ -1800,9 +1806,7 @@ export class ActorManager {
     const records = normalizeActorRecords(request.records);
     await validateActorValidWhile(request.validWhile);
     const runner = request.runner ?? this.agents.config.runner;
-    if (runner !== "pi" && runner !== "pi-durable" && runner !== "claude") {
-      throw new Error(`Invalid Fabric actor runner: ${String(request.runner)}`);
-    }
+    const runnerAdapter = requireActorRunner(runner, residency);
     validateActorInferenceContext(request.inferenceContext, runner);
     validateActorCoalesceKey(request.coalesceKey);
     validateActorDedupeKey(request.dedupeKey);
@@ -1879,6 +1883,7 @@ export class ActorManager {
       ...(deadLetterReplayMaxAgeMs !== undefined ? { deadLetterReplayMaxAgeMs } : {}),
       residency,
       runner,
+      ...(residency === "durable" && runnerAdapter.residentModule ? { runnerModule: runnerAdapter.residentModule } : {}),
       ...(kernel ? { kernel } : {}),
       ...(pythonRuntime ? { pythonRuntime } : {}),
       ...(model ? { model } : {}),
@@ -7335,6 +7340,7 @@ export class ActorManager {
     capabilityRequirements?: string[],
     capabilityDigest?: string,
   ): AgentRunRequest {
+    requireActorRunner(actor.runner, actor.residency);
     const items = this.#batchItems(actor.id, item);
     // Neither a mixed batch nor collapsed history can borrow the primary sender's authority.
     const provenance = this.#runProvenance(actor, items);
@@ -7418,7 +7424,9 @@ export class ActorManager {
         ? "The Fabric host manages your mailbox, subscriptions, delivery, and lifecycle. You do not have fabric_exec or direct agents/mesh APIs; reply with your analysis and the host delivers it. Do not attempt to call fabric_exec, agents, or mesh tools."
         : actor.runner === "pi" || actor.runner === "pi-durable"
           ? "You may use Fabric for tools and durable coordination. In fabric_exec, agents.main() discovers the user-facing Main target; agents.steer() and agents.followUp() message Main or other known agents, while mesh.self(), mesh.members(), mesh.publish(), mesh.read(), mesh.get(), and mesh.put() support durable coordination. Use addressed messages or shared versioned state when useful."
-          : "The Fabric host manages your mailbox, subscriptions, delivery, and lifecycle. This Claude runner has Claude Code tools but not fabric_exec or direct mesh APIs; coordinate through the messages the host delivers.";
+          : actor.runner === "claude"
+            ? "The Fabric host manages your mailbox, subscriptions, delivery, and lifecycle. This Claude runner has Claude Code tools but not fabric_exec or direct mesh APIs; coordinate through the messages the host delivers."
+            : "The Fabric host manages your mailbox, subscriptions, delivery, and lifecycle. Use the tools supplied by your runner and coordinate through the messages the host delivers.";
     const capabilityInstruction = actor.requirements.length > 0
       ? `Your Fabric execution surface is closed to the committed capability refs: ${actor.requirements.map((requirement) => requirement.ref).join(", ")}. The host records and verifies a portable descriptor digest before each run.`
       : undefined;
@@ -8901,6 +8909,36 @@ export class ActorManager {
       () => this.#actors.get(actor.id)?.activationBlocked?.since === blocked.since);
   }
 
+  /** Held work only: a healthy resident's in-flight activation is not evidence of an orphan backlog. */
+  #orphanOwnerBacklog(actor: ManagedActor): { counts: FabricActorQueueCounts; queueDepth: number; oldestItemAgeMs?: number } {
+    const running = this.#runningActor(actor.id) ?? actor;
+    const counts = this.#queuedWorkCounts(actor, running, actor.status === "stopped");
+    const queueDepth = counts.queued + counts.parked + counts.overflow + counts.deadLetter + counts.settled;
+    const times = [...actor.queue, ...(running !== actor ? running.queue : []),
+      ...(this.#parked.get(actor.id) ?? []), ...(this.#overflow.get(actor.id) ?? [])].map(item => item.createdAt);
+    for (const window of this.#pendingSettledWindows(actor.id)) times.push(window.pending.observedAt);
+    if (counts.deadLetter) for (const entry of this.#readDeadLetters(actor.id)) times.push(entry.at);
+    const oldest = times.reduce((min, at) => Number.isFinite(at) && at > 0 ? Math.min(min, at) : min, Infinity);
+    return { counts, queueDepth, ...(Number.isFinite(oldest) ? { oldestItemAgeMs: Math.max(0, Date.now() - oldest) } : {}) };
+  }
+
+  /** Observe only actors this manager already owns, on the existing maintenance pass. No ownership or queue writes. */
+  #alarmOrphanOwner(actor: ManagedActor, now: number): void {
+    if (actor.residency !== "durable" || actor.removal) return;
+    const backlog = this.#orphanOwnerBacklog(actor);
+    if (!backlog.queueDepth || !sessionActorRootGone(this.mesh, actor.rootId, this.#lineageAlive, now, ACTOR_ORPHAN_OWNER_AFTER_MS)) return;
+    const rootId = actor.rootId;
+    // Use the existing creation-anchored six-hour slots, NOT an owner-incarnation or depth-growth policy.
+    const since = actor.createdAt;
+    this.#alarmActorState(actor, "actor-owner-orphaned", since, actorAlarmSlot(now, since, 0), now, () => ({
+      actorId: actor.id, actorName: actor.name, ownerRoot: rootId, reason: "owner-root-gone", since,
+      ownerAbsentForAtLeastMs: ACTOR_ORPHAN_OWNER_AFTER_MS, ...backlog,
+    }), () => !this.#closing && !this.#releaseStrict && this.#canConsumeMesh?.() !== false &&
+      this.#actors.get(actor.id) === actor && actor.rootId === rootId && !actor.removal && this.#ownershipDecision(actor.id) &&
+      this.#orphanOwnerBacklog(actor).queueDepth > 0 &&
+      !!sessionActorRootGone(this.mesh, rootId, this.#lineageAlive, Date.now(), ACTOR_ORPHAN_OWNER_AFTER_MS));
+  }
+
   /**
    * smarty-dev#9332: actor states that cannot act raise the same owner alarm as a blocked activation
    * (fabric.alarm.actor-activation records ownerRoot; onDeliver reaches the owner's Main),
@@ -8911,6 +8949,7 @@ export class ActorManager {
    * - actor-event-dropped: re-alarmed here while its episode lasts (raised first at the drop itself).
    */
   #alarmActorStates(actor: ManagedActor, now: number): void {
+    this.#alarmOrphanOwner(actor, now);
     if (actor.status === "stopped" && !actor.removal && (actor.residency === "durable" || actor.supervisorFor)) {
       const since = actor.stoppedAt;
       if (since !== undefined) {
@@ -9059,9 +9098,22 @@ export class ActorManager {
       const attemptId = randomUUID();
       const dedupeKey = actorAlarmDedupeKey(kind, actor.id, since, slot);
       let event: MeshEvent;
+      const orphanOwner = kind === "actor-owner-orphaned";
+      // Actor output is pinned to its original Main by the resident outbox. This host alarm instead
+      // uses the existing addressed fleet work path: RootInbox admits it and wakes the configured Main.
+      // Resolve only after taking/revalidating the claim; absent/self targets leave the slot retryable.
+      const to = orphanOwner ? meshAlarmRecipient() : undefined;
+      if (orphanOwner && (!to || to === actor.rootId)) {
+        await release();
+        return;
+      }
+      const text = orphanOwner ? `P0: durable actor ${actor.id} has held work but its Main owner ${actor.rootId} is proven gone, with no live lease or newer liveness evidence for at least 12 minutes. ` +
+        `Queue depth: ${data.queueDepth}; oldest item age: ${data.oldestItemAgeMs ?? "unknown"} ms. ` +
+        "Inspect with agents.actorStatus and agents.log; restore its Main or explicitly choose an owner. The backlog is retained." : undefined;
       try {
-        event = await this.mesh.publish({ id: attemptId, topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, kind, from: this.identity, data,
-          dedupeKey });
+        event = await this.mesh.publish({ id: attemptId,
+          topic: orphanOwner ? "fleet.work.actor-alarms" : FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC,
+          kind: orphanOwner ? "p0" : kind, from: this.identity, data, ...(to ? { to } : {}), ...(text ? { text } : {}), dedupeKey });
       } catch {
         await release();
         return;
@@ -9074,7 +9126,7 @@ export class ActorManager {
         : slot > 0;
       // At-most-once Main delivery: receipt replay returns the original id, never this attempt's id.
       // ponytail: a crash after publish but before onDeliver loses this slot's notice; the next slot re-alarms.
-      if (repeat && event.id === attemptId && current() && this.mesh.get(key)?.version === claim.version) {
+      if (!orphanOwner && repeat && event.id === attemptId && current() && this.mesh.get(key)?.version === claim.version) {
         const reason = actorAlarmReason(data.reason);
         const notice: FabricActorMessage = {
           id: dedupeKey, actorId: actor.id, actorName: actor.name, direction: "out",
@@ -9464,6 +9516,7 @@ export class ActorManager {
       coalesce: actor.coalesce,
       residency: actor.residency,
       runner: actor.runner,
+      ...(actor.runnerModule ? { runnerModule: actor.runnerModule } : {}),
       ...(actor.kernel ? { kernel: actor.kernel } : {}),
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
       ...(actor.runnerSessionId ? { runnerSessionId: actor.runnerSessionId } : {}),
@@ -10013,6 +10066,7 @@ export class ActorManager {
       let principalScope: FabricScope | undefined;
       try {
         records = normalizeActorRecords(record.records);
+        if (record.runner !== undefined && !isFabricRunnerId(record.runner)) continue;
         validateActorInferenceContext(record.inferenceContext, record.runner ?? "pi");
         requirements = normalizeCapabilityRequirements(
           Array.isArray(record.requirements) ? record.requirements : [],
@@ -10050,10 +10104,11 @@ export class ActorManager {
         triggerTurn,
         coalesce: record.coalesce !== false,
         residency: record.residency === "durable" ? "durable" : "session",
-        runner: record.runner === "claude" || record.runner === "pi-durable" ? record.runner : "pi",
+        runner: typeof record.runner === "string" ? record.runner : "pi",
+        ...(typeof record.runnerModule === "string" ? { runnerModule: record.runnerModule } : {}),
         // Legacy Pi sessions were TypeScript-only. Do not change their language
         // when the current host happens to select Python after a restart.
-        ...(record.runner !== "claude" && record.extensions !== false
+        ...((record.runner === undefined || record.runner === "pi" || record.runner === "pi-durable") && record.extensions !== false
           ? {
               kernel: record.kernel === "python" ? "python" as const : "typescript" as const,
               pythonRuntime: record.pythonRuntime === "cpython" ? "cpython" as const : "monty" as const,

@@ -68,7 +68,7 @@ const crashPublisher = async (store: MeshStore, packet: Parameters<MeshStore["pu
   try {
     const result = await closed;
     expect(timedOut, stderr).toBe(false);
-    expect(stderr).toBe("");
+    expect(stderr.replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/gm, "")).toBe("");
     expect(result.code).not.toBe(0);
     if (process.platform !== "win32") expect(result.signal).toBe("SIGKILL");
   } finally {

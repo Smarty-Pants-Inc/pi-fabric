@@ -22,6 +22,7 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { awaitAgentCwd } from "../agents/manager.js";
 import { BUILT_IN_RUNNER_IDS, requireAgentRunner } from "../agents/runner-registry.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
+import { retainCleanupRoot } from "../agents/worktree-manager.js";
 import { executeFile, spawnDetached, resolveScriptRuntime } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
 import { processStartTime, residentProcessAlive } from "./process-identity.js";
@@ -894,6 +895,8 @@ export class ResidencyClient {
     }
     const command: ResidentCommand = { format: RESIDENT_EXPIRING_COMMAND_FORMAT, operation: "cleanup", requestId: newResidentRequestId(),
       rootId: this.options.config.rootId, id: metadata.id, deleteBranch, createdAt: Date.now() };
+    const custody: Array<{ source: string; destination: string; receipt: string }> = [];
+    const deferred: string[] = [];
     let commitAttempted = false;
     const commit = (): void => {
       throwIfAborted(signal);
@@ -902,43 +905,48 @@ export class ResidencyClient {
       commitResidentRequest(this.options.config.residencyRoot, command, metadata.id, this.hostId);
     };
     try {
-      if (metadata.handle.worktree) {
-        const gitRoot = metadata.worktreeGitRoot ?? this.options.config.projectRoot;
-        const worktree = await registeredWorktree(gitRoot, metadata.handle.worktree);
-        commit();
-        await executeFile(
-          "git",
-          ["worktree", "remove", "--force", worktree],
-          { cwd: gitRoot, timeoutMs: 60_000 },
-        );
-        if (deleteBranch && metadata.handle.branch) {
-          throwIfAborted(signal);
-          await executeFile(
-            "git",
-            ["branch", "-D", metadata.handle.branch],
-            { cwd: gitRoot, timeoutMs: 30_000 },
-          );
-        }
-      } else if (deleteBranch) {
+      const gitRoot = metadata.worktreeGitRoot ?? this.options.config.projectRoot;
+      const worktree = metadata.handle.worktree ? await registeredWorktree(gitRoot, metadata.handle.worktree) : undefined;
+      if (!worktree && deleteBranch) {
         throw new Error(`Durable Fabric agent ${metadata.id} has no worktree branch to delete`);
-      } else {
-        commit();
       }
+      if (worktree) {
+        deferred.push(`Git worktree registration cleanup deferred: ${JSON.stringify(gitRoot)} still registers ${JSON.stringify(worktree)}; no remove or prune was attempted.`);
+        if (deleteBranch && metadata.handle.branch) deferred.push(`Git branch deletion deferred: ${metadata.handle.branch} was not deleted.`);
+      }
+      // The helper durably receipts and renames whole roots, including files.
+      // Commit before its first effect; EXDEV is visible, never copy-and-delete.
+      // Keep prior held roots on every partial failure, without rollback over a
+      // replacement at a canonical source path. Git registration remains debt.
+      commit();
+      const archive = `${this.options.config.residencyRoot}.trace-archive`;
+      const retain = (source: string, kind: string): void => {
+        throwIfAborted(signal);
+        const move = retainCleanupRoot(source, archive, metadata.id, `durable agent cleanup whole-root custody: ${kind}`);
+        if (move) custody.push(move);
+      };
+      if (runDirectoryPresent) retain(metadata.runDirectory, "run");
+      if (worktree) retain(worktree, "worktree");
+      retain(this.#metadataPath(metadata.id), "agent metadata");
+      retain(residentResultPath(this.options.config.residencyRoot, metadata.id), "resident result");
+      if (deferred.length) diagnostics.warn("src/residency/client.ts", `[pi-fabric] resident cleanup ${metadata.id}: ${deferred.join(" ")}`);
+      // Consumption is last, including cancellation that arrived during the
+      // final move. A failed/cancelled move never acknowledges partial cleanup.
       throwIfAborted(signal);
-      if (runDirectoryPresent) fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
-      fs.rmSync(this.#metadataPath(metadata.id), { force: true });
-      fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
       this.#completions.forget(metadata.id);
       this.options.onResultConsumed?.(metadata.id);
       acknowledgeResidentResponse(this.options.config.residencyRoot, { format: 1, requestId: command.requestId, ok: true, completedAt: Date.now() }, Date.now(), command.format);
       return { cleaned: true };
     } catch (error) {
-      if (!commitAttempted) throw error;
+      const detail = new Error(`Resident cleanup refused for ${metadata.id}: ${error instanceof Error ? error.message : String(error)}. ` +
+        `Custody paths: ${JSON.stringify(custody)}. ${deferred.join(" ")} No root rollback or source-path deletion was attempted.`, { cause: error });
+      diagnostics.warn("src/residency/client.ts", `[pi-fabric] ${detail.message}`);
+      if (!commitAttempted) throw detail;
       let decision;
       try { decision = readResidentRequestDecision(this.options.config.residencyRoot, command.requestId); } catch { /* unknown fence */ }
-      if (decision?.state === "abandoned") throw error;
+      if (decision?.state === "abandoned") throw detail;
       // Partial cleanup or an unreadable fence is not a proved rejection either.
-      throw new ResidentOutcomeUnknownError(command, decision, error, signal);
+      throw new ResidentOutcomeUnknownError(command, decision, detail, signal);
     }
   }
 

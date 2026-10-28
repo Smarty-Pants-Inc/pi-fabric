@@ -13,6 +13,7 @@ const dead = vi.hoisted(() => new Set<number>());
 vi.mock("../src/residency/process-identity.js", async (original) => ({
   ...await original<typeof import("../src/residency/process-identity.js")>(),
   residentProcessAlive: vi.fn((pid: number) => !dead.has(pid)),
+  residentHostOwnerAlive: vi.fn((owner: { pid: number }) => !dead.has(owner.pid)),
 }));
 // The real spawnDetached API handle shape; only the OS spawn is replaced.
 vi.mock("../src/agents/transports/process-utils.js", async (original) => ({

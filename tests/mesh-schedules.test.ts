@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import fs from "node:fs";
+import fs, { type FSWatcher } from "node:fs";
+import { EventEmitter } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +12,8 @@ import { residentIdleDecision } from "../src/residency/host.js";
 import type { FabricParticipantSource } from "../src/topology/types.js";
 
 const roots: string[] = [];
+const monitors: ActorMeshMonitor[] = [];
+const monitorStores: MeshStore[] = [];
 const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
 const context = {} as FabricInvocationContext;
 const participants: FabricParticipantSource = {
@@ -25,6 +28,9 @@ const meshRoot = (): string => {
 };
 
 afterEach(() => {
+  for (const monitor of monitors.splice(0)) monitor.close();
+  for (const store of monitorStores.splice(0)) store.closeState();
+  vi.restoreAllMocks();
   vi.useRealTimers();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -196,6 +202,134 @@ describe("mesh schedules", () => {
       expect(store.scheduled()).toEqual([]);
     } finally {
       monitor.close();
+    }
+  });
+});
+
+describe("monitor schedule reconciliation", () => {
+  // Recorded catch: scheduling before the initial poll hides the schedule-only
+  // watch race. Use the real watcher, and prove the initial idle tail has finished.
+  it("delivers a schedule added strictly after the initial idle poll within three seconds", async () => {
+    const store = new MeshStore(meshRoot(), 64 * 1024, 100);
+    monitorStores.push(store);
+    const tail = vi.spyOn(store, "tail");
+    const events: string[] = [];
+    const monitor = new ActorMeshMonitor(store, { enabled: true, actorPollMs: 60_000, maxReadEvents: 100 }, {
+      beforePoll: () => true,
+      onEvent: event => { events.push(String(event.text)); },
+    });
+    monitors.push(monitor);
+    monitor.start();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(tail).toHaveBeenCalledOnce();
+    expect(monitor.caughtUp()).toBe(true);
+    await store.schedule({ topic: "t", from: identity, text: "post-idle", dueAt: Date.now() + 150 });
+    await vi.waitFor(() => expect(events).toEqual(["post-idle"]), { timeout: 3_000, interval: 20 });
+    expect(store.scheduled()).toEqual([]);
+  });
+
+  // Control only the notification/clock boundary; scheduling, replacement,
+  // cancellation and release still go through the real store and event log.
+  const controlled = async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
+    const store = new MeshStore(meshRoot(), 64 * 1024, 100);
+    monitorStores.push(store);
+    const watcher = Object.assign(new EventEmitter(), { close: vi.fn() });
+    const watch = vi.spyOn(fs, "watch").mockReturnValue(watcher as unknown as FSWatcher);
+    const tail = vi.spyOn(store, "tail");
+    const release = vi.spyOn(store, "releaseDueSchedules");
+    const beforePoll = vi.fn(() => true);
+    const onEvent = vi.fn();
+    const canConsumeMesh = vi.fn(() => true);
+    const canAdmit = vi.fn(() => true);
+    const monitor = new ActorMeshMonitor(store, { enabled: true, actorPollMs: 60_000, maxReadEvents: 100 }, {
+      beforePoll, canConsumeMesh, canAdmit, onEvent,
+    });
+    monitors.push(monitor);
+    monitor.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tail).toHaveBeenCalledOnce();
+    const notify = watch.mock.calls[0]!.at(-1) as fs.WatchListener<string>;
+    return { store, monitor, tail, release, beforePoll, canConsumeMesh, canAdmit, onEvent, notify };
+  };
+
+  it.each(["schedules.json", null])("reconciles earlier/later replacement and cancellation on %s notifications without idle tails", async filename => {
+    const s = await controlled();
+    const now = Date.now();
+    await s.store.schedule({ topic: "t", from: identity, text: "original", key: "wake", dueAt: now + 1_000 });
+    s.notify("rename", filename);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.tail).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(2); // safety net plus due timer
+
+    await s.store.schedule({ topic: "t", from: identity, text: "earlier", key: "wake", dueAt: now + 200 });
+    s.notify("rename", filename);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(s.onEvent.mock.calls.map(([event]) => event.text)).toEqual(["earlier"]);
+    expect(s.store.scheduled()).toEqual([]);
+    s.notify("change", "events.jsonl"); // settle the release's event-log edge
+    await vi.advanceTimersByTimeAsync(0);
+    const reads = s.tail.mock.calls.length;
+
+    await s.store.schedule({ topic: "t", from: identity, text: "superseded", key: "wake", dueAt: now + 400 });
+    s.notify("rename", filename);
+    await vi.advanceTimersByTimeAsync(0);
+    await s.store.schedule({ topic: "t", from: identity, text: "later", key: "wake", dueAt: now + 700 });
+    s.notify("rename", filename);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(s.onEvent).toHaveBeenCalledOnce();
+    expect(s.tail).toHaveBeenCalledTimes(reads); // the superseded timer did not wake/tail
+    await vi.advanceTimersByTimeAsync(300);
+    expect(s.onEvent.mock.calls.map(([event]) => event.text)).toEqual(["earlier", "later"]);
+
+    await s.store.schedule({ topic: "t", from: identity, text: "cancelled", key: "wake", dueAt: now + 900 });
+    s.notify("rename", filename);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(2);
+    await s.store.unschedule("wake");
+    s.notify("rename", filename);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(1);
+    s.tail.mockClear();
+    s.beforePoll.mockClear();
+    for (let index = 0; index < 10; index++) {
+      s.notify("change", filename);
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    await vi.advanceTimersByTimeAsync(300);
+    expect(s.tail).not.toHaveBeenCalled();
+    expect(s.beforePoll).not.toHaveBeenCalled();
+    expect(s.release).toHaveBeenCalledTimes(2);
+    expect(s.onEvent.mock.calls.map(([event]) => event.text)).toEqual(["earlier", "later"]);
+    const plain = await s.store.publish({ topic: "t", from: identity, text: "plain" });
+    s.notify("change", "events.jsonl");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(s.onEvent).toHaveBeenLastCalledWith(plain);
+    expect(s.tail).toHaveBeenCalledOnce();
+  });
+
+  it.each(["beforePoll", "canConsumeMesh", "canAdmit", "close"] as const)("does not release a due schedule after %s denies a timer/queued wake", async gate => {
+    const s = await controlled();
+    await s.store.schedule({ topic: "t", from: identity, text: "held", dueAt: Date.now() + 100 });
+    s.notify("rename", null);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(2);
+    // Queue a watch wake, then revoke admission/close before it can execute.
+    s.notify("rename", null);
+    if (gate === "close") s.monitor.close();
+    else s[gate].mockReturnValue(false);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(s.release).not.toHaveBeenCalled();
+    expect(s.onEvent).not.toHaveBeenCalled();
+    expect(s.store.scheduled().map(entry => entry.text)).toEqual(["held"]);
+    expect(s.tail).toHaveBeenCalledOnce();
+    if (gate === "close") expect(vi.getTimerCount()).toBe(0);
+    else {
+      s[gate].mockReturnValue(true);
+      s.monitor.schedule();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(s.onEvent.mock.calls.map(([event]) => event.text)).toEqual(["held"]);
+      expect(s.store.scheduled()).toEqual([]);
     }
   });
 });

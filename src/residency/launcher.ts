@@ -9,7 +9,7 @@ import type { ChildProcess } from "node:child_process";
 import crossSpawn from "cross-spawn";
 import { observeResidentOwner, captureDescendants, stopObservedDescendants, checkResidentSessionExit, type OwnedProcess } from "./launcher-owner.js";
 import { watchResidentChild, type ResidentChildExit, type ResidentChildLifetime } from "./child-lifetime.js";
-import { processStartTime, residentProcessAlive } from "./process-identity.js";
+import { prepareResidentOwnerObservation, processStartTime, residentHostOwnerAlive } from "./process-identity.js";
 import { assertResidentWakeConfig, canonicalResidentWakeConfig, retainedRoutesAt, ResidentWakeConfigMismatch } from "./wake-index.js";
 import { readWakeJson, residentOwnerLive, residentOwnerSleeping, residentSleepingPath, residentWakeRequestPath, residentWakeIntentLockPath, waitResidentChange, ResidentWakePending } from "./wake.js";
 import { FileLockBusy } from "./file-lock.js";
@@ -484,6 +484,14 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
     trace("launcher-idle", { reason: "root dead, no actors; waiting for an explicit spawn request" });
     return;
   }
+  await prepareResidentOwnerObservation(root);
+  // Cancellation may arrive while native identity is prepared, before the stop listener exists.
+  // Never create a child after that abort (an AbortSignal does not replay an earlier event).
+  if (options.signal?.aborted) return;
+  assertNoWatchdogCustody(root);
+  if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(root)))) return;
+  config = options.wakeOnly ? assertResidentWakeConfig(root, config) : readConfig(configPath);
+  if (readResidentIdleExit(root, config.rootId)) return;
   // Windows has no POSIX birth/session evidence or report-signal recovery.
   // Keep ordinary native child supervision/shutdown, but never enter watchdog custody.
   const watchdogSupported = process.platform !== "win32";
@@ -622,13 +630,14 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
   const sharedExit = (attempt: Attempt): boolean => {
     if (attempt.sharedExit !== undefined) return attempt.sharedExit;
     const owner = readOwner();
-    const ours = owner !== undefined && (owner.token === attempt.generation || owner.pid === attempt.child.pid);
-    const other = owner !== undefined && !ours && residentProcessAlive(owner.pid, owner.processStartTime);
+    const ours = owner !== undefined && (owner.token === attempt.generation ||
+      (owner.pid === attempt.child.pid && residentHostOwnerAlive(owner, ownerPath)));
+    const other = owner !== undefined && !ours && residentHostOwnerAlive(owner, ownerPath);
     return attempt.sharedExit = !attempt.seenOwner && !ours && !other;
   };
   const observe = (attempt: Attempt): void => {
     const owner = readOwner();
-    const live = owner && residentProcessAlive(owner.pid, owner.processStartTime) ? owner.pid : undefined;
+    const live = owner && residentHostOwnerAlive(owner, ownerPath) ? owner.pid : undefined;
     const observation = observeResidentOwner(live, attempt.child.pid, attempt.claimedOwner);
     attempt.claimedOwner = observation.claimed; attempt.seenOwner ||= observation.observedOwner;
     if (owner && owner.pid === attempt.child.pid && observation.observedOwner) attempt.ownerToken = owner.token;
@@ -643,7 +652,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       const held = fs.fstatSync(fd);
       if (held.ino !== inode.ino || held.dev !== inode.dev) throw new Error("Resident kernel fence inode changed during acquisition");
       const owner = readOwner();
-      if (owner && residentProcessAlive(owner.pid, owner.processStartTime)) throw new Error("Another live owner blocks resident fallback");
+      if (owner && residentHostOwnerAlive(owner, ownerPath)) throw new Error("Another live owner blocks resident fallback");
     } finally { fs.closeSync(fd); }
   };
   const ready = async (attempt: Attempt, plan: ResidentHandoverPlan, spec: ResidentLaunchSpec, kind: "target" | "fallback"): Promise<void> => {
@@ -652,7 +661,8 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
       captureDescendants(attempt); observe(attempt);
       if (kind === "target" && !mainGenerationCurrent(root, plan.main)) throw new Error("Main generation lost before terminal release success");
       const owner = readOwner();
-      if (owner && owner.pid === attempt.child.pid && exactResidentProcess(owner as { pid: number; processStartTime: string }) &&
+      if (owner && owner.pid === attempt.child.pid && residentHostOwnerAlive(owner, ownerPath) &&
+          exactResidentProcess(owner as { pid: number; processStartTime: string }) &&
           owner.token !== plan.old.token && owner.releaseRoot === spec.releaseRoot && owner.configDigest === spec.digest &&
           owner.attempt?.id === plan.id && owner.attempt.kind === kind && owner.handover?.launcher.token === launcher.token && owner.readyAt > 0) return;
       await delay(50);
@@ -701,7 +711,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
     const coldStartMs = numberSetting(watchdog?.coldStartMs, 900_000);
     const owner = readOwner();
     if (typeof owner?.hostId !== "string" || owner.pid !== candidate.child.pid || candidate.closingInput || !candidate.child.pid ||
-        !residentProcessAlive(candidate.child.pid, owner.processStartTime)) return;
+        !residentHostOwnerAlive(owner, ownerPath)) return;
     const lease = readOwnLease(launchConfig, owner.hostId);
     if (!lease || lease.updatedAt < candidate.startedAt) return;
     candidate.firstLeaseAt ??= lease.updatedAt;
@@ -726,7 +736,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
         if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(root)))) reason = "release handover became active";
         else if (candidate.closingInput || !currentOwner || currentOwner.pid !== owner.pid || currentOwner.token !== owner.token ||
           currentOwner.hostId !== owner.hostId || currentOwner.processStartTime !== owner.processStartTime ||
-          currentOwner.startedAt !== owner.startedAt || !residentProcessAlive(owner.pid, owner.processStartTime) ||
+          currentOwner.startedAt !== owner.startedAt || !residentHostOwnerAlive(currentOwner, ownerPath) ||
           (process.platform === "linux" && (!birth || processStartTime(owner.pid) !== birth))) reason = "owner generation or child incarnation changed";
         else if (!currentLease || currentLease.updatedAt !== lease.updatedAt || currentLease.updatedAt < candidate.startedAt ||
           Date.now() - currentLease.updatedAt <= stallMs) reason = "lease renewed, healthy or unavailable";
@@ -791,7 +801,7 @@ async function superviseResident(configPath: string, options: ResidentSuperviseO
         }
         observe(attempt);
         const sleepingOwner = readOwner();
-        if (!plan && sleepingOwner?.pid === attempt.child.pid && residentOwnerSleeping(root)) {
+        if (!plan && sleepingOwner && sleepingOwner.pid === attempt.child.pid && residentHostOwnerAlive(sleepingOwner, ownerPath) && residentOwnerSleeping(root)) {
           // This launcher spawned the closing owner. Its native exit notification, not
           // a 50ms PID/exit recheck, owns sleep completion. One deadline bounds failure.
           try {
@@ -958,6 +968,7 @@ export interface ResidentWakePendingResult { status: "wake-pending"; root: strin
 export async function superviseWake(configPath: string, run: (configPath: string) => Promise<void> = file => supervise(file, { wakeOnly: true }),
   options: { wakeOnly?: boolean; beforeFinalRelease?: () => Promise<void> } = {}): Promise<void | ResidentWakePendingResult> {
   const root = path.dirname(configPath);
+  await prepareResidentOwnerObservation(root);
   let fd: number | undefined;
   try { fd = await lockFile(path.join(root, "wake.lock"), 0, process.platform === "linux"); }
   catch (error) { if (error instanceof FileLockBusy) return; throw error; }

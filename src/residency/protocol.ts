@@ -419,8 +419,11 @@ export interface ResidentHostOwner {
   format: typeof RESIDENT_HOST_FORMAT;
   hostId: string;
   pid: number;
-  /** Linux /proc start ticks; absent for older hosts and on other platforms. */
+  /** Native process birth (Linux /proc start ticks); absent for legacy/unreadable identities. */
   processStartTime?: string | undefined;
+  /** Native boot and PID namespace identity; incomplete legacy records retain PID-only behavior. */
+  bootId?: string | undefined;
+  pidNamespace?: string | undefined;
   token: string;
   /** Binds ready custody transfer to the exact client-owned launch attempt. */
   launchToken?: string;

@@ -2,7 +2,8 @@
 
 import { fabricTurnProvenance, fabricWakeCause, copyFabricWakeCause, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { diagnostics } from "../core/diagnostics.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import type { LockIdentity, LockIdentityVerdict } from "../core/lock-identity.js";
 import { detachedPreview } from "../core/preview.js";
 import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import {
@@ -213,6 +214,16 @@ const loadRunnerModule = (specifier: string): Promise<void> => {
 
 export class ResidentHostAlreadyRunning extends Error {}
 
+type ResidentLockOwner = Partial<ResidentHostOwner>;
+type ResidentStaleReason = Exclude<LockIdentityVerdict, "live" | "unknown">;
+interface ResidentLockRecord {
+  sourcePath: string;
+  bytes: string | undefined;
+  owner: ResidentLockOwner | undefined;
+  alive: boolean;
+  reason?: ResidentStaleReason;
+}
+
 const parseResidentHostConfigPath = (argv: readonly string[]): string => {
   const index = argv.indexOf("--config");
   const value = index >= 0 ? argv[index + 1] : undefined;
@@ -297,6 +308,11 @@ export class ResidentHost {
   lifecycle!: LifecycleBroker;
   #lockFd: number | undefined;
   #exclusiveCreateLock = false;
+  #lockIdentity: LockIdentity | undefined;
+  // Exact predecessor bytes classified while acquiring this fence. A later owner
+  // replacement cannot inherit a stale verdict merely by reusing its PID.
+  readonly #staleOwnerRecords = new Set<string>();
+  readonly #legacyOwnerRecords = new Set<string>();
   readonly #ownerPath: string;
   #failure: unknown;
   /**
@@ -1067,8 +1083,7 @@ export class ResidentHost {
       const owner: ResidentHostOwner = {
         format: RESIDENT_HOST_FORMAT,
         hostId: this.hostId,
-        pid: process.pid,
-        processStartTime: processStartTime(process.pid),
+        ...this.#lockOwner(),
         fabricExtensionPath: this.config.fabricExtensionPath,
         token: this.#token,
         ...(process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN ? { launchToken: process.env.PI_FABRIC_RESIDENT_LAUNCH_TOKEN } : {}),
@@ -3126,12 +3141,18 @@ export class ResidentHost {
 
   async #acquireLock(): Promise<void> {
     fs.mkdirSync(this.config.residencyRoot, { recursive: true, mode: 0o700 });
-    // Windows has no flock helper. Retain main's exclusive-create host claim,
-    // without PID-based stale unlinking or pretending it is a kernel fence.
-    if (process.platform === "win32") { this.#acquireWindowsLock(); return; }
-    // Only an inode we created, or one previously established by this protocol,
-    // is safe to adopt. A dead legacy PID cannot exclude a reclaimer that already
-    // committed to unlinking that inode. Empty/torn legacy startup records prove even less.
+    // Identity readers are first-use only, never registration/idle work.
+    const { readLockIdentity, completeLockIdentity, warnLegacyLockOwner } = await import("../core/lock-identity.js");
+    // No explicit undefined start: on macOS/Windows the async native reader must
+    // prepare birth identity here, before taking any root/establishment lock.
+    this.#lockIdentity = await readLockIdentity();
+    if (!await completeLockIdentity(this.#lockIdentity)) warnLegacyLockOwner(this.#lockPath, JSON.stringify(this.#lockOwner()));
+    // Windows has no flock helper. Its exclusive-create fallback must retain a
+    // stale claim, never delete it or pretend metadata is a kernel fence.
+    if (process.platform === "win32") { await this.#acquireWindowsLock(); return; }
+    // Legacy inodes require our creation/provenance proof: a dead legacy PID
+    // cannot exclude an old reclaimer already committed to unlinking the inode.
+    // Complete new identities can be recovered, but only AFTER taking flock.
     // Serialize creation through provenance publication. A noncreator must
     // never acquire host.lock ahead of its creator and strand a fresh root.
     // This guard is immutable too; arbitrary empty legacy host.lock stays refused.
@@ -3146,24 +3167,128 @@ export class ResidentHost {
     finally { fs.closeSync(establishmentFd); }
   }
 
-  /** Legacy Windows primitive: an atomic claim, not automatic crash recovery. */
-  #acquireWindowsLock(): void {
-    const existing = readJson<ResidentHostOwner>(this.#ownerPath);
-    if (existing && residentProcessAlive(existing.pid, existing.processStartTime)) {
-      throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
+  #lockOwner(): { pid: number; processStartTime: string | undefined; bootId: string | undefined; pidNamespace: string | undefined } {
+    return { pid: process.pid, processStartTime: this.#lockIdentity?.start,
+      bootId: this.#lockIdentity?.bootId, pidNamespace: this.#lockIdentity?.namespace };
+  }
+
+  async #readLockRecord(sourcePath: string, warnLegacy = true): Promise<ResidentLockRecord> {
+    let bytes: string;
+    try { bytes = fs.readFileSync(sourcePath, "utf8"); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { sourcePath, bytes: undefined, owner: undefined, alive: false };
+      throw error;
     }
+    let owner: ResidentLockOwner | undefined;
+    try {
+      const parsed: unknown = JSON.parse(bytes);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) owner = parsed as ResidentLockOwner;
+    } catch { /* Torn diagnostics retain the established-inode legacy policy. */ }
+    const { completeLockIdentity, lockIdentityVerdict, warnLegacyLockOwner } = await import("../core/lock-identity.js");
+    const identity: LockIdentity = { pid: owner?.pid ?? 0, start: owner?.processStartTime,
+      bootId: owner?.bootId, namespace: owner?.pidNamespace };
+    if (!await completeLockIdentity(identity)) {
+      if (warnLegacy) warnLegacyLockOwner(sourcePath, bytes);
+      if (sourcePath === this.#ownerPath) this.#legacyOwnerRecords.add(bytes);
+      return { sourcePath, bytes, owner, alive: !!owner && residentProcessAlive(owner.pid ?? 0, owner.processStartTime) };
+    }
+    const verdict = await lockIdentityVerdict(identity, Date.now() + 2_000);
+    if (verdict === "live" || verdict === "unknown") return { sourcePath, bytes, owner, alive: true };
+    return { sourcePath, bytes, owner, alive: false, reason: verdict };
+  }
+
+  /** POSIX archives diagnostic BYTES, never the flock inode. Only the guarded
+   * exclusive-create fallback may detach the actual claim. Keep all evidence. */
+  #retainStaleRecord(record: ResidentLockRecord, moveAside = false): void {
+    if (!record.reason || record.bytes === undefined) return;
+    if (fs.readFileSync(record.sourcePath, "utf8") !== record.bytes) throw new Error("Resident stale owner changed during recovery");
+    const recoveredAt = new Date().toISOString();
+    const preservedPath = `${record.sourcePath}.stale.${recoveredAt.replace(/[:.]/g, "-")}.${randomUUID()}`;
+    if (!moveAside) fs.copyFileSync(record.sourcePath, preservedPath, fs.constants.COPYFILE_EXCL);
+    fs.writeFileSync(`${preservedPath}.recovery.json`, `${JSON.stringify({ format: 1,
+      kind: "stale-resident-owner-observation", sourcePath: record.sourcePath, preservedPath, recoveredAt,
+      action: moveAside ? "move-aside" : "metadata-snapshot", reason: record.reason,
+      previousOwner: record.owner, recoveredBy: this.#lockOwner() })}\n`, { flag: "wx", mode: 0o600 });
+    if (moveAside) fs.renameSync(record.sourcePath, preservedPath);
+    if (record.sourcePath === this.#ownerPath) this.#staleOwnerRecords.add(record.bytes);
+  }
+
+  /** Publish a NONEMPTY identity-bearing directory atomically. A dead recovery
+   * owner can itself be moved aside safely: deterministic nonempty directory
+   * destinations prevent a delayed cleaner from replacing a live successor. */
+  async #claimStaleRecovery(guard: string, record: ResidentLockRecord): Promise<() => void> {
+    const staging = fs.mkdtempSync(`${guard}.pending.`);
+    const owner = JSON.stringify({ token: this.#token, ...this.#lockOwner(), startedAt: Date.now() });
+    fs.writeFileSync(path.join(staging, "owner"), owner, { flag: "wx", mode: 0o600 });
+    fs.writeFileSync(path.join(staging, "intent.json"), JSON.stringify({ sourcePath: this.#lockPath,
+      previousOwner: record.owner, reason: record.reason, recoveredAt: new Date().toISOString() }), { flag: "wx", mode: 0o600 });
+    const publish = (): boolean => {
+      try { fs.renameSync(staging, guard); return true; }
+      catch (error) {
+        if (["EEXIST", "ENOTEMPTY", "EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) return false;
+        throw error;
+      }
+    };
+    if (!publish()) {
+      const previous = await this.#readLockRecord(path.join(guard, "owner"));
+      if (!previous.reason || previous.bytes === undefined || !previous.owner) {
+        throw new ResidentHostAlreadyRunning("Fabric resident host stale recovery owner is live or uncertain");
+      }
+      const { retainIdentityStaleLock } = await import("../core/lock-identity.js");
+      let moved: boolean;
+      try {
+        moved = retainIdentityStaleLock(guard, fs.lstatSync(guard), previous.bytes,
+          previous.owner.startedAt ?? 0, previous.reason, { pid: previous.owner.pid ?? 0,
+            start: previous.owner.processStartTime, bootId: previous.owner.bootId, namespace: previous.owner.pidNamespace });
+      } catch (error) {
+        if (!["ENOENT", "EEXIST", "ENOTEMPTY", "EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+        moved = false;
+      }
+      if (!moved || !publish()) throw new ResidentHostAlreadyRunning("Fabric resident host stale recovery claim changed");
+    }
+    const held = fs.lstatSync(guard, { bigint: true });
+    return () => {
+      const current = fs.lstatSync(guard, { bigint: true });
+      if (current.dev !== held.dev || current.ino !== held.ino || fs.readFileSync(path.join(guard, "owner"), "utf8") !== owner) {
+        throw new ResidentHostAlreadyRunning("Fabric resident host lost its stale recovery claim");
+      }
+    };
+  }
+
+  /** Atomic exclusive-create claim. Legacy/uncertain records still require a drain. */
+  async #acquireWindowsLock(): Promise<void> {
+    const existing = await this.#readLockRecord(this.#ownerPath);
+    if (existing.alive) throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
     try { this.#lockFd = fs.openSync(this.#lockPath, "wx", 0o600); }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        // Never unlink a stale/empty claim: a delayed starter or legacy
-        // reclaimer may still own it. Windows recovery requires a verified drain.
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const record = await this.#readLockRecord(this.#lockPath);
+      if (!record.reason || record.bytes === undefined) {
         throw new ResidentHostAlreadyRunning("Fabric resident host is already running or has a legacy/uncertain startup record; verify drain before removing it");
       }
-      throw error;
+      const judged = fs.lstatSync(this.#lockPath, { bigint: true });
+      if (!judged.isFile()) throw new Error("Resident startup claim is not a regular file");
+      // A recoverable, per-generation directory claim serializes stale file
+      // detachment; native file rename alone has no inode CAS against a successor.
+      const digest = createHash("sha256").update(`${judged.dev}:${judged.ino}:${record.bytes}`).digest("hex");
+      const guard = `${this.#lockPath}.recover.${digest}`;
+      const assertRecoveryHeld = await this.#claimStaleRecovery(guard, record);
+      const current = fs.lstatSync(this.#lockPath, { bigint: true });
+      if (current.dev !== judged.dev || current.ino !== judged.ino || fs.readFileSync(this.#lockPath, "utf8") !== record.bytes) {
+        throw new ResidentHostAlreadyRunning("Fabric resident host startup claim changed during recovery");
+      }
+      assertRecoveryHeld();
+      this.#retainStaleRecord(record, true);
+      try { this.#lockFd = fs.openSync(this.#lockPath, "wx", 0o600); }
+      catch (claimError) {
+        if ((claimError as NodeJS.ErrnoException).code === "EEXIST") throw new ResidentHostAlreadyRunning("Fabric resident host is already running");
+        throw claimError;
+      }
     }
     this.#exclusiveCreateLock = true;
     try {
-      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
+      this.#retainStaleRecord(existing);
+      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, ...this.#lockOwner() }));
     } catch (error) { this.#releaseLock(error); throw error; }
   }
 
@@ -3188,24 +3313,39 @@ export class ResidentHost {
       const sameInode = (stat: { dev: bigint; ino: bigint }): boolean =>
         stat.dev === locked.dev && stat.ino === locked.ino;
       if (!sameInode(current)) throw new Error("Fabric resident host startup inode was replaced; verify legacy drain");
-      // Read before overwriting: an unknown birth identity is not permission to displace a live owner.
-      const records = [readJson<ResidentHostOwner>(this.#lockPath), readJson<ResidentHostOwner>(this.#ownerPath)];
-      if (records.some((owner) => owner && owner.pid !== process.pid && residentProcessAlive(owner.pid, owner.processStartTime))) {
-        throw new ResidentHostAlreadyRunning("Fabric resident host is already running (legacy owner)");
+      // Kernel acquisition MUST precede metadata recovery. Another boot or PID
+      // namespace is not permission to rename an actively flocked inode.
+      const lockRecord = await this.#readLockRecord(this.#lockPath, !created);
+      const ownerRecord = await this.#readLockRecord(this.#ownerPath);
+      // Native identity reads may await: revalidate the path after them, before
+      // archiving metadata, publishing provenance or overwriting the held inode.
+      if (!sameInode(fs.lstatSync(this.#lockPath, { bigint: true }))) {
+        throw new Error("Fabric resident host startup inode was replaced during identity verification");
+      }
+      if ([lockRecord, ownerRecord].some(record => record.alive && record.owner?.pid !== process.pid)) {
+        throw new ResidentHostAlreadyRunning("Fabric resident host is already running (recorded owner)");
       }
       const provenancePath = path.join(this.config.residencyRoot, "host-fence.json");
       const provenance = readJson<{ format: number; dev: string; ino: string }>(provenancePath);
       const established = provenance?.format === 1 && provenance.dev === String(locked.dev) && provenance.ino === String(locked.ino);
       if (!established) {
-        if (!created || !sameInode(created) || fs.existsSync(provenancePath) || fs.existsSync(this.#ownerPath)) {
+        const freshInode = !!created && sameInode(created);
+        // Complete stale identities also let a restarted PV adopt the SAME
+        // kernel-fenced inode. Arbitrary legacy files still require a drain.
+        if (fs.existsSync(provenancePath) || (!freshInode && !lockRecord.reason) ||
+            (ownerRecord.bytes !== undefined && !ownerRecord.reason)) {
           throw new Error("Fabric resident host has a legacy or uncertain startup record; verify rollout/rollback drain before removing it");
         }
+      }
+      this.#retainStaleRecord(lockRecord);
+      this.#retainStaleRecord(ownerRecord);
+      if (!established) {
         // Bind provenance to the immutable flock inode, not the mutable PID diagnostic.
         // After a crash, corrupt diagnostic bytes must not disable kernel-fenced recovery.
         atomicWrite(provenancePath, { format: 1, dev: String(locked.dev), ino: String(locked.ino) });
       }
       fs.ftruncateSync(this.#lockFd, 0);
-      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, pid: process.pid, processStartTime: processStartTime(process.pid) }));
+      fs.writeFileSync(this.#lockFd, JSON.stringify({ token: this.#token, ...this.#lockOwner() }));
     } catch (error) { this.#releaseLock(error); throw error; }
   }
 
@@ -3213,8 +3353,8 @@ export class ResidentHost {
    * True only while this host provably owns its root: host.lock at its path is
    * still the inode this host locked (the establishment check), and owner.json
    * names this host (the owner fence check) or, before this host published it,
-   * names no live process (a dead predecessor's record). A replaced lock or a
-   * live other generation's owner.json means the root is not ours to write.
+   * is the exact predecessor proved stale during acquisition (or a dead legacy
+   * record). A replaced lock or live successor's owner.json is not ours to write.
    */
   #holdsRoot(): boolean {
     if (this.#lockFd === undefined) return false;
@@ -3223,9 +3363,21 @@ export class ResidentHost {
       const current = fs.lstatSync(this.#lockPath, { bigint: true });
       if (current.dev !== locked.dev || current.ino !== locked.ino) return false;
     } catch { return false; }
-    const owner = readJson<ResidentHostOwner>(this.#ownerPath);
+    let ownerBytes: string;
+    try { ownerBytes = fs.readFileSync(this.#ownerPath, "utf8"); }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+    let owner: ResidentLockOwner | undefined;
+    try {
+      const parsed: unknown = JSON.parse(ownerBytes);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) owner = parsed as ResidentLockOwner;
+    } catch { /* Legacy torn diagnostics preserve their existing behavior. */ }
     if (owner?.token === this.#token) return owner.pid === process.pid;
-    return !owner || !residentProcessAlive(owner.pid, owner.processStartTime);
+    // The old-boot/namespace/reused-PID owner remains until readiness publication.
+    // Reuse only the exact identity verdict obtained under our acquired fence,
+    // never PID-only liveness for that stale predecessor or a mutable successor.
+    if (this.#staleOwnerRecords.has(ownerBytes)) return true;
+    if ((owner?.bootId !== undefined || owner?.pidNamespace !== undefined) && !this.#legacyOwnerRecords.has(ownerBytes)) return false;
+    return !owner || !residentProcessAlive(owner.pid ?? 0, owner.processStartTime);
   }
 
   #releaseLock(failure = this.#failure): void {

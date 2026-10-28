@@ -13,7 +13,7 @@ import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } 
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics, type StateChangeExceptions } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
-import { closeResidentWakeRetryCursor, indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
+import { closeResidentWakeRetryCursor, indexResidentDeliveries, residentDirectories, type WakeSubscription } from "../residency/wake-index.js";
 import { writeFileAtomic } from "../core/atomic-write.js";
 import type { FabricMessageSender } from "../protocol.js";
 import { copyFabricPrincipal, type FabricPrincipal } from "../fabric-provenance.js";
@@ -572,10 +572,12 @@ export class MeshStore {
 
   async publish(input: MeshPublishInput): Promise<MeshEvent> {
     // Due schedules go first so the log keeps due-time order relative to this event; damaged
-    // schedule state must not block ordinary publishing (upstream). With nothing due this stays
-    // synchronous up to the EventLog call: no extra await or lock on the ordinary path.
+    // schedule state must not block ordinary publishing (upstream). With nothing due Linux and
+    // no-residency publishes stay synchronous up to EventLog: no extra await or lock.
     // releaseDueSchedules wakes the recipients of released schedules; this wakes the event's.
     const stamped = { ...input, sender: input.sender ?? processSender() };
+    const preparation = this.#prepareResidentDeliveries();
+    if (preparation) await preparation;
     if (this.#scheduleDue()) await this.releaseDueSchedules().catch(() => undefined);
     const event = await this.#events.publish(stamped);
     await this.#wakeAfterPublish([event]);
@@ -584,10 +586,24 @@ export class MeshStore {
 
   async publishBatch(inputs: MeshPublishInput[], lockTiming?: LockTimingContext): Promise<MeshEvent[]> {
     const stamped = inputs.map((input) => ({ ...input, sender: input.sender ?? processSender() }));
+    const preparation = this.#prepareResidentDeliveries();
+    if (preparation) await preparation;
     if (this.#scheduleDue()) await this.releaseDueSchedules().catch(() => undefined);
     const events = await this.#events.publishBatch(stamped, lockTiming);
     await this.#wakeAfterPublish(events);
     return events;
+  }
+
+  /** Native birth observations must finish BEFORE publication custody, never in EventLog's
+   * synchronous indexing callback. That callback re-reads the actual owner; only its exact
+   * generation may consume the prepared verdict. Linux already has synchronous proc evidence. */
+  #prepareResidentDeliveries(): Promise<void> | undefined {
+    if (process.platform === "linux" || !fs.existsSync(path.join(this.root, "residency"))) return;
+    const roots = residentDirectories(this.root);
+    if (!roots.length) return;
+    return import("../residency/process-identity.js").then(async ({ prepareResidentOwnerObservation }) => {
+      await Promise.all(roots.map(root => prepareResidentOwnerObservation(root).catch(() => undefined)));
+    }).catch(() => undefined); // Unavailable native evidence is UNKNOWN/live, not a publication refusal.
   }
 
   async #wakeAfterPublish(events: readonly MeshEvent[]): Promise<void> {
@@ -626,6 +642,8 @@ export class MeshStore {
    * capability, for side stores (grants) that must commit with an event.
    */
   async transact<T>(operation: (append: (input: MeshAppendInput) => MeshEvent) => T): Promise<T> {
+    const preparation = this.#prepareResidentDeliveries();
+    if (preparation) await preparation;
     const committed: MeshEvent[] = [];
     const result = await this.#lock.withLock(() => {
       try { committed.push(...this.#releaseDueLocked(Date.now())); } catch { /* schedule mutations report it */ }
@@ -700,6 +718,9 @@ export class MeshStore {
     if (Buffer.byteLength(JSON.stringify(released), "utf8") > this.maxEventBytes) {
       throw new Error(`Mesh event exceeds ${this.maxEventBytes} bytes`);
     }
+    // Even a future schedule can release another writer's due entry once the lock is acquired.
+    const preparation = this.#prepareResidentDeliveries();
+    if (preparation) await preparation;
     let releasedEvents: MeshEvent[] = [];
     const scheduled = await this.#lock.withLock(() => {
       // A caller cancelled while this waited for the lock must not commit: the provider's
@@ -759,6 +780,8 @@ export class MeshStore {
   async releaseDueSchedules(now = Date.now()): Promise<MeshEvent[]> {
     const next = this.nextScheduleDueAt();
     if (next === undefined || next > now) return [];
+    const preparation = this.#prepareResidentDeliveries();
+    if (preparation) await preparation;
     const released = await this.#lock.withLock(() => this.#releaseDueLocked(now), undefined, "publish");
     // Released schedules are deliveries: wake their dormant resident recipients.
     await this.#wakeAfterPublish(released);

@@ -11,11 +11,14 @@ import { canonicalResidentWakeConfig } from "../src/residency/wake-index.js";
 import * as residentWake from "../src/residency/wake.js";
 import type { ResidentHostConfig } from "../src/residency/protocol.js";
 
-const mocks = vi.hoisted(() => ({ spawn: vi.fn(), alive: new Set<number>(), births: new Map<number, string>(),
+const mocks = vi.hoisted(() => ({ spawn: vi.fn(), prepare: vi.fn(async () => {}), alive: new Set<number>(), births: new Map<number, string>(),
   sessionEmpty: true, lockHook: undefined as (() => void) | undefined }));
 vi.mock("cross-spawn", () => ({ default: mocks.spawn }));
 vi.mock("../src/residency/process-identity.js", () => ({
   processStartTime: (pid: number) => mocks.births.get(pid) ?? "fixture-birth", residentProcessAlive: (pid: number) => mocks.alive.has(pid),
+  prepareResidentOwnerIdentity: mocks.prepare,
+  prepareResidentOwnerObservation: mocks.prepare,
+  residentHostOwnerAlive: (owner: { pid: number }) => mocks.alive.has(owner.pid),
 }));
 vi.mock("../src/residency/file-lock.js", () => ({ lockFile: async (file: string) => {
   mocks.lockHook?.();
@@ -116,7 +119,8 @@ const fixture = (settings: ResidentHostConfig["watchdog"] = {}, alwaysStall = fa
 const originalExitCode = process.exitCode;
 afterEach(() => {
   vi.restoreAllMocks(); vi.unstubAllEnvs(); vi.useRealTimers(); process.exitCode = originalExitCode;
-  mocks.spawn.mockReset(); mocks.alive.clear(); mocks.births.clear(); mocks.lockHook = undefined; mocks.sessionEmpty = true;
+  mocks.spawn.mockReset(); mocks.prepare.mockReset().mockResolvedValue(undefined);
+  mocks.alive.clear(); mocks.births.clear(); mocks.lockHook = undefined; mocks.sessionEmpty = true;
 });
 
 const clock = () => {
@@ -728,9 +732,26 @@ describe.skipIf(process.platform === "win32")("launcher live-child lease watchdo
       expect(f.events().find(row => row.event === "watchdog-aborted")).toMatchObject({ signal: "SIGUSR2", reason: expect.stringContaining("incarnation changed") });
     } finally { await f.close(); }
   });
+  it.each([false, true])("waits for native identity and never misses an early abort (aborted=%s)", async aborted => {
+    clock();
+    let release!: () => void;
+    const prepared = new Promise<void>(resolve => { release = resolve; });
+    mocks.prepare.mockReturnValueOnce(prepared);
+    const f = fixture({}, true);
+    try {
+      expect(f.children).toHaveLength(0);
+      if (aborted) f.controller.abort();
+      release();
+      await vi.advanceTimersByTimeAsync(50);
+      expect(f.children).toHaveLength(aborted ? 0 : 1);
+      if (aborted) await expect(f.done).resolves.toBeUndefined();
+    } finally { release(); await f.close(); }
+  });
   it("retains five evidence directories without removing reports", async () => {
     clock(); const f = fixture({}, true);
     try {
+      // Native identity preparation is asynchronous; seed evidence after the launcher creates its directories.
+      await vi.advanceTimersByTimeAsync(0);
       for (let i = 1; i <= 7; i++) fs.mkdirSync(path.join(f.root, "wedges", `2025-01-0${i}T00:00:00.000Z`));
       await vi.advanceTimersByTimeAsync(200);
       expect(fs.readdirSync(path.join(f.root, "wedges")).filter(name => /^20/.test(name))).toHaveLength(5);

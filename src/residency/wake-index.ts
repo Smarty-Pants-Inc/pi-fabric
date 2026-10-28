@@ -3,7 +3,7 @@ import path from "node:path";
 import { writeFileAtomic, syncPathNamespace } from "../core/atomic-write.js";
 import type { MeshEvent } from "../mesh/event-log.js";
 import type { ResidentHostConfig, ResidentHostOwner } from "./protocol.js";
-import { residentProcessAlive } from "./process-identity.js";
+import { residentHostOwnerAlive } from "./process-identity.js";
 import type { ResidentWakeRoutes } from "./wake.js";
 
 export interface WakeDelivery { id: string; sequence?: number; deferredAt?: number }
@@ -20,7 +20,7 @@ export const readWakeJson = <T>(file: string): T | undefined => {
 };
 export const residentOwnerLive = (root: string): boolean => {
   const owner = readWakeJson<ResidentHostOwner>(path.join(root, "owner.json"));
-  return !!owner && residentProcessAlive(owner.pid, owner.processStartTime);
+  return !!owner && residentHostOwnerAlive(owner, path.join(root, "owner.json"));
 };
 export const residentOwnerSleeping = (root: string): boolean => {
   const owner = readWakeJson<ResidentHostOwner>(path.join(root, "owner.json"));

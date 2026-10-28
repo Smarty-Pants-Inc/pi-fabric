@@ -26,6 +26,7 @@ export class ActorMeshMonitor {
   #dueAt: number | undefined;
   #watcher: FSWatcher | undefined;
   #stamp: string | undefined;
+  #scheduleStamp: string | undefined;
   #needsPoll = true;
   #offset: number;
   #scheduled = false;
@@ -237,9 +238,9 @@ export class ActorMeshMonitor {
     this.#safetyNetTimer.unref();
   }
 
-  #meshStamp(): string | undefined {
+  #meshStamp(names: readonly string[] = ["events.jsonl", "generation"]): string | undefined {
     try {
-      return ["events.jsonl", "generation"].map(name => {
+      return names.map(name => {
         const stat = fs.statSync(path.join(this.mesh.root, name), { bigint: true, throwIfNoEntry: false });
         return stat ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}` : "missing";
       }).join("/");
@@ -252,21 +253,16 @@ export class ActorMeshMonitor {
   async #poll(explicit: boolean, maintenance: boolean): Promise<void> {
     if (this.#polling || this.#closed || !this.config.enabled) return;
     const stamp = this.#meshStamp();
-    const unchanged = !this.#needsPoll && stamp !== undefined && stamp === this.#stamp;
-    if (!explicit && !maintenance && unchanged) return;
+    const scheduleStamp = this.#meshStamp(["schedules.json"]);
+    let unchanged = !this.#needsPoll && stamp !== undefined && stamp === this.#stamp;
+    const schedulesUnchanged = scheduleStamp !== undefined && scheduleStamp === this.#scheduleStamp;
+    if (!explicit && !maintenance && unchanged && schedulesUnchanged) return;
     // The safety net also retains the manager's registry/ownership/filter/child-result
     // recovery obligations, even with a quiet log. It does not reread that log.
     if (!this.callbacks.beforePoll() || !this.#mayAdmit()) {
       this.#needsPoll = true;
       return;
     }
-    if (!explicit && unchanged) {
-      // Ignored-only progress can still owe its ten-second checkpoint, even
-      // though an unchanged log needs no reread.
-      this.#persistCursor(false);
-      return;
-    }
-    this.#needsPoll = true;
     this.#polling = true;
     try {
       // Whichever process polls first releases due schedules; the store lock
@@ -275,12 +271,23 @@ export class ActorMeshMonitor {
       let dueAt: number | undefined;
       try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
       if (dueAt !== undefined && dueAt <= Date.now()) {
+        // Releasing schedules can append events without changing the stamp read above.
+        this.#needsPoll = true;
+        unchanged = false;
         await this.mesh.releaseDueSchedules?.().catch(() => undefined);
         if (!this.#mayAdmit()) return;
         try { dueAt = this.mesh.nextScheduleDueAt?.(); } catch { dueAt = undefined; }
       }
       if (!this.#mayAdmit()) return;
       this.#armDue(dueAt);
+      this.#scheduleStamp = scheduleStamp;
+      if (!explicit && unchanged) {
+        // Schedule-only changes rearm/cancel the timer, not an event-log read.
+        // Ignored-only progress can still owe its ten-second checkpoint.
+        this.#persistCursor(false);
+        return;
+      }
+      this.#needsPoll = true;
       if (this.#archiveAfter !== undefined && !this.#catchUpArchive()) return;
       // Live and catch-up both read whole pages. A throwing dispatch restores the boundary
       // before its event, so an empty later poll cannot checkpoint past failed work.

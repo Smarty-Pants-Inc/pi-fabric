@@ -13,6 +13,7 @@ const liveness = vi.hoisted(() => ({ alive: true }));
 vi.mock("../src/residency/process-identity.js", async (original) => ({
   ...await original<typeof import("../src/residency/process-identity.js")>(),
   residentProcessAlive: vi.fn(() => liveness.alive),
+  residentHostOwnerAlive: vi.fn(() => liveness.alive),
 }));
 // The real spawnDetached API handle shape; only the OS spawn is replaced.
 vi.mock("../src/agents/transports/process-utils.js", async (original) => ({

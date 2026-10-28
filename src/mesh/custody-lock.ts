@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
+import { completeLockIdentity, formatLockOwner, isIdentityLockOwner, legacyLockOwnerFields, lockIdentityVerdict, parseIdentityLockOwner, readLockIdentity,
+  retainIdentityStaleLock, warnLegacyLockOwner } from "../core/lock-identity.js";
 import {
   alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation,
   readPhysicalHostIdentity, readPhysicalMachineId, validBootId, type StaleLockNote,
@@ -51,7 +53,7 @@ export interface MeshCustodyStore {
   exclusive<T>(operation: () => T, lockTimeoutMs?: number): Promise<T>;
   /** The active MeshStore.withTryLock budget, if any: custody honours it like the mesh lock. */
   readonly tryLockBudgetMs?: number | undefined;
-  /** The mesh lock protocol; custody records follow it (protocol 3 names the holder's PID namespace). */
+  /** The mesh lock protocol controls legacy recovery; all new custody owners carry restart identity. */
   readonly lockProtocol?: 1 | 2 | 3;
 }
 
@@ -96,17 +98,10 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
   // this one dies (clearDeadCustodyLock), on ESRCH or, with the incarnation above, a reused PID. Without a valid incarnation
   // (none passed, or the native read failed) only ESRCH recovers it. Linux with a machine id writes what it always did.
   const machineSlot = machineId ?? (options.hostQualified ? ownHostLabel() : undefined);
-  // Protocol 3 (smarty-dev#9569): the holder's PID namespace on one more line (plain: 6 fields, hostQualified: 8),
-  // so readers from before protocol 3, which accept only 4/5 or 7 fields, never reclaim it.
-  // The namespace reader is a lazy module (startup graph budget): loaded only for a protocol-3 record.
-  const namespace = options.lockProtocol === 3
-    ? await import("../core/pid-namespace.js").then(module => module.ownPidNamespace()).catch(() => undefined) : undefined;
-  const nsLine = options.lockProtocol === 3 ? `${namespace ?? ""}\n` : "";
-  const record = options.hostQualified
-    ? `${token}\n${process.pid}\n${Date.now()}\n${started ?? ""}\n${machineSlot ?? ""}\n${physical?.bootId ?? ""}\n${nsLine}`
-    : options.lockProtocol === 3
-      ? `${token}\n${process.pid}\n${Date.now()}\n${started ?? ""}\n${nsLine}`
-      : `${token}\n${process.pid}\n${Date.now()}\n${started ? `${started}\n` : ""}`;
+  // Every protocol/default and host-qualified gate writes the same unambiguous restart-aware format.
+  // An explicitly prepared caller must not start a native command while holding registry custody.
+  const identity = await readLockIdentity({ start: started, prepared: Object.hasOwn(options, "ownIncarnation") });
+  const record = formatLockOwner(token, Date.now(), identity, machineSlot);
   const readOwner = (): string | undefined => {
     try { return fs.readFileSync(ownerPath, "utf8"); }
     catch (error) { if (errorCode(error) === "ENOENT") return undefined; throw error; }
@@ -219,7 +214,7 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     const stat = fs.lstatSync(lock);
     if (!stat.isDirectory()) return false;
     const owner = readOwner();
-    const fields = owner?.split("\n") ?? [];
+    let fields = owner?.split("\n") ?? [];
     const [token, pidText, createdText, recordedStart] = fields;
     const pid = Number(pidText);
     if (hostQualified && (!pidText?.trim() || !Number.isSafeInteger(pid) || pid <= 0)) {
@@ -230,6 +225,21 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
       throw new MeshCustodyUnrecoverableError(lock);
     }
     if (owner === undefined || !owner.endsWith("\n")) return false;    // never ownerless by protocol
+    let restartOwner: Awaited<ReturnType<typeof parseIdentityLockOwner>> = undefined;
+    if (isIdentityLockOwner(owner)) {
+      const parsed = restartOwner = await parseIdentityLockOwner(owner);
+      if (!parsed) { note.verdict = "unproven"; note.namespace = ""; note.token = token ?? ""; return false; }
+      if (await completeLockIdentity(parsed.identity)) {
+        const verdict = await lockIdentityVerdict(parsed.identity, deadline);
+        if (verdict === "live") return false;
+        if (verdict === "unknown") {
+          note.verdict = "unproven"; note.namespace = parsed.identity.namespace ?? ""; note.token = parsed.token; return false;
+        }
+        return retainIdentityStaleLock(lock, stat, owner, parsed.createdAt, verdict, parsed.identity);
+      }
+      fields = legacyLockOwnerFields(owner, lockProtocol, hostQualified);
+    }
+    warnLegacyLockOwner(lock, owner);
     // A host-lease commit gate is never recovered by a foreign/unknown PID. Matching
     // machine evidence is still mandatory when boot/process identity is unavailable.
     const physical = hostQualified ? readPhysicalHostIdentity() : undefined;
@@ -270,6 +280,7 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
         return false;
       }
     }
+    let recoveryReason: "other-boot" | "dead-pid" | "reused-pid" = previousBoot ? "other-boot" : "dead-pid";
     if (hostQualified && !hostLabel && !bootKnown && !previousBoot) {
       // ESRCH on THIS machine plus old namespace/owner metadata, never expiry of a LIVE
       // holder. Do not compare incarnations or infer a reboot from missing evidence.
@@ -284,11 +295,18 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
       const actual = pid === process.pid ? ownStart
         : remaining > 0 ? await processIncarnation(pid, remaining).catch(() => undefined) : undefined;
       if (!actual || actual === recordedStart) return false;
+      recoveryReason = "reused-pid";
     }
     const current = fs.lstatSync(lock);
     if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== owner) return false;
     // pi-fabric#923 round 5: the root checked as host-local must still be the root this path names, right now.
     if (pin && !pin.unchanged()) { note.verdict = "unproven"; note.namespace = recordNamespace ?? ""; note.token = token!; return false; }
+    // New incomplete owners must use the SAME destination as new complete/operator recovery; retain the legacy
+    // death proof, not a different anti-ABA fence for the same immutable owner/inode.
+    if (restartOwner) return retainIdentityStaleLock(lock, stat, owner, restartOwner.createdAt,
+      recoveryReason, restartOwner.identity, () => {
+        if (pin && !pin.unchanged()) throw new Error("Fabric custody lock root changed before recovery");
+      });
     fs.renameSync(lock, `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`);
     return true;
   } catch (error) {

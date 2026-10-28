@@ -1,6 +1,7 @@
-// Operator recovery of a mesh `.lock` or `custody.lock` that automatic recovery refuses (smarty-dev#9569, D2). Under
-// lock protocol 3 a holder of another PID namespace (a container, a VM, another host), or one whose namespace cannot
-// be proven, is never reclaimed on pid evidence: its pid means nothing here. This is the manual step for such a holder.
+// Operator recovery of a mesh `.lock` or `custody.lock` (smarty-dev#9569, D2). OLD protocol-3 owners keep the
+// namespace/local-filesystem rules below. Complete restart-aware owners follow automatic acquisition's explicit
+// stale policy (another boot/namespace, ESRCH, reused pid); a positively LIVE same-start owner is never stolen.
+// Unknown identity still has the audited operator override.
 //
 // - Safe form: only when the holder's namespace is OURS and pid evidence proves it dead (ESRCH). That is the
 //   automatic rule, run on demand; the best place to run it is INSIDE the holder's namespace (`docker exec`), where its
@@ -10,13 +11,15 @@
 //   until smarty-dev#9569 (b)/(d)), so two writers could run. The result says so and the caller must surface it.
 //
 // Both forms name the exact holder token, re-check the directory inode and the owner bytes right before acting, and
-// rename the directory to the same retained `.dead.<hash>` fence the automatic recovery uses.
+// rename the directory to the same retained deterministic fence the automatic recovery uses (dated for new owners).
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ownPidNamespace, reclaimVerdict, type PidNamespaceVerdict } from "../core/pid-namespace.js";
 import { MESH_CUSTODY_LOCK_NAME } from "./custody-lock.js";
+import { completeLockIdentity, identityStaleLockAside, isIdentityLockOwner, lockIdentityVerdict, parseIdentityLockOwner,
+  retainIdentityStaleLock, warnLegacyLockOwner } from "../core/lock-identity.js";
 
 export class MeshLockRecoverRefusedError extends Error {
   readonly code = "FABRIC_MESH_LOCK_RECOVER_REFUSED";
@@ -132,6 +135,7 @@ const alive = (pid: number): boolean => {
 
 /** The holder's namespace line, or null for a legacy record; undefined when the record is not a lock record. */
 const namespaceOf = (fields: string[], kind: "mesh" | "custody"): string | null | undefined => {
+  if (fields.length === 9 && isIdentityLockOwner(fields.join("\n"))) return fields[6]!;
   if (fields.length === 6) return fields[4]!;
   if (kind === "custody" && fields.length === 8) return fields[6]!;
   if (fields.length === 4 || fields.length === 5 || (kind === "custody" && fields.length === 7)) return null;
@@ -172,14 +176,28 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
   if (fields[0] !== options.holder) {
     throw new MeshLockRecoverRefusedError(`${lock} is held by ${diagnostic.holder}, not ${projectOwner(options.holder, pid, namespace).holder}`);
   }
+  const restartOwner = isIdentityLockOwner(owner) ? await parseIdentityLockOwner(owner) : undefined;
+  if (isIdentityLockOwner(owner) && !restartOwner) throw new MeshLockRecoverRefusedError(`${lock} does not hold a valid restart owner record`);
+  const completeRestartOwner = restartOwner !== undefined && await completeLockIdentity(restartOwner.identity);
+  const restartVerdict = completeRestartOwner ? await lockIdentityVerdict(restartOwner!.identity, Date.now() + 2_000) : undefined;
+  if (!completeRestartOwner) warnLegacyLockOwner(lock, owner);
   // pi-fabric#923 (fabric-store decisions): a record without a namespace is UNPROVEN (its pid may name nothing here
   // although it is alive in another namespace); no previous-boot inference (VM clones share a machine id). The safe
   // form recovers only a holder of OUR namespace whose pid is gone; everything else is the audited unsafe override.
-  const result = namespace === null ? { verdict: "unproven" as PidNamespaceVerdict } : reclaimVerdict(namespace, await ownPidNamespace(), root);
+  // NEW complete owners use the same explicit restart policy as automatic acquisition, without a local-FS gate.
+  // OLD owners keep the original safe/unsafe operator rules, including the pinned local-filesystem proof.
+  const result = completeRestartOwner ? { verdict: (restartVerdict === "other-boot" || restartVerdict === "other-namespace"
+    ? "foreign" : restartVerdict === "unknown" ? "unproven" : "pid") as PidNamespaceVerdict }
+    : namespace === null ? { verdict: "unproven" as PidNamespaceVerdict } : reclaimVerdict(namespace, await ownPidNamespace(), root);
   const pin = "pin" in result ? result.pin : undefined;
   try {
   const verdict: PidNamespaceVerdict = result.verdict;
-  const provenDead = verdict === "pid" && !(options.alive ?? alive)(pid);
+  // A complete new receipt positively identifies a LIVE holder: even an operator override cannot steal it.
+  // Legacy and unknown receipts retain the existing explicitly labelled unsafe override.
+  if (restartVerdict === "live") throw new MeshLockRecoverRefusedError(`holder pid ${diagnostic.holderPid} has the same live process start: it is not recovered`);
+  const provenDead = completeRestartOwner
+    ? restartVerdict !== undefined && restartVerdict !== "unknown"
+    : verdict === "pid" && !(options.alive ?? alive)(pid);
   if (!provenDead && options.unsafeHolderStopped !== true) {
     throw new MeshLockRecoverRefusedError(verdict === "pid"
       ? `holder pid ${diagnostic.holderPid} is running here: it is not recovered`
@@ -201,8 +219,16 @@ export const recoverMeshLock = async (root: string, options: MeshLockRecoverOpti
   const audit: LockRecoverAudit = { at: new Date().toISOString(), root, lock, mode, ...metadata, verdict, operator: operator() };
   // The audit is written BEFORE the rename: a recovery that happened is always on record. A failed audit refuses.
   appendAudit(path.join(root, "lock-recoveries.jsonl"), `${JSON.stringify(audit)}\n`, options.auditMaxBytes ?? AUDIT_MAX_BYTES, options.platform);
-  const fence = `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
-  fs.renameSync(lock, fence);
+  const fence = restartOwner ? identityStaleLockAside(lock, stat, owner, restartOwner.createdAt)
+    : `${lock}.dead.${createHash("sha256").update(`${stat.dev}:${stat.ino}:${owner}`).digest("hex")}`;
+  if (restartOwner) {
+    if (!retainIdentityStaleLock(lock, stat, owner, restartOwner.createdAt,
+      provenDead ? restartVerdict ?? "dead-pid" : "operator-stopped", restartOwner.identity, () => {
+        if (provenDead && pin && !pin.unchanged()) throw new MeshLockRecoverRefusedError(`${root} was replaced before recovery; nothing was recovered`);
+      })) {
+      throw new MeshLockRecoverRefusedError(`${lock} changed while it was checked; nothing was recovered`);
+    }
+  } else fs.renameSync(lock, fence);
   return { recovered: true, mode, lock, fence, holderPid: metadata.holderPid, holderNamespace: metadata.holderNamespace, verdict, audit,
     ...(provenDead ? {} : { warning: `UNSAFE override by ${audit.operator.user} (uid ${String(audit.operator.uid)}, pid ${audit.operator.pid}, parent pid ${audit.operator.ppid} ${audit.operator.parentExecutable}, host ${audit.operator.host}): ${lock} of holder ${options.holder} (pid ${pid}, namespace ${String(namespace)}) was recovered on the operator's word that the holder is stopped. If it is still running, its release can remove its successor's lock and two writers can run.` }) };
   } finally { pin?.close(); }

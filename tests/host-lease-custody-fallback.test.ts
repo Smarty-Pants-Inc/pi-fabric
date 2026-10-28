@@ -68,13 +68,14 @@ const gate = async (root: string, hostId: string, pid: number | string, stale = 
   if (stale) age(lock);
   return { domain, lock, owner };
 };
-const fences = (domain: string) => fs.readdirSync(domain).filter(name => name.startsWith("custody.lock.dead."));
+const fences = (domain: string) => fs.readdirSync(domain, { withFileTypes: true })
+  .filter(entry => entry.isDirectory() && entry.name.startsWith("custody.lock.dead.")).map(entry => entry.name);
 
 describe.each(["file", "sqlite"] as const)("%s missing-identity custody recovery", backend => {
   it("retains machine locality in a receipt without boot or process-start identity", async () => {
     const s = setup(backend), held = await gate(s.root, s.lease.id, process.pid);
     expect(readPhysicalHostIdentity()).toBeUndefined(); expect(readPhysicalMachineId()).toBe(machineId);
-    expect(held.owner.split("\n")).toEqual([expect.any(String), String(process.pid), expect.any(String), "", machineId, "", ""]);
+    expect(held.owner.split("\n")).toEqual([expect.any(String), String(process.pid), expect.any(String), "", machineId, "", "", "fabric-lock-owner-v1", ""]);
   });
 
   it.skipIf(process.platform === "win32")("SIGKILLs a real host-qualified custody holder, recovers once, and never steals it live (POSIX SIGKILL is unavailable on Windows)", async () => {
@@ -126,7 +127,7 @@ describe.each(["file", "sqlite"] as const)("%s missing-identity custody recovery
         });
       });
       const owner = fs.readFileSync(path.join(lock, "owner"), "utf8");
-      expect(owner.split("\n")).toEqual([expect.any(String), String(child.pid), expect.any(String), "", machineId, "", ""]);
+      expect(owner.split("\n")).toEqual([expect.any(String), String(child.pid), expect.any(String), "", machineId, "", "", "fabric-lock-owner-v1", ""]);
       age(lock); // Age is accelerated; it must not make the real live holder recoverable.
       for (let attempt = 0; attempt < 2; attempt++) {
         await expect(renewHostLease(s.mesh, s.lease, { claim: true, ownIncarnation: undefined })).rejects.toBeInstanceOf(HostLeaseLockBusyError);

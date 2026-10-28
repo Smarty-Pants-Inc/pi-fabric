@@ -84,6 +84,7 @@ import { FabricActorQueuedWorkError } from "../actors/types.js";
 import type { AgentRunRecord } from "../agents/types.js";
 import type { StateProjector } from "../mesh/state-projector.js";
 import { AgentManager, rootRecordLastSeenMs } from "../agents/manager.js";
+import { retainCleanupRoot } from "../agents/worktree-manager.js";
 import type { SpawnRouterAdmission } from "../agents/spawn-router.js";
 import { FabricTargetTerminalError, terminalRejectionFields, type AgentTerminalNotice } from "../agents/terminal-target.js";
 import { launchScope } from "../scope.js";
@@ -2798,8 +2799,9 @@ export class ResidentHost {
         await this.agents.join(command.id);
         commit(command.id);
         await this.agents.cleanup(command.id, command.deleteBranch);
-        fs.rmSync(path.join(this.#agentsPath, `${command.id}.json`), { force: true });
-        fs.rmSync(residentResultPath(this.config.residencyRoot, command.id), { force: true });
+        const archive = `${this.config.residencyRoot}.trace-archive`;
+        retainCleanupRoot(path.join(this.#agentsPath, `${command.id}.json`), archive, command.id, "resident cleanup agent metadata");
+        retainCleanupRoot(residentResultPath(this.config.residencyRoot, command.id), archive, command.id, "resident cleanup saved result");
         response = {
           format: RESIDENT_HOST_FORMAT,
           requestId,

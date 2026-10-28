@@ -96,6 +96,16 @@ export type RecoveryDurableAppendResult =
   | { readonly durable: true; readonly seq: number }
   | { readonly durable: false; readonly reason: "deadline" | "aborted" | "store-unavailable" | "superseded" | "not-found" };
 
+export interface RecoveryDurableEntryRequest {
+  readonly sessionId: string;
+  readonly deliveryId: string;
+  readonly recordKind: "control-seen" | "carrier";
+}
+
+export type RecoveryDurableEntryResult =
+  | { readonly found: true; readonly seq: number; readonly bytes: Uint8Array }
+  | { readonly found: false; readonly reason: "not-found" | "store-unavailable" | "superseded" };
+
 /** B6's bounded post-append barrier, before application/broker ACK or carrier commitment.
  * durable:true means WRITTEN AND FSYNCED (or the store's equivalent commit), not merely
  * enqueued. Idempotent per (sessionId, deliveryId, recordKind): return the same seq and
@@ -103,12 +113,20 @@ export type RecoveryDurableAppendResult =
  * Carrier correlation is post-append: a message_end observation is not a commit receipt. */
 export interface RecoveryDurabilityAdapter {
   awaitDurableAppend(request: RecoveryDurableAppendRequest): Promise<RecoveryDurableAppendResult>;
+  /** Exact retained UTF-8 serialized native/store bytes after tool_result hooks, not a
+   * parsed/reserialized message. A missing entry is not permission to expose raw results. */
+  readDurableEntry(request: RecoveryDurableEntryRequest): Promise<RecoveryDurableEntryResult>;
 }
 
 export interface SettledRecoveryEffect {
   readonly toolCallId: string;
   readonly key: string;
   readonly outcome: "committed" | "not-committed" | "uncertain";
+  /** SHA-256 of the full alias-bound message's UTF-8 JSON.stringify bytes, with no
+   * replacer, indentation, key sorting or trailing newline. Required for committed.
+   * Each alias has its OWN hash (toolCallId AND original timestamp are included); same-K
+   * consistency omits ONLY top-level toolCallId and timestamp as alias/attempt correlation.
+   * Every other field, including nested IDs/timestamps, remains part of that comparison. */
   readonly resultBytesHash?: string;
 }
 
@@ -120,12 +138,46 @@ export interface RecoveryEffectsSettlement {
 type RecoveryMessage = ContextEvent["messages"][number];
 export type RecoveryToolResult = Extract<RecoveryMessage, { role: "toolResult" }>;
 
+export type RecoveryToolResultSource = "native-entry" | "adapter-original";
+
+export interface RecoveryToolResultRead {
+  readonly message: RecoveryToolResult;
+  readonly source: RecoveryToolResultSource;
+  readonly postHook: boolean;
+}
+
+/** Later native boundary supplies the SAME current live tool_result transformation path,
+ * with strict error propagation (ordinary observer dispatch that swallows errors is NOT
+ * sufficient). Resolve the original call/input for the hook; never execute the tool again.
+ * Receives a detached message: raw adapter/native history must not be mutated. */
+export type RecoveryToolResultTransform = (
+  message: RecoveryToolResult, effect: SettledRecoveryEffect,
+) => Promise<RecoveryToolResult>;
+
+/** Retained per-call materialization pin in the existing continuation marker. Receipts
+ * form a monotonic union under the same generation/text/admission: new materialized calls
+ * are added durably before admission; returned pinned calls must reproduce hash AND source.
+ * Historical pins are never erased when settlement/context omits a call, and do not cause
+ * that call to be materialized into a context which no longer contains it. */
+export interface RecoveryMaterializedResultReceipt {
+  readonly toolCallId: string;
+  readonly source: RecoveryToolResultSource;
+  /** SHA-256 of exactly the UTF-8 JSON.stringify message installed into context. */
+  readonly resultBytesHash: string;
+}
+
 /** B4 settles immutable saved intents before any model continuation. A nested fabric_exec
- * program is never replayed wholesale. The result reader materializes the original native
- * call's truthful result from durable bytes and verifies resultBytesHash. */
+ * program is never replayed wholesale. Prefer native-entry with postHook=true. An
+ * adapter-original MUST undergo the native strict transformation callback regardless of
+ * its postHook flag. Unavailable/failed processing blocks, never exposes raw fallback.
+ * Duplicate (toolCallId,key) rows are invalid. Same-K aliases must agree on outcome and
+ * their complete materialized result apart from ONLY top-level toolCallId and timestamp,
+ * which correlate physical aliases/attempts. Each original timestamp/identity is preserved
+ * by strict transformation and checked by its full per-alias hash. No other field, including
+ * nested IDs/timestamps, is ignored; full-message hash/source pins are never relaxed. */
 export interface RecoveryEffectAdapter {
   settlePendingIntents(sessionId: string, recoveryGeneration: string): Promise<RecoveryEffectsSettlement>;
-  readToolResult(effect: SettledRecoveryEffect): Promise<RecoveryToolResult>;
+  readToolResult(effect: SettledRecoveryEffect): Promise<RecoveryToolResultRead>;
 }
 
 /** B3 consumes these providers; unconfigured ordinary sessions do not activate recovery. */

@@ -3,9 +3,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { writeJsonAtomic } from "../core/atomic-write.js";
+import { repairRecoveryContext } from "./context-repair.js";
 import type {
   ContinuationAdmission, ContinuationRequest, PortableSessionBinding, RecoveryAcceptedInput,
   RecoveryEffectsSettlement, RecoveryInputSnapshot, RecoveryToolResult, SessionRecoveryAdapters,
+  RecoveryMaterializedResultReceipt, RecoveryToolResultTransform,
 } from "./l7-interfaces.js";
 
 type RecoveryContext = Parameters<SessionRecoveryAdapters["identity"]["validate"]>[0];
@@ -22,14 +24,18 @@ export interface SessionRecoveryOptions {
    * Must resolve only after acquisition, and reject on loss/refusal. Called AFTER B2 and
    * BEFORE reading work or settling effects. This coordinator never invents lease success. */
   readonly activateSuccessor: (binding: PortableSessionBinding) => Promise<void>;
+  /** Native boundary's live strict hook path, required ONLY for adapter-original reads.
+   * No implementation/fallback is invented here; absence or any error blocks recovery. */
+  readonly transformToolResult?: RecoveryToolResultTransform;
 }
 
 export interface PreparedSessionRecovery {
   readonly binding: PortableSessionBinding;
   readonly classification: SessionRecoveryClassification;
-  /** Original native results for EVERY known settled call, including truthful errors for
-   * not-committed outcomes, one per toolCallId. Parent installs a provider-only
-   * repair view; neither this module nor the adapter may rewrite/truncate raw history. */
+  /** Detached, frozen post-hook native results for exact calls in the original active
+   * provider context, including truthful errors for not-committed outcomes, one per ID.
+   * Nested/non-native aliases are checked but never invented as provider results.
+   * Parent installs a provider-only view; raw history is never rewritten/truncated. */
   readonly results: readonly RecoveryToolResult[];
   readonly continuation?: Readonly<ContinuationRequest>;
   /** One-shot per preparation, including failures. A retry creates a fresh preparation,
@@ -52,6 +58,9 @@ interface ContinuationMarker {
   readonly recoveryGeneration: string;
   readonly text: string;
   readonly admissionId?: string;
+  /** Monotonic per-call receipt union; legacy markers/new calls are persisted before admission.
+   * Historical receipts remain even when settlement or the active view omits their calls. */
+  readonly resultReceipts?: readonly RecoveryMaterializedResultReceipt[];
 }
 
 const record = (value: unknown): value is Record<string, unknown> =>
@@ -124,13 +133,17 @@ function readMarker(file: string, binding: PortableSessionBinding, accepted: Rec
     throw new Error(`Recovery continuation marker unreadable/corrupt: ${file}`, { cause: error });
   }
   const fields = ["format", "sessionId", "sessionFile", "stateDirectory", "originalInputId", "originalText",
-    "originalPodId", "originalBootId", "recoveryGeneration", "text", "admissionId"];
+    "originalPodId", "originalBootId", "recoveryGeneration", "text", "admissionId", "resultReceipts"];
   if (!record(value) || Object.keys(value).some(key => !fields.includes(key)) || value.format !== 1 ||
       value.sessionId !== binding.evidence.sessionId || value.sessionFile !== binding.sessionFile ||
       value.stateDirectory !== binding.stateDirectory || value.originalInputId !== accepted.inputId ||
       value.originalText !== accepted.text || value.originalPodId !== accepted.podId || value.originalBootId !== accepted.bootId ||
       !generation(value.recoveryGeneration) || !nonempty(value.text) ||
-      ("admissionId" in value && !nonempty(value.admissionId))) {
+      ("admissionId" in value && !nonempty(value.admissionId)) ||
+      ("resultReceipts" in value && (!Array.isArray(value.resultReceipts) || value.resultReceipts.some(receipt =>
+        !record(receipt) || Object.keys(receipt).length !== 3 || !nonempty(receipt.toolCallId) ||
+        !["native-entry", "adapter-original"].includes(receipt.source as string) || !hash(receipt.resultBytesHash)) ||
+        new Set(value.resultReceipts.map(receipt => receipt.toolCallId)).size !== value.resultReceipts.length))) {
     throw new Error(`Recovery continuation marker malformed or identity conflict: ${file}`);
   }
   return value as unknown as ContinuationMarker;
@@ -145,14 +158,20 @@ function checkedSettlement(value: RecoveryEffectsSettlement): RecoveryEffectsSet
   if (!record(value) || !Array.isArray(value.settled) || !Number.isSafeInteger(value.uncertain) || value.uncertain < 0) {
     throw new Error("Recovery effect settlement is malformed");
   }
-  const keys = new Set<string>();
+  const aliases = new Set<string>(), outcomes = new Map<string, string>();
   for (const effect of value.settled) {
-    if (!record(effect) || !nonempty(effect.toolCallId) || !nonempty(effect.key) || keys.has(effect.key) ||
+    if (!record(effect) || !nonempty(effect.toolCallId) || !nonempty(effect.key) ||
         !nonempty(effect.outcome) || !["committed", "not-committed", "uncertain"].includes(effect.outcome) ||
-        (effect.outcome === "committed" && !hash(effect.resultBytesHash))) {
+        (effect.outcome === "committed" && !hash(effect.resultBytesHash)) ||
+        (effect.resultBytesHash !== undefined && !hash(effect.resultBytesHash))) {
       throw new Error("Recovery effect settlement is malformed, conflicting or missing a committed result hash");
     }
-    keys.add(effect.key);
+    const pair = JSON.stringify([effect.toolCallId, effect.key]);
+    if (aliases.has(pair)) throw new Error("Recovery effect settlement has a duplicate (alias,key)");
+    aliases.add(pair);
+    const outcome = outcomes.get(effect.key);
+    if (outcome !== undefined && outcome !== effect.outcome) throw new Error("Recovery same-key outcome conflict is uncertain");
+    outcomes.set(effect.key, effect.outcome);
   }
   if (value.uncertain !== 0 || value.settled.some(effect => effect.outcome === "uncertain")) {
     throw new Error("Recovery effect settlement is uncertain; continuation is blocked");
@@ -167,6 +186,22 @@ function checkedResult(value: RecoveryToolResult, toolCallId: string): RecoveryT
           content.type === "image" ? typeof content.data !== "string" || !nonempty(content.mimeType) : true)) ||
       typeof value.isError !== "boolean" || !Number.isFinite(value.timestamp)) {
     throw new Error(`Recovery original native tool result is malformed or mismatched: ${toolCallId}`);
+  }
+  return value;
+}
+
+/** JSON is the byte contract: no replacer/spacing/sorting/newline, UTF-8, full alias ID.
+ * Parse the serialization to detach adapter aliases, then freeze the exact message hashed
+ * and installed. Hooks receive a separate detached copy and cannot mutate raw history. */
+function snapshotResult(value: RecoveryToolResult, toolCallId: string): RecoveryToolResult {
+  checkedResult(value, toolCallId);
+  return checkedResult(JSON.parse(JSON.stringify(value)), toolCallId);
+}
+
+function freezeResult<T>(value: T): T {
+  if (value && typeof value === "object") {
+    for (const child of Object.values(value)) freezeResult(child);
+    Object.freeze(value);
   }
   return value;
 }
@@ -202,30 +237,76 @@ export async function prepareSessionRecovery(
   const classification = classify(snapshot, bootId);
   const file = accepted ? markerPath(binding, accepted.inputId) : undefined;
   const prior = accepted && file ? readMarker(file, binding, accepted) : undefined;
+  const recoveryGeneration = prior?.recoveryGeneration ?? randomUUID();
+  // Classification controls continuation, NOT the obligation to settle already-issued
+  // intents. Reuse B4's settle port even for cancelled/completed/same-boot/clean history;
+  // it owns recording verdicts, must not restart unissued slots, and uncertainty throws.
+  // These non-interrupted paths never read/materialize results or create a continuation.
+  const settlement = checkedSettlement(await adapters.effects.settlePendingIntents(sessionId, recoveryGeneration));
   if (classification !== "interrupted") {
     const idle = Promise.resolve(undefined);
     return { binding, classification, results: [], admitContinuation: () => idle };
   }
   // Classification above proves presence; cancelled/completed/unchanged boots never get here.
   if (!accepted || !file) throw new Error("Recovery interrupted input is missing");
-  const recoveryGeneration = prior?.recoveryGeneration ?? randomUUID();
-  const settlement = checkedSettlement(await adapters.effects.settlePendingIntents(sessionId, recoveryGeneration));
+  // Pi's native active-branch, compaction-aware projection is the source of actual calls.
+  // getEntries()/all physical rows would include abandoned branches. Never infer native
+  // IDs from B4 aliases or strip provider suffixes such as |fc_item.
+  const originalMessages = structuredClone(context.sessionManager.buildSessionProjection().messages);
+  const nativeCalls = new Set(originalMessages.flatMap(message => message.role === "assistant"
+    ? message.content.filter(part => part.type === "toolCall").map(part => part.id) : []));
   const results = new Map<string, RecoveryToolResult>();
+  const byKey = new Map<string, Omit<RecoveryToolResult, "toolCallId" | "timestamp">>();
+  const receiptsByCall = new Map<string, RecoveryMaterializedResultReceipt>(
+    (prior?.resultReceipts ?? []).map(receipt => [receipt.toolCallId, receipt]),
+  );
   for (const effect of settlement.settled) {
-    // B4 verifies committed resultBytesHash and returns the ORIGINAL native call's truthful
-    // result for BOTH known outcomes. A not-committed result may be an explicit native
-    // error; preserve it, never fabricate success. All calls in an aborted multi-call
-    // assistant must be settled before context repair can revive that assistant. Nested
-    // effects reconcile individually, but never become duplicate native tool results.
-    const result = checkedResult(await adapters.effects.readToolResult(effect), effect.toolCallId);
+    const read = await adapters.effects.readToolResult(effect);
+    if (!record(read) || !["native-entry", "adapter-original"].includes(read.source as string) ||
+        typeof read.postHook !== "boolean" || (read.source === "native-entry" && read.postHook !== true)) {
+      throw new Error(`Recovery tool result provenance/post-hook state is invalid: ${effect.toolCallId}`);
+    }
+    const original = snapshotResult(read.message, effect.toolCallId);
+    let result = original;
+    if (read.source === "adapter-original") {
+      if (typeof expected.transformToolResult !== "function") throw new Error("Recovery adapter-original requires the live strict tool_result hook transformation");
+      // Do NOT catch: strict errors propagate and never permit raw fallback. An adapter's
+      // postHook flag cannot bypass current live processing. Preserve native identity/error.
+      result = snapshotResult(await expected.transformToolResult(snapshotResult(original, effect.toolCallId), effect), effect.toolCallId);
+      if (result.toolName !== original.toolName || result.timestamp !== original.timestamp || (original.isError && !result.isError)) {
+        throw new Error(`Recovery tool result transformation changed original identity/error: ${effect.toolCallId}`);
+      }
+    }
+    const resultBytesHash = createHash("sha256").update(JSON.stringify(result), "utf8").digest("hex");
+    if (read.source === "native-entry" && effect.resultBytesHash !== undefined && effect.resultBytesHash !== resultBytesHash) {
+      throw new Error(`Recovery tool result hash mismatch: ${effect.toolCallId}`);
+    }
+    // Full alias hashes bind the physical ID AND original native timestamp. Only the
+    // common same-K comparison omits these top-level correlation fields; nested fields,
+    // content, toolName, isError, details and every other materialized field still agree.
+    const { toolCallId: _alias, timestamp: _timestamp, ...comparable } = result;
+    const previousKey = byKey.get(effect.key);
+    if (previousKey && !isDeepStrictEqual(previousKey, comparable)) throw new Error(`Recovery same-key result conflict is uncertain: ${effect.key}`);
+    byKey.set(effect.key, comparable);
+    const receipt = { toolCallId: effect.toolCallId, source: read.source, resultBytesHash } as const;
+    const previousReceipt = receiptsByCall.get(effect.toolCallId);
+    // Revalidate any returned historical call even if compaction/branching hides it.
+    // Absence from settlement is not erasure, nor permission to resurrect it in context.
+    if (previousReceipt && !isDeepStrictEqual(previousReceipt, receipt)) throw new Error(`Recovery materialized result receipt hash/source provenance conflict: ${effect.toolCallId}`);
+    if (!nativeCalls.has(effect.toolCallId)) continue;
     const previous = results.get(effect.toolCallId);
-    if (previous && !isDeepStrictEqual(previous, result)) throw new Error(`Recovery tool result conflict: ${effect.toolCallId}`);
-    results.set(effect.toolCallId, result);
+    if (previous && JSON.stringify(previous) !== JSON.stringify(result)) throw new Error(`Recovery tool result conflict: ${effect.toolCallId}`);
+    if (!previousReceipt) receiptsByCall.set(effect.toolCallId, receipt);
+    results.set(effect.toolCallId, freezeResult(result));
   }
-  const marker: ContinuationMarker = prior ?? {
+  // Retain the existing repair path's exact binding and whole-assistant settlement checks
+  // before writing any receipt. Parent still installs/validates its final provider view.
+  repairRecoveryContext(originalMessages, [...results.values()]);
+  const resultReceipts = [...receiptsByCall.values()].sort((a, b) => a.toolCallId < b.toolCallId ? -1 : a.toolCallId > b.toolCallId ? 1 : 0);
+  const marker: ContinuationMarker = prior ? { ...prior, resultReceipts } : {
     format: 1, sessionId, sessionFile: binding.sessionFile, stateDirectory: binding.stateDirectory,
     originalInputId: accepted.inputId, originalText: accepted.text, originalPodId: accepted.podId, originalBootId: accepted.bootId,
-    recoveryGeneration,
+    recoveryGeneration, resultReceipts,
     text: `Continue interrupted logical input ${JSON.stringify(accepted.inputId)} using the repaired original tool results. ` +
       "Do not recreate committed effects or replay the interrupted program. Finish only the remaining authorized work.\n\n" + accepted.text,
   };
@@ -233,9 +314,10 @@ export async function prepareSessionRecovery(
   if (prior ? !current || !isDeepStrictEqual(prior, current) : current !== undefined) {
     throw new Error("Recovery continuation marker changed during preparation");
   }
-  // Durable file + directory barriers BEFORE B5 can enqueue anything. Raw session/receipt
-  // files are never written. A crash after B5 acceptance leaves this exact request to retry.
-  if (!prior) writeJsonAtomic(file, marker, { durable: true });
+  // Durable file + directory barriers BEFORE B5 can enqueue anything, including new
+  // distinct calls settled after continuation progress under this SAME generation/text/id.
+  // Raw session/predecessor receipt files are never written. Retry this exact request.
+  if (!prior || !isDeepStrictEqual(prior.resultReceipts, resultReceipts)) writeJsonAtomic(file, marker, { durable: true });
   const continuation: Readonly<ContinuationRequest> = Object.freeze({
     sessionId, originalInputId: marker.originalInputId, recoveryGeneration: marker.recoveryGeneration, text: marker.text,
   });

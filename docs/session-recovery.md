@@ -106,15 +106,80 @@ inbox drains are stopped:
 3. B5 supplies complete accepted-input, settlement and durable explicit-cancel history.
    A different-boot open input with known no-cancel history is interrupted; clean,
    completed, cancelled and same-boot inputs are not automatically continued. Missing,
-   corrupt or unknown history is uncertainty.
+   corrupt or unknown history is uncertainty. Classification gates continuation, not
+   settlement: before returning for any non-interrupted classification, the coordinator
+   still calls B4's existing `settlePendingIntents` port for already-issued intents. B4
+   records committed/not-committed/uncertain outcomes without restarting unissued slots;
+   uncertainty rejects rather than returning silent success. These settlement-only paths
+   do not read/materialize tool results, install provider context, create a continuation
+   marker or call B5 admission. An existing marker's generation is reused and its result
+   receipts/admission are untouched. Unconfigured ordinary startup remains inert.
 4. B4 settles saved intents by stable effect keys and resolves exact original native
-   results. Uncertainty blocks continuation. An outer `fabric_exec` result represents
-   its settled nested effects; the interrupted JavaScript program is never replayed.
+   results. `readToolResult(effect)` returns `{ message, source: 'native-entry' |
+   'adapter-original', postHook: boolean }`. Prefer `native-entry` with `postHook: true`;
+   other native-entry flags block. For `adapter-original`, the caller must supply
+   `SessionRecoveryOptions.transformToolResult(message, effect)`, the same current live
+   strict `tool_result` transformation path, with original call/input resolution. It is
+   always invoked, even if the adapter claims `postHook: true`. Missing callbacks and
+   thrown errors block without raw fallback; errors propagate unchanged. This coordinator
+   does not implement a hook runner. Ordinary Pi observer dispatch that swallows handler
+   errors does not satisfy this strict port. The callback may not change call ID, tool
+   name or timestamp, or turn an original error into success. Raw messages are detached
+   before callbacks, and materialized results are detached and deeply frozen afterward.
+
+   Duplicate `(toolCallId, key)` rows block, but consistent same-key physical aliases are
+   valid. Same-key aliases must agree on outcome and every field of their materialized
+   messages except **only the top-level `toolCallId` and `timestamp`**, which correlate
+   physical aliases/attempts rather than the logical effect result. Content, tool name,
+   error flags, details, nested IDs/timestamps and every other field are still checked.
+   Full per-alias hashes therefore legitimately differ: each full message includes its
+   exact alias ID **and original native timestamp**. Strict transformation must still
+   preserve both; neither field is removed from a materialized message or its hash.
+   Every alias is read/checked, including
+   aliases not visible to the provider. Only exact original assistant call IDs present in
+   `context.sessionManager.buildSessionProjection().messages` become provider results;
+   this is Pi's active-branch, compaction-aware projection, not all session entries.
+   No provider suffix normalization (for example `call|fc_item` to `call`) is performed.
+   An outer `fabric_exec` result may cover multiple distinct settled nested keys, but
+   invisible nested aliases never become invented results or revive an unsettled outer
+   assistant. The existing `repairRecoveryContext` checks exact call/tool-name binding
+   and whole-assistant settlement before any receipt is written. The interrupted
+   JavaScript program is never replayed.
 5. A durable continuation marker retains the original input, recovery generation and
    exact continuation text before B5 admission. Retrying after enqueue without a caller
    receipt uses that same generation and admission. Changed/corrupt markers or a changed
-   admission ID are errors. Cancellation is reread immediately before admission; B5
-   must serialize the final cancellation/admission race.
+   admission ID are errors. Its retained format-1 recovery receipt now also contains
+   `resultReceipts: Array<{ toolCallId, source, resultBytesHash }>` as a monotonic retained
+   union of materialized calls, sorted lexicographically by exact ID. A continuation can
+   progress, issue a distinct new call and crash again: its newly settled/materialized
+   call is added to this same marker without changing the original input, generation,
+   continuation text or admission ID. The expanded union is durable (file/directory
+   barriers) **before** context installation or the next B5 admission, and checked again
+   before admission. Any previously pinned call returned by B4 must reproduce the retained
+   hash **and source** exactly, even if it is no longer in the active provider view;
+   changed provenance blocks without overwriting any pin or persisting partial additions.
+   Historical receipts are never erased merely because compaction, branching, settlement
+   or the provider view no longer returns their calls. Retaining a receipt does **not**
+   resurrect that call into provider context: only current exact native calls materialize.
+   Existing format-1 markers without this field are upgraded additively and durably after
+   successful settlement, before admission. This uses the existing coordinator receipt,
+   not another ledger or B6's native carrier-commit evidence.
+
+   The exact B3/B4 result hash serialization is SHA-256, lower-case hex, of the UTF-8
+   bytes from JavaScript `JSON.stringify(materializedMessage)` with no replacer, spacing,
+   key sorting or trailing newline. It covers the complete native `role: 'toolResult'`
+   message, including call ID, timestamp, error flag and all serialized optional fields,
+   **not** the read envelope, store entry framing, or just text content. Materialization
+   snapshots that JSON as a detached plain message and hashes the same representation
+   used in context. For `native-entry`, B3 compares any supplied B4 `resultBytesHash`
+   (required for committed effects) to that exact hash. B4 must conform to this native
+   message serialization; arbitrary store-record bytes are a different object. For
+   `adapter-original`, the B4 pre-hook hash is not compared with post-hook bytes; B3
+   records its own post-hook hash plus source instead. B6 still returns its exact stored
+   bytes without reserialization (see below).
+
+   Cancellation is reread immediately before admission; B5 must serialize the final
+   cancellation/admission race.
 6. The synchronous pre-admission callback installs and validates the provider view with
    `repairRecoveryContext`. It replaces aborted/synthetic results with retained truthful
    native results, preserves original IDs/arguments, and suppresses duplicates without
@@ -150,6 +215,12 @@ Repeated `(sessionId, deliveryId, recordKind)` requests return the same sequence
 without appending twice. The closed failure reasons are `deadline`, `aborted`,
 `store-unavailable`, `superseded` and `not-found`. This defines the provider contract;
 it does not implement B6 storage or turn a pre-append `message_end` into a commit.
+Beside the barrier, `readDurableEntry({ sessionId, deliveryId, recordKind })` returns
+`{ found: true, seq: number, bytes: Uint8Array }` or `{ found: false, reason:
+'not-found' | 'store-unavailable' | 'superseded' }`. `bytes` are the exact retained
+UTF-8 serialized native/store bytes after hooks, not parsed/reserialized JSON. There
+are no deadline/signal or other new arguments on this companion read. This type-only
+port does not implement a store reader or establish native post-hook durability.
 
 The inspected Pi 1.2.0 runtime does not expose an atomic, fail-closed startup
 recovery transaction/fence handoff. Cold startup has no `session_ready`; replacement

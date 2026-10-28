@@ -8,7 +8,7 @@ import path from "node:path";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
-import { convertToLlm, type ContextEvent } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, SessionManager, type ContextEvent } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { prepareSessionRecovery } from "../src/recovery/coordinator.js";
@@ -18,7 +18,17 @@ import type {
   RecoveryInputSnapshot, RecoveryToolResult, SessionRecoveryAdapters, SettledRecoveryEffect,
 } from "../src/recovery/l7-interfaces.js";
 
-const fixture = () => {
+const resultHash = (message: RecoveryToolResult): string => createHash("sha256").update(JSON.stringify(message), "utf8").digest("hex");
+const nativeResult = (message: RecoveryToolResult) => ({ message, source: "native-entry" as const, postHook: true });
+const originalAssistant = (ids = ["native-call", "unstarted-call"]): AssistantMessage => ({
+  role: "assistant", api: "openai-responses", provider: "openai", model: "recovery-test", timestamp: 1,
+  stopReason: "aborted", errorMessage: "original interruption",
+  usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  content: ids.map(id => ({ type: "toolCall", id, name: id === "unstarted-call" ? "write" : "fabric_exec", arguments: {} })),
+});
+
+const fixture = (callIds = ["native-call", "unstarted-call"]) => {
   // Preserve all raw fixtures, including interrupted tails and predecessor receipts.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "recovery-coordinator-"));
   const sessionFile = path.join(root, "session.jsonl"), stateDirectory = path.join(root, "state");
@@ -57,6 +67,10 @@ const fixture = () => {
     role: "toolResult", toolCallId: "native-call", toolName: "fabric_exec",
     content: [{ type: "text", text: "Original durable committed result" }], isError: false, timestamp: 1,
   };
+  settlement = { ...settlement, settled: settlement.settled.map(effect => effect.outcome === "committed"
+    ? { ...effect, resultBytesHash: resultHash(result) } : effect) };
+  const manager = SessionManager.inMemory(root);
+  manager.appendMessage(originalAssistant(callIds));
   const events: string[] = [], requests: ContinuationRequest[] = [], generations: string[] = [];
   const nativeFile = path.join(stateDirectory, "native-admissions.json");
   const adapters: SessionRecoveryAdapters = {
@@ -90,13 +104,13 @@ const fixture = () => {
       settlePendingIntents: vi.fn(async (sessionId, generation) => {
         expect(sessionId).toBe("session-1"); events.push("settle"); generations.push(generation); return settlement;
       }),
-      readToolResult: vi.fn(async (effect: SettledRecoveryEffect): Promise<RecoveryToolResult> => {
+      readToolResult: vi.fn(async (effect: SettledRecoveryEffect) => {
         events.push("result");
-        if (effect.outcome === "not-committed") return {
+        if (effect.outcome === "not-committed") return nativeResult({
           role: "toolResult", toolCallId: effect.toolCallId, toolName: "write", isError: true, timestamp: 1,
           content: [{ type: "text", text: "Original operation was not committed; destination refused it." }],
-        };
-        return result;
+        });
+        return nativeResult(result);
       }),
     },
   };
@@ -106,7 +120,7 @@ const fixture = () => {
       expect(validated).toEqual(binding); events.push("lease-activation");
     }),
   };
-  const context = {} as Parameters<SessionRecoveryAdapters["identity"]["validate"]>[0];
+  const context = { sessionManager: manager } as unknown as Parameters<SessionRecoveryAdapters["identity"]["validate"]>[0];
   const prepare = () => prepareSessionRecovery(context, adapters, options);
   const markerFile = (): string => {
     const directory = path.join(stateDirectory, "recovery", "continuations");
@@ -125,13 +139,339 @@ const fixture = () => {
   };
   return {
     root, sessionFile, stateDirectory, binding, successorMachine, adapters, options, context, prepare, marker, markerFile,
-    events, requests, generations, nativeFile, snapshotFile, changeInput, preserved, setSnapshot, getSnapshot,
+    events, requests, generations, nativeFile, snapshotFile, changeInput, preserved, setSnapshot, getSnapshot, manager,
+    result: () => result,
     setSettlement: (value: RecoveryEffectsSettlement) => { settlement = value; },
     setResult: (value: RecoveryToolResult) => { result = value; },
   };
 };
 
 describe("startup session recovery coordinator", () => {
+  it("hashes the exact materialized native envelope and rejects a B4 hash mismatch before any receipt/admission", async () => {
+    const f = fixture(["native-call"]);
+    f.setSettlement({ uncertain: 0, settled: [{ toolCallId: "native-call", key: "K", outcome: "committed", resultBytesHash: "0".repeat(64) }] });
+    await expect(f.prepare()).rejects.toThrow(/hash/i);
+    expect(fs.existsSync(path.join(f.stateDirectory, "recovery"))).toBe(false);
+    expect(f.requests).toEqual([]);
+    f.preserved();
+  });
+
+  it.each([false, true])("strictly transforms adapter-original even when its postHook flag is %s, then retains exact hash/source across restart", async postHook => {
+    const f = fixture(["native-call"]), original = { ...f.result(), isError: true, content: [{ type: "text" as const, text: "secret original failure" }] };
+    const transformed = { ...original, content: [{ type: "text" as const, text: "[redacted] original failure\n\u0000é" }] };
+    const originalBytes = JSON.stringify(original);
+    f.setSettlement({ uncertain: 0, settled: [{ toolCallId: "native-call", key: "K", outcome: "committed", resultBytesHash: resultHash(original) }] });
+    vi.mocked(f.adapters.effects.readToolResult).mockResolvedValue({ message: original, source: "adapter-original", postHook });
+    const transform = vi.fn(async (message: RecoveryToolResult, effect: SettledRecoveryEffect) => {
+      expect(message).toEqual(original); expect(effect.key).toBe("K");
+      // A live hook may mutate its argument; it must not own the adapter/raw history object.
+      message.content = transformed.content;
+      return message;
+    });
+    Object.assign(f.options, { transformToolResult: transform });
+    const prepared = await f.prepare();
+    expect(transform).toHaveBeenCalledTimes(1);
+    expect(prepared.results).toEqual([transformed]);
+    expect(prepared.results[0]?.isError).toBe(true);
+    const receipts = [{ toolCallId: "native-call", source: "adapter-original", resultBytesHash: resultHash(transformed) }];
+    expect(f.marker()).toMatchObject({ resultReceipts: receipts });
+    expect(JSON.stringify(original)).toBe(originalBytes);
+    const bytes = fs.readFileSync(f.markerFile(), "utf8");
+    const restarted = await f.prepare();
+    expect(restarted.results).toEqual(prepared.results);
+    expect(fs.readFileSync(f.markerFile(), "utf8")).toBe(bytes);
+    await restarted.admitContinuation(() => expect(f.marker().resultReceipts).toEqual(receipts));
+    expect(f.requests).toHaveLength(1);
+    f.preserved();
+  });
+
+  it.each(["missing", "throws", "wrong-call", "wrong-name", "wrong-timestamp", "lost-error", "malformed"] as const)("blocks adapter-original when strict transformation is %s without raw fallback", async fault => {
+    const f = fixture(), original = { ...f.result(), isError: true };
+    vi.mocked(f.adapters.effects.readToolResult).mockResolvedValue({ message: original, source: "adapter-original", postHook: true });
+    const failure = new Error("strict hook refused");
+    if (fault !== "missing") Object.assign(f.options, { transformToolResult: async () => {
+      if (fault === "throws") throw failure;
+      return { ...original, ...(fault === "wrong-call" ? { toolCallId: "other" } :
+        fault === "wrong-name" ? { toolName: "other" } : fault === "wrong-timestamp" ? { timestamp: 2 } :
+          fault === "lost-error" ? { isError: false } : { content: null }) };
+    } });
+    if (fault === "throws") await expect(f.prepare()).rejects.toBe(failure);
+    else await expect(f.prepare()).rejects.toThrow(/hook|transform|result/i);
+    expect(fs.existsSync(path.join(f.stateDirectory, "recovery"))).toBe(false);
+    expect(f.requests).toEqual([]); f.preserved();
+  });
+
+  it.each(["not-post-hook", "missing-flag", "unknown-source", "raw-message"] as const)("rejects %s result provenance", async fault => {
+    const f = fixture();
+    const envelope = { message: f.result(), source: "native-entry", postHook: true };
+    vi.mocked(f.adapters.effects.readToolResult).mockResolvedValue((fault === "raw-message" ? f.result() :
+      { ...envelope, ...(fault === "not-post-hook" ? { postHook: false } :
+        fault === "missing-flag" ? { postHook: undefined } : { source: "unknown" }) }) as never);
+    await expect(f.prepare()).rejects.toThrow(/result|hook|provenance/i);
+    expect(f.requests).toEqual([]);
+  });
+
+  it("uses native-entry postHook=true without re-running hooks and records the checked hash before admission", async () => {
+    const f = fixture(), transform = vi.fn(async () => { throw new Error("must not rerun native hooks"); });
+    Object.assign(f.options, { transformToolResult: transform });
+    const prepared = await f.prepare();
+    const receipts = prepared.results.map(message => ({ toolCallId: message.toolCallId, source: "native-entry", resultBytesHash: resultHash(message) }));
+    expect(f.marker().resultReceipts).toEqual(receipts);
+    await prepared.admitContinuation(() => expect(f.marker().resultReceipts).toEqual(receipts));
+    expect(transform).not.toHaveBeenCalled();
+    f.preserved();
+  });
+
+  it.each(["hash", "source"] as const)("rejects changed retained result %s provenance on restart without overwriting the receipt", async fault => {
+    const f = fixture(["native-call"]); await f.prepare();
+    const bytes = fs.readFileSync(f.markerFile(), "utf8");
+    if (fault === "hash") {
+      const changed = { ...f.result(), content: [{ type: "text" as const, text: "different durable result" }] };
+      f.setResult(changed);
+      f.setSettlement({ uncertain: 0, settled: [{ toolCallId: "native-call", key: "K", outcome: "committed", resultBytesHash: resultHash(changed) }] });
+    } else {
+      vi.mocked(f.adapters.effects.readToolResult).mockImplementation(async effect => ({
+        ...(await Promise.resolve(nativeResult({ ...f.result(), toolCallId: effect.toolCallId }))), source: "adapter-original",
+      }));
+      Object.assign(f.options, { transformToolResult: async (message: RecoveryToolResult) => message });
+    }
+    await expect(f.prepare()).rejects.toThrow(/receipt|provenance/i);
+    expect(fs.readFileSync(f.markerFile(), "utf8")).toBe(bytes);
+    expect(f.requests).toEqual([]);
+  });
+
+  it("durably unions newly settled calls after native continuation progress under the same generation/text/admission", async () => {
+    const f = fixture(["native-call"]), first = f.result();
+    f.setSettlement({ uncertain: 0, settled: [{ toolCallId: first.toolCallId, key: "K1", outcome: "committed", resultBytesHash: resultHash(first) }] });
+    const initial = await f.prepare();
+    await initial.admitContinuation(() => repairRecoveryContext(f.manager.buildSessionProjection().messages, initial.results));
+    const originalMarker = f.marker();
+    f.manager.appendMessage({ role: "user", content: initial.continuation!.text, timestamp: 2 });
+    f.manager.appendMessage(originalAssistant(["second-call"]));
+    const second = { ...first, toolCallId: "second-call", timestamp: 3, content: [{ type: "text" as const, text: "New distinct settled result" }] };
+    const messages = [first, second];
+    f.setSettlement({ uncertain: 0, settled: messages.map((message, index) => ({
+      toolCallId: message.toolCallId, key: `K${index + 1}`, outcome: "committed", resultBytesHash: resultHash(message),
+    })) });
+    vi.mocked(f.adapters.effects.readToolResult).mockImplementation(async effect => nativeResult(messages.find(message => message.toolCallId === effect.toolCallId)!));
+    const sync = fs.fsyncSync, barriers: string[] = [];
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      barriers.push(fs.fstatSync(fd).isDirectory() ? "directory" : "file"); sync(fd);
+    });
+    const progressed = await f.prepare();
+    expect(progressed.results).toEqual(messages);
+    const receipts = messages.map(message => ({ toolCallId: message.toolCallId, source: "native-entry", resultBytesHash: resultHash(message) }));
+    expect(f.marker()).toEqual({ ...originalMarker, resultReceipts: receipts });
+    expect(barriers).toContain("file");
+    if (process.platform !== "win32") expect(barriers).toContain("directory");
+    expect(f.requests).toHaveLength(1); // New receipt is already durable BEFORE any second admission.
+    const bytes = fs.readFileSync(f.markerFile(), "utf8");
+    // Crash again after preparation but before admission: the expanded receipt is stable.
+    const restarted = await f.prepare();
+    expect(restarted.continuation).toEqual(initial.continuation);
+    expect(fs.readFileSync(f.markerFile(), "utf8")).toBe(bytes);
+    await expect(restarted.admitContinuation(() => {
+      expect(f.marker().resultReceipts).toEqual(receipts);
+      expect(repairRecoveryContext(f.manager.buildSessionProjection().messages, restarted.results)
+        .filter(message => message.role === "toolResult")).toEqual(messages);
+    })).resolves.toEqual({ admissionId: "native-admission-1", existing: true });
+    expect(f.requests).toEqual([initial.continuation, initial.continuation]);
+    expect(new Set(f.generations).size).toBe(1);
+    expect(f.marker()).toEqual({ ...originalMarker, resultReceipts: receipts });
+    f.preserved();
+  });
+
+  it.each([
+    ["branch", false], ["branch", true], ["compaction", false], ["compaction", true],
+  ] as const)("retains historical receipts without resurrecting calls after %s (B4 still returns history: %s)", async (view, returned) => {
+    const f = fixture(["native-call"]), first = f.result();
+    f.setSettlement({ uncertain: 0, settled: [{ toolCallId: first.toolCallId, key: "K1", outcome: "committed", resultBytesHash: resultHash(first) }] });
+    const initial = await f.prepare(); await initial.admitContinuation(() => {});
+    const saved = f.marker();
+    if (view === "branch") f.manager.resetLeaf();
+    const secondEntry = f.manager.appendMessage(originalAssistant(["second-call"]));
+    if (view === "compaction") f.manager.appendCompaction("First result summarized", secondEntry, 100);
+    const second = { ...first, toolCallId: "second-call", timestamp: 3 };
+    const messages = returned ? [first, second] : [second];
+    f.setSettlement({ uncertain: 0, settled: messages.map(message => ({
+      toolCallId: message.toolCallId, key: message.toolCallId, outcome: "committed", resultBytesHash: resultHash(message),
+    })) });
+    vi.mocked(f.adapters.effects.readToolResult).mockImplementation(async effect => nativeResult(messages.find(message => message.toolCallId === effect.toolCallId)!));
+    const raw = f.manager.buildSessionProjection().messages, rawBytes = JSON.stringify(raw);
+    const prepared = await f.prepare();
+    expect(prepared.results).toEqual([second]);
+    expect(repairRecoveryContext(raw, prepared.results).filter(message => message.role === "toolResult")).toEqual([second]);
+    expect(JSON.stringify(raw)).toBe(rawBytes);
+    expect(f.marker()).toEqual({ ...saved, resultReceipts: [
+      { toolCallId: first.toolCallId, source: "native-entry", resultBytesHash: resultHash(first) },
+      { toolCallId: second.toolCallId, source: "native-entry", resultBytesHash: resultHash(second) },
+    ] });
+    await expect(prepared.admitContinuation(() => {})).resolves.toEqual({ admissionId: "native-admission-1", existing: true });
+    // Neither the native view nor settlement returns either historical call now.
+    f.manager.appendCompaction("All calls summarized", null, 100);
+    f.setSettlement({ uncertain: 0, settled: [] });
+    const bytes = fs.readFileSync(f.markerFile(), "utf8"), empty = await f.prepare();
+    expect(empty.results).toEqual([]);
+    expect(empty.continuation).toEqual(initial.continuation);
+    expect(fs.readFileSync(f.markerFile(), "utf8")).toBe(bytes);
+    await expect(empty.admitContinuation(() => {})).resolves.toEqual({ admissionId: "native-admission-1", existing: true });
+    expect(fs.readFileSync(f.markerFile(), "utf8")).toBe(bytes);
+    f.preserved();
+  });
+
+  it.each(["hash", "source", "timestamp"] as const)("revalidates a previously pinned invisible call's %s before adding any new receipt", async fault => {
+    const f = fixture(["native-call"]), original = f.result();
+    f.setSettlement({ uncertain: 0, settled: [{ toolCallId: original.toolCallId, key: "K1", outcome: "committed", resultBytesHash: resultHash(original) }] });
+    await (await f.prepare()).admitContinuation(() => {});
+    f.manager.resetLeaf(); f.manager.appendMessage(originalAssistant(["second-call"]));
+    const first = { ...original, ...(fault === "hash" ? { content: [] } : fault === "timestamp" ? { timestamp: 99 } : {}) };
+    const second = { ...original, toolCallId: "second-call", timestamp: 3 };
+    // The new call is deliberately read first: a later historical conflict must not persist it.
+    f.setSettlement({ uncertain: 0, settled: [second, first].map(message => ({
+      toolCallId: message.toolCallId, key: message.toolCallId, outcome: "committed", resultBytesHash: resultHash(message),
+    })) });
+    vi.mocked(f.adapters.effects.readToolResult).mockImplementation(async effect => ({
+      ...nativeResult(effect.toolCallId === first.toolCallId ? first : second),
+      source: fault === "source" && effect.toolCallId === first.toolCallId ? "adapter-original" : "native-entry",
+    }));
+    Object.assign(f.options, { transformToolResult: async (message: RecoveryToolResult) => message });
+    const bytes = fs.readFileSync(f.markerFile(), "utf8");
+    await expect(f.prepare()).rejects.toThrow(/receipt|provenance/i);
+    expect(fs.readFileSync(f.markerFile(), "utf8")).toBe(bytes);
+    expect(f.requests).toHaveLength(1); f.preserved();
+  });
+
+  it("accepts consistent same-K physical aliases but materializes only exact calls in the active native branch", async () => {
+    const f = fixture(), nativeId = "native_call|fc_original";
+    const abandoned = f.manager.getLeafId()!;
+    f.manager.appendMessage(originalAssistant(["other-branch"]));
+    f.manager.branch(abandoned);
+    f.manager.appendMessage(originalAssistant([nativeId]));
+    const ids = ["nested-physical", nativeId, "native_call", "other-branch"];
+    const messages = ids.map(toolCallId => ({ ...f.result(), toolCallId }));
+    expect(new Set(messages.map(resultHash)).size).toBe(ids.length); // Full hashes MUST differ with the alias ID.
+    f.setSettlement({ uncertain: 0, settled: messages.map(message => ({
+      toolCallId: message.toolCallId, key: "K", outcome: "committed", resultBytesHash: resultHash(message),
+    })) });
+    vi.mocked(f.adapters.effects.readToolResult).mockImplementation(async effect => nativeResult(messages.find(message => message.toolCallId === effect.toolCallId)!));
+    const raw = f.manager.buildSessionProjection().messages, before = JSON.stringify(raw);
+    const prepared = await f.prepare();
+    expect(prepared.results).toEqual([messages[1]]);
+    const repaired = repairRecoveryContext(raw, prepared.results);
+    expect(repaired.filter(message => message.role === "toolResult")).toEqual([messages[1]]);
+    expect(JSON.stringify(raw)).toBe(before);
+    expect(f.adapters.effects.readToolResult).toHaveBeenCalledTimes(4); // Even invisible aliases are checked for consistency.
+    expect(f.marker().resultReceipts).toEqual([{ toolCallId: nativeId, source: "native-entry", resultBytesHash: resultHash(messages[1]!) }]);
+    f.preserved();
+  });
+
+  it.each(["outcome", "content", "details", "error", "tool-name", "nested-id", "nested-timestamp", "extra-field"] as const)("blocks inconsistent same-K aliases (%s), including an invisible nested alias", async fault => {
+    const f = fixture(), first = { ...f.result(), details: { id: "saved-effect", timestamp: 10 }, extra: "original" };
+    const second = { ...first, toolCallId: "nested-only", timestamp: 2, ...(fault === "content" ? { content: [] } :
+      fault === "details" ? { details: { contradictory: true } } : fault === "error" ? { isError: true } :
+        fault === "tool-name" ? { toolName: "other-tool" } : fault === "nested-id" ? { details: { ...first.details, id: "changed" } } :
+          fault === "nested-timestamp" ? { details: { ...first.details, timestamp: 99 } } : fault === "extra-field" ? { extra: "changed" } : {}) };
+    f.setSettlement({ uncertain: 0, settled: [
+      { toolCallId: first.toolCallId, key: "K", outcome: "committed", resultBytesHash: resultHash(first) },
+      { toolCallId: second.toolCallId, key: "K", outcome: fault === "outcome" ? "not-committed" : "committed", resultBytesHash: resultHash(second) },
+    ] });
+    vi.mocked(f.adapters.effects.readToolResult).mockImplementation(async effect => nativeResult(effect.toolCallId === first.toolCallId ? first : second));
+    await expect(f.prepare()).rejects.toThrow(/uncertain|conflict/i);
+    expect(f.requests).toEqual([]); f.preserved();
+  });
+
+  it.each(["native-entry", "adapter-original"] as const)("allows same-K native aliases with distinct original timestamps via %s, retaining each full ID/timestamp hash across restart", async source => {
+    const f = fixture(["first|fc_first", "second|fc_second"]);
+    const messages = ["first|fc_first", "second|fc_second"].map((toolCallId, index) => ({ ...f.result(), toolCallId, timestamp: index + 1 }));
+    f.setSettlement({ uncertain: 0, settled: messages.map(message => ({
+      toolCallId: message.toolCallId, key: "K", outcome: "committed", resultBytesHash: resultHash(message),
+    })) });
+    vi.mocked(f.adapters.effects.readToolResult).mockImplementation(async effect => ({
+      ...nativeResult(messages.find(message => message.toolCallId === effect.toolCallId)!), source,
+    }));
+    const transform = vi.fn(async (message: RecoveryToolResult) => message);
+    Object.assign(f.options, { transformToolResult: transform });
+    const prepared = await f.prepare();
+    expect(prepared.results).toEqual(messages);
+    expect(messages[0]!.timestamp).toBe(1); expect(messages[1]!.timestamp).toBe(2);
+    expect(new Set(messages.map(resultHash)).size).toBe(2);
+    expect(f.marker().resultReceipts).toEqual(messages.map(message => ({ toolCallId: message.toolCallId, source, resultBytesHash: resultHash(message) })));
+    expect(repairRecoveryContext(f.manager.buildSessionProjection().messages, prepared.results).filter(message => message.role === "toolResult")).toEqual(messages);
+    await prepared.admitContinuation(() => {});
+    const bytes = fs.readFileSync(f.markerFile(), "utf8"), restarted = await f.prepare();
+    expect(restarted.results).toEqual(messages);
+    expect(fs.readFileSync(f.markerFile(), "utf8")).toBe(bytes);
+    await expect(restarted.admitContinuation(() => {})).resolves.toEqual({ admissionId: "native-admission-1", existing: true });
+    expect(transform).toHaveBeenCalledTimes(source === "adapter-original" ? 4 : 0);
+    f.preserved();
+  });
+
+  it("still checks a distinct-timestamp alias's complete native-entry hash including ID and timestamp", async () => {
+    const f = fixture(["first", "second"]), first = { ...f.result(), toolCallId: "first", timestamp: 1 };
+    const second = { ...first, toolCallId: "second", timestamp: 2 };
+    f.setSettlement({ uncertain: 0, settled: [
+      { toolCallId: first.toolCallId, key: "K", outcome: "committed", resultBytesHash: resultHash(first) },
+      { toolCallId: second.toolCallId, key: "K", outcome: "committed", resultBytesHash: resultHash({ ...second, timestamp: 1 }) },
+    ] });
+    vi.mocked(f.adapters.effects.readToolResult).mockImplementation(async effect => nativeResult(effect.toolCallId === first.toolCallId ? first : second));
+    await expect(f.prepare()).rejects.toThrow(/hash mismatch/i);
+    expect(fs.existsSync(path.join(f.stateDirectory, "recovery"))).toBe(false);
+    expect(f.requests).toEqual([]); f.preserved();
+  });
+
+  it("blocks a partially settled native multi-call assistant before writing a result receipt", async () => {
+    const f = fixture();
+    f.setSettlement({ uncertain: 0, settled: [{ toolCallId: "native-call", key: "K", outcome: "committed", resultBytesHash: resultHash(f.result()) }] });
+    await expect(f.prepare()).rejects.toThrow(/unsettled-aborted-call/);
+    expect(fs.existsSync(path.join(f.stateDirectory, "recovery"))).toBe(false);
+    expect(f.requests).toEqual([]); f.preserved();
+  });
+
+  it("upgrades a legacy format-1 marker with durable result provenance without changing generation/text/admission", async () => {
+    const f = fixture(); await (await f.prepare()).admitContinuation(() => {});
+    const legacy = f.marker(); delete legacy.resultReceipts;
+    writeJsonAtomic(f.markerFile(), legacy, { durable: true });
+    const prepared = await f.prepare();
+    expect(f.marker()).toMatchObject(legacy);
+    expect(f.marker().resultReceipts).toHaveLength(2);
+    await prepared.admitContinuation(() => expect(f.marker().resultReceipts).toHaveLength(2));
+    expect(f.requests[1]).toEqual(f.requests[0]);
+    f.preserved();
+  });
+
+  it("blocks a changed result receipt between preparation and admission before installing context", async () => {
+    const f = fixture(), prepared = await f.prepare(), install = vi.fn();
+    const marker = f.marker();
+    const receipts = marker.resultReceipts as Array<{ resultBytesHash: string }>;
+    receipts[0]!.resultBytesHash = "0".repeat(64);
+    writeJsonAtomic(f.markerFile(), marker, { durable: true });
+    await expect(prepared.admitContinuation(install)).rejects.toThrow(/marker/);
+    expect(install).not.toHaveBeenCalled(); expect(f.requests).toEqual([]);
+    f.preserved();
+  });
+
+  it("detaches and freezes materialized results so later adapter mutations cannot invalidate retained byte hashes", async () => {
+    const f = fixture(), original = f.result(), prepared = await f.prepare();
+    const bytes = JSON.stringify(prepared.results[0]);
+    original.content = [{ type: "text", text: "late mutation" }];
+    expect(JSON.stringify(prepared.results[0])).toBe(bytes);
+    expect(Object.isFrozen(prepared.results[0])).toBe(true);
+    expect(Object.isFrozen(prepared.results[0]!.content)).toBe(true);
+    expect(f.marker().resultReceipts).toEqual(prepared.results.map(message => ({ toolCallId: message.toolCallId, source: "native-entry", resultBytesHash: resultHash(message) })));
+    f.preserved();
+  });
+
+  it("does not revive a partially settled outer assistant by inventing a result for a nested alias", async () => {
+    const f = fixture();
+    const nested = { ...f.result(), toolCallId: "nested-only" };
+    f.setSettlement({ uncertain: 0, settled: [{ toolCallId: nested.toolCallId, key: "K", outcome: "committed", resultBytesHash: resultHash(nested) }] });
+    vi.mocked(f.adapters.effects.readToolResult).mockResolvedValue(nativeResult(nested));
+    const prepared = await f.prepare();
+    expect(prepared.results).toEqual([]);
+    expect(repairRecoveryContext(f.manager.buildSessionProjection().messages, prepared.results).filter(message => message.role === "toolResult")).toEqual([]);
+    f.preserved();
+  });
+
   it("orders validated identity -> awaited parent lease callback -> complete history -> effects/results -> durable marker -> context -> B5", async () => {
     const f = fixture();
     let release!: () => void;
@@ -200,7 +540,11 @@ describe("startup session recovery coordinator", () => {
       content: [{ type: "text", text: "Original durable committed result" }],
     };
     vi.mocked(f.adapters.effects.readToolResult).mockImplementation(async effect =>
-      effect.outcome === "not-committed" ? knownFailure : committed);
+      nativeResult(effect.outcome === "not-committed" ? knownFailure : committed));
+    f.setSettlement({ uncertain: 0, settled: [
+      { toolCallId: "native-call", key: "saved-effect-1", outcome: "committed", resultBytesHash: resultHash(committed) },
+      { toolCallId: "unstarted-call", key: "saved-effect-2", outcome: "not-committed" },
+    ] });
     const original: AssistantMessage = {
       role: "assistant", api: "openai-responses", provider: "openai", model: "recovery-test", timestamp: 1,
       stopReason: "aborted", errorMessage: "original interruption",
@@ -214,7 +558,7 @@ describe("startup session recovery coordinator", () => {
     const raw: ContextEvent["messages"] = [{ role: "user", content: "original input", timestamp: 0 }, original];
     const rawBytes = JSON.stringify(raw), prepared = await f.prepare();
     expect(prepared.results).toEqual([committed, knownFailure]);
-    expect(prepared.results[1]).toBe(knownFailure);
+    expect(prepared.results[1]).toEqual(knownFailure);
     await prepared.admitContinuation(() => {
       const repaired = repairRecoveryContext(raw, prepared.results);
       expect(repaired.filter(message => message.role === "toolResult")).toEqual([committed, knownFailure]);
@@ -322,7 +666,7 @@ describe("startup session recovery coordinator", () => {
     f.preserved();
   });
 
-  it.each(["completed", "cancelled", "unchanged-boot", "clean"] as const)("does not settle, create a marker or admit %s history", async classification => {
+  it.each(["completed", "cancelled", "unchanged-boot", "clean"] as const)("settles issued intents but does not materialize, create a marker or admit %s history", async classification => {
     const f = fixture();
     if (classification === "clean") f.setSnapshot({ sessionId: "session-1", complete: true });
     if (classification === "completed") f.changeInput({ settlement: "completed" });
@@ -335,10 +679,72 @@ describe("startup session recovery coordinator", () => {
     const install = vi.fn();
     expect(await prepared.admitContinuation(install)).toBeUndefined();
     expect(install).not.toHaveBeenCalled();
-    expect(f.adapters.effects.settlePendingIntents).not.toHaveBeenCalled();
+    expect(f.adapters.effects.settlePendingIntents).toHaveBeenCalledTimes(1);
+    expect(f.adapters.effects.readToolResult).not.toHaveBeenCalled();
     expect(f.requests).toEqual([]);
     expect(fs.existsSync(path.join(f.stateDirectory, "recovery"))).toBe(false);
     f.preserved();
+  });
+
+  it.each(["cancelled", "completed", "unchanged-boot", "clean"] as const)("records each issued-intent outcome for %s history without restarting any slot or continuing", async classification => {
+    for (const outcome of ["committed", "not-committed", "uncertain"] as const) {
+      const f = fixture(["native-call"]);
+      if (classification === "cancelled") f.changeInput({ cancellation: "cancelled" });
+      if (classification === "completed") f.changeInput({ settlement: "completed" });
+      if (classification === "unchanged-boot") f.changeInput({ podId: "pod-B", bootId: "boot-B" });
+      if (classification === "clean") f.setSnapshot({ sessionId: "session-1", complete: true });
+      // A retained B4 double owns one ALREADY-issued slot; settlement may record its
+      // verdict but must not create/restart a slot. This does not qualify actual B4 IO.
+      const issuedFile = path.join(f.stateDirectory, "issued-intents.json");
+      const issued = { slots: [{ toolCallId: "native-call", key: "issued-K", status: "issued" }] };
+      writeJsonAtomic(issuedFile, issued, { durable: true });
+      vi.mocked(f.adapters.effects.settlePendingIntents).mockImplementation(async (sessionId, generation) => {
+        expect(sessionId).toBe("session-1"); expect(generation).toMatch(/^[a-f0-9-]{36}$/);
+        const retained = JSON.parse(fs.readFileSync(issuedFile, "utf8"));
+        expect(retained).toEqual(issued);
+        writeJsonAtomic(issuedFile, { slots: [{ ...retained.slots[0], status: outcome }] }, { durable: true });
+        return { uncertain: outcome === "uncertain" ? 1 : 0, settled: [{
+          toolCallId: "native-call", key: "issued-K", outcome,
+          ...(outcome === "committed" ? { resultBytesHash: resultHash(f.result()) } : {}),
+        }] };
+      });
+      const projection = vi.spyOn(f.manager, "buildSessionProjection").mockImplementation(() => {
+        throw new Error("Non-interrupted settlement must not materialize a provider continuation");
+      });
+      const entries = JSON.stringify(f.manager.getEntries()), install = vi.fn();
+      if (outcome === "uncertain") await expect(f.prepare()).rejects.toThrow(/uncertain/i);
+      else {
+        const prepared = await f.prepare();
+        expect(prepared.classification).toBe(classification);
+        expect(prepared.results).toEqual([]); expect(prepared.continuation).toBeUndefined();
+        await expect(prepared.admitContinuation(install)).resolves.toBeUndefined();
+      }
+      expect(JSON.parse(fs.readFileSync(issuedFile, "utf8"))).toEqual({
+        slots: [{ ...issued.slots[0], status: outcome }],
+      });
+      expect(f.adapters.effects.settlePendingIntents).toHaveBeenCalledTimes(1);
+      expect(f.adapters.effects.readToolResult).not.toHaveBeenCalled();
+      expect(projection).not.toHaveBeenCalled(); expect(install).not.toHaveBeenCalled();
+      expect(f.adapters.inputs.admitContinuation).not.toHaveBeenCalled();
+      expect(JSON.stringify(f.manager.getEntries())).toBe(entries);
+      expect(fs.existsSync(path.join(f.stateDirectory, "recovery"))).toBe(false);
+      f.preserved(); projection.mockRestore();
+    }
+  });
+
+  it("settles a cancelled input using its retained generation without modifying the existing result/admission marker", async () => {
+    const f = fixture(); await (await f.prepare()).admitContinuation(() => {});
+    const bytes = fs.readFileSync(f.markerFile(), "utf8"), generation = f.marker().recoveryGeneration;
+    f.changeInput({ cancellation: "cancelled" });
+    vi.mocked(f.adapters.effects.settlePendingIntents).mockClear();
+    vi.mocked(f.adapters.effects.readToolResult).mockClear();
+    const cancelled = await f.prepare();
+    expect(f.adapters.effects.settlePendingIntents).toHaveBeenCalledExactlyOnceWith("session-1", generation);
+    expect(f.adapters.effects.readToolResult).not.toHaveBeenCalled();
+    expect(cancelled.results).toEqual([]); expect(cancelled.continuation).toBeUndefined();
+    expect(await cancelled.admitContinuation(() => { throw new Error("must not install"); })).toBeUndefined();
+    expect(f.requests).toHaveLength(1);
+    expect(fs.readFileSync(f.markerFile(), "utf8")).toBe(bytes); f.preserved();
   });
 
   it("durable cancellation takes precedence over completed settlement", async () => {
@@ -460,10 +866,10 @@ describe("startup session recovery coordinator", () => {
   });
 
   it("returns exactly one truthful native result for multiple committed nested effects, not a replayed program", async () => {
-    const f = fixture();
+    const f = fixture(["native-call"]);
     f.setSettlement({ uncertain: 0, settled: [
-      { toolCallId: "native-call", key: "nested-1", outcome: "committed", resultBytesHash: "b".repeat(64) },
-      { toolCallId: "native-call", key: "nested-2", outcome: "committed", resultBytesHash: "b".repeat(64) },
+      { toolCallId: "native-call", key: "nested-1", outcome: "committed", resultBytesHash: resultHash(f.result()) },
+      { toolCallId: "native-call", key: "nested-2", outcome: "committed", resultBytesHash: resultHash(f.result()) },
     ] });
     const prepared = await f.prepare();
     expect(prepared.results).toHaveLength(1);
@@ -486,7 +892,12 @@ describe("startup session recovery coordinator", () => {
       { toolCallId: "native-call", key: "nested-1", outcome: "committed", resultBytesHash: "b".repeat(64) },
       { toolCallId: "native-call", key: "nested-2", outcome: "committed", resultBytesHash: "c".repeat(64) },
     ] });
-    vi.mocked(f.adapters.effects.readToolResult).mockResolvedValueOnce({ role: "toolResult", toolCallId: "native-call", toolName: "fabric_exec", content: [], isError: false, timestamp: 2 });
+    const conflicting = { ...f.result(), content: [] };
+    f.setSettlement({ uncertain: 0, settled: [
+      { toolCallId: "native-call", key: "nested-1", outcome: "committed", resultBytesHash: resultHash(conflicting) },
+      { toolCallId: "native-call", key: "nested-2", outcome: "committed", resultBytesHash: resultHash(f.result()) },
+    ] });
+    vi.mocked(f.adapters.effects.readToolResult).mockResolvedValueOnce(nativeResult(conflicting));
     await expect(f.prepare()).rejects.toThrow(/result.*conflict/i);
     expect(f.requests).toEqual([]);
   });
@@ -501,13 +912,18 @@ describe("startup session recovery coordinator", () => {
     f.preserved();
   });
 
-  it.each(["invalid-json", "missing-generation", "wrong-input", "wrong-session-file", "bad-admission-id"] as const)("fails a %s durable marker without repairing/overwriting it", async fault => {
+  it.each(["invalid-json", "missing-generation", "wrong-input", "wrong-session-file", "bad-admission-id", "bad-result-receipt", "duplicate-result-receipt"] as const)("fails a %s durable marker without repairing/overwriting it", async fault => {
     const f = fixture(); await f.prepare();
     const marker = f.marker();
     if (fault === "missing-generation") delete marker.recoveryGeneration;
     if (fault === "wrong-input") marker.originalInputId = "another-input";
     if (fault === "wrong-session-file") marker.sessionFile = "another-file";
     if (fault === "bad-admission-id") marker.admissionId = "";
+    if (fault === "bad-result-receipt") marker.resultReceipts = [{ toolCallId: "native-call", source: "raw", resultBytesHash: "0".repeat(64) }];
+    if (fault === "duplicate-result-receipt") marker.resultReceipts = [
+      { toolCallId: "native-call", source: "native-entry", resultBytesHash: "0".repeat(64) },
+      { toolCallId: "native-call", source: "native-entry", resultBytesHash: "0".repeat(64) },
+    ];
     const bytes = fault === "invalid-json" ? '{"partial":' : JSON.stringify(marker);
     fs.writeFileSync(f.markerFile(), bytes);
     vi.mocked(f.adapters.effects.settlePendingIntents).mockClear();

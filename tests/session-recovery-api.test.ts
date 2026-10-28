@@ -1,9 +1,10 @@
 // Keep reason: data safety. Conflicting recovery providers must not silently choose a writer.
 import { createEventBus } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import {
   registerSessionRecoveryAdapters, sessionRecoveryAdapters,
-  type SessionRecoveryAdapters,
+  type SessionRecoveryAdapters, type RecoveryDurabilityAdapter, type RecoveryDurableEntryRequest,
+  type RecoveryDurableEntryResult, type RecoveryToolResultRead,
 } from "../src/recovery/l7-interfaces.js";
 
 function providers(): SessionRecoveryAdapters {
@@ -15,6 +16,25 @@ function providers(): SessionRecoveryAdapters {
 }
 
 describe("session recovery provider registration", () => {
+  it("pins the B4 read envelope and B6 exact-byte companion read without changing append arguments", async () => {
+    expectTypeOf<RecoveryToolResultRead["source"]>().toEqualTypeOf<"native-entry" | "adapter-original">();
+    expectTypeOf<RecoveryToolResultRead["postHook"]>().toEqualTypeOf<boolean>();
+    expectTypeOf<keyof RecoveryDurableEntryRequest>().toEqualTypeOf<"sessionId" | "deliveryId" | "recordKind">();
+    expectTypeOf<Extract<RecoveryDurableEntryResult, { found: true }>["bytes"]>().toEqualTypeOf<Uint8Array>();
+    expectTypeOf<Extract<RecoveryDurableEntryResult, { found: false }>["reason"]>().toEqualTypeOf<"not-found" | "store-unavailable" | "superseded">();
+    const bytes = new TextEncoder().encode(' {"role":"toolResult","content":[]}\n');
+    const reads: RecoveryDurableEntryRequest[] = [];
+    const adapter: RecoveryDurabilityAdapter = {
+      awaitDurableAppend: async () => ({ durable: true, seq: 7 }),
+      readDurableEntry: async request => { reads.push(request); return { found: true, seq: 7, bytes }; },
+    };
+    const request: RecoveryDurableEntryRequest = { sessionId: "s", deliveryId: "d", recordKind: "carrier" };
+    const result = await adapter.readDurableEntry(request);
+    expect(reads).toEqual([request]);
+    expect(result).toEqual({ found: true, seq: 7, bytes });
+    if (result.found) expect(result.bytes).toBe(bytes); // Type/fixture proof only, not a B6 implementation.
+  });
+
   it("leaves ordinary sessions inert", () => {
     expect(sessionRecoveryAdapters({ events: createEventBus() })).toBeUndefined();
   });

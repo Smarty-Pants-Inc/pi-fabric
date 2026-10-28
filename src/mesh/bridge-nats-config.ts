@@ -74,6 +74,8 @@ export interface NatsLinkConfig {
   readonly orgJson?: string;
   /** Deadline of each call to the NATS side, ms (default 30,000). */
   readonly callTimeoutMs: number;
+  /** Pending direction without cursor progress, ms (default 180,000; 60,000..3,600,000). */
+  readonly directionStallAfterMs?: number;
   readonly logLevel: "info" | "debug";
 }
 
@@ -174,7 +176,7 @@ const server = (value: unknown): boolean => {
  */
 export const parseNatsLinkConfig = (value: unknown): NatsLinkConfig => {
   const root = object(value, "config",
-    ["version", "name", "link", "file", "stateDir", "nats", "allow", "orgJson", "callTimeoutMs", "logLevel"],
+    ["version", "name", "link", "file", "stateDir", "nats", "allow", "orgJson", "callTimeoutMs", "directionStallAfterMs", "logLevel"],
     ["version", "name", "link", "file", "stateDir", "nats"]);
   if (root.version !== NATS_LINK_CONFIG_VERSION) throw new NatsLinkConfigError("version", `must be ${NATS_LINK_CONFIG_VERSION}`);
   if (!full(BRIDGE_NAME, root.name)) throw new NatsLinkConfigError("name", "must be a bridge name ([A-Za-z0-9][A-Za-z0-9._-]{0,62})");
@@ -277,6 +279,8 @@ export const parseNatsLinkConfig = (value: unknown): NatsLinkConfig => {
     allow,
     ...(orgJson === undefined ? {} : { orgJson }),
     callTimeoutMs: integer(root.callTimeoutMs, "callTimeoutMs", 30_000, 1_000, 300_000),
+    // Keep the import-light parser's default pinned to BRIDGE_DIRECTION_STALL_AFTER_MS by tests.
+    directionStallAfterMs: integer(root.directionStallAfterMs, "directionStallAfterMs", 180_000, 60_000, 3_600_000),
     logLevel,
   };
 };

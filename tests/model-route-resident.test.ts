@@ -126,7 +126,7 @@ describe("resident LIVE custody and manual config rollback", () => {
     const restored = new ResidentHost(state.config, () => {}, { getAvailable: () => available });
     closers.push(() => restored.close()); await restored.start();
     expect(restored.agents.runDirectory(a.runId!)).toBeUndefined(); // No old live handle/map.
-    expect(restored.agents.actorArchiveSources(state.actor.id, state.actor.sessionFile!).get(a.runId!)).toBe(source);
+    expect((await restored.agents.actorArchiveSources(state.actor.id, state.actor.sessionFile!)).get(a.runId!)).toBe(source);
     denied = false;
     const next = await restored.actors.ask(state.actor.id, "ECHO_MODEL", "test"); expect(next.text).toContain(cheap.model);
     // #752 reviewed contract: docs/residency-runtime.md:64-69, 87-92 at 2f6838c3.

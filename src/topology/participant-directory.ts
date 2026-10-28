@@ -46,7 +46,7 @@ import {
   participantLeaseGraceMs,
   waitForHostLeaseRenewal,
   type RoutingLeaseWaitOptions,
-  readHostLeases,
+  readHostLeasesForIds,
   removeHostLeaseIf,
   removeOwnedHostLease,
   FabricHostLeaseSupersededError,
@@ -2096,16 +2096,27 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   // Valid host records by id, each with its effective expiry: the later of its shared-state
   // lease and its file lease (smarty-dev#816).
-  #liveHosts(entries: Iterable<MeshStateEntry>, leases: ReadonlyMap<string, FabricHostLease> = readHostLeases(this.mesh.root)): Map<string, FabricHostRecord & { mirror?: FabricMirrorLease; bridgeStale?: true }> {
+  #liveHosts(entries: Iterable<MeshStateEntry>, leases?: ReadonlyMap<string, FabricHostLease>): Map<string, FabricHostRecord & { mirror?: FabricMirrorLease; bridgeStale?: true }> {
     const hosts = new Map<string, FabricHostRecord & { mirror?: FabricMirrorLease; bridgeStale?: true }>();
     for (const entry of entries) {
       const host = hostFromEntry(entry);
-      const mirror = host && hostMirrorLease(leases, host);
-      if (host) hosts.set(host.id, { ...host, ...hostLiveness(leases, host),
-        ...(mirror ? { mirror } : host.remoteHost && (host.mirrorLease === 1 || leases.get(host.id)?.mirrorLease === 1)
+      if (!host) continue;
+      // Liveness/provenance only consult leases.get(host.id), never root/identity aliases.
+      // Do not discover/stat the fleet's historical lease directory for a known host.
+      const selected = leases ?? readHostLeasesForIds(this.mesh.root, [host.id]);
+      const mirror = hostMirrorLease(selected, host);
+      hosts.set(host.id, { ...host, ...hostLiveness(selected, host),
+        ...(mirror ? { mirror } : host.remoteHost && (host.mirrorLease === 1 || selected.get(host.id)?.mirrorLease === 1)
           ? { bridgeStale: true as const } : {}) });
     }
     return hosts;
+  }
+
+  #leasesForHosts(entries: readonly MeshStateEntry[]): Map<string, FabricHostLease> {
+    return readHostLeasesForIds(this.mesh.root, entries.flatMap(entry => {
+      const host = hostFromEntry(entry);
+      return host ? [host.id] : [];
+    }));
   }
 
   #mirrorStatus(owner: FabricHostRecord & { mirror?: FabricMirrorLease; bridgeStale?: true }, now: number) {
@@ -2208,8 +2219,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       participant.ownerHostId !== ownerHostId ||
       participant.ownerIdentityId !== ownerIdentityId
     ) return undefined;
-    const leases = readHostLeases(this.mesh.root);
-    const hosts = this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read), leases);
+    const hosts = this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read));
     const owner = hosts.get(ownerHostId);
     if (
       !owner ||
@@ -4069,7 +4079,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const read = { fresh: false };
     const token = this.mesh.stateToken(read);
     const files = this.#participantFiles(read, this.options.listReadCacheMs);
-    const leases = readHostLeases(this.mesh.root);
+    const leases = this.#leasesForHosts(this.mesh.listAllShared(HOST_PREFIX, { snapshot: token }));
     const local = JSON.stringify([root.id, root.name, root.sessionId, ...[...this.#localRecords.values()].map(record =>
       [record.id, record.kind, record.rootId, record.name, record.sessionId, record.status, record.reloadUntil, record.remoteHost])]);
     const last = this.#rootCollisionPass;
@@ -4092,14 +4102,15 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #legacyRenewalsRequired(now: number, snapshot?: object): boolean {
     if (typeof this.mesh.stateToken !== "function" || typeof this.mesh.listAllShared !== "function") {
       const read = snapshot ? { snapshot } : {};
-      return this.#legacyRenewalsScan(now, readHostLeases(this.mesh.root), (prefix) => this.mesh.listAll(prefix, read),
-        this.#participantFiles(read)).required;
+      const hosts = this.mesh.listAll(HOST_PREFIX, read);
+      return this.#legacyRenewalsScan(now, this.#leasesForHosts(hosts),
+        (prefix) => prefix === HOST_PREFIX ? hosts : this.mesh.listAll(prefix, read), this.#participantFiles(read)).required;
     }
     // Unpinned: the current canonical snapshot, the same exact read an unpinned listAll made.
     const token = snapshot ?? this.mesh.stateToken();
     const read = { snapshot: token };
     const files = this.#participantFiles(read);
-    const leases = readHostLeases(this.mesh.root);
+    const leases = this.#leasesForHosts(this.mesh.listAllShared(HOST_PREFIX, read));
     const checkedAt = Date.now();
     const memo = this.#legacyRenewals;
     if (memo && memo.files === files && samePeerLeases(memo.leases, leases, this.options.hostId) &&

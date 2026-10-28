@@ -2058,14 +2058,18 @@ export class ActorManager {
     this.#slotRunIds.set(actor.id, runs);
   }
 
-  #assertSlotExecutionSettled(cleanup: RemovalCleanup): void {
+  async #assertSlotExecutionSettled(cleanup: RemovalCleanup): Promise<void> {
     if (!cleanup.slotTopics) return;
     if (cleanup.slotLaunchUnknown || this.#slotLaunchUnknown.has(cleanup.id)) {
       throw new Error("Protected actor launch outcome is unidentified; native execution settlement must be reconciled before cleanup");
     }
+    const sources = await this.agents.actorArchiveSources(cleanup.id, path.join(cleanup.sessionDir, "session.jsonl"));
+    // Discovery yields: take fresh execution-custody hints only AFTER it finishes.
+    if (cleanup.slotLaunchUnknown || this.#slotLaunchUnknown.has(cleanup.id)) {
+      throw new Error("Protected actor launch outcome is unidentified; native execution settlement must be reconciled before cleanup");
+    }
     const runs = new Set([...(cleanup.slotRunIds ?? []), ...(this.#slotRunIds.get(cleanup.id) ?? []),
-      ...(cleanup.lastRunId ? [cleanup.lastRunId] : []),
-      ...this.agents.actorArchiveSources(cleanup.id, path.join(cleanup.sessionDir, "session.jsonl")).keys()]);
+      ...(cleanup.lastRunId ? [cleanup.lastRunId] : []), ...sources.keys()]);
     for (const runId of runs) {
       // Native retained-tree custody checks descendants, unknown launch outcomes,
       // pending stop/release and lost contact. A terminal status alone is NOT proof.
@@ -4945,7 +4949,7 @@ export class ActorManager {
     try {
       this.#cleanupTreeRemoval(cleanup);
       await this.#joinStoppedRun(id);
-      this.#assertSlotExecutionSettled(cleanup);
+      await this.#assertSlotExecutionSettled(cleanup);
       // Persist only a decided escalation; a refused one rolled its flag back.
       for (let pending; (pending = this.#operatorEscalations.get(id));) await pending.catch(() => undefined);
       if (this.#operatorRemovals.has(id) && !cleanup.operator) {
@@ -5443,7 +5447,7 @@ export class ActorManager {
       // their source veto on disk for the next execution owner.
       for (const actor of owned) {
         const pending = new Set([...(this.#pendingRunArchives.get(actor.id) ?? []),
-          ...this.agents.actorArchiveSources(actor.id, actor.sessionFile).keys()]);
+          ...(await this.agents.actorArchiveSources(actor.id, actor.sessionFile)).keys()]);
         for (const runId of pending) await this.#retainRunLog(actor, runId).catch(() => undefined);
       }
       for (const actor of owned) {
@@ -6971,7 +6975,7 @@ export class ActorManager {
             // Release the in-memory handle and tmp run dir for completed runs;
             // failed runs are retained for agents.status(actor.lastRunId).
             const priorArchives = new Set([...(this.#pendingRunArchives.get(actor.id) ?? []),
-              ...this.agents.actorArchiveSources(actor.id, actor.sessionFile).keys()]);
+              ...(await this.agents.actorArchiveSources(actor.id, actor.sessionFile)).keys()]);
             if (previousRunId && previousRunId !== runId) priorArchives.add(previousRunId);
             for (const priorRunId of priorArchives) {
               if (priorRunId === runId) continue;
@@ -8832,7 +8836,7 @@ export class ActorManager {
     if (!pending) this.#pendingRunArchives.set(actor.id, pending = new Set());
     pending.add(runId);
     try {
-      const source = this.agents.runDirectory(runId) ?? this.agents.actorArchiveSources(actor.id, actor.sessionFile).get(runId);
+      const source = this.agents.runDirectory(runId) ?? (await this.agents.actorArchiveSources(actor.id, actor.sessionFile, runId)).get(runId);
       const result = await this.#logs.retainRun(actor, runId, source);
       // Only a verified copy discharges the durable source veto, including on close/restarted-owner retries.
       if (result.archived) await this.agents.commitActorArchive(runId, actor.id, actor.sessionFile);

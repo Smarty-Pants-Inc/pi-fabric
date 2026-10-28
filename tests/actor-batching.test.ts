@@ -66,7 +66,7 @@ const fixture = async (root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-batch
   });
   vi.spyOn(agents, "cleanup").mockResolvedValue({ cleaned: true });
   vi.spyOn(agents, "runDirectory").mockReturnValue(undefined);
-  vi.spyOn(agents, "actorArchiveSources").mockReturnValue(new Map());
+  vi.spyOn(agents, "actorArchiveSources").mockResolvedValue(new Map());
   vi.spyOn(agents, "outputPrincipal").mockReturnValue(undefined);
   const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorQueueLimit: limit }, agents, () => {}, {
     actorRoot: path.join(root, "actors"), persistent: true, releasePaused: true, reapDeadSessionPresence: false,

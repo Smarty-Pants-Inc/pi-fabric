@@ -8,7 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { ownProcessIncarnation, readPhysicalHostIdentity, readFileRetrying, writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
-import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, hostLeaseDirectoryStamp, readHostLease, readHostLeaseCurrent, readHostLeases, removeHostLeaseIf, sameHostLeaseVersion, STATE_LEASE_RENEW_MS, withHostLeaseDirectoryCustody, writeHostLeaseVersionIf } from "../topology/host-leases.js";
+import { type BridgeLeaseProcess, type FabricHostLease, type FabricMirrorLease, MIRROR_FRESH_MS, hostLeaseExpiry, hostLeasePath, hostLiveness, hostLeaseDirectoryStamp, readHostLease, readHostLeaseCurrent, readHostLeases, readHostLeasesAsync, readHostLeasesForIds, removeHostLeaseIf, sameHostLeaseVersion, STATE_LEASE_RENEW_MS, withHostLeaseDirectoryCustody, writeHostLeaseVersionIf } from "../topology/host-leases.js";
 import { withHostLeaseFileCustody } from "../topology/host-lease-lock.js";
 import { meshDirectoryStamp } from "../topology/publication-generation.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../topology/types.js";
@@ -606,8 +606,12 @@ const participantAuthorityStamp = (files: ReturnType<typeof participantFileSnaps
  * every lease once a handoff could be voided, plus each native lease's live/dead judgment at the plan's
  * `judgedAt`. A renewal that keeps a native live moves nothing; one that revives it, or a new native,
  * does (the plan's liveness window covers time passing). */
-const hostLeaseAuthorityStamp = (root: string, relevantIds: ReadonlySet<string> | undefined, judgedAt?: number): string =>
-  contentDigest([...readHostLeases(root).values()]
+const hostLeaseAuthorityStamp = (root: string, relevantIds: ReadonlySet<string> | undefined, judgedAt?: number,
+  capturedLeases?: ReadonlyMap<string, FabricHostLease>): string =>
+  // Synchronous commit rechecks deliberately retain COMPLETE discovery: a lease-only file
+  // with an arbitrary id can change its rootId/identityId to a consulted identity under churn.
+  // Point-reading relevantIds would miss that authority; an old async snapshot cannot prove it.
+  contentDigest([...(capturedLeases ?? readHostLeases(root)).values()]
     .filter(lease => relevantIds === undefined || relevantIds.has(lease.id) || relevantIds.has(lease.rootId) ||
       relevantIds.has(lease.identityId))
     .map(lease => [lease.id, lease.rootId, lease.identityId, lease.startedAt, lease.incarnationToken,
@@ -773,6 +777,8 @@ export const bridgeHandoffScope = (
     if (entry.key.startsWith(HOST_PREFIX)) ids.push(value.rootId, isObject(value.identity) ? value.identity.id : undefined);
     for (const id of ids) if (typeof id === "string") answering.add(id);
   }
+  // File-only native aliases need not have a host state row or a filename derived from
+  // the handoff id. Synchronous control consumers must keep this complete authority read.
   for (const lease of leases().values()) {
     if (nativeLeaseLive(lease, now)) answering.add(lease.id).add(lease.rootId).add(lease.identityId);
   }
@@ -1046,18 +1052,22 @@ export class StoreBridgeSide implements BridgeSide {
 
   relayOrigin(id: string): string | undefined {
     const host = this.#relayProjection(id);
-    return host && hostLeaseExpiry(readHostLeases(this.store.root), host) > this.now() ? host.remoteHost : undefined;
+    return host && hostLeaseExpiry(readHostLeasesForIds(this.store.root, [host.id]), host) > this.now() ? host.remoteHost : undefined;
   }
 
   relayStaleOrigin(id: string): string | undefined {
     const host = this.#relayProjection(id);
-    return host && hostLeaseExpiry(readHostLeases(this.store.root), host) <= this.now() ? host.remoteHost : undefined;
+    return host && hostLeaseExpiry(readHostLeasesForIds(this.store.root, [host.id]), host) <= this.now() ? host.remoteHost : undefined;
   }
 
   async relayPresence(): Promise<Pick<BridgePresence, "hosts" | "participants">> {
     const hosts: BridgeHost[] = [];
-    const leases = readHostLeases(this.store.root);
-    for (const entry of this.store.listAll(HOST_PREFIX, { fresh: true })) {
+    const hostEntries = this.store.listAll(HOST_PREFIX, { fresh: true });
+    const leases = readHostLeasesForIds(this.store.root, hostEntries.flatMap(entry => {
+      const host = hostOf(entry.key, entry.value);
+      return host ? [host.id] : [];
+    }));
+    for (const entry of hostEntries) {
       const host = hostOf(entry.key, entry.value);
       if (!host || host.remoteHost === undefined || host.remoteHost === this.peer || host.bridgeVia !== undefined ||
           !CANONICAL_ID.test(host.id) || host.rootId !== host.id || host.identity.id !== host.id ||
@@ -1078,9 +1088,11 @@ export class StoreBridgeSide implements BridgeSide {
     return { hosts, participants };
   }
 
-  #presenceSnapshot(): BridgePresence {
-    return this.#presence(this.store.listAll(HOST_PREFIX, { fresh: true }), this.#participantEntries(),
-      this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true }));
+  async #presenceSnapshot(): Promise<BridgePresence> {
+    const hostEntries = this.store.listAll(HOST_PREFIX, { fresh: true });
+    const participants = this.#participantEntries();
+    const handoffs = this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true });
+    return this.#presence(hostEntries, participants, handoffs, await readHostLeasesAsync(this.store.root));
   }
 
   subscribeChanges(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): () => void {
@@ -1103,11 +1115,15 @@ export class StoreBridgeSide implements BridgeSide {
       return digest;
     };
     const snapshot = () => {
-      const leases = readHostLeases(this.store.root);
       const hostEntries = fileState ? this.store.listAllShared(HOST_PREFIX, { fresh: true })
         : this.store.listAll(HOST_PREFIX, { fresh: true });
       const participantEntries = fileState ? this.store.listAllShared(PARTICIPANT_PREFIX, { fresh: true })
         : this.store.listAll(PARTICIPANT_PREFIX, { fresh: true });
+      const handoffEntries = fileState ? this.store.listAllShared(BRIDGE_HANDOFF_PREFIX, { fresh: true })
+        : this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true });
+      const leases = handoffEntries.length > 0 ? readHostLeases(this.store.root)
+        : readHostLeasesForIds(this.store.root, hostEntries.flatMap(entry =>
+          isObject(entry.value) && typeof entry.value.id === "string" ? [entry.value.id] : []));
       // Include held projection existence/content, so an external prune/lease removal repairs
       // without waiting for traffic. Exclude our renewal fields: our own mirror writes then
       // cause at most one settling pass, never a self-sustaining lease-write feedback loop.
@@ -1124,8 +1140,7 @@ export class StoreBridgeSide implements BridgeSide {
         }).sort((a, b) => a.key.localeCompare(b.key));
       const native = this.#presence(hostEntries,
         [...participantEntries, ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })],
-        fileState ? this.store.listAllShared(BRIDGE_HANDOFF_PREFIX, { fresh: true })
-          : this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true }), leases);
+        handoffEntries, leases);
       // Other links' mirror additions/removals must wake the hub's exporting links.
       const relays = [...hostEntries, ...participantEntries]
         .filter(entry => remoteHostOf(entry.value) !== undefined && mirrorLinkOf(entry.value) !== this.peer)
@@ -1229,7 +1244,11 @@ export class StoreBridgeSide implements BridgeSide {
     capturedLeases?: ReadonlyMap<string, FabricHostLease>,
   ): { presence: BridgePresence; voided: MeshStateEntry[]; leases: ReadonlyMap<string, FabricHostLease>; now: number } {
     const now = this.now();
-    const leases = capturedLeases ?? readHostLeases(this.store.root);
+    // Presence needs only each host's own lease unless a handoff consults file-only aliases.
+    // Mirror collision/incarnation planning passes a COMPLETE map explicitly below.
+    const leases = capturedLeases ?? (handoffEntries.length > 0 ? readHostLeases(this.store.root)
+      : readHostLeasesForIds(this.store.root, hostEntries.flatMap(entry =>
+        isObject(entry.value) && typeof entry.value.id === "string" ? [entry.value.id] : [])));
     const handoffs = bridgeHandoffScope(handoffEntries, hostEntries, participantEntries, () => leases, now, this.peer);
     const reserved = new Set<string>(handoffs.reserved);
     const hosts: BridgeHost[] = [];
@@ -1684,7 +1703,7 @@ export class StoreBridgeSide implements BridgeSide {
 
   async owned(): Promise<Pick<BridgePresence, "hosts" | "participants">> {
     const now = this.now();
-    const leases = readHostLeases(this.store.root);
+    const leases = await readHostLeasesAsync(this.store.root);
     const hosts: BridgeHost[] = [];
     for (const entry of this.store.listAll(HOST_PREFIX, { fresh: true })) {
       if (mirrorLinkOf(entry.value) !== this.peer) continue;
@@ -1831,14 +1850,19 @@ export class StoreBridgeSide implements BridgeSide {
       return [...protectionRoots].sort();
     };
     // The pass's plan on one state view: admission, reservations and the CAS versions. undefined: halted.
-    const compute = (view: MeshBatchView, participantFiles: ReturnType<typeof participantFileSnapshot>, livenessSensitive: boolean):
+    const compute = (view: MeshBatchView, participantFiles: ReturnType<typeof participantFileSnapshot>, livenessSensitive: boolean,
+      capturedLeases?: ReadonlyMap<string, FabricHostLease>):
       { ops: MeshBatchOperation[]; leases: BridgeLease[]; removed: BridgeUnlease[];
         judged: { livenessWindow?: LeaseLivenessWindow } } | undefined => {
         const leases: BridgeLease[] = [];
         const removed: BridgeUnlease[] = [];
         const hostEntries = view.listAll(HOST_PREFIX);
         const participantEntries = view.listAll(PARTICIPANT_PREFIX);
-        const scan = this.#scan(hostEntries, [...participantEntries, ...participantFiles.entries], view.listAll(BRIDGE_HANDOFF_PREFIX));
+        // Unlike ordinary presence, collision and incarnation authority includes arbitrary-id
+        // file-only root/identity aliases. Sync commit/recovery checks keep the full read;
+        // outside-transaction plans supply a complete asynchronously discovered map.
+        const scan = this.#scan(hostEntries, [...participantEntries, ...participantFiles.entries], view.listAll(BRIDGE_HANDOFF_PREFIX),
+          capturedLeases ?? readHostLeases(this.store.root));
         const own = new Set(scan.presence.reserved);
         const protectionRoots = new Set(collisionProtection(hostEntries, participantEntries, participantFiles, scan.leases));
         for (const root of protectionRoots) skippedRoots.add(root);
@@ -2130,8 +2154,8 @@ export class StoreBridgeSide implements BridgeSide {
     const recovering = !partial && !this.#recovered;
     const probeEligible = (view: MeshBatchView | undefined): boolean => this.#hasCommittedPass && !halted() &&
       view !== undefined && view.listAll(BRIDGE_HANDOFF_PREFIX).length === 0 && !this.#outbox.hasUnconfirmed();
-    const staleCheck = (view: MeshBatchView): void => {
-      try { compute(view, participantFileSnapshot(this.store.root), false); }
+    const staleCheck = (view: MeshBatchView, capturedLeases?: ReadonlyMap<string, FabricHostLease>): void => {
+      try { compute(view, participantFileSnapshot(this.store.root), false, capturedLeases); }
       catch (error) { if (error instanceof BridgeStaleIncarnationError) throw error; }
     };
     // A lease-only pass has no transaction to roll back: when one of its effects, under its host gate,
@@ -2146,7 +2170,7 @@ export class StoreBridgeSide implements BridgeSide {
     };
     // Without a recovery, the lease-only probe's own lock-free plan on this same view is the check.
     const probing = !recovering && probeEligible(committed?.view);
-    if (lockFreeView && !probing) staleCheck(lockFreeView);
+    if (lockFreeView && !probing) staleCheck(lockFreeView, await readHostLeasesAsync(this.store.root));
     let probe = probing ? committed : undefined;
     // Effects this pass's recovery ran: their rows retire in this pass's first durable batch, as main's
     // replay made its batch durable and retired them in the same COMMIT.
@@ -2171,8 +2195,10 @@ export class StoreBridgeSide implements BridgeSide {
     if (probe) {
       let probed: ReturnType<typeof compute> | undefined;
       // The consulted lease authority this lease-only plan is made on (main read it again in its fence).
-      const consultedBefore = incomingAuthorityIds.size > 0 ? hostLeaseAuthorityStamp(this.store.root, incomingAuthorityIds) : undefined;
-      try { probed = compute(probe.view, participantFileSnapshot(this.store.root), false); }
+      const probeLeases = await readHostLeasesAsync(this.store.root);
+      const consultedBefore = incomingAuthorityIds.size > 0
+        ? hostLeaseAuthorityStamp(this.store.root, incomingAuthorityIds, undefined, probeLeases) : undefined;
+      try { probed = compute(probe.view, participantFileSnapshot(this.store.root), false, probeLeases); }
       catch (error) {
         // A newer incarnation's committed evidence is final: fence now, not after winning custody.
         if (error instanceof BridgeStaleIncarnationError) throw error;
@@ -2316,10 +2342,12 @@ export class StoreBridgeSide implements BridgeSide {
             // compare the current leases with authority this plan never read.
             const authorityScope = judgesLeaseLiveness ? undefined : leaseAuthorityIds;
             const judgedAt = judgesLeaseLiveness ? this.now() : undefined;
+            const planLeases = !cacheStillOwnsState && planRevision !== undefined
+              ? await readHostLeasesAsync(this.store.root) : undefined;
             const leaseAuthorityBefore = cacheStillOwnsState && cachedPlan ? cachedPlan.leaseAuthorityStamp
-              : planRevision !== undefined ? hostLeaseAuthorityStamp(this.store.root, authorityScope, judgedAt) : "unknown";
+              : planRevision !== undefined ? hostLeaseAuthorityStamp(this.store.root, authorityScope, judgedAt, planLeases) : "unknown";
             const planned = planRevision !== undefined && !halted()
-              ? cacheStillOwnsState ? undefined : compute(early!.view, files!, judgesLeaseLiveness)
+              ? cacheStillOwnsState ? undefined : compute(early!.view, files!, judgesLeaseLiveness, planLeases)
               : undefined;
             const leaseStampAfter = planRevision !== undefined ? hostLeaseDirectoryStamp(this.store.root) : undefined;
             const leaseAuthorityAfter = !cacheStillOwnsState && leaseStampBefore !== leaseStampAfter

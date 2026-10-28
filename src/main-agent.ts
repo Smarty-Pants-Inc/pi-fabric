@@ -344,6 +344,11 @@ const mainSenderClaimAllowed = (sender: MeshIdentity, deliveryId: unknown, sourc
     deliveryId.startsWith("resident:") && source !== "actor-output");
 
 export interface HeldAgentMessage {
+  /** A composer input parked by recovery, not an agent-message envelope. The native void
+   * user API has no correlated receipt: a handed input stays journalled, never retried on guesswork. */
+  recoveryUser?: { from?: MeshIdentity; verification?: "mesh" | "bridge" };
+  /** Native threw after an attempted handoff. Only a correlated receipt, not reopen, settles it. */
+  recoveryHandoffUncertain?: true;
   outcomeSend?: DeliverySend;
   /** Per-handoff evidence, never inferred from Main's later state at confirmation. */
   deliveryReason?: "operator-halt";
@@ -595,6 +600,52 @@ export class MainAgentController implements FabricMainAgentTarget {
   #wake: ReturnType<typeof setInterval> | undefined;
   #preflightWake: ReturnType<typeof setInterval> | undefined;
   #operation: { kind: "compact" | "tree"; signal: AbortSignal | undefined } | undefined;
+  // Runtime/native owns this live epoch predicate. No input, halt, reload or attach clears it.
+  #recoveryDrainPredicate: (() => boolean) | undefined;
+  #recoveryPredicateFailed = false;
+  // Replay-proven native/legacy-chain completion is deferred, not published, while held.
+  #recoveryReplayConsumed = new Set<HeldAgentMessage>();
+
+  /** Install BEFORE attachFollowUpDrain opens/replays the retained journal. Installation never drains. */
+  setRecoveryDrainPredicate(predicate: () => boolean): void {
+    this.#recoveryDrainPredicate = predicate;
+    this.#stopWake();
+    this.#stopProviderDeadTimer();
+    this.#stopProviderDeadDeadline();
+  }
+
+  /** One owner-driven epoch/configuration edge, not a release token or a polling loop. */
+  reconsiderRecoveryDrain(): void {
+    if (!this.#recoveryDrainOpen() || !this.#bindingsLive || this.#reloading || !this.#context || this.#contextRetired()) return;
+    this.#confirm();
+    this.#armProviderDeadTimer();
+    if (this.#context.isIdle()) this.#release(true);
+  }
+
+  #recoveryDrainOpen(): boolean {
+    if (!this.#recoveryDrainPredicate) return true;
+    try {
+      const open = this.#recoveryDrainPredicate() === true;
+      this.#recoveryPredicateFailed = false;
+      return open;
+    } catch (error) {
+      if (!this.#recoveryPredicateFailed) diagnostics.warn("src/main-agent.ts",
+        "[pi-fabric] Main recovery drain predicate failed; native handoff and consumption remain held", error);
+      this.#recoveryPredicateFailed = true;
+      return false;
+    }
+  }
+
+  #assertRecoveryDrainOpen(): void {
+    if (!this.#recoveryDrainOpen()) throw Object.assign(new Error("Main recovery drain is held"), { code: "MAIN_RECOVERY_DRAIN_HELD" });
+  }
+
+  #holdForRecovery(item: HeldAgentMessage): void {
+    if (!this.#journal) throw new Error("Main recovery drain is held without an open journal; retry admission later");
+    this.#admit(item);
+    this.#held.push(item);
+    try { this.#save(); } catch (error) { this.#held.pop(); throw error; }
+  }
 
   constructor(
     readonly pi: ExtensionAPI,
@@ -722,6 +773,12 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (!text) throw new Error("Main agent message must not be empty");
     const messageId = randomUUID();
     const options = { deliverAs: delivery };
+    if (!this.#recoveryDrainOpen()) {
+      this.#holdForRecovery({ id: messageId, message: text, sentAt: Date.now(),
+        from: from ?? { id: this.id, name: "Main", kind: "main" }, deliverAs: delivery, triggerTurn: true,
+        recoveryUser: { ...(from ? { from: structuredClone(from) } : {}), ...(verification ? { verification } : {}) } });
+      return { queued: true, messageId, routed: "main", triggered: false, reason: "recovery-drain-held" };
+    }
     // An unknown caller cannot claim this Main's identity. Pi records the unclaimed turn as terminal.
     // The dashboard composer is human input (no Fabric sender). Keep it user.
     if (from) sendFabricUserMessage(this.pi, text, from, delivery, options, verification);
@@ -824,6 +881,14 @@ export class MainAgentController implements FabricMainAgentTarget {
       ...(request.data === undefined ? {} : { data: serializableData(request.data) }),
       ...(deliveryId === undefined ? {} : { deliveryId }),
     };
+    // Storage-only admission precedes EVERY wake/preemption path, including passive and flush=0.
+    if (!this.#recoveryDrainOpen()) {
+      item.deliverAs = request.delivery;
+      item.triggerTurn = request.triggerTurn ?? true;
+      this.#holdForRecovery(item);
+      return { queued: true, messageId: item.id, routed: "main", triggered: false,
+        reason: "recovery-drain-held", ...this.queueDepth(sender.id) };
+    }
     // Retry required owner authority at the next delivery, even without a durable delivery id.
     this.#retryPendingHalt();
     // Only a launch-bound project/org Main's new peer control envelope gets one run; halt stays latched.
@@ -868,6 +933,14 @@ export class MainAgentController implements FabricMainAgentTarget {
       const index = this.#interrupts.size;
       this.#held.splice(index, 0, item);
       try { this.#save(deliveryId !== undefined ? { commandId: deliveryId, messageId: item.id } : undefined); } catch (error) { this.#held.splice(index, 1); throw error; }
+      if (!this.#recoveryDrainOpen()) {
+        // The journal barrier may have closed recovery after live priority admission.
+        // Without an actual interruption this is still ordinary FIFO pending work.
+        this.#held.splice(index, 1);
+        this.#held.push(item);
+        this.#save();
+        return { queued: true, messageId: item.id, routed: "main", triggered: false, reason: "recovery-drain-held" };
+      }
       const abort = !this.#interruptUsedThisTurn;
       this.#interrupts.add(item.id);
       // Same native cancellation path as Escape. Do not queue into Pi's aborted run:
@@ -876,7 +949,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         this.#interruptUsedThisTurn = true;
         this.#interruptResume = true;
         this.#lastInterrupt.set(sender.id, performance.now());
-        this.#context.abort();
+        if (this.#recoveryDrainOpen()) this.#context.abort();
       }
       return { queued: true, messageId: item.id, routed: "main", triggered: false,
         reason: abort ? "interrupt pending settlement" : "interrupt already used this turn; ordinary steer" };
@@ -924,7 +997,19 @@ export class MainAgentController implements FabricMainAgentTarget {
       try {
         triggered = this.#send([item], request.delivery, triggerTurn, false, peerSteerWake);
       } catch (error) {
+        const held = (error as { code?: string })?.code === "MAIN_RECOVERY_DRAIN_HELD";
+        if (this.#recoveryDrainPredicate && !held) {
+          item.recoveryHandoffUncertain = true;
+          this.#trySave();
+          throw error; // ambiguous native completion stays journalled, including across rebind
+        }
         this.#sent.splice(this.#sent.indexOf(item), 1);
+        if (held) {
+          delete item.handed;
+          this.#held.push(item);
+          this.#save();
+          return { queued: true, messageId: item.id, routed: "main", triggered: false, reason: "recovery-drain-held" };
+        }
         this.#trySave();
         restorePeerWakeOnFailure();
         throw error;
@@ -1063,6 +1148,8 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** Remember that this item's delivery id and its superseded ids are done. */
   #consume(item: HeldAgentMessage): void {
+    this.#assertRecoveryDrainOpen();
+    this.#recoveryReplayConsumed.delete(item);
     this.#replayed.delete(item.id);
     const ids = [...(item.supersedes ?? []), ...(item.deliveryId === undefined ? [] : [item.deliveryId])];
     if (!ids.length) return;
@@ -1219,6 +1306,7 @@ export class MainAgentController implements FabricMainAgentTarget {
    * done, one still in Pi's queue awaits the session, and any other was lost and is held again.
    */
   #reconcile(event: BoundaryEvent, triggerTurn = true): void {
+    if (!this.#recoveryDrainOpen()) return;
     const pending = event.context?.pendingMessages;
     if (!this.#unverified.length || !Array.isArray(pending)) return;
     const queued = agentMessageIds(pending);
@@ -1227,6 +1315,8 @@ export class MainAgentController implements FabricMainAgentTarget {
     // not sent again in this process; it stays journalled and a restart replays it.
     const seen = this.#source !== "" && this.#unverified.some((item) => !delivered.has(item.id)) ? this.#inMemory() : new Set<string>();
     for (const item of [...this.#unverified]) {
+      if (!this.#recoveryDrainOpen()) break;
+      if (item.recoveryUser) continue; // no native user receipt/queue identity: never infer a safe retry
       if (delivered.has(item.id)) {
         this.#unverified.splice(this.#unverified.indexOf(item), 1);
         this.#recordSuperseded(item);
@@ -1241,8 +1331,14 @@ export class MainAgentController implements FabricMainAgentTarget {
         try {
           this.#send([item], item.deliverAs, triggerTurn && (item.triggerTurn ?? true), false);
           this.#sent.push(item);
-        } catch {
-          continue; // Still journalled as unverified, including any handoff evidence.
+        } catch (error) {
+          if (this.#recoveryDrainPredicate && item.handed &&
+            (error as { code?: string })?.code !== "MAIN_RECOVERY_DRAIN_HELD") {
+            item.recoveryHandoffUncertain = true;
+            this.#unverified.splice(this.#unverified.indexOf(item), 1);
+            this.#sent.push(item);
+          }
+          continue; // An attempted ambiguous handoff is never resubmitted just from reopening.
         }
       } else {
         const { handed: _handed, ...held } = item;
@@ -1261,6 +1357,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #recordOutcome(send: DeliverySend | undefined, outcome: DeliveryOutcome, reason: string): boolean {
+    if (!this.#recoveryDrainOpen()) return false;
     const root = this.meshRoot ?? (this.#journal ? path.dirname(path.dirname(this.#journal)) : undefined);
     if (!send || !root) return true;
     try { appendDeliveryOutcome(root, send, outcome, reason); return true; }
@@ -1277,6 +1374,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** Drop the handed-over followUps the session now holds (the only way one leaves the journal). */
   #confirm(): void {
+    if (!this.#recoveryDrainOpen()) return;
     this.#retryPendingHalt();
     let outcomesChanged = false;
     for (const item of this.#held) outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
@@ -1285,7 +1383,9 @@ export class MainAgentController implements FabricMainAgentTarget {
     const before = this.#sent.length;
     for (const item of this.#sent) outcomesChanged = this.#recordSuperseded(item) || outcomesChanged;
     const kept = this.#sent.filter((item) => {
-      if (!delivered.has(item.id) || item.supersededSends?.length || !this.#recordOutcome(item.outcomeSend, "delivered", this.#deliveryReason(item))) return true;
+      const nativeDelivered = delivered.has(item.id);
+      if (!this.#recoveryDrainOpen() || item.recoveryUser || (!nativeDelivered && !this.#recoveryReplayConsumed.has(item)) || item.supersededSends?.length ||
+        (nativeDelivered && !this.#recordOutcome(item.outcomeSend, "delivered", this.#deliveryReason(item)))) return true;
       this.#consume(item);
       return false;
     });
@@ -1395,6 +1495,8 @@ export class MainAgentController implements FabricMainAgentTarget {
       if (this.#inboxFence && !this.#inboxFence.owns(item.id)) continue;
       if (delivered.has(item.id) || delivered.has(chainOf(item)) || last.get(chainOf(item)) !== item ||
         (item.deliveryId !== undefined && this.#consumed.has(item.deliveryId))) {
+        // Reading a pre-existing native receipt while held is not permission to publish consumption.
+        if (!this.#recoveryDrainOpen()) { this.#recoveryReplayConsumed.add(item); this.#sent.push(item); continue; }
         this.#recordSuperseded(item);
         if (item.supersededSends?.length || (delivered.has(item.id) && !this.#recordOutcome(item.outcomeSend, "delivered", this.#deliveryReason(item)))) {
           this.#sent.push(item);
@@ -1406,7 +1508,7 @@ export class MainAgentController implements FabricMainAgentTarget {
       this.#recordSuperseded(item);
       last.delete(chainOf(item));                          // a duplicate id goes once
       this.#replayed.add(item.id);
-      (item.handed ? this.#unverified : this.#held).push(item);
+      (item.handed ? (item.recoveryUser || item.recoveryHandoffUncertain ? this.#sent : this.#unverified) : this.#held).push(item);
     }
     this.#trySave();
   }
@@ -1720,9 +1822,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     // well would deliver them twice. Without one, Pi's own queue takes them, as before.
     if (this.#journal) this.#trySave();
     else this.#release(true, true);
-    this.#held.splice(0);
-    this.#sent.splice(0);
-    this.#unverified.splice(0);
+    // A hold installed over a legacy no-journal drain cannot turn close into a
+    // native fallback or silently discard its pre-existing volatile queue.
+    if (this.#journal || this.#recoveryDrainOpen()) {
+      this.#held.splice(0);
+      this.#sent.splice(0);
+      this.#unverified.splice(0);
+      this.#recoveryReplayConsumed.clear();
+    }
     this.#consumed = new Set();
     this.#consumedDirty = false;
     this.#delivered = new Set();
@@ -1754,6 +1861,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #flushDue(): void {
+    if (!this.#recoveryDrainOpen()) return;
     if (!this.#held.length || this.#suspended || this.#reloading || this.#providerAttemptInFlight) return;
     if (this.#halted || this.#context?.signal?.aborted) { this.#release(false); return; }
     if (this.#providerHeld()) { this.#scheduleProviderWake(); return; }
@@ -1788,6 +1896,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** Send the first count held items as one message; they leave the queue only once it is sent. */
   #handOver(count: number, deliverAs: FabricMainAgentDelivery, triggerTurn: boolean, flushed: boolean): boolean {
+    if (!this.#recoveryDrainOpen()) return false;
     // smarty-dev#1826: an item that cannot be rendered fails every retry and, first in the queue,
     // holds every later followUp. It leaves the queue, with a report; the rest go. A failure of
     // Pi's queue itself keeps them all for the next boundary.
@@ -1816,11 +1925,22 @@ export class MainAgentController implements FabricMainAgentTarget {
       const different = this.#held.slice(0, count).findIndex(item => JSON.stringify(this.#provenance(item)) !== key);
       if (different > 0) count = different;
     }
+    // Composer input keeps its native user route and cannot be batched into an agent envelope.
+    const userBoundary = this.#held.slice(0, count).findIndex(item => item.recoveryUser !== undefined);
+    if (userBoundary >= 0) count = userBoundary === 0 ? 1 : userBoundary;
     const batch = this.#held.slice(0, count);
     try {
       this.#send(batch, deliverAs, triggerTurn, flushed);
     } catch {
-      return false;                                      // kept; the next boundary or release retries
+      // A native void call may throw after enqueueing. With recovery installed, its
+      // durable attempt marker is ambiguous, NOT permission to submit again on open.
+      if (this.#recoveryDrainPredicate && batch.every(item => item.handed)) {
+        for (const item of batch) item.recoveryHandoffUncertain = true;
+        this.#held.splice(0, count);
+        this.#sent.push(...batch);
+        this.#trySave();
+      }
+      return false;                                      // an unattempted handoff remains held
     }
     this.#held.splice(0, count);
     for (const item of batch) item.handed = true;
@@ -1830,6 +1950,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #wakeWhenIdle(): void {
+    if (!this.#recoveryDrainOpen()) return;
     // Pi leaves its busy state only after every handler of the event has finished, which can
     // take any time (review/astra F2 on pi-fabric#102): wait for idle, not one tick. A release
     // or a new run ends the wait; a cancelled or failed operation releases without a run.
@@ -1843,6 +1964,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Retain cancellation evidence while later completion handlers still run.
     this.#wake = setInterval(() => {
       if (this.#contextRetired()) return;
+      if (!this.#recoveryDrainOpen()) { this.#stopWake(); return; }
       // Drain-off uses #closed to stop holding, not to end a manual operation. Close
       // itself cancels this timer; only the real idle boundary retires its signal.
       if (!this.#context || !operation?.signal || operation.signal.aborted) {
@@ -1858,6 +1980,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #wakeAfterPreflight(): void {
+    if (!this.#recoveryDrainOpen()) return;
     // Handled input and failed validation clear isPromptPending without any run/settle
     // event. Observe that completion only after admission is journalled. If a run starts,
     // leave FIFO delivery to its boundaries; halt/reload/close cancel this waiter too.
@@ -1870,6 +1993,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     const operation = this.#operation;
     this.#preflightWake = setInterval(() => {
       if (this.#contextRetired()) return;
+      if (!this.#recoveryDrainOpen()) { this.#stopWake(); return; }
       if (isCompactionCancelled(operation?.signal)) { this.#stopWake(); return; }
       const ctx = this.#context;
       // A no-run preflight may also leave an async compaction handler finishing. Busy
@@ -1977,6 +2101,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #scheduleProviderWake(): void {
+    if (!this.#recoveryDrainOpen()) return;
     // #closed also means the ordinary busy drain is disabled. Backoff holds work in both modes.
     // A non-retryable incident never schedules a timed retry (smarty-dev#8742).
     if (this.#providerDead || this.#providerWake || this.#providerAttemptInFlight || !this.#context || this.#reloading || this.#halted ||
@@ -2079,6 +2204,7 @@ export class MainAgentController implements FabricMainAgentTarget {
    * attempt is already in flight and needs neither timer; owner input ends the incident.
    */
   #armProviderDeadTimer(): void {
+    if (!this.#recoveryDrainOpen()) return;
     const phase = this.#providerDead?.phase;
     if (phase !== "recovering" && phase !== "probation") return;
     if (phase === "probation" && this.#providerAttemptInFlight) return;
@@ -2143,6 +2269,7 @@ export class MainAgentController implements FabricMainAgentTarget {
 
   /** The same path a human /compact takes; compaction extensions may drop provider-bound blocks. */
   #compactForRecovery(dead: ProviderDeadState, ctx: ExtensionContext): void {
+    if (!this.#recoveryDrainOpen()) return;
     this.#stopProviderDeadDeadline();
     dead.phase = "compacting";
     this.#providerStateDirty = true;
@@ -2152,7 +2279,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     // a stale ctx retires only a stale current binding (#contextRetired), never a live successor.
     const fresh = (): boolean => {
       if (!extensionContextLive(ctx)) { this.#contextRetired(); return false; }
-      return this.#providerDead === dead && this.#bindingsLive && !this.#reloading;
+      return this.#recoveryDrainOpen() && this.#providerDead === dead && this.#bindingsLive && !this.#reloading;
     };
     const failed = (): void => {
       if (!fresh() || this.#halted || dead.phase !== "compacting") return;
@@ -2160,6 +2287,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     };
     try {
       // Pi calls onComplete after its compaction state is cleared: the idle edge for the one attempt.
+      if (!this.#recoveryDrainOpen()) return;
       ctx.compact({ onComplete: () => { if (fresh()) { this.#providerCompacted(); this.#armProviderDeadTimer(); } }, onError: failed });
     } catch {
       failed();
@@ -2183,7 +2311,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #attemptAfterCompaction(): void {
-    if (this.#providerAttemptInFlight) return;
+    if (!this.#recoveryDrainOpen() || this.#providerAttemptInFlight) return;
     if (this.#held.some(item => item.deliverAs !== "nextTurn" && (item.triggerTurn ?? true))) {
       this.#release(true);                               // held work goes first, as one attempt
       if (this.#providerAttemptInFlight) this.#stopProviderDeadDeadline();
@@ -2195,6 +2323,13 @@ export class MainAgentController implements FabricMainAgentTarget {
     this.#providerStateDirty = true;
     this.#trySave(true);
     try {
+      if (!this.#recoveryDrainOpen()) {
+        this.#providerAttemptInFlight = false;
+        if (this.#providerDead) delete this.#providerDead.attemptStarted;
+        this.#providerStateDirty = true;
+        this.#trySave(true);
+        return;
+      }
       sendFabricMessage(this.pi, {
         customType: "pi-fabric-provider-retry", display: true,
         content: "Continue the interrupted turn: the provider rejected the previous request as non-retryable, and Fabric compacted the session once to recover. This is Fabric's one automatic retry.",
@@ -2287,7 +2422,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #release(triggerTurn: boolean, closing = false): void {
-    if (this.#reloading) return;
+    if (!this.#recoveryDrainOpen() || this.#reloading) return;
     if (!closing && triggerTurn && !this.#halted && !this.#context?.signal?.aborted && this.#context && promptPending(this.#context)) {
       this.#wakeAfterPreflight();
       return;
@@ -2330,6 +2465,7 @@ export class MainAgentController implements FabricMainAgentTarget {
   }
 
   #releaseQueue(triggerTurn: boolean, singleWake = false): void {
+    if (!this.#recoveryDrainOpen()) return;
     // In byte/provenance-bounded messages, oldest first; a failed send keeps the rest.
     while (this.#held.length) {
       const first = this.#held[0]!;
@@ -2370,6 +2506,7 @@ export class MainAgentController implements FabricMainAgentTarget {
     flushed: boolean,
     peerSteer = false,
   ): boolean | undefined {
+    this.#assertRecoveryDrainOpen();
     items = items.filter(item => !this.#inboxFence || this.#inboxFence.owns(item.id));
     if (this.#reloading || !items.length || (this.#inboxFence && !this.#inboxFence.active())) return false;
     const interrupt = this.#context?.isIdle() === true && items.every(item => this.#interrupts.has(item.id));
@@ -2406,8 +2543,18 @@ export class MainAgentController implements FabricMainAgentTarget {
     const provenance = this.#provenance(first);
     const options = { deliverAs, triggerTurn };
     const triggered = !triggerTurn || deliverAs === "nextTurn" ? false : this.#context?.isIdle();
-    this.pi.sendMessage(
-      fabricWakeMessage(this.pi, {
+    if (first.recoveryUser) {
+      this.#assertRecoveryDrainOpen();
+      first.handed = true;
+      this.#save();
+      if (!this.#recoveryDrainOpen()) { delete first.handed; this.#save(); this.#assertRecoveryDrainOpen(); }
+      const user = first.recoveryUser;
+      const options = { deliverAs: deliverAs === "steer" ? "steer" as const : "followUp" as const };
+      if (user.from) sendFabricUserMessage(this.pi, first.message, user.from, options.deliverAs, options, user.verification);
+      else this.pi.sendUserMessage(first.message, options);
+      return triggered;
+    }
+    const nativeMessage = fabricWakeMessage(this.pi, {
         customType: "pi-fabric-agent-message",
         content: [
           ...(flushed
@@ -2430,9 +2577,24 @@ export class MainAgentController implements FabricMainAgentTarget {
         (!item.provenance || item.unattributedOnReplay === true)
         ? [{ cause: "unattributed" as const }]
         : item.wakeCauses ?? [item.wakeCause ?? mainWakeCause(item.from, item.source, delivery,
-          item.admissionTopic, item.admissionKey ?? item.deliveryId)])),
-      provenance ? fabricProvenanceOptions(this.pi, options, provenance) : options,
-    );
+          item.admissionTopic, item.admissionKey ?? item.deliveryId)]));
+    const nativeOptions = provenance ? fabricProvenanceOptions(this.pi, options, provenance) : options;
+    this.#assertRecoveryDrainOpen();
+    // Retain a native attempt before the void API: a throw may still have queued it.
+    if (this.#recoveryDrainPredicate) {
+      for (const item of items) item.handed = true;
+      try { this.#save(); } catch (error) {
+        for (const item of items) delete item.handed;
+        throw error;
+      }
+      // Receipt/provenance callbacks and the journal barrier may have closed the epoch.
+      if (!this.#recoveryDrainOpen()) {
+        for (const item of items) delete item.handed;
+        this.#save();
+        this.#assertRecoveryDrainOpen();
+      }
+    }
+    this.pi.sendMessage(nativeMessage, nativeOptions);
     // A fresh delivery can win the deadline without going through #releaseQueue. It is
     // still the one retry attempt; later peer wakes must wait for its actual outcome.
     if (triggerTurn && deliverAs !== "nextTurn" && this.#providerFailed) {

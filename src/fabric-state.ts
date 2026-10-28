@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { SessionRecoveryActivation } from "./recovery/l7-interfaces.js";
 import { configureFabricDiagnostics, diagnostics, notifyDiagnostic } from "./core/diagnostics.js";
 import type { RootInboxBatch, RootInboxSession, RootInboxReconcileOptions } from "./topology/root-inbox-shared.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
@@ -92,6 +93,7 @@ type ActivationFailureHook = () => void | Promise<void>;
 
 export class FabricState {
   #runtime: FabricRuntimeState | undefined;
+  #sessionRecovery: SessionRecoveryActivation | undefined;
   #activatingRuntime: FabricRuntimeState | undefined;
   #activation: Promise<FabricRuntimeState> | undefined;
   #recordsWake: (() => Promise<void>) | undefined;
@@ -240,6 +242,18 @@ export class FabricState {
     this.#activationHook = hook;
     this.#activationFailureHook = onFailure;
     this.#deactivationHook = onDeactivate;
+  }
+
+  assertSessionRecoveryActive(): void {
+    const runtime = this.#current();
+    if (!runtime) throw new Error("Portable session recovery has not activated its owner lease");
+    runtime.assertSessionRecoveryActive();
+  }
+
+  /** Set before bootstrap can reactivate a retained runtime. Cleared on ordinary session start. */
+  setSessionRecovery(activation: SessionRecoveryActivation | undefined): void {
+    this.#sessionRecovery = activation;
+    this.#current()?.setSessionRecovery(activation);
   }
 
   async bootstrap(context: ExtensionContext): Promise<void> {
@@ -758,6 +772,7 @@ export class FabricState {
         ...(this.#options.paths ? { paths: this.#options.paths } : {}),
         ...(this.#entryIdentity ? { entryIdentity: this.#entryIdentity } : {}),
         foregroundTools: () => this.foregroundTools().tools,
+        ...(this.#sessionRecovery ? { sessionRecovery: this.#sessionRecovery } : {}),
       },
     );
   }

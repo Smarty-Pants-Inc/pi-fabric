@@ -898,6 +898,10 @@ export class MeshStore {
     return this.#events.nextEventAfter(after);
   }
 
+  nextEventAfterAsync(after: number): Promise<MeshEvent | undefined> {
+    return this.#events.nextEventAfterAsync(after);
+  }
+
   oldestSequence(): number | undefined {
     return this.#events.oldestSequence();
   }

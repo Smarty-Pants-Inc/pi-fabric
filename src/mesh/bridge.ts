@@ -985,7 +985,7 @@ export class StoreBridgeSide implements BridgeSide {
       // is harmless unless the store actually holds an event inside the gap.
       const first = page.events.find(event => event.sequence > after);
       const gap = first !== undefined && first.sequence > after + 1 &&
-        (this.store.nextEventAfter(after)?.sequence ?? Infinity) < first.sequence;
+        ((await this.store.nextEventAfterAsync(after))?.sequence ?? Infinity) < first.sequence;
       if (!gap && meshCursorGeneration(page.nextOffset) === meshCursorGeneration(offset) && page.nextOffset >= offset) {
         return this.#page(page.events, after, pageBytes, { start: offset, cursors: page.cursors ?? [], end: page.nextOffset });
       }

@@ -110,6 +110,13 @@ export interface MeshTailResult {
   cursors?: number[];
 }
 
+interface EventReadInput {
+  after?: number;
+  topic?: string;
+  to?: string;
+  limit?: number;
+}
+
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const DEFAULT_MAX_EVENT_LOG_BYTES = 64 * 1024 * 1024;
 const DEFAULT_RETAINED_EVENT_LOG_BYTES = 16 * 1024 * 1024;
@@ -1109,22 +1116,39 @@ export class EventLog {
       data: typeof input.data === "function" || input.data === undefined ? input.data : jsonClone(input.data) };
   }
 
-  read(
-    input: {
-      after?: number;
-      topic?: string;
-      to?: string;
-      limit?: number;
-    } = {},
-  ): MeshEvent[] {
-    if (input.topic !== undefined) this.#validateTopic(input.topic);
-    const limit = Math.max(1, Math.min(Math.floor(input.limit ?? 100), this.maxReadEvents));
-    const after = input.after === undefined ? undefined : Math.max(0, Math.floor(input.after));
+  read(input: EventReadInput = {}): MeshEvent[] {
+    const { after, limit, filter } = this.#prepareRead(input);
     const events =
       after === undefined
-        ? this.#readRecentEvents(input, limit)
-        : this.#readArchivedAfter(after, input, limit) ?? this.#readEventsAfter(after, input, limit);
+        ? this.#readRecentEvents(filter, limit)
+        : this.#readArchivedAfter(after, filter, limit) ?? this.#readEventsAfter(after, filter, limit);
     return events.map((event) => jsonClone(event));
+  }
+
+  /** Same cursor/filter semantics as read(), with archive I/O yielding between chunks. */
+  async readAsync(input: EventReadInput = {}): Promise<MeshEvent[]> {
+    const { after, limit, filter } = this.#prepareRead(input);
+    let events: MeshEvent[];
+    if (after === undefined) events = this.#readRecentEvents(filter, limit);
+    else {
+      const archive = this.#archiveForReadAfter(after);
+      const archived = archive && await archive.readAfterAsync(
+        after, this.#readLastEventSequence(), (event) => this.#eventMatches(event, filter), limit, filter.topic,
+      );
+      events = archived?.length ? archived : this.#readEventsAfter(after, filter, limit);
+    }
+    return events.map((event) => jsonClone(event));
+  }
+
+  #prepareRead(input: EventReadInput): { after: number | undefined; limit: number; filter: EventReadInput } {
+    // Capture caller-owned options before asynchronous archive reads can yield.
+    const filter = { ...input };
+    if (filter.topic !== undefined) this.#validateTopic(filter.topic);
+    return {
+      after: filter.after === undefined ? undefined : Math.max(0, Math.floor(filter.after)),
+      limit: Math.max(1, Math.min(Math.floor(filter.limit ?? 100), this.maxReadEvents)),
+      filter,
+    };
   }
 
   /**
@@ -1153,7 +1177,8 @@ export class EventLog {
 
   // A cursor older than the live log reads the archive, which holds every event since it was
   // set (smarty-dev#754). The oldest live sequence changes only when the log is rewritten.
-  #readArchivedAfter(after: number, input: { topic?: string; to?: string }, limit: number): MeshEvent[] | undefined {
+  // Both read APIs use the same generation/inode cache and archive admission boundary.
+  #archiveForReadAfter(after: number): MeshArchive | undefined {
     let identity: string;
     try {
       const stat = fs.statSync(this.#eventsPath);
@@ -1165,7 +1190,11 @@ export class EventLog {
     if (this.#oldestLive?.identity !== identity) this.#oldestLive = { identity, sequence: this.oldestSequence() };
     const oldest = this.#oldestLive.sequence;
     if (oldest === undefined || after + 1 >= oldest) return undefined;
-    const archived = MeshArchive.fromRoot(this.root)
+    return MeshArchive.fromRoot(this.root);
+  }
+
+  #readArchivedAfter(after: number, input: { topic?: string; to?: string }, limit: number): MeshEvent[] | undefined {
+    const archived = this.#archiveForReadAfter(after)
       ?.readAfter(after, this.#readLastEventSequence(), (event) => this.#eventMatches(event, input), limit, input.topic);
     return archived?.length ? archived : undefined;
   }

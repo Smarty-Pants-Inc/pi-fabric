@@ -936,9 +936,11 @@ const mirrorMeshJournalLine = (line: string): void => {
     child.stdin.end(`${line}\n`);
   } catch (error) { fail(error); }
 };
-export const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLine>[0]): void => {
+const meshDiagnostic = (line: string): void => diagnostics.warn("src/core/atomic-write.ts", line);
+export const emitMeshJournalAlarm = (alarm: Parameters<typeof meshJournalAlarmLine>[0],
+  diagnostic = meshDiagnostic): void => {
   const line = meshJournalAlarmLine(alarm);
-  diagnostics.warn("src/core/atomic-write.ts", line);
+  diagnostic(line);
   mirrorMeshJournalLine(line);
 };
 
@@ -987,7 +989,12 @@ export class MeshBackgroundRetry {
   #undeliverableReported = false;
   #alarm: ((alarm: MeshOutageAlarm) => Promise<unknown> | void) | undefined;
   #alarmAfterMs = MESH_OUTAGE_ALARM_AFTER_MS;
-  /** Where this path's outage alarm goes (the owner's mesh publish). The stderr line is written regardless.
+  #diagnostic = meshDiagnostic;
+  diagnosticsTo(sink: (line: string) => void): this {
+    this.#diagnostic = line => { try { sink(line); } catch { /* Diagnostics never break background work. */ } };
+    return this;
+  }
+  /** Where this path's outage alarm goes (the owner's mesh publish). The diagnostic line is written regardless.
    * `afterMs`: the outage bound (tests shorten it). */
   alarmsTo(sink: (alarm: MeshOutageAlarm) => Promise<unknown> | void, afterMs = MESH_OUTAGE_ALARM_AFTER_MS): this {
     this.#alarm = sink;
@@ -1006,7 +1013,7 @@ export class MeshBackgroundRetry {
   }
   #raise(alarm: MeshOutageAlarm): void {
     // The independent sink: one structured line, written at alarm time whatever the mesh does.
-    emitMeshJournalAlarm({ ...alarm });
+    emitMeshJournalAlarm({ ...alarm }, this.#diagnostic);
     if (this.#alarm) {
       this.#pendingAlarms.push({ alarm, attempts: 0, firstAt: performance.now() });
       while (this.#pendingAlarms.length > MESH_ALARM_QUEUE_MAX) { this.#pendingAlarms.shift(); this.#droppedOverflow++; this.#reportUndeliverable(); }
@@ -1018,7 +1025,7 @@ export class MeshBackgroundRetry {
     if (this.#undeliverableReported) return;
     this.#undeliverableReported = true;
     emitMeshJournalAlarm({ label: this.label, state: "outage", sinceMs: Date.now(), reason: "mesh-alarm-undeliverable",
-      droppedOverflow: this.#droppedOverflow, droppedAfterRetries: this.#droppedExhausted, queued: this.#pendingAlarms.length });
+      droppedOverflow: this.#droppedOverflow, droppedAfterRetries: this.#droppedExhausted, queued: this.#pendingAlarms.length }, this.#diagnostic);
   }
   /** Remove `head` by identity (pi-fabric#893 Astra P1): while its publish was awaited, an overflow in #raise may
    * already have dropped (and counted) it, and the queue's first entry is then the NEXT, unattempted event. */
@@ -1101,7 +1108,7 @@ export class MeshBackgroundRetry {
     // Final summary: retries suppressed after the last line are reported once the window
     // has passed, so an outage that ends inside a window is not silently dropped. It takes
     // that window's single line; a later outage inside it is counted, not printed.
-    diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ${this.label}: ${this.#recoveryMessage} (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
+    this.#diagnostic(`[pi-fabric] ${this.label}: ${this.#recoveryMessage} (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)`);
     this.#lastReportedAt = now;
     this.#suppressed = 0;
   }
@@ -1118,7 +1125,7 @@ export class MeshBackgroundRetry {
         return false;
       }
       this.#resetBackoff();
-      diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ${this.label}: background operation failed: ${message}`);
+      this.#diagnostic(`[pi-fabric] ${this.label}: background operation failed: ${message}`);
       return false;
     }
     this.#delay = Math.min(this.maxMs, Math.max(this.minMs, this.#delay * 2));
@@ -1146,7 +1153,7 @@ export class MeshBackgroundRetry {
     if (elapsedMs >= this.warningWindowMs) {
       const summary = this.#suppressed > 0
         ? ` (${this.#suppressed} similar retries suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
-      diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ${this.label}: ${refusal ?? (isMeshLockTimeout(error) ? "mesh lock timeout" : "mesh WAL cap")}; retrying in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
+      this.#diagnostic(`[pi-fabric] ${this.label}: ${refusal ?? (isMeshLockTimeout(error) ? "mesh lock timeout" : "mesh WAL cap")}; retrying in ${delayMs} ms: ${meshDeferredSummary(error)}${summary}`);
       this.#lastReportedAt = now;
       this.#suppressed = 0;
     } else {
@@ -1167,7 +1174,7 @@ export class MeshBackgroundRetry {
     }
     const summary = this.#failureSuppressed > 0
       ? ` (${this.#failureSuppressed} similar failures suppressed in the last ${Math.floor(elapsedMs / 1_000)}s)` : "";
-    diagnostics.warn("src/core/atomic-write.ts", `[pi-fabric] ${this.label}: background operation failed: ${message}; retrying in ${this.#failureDelay} ms${summary}`);
+    this.#diagnostic(`[pi-fabric] ${this.label}: background operation failed: ${message}; retrying in ${this.#failureDelay} ms${summary}`);
     this.#failureMessage = message;
     this.#failureReportedAt = now;
     this.#failureSuppressed = 0;

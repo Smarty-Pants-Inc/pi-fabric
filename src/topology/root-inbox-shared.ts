@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { confirmedSessionReceiptSnapshot, type SessionReceiptManager } from "../core/session-receipts.js";
 import type { MeshEvent } from "../mesh/store.js";
 
@@ -86,6 +86,51 @@ export const rootInboxCarrierDigest = (carrier: unknown): string => {
     ? content.map(part => part && typeof part === "object" && part.type === "text" && typeof part.text === "string"
       ? part.text : { part }) : [];
   return createHash("sha256").update(JSON.stringify(rendered)).digest("hex");
+};
+
+/** Private custody follows a live host manager, never serialized history. */
+export interface RootInboxReceiptIssuer {
+  readonly sessionId: string;
+  readonly receipts: Map<string, RootInboxReceiptSnapshot>;
+  readonly consumed: WeakSet<RootInboxReceiptSnapshot>;
+  readonly queued: Map<string, number>;
+  turn: number;
+}
+const ISSUERS_KEY = Symbol.for("pi-fabric.rootInboxReceiptIssuers.v1");
+/** Only same-manager/session reloads inherit custody. Omitted identity releases old authority. */
+export const rootInboxReceiptIssuer = (manager?: object, sessionId = "", reload = false): RootInboxReceiptIssuer => {
+  const host = globalThis as typeof globalThis & { [ISSUERS_KEY]?: WeakMap<object, RootInboxReceiptIssuer> };
+  const resident = host[ISSUERS_KEY] ??= new WeakMap();
+  const previous = manager ? resident.get(manager) : undefined;
+  if (reload && previous?.sessionId === sessionId) return previous;
+  const issuer = { sessionId, receipts: new Map(), consumed: new WeakSet(), queued: new Map(), turn: 0 };
+  if (manager) resident.set(manager, issuer);
+  return issuer;
+};
+export const registerRootInboxReceipt = (issuer: RootInboxReceiptIssuer, details: object, content: unknown): void => {
+  const strings = (value: unknown): string[] => Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string") : [];
+  const fields = details as { ids?: unknown; receipts?: unknown; nonce?: unknown };
+  const snapshot: RootInboxReceiptSnapshot = Object.freeze({
+    ids: Object.freeze(strings(fields.ids)), receipts: Object.freeze(strings(fields.receipts)),
+    digest: rootInboxCarrierDigest({ content }),
+  });
+  const nonce = randomUUID();
+  fields.nonce = nonce;
+  issuer.receipts.set(nonce, snapshot);
+  while (issuer.receipts.size > 2_048) issuer.receipts.delete(issuer.receipts.keys().next().value!);
+};
+/** Detached carriers resolve only to the private shown-only snapshot. */
+export const verifyRootInboxReceipt = (
+  issuer: RootInboxReceiptIssuer, details: unknown, carrier: unknown, accepted: Set<string>,
+): RootInboxReceiptSnapshot | undefined => {
+  if (!details || typeof details !== "object") return undefined;
+  const nonce = (details as { nonce?: unknown }).nonce;
+  if (typeof nonce !== "string" || accepted.has(nonce)) return undefined;
+  const snapshot = issuer.receipts.get(nonce);
+  if (!snapshot || snapshot.digest !== rootInboxCarrierDigest(carrier)) return undefined;
+  accepted.add(nonce);
+  return snapshot;
 };
 
 const trimmedField = (data: unknown, field: string): string | undefined => {
@@ -253,7 +298,7 @@ export const confirmedRootInboxSession = (
 
 /** A receipt snapshot of canonical entries; async inbox reads must not retain the history.
  * Batch presence retains its compatibility lookback; delivery identity does not. Unsigned inbox
- * carriers are intentionally fail-open: only the live issuer verifier may grant inbox authority. */
+ * carriers are intentionally fail-open: only a private resident issuer verifier may grant authority. */
 export const rootInboxSession = (
   entries: readonly unknown[], lookbackOrVerifier: number | RootInboxReceiptVerifier = 500,
   verifier?: RootInboxReceiptVerifier,

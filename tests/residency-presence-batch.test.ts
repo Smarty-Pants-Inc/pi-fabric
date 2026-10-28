@@ -9,6 +9,7 @@ import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import { ActorDirectory } from "../src/actors/directory.js";
 import { ActorBindingStore } from "../src/actors/binding-store.js";
 import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
+import { flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ResidentHost } from "../src/residency/host.js";
 import { residentRoot, type ResidentHostConfig } from "../src/residency/protocol.js";
@@ -20,13 +21,25 @@ const roots: string[] = [], hosts: ResidentHost[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(hosts.splice(0).map(host => host.close()));
+  await flushFabricDiagnostics();
+  vi.unstubAllEnvs();
   Object.defineProperty(process, "platform", nativePlatform);
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 const participantKey = (id: string) => "topology/participants/" + createHash("sha256").update(id).digest("hex");
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const retryDiagnostics = async (root: string): Promise<Array<{ level: string; message: string }>> => {
+  await flushFabricDiagnostics();
+  const directory = path.join(root, "profile", "fabric", "diagnostics");
+  return fs.existsSync(directory) ? fs.readdirSync(directory).filter(file => file.endsWith(".jsonl"))
+    .flatMap(file => fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)))
+    : [];
+};
 const fixture = async (files = false, count = 40) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-presence-batch-")); roots.push(root);
+  vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "profile"));
+  vi.stubEnv("PI_FABRIC_SESSION_ID", undefined);
+  vi.stubEnv("SMARTY_ROLE", "worktree-agent");
   const config: ResidentHostConfig = {
     format: 1, rootId: "session:absent-main", sessionId: "absent-main", cwd: root, projectRoot: root,
     meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"),
@@ -370,7 +383,7 @@ describe("#4383 resident host presence batch", () => {
   });
 
   it("does not spawn per-actor or change-triggered retries after a timed-out heartbeat", async () => {
-    const { host, records } = await fixture();
+    const { host, records, root } = await fixture();
     let releaseRecovery!: () => void;
     const recoveryGate = new Promise<void>(resolve => { releaseRecovery = resolve; });
     const recovery = vi.spyOn(host.participants.options, "waitForPublicationRetry").mockImplementation(() => recoveryGate);
@@ -398,15 +411,20 @@ describe("#4383 resident host presence batch", () => {
       expect(batch).toHaveBeenCalledOnce();
       expect(recovery).toHaveBeenCalledOnce();
       releaseRecovery();
-      expect(warn.mock.calls.flat().join("\n")).not.toContain("actor presence");
+      const diagnostics = await retryDiagnostics(root);
+      // This failure belongs to the foreground refresh, not a background retry.
+      // It must not cause a per-actor warning in either sink.
+      expect(JSON.stringify(diagnostics)).not.toMatch(/actor presence|Actor presence omitted/);
       await host.participants.refresh();
       expect(batch).toHaveBeenCalledTimes(2);
       expect(batch.mock.calls[1]![0].ops.filter(op => op.key.startsWith("actors/"))).toHaveLength(40);
+      expect(await retryDiagnostics(root)).toEqual(diagnostics);
+      expect(warn).not.toHaveBeenCalled();
     } finally { release(); releaseRecovery(); await changing.catch(() => undefined); await refreshing.catch(() => undefined); }
   });
 
   it("does not turn a failed change round into a second full heartbeat for its waiters", async () => {
-    const { host, records } = await fixture();
+    const { host, records, root } = await fixture();
     let releaseRecovery!: () => void;
     const recoveryGate = new Promise<void>(resolve => { releaseRecovery = resolve; });
     vi.spyOn(host.participants.options, "waitForPublicationRetry").mockImplementation(() => recoveryGate);
@@ -424,9 +442,14 @@ describe("#4383 resident host presence batch", () => {
       const waiting = expect(host.participants.refresh()).rejects.toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT" });
       release(); await waiting;
       await delay(1_100);
-      expect(batch).toHaveBeenCalledOnce(); expect(warn).toHaveBeenCalledOnce();
+      expect(batch).toHaveBeenCalledOnce();
+      const diagnostics = await retryDiagnostics(root);
+      expect(diagnostics).toEqual([expect.objectContaining({ level: "warning",
+        message: expect.stringMatching(/mesh lock timeout; retrying in \d+ ms: FABRIC_MESH_LOCK_TIMEOUT.*held by pid 123/) })]);
+      expect(warn).not.toHaveBeenCalled();
       await host.participants.refresh();
       expect(batch).toHaveBeenCalledTimes(2);
+      expect(await retryDiagnostics(root)).toEqual(diagnostics);
     } finally { releaseRecovery(); release(); mutationRefresh.mockRestore(); }
   });
 

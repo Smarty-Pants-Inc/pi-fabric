@@ -4,12 +4,12 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createHash } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agents/manager.js";
 import type { ActorManager } from "../src/actors/manager.js";
 import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
-import { diagnostics } from "../src/core/diagnostics.js";
+import { flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import type { LifecycleBroker } from "../src/lifecycle/broker.js";
 import { MainAgentController } from "../src/main-agent.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
@@ -26,10 +26,38 @@ import type { FabricParticipantRecord } from "../src/topology/types.js";
 // not a canned canConsumeMesh result. No worker, result authentication bypass,
 // production fleet root, new polling interval, or result-authentication bypass.
 const directories: ParticipantDirectory[] = [];
+let diagnosticRoot: string;
+let consoleLines: string[];
+const uiNotify = vi.fn();
+beforeEach(() => {
+  diagnosticRoot = fs.mkdtempSync(path.join(os.tmpdir(), "control-admission-diagnostics-"));
+  vi.stubEnv("PI_CODING_AGENT_DIR", diagnosticRoot);
+  vi.stubEnv("PI_FABRIC_SESSION_ID", undefined);
+  vi.stubEnv("SMARTY_ROLE", "worktree-agent");
+  consoleLines = [];
+  uiNotify.mockClear();
+  for (const method of ["warn", "error", "info", "log"] as const) {
+    vi.spyOn(console, method).mockImplementation((...args) => { consoleLines.push(args.map(String).join(" ")); });
+  }
+});
+type DiagnosticRecord = { at: string; level: string; source: string; message: string };
+const persistedDiagnostics = async (detail: string): Promise<DiagnosticRecord[]> => {
+  await flushFabricDiagnostics();
+  const directory = path.join(diagnosticRoot, "fabric", "diagnostics");
+  const records: DiagnosticRecord[] = fs.existsSync(directory) ? fs.readdirSync(directory).filter(file => file.endsWith(".jsonl"))
+    .flatMap(file => fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line))) : [];
+  return records.filter(record => record.source === "src/topology/participant-directory.ts" && record.message.includes(detail));
+};
 afterEach(async () => {
   await Promise.all(directories.splice(0).map(directory => directory.close()));
+  await flushFabricDiagnostics();
+  const leaked = consoleLines.filter(line => /isolated participant snapshot source|participant heartbeat\/change refresh:/.test(line));
   vi.restoreAllMocks();
   vi.useRealTimers();
+  vi.unstubAllEnvs();
+  fs.rmSync(diagnosticRoot, { recursive: true, force: true });
+  expect(leaked).toEqual([]);
+  expect(uiNotify).not.toHaveBeenCalled();
 });
 
 const ROOT = "session:4ddfc58b-d782-480d-88b7-51a7cbbd61ec";
@@ -54,7 +82,8 @@ const fixture = (options: Partial<ParticipantDirectoryOptions> = {}) => {
   });
   const pi = { getThinkingLevel: () => "off" } as unknown as ExtensionAPI;
   const main = new MainAgentController(pi, identity.id, true, root);
-  const extensionContext = { isIdle: () => true, hasPendingMessages: () => false } as ExtensionContext;
+  const extensionContext = { isIdle: () => true, hasPendingMessages: () => false,
+    ui: { notify: uiNotify } } as unknown as ExtensionContext;
   // Unused manager methods intentionally absent: Main diagnostics must not read
   // or authenticate any task result, even when its source is the refresh failure.
   const provider = new AgentsProvider({ cwd: root } as AgentManager,
@@ -229,11 +258,14 @@ describe("host control-admission alarm on the existing heartbeat (#17018)", () =
     s.fail(new Error(secretDetail));
     await expect(s.directory.refresh()).rejects.toThrow(secretDetail);
     await expect(s.status()).resolves.toMatchObject({ controlAdmissionReason: expect.stringContaining(secretDetail) });
-    const warning = vi.spyOn(diagnostics, "warn");
     await s.tick(since + 60_001);
     await vi.waitFor(() => expect(s.alarms()).toHaveLength(1));
     expect(JSON.stringify(s.alarms())).not.toContain(secretDetail);
-    expect(warning.mock.calls.some(args => args.some(value => String(value).includes(secretDetail)))).toBe(true);
+    // The threshold alarm keeps its existing visible warning policy; the raw
+    // retry detail must also survive in the private diagnostic journal.
+    expect(await persistedDiagnostics(secretDetail)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ level: "warning", message: expect.stringContaining(secretDetail) }),
+    ]));
   });
 
   it("does not alarm on a healthy idle Main or a recovered sub-minute gate", async () => {
@@ -258,7 +290,6 @@ const registerIsolated = (directory: ParticipantDirectory, source: ParticipantSn
 describe("explicit operational snapshot isolation, never root/publication isolation (#17018 requirement 3)", () => {
   it("keeps a cold healthy root admitted when a separate opted-in source throws, and surfaces its failure", async () => {
     const s = fixture();
-    const warning = vi.spyOn(diagnostics, "warn");
     const failure = new Error("unrelated operational source failed");
     // It is deliberately registered before the root source in the peer-label
     // prepass: use an independent directory to test both selection loops.
@@ -273,13 +304,14 @@ describe("explicit operational snapshot isolation, never root/publication isolat
     await expect(directory.refresh()).resolves.toBeUndefined();
     expect(directory.canConsumeMesh()).toBe(true);
     expect(directory.get(s.identity.id)).toMatchObject({ kind: "root", stale: false });
-    expect(warning.mock.calls.some(args => args.some(value => String(value).includes(failure.message)))).toBe(true);
+    expect(await persistedDiagnostics(failure.message)).toEqual([
+      expect.objectContaining({ level: "warning", message: expect.stringContaining(failure.message) }),
+    ]);
   });
 
   it("omits failed opted-in source records instead of trusting the previous snapshot", async () => {
     const s = fixture();
     let broken = false;
-    const warning = vi.spyOn(diagnostics, "warn");
     registerIsolated(s.directory, () => {
       if (broken) throw new Error("operational snapshot integrity failure");
       return [{ format: 1, id: "agent:unrelated", kind: "agent", rootId: s.identity.id,
@@ -294,31 +326,30 @@ describe("explicit operational snapshot isolation, never root/publication isolat
     expect(s.directory.canConsumeMesh()).toBe(true);
     expect(s.directory.get(s.identity.id)).toMatchObject({ kind: "root", stale: false });
     expect(s.directory.get("agent:unrelated")).toBeUndefined();
-    expect(warning.mock.calls.some(args => args.some(value => String(value).includes("operational snapshot integrity failure")))).toBe(true);
+    expect(await persistedDiagnostics("operational snapshot integrity failure")).toHaveLength(1);
     const status = await s.status();
     expect(status).not.toHaveProperty("controlAdmission", "gated");
   });
 
-  it("deduplicates isolated source diagnostics and rearms them after source recovery", async () => {
+  it("deduplicates persisted isolated source diagnostics and rearms them after source recovery", async () => {
     const s = fixture();
-    const warning = vi.spyOn(diagnostics, "warn");
     let broken = true, attempt = 0;
     const remove = registerIsolated(s.directory, () => {
       if (broken) throw new Error(`isolated diagnostic episode ${++attempt}`);
       return [];
     });
-    const count = () => warning.mock.calls.filter(args => args.some(value => String(value).includes("isolated diagnostic episode"))).length;
+    const count = async () => (await persistedDiagnostics("isolated diagnostic episode")).length;
     await s.directory.refresh();
     await s.directory.refresh();
-    expect(count()).toBe(1);
+    expect(await count()).toBe(1);
     broken = false;
     await s.directory.refresh();
     broken = true;
     await s.directory.refresh();
-    expect(count()).toBe(2);
+    expect(await count()).toBe(2);
     remove();
     await s.directory.refresh();
-    expect(count()).toBe(2);
+    expect(await count()).toBe(2);
   });
 
   it("keeps a non-root source fatal unless explicitly isolated", async () => {
@@ -388,7 +419,6 @@ describe("isolated source diagnostics are local health, not admission authority 
     const s = fixture();
     let broken = true, attempt = 0;
     const secret = "RAW_SOURCE_DETAIL_MUST_STAY_LOCAL";
-    const warnings = vi.spyOn(diagnostics, "warn");
     s.directory.registerSource(reportFailure => {
       if (broken) reportFailure(new Error(`${secret} ${++attempt}`), "actor:one");
       return [];
@@ -400,7 +430,7 @@ describe("isolated source diagnostics are local health, not admission authority 
     for (const id of ["main", ROOT]) await expect(s.status(id)).resolves.toMatchObject({
       controlAdmission: "admitted", isolatedSourceFailures: [expected],
     });
-    expect(warnings.mock.calls.filter(args => String(args).includes(secret))).toHaveLength(1);
+    expect(await persistedDiagnostics(secret)).toHaveLength(1);
     const alarms = () => s.mesh.read({ topic: "ops.owner", limit: 100 }).filter(event => event.kind === "fabric.participant-source.alarm");
     await vi.advanceTimersByTimeAsync(60_000);
     expect(alarms()).toHaveLength(0);
@@ -420,7 +450,7 @@ describe("isolated source diagnostics are local health, not admission authority 
     await vi.waitFor(() => expect(alarms()).toHaveLength(2));
     expect(alarms()[1]!.data).toMatchObject({ since: secondSince });
     expect(alarms()[1]!.dedupeKey).not.toBe(alarms()[0]!.dedupeKey);
-    expect(warnings.mock.calls.filter(args => String(args).includes(secret))).toHaveLength(2);
+    expect(await persistedDiagnostics(secret)).toHaveLength(2);
   });
 
   it("keeps sources independent, clears only recovered diagnostics, and bounds the local array", async () => {
@@ -430,15 +460,18 @@ describe("isolated source diagnostics are local health, not admission authority 
     const remove = s.directory.registerSource(() => { throw new Error("second"); }, { isolateErrors: true, name: "second" });
     await s.directory.refresh();
     expect(s.directory.isolatedSourceFailures().map(failure => failure.source)).toEqual(["first", "second"]);
+    expect(await persistedDiagnostics("snapshot source first failed")).toHaveLength(1);
+    expect(await persistedDiagnostics("snapshot source second failed")).toHaveLength(1);
     firstBroken = false;
     await s.directory.refresh();
     expect(s.directory.isolatedSourceFailures().map(failure => failure.source)).toEqual(["second"]);
+    expect(await persistedDiagnostics("snapshot source second failed")).toHaveLength(1);
     remove();
     expect(s.directory.isolatedSourceFailures()).toEqual([]);
-    vi.spyOn(diagnostics, "warn").mockImplementation(() => {});
     for (let i = 0; i < 101; i++) s.directory.registerSource(() => { throw new Error("outage"); }, { isolateErrors: true, name: `source-${i}` });
     await s.directory.refresh();
     expect(s.directory.isolatedSourceFailures()).toHaveLength(100);
+    expect(await persistedDiagnostics("omitting failed records: outage")).toHaveLength(101);
     expect(s.directory.canConsumeMesh()).toBe(true);
   });
 

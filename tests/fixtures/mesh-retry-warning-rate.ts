@@ -1,15 +1,18 @@
-// Real-path probe for smarty-dev#8305: a real ParticipantDirectory heartbeat loop, real mesh
-// lock files held by this process, real timers. Records every console.warn with its wall time
+// Real-path probe: a real ParticipantDirectory heartbeat loop, real mesh lock files held
+// by this process, and real timers. Reads private persisted diagnostics with their wall times
 // and prints one RATE line for tests/mesh-background-retry-log-rate.test.ts to judge.
 import fs from "node:fs";
 import path from "node:path";
 import { isMeshLockTimeout, MeshBackgroundRetry } from "../../src/core/atomic-write.js";
+import { flushFabricDiagnostics } from "../../src/core/diagnostics.js";
 import { MeshStore } from "../../src/mesh/store.js";
 import { ParticipantDirectory } from "../../src/topology/participant-directory.js";
 import type { FabricParticipantInfo } from "../../src/topology/types.js";
 
 const root = process.argv[2]!;
 process.env.PI_CODING_AGENT_DIR = path.join(root, "agent");
+process.env.SMARTY_ROLE = "worktree-agent";
+delete process.env.PI_FABRIC_SESSION_ID;
 process.env.PI_FABRIC_PROJECT_ROOT = root;
 process.env.PI_FABRIC_MESH_ROOT = path.join(root, "mesh");
 process.env.PI_FABRIC_RUN_ROOT = path.join(root, "runs");
@@ -17,11 +20,13 @@ const windowMs = Number(process.env.PI_FABRIC_MESH_RETRY_WARNING_WINDOW_MS);
 const label = "participant heartbeat/change refresh";
 const startedAt = Date.now();
 
-const lines: Array<{ at: number; text: string }> = [];
-const warn = console.warn.bind(console);
-console.warn = (...args: unknown[]) => {
-  lines.push({ at: Date.now() - startedAt, text: args.map(String).join(" ") });
-  warn(...args);
+type DiagnosticRecord = { at: string; source: string; level: string; message: string };
+const lines = () => {
+  const directory = path.join(root, "agent", "fabric", "diagnostics");
+  const records: DiagnosticRecord[] = fs.existsSync(directory) ? fs.readdirSync(directory).filter(file => file.endsWith(".jsonl"))
+    .flatMap(file => fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line))) : [];
+  return records.map(record => ({ at: Date.parse(record.at) - startedAt, text: record.message,
+    source: record.source, level: record.level }));
 };
 // Observation only: count this path's typed lock timeouts and confirmed acquisitions.
 let timeouts = 0, acquisitions = 0;
@@ -40,7 +45,7 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const until = async (what: string, check: () => boolean, ms = 15_000) => {
   const deadline = Date.now() + ms;
   while (!check()) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}: ${JSON.stringify({ timeouts, acquisitions, lines })}`);
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}: ${JSON.stringify({ timeouts, acquisitions, lines: lines() })}`);
     await sleep(10);
   }
 };
@@ -61,8 +66,8 @@ const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: identi
 directory.registerSource(() => [record]);
 await directory.start();
 
-const retryLines = () => lines.filter(line => line.text.startsWith(`[pi-fabric] ${label}: mesh lock timeout; retrying`));
-const suppressed = () => lines.reduce((sum, line) => sum + Number(/\((\d+) similar retries suppressed/.exec(line.text)?.[1] ?? 0), 0);
+const retryLines = () => lines().filter(line => line.text.startsWith(`[pi-fabric] ${label}: mesh lock timeout; retrying`));
+const suppressed = () => lines().reduce((sum, line) => sum + Number(/\((\d+) similar retries suppressed/.exec(line.text)?.[1] ?? 0), 0);
 let outages = 0;
 // One short outage: the heartbeat times out on the held lock, then recovers with a real acquisition.
 const shortOutage = async () => {
@@ -90,4 +95,5 @@ for (let extra = 0; extra < 3 && timeouts === retryLines().length + suppressed()
 // The final summary arrives with the first real acquisition after the window.
 await until("the final summary", () => timeouts === retryLines().length + suppressed(), windowMs + 15_000);
 await directory.close();
-console.log(`RATE ${JSON.stringify({ windowMs, pid: process.pid, outages, timeouts, acquisitions, lines })}`);
+await flushFabricDiagnostics();
+console.log(`RATE ${JSON.stringify({ windowMs, pid: process.pid, outages, timeouts, acquisitions, lines: lines() })}`);

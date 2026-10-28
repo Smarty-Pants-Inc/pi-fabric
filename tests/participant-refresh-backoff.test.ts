@@ -1,9 +1,12 @@
+import childProcess from "node:child_process";
+import { PassThrough } from "node:stream";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshBackgroundRetry, MeshLockTimeoutError } from "../src/core/atomic-write.js";
-import { MeshStore } from "../src/mesh/store.js";
+import { configureFabricDiagnostics, fabricDiagnosticsFile, flushFabricDiagnostics, logDiagnostic } from "../src/core/diagnostics.js";
+import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, meshOutageAlarmSink, MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 
@@ -17,6 +20,8 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   await Promise.all(directories.splice(0).map(directory => directory.close()));
+  await flushFabricDiagnostics();
+  vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -53,6 +58,49 @@ describe("background failure backoff (opt-in)", () => {
     expect(await retry.run(() => { throw new MeshLockTimeoutError("", 1, 1); }, false)).toBe("retry");
   });
 
+  it("keeps private retry diagnostics plus outage/recovery journal mirrors and real mesh alarms", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "participant-private-alarm-"));
+    roots.push(root);
+    vi.stubEnv("SMARTY_ROLE", "worktree-agent@x");
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+    vi.stubEnv("JOURNAL_STREAM", undefined);
+    configureFabricDiagnostics("participant-private-alarm");
+    const journal: string[] = [];
+    // Inert native child: prove the independent journal route without sending a live alarm.
+    vi.spyOn(childProcess, "execFile").mockImplementation(() => {
+      const child = new childProcess.ChildProcess();
+      child.stdin = new PassThrough();
+      child.stdin.on("data", chunk => journal.push(String(chunk)));
+      return child;
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const mesh = new MeshStore(root, 65_536, 1_000);
+    const from = { id: "owner", name: "owner", kind: "main" as const };
+    const to = "session:22222222-2222-4222-8222-222222222222";
+    const retry = new MeshBackgroundRetry("participant heartbeat/change refresh")
+      .diagnosticsTo(line => logDiagnostic("src/topology/participant-directory.ts", line))
+      .alarmsTo(meshOutageAlarmSink(() => ({ mesh, from }), { PI_FABRIC_MESH_ALARM_TO: to }), 0);
+    expect(retry.failure(new MeshLockTimeoutError(" held by pid 123", 1, 1))).toBe(true);
+    retry.success(true);
+    await vi.waitFor(() => expect(mesh.read({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC, limit: 10 })).toHaveLength(2));
+    expect(mesh.read({ topic: FABRIC_MESH_OUTAGE_ALARM_TOPIC, limit: 10 }).map(event => [event.kind, event.to]))
+      .toEqual([["mesh-outage", to], ["mesh-recovered", to]]);
+    await flushFabricDiagnostics();
+    const rows = fs.readFileSync(fabricDiagnosticsFile("participant-private-alarm"), "utf8").trim().split("\n")
+      .map(line => JSON.parse(line));
+    expect(rows.some(row => row.message.includes("retrying in"))).toBe(true);
+    expect(rows.some(row => row.message.includes('"state":"outage"'))).toBe(true);
+    expect(rows.some(row => row.message.includes('"state":"recovered"'))).toBe(true);
+    if (process.platform === "linux") {
+      expect(journal.some(line => line.includes('"state":"outage"'))).toBe(true);
+      expect(journal.some(line => line.includes('"state":"recovered"'))).toBe(true);
+    }
+    expect(warn).not.toHaveBeenCalled();
+    expect(stderr).not.toHaveBeenCalled();
+    retry.close();
+  });
+
   it("leaves the default (queue) boundary unchanged: no backoff for a non-transient failure", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const retry = new MeshBackgroundRetry("handler");
@@ -62,9 +110,12 @@ describe("background failure backoff (opt-in)", () => {
 });
 
 describe("participant heartbeat/change refresh under a permanent failure", () => {
-  it("bounds attempts and warning lines over a minute of noisy canConsumeMesh/change triggers; explicit refresh recovers at once", { timeout: 30_000 }, async () => {
+  it("bounds attempts and private log lines without TUI noise; explicit refresh still rejects real failures and recovers at once", { timeout: 30_000 }, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-refresh-backoff-"));
     roots.push(root);
+    vi.stubEnv("SMARTY_ROLE", "worktree-agent@x");
+    vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+    configureFabricDiagnostics("participant-backoff");
     const mesh = new MeshStore(root, 65536, 1000, { lockTimeoutMs: 500 });
     const identity = { id: "owner", name: "owner", kind: "main" as const };
     let failing = false;
@@ -87,11 +138,13 @@ describe("participant heartbeat/change refresh under a permanent failure", () =>
     expect(directory.canConsumeMesh()).toBe(true);
 
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
     const base = Date.now();
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(base);
     failing = true;
-    await directory.refresh().catch(() => undefined); // the explicit attempt that starts the outage
+    await expect(directory.refresh()).rejects.toMatchObject({ code: "EACCES" }); // real failures remain strict
     // A simulated minute: consumers gate every 100 ms, and every tick is also a change event.
     for (let elapsed = 0; elapsed <= 60_000; elapsed += 100) {
       vi.setSystemTime(base + elapsed);
@@ -103,8 +156,16 @@ describe("participant heartbeat/change refresh under a permanent failure", () =>
     // Backoff 1 s, 2 s, then the 2.5 s cap (half a heartbeat): about 25 attempts, not one per trigger (>600).
     expect(attempts).toBeGreaterThan(3);
     expect(attempts).toBeLessThanOrEqual(30);
-    expect(failed(warn).length).toBeGreaterThanOrEqual(1);
-    expect(failed(warn).length).toBeLessThanOrEqual(2);
+    await flushFabricDiagnostics();
+    const lines = fs.readFileSync(fabricDiagnosticsFile("participant-backoff"), "utf8").trim().split("\n")
+      .map(line => JSON.parse(line)).filter(row => row.message.includes("background operation failed"));
+    expect(lines.length).toBeGreaterThanOrEqual(1);
+    expect(lines.length).toBeLessThanOrEqual(2);
+    expect(lines[0]).toMatchObject({ level: "warning", source: "src/topology/participant-directory.ts",
+      message: expect.stringContaining("EACCES") });
+    expect(warn).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+    expect(stderr).not.toHaveBeenCalled();
 
     // Counterexample: an explicit refresh is not held back by the background backoff and recovers now.
     failing = false;

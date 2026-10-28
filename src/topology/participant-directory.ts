@@ -3171,6 +3171,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       return ops;
     }, (ops) => this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
+      lockTiming: { operation: "directory-withdraw" },
       beforeCommit: () => { assertHostLeaseOwner(this.mesh.root, leaseOwner); } })));
     // A superseded incarnation owns nothing left to lapse: its successor holds the lease.
     const failed = (reason: string): void => { if (!this.#superseded) this.#withdrawalFailure(reason); };
@@ -3782,6 +3783,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         this.mesh.root, this.options.hostId));
       let committedAt = 0;
       const results = await this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
+        lockTiming: { operation: changed || legacyChanged ? "directory-publish" : "directory-renew" },
         beforeCommit: () => {
           assertHostLeaseOwner(this.mesh.root, this.#leaseFenceOwner());
           this.#assertRootPublishable(statePuts.get(keyFor(PARTICIPANT_PREFIX, this.options.rootId)));

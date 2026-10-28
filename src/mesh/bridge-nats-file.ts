@@ -7,7 +7,7 @@ import {
 } from "../transport/types.js";
 import type { BridgeChange } from "./change-notifier.js";
 import {
-  admitPresence, BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, LEASE_LAPSE_DEFER_MS, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
+  admitPresence, BRIDGE_LEASE_MS, BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, LEASE_LAPSE_DEFER_MS, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
   type BridgeRead, type BridgeSide, type MeshBridgeOptions,
 } from "./bridge.js";
 import {
@@ -293,6 +293,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   #lastMirror: { hosts: BridgePresence["hosts"]; participants: BridgePresence["participants"] } | undefined;
   #fileRenewal: Promise<void> | undefined;
   #fileRenewalPending = false;
+  #fileRenewalVersion = 0;
   #fenced = false;
 
   constructor(options: NatsCarrierSideOptions) {
@@ -423,21 +424,30 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     const listener = { changed, failed };
     this.#listeners.add(listener);
     const unwatch = this.port.watchPresence(() => {
-      changed("presence");
+      this.#fileRenewalVersion++;
       this.#fileRenewalPending = true;
+      changed("presence");
       this.#renewFileMirror();
-    }, failed);
+    }, error => {
+      this.#fileRenewalVersion++; // An invalidated reader cannot authorize queued recovery.
+      failed(error);
+    });
     this.#start();
+    // The port may already have observed a fresh owner before this subscription. Bootstrap
+    // from that reader too, independently of the first full sync's outbound mirror.
+    this.#fileRenewalPending = true;
+    this.#renewFileMirror();
     if (this.#pumpError) queueMicrotask(() => failed(this.#pumpError!));
     return () => {
+      this.#fileRenewalVersion++;
       this.#listeners.delete(listener);
       unwatch();
     };
   }
 
   /** The live KV watch renews inbound leases independently of a slow bidirectional pass or
-   * drain. Coalesce bursts, but resample after changes during a write. Never restamp a cached
-   * snapshot or change membership here: only the ordinary full sync installs/removes owners. */
+   * drain. Missing owners use the ordinary partial installer, never omission withdrawal or
+   * existing-owner replacement. Coalesce bursts and invalidate queued samples on any change. */
   #renewFileMirror(): void {
     if (this.#fileRenewal || this.#fenced || this.#listeners.size === 0) return;
     this.#fileRenewal = (async () => {
@@ -446,10 +456,21 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
         const local = await this.#file.presence();
         // Anchor before the NATS read/queue/write, exactly as MeshBridge's inbound sample does.
         const observedAt = this.#now();
+        const version = this.#fileRenewalVersion;
+        const current = (): boolean => !this.#fenced && this.#listeners.size > 0 && version === this.#fileRenewalVersion;
         const claimed = await this.presence();
-        if (this.#fenced || this.#listeners.size === 0) return;
+        if (!current()) continue;
         const admitted = admitPresence(claimed, new Set(local.reserved), this.#link);
-        await this.#file.renewMirroredLeases(admitted.hosts, observedAt);
+        const missing = new Set(await this.#file.renewMirroredLeases(admitted.hosts, observedAt, current));
+        if (!current() || missing.size === 0) continue;
+        const hosts = admitted.hosts.filter(host => missing.has(host.record.id));
+        const participants = admitted.participants.filter(participant => missing.has(participant.ownerHostId));
+        // The mirror queue/custody wait cannot turn a once-live sample into new authority.
+        // A newer watch event (including explicit deletion) cancels it; the next loop resamples.
+        const fresh = (): boolean => current() && observedAt <= this.#now() && hosts.every(host =>
+          Number.isFinite(host.observedAt) && Number.isFinite(host.expiresAt) &&
+          observedAt + Math.min(BRIDGE_LEASE_MS, host.expiresAt - host.observedAt!) > this.#now());
+        await this.#file.mirror({ hosts, participants, partial: true }, observedAt, false, fresh);
       }
     })().catch(error => {
       if (this.#fenced || this.#listeners.size === 0) return;

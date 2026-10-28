@@ -1,5 +1,9 @@
 // L1 (smarty-dev#15310): NATS side of the A' bridge, presence both ways, against an in-memory
 // multi-machine KV with the broker's CAS/watch semantics and the real KV participant directory.
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   NatsBridgePresence,
@@ -7,9 +11,11 @@ import {
   projectNatsMirrorRecord,
   type NatsBridgeMirrorPresence,
 } from "../src/mesh/bridge-nats-presence.js";
-import type { BridgeHost } from "../src/mesh/bridge.js";
+import { admitPresence, StoreBridgeSide, type BridgeHost } from "../src/mesh/bridge.js";
+import { MeshStore } from "../src/mesh/store.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
-import type { TransportHostLeaseProcessProof } from "../src/topology/host-leases.js";
+import { hostLeasePath, mirroredOwnerRoutingStatus, readHostLease,
+  type TransportHostLeaseProcessProof } from "../src/topology/host-leases.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import { advance, hKey, kvWorld as world, natsLease, pKey, seedNative, type Clock } from "./helpers/bridge-nats-kv.js";
 import { TransportDeniedError, TransportUncertainError, type FabricTransport, type TransportKv } from "../src/transport/types.js";
@@ -196,8 +202,8 @@ describe("NATS presence -> file mirror snapshot", () => {
     advance(clock, 12_999);
     expect((await side.presence()).hosts[0]!.expiresAt).toBe(clock.wall + 1);
     advance(clock, 1);
-    expect((await side.presence()).hosts).toEqual([]);
-    expect(side.resolve(NATS_ROOT)?.live).toBe(false);
+    expect(await side.presence()).toMatchObject({ hosts: [], participants: [], partial: true });
+    expect(side.resolve(NATS_ROOT)).toMatchObject({ live: false, leaseLapsed: true, presenceFailure: "expired" });
     // A renewal received now restores it; an owner clock already past its expiry does not.
     w.leases.put(hKey(V2, NATS_ROOT), `${NATS_ROOT}#nats-inc-1`, natsLease(NATS_ROOT, "nats-inc-1", clock.wall),
       w.leases.values.get(hKey(V2, NATS_ROOT))!.revision);
@@ -205,6 +211,240 @@ describe("NATS presence -> file mirror snapshot", () => {
     w.leases.put(hKey(V2, NATS_ROOT), `${NATS_ROOT}#nats-inc-1`, natsLease(NATS_ROOT, "nats-inc-1", clock.wall - 14_000),
       w.leases.values.get(hKey(V2, NATS_ROOT))!.revision);
     await waitFor(() => expect(side.resolve(NATS_ROOT)?.live).toBe(false));
+    expect(await side.presence()).toMatchObject({ hosts: [], participants: [], partial: true });
+  });
+
+  // Keep: smarty-dev#16876 / CAUSE3 reproduced an aged lease becoming complete omission and
+  // deleting a live root's canonical file records. Exercise the real admission/mirror boundary.
+  it("replays CAUSE3 without withdrawing or renewing an aged mirror, including an aged rootRecheck", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-omit-"));
+    const mesh = new MeshStore(path.join(dir, "mesh"), 65_536, 1_000, { stateBackend: "file" });
+    const clock = { wall: Date.now(), mono: 50_000 };
+    const w = world();
+    seedNative(w, V2, natsRoot(), clock.wall);
+    const { side } = bridge(w, { clock });
+    const hub = new StoreBridgeSide(mesh, "nats", () => clock.wall);
+    const key = (prefix: string) => prefix + createHash("sha256").update(NATS_ROOT).digest("hex");
+    const hostKey = key("topology/hosts/");
+    const participantKey = key("topology/participants/");
+    const mirror = async () => {
+      const claimed = await side.presence();
+      const admitted = admitPresence(claimed, new Set(claimed.reserved), "nats");
+      expect(admitted.partial).toBe(claimed.partial);
+      await hub.mirror(admitted, clock.wall);
+      return claimed;
+    };
+    const renew = async (rootRecheck = false) => {
+      const leaseKey = hKey(V2, NATS_ROOT);
+      const revision = w.leases.put(leaseKey, `${NATS_ROOT}#nats-inc-1`, {
+        ...natsLease(NATS_ROOT, "nats-inc-1", clock.wall), ...(rootRecheck ? { rootRecheck: true } : {}),
+      }, w.leases.values.get(leaseKey)?.revision ?? 0);
+      await waitFor(() => expect(side.reader.lease(V2, NATS_ROOT)?.entry.revision).toBe(revision));
+    };
+    try {
+      await side.whenReady();
+      const first = await mirror();
+      expect(first.partial).toBeUndefined();
+      expect(first.participants.map(record => record.id)).toEqual([NATS_ROOT]);
+      const heldHost = mesh.get(hostKey, { fresh: true });
+      const heldParticipant = mesh.get(participantKey, { fresh: true });
+      expect(heldHost).toBeDefined();
+      expect(heldParticipant).toBeDefined();
+      const heldLease = fs.readFileSync(hostLeasePath(mesh.root, NATS_ROOT), "utf8");
+      const originalDeadline = readHostLease(mesh.root, NATS_ROOT)!.expiresAt;
+      expect(originalDeadline).toBe(clock.wall + 13_000);
+      const expectHeld = () => {
+        expect(mesh.get(hostKey, { fresh: true })).toEqual(heldHost);
+        expect(mesh.get(participantKey, { fresh: true })).toEqual(heldParticipant);
+        expect(fs.readFileSync(hostLeasePath(mesh.root, NATS_ROOT), "utf8")).toBe(heldLease);
+        expect(readHostLease(mesh.root, NATS_ROOT)!.expiresAt).toBe(originalDeadline);
+        expect(mirroredOwnerRoutingStatus({ ...readHostLease(mesh.root, NATS_ROOT)!, remoteHost: "nats" }, clock.wall)).toBe("bridge-stale");
+      };
+      // A ready reader with retained presence, but no renewed lease observation: UNKNOWN, not gone.
+      advance(clock, 14_000);
+      expect(side.reader.ready).toBe(true);
+      expect(side.reader.resyncing).toBe(false);
+      expect(side.resolve(NATS_ROOT)).toMatchObject({ live: false, leaseLapsed: true });
+      expect(await mirror()).toMatchObject({ hosts: [], participants: [], partial: true });
+      expectHeld();
+      // Presence refresh alone cannot renew lease authority or shift the mirror's deadline.
+      const presenceKey = pKey(V2, NATS_ROOT);
+      const presenceRevision = w.presence.put(presenceKey, `${NATS_ROOT}#nats-inc-1`, natsRoot(NATS_ROOT, "nats-inc-1", {
+        updatedAt: clock.wall,
+      }), w.presence.values.get(presenceKey)!.revision);
+      await waitFor(() => expect(side.resolve(NATS_ROOT)?.record.updatedAt).toBe(clock.wall));
+      expect(await mirror()).toMatchObject({ hosts: [], participants: [], partial: true });
+      expectHeld();
+      // Fresh rootRecheck is partial, and aging must not turn it back into complete absence.
+      await renew(true);
+      expect(side.resolve(NATS_ROOT)).toMatchObject({ live: false, rootRecheck: true });
+      expect(await mirror()).toMatchObject({ hosts: [], participants: [], partial: true });
+      expectHeld();
+      advance(clock, 14_000);
+      expect(side.resolve(NATS_ROOT)).toMatchObject({ live: false, rootRecheck: false, leaseLapsed: false, presenceFailure: "root-recheck" });
+      expect(await mirror()).toMatchObject({ hosts: [], participants: [], partial: true });
+      expectHeld();
+      // A new lease observation restores the projection; no stale evidence is made live.
+      await renew();
+      expect(side.resolve(NATS_ROOT)?.live).toBe(true);
+      expect((await mirror()).partial).toBeUndefined();
+      expect(readHostLease(mesh.root, NATS_ROOT)!.expiresAt).toBe(clock.wall + 13_000);
+      expect(side.verifySender(NATS_ROOT, V2)).toMatchObject({ ok: true });
+      // Broker lease expiry is still not presence deletion; its last deadline stays unchanged.
+      const renewedHost = mesh.get(hostKey, { fresh: true });
+      const renewedParticipant = mesh.get(participantKey, { fresh: true });
+      const renewedLease = fs.readFileSync(hostLeasePath(mesh.root, NATS_ROOT), "utf8");
+      advance(clock, 15_000);
+      w.leases.expire(hKey(V2, NATS_ROOT));
+      await waitFor(() => expect(side.reader.lease(V2, NATS_ROOT)).toBeUndefined());
+      expect(await mirror()).toMatchObject({ hosts: [], participants: [], partial: true });
+      expect(mesh.get(hostKey, { fresh: true })).toEqual(renewedHost);
+      expect(mesh.get(participantKey, { fresh: true })).toEqual(renewedParticipant);
+      expect(fs.readFileSync(hostLeasePath(mesh.root, NATS_ROOT), "utf8")).toBe(renewedLease);
+      // Explicit verified presence deletion, unlike lease uncertainty, withdraws immediately.
+      expect(w.presence.delete(presenceKey, presenceRevision)).toBe(true);
+      await waitFor(() => expect(side.resolve(NATS_ROOT)).toBeUndefined());
+      expect(await mirror()).toEqual({ hosts: [], participants: [], reserved: [] });
+      expect(mesh.get(hostKey, { fresh: true })).toBeUndefined();
+      expect(mesh.get(participantKey, { fresh: true })).toBeUndefined();
+      expect(readHostLease(mesh.root, NATS_ROOT)).toBeUndefined();
+    } finally {
+      await side.close();
+      mesh.closeState();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["live", "aged", "aged rootRecheck"])("allows complete absence after an explicit presence delete (%s lease)", async state => {
+    const w = world();
+    seedNative(w, V2, natsRoot(), 1_000_000);
+    if (state === "aged rootRecheck") {
+      const key = hKey(V2, NATS_ROOT);
+      w.leases.put(key, `${NATS_ROOT}#nats-inc-1`, { ...natsLease(NATS_ROOT, "nats-inc-1", 1_000_000), rootRecheck: true },
+        w.leases.values.get(key)!.revision);
+    }
+    const { side, clock } = bridge(w);
+    await side.whenReady();
+    if (state !== "live") {
+      advance(clock, 14_000);
+      expect((await side.presence()).partial).toBe(true);
+    }
+    const key = pKey(V2, NATS_ROOT);
+    expect(w.presence.delete(key, w.presence.values.get(key)!.revision)).toBe(true);
+    await waitFor(() => expect(side.resolve(NATS_ROOT)).toBeUndefined());
+    expect(side.reader.lease(V2, NATS_ROOT)).toBeDefined();
+    expect(await side.presence()).toEqual({ hosts: [], participants: [], reserved: [] });
+  });
+
+  it("keeps unrelated live additions in a partial snapshot with an aged admitted root", async () => {
+    const w = world();
+    seedNative(w, V2, natsRoot(), 1_000_000);
+    const { side, clock } = bridge(w);
+    await side.whenReady();
+    advance(clock, 14_000);
+    seedNative(w, V2, natsRoot(FILE_ROOT, "new-inc"), clock.wall);
+    await waitFor(() => expect(side.resolve(FILE_ROOT)?.live).toBe(true));
+    const presence = await side.presence();
+    expect(presence.partial).toBe(true);
+    expect(presence.hosts.map(host => host.record.id)).toEqual([FILE_ROOT]);
+    expect(presence.participants.map(record => record.id)).toEqual([FILE_ROOT]);
+    expect(side.verifySender(NATS_ROOT, V2)).toEqual({ ok: false, refuse: "FABRIC_SENDER_UNVERIFIED" });
+  });
+
+  it("holds a verified deletion while another root is lease-aged, until a complete snapshot", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-mixed-omit-"));
+    const mesh = new MeshStore(path.join(dir, "mesh"), 65_536, 1_000, { stateBackend: "file" });
+    const w = world();
+    seedNative(w, V2, natsRoot(), 1_000_000);
+    seedNative(w, V2, natsRoot(FILE_ROOT, "other-inc"), 1_000_000);
+    const { side, clock } = bridge(w);
+    const hub = new StoreBridgeSide(mesh, "nats", () => clock.wall);
+    const deletedKey = "topology/participants/" + createHash("sha256").update(FILE_ROOT).digest("hex");
+    const mirror = async () => {
+      const claimed = await side.presence();
+      await hub.mirror(admitPresence(claimed, new Set(claimed.reserved), "nats"), clock.wall);
+      return claimed;
+    };
+    try {
+      await side.whenReady();
+      expect((await mirror()).participants).toHaveLength(2);
+      const held = mesh.get(deletedKey, { fresh: true });
+      expect(held).toBeDefined();
+      const lease = fs.readFileSync(hostLeasePath(mesh.root, FILE_ROOT), "utf8");
+      advance(clock, 14_000);
+      const key = pKey(V2, FILE_ROOT);
+      expect(w.presence.delete(key, w.presence.values.get(key)!.revision)).toBe(true);
+      await waitFor(() => expect(side.resolve(FILE_ROOT)).toBeUndefined());
+      // There is no per-id deletion evidence in BridgePresence. A remains unknown, so this
+      // snapshot also holds B's omission at the file mirror; no authority is extended for B.
+      expect(await mirror()).toEqual({ hosts: [], participants: [], reserved: [], partial: true });
+      expect(mesh.get(deletedKey, { fresh: true })).toEqual(held);
+      expect(fs.readFileSync(hostLeasePath(mesh.root, FILE_ROOT), "utf8")).toBe(lease);
+      // Fresh evidence for A permits a complete snapshot, which finally withdraws B, not A.
+      const leaseKey = hKey(V2, NATS_ROOT);
+      w.leases.put(leaseKey, `${NATS_ROOT}#nats-inc-1`, natsLease(NATS_ROOT, "nats-inc-1", clock.wall),
+        w.leases.values.get(leaseKey)!.revision);
+      await waitFor(() => expect(side.resolve(NATS_ROOT)?.live).toBe(true));
+      const complete = await mirror();
+      expect(complete.partial).toBeUndefined();
+      expect(complete.participants.map(record => record.id)).toEqual([NATS_ROOT]);
+      expect(mesh.get(deletedKey, { fresh: true })).toBeUndefined();
+      expect(readHostLease(mesh.root, FILE_ROOT)).toBeUndefined();
+    } finally {
+      await side.close();
+      mesh.closeState();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["actor", natsRoot(NATS_ROOT, "nats-inc-1", { kind: "actor" })],
+    ["agent", natsRoot(NATS_ROOT, "nats-inc-1", { kind: "agent" })],
+    ["non-canonical id", natsRoot("not-a-session")],
+    ["different root", natsRoot(NATS_ROOT, "nats-inc-1", { rootId: FILE_ROOT })],
+    ["different owner host", natsRoot(NATS_ROOT, "nats-inc-1", { ownerHostId: FILE_ROOT })],
+    ["different owner identity", natsRoot(NATS_ROOT, "nats-inc-1", { ownerIdentityId: FILE_ROOT })],
+    ["terminal", natsRoot(NATS_ROOT, "nats-inc-1", { status: "stopped" })],
+    ["legacy", natsRoot(NATS_ROOT, "nats-inc-1", { controlProtocol: "legacy" })],
+    ["missing incarnation", natsRoot(NATS_ROOT, "")],
+    ["mirrored", natsRoot(NATS_ROOT, "nats-inc-1", { remoteHost: "file" })],
+    ["relayed", natsRoot(NATS_ROOT, "nats-inc-1", { bridgeVia: "file" })],
+  ] as const)("does not hold omissions for an aged row outside the native canonical root boundary (%s)", async (_label, record) => {
+    const w = world();
+    seedNative(w, V2, record, 1_000_000);
+    const { side, clock } = bridge(w);
+    await side.whenReady();
+    advance(clock, 14_000);
+    expect(await side.presence()).toEqual({ hosts: [], participants: [], reserved: [] });
+    // Missing lease evidence must not make a terminal or otherwise ineligible row hold omissions.
+    w.leases.expire(hKey(V2, record.ownerHostId));
+    await waitFor(() => expect(side.reader.lease(V2, record.ownerHostId)).toBeUndefined());
+    expect(await side.presence()).toEqual({ hosts: [], participants: [], reserved: [] });
+  });
+
+  it.each(["own machine", "denied", "ambiguous"])("does not hold omissions for an aged canonical root excluded by %s", async boundary => {
+    const w = world();
+    seedNative(w, boundary === "own machine" ? BRIDGE : V2, natsRoot(), 1_000_000);
+    if (boundary === "ambiguous") seedNative(w, "v3-org", natsRoot(), 1_000_000);
+    const { side, clock } = bridge(w, { admit: () => boundary !== "denied" });
+    await side.whenReady();
+    advance(clock, 14_000);
+    expect(await side.presence()).toEqual({ hosts: [], participants: [], reserved: [] });
+  });
+
+  it.each(["identity", "incarnation", "root"])("does not turn a verified lease %s mismatch into age-only uncertainty", async mismatch => {
+    const w = world();
+    seedNative(w, V2, natsRoot(), 1_000_000);
+    const incarnation = mismatch === "incarnation" ? "other-inc" : "nats-inc-1";
+    const key = hKey(V2, NATS_ROOT);
+    w.leases.put(key, `${NATS_ROOT}#${incarnation}`, natsLease(NATS_ROOT, incarnation, 1_000_000,
+      mismatch === "root" ? FILE_ROOT : NATS_ROOT, mismatch === "identity" ? FILE_ROOT : NATS_ROOT),
+      w.leases.values.get(key)!.revision);
+    const { side, clock } = bridge(w);
+    await side.whenReady();
+    advance(clock, 14_000);
+    expect(side.resolve(NATS_ROOT)).toMatchObject({ live: false, leaseLapsed: false });
+    expect(await side.presence()).toEqual({ hosts: [], participants: [], reserved: [] });
   });
 
   it("keeps serving the last snapshot through a reconnect gap, bounded by lease age, and switches at the new ready", async () => {

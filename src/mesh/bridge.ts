@@ -1644,11 +1644,13 @@ export class StoreBridgeSide implements BridgeSide {
    * and each write checks the fence, so a mirror in flight cannot restore a record or lease after
    * the withdrawal (security review round 2, F3).
    */
-  mirror(presence: BridgeMirrorPresence, observedAt?: number, fromHub = false): Promise<void> {
+  mirror(presence: BridgeMirrorPresence, observedAt?: number, fromHub = false, observationCurrent?: () => boolean): Promise<void> {
     if (this.#staleAdmission) return Promise.reject(this.#staleAdmission);
     if (this.#fenced) return Promise.resolve();
     // Only the forced-command agent sets fromHub for its trusted hub's mirror RPC.
-    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt, fromHub)).catch((error: unknown) => {
+    // Watch-driven partial recovery can additionally invalidate its sample while queued or
+    // awaiting custody. The ordinary installer still owns admission, incarnation and COMMIT.
+    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt, fromHub, observationCurrent)).catch((error: unknown) => {
       if (error instanceof BridgeStaleIncarnationError) {
         // This instance never acquired the newer incarnation. Fence queued writes and keep
         // cleanup from withdrawing its predecessor's persisted authority after the refusal.
@@ -1662,23 +1664,32 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   /** Refresh only already-installed direct root leases, never membership or incarnations.
+   * Return missing owners for the caller to recover through the ordinary partial installer.
    * A live watch may call this while a full mirror/drain is waiting. The existing per-host
    * custody, current-row checks and exact file-version CAS still own every lease write. */
-  renewMirroredLeases(hosts: readonly BridgeHost[], observedAt: number): Promise<void> {
+  renewMirroredLeases(hosts: readonly BridgeHost[], observedAt: number, observationCurrent?: () => boolean): Promise<string[]> {
     const run = this.#leaseRenewal.then(async () => {
+      const missing: string[] = [];
+      const halted = (): boolean => this.#fenced || observationCurrent?.() === false;
       if (this.#staleAdmission) throw this.#staleAdmission;
-      if (this.#fenced || !Number.isFinite(observedAt) || observedAt > this.now()) return;
+      if (halted() || !Number.isFinite(observedAt) || observedAt > this.now()) return missing;
       for (const { record, expiresAt, observedAt: sourceObservedAt } of hosts) {
-        if (this.#fenced) return;
+        if (halted()) break;
         if (!isAdmissibleRecord("host", record) || remoteHostOf(record) !== undefined ||
           record.id !== record.rootId || record.identity.id !== record.id ||
           !Number.isFinite(sourceObservedAt) || !Number.isFinite(expiresAt) || expiresAt <= sourceObservedAt!) continue;
         const until = observedAt + Math.min(BRIDGE_LEASE_MS, expiresAt - sourceObservedAt!);
         if (until <= this.now() || this.now() - observedAt >= MIRROR_FRESH_MS) continue;
+        // Do not take the lease additions gate just to discover an already-withdrawn row.
+        if (!this.store.get(keyFor(HOST_PREFIX, record.id), { fresh: true })) {
+          missing.push(record.id);
+          continue;
+        }
         await withHostLeaseFileCustody(this.store, hostLeasePath(this.store.root, record.id), () => {
-          if (this.#fenced || until <= this.now()) return;
+          if (halted() || until <= this.now()) return;
           const entry = this.store.get(keyFor(HOST_PREFIX, record.id), { fresh: true });
-          const held = entry && mirrorLinkOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
+          if (!entry) { missing.push(record.id); return; }
+          const held = mirrorLinkOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
           // New/changed owners belong to full reconciliation, never this lease-only path.
           if (!held || held.remoteHost !== this.peer || held.bridgeVia !== undefined || entry!.updatedBy.id !== record.id ||
             held.rootId !== record.rootId || !sameIdentity(held.identity, record.identity) ||
@@ -1695,8 +1706,9 @@ export class StoreBridgeSide implements BridgeSide {
           }, false, false);
         });
       }
+      return missing;
     });
-    this.#leaseRenewal = run.catch(() => undefined);
+    this.#leaseRenewal = run.then(() => undefined, () => undefined);
     return run;
   }
 
@@ -1738,11 +1750,12 @@ export class StoreBridgeSide implements BridgeSide {
     return { hosts, participants };
   }
 
-  async #mirror(presence: BridgeMirrorPresence, final: boolean, observedAt?: number, fromHub = false): Promise<void> {
+  async #mirror(presence: BridgeMirrorPresence, final: boolean, observedAt?: number, fromHub = false,
+    observationCurrent?: () => boolean): Promise<void> {
     await this.store.prepareLock();
     // This host's own participant-directory reader decides which mirror rows are readable here.
     const readsParticipant = (entry: MeshStateEntry): boolean => participantFromEntry(entry) !== undefined;
-    const halted = (): boolean => this.#fenced && !final;
+    const halted = (): boolean => (this.#fenced && !final) || observationCurrent?.() === false;
     const now = this.now();
     // A host live when the snapshot was requested stays admissible: a pass (slow presence read,
     // transport, queueing) can outlast a 15 s source lease's remaining life, which dropped every
@@ -2461,9 +2474,12 @@ export class StoreBridgeSide implements BridgeSide {
                     !skippedRoots.has(row.payload.rootId);
                 });
               },
-              ...(planRevision !== undefined && activePlan ? { beforeCommit: () => {
-                if (leaseStamp === undefined ||
-                  (judgesLeaseLiveness && !leaseLivenessUnchanged(activePlan!.livenessWindow, this.now()))) throw new MirrorPlanStale();
+              ...(observationCurrent || (planRevision !== undefined && activePlan) ? { beforeCommit: () => {
+                // No queued watch sample may restore membership after a newer observation,
+                // explicit source deletion or its original deadline. Roll back this batch.
+                if (observationCurrent?.() === false) throw new BridgeMirrorDeferredError(false, 0);
+                if (planRevision !== undefined && activePlan && (leaseStamp === undefined ||
+                  (judgesLeaseLiveness && !leaseLivenessUnchanged(activePlan.livenessWindow, this.now())))) throw new MirrorPlanStale();
               } } : {}),
               commitOutbox: ({ view, results }) => {
                 committedView = view;

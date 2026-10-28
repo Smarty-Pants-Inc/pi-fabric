@@ -170,6 +170,10 @@ describe.skipIf(!binary)("NATS carrier sender lease-lapse", () => {
         await f.pod.send(original); await f.pending(); await f.lapse();
         const delivery = f.deliveries.find(item => item.envelope.id === original.id)!;
         expect(delivery.publishedAt).toEqual(expect.any(Number));
+        // advance(WINDOW) moves only the carrier clock, not the real broker clock.
+        // Prior windows are terminal; align this fresh window with its broker publish
+        // so later iterations do not accidentally test an already-expired delivery.
+        f.advance(delivery.publishedAt! - f.clock());
         await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
         f.advance(WINDOW); await expect(f.link.remote.read(0)).resolves.toMatchObject({ events: [] });
         // Unlike term()'s void result, the consumer floor is broker evidence of settlement.

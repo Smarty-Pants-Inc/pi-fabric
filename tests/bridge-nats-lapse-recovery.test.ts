@@ -96,6 +96,60 @@ describe("NATS carrier bounded lapse recovery", () => {
     expect(again.termed).toHaveLength(1); expect(claim).not.toHaveBeenCalled();
   });
 
+  it("keeps an iteration-2 fresh delivery when broker and carrier clocks advance together", async () => {
+    const f = await fixture(1); f.lapse();
+    let brokerTime = f.initial;
+    const first = await f.deliver("clock-first", 1, brokerTime);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    brokerTime += WINDOW; f.advance(WINDOW);
+    await expect(f.link.remote.read(0)).resolves.toEqual({ events: [], through: 0 });
+    expect(first.termed).toHaveLength(1);
+    await f.restart(); f.lapse();
+    Object.assign(f.port, { ackFloor: async () => 1 });
+
+    // A fresh broker publish is fresh locally too, even after the prior window and restart.
+    const fresh = await f.deliver("clock-fresh", 2, brokerTime);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(fresh.termed).toEqual([]);
+    expect(f.saved()).toEqual([expect.objectContaining({ id: "clock-fresh", startedAt: brokerTime })]);
+    f.port.routes.set(natsLead.id, route(natsLead, POD_MACHINE, "inc-moved-lead"));
+    const page = await f.link.remote.read(0);
+    expect(page.events.map(event => event.id)).toEqual(["clock-fresh"]);
+    expect(fresh.termed).toEqual([]);
+    expect(f.saved()[0]!.startedAt).toBe(brokerTime);
+    await f.link.remote.read(page.through);
+    expect(fresh.acked).toBe(1);
+  });
+
+  it("reclaims at capacity across restart with aligned broker and carrier clocks", async () => {
+    const f = await fixture(); f.lapse();
+    let brokerTime = f.initial, floor = 0;
+    for (let i = 1; i <= 4; i++) {
+      if (i === 3) { await f.restart(); f.lapse(); }
+      Object.assign(f.port, { ackFloor: async () => floor });
+      const d = await f.deliver(`aligned-${i}`, i, brokerTime);
+      await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+      expect(d.termed).toEqual([]);
+      expect(f.saved().find(lapse => lapse.id === `aligned-${i}`)!.startedAt).toBe(brokerTime);
+      brokerTime += WINDOW; f.advance(WINDOW);
+      await expect(f.link.remote.read(0)).resolves.toEqual({ events: [], through: 0 });
+      expect(d.termed).toHaveLength(1); floor = i;
+      expect(f.saved().length).toBeLessThanOrEqual(2);
+      if (i >= 3) expect(f.saved().some(lapse => lapse.id === "aligned-1")).toBe(false);
+    }
+    expect(f.logs.filter(line => line.includes("retaining this lapse in memory only"))).toEqual([]);
+  });
+
+  it("TERMs a genuinely older-than-30-s broker publish on its first delivery when lapsed", async () => {
+    const f = await fixture(); f.lapse();
+    f.advance(WINDOW + 1); // Both clocks have moved on since this message was published.
+    const old = await f.deliver("genuinely-old-first", 1, f.initial);
+    await expect(f.link.remote.read(0)).resolves.toEqual({ events: [], through: 0 });
+    expect(old.termed).toHaveLength(1); expect(old.acked).toBe(0);
+    expect(f.saved()).toEqual([expect.objectContaining({ id: "genuinely-old-first", startedAt: f.initial,
+      terminalReason: expect.any(String) })]);
+  });
+
   it("a full journal with no reclaimable entry uses memory-only retention and never wedges", async () => {
     const f = await fixture(); f.lapse();
     for (let i = 1; i <= 3; i++) {

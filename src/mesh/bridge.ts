@@ -17,7 +17,7 @@ import { participantFilePresent, readParticipantFiles, withParticipantFileDirect
 import { participantFromEntry } from "../topology/participant-directory.js";
 import { FABRIC_MESH_OUTAGE_ALARM_TOPIC, isMeshAlarmTarget, meshCursorGeneration, type MeshBatchOperation, type MeshBatchView, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshStateEntry, type MeshStore } from "./store.js";
 import { markSqliteBridgeProcess } from "./sqlite-holds.js";
-import { PresenceDropReasons, type PresenceDropCount } from "./presence-drop-reasons.js";
+import { PRESENCE_COPY_FIELDS, PresenceDropReasons, type PresenceDropCount } from "./presence-drop-reasons.js";
 import { CommitOutbox, type CommitOutboxEffect } from "./commit-outbox.js";
 import { assertBridgeStateBackend, isMeshRetryableBusy, isMeshStateBusy, isMeshStateWalCap } from "./state-backend.js";
 import { MeshLockQueueExpiredError, withInitialMeshLockAdmission, type InitialMeshLockDiagnostics } from "./mesh-lock.js";
@@ -327,7 +327,7 @@ export interface BridgePresence {
   partial?: boolean;
   /** Number of malformed, conflicting, or otherwise dropped records observed in the raw scan. */
   droppedCount?: number;
-  /** Bounded, value-free key-family/reason counts; optional for older bridge peers. */
+  /** Bounded key-family/reason counts and sanitized copy-conflict samples; optional for older peers. */
   droppedReasons?: PresenceDropCount[];
   /**
    * Every id and identity id of native records, live or not: a peer may never claim them. Only a
@@ -809,6 +809,12 @@ export const bridgeHandoffScope = (
 const settled = (value: Record<string, unknown>): string =>
   contentDigest({ ...value, updatedAt: undefined, expiresAt: undefined });
 
+// Dual publication can lag ordinary tool activity without changing ownership or addresses.
+// Keep this scoped to participant-copy comparison; settled() still fingerprints mirror writes.
+const participantCopyDigest = (value: FabricParticipantRecord): string =>
+  contentDigest({ ...value, updatedAt: undefined, expiresAt: undefined,
+    turns: undefined, toolCalls: undefined, usage: undefined, currentTool: undefined });
+
 /**
  * A bridge side over a mesh store on this host. `peer` names the other side: it is the
  * `remoteHost` mark on mirrored records and the `bridge.from` of events it bridges in.
@@ -1269,6 +1275,7 @@ export class StoreBridgeSide implements BridgeSide {
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants = new Map<string, { record: FabricParticipantRecord; updatedAt: number }>();
     const participantCopies = new Map<string, { record: FabricParticipantRecord; updatedAt: number }>();
+    const conflictingParticipants = new Set<string>();
     for (const entry of participantEntries) {
       const mark = remoteHostOf(entry.value);
       if (mirrorLinkOf(entry.value) === this.peer) continue;
@@ -1280,9 +1287,16 @@ export class StoreBridgeSide implements BridgeSide {
         continue;
       }
       const copy = participantCopies.get(entry.key);
-      if (copy && settled(copy.record as unknown as Record<string, unknown>) !==
-        settled(participant as unknown as Record<string, unknown>)) {
-        rawDroppedCount += 1; reasons.add("topology/participants", "conflicting-copy");
+      if (copy && participantCopyDigest(copy.record) !== participantCopyDigest(participant)) {
+        const before = copy.record as unknown as Record<string, unknown>;
+        const after = participant as unknown as Record<string, unknown>;
+        const fields = PRESENCE_COPY_FIELDS.filter(field => field !== "other" &&
+          contentDigest({ value: before[field] }) !== contentDigest({ value: after[field] }));
+        const id = CANONICAL_ID.test(participant.id) || /^[0-9a-f]{32}$/.test(participant.id)
+          ? participant.id : `participant:${entry.key.slice(PARTICIPANT_PREFIX.length)}`;
+        rawDroppedCount += 1;
+        reasons.add("topology/participants", "conflicting-copy", 1, [{ id, fields: fields.length ? fields : ["other"] }]);
+        conflictingParticipants.add(participant.id);
       }
       if (!copy || copy.updatedAt <= entry.updatedAt) participantCopies.set(entry.key, { record: participant, updatedAt: entry.updatedAt });
       const owner = live.get(participant.ownerHostId);
@@ -1299,7 +1313,11 @@ export class StoreBridgeSide implements BridgeSide {
         reasons.add("topology/participants", entry.updatedBy.id !== participant.ownerIdentityId ? "writer-mismatch" : "owner-mismatch");
       }
     }
-    const admitted = admitPresence({ hosts, participants: [...participants.values()].map(({ record }) => record),
+    // A genuine copy conflict supplies no replacement authority for this id. Hold its prior
+    // mirror by omission, but still export all other valid additions in this partial snapshot.
+    // Reservations above retain every copy's claims; no owner/incarnation fence is waived.
+    const admitted = admitPresence({ hosts: hosts.filter(({ record }) => !conflictingParticipants.has(record.id)),
+      participants: [...participants.values()].map(({ record }) => record).filter(record => !conflictingParticipants.has(record.id)),
       ...(rawDroppedCount > 0 ? { partial: true, droppedCount: rawDroppedCount, droppedReasons: reasons.entries() } : {}) }, new Set());
     return {
       // Root admission exports canonical root hosts; valid resident/runtime rows travel separately

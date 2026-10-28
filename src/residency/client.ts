@@ -950,7 +950,7 @@ export class ResidencyClient {
           throw error;
         }
       };
-      if (runDirectoryPresent) retain(metadata.runDirectory, "run");
+      if (runDirectoryPresent || (prior && !cleanup.completed.has(metadata.runDirectory))) retain(metadata.runDirectory, "run");
       if (cleanup.temporary && !cleanup.completed.has(cleanup.temporary.directory)) {
         const current = ownedShortTmpdir(cleanup.temporary.directory);
         if (current && (current.dev !== cleanup.temporary.dev || current.ino !== cleanup.temporary.ino)) {

@@ -13,10 +13,11 @@ import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { nativeArch, pinnedTarball, TOOLCHAIN, withPinnedZig } from "./native-toolchain.mjs";
 
-export const NATIVE_HELPERS = ["fabric-landlock", "fabric-mesh-lease"];
+export const NATIVE_HELPERS = ["fabric-landlock", "fabric-mesh-lease", "fabric-trace-move"];
 // smarty-dev#7858: the Windows verified-removal helper, cross-built by the pinned zig (on Linux, shipped in the
 // package; on the Windows CI job, with the pinned Windows zig in FABRIC_WIN_ZIG). One expected sha256 for both.
 export const WINDOWS_HELPER = "fabric-win-remove.exe";
+export const WINDOWS_HELPERS = [WINDOWS_HELPER, "fabric-win-trace-move.exe"];
 const winCompile = (root) => ["cc", "-target", "x86_64-windows-gnu", "-std=c11", "-O2", "-g0", "-Wall", "-Wextra", "-Werror",
   "-municode", "-s", `-ffile-prefix-map=${root}=.`];
 const winBuild = (zig, env, root) => (source, output) =>
@@ -55,7 +56,7 @@ export function buildLandlock() {
     if (zigVersion !== TOOLCHAIN.zig.version) throw new Error(`FABRIC_WIN_ZIG ${zig} is not zig ${TOOLCHAIN.zig.version} (${zigVersion})`);
     const env = { ...process.env, SOURCE_DATE_EPOCH: "0" };
     return buildHelpers(`zig ${zigVersion} (windows host)`, true, winCompile("<root>"), undefined, "x86_64",
-      { name: WINDOWS_HELPER, build: winBuild(zig, env, resolve(".")) }, []);
+      { names: WINDOWS_HELPERS, build: winBuild(zig, env, resolve(".")) }, []);
   }
   if (process.platform !== "linux") return {};
   const root = resolve(".");
@@ -74,7 +75,7 @@ export function buildLandlock() {
         const compiled = spawnSync(zig, [...zigCompile(root, arch), source, "-o", `${output}.o`], { encoding: "utf8", env: pinnedEnv });
         return compiled.status !== 0 || compiled.error ? compiled
           : spawnSync(zig, [...zigLink(arch), `${output}.o`, "-o", output], { encoding: "utf8", env: pinnedEnv });
-      }, arch, { name: WINDOWS_HELPER, build: winBuild(zig, pinnedEnv, root) });
+      }, arch, { names: WINDOWS_HELPERS, build: winBuild(zig, pinnedEnv, root) });
     });
   }
   if (process.env.FABRIC_NATIVE_CC_PINNED === "1") throw new Error(`FABRIC_NATIVE_CC_PINNED=1 but ${tarball.reason}`);
@@ -93,8 +94,8 @@ export function buildLandlock() {
 function buildHelpers(compiler, pinned, recordedFlags, build, arch, windows, linuxHelpers = NATIVE_HELPERS) {
   mkdirSync("dist/native", { recursive: true });
   const helpers = {};
-  for (const helper of [...linuxHelpers, ...windows ? [windows.name] : []]) {
-    const windowsHelper = helper === windows?.name;
+  for (const helper of [...linuxHelpers, ...(windows?.names ?? [])]) {
+    const windowsHelper = windows?.names.includes(helper);
     const hashes = [];
     const outputs = [];
     try {

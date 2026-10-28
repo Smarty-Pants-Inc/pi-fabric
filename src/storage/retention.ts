@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
 import { writeJsonAtomic } from "../core/atomic-write.js";
@@ -6,6 +7,8 @@ import { ownedStat, processAlive } from "./scratch.js";
 import { boundedRunTree } from "./reference-scan.js";
 import { countRefusal, countRemoval, removalTallyOn, verifiedRemove } from "./verified-remove.js";
 import { archiveSessionTrace, SESSION_ARCHIVE_DIR, type SessionTraceMove } from "./session-archive.js";
+import { archiveTraceCopy } from "./trace-archive.js";
+import { moveTraceNoReplace, nativeTraceMoveHost } from "./trace-move.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { FileLockBusy, lockFile } from "../residency/file-lock.js";
 import { recoverActorRunArchives } from "../actors/child-completions.js";
@@ -259,7 +262,7 @@ const runFiles = new Set([
   "settlement.json",
 ]);
 /** Backups/reclaims and unfamiliar JSONL journals are traces too, at every depth. */
-const retentionTrace = (name: string): boolean => /\.jsonl/i.test(name);
+const retentionTrace = (name: string): boolean => /\.(?:jsonl|ndjson)/i.test(name);
 const runFile = (name: string): boolean => retentionTrace(name) || runFiles.has(name) ||
   /^manager-restored-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/.test(name) ||
   /^oversized-event-prefix(-\d+)?\.txt$/.test(name);
@@ -577,38 +580,79 @@ const artifactPlan = (directory: string, expired: Deadline): ArtifactPlan | unde
 };
 const sameArtifact = (current: fs.Stats | undefined, judged: fs.Stats): boolean => !!current &&
   current.dev === judged.dev && current.ino === judged.ino && current.isDirectory() === judged.isDirectory() && current.isFile() === judged.isFile();
+/** Carry the captured root-to-parent judgments through the removal seams. Only a successful, known namespace
+ * mutation may advance that parent's mtime; no callback, failed syscall or unrelated directory refresh is adopted.
+ * Checks and syscalls are not atomic against another process of our own uid (the existing removal residual). */
+const artifactDirectories = (plan: ArtifactPlan) => {
+  const root = path.resolve(plan.directory);
+  const directories = new Map<string, fs.Stats>([[root, plan.stat], ...plan.entries
+    .filter(entry => entry.stat.isDirectory()).map(entry => [path.resolve(entry.file), entry.stat] as [string, fs.Stats])]);
+  let valid = true;
+  const check = (directory: string, changed = false): boolean => {
+    if (!valid) return false;
+    const chain: string[] = [];
+    for (let current = path.resolve(directory);; current = path.dirname(current)) {
+      if (!directories.has(current)) return (valid = false);
+      chain.push(current);
+      if (current === root) break;
+      if (path.dirname(current) === current) return (valid = false);
+    }
+    let advanced: fs.Stats | undefined;
+    for (const current of chain.reverse()) {
+      const expected = directories.get(current)!, now = ownedStat(current);
+      if (!now || !sameArtifact(now, expected) || now.uid !== expected.uid || !closedArtifact(now) ||
+          (!(changed && current === path.resolve(directory)) && now.mtimeMs !== expected.mtimeMs)) return (valid = false);
+      if (current === path.resolve(directory)) advanced = now;
+    }
+    if (changed) directories.set(path.resolve(directory), advanced!);
+    return true;
+  };
+  return {
+    check,
+    proof: (directory: string) => ({ verify: () => check(directory), parentChanged: () => check(directory, true) }),
+    removed: (directory: string): boolean => {
+      directories.delete(path.resolve(directory));
+      const parent = path.dirname(path.resolve(directory));
+      return directories.has(parent) ? check(parent, true) : valid;
+    },
+  };
+};
 /** Never hand a directory to recursive deletion: even a trace created after inspection must survive.
  * rmdir is empty-only; per-file verifiedRemove retains its inode/ownership/final-reference checks. */
 const pruneArtifactPlan = (plan: ArtifactPlan, options: {
   deleter: string; dryRun?: boolean; retainMetadata: boolean; keep?: readonly string[]; proceed: () => boolean; expired: Deadline;
-}): boolean => {
+}, directories = artifactDirectories(plan)): boolean => {
   const protectedEntry = (entry: ArtifactEntry): boolean => retentionTrace(path.basename(entry.file)) ||
     options.keep?.includes(entry.relative) === true || (options.retainMetadata &&
       (TRACE_ANCHORS.has(path.basename(entry.file)) || entry.relative.split(path.sep).some(part => TRACE_ANCHOR_DIRECTORIES.has(part))));
   for (const entry of plan.entries) {
     if (options.expired() || !options.proceed()) return false;
     if (!entry.stat.isFile() || protectedEntry(entry)) continue;
+    const directoryProof = directories.proof(path.dirname(entry.file));
     const unlink = (): boolean => {
-      const current = ownedStat(entry.file), parent = ownedStat(path.dirname(entry.file));
+      const current = ownedStat(entry.file);
       if (!current || !sameArtifact(current, entry.stat) || current.mtimeMs !== entry.stat.mtimeMs || !closedArtifact(current) ||
-          !parent?.isDirectory() || !closedArtifact(parent) || !options.proceed()) return false;
+          !options.proceed() || !directoryProof.verify()) return false;
       fs.unlinkSync(entry.file); return true;
     };
     if (!verifiedRemove(entry.file, entry.stat, { deleter: options.deleter, ...(options.dryRun ? { dryRun: true } : {}),
-      proceed: options.proceed, fallback: unlink }).removed) return false;
+      proceed: options.proceed, directoryProof, fallback: unlink }).removed) return false;
   }
   if (options.dryRun) return !plan.entries.some(protectedEntry);
   for (const entry of [...plan.entries].reverse().concat({ file: plan.directory, relative: "", stat: plan.stat })) {
     if (options.expired() || !options.proceed()) return false;
     if (!entry.stat.isDirectory() || protectedEntry(entry)) continue;
     const current = ownedStat(entry.file), parent = ownedStat(path.dirname(entry.file));
-    if (!sameArtifact(current, entry.stat) || !closedArtifact(current!) || !parent?.isDirectory() || !closedArtifact(parent)) return false;
-    try { fs.rmdirSync(entry.file); }
-    catch (error) { if (!["ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) return false; }
+    if (!sameArtifact(current, entry.stat) || !closedArtifact(current!) || !parent?.isDirectory() || !closedArtifact(parent) ||
+        !directories.check(entry.file)) return false;
+    try {
+      fs.rmdirSync(entry.file);
+      if (!directories.removed(entry.file)) return false;
+    } catch (error) { if (!["ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) return false; }
   }
   return !fs.existsSync(plan.directory);
 };
-/** Artifact collection for callers that already hold worker/archive custody. Raw JSONL (including every
+/** Artifact collection for callers that already hold worker/archive custody. Raw JSONL/NDJSON (including every
  * backup/reclaim) stays in place at every depth. Status and admission/receipt anchors stay whenever either
  * the run or its recorded external scratch contains traces, so another sweep can recheck custody. */
 export const removeRunArtifacts = (directory: string, options: {
@@ -626,20 +670,12 @@ export const removeRunArtifacts = (directory: string, options: {
   }
   const retainMetadata = plan.traces || scratch?.traces === true;
   const common = { deleter: options.deleter, ...(options.dryRun ? { dryRun: true } : {}), retainMetadata, proceed, expired };
-  try {
-    const removed = pruneArtifactPlan(plan, { ...common, ...(options.keep ? { keep: options.keep } : {}) });
-    // A trace-bearing run intentionally remains; its saved status still names the scratch we may prune.
-    if (scratch && (removed || retainMetadata || options.keep?.length)) pruneArtifactPlan(scratch, common);
-    return removed;
-  } finally {
-    if (!options.dryRun) for (const tree of scratch ? [plan, scratch] : [plan]) {
-      for (const entry of [{ file: tree.directory, stat: tree.stat }, ...tree.entries]) {
-        if (!entry.stat.isDirectory() || !sameArtifact(ownedStat(entry.file), entry.stat)) continue;
-        // Partial artifact pruning must not restart legacy mtime-based retention on retained anchors.
-        try { fs.utimesSync(entry.file, entry.stat.atimeMs / 1000, entry.stat.mtimeMs / 1000); } catch { /* delays collection only */ }
-      }
-    }
-  }
+  const directories = artifactDirectories(plan);
+  const removed = pruneArtifactPlan(plan, { ...common, ...(options.keep ? { keep: options.keep } : {}) }, directories);
+  // A trace-bearing run intentionally remains; its saved status still names the scratch we may prune. Neither
+  // that keep policy nor a changed run judgment grants authority over scratch's independently captured proof.
+  if (scratch && (removed || ((retainMetadata || options.keep?.length) && directories.check(directory)))) pruneArtifactPlan(scratch, common);
+  return removed;
 };
 /** Compatibility entrypoint for resident/actor callers with their own custody proof. The old recursive
  * fallback is deliberately not called: it could erase a trace admitted after the safety walk. */
@@ -977,7 +1013,7 @@ const TERMINAL_EVENT_TAIL_LINES = 200;
 const EVENT_TAIL_MARKER = Buffer.from('{"fabricTruncated":true,"reason":"terminal run event retention"}\n');
 
 /** Compact only an owned, safely terminal run. Read a bounded suffix, keep complete JSONL
- * lines (at most the last 200), and atomically replace only events.jsonl; status/reply/result remain byte-for-byte.
+ * lines (at most the last 200), and publish only events.jsonl without clobbering a new writer; status/reply/result remain byte-for-byte.
  * The marker counts against the byte cap. A single oversized final event may leave only
  * the marker rather than a corrupt JSON fragment. Already bounded logs are never rewritten.
  * Callers retain their ownership/latest-run vetoes before entering this shared predicate. */
@@ -1057,38 +1093,33 @@ export const compactTerminalRunEvents = (
         checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
         runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired) ||
         expired() || options.isRetained?.()) return false;
-    if (!artifactPlan(directory, expired)) return false;
+    const plan = artifactPlan(directory, expired);
+    if (!plan || !sameArtifact(plan.stat, directoryStat) || plan.stat.mtimeMs !== directoryStat.mtimeMs) return false;
+    const directoryProof = artifactDirectories(plan).proof(directory);
     const next = Buffer.concat([EVENT_TAIL_MARKER, retained]);
     let replaced = false;
-    try {
-      // Retain the COMPLETE original by the existing same-filesystem archive rename before publishing a tail.
-      // An archive failure never truncates the source. No original inode goes through verifiedRemove.
-      if (options.dryRun) { countRemoval("compactTerminalRunEvents", 0); replaced = true; }
-      else {
-        const move = archiveSessionTrace(file, path.join(directory, SESSION_ARCHIVE_DIR),
-          { reason: "terminal run event retention", deleter: "compactTerminalRunEvents" }, stat);
-        if (move.manifest === false) {
-          // The rename succeeded but durable manifest settlement failed. Restore the original name exclusively;
-          // keep the archived link too rather than risk losing either recovery location.
-          try { fs.linkSync(move.to, file); } catch { /* the full original remains in the archive */ }
-          return false;
-        }
-        replaced = publishExclusive(file, next);
-        if (!replaced) {
-          try { fs.linkSync(move.to, file); } catch { /* the archive retains the full original regardless */ }
-        }
-        if (replaced) countRemoval("compactTerminalRunEvents", 0);
-      }
-    } finally {
-      if (!options.dryRun) {
-        // Residency expiry (and legacy timestamp fallback) uses directory mtime.
-        // Creating/renaming the atomic tail must not restart that retention clock.
-        const current = ownedStat(directory);
-        if (current?.dev === directoryStat.dev && current.ino === directoryStat.ino) {
-          try { fs.utimesSync(directory, directoryStat.atimeMs / 1000, directoryStat.mtimeMs / 1000); }
-          catch { /* A failed timestamp restore only delays collection; it cannot authorize it. */ }
-        }
-      }
+    // A dry run checks the captured directory judgment too, but never creates an archive or a derivative.
+    if (options.dryRun) {
+      if (!directoryProof.verify()) return false;
+      countRemoval("compactTerminalRunEvents", 0); replaced = true;
+    } else {
+      const archive = path.join(directory, SESSION_ARCHIVE_DIR);
+      if (!directoryProof.verify()) return false;
+      // Account for this one known root namespace change ourselves. The copy helper may populate the archive,
+      // but must not cause us to adopt an unrelated refresh of the run directory while it copies/readbacks.
+      try {
+        fs.mkdirSync(archive, { mode: 0o700 });
+        if (!directoryProof.parentChanged()) return false;
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      const archiveStat = ownedStat(archive);
+      if (!archiveStat?.isDirectory() || !closedArtifact(archiveStat) || !directoryProof.verify()) return false;
+      // A durable, independently read-back SHA256 copy must exist BEFORE replacing any byte of the raw source.
+      // The helper never removes the original; any copy/readback/durability failure leaves that original in place.
+      const copy = archiveTraceCopy(file, archive, { reason: "terminal run event retention", deleter: "compactTerminalRunEvents" }, stat);
+      if (!directoryProof.verify()) return false;
+      replaced = publishTraceDerivative(file, next, stat, copy.sha256, archive, directoryProof, () =>
+        !expired() && !options.isRetained?.() && !runTreeExitVeto(directory, 0, expired, true) && canRemoveTerminalRun(directory, expired));
+      if (replaced) countRemoval("compactTerminalRunEvents", 0);
     }
     if (!replaced) return false;
     options.onCompact?.({ path: file, beforeBytes: stat.size, afterBytes: EVENT_TAIL_MARKER.length + retained.length });
@@ -1096,25 +1127,106 @@ export const compactTerminalRunEvents = (
   } catch { return false; }
 };
 
-/** Publish `data` at `file` only while the name is free: an O_EXCL|O_NOFOLLOW private temp beside it, then link
- * (EEXIST never replaces anything), then the temp goes. */
-const publishExclusive = (file: string, data: Buffer): boolean => {
-  const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+/** Take the original into custody and validate its COMPLETE content against the verified archive. Linux/Windows
+ * use single atomic no-replace moves for custody, publication and refused evidence; no source-name unlink.
+ * macOS retains the existing no-clobber link publication. The held original is permanent evidence.
+ * Open-inode writers are rechecked after publication. Restoration links without replacement or source unlink.
+ * No timestamps are restored and uncertain native execution grants no further namespace mutation authority. */
+const publishTraceDerivative = (file: string, data: Buffer, judged: fs.Stats, sha256: string, archive: string,
+  directoryProof: { verify: () => boolean; parentChanged: () => boolean }, proceed: () => boolean): boolean => {
+  let created: fs.Stats | undefined, held: string | undefined, published = false, accepted = false, uncertain = false;
+  const native = nativeTraceMoveHost();
+  const move = (source: string, destination: string): void => {
+    if (!native) { fs.renameSync(source, destination); return; }
+    const result = moveTraceNoReplace(source, destination);
+    if (result.status === "moved") return;
+    uncertain = result.status === "unknown";
+    throw new Error("trace move refused");
+  };
+  const unchanged = (current: fs.Stats | undefined, expected: fs.Stats, moved = false, links = expected.nlink): boolean => !!current &&
+    sameArtifact(current, expected) && current.uid === expected.uid && current.gid === expected.gid &&
+    current.mode === expected.mode && current.nlink === links && current.size === expected.size &&
+    current.mtimeMs === expected.mtimeMs && (moved || current.ctimeMs === expected.ctimeMs) && closedArtifact(current);
+  // Bounded by the judged size, with independent descriptor/path final checks and an EOF probe. Rename may
+  // advance ctime, but it may not excuse a content, size, mtime, mode, ownership or link-count change.
+  const validateHeld = (): boolean => {
+    if (!held) return false;
+    const before = ownedStat(held);
+    if (!unchanged(before, judged, true)) return false;
+    const fd = fs.openSync(held, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    try {
+      if (!unchanged(fs.fstatSync(fd), before!)) return false;
+      const hash = createHash("sha256"), buffer = Buffer.allocUnsafe(1 << 20);
+      for (let read = 0; read < judged.size;) {
+        const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, judged.size - read), read);
+        if (count <= 0) return false;
+        hash.update(buffer.subarray(0, count)); read += count;
+      }
+      return fs.readSync(fd, buffer, 0, 1, judged.size) === 0 && hash.digest("hex") === sha256 &&
+        unchanged(fs.fstatSync(fd), before!) && unchanged(ownedStat(held), before!);
+    } finally { fs.closeSync(fd); }
+  };
   try {
+    if (!unchanged(ownedStat(file), judged) || !proceed() || !directoryProof.verify()) return false;
+    const preparation = fs.mkdtempSync(path.join(archive, ".events-preparation-"));
+    const temp = path.join(preparation, "tail.jsonl.tmp");
     const fd = fs.openSync(temp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
-    try { fs.writeSync(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-    fs.linkSync(temp, file);
-    return true;
+    try {
+      created = fs.fstatSync(fd);
+      if (!directoryProof.verify()) return false;
+      for (let written = 0; written < data.length;) {
+        const count = fs.writeSync(fd, data, written, data.length - written);
+        if (count <= 0) return false;
+        written += count;
+      }
+      fs.fsyncSync(fd);
+      created = fs.fstatSync(fd);
+    } finally { fs.closeSync(fd); }
+    if (!proceed() || !directoryProof.verify() || !unchanged(ownedStat(temp), created) || !unchanged(ownedStat(file), judged)) return false;
+    const custody = fs.mkdtempSync(path.join(archive, ".events-custody-"));
+    const destination = path.join(custody, "events.jsonl");
+    move(file, destination);
+    held = destination; // A failed/unknown move never authorizes restoration from an unjudged destination.
+    if (!directoryProof.parentChanged() || !validateHeld() || !proceed() || !directoryProof.verify() ||
+        !unchanged(ownedStat(temp), created)) return false;
+    if (native) move(temp, file);
+    else fs.linkSync(temp, file); // macOS: retain the existing atomic no-clobber publication.
+    published = true;
+    if (!directoryProof.parentChanged() || !validateHeld() || !directoryProof.verify()) return false;
+    if (!native) {
+      // Existing macOS behavior only; Linux/Windows never unlink a private source pathname.
+      const linked = fs.lstatSync(temp);
+      if (!unchanged(linked, created, true, 2) || !unchanged(fs.lstatSync(file), linked)) return false;
+      fs.unlinkSync(temp);
+    }
+    accepted = unchanged(ownedStat(file), created, true) && proceed() && directoryProof.verify() &&
+      validateHeld() && directoryProof.verify();
+    return accepted;
   } catch { return false; }
-  finally { try { fs.unlinkSync(temp); } catch { /* never created */ } }
+  finally {
+    if (held && !accepted && !uncertain) {
+      try {
+        // Roll back our published name by moving, not deleting: a concurrent append or path replacement
+        // remains in custody too. If the public name is occupied by anything else, restoration cannot clobber it.
+        if (published && created && sameArtifact(fs.lstatSync(file, { throwIfNoEntry: false }), created) && directoryProof.verify()) {
+          const refusal = fs.mkdtempSync(path.join(archive, ".events-refusal-"));
+          move(file, path.join(refusal, "refused-derivative.jsonl"));
+          directoryProof.parentChanged();
+        }
+        fs.linkSync(held, file);
+        directoryProof.parentChanged();
+      } catch { /* changed/occupied public name or missing held source: preserve all custody evidence */ }
+    }
+    // Failed derivatives remain in private archive custody too; error handling never discards a late append.
+  }
 };
 
 /** Immutable, ordinary rotation history only. Malformed-session orphan backups are
  * recovery evidence, not rotation history, and keep their existing exemption.
- * smarty-dev#16444 (R-keep-all-traces): this never unlinks. Every older backup MOVES, by one same-filesystem rename,
- * into `<actor dir>/session-archive/<stamp>-<sha256-12>.jsonl` with a MANIFEST.jsonl line; the newest backup stays in
- * place (resume semantics are unchanged). Returns what it moved (a dry run: what it would move, `to` the archive
- * directory and no sha256). A failed move keeps that backup where it is. */
+ * smarty-dev#16444 (R-keep-all-traces): a durable, independently read-back SHA256 copy of every older backup
+ * precedes its existing same-filesystem archive rename/manifest protocol. Both archive copies remain; the newest
+ * backup stays in place (resume semantics are unchanged). Returns what it moved (a dry run: what it would move,
+ * `to` the archive directory and no sha256). Any copy/verification/move failure keeps the source or its archive. */
 export const pruneActorSessionBackups = (sessionFile: string, options: {
   dryRun?: boolean; onPrune?: (change: { path: string; bytes: number; to?: string; sha256?: string }) => void;
   /** Asked right before each move; true stops the prune there (smarty-dev#7766: a hold or epoch change mid-prune). */
@@ -1159,7 +1271,14 @@ export const pruneActorSessionBackups = (sessionFile: string, options: {
       }
       let move: SessionTraceMove;
       try {
-        move = archiveSessionTrace(file, archive, { reason: "rotation history", deleter: "pruneActorSessionBackups" }, backup.stat);
+        const copy = archiveTraceCopy(file, archive, { reason: "rotation history", deleter: "pruneActorSessionBackups" }, backup.stat);
+        if (options.stop?.()) break;
+        const current = ownedStat(file);
+        if (!current || !sameArtifact(current, copy.stat) || current.uid !== copy.stat.uid || current.mode !== copy.stat.mode ||
+            current.size !== copy.stat.size || current.mtimeMs !== copy.stat.mtimeMs || current.ctimeMs !== copy.stat.ctimeMs) {
+          throw new Error("session backup changed after its verified copy");
+        }
+        move = archiveSessionTrace(file, archive, { reason: "rotation history", deleter: "pruneActorSessionBackups" }, copy.stat);
       } catch {
         countRefusal("pruneActorSessionBackups", "archive move failed; backup kept in place", file, backup.stat.size);
         continue;

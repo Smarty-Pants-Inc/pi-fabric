@@ -18,15 +18,18 @@
   },
   "expected": {
     "windows": {
-      "fabric-win-remove.exe": "5a05e1396efd29e4c1449ebb4a88f907dc429ef165c7a0b1d5d783244315167e"
+      "fabric-win-remove.exe": "5a05e1396efd29e4c1449ebb4a88f907dc429ef165c7a0b1d5d783244315167e",
+      "fabric-win-trace-move.exe": "9574e331144b221396933f2ee295d0f0a164b5688c047cadbc3502b6e89c2224"
     },
     "x86_64": {
       "fabric-landlock": "feb223824e44d02fcc4735d85ae0a91f2a29394197007c11b893c8b8ea02772a",
-      "fabric-mesh-lease": "55dbfeccf67de7edb65d34825d61710069b9d2e6d0b6d17c2c7bd0cbbd31362c"
+      "fabric-mesh-lease": "55dbfeccf67de7edb65d34825d61710069b9d2e6d0b6d17c2c7bd0cbbd31362c",
+      "fabric-trace-move": "238855ca33d599c1c6d4c61d433e8614c405f8a3a5cd75b7245b9916f80b6ea8"
     },
     "aarch64": {
       "fabric-landlock": "0c2b786f8de2d49cf240b1afe69d83e7443666671df07b6a47e88e393c725978",
-      "fabric-mesh-lease": "b58982abbc1ea8fbc042baa0b7dd510cb08361c399cb5ec27d9fb45f0dd5e822"
+      "fabric-mesh-lease": "b58982abbc1ea8fbc042baa0b7dd510cb08361c399cb5ec27d9fb45f0dd5e822",
+      "fabric-trace-move": "af4ac2f959074882a478030e8ceb83e249516565ed313a0cb5921051c3ecf73f"
     }
   }
 }

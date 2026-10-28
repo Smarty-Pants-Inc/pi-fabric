@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import { stageRunArchive } from "../src/agents/archive-custody.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 import * as processIdentity from "../src/residency/process-identity.js";
+import * as traceMove from "../src/storage/trace-move.js";
 import {
   canRemoveManagedRunRoot,
   canRemoveTerminalRun,
@@ -408,6 +410,32 @@ describe("shared run-tree exit veto", () => {
   });
 });
 describe("safe run roots", () => {
+  it("R2 admits JSONL/NDJSON backup and reclaim traces at every supported run depth while pruning nontrace bloat", () => {
+    const runsDirectory = temporaryDirectory(), run = path.join(runsDirectory, "old");
+    const directories = [run, path.join(run, "nested", "child"), path.join(run, "nested", "child", "nested", "grandchild")];
+    const protectedFiles = new Map<string, Buffer>();
+    for (const directory of directories) {
+      writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" });
+      for (const name of ["events.jsonl", "events.jsonl.1.bak", "lifecycle.ndjson.20261028.bak", "journal.ndjson.reclaim"]) {
+        const file = path.join(directory, name), bytes = Buffer.from(name + "\nraw bytes\u0000\xff");
+        fs.writeFileSync(file, bytes); protectedFiles.set(file, bytes);
+      }
+      fs.writeFileSync(path.join(directory, "reply.json"), "eligible bloat");
+    }
+    const scratch = path.join(run, "tmp", "deep", "deeper"); fs.mkdirSync(scratch, { recursive: true });
+    const scratchFile = path.join(scratch, "worker.ndjson.1.bak"), scratchBytes = Buffer.from("scratch raw backup\n");
+    fs.writeFileSync(scratchFile, scratchBytes); protectedFiles.set(scratchFile, scratchBytes);
+    fs.writeFileSync(path.join(scratch, "cache.bin"), "eligible cache bloat");
+    expect(canRemoveTerminalRun(run)).toBe(true);
+    expect(pruneActorRunArchives({ runsDirectory, retentionMs: DAY, now: 100 * DAY })).toEqual([]);
+    for (const [file, bytes] of protectedFiles) expect(fs.readFileSync(file), file).toEqual(bytes);
+    for (const directory of directories) {
+      expect(fs.existsSync(path.join(directory, "reply.json"))).toBe(false);
+      expect(fs.existsSync(path.join(directory, "status.json"))).toBe(true);
+    }
+    expect(fs.existsSync(path.join(scratch, "cache.bin"))).toBe(false);
+  });
+
   const sweep = (tempRoot: string, now = 100 * DAY) => sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
 
   it.each(["closed", "orphan"])("R3 keeps route sessions and prunes eligible bloat in expired %s roots without weakening fences", kind => {
@@ -574,7 +602,7 @@ describe("terminal run event log retention", () => {
     const replyBefore = fs.readFileSync(path.join(dir, "reply.json"));
     const originalEvents = fs.readFileSync(path.join(dir, "events.jsonl"));
     const options = { runsDirectory, retentionMs: 7 * DAY, now: 3 * DAY };
-    const rename = vi.spyOn(fs, "renameSync");
+    const rename = traceMove.nativeTraceMoveHost() ? vi.spyOn(traceMove, "moveTraceNoReplace") : vi.spyOn(fs, "renameSync");
     const read = vi.spyOn(fs, "readSync");
     try {
       expect(pruneActorRunArchives(options)).toEqual([]);
@@ -605,6 +633,35 @@ describe("terminal run event log retention", () => {
       expect(rename).toHaveBeenCalledTimes(renameCountAfterCompaction);
       expect(fs.readFileSync(path.join(dir, "events.jsonl")).equals(compacted)).toBe(true);
     } finally { rename.mockRestore(); read.mockRestore(); }
+  });
+
+  it("verifies a full byte/hash archive while the raw original still exists before derivative replacement", () => {
+    const dir = make(temporaryDirectory(), "old", { status: "completed", finishedAt: DAY });
+    const file = path.join(dir, "events.jsonl"), original = fs.readFileSync(file);
+    const sha256 = createHash("sha256").update(original).digest("hex");
+    const rename = fs.renameSync, nativeMove = traceMove.moveTraceNoReplace;
+    let checkedBeforeReplacement = false;
+    const check = (from: fs.PathLike): void => {
+      if (String(from) === file) {
+        const archive = path.join(dir, "session-archive");
+        const receipt = fs.readFileSync(path.join(archive, "MANIFEST.jsonl"), "utf8").trim().split("\n")
+          .map(line => JSON.parse(line) as { to: string; sha256: string; bytes: number })
+          .find(record => record.sha256 === sha256 && record.bytes === original.length);
+        expect(receipt).toBeDefined();
+        expect(fs.readFileSync(receipt!.to)).toEqual(original);
+        expect(fs.readFileSync(file)).toEqual(original);
+        checkedBeforeReplacement = true;
+      }
+    };
+    const replacement = traceMove.nativeTraceMoveHost()
+      ? vi.spyOn(traceMove, "moveTraceNoReplace").mockImplementation((from, to) => { check(from); return nativeMove(from, to); })
+      : vi.spyOn(fs, "renameSync").mockImplementation((from, to) => { check(from); return rename(from, to); });
+    try {
+      expect(compactTerminalRunEvents(dir, { now: 3 * DAY })).toBe(true);
+      expect(checkedBeforeReplacement).toBe(true);
+      expect(fs.statSync(file).size).toBeLessThan(original.length);
+      expect(sessionArchiveContains(dir, original)).toBe(true);
+    } finally { replacement.mockRestore(); }
   });
 
   it("leaves large live, queued, unknown, young and lastRunId-retained archives byte-for-byte", () => {
@@ -673,7 +730,12 @@ describe("terminal run event log retention", () => {
 
   it("leaves the original log intact and removes its temporary file when atomic rename fails", () => {
     const dir = make(temporaryDirectory(), "old", { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: DAY });
-    const rename = vi.spyOn(fs, "renameSync").mockImplementation(() => { throw Object.assign(new Error("disk full"), { code: "ENOSPC" }); });
+    const fail = (): never => { throw Object.assign(new Error("disk full"), { code: "ENOSPC" }); };
+    const move = traceMove.moveTraceNoReplace;
+    const rename = traceMove.nativeTraceMoveHost() ? vi.spyOn(traceMove, "moveTraceNoReplace").mockImplementation((from, to) => {
+      fs.writeFileSync(to, "late custody occupant\n", { flag: "wx" });
+      return move(from, to); // Actual native no-replace failure; source and late occupant both remain.
+    }) : vi.spyOn(fs, "renameSync").mockImplementation(fail);
     try {
       expect(compactTerminalRunEvents(dir, { now: 3 * DAY })).toBe(false);
       expect(fs.readFileSync(path.join(dir, "events.jsonl")).equals(log) || sessionArchiveContains(dir, log)).toBe(true);

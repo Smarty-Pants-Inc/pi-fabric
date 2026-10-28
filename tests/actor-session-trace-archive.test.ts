@@ -155,8 +155,8 @@ const backups = (sessionFile: string): string[] => fs.readdirSync(path.dirname(s
 const archiveOf = (sessionFile: string): string => path.join(path.dirname(sessionFile), "session-archive");
 const archived = (directory: string): string[] => fs.existsSync(directory)
   ? fs.readdirSync(directory).filter(name => /^\d{8}T\d{9}Z-[0-9a-f]{12}(\.\d+)?\.jsonl$/.test(name)).sort() : [];
-/** The archive's manifest lines; `phase` selects MOVING (the intent, before the rename) or MOVED-TO (after it). */
-const manifest = (directory: string, phase?: "MOVING" | "MOVED-TO"): Array<Record<string, any>> =>
+/** COPY-READBACK precedes a backup's MOVING intent and MOVED-TO settlement. */
+const manifest = (directory: string, phase?: "COPY-READBACK" | "MOVING" | "MOVED-TO"): Array<Record<string, any>> =>
   fs.readFileSync(path.join(directory, "MANIFEST.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line))
     .filter(line => phase === undefined || line.phase === phase);
 /** Each MOVED-TO line follows its own MOVING intent (same from, to and sha256). */
@@ -255,21 +255,42 @@ describe("actor session traces are archived, never deleted (smarty-dev#16444)", 
 
   it("3. pruneActorSessionBackups on 5 backups unlinks nothing, archives 4 and keeps the newest in place", () => {
     const { session, names, hashes } = fiveBackups();
+    const archive = archiveOf(session), originals = names.map(name => fs.readFileSync(name));
     const dry = pruneActorSessionBackups(session, { dryRun: true });
     expect(dry.map(move => move.from)).toEqual(names.slice(0, 4));
     expect(names.every(name => fs.existsSync(name))).toBe(true); // a dry run moves nothing
+    let verifiedBeforeMove = 0;
+    beforeRename = (source, destination) => {
+      const index = names.indexOf(source);
+      if (index < 0 || path.dirname(destination) !== archive) return;
+      const copy = manifest(archive, "COPY-READBACK").find(line => line.from === source);
+      expect(copy).toMatchObject({ bytes: originals[index]!.length, sha256: hashes[index] });
+      expect(fs.readFileSync(copy!.to)).toEqual(originals[index]);
+      expect(sha(copy!.to)).toBe(hashes[index]);
+      expect(fs.readFileSync(source)).toEqual(originals[index]);
+      verifiedBeforeMove++;
+    };
     const moved = pruneActorSessionBackups(session);
+    expect(verifiedBeforeMove).toBe(4);
     expect(moved.map(move => move.from)).toEqual(names.slice(0, 4));
     expect(moved.map(move => move.sha256)).toEqual(hashes.slice(0, 4));
     expect(moved.every(move => move.manifest === undefined)).toBe(true);
     expect(fs.existsSync(names[4]!)).toBe(true);
     expect(names.slice(0, 4).some(name => fs.existsSync(name))).toBe(false);
-    const archive = archiveOf(session);
     expect(archived(archive)).toHaveLength(4);
     expect(moved.map(move => sha(move.to))).toEqual(hashes.slice(0, 4));
-    // smarty-dev#1568 P2-1: a fsynced MOVING intent (from, to, sha256) before each rename, MOVED-TO after it.
+    // Verified full copies precede the existing durable rename-intent/settlement protocol, with no inventory/API loss.
+    const copies = manifest(archive, "COPY-READBACK");
+    expect(copies).toHaveLength(4);
     expect(manifest(archive).map(line => [line.phase, line.from, line.to, line.sha256]))
-      .toEqual(moved.flatMap(move => [["MOVING", move.from, move.to, move.sha256], ["MOVED-TO", move.from, move.to, move.sha256]]));
+      .toEqual(moved.flatMap((move, index) => [["COPY-READBACK", move.from, copies[index]!.to, move.sha256],
+        ["MOVING", move.from, move.to, move.sha256], ["MOVED-TO", move.from, move.to, move.sha256]]));
+    moved.forEach((move, index) => {
+      expect(fs.readFileSync(move.to)).toEqual(originals[index]);
+      expect(fs.readFileSync(copies[index]!.to)).toEqual(originals[index]);
+      expect(sha(copies[index]!.to)).toBe(hashes[index]);
+      expect(copies[index]!.to).not.toBe(move.to);
+    });
     expect(fs.readFileSync(session, "utf8")).toBe("live\n");
     // Idempotent: only the newest is left, so a second prune moves nothing.
     expect(pruneActorSessionBackups(session)).toEqual([]);
@@ -277,7 +298,7 @@ describe("actor session traces are archived, never deleted (smarty-dev#16444)", 
 
   it("3b. a failure AFTER the rename is reported as moved with manifest:false, never as kept in place (smarty-dev#1568 P2-1)", () => {
     const { session, names, hashes } = fiveBackups();
-    const archive = archiveOf(session);
+    const archive = archiveOf(session), originals = names.map(name => fs.readFileSync(name));
     // The MOVED-TO append fails (MANIFEST.jsonl made read-only right after the first rename); the MOVING intent is on disk.
     afterRename = (_source, destination) => {
       if (path.dirname(destination) === archive) { fs.chmodSync(path.join(archive, "MANIFEST.jsonl"), 0o400); afterRename = undefined; }
@@ -291,8 +312,15 @@ describe("actor session traces are archived, never deleted (smarty-dev#16444)", 
     // The read-only manifest refuses the next MOVING intent: those backups stay in place (nothing moved, nothing lost).
     expect(moved).toHaveLength(1);
     expect(names.slice(1).every(name => fs.existsSync(name))).toBe(true);
+    names.slice(1).forEach((name, index) => expect(fs.readFileSync(name)).toEqual(originals[index + 1]));
+    const copies = manifest(archive, "COPY-READBACK");
+    expect(copies).toHaveLength(1);
+    expect(copies[0]).toMatchObject({ from: names[0], bytes: originals[0]!.length, sha256: hashes[0] });
+    expect(fs.readFileSync(copies[0]!.to)).toEqual(originals[0]);
+    expect(sha(copies[0]!.to)).toBe(hashes[0]);
+    expect(fs.readFileSync(moved[0]!.to)).toEqual(originals[0]);
     expect(manifest(archive).map(line => [line.phase, line.from, line.to, line.sha256]))
-      .toEqual([["MOVING", names[0], moved[0]!.to, hashes[0]]]);
+      .toEqual([["COPY-READBACK", names[0], copies[0]!.to, hashes[0]], ["MOVING", names[0], moved[0]!.to, hashes[0]]]);
   });
 
   it("4a. actor removal moves the WHOLE actor dir into the fleet archive: every file byte-identical, with a manifest", async () => {

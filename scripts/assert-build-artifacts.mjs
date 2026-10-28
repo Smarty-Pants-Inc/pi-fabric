@@ -131,7 +131,10 @@ const required = [
   ...declarations,
   ...declarations.map((file) => `${file}.map`),
 ];
-if (process.platform === "linux") required.push("native/fabric-landlock", "native/fabric-mesh-lease", "native/manifest.json");
+if (process.platform === "linux") required.push("native/fabric-landlock", "native/fabric-mesh-lease", "native/fabric-trace-move", "native/manifest.json");
+if ((process.platform === "linux" && process.env.FABRIC_NATIVE_CC_PINNED === "1") || (process.platform === "win32" && process.env.FABRIC_WIN_ZIG)) {
+  required.push("native/fabric-win-remove.exe", "native/fabric-win-trace-move.exe");
+}
 const missing = required.filter((file) => !existsSync(join(dist, file)));
 if (missing.length > 0) throw new Error(`Missing build artifacts:\n${missing.join("\n")}`);
 if (process.platform === "linux") {
@@ -160,7 +163,7 @@ if (process.platform === "linux") {
   owned(dist, "dist");
   const top = lstatSync(root);
   if ((top.mode & 0o022) !== 0 || top.uid !== process.geteuid()) throw new Error(`the package root ${root} must be owned by uid ${process.geteuid()} and not group/other-writable`);
-  for (const helper of ["fabric-landlock", "fabric-mesh-lease"]) {
+  for (const helper of ["fabric-landlock", "fabric-mesh-lease", "fabric-trace-move", ...(pinned ? ["fabric-win-remove.exe", "fabric-win-trace-move.exe"] : [])]) {
     const actual = createHash("sha256").update(readFileSync(join(dist, "native", helper))).digest("hex");
     if (!manifest.helpers?.[helper] || manifest.helpers[helper] !== actual) {
       throw new Error(`Native helper ${helper} sha256 ${actual} differs from the build manifest (${manifest.helpers?.[helper]})`);
@@ -173,6 +176,15 @@ if (process.platform === "linux") {
   }
   // bin/fabric-mesh-backend checks this one bundle before it loads it (pi-fabric#880): it must import no package file.
   if (/\bfrom\s*["']\.|\bimport\s*\(\s*["']\./.test(cli)) throw new Error("dist/mesh/mesh-backend-cli.js imports a package file: bin/fabric-mesh-backend's pre-load check would not cover it");
+}
+
+if (process.platform === "win32" && process.env.FABRIC_WIN_ZIG) {
+  const native = JSON.parse(readFileSync(join(dist, "native/manifest.json"), "utf8"));
+  if (native.toolchain !== "pinned") throw new Error("Windows native artifacts must use the pinned toolchain");
+  for (const helper of ["fabric-win-remove.exe", "fabric-win-trace-move.exe"]) {
+    const actual = createHash("sha256").update(readFileSync(join(dist, "native", helper))).digest("hex");
+    if (native.helpers?.[helper] !== actual) throw new Error(`Native helper ${helper} differs from the build manifest`);
+  }
 }
 
 const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");

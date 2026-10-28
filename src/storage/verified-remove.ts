@@ -352,6 +352,10 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
   dryRun?: boolean;
   /** The caller's last check, after the move and its re-verify, right before the delete. False keeps it (moved back). */
   proceed?: () => boolean;
+  /** Captured ancestor judgments, checked after seams and before namespace changes (also in dry runs).
+   * `parentChanged` advances ONLY the immediate parent's expected mtime, immediately after a successful own
+   * mkdir/rename/rollback/unlink/rmdir. Never called after a callback or a failed/partial operation. */
+  directoryProof?: { verify: () => boolean; parentChanged: () => boolean };
   /** Not Linux only: main's unchanged path-based removal (smarty-dev#7858 carries the verified path there). Returns
    * whether it removed the target. Never used on Linux. */
   fallback?: () => boolean;
@@ -368,22 +372,33 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
   };
   /** A platform-cause refusal: also counted and logged where no report tally is on (pi-fabric#1014). */
   const skip = (reason: string): VerifiedRemoveResult => { reportRemovalSkip(deleter, reason, target); return no(reason); };
+  const directoriesUnchanged = (): boolean => { try { return options.directoryProof?.verify() !== false; } catch { return false; } };
+  const parentChanged = (): boolean => { try { return options.directoryProof?.parentChanged() !== false; } catch { return false; } };
+  const requireDirectories = (): void => { if (!directoriesUnchanged()) refuse("an ancestor directory changed since judgment"); };
   // smarty-dev#7858: on Windows with the verified helper, it takes the place of main's path-based fallback.
   const windowsHelper = windowsVerified ? windowsRemoveHelper() : undefined;
   if (windowsHelper) {
     if (!judged) return no("no judged stat");
     try {
       verifiedRemoveTestHooks.beforeOpen?.(target);
+      requireDirectories();
       const entries = windowsEntries(target, judged);
       verifiedRemoveTestHooks.beforeHelper?.(target);
+      requireDirectories();
       const bytes = options.freed ?? entries.reduce((sum, { stat }) => sum + (stat.isFile() ? Number(stat.size) : 0), 0);
-      if (options.dryRun) { windowsRemove(windowsHelper, entries, true); countRemoval(deleter, bytes); return { removed: true, bytes }; }
-      if (!options.proceed) { windowsRemove(windowsHelper, entries, false); countRemoval(deleter, bytes); return { removed: true, bytes }; }
+      if (options.dryRun) { windowsRemove(windowsHelper, entries, true); requireDirectories(); countRemoval(deleter, bytes); return { removed: true, bytes }; }
+      if (!options.proceed) {
+        windowsRemove(windowsHelper, entries, false);
+        if (!parentChanged()) return no("an ancestor directory changed during removal");
+        countRemoval(deleter, bytes); return { removed: true, bytes };
+      }
       // The caller's final check runs with the target off its name, as on Linux (step 4): a compaction publishes its
       // new tail at the free name (pi-fabric#913 Windows CI). The move is by path; the helper then verifies every
       // moved entry by its judged id, so a swapped entry is refused and stays at the grave name, reported.
       const grave = path.join(path.dirname(target), `.retention-graveyard-${process.pid}-${randomUUID()}`);
+      requireDirectories();
       fs.renameSync(target, grave);
+      if (!parentChanged()) return no("an ancestor directory changed during removal; left in the graveyard", grave);
       const moved = entries.map(({ file, stat }) => ({ file: grave + file.slice(target.length), stat }));
       let kept: string | undefined;
       try { windowsRemove(windowsHelper, moved, true); }
@@ -393,16 +408,20 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
       }
       let keep: boolean;
       try { keep = kept !== undefined || !options.proceed(); } catch { keep = true; }
+      if (!directoriesUnchanged()) return no("an ancestor directory changed since judgment; left in the graveyard", grave);
       if (keep) {
         // ponytail: lstat, then rename back (Windows rename replaces): a same-user create in between is the
         // smarty-dev#7800 class; the Linux path has the same check-then-move.
         try { fs.lstatSync(target); return no("kept by the final check; name is taken, left in the graveyard", grave); }
         catch { /* the name is free */ }
+        if (!directoriesUnchanged()) return no("an ancestor directory changed since judgment; left in the graveyard", grave);
         try { fs.renameSync(grave, target); } catch (error) { return no(`kept by the final check; move back failed (${code(error)}), left in the graveyard`, grave); }
+        if (!parentChanged()) return no("an ancestor directory changed during rollback");
         return no(kept ?? "kept by the final check");
       }
-      try { windowsRemove(windowsHelper, moved, false); }
+      try { requireDirectories(); windowsRemove(windowsHelper, moved, false); }
       catch (error) { return no(`${error instanceof Refusal ? error.message : code(error)}; the rest is left in the graveyard`, grave); }
+      if (!parentChanged()) return no("an ancestor directory changed during removal");
       countRemoval(deleter, bytes);
       return { removed: true, bytes };
     } catch (error) {
@@ -412,12 +431,19 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
   if (process.platform !== "linux" && options.fallback) {
     // Main's path-based removal (smarty-dev#7858), counted like the verified path (pi-fabric#850 round 1 P2). The size
     // walk runs only for a report: in-process sweeps keep main's filesystem cost (actor-manager-startup #4250 guard).
-    const bytes = options.freed ?? (tally ? pathBytes(target) : 0);
-    if (options.dryRun) { countRemoval(deleter, bytes); return { removed: true, bytes }; }
+    let bytes: number;
+    try {
+      verifiedRemoveTestHooks.beforeOpen?.(target);
+      requireDirectories();
+      bytes = options.freed ?? (tally ? pathBytes(target) : 0);
+      requireDirectories();
+      if (options.dryRun) { countRemoval(deleter, bytes); return { removed: true, bytes }; }
+    } catch (error) { return no(error instanceof Refusal ? error.message : `verification failed (${code(error)})`); }
     let removed = false;
-    try { removed = options.fallback(); } catch { /* main's best effort */ }
+    try { requireDirectories(); removed = options.fallback(); } catch { /* main's best effort */ }
     // A failed fallback is not silent outside a tally either (logged; no metadata work, pi-fabric#1014).
     if (!removed) return skip("removal failed (main's path on this platform)");
+    if (!parentChanged()) return no("an ancestor directory changed during removal");
     countRemoval(deleter, bytes);
     return { removed: true, bytes };
   }
@@ -435,11 +461,12 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
    * each step that changes its namespace after proceed() (rollback, container cleanup), so a chmod since the open
    * stops them. It does not exclude our own uid or root (not atomic with the name operation). */
   const parentHeld = (): boolean => {
-    try { const now = fs.fstatSync(parent!); return now.isDirectory() && now.uid === parentStat!.uid && closed(now); }
+    try { const now = fs.fstatSync(parent!); return now.isDirectory() && same(now, parentStat!) && now.uid === parentStat!.uid && closed(now) && directoriesUnchanged(); }
     catch { return false; }
   };
   try {
     verifiedRemoveTestHooks.beforeOpen?.(target);
+    requireDirectories();
     const uid = process.geteuid();
     try { parent = fs.openSync(path.dirname(target), fs.constants.O_RDONLY | NOFOLLOW | DIRECTORY); }
     catch (error) { return no(`parent open failed (${code(error)})`); }
@@ -462,17 +489,19 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
       } finally { fs.closeSync(fd); }
     } else if (!judged.isFile()) refuse("target is not a regular file or directory");
     if (options.freed !== undefined) bytes = options.freed;
+    requireDirectories();
     if (options.dryRun) { countRemoval(deleter, bytes); return { removed: true, bytes }; }
 
     graveName = `.retention-graveyard-${process.pid}`;
-    try { fs.mkdirSync(at(parent, graveName), { mode: 0o700 }); }
+    try {
+      fs.mkdirSync(at(parent, graveName), { mode: 0o700 });
+      if (!parentChanged()) refuse("an ancestor directory changed during graveyard creation");
+    }
     catch (error) { if (code(error) !== "EEXIST") throw error; }
     grave = open(at(parent, graveName));
     graveStat = fs.fstatSync(grave);
     if (graveStat.uid !== uid || (graveStat.mode & 0o077) !== 0) { grave = (fs.closeSync(grave), undefined); graveStat = undefined; return no("graveyard is not our private directory"); }
     const entryName = `${name}.${randomUUID()}`;
-    fs.renameSync(at(parent, name), at(grave, entryName));
-    moved = entryName;
     /** A refusal that leaves the entry in the graveyard, reported where it actually is now (see `located`). */
     const left = (reason: string): VerifiedRemoveResult => {
       const file = located(grave!, entryName);
@@ -484,6 +513,10 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
       if (tally) (entry(deleter).graveyards ??= []).push(`unresolved: held graveyard container ${held}, entry ${entryName}`);
       return { removed: false, reason: `${category} (held container ${held}, entry ${entryName})` };
     };
+    requireDirectories();
+    fs.renameSync(at(parent, name), at(grave, entryName));
+    moved = entryName;
+    if (!parentChanged()) return left("an ancestor directory changed during removal; left in the graveyard");
     // The full no-delete revalidation of the snapshot, below the private graveyard.
     const recheck = (): void => {
       verify(at(grave!, moved!), judged, uid);
@@ -506,6 +539,7 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
       moved = undefined;
       return left(`${reason} (changed during removal; left in the graveyard)`);
     }
+    if (!directoriesUnchanged()) return left("an ancestor directory changed since judgment; left in the graveyard");
     if (keep) {
       // Back to its name, never over anything that appeared there: link fails on EEXIST; a directory moves back
       // only while the name is absent. Otherwise it stays in the graveyard and is reported.
@@ -515,8 +549,10 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
           try { fs.lstatSync(at(parent, name)); return left("kept by the final check; name is taken, left in the graveyard"); }
           catch (error) { if (code(error) !== "ENOENT") throw error; }
           fs.renameSync(at(grave, moved), at(parent, name));
+          if (!parentChanged()) return left("an ancestor directory changed during rollback");
         } else {
           fs.linkSync(at(grave, moved), at(parent, name));
+          if (!parentChanged()) return left("an ancestor directory changed during rollback; link retained in the graveyard");
           fs.unlinkSync(at(grave, moved));
         }
         moved = undefined;
@@ -526,7 +562,7 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
         return left(`kept by the final check; move back failed (${code(error)}), left in the graveyard`);
       }
     }
-    try { removeTree(grave, moved, snap, uid, 0); }
+    try { requireDirectories(); removeTree(grave, moved, snap, uid, 0); }
     catch (error) {
       const reason = error instanceof Refusal ? error.message : `removal failed (${code(error)})`;
       moved = undefined;
@@ -547,7 +583,10 @@ export const verifiedRemove = (target: string, judged: fs.Stats | undefined, opt
       if (graveName !== undefined && moved === undefined && graveStat !== undefined && parentHeld()) {
         try {
           const now = fs.lstatSync(at(parent, graveName));
-          if (now.isDirectory() && same(now, graveStat) && now.uid === graveStat.uid && (now.mode & 0o077) === 0) fs.rmdirSync(at(parent, graveName));
+          if (now.isDirectory() && same(now, graveStat) && now.uid === graveStat.uid && (now.mode & 0o077) === 0 && directoriesUnchanged()) {
+            fs.rmdirSync(at(parent, graveName));
+            parentChanged();
+          }
         } catch { /* holds a reported entry, or gone */ }
       }
       fs.closeSync(parent);

@@ -165,6 +165,48 @@ const expectUnconfirmedClose = async (manager: AgentManager) => {
   await expect(manager.close()).rejects.toThrow(/execution exit unconfirmed/);
   managers.splice(managers.indexOf(manager), 1);
 };
+// Data-safety regressions: retention must preserve real journal bytes and custody,
+// without letting trace-bearing directories pin unrelated task/reply/scratch bloat.
+const retentionArtifacts = (directory: string): Array<{ relative: string; bytes: Buffer }> => {
+  const artifacts: Array<{ relative: string; bytes: Buffer }> = [];
+  const anchors = new Set(["status.json", "manager-result.json", "run-identity.json", "manager-nested.json", "final-answer.json", "queued-result.json"]);
+  const anchorDirectories = new Set(["terminal-controls", "terminal-notices", "follow-ups", "deliveries"]);
+  const visit = (current: string): void => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const file = path.join(current, entry.name);
+      const relative = path.relative(directory, file);
+      if (entry.isDirectory()) visit(file);
+      else if (entry.isFile() && (/\.jsonl/i.test(entry.name) || anchors.has(entry.name) ||
+          relative.split(path.sep).some(part => anchorDirectories.has(part)))) {
+        artifacts.push({ relative, bytes: fs.readFileSync(file) });
+      }
+    }
+  };
+  visit(directory);
+  return artifacts.sort((left, right) => left.relative.localeCompare(right.relative));
+};
+const expectRetentionArtifactsUnchanged = (directory: string, before: ReturnType<typeof retentionArtifacts>): void => {
+  const traces = (artifacts: ReturnType<typeof retentionArtifacts>) => artifacts.filter(artifact => /\.jsonl/i.test(path.basename(artifact.relative)));
+  expect(traces(before).length, "the preservation control contains actual JSONL bytes").toBeGreaterThan(0);
+  expect(traces(retentionArtifacts(directory)).map(artifact => artifact.relative)).toEqual(traces(before).map(artifact => artifact.relative));
+  for (const artifact of before) expect(fs.readFileSync(path.join(directory, artifact.relative)), artifact.relative).toEqual(artifact.bytes);
+};
+const seedRetentionBloat = (directory: string): string[] => {
+  const scratch = path.join(directory, "tmp", "retention-proof");
+  const empty = path.join(directory, "tmp", "empty-retention-proof");
+  fs.mkdirSync(scratch, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(empty, { mode: 0o700 });
+  fs.writeFileSync(path.join(scratch, "session.JSONL.bak"), '{"trace":"nested retention proof π"}\n', { mode: 0o600 });
+  const files = [path.join(directory, "reply.json"), path.join(scratch, "payload.txt")];
+  for (const file of files) fs.writeFileSync(file, "eligible nontrace bloat\n", { mode: 0o600 });
+  return [...files, empty];
+};
+const expectRetentionPruned = (directory: string, bloat: string[], keepPrompt = false): void => {
+  expect(fs.existsSync(directory), "trace-bearing directory remains").toBe(true);
+  for (const file of bloat) expect(fs.existsSync(file), file).toBe(false);
+  expect(fs.existsSync(path.join(directory, "task.txt"))).toBe(keepPrompt);
+  for (const anchor of ["status.json", "manager-result.json", "run-identity.json"]) expect(fs.existsSync(path.join(directory, anchor)), anchor).toBe(true);
+};
 describe("Agent prompt retention (#11663)", () => {
   const managedFixture = (prefix: string) => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(tempRoot);
@@ -180,7 +222,7 @@ describe("Agent prompt retention (#11663)", () => {
   };
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
-  it("keeps a failed prompt and metadata across manager close while successful trees are removed", async () => {
+  it("keeps a failed prompt and metadata across manager close while successful nontrace artifacts are removed", async () => {
     const manager = managedFixture("pi-fabric-prompt-retention-");
     const prompt = "FAIL_DIRECTIVE\nprivate brief with exact bytes: π\n";
     const failedHandle = await manager.spawn({ task: prompt, transport: "process" });
@@ -211,10 +253,18 @@ describe("Agent prompt retention (#11663)", () => {
       expect(fs.statSync(path.dirname(promptPath)).mode & 0o777).toBe(0o700);
     }
     const successfulDirectory = manager.runDirectory(successfulHandle.id)!;
+    const failedDirectory = path.dirname(promptPath);
+    const failedBloat = seedRetentionBloat(failedDirectory);
+    const successfulBloat = seedRetentionBloat(successfulDirectory);
+    // Close intentionally compacts unsuccessful status/result metadata; journals and identity do not change.
+    const failedArtifacts = retentionArtifacts(failedDirectory).filter(artifact => !["status.json", "manager-result.json"].includes(artifact.relative));
+    const successfulArtifacts = retentionArtifacts(successfulDirectory);
     await manager.close();
-    expect(fs.existsSync(successfulDirectory)).toBe(false);
+    expectRetentionPruned(successfulDirectory, successfulBloat);
+    expectRetentionArtifactsUnchanged(successfulDirectory, successfulArtifacts);
+    expectRetentionPruned(failedDirectory, failedBloat, true);
+    expectRetentionArtifactsUnchanged(failedDirectory, failedArtifacts);
     expect(fs.existsSync(promptPath)).toBe(true);
-    expect(fs.readdirSync(path.dirname(promptPath)).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
     const retainedResult = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "manager-result.json"), "utf8")) as AgentRunRecord;
     expect(retainedResult).toMatchObject({ id: failedHandle.id, status: "failed" });
     expect(retainedResult).not.toHaveProperty("task");
@@ -246,8 +296,12 @@ describe("Agent prompt retention (#11663)", () => {
     const currentBytes = fs.readFileSync(taskPath);
     expect(createHash("sha256").update(currentBytes).digest("hex")).toBe(beforeClose.inputSha256);
     expect(Buffer.byteLength(currentBytes)).toBe(beforeClose.inputBytes);
+    const directory = path.dirname(taskPath);
+    const bloat = seedRetentionBloat(directory);
+    const artifacts = retentionArtifacts(directory).filter(artifact => !["status.json", "manager-result.json"].includes(artifact.relative));
     await manager.close();
-    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+    expectRetentionPruned(directory, bloat, true);
+    expectRetentionArtifactsUnchanged(directory, artifacts);
     expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
     const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
     expect(persisted.promptSha256).toBe(beforeClose.promptSha256);
@@ -267,8 +321,12 @@ describe("Agent prompt retention (#11663)", () => {
     await manager.wait(handle.id);
     const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
     fs.writeFileSync(taskPath, "tampered bytes\n", { mode: 0o600 });
+    const directory = path.dirname(taskPath);
+    const bloat = seedRetentionBloat(directory);
+    const artifacts = retentionArtifacts(directory).filter(artifact => !["status.json", "manager-result.json"].includes(artifact.relative));
     await manager.close();
-    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["manager-result.json", "status.json"]);
+    expectRetentionPruned(directory, bloat);
+    expectRetentionArtifactsUnchanged(directory, artifacts);
     expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).toMatchObject({ status: "failed" });
     expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
     const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
@@ -296,9 +354,21 @@ describe("Agent prompt retention (#11663)", () => {
       const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
       const runRoot = path.dirname(path.dirname(taskPath));
       expect(path.dirname(runRoot)).toBe(tempRoot);
+      const control = await manager.run({ task: "FAIL_DIRECTIVE\ntrace-free sweep control\n", transport: "process" });
+      const controlRun = manager.runDirectory(control.id)!;
+      // Only fixture-created journals are removed to make a genuinely trace-free control.
+      for (const artifact of retentionArtifacts(controlRun).filter(artifact => /\.jsonl/i.test(path.basename(artifact.relative)))) {
+        fs.unlinkSync(path.join(controlRun, artifact.relative));
+      }
       await manager.close();
       const owner = JSON.parse(fs.readFileSync(path.join(runRoot, ".fabric-owner.json"), "utf8")) as { closedAt?: number };
       expect(owner.closedAt).toBeTypeOf("number");
+      const directory = path.dirname(taskPath);
+      const bloat = seedRetentionBloat(directory);
+      const artifacts = retentionArtifacts(directory);
+      const ownerBytes = fs.readFileSync(path.join(runRoot, ".fabric-owner.json"));
+      expect(fs.existsSync(taskPath)).toBe(true);
+      expect(fs.existsSync(controlRun), "unsuccessful trace-free prompt waits for the configured age").toBe(true);
       const sweepOptions = {
         tempRoot,
         orphanedTempRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.orphanedTempRunMs,
@@ -307,10 +377,18 @@ describe("Agent prompt retention (#11663)", () => {
       expect(retentionStorage.sweepTempRunRoots({ ...sweepOptions,
         now: result.finishedAt! + DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs - 1,
       }).removedRuns).toEqual([]);
+      expectRetentionArtifactsUnchanged(directory, artifacts);
+      for (const file of bloat) expect(fs.existsSync(file), "young run is not pruned").toBe(true);
       const swept = retentionStorage.sweepTempRunRoots({ ...sweepOptions,
-        now: result.finishedAt! + DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs + 1,
+        now: Math.max(result.finishedAt!, control.finishedAt!) + DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs + 1,
       });
-      expect(swept.removedRuns).toContain(path.dirname(taskPath));
+      expect(swept.removedRuns).toContain(controlRun);
+      expect(fs.existsSync(controlRun), "eligible trace-free run is still fully collected").toBe(false);
+      expect(swept.removedRuns).not.toContain(directory);
+      expect(swept.removedRoots).not.toContain(runRoot);
+      expectRetentionPruned(directory, bloat);
+      expectRetentionArtifactsUnchanged(directory, artifacts);
+      expect(fs.readFileSync(path.join(runRoot, ".fabric-owner.json"))).toEqual(ownerBytes);
     } finally { tmpdir.mockRestore(); vi.unstubAllEnvs(); }
   });
 });
@@ -753,6 +831,8 @@ describe("AgentManager", () => {
       const result = await manager.run({ task: "expiry content gate", transport: "process" });
       const run = manager.runDirectory(result.id)!;
       roots.push(path.dirname(run));
+      const bloat = seedRetentionBloat(run);
+      const artifacts = retentionArtifacts(run);
       const status = fs.readFileSync(path.join(run, "status.json"), "utf8");
       const deliveries = path.join(run, "deliveries");
       fs.mkdirSync(deliveries);
@@ -764,26 +844,36 @@ describe("AgentManager", () => {
         fs.writeFileSync(path.join(child, "task.txt"), "live descendant");
         fs.writeFileSync(path.join(child, "status.json"), JSON.stringify({ status: "running", transport: "process", sessionId: String(process.pid) }));
       }
-      if (contents === "link") fs.linkSync(path.join(run, "task.txt"), path.join(run, "reply.json"));
+      if (contents === "link") {
+        fs.unlinkSync(path.join(run, "reply.json"));
+        fs.linkSync(path.join(run, "task.txt"), path.join(run, "reply.json"));
+      }
       if (contents === "unknown") fs.writeFileSync(path.join(run, "diagnostic.txt"), "preserve unknown content");
-      // A later empty run proves that the entire requested sweep has run, including vetoes.
+      // A later eligible run must lose real bloat: keeping every tree cannot pass the veto cases.
       const control = await manager.run({ task: "empty expiry control", transport: "process" });
       const controlRun = manager.runDirectory(control.id)!;
+      const controlBloat = seedRetentionBloat(controlRun);
+      const controlArtifacts = retentionArtifacts(controlRun);
       fs.mkdirSync(path.join(controlRun, "deliveries"));
       expect(sweep).toBeTypeOf("function");
       clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2_000);
       sweep!();
-      await vi.waitFor(() => expect(fs.existsSync(controlRun)).toBe(false), { timeout: 2_000 });
-      expect(fs.existsSync(run), contents).toBe(contents !== "empty");
-      if (contents !== "empty") {
+      await vi.waitFor(() => expectRetentionPruned(controlRun, controlBloat), { timeout: 2_000 });
+      expectRetentionArtifactsUnchanged(controlRun, controlArtifacts);
+      expectRetentionArtifactsUnchanged(run, artifacts);
+      if (contents === "empty") expectRetentionPruned(run, bloat);
+      else {
         expect(manager.runDirectory(result.id)).toBe(run);
         expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(status);
+        expect(fs.existsSync(path.join(run, "task.txt")), "a veto retains the prompt, not just traces").toBe(true);
+        for (const file of bloat) expect(fs.existsSync(file), `${contents} veto preserves ${file}`).toBe(true);
       }
       if (contents === "pending") {
         expect(fs.readFileSync(path.join(deliveries, "ingress.json"), "utf8")).toContain("not consumed");
         fs.unlinkSync(path.join(deliveries, "ingress.json"));
         sweep!();
-        await vi.waitFor(() => expect(fs.existsSync(run)).toBe(false), { timeout: 2_000 });
+        await vi.waitFor(() => expectRetentionPruned(run, bloat), { timeout: 2_000 });
+        expectRetentionArtifactsUnchanged(run, artifacts);
       }
     } finally {
       clock?.mockRestore();
@@ -828,18 +918,28 @@ describe("AgentManager", () => {
       const result = await manager.run({ task: "LARGE_RESULT", residency: "durable", transport: "process" });
       const run = manager.runDirectory(result.id)!;
       roots.push(path.dirname(run));
+      const bloat = seedRetentionBloat(run);
+      const artifacts = retentionArtifacts(run);
       const worker = fs.readFileSync(path.join(run, "status.json"), "utf8");
       expect(result).toMatchObject({ status: "completed", text: "x".repeat(100_000), value: { output: "x".repeat(100_000) } });
       const ordinary = await manager.run({ task: "ordinary session", transport: "process" });
       const ordinaryRun = manager.runDirectory(ordinary.id)!;
+      const ordinaryBloat = seedRetentionBloat(ordinaryRun);
+      const ordinaryArtifacts = retentionArtifacts(ordinaryRun);
       const actor = await manager.run({ task: "actor activation", residency: "durable", actorId: "actor:fixture", transport: "process" });
       const actorRun = manager.runDirectory(actor.id)!;
+      const actorBloat = seedRetentionBloat(actorRun);
+      const actorArtifacts = retentionArtifacts(actorRun);
       expect(sweep).toBeTypeOf("function");
       // Advance only the manager's clock after real subprocess completion; do not fabricate status.
       clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2_000);
       const attempts = save.mock.calls.length;
       sweep!();
-      await vi.waitFor(() => expect(fs.existsSync(ordinaryRun)).toBe(false), { timeout: 2_000 });
+      await vi.waitFor(() => expectRetentionPruned(ordinaryRun, ordinaryBloat), { timeout: 2_000 });
+      expectRetentionArtifactsUnchanged(ordinaryRun, ordinaryArtifacts);
+      expectRetentionArtifactsUnchanged(run, artifacts);
+      expect(fs.existsSync(path.join(run, "task.txt")), "unsaved completion cannot lose its prompt").toBe(true);
+      for (const file of bloat) expect(fs.existsSync(file), "save failure vetoes nontrace collection").toBe(true);
       expect(fs.existsSync(run), "unsaved completion stays tracked").toBe(true);
       expect(manager.retentionReferences().has(result.id), "pending saved-result publication keeps its acknowledgement fence").toBe(true);
       expect(save.mock.calls.length).toBeGreaterThan(attempts);
@@ -849,17 +949,21 @@ describe("AgentManager", () => {
       expect(result.warnings).toEqual(expect.arrayContaining([expect.stringMatching(/save failed.*retained/i)]));
       expect(result.warnings!.join(" ")).toContain(`${result.id}.json`);
       expect(fs.existsSync(actorRun), "retention still leaves activation cleanup to its actor").toBe(true);
+      expectRetentionArtifactsUnchanged(actorRun, actorArtifacts);
+      for (const file of actorBloat) expect(fs.existsSync(file), "activation remains actor-owned").toBe(true);
       expect((await manager.wait(result.id)).text).toHaveLength(100_000);
       // Fix the native obstruction. The next sweep must retry the original, non-UI-truncated result.
       fs.rmSync(path.join(root, `${result.id}.json`), { recursive: true });
       unblocked = true;
       sweep!();
-      await vi.waitFor(() => expect(fs.existsSync(run)).toBe(false), { timeout: 2_000 });
+      await vi.waitFor(() => expectRetentionPruned(run, bloat), { timeout: 2_000 });
+      expectRetentionArtifactsUnchanged(run, artifacts);
       const saved = JSON.parse(fs.readFileSync(path.join(root, `${result.id}.json`), "utf8"));
       expect(saved).toMatchObject({ id: result.id, status: "completed", text: "x".repeat(100_000), value: { output: "x".repeat(100_000) } });
       expect(saved.warnings).toBeUndefined(); // a failed save must not corrupt the original completion
       await manager.close();
-      expect(fs.existsSync(actorRun), "ordinary close can still collect a finished actor activation").toBe(false);
+      expectRetentionPruned(actorRun, actorBloat);
+      expectRetentionArtifactsUnchanged(actorRun, actorArtifacts);
     } finally {
       clock?.mockRestore();
       await manager.close(); // keep the host-global sweep disabled even on an assertion failure
@@ -884,6 +988,8 @@ describe("AgentManager", () => {
     managers.push(manager);
     const result = await manager.run({ task: "LARGE_RESULT", residency, transport: "process" });
     const run = manager.runDirectory(result.id)!;
+    const bloat = seedRetentionBloat(run);
+    const artifacts = retentionArtifacts(run);
     const worker = JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"));
     expect(result).toMatchObject({ status: worker.status, text: worker.text, value: worker.value });
     expect(result.text).toHaveLength(100_000);
@@ -893,6 +999,9 @@ describe("AgentManager", () => {
     if (collection === "cleanup") {
       await expect(manager.cleanup(result.id)).rejects.toThrow(/EIO writing/);
       expect(fs.existsSync(run), "throwing callback must veto explicit cleanup").toBe(true);
+      expectRetentionArtifactsUnchanged(run, artifacts);
+      expect(fs.existsSync(path.join(run, "task.txt"))).toBe(true);
+      for (const file of bloat) expect(fs.existsSync(file), "throwing callback vetoes nontrace collection").toBe(true);
     }
     // Ordinary nonresident manager: no callback and no persistence obligation.
     const ordinary = new AgentManager(process.cwd(), manager.config, {
@@ -901,17 +1010,24 @@ describe("AgentManager", () => {
     managers.push(ordinary);
     const session = await ordinary.run({ task: "ordinary session", transport: "process" });
     const sessionRun = ordinary.runDirectory(session.id)!;
-    await ordinary.cleanup(session.id);
-    expect(fs.existsSync(sessionRun)).toBe(false);
+    const sessionBloat = seedRetentionBloat(sessionRun);
+    const sessionArtifacts = retentionArtifacts(sessionRun);
+    expect(await ordinary.cleanup(session.id)).toEqual({ cleaned: false });
+    expectRetentionPruned(sessionRun, sessionBloat);
+    expectRetentionArtifactsUnchanged(sessionRun, sessionArtifacts);
     // Actor callback returns normally; it must not inherit the unrelated public task's pin.
     const actor = await manager.run({ task: "actor activation", actorId: "actor:fixture", residency: "durable", transport: "process" });
     const actorRun = manager.runDirectory(actor.id)!;
-    await manager.cleanup(actor.id);
-    expect(fs.existsSync(actorRun)).toBe(false);
+    const actorBloat = seedRetentionBloat(actorRun);
+    const actorArtifacts = retentionArtifacts(actorRun);
+    expect(await manager.cleanup(actor.id)).toEqual({ cleaned: false });
+    expectRetentionPruned(actorRun, actorBloat);
+    expectRetentionArtifactsUnchanged(actorRun, actorArtifacts);
     blocked = false;
     if (collection === "cleanup") await manager.cleanup(result.id);
     else await manager.close();
-    expect(fs.existsSync(run), "successful preservation authorizes collection").toBe(false);
+    expectRetentionPruned(run, bloat);
+    expectRetentionArtifactsUnchanged(run, artifacts);
     const saved = JSON.parse(fs.readFileSync(savedPath, "utf8"));
     expect(saved).toMatchObject(worker); // manager may add transport metadata, never truncate the completion
     expect(saved.error).toBe(worker.error);
@@ -2090,9 +2206,14 @@ describe("AgentManager", () => {
       expect(await launched[0]!.isAlive()).toBe(false);
       expect(launched[0]!.lostContact?.()).toBeUndefined();
       expect(fs.existsSync(path.join(runDirectory, "unresolved-worker.json"))).toBe(false);
-      expect(await manager.cleanup(handle.id)).toMatchObject({ cleaned: true });
+      const bloat = seedRetentionBloat(runDirectory);
+      const artifacts = retentionArtifacts(runDirectory);
+      expect(await manager.cleanup(handle.id)).toEqual({ cleaned: false });
+      expectRetentionPruned(runDirectory, bloat);
+      expectRetentionArtifactsUnchanged(runDirectory, artifacts);
       await manager.close();
-      expect(fs.existsSync(runDirectory)).toBe(false);
+      expectRetentionPruned(runDirectory, bloat);
+      expectRetentionArtifactsUnchanged(runDirectory, artifacts);
     } finally {
       spy.mockRestore();
       for (const handle of launched) await handle.stop();
@@ -2192,7 +2313,7 @@ describe("AgentManager", () => {
     }
   }, 45_000);
 
-  it.skipIf(process.platform === "win32")("R3 close preserves an untracked surviving worker directory and removes tracked terminal runs", async () => {
+  it.skipIf(process.platform === "win32")("R3 close preserves an untracked surviving worker directory and prunes tracked terminal nontrace artifacts", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-orphan-"));
     roots.push(root);
     const runRoot = path.join(root, "runs");
@@ -2210,9 +2331,12 @@ describe("AgentManager", () => {
       const result = await manager.run({ task: "complete quickly", transport: "process" });
       expect(result.status).toBe("completed");
       const tracked = manager.runDirectory(result.id)!;
+      const bloat = seedRetentionBloat(tracked);
+      const artifacts = retentionArtifacts(tracked);
       await manager.close();
       expect(child.exitCode).toBeNull();
-      expect(fs.existsSync(tracked)).toBe(false);
+      expectRetentionPruned(tracked, bloat);
+      expectRetentionArtifactsUnchanged(tracked, artifacts);
       expect(fs.existsSync(untracked)).toBe(true);
       expect(fs.readFileSync(path.join(untracked, "evidence"), "utf8")).toBe("still in use");
     } finally { child.kill(); await exited; }

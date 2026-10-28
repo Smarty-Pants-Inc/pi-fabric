@@ -99,6 +99,25 @@ describe.skipIf(process.platform === "win32")("resident run age pruning (no real
     expect(snapshot()).toEqual(before);
   });
 
+  it.each(["jsonl", "ndjson"])("dry-run %s trace pair retains trace/status bytes and plans only the nontrace reply", extension => {
+    const now = Date.now();
+    const { runs, actorRoot, run, aged, snapshot } = fixture(now);
+    const trace = path.join(run.old, `worker-session.${extension}`);
+    const bytes = Buffer.from('{"worker":"retained raw trace"}\n');
+    fs.writeFileSync(trace, bytes, { mode: 0o600 });
+    age(run.old, aged);
+    const before = snapshot();
+    const unlink = vi.spyOn(fs, "unlinkSync"), rmdir = vi.spyOn(fs, "rmdirSync"), rename = vi.spyOn(fs, "renameSync");
+
+    expect(sweepResidentRuns(runs, now, 10_000, { actorRoots: [actorRoot], dryRun: true })).toEqual([]);
+    expect(recorded).toEqual([{ target: path.join(run.old, "reply.json"), deleter: "sweepResidentRuns", dryRun: true }]);
+    expect(fs.readFileSync(trace)).toEqual(bytes);
+    expect(snapshot()).toEqual(before);
+    expect(unlink).not.toHaveBeenCalled();
+    expect(rmdir).not.toHaveBeenCalled();
+    expect(rename).not.toHaveBeenCalled();
+  });
+
   it("the streaming ResidentRequestRetention selects the same old run (recorded verifiedRemove, no fallback)", () => {
     const now = Date.now();
     const { dir, actorRoot, run, snapshot } = fixture(now);

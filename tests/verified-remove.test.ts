@@ -9,6 +9,7 @@ import {
 import { sweepResidentRuns } from "../src/residency/retention.js";
 import { closeScratch, createScratch, sweepScratch } from "../src/storage/scratch.js";
 import { MeshRetentionApplyDisabledError, sweepMeshRetention } from "../src/storage/retention-cli.js";
+import * as traceMove from "../src/storage/trace-move.js";
 
 // smarty-dev#7916 acceptance: for each routed deleter, a swap between the judgment and the delete (file to symlink,
 // a replaced inode, a foreign owner, a refreshed mtime) deletes nothing; no getuid deletes nothing; a future-dated
@@ -46,7 +47,7 @@ const shape = (file: string): unknown => {
 type Swap = "symlink" | "replaced inode" | "foreign owner" | "refreshed mtime";
 const SWAPS: Swap[] = ["symlink", "replaced inode", "foreign owner", "refreshed mtime"];
 /** Apply `swap` to `target` once, right before the removal; returns what must still exist afterwards. */
-const armSwap = async (target: string, swap: Swap, hookTarget = target): Promise<() => Record<string, unknown>> => {
+const armSwap = async (target: string, swap: Swap, hookTargets = [target]): Promise<() => Record<string, unknown>> => {
   const outside = tmp("fabric-swap-outside-");
   const moved = path.join(outside, "moved");
   let fired = false;
@@ -65,15 +66,24 @@ const armSwap = async (target: string, swap: Swap, hookTarget = target): Promise
   };
   const hooks = await import("../src/storage/verified-remove.js").then(module => module.verifiedRemoveTestHooks).catch(() => undefined);
   let hookFired = false;
+  let beforeSwap: unknown;
+  let refreshedMtime: number | undefined;
   if (hooks) {
-    hooks.beforeOpen = (file) => { if (file === hookTarget) { hookFired = true; doSwap(); } };
+    hooks.beforeOpen = (file) => {
+      // Directory iteration order is unspecified: swap at the FIRST eligible artifact, not status-after-reply.
+      if (!hookTargets.includes(file) || fired) return;
+      hookFired = true;
+      beforeSwap = shape(target);
+      doSwap();
+      if (swap === "refreshed mtime") refreshedMtime = fs.lstatSync(target).mtimeMs;
+    };
     restores.push(() => { delete hooks.beforeOpen; });
   } else {
     // main: swap inside main's own removal call on the target, before it runs.
     const intercept = <K extends "rmSync" | "unlinkSync" | "renameSync">(name: K) => {
       const original = fs[name] as (...args: unknown[]) => unknown;
       vi.spyOn(fs, name).mockImplementation(((...args: unknown[]) => {
-        if (args[0] === target || args[0] === hookTarget || (name === "renameSync" && (args[1] === target || args[1] === hookTarget))) doSwap();
+        if (args[0] === target || hookTargets.includes(String(args[0])) || (name === "renameSync" && (args[1] === target || hookTargets.includes(String(args[1]))))) doSwap();
         return original(...args);
       }) as never);
     };
@@ -81,40 +91,41 @@ const armSwap = async (target: string, swap: Swap, hookTarget = target): Promise
     const rm = fs.promises.rm;
     vi.spyOn(fs.promises, "rm").mockImplementation(((file: fs.PathLike, options?: fs.RmOptions) => { if (file === target) doSwap(); return rm(file, options); }) as never);
   }
-  return () => ({ target: shape(target), outside: shape(outside), moved, hookFired });
+  return () => ({ target: shape(target), outside: shape(outside), moved, hookFired, beforeSwap, refreshedMtime });
 };
 
-interface Fixture { target: string; hookTarget: string; act: () => unknown }
+const artifactTargets = (directory: string): string[] => ["status.json", "reply.json"].map(name => path.join(directory, name));
+interface Fixture { target: string; hookTargets: string[]; act: () => unknown }
 const FIXTURES: Record<string, () => Fixture> = {
   pruneActorRunArchives: () => {
     const runs = tmp("fabric-vr-archives-");
     const target = run(path.join(runs, "old"));
-    return { target, hookTarget: path.join(target, "status.json"), act: () => pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW }) };
+    return { target, hookTargets: artifactTargets(target), act: () => pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW }) };
   },
   sweepResidentRuns: () => {
     const residency = tmp("fabric-vr-resident-");
     const target = old(run(path.join(residency, "runs", "old")));
-    return { target, hookTarget: path.join(target, "status.json"), act: () => sweepResidentRuns(path.join(residency, "runs"), NOW, 10_000, { retentionMs: DAY }) };
+    return { target, hookTargets: artifactTargets(target), act: () => sweepResidentRuns(path.join(residency, "runs"), NOW, 10_000, { retentionMs: DAY }) };
   },
   "pruneClosedRunRoot (sweepTempRunRoots)": () => {
     const tempRoot = tmp("fabric-vr-closed-");
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "closed");
     const target = run(path.join(root, "old"));
     write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }));
-    return { target, hookTarget: path.join(target, "status.json"), act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
+    return { target, hookTargets: artifactTargets(target), act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
   },
   "sweepTempRunRoots (orphaned root)": () => {
     const tempRoot = tmp("fabric-vr-orphan-");
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "orphan");
     const target = run(path.join(root, "old"));
     write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
-    return { target, hookTarget: path.join(target, "status.json"), act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
+    return { target, hookTargets: artifactTargets(target), act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
   },
   removeEmptyRunRoot: () => {
     const tempRoot = tmp("fabric-vr-empty-");
     const target = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "empty");
     write(path.join(target, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, closedAt: 1 }));
-    return { target, hookTarget: path.join(target, ".fabric-owner.json"), act: () => removeEmptyRunRoot(target) };
+    return { target, hookTargets: [path.join(target, ".fabric-owner.json")], act: () => removeEmptyRunRoot(target) };
   },
   // smarty-dev#16444: pruneActorSessionBackups is no longer a deleter (it moves older backups into session-archive/,
   // tests/actor-session-trace-archive.test.ts), so it left this deletion matrix.
@@ -123,14 +134,14 @@ const FIXTURES: Record<string, () => Fixture> = {
     const target = createScratch("output", tempRoot);
     write(path.join(target, "output.txt"), "x");
     closeScratch(target);
-    return { target, hookTarget: target, act: () => sweepScratch({ tempRoot, now: Date.now() + 2 * DAY }) };
+    return { target, hookTargets: [target], act: () => sweepScratch({ tempRoot, now: Date.now() + 2 * DAY }) };
   },
   claimMeshRetentionSweep: () => {
     const meshRoot = tmp("fabric-vr-claim-");
     const hour = 3600_000;
     claimMeshRetentionSweep(meshRoot, hour, 10 * hour);
     const target = path.join(meshRoot, ".mesh-retention-sweep-10.json");
-    return { target, hookTarget: target, act: () => claimMeshRetentionSweep(meshRoot, hour, 12 * hour) };
+    return { target, hookTargets: [target], act: () => claimMeshRetentionSweep(meshRoot, hour, 12 * hour) };
   },
 };
 // The public mesh pass is not in FIXTURES: its apply rejects at the boundary until smarty-dev#10678 (pi-fabric#1014 SEC
@@ -148,27 +159,39 @@ const meshPass = () => {
 };
 
 describe.skipIf(process.platform !== "linux")("verified removal: every routed retention deleter (smarty-dev#7916)", () => {
-  it("keeps run artifacts when the judged root mtime changes before the first per-file removal", async () => {
+  it.each([
+    ["Linux apply", "linux", false], ["Linux dry run", "linux", true],
+    ["fallback apply", "darwin", false], ["fallback dry run", "darwin", true],
+  ] as const)("keeps run artifacts when the judged root mtime changes before the first per-file removal (%s)", async (_name, platform, dryRun) => {
     const runs = tmp("fabric-vr-root-mtime-");
     const target = run(path.join(runs, "old"));
     const status = path.join(target, "status.json");
+    const artifacts = artifactTargets(target), before = shape(target);
     const hooks = (await import("../src/storage/verified-remove.js")).verifiedRemoveTestHooks;
-    let fired = false;
+    let firstArtifact: string | undefined, beforeRefresh: unknown, refreshedMtime: number | undefined;
     hooks.beforeOpen = file => {
-      if (file !== status || fired) return;
-      fired = true;
+      if (!artifacts.includes(file) || firstArtifact !== undefined) return;
+      firstArtifact = file;
+      beforeRefresh = shape(target);
       const refreshed = Date.now() / 1_000 + 5;
       fs.utimesSync(target, refreshed, refreshed);
+      refreshedMtime = fs.lstatSync(target).mtimeMs;
     };
     restores.push(() => { delete hooks.beforeOpen; });
     const deletionCalls: string[] = [];
     vi.spyOn(fs, "unlinkSync").mockImplementation((file => { deletionCalls.push(`unlink:${String(file)}`); }) as typeof fs.unlinkSync);
     vi.spyOn(fs, "rmdirSync").mockImplementation((file => { deletionCalls.push(`rmdir:${String(file)}`); }) as typeof fs.rmdirSync);
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: platform });
+    restores.push(() => Object.defineProperty(process, "platform", originalPlatform));
     try {
-      pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW });
-      expect(fired).toBe(true);
+      pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW, dryRun });
+      expect(artifacts).toContain(firstArtifact);
+      expect(beforeRefresh, "no earlier artifact was removed before the seam").toEqual(before);
       expect({ status: fs.existsSync(status), reply: fs.existsSync(path.join(target, "reply.json")) }).toEqual({ status: true, reply: true });
       expect(deletionCalls).toEqual([]);
+      expect(shape(target), "no graveyard or artifact move").toEqual(before);
+      expect(fs.lstatSync(target).mtimeMs, "do not backdate the external refresh").toBe(refreshedMtime);
       expect(fs.readFileSync(status, "utf8")).toContain('"status":"completed"');
       expect(fs.readFileSync(path.join(target, "reply.json"), "utf8")).toBe('{"text":"done"}');
     } finally { vi.restoreAllMocks(); }
@@ -180,10 +203,10 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     expect(fs.existsSync(target)).toBe(false);
   });
 
-  it("paired trace control: leaves JSONL byte-identical and prunes a nontrace artifact", () => {
+  it.each(["jsonl", "ndjson"])("paired %s trace control: leaves trace bytes identical and prunes a nontrace artifact", extension => {
     const runs = tmp("fabric-vr-trace-pair-");
     const target = run(path.join(runs, "old"));
-    const status = path.join(target, "status.json"), reply = path.join(target, "reply.json"), trace = path.join(target, "events.jsonl");
+    const status = path.join(target, "status.json"), reply = path.join(target, "reply.json"), trace = path.join(target, `events.${extension}`);
     write(trace, LOG);
     const originalStatus = fs.readFileSync(status), originalTrace = fs.readFileSync(trace);
     const deletionCalls: string[] = [];
@@ -209,28 +232,61 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     expect(compactTerminalRunEvents(directory, { now: NOW, terminalRunEventsMaxBytes: 1024 })).toBe(true);
     expect(fs.statSync(events).size).toBeLessThan(original.length);
     const archive = path.join(directory, "session-archive");
-    const archived = fs.readdirSync(archive).filter(name => name.endsWith(".jsonl"));
+    const archived = fs.readdirSync(archive).filter(name => name !== "MANIFEST.jsonl" && name.endsWith(".jsonl"));
     expect(archived).toHaveLength(1);
     expect(fs.readFileSync(path.join(archive, archived[0]!))).toEqual(original);
   });
 
-  it("keeps the source trace byte-identical when archive rename fails", () => {
-    const directory = run(path.join(tmp("fabric-vr-compact-rename-failure-"), "old"));
-    const events = path.join(directory, "events.jsonl");
+  it.each(["archive copy", "tail publication"])("keeps the source trace byte-identical when %s fails", failure => {
+    const directory = run(path.join(tmp("fabric-vr-compact-failure-"), "old"));
+    const events = path.join(directory, "events.jsonl"), archive = path.join(directory, "session-archive");
     write(events, LOG);
-    const original = fs.readFileSync(events);
-    const rename = fs.renameSync;
-    vi.spyOn(fs, "renameSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
-      if (String(from) === events) throw Object.assign(new Error("archive rename failed"), { code: "ENOSPC" });
-      return rename(from, to);
-    }) as typeof fs.renameSync);
+    const original = fs.readFileSync(events), originalStat = fs.lstatSync(events);
+    const open = fs.openSync, link = fs.linkSync;
+    let injected = false;
+    vi.spyOn(fs, "openSync").mockImplementation(((file: fs.PathLike, flags: string | number, mode?: number) => {
+      if (failure === "archive copy" && path.dirname(String(file)) === archive &&
+          path.basename(String(file)) !== "MANIFEST.jsonl" && String(file).endsWith(".jsonl") &&
+          typeof flags === "number" && (flags & fs.constants.O_CREAT) !== 0) {
+        injected = true;
+        throw Object.assign(new Error("archive copy failed"), { code: "ENOSPC" });
+      }
+      return open(file, flags as never, mode);
+    }) as typeof fs.openSync);
+    if (traceMove.nativeTraceMoveHost()) {
+      const move = traceMove.moveTraceNoReplace;
+      vi.spyOn(traceMove, "moveTraceNoReplace").mockImplementation((from, to) => {
+        if (failure === "tail publication" && to === events && from.endsWith(".tmp")) {
+          injected = true;
+          // Preserve the derivative and force an actual native ENOENT, not a green stub movement.
+          fs.renameSync(from, from + ".evidence");
+        }
+        return move(from, to);
+      });
+    } else vi.spyOn(fs, "linkSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+      if (failure === "tail publication" && String(to) === events && String(from).endsWith(".tmp")) {
+        injected = true;
+        throw Object.assign(new Error("tail publication failed"), { code: "ENOSPC" });
+      }
+      return link(from, to);
+    }) as typeof fs.linkSync);
     expect(compactTerminalRunEvents(directory, { now: NOW, terminalRunEventsMaxBytes: 1024 })).toBe(false);
     vi.restoreAllMocks();
+    expect(injected, "the failure seam must actually execute").toBe(true);
     expect(fs.readFileSync(events)).toEqual(original);
-    expect(fs.readFileSync(path.join(directory, "session-archive", "MANIFEST.jsonl"), "utf8")).toContain("MOVE-FAILED");
+    expect(fs.lstatSync(events)).toMatchObject({ dev: originalStat.dev, ino: originalStat.ino });
+    const archived = fs.readdirSync(archive).filter(name => name !== "MANIFEST.jsonl" && name.endsWith(".jsonl"));
+    if (failure === "archive copy") {
+      expect(archived).toEqual([]);
+      expect(fs.existsSync(path.join(archive, "MANIFEST.jsonl"))).toBe(false);
+    } else {
+      expect(archived).toHaveLength(1);
+      expect(fs.readFileSync(path.join(archive, archived[0]!))).toEqual(original);
+      expect(fs.readFileSync(path.join(archive, "MANIFEST.jsonl"), "utf8")).toContain("COPY-READBACK");
+    }
   });
 
-  it("refuses an archive pre-rename identity recheck after the trace inode changes", () => {
+  it("refuses the archive source-open identity recheck after the trace inode changes", () => {
     const directory = run(path.join(tmp("fabric-vr-compact-recheck-"), "old"));
     const events = path.join(directory, "events.jsonl"), displaced = path.join(directory, "events.original");
     write(events, LOG);
@@ -249,13 +305,15 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     expect(traceOpens).toBe(2);
     expect(fs.readFileSync(displaced)).toEqual(original);
     expect(fs.readFileSync(events, "utf8")).toBe("replacement\n");
-    expect(fs.existsSync(path.join(directory, "session-archive"))).toBe(false);
+    // The copy path prepares its directory before opening the source, but must publish no archive or receipt.
+    expect(fs.readdirSync(path.join(directory, "session-archive"))).toEqual([]);
   });
 
   const cases = Object.keys(FIXTURES).flatMap(name => SWAPS.map(swap => [name, swap] as const));
   it.each(cases)("%s deletes nothing after a swap to a %s between judgment and per-file removal", async (name, swap) => {
-    const { target, hookTarget, act } = FIXTURES[name]!();
-    const observe = await armSwap(target, swap, hookTarget);
+    const { target, hookTargets, act } = FIXTURES[name]!();
+    const before = shape(target);
+    const observe = await armSwap(target, swap, hookTargets);
     const deletionCalls: string[] = [];
     vi.spyOn(fs, "unlinkSync").mockImplementation((file => { deletionCalls.push(`unlink:${String(file)}`); }) as typeof fs.unlinkSync);
     vi.spyOn(fs, "rmdirSync").mockImplementation((file => { deletionCalls.push(`rmdir:${String(file)}`); }) as typeof fs.rmdirSync);
@@ -264,14 +322,19 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
     const after = observe();
     for (const restore of restores.splice(0).reverse()) restore();
     vi.restoreAllMocks();
-    expect(after.hookFired, `${name} / ${swap}: per-file hook`).toBe(true);
+    expect(after.hookFired, `${name} / ${swap}: first eligible per-file hook`).toBe(true);
+    expect(after.beforeSwap, `${name} / ${swap}: no earlier artifact removal`).toEqual(before);
     expect(after.target, `${name} / ${swap}: target path`).not.toBeNull();
     if (swap === "symlink") expect(after.target).toEqual(["link", after.moved]);
     if (swap === "symlink" || swap === "replaced inode") {
       const outside = after.outside as Record<string, unknown>;
       expect(Object.values(outside).every(value => value !== null), `${name} / ${swap}: moved original`).toBe(true);
     }
-    if (swap === "refreshed mtime") expect(fs.existsSync(hookTarget), `${name}: artifact under refreshed root`).toBe(true);
+    if (swap === "refreshed mtime") {
+      for (const artifact of hookTargets) expect(fs.existsSync(artifact), `${name}: artifact under refreshed root`).toBe(true);
+      expect(shape(target), `${name}: refreshed tree byte-identical, no graveyard`).toEqual(before);
+      expect(fs.lstatSync(target).mtimeMs, `${name}: refreshed mtime is not backdated`).toBe(after.refreshedMtime);
+    }
     expect(deletionCalls, `${name} / ${swap}: no deletion operation`).toEqual([]);
   });
 
@@ -376,8 +439,8 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
   it("a dry run verifies the whole tree and reports its bytes, and changes nothing", async () => {
     const { verifiedRemove } = await import("../src/storage/verified-remove.js");
     const target = run(path.join(tmp("fabric-vr-dry-"), "old"));
-    const before = shape(path.dirname(target));
     write(path.join(target, "events.jsonl"), LOG);
+    const before = shape(path.dirname(target));
     const result = verifiedRemove(target, fs.lstatSync(target), { deleter: "test", dryRun: true });
     expect(result).toEqual({ removed: true, bytes: LOG.length + 15 + fs.statSync(path.join(target, "status.json")).size });
     expect(shape(path.dirname(target))).toEqual(before);

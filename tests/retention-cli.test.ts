@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { MESH_RETENTION_APPLY_DISABLED_CODE, MESH_RETENTION_APPROVAL, MESH_RETENTION_HOLD, MeshRetentionApplyDisabledError, sweepMeshRetention, writeReport } from "../src/storage/retention-cli.js";
 import { pruneActorSessionBackups } from "../src/storage/retention.js";
@@ -197,15 +198,46 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     expect(fs.statSync(report).mode & 0o777).toBe(0o600);
   });
 
-  it("re-checks the gate before EACH session-backup unlink (smarty-dev#7766)", () => {
+  it("re-checks the gate before EACH session-backup move (smarty-dev#7766)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-backups-")); roots.push(dir);
     const session = path.join(dir, "session.jsonl");
     write(session, "");
     for (const stamp of ["20260927T150000000Z", "20260928T150000000Z", "20260929T150000000Z", "20260930T150000000Z"]) write(`${session}.${stamp}.bak`, "x");
-    let asked = 0;
-    // A hold lands after the first unlink: the remaining older backups stay.
-    expect(pruneActorSessionBackups(session, { stop: () => asked++ > 0 })).toHaveLength(1);
+    let completedMoves = 0;
+    // A hold lands after the first actual move, not after an arbitrary number of safety checks.
+    expect(pruneActorSessionBackups(session, {
+      stop: () => completedMoves > 0, onPrune: () => { completedMoves++; },
+    })).toHaveLength(1);
+    expect(completedMoves).toBe(1);
     expect(fs.readdirSync(dir).filter(name => name.endsWith(".bak"))).toHaveLength(3);
+  });
+
+  it("a hold landing after a verified copy still vetoes the backup move and preserves the raw original", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-backups-copy-hold-")); roots.push(dir);
+    const session = path.join(dir, "session.jsonl"), old = `${session}.20260927T150000000Z.bak`;
+    const latest = `${session}.20260928T150000000Z.bak`, original = '{"type":"session","raw":"hold-before-move"}\n';
+    write(session, "live"); write(old, original); write(latest, "newest");
+    fs.utimesSync(old, 1_000, 1_000); fs.utimesSync(latest, 1_001, 1_001);
+    const before = fs.lstatSync(old), archive = path.join(dir, "session-archive"), manifest = path.join(archive, "MANIFEST.jsonl");
+    const records = () => fs.existsSync(manifest) ? fs.readFileSync(manifest, "utf8").trim().split("\n")
+      .filter(Boolean).map(line => JSON.parse(line) as { phase: string; from: string; to: string; sha256: string; bytes: number }) : [];
+    let completedMoves = 0;
+    const moved = pruneActorSessionBackups(session, {
+      stop: () => records().some(record => record.phase === "COPY-READBACK" && record.from === old),
+      onPrune: () => { completedMoves++; },
+    });
+    expect(moved).toEqual([]); expect(completedMoves).toBe(0);
+    const after = fs.lstatSync(old);
+    expect([after.dev, after.ino, after.size, after.mtimeMs, after.ctimeMs])
+      .toEqual([before.dev, before.ino, before.size, before.mtimeMs, before.ctimeMs]);
+    expect(fs.readFileSync(old, "utf8")).toBe(original);
+    expect(fs.readFileSync(latest, "utf8")).toBe("newest");
+    expect(fs.readFileSync(session, "utf8")).toBe("live");
+    expect(records()).toHaveLength(1);
+    const copy = records()[0]!;
+    expect(copy).toMatchObject({ phase: "COPY-READBACK", from: old, bytes: Buffer.byteLength(original),
+      sha256: createHash("sha256").update(original).digest("hex") });
+    expect(fs.readFileSync(copy.to, "utf8")).toBe(original);
   });
 
   it("never accepts an approval whose owner cannot be proven (smarty-dev#7766)", async () => {

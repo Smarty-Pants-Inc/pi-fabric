@@ -63,8 +63,9 @@ const lazyEntryPoints = [
   "src/actors/slot-authority.ts",
   // Import-only per-materialization claim parsing, not idle registration work.
   "src/commands/slot-import.ts",
-  // First-use scratch removal: a stable entry keeps the shared verifier out of the startup graph.
+  // First-use scratch removal: stable entries keep verification and trace copies lazy across installs.
   "src/storage/verified-remove.ts",
+  "src/storage/trace-archive.ts",
   // The resident's first operator cleanup reuses the offline final-check helper (smarty-dev#8090).
   "src/actors/remove-offline.ts",
   "src/residency/launcher-owner.ts",

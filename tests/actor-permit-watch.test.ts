@@ -150,6 +150,12 @@ afterEach(async () => {
     await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
     await f.actors.close();
     await f.agents.close();
+    const sink = process.env.FABRIC_ACTOR_PERMIT_TRACE_SINK;
+    if (sink) {
+      const destination = path.join(sink, path.basename(f.root));
+      preserveTraces(f.root, destination);
+      fs.writeFileSync(path.join(destination, "recorded-deletions.json"), JSON.stringify(deletionCalls, null, 2), { flag: "wx" });
+    }
   }
   fixtures.length = 0;
   expect(deletionCalls.length).toBeGreaterThan(0);
@@ -157,7 +163,21 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-function fixture(): Fixture {
+// Keep product operations inside the test's guarded TMPDIR. Export traces with
+// exclusive new-file writes only: no destination replacement/deletion, no links
+// followed, and no temporary-wrapper cleanup can remove this caller-owned sink.
+function preserveTraces(source: string, destination: string): void {
+  fs.mkdirSync(destination);
+  for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+    const from = path.join(source, entry.name), to = path.join(destination, entry.name);
+    if (entry.isDirectory()) preserveTraces(from, to);
+    else if (entry.isFile()) fs.writeFileSync(to, fs.readFileSync(from), { flag: "wx" });
+    else if (entry.isSymbolicLink()) fs.writeFileSync(`${to}.symlink-target`, fs.readlinkSync(from), { flag: "wx" });
+    else throw new Error(`Unexpected fixture trace type: ${from}`);
+  }
+}
+
+function fixture(onSettled?: (result: AgentRunRecord) => void): Fixture {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-permit-watch-"));
   fixtureRoots.push(root); // Constructors can release metadata locks before fixture() returns.
   const admission = path.join(root, "actors", "admission.json");
@@ -165,7 +185,7 @@ function fixture(): Fixture {
     enabled: true, runner: "pi", transport: "process", maxConcurrent: 1, budgetUsd: 0,
     deniedModels: [], timeoutMs: 24 * 60 * 60_000, retainRuns: true, sessionExport: false }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
-    meshRoot: path.join(root, "mesh"), admissionSnapshotPath: admission,
+    meshRoot: path.join(root, "mesh"), admissionSnapshotPath: admission, ...(onSettled ? { onSettled } : {}),
   });
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const identity: MeshIdentity = { id: "session:permit-test", name: "main", kind: "main", sessionId: "permit-test" };
@@ -452,6 +472,177 @@ async function reconciledExactlyOnce(
 }
 
 describe("actor worker permit release (#9031)", () => {
+  it.each(["later-close", "already-closed", "historical-debt", "save-failure"] as const)(
+    "settles the exact saved actor outcome after a failed monitor, with FIFO and once-only delivery (%s)", async mode => {
+      const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
+      const stops: number[] = [];
+      vi.mocked(ProcessTransport.prototype.launch).mockImplementation(async request => {
+        const handle = await launch(request);
+        const worker = workers.get(Number(handle.sessionId))!;
+        return { ...handle, stop: async () => {
+          stops.push(worker.pid);
+          // Fulfill close BEFORE the stop rejects and the recovery owner arms.
+          // It must inspect an already-fired receipt, not depend on a new event.
+          if (mode === "already-closed") worker.nativeClose();
+          return handle.stop();
+        } };
+      });
+      const delivered: AgentRunRecord[] = [];
+      const f = fixture(result => { delivered.push(structuredClone(result)); });
+      const actor = await create(f, `saved-after-monitor-${mode}`);
+      await f.actors.tell(actor.id, "FIFO event 0");
+      const first = await launched(f, actor.id);
+      const answer = f.agents.wait(first.launch.id);
+      await f.actors.tell(actor.id, "FIFO event 1");
+      await f.actors.tell(actor.id, "FIFO event 2");
+      await eventually(() => expect(f.actors.status(actor.id).queued).toBe(2));
+      const before = queueEvidence(f, actor.id);
+      const saved = { status: "completed" as const, text: "the real saved answer", value: { exact: [7, "kept"] },
+        warnings: ["worker saved completion after slow child exit"], exitCode: null, turns: 4, toolCalls: 2,
+        finishedAt: Date.now(), updatedAt: Date.now() };
+      // The normal terminal path gets ONE checked stop while the primary is live.
+      // Its rejection kills the baseline monitor. Recovery must not stop it again.
+      save(first, saved);
+      await eventually(() => expect(stops.filter(pid => pid === first.pid)).toHaveLength(1));
+      const resultFile = path.join(path.dirname(first.statusFile), "manager-result.json");
+      const unresolved = path.join(path.dirname(first.statusFile), "unresolved-worker.json");
+      await eventually(() => expect(fs.existsSync(unresolved)).toBe(true));
+      await observe();
+      expect(stops.filter(pid => pid === first.pid)).toHaveLength(1);
+      expect(fs.existsSync(resultFile)).toBe(false);
+      expect(delivered).toEqual([]);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+
+      first.alive = false;
+      first.descendants = true;
+      if (mode === "historical-debt") first.debt = "immutable historical native stop debt";
+      await observe();
+      expect(first.descendants, "recovery cannot kill a surviving descendant").toBe(true);
+      expect(stops.filter(pid => pid === first.pid)).toHaveLength(1);
+      expect(fs.existsSync(resultFile)).toBe(false);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+      expect(workers.size).toBe(1);
+
+      let failSave = mode === "save-failure";
+      const open = fs.openSync;
+      const saveAttempts: string[] = [];
+      const writes = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+        if (typeof file === "string" && file.startsWith(resultFile) && file.endsWith(".tmp")) {
+          saveAttempts.push(file);
+          if (failSave) {
+            failSave = false;
+            // Keep the retry at an unknown identity boundary until the test has
+            // inspected custody after exactly ONE failed durable write.
+            first.probeError = "EIO";
+            throw new Error("injected manager-result write failure");
+          }
+        }
+        return open(file, flags, mode);
+      });
+      try {
+        first.descendants = false;
+        first.nativeClose();
+        if (mode === "save-failure") {
+          await eventually(() => expect(saveAttempts.length).toBeGreaterThan(0));
+          expect(fs.existsSync(resultFile)).toBe(false);
+          expect(delivered).toEqual([]);
+          expect(queueEvidence(f, actor.id)).toEqual(before);
+          expect(f.actors.status(actor.id).inFlightRun?.id).toBe(first.launch.id);
+          expect(workers.size).toBe(1);
+          expect(saveAttempts).toHaveLength(1);
+          delete first.probeError;
+        }
+        await expect(answer).resolves.toMatchObject(saved);
+        expect(JSON.parse(fs.readFileSync(resultFile, "utf8"))).toMatchObject(saved);
+        expect(delivered.filter(result => result.id === first.launch.id)).toHaveLength(1);
+        expect(delivered.find(result => result.id === first.launch.id)).toMatchObject(saved);
+        expect(JSON.parse(fs.readFileSync(first.statusFile, "utf8"))).toMatchObject(saved);
+        expect(stops.filter(pid => pid === first.pid)).toHaveLength(1);
+        if (mode === "historical-debt") {
+          expect(first.debt).toBe("immutable historical native stop debt");
+          expect(fs.existsSync(unresolved)).toBe(true);
+          expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+          expect(deletionCalls).not.toContain(unresolved);
+        }
+        let previousId = first.launch.id;
+        for (let index = 1; index <= 2; index++) {
+          await eventually(() => {
+            const inFlight = f.actors.status(actor.id).inFlightRun?.id;
+            expect(inFlight).toBeDefined();
+            expect(inFlight).not.toBe(previousId);
+          });
+          const next = await launched(f, actor.id);
+          previousId = next.launch.id;
+          expect(next.launch.id).not.toBe(first.launch.id);
+          expect(next.record.task).toContain(`FIFO event ${index}`);
+          expect(workers.size).toBe(index + 1);
+          first.nativeClose(); first.nativeClose();
+          const nextAnswer = f.agents.wait(next.launch.id);
+          complete(next);
+          await expect(nextAnswer).resolves.toMatchObject({ text: "finished" });
+        }
+        await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
+        expect(delivered.map(result => result.id)).toEqual([...workers.values()].map(worker => worker.launch.id));
+        expect(f.actors.status(actor.id).queued).toBe(0);
+      } finally { failSave = false; delete first.probeError; writes.mockRestore(); }
+    }, 20_000,
+  );
+
+  it.each(["rejected-close", "unknown-tree", "pending-close"] as const)(
+    "failed-monitor recovery refuses saved completion without current native proof (%s)", async mode => {
+      const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
+      const close = joinGate();
+      let unknownTree = false;
+      let restoreClosed = () => {};
+      let firstId: string | undefined;
+      const stops: number[] = [];
+      vi.mocked(ProcessTransport.prototype.launch).mockImplementation(async request => {
+        const handle = await launch(request);
+        firstId ??= request.id;
+        if (request.id !== firstId) return handle;
+        const worker = workers.get(Number(handle.sessionId))!;
+        const transport = { ...handle, ...(mode !== "unknown-tree" ? { closed: close.promise } : {}),
+          isAlive: async () => {
+            if (unknownTree) throw new Error("whole execution probe unknown");
+            return handle.isAlive();
+          },
+          stop: async () => { stops.push(worker.pid); return handle.stop(); },
+        };
+        restoreClosed = () => { transport.closed = handle.closed!; };
+        return transport;
+      });
+      const f = fixture();
+      const actor = await create(f, `unproven-native-${mode}`);
+      await f.actors.tell(actor.id, "saved answer cannot discharge unknown native custody");
+      const first = await launched(f, actor.id);
+      await f.actors.tell(actor.id, "successor must remain queued");
+      const before = queueEvidence(f, actor.id);
+      save(first, { status: "completed", text: "saved but not publishable", finishedAt: Date.now(), updatedAt: Date.now() });
+      await eventually(() => expect(stops.filter(pid => pid === first.pid)).toHaveLength(1));
+      let resolved = false;
+      const waiting = f.agents.wait(first.launch.id).then(result => { resolved = true; return result; });
+      first.alive = false;
+      first.nativeClose();
+      if (mode === "rejected-close") close.reject(new Error("captured native close rejected"));
+      if (mode === "unknown-tree") unknownTree = true;
+      try {
+        await observe();
+        expect(resolved).toBe(false);
+        expect(fs.existsSync(path.join(path.dirname(first.statusFile), "manager-result.json"))).toBe(false);
+        expect(queueEvidence(f, actor.id)).toEqual(before);
+        expect(stops.filter(pid => pid === first.pid)).toHaveLength(1);
+        expect(workers.size).toBe(1);
+      } finally {
+        unknownTree = false;
+        close.resolve();
+        // Only fixture teardown replaces the failed proof seam with the
+        // original fulfilled receipt; production cannot repair rejected close.
+        restoreClosed();
+        await waiting;
+      }
+    }, 15_000,
+  );
+
   it.each(["absent", "reused"] as const)("host-proven %s worker releases real admission and launches the next activation", async mode => {
     const f = fixture();
     const actor = await create(f, "permit-owner");

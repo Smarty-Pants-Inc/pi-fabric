@@ -201,6 +201,7 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
     remote: MeshIdentity,
     stamp: (data: Record<string, unknown>) => Record<string, unknown> = (data) => ({ ...data, bridge: { from: "forge", id: "x" } }),
     legacy = false,
+    relayMs = 20,
   ) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-remote-mesh-"));
     cleanup.push(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -233,14 +234,14 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
         await mesh.publish({ topic: event.topic, kind: event.kind, from: event.from, to: event.to, data: stamp(event.data as Record<string, unknown>) });
       }
     };
-    const timer = setInterval(() => void relay().catch(() => undefined), 20);
+    const timer = setInterval(() => void relay().catch(() => undefined), relayMs);
     cleanup.push(() => clearInterval(timer), () => owner.close());
     return { received };
   };
 
-  const senderOn = (mesh: MeshStore, local: MeshIdentity, acknowledgementTimeoutMs = 300, directory?: ParticipantDirectory) => {
+  const senderOn = (mesh: MeshStore, local: MeshIdentity, acknowledgementTimeoutMs = 300, directory?: ParticipantDirectory, pollMs = 20) => {
     const sender = new FabricControlPlane(mesh, local, {
-      enabled: true, hostId: local.id, pollMs: 20, acknowledgementTimeoutMs,
+      enabled: true, hostId: local.id, pollMs, acknowledgementTimeoutMs,
       ...(directory ? { readMirroredOwner: (host: string, ownerIdentity: string | undefined, target: string) =>
         directory.mirroredControlOwner(host, ownerIdentity, target) } : {}),
     });
@@ -341,18 +342,25 @@ describe("mirrored remote roots (smarty-dev#2004)", () => {
       (data: Record<string, unknown>) => ({ ...data, bridge: { from: "ryzen2", id: "x" } }),    // another link
     ]) {
       const { mesh, directory, mirror, local, remote } = await setup();
-      // Keep the lease live beyond the 45 s bridge/ACK window. The fake clock drives
-      // the actual relay, command handler and sender observation without a real 45 s wait.
+      // Keep the lease live beyond the bridge/ACK window and the bounded late
+      // confirmation grace. Drive the actual relay, handler and sender with the clock.
       await mirror({ expiresAt: Date.now() + 120_000 });
       vi.useFakeTimers();
-      const { received } = await remoteOwner(mesh, local, remote, forged);
-      const sender = senderOn(mesh, local, 2_000, directory);
+      // A one-second fixture cadence still traverses both real meshes and the lease
+      // watchdog, without thousands of redundant reads during this fake-clock jump.
+      const { received } = await remoteOwner(mesh, local, remote, forged, false, 1_000);
+      const sender = senderOn(mesh, local, 2_000, directory, 1_000);
       const router = routerFor(directory, sender, local);
       try {
         const observation = router.routeMessage(remote.id, "hi", undefined, "steer");
-        void observation.catch(() => undefined);
+        let settled = false;
+        void observation.then(() => { settled = true; }, () => { settled = true; });
         await vi.advanceTimersByTimeAsync(0); // publish the actual command before the clock jump
         await vi.advanceTimersByTimeAsync(45_000);
+        expect(settled).toBe(false); // A forged ACK cannot settle the proof-only late window.
+        await vi.advanceTimersByTimeAsync(4_999);
+        expect(settled).toBe(false); // The grace is neither skipped nor shortened.
+        await vi.advanceTimersByTimeAsync(1);
         await expect(observation).rejects.toThrow("Fabric mesh bridge to remote host forge is not responding");
       } finally {
         await sender.close();

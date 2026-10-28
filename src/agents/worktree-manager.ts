@@ -1,8 +1,60 @@
 import fs from "node:fs";
 import path from "node:path";
+import { syncDirectoryChain, writeJsonAtomic } from "../core/atomic-write.js";
 import { addCloneFirstWorktree } from "./clone-first-worktree.js";
 import { executeFile } from "./transports/process-utils.js";
 import { fabricWorktreePath } from "./worktree-paths.js";
+
+export interface CleanupRootCustody { source: string; destination: string; receipt: string; }
+
+/** Rename-only custody for files, directories and symlinks; never a deletion certificate. */
+export const retainCleanupRoot = (
+  source: string, archive: string, id: string, reason = "agent cleanup whole-root custody",
+): CleanupRootCustody | undefined => {
+  if (!fs.lstatSync(source, { throwIfNoEntry: false })) return undefined;
+  const relative = path.relative(path.resolve(source), path.resolve(archive));
+  if (relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))) {
+    throw new Error(`Cleanup custody archive must be outside source: ${source} -> ${archive}`);
+  }
+  fs.mkdirSync(archive, { recursive: true, mode: 0o700 });
+  const container = fs.mkdtempSync(path.join(archive, "cleanup-"));
+  fs.chmodSync(container, 0o700);
+  const move = { source, destination: path.join(container, "tree"), receipt: path.join(container, "custody.json") };
+  const prepared = { format: 1, id, reason, source, destination: move.destination, time: Date.now(), state: "prepared" };
+  const save = (state: string, error?: unknown): void => writeJsonAtomic(move.receipt, {
+    ...prepared, time: Date.now(), state, ...(error === undefined ? {} : { error: String(error) }),
+  }, { durable: true, newline: true });
+  // Keep an immutable prepared receipt even if publication of a later state fails.
+  // Durable writes sync the file AND all containing directory entries through
+  // the existing parent/root (Windows skips unsupported directory barriers).
+  writeJsonAtomic(path.join(container, "custody.prepared.json"), prepared, { durable: true, newline: true });
+  save("prepared");
+  try {
+    // No walk/copy fallback: a fresh container's never-used child cannot clobber
+    // earlier custody. EXDEV leaves the original intact and fails visibly.
+    fs.renameSync(source, move.destination);
+  } catch (error) {
+    try { save("rename-failed", error); } catch { /* Durable prepared paths remain. */ }
+    const code = (error as NodeJS.ErrnoException).code;
+    const refusal = new Error(`Cleanup custody refused${code ? ` (${code})` : ""}: ${source} -> ${move.destination}; no copy/delete fallback: ${String(error)}`, { cause: error });
+    console.warn(`[pi-fabric] ${refusal.message}`);
+    throw refusal;
+  }
+  try {
+    // Make the held entry durable BEFORE the separate source unlink barrier
+    // or a fallible moved-receipt publication. A failure never rolls back.
+    syncDirectoryChain(path.dirname(move.destination));
+    syncDirectoryChain(path.dirname(source));
+    save("moved");
+  } catch (error) {
+    // No rollback, unlink, or canonical-path retry after the move committed.
+    const failure = Object.assign(new Error(`Cleanup root retained at ${move.destination} (from ${source}); custody receipt update failed: ${String(error)}`, { cause: error }), { retainedRoot: move });
+    console.warn(`[pi-fabric] ${failure.message}; prepared receipt: ${path.join(container, "custody.prepared.json")}`);
+    throw failure;
+  }
+  console.warn(`[pi-fabric] cleanup retained whole root: ${source} -> ${move.destination}; receipt: ${move.receipt}`);
+  return move;
+};
 
 export interface WorktreeLease {
   gitRoot: string;
@@ -187,17 +239,21 @@ export class WorktreeManager {
   async cleanup(id: string, deleteBranch = false): Promise<boolean> {
     const lease = this.#leases.get(id);
     if (!lease) return false;
-    await executeFile("git", ["worktree", "remove", "--force", lease.path], {
-      cwd: lease.gitRoot,
-      timeoutMs: 60_000,
-    });
-    if (deleteBranch) {
-      await executeFile("git", ["branch", "-D", lease.branch], {
-        cwd: lease.gitRoot,
-        timeoutMs: 30_000,
-      });
+    // Common to explicit cleanup AND automatic prelaunch/setup rollback. Never
+    // run Git remove/prune here: even after rename those are not metadata-only.
+    const deferred = `Git worktree registration cleanup deferred: ${JSON.stringify(lease.gitRoot)} still registers ${JSON.stringify(lease.path)}; no remove or prune was attempted.${deleteBranch ? ` Git branch deletion deferred: ${lease.branch} was not deleted.` : ""}`;
+    try {
+      retainCleanupRoot(lease.path, `${path.dirname(lease.path)}.trace-archive`, id);
+      this.#leases.delete(id);
+      console.warn(`[pi-fabric] cleanup ${id}: ${deferred}`);
+    } catch (error) {
+      // A post-move receipt failure ends path ownership too: a retry must not
+      // capture a new canonical occupant. A pre-move refusal keeps the lease.
+      if (error instanceof Error && "retainedRoot" in error) this.#leases.delete(id);
+      // Automatic rollback catches exceptions; keep refusal and Git debt visible.
+      console.warn(`[pi-fabric] worktree cleanup refused for ${id}: ${String(error)}; ${deferred}`);
+      throw error;
     }
-    this.#leases.delete(id);
     return true;
   }
 }

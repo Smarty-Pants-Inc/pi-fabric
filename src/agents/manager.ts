@@ -124,7 +124,7 @@ import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/termi
 import { FabricTargetTerminalError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
 import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlRefusalProven, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
-import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
+import { WorktreeManager, retainCleanupRoot, type AgentWorktreeResult } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
 import {
   AgentWriteRootOverlapError,
@@ -5026,11 +5026,38 @@ export class AgentManager {
     if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await this.#removeRunTree(directory, runId);
   }
 
-  /** Remove a run tree, then (only once it is gone) its recorded short TMPDIR outside it (smarty-dev#15878). */
+  // A committed move ends canonical-path ownership, even if its receipt update
+  // or the second root's custody fails. Retries must never capture a replacement.
+  readonly #cleanupRunCustody = new Map<string, { temporary: string | undefined; runRetained: boolean; temporaryRetained: boolean }>();
+
+  /** Retain the whole run and its owned, recorded private TMPDIR without deleting either. */
   async #removeRunTree(runDirectory: string, id: string, known?: string): Promise<void> {
-    const temporary = recordedShortTmpdir(runDirectory, id, known);
-    await removeTree(runDirectory);
-    if (!fs.existsSync(runDirectory)) await removeOwnedShortTmpdir(temporary);
+    let custody = this.#cleanupRunCustody.get(runDirectory);
+    if (!custody) {
+      custody = { temporary: recordedShortTmpdir(runDirectory, id, known), runRetained: false, temporaryRetained: false };
+      this.#cleanupRunCustody.set(runDirectory, custody);
+    }
+    const archive = `${this.#runRoot}.trace-archive`;
+    if (!custody.runRetained) {
+      try {
+        retainCleanupRoot(runDirectory, archive, id, "agent cleanup run directory");
+        custody.runRetained = true;
+      } catch (error) {
+        if (error instanceof Error && "retainedRoot" in error) custody.runRetained = true;
+        throw error;
+      }
+    }
+    if (!custody.temporaryRetained) {
+      try {
+        if (custody.temporary && ownedShortTmpdir(custody.temporary)) {
+          retainCleanupRoot(custody.temporary, archive, id, "agent cleanup private TMPDIR");
+        }
+        custody.temporaryRetained = true;
+      } catch (error) {
+        if (error instanceof Error && "retainedRoot" in error) custody.temporaryRetained = true;
+        throw error;
+      }
+    }
   }
 
   /**
@@ -5452,9 +5479,9 @@ export class AgentManager {
       if (!this.#saveQueuedRouteOutcome(queued)) throw new Error(`Cannot clean up agent ${id}: ${queued.routeSaveFailure}`);
       const exitVeto = runTreeExitVeto(runDirectory);
       if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
-      this.#onResultConsumed?.(id);
       const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
       if (!this.config.retainRuns) await this.#removeRunTree(runDirectory, id);
+      this.#onResultConsumed?.(id);
       this.#queued.delete(id);
       this.#forgetRunMetadata(id);
       this.#invalidateUiList();
@@ -5489,11 +5516,11 @@ export class AgentManager {
     if (!this.#canCollect(managed)) {
       throw new Error(`Cannot clean up agent ${id}: ${uncheckedExternalExit(managed.transport) ? "external transport has no checked worker exit receipt" : managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
     }
-    this.markForeground(id);
     const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
     if (!this.config.retainRuns) {
       await this.#removeRunTree(managed.runDirectory, id, managed.temporaryDirectory);
     }
+    this.markForeground(id);
     this.#runs.delete(id);
     this.#forgetRunMetadata(id);
     this.#pruneRetainedUiRecords();

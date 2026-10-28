@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { ArchiveSha256, type Sha256State } from "./archive-sha256.js";
+import { archiveRangeCache, type ArchiveRangeBlock, type ArchiveRangeIndex } from "./archive-range-cache.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -17,8 +18,8 @@ import type { IndexDirectoryBarrier } from "./receipt-namespace.js";
  *   <dir>/<yyyy>/<mm>/<dd>/<topic>.jsonl  one line per event, the same bytes as the live log
  *   <dir>/<yyyy>/<mm>/<dd>/SEAL.json     per file line count, sequence range and sha256
  *   <dir>/<yyyy>/<mm>/<dd>/.digest-*.json rebuildable SHA-256 checkpoints and counters
- *   <dir>/<yyyy>/<mm>/<dd>/.range-*.json  rebuildable identity-bound sparse read ranges
- *   <dir>/<yyyy>/<mm>/<dd>/.ranges.json   bounded aggregate of those read hints for reopening
+ * Range read hints live only in a bounded process-local cache. Legacy in-day .range-*
+ * and .ranges.json sidecars are ignored and never modified, even on unsealed days.
  *   <dir>/DIGEST-REPAIR.json              deferred oversized legacy line (read off-lock)
  *   <dir>/<yyyy>/<mm>/<dd>/ABORTED.json  positive event-identity abort markers
  *   <dir>/sequence-index/<bucket>/<n>.json  exact line address and advisory live confirmation
@@ -117,25 +118,7 @@ interface DigestCheckpoint {
   lastSequence: number;
 }
 
-// Rebuildable read hints, never publication evidence. Blocks cover the file in byte order;
-// their boundaries are complete lines, except the ignored torn suffix in the final block.
-// null means unknown (including an empty/invalid block), so it must not prune a read.
-type ArchiveRangeBlock = [start: number, end: number, min: number | null, max: number | null];
-interface ArchiveRangeIndex {
-  version: 1;
-  identity: string;
-  min: number | null;
-  max: number | null;
-  blocks: ArchiveRangeBlock[];
-  checksum: string;
-}
-// One checksummed catalog replaces a metadata open/hash per segment on fresh-object reads.
-// Each row is still bound to the segment's EXACT identity (including ctime), not its day.
-// Legacy summary-only rows may have come from unchecked digest counters; never prune by them.
-type ArchiveRangeCatalogEntry = [name: string, identity: string, min: number | null, max: number | null, blocks?: ArchiveRangeBlock[]];
-interface ArchiveRangeCatalog { version: 1; files: ArchiveRangeCatalogEntry[]; checksum: string }
-type ArchiveRangeHint = Pick<ArchiveRangeIndex, "identity" | "min" | "max"> & { blocks?: ArchiveRangeBlock[] };
-const ARCHIVE_RANGE_CATALOG_BYTES = 16 * 1024 * 1024;
+// Range hints are derived only from scanned data, never from old on-disk sidecars.
 const ARCHIVE_RANGE_BLOCK_BYTES = 2 * 1024;
 const ARCHIVE_RANGE_MAX_BLOCKS = 1024;
 // Names only, never segment identities. Bound both count and serialized name bytes.
@@ -147,33 +130,11 @@ const forgetDayNames = (directory: string): void => {
   const cached = dayNamesCache.get(directory);
   if (cached) { dayNamesCacheBytes -= cached.bytes; dayNamesCache.delete(directory); }
 };
-// Only validated catalog contents are shared across objects, never segment identities.
-// Account their serialized bytes as well as entry count; replaced generations evict in place.
-const ARCHIVE_RANGE_CATALOG_CACHE_BYTES = 32 * 1024 * 1024;
-const ARCHIVE_RANGE_CATALOG_CACHE_ENTRIES = 128;
-const rangeCatalogCache = new Map<string, { identity: string; bytes: number; files: Map<string, ArchiveRangeCatalogEntry> }>();
-let rangeCatalogCacheBytes = 0;
-const forgetRangeCatalog = (absolute: string): void => {
-  const cached = rangeCatalogCache.get(absolute);
-  if (cached) { rangeCatalogCacheBytes -= cached.bytes; rangeCatalogCache.delete(absolute); }
-};
-const cacheRangeCatalog = (absolute: string, identity: string, bytes: number, files: Map<string, ArchiveRangeCatalogEntry>): void => {
-  forgetRangeCatalog(absolute);
-  while (rangeCatalogCache.size >= ARCHIVE_RANGE_CATALOG_CACHE_ENTRIES || rangeCatalogCacheBytes + bytes > ARCHIVE_RANGE_CATALOG_CACHE_BYTES) {
-    forgetRangeCatalog(rangeCatalogCache.keys().next().value!);
-  }
-  rangeCatalogCache.set(absolute, { identity, bytes, files });
-  rangeCatalogCacheBytes += bytes;
-};
-const catalogChecksum = (files: ArchiveRangeCatalogEntry[]): string =>
-  createHash("sha256").update(JSON.stringify(files)).digest("hex");
 interface ArchiveReadRequest { descriptor: number; position: number; length: number }
 type ArchiveReadSteps<T> = Generator<ArchiveReadRequest | undefined, T, Buffer>;
 interface ArchiveCandidate { event: MeshEvent; fileOrder: number; offset: number }
 const compareArchiveCandidates = (a: ArchiveCandidate, b: ArchiveCandidate): number =>
   a.event.sequence - b.event.sequence || a.fileOrder - b.fileOrder || a.offset - b.offset;
-const rangeChecksum = (index: Omit<ArchiveRangeIndex, "version" | "checksum">): string =>
-  createHash("sha256").update(JSON.stringify([index.identity, index.min, index.max, index.blocks])).digest("hex");
 const rangeOutside = (min: number | null, max: number | null, after: number, through: number): boolean =>
   (max !== null && max <= after) || (min !== null && min > through);
 
@@ -296,7 +257,6 @@ const truncateTo = (file: string, size: number): void => {
 };
 
 export class MeshArchive {
-  readonly #readRanges = new Map<string, ArchiveRangeIndex>();
 
   constructor(readonly dir: string, readonly meshRoot: string) {}
 
@@ -865,18 +825,12 @@ export class MeshArchive {
       const aborted = abortedStat ? this.#readJson<Record<string, string>>(`${day}/ABORTED.json`) : undefined;
       const nameSnapshot = topic === undefined ? this.#readDayNames(directory) : undefined;
       const names = nameSnapshot?.names ?? [archiveFileName(topic!)];
-      const catalog = this.#readRangeCatalog(day);
-      const pendingIndexes: Array<{ file: string; index: ArchiveRangeIndex }> = [];
-      let catalogChanged = false;
-      const remember = (name: string, hint: ArchiveRangeHint): void => {
-        const prior = catalog.get(name);
-        if (prior?.[1] === hint.identity && prior[2] === hint.min && prior[3] === hint.max &&
-            (prior[4] !== undefined || hint.blocks === undefined)) return;
-        const row: ArchiveRangeCatalogEntry = [name, hint.identity, hint.min, hint.max];
-        if (hint.blocks !== undefined) row[4] = hint.blocks;
-        catalog.set(name, row);
-        catalogChanged = true;
-      };
+      const dayIdentity = nameSnapshot?.identity ?? fileIdentity(fs.statSync(directory));
+      const sealIdentity = this.#rangeFileIdentity(`${day}/SEAL.json`);
+      // A missing seal is a generation too. Unsealed days still require exact segment
+      // identities on every read: a same-directory append need not change dayIdentity.
+      const generation = `${dayIdentity}|${sealIdentity}`;
+      const catalog = archiveRangeCache.get(directory, generation);
       const identities: Array<{ absolute: string; identity: string }> = [];
       const work: Array<{ absolute: string; identity: string; order: number; block: ArchiveRangeBlock }> = [];
       let candidates: ArchiveCandidate[] = [];
@@ -902,10 +856,7 @@ export class MeshArchive {
         identities.push({ absolute, identity });
         if (!stat) continue;
         const saved = catalog.get(name);
-        const hint = saved?.[1] === identity && saved[4] !== undefined
-          ? { identity, min: saved[2], max: saved[3], blocks: saved[4] } : undefined;
-        if (hint && rangeOutside(hint.min, hint.max, after, through)) continue;
-        let index = hint?.blocks ? { identity, min: hint.min, max: hint.max, blocks: hint.blocks } : this.#readRangeIndex(file, stat);
+        let index = saved?.identity === identity ? saved : undefined;
         if (!index) {
           // DigestCheckpoint counters have no checksum covering their extrema. A valid
           // hash state/byte count does not authenticate them: derive read hints from data.
@@ -918,13 +869,11 @@ export class MeshArchive {
             if (!rangeReadCompatible(identity, handleIdentity) || !rangeReadCompatible(identity, current)) throw new MeshArchiveRecoveryChanged();
             const built = this.#makeRangeIndex(identity, blocks);
             index = built;
-            pendingIndexes.push({ file, index: built });
           } finally { fs.closeSync(descriptor); }
-          remember(name, index);
+          catalog.set(name, index);
           candidates = trim(candidates.concat(items));
           continue; // Already parsed exactly once while building its index.
         }
-        remember(name, index);
         if (rangeOutside(index.min, index.max, after, through)) continue;
         for (const block of index.blocks) {
           if (!rangeOutside(block[2], block[3], after, through)) work.push({ absolute, identity, order, block });
@@ -955,18 +904,14 @@ export class MeshArchive {
       }
       const currentAborted = fs.statSync(abortedPath, { throwIfNoEntry: false });
       if (abortedIdentity !== (currentAborted ? fileIdentity(currentAborted) : "missing")) throw new MeshArchiveRecoveryChanged();
-      if (nameSnapshot && nameSnapshot.identity !== fileIdentity(fs.statSync(directory))) throw new MeshArchiveRecoveryChanged();
-      // Defer our own directory-changing metadata installs until the snapshot is fenced.
-      // Never relabel a pre-write name list with the post-write directory generation.
-      for (const { file, index } of pendingIndexes) {
-        this.#saveRangeIndex(file, index);
-        yield undefined; // Async readers yield between installs; the sync driver continues immediately.
-      }
+      if (dayIdentity !== fileIdentity(fs.statSync(directory)) ||
+          sealIdentity !== this.#rangeFileIdentity(`${day}/SEAL.json`)) throw new MeshArchiveRecoveryChanged();
+      // Install only a fenced snapshot in memory. No range read creates any file.
       if (topic === undefined && catalog.size > names.length) {
         const present = new Set(names);
-        for (const name of catalog.keys()) if (!present.has(name)) { catalog.delete(name); catalogChanged = true; }
+        for (const name of catalog.keys()) if (!present.has(name)) catalog.delete(name);
       }
-      if (catalogChanged) this.#saveRangeCatalog(day, catalog);
+      archiveRangeCache.set(directory, generation, catalog);
       for (const candidate of trim(candidates)) found.push(candidate.event);
       if (found.length >= limit) break;
     }
@@ -995,73 +940,9 @@ export class MeshArchive {
     return { identity, names };
   }
 
-  #readRangeCatalog(day: string): Map<string, ArchiveRangeCatalogEntry> {
-    const absolute = path.join(this.dir, day, ".ranges.json");
-    let descriptor: number | undefined;
-    try {
-      const stat = fs.statSync(absolute, { throwIfNoEntry: false });
-      const identity = stat ? fileIdentity(stat) : "missing";
-      const cached = rangeCatalogCache.get(absolute);
-      if (stat && cached?.identity === identity) {
-        // LRU touch; return a private map so remember()/pruning cannot mutate the cache.
-        rangeCatalogCache.delete(absolute); rangeCatalogCache.set(absolute, cached);
-        return new Map(cached.files);
-      }
-      forgetRangeCatalog(absolute);
-      if (!stat || stat.size > ARCHIVE_RANGE_CATALOG_BYTES) return new Map();
-      descriptor = fs.openSync(absolute, "r");
-      if (fileIdentity(fs.fstatSync(descriptor)) !== identity) return new Map();
-      const size = stat.size;
-      // Bound the actual read too, even if corrupt metadata grows after fstat.
-      const bytes = Buffer.allocUnsafe(size);
-      if (fs.readSync(descriptor, bytes, 0, size, 0) !== size) return new Map();
-      const catalog = JSON.parse(bytes.toString("utf8")) as ArchiveRangeCatalog;
-      if (!catalog || catalog.version !== 1 || !Array.isArray(catalog.files) ||
-          catalog.checksum !== catalogChecksum(catalog.files)) return new Map();
-      const files = new Map<string, ArchiveRangeCatalogEntry>();
-      for (const row of catalog.files) {
-        if (!Array.isArray(row) || (row.length !== 4 && row.length !== 5) || typeof row[0] !== "string" ||
-            !row[0].endsWith(".jsonl") || /[/\\]/.test(row[0]) || files.has(row[0]) || typeof row[1] !== "string" ||
-            !((row[2] === null && row[3] === null) || (Number.isFinite(row[2]) && Number.isFinite(row[3]) && row[2]! <= row[3]!))) return new Map();
-        if (row[4] !== undefined) {
-          const size = Number(row[1].split(":")[2]);
-          if (!Number.isSafeInteger(size) || size < 0 || !Array.isArray(row[4])) return new Map();
-          let end = 0, min = Infinity, max = -Infinity, unknown = false;
-          for (const block of row[4]) {
-            if (!Array.isArray(block) || block.length !== 4 || block[0] !== end || !Number.isSafeInteger(block[1]) || block[1] <= end || block[1] > size ||
-                !((block[2] === null && block[3] === null) || (Number.isFinite(block[2]) && Number.isFinite(block[3]) && block[2]! <= block[3]!))) return new Map();
-            end = block[1];
-            if (block[2] === null || block[3] === null) unknown = true;
-            else { min = Math.min(min, block[2]); max = Math.max(max, block[3]); }
-          }
-          if (end !== size || row[2] !== (!unknown && Number.isFinite(min) ? min : null) ||
-              row[3] !== (!unknown && Number.isFinite(max) ? max : null)) return new Map();
-        }
-        files.set(row[0], row);
-      }
-      const current = fs.statSync(absolute, { throwIfNoEntry: false });
-      if (fileIdentity(fs.fstatSync(descriptor)) !== identity || !current || fileIdentity(current) !== identity) return new Map();
-      cacheRangeCatalog(absolute, identity, size, files);
-      return new Map(files);
-    } catch { return new Map(); } // A missing/torn/corrupt catalog falls back to sibling hints/data.
-    finally { if (descriptor !== undefined) fs.closeSync(descriptor); }
-  }
-
-  #saveRangeCatalog(day: string, catalog: Map<string, ArchiveRangeCatalogEntry>): void {
-    try {
-      const files = [...catalog.values()];
-      const text = `${JSON.stringify({ version: 1, files, checksum: catalogChecksum(files) })}\n`;
-      if (Buffer.byteLength(text) <= ARCHIVE_RANGE_CATALOG_BYTES) writeFileAtomic(path.join(this.dir, day, ".ranges.json"), text);
-    } catch { /* Rebuildable, bounded and optional, including on read-only archives. */ }
-  }
-
   #rangeFileIdentity(relative: string): string {
     const stat = fs.statSync(path.join(this.dir, relative), { throwIfNoEntry: false });
     return stat ? fileIdentity(stat) : "missing";
-  }
-
-  #rangePath(relative: string): string {
-    return `${path.posix.dirname(relative)}/.range-${createHash("sha256").update(path.posix.basename(relative)).digest("hex")}.json`;
   }
 
   #makeRangeIndex(identity: string, blocks: ArchiveRangeBlock[]): ArchiveRangeIndex {
@@ -1070,44 +951,7 @@ export class MeshArchive {
       min = blocks.reduce((value, block) => Math.min(value, block[2]!), Infinity);
       max = blocks.reduce((value, block) => Math.max(value, block[3]!), -Infinity);
     }
-    const index = { version: 1 as const, identity, min, max, blocks };
-    return { ...index, checksum: rangeChecksum(index) };
-  }
-
-  #readRangeIndex(relative: string, stat: fs.Stats): ArchiveRangeIndex | undefined {
-    const identity = fileIdentity(stat);
-    const cached = this.#readRanges.get(relative);
-    if (cached?.identity === identity) return cached;
-    this.#readRanges.delete(relative);
-    try {
-      const target = path.join(this.dir, this.#rangePath(relative));
-      // An index is small relative to its segment; never read arbitrary corrupt metadata.
-      if (fs.statSync(target).size > Math.min(4 * 1024 * 1024,
-        4096 + Math.min(ARCHIVE_RANGE_MAX_BLOCKS, Math.ceil(stat.size / ARCHIVE_RANGE_BLOCK_BYTES)) * 256)) return undefined;
-      const index = JSON.parse(fs.readFileSync(target, "utf8")) as ArchiveRangeIndex;
-      if (!index || index.version !== 1 || index.identity !== identity || !Array.isArray(index.blocks)) return undefined;
-      let end = 0;
-      for (const block of index.blocks) {
-        if (!Array.isArray(block) || block.length !== 4 || block[0] !== end || !Number.isSafeInteger(block[1]) || block[1] <= end || block[1] > stat.size ||
-            !((block[2] === null && block[3] === null) || (Number.isFinite(block[2]) && Number.isFinite(block[3]) && block[2]! <= block[3]!))) return undefined;
-        end = block[1];
-      }
-      const checked = this.#makeRangeIndex(identity, index.blocks);
-      if (end !== stat.size || checked.min !== index.min || checked.max !== index.max || checked.checksum !== index.checksum) return undefined;
-      this.#cacheRangeIndex(relative, index);
-      return index;
-    } catch { return undefined; } // Missing, torn, stale, or unreadable hints never hide events.
-  }
-
-  #cacheRangeIndex(relative: string, index: ArchiveRangeIndex): void {
-    if (this.#readRanges.size >= 2048) this.#readRanges.delete(this.#readRanges.keys().next().value!);
-    this.#readRanges.set(relative, index);
-  }
-
-  #saveRangeIndex(relative: string, index: ArchiveRangeIndex): void {
-    this.#cacheRangeIndex(relative, index);
-    try { writeFileAtomic(path.join(this.dir, this.#rangePath(relative)), `${JSON.stringify(index)}\n`); }
-    catch { /* Rebuildable cache: a read-only archive must remain readable. */ }
+    return { identity, min, max, blocks };
   }
 
   *#scanRangeBlocks(descriptor: number, start: number, end: number, visit: (event: MeshEvent, offset: number) => void): ArchiveReadSteps<ArchiveRangeBlock[]> {

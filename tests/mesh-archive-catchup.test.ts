@@ -284,8 +284,8 @@ describe("lossless archived-history catch-up", () => {
       const archive = state === "reopened" ? new MeshArchive(f.dir, f.root) : f.archive;
       return mode === "sync" ? archive.readAfter(after, 100, all, 100) : archive.readAfterAsync(after, 100, all, 100);
     };
-    exact(await read(), [event(10, "fleet.work.a")]); // Sidecar/catalog installs change the directory.
-    exact(await read(), [event(10, "fleet.work.a")]); // Re-enumerate their actual new generation.
+    exact(await read(), [event(10, "fleet.work.a")]); // Warm the process-local cache.
+    exact(await read(), [event(10, "fleet.work.a")]); // Reuse only the exact directory generation.
     fs.utimesSync(directory, 1_700_000_000, 1_700_000_000);
     exact(await read(), [event(10, "fleet.work.a")]);
     const readdir = fs.readdirSync;
@@ -360,72 +360,35 @@ describe("lossless archived-history catch-up", () => {
     exact(actual, legacyReadAfter(f.dir, 40, 100, all, 2));
   });
 
-  it.each([
-    ["sibling", "sync"], ["catalog", "sync"], ["sibling", "async"], ["catalog", "async"],
-  ] as const)("does not rebind old names after a new JSONL arrives during deferred %s installation (%s)", async (target, mode) => {
-    const f = setup();
-    const file = segment(f.dir, "2026/01/01", "fleet.work.a", [event(90, "fleet.work.a")]);
-    const directory = path.dirname(file), rename = fs.renameSync;
-    let additions = 0;
-    vi.spyOn(fs, "renameSync").mockImplementation(((...args: Parameters<typeof fs.renameSync>) => {
-      rename(...args);
-      const name = path.basename(String(args[1]));
-      if (!additions && path.dirname(String(args[1])) === directory &&
-          (target === "catalog" ? name === ".ranges.json" : name.startsWith(".range-"))) {
-        additions++;
-        segment(f.dir, "2026/01/01", "fleet.work.b", [event(50, "fleet.work.b"), event(200, "fleet.work.b")]);
-      }
-    }) as typeof fs.renameSync);
-    const read = async () => {
-      const archive = new MeshArchive(f.dir, f.root);
-      return mode === "sync" ? archive.readAfter(40, 100, all, 2) : archive.readAfterAsync(40, 100, all, 2);
-    };
-    exact(await read(), [event(90, "fleet.work.a")]); // The validated pre-install snapshot.
-    expect(additions).toBe(1);
-    exact(await read(), [event(50, "fleet.work.b"), event(90, "fleet.work.a")]);
-    exact(await read(), legacyReadAfter(f.dir, 40, 100, all, 2));
-  });
-
-  it("yields between deferred range installations during a real async catch-up", async () => {
+  it.each(["sync", "async"] as const)("never installs deferred range files during catch-up (%s)", async mode => {
     const f = setup();
     const values = [event(10, "fleet.work.a"), event(20, "fleet.work.b")];
     const file = segment(f.dir, "2026/01/01", values[0]!.topic, [values[0]!]);
     segment(f.dir, "2026/01/01", values[1]!.topic, [values[1]!]);
-    const directory = path.dirname(file), rename = fs.renameSync;
-    const heartbeatAtInstall: boolean[] = [];
-    let heartbeatRan = false;
-    let heartbeat: Promise<void> | undefined;
-    vi.spyOn(fs, "renameSync").mockImplementation((...args: Parameters<typeof fs.renameSync>) => {
-      rename(...args);
-      const target = String(args[1]);
-      if (path.dirname(target) !== directory || !path.basename(target).startsWith(".range-")) return;
-      heartbeatAtInstall.push(heartbeatRan);
-      if (heartbeatAtInstall.length === 1) {
-        heartbeat = new Promise<void>(resolve => setImmediate(() => { heartbeatRan = true; resolve(); }));
-      }
-    });
-    try { exact(await f.archive.readAfterAsync(0, MAX, all, 100), values); }
-    finally { await heartbeat; }
-    // The old tight install loop records [false, false], even though data scanning yields.
-    expect(heartbeatAtInstall).toEqual([false, true]);
+    const names = fs.readdirSync(path.dirname(file));
+    const rename = vi.spyOn(fs, "renameSync");
+    const write = vi.spyOn(fs, "writeFileSync");
+    const open = vi.spyOn(fs, "openSync");
+    const actual = mode === "sync" ? f.archive.readAfter(0, MAX, all, 100) : await f.archive.readAfterAsync(0, MAX, all, 100);
+    exact(actual, values);
+    expect(rename).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    expect(open.mock.calls.every(call => call[1] === "r")).toBe(true);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(names);
   });
 
-  it.each(["sync", "async"] as const)("reopens dense small-block siblings without self-rejecting their metadata size (%s)", async mode => {
+  it.each(["sync", "async"] as const)("reopens dense small-block ranges from memory without reparsing the full segment (%s)", async mode => {
     const f = setup();
     const values = Array.from({ length: 3072 }, (_, index) => event(index + 1, "fleet.work.dense", "x".repeat(64)));
     const file = segment(f.dir, "2026/01/01", "fleet.work.dense", values);
+    const names = fs.readdirSync(path.dirname(file));
     exact(await f.archive.readAfterAsync(0, 3072, all, 4000), values);
-    const sibling = path.join(path.dirname(file), `.range-${createHash("sha256").update(path.basename(file)).digest("hex")}.json`);
-    const index = JSON.parse(fs.readFileSync(sibling, "utf8"));
-    expect(index.blocks.length).toBeGreaterThan(100);
-    expect(index.blocks.length).toBeLessThanOrEqual(1024);
-    expect(fs.statSync(sibling).size).toBeGreaterThan(4096 + Math.ceil(fs.statSync(file).size / (64 * 1024)) * 256);
-    fs.writeFileSync(path.join(path.dirname(file), ".ranges.json"), "{torn");
     const reopened = new MeshArchive(f.dir, f.root), parsed = parsedEvents();
     const actual = mode === "sync" ? reopened.readAfter(3040, 3072, all, 32) : await reopened.readAfterAsync(3040, 3072, all, 32);
     const count = parsed.count; parsed.restore();
     exact(actual, values.slice(-32));
-    expect(count).toBeLessThan(100); // The valid sibling was used, not a full-file rebuild.
+    expect(count).toBeLessThan(100);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(names);
   });
 
   it.each(["sync", "async"] as const)("keeps small-block ordering, ties and unknown ranges across the full published horizon (%s)", async mode => {
@@ -444,82 +407,56 @@ describe("lossless archived-history catch-up", () => {
     }
   });
 
-  it.each(["sync", "async"] as const)("persists sibling ranges and safely rebuilds corrupt metadata on re-open (%s)", async mode => {
+  it.each(["sync", "async"] as const)("ignores even checksummed identity-matching legacy range sidecars (%s)", async mode => {
     const f = setup();
     const file = segment(f.dir, "2026/01/01", "fleet.work.catchup", [event(10), event(90), event(20)]);
-    const cache = path.join(path.dirname(file), `.range-${createHash("sha256").update(path.basename(file)).digest("hex")}.json`);
-    const read = async () => {
-      const reopened = new MeshArchive(f.dir, f.root);
-      return mode === "sync" ? reopened.readAfter(50, MAX, all, 100) : reopened.readAfterAsync(50, MAX, all, 100);
-    };
-    exact(await read(), [event(90)]);
-    expect(fs.existsSync(cache)).toBe(true);
-    const saved = fs.readFileSync(cache, "utf8");
-    expect(JSON.parse(saved)).toMatchObject({ version: 1, min: 10, max: 90, blocks: expect.any(Array), checksum: expect.any(String) });
-    for (const damage of [
-      "{torn", "null", "[]", '{"version":999}',
-      JSON.stringify({ ...JSON.parse(saved), checksum: "0".repeat(64) }),
-      JSON.stringify({ ...JSON.parse(saved), min: 0, max: 1 }),
-      JSON.stringify({ ...JSON.parse(saved), identity: "stale-identity" }),
-      JSON.stringify({ ...JSON.parse(saved), blocks: [[0, 1, 0, 1]] }),
-    ]) {
-      fs.writeFileSync(cache, damage);
-      // Damage both independent sources: a valid catalog is allowed to bypass its sibling.
-      fs.writeFileSync(path.join(path.dirname(file), ".ranges.json"), "{torn");
-      exact(await read(), legacyReadAfter(f.dir, 50, MAX, all, 100));
+    const directory = path.dirname(file), stat = fs.statSync(file);
+    const identity = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    const blocks = [[0, stat.size, 0, 1]];
+    const index = { version: 1, identity, min: 0, max: 1, blocks,
+      checksum: createHash("sha256").update(JSON.stringify([identity, 0, 1, blocks])).digest("hex") };
+    const files = [[path.basename(file), identity, 0, 1, blocks]];
+    const catalog = { version: 1, files, checksum: createHash("sha256").update(JSON.stringify(files)).digest("hex") };
+    const sibling = path.join(directory, `.range-${createHash("sha256").update(path.basename(file)).digest("hex")}.json`);
+    fs.writeFileSync(sibling, JSON.stringify(index));
+    fs.writeFileSync(path.join(directory, ".ranges.json"), JSON.stringify(catalog));
+    const before = fs.readdirSync(directory).map(name => [name, fs.readFileSync(path.join(directory, name)), fs.statSync(path.join(directory, name)).mtimeMs]);
+    const open = fs.openSync;
+    const noSidecars = vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+      expect(path.basename(String(args[0]))).not.toMatch(/^\.range/);
+      return open(...args);
+    }) as typeof fs.openSync);
+    for (let pass = 0; pass < 8; pass++) {
+      const archive = new MeshArchive(f.dir, f.root);
+      const actual = mode === "sync" ? archive.readAfter(50, MAX, all, 100) : await archive.readAfterAsync(50, MAX, all, 100);
+      exact(actual, legacyReadAfter(f.dir, 50, MAX, all, 100));
     }
+    noSidecars.mockRestore();
+    expect(fs.readdirSync(directory).map(name => [name, fs.readFileSync(path.join(directory, name)), fs.statSync(path.join(directory, name)).mtimeMs])).toEqual(before);
   });
 
-  it.each(["sync", "async"] as const)("validates catalogs independently, including combined catalog/sibling corruption (%s)", async mode => {
+  it.each(["sync", "async"] as const)("leaves torn and corrupt old sidecars untouched rather than repairing them (%s)", async mode => {
     const f = setup();
     const file = segment(f.dir, "2026/01/01", "fleet.work.catchup", [event(10), event(90), event(20)]);
     const directory = path.dirname(file), catalogFile = path.join(directory, ".ranges.json");
     const sibling = path.join(directory, `.range-${createHash("sha256").update(path.basename(file)).digest("hex")}.json`);
-    const read = async () => {
-      const reopened = new MeshArchive(f.dir, f.root);
-      return mode === "sync" ? reopened.readAfter(50, 100, all, 100) : reopened.readAfterAsync(50, 100, all, 100);
-    };
-    exact(await read(), [event(90)]);
-    const saved = JSON.parse(fs.readFileSync(catalogFile, "utf8"));
-    const withFiles = (files: unknown[]) => JSON.stringify({ ...saved, files,
-      checksum: createHash("sha256").update(JSON.stringify(files)).digest("hex") });
-    fs.writeFileSync(sibling, "{torn");
-    // Both a disk-validated catalog and the subsequently cached catalog are independent
-    // of damaged siblings, rather than accidentally relying on the sibling's parse result.
-    exact(await read(), [event(90)]);
-    exact(await read(), [event(90)]);
-    for (const damage of [
-      "{torn", "null", "[]", '{"version":999}',
-      JSON.stringify({ ...saved, checksum: "0".repeat(64) }),
-      withFiles([[saved.files[0][0], saved.files[0][1], 0, 1, saved.files[0][4]]]),
-      withFiles([[saved.files[0][0], saved.files[0][1], 10, 90, [[0, 1, 10, 90]]]]),
-      withFiles([[saved.files[0][0], "stale-identity", 10, 90, saved.files[0][4]]]),
-      withFiles([saved.files[0], saved.files[0]]),
-      withFiles([["../unsafe.jsonl", ...saved.files[0].slice(1)]]),
-    ]) {
+    for (const damage of ["{torn", "null", "[]", '{"version":999}', '{"files":[["../unsafe.jsonl","stale",0,1]]}']) {
       fs.writeFileSync(catalogFile, damage);
-      fs.writeFileSync(sibling, "{torn");
-      exact(await read(), legacyReadAfter(f.dir, 50, 100, all, 100));
+      fs.writeFileSync(sibling, damage);
+      const archive = new MeshArchive(f.dir, f.root);
+      const actual = mode === "sync" ? archive.readAfter(50, 100, all, 100) : await archive.readAfterAsync(50, 100, all, 100);
+      exact(actual, legacyReadAfter(f.dir, 50, 100, all, 100));
+      expect(fs.readFileSync(catalogFile, "utf8")).toBe(damage);
+      expect(fs.readFileSync(sibling, "utf8")).toBe(damage);
     }
-    // A cached catalog's same-inode, same-size corruption with restored mtime must be
-    // rejected by ctime, even though its old validated rows could still prune this read.
-    exact(await read(), [event(90)]);
-    const before = fs.statSync(catalogFile), text = fs.readFileSync(catalogFile, "utf8");
-    const changed = text.replace(/"checksum":"[a-f0-9]/, '"checksum":"!');
-    expect(changed.length).toBe(text.length);
-    fs.writeFileSync(catalogFile, changed);
-    fs.utimesSync(catalogFile, before.atime, before.mtime);
-    fs.writeFileSync(sibling, "{torn");
-    exact(await read(), [event(90)]);
-    expect(JSON.parse(fs.readFileSync(catalogFile, "utf8")).checksum).not.toContain("!");
   });
 
-  it("reuses only exact-current validated catalogs across fromRoot/new objects, checking real segments every read", () => {
+  it("reuses process-local ranges across fromRoot/new objects, checking real segments every read", () => {
     const f = setup();
     const file = segment(f.dir, "2026/01/01", "fleet.work.catchup", [event(10), event(90)]);
     fs.writeFileSync(path.join(f.root, MESH_ARCHIVE_CONFIG), JSON.stringify({ version: 1, dir: f.dir }));
     const read = () => MeshArchive.fromRoot(f.root)!.readAfter(50, 100, all, 10);
-    exact(read(), [event(90)]); // Builds persisted metadata, not a populated module cache.
+    exact(read(), [event(90)]); // Builds only process-local hints.
     const open = fs.openSync, stat = fs.statSync;
     let catalogOpens = 0, segmentStats = 0;
     vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
@@ -530,11 +467,11 @@ describe("lossless archived-history catch-up", () => {
       if (String(args[0]) === file) segmentStats++;
       return stat(...args);
     }) as typeof fs.statSync);
-    exact(read(), [event(90)]); // Honest first reopened read loads and validates the disk catalog.
-    expect(catalogOpens).toBe(1);
+    exact(read(), [event(90)]); // Fresh objects share memory, never a disk catalog.
+    expect(catalogOpens).toBe(0);
     exact(read(), [event(90)]);
     exact(new MeshArchive(f.dir, f.root).readAfter(50, 100, all, 10), [event(90)]);
-    expect(catalogOpens).toBe(1);
+    expect(catalogOpens).toBe(0);
     expect(segmentStats).toBeGreaterThanOrEqual(6);
     fs.appendFileSync(file, JSON.stringify(event(95)) + "\n");
     exact(read(), [event(90), event(95)]); // A catalog hit never vouches for the current segment.

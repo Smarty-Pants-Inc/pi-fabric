@@ -4970,7 +4970,7 @@ export class AgentManager {
 
   /** Discharge actor-log custody only after the owning archive succeeded. */
   async commitActorArchive(runId: string, actorId: string, sessionFile: string): Promise<void> {
-    const directory = this.actorArchiveSources(actorId, sessionFile).get(runId);
+    const directory = (await this.actorArchiveSources(actorId, sessionFile, runId)).get(runId);
     if (!directory) return;
     fs.rmSync(path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE));
     syncDirectoryChain(directory);
@@ -5113,21 +5113,10 @@ export class AgentManager {
     return "tmpdir: short private TMPDIR unavailable (diagnostic failed); child launched on " + path.join(this.#runRoot, id, "tmp") + " and bash may be refused by the fleet guard";
   }
   /** Recover only this actor's fenced sources under the configured host run root. */
-  actorArchiveSources(actorId: string, sessionFile: string): Map<string, string> {
-    const sources = new Map<string, string>();
-    if (!ownedStat(this.#runRoot)?.isDirectory()) return sources;
-    for (const runId of fs.readdirSync(this.#runRoot)) {
-      if (!/^[a-f0-9]{32}$/.test(runId)) continue;
-      const directory = path.join(this.#runRoot, runId);
-      const file = path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE);
-      if (!ownedStat(directory)?.isDirectory() || !ownedStat(file)?.isFile()) continue;
-      try {
-        if (fs.statSync(file).size > 4096) continue;
-        const marker = JSON.parse(fs.readFileSync(file, "utf8"));
-        if (marker.format === 1 && marker.runId === runId && marker.actorId === actorId && marker.sessionFile === sessionFile) sources.set(runId, directory);
-      } catch { /* Unreadable custody stays a collection veto, never authority. */ }
-    }
-    return sources;
+  async actorArchiveSources(actorId: string, sessionFile: string, runId?: string): Promise<Map<string, string>> {
+    // Archive discovery is optional first-use work, never part of the eager startup graph.
+    const { discoverActorArchiveSources } = await import("./actor-archive-discovery.js");
+    return discoverActorArchiveSources(this.#runRoot, actorId, sessionFile, runId);
   }
 
   worktreeGitRoot(id: string): string | undefined {

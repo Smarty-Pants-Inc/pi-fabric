@@ -35,7 +35,8 @@ async function matches(directory: string, runId: string, actorId: string, sessio
   finally { await handle?.close(); }
 }
 
-/** Stream the run root via native asynchronous I/O; one marker/handle at a time, no full listing or queued fan-out.
+/** Stream the run root via native asynchronous I/O; at most 32 marker FDs plus one directory handle.
+ * Fixed batches preserve enumeration order regardless of completion order, without a full listing or unbounded fan-out.
  * Known run IDs (archive commit/restarted-owner retry) inspect only their exact fenced source.
  * There is deliberately no cache: a failed sink or a later publication must remain discoverable.
  */
@@ -49,10 +50,32 @@ export async function discoverActorArchiveSources(runRoot: string, actorId: stri
     return sources;
   }
   const directory = await fs.promises.opendir(runRoot, { bufferSize: 32 });
-  for await (const entry of directory) {
-    if (!entry.isDirectory() || !/^[a-f0-9]{32}$/.test(entry.name)) continue;
-    const source = path.join(runRoot, entry.name);
-    if (await matches(source, entry.name, actorId, sessionFile)) sources.set(entry.name, source);
+  const pending: { runId: string; source: string; result: Promise<PromiseSettledResult<boolean>> }[] = [];
+  const flush = async () => {
+    const batch = pending.splice(0);
+    const results = await Promise.all(batch.map(candidate => candidate.result));
+    for (let i = 0; i < batch.length; i++) {
+      const result = results[i]!;
+      if (result.status === "rejected") throw result.reason;
+      if (result.value) sources.set(batch[i]!.runId, batch[i]!.source);
+    }
+  };
+  try {
+    let entry: fs.Dirent | null;
+    while ((entry = await directory.read()) !== null) {
+      if (!entry.isDirectory() || !/^[a-f0-9]{32}$/.test(entry.name)) continue;
+      const source = path.join(runRoot, entry.name);
+      // Handle rejection immediately: even a close failure must not become unhandled while reading the directory.
+      const result = matches(source, entry.name, actorId, sessionFile).then(
+        value => ({ status: "fulfilled" as const, value }), reason => ({ status: "rejected" as const, reason }));
+      pending.push({ runId: entry.name, source, result });
+      if (pending.length === 32) await flush();
+    }
+    await flush();
+    return sources;
+  } finally {
+    // Iterator/read failure can occur with a partial batch. Drain every marker before returning/throwing and closing the root.
+    await Promise.all(pending.map(candidate => candidate.result));
+    await directory.close();
   }
-  return sources;
 }

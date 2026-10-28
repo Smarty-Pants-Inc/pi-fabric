@@ -123,6 +123,8 @@ const lazyEntryPoints = [
   "src/core/model-served.ts",
   "src/core/auto-approval-classifier-impl.ts",
   "src/guards/foreground-wait.ts",
+  // Archive recovery loads only at first use; delayed imports need a stable path across installs.
+  "src/agents/actor-archive-discovery.ts",
   "src/agents/model-route.ts",
   "src/agents/model-route-prepare.ts",
   "src/agents/per-call-route.ts",

@@ -467,6 +467,9 @@ export class MeshLock {
     let operationFailure: { error: unknown } | undefined;
     let budgetSpent = false;
     let budgetTimer: ReturnType<typeof setTimeout> | undefined;
+    let budgetMonotonicDeadline: bigint | undefined;
+    const waitBudgetSpent = (): boolean => budgetSpent ||
+      (budgetMonotonicDeadline !== undefined && process.hrtime.bigint() > budgetMonotonicDeadline);
     // The shared admission helper fixes the relative budget only after setup; expiry cannot grant admission.
     try {
       // Attempts and the largest gap between two of them: a large gap means this waiter stalled
@@ -483,6 +486,9 @@ export class MeshLock {
         // Lazy arming keeps uncontended acquisitions free of another clock read or timer.
         // Spent means strictly past the budget (+1 ms), so an attempt due exactly at the deadline still runs.
         const remaining = initial ? Math.min(deadline - Date.now(), initial.expiresAt! - performance.now()) : deadline - Date.now();
+        // A synchronous admission/verifier stall can block the timer callback. Supplement, never replace, its
+        // authority with a host-monotonic deadline armed at this SAME first wait, independent of Date/performance.
+        budgetMonotonicDeadline ??= process.hrtime.bigint() + BigInt(Math.ceil(Math.max(0, remaining) * 1_000_000));
         budgetTimer ??= setTimeout(() => { budgetSpent = true; }, Math.max(0, remaining) + 1);
         const pending = ticket.queued
           ? ticket.wait(Math.min(ms, Math.max(0, remaining)), signal, deadline)
@@ -524,7 +530,7 @@ export class MeshLock {
         const attemptAt = Date.now();
         // Both waits can spend the budget in setup or resume late, even on a release signal.
         // Keep the initial eligible probe; once we have waited, timer expiry is not admission.
-        if (waited && (waitSetupExpired || budgetSpent)) {
+        if (waited && (waitSetupExpired || waitBudgetSpent())) {
           if (attempts === 0 && ticket.queued) throw admission.expire(this.#lockPath, this.root, "mesh-lock", lockClass);
           throw timeout();
         }
@@ -615,6 +621,9 @@ export class MeshLock {
       if (timed) lockHeldAt = performance.now();
       try {
         signal?.throwIfAborted();
+        // Canonical publication/pinning can also stall synchronously after the admission check. Release without
+        // entering the operation if that spent a waited budget; the initial eligible probe remains unchanged.
+        if (waited && (waitSetupExpired || waitBudgetSpent())) throw timeout();
         if (initial && (performance.now() > initial.expiresAt! || Date.now() > deadline)) throw timeout();
         operationEntered = true;
         return acrossAwait ? await operation() : operation();

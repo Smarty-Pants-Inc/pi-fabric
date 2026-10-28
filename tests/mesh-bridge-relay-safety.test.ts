@@ -7,6 +7,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
+import type { BridgeRelayDispatchBudget } from "../src/mesh/bridge-relay.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { FabricControlPlane, FabricControlStaleIncarnationError } from "../src/topology/control-plane.js";
 import { FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "../src/mesh/control-idempotency.js";
@@ -29,8 +30,9 @@ const closers: Array<() => Promise<void>> = [];
 afterEach(async () => {
   for (const close of closers.splice(0).reverse()) await close();
   vi.restoreAllMocks();
-  expect(removals).toEqual([]);
-  removals.length = 0;
+  vi.useRealTimers();
+  const attemptedRemovals = removals.splice(0);
+  expect(attemptedRemovals).toEqual([]);
   // Hygiene is confined to this test's own private mkdtemp children.
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -88,25 +90,30 @@ const fixture = async (hook?: RelayHook, targetToken?: string) => {
     new MeshStore(path.join(dir, name), 64 * 1024, 100, { stateBackend: "file" })]));
   const mains = Object.fromEntries(await Promise.all(Object.entries(stores).map(async ([name, store]) =>
     [name, await native(store, name, name === "ryzen2" ? targetToken : undefined)] as const)));
-  const links: Array<{ bridge: MeshBridge; remote: RemoteBridgeSide }> = ["ryzen2", "ryzen3"].map(name => {
+  const logs: string[] = [];
+  const links: Array<{ bridge: MeshBridge; remote: RemoteBridgeSide; side: StoreBridgeSide; requests: Array<{ id: number; op: string }> }> = ["ryzen2", "ryzen3"].map(name => {
     const input = new PassThrough(), output = new PassThrough();
-    const serving = serveBridgeAgent(new StoreBridgeSide(stores[name]!, "ryzen1"), input, output);
+    const requests: Array<{ id: number; op: string }> = [];
+    input.on("data", chunk => { for (const line of String(chunk).trim().split("\n")) requests.push(JSON.parse(line)); });
+    const side = new StoreBridgeSide(stores[name]!, "ryzen1");
+    const serving = serveBridgeAgent(side, input, output);
     const remote = new RemoteBridgeSide(output, input);
     closers.push(async () => { remote.close(); input.end(); await serving; output.end(); });
     const bridge = new MeshBridge({ localName: "ryzen1", remoteName: name,
       local: new StoreBridgeSide(stores.ryzen1!, name), remote, cursorPath: path.join(dir, `${name}.json`), presenceMs: 0,
+      log: line => logs.push(line),
       relay: async (destination, event) => {
         const target = links.find(link => link.bridge.options.remoteName === destination);
         if (!target) throw new Error("Missing test destination");
         const deliver = () => target.bridge.deliverRelay(name, event);
         if (hook) await hook(deliver, event); else await deliver();
       } });
-    return { bridge, remote };
+    return { bridge, remote, side, requests };
   });
   for (const link of links) await link.bridge.start();
   for (const link of links) await link.bridge.syncPresence();
   const drain = async (): Promise<void> => { for (const link of links) await link.bridge.step(); };
-  return { dir, stores, mains, links, drain };
+  return { dir, stores, mains, links, drain, logs };
 };
 const senderFor = (f: Awaited<ReturnType<typeof fixture>>, mirrorLeaseWaitMs?: number) => {
   const a = f.stores.ryzen3!, source = f.mains.ryzen3!;
@@ -120,6 +127,129 @@ const senderFor = (f: Awaited<ReturnType<typeof fixture>>, mirrorLeaseWaitMs?: n
 };
 const unavailable = (): Error => Object.assign(new Error("Injected unavailable relay response"), {
   code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true });
+
+const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(yes => { resolve = yes; }); return { promise, resolve }; };
+const relayB = async () => {
+  const f = await fixture(), link = f.links[0]!, source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+  const origin = await f.stores.ryzen3!.publish({ topic: "fabric.control.command", kind: "followUp", from: source.identity,
+    to: target.identity.id, text: "private-relay-B-body", data: { version: 1, commandId: "relay-B-exact-command", targetId: target.identity.id,
+      operation: "followUp", replyTo: source.identity.id, requestedAt: Date.now(), deadlineAt: Date.now() + 60_000,
+      ownerIncarnation: target.ownerIncarnation, destinationRemoteHost: "ryzen2", message: "private-relay-B-body" } });
+  const pub: BridgePublish = { topic: origin.topic, kind: origin.kind, from: origin.from, to: origin.to!, ...(origin.text !== undefined ? { text: origin.text } : {}),
+    data: { ...origin.data as Record<string, unknown>, bridge: { from: "ryzen3", id: origin.id } } };
+  const logs: string[] = [];
+  link.bridge.options.log = line => logs.push(line);
+  const entered = deferred(), release = deferred(), mirror = link.side.mirror.bind(link.side);
+  let mirrorError: Error | undefined;
+  const failMirror = () => { mirrorError = new Error("private-peer-error"); };
+  vi.spyOn(link.side, "mirror").mockImplementationOnce(async (...args) => {
+    entered.resolve(); await release.promise; if (mirrorError) throw mirrorError; return mirror(...args);
+  });
+  const nativePresence = await link.bridge.options.local.presence(), relays = await link.bridge.options.local.relayPresence!();
+  const mirrorSample = { hosts: [...nativePresence.hosts, ...relays.hosts], participants: [...nativePresence.participants, ...relays.participants] };
+  const pending = link.remote.mirror(mirrorSample);
+  void pending.catch(() => undefined);
+  closers.push(async () => { release.resolve(); await pending.catch(() => undefined); });
+  await entered.promise;
+  const controller = new AbortController(), expiresAt = performance.now() + 4_000;
+  const budget: BridgeRelayDispatchBudget = { signal: controller.signal, remaining: () => {
+    const remaining = expiresAt - performance.now();
+    if (controller.signal.aborted || remaining <= 0) throw unavailable();
+    return remaining;
+  } };
+  return { ...f, link, source, target, pub, pending, release, budget, controller, logs, failMirror, mirrorSample };
+};
+
+describe("relay B original-budget exact mirror observation (stdio/store, NOT authenticated UDS/native COMMIT proof)", () => {
+  it("settles a routine mirror and issues exactly one command/handler, with zero-delay healthy population too", async () => {
+    const f = await relayB();
+    const receiver = new FabricControlPlane(f.stores.ryzen2!, f.target.identity, { enabled: true, hostId: f.target.identity.id,
+      ownerIncarnation: f.target.ownerIncarnation });
+    const receive = vi.fn(() => ({ accepted: true })); receiver.start(receive); closers.push(() => receiver.close());
+    const publish = f.link.side.publish.bind(f.link.side);
+    let serviceMs = 0;
+    vi.spyOn(f.link.side, "publish").mockImplementation(async (...args) => {
+      const started = performance.now(); await new Promise(resolve => setTimeout(resolve, 200));
+      serviceMs = performance.now() - started; return publish(...args);
+    });
+    const started = performance.now();
+    const delivery = f.link.bridge.deliverRelay("ryzen3", f.pub, f.budget);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(f.link.requests.filter(request => request.op === "publish")).toHaveLength(0);
+    f.release.resolve(); await f.pending; await delivery;
+    await vi.waitFor(() => expect(receive).toHaveBeenCalledOnce());
+    expect(events(f.stores.ryzen2!, "fabric.control.command")).toHaveLength(1);
+    expect(f.link.requests.filter(request => request.op === "publish")).toHaveLength(1);
+    expect(f.logs.find(line => line.startsWith("relay dispatch"))).toMatch(/schedulingDelayMs=\d+ outcome=confirmed$/);
+    const delayMs = Number(/schedulingDelayMs=(\d+)/.exec(f.logs.find(line => line.startsWith("relay dispatch"))!)![1]);
+    expect(delayMs).toBeGreaterThanOrEqual(40);
+    expect(delayMs).toBeLessThanOrEqual(performance.now() - started - serviceMs + 20); // exclude actual SENT service
+    await f.link.bridge.deliverRelay("ryzen3", f.pub, f.budget); // explicit SAME event retry -> durable commandId dedupe
+    expect(events(f.stores.ryzen2!, "fabric.control.command")).toHaveLength(1);
+    expect(receive).toHaveBeenCalledOnce();
+    expect(f.logs.filter(line => line.startsWith("relay dispatch"))).toHaveLength(2);
+    expect(f.logs.at(-1)).toMatch(/schedulingDelayMs=0 outcome=confirmed$/);
+    expect(f.logs.join("\n")).not.toContain("private-relay-B-body");
+    expect(markerFiles(f.stores.ryzen1!.root, "private-relay-B-body")).toEqual([]);
+  });
+
+  it("a 31 s held mirror returns negative inside the ORIGINAL 4 s budget and never sends after late release (VIRTUAL timers)", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const f = await relayB();
+    const delivery = f.link.bridge.deliverRelay("ryzen3", f.pub, f.budget).catch(error => error);
+    await vi.advanceTimersByTimeAsync(501);
+    expect(await delivery).toMatchObject({ code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true });
+    expect(f.logs).toContain("relay NAK stage=destination reason=mirror-wait-unavailable");
+    await vi.advanceTimersByTimeAsync(30_499);
+    f.release.resolve(); await f.pending.catch(error => expect(error).toMatchObject({ timedOut: true }));
+    expect(f.link.requests.filter(request => request.op === "publish")).toHaveLength(0);
+    expect(events(f.stores.ryzen2!, "fabric.control.command")).toHaveLength(0);
+    expect(f.logs.filter(line => line.startsWith("relay dispatch"))).toHaveLength(1);
+  });
+
+  it.each(["route", "identity", "held", "stop", "disconnect", "spent-budget", "spent-at-final-seam", "last-seam-mirror", "close", "mirror-error"] as const)(
+    "%s changes during the ONE wait forbid any late publication", async change => {
+      const f = await relayB();
+      const delivery = f.link.bridge.deliverRelay("ryzen3", f.pub, f.budget).catch(error => error);
+      let stopped: Promise<void> | undefined, replacement: Promise<void> | undefined;
+      if (change === "last-seam-mirror") {
+        const holds = f.link.bridge.options.local.holds!.bind(f.link.bridge.options.local);
+        vi.spyOn(f.link.bridge.options.local, "holds").mockImplementation((...args) => {
+          replacement ??= f.link.remote.mirror(f.mirrorSample);
+          return holds(...args);
+        });
+      }
+      if (change === "spent-at-final-seam") {
+        let remainingCalls = 0;
+        f.budget.remaining = () => { if (++remainingCalls === 3) throw unavailable(); return 4_000; };
+      }
+      if (change === "route") vi.spyOn(f.link.bridge.options.local, "relayOrigin").mockReturnValue("other-link");
+      if (change === "identity") {
+        const current = await f.link.bridge.options.local.relayPresence!();
+        // Keep the ordinary refresh intact (no omission/withdrawal); only the final
+        // authoritative identity lookup loses the sender during this test seam.
+        vi.spyOn(f.link.bridge.options.local, "relayPresence").mockResolvedValue(current)
+          .mockResolvedValueOnce(current).mockResolvedValueOnce({ hosts: [], participants: [] });
+      }
+      if (change === "held") vi.spyOn(f.link.bridge.options.local, "holds").mockReturnValue(false);
+      if (change === "stop") stopped = f.link.bridge.stop();
+      if (change === "disconnect") f.controller.abort(); // real UDS abort wiring is separate/native acceptance
+      if (change === "spent-budget") f.budget.remaining = () => { throw unavailable(); };
+      if (change === "close") f.link.remote.close();
+      if (change === "mirror-error") f.failMirror();
+      f.release.resolve(); await f.pending.catch(() => undefined);
+      const error = await delivery;
+      expect(error).toMatchObject({ code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true });
+      for (const property of ["notRun", "notDelivered", "result", "sent"]) expect(error).not.toHaveProperty(property);
+      await stopped; await replacement;
+      if (change === "last-seam-mirror") expect(f.logs).toContain("relay NAK stage=destination reason=dispatch-deferred");
+      expect(f.link.requests.filter(request => request.op === "publish")).toHaveLength(0);
+      expect(events(f.stores.ryzen2!, "fabric.control.command")).toHaveLength(0);
+      expect(f.logs.filter(line => line.startsWith("relay NAK stage=destination reason="))).toHaveLength(1);
+      expect(f.logs.filter(line => line.startsWith("relay dispatch"))).toHaveLength(1);
+      expect(f.logs.join("\n")).not.toMatch(/private-relay-B-body|private-peer-error/);
+    });
+});
 
 describe("local singleton relay data safety", () => {
   it("delivers fresh full text/message/data A -> B, keeping body markers out of all hub files", async () => {
@@ -144,12 +274,82 @@ describe("local singleton relay data safety", () => {
     expect(events(b, "fabric.control.command")).toHaveLength(1);
     expect(events(b, "fabric.control.command")[0]).toMatchObject({ text: marker, verification: "bridge", from: source.identity,
       data: { bridge: { from: "ryzen3", via: "ryzen1" } } });
+    expect(f.logs.filter(line => line.startsWith("relay outcome v1"))).toEqual([
+      `relay outcome v1 sequence=${events(a, "fabric.control.command")[0]!.sequence} outcome=confirmed`,
+    ]);
     expect(events(a, "fabric.control.ack")[0]).toMatchObject({ data: { accepted: true, messageId: "fixed-delivery-receipt" } });
     expect(markerFiles(a.root, marker).length).toBeGreaterThan(0);
     expect(markerFiles(b.root, marker).length).toBeGreaterThan(0);
     expect(markerFiles(hub.root, marker)).toEqual([]);
     bodyFreeReceipts(hub);
     for (const link of f.links) expect(fs.readFileSync(link.bridge.options.cursorPath, "utf8")).not.toContain(marker);
+  });
+
+  // Keep reason: #16378's completed-ACK replay failed after real destination dedupe.
+  // This is public control + real file stores/stdio bridges, NOT native CLI/UDS proof.
+  it.each(["steer", "followUp"] as const)("recovers an ordinary successful %s ACK without a new source publication or destination delivery", async operation => {
+    const f = await fixture();
+    const a = f.stores.ryzen3!, b = f.stores.ryzen2!, hub = f.stores.ryzen1!, target = f.mains.ryzen2!;
+    const sender = senderFor(f), marker = `local-completed-${operation}-private-body`;
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const input = { message: marker, data: { nested: { marker, count: 1 } }, ownerIncarnation: target.ownerIncarnation };
+    const options = { routedRemoteHost: "ryzen2", idempotencyKey: `completed-${operation}-stable-key` };
+    const receiver = new FabricControlPlane(b, target.identity, { enabled: true, hostId: target.identity.id, ownerIncarnation: target.ownerIncarnation });
+    const receive = vi.fn(() => ({ accepted: true, messageId: "completed-owner-receipt", result: { private: marker } }));
+    receiver.start(receive); closers.push(() => receiver.close());
+    const first = sender.request(target.identity.id, target.identity.id, operation, input, target.identity.id, options);
+    void first.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
+    await f.drain();
+    await vi.waitFor(() => expect(events(b, "fabric.control.ack")).toHaveLength(1));
+    await f.drain(); await f.drain();
+    const original = await first;
+    expect(original).toEqual({ queued: true, routed: "mesh", acknowledged: true, messageId: "completed-owner-receipt" });
+    expect(sender.relayAcknowledgementRecoverySnapshot()).toEqual({ retained: 1, acknowledged: 1, limit: 256, ttlMs: 8_000 });
+    const publish = vi.spyOn(a, "publish");
+    now += 2_312; // Explicit caller replay AFTER successful owner ACK, not lost-receipt recovery.
+    await expect(sender.request(target.identity.id, target.identity.id, operation,
+      { ownerIncarnation: target.ownerIncarnation, data: { nested: { count: 1, marker } }, message: marker }, target.identity.id, options))
+      .resolves.toEqual(original);
+    for (const changed of [
+      { ...input, message: "changed-completed-message" },
+      { ...input, data: { nested: { marker, count: 2 } } },
+    ]) await expect(sender.request(target.identity.id, target.identity.id, operation, changed, target.identity.id, options))
+      .rejects.toBeInstanceOf(FabricIdempotencyKeyReusedError);
+    expect(publish).not.toHaveBeenCalled();
+    expect(events(a, "fabric.control.command")).toHaveLength(1);
+    expect(events(b, "fabric.control.command")).toHaveLength(1);
+    expect(events(a, "fabric.control.ack")).toHaveLength(1);
+    expect(receive).toHaveBeenCalledOnce();
+    expect(f.logs.filter(line => line.startsWith("relay outcome v1"))).toHaveLength(1);
+    // F16378-R7-ACK-01: real owner success settles first, then contradictory owner
+    // receipts cross the same two bridges. None may replace the original success.
+    const commandId = (events(b, "fabric.control.command")[0]!.data as { commandId: string }).commandId;
+    const reads = vi.spyOn(a, "tail");
+    for (const [index, late] of [
+      { accepted: false }, { accepted: false, notRun: true }, { accepted: true, notRun: true },
+    ].entries()) {
+      await b.publish({ topic: "fabric.control.ack", kind: late.accepted ? "accepted" : "rejected", from: target.identity,
+        to: f.mains.ryzen3!.identity.id, data: { version: 1, commandId, targetId: target.identity.id,
+          ownerIncarnation: target.ownerIncarnation, ...late, error: "Fabric control command expired", messageId: "contradictory-owner-orphan" } });
+      await f.drain(); await f.drain();
+      const orphan = events(a, "fabric.control.ack").at(-1)!;
+      expect(orphan).toMatchObject({ verification: "bridge", from: target.identity,
+        data: { ...late, bridge: { from: "ryzen2", via: "ryzen1" } } });
+      await vi.waitFor(() => expect(reads.mock.results.some(result => result.type === "return" &&
+        result.value.events.some(event => event.sequence === orphan.sequence))).toBe(true));
+      sender.pause(); await sender.checkpointForRelease(); sender.resume();
+      publish.mockClear();
+      await expect(sender.request(target.identity.id, target.identity.id, operation, input, target.identity.id, options)).resolves.toEqual(original);
+      expect(publish).not.toHaveBeenCalled();
+      expect(events(a, "fabric.control.command")).toHaveLength(1);
+      expect(events(b, "fabric.control.command")).toHaveLength(1);
+      expect(events(a, "fabric.control.ack")).toHaveLength(index + 2);
+      expect(receive).toHaveBeenCalledOnce();
+    }
+    expect(markerFiles(hub.root, marker)).toEqual([]);
+    bodyFreeReceipts(hub);
   });
 
   it("strips singleton sensitive ACK text/result at both the hub and A", async () => {
@@ -185,6 +385,11 @@ describe("local singleton relay data safety", () => {
     await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
     await f.drain();
     await expect(pending).rejects.toMatchObject({ code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true, idempotencyKey: "down-stable-key" });
+    expect(f.logs.filter(line => line.startsWith("relay NAK stage=source"))).toEqual(["relay NAK stage=source reason=destination-unavailable"]);
+    expect(f.logs.filter(line => line.startsWith("relay outcome v1"))).toEqual([
+      `relay outcome v1 sequence=${events(a, "fabric.control.command")[0]!.sequence} outcome=nak`,
+    ]);
+    expect(f.logs.join("\n")).not.toContain(marker);
     const ack = events(a, "fabric.control.ack")[0]!;
     expect(ack).toMatchObject({ from: { id: "bridge:ryzen1", name: "mesh-bridge", kind: "main" }, verification: "bridge", to: source.identity.id,
       data: { accepted: false, retryable: true, errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", bridge: { from: "ryzen1" } } });
@@ -359,6 +564,9 @@ describe("local singleton relay data safety", () => {
     await expect(conflict).rejects.toMatchObject({ name: "FabricIdempotencyKeyReusedError", code: FABRIC_IDEMPOTENCY_KEY_REUSED,
       retryable: false, idempotencyKey: options.idempotencyKey, message: "Fabric idempotency key reused with different input" });
     expect(calls).toBe(2);
+    expect(f.logs).toContain("relay NAK stage=source reason=idempotency-conflict");
+    expect(f.logs).toContain("relay NAK stage=destination reason=idempotency-conflict");
+    expect(f.logs.join("\n")).not.toMatch(new RegExp(`${marker}|${changedMarker}`));
     expect(events(a, "fabric.control.command")).toHaveLength(2);
     expect(events(b, "fabric.control.command")).toHaveLength(1);
     expect(events(b, "fabric.control.command")[0]!.data).toMatchObject({ message: marker, data: input.data });
@@ -466,7 +674,8 @@ describe("local singleton relay data safety", () => {
       data: { version: 1, commandId, targetId: target.identity.id, ownerIncarnation: target.ownerIncarnation, accepted: true,
         messageId: "owner-after-invalid-idempotency-refusal", bridge: { from: "ryzen2", id: "valid-owner-after-invalid-refusal", via: "ryzen1" } } }, [], true);
     await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "owner-after-invalid-idempotency-refusal" });
-    expect(sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 0, acknowledged: 0 });
+    // Only the genuine ordinary owner success now contributes a recoverable receipt.
+    expect(sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 1, acknowledged: 1 });
   });
 
   it.each(["fresh", "bridge-stale"] as const)("recovers the real owner ACK consumed at A before same-key retry registration (%s mirror)", async mirrorState => {
@@ -522,6 +731,41 @@ describe("local singleton relay data safety", () => {
     expect(markerFiles(b.root, marker).length).toBeGreaterThan(0);
     expect(markerFiles(hub.root, marker)).toEqual([]);
     bodyFreeReceipts(hub);
+  });
+
+  it.each([false, true])("still recovers a late owner negative after prior relay refusal (notRun=%s)", async notRun => {
+    const f = await fixture(async () => { throw unavailable(); });
+    const a = f.stores.ryzen3!, target = f.mains.ryzen2!, source = f.mains.ryzen3!;
+    const sender = senderFor(f), ingress = new StoreBridgeSide(a, "ryzen1");
+    const input = { message: "legacy-negative-recovery", ownerIncarnation: target.ownerIncarnation };
+    const options = { routedRemoteHost: "ryzen2", idempotencyKey: "legacy-negative-recovery-key" };
+    const send = () => sender.request(target.identity.id, target.identity.id, "followUp", input, target.identity.id, options);
+    const first = send(); void first.catch(() => undefined);
+    await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(1));
+    await f.drain();
+    await expect(first).rejects.toMatchObject({ code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE" });
+    expect(sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 1, acknowledged: 0 });
+    const originalId = (events(a, "fabric.control.command")[0]!.data as { commandId: string }).commandId;
+    await ingress.publish({ topic: "fabric.control.ack", kind: "rejected", from: target.identity, to: source.identity.id,
+      data: { version: 1, commandId: originalId, targetId: target.identity.id, ownerIncarnation: target.ownerIncarnation,
+        accepted: false, error: "Fabric control command expired", ...(notRun ? { notRun: true } : {}),
+        bridge: { from: "ryzen2", id: "legacy-negative-owner", via: "ryzen1" } } }, [], true);
+    await vi.waitFor(() => expect(sender.relayAcknowledgementRecoverySnapshot().acknowledged).toBe(1));
+    const retry = send(); void retry.catch(() => undefined);
+    if (!notRun) {
+      await expect(retry).rejects.toThrow("Fabric control command expired");
+      expect(events(a, "fabric.control.command")).toHaveLength(1); // Recover the refusal, not a fresh publication.
+    } else {
+      await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(2));
+      const nextId = (events(a, "fabric.control.command")[1]!.data as { commandId: string }).commandId;
+      expect(nextId).not.toBe(originalId); // Preserve the existing sole proven-notRun resend.
+      await ingress.publish({ topic: "fabric.control.ack", kind: "accepted", from: target.identity, to: source.identity.id,
+        data: { version: 1, commandId: nextId, targetId: target.identity.id, ownerIncarnation: target.ownerIncarnation,
+          accepted: true, messageId: "legacy-negative-resend-success",
+          bridge: { from: "ryzen2", id: "legacy-negative-resend-owner", via: "ryzen1" } } }, [], true);
+      await expect(retry).resolves.toMatchObject({ acknowledged: true, messageId: "legacy-negative-resend-success" });
+    }
+    expect(events(f.stores.ryzen2!, "fabric.control.command")).toEqual([]);
   });
 
   it("rejects changed body against a real cached late ACK without publishing, then accepts reordered identical input", async () => {
@@ -695,7 +939,8 @@ describe("local singleton relay data safety", () => {
     await vi.waitFor(() => expect(events(a, "fabric.control.command")).toHaveLength(2));
     await ingress.publish({ ...ack, data: { ...ack.data, bridge: { ...ack.data.bridge, id: "fresh-live-owner-event" } } }, [], true);
     await expect(retry).resolves.toMatchObject({ acknowledged: true, messageId: "finite-owner-receipt" });
-    expect(sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 0, acknowledged: 0 });
+    // The expired orphan did not recover; this newly pending ordinary success starts its own window.
+    expect(sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 1, acknowledged: 1 });
   });
 
   it("caps refused-request authority at 256 and evicts the oldest without a full log scan", async () => {
@@ -730,6 +975,48 @@ describe("local singleton relay data safety", () => {
     await vi.waitFor(() => expect(sender.relayAcknowledgementRecoverySnapshot()).toEqual({ retained: 256, acknowledged: 1, limit: 256, ttlMs: 8_000 }));
     expect(events(f.stores.ryzen2!, "fabric.control.command")).toEqual([]);
     expect(events(f.stores.ryzen1!, "fabric.control.command")).toEqual([]);
+  }, 30_000);
+
+  it("shares the 256-entry bound between ordinary successes and refusal authority and evicts the oldest successful receipt", async () => {
+    const f = await fixture(), a = f.stores.ryzen3!, source = f.mains.ryzen3!, target = f.mains.ryzen2!;
+    const sender = senderFor(f), ingress = new StoreBridgeSide(a, "ryzen1");
+    vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    const input = { message: "bounded-success-body", ownerIncarnation: target.ownerIncarnation };
+    const send = (index: number) => sender.request(target.identity.id, target.identity.id, "followUp", input,
+      target.identity.id, { routedRemoteHost: "ryzen2", idempotencyKey: `bounded-completed-${index}` });
+    const ownerAck = (command: ReturnType<typeof events>[number]) => ingress.publish({ topic: "fabric.control.ack", kind: "accepted",
+      from: target.identity, to: source.identity.id, data: { version: 1, commandId: (command.data as { commandId: string }).commandId,
+        targetId: target.identity.id, ownerIncarnation: target.ownerIncarnation, accepted: true,
+        messageId: "bounded-confirmed-owner", bridge: { from: "ryzen2", id: `completed-${command.id}`, via: "ryzen1" } } }, [], true);
+    let after = 0;
+    for (let index = 0; index < 257; index++) {
+      const pending = send(index); void pending.catch(() => undefined);
+      await vi.waitFor(() => expect(a.read({ topic: "fabric.control.command", after, limit: 1 })).toHaveLength(1), { interval: 1 });
+      const command = a.read({ topic: "fabric.control.command", after, limit: 1 })[0]!;
+      after = command.sequence;
+      if (index === 1) {
+        await ingress.publish({ topic: "fabric.control.ack", kind: "rejected", from: { id: "bridge:ryzen1", name: "mesh-bridge", kind: "main" }, to: source.identity.id,
+          data: { version: 1, commandId: (command.data as { commandId: string }).commandId, targetId: target.identity.id, accepted: false,
+            error: "Relay destination unavailable", errorCode: "FABRIC_RELAY_DESTINATION_UNAVAILABLE", retryable: true,
+            bridge: { from: "ryzen1", id: command.id } } }, [], true);
+        await expect(pending).rejects.toMatchObject({ code: "FABRIC_RELAY_DESTINATION_UNAVAILABLE" });
+      } else {
+        await ownerAck(command);
+        await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "bounded-confirmed-owner" });
+      }
+      expect(sender.relayAcknowledgementRecoverySnapshot().retained).toBe(Math.min(index + 1, 256));
+    }
+    expect(sender.relayAcknowledgementRecoverySnapshot()).toEqual({ retained: 256, acknowledged: 255, limit: 256, ttlMs: 8_000 });
+    const publish = vi.spyOn(a, "publish");
+    await expect(send(256)).resolves.toMatchObject({ acknowledged: true, messageId: "bounded-confirmed-owner" });
+    expect(publish).not.toHaveBeenCalled(); publish.mockRestore();
+    const evicted = send(0); void evicted.catch(() => undefined);
+    await vi.waitFor(() => expect(a.read({ topic: "fabric.control.command", after, limit: 1 })).toHaveLength(1));
+    const fresh = a.read({ topic: "fabric.control.command", after, limit: 1 })[0]!;
+    await ownerAck(fresh);
+    await expect(evicted).resolves.toMatchObject({ acknowledged: true });
+    expect(sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 256, acknowledged: 256 });
+    expect(events(f.stores.ryzen2!, "fabric.control.command")).toEqual([]);
   }, 30_000);
 
   it("scrubs a seeded historical FULL hub ACK on singleton egress while preserving native hub marker bytes", async () => {

@@ -16,6 +16,7 @@ import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 import { removeHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { FileControlReader, FileTransport } from "../src/transport/file.js";
+import { StoreBridgeSide, type BridgePublish } from "../src/mesh/bridge.js";
 
 const roots: string[] = [];
 const planes: FabricControlPlane[] = [];
@@ -79,6 +80,7 @@ describe("origin control idempotency keys", () => {
       { message, ownerIncarnation: owner.incarnation }, "owner", { idempotencyKey: "caller-supplied-followup" });
 
     await expect(send("original message")).resolves.toMatchObject({ acknowledged: true, messageId: "original message" });
+    expect(sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 0, acknowledged: 0 }); // Native success is not retained.
     await expect(send("original message")).resolves.toMatchObject({ acknowledged: true, messageId: "original message" });
     await expect(send("edited message")).rejects.toMatchObject({
       name: "FabricIdempotencyKeyReusedError", code: "FABRIC_IDEMPOTENCY_KEY_REUSED", retryable: false,
@@ -90,6 +92,177 @@ describe("origin control idempotency keys", () => {
     expect(ids).toHaveLength(2); // The edited retry is refused before the source event is published.
     expect(ids[0]).toBe(ids[1]); // Identical retry still reuses the original command id and receipt.
     expect(receive).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Keep reason: #16378 completed bridge ACKs need bounded explicit replay, not automatic resend.
+// Real file stores/public requests with injected bridge ingress; not native CLI/UDS evidence.
+describe("successful bridged message ACK recovery (#16378)", () => {
+  const setup = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-completed-ack-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { stateBackend: "file" });
+    const route = { ownerHostId: "host:owner", ownerIdentityId: "identity:owner", targetId: "agent:target",
+      ownerIncarnation: fixtureOwnerIncarnation, remoteHost: "forge" };
+    const sender = new FabricControlPlane(mesh, identity("host:sender"), { enabled: true, hostId: "host:sender", pollMs: 20,
+      readMirroredOwner: owner => owner === "host:barrier" ? undefined : { remoteHost: route.remoteHost, expiresAt: Date.now() + 60_000 } });
+    planes.push(sender); sender.start(() => ({ accepted: false }));
+    const commands = () => mesh.read({ topic: "fabric.control.command", limit: 1_000 }).filter(event => event.kind === "followUp");
+    const next = async (count: number) => {
+      await vi.waitFor(() => expect(commands()).toHaveLength(count), { interval: 5 });
+      return commands()[count - 1]!;
+    };
+    const send = () => sender.request(route.ownerHostId, route.targetId, "followUp",
+      { message: "private-completed-body", data: { nested: { value: 1 } }, ownerIncarnation: route.ownerIncarnation },
+      route.ownerIdentityId, { routedRemoteHost: route.remoteHost, idempotencyKey: "completed-public-key" });
+    const wire = (command: MeshEvent): BridgePublish => ({ topic: "fabric.control.ack", kind: "accepted",
+      from: identity(route.ownerIdentityId), to: "host:sender", data: { version: 1,
+        commandId: (command.data as FabricControlCommand).commandId, targetId: route.targetId, ownerIncarnation: route.ownerIncarnation,
+        accepted: true, messageId: "confirmed-original", result: { private: "must-not-be-retained" }, bridge: { from: route.remoteHost, id: `ack:${command.id}` } } });
+    let ingressSequence = 0;
+    const publish = (ack: BridgePublish) => {
+      const bridge = (ack.data as { bridge?: { from?: string } }).bridge;
+      // Bind ingress to the ACK's actual peer, not a newly resolved route, and give
+      // each injected ACK its own event identity (real bridge ingress dedupes IDs).
+      return new StoreBridgeSide(mesh, bridge?.from ?? route.remoteHost).publish({ ...ack,
+        data: { ...ack.data as object, bridge: { ...bridge, from: bridge?.from ?? route.remoteHost, id: `ingress:${++ingressSequence}` } } }, [], true);
+    };
+    const complete = async () => {
+      const pending = send(); void pending.catch(() => undefined);
+      const command = await next(1), ack = wire(command);
+      await publish(ack);
+      const original = await pending;
+      expect(sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 1, acknowledged: 1 });
+      return { command, ack, original };
+    };
+    // A public native request/ACK proves the shared reader advanced past preceding hostile/orphan ACKs.
+    let sequence = 0;
+    const barrier = async () => {
+      const targetId = `barrier:${++sequence}`;
+      const pending = sender.request("host:barrier", targetId, "stop", { ownerIncarnation: fixtureOwnerIncarnation }, "host:barrier", { routedRemoteHost: null });
+      void pending.catch(() => undefined);
+      await vi.waitFor(() => expect(mesh.read({ topic: "fabric.control.command", limit: 1_000 }).some(e => e.to === "host:barrier" && (e.data as FabricControlCommand).targetId === targetId)).toBe(true));
+      const command = mesh.read({ topic: "fabric.control.command", limit: 1_000 }).find(e => e.to === "host:barrier" && (e.data as FabricControlCommand).targetId === targetId)!;
+      await mesh.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity("host:barrier"), to: "host:sender",
+        data: { version: 1, commandId: (command.data as FabricControlCommand).commandId, targetId, ownerIncarnation: fixtureOwnerIncarnation, accepted: true } });
+      await pending;
+    };
+    return { mesh, sender, route, send, next, wire, publish, complete, barrier, commands };
+  };
+
+  it.each([
+    { accepted: false, notRun: false },
+    { accepted: false, notRun: true },
+    { accepted: true, notRun: true },
+  ])("preserves success after a late accepted=$accepted/notRun=$notRun orphan ACK (F16378-R7-ACK-01)", async ({ accepted, notRun }) => {
+    const f = setup(), { ack, original } = await f.complete();
+    await f.publish({ ...ack, kind: accepted ? "accepted" : "rejected", data: { ...ack.data,
+      accepted, ...(notRun ? { notRun: true } : {}), error: "Fabric control command expired", messageId: "contradictory-orphan" } });
+    await f.barrier(); // Prove the authenticated orphan was consumed AFTER successful settlement.
+    const publish = vi.spyOn(f.mesh, "publish");
+    let settled = false;
+    const replay = f.send().finally(() => { settled = true; }); void replay.catch(() => undefined);
+    // A broken notRun replay starts a resend: fail on that publication, not a test timeout.
+    await vi.waitFor(() => expect(settled || f.commands().length > 1).toBe(true));
+    expect(f.commands()).toHaveLength(1);
+    await expect(replay).resolves.toEqual(original);
+    expect(publish).not.toHaveBeenCalled();
+    expect(f.sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 1, acknowledged: 1 });
+  });
+
+  it.each(["ownerHostId", "ownerIdentityId", "targetId", "ownerIncarnation", "remoteHost"] as const)("does not reuse a successful receipt after changed %s", async field => {
+    const f = setup(), { ack } = await f.complete();
+    f.route[field] = `changed-${field}`;
+    let done = false;
+    const pending = f.send().finally(() => { done = true; }); void pending.catch(() => undefined);
+    const command = await f.next(2);
+    // The old completed receipt is neither a fresh receipt nor proof of notRun.
+    await f.publish(ack); await f.barrier();
+    expect(done).toBe(false);
+    await f.publish({ ...f.wire(command), data: { ...f.wire(command).data, messageId: "new-authority-live" } });
+    await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "new-authority-live" });
+    expect(f.commands()).toHaveLength(2);
+  });
+
+  it("uses one fixed 8000 ms success window: neither access nor repeated ACKs renew it, and late orphans cannot revive it", async () => {
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = setup(), { ack, original } = await f.complete();
+    now += 2_312;
+    const publish = vi.spyOn(f.mesh, "publish");
+    await expect(f.send()).resolves.toEqual(original);
+    expect(publish).not.toHaveBeenCalled(); publish.mockRestore();
+    now += 5_687; // 7999 since first successful ACK.
+    await f.publish({ ...ack, data: { ...ack.data as object, bridge: { from: "forge", id: "repeated-at-7999" } } });
+    await f.barrier();
+    await expect(f.send()).resolves.toEqual(original);
+    now += 1;
+    expect(f.sender.relayAcknowledgementRecoverySnapshot()).toEqual({ retained: 0, acknowledged: 0, limit: 256, ttlMs: 8_000 });
+    await f.publish({ ...ack, data: { ...ack.data as object, bridge: { from: "forge", id: "orphan-at-8000" } } });
+    await f.barrier();
+    expect(f.sender.relayAcknowledgementRecoverySnapshot().retained).toBe(0);
+    const pending = f.send(); void pending.catch(() => undefined);
+    const command = await f.next(2);
+    await f.publish({ ...f.wire(command), data: { ...f.wire(command).data, messageId: "fresh-after-expiry" } });
+    await expect(pending).resolves.toMatchObject({ acknowledged: true, messageId: "fresh-after-expiry" });
+  });
+
+  it.each(["wrong-owner", "wrong-epoch", "wrong-origin", "wrong-target", "wrong-recipient", "bad-version", "native", "unstamped", "infrastructure", "body-conflict"] as const)("does not populate success recovery from %s ACKs", async variant => {
+    const f = setup();
+    let done = false;
+    const pending = f.send().finally(() => { done = true; }); void pending.catch(() => undefined);
+    const command = await f.next(1), ack = f.wire(command);
+    const data = ack.data as Record<string, unknown>;
+    if (variant === "wrong-owner") ack.from = identity("identity:forged");
+    if (variant === "wrong-epoch") data.ownerIncarnation = "epoch:forged";
+    if (variant === "wrong-origin") data.bridge = { from: "other-link" };
+    if (variant === "wrong-target") data.targetId = "agent:forged";
+    if (variant === "wrong-recipient") ack.to = "host:other";
+    if (variant === "bad-version") data.version = 2;
+    if (variant === "native") delete data.bridge;
+    if (variant === "infrastructure") data.errorCode = "FABRIC_RELAY_DESTINATION_UNAVAILABLE";
+    if (variant === "body-conflict") data.errorCode = "FABRIC_IDEMPOTENCY_KEY_REUSED";
+    if (variant === "native" || variant === "unstamped") await f.mesh.publish(ack);
+    else await f.publish(ack);
+    await f.barrier();
+    expect(f.sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 0, acknowledged: 0 });
+    // Preserve existing live verifier behavior; retention additionally requires verified bridge ingress.
+    if (!done) await f.publish(f.wire(command));
+    await expect(pending).resolves.toMatchObject({ acknowledged: true });
+  });
+
+  it.each([false, true])("does not retain an ordinary accepted=false ACK (notRun=%s), preserving only the existing owner-proven resend", async notRun => {
+    const f = setup(), pending = f.send(); void pending.catch(() => undefined);
+    const command = await f.next(1);
+    await f.publish({ ...f.wire(command), kind: "rejected", data: { ...f.wire(command).data,
+      accepted: false, error: "Fabric control command expired", ...(notRun ? { notRun: true } : {}) } });
+    if (!notRun) await expect(pending).rejects.toThrow("Fabric control command expired");
+    const retry = notRun ? pending : f.send(); void retry.catch(() => undefined);
+    const second = await f.next(2);
+    expect(f.sender.relayAcknowledgementRecoverySnapshot()).toMatchObject({ retained: 0, acknowledged: 0 });
+    const firstId = (command.data as FabricControlCommand).commandId, secondId = (second.data as FabricControlCommand).commandId;
+    if (notRun) expect(secondId).not.toBe(firstId); else expect(secondId).toBe(firstId);
+    await f.publish(f.wire(second));
+    await expect(retry).resolves.toMatchObject({ acknowledged: true });
+  });
+
+  it("excludes accepted=true/notRun ACKs without changing their existing live settlement", async () => {
+    const f = setup(), first = f.send(); void first.catch(() => undefined);
+    const command = await f.next(1);
+    await f.publish({ ...f.wire(command), data: { ...f.wire(command).data, notRun: true } });
+    await expect(first).resolves.toMatchObject({ acknowledged: true });
+    expect(f.sender.relayAcknowledgementRecoverySnapshot().retained).toBe(0);
+    const retry = f.send(); void retry.catch(() => undefined);
+    await f.publish(f.wire(await f.next(2)));
+    await expect(retry).resolves.toMatchObject({ acknowledged: true });
+  });
+
+  it("does not turn requestResult into a successful message/result cache", async () => {
+    const f = setup();
+    const pending = f.sender.requestResult(f.route.ownerHostId, f.route.targetId, "followUp", { ownerIncarnation: fixtureOwnerIncarnation }, f.route.ownerIdentityId, { routedRemoteHost: "forge" });
+    void pending.catch(() => undefined);
+    await f.publish(f.wire(await f.next(1)));
+    await expect(pending).resolves.toEqual({ private: "must-not-be-retained" }); // General live result behavior is unchanged, not cached.
+    expect(f.sender.relayAcknowledgementRecoverySnapshot().retained).toBe(0);
   });
 });
 

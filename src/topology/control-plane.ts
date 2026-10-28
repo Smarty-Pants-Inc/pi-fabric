@@ -51,8 +51,8 @@ const NATS_IN_HAND_CAPACITY = 128;
 const NATS_WORKING_MS = 10_000;
 const NATS_HORIZON_MS = 24 * 60 * 60 * 1_000;
 type NatsControlErrorCode = "FABRIC_CONTROL_ID_CONFLICT" | "FABRIC_SENDER_UNVERIFIED";
-// Source-local recovery only after an authenticated relay refusal. The UDS relay's
-// fixed 4 s receipt window permits at most this 8 s observation window; no idle timer.
+// Source-local recovery for authenticated relay refusals and successful bridged messages.
+// Keep the relay's existing fixed 8 s observation window; no renewal or idle timer.
 // Keep this constant local: importing the optional UDS runtime would widen startup.
 const RELAY_ACK_RECOVERY_TTL_MS = 8_000;
 const RELAY_ACK_RECOVERY_LIMIT = 256;
@@ -543,6 +543,8 @@ interface PendingControlRequest {
   readonly idempotencyKey: string;
   /** Canonical semantic wire input; authority/attempt metadata is authenticated separately. */
   readonly bodyFingerprint: string;
+  /** Ordinary message request, not a general result request. */
+  readonly messageRequest?: boolean;
   readonly destinationRemoteHost?: string | null;
   /** Original source event, fixed before publication can yield. */
   readonly commandEventId: string;
@@ -555,7 +557,7 @@ interface PendingControlRequest {
   onAbort?: () => void;
 }
 
-/** Only captured authority survives a typed refusal: no callbacks, input, lease reads or timers. */
+/** Recovery keeps only captured authority: no callbacks, input, lease reads or timers. */
 type ControlAcknowledgementAuthority = Readonly<Pick<PendingControlRequest,
   "ownerHostId" | "ownerIdentityId" | "ownerMachine" | "ownerIncarnation" | "targetId" | "destinationRemoteHost">> & {
   readonly mirroredOwner?: Readonly<{ remoteHost: string }>;
@@ -578,7 +580,7 @@ interface OriginIdempotencyRecord {
   readonly expiresAt: number;
 }
 
-/** Never invoke a getter while capturing a late ACK; wire records must be plain own data. */
+/** Never invoke a getter while retaining an ACK; wire records must be plain own data. */
 const ownDataRecord = (value: unknown): Record<string, unknown> | undefined => {
   if (!isObject(value)) return undefined;
   const prototype = Object.getPrototypeOf(value);
@@ -694,7 +696,7 @@ export class FabricControlPlane {
   #retainRelayAuthority(commandId: string, pending: PendingControlRequest): void {
     this.#pruneRelayAcknowledgements();
     if (this.#closed || !pending.mirroredOwner || typeof pending.destinationRemoteHost !== "string" ||
-        pending.relayHub === undefined || (pending.operation !== "steer" && pending.operation !== "followUp")) return;
+        (pending.operation !== "steer" && pending.operation !== "followUp")) return;
     const key = relayAcknowledgementKey(commandId, pending.idempotencyKey);
     const authority: ControlAcknowledgementAuthority = Object.freeze({
       ownerHostId: pending.ownerHostId, ownerIdentityId: pending.ownerIdentityId,
@@ -702,7 +704,7 @@ export class FabricControlPlane {
       destinationRemoteHost: pending.destinationRemoteHost,
       mirroredOwner: Object.freeze({ remoteHost: pending.mirroredOwner.remoteHost }),
     });
-    // Another refusal cannot renew an existing recovery window or overwrite its original authority.
+    // Neither another refusal nor an owner ACK renews the fixed window or its original authority.
     const entry = this.#relayAcknowledgements.get(key) ?? Object.freeze({ commandId,
       idempotencyKey: pending.idempotencyKey, bodyFingerprint: pending.bodyFingerprint,
       expiresAt: Date.now() + RELAY_ACK_RECOVERY_TTL_MS, authority });
@@ -1240,6 +1242,7 @@ export class FabricControlPlane {
         commandEventId,
         ...(relayHub !== undefined ? { relayHub } : {}),
         ...(readOwnerExpiry && messageRequest ? { readOwnerExpiry } : {}),
+        ...(messageRequest ? { messageRequest: true } : {}),
         ...(destinationRemoteHost !== undefined ? { destinationRemoteHost } : {}),
         ...(mirroredOwner ? { mirroredOwner: { ...mirroredOwner } } : {}),
       };
@@ -2044,21 +2047,41 @@ export class FabricControlPlane {
     if (!data || !from || typeof data.commandId !== "string" || typeof from.id !== "string") return;
     const pending = this.#pending.get(data.commandId);
     if (pending) {
-      if (this.#authenticatedAcknowledgement({ from: { id: from.id }, data }, pending)) this.#settleAcknowledgement(data.commandId, pending, data);
+      if (this.#authenticatedAcknowledgement({ from: { id: from.id }, data }, pending)) {
+        if (pending.messageRequest && data.accepted === true && data.notRun !== true) this.#retainOwnerAcknowledgement(event, pending);
+        this.#settleAcknowledgement(data.commandId, pending, data);
+      }
       return;
     }
-    // No general ACK cache: only an exact command with previously retained refusal authority.
+    this.#retainOwnerAcknowledgement(event);
+  }
+
+  /** Ordinary bridged message successes and late refusal recovery share one body-free sanitizer/map. */
+  #retainOwnerAcknowledgement(event: MeshEvent, pending?: PendingControlRequest): void {
+    const envelope = ownDataRecord(event);
+    const data = envelope && ownDataRecord(envelope.data);
+    const from = envelope && ownDataRecord(envelope.from);
+    if (!data || !from || typeof data.commandId !== "string" || typeof from.id !== "string" ||
+        envelope?.verification !== "bridge" || envelope.to !== this.options.hostId || typeof data.accepted !== "boolean" ||
+        data.errorCode === RELAY_DESTINATION_UNAVAILABLE || data.errorCode === FABRIC_IDEMPOTENCY_KEY_REUSED) return;
+    const bridge = ownDataRecord(data.bridge);
+    const warning = data.warning === undefined ? undefined : ownDataRecord(data.warning);
+    if (!bridge || (data.warning !== undefined && !warning)) return;
+    const safeData = { ...data, bridge, ...(warning ? { warning } : {}) };
+    const safeEvent = { from: { id: from.id }, data: safeData };
+    if (pending) {
+      if (!this.#authenticatedAcknowledgement(safeEvent, pending)) return;
+      this.#retainRelayAuthority(data.commandId, pending);
+    }
+    // No general ACK cache: exact live success or previously retained refusal authority only.
     for (const [key, entry] of this.#relayAcknowledgements) {
-      if (entry.commandId !== data.commandId || envelope?.verification !== "bridge" ||
-          envelope.to !== this.options.hostId || typeof data.accepted !== "boolean" ||
-          data.errorCode === RELAY_DESTINATION_UNAVAILABLE || data.errorCode === FABRIC_IDEMPOTENCY_KEY_REUSED ||
-          (entry.authority.ownerIncarnation !== undefined && data.ownerIncarnation !== entry.authority.ownerIncarnation)) continue;
-      const bridge = ownDataRecord(data.bridge);
-      const warning = data.warning === undefined ? undefined : ownDataRecord(data.warning);
-      if (!bridge || (data.warning !== undefined && !warning)) continue;
-      const safeData = { ...data, bridge, ...(warning ? { warning } : {}) };
-      const safeEvent = { from: { id: from.id }, data: safeData };
-      if (!this.#authenticatedAcknowledgement(safeEvent, entry.authority)) continue;
+      if (entry.commandId !== data.commandId ||
+          (entry.authority.ownerIncarnation !== undefined && data.ownerIncarnation !== entry.authority.ownerIncarnation) ||
+          !this.#authenticatedAcknowledgement(safeEvent, entry.authority)) continue;
+      // Refusal recovery still accepts owner negatives, but they (or notRun) cannot
+      // replace a successful receipt already retained for this exact authority.
+      if (ownDataRecord(entry.acknowledgement?.data)?.accepted === true &&
+          (data.accepted !== true || data.notRun === true)) return;
       // Keep only the ordinary receipt and the authority fields that the SAME verifier needs.
       // Bridged message results are scrubbed at ingress; never retain an arbitrary result/body.
       const { result: _result, ...acceptance } = this.#acknowledgementAcceptance(safeData, entry.authority);
@@ -2072,7 +2095,7 @@ export class FabricControlPlane {
         }) });
       this.#relayAcknowledgements.delete(key);
       this.#relayAcknowledgements.set(key, Object.freeze({ ...entry, acknowledgement }));
-      return; // preserve the refusal's absolute deadline, not a receipt-relative TTL
+      return; // preserve the entry's absolute deadline, including an earlier refusal
     }
   }
 

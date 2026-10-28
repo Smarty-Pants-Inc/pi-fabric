@@ -27,6 +27,7 @@ import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
 import { BridgeLegacyBaselineAlarmEpisode, supportsLegacyBaselineAlarm, type BridgeLegacyBaselineAlarm } from "./bridge-baseline-alarms.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 import { HUB_FACTORY_RECIPIENT, isAddressedHubFactoryEvent, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
+import type { BridgeRelayDispatchBudget } from "./bridge-relay.js";
 export { HUB_FACTORY_RECIPIENT, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
 
 /**
@@ -152,7 +153,7 @@ export class BridgeStartDeadlineError extends Error {
   readonly code = "FABRIC_BRIDGE_START_DEADLINE";
   constructor(readonly waitedMs: number, readonly deadlineMs: number, readonly attempts: number, readonly lastError: unknown) {
     super(`Bridge start still refused after ${waitedMs} ms (deadline ${deadlineMs} ms, ${attempts} attempts); last: ` +
-      `${lastError instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(lastError)}: ${meshDeferredSummary(lastError)}`);
+      `${bridgeRetryLabel(lastError)}: ${meshDeferredSummary(lastError)}`);
     this.name = "BridgeStartDeadlineError";
   }
 }
@@ -453,7 +454,7 @@ export interface BridgeSide {
   subscribeChanges?(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): (() => void) | undefined | Promise<(() => void) | undefined>;
   /** Reported hello version, required before a remote may use the pre-capability polling path. */
   readonly protocolVersion?: number | undefined;
-  /** An open, negotiated traffic lane remains usable despite a retained pending mirror. */
+  /** A negotiated mirror is pending: preemptive presence may defer, but protected RPCs still refuse. */
   readonly pendingMirrorTraffic?: boolean;
   /** Optional v1 capability: old peers and sequence-only cursor files remain readable. */
   latestCursor?(): Promise<BridgeHead>;
@@ -2930,7 +2931,27 @@ export class BridgeMirrorDeferredError extends Error {
     this.code = timedOut ? "FABRIC_BRIDGE_STALE" : "FABRIC_BRIDGE_MIRROR_PENDING";
   }
 }
-const isBridgeRetryable = (error: unknown): boolean => error instanceof BridgeMirrorDeferredError || isMeshRetryableBusy(error);
+/** Local scheduling refusal, constructed only before allocating or sending an RPC. Never a peer outcome. */
+export class BridgeDispatchDeferredError extends Error {
+  readonly code = "FABRIC_BRIDGE_DISPATCH_DEFERRED";
+  readonly sent = false;
+  constructor(readonly reason: "mirror-pending" | "traffic-in-flight") {
+    super(reason === "mirror-pending" ? "Bridge dispatch deferred: mirror pending" : "Bridge dispatch deferred: traffic in flight");
+    this.name = "BridgeDispatchDeferredError";
+  }
+}
+const isBridgeRetryable = (error: unknown): boolean => error instanceof BridgeDispatchDeferredError ||
+  error instanceof BridgeMirrorDeferredError || isMeshRetryableBusy(error);
+const bridgeRetryLabel = (error: unknown): string => error instanceof BridgeDispatchDeferredError ? "bridge dispatch deferred"
+  : error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error);
+interface BridgeDispatchReservation { release: () => void }
+interface PendingBridgeMirror {
+  id: number;
+  error: BridgeMirrorDeferredError;
+  recycle?: ReturnType<typeof setTimeout>;
+  completed: Promise<boolean>;
+  complete: (ok: boolean) => void;
+}
 
 /** The hub's view of the remote side, over the transport's stdio. */
 export class RemoteBridgeSide implements BridgeSide {
@@ -2945,6 +2966,8 @@ export class RemoteBridgeSide implements BridgeSide {
   #legacyMirrorSnapshot: LegacyMirrorSnapshot | undefined;
   #lastPresenceRenewalAt = Number.NEGATIVE_INFINITY;
   #independentRpc = false;
+  #busyTail = false;
+  #protectedOutstanding = 0;
   #protocolVersion: number | undefined;
   #changesReady: Promise<void> | undefined;
   readonly #subscribers = new Set<{ changed: (kind: BridgeChange) => void; failed: (error: Error) => void }>();
@@ -2953,7 +2976,8 @@ export class RemoteBridgeSide implements BridgeSide {
   publishWithReceipt?: NonNullable<BridgeSide["publishWithReceipt"]>;
   publishBatchWithReceipt?: NonNullable<BridgeSide["publishBatchWithReceipt"]>;
   #closed: Error | undefined;
-  #mirrorPending: { id: number; error: BridgeMirrorDeferredError; recycle?: ReturnType<typeof setTimeout> } | undefined;
+  #mirrorPending: PendingBridgeMirror | undefined;
+  #mirrorGeneration = 0;
   readonly #pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   readonly #onClosed: (error: Error) => void;
   readonly closed: Promise<Error>;
@@ -3000,6 +3024,7 @@ export class RemoteBridgeSide implements BridgeSide {
           const late = mirrorPending.error.timedOut;
           if (mirrorPending.recycle !== undefined) clearTimeout(mirrorPending.recycle);
           this.#mirrorPending = undefined;
+          mirrorPending.complete(response.ok === true);
           if (late && response.ok !== true && response.code !== MESH_LOCK_TIMEOUT_CODE &&
             response.code !== MESH_INCARNATION_PENDING_CODE && response.code !== MESH_SNAPSHOT_RETRIES_EXHAUSTED_CODE) {
             this.close(staleError ?? new Error(`Bridge agent: ${String(response.error)}`));
@@ -3044,7 +3069,9 @@ export class RemoteBridgeSide implements BridgeSide {
     for (const pending of this.#pending.values()) pending.reject(error);
     this.#pending.clear();
     if (this.#mirrorPending?.recycle !== undefined) clearTimeout(this.#mirrorPending.recycle);
+    const mirror = this.#mirrorPending;
     this.#mirrorPending = undefined;
+    mirror?.complete(false);
     this.#onClosed(error);
     for (const subscriber of this.#subscribers) subscriber.failed(error);
     this.#subscribers.clear();
@@ -3052,17 +3079,67 @@ export class RemoteBridgeSide implements BridgeSide {
     if (destroyInput) this.input.destroy();
   }
 
-  #call<T>(op: RpcOp, args?: unknown, options: { timeoutMs?: number; fatalTimeout?: boolean } = {}): Promise<T> {
+  #reserveProtected(): BridgeDispatchReservation {
+    if (this.#closed) throw this.#closed;
+    if (this.#mirrorPending) throw new BridgeDispatchDeferredError("mirror-pending");
+    this.#protectedOutstanding++;
+    let released = false;
+    return { release: () => {
+      if (released) return;
+      released = true;
+      this.#protectedOutstanding--;
+    } };
+  }
+
+  /** Relay B only: one short wait for this EXACT slot, charged to the existing IPC budget.
+   * Completion is the event source; 500 ms (or one quarter of remaining time) is only a bound.
+   * No payload, request, RPC timer or replacement-slot wait is retained here. */
+  waitForPendingMirror(budget: BridgeRelayDispatchBudget): Promise<boolean> | undefined {
+    const mirror = this.#mirrorPending;
+    const generation = this.#mirrorGeneration;
+    if (!mirror) return undefined;
+    if (this.#closed || mirror.error.timedOut || budget.signal.aborted) return Promise.resolve(false);
+    const waitMs = Math.min(500, Math.floor(budget.remaining() / 4));
+    if (waitMs <= 0) return Promise.resolve(false);
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = (ok: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        budget.signal.removeEventListener("abort", aborted);
+        try { budget.remaining(); } catch { ok = false; }
+        resolve(ok && !mirror.error.timedOut && !budget.signal.aborted && !this.#closed && this.#mirrorPending === undefined && this.#mirrorGeneration === generation);
+      };
+      const aborted = (): void => finish(false);
+      const timer = setTimeout(aborted, waitMs);
+      budget.signal.addEventListener("abort", aborted, { once: true });
+      void mirror.completed.then(finish);
+      if (budget.signal.aborted) aborted();
+    });
+  }
+
+  #call<T>(op: RpcOp, args?: unknown, options: { timeoutMs?: number; fatalTimeout?: boolean } = {},
+    owned?: BridgeDispatchReservation): Promise<T> {
     if (this.#closed) return Promise.reject(this.#closed);
-    // Legacy agents have one global FIFO. Negotiated agents can serve traffic while
-    // mirroring, but never enqueue more topology work behind the one pending mirror.
-    if (this.#mirrorPending && (!this.#independentRpc || op === "hello" || op === "presence" || op === "mirror")) {
-      return Promise.reject(this.#mirrorPending.error);
+    // Synchronous final wire seam: no await, ID, pending slot, timer or write before admission.
+    // independentRpc is not native-COMMIT isolation. Only positively negotiated controls bypass.
+    let reservation: BridgeDispatchReservation | undefined;
+    if (op === "mirror") {
+      if (this.#mirrorPending) return Promise.reject(this.#mirrorPending.error);
+      if (this.#protectedOutstanding) return Promise.reject(new BridgeDispatchDeferredError("traffic-in-flight"));
+    } else if (!owned && !(op === "ping" && this.watchdogPing) && !(op === "tail" && this.#busyTail)) {
+      try { reservation = this.#reserveProtected(); } catch (error) { return Promise.reject(error); }
     }
     const id = this.#next++;
     const timeoutMs = options.timeoutMs ?? this.callTimeoutMs;
     return new Promise<T>((resolve, reject) => {
-      if (op === "mirror") this.#mirrorPending = { id, error: new BridgeMirrorDeferredError(false, timeoutMs) };
+      if (op === "mirror") {
+        this.#mirrorGeneration++;
+        let complete!: (ok: boolean) => void;
+        const completed = new Promise<boolean>(resolve => { complete = resolve; });
+        this.#mirrorPending = { id, error: new BridgeMirrorDeferredError(false, timeoutMs), completed, complete };
+      }
       let timeoutCheck: ReturnType<typeof setImmediate> | undefined;
       const timer = setTimeout(() => {
         if (op === "mirror") {
@@ -3071,7 +3148,10 @@ export class RemoteBridgeSide implements BridgeSide {
           // only this RPC channel through the existing CLI/supervisor reconnect path.
           const recycle = setTimeout(() => this.close(new Error(
             `Bridge mirror remained pending ${BRIDGE_MIRROR_PENDING_MAX_MS} ms after timeout; recycling transport`)), BRIDGE_MIRROR_PENDING_MAX_MS);
-          this.#mirrorPending = { id, error, recycle };
+          // Mutate the retained slot, not its identity: the original ID owns exclusion
+          // even after this nonfatal timeout and while a relay is observing settlement.
+          this.#mirrorPending!.error = error;
+          this.#mirrorPending!.recycle = recycle;
           // Keep this one response slot: its late ACK releases the gate, but never renews a
           // hub observation. The loop retries a NEW presence snapshot after backoff.
           reject(error);
@@ -3084,8 +3164,11 @@ export class RemoteBridgeSide implements BridgeSide {
           timeoutCheck = setImmediate(() => {
             const pending = this.#pending.get(id);
             if (pending) {
-              this.#pending.delete(id);
-              pending.reject(error);
+              // A nonfatal protected head probe is STILL sent work. Retain its wire
+              // slot/reservation until its actual reply or channel close, never admit
+              // a mirror merely because the caller stopped waiting. Ping owns no slot.
+              if (reservation) reject(error);
+              else { this.#pending.delete(id); pending.reject(error); }
             }
           });
           return;
@@ -3095,10 +3178,12 @@ export class RemoteBridgeSide implements BridgeSide {
       const settle = <V>(done: (value: V) => void) => (value: V): void => {
         clearTimeout(timer);
         if (timeoutCheck !== undefined) clearImmediate(timeoutCheck);
+        reservation?.release();
         done(value);
       };
       this.#pending.set(id, { resolve: settle(resolve as (value: unknown) => void), reject: settle(reject) });
-      this.output.write(`${JSON.stringify({ id, op, ...(args === undefined ? {} : { args }) })}\n`);
+      try { this.output.write(`${JSON.stringify({ id, op, ...(args === undefined ? {} : { args }) })}\n`); }
+      catch (error) { this.close(error instanceof Error ? error : new Error("Bridge transport write failed")); }
     });
   }
 
@@ -3127,18 +3212,31 @@ export class RemoteBridgeSide implements BridgeSide {
       independentRpc?: unknown; partialPresence?: unknown; nonRootHosts?: unknown; responsivePing?: unknown; busyTail?: unknown }>("hello", {
       version: BRIDGE_PROTOCOL_VERSION, busyTail: true, ...(changes ? { changes: true } : {}),
     });
+    // A received but invalid renegotiation must not inherit previous exemptions.
+    this.#independentRpc = false;
+    this.#busyTail = false;
+    delete this.watchdogPing;
     if (reply?.version !== BRIDGE_PROTOCOL_VERSION && reply?.version !== LEGACY_BRIDGE_PROTOCOL_VERSION) {
       throw new Error(`Bridge agent speaks unsupported protocol ${String(reply?.version)}`);
     }
     if (this.#protocolVersion !== undefined && this.#protocolVersion !== reply.version) {
       throw new Error(`Bridge agent changed protocol ${this.#protocolVersion} to ${reply.version}; refusing protocol downgrade`);
     }
+    // Validate the whole hello before granting ANY controls; malformed/failed setup
+    // must not exempt a subsequent call from conservative dispatch admission.
+    if (reply.changes !== true) {
+      if (reply.version === BRIDGE_PROTOCOL_VERSION) {
+        throw new Error(`Bridge protocol ${reply.version} requires changes:true; refusing notification downgrade`);
+      }
+      if (changes) throw new BridgeLegacyNotificationsError(`Legacy bridge protocol ${reply.version} predates change notifications`);
+    }
     this.#protocolVersion = reply.version;
     const supportsPartialPresence = reply.partialPresence === true;
     this.#supportsPartialPresence = supportsPartialPresence;
     this.#supportsNonRootHosts = reply.nonRootHosts === true;
-    // Both ordinary hello and automatic notification setup negotiate dispatch isolation.
+    // Capabilities describe responsive controls, never synchronous worker isolation.
     this.#independentRpc = reply.independentRpc === true;
+    this.#busyTail = reply.busyTail === true && reply.tail === true;
     if (reply.responsivePing === true) this.watchdogPing = timeoutMs => this.#call("ping", undefined, { timeoutMs, fatalTimeout: false });
     else delete this.watchdogPing;
     // Notification setup must not silently switch a caller's chosen read/publication mode.
@@ -3149,18 +3247,18 @@ export class RemoteBridgeSide implements BridgeSide {
         this.publishWithReceipt = event => this.#call<BridgePublishReceipt>("publishReceipt", event);
         if (reply.publishBatch === true) {
           this.publishBatchWithReceipt = async events => {
-            const published = await this.publishBatch!(events);
-            return published.length ? this.#call<BridgePublishReceipt[]>("publishReceiptTimes", published.map(({ sequence }) => sequence)) : [];
+            // ONE logical reservation spans both frames, including a short committed prefix.
+            // No mirror may enter the ACK -> receipt-lookup gap. Internal calls alone own it.
+            const reservation = this.#reserveProtected();
+            try {
+              const published = await this.#call<Array<{ sequence: number }>>("publishBatch", events.map(({ event }) => event), {}, reservation);
+              return published.length ? await this.#call<BridgePublishReceipt[]>("publishReceiptTimes",
+                published.map(({ sequence }) => sequence), {}, reservation) : [];
+            } finally { reservation.release(); }
           };
         }
       }
       if (reply.publishBatch === true) this.publishBatch = events => this.#call<Array<{ sequence: number }>>("publishBatch", events.map(({ event }) => event));
-    }
-    if (reply.changes !== true) {
-      if (reply.version === BRIDGE_PROTOCOL_VERSION) {
-        throw new Error(`Bridge protocol ${reply.version} requires changes:true; refusing notification downgrade`);
-      }
-      if (changes) throw new BridgeLegacyNotificationsError(`Legacy bridge protocol ${reply.version} predates change notifications`);
     }
   }
 
@@ -3610,6 +3708,9 @@ export class MeshBridge {
   readonly #directionPending: Record<Direction, boolean> = { toRemote: false, toLocal: false };
   readonly #directionBackoff: Record<Direction, boolean> = { toRemote: false, toLocal: false };
   readonly #directionMirrorBackoff: Record<Direction, boolean> = { toRemote: false, toLocal: false };
+  /** Scalar timing for an already-read refused page only; bodies remain in the source log.
+   * No timers, authority, durable replay state or idle activity are derived from telemetry. */
+  readonly #dispatchDeferredAt: Record<Direction, Map<number, number>> = { toRemote: new Map(), toLocal: new Map() };
   readonly #directionWake: Partial<Record<Direction, (reason?: DirectionWakeReason) => void>> = {};
   readonly #directionWakeReason: Partial<Record<Direction, DirectionWakeReason>> = {};
   /** The retained-boundary retry kind currently being consumed by a direction pass. */
@@ -3970,7 +4071,7 @@ export class MeshBridge {
           delay = walCapDelay = walCapRetryDelay(walCapDelay, this.options.walCapRetryMinMs);
         }
         delay = Math.min(delay, deadlineMs - waitedMs);
-        const label = error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error);
+        const label = bridgeRetryLabel(error);
         const kind = `${label}|${error instanceof Error ? error.name : typeof error}|${String((error as { code?: unknown }).code ?? "")}`;
         if (loggedAt === undefined || kind !== loggedKind || now - loggedAt >= START_WAIT_LOG_MS) {
           const waiting = loggedAt === undefined ? "" : ` (waiting ${waitedMs} ms of ${deadlineMs} ms, ${attempts} attempts)`;
@@ -3995,17 +4096,26 @@ export class MeshBridge {
    * Destination-link admission for authenticated delivery-only IPC. The sourceRemote is
    * supplied by the UDS registry, never inferred from the event. No hub publication here.
    */
-  deliverRelay(sourceRemote: string, input: BridgePublish): Promise<void> {
-    const work = this.#deliverRelay(sourceRemote, input).catch((error: unknown) => {
-      if (isIdempotencyKeyReused(error)) throw new FabricIdempotencyKeyReusedError();
+  deliverRelay(sourceRemote: string, input: BridgePublish, budget?: BridgeRelayDispatchBudget): Promise<void> {
+    const timing = { waitMs: 0, reason: "destination-unavailable" };
+    let outcome = "unavailable";
+    const work = this.#deliverRelay(sourceRemote, input, budget, timing).then(() => { outcome = "confirmed"; }).catch((error: unknown) => {
+      if (error instanceof BridgeDispatchDeferredError) timing.reason = "dispatch-deferred";
+      if (isIdempotencyKeyReused(error)) { outcome = "idempotency-conflict"; timing.reason = "idempotency-conflict"; }
+      try { this.#log(`relay NAK stage=destination reason=${timing.reason}`); } catch { /* diagnostic only */ }
+      if (outcome === "idempotency-conflict") throw new FabricIdempotencyKeyReusedError();
       throw relayUnavailable();
+    }).finally(() => {
+      // Per-message distribution, including zero-wait healthy calls. Never log body/identity/error text.
+      try { this.#log(`relay dispatch v1 measurement=mirror-slot-wait schedulingDelayMs=${Math.max(0, Math.round(timing.waitMs))} outcome=${outcome}`); } catch { /* diagnostic only */ }
     });
     this.#relayDeliveries.add(work);
     void work.then(() => this.#relayDeliveries.delete(work), () => this.#relayDeliveries.delete(work));
     return work;
   }
 
-  async #deliverRelay(sourceRemote: string, input: BridgePublish): Promise<void> {
+  async #deliverRelay(sourceRemote: string, input: BridgePublish, budget: BridgeRelayDispatchBudget | undefined,
+    timing: { waitMs: number; reason: string }): Promise<void> {
     const { local, remote, localName, remoteName } = this.options;
     const ready = (): boolean => this.#ready && !this.#stopped && !this.#notificationError;
     if (!ready() || !validBridgeName(sourceRemote) || sourceRemote === remoteName || sourceRemote === localName) throw relayUnavailable();
@@ -4013,6 +4123,23 @@ export class MeshBridge {
     const stamp = pub.data.bridge;
     if (pub.topic !== "fabric.control.command" || stamp.from !== sourceRemote || hasHubHop(pub) || !stamp.id ||
       pub.data.destinationRemoteHost !== remoteName || typeof pub.data.commandId !== "string" || !pub.data.commandId) throw relayUnavailable();
+    // B: wait at most once, for the exact already-pending mirror and ONLY within the
+    // original authenticated IPC budget. Manual callers without that budget fail fast.
+    timing.reason = "budget-or-peer-unavailable";
+    budget?.remaining();
+    timing.reason = "mirror-wait-unavailable";
+    const waiting = budget && remote instanceof RemoteBridgeSide ? remote.waitForPendingMirror(budget) : undefined;
+    if (waiting) {
+      const since = monotonicClock.now();
+      let settled: boolean;
+      try { settled = await waiting; } finally { timing.waitMs = monotonicClock.now() - since; }
+      if (!settled) throw relayUnavailable();
+    }
+    timing.reason = "budget-or-peer-unavailable";
+    budget?.remaining();
+    if (!ready()) throw relayUnavailable();
+    timing.reason = "authority-unavailable";
+    // Repeat ALL authority/identity/route/held checks after waiting, not a saved preflight.
     // One normal refresh when due, then fresh hub authority; no remote-supplied origin maps.
     const { remote: owned } = await this.#authority();
     const relays = await local.relayPresence?.() ?? { hosts: [], participants: [] };
@@ -4025,10 +4152,23 @@ export class MeshBridge {
       local.relayOrigin?.(pub.from.id) !== sourceRemote || !local.holds?.(pub.to)) throw relayUnavailable();
     // Reuse this destination's OWN connected remote side, preserving the original source
     // event id. The destination store's commandId dedupe survives lost UDS receipts/retries.
-    const receipt = await remote.publish({ ...pub, from: identity, data: { ...pub.data, bridge: { ...stamp, via: localName } } });
+    const outbound = { ...pub, from: identity, data: { ...pub.data, bridge: { ...stamp, via: localName } } };
+    timing.reason = "budget-or-peer-unavailable";
+    budget?.remaining(); // Last synchronous seam; no await before the ONE normal gated send.
+    if (!ready()) throw relayUnavailable();
+    timing.reason = "dispatch-unavailable";
+    const receipt = await remote.publish(outbound);
     // A fulfilled RPC is not confirmation by itself. Missing/malformed receipts are
     // delivery-unknown, just like a lost response, and cannot authorize a hub envelope.
     if (!Number.isSafeInteger(receipt?.sequence) || receipt.sequence <= 0) throw relayUnavailable();
+  }
+
+  #logDispatchDelay(direction: Direction, sequence: number, dispatchAt = monotonicClock.now()): void {
+    const timings = this.#dispatchDeferredAt[direction];
+    const since = timings.get(sequence);
+    timings.delete(sequence);
+    const delay = since === undefined ? 0 : Math.max(0, Math.round(dispatchAt - since));
+    try { this.#log(`bridge dispatch v1 dir=${direction} sequence=${sequence} measurement=observed-dispatch preReadHol=unmeasured schedulingDelayMs=${delay}`); } catch { /* diagnostic only */ }
   }
 
   #save(): void {
@@ -4038,6 +4178,9 @@ export class MeshBridge {
     const now = Date.now();
     for (const direction of ["toRemote", "toLocal"] as const) {
       const after = this.#cursor[direction].after;
+      for (const sequence of this.#dispatchDeferredAt[direction].keys()) {
+        if (sequence <= after) this.#dispatchDeferredAt[direction].delete(sequence); // Consumed without publication: no delivery-latency sample.
+      }
       const previous = this.#lastCursorAfter[direction];
       this.#lastCursorAfter[direction] = after;
       if (previous === undefined || after > previous) this.#noteDirectionSuccess(direction, now, monotonicClock.now());
@@ -4617,7 +4760,7 @@ export class MeshBridge {
           return;
         }
         const now = monotonicClock.now();
-        const label = error instanceof BridgeMirrorDeferredError ? "bridge mirror degraded" : meshBusyLabel(error);
+        const label = bridgeRetryLabel(error);
         if (busy && busy.last !== label) resetStreak(`bridge busy streak failure class changed from ${busy.last} to ${label}`);
         this.#directionMirrorBackoff[direction] = error instanceof BridgeMirrorDeferredError;
         // A late ACK may arrive while the other half of syncPresence is still settling.
@@ -4759,12 +4902,16 @@ export class MeshBridge {
     // All holds stay fresh; even a transient short receipt keeps the remainder small.
     // The next #forward pass starts at the full batch limit again.
     let candidateLimit = BRIDGE_BATCH_MAX_EVENTS;
+    let retainedPage: BridgeRead | undefined;
+    try {
     while (true) {
+      retainedPage = undefined;
       const start = cursor.after;
       const startOffset = cursor.offset;
       let page: BridgeRead;
       const endRead = phase("readMs");
       try { page = await (source.tail?.(start, startOffset) ?? source.read(start)); } finally { endRead(); }
+      retainedPage = page;
       this.#deliveryAge.drainPage(direction, page.events.length);
       if (page.busy === true) {
         if (page.events.length || page.through !== start || page.offset !== startOffset || page.skipped?.length)
@@ -4860,12 +5007,13 @@ export class MeshBridge {
             }
           }
           if (candidates.length > 1) {
+            let dispatchAt = 0;
             let committed: readonly BridgePublishReceipt[] | undefined;
             try {
               const end = phase("publishMs");
               try {
                 committed = await this.#deliveryAge.trackBatch(direction, page.events.slice(index, index + candidates.length),
-                  () => target.publishBatchWithReceipt ? target.publishBatchWithReceipt(candidates) : target.publishBatch!(candidates),
+                  () => { dispatchAt = monotonicClock.now(); return target.publishBatchWithReceipt ? target.publishBatchWithReceipt(candidates) : target.publishBatch!(candidates); },
                   Math.max(0, sourceHead - cursor.after));
               } finally { end(); }
             }
@@ -4884,6 +5032,7 @@ export class MeshBridge {
               const spent = spends.slice(0, committed.length).filter((size) => size > 0);
               this.#factoryTokens -= spent.length;
               this.#factoryBytes -= spent.reduce((sum, size) => sum + size, 0);
+              for (const item of page.events.slice(index, index + committed.length)) this.#logDispatchDelay(direction, item.sequence, dispatchAt);
               const ids = page.events.slice(index, index + committed.length).map(item => item.id);
               for (const id of ids) seen.add(id);
               cursor.mark = Math.max(cursor.mark, ...committed.map(result => result.sequence));
@@ -4978,6 +5127,10 @@ export class MeshBridge {
               if (cursor.after > start) checkpoint();
               return { forwarded, dropped };
             }
+            // Source population/denominator: one resolved relay command, including
+            // destination-down failures that never reached destination IPC. Deduplicate
+            // by link + source sequence across restart; pending grace has no outcome yet.
+            try { this.#log(`relay outcome v1 sequence=${event.sequence} outcome=${result.delivered ? "confirmed" : "nak"}`); } catch { /* diagnostic only */ }
             if (result.delivered) {
               if (result.sequence !== undefined) cursor.mark = Math.max(cursor.mark, result.sequence);
               forwarded += 1;
@@ -5028,6 +5181,7 @@ export class MeshBridge {
             const held = direction === "toLocal"
               ? [event.from.id, ...(event.topic === "fabric.control.ack" && isObject(event.data) && typeof event.data.targetId === "string" ? [event.data.targetId] : [])]
               : [];
+            let dispatchAt = 0;
             const publish = async (): Promise<BridgePublishReceipt> => {
               if (direction === "toRemote" && this.options.local.holds && !this.options.local.holds(event.to!)) {
                 throw new BridgeOwnershipError(`${event.to} is no longer bound to bridge link ${this.options.remoteName}`);
@@ -5037,6 +5191,7 @@ export class MeshBridge {
               if (destinationRefusal) throw new BridgeOwnershipError(destinationRefusal);
               // Built from the current rules, so a sender identity refreshed below is the one sent.
               const outbound = this.#outbound(event, rules, direction);
+              dispatchAt = monotonicClock.now(); // Exclude sent RPC/native service and receipt lookup from scheduling delay.
               return target.publishWithReceipt ? target.publishWithReceipt(outbound, held) : target.publish(outbound, held);
             };
             let published: BridgePublishReceipt;
@@ -5061,6 +5216,7 @@ export class MeshBridge {
               this.#factoryTokens -= 1;
               this.#factoryBytes -= factorySpend;
             }
+            this.#logDispatchDelay(direction, event.sequence, dispatchAt);
             seen.add(event.id);
             cursor.mark = Math.max(cursor.mark, published.sequence);
             cursor.after = event.sequence;
@@ -5116,6 +5272,15 @@ export class MeshBridge {
       if (!moved) break;
     }
     return { forwarded, dropped };
+    } catch (error) {
+      if (error instanceof BridgeDispatchDeferredError && retainedPage) {
+        const since = monotonicClock.now();
+        for (const item of retainedPage.events) if (item.sequence > cursor.after && !this.#dispatchDeferredAt[direction].has(item.sequence)) {
+          this.#dispatchDeferredAt[direction].set(item.sequence, since);
+        }
+      }
+      throw error; // Only an UNSENT local refusal retains this exact suffix for normal retry.
+    }
   }
 
   #isRelayCommand(event: MeshEvent, rules: BridgeRules, direction: Direction): boolean {
@@ -5215,6 +5380,9 @@ export class MeshBridge {
       const refusal = idempotencyConflict
         ? { error: "Fabric idempotency key reused with different input", errorCode: FABRIC_IDEMPOTENCY_KEY_REUSED, retryable: false }
         : { error: "Relay destination unavailable", errorCode: RELAY_UNAVAILABLE_CODE, retryable: true };
+      // Every source NAK attempt is reason-logged, including lost/ambiguous receipts.
+      // Fixed reasons only, never peer error text or command bodies.
+      try { this.#log(`relay NAK stage=source reason=${idempotencyConflict ? "idempotency-conflict" : "destination-unavailable"}`); } catch { /* diagnostic only */ }
       await remote.publish({
         topic: "fabric.control.ack", kind: "ack",
         from: { id: `bridge:${localName}`, name: "mesh-bridge", kind: "main" }, to: pub.from.id,
@@ -5442,7 +5610,7 @@ export class MeshBridge {
               walCapLoggedAt = now;
             }
           } else if (!reportedTimeout) {
-            this.#log(`${meshBusyLabel(error)}; retrying in ${delay} ms: ${meshDeferredSummary(error)}`);
+            this.#log(`${bridgeRetryLabel(error)}; retrying in ${delay} ms: ${meshDeferredSummary(error)}`);
             reportedTimeout = true;
           }
         }
@@ -5532,6 +5700,6 @@ const allBridgedIds = async (side: BridgeSide, after: number): Promise<Set<strin
 };
 
 const isPermanent = (error: unknown): boolean =>
-  !isIdempotencyKeyReused(error) && !isMeshIncarnationPending(error) && !isMeshSnapshotRetriesExhausted(error) &&
+  !(error instanceof BridgeDispatchDeferredError) && !isIdempotencyKeyReused(error) && !isMeshIncarnationPending(error) && !isMeshSnapshotRetriesExhausted(error) &&
   !isMeshLockTimeout(error) && (error instanceof BridgeOwnershipError ||
     error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message));

@@ -5,7 +5,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  BRIDGE_LEASE_MS, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide,
+  BRIDGE_LEASE_MS, BridgeDispatchDeferredError, MeshBridge, RemoteBridgeSide, serveBridgeAgent, StoreBridgeSide,
   type BridgePublish,
 } from "../src/mesh/bridge.js";
 import { watchBridgeStore } from "../src/mesh/change-notifier.js";
@@ -22,7 +22,9 @@ import { writeParticipantFile } from "../src/topology/participant-files.js";
 // Held-barrier characterization / future isolation gate, using the SAME real path:
 //   FABRIC_TEST_INGRESS_BARRIER=blocked     ...   # characterize the old implementation
 //   FABRIC_TEST_INGRESS_BARRIER=independent ...  # red before an isolation fix, green after
-// Default "independent" asserts progress with the topology barrier still held.
+// Default "independent" asserts progress with a PRESENCE service held. #16378
+// intentionally supersedes mirror-service independence: even a worker-free async
+// mirror blocks protected publication/read/head RPCs until its original slot settles.
 // Requires serveBridgeAgent's optional fourth-argument debug callback for benchmark timings.
 const COMMANDS = 50, IN_FLIGHT = 10, WAVES = COMMANDS / IN_FLIGHT;
 const SEED = 0x64779751;
@@ -291,8 +293,8 @@ const verifyAck = (ack: MeshEvent, target: Native, source: Native, id: string) =
     data: { commandId: id, targetId: target.identity.id, ownerIncarnation: target.ownerIncarnation,
       accepted: true, messageId: `ingress:${id}` } });
 };
-const isMirrorPending = (error: unknown): boolean =>
-  error instanceof Error && "code" in error && error.code === "FABRIC_BRIDGE_MIRROR_PENDING";
+const isDispatchDeferred = (error: unknown): boolean =>
+  error instanceof BridgeDispatchDeferredError && error.code === "FABRIC_BRIDGE_DISPATCH_DEFERRED" && error.sent === false;
 
 // Direct RPC: native source event -> RemoteBridgeSide.publish -> real owner handler/ACK
 // -> remote read -> local publication with the real sender ownership fence.
@@ -302,7 +304,7 @@ const directCommand = async (f: Fixture, id: string, serviceDone: Promise<unknow
   sample.publishedAt = performance.now();
   try { await f.remote.publish(bridged(origin, "hub")); }
   catch (error) {
-    if (!isMirrorPending(error)) throw error;
+    if (!isDispatchDeferred(error)) throw error;
     sample.mirrorDeferrals++;
     await serviceDone; // one bounded retry of the SAME valid event, not a polling loop
     await f.remote.publish(bridged(origin, "hub"));
@@ -451,20 +453,20 @@ const heldObservation = async (f: Fixture, id: string) => {
 };
 
 describe("mesh bridge ingress: real file meshes and stdio", () => {
-  it("retains the global pending-mirror gate when an old hello has no independent RPC capability", async () => {
+  it("refuses protected legacy traffic UNSENT while the original mirror owns admission", async () => {
     const f = await fixture(true), hold = f.hold("mirror");
     const pending = f.remote.mirror(await f.local.presence());
     void pending.catch(() => undefined);
     try {
       await within(hold.entered, "legacy mirror pending");
       const before = f.wire.entries.length;
-      await expect(f.remote.read(0)).rejects.toMatchObject({ code: "FABRIC_BRIDGE_MIRROR_PENDING" });
+      await expect(f.remote.read(0)).rejects.toMatchObject({ code: "FABRIC_BRIDGE_DISPATCH_DEFERRED", sent: false, reason: "mirror-pending" });
       expect(f.wire.entries).toHaveLength(before);
     } finally { hold.release(); hold.restore(); await pending; }
     f.assertHealthy();
   });
 
-  it.each(["presence", "mirror"] as const)("direct remote: valid command/ACK across a held %s service", async op => {
+  it.each(["presence", "mirror"] as const)("direct remote: held %s permits presence parallelism, but mirror retains UNSENT command until release", async op => {
     const f = await fixture(), hold = f.hold(op);
     const snapshot = await f.local.presence();
     const service = op === "presence" ? f.remote.presence() : f.remote.mirror(snapshot);
@@ -478,18 +480,24 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
       await f.far.publish({ topic: "ingress.lock-probe", kind: "probe", from: f.lane.identity });
       const attempt = f.remote.publish(bridged(origin, "hub"));
       const result = attempt.then(() => ({ delivered: true as const }), error => ({ delivered: false as const, error }));
-      // Mirror currently refuses locally; presence currently admits the wire request
-      // behind its FIFO. Only a successful attempt or the exact pending refusal is allowed.
+      // A protected presence is not a mirror: other protected calls remain concurrent.
+      // A pending mirror instead refuses the command before any frame or handler entry.
       if (op === "presence") await f.wire.wait(frame => frame.op === "publish", "valid control queued on stdio");
-      if (barrierMode === "independent") {
-        const outcome = await within(result, "control RPC while service held", 1_000);
-        expect(outcome.delivered).toBe(true);
+      if (op === "mirror") {
+        const outcome = await within(result, "UNSENT mirror scheduling refusal", 1_000);
+        expect(outcome.delivered).toBe(false);
+        if (!outcome.delivered) expect(isDispatchDeferred(outcome.error)).toBe(true);
+        expect(f.wire.entries.some(frame => frame.op === "publish")).toBe(false);
+        expect(sample.admissions).toBe(0);
+        expect(f.far.read({ topic: "fabric.control.command", limit: 256 })).toHaveLength(0);
+      } else {
+        if (barrierMode === "independent") expect((await within(result, "control during held presence", 1_000)).delivered).toBe(true);
+        await heldObservation(f, id);
       }
-      await heldObservation(f, id);
       hold.release(); await service;
       const outcome = await result;
       if (!outcome.delivered) {
-        expect(isMirrorPending(outcome.error)).toBe(true);
+        expect(isDispatchDeferred(outcome.error)).toBe(true);
         sample.mirrorDeferrals++;
         await f.remote.publish(bridged(origin, "hub"));
       }
@@ -504,7 +512,7 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
     } finally { hold.release(); hold.restore(); await service; }
   });
 
-  it("run(): inbound native command/ACK across a held outbound presence mirror", async () => {
+  it("run(): retains inbound native command behind an async outbound mirror, then delivers/ACKs after release", async () => {
     const f = await fixture();
     await f.launch();
     const hold = f.hold("mirror");
@@ -518,7 +526,10 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
     try {
       await f.farLog.wait(event => event.topic === "fabric.control.command" && commandIdOf(event) === id,
         "native inbound command committed while outbound mirror held");
-      await heldObservation(f, id);
+      await f.logs.wait(message => message.startsWith("bridge dispatch deferred (toLocal)"), "protected source read refused UNSENT");
+      expect(f.samples.get(id)!.admissions).toBe(0);
+      expect(f.hub.read({ topic: "fabric.control.command", limit: 256 })).toHaveLength(0);
+      expect(f.far.read({ topic: "fabric.control.ack", limit: 256 })).toHaveLength(0);
       hold.release();
       await pending;
       expect(f.samples.get(id)!.admissions).toBe(1);
@@ -539,7 +550,8 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
     const before = f.wire.entries.at(-1)!.id;
     try {
       await f.far.publish(command(newcomer, f.lead, id));
-      await f.wire.wait(frame => frame.id > before && (frame.op === "tail" || frame.op === "read"), "newcomer read during old pass");
+      await f.logs.wait(message => message.startsWith("bridge dispatch deferred (toLocal)"), "newcomer read retained by pending mirror");
+      expect(f.wire.entries.some(frame => frame.id > before && (frame.op === "tail" || frame.op === "read"))).toBe(false);
       expect(f.local.holds(newcomer.identity.id)).toBe(false);
       expect(sample.admissions).toBe(0);
       // This pass succeeds normally, well before the call deadline: no timeout/late
@@ -570,12 +582,9 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
       accept.resolve();
       const nativeAck = await f.farLog.wait(ackFor(id), "real far owner ACK committed while mirror held");
       expect(nativeAck.verification).toBe("mesh");
-      if (barrierMode === "independent") {
-        await f.hubLog.wait(ackFor(id), "ACK ingress must not await held outbound mirror", 1_000);
-      } else {
-        await turn(); await turn();
-        if (barrierMode === "blocked") expect(f.hub.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(0);
-      }
+      await f.logs.wait(message => message.startsWith("bridge dispatch deferred (toLocal)"), "durable ACK read blocked by mirror");
+      expect(f.hub.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(0);
+      expect(f.responses.entries.some(response => response.eventIds.includes(nativeAck.id))).toBe(false);
       hold.release();
       verifyAck(await f.hubLog.wait(ackFor(id), "remote-to-hub ACK after barrier release"), f.lane, f.lead, id);
       expect(sample.admissions).toBe(1);
@@ -583,7 +592,7 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
     } finally { accept.resolve(); hold.release(); hold.restore(); }
   });
 
-  it("run(): post-deadline inbound command and real ACK progress while the mirror is still held", async () => {
+  it("run(): post-deadline inbound command is UNSENT/retained until the ORIGINAL late mirror ACK, then delivers once", async () => {
     const f = await fixture(false, 500);
     await f.launch();
     const hold = f.hold("mirror");
@@ -593,23 +602,31 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
     try {
       // The real mirror timer settles the pass, not the retained response slot.
       await f.logs.wait(message => message.startsWith("bridge mirror degraded"), "real mirror deadline logged");
-      await expect(f.remote.presence()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE", timedOut: true });
+      await expect(f.remote.presence()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_DISPATCH_DEFERRED", sent: false });
       expect(f.local.holds(f.lane.identity.id, f.lane.identity)).toBe(true);
-      await f.remote.latestSequence(); // The negotiated traffic lane itself is available.
+      await expect(f.remote.latestSequence()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_DISPATCH_DEFERRED", sent: false });
       const id = "post-deadline-inbound";
-      await inboundCommand(f, id);
+      const delivery = inboundCommand(f, id);
+      void delivery.catch(() => undefined);
+      await f.farLog.wait(event => event.topic === "fabric.control.command" && commandIdOf(event) === id, "native source retained before late mirror ACK");
+      expect(f.samples.get(id)!.admissions).toBe(0);
+      expect(f.hub.read({ topic: "fabric.control.command", limit: 256 })).toHaveLength(0);
+      expect(f.hub.read({ topic: "fabric.control.ack", limit: 256 })).toHaveLength(0);
+      expect(f.responses.entries.some(response => response.id === mirrorId)).toBe(false);
+      hold.release();
+      await delivery;
       expect(f.samples.get(id)!.admissions).toBe(1);
       expect(f.hub.read({ topic: "fabric.control.command", after: 0, limit: 256 })).toHaveLength(1);
       expect(f.hub.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toMatchObject([
         { verification: "mesh", data: { commandId: id, accepted: true } },
       ]);
       expect(f.far.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(1);
-      expect(f.responses.entries.some(response => response.id === mirrorId)).toBe(false);
+      expect(f.responses.entries.some(response => response.id === mirrorId)).toBe(true);
       f.assertHealthy();
     } finally { hold.release(); hold.restore(); }
   }, 15_000);
 
-  it("run(): post-deadline real far-owner ACK reaches the hub while the mirror is still held", async () => {
+  it("run(): real far-owner ACK is already durable after the deadline, but its protected read waits for mirror release", async () => {
     const f = await fixture(false, 500);
     await f.launch();
     const id = "post-deadline-ack", sample = newSample(f, id), accept = deferred<void>();
@@ -624,16 +641,20 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
     const mirrorId = f.wire.entries.filter(frame => frame.op === "mirror").at(-1)!.id;
     try {
       await f.logs.wait(message => message.startsWith("bridge mirror degraded"), "real mirror deadline before ACK");
-      await expect(f.remote.presence()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE", timedOut: true });
+      await expect(f.remote.presence()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_DISPATCH_DEFERRED", sent: false });
       expect(f.local.holds(f.lane.identity.id, f.lane.identity)).toBe(true);
       accept.resolve();
       const nativeAck = await f.farLog.wait(ackFor(id), "real far ACK committed after mirror deadline");
       expect(nativeAck.verification).toBe("mesh");
-      verifyAck(await f.hubLog.wait(ackFor(id), "post-deadline ACK ingress with mirror still held"), f.lane, f.lead, id);
+      expect(f.hub.read({ topic: "fabric.control.ack", limit: 256 })).toHaveLength(0);
+      expect(f.responses.entries.some(response => response.eventIds.includes(nativeAck.id))).toBe(false);
+      expect(f.responses.entries.some(response => response.id === mirrorId)).toBe(false);
+      hold.release();
+      verifyAck(await f.hubLog.wait(ackFor(id), "already-durable ACK ingress after original mirror release"), f.lane, f.lead, id);
       await f.responses.wait(response => response.ok && response.eventIds.includes(nativeAck.id), "actual far ACK read response");
       expect(sample.admissions).toBe(1);
       expect(f.hub.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(1);
-      expect(f.responses.entries.some(response => response.id === mirrorId)).toBe(false);
+      expect(f.responses.entries.some(response => response.id === mirrorId)).toBe(true);
       f.assertHealthy();
     } finally { accept.resolve(); hold.release(); hold.restore(); }
   }, 15_000);
@@ -647,15 +668,16 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
     let freshLocal: Hold | undefined;
     try {
       await f.logs.wait(message => message.startsWith("bridge mirror degraded"), "old snapshot's real mirror deadline");
-      await expect(f.remote.presence()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE", timedOut: true });
+      await expect(f.remote.presence()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_DISPATCH_DEFERRED", sent: false });
       // This root cannot have appeared in either half of the old snapshot.
       const newcomer = await native(f.far, "new-after-deadline");
       const id = "post-deadline-new-root", sample = newSample(f, id);
       sample.expectedSender = newcomer.identity.id;
       freshLocal = f.hold("mirror", f.local);
       const origin = await f.far.publish(command(newcomer, f.lead, id));
-      await f.responses.wait(response => response.ok && response.eventIds.includes(origin.id), "new root's actual source read response");
-      await f.logs.wait(message => message.startsWith("bridge mirror degraded (toLocal)"), "new root's blocked topology refresh");
+      await expect(f.remote.read(0)).rejects.toMatchObject({ code: "FABRIC_BRIDGE_DISPATCH_DEFERRED", sent: false });
+      expect(f.responses.entries.some(response => response.eventIds.includes(origin.id))).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(f.root, "cursor.json"), "utf8")).toLocal.after).toBeLessThan(origin.sequence);
       expect(sample.admissions).toBe(0);
       expect(f.local.holds(newcomer.identity.id, newcomer.identity)).toBe(false);
       expect(f.hub.read({ topic: "fabric.control.command", after: 0, limit: 256 })).toHaveLength(0);
@@ -672,6 +694,7 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
       expect(f.far.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(0);
       freshLocal.release();
       verifyAck(await f.farLog.wait(ackFor(id), "newcomer ACK after fresh local commit"), f.lead, newcomer, id);
+      await f.responses.wait(response => response.ok && response.eventIds.includes(origin.id), "new root read only after original mirror release");
       expect(sample.admissions).toBe(1);
       expect(f.local.holds(newcomer.identity.id, newcomer.identity)).toBe(true);
       expect(f.hub.read({ topic: "fabric.control.command", after: 0, limit: 256 })).toHaveLength(1);
@@ -692,7 +715,7 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
     let freshLocal: Hold | undefined, freshRemote: Hold | undefined;
     try {
       await f.logs.wait(message => message.startsWith("bridge mirror degraded"), "real mirror deadline before expiry jump");
-      await expect(f.remote.presence()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_STALE", timedOut: true });
+      await expect(f.remote.presence()).rejects.toMatchObject({ code: "FABRIC_BRIDGE_DISPATCH_DEFERRED", sent: false });
       expect(f.local.holds(f.lane.identity.id, f.lane.identity)).toBe(true);
       const beforeJump = Date.now(), realNow = Date.now.bind(Date);
       vi.spyOn(Date, "now").mockImplementation(() => realNow() + BRIDGE_LEASE_MS + 1);
@@ -705,8 +728,9 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
       freshRemote = f.hold("mirror");
       const id = "post-deadline-expired-root", sample = newSample(f, id);
       const origin = await f.far.publish(command(f.lane, f.lead, id)); // New, valid 30 s command AFTER the jump.
-      await f.responses.wait(response => response.ok && response.eventIds.includes(origin.id), "expired root's actual source read response");
-      await f.logs.wait(message => message.startsWith("bridge mirror degraded (toLocal)"), "expired root's blocked topology refresh");
+      await expect(f.remote.read(0)).rejects.toMatchObject({ code: "FABRIC_BRIDGE_DISPATCH_DEFERRED", sent: false });
+      expect(f.responses.entries.some(response => response.eventIds.includes(origin.id))).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(f.root, "cursor.json"), "utf8")).toLocal.after).toBeLessThan(origin.sequence);
       expect(sample.admissions).toBe(0);
       expect(f.local.holds(f.lane.identity.id, f.lane.identity)).toBe(false);
       expect(f.hub.read({ topic: "fabric.control.command", after: 0, limit: 256 })).toHaveLength(0);
@@ -714,7 +738,10 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
       expect(f.far.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(0);
 
       oldMirror.release();
-      await within(Promise.all([freshLocal.entered, freshRemote.entered]), "fresh claims held before either mirror critical section");
+      // Reciprocal admission can refuse the fresh remote mirror while a protected
+      // read is still in flight. Do not demand simultaneous entry (that would deadlock
+      // this harness): local commit is held, remote commit is either gated or held.
+      await within(freshLocal.entered, "fresh local claims held before local mirror critical section");
       const lateLease = readHostLease(f.far.root, f.lead.identity.id)!;
       expect(lateLease.mirror!.observedAt).toBeLessThanOrEqual(beforeJump);
       expect(lateLease.expiresAt).toBeLessThanOrEqual(beforeJump + BRIDGE_LEASE_MS);
@@ -727,6 +754,7 @@ describe("mesh bridge ingress: real file meshes and stdio", () => {
       expect(f.far.read({ topic: "fabric.control.ack", after: 0, limit: 256 })).toHaveLength(0);
       freshRemote.release(); freshLocal.release();
       verifyAck(await f.farLog.wait(ackFor(id), "expired root ACK only after fresh local commit"), f.lead, f.lane, id);
+      await f.responses.wait(response => response.ok && response.eventIds.includes(origin.id), "expired root read after original mirror release");
       expect(sample.admissions).toBe(1);
       expect(f.local.holds(f.lane.identity.id, f.lane.identity)).toBe(true);
       expect(f.hub.read({ topic: "fabric.control.command", after: 0, limit: 256 })).toHaveLength(1);

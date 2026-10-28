@@ -125,7 +125,7 @@ export interface EffectTransitionInput {
   readonly parentToolCallId?: string;
   readonly attempt: EffectAttemptIdentity;
   readonly at: string;
-  readonly recoveryGeneration?: number;
+  readonly recoveryGeneration?: string;
   readonly outcome?: EffectOutcome;
   readonly result?: EffectResult;
   readonly resultBytesHash?: string;
@@ -149,7 +149,7 @@ export interface EffectRecord {
 
 export interface EffectSinkContext {
   readonly owner: RecoveryOwner;
-  readonly recoveryGeneration: number;
+  readonly recoveryGeneration: string;
 }
 /** A sink must query/dedupe or prove the recorded pre/post state; a negative
  * stale read alone never authorizes retry. It receives only stored intent bytes. */
@@ -177,7 +177,7 @@ export interface SettlePendingIntentsResult {
   readonly settled: SettledEffect[];
   readonly uncertain: boolean;
 }
-export type SettlePendingIntents = (sessionId: string, recoveryGeneration: number) => Promise<SettlePendingIntentsResult>;
+export type SettlePendingIntents = (sessionId: string, recoveryGeneration: string) => Promise<SettlePendingIntentsResult>;
 
 export interface EffectRepair {
   readonly key: string;

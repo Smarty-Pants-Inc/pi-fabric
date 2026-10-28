@@ -1567,6 +1567,7 @@ export class ResidentHost {
       const plan = this.#deliveryCommits.plan();
       try {
         await this.mesh.writeBatch({ identity: this.identity, ops: [],
+          lockTiming: { operation: "resident-delivery-route" },
           prepare: () => plan.stage([], [{ kind: "delivery", key: id, payload: record(rootId()) }], { durable: true }),
           afterCommit: view => { chosen = plan.run(view) === 1; } });
         await this.#deliveryCommits.retire().catch(() => undefined);

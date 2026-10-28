@@ -750,12 +750,13 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     }
     const now = this.#now();
     // Only a proven WAIT/append lapse enters here. Never age out the healthy path.
-    // A lost journal cannot renew a lapsed redelivery. Missing/future broker metadata
-    // conservatively expires that WAIT, without trusting sender-controlled createdAt.
+    // Broker time may shorten, never extend, the local first-seen window. Clamp a
+    // fast broker to local now; absent/invalid metadata uses local first-seen.
+    // After total history loss this bounds the window from local re-observation,
+    // not the unrecoverable original local time. Never trust sender-createdAt.
     const publishedAt = delivery.publishedAt;
-    const anchor = delivery.attempt > 1
-      ? (typeof publishedAt === "number" && Number.isFinite(publishedAt) && publishedAt <= now ? publishedAt : now - LEASE_LAPSE_DEFER_MS)
-      : now;
+    const anchor = typeof publishedAt === "number" && Number.isFinite(publishedAt)
+      ? Math.min(publishedAt, now) : now;
     const lapse = held.lapse ?? { sequence: delivery.streamSequence, id: delivery.envelope.id,
       sourceMachine: delivery.sourceMachine, senderId: delivery.envelope.from.id,
       startedAt: Math.min(startedAt, now, anchor), ...context };

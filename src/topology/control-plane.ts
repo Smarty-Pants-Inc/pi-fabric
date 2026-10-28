@@ -5,8 +5,9 @@ import type { MeshControlIncarnationFence } from "../config.js";
 import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredOwnerRoutingStatus, participantLeaseGraceMs, waitForMirroredLeaseRenewal, type FabricMirrorLease, type MirrorLeaseWaitBudget } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { FabricPeerLeaseStaleError } from "../agents/peer-lease-stale.js";
-import { assertSteerPriority, type FabricSteerPriority } from "../main-agent.js";
-import { copyFabricPrincipal, copyFabricWakeCause, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
+import { assertSteerPriority, type FabricSteerPriority, type FabricMainAgentDeliveryRequest, type FabricAgentMessageResult } from "../main-agent.js";
+import { readScriptedInput } from "../recovery/input-admission.js";
+import { copyFabricPrincipal, copyFabricWakeCause, copyFabricWakeAdmission, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { FOLLOW_UP_RUNNING_TASK_MESSAGE, type AgentFollowUpRunningWarning } from "../agents/types.js";
 import { FabricTargetTerminalError, terminalRejectionFields } from "../agents/terminal-target.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -287,6 +288,63 @@ export type FabricControlHandler = (
   signal: AbortSignal,
   verification?: MeshEvent["verification"],
 ) => Promise<FabricControlAcceptance> | FabricControlAcceptance;
+
+/** Host composition only: bind to admitBoundScriptedInput, never the generic handler.
+ * The bound registry must enforce exact native Main/session/root identity and immutable
+ * input + stable deliveryId. A current authenticated claim may not yet have B5 intent;
+ * typed admission covers that window too. Undefined leaves the outcome indeterminate. */
+export type FabricScriptedInputReconciler = (input: {
+  root: string;
+  sessionId: string;
+  request: FabricMainAgentDeliveryRequest;
+}) => FabricAgentMessageResult | undefined;
+let scriptedInputReconciler: FabricScriptedInputReconciler | undefined;
+export const bindScriptedInputControlReconciler = (reconcile: FabricScriptedInputReconciler): (() => void) => {
+  scriptedInputReconciler = reconcile;
+  return () => { if (scriptedInputReconciler === reconcile) scriptedInputReconciler = undefined; };
+};
+
+const scriptedInputDeadline = (operation: FabricControlOperation, targetId: string, data: unknown): number | undefined => {
+  const metadata = readScriptedInput(data);
+  if (!metadata) return undefined;
+  if ((operation !== "steer" && operation !== "followUp") ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(metadata.sessionId) || targetId !== `session:${metadata.sessionId}`) {
+    throw new Error("Scripted input requires an exact session target and steer/followUp delivery");
+  }
+  return metadata.deadlineAt;
+};
+
+/** The same authenticated native request is used for ordinary admission and orphan lookup. */
+export const scriptedInputControlRequest = (command: FabricControlCommand, from: MeshIdentity,
+  verification?: MeshEvent["verification"]): { sessionId: string; request: FabricMainAgentDeliveryRequest } | undefined => {
+  const metadata = readScriptedInput(command.data);
+  if (!metadata) return undefined;
+  scriptedInputDeadline(command.operation, command.targetId, command.data);
+  if (verification !== "mesh" && verification !== "bridge") throw new Error("Scripted input requires an authenticated native sender");
+  if (typeof command.message !== "string" || !command.message.trim()) throw new Error("Fabric control message must not be empty");
+  return { sessionId: metadata.sessionId, request: copyFabricWakeAdmission(command, {
+    from, verification, principal: command.principal, message: command.message,
+    delivery: command.operation as "steer" | "followUp",
+    ...(command.priority ? { priority: command.priority } : {}),
+    triggerTurn: command.triggerTurn ?? true,
+    deliveryId: command.commandId,
+    ...(command.eventId === undefined ? {} : { inboxEventId: command.eventId }),
+    ...(command.inboxTopic === undefined ? {} : { inboxTopic: command.inboxTopic }),
+    ...(command.inboxKey === undefined ? {} : { inboxKey: command.inboxKey }),
+    ...(command.inboxReceipts === undefined ? {} : { inboxReceipts: command.inboxReceipts }),
+    outcomeSend: { eventId: command.eventId ?? command.commandId, to: command.targetId, from: from.id, mode: command.operation as "steer" | "followUp" },
+    data: command.data,
+  }) };
+};
+export const scriptedInputControlAcceptance = (result: FabricAgentMessageResult): FabricControlAcceptance => ({
+  accepted: true, messageId: result.messageId,
+  ...(result.triggered === undefined ? {} : { triggered: result.triggered }),
+  ...(result.reason === undefined ? {} : { reason: result.reason }),
+  ...(result.halted ? { halted: true } : {}),
+  ...(result.pendingFollowUps === undefined ? {} : { pendingFollowUps: result.pendingFollowUps }),
+  ...(result.oldestAgeS === undefined ? {} : { oldestAgeS: result.oldestAgeS }),
+  ...(result.stalled ? { stalled: true } : {}),
+});
 
 const controlSeenKey = (hostId: string, commandId: string): string =>
   CONTROL_SEEN_PREFIX +
@@ -947,6 +1005,8 @@ export class FabricControlPlane {
     const requestCreatedAt = Date.now();
     // Clone semantic JSON plus normalized attribution before publication or any retry yields.
     input = snapshotControlInput(input);
+    const scriptedDeadline = scriptedInputDeadline(operation, targetId, input.data);
+    if (scriptedDeadline !== undefined && Date.now() >= scriptedDeadline) throw new Error("Scripted input deadline expired");
     const natsOwner = this.#transport.kind === "nats"
       ? this.#captureNatsOwner(ownerHostId, ownerIdentityId, targetId, input.ownerIncarnation) : undefined;
     // One logical message key survives both observation retries and a proven-notRun resend.
@@ -982,6 +1042,7 @@ export class FabricControlPlane {
       // picks commands up late (a fleet relaunch) expired 4 of 2,802 commands, and a manual
       // retry 6 s later worked (smarty-dev#816). A second expiry means the owner is stuck.
       if (
+        scriptedDeadline !== undefined ||
         (operation !== "steer" && operation !== "followUp") ||
         !(error instanceof FabricControlRejection) ||
         !error.notRun ||
@@ -1075,6 +1136,8 @@ export class FabricControlPlane {
     if (input.ownerIncarnation !== undefined && !isIncarnation(input.ownerIncarnation)) {
       throw new Error("Invalid Fabric owner incarnation");
     }
+    const scriptedDeadline = scriptedInputDeadline(operation, targetId, input.data);
+    if (scriptedDeadline !== undefined && Date.now() >= scriptedDeadline) throw new Error("Scripted input deadline expired");
     // Freeze the resolved activation AND request origin before any publication/lock wait.
     // requestedAt remains commit-stamped and cannot prove a legacy request's origin.
     const ownerIncarnation = input.ownerIncarnation;
@@ -1211,7 +1274,9 @@ export class FabricControlPlane {
     // Charge the randomized resend sleep after applying native/bridge floors.
     // In particular, the 30s bridge floor must not erase the spent retry budget.
     const timeoutMs = Math.max(this.#pollMs * 4, originalTimeoutMs - retryBudgetSpentMs);
-    const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
+    const ackGraceMs = scriptedDeadline === undefined ? Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs) : 0;
+    const remainingWait = (): number => scriptedDeadline === undefined ? timeoutMs + ackGraceMs
+      : Math.max(1, Math.min(timeoutMs, scriptedDeadline - Date.now()));
     let pendingRequest: PendingControlRequest;
     let skipPublication = false;
     let publishedEvent: MeshEvent | undefined;
@@ -1260,10 +1325,14 @@ export class FabricControlPlane {
         this.#settleAcknowledgement(commandId, pending, cached.data as Record<string, unknown>);
         return;
       }
+      if (scriptedDeadline !== undefined) {
+        pending.timer = setTimeout(() => this.#timeoutPending(commandId), remainingWait());
+        pending.timer.unref();
+      }
       if (pending.mirroredOwner) {
         // Capture validated authority first, then arm before publish can wait on the mesh lock.
         // Renewal or a failed directory read cannot extend this sender-local message budget.
-        if (messageRequest && (operation === "steer" || operation === "followUp")) {
+        if (!pending.timer && messageRequest && (operation === "steer" || operation === "followUp")) {
           // The finite admission budget includes the bridge window and return-leg ACK grace.
           // It is not refreshed by lease renewal, nor reset by a late publish.
           pending.timer = setTimeout(() => this.#timeoutPending(commandId), timeoutMs + ackGraceMs);
@@ -1324,6 +1393,9 @@ export class FabricControlPlane {
               }
             }
           }
+          if (scriptedDeadline !== undefined && (committedAt >= scriptedDeadline || this.#pending.get(commandId) !== pendingRequest!)) {
+            throw new Error("Scripted input deadline expired before publication");
+          }
           return {
             version: 1,
             commandId,
@@ -1331,7 +1403,7 @@ export class FabricControlPlane {
             replyTo: this.options.hostId,
             requestCreatedAt,
             requestedAt: committedAt,
-            deadlineAt: committedAt + timeoutMs,
+            deadlineAt: Math.min(committedAt + timeoutMs, scriptedDeadline ?? Infinity),
           };
         },
       });
@@ -1349,7 +1421,8 @@ export class FabricControlPlane {
           if (pending.signal.aborted) { pending.onAbort(); pending.signal.throwIfAborted(); }
         }
         // Keep the original admission/ACK bound, rather than restarting it after renewal.
-        const remaining = Math.max(0, timeoutMs + ackGraceMs - (Date.now() - requestCreatedAt));
+        const remaining = Math.max(0, Math.min(timeoutMs + ackGraceMs - (Date.now() - requestCreatedAt),
+          scriptedDeadline === undefined ? Infinity : scriptedDeadline - Date.now()));
         pending.timer = setTimeout(() => this.#timeoutPending(commandId), remaining);
         pending.timer.unref();
         this.#startLeaseWatchdog();
@@ -1363,7 +1436,7 @@ export class FabricControlPlane {
         // message's admission timer, or revive a request already settled while publishing.
         if (this.#pending.get(commandId) === pendingRequest! && !pendingRequest!.timer) {
           pendingRequest!.timer = setTimeout(
-            () => this.#timeoutPending(commandId), timeoutMs + ackGraceMs,
+            () => this.#timeoutPending(commandId), remainingWait(),
           );
           pendingRequest!.timer.unref();
         }
@@ -2168,6 +2241,8 @@ export class FabricControlPlane {
     if (!this.options.enabled) throw new Error("Fabric mesh is disabled; cannot control a remote participant");
     if (this.#paused) throw Object.assign(new TransportUnavailableError("NATS control admission is draining"), { code: "FABRIC_TRANSPORT_DRAINING", notRun: true });
     options.signal?.throwIfAborted();
+    const scriptedDeadline = scriptedInputDeadline(operation, targetId, input.data);
+    if (scriptedDeadline !== undefined && Date.now() >= scriptedDeadline) throw new Error("Scripted input deadline expired");
     const owner = captured ?? this.#captureNatsOwner(ownerHostId, ownerIdentityId, targetId, input.ownerIncarnation);
     const idempotencyKey = options.idempotencyKey ?? randomUUID();
     const commandBody = { targetId, operation, ownerIncarnation: owner.ownerIncarnation,
@@ -2194,7 +2269,7 @@ export class FabricControlPlane {
     const originalTimeoutMs = Math.min(NATS_HORIZON_MS, Math.max(this.#bridgeTimeoutMs,
       Math.floor(options.timeoutMs ?? this.#ackTimeoutMs)));
     const timeoutMs = Math.min(NATS_HORIZON_MS, Math.max(this.#pollMs * 4, originalTimeoutMs - retryBudgetSpentMs));
-    const ackGraceMs = Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs);
+    const ackGraceMs = scriptedDeadline === undefined ? Math.min(MAX_CONTROL_ACK_GRACE_MS, 2 * timeoutMs) : 0;
     // The envelope id is generated once here; all transport-level retries reuse it.
     const commandEventId = randomUUID();
     let pending!: PendingControlRequest;
@@ -2203,7 +2278,8 @@ export class FabricControlPlane {
         ownerMachine: owner.machine, ownerIncarnation: owner.ownerIncarnation, operation, targetId,
         commandPublished: false, requestCreatedAt, idempotencyKey, bodyFingerprint, commandEventId };
       this.#pending.set(commandId, pending);
-      pending.timer = setTimeout(() => this.#timeoutPending(commandId), timeoutMs + ackGraceMs);
+      pending.timer = setTimeout(() => this.#timeoutPending(commandId),
+        Math.max(1, Math.min(timeoutMs + ackGraceMs, scriptedDeadline === undefined ? Infinity : scriptedDeadline - Date.now())));
       pending.timer.unref();
       if (options.signal) {
         const abort = (): void => {
@@ -2228,8 +2304,9 @@ export class FabricControlPlane {
           if (this.#closed || this.#paused) throw new TransportUnavailableError("NATS control admission is closed or draining");
           // P3's immutable, live ParticipantView snapshot is never re-resolved or retargeted.
           // The receiver's live lease + enforced incarnation close the preflight/PubAck race.
+          if (scriptedDeadline !== undefined && committedAt >= scriptedDeadline) throw new Error("Scripted input deadline expired before publication");
           return { version: 1, commandId, ...commandBody, replyTo: this.options.hostId,
-            requestCreatedAt, requestedAt: committedAt, deadlineAt: committedAt + timeoutMs };
+            requestCreatedAt, requestedAt: committedAt, deadlineAt: Math.min(committedAt + timeoutMs, scriptedDeadline ?? Infinity) };
         },
       }, operation === "ask" && options.detachOnMainCeiling ? withoutMainExecutionCeiling(options.signal) : options.signal)
         .then(() => {
@@ -2520,7 +2597,10 @@ export class FabricControlPlane {
         data: wire.body, verification: delivery.verification } as MeshEvent;
       const command = commandFromEvent(event);
       if (!command || !command.commandId || !command.targetId) { await terminate("Malformed NATS control body"); return; }
-      const deadlineAt = Math.min(command.deadlineAt!, command.requestedAt + NATS_HORIZON_MS);
+      let scriptedDeadline: number | undefined;
+      try { scriptedDeadline = scriptedInputDeadline(command.operation, command.targetId, command.data); }
+      catch { await terminate("Malformed scripted input control"); return; }
+      const deadlineAt = Math.min(command.deadlineAt!, command.requestedAt + NATS_HORIZON_MS, scriptedDeadline ?? Infinity);
       receipt.workingUntil = deadlineAt + MAX_CONTROL_ACK_GRACE_MS;
       const context: NatsControlContext = { command, event, sourceMachine: delivery.sourceMachine, deadlineAt, bodyDigest, session };
       if (!this.#natsSenderVerified(context)) {
@@ -2672,6 +2752,9 @@ export class FabricControlPlane {
   async #sendNatsAcknowledgement(context: NatsControlContext, acceptance: FabricControlAcceptance,
     ownerIncarnation: string | null = this.incarnation, staleIncarnation?: string | null): Promise<void> {
     const { command, session } = context;
+    // writeBatch commits a record, not its fsync barrier. Cover THIS private store,
+    // including replay outcomes; syncing the parent mesh does not cover control-seen.
+    if (isObject(command.data) && Object.hasOwn(command.data, "scriptedInput")) await this.#seen.sync();
     await this.#sendNats({ id: `ack:${context.event.id}`, kind: "ack",
       to: { machine: context.sourceMachine, hostId: command.replyTo }, targetId: command.targetId,
       // P6's ownerIdentityId is this identity, not the potentially different runtime inbox hostId.
@@ -2816,12 +2899,33 @@ export class FabricControlPlane {
         record.bodyDigest !== undefined && record.bodyDigest !== context.bodyDigest) {
       await this.#sendNatsConflict(context); return; // absolutely no mutation of the original outcome
     }
-    if (record.sourceMachine !== undefined && (record.sourceMachine !== context.sourceMachine || record.requesterId !== context.event.from.id)) {
+    const portableScriptedRetry = context.command.ownerIncarnation === this.incarnation &&
+      record.bodyDigest === context.bodyDigest && record.requesterId === context.event.from.id &&
+      (context.command.operation === "steer" || context.command.operation === "followUp") && !!readScriptedInput(context.command.data);
+    // The current ParticipantView/source-machine check already ran. Only an unchanged
+    // scripted round may follow that authenticated sender to its new physical machine.
+    if (record.sourceMachine !== undefined && (record.requesterId !== context.event.from.id ||
+        record.sourceMachine !== context.sourceMachine && !portableScriptedRetry)) {
       await this.#sendNatsAcknowledgement(context, { accepted: false, error: "Fabric control sender is unverified",
         errorCode: "FABRIC_SENDER_UNVERIFIED", notRun: true }); return;
     }
-    const acceptance = record.acceptance ?? { accepted: false, error: "Fabric control outcome is indeterminate after owner restart" };
-    if (!record.acceptance || record.expiresAt < context.deadlineAt + NATS_HORIZON_MS) {
+    if (!record.acceptance && readScriptedInput(context.command.data)) {
+      // Persisting an earlier outcome may have yielded before this replay read.
+      // Revalidate the native lease/session AND authenticated source at admission.
+      this.#assertNatsSession(context.session);
+      if (!this.#natsSenderVerified(context)) {
+        await this.#sendNatsAcknowledgement(context, { accepted: false, error: "Fabric control sender is unverified",
+          errorCode: "FABRIC_SENDER_UNVERIFIED", notRun: true }); return;
+      }
+    }
+    const reconciled = record.acceptance ? undefined
+      : this.#reconcileScriptedInput(context.command, context.event.from, context.event.verification, record, context.bodyDigest);
+    const acceptance = record.acceptance ?? reconciled
+      ?? { accepted: false, error: "Fabric control outcome is indeterminate after owner restart" };
+    // Do not freeze a temporarily unbound/stale scripted orphan as a terminal generic
+    // indeterminate result. A later current-epoch retry can still reconcile its native input.
+    const unresolvedScripted = !record.acceptance && !reconciled && !!readScriptedInput(context.command.data);
+    if (!unresolvedScripted && (!record.acceptance || record.expiresAt < context.deadlineAt + NATS_HORIZON_MS)) {
       const outcome: NatsRetainedOutcome = { version, record: { ...record, carrier: "nats", acceptance,
         expiresAt: Math.max(record.expiresAt, context.deadlineAt + NATS_HORIZON_MS) } };
       this.#natsOutcomes.set(key, outcome);
@@ -2957,10 +3061,31 @@ export class FabricControlPlane {
     return remoteHost !== undefined && isObject(data.bridge) && data.bridge.from === remoteHost;
   }
 
+  #reconcileScriptedInput(command: FabricControlCommand, from: MeshIdentity,
+    verification: MeshEvent["verification"] | undefined, record: FabricControlSeenRecord, bodyDigest: string): FabricControlAcceptance | undefined {
+    // A tagged wire body is NOT a replay capability. The persisted immutable command
+    // and current authenticated route authorize ONLY native stable-id input admission.
+    if (!scriptedInputReconciler || command.ownerIncarnation !== this.incarnation ||
+      record.bodyDigest !== bodyDigest || record.requesterId !== from.id) return undefined;
+    this.#assertAdmission();
+    let input: ReturnType<typeof scriptedInputControlRequest>;
+    try { input = scriptedInputControlRequest(command, from, verification); } catch { return undefined; }
+    if (!input) return undefined;
+    const result = scriptedInputReconciler({ root: this.mesh.root, ...input });
+    return result === undefined ? undefined : scriptedInputControlAcceptance(result);
+  }
+
   async #acceptCommand(event: MeshEvent): Promise<void> {
     assertMeshConsumption(this.options.canConsumeMesh);
     const command = commandFromEvent(event);
     if (!command) return;
+    let scriptedDeadline: number | undefined;
+    try { scriptedDeadline = scriptedInputDeadline(command.operation, command.targetId, command.data); }
+    catch (error) {
+      await this.#publishAcknowledgement(command, { accepted: false, notRun: true,
+        error: error instanceof Error ? error.message : String(error) });
+      return;
+    }
     const ownedKey = controlSeenKey(this.options.hostId, command.commandId);
     const owned = this.#ownedCommands.get(ownedKey);
     if (owned) {
@@ -2980,6 +3105,7 @@ export class FabricControlPlane {
     const deadlineAt = Math.min(
       command.deadlineAt ?? command.requestedAt + this.#ackTimeoutMs,
       command.requestedAt + MAX_CONTROL_TIMEOUT_MS,
+      scriptedDeadline ?? Infinity,
     );
     const key = ownedKey;
     // Historical replay has no waiting sender; keep relaunches free of redundant ACK writes. A command a
@@ -2994,13 +3120,26 @@ export class FabricControlPlane {
     if (duplicate) {
       if (duplicate.hostId === this.options.hostId && duplicate.commandId === command.commandId &&
         duplicate.targetId === command.targetId) {
-        if (duplicate.acceptance && (command.operation === "steer" || command.operation === "followUp")) {
-          this.#ownedCommands.set(ownedKey, { event, acceptance: duplicate.acceptance,
+        if (scriptedDeadline !== undefined && (duplicate.bodyDigest !== controlBodyFingerprint(event.data, event.principal) || duplicate.requesterId !== event.from.id)) {
+          await this.#publishAcknowledgement(command, { accepted: false, error: "Fabric control id reused with different input",
+            errorCode: "FABRIC_CONTROL_ID_CONFLICT", notRun: true });
+          return;
+        }
+        const reconciled = duplicate.acceptance ? undefined : this.#reconcileScriptedInput(command, event.from, event.verification, duplicate, controlBodyFingerprint(event.data, event.principal));
+        if (reconciled) {
+          // Save the reconciled native receipt before ACK, never redo the generic handler.
+          const prior = this.#seen.get(ownedKey, { fresh: true });
+          await this.#putFenced(this.#seen, { key: ownedKey, identity: this.identity, ifVersion: prior?.version ?? 0,
+            value: { ...duplicate, acceptance: reconciled } });
+        }
+        const acceptance = duplicate.acceptance ?? reconciled;
+        if (acceptance && (command.operation === "steer" || command.operation === "followUp")) {
+          this.#ownedCommands.set(ownedKey, { event, acceptance,
             // A worker may already exist: queued replay custody is running too, not retry work.
-            running: true, acknowledgement: { command, ownerIncarnation: duplicate.ownerIncarnation ?? null } });
+            running: true, acknowledgement: { command, ownerIncarnation: scriptedDeadline !== undefined && incarnationMatches ? this.incarnation : duplicate.ownerIncarnation ?? null } });
           this.#resumeAcknowledgements();
         } else {
-          await this.#publishAcknowledgement(command, duplicate.acceptance ?? {
+          await this.#publishAcknowledgement(command, acceptance ?? {
             accepted: false, error: "Fabric control outcome is indeterminate after owner restart",
           }, duplicate.ownerIncarnation ?? null);
         }
@@ -3028,6 +3167,7 @@ export class FabricControlPlane {
           ownerIncarnation: this.incarnation,
           expiresAt: Math.max(deadlineAt, now) + this.#ackTimeoutMs,
           ...(command.deadlineAt !== undefined ? { explicitDeadline: true } : {}),
+          ...(readScriptedInput(command.data) ? { bodyDigest: controlBodyFingerprint(event.data, event.principal), requesterId: event.from.id } : {}),
         } satisfies FabricControlSeenRecord,
         identity: this.identity,
         ifVersion: 0,
@@ -3041,6 +3181,11 @@ export class FabricControlPlane {
         raced.commandId === command.commandId &&
         raced.targetId === command.targetId
       ) {
+        if (scriptedDeadline !== undefined && (raced.bodyDigest !== controlBodyFingerprint(event.data, event.principal) || raced.requesterId !== event.from.id)) {
+          await this.#publishAcknowledgement(command, { accepted: false, error: "Fabric control id reused with different input",
+            errorCode: "FABRIC_CONTROL_ID_CONFLICT", notRun: true });
+          return;
+        }
         await this.#publishAcknowledgement(
           command,
           raced.acceptance ?? {
@@ -3064,7 +3209,8 @@ export class FabricControlPlane {
     if (!owned.acceptance) this.#assertAdmission();
     else assertMeshConsumption(this.options.canConsumeMesh);
     const command = commandFromEvent(owned.event)!;
-    const deadlineAt = Math.min(command.deadlineAt ?? command.requestedAt + this.#ackTimeoutMs, command.requestedAt + MAX_CONTROL_TIMEOUT_MS);
+    const deadlineAt = Math.min(command.deadlineAt ?? command.requestedAt + this.#ackTimeoutMs, command.requestedAt + MAX_CONTROL_TIMEOUT_MS,
+      scriptedInputDeadline(command.operation, command.targetId, command.data) ?? Infinity);
     owned.running = true;
     const execution = this.#executeClaimedCommand(command, owned.event.from, key, owned, deadlineAt, owned.event.sequence, owned.event.verification)
       .catch(error => {
@@ -3237,6 +3383,7 @@ export class FabricControlPlane {
             expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
             sequence,
             acceptance,
+            ...(readScriptedInput(command.data) ? { bodyDigest: controlBodyFingerprint(owned.event.data, owned.event.principal), requesterId: from.id } : {}),
           } satisfies FabricControlSeenRecord,
           identity: this.identity,
           ifVersion: owned.claimVersion,
@@ -3280,7 +3427,9 @@ export class FabricControlPlane {
           const retained = await this.#seen.put({ key, identity: this.identity, ifVersion: owned.claimVersion,
             value: { format: 1, hostId: this.options.hostId, commandId: command.commandId,
               targetId: command.targetId, ownerIncarnation: outcomeIncarnation, expiresAt: Math.max(deadlineAt, Date.now()) + this.#ackTimeoutMs,
-              acceptance: owned.acceptance } satisfies FabricControlSeenRecord });
+              acceptance: owned.acceptance,
+              ...(readScriptedInput(command.data) ? { bodyDigest: controlBodyFingerprint(owned.event.data, owned.event.principal), requesterId: from.id } : {}),
+            } satisfies FabricControlSeenRecord });
           owned.claimVersion = retained.version;
         } catch { /* The owned in-memory outcome and durable claim remain; never replay. */ }
       }
@@ -3407,6 +3556,7 @@ export class FabricControlPlane {
     // null explicitly attests that this command arrived without an epoch.
     staleIncarnation?: string | null,
   ): Promise<void> {
+    if (isObject(command.data) && Object.hasOwn(command.data, "scriptedInput")) await this.#seen.sync();
     await this.#fileTransport.publish({
         topic: ACK_TOPIC,
         kind: acceptance.accepted ? "accepted" : "rejected",

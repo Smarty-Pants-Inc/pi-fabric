@@ -520,6 +520,14 @@ export class AgentsProvider implements FabricProvider {
     );
   }
 
+  /** Native host startup hook, not an agents action: one finite outbox pass after
+   * portable ownership/binding/routing readiness. Defaults to this owner's identity.
+   * A host may supply another authenticated hosted sender/context; persisted data
+   * never selects sender authority. Expired/unknown rounds remain in the summary. */
+  resumeScriptedInputs(from?: MeshIdentity, context?: FabricInvocationContext): ReturnType<AgentMessageRouter["resumeScriptedInputs"]> {
+    return this.#router.resumeScriptedInputs(from, context);
+  }
+
   readonly #lifecycleScheduler: LifecycleDeliveryScheduler;
 
   #lifecycleMessage(event: FabricLifecycleEvent): string {

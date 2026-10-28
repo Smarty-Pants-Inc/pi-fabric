@@ -145,57 +145,79 @@ const waitForStoppedWorker = (directory: string, currentRecord: () => Record<str
     check(); // Covers an exit between the first identity check and registering the watcher.
   });
 
+const SAVED_ACTOR_ANSWER = Symbol("saved actor answer requires delivery");
+
+/** Recover one durable stop without dropping its native/descendant or archive custody. */
+const recoverActorStop = async (directory: string, actorId: string, closeSignal: AbortSignal,
+  stoppedActor = false): Promise<AgentRunResult | typeof SAVED_ACTOR_ANSWER | undefined> => {
+  const id = path.basename(directory);
+  if (!RUN_ID.test(id)) return undefined;
+  const statusFile = path.join(directory, "status.json");
+  const status = readJson(statusFile);
+  const intent = readRunStopIntent(directory, status);
+  if (!intent) return undefined;
+  // Legacy receipts have no identity snapshot. They still fence admission when
+  // retry removed status, but cannot prove an unknown replacement gone.
+  let taskActor: unknown;
+  try { taskActor = JSON.parse(fs.readFileSync(path.join(directory, "task.txt"), "utf8")).actorId; } catch { /* not an actor task */ }
+  const matches = (record: Record<string, unknown> | undefined): record is Record<string, unknown> =>
+    record?.id === id && record.transport === "process" && record.actorId === actorId;
+  const fallback = { id, actorId, transport: "process", status: "running" };
+  if (!matches(intent.recoveryRecord) && !matches(status) && taskActor !== actorId) return undefined;
+  const currentRecord = (): Record<string, unknown> => {
+    const latestStatus = readJson(statusFile);
+    const latestSnapshot = readRunStopIntent(directory, latestStatus)?.recoveryRecord;
+    // A present snapshot supersedes status even when unusable or identity-less:
+    // never discharge its custody using an older attempt's status/pid.
+    return matches(latestSnapshot) ? latestSnapshot : latestSnapshot === undefined && matches(latestStatus) ? latestStatus : fallback;
+  };
+  let record = await waitForStoppedWorker(directory, currentRecord, closeSignal);
+  const latest = readJson(statusFile);
+  if (matches(latest)) record = latest;
+  // Restore the process record needed by the existing completion delivery/ack
+  // path, without consuming or changing its immutable settlement receipt.
+  if (!latest) writeJsonAtomic(statusFile, record, { durable: true });
+  const savedAnswer = savedEnodevAnswer(directory);
+  // Active actors retain the existing delivery/queue-ack protocol. A terminally
+  // stopped actor has no activation to replay: publish its saved answer locally,
+  // without delivering it or changing the immutable receipt or custody markers.
+  if (savedAnswer !== undefined && !stoppedActor) return SAVED_ACTOR_ANSWER;
+  const recoveredIntent = readRunStopIntent(directory, record) ?? intent;
+  if (record.status !== "running" && record.status !== "queued") {
+    if (!["completed", "failed", "stopped", "timed_out"].includes(String(record.status))) return undefined;
+    const outcome = { ...record, stopIntent: recoveredIntent } as unknown as AgentRunResult;
+    writeJsonAtomic(statusFile, outcome, { durable: true });
+    if (outcome.status === "stopped" || outcome.status === "timed_out") recoveredDurableStops.add(outcome);
+    return outcome;
+  }
+  const outcome = { ...record, ...uncleanReceipt(record),
+    ...(savedAnswer !== undefined ? { status: "completed", text: savedAnswer }
+      : { status: recoveredIntent.reason === "explicit" ? "stopped" : "timed_out",
+        error: recoveredIntent.reason === "explicit" ? "Agent stopped" : "Agent timed out" }),
+    stopIntent: recoveredIntent, finishedAt: Date.now() } as unknown as AgentRunResult;
+  writeJsonAtomic(statusFile, outcome, { durable: true });
+  if (outcome.status === "stopped" || outcome.status === "timed_out") recoveredDurableStops.add(outcome);
+  return outcome;
+};
+
+/** Exact-run recovery for an already stopped actor; never scans or launches work. */
+export const recoverStoppedActorRun = async (directory: string, actorId: string, closeSignal: AbortSignal): Promise<AgentRunResult | undefined> => {
+  const outcome = await recoverActorStop(directory, actorId, closeSignal, true);
+  return outcome === SAVED_ACTOR_ANSWER ? undefined : outcome;
+};
+
 /** Recover explicit stops before requiring ENODEV evidence: stop intent is written before transport.stop(). */
 export const recoverDurableActorStop = async (runRoot: string, actorId: string, activationId: string,
   closeSignal: AbortSignal): Promise<AgentRunResult | undefined> => {
   let directories: string[];
   try { directories = fs.readdirSync(runRoot).map(name => path.join(runRoot, name)); } catch { return undefined; }
   for (const directory of directories) {
-    const id = path.basename(directory);
-    if (!RUN_ID.test(id) || activationOf(directory) !== activationId) continue;
-    const statusFile = path.join(directory, "status.json");
-    const status = readJson(statusFile);
-    const intent = readRunStopIntent(directory, status);
-    if (!intent) continue;
-    // Legacy receipts have no identity snapshot. They still fence admission when
-    // retry removed status, but cannot prove an unknown replacement gone.
-    let taskActor: unknown;
-    try { taskActor = JSON.parse(fs.readFileSync(path.join(directory, "task.txt"), "utf8")).actorId; } catch { /* not an actor task */ }
-    const matches = (record: Record<string, unknown> | undefined): record is Record<string, unknown> =>
-      record?.id === id && record.transport === "process" && record.actorId === actorId;
-    const fallback = { id, actorId, transport: "process", status: "running" };
-    const snapshot = intent.recoveryRecord;
-    if (!matches(snapshot) && !matches(status) && taskActor !== actorId) continue;
-    const currentRecord = (): Record<string, unknown> => {
-      const latestStatus = readJson(statusFile);
-      const latestSnapshot = readRunStopIntent(directory, latestStatus)?.recoveryRecord;
-      // An explicit identity-less snapshot means launch is pending: never fall
-      // back to a superseded attempt's status/pid to discharge that custody.
-      return matches(latestSnapshot) ? latestSnapshot : matches(latestStatus) ? latestStatus : fallback;
-    };
-    let record = await waitForStoppedWorker(directory, currentRecord, closeSignal);
-    const latest = readJson(statusFile);
-    if (matches(latest)) record = latest;
-    // Restore the process record needed by the existing completion delivery/ack
-    // path, without consuming or changing its immutable settlement receipt.
-    if (!latest) writeJsonAtomic(statusFile, record, { durable: true });
-    // Completion wins even without ENODEV. Reuse the existing delivery/queue-ack
-    // protocol below rather than overwriting the receipt or settling before delivery.
-    if (savedEnodevAnswer(directory) !== undefined) return undefined;
-    const recoveredIntent = readRunStopIntent(directory, record) ?? intent;
-    if (record.status !== "running" && record.status !== "queued") {
-      if (!["completed", "failed", "stopped", "timed_out"].includes(String(record.status))) continue;
-      const outcome = { ...record, stopIntent: recoveredIntent } as unknown as AgentRunResult;
-      writeJsonAtomic(path.join(directory, "status.json"), outcome, { durable: true });
-      if (outcome.status === "stopped" || outcome.status === "timed_out") recoveredDurableStops.add(outcome);
-      return outcome;
-    }
-    const outcome = { ...record, ...uncleanReceipt(record), status: recoveredIntent.reason === "explicit" ? "stopped" : "timed_out",
-      error: recoveredIntent.reason === "explicit" ? "Agent stopped" : "Agent timed out",
-      stopIntent: recoveredIntent, finishedAt: Date.now() } as unknown as AgentRunResult;
-    writeJsonAtomic(path.join(directory, "status.json"), outcome, { durable: true });
-    recoveredDurableStops.add(outcome);
-    return outcome;
+    if (!RUN_ID.test(path.basename(directory)) || activationOf(directory) !== activationId) continue;
+    const outcome = await recoverActorStop(directory, actorId, closeSignal);
+    // Completion short-circuits the WHOLE scan, not just this attempt: a later
+    // stopped attempt of the same activation cannot hide its saved answer.
+    if (outcome === SAVED_ACTOR_ANSWER) return undefined;
+    if (outcome) return outcome;
   }
   return undefined;
 };

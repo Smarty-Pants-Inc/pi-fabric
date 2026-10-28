@@ -33,7 +33,7 @@ import { discardWorkerCompletion, type CompletionRecipient } from "./completion-
 import { processStartTime } from "../residency/process-identity.js";
 import { FABRIC_ACTOR_SELF_ENV, normalizeFabricActorActivationIdentity, type FabricActorActivationIdentity } from "../actors/activation-identity.js";
 import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
-  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, goneEnodevOutcome, savedEnodevAnswer, recoverDurableActorStop, type OwnedProcess } from "./enodev-recovery.js";
+  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, goneEnodevOutcome, savedEnodevAnswer, recoverDurableActorStop, recoverStoppedActorRun, type OwnedProcess } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -5297,6 +5297,39 @@ export class AgentManager {
 
   async stop(id: string, options: { consume?: boolean; caller?: AgentRunStopCaller } = {}): Promise<AgentRunResult> {
     return this.#stop(id, options.consume !== false, true, options.caller ?? this.#stopIntentCaller("agents.stop"));
+  }
+
+  /** Host-only exact-run stop for a terminal actor, including a previous host's
+   * checkpoint. Recovery publishes through the authenticated previous-run store;
+   * it never launches work, scans the run root, or discharges native/archive debt. */
+  async stopActorRun(id: string, actorId: string, caller: AgentRunStopCaller): Promise<AgentRunResult | undefined> {
+    const managed = this.#runs.get(id);
+    const queued = this.#queued.get(id);
+    if (managed || queued) {
+      if ((managed?.actorId ?? queued?.info.actorId) !== actorId) return undefined;
+      // Legacy actor stops abandoned their run before recording STOPPED. This
+      // explicit terminal stop supersedes abandonment, not a saved terminal loss.
+      if (managed && !managed.settled) managed.abandoned = false;
+      return this.stop(id, { consume: false, caller });
+    }
+    const previous = this.#previousRun(id);
+    if (previous) return previous.actorId === actorId ? previous : undefined;
+    if (!/^[a-f0-9]{32}$/.test(id)) return undefined;
+    const directory = path.join(this.#runRoot, id);
+    const record = readRecord(path.join(directory, "status.json"));
+    const intent = readRunStopIntent(directory, record as unknown as Record<string, unknown> | undefined);
+    const matches = (value: Record<string, unknown> | undefined): boolean =>
+      value?.id === id && value.actorId === actorId && value.transport === "process";
+    if (!matches(record as unknown as Record<string, unknown> | undefined) && !matches(intent?.recoveryRecord)) return undefined;
+    // Keep any identity-less pending-replacement snapshot: a worker checkpoint
+    // cannot replace it with the dead identity of an earlier attempt.
+    persistRunStopIntent(directory, "explicit", intent || !record ? undefined : omitRetainedTasks(record) as unknown as Record<string, unknown>, caller);
+    const result = await recoverStoppedActorRun(directory, actorId, this.#closeAbort.signal);
+    if (result) {
+      this.restorePreviousRuns([result]);
+      this.#retentionRevision++;
+    }
+    return result;
   }
 
   /** Attribute a stop initiated by the actor host before its abort signal can race settlement. */

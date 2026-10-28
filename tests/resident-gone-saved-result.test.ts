@@ -54,8 +54,8 @@ const queue = (root: string, actorId: string): QueueItem[] => {
 };
 
 // Vitest's global teardown removes its own TMPDIR even if this suite does not.
-// Preserve every regular file, byte-for-byte, in caller-owned scratch OUTSIDE
-// that disposable root before teardown. No source trace is explicitly removed.
+// SETTLE_REPRO_EVIDENCE_ROOT opts into caller-owned scratch outside that root;
+// otherwise evidence stays in the test temp dir. No source trace is explicitly removed.
 // writeFile (rather than rename/copy into a wider deletion ceiling) also leaves
 // the standard test deletion guard intact. A SHA-256 inventory binds the copy.
 const preserve = (source: string, destination: string) => {
@@ -80,8 +80,8 @@ const fixture = async (name: string) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `resident-gone-saved-${name}-`));
   const evidenceBase = process.env.SETTLE_REPRO_EVIDENCE_ROOT;
   // An explicit caller-owned sink survives both Vitest and smarty-test-env's
-  // temp removers. Without one, allocate fresh scratch outside Vitest's root.
-  const evidence = fs.mkdtempSync(path.join(evidenceBase ?? path.dirname(path.dirname(os.tmpdir())), `settle-retained-${name}-`));
+  // temp removers. The default must stay writable, not climb to filesystem root.
+  const evidence = fs.mkdtempSync(path.join(evidenceBase ?? os.tmpdir(), `settle-retained-${name}-`));
   const events = observe(root);
   const gates = path.join(root, "gates"); fs.mkdirSync(gates);
   const config: ResidentHostConfig = {
@@ -186,6 +186,9 @@ const fixture = async (name: string) => {
 
 // This suite intentionally fails on the unmodified source: normal result
 // publication is required, never an assertion that the actor remains wedged.
+// Native proof here requires Linux /proc births and its pre-publication drain;
+// Windows instead has early terminal publication with a separate native join,
+// exercised without platform substitution by actor-permit-watch's recovery cases.
 describe.skipIf(process.platform !== "linux")("resident gone native worker with a saved terminal result", () => {
   it("publishes the saved result once and continues the durable actor FIFO after its terminal monitor failed", async () => {
     const f = await fixture("gone");

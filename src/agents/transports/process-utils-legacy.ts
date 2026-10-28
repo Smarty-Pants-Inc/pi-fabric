@@ -3,7 +3,7 @@ import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { AgentTransportLaunch } from "../types.js";
+import type { AgentNativeExitDiagnostic, AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
 
@@ -267,6 +267,31 @@ const linuxGroupMember = (pid: number): LinuxGroupMember | undefined => {
     throw error; // Unknown identity is not permission to signal or to report exit.
   }
 };
+/** Best-effort launch-time observation, not cgroup admission or signaling authority.
+ * Birth checks bracket a bounded procfs read; failure never blocks native teardown. */
+export const observeProcessCgroup = (pid: number, started?: string): AgentNativeExitDiagnostic["cgroup"] => {
+  if (process.platform !== "linux") return Object.freeze({ state: "unsupported", reason: "linux-procfs-required" });
+  if (!started) return Object.freeze({ state: "unavailable", reason: "worker-birth-unavailable" });
+  let fd: number | undefined;
+  try {
+    if (linuxGroupMember(pid)?.started !== started) return Object.freeze({ state: "unavailable", reason: "worker-birth-changed-or-gone" });
+    fd = fs.openSync(`/proc/${pid}/cgroup`, fs.constants.O_RDONLY);
+    const buffer = Buffer.alloc(4097);
+    let size = 0;
+    while (size < buffer.length) {
+      const count = fs.readSync(fd, buffer, size, buffer.length - size, size);
+      if (count === 0) break;
+      size += count;
+    }
+    if (size > 4096) return Object.freeze({ state: "unavailable", reason: "cgroup-membership-too-large" });
+    const membership = buffer.toString("utf8", 0, size).trim();
+    if (!membership) return Object.freeze({ state: "unavailable", reason: "cgroup-membership-empty" });
+    if (linuxGroupMember(pid)?.started !== started) return Object.freeze({ state: "unavailable", reason: "worker-birth-changed-or-gone" });
+    return Object.freeze({ state: "observed", source: "procfs", observedAt: Date.now(), membership });
+  } catch { return Object.freeze({ state: "unavailable", reason: "cgroup-observation-failed" }); }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* diagnostics cannot block teardown */ } } }
+};
+
 const linuxProcesses = (): LinuxGroupMember[] =>
   fs.readdirSync("/proc").flatMap((entry) => {
     if (!/^\d+$/.test(entry)) return [];
@@ -287,7 +312,7 @@ export const spawnDetached = async (
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; primaryExit?: Promise<void>; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; primaryExit?: Promise<void>; nativeExit?(): AgentNativeExitDiagnostic | undefined; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
   const runtime = await resolveScriptRuntime(runtimeOptionsForWorker(workerPath));
   const treeOwner = process.platform === "linux" ? await import("../../residency/launcher-owner.js") : undefined;
   assertTransportLaunchAllowed(authority);
@@ -318,10 +343,17 @@ export const spawnDetached = async (
     return spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
   }
   const pid = child.pid;
+  let birth: LinuxGroupMember | undefined;
+  let birthUnknown = false;
+  try { birth = process.platform === "linux" ? linuxGroupMember(pid) : undefined; } catch { birthUnknown = true; }
+  const cgroupObservation = observeProcessCgroup(pid, birth?.started);
+  let nativeExit: AgentNativeExitDiagnostic | undefined;
   // Exit is latched: after the worker/group empties its numeric id is not identity.
   let exited = false;
   let force: ReturnType<typeof setTimeout> | undefined;
-  const primaryExit = new Promise<void>(resolve => child.once("exit", () => {
+  const primaryExit = new Promise<void>(resolve => child.once("exit", (code, signal) => {
+    nativeExit = Object.freeze({ scope: "primary", pid, ...(birth ? { processStartTime: birth.started } : {}),
+      code, signal, exitedAt: Date.now(), cgroup: cgroupObservation });
     exited = true; clearTimeout(force); resolve();
   }));
   let nativeClosed = false;
@@ -357,9 +389,6 @@ export const spawnDetached = async (
       }
     } else if (message.type === "fabric-execution-settled") executionPending = false;
   });
-  let birth: LinuxGroupMember | undefined;
-  let birthUnknown = false;
-  try { birth = process.platform === "linux" ? linuxGroupMember(pid) : undefined; } catch { birthUnknown = true; }
   // Share the original birth anchor with sampled cleanup. A second observation
   // must not adopt a replacement process when the captured worker was absent.
   const ownedTree = treeOwner ? { processes: new Map<number, import("../../residency/launcher-owner.js").OwnedProcess>(
@@ -503,7 +532,8 @@ export const spawnDetached = async (
   const handle = {
     pid,
     closed,
-    ...(process.platform === "win32" ? { primaryExit } : {}),
+    primaryExit,
+    nativeExit: () => nativeExit,
     lostContact: () => lost,
     stopDebt: () => stopFailed ? undefined : lost,
     forcedCleanupCount: () => forcedDescendants.size,

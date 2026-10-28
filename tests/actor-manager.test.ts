@@ -2645,6 +2645,7 @@ describe("ActorManager", () => {
       expect.any(Function),
       expect.any(Function), // durable activation-lineage downgrade fence
       { timeoutMs: 30_000, onPreparing: expect.any(Function) },
+      expect.any(Function), // host-only durable-loss fence
     );
   });
 

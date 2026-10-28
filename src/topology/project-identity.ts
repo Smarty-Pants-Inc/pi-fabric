@@ -195,17 +195,29 @@ export class FabricProjectLeadInvalidError extends Error {
 
 const MAX_LEAD_MARKER_BYTES = 128;
 const LEAD_SESSION_ID = /^session:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+export const isProjectLeadId = (id: string): boolean => LEAD_SESSION_ID.test(id);
 const validatedLead = (value: string, allowBareUuid = false): string => {
   const trimmed = value.trim();
   const id = allowBareUuid && !trimmed.startsWith("session:") ? `session:${trimmed}` : trimmed;
-  if (value.length > MAX_LEAD_MARKER_BYTES || !LEAD_SESSION_ID.test(id)) throw new FabricProjectLeadInvalidError();
+  if (value.length > MAX_LEAD_MARKER_BYTES || !isProjectLeadId(id)) throw new FabricProjectLeadInvalidError();
   return id;
 };
 
-/** Launch metadata: explicit launcher values stay strict; malformed file hints never block startup. */
-export const recordedProjectLead = (cwd: string, env: NodeJS.ProcessEnv = process.env): string | undefined => {
+/**
+ * Read only within the actual lane, never its common Git checkout or arbitrary ancestors.
+ * Callers starting in a subdirectory must supply the known lane boundary explicitly.
+ * Explicit launcher values stay strict; malformed file hints never block startup.
+ */
+export const recordedProjectLead = (
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+  laneCwd: string = cwd,
+): string | undefined => {
   const explicit = env.SMARTY_LEAD_SESSION?.trim();
   if (explicit) return validatedLead(explicit);
+  const lane = path.resolve(laneCwd);
+  const relative = path.relative(lane, path.resolve(cwd));
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return undefined;
   for (let dir = path.resolve(cwd); ; dir = path.dirname(dir)) {
     const local = path.join(dir, ".local");
     const marker = path.join(local, "lead");
@@ -249,7 +261,8 @@ export const recordedProjectLead = (cwd: string, env: NodeJS.ProcessEnv = proces
       return undefined;
     }
     if (lead) return lead;
-    if (fs.existsSync(path.join(dir, ".git")) || path.dirname(dir) === dir) return undefined;
+    // Both a checkout's .git directory and a linked worktree's .git file end the scan.
+    if (dir === lane || fs.existsSync(path.join(dir, ".git")) || path.dirname(dir) === dir) return undefined;
   }
 };
 
@@ -304,8 +317,8 @@ export class FabricProjectAgentAmbiguousError extends Error {
 /**
  * The launch-recorded id is an exact return address, independent of repository. The directory
  * admits live, non-colliding roots; an attributed but bridge-stale mirror cannot lead.
- * Without a binding, elect only same-repository native roots (smarty-dev#2045).
- * Legacy native records retain path matching. Never choose by recency.
+ * Without an actual binding, fail unresolved. Repository, path, role and recency are never
+ * return-address authority, including for legacy roots. Exact-bound fresh mirrors remain valid.
  */
 export const resolveProjectAgent = <T extends ProjectRoot>(
   allRoots: readonly T[],
@@ -328,39 +341,7 @@ export const resolveProjectAgent = <T extends ProjectRoot>(
     }
     return recorded;
   }
-  const repository = options.repository ? normalizeOrigin(options.repository) : undefined;
-  if (options.repository !== undefined && !repository) {
-    throw new FabricProjectAgentUnresolvedError(`No live project agent for ${project}: invalid repository identity.`);
-  }
-  const sameProject = (root: T): boolean => {
-    if (repository && root.repository) return normalizeOrigin(root.repository) === repository;
-    // Remote paths are neither locally meaningful nor authority to name this repository.
-    return root.remoteHost === undefined &&
-      (root.project ?? (root.cwd ? canonical(root.cwd) : undefined)) === project;
-  };
-  const roots = allRoots.filter((root) => eligible(root) && sameProject(root));
-  const native = roots.filter((root) => root.remoteHost === undefined);
-  const tagged = native.filter((root) => root.role === "project-agent");
-  const untagged = native.filter((root) =>
-    root.role === undefined && root.project === undefined && root.cwd !== undefined && canonical(root.cwd) === project);
-  const candidates = tagged.length > 0 ? tagged : untagged;
-  if (candidates.length === 0) {
-    if (repository && allRoots.some((root) => eligible(root) && root.remoteHost === undefined &&
-      root.repository && normalizeOrigin(root.repository) !== repository)) {
-      throw new FabricProjectAgentUnresolvedError(
-        `No live project agent for ${project}. No recorded launch lead; live native roots belong to another repository.`,
-      );
-    }
-    const inProject = native.map((root) => `${root.id} (${root.role ?? "no role"})`);
-    throw new FabricProjectAgentUnresolvedError(
-      `No live project agent for ${project}. ` +
-        (inProject.length > 0 ? `Live roots in this project: ${inProject.join(", ")}.` : "No live root is in this project."),
-    );
-  }
-  if (candidates.length > 1) {
-    throw new FabricProjectAgentAmbiguousError(
-      `Ambiguous Fabric project agent for ${project}: ${candidates.map((root) => root.id).sort().join(", ")}. Record the launch lead in SMARTY_LEAD_SESSION or .local/lead.`,
-    );
-  }
-  return candidates[0]!;
+  throw new FabricProjectAgentUnresolvedError(
+    `No live project agent for ${project}: no actual Main spawner or lane launch lead binding.`,
+  );
 };

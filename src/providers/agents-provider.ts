@@ -1,6 +1,7 @@
 import { invocationFabricPrincipal, snapshotFabricInvocation, fabricHostIdentity, fabricTurnProvenance, fabricWakeCause, withFabricWakeAdmission, type FabricWakeCause } from "../fabric-provenance.js";
 import { diagnostics } from "../core/diagnostics.js";
 import { createHash, randomUUID } from "node:crypto";
+import path from "node:path";
 import { actorInstructionsSource, resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import { readTaskReturnAddress } from "../agents/task-return-address.js";
 import { sandboxResultPrefix, type SandboxAutoReturn } from "../agents/sandbox-auto-return.js";
@@ -12,7 +13,7 @@ import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { ActorManager, ActorRegistryOwnershipError, parseBashTimeoutSeconds } from "../actors/manager.js";
 import { FABRIC_ACTOR_SELF_ENV, actorActivationIdentityFromEnvironment, type FabricActorActivationIdentity } from "../actors/activation-identity.js";
 import { slotAdmissionFor } from "../actors/slot-admission.js";
-import { participantProject, recordedProjectLead, repositoryOf, resolveProjectAgent } from "../topology/project-identity.js";
+import { FabricProjectAgentUnresolvedError, isProjectLeadId, recordedProjectLead, resolveProjectAgent } from "../topology/project-identity.js";
 import { GlobalActorRegistry } from "../actors/global-registry.js";
 import type { FabricActorStopOptions } from "../actors/types.js";
 import { isFabricActorHostEvent, FabricActorBatchPolicyError, normalizeDeadLetterReplayMaxAgeMs, normalizeActorActivation, normalizeActorBatching, validateActorCoalesceKey, validateActorDedupeKey, validateActorInferenceContext } from "../actors/types.js";
@@ -80,7 +81,7 @@ import {
 import { checkedHandoffCompaction } from "../agents/handoff.js";
 import { checkedSeed, completedBranchPrefix, snippetTask } from "../agents/fork-seed.js";
 import { readAgentLineage } from "../agents/child-env.js";
-import { assertAgentSpawnAllowed, snapshotAgentSpawnEnvironment, type AgentSpawnCaller } from "../agents/spawn-authority.js";
+import { assertAgentSpawnAllowed, hasWorkerMarker, snapshotAgentSpawnEnvironment, type AgentSpawnCaller } from "../agents/spawn-authority.js";
 import { childScope, sessionScope } from "../scope.js";
 import { withInheritedSessionPins } from "../agents/session-pins.js";
 import type {
@@ -459,7 +460,9 @@ export class AgentsProvider implements FabricProvider {
   readonly #transcripts = new AgentTranscriptReader();
   readonly #toolCeiling = readChildToolAllowlist();
   readonly #router: AgentMessageRouter;
-  readonly #projectLeadId: string | undefined;
+  readonly #projectAgentCwd: string;
+  /** Explicit launcher environment is retained only for terminal error return addressing. */
+  readonly #projectLeadEnvironment: NodeJS.ProcessEnv;
   readonly #taskReturnAddress = readTaskReturnAddress();
   readonly #spawnEnvironment: NodeJS.ProcessEnv;
   readonly #spawnCaller: AgentSpawnCaller;
@@ -497,7 +500,8 @@ export class AgentsProvider implements FabricProvider {
     this.#spawnCaller = identity
       ? Object.freeze({ kind: identity.kind, id: identity.id })
       : (typeof (actorManager as { create?: unknown }).create === "function" ? null : undefined);
-    this.#projectLeadId = recordedProjectLead(manager.cwd ?? process.cwd());
+    this.#projectAgentCwd = path.resolve(manager.cwd ?? process.cwd());
+    this.#projectLeadEnvironment = { SMARTY_LEAD_SESSION: process.env.SMARTY_LEAD_SESSION };
     this.#router = new AgentMessageRouter(
       manager, actorManager, mainAgent, participants, control,
       (binding, runner, context, requiredPin, role) => {
@@ -1226,12 +1230,23 @@ export class AgentsProvider implements FabricProvider {
         if (stalled) throw stalled;
         const roots = this.participants.sessions?.() ??
           this.participants.list({ scope: "project", kinds: ["root"] });
-        const project = participantProject(context.cwd);
-        const repository = repositoryOf(project);
-        return resolveProjectAgent(roots, project, {
-          ...(repository ? { repository } : {}),
-          ...(this.#projectLeadId ? { leadId: this.#projectLeadId } : {}),
-        });
+        // The router already captured the immediate incoming spawner at bootstrap. Never
+        // re-read mutable spawn env, substitute lineage Main, or elect by role/repository.
+        const spawner = this.#router.spawner;
+        const environment = this.#spawnEnvironment;
+        const expectsBinding = hasWorkerMarker(environment) ||
+          ["PI_FABRIC_SPAWNER_ID", "PI_FABRIC_SPAWNER_RUN", "PI_FABRIC_SPAWNER_SESSION_ID"]
+            .some(key => environment[key] !== undefined);
+        if ((spawner && (spawner.kind !== "main" || !isProjectLeadId(spawner.id))) || (!spawner && (expectsBinding ||
+          this.#spawnCaller === null || (this.#spawnCaller && this.#spawnCaller.kind !== "main")))) {
+          throw new FabricProjectAgentUnresolvedError(
+            `No live project agent for ${this.#projectAgentCwd}: no supported immediate Main spawner binding.`,
+          );
+        }
+        // Only an actual root lane may use its launcher's marker. Read at invocation so
+        // late launcher metadata is visible; guest cwd and the common Git checkout are not authority.
+        const leadId = spawner?.id ?? recordedProjectLead(this.#projectAgentCwd, {});
+        return resolveProjectAgent(roots, this.#projectAgentCwd, { ...(leadId ? { leadId } : {}) });
       }
       case "subscribe": {
         const events = Array.isArray(args.events)
@@ -1971,7 +1986,10 @@ export class AgentsProvider implements FabricProvider {
 
   /** Host-authored terminal lane report: use only a recorded return address, never elect a lead. */
   async reportMainProviderError(message: string): Promise<FabricAgentMessageResult | undefined> {
-    const target = this.#taskReturnAddress?.spawnerId ?? this.#router.spawner?.id ?? this.#projectLeadId;
+    // This is a separate exact return-address path, not projectAgent resolution. Preserve
+    // task/spawner precedence and never turn an unavailable lead into an election.
+    const target = this.#taskReturnAddress?.spawnerId ?? this.#router.spawner?.id ??
+      recordedProjectLead(this.#projectAgentCwd, this.#projectLeadEnvironment);
     if (!target || this.mainAgent.matches(target)) return undefined;
     return this.routeMessage(target, message, undefined, "followUp");
   }

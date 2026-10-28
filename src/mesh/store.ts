@@ -855,6 +855,11 @@ export class MeshStore {
     return this.#events.read(input);
   }
 
+  /** Async archive catch-up; live/recent reads retain read()'s behavior. */
+  readAsync(input: { after?: number; topic?: string; to?: string; limit?: number } = {}): Promise<MeshEvent[]> {
+    return this.#events.readAsync(input);
+  }
+
   /**
    * Durability barrier (smarty-dev#9313): resolves once every event AND every keyed-state commit
    * made on this root before the call, by any process, is on disk; otherwise it throws, for SQLite

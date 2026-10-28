@@ -609,6 +609,7 @@ globalThis.agents = Object.freeze({
   setFollowUpMode: (args) => __call("agents.setFollowUpMode", args),
   compact: (args) => __call("agents.compact", args),
   actorStatus: (args) => __call("agents.actorStatus", args),
+  actorHealth: (args) => __call("agents.actorHealth", args),
   slotStatus: (args = {}) => __call("agents.slotStatus", args),
   instructions: (args) => __call("agents.instructions", args),
   setModel: (args) => __call("agents.setModel", args),

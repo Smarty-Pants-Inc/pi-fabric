@@ -303,23 +303,30 @@ export class SlotAdmissionCoordinator {
     return found;
   }
 
-  isCurrent(actorId: string, topics: readonly string[], registryRoot: string): boolean {
+  isCurrent(actorId: string, topics: readonly string[], registryRoot: string, options: { readOnly?: boolean } = {}): boolean {
     try {
       if (!this.#protected(topics, registryRoot)) return true;
-      this.withCurrent(actorId, topics, registryRoot, () => undefined);
+      // Health is an observation, not execution admission: it must not acquire
+      // SQLite writer custody. Execution callers retain the fenced default.
+      if (options.readOnly) this.#assertCurrent(actorId, topics, registryRoot);
+      else this.withCurrent(actorId, topics, registryRoot, () => undefined);
       return true;
     } catch { return false; }
+  }
+
+  #assertCurrent(actorId: string, topics: readonly string[], registryRoot: string): void {
+    this.#authority.assert(registryRoot);
+    const found = this.#find(actorId, registryRoot, this.mesh.listAll(SLOT_ADMISSION_PREFIX, { fresh: true }));
+    if (!found || found.role.state !== "admitted" || !this.#syncedIds.has(actorId)
+      || topics.filter(topic => this.isProtected([topic])).length !== 1 || !topics.includes(found.pair.topic)) {
+      refuse("occupied", "Protected actor is not the exact current synced admitted ID/topic/registry");
+    }
   }
 
   withCurrent<T>(actorId: string, topics: readonly string[], registryRoot: string, operation: () => T): T {
     if (!this.#protected(topics, registryRoot)) return operation();
     return this.mesh.withStateWriteFence(() => {
-      this.#authority.assert(registryRoot);
-      const found = this.#find(actorId, registryRoot, this.mesh.listAll(SLOT_ADMISSION_PREFIX, { fresh: true }));
-      if (!found || found.role.state !== "admitted" || !this.#syncedIds.has(actorId)
-        || topics.filter(topic => this.isProtected([topic])).length !== 1 || !topics.includes(found.pair.topic)) {
-        refuse("occupied", "Protected actor is not the exact current synced admitted ID/topic/registry");
-      }
+      this.#assertCurrent(actorId, topics, registryRoot);
       const result = operation();
       if (object(result) && typeof result.then === "function") throw new Error("Slot current-state operation must be synchronous");
       return result;

@@ -1,4 +1,4 @@
-import type { FabricActorInfo } from "../actors/types.js";
+import type { FabricActorHealth, FabricActorInfo } from "../actors/types.js";
 import type { FabricAgentRunner, FabricAgentTransport } from "../config.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { AgentPlacementKind, AgentUsage } from "../agents/types.js";
@@ -100,6 +100,8 @@ export interface FabricParticipantRecord {
   actorOwnershipToken?: string;
   actorQueued?: number;
   actorMessages?: number;
+  /** Owner-observed health; meaningful only while this actor participant's lease is fresh. */
+  actorHealth?: FabricActorHealth;
   /** Accepted activation preparation or AgentManager admission receipt, before worker launch. */
   actorPreparing?: FabricActorInfo["preparing"];
   /** The actor's in-flight run (smarty-dev#2184 item 8). */
@@ -212,6 +214,8 @@ export type FabricControlAdmission =
   | { controlAdmission: "gated"; controlAdmissionReason: string };
 
 export interface FabricParticipantSource {
+  /** Synchronous observation scope: suppress advisory publications from nested reads. */
+  observe?<T>(read: () => T): T;
   list(options?: FabricParticipantListOptions, now?: number): FabricParticipantInfo[];
   get(id: string, now?: number, options?: { fresh?: boolean }): FabricParticipantInfo | undefined;
   /**

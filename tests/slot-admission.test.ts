@@ -479,6 +479,22 @@ describe.runIf(process.platform === "linux")("same-transaction permanent actor-b
     expect(f.coordinator.withCurrent("actor:review-1", [routes[0]!.topic], f.binding.registryRoots[1]!, () => "enabled")).toBe("enabled");
   });
 
+  it("observes current slot health without writer custody while execution stays fenced", async () => {
+    const f = await fresh();
+    await f.coordinator.admit(f.input());
+    const registry = f.binding.registryRoots[1]!;
+    const before = f.mesh.get(admissionKey, { fresh: true });
+    const fence = vi.spyOn(f.mesh, "withStateWriteFence").mockImplementation(() => {
+      throw new Error("health must not acquire writer custody");
+    });
+    expect(f.coordinator.isCurrent("actor:review-1", [routes[0]!.topic], registry, { readOnly: true })).toBe(true);
+    expect(f.coordinator.isCurrent("actor:missing", [routes[0]!.topic], registry, { readOnly: true })).toBe(false);
+    expect(fence).not.toHaveBeenCalled();
+    expect(f.mesh.get(admissionKey, { fresh: true })).toEqual(before);
+    expect(f.coordinator.isCurrent("actor:review-1", [routes[0]!.topic], registry)).toBe(false);
+    expect(fence).toHaveBeenCalledOnce();
+  });
+
   it("treats the host-captured exception lane as attempt state, never a different birth (smarty-dev#16357)", async () => {
     const f = await fresh();
     const captured = f.input();

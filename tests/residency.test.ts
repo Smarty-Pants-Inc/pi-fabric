@@ -1898,10 +1898,15 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(passive.owns(actor.id)).toBe(false);
       const definition = passive.definition(actor.id);
       await control.request(client.hostId, actor.id, "followUp", { message: "LIVE_WITH_PROGRESS", ownerIncarnation: await liveControlOwnerIncarnation(state.participants, actor.id), data: { fakeWorkerReleasePath: releasePath } }, client.hostId);
-      await waitFor(() => participant()?.status === "running" && participant()?.actorRun !== undefined);
+      await waitFor(() => participant()?.status === "running" && participant()?.actorRun !== undefined &&
+        participant()?.actorHealth?.state === "healthy");
       const running = participant()!;
       expect(await provider.invoke("actorStatus", { id: actor.id }, context)).toMatchObject({
         status: "running", queued: 0, inFlightRun: { id: running.actorRun!.id }, lastRunId: baseline.lastRunId,
+        health: { state: "healthy", lastProgressAt: expect.any(Number) },
+      });
+      expect(await provider.invoke("actorHealth", { id: actor.id }, context)).toEqual({
+        state: "healthy", lastProgressAt: expect.any(Number),
       });
       expect(await provider.invoke("actors", {}, context)).toContainEqual(expect.objectContaining({
         id: actor.id, status: "running", queued: 0, inFlightRun: expect.objectContaining({ id: running.actorRun!.id }),

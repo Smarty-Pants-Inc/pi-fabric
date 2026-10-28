@@ -633,6 +633,35 @@ describe("guest agents surface", () => {
     expect(read.errors).toEqual([]);
   });
 
+  it.each([false, true])("types actor health and owner-published participant health (fullCodeMode=%s)", fullCodeMode => {
+    const read = typeCheckFabricCode(
+      `const health: FabricActorHealth = await agents.actorHealth({ id: "actor-1" });
+       const state: FabricActorHealth["state"] = health.state;
+       const progress: number | null = health.lastProgressAt;
+       const actor = await agents.actorStatus({ id: "actor-1" });
+       const actorHealth: FabricActorInfo["health"] = actor.health;
+       const omitted: Pick<FabricActorInfo, "health"> = {};
+       const participant = (await agents.members({ kinds: ["actor"] }))[0];
+       const publishedHealth: FabricActorHealth | undefined = participant?.actorHealth;
+       return { state, progress, actorHealth, omitted, publishedHealth };`,
+      guestTypeDeclarations(fullCodeMode), true,
+    );
+    expect(read.errors).toEqual([]);
+  });
+
+  it("bridges actorHealth through the direct QuickJS agents facade", async () => {
+    const calls: Array<{ ref: string; args: unknown }> = [];
+    const health = { state: "healthy", lastProgressAt: 123_456 } as const;
+    const result = await new QuickJsRuntime().execute(
+      'return await agents.actorHealth({ id: "actor-health-probe" });',
+      async (ref, args) => { calls.push({ ref, args }); return health; },
+      { timeoutMs: 5_000, memoryLimitBytes: 32 * 1024 * 1024 },
+    );
+    expect(result.terminationReason).toBe("completed");
+    expect(result.value).toEqual(health);
+    expect(calls).toEqual([{ ref: "agents.actorHealth", args: { id: "actor-health-probe" } }]);
+  });
+
   it("types sender notices on steer/followUp and mesh publish receipts", () => {
     const read = typeCheckFabricCode(
       `const steer: string | undefined = (await agents.steer({ id: "main", message: "head abc1234" })).notice;

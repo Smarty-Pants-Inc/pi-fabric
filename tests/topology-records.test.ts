@@ -18,10 +18,12 @@ describe("actorParticipantRecord", () => {
     };
     const actor = {
       id: "actor:test", name: "test", status, runner: "pi", createdAt: 500, updatedAt: 3_000,
-      queued: 2, messages: 7, preparing,
+      queued: 2, messages: 7, preparing, health: { state: "healthy", lastProgressAt: 1_234 },
     } as FabricActorInfo;
     const record = actorParticipantRecord(actor, "root:test", "host:test", "identity:test", "root:test");
-    expect(record).toMatchObject({ status, actorQueued: 2, actorMessages: 7, actorPreparing: preparing });
+    expect(record).toMatchObject({ status, actorQueued: 2, actorMessages: 7, actorPreparing: preparing,
+      actorHealth: { state: "healthy", lastProgressAt: 1_234 } });
+    expect(record.actorHealth).not.toBe(actor.health);
     expect(record).not.toHaveProperty("actorRun");
   });
 });

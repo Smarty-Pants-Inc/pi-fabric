@@ -22,6 +22,7 @@ import { normalizeActorRecords } from "../actors/records.js";
 import type {
   FabricActorDelivery,
   FabricActorHostEvent,
+  FabricActorHealth,
   FabricActorInfo,
   FabricActorReadInfo,
   FabricActorSelfReadInfo,
@@ -138,6 +139,64 @@ export { collectAgentToolPreviewNodes, type AgentToolPreviewTreeOptions } from "
 const modelResolutionMetadata = (selection: { model?: unknown; via?: unknown }): { selectedModel?: string; via?: string } =>
   typeof selection.model === "string" && typeof selection.via === "string"
     ? { selectedModel: selection.model, via: selection.via } : {};
+
+/** Compact, detached public health: never forward owner-private diagnostics or legacy extras. */
+const actorHealthSnapshot = (health: FabricActorHealth | undefined): FabricActorHealth => {
+  if (!health || (health.state !== "healthy" && health.state !== "stale" && health.state !== "unknown") ||
+      (health.lastProgressAt !== null && (typeof health.lastProgressAt !== "number" ||
+        !Number.isFinite(health.lastProgressAt) || health.lastProgressAt < 0))) {
+    return { state: "unknown", lastProgressAt: null };
+  }
+  return { state: health.state, lastProgressAt: health.lastProgressAt };
+};
+
+/** Only absence/availability refusals are health-unknown; ambiguous/configuration bugs still throw. */
+const actorHealthUnavailable = (error: unknown): boolean => {
+  const seen = new Set<Error>();
+  for (let depth = 0; depth < 8; depth++) {
+    if (!(error instanceof Error) || seen.has(error)) return false;
+    seen.add(error);
+    // Read RPC expiry/availability can be wrapped by the resident outcome fence.
+    // Do not descend arbitrary programming/configuration errors' causes.
+    if (error instanceof ResidentOutcomeUnknownError) {
+      if (error.operation !== "actorStatus") return false;
+      error = error.cause;
+      continue;
+    }
+    switch ((error as Error & { code?: string }).code) {
+      // resolveActorTargetFresh -> directory/presence and routing-lease recovery.
+      case "FABRIC_PARTICIPANT_STALE":
+      case "FABRIC_PEER_LEASE_STALE":
+      case "FABRIC_PARTICIPANT_NOT_YET_MIRRORED":
+      case "FABRIC_ROUTE_AUTHORITY_CHANGED":
+      case "FABRIC_BRIDGE_STALE":
+      case "FABRIC_BRIDGE_MIRROR_PENDING":
+      case "FABRIC_BRIDGE_STALE_INCARNATION":
+      case "FABRIC_DIRECTORY_UNAVAILABLE":
+      case "FABRIC_DIRECTORY_NOT_READY":
+      case "FABRIC_TRANSPORT_UNAVAILABLE":
+      case "FABRIC_TRANSPORT_UNCERTAIN":
+      case "FABRIC_MESH_LOCK_TIMEOUT":
+      case "FABRIC_MESH_INCARNATION_PENDING":
+      case "FABRIC_MESH_SNAPSHOT_RETRIES_EXHAUSTED":
+      case "FABRIC_HOST_LEASE_LOST":
+      case "FABRIC_HOST_LEASE_SUPERSEDED":
+      case "FABRIC_HOST_LEASE_CONTESTED":
+      case "FABRIC_HOST_LEASE_LEGACY_BUSY":
+      // The existing resident status RPC, not a new health transport.
+      case "RESIDENT_COMMAND_UNSUPPORTED":
+      case "RESIDENT_REQUEST_EXPIRED":
+        return true;
+    }
+    return /^Unknown Fabric (?:actor|participant):/.test(error.message) ||
+      error.message === "Root resident host is not live" ||
+      error.message === "Root resident host exited during actor request" ||
+      error.message === "Fabric resident host exited while processing a request" ||
+      /^Timed out waiting for resident host actor response \(actorStatus\)/.test(error.message) ||
+      /^Timed out waiting for Fabric residency request .+ \(actorStatus\)/.test(error.message);
+  }
+  return false;
+};
 
 const REMOTE_ASK_ACK_GRACE_MS = 30_000;
 const MAX_ACTIVITY_CWD_CHARS = 240;
@@ -1614,34 +1673,20 @@ export class AgentsProvider implements FabricProvider {
         });
         return result;
       }
-      case "actorStatus": {
-        const id = String(args.id);
-        const ownActor = actorActivationIdentityFromEnvironment();
-        // Older in-process managers can select a newer worker/extension without
-        // supplying the activation tuple. Absence keeps the pre-tuple read path;
-        // a present but malformed tuple must still fail closed.
-        if (process.env[FABRIC_ACTOR_SELF_ENV] !== undefined) {
-          if (!ownActor) throw new Error("Fabric actor activation identity is unavailable");
-          if (id !== ownActor.actorId) throw new Error(`Unknown Fabric actor: ${id}`);
-          return await this.#ownActorStatus(ownActor, context.signal);
-        }
-        await this.actorManager.reconcileSessionOrphans();
-        let actor: FabricActorInfo | undefined;
+      case "actorStatus":
+        return this.#readActorStatus(String(args.id), context.signal);
+      case "actorHealth": {
+        context.signal?.throwIfAborted();
         try {
-          actor = this.actorManager.status(id);
+          const read = () => this.#readActorHealth(String(args.id));
+          const health = this.participants.observe ? this.participants.observe(read) : read();
+          context.signal?.throwIfAborted();
+          return health;
         } catch (error) {
-          if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
+          context.signal?.throwIfAborted();
+          if (!actorHealthUnavailable(error)) throw error;
+          return actorHealthSnapshot(undefined);
         }
-        if (actor && (actor.sessionOrphan && actor.status === "stopped" || this.actorManager.owns(actor.id))) return actor;
-        // A retained definition is not a fresh execution snapshot. Recover its
-        // exact owner before a resident query or the synchronous live overlay.
-        await this.#resolveActorTarget(actor?.id ?? id, context.signal);
-        // Query a live root owner for authoritative bindings; otherwise keep the
-        // fresh participant overlay (including unknown when execution is unavailable).
-        const resident = this.#liveResidentActorClient() ? await this.#residentActorOwner(id, context.signal) : undefined;
-        return resident
-          ? resident.client.actorStatus(resident.id, context.signal)
-          : this.#actorWithLiveState(actor ?? this.actorManager.status(id));
       }
       case "instructions": {
         const actor = this.actorManager.status(String(args.id));
@@ -1662,7 +1707,7 @@ export class AgentsProvider implements FabricProvider {
         if (!resident) return local;
         const authoritative = await resident.actors(context.signal);
         const byId = new Map(local.map((actor) => [actor.id, actor]));
-        for (const actor of authoritative) byId.set(actor.id, actor);
+        for (const actor of authoritative) byId.set(actor.id, { ...actor, health: this.#ownerActorHealth(actor) });
         return [...byId.values()];
       }
       case "messages": {
@@ -2218,6 +2263,73 @@ export class AgentsProvider implements FabricProvider {
     }
   }
 
+  /** No status/owns calls, routing recovery, refresh/publication, or resident RPC writes. */
+  #readActorHealth(id: string): FabricActorHealth {
+    const ownActor = actorActivationIdentityFromEnvironment();
+    if (process.env[FABRIC_ACTOR_SELF_ENV] !== undefined) {
+      if (!ownActor) throw new Error("Fabric actor activation identity is unavailable");
+      if (id !== ownActor.actorId) throw new Error(`Unknown Fabric actor: ${id}`);
+    }
+    const candidates = ownActor ? [] : this.actorManager.readHealth(id);
+    const exact = candidates.find(actor => actor.id === id);
+    const current = candidates.length > 1 ? candidates.filter(actor => !actor.removing) : candidates;
+    if (!exact && candidates.length > 1 && current.length !== 1) throw new Error(`Ambiguous Fabric actor: ${id}`);
+    const actor = exact ?? current[0];
+    if (actor?.health) return actorHealthSnapshot(actor.health);
+
+    // Fresh owner publications are sufficient for foreign execution health.
+    // Missing evidence is unknown; do not repair/recover an owner to answer a read.
+    let owner = this.participants.get(actor?.id ?? id, undefined, { fresh: true });
+    if (!actor && !owner) {
+      const matches = this.participants.list({ kinds: ["actor"], fresh: true })
+        .filter(participant => participant.id.startsWith(id) || participant.name === id);
+      if (matches.length > 1) throw new Error(`Ambiguous Fabric actor: ${id}`);
+      owner = matches[0];
+    }
+    const matchesActivation = !ownActor || (owner?.rootId === ownActor.rootId && owner.name === ownActor.name &&
+      owner.actorOwnershipToken === ownActor.ownershipToken);
+    return actorHealthSnapshot(owner && matchesActivation && !owner.stale && !owner.bridgeStale && owner.kind === "actor" &&
+      owner.controlProtocol !== "legacy" ? owner.actorHealth : undefined);
+  }
+
+  /** Status retains its existing orphan maintenance; health uses a separate observational path. */
+  async #readActorStatus(id: string, signal?: AbortSignal): Promise<FabricActorReadInfo | FabricActorSelfReadInfo> {
+    signal?.throwIfAborted();
+    const ownActor = actorActivationIdentityFromEnvironment();
+    // Older launchers omit the tuple; a present but malformed tuple fails closed.
+    if (process.env[FABRIC_ACTOR_SELF_ENV] !== undefined) {
+      if (!ownActor) throw new Error("Fabric actor activation identity is unavailable");
+      if (id !== ownActor.actorId) throw new Error(`Unknown Fabric actor: ${id}`);
+      return this.#ownActorStatus(ownActor, signal);
+    }
+    await this.actorManager.reconcileSessionOrphans();
+    let actor: FabricActorInfo | undefined;
+    try {
+      actor = this.actorManager.status(id);
+    } catch (error) {
+      if (!(error instanceof Error && /Unknown Fabric actor/.test(error.message))) throw error;
+    }
+    if (actor && (actor.sessionOrphan && actor.status === "stopped" || this.actorManager.owns(actor.id))) {
+      return this.#actorWithLiveState(actor);
+    }
+    // Retained definitions are not fresh execution snapshots. Recover the exact
+    // owner before the existing resident query or the synchronous live overlay.
+    await this.#resolveActorTarget(actor?.id ?? id, signal);
+    const resident = this.#liveResidentActorClient() ? await this.#residentActorOwner(id, signal) : undefined;
+    if (!resident) return this.#actorWithLiveState(actor ?? this.actorManager.status(id));
+    const status = await resident.client.actorStatus(resident.id, signal);
+    signal?.throwIfAborted();
+    return { ...status, health: this.#ownerActorHealth(status) };
+  }
+
+  /** Recheck the lease after an awaited owner RPC; a reply cannot extend its lease. */
+  #ownerActorHealth(actor: Pick<FabricActorReadInfo, "id" | "health">): FabricActorHealth {
+    if (this.actorManager.owns(actor.id)) return actorHealthSnapshot(actor.health);
+    const live = this.participants.get(actor.id, undefined, { fresh: true });
+    return actorHealthSnapshot(live && !live.stale && live.kind === "actor" && live.controlProtocol !== "legacy"
+      ? actor.health : undefined);
+  }
+
   async #ownActorStatus(
     identity: FabricActorActivationIdentity,
     signal?: AbortSignal,
@@ -2231,11 +2343,12 @@ export class AgentsProvider implements FabricProvider {
         const status = await resident.client.actorStatus(resident.id, signal);
         if (status.id === identity.actorId && status.name === identity.name && status.rootId === identity.rootId &&
             status.ownershipToken === identity.ownershipToken && status.instructionsDigest === identity.instructionsDigest) {
-          return { ...status, ...(identity.roleStamp ? { roleStamp: identity.roleStamp } : {}) };
+          return { ...status, health: this.#ownerActorHealth(status), ...(identity.roleStamp ? { roleStamp: identity.roleStamp } : {}) };
         }
       }
-    } catch {
+    } catch (error) {
       signal?.throwIfAborted();
+      if (!actorHealthUnavailable(error)) throw error;
       // The immutable activation tuple is sufficient when the owner is offline.
     }
     signal?.throwIfAborted();
@@ -2247,6 +2360,7 @@ export class AgentsProvider implements FabricProvider {
       instructionsDigest: identity.instructionsDigest,
       ...(identity.roleStamp ? { roleStamp: identity.roleStamp } : {}),
       status: "unknown",
+      health: actorHealthSnapshot(undefined),
     };
   }
 
@@ -2258,13 +2372,15 @@ export class AgentsProvider implements FabricProvider {
   #actorWithLiveState(actor: FabricActorInfo): FabricActorReadInfo {
     // A fenced terminal root-gone decision outranks stale owner advertisements and
     // must remain inspectable without entering routing lease grace/recovery.
-    if (actor.status === "stopped" && actor.sessionOrphan) return actor;
-    if (this.actorManager.owns(actor.id)) return actor;
+    if (actor.status === "stopped" && actor.sessionOrphan) return { ...actor, health: actorHealthSnapshot(undefined) };
+    if (this.actorManager.owns(actor.id)) return { ...actor, health: actorHealthSnapshot(actor.health) };
     const live = this.participants.get(actor.id, undefined, { fresh: true });
     // Strip passive counts and runs even when an older owner omits its live counters.
     // In particular, an idle owner without actorRun must clear a registry's stale run.
-    const { queued: _queued, messages: _messages, preparing: _preparing, inFlightRun: _run, ...definition } = actor;
-    if (!live || live.stale || live.kind !== "actor") return { ...definition, status: actor.status === "dormant" ? "dormant" : "unknown" };
+    const { queued: _queued, messages: _messages, preparing: _preparing, inFlightRun: _run, health: _health, ...definition } = actor;
+    if (!live || live.stale || live.kind !== "actor") return {
+      ...definition, status: actor.status === "dormant" ? "dormant" : "unknown", health: actorHealthSnapshot(undefined),
+    };
     const now = Date.now();
     const removal = live.actorRemoval ?? actor.removal;
     const run = live.actorRun;
@@ -2276,6 +2392,8 @@ export class AgentsProvider implements FabricProvider {
     return {
       ...definition,
       status,
+      // Foreign health is owner-published evidence, never the passive registry's snapshot.
+      health: actorHealthSnapshot(live.controlProtocol === "legacy" ? undefined : live.actorHealth),
       ...(live.actorQueued !== undefined ? { queued: live.actorQueued } : {}),
       ...(live.actorMessages !== undefined ? { messages: live.actorMessages } : {}),
       ...(live.actorPreparing

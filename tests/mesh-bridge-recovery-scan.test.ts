@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { performance } from "node:perf_hooks";
+import { syncBuiltinESMExports } from "node:module";
 import { afterEach, expect, it, vi } from "vitest";
 import { MeshBridge, RemoteBridgeSide, StoreBridgeSide, serveBridgeAgent } from "../src/mesh/bridge.js";
 import { MESH_ARCHIVE_CONFIG, archiveFileName } from "../src/mesh/archive.js";
@@ -27,6 +28,7 @@ const fixture = (count: number, days: number) => {
   const from = { id: "fixture-writer", name: "writer", kind: "main" as const };
   let last!: MeshEvent;
   const expected: string[] = [];
+  let archiveBytes = 0;
   for (let day = 0, index = 0; day < days; day++) {
     const directory = path.join(archive, "2026", "01", String(day + 1).padStart(2, "0"));
     fs.mkdirSync(directory, { recursive: true });
@@ -48,7 +50,9 @@ const fixture = (count: number, days: number) => {
     const files: Record<string, unknown> = {};
     for (const [topic, rows] of topics) {
       const name = archiveFileName(topic);
-      fs.writeFileSync(path.join(directory, name), rows.map(row => JSON.stringify(row) + "\n").join(""));
+      const text = rows.map(row => JSON.stringify(row) + "\n").join("");
+      archiveBytes += Buffer.byteLength(text);
+      fs.writeFileSync(path.join(directory, name), text);
       files[name] = { lines: rows.length, firstSequence: rows[0]!.sequence, lastSequence: rows.at(-1)!.sequence, sha256: "fixture" };
     }
     fs.writeFileSync(path.join(directory, "SEAL.json"), JSON.stringify({ files }));
@@ -57,25 +61,76 @@ const fixture = (count: number, days: number) => {
   fs.writeFileSync(path.join(root, "events.jsonl"), JSON.stringify(last) + "\n");
   fs.writeFileSync(path.join(root, "sequence"), String(last.sequence));
   fs.writeFileSync(path.join(root, MESH_ARCHIVE_CONFIG), JSON.stringify({ version: 1, dir: archive }));
-  return { store: new MeshStore(root, 64 * 1024, 500), mark, head: last.sequence, expected };
+  return { store: new MeshStore(root, 64 * 1024, 500), mark, head: last.sequence, expected, archiveBytes };
+};
+
+// Count native bytes, not requested buffer sizes or logical event telemetry.
+// Avoid retaining mocks/results and keep async wrappers on their handles only:
+// closed handles are not retained by the meter.
+const archiveReadMeter = (root: string) => {
+  const archive = path.join(root, "history") + path.sep;
+  const isArchive = (file: unknown) => typeof file === "string" && file.startsWith(archive) && file.endsWith(".jsonl");
+  const descriptors = new Set<number>();
+  const native = { readFileSync: fs.readFileSync, readSync: fs.readSync,
+    openSync: fs.openSync, closeSync: fs.closeSync, open: fs.promises.open };
+  let insideFullRead = false;
+  const meter = { archiveReads: 0, archiveReadBytes: 0, restore: () => {
+    fs.readFileSync = native.readFileSync;
+    fs.readSync = native.readSync;
+    fs.openSync = native.openSync;
+    fs.closeSync = native.closeSync;
+    fs.promises.open = native.open;
+    syncBuiltinESMExports();
+  } };
+  const record = (bytes: number) => { meter.archiveReads++; meter.archiveReadBytes += bytes; };
+  fs.openSync = (...args) => {
+    const fd = native.openSync(...args);
+    if (isArchive(args[0])) descriptors.add(fd);
+    else descriptors.delete(fd);
+    return fd;
+  };
+  fs.closeSync = fd => { native.closeSync(fd); descriptors.delete(fd); };
+  fs.readSync = ((...args: Parameters<typeof fs.readSync>) => {
+    const bytes = native.readSync(...args);
+    if (!insideFullRead && descriptors.has(args[0])) record(bytes);
+    return bytes;
+  }) as typeof fs.readSync;
+  fs.readFileSync = ((...args: Parameters<typeof fs.readFileSync>) => {
+    const parent = insideFullRead;
+    insideFullRead = true;
+    try {
+      const result = native.readFileSync(...args);
+      // A full-file call may delegate to readSync: count only the outer call.
+      if (!parent && (isArchive(args[0]) || typeof args[0] === "number" && descriptors.has(args[0]))) {
+        record(Buffer.byteLength(result));
+      }
+      return result;
+    } finally { insideFullRead = parent; }
+  }) as typeof fs.readFileSync;
+  fs.promises.open = async (...args) => {
+    const handle = await native.open(...args);
+    if (isArchive(args[0])) {
+      const read = handle.read;
+      handle.read = (async (...readArgs: Parameters<typeof read>) => {
+        const result = await Reflect.apply(read, handle, readArgs) as Awaited<ReturnType<typeof read>>;
+        record(result.bytesRead);
+        return result;
+      }) as typeof handle.read;
+    }
+    return handle;
+  };
+  syncBuiltinESMExports();
+  return meter;
 };
 
 it("recovers 770k old-mark positions across archived days within startup and slice budgets", async () => {
   const f = fixture(770_000, 15);
-  const side = new StoreBridgeSide(f.store, "spoke");
-  let archiveReads = 0, archiveReadBytes = 0;
-  const readFile = fs.readFileSync;
-  vi.spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
-    const result = readFile(...args);
-    if (String(args[0]).startsWith(path.join(f.store.root, "history")) && String(args[0]).endsWith(".jsonl")) {
-      archiveReads++;
-      archiveReadBytes += Buffer.byteLength(result);
-    }
-    return result;
-  }) as typeof fs.readFileSync);
+  const meter = archiveReadMeter(f.store.root);
   const ids: string[] = [];
   let cursor = f.mark, pages = 0, turns = 0, maxSliceMs = 0;
-  let previous = performance.now(), finished = false;
+  let elapsedMs = 0;
+  const started = performance.now();
+  let previous = started, finished = false;
   // A check-phase heartbeat measures thread occupancy, not promise/microtask latency.
   const heartbeat = () => {
     const now = performance.now();
@@ -85,8 +140,8 @@ it("recovers 770k old-mark positions across archived days within startup and sli
     if (!finished) setImmediate(heartbeat);
   };
   setImmediate(heartbeat);
-  const started = performance.now();
   try {
+    const side = new StoreBridgeSide(f.store, "spoke");
     for (;;) {
       const page = await side.bridgedIds(cursor);
       pages++;
@@ -96,15 +151,25 @@ it("recovers 770k old-mark positions across archived days within startup and sli
       if (page.done) break;
     }
   } finally {
-    finished = true;
+    // Include the last synchronous interval even if EOF resolves in a microtask,
+    // then drain the already-queued heartbeat before recording or restoring IO.
     maxSliceMs = Math.max(maxSliceMs, performance.now() - previous);
+    finished = true;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    elapsedMs = performance.now() - started;
+    meter.restore();
   }
-  const elapsedMs = performance.now() - started;
-  console.log(JSON.stringify({ recoveryScale: { positions: 770_000, days: 15, pages, turns, archiveReads, archiveReadBytes, elapsedMs, maxSliceMs } }));
+  // A fixed allowance for bounded read-ahead/boundary probes, never per page.
+  // The fixture has 45 archive files; 10% generously exceeds 64 KiB per file.
+  const archiveReadBudgetBytes = Math.floor(f.archiveBytes * 1.10);
+  const { archiveReads, archiveReadBytes } = meter;
+  console.log(JSON.stringify({ recoveryScale: { positions: 770_000, days: 15, pages, turns, archiveReads, archiveReadBytes,
+    expectedArchiveBytes: f.archiveBytes, archiveReadBudgetBytes, elapsedMs, maxSliceMs } }));
   expect(cursor).toBe(f.head);
   expect(ids).toEqual(f.expected);
-  expect(maxSliceMs).toBeLessThan(1_000);
-  expect(elapsedMs).toBeLessThan(60_000);
+  expect.soft(archiveReadBytes).toBeLessThanOrEqual(archiveReadBudgetBytes);
+  expect.soft(maxSliceMs).toBeLessThan(250);
+  expect.soft(elapsedMs).toBeLessThanOrEqual(5_000);
   expect(turns).toBeGreaterThan(1);
 }, 300_000);
 

@@ -24,6 +24,7 @@ import { MeshLockQueueExpiredError, withInitialMeshLockAdmission, type InitialMe
 import { BridgeDeliveryAgeMonitor, type BridgeDeliveryAgeAlarm, type BridgeDrainPhase } from "./bridge-delivery-age.js";
 import { watchBridgeStore, type BridgeChange } from "./change-notifier.js";
 import { BRIDGE_BATCH_MAX_EVENTS } from "./event-log.js";
+import { RecoveryReadError, type RecoveryReader, type RecoveryReadCost } from "./recovery-reader.js";
 import { BridgeLegacyBaselineAlarmEpisode, supportsLegacyBaselineAlarm, type BridgeLegacyBaselineAlarm } from "./bridge-baseline-alarms.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "./control-idempotency.js";
 import { HUB_FACTORY_RECIPIENT, isAddressedHubFactoryEvent, isWorkTopic, parseWorkTopic } from "./bridge-topics.js";
@@ -913,8 +914,9 @@ export class StoreBridgeSide implements BridgeSide {
   #skippedRoots: ReadonlySet<string> | undefined;
   #leaseProcess: Promise<BridgeLeaseProcess | undefined> | undefined;
   readonly #reportedUnreadable = new Set<string>();
-  /** Logical event bytes inspected by the last recovery page, not archive I/O bytes. */
-  recoveryReadCost: { events: number; eventBytes: number; maxSliceMs: number } | undefined;
+  #recoveryReader: RecoveryReader | undefined;
+  /** Visible-position costs and actual native work for the last attempted recovery page, including failure. */
+  recoveryReadCost: RecoveryReadCost | undefined;
 
   constructor(
     readonly store: MeshStore,
@@ -2606,35 +2608,33 @@ export class StoreBridgeSide implements BridgeSide {
   async bridgedIds(after: number): Promise<BridgedIds> {
     this.recoveryReadCost = undefined;
     this.#ingressAbort.signal.throwIfAborted();
-    // Bound inspected events, not matching IDs. The wire/cursor shape stays protocol-2:
-    // even a page with no IDs advances through, and is not EOF until the head is covered.
-    const horizon = (await this.latestCursor()).through;
-    if (after >= horizon) return { ids: [], through: after, done: true };
-    await new Promise<void>(resolve => setImmediate(resolve));
-    this.#ingressAbort.signal.throwIfAborted();
-    const ids: string[] = [];
-    // Larger than a delivery frame to avoid reparsing an archive day once per 500
-    // events; still below the existing 50k matching-ID/wire cap even if ALL match.
-    const limit = Math.min(10_000, BRIDGED_IDS_PAGE);
-    const sliceStarted = monotonicClock.now();
-    const page = this.store.readRecovery(after, limit);
-    const prefix = `${RELAY_RECEIPT_PREFIX}${encodeURIComponent(this.peer)}:`;
-    for (const event of page) {
-      if (event.sequence > horizon) break;
-      const stamp = bridgeStampOf(event);
-      if ((stamp?.via ?? stamp?.from) === this.peer) ids.push(stamp!.id);
-      else if (isRelayReceipt(event)) {
-        const key = event.id.startsWith(prefix) ? event.id : event.dedupeKey;
-        if (key?.startsWith(prefix)) {
-          try { ids.push(decodeURIComponent(key.slice(prefix.length))); } catch { /* malformed receipt grants no recovery */ }
+    if (!this.#recoveryReader) {
+      const prefix = `${RELAY_RECEIPT_PREFIX}${encodeURIComponent(this.peer)}:`;
+      this.#recoveryReader = this.store.createRecoveryReader(event => {
+        const stamp = bridgeStampOf(event);
+        if ((stamp?.via ?? stamp?.from) === this.peer) return stamp!.id;
+        else if (isRelayReceipt(event)) {
+          const key = event.id.startsWith(prefix) ? event.id : event.dedupeKey;
+          if (key?.startsWith(prefix)) {
+            try { return decodeURIComponent(key.slice(prefix.length)); } catch { /* malformed receipt grants no recovery */ }
+          }
         }
-      }
+        return undefined;
+      }, this.#ingressAbort.signal);
     }
-    this.recoveryReadCost = { events: page.length,
-      eventBytes: page.reduce((bytes, event) => bytes + Buffer.byteLength(JSON.stringify(event)) + 1, 0),
-      maxSliceMs: monotonicClock.now() - sliceStarted };
-    const through = Math.min(horizon, page.at(-1)?.sequence ?? horizon);
-    return { ids, through, done: through >= horizon || page.length < limit };
+    try {
+      const page = await this.#recoveryReader.read(after);
+      // Retain completed work even if fencing wins this post-await publication boundary.
+      this.recoveryReadCost = page.cost;
+      this.#ingressAbort.signal.throwIfAborted();
+      return { ids: page.ids, through: page.through, done: page.done };
+    } catch (error) {
+      if (error instanceof RecoveryReadError) {
+        this.recoveryReadCost = error.cost;
+        throw error.cause; // Preserve the public error/abort reason, not the internal envelope.
+      }
+      throw error;
+    }
   }
 
 }
@@ -5579,7 +5579,8 @@ export class MeshBridge {
 
 const allBridgedIds = async (side: BridgeSide, after: number, check: () => void, log: (line: string) => void): Promise<Set<string>> => {
   const ids = new Set<string>();
-  let cursor = after, pages = 0, events = 0, eventBytes = 0, maxSliceMs = 0;
+  let cursor = after, pages = 0, attemptedPages = 0;
+  let totalCost: RecoveryReadCost | undefined;
   const started = monotonicClock.now();
   check();
   const horizon = (await (side.latestCursor?.() ?? side.latestSequence().then(through => ({ through })))).through;
@@ -5589,10 +5590,21 @@ const allBridgedIds = async (side: BridgeSide, after: number, check: () => void,
   try {
     for (;;) {
       check();
-      const page = await side.bridgedIds(cursor);
-      pages++;
-      const cost = side instanceof StoreBridgeSide ? side.recoveryReadCost : undefined;
-      if (cost) { events += cost.events; eventBytes += cost.eventBytes; maxSliceMs = Math.max(maxSliceMs, cost.maxSliceMs); }
+      let page: BridgedIds;
+      attemptedPages++;
+      try {
+        page = await side.bridgedIds(cursor);
+        pages++;
+      } finally {
+        // Count each attempt once, even when the reader or adapter rejects before a page exists.
+        const cost = side instanceof StoreBridgeSide ? side.recoveryReadCost : undefined;
+        if (cost) {
+          if (!totalCost) totalCost = { ...cost };
+          else for (const key of Object.keys(cost) as Array<keyof RecoveryReadCost>) {
+            totalCost[key] = key === "maxSliceMs" ? Math.max(totalCost[key], cost[key]) : totalCost[key] + cost[key];
+          }
+        }
+      }
       check();
       if (!page || !Array.isArray(page.ids) || !Number.isSafeInteger(page.through) || page.through < cursor) throw new Error("Bridge ids page is invalid");
       for (const id of page.ids) if (typeof id === "string") ids.add(id);
@@ -5604,10 +5616,20 @@ const allBridgedIds = async (side: BridgeSide, after: number, check: () => void,
       await new Promise<void>(resolve => setImmediate(resolve));
     }
   } finally {
+    // Preserve the legacy fields/order: inspectedEvents/eventBytes count popped positions,
+    // not eager frontier work. The appended parse/native counters make that distinction explicit.
     const cost = side instanceof StoreBridgeSide
-      ? `inspectedEvents=${events} eventBytes=${eventBytes} maxSliceMs=${Math.ceil(maxSliceMs)}`
+      ? `inspectedEvents=${totalCost?.events ?? 0} eventBytes=${totalCost?.eventBytes ?? 0} maxSliceMs=${Math.ceil(totalCost?.maxSliceMs ?? 0)}`
       : "inspectedEvents=unavailable eventBytes=unavailable maxSliceMs=unavailable";
-    log(`mark=${after} horizon=${horizon} pages=${pages} ${cost} matchingIds=${ids.size} elapsedMs=${Math.ceil(monotonicClock.now() - started)} completed=${completed} cancelled=${!completed}`);
+    const attemptedCost = side instanceof StoreBridgeSide
+      ? ` attemptedPages=${attemptedPages} poppedEvents=${totalCost?.events ?? 0}` +
+        ` parseAttempts=${(totalCost?.archiveParseAttempts ?? 0) + (totalCost?.liveParseAttempts ?? 0) + (totalCost?.probeParseAttempts ?? 0)} ` +
+        (["archiveReadBytes", "archiveReadCalls", "archiveParseAttempts", "liveReadBytes", "liveReadCalls", "liveParseAttempts",
+          "probeReadBytes", "probeReadCalls", "probeParseAttempts", "metadataReadBytes", "metadataReadCalls", "discoveryReadCalls",
+          "generationProbes", "horizonMs", "stages", "skippedRecords"] as const)
+          .map(key => `${key}=${totalCost?.[key] ?? 0}`).join(" ")
+      : ` attemptedPages=${attemptedPages}`;
+    log(`mark=${after} horizon=${horizon} pages=${pages} ${cost} matchingIds=${ids.size} elapsedMs=${Math.ceil(monotonicClock.now() - started)} completed=${completed} cancelled=${!completed}${attemptedCost}`);
   }
 };
 

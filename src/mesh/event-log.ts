@@ -11,6 +11,7 @@ import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChan
 import { consumeInitialMeshLockAdmission, withInitialMeshLockAcquisition, delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import type { LockTimingContext } from "./commit-stats.js";
 import { jsonClone } from "./state-file.js";
+import { RecoveryReader, type RecoveryHint } from "./recovery-reader.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import { prepareKeyedPublishNamespace, receiptDirectoryBarrier, type ReceiptNamespace, type KeyedPublishPrefix, type LiveNamespaceBarrier } from "./receipt-namespace.js";
 
@@ -1120,9 +1121,44 @@ export class EventLog {
     return this.#readPage(input);
   }
 
-  /** Recovery has its own inspected-event bound, independent of the small delivery frame. */
-  readRecovery(after: number, limit: number): MeshEvent[] {
-    return this.#readPage({ after }, Math.max(1, Math.min(Math.floor(limit), 10_000)));
+  /** Internal recovery ownership belongs to the calling bridge side, never normal delivery. */
+  createRecoveryReader(project: (event: MeshEvent) => string | undefined, signal: AbortSignal): RecoveryReader {
+    return new RecoveryReader({
+      root: this.root,
+      maxEventBytes: this.maxEventBytes,
+      horizon: () => {
+        const head = this.latestCursor();
+        // Lastless recovery is deliberately stricter than ordinary sequence reconciliation:
+        // only complete committed lines authorize archive visibility, never reservations.
+        return head.last?.sequence ?? this.#readCommittedSequence();
+      },
+      generation: () => this.#readGeneration(),
+      hint: (after, generation, inode) => {
+        const cached = this.#readHints;
+        if (cached?.generation !== generation || cached.inode !== inode) return undefined;
+        let boundary: RecoveryHint | undefined;
+        for (const hint of [...cached.lines, ...cached.anchors.values()]) {
+          if (hint.sequence <= after && (!boundary || hint.sequence > boundary.sequence)) boundary = hint;
+        }
+        // The asynchronous reader validates size, inode, generation and the ending byte.
+        return boundary;
+      },
+      remember: (after, generation, inode, scanned, boundary) => {
+        const cached = this.#readHints?.generation === generation && this.#readHints.inode === inode ? this.#readHints : undefined;
+        const anchors = cached?.anchors ?? new Map<number, RecoveryHint>();
+        if (boundary) {
+          anchors.delete(after);
+          anchors.set(after, boundary);
+          if (anchors.size > READ_HINT_LINES) anchors.delete(anchors.keys().next().value!);
+        }
+        if (!scanned.length && !boundary) return;
+        const lines = new Map((cached?.lines ?? []).map(hint => [hint.sequence, hint.offset]));
+        for (const hint of scanned) lines.set(hint.sequence, hint.offset);
+        this.#readHints = { generation, inode, anchors,
+          lines: [...lines].sort((left, right) => left[0] - right[0]).slice(-READ_HINT_LINES)
+            .map(([sequence, offset]) => ({ sequence, offset })) };
+      },
+    }, project, signal);
   }
 
   #readPage(input: EventReadInput, pageLimit?: number): MeshEvent[] {

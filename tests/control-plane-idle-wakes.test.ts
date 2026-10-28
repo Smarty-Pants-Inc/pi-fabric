@@ -81,7 +81,8 @@ describe("control plane idle wakes", () => {
     await vi.advanceTimersByTimeAsync(15 * minute - 1);
     expect(tail).toHaveBeenCalledTimes(startupReads);
     await vi.advanceTimersByTimeAsync(2);
-    expect(deletion).toHaveBeenCalledExactlyOnceWith({ identity: identity("host:owner"), ops: [
+    expect(deletion).toHaveBeenCalledExactlyOnceWith({ identity: identity("host:owner"),
+      lockTiming: { operation: "control-legacy-seen-cleanup" }, ops: [
       { kind: "delete", key: "topology/control-seen/expired", ifVersion: 1, onConflict: "skip" },
     ] }); // the other retained claim is still inside its grace
     await owner.close();

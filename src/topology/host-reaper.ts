@@ -241,6 +241,7 @@ export const reapDeadHostRecords = async (
   try {
     results = await targetGates(() => fenced(() => mesh.writeBatch({
       identity,
+      lockTiming: { operation: "host-reap" },
       fileRead: { read: () => fileLeases(mesh),
         stamp: () => typeof root === "string" ? meshDirectoryStamp(root, "host-leases") : "", retries: 1 },
       ops: dead.map(({ entry, hostId }) => ({

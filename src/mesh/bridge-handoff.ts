@@ -263,6 +263,7 @@ export const handOffNativeIdentity = async (store: MeshStore, request: BridgeHan
   const handoffKey = keyFor(BRIDGE_HANDOFF_PREFIX, id);
   await store.writeBatch({
     identity: commandIdentity(hostname),
+    lockTiming: { operation: "bridge-handoff-grant" },
     ops: [],
     // Judged again on the commit's own snapshot, so a native that came back since is never retired.
     prepare: (view) => {
@@ -298,6 +299,7 @@ export const revokeHandoff = async (store: MeshStore, session: string, hostname 
   let removed: unknown;
   await store.writeBatch({
     identity: commandIdentity(hostname),
+    lockTiming: { operation: "bridge-handoff-revoke" },
     ops: [],
     prepare: (view) => {
       const entry = view.get(key);

@@ -149,6 +149,46 @@ describe("NATS carrier bounded lapse recovery", () => {
     expect(again.termed).toHaveLength(1);
   });
 
+  it.each([1, 2])("clamps +20 s broker skew to the local first-seen deadline (attempt %i)", async attempt => {
+    const f = await fixture(); f.lapse();
+    const d = await f.deliver("broker-ahead", 1, f.initial + 20_000, attempt);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(f.saved()[0]!.startedAt).toBe(f.initial);
+    f.advance(WINDOW - 1);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(d.termed).toEqual([]);
+    f.advance(1); await expect(f.link.remote.read(0)).resolves.toMatchObject({ events: [] });
+    expect(d.termed).toHaveLength(1); expect(d.acked).toBe(0);
+    expect(f.now() - f.initial).toBe(WINDOW);
+  });
+
+  it.each([1, 2])("uses the earlier broker bound for -20 s skew (attempt %i)", async attempt => {
+    const f = await fixture(); f.lapse();
+    const d = await f.deliver("broker-behind", 1, f.initial - 20_000, attempt);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(f.saved()[0]!.startedAt).toBe(f.initial - 20_000);
+    // min(local first-seen, broker publish) + 30 s is local first-seen + 10 s.
+    f.advance(9_999);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(d.termed).toEqual([]);
+    f.advance(1); await expect(f.link.remote.read(0)).resolves.toMatchObject({ events: [] });
+    expect(d.termed).toHaveLength(1); expect(d.acked).toBe(0);
+    expect(f.now()).toBe(f.initial - 20_000 + WINDOW);
+  });
+
+  it("uses local first-seen when a lapsed redelivery has no broker timestamp", async () => {
+    const f = await fixture(); f.lapse();
+    const d = await f.deliver("no-broker-time", 1, f.initial, 2);
+    Reflect.deleteProperty(d, "publishedAt");
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(f.saved()[0]!.startedAt).toBe(f.initial);
+    f.advance(WINDOW - 1);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(d.termed).toEqual([]);
+    f.advance(1); await expect(f.link.remote.read(0)).resolves.toMatchObject({ events: [] });
+    expect(d.termed).toHaveLength(1); expect(d.acked).toBe(0);
+  });
+
   it.each(["before-write", "after-rename"])("retains the same first timestamp after a %s failure", async mode => {
     const f = await fixture(); f.lapse(); const d = await f.deliver("write-failure", 1);
     const realWrite = atomic.writeJsonAtomic, realSync = fs.fsyncSync;

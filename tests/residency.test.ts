@@ -1,4 +1,5 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as cleanupCustody from "../src/agents/worktree-manager.js";
 import { diagnostics } from "../src/core/diagnostics.js";
 import { hasUnresolvedWorker, markUnresolvedWorker } from "../src/storage/retention.js";
@@ -97,14 +98,33 @@ const observeCleanupCustody = () => {
   });
   return { moves, restore: () => observer.mockRestore() };
 };
-const expectHeldSources = (moves: cleanupCustody.CleanupRootCustody[], sources: Array<{ source: string; stat: fs.Stats; file: string; bytes: Buffer }>) => {
+const sameCustodySource = (actual: string, expected: string, platform = process.platform): boolean =>
+  platform === "win32" ? path.win32.resolve(actual).toLowerCase() === path.win32.resolve(expected).toLowerCase()
+    : path.resolve(actual) === path.resolve(expected);
+const expectHeldSources = (moves: cleanupCustody.CleanupRootCustody[], sources: Array<{ source: string; stat: fs.Stats; file: string; bytes: Buffer }>, id: string) => {
   for (const { source, stat, file, bytes } of sources) {
-    const move = moves.find(row => row.source === source); expect(move, source).toBeDefined();
-    expect(JSON.parse(fs.readFileSync(move!.receipt, "utf8"))).toMatchObject({ source, destination: move!.destination, state: "moved", reason: expect.any(String), time: expect.any(Number) });
+    const move = moves.find(row => sameCustodySource(row.source, source)); expect(move, source).toBeDefined();
+    const receipt = JSON.parse(fs.readFileSync(move!.receipt, "utf8"));
+    // Keep the actual Git spelling bound to the real receipt; normalize ONLY the
+    // fixture/source comparison, never destination, identity or payload evidence.
+    expect(receipt).toMatchObject({ source: move!.source, destination: move!.destination, state: "moved", id, reason: expect.any(String), time: expect.any(Number) });
+    expect(sameCustodySource(receipt.source, source)).toBe(true);
+    const prepared = JSON.parse(fs.readFileSync(path.join(path.dirname(move!.receipt), "custody.prepared.json"), "utf8"));
+    expect(prepared).toMatchObject({ source: move!.source, destination: move!.destination, id: receipt.id, reason: receipt.reason, state: "prepared" });
+    expect(prepared.time).toBeGreaterThan(0); expect(prepared.time).toBeLessThanOrEqual(receipt.time);
     expect(fs.statSync(move!.destination)).toMatchObject({ dev: stat.dev, ino: stat.ino });
     expect(fs.readFileSync(path.join(move!.destination, path.relative(source, file)))).toEqual(bytes);
   }
 };
+describe("custody source path comparison contract (not native Windows proof)", () => {
+  it("accepts Git Windows slash aliases but rejects wrong drive/path and POSIX case aliases", () => {
+    expect(sameCustodySource("D:/fixture/worktrees/agent", "D:\\fixture\\worktrees\\agent", "win32")).toBe(true);
+    expect(sameCustodySource("E:/fixture/worktrees/agent", "D:\\fixture\\worktrees\\agent", "win32")).toBe(false);
+    expect(sameCustodySource("D:/fixture/worktrees/other", "D:\\fixture\\worktrees\\agent", "win32")).toBe(false);
+    expect(sameCustodySource("/fixture/Agent", "/fixture/agent", "linux")).toBe(false);
+    expect(sameCustodySource("/fixture/other", "/fixture/agent", "linux")).toBe(false);
+  });
+});
 const worktreeBranches = (repository: string): string[] =>
   git(repository, "worktree", "list", "--porcelain")
     .split("\n")
@@ -351,6 +371,27 @@ afterEach(async () => {
     }
     // A host that could not be stopped may still write: keep its root (the failure below names it).
     if (stopFailed) continue;
+    // Preserve exact native-fixture bytes BEFORE this suite's ordinary teardown.
+    // Export is only a copy; in-test stat assertions establish object identity.
+    const evidence = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
+    if (evidence) {
+      const inventory = (base: string) => {
+        const rows: Array<{ relative: string; sha256: string }> = [];
+        const walk = (relative: string): void => {
+          const file = path.join(base, relative), stat = fs.lstatSync(file);
+          if (stat.isSymbolicLink() || (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1))) throw new Error(`Unsafe resident fixture export: ${file}`);
+          if (stat.isDirectory()) for (const name of fs.readdirSync(file).sort()) walk(path.join(relative, name));
+          else rows.push({ relative, sha256: createHash("sha256").update(fs.readFileSync(file)).digest("hex") });
+        };
+        walk(""); return rows;
+      };
+      fs.mkdirSync(evidence, { recursive: true });
+      const before = inventory(root), destination = path.join(evidence, path.basename(root));
+      if (process.platform === "win32") fs.cpSync(root, destination, { recursive: true });
+      else execFileSync("cp", ["-a", "--", root, destination]);
+      expect(inventory(root)).toEqual(before); expect(inventory(destination)).toEqual(before);
+      fs.writeFileSync(path.join(evidence, `${path.basename(root)}-export.json`), JSON.stringify({ source: root, destination, entries: before, method: "pre-teardown copy, no inode claim" }));
+    }
     // A host that already removed owner.json (idle exit) may still be finishing its last mesh
     // writes: retry ENOTEMPTY briefly instead of failing the suite on a loaded runner.
     fs.rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
@@ -1642,7 +1683,7 @@ describe("durable completion receipts", () => {
         try {
           expect(await invoke()).toEqual({ cleaned: true });
           for (const { source } of sources) expect(fs.existsSync(source)).toBe(false);
-          expectHeldSources(custody.moves, sources);
+          expectHeldSources(custody.moves, sources, seeded.id);
           expect(worktreeBranches(source)).toContain(branch);
           expect(git(source, "branch", "--list", branch)).toContain(branch);
           expect(warning.mock.calls.flat().join(" ")).toContain("deferred");
@@ -3377,7 +3418,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       const custody = observeCleanupCustody(); const warning = vi.spyOn(diagnostics, "warn");
       try {
         await expect(client.cleanupAgent(id, true)).resolves.toEqual({ cleaned: true });
-        expectHeldSources(custody.moves, sources);
+        expectHeldSources(custody.moves, sources, id);
         expect(worktreeBranches(source)).toContain(branch);
         expect(git(source, "branch", "--list", branch)).toContain(branch);
         expect(fs.existsSync(runDirectory)).toBe(false);

@@ -1,10 +1,11 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
+import * as worktreeCustody from "../src/agents/worktree-manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { spawnDetached } from "../src/agents/transports/process-utils.js";
 import type { AgentTransportHandle, AgentTransportLaunch } from "../src/agents/types.js";
@@ -19,12 +20,71 @@ const hostPlatform = process.platform;
 
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
-  return { ...actual, spawn: vi.fn(actual.spawn) };
+  return { ...actual, spawn: vi.fn(actual.spawn), execFileSync: vi.fn(actual.execFileSync) };
 });
 
 const roots: string[] = [];
+const movedRoots = new Set<string>();
+const securityContainers: string[] = [];
+const rawExports: Array<{ receipt: string; before: unknown[] }> = [];
+let stressPhases: { started: number; loopFinished?: number; closeFinished?: number } | undefined;
+const inventory = (root: string): unknown[] => {
+  const rows: unknown[] = [];
+  const walk = (relative: string): void => {
+    const file = path.join(root, relative), stat = fs.lstatSync(file, { bigint: true });
+    expect(stat.isSymbolicLink()).toBe(false);
+    expect(stat.isDirectory() || stat.isFile()).toBe(true);
+    rows.push({ relative, dev: String(stat.dev), ino: String(stat.ino), directory: stat.isDirectory(),
+      ...(stat.isFile() ? { bytes: fs.readFileSync(file).toString("base64") } : {}) });
+    if (stat.isDirectory()) for (const name of fs.readdirSync(file).sort()) walk(path.join(relative, name));
+  };
+  walk(""); return rows;
+};
+const observeCustody = (): void => {
+  movedRoots.clear(); securityContainers.length = 0; rawExports.length = 0; stressPhases = undefined;
+  const retain = worktreeCustody.retainCleanupRoot;
+  vi.spyOn(worktreeCustody, "retainCleanupRoot").mockImplementation((source, ...args) => {
+    const before = inventory(source), moved = retain(source, ...args);
+    expect(moved).toBeDefined();
+    expect(inventory(moved!.destination)).toEqual(before);
+    const prepared = JSON.parse(fs.readFileSync(path.join(path.dirname(moved!.receipt), "custody.prepared.json"), "utf8"));
+    expect(prepared).toMatchObject({ id: args[1], source, destination: moved!.destination, state: "prepared" });
+    expect(JSON.parse(fs.readFileSync(moved!.receipt, "utf8"))).toMatchObject({ ...prepared, time: expect.any(Number), state: "moved" });
+    movedRoots.add(source);
+    rawExports.push({ receipt: moved!.receipt, before });
+    return moved;
+  });
+};
+const recordSecuritySubprocess = async (): Promise<void> => {
+  if (hostPlatform !== "win32") vi.stubEnv("SystemRoot", "C:\\Windows");
+  const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  vi.mocked(execFileSync).mockImplementation(((file: string, args: string[], options: any) => {
+    const container = options?.env?.PI_FABRIC_CLEANUP_CONTAINER;
+    if (!container) return actual.execFileSync(file, args, options);
+    expect(path.win32.basename(file)).toBe("powershell.exe");
+    expect(Buffer.from(args[4]!, "base64").toString("utf16le")).toContain("Get-Acl -LiteralPath $directory");
+    expect(fs.realpathSync(container)).toBe(container);
+    securityContainers.push(container);
+    return Buffer.alloc(0); // Recorded contract boundary; NEVER native DACL certification.
+  }) as typeof execFileSync);
+};
 afterEach(() => {
-  vi.useRealTimers(); vi.restoreAllMocks();
+  // Evidence COPY is not part of the 20s admission/eviction contract. Export
+  // after the native checks, but BEFORE fixture teardown, including failed runs.
+  const stage = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
+  if (stage) {
+    fs.mkdirSync(stage, { recursive: true });
+    for (const { receipt, before } of rawExports.splice(0)) {
+      const out = fs.mkdtempSync(path.join(stage, "stop-contract-"));
+      fs.cpSync(path.dirname(receipt), path.join(out, "container"), { recursive: true, dereference: false });
+      fs.writeFileSync(path.join(out, "native-inventory.json"), JSON.stringify(before));
+    }
+    if (stressPhases) {
+      const out = fs.mkdtempSync(path.join(stage, "stop-phases-"));
+      fs.writeFileSync(path.join(out, "phase-timings.json"), JSON.stringify(stressPhases));
+    }
+  }
+  vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllEnvs();
   vi.mocked(spawn).mockReset();
   delete privateDirTestHooks.platform;
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
@@ -99,6 +159,14 @@ describe.skipIf(process.platform !== "linux")("absent native worker stop fence",
 // Inject only the parent's product branch. These are deterministic contract
 // probes, not native Windows process-tree certification.
 describe.each(["linux", "win32"] as const)("merge stop custody (%s)", platform => {
+  beforeEach(async context => {
+    observeCustody();
+    // Fake-OS probes and the 1005-handle stress contract record ONLY the ACL
+    // subprocess. Real filesystem rename and receipt/object proofs stay active.
+    if (platform !== hostPlatform || context.task.name === "releases confirmed custom process admission and evicts settled handles") {
+      await recordSecuritySubprocess();
+    }
+  });
   it.each([false, true])("does not publish unchecked terminal success or release custody (close hook=%s)", async closeHook => {
     vi.useFakeTimers(); vi.spyOn(process, "platform", "get").mockReturnValue(platform);
     let gone = false;
@@ -159,14 +227,24 @@ describe.each(["linux", "win32"] as const)("merge stop custody (%s)", platform =
     });
     const manager = setup();
     let first: string | undefined;
+    let firstRoot: string | undefined;
+    let firstInventory: unknown[] | undefined;
+    stressPhases = { started: performance.now() };
     try {
       for (let index = 0; index < 1_005; index++) {
         const result = await manager.run({ task: `eviction pressure ${index}` });
-        first ??= result.id;
+        if (!first) {
+          first = result.id; firstRoot = manager.runDirectory(first)!;
+          firstInventory = inventory(firstRoot);
+        }
         expect(result.status).toBe("completed");
       }
-      expect(manager.runDirectory(first!), "confirmed execution can really release and prune on either platform").toBeUndefined();
-    } finally { await manager.close(); }
+      expect(manager.runDirectory(first!), "checked dead execution may evict a handle, never its raw root").toBeUndefined();
+      stressPhases.loopFinished = performance.now();
+    } finally { await manager.close(); stressPhases.closeFinished = performance.now(); }
+    expect(inventory(firstRoot!)).toEqual(firstInventory);
+    expect(movedRoots.size, "all 1000 retained handles require whole-root prepared+moved receipts").toBe(1_000);
+    expect(securityContainers.length).toBe(platform === "win32" ? 1_000 : 0);
   }, 20_000);
 
   it("retains a failed release observation after execution was already confirmed", async () => {

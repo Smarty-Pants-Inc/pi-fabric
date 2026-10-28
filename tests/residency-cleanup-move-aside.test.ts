@@ -148,7 +148,9 @@ afterEach(async () => {
   vi.restoreAllMocks();
   for (const { root, client, participants } of fixtures.splice(0)) {
     await client.close(); await participants.close();
-    const evidence = process.env.PI_FABRIC_CUSTODY_EVIDENCE_DIR;
+    // The command owner stages exports inside the authentic inherited private TMPDIR
+    // and copies/readbacks them before ordinary wrapper cleanup. Production selectors are scrubbed.
+    const evidence = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
     if (evidence) {
       fs.mkdirSync(evidence, { recursive: true }); const destination = path.join(evidence, path.basename(root));
       if (process.platform === "win32") fs.cpSync(root, destination, { recursive: true });

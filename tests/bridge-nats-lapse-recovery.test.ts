@@ -98,15 +98,21 @@ describe("NATS carrier bounded lapse recovery", () => {
     expect(again.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
   });
 
-  it("keeps legacy untagged v1 target waits on their original unpaused 30 s deadline", async () => {
+  it.each([WINDOW, 5_000])("keeps legacy untagged v1 waits on their original unpaused %i ms deadline", async budgetMs => {
     const f = await fixture(); f.port.routes.delete(fileLead.id);
     await f.deliver("legacy-target", 1);
     await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
     const entry = JSON.parse(fs.readFileSync(f.lapsePath, "utf8")).lapses[0];
     delete entry.separate; delete entry.target; delete entry.senderStartedAt;
+    entry.budgetMs = budgetMs;
     fs.writeFileSync(f.lapsePath, JSON.stringify({ v: 1, lapses: [entry] }));
-    f.advance(WINDOW); await f.restart();
+    f.advance(budgetMs - 1); await f.restart(); f.port.routes.delete(fileLead.id);
     const again = await f.deliver("legacy-target", 1, f.initial, 2);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    const retained = JSON.parse(fs.readFileSync(f.lapsePath, "utf8")).lapses[0];
+    expect(retained.startedAt).toBe(entry.startedAt); expect(retained.budgetMs).toBe(budgetMs);
+    expect(retained.target).toBeUndefined(); expect(again.termed).toEqual([]);
+    f.advance(1);
     await f.link.remote.read(0); expect(again.termed).toHaveLength(1); expect(f.ledger.records.size).toBe(0);
   });
 
@@ -179,6 +185,21 @@ describe("NATS carrier bounded lapse recovery", () => {
     await f.restart(); f.port.routes.delete(fileLead.id);
     const again = await f.deliver("overflow-target", 3, published, 2);
     await f.link.remote.read(0); expect(again.termed).toHaveLength(1); expect(f.saved()).toHaveLength(2);
+  });
+
+  it("does not rewrite sender-only retention for changing remaining-authority diagnostics", async () => {
+    const f = await fixture(); f.lapse();
+    const expired = f.port.routes.get(natsLead.id)!;
+    f.port.routes.set(natsLead.id, { ...expired, presenceFailure: "expired", remainingAuthorityMs: -100 });
+    const d = await f.deliver("sender-diagnostic-churn", 1);
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    const saved = fs.readFileSync(f.lapsePath, "utf8");
+    f.port.routes.set(natsLead.id, { ...expired, presenceFailure: "expired", remainingAuthorityMs: -200 });
+    await expect(f.link.remote.read(0)).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    expect(fs.readFileSync(f.lapsePath, "utf8")).toBe(saved);
+    f.advance(WINDOW); await f.link.remote.read(0);
+    expect(d.termed).toHaveLength(1);
+    expect(fs.readFileSync(f.lapsePath, "utf8")).toContain("remainingAuthorityMs=-200");
   });
 
   it("an earlier real sender lapse still expires at 30 s after the reason changes to target lag", async () => {

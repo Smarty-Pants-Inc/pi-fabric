@@ -351,6 +351,31 @@ describe("NatsCarrierSide under MeshBridge", () => {
     expect(f.logs.filter(line => line.includes("projection-lag") && /refused|dropped/.test(line))).toEqual([]);
   });
 
+  it("imports an already-real carrier sender deadline before considering own projection retention", async () => {
+    let time = NOW;
+    vi.spyOn(Date, "now").mockImplementation(() => time);
+    const f = await fixture({ now: () => time });
+    const sender = f.port.routes.get(natsLead.id)!;
+    f.port.routes.set(natsLead.id, { ...sender, route: { ...sender.route, live: false }, leaseLapsed: true });
+    const d = f.port.deliver(natsAsk("carrier-to-append"), POD_MACHINE, 1); await settle();
+    await expect(f.link.bridge.step()).rejects.toBeInstanceOf(NatsCarrierDeferredError);
+    const first = JSON.parse(fs.readFileSync(path.join(f.root, "cursor.json.sender-lease-lapse"), "utf8")).lapses[0].senderStartedAt;
+    expect(first).toBe(NOW);
+    time += 20_000; f.port.routes.set(natsLead.id, sender); await f.link.bridge.syncPresence();
+    const publish = f.link.local.publish.bind(f.link.local);
+    vi.spyOn(f.link.local, "publish").mockImplementation(async (...args) => {
+      writeHostLease(f.store.root, { ...readHostLease(f.store.root, natsLead.id)!, expiresAt: time - 1 });
+      return publish(...args);
+    });
+    expect(await f.link.bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
+    expect(JSON.parse(fs.readFileSync(path.join(f.root, "cursor.json"), "utf8")).toLocal.leaseLapse.startedAt).toBe(first);
+    expect(d.acked).toBe(0); expect(d.termed).toEqual([]);
+    time += 10_000;
+    expect(await f.link.bridge.step()).toMatchObject({ toLocal: 0, dropped: 1 });
+    expect(f.events("fabric.control.command")).toEqual([]);
+    expect(d.acked).toBe(1); // Existing permanent append-fence refusal advances/ACKs only at the original bound.
+  });
+
   it("rechecks the immutable cap under the append fence after a lock wait crosses it", async () => {
     let time = NOW;
     vi.spyOn(Date, "now").mockImplementation(() => time);

@@ -4361,7 +4361,7 @@ export class MeshBridge {
     // A real sender/legacy append deadline, once retained, is never enlarged by projection lag.
     const existingDeadline = this.#leaseLapseAt(direction, event);
     if (existingDeadline !== undefined && Date.now() >= existingDeadline) return false;
-    if (lapsed && this.options.remote.deferOwnMirror) {
+    if (lapsed && this.options.remote.retainLeaseLapse?.(event) === undefined && this.options.remote.deferOwnMirror) {
       const retained = await this.options.remote.deferOwnMirror(event);
       if (retained !== undefined) return retained;
     }

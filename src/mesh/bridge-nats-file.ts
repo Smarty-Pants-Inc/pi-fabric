@@ -891,7 +891,15 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     targetKind?: TargetWait["kind"]): number {
     const held = this.#inHand.get(delivery.streamSequence)!;
     const saved = held.lapse ?? this.#savedLapse(delivery);
-    if (saved) held.lapse = { ...saved, ...context };
+    if (saved) held.lapse = { ...saved, ...context,
+      ...(!saved.separate ? { budgetMs: Math.min(saved.budgetMs ?? LEASE_LAPSE_DEFER_MS, context.budgetMs ?? LEASE_LAPSE_DEFER_MS) } : {}) };
+    if (saved && !targetKind && (!saved.separate || saved.senderStartedAt !== undefined)) {
+      // Sender-only retries have no new accounting. Keep diagnostic churn in memory as before;
+      // a terminal decision persists its latest reason, but a changing remainingAuthorityMs
+      // must not add a durable write per retry or rewrite an existing sender boundary.
+      this.#saveSenderLapses();
+      return saved.senderStartedAt ?? saved.startedAt;
+    }
     const now = this.#now();
     // Only a proven WAIT/append lapse enters here. Never age out the healthy path.
     // Broker time may shorten, never extend, the local first-seen window. Clamp a

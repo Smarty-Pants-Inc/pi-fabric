@@ -1,4 +1,5 @@
 import type { ProviderOperations, ProviderOperation } from "./provider-operations.js";
+import type { CertifiedDispatchPolicy } from "../effects/extension.js";
 import { snapshotFabricInvocation } from "../fabric-provenance.js";
 import { AgentSpawnForbiddenError } from "../agents/spawn-authority.js";
 import { retainResidentProcessWork } from "../residency/process-work.js";
@@ -309,6 +310,7 @@ export class ActionRegistry {
   readonly #shutdown = new AbortController();
   readonly #views = new WeakMap<FabricCommittedCapabilityView, { controller: AbortController; signal: AbortSignal; authority: CapabilityAuthority }>();
   #operations: Promise<ProviderOperations> | undefined;
+  #certifiedDispatchPolicy: CertifiedDispatchPolicy | undefined;
   readonly #providerBindings = new FabricProviderBindings();
   readonly #activeEffects = new Map<string, { ref: string; effect: FabricActionEffect }>();
   readonly #unavailable = new Map<string, string>();
@@ -319,6 +321,13 @@ export class ActionRegistry {
 
   constructor(readonly toolResultProxy?: FabricNestedToolResultProxy) {
     this.#providerBindings.subscribe(() => this.#speculation?.reset?.());
+  }
+
+  /** Only host composition binds this policy; model arguments cannot opt out. */
+  setCertifiedDispatchPolicy(policy: CertifiedDispatchPolicy | undefined): void {
+    if (this.#certifiedDispatchPolicy === policy) return;
+    this.#certifiedDispatchPolicy = policy;
+    this.#speculation?.reset?.();
   }
 
   /** Native mesh composition opts in; hosted registries never inspect ambient session APIs. */
@@ -340,6 +349,7 @@ export class ActionRegistry {
   }
 
   #allowsSpeculation(action: ResolvedFabricAction): boolean {
+    if (this.#certifiedDispatchPolicy) return false;
     const localRead = action.risk === "read" && action.effect?.kind === "none";
     // MCP keeps its conservative network/effect classification. Only the live
     // eligibility callback can attest an allowlisted read; explicit unsafe
@@ -814,6 +824,7 @@ export class ActionRegistry {
       if (!provider.acquire) {
         throw new Error(`Fabric provider does not implement scoped acquisition: ${provider.name}`);
       }
+      await this.#assertCertifiedDispatch({ ref: action.ref, mode: "acquire", args, context, provider });
       // Supervised callers may supply the same policy hooks as invoke. Base
       // contexts remain supported; their host owns authorization/approval.
       if (context.authorize) {
@@ -907,6 +918,7 @@ export class ActionRegistry {
       traceOperation?.resolved(action.provider, action.name);
 
       failureStage = "guard";
+      await this.#assertCertifiedDispatch({ ref: action.ref, mode: "invoke", args, context, provider });
       if (action.effect?.kind === "scoped") {
         throw new FabricTraceSafeError(
           `Fabric scoped action ${ref} requires a supervised acquisition context`,
@@ -1258,7 +1270,7 @@ export class ActionRegistry {
       }
     | undefined
   > {
-    if (!this.#speculationEligibility) return undefined;
+    if (this.#certifiedDispatchPolicy || !this.#speculationEligibility) return undefined;
     try {
       context = this.#scopeContext(context);
       args = snapshotArguments(args);
@@ -1609,10 +1621,26 @@ export class ActionRegistry {
     return { ...context, signal: shareCancellationEffects(AbortSignal.any([this.#providerBindings.signal(binding.id), ...(context.signal ? [context.signal] : [])]), context.signal) };
   }
 
+  async #assertCertifiedDispatch(request: Parameters<CertifiedDispatchPolicy["assertDispatch"]>[0]): Promise<void> {
+    // Rebinding while an async check runs must pass the successor policy too.
+    for (;;) {
+      const policy = this.#certifiedDispatchPolicy;
+      if (!policy) return;
+      await policy.assertDispatch({ ...request, args: snapshotArguments(request.args) });
+      if (policy !== this.#certifiedDispatchPolicy) continue;
+      if (request.mode === "speculate" || request.mode === "replay") {
+        throw new Error("Certified dispatch disables speculation and speculative replay");
+      }
+      return;
+    }
+  }
+
   async #preparePlanned(binding: FabricProviderBinding, actionName: string, authority: { ref: string; descriptor: string }, mode: ProviderOperation["mode"], args: Record<string, unknown>, context: FabricInvocationContext, replayValue?: unknown, adopt?: ProviderOperation["adopt"]): Promise<(signal?: AbortSignal) => Promise<unknown>> {
     const payload = snapshotArguments(args);
     this.#operations ??= import("./provider-operations.js").then(({ ProviderOperations }) => new ProviderOperations(this.#providerBindings));
     return (await this.#operations).prepare({ binding, action: actionName, ...authority, mode, args: payload, context, replayValue, ...(adopt ? { adopt } : {}),
+      // Look up host authority at execution, never capture it in the ticket.
+      assertDispatch: request => this.#assertCertifiedDispatch(request),
       observe: async observedContext => {
         const descriptor = await binding.provider.describe(actionName, observedContext);
         if (!descriptor) return { ref: "", descriptor: "" };

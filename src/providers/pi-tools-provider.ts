@@ -17,7 +17,8 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { parseGitWorktreeAdd, tryExecuteGitWorktreeAdd } from "../agents/bash-worktree-add.js";
-import { runAbortable, throwIfAborted } from "../async-settlement.js";
+import { runAbortable, throwIfAborted, throwIfExecutionExpired } from "../async-settlement.js";
+import type { CertifiedToolDispatcher } from "../effects/extension.js";
 import { trackResidentProcessWork } from "../residency/process-work.js";
 import { CapturedToolCatalog } from "../capture/catalog.js";
 import { readFabricBashMiddleware } from "../core/shell-middleware.js";
@@ -300,6 +301,7 @@ export class PiToolsProvider implements FabricProvider {
   readonly #getLandlockSettings: (() => LandlockSettings) | undefined;
   readonly #getPowerShellPolicy: (() => FabricPowerShellPolicy) | undefined;
   #landlock: LandlockBashConfinement | undefined;
+  #certifiedToolDispatcher: CertifiedToolDispatcher | undefined;
 
   constructor(
     cwd: string,
@@ -331,6 +333,12 @@ export class PiToolsProvider implements FabricProvider {
     this.#getShellHangMs = hostCapabilities.getShellHangMs;
     this.#getLandlockSettings = hostCapabilities.getLandlockSettings;
     this.#getPowerShellPolicy = hostCapabilities.getPowerShellPolicy;
+  }
+
+  /** Host composition shares the same adapters with both Pi and captured refs. */
+  setCertifiedToolDispatcher(dispatcher: CertifiedToolDispatcher | undefined): void {
+    this.#certifiedToolDispatcher = dispatcher;
+    this.#capturedTools?.setCertifiedToolDispatcher(dispatcher);
   }
 
   get shellJobs(): FabricShellJobStore {
@@ -384,6 +392,9 @@ export class PiToolsProvider implements FabricProvider {
 
   prepareArguments(actionName: string, args: Record<string, unknown>): Record<string, unknown> {
     this.#assertAllowed(actionName);
+    // The certified shell has an exact {command} grammar. Ordinary Pi shell
+    // preparation adds cwd/defaults and must not erase unsupported caller flags.
+    if (this.#certifiedToolDispatcher && isPiShellToolName(actionName)) return structuredClone(args);
     const middleware = this.#bashMiddleware(actionName);
     const definition = (middleware ? undefined : this.#catalog?.get(actionName)?.definition) ?? this.#tools[actionName as PiCoreToolName];
     const properties = (definition?.parameters as { properties?: Record<string, unknown> } | undefined)?.properties ?? {};
@@ -455,6 +466,7 @@ export class PiToolsProvider implements FabricProvider {
   }
 
   #assertAllowed(name: string): void {
+    this.#certifiedToolDispatcher?.assertTool(name, this.#catalog?.get(name)?.definition);
     if (this.#requireCapturedOverrides && (!PI_CORE_TOOL_NAMES.includes(name as PiCoreToolName) || !this.#catalog?.get(name))) {
       throw new Error(`Managed Pi tool requires an authorized captured override: ${name}`);
     }
@@ -493,7 +505,7 @@ export class PiToolsProvider implements FabricProvider {
   }
 
   #bashMiddleware(name: string) {
-    if (name !== "bash" || this.#requireCapturedOverrides) return undefined;
+    if (this.#certifiedToolDispatcher || name !== "bash" || this.#requireCapturedOverrides) return undefined;
     return readFabricBashMiddleware(this.#catalog?.get(name)?.definition);
   }
 
@@ -576,6 +588,20 @@ export class PiToolsProvider implements FabricProvider {
     onUpdate: (partialResult: PiToolResult) => void,
     middleware: FabricBashMiddlewareV1 | undefined,
   ): Promise<PiToolResult> {
+    // Hooks have finished. Never run a stock mutation and receipt it afterward;
+    // the shared adapter owns the entire effect, including certified shells.
+    const dispatcher = this.#certifiedToolDispatcher;
+    if (dispatcher) {
+      dispatcher.assertTool(name, this.#catalog?.get(name)?.definition);
+      const finalArgs = structuredClone(args);
+      const invalid = validationMessage(this.#descriptor(name, tool).inputSchema, finalArgs);
+      if (invalid) throw new Error(`Invalid final arguments for pi.${name}: ${invalid}`);
+      throwIfExecutionExpired(context);
+      return runAbortable(context.signal, () =>
+        trackResidentProcessWork(context.extensionContext.sessionManager?.getSessionId?.(), () =>
+          dispatcher.execute(name, context.nestedToolCallId, finalArgs, context)),
+      );
+    }
     if (!isPiShellToolName(name) || this.#requireCapturedOverrides) {
       return await runAbortable(context.signal, () =>
         trackResidentProcessWork(context.extensionContext.sessionManager?.getSessionId?.(), () => tool.execute(
@@ -720,6 +746,7 @@ export class PiToolsProvider implements FabricProvider {
     let preflightEmitted = false;
     if (
       name === "bash" &&
+      !this.#certifiedToolDispatcher &&
       !this.#landlockEnabled() &&
       !this.#requireCapturedOverrides &&
       !this.#catalog?.get(name) &&
@@ -735,16 +762,19 @@ export class PiToolsProvider implements FabricProvider {
         await this.#emitToolCallPreflight(name, args, context, runner);
         preflightEmitted = true;
       }
-      const intercepted = await tryExecuteGitWorktreeAdd(args, this.#cwd);
-      if (intercepted) {
-        this.#attachPreview(name, intercepted, args, context);
-        return this.#normalizeResult(name, intercepted, args, context);
+      // A hook can bind the certified profile while preflight is awaited.
+      if (!this.#certifiedToolDispatcher) {
+        const intercepted = await tryExecuteGitWorktreeAdd(args, this.#cwd);
+        if (intercepted) {
+          this.#attachPreview(name, intercepted, args, context);
+          return this.#normalizeResult(name, intercepted, args, context);
+        }
       }
       // Parsed but not intercepted (e.g. outside a git repo): fall through to a
       // normal execution. The preflight already fired, so downstream must not
       // emit it again and re-apply any argument mutation.
     }
-    if (name === "bash" && this.#landlockEnabled()
+    if (!this.#certifiedToolDispatcher && name === "bash" && this.#landlockEnabled()
       && (this.#requireCapturedOverrides || (this.#catalog?.get(name) && !middleware))) {
       throw new Error("Landlock enforce requires standard local bash or cooperative middleware; refusing an unconfined opaque/managed override");
     }
@@ -756,7 +786,8 @@ export class PiToolsProvider implements FabricProvider {
       if (isPiShellToolName(name) && args.durable === true) throw new Error("Durable shell tasks are unavailable for opaque shell overrides; a Fabric-compatible middleware adapter is required");
       if (isPiShellToolName(name) && args.notify !== undefined) throw new Error("notify requires durable:true");
       // `durable` is Fabric's own argument; an override never sees it.
-      const { durable: _durable, ...overrideArgs } = args;
+      const { durable: _durable, ...ordinaryOverrideArgs } = args;
+      const overrideArgs = this.#certifiedToolDispatcher ? args : ordinaryOverrideArgs;
       // CapturedToolsProvider runs every shell call through preflightShellCall,
       // including the bash-guard view of an opted-in powershell override.
       const value = await this.#capturedTools!.invoke(name, overrideArgs, context);
@@ -804,7 +835,7 @@ export class PiToolsProvider implements FabricProvider {
     context: FabricInvocationContext,
     runner: ExtensionRunner,
   ): Promise<void> {
-    const input = isPiShellToolName(name)
+    const input = isPiShellToolName(name) && !this.#certifiedToolDispatcher
       ? await preflightShellCall({
           name,
           args,
@@ -830,18 +861,20 @@ export class PiToolsProvider implements FabricProvider {
     context: FabricInvocationContext,
     runner: ExtensionRunner,
   ): Promise<Record<string, unknown>> {
-    const input: Record<string, unknown> = { ...args };
-    const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
-      type: "tool_call",
-      toolName: name,
-      toolCallId: context.nestedToolCallId,
-      input,
-    }));
+    const certified = this.#certifiedToolDispatcher !== undefined;
+    const input: Record<string, unknown> = certified ? structuredClone(args) : { ...args };
+    if (certified && isPiShellToolName(name)) {
+      // The existing run-defaults hook defers into this host-only holder.
+      // Never apply it: the certified adapter owns argv, cwd and timeout.
+      Object.defineProperty(input, Symbol.for("pi-fabric.bash-defaults.deferred"), { value: {} });
+    }
+    const event = { type: "tool_call" as const, toolName: name, toolCallId: context.nestedToolCallId, input };
+    const preflight = await runAbortable(context.signal, () => runner.emitToolCall(event));
     if (preflight?.block) {
       context.updateArguments?.(args);
       throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
     }
-    return input;
+    return this.#certifiedToolDispatcher ? event.input : input;
   }
 
   // Replay the agent-core tool-execution lifecycle for a nested pi.* call, so
@@ -871,10 +904,12 @@ export class PiToolsProvider implements FabricProvider {
     let result: PiToolResult;
     let isError = false;
     let thrown: unknown;
+    let executingDispatcher: CertifiedToolDispatcher | undefined;
     let executionStarted = false;
     let updateTail: Promise<void> = Promise.resolve();
     try {
       if (!preflightEmitted) await this.#emitToolCallPreflight(name, args, context, runner);
+      executingDispatcher = this.#certifiedToolDispatcher;
       executionStarted = true;
       result = await this.#runExecute(
         name,
@@ -939,6 +974,8 @@ export class PiToolsProvider implements FabricProvider {
       isError = patch.isError ?? isError;
     }
 
+    const certifiedError = executingDispatcher?.projectError?.(thrown, textContent(result.content));
+    if (certifiedError) isError = true;
     result = { ...result, isError };
 
     // Capture the read's clean text note AFTER the patch — the handoff strips
@@ -954,6 +991,7 @@ export class PiToolsProvider implements FabricProvider {
       isError,
     }));
 
+    if (certifiedError) throw certifiedError;
     if (isError && !(context.nativeToolResult && tool.outputSchema && result.structuredContent !== undefined)) {
       if (isPiShellToolName(name)) {
         throw piBashResultError(thrown, textContent(result.content));

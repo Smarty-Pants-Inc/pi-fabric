@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { throwIfAborted, throwIfExecutionExpired, settleWithin, shareCancellationEffects } from "../async-settlement.js";
 import { providerTake, providerRevoke, type ProviderTicket, type StateText } from "../verified/generated/provider-kernel.js";
 import type { FabricInvocationContext, FabricScopedProviderResult } from "../protocol.js";
+import type { CertifiedDispatchPolicy } from "../effects/extension.js";
 import type { FabricProviderBinding, FabricProviderBindings } from "./provider-bindings.js";
 
 const encode = (text: string): StateText => {
@@ -27,6 +28,8 @@ export interface ProviderOperation {
   args: Record<string, unknown>;
   context: FabricInvocationContext;
   replayValue?: unknown;
+  /** Host-owned, live lookup at execution, never authority captured in a ticket. */
+  assertDispatch?: CertifiedDispatchPolicy["assertDispatch"];
   /** Synchronously transfer disposal to a trusted owner inverse stack. */
   adopt?: (dispose: () => Promise<void>) => void;
   observe(context: FabricInvocationContext): Promise<{ ref: string; descriptor: string }>;
@@ -74,6 +77,9 @@ export class ProviderOperations {
         if (target.slice(0, separator) !== binding.name || action !== input.action) {
           throw new Error("Provider descriptor changed the requested action");
         }
+        // Even replay consumes current host dispatch authority. A prepared ticket
+        // must not retain permission from before the certified profile was bound.
+        await input.assertDispatch?.({ ref, mode, args: structuredClone(args), context, provider: binding.provider });
         // Preparation, descriptor observation and plan decoding may be synchronous.
         // The timer's signal alone cannot prevent new effects after their overrun.
         if (mode === "replay") { throwIfExecutionExpired(context); return replay; }

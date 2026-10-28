@@ -1,3 +1,5 @@
+import type { ContextEvent } from "@earendil-works/pi-coding-agent";
+
 /** Host-owned contracts for the bounded, retained-volume effect profile.
  * None of these capabilities or slot selectors belong in model arguments. */
 export type JsonValue = null | boolean | number | string | readonly JsonValue[] | { readonly [key: string]: JsonValue };
@@ -115,6 +117,9 @@ export interface EffectIntent {
   readonly canonicalTarget: string;
   readonly file?: PreparedFileEffect;
   readonly message?: PreparedPeerEffect;
+  /** Adapter-owned immutable preparation (fixed argv, file identity/size etc.).
+   * Sink validates it against canonical target/args/payload and the bound roots. */
+  readonly adapterData?: JsonValue;
   readonly originAttempt: EffectAttemptIdentity;
 }
 
@@ -175,8 +180,10 @@ export interface SettledEffect {
 }
 export interface SettlePendingIntentsResult {
   readonly settled: SettledEffect[];
-  readonly uncertain: boolean;
+  readonly uncertain: number;
 }
+export type EffectToolResult = Extract<ContextEvent["messages"][number], { role: "toolResult" }>;
+export type ReadToolResult = (effect: SettledEffect) => Promise<EffectToolResult>;
 export type SettlePendingIntents = (sessionId: string, recoveryGeneration: string) => Promise<SettlePendingIntentsResult>;
 
 export interface EffectRepair {

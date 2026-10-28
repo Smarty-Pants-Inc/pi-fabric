@@ -314,12 +314,18 @@ B6 never opens/scans/appends/fsyncs Pi files or calls back into Pi persistence.
 On restart the legitimate native writer recovers its full append domain and
 re-emits flush-qualified descriptors; B6 recovers its own committed log/index.
 
-These are **types, documentation and API fixtures only**. There is no B6 store
-implementation, native append feed/flush implementation or adapter activation here.
-Durability is deliberately **not wired into `SessionRecoveryAdapters` composition**
-in this phase. Successful REQUIRED open/recovery, native integration, physical
-power-off, cross-host recovery and the 120-second target remain unqualified;
-the test fakes establish none of those durability guarantees.
+The opt-in [`pi-fabric/recovery` evidence store](recovery-evidence.md) implements
+this B6 port with an append-only disk journal, exact copied entry bindings and
+file/namespace durability barriers. Its filesystem tests cover REQUIRED recovery,
+failed fsync, immutable conflicts and a process exit after the committed append but
+before caller acknowledgement. The host must supply trusted native provenance;
+B6 never reads or writes a Pi backing file.
+
+There is still **no native append feed/flush implementation or adapter activation**
+in this package. Durability is deliberately **not wired into
+`SessionRecoveryAdapters` composition** in this phase. The native Pi ACK/effect path,
+physical power-off, cross-host recovery and the 120-second target remain
+unqualified. Filesystem fixtures do not establish those live guarantees.
 
 The inspected Pi 1.2.0 runtime does not expose an atomic, fail-closed startup
 recovery transaction/fence handoff. Cold startup has no `session_ready`; replacement

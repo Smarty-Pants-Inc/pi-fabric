@@ -108,7 +108,7 @@ describe("published build artifact guards", () => {
     fs.rmSync(path.join(dir, "dist/ui/image-overlays.js"));
     rejected(dir, "ui/image-overlays.js");
   });
-  it.each(["native-discovery.js", "memory/extractive-history.js", "durable/worker.js", "durable/worker-host.js"])("requires stable optional entry %s", (entry) => {
+  it.each(["native-discovery.js", "memory/extractive-history.js", "durable/worker.js", "durable/worker-host.js", "recovery.js"])("requires stable optional entry %s", (entry) => {
     const dir = fixture();
     fs.rmSync(path.join(dir, "dist", entry));
     rejected(dir, entry);

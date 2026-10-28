@@ -86,10 +86,16 @@ adoption and owner-incarnation/depth-growth dedupe remain outside this increment
 
 A file backup preserves actor definitions, queues and history, not live processes
 or kernel locks. On Linux, the original Main's normal startup reconciles its
-runtime generation even when the restored owner is dead. Existing durable-work
-recovery starts the launcher; the host loads the original registry and publishes
-its actor source before reporting readiness. It does not create replacement
-actors or treat a copied `owner.json` as evidence of a live host.
+runtime generation even when the restored owner is dead. Main initialization
+awaits own-root durable-work recovery and usable ask/control publication in its
+own participant directory before the first ordinary `agents.ask`. Recovery and
+publication share the existing bounded host-start budget, including retries of
+a retained predecessor's NATS lease conflict. The host loads the original registry;
+retained quiescing presence or the same resident host ID does not prove that a
+replacement incarnation has published. Empty/dormant roots stay lazy, intentional
+idle exits stay stopped, and genuine live owners are attached to normally. Recovery
+does not create replacement actors or treat a copied `owner.json` as evidence of
+a live host.
 
 Copying `host.lock` changes its device/inode identity. While holding both startup
 locks, recovery can rebind a valid prior `host-fence.json` to that copied inode

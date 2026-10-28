@@ -10,6 +10,11 @@ import { describe, expect, it, vi } from "vitest";
 import { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { normalizeFabricConfig, type FabricConfig } from "../src/config.js";
 import { FabricRuntimeState } from "../src/fabric-runtime-state.js";
+import { MeshStore } from "../src/mesh/store.js";
+import { openFabricTransport } from "../src/transport/index.js";
+import type { FabricTransport } from "../src/transport/types.js";
+import { leaseValue, presenceValue } from "../src/topology/participant-view.js";
+import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
 import { mainGenerationPath, type ResidentMainGeneration } from "../src/residency/handover.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { residentRoot, type ResidentHostOwner } from "../src/residency/protocol.js";
@@ -57,7 +62,9 @@ async function main(root: string, config: FabricConfig) {
     cwd: root, signal: AbortSignal.timeout(45_000), parentToolCallId: "l8-restore", nestedToolCallId: ref, extensionContext: context,
     update() {}, approve: async () => {}, audits: [], maxResultChars: 50_000,
   });
+  const initializeStartedAt = performance.now();
   await runtime.initialize(context, config);
+  console.log("L8_MAIN_STARTUP_MS", JSON.stringify({ elapsedMs: performance.now() - initializeStartedAt }));
   return { runtime, invoke };
 }
 
@@ -75,6 +82,8 @@ describe.skipIf(!binary || process.platform !== "linux")("checkpoint/erase/resto
     vi.stubEnv("PI_FABRIC_PI_BINARY", path.join(repository, "node_modules/@earendil-works/pi-coding-agent/dist/cli.js"));
     for (const [name, value] of Object.entries(launches.env)) vi.stubEnv(name, value);
     let broker: PathBHarness | undefined;
+    let inspector: FabricTransport | undefined;
+    let inspectorMesh: MeshStore | undefined;
     let first: Awaited<ReturnType<typeof main>> | undefined;
     let restored: Awaited<ReturnType<typeof main>> | undefined;
     try {
@@ -118,6 +127,23 @@ faux.setResponses([fauxAssistantMessage(${JSON.stringify(ack)})]); pi.registerPr
       const resident = residentRoot(meshRoot, rootId);
       const ownerPath = path.join(resident, "owner.json");
       const oldOwner = read<ResidentHostOwner>(ownerPath);
+      // Inspect the real authenticated KV rows, not Main's passive projection.
+      // This transport never starts a participant directory or claims a host lease.
+      inspectorMesh = new MeshStore(path.join(root, "inspector-mesh"), 65_536, 1_000);
+      inspector = await openFabricTransport({ config: config.mesh, hostId: "l8-restore-inspector", mesh: inspectorMesh });
+      const kvKey = (kind: "p" | "h", id: string) =>
+        `${inspector!.self.machine}.${kind}.${createHash("sha256").update(id).digest("hex").slice(0, 32)}`;
+      const presence = inspector.kv("presence"), leases = inspector.kv("leases");
+      const actorKey = kvKey("p", actor.id), leaseKey = kvKey("h", oldOwner.hostId);
+      const originalPresence = await presence.get<FabricParticipantRecord>(actorKey);
+      const originalLease = await leases.get<FabricKvHostLease>(leaseKey);
+      if (!originalPresence || !originalLease) throw new Error("Original resident must publish both NATS presence and lease");
+      expect(presenceValue(originalPresence)).toMatchObject({ id: actor.id, kind: "actor", rootId,
+        residency: "durable", ownerHostId: oldOwner.hostId, capabilities: expect.arrayContaining(["ask"]) });
+      expect(leaseValue(originalLease)).toMatchObject({ id: oldOwner.hostId, rootId,
+        identityId: originalPresence.value.ownerIdentityId, incarnation: originalPresence.value.ownerIncarnation,
+        pid: oldOwner.pid });
+      expect(originalLease.owner).toBe(originalPresence.owner);
       const lockPath = path.join(resident, "host.lock");
       const oldFence = read<{ dev: string; ino: string }>(path.join(resident, "host-fence.json"));
       // Counterexample: a new Main runtime attaches to a genuine live owner.
@@ -153,7 +179,24 @@ faux.setResponses([fauxAssistantMessage(${JSON.stringify(ack)})]); pi.registerPr
           fs.writeFileSync(file, JSON.stringify({ ...previous, pid: process.pid, processStartTime: `${BigInt(processStartTime(process.pid)!) + 1n}` }));
         }
       }
-      console.log("L8_PHASE", JSON.stringify({ phase: "restored-files", actorId: actor.id, stale, oldOwner: oldOwner.pid, closedMain: closedMain.nonce }));
+      // Graceful fixture cleanup can withdraw the old broker rows. Reproduce the
+      // CI counterexample deterministically: retain the ORIGINAL incarnation's
+      // quiescing presence and matching lease, as if shutdown stopped after its
+      // quiesce publication. Keep the dead owner's process identity, not ours.
+      // The lease is essential: without it, stopping presence is not routable.
+      const stoppingPresence: FabricParticipantRecord = { ...originalPresence.value, status: "stopping", capabilities: [] };
+      const remainingPresence = await presence.get(actorKey), remainingLease = await leases.get(leaseKey);
+      const stoppingRevision = await presence.put(actorKey, originalPresence.owner, stoppingPresence, remainingPresence?.revision ?? 0);
+      const retainedLeaseRevision = await leases.put(leaseKey, originalLease.owner, originalLease.value, remainingLease?.revision ?? 0);
+      const retainedPresence = await presence.get<FabricParticipantRecord>(actorKey);
+      const retainedLease = await leases.get<FabricKvHostLease>(leaseKey);
+      expect(retainedPresence).toMatchObject({ revision: stoppingRevision, owner: originalPresence.owner, value: stoppingPresence });
+      expect(retainedLease).toMatchObject({ revision: retainedLeaseRevision, owner: originalLease.owner, value: originalLease.value });
+      expect(presenceValue(retainedPresence!)).toEqual(stoppingPresence);
+      expect(leaseValue(retainedLease!)).toEqual(originalLease.value);
+      console.log("L8_PHASE", JSON.stringify({ phase: "restored-files", actorId: actor.id, stale, oldOwner: oldOwner.pid,
+        closedMain: closedMain.nonce, retainedStatus: stoppingPresence.status, retainedCapabilities: stoppingPresence.capabilities,
+        retainedIncarnation: stoppingPresence.ownerIncarnation, stoppingRevision, retainedLeaseRevision }));
       restored = await main(work, config);
       // Startup recovery must publish before the ordinary ask can resolve its
       // original NATS actor route. No create/import/register/ensureActor repair.
@@ -165,6 +208,11 @@ faux.setResponses([fauxAssistantMessage(${JSON.stringify(ack)})]); pi.registerPr
         expect(history).toHaveLength(oldHistory.length + 2);
       });
       expect(history.slice(0, oldHistory.length)).toEqual(oldHistory);
+      // Direct asks are persisted as their #enqueue payload in FabricActorMessage.data, not text.
+      expect(history.slice(oldHistory.length)).toMatchObject([
+        { actorId: actor.id, direction: "in", source: "direct", data: { message: "after restore" } },
+        { id: after.id, actorId: actor.id, direction: "out", text: ack },
+      ]);
       expect(fs.readFileSync(sessionFile, "utf8").startsWith(transcript)).toBe(true);
       expect(restored.runtime.participantInfos().find(row => row.id === actor.id)).toMatchObject({ id: actor.id, rootId, ownerHostId: oldOwner.hostId });
       const newOwner = read<ResidentHostOwner>(ownerPath);
@@ -187,7 +235,13 @@ faux.setResponses([fauxAssistantMessage(${JSON.stringify(ack)})]); pi.registerPr
       try { await first?.runtime.shutdown("exit"); await restored?.runtime.shutdown("exit"); }
       finally {
         try { await stopAllOwned(launches.owned().reverse(), 5_000, 5_000); }
-        finally { await broker?.stop(); vi.restoreAllMocks(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
+        finally {
+          try { await inspector?.close(); }
+          finally {
+            inspectorMesh?.closeState();
+            await broker?.stop(); vi.restoreAllMocks(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true });
+          }
+        }
       }
     }
   }, 180_000);

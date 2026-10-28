@@ -1874,6 +1874,7 @@ export class FabricRuntimeState {
     }
     this.#lifecycle.start();
     this.#residency?.start();
+    await this.#residency?.waitForStartupRecovery();
     await builtins.install(createProviderComponent({
       provider: "agents",
       description: "Agents, actors, lifecycle delivery, and residency control",

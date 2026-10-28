@@ -106,16 +106,81 @@ export type RecoveryDurableEntryResult =
   | { readonly found: true; readonly seq: number; readonly bytes: Uint8Array }
   | { readonly found: false; readonly reason: "not-found" | "store-unavailable" | "superseded" };
 
+/** Captured by the native serializer, never reconstructed from a mutable event or alias. */
+export interface RecoveryNativeEntryLocation {
+  /** Exact B2/native-validated retained file. */
+  readonly file: string;
+  readonly offset: number;
+  /** UTF-8 JSON byte length EXCLUDING the terminating LF. */
+  readonly length: number;
+}
+
+/** Native Pi is the sole writer/fsync owner of its backing file. Ordinary receipts cover
+ * bytesThrough >= offset + length + 1 after file fsync/fdatasync and required directory
+ * fsync; namespaceDurable also covers an already durable unchanged namespace. Owned
+ * receipts come from the actual successful NONEMPTY committed append: bytes/sha256 cover
+ * its trusted committed prefix, not just this entry. currentReceipt/empty append proves
+ * custody only, never a previously unknown append's durability. Recovery must establish
+ * committed-append evidence rather than manufacture a receipt from a later stat/read. */
+export type RecoveryNativeFlushReceipt =
+  | { readonly kind: "file-fsync"; readonly file: string; readonly bytesThrough: number; readonly namespaceDurable: true }
+  | { readonly kind: "owned-journal-commit"; readonly file: string; readonly bytes: number; readonly sha256: string };
+
+export interface RecoveryNativeEntryRegistrationRequest {
+  readonly sessionId: string;
+  /** User carrier: original B5 deliveryId. Other native entries: pi-native-entry:v1: plus
+   * lower-hex SHA-256 of UTF-8 JSON.stringify([sessionId, entryId]). B5 must reject IDs
+   * beginning with that reserved prefix; these references do not admit new inputs. */
+  readonly deliveryId: string;
+  readonly recordKind: "carrier";
+  readonly entryId: string;
+  readonly location: RecoveryNativeEntryLocation;
+  /** Exact serializer-emitted JSON bytes PLUS final LF; B6 must copy this mutable array. */
+  readonly bytes: Uint8Array;
+  /** Lower-case hex SHA-256 of bytes, INCLUDING LF (not the extracted message hash). */
+  readonly bytesSha256: string;
+  readonly flushReceipt: RecoveryNativeFlushReceipt;
+  /** Absolute Unix milliseconds, bounded by the original input/lifecycle deadline. */
+  readonly deadlineMs: number;
+  readonly signal?: AbortSignal;
+}
+
+export type RecoveryNativeEntryRegistrationResult =
+  | { readonly registered: true; readonly existing: boolean }
+  | { readonly registered: false; readonly reason: "conflict" | "deadline" | "aborted" | "store-unavailable" | "superseded" };
+
 /** B6's bounded post-append barrier, before application/broker ACK or carrier commitment.
  * durable:true means WRITTEN AND FSYNCED (or the store's equivalent commit), not merely
  * enqueued. Idempotent per (sessionId, deliveryId, recordKind): return the same seq and
  * never append twice. Expired deadlines return deadline; an aborted signal returns aborted.
- * Carrier correlation is post-append: a message_end observation is not a commit receipt. */
+ * Carrier correlation is post-append: a message_end observation is not a commit receipt.
+ * REQUIRED activation needs successful open/recovery of B6's authoritative committed log
+ * for the exact bound store/session, not merely a registered/cached adapter object. These
+ * ports define an owner contract; they do not implement a store or activate composition. */
 export interface RecoveryDurabilityAdapter {
   awaitDurableAppend(request: RecoveryDurableAppendRequest): Promise<RecoveryDurableAppendResult>;
   /** Exact retained UTF-8 serialized native/store bytes after tool_result hooks, not a
-   * parsed/reserialized message. A missing entry is not permission to expose raw results. */
+   * parsed/reserialized message. Registered native entries include their final LF. After
+   * successful REQUIRED committed-log recovery, not-found authoritatively means no committed
+   * record for this exact tuple. Cache misses, incomplete reconstruction, inaccessible
+   * ranges, uncertain reads or lost availability MUST return store-unavailable; lost
+   * availability invalidates negative authority until successful recovery. Superseded
+   * bindings return superseded. B6 absence alone neither proves native-file absence nor
+   * permits reappend/raw-result fallback; complete B5/native evidence is still required. */
   readDurableEntry(request: RecoveryDurableEntryRequest): Promise<RecoveryDurableEntryResult>;
+  /** Call ONLY after persistenceReleased resolves, outside ordinary/owned persistence and
+   * terminal queues, from the B5/B3 drain. Validate bound session/file, byte bounds, length
+   * (bytes.length === location.length + 1), final LF, hash, parsed actual entryId and native
+   * receipt coverage/provenance. An invalid/incompatible receipt refuses. Immutable binding:
+   * (sessionId, deliveryId, 'carrier') -> (entryId, location, bytes, bytesSha256). Copy bytes;
+   * identical repeats preserve the barrier seq, changed bindings conflict without overwrite.
+   * A later valid larger-prefix receipt may strengthen the SAME entry without changing its
+   * binding/seq. Deadline/signal do not change identity. registered:true is correlation ONLY,
+   * NEVER durability/ACK; awaitDurableAppend commits B6's own retained bytes/index/seq.
+   * Native alone scans/recovers its append domain and re-emits flush-qualified descriptors;
+   * B6 never opens/scans/appends/fsyncs Pi files or reenters Pi persistence. Conflicts on
+   * the unchanged barrier/read remain superseded with diagnostics, not a new reason. */
+  registerNativeEntry(request: RecoveryNativeEntryRegistrationRequest): Promise<RecoveryNativeEntryRegistrationResult>;
 }
 
 export interface SettledRecoveryEffect {

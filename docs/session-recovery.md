@@ -219,8 +219,107 @@ Beside the barrier, `readDurableEntry({ sessionId, deliveryId, recordKind })` re
 `{ found: true, seq: number, bytes: Uint8Array }` or `{ found: false, reason:
 'not-found' | 'store-unavailable' | 'superseded' }`. `bytes` are the exact retained
 UTF-8 serialized native/store bytes after hooks, not parsed/reserialized JSON. There
-are no deadline/signal or other new arguments on this companion read. This type-only
-port does not implement a store reader or establish native post-hook durability.
+are no deadline/signal or other new arguments on this companion read. Both existing
+request/result shapes and their closed unions are unchanged.
+
+For REQUIRED activation, B6 must first successfully open/recover its authoritative
+committed log for the exact bound store/session. Only after that boundary does the
+companion's `not-found` authoritatively mean **no committed record for that exact
+tuple**. A cache miss, incomplete reconstruction, inaccessible committed range,
+uncertain read or lost availability must return `store-unavailable`, not `not-found`;
+a superseded binding returns `superseded`. Lost availability invalidates negative
+authority until successful recovery, not until a cached adapter object reappears.
+Even authoritative B6 absence alone does not prove native-file absence or authorize
+reappend: complete B5 history, a full native append-domain scan and exclusion/quiescence
+of old writers/current appends are separate requirements. The barrier's own
+`not-found` is not permission to append or expose raw results.
+
+### Additive native-entry registration contract (B6 N1/N2)
+
+`RecoveryDurabilityAdapter` also requires one additive method:
+
+```ts
+registerNativeEntry(request: {
+  readonly sessionId: string;
+  readonly deliveryId: string;
+  readonly recordKind: 'carrier';
+  readonly entryId: string;
+  readonly location: RecoveryNativeEntryLocation;
+  readonly bytes: Uint8Array;
+  readonly bytesSha256: string;
+  readonly flushReceipt: RecoveryNativeFlushReceipt;
+  readonly deadlineMs: number;
+  readonly signal?: AbortSignal;
+}): Promise<
+  | { readonly registered: true; readonly existing: boolean }
+  | { readonly registered: false; readonly reason:
+      'conflict' | 'deadline' | 'aborted' | 'store-unavailable' | 'superseded' }
+>;
+```
+
+The public readonly types are `RecoveryNativeEntryLocation`,
+`RecoveryNativeFlushReceipt`, `RecoveryNativeEntryRegistrationRequest` and
+`RecoveryNativeEntryRegistrationResult`. Location is `{ file: string, offset: number,
+length: number }`: the exact B2/native-validated retained file, byte offset of JSON,
+and UTF-8 JSON byte length **excluding LF**. Registration bytes are the exact native
+serializer-emitted JSON **plus the final LF**; `bytes.length === location.length + 1`.
+`bytesSha256` is lower-case hex SHA-256 of those exact bytes **including LF**, not
+B3/B4's extracted native-message hash. The companion returns these same retained
+entry bytes, never a parsed/reserialized message.
+
+Native Pi remains the **sole writer/fsync owner of the native file**. It captures
+entry ID, exact bytes/location and flush evidence at the real serializer/append,
+not from a mutable event or a later unsynchronized stat. The receipt is one of:
+
+- `{ kind: 'file-fsync', file, bytesThrough, namespaceDurable: true }`: issued after
+  file fsync/fdatasync covering `bytesThrough >= offset + length + 1` and required
+  creation/namespace directory fsync. An already durable unchanged namespace also
+  satisfies `namespaceDurable: true`.
+- `{ kind: 'owned-journal-commit', file, bytes, sha256 }`: the actual successful
+  **nonempty committed native append** and its trusted prefix byte count/hash.
+  The hash covers the committed prefix, not just the entry; offset is captured from
+  that append's prior trusted count (or committed count minus suffix length). Reuse
+  the existing owned writer's file/directory fsync and readback, not a second writer
+  or duplicate fsync. A later `currentReceipt`, empty append or generic terminal
+  success proves custody at most, not an unknown append's durability. Recovery must
+  establish native recovered committed-append evidence or remain uncertain.
+
+B6 validates session/file binding, bounds, length, final LF, hash, parsed actual
+`entryId` and native receipt coverage/provenance through the native integration;
+invalid or incompatible receipts refuse. B6 **copies** the mutable `Uint8Array`.
+The immutable binding is `(sessionId, deliveryId, 'carrier') -> (entryId, location,
+bytes, bytesSha256)`. An identical repeat is safe and preserves the barrier's seq;
+a changed entry ID, location, bytes or hash conflicts without overwriting the first
+binding, even if user text matches. A later valid receipt covering a larger prefix
+may strengthen the **same immutable entry**, without changing its binding or seq.
+Operational deadline/signal are not identity; attempts are bounded by the original
+input/lifecycle deadline. `registered: true` accepts correlation **only**: it is
+**never durability or ACK**. The unchanged `awaitDurableAppend` must still commit
+or reconcile B6's own retained bytes/index and yield the stable sequence. Only the
+new registration union has `conflict`; conflicts through the fixed barrier/read
+remain `superseded` with diagnostics, without widening either closed union.
+
+Reserve `pi-native-entry:v1:` outside B5's delivery-ID namespace; B5 must reject
+allocation of any ID beginning with it. Non-user native entries use that prefix
+plus lower-hex SHA-256 of UTF-8 `JSON.stringify([sessionId, entryId])`. Registration
+also checks session/entry identity so collisions conflict rather than alias. A user
+carrier retains its original B5 delivery ID. Each later tool-result or terminal
+witness gets its own derived reference with `recordKind: 'carrier'`; it neither
+reuses the user's old sequence for new bytes nor admits another input.
+
+Call registration **only after `persistenceReleased` resolves**, outside the
+enclosing ordinary/owned persistence and terminal queue, from the B5/B3 drain.
+Inside persistence, native only captures/flushes/bookkeeps; it never awaits B6/B5.
+B6 never opens/scans/appends/fsyncs Pi files or calls back into Pi persistence.
+On restart the legitimate native writer recovers its full append domain and
+re-emits flush-qualified descriptors; B6 recovers its own committed log/index.
+
+These are **types, documentation and API fixtures only**. There is no B6 store
+implementation, native append feed/flush implementation or adapter activation here.
+Durability is deliberately **not wired into `SessionRecoveryAdapters` composition**
+in this phase. Successful REQUIRED open/recovery, native integration, physical
+power-off, cross-host recovery and the 120-second target remain unqualified;
+the test fakes establish none of those durability guarantees.
 
 The inspected Pi 1.2.0 runtime does not expose an atomic, fail-closed startup
 recovery transaction/fence handoff. Cold startup has no `session_ready`; replacement

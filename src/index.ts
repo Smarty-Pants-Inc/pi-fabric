@@ -13,6 +13,8 @@ export type {
   RecoveryAcceptedInput, RecoveryInputSnapshot, ContinuationRequest, ContinuationAdmission,
   RecoveryInputAdapter, RecoveryDurableAppendRequest, RecoveryDurableAppendResult, RecoveryDurabilityAdapter,
   RecoveryDurableEntryRequest, RecoveryDurableEntryResult,
+  RecoveryNativeEntryLocation, RecoveryNativeFlushReceipt,
+  RecoveryNativeEntryRegistrationRequest, RecoveryNativeEntryRegistrationResult,
   SettledRecoveryEffect, RecoveryEffectsSettlement, RecoveryToolResult,
   RecoveryToolResultSource, RecoveryToolResultRead, RecoveryToolResultTransform, RecoveryMaterializedResultReceipt,
   RecoveryEffectAdapter, SessionRecoveryAdapters,

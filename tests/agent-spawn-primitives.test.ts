@@ -45,7 +45,7 @@ beforeEach(() => {
 afterEach(async () => {
   await Promise.all(managers.splice(0).map((manager) => manager.close()));
   restoreAdmissionFixture?.();
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  roots.splice(0); // Preserve raw fixtures for the inherited test owner.
   if (savedPolicy === undefined) delete process.env.PI_FABRIC_WRITE_POLICY;
   else process.env.PI_FABRIC_WRITE_POLICY = savedPolicy;
   if (savedLineage === undefined) delete process.env.PI_FABRIC_LINEAGE;
@@ -484,7 +484,26 @@ describe("agent manager spawning primitives", () => {
         ? "echo installing & echo broken 1>&2 & exit 3"
         : "echo installing; echo broken >&2; exit 3",
     })).rejects.toThrow(/Worktree setup command exited with 3:\n[\s\S]*broken/);
-    expect(git(repository, "worktree", "list", "--porcelain")).toBe(before);
+    // Setup failure archives its whole tree, without deleting Git registration or branch debt.
+    const after = git(repository, "worktree", "list", "--porcelain");
+    expect(after.match(/^worktree /gm)!.length).toBe(before.match(/^worktree /gm)!.length + 1);
+    // Discover receipts only inside this command's known owned fixture namespace,
+    // independently of the helper's archive placement policy.
+    const namespace = os.tmpdir();
+    const receipts = fs.readdirSync(namespace, { recursive: true }).map(String)
+      .filter(name => path.basename(name) === "custody.json")
+      .map(name => ({ container: path.dirname(path.join(namespace, name)), ...JSON.parse(fs.readFileSync(path.join(namespace, name), "utf8")) }))
+      .filter(row => row.source.startsWith(path.join(repository, ".pi", "fabric", "worktrees") + path.sep));
+    expect(receipts).toHaveLength(2); // The successful run and the failed prelaunch setup.
+    for (const receipt of receipts) {
+      expect(receipt).toMatchObject({ state: "moved", id: path.basename(receipt.source), reason: expect.any(String), time: expect.any(Number) });
+      expect(JSON.parse(fs.readFileSync(path.join(receipt.container, "custody.prepared.json"), "utf8"))).toMatchObject({ state: "prepared", source: receipt.source, destination: receipt.destination, id: receipt.id });
+      if (process.platform !== "win32") expect(fs.statSync(receipt.container).mode & 0o777).toBe(0o700);
+      expect(fs.existsSync(receipt.source)).toBe(false);
+      expect(fs.readFileSync(path.join(receipt.destination, "README.md"))).toEqual(fs.readFileSync(path.join(repository, "README.md")));
+      expect(after.replaceAll("\\", "/")).toContain(receipt.source.replaceAll("\\", "/"));
+    }
+    expect(git(repository, "branch", "--list", "pi-fabric/*").trim().split("\n")).toHaveLength(2);
   });
 
   it("parses the new worker arguments", () => {

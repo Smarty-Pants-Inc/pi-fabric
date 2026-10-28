@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,9 +16,24 @@ import type { FabricMainAgentTarget } from "../src/main-agent.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import * as processUtils from "../src/agents/transports/process-utils.js";
 import * as cloneFirst from "../src/agents/clone-first-worktree.js";
-import { shortTmpdirName } from "../src/agents/short-tmpdir.js";
+import { RUN_IDENTITY_FILE } from "../src/agents/run-identity.js";
+import { preserveCancellationOutcome } from "../src/async-settlement.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
+const { observed, namespaces } = vi.hoisted(() => ({ observed: new Set<string>(), namespaces: new Map<string, Set<string>>() }));
+vi.mock("../src/core/atomic-write.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/core/atomic-write.js")>();
+  return { ...actual, writeJsonAtomic: (...args: Parameters<typeof actual.writeJsonAtomic>) => {
+    const result = actual.writeJsonAtomic(...args);
+    const [file, value] = args;
+    // Pass through actual durable receipt publication, including lexical helper
+    // calls inside WorktreeManager. Only our owned source namespace/IDs qualify.
+    if (path.basename(file) === "custody.json" && value && typeof value === "object" &&
+      "source" in value && typeof value.source === "string" && "id" in value && typeof value.id === "string" &&
+      [...namespaces].some(([root, ids]) => (value.source as string).startsWith(root + path.sep) || ids.has(value.id as string))) observed.add(file);
+    return result;
+  } };
+});
 beforeEach(() => installInProcessResidentFence());
 
 // Data-safety keep reason: actual provider -> client -> file mesh -> LIVE host ->
@@ -41,15 +57,8 @@ const verify = (root: string): void => {
 };
 interface Move { source: string; destination: string; state: string; id: string; reason: string; time: number; }
 const receipts = (root: string): Move[] => {
-  const found: Move[] = [];
-  const walk = (directory: string): void => {
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      const file = path.join(directory, entry.name);
-      if (entry.isDirectory()) walk(file);
-      else if (entry.name === "custody.json") found.push(JSON.parse(fs.readFileSync(file, "utf8")) as Move);
-    }
-  };
-  walk(root); return found;
+  return [...observed].map(file => JSON.parse(fs.readFileSync(file, "utf8")) as Move)
+    .filter(move => move.source.startsWith(root + path.sep) || namespaces.get(root)?.has(move.id));
 };
 const held = (root: string, source: string, id: string): Move => {
   const receipt = receipts(root).find(row => row.source === source && row.state === "moved");
@@ -57,12 +66,23 @@ const held = (root: string, source: string, id: string): Move => {
   expect(receipt).toMatchObject({ source, id, reason: expect.any(String), time: expect.any(Number) });
   expect(receipt!.reason.length).toBeGreaterThan(0); expect(receipt!.time).toBeGreaterThan(0);
   expect(fs.existsSync(receipt!.destination)).toBe(true);
-  expect(fs.statSync(path.dirname(receipt!.destination)).mode & 0o777).toBe(0o700);
+  const container = path.dirname(receipt!.destination);
+  if (process.platform !== "win32") expect(fs.statSync(container).mode & 0o777).toBe(0o700);
+  else {
+    // Independent native ACL readback: Unix mode bits cannot establish Windows privacy.
+    const script = "$a=Get-Acl -LiteralPath $env:FABRIC_ACL_PROBE; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; [pscustomobject]@{protected=$a.AreAccessRulesProtected;owner=([System.Security.Principal.NTAccount]$a.Owner).Translate([System.Security.Principal.SecurityIdentifier]).Value;current=$sid;rules=@($a.Access|%{[pscustomobject]@{sid=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value;allow=$_.AccessControlType.ToString();inherited=$_.IsInherited}})}|ConvertTo-Json -Depth 5 -Compress";
+    const acl = JSON.parse(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
+      { encoding: "utf8", env: { ...process.env, FABRIC_ACL_PROBE: container } }));
+    expect(acl.protected).toBe(true); expect(acl.owner).toBe(acl.current);
+    expect(acl.rules.length).toBeGreaterThan(0);
+    for (const rule of acl.rules) { expect([acl.current, "S-1-5-18", "S-1-5-32-544"]).toContain(rule.sid); expect(rule.allow).toBe("Allow"); expect(rule.inherited).toBe(false); }
+  }
   return receipt!;
 };
 
 const fixture = async (retainRuns = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-live-move-aside-"));
+  namespaces.set(root, new Set());
   const rootId = "session:live-cleanup-move-aside";
   const config: ResidentHostConfig = {
     format: 1, rootId, sessionId: "live-cleanup-move-aside", cwd: root, projectRoot: root,
@@ -76,6 +96,7 @@ const fixture = async (retainRuns = false) => {
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
   };
   const gitCalls: string[][] = [];
+  const temporaryDirectories = new Set<string>();
   let rejectSetup = false;
   const execute = processUtils.executeFile;
   vi.spyOn(processUtils, "executeFile").mockImplementation(async (command, args, options) => {
@@ -109,20 +130,42 @@ const fixture = async (retainRuns = false) => {
     const handle = await client.spawnAgent({ task: "fixture cleanup", transport: "process", residency: "durable", worktree }, AbortSignal.timeout(5_000));
     await host.agents.wait(handle.id, { timeoutMs: 5_000 });
     const run = host.agents.runDirectory(handle.id)!; seed(run);
-    // Exercise the real recorded/owned short-TMPDIR path without relaxing the
-    // fleet's short-name budget. This private fixture is recorded after worker exit.
-    const temporary = path.join(root, shortTmpdirName(handle.id)); fs.mkdirSync(temporary, { mode: 0o700 }); seed(temporary);
-    const statusFile = path.join(run, "status.json");
-    const status = JSON.parse(fs.readFileSync(statusFile, "utf8"));
-    fs.writeFileSync(statusFile, JSON.stringify({ ...status, temporaryDirectory: temporary }));
+    // Read the prelaunch native receipt, never overwrite the manager's binding.
+    const identity = JSON.parse(fs.readFileSync(path.join(run, RUN_IDENTITY_FILE), "utf8"));
+    expect(identity).toMatchObject({ runId: handle.id, runDirectory: fs.realpathSync(run) });
+    const temporary = identity.temporaryDirectory as string;
+    expect(path.isAbsolute(temporary)).toBe(true); expect(fs.statSync(temporary).isDirectory()).toBe(true); seed(temporary);
+    temporaryDirectories.add(temporary);
+    const relative = path.relative(run, temporary);
+    const externalTemporary = relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+    if (process.platform === "win32") expect(externalTemporary).toBe(false);
+    else { expect(externalTemporary).toBe(true); expect(host.agents.status(handle.id)).toMatchObject({ temporaryDirectory: temporary }); }
+    const ids = namespaces.get(root) ?? new Set<string>(); ids.add(handle.id); namespaces.set(root, ids);
     const metadata = path.join(config.residencyRoot, "agents", `${handle.id}.json`);
     const result = residentResultPath(config.residencyRoot, handle.id);
-    return { id: handle.id, run, temporary, metadata, result, worktree: handle.worktree };
+    return { id: handle.id, run, temporary, externalTemporary, metadata, result, worktree: handle.worktree };
   };
   const noGitDelete = () => expect(gitCalls.filter(args => args[0] === "worktree" && args[1] === "remove" || args[0] === "branch" || args.includes("prune"))).toEqual([]);
   const dispose = async () => {
-    await client.close(); await host.close(); await participants.close(); vi.restoreAllMocks();
-    // Retain raw fixtures and receipts for the evidence owner, rather than reaping them.
+    // Export before host teardown as well as the wrapper/global cleanup owner.
+    try {
+      const evidence = process.env.PI_FABRIC_CUSTODY_EVIDENCE_DIR;
+      if (evidence) {
+        fs.mkdirSync(evidence, { recursive: true }); const destination = path.join(evidence, path.basename(root));
+        if (process.platform === "win32") fs.cpSync(root, destination, { recursive: true });
+        else execFileSync("cp", ["-a", "--", root, destination]);
+        for (const temporary of temporaryDirectories) if (!temporary.startsWith(root + path.sep) && fs.existsSync(temporary)) {
+          const target = path.join(evidence, `${path.basename(root)}-${path.basename(temporary)}`);
+          if (process.platform === "win32") fs.cpSync(temporary, target, { recursive: true });
+          else execFileSync("cp", ["-a", "--", temporary, target]);
+        }
+        for (const receipt of receipts(root)) if (!receipt.destination.startsWith(root + path.sep) && fs.existsSync(receipt.destination)) {
+          const target = path.join(evidence, `${path.basename(root)}-${path.basename(path.dirname(receipt.destination))}`);
+          if (process.platform === "win32") fs.cpSync(path.dirname(receipt.destination), target, { recursive: true });
+          else execFileSync("cp", ["-a", "--", path.dirname(receipt.destination), target]);
+        }
+      }
+    } finally { await client.close(); await host.close(); await participants.close(); vi.restoreAllMocks(); }
     console.log(`retained live cleanup fixture: ${root}`);
   };
   return { root, config, host, client, provider, context, launch, dispose, noGitDelete, failSetup: () => { rejectSetup = true; } };
@@ -133,22 +176,24 @@ describe("live cleanup move-aside custody", () => {
     const f = await fixture(); const fds: number[] = [];
     try {
       const run = await f.launch();
-      const roots = [run.worktree!, run.run, run.temporary, run.metadata, run.result];
+      const roots = [run.worktree!, run.run, ...(run.externalTemporary ? [run.temporary] : []), run.metadata, run.result];
       const inodes = roots.map(source => fs.statSync(source).ino);
-      const files = [path.join(run.worktree!, "sessions/raw.JSONL"), path.join(run.run, "sessions/raw.JSONL"), path.join(run.temporary, "sessions/raw.JSONL"), run.metadata, run.result];
+      const directories = new Set([run.worktree!, run.run, ...(run.externalTemporary ? [run.temporary] : [])]);
+      const files = roots.map(source => directories.has(source) ? path.join(source, "sessions/raw.JSONL") : source);
       const bytes = files.map(file => fs.readFileSync(file));
       for (const file of files) fds.push(fs.openSync(file, "a"));
       await expect(f.provider.invoke("cleanup", { id: run.id, deleteBranch: true }, f.context)).resolves.toEqual({ cleaned: true });
       for (const [index, source] of roots.entries()) {
         const receipt = held(f.root, source, run.id);
         expect(fs.existsSync(source)).toBe(false); expect(fs.statSync(receipt.destination).ino).toBe(inodes[index]);
-        if (index < 3) verify(receipt.destination);
-        const file = index < 3 ? path.join(receipt.destination, "sessions/raw.JSONL") : receipt.destination;
+        if (directories.has(source)) verify(receipt.destination);
+        const file = directories.has(source) ? path.join(receipt.destination, "sessions/raw.JSONL") : receipt.destination;
         expect(fs.readFileSync(file)).toEqual(bytes[index]);
         fs.writeSync(fds[index]!, "late-open-FD-tail");
         expect(fs.readFileSync(file)).toEqual(Buffer.concat([bytes[index]!, Buffer.from("late-open-FD-tail")]));
       }
-      expect(receipts(f.root)).toHaveLength(5); f.noGitDelete();
+      if (!run.externalTemporary) verify(path.join(held(f.root, run.run, run.id).destination, path.relative(run.run, run.temporary)));
+      expect(receipts(f.root)).toHaveLength(run.externalTemporary ? 5 : 4); f.noGitDelete();
       const decisions = fs.readdirSync(path.join(f.config.residencyRoot, "decisions"))
         .map(name => readResidentRequestDecision(f.config.residencyRoot, name.slice(0, -5)));
       expect(decisions).toContainEqual(expect.objectContaining({ operation: "cleanup", id: run.id, state: "committed" }));
@@ -158,20 +203,21 @@ describe("live cleanup move-aside custody", () => {
   it("retainRuns leaves run and TMPDIR untouched but LIVE host still retains metadata and saved result", async () => {
     const f = await fixture(true);
     try {
-      const run = await f.launch(false);
+      const run = await f.launch();
       const metadata = fs.readFileSync(run.metadata), result = fs.readFileSync(run.result);
       await expect(f.provider.invoke("cleanup", { id: run.id }, f.context)).resolves.toEqual({ cleaned: true });
       const metaHeld = held(f.root, run.metadata, run.id), resultHeld = held(f.root, run.result, run.id);
       expect(fs.readFileSync(metaHeld.destination)).toEqual(metadata); expect(fs.readFileSync(resultHeld.destination)).toEqual(result);
-      verify(run.run); verify(run.temporary); expect(receipts(f.root)).toHaveLength(2); f.noGitDelete();
+      verify(held(f.root, run.worktree!, run.id).destination);
+      verify(run.run); verify(run.temporary); expect(receipts(f.root)).toHaveLength(3); f.noGitDelete();
     } finally { await f.dispose(); }
   });
 
   it("replacement canonical occupants survive every successful root move", async () => {
     const f = await fixture();
     try {
-      const run = await f.launch(); const sources = [run.worktree!, run.run, run.temporary, run.metadata, run.result];
-      const directories = new Set(sources.slice(0, 3)); const rename = fs.renameSync;
+      const run = await f.launch(); const sources = [run.worktree!, run.run, ...(run.externalTemporary ? [run.temporary] : []), run.metadata, run.result];
+      const directories = new Set([run.worktree!, run.run, ...(run.externalTemporary ? [run.temporary] : [])]); const rename = fs.renameSync;
       const replacements = new Map([run.metadata, run.result].map(source => [source,
         JSON.stringify({ ...JSON.parse(fs.readFileSync(source, "utf8")), replacementRaw: "new canonical bytes" }) + "\n"]));
       vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
@@ -190,31 +236,51 @@ describe("live cleanup move-aside custody", () => {
     } finally { await f.dispose(); }
   });
 
-  it.each(["run", "temporary", "metadata", "result"] as const)("partial EXDEV at %s preserves previously held and remaining original raw objects with committed known ID", async kind => {
+  it.each(((process.platform === "win32" ? ["worktree", "run", "metadata", "result"] : ["worktree", "run", "temporary", "metadata", "result"]) as Array<"worktree" | "run" | "temporary" | "metadata" | "result">).flatMap(kind => [false, true].map(crossDevice => ({ kind, crossDevice }))))("partial EXDEV at $kind (cross-device metadata=$crossDevice) retains originals and structured committed outcome", async ({ kind, crossDevice }) => {
     const f = await fixture();
     try {
-      const run = await f.launch(); const target = run[kind];
+      const run = await f.launch(); const target = run[kind]!;
       const raw = fs.statSync(target).isDirectory() ? undefined : fs.readFileSync(target);
-      const rename = fs.renameSync;
+      const rename = fs.renameSync; const lstat = fs.lstatSync.bind(fs); let deviceProbe = false;
+      vi.spyOn(fs, "lstatSync").mockImplementation(((file, options) => {
+        const stat = lstat(file, options);
+        if (deviceProbe && String(file) === target && stat) {
+          deviceProbe = false; return new Proxy(stat, { get: (value, key) => key === "dev" ? Number(value.dev) + 1 : Reflect.get(value, key) });
+        }
+        return stat;
+      }) as typeof fs.lstatSync);
       vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
-        if (String(source) === target) throw Object.assign(new Error("fixture custody cross-device refusal"), { code: "EXDEV" });
+        if (String(source) === target) { deviceProbe = crossDevice; throw Object.assign(new Error("fixture custody cross-device refusal"), { code: "EXDEV" }); }
         rename(source, destination);
       });
-      const copy = vi.spyOn(fs, "cpSync");
-      const error = await f.client.cleanupAgent(run.id, true).catch((error: Error) => error);
-      expect(error).toBeInstanceOf(Error); expect((error as Error).message).toMatch(/EXDEV/);
+      const signal = new AbortController().signal;
+      const error = await f.provider.invoke("cleanup", { id: run.id, deleteBranch: true }, { ...f.context, signal }).catch((error: Error) => error);
+      expect(error).toBeInstanceOf(Error); expect((error as Error).message).toMatch(crossDevice ? /custody deferred/ : /EXDEV/);
       expect(error).toMatchObject({ residentOutcome: { id: run.id, state: "committed", operation: "cleanup" } });
       if (raw) expect(fs.readFileSync(target)).toEqual(raw); else verify(target);
-      expect(receipts(f.root)).toContainEqual(expect.objectContaining({ source: target, id: run.id, state: "rename-failed" }));
-      verify(held(f.root, run.worktree!, run.id).destination);
-      if (kind !== "run") verify(held(f.root, run.run, run.id).destination);
-      if (kind === "metadata" || kind === "result") verify(held(f.root, run.temporary, run.id).destination);
+      const cleanupStatus = (error as Error & { cleanupStatus?: { state: string; source: string; originalRetained: true; verifiedCopyPath?: string } }).cleanupStatus;
+      if (crossDevice) {
+        expect(cleanupStatus).toMatchObject({ source: target, originalRetained: true, state: process.platform === "linux" ? "held-in-place" : "copy-failed" });
+        expect(receipts(f.root)).toContainEqual(expect.objectContaining({ source: target, id: run.id, state: cleanupStatus!.state, originalRetained: true }));
+        if (process.platform === "linux") {
+          expect(cleanupStatus!.verifiedCopyPath).toEqual(expect.any(String));
+          if (raw) expect(fs.readFileSync(cleanupStatus!.verifiedCopyPath!)).toEqual(raw); else verify(cleanupStatus!.verifiedCopyPath!);
+        } else expect(cleanupStatus!.verifiedCopyPath).toBeUndefined();
+      } else { expect(cleanupStatus).toBeUndefined(); expect(receipts(f.root)).toContainEqual(expect.objectContaining({ source: target, id: run.id, state: "rename-failed" })); }
+      const settled = preserveCancellationOutcome({ value: undefined, terminationReason: "runtime_error" as const }, signal);
+      expect(settled).toMatchObject({ residentOutcomes: [expect.objectContaining({ id: run.id, state: "committed", operation: "cleanup",
+        ...(crossDevice ? { cleanupStatus } : {}),
+      })] });
+      if (kind !== "worktree") verify(held(f.root, run.worktree!, run.id).destination);
+      if (kind !== "worktree" && kind !== "run") verify(held(f.root, run.run, run.id).destination);
+      if (kind === "metadata" || kind === "result") verify(run.externalTemporary ? held(f.root, run.temporary, run.id).destination
+        : path.join(held(f.root, run.run, run.id).destination, path.relative(run.run, run.temporary)));
       if (kind === "result") held(f.root, run.metadata, run.id);
-      expect(copy).not.toHaveBeenCalled(); f.noGitDelete();
+      expect(f.host.agents.hasRunCustody(run.id)).toBe(kind === "worktree" || kind === "run" || kind === "temporary"); f.noGitDelete();
     } finally { await f.dispose(); }
   });
 
-  it.each(["run", "temporary", "metadata", "result"] as const)("post-move receipt failure at %s leaves immutable prepared receipt and original inode held, never rolled back", async kind => {
+  it.each((process.platform === "win32" ? ["run", "metadata", "result"] : ["run", "temporary", "metadata", "result"]) as Array<"run" | "temporary" | "metadata" | "result">)("post-move receipt failure at %s leaves immutable prepared receipt and original inode held, never rolled back", async kind => {
     const f = await fixture();
     try {
       const run = await f.launch(); const target = run[kind]; const inode = fs.statSync(target).ino;

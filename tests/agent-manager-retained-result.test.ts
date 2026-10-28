@@ -442,6 +442,93 @@ describe("retained manager outcome at close", () => {
     expect(consumed).not.toHaveBeenCalled();
   });
 
+  it("stages final consumption after checked run custody and retains exact result on finalizer failure", async () => {
+    recordFsRemovals();
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(request => fakeManagerHeapWorker(request));
+    const consumed = vi.fn();
+    const { manager } = managedFixture({ onResultConsumed: consumed });
+    const handle = await manager.spawn({ task: "staged finalization", transport: "process", extensions: false });
+    await manager.join(handle.id);
+    consumed.mockClear();
+    const run = manager.runDirectory(handle.id)!;
+    const original = fs.readFileSync(path.join(run, "manager-result.json"));
+    const finalize = vi.fn(() => {
+      expect(manager.hasRunCustody(handle.id)).toBe(true);
+      expect(fs.existsSync(run)).toBe(false);
+      expect(manager.status(handle.id)).toMatchObject({ id: handle.id, status: "completed" });
+      throw new Error("resident result copy failed");
+    });
+    await expect(manager.cleanup(handle.id, false, finalize)).rejects.toThrow("resident result copy failed");
+    expect(finalize).toHaveBeenCalledOnce();
+    expect(consumed).not.toHaveBeenCalled();
+    expect(manager.hasRunCustody(handle.id)).toBe(true);
+    const held = custodyMoves.find(move => move.source === run)!.destination;
+    expect(fs.readFileSync(path.join(held, "manager-result.json"))).toEqual(original);
+    expect(manager.hasRetainedCustody()).toBe(true);
+    await expect(manager.cleanup(handle.id)).rejects.toThrow("trace finalization is pending");
+    await manager.close();
+    expect(manager.hasRunCustody(handle.id)).toBe(true);
+    expect(manager.status(handle.id)).toMatchObject({ id: handle.id, status: "completed" });
+    expect(consumed).not.toHaveBeenCalled();
+    fs.mkdirSync(run);
+    fs.writeFileSync(path.join(run, "manager-result.json"), JSON.stringify({ id: handle.id, status: "completed", text: "forged" }));
+    const success = vi.fn(() => { expect(manager.hasRunCustody(handle.id)).toBe(true); });
+    await manager.cleanup(handle.id, false, success);
+    expect(success).toHaveBeenCalledOnce();
+    expect(consumed).toHaveBeenCalledExactlyOnceWith(handle.id);
+    expect(manager.hasRunCustody(handle.id)).toBe(false);
+    expect(custodyMoves.filter(move => move.source === run)).toHaveLength(1);
+    expect(fs.readFileSync(path.join(held, "manager-result.json"))).toEqual(original);
+    expect(JSON.parse(fs.readFileSync(path.join(run, "manager-result.json"), "utf8")).text).toBe("forged");
+  });
+
+  it("keeps terminal queued custody through finalizer failure and checks the original held tree on retry", async () => {
+    recordFsRemovals();
+    const consumed = vi.fn();
+    const { manager, root } = managedFixture({ onResultConsumed: consumed });
+    // Occupy the real one-permit path; zero is normalized to a positive cap,
+    // so maxConcurrent=0 never established the queued precondition.
+    const blocker = await manager.spawn({ task: "HANG", transport: "process", extensions: false });
+    const queued = await manager.spawn({ task: "queued finalization", transport: "process", extensions: false });
+    expect(queued.status).toBe("queued");
+    await manager.stop(queued.id);
+    await manager.stop(blocker.id);
+    consumed.mockClear();
+    const run = path.join(root, queued.id);
+    fs.mkdirSync(run, { recursive: true }); fs.writeFileSync(path.join(run, "raw.JSONL"), "queued raw");
+    const finalize = vi.fn(() => { throw new Error("queued resident copy failed"); });
+    await expect(manager.cleanup(queued.id, false, finalize)).rejects.toThrow("queued resident copy failed");
+    expect(consumed).not.toHaveBeenCalled(); expect(manager.hasRunCustody(queued.id)).toBe(true);
+    const held = custodyMoves.find(move => move.source === run)!.destination;
+    const child = path.join(held, "nested", "child"); fs.mkdirSync(child, { recursive: true });
+    fs.writeFileSync(path.join(child, "status.json"), JSON.stringify({ status: "running", transport: "process", sessionId: String(process.pid) }));
+    await expect(manager.cleanup(queued.id, false, finalize)).rejects.toThrow(
+      `Cannot clean up agent ${queued.id}: worker exit is unconfirmed: nonterminal process record (${child})`);
+    expect(fs.readFileSync(path.join(child, "status.json"), "utf8")).toBe(JSON.stringify({ status: "running", transport: "process", sessionId: String(process.pid) }));
+    expect(manager.hasRunCustody(queued.id)).toBe(true);
+    expect(finalize).toHaveBeenCalledOnce(); expect(consumed).not.toHaveBeenCalled();
+    fs.renameSync(child, path.join(path.dirname(held), "retired-synthetic-child"));
+    await manager.cleanup(queued.id, false, () => {});
+    expect(consumed).toHaveBeenCalledExactlyOnceWith(queued.id); expect(manager.hasRunCustody(queued.id)).toBe(false);
+    expect(fs.readFileSync(path.join(held, "raw.JSONL"), "utf8")).toBe("queued raw");
+  });
+
+  it("never invokes staged finalization before descendant exit proof", async () => {
+    recordFsRemovals();
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(request => fakeManagerHeapWorker(request));
+    const { manager } = managedFixture();
+    const result = await manager.run({ task: "liveness before finalizer", transport: "process", extensions: false });
+    const run = manager.runDirectory(result.id)!;
+    const descendant = path.join(run, "nested", "child");
+    fs.mkdirSync(descendant, { recursive: true });
+    fs.writeFileSync(path.join(descendant, "status.json"), JSON.stringify({ status: "running", transport: "process", sessionId: String(process.pid) }));
+    const finalize = vi.fn();
+    await expect(manager.cleanup(result.id, false, finalize)).rejects.toThrow(/descendant worker may still be running/);
+    expect(finalize).not.toHaveBeenCalled();
+    expect(manager.hasRunCustody(result.id)).toBe(true);
+    expect(fs.existsSync(run)).toBe(true);
+  });
+
   it("reports the typed missing-result code before collection provenance", async () => {
     recordFsRemovals();
     vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(request => fakeManagerHeapWorker(request));

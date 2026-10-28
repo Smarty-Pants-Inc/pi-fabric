@@ -39,6 +39,7 @@ class ScriptedInbox implements NatsBridgeInboxSource {
   readonly #queue: FakeMessage[] = [];
   #wake: (() => void) | undefined;
   verified = true;
+  readonly ackFloor = vi.fn(async () => 6);
   push(message: FakeMessage): void { this.#queue.push(message); this.#wake?.(); }
   isVerified(): boolean { return this.verified; }
   async *consume(signal: AbortSignal): AsyncIterable<NatsBridgeInboxMessage> {
@@ -56,7 +57,7 @@ class ScriptedInbox implements NatsBridgeInboxSource {
 
 function message(options: { id: string; kind?: "command" | "ack"; toHostId?: string; targetId?: string; source?: string;
   subjectSource?: string; toMachine?: string; subjectMachine?: string; body?: Record<string, unknown>; sequence?: number;
-  attempt?: number; principal?: unknown; raw?: string }): FakeMessage {
+  attempt?: number; publishedAt?: number; principal?: unknown; raw?: string }): FakeMessage {
   const kind = options.kind ?? "command";
   const toHostId = options.toHostId ?? FILE_ROOT;
   const targetId = options.targetId ?? FILE_ROOT;
@@ -71,7 +72,8 @@ function message(options: { id: string; kind?: "command" | "ack"; toHostId?: str
     calls,
     subject: `fabric.in.${options.subjectMachine ?? BRIDGE}.${hashToken(toHostId)}.${kind === "command" ? "cmd" : "ack"}.${hashToken(targetId)}.${options.subjectSource ?? source}`,
     data: Buffer.from(options.raw ?? JSON.stringify({ format: 1, sourceMachine: source, envelope })),
-    info: { streamSequence: options.sequence ?? 1, deliveryCount: options.attempt ?? 1 },
+    info: { streamSequence: options.sequence ?? 1, deliveryCount: options.attempt ?? 1,
+      ...(options.publishedAt === undefined ? {} : { timestampNanos: options.publishedAt * 1_000_000 }) },
     async ackAck() { calls.push("ack"); return true; },
     nak(delay?: number) { calls.push(`nak:${delay ?? ""}`); },
     term(reason?: string) { calls.push(`term:${reason ?? ""}`); },
@@ -492,12 +494,18 @@ describe("NATS bridge port: machine-wide inbox", () => {
     const { port: p, inbox } = port(w);
     const iterator = p.inbox(new AbortController().signal)[Symbol.asyncIterator]();
     const principal = { kind: "human", id: "principal-b" };
-    const sent = message({ id: "n-1", sequence: 7, attempt: 2, principal });
+    const sent = message({ id: "n-1", sequence: 7, attempt: 2, principal, publishedAt: 456 });
     inbox.push(sent);
     const delivery = await next(iterator);
-    expect(delivery).toMatchObject({ sourceMachine: V2, toHostId: FILE_ROOT, streamSequence: 7, attempt: 2,
+    expect(delivery).toMatchObject({ sourceMachine: V2, toHostId: FILE_ROOT, streamSequence: 7, attempt: 2, publishedAt: 456,
       envelope: { id: "n-1", kind: "command", createdAt: 123, to: { machine: BRIDGE, hostId: FILE_ROOT } } });
     expect(delivery.bodyDigest).toBe(controlBodyFingerprint(delivery.envelope.body, principal));
+    expect(await p.ackFloor()).toBe(6);
+    expect(inbox.ackFloor).toHaveBeenCalledOnce();
+    inbox.verified = false;
+    await expect(p.ackFloor()).rejects.toThrow(/unavailable/);
+    expect(inbox.ackFloor).toHaveBeenCalledOnce();
+    inbox.verified = true;
     expect(sent.calls).toEqual([]);
     delivery.working();
     await delivery.ack();

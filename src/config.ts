@@ -1085,7 +1085,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     timeoutMs: DEFAULT_AGENT_TIMEOUT_MS,
     extensions: true,
     defaultTools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
-    retainRuns: false,
+    retainRuns: true,
     notifyOnComplete: true,
     budgetUsd: 0,
     maxTokensPerChild: 0,

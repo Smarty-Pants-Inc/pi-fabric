@@ -331,7 +331,7 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
     "timeoutMs": 86400000,
     "extensions": true,
     "defaultTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
-    "retainRuns": false,
+    "retainRuns": true,
     "notifyOnComplete": true,
     "budgetUsd": 0,
     "maxTokensPerChild": 0,
@@ -771,6 +771,8 @@ Selecting this remote classifier authorizes sending that evidence to TypeSafe; i
 Authentication uses `/login jev`/`TYPESAFE_API_KEY` on the TypeSafe route, the existing `openrouter` credential (`/login openrouter`, `OPENROUTER_API_KEY`, or `TYPESAFE_OPENROUTER_API_KEY`) on the OpenRouter route, and the existing `vercel-ai-gateway` credential (`/login vercel-ai-gateway` or `AI_GATEWAY_API_KEY`) on the Vercel AI Gateway route, then trusted `jev.credentialCommand`; the command is resolved per classification and not cached across decisions. `jev.maxRequestBytes` and `jev.requestTimeoutMs` apply, with a 30-second classifier timeout ceiling and no automatic retries. Typed token usage is included in approval accounting. TypeSafe does not return prices: cost fields are zero/unpriced, **not evidence that inference is free**.
 
 ## Temporal retention
+
+`agents.retainRuns` defaults to `true`: run files are retained across manager close, subject to the existing retention sweeps and cleanup rules below. Explicit `false` still requests close-time deletion after child transports stop.
 
 Fabric clears inactive run artifacts by age. It never truncates active JSONL files. The defaults are:
 

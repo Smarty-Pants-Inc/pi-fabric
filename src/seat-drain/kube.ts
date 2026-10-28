@@ -72,7 +72,19 @@ export const verifyKubeconfig = async (access: KubeAccess, timeoutMs: number): P
   if (!ca || createHash("sha256").update(ca).digest("hex") !== access.caSha256) throw new SeamGap("kubeconfig-ca-mismatch");
 };
 
-export interface PodView { uid: string; nodeName: string | null; piRunning: boolean; piTerminated: { exitCode: number } | null; meshRoot: string | null }
+export interface PodView {
+  uid: string; nodeName: string | null; piRunning: boolean; piTerminated: { exitCode: number } | null; meshRoot: string | null;
+  /** The pi container's args as the API reports them (the `--session` path A rendered); null when absent. */
+  piArgs: string[] | null;
+  /** The pi container's NATS machine, from its literal PI_FABRIC_MESH_NATS value (`machine`); null when not stated there. */
+  natsMachine: string | null;
+}
+
+/**
+ * The in-image pi-fabric CLI that `kubectl exec` runs inside a seat Pod (fixed argv, ruling 10-25). Confirmed on
+ * 10-25 by the seat image's owner for pi-fabric 0.112.0. The seams still check `test -x` on it inside the Pod first.
+ */
+export const POD_FABRIC_CLI = { path: "/opt/pi-fabric/dist/cli/index.js", confirmed: true } as const;
 
 /** The pod as the API reports it; undefined when it cannot be read. */
 export const readPod = async (access: KubeAccess, name: string, timeoutMs: number): Promise<PodView | undefined> => {
@@ -89,5 +101,9 @@ export const readPod = async (access: KubeAccess, name: string, timeoutMs: numbe
   const state = object(status?.state) ? status.state : {};
   const terminated = object(state.terminated) && Number.isSafeInteger(state.terminated.exitCode) ? { exitCode: state.terminated.exitCode as number } : null;
   const nodeName = object(pod.spec) && typeof pod.spec.nodeName === "string" ? pod.spec.nodeName : null;
-  return { uid: pod.metadata.uid, nodeName, piRunning: object(state.running), piTerminated: terminated, meshRoot };
+  const piArgs = Array.isArray(pi?.args) && pi.args.every(arg => typeof arg === "string") ? [...pi.args as string[]] : null;
+  const natsEnv = env.find(entry => entry.name === "PI_FABRIC_MESH_NATS");
+  const nats = typeof natsEnv?.value === "string" ? json(natsEnv.value) : undefined;
+  const natsMachine = object(nats) && typeof nats.machine === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(nats.machine) ? nats.machine : null;
+  return { uid: pod.metadata.uid, nodeName, piRunning: object(state.running), piTerminated: terminated, meshRoot, piArgs, natsMachine };
 };

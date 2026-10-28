@@ -1028,7 +1028,8 @@ export class NatsBridgePresence {
   /**
    * Live, unique, admitted canonical NATS roots on other machines, as sampled hosts. Before both
    * KV snapshots are ready the answer is an empty partial snapshot: it can never withdraw a mirror.
-   * A root whose owner lease awaits a root re-check is left out and makes the snapshot partial.
+   * An admitted root with missing, aged or root-recheck lease evidence is left out and makes the
+   * snapshot partial: lease uncertainty is not presence deletion and grants no new mirror authority.
    */
   async presence(): Promise<BridgePresence> {
     if (!this.reader.ready) return { hosts: [], participants: [], reserved: [], partial: true };
@@ -1044,13 +1045,14 @@ export class NatsBridgePresence {
     }
     for (const id of [...this.#ambiguous]) if (!ambiguous.includes(id)) this.#ambiguous.delete(id);
     const rechecking = new Set<string>();
+    let leaseUncertain = false;
     for (const route of routes) {
-      if (route.machine === this.reader.machine || (!route.live && !route.rootRecheck) || route.kind !== "root") continue;
+      if (route.machine === this.reader.machine || route.kind !== "root" || KV_TERMINAL.has(route.record.status)) continue;
       const record = projectNatsMirrorRecord(route.record);
       if (!record || !isCanonicalRoot(record.id) || record.id !== record.rootId || record.id !== record.ownerHostId ||
         record.id !== record.ownerIdentityId) continue;
       if (!this.options.admit(record, "toFile", route.machine)) continue;
-      if (route.rootRecheck) {
+      if (route.presenceFailure === "root-recheck") {
         // Its owner is re-checking the root: not routable, so not mirrored live, and not gone, so the
         // snapshot is partial and the file side holds its mirror (to that mirror's own deadline).
         rechecking.add(record.id);
@@ -1060,8 +1062,15 @@ export class NatsBridgePresence {
         }
         continue;
       }
+      if (!route.live) {
+        // The admitted presence row still exists. A missing lease (including broker expiry) or
+        // an aged matching lease proves no liveness, but also no withdrawal. Do not emit a host:
+        // a partial mirror pass keeps only the held mirror's ORIGINAL deadline, even if expired.
+        if (route.leaseLapsed || route.presenceFailure === "no-route") leaseUncertain = true;
+        continue;
+      }
       const remaining = Math.min(MIRROR_FRESH_MS, route.liveUntil - monotonicNow);
-      if (remaining <= 0) continue;
+      if (remaining <= 0) { leaseUncertain = true; continue; }
       const expiresAt = observedAt + remaining;
       hosts.push({
         record: {
@@ -1075,9 +1084,11 @@ export class NatsBridgePresence {
       participants.push(record);
     }
     for (const id of [...this.#rechecking]) if (!rechecking.has(id)) this.#rechecking.delete(id);
-    // During a reconnect gap a root that aged out is unknown, not gone: never withdrawal evidence.
-    // So is a root whose lease awaits a root re-check.
-    return { hosts, participants, reserved: [], ...(this.reader.resyncing || rechecking.size > 0 ? { partial: true } : {}) };
+    // A reconnect gap or an admitted root's uncertain lease is unknown, not gone. A verified
+    // presence deletion removes the route entirely and can still yield a complete empty snapshot.
+    // Partial is snapshot-wide: an unrelated uncertain root also delays that deletion's omission.
+    return { hosts, participants, reserved: [],
+      ...(this.reader.resyncing || rechecking.size > 0 || leaseUncertain ? { partial: true } : {}) };
   }
 
   /**

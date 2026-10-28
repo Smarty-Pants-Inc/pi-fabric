@@ -16,6 +16,7 @@ const stable = [
   "agents.js",
   "jev.js",
   "protocol.js",
+  "recovery.js",
   "judge-cli.js",
   "resident-drain-cli.js",
   "scope.js",
@@ -323,6 +324,10 @@ if ([...startupFiles].some(file => /class ProviderOperations|Fabric provider ope
 const initialSource = [...startupFiles]
   .map((file) => readFileSync(file, "utf8"))
   .join("\n");
+// Recovery evidence is an opt-in package entry, never an idle extension store.
+if (initialSource.includes("src/recovery/recovery-journal.ts") || initialSource.includes("src/recovery/attempt-ledger.ts")) {
+  throw new Error("Recovery evidence store escaped into the startup graph");
+}
 // file-lock, entropy/compiler and entropy/trial are eager while Pi loads dist/index.js (pi-fabric#982): its
 // re-exported entropy barrel imports them. Restore these 3 markers with the bootstrap entry, smarty-dev#10373.
 for (const forbidden of ["src/storage/verified-remove.ts", "src/bash-idle-watchdog.ts", "src/guards/foreground-wait.ts", "src/lifecycle/reload-slots.ts", "src/core/landlock.ts", "src/core/pattern-kill.ts", "src/compaction/hook.ts", "src/compaction/branch-summary.ts", "src/compaction/projections.ts", "src/coordination/unverified-ids.ts", "src/core/auto-approval-classifier-impl.ts", "src/main-agent.ts", "src/providers/agents-message-router.ts", "src/fabric-runtime-state.ts", "src/topology/root-inbox.ts", "src/topology/root-inbox-context.ts", "src/prewalk/handoff.ts", "src/jev/client.ts", "src/ui/languages/bend.ts", "src/ui/settings.ts", "src/ui/conversation.ts", "src/ui/conversation-chrome.ts", 'from "mcporter"', "src/native-discovery.ts", "src/memory/extractive-history.ts", "src/memory/extractive-index.ts", "src/ui/image-overlays.ts", "src/ui/kitty-viewport.ts"]) {

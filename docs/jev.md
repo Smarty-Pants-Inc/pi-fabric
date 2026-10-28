@@ -57,7 +57,44 @@ On Pi 0.99.0 or newer, `/login jev` prompts privately for a TypeSafe API key and
 
 Jev has three upstream routes. Bare aliases (`jev-latest`, `jev-1.13`, `jev-1.13.0`, `jev-preview`) post to TypeSafe's `/v1/systemone`. OpenRouter decisions IDs (`typesafe/jev-1.13`, `~typesafe/jev-latest`) post to OpenRouter's `/api/alpha/decisions` and reuse the **existing `openrouter` credential** (the same `auth.json` entry as your chat models), so `/login openrouter` covers both. OpenRouter serves Jev on its Decisions API, not `/chat/completions`, and has no `jev-preview` alias. Vercel AI Gateway model IDs (`typesafe-ai/jev`, or the `jev-latest` alias) post to its TypeSafe-compatible `/typesafe/v1/systemone` endpoint and reuse the **existing `vercel-ai-gateway` credential** (`/login vercel-ai-gateway`, `AI_GATEWAY_API_KEY`); the request and response shapes stay TypeSafe's own, so only the base URL and key change. No second provider is registered.
 
-TypeSafe route resolution order:
+### Routing TypeSafe through a proxy
+
+The default TypeSafe HTTP endpoint remains `https://api.typesafe.ai/v1/systemone`.
+To route typed Jev evaluations through a TypeSafe-compatible proxy such as LiteLLM,
+set the base URL in trusted Fabric configuration (`fabric.json`):
+
+```json
+{
+  "jev": {
+    "baseUrl": "https://proxy.example/v1"
+  }
+}
+```
+
+The client appends `/systemone`, so this example posts to
+`https://proxy.example/v1/systemone`; supply the base, not the full endpoint.
+Trailing slashes are ignored. Endpoint precedence for the standard TypeSafe route is:
+
+1. Nonblank `PI_FABRIC_JEV_BASE_URL` from the host environment.
+2. Nonblank `jev.baseUrl` from Fabric configuration (trusted project configuration
+   overrides global configuration; untrusted project configuration is ignored).
+3. The unchanged TypeSafe default above.
+
+Environment and config values are trimmed; a blank value is treated as unset.
+The environment override is resolved when each `JevClient` is constructed, including
+clients built directly from defaults; recreate clients/restart the session after
+changing it. This changes only the in-process TypeSafe HTTP destination. OpenRouter
+and Vercel AI Gateway endpoints, explicitly injected custom route endpoints, the
+opt-in Unix-socket gateway, and explicit jev-fabric dispatch remain unchanged.
+The setting does not reroute the separate lossless decisions API.
+
+The typed `{model,state,questions}` body and bearer authentication are unchanged.
+For LiteLLM, use the calling org's proxy virtual key through the existing Jev
+credential sources below (for example `TYPESAFE_API_KEY` when no Pi credential is
+configured); the real TypeSafe key stays on the proxy. No endpoint or key is
+accepted from model-visible `jev.evaluate` arguments.
+
+TypeSafe credential resolution order (unchanged):
 
 1. Pi's provider authentication (`auth.json`, then `TYPESAFE_API_KEY`, including supported Pi runtime overrides).
 2. `TYPESAFE_API_KEY` directly when running without Pi's auth service.
@@ -79,7 +116,7 @@ For Localterm, set this in your trusted `fabric.json` (never put the resolved se
 
 Command-backed credentials are POSIX-only for now: on Windows the command is refused before any process starts (`JevCredentialCommandUnsupportedError`), so use the environment or Pi credential there; model routing then records the pinned fallback. Ponytail follow-up: Windows support needs a persistent owned-tree identity (e.g. a Job Object) so retirement never targets an expired or reused PID.
 
-The command uses argv, not a shell. It runs only when inference needs a key, with a timeout and bounded private output. Successful command credentials are cached until provider reload. Pi credentials are resolved afresh, so login/logout changes are honored. The key is never placed in the guest, request body, browser, or returned diagnostics. HTTP errors expose status codes, not response bodies or headers. Requests use the fixed TypeSafe HTTPS endpoint and reject redirects.
+The command uses argv, not a shell. It runs only when inference needs a key, with a timeout and bounded private output. Successful command credentials are cached until provider reload. Pi credentials are resolved afresh, so login/logout changes are honored. The key is never placed in the guest, request body, browser, or returned diagnostics. HTTP errors expose status codes, not response bodies or headers. Requests use the selected route's endpoint (the TypeSafe default or trusted base URL override above) and reject redirects.
 
 `await jev.status()` reports configuration presence without running the command or making an authentication request. `verified: false` means this status operation did not verify a credential; presence does not prove validity. Missing auth does not prevent deterministic programs from running.
 
@@ -119,7 +156,7 @@ return { team: result.answers.route.choice, refundProbability: result.answers.re
 - Questions are independent and share the same state. Batch independent/speculative questions; a later answer cannot be referenced inside that same request.
 - IDs are for code, not model instructions. Put the full judgment in `instructions`.
 - Keep exact rules, arithmetic, source extraction, action execution, and permissions in code. Confidence is neither truth nor authorization.
-- State is sent to TypeSafe. Bound and minimize browser/application data; do not send secrets or unrelated private content.
+- State is sent to the selected upstream, including a configured proxy. Bound and minimize browser/application data; do not send secrets or unrelated private content.
 
 Fabric accepts up to 128 questions and 255 Choice options per question, subject to the configured request byte cap and upstream limits. Structured JSON instructions/rubrics are supported. Service failures are not automatically retried: a controller must decide whether a retry is affordable and its observation is still fresh. A received transient HTTP status (408, 429, 500, 502, 503, 504 or 529) with validated reported usage rejects with numeric `status` and, when the response sends `Retry-After-Ms` or `Retry-After`, `retryAfterMs` (whole milliseconds, at most one day) on the error object. Missing or invalid usage remains unknown and closes inference for the rest of the run. For HTTP 429/529, back off; do not spin.
 

@@ -9,6 +9,9 @@ export interface FabricJevConfig {
   /** Optional trusted selector, overriding the document default; never affects auto approval. */
   decisionProfile?: string | null;
   model: string;
+  /** Trusted TypeSafe HTTP base URL (for example https://proxy.example/v1); the client appends /systemone.
+   * PI_FABRIC_JEV_BASE_URL overrides it. Other routes and explicit transports are unchanged. */
+  baseUrl?: string;
   /** Minimum Noul safety probability for Jev auto approvals (0–1). */
   autoApprovalThreshold: number;
   /** Trusted host configuration only; argv, never a shell expression. */
@@ -71,6 +74,8 @@ export function normalizeJevConfig(value: unknown): FabricJevConfig {
     // Bare aliases use the direct route; `~typesafe/...` and `typesafe/...` select OpenRouter decisions.
     model: typeof input.model === "string" && isJevModelId(input.model)
       ? input.model : DEFAULT_JEV_CONFIG.model,
+    ...(typeof input.baseUrl === "string" && input.baseUrl.trim()
+      ? { baseUrl: input.baseUrl.trim() } : {}),
     autoApprovalThreshold: typeof input.autoApprovalThreshold === "number" &&
       Number.isFinite(input.autoApprovalThreshold) && input.autoApprovalThreshold >= 0 && input.autoApprovalThreshold <= 1
       ? input.autoApprovalThreshold : DEFAULT_JEV_CONFIG.autoApprovalThreshold,

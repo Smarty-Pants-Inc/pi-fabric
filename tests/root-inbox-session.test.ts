@@ -17,6 +17,7 @@ import { afterEach, describe, expect, it } from "vitest";
 const fabricEntry = path.resolve("dist/index.js");
 const built = fs.existsSync(fabricEntry);
 const HOST_CAPABILITIES_KEY = Symbol.for("pi-fabric.test.hostCapabilities");
+const INBOX_MANAGER_KEY = Symbol.for("pi-fabric.test.inboxManagerObserver");
 const ENV_KEYS = ["PI_FABRIC_MESH_ROOT", "PI_CODING_AGENT_DIR", "PI_FABRIC_INBOX_WAKE_MS", "PI_FABRIC_INBOX_WAKE_COOLDOWN_MS"] as const;
 
 describe.skipIf(!built)("the root inbox in a real Pi session", () => {
@@ -36,11 +37,12 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     }
     for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
     delete (globalThis as Record<symbol, unknown>)[HOST_CAPABILITIES_KEY];
+    delete (globalThis as Record<symbol, unknown>)[INBOX_MANAGER_KEY];
   });
 
   // `wake`: the idle wake ticks every 100 ms with no cooldown (smarty-dev#1595); otherwise it
   // keeps its 15 s default and stays out of these short tests.
-  const start = async (tokensPerSecond = 1_000, wake = false, extra: { persisted?: boolean; extensions?: (root: string) => string[]; warm?: boolean; wakeMs?: string; config?: unknown; optIn?: boolean } = {}) => {
+  const start = async (tokensPerSecond = 1_000, wake = false, extra: { persisted?: boolean; extensionsBefore?: (root: string) => string[]; extensions?: (root: string) => string[]; warm?: boolean; wakeMs?: string; config?: unknown; optIn?: boolean } = {}) => {
     if (wake) {
       process.env.PI_FABRIC_INBOX_WAKE_MS = extra.wakeMs ?? "100";
       process.env.PI_FABRIC_INBOX_WAKE_COOLDOWN_MS = "0";
@@ -66,7 +68,7 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     modelRuntime.registerNativeProvider(faux.provider);
     const loader = new DefaultResourceLoader({
       cwd: root, agentDir, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-      additionalExtensionPaths: [fabricEntry, ...(extra.extensions?.(root) ?? [])],
+      additionalExtensionPaths: [...(extra.extensionsBefore?.(root) ?? []), fabricEntry, ...(extra.extensions?.(root) ?? [])],
     });
     await loader.reload();
     const { session } = await createAgentSession({
@@ -74,7 +76,8 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
       sessionManager: extra.persisted ? SessionManager.create(root, path.join(root, "sessions")) : SessionManager.inMemory(root),
     });
     sessions.push(session);
-    await session.bindExtensions({});
+    // The SDK emits reload's session_start only when an embedder binding remains installed.
+    await session.bindExtensions({ shutdownHandler: async () => {} });
     const inboxMessages = () => session.messages.filter((message) =>
       message.role === "custom" && (message as { customType?: string }).customType === "pi-fabric-inbox");
     // A peer's shadow record from two minutes ago, whose steer never arrived.
@@ -99,6 +102,96 @@ describe.skipIf(!built)("the root inbox in a real Pi session", () => {
     expect(inboxMessages()).toEqual([]);
     return { session, faux, inboxMessages, missedWork, root, meshRoot, loader, modelRuntime };
   };
+
+  it("acks isolated native handler drafts before reconcile, then delivers once across compaction and /reload", async () => {
+    const managers: object[] = [];
+    (globalThis as Record<symbol, unknown>)[INBOX_MANAGER_KEY] = (manager: object) => managers.push(manager);
+    const { session, faux, missedWork, meshRoot, inboxMessages } = await start(100_000, false, {
+      persisted: true,
+      extensions: root => {
+        const observer = path.join(root, "inbox-manager-observer.ts");
+        fs.writeFileSync(observer, `export default function(pi) {
+          pi.on("session_start", (_event, ctx) => globalThis[Symbol.for("pi-fabric.test.inboxManagerObserver")]?.(ctx.sessionManager));
+        }`);
+        return [observer];
+      },
+      extensionsBefore: root => {
+        const adapter = path.join(root, "native-handler-isolation.ts");
+        // npm Pi 1.1.0 passes the original reference. The installed pinned host isolates EACH
+        // message_end handler draft; replay that real boundary on older CI hosts as well.
+        fs.writeFileSync(adapter, `export default function(pi) {
+          pi.on("message_end", event => event.message.role === "custom" && event.message.customType === "pi-fabric-inbox"
+            ? { message: JSON.parse(JSON.stringify(event.message)) } : undefined);
+        }`);
+        return [adapter];
+      },
+    });
+    session.setAutoCompactionEnabled(false);
+    // This fixture is deliberately short; retain a recent turn rather than the default 20k tokens.
+    session.settingsManager.applyOverrides({ compaction: { enabled: false, keepRecentTokens: 128 } });
+    const { MeshStore } = await import("../src/mesh/store.js");
+    const { eventReceipt } = await import("../src/topology/root-inbox-shared.js");
+    const mesh = new MeshStore(meshRoot, 64 * 1024, 100);
+    const key = "topology/inbox/" + createHash("sha256").update(`session:${session.sessionManager.getSessionId()}`).digest("hex").slice(0, 32);
+    const delivered = () => new Set((mesh.get(key, { fresh: true })?.value as { delivered?: string[] } | undefined)?.delivered ?? []);
+    const ids = () => session.sessionManager.getEntries().flatMap(entry => entry.type === "custom_message" && entry.customType === "pi-fabric-inbox"
+      ? (entry.details as { ids?: string[] })?.ids ?? [] : []);
+    try {
+      const first = missedWork("native draft before normal turn");
+      faux.setResponses([() => {
+        // Before turn_end can hide the bug by committing the nonce-verified canonical receipt.
+        expect(delivered().has(eventReceipt(first))).toBe(true);
+        expect(ids()).toEqual([first]);
+        return fauxAssistantMessage("processed first isolated delivery");
+      }]);
+      await session.prompt("receive native draft");
+      faux.setResponses([fauxAssistantMessage("nothing duplicated")]);
+      await session.prompt("normal turn after delivery");
+      expect(ids()).toEqual([first]);
+      // Real bounded tool output gives the default Fabric compactor useful completed context.
+      faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("fabric_exec", { code: 'return "SYNTHETIC_COMPLETED_CONTEXT ".repeat(1600);' })),
+        fauxAssistantMessage("completed synthetic setup"),
+      ]);
+      await session.prompt("complete synthetic setup before compaction");
+      faux.setResponses([fauxAssistantMessage("## Progress\nProcessed first isolated delivery.\n## Next Steps\nWait for new work.")]);
+      await session.compact();
+      expect(session.sessionManager.getEntries().some(entry => entry.type === "compaction")).toBe(true);
+      const second = missedWork("native draft after compaction");
+      faux.setResponses([() => {
+        expect(delivered().has(eventReceipt(second))).toBe(true);
+        return fauxAssistantMessage("processed after compaction");
+      }]);
+      await session.prompt("receive after compaction");
+      expect(ids()).toEqual([first, second]);
+      type Custody = { sessionId: string; receipts: Map<string, object>; consumed: WeakSet<object> };
+      const custody = () => (globalThis as Record<symbol, WeakMap<object, Custody>>)[Symbol.for("pi-fabric.rootInboxReceiptIssuers.v1")]?.get(managers.at(-1)!);
+      const beforeReload = custody();
+      const nonce = (inboxMessages().at(-1) as { details: { nonce: string } }).details.nonce;
+      expect(beforeReload?.sessionId).toBe(session.sessionManager.getSessionId());
+      const snapshot = beforeReload!.receipts.get(nonce)!;
+      expect(snapshot).toBeDefined();
+      expect(beforeReload!.consumed.has(snapshot)).toBe(true);
+      await session.reload(); // Actual SDK reload: shutdown, reload extension modules, session_start.
+      expect(managers).toHaveLength(2);
+      expect(managers[1]).toBe(managers[0]);
+      expect(custody()).toBe(beforeReload); // Real reloaded modules share custody.
+      expect(custody()?.receipts.get(nonce)).toBe(snapshot);
+      expect(custody()?.consumed.has(snapshot)).toBe(true);
+      const third = missedWork("native draft after reload");
+      faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", { code: "return 1" })), () => {
+        expect(delivered().has(eventReceipt(third))).toBe(true);
+        return fauxAssistantMessage("processed after reload");
+      }, fauxAssistantMessage("settled")]);
+      await session.prompt("activate and receive after reload");
+      expect(ids()).toEqual([first, second, third]);
+      faux.setResponses([fauxAssistantMessage("no lost or repeated work")]);
+      await session.prompt("verify after reload");
+      expect(ids()).toEqual([first, second, third]);
+      expect(new Set(ids()).size).toBe(3);
+      expect(inboxMessages().length).toBeGreaterThan(0);
+    } finally { mesh.closeState(); }
+  }, 60_000);
 
   it("does not cache a failed native session append before its shadow, then delivers once after reload (F5)", async () => {
     const h = await start(1_000, false, { persisted: true });

@@ -7,6 +7,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
+import { configureFabricDiagnostics, fabricDiagnosticsFile, flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import { confirmWitnessPlatform, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
@@ -1689,6 +1690,14 @@ describe("ParticipantDirectory", () => {
       vi.spyOn(Math, "random").mockReturnValue(0.999999);
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-outage-"));
       roots.push(root);
+      vi.stubEnv("SMARTY_ROLE", "worktree-agent@x");
+      vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+      configureFabricDiagnostics("directory-outage");
+      const lines = async (): Promise<string[]> => {
+        await flushFabricDiagnostics();
+        return fs.readFileSync(fabricDiagnosticsFile("directory-outage"), "utf8").trim().split("\n")
+          .map(line => JSON.parse(line).message);
+      };
       const identity: MeshIdentity = { id: "session:busy", name: "main", kind: "main", sessionId: "busy" };
       const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 100 });
       const source = vi.fn(() => [rootRecord(identity.id, identity.id, "busy")]);
@@ -1728,8 +1737,8 @@ describe("ParticipantDirectory", () => {
         hold();
         const holder = fs.readFileSync(path.join(lockPath, "owner"), "utf8");
         expect(await tick()).toBe("retry");
-        expect(warn).toHaveBeenCalledOnce();
-        expect(warn.mock.calls[0]![0]).toContain(`pid ${process.pid}`);
+        expect(await lines()).toHaveLength(1);
+        expect((await lines())[0]).toContain(`pid ${process.pid}`);
         const retry = runs.mock.contexts.at(-1) as MeshBackgroundRetry;
         const recovered = vi.spyOn(retry, "success");
         await vi.advanceTimersByTimeAsync(retry.waitMs);
@@ -1747,7 +1756,7 @@ describe("ParticipantDirectory", () => {
         expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(holder);
 
         expect(await tick()).toBe("retry");
-        expect(warn).toHaveBeenCalledOnce(); // same live holder, same continuous outage
+        expect(await lines()).toHaveLength(1); // same live holder, same continuous outage
         expect(retry.waitMs).toBeGreaterThan(0); // second timeout retained the doubled delay
         heartbeat();
         expect(await runs.mock.results.at(-1)!.value).toBe("skipped");
@@ -1763,7 +1772,7 @@ describe("ParticipantDirectory", () => {
         expect(await tick()).toBe("retry");
         // smarty-dev#8305: a later outage inside the warning window is counted, not printed.
         // (This asserted the old once-per-outage warning, unbounded on a flapping lock.)
-        expect(warn).toHaveBeenCalledOnce();
+        expect(await lines()).toHaveLength(1);
 
         // The first real acquisition after the window prints the final summary of both
         // suppressed retries (the continuous outage's second timeout and the later outage).
@@ -1772,13 +1781,16 @@ describe("ParticipantDirectory", () => {
         expect(retry.waitMs).toBe(0);
         expect(await tick()).toBe("done");
         expect(recovered).toHaveBeenCalledTimes(2);
-        expect(warn).toHaveBeenCalledTimes(2);
-        expect(warn.mock.calls[1]![0]).toMatch(
+        expect(await lines()).toHaveLength(2);
+        expect((await lines())[1]).toMatch(
           /^\[pi-fabric\] participant heartbeat\/change refresh: mesh lock recovered \(2 similar retries suppressed in the last 6\ds\)$/);
+        expect(warn).not.toHaveBeenCalled();
       } finally {
         fs.rmSync(lockPath, { recursive: true, force: true });
         await directory.close();
+        await flushFabricDiagnostics();
         vi.restoreAllMocks();
+        vi.unstubAllEnvs();
         vi.useRealTimers();
       }
     });

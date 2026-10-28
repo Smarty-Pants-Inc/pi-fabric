@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { diagnostics } from "../core/diagnostics.js";
+import { diagnostics, logDiagnostic } from "../core/diagnostics.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -783,6 +783,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #rootRecheckPending = false;
   #transportLost = false;
   readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh")
+    .diagnosticsTo(line => logDiagnostic("src/topology/participant-directory.ts", line))
     .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.options.identity })));
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
@@ -1364,7 +1365,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           dedupeKey: `participant-source:${this.options.hostId}:${this.ownerIncarnation}:${randomUUID()}`, alarmed: false };
         this.#sourceFailures.set(source, incident);
         // Dedupe by source + fixed reason, NOT changing error text or failed item.
-        diagnostics.warn("src/topology/participant-directory.ts", `[pi-fabric] isolated participant snapshot source ${incident.source} failed; omitting failed records: ${detail instanceof Error ? detail.message : String(detail)}`);
+        logDiagnostic("src/topology/participant-directory.ts", `[pi-fabric] isolated participant snapshot source ${incident.source} failed; omitting failed records: ${detail instanceof Error ? detail.message : String(detail)}`);
       }
       if (!wholeSource && failedIds.size === 1) incident.participantId = failedIds.values().next().value!;
       else delete incident.participantId;

@@ -138,21 +138,18 @@ export const appendDiagnosticSync = (id: string, line: string, bytes: number): v
 const drain = (): void => {
   if (draining || !pending.some(row => row.id)) return;
   // Actual first diverted diagnostic, never registration or an idle lifecycle hook.
-  let loaded = false;
   draining = import("./diagnostics-log.js").then(({ appendDiagnostic }) => {
-    loaded = true;
-    const batch = pending;
-    pending = [];
     pendingBytes = 0;
-    for (const row of batch) {
+    for (const row of pending.splice(0)) {
       if (row.id) appendDiagnostic(row.id, row.line, row.bytes);
       else { pending.push(row); pendingBytes += row.bytes; }
     }
-  }).catch(() => {
-    // Keep the bounded queue for a future diagnostic to retry; never fall back to the pane.
-  }).finally(() => {
+  }).then(() => {
     draining = undefined;
-    if (loaded) drain(); // Include lines queued between the import's resolution and this continuation.
+    drain(); // Include lines queued between the import's resolution and this continuation.
+  }, () => {
+    // Keep the bounded queue for a future diagnostic to retry; never fall back to the pane.
+    draining = undefined;
   });
 };
 
@@ -162,13 +159,15 @@ const enqueue = (level: Level, source: string, message: string): void => {
     source: source.slice(0, 1024), message: message.slice(0, 64 * 1024) })}\n`;
   const bytes = Buffer.byteLength(line);
   while (pending.length && pendingBytes + bytes > DIAGNOSTICS_MAX_BYTES) pendingBytes -= pending.shift()!.bytes;
-  pending.push({ id: sessionId ?? (process.env.PI_FABRIC_SESSION_ID?.trim() || undefined), line, bytes });
+  // Principals keep pre-session rows bindable; sessionless workers persist at first use.
+  pending.push({ id: sessionId ?? (process.env.PI_FABRIC_SESSION_ID?.trim() ||
+    (isPrincipalDiagnostics() ? undefined : `process-${process.pid}`)), line, bytes });
   pendingBytes += bytes;
   if (!exitFlushRegistered) {
     exitFlushRegistered = true;
     // An exit handler cannot await the lazy import. Use the same bounded, private writer.
     process.once("exit", () => {
-      for (const row of pending) if (row.id) appendDiagnosticSync(row.id, row.line, row.bytes);
+      for (const row of pending) appendDiagnosticSync(row.id ?? `process-${process.pid}`, row.line, row.bytes);
       pending = [];
       pendingBytes = 0;
     });
@@ -177,10 +176,15 @@ const enqueue = (level: Level, source: string, message: string): void => {
 };
 
 export const configureFabricDiagnostics = (id: string): void => {
-  if (!isPrincipalDiagnostics() || !id) return;
+  if (!id) return;
   sessionId = id;
   for (const row of pending) row.id ??= id;
   drain();
+};
+
+/** Log-only internal diagnostic for every role; never falls back to console or UI. */
+export const logDiagnostic = (source: string, message: string, level: Level = "warning"): void => {
+  try { enqueue(level, source, message); } catch {}
 };
 
 /** Await already-requested writes for checks/shutdown; does not activate an idle sink. */

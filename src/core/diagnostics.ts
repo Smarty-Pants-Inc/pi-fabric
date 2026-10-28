@@ -6,6 +6,7 @@ export {
   fabricDiagnosticsFile,
   appendDiagnosticSync,
   configureFabricDiagnostics,
+  logDiagnostic,
   flushFabricDiagnostics,
   diagnostics,
   notifyDiagnostic,

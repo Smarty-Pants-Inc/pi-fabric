@@ -297,7 +297,9 @@ it("the real runtime isolates only independent task/actor/provider source faults
   await assertHealthy();
 }, 30_000);
 
-it.each(["project", "session"] as const)("one %s actor's strict preparing-result fault preserves healthy actors, reports its id, and recovers (#17018 P2-1)", async (scope) => {
+it.each([
+  ["project", "missing"], ["session", "missing"], ["project", "hard-linked"], ["session", "hard-linked"],
+] as const)("%s actor inventory needs no %s saved result during queued-to-settled handoff", async (scope, damage) => {
   const { base, runRoot, ownerId, runtime, manager, directory, control, status, sources, sendMessage } = await runtimeFixture();
   const deferred = () => {
     let resolve!: () => void;
@@ -362,23 +364,36 @@ it.each(["project", "session"] as const)("one %s actor's strict preparing-result
     const bytes = fs.readFileSync(resultFile);
     const preserved = path.join(base, "preserved-actor-result.json");
     expect(fs.statSync(resultFile).nlink).toBe(1);
-    fs.linkSync(resultFile, preserved);
-    expect(fs.statSync(resultFile).nlink).toBe(2);
-    expect(fs.readFileSync(resultFile)).toEqual(bytes);
+    if (damage === "missing") {
+      fs.unlinkSync(resultFile); // Test-owned result only; public reads must still fail closed.
+      expect(fs.existsSync(resultFile)).toBe(false);
+    } else {
+      fs.linkSync(resultFile, preserved);
+      expect(fs.statSync(resultFile).nlink).toBe(2);
+      expect(fs.readFileSync(resultFile)).toEqual(bytes);
+    }
     const strictError = (await observe(() => actors.listOwned(true))).error;
     expect(strictError).toMatchObject({ code: "FABRIC_MISSING_RESULT" });
     expect((await observe(() => actors.listOwned())).error).toEqual(strictError);
     expect((await observe(() => actors.list())).error).toEqual(strictError);
     expect((await observe(() => actors.status(damaged.id))).error).toEqual(strictError);
     const reportFailure = vi.fn();
+    const strictReader = vi.spyOn(manager, "status");
+    const open = vi.spyOn(fs, "openSync");
     const records = sources.get("actors")!(reportFailure);
-    expect(records.map(record => record.id).sort()).toEqual([healthy.id, otherScope.id].sort());
-    expect(reportFailure).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ code: "FABRIC_MISSING_RESULT" }), damaged.id);
+    expect(records.map(record => record.id).sort()).toEqual([damaged.id, healthy.id, otherScope.id].sort());
+    expect(reportFailure).not.toHaveBeenCalled();
     await expect(directory.refresh()).resolves.toBeUndefined();
-    expect(directory.isolatedSourceFailures()).toContainEqual({ source: "actors", participantId: damaged.id,
-      reason: "participant snapshot source failed", since: expect.any(Number) });
-    expect(directory.get(damaged.id, undefined, { fresh: true })).toBeUndefined();
-    for (const actor of [healthy, otherScope]) expect(directory.get(actor.id, undefined, { fresh: true }))
+    // Exercise the actual change-driven source, not just an explicit refresh.
+    const presence = vi.spyOn(manager, "listForPresence");
+    directory.scheduleRefresh();
+    await vi.waitFor(() => expect(presence).toHaveBeenCalled(), { timeout: 3_000 });
+    expect(strictReader).not.toHaveBeenCalled();
+    expect(open.mock.calls.filter(([file]) => String(file) === resultFile)).toEqual([]);
+    strictReader.mockRestore();
+    open.mockRestore();
+    expect(directory.isolatedSourceFailures()).toEqual([]);
+    for (const actor of [damaged, healthy, otherScope]) expect(directory.get(actor.id, undefined, { fresh: true }))
       .toMatchObject({ id: actor.id, kind: "actor" });
     expect(directory.get(ownerId, undefined, { fresh: true })).toMatchObject({ id: ownerId, kind: "root" });
     expect(control.options.canConsumeMesh?.()).toBe(true);
@@ -397,8 +412,8 @@ it.each(["project", "session"] as const)("one %s actor's strict preparing-result
       content: expect.stringContaining("control survives one damaged actor"),
     }), expect.objectContaining({ deliverAs: "followUp", triggerTurn: false }));
     expect((await observe(() => manager.status(activationId!))).error).toEqual(strictError);
-    // Recovery is actor lifecycle progress, NOT unlink/rewrite of an authenticated
-    // file (unlink cannot restore ctime). Native archival may then retire its handle.
+    // Inventory did not authenticate or repair a result. Lifecycle handoff still
+    // clears preparing normally; native archival may then retire its handle.
     handoff.resolve();
     expect((await outcome).error).toBeNull();
     expect(actors.status(damaged.id)).not.toHaveProperty("preparing");

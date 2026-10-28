@@ -9,7 +9,7 @@ import { MeshBackgroundRetry, MeshLockTimeoutError, meshRetryWarningWindowMs } f
 const busy = () => new MeshLockTimeoutError(" held by pid 123 (alive, running)", 6, 8020);
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllEnvs(); });
 
-// smarty-dev#8305 end to end: a real ParticipantDirectory heartbeat loop in its own Node
+// End to end: a real ParticipantDirectory heartbeat loop in its own Node
 // process, behind real mesh lock files that process holds, on real timers. Only the window is
 // shortened (PI_FABRIC_MESH_RETRY_WARNING_WINDOW_MS) so the run takes seconds, not minutes.
 describe("real participant directory under a held mesh lock", () => {
@@ -26,28 +26,34 @@ describe("real participant directory under a held mesh lock", () => {
   });
   afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
 
-  it("prints at most one warning per window across a held outage and a flapping lock, then a final summary", async () => {
-    const cwd = path.join(root, "probe");
-    fs.mkdirSync(cwd);
-    const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+  it("persists at most one diagnostic per window across a held outage and a flapping lock, then a final summary", async () => {
+    const cwd = fs.mkdtempSync(path.join(root, "probe-"));
+    const result = await new Promise<{ code: number | null; output: string; stderr: string }>((resolve, reject) => {
       const child = spawn(process.execPath, ["--unhandled-rejections=strict", bundle, cwd],
         { env: { ...process.env, PI_FABRIC_MESH_RETRY_WARNING_WINDOW_MS: String(windowMs) } });
-      let output = "";
+      let output = "", stderr = "";
       child.stdout.on("data", chunk => { output += chunk; });
-      child.stderr.on("data", chunk => { output += chunk; });
+      child.stderr.on("data", chunk => { stderr += chunk; });
       const timeout = setTimeout(() => child.kill("SIGKILL"), 75_000);
       child.on("error", reject);
-      child.on("close", code => { clearTimeout(timeout); resolve({ code, output }); });
+      child.on("close", code => { clearTimeout(timeout); resolve({ code, output, stderr }); });
     });
-    expect(result.code, result.output).toBe(0);
+    expect(result.code, result.output + result.stderr).toBe(0);
+    // Local Node children inherit the test filesystem guard's exact startup banner.
+    // Strip only that one line; every product warning or other stderr byte still fails.
+    expect(result.stderr.replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/, "")).toBe("");
     const report = result.output.split("\n").find(line => line.startsWith("RATE "));
     expect(report, result.output).toBeDefined();
+    expect(result.output.trim()).toBe(report); // No diagnostic console/UI output besides the probe receipt.
     const rate = JSON.parse(report!.slice(5)) as {
-      windowMs: number; pid: number; outages: number; timeouts: number; lines: Array<{ at: number; text: string }> };
+      windowMs: number; pid: number; outages: number; timeouts: number;
+      lines: Array<{ at: number; text: string; level: string; source: string }> };
     const evidence = JSON.stringify(rate, null, 1);
     expect(rate.windowMs).toBe(windowMs);
-    // Every warning is this path's: nothing else, and no unrelated-error lines, reached stderr.
-    expect(rate.lines.every(line => line.text.startsWith(`[pi-fabric] ${label}: mesh lock `)), evidence).toBe(true);
+    // Read the actual private JSONL: every warning belongs to this path, with no unrelated errors.
+    expect(rate.lines.length, evidence).toBeGreaterThanOrEqual(3);
+    expect(rate.lines.every(line => line.level === "warning" && line.source === "src/topology/participant-directory.ts" &&
+      Number.isFinite(line.at) && line.at >= 0 && line.text.startsWith(`[pi-fabric] ${label}: mesh lock `)), evidence).toBe(true);
     const retrying = rate.lines.filter(line => line.text.includes(": mesh lock timeout; retrying in "));
     const summary = rate.lines.at(-1)!;
 
@@ -66,7 +72,7 @@ describe("real participant directory under a held mesh lock", () => {
     // The final summary follows the last real acquisition after the window.
     expect(summary.text, evidence).toMatch(
       new RegExp(`^\\[pi-fabric\\] ${label.replace("/", "\\/")}: mesh lock recovered \\(([1-9]\\d*) similar retries suppressed in the last \\d+s\\)$`));
-    // Every typed lock timeout was either printed or counted in exactly one summary.
+    // Every typed lock timeout was either persisted or counted in exactly one summary.
     const counted = rate.lines.reduce((sum, line) => sum + Number(/\((\d+) similar retries suppressed/.exec(line.text)?.[1] ?? 0), 0);
     expect(retrying.length + counted, evidence).toBe(rate.timeouts);
   }, 90_000);

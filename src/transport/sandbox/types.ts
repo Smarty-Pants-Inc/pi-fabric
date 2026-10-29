@@ -121,6 +121,8 @@ export interface SandboxTransportConfig {
   enabled: boolean;
   /** Legacy deployment metadata; placement chooses the SandboxTemplate from profile. */
   template: string;
+  /** Expected Placement Claim namespace; defaults to "smarty-island" when omitted. */
+  namespace?: string;
   placementUrl?: string;
   readyTimeoutMs: number;
 }

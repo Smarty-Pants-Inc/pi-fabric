@@ -6,7 +6,10 @@ One co-versioned file set. Import `B4EffectRecoveryProviderV1` from `contract.ts
 
 `runConformance` registers Vitest tests. Its argument is a fixture factory
 (`ConformanceFactory` in `fixtures.ts`), which creates an isolated provider plus
-retained-state/destination controls. These controls are **not** provider methods.
+retained-state/destination controls. A `ScenarioSource` may be a concrete consumer
+scenario or a callback receiving the harness's `recoveryIdentity()` accessor;
+resolve the callback after acquiring that independent identity and before issuing
+intents. These controls are **not** provider methods.
 The fake implements the complete interface; the real factory exposes the
 unmodified `createCertifiedEffectRecordPort`, including its missing/incompatible
 methods, without shimming failures into successes.
@@ -14,13 +17,16 @@ methods, without shimming failures into successes.
 ```sh
 B4_CONFORMANCE_TARGET=fake bunx --no-install vitest run tests/contracts/l7-b4-effect-recovery-provider-v1/provider.test.ts --reporter=verbose
 B4_CONFORMANCE_TARGET=real bunx --no-install vitest run tests/contracts/l7-b4-effect-recovery-provider-v1/provider.test.ts --reporter=verbose
-bunx --no-install vitest run tests/contracts/l7-b4-effect-recovery-provider-v1/consumer.test.ts tests/contracts/l7-b4-effect-recovery-provider-v1/resolver-errors.test.ts --reporter=verbose
+bunx --no-install vitest run tests/contracts/l7-b4-effect-recovery-provider-v1/consumer.test.ts tests/contracts/l7-b4-effect-recovery-provider-v1/resolver-errors.test.ts tests/contracts/l7-b4-effect-recovery-provider-v1/identities.test.ts --reporter=verbose
 ```
 
-`provider.test.ts` runs 33 cases per target (C01–C35 except moved C21/C22).
+`provider.test.ts` runs 34 cases per target (C01–C36 except moved C21/C22).
 `consumer.test.ts` adds four fake configurability flows; `resolver-errors.test.ts`
-runs the same 33 cases with resolver messages that omit the error code.
+runs the same 34 cases with resolver messages that omit the error code.
+`identities.test.ts` runs the same 34 cases with distinct non-default identities.
 C13 forces a sink await; C35 reads the adapter-original path with no timestamp.
+C36 refuses the right original with a wrong admissionId (`RECOVERY_CONFLICT`),
+checks no retained-state change, then checks that the valid input still repairs.
 
 The default runs both. Real-provider failures remain ordinary failing tests,
 not skips or expected failures. The selected integration head does not yet
@@ -37,6 +43,9 @@ implement the entire frozen R3/B3 contract. This draft must not be called G2 GRE
 - G4: B4 never mints a generation. B5/Main owns pin creation and refusal, not
   B4. C21/C22 moved to `../l7-b5-main-generation-v1/conformance.ts`, exported as
   `runGenerationPinConformance`; Main/B5 must bind/run it by 2026-10-30 18:00Z.
+  Per the final CoS scope ruling, those sibling C21/C22 cases are not changed
+  here: their remaining `GENERATION` / `intent()` fixture coupling belongs to
+  fv2-l7-main2 + fv2-l7-b5r2. This is not a C21/C22 execution or identity-fix claim.
   The B4 fake has no hidden pin check. Its receipt generation is fixture input,
   not proof of B5 admission. See that suite's README for unexecuted coverage.
 - Receipt `viewSha256` was removed in v2 because Pi's request digest contains
@@ -54,15 +63,18 @@ implement the entire frozen R3/B3 contract. This draft must not be called G2 GRE
   Main owns the per-original hold versus integration decision. Do not stamp
   unrelated pending intents with one selected original's g.
 
-## Harness-supplied identities (Ch1)
+## Harness-supplied identities (Ch1 and N1)
 
 Every `ConformanceHarness` must expose `recoveryIdentity()` returning
 `{ acceptedInput, recoveryGeneration, executionBranchEntryId }`. The expected
 values are independent of the B4 ref/view. Real B5 compositions supply the actual
 selection's admissionId/deliveryId, the retained delivery anchor, and g returned
 by `ensureRecoveryGeneration`; never seed a pin or mock the UUID allocator.
-The fake supplies its stand-in values through the same accessor. The shared
-repair cases check deliveryId == admissionId and observed settlement g == pin g,
+The fake supplies its stand-in values through the same accessor. Every shared
+scenario intent now takes session, original and A from that accessor before it
+is issued, including dependent/peer intents, alias keys and dedupe keys. Each
+seeded intent is also checked against the harness observations. A native anchor
+need not equal the fake's default `"A"`. The shared repair cases check deliveryId == admissionId and observed settlement g == pin g,
 then retain all ref/view/hash/reopen/forgery/J2 assertions unconditionally.
 
 `createAcceptedInput(now)` captures a deadline 120 seconds after the harness clock;
@@ -70,11 +82,31 @@ then retain all ref/view/hash/reopen/forgery/J2 assertions unconditionally.
 renew that deadline. Consumer P2 also checks a clock in 2031.
 `createReal(scenario, { recoveryIdentity })` accepts observations from real B5.
 Without that option it remains the explicitly labelled B4-only boundary probe:
-the contract base has no B5 allocator. Ch1's real B5 proof uses the approved
-combined base `cf50f1d995cb78e7d0ea591dbdb6025247c966f4` with this contract merged,
-not fabricated B5 state on the old base. Its native owner/delivery fixture is
-`probe:native-Pi`; missing B4 repair methods stay RED. Round-4 `RESULT.md` retains
-the wiring, exact counts and mutant evidence; no production file changes.
+the contract base has no B5 allocator. The v6 real B5 proof uses combined head
+`dc1808ddb03fcf3fdfaf7d6059389e509efe6cd5` with this contract merged in scratch
+(the merge is not pushed), not fabricated B5 state on the old base. Native
+owner/delivery fixtures remain explicitly probes, not native/B6 qualification;
+missing B4 repair methods stay RED. Round-5 `RESULT.md` retains the wiring,
+per-case v5 comparison, exact counts and mutant evidence; no production file changes.
+
+## Committed real-B5 target (N2)
+
+`real-b5.ts` and `real-b5.test.ts` are the round-4 composition harness, now part
+of this contract source set. Run on the combined branch with v6 merged, not on
+the contract-only F base: that base lacks the real B5 allocator/admission exports.
+No fake, pin seeding or compatibility shim substitutes for missing B5 functions.
+
+```sh
+bunx --no-install vitest run tests/contracts/l7-b4-effect-recovery-provider-v1/real-b5.test.ts --testTimeout=60000 --reporter=verbose --reporter=json --outputFile.json=/tmp/b4-real-b5.json
+```
+
+This runs all 34 cases through actual B5 admission, selection, generation pin,
+delivery, interruption and retained reopen, then the unmodified real B4 port.
+The verbose/JSON reporters retain per-case statuses, including ordinary REDs
+for the absent real repair methods. The 60-second runner budget does not extend
+the original-input deadline (120 seconds). Native owner/delivery are still
+`probe:native-Pi`; this is not native/B6 qualification. See round-5 `RESULT.md`
+for the per-case comparison with v5 and the additional distinct-anchor proof.
 
 ## Consumer-owned identities (K9)
 
@@ -114,7 +146,18 @@ export or change to B4 behavior. Passing the fake never enables REQUIRED.
 
 The authoritative source-pinned narrative and conflicts are co-versioned here:
 [`B4-CONTRACT.md`](./B4-CONTRACT.md). Verify its frozen bytes from this directory
-with `sha256sum -c B4-CONTRACT.sha256`. V2 corrects K1–K4; v3 applies K5–K9;
-v4 records K10 and its restored settlement obligations; v5 applies Ch1.
-The round-2 `PHASE1.md` (v2) and `RESULT.md` (v3) record commit/hash and per-test evidence. CoS owns PR
-body updates; the builder is authorized only to push this branch.
+with `sha256sum -c B4-CONTRACT.sha256`. Contract revisions are distinct from the
+unchanged provider ABI `V1`:
+
+- v2: K1–K4, contract SHA-256 prefix `38e0f907`.
+- v3: K5–K9, contract SHA-256 prefix `878cdd86`.
+- Historical K10 text `1c4446be` and its settlement-obligations correction
+  `a118f496` are cited by contract hash, not assigned a shared version label.
+- v5: Ch1, contract SHA-256
+  `5999e635b3554acd9d9b5843eb66479d4479db198384c53479501a98819e91fe`.
+- v6: N1/N2/N4/N5, contract SHA-256
+  `7f0dad114164261e28f44b58fe9425d48d7ce6f49f380c49d8aa758b7419ba9a`.
+
+The round-2 `PHASE1.md` (v2) and `RESULT.md` (v3), round-4 `RESULT.md` (v5),
+and round-5 `RESULT.md` (v6) record commit/hash and per-test evidence. CoS owns
+PR body updates; the builder is authorized only to push this branch.

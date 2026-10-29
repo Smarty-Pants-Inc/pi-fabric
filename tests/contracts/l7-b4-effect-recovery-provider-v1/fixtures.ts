@@ -61,7 +61,13 @@ export interface ConformanceHarness {
   fileSnapshot(): { bytes: string; identity: string };
   dispose(): Promise<void>;
 }
-export type ConformanceFactory = (scenario: Scenario) => Promise<ConformanceHarness>;
+/** Resolve only after the harness has obtained its independent input/pin/anchor.
+ * Existing consumer-owned concrete scenarios remain supported. */
+export type ScenarioSource = Scenario | ((h: Pick<ConformanceHarness, "recoveryIdentity">) => Scenario);
+export type ConformanceFactory = (scenario: ScenarioSource) => Promise<ConformanceHarness>;
+export function resolveScenario(source: ScenarioSource, h: Pick<ConformanceHarness, "recoveryIdentity">): Scenario {
+  return typeof source === "function" ? source(h) : source;
+}
 
 export interface FixtureIdentity {
   readonly acceptedInput: Readonly<AcceptedRecoveryInput>;

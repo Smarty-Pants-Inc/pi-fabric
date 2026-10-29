@@ -1,8 +1,8 @@
 import type { EffectIntent, EffectOutcome } from "../../../src/effects/contracts.js";
 import { canonicalEncode, intentBindingDigest } from "../../../src/effects/slots.js";
 import type { AcceptedRecoveryInput, B4EffectRecoveryProviderV1, RepairRef, RepairReceiptView, SettledRecoveryEffect } from "./contract.js";
-import { adapterOriginalResult, canonicalCopy, copy, createAcceptedInput, createSinkGate, fail, GENERATION, hash, immutable, intent, joinedBranch, joinedEvidence, originalResult, SESSION,
-  type ConformanceHarness, type Scenario } from "./fixtures.js";
+import { adapterOriginalResult, canonicalCopy, copy, createAcceptedInput, createSinkGate, fail, GENERATION, hash, immutable, intent, joinedBranch, joinedEvidence, originalResult, resolveScenario, SESSION,
+  type ConformanceHarness, type ScenarioSource } from "./fixtures.js";
 
 export interface FakeOptions {
   readonly now?: () => number;
@@ -19,11 +19,16 @@ export interface FakeHarness extends Omit<ConformanceHarness, "provider"> {
 
 /** Producer-owned TEST ONLY. In-memory behavior model, never a durability,
  * native receipt, B1 witness or peer sink implementation. No production exports. */
-export async function createFake(scenario: Scenario = {}, options: FakeOptions = {}): Promise<FakeHarness> {
+export async function createFake(source: ScenarioSource = {}, options: FakeOptions = {}): Promise<FakeHarness> {
   const sessionId = options.sessionId ?? options.acceptedInput?.sessionId ?? SESSION;
   const acceptedInput = immutable(copy(options.acceptedInput ?? { ...createAcceptedInput(options.now), sessionId }));
   if (acceptedInput.sessionId !== sessionId) throw new Error("Fake session and accepted input must agree");
   const identity = { acceptedInput, executionBranchEntryId: options.executionBranchEntryId ?? "A" };
+  // Receipt fixture input only. Pin allocation/validation belongs to B5/Main,
+  // not this provider; no hidden pin check before settlement or repair.
+  const receiptGeneration = options.pin ?? GENERATION;
+  const recoveryIdentity = () => immutable(copy({ ...identity, recoveryGeneration: receiptGeneration }));
+  const scenario = resolveScenario(source, { recoveryIdentity });
   const sinkGate = createSinkGate(scenario.stallSink);
   const resultFor = scenario.resultSource === "adapter-original" ? adapterOriginalResult : originalResult;
   const intents = new Map<string, EffectIntent>();
@@ -31,9 +36,6 @@ export async function createFake(scenario: Scenario = {}, options: FakeOptions =
   const destination = new Set(scenario.committedBeforeAck ?? []);
   const observed: EffectIntent[] = [];
   const generations: string[] = [];
-  // Receipt fixture input only. Pin allocation/validation belongs to B5/Main,
-  // not this provider; no hidden pin check before settlement or repair.
-  const receiptGeneration = options.pin ?? GENERATION;
   let fileBytes = scenario.fileState === "post" ? "after" : scenario.fileState === "neither" || scenario.shellState === "changed" ? "foreign" : "before";
   let fileIdentity = "original-inode";
   let joinedLeaf = options.joinedLeafEntryId ?? "J";
@@ -125,7 +127,7 @@ export async function createFake(scenario: Scenario = {}, options: FakeOptions =
       return receipt;
     },
   };
-  return { provider, recoveryIdentity: () => immutable(copy({ ...identity, recoveryGeneration: receiptGeneration })), issue, async reopen() { /* Same retained model state; NOT a process-crash proof. */ },
+  return { provider, recoveryIdentity, issue, async reopen() { /* Same retained model state; NOT a process-crash proof. */ },
     destination: () => [...destination], observedIntents: () => copy(observed), generations: () => [...generations],
     async ledgerDigest() { return hash(canonicalEncode({ intents: [...intents.values()], outcomes: [...outcomes], receipt: receipt ?? null })); },
     joinedBranch: () => copy(joinedBranch(joinedLeaf, identity)), sinkGate,
@@ -135,6 +137,6 @@ export async function createFake(scenario: Scenario = {}, options: FakeOptions =
 
 /** Full-provider accessor for consumers that do not need retained-state controls.
  * No Partial cast; all four methods are available in the exported return type. */
-export async function createFakeProvider(scenario: Scenario = {}, options: FakeOptions = {}): Promise<B4EffectRecoveryProviderV1> {
+export async function createFakeProvider(scenario: ScenarioSource = {}, options: FakeOptions = {}): Promise<B4EffectRecoveryProviderV1> {
   return (await createFake(scenario, options)).provider;
 }

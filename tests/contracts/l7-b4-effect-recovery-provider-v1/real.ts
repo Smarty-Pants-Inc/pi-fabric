@@ -7,7 +7,7 @@ import { EffectStore } from "../../../src/effects/store.js";
 import { canonicalEncode, mintEffectKey, manifestDigest } from "../../../src/effects/slots.js";
 import { prepareFileEffect } from "../../../src/effects/file.js";
 import { prepareShellEffect, shellEffectCommand } from "../../../src/effects/shell.js";
-import { adapterOriginalResult, canonicalCopy, copy, createAcceptedInput, createSinkGate, fail, GENERATION, hash, immutable, intent, joinedBranch, originalResult, type RecoveryIdentity, type Scenario, type ConformanceHarness } from "./fixtures.js";
+import { adapterOriginalResult, canonicalCopy, copy, createAcceptedInput, createSinkGate, fail, GENERATION, hash, immutable, intent, joinedBranch, originalResult, resolveScenario, type RecoveryIdentity, type ScenarioSource, type ConformanceHarness } from "./fixtures.js";
 
 /** Unmodified real B4 store/reconciler/record port at the selected integration
  * head. Sinks below are controlled boundary probes, NOT real peer/native/B6
@@ -19,10 +19,11 @@ export interface RealOptions {
    * The old B4-only base has no B5 allocator, so its default is explicitly a probe. */
   readonly recoveryIdentity?: () => RecoveryIdentity;
 }
-export const createReal = async (scenario: Scenario, options: RealOptions = {}): Promise<ConformanceHarness> => {
+export const createReal = async (source: ScenarioSource, options: RealOptions = {}): Promise<ConformanceHarness> => {
   const probeIdentity = immutable({ acceptedInput: createAcceptedInput(options.now), executionBranchEntryId: "A", recoveryGeneration: GENERATION });
   const recoveryIdentity = options.recoveryIdentity ?? (() => probeIdentity);
   const identity = recoveryIdentity();
+  const scenario = resolveScenario(source, { recoveryIdentity });
   const sessionId = identity.acceptedInput.sessionId;
   const root = mkdtempSync(join(tmpdir(), "b4-contract-"));
   const sessionRoot = join(root, "session");

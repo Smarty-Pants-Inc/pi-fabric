@@ -968,6 +968,17 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     return w;
   };
 
+  // Regression: restoring the route needs only the source header, even for a Paul-sized Pi session.
+  it.each([157_000_000, 314_000_000])("restores the route with a sparse %i-byte source journal", async bytes => {
+    const w = await published();
+    const source = JSON.parse(fs.readFileSync(path.join(w.seat.runDir, "seat-run.json"), "utf8")).source.journal as string;
+    fs.truncateSync(source, bytes);
+    const result = await run(w, "rc-restore-route", writer(w));
+    expect(result).toMatchObject({ code: 0, stderr: "", receipt: { result: "pass", observed: {
+      sessionId: SID, route: `v1@${process.pid}:${procStartTime(process.pid)}` } } });
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "pass" });
+  });
+
   it("passes rc-restore-route when its file-side seat row appears at +640 s", async () => {
     const w = await published();
     w.gate = null;

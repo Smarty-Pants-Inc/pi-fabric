@@ -1571,23 +1571,29 @@ export class ResidentHost {
     if (stableId) {
       if (typeof rootId !== "string") throw new Error("Confirmed resident delivery requires a fixed root");
       const key = `${residentDeliveryPrefix(rootId)}${id}`;
-      const inspect = async (): Promise<{ written: boolean; confirmed: boolean }> => {
+      const inspect = async (): Promise<{ written: boolean; confirmed: boolean } | undefined> => {
         let written = false;
         let confirmed = false;
         // A retained tombstone, not an outbox write or mesh put, proves Main has
         // synchronously journaled the notice and deleted its delivery key.
-        await this.mesh.writeBatch({ identity: this.identity, ops: [],
-          lockTiming: { operation: "resident-delivery-confirmation" },
-          prepare: view => {
-            written = view.version(key) > 0;
-            confirmed = written && view.get(key) === undefined;
-            return [];
-          } });
+        try {
+          await this.mesh.writeBatch({ identity: this.identity, ops: [],
+            lockTiming: { operation: "resident-delivery-confirmation" },
+            prepare: view => {
+              written = view.version(key) > 0;
+              confirmed = written && view.get(key) === undefined;
+              return [];
+            } });
+        } catch {
+          // Probe uncertainty does not establish failed producer custody.
+          return undefined;
+        }
         return { written, confirmed };
       };
       // Inspect BEFORE staging: retries must not rewrite either a pending mesh
       // record or a consumed tombstone (including an ack-before-marker crash).
       const before = await inspect();
+      if (!before) return false;
       if (before.confirmed) return true;
       if (!before.written && !fs.existsSync(path.join(this.#deliveryOutboxPath, `${id}.json`))) persist(rootId);
       this.#scheduleIdleCheck();
@@ -1595,7 +1601,7 @@ export class ResidentHost {
       // The existing retry owner contains flush errors. Never turn that failed
       // attempt into confirmation, even if Main consumes concurrently.
       if (flushed === "retry" || flushed === "failed" || flushed === "skipped") return false;
-      return (await inspect()).confirmed;
+      return (await inspect())?.confirmed ?? false;
     }
     if (typeof rootId === "function") {
       // Serialize proof+absence and target selection with resumed-root proof

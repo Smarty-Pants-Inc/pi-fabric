@@ -10,10 +10,17 @@ import {
   FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, actorAlarmDedupeKey, actorAlarmKey,
 } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
 import { MainAgentController } from "../src/main-agent.js";
 import { ResidencyClient } from "../src/residency/client.js";
 import { ResidentHost } from "../src/residency/host.js";
-import { RESIDENT_HOST_FORMAT, residentDeliveryPrefix, type ResidentHostConfig } from "../src/residency/protocol.js";
+import { readResidentDrainReceipt, type ResidentDrainIntent, type ResidentDrainReceipt } from "../src/residency/drain.js";
+import { mainGenerationPath, residentLaunchSpec, type ResidentMainGeneration } from "../src/residency/handover.js";
+import { readResidentIdleExit } from "../src/residency/idle-exit.js";
+import { processStartTime } from "../src/residency/process-identity.js";
+import { RESIDENT_HOST_FORMAT, residentDeliveryPrefix, type ResidentCommand, type ResidentCommandResponse,
+  type ResidentHostConfig, type ResidentHostOwner } from "../src/residency/protocol.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { installInProcessResidentFence } from "./helpers/in-process-resident-fence.js";
 
 // Keep reason: the publish/outbox/Main-journal crash boundary cannot be exercised by a callback-only unit test.
@@ -39,7 +46,7 @@ const waitFor = async (predicate: () => boolean, description: string): Promise<v
 type RegistryRow = { id: string; stoppedAt?: number; stoppedAlarmSince?: number; [key: string]: unknown };
 type JournalItem = { id: string; deliveryId?: string; message: string; handed?: boolean };
 
-const fixture = async () => {
+const fixture = async (options: { idleExitMs?: number; onIdle?: ConstructorParameters<typeof ResidentHost>[1]; drain?: boolean } = {}) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-stop-custody-"));
   const realNow = Date.now.bind(Date);
   const clock = { skew: 0 };
@@ -51,12 +58,37 @@ const fixture = async () => {
     actorRoot: path.join(root, "actors"), residencyRoot: path.join(root, "resident"),
     fullCodeMode: true,
     agents: { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 5_000, budgetUsd: 0 },
-    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorScope: "project", actorPollMs: 20, residentIdleExitMs: 0 },
+    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorScope: "project", actorPollMs: 20, residentIdleExitMs: options.idleExitMs ?? 0 },
     retention: DEFAULT_FABRIC_CONFIG.retention,
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
     fabricExtensionPath: path.resolve("dist/index.js"), piBinary: "pi", claudeBinary: "claude", vedaBinary: "veda",
     piModels: { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" },
   };
+  // Only the negotiated-drain cases need retained A/B artifacts and a birth-bound launcher.
+  // The copied fake worker remains the real process actor fixture, not a mocked producer.
+  let launch: ConstructorParameters<typeof ResidentHost>[3];
+  let target: ReturnType<typeof residentLaunchSpec> | undefined;
+  let mainParticipants: ParticipantDirectory | undefined;
+  if (options.drain) {
+    const a = path.join(root, "A"), b = path.join(root, "B");
+    for (const release of [a, b]) {
+      fs.mkdirSync(path.join(release, "dist/residency"), { recursive: true });
+      fs.writeFileSync(path.join(release, "package.json"), '{"type":"module"}');
+      fs.copyFileSync(config.workerPath, path.join(release, "dist/worker.js"));
+      for (const file of ["index.js", "residency/pi-entry.js"]) {
+        fs.writeFileSync(path.join(release, "dist", file), "// retained fixture artifact; never executed\n");
+      }
+    }
+    const previous = residentLaunchSpec({ ...config, workerPath: path.join(a, "dist/worker.js"),
+      fabricExtensionPath: path.join(a, "dist/index.js"), piBinary: process.execPath }, path.join(a, "dist/residency/pi-entry.js"));
+    Object.assign(config, previous.config);
+    target = residentLaunchSpec({ ...config, workerPath: path.join(b, "dist/worker.js"),
+      fabricExtensionPath: path.join(b, "dist/index.js") }, path.join(b, "dist/residency/pi-entry.js"));
+    launch = { spec: previous, launcher: { pid: process.pid, processStartTime: processStartTime(process.pid)!,
+      token: "stop-custody-launcher", entry: previous.entry, runtime: previous.runtime } };
+    fs.mkdirSync(config.residencyRoot, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(config.residencyRoot, "config.json"), JSON.stringify(config), { mode: 0o600 });
+  }
   const sendMessage = vi.fn();
   const pi = { hostCapabilities: { turnProvenance: 1 }, sendMessage, on: () => () => {} } as unknown as ExtensionAPI;
   const main = new MainAgentController(pi, config.rootId, true, config.cwd, config.sessionId);
@@ -77,6 +109,7 @@ const fixture = async () => {
     try {
       for (const item of clients.reverse()) await item.close();
       main.closeFollowUpDrain();
+      await mainParticipants?.close();
       for (const item of hosts.reverse()) await item.close().catch(() => undefined);
     } finally {
       // The only cleanup target is this fixture's own mkdtemp tree, never global traces or shared state.
@@ -85,7 +118,7 @@ const fixture = async () => {
   });
   const startHost = async () => {
     const firstInterval = intervals.mock.calls.length;
-    host = new ResidentHost(config);
+    host = new ResidentHost(config, options.onIdle, undefined, launch);
     hosts.push(host);
     await host.start();
     maintenance = intervals.mock.calls.slice(firstInterval)
@@ -131,9 +164,46 @@ const fixture = async () => {
     else if (closeError) throw closeError;
     await startHost();
   };
+  const advance = async (ms: number) => {
+    clock.skew += ms;
+    // Native 50 ms request polls own dead-root idle sampling, as in residency-idle-exit.
+    await new Promise(resolve => setTimeout(resolve, 150));
+  };
+  const drain = async (): Promise<ResidentDrainReceipt> => {
+    if (!launch || !target) throw new Error("Negotiated drain fixture was not enabled");
+    const identity = { id: config.rootId, name: "Main", kind: "main" as const, sessionId: config.sessionId };
+    mainParticipants = new ParticipantDirectory(host.mesh, { enabled: true, hostId: identity.id, rootId: identity.id, identity });
+    mainParticipants.registerSource(() => [{ format: 1, id: identity.id, kind: "root", rootId: identity.id,
+      ownerHostId: identity.id, ownerIdentityId: identity.id, name: "Main", status: "idle", residency: "session",
+      runner: "pi", transport: "host", capabilities: ["fabric"], cwd: root, sessionId: identity.sessionId,
+      startedAt: Date.now(), updatedAt: Date.now(), controlProtocol: "v1",
+      mainProcess: { pid: process.pid, host: os.hostname(), startTime: processStartTime(process.pid)! } }]);
+    await mainParticipants.start();
+    const owner = JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "owner.json"), "utf8")) as ResidentHostOwner;
+    const generation: ResidentMainGeneration = { pid: process.pid, processStartTime: processStartTime(process.pid)!,
+      nonce: randomUUID(), rootId: config.rootId, sessionId: config.sessionId, releaseRoot: launch.spec.releaseRoot };
+    fs.writeFileSync(mainGenerationPath(config.residencyRoot), JSON.stringify(generation), { mode: 0o600 });
+    const intent: ResidentDrainIntent = { caller: { identity, hostId: identity.id }, main: generation, target,
+      expected: { releaseRoot: launch.spec.releaseRoot, configDigest: owner.configDigest!, launcher: launch.launcher,
+        owner: { pid: owner.pid, processStartTime: owner.processStartTime!, token: owner.token, hostId: owner.hostId } }, timeoutMs: 2_000 };
+    const requestId = randomUUID();
+    const command: ResidentCommand = { ...intent, format: 2, operation: "releaseDrain", requestId,
+      rootId: config.rootId, createdAt: Date.now() };
+    const responsePath = path.join(config.residencyRoot, "responses", `${requestId}.json`);
+    fs.writeFileSync(path.join(config.residencyRoot, "requests", `${requestId}.json`), JSON.stringify(command), { mode: 0o600 });
+    await waitFor(() => fs.existsSync(responsePath), "real releaseDrain response");
+    const response = JSON.parse(fs.readFileSync(responsePath, "utf8")) as ResidentCommandResponse;
+    expect(response).toMatchObject({ ok: true, drain: { phase: "held", admissionHeld: true, terminal: false } });
+    let receipt: ResidentDrainReceipt | undefined;
+    await waitFor(() => {
+      receipt = readResidentDrainReceipt(config.residencyRoot, response.drain!.id, response.drain);
+      return receipt?.terminal === true;
+    }, "real releaseDrain terminal checkpoint receipt");
+    return receipt!;
+  };
   await startHost();
   return { root, config, clock, registry, outbox, prefix, get host() { return host; }, get client() { return client; },
-    tick, tickUntil, row, notices, sentNotices, alarms, deliveries, outboxFiles, version, restart };
+    tick, tickUntil, row, notices, sentNotices, alarms, deliveries, outboxFiles, version, restart, advance, drain };
 };
 
 const stoppedActor = async (s: Awaited<ReturnType<typeof fixture>>) => {
@@ -147,8 +217,88 @@ const stoppedActor = async (s: Awaited<ReturnType<typeof fixture>>) => {
   return actor;
 };
 
-// Four bounded cases, one actor/root each. These assert durable journal admission as well as native Pi sends.
+// A confirmation probe is uncertainty, not a failed producer. Inject at the exact locked inspect,
+// with Main absent so the pre/post-flush crash images and missing marker are directly observable.
+const recoverConfirmationProbeTimeout = async (s: Awaited<ReturnType<typeof fixture>>, phase: "before" | "after") => {
+  const actor = await stoppedActor(s);
+  const since = s.row(actor.id).stoppedAt!;
+  const claimKey = actorAlarmKey(actor.id, "actor-stopped");
+  const writeBatch = s.host.mesh.writeBatch.bind(s.host.mesh);
+  const failAt = phase === "before" ? 1 : 2;
+  let probes = 0, failures = 0;
+  const fault = vi.spyOn(s.host.mesh, "writeBatch").mockImplementation(async input => {
+    if (input.lockTiming?.operation === "resident-delivery-confirmation" && ++probes === failAt) {
+      failures++;
+      throw new MeshLockTimeoutError(" stopped notice confirmation probe fixture", 1, 0);
+    }
+    return writeBatch(input);
+  });
+  try {
+    await s.tickUntil(() => failures === 1 && (s.host.mesh.get(claimKey)?.value as { state?: string })?.state === "published",
+      `${phase}-flush probe failure settles without a stop marker`);
+    expect(probes).toBe(failAt);
+    expect(s.row(actor.id).stoppedAlarmSince).toBeUndefined();
+    expect(s.notices()).toHaveLength(0);
+    expect(s.sentNotices()).toHaveLength(0);
+    expect(s.outboxFiles()).toHaveLength(0);
+    // Unknown pre-stage custody must NOT stage anything; post-flush uncertainty retains its single record.
+    expect(s.deliveries()).toHaveLength(phase === "before" ? 0 : 1);
+    const pending = s.deliveries()[0];
+    fault.mockRestore();
+    s.client.start();
+    await s.tick(); // Existing ActorManager maintenance retries the same episode, not a new retry API.
+    await waitFor(() => s.notices().length === 1 && s.deliveries().length === 0, "next maintenance retry reaches Main once");
+    await s.tickUntil(() => s.row(actor.id).stoppedAlarmSince === since, "recovered Main confirmation checkpoints the stop marker");
+    const notice = s.notices()[0]!;
+    expect(notice.deliveryId).toMatch(/^resident:/);
+    if (pending) expect(notice.deliveryId).toBe(`resident:${s.config.rootId}:${(pending.value as { id: string }).id}`);
+    for (let n = 0; n < 3; n++) await s.tick();
+    expect(s.notices().map(item => item.deliveryId)).toEqual([notice.deliveryId]);
+    expect(s.sentNotices()).toHaveLength(1);
+    expect(s.alarms(actor.id)).toHaveLength(1);
+    expect(s.outboxFiles()).toHaveLength(0);
+    expect(s.deliveries()).toHaveLength(0);
+    return actor;
+  } finally { fault.mockRestore(); }
+};
+
+// Bounded cases, one actor/root each. These assert durable journal admission as well as native Pi sends.
 describe("resident stopped alarm custody", () => {
+  it.each(["before", "after"] as const)("confirmation probe timeout %s flush recovers once and permits actual idle exit", async phase => {
+    const onIdle = vi.fn();
+    const idleExitMs = 60_000;
+    const s = await fixture({ onIdle, idleExitMs });
+    const actor = await recoverConfirmationProbeTimeout(s, phase);
+    expect(onIdle).not.toHaveBeenCalled();
+    await s.host.actors.remove(actor.id);
+    expect(s.host.actors.hasOwnedActors()).toBe(false);
+    await s.advance(1_000); // First dead-root/no-actor request sample starts the continuous window.
+    expect(onIdle).not.toHaveBeenCalled();
+    await s.advance(idleExitMs);
+    await waitFor(() => onIdle.mock.calls.length === 1, "recovered host actually retires on native idle polls");
+    expect(onIdle).toHaveBeenCalledExactlyOnceWith("idle-exit");
+    const retirement = readResidentIdleExit(s.config.residencyRoot, s.config.rootId);
+    expect(retirement).toMatchObject({ reason: "root-dead-idle", pid: process.pid });
+    expect(retirement!.idleMs).toBeGreaterThanOrEqual(idleExitMs);
+    expect(s.notices()).toHaveLength(1);
+    expect(s.sentNotices()).toHaveLength(1);
+  }, 30_000);
+
+  it.skipIf(process.platform !== "linux").each(["before", "after"] as const)(
+    "confirmation probe timeout %s flush recovers once and permits actual cooperative drain", async phase => {
+      const s = await fixture({ drain: true });
+      await recoverConfirmationProbeTimeout(s, phase);
+      // This endpoint safely resumes A: no launch attestation/containment is invented and no B is launched.
+      // Reaching checkpoint/readback proves the real sticky-publication drain guard was passed.
+      expect(await s.drain()).toMatchObject({ phase: "checkpointed", outcome: "containment-unavailable",
+        code: "CONTAINMENT_UNAVAILABLE", checkpointReadback: true, terminal: true, admissionHeld: false,
+        checkpoint: { actors: { project: expect.anything(), session: expect.anything() },
+          agents: expect.anything(), control: expect.anything(), lifecycle: expect.anything() },
+        quiet: { publications: 0, producerOutbox: 0 } });
+      expect(s.notices()).toHaveLength(1);
+      expect(s.sentNotices()).toHaveLength(1);
+    }, 30_000);
+
   it("takes over a crash image after alarm publication but before onDeliver and admits ONE Main notice", async () => {
     const s = await fixture();
     const actor = await stoppedActor(s);
@@ -298,8 +448,8 @@ describe("resident stopped alarm custody", () => {
     } finally { handoffFault.mockRestore(); }
   }, 30_000);
 
-  it("leaves the marker absent on asynchronous outbox persistence rejection and retries the same episode", async () => {
-    const s = await fixture();
+  it("leaves the marker absent on asynchronous outbox persistence rejection and retries the same episode but still blocks drain", async () => {
+    const s = await fixture({ drain: process.platform === "linux" });
     const actor = await stoppedActor(s);
     const since = s.row(actor.id).stoppedAt!;
     const rename = fs.renameSync;
@@ -329,6 +479,14 @@ describe("resident stopped alarm custody", () => {
       expect(s.sentNotices()).toHaveLength(1);
       expect(s.alarms(actor.id)).toHaveLength(1);
       expect(s.outboxFiles()).toHaveLength(0);
+      if (process.platform === "linux") {
+        // A genuine persist rejection MUST remain tracked even after its notice later reaches Main.
+        // Catching the entire stable-delivery branch or globally clearing failures would fail this proof.
+        const receipt = await s.drain();
+        expect(receipt).toMatchObject({ outcome: "resumed", code: "DRAIN_UNCERTAIN", terminal: true,
+          admissionHeld: false, reason: expect.stringContaining("unconfirmed producer/publication obligations") });
+        expect(receipt.checkpointReadback).not.toBe(true);
+      }
     } finally { fault.mockRestore(); }
   }, 30_000);
 });

@@ -1,10 +1,33 @@
 /** Process-local, disposable read hints. Never persisted or used as publication evidence. */
 export type ArchiveRangeBlock = [start: number, end: number, min: number | null, max: number | null];
+export interface ArchiveRangeBlocks extends Iterable<ArchiveRangeBlock> { readonly length: number }
+
+// Four IEEE-754 doubles per block, not a V8 array/object per tuple. NaN encodes
+// unknown extrema; offsets and every finite sequence retain their exact bits.
+class PackedRangeBlocks implements ArchiveRangeBlocks {
+  readonly #values: Float64Array;
+  readonly length: number;
+  constructor(blocks: ArchiveRangeBlocks) {
+    this.length = blocks.length; this.#values = new Float64Array(this.length * 4);
+    let offset = 0;
+    for (const block of blocks) {
+      this.#values[offset++] = block[0]; this.#values[offset++] = block[1];
+      this.#values[offset++] = block[2] ?? NaN; this.#values[offset++] = block[3] ?? NaN;
+    }
+  }
+  *[Symbol.iterator](): IterableIterator<ArchiveRangeBlock> {
+    for (let offset = 0; offset < this.#values.length; offset += 4) {
+      const min = this.#values[offset + 2]!, max = this.#values[offset + 3]!;
+      yield [this.#values[offset]!, this.#values[offset + 1]!, Number.isNaN(min) ? null : min, Number.isNaN(max) ? null : max];
+    }
+  }
+}
+
 export interface ArchiveRangeIndex {
   identity: string;
   min: number | null;
   max: number | null;
-  blocks: ArchiveRangeBlock[];
+  blocks: ArchiveRangeBlocks;
 }
 
 export const ARCHIVE_RANGE_CACHE_ENTRIES = 128;
@@ -39,17 +62,21 @@ class ArchiveRangeCache {
 
   set(day: string, generation: string, files: Map<string, ArchiveRangeIndex>): void {
     this.#forget(day);
-    // Charge UTF-16 strings, map/object overhead and 128 bytes per four-number block,
-    // rather than just JSON bytes. This bounds retained hints, not transient scan data.
+    // Charge UTF-16 strings, map/object/typed-array overhead and the exact packed
+    // buffer bytes. This bounds retained hints, not transient scan data or total RSS.
     let bytes = 512 + 2 * (day.length + generation.length);
     for (const [name, index] of files) {
-      bytes += 512 + 2 * (name.length + index.identity.length) + 128 * index.blocks.length;
+      bytes += 768 + 2 * (name.length + index.identity.length) + 32 * index.blocks.length;
       if (bytes > ARCHIVE_RANGE_CACHE_BYTES) return; // Oversized days remain readable, uncached.
     }
     while (this.#days.size >= ARCHIVE_RANGE_CACHE_ENTRIES || this.#bytes + bytes > ARCHIVE_RANGE_CACHE_BYTES) {
       this.#forget(this.#days.keys().next().value!);
     }
-    this.#days.set(day, { generation, files: new Map(files), bytes });
+    const packed = new Map<string, ArchiveRangeIndex>();
+    for (const [name, index] of files) packed.set(name, {
+      ...index, blocks: index.blocks instanceof PackedRangeBlocks ? index.blocks : new PackedRangeBlocks(index.blocks),
+    });
+    this.#days.set(day, { generation, files: packed, bytes });
     this.#bytes += bytes;
   }
 }

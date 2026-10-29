@@ -99,6 +99,16 @@ it("bounds the process cache across 384 real days and fresh archive objects", as
   expect(archiveRangeCache.stats.entries).toBe(128);
 });
 
+it("packs exact offsets and extrema, preserving unknown bounds and private snapshot storage", () => {
+  const blocks: ArchiveRangeIndex["blocks"] = [[0, 4096, null, null], [4096, MAX, -0, MAX]];
+  archiveRangeCache.set("packed-roundtrip", "a", new Map([["a.jsonl", { identity: "a", min: null, max: null, blocks }]]));
+  const saved = archiveRangeCache.get("packed-roundtrip", "a").get("a.jsonl")!;
+  expect([...saved.blocks]).toEqual([...blocks]);
+  const returned = [...saved.blocks]; returned[0]![0] = 99;
+  expect([...saved.blocks][0]![0]).toBe(0);
+  expect(archiveRangeCache.stats.bytes).toBeLessThanOrEqual(ARCHIVE_RANGE_CACHE_BYTES);
+});
+
 it("uses LRU eviction and a byte cap, including oversized-day refusal", () => {
   const prefix = "memory-only-lru-";
   const small = new Map<string, ArchiveRangeIndex>([["a.jsonl", { identity: "a", min: 1, max: 1, blocks: [[0, 1, 1, 1]] }]]);
@@ -108,12 +118,12 @@ it("uses LRU eviction and a byte cap, including oversized-day refusal", () => {
   expect(archiveRangeCache.get(prefix + 1, "seal").size).toBe(0);
   expect(archiveRangeCache.get(prefix + 0, "seal").size).toBe(1);
   const large = new Map<string, ArchiveRangeIndex>();
-  for (let i = 0; i < 8; i++) large.set(`${i}.jsonl`, { identity: String(i), min: 1, max: 1, blocks: Array.from({ length: 1024 }, (_, n) => [n, n + 1, 1, 1]) });
+  for (let i = 0; i < 16; i++) large.set(`${i}.jsonl`, { identity: String(i), min: 1, max: 1, blocks: Array.from({ length: 1024 }, (_, n) => [n, n + 1, 1, 1]) });
   for (let i = 0; i < 100; i++) { archiveRangeCache.set(`byte-day-${i}`, "seal", large); bounded(); }
   expect(archiveRangeCache.stats.entries).toBeLessThan(128);
   expect(archiveRangeCache.get("byte-day-0", "seal").size).toBe(0);
   const oversized = new Map<string, ArchiveRangeIndex>();
-  for (let i = 0; i < 257; i++) oversized.set(`${i}.jsonl`, large.get("0.jsonl")!);
+  for (let i = 0; i < 1025; i++) oversized.set(`${i}.jsonl`, large.get("0.jsonl")!);
   archiveRangeCache.set("oversized", "seal", oversized);
   expect(archiveRangeCache.get("oversized", "seal").size).toBe(0); bounded();
   archiveRangeCache.set("generation", "seal-a", small);

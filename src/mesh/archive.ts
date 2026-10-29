@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { ArchiveSha256, type Sha256State } from "./archive-sha256.js";
 import { archiveRangeCache, type ArchiveRangeBlock, type ArchiveRangeIndex } from "./archive-range-cache.js";
+import { archiveDayBounds } from "./archive-day-bounds.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,7 +20,8 @@ import type { IndexDirectoryBarrier } from "./receipt-namespace.js";
  *   <dir>/<yyyy>/<mm>/<dd>/SEAL.json     per file line count, sequence range and sha256
  *   <dir>/<yyyy>/<mm>/<dd>/.digest-*.json rebuildable SHA-256 checkpoints and counters
  * Range read hints live only in a bounded process-local cache. Legacy in-day .range-*
- * and .ranges.json sidecars are ignored and never modified, even on unsealed days.
+ * and .ranges.json sidecars are ignored by reads. An explicit one-time maintenance
+ * migration can retire them outside sealed day directories (see archive-range-cache.md).
  *   <dir>/DIGEST-REPAIR.json              deferred oversized legacy line (read off-lock)
  *   <dir>/<yyyy>/<mm>/<dd>/ABORTED.json  positive event-identity abort markers
  *   <dir>/sequence-index/<bucket>/<n>.json  exact line address and advisory live confirmation
@@ -822,7 +824,6 @@ export class MeshArchive {
       const abortedIdentity = abortedStat ? fileIdentity(abortedStat) : "missing";
       // Missing is common; avoid constructing/catching ENOENT twice per day. A final exact
       // stat still fences creation, replacement, removal and same-size abort rewrites.
-      const aborted = abortedStat ? this.#readJson<Record<string, string>>(`${day}/ABORTED.json`) : undefined;
       const nameSnapshot = topic === undefined ? this.#readDayNames(directory) : undefined;
       const names = nameSnapshot?.names ?? [archiveFileName(topic!)];
       const dayIdentity = nameSnapshot?.identity ?? fileIdentity(fs.statSync(directory));
@@ -830,6 +831,21 @@ export class MeshArchive {
       // A missing seal is a generation too. Unsealed days still require exact segment
       // identities on every read: a same-directory append need not change dayIdentity.
       const generation = `${dayIdentity}|${sealIdentity}`;
+      const bounds = archiveDayBounds.get(directory, generation);
+      if (bounds && rangeOutside(bounds.min, bounds.max, after, through)) {
+        // A sealed directory is not proof that its files stayed unchanged: old writers
+        // and manual repairs can rewrite an inode without changing directory metadata.
+        // Validate all segment identities on both sides, including topic-filtered skips.
+        const snapshot = nameSnapshot ?? this.#readDayNames(directory);
+        const fingerprint = this.#dayRangeFingerprint(directory, snapshot.names);
+        if (fingerprint === bounds.fingerprint) {
+          if (fingerprint !== this.#dayRangeFingerprint(directory, snapshot.names) ||
+              dayIdentity !== fileIdentity(fs.statSync(directory)) ||
+              sealIdentity !== this.#rangeFileIdentity(`${day}/SEAL.json`)) throw new MeshArchiveRecoveryChanged();
+          continue; // No segment open/parse, nor any touch of the fine-hint LRU.
+        }
+      }
+      const aborted = abortedStat ? this.#readJson<Record<string, string>>(`${day}/ABORTED.json`) : undefined;
       const catalog = archiveRangeCache.get(directory, generation);
       const identities: Array<{ absolute: string; identity: string }> = [];
       const work: Array<{ absolute: string; identity: string; order: number; block: ArchiveRangeBlock }> = [];
@@ -912,10 +928,37 @@ export class MeshArchive {
         for (const name of catalog.keys()) if (!present.has(name)) catalog.delete(name);
       }
       archiveRangeCache.set(directory, generation, catalog);
+      if (topic === undefined) {
+        let min = Infinity, max = -Infinity;
+        for (const name of names) {
+          const index = catalog.get(name);
+          if (index?.min === null || index?.min === undefined || index.max === null) { min = NaN; break; }
+          min = Math.min(min, index.min); max = Math.max(max, index.max);
+        }
+        archiveDayBounds.set(directory, {
+          generation, fingerprint: this.#catalogRangeFingerprint(names, catalog),
+          min: Number.isFinite(min) ? min : null, max: Number.isFinite(min) ? max : null,
+        });
+      }
       for (const candidate of trim(candidates)) found.push(candidate.event);
       if (found.length >= limit) break;
     }
     return found.slice(0, limit);
+  }
+
+  #catalogRangeFingerprint(names: string[], catalog: Map<string, ArchiveRangeIndex>): string {
+    const hash = createHash("sha256");
+    for (const name of names) hash.update(JSON.stringify([name, catalog.get(name)?.identity ?? "missing"]));
+    return hash.digest("hex");
+  }
+
+  #dayRangeFingerprint(directory: string, names: string[]): string {
+    const hash = createHash("sha256");
+    for (const name of names) {
+      const stat = fs.statSync(`${directory}${path.sep}${name}`, { throwIfNoEntry: false });
+      hash.update(JSON.stringify([name, stat ? fileIdentity(stat) : "missing"]));
+    }
+    return hash.digest("hex");
   }
 
   #readDayNames(directory: string): { identity: string; names: string[] } {

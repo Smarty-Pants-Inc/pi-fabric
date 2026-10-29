@@ -1046,9 +1046,8 @@ describe("resident retention config reload", () => {
     { change: "byte cap", initial: { terminalRunEventsMaxBytes: 512 * 1024 },
       reloaded: { terminalRunEventsMaxBytes: 128 * 1024 } },
   ].flatMap(policy => [0, 6].map(recoveryMs => ({ ...policy, recoveryMs }))))("applies a same-release client reload to an already-running host's next sweep without replacing its owner ($change, recovery=$recoveryMs ms)", async ({ initial, reloaded, recoveryMs }) => {
-    // The streamed first sweep must genuinely retain this fixture: unlike the
-    // former startup sweep, it runs after the log is created. Set the initial
-    // policy before constructing the host, which takes its own shared copy.
+    // Set the legacy settings before construction, then prove a real client
+    // reload reaches the existing collector. Neither policy may shorten logs.
     const { root, config, host } = fixture(initial);
     const initialRetention = { ...config.retention };
     let client: ResidencyClient | undefined;
@@ -1068,7 +1067,7 @@ describe("resident retention config reload", () => {
       const owner = fs.readFileSync(ownerPath, "utf8");
       const run = path.join(config.residencyRoot, "runs", "reload-retention");
       fs.mkdirSync(run, { recursive: true });
-      // Stay below the 200-line tail limit so the byte-cap case tests only bytes.
+      // Exceed both byte caps: preservation must not merely mean already bounded.
       const log = Buffer.from((JSON.stringify({ text: "x".repeat(3000) }) + "\n").repeat(100));
       const status = JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647",
         finishedAt: Date.now() - 8 * 60 * 60 * 1000 });
@@ -1079,7 +1078,7 @@ describe("resident retention config reload", () => {
       await vi.waitFor(() => expect(fs.existsSync(path.join(config.residencyRoot, "request-retention.json"))).toBe(true));
       expect(fs.readFileSync(path.join(run, "events.jsonl"))).toEqual(log);
       // The real reload creates a new client; ensureHost publishes desired config and reuses the owner.
-      // Each case changes only one threshold, making stale policy observable.
+      // Each case changes one compatibility setting; the collector must see it.
       const next = { ...config, retention: { ...config.retention, ...reloaded } };
       client = new ResidencyClient({ config: next, mesh: host.mesh, participants: host.participants,
         mainAgent: { local: false } as FabricMainAgentTarget });
@@ -1103,13 +1102,12 @@ describe("resident retention config reload", () => {
         policies.push({ ...this.retention });
         return nativeSweep.call(this, now + 60_001, ...args);
       });
-      const deadline = Date.now() + 2500;
-      while (fs.statSync(path.join(run, "events.jsonl")).size > 128 * 1024 && Date.now() < deadline) await delay(10);
+      await vi.waitFor(() => expect(policies).toContainEqual({ ...next.retention, retainRuns: config.agents.retainRuns }));
       expect(sweep).toHaveBeenCalled();
       expect(sweep.mock.calls.every(call => call[2] === 5)).toBe(true);
       expect(policies).toContainEqual({ ...next.retention, retainRuns: config.agents.retainRuns });
       due.mockRestore(); sweep.mockRestore();
-      expect(fs.statSync(path.join(run, "events.jsonl")).size).toBeLessThanOrEqual(128 * 1024);
+      expect(fs.readFileSync(path.join(run, "events.jsonl"))).toEqual(log);
       expect(config.retention).toEqual(initialRetention);
       expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(status);
       expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep"}');
@@ -1120,7 +1118,7 @@ describe("resident retention config reload", () => {
       vi.restoreAllMocks(); await client?.close(); await host.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000); // Real host/client startup and close; the asserted 5-ms sweep budget is unchanged.
 });
 
 describe("resident tracked result preservation", () => {

@@ -101,7 +101,7 @@ export const buildRetentionSection = (
     submenu: sectionSubmenu(
       theme,
       "Retention",
-      "Cleanup removes dead temporary roots and terminal run artifacts, and bounds older terminal event logs. Active runs, latest actor runs and actor session.jsonl files are never modified.",
+      "Cleanup removes dead temporary roots and terminal run artifacts. Retained event logs are never shortened. Active runs, latest actor runs and actor session.jsonl files are never modified.",
       [
         setting(
           "retention.orphanedTempRunMs",
@@ -153,9 +153,9 @@ export const buildRetentionSection = (
           "Terminal event log age",
           formatRetention(config.retention.terminalRunEventsAgeMs),
           {
-            description: "Bound older terminal event logs; live and latest actor runs are exempt.",
+            description: "Inactive compatibility setting. Retained terminal event logs are never shortened.",
             submenu: numericSubmenu(theme, [3_600_000, 6 * 3_600_000, 86_400_000, 3 * 86_400_000, 7 * 86_400_000],
-              formatRetention, "Terminal event log age", "Bound terminal event logs after this age."),
+              formatRetention, "Terminal event log age", "Inactive; saved for configuration compatibility only."),
           },
         ),
         setting(
@@ -163,9 +163,9 @@ export const buildRetentionSection = (
           "Terminal event log tail",
           `${config.retention.terminalRunEventsMaxBytes / 1024} KiB`,
           {
-            description: "Retain complete trailing event lines within this byte cap, including a truncation marker.",
+            description: "Inactive compatibility setting. Retained terminal event logs keep all original bytes.",
             submenu: numericSubmenu(theme, [64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024],
-              (bytes) => `${bytes / 1024} KiB`, "Terminal event log tail", "Maximum retained terminal events.jsonl bytes."),
+              (bytes) => `${bytes / 1024} KiB`, "Terminal event log tail", "Inactive; no size cap is applied to retained events.jsonl files."),
           },
         ),
       ],

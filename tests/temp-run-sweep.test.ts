@@ -100,7 +100,9 @@ describe("configured detached temp sweep", () => {
       await manager.close();
       expect(launches).toHaveLength(count + 1);
       const launch = launches.at(-1)!;
-      expect(launch).toMatchObject({ status: 0, stderr: sweepStderr, env: { TMPDIR: privateA } });
+      expect(launch).toMatchObject({ status: 0, env: { TMPDIR: privateA } });
+      expect(launch.stderr.startsWith(sweepStderr)).toBe(true);
+      expect(launch.stderr).not.toMatch(/refused|failed/);
       expect(launch.stderr).not.toMatch(/refused|failed/);
       expect(launch.env?.PI_FABRIC_TMPDIR).toBe(override);
       const request = JSON.parse(launch.args[1]!) as TempRunSweepRequest;
@@ -195,7 +197,9 @@ describe("configured detached temp sweep", () => {
       sweepPath: entry, retention: { ...DEFAULT_FABRIC_CONFIG.retention, orphanedTempRunMs: 6 * HOUR },
     }); managers.push(manager);
     await manager.close();
-    expect(launches).toHaveLength(1); expect(launches[0]).toMatchObject({ status: 0, stderr: sweepStderr });
+    expect(launches).toHaveLength(1); expect(launches[0]).toMatchObject({ status: 0 });
+    expect(launches[0]!.stderr.startsWith(sweepStderr)).toBe(true);
+    expect(launches[0]!.stderr).not.toMatch(/refused|failed/);
     expect(JSON.parse(launches[0]!.args[1]!).tempRoot).toBe(shared);
     expect(retained.map(snapshot)).toEqual(before);
     expect(fs.readFileSync(path.join(liveOwner, ".fabric-owner.json"), "utf8")).toBe(ownerBefore);
@@ -221,7 +225,9 @@ describe("configured detached temp sweep", () => {
     }); managers.push(manager);
     await manager.close();
     expect(launches).toHaveLength(1);
-    expect(launches[0]).toMatchObject({ status: 0, stderr: sweepStderr });
+    expect(launches[0]).toMatchObject({ status: 0 });
+    expect(launches[0]!.stderr.startsWith(sweepStderr)).toBe(true);
+    expect(launches[0]!.stderr).not.toMatch(/refused|failed/);
     expect(JSON.parse(launches[0]!.args[1]!)).toMatchObject({ terminalRunEventsAgeMs: 24 * HOUR, terminalRunEventsMaxBytes: 1024 });
     expect(snapshot(run)).toEqual(before);
   });

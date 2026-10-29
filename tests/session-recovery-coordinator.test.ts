@@ -45,7 +45,7 @@ const fixture = (callIds = ["native-call", "unstarted-call"]) => {
       sessionId: "session-1", predecessorReceipt: { bytes: receipt, sha256: createHash("sha256").update(receipt).digest("hex") },
       predecessorPodId: "pod-A", predecessorBootId: "boot-A",
       successorPodId: "pod-B", successorBootId: "boot-B",
-      exclusionProof: { kind: "volume-detach", observedAt: 1, detail: "native-driver-receipt" },
+      exclusionProof: { kind: "b1-fence", observedAt: 1, detail: "native-driver-receipt" },
     },
   };
   const snapshotFile = path.join(stateDirectory, "input-history.json");
@@ -800,21 +800,21 @@ describe("startup session recovery coordinator", () => {
     f.preserved();
   });
 
-  it.each(["sessionId", "sessionFile", "stateDirectory", "lease-absent-unproven", "validator-refused", "lease-refused"] as const)("does not read history/effects or mutate files on %s identity/lease failure", async fault => {
+  it.each(["sessionId", "sessionFile", "stateDirectory", "validator-refused", "lease-refused"] as const)("does not read history/effects or mutate files on %s identity/lease failure", async fault => {
     const f = fixture();
     if (fault === "sessionId") Object.assign(f.binding.evidence, { sessionId: "wrong" });
     if (fault === "sessionFile") Object.assign(f.binding, { sessionFile: `${f.sessionFile}.wrong` });
     if (fault === "stateDirectory") Object.assign(f.binding, { stateDirectory: `${f.stateDirectory}.wrong` });
-    if (fault === "lease-absent-unproven") {
-      Object.assign(f.binding.evidence.exclusionProof, { kind: "lease-absent" });
-      f.options.activateSuccessor.mockRejectedValue(new Error("B2 native physical exclusion chain unresolved"));
-    }
     if (fault === "validator-refused") vi.mocked(f.adapters.identity.validate).mockRejectedValue(new Error("old writer still has access"));
     if (fault === "lease-refused") f.options.activateSuccessor.mockRejectedValue(new Error("actual successor lease not acquired"));
     await expect(f.prepare()).rejects.toThrow();
     expect(f.adapters.inputs.readRecoveryInput).not.toHaveBeenCalled();
     expect(f.adapters.effects.settlePendingIntents).not.toHaveBeenCalled();
-    if (fault !== "lease-refused" && fault !== "lease-absent-unproven") expect(f.options.activateSuccessor).not.toHaveBeenCalled();
+    expect(f.adapters.effects.readToolResult).not.toHaveBeenCalled();
+    expect(f.adapters.inputs.admitContinuation).not.toHaveBeenCalled();
+    if (fault !== "lease-refused") expect(f.options.activateSuccessor).not.toHaveBeenCalled();
+    expect(fs.existsSync(f.nativeFile)).toBe(false);
+    expect(fs.existsSync(path.join(f.stateDirectory, "recovery"))).toBe(false);
     f.preserved();
   });
 
@@ -833,23 +833,71 @@ describe("startup session recovery coordinator", () => {
     expect(f.adapters.inputs.readRecoveryInput).not.toHaveBeenCalled();
   });
 
-  it("consumes the approved lease-absent evidence discriminator only through B2 and the mandatory native activation callback", async () => {
+  it.each(["lease-absent", "harness-asserted"] as const)("refuses %s evidence before activation/history/effects/admission or mutations even when B2 and native activation would succeed", async kind => {
     const f = fixture();
-    Object.assign(f.binding.evidence.exclusionProof, { kind: "lease-absent" });
-    // This double checks choreography only. The real B2/lease integration must validate
-    // physical exclusion; a descriptive lease-absent record itself is never that proof.
-    const prepared = await f.prepare();
-    expect(prepared.classification).toBe("interrupted");
-    expect(f.events.slice(0, 3)).toEqual(["identity", "lease-activation", "snapshot"]);
+    // Runtime injection keeps this RED independent of the current production evidence union.
+    // Lease expiry plus a harness stop assertion cannot substitute for B1's fence receipt.
+    Object.assign(f.binding.evidence.exclusionProof, { kind, detail: "lease expired + harness record confirms old writer stopped" });
+    const history = fs.readFileSync(f.snapshotFile, "utf8"), entries = JSON.stringify(f.manager.getEntries());
+    const files = fs.readdirSync(f.stateDirectory).sort();
+    const projection = vi.spyOn(f.manager, "buildSessionProjection");
+    await expect(f.prepare()).rejects.toThrow(/exclusion|evidence|B1|fence/i);
+    expect(f.adapters.identity.validate).toHaveBeenCalledExactlyOnceWith(f.context);
+    expect(f.events).toEqual(["identity"]);
+    expect(f.options.activateSuccessor).not.toHaveBeenCalled();
+    expect(f.adapters.inputs.readRecoveryInput).not.toHaveBeenCalled();
+    expect(f.adapters.effects.settlePendingIntents).not.toHaveBeenCalled();
+    expect(f.adapters.effects.readToolResult).not.toHaveBeenCalled();
+    expect(f.adapters.inputs.admitContinuation).not.toHaveBeenCalled();
+    expect(projection).not.toHaveBeenCalled();
+    expect(f.requests).toEqual([]);
+    expect(fs.existsSync(f.nativeFile)).toBe(false);
+    expect(fs.existsSync(path.join(f.stateDirectory, "recovery"))).toBe(false);
+    expect(fs.readdirSync(f.stateDirectory).sort()).toEqual(files);
+    expect(fs.readFileSync(f.snapshotFile, "utf8")).toBe(history);
+    expect(JSON.stringify(f.manager.getEntries())).toBe(entries);
+    f.preserved();
   });
 
-  it("never treats lease-absent evidence as sufficient when no native activation callback is provided", async () => {
+  it("allows the b1-fence receipt discriminator only through the same B2 identity and mandatory native activation", async () => {
     const f = fixture();
-    Object.assign(f.binding.evidence.exclusionProof, { kind: "lease-absent" });
+    // Proposed sole production kind; this DTO string does not authenticate a controller.
+    // B2 and real native activation still own receipt validation and exclusion authority.
+    Object.assign(f.binding.evidence.exclusionProof, { kind: "b1-fence" });
+    const prepared = await f.prepare();
+    expect(f.adapters.identity.validate).toHaveBeenCalledExactlyOnceWith(f.context);
+    expect(f.options.activateSuccessor).toHaveBeenCalledExactlyOnceWith(prepared.binding);
+    expect(prepared.binding).toEqual(f.binding);
+    expect(prepared.classification).toBe("interrupted");
+    expect(f.events).toEqual(["identity", "lease-activation", "snapshot", "settle", "result", "result"]);
+    expect(f.marker().admissionId).toBeUndefined();
+    expect(f.adapters.inputs.admitContinuation).not.toHaveBeenCalled();
+    await expect(prepared.admitContinuation(() => { f.events.push("context-install"); }))
+      .resolves.toEqual({ admissionId: "native-admission-1", existing: false });
+    expect(f.events.slice(-3)).toEqual(["snapshot", "context-install", "native-admission"]);
+    expect(f.requests).toEqual([prepared.continuation]);
+    expect(f.marker()).toMatchObject({ admissionId: "native-admission-1" });
+    f.preserved();
+  });
+
+  it("refuses b1-fence evidence before history/effects/admission or mutations when native activation is absent", async () => {
+    const f = fixture();
+    Object.assign(f.binding.evidence.exclusionProof, { kind: "b1-fence" });
+    const history = fs.readFileSync(f.snapshotFile, "utf8");
     await expect(prepareSessionRecovery(f.context, f.adapters, {
       ...f.options, activateSuccessor: undefined,
     } as never)).rejects.toThrow(/activation/i);
+    expect(f.adapters.identity.validate).toHaveBeenCalledExactlyOnceWith(f.context);
+    expect(f.events).toEqual(["identity"]);
+    expect(f.options.activateSuccessor).not.toHaveBeenCalled();
     expect(f.adapters.inputs.readRecoveryInput).not.toHaveBeenCalled();
+    expect(f.adapters.effects.settlePendingIntents).not.toHaveBeenCalled();
+    expect(f.adapters.effects.readToolResult).not.toHaveBeenCalled();
+    expect(f.adapters.inputs.admitContinuation).not.toHaveBeenCalled();
+    expect(fs.existsSync(f.nativeFile)).toBe(false);
+    expect(fs.existsSync(path.join(f.stateDirectory, "recovery"))).toBe(false);
+    expect(fs.readFileSync(f.snapshotFile, "utf8")).toBe(history);
+    f.preserved();
   });
 
   it.each(["uncertain-count", "uncertain-effect", "malformed", "missing-result-hash", "duplicate-key"] as const)("blocks continuation on %s settlement", async fault => {

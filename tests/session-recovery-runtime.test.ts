@@ -44,7 +44,7 @@ function fixture() {
     binding: { sessionFile, stateDirectory, transportMachine: "machine-a", evidence: {
       sessionId, predecessorReceipt: { bytes: "{}", sha256: "0".repeat(64) },
       predecessorPodId: "old-pod", predecessorBootId: "old-boot", successorPodId: "new-pod", successorBootId: "new-boot",
-      exclusionProof: { kind: "volume-detach", observedAt: Date.now(), detail: "fixture only" },
+      exclusionProof: { kind: "b1-fence", observedAt: Date.now(), detail: "fixture only" },
     } }, identity: { validate: async () => { throw new Error("B2 was already validated by the startup owner"); }, verifyPredecessor },
   };
   const runtime = new FabricRuntimeState(pi, new CapturedToolCatalog(), { sessionRecovery: activation }); runtimes.push(runtime);

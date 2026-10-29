@@ -13,7 +13,8 @@ export interface PortableIdentityEvidence {
   readonly successorPodId: string;
   readonly successorBootId: string;
   readonly exclusionProof: {
-    readonly kind: "kubelet-fence" | "volume-detach" | "lease-absent";
+    /** B1 receipt discriminator, not controller authenticity; B2 must validate the receipt. */
+    readonly kind: "b1-fence";
     readonly observedAt: number;
     /** Native receipt/resource reference. Not an operator's assertion of death. */
     readonly detail: string;

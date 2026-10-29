@@ -80,12 +80,12 @@ function assertBinding(binding: PortableSessionBinding, expected: SessionRecover
   const evidence = binding.evidence;
   if (!nonempty(evidence.predecessorPodId) || !nonempty(evidence.predecessorBootId) ||
       !nonempty(evidence.successorPodId) || !nonempty(evidence.successorBootId) ||
-      !evidence.exclusionProof || !["kubelet-fence", "volume-detach", "lease-absent"].includes(evidence.exclusionProof.kind)) {
+      !evidence.exclusionProof || evidence.exclusionProof.kind !== "b1-fence") {
     throw new Error("Recovery requires validated B2 writer exclusion evidence");
   }
-  // These are evidence discriminators, not proofs this module can establish. In particular,
-  // lease absence ALONE cannot fence files: B2 validates the native physical exclusion chain,
-  // and the mandatory parent callback verifies the predecessor under actual lease custody.
+  // The B1 receipt kind is a discriminator, not controller authenticity this module can
+  // establish. B2 must validate the native physical exclusion chain, and the mandatory
+  // parent callback verifies the predecessor under actual lease custody.
   if (typeof expected.activateSuccessor !== "function") throw new Error("Recovery requires actual parent lease activation");
 }
 

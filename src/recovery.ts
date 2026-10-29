@@ -1,5 +1,6 @@
 /** Opt-in retained recovery evidence. Importing Fabric's extension does not open a store. */
 export * from "./recovery/l7-interfaces.js";
+export { createPortablePreOpenBinding, acquirePortableVolumeGuard } from "./recovery/exclude-writer.js";
 export * from "./recovery/recovery-journal.js";
 export * from "./recovery/durability-store.js";
 export * from "./recovery/attempt-ledger.js";

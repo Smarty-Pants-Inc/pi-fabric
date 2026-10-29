@@ -16,7 +16,8 @@ import { taskAgentEnvironment, withoutTaskBoundary } from "../task-environment.j
 import { configureTaskGitReadOnlyEnvironment } from "../task-git-credential.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
-import { agentPlacementProbe, liveAgentPlacement } from "../placement-config.js";
+import { agentPlacementProbe } from "../placement-config.js";
+import { liveAgentPlacement } from "./placement-policy.js";
 import { normalizeAgentCapabilityTokens } from "../../host-compatibility.js";
 import { assertAgentRequiredInputsExist, normalizeAgentRequires } from "../input-validation.js";
 import { isInside, readWritePolicy } from "../write-guard.js";

@@ -15,7 +15,9 @@ import { HerdrTransport } from "../src/agents/transports/herdr-transport.js";
 import * as processUtils from "../src/agents/transports/process-utils.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import type { AgentTransportLaunch } from "../src/agents/types.js";
-import { liveAgentPlacement, probeAgentPlacement } from "../src/agents/placement-config.js";
+import { probeAgentPlacement } from "../src/agents/placement-config.js";
+import { liveAgentPlacement } from "../src/agents/transports/placement-policy.js";
+import { diagnostics } from "../src/core/diagnostics.js";
 import type { InheritedSessionPin } from "../src/agents/session-pins.js";
 
 const roots: string[] = [], managers: AgentManager[] = [];
@@ -263,6 +265,7 @@ describe("host process task placement", () => {
     expect(read()?.default).toBe("local");
     const local = read();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const diagnostic = vi.spyOn(diagnostics, "warn");
     for (const invalid of ['{"agents":', JSON.stringify({ agents: { placement: { ...f.raw, command: [] } } })]) {
       fs.writeFileSync(file, invalid);
       expect(read()).toBe(local);
@@ -270,6 +273,8 @@ describe("host process task placement", () => {
       expect(fs.readFileSync(file, "utf8")).toBe(invalid);
     }
     expect(warn).toHaveBeenCalledTimes(2);
+    expect(diagnostic).toHaveBeenCalledTimes(2);
+    expect(diagnostic.mock.calls.every(([source]) => source === "src/agents/transports/placement-policy.ts")).toBe(true);
     fs.writeFileSync(file, JSON.stringify({ agents: { placement: f.raw } }));
     expect(read()?.default).toBe("remote");
     fs.writeFileSync(file, "{}");

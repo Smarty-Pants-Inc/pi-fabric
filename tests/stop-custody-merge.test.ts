@@ -341,6 +341,8 @@ describe("native filesystem stop custody stress", () => {
     } finally { await manager.close(); stressPhases.closeFinished = performance.now(); }
     expect(inventory(firstRoot!)).toEqual(firstInventory);
     expect(movedRoots.size, "retained-run stress must not archive or delete raw roots").toBe(0);
-    expect(securityContainers.length).toBe(hostPlatform === "win32" ? 1_000 : 0);
+    // Retained roots need no cleanup custody containers; close only prepares these
+    // for roots it is actually authorized to collect (retainRuns:false).
+    expect(securityContainers.length).toBe(0);
   }, 20_000);
 });

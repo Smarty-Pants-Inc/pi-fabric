@@ -6,6 +6,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { withRootExceptionMetadata, writeModelExceptions } from "./helpers/model-exceptions.js";
+import { retainedRunDirectory } from "./helpers/retained-run-directory.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import { saveFinalAnswerReceipt } from "../src/worker/terminal-answer.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
@@ -307,6 +308,8 @@ describe("ordinary process-task final answer boundary", () => {
     const receipt = finish(handle.id, "done");
     const next = await manager.spawn({ task: "native-close barrier", transport: "process" });
     expect(next.status).toBe("queued");
+    const runDirectory = path.join(root, handle.id);
+    const rawReceipt = fs.readFileSync(path.join(runDirectory, "final-answer.json"));
     const outbox = path.join(root, handle.id, "terminal-notices", `${queued.messageId}.json`);
     manager.status(handle.id);
     await waitUntil(() => attempts === 1 && fs.existsSync(outbox));
@@ -326,7 +329,10 @@ describe("ordinary process-task final answer boundary", () => {
     // The queued next launch proves the first run released native admission.
     await waitUntil(() => launch.mock.calls.length === 2);
     close(next.id);
-    expect((await manager.cleanup(handle.id)).cleaned).toBe(false); // retained run, no worktree
+    expect((await manager.cleanup(handle.id)).cleaned).toBe(true); // handle/worktree cleanup succeeded; run data is retained
+    const retained = retainedRunDirectory(runDirectory);
+    expect(fs.existsSync(retained)).toBe(true);
+    expect(fs.readFileSync(path.join(retained, "final-answer.json"))).toEqual(rawReceipt);
   });
 
   it.runIf(hasPosixTrustMetadata)("does not change non-Pi process terminal semantics", async () => {

@@ -48,6 +48,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
+// Windows dead-owner reclaim is a known gap; roots are kept. POSIX expectations below remain unchanged.
 describe("persistent archive custody", () => {
   it.each(["archive-pending.json", "actor-run-archive-pending.json"])("retains full terminal event sources before and after %s commit", pendingFile => {
     const directory = temporaryDirectory();
@@ -121,6 +122,14 @@ describe("persistent archive custody", () => {
     };
     sweep(); expect(fs.existsSync(source)).toBe(true);
     enqueue.mockRestore(); sweep();
+    if (process.platform === "win32") {
+      expect(fs.existsSync(root)).toBe(true);
+      expect(fs.existsSync(source)).toBe(true);
+      const pending = JSON.parse(fs.readFileSync(path.join(source, "archive-pending.json"), "utf8"));
+      expect(pending.pending.shutdown.result).toEqual(result);
+      expect(runTreeExitVeto(parent)).toMatch(/archive is pending/);
+      return;
+    }
     expect(fs.existsSync(root)).toBe(false);
     const store = new ActorChildCompletionStore(sessionFile);
     expect(JSON.parse(fs.readFileSync(store.resultFile(id), "utf8"))).toMatchObject(result);
@@ -399,7 +408,12 @@ describe("safe run roots", () => {
     ageRunRoot(root, 1);
     const result = sweep(tempRoot);
     if (kind === "closed") expect(result.removedRuns).toContain(path.join(root, "done"));
-    expect(fs.existsSync(path.join(root, "done"))).toBe(false);
+    if (kind === "orphan" && process.platform === "win32") {
+      expect(fs.existsSync(root)).toBe(true);
+      expect(fs.existsSync(path.join(root, "done"))).toBe(true);
+      expect(fs.readFileSync(path.join(root, "done", "route-session.jsonl"), "utf8")).toBe('{"type":"session"}\n');
+      expect(fs.readFileSync(path.join(root, "done", "route-dispatch-receipt.json"), "utf8")).toBe('{"runId":"owned-receipt"}');
+    } else expect(fs.existsSync(path.join(root, "done"))).toBe(false);
     for (const name of ["pending", "live", "unresolved"]) expect(fs.existsSync(path.join(root, name))).toBe(true);
   });
   it.each([
@@ -636,7 +650,11 @@ describe("temporal retention", () => {
     }
     ageRunRoot(orphaned, 1);
     const unmarked = sweep(tempRoot);
-    expect(unmarked.removedRoots).toContain(orphaned);         // the closed root goes too once empty
+    if (process.platform === "win32") {
+      expect(unmarked.removedRoots).not.toContain(orphaned);
+      expect(fs.existsSync(orphaned)).toBe(true);
+      expect(fs.readFileSync(path.join(orphaned, "lost", "task.txt"), "utf8")).toBe("work");
+    } else expect(unmarked.removedRoots).toContain(orphaned); // the closed root goes too once empty
     expect(unmarked.removedRuns).toEqual([path.join(closed, "lost")]);
   });
 
@@ -685,8 +703,14 @@ describe("temporal retention", () => {
       now: 6 * HOUR + 2,
     });
 
-    expect(result.removedRoots).toEqual([runRoot]);
-    expect(fs.existsSync(runRoot)).toBe(false);
+    if (process.platform === "win32") {
+      expect(result.removedRoots).toEqual([]);
+      expect(fs.existsSync(runRoot)).toBe(true);
+      expect(fs.readFileSync(path.join(runRoot, ".fabric-owner.json"), "utf8")).toContain('"heartbeatAt":1');
+    } else {
+      expect(result.removedRoots).toEqual([runRoot]);
+      expect(fs.existsSync(runRoot)).toBe(false);
+    }
   });
 
   it("sweeps a host at most once per interval, and again once the marker is stale (smarty-dev#2010)", () => {
@@ -705,16 +729,28 @@ describe("temporal retention", () => {
       tempRoot, now, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY, minIntervalMs: HOUR,
     });
     const first = deadRoot("first");
-    expect(sweepAt(DAY).removedRoots).toEqual([first]);
+    const firstSweep = sweepAt(DAY);
+    if (process.platform === "win32") {
+      expect(firstSweep.removedRoots).not.toContain(first);
+      expect(fs.existsSync(first)).toBe(true);
+    } else expect(firstSweep.removedRoots).toEqual([first]);
     const second = deadRoot("second");
     // Another process swept within the hour: this one skips the walk.
     expect(sweepAt(DAY + HOUR - 1).removedRoots).toEqual([]);
     expect(fs.existsSync(second)).toBe(true);
-    expect(sweepAt(DAY + HOUR).removedRoots).toEqual([second]);
+    const secondSweep = sweepAt(DAY + HOUR);
+    if (process.platform === "win32") {
+      expect(secondSweep.removedRoots).not.toContain(second);
+      expect(fs.existsSync(second)).toBe(true);
+    } else expect(secondSweep.removedRoots).toEqual([second]);
     // A marker from the future (clock skew, tampering) does not suppress collection.
     fs.writeFileSync(path.join(tempRoot, RUN_ROOT_SWEEP_MARKER), JSON.stringify({ sweptAt: 10 * DAY }));
     const third = deadRoot("third");
-    expect(sweepAt(2 * DAY).removedRoots).toEqual([third]);
+    const thirdSweep = sweepAt(2 * DAY);
+    if (process.platform === "win32") {
+      expect(thirdSweep.removedRoots).not.toContain(third);
+      expect(fs.existsSync(third)).toBe(true);
+    } else expect(thirdSweep.removedRoots).toEqual([third]);
   });
 
   it("collects expired actor runs with worker reply and overflow files, still vetoed by unknown files (smarty-dev#2010)", () => {
@@ -777,9 +813,24 @@ describe("temporal retention", () => {
       ageRunRoot(orphan, 1);
       // Whole-tree custody retires canonical names without deleting any trace.
       const removed = () => 8 - fs.readdirSync(orphan).filter((name) => name.startsWith("run-")).length;
+      const before = Array.from({ length: 8 }, (_, index) => {
+        const run = path.join(orphan, `run-${index}`);
+        return [fs.readFileSync(path.join(run, "status.json")), fs.readFileSync(path.join(run, "task.txt"))] as const;
+      });
       // The clock passes the budget right after the fifth run is removed.
       vi.spyOn(performance, "now").mockImplementation(() => (removed() >= 5 ? 10_000 : 0));
       expect(budgetSweep(tempRoot, 1_000)).toEqual({ removedRoots: [], removedRuns: [] });
+      if (process.platform === "win32") {
+        expect(removed()).toBe(0);
+        expect(fs.existsSync(orphan)).toBe(true);
+        for (let index = 0; index < before.length; index++) {
+          const run = path.join(orphan, `run-${index}`);
+          expect(fs.readFileSync(path.join(run, "status.json"))).toEqual(before[index]![0]);
+          expect(fs.readFileSync(path.join(run, "task.txt"))).toEqual(before[index]![1]);
+        }
+        vi.restoreAllMocks();
+        return;
+      }
       expect(removed()).toBe(5);
       expect(fs.readdirSync(orphan).filter((name) => name.startsWith("run-"))).toHaveLength(3);
       vi.restoreAllMocks();
@@ -978,7 +1029,7 @@ describe("temporal retention", () => {
     expect(fs.readFileSync(outside, "utf8")).toBe("keep");
   });
 
-  it("removes a dead owner's root holding pi-durable journals after the orphan grace (#229)", () => {
+  it("reclaims or keeps a dead owner's root holding pi-durable journals after the orphan grace (#229)", () => {
     const tempRoot = temporaryDirectory();
     const runRoot = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "durable-orphan");
     fs.mkdirSync(runRoot);
@@ -990,7 +1041,13 @@ describe("temporal retention", () => {
     fs.writeFileSync(path.join(run, "durable", "initial", "store", "main.jsonl"), "{}\n");
     ageRunRoot(runRoot, 1);
     expect(sweepAt(tempRoot, 2).removedRoots).toEqual([]);
-    expect(sweepAt(tempRoot, 6 * HOUR + 2).removedRoots).toEqual([runRoot]);
+    const result = sweepAt(tempRoot, 6 * HOUR + 2);
+    if (process.platform === "win32") {
+      expect(result.removedRoots).not.toContain(runRoot);
+      expect(fs.existsSync(runRoot)).toBe(true);
+      expect(fs.readFileSync(path.join(runRoot, "run", "durable", "initial", "store", "main.jsonl"), "utf8")).toBe("{}\n");
+      expect(fs.existsSync(path.join(runRoot, "run", "durable", "initial", "lease.sqlite"))).toBe(true);
+    } else expect(result.removedRoots).toEqual([runRoot]);
   });
 
   it("expires actor archives after seven days while preserving the latest run", () => {

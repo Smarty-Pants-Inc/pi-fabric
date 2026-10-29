@@ -14,6 +14,8 @@ import { ActorLogStore } from "../src/actors/log-store.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { fabricTurnProvenance } from "../src/fabric-provenance.js";
 import { FABRIC_RUN_ROOT_PREFIX, canRemoveTerminalRun, markRunRootActive, markRunRootClosed, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
+import { ageRunRoot } from "./helpers/age-run-root.js";
+import { retainedRunDirectory } from "./helpers/retained-run-directory.js";
 
 // Terminal publication is not the native worker's close receipt. Join the exact
 // owned instance before treating its emitted run tree as a quiescent fixture.
@@ -140,6 +142,19 @@ const makeUnsafe = (run: string, kind: UnsafeKind) => {
 
 // Copy the entire emitted tree, including native session and delivery artifacts.
 const copyRun = (source: string, destination: string) => { fs.cpSync(source, destination, { recursive: true }); return destination; };
+const runBytes = (directory: string): Array<[string, string]> => {
+  const rows: Array<[string, string]> = [];
+  const walk = (current: string): void => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const file = path.join(current, entry.name), relative = path.relative(directory, file);
+      if (entry.isSymbolicLink()) rows.push([relative, `link:${fs.readlinkSync(file)}`]);
+      else if (entry.isDirectory()) { rows.push([`${relative}/`, "directory"]); walk(file); }
+      else rows.push([relative, `file:${fs.readFileSync(file).toString("base64")}`]);
+    }
+  };
+  walk(directory);
+  return rows;
+};
 
 describe("I-2 production-worker ingress retention", () => {
   it("a completed native descendant persists its process identity and releases a retained failed parent's ownership debt", async () => {
@@ -212,13 +227,32 @@ describe("I-2 production-worker ingress retention", () => {
     for (const kind of unsafeKinds) makeUnsafe(copyRun(attributed.run, path.join(root, kind)), kind);
     if (state === "closed") markRunRootClosed(root, base, true);
     else fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: base, heartbeatAt: base, orphanedAt: base }));
+    // Synthetic time must also age every copied file and directory; retention uses
+    // last observed filesystem activity rather than fixture timestamps alone.
+    ageRunRoot(root, base);
+    const plainBefore = runBytes(path.join(root, "plain"));
+    const attributedBefore = runBytes(path.join(root, "attributed"));
     const sweep = (now: number) => sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 200, oneShotRunRetentionMs: 200 });
     expect(sweep(base + 99).removedRuns).toEqual([]);
     for (const name of ["plain", "attributed", ...unsafeKinds]) expect(fs.existsSync(path.join(root, name))).toBe(true);
     sweep(base + 201);
     // Check the negative controls first so they are exercised on the pre-fix tree too.
     for (const kind of unsafeKinds) expect(fs.existsSync(path.join(root, kind)), kind).toBe(true);
-    for (const name of ["plain", "attributed"]) expect(fs.existsSync(path.join(root, name)), name).toBe(false);
+    if (state === "orphan" && process.platform === "win32") {
+      // Windows dead-owner reclaim is a known gap; roots are kept.
+      expect(fs.existsSync(root)).toBe(true);
+      for (const [name, before] of [["plain", plainBefore], ["attributed", attributedBefore]] as const) {
+        expect(fs.existsSync(path.join(root, name)), name).toBe(true);
+        expect(runBytes(path.join(root, name))).toEqual(before);
+      }
+    } else {
+      for (const [name, before] of [["plain", plainBefore], ["attributed", attributedBefore]] as const) {
+        expect(fs.existsSync(path.join(root, name)), name).toBe(false);
+        const retained = retainedRunDirectory(path.join(root, name));
+        expect(fs.existsSync(retained), `${name} is held in place or in a receipt-backed archive`).toBe(true);
+        expect(runBytes(retained)).toEqual(before);
+      }
+    }
   }, 90000);
 
   // Keep: data safety; real production archive bytes must survive automatic retention.

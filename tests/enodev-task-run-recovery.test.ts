@@ -16,6 +16,8 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { sweepTempRunRoots } from "../src/storage/retention.js";
+import { ageRunRoot } from "./helpers/age-run-root.js";
+import { retainedRunDirectory } from "./helpers/retained-run-directory.js";
 import { writeHostLease } from "../src/topology/host-leases.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 
@@ -172,8 +174,13 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed task-agent runs
     const now = Date.now();
     fs.writeFileSync(path.join(runRoot, ".fabric-owner.json"), JSON.stringify({ pid: deadPid(), startedAt: now - 3_600_000,
       heartbeatAt: now - 3_600_000, orphanedAt: now - 3_600_000 }));
+    const settlementBytes = fs.readFileSync(path.join(dead, "settlement.json"));
+    // The sweep uses observed filesystem activity, not the synthetic owner times.
+    ageRunRoot(runRoot, now - 3_600_000);
     sweepTempRunRoots({ tempRoot: tmp, orphanedTempRunRetentionMs: 1_000, oneShotRunRetentionMs: 1_000, now });
     expect(fs.existsSync(dead)).toBe(false);
+    const archived = retainedRunDirectory(dead);
+    expect(fs.readFileSync(path.join(archived, "settlement.json"))).toEqual(settlementBytes);
     expect(fs.existsSync(path.join(live, "settlement.json"))).toBe(true);
   });
 
@@ -209,6 +216,12 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed task-agent runs
     const owner = path.join(runRoot, ".fabric-owner.json");
     const now = Date.now();
     fs.writeFileSync(owner, JSON.stringify({ pid: deadPid(), startedAt: now - 3_600_000, heartbeatAt: now - 3_600_000, orphanedAt: now - 3_600_000 }));
+    // This launch is intentionally mocked before a worker can emit a trace; seed
+    // representative raw bytes so the archive assertion covers the log itself.
+    const eventsFile = path.join(directory, "events.jsonl");
+    if (!fs.existsSync(eventsFile)) fs.writeFileSync(eventsFile, '{"type":"raw","text":"SCRATCH ANSWER"}\n');
+    const rawEvents = fs.readFileSync(eventsFile);
+    const settlementBytes = fs.readFileSync(path.join(directory, "settlement.json"));
     // Recovery alone first (what the sweep runs before its safety walk): settled lost, once.
     expect(recoverEnodevTaskRun(directory)).toBe("lost");
     expect(vetoed(directory)).toBe(false);
@@ -222,9 +235,14 @@ describe.runIf(process.platform === "linux")("ENODEV-unconfirmed task-agent runs
     await completions.drain();
     expect(delivered).toEqual([]);
     expect(journal(meshRoot)).toEqual([]);
-    // With the marker gone, retention can collect the run.
+    // With the marker gone and actual fixture activity aged past grace, retention
+    // archives the whole run. Its raw trace and saved answer bytes remain intact.
+    ageRunRoot(runRoot, now - 3_600_000);
     sweepTempRunRoots({ tempRoot: tmp, orphanedTempRunRetentionMs: 1_000, oneShotRunRetentionMs: 1_000, now });
     expect(fs.existsSync(directory)).toBe(false);
+    const archived = retainedRunDirectory(directory);
+    expect(fs.readFileSync(path.join(archived, "events.jsonl"))).toEqual(rawEvents);
+    expect(fs.readFileSync(path.join(archived, "settlement.json"))).toEqual(settlementBytes);
     await completions.drain();
     expect(delivered).toEqual([]);
   });

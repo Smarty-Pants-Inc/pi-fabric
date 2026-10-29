@@ -126,7 +126,7 @@ afterEach(() => {
   delete privateDirTestHooks.platform;
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
-const setup = () => {
+const setup = (retainRuns = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-stop-merge-")); roots.push(root);
   privateDirTestHooks.platform = hostPlatform;
   if (hostPlatform === "win32") {
@@ -139,7 +139,7 @@ const setup = () => {
     });
   }
   return new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, timeoutMs: 60_000,
-    maxConcurrent: 1, retainRuns: false, budgetUsd: 0, notifyOnComplete: false },
+    maxConcurrent: 1, retainRuns, budgetUsd: 0, notifyOnComplete: false },
   { runRoot: path.join(root, "runs"), workerPath: path.join(root, "worker.mjs") });
 };
 const stillRunning = async (manager: AgentManager, id: string) => {
@@ -289,6 +289,27 @@ describe("native filesystem stop custody stress", () => {
     if (hostPlatform === "win32") await recordSecuritySubprocess();
   });
 
+  it("archives a completed raw run as one exact whole-root custody transfer", async () => {
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      terminal(request);
+      return { kind: "process", sessionId: "2147483647", stop: async () => {}, isAlive: async () => false };
+    });
+    const manager = setup();
+    try {
+      const result = await manager.run({ task: "single-root custody proof" });
+      expect(result.status).toBe("completed");
+      const source = manager.runDirectory(result.id)!;
+      const before = inventory(source);
+      await manager.close();
+      expect(movedRoots).toEqual(new Set([source]));
+      expect(rawExports).toHaveLength(1);
+      expect(rawExports[0]!.before).toEqual(before);
+      const receipt = JSON.parse(fs.readFileSync(rawExports[0]!.receipt, "utf8")) as { destination: string; state: string };
+      expect(receipt.state).toBe("moved");
+      expect(inventory(receipt.destination)).toEqual(before);
+    } finally { await manager.close(); }
+  });
+
   it("releases confirmed custom process admission and evicts settled handles", async () => {
     expect(vi.isMockFunction(Object.getOwnPropertyDescriptor(process, "platform")?.get),
       "native filesystem custody must not use a mocked process.platform").toBe(false);
@@ -297,7 +318,11 @@ describe("native filesystem stop custody stress", () => {
       terminal(request);
       return { kind: "process", sessionId: "2147483647", stop: async () => {}, isAlive: async () => false };
     });
-    const manager = setup();
+    // This case is specifically the 1,000-handle/transport-admission stress
+    // check. Keep roots in place here instead of doing 1,000 durable archive
+    // transactions in its 20s budget; the adjacent custody cases verify the
+    // default archive/receipt path on real filesystem trees.
+    const manager = setup(true);
     let first: string | undefined;
     let firstRoot: string | undefined;
     let firstInventory: unknown[] | undefined;
@@ -315,7 +340,7 @@ describe("native filesystem stop custody stress", () => {
       stressPhases.loopFinished = performance.now();
     } finally { await manager.close(); stressPhases.closeFinished = performance.now(); }
     expect(inventory(firstRoot!)).toEqual(firstInventory);
-    expect(movedRoots.size, "all 1000 retained handles require whole-root prepared+moved receipts").toBe(1_000);
+    expect(movedRoots.size, "retained-run stress must not archive or delete raw roots").toBe(0);
     expect(securityContainers.length).toBe(hostPlatform === "win32" ? 1_000 : 0);
   }, 20_000);
 });

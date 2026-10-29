@@ -600,14 +600,39 @@ const participantAuthorityStamp = (files: ReturnType<typeof participantFileSnaps
  * every lease once a handoff could be voided, plus each native lease's live/dead judgment at the plan's
  * `judgedAt`. A renewal that keeps a native live moves nothing; one that revives it, or a new native,
  * does (the plan's liveness window covers time passing). */
-const hostLeaseAuthorityStamp = (root: string, relevantIds: ReadonlySet<string> | undefined, judgedAt?: number): string =>
-  contentDigest([...readHostLeases(root).values()]
+const leaseAuthorityStamp = (leases: ReadonlyMap<string, FabricHostLease>, relevantIds: ReadonlySet<string> | undefined, judgedAt?: number): string =>
+  contentDigest([...leases.values()]
     .filter(lease => relevantIds === undefined || relevantIds.has(lease.id) || relevantIds.has(lease.rootId) ||
       relevantIds.has(lease.identityId))
     .map(lease => [lease.id, lease.rootId, lease.identityId, lease.startedAt, lease.incarnationToken,
       lease.bridgeSupersededTokens, lease.bridgeSupersededTokenSeen,
       ...(relevantIds === undefined && judgedAt !== undefined ? [nativeLeaseLive(lease, judgedAt)] : [])])
     .sort((left, right) => String(left[0]).localeCompare(String(right[0]))));
+
+const hostLeaseAuthorityStamp = (root: string, relevantIds: ReadonlySet<string> | undefined, judgedAt?: number): string =>
+  leaseAuthorityStamp(readHostLeases(root), relevantIds, judgedAt);
+
+/** Reuse compares consulted authority, not whether its first file has been written.
+ * hostLiveness already falls back to a genuine native host row without a matching lease.
+ * Supply that row only for absent leases; EVERY actual lease keeps its binding, incarnation
+ * and history in the comparison, including a first file that disagrees with the fallback.
+ * Mirrors have no native bootstrap authority. This is NOT the admission/commit stamp above. */
+const leaseReuseAuthorityStamp = (leases: ReadonlyMap<string, FabricHostLease>, hostEntries: readonly MeshStateEntry[]): string => {
+  const consulted = new Map(leases);
+  for (const entry of hostEntries) {
+    const host = hostOf(entry.key, entry.value);
+    if (!host || remoteHostOf(host) !== undefined || entry.updatedBy.id !== host.identity.id || consulted.has(host.id)) continue;
+    consulted.set(host.id, { id: host.id, rootId: host.rootId, identityId: host.identity.id,
+      startedAt: host.startedAt, updatedAt: host.updatedAt, expiresAt: host.expiresAt,
+      ...(host.incarnationToken !== undefined ? { incarnationToken: host.incarnationToken } : {}),
+      ...(host.bridgeSupersededTokens !== undefined ? { bridgeSupersededTokens: host.bridgeSupersededTokens } : {}),
+      ...(host.bridgeSupersededTokenSeen !== undefined ? { bridgeSupersededTokenSeen: host.bridgeSupersededTokenSeen } : {}) });
+  }
+  return leaseAuthorityStamp(consulted, undefined);
+};
+
+const hostLeaseReuseAuthorityStamp = (store: MeshStore): string =>
+  leaseReuseAuthorityStamp(readHostLeases(store.root), store.listAll(HOST_PREFIX, { fresh: true }));
 
 const unrelatedMirrorStateKeys = (view: MeshBatchView, relevantIds: ReadonlySet<string>): ReadonlySet<string> => {
   const ignored = new Set<string>();
@@ -1130,7 +1155,13 @@ export class StoreBridgeSide implements BridgeSide {
       const projection = fileState ? { ...native, participants: native.participants.map(fingerprint) } : native;
       const topology = { ...projection, hosts: native.hosts.map(host => settled(host.record as unknown as Record<string, unknown>)) };
       const content = { ...projection, hosts: native.hosts.map(({ observedAt: _observedAt, ...host }) => host) };
-      return { native, digest: contentDigest({ native: content, mirrored, relays }), topology: contentDigest({ topology, mirrored, relays }) };
+      // Source-side authority must cross the existing presence notice, not depend on the
+      // receiver finding it in its own lease directory. Compare this captured lease map
+      // with the already-consulted native bootstrap authority: an equivalent first file
+      // is TTL-only, but first-file history/binding/incarnation changes are still topology.
+      const authority = leaseReuseAuthorityStamp(leases, hostEntries);
+      return { native, digest: contentDigest({ native: content, mirrored, relays, authority }),
+        topology: contentDigest({ topology, mirrored, relays, authority }) };
     };
     // A WAL write can be observed before the writer's COMMIT/wal-index publication. A
     // read then sees old state and may receive no later fs event. Fence the observation
@@ -1175,9 +1206,9 @@ export class StoreBridgeSide implements BridgeSide {
       }
     };
     // One check-phase tick per notification burst: the burst's scan (if any) first, then its event wake.
-    // A lease renewal followed by routed work arrives as one burst; classifying the lease before the
-    // directions wake lets their authority check see the pending lease and refresh it now, instead of
-    // forwarding under the old mirror and leaving the renewal to the half-lease flush.
+    // A lease renewal followed by routed work arrives as one burst; classify the lease before the
+    // directions wake so their authority check can distinguish changed admission from a TTL-only
+    // renewal, which remains coalesced until the half-lease flush.
     const tick = (): void => {
       burst = undefined;
       if (!active) return;
@@ -3660,6 +3691,7 @@ export class MeshBridge {
   #syncedPresenceVersion = 0;
   #leaseVersion = 0;
   #syncedLeaseVersion = 0;
+  #leaseAuthority: { directory: string; stamp: string } | undefined;
   #leaseRenewAt = Infinity;
   #legacyPolling = false;
   #expiryAt = Infinity;
@@ -4415,6 +4447,8 @@ export class MeshBridge {
     const syncedAt = Date.now();
     const presenceVersion = this.#presenceVersion;
     const leaseVersion = this.#leaseVersion;
+    const authorityStore = this.options.local instanceof StoreBridgeSide ? this.options.local.store : undefined;
+    const leaseAuthorityBefore = authorityStore === undefined ? undefined : hostLeaseReuseAuthorityStamp(authorityStore);
     const localPresence = this.#timeMembershipStep("syncPresence.local.presence", () => this.options.local.presence());
     // StoreBridgeSide.presence() scans synchronously before returning its promise. That
     // hub work precedes the remote request; do not charge it to the inbound sample's
@@ -4504,6 +4538,12 @@ export class MeshBridge {
     this.#presenceAt = syncedAt;
     this.#syncedPresenceVersion = presenceVersion;
     this.#syncedLeaseVersion = leaseVersion;
+    const directory = authorityStore === undefined ? undefined : hostLeaseDirectoryStamp(authorityStore.root);
+    const stamp = authorityStore === undefined ? undefined : hostLeaseReuseAuthorityStamp(authorityStore);
+    // Mirror installation or a concurrent writer may change authority after the sample.
+    // Only a stable stamp certifies reuse; TTL hints during the pass preserve that stamp.
+    this.#leaseAuthority = directory !== undefined && stamp !== undefined && stamp === leaseAuthorityBefore
+      ? { directory, stamp } : undefined;
     if (this.#unaddressedRefreshVersion === unaddressedRefreshVersion) this.#unaddressedRefreshAt = undefined;
     // Origin updates normally renew mirrors. A source with a long lease and no heartbeat
     // still needs its capped, held projection to remain live: one lease deadline, 1 s before
@@ -4618,6 +4658,21 @@ export class MeshBridge {
       (this.#legacyPolling && Date.now() - this.#presenceAt >= (this.options.presenceMs ?? DEFAULT_PRESENCE_MS));
   }
 
+  /** Built-in sources promote changed authority to presence before sending a lease hint.
+   * Still fence reuse against canonical local lease/bootstrap authority; renewals leave
+   * leaseVersion pending for the existing half-authority deadline. Custom/unknown local sides retain
+   * the conservative full refresh. Directory metadata avoids rescanning unchanged files. */
+  #leaseAuthorityChanged(): boolean {
+    if (this.#leaseVersion === this.#syncedLeaseVersion) return false;
+    if (!(this.options.local instanceof StoreBridgeSide) || !this.#leaseAuthority) return true;
+    const root = this.options.local.store.root, directory = hostLeaseDirectoryStamp(root);
+    if (directory === undefined) return true;
+    if (directory === this.#leaseAuthority.directory) return false;
+    if (hostLeaseReuseAuthorityStamp(this.options.local.store) !== this.#leaseAuthority.stamp) return true;
+    this.#leaseAuthority.directory = directory;
+    return false;
+  }
+
   /** Only preemptive traffic refreshes may leave an active notification pass or its retained
    * independent mirror slot alone. Missing/expired membership and commit refusals still refresh. */
   #deferPreemptivePresence(): boolean {
@@ -4636,7 +4691,7 @@ export class MeshBridge {
     // A page/read/write can wait on the mesh lock longer than a mirrored lease.
     // Refresh once before denying stale authority, sharing the normal presence pass.
     // Store lock and transport call timeouts bound it; no retry loop or fresh-message RPC.
-    if (refreshIfStale && !this.#deferPreemptivePresence() && (this.#presenceDue() || this.#leaseVersion !== this.#syncedLeaseVersion ||
+    if (refreshIfStale && !this.#deferPreemptivePresence() && (this.#presenceDue() || this.#leaseAuthorityChanged() ||
       (!this.#notificationMode && Date.now() - this.#presenceAt > DEFAULT_PRESENCE_MS))) {
       const end = direction && this.#deliveryAge.drainPhase(direction, "membershipWaitMs");
       try { await this.syncPresence(); } finally { if (end) end(); }
@@ -5527,7 +5582,7 @@ export class MeshBridge {
         const firstPending = this.#leaseVersion === this.#syncedLeaseVersion;
         this.#leaseVersion++;
         // One pending half-lease flush coalesces every lane's heartbeat. Further renewals
-        // neither reschedule it nor take a lock; actual routed work refreshes immediately.
+        // neither reschedule it nor take a lock; routed work refreshes only changed authority.
         if (firstPending && !backingOff) this.#wake?.();
         wakeDirections(true);
         return;

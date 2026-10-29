@@ -25,8 +25,8 @@ afterEach(async () => {
 const key = (kind: string, id: string) => `topology/${kind}/${createHash("sha256").update(id).digest("hex")}`;
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 const settle = () => sleep(40);
-const until = async (check: () => boolean) => {
-  const deadline = performance.now() + 3_000;
+const until = async (check: () => boolean, timeoutMs = 3_000) => {
+  const deadline = performance.now() + timeoutMs;
   while (!check() && performance.now() < deadline) await sleep(5);
   expect(check()).toBe(true);
 };
@@ -463,22 +463,22 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
       identityId: lane.id, startedAt: lane.host.startedAt, updatedAt: Date.now(), expiresAt: expiry });
     const expiry = Date.now() + 12_000;
     renew(f.far.root, expiry); // host-leases mkdir after watch setup
-    // Renewal-only updates are pending until the half-lease flush; actual work demands fresh authority now.
-    await f.far.publish({ topic: "fleet.work.notify.7299", kind: "probe", from: lane.identity, to: "absent" });
-    await until(() => (readHostLeases(f.hub.root).get(lane.id)?.mirror?.sourceExpiresAt ?? 0) >= expiry);
+    // A TTL-only hint stays coalesced; the existing half-authority flush is capped at 7.5 s.
+    // Allow 1 s for scheduling, then require the mirror to carry the actual renewed source expiry.
+    await until(() => (readHostLeases(f.hub.root).get(lane.id)?.mirror?.sourceExpiresAt ?? 0) >= expiry, 8_500);
     const nextExpiry = Date.now() + 14_000;
     renew(replacement, nextExpiry);
     fs.renameSync(path.join(f.far.root, "host-leases"), path.join(f.root, "old-leases"));
     fs.renameSync(path.join(replacement, "host-leases"), path.join(f.far.root, "host-leases"));
-    await f.far.publish({ topic: "fleet.work.notify.7299", kind: "probe", from: lane.identity, to: "absent" });
-    await until(() => (readHostLeases(f.hub.root).get(lane.id)?.mirror?.sourceExpiresAt ?? 0) >= nextExpiry);
+    // The atomic directory replacement must rebind the watch; its TTL-only renewal still flushes at half-authority.
+    await until(() => (readHostLeases(f.hub.root).get(lane.id)?.mirror?.sourceExpiresAt ?? 0) >= nextExpiry, 8_500);
     // Own mirror/lease writes and cursor renames settle, rather than feeding a renewal loop.
     await settle();
     const mirrors = vi.spyOn(f.local, "mirror");
     await settle();
     expect(mirrors).not.toHaveBeenCalled();
     expect(live.failure()).toBeUndefined();
-  });
+  }, 30_000);
 
   it("reconciles finite source expiry once, then becomes timer-free instead of renewing every 5 s", async () => {
     const f = fixture();

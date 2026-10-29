@@ -149,7 +149,10 @@ describe("NATS carrier bounded lapse recovery", () => {
     expect(again.termed).toHaveLength(1);
   });
 
-  it.each(["before-write", "after-rename"])("retains the same first timestamp after a %s failure", async mode => {
+  // The after-rename fault injects a directory fsync failure; Windows has no namespace barrier (the atomic writer
+  // skips the directory fsync there, atomic-write.ts namespaceBarrierAvailable), so that case cannot fault on win32.
+  const timestampFaultModes = atomic.namespaceBarrierAvailable() ? ["before-write", "after-rename"] : ["before-write"];
+  it.each(timestampFaultModes)("retains the same first timestamp after a %s failure", async mode => {
     const f = await fixture(); f.lapse(); const d = await f.deliver("write-failure", 1);
     const realWrite = atomic.writeJsonAtomic, realSync = fs.fsyncSync;
     const fault = mode === "before-write" ? vi.spyOn(atomic, "writeJsonAtomic").mockImplementation((file, value, options) => {

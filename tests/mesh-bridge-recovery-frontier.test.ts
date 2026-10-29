@@ -702,7 +702,7 @@ function emitEvidence(fixture: Fixture, scan: SuccessfulScan, initial: Cancellat
 
 afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
-});
+}, 300_000);
 
 it.each([100_000, 3_321])("measures native recovery over a %s-topic one-row archive day", async topicCount => {
   const fixture = createFixture(topicCount);

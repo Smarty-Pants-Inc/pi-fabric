@@ -3928,17 +3928,20 @@ export class MeshBridge {
     const cursor = this.#cursor!; // start() initialized it, or run() already observed readiness.
     const started = monotonicClock.now();
     let failed = false;
-    const check = (): void => {
+    let recoveryWorkStarted = false;
+    const check = (recoveryWork = false): void => {
       if (this.#stopped || failed) throw new Error("Bridge recovery cancelled");
       if (this.#notificationError) throw this.#notificationError;
-      if (monotonicClock.now() - started >= budgetMs) throw new Error(`Bridge recovery exceeded ${budgetMs} ms startup budget`);
+      recoveryWorkStarted ||= recoveryWork;
+      // Head-only reconciliation still observes cancellation, but spends no recovery budget.
+      if (recoveryWork && monotonicClock.now() - started >= budgetMs) throw new Error(`Bridge recovery exceeded ${budgetMs} ms startup budget`);
     };
     try {
       const [toRemote, toLocal] = await Promise.all([
         allBridgedIds(this.options.remote, cursor.toRemote.mark, check, line => this.#log(`recovery (toRemote): ${line}`)),
         allBridgedIds(this.options.local, cursor.toLocal.mark, check, line => this.#log(`recovery (toLocal): ${line}`)),
       ]);
-      check();
+      check(recoveryWorkStarted);
       this.#seen = { toRemote, toLocal };
     } finally { failed = true; }
   }
@@ -4006,12 +4009,16 @@ export class MeshBridge {
     let retryMs = LOCK_RETRY_MIN_MS;
     let walCapDelay: number | undefined;
     const startedAt = this.#now();
+    const recoveryBudgetMs = Math.max(0, Math.min(deadlineMs, this.options.startDeadlineMs ?? BRIDGE_START_DEADLINE_MS));
     let attempts = 0;
     let loggedAt: number | undefined;
     let loggedKind: string | undefined;
     for (;;) {
       attempts += 1;
-      try { return await this.start(Math.max(0, deadlineMs - Math.max(0, this.#now() - startedAt))); }
+      // Keep a finite per-attempt recovery budget, capped by the caller's start bound (the CLI
+      // passes its remaining watchdog time here). Shrinking it to zero on the final attempt
+      // would replace the actual busy refusal, or prevent that attempt from succeeding.
+      try { return await this.start(recoveryBudgetMs); }
       catch (error) {
         if (this.#stopped || !isBridgeRetryable(error)) throw error;
         const now = this.#now();
@@ -5577,7 +5584,7 @@ export class MeshBridge {
   }
 }
 
-const allBridgedIds = async (side: BridgeSide, after: number, check: () => void, log: (line: string) => void): Promise<Set<string>> => {
+const allBridgedIds = async (side: BridgeSide, after: number, check: (recoveryWork?: boolean) => void, log: (line: string) => void): Promise<Set<string>> => {
   const ids = new Set<string>();
   let cursor = after, pages = 0, attemptedPages = 0;
   let totalCost: RecoveryReadCost | undefined;
@@ -5589,7 +5596,7 @@ const allBridgedIds = async (side: BridgeSide, after: number, check: () => void,
   let completed = false;
   try {
     for (;;) {
-      check();
+      check(true);
       let page: BridgedIds;
       attemptedPages++;
       try {
@@ -5605,7 +5612,7 @@ const allBridgedIds = async (side: BridgeSide, after: number, check: () => void,
           }
         }
       }
-      check();
+      check(true);
       if (!page || !Array.isArray(page.ids) || !Number.isSafeInteger(page.through) || page.through < cursor) throw new Error("Bridge ids page is invalid");
       for (const id of page.ids) if (typeof id === "string") ids.add(id);
       if (page.done || page.through >= horizon) { completed = true; return ids; }

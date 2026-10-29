@@ -26,7 +26,8 @@ import {
  */
 export const MESH_CUSTODY_LOCK_NAME = "custody.lock";
 const CUSTODY_LOCK_TIMEOUT_MS = 10_000;
-// Same conservative 30s staleness bound as mesh/exclusive locks; age alone NEVER proves death.
+// Same conservative 30s staleness bound as mesh/exclusive locks; also the missing-owner release grace.
+// Age alone NEVER proves death or authorizes recovery of an ownerless host-qualified gate.
 export const CUSTODY_LOCK_STALE_MS = 30_000;
 
 /** Not a contention timeout: callers must surface this refusal, not silently retry/skip it. */
@@ -227,9 +228,16 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
       // canonical lock we actually observed, just as recovery fences the same inode/bytes.
       const current = fs.lstatSync(lock);
       if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== owner) return false;
+      // Publication installs a complete owner, but releaseFenceLock unlinks (pinned) or
+      // renames (unpinned) owner BEFORE canonical rmdir. ENOENT is transient until the
+      // release grace expires; PRESENT empty/malformed PID bytes still refuse at once.
+      // Use the rechecked mtime: the initial stat may predate the release's owner removal.
+      // Past grace, alarm/refuse rather than rename: no receipt proves host/PID locality,
+      // and an empty recovery fence cannot protect a successor from a paused recoverer.
+      if (owner === undefined && Date.now() - current.mtimeMs <= CUSTODY_LOCK_STALE_MS) return false;
       throw new MeshCustodyUnrecoverableError(lock);
     }
-    if (owner === undefined || !owner.endsWith("\n")) return false;    // never ownerless by protocol
+    if (owner === undefined || !owner.endsWith("\n")) return false;
     // A host-lease commit gate is never recovered by a foreign/unknown PID. Matching
     // machine evidence is still mandatory when boot/process identity is unavailable.
     const physical = hostQualified ? readPhysicalHostIdentity() : undefined;

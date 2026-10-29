@@ -260,13 +260,29 @@ const runChild = (root: string, key: string, value: unknown): Promise<{ code: nu
   });
 
 describe("LifecycleBroker canonical state-file relevance", () => {
-  it.each(["file", "sqlite"] as const)("%s: unrelated real state commits do not drain, but a subscription commit delivers the existing event", async stateBackend => {
+  it.each([
+    ["file", "file", false],
+    ["sqlite", "sqlite", false],
+    ["sqlite with Windows cached notifications", "sqlite", true],
+  ] as const)("%s: unrelated real state commits do not drain, but a subscription commit delivers the existing event", async (_name, stateBackend, deferredStateHints) => {
+    // Keep reason: pi-fabric#1735's Windows failure. ReadDirectoryChangesW can defer size/last-write
+    // hints until cached writes are flushed. Control only that OS boundary; state and checkpoints stay native.
+    const files = deferredStateHints ? fakeWatch() : undefined;
     const root = tempRoot();
     // A long file read-cache window must not hide a commit carried by the only state-file hint.
     const mesh = new MeshStore(root, 64 * 1024, 100, { stateBackend, readCacheMs: 60_000 });
     const writer = new MeshStore(root, 64 * 1024, 100, { stateBackend });
     expect(mesh.stateBackend).toBe(stateBackend);
     cleanups.push(() => { writer.closeState(); mesh.closeState(); });
+    if (files) {
+      const backend = writer.stateBackendHandle;
+      const sync = backend.sync.bind(backend);
+      const synced = vi.spyOn(backend, "sync").mockImplementation(async budgetMs => {
+        await sync(budgetMs);
+        files.fire(root, "state.db");
+      });
+      restores.push(() => synced.mockRestore());
+    }
     const event = await settleEvent(mesh);
     await mesh.put({ key: FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + "caught-up", identity: target, ifVersion: 0,
       value: { ...subscription("caught-up"), afterSequence: event.sequence } });
@@ -285,7 +301,11 @@ describe("LifecycleBroker canonical state-file relevance", () => {
     await writer.writeBatch({ identity: sourceIdentity, ops: Array.from({ length: 455 }, (_, index) => ({
       kind: "put" as const, key: `unrelated/${index}`, value: index,
     })) });
-    // Prove a native state-file notification reached the receiver, not merely that nothing happened.
+    // NORMAL WAL commits are visible to SQLite readers before Windows must report a file change.
+    // Flush through SQLite's own checkpoint API, never an extra fd on a live database file:
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw
+    if (stateBackend === "sqlite") await writer.stateBackendHandle.sync(1_000);
+    // Prove a state-file notification reached the receiver, not merely that nothing happened.
     await until(() => projections.mock.calls.length > 0 || drains.mock.calls.length > 0);
     await new Promise(resolve => setTimeout(resolve, 100));
     await flush();
@@ -298,7 +318,10 @@ describe("LifecycleBroker canonical state-file relevance", () => {
     // Same native watcher, same event log, no event-file write: only the relevant subscription changes.
     await writer.put({ key: FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + "sub1", value: subscription("sub1"),
       identity: sourceIdentity, ifVersion: 0 });
+    if (stateBackend === "sqlite") await writer.stateBackendHandle.sync(1_000);
     await until(() => delivered.length > 0);
+    await flush();
+    files?.fire(root, "state.db"); // A duplicate post-flush hint must not repeat delivery.
     await flush();
     expect(delivered.map(entry => entry.id)).toEqual([event.id]);
     expect(drains).toHaveBeenCalled();

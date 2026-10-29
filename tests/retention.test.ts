@@ -49,7 +49,7 @@ afterEach(() => {
 });
 
 describe("persistent archive custody", () => {
-  it.each(["archive-pending.json", "actor-run-archive-pending.json"])("retains full terminal event sources until %s commit, then permits main compaction", pendingFile => {
+  it.each(["archive-pending.json", "actor-run-archive-pending.json"])("retains full terminal event sources before and after %s commit", pendingFile => {
     const directory = temporaryDirectory();
     writeStatus(directory, { status: "completed", finishedAt: 1, transport: "process", sessionId: "2147483647" });
     const events = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
@@ -63,8 +63,8 @@ describe("persistent archive custody", () => {
     expect(compactTerminalRunEvents(directory, { now: DAY })).toBe(false);
     expect(fs.readFileSync(file, "utf8")).toBe(events);
     fs.unlinkSync(pending);
-    expect(compactTerminalRunEvents(directory, { now: DAY })).toBe(true);
-    expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(201);
+    expect(compactTerminalRunEvents(directory, { now: DAY })).toBe(false);
+    expect(fs.readFileSync(file, "utf8")).toBe(events);
     expect(fs.readFileSync(path.join(directory, "status.json"), "utf8")).toBe(status);
     expect(fs.readFileSync(path.join(directory, "reply.json"), "utf8")).toBe('{"text":"full outcome"}');
   });
@@ -517,46 +517,30 @@ describe("terminal run event log retention", () => {
     JSON.stringify({ sequence, text: "🙂".repeat(24) }) + "\n").join(""));
   const make = (runs: string, id: string, record: Record<string, unknown>) => {
     const dir = path.join(runs, id);
-    // Positive compaction fixtures represent a persisted, confirmed-dead process.
+    // Eligible retention fixtures represent a persisted, confirmed-dead process.
     writeStatus(dir, { transport: "process", sessionId: "2147483647", ...record });
     fs.writeFileSync(path.join(dir, "events.jsonl"), log);
     fs.writeFileSync(path.join(dir, "reply.json"), '{"text":"keep this result"}');
     return dir;
   };
 
-  it.each(["completed", "failed", "stopped", "timed_out"])("bounds an old %s archive to the default tail, keeps status/reply and never rewrites it twice", (status) => {
+  it.each(["completed", "failed", "stopped", "timed_out"])("keeps every byte of an old %s archive, including logs above the former cap", (status) => {
     const runsDirectory = path.join(temporaryDirectory(), "actors", "project", "a", "runs");
     const dir = make(runsDirectory, "old", { status, finishedAt: DAY });
+    const file = path.join(dir, "events.jsonl");
     const statusBefore = fs.readFileSync(path.join(dir, "status.json"));
     const replyBefore = fs.readFileSync(path.join(dir, "reply.json"));
+    const stat = fs.statSync(file);
     const options = { runsDirectory, retentionMs: 7 * DAY, now: 3 * DAY };
-    const rename = vi.spyOn(fs, "renameSync");
-    const read = vi.spyOn(fs, "readSync");
-    try {
+    expect(log.length).toBeGreaterThan(256 * 1024);
+    for (let pass = 0; pass < 2; pass++) {
       expect(pruneActorRunArchives(options)).toEqual([]);
-      const compacted = fs.readFileSync(path.join(dir, "events.jsonl"));
-      expect(compacted.length).toBeLessThanOrEqual(256 * 1024);
-      expect(compacted.toString().trim().split("\n")).toHaveLength(201);
-      const newline = compacted.indexOf(0x0a);
-      expect(JSON.parse(compacted.subarray(0, newline).toString())).toMatchObject({ fabricTruncated: true });
-      const tail = compacted.subarray(newline + 1);
-      expect(tail.equals(log.subarray(log.length - tail.length))).toBe(true);
-      const lines = tail.toString().trim().split("\n").map(line => JSON.parse(line));
-      expect(lines.at(-1).sequence).toBe(11999);
-      expect(lines).toHaveLength(200);
-      expect(lines[0].sequence).toBe(11800);
+      expect(fs.readFileSync(file).equals(log)).toBe(true);
+      expect(fs.statSync(file).ino).toBe(stat.ino);
+      expect(fs.statSync(file).mtimeMs).toBe(stat.mtimeMs);
       expect(fs.readFileSync(path.join(dir, "status.json"))).toEqual(statusBefore);
       expect(fs.readFileSync(path.join(dir, "reply.json"))).toEqual(replyBefore);
-      expect(read.mock.calls.length).toBeGreaterThan(0);
-      expect(read.mock.calls.every(call => call[1].byteLength <= 256 * 1024)).toBe(true);
-      expect(rename).toHaveBeenCalledTimes(1);
-      const stat = fs.statSync(path.join(dir, "events.jsonl"));
-      expect(pruneActorRunArchives(options)).toEqual([]);
-      expect(fs.statSync(path.join(dir, "events.jsonl")).ino).toBe(stat.ino);
-      expect(fs.statSync(path.join(dir, "events.jsonl")).mtimeMs).toBe(stat.mtimeMs);
-      expect(rename).toHaveBeenCalledTimes(1);
-      expect(fs.readFileSync(path.join(dir, "events.jsonl")).equals(compacted)).toBe(true);
-    } finally { rename.mockRestore(); read.mockRestore(); }
+    }
   });
 
   it("leaves large live, queued, unknown, young and lastRunId-retained archives byte-for-byte", () => {
@@ -588,35 +572,29 @@ describe("terminal run event log retention", () => {
     expect(fs.readFileSync(file).equals(log)).toBe(true);
   });
 
-  it("rechecks descendant exit immediately before atomic replacement, not just before reading the tail", () => {
-    const dir = make(temporaryDirectory(), "old", { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: DAY });
-    const child = path.join(dir, "nested", "child");
-    writeStatus(child, { status: "completed", transport: "process", sessionId: "2147483647" });
-    const read = fs.readSync;
-    const changed = vi.spyOn(fs, "readSync").mockImplementation((...args: Parameters<typeof read>) => {
-      // The first safety walk succeeds; a legacy/unknown writer appears during the read.
-      writeStatus(child, { status: "completed", transport: "process" });
-      return read(...args);
-    });
+  it("performs no compaction reads or writes even for safely terminal descendants", () => {
+    const dir = make(temporaryDirectory(), "old", { status: "completed", finishedAt: DAY });
+    writeStatus(path.join(dir, "nested", "child"), { status: "completed", transport: "process", sessionId: "2147483647" });
+    const read = vi.spyOn(fs, "readSync");
+    const rename = vi.spyOn(fs, "renameSync");
     try {
       expect(compactTerminalRunEvents(dir, { now: 3 * DAY })).toBe(false);
-      expect(changed).toHaveBeenCalled();
+      expect(read).not.toHaveBeenCalled();
+      expect(rename).not.toHaveBeenCalled();
       expect(fs.readFileSync(path.join(dir, "events.jsonl"))).toEqual(log);
-    } finally { changed.mockRestore(); }
+    } finally { read.mockRestore(); rename.mockRestore(); }
   });
 
-  it("honors custom age/cap and a zero budget, and drops an oversized final line without corrupt JSON", () => {
-    const dir = make(temporaryDirectory(), "old", { status: "completed", transport: "process", sessionId: "2147483647", finishedAt: DAY });
+  it("never lets custom age/cap or a zero budget discard trace bytes, including oversized final events", () => {
+    const dir = make(temporaryDirectory(), "old", { status: "completed", finishedAt: DAY });
     expect(compactTerminalRunEvents(dir, { now: 3 * DAY, terminalRunEventsAgeMs: 3 * DAY })).toBe(false);
     expect(compactTerminalRunEvents(dir, { now: 3 * DAY, expired: () => true })).toBe(false);
-    expect(fs.readFileSync(path.join(dir, "events.jsonl")).equals(log)).toBe(true);
-    expect(compactTerminalRunEvents(dir, { now: 3 * DAY, terminalRunEventsMaxBytes: 1024 })).toBe(true);
-    expect(fs.statSync(path.join(dir, "events.jsonl")).size).toBeLessThanOrEqual(1024);
-    fs.writeFileSync(path.join(dir, "events.jsonl"), JSON.stringify({ huge: "x".repeat(10000) }) + "\n");
-    expect(compactTerminalRunEvents(dir, { now: 3 * DAY, terminalRunEventsMaxBytes: 1024 })).toBe(true);
-    const lines = fs.readFileSync(path.join(dir, "events.jsonl"), "utf8").trim().split("\n");
-    expect(lines).toHaveLength(1);
-    expect(JSON.parse(lines[0]!)).toMatchObject({ fabricTruncated: true });
+    expect(compactTerminalRunEvents(dir, { now: 3 * DAY, terminalRunEventsAgeMs: 0, terminalRunEventsMaxBytes: 1024 })).toBe(false);
+    expect(fs.readFileSync(path.join(dir, "events.jsonl"))).toEqual(log);
+    const oversized = JSON.stringify({ huge: "x".repeat(10000) }) + "\n";
+    fs.writeFileSync(path.join(dir, "events.jsonl"), oversized);
+    expect(compactTerminalRunEvents(dir, { now: 3 * DAY, terminalRunEventsMaxBytes: 1024 })).toBe(false);
+    expect(fs.readFileSync(path.join(dir, "events.jsonl"), "utf8")).toBe(oversized);
   });
 
   it("leaves the original log intact and removes its temporary file when atomic rename fails", () => {

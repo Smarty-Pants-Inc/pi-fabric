@@ -66,7 +66,8 @@ import type { KvParticipantDirectory, ParticipantLeaseGate, ParticipantView } fr
 import type { NatsLocalProjection, NatsLocalProjectionMetrics } from "./nats-local-projection.js";
 import { peerLabelPrefix } from "./peer-settle.js";
 import { rootParticipantName } from "./participant-name.js";
-import { controlAdmissionAlarm, isolatedParticipantSourceAlarm } from "./stall-alarms.js";
+import { controlAdmissionAlarm, isolatedParticipantSourceAlarm, resolveNativeMainSuccessor } from "./stall-alarms.js";
+import type { NativeRecoveryCustodyReader } from "../core/session-receipts.js";
 import { knownOwnProcessIncarnation, ownProcessIncarnation } from "../core/atomic-write.js";
 import {
   ParticipantFileLockBusyError,
@@ -755,6 +756,40 @@ type RemoteMirrorLease = { state: "none" } | { state: "ended" } | {
 type ReconnectRefresh = { dueAt: number | undefined; timer?: NodeJS.Timeout; ready?: AbortController; running?: true };
 
 export class ParticipantDirectory implements FabricParticipantSource {
+  #readNativeCustody: NativeRecoveryCustodyReader | undefined;
+
+  setNativeRecoveryReader(readNativeCustody: NativeRecoveryCustodyReader | undefined): void {
+    this.#readNativeCustody = readNativeCustody;
+  }
+
+  /** Delivery-only lookup; never publishes a synthetic old identity or changes get/list. */
+  resolveNativeMessageTarget(originalTargetId: string, operation: "steer" | "followUp"): FabricParticipantInfo | undefined {
+    if (!this.#readNativeCustody || !originalTargetId.startsWith("session:") ||
+        (operation !== "steer" && operation !== "followUp")) return undefined;
+    let outgoingNative = false, uncertain = false;
+    const successor = resolveNativeMainSuccessor(this.mesh.root, originalTargetId, scope => {
+      try {
+        const custody = this.#readNativeCustody!(scope);
+        outgoingNative ||= custody.status === "validated" && custody.transfers.some(edge =>
+          `session:${edge.source.sessionId}` === originalTargetId);
+        uncertain ||= custody.status === "hold";
+        return custody;
+      } catch (error) { uncertain = true; throw error; }
+    });
+    if (!successor) {
+      if (outgoingNative || uncertain) throw new Error(`Native message routing HOLD for ${originalTargetId}`);
+      return undefined;
+    }
+    const participant = this.get(successor.rootId, undefined, { fresh: true });
+    if (!participant || participant.id !== successor.rootId || participant.rootId !== successor.rootId ||
+        participant.kind !== "root" || participant.stale || participant.interactive === false ||
+        !participant.capabilities.includes(operation) || successor.bindings.length === 0 ||
+        successor.bindings.some(binding => binding.phase !== "received")) {
+      throw new Error(`Native message routing HOLD for ${originalTargetId}: effective owner unavailable`);
+    }
+    return participant;
+  }
+
   /** Distinct from PID incarnation and actor lineage; rotates on every activation/reload. */
   readonly ownerIncarnation = randomUUID();
   #transportLease: TransportHostLease | undefined;

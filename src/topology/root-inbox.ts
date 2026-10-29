@@ -1,19 +1,22 @@
 import { createHash } from "node:crypto";
 import { diagnostics } from "../core/diagnostics.js";
+import { readNativeRecoveryCustody, nativeRecoveryCarrierCustody } from "../core/native-recovery.js";
+import type { NativeRecoveryBinding, NativeRecoveryCustodyReader, NativeRecoveryCustodyResult,
+  NativeRecoveryParkIntent, NativeRecoverySessionRef } from "../core/session-receipts.js";
 import { appendDeliveryOutcome } from "../mesh/delivery-outcomes.js";
 import { MeshBackgroundQueue } from "../core/atomic-write.js";
 import type { MeshEvent, MeshIdentity, MeshStore } from "../mesh/store.js";
 import {
   INBOX_HORIZON_MS, ROOT_ID_PREFIX, ROOT_INBOX_ACTION_KINDS, compareRootInboxEvents, crossIdentityReceipts, deliveryIdentity,
   eventReceipt, eventReceipts, rootInboxBudget, topicWorkReceipt, workKey,
-  type RootInboxBatch, type RootInboxEvent, type RootInboxReconcileOptions, type RootInboxSession,
+  type NativeRecoveryInboxHandoff, type RootInboxBatch, type RootInboxEvent, type RootInboxReconcileOptions, type RootInboxSession,
 } from "./root-inbox-shared.js";
 
 export {
   INBOX_INJECT_EVENT_TEXT_BYTES, INBOX_INJECT_MAX_EVENTS, INBOX_INJECT_MAX_TEXT_BYTES, ROOT_ID_PREFIX, ROOT_INBOX_CUSTOM_TYPE,
   confirmedMainInboxIds, confirmedRootInboxSession, projectRootInboxReceipt, rootInboxBudget, rootInboxMessage, rootInboxSession,
   rootInboxSummary, sessionHoldsInboxBatch,
-  type RootInboxBatch, type RootInboxEvent, type RootInboxReconcileOptions, type RootInboxSession,
+  type NativeRecoveryInboxHandoff, type RootInboxBatch, type RootInboxEvent, type RootInboxReconcileOptions, type RootInboxSession,
 } from "./root-inbox-shared.js";
 
 /**
@@ -97,6 +100,8 @@ const wakeCooldownMs = (): number => {
 
 interface RootInboxState {
   after: number;
+  /** Reversible pre-snapshot scope locator only; neither a seal nor successor authority. */
+  nativeRecoveryPark?: NativeRecoveryParkIntent;
   pending?: { through: number; ids: string[]; since: number; alarmed?: boolean };
   /** Hashed delivery/work identities, scoped by this recipient's state key. */
   delivered?: string[];
@@ -136,11 +141,21 @@ export class RootInbox {
   #delivered = new Map<string, number>();
   #acks = new Map<string, number>();
   #fallbacks = new Map<string, number>();
+  #initialAfter: number | undefined;
+  #native: { scope: NativeRecoverySessionRef; read: NativeRecoveryCustodyReader; chain: string } | undefined;
+  #nativeResult: NativeRecoveryCustodyResult | undefined;
+  #nativeBlocked: string | undefined;
+  readonly #predecessors = new Map<string, RootInbox>();
+  readonly #offered = new Map<string, { inbox: RootInbox; event: MeshEvent }>();
+  readonly #reads = new Set<Promise<unknown>>();
+  #writes = Promise.resolve();
   readonly #notifications = new MeshBackgroundQueue("root inbox wake notification");
   /** An ack is one-shot: its own queue retries a mesh lock timeout instead of dropping it. */
   readonly #ackWrites = new MeshBackgroundQueue("root inbox ack");
 
-  async close(): Promise<void> { await Promise.all([this.#ackWrites.close(), this.#notifications.close()]); }
+  async close(): Promise<void> {
+    await Promise.all([this.#ackWrites.close(), this.#notifications.close(), ...[...this.#predecessors.values()].map(inbox => inbox.close())]);
+  }
 
   constructor(
     readonly mesh: MeshStore,
@@ -154,6 +169,177 @@ export class RootInbox {
     return ROOT_INBOX_PREFIX + createHash("sha256").update(this.identity.id).digest("hex").slice(0, 32);
   }
 
+  /** Reversible pre-snapshot flush. R/N suspend delivery; only native PREPARED seals S. */
+  async parkForNativeRecovery(intent: NativeRecoveryParkIntent): Promise<NativeRecoveryInboxHandoff> {
+    if (intent.version !== 1 || !intent.operationId || `${ROOT_ID_PREFIX}${intent.source.sessionId}` !== this.identity.id ||
+        !intent.source.sessionFile || !intent.target.sessionFile || intent.source.sessionId === intent.target.sessionId) {
+      throw new Error("Root inbox native recovery source mismatch");
+    }
+    const state = this.#load(), after = state.after;
+    // Deliberately copy only intent fields. The handoff itself participates in PREPARED's
+    // digest, so no digest/entry/phase can be required here. An aborted intent may be replaced.
+    state.nativeRecoveryPark = JSON.parse(JSON.stringify({ version: 1, operationId: intent.operationId,
+      source: intent.source, target: intent.target })) as NativeRecoveryParkIntent;
+    await Promise.all(this.#reads);
+    await Promise.all(this.#readers().map(async inbox => {
+      await inbox.#ackWrites.checkpointForRelease();
+      await inbox.#save(true); // A background first-attempt receipt is not a confirmed flush.
+    }));
+    return { version: 1, rootId: this.identity.id, key: this.key, after };
+  }
+
+  /** Install every committed predecessor reader before start/wake/context, keeping its own key/marks. */
+  async adoptNativeRecoveryInbox(handoff: NativeRecoveryInboxHandoff, readNativeCustody: NativeRecoveryCustodyReader): Promise<void> {
+    this.#nativeBlocked = "Root inbox native recovery adoption incomplete";
+    if (handoff.version !== 1 || !handoff.rootId.startsWith(ROOT_ID_PREFIX) || handoff.rootId === this.identity.id ||
+        !Number.isSafeInteger(handoff.after) || handoff.after < 0 || handoff.key !== this.#keyFor(handoff.rootId)) {
+      throw new Error("Invalid native recovery inbox handoff");
+    }
+    // The handoff has no sessionFile. Parked cursor rows supply scope locators only;
+    // native must validate the exact target. A row alone never grants adoption.
+    let rootId = handoff.rootId;
+    const visited = new Set<string>();
+    let scope: NativeRecoverySessionRef;
+    let result: NativeRecoveryCustodyResult;
+    for (;;) {
+      if (visited.has(rootId)) throw new Error("Cyclic root inbox recovery locator");
+      visited.add(rootId);
+      const locator = (this.mesh.get(this.#keyFor(rootId))?.value as Partial<RootInboxState> | undefined)?.nativeRecoveryPark;
+      if (!locator || `${ROOT_ID_PREFIX}${locator.source.sessionId}` !== rootId) throw new Error("Missing parked root inbox recovery locator");
+      scope = locator.target;
+      result = readNativeRecoveryCustody(scope, readNativeCustody);
+      if (result.status !== "validated") throw new Error(result.status === "hold" ? result.reason : "Missing native recovery custody");
+      const edge = result.transfers.find(transfer => this.#intentKey(transfer) === this.#intentKey(locator));
+      if (!edge || edge.phase !== "received") throw new Error("Root inbox recovery requires matching RECEIVED");
+      rootId = `${ROOT_ID_PREFIX}${scope.sessionId}`;
+      if (rootId === this.identity.id) break;
+    }
+    const chain = this.#committedChain(result);
+    if (this.#native && this.#native.chain !== chain) throw new Error("Conflicting root inbox native recovery adoption");
+    if (!result.transfers.some(edge => `${ROOT_ID_PREFIX}${edge.source.sessionId}` === handoff.rootId)) {
+      throw new Error("Native recovery inbox predecessor absent");
+    }
+    const readers = new Map<string, RootInbox>();
+    for (const edge of result.transfers) {
+      const id = `${ROOT_ID_PREFIX}${edge.source.sessionId}`;
+      const stored = this.mesh.get(this.#keyFor(id))?.value as Partial<RootInboxState> | undefined;
+      const after = id === handoff.rootId ? handoff.after : stored?.after;
+      if (!Number.isSafeInteger(after) || after! < 0) throw new Error("Missing native predecessor inbox boundary");
+      const inbox = this.#predecessors.get(id) ?? new RootInbox(this.mesh, { id, name: id, kind: "main", sessionId: edge.source.sessionId }, () => [id], this.options);
+      inbox.#initialAfter = after;
+      inbox.#load();
+      readers.set(id, inbox);
+    }
+    this.#predecessors.clear();
+    for (const [id, inbox] of readers) this.#predecessors.set(id, inbox);
+    this.#native = { scope: { ...scope }, read: readNativeCustody, chain };
+    this.#nativeBlocked = undefined;
+    this.#installNativeResult(result);
+  }
+
+  #keyFor(rootId: string): string {
+    return ROOT_INBOX_PREFIX + createHash("sha256").update(rootId).digest("hex").slice(0, 32);
+  }
+
+  #intentKey(intent: NativeRecoveryParkIntent): string {
+    return JSON.stringify([intent.operationId, intent.source.sessionId, intent.source.sessionFile,
+      intent.target.sessionId, intent.target.sessionFile]);
+  }
+
+  #bindingKey(binding: NativeRecoveryBinding): string {
+    return JSON.stringify([binding.operationId, binding.preparedDigest, binding.preparedEntryId,
+      binding.source.sessionId, binding.source.sessionFile, binding.target.sessionId, binding.target.sessionFile]);
+  }
+
+  #committedChain(result: NativeRecoveryCustodyResult): string {
+    if (result.status === "hold") throw new Error(result.reason);
+    if (result.status !== "validated" || !result.transfers.length ||
+        result.transfers.some(edge => edge.phase !== "received" || !edge.receivedEntryId ||
+          edge.occurrences.some(occurrence => occurrence.state === "ambiguous")) ||
+        `${ROOT_ID_PREFIX}${result.transfers.at(-1)!.target.sessionId}` !== this.identity.id) {
+      throw new Error("Root inbox native recovery is not a committed unambiguous target chain");
+    }
+    return JSON.stringify(result.transfers.map(edge => [this.#bindingKey(edge), edge.receivedEntryId]));
+  }
+
+  #installNativeResult(result: NativeRecoveryCustodyResult): void {
+    this.#nativeResult = result;
+    for (const inbox of this.#predecessors.values()) inbox.#nativeResult = result;
+  }
+
+  #refreshNative(): void {
+    if (this.#nativeBlocked) throw new Error(this.#nativeBlocked);
+    if (!this.#native) return;
+    const result = readNativeRecoveryCustody(this.#native.scope, this.#native.read);
+    if (this.#committedChain(result) !== this.#native.chain) throw new Error("Root inbox native recovery chain changed");
+    this.#installNativeResult(result);
+  }
+
+  #nativeStatus(id: string, receipts: readonly string[] = []): "none" | "hold" | "reserved" | "received" | "consumed" {
+    if (!this.#nativeResult) return "none";
+    let found: ReturnType<typeof nativeRecoveryCarrierCustody> = { status: "none" };
+    for (const inboxId of new Set([id, eventReceipt(id), ...receipts])) {
+      const custody = nativeRecoveryCarrierCustody(this.#nativeResult, { inboxId });
+      if (custody.status === "hold") throw new Error(custody.reason ?? "Root inbox native custody hold");
+      if (custody.status === "none") continue;
+      if (found.status !== "none" && (found.transfer?.operationId !== custody.transfer?.operationId ||
+          found.occurrence?.ordinal !== custody.occurrence?.ordinal)) throw new Error("Conflicting native root inbox occurrence identities");
+      found = custody;
+    }
+    return found.status;
+  }
+
+  #nativePending(id: string, receipts: readonly string[] = []): boolean {
+    const status = this.#nativeStatus(id, receipts);
+    return status === "reserved" || status === "received";
+  }
+
+  #readers(): RootInbox[] { return [...this.#predecessors.values(), this]; }
+
+  #receiptLedger(id: string, sequence?: number): RootInbox | undefined {
+    const offered = this.#offered.get(id);
+    if (offered) return offered.inbox;
+    const pending = this.#readers().find(inbox => inbox.#state?.pending?.ids.includes(id));
+    if (pending) return pending;
+    if (!this.#predecessors.size) return this;
+    // A restored native carrier may enter context before RootInbox offered it at T.
+    // Resolve its ORIGINAL event address, never T's unrelated high-water mark.
+    const event = this.#reread(sequence === undefined ? 0 : sequence - 1,
+      { ids: [id], through: sequence ?? this.mesh.latestSequence(), since: this.#now() })[0];
+    if (!event) return undefined;
+    const inbox = event.to === this.identity.id ? this : event.to ? this.#predecessors.get(event.to) : undefined;
+    if (inbox) {
+      this.#offered.set(id, { inbox, event });
+      while (this.#offered.size > MAX_DELIVERED_RECEIPTS) this.#offered.delete(this.#offered.keys().next().value!);
+    }
+    return inbox;
+  }
+
+  async #reading<T>(read: () => Promise<T>): Promise<T> {
+    const work = read();
+    this.#reads.add(work);
+    try { return await work; }
+    finally { this.#reads.delete(work); }
+  }
+
+  async #collect(session: RootInboxSession, options: RootInboxReconcileOptions, priority: boolean): Promise<RootInboxBatch> {
+    const events: RootInboxEvent[] = [];
+    let through = this.#load().after, skippedStale = 0;
+    for (const inbox of this.#readers()) {
+      const batch = await inbox.#next(session, options, priority);
+      if (inbox === this) through = batch.through;
+      skippedStale += batch.skippedStale ?? 0;
+      for (const event of batch.events) {
+        this.#offered.set(event.id, { inbox, event });
+        while (this.#offered.size > MAX_DELIVERED_RECEIPTS) this.#offered.delete(this.#offered.keys().next().value!);
+        events.push(event);
+      }
+      this.#dueAt = Math.min(this.#dueAt, inbox.#dueAt);
+    }
+    return { events, through,
+      ...(skippedStale ? { skippedStale, horizonMs: this.#horizon() } : {}) };
+  }
+
   /**
    * The batch to deliver now. A pending batch the session holds is committed first; one it does
    * not hold is delivered again. Ordinary admission stops at the steer grace (priority reads
@@ -162,7 +348,8 @@ export class RootInbox {
    */
   async next(session: RootInboxSession, options: RootInboxReconcileOptions = {}): Promise<RootInboxBatch> {
     this.#dueAt = Number.POSITIVE_INFINITY;
-    return this.#next(session, options, options.priority === true);
+    this.#refreshNative();
+    return this.#reading(() => this.#collect(session, options, options.priority === true));
   }
 
   /**
@@ -180,7 +367,9 @@ export class RootInbox {
     saveImmediately = immediateSnapshot(state) !== this.#savedImmediate || saveImmediately;
     // Canonical history without a finite timestamp is exact-replay evidence only; do not
     // renew its ambiguous key/ref claim at read time.
-    saveImmediately = this.#remember(session.delivered ?? [], session.deliveredAt, true) || saveImmediately;
+    // T's history can contain several recipients. Do not copy that whole receipt ledger into
+    // each predecessor: matched addressed events below retain only their own exact receipts.
+    if (!this.#nativeResult) saveImmediately = this.#remember(session.delivered ?? [], session.deliveredAt, true) || saveImmediately;
     let skippedStale = 0;
     const reservations = new Set<string>();
     if (state.pending && options.turnEnd) await this.#alarmPending(state).catch(error => {
@@ -209,7 +398,9 @@ export class RootInbox {
         // A missing retained event proves neither delivery nor expiry. Keep its id pending, until
         // the batch itself is older than the stale horizon: its events are older still.
         const found = new Set(reread.map((event) => event.id));
-        let missing = unacked.filter((id) => !found.has(id) &&
+        const withheld = new Set(unacked.filter(id => !found.has(id) && this.#nativePending(id) &&
+          !this.#delivered.has(eventReceipt(id)) && !session.delivered?.has(eventReceipt(id))));
+        let missing = unacked.filter((id) => !found.has(id) && !withheld.has(id) && this.#nativeStatus(id) !== "consumed" &&
           !this.#delivered.has(eventReceipt(id)) && !session.delivered?.has(eventReceipt(id)));
         if (missing.length && this.#now() - held.since > this.#horizon()) {
           skippedStale += missing.length;
@@ -217,14 +408,19 @@ export class RootInbox {
         }
         // A native delivery can arrive after the pending save. Recheck it on recovery too.
         const events = pending.filter((event) => {
-          if (this.#stale(event)) { skippedStale++; return false; }
-          if (!this.#steered(event, session, reservations)) return true;
+          const status = this.#nativeStatus(event.id, eventReceipts(event));
+          const reserved = status === "reserved" || status === "received";
+          // Real canonical receipts win even while native still reports the saved holder pending.
+          const confirmed = reserved ? this.#steered(event, session, reservations) : undefined;
+          if (reserved && !confirmed) { withheld.add(event.id); return false; }
+          if (status !== "consumed" && this.#stale(event)) { skippedStale++; return false; }
+          if (!confirmed && !this.#steered(event, session, reservations)) return true;
           this.#consumeFallback(event, reservations);
           this.#remember(eventReceipts(event));
           return false;
         }).map((event) => this.#late(event));
-        if (events.length || missing.length) {
-          held.ids = [...events.map((event) => event.id), ...missing];
+        if (events.length || missing.length || withheld.size) {
+          held.ids = [...events.map((event) => event.id), ...missing, ...withheld];
           // Retry a failed pending-cursor save before delivery: in-memory pending alone
           // is not durable admission, including after a mesh acquisition timeout.
           await this.#save(true);
@@ -267,18 +463,23 @@ export class RootInbox {
    * `idle` is checked again after the read: a turn that started meanwhile takes the batch itself.
    */
   async wake(session: RootInboxSession, idle: () => boolean): Promise<RootInboxBatch | undefined> {
+    return this.#reading(() => this.#wake(session, idle));
+  }
+
+  async #wake(session: RootInboxSession, idle: () => boolean): Promise<RootInboxBatch | undefined> {
     this.#dueAt = Number.POSITIVE_INFINITY;
+    this.#refreshNative();
     const cooldownEnd = this.#wokeAt + (this.options.wakeCooldownMs ?? wakeCooldownMs());
     const cooling = this.#now() < cooldownEnd;
-    const peeked = this.#peek(session);
+    const peeked = this.#readers().flatMap(inbox => inbox.#peek(session));
     const urgent = peeked.some((event) => URGENT_KINDS.has(event.kind));
     // Work addressed to this exact session wakes at once too (smarty-dev#4313), unless delivered late.
-    const exact = peeked.some((event) => this.#exact(event) && !event.deliveredLate);
+    const exact = peeked.some((event) => this.#readers().some(inbox => inbox.#exact(event)) && !event.deliveredLate);
     if (cooling && !urgent && !exact) {
       if (peeked.length) this.#dueAt = Math.min(this.#dueAt, cooldownEnd);
       return undefined;
     }
-    const batch = await this.#next(session, {}, true);
+    const batch = await this.#collect(session, {}, true);
     if (!idle()) return undefined;
     // A stale-only drain reports once but must not buy a model turn; nor does late actionable work.
     if (batch.events.length === 0) return batch.skippedStale ? batch : undefined;
@@ -301,7 +502,7 @@ export class RootInbox {
    */
   async consume(ids: readonly string[], receipts: readonly string[] = []): Promise<void> {
     this.ack(ids, receipts);
-    await this.#ackWrites.enqueue(() => this.#save(true));
+    await Promise.all(this.#readers().map(inbox => inbox.#ackWrites.enqueue(() => inbox.#save(true))));
   }
 
   /**
@@ -310,6 +511,22 @@ export class RootInbox {
    * whole batch is acked; then the cursor and the high-water mark move past the batch.
    */
   ack(ids: readonly string[], receipts: readonly string[] = []): void {
+    this.#refreshNative();
+    const groups = new Map<RootInbox, { ids: string[]; receipts: Set<string> }>();
+    for (const id of ids) {
+      const inbox = this.#receiptLedger(id);
+      if (!inbox) throw new Error("Root inbox receipt has no original addressed ledger");
+      const offered = this.#offered.get(id);
+      const group = groups.get(inbox) ?? { ids: [], receipts: new Set<string>() };
+      group.ids.push(id);
+      if (offered) for (const receipt of eventReceipts(offered.event)) if (receipts.includes(receipt)) group.receipts.add(receipt);
+      groups.set(inbox, group);
+    }
+    if (!ids.length) groups.set(this, { ids: [], receipts: new Set(receipts) });
+    for (const [inbox, group] of groups) inbox.#ack(group.ids, groups.size === 1 ? receipts : [...group.receipts]);
+  }
+
+  #ack(ids: readonly string[], receipts: readonly string[]): void {
     const state = this.#load();
     this.#trimReceipts();
     this.#remember([...ids.map(eventReceipt), ...receipts]);
@@ -344,12 +561,17 @@ export class RootInbox {
 
   /**
    * Whether an event was acknowledged (smarty-dev#8962): its id is in the acked set, or its
-   * sequence is at or below the high-water mark. Reads the cached state only, never the mesh, so the
-   * context hook can ask on every request; before the first load nothing counts as acked.
+   * sequence is at or below its own high-water mark. Ordinary sessions use cached state only;
+   * native-restored carriers can resolve their original addressed ledger before their first offer.
    */
   acked(id: string, sequence?: number): boolean {
-    if (!this.#state) return false;
-    return this.#acks.has(id) || (sequence !== undefined && sequence <= this.#mark());
+    this.#refreshNative();
+    const status = this.#nativeStatus(id);
+    if (status === "consumed") return true;
+    const inbox = this.#receiptLedger(id, sequence);
+    if (!inbox || !inbox.#state) return false;
+    if (status === "received" || status === "reserved") return inbox.#acks.has(id) || inbox.#delivered.has(eventReceipt(id));
+    return inbox.#acks.has(id) || (sequence !== undefined && sequence <= inbox.#mark());
   }
 
   /**
@@ -367,7 +589,7 @@ export class RootInbox {
     const after = state.pending ? Math.max(state.after, state.pending.through) : state.after;
     const reservations = new Set<string>();
     return [...(pending ? this.#reread(state.after, pending).filter((event) =>
-      !this.#acked(event) && !this.#stale(event) && !this.#steered(event, session, reservations)).map((event) => this.#late(event)) : []),
+      !this.#acked(event) && !this.#nativePending(event.id, eventReceipts(event)) && !this.#stale(event) && !this.#steered(event, session, reservations)).map((event) => this.#late(event)) : []),
     ...this.#scan(after, session, false, undefined, true, reservations).events];
   }
 
@@ -461,6 +683,7 @@ export class RootInbox {
     const value = this.mesh.get(this.key)?.value as Partial<RootInboxState> | undefined;
     if (!value || typeof value !== "object") return;
     const state = this.#state!;
+    if (value.nativeRecoveryPark !== undefined) state.nativeRecoveryPark ??= value.nativeRecoveryPark;
     const theirs = Math.max(sequenceOf(value.after), sequenceOf(value.ackedThrough));
     if (theirs > this.#mark()) state.ackedThrough = theirs;
     for (const [id, bound] of parseAcks(value.acked)) if (!this.#acks.has(id)) this.#acks.set(id, bound);
@@ -514,6 +737,9 @@ export class RootInbox {
     for (;;) {
       const page = this.mesh.read({ after: through, limit: pageSize });
       for (const event of page) {
+        // Native reservation is neither delivery nor expiry, and never advances this ledger.
+        if (addressed(event) && !this.#acked(event) && this.#nativePending(event.id, eventReceipts(event)) &&
+            !this.#steered(event, session, reservations)) return result();
         // Only unadmitted addressed work inside the grace holds the cursor; it is due once mature.
         if (event.createdAt > cutoff && event.sequence > bypassThrough && addressed(event) && !this.#acked(event)) {
           this.#dueAt = Math.min(this.#dueAt, event.createdAt + grace);
@@ -521,6 +747,7 @@ export class RootInbox {
         }
         if (addressed(event)) {
           if (this.#acked(event)) { /* Delivered and acked, at or below the mark: never again. */ }
+          else if (this.#nativeStatus(event.id, eventReceipts(event)) === "consumed") onDelivered?.(event, reservations);
           else if (this.#stale(event)) skippedStale++;
           else if (this.#steered(event, session, reservations)) onDelivered?.(event, reservations);
           else if (!eventReceipts(event).some((id) => seen.has(id))) {
@@ -543,7 +770,7 @@ export class RootInbox {
   // Before Pi records a native message, its shadow remains recoverable (at least once).
   #steered(event: MeshEvent, session: RootInboxSession, reservations?: Set<string>): boolean {
     const has = (id: string): boolean => this.#delivered.has(id) || session.delivered?.has(id) === true;
-    if (eventReceipts(event).some(has) || crossIdentityReceipts(event.from.id, event.data).some(has)) return true;
+    if (eventReceipts(event).some(has) || crossIdentityReceipts(event.from.id, event.data).some(has) || this.#nativeStatus(event.id, eventReceipts(event)) === "consumed") return true;
     const identity = deliveryIdentity(event.data);
     // An explicit deliveryId/messageId/commandId is a stable event identity. Once the exact receipts above
     // miss, this is distinct work: never let its shared key/ref fall back to a native carrier.
@@ -713,7 +940,8 @@ export class RootInbox {
     const pending = value?.pending;
     // A root with no cursor starts at the present: the inbox is for what it misses from now on.
     this.#state = {
-      after: saved ? value!.after! : this.mesh.latestSequence(),
+      after: saved ? value!.after! : this.#initialAfter ?? this.mesh.latestSequence(),
+      ...(value?.nativeRecoveryPark ? { nativeRecoveryPark: value.nativeRecoveryPark } : {}),
       ...(Array.isArray(value?.delivered) ? { delivered: value.delivered.filter((id): id is string => typeof id === "string") } : {}),
       ...(Array.isArray(value?.fallbacks) ? { fallbacks: value.fallbacks.filter((id): id is string => typeof id === "string") } : {}),
       ...(pending && Array.isArray(pending.ids) && typeof pending.through === "number"
@@ -756,6 +984,12 @@ export class RootInbox {
   }
 
   async #save(now: boolean): Promise<void> {
+    const work = this.#writes.then(() => this.#saveState(now));
+    this.#writes = work.catch(() => {}); // A failed save stays dirty, but a later explicit retry may succeed.
+    await work;
+  }
+
+  async #saveState(now: boolean): Promise<void> {
     this.#absorb();
     this.#trimReceipts();
     const text = JSON.stringify(this.#state);

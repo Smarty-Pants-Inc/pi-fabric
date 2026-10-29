@@ -7,6 +7,7 @@ import { WorktreeManager } from "../src/agents/worktree-manager.js";
 import { ActorManager } from "../src/actors/manager.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore } from "../src/mesh/store.js";
+import { canRemoveTerminalRun, isSettledTerminalRun } from "../src/storage/retention.js";
 
 // Keep reason: PR #1726 data-safety and real cleanup/actor lifecycle regression.
 // Native git removal is hosted-only. Substitute only that boundary with an
@@ -33,7 +34,24 @@ const setup = (retainRuns: boolean) => {
   closers.push(() => agents.close());
   return { root, agents };
 };
-const originalBytes = (run: string) => fs.readFileSync(path.join(run, "events.jsonl.original"));
+const retainedRunDirectory = (directory: string): string => {
+  if (fs.existsSync(path.join(directory, "status.json"))) return directory;
+  let source = directory;
+  while (path.dirname(source) !== source) {
+    const parent = path.dirname(source), archive = `${parent}.trace-archive`;
+    try {
+      for (const name of fs.readdirSync(archive)) {
+        const receipt = JSON.parse(fs.readFileSync(path.join(archive, name, "custody.json"), "utf8"));
+        if (receipt.state === "moved" && receipt.source === source && typeof receipt.destination === "string") {
+          return path.join(receipt.destination, path.relative(source, directory));
+        }
+      }
+    } catch { /* This ancestor is not an archive for the moved root. */ }
+    source = parent;
+  }
+  return directory;
+};
+const originalBytes = (run: string) => fs.readFileSync(path.join(retainedRunDirectory(run), "events.jsonl.original"));
 
 describe("settlement and cleanup with a retained original", () => {
   it.each([false, true])("cleans the worktree and forgets the handle, retaining raw bytes (retainRuns=%s)", async retainRuns => {
@@ -58,6 +76,44 @@ describe("settlement and cleanup with a retained original", () => {
     expect(originalBytes(run)).toEqual(original);
     await agents.close();
     expect(originalBytes(run)).toEqual(original);
+  });
+
+  it.each([
+    { retainRuns: false, nested: false },
+    { retainRuns: true, nested: false },
+    { retainRuns: false, nested: true },
+    { retainRuns: true, nested: true },
+  ])("checkpoints for release after cleanup retains an original (retainRuns=$retainRuns, nested=$nested)", async ({ retainRuns, nested }) => {
+    const { agents } = setup(retainRuns);
+    const result = await agents.run({ task: "synthetic release checkpoint", transport: "process" });
+    expect(result.status, result.error).toBe("completed");
+    const run = agents.runDirectory(result.id)!;
+    const retained = nested ? path.join(run, "nested", "child") : run;
+    if (nested) {
+      fs.mkdirSync(retained, { recursive: true });
+      for (const name of ["events.jsonl", "events.jsonl.original"]) fs.renameSync(path.join(run, name), path.join(retained, name));
+      fs.copyFileSync(path.join(run, "status.json"), path.join(retained, "status.json"));
+    }
+    const bytes = originalBytes(retained);
+    expect(bytes.length).toBeGreaterThan(8 * 1024);
+    await expect(agents.cleanup(result.id)).resolves.toEqual({ cleaned: true });
+    expect(agents.list()).toEqual([]);
+    const retainedRoot = retainedRunDirectory(run);
+    expect(isSettledTerminalRun(retainedRoot)).toBe(true);
+    expect(canRemoveTerminalRun(retainedRoot)).toBe(false);
+
+    // Release inspects these now-untracked trees; trace retention is not live custody.
+    agents.pauseForRelease(true);
+    await expect(agents.checkpointForRelease()).resolves.toBeUndefined();
+    const receipt = agents.releaseCheckpointReceipt() as { admissionHeld: boolean; disk: { files: Array<{ path: string; bytes: number }> } };
+    expect(receipt.admissionHeld).toBe(true);
+    if (retainRuns) expect(receipt.disk.files).toContainEqual(expect.objectContaining({
+      path: path.join(result.id, ...(nested ? ["nested", "child"] : []), "events.jsonl.original"), bytes: bytes.length,
+    }));
+    expect(canRemoveTerminalRun(run)).toBe(false);
+    expect(originalBytes(retained)).toEqual(bytes);
+    await agents.close();
+    expect(originalBytes(retained)).toEqual(bytes);
   });
 
   it("keeps nested originals when explicit cleanup forgets the parent handle", async () => {

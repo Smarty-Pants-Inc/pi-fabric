@@ -62,8 +62,8 @@ export interface B4RepairReceiptV1 extends B4RepairRequestV1 {
   readonly executionBranchEntryId: string; // A: immutable original anchor
   readonly joinedLeafEntryId: string; // J: actual joined native view (may differ)
   /** Pi cf3cf677 agent-session.ts:1757-1768 baseHistorySha256 at J:
-   * SHA256(UTF8(JSON.stringify(branch.map(entry =>
-   *   [entry.id, SHA256(UTF8(JSON.stringify(entry) + "\n")))])))).
+   * H(JSON.stringify(branch.map(entry => [entry.id, H(JSON.stringify(entry) + "\n")]))),
+   * where H(text) is SHA256 of UTF-8 text as lower-case hex.
    * Preserve branch order and native property order; no canonical sorting. */
   readonly joinedHistorySha256: string;
   /** Encoding OPEN: native/B4 producer + fv2-l7-main, due 2026-10-30 12:00Z.

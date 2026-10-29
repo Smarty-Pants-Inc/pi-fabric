@@ -7,7 +7,7 @@ import { EffectStore } from "../../../src/effects/store.js";
 import { canonicalEncode, mintEffectKey, manifestDigest } from "../../../src/effects/slots.js";
 import { prepareFileEffect } from "../../../src/effects/file.js";
 import { prepareShellEffect, shellEffectCommand } from "../../../src/effects/shell.js";
-import { canonicalCopy, copy, fail, hash, intent, joinedBranch, originalResult, SESSION, type ConformanceFactory, type ConformanceHarness } from "./fixtures.js";
+import { adapterOriginalResult, canonicalCopy, copy, createSinkGate, fail, hash, intent, joinedBranch, originalResult, SESSION, type ConformanceFactory, type ConformanceHarness } from "./fixtures.js";
 
 /** Unmodified real B4 store/reconciler/record port at the selected integration
  * head. Sinks below are controlled boundary probes, NOT real peer/native/B6
@@ -22,15 +22,17 @@ export const createReal: ConformanceFactory = async scenario => {
   const destination = new Set(scenario.committedBeforeAck ?? []);
   const observed: EffectIntent[] = [];
   const generations: string[] = [];
+  const sinkGate = createSinkGate(scenario.stallSink);
   let lostAck = scenario.lostAck === true;
   let incarnation = 0;
   const sink = (kind: string): EffectSink => ({ kind, adapterVersion: "1",
     async reconcile(value, context) {
       observed.push(copy(value)); generations.push(context.recoveryGeneration);
+      await sinkGate.enter();
       const outcome = scenario.outcomes?.[value.slot.id] ?? "committed";
       if (outcome === "committed") destination.add(value.key);
       if (lostAck) { lostAck = false; throw new Error("destination committed, reply lost"); }
-      return { outcome, ...(outcome === "committed" ? { result: originalResult(value) } : {}) };
+      return { outcome, ...(outcome === "committed" ? { result: scenario.resultSource === "adapter-original" ? adapterOriginalResult(value) : originalResult(value) } : {}) };
     },
   });
   const open = () => {
@@ -49,6 +51,7 @@ export const createReal: ConformanceFactory = async scenario => {
       // Simulated native boundary returns exact native-shaped bytes; this does
       // not fix B4's hash or missing postHook. B6 provenance is not tested here.
       async readNativeToolResult(effect) {
+        if (scenario.resultSource === "adapter-original") return undefined;
         const value = await store.withSession("settle", tx => tx.read(effect.key).intent);
         return { ...originalResult(value) as object, toolCallId: effect.toolCallId } as Awaited<ReturnType<NonNullable<Parameters<typeof createCertifiedEffectRecordPort>[0]["readNativeToolResult"]>>>;
       },
@@ -102,10 +105,10 @@ export const createReal: ConformanceFactory = async scenario => {
       };
       walk(sessionRoot); return hash(canonicalEncode(files));
     },
-    joinedBranch: () => copy(joinedBranch()), // Native boundary probe, not a production reader.
+    joinedBranch: () => copy(joinedBranch()), sinkGate, // Native boundary probe, not a production reader.
     advanceJoinedLeaf() { /* No producer at this head: suite reports absent method. */ },
     fileSnapshot() { const stat = statSync(target); return { bytes: readFileSync(target, "utf8"), identity: `${stat.dev}:${stat.ino}` }; },
-    async dispose() { rmSync(root, { recursive: true, force: true }); },
+    async dispose() { sinkGate.release(); rmSync(root, { recursive: true, force: true }); },
   };
   return harness;
 };

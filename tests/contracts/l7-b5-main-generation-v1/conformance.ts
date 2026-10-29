@@ -16,10 +16,13 @@ export interface GenerationPinHarness {
   destination(): readonly string[];
   dispose(): Promise<void>;
 }
-export type GenerationPinFactory = (scenario: Scenario) => Promise<GenerationPinHarness>;
+export interface GenerationPinScenario extends Scenario {
+  readonly pin?: string | null;
+}
+export type GenerationPinFactory = (scenario: GenerationPinScenario) => Promise<GenerationPinHarness>;
 
 export function runGenerationPinConformance(factory: GenerationPinFactory): void {
-  const test = (name: string, scenario: Scenario, check: (h: GenerationPinHarness) => Promise<void>) => {
+  const test = (name: string, scenario: GenerationPinScenario, check: (h: GenerationPinHarness) => Promise<void>) => {
     it(name, async () => {
       const h = await factory(scenario);
       try { await check(h); } finally { await h.dispose(); }

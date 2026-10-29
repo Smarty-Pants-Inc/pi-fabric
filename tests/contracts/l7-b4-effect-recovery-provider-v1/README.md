@@ -14,7 +14,13 @@ methods, without shimming failures into successes.
 ```sh
 B4_CONFORMANCE_TARGET=fake bunx --no-install vitest run tests/contracts/l7-b4-effect-recovery-provider-v1/provider.test.ts --reporter=verbose
 B4_CONFORMANCE_TARGET=real bunx --no-install vitest run tests/contracts/l7-b4-effect-recovery-provider-v1/provider.test.ts --reporter=verbose
+bunx --no-install vitest run tests/contracts/l7-b4-effect-recovery-provider-v1/consumer.test.ts tests/contracts/l7-b4-effect-recovery-provider-v1/resolver-errors.test.ts --reporter=verbose
 ```
+
+`provider.test.ts` runs 33 cases per target (C01–C35 except moved C21/C22).
+`consumer.test.ts` adds four fake configurability flows; `resolver-errors.test.ts`
+runs the same 33 cases with resolver messages that omit the error code.
+C13 forces a sink await; C35 reads the adapter-original path with no timestamp.
 
 The default runs both. Real-provider failures remain ordinary failing tests,
 not skips or expected failures. The selected integration head does not yet
@@ -39,13 +45,37 @@ implement the entire frozen R3/B3 contract. This draft must not be called G2 GRE
 - The multi-original-pin case is OPEN for fv2-l7-main; the two-argument settlement
   signature cannot express a different generation per original in one pass.
 
+## Consumer-owned identities (K9)
+
+```ts
+const h = await createFake({ intents: consumerIntents }, {
+  sessionId: input.sessionId,
+  acceptedInput: input,                  // complete AcceptedRecoveryInput
+  executionBranchEntryId: originalA,
+  joinedLeafEntryId: actualJ,
+  pin: retainedB5Generation,             // fixture evidence, not B4 validation
+});
+const provider: B4EffectRecoveryProviderV1 = h.provider; // no Partial cast
+// settle -> read -> repairMaintenance(input, actualJ) -> resolveRepair(ref)
+await h.dispose();
+```
+
+`createFakeProvider(scenario, options)` is the direct full-provider accessor when
+no retained-state controls are needed. `advanceJoinedLeaf(nextId)` supports any
+consumer leaf ID. Defaults preserve existing fixture-only consumers. Main must
+still execute its own B5 generation checks; this fake deliberately will not
+perform those checks for it.
+
 The fake is an **in-memory component stand-in**, not a durable producer, genuine
 repair receipt, installed native host or B1 witness. Reopen in fake tests retains
 model state; it is not a process-crash test. The real factory reopens real B4
 records on disk. C28–C32 use the real file and fixed shell adapters. Other sink
 and native-entry boundaries are controlled probes. In particular C12 is **not**
 a real peer/control late-request or cache-expiry qualification; B5/transport
-integration and the shipped S3/S7/S8 flows must prove those.
+integration and the shipped S3/S7/S8 flows must prove those. The explicit
+before/after-deadline and before/after-cache-expiry both-side matrix is in
+B4-CONTRACT.md §7: owner B5/control sender + transport receiver, Main integrating,
+due 2026-10-30 18:00Z; it is not executed in this delivery.
 
 All files live under `tests/`, outside `tsconfig.build.json` and production entry
 points. There is no production registration, runtime fallback, new package
@@ -53,6 +83,6 @@ export or change to B4 behavior. Passing the fake never enables REQUIRED.
 
 The authoritative source-pinned narrative and conflicts are co-versioned here:
 [`B4-CONTRACT.md`](./B4-CONTRACT.md). Verify its frozen bytes from this directory
-with `sha256sum -c B4-CONTRACT.sha256`. V2 corrects K1–K4; K5–K9 follow in v3.
-The round-2 `PHASE1.md` records commit/hash and per-test evidence. CoS owns PR
+with `sha256sum -c B4-CONTRACT.sha256`. V2 corrects K1–K4; v3 applies K5–K9.
+The round-2 `PHASE1.md` (v2) and `RESULT.md` (v3) record commit/hash and per-test evidence. CoS owns PR
 body updates; the builder is authorized only to push this branch.

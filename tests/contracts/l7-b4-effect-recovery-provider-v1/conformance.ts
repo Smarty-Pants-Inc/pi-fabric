@@ -74,15 +74,30 @@ export function runConformance(provider: ConformanceFactory): void {
       await h.reopen(); expect((await settle(h)).uncertain).toBe(0);
       expect(h.destination()).toEqual([value.key]); expect(h.observedIntents()).toEqual([value, value]);
     });
-    test("C12 peer boundary probe retains body/deadline beyond transport cache lifetime", { intents: [intent("peer", 0, [], true)], committedBeforeAck: [intent("peer", 0, [], true).key] }, async h => {
+    test("C12 controlled peer probe retains original body/deadline on replay", { intents: [intent("peer", 0, [], true)], committedBeforeAck: [intent("peer", 0, [], true).key] }, async h => {
       const peer = intent("peer", 0, [], true); await settle(h); await h.reopen(); await settle(h);
       // Only a controlled sink boundary, not a real late network request or cache-expiry proof.
       expect(h.destination()).toEqual([peer.key]); expect(h.observedIntents()).toEqual([peer]);
       expect(h.observedIntents()[0]?.message?.originalDeadlineAt).toBe(peer.message!.originalDeadlineAt);
     });
-    test("C13 concurrent settlement serializes and calls sink only once", { intents: [value] }, async h => {
-      const [a, b] = await Promise.all([settle(h), settle(h)]);
+    test("C13 concurrent settlement serializes across an awaited stalled sink", { intents: [value], stallSink: true }, async h => {
+      const first = settle(h);
+      let second: ReturnType<typeof settle> | undefined;
+      try {
+        // An event, not a sleep: first holds the list/attempt/sink/result critical section.
+        await Promise.race([h.sinkGate.entered, first.then(() => { throw new Error("settlement bypassed stalled sink"); })]);
+        second = settle(h);
+        // Let a lock-free fake enter its second sink before releasing the first.
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(h.observedIntents()).toHaveLength(1);
+      } finally {
+        h.sinkGate.release();
+        await Promise.allSettled([first, ...(second ? [second] : [])]);
+      }
+      expect(second).toBeDefined();
+      const [a, b] = await Promise.all([first, second!]);
       expect(a).toEqual(b); expect(h.observedIntents()).toHaveLength(1);
+      expect(h.destination()).toEqual([value.key]);
     });
     test("C14 corrupt retained ledger cannot appear clean", { intents: [value], corrupt: true }, async h => {
       expect((await settle(h)).uncertain).toBeGreaterThan(0); expect(h.destination()).toEqual([]);
@@ -146,7 +161,7 @@ export function runConformance(provider: ConformanceFactory): void {
     test("C25 forged receipt hash/anchor/generation is refused synchronously", { intents: [value] }, async h => {
       await settle(h); const ref = await repair(h);
       for (const bad of [{ ...ref, repairReceiptSha256: hash("forged") }, { ...ref, executionBranchEntryId: "J" }, { ...ref, recoveryGeneration: "g2" }]) {
-        expect(() => h.provider.resolveRepair!(bad)).toThrow("RECOVERY_MAINTENANCE_REPAIR_REQUIRED");
+        expect(() => h.provider.resolveRepair!(bad)).toThrowError(expect.objectContaining({ code: "RECOVERY_MAINTENANCE_REPAIR_REQUIRED" }));
       }
     });
     test("C26 later joined J2 refuses new repair rather than replacing receipt", { intents: [value] }, async h => {
@@ -182,11 +197,21 @@ export function runConformance(provider: ConformanceFactory): void {
     test("C33 missing receipt cannot be resolved from caller JSON", {}, async h => {
       expect(h.provider.resolveRepair).toBeTypeOf("function");
       expect(() => h.provider.resolveRepair!({ originalInputId: accepted.originalInputId, recoveryGeneration: GENERATION,
-        executionBranchEntryId: "A", repairReceiptSha256: hash("invented") })).toThrow("RECOVERY_MAINTENANCE_REPAIR_REQUIRED");
+        executionBranchEntryId: "A", repairReceiptSha256: hash("invented") })).toThrowError(expect.objectContaining({ code: "RECOVERY_MAINTENANCE_REPAIR_REQUIRED" }));
     });
     test("C34 host repair rejects unrelated original input", { intents: [value] }, async h => {
       await settle(h); expect(h.provider.repairMaintenance).toBeTypeOf("function");
       await expect(h.provider.repairMaintenance!({ ...accepted, originalInputId: "unrelated" }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
+    });
+    test("C35 adapter-original read labels provenance without inventing a timestamp", { intents: [value], resultSource: "adapter-original" }, async h => {
+      const effect = (await settle(h)).settled[0]!;
+      const result = await read(h, effect);
+      expect(result.source).toBe("adapter-original");
+      expect(result.message).toEqual({ role: "toolResult", toolCallId: value.tool.originalToolCallId, toolName: "write",
+        content: [{ type: "text", text: "original result" }], isError: false });
+      expect(result.message).not.toHaveProperty("timestamp");
+      // B3 requires a boolean, and re-runs strict hooks regardless of its value.
+      expect(result.postHook).toBeTypeOf("boolean");
     });
   });
 }

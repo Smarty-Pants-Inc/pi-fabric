@@ -29,7 +29,8 @@ export interface Scenario {
   readonly alias?: { readonly key: string; readonly toolCallId: string };
   readonly corrupt?: boolean;
   readonly lostAck?: boolean;
-  readonly pin?: string | null;
+  readonly stallSink?: boolean;
+  readonly resultSource?: "native-entry" | "adapter-original";
   readonly fileState?: "pre" | "post" | "neither";
   readonly shellState?: "matching" | "changed";
 }
@@ -45,13 +46,37 @@ export interface ConformanceHarness {
   ledgerDigest(): Promise<string>;
   /** Ordered native-shaped branch at the joined leaf, observed independently of the receipt. */
   joinedBranch(): readonly JoinedEntry[];
-  advanceJoinedLeaf(): void;
+  readonly sinkGate: SinkGate;
+  advanceJoinedLeaf(nextLeafId?: string): void;
   fileSnapshot(): { bytes: string; identity: string };
   dispose(): Promise<void>;
 }
 export type ConformanceFactory = (scenario: Scenario) => Promise<ConformanceHarness>;
 
-export function intent(id = "write", ordinal = 0, predecessors: readonly string[] = [], peer = false): EffectIntent {
+export interface FixtureIdentity {
+  readonly acceptedInput: Readonly<AcceptedRecoveryInput>;
+  readonly executionBranchEntryId: string;
+}
+export const defaultIdentity: FixtureIdentity = { acceptedInput: accepted, executionBranchEntryId: "A" };
+
+/** A deterministic event gate, not a timing assumption. Both real and fake sink
+ * probes await it before returning their outcome; C13 releases it in finally. */
+export interface SinkGate {
+  readonly entered: Promise<void>;
+  enter(): Promise<void>;
+  release(): void;
+}
+export function createSinkGate(stall = false): SinkGate {
+  let entered!: () => void;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const observed = new Promise<void>(resolve => { entered = resolve; });
+  if (!stall) release();
+  return { entered: observed, async enter() { entered(); await gate; }, release };
+}
+
+export function intent(id = "write", ordinal = 0, predecessors: readonly string[] = [], peer = false,
+  identity: FixtureIdentity = defaultIdentity): EffectIntent {
   const payloadText = peer ? canonicalEncode({ text: "original peer bytes" }) : `original-${id}`;
   const payload = { encoding: "base64" as const, bytes: Buffer.from(payloadText).toString("base64"), digest: hash(payloadText) };
   const slot: EffectSlot = {
@@ -59,11 +84,12 @@ export function intent(id = "write", ordinal = 0, predecessors: readonly string[
     adapterVersion: "1", canonicalTarget: peer ? "logical-recipient" : `/retained/${id}`,
     predecessors, canonicalArguments: peer ? { text: "original peer bytes" } : { path: id, content: payloadText }, constraints: {},
   };
-  const tuple = [1, "contract-org", SESSION, INPUT, id, slot.kind] as const;
+  const input = identity.acceptedInput;
+  const tuple = [1, "contract-org", input.sessionId, input.originalInputId, id, slot.kind] as const;
   return {
     format: "fabric.effect-intent", version: 1, key: mintEffectKey(tuple), keyTuple: tuple,
     manifestDigest: manifestDigest({ version: 1, slots: [{ ...slot, predecessors: [] }] }),
-    acceptedInput: { id: INPUT, digest: hash("original input"), nativeEntryId: "A" },
+    acceptedInput: { id: input.originalInputId, digest: input.payloadSha256, nativeEntryId: identity.executionBranchEntryId },
     slot, tool: { canonicalRef: slot.canonicalRef, adapterVersion: "1", originalToolCallId: `call-${id}`, nativeAssistantEntryId: "assistant" },
     canonicalArguments: slot.canonicalArguments, canonicalTarget: slot.canonicalTarget, payload,
     ...(peer ? { message: { logicalRecipient: slot.canonicalTarget, immutableBody: { text: "original peer bytes" },
@@ -72,25 +98,31 @@ export function intent(id = "write", ordinal = 0, predecessors: readonly string[
     originAttempt: { podUID: "old-pod", bootId: "old-boot", ownerIncarnation: "old-owner", authorityRevision: "old-revision" },
   };
 }
+export function adapterOriginalResult(value: EffectIntent): JsonValue {
+  // Stored adapter original has no native timestamp. Never synthesize one.
+  return { role: "toolResult", toolCallId: value.tool.originalToolCallId, toolName: value.tool.canonicalRef.slice(3),
+    content: [{ type: "text", text: "original result" }], isError: false };
+}
 export function originalResult(value: EffectIntent): JsonValue {
   // Complete deliberately non-sorted native envelope exposes canonical-vs-native hashing.
-  return { role: "toolResult", toolCallId: value.tool.originalToolCallId, toolName: "write",
-    content: [{ type: "text", text: "original result" }], isError: false, timestamp: 12345 };
+  return { ...adapterOriginalResult(value) as object, timestamp: 12345 };
 }
 export type JoinedEntry = Readonly<{ id: string; [key: string]: unknown }>;
-export function joinedBranch(joinedLeafEntryId = "J"): readonly JoinedEntry[] {
+export function joinedBranch(joinedLeafEntryId = "J", identity: FixtureIdentity = defaultIdentity): readonly JoinedEntry[] {
   // Deliberately non-sorted property order and UTF-8 content: exact Pi history bytes.
-  return [{ id: "A", parentId: null, type: "message", message: { role: "user", content: "original input" } },
-    { id: joinedLeafEntryId, parentId: "A", type: "message", message: { role: "assistant", content: "joined λ" } }];
+  const anchor = identity.executionBranchEntryId;
+  return [{ id: anchor, parentId: null, type: "message", message: { role: "user", content: identity.acceptedInput.text } },
+    { id: joinedLeafEntryId, parentId: anchor, type: "message", message: { role: "assistant", content: "joined λ" } }];
 }
-export function joinedEvidence(settlements: B4RepairReceiptV1["settlements"], joinedLeafEntryId = "J"): B4RepairReceiptV1 {
-  const branch = joinedBranch(joinedLeafEntryId);
+export function joinedEvidence(settlements: B4RepairReceiptV1["settlements"], joinedLeafEntryId = "J",
+  identity: FixtureIdentity = defaultIdentity, generation = GENERATION): B4RepairReceiptV1 {
+  const branch = joinedBranch(joinedLeafEntryId, identity);
   const raw = JSON.stringify(branch[branch.length - 1]) + "\n";
   // P agent-session.ts:1757-1768, not receipt canonicalEncode or an opaque fixture string.
   const joinedHistorySha256 = hash(JSON.stringify(branch.map(entry => [entry.id, hash(JSON.stringify(entry) + "\n")])));
-  return { version: 1, sessionId: SESSION, originalInputId: INPUT, recoveryGeneration: GENERATION,
-    executionBranchEntryId: "A", joinedLeafEntryId, joinedHistorySha256,
-    protectedRangeSha256: hash("original calls and exact results"), protectedEntryIds: ["assistant", "J"], settlements,
-    nativeEntries: [{ entryId: "J", deliveryId: "pi-native-entry:v1:fixture", recordKind: "carrier", file: "/retained/session.jsonl",
+  return { version: 1, sessionId: identity.acceptedInput.sessionId, originalInputId: identity.acceptedInput.originalInputId, recoveryGeneration: generation,
+    executionBranchEntryId: identity.executionBranchEntryId, joinedLeafEntryId, joinedHistorySha256,
+    protectedRangeSha256: hash("original calls and exact results"), protectedEntryIds: ["assistant", joinedLeafEntryId], settlements,
+    nativeEntries: [{ entryId: joinedLeafEntryId, deliveryId: `pi-native-entry:v1:fixture:${joinedLeafEntryId}`, recordKind: "carrier", file: "/retained/session.jsonl",
       offset: 0, length: Buffer.byteLength(raw) - 1, bytesSha256: hash(raw), b6Sequence: 7 }] };
 }

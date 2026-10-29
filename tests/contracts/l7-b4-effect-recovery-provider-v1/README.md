@@ -49,6 +49,10 @@ implement the entire frozen R3/B3 contract. This draft must not be called G2 GRE
   composition suite in `../l7-b5-admission-v1/`, not this B4 suite; owner
   fv2-l7-b5fix, due 2026-10-30 18:00Z. See B4-CONTRACT.md §4 rule 5 for the
   recorded decision and unexecuted B5/Main coverage.
+  Standing settlement obligations remain under K10: the two-argument settlement
+  signature cannot express a different generation per original in one pass.
+  Main owns the per-original hold versus integration decision. Do not stamp
+  unrelated pending intents with one selected original's g.
 
 ## Consumer-owned identities (K9)
 

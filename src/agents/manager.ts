@@ -7799,7 +7799,7 @@ export class AgentManager {
     if (keepResult && resultFile) managed.resultFingerprint = writePrivateJsonAtomic(resultFile, omitRetainedTasks(record));
     writeJsonAtomic(managed.statusFile, omitRetainedTasks(compactUiRecord(this.#withTransportMetadata(record, managed, false))), { space: 2 });
     for (const entry of fs.readdirSync(managed.runDirectory)) {
-      if (entry === "status.json" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
+      if (entry === "status.json" || entry === "lifecycle.jsonl" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
       await removeTree(path.join(managed.runDirectory, entry));
     }
     // pi-fabric#1554 P1 (smarty-dev#15878): the loop above prunes the in-tree tmp/ such a run used before. Its short

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import type { B1ErrorCode, RevokeGenerationRequest } from "./contract.js";
+import type { B1ErrorCode, ReceiverIdentity, RevokeGenerationRequest } from "./contract.js";
 import type { B1Fact, B1Harness, B1HarnessFactory, B1MountFault, B1TeardownItem } from "./harness.js";
 
 // Independent consumer-side fixture encoding. Not imported from the implementation.
@@ -98,6 +98,46 @@ export function runConformance(factory: B1HarnessFactory): void {
       expect(h.observe()).toEqual(before);
     });
 
+    // Design §8.1.6: fail-closed decoding is required independently on BOTH ports.
+    test("unknown mount profile fails closed on an actually mounted receiver", async h => {
+      await complete(h); const request = h.mountRequest(), before = h.observe();
+      Object.defineProperty(request, "requiredProfile", { value: "unknown-profile", enumerable: true });
+      await failure(() => h.ports.currentMountGeneration(request), "B1_UNSUPPORTED_PROFILE", "refused");
+      expect(h.observe()).toEqual(before);
+    });
+    for (const version of [0, 2]) {
+      test(`revoke version ${version} is invalid before any effects (§8.1.6)`, async h => {
+        h.completeRetirement(); const request = h.revokeRequest(), before = h.observe();
+        Object.defineProperty(request, "version", { value: version, enumerable: true });
+        await failure(() => h.ports.revokeGeneration(rehash(request)), "B1_INVALID_ARGUMENT", "refused");
+        expect(h.observe()).toEqual(before);
+      });
+      test(`mount version ${version} is invalid and read-only (§8.1.6)`, async h => {
+        await complete(h); const request = h.mountRequest(), before = h.observe();
+        Object.defineProperty(request, "version", { value: version, enumerable: true });
+        await failure(() => h.ports.currentMountGeneration(request), "B1_INVALID_ARGUMENT", "refused");
+        expect(h.observe()).toEqual(before);
+      });
+    }
+    for (const operationId of ["", " \t"]) test(`empty operationId ${JSON.stringify(operationId)} is invalid (§8.1.6)`, async h => {
+      h.completeRetirement(); const before = h.observe();
+      await failure(() => h.ports.revokeGeneration(rehash({ ...h.revokeRequest(), operationId })), "B1_INVALID_ARGUMENT", "refused");
+      expect(h.observe()).toEqual(before);
+    });
+    for (const [label, deadlineUnixMs] of [["NaN", NaN], ["negative", -1], ["fractional", 0.5],
+      ["infinite", Infinity], ["unsafe integer", Number.MAX_SAFE_INTEGER + 1]] as const) {
+      test(`revoke ${label} deadline is invalid, not a liveness bypass (§8.1.1/6/7)`, async h => {
+        h.completeRetirement(); const before = h.observe();
+        await failure(() => h.ports.revokeGeneration({ ...h.revokeRequest(), deadlineUnixMs }), "B1_INVALID_ARGUMENT", "refused");
+        expect(h.observe()).toEqual(before);
+      });
+      test(`mount ${label} deadline is invalid and read-only (§8.1.6/7)`, async h => {
+        await complete(h); const before = h.observe();
+        await failure(() => h.ports.currentMountGeneration({ ...h.mountRequest(), deadlineUnixMs }), "B1_INVALID_ARGUMENT", "refused");
+        expect(h.observe()).toEqual(before);
+      });
+    }
+
     test("valid-looking caller evidence cannot create inventory/exit facts or open the successor gate", async h => {
       const request = h.revokeRequest();
       const before = h.observe();
@@ -114,6 +154,22 @@ export function runConformance(factory: B1HarnessFactory): void {
         attachGrant: { receiver: request.reservedReceiver, acquisitionId: request.reservedAcquisitionId } });
       h.attachReservedReceiver();
       expect((await h.ports.currentMountGeneration(h.mountRequest())).self).toEqual(request.reservedReceiver);
+    });
+
+    test("revoke receipt binds exact storage, reservation and revoked inventory (§8.1.3/§8.3)", async h => {
+      h.completeRetirement(); const request = h.revokeRequest(), actual = h.observe();
+      expect(actual.actualPredecessors.length).toBeGreaterThan(0);
+      const receipt = await h.ports.revokeGeneration(request);
+      expect(receipt).toMatchObject({ version: 1, kind: "fabric.b1.revoke", operationId: request.operationId,
+        requestSha256: request.requestSha256 });
+      expect(receipt.storage).toEqual(request.storage);
+      expect(receipt.reservedReceiver).toEqual(request.reservedReceiver);
+      expect(receipt.reservedAcquisitionId).toBe(request.reservedAcquisitionId);
+      expect(receipt.revoked).toEqual(actual.actualPredecessors); // Exact list, not subset/duplicated summary.
+      expect(receipt.revoked).toEqual(request.predecessor.generations);
+      expect(receipt.exitedPodUIDs).toEqual(actual.actualPodUIDs);
+      expect(h.observe().attachGrant).toEqual({ receiver: receipt.reservedReceiver,
+        acquisitionId: receipt.reservedAcquisitionId, revokeReceiptHash: receipt.record.sha256 });
     });
 
     const factCases: readonly { fact: B1Fact; code: B1ErrorCode }[] = [
@@ -142,6 +198,66 @@ export function runConformance(factory: B1HarnessFactory): void {
       h.attachReservedReceiver();
       expect((await h.ports.currentMountGeneration(h.mountRequest())).acquisitionId).toBe(request.reservedAcquisitionId);
     });
+
+    // Design §8.1.5/§9 #2: facts must be re-observed AFTER effects, not only on entry.
+    for (const { fact, code } of [
+      { fact: "killIssued", code: "B1_KILL_NOT_CONFIRMED" },
+      { fact: "restartDisabled", code: "B1_RESTART_NOT_DISABLED" },
+      { fact: "nodeReachable", code: "B1_NODE_UNREACHABLE" },
+    ] satisfies readonly { fact: B1Fact; code: B1ErrorCode }[]) {
+      test(`post-effect ${fact} regression is rechecked before commit (§8.1.5/§9 #2)`, async h => {
+        h.completeRetirement(); h.setFact("workloadsExited", false); const request = h.revokeRequest();
+        await failure(() => h.ports.revokeGeneration(request), "B1_TASKS_STILL_ALIVE", "held");
+        expect(h.observe().operation).toMatchObject({ restartRevocationPersisted: true, killSubmitted: true, retirementRequested: true });
+        h.setFact("workloadsExited", true); h.setFact(fact, false); const changed = h.observe();
+        await failure(() => h.ports.revokeGeneration(request), code, "held"); withheld(h);
+        expect(h.observe()).toEqual(changed); // No new effects/receipt while the regression is present.
+        h.setFact(fact, true);
+        expect((await h.ports.revokeGeneration(request)).operationId).toBe(request.operationId);
+      });
+    }
+    test("task discovered after kill invalidates immutable coverage and retains the slot (§8.1.5/§9 #2)", async h => {
+      h.completeRetirement(); h.setFact("workloadsExited", false); const request = h.revokeRequest();
+      await failure(() => h.ports.revokeGeneration(request), "B1_TASKS_STILL_ALIVE", "held");
+      const tasks = h.observe().actualWorkloadTaskIds;
+      h.discoverWorkloadTask(); h.setFact("workloadsExited", true); const discovered = h.observe();
+      expect(discovered.actualWorkloadTaskIds.length).toBeGreaterThan(tasks.length);
+      expect(h.revokeRequest().predecessor).toEqual(request.predecessor); // Never rewrite hashed evidence in place.
+      await failure(() => h.ports.revokeGeneration(request), "B1_PREDECESSOR_SET_INCOMPLETE", "held");
+      expect(h.observe()).toEqual(discovered); withheld(h);
+      h.completeRetirement(); const claimedComplete = h.observe(); // A boolean cannot repair old immutable coverage.
+      await failure(() => h.ports.revokeGeneration(request), "B1_PREDECESSOR_SET_INCOMPLETE", "held");
+      expect(h.observe()).toEqual(claimedComplete);
+      await failure(() => h.ports.revokeGeneration(rehash({ ...request, operationId: `${request.operationId}:replacement` })),
+        "B1_OPERATION_CONFLICT", "refused"); expect(h.observe()).toEqual(claimedComplete);
+      h.retireFailedCandidateAndReserve({ ...request.reservedReceiver, podUID: `${request.reservedReceiver.podUID}:fresh`,
+        nodeName: "fresh-after-task", nodeUID: "fresh-after-task-uid" });
+      const transferred = h.observe();
+      await failure(() => h.ports.revokeGeneration(request), "B1_STALE_GENERATION", "refused");
+      expect(h.observe()).toEqual(transferred);
+      h.completeRetirement(); const next = h.revokeRequest();
+      expect(next.operationId).not.toBe(request.operationId); expect(next.reservedAcquisitionId).not.toBe(request.reservedAcquisitionId);
+      expect(next.predecessor.podUIDs).toContain(request.reservedReceiver.podUID);
+      expect((await h.ports.revokeGeneration(next)).reservedReceiver).toEqual(next.reservedReceiver);
+    });
+
+    // Design §4.1/§9 #3: exact HELD retries must not resubmit already-recorded effects.
+    for (const { fact, code } of [
+      { fact: "restartDisabled", code: "B1_RESTART_NOT_DISABLED" },
+      { fact: "killIssued", code: "B1_KILL_NOT_CONFIRMED" },
+      { fact: "oldPathRetired", code: "B1_TEARDOWN_INCOMPLETE" },
+      { fact: "workloadsExited", code: "B1_TASKS_STILL_ALIVE" },
+    ] satisfies readonly { fact: B1Fact; code: B1ErrorCode }[]) {
+      test(`exact held retry at ${fact} leaves the complete observed state unchanged (§4.1/§9 #3)`, async h => {
+        h.completeRetirement(); h.setFact(fact, false); const request = h.revokeRequest();
+        await failure(() => h.ports.revokeGeneration(request), code, "held"); const held = h.observe();
+        await failure(() => h.ports.revokeGeneration(request), code, "held"); expect(h.observe()).toEqual(held);
+        h.reopen();
+        await failure(() => h.ports.revokeGeneration({ ...request, deadlineUnixMs: request.deadlineUnixMs + 10_000 }), code, "held");
+        expect(h.observe()).toEqual(held); withheld(h);
+        h.setFact(fact, true); await h.ports.revokeGeneration(request);
+      });
+    }
 
     const teardownItems: readonly B1TeardownItem[] = ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8"];
     for (const item of teardownItems) test(`${item} is conjunctive, not a success-shaped summary flag`, async h => {
@@ -295,6 +411,8 @@ export function runConformance(factory: B1HarnessFactory): void {
         [rehash({ ...original, reservedReceiver: { ...original.reservedReceiver, podUID: "other" } }), "B1_NOT_AUTHORIZED"],
         [rehash({ ...original, reservedAcquisitionId: "other" }), "B1_NOT_AUTHORIZED"],
         [rehash({ ...original, expectedControllerRevision: "0" }), "B1_STALE_GENERATION"],
+        // §8.1.2 requires equality, not merely revision >= the completed S1 reservation.
+        [rehash({ ...original, expectedControllerRevision: (BigInt(original.expectedControllerRevision) + 1n).toString() }), "B1_STALE_GENERATION"],
       ] satisfies readonly (readonly [RevokeGenerationRequest, B1ErrorCode])[]) {
         await failure(() => h.ports.revokeGeneration(request), code, "refused"); expect(h.observe()).toEqual(before);
       }
@@ -309,6 +427,104 @@ export function runConformance(factory: B1HarnessFactory): void {
         await failure(() => h.ports.revokeGeneration(rehash({ ...original, reservedReceiver: receiver })),
           "B1_SAME_NODE_REUSE_UNQUALIFIED", "refused"); expect(h.observe()).toEqual(before);
       }
+    });
+
+    // Design §4.1/§9 #4: exercise real multi-handover histories through the ports.
+    const freshNode = (h: B1Harness, name: string): ReceiverIdentity => ({ nodeName: name,
+      nodeUID: `${h.revokeRequest().storage.identityRecordUID}:${name}:uid`,
+      podUID: `${h.revokeRequest().storage.identityRecordUID}:${name}:pod` });
+    test("B→C→B historical-node quarantine refuses non-immediate reuse (§4.1/§9 #4)", async h => {
+      const first = h.revokeRequest(), b = first.predecessor.generations[0]?.receiver;
+      if (!b) throw new Error("Required fixture needs initial B");
+      const c = (await complete(h)).mount;
+      h.reserveNextReceiver({ ...b, podUID: `${b.podUID}:new-pod` }); h.completeRetirement();
+      const request = h.revokeRequest(), before = h.observe();
+      expect(request.predecessor.generations.map(g => g.receiver)).toEqual([c.self]);
+      expect(before.quarantinedNodeNames).toContain(b.nodeName);
+      await failure(() => h.ports.revokeGeneration(request), "B1_SAME_NODE_REUSE_UNQUALIFIED", "refused");
+      expect(h.observe()).toEqual(before);
+      expect(before).toMatchObject({ operation: null, attachGrant: null, receiverMounted: false });
+    });
+    test("historical node-name recreation does not erase its ticket key (§4.1/§9 #4)", async h => {
+      const b = h.revokeRequest().predecessor.generations[0]?.receiver;
+      if (!b) throw new Error("Required fixture needs initial B");
+      await complete(h);
+      h.reserveNextReceiver({ ...b, podUID: `${b.podUID}:recreated`, nodeUID: `${b.nodeUID}:recreated` });
+      h.completeRetirement(); const before = h.observe();
+      await failure(() => h.ports.revokeGeneration(h.revokeRequest()), "B1_SAME_NODE_REUSE_UNQUALIFIED", "refused");
+      expect(h.observe()).toEqual(before);
+    });
+    for (const size of [2, 3]) test(`N=${size} pool allows exactly N−1 fresh handovers then holds admission (§4.1/§9 #4)`, async h => {
+      const initial = h.revokeRequest(), b = initial.predecessor.generations[0]?.receiver;
+      if (!b) throw new Error("Required fixture needs an initial node key");
+      const pool = [b, initial.reservedReceiver, ...(size === 3 ? [freshNode(h, "third-node")] : [])];
+      let successes = 0;
+      for (let i = 1; i < size; i++) {
+        const node = pool[i]; if (!node) throw new Error("Missing finite-pool node");
+        if (i > 1) h.reserveNextReceiver(node);
+        const { request, receipt, mount } = await complete(h); successes++;
+        expect(mount.self.nodeName).toBe(node.nodeName);
+        expect(receipt.reservedAcquisitionId).toBe(request.reservedAcquisitionId);
+        expect(mount.acquisitionId).toBe(request.reservedAcquisitionId);
+      }
+      expect(successes).toBe(size - 1);
+      h.reserveNextReceiver({ ...b, podUID: `${b.podUID}:pool-exhausted` }); h.completeRetirement();
+      const request = h.revokeRequest(), before = h.observe();
+      // Every finite-pool key is either historical or the immediate predecessor.
+      for (const node of pool) {
+        await failure(() => h.ports.revokeGeneration(rehash({ ...request, reservedReceiver: { ...node,
+          podUID: `${node.podUID}:retry` } })), "B1_SAME_NODE_REUSE_UNQUALIFIED", "refused");
+        expect(h.observe()).toEqual(before);
+      }
+      expect(before.attachGrant).toBeNull(); expect(before.receiverScheduled).toBe(false);
+    });
+    test("failed candidate consumes its historical key without a fictitious generation (§4.1/§8.2/§9 #4)", async h => {
+      h.completeRetirement(); const failed = h.revokeRequest();
+      await h.ports.revokeGeneration(failed);
+      h.failNextReceiverAttach();
+      await failure(() => h.attachReservedReceiver(), "B1_DRIVER_OUTCOME_UNKNOWN", "held");
+      const held = h.observe();
+      expect(held).toMatchObject({ candidateAttachSubmitted: true, receiverScheduled: true,
+        receiverMounted: false, receiverReceipt: null, operation: { state: "committed" } });
+      expect(held.attachGrant).not.toBeNull(); // The failed raw attempt was AFTER S6, not an impossible early attach.
+      await failure(() => h.retireFailedCandidateAndReserve(freshNode(h, "third-node")), "B1_OPERATION_CONFLICT", "refused");
+      expect(h.observe()).toEqual(held); // Unknown retirement cannot transfer or release the slot.
+      h.completeRetirement(); h.retireFailedCandidateAndReserve(freshNode(h, "third-node"));
+      const next = h.revokeRequest();
+      expect(next.predecessor.podUIDs).toContain(failed.reservedReceiver.podUID);
+      expect(next.predecessor.generations.some(g => g.receiver.podUID === failed.reservedReceiver.podUID)).toBe(false);
+      expect(h.observe().retiredCandidatePodUIDs).toContain(failed.reservedReceiver.podUID);
+      expect(h.observe().quarantinedNodeNames).toContain(failed.reservedReceiver.nodeName);
+      await complete(h);
+      h.reserveNextReceiver({ ...failed.reservedReceiver, podUID: `${failed.reservedReceiver.podUID}:new`,
+        nodeUID: `${failed.reservedReceiver.nodeUID}:recreated` }); h.completeRetirement(); const before = h.observe();
+      await failure(() => h.ports.revokeGeneration(h.revokeRequest()), "B1_SAME_NODE_REUSE_UNQUALIFIED", "refused");
+      expect(h.observe()).toEqual(before);
+    });
+
+    test("N=2 failed attach consumes the last fresh key without a successful handover (§4.1/§9 #4)", async h => {
+      h.completeRetirement(); const request = h.revokeRequest(), b = request.predecessor.generations[0]?.receiver;
+      if (!b) throw new Error("Required fixture needs initial B");
+      await h.ports.revokeGeneration(request); h.failNextReceiverAttach();
+      await failure(() => h.attachReservedReceiver(), "B1_DRIVER_OUTCOME_UNKNOWN", "held");
+      h.completeRetirement(); h.retireFailedCandidateAndReserve({ ...b, podUID: `${b.podUID}:new` });
+      h.completeRetirement(); const next = h.revokeRequest(), before = h.observe();
+      for (const receiver of [b, request.reservedReceiver]) {
+        await failure(() => h.ports.revokeGeneration(rehash({ ...next, reservedReceiver: receiver })),
+          "B1_SAME_NODE_REUSE_UNQUALIFIED", "refused"); expect(h.observe()).toEqual(before);
+      }
+      expect(before).toMatchObject({ receiverScheduled: false, receiverMounted: false, attachGrant: null });
+    });
+    test("earlier receipt readback never grants a later candidate after slot transfer (§8.1.3/§8.3)", async h => {
+      const { request, receipt } = await complete(h);
+      h.reserveNextReceiver(freshNode(h, "third-node")); const reserved = h.observe(); h.reopen();
+      expect(await h.ports.revokeGeneration({ ...request, deadlineUnixMs: 0 })).toEqual(receipt);
+      expect(h.observe()).toEqual(reserved);
+      await failure(() => h.attachReservedReceiver(), "B1_TEARDOWN_INCOMPLETE", "held");
+      expect(h.observe()).toEqual(reserved);
+      const { mount } = await complete(h);
+      expect(mount.acquisitionId).not.toBe(request.reservedAcquisitionId);
+      expect(mount.self.nodeName).toBe("third-node");
     });
 
     test("empty REQUIRED inventory is held even with valid hashes and complete retirement flags", async h => {
@@ -406,7 +622,16 @@ export function runConformance(factory: B1HarnessFactory): void {
       expect(h.observe()).toEqual(before);
     });
 
+    // §4.2 S8/S10, §5/§8.2: actual acquisition/attach lineage and each independent FD.
     const mountFaults: readonly { fault: B1MountFault; code: B1ErrorCode; disposition: "refused" | "held" }[] = [
+      { fault: "stale-acquisition", code: "B1_MOUNT_LINEAGE_UNKNOWN", disposition: "held" },
+      { fault: "foreign-acquisition", code: "B1_MOUNT_LINEAGE_UNKNOWN", disposition: "held" },
+      { fault: "attach-observation-mismatch", code: "B1_MOUNT_LINEAGE_UNKNOWN", disposition: "held" },
+      { fault: "lock-wrong-namespace", code: "B1_METADATA_OFF_VOLUME", disposition: "refused" },
+      { fault: "generation-wrong-namespace", code: "B1_METADATA_OFF_VOLUME", disposition: "refused" },
+      { fault: "lock-wrong-filesystem", code: "B1_METADATA_OFF_VOLUME", disposition: "refused" },
+      { fault: "generation-wrong-filesystem", code: "B1_METADATA_OFF_VOLUME", disposition: "refused" },
+      { fault: "same-metadata-inode", code: "B1_METADATA_OFF_VOLUME", disposition: "refused" },
       { fault: "wrong-self", code: "B1_SELF_IDENTITY_MISMATCH", disposition: "refused" },
       { fault: "wrong-storage", code: "B1_STORAGE_IDENTITY_MISMATCH", disposition: "refused" },
       { fault: "wrong-bootstrap", code: "B1_SELF_IDENTITY_MISMATCH", disposition: "refused" },
@@ -427,6 +652,50 @@ export function runConformance(factory: B1HarnessFactory): void {
       h.setMountFault(fault); const before = h.observe();
       await failure(() => h.ports.currentMountGeneration(h.mountRequest()), code, disposition);
       expect(h.observe()).toEqual(before);
+    });
+
+    for (const role of ["lockRelativePath", "generationRelativePath"] as const) {
+      test(`mount target ${role} must match enrollment (§4.2 S8/§5/§8.2)`, async h => {
+        await complete(h); const request = h.mountRequest(), before = h.observe();
+        await failure(() => h.ports.currentMountGeneration({ ...request, target: { ...request.target, [role]: "elsewhere" } }),
+          "B1_MOUNT_NOT_FOUND", "refused");
+        expect(h.observe()).toEqual(before);
+      });
+    }
+    test("mount custody and device reply bind independent record bytes and FD evidence (§6/§8.2)", async h => {
+      const { request } = await complete(h);
+      let previousHash: string | undefined, lockInode: string | undefined;
+      for (let i = 0; i < 2; i++) {
+        const before = h.observe(), mount = await h.ports.currentMountGeneration(h.mountRequest());
+        expect(mount.custody.acquisitionId).toBe(request.reservedAcquisitionId);
+        expect(mount.acquisitionId).toBe(request.reservedAcquisitionId);
+        const independent: unknown = JSON.parse(before.custodyRecordPayloadBytes);
+        expect(independent).toMatchObject({ storage: request.storage,
+          acquisitionId: request.reservedAcquisitionId, value: before.custodyValue });
+        expect(mount.custody.recordSha256).toBe(hash(before.custodyRecordPayloadBytes));
+        expect(h.readEvidence(mount.observation)).toMatchObject({ data: {
+          actualMount: mount.actualMount, acquisitionId: mount.acquisitionId,
+          lockFd: { role: "lock", inode: mount.custody.lockInode, deviceLifetimeId: mount.actualMount.deviceLifetimeId },
+          generationFd: { role: "generation", deviceLifetimeId: mount.actualMount.deviceLifetimeId },
+        } });
+        expect(h.readEvidence(mount.attachObservation)).toMatchObject({ data: { actual: {
+          deviceLifetimeId: mount.actualMount.deviceLifetimeId,
+        } } });
+        if (i) { expect(mount.custody.recordSha256).not.toBe(previousHash); expect(mount.custody.lockInode).toBe(lockInode); }
+        previousHash = mount.custody.recordSha256; lockInode = mount.custody.lockInode;
+        expect(h.observe()).toEqual(before);
+        if (!i) h.incrementCustody(); // Fixture M2 mutation, never performed by the port.
+      }
+    });
+    test("reused nonce cannot authenticate a changed observation (§8.1.8/§8.2)", async h => {
+      await complete(h); const request = h.mountRequest();
+      const first = await h.ports.currentMountGeneration(request), originalEvidence = h.readEvidence(first.observation);
+      h.incrementCustody(); const changed = h.observe();
+      await failure(() => h.ports.currentMountGeneration(request), "B1_INVALID_ARGUMENT", "refused");
+      expect(h.observe()).toEqual(changed); expect(h.readEvidence(first.observation)).toEqual(originalEvidence);
+      const fresh = await h.ports.currentMountGeneration(h.mountRequest());
+      expect(fresh.custody.value).toBe(changed.custodyValue);
+      expect(fresh.observation.sha256).not.toBe(first.observation.sha256); expect(h.observe()).toEqual(changed);
     });
 
     test("canonical counters retain bigint precision, and mount read never increments/reclaims custody", async h => {

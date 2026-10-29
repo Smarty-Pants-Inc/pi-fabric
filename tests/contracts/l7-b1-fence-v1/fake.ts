@@ -85,24 +85,24 @@ interface Operation {
 }
 
 export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness {
-  const id = `test-only-b1-${randomUUID()}`;
+  let id = `test-only-b1-${randomUUID()}`;
   const storage: StorageIdentity = {
     clusterUID: `${id}:cluster`, identityRecordUID: `${id}:identity`, sessionId: `${id}:session`,
     pvcUID: `${id}:pvc`, pvUID: `${id}:pv`, csiDriver: "driver.longhorn.io",
     volumeHandle: `${id}:volume`, filesystemUUID: `${id}:filesystem`,
   };
-  const oldReceiver: ReceiverIdentity = { podUID: `${id}:old-pod`, nodeUID: `${id}:old-node`, nodeName: "old-node" };
-  const receiver: ReceiverIdentity = { podUID: `${id}:receiver-pod`, nodeUID: `${id}:receiver-node`, nodeName: "receiver-node" };
+  let oldReceiver: ReceiverIdentity = { podUID: `${id}:old-pod`, nodeUID: `${id}:old-node`, nodeName: "old-node" };
+  let receiver: ReceiverIdentity = { podUID: `${id}:receiver-pod`, nodeUID: `${id}:receiver-node`, nodeName: "receiver-node" };
   const engineFor = (label: string, nodeUID: string): EngineIncarnation => ({
     engineObjectUID: `${id}:${label}-engine-object`, engineName: `${label}-engine`,
     instanceManagerPodUID: `${id}:${label}-im`, processUUID: `${id}:${label}-process`,
     nodeUID, nodeBootId: `${id}:${label}-boot`,
   });
-  const oldEngine = engineFor("old", oldReceiver.nodeUID), engine = engineFor("receiver", receiver.nodeUID);
-  const acquisitionId = `${id}:acquisition`, operationId = `${id}:operation`, reservationRevision = "7";
-  const target: ActualMountTarget = { bootstrapHandle: `${id}:authenticated-bootstrap-handle`,
+  let oldEngine = engineFor("old", oldReceiver.nodeUID), engine = engineFor("receiver", receiver.nodeUID);
+  let acquisitionId = `${id}:acquisition`, operationId = `${id}:operation`, reservationRevision = "7";
+  let target: ActualMountTarget = { bootstrapHandle: `${id}:authenticated-bootstrap-handle`,
     protectedRoot: "/test-only/protected", lockRelativePath: "custody/lock", generationRelativePath: "custody/custody.gen" };
-  const bootstrapExecutionId = `${id}:bootstrap-execution`;
+  let bootstrapExecutionId = `${id}:bootstrap-execution`;
   const evidence = new Map<string, { ref: EvidenceRef; payloadBytes: string; payload: unknown }>();
   // Bounded helper-memory replies only, not protected/controller storage or reopen durability.
   const mountReplies = new Map<string, { ref: EvidenceRef; payload: unknown }>();
@@ -118,22 +118,29 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
     uri: `test-only-memory://${id}/record/${label}`, sha256: sha256(bytes), namespace: "test-only",
     name: label, uid: `${id}:${label}`, resourceVersion: revision,
   });
-  const anchor = recordFor("previous-receipt", canonical({ kind: "test-only-previous-receipt", storage }), "6");
+  let anchor = recordFor("previous-receipt", canonical({ kind: "test-only-previous-receipt", storage }), "6");
   const newAnchor = recordFor("new-volume-seal", canonical({ kind: "test-only-new-volume-seal", storage }), "1");
-  const granted: GenerationRef = { acquisitionId: `${id}:old-acquisition`, receiver: oldReceiver,
+  let granted: GenerationRef = { acquisitionId: `${id}:old-acquisition`, receiver: oldReceiver,
     engine: oldEngine, applicationGeneration: "9007199254740992", ticketId: `${id}:old-node-ticket` };
   let volume = scenario.volume ?? "required";
   let actualPredecessors: readonly GenerationRef[] = volume === "required" ? [copy(granted)] : [];
   // Includes an ungranted/failed candidate, deliberately not just GenerationRef receivers.
   let actualPodUIDs: readonly string[] = volume === "required" ? [oldReceiver.podUID, `${id}:failed-candidate-pod`] : [];
+  const historicalNodeNames = new Set<string>();
+  const retiredCandidatePodUIDs: string[] = [];
+  const completedOperations = new Map<string, Operation>();
+  const supersededOperations = new Set<string>();
+  let actualWorkloadTaskIds: readonly string[] = volume === "required" ? [`${id}:old-task`, `${id}:old-child-task`] : [];
+  let enumeratedWorkloadTaskIds = copy(actualWorkloadTaskIds);
   const enumerationFor = (): EvidenceRef => retainEvidence("fabric.b1.inventory", {
     storage, since: volume === "required" ? anchor : newAnchor,
-    generations: actualPredecessors, podUIDs: actualPodUIDs,
+    generations: actualPredecessors, podUIDs: actualPodUIDs, workloadTasks: enumeratedWorkloadTaskIds,
+    quarantinedNodeNames: [...historicalNodeNames, oldReceiver.nodeName].sort(), retiredCandidatePodUIDs,
     oldReplicas: volume === "required" ? [`${id}:old-replica-1`, `${id}:old-replica-2`] : [],
   });
   let enumeration = enumerationFor();
-  const restartRef = retainEvidence("test-only.restart-observation", { storage, operationId });
-  const killRef = retainEvidence("test-only.kill-observation", { storage, operationId });
+  let restartRef = retainEvidence("test-only.restart-observation", { storage, operationId });
+  let killRef = retainEvidence("test-only.kill-observation", { storage, operationId });
   const plan = retainEvidence("fabric.b1.qualification", { profile: "b1-v1-observed", state: "candidate-test",
     limitation: "in-memory fixture only; no installed platform or real verifier" });
   const assurance: Assurance = { profile: "b1-v1-observed", staleDriverOperations: "not-prevented",
@@ -151,6 +158,7 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
   let attachGrant: B1Observation["attachGrant"] = null;
   let actualAttachment: B1Observation["actualAttachment"] = volume === "required" ? "predecessor" : "none";
   let receiverScheduled = false, mounted: ModelMount | undefined, contained = false;
+  let candidateAttachSubmitted = false, failNextAttach = false;
   let receiverReceipt: ReceiverReceipt | null = null, receiverReceiptPayloadBytes: string | null = null;
   let custodyValue = scenario.custodyValue ?? "9007199254740993";
   let applicationBytes = "test-only acknowledged prefix\n", loseAck = false, closed = false;
@@ -186,6 +194,10 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
     if (!facts.inventoryComplete || !same(req.predecessor, expected)) {
       fail("B1_PREDECESSOR_SET_INCOMPLETE", "held", "Request is not the independently retained complete predecessor inventory");
     }
+    // A new task cannot be covered by editing a boolean or the hashed request (§8.1.5).
+    if (!same(actualWorkloadTaskIds, enumeratedWorkloadTaskIds)) {
+      fail("B1_PREDECESSOR_SET_INCOMPLETE", "held", "New task invalidates immutable coverage; drain and transfer the held slot");
+    }
     if (!actualPodUIDs.length && volume !== "sealed-new") {
       fail("B1_PREDECESSOR_SET_INCOMPLETE", "held", "An empty inventory requires a fixture-provisioned sealed NEW anchor");
     }
@@ -198,6 +210,14 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
     }
     const bytes = semantics(req);
     if (req.requestSha256 !== sha256(bytes)) fail("B1_INVALID_ARGUMENT", "refused", "Semantic request digest mismatch");
+    const historical = completedOperations.get(req.operationId);
+    if (historical?.receipt) {
+      if (historical.semanticPayloadBytes !== bytes || historical.requestSha256 !== req.requestSha256) {
+        fail("B1_OPERATION_CONFLICT", "refused", "Historical replay changed semantic bytes");
+      }
+      return copy(historical.receipt);
+    }
+    if (supersededOperations.has(req.operationId)) fail("B1_STALE_GENERATION", "refused", "Uncommitted operation was terminally superseded under the held slot");
     if (operation) {
       if (operation.operationId !== req.operationId) {
         fail(operation.state === "committed" ? "B1_STALE_GENERATION" : "B1_OPERATION_CONFLICT", "refused", "Volume lifecycle slot remains owned by the original operation");
@@ -212,6 +232,11 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
       if (!same(req.storage, storage)) fail("B1_STORAGE_IDENTITY_MISMATCH", "refused", "Not the model's actual storage identity");
       if (req.reservedReceiver.nodeUID === oldReceiver.nodeUID || req.reservedReceiver.nodeName === oldReceiver.nodeName) {
         fail("B1_SAME_NODE_REUSE_UNQUALIFIED", "refused", "Immediate old node/ticket reuse is not qualified for B");
+      }
+      // Permanent per-volume/per-epoch keys: not just the immediate predecessor (§4.1).
+      if (historicalNodeNames.has(req.reservedReceiver.nodeName)) {
+        fail("B1_SAME_NODE_REUSE_UNQUALIFIED",
+          "refused", "Historical or failed-candidate node-name key remains quarantined");
       }
       if (req.operationId !== operationId || req.expectedControllerRevision !== reservationRevision) {
         fail("B1_STALE_GENERATION", "refused", "Request does not identify the independently reserved S1 revision");
@@ -336,6 +361,11 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
     if (!retirementStillComplete()) fail("B1_UNEXPECTED_ATTACHMENT", "held", "Independent retirement/coverage facts changed after S6");
     if (mounted) return;
     if (!facts.newReplicasAfterCut) fail("B1_MOUNT_LINEAGE_UNKNOWN", "held", "Successor cannot connect old/pre-cut replica incarnations");
+    candidateAttachSubmitted = true;
+    if (failNextAttach) {
+      failNextAttach = false; receiverScheduled = true; facts.coverageContinuous = false; progress();
+      fail("B1_DRIVER_OUTCOME_UNKNOWN", "held", "TEST-ONLY submitted S7 attach failed before engine/mount; positively reconcile before slot transfer");
+    }
     const actual: MountGeneration["actualMount"] = { bootstrapExecutionId, containerId: `${id}:receiver-container`,
       mountNamespaceInode: "4101", mountId: "5101", deviceMajorMinor: "8:32", deviceLifetimeId: `${id}:receiver-device-lifetime`,
       iqn: `${id}:iqn`, portal: "192.0.2.10:3260", lun: "1", backingSocketInode: "6101",
@@ -377,7 +407,62 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
       case "engine-changed": m.engine = engineFor("unplanned", receiver.nodeUID); break;
       case "device-reused": m.actual = { ...m.actual, deviceLifetimeId: `${id}:reused-dev-t-new-lifetime` }; break;
       case "old-replica": m.replicas = [{ id: `${id}:old-replica-1`, startedAfterCut: false }]; break;
+      case "stale-acquisition": m.acquisitionId = granted.acquisitionId; break;
+      case "foreign-acquisition": m.acquisitionId = `${id}:foreign-acquisition`; break;
+      case "attach-observation-mismatch": m.attachObservation = retainEvidence("fabric.b1.attach-observation", {
+        storage, receiver, acquisitionId, wrongCut: true,
+      }); break;
+      case "lock-wrong-namespace": if (m.lock) m.lock.namespaceInode = "foreign-namespace"; break;
+      case "generation-wrong-namespace": if (m.generation) m.generation.namespaceInode = "foreign-namespace"; break;
+      case "lock-wrong-filesystem": if (m.lock) m.lock.filesystemUUID = "foreign-filesystem"; break;
+      case "generation-wrong-filesystem": if (m.generation) m.generation.filesystemUUID = "foreign-filesystem"; break;
+      case "same-metadata-inode": if (m.lock && m.generation) m.generation.inode = m.lock.inode; break;
     }
+  };
+  // TEST-ONLY controller continuation of the design's existing state table, not a new B1 port.
+  const nextReservation = (next: ReceiverIdentity, failed: boolean): void => {
+    assertLive();
+    if (!operation || contained || (failed ? mounted !== undefined || !retirementStillComplete()
+      : !mounted || !receiverReceipt || !operation.receipt)) {
+      fail("B1_OPERATION_CONFLICT", "refused", "Slot transfer requires an attached receiver or positively drained failed candidate");
+    }
+    const previous = operation;
+    if (previous.receipt) completedOperations.set(previous.operationId, copy(previous));
+    else supersededOperations.add(previous.operationId);
+    if (failed) {
+      // No fictitious engine/GenerationRef for a candidate that never mounted (§8.2).
+      // A merely gated S1 candidate has not used a CSI key. A submitted S7 candidate has.
+      if (candidateAttachSubmitted) historicalNodeNames.add(receiver.nodeName);
+      retiredCandidatePodUIDs.push(receiver.podUID);
+      actualPodUIDs = [...actualPodUIDs, receiver.podUID];
+      if (previous.receipt) anchor = copy(previous.receipt.record);
+    } else {
+      historicalNodeNames.add(oldReceiver.nodeName);
+      oldReceiver = copy(receiver); oldEngine = copy(engine);
+      granted = { acquisitionId, receiver: copy(receiver), engine: copy(engine), applicationGeneration: custodyValue,
+        ticketId: `${id}:receiver-node-ticket` };
+      actualPredecessors = [copy(granted)]; actualPodUIDs = [receiver.podUID];
+      actualWorkloadTaskIds = [`${id}:receiver-task`, `${id}:receiver-child-task`];
+      // Above preconditions establish this controller-owned post-attach receipt.
+      if (!receiverReceipt) fail("B1_OPERATION_CONFLICT", "refused", "Attached predecessor needs retained receiver evidence");
+      anchor = copy(receiverReceipt.record);
+    }
+    // One CAS transfers the continuously held slot. Older operations remain readback/tombstones.
+    progress(); reservationRevision = revision.toString();
+    id = `${id}:next`; receiver = copy(next);
+    acquisitionId = `${id}:acquisition`; operationId = `${id}:operation`;
+    engine = engineFor("receiver", receiver.nodeUID);
+    target = { ...target, bootstrapHandle: `${id}:authenticated-bootstrap-handle` };
+    bootstrapExecutionId = `${id}:bootstrap-execution`;
+    operation = undefined; attachGrant = null; mounted = undefined; receiverReceipt = null; receiverReceiptPayloadBytes = null;
+    receiverScheduled = false; candidateAttachSubmitted = false; failNextAttach = false;
+    actualAttachment = actualPredecessors.length ? "predecessor" : "none";
+    volume = "required";
+    for (const key of factKeys) facts[key] = ["driverOutcomeKnown", "nodeReachable", "coverageContinuous", "newReplicasAfterCut"].includes(key);
+    for (const item of teardownItems) teardown[item] = false;
+    enumeratedWorkloadTaskIds = copy(actualWorkloadTaskIds); enumeration = enumerationFor();
+    restartRef = retainEvidence("test-only.restart-observation", { storage, operationId });
+    killRef = retainEvidence("test-only.kill-observation", { storage, operationId });
   };
   const observe = (): B1Observation => {
     const operationView = operation ? { operationId: operation.operationId, requestSha256: operation.requestSha256,
@@ -388,10 +473,13 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
       ? { payloadBytes: operation.payloadBytes, record: operation.receipt.record } : null;
     const evidenceView = [...evidence.values()].map(({ ref, payloadBytes }) => ({ ref, payloadBytes }));
     const view = { profile: "b1-v1-observed" as const, trustDomain: "test-only" as const,
-      controllerRevision: revision.toString(), facts, teardown, actualPredecessors, actualPodUIDs,
+      controllerRevision: revision.toString(), facts, teardown, actualPredecessors, actualPodUIDs, actualWorkloadTaskIds,
+      quarantinedNodeNames: [...new Set([...historicalNodeNames, oldReceiver.nodeName])].sort(), retiredCandidatePodUIDs,
+      reservation: { operationId, acquisitionId, receiver, revision: reservationRevision },
       operation: operationView, attachGrant, retainedReceipt, receiverReceipt, receiverReceiptPayloadBytes,
       evidence: evidenceView, actualAttachment,
-      receiverScheduled, receiverMounted: mounted !== undefined, contained, custodyValue, applicationBytes };
+      receiverScheduled, receiverMounted: mounted !== undefined, candidateAttachSubmitted, contained, custodyValue,
+      custodyRecordPayloadBytes: canonical({ storage, acquisitionId, value: custodyValue }), applicationBytes };
     return copy({ ...view, storageSnapshot: canonical({ ...view, mounted: mounted ? {
       ...mounted, lock: mounted.lock ?? null, generation: mounted.generation ?? null,
     } : null, volume }) });
@@ -410,6 +498,12 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
     observe,
     setFact(key, value) { assertLive(); facts[key] = value; },
     setTeardown(item, value) { assertLive(); teardown[item] = value; },
+    discoverWorkloadTask() {
+      assertLive(); actualWorkloadTaskIds = [...actualWorkloadTaskIds, `${id}:new-task-${actualWorkloadTaskIds.length}`];
+      facts.inventoryComplete = false; // Immutable enumeration/semantic request is intentionally unchanged.
+    },
+    reserveNextReceiver(next) { nextReservation(next, false); },
+    retireFailedCandidateAndReserve(next) { nextReservation(next, true); },
     completeRetirement() {
       assertLive();
       for (const key of factKeys) facts[key] = true;
@@ -419,9 +513,11 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
     provisionNewVolume(sealed) {
       assertLive(); if (operation) fail("B1_OPERATION_CONFLICT", "refused", "NEW fixture provisioning cannot replace retained REQUIRED/operation history");
       volume = sealed ? "sealed-new" : "unsealed-new"; actualPredecessors = []; actualPodUIDs = [];
+      actualWorkloadTaskIds = []; enumeratedWorkloadTaskIds = [];
       enumeration = enumerationFor(); actualAttachment = "none";
     },
     attachReservedReceiver: attach,
+    failNextReceiverAttach() { assertLive(); failNextAttach = true; },
     setMountFault: mountFault,
     setCustodyValue(value) { assertLive(); custodyValue = value; },
     incrementCustody() { assertLive(); custodyValue = (canonicalCounter(custodyValue) + 1n).toString(); },

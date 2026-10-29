@@ -13,7 +13,10 @@ export type B1MountFault =
   | "wrong-self" | "wrong-storage" | "wrong-bootstrap" | "wrong-root"
   | "lineage-unknown" | "lock-off-volume" | "generation-off-volume"
   | "lock-fd-missing" | "generation-fd-missing" | "stale-observation"
-  | "observer-unavailable" | "engine-changed" | "device-reused" | "old-replica";
+  | "observer-unavailable" | "engine-changed" | "device-reused" | "old-replica"
+  | "stale-acquisition" | "foreign-acquisition" | "attach-observation-mismatch"
+  | "lock-wrong-namespace" | "generation-wrong-namespace"
+  | "lock-wrong-filesystem" | "generation-wrong-filesystem" | "same-metadata-inode";
 
 /** Only fixture provisioning. No option can select or simulate A assurance. */
 export interface B1Scenario {
@@ -31,6 +34,13 @@ export interface B1Observation {
   readonly teardown: Readonly<Record<B1TeardownItem, boolean>>;
   readonly actualPredecessors: readonly GenerationRef[];
   readonly actualPodUIDs: readonly string[];
+  readonly actualWorkloadTaskIds: readonly string[];
+  /** Per-volume node-name keys retained for this operating epoch (§4.1/§9 #4). */
+  readonly quarantinedNodeNames: readonly string[];
+  readonly retiredCandidatePodUIDs: readonly string[];
+  readonly reservation: Readonly<{
+    operationId: string; acquisitionId: string; receiver: ReceiverIdentity; revision: string;
+  }>;
   readonly operation: Readonly<{
     operationId: string;
     requestSha256: string;
@@ -57,8 +67,11 @@ export interface B1Observation {
   readonly actualAttachment: "predecessor" | "none" | "receiver";
   readonly receiverScheduled: boolean;
   readonly receiverMounted: boolean;
+  readonly candidateAttachSubmitted: boolean;
   readonly contained: boolean;
   readonly custodyValue: string;
+  /** Independently provisioned fixture bytes, not reconstructed from a port reply. */
+  readonly custodyRecordPayloadBytes: string;
   readonly applicationBytes: string;
   /** Exact model storage/topology fingerprint, not an authoritative production read. */
   readonly storageSnapshot: string;
@@ -72,12 +85,23 @@ export interface B1Harness {
   observe(): B1Observation;
   setFact(fact: B1Fact, value: boolean): void;
   setTeardown(item: B1TeardownItem, value: boolean): void;
+  /** Adds a real model task without rewriting the immutable request's coverage. */
+  discoverWorkloadTask(): void;
+  /** Controller fixture S0–S3 for another handover, retaining per-volume history. */
+  reserveNextReceiver(receiver: ReceiverIdentity): void;
+  /** Positive executor drain + terminal Pod retirement + atomic slot transfer.
+   * Models a failed candidate's plausibly submitted node key, even without an engine.
+   * Requires independently complete retirement; never an operator-safe port override. */
+  retireFailedCandidateAndReserve(receiver: ReceiverIdentity): void;
   /** Fixture-only independent observations; no port call fabricates these facts. */
   completeRetirement(): void;
   /** Before the operation only: provision an explicitly NEW empty volume fixture. */
   provisionNewVolume(sealed: boolean): void;
   /** Simulates the controller-owned S7 path, requires the exact committed S6 grant. */
   attachReservedReceiver(): void;
+  /** Next S7 actually submits a candidate's raw attach but fails before an engine/mount.
+   * Retirement observations must be completed again before terminal slot transfer. */
+  failNextReceiverAttach(): void;
   /** One topology/provenance corruption of the already-mounted receiver fixture. */
   setMountFault(fault: B1MountFault): void;
   /** On-volume fixture controls, NEVER performed by either read-only mount call. */

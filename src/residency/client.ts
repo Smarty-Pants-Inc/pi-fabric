@@ -30,7 +30,7 @@ import {
 } from "./handover.js";
 import { kernelFenceAvailable } from "./file-lock.js";
 import { assertNoWatchdogCustody } from "./watchdog-custody.js";
-import { runTreeExitVeto, runTreeResourceVeto } from "../storage/retention.js";
+import { runTreeExitVeto, runTreeRemovalVeto, runTreeResourceVeto } from "../storage/retention.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, meshOutageAlarmSink, type MeshStateEntry } from "../mesh/store.js";
@@ -910,7 +910,7 @@ export class ResidencyClient {
         commit();
       }
       throwIfAborted(signal);
-      if (runDirectoryPresent) fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
+      if (runDirectoryPresent && !runTreeRemovalVeto(metadata.runDirectory)) fs.rmSync(metadata.runDirectory, { recursive: true, force: true });
       fs.rmSync(this.#metadataPath(metadata.id), { force: true });
       fs.rmSync(residentResultPath(this.options.config.residencyRoot, metadata.id), { force: true });
       this.#completions.forget(metadata.id);

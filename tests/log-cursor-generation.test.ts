@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readJsonlPage, readJsonlPageFromDescriptor } from "../src/log-tail.js";
@@ -6,9 +7,7 @@ import { compactTerminalRunLog } from "../src/worker/run-log.js";
 
 const roots: string[] = [];
 const logFile = (text: string): string => {
-  const scratch = path.resolve(".local");
-  fs.mkdirSync(scratch, { recursive: true });
-  const root = fs.mkdtempSync(path.join(scratch, "log-cursor-test-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "log-cursor-test-"));
   roots.push(root);
   const file = path.join(root, "events.jsonl");
   fs.writeFileSync(file, text);
@@ -99,7 +98,9 @@ describe("generation-bound byte log cursors", () => {
             }
           } finally { rename?.mockRestore(); sleep?.mockRestore(); }
           expect(fs.readFileSync(file, "utf8")).toBe(original);
-          expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+          // Failed replacement retains both names for the exact original inode.
+          expect(fs.readdirSync(path.dirname(file)).sort()).toEqual(["events.jsonl", "events.jsonl.original"]);
+          expect(fs.readFileSync(`${file}.original`, "utf8")).toBe(original);
           expect(indices(boundPage(file, latest))).toEqual(indices(readJsonlPageFromDescriptor(held!, 2, latest.before)));
           fs.closeSync(held!);
           held = undefined;
@@ -113,6 +114,7 @@ describe("generation-bound byte log cursors", () => {
           const oldPage = readJsonlPageFromDescriptor(held, 10, undefined, undefined, undefined, latest.generation);
           expect(oldPage.lines.map((line) => line.raw).join("\n") + "\n").toBe(original);
         }
+        expect(fs.readFileSync(`${file}.original`, "utf8")).toBe(original);
         expect(readJsonlPage(file, 10).generation).not.toBe(latest.generation);
         // A bare legacy offset cannot identify the replaced inode. It remains accepted,
         // but its response carries only the current generation, not a safety claim.

@@ -147,8 +147,10 @@ import { ownedStat, processAlive } from "../storage/scratch.js";
 import {
   canRemoveManagedRunRoot,
   canRemoveTerminalRun,
+  isSettledTerminalRun,
   hasUnresolvedWorker,
   runTreeExitVeto,
+  runTreeRemovalVeto,
   runTreeResourceVeto,
   markUnresolvedWorker,
   heartbeatRunRoot,
@@ -3726,7 +3728,7 @@ export class AgentManager {
         // cannot make this committed source uncollectible on a later sweep.
         const directory = path.join(this.#runRoot, queued.info.id);
         if ((!fs.existsSync(path.join(directory, "status.json")) ||
-            (readRecord(path.join(directory, "status.json")) as AgentRunRecord & { queuedArchiveCommitted?: boolean } | undefined)?.queuedArchiveCommitted) && !runTreeExitVeto(directory)) {
+            (readRecord(path.join(directory, "status.json")) as AgentRunRecord & { queuedArchiveCommitted?: boolean } | undefined)?.queuedArchiveCommitted) && !runTreeRemovalVeto(directory)) {
           writeJsonAtomic(path.join(directory, "status.json"), { id: queued.info.id, status: queued.terminal.status, queuedArchiveCommitted: true,
             startedAt: queued.terminal.startedAt, updatedAt: queued.terminal.updatedAt, finishedAt: queued.terminal.finishedAt }, { durable: true });
           try {
@@ -4440,7 +4442,7 @@ export class AgentManager {
         // establish exit; a terminal record with no PID is still uncertain.
         const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
           ? Number(record.sessionId) : undefined;
-        if (pid !== undefined && !processAlive(pid) && !runTreeExitVeto(run, 0, expired, true) && canRemoveTerminalRun(run, expired)) continue;
+        if (pid !== undefined && !processAlive(pid) && !runTreeExitVeto(run, 0, expired, true) && isSettledTerminalRun(run, expired)) continue;
         const actorId = record?.actorId;
         if (typeof actorId === "string" && /^[A-Za-z0-9_-]+$/.test(actorId)) protect(entry.name, actorId);
         else refs.add("*");
@@ -4587,7 +4589,7 @@ export class AgentManager {
                   held: !(pid !== undefined && !processAlive(pid) &&
                     (yield* proof(() => boundedRunTree(run, expired))) &&
                     (yield* proof(() => !runTreeExitVeto(run, 0, expired, true))) &&
-                    (yield* proof(() => canRemoveTerminalRun(run, expired)))) };
+                    (yield* proof(() => isSettledTerminalRun(run, expired)))) };
                 this.#retentionSliceHint = undefined;
                 if (!incomplete) this.#retentionWatermark.set(entry.name, prepared);
                 index(entry.name, prepared.actorId);
@@ -4627,7 +4629,7 @@ export class AgentManager {
     syncDirectoryChain(directory);
     // A restarted owner has no live handle, but the saved native exit and all
     // other archive fences still govern collection of this exact source.
-    if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await removeTree(directory);
+    if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeRemovalVeto(directory, 0, undefined, true)) await removeTree(directory);
   }
   /** Recover only this actor's fenced sources under the configured host run root. */
   actorArchiveSources(actorId: string, sessionFile: string): Map<string, string> {
@@ -4994,12 +4996,12 @@ export class AgentManager {
       const exitVeto = runTreeExitVeto(runDirectory);
       if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
       this.#onResultConsumed?.(id);
-      const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
-      if (!this.config.retainRuns) await removeTree(runDirectory);
+      await this.#worktrees.cleanup(id, deleteBranch);
+      if (!this.config.retainRuns && !runTreeRemovalVeto(runDirectory)) await removeTree(runDirectory);
       this.#queued.delete(id);
       this.#forgetRunMetadata(id);
       this.#invalidateUiList();
-      return { cleaned: cleaned || !fs.existsSync(runDirectory) };
+      return { cleaned: true };
     }
     const managed = this.#requireRun(id);
     if (!managed.settled) throw new Error("Cannot clean up a running agent");
@@ -5031,15 +5033,15 @@ export class AgentManager {
       throw new Error(`Cannot clean up agent ${id}: ${uncheckedExternalExit(managed.transport) ? "external transport has no checked worker exit receipt" : managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
     }
     this.markForeground(id);
-    const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
-    if (!this.config.retainRuns) {
+    await this.#worktrees.cleanup(id, deleteBranch);
+    if (!this.config.retainRuns && !runTreeRemovalVeto(managed.runDirectory)) {
       await removeTree(managed.runDirectory);
     }
     this.#runs.delete(id);
     this.#forgetRunMetadata(id);
     this.#pruneRetainedUiRecords();
     this.#invalidateUiList();
-    return { cleaned: cleaned || !fs.existsSync(managed.runDirectory) };
+    return { cleaned: true };
   }
 
   readLog(id: string, opts: { lines?: number; before?: number; beforeGeneration?: string } = {}): FabricAgentLog {
@@ -5505,7 +5507,8 @@ export class AgentManager {
           if (this.#onStoppedAtClose) for (const result of results) {
             const directory = path.join(this.#runRoot, result.id);
             this.#commitArchive(directory, result, "shutdown");
-            if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure && !fs.existsSync(path.join(directory, "status.json"))) fs.rmSync(directory, { recursive: true, force: true });
+            if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure &&
+                !fs.existsSync(path.join(directory, "status.json")) && !runTreeRemovalVeto(directory)) fs.rmSync(directory, { recursive: true, force: true });
           }
           break;
         }
@@ -5549,6 +5552,7 @@ export class AgentManager {
           // explicit roots: an unexpected loss keeps custody and a loud refusal.
           if (managed.settledResultFile && !this.#exactResultPresent(managed)) return;
           if (await this.#retainTerminalPromptRecord(managed).catch(() => true)) return;
+          if (runTreeRemovalVeto(managed.runDirectory)) return;
           try { await removeTree(managed.runDirectory); } catch { return; } // A swallowed failure is no provenance.
           // A no-op removal or remaining/dangling entry is not collection.
           if (managed.settledResultFile && pathAbsentNoFollow(managed.settledResultFile)) managed.resultCollected = true;
@@ -5570,7 +5574,7 @@ export class AgentManager {
           // All tracked transports are confirmed exited above; untracked runs stay put.
           await Promise.all([...this.#queued.values()]
             .filter(queued => queued.terminal && !queued.routeSaveFailure && !queued.cleanupPending &&
-              !runTreeExitVeto(path.join(this.#runRoot, queued.info.id)))
+              !runTreeRemovalVeto(path.join(this.#runRoot, queued.info.id)))
             .map(queued => removeTree(path.join(this.#runRoot, queued.info.id)).catch(() => undefined)));
           // Independently collectible tracked runs were removed above. Retry only
           // the owned empty root; never recursively remove unknown contents.
@@ -7282,11 +7286,12 @@ export class AgentManager {
     // artifact. A verified current task.txt and status.json are the complete
     // retained proof; a mismatch drops task.txt. The manager's exact outcome stays
     // beside status.json with only its task fields removed; every other field is
-    // kept uncompacted. status.json stays compact and taskless.
+    // kept uncompacted. status.json stays compact and taskless. The exact original
+    // event log remains a permanent deletion fence, including during prompt pruning.
     if (keepResult && resultFile) managed.resultFingerprint = writePrivateJsonAtomic(resultFile, omitRetainedTasks(record));
     writeJsonAtomic(managed.statusFile, omitRetainedTasks(compactUiRecord(this.#withTransportMetadata(record, managed, false))), { space: 2 });
     for (const entry of fs.readdirSync(managed.runDirectory)) {
-      if (entry === "status.json" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
+      if (entry === "status.json" || entry === "events.jsonl.original" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
       await removeTree(path.join(managed.runDirectory, entry));
     }
     // Once an unsuccessful run has a retained status, never fall back to deleting its

@@ -3,8 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { compactTerminalRunLog } from "../src/worker/run-log.js";
-import { canRemoveTerminalRun, compactTerminalRunEvents, pruneActorRunArchives, runTreeExitVeto,
-  runTreeResourceVeto } from "../src/storage/retention.js";
+import { canRemoveTerminalRun, compactTerminalRunEvents, isSettledTerminalRun, pruneActorRunArchives,
+  removeUnreferencedRun, runTreeExitVeto, runTreeRemovalVeto, runTreeResourceVeto, sweepTempRunRoots } from "../src/storage/retention.js";
 import { ResidentRequestRetention, sweepResidentRuns } from "../src/residency/retention.js";
 
 const roots: string[] = [];
@@ -121,6 +121,46 @@ describe("terminal run-log raw-byte preservation", () => {
   });
 });
 
+describe("retained-original namespace durability", () => {
+  it.skipIf(process.platform === "win32")("syncs the retained link's directory before publishing the compacted view", () => {
+    const { file, original } = fixture();
+    const sync = fs.fsyncSync;
+    const rename = fs.renameSync;
+    let directorySynced = false;
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fs.fstatSync(fd).isDirectory()) {
+        expect(fs.readFileSync(`${file}.original`)).toEqual(original);
+        directorySynced = true;
+      }
+      sync(fd);
+    });
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      expect(directorySynced).toBe(true);
+      rename(from, to);
+    });
+    // This test asserts durable ordering, not the independent elapsed-work ceiling.
+    vi.spyOn(performance, "now").mockReturnValue(0);
+    expect(compactTerminalRunLog(file, "completed").compacted).toBe(1);
+  });
+
+  it.skipIf(process.platform === "win32")("retains both full-log names when the directory barrier fails", () => {
+    const { file, original } = fixture();
+    const sync = fs.fsyncSync;
+    vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (fs.fstatSync(fd).isDirectory()) throw new Error("synthetic directory sync failure");
+      sync(fd);
+    });
+    const rename = vi.spyOn(fs, "renameSync");
+    expect(compactTerminalRunLog(file, "completed")).toMatchObject({ compacted: 0,
+      error: "synthetic directory sync failure" });
+    expect(rename).not.toHaveBeenCalled();
+    expect(fs.readFileSync(file)).toEqual(original);
+    expect(fs.readFileSync(`${file}.original`)).toEqual(original);
+    expect(fs.statSync(file).nlink).toBe(2);
+    expect(fs.statSync(`${file}.original`).ino).toBe(fs.statSync(file).ino);
+  });
+});
+
 // Exercise the actual filesystem retention entry points, not mock call counts.
 // The positive control proves terminal/exit custody would otherwise permit collection.
 describe("retention of original run logs", () => {
@@ -144,13 +184,21 @@ describe("retention of original run logs", () => {
   it("vetoes event-tail compaction and actor run pruning without changing resource cleanup", () => {
     const { runs, run, events, original } = retained();
     const compacted = fs.readFileSync(events);
-    expect(runTreeExitVeto(run)).toBe("original run log is retained");
+    expect(runTreeExitVeto(run)).toBeUndefined();
+    expect(runTreeRemovalVeto(run)).toBe("original run log is retained");
     expect(runTreeResourceVeto(run)).toBeUndefined();
+    expect(isSettledTerminalRun(run)).toBe(true);
     expect(canRemoveTerminalRun(run)).toBe(false);
     expect(compactTerminalRunEvents(run, { now, terminalRunEventsAgeMs: 0,
       terminalRunEventsMaxBytes: 100 })).toBe(false);
     expect(pruneActorRunArchives({ runsDirectory: runs, now, retentionMs: 0 })).toEqual([]);
     expect(fs.readFileSync(events)).toEqual(compacted);
+    expect(fs.readFileSync(`${events}.original`)).toEqual(original);
+  });
+
+  it("keeps originals at the shared run-tree removal entry point", () => {
+    const { run, events, original } = retained();
+    expect(removeUnreferencedRun(run, fs.statSync(run))).toBe(false);
     expect(fs.readFileSync(`${events}.original`)).toEqual(original);
   });
 
@@ -166,13 +214,29 @@ describe("retention of original run logs", () => {
     expect(fs.readFileSync(`${events}.original`)).toEqual(original);
   });
 
+  it("keeps originals through closed temporary-root retention", () => {
+    const { root, run, original } = retained();
+    const tempRoot = path.join(root, "temp");
+    const managedRoot = path.join(tempRoot, "pi-fabric-runs-retained");
+    fs.mkdirSync(managedRoot, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(managedRoot, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647,
+      startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }), { mode: 0o600 });
+    const managedRun = path.join(managedRoot, "history");
+    fs.renameSync(run, managedRun);
+    expect(sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 }))
+      .toEqual({ removedRuns: [], removedRoots: [] });
+    expect(fs.readFileSync(path.join(managedRun, "events.jsonl.original"))).toEqual(original);
+  });
+
   it("propagates retained-original custody from a nested run to its parent", () => {
     const { root, run, events, original } = retained();
     const parent = path.join(root, "parent");
     fs.mkdirSync(path.join(parent, "nested"), { recursive: true });
     fs.writeFileSync(path.join(parent, "status.json"), fs.readFileSync(path.join(run, "status.json")));
     fs.renameSync(run, path.join(parent, "nested", "child"));
-    expect(runTreeExitVeto(parent)).toBe("original run log is retained");
+    expect(runTreeExitVeto(parent)).toBeUndefined();
+    expect(runTreeRemovalVeto(parent)).toBe("original run log is retained");
+    expect(isSettledTerminalRun(parent)).toBe(true);
     expect(canRemoveTerminalRun(parent)).toBe(false);
     expect(fs.readFileSync(path.join(parent, "nested", "child", path.basename(`${events}.original`)))).toEqual(original);
   });

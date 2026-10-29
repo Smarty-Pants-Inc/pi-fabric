@@ -34,8 +34,11 @@ const realpathWithMissingTail = (file: string): string => {
   }
 };
 
-/** Caller-owned scratch/state wins over even an explicitly declared shared mount. */
-export const placementLocalPathReason = (cwd: string, config: AgentPlacementConfig): string | undefined => {
+/** Caller-owned scratch/state wins over shared mounts and source staging.
+ * Source staging skips only the shared-mount requirement; the caller must still
+ * validate that --src will use the Git manifest, never recursive copying.
+ */
+export const placementLocalPathReason = (cwd: string, config: AgentPlacementConfig, stagesSource = false): string | undefined => {
   if (!path.isAbsolute(cwd)) return undefined;
   const localReason = `caller-local cwd requires the local worker: ${cwd}`;
   const localRoots = [process.env.TMPDIR || os.tmpdir(), "/srv/scratch", path.join(os.homedir(), ".local", "state")]
@@ -54,6 +57,7 @@ export const placementLocalPathReason = (cwd: string, config: AgentPlacementConf
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     return `caller-local cwd cannot be inspected safely: ${cwd}`;
   }
+  if (stagesSource) return undefined;
   for (const root of config.sharedMounts ?? []) {
     if (!path.isAbsolute(root)) continue;
     try {

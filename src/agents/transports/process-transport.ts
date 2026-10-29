@@ -338,14 +338,18 @@ export class ProcessTransport implements AgentTransportAdapter {
         : placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
       if (!reason) reason = agentPlacementProbe(placement, request.cwd).reason;
+      const separator = placement.command.indexOf("--");
+      const stagesSource = placement.command.slice(0, separator < 0 ? undefined : separator)
+        .some((entry, index, options) => entry === "--src" && options[index + 1] === "{cwd}");
       if (!reason) {
         const { placementLocalPathReason } = await import("./placement.js");
-        reason = placementLocalPathReason(request.cwd, placement);
+        reason = placementLocalPathReason(request.cwd, placement, stagesSource);
       }
-      // --src ships the Main's workspace, unlike --cwd which names a target-local
-      // lane. Require the launcher's tracked/unignored manifest branch; home,
-      // non-Git and ignored roots must never enter its recursive-copy branch.
-      if (!reason && placement.command.some((entry, index) => entry === "--src" && placement.command[index + 1] === "{cwd}")) {
+      // --src ships the Main's workspace without a shared mount, unlike --cwd
+      // which names a target-local lane. After the scratch/state fences, require
+      // the launcher's tracked/unignored manifest branch; home, non-Git and
+      // ignored roots must never enter its recursive-copy branch.
+      if (!reason && stagesSource) {
         try {
           const cwd = fs.realpathSync(request.cwd);
           if (cwd === path.parse(cwd).root || cwd === fs.realpathSync(os.homedir())) throw new Error("home or root source");

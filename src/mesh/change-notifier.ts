@@ -6,11 +6,14 @@ export type BridgeChange = "events" | "presence" | "lease";
 /** Directory watches survive atomic file replacement. The root watch also discovers/rebinds
  * lease and participant directories: watching their old inode alone loses a mkdir/rename.
  * Notifications are hints, not authority; the bridge still reads/fences canonical snapshots.
- * There is deliberately no polling fallback on filesystems without working watches. */
+ * There is deliberately no polling fallback on filesystems without working watches.
+ * Presence interest filters content hints before metadata work, never structural rebinds;
+ * state-file hints retain the legacy "presence" kind and are always delivered. */
 export const watchBridgeStore = (
   root: string,
   changed: (kind: BridgeChange) => void,
   failed: (error: Error) => void,
+  presenceRelevant: () => boolean = () => true,
 ): (() => void) => {
   let closed = false;
   const children = new Map<string, { identity: string; watcher: fs.FSWatcher }>();
@@ -39,7 +42,7 @@ export const watchBridgeStore = (
   const open = (directory: string, callback: (name: string | null) => void): fs.FSWatcher => {
     const watcher = fs.watch(directory, (_event, name) => {
       if (closed) return;
-      try { callback(name === null ? null : String(name)); } catch (error) { fail(error); }
+      try { callback(name == null ? null : String(name)); } catch (error) { fail(error); }
     });
     watcher.on("error", fail);
     return watcher;
@@ -54,8 +57,9 @@ export const watchBridgeStore = (
     if (current === undefined) return; // root watch catches its creation; snapshot catches its contents
     try {
       const watcher = open(directory, (file) => {
+        if (file !== null && file !== name && (!file.endsWith(".json") || !presenceRelevant())) return;
         bind(name);
-        if (file === null || file === name || file.endsWith(".json")) changed("presence");
+        if (presenceRelevant()) changed("presence");
       });
       children.set(name, { identity: current, watcher });
     } catch (error) {
@@ -66,16 +70,22 @@ export const watchBridgeStore = (
   try {
     const rootIdentity = identity(root);
     if (rootIdentity === undefined) throw new Error("mesh root does not exist");
+    const rootName = path.basename(path.resolve(root));
     rootWatcher = open(root, (name) => {
+      const presence = name === null || name === "participants" || name === "host-leases";
+      const events = name === null || name === "events.jsonl" || name === "generation";
+      const state = name === null || name === "state.json" || name === "state.db" || name === "state.db-wal" || name === "state.db-journal";
+      // Ignore cursor, temporary, lock, journal/signal and outbox sidecars BEFORE stat.
+      // Linux self-rename hints name the root itself; Windows can omit the name or emit an error.
+      if (!presence && !events && !state && name !== rootName) return;
       if (identity(root) !== rootIdentity) throw new Error("mesh root was removed or replaced; reconnect the bridge");
-      if (name === null || name === "participants" || name === "host-leases") {
+      if (presence) {
         bind("participants");
         bind("host-leases");
-        changed("presence");
+        if (presenceRelevant()) changed("presence");
       }
-      if (name === null || name === "events.jsonl" || name === "generation") changed("events");
-      if (name === null || name === "state.json" || name === "state.db" || name === "state.db-wal" || name === "state.db-journal") changed("presence");
-      // Ignore cursor, temporary, lock, journal/signal and outbox sidecar writes.
+      if (events) changed("events");
+      if (state) changed("presence");
     });
     bind("participants");
     bind("host-leases");

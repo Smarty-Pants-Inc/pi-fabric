@@ -72,6 +72,12 @@ export class LifecycleBroker {
   #pollScheduled = false;
   /** A wake arrived that no completed drain has served yet (notification, failed or gated drain). */
   #dirty = false;
+  /** An unread event needs a target that presence may make available; idle heartbeats otherwise do not drain. */
+  #waitingForPresence = false;
+  /** Targets skipped before publication; only a local in-memory publication change makes their presence relevant. */
+  readonly #unpublishedTargets = new Set<string>();
+  /** Last observed lifecycle-subscription projection, not the whole shared state. */
+  #subscriptionProjection: string | undefined;
   /** The drain loop is active; a wake during it only sets #dirty and the loop runs again. */
   #draining = false;
   /** The current drain swallowed a failure (delivery, cursor or receipt write) and left work behind. */
@@ -108,20 +114,29 @@ export class LifecycleBroker {
     this.#armWatch();
     // A subscription may become visible here only when the state projector catches up, after its event's
     // file wake was already drained against the stale view: that projection wakes a fresh drain.
-    this.#stopStateChanges ??= this.mesh.subscribeStateChanges(() => this.#wake());
+    this.#stopStateChanges ??= this.mesh.subscribeStateChanges(() => this.#stateProjectionChanged());
     this.#wake();
   }
 
   #armWatch(): void {
     if (this.#closed || this.#stopWatch) return;
     try {
-      this.#stopWatch = watchBridgeStore(this.mesh.root, () => {
+      this.#stopWatch = watchBridgeStore(this.mesh.root, (kind) => {
         this.#rearmAttempts = 0; // a delivered notification proves the watch works
-        this.#wake();
-      }, (error) => this.#watchFailed(error));
+        if (kind === "events") this.#wake();
+        else this.#stateProjectionChanged(); // state files retain the legacy presence kind
+      }, (error) => this.#watchFailed(error), () => this.#presenceRelevant());
     } catch (error) {
       this.#watchFailed(error);
     }
+  }
+
+  #presenceRelevant(): boolean {
+    if (this.#dirty || this.#draining || this.#waitingForPresence) return true;
+    // publishes() reads only the directory's local publication map, not fleet presence files.
+    // Bootstrap/source refresh can publish a previously skipped target without changing its subscription.
+    for (const id of this.#unpublishedTargets) if (this.participants.publishes?.(id) !== false) return true;
+    return false;
   }
 
   // One rescan plus bounded re-arms; exhaustion retains the shared degraded-only carrier.
@@ -152,6 +167,20 @@ export class LifecycleBroker {
       if (this.#stopWatch) this.#wake(); // notifications may have been missed while unarmed
     }, delay);
     this.#rearmTimer.unref?.();
+  }
+
+  #stateProjectionChanged(): void {
+    if (this.#presenceRelevant()) { this.#wake(); return; }
+    try {
+      // A file/DB/WAL hint may be the only notification of another writer's subscription commit.
+      // Bypass the file read-cache window, but compare only the canonical subscription projection.
+      const projection = JSON.stringify(this.mesh.listAllShared(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX, { fresh: true }));
+      if (projection === this.#subscriptionProjection) return;
+      this.#subscriptionProjection = projection;
+    } catch {
+      // A failed observation must reach the normal contained drain/retry path, not lose the hint.
+    }
+    this.#wake();
   }
 
   #wake(): void {
@@ -426,6 +455,9 @@ export class LifecycleBroker {
 
   async #drain(): Promise<void> {
     const entries = this.mesh.listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX);
+    this.#subscriptionProjection = JSON.stringify(entries);
+    this.#waitingForPresence = false;
+    this.#unpublishedTargets.clear();
     const listed = new Set<string>();
     let latestSequence: number | undefined;
     // One directory rebuild serves every subscription in this cycle that still
@@ -445,14 +477,17 @@ export class LifecycleBroker {
       // memory) and caught-up subscriptions before the directory read: that read parses every
       // participant and host record, and ran for every subscription on every poll of every
       // host, about a quarter of a core per idle Pi on the fleet mesh (smarty-dev#557).
-      if (this.participants.publishes?.(subscription.to) === false) continue;
+      if (this.participants.publishes?.(subscription.to) === false) {
+        this.#unpublishedTargets.add(subscription.to);
+        continue;
+      }
       latestSequence ??= this.mesh.latestSequence();
       if (latestSequence <= this.#cursor(subscription)) continue;
       directory ??= new Map(
         this.participants.list({ scope: "project" }).map((record) => [record.id, record]),
       );
       const target = directory.get(subscription.to) ?? this.participants.get(subscription.to);
-      if (!target || target.stale || !target.local) continue;
+      if (!target || target.stale || !target.local) { this.#waitingForPresence = true; continue; }
       if (this.#paused) return;
       await this.#drainSubscription(entry, subscription);
       if (this.#paused) return;

@@ -188,11 +188,13 @@ export const reconcilePending = async (
   });
 };
 
-/** Read only an acknowledged original result under a verified physical alias.
+/** Authenticate the canonical ledger original and physical alias independently
+ * of a recovery descriptor's hash. A joined native message has its OWN exact
+ * JSON.stringify hash; callers must check that separate hash in its own domain.
  * Parent IDs are join references, never aliases authorizing a fabricated parent
  * return. In particular this cannot reconstruct an unevaluated JS final value. */
-const readResultRecord = async (
-  owner: RecoveryOwner, store: EffectStore, key: string, toolCallId: string, resultBytesHash: string,
+export const readEffectResultRecord = async (
+  owner: RecoveryOwner, store: EffectStore, key: string, toolCallId: string,
 ) => {
   if (store.owner !== owner) throw new EffectContractError("EFFECT_OWNER_MISMATCH", "Result lookup must use the bound recovery capability");
   return store.withSession("settle", transaction => {
@@ -201,15 +203,22 @@ const readResultRecord = async (
       throw new EffectContractError("EFFECT_CALL_ALIAS_MISMATCH", "Tool call is not a recorded physical alias for this effect");
     }
     const result = resultTransition(record);
-    if (!result || result.result === undefined || result.resultBytesHash !== resultBytesHash || sha256Bytes(canonicalEncode(result.result)) !== resultBytesHash) {
-      throw new EffectContractError("EFFECT_RESULT_UNAVAILABLE", "No acknowledged original result matches this call/hash");
+    if (!result || result.result === undefined || result.resultBytesHash === undefined ||
+        sha256Bytes(canonicalEncode(result.result)) !== result.resultBytesHash) {
+      throw new EffectContractError("EFFECT_RESULT_UNAVAILABLE", "No acknowledged original result has verified canonical ledger bytes");
     }
     return { record, result };
   });
 };
 export const readEffectResult = async (
   owner: RecoveryOwner, store: EffectStore, key: string, toolCallId: string, resultBytesHash: string,
-): Promise<EffectResult> => (await readResultRecord(owner, store, key, toolCallId, resultBytesHash)).result.result!;
+): Promise<EffectResult> => {
+  const { result } = await readEffectResultRecord(owner, store, key, toolCallId);
+  if (result.resultBytesHash !== resultBytesHash) {
+    throw new EffectContractError("EFFECT_RESULT_UNAVAILABLE", "No acknowledged original result matches this call/hash");
+  }
+  return result.result!;
+};
 
 /** B3's readToolResult(effect) is bound to one session runtime. Return only a
  * complete original native message; do not invent IDs, timestamps, parent
@@ -220,7 +229,10 @@ export const readToolResult = async (
   if (effect.outcome === "uncertain" || effect.resultBytesHash === undefined) {
     throw new EffectContractError("EFFECT_RESULT_UNAVAILABLE", "An uncertain or unhashed effect has no repairable original native result");
   }
-  const { record, result } = await readResultRecord(owner, store, effect.key, effect.toolCallId, effect.resultBytesHash);
+  const { record, result } = await readEffectResultRecord(owner, store, effect.key, effect.toolCallId);
+  if (result.resultBytesHash !== effect.resultBytesHash) {
+    throw new EffectContractError("EFFECT_RESULT_UNAVAILABLE", "No acknowledged original result matches this call/hash");
+  }
   if (result.outcome !== effect.outcome) throw new EffectContractError("EFFECT_RESULT_OUTCOME_MISMATCH", "Settlement descriptor differs from the original durable outcome");
   const parent = record.intent.tool.originalToolCallId === effect.toolCallId ? record.intent.tool.parentToolCallId :
     record.transitions.find(row => row.toolCallId === effect.toolCallId)?.parentToolCallId;

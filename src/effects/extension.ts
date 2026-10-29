@@ -11,7 +11,7 @@ import type {
 } from "./contracts.js";
 import { canonicalEncode, mintEffectKey, resolveEffectSlot, sha256Bytes } from "./slots.js";
 import { EffectStore } from "./store.js";
-import { createEffectReconciler, readEffectResult } from "./reconcile.js";
+import { createEffectReconciler, readEffectResultRecord } from "./reconcile.js";
 import { prepareFileEffect, reconcileFileEffect, type PreparedFileEffect } from "./file.js";
 import { executeShellEffect, prepareShellEffect, type PreparedShellEffect, type CertifiedShellProfile } from "./shell.js";
 
@@ -314,8 +314,11 @@ export interface CertifiedEffectRecordOptions {
   readonly adapterVersion?: string;
   /** B5's typed stored-intent sinks, not generic provider risk exemptions. */
   readonly additionalSinks?: readonly EffectSink[];
-  /** Optional B3/B6 exact native-entry reader. It must verify the durable
-   * sink-to-native join; a raw adapter hash is NOT a native-envelope hash.
+  /** Optional B3/B6 exact post-hook native-entry reader. It must verify the
+   * durable sink-to-native join for this key/physical alias/outcome and preserve
+   * JSON.stringify field order. Settlement calls it OUTSIDE the store lock to
+   * project each alias's native hash; the incoming adapter hash is NOT a native
+   * hash. Only undefined means no joined entry; errors must block, not fall back.
    * Absent a joined entry, B3 re-runs hooks on the labelled adapter-original.
    * This port is not proof that the post-append boundary is installed. */
   readonly readNativeToolResult?: (effect: SettledEffect) => Promise<Awaited<ReturnType<ReadToolResult>> | undefined>;
@@ -364,24 +367,56 @@ const storedAdapter = (intent: EffectIntent, owner: RecoveryOwner): PreparedFile
   return adapterError("Unsupported or inconsistent stored adapter format");
 };
 
-/** The hash verifies stored adapter-original bytes, not a made-up native
- * envelope. B3 prefers B6's actual post-hook entry; otherwise it must re-run
- * emitToolResult before materialization. Physical aliases keep the ORIGINAL
- * message ID here; B3 owns the verified alias/context projection. No timestamp
- * or unevaluated parent fabric_exec result is manufactured by this reader. */
-export const readCertifiedToolResult = async (options: Pick<CertifiedEffectRecordOptions, "owner" | "store" | "readNativeToolResult">, effect: SettledEffect) => {
-  if (effect.outcome === "uncertain" || !effect.resultBytesHash) throw new EffectContractError("EFFECT_RESULT_UNAVAILABLE", "No acknowledged effect can authorize result repair");
-  const original = await readEffectResult(options.owner, options.store, effect.key, effect.toolCallId, effect.resultBytesHash);
-  const native = await options.readNativeToolResult?.(effect);
-  if (native) {
-    const message = jsonCopy(native);
-    if (message.role !== "toolResult" || message.toolCallId !== effect.toolCallId || !message.toolName ||
-        !Array.isArray(message.content) || typeof message.isError !== "boolean" || !Number.isFinite(message.timestamp)) {
-      throw new EffectContractError("EFFECT_NATIVE_RESULT_INVALID", "Native receipt did not identify the actual call's complete original result");
-    }
-    return { source: "native-entry" as const, message };
+type NativeResultOptions = Pick<CertifiedEffectRecordOptions, "readNativeToolResult">;
+/** Validation uses the strict JSON guard, but NEVER its sorted encoding as the
+ * native snapshot. Reject omissions/conversions (undefined, accessors, sparse
+ * arrays, nonfinite/exotic values etc.) before detaching the exact native bytes. */
+const readJoinedNativeResult = async (options: NativeResultOptions, effect: SettledEffect): Promise<EffectToolResult | undefined> => {
+  const native = await options.readNativeToolResult?.(Object.freeze({ ...effect }));
+  if (native === undefined) return undefined;
+  let message: EffectToolResult;
+  try {
+    canonicalEncode(native);
+    message = JSON.parse(JSON.stringify(native)) as EffectToolResult;
+  } catch {
+    throw new EffectContractError("EFFECT_NATIVE_RESULT_INVALID", "Native result must be lossless strict JSON");
   }
-  const record = await options.store.withSession("settle", transaction => transaction.read(effect.key));
+  if (!jsonObject(message) || message.role !== "toolResult" || message.toolCallId !== effect.toolCallId ||
+      typeof message.toolName !== "string" || !message.toolName.trim() || typeof message.isError !== "boolean" ||
+      typeof message.timestamp !== "number" || !Number.isFinite(message.timestamp) ||
+      !Array.isArray(message.content) || !message.content.every(block => jsonObject(block) &&
+        ((block.type === "text" && typeof block.text === "string" && (block.textSignature === undefined || typeof block.textSignature === "string")) ||
+          (block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string")))) {
+    throw new EffectContractError("EFFECT_NATIVE_RESULT_INVALID", "Native receipt did not identify the actual call's complete original result");
+  }
+  return message;
+};
+
+/** Authenticate the stored canonical original separately from the selected
+ * source's descriptor hash. Native hashes cover exact post-hook JSON.stringify
+ * bytes, including THIS alias's ID and timestamp. Adapter fallback keeps the
+ * ORIGINAL identity and canonical hash; B3 owns alias/context projection and
+ * live hook processing. Never manufacture a timestamp or parent JS return. */
+export const readCertifiedToolResult = async (options: Pick<CertifiedEffectRecordOptions, "owner" | "store" | "readNativeToolResult">, effect: SettledEffect) => {
+  effect = Object.freeze({ ...effect });
+  if (effect.outcome === "uncertain" || !effect.resultBytesHash) throw new EffectContractError("EFFECT_RESULT_UNAVAILABLE", "No acknowledged effect can authorize result repair");
+  const { record, result } = await readEffectResultRecord(options.owner, options.store, effect.key, effect.toolCallId);
+  if (result.outcome !== effect.outcome) {
+    throw new EffectContractError("EFFECT_RESULT_OUTCOME_MISMATCH", "Settlement descriptor differs from the original durable outcome");
+  }
+  // The transaction above is released before a host reader may itself use
+  // store.withSession. Its canonical hash never authorizes native message bytes.
+  const message = await readJoinedNativeResult(options, effect);
+  if (message !== undefined) {
+    if (sha256Bytes(JSON.stringify(message)) !== effect.resultBytesHash) {
+      throw new EffectContractError("EFFECT_RESULT_UNAVAILABLE", "No joined native result matches this call/hash");
+    }
+    return { source: "native-entry" as const, postHook: true as const, message };
+  }
+  if (result.resultBytesHash !== effect.resultBytesHash) {
+    throw new EffectContractError("EFFECT_RESULT_UNAVAILABLE", "No acknowledged adapter original matches this call/hash");
+  }
+  const original = result.result!;
   const alias = record.intent.tool.originalToolCallId === effect.toolCallId ? record.intent.tool : record.transitions.find(row => row.toolCallId === effect.toolCallId);
   if (alias?.parentToolCallId !== undefined) {
     throw new EffectContractError("EFFECT_NESTED_RESULT_REQUIRES_PARENT_REPAIR", "A nested adapter result is not an original native parent return; consume labelled logical repairs");
@@ -391,7 +426,7 @@ export const readCertifiedToolResult = async (options: Pick<CertifiedEffectRecor
       !Array.isArray(original.content) || typeof original.isError !== "boolean" || Object.hasOwn(original, "timestamp")) {
     throw new EffectContractError("EFFECT_ADAPTER_RESULT_INVALID", "No complete labelled adapter original exists; do not invent native metadata");
   }
-  return { source: "adapter-original" as const, message: jsonCopy(original) as unknown as Omit<EffectToolResult, "timestamp"> };
+  return { source: "adapter-original" as const, postHook: false as const, message: jsonCopy(original) as unknown as Omit<EffectToolResult, "timestamp"> };
 };
 
 /** Concrete B4-records bridge. B3 supplies one owner/store and admission/native
@@ -445,8 +480,18 @@ export const createCertifiedEffectRecordPort = (options: CertifiedEffectRecordOp
   const settle = async (generation: string) => {
     needsSettlement = true;
     const result = await recovery.reconcilePending(generation);
+    // Reconciliation's RESULT/repairs retain canonical adapter hashes. Only the
+    // B3 settlement descriptors project joined native bytes, per physical alias.
+    // Do not call the host inside reconcilePending's session transaction: the
+    // native join reader is allowed to acquire that SAME store lock.
+    const settled: SettledEffect[] = [];
+    for (const effect of result.settled) {
+      const native = effect.outcome !== "uncertain" && effect.resultBytesHash !== undefined
+        ? await readJoinedNativeResult(options, effect) : undefined;
+      settled.push(native === undefined ? effect : { ...effect, resultBytesHash: sha256Bytes(JSON.stringify(native)) });
+    }
     needsSettlement = result.uncertain > 0;
-    return result;
+    return { ...result, settled };
   };
   const asToolResult = (record: EffectRecord): AgentToolResult<unknown> => {
     const result = terminalResult(record);

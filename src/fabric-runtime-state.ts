@@ -353,6 +353,12 @@ export class FabricRuntimeState {
     }
   }
 
+  /** Called by the [D] base binding at the native current-epoch release edge. */
+  reconsiderSessionRecoveryDrain(): void {
+    this.assertSessionRecoveryActive();
+    this.#mainAgent?.reconsiderRecoveryDrain();
+  }
+
   get initialized(): boolean {
     return Boolean(this.#execution);
   }
@@ -1038,6 +1044,12 @@ export class FabricRuntimeState {
     const mesh = this.#mesh;
     // Capture once: a later session replacement must not change this activation's proof.
     const sessionRecovery = this.#sessionRecovery;
+    if (sessionRecovery) {
+      // BEFORE attachFollowUpDrain can replay/open retained Main work.
+      mainAgent.setRecoveryDrainPredicate(() => this.#sessionRecovery === sessionRecovery &&
+        this.#bindingFresh() && this.#participants?.canConsumeMesh() === true &&
+        live.read(ctx => ctx.sessionRecovery?.isReady()) === true);
+    }
     if (sessionRecovery) {
       const binding = sessionRecovery.binding;
       if (identity.kind !== "main" || binding.evidence.sessionId !== sessionId ||

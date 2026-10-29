@@ -74,6 +74,7 @@ const fixture = (callIds = ["native-call", "unstarted-call"]) => {
   const events: string[] = [], requests: ContinuationRequest[] = [], generations: string[] = [];
   const nativeFile = path.join(stateDirectory, "native-admissions.json");
   const adapters: SessionRecoveryAdapters = {
+    maintenance: Object.fromEntries(["admitMaintenance", "beginMaintenance", "prepareMaintenance", "consumeMaintenance", "adoptMaintenance", "read", "listPending", "withMaintenanceAttempt", "assertMaintenanceGate", "cancelMaintenance", "reconcileAfterJoin", "captureTaskAbort", "releaseLostMaintenance"].map(name => [name, () => { throw new Error("maintenance not used by this fixture"); }])) as unknown as SessionRecoveryAdapters["maintenance"],
     identity: {
       validate: vi.fn(async () => {
         // Simulate B2 running on another machine with the same retained predecessor receipt.

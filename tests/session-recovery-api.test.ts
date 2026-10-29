@@ -15,6 +15,7 @@ import type * as PublicRecovery from "../src/index.js";
 
 function providers(): SessionRecoveryAdapters {
   return {
+    maintenance: Object.fromEntries(["admitMaintenance", "beginMaintenance", "prepareMaintenance", "consumeMaintenance", "adoptMaintenance", "read", "listPending", "withMaintenanceAttempt", "assertMaintenanceGate", "cancelMaintenance", "reconcileAfterJoin", "captureTaskAbort", "releaseLostMaintenance"].map(name => [name, () => { throw new Error("maintenance not used by this fixture"); }])) as unknown as SessionRecoveryAdapters["maintenance"],
     identity: { validate: async () => { throw new Error("not used"); }, verifyPredecessor: async () => {} },
     inputs: { readRecoveryInput: async () => { throw new Error("not used"); }, admitContinuation: async () => { throw new Error("not used"); } },
     effects: { settlePendingIntents: async () => ({ settled: [], uncertain: 0 }), readToolResult: async () => { throw new Error("not used"); } },
@@ -83,8 +84,8 @@ describe("session recovery provider registration", () => {
       | { readonly found: true; readonly seq: number; readonly bytes: Uint8Array }
       | { readonly found: false; readonly reason: "not-found" | "store-unavailable" | "superseded" }
     >();
-    // Runtime composition is intentionally not expanded in this contract-only phase.
-    expectTypeOf<keyof SessionRecoveryAdapters>().toEqualTypeOf<"identity" | "inputs" | "effects">();
+    // Maintenance is a distinct admission owner, never a fabricated input.
+    expectTypeOf<keyof SessionRecoveryAdapters>().toEqualTypeOf<"identity" | "inputs" | "effects" | "maintenance">();
   });
 
   it("exercises both native receipt variants through a fixture, separately from the durable barrier", async () => {
@@ -186,13 +187,14 @@ describe("session recovery provider registration", () => {
     registerSessionRecoveryAdapters(pi, { inputs: adapters.inputs });
     registerSessionRecoveryAdapters(pi, { effects: adapters.effects });
     registerSessionRecoveryAdapters(pi, { identity: adapters.identity });
+    registerSessionRecoveryAdapters(pi, { maintenance: adapters.maintenance });
     expect(sessionRecoveryAdapters(pi)).toEqual(adapters);
   });
 
   it("does not invent missing effect or input implementations", () => {
     const pi = { events: createEventBus() };
     const unsubscribe = registerSessionRecoveryAdapters(pi, { identity: providers().identity });
-    expect(() => sessionRecoveryAdapters(pi)).toThrow("requires identity, inputs and effects");
+    expect(() => sessionRecoveryAdapters(pi)).toThrow("requires identity, inputs, effects and maintenance");
     unsubscribe();
     expect(sessionRecoveryAdapters(pi)).toBeUndefined();
   });

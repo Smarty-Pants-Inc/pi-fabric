@@ -246,7 +246,104 @@ export interface RecoveryEffectAdapter {
 }
 
 /** B3 consumes these providers; unconfigured ordinary sessions do not activate recovery. */
+export interface RecoveryIo { readonly deadlineMs?: number; readonly signal?: AbortSignal }
+export interface RecoveryTaskAbort { readonly requestId: string; readonly at: number; readonly bootId: string; readonly originalInputIds: readonly string[]; readonly maintenanceRequestId: string; committed: boolean }
+/** Pinned B5 maintenance-admission port; B3 must not implement a second admission ledger. */
+export type RecoveryEpoch = Readonly<{ processIncarnationId: string; bindingId: string; epoch: number }>;
+export type MaintenanceOperation =
+  | { kind: "compact"; reason: "manual"; targetModel?: never }
+  | { kind: "compact"; reason: "model-switch"; targetModel: Readonly<{ provider: string; id: string }> }
+  | { kind: "tree-nav"; targetEntryId: string | null; summarize: boolean }
+  | { kind: "auto-compact-retry"; retryAnchor: string };
+export type RepairRef = Readonly<{
+  originalInputId: string; recoveryGeneration: string;
+  executionBranchEntryId: string; repairReceiptSha256: string;
+}>;
+export interface MaintenanceRequest {
+  readonly version: 1; readonly admissionKind: "maintenance";
+  readonly sessionId: string; readonly requestId: string; readonly epoch: RecoveryEpoch;
+  readonly operation: MaintenanceOperation;
+  readonly baseLeafId: string | null; readonly baseHistorySha256: string; readonly viewSha256: string;
+  readonly issuedAtMs: number; readonly deadlineMs: number; readonly repair?: RepairRef;
+}
+export interface NativePlanRef { readonly entryId: string; readonly bytesSha256: string; readonly planSha256: string }
+export interface MaintenanceCompletion {
+  readonly outcome: "completed" | "noop" | "cancelled" | "failed";
+  readonly errorCode?: string; readonly checkpointEntryId: string;
+  readonly entries: ReadonlyArray<{ readonly entryId: string; readonly bytesSha256: string; readonly seq: number }>;
+}
+export interface MaintenanceRecord {
+  readonly request: Readonly<MaintenanceRequest>; readonly operationSha256: string;
+  revision: number; activeEpoch: RecoveryEpoch; permitRevision: number;
+  state: "ADMITTED" | "ACTIVE" | "PREPARED" | "CONSUMED";
+  plan?: NativePlanRef; completion?: MaintenanceCompletion;
+}
+export interface AcceptedRecoveryMaintenance {
+  readonly admissionKind: "maintenance"; readonly sessionId: string; readonly requestId: string;
+  readonly epoch: RecoveryEpoch; readonly operationSha256: string; readonly permitRevision: number;
+  readonly deadlineMs: number;
+}
+export type RecoveryGateSubject = Readonly<import("@earendil-works/pi-coding-agent").AcceptedRecoveryInput | AcceptedRecoveryMaintenance>;
+export type ProviderPurpose = "turn" | "compact-summary" | "tree-summary" | "bug-report";
+export interface MaintenanceKey { readonly sessionId: string; readonly requestId: string }
+export const RECOVERY_MAINTENANCE_CODES = [
+  "RECOVERY_MAINTENANCE_UNBOUND", "RECOVERY_MAINTENANCE_TOKEN_REUSED",
+  "RECOVERY_MAINTENANCE_CONFLICT", "RECOVERY_MAINTENANCE_INVALID",
+  "RECOVERY_MAINTENANCE_USER_TEXT", "RECOVERY_MAINTENANCE_HOOK_CONTENT",
+  "RECOVERY_MAINTENANCE_KIND_MISMATCH", "RECOVERY_MAINTENANCE_PURPOSE_UNSUPPORTED",
+  "RECOVERY_MAINTENANCE_INPUT_SELECTED", "RECOVERY_MAINTENANCE_BUSY", "RECOVERY_MAINTENANCE_SELF_CALL",
+  "RECOVERY_MAINTENANCE_DEADLINE", "RECOVERY_MAINTENANCE_CANCELLED", "RECOVERY_MAINTENANCE_INTERRUPTED",
+  "RECOVERY_MAINTENANCE_RETRY_EXHAUSTED", "RECOVERY_MAINTENANCE_REPAIR_REQUIRED", "RECOVERY_MAINTENANCE_UNCERTAIN",
+] as const;
+export type MaintenanceFailureCode = typeof RECOVERY_MAINTENANCE_CODES[number] | "RECOVERY_EPOCH_REVOKED" | "RECOVERY_EXECUTION_BRANCH_REQUIRED";
+export type MaintenanceRefusal = Readonly<{ ok: false; code: MaintenanceFailureCode; message: string }>;
+export type MaintenanceResult<T = MaintenanceRecord> = Readonly<{ ok: true; value: T }> | MaintenanceRefusal;
+export interface BegunMaintenance { readonly record: MaintenanceRecord; readonly token: AcceptedRecoveryMaintenance }
+export interface MaintenanceSnapshot { readonly revision: number; readonly record?: MaintenanceRecord }
+export interface PendingMaintenance { readonly revision: number; readonly records: readonly MaintenanceRecord[] }
+export interface MaintenanceLedgerEntry {
+  record: MaintenanceRecord;
+  /** Internal durable disposition, NOT permission carried by public JSON or a token. */
+  settlementOnly: boolean;
+  cancelRequested: boolean;
+}
+export interface MaintenanceJoinReconciliation extends RecoveryIo {
+  /** The ACTUAL native operation/run + summary requests + persistence release, not isIdle,
+   * abort notification, observer completion, or a timeout surrogate. B3 owns this promise. */
+  readonly joined: Promise<void>;
+  /** Native scans its own WAL, validates the exact plan/entries and completes B6 barriers.
+   * It returns a control-only plan for unprepared failure/cancel/interruption; never inference.
+   * A durable prepare found after an unknown ACK wins over late cancel/expiry. */
+  settle(record: Readonly<MaintenanceRecord>, prepare: (plan: NativePlanRef) => Promise<MaintenanceResult>): Promise<MaintenanceCompletion>;
+  /** Current-binding recovery pass, including issued intents/repair/branch restoration.
+   * Consumption precedes this callback; HELD release/reconsideration follows it. */
+  reconcile(record: Readonly<MaintenanceRecord>): Promise<void>;
+  readonly taskAbortRequestId?: string;
+}
+
+/** Exact B5 port for B3's composition. All mutations share input-admission's synchronous
+ * revision owner. No provider, hook, join, callback or B6 wait runs inside a transaction.
+ * B3 keeps native HELD and its private shared attempt; a copied accepted token is not one.
+ * read/list are bounded snapshots, never a second scheduler or a poller. */
+export interface RecoveryMaintenanceAdapter {
+  admitMaintenance(request: MaintenanceRequest, io?: RecoveryIo): Promise<MaintenanceResult>;
+  beginMaintenance(key: MaintenanceKey, epoch: RecoveryEpoch, expectedRevision: number, io?: RecoveryIo): Promise<MaintenanceResult<BegunMaintenance>>;
+  prepareMaintenance(token: AcceptedRecoveryMaintenance, plan: NativePlanRef, io?: RecoveryIo): Promise<MaintenanceResult>;
+  consumeMaintenance(token: AcceptedRecoveryMaintenance, completion: MaintenanceCompletion, io?: RecoveryIo): Promise<MaintenanceResult>;
+  adoptMaintenance(key: MaintenanceKey, epoch: RecoveryEpoch, expectedRevision: number, io?: RecoveryIo): Promise<MaintenanceResult<BegunMaintenance>>;
+  read(key: MaintenanceKey, io?: RecoveryIo): Promise<MaintenanceResult<MaintenanceSnapshot>>;
+  listPending(sessionId: string, limit: number, io?: RecoveryIo): Promise<MaintenanceResult<PendingMaintenance>>;
+  withMaintenanceAttempt<T>(token: AcceptedRecoveryMaintenance, run: (signal: AbortSignal) => Promise<T>): Promise<T>;
+  assertMaintenanceGate(token: AcceptedRecoveryMaintenance, purpose: ProviderPurpose, viewSha256: string): void;
+  cancelMaintenance(key: MaintenanceKey, epoch: RecoveryEpoch, io?: RecoveryIo): Promise<MaintenanceResult>;
+  reconcileAfterJoin(key: MaintenanceKey, epoch: RecoveryEpoch, edge: MaintenanceJoinReconciliation): Promise<MaintenanceResult>;
+  captureTaskAbort(sessionId: string, requestId: string, epoch: RecoveryEpoch, at: number, bootId: string, io?: RecoveryIo): Promise<MaintenanceResult<RecoveryTaskAbort>>;
+  releaseLostMaintenance(key: MaintenanceKey, epoch: RecoveryEpoch, io?: RecoveryIo): Promise<MaintenanceResult<void>>;
+}
+
+
 export interface SessionRecoveryAdapters {
+  readonly maintenance: RecoveryMaintenanceAdapter;
   readonly identity: PortableIdentityAdapter;
   readonly inputs: RecoveryInputAdapter;
   readonly effects: RecoveryEffectAdapter;
@@ -276,7 +373,7 @@ export function sessionRecoveryAdapters(pi: Pick<ExtensionAPI, "events">): Sessi
   let invalid = false;
   pi.events.emit(SESSION_RECOVERY_ADAPTERS_GET, { accept: (parts: Partial<SessionRecoveryAdapters>) => {
     if (!parts || typeof parts !== "object" || Array.isArray(parts)) { invalid = true; return; }
-    for (const key of ["identity", "inputs", "effects"] as const) {
+    for (const key of ["identity", "inputs", "effects", "maintenance"] as const) {
       const adapter = parts[key];
       if (!adapter) continue;
       // Pi's event bus catches listener errors. Record the conflict here and throw outside
@@ -288,7 +385,10 @@ export function sessionRecoveryAdapters(pi: Pick<ExtensionAPI, "events">): Sessi
   if (invalid) throw new Error("Malformed session recovery provider registration");
   if (conflict) throw new Error(`Conflicting session recovery ${conflict} providers`);
   if (Object.keys(adapters).length === 0) return undefined;
-  if (!adapters.identity || !adapters.inputs || !adapters.effects) throw new Error("Session recovery requires identity, inputs and effects providers");
+  if (!adapters.identity || !adapters.inputs || !adapters.effects || !adapters.maintenance) throw new Error("Session recovery requires identity, inputs, effects and maintenance providers");
+  for (const name of ["admitMaintenance", "beginMaintenance", "prepareMaintenance", "consumeMaintenance", "adoptMaintenance", "read", "listPending", "withMaintenanceAttempt", "assertMaintenanceGate", "cancelMaintenance", "reconcileAfterJoin", "captureTaskAbort", "releaseLostMaintenance"] as const) {
+    if (typeof adapters.maintenance[name] !== "function") throw new Error("Malformed session recovery maintenance API");
+  }
   if (typeof adapters.identity.validate !== "function" || typeof adapters.identity.verifyPredecessor !== "function" ||
     typeof adapters.inputs.readRecoveryInput !== "function" || typeof adapters.inputs.admitContinuation !== "function" ||
     typeof adapters.effects.settlePendingIntents !== "function" || typeof adapters.effects.readToolResult !== "function") {

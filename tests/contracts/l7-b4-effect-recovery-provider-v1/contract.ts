@@ -61,11 +61,13 @@ export interface B4RepairReceiptV1 extends B4RepairRequestV1 {
   readonly version: 1;
   readonly executionBranchEntryId: string; // A: immutable original anchor
   readonly joinedLeafEntryId: string; // J: actual joined native view (may differ)
-  /** SHA-256 of the exact joined-history encoding owned by native. */
+  /** Pi cf3cf677 agent-session.ts:1757-1768 baseHistorySha256 at J:
+   * SHA256(UTF8(JSON.stringify(branch.map(entry =>
+   *   [entry.id, SHA256(UTF8(JSON.stringify(entry) + "\n")))])))).
+   * Preserve branch order and native property order; no canonical sorting. */
   readonly joinedHistorySha256: string;
-  /** Exact native prepared/repaired view digest used by maintenance admission. */
-  readonly viewSha256: string;
-  /** SHA-256 of the exact protected call/result range encoding owned by native. */
+  /** Encoding OPEN: native/B4 producer + fv2-l7-main, due 2026-10-30 12:00Z.
+   * The fixture's encoding is not a production prescription. */
   readonly protectedRangeSha256: string;
   readonly protectedEntryIds: readonly string[];
   readonly settlements: readonly SettledRecoveryEffect[];

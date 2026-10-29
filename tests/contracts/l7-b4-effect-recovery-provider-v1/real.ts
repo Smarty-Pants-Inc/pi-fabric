@@ -7,7 +7,7 @@ import { EffectStore } from "../../../src/effects/store.js";
 import { canonicalEncode, mintEffectKey, manifestDigest } from "../../../src/effects/slots.js";
 import { prepareFileEffect } from "../../../src/effects/file.js";
 import { prepareShellEffect, shellEffectCommand } from "../../../src/effects/shell.js";
-import { canonicalCopy, copy, fail, hash, intent, originalResult, SESSION, type ConformanceFactory, type ConformanceHarness } from "./fixtures.js";
+import { canonicalCopy, copy, fail, hash, intent, joinedBranch, originalResult, SESSION, type ConformanceFactory, type ConformanceHarness } from "./fixtures.js";
 
 /** Unmodified real B4 store/reconciler/record port at the selected integration
  * head. Sinks below are controlled boundary probes, NOT real peer/native/B6
@@ -102,6 +102,7 @@ export const createReal: ConformanceFactory = async scenario => {
       };
       walk(sessionRoot); return hash(canonicalEncode(files));
     },
+    joinedBranch: () => copy(joinedBranch()), // Native boundary probe, not a production reader.
     advanceJoinedLeaf() { /* No producer at this head: suite reports absent method. */ },
     fileSnapshot() { const stat = statSync(target); return { bytes: readFileSync(target, "utf8"), identity: `${stat.dev}:${stat.ino}` }; },
     async dispose() { rmSync(root, { recursive: true, force: true }); },

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { canonicalEncode } from "../../../src/effects/slots.js";
 import type { B4EffectRecoveryProviderV1 } from "./contract.js";
@@ -115,15 +116,8 @@ export function runConformance(provider: ConformanceFactory): void {
       const effect = (await settle(h)).settled[0]!;
       await expect(read(h, { ...effect, resultBytesHash: hash("forged") })).rejects.toMatchObject({ code: "EFFECT_RESULT_UNAVAILABLE" });
     });
-    test("C21 missing B5 pin never mints a generation or starts settlement", { intents: [value], pin: null }, async h => {
-      await expect(settle(h)).rejects.toMatchObject({ code: "RECOVERY_HISTORY_INCOMPLETE" });
-      expect(h.generations()).toEqual([]); expect(h.destination()).toEqual([]);
-    });
-    test("C22 second recovery cannot replace the retained generation", { intents: [value], lostAck: true }, async h => {
-      await settle(h); await h.reopen(); const before = await h.ledgerDigest();
-      await expect(settle(h, "caller-random-g2")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
-      expect(await h.ledgerDigest()).toBe(before); expect(h.generations()).toEqual([GENERATION]);
-    });
+    // C21/C22 moved to ../l7-b5-main-generation-v1/conformance.ts.
+    // The B4 ABI has no B5 pin port; B5/Main owns these refusals (R3:150-152).
     test("C23 J differs from A: host repair returns bound view and canonical receipt hash", { intents: [value] }, async h => {
       await settle(h); const ref = await repair(h);
       expect(ref).toMatchObject({ originalInputId: accepted.originalInputId, recoveryGeneration: GENERATION, executionBranchEntryId: "A" });
@@ -131,8 +125,17 @@ export function runConformance(provider: ConformanceFactory): void {
       expect(view).not.toBeInstanceOf(Promise);
       expect(view).toMatchObject({ sessionId: SESSION, joinedLeafEntryId: "J", executionBranchEntryId: "A", recoveryGeneration: GENERATION });
       expect(view.protectedEntryIds).not.toHaveLength(0); expect(view.nativeEntries).not.toHaveLength(0);
-      expect(view.settlements).toHaveLength(1); expect(view.joinedHistorySha256).toMatch(/^[a-f0-9]{64}$/);
-      expect(view.protectedRangeSha256).toMatch(/^[a-f0-9]{64}$/); expect(view.viewSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(view.settlements).toHaveLength(1);
+      // Compute from the observed branch, not joinedEvidence or the receipt itself.
+      const sha256 = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
+      const branch = h.joinedBranch();
+      const exactHistory = JSON.stringify(branch.map(entry => [entry.id, sha256(JSON.stringify(entry) + "\n")]));
+      expect(branch.at(-1)?.id).toBe(view.joinedLeafEntryId);
+      expect(view.joinedHistorySha256).toBe(sha256(exactHistory));
+      expect(view.joinedHistorySha256).not.toBe(sha256(JSON.stringify(branch.map(entry => [entry.id, sha256(JSON.stringify(entry))]))));
+      expect(view.joinedHistorySha256).not.toBe(sha256(JSON.stringify(branch.map(entry => [entry.id, sha256(canonicalEncode(entry) + "\n")]))));
+      expect(view).not.toHaveProperty("viewSha256");
+      expect(view.protectedRangeSha256).toMatch(/^[a-f0-9]{64}$/);
       expect(ref.repairReceiptSha256).toBe(hash(canonicalEncode(view)));
     });
     test("C24 second recovery resolves identical immutable receipt without reminting", { intents: [value] }, async h => {

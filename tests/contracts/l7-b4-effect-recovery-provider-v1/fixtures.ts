@@ -43,6 +43,8 @@ export interface ConformanceHarness {
   observedIntents(): readonly EffectIntent[];
   generations(): readonly string[];
   ledgerDigest(): Promise<string>;
+  /** Ordered native-shaped branch at the joined leaf, observed independently of the receipt. */
+  joinedBranch(): readonly JoinedEntry[];
   advanceJoinedLeaf(): void;
   fileSnapshot(): { bytes: string; identity: string };
   dispose(): Promise<void>;
@@ -75,10 +77,19 @@ export function originalResult(value: EffectIntent): JsonValue {
   return { role: "toolResult", toolCallId: value.tool.originalToolCallId, toolName: "write",
     content: [{ type: "text", text: "original result" }], isError: false, timestamp: 12345 };
 }
+export type JoinedEntry = Readonly<{ id: string; [key: string]: unknown }>;
+export function joinedBranch(joinedLeafEntryId = "J"): readonly JoinedEntry[] {
+  // Deliberately non-sorted property order and UTF-8 content: exact Pi history bytes.
+  return [{ id: "A", parentId: null, type: "message", message: { role: "user", content: "original input" } },
+    { id: joinedLeafEntryId, parentId: "A", type: "message", message: { role: "assistant", content: "joined λ" } }];
+}
 export function joinedEvidence(settlements: B4RepairReceiptV1["settlements"], joinedLeafEntryId = "J"): B4RepairReceiptV1 {
-  const raw = '{"id":"J","parentId":"A","type":"message"}\n';
+  const branch = joinedBranch(joinedLeafEntryId);
+  const raw = JSON.stringify(branch[branch.length - 1]) + "\n";
+  // P agent-session.ts:1757-1768, not receipt canonicalEncode or an opaque fixture string.
+  const joinedHistorySha256 = hash(JSON.stringify(branch.map(entry => [entry.id, hash(JSON.stringify(entry) + "\n")])));
   return { version: 1, sessionId: SESSION, originalInputId: INPUT, recoveryGeneration: GENERATION,
-    executionBranchEntryId: "A", joinedLeafEntryId, joinedHistorySha256: hash(`A-through-${joinedLeafEntryId}`), viewSha256: hash(`view-${joinedLeafEntryId}`),
+    executionBranchEntryId: "A", joinedLeafEntryId, joinedHistorySha256,
     protectedRangeSha256: hash("original calls and exact results"), protectedEntryIds: ["assistant", "J"], settlements,
     nativeEntries: [{ entryId: "J", deliveryId: "pi-native-entry:v1:fixture", recordKind: "carrier", file: "/retained/session.jsonl",
       offset: 0, length: Buffer.byteLength(raw) - 1, bytesSha256: hash(raw), b6Sequence: 7 }] };

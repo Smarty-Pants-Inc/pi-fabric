@@ -1,7 +1,7 @@
 import type { EffectIntent, EffectOutcome } from "../../../src/effects/contracts.js";
 import { canonicalEncode, intentBindingDigest } from "../../../src/effects/slots.js";
 import type { B4EffectRecoveryProviderV1, RepairRef, RepairReceiptView, SettledRecoveryEffect } from "./contract.js";
-import { accepted, canonicalCopy, copy, fail, GENERATION, hash, immutable, INPUT, intent, joinedEvidence, originalResult, SESSION,
+import { accepted, canonicalCopy, copy, fail, GENERATION, hash, immutable, INPUT, intent, joinedBranch, joinedEvidence, originalResult, SESSION,
   type ConformanceFactory } from "./fixtures.js";
 
 /** Producer-owned TEST ONLY. In-memory behavior model, never a durability,
@@ -12,7 +12,9 @@ export const createFake: ConformanceFactory = async scenario => {
   const destination = new Set(scenario.committedBeforeAck ?? []);
   const observed: EffectIntent[] = [];
   const generations: string[] = [];
-  const pin = scenario.pin === undefined ? GENERATION : scenario.pin;
+  // Receipt fixture input only. Pin allocation/validation belongs to B5/Main,
+  // not this provider; no hidden pin check before settlement or repair.
+  const receiptGeneration = scenario.pin ?? GENERATION;
   let fileBytes = scenario.fileState === "post" ? "after" : scenario.fileState === "neither" || scenario.shellState === "changed" ? "foreign" : "before";
   let fileIdentity = "original-inode";
   let joinedLeaf = "J";
@@ -41,8 +43,6 @@ export const createFake: ConformanceFactory = async scenario => {
       const run = async () => {
         if (sessionId !== SESSION) fail("EFFECT_SESSION_MISMATCH");
         if (typeof generation !== "string" || !generation.trim()) fail("EFFECT_RECOVERY_GENERATION");
-        if (intents.size && !pin) fail("RECOVERY_HISTORY_INCOMPLETE");
-        if (intents.size && generation !== pin) fail("RECOVERY_CONFLICT");
         if (scenario.corrupt) return { settled: [], uncertain: 1 };
         if (!intents.size) return { settled: [], uncertain: 0 };
         const visiting = new Set<string>();
@@ -89,14 +89,13 @@ export const createFake: ConformanceFactory = async scenario => {
     },
     async repairMaintenance(input, executionLeafId) {
       if (input.sessionId !== SESSION || input.originalInputId !== INPUT || canonicalEncode(input) !== canonicalEncode(accepted)) fail("RECOVERY_CONFLICT");
-      if (!pin) fail("RECOVERY_HISTORY_INCOMPLETE");
       if (executionLeafId !== joinedLeaf || [...intents.keys()].some(key => !outcomes.has(key) || outcomes.get(key) === "uncertain")) fail("RECOVERY_MAINTENANCE_REPAIR_REQUIRED");
       if (receipt) {
         if (receipt.joinedLeafEntryId !== joinedLeaf) fail("RECOVERY_MAINTENANCE_REPAIR_REQUIRED");
         return ref!;
       }
-      receipt = immutable({ ...joinedEvidence(rows(), joinedLeaf), recoveryGeneration: pin });
-      ref = immutable({ originalInputId: INPUT, recoveryGeneration: pin, executionBranchEntryId: "A",
+      receipt = immutable({ ...joinedEvidence(rows(), joinedLeaf), recoveryGeneration: receiptGeneration });
+      ref = immutable({ originalInputId: INPUT, recoveryGeneration: receiptGeneration, executionBranchEntryId: "A",
         repairReceiptSha256: hash(canonicalEncode(receipt)) });
       return ref;
     },
@@ -108,6 +107,7 @@ export const createFake: ConformanceFactory = async scenario => {
   return { provider, issue, async reopen() { /* Same retained model state; NOT a process-crash proof. */ },
     destination: () => [...destination], observedIntents: () => copy(observed), generations: () => [...generations],
     async ledgerDigest() { return hash(canonicalEncode({ intents: [...intents.values()], outcomes: [...outcomes], receipt: receipt ?? null })); },
+    joinedBranch: () => copy(joinedBranch(joinedLeaf)),
     advanceJoinedLeaf() { joinedLeaf = "J2"; },
     fileSnapshot() { return { bytes: fileBytes, identity: fileIdentity }; }, async dispose() {} };
 };

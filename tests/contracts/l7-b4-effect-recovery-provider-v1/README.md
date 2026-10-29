@@ -28,9 +28,14 @@ implement the entire frozen R3/B3 contract. This draft must not be called G2 GRE
 - New R3 resolver: synchronous `resolveRepair(ref)`; no effect/provider await in
   a B5 transaction. Receipt hash uses `canonicalEncode(view)`. Native tool-result
   hashes use exact `JSON.stringify(message)` bytes. These are different hashes.
-- G4: no random generation, no pin replacement. The fake's pin comes from the
-  fixture representing B5's durable original-input pin. Real B5 binding is still
-  Main's integration work; the real harness does not invent it.
+- G4: B4 never mints a generation. B5/Main owns pin creation and refusal, not
+  B4. C21/C22 moved to `../l7-b5-main-generation-v1/conformance.ts`, exported as
+  `runGenerationPinConformance`; Main/B5 must bind/run it by 2026-10-30 18:00Z.
+  The B4 fake has no hidden pin check. Its receipt generation is fixture input,
+  not proof of B5 admission. See that suite's README for unexecuted coverage.
+- Receipt `viewSha256` was removed in v2 because Pi's request digest contains
+  the receipt ref. `joinedHistorySha256` is pinned to Pi's base-history encoding;
+  C23 checks exact ordered JSON.stringify entry bytes, inner LF, and outer hash.
 - The multi-original-pin case is OPEN for fv2-l7-main; the two-argument settlement
   signature cannot express a different generation per original in one pass.
 
@@ -46,5 +51,8 @@ All files live under `tests/`, outside `tsconfig.build.json` and production entr
 points. There is no production registration, runtime fallback, new package
 export or change to B4 behavior. Passing the fake never enables REQUIRED.
 
-The authoritative source-pinned narrative and conflicts are in the requester's
-`B4-CONTRACT.md` delivery artifact, identified by SHA-256 in the draft PR body.
+The authoritative source-pinned narrative and conflicts are co-versioned here:
+[`B4-CONTRACT.md`](./B4-CONTRACT.md). Verify its frozen bytes from this directory
+with `sha256sum -c B4-CONTRACT.sha256`. V2 corrects K1–K4; K5–K9 follow in v3.
+The round-2 `PHASE1.md` records commit/hash and per-test evidence. CoS owns PR
+body updates; the builder is authorized only to push this branch.

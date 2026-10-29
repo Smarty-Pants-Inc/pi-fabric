@@ -247,21 +247,11 @@ const mergeParticipantEntries = (
   return { entries: [...byKey.values()], shadowed };
 };
 
-// smarty-dev#7978: whether two host-lease readings agree on every PEER lease, by the cached lease
-// object's identity (readHostLeases reuses it while that file's identity and timestamps are unchanged).
-// This host's own lease is left out: no derived peer answer reads it, and it renews every heartbeat.
-const samePeerLeases = (
-  left: ReadonlyMap<string, FabricHostLease>, right: ReadonlyMap<string, FabricHostLease>, ownHostId: string,
-): boolean => {
-  let peers = 0;
-  for (const [id, lease] of right) {
-    if (id === ownHostId) continue;
-    peers += 1;
-    if (left.get(id) !== lease) return false;
-  }
-  for (const id of left.keys()) if (id !== ownHostId) peers -= 1;
-  return peers === 0;
-};
+// Fresh point reads reuse the parsed object only while the file identity/timestamps agree.
+// Compare only candidate owners, including our own if it owns a different collision candidate.
+const sameCandidateLeases = (
+  left: ReadonlyMap<string, FabricHostLease>, right: ReadonlyMap<string, FabricHostLease>,
+): boolean => left.size === right.size && [...right].every(([id, lease]) => left.get(id) === lease);
 
 /**
  * Whether two selections of the shared entries a derived peer answer reads are the same state (smarty-dev#7978,
@@ -303,6 +293,30 @@ interface PeerSignals {
   /** The `now` it was computed for, and the wall clock when (the safety interval's reference). */
   at: number;
   checkedAt: number;
+}
+
+interface LegacyRenewalCandidates {
+  hosts: readonly MeshStateEntry[];
+  sessions: readonly MeshStateEntry[];
+  participants: readonly FabricParticipantRecord[];
+  ownerIds: ReadonlySet<string>;
+}
+
+interface RootCollisionCandidates {
+  hosts: readonly MeshStateEntry[];
+  participants: readonly FabricParticipantRecord[];
+  terminalRoots: readonly MeshStateEntry[];
+  sessions: readonly MeshStateEntry[];
+  mirrors: readonly FabricParticipantRecord[];
+  shadowed: readonly FabricParticipantRecord[];
+  malformed: readonly MeshStateEntry[];
+  ownerIds: ReadonlySet<string>;
+}
+
+interface RootCollisionSignals extends PeerSignals {
+  local: string;
+  candidates: RootCollisionCandidates;
+  peers: readonly FabricParticipantRecord[];
 }
 
 // Message-only legacy compatibility stays narrow; retry policy also uses shared isMeshWriteDeferred.
@@ -558,13 +572,34 @@ const isLocal = (participant: FabricParticipantRecord, localHostId: string): boo
 /** Mesh topic of a refused mirrored record (smarty-dev#2004); one event per collision and process. */
 export const MIRROR_COLLISION_TOPIC = "fabric.topology.mirror-refused";
 
+// Collision preparation already captured each relevant owner's lease once. Keep exactly the
+// sessionLiveness pairing rules without issuing another point read for each session envelope.
+const candidateSessionLiveness = (entry: MeshStateEntry, leases: ReadonlyMap<string, FabricHostLease>) => {
+  const stored = sessionLiveness(entry);
+  if (!isObject(entry.value)) return stored;
+  const value = entry.value;
+  if (value.livenessLeaseFiles !== 1 || typeof value.id !== "string" || typeof value.sessionId !== "string" ||
+    entry.key !== `sessions/${value.sessionId}` || entry.updatedBy.id !== value.id) return stored;
+  const lease = leases.get(typeof value.livenessHostId === "string" ? value.livenessHostId : value.id);
+  const session = lease?.session;
+  const matching = lease?.rootId === value.id && lease.identityId === entry.updatedBy.id &&
+    (typeof value.livenessIncarnationToken === "string" ? lease.incarnationToken === value.livenessIncarnationToken :
+      lease.startedAt === value.livenessStartedAt) &&
+    session?.id === value.sessionId && session.startedAt === value.startedAt;
+  return effectiveLiveness(stored, matching ? session : undefined);
+};
+
 const legacyRootFromEntry = (
   entry: MeshStateEntry,
   localRootId: string,
   now: number,
   meshRoot?: string,
+  leases?: ReadonlyMap<string, FabricHostLease>,
 ): FabricParticipantInfo | undefined => {
-  if (!isLiveLegacyRootEntry(entry, now, meshRoot) || entry.value.id === localRootId) return undefined;
+  // Validate metadata without consulting leases first; the captured liveness supplies the TTL.
+  if (!isLiveLegacyRootEntry(entry, Number.NEGATIVE_INFINITY) || entry.value.id === localRootId) return undefined;
+  const live = leases ? candidateSessionLiveness(entry, leases) : sessionLiveness(entry, meshRoot);
+  if (live.expiresAt < now) return undefined;
   const value = entry.value;
   return {
     format: 1,
@@ -583,7 +618,7 @@ const legacyRootFromEntry = (
     ...(typeof value.model === "string" ? { model: value.model } : {}),
     ...(typeof value.thinking === "string" ? { thinking: value.thinking } : {}),
     startedAt: value.startedAt,
-    updatedAt: sessionLiveness(entry, meshRoot).updatedAt,
+    updatedAt: live.updatedAt,
     pendingMessages: value.pendingMessages === true,
     controlProtocol: "legacy",
     local: false,
@@ -884,8 +919,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
    * change signals (state snapshot, participant files, peer leases) are unchanged, and is recomputed at
    * least once per lease period (#leaseMs), the safety net of the existing heartbeat timer.
    */
-  #legacyRenewals: (PeerSignals & { required: boolean; until: number }) | undefined;
-  #rootCollisionPass: (PeerSignals & { local: string }) | undefined;
+  #legacyRenewals: (PeerSignals & { candidates: LegacyRenewalCandidates; required: boolean; until: number }) | undefined;
+  #rootCollisionPass: RootCollisionSignals | undefined;
 
   constructor(
     readonly mesh: MeshStore,
@@ -2141,10 +2176,10 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   // Check initial registration AND heartbeat renames, using both file and legacy/state peers.
   // This is an alert, not a race-free exclusive claim or a fork-ancestry inference.
-  #reportRootCollisions(root: FabricParticipantRecord): void {
-    // Advisory only: collision alerts may lag the bounded idle view. They must not bypass
-    // coalescing on every heartbeat; ownership/lineage/delivery reads below stay fresh.
-    for (const peer of this.list({ scope: "project", kinds: ["root"] })) {
+  #reportRootCollisions(root: FabricParticipantRecord, peers: readonly FabricParticipantRecord[]): void {
+    // These peers were prepared synchronously with the change signals. Do not call list():
+    // even an empty candidate set must not materialize every retained fleet lease downstream.
+    for (const peer of peers) {
       if (peer.id === root.id || !["idle", "running", "reloading"].includes(peer.status)) continue;
       const sameSession = root.sessionId !== undefined && root.sessionId === peer.sessionId;
       const sameName = root.name !== "main" && root.name === peer.name;
@@ -3420,7 +3455,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       // and every collision it still has was already reported (#reportedRootCollisions).
       const signals = this.#rootCollisionSignals(candidateRoot, now);
       if (signals) {
-        this.#reportRootCollisions(candidateRoot);
+        this.#reportRootCollisions(candidateRoot, signals.peers);
         this.#rootCollisionPass = signals;
       }
     }
@@ -3524,22 +3559,27 @@ export class ParticipantDirectory implements FabricParticipantSource {
       return participant ? [{ entry, participant }] : [];
     });
     const existingById = new Map(existing.map((item) => [item.participant.id, item]));
-    const legacyRoots = new Map(
-      this.mesh
-        .listAllShared(LEGACY_SESSION_PREFIX, read)
-        .flatMap((entry) => {
-          const root = legacyRootFromEntry(entry, this.options.rootId, now, this.mesh.root);
-          return root ? [[root.id, root] as const] : [];
-        }),
-    );
-    const legacyActorOwners = new Map(
-      this.mesh
-        .listAllShared(LEGACY_ACTOR_PREFIX, read)
-        .flatMap((entry) => {
-          const actor = legacyActorFromEntry(entry, legacyRoots, now, this.options.terminalActor);
-          return actor ? [[actor.id, actor.ownerIdentityId] as const] : [];
-        }),
-    );
+    // Only legacy actors whose ids this publication could take over need their root's
+    // liveness. Otherwise this preparation would point-read every modern session's lease
+    // even after the compatibility/collision prechecks correctly narrowed their owners.
+    const legacyActors = this.mesh.listAllShared(LEGACY_ACTOR_PREFIX, read).filter(entry =>
+      isObject(entry.value) && typeof entry.value.id === "string" && desired.get(entry.value.id)?.kind === "actor");
+    const legacyOwners = new Set(legacyActors.map(entry => entry.updatedBy.id));
+    const legacySessions = this.mesh.listAllShared(LEGACY_SESSION_PREFIX, read).filter(entry => legacyOwners.has(entry.updatedBy.id));
+    const sessionOwnerIds = new Set<string>();
+    for (const entry of legacySessions) {
+      if (!isLiveLegacyRootEntry(entry, Number.NEGATIVE_INFINITY) || entry.value.livenessLeaseFiles !== 1) continue;
+      sessionOwnerIds.add(typeof entry.value.livenessHostId === "string" ? entry.value.livenessHostId : entry.value.id);
+    }
+    const sessionLeases = this.#candidateLeases(sessionOwnerIds);
+    const legacyRoots = new Map(legacySessions.flatMap(entry => {
+      const root = legacyRootFromEntry(entry, this.options.rootId, now, undefined, sessionLeases);
+      return root ? [[root.id, root] as const] : [];
+    }));
+    const legacyActorOwners = new Map(legacyActors.flatMap(entry => {
+      const actor = legacyActorFromEntry(entry, legacyRoots, now, this.options.terminalActor);
+      return actor ? [[actor.id, actor.ownerIdentityId] as const] : [];
+    }));
     // A write needs a change beyond the timestamps that sources stamp on every read (Main's
     // info() sets updatedAt to now) and the activity counters, which ride along at most every
     // ACTIVITY_REFRESH_MS.
@@ -4054,30 +4094,140 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return leaseAt;
   }
 
-  /**
-   * The root-collision report's change signals now, or undefined when nothing it reads changed since the
-   * last report: the bounded list() view's snapshot and participant files, the peer leases, and the
-   * local records and root it compares (smarty-dev#7978). Staleness only grows with time, so an unchanged
-   * view can report no new collision; a lease period still forces a full pass.
-   */
-  #rootCollisionSignals(root: FabricParticipantRecord, now: number): (PeerSignals & { local: string }) | undefined {
+  /** Fresh leases of distinct candidate owners only; never a directory-stamp negative cache. */
+  #candidateLeases(ownerIds: ReadonlySet<string>): ReadonlyMap<string, FabricHostLease> {
+    const leases = new Map<string, FabricHostLease>();
+    for (const id of ownerIds) {
+      const lease = readHostLease(this.mesh.root, id);
+      if (lease) leases.set(id, lease);
+    }
+    return leases;
+  }
+
+  #possibleRootCollision(root: FabricParticipantRecord, peer: Pick<FabricParticipantRecord, "id" | "name" | "sessionId" | "status">): boolean {
+    return peer.id !== root.id && ["idle", "running", "reloading"].includes(peer.status) &&
+      ((root.sessionId !== undefined && root.sessionId === peer.sessionId) || (root.name !== "main" && root.name === peer.name));
+  }
+
+  /** Canonical precedence first, liveness second. Keep nonmatching native roots of a legacy
+   * candidate's id too: an accepted native suppresses that legacy fallback in list(). */
+  #rootCollisionCandidates(root: FabricParticipantRecord, list: (prefix: string) => readonly MeshStateEntry[],
+    files: readonly MeshStateEntry[]): RootCollisionCandidates {
+    const hosts = list(HOST_PREFIX);
+    const merged = mergeParticipantEntries(files, list(PARTICIPANT_PREFIX));
+    const parsed = this.#participantsOf(merged.entries);
+    const nativeRoots = parsed.participants.filter(peer => peer.kind === "root");
+    // An observer's terminal envelope can hide an authentic root FILE even when the
+    // envelope says actor. Inspect file metadata first, not the terminal authority callback
+    // (which can itself read owner leases). Never cache the callback's accepted answer.
+    const terminalRoots = parsed.terminalActors.map(entry => {
+      const file = readParticipantFile(this.mesh.root, entry.key);
+      const fallback = file && participantFromEntry(file);
+      const value = entry.value;
+      // Raw fields are selectors only, NOT accepted presence; #rootCollisionPeers validates
+      // through #terminalOrParticipant before a terminal candidate can suppress a legacy root.
+      const raw = isObject(value) && value.kind === "root" &&
+        ["id", "name", "status", "rootId", "ownerHostId", "ownerIdentityId"].every(key => typeof value[key] === "string")
+        ? value as unknown as FabricParticipantRecord : undefined;
+      return { entry, metadata: [fallback, raw].filter((peer): peer is FabricParticipantRecord => peer?.kind === "root") };
+    });
+    const participants = [...nativeRoots, ...terminalRoots.flatMap(candidate => candidate.metadata)];
+    const sessions = list(LEGACY_SESSION_PREFIX).filter(entry => isLiveLegacyRootEntry(entry, Number.NEGATIVE_INFINITY));
+    const ids = new Set(participants.filter(peer => this.#possibleRootCollision(root, peer)).map(peer => peer.id));
+    for (const entry of sessions) {
+      const value = entry.value as Record<string, unknown> & { id: string; status: string };
+      if (this.#possibleRootCollision(root, { id: value.id, status: value.status,
+        name: typeof value.name === "string" ? value.name : "main",
+        ...(typeof value.sessionId === "string" ? { sessionId: value.sessionId } : {}) })) ids.add(value.id);
+    }
+    // A refused mirror can reveal a local in-memory root, just as the project listing does.
+    const claims = this.#liveHosts(hosts, new Map());
+    for (const peer of participants) {
+      const local = this.#localRecords.get(peer.id);
+      if (local?.kind === "root" && this.#possibleRootCollision(root, local) && this.#collides(peer, claims, false)) ids.add(peer.id);
+    }
+    const candidates = participants.filter(peer => ids.has(peer.id));
+    const legacy = sessions.filter(entry => ids.has((entry.value as { id: string }).id));
+    const ownerIds = new Set<string>();
+    for (const peer of candidates) {
+      const owner = claims.get(peer.ownerHostId);
+      // No lease can repair canonical identity/root/provenance mismatches or a refused mirror.
+      if (owner && ownerMatches(peer, owner, this.options.hostId) && owner.identity.id === peer.ownerIdentityId &&
+        owner.rootId === peer.rootId && !this.#collides(peer, claims, false)) ownerIds.add(peer.ownerHostId);
+    }
+    for (const entry of legacy) {
+      const value = entry.value as Record<string, unknown> & { id: string };
+      if (value.livenessLeaseFiles === 1) ownerIds.add(typeof value.livenessHostId === "string" ? value.livenessHostId : value.id);
+    }
+    return { hosts, participants: nativeRoots.filter(peer => ids.has(peer.id)),
+      terminalRoots: terminalRoots.filter(candidate => candidate.metadata.some(peer => ids.has(peer.id))).map(candidate => candidate.entry),
+      sessions: legacy, ownerIds, mirrors: parsed.participants.filter(peer => peer.remoteHost !== undefined),
+      shadowed: merged.shadowed.flatMap(entry => participantFromEntry(entry) ?? []), malformed: parsed.malformed };
+  }
+
+  /** The project/root slice of list(), using only this synchronous preparation's leases.
+   * Native claims still use ALL host metadata, irrespective of whether those hosts are live. */
+  #rootCollisionPeers(candidates: RootCollisionCandidates, leases: ReadonlyMap<string, FabricHostLease>, now: number): FabricParticipantRecord[] {
+    const hosts = this.#liveHosts(candidates.hosts, leases);
+    for (const entry of candidates.malformed) this.#reportMalformedMirror(entry);
+    for (const peer of candidates.shadowed) this.#collides(peer, hosts);
+    // list() reports refused mirrors before its kind/status filters. Preserve those alerts
+    // with host claims alone: unrelated mirror owners need no lease observation for refusal.
+    for (const peer of candidates.mirrors) if (ownerMatches(peer, hosts.get(peer.ownerHostId), this.options.hostId)) this.#collides(peer, hosts);
+    const byId = new Map<string, FabricParticipantRecord>();
+    const refused: string[] = [];
+    const participants = [...candidates.participants, ...candidates.terminalRoots.flatMap(entry =>
+      this.#terminalOrParticipant(entry) ?? []).filter(peer => peer.kind === "root")];
+    for (const peer of participants) {
+      if (peer.stopReason === "owner-root-gone" && !retainedTerminalActor(peer, now)) continue;
+      const owner = hosts.get(peer.ownerHostId);
+      if (!ownerMatches(peer, owner, this.options.hostId)) continue;
+      if (this.#collides(peer, hosts)) { refused.push(peer.id); continue; }
+      if (!owner || (owner.remoteHost ? this.#mirrorStatus(owner, now) === "lease-stale" : owner.expiresAt < now) ||
+        (peer.status === "reloading" && (peer.reloadUntil ?? 0) < now) ||
+        owner.identity.id !== peer.ownerIdentityId || owner.rootId !== peer.rootId) continue;
+      byId.set(peer.id, peer);
+    }
+    for (const id of refused) {
+      const local = this.#localRecords.get(id);
+      if (local?.kind === "root" && !byId.has(id)) byId.set(id, local);
+    }
+    const legacy = new Map<string, FabricParticipantRecord>();
+    for (const entry of candidates.sessions) {
+      const peer = legacyRootFromEntry(entry, this.options.rootId, now, undefined, leases);
+      if (peer) legacy.set(peer.id, peer);
+    }
+    for (const peer of legacy.values()) if (!byId.has(peer.id)) byId.set(peer.id, peer);
+    return [...byId.values()].sort((left, right) => left.startedAt - right.startedAt ||
+      left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+  }
+
+  /** Same bounded canonical metadata as the collision view; fresh relevant leases on EVERY
+   * call, before any memo hit. An in-place revival need not have delivered a watch callback. */
+  #rootCollisionSignals(root: FabricParticipantRecord, now: number): RootCollisionSignals | undefined {
     const checkedAt = Date.now();
     if (typeof this.mesh.stateToken !== "function" || typeof this.mesh.listAllShared !== "function") {
-      return { token: {}, entries: [], files: [], leases: new Map(), local: "", at: now, checkedAt };
+      const files = this.#participantFiles({ fresh: false }, this.options.listReadCacheMs);
+      const candidates = this.#rootCollisionCandidates(root, prefix => this.mesh.listAll(prefix), files);
+      const leases = this.#candidateLeases(candidates.ownerIds);
+      return { token: {}, entries: [], files, leases, local: "", candidates,
+        peers: this.#rootCollisionPeers(candidates, leases, now), at: now, checkedAt };
     }
-    // Exactly the reads list() makes for it (#parsed with the bounded, non-fresh read).
     const read = { fresh: false };
     const token = this.mesh.stateToken(read);
     const files = this.#participantFiles(read, this.options.listReadCacheMs);
-    const leases = readHostLeases(this.mesh.root);
     const local = JSON.stringify([root.id, root.name, root.sessionId, ...[...this.#localRecords.values()].map(record =>
       [record.id, record.kind, record.rootId, record.name, record.sessionId, record.status, record.reloadUntil, record.remoteHost])]);
     const last = this.#rootCollisionPass;
-    if (last && last.files === files && last.local === local &&
-      samePeerLeases(last.leases, leases, this.options.hostId) && now >= last.at &&
+    const unchanged = last && last.files === files && last.local === local && now >= last.at &&
       checkedAt >= last.checkedAt && checkedAt - last.checkedAt < this.#leaseMs &&
-      this.#samePeerState(last, token, ROOT_COLLISION_PREFIXES)) return undefined;
-    return { token, entries: this.#peerEntries(token, ROOT_COLLISION_PREFIXES), files, leases, local, at: now, checkedAt };
+      this.#samePeerState(last, token, ROOT_COLLISION_PREFIXES);
+    const candidates = unchanged ? last.candidates : this.#rootCollisionCandidates(root,
+      prefix => this.mesh.listAllShared(prefix, { snapshot: token }), files);
+    const leases = this.#candidateLeases(candidates.ownerIds);
+    if (unchanged && sameCandidateLeases(last.leases, leases)) return undefined;
+    return { token, entries: this.#peerEntries(token, ROOT_COLLISION_PREFIXES), files, leases, local, candidates,
+      peers: this.#rootCollisionPeers(candidates, leases, now), at: now, checkedAt };
   }
 
   /**
@@ -4092,24 +4242,25 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #legacyRenewalsRequired(now: number, snapshot?: object): boolean {
     if (typeof this.mesh.stateToken !== "function" || typeof this.mesh.listAllShared !== "function") {
       const read = snapshot ? { snapshot } : {};
-      return this.#legacyRenewalsScan(now, readHostLeases(this.mesh.root), (prefix) => this.mesh.listAll(prefix, read),
-        this.#participantFiles(read)).required;
+      const candidates = this.#legacyRenewalCandidates(prefix => this.mesh.listAll(prefix, read), this.#participantFiles(read));
+      return this.#legacyRenewalsScan(now, this.#candidateLeases(candidates.ownerIds), candidates).required;
     }
-    // Unpinned: the current canonical snapshot, the same exact read an unpinned listAll made.
+    // Unpinned calls (notably the post-confirmation decision) reacquire canonical state AND
+    // fresh candidate leases. Only immutable metadata can be reused; no observation crosses an await.
     const token = snapshot ?? this.mesh.stateToken();
     const read = { snapshot: token };
     const files = this.#participantFiles(read);
-    const leases = readHostLeases(this.mesh.root);
     const checkedAt = Date.now();
     const memo = this.#legacyRenewals;
-    if (memo && memo.files === files && samePeerLeases(memo.leases, leases, this.options.hostId) &&
-      checkedAt >= memo.checkedAt && checkedAt - memo.checkedAt < this.#leaseMs &&
-      (memo.required ? now <= memo.until : now >= memo.at) &&
-      this.#samePeerState(memo, token, LEGACY_RENEWAL_PREFIXES)) return memo.required;
-    // Read-only: hostFromEntry/participantFromEntry/isLiveLegacyRootEntry only inspect the entries, and
-    // #liveHosts and mergeParticipantEntries build new containers, so the shared entries need no copy.
-    const result = this.#legacyRenewalsScan(now, leases, (prefix) => this.mesh.listAllShared(prefix, read), files);
-    this.#legacyRenewals = { token, entries: this.#peerEntries(token, LEGACY_RENEWAL_PREFIXES), files, leases,
+    const unchanged = memo && memo.files === files && checkedAt >= memo.checkedAt &&
+      checkedAt - memo.checkedAt < this.#leaseMs && this.#samePeerState(memo, token, LEGACY_RENEWAL_PREFIXES);
+    const candidates = unchanged ? memo.candidates : this.#legacyRenewalCandidates(
+      prefix => this.mesh.listAllShared(prefix, read), files);
+    const leases = this.#candidateLeases(candidates.ownerIds);
+    if (unchanged && sameCandidateLeases(memo.leases, leases) &&
+      (memo.required ? now <= memo.until : now >= memo.at)) return memo.required;
+    const result = this.#legacyRenewalsScan(now, leases, candidates);
+    this.#legacyRenewals = { token, entries: this.#peerEntries(token, LEGACY_RENEWAL_PREFIXES), files, leases, candidates,
       at: now, checkedAt, ...result };
     return result.required;
   }
@@ -4135,27 +4286,49 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return true;
   }
 
-  /** The scan behind #legacyRenewalsRequired; `until` is when the old reader that answered true lapses. */
+  /** Select capabilities and canonical merge winners without inspecting any host lease. */
+  #legacyRenewalCandidates(list: (prefix: string) => readonly MeshStateEntry[], files: readonly MeshStateEntry[]): LegacyRenewalCandidates {
+    const entries = list(HOST_PREFIX);
+    const hosts = new Map<string, FabricHostRecord>();
+    const ownerIds = new Set<string>();
+    for (const entry of entries) {
+      const host = hostFromEntry(entry);
+      if (!host) continue;
+      hosts.set(host.id, host);
+      if (host.id !== this.options.hostId && host.remoteHost === undefined && host.livenessLeaseFiles !== 1) ownerIds.add(host.id);
+    }
+    const participants: FabricParticipantRecord[] = [];
+    for (const entry of mergeParticipantEntries(files, list(PARTICIPANT_PREFIX)).entries) {
+      const peer = participantFromEntry(entry);
+      if (!peer || peer.ownerHostId === this.options.hostId || peer.remoteHost !== undefined || peer.livenessLeaseFiles === 1) continue;
+      const owner = hosts.get(peer.ownerHostId);
+      if (!owner || owner.identity.id !== peer.ownerIdentityId || owner.rootId !== peer.rootId) continue;
+      participants.push(peer);
+      ownerIds.add(peer.ownerHostId);
+    }
+    // Pre-capability sessions use only their stored fixed TTL. Do not consult the file-backed
+    // liveness of modern sessions merely to discover that their capability excludes them.
+    const sessions = list(LEGACY_SESSION_PREFIX).filter(entry => entry.updatedBy.id !== this.options.identity.id &&
+      isObject(entry.value) && entry.value.livenessLeaseFiles !== 1);
+    return { hosts: entries.filter(entry => { const host = hostFromEntry(entry); return host && ownerIds.has(host.id); }),
+      participants, sessions, ownerIds };
+  }
+
+  /** `until` is when the old reader that answered true lapses. Leases are fresh for this call. */
   #legacyRenewalsScan(now: number, leases: ReadonlyMap<string, FabricHostLease>,
-    list: (prefix: string) => readonly MeshStateEntry[], files: readonly MeshStateEntry[],
+    candidates: LegacyRenewalCandidates,
   ): { required: boolean; until: number } {
-    const hosts = this.#liveHosts(list(HOST_PREFIX), leases);
+    const hosts = this.#liveHosts(candidates.hosts, leases);
     for (const host of hosts.values()) {
       if (host.id !== this.options.hostId && host.remoteHost === undefined &&
         host.expiresAt >= now && host.livenessLeaseFiles !== 1) return { required: true, until: host.expiresAt };
     }
-    for (const entry of list(LEGACY_SESSION_PREFIX)) {
-      if (entry.updatedBy.id !== this.options.identity.id && isLiveLegacyRootEntry(entry, now, this.mesh.root) &&
-        (!isObject(entry.value) || entry.value.livenessLeaseFiles !== 1)) {
-        return { required: true, until: sessionLiveness(entry, this.mesh.root).expiresAt };
-      }
+    for (const entry of candidates.sessions) {
+      if (isLiveLegacyRootEntry(entry, now)) return { required: true, until: sessionLiveness(entry).expiresAt };
     }
-    for (const entry of mergeParticipantEntries(files, list(PARTICIPANT_PREFIX)).entries) {
-      const peer = participantFromEntry(entry);
-      const owner = peer && hosts.get(peer.ownerHostId);
-      if (peer && peer.ownerHostId !== this.options.hostId && peer.remoteHost === undefined &&
-        owner && owner.expiresAt >= now && owner.identity.id === peer.ownerIdentityId &&
-        owner.rootId === peer.rootId && peer.livenessLeaseFiles !== 1) return { required: true, until: owner.expiresAt };
+    for (const peer of candidates.participants) {
+      const owner = hosts.get(peer.ownerHostId);
+      if (owner && owner.expiresAt >= now) return { required: true, until: owner.expiresAt };
     }
     return { required: false, until: Number.POSITIVE_INFINITY };
   }

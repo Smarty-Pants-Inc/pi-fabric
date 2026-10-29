@@ -5,7 +5,7 @@ import { syncDirectoryChain } from "../core/atomic-write.js";
 import { detachedPreview } from "../core/preview.js";
 import type { FabricMeshConfig, FabricRetentionConfig } from "../config.js";
 import type { MeshStore } from "../mesh/store.js";
-import { pruneActorRunArchives, pruneActorSessionBackups } from "../storage/retention.js";
+import { pruneActorSessionBackups } from "../storage/retention.js";
 import { openPrivateDir, writeArchiveFile, type PrivateDirectory } from "../storage/private-dir.js";
 import type { FabricActorMessage } from "./types.js";
 
@@ -158,7 +158,7 @@ export class ActorLogStore {
         }
         // Every present entry must succeed. Missing optional files are not refusals; unreadable files, symlinks,
         // unsafe destination entries and I/O failures are. Never discharge custody after a best-effort copy.
-        for (const file of ["events.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
+        for (const file of ["events.jsonl", "session.jsonl", "steer.jsonl", "lifecycle.jsonl", "route-session.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
           const src = path.join(runDirectory, file);
           if (fs.lstatSync(src, { throwIfNoEntry: false })) copyArchiveFile(held, file, src);
         }
@@ -176,19 +176,10 @@ export class ActorLogStore {
     }
   }
 
-  pruneRuns(actor: ActorLogTarget, now = Date.now()): void {
-    // smarty-dev#16444: archives, never deletes: older session backups move into <actor dir>/session-archive/.
+  pruneRuns(actor: ActorLogTarget, _now = Date.now()): void {
+    // Data safety: run archives are already retained traces; expiry must never delete them.
+    // smarty-dev#16444: older session backups move into <actor dir>/session-archive/ without losing bytes.
     pruneActorSessionBackups(actor.sessionFile);
-    pruneActorRunArchives({
-      runsDirectory: path.join(path.dirname(actor.sessionFile), "runs"),
-      ...(actor.lastRunId ? { latestRunId: actor.lastRunId } : {}),
-      retentionMs: this.retention.actorRunArchiveMs,
-      ...(this.retention.terminalRunEventsAgeMs !== undefined
-        ? { terminalRunEventsAgeMs: this.retention.terminalRunEventsAgeMs } : {}),
-      ...(this.retention.terminalRunEventsMaxBytes !== undefined
-        ? { terminalRunEventsMaxBytes: this.retention.terminalRunEventsMaxBytes } : {}),
-      now,
-    });
   }
 
   retainedRunIds(actor: ActorLogTarget): string[] {

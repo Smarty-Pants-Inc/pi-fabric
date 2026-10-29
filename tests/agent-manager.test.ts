@@ -436,9 +436,14 @@ describe("Agent prompt retention (#11663)", () => {
         oneShotRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs };
       expect(retentionStorage.sweepTempRunRoots({ ...options, now: result.finishedAt! + options.oneShotRunRetentionMs - 1 }).removedRuns).toEqual([]);
       expect(removals).toEqual([]);
+      expect(custodyMoves.filter(move => move.source === run)).toEqual([]);
       expect(retentionStorage.sweepTempRunRoots({ ...options, now: result.finishedAt! + options.oneShotRunRetentionMs + 1 }).removedRuns).toEqual([run]);
-      expect(removals).toContain(run);
-      expect(rawInventory(run)).toEqual(before); // Recorded collection intent is NOT native deletion/custody.
+      expect(removals).not.toContain(run); // Only the empty root/marker may enter a deleter.
+      const move = custodyMoves.find(move => move.source === run)!;
+      expect(move).toBeDefined();
+      expect(JSON.parse(fs.readFileSync(move.receipt, "utf8"))).toMatchObject({ source: run, state: "moved", reason: "temp run retention whole-root custody" });
+      expect(rawInventory(move.destination)).toEqual(before);
+      expect(fs.existsSync(run)).toBe(false);
     } finally { remove.mockRestore(); }
   });
 });

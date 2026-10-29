@@ -988,7 +988,7 @@ describe("concrete record dispatch integration (host receipt probes, not B3/B5/B
       const alias = settled.find(row => row.toolCallId === "fresh-direct-alias")!;
       const nested = settled.find(row => row.toolCallId !== direct.toolCallId && row.toolCallId !== alias.toolCallId)!;
       const read = await f.runtime.readToolResult(direct);
-      expect(read).toEqual({ source: "adapter-original", message: {
+      expect(read).toEqual({ source: "adapter-original", postHook: false, message: {
         role: "toolResult", toolCallId: "direct-original", toolName: "write", content: original.content,
         details: original.details, isError: false,
       } });
@@ -1022,14 +1022,40 @@ describe("concrete record dispatch integration (host receipt probes, not B3/B5/B
       },
     });
     try {
-      await f.direct("write", "native-reader-original", args);
-      const effect = (await f.runtime.settlePendingIntents(f.owner.logicalSessionId, "native-reader-generation")).settled[0]!;
-      expect((await f.runtime.readToolResult(effect)).source).toBe("adapter-original");
+      const original = await f.direct("write", "native-reader-original", args);
+      await f.direct("write", "native-reader-alias", args);
+      const fallbackEffects = (await f.runtime.settlePendingIntents(f.owner.logicalSessionId, "native-reader-generation")).settled;
+      expect(fallbackEffects).toHaveLength(2);
+      const fallbackByCall = new Map(fallbackEffects.map(effect => [effect.toolCallId, effect]));
+      const fallback = await f.runtime.readToolResult(fallbackByCall.get("native-reader-original")!);
+      expect(fallback).toMatchObject({ source: "adapter-original", postHook: false, message: {
+        role: "toolResult", toolCallId: "native-reader-original", toolName: "write", isError: false,
+        content: original.content, details: original.details,
+      } });
+      expect(fallback.message).not.toHaveProperty("timestamp");
+      expect(await f.runtime.readToolResult(fallbackByCall.get("native-reader-alias")!)).toEqual(fallback);
+
       nativeAvailable = true;
-      const read = await f.runtime.readToolResult(effect);
-      expect(read).toMatchObject({ source: "native-entry", message: { timestamp: 123_456, content: [{ text: "post-hook native receipt probe" }] } });
-      expect(sha256Bytes(canonicalEncode(read.message))).not.toBe(effect.resultBytesHash);
-      await expect(f.runtime.readToolResult({ ...effect, resultBytesHash: sha256Bytes("forged raw original") })).rejects.toMatchObject({ code: "EFFECT_RESULT_UNAVAILABLE" });
+      for (const effect of fallbackEffects) {
+        await expect(f.runtime.readToolResult(effect)).rejects.toMatchObject({ code: "EFFECT_RESULT_UNAVAILABLE" });
+      }
+
+      // A fresh settlement must project a native hash independently for each
+      // physical alias; the earlier canonical adapter hash cannot authorize it.
+      const nativeEffects = (await f.runtime.settlePendingIntents(f.owner.logicalSessionId, "native-reader-generation")).settled;
+      expect(nativeEffects).toHaveLength(2);
+      for (const effect of nativeEffects) {
+        const read = await f.runtime.readToolResult(effect);
+        expect(read).toMatchObject({ source: "native-entry", postHook: true, message: {
+          role: "toolResult", toolCallId: effect.toolCallId, toolName: "write", isError: false,
+          content: [{ type: "text", text: "post-hook native receipt probe" }], details: { nativeProbe: true }, timestamp: 123_456,
+        } });
+        expect(effect.resultBytesHash).toBe(sha256Bytes(JSON.stringify(read.message)));
+        expect(effect.resultBytesHash).not.toBe(fallbackByCall.get(effect.toolCallId)!.resultBytesHash);
+        expect(sha256Bytes(canonicalEncode(read.message))).not.toBe(effect.resultBytesHash);
+      }
+      expect(new Set(nativeEffects.map(effect => effect.resultBytesHash)).size).toBe(2);
+      await expect(f.runtime.readToolResult({ ...nativeEffects[0]!, resultBytesHash: sha256Bytes("forged raw original") })).rejects.toMatchObject({ code: "EFFECT_RESULT_UNAVAILABLE" });
     } finally { await f.close(); }
   });
 });

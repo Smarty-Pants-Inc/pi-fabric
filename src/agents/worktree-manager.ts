@@ -146,9 +146,14 @@ const protectCleanupContainers = (containers: readonly string[]): void => {
   // chmod(0700) does not establish Windows privacy. Protect this fresh container's
   // inheritable DACL for the current account and SYSTEM, then verify exact bytes.
   const command = windowsSecurityPowerShell(String.raw`
-$directories = if ($env:PI_FABRIC_CLEANUP_BATCH -eq '1') {
-  @([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())) | ConvertFrom-Json)
+$expectedCount = [int]$env:PI_FABRIC_CLEANUP_EXPECTED_COUNT
+if ($expectedCount -lt 1) { throw 'custody container expected count is invalid' }
+# PowerShell 5.1 emits the JSON array as one object; do not wrap it in @().
+[string[]]$directories = if ($env:PI_FABRIC_CLEANUP_BATCH -eq '1') {
+  [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())) | ConvertFrom-Json
 } else { @($env:PI_FABRIC_CLEANUP_CONTAINER) }
+if ($directories.Count -ne $expectedCount) { throw 'custody container input count mismatch' }
+$protectedCount = 0
 foreach ($directory in $directories) {
 $item = Get-Item -Force -LiteralPath $directory
 if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'custody container is not an ordinary directory' }
@@ -175,8 +180,11 @@ $e = [byte[]]::new($expected.DiscretionaryAcl.BinaryLength)
 $actual.DiscretionaryAcl.GetBinaryForm($a, 0)
 $expected.DiscretionaryAcl.GetBinaryForm($e, 0)
 if ([Convert]::ToBase64String($a) -cne [Convert]::ToBase64String($e)) { throw 'custody DACL read-back mismatch' }
+$protectedCount++
 }
-`, { ...process.env, PI_FABRIC_CLEANUP_CONTAINER: containers[0], PI_FABRIC_CLEANUP_BATCH: containers.length > 1 ? "1" : "0" });
+if ($protectedCount -ne $expectedCount) { throw 'custody container protection count mismatch' }
+`, { ...process.env, PI_FABRIC_CLEANUP_CONTAINER: containers[0], PI_FABRIC_CLEANUP_BATCH: containers.length > 1 ? "1" : "0",
+  PI_FABRIC_CLEANUP_EXPECTED_COUNT: String(containers.length) });
   execFileSync(command.file, command.args, {
     env: command.env, timeout: 15_000, windowsHide: true,
     // ASCII base64 JSON avoids both environment-size and PS 5.1 code-page limits.

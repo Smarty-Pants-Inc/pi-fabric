@@ -1129,12 +1129,21 @@ describe("raw mirrored control freshness admission", () => {
     expect(f.commands()).toHaveLength(1);
   });
 
-  it.each(["stale", "absent", "translated-expired"] as const)("%s authority waits once then refuses peer-stale before publication", async state => {
+  it.each(["stale", "absent"] as const)("%s authority waits once then refuses peer-stale before publication", async state => {
     const f = setup(state), start = Date.now();
     await expect(f.send()).rejects.toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", retryable: true, remoteHost: "forge" });
     expect(Date.now() - start).toBeGreaterThanOrEqual(40);
     expect(Date.now() - start).toBeLessThan(2_000);
     expect(f.commands()).toEqual([]);
+  });
+
+  it("a translated lapse with a fresh positive source sample delivers within sender grace", async () => {
+    const f = setup("translated-expired");
+    const request = f.send();
+    void request.catch(() => undefined);
+    await f.ack();
+    await expect(request).resolves.toMatchObject({ acknowledged: true, messageId: "once" });
+    expect(f.commands()).toHaveLength(1);
   });
 
   it("fresh source-lapsed evidence is immediately Unknown, even with future projection", async () => {

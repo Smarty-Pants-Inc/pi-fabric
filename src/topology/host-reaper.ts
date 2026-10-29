@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { MeshBatchOperation, MeshBatchView, MeshIdentity, MeshStateEntry, MeshStore } from "../mesh/store.js";
 import { type FabricHostLease, hostEntryLiveness, hostLeasePath, hostLeasePredecessor,
-  readHostLeases, removeHostLeaseVersionUnderCustody, sameHostLeaseVersion, withHostLeaseDirectoryCustody } from "./host-leases.js";
+  hostMirrorLease, MIRROR_FRESH_MS, readHostLeases, removeHostLeaseVersionUnderCustody, sameHostLeaseVersion,
+  withHostLeaseDirectoryCustody } from "./host-leases.js";
 import { isMeshWriteDeferred } from "../core/atomic-write.js";
 import { participantFilePresent, readParticipantFiles, removeParticipantFileIf, sweepParticipantLockLeftovers } from "./participant-files.js";
 import { isLiveLegacyRootEntry } from "./legacy-root-liveness.js";
@@ -31,7 +32,25 @@ const record = (value: unknown): Record<string, unknown> | undefined =>
 
 // A host lease entry that is gone for the window: its lease (or, without one, its last write)
 // is older than the cutoff, and so is the host's file lease (smarty-dev#816).
-const leaseGone = (entry: MeshStateEntry, cutoff: number, leases: ReadonlyMap<string, FabricHostLease>): boolean => {
+const hasFreshMirrorObservation = (entry: MeshStateEntry, leases: ReadonlyMap<string, FabricHostLease>, now: number): boolean => {
+  const value = record(entry.value);
+  const identity = record(value?.identity);
+  if (typeof value?.id !== "string" || typeof value.rootId !== "string" || typeof identity?.id !== "string" ||
+      typeof value.remoteHost !== "string") return false;
+  const mirror = hostMirrorLease(leases, {
+    id: value.id, rootId: value.rootId, identity: { id: identity.id }, remoteHost: value.remoteHost,
+    ...(typeof value.startedAt === "number" ? { startedAt: value.startedAt } : {}),
+    ...(typeof value.incarnationToken === "string" ? { incarnationToken: value.incarnationToken } : {}),
+    expiresAt: typeof value.expiresAt === "number" ? value.expiresAt : entry.updatedAt,
+  });
+  return !!mirror && mirror.observedAt <= now && now - mirror.observedAt < MIRROR_FRESH_MS;
+};
+
+const leaseGone = (entry: MeshStateEntry, cutoff: number, leases: ReadonlyMap<string, FabricHostLease>, now: number): boolean => {
+  // Retain the lease receipt while its bridge is still producing observations. This is not
+  // routing authority: hostLiveness still expires at the sampled source deadline, and the
+  // sender independently bounds any use of the last good sample.
+  if (hasFreshMirrorObservation(entry, leases, now)) return false;
   return hostEntryLiveness(entry, leases).expiresAt <= cutoff;
 };
 
@@ -79,14 +98,15 @@ export const deadHostRecords = (
   options: DeadHostOptions,
   leases: ReadonlyMap<string, FabricHostLease> = fileLeases(mesh),
 ): DeadRecord[] => {
-  const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
+  const now = options.now ?? Date.now();
+  const cutoff = now - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
   const fresh = { fresh: true };
   const hosts = new Map<string, boolean>();
   const dead: DeadRecord[] = [];
   for (const entry of mesh.listAll(HOST_PREFIX, fresh)) {
     const id = record(entry.value)?.id;
     if (typeof id !== "string" || entry.key !== hostKey(id)) continue;
-    const gone = id !== options.ownHostId && leaseGone(entry, cutoff, leases);
+    const gone = id !== options.ownHostId && leaseGone(entry, cutoff, leases, now);
     hosts.set(id, gone);
     if (gone) dead.push({ entry, hostId: id });
   }
@@ -194,7 +214,8 @@ export const reapDeadHostRecords = async (
   options: DeadHostOptions & { withCommitFence?: <T>(operation: () => T | Promise<T>) => Promise<T> },
 ): Promise<number> => {
   const fenced = options.withCommitFence ?? (async <T>(operation: () => T | Promise<T>): Promise<T> => operation());
-  const cutoff = (options.now ?? Date.now()) - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
+  const now = options.now ?? Date.now();
+  const cutoff = now - (options.deadAfterMs ?? DEAD_HOST_RECORDS_MS);
   const selectedLeases = fileLeases(mesh);
   const found = deadHostRecords(mesh, options, selectedLeases);
   const bookkeeping = staleDirectoryDeletes(mesh, identity, options);
@@ -249,7 +270,7 @@ export const reapDeadHostRecords = async (
         condition: (current: (key: string) => MeshStateEntry | undefined) => {
           const host = current(hostKey(hostId));
           return !retainedTerminalActor(current(entry.key), options) &&
-            (host === undefined || leaseGone(host, cutoff, leases));
+            (host === undefined || leaseGone(host, cutoff, leases, now));
         },
       })),
       prepare: (view, fileRead) => {
@@ -257,9 +278,9 @@ export const reapDeadHostRecords = async (
         if (typeof root === "string") leases = fileRead as ReadonlyMap<string, FabricHostLease>;
         for (const hostId of targets) {
           const host = view.get(hostKey(hostId));
-          if (!host || leaseGone(host, cutoff, leases)) reapable.add(hostId);
+          if (!host || leaseGone(host, cutoff, leases, now)) reapable.add(hostId);
         }
-        const live = liveRootCursorKeys(view, mesh, options.now ?? Date.now(), leases);
+        const live = liveRootCursorKeys(view, mesh, now, leases);
         return bookkeeping.filter(op => !live.has(op.key));
       },
       beforeCommit: () => { for (const hostId of targets) assertTarget(hostId, selectedLeases.get(hostId)); },
@@ -287,7 +308,7 @@ export const reapDeadHostRecords = async (
       const gone = await removeParticipantFileIf({ root, custody: operation => mesh.custody(operation) }, entry.key, current => {
         const host = mesh.listAll(hostKey(hostId), { fresh: true }).find(candidate => candidate.key === hostKey(hostId));
         return current.version === entry.version && current.updatedAt === entry.updatedAt &&
-          !retainedTerminalActor(current, options) && (!host || leaseGone(host, cutoff, fileLeases(mesh)));
+          !retainedTerminalActor(current, options) && (!host || leaseGone(host, cutoff, fileLeases(mesh), now));
       }, { withCommitFence: operation => targetGate(hostId, () => fenced(() => {
         assertTarget(hostId, retired.has(hostId) ? undefined : selectedLeases.get(hostId));
         return operation();

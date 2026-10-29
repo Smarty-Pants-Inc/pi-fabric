@@ -35,6 +35,7 @@ import {
   hostLeasePredecessor,
   hostLiveness,
   hostMirrorLease,
+  MIRROR_FRESH_MS,
   mirroredOwnerRoutingStatus,
   waitForMirroredLeaseRenewal,
   type MirrorLeaseWaitBudget,
@@ -809,6 +810,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #commitWitnessSeen = 0;
   readonly #leaseMs: number;
   readonly #localRecords = new Map<string, FabricParticipantRecord>();
+  /** Last validated remote root authority, retained only for the bounded mirror grace. */
+  readonly #mirroredControlOwners = new Map<string, { remoteHost: string; expiresAt: number; mirror?: FabricMirrorLease;
+    ownerIncarnation?: string; ownerIdentityId: string; targetId: string; hostStartedAt?: number; hostIncarnationToken?: string }>();
   #parsedCache: { token: object; files: readonly MeshStateEntry[]; value: ParsedDirectory } | undefined;
   #parsedEntries = new Map<string, { source: Readonly<MeshStateEntry>; entry: MeshStateEntry }>();
   /** fv2-11107: the last poll ownership map, reusable only while its observation of the managed actors holds. */
@@ -2194,35 +2198,78 @@ export class ParticipantDirectory implements FabricParticipantSource {
     ownerHostId: string,
     ownerIdentityId: string | undefined,
     targetId: string,
-  ): { remoteHost: string; expiresAt: number; mirror?: FabricMirrorLease; bridgeStale?: true; ownerIncarnation?: string } | undefined {
+  ): { remoteHost: string; expiresAt: number; mirror?: FabricMirrorLease; bridgeStale?: true; ownerIncarnation?: string; ownerChanged?: true } | undefined {
     if (this.#isNats()) return undefined;
     if (!this.options.enabled || ownerIdentityId === undefined) return undefined;
     const read = { fresh: true };
     const entry = this.#participantEntry(keyFor(PARTICIPANT_PREFIX, targetId), read);
     const participant = entry ? participantFromEntry(entry) : undefined;
-    if (
-      !participant?.remoteHost ||
-      participant.id !== targetId ||
-      participant.kind !== "root" ||
-      participant.rootId !== targetId ||
-      participant.ownerHostId !== ownerHostId ||
-      participant.ownerIdentityId !== ownerIdentityId
-    ) return undefined;
+    const prior = this.#mirroredControlOwners.get(ownerHostId);
+    if (!participant?.remoteHost || participant.id !== targetId || participant.kind !== "root" || participant.rootId !== targetId) {
+      return prior?.targetId === targetId && prior.ownerIdentityId === ownerIdentityId
+        ? { remoteHost: prior.remoteHost, expiresAt: 0, ownerChanged: true,
+          ...(prior.ownerIncarnation !== undefined ? { ownerIncarnation: prior.ownerIncarnation } : {}) } : undefined;
+    }
+    if (participant.ownerHostId !== ownerHostId || participant.ownerIdentityId !== ownerIdentityId) {
+      return prior?.targetId === targetId && prior.ownerIdentityId === ownerIdentityId
+        ? { remoteHost: participant.remoteHost, expiresAt: 0, ownerChanged: true,
+          ...(participant.ownerIncarnation !== undefined ? { ownerIncarnation: participant.ownerIncarnation } : {}) } : undefined;
+    }
+    if (prior && prior.targetId === targetId && prior.ownerIdentityId === ownerIdentityId &&
+        (prior.remoteHost !== participant.remoteHost || prior.ownerIncarnation !== participant.ownerIncarnation)) {
+      this.#mirroredControlOwners.delete(ownerHostId);
+      return { remoteHost: participant.remoteHost, expiresAt: 0, ownerChanged: true,
+        ...(participant.ownerIncarnation !== undefined ? { ownerIncarnation: participant.ownerIncarnation } : {}) };
+    }
     const leases = readHostLeases(this.mesh.root);
     const hosts = this.#liveHosts(this.mesh.listAll(HOST_PREFIX, read), leases);
     const owner = hosts.get(ownerHostId);
-    if (
-      !owner ||
-      !ownerMatches(participant, owner, this.options.hostId) ||
-      owner.identity.id !== ownerIdentityId ||
-      owner.rootId !== participant.rootId ||
-      !Number.isFinite(owner.expiresAt) ||
-      this.#collides(participant, hosts, false)
-    ) return undefined;
+    const now = Date.now();
+    const currentLease = leases.get(ownerHostId);
+    const currentSample = currentLease?.mirror;
+    const sampleMatchesPrior = !!prior && !!currentLease && currentLease.rootId === participant.rootId &&
+      currentLease.identityId === ownerIdentityId && currentLease.startedAt === prior.hostStartedAt &&
+      currentLease.incarnationToken === prior.hostIncarnationToken && currentSample?.remoteHost === participant.remoteHost;
+    if (sampleMatchesPrior && currentSample && currentSample.observedAt <= now &&
+        now - currentSample.observedAt < MIRROR_FRESH_MS &&
+        currentSample.observedAt >= (prior!.mirror?.observedAt ?? Number.NEGATIVE_INFINITY) &&
+        currentSample.sourceExpiresAt <= currentSample.sourceObservedAt) {
+      const death = { remoteHost: participant.remoteHost, expiresAt: currentSample.observedAt - 1, mirror: currentSample,
+        ...(participant.ownerIncarnation !== undefined ? { ownerIncarnation: participant.ownerIncarnation } : {}) };
+      this.#mirroredControlOwners.set(ownerHostId, { ...death, ownerIdentityId, targetId,
+        ...(currentLease!.startedAt !== undefined ? { hostStartedAt: currentLease!.startedAt } : {}),
+        ...(currentLease!.incarnationToken !== undefined ? { hostIncarnationToken: currentLease!.incarnationToken } : {}) });
+      return death;
+    }
+    const cached = (): { remoteHost: string; expiresAt: number; mirror: FabricMirrorLease; ownerIncarnation?: string } | undefined => {
+      if (!prior || prior.targetId !== targetId || prior.ownerIdentityId !== ownerIdentityId ||
+          prior.remoteHost !== participant.remoteHost || prior.ownerIncarnation !== participant.ownerIncarnation ||
+          !prior.mirror || prior.mirror.remoteHost !== participant.remoteHost ||
+          prior.mirror.sourceExpiresAt <= prior.mirror.sourceObservedAt || now < prior.mirror.observedAt ||
+          now - prior.mirror.observedAt >= participantLeaseGraceMs()) return undefined;
+      return { remoteHost: prior.remoteHost, expiresAt: prior.expiresAt, mirror: prior.mirror,
+        ...(prior.ownerIncarnation !== undefined ? { ownerIncarnation: prior.ownerIncarnation } : {}) };
+    };
+    if (!owner) {
+      const retained = cached();
+      if (retained) return retained;
+      this.#mirroredControlOwners.delete(ownerHostId);
+      return undefined;
+    }
+    if (!ownerMatches(participant, owner, this.options.hostId) || owner.identity.id !== ownerIdentityId ||
+        owner.rootId !== participant.rootId || !Number.isFinite(owner.expiresAt) || this.#collides(participant, hosts, false)) return undefined;
     const mirror = owner.mirror;
-    return { remoteHost: participant.remoteHost, expiresAt: owner.expiresAt,
+    const result = { remoteHost: participant.remoteHost, expiresAt: owner.expiresAt,
       ...(participant.ownerIncarnation !== undefined ? { ownerIncarnation: participant.ownerIncarnation } : {}),
       ...(mirror ? { mirror } : owner.bridgeStale ? { bridgeStale: true as const } : {}) };
+    if (mirror) this.#mirroredControlOwners.set(ownerHostId, { ...result, ownerIdentityId, targetId,
+      ...(owner.startedAt !== undefined ? { hostStartedAt: owner.startedAt } : {}),
+      ...(owner.incarnationToken !== undefined ? { hostIncarnationToken: owner.incarnationToken } : {}) });
+    else if (owner.bridgeStale) {
+      const retained = cached();
+      if (retained) return retained;
+    }
+    return result;
   }
 
   #routingOwner(id: string) {

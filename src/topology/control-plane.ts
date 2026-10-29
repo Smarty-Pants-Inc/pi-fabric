@@ -399,7 +399,16 @@ export interface MirroredControlOwner {
   ownerIncarnation?: string;
   /** Observation exists but does not belong to this owner/link. Never fall back to legacy expiry. */
   bridgeStale?: true;
+  /** Fresh directory evidence says the validated participant's owner binding changed. */
+  ownerChanged?: true;
 }
+
+const mirroredRoutingStatusWithGrace = (owner: MirroredControlOwner, now: number, graceMs: number) => {
+  const status = mirroredOwnerRoutingStatus(owner, now);
+  return status === "bridge-stale" && owner.mirror && owner.mirror.remoteHost === owner.remoteHost &&
+    owner.mirror.sourceExpiresAt > owner.mirror.sourceObservedAt && owner.mirror.observedAt <= now &&
+    now - owner.mirror.observedAt < participantLeaseGraceMs(graceMs) ? "live" : status;
+};
 
 /** Private pre-publication signal only; never an owner ACK and never replay published work. */
 class MirrorLeaseAdmissionRequired extends Error {
@@ -1093,6 +1102,7 @@ export class FabricControlPlane {
       if (typeof destination.remoteHost === "string") throw unavailable(destination.remoteHost);
       throw error;
     }
+    if (mirroredOwner?.ownerChanged) throw new FabricControlStaleIncarnationError(targetId);
     if (typeof destination.remoteHost === "string" && mirroredOwner?.remoteHost !== destination.remoteHost) {
       throw unavailable(destination.remoteHost);
     }
@@ -1153,6 +1163,7 @@ export class FabricControlPlane {
     const capturedMirror = mirroredOwner;
     const readMirror = (): MirroredControlOwner | undefined => {
       const current = this.options.readMirroredOwner?.(ownerHostId, ownerIdentityId, targetId);
+      if (current?.ownerChanged) throw new FabricControlStaleIncarnationError(targetId);
       if (!current || current.remoteHost !== destinationRemoteHost) return undefined;
       if (current.ownerIncarnation !== capturedMirror?.ownerIncarnation ||
         ownerIncarnation !== undefined && current.ownerIncarnation !== undefined && current.ownerIncarnation !== ownerIncarnation) {
@@ -1170,7 +1181,7 @@ export class FabricControlPlane {
       if (this.#pending.has(commandId)) throw new Error(`Fabric message with idempotencyKey ${idempotencyKey} is already awaiting acknowledgement`);
       const current = readMirror();
       if (!current) throw unavailable(initial.remoteHost);
-      const status = mirroredOwnerRoutingStatus(current, (this.options.now ?? Date.now)());
+      const status = mirroredRoutingStatusWithGrace(current, (this.options.now ?? Date.now)(), this.options.leaseGraceMs ?? participantLeaseGraceMs());
       if (status === "lease-stale") throw rootGone(initial.remoteHost);
       if (status === "bridge-stale") throw new FabricPeerLeaseStaleError(targetId, initial.remoteHost,
         Math.max(0, (this.options.now ?? Date.now)() - current.expiresAt));
@@ -1185,7 +1196,7 @@ export class FabricControlPlane {
     });
     if (cachedAtAdmission && mirroredOwner && !readMirror()) throw unavailable(mirroredOwner.remoteHost);
     if (mirroredOwner && !cachedAtAdmission) {
-      const status = mirroredOwnerRoutingStatus(mirroredOwner, (this.options.now ?? Date.now)());
+      const status = mirroredRoutingStatusWithGrace(mirroredOwner, (this.options.now ?? Date.now)(), this.options.leaseGraceMs ?? participantLeaseGraceMs());
       if (status === "lease-stale") throw rootGone(mirroredOwner.remoteHost);
       if (status === "bridge-stale") mirroredOwner = await renewMirror(mirroredOwner);
     }
@@ -1317,7 +1328,7 @@ export class FabricControlPlane {
             if (mirroredOwner) {
               const current = readMirror();
               if (!current) throw unavailable(mirroredOwner.remoteHost);
-              const status = mirroredOwnerRoutingStatus(current, (this.options.now ?? Date.now)());
+              const status = mirroredRoutingStatusWithGrace(current, (this.options.now ?? Date.now)(), this.options.leaseGraceMs ?? participantLeaseGraceMs());
               if (status === "lease-stale") throw rootGone(mirroredOwner.remoteHost);
               if (status === "bridge-stale") {
                 if (waitBudget.waited) throw new FabricPeerLeaseStaleError(targetId, current.remoteHost,
@@ -1528,9 +1539,18 @@ export class FabricControlPlane {
           // A failed read is not evidence of a lapse. The independent request timer stays armed.
           continue;
         }
+        // Absence may be a short mirror-file gap, but changed ownership or incarnation is
+        // affirmative revocation and cannot inherit the captured owner's grace.
+        if (current?.ownerChanged || current && current.ownerIncarnation !== captured.ownerIncarnation) {
+          const changed = this.#clearPending(commandId);
+          if (!changed) continue;
+          void this.#publishCancellation(commandId, changed);
+          changed.reject(new FabricControlStaleIncarnationError(pending.targetId));
+          continue;
+        }
         // Never adopt a different link's label. Missing ownership cannot renew this lease.
         if (current?.remoteHost === captured.remoteHost) Object.assign(captured, { ...current, mirror: current.mirror, bridgeStale: current.bridgeStale });
-        const status = mirroredOwnerRoutingStatus(captured, (this.options.now ?? Date.now)());
+        const status = mirroredRoutingStatusWithGrace(captured, (this.options.now ?? Date.now)(), this.options.leaseGraceMs ?? participantLeaseGraceMs());
         if (status === "live") continue;
         const lapsed = this.#clearPending(commandId);
         if (!lapsed) continue;

@@ -1,6 +1,7 @@
 import type {
   EffectIntent, EffectRecord, EffectRepair, EffectResult, EffectSink, EffectSinkResult, EffectTransition,
-  EffectToolResult, ReadToolResult, ReconcilePendingResult, RecoveryOwner, SettledEffect, SettlePendingIntents, SettlePendingIntentsResult,
+  EffectToolResult, ReadToolResult, ReconcilePendingResult, RecoveryOwner, SettledEffect, SettleOriginalPendingIntents,
+  SettlePendingIntents, SettlePendingIntentsResult,
 } from "./contracts.js";
 import { EffectContractError } from "./contracts.js";
 import { canonicalEncode, sha256Bytes } from "./slots.js";
@@ -23,16 +24,26 @@ const checkGeneration = (generation: string): void => {
   canonicalEncode(generation);
 };
 
+type OriginalSelector = { readonly originalInputId: string } | undefined;
+
 /** No input admission, prompt submission, JS replay, or independent startup hook.
  * The session-wide store lock also prevents a later path mutation obscuring a
- * pending intent while its sink is queried. B3 owns cross-process exclusion. */
-export const reconcilePending = async (
+ * pending intent while its sink is queried. B3 owns cross-process exclusion.
+ * An explicit selector restricts the entire pass, not just its returned rows. */
+const reconcileSelectedPending = async (
   owner: RecoveryOwner,
   store: EffectStore,
   sinks: readonly EffectSink[],
   recoveryGeneration: string,
+  selector: OriginalSelector,
 ): Promise<ReconcilePendingResult> => {
   checkGeneration(recoveryGeneration);
+  if (selector !== undefined) {
+    if (typeof selector.originalInputId !== "string" || !selector.originalInputId.trim()) {
+      throw new EffectContractError("EFFECT_ORIGINAL_INPUT", "Original input ID must be a nonempty string");
+    }
+    canonicalEncode(selector.originalInputId);
+  }
   if (store.owner !== owner) {
     throw new EffectContractError("EFFECT_OWNER_MISMATCH", "Reconciliation must use the store's bound recovery capability");
   }
@@ -55,6 +66,19 @@ export const reconcilePending = async (
     } catch (error) {
       // Do not skip corrupt directories and then report that no work is pending.
       return { settled, repairs, ledgerFrontier, unresolved: [{ key: "ledger", reason: explain(error) }], uncertain: 1 };
+    }
+    if (selector !== undefined) {
+      // Filter BEFORE dependency indexing, traversal, writes and projection. A
+      // predecessor with the same slot ID in another original is not evidence.
+      records = records.filter(record => record.intent.acceptedInput.id === selector.originalInputId);
+    } else {
+      const pendingOriginals = new Set(records.filter(record => !resultTransition(record))
+        .map(record => record.intent.acceptedInput.id));
+      if (pendingOriginals.size > 1) {
+        // Preflight the complete pass: do not settle one original with another
+        // original's opaque generation, even if a terminal record sorts first.
+        throw new EffectContractError("EFFECT_ORIGINAL_SCOPE_REQUIRED", "Multiple pending originals require explicit original-scoped settlement");
+      }
     }
     const byKey = new Map(records.map(record => [record.intent.key, record]));
     const bySlot = new Map(records.map(record => [
@@ -188,6 +212,18 @@ export const reconcilePending = async (
   });
 };
 
+/** Legacy entry: an opaque generation can authorize writes for at most one
+ * nonterminal original. Terminal records from any original remain projectable. */
+export const reconcilePending = (
+  owner: RecoveryOwner, store: EffectStore, sinks: readonly EffectSink[], recoveryGeneration: string,
+): Promise<ReconcilePendingResult> => reconcileSelectedPending(owner, store, sinks, recoveryGeneration, undefined);
+
+/** Caller names the original and supplies its generation; B4 neither allocates
+ * nor looks up pins, and never waits for another original to become terminal. */
+export const reconcileOriginalPending = (
+  owner: RecoveryOwner, store: EffectStore, sinks: readonly EffectSink[], originalInputId: string, recoveryGeneration: string,
+): Promise<ReconcilePendingResult> => reconcileSelectedPending(owner, store, sinks, recoveryGeneration, { originalInputId });
+
 /** Authenticate the canonical ledger original and physical alias independently
  * of a recovery descriptor's hash. A joined native message has its OWN exact
  * JSON.stringify hash; callers must check that separate hash in its own domain.
@@ -265,8 +301,18 @@ export const createEffectReconciler = (options: EffectReconcilerOptions) => {
     const { settled, uncertain } = await run(recoveryGeneration);
     return { settled, uncertain };
   };
+  const runOriginal = (originalInputId: string, generation: string) =>
+    reconcileOriginalPending(options.owner, options.store, options.sinks, originalInputId, generation);
+  const settleOriginal: SettleOriginalPendingIntents = async (sessionId, originalInputId, recoveryGeneration) => {
+    if (sessionId !== options.owner.logicalSessionId) {
+      throw new EffectContractError("EFFECT_SESSION_MISMATCH", "Cannot settle another logical session");
+    }
+    const { settled, uncertain } = await runOriginal(originalInputId, recoveryGeneration);
+    return { settled, uncertain };
+  };
   const read: ReadToolResult = effect => readToolResult(options.owner, options.store, effect);
-  return { reconcilePending: run, settlePendingIntents: settle, readToolResult: read };
+  return { reconcilePending: run, reconcileOriginalPending: runOriginal, settlePendingIntents: settle,
+    settleOriginalPendingIntents: settleOriginal, readToolResult: read };
 };
 
 const bindings = new Map<string, ReturnType<typeof createEffectReconciler>>();
@@ -284,4 +330,11 @@ export const settlePendingIntents: SettlePendingIntents = async (sessionId, reco
   const runtime = bindings.get(sessionId);
   if (!runtime) throw new EffectContractError("EFFECT_SESSION_UNBOUND", `Effect session ${sessionId} is not bound`);
   return runtime.settlePendingIntents(sessionId, recoveryGeneration);
+};
+
+/** Additive original-scoped entry using the same explicitly bound runtime. */
+export const settleOriginalPendingIntents: SettleOriginalPendingIntents = async (sessionId, originalInputId, recoveryGeneration) => {
+  const runtime = bindings.get(sessionId);
+  if (!runtime) throw new EffectContractError("EFFECT_SESSION_UNBOUND", `Effect session ${sessionId} is not bound`);
+  return runtime.settleOriginalPendingIntents(sessionId, originalInputId, recoveryGeneration);
 };

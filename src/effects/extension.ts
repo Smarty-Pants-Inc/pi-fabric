@@ -56,6 +56,7 @@ export interface CertifiedEffectRecordPort {
     prepare(): Promise<PreparedFileEffect | PreparedShellEffect>;
   }): Promise<AgentToolResult<unknown>>;
   settlePendingIntents(sessionId: string, recoveryGeneration: string): Promise<CertifiedSettleResult>;
+  settleOriginalPendingIntents(sessionId: string, originalInputId: string, recoveryGeneration: string): Promise<CertifiedSettleResult>;
   readToolResult(effect: SettledEffect): ReturnType<typeof readCertifiedToolResult>;
 }
 
@@ -220,6 +221,12 @@ export const createCertifiedEffectRuntime = (options: CertifiedEffectRuntimeOpti
       if (sessionId !== options.logicalSessionId) throw new Error("Effect settlement session mismatch");
       if (typeof recoveryGeneration !== "string" || !recoveryGeneration.trim()) throw new Error("Invalid recovery generation");
       return options.records.settlePendingIntents(sessionId, recoveryGeneration);
+    },
+    settleOriginalPendingIntents: (sessionId: string, originalInputId: string, recoveryGeneration: string): Promise<CertifiedSettleResult> => {
+      assertOpen();
+      if (sessionId !== options.logicalSessionId) throw new Error("Effect settlement session mismatch");
+      if (typeof recoveryGeneration !== "string" || !recoveryGeneration.trim()) throw new Error("Invalid recovery generation");
+      return options.records.settleOriginalPendingIntents(sessionId, originalInputId, recoveryGeneration);
     },
     readToolResult: (effect: SettledEffect): ReturnType<typeof readCertifiedToolResult> => {
       assertOpen();
@@ -434,6 +441,7 @@ export const readCertifiedToolResult = async (options: Pick<CertifiedEffectRecor
  * and RESULT. It owns no second journal, input queue, lease or startup hook. */
 export const createCertifiedEffectRecordPort = (options: CertifiedEffectRecordOptions): CertifiedEffectRecordPort & {
   reconcilePending: ReturnType<typeof createEffectReconciler>["reconcilePending"];
+  reconcileOriginalPending: ReturnType<typeof createEffectReconciler>["reconcileOriginalPending"];
   sinks: readonly EffectSink[];
 } => {
   const { owner, store } = options;
@@ -476,22 +484,64 @@ export const createCertifiedEffectRecordPort = (options: CertifiedEffectRecordOp
   const identities = new Set(sinks.map(sink => canonicalEncode([sink.kind, sink.adapterVersion])));
   if (identities.size !== sinks.length) throw new EffectContractError("EFFECT_SINK_AMBIGUOUS", "Certified sink kind/version must be unique");
   const recovery = createEffectReconciler({ owner, store, sinks });
-  let needsSettlement = false;
-  const settle = async (generation: string) => {
-    needsSettlement = true;
-    const result = await recovery.reconcilePending(generation);
+  // New-intent safety remains session-wide, but a scoped success may discharge
+  // only its own failure. Tokens also prevent an older outside-lock native read
+  // from clearing a newer failure/settlement pass for the same original.
+  let unscopedSettlementNeeded: symbol | undefined;
+  const originalsNeedingSettlement = new Map<string, symbol>();
+  let settlementsInFlight = 0;
+  const projectSettlement = async (result: Awaited<ReturnType<typeof recovery.reconcilePending>>) => {
     // Reconciliation's RESULT/repairs retain canonical adapter hashes. Only the
     // B3 settlement descriptors project joined native bytes, per physical alias.
-    // Do not call the host inside reconcilePending's session transaction: the
-    // native join reader is allowed to acquire that SAME store lock.
+    // Both scoped and legacy calls release the session transaction before the
+    // native join reader, which is allowed to acquire that SAME store lock.
     const settled: SettledEffect[] = [];
     for (const effect of result.settled) {
       const native = effect.outcome !== "uncertain" && effect.resultBytesHash !== undefined
         ? await readJoinedNativeResult(options, effect) : undefined;
       settled.push(native === undefined ? effect : { ...effect, resultBytesHash: sha256Bytes(JSON.stringify(native)) });
     }
-    needsSettlement = result.uncertain > 0;
     return { ...result, settled };
+  };
+  const settle = async (generation: string, selector?: { readonly originalInputId: string }) => {
+    if (selector !== undefined && (typeof selector.originalInputId !== "string" || !selector.originalInputId.trim())) {
+      throw new EffectContractError("EFFECT_ORIGINAL_INPUT", "Original input ID must be a nonempty string");
+    }
+    const token = Symbol("settlement");
+    const previousUnscoped = unscopedSettlementNeeded;
+    const previousOriginals = new Map(originalsNeedingSettlement);
+    if (selector === undefined) unscopedSettlementNeeded = token;
+    else originalsNeedingSettlement.set(selector.originalInputId, token);
+    settlementsInFlight += 1;
+    try {
+      const result = await projectSettlement(await (selector === undefined
+        ? recovery.reconcilePending(generation) : recovery.reconcileOriginalPending(selector.originalInputId, generation)));
+      if (result.uncertain === 0) {
+        if (selector === undefined) {
+          if (unscopedSettlementNeeded === token) unscopedSettlementNeeded = undefined;
+          for (const [id, previous] of previousOriginals) {
+            if (originalsNeedingSettlement.get(id) === previous) originalsNeedingSettlement.delete(id);
+          }
+        } else if (originalsNeedingSettlement.get(selector.originalInputId) === token) {
+          originalsNeedingSettlement.delete(selector.originalInputId);
+        }
+      } else if (selector === undefined) {
+        unscopedSettlementNeeded = Symbol("unresolved-settlement");
+      } else originalsNeedingSettlement.set(selector.originalInputId, Symbol("unresolved-settlement"));
+      return result;
+    } catch (error) {
+      // The legacy ambiguity guard is a no-write preflight, not an additional
+      // session-wide failure that would prevent scoped recovery from clearing
+      // the actual per-original obligations.
+      if (selector === undefined) {
+        if (error instanceof EffectContractError && error.code === "EFFECT_ORIGINAL_SCOPE_REQUIRED") {
+          if (unscopedSettlementNeeded === token) unscopedSettlementNeeded = previousUnscoped;
+        } else unscopedSettlementNeeded = Symbol("settlement-failure");
+      } else originalsNeedingSettlement.set(selector.originalInputId, Symbol("settlement-failure"));
+      throw error;
+    } finally {
+      settlementsInFlight -= 1;
+    }
   };
   const asToolResult = (record: EffectRecord): AgentToolResult<unknown> => {
     const result = terminalResult(record);
@@ -507,10 +557,16 @@ export const createCertifiedEffectRecordPort = (options: CertifiedEffectRecordOp
   };
   return {
     sinks,
-    reconcilePending: settle,
+    reconcilePending: generation => settle(generation),
+    reconcileOriginalPending: (originalInputId, generation) => settle(generation, { originalInputId }),
     async settlePendingIntents(sessionId, generation) {
       if (sessionId !== owner.logicalSessionId) throw new EffectContractError("EFFECT_SESSION_MISMATCH", "Cannot settle another logical session");
       const { settled, uncertain } = await settle(generation);
+      return { settled, uncertain };
+    },
+    async settleOriginalPendingIntents(sessionId, originalInputId, generation) {
+      if (sessionId !== owner.logicalSessionId) throw new EffectContractError("EFFECT_SESSION_MISMATCH", "Cannot settle another logical session");
+      const { settled, uncertain } = await settle(generation, { originalInputId });
       return { settled, uncertain };
     },
     readToolResult: effect => readCertifiedToolResult(options, effect),
@@ -523,7 +579,9 @@ export const createCertifiedEffectRecordPort = (options: CertifiedEffectRecordOp
       const canonicalArguments = jsonCopy(request.canonicalArguments) as JsonValue;
       let issued = false;
       return store.withSession("new-intent", async transaction => {
-        if (needsSettlement) throw new EffectContractError("EFFECT_SETTLEMENT_REQUIRED", "An earlier uncertain/barrier failure requires explicit B3 settlement");
+        if (settlementsInFlight > 0 || unscopedSettlementNeeded !== undefined || originalsNeedingSettlement.size > 0) {
+          throw new EffectContractError("EFFECT_SETTLEMENT_REQUIRED", "An earlier uncertain/barrier failure requires explicit B3 settlement");
+        }
         const records = transaction.list();
         const slot = resolveEffectSlot({ acceptedInput: admission.acceptedInput, kind: request.kind,
           canonicalRef: request.canonicalRef, adapterVersion, canonicalTarget: request.canonicalTarget, canonicalArguments,
@@ -597,7 +655,9 @@ export const createCertifiedEffectRecordPort = (options: CertifiedEffectRecordOp
         await controls(record.intent, request).failpoint?.("result-durable");
         return asToolResult(record);
       }).catch((error: unknown) => {
-        if (issued || (error instanceof EffectContractError && error.code === "EFFECT_STORE_UNCERTAIN")) needsSettlement = true;
+        if (issued || (error instanceof EffectContractError && error.code === "EFFECT_STORE_UNCERTAIN")) {
+          originalsNeedingSettlement.set(admission.acceptedInput.id, Symbol("dispatch-failure"));
+        }
         throw error;
       });
     },

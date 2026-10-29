@@ -191,6 +191,10 @@ export interface SettlePendingIntentsResult {
 export type EffectToolResult = Extract<ContextEvent["messages"][number], { role: "toolResult" }>;
 export type ReadToolResult = (effect: SettledEffect) => Promise<EffectToolResult>;
 export type SettlePendingIntents = (sessionId: string, recoveryGeneration: string) => Promise<SettlePendingIntentsResult>;
+/** Additive caller API, not a change to the frozen provider ABI. The caller
+ * supplies this original's opaque generation; B4 has no pin lookup policy. */
+export type SettleOriginalPendingIntents = (sessionId: string, originalInputId: string,
+  recoveryGeneration: string) => Promise<SettlePendingIntentsResult>;
 
 export interface EffectRepair {
   readonly key: string;

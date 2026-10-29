@@ -25,6 +25,8 @@ const primaryEntryPoints = [
   "src/runners.ts",
   // Opt-in durable Pi adapter; never reachable from the extension entry.
   "src/durable.ts",
+  // Explicit native/B5 maintenance composition; no eager registration/activation.
+  "src/effects/maintenance-repair-host.ts",
   "src/jev.ts",
   "src/assessment.ts",
   // Public `pi-fabric/scope`; also the extension's first-use scope parser.

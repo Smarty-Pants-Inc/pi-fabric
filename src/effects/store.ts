@@ -9,6 +9,8 @@ import type {
   EffectTransitionInput, RecoveryOwner,
 } from "./contracts.js";
 import { canonicalEncode, intentBindingDigest, mintEffectKey, sha256Bytes, validateIntent } from "./slots.js";
+import { maintenanceRepairKey, validateMaintenanceRepairBody, validateStoredMaintenanceRepair } from "./repair-records.js";
+import type { MaintenanceRepairRecordBody, StoredMaintenanceRepair } from "./repair-records.js";
 
 /** Synchronous ledger operations, valid only in their owning withSession callback.
  * The callback may await a sink without releasing the session's serialization. */
@@ -17,12 +19,16 @@ export interface EffectStoreTransaction {
   read(key: string): EffectRecord;
   list(): readonly EffectRecord[];
   append(key: string, input: EffectTransitionInput): EffectRecord;
+  readMaintenanceRepair(originalInputId: string): StoredMaintenanceRepair | undefined;
+  listMaintenanceRepairs(): readonly StoredMaintenanceRepair[];
+  publishMaintenanceRepair(candidate: MaintenanceRepairRecordBody): StoredMaintenanceRepair;
 }
 
 const KEY = /^[0-9a-f]{64}$/;
 const validKey = (value: unknown): value is string => typeof value === "string" && value.length === 64 && KEY.test(value);
 const TRANSITION_FILE = /^\d{12}\.json$/;
-const PUBLICATION_WITNESS = /^\.published-(intent\.json|\d{12}\.json)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+const PUBLICATION_WITNESS = /^\.published-(intent\.json|receipt\.json|\d{12}\.json)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+const REPAIRS_DIRECTORY = "repairs-v1";
 const MAX_SEQUENCE = 999_999_999_999;
 const UNCERTAIN = "EFFECT_STORE_UNCERTAIN";
 const INPUT_FIELDS = new Set([
@@ -128,6 +134,7 @@ export class EffectStore {
   readonly #effects: string;
   readonly #orgId: string;
   readonly #logicalSessionId: string;
+  readonly #sessionFile: string;
   #rootIdentity: fs.Stats | undefined;
 
   constructor(owner: RecoveryOwner) {
@@ -144,6 +151,7 @@ export class EffectStore {
     this.#effects = path.join(this.#root, "effects");
     this.#orgId = owner.orgId;
     this.#logicalSessionId = owner.logicalSessionId;
+    this.#sessionFile = owner.sessionFile;
     // Never mkdir the supplied root. Missing retained state is not a fresh session.
     this.#rootIdentity = this.#io(undefined, () => this.#directory(this.#root));
   }
@@ -192,6 +200,9 @@ export class EffectStore {
         read: (key: string) => { guard(); return this.#read(key); },
         list: () => { guard(); return this.#list(); },
         append: (key: string, input: EffectTransitionInput) => { guard(); return this.#append(key, input); },
+        readMaintenanceRepair: (originalInputId: string) => { guard(); return this.#readMaintenanceRepair(originalInputId); },
+        listMaintenanceRepairs: () => { guard(); return this.#listMaintenanceRepairs(); },
+        publishMaintenanceRepair: (candidate: MaintenanceRepairRecordBody) => { guard(); return this.#publishMaintenanceRepair(candidate); },
       });
       const context = new Map(scopes.getStore());
       context.set(this.#root, scope);
@@ -319,12 +330,12 @@ export class EffectStore {
     } finally { fs.closeSync(fd); }
   }
 
-  #evidence(directory: string, filename: string, intentDirectory: boolean): void {
+  #evidence(directory: string, filename: string, expected: "intent.json" | "transition" | "receipt.json"): void {
     const evidence = this.#regular(path.join(directory, filename));
     const witness = PUBLICATION_WITNESS.exec(filename);
     if (!witness) return; // A failed/unpublished stage is never authority for an effect.
     const target = witness[1]!;
-    if ((target === "intent.json") !== intentDirectory ||
+    if ((expected === "transition" ? !TRANSITION_FILE.test(target) : target !== expected) ||
         !sameInode(evidence, this.#regular(path.join(directory, target)))) {
       throw new Error("A retained publication witness no longer matches its committed record");
     }
@@ -383,7 +394,7 @@ export class EffectStore {
       for (const entry of entries) {
         if (entry === "intent.json" || entry === "transitions") continue;
         if (!entry.endsWith(".tmp")) throw new Error(`Unexpected committed effect filename: ${entry}`);
-        this.#evidence(directory, entry, true);
+        this.#evidence(directory, entry, "intent.json");
       }
       const { value: intent, bytes } = this.#canonicalFile<EffectIntent>(path.join(directory, "intent.json"));
       this.#verifyIntent(intent, key);
@@ -396,7 +407,7 @@ export class EffectStore {
       let terminal = false;
       for (const filename of filenames) {
         const file = path.join(transitionDirectory, filename);
-        if (filename.endsWith(".tmp")) { this.#evidence(transitionDirectory, filename, false); continue; }
+        if (filename.endsWith(".tmp")) { this.#evidence(transitionDirectory, filename, "transition"); continue; }
         const sequence = transitions.length + 1;
         if (!TRANSITION_FILE.test(filename) || filename !== sequenceFile(sequence)) {
           throw new Error(`Broken sequence or unexpected committed transition filename: ${filename}`);
@@ -469,6 +480,7 @@ export class EffectStore {
       const entries = fs.readdirSync(this.#effects).sort();
       const records: EffectRecord[] = [];
       for (const key of entries) {
+        if (key === REPAIRS_DIRECTORY) { this.#listMaintenanceRepairs(); continue; }
         if (!validKey(key)) throw new Error(`Unexpected effect namespace entry: ${key}`);
         if (!this.#unpublished(this.#keyDirectory(key))) records.push(this.#read(key));
       }
@@ -479,6 +491,146 @@ export class EffectStore {
       }
       return Object.freeze(records);
     });
+  }
+
+  #repairOwner(): Pick<RecoveryOwner, "orgId" | "logicalSessionId" | "sessionFile"> {
+    if (this.owner.sessionFile !== this.#sessionFile) {
+      throw new EffectContractError("EFFECT_OWNER_STALE", "Repair native file binding changed");
+    }
+    return { orgId: this.#orgId, logicalSessionId: this.#logicalSessionId, sessionFile: this.#sessionFile };
+  }
+
+  /** A saved frontier identifies authenticated immutable prefixes, not the current
+   * global revision. New-publication exact key/tail checks also belong to the
+   * engine's SAME transaction; later aliases/keys do not erase historical receipts. */
+  #verifyRepairFrontier(candidate: MaintenanceRepairRecordBody): void {
+    for (const entry of candidate.frontier) {
+      const record = this.#read(entry.key);
+      const digest = entry.sequence === 0 ? record.intentDigest : record.transitions[entry.sequence - 1]?.digest;
+      if (record.intent.acceptedInput.id !== candidate.view.originalInputId ||
+          record.intent.acceptedInput.digest !== candidate.originalPayloadSha256 || digest !== entry.digest) {
+        throw new EffectContractError("EFFECT_REPAIR_CONFLICT", "Repair frontier does not match its original's retained immutable prefix");
+      }
+    }
+  }
+
+  /** No recursion through #list: effect enumeration validates this reserved
+   * namespace too, including when deciding whether a storage latch may clear. */
+  #listMaintenanceRepairs(): readonly StoredMaintenanceRepair[] {
+    const owner = this.#repairOwner();
+    return this.#io(undefined, () => {
+      this.#directory(this.#root);
+      try { fs.lstatSync(this.#effects); }
+      catch (error) {
+        if (codeOf(error) !== "ENOENT") throw error;
+        syncDirectoryChain(this.#root);
+        return Object.freeze([]);
+      }
+      const effectsIdentity = this.#directory(this.#effects);
+      const effectNames = fs.readdirSync(this.#effects).sort();
+      const records: StoredMaintenanceRepair[] = [];
+      if (effectNames.includes(REPAIRS_DIRECTORY)) {
+        const namespace = path.join(this.#effects, REPAIRS_DIRECTORY);
+        const identity = this.#directory(namespace);
+        const keys = fs.readdirSync(namespace).sort();
+        for (const key of keys) {
+          if (!validKey(key)) throw new Error(`Unexpected repair namespace entry: ${key}`);
+          const directory = path.join(namespace, key);
+          const receiptIdentity = this.#directory(directory);
+          const names = fs.readdirSync(directory).sort();
+          for (const name of names) {
+            if (name === "receipt.json") continue;
+            if (!name.endsWith(".tmp") || (name.startsWith(".published-") && !PUBLICATION_WITNESS.test(name))) {
+              throw new Error(`Unexpected committed repair filename: ${name}`);
+            }
+            this.#evidence(directory, name, "receipt.json");
+          }
+          // Ordinary unpublished stages confer no authority. A retained witness
+          // with no exact canonical target already failed in #evidence above.
+          if (names.includes("receipt.json")) {
+            const file = path.join(directory, "receipt.json");
+            const committed = this.#regular(file);
+            const { value: record } = this.#canonicalFile<StoredMaintenanceRepair>(file);
+            validateStoredMaintenanceRepair(record, owner);
+            if (maintenanceRepairKey(this.#orgId, this.#logicalSessionId, record.view.originalInputId) !== key) {
+              throw new Error("Repair original does not match its retained directory key");
+            }
+            this.#verifyRepairFrontier(record);
+            if (!names.some(name => PUBLICATION_WITNESS.exec(name)?.[1] === "receipt.json")) {
+              // Recover the precise cut after canonical no-clobber publication but
+              // before its witness. Never infer authority from plain stages, and
+              // never acknowledge a canonical receipt whose later deletion would
+              // look unpublished. This adds NO new stage on replay.
+              if (!sameInode(committed, this.#regular(file))) throw new Error("Repair changed before witness recovery");
+              const witness = `.published-receipt.json-${randomUUID()}.tmp`;
+              fs.linkSync(file, path.join(directory, witness));
+              this.#evidence(directory, witness, "receipt.json");
+              names.push(witness);
+              names.sort();
+            }
+            records.push(freeze(record));
+          }
+          syncDirectoryChain(directory);
+          if (!sameInode(receiptIdentity, this.#directory(directory)) ||
+              canonicalEncode(names) !== canonicalEncode(fs.readdirSync(directory).sort())) {
+            throw new Error("Repair namespace changed during receipt verification");
+          }
+        }
+        syncDirectoryChain(namespace);
+        if (!sameInode(identity, this.#directory(namespace)) ||
+            canonicalEncode(keys) !== canonicalEncode(fs.readdirSync(namespace).sort())) {
+          throw new Error("Repair namespace changed during enumeration");
+        }
+      }
+      syncDirectoryChain(this.#effects);
+      if (!sameInode(effectsIdentity, this.#directory(this.#effects)) ||
+          canonicalEncode(effectNames) !== canonicalEncode(fs.readdirSync(this.#effects).sort())) {
+        throw new Error("Effect namespace changed during repair enumeration");
+      }
+      return Object.freeze(records);
+    });
+  }
+
+  #readMaintenanceRepair(originalInputId: string): StoredMaintenanceRepair | undefined {
+    // Validate the original before deriving a path; absence never mkdirs a namespace.
+    maintenanceRepairKey(this.#orgId, this.#logicalSessionId, originalInputId);
+    return this.#listMaintenanceRepairs().find(record => record.view.originalInputId === originalInputId);
+  }
+
+  #publishMaintenanceRepair(input: MaintenanceRepairRecordBody): StoredMaintenanceRepair {
+    // Snapshot first; invalid caller data/conflicting candidates are NOT storage
+    // failures and cannot introduce the store's global admission latch.
+    const candidate: unknown = JSON.parse(canonicalEncode(input));
+    validateMaintenanceRepairBody(candidate, this.#repairOwner());
+    const record: StoredMaintenanceRepair = {
+      ...candidate, recordSha256: sha256Bytes(canonicalEncode(candidate)),
+    };
+    const bytes = canonicalEncode(record);
+    const existing = this.#readMaintenanceRepair(candidate.view.originalInputId);
+    if (existing) {
+      if (canonicalEncode(existing) !== bytes) {
+        throw new EffectContractError("EFFECT_REPAIR_CONFLICT", "An original already has a different immutable repair receipt");
+      }
+      // The exact existing canonical file was reread and namespace-barriered above.
+      // Do NOT publish another retained stage on an ordinary exact retry.
+      return existing;
+    }
+    this.#verifyRepairFrontier(candidate);
+    const key = maintenanceRepairKey(this.#orgId, this.#logicalSessionId, candidate.view.originalInputId);
+    this.#io(undefined, () => {
+      this.#mkdir(this.#effects);
+      const namespace = path.join(this.#effects, REPAIRS_DIRECTORY);
+      this.#mkdir(namespace);
+      const directory = path.join(namespace, key);
+      this.#mkdir(directory);
+      this.#publish(path.join(directory, "receipt.json"), bytes);
+    });
+    const published = this.#readMaintenanceRepair(candidate.view.originalInputId);
+    if (!published) return this.#io(undefined, () => { throw new Error("Published repair receipt is missing"); });
+    if (canonicalEncode(published) !== bytes) {
+      throw new EffectContractError("EFFECT_REPAIR_CONFLICT", "Repair receipt publication lost to a different immutable candidate");
+    }
+    return published;
   }
 
   #bind(intent: EffectIntent): EffectRecord {

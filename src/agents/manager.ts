@@ -124,7 +124,7 @@ import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/termi
 import { FabricTargetTerminalError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
 import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlRefusalProven, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
-import { WorktreeManager, type AgentWorktreeResult } from "./worktree-manager.js";
+import { WorktreeManager, retainCleanupRoot, type AgentWorktreeResult, type CleanupRootCustody, type CleanupCustodyDeferredStatus } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
 import {
   AgentWriteRootOverlapError,
@@ -241,10 +241,6 @@ const writePolicyDispositionAudit = (
 // checked exit receipt. Scope-cut release/collection rather than trust false.
 const uncheckedExternalExit = (transport: Pick<AgentTransportHandle, "kind">): boolean =>
   transport.kind === "tmux" || transport.kind === "screen";
-/** smarty-dev#15878: a run's recorded short TMPDIR outside its run tree, removed only while it is a real directory of ours. */
-const removeOwnedShortTmpdir = async (temporary: string | undefined): Promise<void> => {
-  if (temporary && ownedShortTmpdir(temporary)) await removeTree(temporary).catch(() => undefined);
-};
 // agents.childQuestionTimeoutMs default: routed child dialogs cancel after 10 minutes.
 const DEFAULT_CHILD_QUESTION_TIMEOUT_MS = 600_000;
 const MAX_NAME_LENGTH = 60;
@@ -265,9 +261,6 @@ const MANAGER_NESTED_FILE = "manager-nested.json";
 const MAX_LOG_SUMMARY_CHARS = 7_000;
 const MAX_LOG_DETAIL_CHARS = 900;
 const RETENTION_SWEEP_INTERVAL_MS = 15 * 60 * 1_000;
-/** Unsuccessful managed prompts are retained only up to the existing UI bound, in bytes. */
-const TERMINAL_PROMPT_RETENTION_MAX_BYTES = MAX_UI_TEXT_CHARS;
-
 const clearChildActorSelfEnvironment = (environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
   const child = { ...environment };
   delete child[FABRIC_ACTOR_SELF_ENV];
@@ -369,40 +362,6 @@ const writePrivateJsonAtomic = (filePath: string, value: unknown): PrivateFileFi
   const serialized = JSON.stringify(value, null, 2);
   if (serialized === undefined) throw new Error(`Could not serialize ${filePath}`);
   return writePrivateFileAtomic(filePath, Buffer.from(serialized, "utf8"));
-};
-
-/** Verify the retained task is still the exact admitted brief. The open descriptor,
- * not a path read, is authoritative; the second stat catches replacement while hashing. */
-const promptFileMatches = (filePath: string, expectedSha256: string, expectedBytes: number): boolean => {
-  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
-  let fd: number | undefined;
-  try {
-    fd = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
-    const before = fs.fstatSync(fd);
-    if (!before.isFile() || before.nlink !== 1 ||
-        (!NATIVE_WINDOWS_FILESYSTEM && (before.mode & 0o777) !== 0o600) || before.size !== expectedBytes) return false;
-    const hash = createHash("sha256");
-    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, expectedBytes));
-    for (let offset = 0; offset < expectedBytes;) {
-      const read = fs.readSync(fd, chunk, 0, Math.min(chunk.byteLength, expectedBytes - offset), offset);
-      if (read <= 0) return false;
-      hash.update(chunk.subarray(0, read));
-      offset += read;
-    }
-    const after = fs.fstatSync(fd);
-    const current = ownedStat(filePath);
-    if (!current || before.dev !== after.dev || before.ino !== after.ino || before.uid !== after.uid ||
-        before.mode !== after.mode || before.nlink !== after.nlink || before.size !== after.size ||
-        before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs ||
-        current.dev !== after.dev || current.ino !== after.ino || current.uid !== after.uid ||
-        current.mode !== after.mode || current.nlink !== after.nlink || current.size !== after.size ||
-        current.mtimeMs !== after.mtimeMs || current.ctimeMs !== after.ctimeMs) return false;
-    return hash.digest("hex") === expectedSha256;
-  } catch {
-    return false;
-  } finally {
-    if (fd !== undefined) fs.closeSync(fd);
-  }
 };
 
 /** Host-only provenance: public model fields never confer an implicit/default exemption. */
@@ -1063,11 +1022,6 @@ const normalizeRecordTasks = (record: AgentRunRecord): AgentRunRecord => ({
   ...(record.nestedAgents ? { nestedAgents: record.nestedAgents.map(normalizeRecordTasks) } : {}),
 });
 
-/** True only for a confirmed ENOENT from lstat; a dangling entry or other error is not absence. */
-const pathAbsentNoFollow = (file: string): boolean => {
-  try { fs.lstatSync(file); return false; }
-  catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
-};
 
 const readRecord = (filePath: string): AgentRunRecord | undefined => {
   try {
@@ -3785,7 +3739,7 @@ export class AgentManager {
 
   /** True while retained execution custody or its admission permit remains unresolved. */
   hasRetainedCustody(): boolean {
-    return this.heldPermits() > 0 ||
+    return this.heldPermits() > 0 || this.#cleanupFinalizationPending.size > 0 ||
       [...this.#queued.values()].some(queued => queued.cleanupPending !== undefined) ||
       [...this.#runs.values()].some(managed => managed.transport.kind === "process" && (
         // Normal finishing still owns its tree until exact exit and settlement.
@@ -4443,15 +4397,14 @@ export class AgentManager {
       throw Object.assign(new Error(`Fabric agent ${managed.id} has no published terminal result; result unavailable or unauthenticated (authentication/integrity failure)`),
         { code: "FABRIC_MISSING_RESULT" as const });
     }
-    const expectedFile = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
-    const result = readAuthenticatedRecord(managed.settledResultFile, expectedFile, managed.resultFingerprint);
-    if (result && result.id === managed.id && terminalStatuses.has(result.status)) return result;
-    // Close's whole-tree collection is the only owned path that removes the published
-    // file while the handle stays readable. Only its recorded provenance (validated
-    // exact file, successful removal, no-follow absence) authorizes the bounded summary.
-    // An unexpected absence, dangling entry, corrupt or foreign file still fails loudly.
-    if (!result && this.#closing && managed.executionExited && managed.settledSummary && managed.resultCollected &&
-        pathAbsentNoFollow(managed.settledResultFile)) return this.#collectedResult(managed, managed.settledSummary);
+    const file = this.#ownedResultFile(managed);
+    const result = file && readAuthenticatedRecord(file, file, managed.resultFingerprint);
+    if (result && result.id === managed.id && terminalStatuses.has(result.status)) {
+      if (this.#closing && managed.resultCollected && managed.settledSummary) return this.#collectedResult(managed, managed.settledSummary);
+      return result;
+    }
+    // Even collected summaries require the original held file's exact fingerprint.
+    // Canonical absence/replacements never substitute for that authentication.
     throw Object.assign(new Error(`Fabric agent ${managed.id} has no saved terminal result at ${managed.settledResultFile}; result unavailable or unauthenticated (authentication/integrity failure)`),
       { code: "FABRIC_MISSING_RESULT" as const });
   }
@@ -4477,7 +4430,7 @@ export class AgentManager {
     if (!record || !terminalStatuses.has(record.status)) {
       throw new Error(`Agent ${managed.id} settled without a result`);
     }
-    return this.#withTransportMetadata(record, managed) as AgentRunResult;
+    return this.#withCleanupStatus(managed.id, this.#withTransportMetadata(record, managed)) as AgentRunResult;
   }
 
   #boundedResult(managed: ManagedAgent | QueuedAgent, options: { timeoutMs?: number; signal?: AbortSignal }): Promise<AgentRunResult> {
@@ -4639,7 +4592,7 @@ export class AgentManager {
 
   status(id: string): AgentRunRecord | AgentHandleInfo {
     const queued = this.#queued.get(id);
-    if (queued) return queued.terminal ? structuredClone(queued.terminal) : this.#queuedInfo(queued);
+    if (queued) return this.#withCleanupStatus(id, queued.terminal ? structuredClone(queued.terminal) : this.#queuedInfo(queued));
     const previous = this.#previousRun(id);
     if (previous) {
       this.#terminalNoticeOutbox.recover(path.dirname(this.#previousRuns.get(id)!.resultFile));
@@ -4667,7 +4620,7 @@ export class AgentManager {
       managed.latestUiRecord = compact;
       this.#invalidateUiList();
     }
-    const result = structuredClone(this.#publicRecord(this.#withTransportMetadata(record, managed), managed));
+    const result = structuredClone(this.#withCleanupStatus(managed.id, this.#publicRecord(this.#withTransportMetadata(record, managed), managed)));
     this.#pruneRetainedUiRecords();
     const deliveries = this.#checkFollowUps(managed);
     if (deliveries.length) result.followUpDeliveries = deliveries;
@@ -4745,7 +4698,7 @@ export class AgentManager {
         managed.latestRecord = record;
         managed.latestUiRecord = record;
       }
-      return compactUiRecord(this.#publicRecord(this.#withTransportMetadata(record, managed), managed));
+      return this.#withCleanupStatus(managed.id, compactUiRecord(this.#publicRecord(this.#withTransportMetadata(record, managed), managed)));
     };
     // Live ownership always stays visible. If its detailed snapshot cannot fit,
     // display the handle; never omit an active agent in favour of old results.
@@ -4811,7 +4764,7 @@ export class AgentManager {
       if (!managed.settled || managed.processStopPending || (managed.actorId && managed.nativeReleasePending) || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
           // Settlement and primary exit do not prove descendant exit. The
           // persistent tree veto checks every descendant's worker identity too.
-          unconfirmedProcess || runTreeExitVeto(managed.runDirectory, 0, undefined, true)) protect(managed.id, managed.actorId);
+          unconfirmedProcess || runTreeExitVeto(this.#ownedRunDirectory(managed), 0, undefined, true)) protect(managed.id, managed.actorId);
     }
     // A restarted host does not own handles for the previous host's actor workers.
     // Reuse offline retention's exit/ownership predicate; a truncated or unknown
@@ -4944,7 +4897,7 @@ export class AgentManager {
       const unconfirmedProcess = pid !== undefined && (!Number.isSafeInteger(pid) || pid <= 0 || processAlive(pid));
       if (!managed.settled || managed.processStopPending || (managed.actorId && managed.nativeReleasePending) || managed.lostContact || managed.settlementSaveFailure || uncheckedExternalExit(managed.transport) ||
           unconfirmedProcess || !(yield* proof(() => boundedRunTree(managed.runDirectory, expired))) ||
-          !(yield* proof(() => !runTreeExitVeto(managed.runDirectory, 0, expired, true)))) protect(managed.id, managed.actorId);
+          !(yield* proof(() => !runTreeExitVeto(this.#ownedRunDirectory(managed), 0, expired, true)))) protect(managed.id, managed.actorId);
       yield;
     }
     // Reconcile activity with a persistent identity watermark. Directory
@@ -5017,7 +4970,7 @@ export class AgentManager {
 
   /** Discharge actor-log custody only after the owning archive succeeded. */
   async commitActorArchive(runId: string, actorId: string, sessionFile: string): Promise<void> {
-    const directory = this.actorArchiveSources(actorId, sessionFile).get(runId);
+    const directory = (await this.actorArchiveSources(actorId, sessionFile, runId)).get(runId);
     if (!directory) return;
     fs.rmSync(path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE));
     syncDirectoryChain(directory);
@@ -5026,11 +4979,102 @@ export class AgentManager {
     if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await this.#removeRunTree(directory, runId);
   }
 
-  /** Remove a run tree, then (only once it is gone) its recorded short TMPDIR outside it (smarty-dev#15878). */
+  // A committed move ends canonical-path ownership, even if its receipt update
+  // or the second root's custody fails. Retries must never capture a replacement.
+  readonly #cleanupRunCustody = new Map<string, { temporary: string | undefined; runRetained: boolean; temporaryRetained: boolean; run?: CleanupRootCustody; temporaryRoot?: CleanupRootCustody }>();
+
+  readonly #cleanupDeferred = new Map<string, CleanupCustodyDeferredStatus>();
+  // Resident trace finalization is part of cleanup, not permission to forget
+  // the manager's authenticated result/notification custody on partial failure.
+  readonly #cleanupFinalizationPending = new Set<string>();
+
+  async #finalizeCleanup(id: string, beforeConsume?: () => void | Promise<void>): Promise<void> {
+    if (!beforeConsume) {
+      if (this.#cleanupFinalizationPending.has(id)) throw new Error(`Cannot clean up agent ${id}: trace finalization is pending`);
+      return;
+    }
+    this.#cleanupFinalizationPending.add(id);
+    try { await beforeConsume(); }
+    catch (error) { this.#recordCleanupFailure(id, error); throw error; }
+    this.#cleanupFinalizationPending.delete(id);
+  }
+
+  #recordCleanupFailure(id: string, error: unknown): void {
+    if (error instanceof Error && "code" in error && error.code === "CLEANUP_CUSTODY_DEFERRED" && "cleanupStatus" in error) {
+      this.#cleanupDeferred.set(id, structuredClone(error.cleanupStatus as CleanupCustodyDeferredStatus));
+      this.#invalidateUiList();
+    }
+  }
+
+  #withCleanupStatus<T extends { warnings?: string[] }>(id: string, record: T): T {
+    const cleanupStatus = this.#cleanupDeferred.get(id);
+    if (!cleanupStatus) return record;
+    return { ...record, cleanupStatus: structuredClone(cleanupStatus), warnings: [...(record.warnings ?? []),
+      `Cleanup deferred (${cleanupStatus.state}); original retained at ${cleanupStatus.source}; receipt: ${cleanupStatus.receipt}`] };
+  }
+
+  async #cleanupWorktree(id: string, deleteBranch: boolean): Promise<boolean> {
+    try { return await this.#worktrees.cleanup(id, deleteBranch); }
+    catch (error) { this.#recordCleanupFailure(id, error); throw error; }
+  }
+
+  /** Only custody returned to this manager can redirect original-tree proofs. */
+  #ownedRunDirectory(managed: ManagedAgent): string {
+    return this.#cleanupRunCustody.get(managed.runDirectory)?.run?.destination ?? managed.runDirectory;
+  }
+
+  #ownedResultFile(managed: ManagedAgent): string | undefined {
+    const expected = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
+    // Keep the caller-pointer boundary: custody cannot bless a substituted pointer.
+    if (!managed.settledResultFile || path.resolve(managed.settledResultFile) !== path.resolve(expected)) return undefined;
+    return path.join(this.#ownedRunDirectory(managed), MANAGER_RESULT_FILE);
+  }
+
+  /** Retain the whole run and its owned, recorded private TMPDIR without deleting either. */
   async #removeRunTree(runDirectory: string, id: string, known?: string): Promise<void> {
-    const temporary = recordedShortTmpdir(runDirectory, id, known);
-    await removeTree(runDirectory);
-    if (!fs.existsSync(runDirectory)) await removeOwnedShortTmpdir(temporary);
+    let custody = this.#cleanupRunCustody.get(runDirectory);
+    if (!custody) {
+      custody = { temporary: recordedShortTmpdir(runDirectory, id, known), runRetained: false, temporaryRetained: false };
+      this.#cleanupRunCustody.set(runDirectory, custody);
+    }
+    const archive = `${this.#runRoot}.trace-archive`;
+    if (!custody.runRetained) {
+      try {
+        const moved = retainCleanupRoot(runDirectory, archive, id, "agent cleanup run directory");
+        if (moved) custody.run = moved;
+        custody.runRetained = true;
+        if (custody.run && this.#cleanupDeferred.get(id)?.source === runDirectory) this.#cleanupDeferred.delete(id);
+      } catch (error) {
+        this.#recordCleanupFailure(id, error);
+        if (error instanceof Error && "retainedRoot" in error) {
+          custody.run = error.retainedRoot as CleanupRootCustody;
+          custody.runRetained = true;
+          // Committed rename is not an original-retained-in-place copy, even
+          // when publishing the moved receipt fails after a prior copy refusal.
+          if (this.#cleanupDeferred.get(id)?.source === runDirectory) this.#cleanupDeferred.delete(id);
+        }
+        throw error;
+      }
+    }
+    if (!custody.temporaryRetained) {
+      try {
+        if (custody.temporary && ownedShortTmpdir(custody.temporary)) {
+          const moved = retainCleanupRoot(custody.temporary, archive, id, "agent cleanup private TMPDIR");
+          if (moved) custody.temporaryRoot = moved;
+          if (custody.temporaryRoot && this.#cleanupDeferred.get(id)?.source === custody.temporary) this.#cleanupDeferred.delete(id);
+        }
+        custody.temporaryRetained = true;
+      } catch (error) {
+        this.#recordCleanupFailure(id, error);
+        if (error instanceof Error && "retainedRoot" in error) {
+          custody.temporaryRoot = error.retainedRoot as CleanupRootCustody;
+          custody.temporaryRetained = true;
+          if (this.#cleanupDeferred.get(id)?.source === custody.temporary) this.#cleanupDeferred.delete(id);
+        }
+        throw error;
+      }
+    }
+    this.#cleanupDeferred.delete(id);
   }
 
   /**
@@ -5069,21 +5113,10 @@ export class AgentManager {
     return "tmpdir: short private TMPDIR unavailable (diagnostic failed); child launched on " + path.join(this.#runRoot, id, "tmp") + " and bash may be refused by the fleet guard";
   }
   /** Recover only this actor's fenced sources under the configured host run root. */
-  actorArchiveSources(actorId: string, sessionFile: string): Map<string, string> {
-    const sources = new Map<string, string>();
-    if (!ownedStat(this.#runRoot)?.isDirectory()) return sources;
-    for (const runId of fs.readdirSync(this.#runRoot)) {
-      if (!/^[a-f0-9]{32}$/.test(runId)) continue;
-      const directory = path.join(this.#runRoot, runId);
-      const file = path.join(directory, ACTOR_RUN_ARCHIVE_PENDING_FILE);
-      if (!ownedStat(directory)?.isDirectory() || !ownedStat(file)?.isFile()) continue;
-      try {
-        if (fs.statSync(file).size > 4096) continue;
-        const marker = JSON.parse(fs.readFileSync(file, "utf8"));
-        if (marker.format === 1 && marker.runId === runId && marker.actorId === actorId && marker.sessionFile === sessionFile) sources.set(runId, directory);
-      } catch { /* Unreadable custody stays a collection veto, never authority. */ }
-    }
-    return sources;
+  async actorArchiveSources(actorId: string, sessionFile: string, runId?: string): Promise<Map<string, string>> {
+    // Archive discovery is optional first-use work, never part of the eager startup graph.
+    const { discoverActorArchiveSources } = await import("./actor-archive-discovery.js");
+    return discoverActorArchiveSources(this.#runRoot, actorId, sessionFile, runId);
   }
 
   worktreeGitRoot(id: string): string | undefined {
@@ -5155,6 +5188,8 @@ export class AgentManager {
   #forgetRunMetadata(id: string): void {
     this.#dropPreviousRun(id);
     if (this.#runs.has(id) || this.#queued.has(id)) return;
+    this.#cleanupRunCustody.delete(path.join(this.#runRoot, id));
+    this.#cleanupDeferred.delete(id);
     if (!this.#foregroundPrepared.has(id) || this.#foregroundDelivered.has(id)) {
       this.#foregroundPrepared.delete(id);
       this.#foregroundDelivered.delete(id);
@@ -5441,20 +5476,22 @@ export class AgentManager {
     return this.#settledResult(managed);
   }
 
-  async cleanup(id: string, deleteBranch = false): Promise<{ cleaned: boolean }> {
+  async cleanup(id: string, deleteBranch = false, beforeConsume?: () => void | Promise<void>): Promise<{ cleaned: boolean }> {
     const queued = this.#queued.get(id);
     if (queued) {
       if (!queued.terminal) throw new Error("Cannot clean up a queued agent");
       const runDirectory = path.join(this.#runRoot, id);
-      if (queued.cleanupPending || hasUnresolvedWorker(runDirectory)) {
+      const ownedRunDirectory = this.#cleanupRunCustody.get(runDirectory)?.run?.destination ?? runDirectory;
+      if (queued.cleanupPending || hasUnresolvedWorker(ownedRunDirectory)) {
         throw new Error(`Cannot clean up agent ${id}: Fabric lost track of its worker; check ${runDirectory} before removing its files`);
       }
       if (!this.#saveQueuedRouteOutcome(queued)) throw new Error(`Cannot clean up agent ${id}: ${queued.routeSaveFailure}`);
-      const exitVeto = runTreeExitVeto(runDirectory);
+      const exitVeto = runTreeExitVeto(ownedRunDirectory);
       if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
-      this.#onResultConsumed?.(id);
-      const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
+      const cleaned = await this.#cleanupWorktree(id, deleteBranch);
       if (!this.config.retainRuns) await this.#removeRunTree(runDirectory, id);
+      await this.#finalizeCleanup(id, beforeConsume);
+      this.#onResultConsumed?.(id);
       this.#queued.delete(id);
       this.#forgetRunMetadata(id);
       this.#invalidateUiList();
@@ -5475,7 +5512,7 @@ export class AgentManager {
     }
     // Retry transient custody without erasing immutable transport uncertainty.
     await this.#drainExecution(managed).catch(() => undefined);
-    if (managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) {
+    if (managed.lostContact || hasUnresolvedWorker(this.#ownedRunDirectory(managed))) {
       throw new Error(
         `Cannot clean up agent ${id}: Fabric lost track of its worker (${managed.lostContact ?? "see its run directory"}), ` +
         `a running agent may still use ${managed.runDirectory}. Check the worker, then remove its files by hand.`,
@@ -5484,16 +5521,17 @@ export class AgentManager {
     if (managed.settlementSaveFailure && !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) {
       throw new Error(`Cannot clean up agent ${id}: ${managed.settlementSaveFailure.warning}`);
     }
-    const exitVeto = runTreeExitVeto(managed.runDirectory, 0, undefined, true);
+    const exitVeto = runTreeExitVeto(this.#ownedRunDirectory(managed), 0, undefined, true);
     if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
     if (!this.#canCollect(managed)) {
       throw new Error(`Cannot clean up agent ${id}: ${uncheckedExternalExit(managed.transport) ? "external transport has no checked worker exit receipt" : managed.settlementSaveFailure?.warning ?? "terminal result is not durably preserved"}`);
     }
-    this.markForeground(id);
-    const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
+    const cleaned = await this.#cleanupWorktree(id, deleteBranch);
     if (!this.config.retainRuns) {
       await this.#removeRunTree(managed.runDirectory, id, managed.temporaryDirectory);
     }
+    await this.#finalizeCleanup(id, beforeConsume);
+    this.markForeground(id);
     this.#runs.delete(id);
     this.#forgetRunMetadata(id);
     this.#pruneRetainedUiRecords();
@@ -5503,7 +5541,7 @@ export class AgentManager {
 
   readLog(id: string, opts: { lines?: number; before?: number; beforeGeneration?: string } = {}): FabricAgentLog {
     const managed = this.#requireRun(id);
-    const runDirectory = managed.runDirectory;
+    const runDirectory = this.#ownedRunDirectory(managed);
     const logFile = path.join(runDirectory, "events.jsonl");
     const lines = Math.max(1, Math.min(opts.lines ?? 200, 5000));
     const page = readJsonlPage(logFile, lines, opts.before, undefined, opts.beforeGeneration);
@@ -6000,8 +6038,8 @@ export class AgentManager {
     // Primary transport exit cannot release a surviving descendant's files or
     // shared budget. Keep the persistent run tree (and its owning actor ID) for
     // the next fenced owner whenever tree-wide exit evidence is incomplete.
-    const unresolved = all.some((managed) => managed.processStopPending || (managed.actorId && managed.nativeReleasePending) ||
-        managed.lostContact || runTreeResourceVeto(managed.runDirectory, 0, undefined, true)) ||
+    const unresolved = this.#cleanupFinalizationPending.size > 0 || all.some((managed) => managed.processStopPending || (managed.actorId && managed.nativeReleasePending) ||
+        managed.lostContact || runTreeResourceVeto(this.#ownedRunDirectory(managed), 0, undefined, true)) ||
       [...this.#queued.values()].some((queued) => queued.cleanupPending) ||
       runRootHasExitVeto(this.#runRoot, new Set([...this.#queued.values()].filter(queued => queued.terminal && !queued.cleanupPending).map(queued => queued.info.id)));
     // An unrelated retained tree fences shared budget/root deletion, not an
@@ -6009,18 +6047,15 @@ export class AgentManager {
     // Nested run artifacts belong to the enclosing run (upstream lineage): its
     // owner removes them on cleanup/retention/root shutdown, not this child.
     if (!this.config.retainRuns && !this.#parentOwnedRunRoot) {
-      await Promise.all(all.filter(managed => this.#canCollect(managed))
+      await Promise.all(all.filter(managed => !this.#cleanupFinalizationPending.has(managed.id) && this.#canCollect(managed))
         .map(async (managed) => {
-          // Only sweep-owned managed roots retain unsuccessful terminal prompts.
-          // Explicit roots (including judge runs) and completed runs keep whole-tree
-          // deletion. Retention errors preserve custody rather than authorize deletion.
-          // Validate the exact result before any collection attempt, including
-          // explicit roots: an unexpected loss keeps custody and a loud refusal.
+          // Every terminal outcome keeps its WHOLE original tree. Never rewrite
+          // failed/stopped/timed_out raw records into a task/status-only residue.
+          // Unexpected result loss keeps custody rather than authorizing archival.
           if (managed.settledResultFile && !this.#exactResultPresent(managed)) return;
-          if (await this.#retainTerminalPromptRecord(managed).catch(() => true)) return;
           try { await this.#removeRunTree(managed.runDirectory, managed.id, managed.temporaryDirectory); } catch { return; } // A swallowed failure is no provenance.
           // A no-op removal or remaining/dangling entry is not collection.
-          if (managed.settledResultFile && pathAbsentNoFollow(managed.settledResultFile)) managed.resultCollected = true;
+          if (this.#cleanupRunCustody.get(managed.runDirectory)?.run && this.#exactResultPresent(managed)) managed.resultCollected = true;
         }));
     }
     // A failed stop is not authority to delete a child's working files.
@@ -6114,7 +6149,7 @@ export class AgentManager {
       await this.#startTempRunSweep();
     }
     const expired = [...this.#runs.values()].filter((managed) => {
-      if (!managed.settled || !managed.executionExited || managed.actorId || managed.processStopPending ||
+      if (this.#cleanupFinalizationPending.has(managed.id) || !managed.settled || !managed.executionExited || managed.actorId || managed.processStopPending ||
           (managed.actorId && managed.nativeReleasePending) || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
       const record = readRecord(managed.statusFile) ?? managed.latestRecord;
       const finishedAt = record?.finishedAt ?? record?.updatedAt;
@@ -6123,8 +6158,9 @@ export class AgentManager {
     for (const managed of expired) {
       if (!this.#canCollect(managed)) continue;
       // Retry settlement saves first; pending deliveries and unsafe contents still veto expiry.
-      if (!canRemoveTerminalRun(managed.runDirectory)) continue;
-      await this.#removeRunTree(managed.runDirectory, managed.id, managed.temporaryDirectory).catch(() => undefined);
+      if (!canRemoveTerminalRun(this.#ownedRunDirectory(managed))) continue;
+      try { await this.#removeRunTree(managed.runDirectory, managed.id, managed.temporaryDirectory); }
+      catch { continue; } // Partial moves/deferred copies retain the known-ID obligation.
       if (!fs.existsSync(managed.runDirectory)) {
         this.#runs.delete(managed.id);
         this.#forgetRunMetadata(managed.id);
@@ -6989,7 +7025,7 @@ export class AgentManager {
   }
 
   #routeTerminalNotices(managed: ManagedAgent): void {
-    this.#terminalNoticeOutbox.route(managed.runDirectory);
+    this.#terminalNoticeOutbox.route(this.#ownedRunDirectory(managed));
   }
 
   #actorWorkerGone(managed: ManagedAgent, recheck = false): boolean {
@@ -7770,64 +7806,23 @@ export class AgentManager {
     }
   }
 
-  async #retainTerminalPromptRecord(managed: ManagedAgent): Promise<boolean> {
-    if (!this.#managedTempRoot) return false;
-    // The manager's exact validated outcome governs retention. A worker can still
-    // have written a completed status.json after host validation failed the run.
-    const record = this.#readResult(managed) ?? managed.latestRecord;
-    if (!record || (record.status !== "failed" && record.status !== "stopped" && record.status !== "timed_out")) return false;
-    const resultFile = managed.settledResultFile;
-    const keepResult = resultFile === path.join(managed.runDirectory, MANAGER_RESULT_FILE) && this.#exactResultPresent(managed);
-    const promptFile = path.join(managed.runDirectory, "task.txt");
-    const stat = ownedStat(promptFile);
-    const expectedSha256 = managed.inputSha256 ?? record.inputSha256;
-    const expectedBytes = managed.inputBytes ?? record.inputBytes;
-    const oversized = expectedBytes !== undefined && expectedBytes > TERMINAL_PROMPT_RETENTION_MAX_BYTES;
-    const currentMatches = !oversized && stat?.isFile() === true && expectedSha256 !== undefined && expectedBytes !== undefined &&
-      stat.size <= TERMINAL_PROMPT_RETENTION_MAX_BYTES && promptFileMatches(promptFile, expectedSha256, expectedBytes);
-    if (!currentMatches) {
-      managed.promptRetentionDropped = true;
-      // A small file that fails its current-input digest is not safe to retain.
-      // Keep the mismatch visible in status.json, but drop the unverified bytes.
-      managed.promptRetentionMismatch = !oversized;
-    }
-    // Persist the manager's authoritative metadata before removing every other
-    // artifact. A verified current task.txt and status.json are the complete
-    // retained proof; a mismatch drops task.txt. The manager's exact outcome stays
-    // beside status.json with only its task fields removed; every other field is
-    // kept uncompacted. status.json stays compact and taskless.
-    if (keepResult && resultFile) managed.resultFingerprint = writePrivateJsonAtomic(resultFile, omitRetainedTasks(record));
-    writeJsonAtomic(managed.statusFile, omitRetainedTasks(compactUiRecord(this.#withTransportMetadata(record, managed, false))), { space: 2 });
-    for (const entry of fs.readdirSync(managed.runDirectory)) {
-      if (entry === "status.json" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
-      await removeTree(path.join(managed.runDirectory, entry));
-    }
-    // pi-fabric#1554 P1 (smarty-dev#15878): the loop above prunes the in-tree tmp/ such a run used before. Its short
-    // TMPDIR outside the run tree goes the same way here, or a scratch of more than 64 entries vetoes every later sweep.
-    await removeOwnedShortTmpdir(recordedShortTmpdir(managed.runDirectory, managed.id, managed.temporaryDirectory));
-    // Once an unsuccessful run has a retained status, never fall back to deleting its
-    // whole tree. Any cleanup error propagates to the close custody fence.
-    return true;
-  }
-
   /** The manager's own exact terminal result file (no replacement/mutation/symlink). */
   #exactResultPresent(managed: ManagedAgent): boolean {
-    const file = managed.settledResultFile;
-    const expectedFile = path.join(managed.runDirectory, MANAGER_RESULT_FILE);
-    if (!file || path.resolve(file) !== path.resolve(expectedFile)) return false;
-    const result = readAuthenticatedRecord(file, expectedFile, managed.resultFingerprint);
+    const file = this.#ownedResultFile(managed);
+    if (!file) return false;
+    const result = readAuthenticatedRecord(file, file, managed.resultFingerprint);
     return result?.id === managed.id && terminalStatuses.has(result.status);
   }
 
   #canCollect(managed: ManagedAgent): boolean {
     if (!managed.executionExited || managed.processStopPending || (managed.actorId && managed.nativeReleasePending) ||
-        this.#terminalNoticeOutbox.hasPending(managed.runDirectory) || managed.lostContact || hasUnresolvedWorker(managed.runDirectory)) return false;
+        this.#terminalNoticeOutbox.hasPending(this.#ownedRunDirectory(managed)) || managed.lostContact || hasUnresolvedWorker(this.#ownedRunDirectory(managed))) return false;
     if (uncheckedExternalExit(managed.transport)) return false;
     // Retry the durable full archive before asking its pending-marker collection veto.
     // Settlement compacts UI caches. Retry only the original full result, never those caches.
     if (managed.settlementSaveFailure &&
         !this.#saveSettledResult(managed, managed.settlementSaveFailure.result)) return false;
-    return !runTreeExitVeto(managed.runDirectory, 0, undefined, true);
+    return this.#exactResultPresent(managed) && !runTreeExitVeto(this.#ownedRunDirectory(managed), 0, undefined, true);
   }
 
   #notifyBackgroundComplete(managed: ManagedAgent, result: AgentRunResult): void {
@@ -8094,8 +8089,9 @@ export class AgentManager {
     let handlesChanged = false;
     for (const managed of settled.slice(0, -MAX_RETAINED_RUN_HANDLES)) {
       if (managed.executionExited && !managed.settlementSaveFailure && !managed.processStopPending &&
-          !(managed.actorId && managed.nativeReleasePending) && !managed.lostContact && !hasUnresolvedWorker(managed.runDirectory) &&
-          !this.#terminalNoticeOutbox.hasPending(managed.runDirectory) &&
+          !this.#cleanupFinalizationPending.has(managed.id) && !this.#cleanupRunCustody.has(managed.runDirectory) && !this.#cleanupDeferred.has(managed.id) &&
+          !(managed.actorId && managed.nativeReleasePending) && !managed.lostContact && !hasUnresolvedWorker(this.#ownedRunDirectory(managed)) &&
+          !this.#terminalNoticeOutbox.hasPending(this.#ownedRunDirectory(managed)) &&
           !this.#pendingAbandonment.has(managed.id) &&
           (!this.#foregroundPrepared.has(managed.id) || this.#foregroundDelivered.has(managed.id))) {
         this.#runs.delete(managed.id);
@@ -8256,7 +8252,7 @@ export class AgentManager {
   #handleInfo(managed: ManagedAgent, status: AgentHandleInfo["status"]): AgentHandleInfo {
     const model = managed.latestRecord?.model ?? managed.model;
     const thinking = managed.latestRecord?.thinking ?? managed.thinking;
-    return {
+    const info: AgentHandleInfo = {
       ...managed.runRoute,
       ...(managed.timeoutNote ? { timeoutNote: managed.timeoutNote } : {}),
       ...(managed.modelPolicyWarnings?.length ? { warnings: [...managed.modelPolicyWarnings] } : {}),
@@ -8295,6 +8291,7 @@ export class AgentManager {
       ...(managed.branch ? { branch: managed.branch } : {}),
       ...(managed.worktree ? { worktree: managed.worktree } : {}),
     };
+    return this.#withCleanupStatus(managed.id, info);
   }
 
   // Retain a bounded tree even when legacy workers removed their nested run

@@ -69,7 +69,7 @@ beforeEach(() => {
   vi.spyOn(fs, "unlinkSync").mockImplementation(probe("unlink"));
   vi.spyOn(fs, "rmdirSync").mockImplementation(probe("rmdir"));
 });
-afterEach(() => { vi.restoreAllMocks(); real.rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); real.rmSync(dir, { recursive: true, force: true }); });
 
 /** A binding store whose `.lock` holds a dead pid's stale record. */
 const staleBinding = () => {
@@ -84,6 +84,12 @@ const staleBinding = () => {
 // and a dry run there authorizes without verification. Swap and judged-stat cases run on Linux only; the fallback case
 // below stays platform-neutral through a controlled darwin stub.
 const linuxIt = it.skipIf(process.platform !== "linux");
+const elapsedClock = () => {
+  vi.useFakeTimers({ toFake: ["Date", "performance"] });
+  // Faking hrtime itself would collapse receipt prefixes at one tick and let UUIDs reverse FIFO.
+  const hostNow = process.hrtime.bigint.bind(process.hrtime);
+  vi.spyOn(process.hrtime, "bigint").mockImplementation(() => hostNow() + BigInt(Math.round(performance.now() * 1_000_000)));
+};
 
 linuxIt("binding store: a stale lock re-taken after its judgment is refused, kept and never rm'd", async () => {
   const { store, lock, ino } = staleBinding();
@@ -151,6 +157,7 @@ it.each([
   { kind: "dead", canonical: true },
   { kind: "stale", canonical: true },
 ])("off Linux lock queue: $kind predecessor with canonical guard=$canonical", ({ kind, canonical }) => {
+  elapsedClock();
   dryRun = false;
   const root = path.join(dir, "mesh-fallback");
   fs.mkdirSync(root, { mode: 0o700 });
@@ -170,6 +177,17 @@ it.each([
   const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
   Object.defineProperty(process, "platform", { value: "darwin" });
   try {
+    if (kind === "stale") {
+      expect(ticket.mayContend()).toBe(false); // first sight of an old wall mtime must never authorize removal
+      expect(fs.lstatSync(receipt).ino).toBe(ino);
+      expect(calls).toEqual([]);
+      expect(primitive.filter(call => call.target === receipt)).toEqual([]);
+      vi.advanceTimersByTime(canonical ? 501 : 30_001); // early canonical reaper / ordinary predecessor observation
+      expect(fs.lstatSync(receipt).ino).toBe(ino);
+    } else {
+      expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+      expect(performance.now()).toBe(0); // genuine death evidence, not an old wall-time substitute
+    }
     if (canonical) {
       expect(ticket.mayContend()).toBe(false);
       expect(fs.existsSync(receipt)).toBe(true);
@@ -189,7 +207,7 @@ it.each([
 });
 
 linuxIt("lock queue: a stalled canonical head is reaped through judged verifiedRemove", () => {
-  vi.useFakeTimers({ toFake: ["Date"] });
+  elapsedClock();
   const root = path.join(dir, "mesh-stalled");
   fs.mkdirSync(root, { mode: 0o700 });
   const canonical = path.join(root, ".lock");
@@ -200,6 +218,8 @@ linuxIt("lock queue: a stalled canonical head is reaped through judged verifiedR
   try {
     expect(head.mayContend()).toBe(true);
     expect(follower.mayContend()).toBe(false); // first observation starts the stall lease
+    expect(calls).toEqual([]);
+    expect(fs.lstatSync(headReceipt).ino).toBe(ino);
     vi.advanceTimersByTime(501); // #stallMs is 500 ms for this budget
     expect(follower.mayContend()).toBe(true);
     expect(calls).toEqual([{ target: headReceipt, ino, removed: true }]);
@@ -226,6 +246,12 @@ linuxIt("lock queue: an existing canonical holder keeps even a dead head receipt
     expect(follower.mayContend()).toBe(false);
     expect(calls).toEqual([]);
     expect(fs.existsSync(headReceipt)).toBe(true);
+    expect(moveAway(canonical)).toBe(true); // recorded owner release, not destructive canonical cleanup
+    expect(follower.mayContend()).toBe(true); // the same proven-dead PID is cleaned immediately after release
+    expect(follower.queued).toBe(true);
+    expect(fs.existsSync(headReceipt)).toBe(false);
+    expect(calls).toEqual([{ target: headReceipt, ino: expect.any(Number), removed: true }]);
+    expect(primitive.filter(call => call.target === headReceipt)).toEqual([]);
   } finally { follower.close(); }
 });
 

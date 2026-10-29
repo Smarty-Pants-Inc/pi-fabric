@@ -35,8 +35,9 @@ let pending;
 process.on("message", async command => {
   try {
     if (command.cmd === "enqueue") {
-      pending = lock.withLock(() => say({ acquired: Date.now() }));
-      say({ queued: true }); // protocol 1: the receipt exists once withLock has returned its promise
+      pending = Promise.all(Array.from({ length: command.count ?? 1 }, (_, index) =>
+        lock.withLock(() => say({ acquired: Date.now(), index }))));
+      say({ queued: true }); // protocol 1: all receipts exist once withLock has returned its promises
       pending.then(finish, error => { say({ error: String(error?.code ?? error) }); finish(); });
     } else if (command.cmd === "block") {
       say({ blocked: Date.now() });
@@ -202,6 +203,62 @@ describe.skipIf(process.platform === "win32")("mesh lock with a stalled live FIF
     expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
   }, 20_000);
 
+  it.each([false, true])("recovers a stalled same-PID head AND successor before either resumes, preserving healthy FIFO (queued before promotion: %s)", async (queuedBeforePromotion) => {
+    const root = scratch();
+    const holder = new MeshLock(root, { lockTimeoutMs: 2500 }, noop);
+    let release = noop;
+    let entered = noop;
+    const inside = new Promise<void>(resolve => { entered = resolve; });
+    const held = holder.withLockAcrossAwait(() => new Promise<void>(resolve => { release = resolve; entered(); }));
+    await inside;
+
+    const stalled = spawn(root, 10_000);
+    await stalled.next("ready");
+    stalled.send({ cmd: "enqueue", count: 2 });
+    await stalled.next("queued");
+    expect(receipts(root).map(pidOf)).toEqual([process.pid, stalled.process.pid, stalled.process.pid]);
+    stalled.send({ cmd: "block", ms: 1800 });
+    await stalled.next("blocked");
+    const parked = receipts(root).slice(1);
+
+    const order: number[] = [];
+    const acquired: number[] = [];
+    const pending: Promise<void>[] = [];
+    const enqueueFollowers = (): void => {
+      for (let index = 0; index < 3; index += 1) {
+        const follower = new MeshLock(root, { lockTimeoutMs: 2500 }, noop);
+        pending.push(follower.withLock(() => {
+          expect(ownerPid(root)).toBe(process.pid); // actual canonical entry, not just ticket eligibility
+          expect(receipts(root).some(name => parked.includes(name))).toBe(false);
+          order.push(index);
+          acquired.push(Date.now());
+        }));
+      }
+    };
+    if (queuedBeforePromotion) enqueueFollowers();
+    const releasedAt = Date.now();
+    release();
+    await held;
+    expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
+    if (!queuedBeforePromotion) enqueueFollowers();
+    expect(receipts(root)).toHaveLength(5); // stalled head + immediate successor, then three healthy waiters
+    await Promise.all(pending);
+
+    console.info(`SAME_PID_STALLED_PAIR promotion=${queuedBeforePromotion} recoveryMs=${acquired.at(-1)! - releasedAt} order=${order}`);
+    expect(order).toEqual([0, 1, 2]);
+    // Two independently observed stall bounds (~2 x 250 ms), NOT the 80% fallback (2000 ms) or resumption (1800 ms).
+    expect(acquired.at(-1)! - releasedAt).toBeLessThan(1100);
+    expect(stalled.messages.some(message => "acquired" in message)).toBe(false);
+    await stalled.next("done");
+    const resumed = stalled.messages.filter(message => "acquired" in message);
+    expect(resumed).toHaveLength(2);
+    expect(resumed.every(message => Number(message.acquired) >= acquired.at(-1)!)).toBe(true);
+    expect(stalled.messages.some(message => "error" in message)).toBe(false);
+    expect(reclaimFences(root)).toEqual([]);
+    expect(receipts(root)).toEqual([]);
+    expect(fs.existsSync(path.join(root, ".lock"))).toBe(false);
+  }, 20_000);
+
   it("reaps one parked head and admits multiple followers without a per-follower bypass delay", async () => {
     const root = scratch();
     const holderA = new MeshLock(root, { lockTimeoutMs: 2500 }, noop);
@@ -248,29 +305,49 @@ describe.skipIf(process.platform === "win32")("mesh lock with a stalled live FIF
     expect(receipts(root)).toEqual([]);
   }, 20_000);
 
-  it("never bypasses a live slow .lock holder, even when its receipt looks stalled", async () => {
+  it.each([1200, 4200])("never bypasses a live slow .lock holder, even when its receipt looks stalled (hold %s ms)", async holdMs => {
     const root = scratch();
     const h = spawn(root, 10_000);
     await h.next("ready");
-    h.send({ cmd: "hold", ms: 1200 });
+    h.send({ cmd: "hold", ms: holdMs });
     const entered = await h.next("entered");
     expect(ownerPid(root)).toBe(h.process.pid);
+    const canonical = path.join(root, ".lock");
+    const heldInode = fs.lstatSync(canonical).ino;
+    const heldOwner = fs.readFileSync(path.join(canonical, "owner"), "utf8");
 
     const follower = new MeshLock(root, { lockTimeoutMs: 2500 }, noop);
     let during: { at: number; inside: boolean; exitAt: number; owner: number; fences: string[] } | undefined;
-    const f = follower.withLock(() => {
+    const operation = (): void => {
       during = {
         at: Date.now(), inside: fs.existsSync(path.join(root, "inside")),
         exitAt: Number(fs.readFileSync(path.join(root, "exit"), "utf8")), owner: ownerPid(root), fences: reclaimFences(root),
       };
-    });
+    };
+    const f = follower.withLock(operation).catch((error: unknown) => error);
     // F queued behind the holder's receipt (kept through its critical section).
     expect(receipts(root).map(pidOf)).toEqual([h.process.pid, process.pid]);
     const holderReceipt = receipts(root).find(receipt => pidOf(receipt) === h.process.pid)!;
     await new Promise<void>(resolve => setTimeout(resolve, 300));
     expect(fs.existsSync(path.join(root, ".lock"))).toBe(true);
     expect(fs.existsSync(path.join(meshLockQueueDirectory(root), holderReceipt))).toBe(true);
-    await f;
+    const result = await f;
+    if (holdMs > 2500) {
+      // The holder spans BOTH the ordinary 80% fallback (2000 ms + stall observation) and the fixed 2500 ms deadline.
+      // Late advisory fallback must still let MeshLock judge a dead canonical owner, but never steal this LIVE one.
+      expect(result).toMatchObject({ code: "FABRIC_MESH_LOCK_TIMEOUT", attempts: expect.any(Number) });
+      expect(result).not.toHaveProperty("preLockCode");
+      expect((result as { attempts: number }).attempts).toBeGreaterThan(0);
+      expect(during).toBeUndefined();
+      expect(fs.lstatSync(canonical).ino).toBe(heldInode);
+      expect(fs.readFileSync(path.join(canonical, "owner"), "utf8")).toBe(heldOwner);
+      expect(fs.existsSync(path.join(root, "inside"))).toBe(true);
+      expect(fs.existsSync(path.join(meshLockQueueDirectory(root), holderReceipt))).toBe(true);
+      expect(reclaimFences(root)).toEqual([]);
+      console.info(`LIVE_SLOW_HOLDER holdMs=${holdMs} lateFallbackAttempts=${(result as { attempts: number }).attempts} stolen=false`);
+      // A fresh bounded acquisition enters only after the same real holder releases.
+      await follower.withLock(operation);
+    } else expect(result).toBeUndefined();
     await h.next("done");
 
     expect(during!.inside).toBe(false);

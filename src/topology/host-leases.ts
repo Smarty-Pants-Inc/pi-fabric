@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
+import { setTimeout as readDelay } from "node:timers/promises";
+import { hostLeaseFileNames, visitHostLeaseFiles } from "./lease-discovery.js";
 import { isMeshLockTimeout, readFileRetrying, writeJsonAtomic, type PhysicalHostIdentity } from "../core/atomic-write.js";
 import { effectiveLiveness, type Liveness } from "./liveness.js";
 import { watchBridgeStore } from "../mesh/change-notifier.js";
@@ -279,7 +281,7 @@ export const withHostLeaseDirectoryCustody = <T>(mesh: HostLeaseMesh,
   mesh.leaseCustody(hostLeaseAdditionsGatePath(mesh.root), async () => {
     const directory = path.join(mesh.root, LEASE_DIR);
     let names: string[];
-    try { names = fs.readdirSync(directory).filter(name => /^[0-9a-f]{32}\.json$/.test(name)).sort(); }
+    try { names = (await hostLeaseFileNames(directory)).filter(name => /^[0-9a-f]{32}\.json$/.test(name)).sort(); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") names = []; else throw error; }
     const relevant = relevantIds === undefined ? undefined : new Set<string>();
     if (relevant && relevantIds) {
@@ -287,7 +289,7 @@ export const withHostLeaseDirectoryCustody = <T>(mesh: HostLeaseMesh,
         const file = hostLeasePath(mesh.root, id);
         if (fs.existsSync(file)) relevant.add(path.basename(file));
       }
-      for (const lease of readHostLeases(mesh.root).values()) {
+      for (const lease of (await readHostLeasesAsync(mesh.root)).values()) {
         if (relevantIds.has(lease.id) || relevantIds.has(lease.rootId) || relevantIds.has(lease.identityId)) {
           relevant.add(path.basename(hostLeasePath(mesh.root, lease.id)));
         }
@@ -645,6 +647,77 @@ export const readHostLeases = (meshRoot: string, problems?: string[]): Map<strin
   return leases;
 };
 
+/** Complete asynchronous discovery for callers that can await IO. No listing TTL or last
+ * completed snapshot: every invocation enumerates and stats current files. Per-file cache
+ * identity, transient-read fallback and expired-file inclusion match readHostLeases.
+ * This is NOT a coherent cross-file transaction; destructive users retain their custody,
+ * directory-stamp brackets and strict current/version checks. */
+export const readHostLeasesAsync = async (meshRoot: string, problems?: string[]): Promise<Map<string, FabricHostLease>> => {
+  const dir = path.join(meshRoot, LEASE_DIR);
+  const failed = (file: string, error: unknown): void => {
+    const code = (error as NodeJS.ErrnoException)?.code ?? "EUNKNOWN";
+    if (code !== "ENOENT") problems?.push(`${file}: ${code}`);
+  };
+  let names: string[];
+  try { names = await hostLeaseFileNames(dir); }
+  catch (error) { failed(dir, error); return new Map(); }
+  const known = cache.get(dir) ?? new Map();
+  cache.set(dir, known);
+  const observed = new Map<string, FabricHostLease>();
+  await visitHostLeaseFiles(names, async name => {
+    const file = path.join(dir, name);
+    let stat: fs.BigIntStats;
+    try { stat = await fs.promises.stat(file, { bigint: true }); }
+    catch (error) { failed(file, error); return; }
+    const slot = known.get(name);
+    let lease: FabricHostLease | undefined;
+    if (slot && sameLeaseStat(slot, stat)) lease = slot.lease;
+    else {
+      let text: string;
+      try {
+        for (let attempt = 1; ; attempt++) {
+          try { text = await fs.promises.readFile(file, "utf8"); break; }
+          catch (error) {
+            if (attempt >= 5 || !["EPERM", "EACCES", "EBUSY"].includes((error as NodeJS.ErrnoException)?.code ?? "")) throw error;
+            await readDelay(5 * attempt);
+          }
+        }
+      } catch (error) {
+        failed(file, error);
+        if (slot?.lease) observed.set(name, slot.lease);
+        return; // Do not cache unreadable bytes; next lookup must retry them.
+      }
+      lease = leaseOf(text, name);
+      // An awaited read must not overwrite a newer synchronous/parallel observation's cache.
+      if (known.get(name) === slot) known.set(name, {
+        dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs, lease,
+      });
+    }
+    if (lease) observed.set(name, lease);
+    else problems?.push(`${file}: invalid`);
+  });
+  const present = new Set(names);
+  await visitHostLeaseFiles([...known.keys()], async name => { if (!present.has(name)) known.delete(name); });
+  const leases = new Map<string, FabricHostLease>();
+  // Preserve directory order even when stat/read completions arrive out of order.
+  await visitHostLeaseFiles(names, async name => {
+    const lease = observed.get(name);
+    if (lease) leases.set(lease.id, lease);
+  });
+  return leases;
+};
+
+/** Exact finite host-id selection, NOT discovery by rootId or identityId. Use only when
+ * the consumer consults leases.get(host.id); file-only aliases require complete discovery. */
+export const readHostLeasesForIds = (meshRoot: string, hostIds: Iterable<string>): Map<string, FabricHostLease> => {
+  const leases = new Map<string, FabricHostLease>();
+  for (const id of new Set(hostIds)) {
+    const lease = readHostLease(meshRoot, id);
+    if (lease) leases.set(id, lease);
+  }
+  return leases;
+};
+
 /** Cheap topology-cache invalidation; freshness itself always uses effectiveLiveness. */
 export const hostLeasesStamp = (meshRoot: string): string | undefined => {
   try {
@@ -715,6 +788,10 @@ type LeaseSlots = Map<string, Pick<fs.BigIntStats, "dev" | "ino" | "size" | "mti
   lease: FabricHostLease | undefined;
 }>;
 
+const sameLeaseStat = (slot: Pick<fs.BigIntStats, "dev" | "ino" | "size" | "mtimeNs" | "ctimeNs">, stat: fs.BigIntStats): boolean =>
+  slot.dev === stat.dev && slot.ino === stat.ino && slot.size === stat.size &&
+  slot.mtimeNs === stat.mtimeNs && slot.ctimeNs === stat.ctimeNs;
+
 const cachedLease = (
   known: LeaseSlots, dir: string, name: string, stat: fs.BigIntStats, problems?: string[],
 ): FabricHostLease | undefined => {
@@ -724,8 +801,7 @@ const cachedLease = (
   // NTFS IDs can exceed Number.MAX_SAFE_INTEGER, so distinct replacements can have the
   // same numeric ino. Nanosecond timestamps also avoid rounding away a change when a
   // filesystem lacks useful dev/ino values.
-  if (slot && slot.dev === stat.dev && slot.ino === stat.ino && slot.size === stat.size &&
-    slot.mtimeNs === stat.mtimeNs && slot.ctimeNs === stat.ctimeNs) return slot.lease ?? invalid();
+  if (slot && sameLeaseStat(slot, stat)) return slot.lease ?? invalid();
   const parsed = parseLease(path.join(dir, name), name);
   if (!parsed.read) {                                       // unreadable for now: keep the last answer
     if (parsed.code !== "ENOENT") problems?.push(`${path.join(dir, name)}: ${parsed.code}`);

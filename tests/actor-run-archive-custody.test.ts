@@ -126,7 +126,7 @@ describe("actor archive custody through real filesystem cleanup", () => {
       await expect(retain.mock.results[0]!.value).rejects.toMatchObject({ code: "FABRIC_ACTOR_RUN_ARCHIVE_REFUSED" });
       expect(fs.readFileSync(path.join(source, "events.jsonl"), "utf8")).toBe(original);
       expect(fs.existsSync(marker(source))).toBe(true);
-      expect(f.agents.actorArchiveSources(actor.id, actor.sessionFile!).get(a.runId!)).toBe(source);
+      expect((await f.agents.actorArchiveSources(actor.id, actor.sessionFile!)).get(a.runId!)).toBe(source);
       expect(f.actors.status(actor.id).pendingRunArchives).toBe(1);
       expect(logged).toHaveBeenCalledWith("src/actors/manager.ts", expect.stringContaining("source retained for retry"));
     }

@@ -46,10 +46,10 @@ export class MeshLockTicket {
   readonly #stallMs: number;
   readonly #passStalledHead: boolean;
   readonly #bypassLock: string | undefined;
-  #nextAfterHead = false;
   #queueHead: string | undefined;
-  #predecessorMtimeMs = 0;
   #predecessorStat: fs.Stats | undefined;
+  #observedPredecessor: string | undefined;
+  #predecessorSeenAt = 0;
   #observedBeat: string | undefined;
   #beatSeenAt = 0;
   #headCheckedAt = 0;
@@ -57,8 +57,6 @@ export class MeshLockTicket {
   #head = false;
   #predecessor: string | undefined;
   #touchedAt = 0;
-  #observedHead: string | undefined;
-  #observedAt = 0;
   #rootWatcher: fs.FSWatcher | undefined;
   #predecessorWatcher: fs.FSWatcher | undefined;
   #watched: string | undefined;
@@ -68,10 +66,12 @@ export class MeshLockTicket {
   /** `passStalledHead` (smarty-dev#10516): pass a stalled head at any time, not only past 80% of the budget. Only for
    * a queue whose ticket closes when the lock is taken (SQLite state writes): there a stale head never holds the lock.
    * A `.lock` holder keeps its receipt through its critical section, so a long hold would look stalled.
-   * `stalledHeadBypassLock` (smarty-dev#9805): the canonical `.lock` directory path. Only the waiter directly behind
-   * the head may reap its receipt early, once its own observation of the head's name and mtime is older than the stall
-   * bound and that path is absent. Reaping makes the follower the new FIFO head; a resumed head sees its missing ticket
-   * and falls back to the plain contest, while mkdir/rename stays the only exclusion fence. */
+   * `stalledHeadBypassLock` (smarty-dev#9805): the canonical `.lock` directory path. Any live waiter may reap the
+   * head's receipt early, once its own observation of that head's inode and mtime is older than the stall bound and
+   * that path is absent. Head and immediate successor may share a stalled event loop. Reaping advances FIFO without
+   * closing healthy followers' admission; a resumed reaped head falls back to the plain contest. The late fallback
+   * remains necessary when .lock exists with a dead owner: only MeshLock can judge/recover canonical custody.
+   * Canonical mkdir/rename stays the only exclusion fence, including for old releases that ignore this queue. */
   constructor(root: string, token: string, budgetMs: number,
     options: { passStalledHead?: boolean; stalledHeadBypassLock?: string } = {}) {
     this.#directory = meshLockQueueDirectory(root);
@@ -79,7 +79,7 @@ export class MeshLockTicket {
     // hrtime is a host-wide monotonic clock, unlike a wall clock that can step backwards.
     this.#name = `${process.hrtime.bigint().toString().padStart(24, "0")}-${process.pid}-${token}`;
     this.#file = path.join(this.#directory, this.#name);
-    this.#fallbackAt = Date.now() + Math.min(10_000, Math.max(0, budgetMs * 0.8));
+    this.#fallbackAt = performance.now() + Math.min(10_000, Math.max(0, budgetMs * 0.8));
     this.#staleMs = Math.max(30_000, budgetMs * 2);
     this.#gated = budgetMs >= GATED_BUDGET_MS;
     this.#stallMs = Math.min(2000, Math.max(4 * HEARTBEAT_MS, budgetMs * 0.1));
@@ -104,18 +104,14 @@ export class MeshLockTicket {
   }
 
   /** True when this waiter may probe .lock: it is the head, or admission is closed/fell back.
-   * Non-heads stat only their predecessor's receipt (never .lock/owner) and list the queue only
-   * when that receipt goes, or once past the fallback point (with `passStalledHead`, at most once
-   * per heartbeat interval at any time) to judge the head's progress. */
+   * Non-heads stat their predecessor's receipt (never .lock/owner), plus the cached head for canonical stalled-head
+   * recovery. They list the queue only when either goes, or once past the fallback point (with
+   * `passStalledHead`, at most once per heartbeat interval at any time) to judge the head's progress. */
   mayContend(): boolean {
     if (this.#closed) return true;
     // Short (try) budgets keep the previous unconditional 80% fallback, head included.
-    if (!this.#gated && Date.now() >= this.#fallbackAt) { this.close(); return true; }
+    if (!this.#gated && performance.now() >= this.#fallbackAt) { this.close(); return true; }
     if (this.#head) { this.#heartbeat(); return true; }
-    // An earlier head can disappear while our immediate predecessor stays. Rediscover its promotion instead of
-    // caching index > 1 until that predecessor leaves; it may itself now be the stalled head (#9805).
-    if (this.#bypassLock !== undefined && !this.#nextAfterHead && this.#queueHead !== undefined &&
-      !fs.existsSync(path.join(this.#directory, this.#queueHead))) this.#predecessor = undefined;
     if (this.#predecessor !== undefined && this.#waitingOn(this.#predecessor)) {
       const held = this.#holdBack();
       if (held !== undefined) return held;
@@ -132,8 +128,7 @@ export class MeshLockTicket {
       if (index < 0) { this.close(); return true; }
       if (index === 0) { this.#head = true; this.#predecessor = undefined; this.#heartbeat(true); return true; }
       this.#predecessor = names[index - 1]!;
-      // Receipt names are host-monotonic, so a predecessor at index 0 stays head until its receipt goes (watched).
-      this.#nextAfterHead = index === 1;
+      // Receipt names are host-monotonic, so this head stays first until its receipt goes.
       this.#queueHead = names[0];
       if (this.#waitingOn(this.#predecessor)) {
         const held = this.#holdBack();
@@ -153,8 +148,15 @@ export class MeshLockTicket {
     const file = path.join(this.#directory, name);
     try {
       const stat = fs.lstatSync(file);
-      if (pidAlive(name) && Date.now() - stat.mtimeMs <= this.#staleMs) {
-        this.#predecessorMtimeMs = stat.mtimeMs;
+      const now = performance.now();
+      // mtime is another process's persisted wall clock, not an elapsed-time origin. Age only our own
+      // unchanged (name, dev, ino, mtime) observation; first sight and any identity/heartbeat change reset it.
+      const beat = `${name}:${stat.dev}:${stat.ino}:${stat.mtimeMs}`;
+      if (beat !== this.#observedPredecessor) {
+        this.#observedPredecessor = beat;
+        this.#predecessorSeenAt = now;
+      }
+      if (pidAlive(name) && now - this.#predecessorSeenAt <= this.#staleMs) {
         this.#predecessorStat = stat;
         return true;
       }
@@ -165,11 +167,12 @@ export class MeshLockTicket {
       // A receipt is a regular file (main unlinked it; an unlink never removes a directory): anything else is kept and
       // waited on, never handed to a recursive removal. verifiedRemove's `.retention-graveyard-*` never matches TICKET.
       if (!stat.isFile()) return true;
-      if (!verifiedRemove(file, stat, { deleter: "meshLockQueueReceipt", fallback: () => {
+      if (!verifiedRemove(file, stat, { deleter: "meshLockQueueReceipt", proceed: () => this.#canonicalLockAbsent(), fallback: () => {
         if (this.#bypassLock !== undefined && !this.#canonicalLockAbsent()) return false;
         fs.unlinkSync(file);
         return true;
       } }).removed) {
+        this.#predecessorSeenAt = now; // a verification refusal gets another full observation bound
         return fs.lstatSync(file, { throwIfNoEntry: false }) !== undefined;
       }
     } catch (error) {
@@ -179,12 +182,14 @@ export class MeshLockTicket {
   }
 
   /** Past 80% of an ordinary budget (with `passStalledHead`, at any time), join the plain contest only if the head is
-   * stalled: neither its heartbeat nor our first sight of it as head is within the stall bound. The second term
-   * keeps a head that has only just taken over from being judged by its old creation time. Returns undefined when the
-   * canonical-lock follower reaped its stalled head and the caller must rescan. */
+   * stalled: its exact identity/heartbeat has stayed unchanged for a full local monotonic observation bound.
+   * A head that has only just taken over cannot be judged by its old creation time. Returns undefined when the
+   * canonical-lock waiter reaped its stalled head and the caller must rescan. */
   #holdBack(): boolean | undefined {
     if (this.#reapStalledHead()) return undefined;
-    const now = Date.now();
+    // Keep the late plain-contest fallback, even for canonical queues: a dead canonical owner can leave .lock
+    // present behind an alive stalled head. Only the acquisition path can prove/recover that dead owner.
+    const now = performance.now();
     if (now < this.#fallbackAt) {
       // smarty-dev#10516: a stalled head otherwise holds every waiter to 80% of its budget, and most then time out in
       // the last 20%. One queue listing per heartbeat interval at most, not one per poll.
@@ -193,10 +198,9 @@ export class MeshLockTicket {
     }
     const head = fs.readdirSync(this.#directory).filter(name => TICKET.test(name)).sort()[0];
     if (head === undefined || head === this.#name) return false; // the next scan makes us head
-    if (head !== this.#observedHead) { this.#observedHead = head; this.#observedAt = now; }
     try {
-      const heartbeat = Math.max(fs.statSync(path.join(this.#directory, head)).mtimeMs, this.#observedAt);
-      if (now - heartbeat <= this.#stallMs) return false;
+      const stat = fs.lstatSync(path.join(this.#directory, head));
+      if (!stat.isFile() || !this.#headStalled(head, stat, now)) return false;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
       throw error;
@@ -205,27 +209,42 @@ export class MeshLockTicket {
     return true;
   }
 
-  /** smarty-dev#9805: reap the receipt of a stalled head only from the waiter directly behind it. This waiter must
-   * have observed the same head name and mtime for #stallMs, and the canonical lock must be absent at the judgment.
-   * The judged stat goes through verifiedRemove, exactly like ordinary dead/stale receipt cleanup. A failed verification
-   * keeps the receipt and holds back; a successful removal asks mayContend() to rescan. */
-  #reapStalledHead(): boolean {
-    if (this.#bypassLock === undefined || !this.#nextAfterHead || this.#predecessor === undefined) return false;
-    const now = Date.now();
-    const beat = `${this.#predecessor}:${this.#predecessorMtimeMs}`;
+  /** Both early reaping and legacy fallback use the same local observation, never a wall-clock mtime age.
+   * Include the head's name so promotion, inode replacement and heartbeat changes each get a full stall bound. */
+  #headStalled(name: string, stat: fs.Stats, now: number): boolean {
+    const beat = `${name}:${stat.dev}:${stat.ino}:${stat.mtimeMs}`;
     if (beat !== this.#observedBeat) {
       this.#observedBeat = beat;
       this.#beatSeenAt = now;
       return false;
     }
-    if (now - this.#beatSeenAt <= this.#stallMs) return false;
-    if (!this.#canonicalLockAbsent()) return false;
-    const judged = this.#predecessorStat;
+    return now - this.#beatSeenAt > this.#stallMs;
+  }
+
+  /** smarty-dev#9805: any live waiter can recover a stalled head, even if its immediate successor is stalled too.
+   * Observe the cached HEAD (not our predecessor) unchanged for #stallMs. A promoted/replaced/refreshed head gets a
+   * fresh observation bound. The canonical lock must be absent at judgment and verifiedRemove's final check. Only
+   * that judged regular receipt can go; successful removal/disappearance asks mayContend() to rescan in FIFO order. */
+  #reapStalledHead(): boolean {
+    if (this.#bypassLock === undefined || this.#queueHead === undefined) return false;
+    const file = path.join(this.#directory, this.#queueHead);
+    let judged: fs.Stats | undefined;
+    try {
+      // Reuse the predecessor stat for the common immediate-follower case; deeper waiters stat only the cached head.
+      judged = this.#queueHead === this.#predecessor ? this.#predecessorStat : fs.lstatSync(file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      throw error;
+    }
     if (judged === undefined || !judged.isFile()) return false;
-    const file = path.join(this.#directory, this.#predecessor);
+    const now = performance.now();
+    if (!this.#headStalled(this.#queueHead, judged, now)) return false;
+    if (!this.#canonicalLockAbsent()) return false;
     try {
       const removed = verifiedRemove(file, judged, { deleter: "meshLockQueueReceipt", proceed: () => this.#canonicalLockAbsent(), fallback: () => {
-        if (!this.#canonicalLockAbsent()) return false;
+        const current = fs.lstatSync(file);
+        if (!current.isFile() || current.dev !== judged.dev || current.ino !== judged.ino || current.mtimeMs !== judged.mtimeMs ||
+          !this.#canonicalLockAbsent()) return false;
         fs.unlinkSync(file);
         return true;
       } }).removed;
@@ -237,7 +256,6 @@ export class MeshLockTicket {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    this.#predecessorStat = undefined;
     this.#observedBeat = undefined;
     return true;
   }
@@ -251,10 +269,13 @@ export class MeshLockTicket {
 
   /** The head (and the holder, until it releases) proves progress by its receipt's mtime. */
   #heartbeat(force = false): void {
-    const now = Date.now();
+    const now = performance.now();
     if (!force && now - this.#touchedAt < HEARTBEAT_MS) return;
     this.#touchedAt = now;
-    try { fs.utimesSync(this.#file, now / 1000, now / 1000); }
+    // Persist wall time in the filesystem: other processes/releases read this mtime. It is a freshness
+    // token here, never subtracted from our local monotonic clock to infer elapsed age.
+    const wall = Date.now() / 1000;
+    try { fs.utimesSync(this.#file, wall, wall); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   }
 
@@ -271,6 +292,9 @@ export class MeshLockTicket {
     }
     signal?.throwIfAborted();
     if (this.#signalled) { this.#signalled = false; return Promise.resolve(); }
+    // MeshLock's existing absolute Date-based API supplies a local caller deadline, not observation aging.
+    // A forward wall step may end this wait early; a backward step may lengthen it, but the caller's
+    // already-armed monotonic guard still bounds admission. Never use this deadline to age receipts.
     const sleepMs = deadline === undefined ? ms : Math.min(ms, deadline - Date.now());
     if (deadline !== undefined && sleepMs <= 0) return Promise.resolve();
     return new Promise((resolve, reject) => {

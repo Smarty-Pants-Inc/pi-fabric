@@ -179,6 +179,65 @@ describe.each(["file", "sqlite"] as const)("ParticipantDirectory idle heartbeat 
     expect(await pass()).toBe(true);
   });
 
+  it("selects newly referenced hosts from a changed snapshot, with identity and incarnation checked on every lease change", async () => {
+    const { alpha, mesh, meshRoot, collisions } = setup();
+    await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, participants: "files" }, identity: identityOf("policy") });
+    await alpha.start();
+    await alpha.refresh(); // Both derivations already have a cached answer without this host.
+    const peer = identityOf("new-file-owner");
+    const now = Date.now();
+    await mesh.put({ key: "topology/hosts/" + sha(peer.id), identity: peer, value: {
+      format: 1, id: peer.id, rootId: peer.id, identity: peer, startedAt: 1, incarnationToken: "current",
+      updatedAt: now - 60_000, expiresAt: now - 30_000, livenessLeaseFiles: 1,
+    } });
+    await mesh.put({ key: "topology/participants/" + sha(peer.id), identity: peer,
+      value: { ...rootRecord(peer, "alpha"), ownerIncarnation: "current" } });
+    const lease = { id: peer.id, rootId: peer.id, identityId: peer.id, startedAt: 1,
+      incarnationToken: "current", updatedAt: now, expiresAt: now + 60_000 };
+    const alphaKey = "topology/participants/" + sha("session:alpha");
+    for (const mismatch of [{ rootId: "wrong-root" }, { identityId: "wrong-identity" }, { incarnationToken: "predecessor" }]) {
+      writeHostLease(meshRoot, { ...lease, ...mismatch });
+      await alpha.refresh();
+      expect(mesh.get(alphaKey, { fresh: true })).toBeUndefined();
+      expect(alpha.list({ scope: "project" }).some(row => row.id === peer.id)).toBe(false);
+      expect(collisions).toEqual([]);
+    }
+    // No state change: only the exact known host's file becomes authoritative.
+    writeHostLease(meshRoot, lease);
+    await alpha.refresh();
+    expect(mesh.get(alphaKey, { fresh: true })).toBeDefined(); // pre-capability participant needs dual publication
+    expect(alpha.list({ scope: "project" }).some(row => row.id === peer.id)).toBe(true);
+    expect(collisions).toEqual([expect.objectContaining({ reason: "duplicate-session", ids: ["session:alpha", peer.id] })]);
+  });
+
+  it("detects a session-only collision when an explicitly named lease-only host changes without a state commit", async () => {
+    const { alpha, mesh, meshRoot, collisions } = setup();
+    await mesh.put({ key: LIVENESS_POLICY_KEY, value: { version: 1, participants: "files" }, identity: identityOf("policy") });
+    await alpha.start();
+    const old = identityOf("session-only");
+    const now = Date.now();
+    await mesh.put({ key: "sessions/alpha", identity: old, value: {
+      id: old.id, sessionId: "alpha", cwd: "/tmp/project", startedAt: 1, status: "idle",
+      livenessLeaseFiles: 1, livenessHostId: "arbitrary-lease-only-host", livenessIncarnationToken: "session-token",
+    } });
+    // Age only this immutable advertisement; its lease has not been created yet.
+    const real = Date.now;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => real() + 20_000);
+    try {
+      await alpha.refresh();
+      expect(collisions).toEqual([]);
+      expect(mesh.listAll("topology/hosts/").some(entry => (entry.value as { id?: string }).id === "arbitrary-lease-only-host")).toBe(false);
+      const before = mesh.stateToken({ fresh: true });
+      writeHostLease(meshRoot, { id: "arbitrary-lease-only-host", rootId: old.id, identityId: old.id,
+        incarnationToken: "session-token", updatedAt: now + 20_000, expiresAt: now + 60_000,
+        session: { id: "alpha", startedAt: 1, updatedAt: now + 20_000, expiresAt: now + 60_000 } });
+      expect(mesh.stateToken({ fresh: true })).toBe(before);
+      expect(alpha.list({ scope: "project", kinds: ["root"] }).some(row => row.id === old.id)).toBe(true);
+      await alpha.refresh();
+      expect(collisions).toEqual([expect.objectContaining({ reason: "duplicate-session", ids: ["session:alpha", old.id] })]);
+    } finally { clock.mockRestore(); }
+  });
+
   it("sees a changed lease within one pass, and lets the old reader's expiry take effect on time without a change", async () => {
     const { alpha, mesh, meshRoot } = setup();
     const policy = identityOf("policy");

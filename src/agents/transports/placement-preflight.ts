@@ -131,6 +131,12 @@ const fleetRoot = (config: AgentPlacementConfig, cwd: string): string | undefine
     ? path.join(os.homedir(), ".local", "share", "smarty-dev", "factory", "current") : path.dirname(bin);
 };
 
+/** Identifies the installed fleet-helper protocol, not a proven relay. GitHub
+ * still needs its read-only compatibility handshake and selected-host probe.
+ * A custom picker alone does not opt a generic launcher into this protocol.
+ */
+export const usesFleetPlacementHelper = (config: AgentPlacementConfig, cwd: string): boolean => fleetRoot(config, cwd) !== undefined;
+
 const hostSlot = (command: readonly string[]): number | undefined => {
   const end = command.indexOf("--") < 0 ? command.length : command.indexOf("--");
   const slots = command.slice(1, end).flatMap((entry, index) => entry === "--host" ? [index + 1] : []);
@@ -211,17 +217,32 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
     const pairs: [string, string][] = [];
     if (targetCwd) pairs.push([targetCwd, targetCwd]);
     let guard = ":";
+    let relayGithub = false;
     if (root) {
-      // Reuse installed literal-path/corpus inference, not another prompt scanner.
-      const source = path.join(root, "setup/factory/task-preflight.py");
-      const admitted = await query("python3", ["-I", source, "--admit", "--root", project, String(requires.length), ...requires, "0", ...(request.needs ?? []).filter(need => need === "github" || need === "corpus")], deadline, environment, request.signal, task);
+      // Keep admission, compatibility and the target guard on the same helper
+      // bytes. No independent prompt scanner or credential lookup lives here.
+      const source = fs.readFileSync(path.join(root, "setup/factory/task-preflight.py"), "utf8");
+      const admitted = await query("python3", ["-I", "-c", source, "--admit", "--root", project, String(requires.length), ...requires, "0", ...(request.needs ?? [])], deadline, environment, request.signal, task);
       const fields = admitted.stdout.split("\0");
       if (fields.at(-1) === "") fields.pop();
       const guards = Number(fields[3]);
       if (admitted.code !== 0 || fields.length < 4 || !/^\d+$/u.test(fields[3]!) || !Number.isSafeInteger(guards) || guards > fields.length - 4 || (fields.length - 4 - guards) % 2) throw new Error(`Installed task admission failed: ${admitted.stderr.trim()}`);
-      if (fields[0] || fields[1]) throw new Error(fields[0] || `needs ${fields[1]}: ${fields[2]}`);
+      if (fields[0]) throw new Error(fields[0]);
+      const needs = [...new Set([...(request.needs ?? []), ...fields[1]!.split(/\s+/u).filter(Boolean)])];
+      if (needs.some(need => need !== "github")) throw new Error(`needs ${needs.join(" ")}: ${fields[2]}`);
+      relayGithub = needs.includes("github");
+      if (relayGithub) {
+        // Old --probe silently accepts unknown --host/--needs as relative
+        // paths. Its exit 0 is NOT evidence that it checked the GitHub relay.
+        // This handshake shares the original <=5s budget with every query.
+        const capabilities = await query("python3", ["-I", "-c", source, "--capabilities"], deadline, environment, request.signal);
+        if (capabilities.code !== 0 || !capabilities.stdout.split(/\r?\n/u).includes("github-relay-v1")) {
+          throw new Error("Installed task helper lacks github-relay-v1 capability; GitHub relay cannot be verified");
+        }
+      }
       for (let index = 4 + guards; index < fields.length; index += 2) pairs.push([fields[index]!, fields[index + 1]!]);
-      guard = ["python3", "-I", "-c", fs.readFileSync(source, "utf8"), "--probe", "--root", project, "--workspace", targetCwd, ...fields.slice(4, 4 + guards)].map(quote).join(" ");
+      guard = ["python3", "-I", "-c", source, "--probe", "--root", project, "--workspace", targetCwd,
+        ...(relayGithub ? ["--host", host, "--needs", needs.join(" ")] : []), ...fields.slice(4, 4 + guards)].map(quote).join(" ");
     } else {
       // Explicit injected/custom protocol: honor declared literal inputs only.
       pairs.push(...requires.map(file => [file, file] as [string, string]));
@@ -245,6 +266,9 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
       throw new Error(`Read-only SSH preflight failed: ${probed.stdout.trim() || probed.stderr.trim() || `exit ${probed.code}`}`);
     }
     const pinned = [...command];
+    // Preserve explicit GitHub work even when the original prompt names no
+    // tool. The fleet launcher rechecks this union on the final target too.
+    if (relayGithub) pinned.splice(end, 0, "--needs", "github");
     const slot = hostSlot(pinned);
     if (slot !== undefined) pinned[slot + 1] = host;
     else pinned.splice(end, 0, "--host", host);

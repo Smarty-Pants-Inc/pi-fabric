@@ -333,7 +333,13 @@ export class ProcessTransport implements AgentTransportAdapter {
     if (placement) {
       const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 5_000);
       const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
-      const unmet = (needs ?? []).filter(need => !capabilities.includes(need));
+      // Only the installed fleet helper can prove GitHub on the selected host
+      // dynamically. This defers admission, not safety: preflight requires its
+      // version handshake and relay read before any launcher can run. Generic
+      // launchers (even with a picker) retain host-owned flat capabilities.
+      const fleetGithub = needs?.includes("github") && placement.default === "remote"
+        && (await import("./placement.js")).usesFleetPlacementHelper(placement, request.cwd);
+      const unmet = (needs ?? []).filter(need => !capabilities.includes(need) && !(fleetGithub && need === "github"));
       let reason = request.needs?.includes("local") ? "reserved need: local pins to the Main host"
         : placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;

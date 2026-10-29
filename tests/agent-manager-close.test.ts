@@ -13,6 +13,7 @@ import { hasUnresolvedWorker, runTreeExitVeto } from "../src/storage/retention.j
 import { processAlive } from "../src/storage/scratch.js";
 import * as agentRemoval from "../src/agents/rm.js";
 import * as retention from "../src/storage/retention.js";
+import { ageRunRoot } from "./helpers/age-run-root.js";
 
 vi.mock("node:child_process", async original => {
   const actual = await original<typeof import("node:child_process")>();
@@ -301,6 +302,7 @@ describe("AgentManager close storage", () => {
     fs.mkdirSync(sentinel);
     const marker = { pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 };
     fs.writeFileSync(path.join(sentinel, ".fabric-owner.json"), JSON.stringify(marker));
+    ageRunRoot(sentinel, Date.now() - 7 * 60 * 60 * 1_000);
     const second = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 });
     managers.push(second);
     await new Promise((resolve) => setImmediate(resolve));
@@ -319,6 +321,7 @@ describe("AgentManager close storage", () => {
     const sentinel = path.join(tempRoot, "pi-fabric-runs-bundled");
     fs.mkdirSync(sentinel);
     fs.writeFileSync(path.join(sentinel, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
+    ageRunRoot(sentinel, Date.now() - 7 * 60 * 60 * 1_000);
     // process.execPath is the Pi executable itself, which cannot run sweep-main.js.
     process.execPath = "/usr/local/bin/pi";
     process.env.PI_FABRIC_NODE_BINARY = originalExecPath;

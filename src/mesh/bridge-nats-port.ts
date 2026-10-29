@@ -22,6 +22,7 @@ import { openNatsConnection } from "../transport/nats/connection.js";
 import { createFileActorDirectory, readFileActorsForMirror } from "./bridge-nats-actors.js";
 import type { MeshIdentity } from "./event-log.js";
 import type { BridgePresence } from "./bridge.js";
+import type { BridgeChange } from "./change-notifier.js";
 import {
   bridgeNatsLinkIdentity,
   type BridgeNatsMirrorSet,
@@ -337,8 +338,8 @@ export class NatsBridgePort implements BridgeNatsPort {
   presence(): Promise<BridgePresence> { return this.kv.presence(); }
 
   /** Another machine's presence or lease change. The KV watches retry on their own; `failed` is never called. */
-  watchPresence(changed: () => void, failed: (error: Error) => void): () => void {
-    return this.kv.subscribeChanges(() => { changed(); }, failed);
+  watchPresence(changed: (kind?: BridgeChange) => void, failed: (error: Error) => void): () => void {
+    return this.kv.subscribeChanges(changed, failed);
   }
 
   /**

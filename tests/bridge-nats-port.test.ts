@@ -249,6 +249,49 @@ describe("NATS bridge port: link identity and presence", () => {
       `${LINK_ID}@${BRIDGE}`, `${FILE_ROOT}@${BRIDGE}`, `${NATS_ROOT}@v2-org`, `${NATS_ROOT}@v3-org`]);
   });
 
+  it("preserves lease renewal kind and classifies authority expiry as presence, ignoring its own machine's rows", async () => {
+    const w = kvWorld();
+    seedNative(w, V2, natsRoot(), 1_000_000);
+    const { port: p, clock } = port(w);
+    await p.start();
+    const changes: Array<string | undefined> = [];
+    const failures: Error[] = [];
+    const unwatch = p.watchPresence((kind?: string) => { changes.push(kind); }, error => { failures.push(error); });
+    try {
+      await p.mirror(mirrorSet(clock.wall), clock.wall);
+      await vi.waitFor(() => expect(p.resolve(FILE_ROOT)?.route.live).toBe(true));
+      expect(changes, "own-machine presence and lease puts do not wake the link").toEqual([]);
+
+      const leaseKey = hKey(V2, NATS_ROOT);
+      for (let renewal = 0; renewal < 3; renewal++) {
+        advance(clock, 300);
+        const current = w.leases.values.get(leaseKey)!;
+        const revision = w.leases.put(leaseKey, current.owner,
+          natsLease(NATS_ROOT, "nats-inc-1", clock.wall), current.revision);
+        await vi.waitFor(() => expect(p.kv.reader.lease(V2, NATS_ROOT)?.entry.revision).toBe(revision));
+        expect(changes, "each actual lease-bucket revision remains a lease hint").toEqual(Array(renewal + 1).fill("lease"));
+      }
+
+      const presenceKey = pKey(V2, NATS_ROOT);
+      const current = w.presence.values.get(presenceKey)!;
+      w.presence.put(presenceKey, current.owner, { ...natsRoot(), status: "running", updatedAt: clock.wall }, current.revision);
+      await vi.waitFor(() => expect(changes).toEqual(["lease", "lease", "lease", "presence"]));
+      expect(p.resolve(NATS_ROOT)?.route.live).toBe(true);
+
+      w.leases.expire(leaseKey);
+      await vi.waitFor(() => expect(changes).toEqual(["lease", "lease", "lease", "presence", "presence"]));
+      expect(p.resolve(NATS_ROOT)?.route.live).toBe(false);
+      expect(w.presence.delete(presenceKey, w.presence.values.get(presenceKey)!.revision)).toBe(true);
+      await vi.waitFor(() => expect(changes).toEqual(["lease", "lease", "lease", "presence", "presence", "presence"]));
+
+      const beforeOwnWithdrawal = [...changes];
+      await p.withdraw();
+      await vi.waitFor(() => expect(p.resolve(FILE_ROOT)).toBeUndefined());
+      expect(changes, "own-machine withdrawals also stay ignored").toEqual(beforeOwnWithdrawal);
+      expect(failures).toEqual([]);
+    } finally { unwatch(); }
+  });
+
   it("returns only admitted roots from other machines, and wakes only on another machine's change", async () => {
     const w = kvWorld();
     const other = "session:33333333-3333-4333-8333-333333333333";

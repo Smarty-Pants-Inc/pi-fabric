@@ -1,7 +1,7 @@
 // L1 (smarty-dev#15310): the NATS side's presence() snapshot through the REAL file-mesh admission and
 // mirror (MeshBridge admitPresence + StoreBridgeSide.mirror), read back with the real participant
 // directory: a live v2 root appears on the hub as a live mirrored root of the link, nothing is dropped,
-// and an expired NATS lease withdraws it on the next complete snapshot.
+// lease uncertainty retains its original deadline, and verified presence deletion withdraws it.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,7 +11,7 @@ import { admitPresence, StoreBridgeSide } from "../src/mesh/bridge.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
-import { hKey, kvWorld, natsLease, seedNative } from "./helpers/bridge-nats-kv.js";
+import { hKey, kvWorld, natsLease, pKey, seedNative } from "./helpers/bridge-nats-kv.js";
 
 const V2 = "v2-org";
 const LINK = "v2";
@@ -30,7 +30,7 @@ const natsRoot = (now: number): FabricParticipantRecord => ({ format: 1, id: NAT
   sessionId: NATS_ROOT.slice(8), cwd: "/work/v2" });
 
 describe("NATS presence through the real file mirror", () => {
-  it("lands a live v2 root on the hub as the link's live mirrored root, and withdraws it when its lease is gone", async () => {
+  it("holds the original mirror deadline when its lease is gone, and withdraws on verified presence deletion", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-nats-presence-file-"));
     temps.push(dir);
     const mesh = new MeshStore(path.join(dir, "mesh"), 65_536, 1_000);
@@ -58,12 +58,25 @@ describe("NATS presence through the real file mirror", () => {
     expect(listed).toMatchObject({ id: NATS_ROOT, remoteHost: LINK, ownerIncarnation: "nats-inc-1", stale: false, name: "v2-main" });
     expect((await hub.owned()).participants.map(participant => participant.id)).toEqual([NATS_ROOT]);
 
-    // The v2 lease expires on the broker: the next complete snapshot omits the root and the hub withdraws it.
+    const original = (await hub.owned()).hosts.find(host => host.record.id === NATS_ROOT)!;
+    // Lease disappearance alone is not membership withdrawal: hold the mirror without renewing it.
     w.leases.expire(hKey(V2, NATS_ROOT));
     await vi.waitFor(() => expect(side.resolve(NATS_ROOT)?.live).toBe(false));
-    const later = await side.presence();
-    expect(later.hosts).toEqual([]);
-    await hub.mirror(admitPresence(later, new Set(later.reserved), LINK), Date.now());
+    const uncertain = await side.presence();
+    expect(uncertain.hosts).toEqual([]);
+    expect(uncertain.partial).toBe(true);
+    await hub.mirror(admitPresence(uncertain, new Set(uncertain.reserved), LINK), Date.now());
+    const held = await hub.owned();
+    expect(held.participants.map(participant => participant.id)).toEqual([NATS_ROOT]);
+    expect(held.hosts.find(host => host.record.id === NATS_ROOT)?.expiresAt).toBe(original.expiresAt);
+
+    // A verified presence deletion still permits complete omission and canonical withdrawal.
+    w.presence.expire(pKey(V2, NATS_ROOT));
+    await vi.waitFor(() => expect(side.resolve(NATS_ROOT)).toBeUndefined());
+    const deleted = await side.presence();
+    expect(deleted.partial).toBeUndefined();
+    expect(deleted.hosts).toEqual([]);
+    await hub.mirror(admitPresence(deleted, new Set(deleted.reserved), LINK), Date.now());
     expect(reader.list({ scope: "project", kinds: ["root"], fresh: true }).some(participant => participant.id === NATS_ROOT)).toBe(false);
   });
 

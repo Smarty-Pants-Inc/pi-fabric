@@ -124,7 +124,8 @@ const denyHeldReplacement = (file: string, held: number, code?: "EPERM" | "EBUSY
   } finally { rename?.mockRestore(); sleep?.mockRestore(); }
   expect(fs.readFileSync(file).equals(original)).toBe(true);
   expect(fs.statSync(file, { bigint: true }).ino).toBe(identity.ino);
-  expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+  expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.original"]);
+  expect(fs.readFileSync(`${file}.original`)).toEqual(original);
 };
 
 const readTranscript = (text: string) => new NativeConversationReader().read({ id: "run", status: "running", logFile: logFile(text) });
@@ -363,7 +364,8 @@ describe("worker run log", () => {
       expect(outcome.afterBytes).toBeLessThan(outcome.beforeBytes);
     } finally { spy.mockRestore(); }
     expect(fs.readFileSync(file, "utf8")).not.toBe(text);
-    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.original"]);
+    expect(fs.readFileSync(`${file}.original`, "utf8")).toBe(text);
   });
 
   it("closes every owned source/temp descriptor after fsync and before replacement", () => {
@@ -418,7 +420,8 @@ describe("worker run log", () => {
     } finally { rename.mockRestore(); sleep.mockRestore(); clock.mockRestore(); unlink.mockRestore(); }
     expect(fs.readFileSync(file).equals(original)).toBe(true);
     expect(fs.statSync(file).ino).toBe(inode);
-    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.original"]);
+    expect(fs.readFileSync(`${file}.original`)).toEqual(original);
   });
 
   it.each(["identity", "size", "mtime"])("rechecks source %s before retrying replacement", (change) => {
@@ -442,7 +445,8 @@ describe("worker run log", () => {
       expect(rename).toHaveBeenCalledTimes(1);
     } finally { rename.mockRestore(); }
     expect(fs.readFileSync(file, "utf8")).toBe(change === "size" ? `${text}external append\n` : text);
-    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.original"]);
+    expect(fs.readFileSync(`${file}.original`, "utf8")).toBe(change === "size" ? `${text}external append\n` : text);
   });
 
   it("keeps the terminal work deadline while backing off persistent replacement contention", () => {
@@ -465,7 +469,8 @@ describe("worker run log", () => {
       expect(elapsed).toBe(MAX_TERMINAL_LOG_WORK_MS);
     } finally { rename.mockRestore(); sleep.mockRestore(); clock.mockRestore(); }
     expect(fs.readFileSync(file, "utf8")).toBe(text);
-    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.original"]);
+    expect(fs.readFileSync(`${file}.original`, "utf8")).toBe(text);
   });
 
   it("uses a write-capable source for Windows-style FlushFileBuffers and real fsync", () => {
@@ -708,7 +713,9 @@ describe("worker run log", () => {
     } finally { spy.mockRestore(); }
     expect(fs.readFileSync(file, "utf8")).toBe(text);
     expect(fs.statSync(file).ino).toBe(inode);
-    expect(fs.readdirSync(directory).sort()).toEqual(["events.jsonl", "foreign.compact.tmp"]);
+    expect(fs.readdirSync(directory).sort()).toEqual(failure === "rename"
+      ? ["events.jsonl", "events.jsonl.original", "foreign.compact.tmp"] : ["events.jsonl", "foreign.compact.tmp"]);
+    if (failure === "rename") expect(fs.readFileSync(`${file}.original`, "utf8")).toBe(text);
   });
 
   it("invalidates growing replacements when Windows file IDs round to the same number", () => {
@@ -800,7 +807,7 @@ describe("worker run log", () => {
       });
 
       it.each([false, true])("retains loaded older native pages after large terminal replacement (follow=%s)", (follow) => {
-        const directory = fs.mkdtempSync(path.resolve(".native-replacement-"));
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), "native-replacement-"));
         directories.push(directory);
         const file = path.join(directory, "events.jsonl");
         const events = Array.from({ length: 160 }, (_, index) => {

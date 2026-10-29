@@ -184,18 +184,20 @@ describe.runIf(process.platform === "linux")("C2 candidate-bundled native proces
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), "b5-c2-process-")), root = path.join(temp, "store"); fs.mkdirSync(root);
     const bundle = path.join(temp, "worker.mjs"), trace = path.join(temp, "trace.jsonl"), fact = path.join(temp, "identity.json");
     fs.writeFileSync(fact, JSON.stringify({ mode: "NEW", sessionId: "seal-session" }), { flag: "wx" });
-    // Default output stays in this test's temp. Only an explicit, caller-owned
-    // destination may retain evidence beyond Vitest's run-root teardown.
-    const destination = process.env.B5_C2_PROCESS_EVIDENCE_DIR;
-    if (destination !== undefined && (!path.isAbsolute(destination) || !fs.lstatSync(destination).isDirectory() || fs.lstatSync(destination).isSymbolicLink())) {
-      throw new Error("B5_C2_PROCESS_EVIDENCE_DIR must be an existing absolute caller-owned directory");
-    }
-    const evidence = destination === undefined ? temp : fs.mkdtempSync(path.join(destination, `${stage}-`));
+    // All artifacts stay in THIS scenario's private temp; legacy
+    // B5_C2_PROCESS_EVIDENCE_DIR is ignored, never validated/read/written.
+    // Only B5_C2_PROCESS_EVIDENCE=stdout exports one-line JSON snapshots.
+    // The caller captures stdout, waits for Vitest to exit, then writes fixed
+    // artifact names from these strings outside the guarded test process.
+    const exportEvidence = process.env.B5_C2_PROCESS_EVIDENCE === "stdout";
+    const processes = path.join(temp, "processes.jsonl");
     const persist = () => {
-      if (evidence === temp) return;
-      // Exact paths allocated by THIS scenario, never a glob/copy of arbitrary traces.
-      if (fs.existsSync(trace)) fs.copyFileSync(trace, path.join(evidence, "trace.jsonl"));
-      fs.copyFileSync(fact, path.join(evidence, "identity.json"));
+      if (!exportEvidence) return;
+      const read = (file: string) => fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null;
+      const records = read(processes);
+      console.info("C2_PROCESS_EVIDENCE " + JSON.stringify({ version: 1, stage,
+        trace: read(trace), identity: read(fact),
+        processes: records === null ? [] : records.trimEnd().split("\n").map(line => JSON.parse(line)) }));
     };
     const lifecycle = c2Lifecycle(close => cleanups.push(async () => {
       try { await close(); } finally { persist(); }
@@ -205,7 +207,7 @@ describe.runIf(process.platform === "linux")("C2 candidate-bundled native proces
       const result = await lifecycle.run(
         () => spawn(process.execPath, [bundle, root, trace, fact, stage, mode], { stdio: ["ignore", "pipe", "pipe"] }),
         terminal => {
-          fs.appendFileSync(path.join(evidence, "processes.jsonl"), JSON.stringify({ stage, mode, boundary: "close", ...terminal }) + "\n");
+          fs.appendFileSync(processes, JSON.stringify({ stage, mode, boundary: "close", ...terminal }) + "\n");
           persist(); // Includes actual exit separately from terminal, drained output, even on cancellation.
         },
       );

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import { diagnostics } from "../core/diagnostics.js";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -7,6 +8,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import { isWatchLimitError } from "../core/watch-fallback.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { processAlive } from "../storage/scratch.js";
+import { retainCleanupRoot, restoreCleanupRoot, type CleanupRootCustody } from "../agents/worktree-manager.js";
 
 export interface LegacyRunArchivePolicy {
   legacyRunArchiveEnabled?: boolean;
@@ -23,6 +25,35 @@ const owned = async (file: string): Promise<fs.Stats> => {
   const stat = await fsp.lstat(file);
   if (stat.isSymbolicLink() || (stat.isFile() && stat.nlink !== 1) || (process.getuid && stat.uid !== process.getuid())) throw new Error("unsafe ownership/link");
   return stat;
+};
+type LegacyRunManifest = { format: 1; entries: Array<{ path: string; type: "directory" } | { path: string; type: "file"; size: number; sha256: string }> };
+const legacyRunManifest = (root: string): LegacyRunManifest => {
+  const entries: LegacyRunManifest["entries"] = [];
+  const walk = (file: string, relative: string): void => {
+    const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink()) throw new Error(`legacy run manifest refuses a link: ${relative || "."}`);
+    if (stat.isDirectory()) {
+      entries.push({ path: relative || ".", type: "directory" });
+      for (const name of fs.readdirSync(file).sort()) walk(path.join(file, name), relative ? `${relative}/${name}` : name);
+      return;
+    }
+    if (!stat.isFile() || stat.nlink !== 1) throw new Error(`legacy run manifest refuses an unsafe entry: ${relative}`);
+    if (!fs.constants.O_NOATIME) throw new Error("legacy run hashing requires no-atime reads");
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | fs.constants.O_NOATIME);
+    try {
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== stat.size) throw new Error(`legacy run changed before hashing: ${relative}`);
+      const hash = createHash("sha256"), buffer = Buffer.alloc(64 * 1024); let size = 0;
+      for (;;) { const count = fs.readSync(fd, buffer, 0, buffer.length, null); if (!count) break; size += count; hash.update(buffer.subarray(0, count)); }
+      const current = fs.lstatSync(file);
+      if (size !== stat.size || current.isSymbolicLink() || current.dev !== stat.dev || current.ino !== stat.ino || current.size !== stat.size || current.mtimeMs !== stat.mtimeMs) {
+        throw new Error(`legacy run changed while hashing: ${relative}`);
+      }
+      entries.push({ path: relative, type: "file", size, sha256: hash.digest("hex") });
+    } finally { fs.closeSync(fd); }
+  };
+  walk(root, "");
+  return { format: 1, entries };
 };
 /** Keep source and destination in an owned, unaliased namespace. Revalidate
  * around asynchronous custody checks; never follow an operator-created alias. */
@@ -477,36 +508,36 @@ export class ResidentLegacyRunArchive {
         if (!stat.isDirectory() || (stat.mode & 0o077) !== 0 || !await unaliasedDirectory(directory)) throw new Error("unsafe retirement root");
       }
       if ((await owned(runs)).dev !== (await owned(day)).dev) throw new Error("retirement must stay on the same filesystem");
-      // A private unique slice prevents overwriting a previously retired ID.
-      const batch = await fsp.mkdtemp(path.join(day, "slice-"));
-      const moved: typeof candidates = [];
+      const moved: Array<{ run: (typeof candidates)[number]; custody: CleanupRootCustody }> = [];
       for (const run of candidates) {
         if (this.options.isRetained(run.id) || this.#closed || !this.#enabled()) continue;
         const source = path.join(runs, run.id);
         if ((await legacyRunTreeProof(source, now, this.policy.legacyRunArchiveAgeMs ?? DEFAULT_AGE_MS))?.fingerprint !== run.proof.fingerprint) continue;
         if (await this.#referenceFence(ids) !== fence || this.options.isRetained(run.id) || this.#closed || !this.#enabled()) break;
-        if (!await unaliasedDirectory(runs) || !await unaliasedDirectory(batch)) throw new Error("run namespace changed");
-        // No copy fallback on EXDEV, no compression and no source unlink.
-        await fsp.rename(source, path.join(batch, run.id));
+        if (!await unaliasedDirectory(runs) || !await unaliasedDirectory(day)) throw new Error("run namespace changed");
+        const sourceStat = await owned(source), manifest = legacyRunManifest(source);
+        const custody = retainCleanupRoot(source, day, run.id, "legacy resident run archival", undefined, {
+          expected: { dev: sourceStat.dev, ino: sourceStat.ino, mtimeMs: sourceStat.mtimeMs },
+          manifest,
+          beforeRename: () => {
+            if (this.options.isRetained(run.id) || this.#closed || !this.#enabled()) throw new Error("legacy run custody changed before rename");
+          },
+          verifyDestination: destination => {
+            if (JSON.stringify(legacyRunManifest(destination)) !== JSON.stringify(manifest)) throw new Error("legacy run custody manifest mismatch");
+          },
+        });
+        if (!custody) continue;
         // A directory watch follows the inode: stop observing retired bytes.
         this.#unwatchRun(run.id);
-        moved.push(run); this.health.archived++; settled.add(run.id);
+        moved.push({ run, custody }); this.health.archived++; settled.add(run.id);
       }
-      // Known live actors/managers can reopen by path, so retain their original
-      // namespace. Opaque descriptors need no census: rename preserves inodes.
-      if (await this.#referenceFence(ids) !== fence || moved.some(run => this.options.isRetained(run.id)) || !this.#enabled()) {
-        for (const run of moved) {
-          if (!await unaliasedDirectory(runs) || !await unaliasedDirectory(batch)) throw new Error("namespace changed; moved bytes retained");
-          const destination = path.join(runs, run.id);
-          try { await fsp.lstat(destination); throw new Error("run ID reused; moved bytes retained"); }
-          catch (error) { if (!gone(error)) throw error; }
-          await fsp.rename(path.join(batch, run.id), destination); this.health.archived--; settled.delete(run.id);
+      // Known live actors/managers can reopen by path, so restore their original
+      // namespace if the final reference fence changed. The receipt records both moves.
+      if (await this.#referenceFence(ids) !== fence || moved.some(({ run }) => this.options.isRetained(run.id)) || !this.#enabled()) {
+        for (const { run, custody } of moved) {
+          if (!await unaliasedDirectory(runs)) throw new Error("run namespace changed; moved bytes retained");
+          restoreCleanupRoot(custody); this.health.archived--; settled.delete(run.id);
         }
-      }
-      // Persist both sides of the rename on platforms supporting directory fsync.
-      for (const directory of [batch, day, retired, runs]) {
-        const handle = await fsp.open(directory, "r");
-        try { await handle.sync(); } finally { await handle.close(); }
       }
     } catch (error) {
       // A partial slice is already a valid retained source, not an ambiguous

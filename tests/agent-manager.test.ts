@@ -1908,10 +1908,16 @@ describe("AgentManager", () => {
     expect(result.text).toBe("startup retry recovered");
     const directory = manager.runDirectory(result.id)!;
     expect(fs.readFileSync(path.join(directory, "startup-attempts"), "utf8")).toBe("2");
-    const previous = fs.readdirSync(directory).filter(name => /^lifecycle\.jsonl\.prior-[0-9a-f-]{36}$/.test(name));
-    expect(previous).toHaveLength(1);
-    expect(fs.readFileSync(path.join(directory, previous[0]!), "utf8")).toContain('"fixtureAttempt":1');
+    const archive = `${directory}.trace-archive`;
+    const receipts = fs.readdirSync(archive).map(name => JSON.parse(fs.readFileSync(path.join(archive, name, "custody.json"), "utf8")));
+    const previousLifecycle = receipts.find(receipt => receipt.source === path.join(directory, "lifecycle.jsonl"));
+    expect(previousLifecycle).toMatchObject({ state: "moved", source: path.join(directory, "lifecycle.jsonl") });
+    expect(fs.readFileSync(previousLifecycle.destination, "utf8")).toContain('"fixtureAttempt":1');
     expect(fs.readFileSync(path.join(directory, "lifecycle.jsonl"), "utf8")).toContain('"fixtureAttempt":2');
+    const previousStatus = receipts.find(receipt => receipt.source === path.join(directory, "status.json"));
+    expect(previousStatus).toMatchObject({ state: "moved", source: path.join(directory, "status.json") });
+    expect(JSON.parse(fs.readFileSync(previousStatus.destination, "utf8")).status).toBe("failed");
+    expect(JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")).status).toBe("completed");
   });
 
   it.skipIf(process.platform === "win32")("3238 pins the first Pi artifact across a startup retry when its launcher symlink moves", async () => {

@@ -1,9 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
-import { syncDirectoryChain } from "../core/atomic-write.js";
+import { retainCleanupRoot } from "../agents/worktree-manager.js";
 
-/** Move a superseded attempt output aside before the next attempt reuses its canonical filename. */
+/** Move a superseded attempt output into receipt-backed custody before its name is reused. */
 export const retainPriorAttemptFile = (file: string): string | undefined => {
   const stat = fs.lstatSync(file, { throwIfNoEntry: false });
   if (!stat) return undefined;
@@ -11,12 +10,7 @@ export const retainPriorAttemptFile = (file: string): string | undefined => {
     throw new Error(`Refusing unsafe prior-attempt artifact: ${file}`);
   }
 
-  const retained = `${file}.prior-${randomUUID()}`;
-  fs.renameSync(file, retained);
-  const moved = fs.lstatSync(retained);
-  if (!moved.isFile() || moved.dev !== stat.dev || moved.ino !== stat.ino) {
-    throw new Error(`Prior-attempt artifact changed during retention: ${file}`);
-  }
-  syncDirectoryChain(path.dirname(file));
-  return retained;
+  const custody = retainCleanupRoot(file, `${path.dirname(file)}.trace-archive`, path.basename(file),
+    "superseded prior-attempt artifact", undefined, { expected: { dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs } });
+  return custody?.destination;
 };

@@ -73,13 +73,19 @@ show that file. A stable, completely visible `/proc` census therefore cannot
 prove absence of writable file custody. Compressing a snapshot and then deleting
 the source can lose later writes through that queued descriptor.
 
-On POSIX, this policy does **not compress, copy, unlink, recursively remove, or
-expire** legacy source trees. It only moves them with same-filesystem `rename(2)` into
-`runs-retired/YYYY-MM-DD/slice-*/RUN_ID/`, inside the residency root. Rename keeps
-the directory and file inodes linked. A hidden descriptor received later still
-writes into the moved file; the retained bytes are not a stale compressed copy.
-There is no `/proc` census, mount/namespace completeness proof, compression child,
-bundle append, manifest or deletion transaction in this worker anymore.
+On POSIX, this policy does **not compress, copy then delete, unlink, recursively
+remove, or expire** legacy source trees. It moves each eligible tree with same-filesystem
+`rename(2)` into a receipt-backed container below
+`runs-retired/YYYY-MM-DD/cleanup-*/tree`. The adjacent `custody.json` records the
+original and destination paths, source identity, and a per-entry size/SHA-256
+manifest. A durable prepared receipt is written before the rename; after the
+rename the destination is independently checked against that manifest before
+the receipt is marked `moved`. If `EXDEV` prevents the rename, any verified
+shadow is explicitly `held-in-place` and the original source remains. Rename
+keeps the directory and file inodes linked. A hidden descriptor received later still writes into the moved file; the
+retained bytes are not a stale compressed copy. There is no `/proc` census,
+mount/namespace completeness proof, compression child, bundle append, or
+deletion transaction in this worker anymore.
 
 The hot `runs/` directory shrinks, reducing startup and sweep work. **Total disk
 usage does not shrink.** Deletion is cut from this PR: a follow-up needs an
@@ -156,23 +162,25 @@ keeps checked/archived/skipped counters and the latest error; the historical
 ## Inspect and restore
 
 Retired runs are ordinary directories. No tar tooling or decompression is needed.
-Stop the owning resident and inspect the selected retained tree, then move it back
-into an **empty** original slot. Never overwrite a live run with the same ID.
-For example, in the stopped resident's root:
+Stop the owning resident, inspect the receipt and its destination tree, then move
+the tree back into an **empty** original slot. Never overwrite a live run with
+the same ID. For example, after selecting the receipt for the desired run in the
+stopped resident's root:
 
 ```sh
-# Inspect the exact dated slice and ID first.
-ls runs-retired/2026-10-04/slice-EXAMPLE/RUN_ID/
+# Read source and destination from the selected custody.json first.
+cat runs-retired/YYYY-MM-DD/cleanup-EXAMPLE/custody.json
 # Verify runs/RUN_ID does not exist; restore on the SAME filesystem.
-test ! -e runs/RUN_ID && mv -T runs-retired/2026-10-04/slice-EXAMPLE/RUN_ID runs/RUN_ID
+test ! -e runs/RUN_ID && mv -T runs-retired/YYYY-MM-DD/cleanup-EXAMPLE/tree runs/RUN_ID
 ```
 
 The `mv -T` example uses GNU coreutils; on other platforms use an equivalent
 non-overwriting directory rename while the owner is stopped. Unique private
-slice directories keep repeated run IDs from overwriting previously retired
+custody containers keep repeated run IDs from overwriting previously retired
 bytes. A partial failure or restart needs no compressed-tail recovery: each
-completed rename already leaves a complete ordinary source directory. The next
-collector scans only remaining hot runs and never deletes older slices.
+completed rename already leaves a complete ordinary source directory and its
+receipt. The next collector scans only remaining hot runs and never deletes
+older custody trees.
 
 Any pre-existing `archive/` bundles or `.staging-*` bytes from the older branch
 implementation are untouched. Inspect/recover those manually; this worker

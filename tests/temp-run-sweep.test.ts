@@ -92,7 +92,9 @@ describe("configured detached temp sweep", () => {
       expect(launches).toHaveLength(count + 1);
       const launch = launches.at(-1)!;
       expect(launch).toMatchObject({ status: 0, env: { TMPDIR: privateA } });
-      expect(launch.stderr).not.toMatch(/refused|failed/);
+      const stderrLines = launch.stderr.trim().split(/\r?\n/).filter(Boolean);
+      expect(stderrLines.every(line => /^\[pi-fabric\] cleanup retained whole root: .+ -> .+; receipt: .+\/custody\.json$/.test(line))).toBe(true);
+      expect(launch.stderr).toBe(stderrLines.length ? `${stderrLines.join("\n")}\n` : "");
       expect(launch.env?.PI_FABRIC_TMPDIR).toBe(override);
       const request = JSON.parse(launch.args[1]!) as TempRunSweepRequest;
       expect(request).toMatchObject({ tempRoot: override ?? privateA, orphanedTempRunRetentionMs: grace });

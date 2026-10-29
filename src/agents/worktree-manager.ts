@@ -13,8 +13,12 @@ export interface CleanupRootCustody { source: string; destination: string; recei
 export interface CleanupRootMoveGuard {
   /** Identity that the caller judged, when the move follows a reference/inode check. */
   expected?: { dev: number; ino: number; mtimeMs?: number };
+  /** Durable content manifest included in both custody receipts. */
+  manifest?: unknown;
   /** Re-run caller-owned exit/reference/content checks immediately before the rename. */
   beforeRename?: () => void;
+  /** Verify the moved destination against the prepared manifest before publishing `moved`. */
+  verifyDestination?: (destination: string) => void;
 }
 
 /** A verified shadow is NOT whole-object custody or permission to consume results. */
@@ -385,6 +389,8 @@ export const retainCleanupRoot = (
   }
   const archiveRefusals: ArchiveRefusal[] = [];
   const evidence = { format: 1, id, reason: rootLink ? "root-is-symlink" : reason, source,
+    sourceIdentity: { dev: sourceStat.dev, ino: sourceStat.ino, size: sourceStat.size, mode: sourceStat.mode },
+    ...(guard.manifest === undefined ? {} : { manifest: guard.manifest }),
     ...(rootLink ? { requestedReason: reason, entryPath: source, readlink: { encoding: "base64", bytes: rootLink.toString("base64") } } : {}) };
   try { archive = selectCleanupArchive(archive, source, archiveRefusals); }
   catch (error) {
@@ -461,6 +467,10 @@ export const retainCleanupRoot = (
   let originalHeld = false;
   try {
     originalHeld = sameRoot(move.destination);
+    if (!originalHeld) throw new Error(`Cleanup root changed during rename: ${source}; original custody unproven`);
+    guard.verifyDestination?.(move.destination);
+    originalHeld = sameRoot(move.destination);
+    if (!originalHeld) throw new Error(`Cleanup root changed during destination verification: ${source}; original custody unproven`);
     // Make the held entry durable BEFORE the separate source unlink barrier
     // or a fallible moved-receipt publication. A failure never rolls back.
     syncDirectoryChain(path.dirname(move.destination));
@@ -482,6 +492,32 @@ export const retainCleanupRoot = (
   }
   console.warn(`[pi-fabric] cleanup retained whole root: ${source} -> ${move.destination}; receipt: ${move.receipt}`);
   return move;
+};
+
+/** Return a moved tree through the same receipt protocol when a final reference fence changes. */
+export const restoreCleanupRoot = (move: CleanupRootCustody): void => {
+  const receipt = JSON.parse(fs.readFileSync(move.receipt, "utf8")) as Record<string, unknown>;
+  const identity = receipt.sourceIdentity as { dev?: unknown; ino?: unknown } | undefined;
+  if (receipt.state !== "moved" || receipt.source !== move.source || receipt.destination !== move.destination ||
+      !identity || typeof identity.dev !== "number" || typeof identity.ino !== "number") {
+    throw new Error(`Cannot restore unverified cleanup custody: ${move.source}`);
+  }
+  if (fs.lstatSync(move.source, { throwIfNoEntry: false })) throw new Error(`Cannot restore cleanup custody over a reused source: ${move.source}`);
+  archiveDevice(path.dirname(move.destination));
+  const held = fs.lstatSync(move.destination, { throwIfNoEntry: false });
+  if (!held || held.isSymbolicLink() || held.dev !== identity.dev || held.ino !== identity.ino) {
+    throw new Error(`Cannot restore changed cleanup custody: ${move.destination}`);
+  }
+  const restorePrepared = { ...receipt, time: Date.now(), state: "restore-prepared", restoreDestination: move.source };
+  writeJsonAtomic(move.receipt, restorePrepared, receiptOptions);
+  fs.renameSync(move.destination, move.source);
+  syncDirectoryChain(path.dirname(move.destination));
+  syncDirectoryChain(path.dirname(move.source));
+  const restored = fs.lstatSync(move.source, { throwIfNoEntry: false });
+  if (!restored || restored.isSymbolicLink() || restored.dev !== identity.dev || restored.ino !== identity.ino) {
+    throw new Error(`Cleanup custody restore verification failed: ${move.source}`);
+  }
+  writeJsonAtomic(move.receipt, { ...restorePrepared, time: Date.now(), state: "restored" }, receiptOptions);
 };
 
 export interface WorktreeLease {

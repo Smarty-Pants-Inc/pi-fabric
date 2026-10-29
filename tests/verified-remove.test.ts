@@ -43,6 +43,14 @@ const shape = (file: string): unknown => {
   if (stat.isDirectory()) return Object.fromEntries(fs.readdirSync(file).sort().map(name => [name, shape(path.join(file, name))]));
   return fs.readFileSync(file, "utf8");
 };
+const rawTreePaths = (root: string): Set<string> => {
+  const paths = new Set([root]);
+  const stat = fs.lstatSync(root, { throwIfNoEntry: false });
+  if (stat?.isDirectory() && !stat.isSymbolicLink()) for (const name of fs.readdirSync(root)) {
+    for (const child of rawTreePaths(path.join(root, name))) paths.add(child);
+  }
+  return paths;
+};
 
 type Swap = "symlink" | "replaced inode" | "foreign owner" | "refreshed mtime";
 const SWAPS: Swap[] = ["symlink", "replaced inode", "foreign owner", "refreshed mtime"];
@@ -171,7 +179,17 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
   it.each(Object.keys(FIXTURES))("%s removes its expired target when nothing changes (control)", async name => {
     const fixture = FIXTURES[name]!();
     const before = fixture.runRoot ? shape(fixture.runRoot) : undefined;
+    const rawPaths = fixture.runRoot ? rawTreePaths(fixture.runRoot) : new Set<string>();
+    const deletions: string[] = [];
+    if (fixture.runRoot) {
+      const rmSync = fs.rmSync, unlinkSync = fs.unlinkSync, rm = fs.promises.rm, unlink = fs.promises.unlink;
+      vi.spyOn(fs, "rmSync").mockImplementation((file, options) => { deletions.push(String(file)); return rmSync(file, options); });
+      vi.spyOn(fs, "unlinkSync").mockImplementation(file => { deletions.push(String(file)); return unlinkSync(file); });
+      vi.spyOn(fs.promises, "rm").mockImplementation((file, options) => { deletions.push(String(file)); return rm(file, options); });
+      vi.spyOn(fs.promises, "unlink").mockImplementation(file => { deletions.push(String(file)); return unlink(file); });
+    }
     await fixture.act();
+    if (fixture.runRoot) expect(deletions.filter(file => rawPaths.has(file)), `${name}: positive raw-run path must not unlink or rm`).toEqual([]);
     if (fixture.preserveTree) expect(shape(fixture.runRoot!)).toEqual(before);
     else if (fixture.runRoot && fixture.custodyArchive) {
       expect(fs.existsSync(fixture.target)).toBe(false);

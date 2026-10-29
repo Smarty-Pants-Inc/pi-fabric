@@ -26,6 +26,14 @@ const shape = (file: string): unknown => {
   if (stat.isDirectory()) return Object.fromEntries(fs.readdirSync(file).sort().map(name => [name, shape(path.join(file, name))]));
   return fs.readFileSync(file).toString("hex");
 };
+const rawTreePaths = (root: string): Set<string> => {
+  const paths = new Set([root]);
+  const stat = fs.lstatSync(root, { throwIfNoEntry: false });
+  if (stat?.isDirectory() && !stat.isSymbolicLink()) for (const name of fs.readdirSync(root)) {
+    for (const child of rawTreePaths(path.join(root, name))) paths.add(child);
+  }
+  return paths;
+};
 type Kind = "closed" | "orphan";
 const fixture = (kind: Kind) => {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-runroot-swaps-")); roots.push(tempRoot);
@@ -38,9 +46,11 @@ const fixture = (kind: Kind) => {
   ageRunRoot(root, 1);
   const sweep = () => sweepTempRunRoots({ tempRoot, now: NOW, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
   const deletes: string[] = [];
-  const unlink = fs.unlinkSync, rm = fs.rmSync;
+  const unlink = fs.unlinkSync, rm = fs.rmSync, unlinkAsync = fs.promises.unlink, rmAsync = fs.promises.rm;
   vi.spyOn(fs, "unlinkSync").mockImplementation(file => { deletes.push(String(file)); return unlink(file); });
   vi.spyOn(fs, "rmSync").mockImplementation((file, options) => { deletes.push(String(file)); return rm(file, options); });
+  vi.spyOn(fs.promises, "unlink").mockImplementation(file => { deletes.push(String(file)); return unlinkAsync(file); });
+  vi.spyOn(fs.promises, "rm").mockImplementation((file, options) => { deletes.push(String(file)); return rmAsync(file, options); });
   return { tempRoot, root, run, sweep, deletes, judged: shape(run) };
 };
 const SWAPS = ["replaced inode", "symlink", "foreign owner", "refreshed mtime"] as const;
@@ -48,7 +58,7 @@ const SWAPS = ["replaced inode", "symlink", "foreign owner", "refreshed mtime"] 
 describe.skipIf(process.platform !== "linux")("run-root custody keeps the judged tree", () => {
   describe.each(["closed", "orphan"] as Kind[])("%s root", kind => {
     it("positive control: archives the exact eligible bytes without unlinking raw traces", () => {
-      const f = fixture(kind);
+      const f = fixture(kind), rawPaths = rawTreePaths(f.root);
       const result = f.sweep();
       expect(result.removedRuns).toEqual(kind === "closed" ? [f.run] : []);
       expect(result.removedRoots).toEqual([f.root]);
@@ -57,7 +67,7 @@ describe.skipIf(process.platform !== "linux")("run-root custody keeps the judged
       const receipt = receipts.find(row => row.source === f.run && row.state === "moved");
       expect(receipt).toBeDefined(); expect(shape(receipt.destination)).toEqual(f.judged);
       expect(fs.readFileSync(path.join(receipt.destination, "events.jsonl"))).toEqual(payload);
-      expect(f.deletes.some(file => file.endsWith("events.jsonl"))).toBe(false);
+      expect(f.deletes.filter(file => rawPaths.has(file)), "positive raw-run custody must not call rm or unlink").toEqual([]);
     });
     it.each(SWAPS)("a %s swap during the safety check archives/deletes no tree entry", swap => {
       const f = fixture(kind), aside = path.join(f.tempRoot, "judged-aside"), outside = path.join(f.tempRoot, "outside");

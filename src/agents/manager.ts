@@ -6783,15 +6783,15 @@ export class AgentManager {
         { encoding: "utf8", mode: 0o600 },
       );
       // The relaunched child owns a fresh status/lifecycle pair, so drain what
-      // the previous attempt published (token usage above all) before discarding
-      // the journal it landed in.
+      // the previous attempt published (token usage above all) before moving its
+      // raw attempt files into receipt-backed custody.
       this.#drainLifecycle(managed);
       // Once this attempt is superseded, a supervisor crash must not promote its old failure
       // while the already-launched retry is still running. The previous worker has exited.
       if (this.#meshRoot) discardWorkerCompletion(this.#meshRoot, managed.id);
 
       if (managed.runner === "pi") {
-        // status.json must be removed to fence the new attempt from the old
+        // Move status.json into custody to fence the new attempt from the old
         // terminal verdict. Hand off its native-session joins separately, after
         // confirmed exit so the previous worker's final observations are included.
         const ids = [record, managed.latestRecord, readRecord(managed.statusFile)]
@@ -6803,7 +6803,7 @@ export class AgentManager {
         }
       }
 
-      fs.rmSync(managed.statusFile, { force: true });
+      retainPriorAttemptFile(managed.statusFile);
       // Reset the superseded journal before launching its replacement. A launch
       // already accepted before PREPARE may finish without deleting new output.
       managed.lifecycleOffset = 0;
@@ -6839,7 +6839,7 @@ export class AgentManager {
       delete managed.workerGoneBeforeStop;
       const owned = transport.kind === "process" ? ownedProcess(transport.sessionId) : undefined;
       if (owned) managed.ownProcess = owned;
-      // A stop can land AFTER status removal while launch is pending. Publish only
+      // A stop can land AFTER prior-status custody while launch is pending. Publish only
       // this resolved replacement's identity; the superseded pid proves nothing.
       const stopIntent = readRunStopIntent(managed.runDirectory);
       if (stopIntent) this.#persistStopIntent(managed, stopIntent.reason, true,

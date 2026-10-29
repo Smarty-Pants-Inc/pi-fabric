@@ -261,6 +261,22 @@ const result = await build({
   logLevel: "info",
 });
 
+// Keep the opt-in evidence store in its own bundle. Splitting it with the extension
+// extracts its shared lock/contracts into the idle startup graph unnecessarily.
+await build({
+  entryPoints: ["src/recovery.ts"],
+  outdir: "dist",
+  outbase: "src",
+  bundle: true,
+  packages: "external",
+  platform: "node",
+  format: "esm",
+  target: "node24",
+  define: hostPolicyConstants,
+  sourcemap: true,
+  logLevel: "info",
+});
+
 // Advertise the exact manager/worker contract without importing candidate code at spawn.
 const { WORKER_PROTOCOL_VERSION } = await import("../dist/agents/worker-protocol.js");
 writeFileSync("dist/worker-protocol.json", `${JSON.stringify({ version: WORKER_PROTOCOL_VERSION })}\n`);

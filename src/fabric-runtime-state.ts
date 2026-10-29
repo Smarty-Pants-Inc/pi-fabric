@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { diagnostics, notifyDiagnostic } from "./core/diagnostics.js";
 import { RootInbox, type RootInboxBatch, type RootInboxSession, type RootInboxReconcileOptions } from "./topology/root-inbox.js";
+import type { SessionRecoveryActivation, TransportHostLeasePredecessorSnapshot } from "./recovery/l7-interfaces.js";
 import { RootInboxWatch } from "./topology/root-inbox-wake.js";
 import { MainInboxMaintenance, registerMainInbox, recordMainSuccessor, mainInboxOwns, mainInboxActive, rootPresenceAlarms, stageMainSuccessor, confirmMainSuccessor, providerDeadAlarms, providerDeadAlarmFields, admissionAlarmEnvelope, admissionAlarmRecipient } from "./topology/stall-alarms.js";
 import type { RecordsService } from "./records/service.js";
@@ -221,6 +222,7 @@ export interface FabricRuntimeStateOptions {
   entryIdentity?: FabricLoadedFileIdentity;
   /** Foreground tools declared beside fabric_exec; fences cache holds. */
   foregroundTools?: () => readonly string[];
+  sessionRecovery?: SessionRecoveryActivation;
 }
 
 // ponytail: 10 min covers a reload wave's gap; a longer downtime is future-only by design.
@@ -238,6 +240,7 @@ const notifyDetached = (context: ExtensionContext, message: string): void => {
 
 export class FabricRuntimeState {
   readonly #roleGrant: ParticipantRoleGrant;
+  #sessionRecovery: SessionRecoveryActivation | undefined;
   #registry: ActionRegistry | undefined;
   #config: FabricConfig | undefined;
   #execution: FabricExecutionService | undefined;
@@ -337,6 +340,23 @@ export class FabricRuntimeState {
     this.#managedHost = options.managedHost;
     this.#entryIdentity = options.entryIdentity;
     this.#foregroundTools = options.foregroundTools;
+    this.#sessionRecovery = options.sessionRecovery;
+  }
+
+  setSessionRecovery(activation: SessionRecoveryActivation | undefined): void {
+    this.#sessionRecovery = activation;
+  }
+
+  assertSessionRecoveryActive(): void {
+    if (!this.#sessionRecovery || !this.#bindingFresh() || !this.#participants?.canConsumeMesh()) {
+      throw new Error("Portable session recovery lost its live owner lease or session binding");
+    }
+  }
+
+  /** Called by the [D] base binding at the native current-epoch release edge. */
+  reconsiderSessionRecoveryDrain(): void {
+    this.assertSessionRecoveryActive();
+    this.#mainAgent?.reconsiderRecoveryDrain();
   }
 
   get initialized(): boolean {
@@ -1022,12 +1042,28 @@ export class FabricRuntimeState {
     );
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     const mesh = this.#mesh;
+    // Capture once: a later session replacement must not change this activation's proof.
+    const sessionRecovery = this.#sessionRecovery;
+    if (sessionRecovery) {
+      // BEFORE attachFollowUpDrain can replay/open retained Main work.
+      mainAgent.setRecoveryDrainPredicate(() => this.#sessionRecovery === sessionRecovery &&
+        this.#bindingFresh() && this.#participants?.canConsumeMesh() === true &&
+        live.read(ctx => ctx.sessionRecovery?.isReady()) === true);
+    }
+    if (sessionRecovery) {
+      const binding = sessionRecovery.binding;
+      if (identity.kind !== "main" || binding.evidence.sessionId !== sessionId ||
+        context.sessionManager.getSessionFile?.() !== binding.sessionFile ||
+        !path.isAbsolute(binding.stateDirectory) || !meshConfig.enabled || meshConfig.transport !== "nats") {
+        throw new Error("Portable session recovery requires the exact retained session and NATS owner identity");
+      }
+    }
     let transportStateDir: string | undefined;
     if (meshConfig.enabled && meshConfig.transport === "nats") {
       // Direct bootstrap callers need the same E9/E16 refusals as config loading.
       if (meshConfig.hostTransport !== "nats") throw new FabricMeshTransportConfigError("nats", meshConfig.hostTransport ?? "file");
       validateFabricNatsOperatorMachine(meshConfig.nats.operatorMachine, meshConfig.nats.machine);
-      transportStateDir = path.resolve(path.join(resolveAgentDir(), "fabric"));
+      transportStateDir = sessionRecovery?.binding.stateDirectory ?? path.resolve(path.join(resolveAgentDir(), "fabric"));
       const relative = path.relative(path.resolve(mesh.root), transportStateDir);
       if (relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))) {
         throw new Error("Fabric transport local state directory must be outside the shared mesh root");
@@ -1048,6 +1084,9 @@ export class FabricRuntimeState {
       }
       // The actual factory/environment-resolved identity is authoritative, not config.
       validateFabricNatsOperatorMachine(meshConfig.nats.operatorMachine, this.#transport.self.machine);
+      if (sessionRecovery && this.#transport.self.machine !== sessionRecovery.binding.transportMachine) {
+        throw new Error("Portable session recovery changed the retained transport machine identity");
+      }
     }
     const transport = this.#transport;
     // The managed composition returned above without native managers or a mesh root.
@@ -1071,6 +1110,9 @@ export class FabricRuntimeState {
     this.#participants = new ParticipantDirectory(this.#mesh, {
       ...(transport ? { transport } : {}),
       ...(transportStateDir ? { transportStateDir } : {}),
+      ...(sessionRecovery ? { transportStartupSuccessor: {
+        verifyPredecessor: (previous: TransportHostLeasePredecessorSnapshot, signal: AbortSignal) => sessionRecovery.identity.verifyPredecessor(sessionRecovery.binding, previous, signal),
+      } } : {}),
       beforePublication: async () => {
         // NATS commits its lease/view first; native activation follows start().
         if (transport) return;

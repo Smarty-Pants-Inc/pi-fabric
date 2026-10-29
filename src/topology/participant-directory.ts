@@ -57,11 +57,12 @@ import {
   type FabricHostLease,
   STATE_LEASE_RENEW_MS,
   TRANSPORT_HOST_LEASE_SAFETY_MS,
+  TRANSPORT_HOST_LEASE_TTL_MS,
   renewHostLease,
   meshWriterLeaseRecord,
 } from "./host-leases.js";
 import { HostLeaseLockBusyError, withHostLeaseLock } from "./host-lease-lock.js";
-import type { TransportHostLease } from "./host-leases.js";
+import type { TransportHostLease, TransportHostLeaseStartupSuccessor } from "./host-leases.js";
 import type { KvParticipantDirectory, ParticipantLeaseGate, ParticipantView } from "./participant-view.js";
 import type { NatsLocalProjection, NatsLocalProjectionMetrics } from "./nats-local-projection.js";
 import { peerLabelPrefix } from "./peer-settle.js";
@@ -671,8 +672,10 @@ export interface ParticipantDirectoryOptions {
   enabled: boolean;
   /** Select KV presence/lease lifecycle instead of FILE publication; never import FILE routes. */
   transport?: FabricTransport;
-  /** Existing machine-local runtime state, never the shared mesh root, for the NATS lease receipt. */
+  /** Retained runtime state, never the shared mesh root, for the NATS lease receipt. */
   transportStateDir?: string;
+  /** Optional B2 portable proof; default startup keeps the native local-process proof. */
+  transportStartupSuccessor?: TransportHostLeaseStartupSuccessor;
   /** Existing actor file renewal only; validate the last known lineage against
    * an atomic registry snapshot at the per-key write decision. Never admits keys. */
   actorRenewalAllowed?: (record: FabricParticipantRecord) => boolean;
@@ -1488,6 +1491,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         kv: transport.kv("leases"), self: transport.self, rootId: this.options.rootId,
         identityId: this.options.identity.id, incarnation: this.ownerIncarnation,
         localStateDir: this.options.transportStateDir,
+        ...(this.options.transportStartupSuccessor ? { startupSuccessor: this.options.transportStartupSuccessor } : {}),
         onLost: error => this.#transportLostNow(error),
         onSuspended: error => this.#transportLostNow(error),
       });
@@ -1521,7 +1525,9 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (!lease || !view) throw new Error("NATS participant carrier is incomplete");
     if (this.#closed) throw new TransportUnavailableError("Closed NATS directories require a new activation");
     try {
-      const acquired = await lease.acquire(AbortSignal.timeout(5_000));
+      const startupBudget = this.options.transportStartupSuccessor
+        ? TRANSPORT_HOST_LEASE_TTL_MS + TRANSPORT_HOST_LEASE_SAFETY_MS : 5_000;
+      const acquired = await lease.acquire(AbortSignal.timeout(startupBudget));
       this.#transportLeaseWallDeadline = acquired.expiresAt - TRANSPORT_HOST_LEASE_SAFETY_MS;
       if (this.#closed) throw new TransportUnavailableError("Participant directory closed during acquisition");
       view.start();

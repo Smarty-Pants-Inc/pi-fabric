@@ -2,6 +2,8 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { registerMainProviderRecovery } from "./main-provider-recovery.js";
 import { configureFabricDiagnostics, diagnostics, isPrincipalDiagnostics, logDiagnostic, notifyDiagnostic, setPrewalkStatus } from "./core/diagnostics.js";
 import { extensionContextLive } from "./session-liveness.js";
+import { installNativeMaintenanceBinding, type NativeMaintenanceInstallOptions } from "./recovery/native-maintenance-binding.js";
+import { sessionRecoveryAdapters } from "./recovery/l7-interfaces.js";
 import { registerIncomingMessageRenderers } from "./ui/incoming-messages.js";
 import { principalViewIncomingMode, registerPrincipalView } from "./ui/principal-view.js";
 import {
@@ -258,12 +260,13 @@ const hostQueuesTriggeredBehindPreflight = (pi: ExtensionAPI): boolean => {
   return capabilities?.triggeredMessageQueuesBehindPreflight === true && capabilities.promptPendingVisible === true;
 };
 
-return async function piFabric(pi: ExtensionAPI, options: { managedHost?: FabricManagedHostOptions } = {}): Promise<void> {
+return async function piFabric(pi: ExtensionAPI, options: { managedHost?: FabricManagedHostOptions; nativeRecovery?: NativeMaintenanceInstallOptions } = {}): Promise<void> {
   // A fixture must never construct Fabric state, capture auth or join an inherited mailbox.
   if (registerFabricFixture(pi)) return;
   // A different Fabric requested explicitly with -e (a worker's parent Fabric) wins over
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
+  if (options.nativeRecovery) installNativeMaintenanceBinding(pi, options.nativeRecovery);
   registerFabricPrincipalCapture(pi);
   // smarty-dev#6207: the Main names its sender; a Fabric worker child loads the same hook with -e.
   // First-use import of the standalone hook file (a stable package-local path, as the worker's -e),
@@ -948,6 +951,11 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     endEntropyLifecycle();
   };
 
+  pi.on("session_ready", async (_event, context) => {
+    const native = context.sessionRecovery;
+    if (native?.required) await options.nativeRecovery!.host.reconsiderMain(native);
+  });
+
   pi.on("session_start", async (event, context) => {
     const sessionId = context.sessionManager?.getSessionId?.() ?? "";
     configureFabricDiagnostics(sessionId);
@@ -981,7 +989,18 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     }
     state.thinking.invalidate();
     programRunContext = context;
+    const nativeRecovery = context.sessionRecovery;
+    if (nativeRecovery?.required) {
+      if (!options.nativeRecovery) throw new Error("RECOVERY_NATIVE_BINDING_REQUIRED");
+      const adapters = sessionRecoveryAdapters(pi);
+      if (!adapters) throw new Error("RECOVERY_MAINTENANCE_UNBOUND");
+      const binding = await adapters.identity.validate(context);
+      if (binding.evidence.sessionId !== nativeRecovery.sessionId || binding.sessionFile !== nativeRecovery.sessionFile)
+        throw new Error("RECOVERY_EPOCH_REVOKED");
+      state.setSessionRecovery({ binding, identity: adapters.identity });
+    } else state.setSessionRecovery(undefined);
     await state.bootstrap(context);
+    if (nativeRecovery?.required) { await state.ensure(context); state.assertSessionRecoveryActive(); }
     state.resetRecordsInboxCursor(context.sessionManager);
     // Re-derive the inbox receipt cursor once at session_start; file-backed sessions cache their
     // confirmed prefix and in-memory sessions use SessionManager's point-lookup active-branch walk.

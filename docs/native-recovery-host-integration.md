@@ -29,5 +29,17 @@ terminal and descriptor provenance can default REQUIRED startup be called integr
 Do not remove REQUIRED checks, route through the legacy startup coordinator, invent
 no-op validators, or use the test fixture as production code to make startup green.
 
+## Candidate typecheck boundary
+
+The continuation emitted declarations from Pi `597b9743105a58e5c02b2beb059b36c2b5e55207`
+and checked this Fabric candidate and a read-only archive of baseline
+`44ab5b8adcf458ed16c0bd4da37de53e16922375` against that same declaration set and
+installed dependency graph. Both checks exit 2 with 32 TypeScript diagnostics.
+The diagnostic multiset, normalizing only source-root paths and line/column
+positions, has zero additions and zero removals. There is therefore no B3-added
+diagnostic to fix under the narrow continuation grant. The baseline's actor,
+worker/dependency and other API diagnostics remain untouched. This is
+baseline-equivalent failure, not a green product typecheck.
+
 This document records the bounded continuation's unresolved item 1. It does not
 establish the whole-host, every-session, 120-second, zero-loss/duplicate qualification.

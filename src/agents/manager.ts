@@ -5023,7 +5023,7 @@ export class AgentManager {
     syncDirectoryChain(directory);
     // A restarted owner has no live handle, but the saved native exit and all
     // other archive fences still govern collection of this exact source.
-    if (!this.#runs.has(runId) && !this.config.retainRuns && !runTreeExitVeto(directory, 0, undefined, true)) await this.#removeRunTree(directory, runId);
+    if (!this.#runs.has(runId) && this.config.retainRuns === false && !runTreeExitVeto(directory, 0, undefined, true)) await this.#removeRunTree(directory, runId);
   }
 
   /** Remove a run tree, then (only once it is gone) its recorded short TMPDIR outside it (smarty-dev#15878). */
@@ -5454,7 +5454,7 @@ export class AgentManager {
       if (exitVeto) throw new Error(`Cannot clean up agent ${id}: ${exitVeto}`);
       this.#onResultConsumed?.(id);
       const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
-      if (!this.config.retainRuns) await this.#removeRunTree(runDirectory, id);
+      if (this.config.retainRuns === false) await this.#removeRunTree(runDirectory, id);
       this.#queued.delete(id);
       this.#forgetRunMetadata(id);
       this.#invalidateUiList();
@@ -5491,7 +5491,7 @@ export class AgentManager {
     }
     this.markForeground(id);
     const cleaned = await this.#worktrees.cleanup(id, deleteBranch);
-    if (!this.config.retainRuns) {
+    if (this.config.retainRuns === false) {
       await this.#removeRunTree(managed.runDirectory, id, managed.temporaryDirectory);
     }
     this.#runs.delete(id);
@@ -6008,7 +6008,7 @@ export class AgentManager {
     // independently joined tracked run with its full outcome durably archived.
     // Nested run artifacts belong to the enclosing run (upstream lineage): its
     // owner removes them on cleanup/retention/root shutdown, not this child.
-    if (!this.config.retainRuns && !this.#parentOwnedRunRoot) {
+    if (this.config.retainRuns === false && !this.#parentOwnedRunRoot) {
       await Promise.all(all.filter(managed => this.#canCollect(managed))
         .map(async (managed) => {
           // Only sweep-owned managed roots retain unsuccessful terminal prompts.
@@ -6027,7 +6027,7 @@ export class AgentManager {
     if (detached.length === 0 && !alive.some(Boolean) && !unresolved) {
       this.#unregisteredTransports.clear();
       const storageSafe = !this.#managedTempRoot || canRemoveManagedRunRoot(this.#runRoot);
-      if (!this.config.retainRuns) {
+      if (this.config.retainRuns === false) {
         if (storageSafe && !this.#parentOwnedRunRoot) {
           // The closed marker hands retained terminal records to the normal one-shot
           // sweep. Without it, a live manager owner makes the root invisible to

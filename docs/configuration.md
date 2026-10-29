@@ -331,7 +331,7 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
     "timeoutMs": 86400000,
     "extensions": true,
     "defaultTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
-    "retainRuns": false,
+    "retainRuns": true,
     "notifyOnComplete": true,
     "budgetUsd": 0,
     "maxTokensPerChild": 0,
@@ -772,10 +772,10 @@ Authentication uses `/login jev`/`TYPESAFE_API_KEY` on the TypeSafe route, the e
 
 ## Temporal retention
 
-Fabric clears inactive run artifacts by age. Retention never shortens a retained run's `events.jsonl`, including finished runs. The defaults are:
+Agent managers retain run directories on cleanup and graceful shutdown by default (`agents.retainRuns: true`); these deletion paths require an explicit `agents.retainRuns: false`. Age-based housekeeping has the separate eligibility checks described below. Retention never shortens a retained run's `events.jsonl`, including finished runs. The age defaults are:
 
 - `retention.orphanedTempRunMs`: reclaim a managed temporary run root six hours after a sweep **first notices** its owner is dead, provided its contents and descendant liveness can be verified. Live owners/descendants are preserved. Closed, shutdown-confirmed incomplete runs use the same grace from close.
-- `retention.oneShotRunMs`: retain terminal one-shot agent run artifacts for 24 hours. An explicit `agents.cleanup()` may remove them sooner. Graceful shutdown with `agents.retainRuns: true` marks managed roots closed; empty roots are removed immediately. `retainRuns: false` requests deletion after child transports stop, including for managed temporary roots. Inherited nested roots belong to the enclosing agent run: a child manager stops its session children but leaves their terminal status and transcripts for that run's cleanup/retention or the root-session shutdown.
+- `retention.oneShotRunMs`: retain terminal one-shot agent run artifacts for 24 hours. An explicit `agents.cleanup()` may remove them sooner only with `agents.retainRuns: false`. Graceful shutdown with the default `agents.retainRuns: true` marks managed roots closed; empty roots are removed immediately. `retainRuns: false` requests deletion after child transports stop, including for managed temporary roots. Inherited nested roots belong to the enclosing agent run: a child manager stops its session children but leaves their terminal status and transcripts for that run's cleanup/retention or the root-session shutdown.
 - `retention.actorRunArchiveMs`: retain terminal actor run archives for seven days. Fabric always preserves the latest run for each actor.
 - `retention.terminalRunEventsAgeMs`: inactive, retained only for configuration compatibility (legacy default: 6 hours). No age enables event-log compaction.
 - `retention.terminalRunEventsMaxBytes`: inactive, retained only for configuration compatibility (legacy default: 262144 bytes / 256 KiB). No byte cap or 200-line tail is applied: retained `events.jsonl` files keep their complete original bytes. Plan disk capacity for full traces, not the legacy cap.

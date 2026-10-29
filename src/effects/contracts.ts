@@ -133,6 +133,7 @@ export interface EffectTransitionInput {
   readonly recoveryGeneration?: string;
   readonly outcome?: EffectOutcome;
   readonly result?: EffectResult;
+  /** Ledger integrity: SHA-256(canonicalEncode(result)), NOT a joined native hash. */
   readonly resultBytesHash?: string;
   readonly receipt?: JsonValue;
   readonly reason?: string;
@@ -171,11 +172,16 @@ export interface EffectSinkResult {
   readonly reason?: string;
 }
 
-/** Exact B3 settle interface. toolCallId is a physical-call alias, never K. */
+/** B3 settlement shape. toolCallId is a physical-call alias, never K.
+ * The certified bridge projects exact JSON.stringify native hashes after joining;
+ * the low-level ledger reconciler retains canonical adapter-original hashes. */
 export interface SettledEffect {
   readonly toolCallId: string;
   readonly key: string;
   readonly outcome: EffectOutcome;
+  /** Joined native entry: full UTF-8 JSON.stringify(message), no sorting/LF,
+   * including this alias's ID/timestamp. Without a join, identifies only the
+   * canonical adapter original, which still requires live native processing. */
   readonly resultBytesHash?: string;
 }
 export interface SettlePendingIntentsResult {
@@ -193,6 +199,7 @@ export interface EffectRepair {
   readonly argumentsDigest: string;
   readonly outcome: EffectOutcome;
   readonly result?: EffectResult;
+  /** Canonical ledger-original hash, not native-entry materialization evidence. */
   readonly resultBytesHash?: string;
 }
 export interface ReconcilePendingResult extends SettlePendingIntentsResult {

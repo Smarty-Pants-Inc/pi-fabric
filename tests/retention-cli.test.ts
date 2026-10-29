@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MESH_RETENTION_APPLY_DISABLED_CODE, MESH_RETENTION_APPROVAL, MESH_RETENTION_HOLD, MeshRetentionApplyDisabledError, sweepMeshRetention, writeReport } from "../src/storage/retention-cli.js";
 import { pruneActorSessionBackups } from "../src/storage/retention.js";
 import { lockFile } from "../src/residency/file-lock.js";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import { meshRetentionSweepArgs } from "../src/actors/manager.js";
 
 const roots: string[] = [];
@@ -50,24 +51,24 @@ const applyRejects = async (root: string, options: { now?: number; runRetentionM
 
 describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () => {
   it("lists exact bytes with a whole-tree no-op dry run under existing native fences", async () => {
-    const { root, actor, host } = make(); const before = snapshot(root);
+    const { root, actor } = make(); const before = snapshot(root);
     const plan = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true });
     expect(snapshot(root)).toEqual(before);
     expect(plan.skipped).toEqual([]);
-    expect(plan.changes).toHaveLength(3);
-    expect(plan.bytesBefore).toBeGreaterThan(plan.bytesAfter);
-    expect(plan.changes.map(change => change.path).sort()).toEqual([
-      path.join(host, "runs", "terminal", "events.jsonl"),
-      path.join(actor, "runs", "archive", "events.jsonl"),
-      path.join(actor, "session.jsonl.20260927T150000000Z.bak"),
-    ].sort());
+    // Only the old session backup would move: run logs stay byte-for-byte
+    // intact, and archiving a backup frees no bytes. Account for both exactly.
+    expect(plan.changes).toEqual([{
+      path: path.join(actor, "session.jsonl.20260927T150000000Z.bak"), beforeBytes: 3, afterBytes: 3,
+    }]);
+    expect(plan.bytesBefore).toBe(3);
+    expect(plan.bytesAfter).toBe(3);
     expect(plan.summary.applyRefusal).toBeUndefined();
     await applyRejects(root, { now: 7 * 3600000 });
     expect(fs.existsSync(path.join(actor, "session.jsonl.20260927T150000000Z.bak"))).toBe(true);
   });
 
   it("enumerates an owned actor registry larger than 1 MiB in a dry run without losing latest-run vetoes", async () => {
-    const { root, actor, host } = make();
+    const { root, actor } = make();
     const file = path.join(root, "actors", "project", "actors.json");
     const registry = JSON.parse(fs.readFileSync(file, "utf8"));
     const messages = Array.from({ length: 100 }, (_, index) => ({ id: String(index), text: "x".repeat(1400) }));
@@ -81,12 +82,14 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     write(file, JSON.stringify(registry));
     expect(fs.statSync(file).size).toBeGreaterThan(1024 * 1024);
     const before = snapshot(root);
-    const plan = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true });
+    // Use the still-operative whole-run expiry PREVIEW to prove lastRunId
+    // fencing. A compaction no-op alone cannot distinguish referenced runs.
+    const plan = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true, runRetentionMs: 1000 });
     expect(snapshot(root)).toEqual(before);
     expect(plan.skipped).toEqual([]);
+    expect(plan.removedRuns).toEqual([path.join(actor, "runs", "archive")]);
     expect(plan.changes.map(change => change.path).sort()).toEqual([
-      path.join(host, "runs", "terminal", "events.jsonl"),
-      path.join(actor, "runs", "archive", "events.jsonl"),
+      path.join(actor, "runs", "archive"),
       path.join(actor, "session.jsonl.20260927T150000000Z.bak"),
     ].sort());
     fs.mkdirSync(`${file}.lock`);
@@ -134,19 +137,33 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
 
   it("a host waiting for a root's lock wins that root mid-sweep (smarty-dev#7766)", async () => {
     const { root, host } = make();
+    // Make a real removal-preview candidate: with compaction disabled, a young
+    // run no longer reaches a final mutation veto. No run is actually deleted.
+    const run = path.join(host, "runs", "terminal");
+    fs.utimesSync(run, 1, 1);
     const runs = snapshot(path.join(host, "runs"));
-    // residentRunRetentionMs is read inside the dead root's fenced sweep, before its first deletion.
+    let waiter: ChildProcess | undefined;
+    let exited: Promise<unknown[]> | undefined;
     const options = { now: 30 * 86400000, dryRun: true, runRetentionMs: 7 * 86400000, get residentRunRetentionMs() {
-      // A waking host: flock(1) blocks on host.lock in the background, so /proc/locks lists a waiter.
-      spawnSync("sh", ["-c", `flock -x -w 20 '${path.join(host, "host.lock")}' true </dev/null >/dev/null 2>&1 & sleep 0.3`]);
+      if (!waiter) {
+        waiter = spawn("flock", ["-x", "-w", "20", path.join(host, "host.lock"), "true"], { stdio: "ignore" });
+        exited = once(waiter, "exit");
+        // The getter is synchronous; let the child enter the kernel lock wait.
+        spawnSync("sleep", ["0.3"]);
+      }
       return 86400000;
     } };
-    const result = await sweepMeshRetention(root, options);
-    // A waking host stops its own root's work. The mesh-wide actor pass is independent of host liveness by design
-    // (pi-fabric#645): it keeps its own registry fences.
-    expect(result.changes.filter(change => change.path.startsWith(host))).toEqual([]);
-    expect(result.skipped.map(item => item.reason).join(" ")).toMatch(/host is waking/);
-    expect(snapshot(path.join(host, "runs"))).toEqual(runs);
+    try {
+      const result = await sweepMeshRetention(root, options);
+      // The mesh-wide actor pass has independent registry fences.
+      expect(result.changes.filter(change => change.path.startsWith(host))).toEqual([]);
+      expect(result.skipped).toContainEqual({ path: host, reason: expect.stringMatching(/host is waking/) });
+      expect(snapshot(path.join(host, "runs"))).toEqual(runs);
+      expect(await exited).toEqual([0, null]);
+    } finally {
+      if (waiter && waiter.exitCode === null) waiter.kill();
+      await exited;
+    }
   });
 
   it("a hold landing mid-sweep cannot be reached by apply: it rejects before arming the seam (smarty-dev#10678)", async () => {

@@ -11,14 +11,19 @@ import { writeHostLease } from "../src/topology/host-leases.js";
 import { fabricDataRoot } from "../src/storage/temp-root.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { scriptSpawnArgs } from "../src/agents/transports/process-utils.js";
+import { isHostedOnlyAllowed } from "../scripts/hosted-only.mjs";
 import { FABRIC_RUN_ROOT_PREFIX, RUN_ROOT_SWEEP_MARKER, UNRESOLVED_WORKER_FILE, sweepTempRunRoots, type TempRunSweepRequest } from "../src/storage/retention.js";
 
-// The real .ts entry can select Bun and perform native deletion: hosted CI only (vitest.config.ts).
+// Exercise the real built sweep entry with Node, not the .ts/Bun entry: every
+// deletion stays behind the inherited test-deletion guard on fleet and CI.
 const launches = vi.hoisted(() => [] as Array<{ args: readonly string[]; env: NodeJS.ProcessEnv | undefined; status: number | null; stderr: string }>);
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return { ...actual, spawn: (runtime: string, args: readonly string[], options: Parameters<typeof actual.spawn>[2]) => {
     if (!options?.detached) return actual.spawn(runtime, args, options);
+    // Refuse a runtime/guard regression BEFORE launching a deleting child.
+    expect(runtime).toBe(process.execPath);
+    expect(options.env?.NODE_OPTIONS).toContain("test-deletion-guard.mjs");
     // Exercise the actual detached entry, but join it in the test: no leaked background sweeps.
     const result = actual.spawnSync(runtime, args, { env: options.env, encoding: "utf8", timeout: 20_000 });
     launches.push({ args, env: options.env, status: result.status, stderr: result.stderr });
@@ -28,7 +33,11 @@ vi.mock("node:child_process", async importOriginal => {
 const roots: string[] = [];
 const managers: AgentManager[] = [];
 const HOUR = 3600000;
-const entry = path.resolve("src/storage/sweep-main.ts");
+// The inherited guard emits this exact admission notice locally, never a
+// deletion refusal. Keep asserting all other child stderr is empty.
+const sweepStderr = isHostedOnlyAllowed(process.env) ? "" :
+  "hosted-only (outside-temp deletion reporting): push and let CI run it\n";
+const entry = path.resolve("dist/storage/sweep-main.js");
 const temp = () => { const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-temp-sweep-")); roots.push(root); return root; };
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
@@ -90,7 +99,7 @@ describe("configured detached temp sweep", () => {
       await manager.close();
       expect(launches).toHaveLength(count + 1);
       const launch = launches.at(-1)!;
-      expect(launch).toMatchObject({ status: 0, stderr: "", env: { TMPDIR: privateA } });
+      expect(launch).toMatchObject({ status: 0, stderr: sweepStderr, env: { TMPDIR: privateA } });
       expect(launch.env?.PI_FABRIC_TMPDIR).toBe(override);
       const request = JSON.parse(launch.args[1]!) as TempRunSweepRequest;
       expect(request).toMatchObject({ tempRoot: override ?? privateA, orphanedTempRunRetentionMs: grace });
@@ -183,7 +192,7 @@ describe("configured detached temp sweep", () => {
       sweepPath: entry, retention: { ...DEFAULT_FABRIC_CONFIG.retention, orphanedTempRunMs: 6 * HOUR },
     }); managers.push(manager);
     await manager.close();
-    expect(launches).toHaveLength(1); expect(launches[0]).toMatchObject({ status: 0, stderr: "" });
+    expect(launches).toHaveLength(1); expect(launches[0]).toMatchObject({ status: 0, stderr: sweepStderr });
     expect(JSON.parse(launches[0]!.args[1]!).tempRoot).toBe(shared);
     expect(retained.map(snapshot)).toEqual(before);
     expect(fs.readFileSync(path.join(liveOwner, ".fabric-owner.json"), "utf8")).toBe(ownerBefore);
@@ -197,7 +206,7 @@ describe("configured detached temp sweep", () => {
     expect(JSON.parse(fs.readFileSync(path.join(nested, "status.json"), "utf8")).status).toBe("running");
   });
 
-  it("forwards the manager's configured compaction age and cap to the real sweep entry", async () => {
+  it("forwards legacy event settings to the real sweep entry without altering logs", async () => {
     const tempRoot = temp(); vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
     vi.stubEnv("PI_FABRIC_TMPDIR", undefined); vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
     vi.stubEnv("PI_FABRIC_DEPTH", "0");
@@ -209,18 +218,18 @@ describe("configured detached temp sweep", () => {
     }); managers.push(manager);
     await manager.close();
     expect(launches).toHaveLength(1);
-    expect(launches[0]).toMatchObject({ status: 0, stderr: "" });
+    expect(launches[0]).toMatchObject({ status: 0, stderr: sweepStderr });
     expect(JSON.parse(launches[0]!.args[1]!)).toMatchObject({ terminalRunEventsAgeMs: 24 * HOUR, terminalRunEventsMaxBytes: 1024 });
     expect(snapshot(run)).toEqual(before);
   });
 
-  it("keeps a seven-hour log at a 24-hour age, then uses the chosen cap without restarting expiry", async () => {
+  it("preserves the full log on both sides of the legacy age threshold without restarting expiry", async () => {
     const tempRoot = temp();
     const { root, run, log } = seed(tempRoot, Date.now() - 7 * HOUR);
     const request = { tempRoot, orphanedTempRunRetentionMs: 48 * HOUR, oneShotRunRetentionMs: 48 * HOUR,
       terminalRunEventsAgeMs: 24 * HOUR, terminalRunEventsMaxBytes: 1024 };
     const invoke = async () => {
-      const [runtime, ...args] = await scriptSpawnArgs(entry, [JSON.stringify(request)]);
+      const [runtime, ...args] = await scriptSpawnArgs(entry, [JSON.stringify(request)], { requireNode: true });
       const result = childProcess.spawnSync(runtime!, args, { encoding: "utf8", timeout: 20_000 });
       expect(result.status, result.stderr).toBe(0);
     };
@@ -232,10 +241,8 @@ describe("configured detached temp sweep", () => {
     fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ ...record, finishedAt }));
     fs.utimesSync(run, finishedAt / 1000, finishedAt / 1000);
     const old = snapshot(run); await invoke();
-    const compacted = fs.readFileSync(path.join(run, "events.jsonl"), "utf8");
-    expect(compacted).not.toBe(log); expect(Buffer.byteLength(compacted)).toBeLessThanOrEqual(1024);
-    expect(JSON.parse(compacted.split("\n")[0]!)).toMatchObject({ fabricTruncated: true });
-    expect(JSON.parse(compacted.trim().split("\n").at(-1)!)).toMatchObject({ sequence: 400 });
+    expect(fs.readFileSync(path.join(run, "events.jsonl"))).toEqual(Buffer.from(log));
+    expect(snapshot(run)).toEqual(old);
     expect(snapshot(run).mtime).toBe(old.mtime);
     expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(JSON.stringify({ ...record, finishedAt }));
     expect(sweepTempRunRoots({ ...request, now: finishedAt + 48 * HOUR - 1 }).removedRuns).toEqual([]);
@@ -244,29 +251,29 @@ describe("configured detached temp sweep", () => {
     const typed: TempRunSweepRequest = request; expect(typed.tempRoot).toBe(tempRoot);
   });
 
-  it("uses a configured byte cap in the entry even after the default age has elapsed", async () => {
-    const tempRoot = temp(); const { run } = seed(tempRoot, Date.now() - 25 * HOUR);
+  it("preserves every original byte despite a configured cap after the default age", async () => {
+    const tempRoot = temp(); const { run, log } = seed(tempRoot, Date.now() - 25 * HOUR);
     const request = { tempRoot, orphanedTempRunRetentionMs: 48 * HOUR, oneShotRunRetentionMs: 48 * HOUR,
       terminalRunEventsAgeMs: 24 * HOUR, terminalRunEventsMaxBytes: 1024 };
     const mtime = fs.statSync(run).mtimeMs;
-    const [runtime, ...args] = await scriptSpawnArgs(entry, [JSON.stringify(request)]);
+    const [runtime, ...args] = await scriptSpawnArgs(entry, [JSON.stringify(request)], { requireNode: true });
     const result = childProcess.spawnSync(runtime!, args, { encoding: "utf8", timeout: 20_000 });
     expect(result.status, result.stderr).toBe(0);
-    expect(fs.statSync(path.join(run, "events.jsonl")).size).toBeLessThanOrEqual(1024);
+    expect(fs.readFileSync(path.join(run, "events.jsonl"))).toEqual(Buffer.from(log));
     expect(fs.statSync(run).mtimeMs).toBe(mtime);
   });
 
-  it("does not skip compaction younger than six hours when a shorter age is configured", async () => {
+  it("preserves every original byte even with a legacy age shorter than six hours", async () => {
     const tempRoot = temp(); const finishedAt = Date.now() - 2 * HOUR;
-    const { run } = seed(tempRoot, finishedAt);
+    const { run, log } = seed(tempRoot, finishedAt);
     // Compare the filesystem timestamp, not the input rounded through utimes.
     const mtime = fs.statSync(run).mtimeMs;
     const request = { tempRoot, orphanedTempRunRetentionMs: 48 * HOUR, oneShotRunRetentionMs: 48 * HOUR,
       terminalRunEventsAgeMs: HOUR, terminalRunEventsMaxBytes: 1024 };
-    const [runtime, ...args] = await scriptSpawnArgs(entry, [JSON.stringify(request)]);
+    const [runtime, ...args] = await scriptSpawnArgs(entry, [JSON.stringify(request)], { requireNode: true });
     const result = childProcess.spawnSync(runtime!, args, { encoding: "utf8", timeout: 20_000 });
     expect(result.status, result.stderr).toBe(0);
-    expect(fs.statSync(path.join(run, "events.jsonl")).size).toBeLessThanOrEqual(1024);
+    expect(fs.readFileSync(path.join(run, "events.jsonl"))).toEqual(Buffer.from(log));
     expect(fs.statSync(run).mtimeMs).toBe(mtime);
   });
 });

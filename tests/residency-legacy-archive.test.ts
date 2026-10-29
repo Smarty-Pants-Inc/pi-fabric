@@ -171,10 +171,11 @@ describe.skipIf(process.platform === "win32")("bounded retention reference prepa
       // A one-run fixture guarantees history-0 is visited on every native FS,
       // unlike relying on the platform's 4096-run directory enumeration order.
       retention.sweep(now, refs, 1000);
-      expect(reads).toBe(6); expect(reads).toBeLessThanOrEqual(8);
+      // Retained runs no longer need the former compaction status read.
+      expect(reads).toBe(5); expect(reads).toBeLessThanOrEqual(8);
       expect(rename.mock.calls.some(call => String(call[1]).endsWith("events.jsonl"))).toBe(false);
     } finally { retention.close(); await manager.close(); }
-  });
+  }, 30_000); // Includes real manager shutdown; the read-count bound stays unchanged.
 
   it("resumes at a timed-out predicate without rereading the prepared historical prefix", async () => {
     const root = temporary(); run(root, "boundary-run", { sessionId: "2147483647" });

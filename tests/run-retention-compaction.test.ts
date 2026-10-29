@@ -84,7 +84,7 @@ describe("six-hour terminal run compaction", () => {
     expect(snapshot(run)).toEqual(after);
   });
 
-  it("also compacts a closed managed one-shot root before its unchanged deletion age", () => {
+  it("preserves a closed managed one-shot trace until its unchanged whole-tree archive age", () => {
     const { root, run } = make();
     const managed = path.join(root, FABRIC_RUN_ROOT_PREFIX + "closed");
     fs.mkdirSync(managed);
@@ -92,8 +92,12 @@ describe("six-hour terminal run compaction", () => {
     markRunRootActive(managed, 4 * HOUR); markRunRootClosed(managed, 4 * HOUR, true);
     const sweep = (at: number) => sweepTempRunRoots({ tempRoot: root, now: at, orphanedTempRunRetentionMs: 24 * HOUR, oneShotRunRetentionMs: 24 * HOUR });
     expect(sweep(now).removedRuns).toEqual([]);
-    expect(fs.readFileSync(path.join(managed, "old", "events.jsonl"), "utf8").trim().split("\n")).toHaveLength(201);
+    expect(fs.readFileSync(path.join(managed, "old", "events.jsonl"), "utf8")).toBe(log);
     expect(sweep(28 * HOUR).removedRuns).toEqual([path.join(managed, "old")]);
+    const archive = `${managed}.trace-archive`;
+    const receipt = JSON.parse(fs.readFileSync(path.join(archive, fs.readdirSync(archive)[0]!, "custody.json"), "utf8"));
+    expect(receipt.state).toBe("moved");
+    expect(fs.readFileSync(path.join(receipt.destination, "events.jsonl"), "utf8")).toBe(log);
   });
 
   it.each([{ status: "running" }, { status: "queued" }, { status: "unknown" }, { sessionId: undefined }, { sessionId: String(process.pid) }, { cleanupPending: true }])("leaves nonterminal/unknown/uncertain custody untouched: %j", record => {

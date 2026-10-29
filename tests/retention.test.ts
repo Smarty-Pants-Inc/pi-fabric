@@ -6,6 +6,7 @@ import { ActorChildCompletionStore } from "../src/actors/child-completions.js";
 import { stageRunArchive } from "../src/agents/archive-custody.js";
 import type { AgentRunResult } from "../src/agents/types.js";
 import * as processIdentity from "../src/residency/process-identity.js";
+import { ageRunRoot } from "./helpers/age-run-root.js";
 import {
   canRemoveManagedRunRoot,
   canRemoveTerminalRun,
@@ -114,7 +115,10 @@ describe("persistent archive custody", () => {
     fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 0, heartbeatAt: 0, orphanedAt: 0 }));
     expect(runTreeExitVeto(parent)).toMatch(/archive is pending/);
     const enqueue = vi.spyOn(ActorChildCompletionStore.prototype, "enqueue").mockImplementation(() => { throw new Error("archive unavailable"); });
-    const sweep = () => sweepTempRunRoots({ tempRoot: temp, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 });
+    const sweep = () => {
+      ageRunRoot(root, 1);
+      return sweepTempRunRoots({ tempRoot: temp, orphanedTempRunRetentionMs: 0, oneShotRunRetentionMs: 0 });
+    };
     sweep(); expect(fs.existsSync(source)).toBe(true);
     enqueue.mockRestore(); sweep();
     expect(fs.existsSync(root)).toBe(false);
@@ -392,6 +396,7 @@ describe("safe run roots", () => {
       if (name === "unresolved") markUnresolvedWorker(directory, "not joined");
     }
     fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, ...(kind === "closed" ? { closedAt: 1, childrenStopped: true } : { orphanedAt: 1 }) }));
+    ageRunRoot(root, 1);
     const result = sweep(tempRoot);
     if (kind === "closed") expect(result.removedRuns).toContain(path.join(root, "done"));
     expect(fs.existsSync(path.join(root, "done"))).toBe(false);
@@ -651,6 +656,7 @@ describe("temporal retention", () => {
       expect(fs.existsSync(path.join(runRoot, "lost"))).toBe(true);
       writeStatus(path.join(runRoot, "lost"), { status: "failed", transport: "process", sessionId: "2147483647", finishedAt: 1, updatedAt: 1 });
     }
+    ageRunRoot(orphaned, 1);
     const unmarked = sweep(tempRoot);
     expect(unmarked.removedRoots).toContain(orphaned);         // the closed root goes too once empty
     expect(unmarked.removedRuns).toEqual([path.join(closed, "lost")]);
@@ -685,6 +691,7 @@ describe("temporal retention", () => {
       JSON.stringify({ pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1 }),
     );
 
+    ageRunRoot(runRoot, 1);
     const detected = sweepTempRunRoots({
       tempRoot,
       orphanedTempRunRetentionMs: 6 * HOUR,
@@ -713,6 +720,7 @@ describe("temporal retention", () => {
         path.join(runRoot, ".fabric-owner.json"),
         JSON.stringify({ pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }),
       );
+      ageRunRoot(runRoot, 1);
       return runRoot;
     };
     const sweepAt = (now: number) => sweepTempRunRoots({
@@ -786,16 +794,20 @@ describe("temporal retention", () => {
     it("stops removing an expired orphan root's runs at the budget and keeps the root", () => {
       const tempRoot = temporaryDirectory();
       const orphan = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "orphan");
-      for (let index = 0; index < 40; index++) completedRun(path.join(orphan, `run-${index}`));
+      for (let index = 0; index < 8; index++) completedRun(path.join(orphan, `run-${index}`));
       fs.writeFileSync(path.join(orphan, ".fabric-owner.json"), JSON.stringify({ pid: 2_147_483_647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
-      // Removal is verified and directory-relative (smarty-dev#7916): count the runs gone, not the rm calls.
-      const removed = () => 40 - fs.readdirSync(orphan).filter((name) => name.startsWith("run-")).length;
+      ageRunRoot(orphan, 1);
+      // Whole-tree custody retires canonical names without deleting any trace.
+      const removed = () => 8 - fs.readdirSync(orphan).filter((name) => name.startsWith("run-")).length;
       // The clock passes the budget right after the fifth run is removed.
       vi.spyOn(performance, "now").mockImplementation(() => (removed() >= 5 ? 10_000 : 0));
       expect(budgetSweep(tempRoot, 1_000)).toEqual({ removedRoots: [], removedRuns: [] });
       expect(removed()).toBe(5);
-      expect(fs.readdirSync(orphan).filter((name) => name.startsWith("run-"))).toHaveLength(35);
+      expect(fs.readdirSync(orphan).filter((name) => name.startsWith("run-"))).toHaveLength(3);
       vi.restoreAllMocks();
+      // Moving five runs updates their parent's filesystem activity too. Age
+      // this fixture again before simulating a later post-grace maintenance pass.
+      ageRunRoot(orphan, 1);
       expect(budgetSweep(tempRoot).removedRoots).toEqual([orphan]);
     });
 
@@ -998,6 +1010,7 @@ describe("temporal retention", () => {
     fs.mkdirSync(path.join(run, "durable", "initial", "store"), { recursive: true });
     fs.writeFileSync(path.join(run, "durable", "initial", "lease.sqlite"), "");
     fs.writeFileSync(path.join(run, "durable", "initial", "store", "main.jsonl"), "{}\n");
+    ageRunRoot(runRoot, 1);
     expect(sweepAt(tempRoot, 2).removedRoots).toEqual([]);
     expect(sweepAt(tempRoot, 6 * HOUR + 2).removedRoots).toEqual([runRoot]);
   });

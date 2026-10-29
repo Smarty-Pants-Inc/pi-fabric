@@ -299,7 +299,8 @@ interface PeerSignals {
   entries: readonly (readonly Readonly<MeshStateEntry>[])[];
   /** The participant-file listing: the same array while no file changed. */
   files: readonly MeshStateEntry[];
-  leases: ReadonlyMap<string, FabricHostLease>;
+  /** Absent only when the selected records prove lease changes cannot affect this answer. */
+  leases: ReadonlyMap<string, FabricHostLease> | undefined;
   /** The `now` it was computed for, and the wall clock when (the safety interval's reference). */
   at: number;
   checkedAt: number;
@@ -4057,8 +4058,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   /**
    * The root-collision report's change signals now, or undefined when nothing it reads changed since the
    * last report: the bounded list() view's snapshot and participant files, the peer leases, and the
-   * local records and root it compares (smarty-dev#7978). Staleness only grows with time, so an unchanged
-   * view can report no new collision; a lease period still forces a full pass.
+   * local records and root it compares (smarty-dev#7978). Leases are irrelevant only if no stored/local
+   * candidate can collide, even after revival; otherwise keep observing them. A lease period forces a pass.
    */
   #rootCollisionSignals(root: FabricParticipantRecord, now: number): (PeerSignals & { local: string }) | undefined {
     const checkedAt = Date.now();
@@ -4069,15 +4070,28 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const read = { fresh: false };
     const token = this.mesh.stateToken(read);
     const files = this.#participantFiles(read, this.options.listReadCacheMs);
-    const leases = readHostLeases(this.mesh.root);
     const local = JSON.stringify([root.id, root.name, root.sessionId, ...[...this.#localRecords.values()].map(record =>
       [record.id, record.kind, record.rootId, record.name, record.sessionId, record.status, record.reloadUntil, record.remoteHost])]);
     const last = this.#rootCollisionPass;
-    if (last && last.files === files && last.local === local &&
-      samePeerLeases(last.leases, leases, this.options.hostId) && now >= last.at &&
+    let leases: ReadonlyMap<string, FabricHostLease> | undefined;
+    if (last && last.files === files && last.local === local && now >= last.at &&
       checkedAt >= last.checkedAt && checkedAt - last.checkedAt < this.#leaseMs &&
-      this.#samePeerState(last, token, ROOT_COLLISION_PREFIXES)) return undefined;
-    return { token, entries: this.#peerEntries(token, ROOT_COLLISION_PREFIXES), files, leases, local, at: now, checkedAt };
+      this.#samePeerState(last, token, ROOT_COLLISION_PREFIXES)) {
+      if (last.leases === undefined) return undefined;
+      leases = readHostLeases(this.mesh.root);
+      if (samePeerLeases(last.leases, leases, this.options.hostId)) return undefined;
+    }
+    const entries = this.#peerEntries(token, ROOT_COLLISION_PREFIXES);
+    // Do NOT infer this from the live listing: an expired peer can revive by changing only its
+    // lease. Inspect all raw candidates (including shadowed files/state and local roots) without
+    // filtering liveness/status. False positives merely retain the existing lease-sensitive pass.
+    const possible = (value: unknown): boolean => isObject(value) && value.id !== root.id &&
+      (root.sessionId !== undefined && value.sessionId === root.sessionId ||
+        root.name !== "main" && value.name === root.name);
+    const leaseSensitive = entries.some(selection => selection.some(entry => possible(entry.value))) ||
+      files.some(entry => possible(entry.value)) || [...this.#localRecords.values()].some(possible);
+    return { token, entries, files, leases: leaseSensitive ? leases ?? readHostLeases(this.mesh.root) : undefined,
+      local, at: now, checkedAt };
   }
 
   /**
@@ -4087,7 +4101,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
    * call a full SQLite scan). The answer is now read from the canonical snapshot without copies and
    * reused while its change signals are unchanged: a `true` until the live old reader that proved it
    * lapses (expiry needs no change event), a `false` for any later time (expiry only removes readers),
-   * and either for at most one lease period.
+   * and either for at most one lease period. Only an entirely modern selection (including stale
+   * candidates and both file/state copies) can reuse a negative answer without enumerating leases.
    */
   #legacyRenewalsRequired(now: number, snapshot?: object): boolean {
     if (typeof this.mesh.stateToken !== "function" || typeof this.mesh.listAllShared !== "function") {
@@ -4099,17 +4114,27 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const token = snapshot ?? this.mesh.stateToken();
     const read = { snapshot: token };
     const files = this.#participantFiles(read);
-    const leases = readHostLeases(this.mesh.root);
     const checkedAt = Date.now();
     const memo = this.#legacyRenewals;
-    if (memo && memo.files === files && samePeerLeases(memo.leases, leases, this.options.hostId) &&
-      checkedAt >= memo.checkedAt && checkedAt - memo.checkedAt < this.#leaseMs &&
+    let leases: ReadonlyMap<string, FabricHostLease> | undefined;
+    if (memo && memo.files === files && checkedAt >= memo.checkedAt && checkedAt - memo.checkedAt < this.#leaseMs &&
       (memo.required ? now <= memo.until : now >= memo.at) &&
-      this.#samePeerState(memo, token, LEGACY_RENEWAL_PREFIXES)) return memo.required;
-    // Read-only: hostFromEntry/participantFromEntry/isLiveLegacyRootEntry only inspect the entries, and
-    // #liveHosts and mergeParticipantEntries build new containers, so the shared entries need no copy.
-    const result = this.#legacyRenewalsScan(now, leases, (prefix) => this.mesh.listAllShared(prefix, read), files);
-    this.#legacyRenewals = { token, entries: this.#peerEntries(token, LEGACY_RENEWAL_PREFIXES), files, leases,
+      this.#samePeerState(memo, token, LEGACY_RENEWAL_PREFIXES)) {
+      if (memo.leases === undefined) return memo.required;
+      leases = readHostLeases(this.mesh.root);
+      if (samePeerLeases(memo.leases, leases, this.options.hostId)) return memo.required;
+    }
+    const entries = this.#peerEntries(token, LEGACY_RENEWAL_PREFIXES);
+    // Only structural absence is lease-independent. Include stale, malformed and shadowed
+    // candidates: a negative LIVE-reader scan alone cannot rule out lease-only revival.
+    const modern = (entry: Readonly<MeshStateEntry>): boolean =>
+      isObject(entry.value) && entry.value.livenessLeaseFiles === 1;
+    const allModern = entries.every(selection => selection.every(modern)) && files.every(modern);
+    if (!allModern) leases ??= readHostLeases(this.mesh.root);
+    // Read-only: validation and mergeParticipantEntries never mutate these shared selections.
+    const result = allModern ? { required: false, until: Number.POSITIVE_INFINITY } :
+      this.#legacyRenewalsScan(now, leases!, prefix => entries[LEGACY_RENEWAL_PREFIXES.indexOf(prefix)]!, files);
+    this.#legacyRenewals = { token, entries, files, leases: allModern ? undefined : leases,
       at: now, checkedAt, ...result };
     return result.required;
   }
@@ -4137,7 +4162,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   /** The scan behind #legacyRenewalsRequired; `until` is when the old reader that answered true lapses. */
   #legacyRenewalsScan(now: number, leases: ReadonlyMap<string, FabricHostLease>,
-    list: (prefix: string) => readonly MeshStateEntry[], files: readonly MeshStateEntry[],
+    list: (prefix: typeof LEGACY_RENEWAL_PREFIXES[number]) => readonly MeshStateEntry[], files: readonly MeshStateEntry[],
   ): { required: boolean; until: number } {
     const hosts = this.#liveHosts(list(HOST_PREFIX), leases);
     for (const host of hosts.values()) {

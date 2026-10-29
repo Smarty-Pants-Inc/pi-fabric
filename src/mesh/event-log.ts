@@ -11,6 +11,7 @@ import { MeshArchive, MeshArchiveLookupUnavailableError, MeshArchiveRecoveryChan
 import { consumeInitialMeshLockAdmission, withInitialMeshLockAcquisition, delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-lock.js";
 import type { LockTimingContext } from "./commit-stats.js";
 import { jsonClone } from "./state-file.js";
+import { RecoveryReader, type RecoveryHint, type RecoveryReadCost } from "./recovery-reader.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import { prepareKeyedPublishNamespace, receiptDirectoryBarrier, type ReceiptNamespace, type KeyedPublishPrefix, type LiveNamespaceBarrier } from "./receipt-namespace.js";
 
@@ -1117,7 +1118,52 @@ export class EventLog {
   }
 
   read(input: EventReadInput = {}): MeshEvent[] {
-    const { after, limit, filter } = this.#prepareRead(input);
+    return this.#readPage(input);
+  }
+
+  /** Internal recovery ownership belongs to the calling bridge side, never normal delivery. */
+  createRecoveryReader(project: (event: MeshEvent) => string | undefined, signal: AbortSignal): RecoveryReader {
+    return new RecoveryReader({
+      root: this.root,
+      maxEventBytes: this.maxEventBytes,
+      horizon: cost => {
+        const head = this.latestCursor(cost);
+        // Lastless recovery is deliberately stricter than ordinary sequence reconciliation:
+        // only complete committed lines authorize archive visibility, never reservations.
+        return head.last?.sequence ?? this.#readCommittedSequence(cost);
+      },
+      generation: cost => this.#readGeneration(cost),
+      hint: (after, generation, inode) => {
+        const cached = this.#readHints;
+        if (cached?.generation !== generation || cached.inode !== inode) return undefined;
+        let boundary: RecoveryHint | undefined;
+        for (const hint of [...cached.lines, ...cached.anchors.values()]) {
+          if (hint.sequence <= after && (!boundary || hint.sequence > boundary.sequence)) boundary = hint;
+        }
+        // The asynchronous reader validates size, inode, generation and the ending byte.
+        return boundary;
+      },
+      remember: (after, generation, inode, scanned, boundary) => {
+        const cached = this.#readHints?.generation === generation && this.#readHints.inode === inode ? this.#readHints : undefined;
+        const anchors = cached?.anchors ?? new Map<number, RecoveryHint>();
+        if (boundary) {
+          anchors.delete(after);
+          anchors.set(after, boundary);
+          if (anchors.size > READ_HINT_LINES) anchors.delete(anchors.keys().next().value!);
+        }
+        if (!scanned.length && !boundary) return;
+        const lines = new Map((cached?.lines ?? []).map(hint => [hint.sequence, hint.offset]));
+        for (const hint of scanned) lines.set(hint.sequence, hint.offset);
+        this.#readHints = { generation, inode, anchors,
+          lines: [...lines].sort((left, right) => left[0] - right[0]).slice(-READ_HINT_LINES)
+            .map(([sequence, offset]) => ({ sequence, offset })) };
+      },
+    }, project, signal);
+  }
+
+  #readPage(input: EventReadInput, pageLimit?: number): MeshEvent[] {
+    const { after, limit: deliveryLimit, filter } = this.#prepareRead(input);
+    const limit = pageLimit ?? deliveryLimit;
     const events =
       after === undefined
         ? this.#readRecentEvents(filter, limit)
@@ -1357,8 +1403,8 @@ export class EventLog {
   }
 
   /** Tail offset and sequence boundary from the same file handle, never the reservation/archive head. */
-  latestCursor(): { cursor: number; last?: { sequence: number; id: string } } {
-    const generation = this.#readGeneration();
+  latestCursor(cost?: RecoveryReadCost): { cursor: number; last?: { sequence: number; id: string } } {
+    const generation = this.#readGeneration(cost);
     let descriptor: number | undefined;
     let completeOffset = 0;
     let last: { sequence: number; id: string } | undefined;
@@ -1367,13 +1413,13 @@ export class EventLog {
       const size = fs.fstatSync(descriptor).size;
       if (size > 0) {
         const lastByte = Buffer.allocUnsafe(1);
-        fs.readSync(descriptor, lastByte, 0, 1, size - 1);
+        this.#readProbe(descriptor, lastByte, size - 1, cost);
         if (lastByte[0] === 0x0a) {
           completeOffset = size;
         } else {
           const readBytes = Math.min(size, this.maxEventBytes + 1);
           const tail = Buffer.allocUnsafe(readBytes);
-          fs.readSync(descriptor, tail, 0, readBytes, size - readBytes);
+          this.#readProbe(descriptor, tail, size - readBytes, cost);
           const newline = tail.lastIndexOf(0x0a);
           completeOffset = newline >= 0 ? size - readBytes + newline + 1 : 0;
         }
@@ -1383,11 +1429,12 @@ export class EventLog {
         // if another publisher has since appended. A partial append is never an anchor.
         const readBytes = Math.min(completeOffset, this.maxEventBytes + 2);
         const tail = Buffer.allocUnsafe(readBytes);
-        const bytesRead = fs.readSync(descriptor, tail, 0, readBytes, completeOffset - readBytes);
+        const bytesRead = this.#readProbe(descriptor, tail, completeOffset - readBytes, cost);
         if (bytesRead === readBytes) {
           const lineStart = tail.lastIndexOf(0x0a, tail.length - 2) + 1;
           if (lineStart > 0 || readBytes === completeOffset) {
             try {
+              if (cost) cost.probeParseAttempts++;
               const event = JSON.parse(tail.subarray(lineStart, tail.length - 1).toString("utf8")) as MeshEvent;
               if (Number.isSafeInteger(event.sequence) && event.sequence > 0 && typeof event.id === "string") {
                 last = { sequence: event.sequence, id: event.id };
@@ -1622,9 +1669,12 @@ export class EventLog {
     return true;
   }
 
-  #readGeneration(): number {
+  #readGeneration(cost?: RecoveryReadCost): number {
     try {
-      const parsed: unknown = JSON.parse(fs.readFileSync(this.#generationPath, "utf8"));
+      if (cost) cost.metadataReadCalls++;
+      const bytes = fs.readFileSync(this.#generationPath);
+      if (cost) { cost.metadataReadBytes += bytes.length; cost.metadataParseAttempts++; }
+      const parsed: unknown = JSON.parse(bytes.toString("utf8"));
       return typeof parsed === "number" && Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
     } catch {
       return 0;
@@ -1776,7 +1826,7 @@ export class EventLog {
    * its newline is an append in progress (or one a crash cut, which repair truncates), and the
    * reservation counter is never read. Zero without a complete event line (smarty-dev#9313).
    */
-  #readCommittedSequence(): number {
+  #readCommittedSequence(cost?: RecoveryReadCost): number {
     let descriptor: number | undefined;
     try {
       descriptor = fs.openSync(this.#eventsPath, "r");
@@ -1784,11 +1834,11 @@ export class EventLog {
       if (size === 0) return 0;
       const window = Math.min(size, this.maxEventBytes + 1);
       const tail = Buffer.allocUnsafe(window);
-      fs.readSync(descriptor, tail, 0, window, size - window);
+      this.#readProbe(descriptor, tail, size - window, cost);
       const newline = tail.lastIndexOf(0x0a);
       if (newline < 0) return 0;
       const complete = size - window + newline + 1;
-      return this.#lastSequenceIn(descriptor, complete, Math.min(complete, this.maxEventBytes + 2), true) ?? 0;
+      return this.#lastSequenceIn(descriptor, complete, Math.min(complete, this.maxEventBytes + 2), true, cost) ?? 0;
     } catch (error) {
       if (errorCode(error) === "ENOENT") return 0;
       throw error;
@@ -1797,13 +1847,21 @@ export class EventLog {
     }
   }
 
+  /** Recovery probes count readSync attempts/returned bytes once; readFile's internals are not probes. */
+  #readProbe(descriptor: number, bytes: Buffer, position: number, cost?: RecoveryReadCost): number {
+    if (cost) cost.probeReadCalls++;
+    const count = fs.readSync(descriptor, bytes, 0, bytes.length, position);
+    if (cost) cost.probeReadBytes += count;
+    return count;
+  }
+
   /** The last parsable sequence among the lines of the file's last `bytes`, last line first,
    * decoding only the lines it tries. UTF-8 never has a 0x0a byte inside a character, so these
    * are the lines a whole-text split yields. A probe (`whole` false) never parses its first
    * segment, which may be a cut line: undefined sends the caller to the whole window. */
-  #lastSequenceIn(descriptor: number, size: number, bytes: number, whole: boolean): number | undefined {
+  #lastSequenceIn(descriptor: number, size: number, bytes: number, whole: boolean, cost?: RecoveryReadCost): number | undefined {
     const tail = Buffer.allocUnsafe(bytes);
-    fs.readSync(descriptor, tail, 0, bytes, size - bytes);
+    this.#readProbe(descriptor, tail, size - bytes, cost);
     for (let end = bytes; end > 0;) {
       const newline = tail.lastIndexOf(0x0a, end - 1);
       if (newline < 0 && !whole) return undefined;
@@ -1811,6 +1869,7 @@ export class EventLog {
       end = Math.max(newline, 0);
       if (!line) continue;
       try {
+        if (cost) cost.probeParseAttempts++;
         const parsed = JSON.parse(line) as { sequence?: unknown };
         if (typeof parsed.sequence === "number" && Number.isSafeInteger(parsed.sequence)) return parsed.sequence;
       } catch { /* skip malformed sequence line */ }

@@ -4874,7 +4874,10 @@ export class MeshBridge {
       // Failed/deferred mirrors retain that boundary too.
       const end = phase("membershipWaitMs");
       passRefreshAttempted = true;
-      try { passRefreshed = await refreshMembership(retainedBoundary!); } finally { end(); }
+      try {
+        if (notificationForward) passRefreshed = await refreshMembership(retainedBoundary!);
+        else { await this.#refreshMembership(); passRefreshed = true; }
+      } finally { end(); }
       passRefreshPending = !passRefreshed;
     }
     if (direction === "toLocal" && this.#factoryWaiting) {
@@ -5039,7 +5042,10 @@ export class MeshBridge {
         const refresh = async (): Promise<void> => {
           refreshed = true; // Attempt bound, not a claim of completed negative evidence.
           const end = phase("membershipWaitMs");
-          try { passRefreshed = await refreshMembership(event.sequence); } finally { end(); }
+          try {
+            if (notificationForward) passRefreshed = await refreshMembership(event.sequence);
+            else { await this.#refreshMembership(); passRefreshed = true; }
+          } finally { end(); }
           refreshPending = !passRefreshed;
           // Only current canonical authority can admit after an unfinished sample.
           rules = await authority(false);

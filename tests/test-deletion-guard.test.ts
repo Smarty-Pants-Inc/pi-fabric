@@ -600,13 +600,13 @@ const hostedOnlySuites = ["tests/actor-child-completion-idle-preflight.test.ts",
   "tests/actor-remove-dead-root.test.ts", "tests/agent-manager.test.ts", "tests/agent-release-observation.test.ts",
   "tests/agents-provider.test.ts", "tests/residency-commit-fence.test.ts", "tests/residency-stopped-writer-retention.test.ts",
   "tests/residency.test.ts", "tests/routed-session-boundaries.test.ts", "tests/stall-alarms.test.ts",
-  "tests/task-write-policy.test.ts", "tests/temp-run-sweep.test.ts", "tests/mesh-state-windows-acl.test.ts",
+  "tests/task-write-policy.test.ts", "tests/mesh-state-windows-acl.test.ts",
   "tests/verified-remove-windows.test.ts", "tests/windows-temp-root-native.test.ts"];
 const natsBrokerSuites = ["tests/mesh-state-backend.test.ts", "tests/mesh-state-backend-multiprocess.test.ts",
   "tests/mesh-backend-migration-nats.test.ts", "tests/state-backend-nats-election.test.ts",
   "tests/state-backend-nats-publish-dedupe.test.ts", "tests/state-backend-nats-pull-recovery.test.ts",
   "tests/nats-auth-server.test.ts"];
-const guardableSuites = ["tests/actor-directory.test.ts",
+const guardableSuites = ["tests/actor-directory.test.ts", "tests/temp-run-sweep.test.ts",
   "tests/mesh-backend-migration-nats.test.ts",
   "tests/state-backend-nats.test.ts", "tests/residency-operator-actors.test.ts", "tests/mesh-publish-batch-hold.test.ts",
   "tests/verified-remove.test.ts", "tests/verified-remove-secondary.test.ts", "tests/scratch-platform-retention.test.ts",
@@ -661,7 +661,8 @@ it.each([[undefined, false, "0"], ["false", false, "0"], ["true", true, "0"],
     // Native/tool and Bun counterexamples stay excluded; a guarded actor suite and the migration suites
     // no longer disappear just because they import deleting product code (pi-fabric#1151).
     expect(output.exclude.includes("tests/verified-remove-windows.test.ts")).toBe(!hosted);
-    expect(output.exclude.includes("tests/temp-run-sweep.test.ts")).toBe(!hosted);
+    // The real built sweep now runs under Node with the inherited deletion guard.
+    expect(output.exclude).not.toContain("tests/temp-run-sweep.test.ts");
     // Native Windows ACL fixtures live below USERPROFILE, outside TMPDIR: never collected locally.
     expect(output.exclude.includes("tests/mesh-state-windows-acl.test.ts")).toBe(!hosted);
     expect(output.exclude).not.toContain("tests/actor-directory.test.ts");

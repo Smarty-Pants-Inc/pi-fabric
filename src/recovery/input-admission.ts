@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { requireNamespaceBarrier, syncPathNamespaceDurable, writeJsonAtomic } from "../core/atomic-write.js";
@@ -493,6 +493,12 @@ export interface RecoveryTaskAbort {
   readonly originalInputIds: readonly string[]; readonly maintenanceRequestId: string;
   committed: boolean;
 }
+export interface RecoveryGenerationPin {
+  readonly originalInputId: string;
+  /** Immutable ORIGINAL round admission, never a continuation or a native epoch. */
+  readonly admissionId: string;
+  readonly recoveryGeneration: string;
+}
 export interface RecoverySessionLedger {
   readonly version: 1; readonly sessionId: string;
   revision: number; complete: boolean;
@@ -504,6 +510,8 @@ export interface RecoverySessionLedger {
   maintenance: MaintenanceLedgerEntry[];
   retrySlots: Array<{ anchor: string; requestId: string }>;
   repairs: RepairRef[];
+  /** One durable generation per original/admission, retained through terminal outcome. */
+  recoveryGenerationPins: RecoveryGenerationPin[];
   taskAborts: RecoveryTaskAbort[];
   driveReceipts: string[];
 }
@@ -528,6 +536,8 @@ export interface RecoveryInputSelectionRequest extends RecoveryIo {
 }
 export interface RecoveryInputAdapter {
   readRecoveryInput(sessionId: string, io?: RecoveryIo): Promise<RecoveryInputSnapshot>;
+  /** Call before settlement/repair production; an unknown write ACK must reread this pin. */
+  ensureRecoveryGeneration(sessionId: string, originalInputId: string, io?: RecoveryIo): Promise<string>;
   admitContinuation(request: { sessionId: string; originalInputId: string; recoveryGeneration: string; text: string }): Promise<{ admissionId: string; existing: boolean }>;
   recordInputOutcome(request: RecoveryInputOutcomeRequest): Promise<RecoveryInputOutcomeResult>;
   selectRecoveryInput(request: RecoveryInputSelectionRequest): Promise<RecoveryInputSelectionResult>;
@@ -570,18 +580,19 @@ function checkIo(io?: RecoveryIo): void {
 const ledgerPath = (binding: Binding): string => path.join(base(binding.root), "session", `${hash(binding.sessionId)}.json`);
 const emptyLedger = (binding: Binding): RecoverySessionLedger => ({ version: 1, sessionId: binding.sessionId, revision: 0,
   complete: binding.recovery!.historyComplete && files(binding.root, "receiver", binding.sessionId).length === 0,
-  inputs: [], outcomes: [], maintenance: [], retrySlots: [], repairs: [], taskAborts: [], driveReceipts: [] });
+  inputs: [], outcomes: [], maintenance: [], retrySlots: [], repairs: [], recoveryGenerationPins: [], taskAborts: [], driveReceipts: [] });
 const checkedLedger = (value: unknown, sessionId: string): RecoverySessionLedger => {
   if (!object(value) || value.version !== 1 || value.sessionId !== sessionId || !Number.isSafeInteger(value.revision) || (value.revision as number) < 0 ||
-      typeof value.complete !== "boolean" || !exactKeys(value, ["version", "sessionId", "revision", "complete", "inputs", "outcomes", "currentInputId", "reservation", "maintenance", "retrySlots", "repairs", "taskAborts", "driveReceipts"]) ||
-      ["inputs", "outcomes", "maintenance", "retrySlots", "repairs", "taskAborts", "driveReceipts"].some(key => !Array.isArray(value[key]))) {
+      typeof value.complete !== "boolean" || !exactKeys(value, ["version", "sessionId", "revision", "complete", "inputs", "outcomes", "currentInputId", "reservation", "maintenance", "retrySlots", "repairs", "recoveryGenerationPins", "taskAborts", "driveReceipts"]) ||
+      ["inputs", "outcomes", "maintenance", "retrySlots", "repairs", "recoveryGenerationPins", "taskAborts", "driveReceipts"].some(key => !Array.isArray(value[key]))) {
     return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Corrupt serialized session revision/history");
   }
   const s = value as unknown as RecoverySessionLedger;
   const ids = new Set<string>();
   for (const i of s.inputs) {
-    if (!object(i) || !["round", "continuation"].includes(i.kind) || !nonempty(i.originalInputId) || !nonempty(i.admissionId) || ids.has(i.admissionId) ||
-        !nonempty(i.podId) || !nonempty(i.bootId) || !validTime(i.deadlineAt) || !Number.isSafeInteger(i.acceptedRevision) || i.acceptedRevision > s.revision ||
+    if (!object(i) || !exactKeys(i, ["kind", "originalInputId", "admissionId", "round", "deadlineAt", "podId", "bootId", "acceptedRevision", "recoveryGeneration", "delivery"]) ||
+        !["round", "continuation"].includes(i.kind) || !nonempty(i.originalInputId) || !nonempty(i.admissionId) || ids.has(i.admissionId) ||
+        !nonempty(i.podId) || !nonempty(i.bootId) || !validTime(i.deadlineAt) || !Number.isSafeInteger(i.acceptedRevision) || i.acceptedRevision < 1 || i.acceptedRevision > s.revision ||
         i.admissionId.startsWith("pi-native-entry:v1:")) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Corrupt input occurrence history");
     const round = makeRound(i.round);
     if (canonical(round) !== canonical(i.round) || metadataOf(round).sessionId !== sessionId || metadataOf(round).deadlineAt !== i.deadlineAt || roundId(round) !== i.admissionId) {
@@ -589,7 +600,47 @@ const checkedLedger = (value: unknown, sessionId: string): RecoverySessionLedger
     }
     ids.add(i.admissionId);
   }
-  if (s.currentInputId && !s.inputs.some(i => i.kind === "round" && i.originalInputId === s.currentInputId)) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Missing selected original history");
+  const originals = new Map<string, RecoveryInputRecord>();
+  for (const i of s.inputs.filter(i => i.kind === "round")) {
+    if (originals.has(i.originalInputId) || i.originalInputId !== metadataOf(i.round).inputId || Reflect.has(i, "recoveryGeneration")) {
+      return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Ambiguous original admission/generation history");
+    }
+    originals.set(i.originalInputId, i);
+  }
+  const pins = new Map<string, RecoveryGenerationPin>(); const generations = new Set<string>();
+  for (const pin of s.recoveryGenerationPins) {
+    if (!object(pin) || !exactKeys(pin, ["originalInputId", "admissionId", "recoveryGeneration"]) ||
+        !nonempty(pin.originalInputId) || !nonempty(pin.admissionId) || !nonempty(pin.recoveryGeneration) ||
+        originals.get(pin.originalInputId)?.admissionId !== pin.admissionId || pins.has(pin.originalInputId) || generations.has(pin.recoveryGeneration)) {
+      return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Corrupt or ambiguous recovery generation pin identity");
+    }
+    pins.set(pin.originalInputId, pin); generations.add(pin.recoveryGeneration);
+  }
+  const continuations = new Set<string>();
+  for (const i of s.inputs.filter(i => i.kind === "continuation")) {
+    const original = originals.get(i.originalInputId); const pin = pins.get(i.originalInputId);
+    if (!original || !pin || i.recoveryGeneration !== pin.recoveryGeneration || continuations.has(i.originalInputId) ||
+        i.deadlineAt !== original.deadlineAt || i.podId !== original.podId || i.bootId !== original.bootId ||
+        canonical(i.round) !== canonical(continuationRound(sessionId, original, pin.recoveryGeneration, i.round.message))) {
+      return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Continuation is inconsistent with its original generation pin");
+    }
+    continuations.add(i.originalInputId);
+  }
+  const repairIds = new Set<string>();
+  const checkRepair = (ref: RepairRef): void => {
+    if (!object(ref) || !exactKeys(ref, ["originalInputId", "recoveryGeneration", "executionBranchEntryId", "repairReceiptSha256"]) ||
+        !nonempty(ref.originalInputId) || !nonempty(ref.recoveryGeneration) || !nonempty(ref.executionBranchEntryId) || !validHash(ref.repairReceiptSha256) ||
+        pins.get(ref.originalInputId)?.recoveryGeneration !== ref.recoveryGeneration ||
+        originals.get(ref.originalInputId)?.delivery?.executionBranchEntryId !== ref.executionBranchEntryId) {
+      recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Repair is inconsistent with its original generation pin/branch");
+    }
+  };
+  for (const ref of s.repairs) {
+    checkRepair(ref);
+    if (repairIds.has(ref.originalInputId)) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Ambiguous retained repair history");
+    repairIds.add(ref.originalInputId);
+  }
+  if (s.currentInputId && !originals.has(s.currentInputId)) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Missing selected original history");
   const requestIds = new Set<string>();
   for (const e of s.maintenance) {
     if (!object(e) || typeof e.settlementOnly !== "boolean" || typeof e.cancelRequested !== "boolean" || !object(e.record) ||
@@ -600,7 +651,17 @@ const checkedLedger = (value: unknown, sessionId: string): RecoverySessionLedger
         (["PREPARED", "CONSUMED"].includes(e.record.state) && !e.record.plan) || (e.record.state === "CONSUMED" && !e.record.completion)) {
       return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Corrupt maintenance state/plan history");
     }
+    if (Reflect.has(e.record.request, "repair")) {
+      const ref = e.record.request.repair!; checkRepair(ref);
+      if (!s.repairs.some(retained => canonical(retained) === canonical(ref))) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Maintenance repair is absent from retained generation history");
+    }
     requestIds.add(e.record.request.requestId);
+  }
+  for (const slot of s.retrySlots) {
+    if (!object(slot) || !exactKeys(slot, ["anchor", "requestId"]) || !nonempty(slot.anchor) || !nonempty(slot.requestId) ||
+        (originals.has(slot.anchor) && (!pins.has(slot.anchor) || !s.maintenance.some(e => e.record.request.requestId === slot.requestId && e.record.request.repair?.originalInputId === slot.anchor)))) {
+      return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Retry slot is missing its original generation history");
+    }
   }
   if (s.reservation && (s.reservation.kind === "maintenance" ? !requestIds.has(s.reservation.requestId) : s.reservation.kind !== "input" || !ids.has(s.reservation.admissionId) || !validEpoch(s.reservation.epoch) || !Number.isSafeInteger(s.reservation.revision) || s.reservation.revision < 1 || s.reservation.revision > s.revision)) {
     return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Corrupt session reservation");
@@ -664,6 +725,38 @@ const terminalFor = (s: RecoverySessionLedger, originalInputId: string): Recover
   s.outcomes.find(o => o.originalInputId === originalInputId && o.kind !== "lifecycle-interrupt");
 const originalFor = (s: RecoverySessionLedger, originalInputId: string): RecoveryInputRecord =>
   s.inputs.find(i => i.kind === "round" && i.originalInputId === originalInputId) ?? recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Original input is absent from retained accepted history");
+const continuationRound = (sessionId: string, original: RecoveryInputRecord, recoveryGeneration: string, text: string): Round =>
+  makeRound({ from: { id: `session:${sessionId}`, name: "Main", kind: "main", sessionId }, targetId: `session:${sessionId}`,
+    message: text, delivery: "followUp", triggerTurn: true,
+    data: { scriptedInput: { version: 1, inputId: `scripted-continuation:v1:${hash(canonical([1, sessionId, original.originalInputId, recoveryGeneration]))}`,
+      sessionId, deadlineAt: original.deadlineAt },
+    scriptedContinuation: { version: 1, originalInputId: original.originalInputId, recoveryGeneration } } });
+const requireGenerationPin = (s: RecoverySessionLedger, original: RecoveryInputRecord, generation: string): void => {
+  const pin = s.recoveryGenerationPins.find(p => p.originalInputId === original.originalInputId && p.admissionId === original.admissionId);
+  if (!pin) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Missing durable original recovery generation pin");
+  if (pin.recoveryGeneration !== generation) recoveryFail("RECOVERY_CONFLICT", "Recovery generation differs from the durable original pin");
+};
+/** The only REQUIRED generation allocator. Mint inside the shared synchronous owner,
+ * persist with its file/namespace barriers before exposing g, and never infer/backfill
+ * a pin from a caller UUID, continuation, receipt, boot, or absent marker. */
+export async function ensureRecoveryGeneration(sessionId: string, originalInputId: string, io?: RecoveryIo): Promise<string> {
+  if (!nonempty(originalInputId)) return recoveryFail("RECOVERY_CONFLICT", "Original input identity is required");
+  return commitRecoverySession(sessionId, s => {
+    const original = originalFor(s, originalInputId);
+    const old = s.recoveryGenerationPins.find(p => p.originalInputId === originalInputId && p.admissionId === original.admissionId);
+    if (old) return old.recoveryGeneration; // Also retained after terminal outcome.
+    if (!s.complete || s.inputs.some(i => i.originalInputId === originalInputId && i.recoveryGeneration !== undefined) ||
+        s.repairs.some(r => r.originalInputId === originalInputId) || s.maintenance.some(e => e.record.request.repair?.originalInputId === originalInputId)) {
+      return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Cannot allocate over incomplete or prior generation history");
+    }
+    if (terminalFor(s, originalInputId)) return recoveryFail("RECOVERY_INPUT_TERMINAL", "Cannot allocate a new generation for a terminal original");
+    if (s.currentInputId !== originalInputId) return recoveryFail("RECOVERY_CONFLICT", "Only the current open original can allocate a generation");
+    const generation = randomUUID();
+    if (s.recoveryGenerationPins.some(p => p.recoveryGeneration === generation)) return recoveryFail("RECOVERY_CONFLICT", "Recovery generation identity collision");
+    s.recoveryGenerationPins.push({ originalInputId, admissionId: original.admissionId, recoveryGeneration: generation });
+    return generation;
+  }, io);
+}
 const queuedReceipt = (record: RecoveryInputRecord, existing: boolean): FabricAgentMessageResult => ({
   queued: true, routed: "main", messageId: record.admissionId, deadlineAt: record.deadlineAt,
   ...(existing ? { duplicate: true, triggered: false } : {}),
@@ -703,15 +796,12 @@ function admitRecoveryContinuation(binding: Binding, request: { originalInputId:
   return commitRecoverySession(binding.sessionId, (s, revision) => {
     if (!s.complete) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Continuation requires complete original/outcome history");
     const original = originalFor(s, request.originalInputId);
-    const inputId = `scripted-continuation:v1:${hash(canonical([1, binding.sessionId, request.originalInputId, request.recoveryGeneration]))}`;
-    const from: MeshIdentity = { id: `session:${binding.sessionId}`, name: "Main", kind: "main", sessionId: binding.sessionId };
-    const round = makeRound({ from, targetId: `session:${binding.sessionId}`, message: request.text, delivery: "followUp", triggerTurn: true,
-      data: { scriptedInput: { version: 1, inputId, sessionId: binding.sessionId, deadlineAt: original.deadlineAt },
-        scriptedContinuation: { version: 1, originalInputId: request.originalInputId, recoveryGeneration: request.recoveryGeneration } } });
+    requireGenerationPin(s, original, request.recoveryGeneration);
+    const round = continuationRound(binding.sessionId, original, request.recoveryGeneration, request.text);
     const admissionId = roundId(round);
     const old = s.inputs.find(i => i.admissionId === admissionId);
     if (old) {
-      if (canonical(old.round) !== canonical(round)) fail("CONFLICT", "Changed continuation under the same generation");
+      if (canonical(old.round) !== canonical(round)) recoveryFail("RECOVERY_CONFLICT", "Changed continuation under the same generation");
       return { admissionId, existing: true };
     }
     if (terminalFor(s, request.originalInputId)) return recoveryFail("RECOVERY_INPUT_TERMINAL", "A terminal input cannot receive a new continuation");
@@ -886,18 +976,25 @@ export async function driveRecoveryInputOnce(sessionId: string, key: string, io?
 export async function recordRecoveryRepair(sessionId: string, ref: RepairRef, io?: RecoveryIo): Promise<void> {
   const owner = recoveryOwner(sessionId);
   if (!owner.validateRepair) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "No native repair receipt validator is bound");
-  if (!nonempty(ref.originalInputId) || !nonempty(ref.recoveryGeneration) || !nonempty(ref.executionBranchEntryId) || !validHash(ref.repairReceiptSha256)) return recoveryFail("RECOVERY_CONFLICT", "Invalid repair reference");
-  const verified: unknown = owner.validateRepair(snapshot(ref));
-  if (verified !== undefined) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Repair receipt validation must complete synchronously before admission");
+  if (!object(ref) || !exactKeys(ref, ["originalInputId", "recoveryGeneration", "executionBranchEntryId", "repairReceiptSha256"]) ||
+      Object.values(Object.getOwnPropertyDescriptors(ref)).some(d => !d.enumerable || !("value" in d)) ||
+      !nonempty(ref.originalInputId) || !nonempty(ref.recoveryGeneration) || !nonempty(ref.executionBranchEntryId) || !validHash(ref.repairReceiptSha256)) return recoveryFail("RECOVERY_CONFLICT", "Invalid repair reference");
   commitRecoverySession(sessionId, s => {
+    if (!s.complete) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Repair requires complete original/outcome history");
     const original = originalFor(s, ref.originalInputId);
-    if (terminalFor(s, ref.originalInputId) || s.currentInputId !== ref.originalInputId || s.reservation?.kind === "input" ||
-        !original.delivery || original.delivery.executionBranchEntryId !== ref.executionBranchEntryId) return recoveryFail("RECOVERY_CONFLICT", "Repair must belong to the joined open original execution branch");
+    requireGenerationPin(s, original, ref.recoveryGeneration);
     const old = s.repairs.find(r => r.originalInputId === ref.originalInputId && r.recoveryGeneration === ref.recoveryGeneration);
     if (old && canonical(old) !== canonical(ref)) return recoveryFail("RECOVERY_CONFLICT", "Changed repair receipt under the same generation");
-    if (!old) s.repairs.push(snapshot(ref));
+    // This trusted native port is synchronous validation only, never receipt production,
+    // provider/effect work, or a public JSON grant. Check the pin before invoking it.
+    const verified: unknown = owner.validateRepair!(snapshot(ref));
+    if (verified !== undefined) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Repair receipt validation must complete synchronously before admission");
+    if (old) return; // Exact retained retry, including after a terminal outcome/rebind.
+    if (terminalFor(s, ref.originalInputId) || s.currentInputId !== ref.originalInputId || s.reservation?.kind === "input" ||
+        !original.delivery || original.delivery.executionBranchEntryId !== ref.executionBranchEntryId) return recoveryFail("RECOVERY_CONFLICT", "Repair must belong to the joined open original execution branch");
+    s.repairs.push(snapshot(ref));
   }, io);
 }
 export function createRecoveryInputAdapter(): RecoveryInputAdapter {
-  return { readRecoveryInput, admitContinuation, recordInputOutcome, selectRecoveryInput, commitRecoveryInputDelivery, releaseRecoveryInputAfterJoin };
+  return { readRecoveryInput, ensureRecoveryGeneration, admitContinuation, recordInputOutcome, selectRecoveryInput, commitRecoveryInputDelivery, releaseRecoveryInputAfterJoin };
 }

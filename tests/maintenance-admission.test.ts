@@ -7,7 +7,7 @@ import { build } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   admitBoundScriptedInput, admitContinuation, assertRecoveryInputPermission, bindInputAdmission,
-  commitRecoveryInputDelivery, commitRecoverySession, readRecoveryInput, readRecoverySession,
+  commitRecoveryInputDelivery, commitRecoverySession, ensureRecoveryGeneration, readRecoveryInput, readRecoverySession,
   recordInputOutcome, recordRecoveryRepair, recoveryCanonical, recoveryHash,
   releaseRecoveryInputAfterJoin, selectRecoveryInput, RecoveryAdmissionError,
   type AcceptedRecoveryInput, type InputAdmissionMainAgent, type RecoveryInputOutcomeRequest, type RecoveryAdmissionOwner,
@@ -253,7 +253,8 @@ describe.skipIf(process.platform === "win32")("one serialized input/outcome/main
     const joined = deferred(); let restored = 0;
     const release = releaseRecoveryInputAfterJoin(selected, joined.promise, async () => { restored++; });
     expect(f.snapshot().reservation?.kind).toBe("input"); joined.resolve(); await release;
-    const continuation = { sessionId: f.sessionId, originalInputId: "round-1", recoveryGeneration: "generation-1", text: "resume exact original" };
+    const recoveryGeneration = await ensureRecoveryGeneration(f.sessionId, "round-1");
+    const continuation = { sessionId: f.sessionId, originalInputId: "round-1", recoveryGeneration, text: "resume exact original" };
     const a = await admitContinuation(continuation); const b = await admitContinuation(continuation);
     expect(b).toEqual({ ...a, existing: true }); expect(a.existing).toBe(false); expect(restored).toBe(1);
     expect(f.snapshot().inputs.find(i => i.admissionId === a.admissionId)?.deadlineAt).toBe(first.deadlineAt);
@@ -313,7 +314,8 @@ describe.skipIf(process.platform === "win32")("one serialized input/outcome/main
     await recordInputOutcome(f.outcome()); await releaseRecoveryInputAfterJoin(selected, Promise.resolve(), async () => {});
     refused(await f.api.admitMaintenance(f.request("tree", { kind: "tree-nav", targetEntryId: null, summarize: true })), "INPUT_SELECTED");
     refused(await f.api.admitMaintenance(f.request()), "REPAIR_REQUIRED");
-    const repair = { originalInputId: "round-1", recoveryGeneration: "generation-1", executionBranchEntryId: "branch-1", repairReceiptSha256: D };
+    const recoveryGeneration = await ensureRecoveryGeneration(f.sessionId, "round-1");
+    const repair = { originalInputId: "round-1", recoveryGeneration, executionBranchEntryId: "branch-1", repairReceiptSha256: D };
     refused(await f.api.admitMaintenance({ ...f.request(), repair }), "REPAIR_REQUIRED");
     await recordRecoveryRepair(f.sessionId, repair);
     refused(await f.api.admitMaintenance({ ...f.request(), repair, baseLeafId: "other-branch" }), "REPAIR_REQUIRED");
@@ -322,7 +324,8 @@ describe.skipIf(process.platform === "win32")("one serialized input/outcome/main
   it("one durable auto-retry slot is original-input keyed across different runIds and boots, before continuation", async () => {
     const f = fixture(); const deadline = Date.now() + 90_000; f.admitRound("round-1", deadline); const selected = await f.select(); await f.delivery(selected);
     await recordInputOutcome(f.outcome()); await releaseRecoveryInputAfterJoin(selected, Promise.resolve(), async () => {});
-    const repair = { originalInputId: "round-1", recoveryGeneration: "generation-1", executionBranchEntryId: "branch-1", repairReceiptSha256: D }; await recordRecoveryRepair(f.sessionId, repair);
+    const recoveryGeneration = await ensureRecoveryGeneration(f.sessionId, "round-1");
+    const repair = { originalInputId: "round-1", recoveryGeneration, executionBranchEntryId: "branch-1", repairReceiptSha256: D }; await recordRecoveryRepair(f.sessionId, repair);
     const r = { ...f.request("retry-1", { kind: "auto-compact-retry", retryAnchor: "round-1" }), repair, deadlineMs: deadline };
     take(await f.api.admitMaintenance(r));
     expect(f.snapshot().retrySlots).toEqual([{ anchor: "round-1", requestId: "retry-1" }]);
@@ -397,10 +400,12 @@ describe.skipIf(process.platform === "win32")("bounded refusal, uncertainty and 
     f.admitRound(); expect(await selectRecoveryInput({ sessionId: f.sessionId, originalInputId: "round-1", epoch: f.epoch, expectedRevision: f.snapshot().revision })).toMatchObject({ code: "RECOVERY_MAINTENANCE_BUSY" });
   });
   it("incomplete history never authorizes maintenance, cancellation, or a new continuation", async () => {
-    const f = fixture({ complete: false }); f.admitRound();
+    const f = fixture(); f.admitRound(); await f.select();
+    const recoveryGeneration = await ensureRecoveryGeneration(f.sessionId, "round-1");
+    commitRecoverySession(f.sessionId, state => { state.complete = false; });
     refused(await f.api.admitMaintenance(f.request()), "UNCERTAIN");
     expect(await recordInputOutcome(f.outcome("round-1", "user-cancel"))).toEqual({ durable: false, reason: "incomplete-history" });
-    await expect(admitContinuation({ sessionId: f.sessionId, originalInputId: "round-1", recoveryGeneration: "g", text: "resume" })).rejects.toThrow(/complete/i);
+    await expect(admitContinuation({ sessionId: f.sessionId, originalInputId: "round-1", recoveryGeneration, text: "resume" })).rejects.toThrow(/complete/i);
   });
   it.each(["deadline", "aborted", "conflict", "incomplete-history", "store-unavailable", "superseded"] as const)("recordInputOutcome preserves the closed %s refusal", async reason => {
     const f = fixture(); f.admitRound(); let r = f.outcome("round-1", "user-cancel"); let spy: ReturnType<typeof vi.spyOn> | undefined;
@@ -430,7 +435,8 @@ describe.skipIf(process.platform === "win32")("late commit/abort reconciliation 
     };
     const f = fixture({ owner }); f.admitRound(); const input = await f.select(); await f.delivery(input);
     await recordInputOutcome(f.outcome()); await releaseRecoveryInputAfterJoin(input, Promise.resolve(), async () => {});
-    await expect(recordRecoveryRepair(f.sessionId, { originalInputId: "round-1", recoveryGeneration: "g", executionBranchEntryId: "branch-1", repairReceiptSha256: D })).rejects.toMatchObject({ code: "RECOVERY_HISTORY_INCOMPLETE" });
+    const recoveryGeneration = await ensureRecoveryGeneration(f.sessionId, "round-1");
+    await expect(recordRecoveryRepair(f.sessionId, { originalInputId: "round-1", recoveryGeneration, executionBranchEntryId: "branch-1", repairReceiptSha256: D })).rejects.toMatchObject({ code: "RECOVERY_HISTORY_INCOMPLETE" });
     expect(f.snapshot().repairs).toEqual([]);
   });
   it("rereads a native full-epoch getter so in-control revocation never retains an old compute permit", async () => {

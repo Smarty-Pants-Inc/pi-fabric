@@ -131,21 +131,27 @@ const selectCleanupArchive = (requested: string, source?: string, refused: Archi
 };
 export const cleanupArchiveOutsideGit: (requested: string, source?: string) => string = selectCleanupArchive;
 
-const protectCleanupContainer = (container: string): void => {
+const protectCleanupContainers = (containers: readonly string[]): void => {
+  if (!containers.length) return;
   if (process.platform !== "win32") {
-    fs.chmodSync(container, 0o700);
-    const stat = fs.lstatSync(container);
-    if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o700) {
-      throw new Error("Custody container owner/type/mode read-back mismatch");
+    for (const container of containers) {
+      fs.chmodSync(container, 0o700);
+      const stat = fs.lstatSync(container);
+      if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o700) {
+        throw new Error("Custody container owner/type/mode read-back mismatch");
+      }
     }
     return;
   }
   // chmod(0700) does not establish Windows privacy. Protect this fresh container's
   // inheritable DACL for the current account and SYSTEM, then verify exact bytes.
   const command = windowsSecurityPowerShell(String.raw`
-$directory = $env:PI_FABRIC_CLEANUP_CONTAINER
+$directories = if ($env:PI_FABRIC_CLEANUP_BATCH -eq '1') {
+  @([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())) | ConvertFrom-Json)
+} else { @($env:PI_FABRIC_CLEANUP_CONTAINER) }
+foreach ($directory in $directories) {
 $item = Get-Item -Force -LiteralPath $directory
-if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'custody container is a reparse point' }
+if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'custody container is not an ordinary directory' }
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 $acl = [System.Security.AccessControl.DirectorySecurity]::new()
 $acl.SetOwner($user)
@@ -169,8 +175,14 @@ $e = [byte[]]::new($expected.DiscretionaryAcl.BinaryLength)
 $actual.DiscretionaryAcl.GetBinaryForm($a, 0)
 $expected.DiscretionaryAcl.GetBinaryForm($e, 0)
 if ([Convert]::ToBase64String($a) -cne [Convert]::ToBase64String($e)) { throw 'custody DACL read-back mismatch' }
-`, { ...process.env, PI_FABRIC_CLEANUP_CONTAINER: container });
-  execFileSync(command.file, command.args, { env: command.env, timeout: 15_000, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+}
+`, { ...process.env, PI_FABRIC_CLEANUP_CONTAINER: containers[0], PI_FABRIC_CLEANUP_BATCH: containers.length > 1 ? "1" : "0" });
+  execFileSync(command.file, command.args, {
+    env: command.env, timeout: 15_000, windowsHide: true,
+    // ASCII base64 JSON avoids both environment-size and PS 5.1 code-page limits.
+    input: containers.length > 1 ? Buffer.from(JSON.stringify(containers), "utf8").toString("base64") : undefined,
+    stdio: [containers.length > 1 ? "pipe" : "ignore", "pipe", "pipe"],
+  });
 };
 
 /** Bounded Linux byte-shadow boundary: current-owner ordinary files/directories
@@ -257,12 +269,15 @@ const copyCleanupShadow = (source: string, destination: string): Array<{ path: s
 };
 
 const receiptOptions = { durable: true, newline: true };
-const cleanupContainer = (archive: string): string => {
+const createCleanupContainer = (archive: string): string => {
   archiveDevice(archive);
   fs.mkdirSync(archive, { recursive: true, mode: 0o700 });
   archiveDevice(archive);
-  const container = fs.mkdtempSync(path.join(archive, "cleanup-"));
-  protectCleanupContainer(container);
+  return fs.mkdtempSync(path.join(archive, "cleanup-"));
+};
+const cleanupContainer = (archive: string): string => {
+  const container = createCleanupContainer(archive);
+  protectCleanupContainers([container]);
   return container;
 };
 
@@ -271,9 +286,70 @@ const cleanupContainer = (archive: string): string => {
 // replaced canonical path on retry. This is not a cross-process tombstone.
 const cleanupRootFailures = new Map<string, Error>();
 
+/** Opaque, process-local authority for empty containers only, never source custody. */
+export interface PreparedCleanupContainers { readonly count: number; }
+type PreparedContainer = { container: string; dev: number; ino: number };
+const cleanupContainerBatches = new WeakMap<PreparedCleanupContainers, {
+  archives: Map<string, PreparedContainer[]>; errors: Map<string, unknown>; protectionFailure?: { error: unknown };
+}>();
+
+/** One pinned PowerShell per Windows close, with a full DACL read-back for EACH
+ * fresh container. No payload/receipt is written here. Failed/unused containers
+ * stay empty; failure never falls back to per-root PowerShell launches. */
+export const prepareCleanupContainers = (
+  requests: readonly { source: string; archive: string }[],
+): PreparedCleanupContainers | undefined => {
+  if (process.platform !== "win32") return undefined;
+  const state: NonNullable<ReturnType<typeof cleanupContainerBatches.get>> = { archives: new Map(), errors: new Map() };
+  const seen = new Set<string>();
+  for (const request of requests) {
+    const key = path.resolve(request.source);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      if (cleanupRootFailures.has(key) || !fs.lstatSync(request.source, { throwIfNoEntry: false })) continue;
+      const refusals: ArchiveRefusal[] = [];
+      let archive: string;
+      try { archive = selectCleanupArchive(request.archive, request.source, refusals); }
+      catch (error) {
+        if (!refusals.length) throw error;
+        // Match retain's diagnostic-only refusal path; still no receipt yet.
+        archive = cleanupArchiveOutsideGit(tmpdir(), request.source);
+      }
+      const container = createCleanupContainer(archive), stat = fs.lstatSync(container);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Custody container type mismatch");
+      const entries = state.archives.get(archive) ?? [];
+      entries.push({ container, dev: stat.dev, ino: stat.ino });
+      state.archives.set(archive, entries);
+    } catch (error) { state.errors.set(key, error); }
+  }
+  const containers = [...state.archives.values()].flat();
+  try { protectCleanupContainers(containers.map(entry => entry.container)); }
+  catch (error) { state.protectionFailure = { error }; }
+  const batch = Object.freeze({ count: containers.length });
+  cleanupContainerBatches.set(batch, state);
+  return batch;
+};
+
+const takeCleanupContainer = (batch: PreparedCleanupContainers, source: string, archive: string): string => {
+  const state = cleanupContainerBatches.get(batch);
+  if (!state) throw new Error("Unknown cleanup container batch");
+  if (state.protectionFailure) throw state.protectionFailure.error;
+  if (state.errors.has(path.resolve(source))) throw state.errors.get(path.resolve(source));
+  const entry = state.archives.get(archive)?.pop();
+  if (!entry) throw new Error(`No prepared cleanup container for archive: ${archive}`);
+  const stat = fs.lstatSync(entry.container);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== entry.dev || stat.ino !== entry.ino) {
+    throw new Error("Prepared custody container identity/type mismatch");
+  }
+  archiveDevice(entry.container);
+  if (fs.readdirSync(entry.container).length) throw new Error("Prepared custody container is no longer empty");
+  return entry.container;
+};
+
 /** Whole-object rename when possible; a verified EXDEV shadow always defers cleanup. */
 export const retainCleanupRoot = (
-  source: string, archive: string, id: string, reason = "agent cleanup whole-root custody",
+  source: string, archive: string, id: string, reason = "agent cleanup whole-root custody", batch?: PreparedCleanupContainers,
 ): CleanupRootCustody | undefined => {
   const sourceKey = path.resolve(source), priorFailure = cleanupRootFailures.get(sourceKey);
   if (priorFailure) throw priorFailure;
@@ -297,13 +373,14 @@ export const retainCleanupRoot = (
     let receipt: string;
     try {
       // Diagnostic ONLY: no payload destination and no custody/held authority.
-      receipt = path.join(cleanupContainer(cleanupArchiveOutsideGit(tmpdir(), source)), "custody.json");
+      const diagnosticArchive = cleanupArchiveOutsideGit(tmpdir(), source);
+      receipt = path.join(batch ? takeCleanupContainer(batch, source, diagnosticArchive) : cleanupContainer(diagnosticArchive), "custody.json");
       writeJsonAtomic(receipt, { ...evidence, time: Date.now(), state: "refused", originalRetained: true,
         archiveRefusals, error: String(error) }, receiptOptions);
     } catch (failure) { throw new Error(`${String(error)}; diagnostic refusal receipt unavailable: ${String(failure)}`, { cause: failure }); }
     throw Object.assign(new Error(`${String(error)}; diagnostic-only refusal receipt: ${receipt}`, { cause: error }), { refusalReceipt: receipt });
   }
-  const container = cleanupContainer(archive);
+  const container = batch ? takeCleanupContainer(batch, source, archive) : cleanupContainer(archive);
   const move = { source, destination: path.join(container, "tree"), receipt: path.join(container, "custody.json") };
   const prepared = { ...evidence, destination: move.destination, time: Date.now(), state: "prepared",
     ...(archiveRefusals.length ? { archiveRefusals } : {}) };

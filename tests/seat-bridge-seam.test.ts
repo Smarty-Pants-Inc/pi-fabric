@@ -697,7 +697,7 @@ const gateLive = (side: "file" | "nats", machine?: string) => ({ side, key: `ses
   ...(machine ? { machine } : {}) });
 
 describe.skipIf(!linux)("bridge publish: the seat's one allow-list entry, a link restart, and the read-backs", () => {
-  it("passes when the real seat route becomes live at +659 s, before its 660 s cap", async () => {
+  it("passes when the real seat route becomes live at +659 s, before its 780 s cap", async () => {
     const w = await world();
     setKube(w, MANAGED, { line: identityLine(w) });
     let t = 0;
@@ -711,19 +711,19 @@ describe.skipIf(!linux)("bridge publish: the seat's one allow-list entry, a link
     expect(t).toBe(659_000);
   });
 
-  it("refuses publish when the seat route would appear only after its 660 s cap", async () => {
+  it("refuses publish when the seat route would appear only after its 780 s cap", async () => {
     const w = await world();
     setKube(w, MANAGED, { line: identityLine(w) });
     let t = 0;
-    const availableAt = 701_000;
+    const availableAt = 821_000;
     const result = await run(w, "publish", { owner }, { now: () => t, sleep: async ms => {
       t += ms;
       if (t >= availableAt) { w.gate = gateLive("nats", MACHINE); w.receipt = routable(); }
     } });
     expect(result.receipt).toMatchObject({ result: "refused" });
     expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ result: "refused", reason: "seat-not-routable",
-      elapsedMs: 660_000, measured: { gate: null, receipt: {} } });
-    expect(t).toBe(660_000);
+      elapsedMs: 780_000, measured: { gate: null, receipt: {} } });
+    expect(t).toBe(780_000);
     expect(t).toBeLessThan(availableAt);
   });
 
@@ -987,14 +987,14 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     expect(t).toBe(640_000);
   });
 
-  it("refuses rc-restore-route when the file-side route would appear only after its 660 s cap", async () => {
+  it("refuses rc-restore-route when the file-side route would appear only after its 820 s cap", async () => {
     const w = await published();
     w.gate = null;
     w.receipt = {};
     let t = 0;
     const result = await run(w, "rc-restore-route", writer(w), { now: () => t, sleep: async ms => {
       t += ms;
-      if (t >= 700_000) {
+      if (t >= 860_000) {
         w.gate = gateLive("file");
         w.receipt = { ok: true, verdict: "routable", side: "file", file: { remoteHost: null, live: true, ownerIncarnation: V1_INCARNATION },
           nats: { read: true, records: [{ machine: "hub-a-bridge", live: true, ownerIncarnation: V1_INCARNATION }] } };
@@ -1002,8 +1002,8 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     } });
     expect(result.receipt).toMatchObject({ result: "refused" });
     expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "refused", reason: "v1-not-routable",
-      elapsedMs: 660_000, measured: { gate: null, receipt: {} } });
-    expect(t).toBe(660_000);
+      elapsedMs: 820_000, measured: { gate: null, receipt: {} } });
+    expect(t).toBe(820_000);
   });
 
   it("does not restart rollback's phase deadline after delayed other-route recovery", async () => {

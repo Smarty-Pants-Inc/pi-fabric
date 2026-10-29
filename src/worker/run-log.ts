@@ -219,7 +219,9 @@ export interface RunLogCompaction {
   compactionSkipped?: string;
 }
 
-/** Only the quiescent worker finish path may call this, never a live-log tailer. */
+/** Only the quiescent worker finish path may call this, never a live-log tailer.
+ * A rewrite keeps the exact source bytes at `${filePath}.original` for recovery;
+ * canonical JSON equivalence does not preserve raw encodings or whitespace. */
 export const compactTerminalRunLog = (filePath: string, status: string): RunLogCompaction => {
   const outcome: RunLogCompaction = { compacted: 0, beforeBytes: 0, afterBytes: 0 };
   if (!["completed", "failed", "stopped", "timed_out"].includes(status)) return outcome;
@@ -243,6 +245,12 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
     // failure to obtain write access must retain the full log, like fsync failure.
     source = fs.openSync(filePath, fs.constants.O_RDWR | noFollow);
     const original = fs.fstatSync(source);
+    // Windows file IDs can exceed Number's exact range. A retained original
+    // must be proven to be this inode, not a different file with a rounded ID.
+    const generation = fs.fstatSync(source, { bigint: true });
+    const sameGeneration = (stat: fs.BigIntStats): boolean => stat.isFile() &&
+      stat.dev === generation.dev && stat.ino === generation.ino &&
+      stat.size === generation.size && stat.mtimeNs === generation.mtimeNs;
     if (!original.isFile()) return outcome;
     outcome.beforeBytes = outcome.afterBytes = original.size;
     if (original.size > MAX_TERMINAL_LOG_BYTES) {
@@ -343,17 +351,27 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
     fs.fsyncSync(target);
     fs.closeSync(target);
     target = undefined;
-    const current = fs.lstatSync(filePath);
-    const held = fs.fstatSync(source);
-    if (!current.isFile() || current.dev !== original.dev || current.ino !== original.ino ||
-      current.size !== original.size || current.mtimeMs !== original.mtimeMs ||
-      held.size !== original.size || held.mtimeMs !== original.mtimeMs) {
+    const current = fs.lstatSync(filePath, { bigint: true });
+    const held = fs.fstatSync(source, { bigint: true });
+    if (!sameGeneration(current) || !sameGeneration(held)) {
       throw new Error("Run log changed during terminal compaction");
     }
     // Windows may reject replacement while our source handle is open. Both
     // source and temp have been synced; release every owned handle before commit.
     fs.closeSync(source);
     source = undefined;
+    // Keep the original inode before replacing its reader-facing name. Linking
+    // is exclusive (never overwrite a prior original), leaves events.jsonl
+    // readable throughout, and fails closed on filesystems without hard links.
+    // Never clean this up, even if replacement fails. Run retention explicitly
+    // vetoes trees containing events.jsonl.original; it is not disposable scratch.
+    const preserved = `${filePath}.original`;
+    try { fs.linkSync(filePath, preserved); } catch (error) {
+      // A prior failed publish can leave the same source at both names. Reuse
+      // only that exact inode/generation; never replace unrelated retained bytes.
+      if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "EEXIST") throw error;
+      if (!sameGeneration(fs.lstatSync(preserved, { bigint: true }))) throw error;
+    }
     // ponytail: keep this native-source-worker module self-contained, like
     // run-record's rename retry (a .js dependency cannot resolve under Node's
     // direct .ts worker entry). Never unlink the destination to force success.
@@ -364,9 +382,8 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
       checkWork();
       // Closing the handle and waiting must not relax the source-generation
       // guard: recheck identity, size and mtime immediately before EACH attempt.
-      const latest = fs.lstatSync(filePath);
-      if (!latest.isFile() || latest.dev !== original.dev || latest.ino !== original.ino ||
-        latest.size !== original.size || latest.mtimeMs !== original.mtimeMs) {
+      if (!sameGeneration(fs.lstatSync(filePath, { bigint: true })) ||
+        !sameGeneration(fs.lstatSync(preserved, { bigint: true }))) {
         throw new Error("Run log changed during terminal compaction");
       }
       try {

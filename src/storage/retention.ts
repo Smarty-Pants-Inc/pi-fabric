@@ -183,6 +183,10 @@ const runTreeVeto = (
   try {
     if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
+    // The terminal worker rewrite retains the raw source under this name.
+    // Keep the whole tree (including nested runs), not just its compacted reader view.
+    // Resource/worktree cleanup remains independent of trace retention.
+    if (preserveArchives && fs.existsSync(path.join(directory, "events.jsonl.original"))) return "original run log is retained";
     if (preserveArchives && fs.existsSync(path.join(directory, "archive-pending.json"))) return "terminal result archive is pending";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (preserveArchives && fs.existsSync(path.join(directory, "actor-run-archive-pending.json"))) return "actor run receipt archive is pending";

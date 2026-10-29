@@ -9,7 +9,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { CommitOutbox } from "../src/mesh/commit-outbox.js";
 import { FabricControlPlane } from "../src/topology/control-plane.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
-import { FabricBridgeStaleError, hostMirrorLease, mirroredLeaseStatus, mirroredOwnerRoutingStatus, MIRROR_FRESH_MS, hostLeasePath, readHostLease, writeHostLease, type FabricMirrorLease } from "../src/topology/host-leases.js";
+import { FabricBridgeStaleError, hostMirrorLease, mirroredLeaseStatus, mirroredOwnerRoutingStatus, MIRROR_FRESH_MS, hostLeasePath, readHostLease, readHostLeases, writeHostLease, type FabricMirrorLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { FabricPeerLeaseStaleError } from "../src/agents/peer-lease-stale.js";
 import { deadHostRecords, DEAD_HOST_RECORDS_MS } from "../src/topology/host-reaper.js";
@@ -58,6 +58,108 @@ const request = (f: Awaited<ReturnType<typeof fixture>>) => f.control.request(ro
   ownerIncarnation: "activation-1", message: "recorded-path probe" }, rootId, { routedRemoteHost: "ryzen4" });
 const commands = (f: Awaited<ReturnType<typeof fixture>>) => f.store.read({ topic: "fabric.control.command" });
 
+describe("bounded sender grace for mirrored owners", () => {
+  const acknowledge = async (f: Awaited<ReturnType<typeof fixture>>) => {
+    await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
+    const commandId = (commands(f)[0]!.data as { commandId: string }).commandId;
+    await f.store.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity, to: senderId,
+      data: { version: 1, commandId, targetId: rootId, ownerIncarnation: "activation-1", accepted: true,
+        messageId: "grace-accepted", bridge: { from: "ryzen4" } } });
+  };
+
+  it("delivers after the translated lease lapses inside the configured grace", async () => {
+    const f = await fixture(-60_000, 1_000);
+    vi.spyOn(Date, "now").mockImplementation(f.now);
+    expect(f.directory.mirroredControlOwner(rootId, rootId, rootId)?.mirror).toBeDefined();
+    f.advance(1_001);
+    expect(mirroredOwnerRoutingStatus({ ...f.lease(), remoteHost: "ryzen4" }, f.now())).toBe("bridge-stale");
+    const outcome = settle(request(f));
+    await acknowledge(f);
+    expect(await outcome).toMatchObject({ value: { acknowledged: true, routed: "mesh" }, error: undefined });
+  });
+
+  it("keeps a pending command through a translated lapse and accepts its ACK within grace", async () => {
+    const f = await fixture(-60_000, 1_000);
+    vi.spyOn(Date, "now").mockImplementation(f.now);
+    let settled = false;
+    const outcome = settle(request(f)).then(result => { settled = true; return result; });
+    await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
+    f.advance(1_001);
+    await new Promise(resolve => setTimeout(resolve, 30)); // Real watchdog ticks; the injected wall clock is past expiry.
+    expect(settled).toBe(false);
+    const commandId = (commands(f)[0]!.data as { commandId: string }).commandId;
+    await f.store.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity, to: senderId,
+      data: { version: 1, commandId, targetId: rootId, ownerIncarnation: "activation-1", accepted: true,
+        messageId: "grace-accepted", bridge: { from: "ryzen4" } } });
+    expect(await outcome).toMatchObject({ value: { acknowledged: true, routed: "mesh" }, error: undefined });
+  });
+
+  it("refuses a pending command immediately when its owner incarnation changes", async () => {
+    const f = await fixture();
+    vi.spyOn(Date, "now").mockImplementation(f.now);
+    let settledResult: Awaited<ReturnType<typeof settle>> | undefined;
+    void settle(request(f)).then(result => { settledResult = result; });
+    await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
+    const participantKey = key("topology/participants/", rootId);
+    const current = f.store.get(participantKey, { fresh: true })!;
+    await f.store.writeBatch({ identity, ops: [{ kind: "put", key: participantKey,
+      value: { ...(current.value as Record<string, unknown>), ownerIncarnation: "activation-2" } }] });
+    await new Promise(resolve => setTimeout(resolve, 40));
+    expect(settledResult).toMatchObject({ error: { name: "FabricControlStaleIncarnationError" } });
+  });
+
+  it("delivers across a short lease-file absence while the participant owner is unchanged", async () => {
+    const f = await fixture();
+    vi.spyOn(Date, "now").mockImplementation(f.now);
+    expect(f.directory.mirroredControlOwner(rootId, rootId, rootId)?.mirror).toBeDefined();
+    fs.rmSync(hostLeasePath(f.store.root, rootId), { force: true });
+    readHostLeases(f.store.root, []); // Force the canonical listing to observe the brief file absence.
+    expect(f.directory.mirroredControlOwner(rootId, rootId, rootId)?.mirror).toBeDefined();
+    const outcome = settle(request(f));
+    await acknowledge(f);
+    expect(await outcome).toMatchObject({ value: { acknowledged: true, routed: "mesh" }, error: undefined });
+  });
+
+  it("refuses immediately when a fresh mirror sample proves source death", async () => {
+    const f = await fixture();
+    vi.spyOn(Date, "now").mockImplementation(f.now);
+    const at = f.now();
+    f.advertise({ ...f.lease().mirror!, observedAt: at, sourceObservedAt: at - 1_000,
+      sourceExpiresAt: at - 1_000 });
+    const result = await settle(request(f));
+    expect(result.error?.message).toContain("a fresh bridge sample proves the source lease lapsed");
+    expect(commands(f)).toHaveLength(0);
+  });
+
+  it.each(["ownerHostId", "ownerIdentityId", "remoteHost", "ownerIncarnation"] as const)(
+    "does not reuse grace after participant %s changes", async field => {
+      const f = await fixture();
+      vi.spyOn(Date, "now").mockImplementation(f.now);
+      expect(f.directory.mirroredControlOwner(rootId, rootId, rootId)?.mirror).toBeDefined();
+      const participantKey = key("topology/participants/", rootId);
+      const current = f.store.get(participantKey, { fresh: true })!;
+      const replacement = { ...current.value as Record<string, unknown> };
+      if (field === "ownerHostId") replacement.ownerHostId = "session:replacement";
+      if (field === "ownerIdentityId") replacement.ownerIdentityId = "session:replacement";
+      if (field === "remoteHost") replacement.remoteHost = "ryzen2";
+      if (field === "ownerIncarnation") replacement.ownerIncarnation = "activation-2";
+      await f.store.writeBatch({ identity, ops: [{ kind: "put", key: participantKey, value: replacement }] });
+      const result = await settle(request(f));
+      expect(result.error).toBeDefined();
+      expect(commands(f)).toHaveLength(0);
+    });
+
+  it("refuses after the last good mirror exceeds the grace", async () => {
+    const f = await fixture(-60_000, 1_000);
+    vi.spyOn(Date, "now").mockImplementation(f.now);
+    expect(f.directory.mirroredControlOwner(rootId, rootId, rootId)?.mirror).toBeDefined();
+    f.advance(45_001);
+    const result = await settle(request(f));
+    expect(result.error).toBeDefined();
+    expect(commands(f)).toHaveLength(0);
+  });
+});
+
 describe("source-clock root liveness (#10068)", () => {
   it.each([-60_000, 60_000])("judges the native sample, not hub/source skew (%i ms), then accepts only the attributed ACK", async offset => {
     const f = await fixture(offset);
@@ -97,48 +199,34 @@ describe("source-clock root liveness (#10068)", () => {
         messageId: "router-accepted", bridge: { from: "ryzen4" } } });
     await expect(healthy).resolves.toMatchObject({ acknowledged: true, routed: "mesh" });
     await f.local.mirror({ ...f.presence, participants: f.presence.participants.map(p => ({ ...p, controlProtocol: protocol })) }, f.now());
-    f.advance(MIRROR_FRESH_MS + 1);
-    await expect(router.routeMessage(rootId, "no fresh bridge", undefined, "followUp"))
+    f.advance(45_001);
+    await expect(router.routeMessage(rootId, "sender grace exhausted", undefined, "followUp"))
       .rejects.toMatchObject({ code: "FABRIC_PEER_LEASE_STALE" });
     expect(commands(f)).toHaveLength(1);
     expect(steerRemote).not.toHaveBeenCalled();
   });
 
-  it.each(["steer", "followUp"] as const)("refuses %s at the translated short source TTL while its observation is fresh, then admits a renewed sample", async operation => {
+  it.each(["steer", "followUp"] as const)("delivers %s after the translated source horizon lapses inside grace", async operation => {
     const f = await fixture(-60_000, 1_000);
     vi.spyOn(Date, "now").mockImplementation(f.now);
     expect(f.directory.get(rootId, f.now())?.bridgeStale).toBeUndefined();
     const expiresAt = f.lease().expiresAt;
     expect(expiresAt).toBe(f.now() + 1_000);
-    f.advance(1_000); // Equality is expired authority, even inside the 15 s freshness window.
+    f.advance(1_001);
     expect(mirroredLeaseStatus("ryzen4", f.lease().mirror, f.now())).toBe("live");
     expect(f.local.holds(rootId)).toBe(false);
-    const refusal = settle(f.control.request(rootId, rootId, operation, {
-      ownerIncarnation: "activation-1", message: "expired translated authority" }, rootId, { routedRemoteHost: "ryzen4" }));
-    let settled = false;
-    void refusal.then(() => { settled = true; });
-    await vi.waitFor(() => expect(settled || commands(f).length > 0).toBe(true));
-    expect(commands(f)).toHaveLength(0); // The old head publishes here: this is the negative control.
-    expect((await refusal).error).toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", remoteHost: "ryzen4", targetId: rootId,
-      message: expect.stringContaining("this attempt was not published") });
-    expect(f.directory.get(rootId, f.now())).toMatchObject({ remoteHost: "ryzen4", bridgeStale: true });
-    expect(f.directory.list({ scope: "project", fresh: true }, f.now()).find(p => p.id === rootId))
-      .toMatchObject({ remoteHost: "ryzen4", bridgeStale: true });
-
-    const sourceAt = f.now() - 60_000;
-    await f.local.mirror({ ...f.presence, hosts: [{ ...f.presence.hosts[0]!, observedAt: sourceAt,
-      record: { ...f.presence.hosts[0]!.record, updatedAt: sourceAt, expiresAt: sourceAt + 1_000 },
-      expiresAt: sourceAt + 1_000 }] }, f.now());
-    expect(f.directory.get(rootId, f.now())?.bridgeStale).toBeUndefined();
-    const renewed = f.control.request(rootId, rootId, operation, { ownerIncarnation: "activation-1", message: "renewed" },
-      rootId, { routedRemoteHost: "ryzen4" });
-    void renewed.catch(() => undefined);
+    const outcome = f.control.request(rootId, rootId, operation, {
+      ownerIncarnation: "activation-1", message: "within sender grace" }, rootId, { routedRemoteHost: "ryzen4" });
+    void outcome.catch(() => undefined);
     await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
     const commandId = (commands(f)[0]!.data as { commandId: string }).commandId;
     await f.store.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity, to: senderId,
       data: { version: 1, commandId, targetId: rootId, ownerIncarnation: "activation-1", accepted: true,
-        messageId: "renewed-accepted", bridge: { from: "ryzen4" } } });
-    await expect(renewed).resolves.toMatchObject({ acknowledged: true, routed: "mesh" });
+        messageId: `${operation}-grace-accepted`, bridge: { from: "ryzen4" } } });
+    await expect(outcome).resolves.toMatchObject({ acknowledged: true, routed: "mesh" });
+    expect(f.directory.get(rootId, f.now())).toMatchObject({ remoteHost: "ryzen4", bridgeStale: true });
+    expect(f.directory.list({ scope: "project", fresh: true }, f.now()).find(p => p.id === rootId))
+      .toMatchObject({ remoteHost: "ryzen4", bridgeStale: true });
   });
 
   // Remote-authority trust boundary; retained for the recorded Astra catch, not a timing smoke.
@@ -175,8 +263,12 @@ describe("source-clock root liveness (#10068)", () => {
     const admit = async (operation: "steer" | "followUp") => {
       const before = commands(f).length;
       const outcome = router.routeMessage(rootId, "within original source life", undefined, operation);
-      void outcome.catch(() => undefined);
-      await vi.waitFor(() => expect(commands(f)).toHaveLength(before + 1));
+      let failure: unknown;
+      void outcome.catch(error => { failure = error; });
+      await vi.waitFor(() => {
+        if (failure) throw failure;
+        expect(commands(f)).toHaveLength(before + 1);
+      });
       const commandId = (commands(f)[before]!.data as { commandId: string }).commandId;
       await f.store.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity, to: senderId,
         data: { version: 1, commandId, targetId: rootId, ownerIncarnation: "activation-1", accepted: true,
@@ -198,20 +290,10 @@ describe("source-clock root liveness (#10068)", () => {
     expect(f.directory.list({ scope: "project", fresh: true }, f.now()).find(p => p.id === rootId))
       .toMatchObject({ remoteHost: "ryzen4", bridgeStale: true });
     const before = commands(f).length;
-    for (const operation of ["steer", "followUp"] as const) {
-      const refusal = settle(f.control.request(rootId, rootId, operation, {
-        ownerIncarnation: "activation-1", message: "expired original source deadline" }, rootId, { routedRemoteHost: "ryzen4" }));
-      let settled = false;
-      void refusal.then(() => { settled = true; });
-      await vi.waitFor(() => expect(settled || commands(f).length > before).toBe(true));
-      expect(commands(f)).toHaveLength(before);
-      expect((await refusal).error).toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", remoteHost: "ryzen4", targetId: rootId,
-        message: expect.stringContaining("this attempt was not published") });
-      await expect(router.routeMessage(rootId, "expired original source deadline", undefined, operation))
-        .rejects.toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", remoteHost: "ryzen4",
-          message: expect.stringContaining("this attempt was not published") });
-    }
-    expect(commands(f)).toHaveLength(before);
+    // Translation remains capped at the original source deadline; sender-side policy alone
+    // tolerates the positive last sample until grace is exhausted.
+    for (const operation of ["steer", "followUp"] as const) await admit(operation);
+    expect(commands(f)).toHaveLength(before + 2);
     expect(steerRemote).not.toHaveBeenCalled();
 
     const sourceAt = f.now() - 60_000;
@@ -225,9 +307,9 @@ describe("source-clock root liveness (#10068)", () => {
     for (const operation of ["steer", "followUp"] as const) await admit(operation);
   });
 
-  // LUNA-DELTA-1: a legacy outbox effect runs INSIDE cold prepare, before the new
-  // correction/removal commit. Final-state-only assertions miss this authority window.
-  it.each(["missing", "same-sample inflated"] as const)("cold legacy outbox replay cannot publish expired authority at the prepare checkpoint (%s lease)", async disk => {
+  // A legacy outbox effect runs INSIDE cold prepare. Sender grace admits only after
+  // the exact positive source sample is visible, not from the inflated host-row expiry.
+  it.each(["missing", "same-sample inflated"] as const)("cold legacy outbox replay validates source evidence before publication (%s lease)", async disk => {
     const f = await fixture(-60_000, 500, "cold");
     vi.spyOn(Date, "now").mockImplementation(f.now);
     const t0 = f.now();
@@ -289,9 +371,9 @@ describe("source-clock root liveness (#10068)", () => {
     expect(checkpoint).toMatchObject({ expiresAt: t0 + 500, observedAt: t0, rowExpiry: t0 + 1_500,
       participant: { id: rootId, remoteHost: "ryzen4", bridgeStale: true }, routing: "bridge-stale", commands: 0 });
     expect(recorded).toHaveLength(4);
-    for (const result of recorded) expect(result.error).toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", remoteHost: "ryzen4",
-      message: expect.stringContaining("this attempt was not published") });
-    expect(admitted).toEqual([]);
+    for (const result of recorded) expect(result.error?.message).toBe("recorded prepare-checkpoint publication attempt");
+    expect(admitted).toHaveLength(4);
+    expect(admitted.every(attempt => attempt.startsWith("fabric.control.command:"))).toBe(true);
     expect(steerRemote).not.toHaveBeenCalled();
     expect(commands(f)).toHaveLength(0);
   });
@@ -346,7 +428,7 @@ describe("source-clock root liveness (#10068)", () => {
     }
   });
 
-  it.each(["v1", "legacy"] as const)("the %s router refuses short-TTL authority before control or legacy delivery and names a freshly proven lapse", async protocol => {
+  it.each(["v1", "legacy"] as const)("the %s router applies its supported policy to short-TTL authority", async protocol => {
     const f = await fixture(-60_000, 1_000);
     vi.spyOn(Date, "now").mockImplementation(f.now);
     await f.local.mirror({ ...f.presence, participants: f.presence.participants.map(({ ownerIncarnation, ...p }) => ({ ...p,
@@ -357,12 +439,29 @@ describe("source-clock root liveness (#10068)", () => {
       { local: true, id: senderId, matches: (id: string) => id === senderId } as any,
       f.directory, f.control, binding => binding);
     f.advance(1_001);
-    for (const operation of ["steer", "followUp"] as const) {
-      await expect(router.routeMessage(rootId, "expired translated authority", undefined, operation))
-        .rejects.toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", remoteHost: "ryzen4",
-          message: expect.stringContaining("this attempt was not published") });
+    if (protocol === "v1") {
+      // Positive last-good source evidence admits both real router operations despite
+      // the translated short-TTL horizon; each ACK remains bound to this owner/link.
+      for (const operation of ["steer", "followUp"] as const) {
+        const before = commands(f).length;
+        const outcome = router.routeMessage(rootId, "positive sample within grace", undefined, operation);
+        void outcome.catch(() => undefined);
+        await vi.waitFor(() => expect(commands(f)).toHaveLength(before + 1));
+        const commandId = (commands(f)[before]!.data as { commandId: string }).commandId;
+        await f.store.publish({ topic: "fabric.control.ack", kind: "accepted", from: identity, to: senderId,
+          data: { version: 1, commandId, targetId: rootId, ownerIncarnation: "activation-1", accepted: true,
+            messageId: `${operation}-positive-sample`, bridge: { from: "ryzen4" } } });
+        await expect(outcome).resolves.toMatchObject({ acknowledged: true, routed: "mesh" });
+      }
+      expect(commands(f)).toHaveLength(2);
+    } else {
+      for (const operation of ["steer", "followUp"] as const) {
+        await expect(router.routeMessage(rootId, "legacy protocol has no bounded control fence", undefined, operation))
+          .rejects.toMatchObject({ code: "FABRIC_PEER_LEASE_STALE", remoteHost: "ryzen4",
+            message: expect.stringContaining("this attempt was not published") });
+      }
+      expect(commands(f)).toHaveLength(0);
     }
-    expect(commands(f)).toHaveLength(0);
     expect(steerRemote).not.toHaveBeenCalled();
     // A new expired SOURCE sample is different: it proves lapse and keeps immediate host attribution (#2004).
     f.advertise(mirror(f.now(), { sourceExpiresAt: f.now() - 60_001 }));
@@ -371,13 +470,13 @@ describe("source-clock root liveness (#10068)", () => {
       await expect(router.routeMessage(rootId, "freshly proven source lapse", undefined, operation))
         .rejects.toThrow("its lease mirrored from remote host ryzen4 lapsed");
     }
-    expect(commands(f)).toHaveLength(0);
+    expect(commands(f)).toHaveLength(protocol === "v1" ? 2 : 0);
     expect(steerRemote).not.toHaveBeenCalled();
   });
 
-  it("retains a root behind an old bridge, waits once and refuses peer-stale, never claiming source lapse", async () => {
+  it("retains a root beyond sender grace and refuses peer-stale, never claiming source lapse", async () => {
     const f = await fixture();
-    f.advance(MIRROR_FRESH_MS + 1);
+    f.advance(45_001);
     expect(f.directory.get(rootId, f.now())).toMatchObject({ id: rootId, stale: false });
     const result = await settle(request(f));
     expect(result.error).toBeInstanceOf(FabricPeerLeaseStaleError);
@@ -392,7 +491,7 @@ describe("source-clock root liveness (#10068)", () => {
     const f = await fixture();
     const outcome = settle(request(f));
     await vi.waitFor(() => expect(commands(f)).toHaveLength(1));
-    if (status === "bridge-stale") f.advance(MIRROR_FRESH_MS + 1);
+    if (status === "bridge-stale") f.advance(45_001);
     else f.advertise(mirror(f.now(), { sourceExpiresAt: f.now() - 60_001 }));
     const result = await outcome;
     expect(result.error?.message).toContain("outcome is unknown");

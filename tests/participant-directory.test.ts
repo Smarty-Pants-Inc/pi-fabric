@@ -559,9 +559,9 @@ describe("ParticipantDirectory.mirroredControlOwner", () => {
       expect(directory.get(host.rootId, Date.now(), { fresh: true }))
         .toMatchObject({ remoteHost: "forge", stale: false, bridgeStale: true });
 
-      // Required sample missing: doubt (bridge-stale), never a fallback to the state expiry.
+      // A missing sample may use the last positive mirror within the bounded sender grace.
       lease();
-      expect(read()).toEqual({ remoteHost: "forge", expiresAt: expect.any(Number), bridgeStale: true });
+      expect(read()).toEqual({ remoteHost: "forge", expiresAt: expect.any(Number), mirror: old });
       expect(directory.get(host.rootId, Date.now(), { fresh: true }))
         .toMatchObject({ remoteHost: "forge", stale: false, bridgeStale: true });
       expect(publish).not.toHaveBeenCalled();
@@ -1183,8 +1183,8 @@ describe("ParticipantDirectory.get", () => {
     const alpha = createDirectory(meshRoot, alphaIdentity, alphaIdentity.id, () => [
       rootRecord(alphaIdentity.id, alphaIdentity.id, "alpha"),
       agentRecord("agent:alpha-child", alphaIdentity.id, alphaIdentity.id, alphaIdentity.id),
-    ]);
-    const beta = createDirectory(meshRoot, betaIdentity, betaIdentity.id, () => [rootRecord(betaIdentity.id, betaIdentity.id, "beta")]);
+    ], steadyLease);
+    const beta = createDirectory(meshRoot, betaIdentity, betaIdentity.id, () => [rootRecord(betaIdentity.id, betaIdentity.id, "beta")], steadyLease);
     await alpha.start();
     await beta.start();
     const expected = (id: string) => beta.list({ scope: "project" }).find((participant) => participant.id === id);

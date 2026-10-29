@@ -152,7 +152,11 @@ export const mirroredOwnerRoutingStatus = (
   // never source death. Remove ONLY after ALL bridges run a release with mirrorLease.
   const status = owner.mirror || owner.mirrorLease === 1
     ? mirroredLeaseStatus(owner.remoteHost, owner.mirror, now) : "live";
-  return status === "live" && !(owner.expiresAt > now) ? "bridge-stale" : status;
+  const sampledUntil = owner.mirror && owner.mirror.remoteHost === owner.remoteHost &&
+    owner.mirror.sourceExpiresAt > owner.mirror.sourceObservedAt
+    ? owner.mirror.observedAt + Math.min(MIRROR_FRESH_MS, owner.mirror.sourceExpiresAt - owner.mirror.sourceObservedAt)
+    : owner.expiresAt;
+  return status === "live" && !(Math.min(owner.expiresAt, sampledUntil) > now) ? "bridge-stale" : status;
 };
 
 /** Shared by directory recovery and commit-time control admission: never cascade two waits. */
@@ -804,7 +808,8 @@ export const hostLiveness = (
     // so short-lease origins are reobserved before forwarding. Expired translated authority
     // is not proof of a dead Main; mirroredLeaseStatus alone judges source-death evidence.
     return { updatedAt: lease.mirror.observedAt, expiresAt: lease.mirror.sourceExpiresAt > lease.mirror.sourceObservedAt
-      ? Math.min(lease.expiresAt, lease.mirror.observedAt + MIRROR_FRESH_MS) : lease.mirror.observedAt - 1 };
+      ? Math.min(lease.expiresAt, lease.mirror.observedAt + Math.min(MIRROR_FRESH_MS,
+        lease.mirror.sourceExpiresAt - lease.mirror.sourceObservedAt)) : lease.mirror.observedAt - 1 };
   }
   // No observation grants no authority, but retain the last checkpoint's age for reapers:
   // a missing/corrupt file must not turn a recent projection into an epoch-old record.

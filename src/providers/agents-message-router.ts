@@ -437,7 +437,12 @@ export class AgentMessageRouter {
     if (reason) {
       // Capture pre-wait authority before the canonical probe can replace its view. Classify
       // a proven lapse only after that probe; an unconfirmed/failed directory still wins.
-      const resolved = recoverLease && id ? await resolveLease(id) : undefined;
+      let mirrorControl = false;
+      if (id && this.control) try {
+        const known = this.participants.lastKnown?.(id)?.participant ?? this.participants.get(id, undefined, { fresh: true });
+        mirrorControl = !!known?.remoteHost && known.controlProtocol !== "legacy";
+      } catch { /* the canonical refresh below is authoritative */ }
+      const resolved = recoverLease && id && !mirrorControl ? await resolveLease(id) : undefined;
       await this.#refreshDirectory(reason);
       if (resolved === false) throw this.#unknownParticipant(id!);
     }
@@ -829,7 +834,8 @@ export class AgentMessageRouter {
       if (!participant) {
         throw (!this.#nats ? this.participants.writeStalled?.() : undefined) ?? this.#unknownParticipant(this.mainAgent.id, "Fabric Main participant");
       }
-      if (!this.#nats && participant.stale && this.participants.resolveRoutingLease) {
+      const mirroredControlRoute = !!participant.remoteHost && !!this.control && participant.controlProtocol !== "legacy";
+      if (!this.#nats && participant.stale && !mirroredControlRoute && this.participants.resolveRoutingLease) {
         if (!await this.#resolveRoutingLease(participant.id, context?.signal, budget)) throw this.#unknownParticipant(participant.id);
         const refreshed = this.#rootRouteSnapshot(participant.id, participant);
         if (!refreshed || refreshed.ownerHostId !== participant.ownerHostId || refreshed.ownerIdentityId !== participant.ownerIdentityId) {
@@ -837,8 +843,9 @@ export class AgentMessageRouter {
         }
         participant = refreshed;
       }
-      if (!this.#nats && participant.remoteHost && participant.bridgeStale) throw new LeaseResolutionRequired(participant.id,
-        new FabricPeerLeaseStaleError(participant.id, participant.remoteHost, 0), participant);
+      // A mirrored root's translated expiry/brief lease-file absence is revalidated by the
+      // control plane against its last good source sample and bounded sender grace. Do not
+      // reject here on the directory's stricter listing liveness view.
       if (participant.interactive === false) throw new FabricParticipantNonInteractiveError(participant.id);
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
       const ownerIncarnation = controlOwnerIncarnation(participant);

@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshBatchOperation, type MeshBatchView, type MeshIdentity, type MeshStateEntry } from "../src/mesh/store.js";
 import { DIRECTORY_RETENTION_MS, deadHostRecords, reapDeadHostRecords } from "../src/topology/host-reaper.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
-import { readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
+import { MIRROR_FRESH_MS, readHostLeases, writeHostLease } from "../src/topology/host-leases.js";
 import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 import { RootInbox } from "../src/topology/root-inbox.js";
@@ -367,6 +367,30 @@ describe("records of dead hosts", () => {
     expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now })).toBe(1);
     expect(mesh.get(hostKey("filed"))).toBeDefined();
     expect([...readHostLeases(mesh.root).keys()]).toEqual(["filed"]);
+  });
+
+  it("does not reap an expired mirror while its link observation is still fresh", async () => {
+    const mesh = store();
+    const now = Date.now();
+    const id = "session:mirrored-root";
+    const observedAt = now - 1_000;
+    const sourceObservedAt = observedAt - 10_000;
+    const lease = { id, rootId: id, identityId: id, startedAt: 1, incarnationToken: "mirror-incarnation",
+      updatedAt: observedAt - 7 * HOUR, expiresAt: observedAt + 500, mirrorLease: 1 as const,
+      mirror: { remoteHost: "ryzen4", observedAt, sourceObservedAt, sourceUpdatedAt: sourceObservedAt,
+        sourceExpiresAt: sourceObservedAt + 500 } };
+    await mesh.put({ key: hostKey(id), identity: { id, name: "main", kind: "main" }, value: {
+      format: 1, id, rootId: id, identity: { id, name: "main", kind: "main" }, startedAt: 1,
+      incarnationToken: "mirror-incarnation", updatedAt: now - 7 * HOUR, expiresAt: now - 7 * HOUR,
+      remoteHost: "ryzen4", mirrorLease: 1,
+    } });
+    writeHostLease(mesh.root, lease);
+
+    expect(now - observedAt).toBeLessThan(MIRROR_FRESH_MS);
+    expect(keys(deadHostRecords(mesh, { ownHostId: "own", now, deadAfterMs: 0 }))).toEqual([]);
+    expect(await reapDeadHostRecords(mesh, writer, { ownHostId: "own", now, deadAfterMs: 0 })).toBe(0);
+    expect(mesh.get(hostKey(id))).toBeDefined();
+    expect(readHostLeases(mesh.root).get(id)).toMatchObject({ mirror: { observedAt } });
   });
 
   it("deletes in one batch fenced to the versions it saw, and writes nothing when none are dead", async () => {

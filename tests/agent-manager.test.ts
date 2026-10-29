@@ -205,6 +205,9 @@ describe("Agent prompt retention (#11663)", () => {
     });
     const promptPath = (failedStatus as AgentRunRecord).promptPath!;
     expect(fs.readFileSync(promptPath, "utf8")).toBe(prompt);
+    const lifecyclePath = path.join(path.dirname(promptPath), "lifecycle.jsonl");
+    const lifecycleBytes = Buffer.from('{"event":"run.started"}\n{"event":"run.completed"}\n');
+    fs.writeFileSync(lifecyclePath, lifecycleBytes);
     // Windows has no POSIX modes: exact private modes are POSIX-only.
     if (process.platform !== "win32") {
       expect(fs.statSync(promptPath).mode & 0o777).toBe(0o600);
@@ -214,7 +217,8 @@ describe("Agent prompt retention (#11663)", () => {
     await manager.close();
     expect(fs.existsSync(successfulDirectory)).toBe(false);
     expect(fs.existsSync(promptPath)).toBe(true);
-    expect(fs.readdirSync(path.dirname(promptPath)).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
+    expect(fs.readdirSync(path.dirname(promptPath)).sort()).toEqual(["lifecycle.jsonl", "manager-result.json", "status.json", "task.txt"]);
+    expect(fs.readFileSync(lifecyclePath)).toEqual(lifecycleBytes);
     const retainedResult = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "manager-result.json"), "utf8")) as AgentRunRecord;
     expect(retainedResult).toMatchObject({ id: failedHandle.id, status: "failed" });
     expect(retainedResult).not.toHaveProperty("task");

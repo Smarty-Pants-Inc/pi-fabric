@@ -1,7 +1,6 @@
 import fs from "node:fs";
-import { retentionV2Enabled } from "./retention-platform.js";
 import path from "node:path";
-import { writeFileAtomic, writeJsonAtomic } from "../core/atomic-write.js";
+import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { boundedRunTree } from "./reference-scan.js";
 import { countRefusal, countRemoval, removalTallyOn, verifiedRemove } from "./verified-remove.js";
@@ -889,129 +888,15 @@ export interface TerminalRunEventsRetention {
   terminalRunEventsMaxBytes?: number;
 }
 
-const TERMINAL_EVENT_TAIL_LINES = 200;
-const EVENT_TAIL_MARKER = Buffer.from('{"fabricTruncated":true,"reason":"terminal run event retention"}\n');
-
-/** Compact only an owned, safely terminal run. Read a bounded suffix, keep complete JSONL
- * lines (at most the last 200), and atomically replace only events.jsonl; status/reply/result remain byte-for-byte.
- * The marker counts against the byte cap. A single oversized final event may leave only
- * the marker rather than a corrupt JSON fragment. Already bounded logs are never rewritten.
- * Callers retain their ownership/latest-run vetoes before entering this shared predicate. */
+/** Raw run traces must never be rewritten to a tail by compaction.
+ * Keep this compatibility entry point for retention callers and their existing options;
+ * no compaction is performed or reported, including in dry runs. Paged readers keep the
+ * original file and generation, and no moved-aside trace needs a separate retention fence. */
 export const compactTerminalRunEvents = (
-  directory: string,
-  options: TerminalRunEventsRetention & { now?: number; expired?: Deadline; isRetained?: () => boolean; dryRun?: boolean;
+  _directory: string,
+  _options: TerminalRunEventsRetention & { now?: number; expired?: Deadline; isRetained?: () => boolean; dryRun?: boolean;
     onCompact?: (change: { path: string; beforeBytes: number; afterBytes: number }) => void } = {},
-): boolean => {
-  const now = options.now ?? Date.now();
-  const ageMs = options.terminalRunEventsAgeMs ?? 6 * 60 * 60 * 1_000;
-  const maxBytes = options.terminalRunEventsMaxBytes ?? 256 * 1024;
-  const expired = options.expired ?? noDeadline;
-  const directoryStat = ownedStat(directory);
-  if (!Number.isSafeInteger(ageMs) || ageMs < 0 || !Number.isSafeInteger(maxBytes) ||
-      maxBytes < EVENT_TAIL_MARKER.length || expired() || options.isRetained?.() || !directoryStat?.isDirectory()) return false;
-  const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
-  if (!record?.status || !TERMINAL_STATUSES.has(record.status) ||
-      now - recordAgeReference(record, ownedStat(directory)?.mtimeMs ?? now) < ageMs) return false;
-  const file = path.join(directory, "events.jsonl");
-  const stat = ownedStat(file);
-  if (!stat?.isFile() || stat.size === 0 || (!retentionV2Enabled() &&
-      (runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired)))) return false;
-  try {
-    const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
-    let tail: Buffer;
-    try {
-      const opened = fs.fstatSync(fd);
-      if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.size !== stat.size ||
-          opened.mtimeMs !== stat.mtimeMs) return false;
-      // Establish whether the original satisfies both limits before reserving
-      // marker bytes. Reading at most the cap preserves near-limit unmarked logs
-      // and still includes the look-behind needed for the smaller marked tail.
-      const length = Math.min(stat.size, maxBytes);
-      tail = Buffer.alloc(length);
-      let read = 0;
-      while (read < length) {
-        if (expired()) return false;
-        const count = fs.readSync(fd, tail, read, length - read, stat.size - length + read);
-        if (count === 0) return false;
-        read += count;
-      }
-    } finally { fs.closeSync(fd); }
-    // Skip a partial first line only when we did not read from the start.
-    let retained = tail;
-    if (tail.length < stat.size) {
-      const newline = tail.indexOf(0x0a);
-      retained = newline < 0 ? Buffer.alloc(0) : tail.subarray(newline + 1);
-    } else if (tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)) {
-      retained = tail.subarray(EVENT_TAIL_MARKER.length);
-    }
-    let lines = 0;
-    for (let index = retained.length - 1; index >= 0; index--) {
-      if (retained[index] === 0x0a && index !== retained.length - 1 && ++lines === TERMINAL_EVENT_TAIL_LINES) {
-        retained = retained.subarray(index + 1);
-        break;
-      }
-    }
-    // A full unmarked log of <=200 events, or our already bounded tail, is a no-op.
-    if (stat.size <= maxBytes && (retained.length === stat.size ||
-        (tail.length === stat.size && stat.size === EVENT_TAIL_MARKER.length + retained.length &&
-         tail.subarray(0, EVENT_TAIL_MARKER.length).equals(EVENT_TAIL_MARKER)))) return false;
-    // Reading an unchanged bounded suffix grants no mutation authority. Avoid
-    // four redundant status reads for that no-op (native directory order can
-    // put the historical prefix inside the resident run phase).
-    // A real replacement still requires both independent fresh safety walks.
-    if (retentionV2Enabled() && (runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired))) return false;
-    // Truncation is now known to be necessary. Reserve the marker's space and
-    // drop only complete prefix lines; look behind by one byte so an exactly
-    // aligned final event is kept. An oversized final event leaves only a marker.
-    const eventBytes = maxBytes - EVENT_TAIL_MARKER.length;
-    if (retained.length > eventBytes) {
-      const newline = retained.indexOf(0x0a, retained.length - eventBytes - 1);
-      retained = newline < 0 ? Buffer.alloc(0) : retained.subarray(newline + 1);
-    }
-    const checked = ownedStat(file);
-    if (!checked || checked.dev !== stat.dev || checked.ino !== stat.ino ||
-        checked.size !== stat.size || checked.mtimeMs !== stat.mtimeMs ||
-        runTreeExitVeto(directory, 0, expired, true) || !canRemoveTerminalRun(directory, expired) ||
-        expired() || options.isRetained?.()) return false;
-    const next = Buffer.concat([EVENT_TAIL_MARKER, retained]);
-    let replaced = false;
-    try {
-      // The judged events.jsonl goes through the one verified removal (smarty-dev#7916): verified, moved into the
-      // graveyard and verified again; the new tail then takes the free name (link fails on EEXIST), and only then
-      // is the judged inode removed. A failed publish moves it back.
-      replaced = verifiedRemove(file, stat, { deleter: "compactTerminalRunEvents", freed: stat.size - next.length,
-        ...(options.dryRun ? { dryRun: true } : {}),
-        proceed: () => publishExclusive(file, next),
-        fallback: () => { writeFileAtomic(file, next); return true; } }).removed;
-    } finally {
-      if (!options.dryRun) {
-        // Residency expiry (and legacy timestamp fallback) uses directory mtime.
-        // Creating/renaming the atomic tail must not restart that retention clock.
-        const current = ownedStat(directory);
-        if (current?.dev === directoryStat.dev && current.ino === directoryStat.ino) {
-          try { fs.utimesSync(directory, directoryStat.atimeMs / 1000, directoryStat.mtimeMs / 1000); }
-          catch { /* A failed timestamp restore only delays collection; it cannot authorize it. */ }
-        }
-      }
-    }
-    if (!replaced) return false;
-    options.onCompact?.({ path: file, beforeBytes: stat.size, afterBytes: EVENT_TAIL_MARKER.length + retained.length });
-    return true;
-  } catch { return false; }
-};
-
-/** Publish `data` at `file` only while the name is free: an O_EXCL|O_NOFOLLOW private temp beside it, then link
- * (EEXIST never replaces anything), then the temp goes. */
-const publishExclusive = (file: string, data: Buffer): boolean => {
-  const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  try {
-    const fd = fs.openSync(temp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
-    try { fs.writeSync(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-    fs.linkSync(temp, file);
-    return true;
-  } catch { return false; }
-  finally { try { fs.unlinkSync(temp); } catch { /* never created */ } }
-};
+): boolean => false;
 
 /** Immutable, ordinary rotation history only. Malformed-session orphan backups are
  * recovery evidence, not rotation history, and keep their existing exemption.

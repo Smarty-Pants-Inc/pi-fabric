@@ -375,8 +375,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       if (!reason) {
         const { launchPlacedTask, selectFleetPlacement } = await import("./placement.js");
         const selection = await selectFleetPlacement(placement, request.cwd, request.signal, preflightDeadline);
-        if (selection && "localReason" in selection) reason = selection.localReason;
-        else return launchPlacedTask(request, placement, preflightDeadline, selection?.host);
+        return launchPlacedTask(request, placement, preflightDeadline, selection?.host);
       }
       const args = new Map<string, string>();
       for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);

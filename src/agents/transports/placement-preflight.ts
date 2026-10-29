@@ -139,30 +139,46 @@ const hostSlot = (command: readonly string[]): number | undefined => {
   return slots[0];
 };
 
-export type FleetPlacementSelection = { host: string } | { localReason: string };
+export type FleetPlacementSelection = { host: string };
 
-/** Decision C: only --list-room's eligible hosts may receive remote work, even
- * for explicit --host. Missing/broken/slow picker safely selects the local worker.
+/** Only --list-room's eligible hosts with trusted aliases may receive remote
+ * work, even for explicit --host. Retry one read-only selection within the same
+ * preflight deadline; unavailable placement leaves the work undispatched.
  * An injected host-only picker opts a custom launcher into the same contract.
  */
 export const selectFleetPlacement = async (config: AgentPlacementConfig, cwd: string, signal?: AbortSignal, preflightDeadline?: number, environment: NodeJS.ProcessEnv = taskAgentEnvironment()): Promise<FleetPlacementSelection | undefined> => {
+  let requested = "auto";
   try {
     const root = fleetRoot(config, cwd);
     if (!root && !config.pickerCommand) return undefined;
     const picker = config.pickerCommand ?? [path.join(root!, "bin/smarty-pick-host")];
     const deadline = Math.min(preflightDeadline ?? Infinity, Date.now() + Math.min(config.commandTimeoutMs, 5_000));
     const slot = hostSlot(config.command);
-    const requested = slot === undefined ? "auto" : config.command[slot + 1]!;
+    requested = slot === undefined ? "auto" : config.command[slot + 1]!;
     if (requested !== "auto" && !hostName.test(requested)) throw new Error("Invalid --host option");
-    const picked = await query(picker[0]!, [...picker.slice(1), "--list-room"], deadline, environment, signal);
-    const hosts = picked.stdout.trim().split(/\r?\n/u).filter(Boolean);
-    if (picked.code !== 0 || !hosts.length || hosts.some(host => !hostName.test(host)) || new Set(hosts).size !== hosts.length) throw new Error(`picker refused: ${picked.stderr.trim() || "no eligible host"}`);
-    const host = requested === "auto" ? hosts[0]! : requested;
-    if (!hosts.includes(host)) throw new Error(`host ${host} is not picker-eligible${picked.stderr.trim() ? `: ${picked.stderr.trim()}` : ""}`);
-    if (!Object.hasOwn(config.sshAliases ?? {}, host) || !hostName.test(config.sshAliases![host]!)) throw new Error(`host ${host} has no trusted placement sshAliases entry`);
-    return { host };
+    const mapped = (host: string): boolean => {
+      const alias = config.sshAliases?.[host];
+      return Object.hasOwn(config.sshAliases ?? {}, host) && typeof alias === "string" && hostName.test(alias);
+    };
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const picked = await query(picker[0]!, [...picker.slice(1), "--list-room"], deadline, environment, signal);
+        const hosts = picked.stdout.trim().split(/\r?\n/u).filter(Boolean);
+        if (picked.code !== 0) throw new Error(`picker refused (exit ${picked.code}): ${picked.stderr.trim() || "no eligible host"}`);
+        if (!hosts.length) throw new Error("picker returned no eligible host");
+        if (hosts.some(host => !hostName.test(host)) || new Set(hosts).size !== hosts.length) throw new Error("picker returned malformed or duplicate eligible hosts");
+        const host = requested === "auto" ? hosts.find(mapped) : requested;
+        if (!host) throw new Error(`no picker-eligible host has a trusted placement sshAliases entry: ${hosts.join(", ")}`);
+        if (!hosts.includes(host)) throw new Error(`host ${host} is not picker-eligible${picked.stderr.trim() ? `: ${picked.stderr.trim()}` : ""}`);
+        if (!mapped(host)) throw new Error(`host ${host} has no trusted placement sshAliases entry`);
+        if (Date.now() >= deadline || signal?.aborted) throw new Error("Preflight cancelled or deadline expired");
+        return { host };
+      } catch (error) {
+        if (attempt >= 1 || Date.now() >= deadline || signal?.aborted) throw error;
+      }
+    }
   } catch (error) {
-    return { localReason: `placement-picker-local: ${error instanceof Error ? error.message : String(error)}` };
+    throw new AgentInputError("placement", `placement unavailable; no task started; host=${requested}: ${error instanceof Error ? error.message : String(error)}; retry placement when a suitable eligible host is available`);
   }
 };
 
@@ -180,7 +196,6 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
     if (!selectedHost) {
       const selection = await selectFleetPlacement({ ...config, command }, request.cwd, request.signal, deadline, environment);
       if (!selection) throw new Error("No fleet placement selection");
-      if ("localReason" in selection) throw new Error(selection.localReason);
       host = selection.host;
     }
     const alias = config.sshAliases?.[host];
@@ -236,7 +251,7 @@ export const preflightFleetPlacement = async (request: AgentTransportLaunch, con
     if (Date.now() >= deadline || request.signal?.aborted) throw new Error("Preflight cancelled or deadline expired");
     return { host, command: pinned, environment };
   } catch (error) {
-    if (error instanceof RequiredInputMissingError) throw error;
+    if (error instanceof AgentInputError) throw error;
     throw failure(host, error instanceof Error ? error.message : String(error));
   }
 };

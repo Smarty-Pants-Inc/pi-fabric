@@ -12,6 +12,7 @@
 // stream. Held lines are written before the next other line, so every other line
 // keeps its order; a held delta and a held tool update may swap with each other.
 import fs from "node:fs";
+import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 
@@ -371,6 +372,14 @@ export const compactTerminalRunLog = (filePath: string, status: string): RunLogC
       // only that exact inode/generation; never replace unrelated retained bytes.
       if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "EEXIST") throw error;
       if (!sameGeneration(fs.lstatSync(preserved, { bigint: true }))) throw error;
+    }
+    // POSIX namespace barrier: the retained link must reach stable storage
+    // before a crash can publish the reader-facing replacement. Failure keeps
+    // both full-log names and never reaches rename. Windows cannot fsync a
+    // directory through Node; keep its existing fail-closed link/rename path.
+    if (process.platform !== "win32") {
+      const directory = fs.openSync(path.dirname(filePath), fs.constants.O_RDONLY);
+      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
     }
     // ponytail: keep this native-source-worker module self-contained, like
     // run-record's rename retry (a .js dependency cannot resolve under Node's

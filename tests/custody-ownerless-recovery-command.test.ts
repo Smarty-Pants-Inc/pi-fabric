@@ -4,11 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { main } from "../src/mesh/mesh-backend-cli.js";
+import { configureFabricDiagnostics, fabricDiagnosticsFile, flushFabricDiagnostics } from "../src/core/diagnostics.js";
+import { renderRecoveryCommand } from "../src/core/atomic-write.js";
 import { acquireMeshCustodyLock, MESH_CUSTODY_LOCK_NAME } from "../src/mesh/custody-lock.js";
 
 const roots: string[] = [];
 const children: ChildProcess[] = [];
 afterEach(async () => {
+  await flushFabricDiagnostics();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   for (const child of children.splice(0)) {
@@ -88,6 +91,16 @@ describe("ownerless custody recovery command", () => {
   it("refuses a live holder paused after owner unlink; its resumed and repeated release cannot remove a successor", async () => {
     const root = rootDir();
     const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
+    if (process.platform === "win32") {
+      // Windows cannot verify a Linux PID namespace, so an ownerless directory stays KEPT for an operator.
+      fs.mkdirSync(lock, { mode: 0o700 });
+      const result = await invoke(root);
+      expect(result.code).toBe(3);
+      expect(result.stderr).toContain("ownerless custody recovery requires a verifiable Linux PID namespace");
+      expect(fs.existsSync(lock)).toBe(true);
+      expect(fs.readdirSync(lock)).toEqual([]);
+      return;
+    }
     const holder = startPausedRelease(root, 3_500);
     await waitPhase(holder, "owner-unlinked-before-rmdir");
     expect(fs.existsSync(lock)).toBe(true);
@@ -117,6 +130,19 @@ describe("ownerless custody recovery command", () => {
   it("refuses atomically if a new owner is published after the final identity check", async () => {
     const root = rootDir();
     const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
+    if (process.platform === "win32") {
+      // Windows release detaches the complete directory by rename; there is no ownerless canonical-path seam to pause.
+      const release = await acquireMeshCustodyLock(root, 1_000, { hostQualified: true, ownIncarnation: undefined });
+      release();
+      expect(fs.existsSync(lock)).toBe(false);
+      const successorRelease = await acquireMeshCustodyLock(root, 1_000, { hostQualified: true, ownIncarnation: undefined });
+      const successor = fs.readFileSync(path.join(lock, "owner"), "utf8");
+      release();
+      expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(successor);
+      successorRelease();
+      expect(fs.existsSync(lock)).toBe(false);
+      return;
+    }
     const holder = startPausedRelease(root, 20_000);
     await waitPhase(holder, "owner-unlinked-before-rmdir");
     holder.kill("SIGKILL");
@@ -145,6 +171,16 @@ describe("ownerless custody recovery command", () => {
   it("recovers a genuinely dead release receipt after grace and permits reacquisition", async () => {
     const root = rootDir();
     const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
+    if (process.platform === "win32") {
+      // Without verifiable PID-namespace evidence the command must keep, not guess at, the ownerless lock.
+      fs.mkdirSync(lock, { mode: 0o700 });
+      const result = await invoke(root);
+      expect(result.code).toBe(3);
+      expect(result.stderr).toContain("ownerless custody recovery requires a verifiable Linux PID namespace");
+      expect(fs.existsSync(lock)).toBe(true);
+      expect(fs.readdirSync(lock)).toEqual([]);
+      return;
+    }
     const holder = startPausedRelease(root, 20_000);
     await waitPhase(holder, "owner-unlinked-before-rmdir");
     holder.kill("SIGKILL");
@@ -168,17 +204,21 @@ describe("ownerless custody recovery command", () => {
   it("writes one principal-visible alarm with the exact lock path and recovery command", async () => {
     vi.stubEnv("SMARTY_ROLE", "org-agent-test");
     const root = rootDir();
+    const diagnosticsRoot = fs.mkdtempSync(path.join(os.tmpdir(), "custody-alarm-diagnostics-"));
+    roots.push(diagnosticsRoot);
+    vi.stubEnv("PI_CODING_AGENT_DIR", diagnosticsRoot);
+    configureFabricDiagnostics("custody-alarm-test");
     const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
     fs.mkdirSync(lock, { mode: 0o700 });
-    const output: string[] = [];
-    vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
-      output.push(String(chunk)); return true;
-    }) as typeof process.stderr.write);
     for (let attempt = 0; attempt < 2; attempt++) {
       await expect(acquireMeshCustodyLock(root, 0, { hostQualified: true, ownIncarnation: undefined }))
         .rejects.toMatchObject({ code: "FABRIC_MESH_CUSTODY_UNRECOVERABLE" });
     }
-    const command = `fabric-mesh-backend lock-recover --root ${root} --lock custody --ownerless`;
-    expect(output).toEqual([`[pi-fabric] ALARM FABRIC_MESH_CUSTODY_UNRECOVERABLE: Fabric custody-unrecoverable: ${lock} has no valid owner pid; recovery refused; recover a confirmed dead release with: ${command}\n`]);
+    await flushFabricDiagnostics();
+    const records = fs.readFileSync(fabricDiagnosticsFile("custody-alarm-test"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const command = renderRecoveryCommand(["fabric-mesh-backend", "lock-recover", "--root", root, "--lock", "custody", "--ownerless"]);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ level: "warning", source: "src/mesh/custody-lock.ts",
+      message: `[pi-fabric] ALARM custody-unrecoverable: Fabric custody-unrecoverable: ${lock} has no valid owner pid; recovery refused (code FABRIC_MESH_CUSTODY_UNRECOVERABLE); recover a confirmed dead release with: ${command}` });
   });
 });

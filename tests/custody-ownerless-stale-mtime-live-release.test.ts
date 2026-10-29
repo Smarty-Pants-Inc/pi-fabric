@@ -12,6 +12,17 @@ describe("ownerless stale-mtime release review", () => {
   it("does not reclaim a live release just because the directory mtime predates owner unlink", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "custody-live-ownerless-mtime-")); roots.push(root);
     const lock = path.join(root, "custody.lock");
+    if (process.platform === "win32") {
+      // The rename-based Windows release has no unlink/rmdir seam; without Linux namespace proof, stale mtime stays KEPT.
+      fs.mkdirSync(lock);
+      const old = new Date(Date.now() - 2 * 30_000);
+      fs.utimesSync(lock, old, old);
+      await expect(acquireMeshCustodyLock(root, 0, { hostQualified: true, ownIncarnation: undefined }))
+        .rejects.toBeInstanceOf(MeshCustodyUnrecoverableError);
+      expect(fs.existsSync(lock)).toBe(true);
+      expect(fs.readdirSync(lock)).toEqual([]);
+      return;
+    }
     const holder = spawn(process.execPath, ["--input-type=module", "-e", `
       import fs from "node:fs";
       import { createJiti } from "jiti";

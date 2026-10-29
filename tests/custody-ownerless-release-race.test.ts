@@ -12,6 +12,15 @@ describe("custody ownerless release interleaving", () => {
   it("keeps an ownerless canonical directory busy while its live holder is between unlink and rmdir", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "custody-ownerless-release-")); roots.push(root);
     const lock = path.join(root, "custody.lock");
+    if (process.platform === "win32") {
+      // Windows cannot observe the in-place unlink/rmdir seam; its automatic path keeps an unprovable ownerless lock.
+      fs.mkdirSync(lock);
+      await expect(acquireMeshCustodyLock(root, 250, { hostQualified: true, ownIncarnation: undefined }))
+        .rejects.toBeInstanceOf(MeshCustodyUnrecoverableError);
+      expect(fs.existsSync(lock)).toBe(true);
+      expect(fs.readdirSync(lock)).toEqual([]);
+      return;
+    }
     const holder = spawn(process.execPath, ["--input-type=module", "-e", `
       import fs from "node:fs";
       import { createJiti } from "jiti";

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
+import { diagnostics } from "../core/diagnostics.js";
 import {
   alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation,
   readPhysicalHostIdentity, readPhysicalMachineId, renderRecoveryCommand, validBootId, type StaleLockNote,
@@ -184,8 +185,8 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
         if (!custodyAlarmedLocks.has(error.lock)) {
           custodyAlarmedLocks.add(error.lock);
           const recovery = renderRecoveryCommand(["fabric-mesh-backend", "lock-recover", "--root", path.dirname(error.lock), "--lock", "custody", "--ownerless"]);
-          const alarm = `[pi-fabric] ALARM ${error.code}: ${error.message}; recover a confirmed dead release with: ${recovery}\n`;
-          try { process.stderr.write(alarm); } catch { /* alarm never masks refusal */ }
+          const alarm = `[pi-fabric] ALARM ${error.kind}: ${error.message} (code ${error.code}); recover a confirmed dead release with: ${recovery}\n`;
+          try { diagnostics.warn("src/mesh/custody-lock.ts", alarm.trimEnd()); } catch { /* alarm never masks refusal */ }
         }
       }
       throw error;

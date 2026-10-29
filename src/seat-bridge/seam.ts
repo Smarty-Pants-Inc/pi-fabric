@@ -38,8 +38,9 @@ import { awaitRoutable, LINK_UNIT, natsRecords, otherRoutesBack, reloadLink, rou
 const OWNER = "fabric-v2";
 const PHASES = new Set(["resume", "publish", "rc-restore-route"]);
 const MAX_REQUEST = 64 * 1024;
-const DEADLINE_MS = 780_000;
-const SEAT_ROUTE_WAIT_MS = 300_000;
+const DEADLINE_MS = 840_000;
+const SEAT_ROUTE_WAIT_MS = 660_000;
+const OTHER_ROUTES_WAIT_MS = 480_000;
 const HEX64 = /^[0-9a-f]{64}$/;
 const HEX32 = /^[0-9a-f]{32}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -521,7 +522,7 @@ const publish = async (context: Context): Promise<number> => {
   }
   if (written) {
     // Every other route the link carried live before the restart must be live again, whatever this seat's result.
-    others = await otherRoutesBack(post!.config, routesBefore, `session:${sessionId}`, context.deps, clock(context, 120_000));
+    others = await otherRoutesBack(post!.config, routesBefore, `session:${sessionId}`, context.deps, clock(context, OTHER_ROUTES_WAIT_MS));
     if (!reason && others.down.length > 0) reason = "other-routes-down";
   }
   const final = await readPod(access, pin.name, Math.min(30_000, Math.max(1_000, context.deadline - context.now())));
@@ -631,7 +632,7 @@ const restoreRoute = async (context: Context): Promise<number> => {
     reload = await reloadLink(post.config, context.pins.linkUnit, context.sealed.seat, context.deps, clock(context, 120_000),
       problem => problem === leftover);
     if (!reload.statusOk) reason = "link-not-reloaded";
-    others = await otherRoutesBack(post.config, routesBefore, `session:${sessionId}`, context.deps, clock(context, 120_000));
+    others = await otherRoutesBack(post.config, routesBefore, `session:${sessionId}`, context.deps, clock(context, OTHER_ROUTES_WAIT_MS));
     if (!reason && others.down.length > 0) reason = "other-routes-down";
   }
   // v1: the relaunched writer is this session's live inbox owner (pid + start time), with the session file A named.

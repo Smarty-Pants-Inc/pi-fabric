@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, 'refactor/sd-6477-**', 'feat/sd-6477-**']
+    branches: [main, 'refactor/sd-6477-**', 'feat/sd-6477-**', 'release/aprime-link-*']
 
 permissions:
   contents: read

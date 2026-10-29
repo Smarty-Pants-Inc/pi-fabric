@@ -168,7 +168,7 @@ const run = async (w: World, phase: string, given: Record<string, unknown> | ((w
   let t = 0;
   const deps: BridgeDeps = {
     kubectl: path.join(w.kube, "kubectl"), podCli: "/opt/pi-fabric/dist/cli/index.js", systemctl: path.join(w.seat.base, "systemctl"),
-    seatPins: () => pins, now: () => t, sleep: async ms => { t += ms; }, deadlineMs: 600_000,
+    seatPins: () => pins, now: () => t, sleep: async ms => { t += ms; },
     holder: () => ({ pid: !w.holderStuck && fs.existsSync(w.marker) ? 101 + fs.readFileSync(w.marker, "utf8").split("\n").length : 100,
       startTime: "1", purpose: "start" }),
     status: async config => { w.seenConfigs.push({ allow: structuredClone(config.allow) });
@@ -373,6 +373,42 @@ describe.skipIf(!linux)("bridge resume: a read-only check of the resumed Pi in t
         gap: "resume-thinking-append-missing", elapsedMs: 424_000, measured: { observations: 2 } });
       expect(t).toBeLessThan(phaseCap);
     }
+  });
+
+  it("keeps Pi's missing-append wait at 600 s under the default 840 s phase ceiling", async () => {
+    const w = await world({ sealed: SEALED_BARE });
+    setKube(w, RAW, { line: identityLine(w) });
+    let t = 0;
+    const result = await run(w, "resume", resumeInputs, { now: () => t, sleep: async () => { t += 180_000; } });
+    expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: resume-thinking-append-missing [owner: fabric-v2]\n" });
+    expect(evidenceOf(w, "fabric-v2-bridge-resume-outcome.json")).toMatchObject({ result: "unknown",
+      gap: "resume-thinking-append-missing", elapsedMs: 540_000, measured: { observations: 3 } });
+    expect(t).toBe(540_000);
+    expect(t).toBeLessThan(600_000);
+  });
+
+  it("caps an oversized phase budget at 840 s, with the final read consuming the remaining time", async () => {
+    const w = await world({ sealed: SEALED_BARE });
+    setKube(w, RAW, { line: identityLine(w) });
+    let t = 0;
+    const budgets: number[] = [];
+    const actualVerify = kube.verifyKubeconfig;
+    const actualReadPod = kube.readPod;
+    vi.spyOn(kube, "verifyKubeconfig").mockImplementation(async (access, timeout) => {
+      await actualVerify(access, timeout);
+      budgets.push(timeout); t += 780_000;
+    });
+    vi.spyOn(kube, "readPod").mockImplementation(async (access, name, timeout) => {
+      const value = await actualReadPod(access, name, timeout);
+      budgets.push(timeout); t += timeout;
+      return value;
+    });
+    const result = await run(w, "resume", resumeInputs, { deadlineMs: 900_000, now: () => t, sleep: async ms => { t += ms; } });
+    expect(result).toMatchObject({ code: 2, stdout: "", stderr: "GAP: phase-deadline [owner: fabric-v2]\n" });
+    expect(t).toBe(840_000);
+    expect(budgets).toEqual([30_000, 30_000, 30_000]);
+    expect(w.calls()).toHaveLength(5);
+    expect(fs.existsSync(path.join(w.seat.runDir, "fabric-v2-bridge-resume-outcome.json"))).toBe(false);
   });
 
   /** A thinking_level_change line as Pi writes it (5 keys). */
@@ -661,6 +697,69 @@ const gateLive = (side: "file" | "nats", machine?: string) => ({ side, key: `ses
   ...(machine ? { machine } : {}) });
 
 describe.skipIf(!linux)("bridge publish: the seat's one allow-list entry, a link restart, and the read-backs", () => {
+  it("passes when the real seat route becomes live at +659 s, before its 660 s cap", async () => {
+    const w = await world();
+    setKube(w, MANAGED, { line: identityLine(w) });
+    let t = 0;
+    const result = await run(w, "publish", { owner }, { now: () => t, sleep: async ms => {
+      t += ms;
+      if (t === 659_000) { w.gate = gateLive("nats", MACHINE); w.receipt = routable(); }
+    } });
+    expect(result.receipt).toMatchObject({ result: "pass" });
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ result: "pass", elapsedMs: 659_000,
+      measured: { gate: { status: "live", side: "nats" }, receipt: { verdict: "routable" } } });
+    expect(t).toBe(659_000);
+  });
+
+  it("refuses publish when the seat route would appear only after its 660 s cap", async () => {
+    const w = await world();
+    setKube(w, MANAGED, { line: identityLine(w) });
+    let t = 0;
+    const availableAt = 701_000;
+    const result = await run(w, "publish", { owner }, { now: () => t, sleep: async ms => {
+      t += ms;
+      if (t >= availableAt) { w.gate = gateLive("nats", MACHINE); w.receipt = routable(); }
+    } });
+    expect(result.receipt).toMatchObject({ result: "refused" });
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ result: "refused", reason: "seat-not-routable",
+      elapsedMs: 660_000, measured: { gate: null, receipt: {} } });
+    expect(t).toBe(660_000);
+    expect(t).toBeLessThan(availableAt);
+  });
+
+  it("waits beyond 120 s for another publish route to recover", async () => {
+    const w = await world();
+    setKube(w, MANAGED, { line: identityLine(w) });
+    w.gate = gateLive("nats", MACHINE);
+    w.receipt = routable();
+    w.statusAfter = { ok: true, problems: [], allow: { file: [{ identity: LEAD, live: false },
+      { identity: `session:${SID}`, live: true }], nats: [] } };
+    let t = 0;
+    const result = await run(w, "publish", { owner }, { now: () => t, sleep: async ms => {
+      t += ms;
+      if (t === 121_000) w.statusAfter!.allow.file[0]!.live = true;
+    } });
+    expect(result.receipt).toMatchObject({ result: "pass" });
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ result: "pass", elapsedMs: 121_000,
+      measured: { otherRoutes: { checked: [LEAD], down: [] } } });
+    expect(t).toBe(121_000);
+  });
+
+  it("shares the phase deadline when the seat route consumes most of it", async () => {
+    const w = await world();
+    setKube(w, MANAGED, { line: identityLine(w) });
+    w.statusAfter = { ok: true, problems: [], allow: { file: [{ identity: LEAD, live: false },
+      { identity: `session:${SID}`, live: true }], nats: [] } };
+    let t = 0;
+    const result = await run(w, "publish", { owner }, { deadlineMs: 500_000, now: () => t, sleep: async ms => {
+      t += ms;
+      if (t === 470_000) { w.gate = gateLive("nats", MACHINE); w.receipt = routable(); }
+    } });
+    expect(result.receipt).toMatchObject({ result: "refused" });
+    expect(evidenceOf(w, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ result: "refused", reason: "other-routes-down",
+      elapsedMs: 500_000, measured: { otherRoutes: { checked: [LEAD], down: [LEAD] }, gate: { status: "live" }, receipt: { verdict: "routable" } } });
+    expect(t).toBe(500_000);
+  });
   it("moves the seat's entry, restarts the pinned unit, and passes on the proof chain (incarnation = the managed Pod UID)", async () => {
     const w = await world();
     setKube(w, MANAGED, { line: identityLine(w) });
@@ -756,17 +855,24 @@ describe.skipIf(!linux)("bridge publish: the seat's one allow-list entry, a link
     stuck.gate = gateLive("nats", MACHINE);
     stuck.receipt = routable();
     stuck.holderStuck = true;
-    expect((await run(stuck, "publish", { owner })).receipt).toMatchObject({ result: "refused" });
-    expect(evidenceOf(stuck, "fabric-v2-bridge-publish-outcome.json").reason).toBe("link-not-reloaded");
+    let reloadTime = 0;
+    expect((await run(stuck, "publish", { owner }, { now: () => reloadTime, sleep: async ms => { reloadTime += ms; } }))
+      .receipt).toMatchObject({ result: "refused" });
+    expect(evidenceOf(stuck, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ reason: "link-not-reloaded",
+      measured: { reload: { waitedMs: 120_000 } } });
+    expect(reloadTime).toBe(120_000);
     const down = await world();
     setKube(down, MANAGED, { line: identityLine(down) });
     down.gate = gateLive("nats", MACHINE);
     down.receipt = routable();
     // Live before the restart; after it, the other seat's route stays down.
     down.statusAfter = { ok: true, problems: [], allow: { file: [{ identity: LEAD, live: false }], nats: [{ identity: `session:${SID}`, live: true }] } };
-    expect((await run(down, "publish", { owner })).receipt).toMatchObject({ result: "refused" });
-    expect(evidenceOf(down, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ reason: "other-routes-down",
+    let t = 0;
+    expect((await run(down, "publish", { owner }, { now: () => t, sleep: async ms => { t += ms; } }))
+      .receipt).toMatchObject({ result: "refused" });
+    expect(evidenceOf(down, "fabric-v2-bridge-publish-outcome.json")).toMatchObject({ reason: "other-routes-down", elapsedMs: 480_000,
       measured: { otherRoutes: { checked: [LEAD], down: [LEAD] } } });
+    expect(t).toBe(480_000);
   });
 });
 
@@ -861,6 +967,103 @@ describe.skipIf(!linux)("bridge rc-restore-route: the reverse write, and the rel
     w.roots = [{ id: `session:${SID}`, machine: "hub-a-bridge", live: true, ownerIncarnation: V1_INCARNATION }];
     return w;
   };
+
+  it("passes rc-restore-route when its file-side seat row appears at +640 s", async () => {
+    const w = await published();
+    w.gate = null;
+    w.receipt = {};
+    let t = 0;
+    const result = await run(w, "rc-restore-route", writer(w), { now: () => t, sleep: async ms => {
+      t += ms;
+      if (t === 640_000) {
+        w.gate = gateLive("file");
+        w.receipt = { ok: true, verdict: "routable", side: "file", file: { remoteHost: null, live: true, ownerIncarnation: V1_INCARNATION },
+          nats: { read: true, records: [{ machine: "hub-a-bridge", live: true, ownerIncarnation: V1_INCARNATION }] } };
+      }
+    } });
+    expect(result.receipt).toMatchObject({ result: "pass" });
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "pass", elapsedMs: 640_000,
+      measured: { gate: { status: "live", side: "file" }, receipt: { verdict: "routable", side: "file" } } });
+    expect(t).toBe(640_000);
+  });
+
+  it("refuses rc-restore-route when the file-side route would appear only after its 660 s cap", async () => {
+    const w = await published();
+    w.gate = null;
+    w.receipt = {};
+    let t = 0;
+    const result = await run(w, "rc-restore-route", writer(w), { now: () => t, sleep: async ms => {
+      t += ms;
+      if (t >= 700_000) {
+        w.gate = gateLive("file");
+        w.receipt = { ok: true, verdict: "routable", side: "file", file: { remoteHost: null, live: true, ownerIncarnation: V1_INCARNATION },
+          nats: { read: true, records: [{ machine: "hub-a-bridge", live: true, ownerIncarnation: V1_INCARNATION }] } };
+      }
+    } });
+    expect(result.receipt).toMatchObject({ result: "refused" });
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "refused", reason: "v1-not-routable",
+      elapsedMs: 660_000, measured: { gate: null, receipt: {} } });
+    expect(t).toBe(660_000);
+  });
+
+  it("does not restart rollback's phase deadline after delayed other-route recovery", async () => {
+    const w = await published();
+    w.gate = null;
+    w.receipt = {};
+    let t = 0;
+    let statusCalls = 0;
+    let otherRecovered = false;
+    const result = await run(w, "rc-restore-route", writer(w), { now: () => t, sleep: async ms => {
+      t += ms;
+      if (t === 300_000) otherRecovered = true;
+    }, status: async () => {
+      statusCalls += 1;
+      if (statusCalls === 1) return structuredClone(w.status);
+      const value = structuredClone(w.statusAfter!);
+      value.allow.file[0]!.live = otherRecovered;
+      return value;
+    } });
+    expect(result.receipt).toMatchObject({ result: "refused" });
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "refused", reason: "v1-not-routable",
+      elapsedMs: 840_000, measured: { otherRoutes: { checked: [LEAD], down: [] }, gate: null, receipt: {} } });
+    expect(t).toBe(840_000);
+  });
+
+  it("waits beyond 120 s for another route to recover during rollback", async () => {
+    const w = await published();
+    let t = 0;
+    let statusCalls = 0;
+    let recovered = false;
+    const result = await run(w, "rc-restore-route", writer(w), { now: () => t, sleep: async ms => {
+      t += ms;
+      if (t === 121_000) recovered = true;
+    }, status: async () => {
+      statusCalls += 1;
+      const value = structuredClone(w.statusAfter!);
+      value.allow.file[0]!.live = statusCalls < 3 || recovered;
+      return value;
+    } });
+    expect(result.receipt).toMatchObject({ result: "pass" });
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "pass", elapsedMs: 121_000,
+      measured: { otherRoutes: { checked: [LEAD], down: [] } } });
+    expect(t).toBe(121_000);
+  });
+
+  it("limits rollback's other-route recovery to 480 s", async () => {
+    const w = await published();
+    let t = 0;
+    let statusCalls = 0;
+    const result = await run(w, "rc-restore-route", writer(w), { now: () => t, sleep: async ms => { t += ms; }, status: async () => {
+      statusCalls += 1;
+      const value = structuredClone(w.statusAfter!);
+      value.allow.file[0]!.live = statusCalls < 3;
+      return value;
+    } });
+    expect(result.receipt).toMatchObject({ result: "refused" });
+    expect(evidenceOf(w, "fabric-v2-bridge-rc-restore-route-outcome.json")).toMatchObject({ result: "refused", reason: "other-routes-down",
+      elapsedMs: 480_000, measured: { otherRoutes: { checked: [LEAD], down: [LEAD] } } });
+    expect(t).toBe(480_000);
+  });
 
   it("puts the seat's file entry back exactly, restarts the link, and passes on the live v1 writer", async () => {
     const w = await published();

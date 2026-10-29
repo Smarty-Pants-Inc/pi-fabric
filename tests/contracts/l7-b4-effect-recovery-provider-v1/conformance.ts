@@ -252,7 +252,13 @@ export function runConformance(provider: ConformanceFactory): void {
       const wrong = { ...acceptedInput, admissionId: `${acceptedInput.admissionId}:wrong` };
       await expect(h.provider.repairMaintenance!(wrong, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
       expect(await h.ledgerDigest()).toBe(before);
-      // The refusal must not poison the valid occurrence or manufacture a receipt.
+      // Consistency alone is insufficient: this pair names no retained B5 admission of this original.
+      await expect(h.provider.repairMaintenance!({ ...wrong, deliveryId: wrong.admissionId }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
+      expect(await h.ledgerDigest()).toBe(before);
+      // The correct admission with a wrong delivery must also refuse (the converse inconsistent pair).
+      await expect(h.provider.repairMaintenance!({ ...acceptedInput, deliveryId: wrong.admissionId }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
+      expect(await h.ledgerDigest()).toBe(before);
+      // The refusals must not poison the valid occurrence or manufacture a receipt.
       const ref = await repair(h);
       expect(h.provider.resolveRepair!(ref).originalInputId).toBe(acceptedInput.originalInputId);
     });

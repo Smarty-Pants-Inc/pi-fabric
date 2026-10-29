@@ -25,8 +25,12 @@ bunx --no-install vitest run tests/contracts/l7-b4-effect-recovery-provider-v1/c
 runs the same 34 cases with resolver messages that omit the error code.
 `identities.test.ts` runs the same 34 cases with distinct non-default identities.
 C13 forces a sink await; C35 reads the adapter-original path with no timestamp.
-C36 refuses the right original with a wrong admissionId (`RECOVERY_CONFLICT`),
-checks no retained-state change, then checks that the valid input still repairs.
+C36 binds the admission to the host's retained B5 admission record of that
+original, keyed by `(originalInputId, admissionId)`. It refuses an inconsistent
+pair, a consistent wrong pair (`admissionId = deliveryId = W` not retained for
+that original), and the right admission with a wrong delivery, each with
+`RECOVERY_CONFLICT` and no retained-state change; the valid input still repairs.
+Pair consistency alone is not admission authentication.
 
 The default runs both. Real-provider failures remain ordinary failing tests,
 not skips or expected failures. The selected integration head does not yet
@@ -157,6 +161,11 @@ unchanged provider ABI `V1`:
   `5999e635b3554acd9d9b5843eb66479d4479db198384c53479501a98819e91fe`.
 - v6: N1/N2/N4/N5, contract SHA-256
   `7f0dad114164261e28f44b58fe9425d48d7ce6f49f380c49d8aa758b7419ba9a`.
+- v7: C1 retained admission binding in C36 only, contract SHA-256
+  `0a90d30a6ed6e54f4691e8e57cd8e8480d4b055179258632d9f55db9aa2b28a9`.
+  Round-6 `RESULT.md` records fake, prior mutants (including judge A1 under all
+  four identity setups), and per-case real-B5 evidence on a scratch merge onto
+  `dc1808ddb03fcf3fdfaf7d6059389e509efe6cd5`; no production changes or G2 claim.
 
 The round-2 `PHASE1.md` (v2) and `RESULT.md` (v3), round-4 `RESULT.md` (v5),
 and round-5 `RESULT.md` (v6) record commit/hash and per-test evidence. CoS owns

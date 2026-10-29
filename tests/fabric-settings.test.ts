@@ -1001,7 +1001,7 @@ describe("FabricSettingsComponent", () => {
     } finally { vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it("persists terminal event byte cap and age through the real settings dialog and reload", async () => {
+  it("marks terminal event settings inactive while preserving compatibility through the real dialog and reload", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-settings-retention-"));
     const cwd = path.join(root, "project"); const agentDir = path.join(root, "agent");
     fs.mkdirSync(cwd, { recursive: true });
@@ -1025,7 +1025,9 @@ describe("FabricSettingsComponent", () => {
           const list = rootList.submenuComponent.settingsList;
           for (const [id, value] of [["terminalRunEventsMaxBytes", 128 * 1024], ["terminalRunEventsAgeMs", 6 * 3_600_000]]) {
             list.selectedIndex = list.items.findIndex((item: { id: string }) => item.id === `retention.${id}`);
+            expect(list.items[list.selectedIndex].description).toMatch(/Inactive compatibility setting/);
             list.activateItem();
+            expect(list.submenuComponent.render(120).join("\n")).toContain("Inactive;");
             list.submenuComponent.selectList.onSelect({ value: String(value), label: String(value) });
           }
         }) },

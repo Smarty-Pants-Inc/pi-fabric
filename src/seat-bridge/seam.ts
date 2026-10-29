@@ -38,7 +38,8 @@ import { awaitRoutable, LINK_UNIT, natsRecords, otherRoutesBack, reloadLink, rou
 const OWNER = "fabric-v2";
 const PHASES = new Set(["resume", "publish", "rc-restore-route"]);
 const MAX_REQUEST = 64 * 1024;
-const DEADLINE_MS = 600_000;
+const DEADLINE_MS = 780_000;
+const SEAT_ROUTE_WAIT_MS = 300_000;
 const HEX64 = /^[0-9a-f]{64}$/;
 const HEX32 = /^[0-9a-f]{32}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -283,7 +284,7 @@ const finalSealOf = (context: Context, requested: unknown):
  * ONLY a missing-append wait after a readable identity, not a retry of unavailable identity or NATS startup.
  * Give that existing wait the 600 s startup allowance, sharing the phase's original deadline, never adding to it.
  */
-const APPEND_WAIT_MS = DEADLINE_MS;
+const APPEND_WAIT_MS = 600_000;
 const APPEND_POLL_MS = 2_000;
 // podIdentity's two API reads, executable check and identity exec; leave time to record the last coherent read.
 const APPEND_READ_MS = 30_000 + 30_000 + 120_000 + 30_000;
@@ -514,7 +515,7 @@ const publish = async (context: Context): Promise<number> => {
   }
   if (!reason) {
     const incarnation = read.identity!.ownerIncarnation!;
-    routed = await awaitRoutable(post!.config, sessionId, context.deps, clock(context, 120_000), (gate, value) =>
+    routed = await awaitRoutable(post!.config, sessionId, context.deps, clock(context, SEAT_ROUTE_WAIT_MS), (gate, value) =>
       routeHolds(gate, value, { side: "nats", fileRemoteHost: post!.config.link, natsMachine: machine, incarnation }));
     if (!routed.ok) reason = routed.gate !== null && routed.gate.status !== "live" ? "seat-route-refused-by-gate" : "seat-not-routable";
   }
@@ -648,7 +649,7 @@ const restoreRoute = async (context: Context): Promise<number> => {
     entry.id === `session:${sessionId}`);
   if (!reason) {
     const incarnation = v1!.session.ownerIncarnation!;
-    routed = await awaitRoutable(post.config, sessionId, context.deps, clock(context, 120_000), (gate, value) => {
+    routed = await awaitRoutable(post.config, sessionId, context.deps, clock(context, SEAT_ROUTE_WAIT_MS), (gate, value) => {
       // Listed on allow.file: the gate must resolve it live, and the link mirror v1 into NATS under its own machine.
       if (listed) return routeHolds(gate, value, { side: "file", fileRemoteHost: null, natsMachine: post.config.nats.machine, incarnation });
       const file = object(value.file) ? value.file : undefined;

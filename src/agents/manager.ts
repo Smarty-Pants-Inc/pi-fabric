@@ -124,7 +124,7 @@ import { readFinalAnswerReceipt, type FinalAnswerReceipt } from "../worker/termi
 import { FabricTargetTerminalError, type AgentTerminalNotice, type AgentUndeliveredMessage } from "./terminal-target.js";
 import { TerminalNoticeOutbox, readTerminalAdmission, terminalControlRefusalProven, terminalSenderMatches } from "./terminal-notices.js";
 import type { AgentRunRouteMetadata } from "./types.js";
-import { WorktreeManager, retainCleanupRoot, type AgentWorktreeResult, type CleanupRootCustody, type CleanupCustodyDeferredStatus } from "./worktree-manager.js";
+import { WorktreeManager, retainCleanupRoot, prepareCleanupContainers, type PreparedCleanupContainers, type AgentWorktreeResult, type CleanupRootCustody, type CleanupCustodyDeferredStatus } from "./worktree-manager.js";
 import { writeForkSession, writeHandoffSession } from "./handoff.js";
 import {
   AgentWriteRootOverlapError,
@@ -5031,7 +5031,7 @@ export class AgentManager {
   }
 
   /** Retain the whole run and its owned, recorded private TMPDIR without deleting either. */
-  async #removeRunTree(runDirectory: string, id: string, known?: string): Promise<void> {
+  async #removeRunTree(runDirectory: string, id: string, known?: string, batch?: PreparedCleanupContainers): Promise<void> {
     let custody = this.#cleanupRunCustody.get(runDirectory);
     if (!custody) {
       custody = { temporary: recordedShortTmpdir(runDirectory, id, known), runRetained: false, temporaryRetained: false };
@@ -5040,7 +5040,7 @@ export class AgentManager {
     const archive = `${this.#runRoot}.trace-archive`;
     if (!custody.runRetained) {
       try {
-        const moved = retainCleanupRoot(runDirectory, archive, id, "agent cleanup run directory");
+        const moved = retainCleanupRoot(runDirectory, archive, id, "agent cleanup run directory", batch);
         if (moved) custody.run = moved;
         custody.runRetained = true;
         if (custody.run && this.#cleanupDeferred.get(id)?.source === runDirectory) this.#cleanupDeferred.delete(id);
@@ -5059,7 +5059,7 @@ export class AgentManager {
     if (!custody.temporaryRetained) {
       try {
         if (custody.temporary && ownedShortTmpdir(custody.temporary)) {
-          const moved = retainCleanupRoot(custody.temporary, archive, id, "agent cleanup private TMPDIR");
+          const moved = retainCleanupRoot(custody.temporary, archive, id, "agent cleanup private TMPDIR", batch);
           if (moved) custody.temporaryRoot = moved;
           if (custody.temporaryRoot && this.#cleanupDeferred.get(id)?.source === custody.temporary) this.#cleanupDeferred.delete(id);
         }
@@ -6053,21 +6053,45 @@ export class AgentManager {
         managed.lostContact || runTreeResourceVeto(this.#ownedRunDirectory(managed), 0, undefined, true)) ||
       [...this.#queued.values()].some((queued) => queued.cleanupPending) ||
       runRootHasExitVeto(this.#runRoot, new Set([...this.#queued.values()].filter(queued => queued.terminal && !queued.cleanupPending).map(queued => queued.info.id)));
+    // Prepare only empty Windows containers, sharing ONE security subprocess
+    // across both close collection phases. Every ordinary collection gate below
+    // remains authoritative; an unused container grants no source custody.
+    const collectible = !this.config.retainRuns && !this.#parentOwnedRunRoot
+      ? all.filter(managed => !this.#cleanupFinalizationPending.has(managed.id) && this.#canCollect(managed)) : [];
+    let cleanupBatch: PreparedCleanupContainers | undefined;
+    if (process.platform === "win32" && !this.config.retainRuns && !this.#parentOwnedRunRoot) {
+      const archive = `${this.#runRoot}.trace-archive`;
+      const requests = (runDirectory: string, id: string, known?: string): Array<{ source: string; archive: string }> => {
+        const custody = this.#cleanupRunCustody.get(runDirectory);
+        const temporary = custody ? custody.temporary : recordedShortTmpdir(runDirectory, id, known);
+        return [
+          ...(!custody?.runRetained ? [{ source: runDirectory, archive }] : []),
+          ...(!custody?.temporaryRetained && temporary && ownedShortTmpdir(temporary) ? [{ source: temporary, archive }] : []),
+        ];
+      };
+      cleanupBatch = prepareCleanupContainers([
+        ...collectible.filter(managed => !managed.settledResultFile || this.#exactResultPresent(managed))
+          .flatMap(managed => requests(managed.runDirectory, managed.id, managed.temporaryDirectory)),
+        ...[...this.#queued.values()]
+          .filter(queued => queued.terminal && !queued.routeSaveFailure && !queued.cleanupPending &&
+            !runTreeExitVeto(path.join(this.#runRoot, queued.info.id)))
+          .flatMap(queued => requests(path.join(this.#runRoot, queued.info.id), queued.info.id)),
+      ]);
+    }
     // An unrelated retained tree fences shared budget/root deletion, not an
     // independently joined tracked run with its full outcome durably archived.
     // Nested run artifacts belong to the enclosing run (upstream lineage): its
     // owner removes them on cleanup/retention/root shutdown, not this child.
     if (!this.config.retainRuns && !this.#parentOwnedRunRoot) {
-      await Promise.all(all.filter(managed => !this.#cleanupFinalizationPending.has(managed.id) && this.#canCollect(managed))
-        .map(async (managed) => {
-          // Every terminal outcome keeps its WHOLE original tree. Never rewrite
-          // failed/stopped/timed_out raw records into a task/status-only residue.
-          // Unexpected result loss keeps custody rather than authorizing archival.
-          if (managed.settledResultFile && !this.#exactResultPresent(managed)) return;
-          try { await this.#removeRunTree(managed.runDirectory, managed.id, managed.temporaryDirectory); } catch { return; } // A swallowed failure is no provenance.
-          // A no-op removal or remaining/dangling entry is not collection.
-          if (this.#cleanupRunCustody.get(managed.runDirectory)?.run && this.#exactResultPresent(managed)) managed.resultCollected = true;
-        }));
+      await Promise.all(collectible.map(async (managed) => {
+        // Every terminal outcome keeps its WHOLE original tree. Never rewrite
+        // failed/stopped/timed_out raw records into a task/status-only residue.
+        // Unexpected result loss keeps custody rather than authorizing archival.
+        if (managed.settledResultFile && !this.#exactResultPresent(managed)) return;
+        try { await this.#removeRunTree(managed.runDirectory, managed.id, managed.temporaryDirectory, cleanupBatch); } catch { return; } // A swallowed failure is no provenance.
+        // A no-op removal or remaining/dangling entry is not collection.
+        if (this.#cleanupRunCustody.get(managed.runDirectory)?.run && this.#exactResultPresent(managed)) managed.resultCollected = true;
+      }));
     }
     // A failed stop is not authority to delete a child's working files.
     if (detached.length === 0 && !alive.some(Boolean) && !unresolved) {
@@ -6086,7 +6110,7 @@ export class AgentManager {
           await Promise.all([...this.#queued.values()]
             .filter(queued => queued.terminal && !queued.routeSaveFailure && !queued.cleanupPending &&
               !runTreeExitVeto(path.join(this.#runRoot, queued.info.id)))
-            .map(queued => this.#removeRunTree(path.join(this.#runRoot, queued.info.id), queued.info.id).catch(() => undefined)));
+            .map(queued => this.#removeRunTree(path.join(this.#runRoot, queued.info.id), queued.info.id, undefined, cleanupBatch).catch(() => undefined)));
           // Independently collectible tracked runs were removed above. Retry only
           // the owned empty root; never recursively remove unknown contents.
           await removeManagedRunRoot(this.#runRoot, this.#managedTempRoot);

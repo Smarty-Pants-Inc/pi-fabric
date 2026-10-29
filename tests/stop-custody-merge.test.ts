@@ -59,12 +59,49 @@ const recordSecuritySubprocess = async (): Promise<void> => {
   if (hostPlatform !== "win32") vi.stubEnv("SystemRoot", "C:\\Windows");
   const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
   vi.mocked(execFileSync).mockImplementation(((file: string, args: string[], options: any) => {
-    const container = options?.env?.PI_FABRIC_CLEANUP_CONTAINER;
+    const env = options?.env;
+    const container = env?.PI_FABRIC_CLEANUP_CONTAINER;
     if (!container) return actual.execFileSync(file, args, options);
     expect(path.win32.basename(file)).toBe("powershell.exe");
-    expect(Buffer.from(args[4]!, "base64").toString("utf16le")).toContain("Get-Acl -LiteralPath $directory");
-    expect(fs.realpathSync(container)).toBe(container);
-    securityContainers.push(container);
+    const script = Buffer.from(args[4]!, "base64").toString("utf16le");
+    expect(script).toContain("Get-Acl -LiteralPath $directory");
+    expect(script).toContain("$item.PSIsContainer");
+    expect(script).toContain("[System.IO.FileAttributes]::ReparsePoint");
+    expect(script).toContain("$read.AreAccessRulesProtected");
+    expect(script).toContain("$read.GetOwner([System.Security.Principal.SecurityIdentifier]).Value");
+    expect(script).toContain("[Convert]::ToBase64String($a) -cne [Convert]::ToBase64String($e)");
+    let protectedPaths: unknown[];
+    if (env.PI_FABRIC_CLEANUP_BATCH === "1") {
+      const encoded = options?.input;
+      expect(typeof encoded).toBe("string");
+      if (typeof encoded !== "string") throw new Error("Cleanup batch stdin must be ASCII base64");
+      expect(encoded).toMatch(/^[A-Za-z0-9+/]+={0,2}$/);
+      const bytes = Buffer.from(encoded, "base64");
+      expect(bytes.toString("base64")).toBe(encoded);
+      const json = bytes.toString("utf8");
+      expect(Buffer.from(json, "utf8").equals(bytes)).toBe(true);
+      const decoded: unknown = JSON.parse(json);
+      expect(Array.isArray(decoded)).toBe(true);
+      if (!Array.isArray(decoded)) throw new Error("Cleanup batch stdin must decode to an array");
+      expect(decoded.length).toBeGreaterThan(1);
+      expect(decoded.every((entry: unknown) => typeof entry === "string")).toBe(true);
+      if (!decoded.every((entry: unknown) => typeof entry === "string")) {
+        throw new Error("Cleanup batch stdin must decode to a string array");
+      }
+      protectedPaths = decoded;
+      expect(protectedPaths[0]).toBe(container);
+    } else {
+      expect(env.PI_FABRIC_CLEANUP_BATCH).toBe("0");
+      expect(options?.input).toBeUndefined();
+      protectedPaths = [container];
+    }
+    for (const protectedPath of protectedPaths) {
+      expect(typeof protectedPath).toBe("string");
+      if (typeof protectedPath !== "string") throw new Error("Protected cleanup path must be a string");
+      expect(protectedPath.length).toBeGreaterThan(0);
+      expect(fs.realpathSync(protectedPath)).toBe(protectedPath);
+      securityContainers.push(protectedPath);
+    }
     return Buffer.alloc(0); // Recorded contract boundary; NEVER native DACL certification.
   }) as typeof execFileSync);
 };

@@ -55,25 +55,35 @@ completions, not arbitrary old temporary worker directories. It does not restart
 work, make session-scoped tasks survive graceful owner cancellation, or rotate
 Mains. A storage-write failure retains the worker status and reports a warning.
 
-## Compaction retry and mesh alarm
+## Native compaction recovery and best-effort mesh alarm
 
 Every Fabric-loaded Pi session, including a leaf task agent that has never called
-a Fabric tool, observes `session_compact_failed`. A genuine terminal failure
-schedules **one** public `ctx.compact` retry with the original custom instructions.
-It runs only after Pi is idle: native `compact` aborts active operations, so Fabric
-never awaits or dispatches the retry inside the emitting failure hook. Owner
-aborts, extension vetoes, and exact no-op outcomes do not retry or alarm. Shutdown
-and session replacement cancel deferred work.
+a Fabric tool, observes `session_compact_failed`. Native Pi owns two transient
+summary retries shared across the summaries and one coalesced fallback operation.
+Fabric does not call `ctx.compact`, schedule another compaction, or signal retry
+completion/idle. Pi's terminal session error is visible through its native path,
+independently of any Fabric event.
 
-A second failure emits a mesh event with topic and kind
-`fabric.session.compaction_failed`. Data includes `session`, `windowPercent`
-(nullable when unknown), `reason`, `error`, `firstError`, and `attempts: 2`.
-The producer identity identifies Main or task agent. Fabric initializes its mesh
-only on actual failure if not already active; registration/idle remain lazy.
+By default, `compaction.primaryTimeoutMs` is `300000` ms (5 minutes) and
+`compaction.fallbackTimeoutMs` is `240000` ms (4 minutes), for a nine-minute
+combined timeout budget. Both settings accept positive milliseconds.
+`compaction.fallbackModel` defaults to
+`cliproxyapi-anthropic/claude-opus-5-5`; `compaction.maxSummaryTokens` defaults to
+`8000`. A summary-token cap is not a latency guarantee or a promise of exact
+provider tokenization.
 
-Pi 0.87.1 exposes the necessary failure event and public retry API: no Pi-side
-change is required for this retry/alarm. The retry is a manual compaction, not a
-resumption of an interrupted automatic inference turn. Pi's internal transient
-summarization retry policy remains independent; Fabric retries one *terminal
-compaction operation*, not each provider stream error. Idle-window alarms and
-mechanical Main rotation are separate owner work, not implemented here.
+For a genuine non-benign terminal failure, Fabric attempts the best-effort mesh
+event with topic and kind `fabric.session.compaction_failed`. Its data is
+`{ session, windowPercent, reason, error, fabricAttempts: 0 }`; `windowPercent`
+is null when unavailable and `error` is a detached preview capped at 4000
+characters. There is no `firstError` or `attempts` field. The event may be absent
+when mesh/runtime/configuration is unavailable or publication fails; callback
+resolution is not a subscriber receipt or wake proof. This optional publication
+is separate from Pi's native terminal session error.
+
+Aborted events/signals, disabled handling, stale contexts, and known no-op
+outcomes (`Already compacted`, `Nothing to compact (session too small)`, and
+`Compaction cancelled`) are not reported. Repeated failures are deduplicated per
+session while the incident context remains live; a replacement context may
+report after the old one is invalidated. Successful `session_compact`, session
+start, and shutdown reset the incident latch.

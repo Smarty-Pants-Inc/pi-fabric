@@ -301,7 +301,10 @@ if (process.argv.includes('--descendant')) {
     {
       behavior: "exit-clean",
       check: (r) => {
-        expect(r.status).toBe("completed");
+        expect(r.status).toBe("failed");
+        expect(r.text).toBe("");
+        expect(r.errorCode).toBe("NO_FINAL_TEXT");
+        expect(r.error).toBe("Pi run ended without nonblank final assistant text");
       },
     },
     {

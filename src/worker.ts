@@ -55,7 +55,7 @@ import type { ActorContextReseed } from "./worker/context-admission.js";
 import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 import { syncPathNamespace } from "./core/atomic-write.js";
-import { finalAssistantText, readFinalAnswerReceipt, withTaskFinalAnswerLock, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
+import { assistantAnswerEvidence, finalAssistantText, readFinalAnswerReceipt, withTaskFinalAnswerLock, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
 import { terminalControls, markTerminalControlForwarded, readTerminalControl, settleTerminalControl, trackTerminalControl, type TerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
 import { senderHeaderHookPath } from "./guards/sender-headers.js";
@@ -908,10 +908,13 @@ const main = async (): Promise<void> => {
   let sawAgentError = false;
   let retryPending = false;
   let piSettledSuccessfully = false;
-  let piSettlementDurable = false;
+  let piSettlementObserved = false;
+  let piExitGraceCleanup = false;
+  let rejectedFinalAnswerReceipt = false;
   let hasFinalText = false;
-  let hasFinalResult = false;
-  let producedFinalAnswer = false;
+  let latestAssistantReplyToolCall = false;
+  let latestReplyToolSucceeded = false;
+  let lastCompactionError: string | undefined;
   let finalAnswerReceipt: FinalAnswerReceipt | undefined;
   let lastUsageMessageTimestamp: number | undefined;
   // smarty-dev#3238: the child's model window, from its own get_state, for an actor's contextUsage.
@@ -924,6 +927,23 @@ const main = async (): Promise<void> => {
   let hasCompletedToolTurn = false;
   let streamingToolCallInTurn = false;
   const unresolvedToolCalls = new Set<string>();
+  const answerTelemetry = (): Record<string, unknown> => ({
+    lastAssistantStopReason: record.lastAssistantStopReason,
+    lastAssistantBlockCounts: record.lastAssistantBlockCounts,
+    lastAssistantTextBytes: record.lastAssistantTextBytes,
+    settleOutcome: record.settleOutcome,
+  });
+  const resetAssistantAnswer = (): void => {
+    hasFinalText = false;
+    latestAssistantReplyToolCall = false;
+    latestReplyToolSucceeded = false;
+    delete record.lastAssistantStopReason;
+    delete record.lastAssistantBlockCounts;
+    delete record.lastAssistantTextBytes;
+  };
+  const hasEligibleFinalText = (): boolean => hasFinalText && !streamingToolCallInTurn && unresolvedToolCalls.size === 0;
+  // This only authorizes cleanup/validation, never successful publication.
+  const hasStructuredReplyCandidate = (): boolean => Boolean(replyFile && latestAssistantReplyToolCall);
   // smarty-dev#8758 item 2: what the child's write/edit/shell tools actually did, from Pi's own tool events.
   const writeReceipt = new WriteReceiptRecorder(options.cwd);
   // pi-fabric#1034 round 6 (Astra P1): an event line over MAX_EVENT_LINE_CHARS is dropped unread, so the recorder
@@ -1050,6 +1070,19 @@ const main = async (): Promise<void> => {
       record.finishingAt = finishingStartedAt;
       update();
     }
+    // Close is reached only after held follow-ups and correlated compaction.
+    // Persist no earlier: a later native turn can supersede earlier prose.
+    if (piSettledSuccessfully && record.settleOutcome === "completed" && modelControl.ready &&
+        !terminalStatus && !lostResult && !rejectedFinalAnswerReceipt &&
+        (hasEligibleFinalText() || (hasStructuredReplyCandidate() && latestReplyToolSucceeded && unresolvedToolCalls.size === 0))) {
+      try {
+        savePiSettlementReceipt(path.join(path.dirname(options.statusFile), "settlement.json"), options.id,
+          hasEligibleFinalText() ? record.text : "", hasStructuredReplyCandidate());
+      } catch (error) {
+        failStalledChild(`Cannot persist Pi settlement receipt: ${String(error)}`);
+        return;
+      }
+    }
     piControlLive = false;
     child.stdin?.end();
     recoveryWatchdog.suspend();
@@ -1063,12 +1096,12 @@ const main = async (): Promise<void> => {
         return;
       }
       const error = `${terminalError ?? "Child Pi settled"}; child did not exit after stdin closed for ${KILL_GRACE_MS}ms`;
-      // fabric_reply writes after assistant message_end; inspect the durable
-      // reply now too. Post-drain reply/schema validation remains authoritative.
-      hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
-      if (piSettledSuccessfully && (hasFinalResult || piSettlementDurable) && modelControl.ready && !terminalStatus &&
+      // EOF grace is cleanup, not answer proof. Even a no-answer settlement
+      // must drain before incomplete classification or provider recovery.
+      if ((piSettledSuccessfully || rejectedFinalAnswerReceipt) && modelControl.ready && !terminalStatus &&
           !terminalError && !sawAgentError && !lostResult) {
-        const warning = `${error}; preserving final result and terminating child`;
+        const warning = `${error}; ${hasEligibleFinalText() || hasStructuredReplyCandidate()
+          ? "preserving final result" : "deferring missing-answer classification until drain"} and terminating child`;
         record.warnings = [...(record.warnings ?? []), warning].slice(-WARNING_RETENTION_CAP);
         appendLog(`${JSON.stringify({ type: "worker_warning", warning })}\n`);
         process.stderr.write(`[pi-fabric] ${warning}\n`);
@@ -1077,7 +1110,7 @@ const main = async (): Promise<void> => {
         // reply/schema validation finishes; terminal records can be collected
         // immediately by the manager. Forced exit must not erase this result.
         update();
-        terminalStatus = "completed";
+        piExitGraceCleanup = true;
         killChild();
       } else {
         failStalledChild(error);
@@ -1637,6 +1670,10 @@ const main = async (): Promise<void> => {
   const validateCompletedResult = (): void => {
     if (record.status !== "completed") return;
     if (replyFile) {
+      // Re-read after drain too: an earlier value or file existence cannot
+      // bless a missing/malformed reply or unrelated unresolved tool work.
+      delete record.value;
+      delete record.replyVia;
       try {
         record.value = JSON.parse(fs.readFileSync(replyFile, "utf8")) as unknown;
         record.replyVia = "tool";
@@ -1656,6 +1693,21 @@ const main = async (): Promise<void> => {
         const output = record.text.trim();
         const snippet = detachedPreview(output, 200);
         record.error = `Structured agent output was invalid: ${reason}${snippet ? ` (output: ${snippet}${output.length > 200 ? "…" : ""})` : ""}`;
+      }
+    }
+    if (record.status === "completed" && isPi && !options.residentStartupProbe) {
+      const structuredFinal = record.replyVia === "tool" && hasStructuredReplyCandidate() && latestReplyToolSucceeded &&
+        !streamingToolCallInTurn && unresolvedToolCalls.size === 0;
+      if (rejectedFinalAnswerReceipt || (replyFile ? !structuredFinal : !hasEligibleFinalText())) {
+        const toolObligations = unresolvedToolCalls.size > 0 || streamingToolCallInTurn;
+        const code = toolObligations ? "UNRESOLVED_TOOL_CALLS"
+          : record.lastAssistantStopReason !== undefined && record.lastAssistantStopReason !== "stop"
+          ? "NON_FINAL_STOP_REASON" : "NO_FINAL_TEXT";
+        record.status = "failed";
+        record.errorCode ??= code;
+        record.error = code === "UNRESOLVED_TOOL_CALLS" ? "Pi run ended without a final answer: tool calls remain unresolved"
+          : code === "NON_FINAL_STOP_REASON" ? "Pi run ended without a final answer: the latest assistant stop reason is not final"
+          : "Pi run ended without nonblank final assistant text";
       }
     }
   };
@@ -1689,12 +1741,60 @@ const main = async (): Promise<void> => {
   const drainTerminalControlAcks = (receipt: FinalAnswerReceipt): void => {
     for (const control of terminalControls(path.dirname(options.statusFile))) refuseTerminalControl(control, receipt.id);
   };
-  const acceptFinalAnswer = (receipt: FinalAnswerReceipt): void => {
+  const acceptFinalAnswer = (receipt: FinalAnswerReceipt, drained = false): void => {
     if (finalAnswerReceipt || !persistentPiTask) return;
+    const evidence = receipt.assistant;
+    const nativeEvidence = evidence && (evidence.lastAssistantStopReason === undefined || typeof evidence.lastAssistantStopReason === "string") &&
+      evidence.lastAssistantBlockCounts && typeof evidence.lastAssistantBlockCounts === "object" &&
+      !Array.isArray(evidence.lastAssistantBlockCounts) && Object.values(evidence.lastAssistantBlockCounts).every(count => Number.isSafeInteger(count) && count >= 0) &&
+      Number.isSafeInteger(evidence.lastAssistantTextBytes) && evidence.lastAssistantTextBytes >= 0 &&
+      Number.isSafeInteger(evidence.unresolvedToolCalls) && evidence.unresolvedToolCalls >= 0;
+    const nativeTextFinal = nativeEvidence && receipt.text.trim().length > 0 && evidence.lastAssistantStopReason === "stop" &&
+      evidence.lastAssistantTextBytes === Buffer.byteLength(receipt.text, "utf8") &&
+      (evidence.lastAssistantBlockCounts.toolCall ?? 0) === 0 && evidence.unresolvedToolCalls === 0;
+    const nativeReplyFinal = nativeEvidence && receipt.structuredReply === true && replyFile && evidence.unresolvedToolCalls === 0;
+    // New receipts carry source-native evidence across both IPC/stdout ordering
+    // and lost IPC. Legacy receipts wait for owned stream drain; blank text is
+    // never a final answer merely because a durable file exists.
+    const legacyTextFinal = !evidence && drained && receipt.text.trim().length > 0 && hasEligibleFinalText() &&
+      record.lastAssistantTextBytes === Buffer.byteLength(receipt.text, "utf8");
+    const legacyReplyCandidate = !evidence && drained && hasStructuredReplyCandidate();
+    if (!nativeTextFinal && !nativeReplyFinal && !legacyTextFinal && !legacyReplyCandidate) {
+      rejectedFinalAnswerReceipt = true;
+      if (!drained) { closeChild(); return; }
+      hasFinalText = false;
+      if (nativeEvidence) {
+        record.lastAssistantStopReason = evidence.lastAssistantStopReason;
+        record.lastAssistantBlockCounts = evidence.lastAssistantBlockCounts;
+        record.lastAssistantTextBytes = evidence.lastAssistantTextBytes;
+        unresolvedToolCalls.clear();
+        if (evidence.unresolvedToolCalls > 0) unresolvedToolCalls.add("native-unresolved-tool-call");
+      }
+      // The durable receipt is still the ingress fence. Bind its FAILED
+      // post-drain validation to that same identity for the manager's exact join.
+      finalAnswerReceipt = receipt;
+      record.finalAnswerReceipt = { id: receipt.id, recordedAt: receipt.recordedAt };
+      emitLifecycle("pi.final_answer", { ...answerTelemetry(), eligible: false });
+      return;
+    }
+    if (nativeEvidence) {
+      record.lastAssistantStopReason = evidence.lastAssistantStopReason;
+      record.lastAssistantBlockCounts = evidence.lastAssistantBlockCounts;
+      record.lastAssistantTextBytes = evidence.lastAssistantTextBytes;
+      // These native facts are newer than potentially lagging stdout tool/error
+      // frames. Never reject a good final because that stream has not caught up.
+      unresolvedToolCalls.clear();
+      streamingToolCallInTurn = false;
+      hasFinalText = Boolean(nativeTextFinal);
+      latestAssistantReplyToolCall = Boolean(nativeReplyFinal);
+      latestReplyToolSucceeded = Boolean(nativeReplyFinal);
+      if (!terminalStatus) { sawAgentError = false; terminalError = undefined; retryPending = false; }
+    }
     finalAnswerReceipt = receipt;
+    rejectedFinalAnswerReceipt = false;
     piControlLive = false;
     nativeActivity = false;
-    producedFinalAnswer = true;
+    emitLifecycle("pi.final_answer", answerTelemetry());
     recoveryWatchdog.dispose();
     toolCallStreamGuard.dispose();
     record.text = receipt.text; // Full answer, not latestRunText's UI-sized tail.
@@ -1823,6 +1923,31 @@ const main = async (): Promise<void> => {
       }
       answerProjected = true;
       record.text = latestRunText(extractText(last));
+      // Merge with observed starts: a recovery projection may omit an attempt,
+      // but cannot discharge tool work without its matching end/result.
+      for (const message of messages.slice(start + 1)) {
+        if (!isMessage(message)) continue;
+        if (message.role === "toolResult") unresolvedToolCalls.delete(stringField(message.toolCallId) ?? "unknown-tool-call");
+        // Pi never executes calls from error/aborted assistant attempts, even
+        // when raw history retains their partial tool-call blocks.
+        if (message.role === "assistant" && message.stopReason !== "error" && message.stopReason !== "aborted" && Array.isArray(message.content)) {
+          for (const block of message.content) if (block?.type === "toolCall") unresolvedToolCalls.add(stringField(block.id) ?? "unknown-tool-call");
+        }
+      }
+      streamingToolCallInTurn = false;
+      const evidence = assistantAnswerEvidence(last, unresolvedToolCalls.size);
+      record.lastAssistantStopReason = evidence.lastAssistantStopReason;
+      record.lastAssistantBlockCounts = evidence.lastAssistantBlockCounts;
+      record.lastAssistantTextBytes = evidence.lastAssistantTextBytes;
+      hasFinalText = last.stopReason === "stop" && extractText(last).trim().length > 0 &&
+        (evidence.lastAssistantBlockCounts.toolCall ?? 0) === 0;
+      const replyIds = Array.isArray(last.content) ? last.content.filter(block =>
+        block?.type === "toolCall" && block.name === "fabric_reply").map(block => block.id) : [];
+      latestAssistantReplyToolCall = replyIds.length > 0;
+      latestReplyToolSucceeded = messages.slice(messages.lastIndexOf(last) + 1).some(message =>
+        isMessage(message) && message.role === "toolResult" && message.toolName === "fabric_reply" &&
+        message.isError !== true && replyIds.includes(message.toolCallId));
+      emitLifecycle("pi.assistant_end", answerTelemetry());
       record.turns = Math.max(record.turns, assistants.length);
       record.toolCalls = Math.max(record.toolCalls, messages.slice(start + 1).filter(
         message => isMessage(message) && message.role === "toolResult",
@@ -1951,8 +2076,7 @@ const main = async (): Promise<void> => {
         (event.message as Record<string, unknown> | undefined)?.role === "assistant") {
       delete record.partialText;
       streamingToolCallInTurn = false;
-      hasFinalText = false;
-      hasFinalResult = false;
+      resetAssistantAnswer();
       update(); // Keep lastCompleteText from the previous turn on disk.
     }
     if (event.type === "message_update" && !terminalStatus) {
@@ -2004,9 +2128,10 @@ const main = async (): Promise<void> => {
       });
       retryPending = false;
       piSettledSuccessfully = false;
-      piSettlementDurable = false;
-      hasFinalText = false;
-      hasFinalResult = false;
+      piSettlementObserved = false;
+      piExitGraceCleanup = false;
+      delete record.settleOutcome;
+      resetAssistantAnswer();
       // Starting a retry is not proof of acceptance: preserve the error and timer
       // until the provider starts a new assistant response.
       return;
@@ -2060,6 +2185,7 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "tool_execution_end") {
+      if (event.toolName === "fabric_reply" && latestAssistantReplyToolCall) latestReplyToolSucceeded = event.isError !== true;
       if (writeReceipt.end(event)) record.writeReceipt = receiptNow();
       unresolvedToolCalls.delete(stringField(event.toolCallId) ?? "unknown-tool-call");
       completedToolInTurn = true;
@@ -2102,17 +2228,25 @@ const main = async (): Promise<void> => {
       const message = event.message;
       if (typeof message !== "object" || message === null || Array.isArray(message)) return;
       const messageRecord = message as Record<string, unknown>;
+      if (messageRecord.role === "toolResult") {
+        if (messageRecord.toolName === "fabric_reply" && latestAssistantReplyToolCall) latestReplyToolSucceeded = messageRecord.isError !== true;
+        unresolvedToolCalls.delete(stringField(messageRecord.toolCallId) ?? "unknown-tool-call");
+        return;
+      }
       if (messageRecord.role !== "assistant") return;
       lostResult = undefined;
       const toolCalls = Array.isArray(messageRecord.content)
         ? messageRecord.content.filter((block): block is Record<string, unknown> =>
           typeof block === "object" && block !== null && block.type === "toolCall") : [];
-      for (const call of toolCalls) unresolvedToolCalls.add(stringField(call.id) ?? "unknown-tool-call");
-      if (toolCalls.length > 0 && messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted") {
-        // The complete message identifies every generated call; pending IDs now
-        // carry the obligation until matching tool_execution_end frames arrive.
-        streamingToolCallInTurn = false;
+      if (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted") {
+        // Pi skips tool execution entirely for error/aborted assistants. Their
+        // partial calls are not obligations; retain any prior real tool starts.
+        for (const call of toolCalls) unresolvedToolCalls.add(stringField(call.id) ?? "unknown-tool-call");
       }
+      // The complete message replaces stream-only hints, even for failed
+      // attempts or final text without calls. Executable calls and observed
+      // starts remain pending until matching tool_execution_end/result frames.
+      streamingToolCallInTurn = false;
       const text = extractText(messageRecord);
       if (text || (messageRecord.stopReason !== "error" && messageRecord.stopReason !== "aborted")) {
         record.inferenceStarted = true;
@@ -2126,8 +2260,14 @@ const main = async (): Promise<void> => {
         piContextOverflow(messageRecord, childContextWindow ?? 0));
       if (options.actorId) contextOverflowSignal = overflowTurn;
       const failedTurn = messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted" || overflowTurn;
-      hasFinalText = Boolean(text) && !failedTurn && messageRecord.stopReason !== "toolUse";
-      producedFinalAnswer ||= hasFinalText;
+      const evidence = assistantAnswerEvidence(messageRecord, unresolvedToolCalls.size);
+      record.lastAssistantStopReason = evidence.lastAssistantStopReason;
+      record.lastAssistantBlockCounts = evidence.lastAssistantBlockCounts;
+      record.lastAssistantTextBytes = evidence.lastAssistantTextBytes;
+      hasFinalText = text.trim().length > 0 && !failedTurn && messageRecord.stopReason === "stop" && toolCalls.length === 0;
+      latestAssistantReplyToolCall = !failedTurn && Boolean(replyFile && toolCalls.some(call => call.name === "fabric_reply"));
+      latestReplyToolSucceeded = false;
+      emitLifecycle("pi.assistant_end", answerTelemetry());
       if (text || messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") {
         answerProjected = true;
       }
@@ -2183,15 +2323,25 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "agent_end") {
-      emitLifecycle("pi.agent_end", { willRetry: event.willRetry === true });
+      emitLifecycle("pi.agent_end", { willRetry: event.willRetry === true, ...answerTelemetry() });
       retryPending = event.willRetry === true;
       if (retryPending && !terminalStatus) recoveryWatchdog.arm(terminalError ?? "Pi announced a retry but did not resume");
       return;
     }
     if (event.type === "agent_settled") {
       nativeActivity = false;
-      emitLifecycle("pi.agent_settled");
+      piSettlementObserved = true;
+      record.settleOutcome = typeof event.outcome === "string" ? event.outcome : undefined;
+      emitLifecycle("pi.agent_settled", answerTelemetry());
       if (!retryPending) {
+        // Settlement ends automatic work, not necessarily successfully: native
+        // compaction failures/aborts need not emit an assistant error message.
+        // Omitted legacy outcomes retain strict final-result validation.
+        piSettledSuccessfully = (event.outcome === undefined || event.outcome === "completed") && !sawAgentError && !terminalError;
+        providerAborted ||= event.outcome === "aborted";
+        if (!piSettledSuccessfully && !terminalStatus) {
+          terminalError ??= lastCompactionError ?? `Pi settled unsuccessfully${record.settleOutcome ? ` (${record.settleOutcome})` : ""}`;
+        }
         if (options.runner === "pi-durable" && !answerProjected && !terminalStatus) {
           if (!recordedResultPending) {
             recordedResultPending = true;
@@ -2202,23 +2352,6 @@ const main = async (): Promise<void> => {
           }
           return;
         }
-        // Settlement ends automatic work, not necessarily successfully: native
-        // compaction failures/aborts need not emit an assistant error message.
-        // Older Pi frames omit outcome; retain their existing result checks.
-        piSettledSuccessfully = event.outcome !== "error" && event.outcome !== "aborted" && !sawAgentError && !terminalError;
-        providerAborted ||= event.outcome === "aborted";
-        piSettlementDurable = false;
-        if (piSettledSuccessfully && event.outcome === "completed" && modelControl.ready && !terminalStatus && !lostResult) {
-          try {
-            savePiSettlementReceipt(path.join(path.dirname(options.statusFile), "settlement.json"), options.id, record.text);
-            piSettlementDurable = true;
-          } catch (error) {
-            failStalledChild(`Cannot persist Pi settlement receipt: ${String(error)}`);
-            return;
-          }
-        }
-        // Tool-only assistant events precede the tool's durable reply write.
-        hasFinalResult = Boolean(hasFinalText || (replyFile && fs.existsSync(replyFile)));
         // Pull controls that landed with the final stream events before deciding
         // whether this one-shot child can close. A queued compact keeps stdin
         // open until its correlated response and compaction_end are observed.
@@ -2233,6 +2366,10 @@ const main = async (): Promise<void> => {
       return;
     }
     if (event.type === "compaction_end") {
+      if (event.willRetry !== true) {
+        lastCompactionError = typeof event.errorMessage === "string" && event.errorMessage
+          ? event.errorMessage : event.aborted === true ? "Pi compaction was aborted" : undefined;
+      }
       emitLifecycle("pi.session_compact", {
         ...(typeof event.reason === "string" ? { reason: event.reason } : {}),
         ...(typeof event.willRetry === "boolean" ? { willRetry: event.willRetry } : {}),
@@ -2546,7 +2683,12 @@ const main = async (): Promise<void> => {
     retryPending = false;
     terminalError = undefined;
     piSettledSuccessfully = false;
-    piSettlementDurable = false;
+    piSettlementObserved = false;
+    piExitGraceCleanup = false;
+    rejectedFinalAnswerReceipt = false;
+    lastCompactionError = undefined;
+    delete record.settleOutcome;
+    resetAssistantAnswer();
     stderr = "";
     activationWindowReady = false;
     outputDecoder = new StringDecoder("utf8");
@@ -2616,9 +2758,9 @@ const main = async (): Promise<void> => {
       outputBuffer = "";
       recordStderr(stderrDecoder.end());
       toolCallStreamGuard.clear();
-      if (persistentPiTask && piRetrySdk && !finalAnswerReceipt) {
+      if (persistentPiTask && !finalAnswerReceipt) {
         const receipt = readFinalAnswerReceipt(path.dirname(options.statusFile), options.id);
-        if (receipt) acceptFinalAnswer(receipt); // Native died after fsync but before frame delivery.
+        if (receipt) acceptFinalAnswer(receipt, true); // Native died after fsync but before frame delivery.
       }
       if (closeTimer) clearTimeout(closeTimer);
       closeTimer = undefined;
@@ -2673,8 +2815,8 @@ const main = async (): Promise<void> => {
       // Reporting retained output must not invoke another model to regenerate
       // the final answer or replay any already-completed tool work (#7567).
       if (canKeepInterruptedOutput(terminalError ?? stderr.trim())) break;
-      if (!persistentPiTask || terminalStatus || providerAborted || producedFinalAnswer ||
-          (replyFile && fs.existsSync(replyFile)) || lostResult || !modelControl.ready ||
+      if (!persistentPiTask || terminalStatus || providerAborted || hasEligibleFinalText() ||
+          (hasStructuredReplyCandidate() && unresolvedToolCalls.size === 0) || rejectedFinalAnswerReceipt || lostResult || !modelControl.ready ||
           record.compaction?.status === "queued" || record.compaction?.status === "in_flight" ||
           !piSessionFile || !fs.existsSync(piSessionFile)) break;
       const errorMessage = terminalError ?? stderr.trim();
@@ -2837,9 +2979,9 @@ const main = async (): Promise<void> => {
   record.finishedAt = Date.now();
   record.updatedAt = record.finishedAt;
   const childCompleted =
-    exitCode === 0 &&
-    !sawAgentError &&
-    (isPi ||
+    (exitCode === 0 || (isPi && (piExitGraceCleanup || rejectedFinalAnswerReceipt))) &&
+    !sawAgentError && !terminalError &&
+    ((isPi && (!piSettlementObserved || piSettledSuccessfully)) ||
       (options.runner === "claude" &&
         claudeResultSeen &&
         claudeSentInputs.length === 0 &&

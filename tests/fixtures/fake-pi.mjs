@@ -23,7 +23,7 @@ const capturePrompt = () => {
     if (process.env.FAKE_PI_PROMPT_LOG) {
       fs.writeFileSync(process.env.FAKE_PI_PROMPT_LOG, JSON.stringify(frame));
     }
-    emit({ type: "message_end", message: { role: "assistant", content: "captured prompt" } });
+    emit({ type: "message_end", message: { role: "assistant", content: "captured prompt", stopReason: "stop" } });
     emit({ type: "agent_settled" });
     process.exit(0);
   });
@@ -45,7 +45,7 @@ const runCompactionLifecycle = (fail) => {
       const frame = JSON.parse(raw);
       if (frame.type === "prompt") {
         emit({ type: "agent_start" });
-        emit({ type: "message_end", message: { role: "assistant", content: "ready" } });
+        emit({ type: "message_end", message: { role: "assistant", content: "ready", stopReason: "stop" } });
         setTimeout(() => {
           settled = true;
           emit({ type: "agent_settled" });
@@ -242,7 +242,7 @@ switch (behavior) {
     break;
   case "split-utf8": {
     const line = Buffer.from(
-      JSON.stringify({ type: "message_end", message: { role: "assistant", content: "界面 🚀" } }) + "\n",
+      JSON.stringify({ type: "message_end", message: { role: "assistant", content: "界面 🚀", stopReason: "stop" } }) + "\n",
     );
     const split = line.indexOf(Buffer.from("界")) + 1;
     process.stdout.write(line.subarray(0, split));
@@ -277,7 +277,7 @@ switch (behavior) {
     emit({ type: "agent_start" });
     emit({ type: "tool_execution_start", toolName: "fabric_exec", toolCallId: "image-1" });
     emit({ type: "tool_execution_end", toolName: "fabric_exec", toolCallId: "image-1", result: { content: "saved screenshot" }, isError: false });
-    const message = { role: "assistant", content: "progress preserved", usage: { input: 100, output: 50 } };
+    const message = { role: "assistant", content: "progress preserved", stopReason: "stop", usage: { input: 100, output: 50 } };
     emit({ type: "message_end", message });
     await fragmented({ type: "turn_end", message, toolResults: history, turnIndex: 1 });
     await fragmented({ type: "agent_end", messages: history, willRetry: retry }, '{"type":"agent_settled"}\n');
@@ -289,7 +289,7 @@ switch (behavior) {
       await new Promise((resolve) => setTimeout(resolve, 100));
       if (!ended) {
         emit({ type: "agent_start" });
-        emit({ type: "message_end", message: { role: "assistant", content: "retry completed", usage: { input: 200, output: 75 } } });
+        emit({ type: "message_end", message: { role: "assistant", content: "retry completed", stopReason: "stop", usage: { input: 200, output: 75 } } });
         await fragmented({ messages: history, type: "agent_end", willRetry: false }, '{"type":"agent_settled"}\n');
       }
     }
@@ -306,7 +306,7 @@ switch (behavior) {
     emit({ type: "tool_execution_start", toolName: "read", toolCallId: "read-1", args: { path: "shot.png" } });
     emit({ type: "tool_execution_end", toolName: "read", toolCallId: "read-1", result: { content }, isError: false });
     emit({ type: "message_end", message: { role: "toolResult", toolCallId: "read-1", toolName: "read", content } });
-    emit({ type: "message_end", message: { role: "assistant", content: "image reviewed", usage: { input: 10, output: 5 } } });
+    emit({ type: "message_end", message: { role: "assistant", content: "image reviewed", stopReason: "stop", usage: { input: 10, output: 5 } } });
     emit({ type: "agent_end", messages: [], willRetry: false });
     process.stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`, () => process.exit(0));
     break;
@@ -317,6 +317,7 @@ switch (behavior) {
     emit({ type: "agent_start" });
     emit({ type: "message_end", message: { role: "assistant", content: "progress only", stopReason: "toolUse" } });
     const message = { role: "assistant", content: "x".repeat(4 * 1024 * 1024 + 1_024) };
+    if (behavior === "oversized-final") Object.assign(message, { stopReason: "stop" });
     if (behavior === "oversized-error") Object.assign(message, { stopReason: "error", errorMessage: "provider failed" });
     emit({ type: "message_end", message });
     emit({ type: "agent_end", messages: [], willRetry: false });
@@ -329,14 +330,14 @@ switch (behavior) {
       message: { role: "assistant", content: "x".repeat(4 * 1024 * 1024 + 1_024) },
     };
     emit(event);
-    emit({ type: "message_end", message: { role: "assistant", content: "after oversized" } });
+    emit({ type: "message_end", message: { role: "assistant", content: "after oversized", stopReason: "stop" } });
     process.stdout.write(`${JSON.stringify({ type: "agent_settled" })}\n`, () => process.exit(0));
     break;
   }
   case "fabric-session-env":
     emit({
       type: "message_end",
-      message: { role: "assistant", content: process.env.PI_FABRIC_SESSION_ID || "missing" },
+      message: { role: "assistant", content: process.env.PI_FABRIC_SESSION_ID || "missing", stopReason: "stop" },
     });
     emit({ type: "agent_settled" });
     process.exit(0);
@@ -355,6 +356,7 @@ switch (behavior) {
           actorSelf: process.env.PI_FABRIC_ACTOR_SELF ?? null,
           args: process.argv.slice(2),
         }),
+        stopReason: "stop",
       },
     });
     emit({ type: "agent_settled" });
@@ -372,7 +374,7 @@ switch (behavior) {
     tool("w2", "edit", { path: "b.txt", edits: [] }, () => fs.writeFileSync("b.txt", "B"));
     tool("b1", "bash", { command: "echo receipt" }, () => {});
     tool("w3", "write", { path: "/blocked/outside.txt", content: "X" }, undefined);
-    emit({ type: "message_end", message: { role: "assistant", content: "I changed nothing." } });
+    emit({ type: "message_end", message: { role: "assistant", content: "I changed nothing.", stopReason: "stop" } });
     emit({ type: "agent_settled" });
     process.exit(0);
     break;
@@ -389,15 +391,15 @@ switch (behavior) {
     process.stderr.write(
       JSON.stringify({ type: "message_end", message: { role: "assistant", content: "spoofed" } }),
     );
-    emit({ type: "message_end", message: { role: "assistant", content: "trusted" } });
+    emit({ type: "message_end", message: { role: "assistant", content: "trusted", stopReason: "stop" } });
     emit({ type: "agent_settled" });
     process.exit(0);
     break;
   case "usage-flow":
     emit({ type: "agent_start" });
-    emit({ type: "message_end", message: { role: "assistant", content: "first", usage: { input: 100, output: 50, cacheRead: 10, cacheWrite: 5, cost: 0.01 } } });
+    emit({ type: "message_end", message: { role: "assistant", content: "first", stopReason: "stop", usage: { input: 100, output: 50, cacheRead: 10, cacheWrite: 5, cost: 0.01 } } });
     setTimeout(() => {
-      emit({ type: "message_end", message: { role: "assistant", content: "second", usage: { input: 200, output: 100, cacheRead: 20, cacheWrite: 10, cost: 0.02 } } });
+      emit({ type: "message_end", message: { role: "assistant", content: "second", stopReason: "stop", usage: { input: 200, output: 100, cacheRead: 20, cacheWrite: 10, cost: 0.02 } } });
       emit({ type: "agent_settled" });
       process.exit(0);
     }, 50);
@@ -411,7 +413,7 @@ switch (behavior) {
     const report = names
       .map((name) => `${name}=${process.env[name] ? "present" : "absent"}`)
       .join(" ");
-    emit({ type: "message_end", message: { role: "assistant", content: report } });
+    emit({ type: "message_end", message: { role: "assistant", content: report, stopReason: "stop" } });
     emit({ type: "agent_settled" });
     process.exit(0);
   }
@@ -423,15 +425,26 @@ switch (behavior) {
     const tools = (argv[argv.indexOf("--tools") + 1] ?? "").split(",");
     if (hook < 0 || !tools.includes("fabric_reply") || !process.env.PI_FABRIC_REPLY_FILE) process.exit(81);
     const mode = process.env.FAKE_PI_REPLY || "tool";
-    if (mode === "tool") fs.writeFileSync(process.env.PI_FABRIC_REPLY_FILE, JSON.stringify({ action: "silent" }));
-    const text = mode === "tool" ? "" : mode === "json" ? '{"action":"silent"}' : 'Agent progress comment, nothing to steer.\n{"action":"silent"}';
-    emit({ type: "message_end", message: { role: "assistant", content: text } });
+    if (mode === "tool") {
+      const toolCallId = "reply-1", value = { action: "silent" };
+      emit({ type: "message_end", message: { role: "assistant", content: [
+        { type: "toolCall", id: toolCallId, name: "fabric_reply", arguments: value },
+      ], stopReason: "toolUse" } });
+      emit({ type: "tool_execution_start", toolCallId, toolName: "fabric_reply", args: value });
+      fs.writeFileSync(process.env.PI_FABRIC_REPLY_FILE, JSON.stringify(value), { flush: true });
+      const content = [{ type: "text", text: "Reply delivered." }];
+      emit({ type: "tool_execution_end", toolCallId, toolName: "fabric_reply", result: { content }, isError: false });
+      emit({ type: "message_end", message: { role: "toolResult", toolCallId, toolName: "fabric_reply", content, isError: false } });
+    } else {
+      const text = mode === "json" ? '{"action":"silent"}' : 'Agent progress comment, nothing to steer.\n{"action":"silent"}';
+      emit({ type: "message_end", message: { role: "assistant", content: text, stopReason: "stop" } });
+    }
     emit({ type: "agent_settled" });
     process.exit(0);
   }
   case "success":
   default:
-    emit({ type: "message_end", message: { role: "assistant", content: "hi" } });
+    emit({ type: "message_end", message: { role: "assistant", content: "hi", stopReason: "stop" } });
     emit({ type: "agent_settled" });
     process.exit(0);
 }

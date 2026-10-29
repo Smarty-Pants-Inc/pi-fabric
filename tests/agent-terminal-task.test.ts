@@ -164,6 +164,48 @@ describe("ordinary process-task final answer boundary", () => {
     expect(await manager.wait(handle.id, { timeoutMs: 1000 })).toMatchObject({ status: "failed", error: record.error, replyVia: "tool", value: { ok: 42 }, finalAnswerReceipt: { id: receipt.id } });
   });
 
+  it.each([
+    ["empty", ""],
+    ["whitespace", " \t\n"],
+  ])("fails closed on an %s old receipt without a structured reply", async (_kind, text) => {
+    const { manager, root, launch, records, close } = harness();
+    const handle = await manager.spawn({ task: "unstructured blank", transport: "process" });
+    const receipt = saveFinalAnswerReceipt(path.join(root, handle.id), handle.id, text);
+    writeJsonAtomic(path.join(root, handle.id, "status.json"), { ...records.get(handle.id)!, status: "completed", text,
+      finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } });
+
+    expect(manager.status(handle.id)).toMatchObject({ status: "finishing" });
+    await expect(manager.wait(handle.id, { timeoutMs: 20 })).rejects.toThrow(/still running|timed out/i);
+    expect(manager.hasRunCustody(handle.id)).toBe(true);
+    expect(manager.isSettled(handle.id)).toBe(false);
+    const next = await manager.spawn({ task: "queued behind native close", transport: "process" });
+    expect(next.status).toBe("queued");
+    expect(launch).toHaveBeenCalledTimes(1);
+
+    close(handle.id);
+    const result = await manager.wait(handle.id, { timeoutMs: 1000 });
+    expect(result).toMatchObject({ status: "failed", errorCode: "NO_FINAL_TEXT",
+      finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } });
+    expect(result.error ?? "").not.toMatch(/^Agent transport exited without a result/);
+    await waitUntil(() => launch.mock.calls.length === 2);
+    expect(launch.mock.calls.filter(([request]) => request.id === handle.id)).toHaveLength(1);
+    close(next.id);
+  });
+
+  it("allows an empty final-answer receipt for a schema-valid fabric_reply", async () => {
+    const schema = { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] };
+    const { manager, root, records, close } = harness();
+    const handle = await manager.spawn({ task: "structured empty", schema, replyTool: true, transport: "process" });
+    const receipt = saveFinalAnswerReceipt(path.join(root, handle.id), handle.id, "");
+    writeJsonAtomic(path.join(root, handle.id, "status.json"), { ...records.get(handle.id)!, status: "completed", text: "",
+      replyVia: "tool", value: { ok: true }, finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } });
+
+    expect(manager.status(handle.id)).toMatchObject({ status: "finishing" });
+    close(handle.id);
+    expect(await manager.wait(handle.id, { timeoutMs: 1000 })).toMatchObject({ status: "completed", text: "",
+      replyVia: "tool", value: { ok: true }, finalAnswerReceipt: { id: receipt.id, recordedAt: receipt.recordedAt } });
+  });
+
   it("routes each queued sender refusal once, including unread tail, and leaves consumed non-final input alone", async () => {
     const notices: AgentTerminalNotice[] = [];
     const { manager, root, close, finish } = harness(notice => { notices.push(notice); });

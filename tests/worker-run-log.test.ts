@@ -111,6 +111,9 @@ const denyHeldReplacement = (file: string, held: number, code?: "EPERM" | "EBUSY
   });
   // Count-bounded denial, without a 700ms real sleep or a raised work budget.
   const sleep = code === undefined ? undefined : vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+  // Injected sharing denial asserts the fixed retry count, not elapsed work.
+  // Native denial and the separate deadline tests keep their real/driven clocks.
+  const clock = code === undefined || vi.isMockFunction(performance.now) ? undefined : vi.spyOn(performance, "now").mockReturnValue(0);
   try {
     const outcome = compactTerminalRunLog(file, "completed");
     expect(outcome).toMatchObject({ compacted: 0, beforeBytes: original.length, afterBytes: original.length });
@@ -121,10 +124,11 @@ const denyHeldReplacement = (file: string, held: number, code?: "EPERM" | "EBUSY
       // Native Windows sharing denial may exhaust the real 500ms deadline.
       expect(outcome.error ?? outcome.compactionSkipped).toMatch(/EPERM|EBUSY|EACCES|MAX_TERMINAL_LOG_WORK_MS=.*full log retained/);
     }
-  } finally { rename?.mockRestore(); sleep?.mockRestore(); }
+  } finally { rename?.mockRestore(); sleep?.mockRestore(); clock?.mockRestore(); }
   expect(fs.readFileSync(file).equals(original)).toBe(true);
   expect(fs.statSync(file, { bigint: true }).ino).toBe(identity.ino);
-  expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+  expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.original"]);
+  expect(fs.readFileSync(`${file}.original`)).toEqual(original);
 };
 
 const readTranscript = (text: string) => new NativeConversationReader().read({ id: "run", status: "running", logFile: logFile(text) });
@@ -363,7 +367,8 @@ describe("worker run log", () => {
       expect(outcome.afterBytes).toBeLessThan(outcome.beforeBytes);
     } finally { spy.mockRestore(); }
     expect(fs.readFileSync(file, "utf8")).not.toBe(text);
-    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.original"]);
+    expect(fs.readFileSync(`${file}.original`, "utf8")).toBe(text);
   });
 
   it("closes every owned source/temp descriptor after fsync and before replacement", () => {
@@ -386,7 +391,7 @@ describe("worker run log", () => {
     });
     const syncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => { fsync(fd); synced.push(fd); });
     const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-      expect(synced).toHaveLength(2);
+      expect(synced).toHaveLength(process.platform === "win32" ? 2 : 3);
       expect(owned.size).toBe(0);
       rename(from, to);
     });
@@ -418,7 +423,8 @@ describe("worker run log", () => {
     } finally { rename.mockRestore(); sleep.mockRestore(); clock.mockRestore(); unlink.mockRestore(); }
     expect(fs.readFileSync(file).equals(original)).toBe(true);
     expect(fs.statSync(file).ino).toBe(inode);
-    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.original"]);
+    expect(fs.readFileSync(`${file}.original`)).toEqual(original);
   });
 
   it.each(["identity", "size", "mtime"])("rechecks source %s before retrying replacement", (change) => {
@@ -442,7 +448,8 @@ describe("worker run log", () => {
       expect(rename).toHaveBeenCalledTimes(1);
     } finally { rename.mockRestore(); }
     expect(fs.readFileSync(file, "utf8")).toBe(change === "size" ? `${text}external append\n` : text);
-    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.original"]);
+    expect(fs.readFileSync(`${file}.original`, "utf8")).toBe(change === "size" ? `${text}external append\n` : text);
   });
 
   it("keeps the terminal work deadline while backing off persistent replacement contention", () => {
@@ -465,7 +472,8 @@ describe("worker run log", () => {
       expect(elapsed).toBe(MAX_TERMINAL_LOG_WORK_MS);
     } finally { rename.mockRestore(); sleep.mockRestore(); clock.mockRestore(); }
     expect(fs.readFileSync(file, "utf8")).toBe(text);
-    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl"]);
+    expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.original"]);
+    expect(fs.readFileSync(`${file}.original`, "utf8")).toBe(text);
   });
 
   it("uses a write-capable source for Windows-style FlushFileBuffers and real fsync", () => {
@@ -502,7 +510,7 @@ describe("worker run log", () => {
       expect(sourceFlags & (fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_APPEND)).toBe(0);
       const noFollow = fs.constants.O_NOFOLLOW ?? 0;
       expect(sourceFlags & noFollow).toBe(noFollow);
-      expect(synced).toHaveLength(2);
+      expect(synced).toHaveLength(process.platform === "win32" ? 2 : 3);
       expect(synced[0]).toBe(source);
       expect(writes.mock.calls.every(([fd]) => fd !== source)).toBe(true);
     } finally { openSpy.mockRestore(); syncSpy.mockRestore(); writes.mockRestore(); }
@@ -708,7 +716,9 @@ describe("worker run log", () => {
     } finally { spy.mockRestore(); }
     expect(fs.readFileSync(file, "utf8")).toBe(text);
     expect(fs.statSync(file).ino).toBe(inode);
-    expect(fs.readdirSync(directory).sort()).toEqual(["events.jsonl", "foreign.compact.tmp"]);
+    expect(fs.readdirSync(directory).sort()).toEqual(failure === "rename"
+      ? ["events.jsonl", "events.jsonl.original", "foreign.compact.tmp"] : ["events.jsonl", "foreign.compact.tmp"]);
+    if (failure === "rename") expect(fs.readFileSync(`${file}.original`, "utf8")).toBe(text);
   });
 
   it("invalidates growing replacements when Windows file IDs round to the same number", () => {
@@ -800,7 +810,7 @@ describe("worker run log", () => {
       });
 
       it.each([false, true])("retains loaded older native pages after large terminal replacement (follow=%s)", (follow) => {
-        const directory = fs.mkdtempSync(path.resolve(".native-replacement-"));
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), "native-replacement-"));
         directories.push(directory);
         const file = path.join(directory, "events.jsonl");
         const events = Array.from({ length: 160 }, (_, index) => {

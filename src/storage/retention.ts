@@ -154,13 +154,18 @@ export const runTreeExitVeto = (
 /** Native resource safety is independent of full-result archival. This only
  * authorizes pre-launch worktree rollback or isolation of shutdown obligations;
  * its tracked root has native transport custody, but descendants need saved exit
- * proof. Run-file collection must use runTreeExitVeto with its archive/root fence. */
+ * proof. Run-file collection must additionally use runTreeRemovalVeto. */
 export const runTreeResourceVeto = (
   directory: string, depth = 0, expired: Deadline = noDeadline, requireDescendantExit = false, requireRootExit = false,
 ): string | undefined => runTreeVeto(directory, depth, expired, requireDescendantExit, false, requireRootExit);
+/** File collection has an additional permanent trace fence. A retained original
+ * is settled history, not an outstanding worker/archive obligation. */
+export const runTreeRemovalVeto = (
+  directory: string, depth = 0, expired: Deadline = noDeadline, requirePersistedExit = false, acceptPidReuse = false,
+): string | undefined => runTreeVeto(directory, depth, expired, requirePersistedExit, true, requirePersistedExit, acceptPidReuse, true);
 const runTreeVeto = (
   directory: string, depth: number, expired: Deadline, requirePersistedExit: boolean, preserveArchives: boolean, requireRootExit: boolean,
-  acceptPidReuse = false,
+  acceptPidReuse = false, preserveOriginal = false,
 ): string | undefined => {
   if (expired() || depth > 32) return "worker exit is unconfirmed: run-tree inspection was incomplete";
   // A previously removed tree has no worker files left to collect. Only this
@@ -172,6 +177,11 @@ const runTreeVeto = (
   }
   try {
     if (!ownedStat(directory)?.isDirectory()) return "worker exit is unconfirmed: unsafe run directory";
+    if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
+    // The terminal worker rewrite retains the raw source under this name.
+    // Keep the whole tree (including nested runs), not just its compacted reader view.
+    // Resource/worktree cleanup remains independent of trace retention.
+    if (preserveOriginal && fs.existsSync(path.join(directory, "events.jsonl.original"))) return "original run log is retained";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (preserveArchives && fs.existsSync(path.join(directory, "archive-pending.json"))) return "terminal result archive is pending";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
@@ -234,7 +244,7 @@ const runTreeVeto = (
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
     if (!ownedStat(nested)?.isDirectory()) return "worker exit is unconfirmed: unsafe nested run directory";
     for (const name of fs.readdirSync(nested)) {
-      const reason = runTreeVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit, preserveArchives, requireRootExit, acceptPidReuse);
+      const reason = runTreeVeto(path.join(nested, name), depth + 1, expired, requirePersistedExit, preserveArchives, requireRootExit, acceptPidReuse, preserveOriginal);
       if (reason) return reason;
     }
   } catch { return "worker exit is unconfirmed: run-tree inspection failed"; }
@@ -247,7 +257,7 @@ const recordAgeReference = (record: RunRecordSummary, fallback: number): number 
 // Every file the worker and manager write into a run directory. A missing name made the run
 // unremovable forever: 54k expired actor runs with reply.json piled up in /tmp (smarty-dev#2010).
 const runFiles = new Set([
-  "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
+  "task.txt", "task.txt.provenance.json", "status.json", "events.jsonl", "events.jsonl.original", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json",
   // Manager-owned exact settlement and byte-evicted legacy nested history.
   // Neither artifact substitutes for the worker status/receipt/exit proof.
   "manager-result.json", "manager-nested.json", "run-identity.json",
@@ -403,12 +413,12 @@ const externalScratchRefusal = (root: string, record: RunRecordSummary | undefin
   if (!ownedStat(temporary)?.isDirectory()) return "an entry is a link, hard-linked or not ours";
   return boundedRunTree(temporary, expired) ? undefined : "task scratch subtree is unsafe or exceeds scan bounds";
 };
-const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, acceptPidReuse = false): boolean => {
+const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired: Deadline = noDeadline, acceptPidReuse = false, preserveOriginal = true): boolean => {
   if (expired() || depth > 32 || !ownedStat(root)?.isDirectory()) return false;
   // Offline collection cannot establish never-launched custody from filenames
   // or a host-wide childrenStopped marker. Only the live admission caller can
   // authorize recordless pre-launch rollback through the non-retention mode.
-  if (runTreeExitVeto(root, 0, expired, true, acceptPidReuse)) return false;
+  if ((preserveOriginal ? runTreeRemovalVeto : runTreeExitVeto)(root, 0, expired, true, acceptPidReuse)) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   // Automatic retention keeps its independent live-writer fence at every level,
   // including descendants, alongside the recursive exit proof. A live PID vetoes;
@@ -482,7 +492,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
         continue;
       }
       if (stat.isDirectory() && name === "nested") {
-        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired, acceptPidReuse)) return false;
+        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, depth + 1, expired, acceptPidReuse, preserveOriginal)) return false;
         continue;
       }
       return false;
@@ -493,7 +503,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, depth = 0, expired:
 /** Why safeRunTree refused a run, as a fixed category for the retention report (ids and paths removed). Report only:
  * it repeats the checks in safeRunTree's order and is not a deletion authority. */
 const runTreeRefusal = (root: string, acceptPidReuse: boolean): string => {
-  const exit = runTreeExitVeto(root, 0, noDeadline, true, acceptPidReuse);
+  const exit = runTreeRemovalVeto(root, 0, noDeadline, true, acceptPidReuse);
   if (exit) return exit.replace(/ \([^)]*\)$/, "");
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId) ? Number(record.sessionId) : undefined;
@@ -519,6 +529,12 @@ const runTreeRefusal = (root: string, acceptPidReuse: boolean): string => {
     }
   } catch { return "run tree unreadable"; }
   return "follow-ups, deliveries, handoff or nested run not proven safe";
+};
+/** Same known-file and exit proof as collection, without treating a retained
+ * original as live custody. This never authorizes run-file removal. */
+export const isSettledTerminalRun = (directory: string, expired: Deadline = noDeadline): boolean => {
+  const record = readJson<RunRecordSummary>(path.join(directory, "status.json"));
+  return !!record?.status && TERMINAL_STATUSES.has(record.status) && safeRunTree(directory, false, 0, expired, false, false);
 };
 /** Explicit resident roots have no managed-temp owner. Require terminal status
  * plus checked process absence, and veto nested survivors and unresolved markers. */
@@ -551,6 +567,7 @@ const removeShortTmpdirAfterRun = (temporary: string | undefined, deleter: strin
  * short TMPDIR outside it. For deleters that hold their own safety proof, such as resident run retention. */
 export const removeRunTreeAndShortTmpdir = (directory: string, judged: fs.Stats | undefined,
   options: { deleter: string; fallback: () => boolean }): boolean => {
+  if (runTreeRemovalVeto(directory)) return false;
   const temporary = recordedShortTmpdir(directory, path.basename(directory));
   const removed = verifiedRemove(directory, judged, options).removed;
   if (removed) removeShortTmpdirAfterRun(temporary, options.deleter);
@@ -1151,10 +1168,12 @@ export const removeUnreferencedRun = (
   bytes = 0,
 ): boolean => {
   const check = (): boolean => { try { return !!referenced?.(); } catch { return true; } };
+  const veto = runTreeRemovalVeto(directory);
+  if (veto) { countRefusal(deleter, veto, directory, bytes); return false; }
   if (check()) { countRefusal(deleter, "referenced at the final check", directory, bytes); return false; }
   const temporary = dryRun ? undefined : recordedShortTmpdir(directory, path.basename(directory));
-  const removed = verifiedRemove(directory, judged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check(),
-    fallback: () => mainRemoveUnreferencedRun(directory, referenced, check) }).removed;
+  const removed = verifiedRemove(directory, judged, { deleter, ...(dryRun ? { dryRun: true } : {}), proceed: () => !check() && !runTreeRemovalVeto(directory),
+    fallback: () => mainRemoveUnreferencedRun(directory, referenced, () => check() || !!runTreeRemovalVeto(directory)) }).removed;
   if (removed) removeShortTmpdirAfterRun(temporary, deleter);
   return removed;
 };

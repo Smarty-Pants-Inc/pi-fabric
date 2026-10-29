@@ -54,6 +54,28 @@ implement the entire frozen R3/B3 contract. This draft must not be called G2 GRE
   Main owns the per-original hold versus integration decision. Do not stamp
   unrelated pending intents with one selected original's g.
 
+## Harness-supplied identities (Ch1)
+
+Every `ConformanceHarness` must expose `recoveryIdentity()` returning
+`{ acceptedInput, recoveryGeneration, executionBranchEntryId }`. The expected
+values are independent of the B4 ref/view. Real B5 compositions supply the actual
+selection's admissionId/deliveryId, the retained delivery anchor, and g returned
+by `ensureRecoveryGeneration`; never seed a pin or mock the UUID allocator.
+The fake supplies its stand-in values through the same accessor. The shared
+repair cases check deliveryId == admissionId and observed settlement g == pin g,
+then retain all ref/view/hash/reopen/forgery/J2 assertions unconditionally.
+
+`createAcceptedInput(now)` captures a deadline 120 seconds after the harness clock;
+`FakeOptions.now` and `RealOptions.now` configure stand-in clocks. Reopen does not
+renew that deadline. Consumer P2 also checks a clock in 2031.
+`createReal(scenario, { recoveryIdentity })` accepts observations from real B5.
+Without that option it remains the explicitly labelled B4-only boundary probe:
+the contract base has no B5 allocator. Ch1's real B5 proof uses the approved
+combined base `cf50f1d995cb78e7d0ea591dbdb6025247c966f4` with this contract merged,
+not fabricated B5 state on the old base. Its native owner/delivery fixture is
+`probe:native-Pi`; missing B4 repair methods stay RED. Round-4 `RESULT.md` retains
+the wiring, exact counts and mutant evidence; no production file changes.
+
 ## Consumer-owned identities (K9)
 
 ```ts
@@ -92,6 +114,7 @@ export or change to B4 behavior. Passing the fake never enables REQUIRED.
 
 The authoritative source-pinned narrative and conflicts are co-versioned here:
 [`B4-CONTRACT.md`](./B4-CONTRACT.md). Verify its frozen bytes from this directory
-with `sha256sum -c B4-CONTRACT.sha256`. V2 corrects K1–K4; v3 applies K5–K9.
+with `sha256sum -c B4-CONTRACT.sha256`. V2 corrects K1–K4; v3 applies K5–K9;
+v4 records K10 and its restored settlement obligations; v5 applies Ch1.
 The round-2 `PHASE1.md` (v2) and `RESULT.md` (v3) record commit/hash and per-test evidence. CoS owns PR
 body updates; the builder is authorized only to push this branch.

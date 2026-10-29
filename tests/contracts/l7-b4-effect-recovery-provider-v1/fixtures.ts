@@ -1,16 +1,22 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { EffectIntent, EffectOutcome, EffectSlot, JsonValue } from "../../../src/effects/contracts.js";
 import { canonicalEncode, manifestDigest, mintEffectKey } from "../../../src/effects/slots.js";
 import type { AcceptedRecoveryInput, B4EffectRecoveryProviderV1, B4RepairReceiptV1 } from "./contract.js";
 
 export const SESSION = "contract-session";
 export const INPUT = "original-input";
-export const GENERATION = "b5-durable-generation";
-export const accepted: AcceptedRecoveryInput = {
-  sessionId: SESSION, originalInputId: INPUT, admissionId: "admission", deliveryId: "delivery",
-  kind: "initial", text: "original input", payloadSha256: createHash("sha256").update("original input").digest("hex"),
-  deadlineMs: 1793404800000, consumption: { kind: "round" },
-};
+/** Stand-in defaults only, never a B5 pin or an expected production identity. */
+export const GENERATION = `probe-generation:${randomUUID()}`;
+export const INPUT_LIFETIME_MS = 120_000;
+export function createAcceptedInput(now: () => number = Date.now): AcceptedRecoveryInput {
+  const admissionId = `probe-admission:${randomUUID()}`;
+  return {
+    sessionId: SESSION, originalInputId: INPUT, admissionId, deliveryId: admissionId,
+    kind: "initial", text: "original input", payloadSha256: createHash("sha256").update("original input").digest("hex"),
+    deadlineMs: now() + INPUT_LIFETIME_MS, consumption: { kind: "round" },
+  };
+}
+export const accepted = createAcceptedInput();
 export const hash = (bytes: string | Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
 export const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 export const canonicalCopy = <T>(value: T): T => JSON.parse(canonicalEncode(value)) as T;
@@ -38,6 +44,10 @@ export interface Scenario {
  * Missing real methods are deliberately not shimmed into a false GREEN. */
 export interface ConformanceHarness {
   provider: Partial<B4EffectRecoveryProviderV1>;
+  /** Independent input/pin observations, never derived from the B4 ref/receipt.
+   * Real B5 compositions read selection, retained delivery and ensureRecoveryGeneration.
+   * B4-only boundary probes and fakes must label their stand-in identities as such. */
+  recoveryIdentity(): RecoveryIdentity;
   issue(intent: EffectIntent): Promise<void>;
   reopen(): Promise<void>;
   destination(): readonly string[];
@@ -56,6 +66,9 @@ export type ConformanceFactory = (scenario: Scenario) => Promise<ConformanceHarn
 export interface FixtureIdentity {
   readonly acceptedInput: Readonly<AcceptedRecoveryInput>;
   readonly executionBranchEntryId: string;
+}
+export interface RecoveryIdentity extends FixtureIdentity {
+  readonly recoveryGeneration: string;
 }
 export const defaultIdentity: FixtureIdentity = { acceptedInput: accepted, executionBranchEntryId: "A" };
 

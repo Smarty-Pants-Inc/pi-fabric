@@ -1,10 +1,11 @@
 import type { EffectIntent, EffectOutcome } from "../../../src/effects/contracts.js";
 import { canonicalEncode, intentBindingDigest } from "../../../src/effects/slots.js";
 import type { AcceptedRecoveryInput, B4EffectRecoveryProviderV1, RepairRef, RepairReceiptView, SettledRecoveryEffect } from "./contract.js";
-import { accepted, adapterOriginalResult, canonicalCopy, copy, createSinkGate, fail, GENERATION, hash, immutable, intent, joinedBranch, joinedEvidence, originalResult, SESSION,
+import { adapterOriginalResult, canonicalCopy, copy, createAcceptedInput, createSinkGate, fail, GENERATION, hash, immutable, intent, joinedBranch, joinedEvidence, originalResult, SESSION,
   type ConformanceHarness, type Scenario } from "./fixtures.js";
 
 export interface FakeOptions {
+  readonly now?: () => number;
   readonly sessionId?: string;
   readonly acceptedInput?: Readonly<AcceptedRecoveryInput>;
   readonly executionBranchEntryId?: string;
@@ -20,7 +21,7 @@ export interface FakeHarness extends Omit<ConformanceHarness, "provider"> {
  * native receipt, B1 witness or peer sink implementation. No production exports. */
 export async function createFake(scenario: Scenario = {}, options: FakeOptions = {}): Promise<FakeHarness> {
   const sessionId = options.sessionId ?? options.acceptedInput?.sessionId ?? SESSION;
-  const acceptedInput = immutable(copy(options.acceptedInput ?? { ...accepted, sessionId }));
+  const acceptedInput = immutable(copy(options.acceptedInput ?? { ...createAcceptedInput(options.now), sessionId }));
   if (acceptedInput.sessionId !== sessionId) throw new Error("Fake session and accepted input must agree");
   const identity = { acceptedInput, executionBranchEntryId: options.executionBranchEntryId ?? "A" };
   const sinkGate = createSinkGate(scenario.stallSink);
@@ -124,7 +125,7 @@ export async function createFake(scenario: Scenario = {}, options: FakeOptions =
       return receipt;
     },
   };
-  return { provider, issue, async reopen() { /* Same retained model state; NOT a process-crash proof. */ },
+  return { provider, recoveryIdentity: () => immutable(copy({ ...identity, recoveryGeneration: receiptGeneration })), issue, async reopen() { /* Same retained model state; NOT a process-crash proof. */ },
     destination: () => [...destination], observedIntents: () => copy(observed), generations: () => [...generations],
     async ledgerDigest() { return hash(canonicalEncode({ intents: [...intents.values()], outcomes: [...outcomes], receipt: receipt ?? null })); },
     joinedBranch: () => copy(joinedBranch(joinedLeaf, identity)), sinkGate,

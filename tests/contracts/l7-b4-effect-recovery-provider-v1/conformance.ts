@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { canonicalEncode } from "../../../src/effects/slots.js";
 import type { B4EffectRecoveryProviderV1 } from "./contract.js";
-import { accepted, copy, GENERATION, hash, intent, originalResult, SESSION, type ConformanceFactory, type ConformanceHarness, type Scenario } from "./fixtures.js";
+import { copy, hash, intent, originalResult, type ConformanceFactory, type ConformanceHarness, type Scenario } from "./fixtures.js";
 
 /** ONE suite for consumer stand-ins and the actual B4 adapter. A factory gives
  * each case an isolated retained-state fixture; it is not a provider API.
@@ -11,11 +11,17 @@ export function runConformance(provider: ConformanceFactory): void {
   const test = (name: string, scenario: Scenario, check: (h: ConformanceHarness) => Promise<void>) => {
     it(name, async () => { const h = await provider(scenario); try { await check(h); } finally { await h.dispose(); } });
   };
-  const settle = (h: ConformanceHarness, generation = GENERATION) => h.provider.settlePendingIntents!(SESSION, generation);
+  const settle = (h: ConformanceHarness, generation = h.recoveryIdentity().recoveryGeneration) =>
+    h.provider.settlePendingIntents!(h.recoveryIdentity().acceptedInput.sessionId, generation);
   const read = (h: ConformanceHarness, effect: Parameters<B4EffectRecoveryProviderV1["readToolResult"]>[0]) => h.provider.readToolResult!(effect);
-  const repair = (h: ConformanceHarness) => {
+  const repair = async (h: ConformanceHarness) => {
     expect(h.provider.repairMaintenance, "real host repairMaintenance is required; no fake shim").toBeTypeOf("function");
-    return h.provider.repairMaintenance!(accepted, "J");
+    const { acceptedInput, recoveryGeneration, executionBranchEntryId } = h.recoveryIdentity();
+    expect(acceptedInput.deliveryId).toBe(acceptedInput.admissionId);
+    expect(h.generations()).toEqual([recoveryGeneration]);
+    const ref = await h.provider.repairMaintenance!(acceptedInput, "J");
+    expect(ref).toMatchObject({ originalInputId: acceptedInput.originalInputId, recoveryGeneration, executionBranchEntryId });
+    return ref;
   };
   const value = intent();
   describe("B4EffectRecoveryProviderV1", () => {
@@ -26,7 +32,7 @@ export function runConformance(provider: ConformanceFactory): void {
       expect(await h.ledgerDigest()).toBe(before);
     });
     test("C02 wrong session refuses before settlement", { intents: [value] }, async h => {
-      await expect(h.provider.settlePendingIntents!("foreign", GENERATION)).rejects.toMatchObject({ code: "EFFECT_SESSION_MISMATCH" });
+      await expect(h.provider.settlePendingIntents!("foreign", h.recoveryIdentity().recoveryGeneration)).rejects.toMatchObject({ code: "EFFECT_SESSION_MISMATCH" });
       expect(h.destination()).toEqual([]);
     });
     test("C03 empty generation is not replaced with a random UUID", { intents: [value] }, async h => {
@@ -37,7 +43,7 @@ export function runConformance(provider: ConformanceFactory): void {
       const result = await settle(h);
       expect(result.uncertain).toBe(0); expect(result.settled).toHaveLength(1);
       expect(result.settled[0]).toMatchObject({ key: value.key, toolCallId: value.tool.originalToolCallId, outcome: "committed" });
-      expect(h.observedIntents()).toEqual([value]); expect(h.generations()).toEqual([GENERATION]);
+      expect(h.observedIntents()).toEqual([value]); expect(h.generations()).toEqual([h.recoveryIdentity().recoveryGeneration]);
     });
     test("C05 terminal result survives reopen with no second sink effect or ledger write", { intents: [value] }, async h => {
       const first = await settle(h); const before = await h.ledgerDigest();
@@ -135,10 +141,12 @@ export function runConformance(provider: ConformanceFactory): void {
     // The B4 ABI has no B5 pin port; B5/Main owns these refusals (R3:150-152).
     test("C23 J differs from A: host repair returns bound view and canonical receipt hash", { intents: [value] }, async h => {
       await settle(h); const ref = await repair(h);
-      expect(ref).toMatchObject({ originalInputId: accepted.originalInputId, recoveryGeneration: GENERATION, executionBranchEntryId: "A" });
+      const { acceptedInput, recoveryGeneration, executionBranchEntryId } = h.recoveryIdentity();
+      expect(ref).toMatchObject({ originalInputId: acceptedInput.originalInputId, recoveryGeneration, executionBranchEntryId });
       expect(h.provider.resolveRepair).toBeTypeOf("function"); const view = h.provider.resolveRepair!(ref);
       expect(view).not.toBeInstanceOf(Promise);
-      expect(view).toMatchObject({ sessionId: SESSION, joinedLeafEntryId: "J", executionBranchEntryId: "A", recoveryGeneration: GENERATION });
+      expect(view).toMatchObject({ sessionId: acceptedInput.sessionId, originalInputId: acceptedInput.originalInputId,
+        joinedLeafEntryId: "J", executionBranchEntryId, recoveryGeneration });
       expect(view.protectedEntryIds).not.toHaveLength(0); expect(view.nativeEntries).not.toHaveLength(0);
       expect(view.settlements).toHaveLength(1);
       // Compute from the observed branch, not joinedEvidence or the receipt itself.
@@ -166,12 +174,12 @@ export function runConformance(provider: ConformanceFactory): void {
     });
     test("C26 later joined J2 refuses new repair rather than replacing receipt", { intents: [value] }, async h => {
       await settle(h); const ref = await repair(h); h.advanceJoinedLeaf();
-      await expect(h.provider.repairMaintenance!(accepted, "J2")).rejects.toMatchObject({ code: "RECOVERY_MAINTENANCE_REPAIR_REQUIRED" });
+      await expect(h.provider.repairMaintenance!(h.recoveryIdentity().acceptedInput, "J2")).rejects.toMatchObject({ code: "RECOVERY_MAINTENANCE_REPAIR_REQUIRED" });
       expect(h.provider.resolveRepair!(ref).joinedLeafEntryId).toBe("J");
     });
     test("C27 uncertain effects cannot yield a repair receipt", { intents: [value], outcomes: { write: "uncertain" } }, async h => {
       await settle(h); expect(h.provider.repairMaintenance).toBeTypeOf("function");
-      await expect(h.provider.repairMaintenance!(accepted, "J")).rejects.toMatchObject({ code: "RECOVERY_MAINTENANCE_REPAIR_REQUIRED" });
+      await expect(h.provider.repairMaintenance!(h.recoveryIdentity().acceptedInput, "J")).rejects.toMatchObject({ code: "RECOVERY_MAINTENANCE_REPAIR_REQUIRED" });
     });
     test("C28 file pre-state commits original bytes once; reopen preserves inode", { fileState: "pre" }, async h => {
       expect(h.fileSnapshot().bytes).toBe("before"); expect((await settle(h)).uncertain).toBe(0);
@@ -196,12 +204,13 @@ export function runConformance(provider: ConformanceFactory): void {
     });
     test("C33 missing receipt cannot be resolved from caller JSON", {}, async h => {
       expect(h.provider.resolveRepair).toBeTypeOf("function");
-      expect(() => h.provider.resolveRepair!({ originalInputId: accepted.originalInputId, recoveryGeneration: GENERATION,
-        executionBranchEntryId: "A", repairReceiptSha256: hash("invented") })).toThrowError(expect.objectContaining({ code: "RECOVERY_MAINTENANCE_REPAIR_REQUIRED" }));
+      const { acceptedInput, recoveryGeneration, executionBranchEntryId } = h.recoveryIdentity();
+      expect(() => h.provider.resolveRepair!({ originalInputId: acceptedInput.originalInputId, recoveryGeneration,
+        executionBranchEntryId, repairReceiptSha256: hash("invented") })).toThrowError(expect.objectContaining({ code: "RECOVERY_MAINTENANCE_REPAIR_REQUIRED" }));
     });
     test("C34 host repair rejects unrelated original input", { intents: [value] }, async h => {
       await settle(h); expect(h.provider.repairMaintenance).toBeTypeOf("function");
-      await expect(h.provider.repairMaintenance!({ ...accepted, originalInputId: "unrelated" }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
+      await expect(h.provider.repairMaintenance!({ ...h.recoveryIdentity().acceptedInput, originalInputId: "unrelated" }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
     });
     test("C35 adapter-original read labels provenance without inventing a timestamp", { intents: [value], resultSource: "adapter-original" }, async h => {
       const effect = (await settle(h)).settled[0]!;

@@ -66,7 +66,9 @@ independently of any Fabric event.
 
 By default, `compaction.primaryTimeoutMs` is `300000` ms (5 minutes) and
 `compaction.fallbackTimeoutMs` is `240000` ms (4 minutes), for a nine-minute
-combined timeout budget. Both settings accept positive milliseconds.
+combined timeout budget. Each value must be a positive finite integer in
+milliseconds, and `primaryTimeoutMs + fallbackTimeoutMs` must be at most
+`540000` ms.
 `compaction.fallbackModel` defaults to
 `cliproxyapi-anthropic/claude-opus-5-5`; `compaction.maxSummaryTokens` defaults to
 `8000`. A summary-token cap is not a latency guarantee or a promise of exact
@@ -87,3 +89,6 @@ outcomes (`Already compacted`, `Nothing to compact (session too small)`, and
 session while the incident context remains live; a replacement context may
 report after the old one is invalidated. Successful `session_compact`, session
 start, and shutdown reset the incident latch.
+
+**INCOMPLETE 2a: phase-bounded, whole operation not yet**
+Whole-operation fixes are a dated follow-up due 2026-10-30 18:00Z.

@@ -7,13 +7,23 @@ import { EffectStore } from "../../../src/effects/store.js";
 import { canonicalEncode, mintEffectKey, manifestDigest } from "../../../src/effects/slots.js";
 import { prepareFileEffect } from "../../../src/effects/file.js";
 import { prepareShellEffect, shellEffectCommand } from "../../../src/effects/shell.js";
-import { adapterOriginalResult, canonicalCopy, copy, createSinkGate, fail, hash, intent, joinedBranch, originalResult, SESSION, type ConformanceFactory, type ConformanceHarness } from "./fixtures.js";
+import { adapterOriginalResult, canonicalCopy, copy, createAcceptedInput, createSinkGate, fail, GENERATION, hash, immutable, intent, joinedBranch, originalResult, type RecoveryIdentity, type Scenario, type ConformanceHarness } from "./fixtures.js";
 
 /** Unmodified real B4 store/reconciler/record port at the selected integration
  * head. Sinks below are controlled boundary probes, NOT real peer/native/B6
  * qualification. Real file/shell behavior is exercised separately by the suite.
  * Missing repair methods and incompatible read results are intentionally exposed. */
-export const createReal: ConformanceFactory = async scenario => {
+export interface RealOptions {
+  readonly now?: () => number;
+  /** Supply actual B5 observations in a composed harness; no fabricated pin writes.
+   * The old B4-only base has no B5 allocator, so its default is explicitly a probe. */
+  readonly recoveryIdentity?: () => RecoveryIdentity;
+}
+export const createReal = async (scenario: Scenario, options: RealOptions = {}): Promise<ConformanceHarness> => {
+  const probeIdentity = immutable({ acceptedInput: createAcceptedInput(options.now), executionBranchEntryId: "A", recoveryGeneration: GENERATION });
+  const recoveryIdentity = options.recoveryIdentity ?? (() => probeIdentity);
+  const identity = recoveryIdentity();
+  const sessionId = identity.acceptedInput.sessionId;
   const root = mkdtempSync(join(tmpdir(), "b4-contract-"));
   const sessionRoot = join(root, "session");
   const workspaceRoot = join(root, "workspace");
@@ -37,7 +47,7 @@ export const createReal: ConformanceFactory = async scenario => {
   });
   const open = () => {
     const owner: RecoveryOwner = {
-      orgId: "contract-org", logicalSessionId: SESSION, sessionRoot, workspaceRoot, sessionFile: join(root, "session.jsonl"),
+      orgId: "contract-org", logicalSessionId: sessionId, sessionRoot, workspaceRoot, sessionFile: join(root, "session.jsonl"),
       pvcUID: "fixture-pvc", exclusionReceipt: "TEST-ONLY-local-boundary", signal: new AbortController().signal,
       attempt: { podUID: `pod-${incarnation}`, bootId: `boot-${incarnation}`, ownerIncarnation: `owner-${incarnation}`, authorityRevision: `${incarnation}` },
       assertLive() {},
@@ -69,9 +79,9 @@ export const createReal: ConformanceFactory = async scenario => {
     const prepared = shell
       ? await prepareShellEffect(workspaceRoot, args, { kind: "read-sha256-v1", path: "file.txt", sha256: hash("before") })
       : await prepareFileEffect(workspaceRoot, "write", args);
-    const base = intent("file");
+    const base = intent("file", 0, [], false, identity);
     const slot = { ...base.slot, kind: shell ? "shell-check" : "file-write", canonicalRef: shell ? "pi.bash" : "pi.write", canonicalTarget: target, canonicalArguments: args };
-    const tuple = [1, "contract-org", SESSION, base.acceptedInput.id, slot.id, slot.kind] as const;
+    const tuple = [1, "contract-org", sessionId, base.acceptedInput.id, slot.id, slot.kind] as const;
     const text = prepared.format === "fabric-file-effect-v1" ? Buffer.from(prepared.desiredBase64, "base64") : Buffer.from(canonicalEncode(prepared));
     const payload = { encoding: "base64" as const, bytes: text.toString("base64"), digest: hash(text) };
     await issue({ ...base, key: mintEffectKey(tuple), keyTuple: tuple, slot, canonicalArguments: args,
@@ -92,7 +102,7 @@ export const createReal: ConformanceFactory = async scenario => {
     writeFileSync(join(sessionRoot, "effects", key, "intent.json"), "corrupt");
   }
   const provider = runtime.port as unknown as ConformanceHarness["provider"];
-  const harness: ConformanceHarness = { provider, issue,
+  const harness: ConformanceHarness = { provider, recoveryIdentity, issue,
     async reopen() { incarnation++; runtime = open(); harness.provider = runtime.port as unknown as ConformanceHarness["provider"]; },
     destination: () => [...destination], observedIntents: () => copy(observed), generations: () => [...generations],
     async ledgerDigest() {
@@ -105,7 +115,7 @@ export const createReal: ConformanceFactory = async scenario => {
       };
       walk(sessionRoot); return hash(canonicalEncode(files));
     },
-    joinedBranch: () => copy(joinedBranch()), sinkGate, // Native boundary probe, not a production reader.
+    joinedBranch: () => copy(joinedBranch("J", recoveryIdentity())), sinkGate, // Native boundary probe, not a production reader.
     advanceJoinedLeaf() { /* No producer at this head: suite reports absent method. */ },
     fileSnapshot() { const stat = statSync(target); return { bytes: readFileSync(target, "utf8"), identity: `${stat.dev}:${stat.ino}` }; },
     async dispose() { sinkGate.release(); rmSync(root, { recursive: true, force: true }); },

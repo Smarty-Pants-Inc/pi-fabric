@@ -2,13 +2,13 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import type { AcceptedRecoveryInput, B4EffectRecoveryProviderV1 } from "./contract.js";
 import { createFake, createFakeProvider } from "./fake.js";
-import { accepted, GENERATION, intent, type FixtureIdentity } from "./fixtures.js";
+import { accepted, GENERATION, INPUT_LIFETIME_MS, intent, type FixtureIdentity } from "./fixtures.js";
 
 const ownInput: AcceptedRecoveryInput = {
   sessionId: "s4-consumer-session", originalInputId: "s4-original", admissionId: "s4-admission",
-  deliveryId: "s4-delivery", kind: "recovery", text: "consumer text λ",
+  deliveryId: "s4-admission", kind: "recovery", text: "consumer text λ",
   payloadSha256: createHash("sha256").update("consumer text λ").digest("hex"),
-  deadlineMs: 1793456789012, consumption: { kind: "effect-read", effectKey: "consumer-effect" },
+  deadlineMs: Date.now() + INPUT_LIFETIME_MS, consumption: { kind: "effect-read", effectKey: "consumer-effect" },
 };
 const identity: FixtureIdentity = { acceptedInput: ownInput, executionBranchEntryId: "s4-anchor" };
 const options = { sessionId: ownInput.sessionId, ...identity, joinedLeafEntryId: "s4-joined", pin: "s4-retained-generation" };
@@ -42,6 +42,13 @@ describe("B4 fake consumer configuration / COMPONENT ONLY", () => {
   });
 
   it("P2 full-provider accessor accepts a consumer deadline rather than module constants", async () => {
+    // A clock beyond the retired 2026 fixture deadline still produces live input.
+    const now = () => Date.UTC(2031, 0, 1);
+    const clockHarness = await createFake({}, { now });
+    const clockInput = clockHarness.recoveryIdentity().acceptedInput;
+    expect(clockInput.deadlineMs).toBe(now() + INPUT_LIFETIME_MS);
+    expect(clockInput.deliveryId).toBe(clockInput.admissionId);
+    await clockHarness.dispose();
     const input = { ...accepted, deadlineMs: accepted.deadlineMs + 1234 };
     const value = intent("deadline-write", 0, [], false, { acceptedInput: input, executionBranchEntryId: "A" });
     const provider: B4EffectRecoveryProviderV1 = await createFakeProvider({ intents: [value] }, { acceptedInput: input });

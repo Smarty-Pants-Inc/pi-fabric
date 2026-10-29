@@ -7798,9 +7798,13 @@ export class AgentManager {
     // kept uncompacted. status.json stays compact and taskless.
     if (keepResult && resultFile) managed.resultFingerprint = writePrivateJsonAtomic(resultFile, omitRetainedTasks(record));
     writeJsonAtomic(managed.statusFile, omitRetainedTasks(compactUiRecord(this.#withTransportMetadata(record, managed, false))), { space: 2 });
+    // Retention removes only the prompt inputs that must not remain with the
+    // compact proof. Unknown files and every worker/child trace are preserved.
+    const promptArtifacts = new Set(["task.txt.provenance.json", "schema.json", "images.json"]);
     for (const entry of fs.readdirSync(managed.runDirectory)) {
-      if (entry === "status.json" || entry === "lifecycle.jsonl" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
-      await removeTree(path.join(managed.runDirectory, entry));
+      if (promptArtifacts.has(entry) || (entry === "task.txt" && !currentMatches)) {
+        await removeTree(path.join(managed.runDirectory, entry));
+      }
     }
     // pi-fabric#1554 P1 (smarty-dev#15878): the loop above prunes the in-tree tmp/ such a run used before. Its short
     // TMPDIR outside the run tree goes the same way here, or a scratch of more than 64 entries vetoes every later sweep.

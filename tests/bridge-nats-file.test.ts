@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BridgePresence } from "../src/mesh/bridge.js";
 import { BridgeMirrorDeferredError } from "../src/mesh/bridge.js";
 import { createNatsFileLink, NatsCarrierDeferredError } from "../src/mesh/bridge-nats-file.js";
@@ -14,6 +14,7 @@ import { bridgeNatsEnvelopeId, bridgeNatsMappedCommandId } from "../src/mesh/bri
 import { controlBodyFingerprint } from "../src/mesh/control-idempotency.js";
 import { MeshStore, type MeshEvent, type MeshIdentity } from "../src/mesh/store.js";
 import type { FabricHostRecord, FabricParticipantRecord } from "../src/topology/types.js";
+import { readHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import {
   BRIDGE_MACHINE, FakePort, LINK, MemoryLedger, POD_MACHINE, fileLead, linkIdentity, natsLead, route, settle,
 } from "./helpers/bridge-nats-l2-fakes.js";
@@ -86,6 +87,90 @@ const natsAsk = (id = "nats-env-1", body: Record<string, unknown> = {}) => ({
 });
 
 describe("NatsCarrierSide under MeshBridge", () => {
+  it("resamples a short source lease before its translated mirror deadline without a KV watch event", async () => {
+    const { store, port, link } = await fixture();
+    const renewal = vi.spyOn(link.local, "renewMirroredLeases");
+    const lease = () => readHostLease(store.root, natsLead.id)!;
+    const token = "pod-1";
+    const hostKey = key("topology/hosts/", natsLead.id);
+    const heldHost = store.get(hostKey, { fresh: true })!;
+    await store.put({ key: hostKey, identity: heldHost.updatedBy,
+      value: { ...(heldHost.value as Record<string, unknown>), incarnationToken: token } });
+    writeHostLease(store.root, { ...lease(), incarnationToken: token });
+    const originalPresence = port.natsPresence;
+    let samples = 0;
+    port.presence = async () => {
+      samples++;
+      const observedAt = Date.now();
+      const expiresAt = observedAt + 600;
+      return { ...originalPresence, hosts: originalPresence.hosts.map(host => ({ ...host,
+        record: { ...host.record, incarnationToken: token, updatedAt: observedAt, expiresAt }, expiresAt, observedAt })) };
+    };
+    let notify: (() => void) | undefined;
+    port.watchPresence = (changed: () => void, _failed: (error: Error) => void) => {
+      notify = () => changed();
+      return () => { notify = undefined; };
+    };
+    const unwatch = link.remote.subscribeChanges(() => undefined, error => { throw error; });
+    closers.push(unwatch);
+    const before = lease().mirror!.observedAt;
+    notify?.();
+    await new Promise<void>(resolve => setTimeout(resolve, 30));
+    const first = lease().mirror!.observedAt;
+    expect(first).toBeGreaterThanOrEqual(before);
+    await new Promise<void>(resolve => setTimeout(resolve, 350));
+    expect(samples).toBeGreaterThan(1);
+    expect(renewal.mock.calls.at(-1)?.[0][0]?.observedAt).toBeGreaterThan(first);
+    expect(lease().mirror!.observedAt).toBeGreaterThan(first);
+  });
+
+  it("does not renew a source lease when a horizon resample proves it expired", async () => {
+    const { store, port, link } = await fixture();
+    await settle();
+    const renewal = vi.spyOn(link.local, "renewMirroredLeases");
+    const lease = () => readHostLease(store.root, natsLead.id)!;
+    const token = "pod-1";
+    const hostKey = key("topology/hosts/", natsLead.id);
+    const heldHost = store.get(hostKey, { fresh: true })!;
+    await store.put({ key: hostKey, identity: heldHost.updatedBy,
+      value: { ...(heldHost.value as Record<string, unknown>), incarnationToken: token } });
+    writeHostLease(store.root, { ...lease(), incarnationToken: token });
+    const originalPresence = port.natsPresence;
+    let samples = 0;
+    let expiredSampled = false;
+    let secondSampleStarted = false;
+    port.presence = async () => {
+      samples++;
+      if (samples === 1) {
+        const observedAt = Date.now();
+        const expiresAt = observedAt + 1_000;
+        return { ...originalPresence, hosts: originalPresence.hosts.map(host => ({ ...host,
+          record: { ...host.record, incarnationToken: token, updatedAt: observedAt, expiresAt }, expiresAt, observedAt })) };
+      }
+      // The horizon timer's live KV read returns after the sampled source lease has expired.
+      secondSampleStarted = true;
+      await new Promise<void>(resolve => setTimeout(resolve, 1_100));
+      expiredSampled = true;
+      return { ...originalPresence, hosts: [], participants: [] };
+    };
+    const unwatch = link.remote.subscribeChanges(() => undefined, error => { throw error; });
+    closers.push(unwatch);
+    const sampleDeadline = Date.now() + 1_500;
+    while (!secondSampleStarted && Date.now() < sampleDeadline) await new Promise<void>(resolve => setTimeout(resolve, 10));
+    expect(secondSampleStarted).toBe(true);
+    const liveMirror = lease().mirror!;
+    expect(liveMirror.sourceExpiresAt - liveMirror.sourceObservedAt).toBe(1_000);
+    const deadline = Date.now() + 3_000;
+    while ((!expiredSampled || !renewal.mock.calls.some(call => call[0].length === 0)) && Date.now() < deadline) {
+      await new Promise<void>(resolve => setTimeout(resolve, 10));
+    }
+    expect(expiredSampled).toBe(true);
+    const renewals = renewal.mock.calls;
+    expect(renewals.some(call => call[0].length === 0)).toBe(true);
+    expect(lease().mirror!.observedAt).toBe(liveMirror.observedAt);
+    expect(lease().mirror!.sourceExpiresAt).toBe(liveMirror.sourceExpiresAt);
+  });
+
   it("mirrors both ways at start: the NATS root into the file mesh, file roots and the link identity into KV", async () => {
     const { link, port } = await fixture();
     expect(link.local.holds(natsLead.id)).toBe(true);

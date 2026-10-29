@@ -7,7 +7,7 @@ import {
 } from "../transport/types.js";
 import type { BridgeChange } from "./change-notifier.js";
 import {
-  admitPresence, BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, LEASE_LAPSE_DEFER_MS, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
+  admitPresence, BRIDGE_LEASE_MS, BRIDGE_PROTOCOL_VERSION, BridgeMirrorDeferredError, LEASE_LAPSE_DEFER_MS, MeshBridge, StoreBridgeSide, type BridgedIds, type BridgeHead, type BridgePresence, type BridgePublish,
   type BridgeRead, type BridgeSide, type MeshBridgeOptions,
 } from "./bridge.js";
 import {
@@ -293,6 +293,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   #lastMirror: { hosts: BridgePresence["hosts"]; participants: BridgePresence["participants"] } | undefined;
   #fileRenewal: Promise<void> | undefined;
   #fileRenewalPending = false;
+  #fileRenewalTimer: ReturnType<typeof setTimeout> | undefined;
   #fenced = false;
 
   constructor(options: NatsCarrierSideOptions) {
@@ -424,22 +425,60 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     this.#listeners.add(listener);
     const unwatch = this.port.watchPresence(() => {
       changed("presence");
+      clearTimeout(this.#fileRenewalTimer);
+      this.#fileRenewalTimer = undefined;
       this.#fileRenewalPending = true;
       this.#renewFileMirror();
     }, failed);
     this.#start();
     if (this.#pumpError) queueMicrotask(() => failed(this.#pumpError!));
+    // The KV watch is primary. Seed one sample now and retain a horizon-based safety
+    // check in case a renewal notification is delayed or lost.
+    this.#fileRenewalPending = true;
+    this.#renewFileMirror();
     return () => {
       this.#listeners.delete(listener);
       unwatch();
+      if (this.#listeners.size === 0) {
+        clearTimeout(this.#fileRenewalTimer);
+        this.#fileRenewalTimer = undefined;
+      }
     };
   }
 
   /** The live KV watch renews inbound leases independently of a slow bidirectional pass or
-   * drain. Coalesce bursts, but resample after changes during a write. Never restamp a cached
-   * snapshot or change membership here: only the ordinary full sync installs/removes owners. */
+   * drain. Coalesce bursts, but resample after changes during a write. A bounded timer is only
+   * the missed-watch safety net; every check reads fresh KV presence and cannot change membership. */
+  #armFileMirrorCheck(delayMs: number): void {
+    clearTimeout(this.#fileRenewalTimer);
+    this.#fileRenewalTimer = undefined;
+    if (this.#fenced || this.#listeners.size === 0 || !Number.isFinite(delayMs)) return;
+    this.#fileRenewalTimer = setTimeout(() => {
+      this.#fileRenewalTimer = undefined;
+      if (this.#fenced || this.#listeners.size === 0) return;
+      this.#fileRenewalPending = true;
+      this.#renewFileMirror();
+    }, Math.max(1, Math.floor(delayMs)));
+    this.#fileRenewalTimer.unref?.();
+  }
+
+  #scheduleFileMirrorCheck(hosts: BridgePresence["hosts"]): void {
+    const horizons = hosts.map(host => typeof host.observedAt === "number" && Number.isFinite(host.observedAt)
+      ? host.expiresAt - host.observedAt : Number.NaN).filter(value => Number.isFinite(value) && value > 0);
+    if (horizons.length === 0) {
+      clearTimeout(this.#fileRenewalTimer);
+      this.#fileRenewalTimer = undefined;
+      return;
+    }
+    // Match MeshBridge's half-sampled-horizon refresh rule, capped by the local mirror TTL.
+    // This polls before a short source lease can lapse, without extending its observed expiry.
+    this.#armFileMirrorCheck(Math.min(BRIDGE_LEASE_MS, ...horizons) / 2);
+  }
+
   #renewFileMirror(): void {
     if (this.#fileRenewal || this.#fenced || this.#listeners.size === 0) return;
+    clearTimeout(this.#fileRenewalTimer);
+    this.#fileRenewalTimer = undefined;
     this.#fileRenewal = (async () => {
       while (this.#fileRenewalPending && !this.#fenced && this.#listeners.size > 0) {
         this.#fileRenewalPending = false;
@@ -450,12 +489,14 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
         if (this.#fenced || this.#listeners.size === 0) return;
         const admitted = admitPresence(claimed, new Set(local.reserved), this.#link);
         await this.#file.renewMirroredLeases(admitted.hosts, observedAt);
+        this.#scheduleFileMirrorCheck(admitted.hosts);
       }
     })().catch(error => {
       if (this.#fenced || this.#listeners.size === 0) return;
       if (error instanceof BridgeMirrorDeferredError || isMeshRetryableBusy(error)) {
-        // No new authority on failure. The normal sync and the next KV update may retry.
+        // No new authority on failure. Retry on a bounded backoff even if the KV watch is quiet.
         this.#log(`NATS file mirror renewal deferred: ${message(error)}`);
+        this.#armFileMirrorCheck(Math.min(1_000, BRIDGE_LEASE_MS / 4));
       } else {
         const failure = error instanceof Error ? error : new Error(message(error));
         for (const listener of this.#listeners) listener.failed(failure);
@@ -504,6 +545,9 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
 
   async fence(): Promise<void> {
     this.#fenced = true;
+    clearTimeout(this.#fileRenewalTimer);
+    this.#fileRenewalTimer = undefined;
+    this.#fileRenewalPending = false;
     await this.#fileRenewal;
     await this.port.fence();
   }
@@ -514,6 +558,9 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
 
   close(_error?: Error): void {
     this.#fenced = true;
+    clearTimeout(this.#fileRenewalTimer);
+    this.#fileRenewalTimer = undefined;
+    this.#fileRenewalPending = false;
     this.#abort.abort();
     clearInterval(this.#working);
     this.#room?.();

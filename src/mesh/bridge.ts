@@ -814,6 +814,27 @@ const participantCopyDigest = (value: FabricParticipantRecord): string =>
   contentDigest({ ...value, updatedAt: undefined, expiresAt: undefined,
     turns: undefined, toolCalls: undefined, usage: undefined, currentTool: undefined });
 
+/** A root-copy status difference is safe to resolve only under its unique live native owner lease. */
+const ownerLeaseAuthorizesRootCopy = (participant: FabricParticipantRecord, owner: FabricHostRecord,
+  leases: ReadonlyMap<string, FabricHostLease>, now: number): boolean => {
+  const lease = leases.get(owner.id);
+  const session = lease?.session;
+  if (owner.remoteHost !== undefined || participant.kind !== "root" || participant.ownerHostId !== owner.id ||
+    participant.rootId !== owner.rootId || participant.ownerIdentityId !== owner.identity.id ||
+    participant.ownerIncarnation === undefined || participant.ownerIncarnation !== owner.incarnationToken ||
+    (owner.identity.sessionId !== undefined && owner.identity.sessionId !== participant.sessionId) ||
+    !participant.sessionId || !lease || lease.id !== owner.id || lease.rootId !== owner.rootId ||
+    lease.identityId !== owner.identity.id || lease.incarnationToken !== owner.incarnationToken ||
+    !session || session.id !== participant.sessionId || session.startedAt !== participant.startedAt ||
+    !(lease.updatedAt <= now) || !(session.updatedAt <= now) || !(lease.expiresAt > now) ||
+    !(session.expiresAt > now) || !(owner.expiresAt > now)) return false;
+  // Any other fresh lease for this root makes the owner claim ambiguous, regardless of identity.
+  // Exclude this lease: its freshness is checked explicitly above, so this guard measures only competitors.
+  const claimants = [...leases.values()].filter(candidate => candidate.id !== lease.id &&
+    candidate.rootId === owner.rootId && candidate.expiresAt > now);
+  return claimants.length === 0;
+};
+
 /**
  * A bridge side over a mesh store on this host. `peer` names the other side: it is the
  * `remoteHost` mark on mirrored records and the `bridge.from` of events it bridges in.
@@ -1273,7 +1294,8 @@ export class StoreBridgeSide implements BridgeSide {
     }
     const live = new Map(hosts.map((host) => [host.record.id, host.record]));
     const participants = new Map<string, { record: FabricParticipantRecord; updatedAt: number }>();
-    const participantCopies = new Map<string, { record: FabricParticipantRecord; updatedAt: number }>();
+    const participantCopies = new Map<string, { record: FabricParticipantRecord; updatedAt: number; updatedById: string }>();
+    const conflictingParticipants = new Set<string>();
     for (const entry of participantEntries) {
       const mark = remoteHostOf(entry.value);
       if (mirrorLinkOf(entry.value) === this.peer) continue;
@@ -1286,9 +1308,22 @@ export class StoreBridgeSide implements BridgeSide {
       }
       const copy = participantCopies.get(entry.key);
       if (copy && participantCopyDigest(copy.record) !== participantCopyDigest(participant)) {
-        rawDroppedCount += 1; reasons.add("topology/participants", "conflicting-copy");
+        const ownerForConflict = live.get(participant.ownerHostId);
+        // `status` is the sole non-routing field this exception tolerates. All other fields,
+        // including unlisted future fields, remain conflicts because the normalized records differ.
+        const statusOnly = copy.record.kind === "root" && participant.kind === "root" &&
+          participantCopyDigest({ ...copy.record, status: participant.status }) === participantCopyDigest(participant) &&
+          copy.updatedById === participant.ownerIdentityId && entry.updatedBy.id === participant.ownerIdentityId &&
+          ownerForConflict !== undefined && ownerLeaseAuthorizesRootCopy(copy.record, ownerForConflict, leases, now) &&
+          ownerLeaseAuthorizesRootCopy(participant, ownerForConflict, leases, now);
+        if (!statusOnly) {
+          rawDroppedCount += 1; reasons.add("topology/participants", "conflicting-copy");
+          conflictingParticipants.add(participant.id);
+        }
       }
-      if (!copy || copy.updatedAt <= entry.updatedAt) participantCopies.set(entry.key, { record: participant, updatedAt: entry.updatedAt });
+      if (!copy || copy.updatedAt <= entry.updatedAt) participantCopies.set(entry.key, {
+        record: participant, updatedAt: entry.updatedAt, updatedById: entry.updatedBy.id,
+      });
       const owner = live.get(participant.ownerHostId);
       if (mark === undefined && participant.kind === "root" && owner && entry.updatedBy.id === participant.ownerIdentityId &&
         owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId) {
@@ -1303,7 +1338,8 @@ export class StoreBridgeSide implements BridgeSide {
         reasons.add("topology/participants", entry.updatedBy.id !== participant.ownerIdentityId ? "writer-mismatch" : "owner-mismatch");
       }
     }
-    const admitted = admitPresence({ hosts, participants: [...participants.values()].map(({ record }) => record),
+    const admitted = admitPresence({ hosts: hosts.filter(({ record }) => !conflictingParticipants.has(record.id)),
+      participants: [...participants.values()].map(({ record }) => record).filter(record => !conflictingParticipants.has(record.id)),
       ...(rawDroppedCount > 0 ? { partial: true, droppedCount: rawDroppedCount, droppedReasons: reasons.entries() } : {}) }, new Set());
     return {
       // Root admission exports canonical root hosts; valid resident/runtime rows travel separately

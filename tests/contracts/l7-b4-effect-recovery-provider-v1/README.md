@@ -42,8 +42,13 @@ implement the entire frozen R3/B3 contract. This draft must not be called G2 GRE
 - Receipt `viewSha256` was removed in v2 because Pi's request digest contains
   the receipt ref. `joinedHistorySha256` is pinned to Pi's base-history encoding;
   C23 checks exact ordered JSON.stringify entry bytes, inner LF, and outer hash.
-- The multi-original-pin case is OPEN for fv2-l7-main; the two-argument settlement
-  signature cannot express a different generation per original in one pass.
+- K10 is DECIDED: pins are per `(sessionId, originalInputId)`; different originals
+  may have different g values. Each repair/continuation must carry its own original's
+  pin; B5 refuses cross-original, unpinned or reminted g with a coded error asserted
+  by `.code`. B4 stays pin-agnostic. Real + fake assertions belong to the B5/Main
+  composition suite in `../l7-b5-admission-v1/`, not this B4 suite; owner
+  fv2-l7-b5fix, due 2026-10-30 18:00Z. See B4-CONTRACT.md §4 rule 5 for the
+  recorded decision and unexecuted B5/Main coverage.
 
 ## Consumer-owned identities (K9)
 

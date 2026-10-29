@@ -5838,13 +5838,13 @@ export class AgentManager {
         throw new Error("Agent release quiescence has an unconfirmed worker exit observation");
       }
     }
-    // Check preserved trees from previous hosts too. Reuse the conservative
-    // retention predicate without removing anything. Unknown external transport
-    // identities have no surviving handle, so are deliberately out of scope.
+    // Check preserved trees from previous hosts too. Prove settlement, not
+    // removability: retained originals are history, not live custody. Unknown
+    // external transport identities have no surviving handle, so are deliberately out of scope.
     const started = performance.now();
     const expired = () => performance.now() - started > 100;
     const inspect = (directory: string, tracked: boolean, depth = 0): void => {
-      if (expired() || depth > 32 || !canRemoveTerminalRun(directory, expired)) {
+      if (expired() || depth > 32 || !isSettledTerminalRun(directory, expired)) {
         throw new Error(`Agent release quiescence has an unresolved run tree: ${directory}`);
       }
       if (!tracked) {

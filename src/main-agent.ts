@@ -1566,9 +1566,11 @@ export class MainAgentController implements FabricMainAgentTarget {
     // Install before either replay branch or an idle drain can run.
     this.#readNativeCustody = readNativeCustody;
     this.#nativeJournalUnknown = false;
-    const sessionFile = context.sessionManager.getSessionFile?.();
-    this.#nativeSessionRef = readNativeCustody && sessionFile
-      ? { sessionId: context.sessionManager.getSessionId(), sessionFile } : undefined;
+    const sessionManager = context.sessionManager;
+    const sessionFile = sessionManager?.getSessionFile?.();
+    const sessionId = sessionManager?.getSessionId?.();
+    this.#nativeSessionRef = readNativeCustody && sessionId && sessionFile
+      ? { sessionId, sessionFile } : undefined;
     const on = (name: string, fn: (event: any, ctx: ExtensionContext) => unknown): void => {
       if (typeof this.pi.on !== "function") return;
       const off = (this.pi.on as (name: string, fn: (event: any, ctx: ExtensionContext) => unknown) => unknown)(name, fn);

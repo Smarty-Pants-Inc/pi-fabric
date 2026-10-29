@@ -170,7 +170,7 @@ export interface NatsPresenceReaderOptions {
   readonly monotonic?: () => number;
 }
 
-export type NatsPresenceListener = (bucket: Bucket, machine: string | undefined) => void;
+export type NatsPresenceListener = (bucket: Bucket, machine: string | undefined, kind: BridgeChange) => void;
 
 /**
  * Read-only view of every machine's KV presence and leases. A lease's live window is bounded by
@@ -343,9 +343,25 @@ export class NatsPresenceReader {
     };
   }
 
-  #notify(bucket: Bucket, machine?: string): void {
+  /** Compare the existing canonical routes at receipt time, not a cached live judgment:
+   * an expired lease revived by this put changes authority even without a gone event.
+   * Include the validated owner/lease binding but omit only renewal clocks. A lease with
+   * no presence rows has no route authority yet; its later presence put wakes the bridge. */
+  #leaseAuthority(key: string): string {
+    const seen = this.#hosts.get(key);
+    const lease = seen?.entry.value;
+    const stable = lease ? (({ updatedAt: _updatedAt, expiresAt: _expiresAt, ...binding }) => binding)(lease) : undefined;
+    return canonicalJson([...this.#records.values()]
+      .filter(record => natsLeaseKey(machineOfKey(record.entry.key, "p")!, record.entry.value.ownerHostId) === key)
+      .map(record => {
+        const { liveUntil: _liveUntil, remainingAuthorityMs: _remaining, ...route } = this.#route(record);
+        return { route, lease: stable, owner: seen?.entry.owner };
+      }));
+  }
+
+  #notify(bucket: Bucket, machine?: string, kind: BridgeChange = "presence"): void {
     for (const listener of [...this.#listeners]) {
-      try { listener(bucket, machine); } catch (error) { this.#report(error); }
+      try { listener(bucket, machine, kind); } catch (error) { this.#report(error); }
     }
     if (this.ready) for (const waiter of [...this.#readyWaiters]) waiter();
   }
@@ -371,7 +387,9 @@ export class NatsPresenceReader {
             // A reconnect gap: keep serving the last snapshot (each lease still ages out by its own
             // receipt time) while the new one loads, so a short outage never reads as "everyone left".
             if (this.#ready.has(bucket)) this.#resync[bucket] = { entries: new Map(), revisions: new Map() };
-            else { this.#clear(bucket); this.#notify(bucket); }
+            else this.#clear(bucket);
+            // A gap changes canonical certainty immediately, even while serving the held view.
+            this.#notify(bucket);
             continue;
           }
           if (event.type === "ready") {
@@ -396,6 +414,7 @@ export class NatsPresenceReader {
           if (revision <= (revisions.get(key) ?? 0)) continue;
           revisions.set(key, revision);
           const receivedAt = this.#monotonic();
+          let change: BridgeChange = "presence";
           if (bucket === "presence") {
             const target = (resync?.entries ?? this.#records) as Map<string, Seen<FabricParticipantRecord>>;
             target.delete(key);
@@ -403,11 +422,19 @@ export class NatsPresenceReader {
             if (record && event.type === "put") target.set(key, { entry: { ...event.entry, value: cloneFrozen(record) }, receivedAt });
           } else {
             const target = (resync?.entries ?? this.#hosts) as Map<string, Seen<FabricKvHostLease>>;
+            const previous = target.get(key)?.entry.value;
+            const before = !resync ? this.#leaseAuthority(key) : undefined;
             target.delete(key);
             const lease = event.type === "put" ? leaseValue(event.entry) : undefined;
             if (lease && event.type === "put") target.set(key, { entry: { ...event.entry, value: cloneFrozen(lease) }, receivedAt });
+            // Bucket origin alone cannot certify TTL-only. Canonical binding/liveness must
+            // survive, neither owner expiry nor receipt-bounded duration may shorten, and
+            // watch uncertainty always remains presence. No wire stamp or receiver cache.
+            if (!resync && this.ready && !this.resyncing && lease && before === this.#leaseAuthority(key) &&
+              (!previous || (lease.expiresAt >= previous.expiresAt &&
+                lease.expiresAt - lease.updatedAt >= previous.expiresAt - previous.updatedAt))) change = "lease";
           }
-          if (!resync) this.#notify(bucket, machine);
+          if (!resync) this.#notify(bucket, machine, change);
         }
         if (this.#closed) return;
         throw new Error(`NATS bridge ${bucket} watch ended`);
@@ -1178,9 +1205,9 @@ export class NatsBridgePresence {
    * must stop, not keep routing on a view that can no longer be refreshed.
    */
   subscribeChanges(changed: (kind: BridgeChange) => void, failed?: (error: Error) => void): () => void {
-    const stopChanges = this.reader.subscribe((bucket, machine) => {
+    const stopChanges = this.reader.subscribe((_bucket, machine, kind) => {
       if (machine === this.reader.machine) return;
-      changed(bucket === "presence" ? "presence" : "lease");
+      changed(kind);
     });
     const stopFailures = failed ? this.reader.subscribeFailure(failed) : undefined;
     return () => { stopChanges(); stopFailures?.(); };

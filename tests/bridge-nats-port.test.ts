@@ -249,7 +249,7 @@ describe("NATS bridge port: link identity and presence", () => {
       `${LINK_ID}@${BRIDGE}`, `${FILE_ROOT}@${BRIDGE}`, `${NATS_ROOT}@v2-org`, `${NATS_ROOT}@v3-org`]);
   });
 
-  it("preserves the KV bucket kind for remote revisions and ignores its own machine's rows", async () => {
+  it("preserves lease renewal kind and classifies authority expiry as presence, ignoring its own machine's rows", async () => {
     const w = kvWorld();
     seedNative(w, V2, natsRoot(), 1_000_000);
     const { port: p, clock } = port(w);
@@ -279,10 +279,10 @@ describe("NATS bridge port: link identity and presence", () => {
       expect(p.resolve(NATS_ROOT)?.route.live).toBe(true);
 
       w.leases.expire(leaseKey);
-      await vi.waitFor(() => expect(changes).toEqual(["lease", "lease", "lease", "presence", "lease"]));
+      await vi.waitFor(() => expect(changes).toEqual(["lease", "lease", "lease", "presence", "presence"]));
       expect(p.resolve(NATS_ROOT)?.route.live).toBe(false);
       expect(w.presence.delete(presenceKey, w.presence.values.get(presenceKey)!.revision)).toBe(true);
-      await vi.waitFor(() => expect(changes).toEqual(["lease", "lease", "lease", "presence", "lease", "presence"]));
+      await vi.waitFor(() => expect(changes).toEqual(["lease", "lease", "lease", "presence", "presence", "presence"]));
 
       const beforeOwnWithdrawal = [...changes];
       await p.withdraw();

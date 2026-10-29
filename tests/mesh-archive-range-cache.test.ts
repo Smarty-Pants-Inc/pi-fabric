@@ -59,6 +59,39 @@ it("keeps all archive names, bytes and mtimes identical through 120 sealed range
   expect(snapshot(f.dir)).toEqual(before);
 });
 
+it.each([false, true])("reuses unchanged head segments across a publish and reparses the changed segment (async: %s)", async asynchronous => {
+  const f = setup();
+  const values = Array.from({ length: 80 }, (_, i) => ({
+    ...event(i + 1), topic: i < 40 ? "test.unchanged" : "test.changed",
+  }));
+  f.archive.catchUp(values.map(value => ({ event: value, line: JSON.stringify(value) })));
+  const read = () => {
+    // Include fresh archive objects: the process-local cache owns the hints.
+    const archive = new MeshArchive(f.dir, f.root);
+    return asynchronous ? archive.readAfterAsync(80, MAX, all, 10) : archive.readAfter(80, MAX, all, 10);
+  };
+  expect(await read()).toEqual([]);
+  const directory = path.join(f.dir, "2024/01/01");
+  expect(fs.existsSync(path.join(directory, "SEAL.json"))).toBe(false);
+  const unchanged = path.join(directory, archiveFileName("test.unchanged"));
+  const before = fs.readFileSync(unchanged);
+  const next = { ...event(81), topic: "test.changed" };
+  f.archive.commit(f.archive.begin({ event: next, line: JSON.stringify(next) }));
+  expect(fs.readFileSync(unchanged)).toEqual(before);
+  const parse = JSON.parse;
+  const parsed = new Map<string, number>();
+  vi.spyOn(JSON, "parse").mockImplementation((...args: Parameters<typeof JSON.parse>) => {
+    const value = parse(...args);
+    if (typeof value?.sequence === "number" && typeof value?.topic === "string") {
+      parsed.set(value.topic, (parsed.get(value.topic) ?? 0) + 1);
+    }
+    return value;
+  });
+  expect(await read()).toEqual([next]);
+  expect(parsed.get("test.unchanged") ?? 0).toBe(0);
+  expect(parsed.get("test.changed")).toBe(41);
+});
+
 it("invalidates memory on same-size seal rewrite, seal removal and resealing", () => {
   const f = setup(), directory = path.join(f.dir, "2024/01/01");
   fs.mkdirSync(directory, { recursive: true });

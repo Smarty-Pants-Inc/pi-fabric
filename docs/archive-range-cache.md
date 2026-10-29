@@ -8,8 +8,12 @@ fine tier does not discard day bounds. A range outside a day is skipped without
 opening or parsing any segment, after checking the names, segment stats, directory
 and seal generation. Bounds are derived from fenced scans, never SEAL or digest
 counters or old range sidecars. Unknown extrema disable the skip. Reads and retries
-reuse summaries across archive objects; a cold process must scan once. These are
-retained-cache accounting caps, not total heap or RSS limits. Summary eviction is
+reuse summaries across archive objects; a cold process must scan once. Unsealed
+head-day fine hints survive digest-checkpoint renames: reuse requires each segment's
+exact device, inode, size, mtime and ctime identity, not the directory's metadata
+generation. A changed segment is rescanned; directory, seal and abort-marker fences
+still protect the whole read. These are retained-cache accounting caps, not total
+heap or RSS limits. Summary eviction is
 safe but can require another scan on archives exceeding the summary budget.
 
 ## One-time migration before backing up sealed days

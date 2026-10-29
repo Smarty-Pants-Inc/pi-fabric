@@ -1545,15 +1545,23 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const agents = objectValue(input.agents);
   const placement = normalizeAgentPlacement(agents.placement);
   const sandbox = objectValue(agents.sandbox);
-  const sandboxTemplate = sandbox.template === undefined ? DEFAULT_FABRIC_CONFIG.agents.sandbox.template
-    : typeof sandbox.template === "string" && /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(sandbox.template)
-      ? sandbox.template : (() => { throw new Error("Invalid agents.sandbox.template"); })();
+  const defaults = DEFAULT_FABRIC_CONFIG.agents.sandbox;
   const sandboxConfig: SandboxTransportConfig = {
-    enabled: booleanValue(sandbox.enabled, DEFAULT_FABRIC_CONFIG.agents.sandbox.enabled),
-    template: sandboxTemplate,
-    ...(sandbox.placementUrl !== undefined ? { placementUrl: sandboxPlacementUrlValue(sandbox.placementUrl) } : {}),
-    readyTimeoutMs: boundedInteger(sandbox.readyTimeoutMs, DEFAULT_FABRIC_CONFIG.agents.sandbox.readyTimeoutMs, 1_000, 90_000),
+    enabled: booleanValue(sandbox.enabled, defaults.enabled),
+    template: defaults.template,
+    readyTimeoutMs: boundedInteger(sandbox.readyTimeoutMs, defaults.readyTimeoutMs, 1_000, 90_000),
   };
+  for (const field of ["template", "namespace"] as const) {
+    const value = sandbox[field];
+    if (value === undefined) continue;
+    if (typeof value !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(value)) {
+      throw new Error(`Invalid agents.sandbox.${field}`);
+    }
+    sandboxConfig[field] = value;
+  }
+  if (sandbox.placementUrl !== undefined) {
+    sandboxConfig.placementUrl = sandboxPlacementUrlValue(sandbox.placementUrl);
+  }
   const placementApi = normalizePlacementApiConfig(agents.placementApi);
   const claude = objectValue(agents.claude);
   const veda = objectValue(agents.veda);

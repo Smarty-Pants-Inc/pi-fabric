@@ -12,6 +12,7 @@ import type { ActorManager } from "../actors/manager.js";
 import type { FabricActorInfo, FabricActorRunBinding } from "../actors/types.js";
 import { assertSteerPriority, type FabricSteerPriority, type FabricAgentMessageResult, type FabricMainAgentTarget } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
+import type { NativeControlAdmission } from "../mesh/bridge-nats-ingress.js";
 import type { FabricInvocationContext } from "../protocol.js";
 import { controlOwnerIncarnation, warnUnfencedControlDelivery, controlActorBindingOptions, FabricControlStaleIncarnationError, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../topology/types.js";
@@ -191,7 +192,7 @@ export class AgentMessageRouter {
   #lastVerifiedReconnectAt = 0;
   constructor(
     readonly manager: Pick<AgentManager, "status" | "steer" | "followUp" | "stop">,
-    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; mesh?: { root: string } },
+    readonly actorManager: Pick<ActorManager, "identity" | "status" | "validateDirectMessage" | "tell" | "ask" | "stop" | "steerRemote" | "resolveBinding" | "resolveActivationBinding"> & { owns?: (id: string) => boolean; isNativeActor?: (id: string) => boolean; mesh?: { root: string } },
     readonly mainAgent: Pick<FabricMainAgentTarget, "matches" | "local" | "id" | "deliverAgent" | "interactive" | "stop" | "bindingContext">,
     readonly participants: Pick<FabricParticipantSource, "get" | "scheduleRefresh" | "writeStalled" | "lastKnown"> & Partial<Pick<FabricParticipantSource, "peers" | "list" | "lineageAlive" | "routingUnavailable" | "refreshRoutingView" | "retainedRouteAllowed">> & {
       resolveRoutingLease?: (id: string, signal?: AbortSignal, budget?: MirrorLeaseWaitBudget) => Promise<boolean>;
@@ -957,6 +958,9 @@ export class AgentMessageRouter {
       throw error;
     }
     const { actor, participant } = target;
+    if (this.#nativeActor(actor?.id ?? participant?.id ?? id, actor, participant)) {
+      throw new Error("Native actors accept only authenticated bridge asks, not tell/steer/followUp");
+    }
     const localActor = Boolean(actor && (this.actorManager.owns?.(actor.id) ?? (!participant || participant.local)));
     const binding = options.binding && context && localActor
       ? await this.resolvePiRunBinding(options.binding, actor!.runner, context, actor!.routeClass !== undefined, `actor:${actor!.name}`)
@@ -1070,11 +1074,17 @@ export class AgentMessageRouter {
     }
   }
 
+  #nativeActor(id: string, actor?: FabricActorInfo, participant?: FabricParticipantInfo): boolean {
+    return this.actorManager.isNativeActor?.(id) === true || actor?.runner === "native" ||
+      (actor !== undefined && Object.hasOwn(actor, "execution")) || participant?.runner === "native";
+  }
+
   async acceptControl(
     command: FabricControlCommand,
     from: MeshIdentity,
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
+    nativeAdmission?: NativeControlAdmission,
   ): Promise<FabricControlAcceptance> {
     try {
       assertSteerPriority(command.priority, command.operation);
@@ -1140,11 +1150,20 @@ export class AgentMessageRouter {
 
     const provenance = verification === "mesh" || verification === "bridge"
       ? fabricTurnProvenance(from, command.operation === "steer" ? "steer" : "followUp", verification, command.principal) : undefined;
-    const message = command.message?.trim();
-    if (!message) return { accepted: false, error: "Fabric control message must not be empty" };
     if (command.operation === "ask") {
       try {
         const actor = this.actorManager.status(command.targetId);
+        const native = this.#nativeActor(actor.id, actor);
+        if (native && !nativeAdmission) throw new Error("Native actor ask requires authenticated bridge admission");
+        if (native && (command.binding !== undefined ||
+            ["model", "thinking", "modelReason", "routeClass", "runner", "execution"].some(key => Object.hasOwn(command, key)))) {
+          throw new Error("Native actors do not support model/thinking overrides");
+        }
+        // The private admission binds exact bytes. Never normalize a native message.
+        const message = native ? command.message : command.message?.trim();
+        if (typeof message !== "string" || (!native && !message)) {
+          return { accepted: false, error: "Fabric control message must not be empty" };
+        }
         const ownership = this.#get(actor.id);
         if (ownership && !ownership.local) {
           return {
@@ -1152,12 +1171,25 @@ export class AgentMessageRouter {
             error: `Participant ${actor.id} is owned by ${ownership.ownerHostId}`,
           };
         }
+        // Validate owner-default provenance even for native calls, but do not
+        // turn the generic foreign-caller binding:{} into a native model override.
+        const bindingOptions = controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId);
+        if (native) {
+          // command.binding was refused above. Remove ONLY helper-created empty
+          // binding views, after its provenance validation; preserve other policy.
+          if ((bindingOptions.binding && Object.keys(bindingOptions.binding).length) ||
+              (bindingOptions.overrides && Object.keys(bindingOptions.overrides).length)) {
+            throw new Error("Native actors do not support model/thinking overrides");
+          }
+          delete bindingOptions.binding;
+          delete bindingOptions.overrides;
+        }
         const result = await this.actorManager.ask(
           actor.id,
           message,
           command.data,
           signal,
-          { provenance, ...controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId), sender: command.sender ?? null },
+          { provenance, ...bindingOptions, ...(native && nativeAdmission ? { nativeAdmission } : {}), sender: command.sender ?? null },
         );
         return { accepted: true, messageId: result.id, result };
       } catch (error) {
@@ -1167,6 +1199,8 @@ export class AgentMessageRouter {
         };
       }
     }
+    const message = command.message?.trim();
+    if (!message) return { accepted: false, error: "Fabric control message must not be empty" };
     if (this.mainAgent.local && this.mainAgent.matches(command.targetId)) {
       if (this.#localMainNonInteractive()) {
         return { accepted: false, error: new FabricParticipantNonInteractiveError(this.mainAgent.id).message };
@@ -1233,6 +1267,9 @@ export class AgentMessageRouter {
       const ownership = this.#get(actor.id);
       if (ownership && !ownership.local) {
         return { accepted: false, error: `Participant ${actor.id} is owned by ${ownership.ownerHostId}` };
+      }
+      if (this.#nativeActor(actor.id, actor, ownership)) {
+        return { accepted: false, error: "Native actors accept only authenticated bridge asks, not tell/steer/followUp" };
       }
       const options = controlActorBindingOptions(command, from, actor.rootId, this.participants.get(from.id)?.rootId);
       // Refuse inexact owner-side model selections before acknowledging a synchronous tell.

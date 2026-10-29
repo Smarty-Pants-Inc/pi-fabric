@@ -5,6 +5,8 @@ import { SessionActorOrphans } from "./session-orphans.js";
 import { ActorSlotRecovery } from "./slot-recovery.js";
 import { slotAdmissionFor } from "./slot-admission.js";
 import { ActorRegistryStore } from "./registry-store.js";
+import type { NativeActorBinding } from "./native-handler.js";
+import { hasNativeActorMarker, NativeActorUnsupportedOperationError } from "./native-execution.js";
 
 /**
  * Run every halt step even when one throws, then report every failure at once: a scope
@@ -120,7 +122,13 @@ export class ActorDirectory extends ActorManager {
     return await super.dormantIdleActors(protectedIds) + await this.#secondary.dormantIdleActors(protectedIds);
   }
   override meshCaughtUp(): boolean { return super.meshCaughtUp() && this.#secondary.meshCaughtUp(); }
+  override isNativeActor(id: string): boolean { return super.isNativeActor(id) || this.#secondary.isNativeActor(id); }
+  override ensureNativeActor(binding: NativeActorBinding): Promise<FabricActorInfo> {
+    if (binding.scope !== "session") return Promise.reject(new NativeActorUnsupportedOperationError());
+    return this.#defaultScope === "session" ? super.ensureNativeActor(binding) : this.#secondary.ensureNativeActor(binding);
+  }
   override async create(request: FabricActorRequest, options: Parameters<ActorManager["create"]>[1] = {}): Promise<FabricActorInfo> {
+    if (hasNativeActorMarker(request)) throw new NativeActorUnsupportedOperationError();
     const scope = request.scope ?? this.#defaultScope;
     if (scope !== "project" && scope !== "session") {
       throw new Error(`Invalid Fabric actor storage scope: ${String(scope)}`);

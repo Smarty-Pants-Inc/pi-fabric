@@ -6,7 +6,7 @@ import type { ParticipantRoute } from "../topology/participant-view.js";
 import type { TransportDelivery, TransportEnvelope } from "../transport/types.js";
 import type { BridgePublish } from "./bridge.js";
 import {
-  BRIDGE_NATS_ACK_TOPIC, BRIDGE_NATS_CONTROL_TOPIC, BRIDGE_NATS_HORIZON_MS, BRIDGE_NATS_MACHINE, bridgeNatsAckEnvelopeId,
+  BRIDGE_NATS_ACK_TOPIC, BRIDGE_NATS_CONTROL_TOPIC, BRIDGE_NATS_HORIZON_MS, BRIDGE_NATS_MACHINE, BRIDGE_NATS_SESSION_ID, bridgeNatsAckEnvelopeId,
   bridgeNatsEnvelopeId, bridgeNatsMappedCommandId, BRIDGE_NATS_REFUSAL, type BridgeNatsDirection, type BridgeNatsPortDelivery,
 } from "./bridge-nats-types.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED } from "./control-idempotency.js";
@@ -127,8 +127,8 @@ export interface NatsCarrierRecord {
   /** The owner epoch the command was addressed to. */
   readonly ownerIncarnation?: string;
   /**
-   * toNats: the exact resolved body sent under destinationEventId to ownerMachine. A resend after any
-   * restart rebuilds the envelope from it: same id, same body bytes, the same verified sender id.
+   * The exact resolved forwarded body, in BOTH directions. Restarts/resends reuse these bytes,
+   * sender and principal. toFile retains an extra private ledger copy for immutable receipt repair.
    */
   readonly body?: Record<string, unknown>;
   /** The owner's first recorded answer, once settled (data is the ACK as sent back to the source). */
@@ -167,6 +167,8 @@ export interface NatsCarrierOutcome {
 export interface NatsCarrierLedger {
   claim(record: NatsCarrierRecord): Promise<NatsCarrierClaim>;
   lookup(direction: NatsCarrierDirection, destinationCommandId: string): Promise<NatsCarrierRecord | undefined>;
+  /** INTERNAL: after fresh verified claim, durably project before event exposure or source ACK. */
+  projectNativeIngress?(record: NatsCarrierRecord): Promise<void>;
   /** Records the owner's outcome. The record stays to its expiry so replays and conflicts still resolve. */
   settle(direction: NatsCarrierDirection, destinationCommandId: string, outcome: NatsCarrierOutcome): Promise<void>;
   /** Optional bookkeeping: the destination confirmed the durable append (PubAck / file append). */
@@ -289,7 +291,10 @@ export const mapNatsCommandId = (link: string, direction: NatsCarrierDirection, 
 /** A verified identity, copied field by field (never a caller object with extra keys). */
 export const carrierIdentity = (identity: MeshIdentity): MeshIdentity => ({
   id: identity.id, name: identity.name, kind: identity.kind,
-  ...(typeof identity.sessionId === "string" ? { sessionId: identity.sessionId } : {}),
+  // A verified Main's optional presence sessionId is diagnostic, never authority. Normalize a
+  // supplied value from its actual ID; preserve legacy omission (native context derives it too).
+  ...(typeof identity.sessionId === "string" ? { sessionId: identity.kind === "main" && BRIDGE_NATS_SESSION_ID.test(identity.id)
+    ? identity.id.slice(8) : identity.sessionId } : {}),
 });
 
 const pick = (source: Record<string, unknown>, fields: readonly string[]): Record<string, unknown> => {
@@ -614,11 +619,13 @@ export class NatsBridgeCarrier {
     if (operation === "cancel") {
       cancelCommandId = map(body.cancelCommandId as string);
       const cancelled = await this.#ledger.lookup("toFile", cancelCommandId);
-      if (!cancelled || cancelled.origin !== "control" || cancelled.requesterId !== requesterId || cancelled.targetId !== targetId) {
+      if (!cancelled || cancelled.origin !== "control" || cancelled.requesterId !== requesterId || cancelled.targetId !== targetId ||
+          cancelled.sourceMachine !== sourceMachine) {
         return { kind: "settled", reason: "cancel names no command this link carried for its sender" };
       }
     }
     const carried = decision.principal === "carry" ? principal : undefined;
+    const data: Record<string, unknown> = wire({ ...pick(body, COMMAND_FIELDS), commandId, ...(cancelCommandId !== undefined ? { cancelCommandId } : {}) });
     const record: NatsCarrierRecord = {
       v: 1, direction: "toFile", origin: "control", link: this.link, operation,
       sourceCommandId: body.commandId as string, destinationCommandId: commandId, sourceEventId: input.id, destinationEventId: input.id,
@@ -627,7 +634,7 @@ export class NatsBridgeCarrier {
       ...(cancelCommandId !== undefined ? { sourceCancelCommandId: body.cancelCommandId as string, cancelCommandId } : {}),
       replyTo: body.replyTo as string, bodyDigest, deadlineAt: body.deadlineAt as number,
       expiresAt: Math.max(body.deadlineAt as number, this.#now()) + BRIDGE_NATS_HORIZON_MS,
-      ...(typeof body.ownerIncarnation === "string" ? { ownerIncarnation: body.ownerIncarnation } : {}),
+      ...(typeof body.ownerIncarnation === "string" ? { ownerIncarnation: body.ownerIncarnation } : {}), body: data,
     };
     // L3's claim table decides, at once and without waiting (bridgeNatsClaimAction).
     const claim = await this.#ledger.claim(record);
@@ -642,6 +649,13 @@ export class NatsBridgeCarrier {
         : { accepted: false, error: `Fabric NATS bridge refused the command: ${code}`, errorCode: code, notRun: true },
       "command id reused with different input or from another reply address");
     }
+    // Only a fresh credential-machine/presence/allow-gated delivery can reach this repair seam.
+    // A same-key attempt may have new times; ONLY the immutable FIRST claim's bytes/deadline
+    // are projection authority. Existing-different receipts/recipes still fail before any replay.
+    // Generic control permits data-only asks; they are not native RPC input. Preserve their normal
+    // forwarding/refusal behavior without trying to mint native evidence for a missing message.
+    if ((stored.operation === "cancel" || (stored.operation === "ask" && typeof stored.body?.message === "string")) &&
+        stored.from.kind === "main" && BRIDGE_NATS_SESSION_ID.test(stored.from.id)) await this.#ledger.projectNativeIngress?.(stored);
     if (claim.action === "awaitAck") return { kind: "settled", reason: "the file owner holds this command; its ACK arrives on its own" };
     if (claim.action === "replayAck") {
       // The file store dedupes the command by its mapped id, so the owner never sees a resend: give this
@@ -656,12 +670,14 @@ export class NatsBridgeCarrier {
           originalOwnerIncarnation: typeof answer.ownerIncarnation === "string" ? answer.ownerIncarnation : null },
       }) };
     }
-    // publish, or resend (unconfirmed): present the event; the file store's receipt makes a repeat one append.
-    const data = wire({ ...pick(body, COMMAND_FIELDS), commandId, ...(cancelCommandId !== undefined ? { cancelCommandId } : {}) });
+    // publish, or resend (unconfirmed): present the FIRST event; the file store's receipt makes a repeat one append.
+    // Retry attempt times may differ for ANY operation, but never replace first bytes or extend their deadline.
+    const retained = stored.body;
     const event: MeshEvent = {
-      id: input.id, sequence: delivery.sequence, createdAt: body.requestedAt as number,
-      topic: BRIDGE_NATS_CONTROL_TOPIC, kind: operation, from: carrierIdentity(sender.identity), to: input.hostId,
-      ...(carried ? { principal: carried } : {}), verification: "bridge", data,
+      id: retained ? stored.sourceEventId : input.id, sequence: delivery.sequence,
+      createdAt: (retained ?? data).requestedAt as number,
+      topic: BRIDGE_NATS_CONTROL_TOPIC, kind: stored.operation, from: carrierIdentity(stored.from), to: stored.ownerHostId,
+      ...(stored.principal ? { principal: stored.principal } : {}), verification: "bridge", data: wire(retained ?? data),
     };
     return { kind: "event", event };
   }

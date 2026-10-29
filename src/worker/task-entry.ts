@@ -9,10 +9,24 @@ import { applyTaskRetryDefaults } from "./retry-profile.js";
 import { installFabricResourcePin } from "./resource-pin.js";
 import { installTerminalAnswerBoundary, installTerminalControlFrameFence } from "./terminal-boundary.js";
 import { registerHostExtensionRunner } from "./host-runner-registration.js";
+// Dynamic, not a shared static chunk: the standalone native fence entry must
+// retain its builtin-only import closure and stable task-entry delegation.
+const guardNativeSelection = async (file: string | undefined, cwd: string): Promise<void> => {
+  if (!file) return;
+  const { guardNativeOwnerSessionSelection } = await import("./native-owner-entry.js");
+  guardNativeOwnerSessionSelection(file, cwd);
+};
 
 const [sdkDirectory, scale, ...args] = process.argv.slice(2);
 if (!sdkDirectory) throw new Error("Native Pi SDK directory is required");
 const load = (file: string) => import(pathToFileURL(path.join(sdkDirectory, file)).href);
+// Fail before SDK/session work even when a native-pinned file is selected by
+// bare task-entry instead of its fenced adapter. Ordinary task selections do not
+// match the deployment's independent native identity config (or conservative
+// adjacent-lock hint) and retain their normal behavior.
+for (let index = 0; index < args.length; index++) {
+  if (args[index] === "--session") await guardNativeSelection(args[index + 1], process.cwd());
+}
 const sdk = await load("index.js") as typeof import("@earendil-works/pi-coding-agent");
 // Fabric's tool capture must observe this SDK's runner, the one that carries the
 // profile guards' tool_call hooks, not Fabric's own peer copy (smarty-dev#8606).
@@ -31,6 +45,7 @@ const parsed = parseArgs(args);
 if (parsed.mode !== "rpc") throw new Error("Task entry supports only native RPC mode");
 const cwd = process.cwd();
 const agentDir = sdk.getAgentDir(); // Unchanged PI_CODING_AGENT_DIR: same auth pathname and lock as Main.
+await guardNativeSelection(parsed.session, cwd);
 const startupSettings = sdk.SettingsManager.create(cwd, agentDir, { projectTrusted: false });
 const sessionManager = await createSessionManager(parsed, cwd, undefined, startupSettings);
 const trustStore = new sdk.ProjectTrustStore(agentDir);

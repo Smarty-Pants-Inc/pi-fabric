@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { AtomicFileWriter, renameAtomic, syncDirectoryChain, writeFileAtomic } from "../core/atomic-write.js";
 import { ActorRegistryPayloads } from "./registry-payloads.js";
+import { hasNativeActorMarker, NativeActorUnsupportedOperationError } from "./native-execution.js";
 
 const ACTOR_REGISTRY_LOCK_TIMEOUT_MS = 5_000;
 const ACTOR_REGISTRY_STALE_LOCK_MS = 30_000;
@@ -156,6 +157,9 @@ export class ActorRegistryStore {
     this.#payloads = new ActorRegistryPayloads(actorRoot);
   }
 
+  /** Exact normalized registry identity; never infer identity from equal file contents. */
+  sameLocation(other: ActorRegistryStore): boolean { return this.#registryPath === other.#registryPath; }
+
   /** A generation is the atomic file identity, not a process-local counter. Old
    * format-1 writers participate without a migration or an auxiliary head file. */
   snapshot(): ActorRegistrySnapshot {
@@ -181,9 +185,11 @@ export class ActorRegistryStore {
    * Stale preparations never publish heads, and fallback re-runs source selection. */
   prepare(actors: readonly Record<string, unknown>[], options: { durable?: boolean } = {}, snapshot = this.snapshot()) {
     const prior = new Map(snapshot.actors.map(row => [row.id, row]));
+    const opaque = new Set<Record<string, unknown>>(snapshot.actors);
     const smallState = (row: Record<string, unknown>): string =>
       JSON.stringify(Object.keys(row).sort().map(key => [key, row[key]]));
     const reusable = actors.map(input => {
+      if (opaque.has(input)) return input;
       const before = prior.get(String(input.id));
       // smarty-dev#6829: a loaded actor whose ring is exactly the one this process committed at
       // the current head selects that head instead of re-reading and re-encoding its history
@@ -207,6 +213,7 @@ export class ActorRegistryStore {
       return instructions === oldInstructions && smallState(small) === smallState(oldSmall) &&
         (selectedStub || messages === oldMessages || JSON.stringify(messages) === JSON.stringify(oldMessages)) ? before : row;
     });
+    const opaqueNative = new Set(reusable.filter(row => hasNativeActorMarker(row) && !Object.hasOwn(row, "registryMessageAppend")));
     const payload = this.#payloads.prepare(reusable, prior);
     const metadata = payload.metadata;
     const custody = (rows: readonly Record<string, unknown>[]): string => JSON.stringify(rows.map(row =>
@@ -228,10 +235,10 @@ export class ActorRegistryStore {
     // another parse nor another serialization. All decoding stays outside custody.
     const changedHeads: Record<string, unknown>[] = [];
     const accepted = freezeRegistryValue(metadata.map((source, index) => {
-      if (source === prior.get(String(source.id))) return source as Record<string, unknown> & { id: string };
+      if (opaque.has(source)) return source as Record<string, unknown> & { id: string };
       const row = JSON.parse(encoded[index]!) as Record<string, unknown> & { id: string };
       this.#encoded.set(row, encoded[index]!);
-      changedHeads.push(row);
+      if (!opaqueNative.has(source)) changedHeads.push(row);
       return row;
     }));
     const temporary = `${this.#registryPath}.${process.pid}.${randomUUID()}.prepared`;
@@ -445,6 +452,7 @@ export class ActorRegistryStore {
       const previous = fs.readFileSync(this.#registryPath, "utf8");
       const parsed = JSON.parse(previous) as { format?: number; actors?: unknown };
       if (!parsed || !Array.isArray(parsed.actors)) throw new Error("Invalid actor registry for downgrade");
+      if (parsed.actors.some(hasNativeActorMarker)) throw new NativeActorUnsupportedOperationError();
       const actors = parsed.actors.map((value: unknown) => {
         if (typeof value !== "object" || value === null || Array.isArray(value) ||
             typeof (value as { id?: unknown }).id !== "string") return value;
@@ -652,7 +660,9 @@ export class ActorRegistryStore {
     const serialized = JSON.stringify({ format: 1, actors: metadata }, null, 2);
     try {
       this.#writer.write(serialized, { durable });
-      this.#payloads.publishHeads(metadata);
+      // Unchanged decoded foreign rows are opaque, even with unknown history
+      // references. Never interpret or rewrite their checkpoint during another birth.
+      this.#payloads.publishHeads(metadata.filter(row => !Object.isFrozen(row) && !hasNativeActorMarker(row)));
     } catch (error) {
       // The post-rename barrier may fail after replacement. Restore an accepted
       // earlier decision with its barriers; never acknowledge the failed commit.

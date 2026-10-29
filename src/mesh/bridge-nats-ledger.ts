@@ -16,14 +16,20 @@
 // Directory entries are made durable (parent fsyncs); a failed directory fsync is an error.
 // The directory is 0700 and the file 0600: the ledger holds command bodies and ACK results.
 // One writer: the mesh's host-qualified custody lock (pid + process incarnation + machine + boot).
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { syncPathNamespaceDurable } from "../core/atomic-write.js";
+import {
+  checkNativeIngressDirectory, encodeNativeIngressReceipt, nativeIngressReceiptForClaim, readNativeIngressReceipt,
+  NATIVE_INGRESS_DIRECTORY, NATIVE_INGRESS_MAX_BYTES,
+} from "./bridge-nats-ingress.js";
 import { acquireMeshCustodyLock, MESH_CUSTODY_LOCK_NAME } from "./custody-lock.js";
 import {
   BRIDGE_NATS_HORIZON_MS,
   BRIDGE_NATS_OPERATIONS,
   BRIDGE_NATS_REFUSAL,
+  BRIDGE_NATS_SESSION_ID,
   type BridgeNatsAckRecord,
   type BridgeNatsClaimAction,
   type BridgeNatsClaimInput,
@@ -94,6 +100,16 @@ const freeze = <T>(value: T): T => {
   return value;
 };
 const cloneJson = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+
+/** Every control retry may have fresh attempt times, including ask/cancel. Compare all other
+ * retained fields exactly; the FIRST full body/deadline remain immutable publication and receipt
+ * authority. This normalization applies only to claim comparison, never to a stored body or receipt.
+ */
+const claimBodySemantics = (input: BridgeNatsClaimInput): unknown => {
+  if (!input.resolvedBody) return input.resolvedBody;
+  const { requestCreatedAt: _created, requestedAt: _requested, deadlineAt: _deadline, ...body } = input.resolvedBody;
+  return body;
+};
 
 /** Shape check of a command record read back from disk or built from a claim. */
 const validCommand = (r: unknown): r is BridgeNatsCommandRecord => {
@@ -342,7 +358,7 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
     const run = this.#queue.then(() => {
       if (this.#closed) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_CLOSED", "ledger is closed");
       if (this.#failed !== undefined) {
-        throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_CLOSED", "ledger stopped after a write failure; restart the link");
+        throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_CLOSED", "ledger stopped after a write failure; inspect the original failure and storage before reopening");
       }
       return work();
     });
@@ -356,7 +372,13 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
     if (fd === undefined) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_CLOSED", "ledger is closed");
     const bytes = Buffer.from(encoded, "utf8");
     try {
-      writeAll(fd, bytes);
+      // One writeSync API call for one fully encoded line; Node may internally issue
+      // multiple syscalls. Never retry a returned short count here: stop and roll back.
+      // This is not disk/power atomicity; load still recovers one torn final record.
+      // A thrown write error is rethrown unchanged (including errno/cause); a returned
+      // short count supplies no errno and cannot diagnose ENOSPC/EFBIG by itself.
+      const written = fs.writeSync(fd, bytes, 0, bytes.length);
+      if (written !== bytes.length) throw new Error(`ledger append was short (${written}/${bytes.length} bytes; errno unavailable); inspect storage before reopening`);
       fs.fsyncSync(fd);
     } catch (error) {
       // Never leave a torn line in front of later ones (load would refuse it as corruption). After a
@@ -371,11 +393,35 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
     this.#compactIfDue(false);
   }
 
+  /** Receipt cleanup runs only under this ledger's existing custody/maintenance, never a timer. */
+  #pruneNativeIngress(): void {
+    const directory = path.join(this.#dir, NATIVE_INGRESS_DIRECTORY);
+    if (!fs.existsSync(directory)) return;
+    checkNativeIngressDirectory(this.#dir);
+    let changed = false;
+    for (const name of fs.readdirSync(directory)) {
+      // A crashed exclusive writer may leave an unpublished staging inode. No live peer writes here.
+      if (/^[0-9a-f]{64}\.\d+\.[0-9a-f-]{36}\.tmp$/.test(name)) {
+        fs.unlinkSync(path.join(directory, name)); changed = true;
+        continue;
+      }
+      if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
+      const id = name.slice(0, -5), claim = this.#commands.get(id);
+      if (claim && this.#live(claim)) continue; // never prune before the claim horizon
+      try {
+        const receipt = readNativeIngressReceipt(this.#dir, id);
+        if (receipt.expiresAt < this.#clock()) { fs.unlinkSync(path.join(directory, name)); changed = true; }
+      } catch { /* Unreadable/corrupt evidence denies admission; do not guess its retention horizon. */ }
+    }
+    if (changed) fsyncDir(directory);
+  }
+
   #compactIfDue(force: boolean): void {
     if (!force && this.#lines <= this.#minCompactLines) return;
     const live = [...this.#commands.values()].filter(record => this.#live(record)).length +
       [...this.#seen.values()].filter(record => this.#live(record)).length;
     const expired = this.#commands.size + this.#seen.size - live;
+    if (force) this.#pruneNativeIngress();
     if (!(force && expired > 0) && this.#lines <= Math.max(this.#minCompactLines, 4 * live)) return;
     const temp = path.join(this.#dir, `${BRIDGE_NATS_LEDGER_FILE}.compact-${process.pid}-${Date.now()}`);
     const lines: Line[] = [
@@ -405,6 +451,7 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
       this.#commands.clear(); this.#originals.clear(); this.#seen.clear();
       for (const line of lines) this.#apply(line);
       this.#lines = lines.length;
+      if (!force) this.#pruneNativeIngress();
     } catch (error) {
       // Before the rename the old file is intact: keep appending to it and retry later. After it, the
       // open descriptor no longer names the ledger file: stop (fail-stop) rather than append to a ghost.
@@ -456,6 +503,20 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
             existing.replyTo !== input.replyTo || existing.targetId !== input.targetId || existing.operation !== input.operation) {
           return { status: "mismatch" as const, created: false as const, record: existing };
         }
+        // The wire digest pins semantic input, not per-attempt times, for EVERY operation.
+        // A duplicate reuses the FIRST full body/sender/principal/deadline and original horizon;
+        // ask/cancel projection must still validate the exact retained recipe, not this attempt.
+        // Never backfill historical evidence or relax route/identity/principal checks.
+        if (existing.direction === "toFile" && existing.resolvedBody !== undefined &&
+            (input.resolvedBody === undefined || canonical(claimBodySemantics(existing)) !== canonical(claimBodySemantics(input)) ||
+             canonical(existing.principal ?? null) !== canonical(input.principal ?? null) ||
+             existing.from.id !== input.from.id || existing.from.kind !== input.from.kind ||
+             // Optional Main sid/name are not credentials; the verified canonical id fixes its sid.
+             (!(existing.from.kind === "main" && BRIDGE_NATS_SESSION_ID.test(existing.from.id)) &&
+               existing.from.sessionId !== input.from.sessionId) || existing.ownerHostId !== input.ownerHostId ||
+             existing.ownerIdentityId !== input.ownerIdentityId || existing.ownerIncarnation !== input.ownerIncarnation)) {
+          return { status: "mismatch" as const, created: false as const, record: existing };
+        }
         return { status: "duplicate" as const, created: false as const, record: existing };
       }
       const live = [...this.#commands.values()].filter(record => this.#live(record)).length;
@@ -466,6 +527,55 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
       if (!validCommand(record)) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_INVALID", "claim does not form a valid record");
       this.#append({ t: "cmd", r: record });
       return { status: "new" as const, created: true as const, record: this.#commands.get(record.commandId)! };
+    });
+  }
+
+  /** INTERNAL sole-writer projection. Called only after a fresh verified delivery's durable claim.
+   * No event/body path or public publication can invoke this through the mesh. An old claim with no
+   * exact retained body remains unavailable to native consumers, never backfilled from current data.
+   */
+  projectNativeIngress(commandId: string, link: string): Promise<void> {
+    return this.#mutate(() => {
+      const record = this.#require(commandId);
+      if (record.resolvedBody === undefined) return;
+      const receipt = nativeIngressReceiptForClaim(record, link);
+      const directory = checkNativeIngressDirectory(this.#dir, true);
+      try { fs.mkdirSync(directory, { mode: 0o700 }); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      checkNativeIngressDirectory(this.#dir);
+      const file = path.join(directory, `${commandId}.json`);
+      const notDurable = (): Error => new Error("Native ingress receipt namespace is not durable on this platform");
+      const confirmExisting = (): void => {
+        const existing = readNativeIngressReceipt(this.#dir, commandId);
+        if (canonical(existing) !== canonical(receipt)) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_CORRUPT",
+          "native ingress receipt conflicts with retained claim; never overwritten");
+        const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+        try { fs.fsyncSync(fd); syncPathNamespaceDurable(file, fs.fstatSync(fd), notDurable); }
+        finally { fs.closeSync(fd); }
+      };
+      if (fs.lstatSync(file, { throwIfNoEntry: false })) { confirmExisting(); return; }
+      const bytes = Buffer.from(encodeNativeIngressReceipt(receipt), "utf8");
+      if (bytes.length > NATIVE_INGRESS_MAX_BYTES) throw new BridgeNatsLedgerError("BRIDGE_NATS_LEDGER_INVALID", "native receipt exceeds byte bound");
+      const temporary = path.join(directory, `${commandId}.${process.pid}.${randomUUID()}.tmp`);
+      const fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      try {
+        fs.fchmodSync(fd, 0o600);
+        writeAll(fd, bytes);
+        fs.fsyncSync(fd);
+        // Hard-link publication is atomic AND create-only. rename would overwrite a conflicting receipt.
+        let published = false;
+        try { fs.linkSync(temporary, file); published = true; } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          confirmExisting();
+        }
+        if (published) syncPathNamespaceDurable(file, fs.fstatSync(fd), notDurable);
+      } finally {
+        fs.closeSync(fd);
+        fs.unlinkSync(temporary);
+      }
+      // Namespace barrier includes publication, staging unlink, and all newly created parents.
+      syncPathNamespaceDurable(file, fs.lstatSync(file), notDurable);
     });
   }
 

@@ -16,6 +16,7 @@ import { createMainExecutionCeilingError } from "../src/async-settlement.js";
 import { removeHostLease, writeHostLease } from "../src/topology/host-leases.js";
 import type { FabricParticipantRecord } from "../src/topology/types.js";
 import { FileControlReader, FileTransport } from "../src/transport/file.js";
+import { MeshConsumptionPausedError } from "../src/topology/mesh-consumption.js";
 
 const roots: string[] = [];
 const planes: FabricControlPlane[] = [];
@@ -167,6 +168,94 @@ describe("saved steer/followUp ACK obligations (#9751)", () => {
     });
     return { release, spy, calls: () => calls, highWater: () => highWater };
   };
+
+  // Keep: directory/admission failures cross the reader cursor and execution trust boundary.
+  it("C1 ingress lookup failures stay loud/replayable, native refusals have no effects, and full-capacity ordinary/native recovery preserves ACK custody", async () => {
+    vi.spyOn(fs, "watch").mockImplementation(() =>
+      Object.assign(new EventEmitter(), { close: vi.fn(), unref: vi.fn() }) as unknown as fs.FSWatcher);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const drain = vi.spyOn(FileControlReader.prototype, "drain");
+    const lookupFailure = new Error("directory lookup failed"), paused = new MeshConsumptionPausedError();
+    let failure: Error | undefined = lookupFailure, admissionPaused = false;
+    const ingress = {
+      requiresNativeAdmission: (id: string) => { if (failure) throw failure; return id === "native:target"; },
+      admitNativeControl: () => { if (admissionPaused) throw paused; throw new Error("bad native admission"); },
+    };
+    const f = setup({ nativeActorIngress: ingress });
+    const receive = vi.fn((command: FabricControlCommand) => ({ accepted: true, messageId: command.commandId }));
+    const ordinary = await f.mesh.publish(f.command("lookup-ordinary"));
+    f.owner.start(receive);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      const reader = drain.mock.contexts[0] as FileControlReader;
+      await expect(drain.mock.results[0]!.value).rejects.toBe(lookupFailure);
+      expect(reader.lastSequence).toBeLessThan(ordinary.sequence);
+      expect(f.acks()).toEqual([]); expect(receive).not.toHaveBeenCalled();
+      expect(f.saved("lookup-ordinary")).toBeUndefined(); expect(f.mesh.get(seenKey("lookup-ordinary"))).toBeUndefined();
+      failure = undefined; f.owner.pause(); f.owner.resume();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.acks("lookup-ordinary")).toHaveLength(1); expect(receive).toHaveBeenCalledOnce();
+      expect(reader.lastSequence).toBeGreaterThanOrEqual(ordinary.sequence);
+      await f.mesh.publish(f.command("native-refusal", "native:target"));
+      f.owner.pause(); f.owner.resume(); await vi.advanceTimersByTimeAsync(0);
+      expect(f.acks("native-refusal")).toEqual([]); expect(f.saved("native-refusal")).toBeUndefined();
+      expect(f.mesh.get(seenKey("native-refusal"))).toBeUndefined(); expect(receive).toHaveBeenCalledOnce();
+      admissionPaused = true;
+      const native = await f.mesh.publish(f.command("native-paused", "native:target"));
+      f.owner.pause(); f.owner.resume(); await vi.advanceTimersByTimeAsync(0);
+      await expect(drain.mock.results.at(-1)!.value).rejects.toBe(paused);
+      expect(reader.lastSequence).toBeLessThan(native.sequence); expect(f.acks("native-paused")).toEqual([]);
+      expect(receive).toHaveBeenCalledOnce(); expect(f.saved("native-paused")).toBeUndefined();
+      admissionPaused = false; f.owner.pause(); f.owner.resume(); await vi.advanceTimersByTimeAsync(0);
+      expect(reader.lastSequence).toBeGreaterThanOrEqual(native.sequence); expect(f.acks("native-paused")).toEqual([]);
+      f.owner.pause(); await f.owner.close();
+
+      for (const nativeReplay of [false, true]) {
+        let prefilterFailure = false, recovered = false, admissions = 0;
+        const full = setup({ nativeActorIngress: {
+          requiresNativeAdmission: id => {
+            if (prefilterFailure) { prefilterFailure = false; throw lookupFailure; }
+            return recovered && nativeReplay && id === "agent:same";
+          },
+          admitNativeControl: () => { admissions++; throw new Error("bad native admission"); },
+        } });
+        const blocked = holdFirstAck(full);
+        // One non-control event puts the 100th obligation on page two, so the
+        // replay reaches the SAME-PAGE capacity prefilter, not just beforePage.
+        await full.mesh.publish({ topic: "fixture.noise", kind: "noise", from: identity(senderId) });
+        for (let index = 1; index <= 100; index++) await full.mesh.publish(full.command(`full:${index}`));
+        const replay = await full.mesh.publish(full.command("full:100"));
+        const next = await full.mesh.publish(full.command("after-recovery", "agent:other"));
+        const effects: string[] = [];
+        full.owner.start(command => {
+          effects.push(command.commandId);
+          if (command.commandId === "full:100") prefilterFailure = true;
+          return { accepted: true, messageId: command.commandId };
+        });
+        try {
+          await vi.advanceTimersByTimeAsync(0);
+          const fullReader = drain.mock.contexts.at(-1) as FileControlReader;
+          await expect(drain.mock.results.at(-1)!.value).rejects.toBe(lookupFailure);
+          expect(fullReader.lastSequence).toBeLessThan(replay.sequence);
+          expect(effects).toHaveLength(100); expect(full.acks()).toEqual([]); expect(admissions).toBe(0);
+          const saved = full.saved("full:100");
+          prefilterFailure = false; recovered = true;
+          full.owner.pause(); full.owner.resume(); await vi.advanceTimersByTimeAsync(0);
+          // A new drain hits the pre-page full-capacity gate first, in BOTH
+          // classifications. Only ACK settlement may resume that unread page.
+          expect(fullReader.lastSequence).toBeLessThan(replay.sequence);
+          expect(full.saved("full:100")).toEqual(saved); expect(effects).toHaveLength(100); expect(admissions).toBe(0);
+          expect(full.saved("after-recovery")).toBeUndefined(); expect(full.mesh.get(seenKey("after-recovery"))).toBeUndefined();
+          blocked.release.open(); await vi.advanceTimersByTimeAsync(0);
+          expect(full.acks()).toHaveLength(101); expect(full.acks("full:100")).toHaveLength(1);
+          expect(full.acks("after-recovery")).toHaveLength(1); expect(effects.at(-1)).toBe("after-recovery");
+          expect(effects).toHaveLength(101); expect(fullReader.lastSequence).toBeGreaterThanOrEqual(next.sequence);
+          expect(admissions).toBe(nativeReplay ? 1 : 0); // native owned replay is authenticated before lookup, then refused
+          full.owner.pause(); await full.owner.close();
+        } finally { blocked.release.open(); blocked.spy.mockRestore(); }
+      }
+    } finally { vi.restoreAllMocks(); vi.useRealTimers(); }
+  }, 20_000);
 
   // Keep reason: the recorded #9751 custody regression needs native completion-error
   // transparency, while E1 deliberately reconciles the generic send path differently.
@@ -2735,6 +2824,7 @@ describe("FabricControlPlane", () => {
       expect.objectContaining({ id: "host:sender" }),
       expect.any(AbortSignal),
       "mesh",
+      undefined, // ordinary steer carries no native admission handle
     );
     expect(observe).not.toHaveBeenCalled();
   });
@@ -2843,6 +2933,7 @@ describe("FabricControlPlane", () => {
       expect.objectContaining({ id: "host:sender" }),
       expect.any(AbortSignal),
       "mesh",
+      undefined, // ordinary ask carries no native admission handle
     );
   });
   it("ignores an acknowledgement forged by a different mesh identity", async () => {

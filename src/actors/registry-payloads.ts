@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { syncPathNamespace, writeFileAtomic } from "../core/atomic-write.js";
+import { hasNativeActorMarker, nativeMessageMetadata } from "./native-execution.js";
+import type { FabricActorMessage } from "./types.js";
 
 const HISTORY_LIMIT = 100;
 
@@ -280,8 +282,25 @@ export class ActorRegistryPayloads {
   }
 
   compact(row: Row, previous?: Row): Row {
-    if (typeof row.id !== "string") return row;
+    // A foreign/quarantined decoded row is opaque, including duplicate IDs. Never
+    // hydrate sidecars or rewrite sentinels merely because another actor saved.
+    if (typeof row.id !== "string" || Object.isFrozen(row)) return row;
     const id = row.id;
+    if (hasNativeActorMarker(row)) {
+      // Only the manager's volatile append port identifies an owned native save.
+      // A raw marker is otherwise opaque, even if its version looks familiar.
+      if (!Object.hasOwn(row, "registryMessageAppend")) return row;
+      const execution = row.execution as Row | undefined;
+      if (row.runner !== "native" || row.instructions !== null || !execution || execution.kind !== "native" || execution.version !== 1 ||
+          typeof execution.handlerKey !== "string") return row;
+      // This is an owned native serialization, not an opaque foreign row. Sanitize
+      // pending archives AND inline migration inputs; never create another body copy.
+      const clean = (value: unknown): unknown[] => Array.isArray(value) ? value.map(message => nativeMessageMetadata(message as FabricActorMessage)) : [];
+      row = { ...row,
+        ...(Array.isArray(row.messages) ? { messages: clean(row.messages) } : {}),
+        ...(Array.isArray(row.registryMessageAppend) ? { registryMessageAppend: clean(row.registryMessageAppend) } : {}) };
+      if (previous && Array.isArray(previous.messages)) previous = { ...previous, messages: clean(previous.messages) };
+    }
     const compact = { ...row };
     delete compact.registryMessageAppend;
     delete compact.registryMessageReset;

@@ -6,6 +6,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { bridgeNatsMappedCommandId } from "../src/mesh/bridge-nats-types.js";
+import { controlBodyFingerprint } from "../src/mesh/control-idempotency.js";
 import type { MeshEvent } from "../src/mesh/store.js";
 import type { TransportEnvelope } from "../src/transport/types.js";
 import { resolveNatsBinary } from "./helpers/nats-cluster.js";
@@ -107,7 +108,33 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: FI
     const again = await withLog(h.natsMain.invoke("agents.followUp", { id: h.fileMain.id, message: token, idempotencyKey: key })) as Record<string, unknown>;
     expect(again).toMatchObject({ acknowledged: true, messageId: first.messageId });
     expect(mentions(h.fileMain, token)).toHaveLength(1);
-    expect(h.fileEvents({ topic: CONTROL, to: h.fileMain.id }).filter((event) => dataOf(event).message === token).length).toBeLessThanOrEqual(2);
+    const attempts = h.wire.since(mark).filter(event => event.phase === "send" && event.hostId === h.natsMain.id &&
+      event.envelope.kind === "command" && bodyOf(event).message === token);
+    expect(attempts).toHaveLength(2);
+    expect(attempts[1]!.envelope.id).not.toBe(sent.envelope.id);
+    expect(bodyOf(attempts[1]!).commandId).toBe(bodyOf(sent).commandId);
+    expect(controlBodyFingerprint(bodyOf(attempts[1]!), attempts[1]!.envelope.principal))
+      .toBe(controlBodyFingerprint(bodyOf(sent), sent.envelope.principal));
+    // Exercise deterministically changed attempt times on the SAME real authenticated broker path,
+    // not MemoryLedger/FakePort. The immutable first claim must still answer with the first outcome.
+    const raw = await h.openPeer(NATS_MAIN_MACHINE, `ordinary-retry-${randomUUID()}`);
+    const remapped: TransportEnvelope = { ...sent.envelope, id: randomUUID(), body: { ...bodyOf(sent),
+      requestCreatedAt: Number(bodyOf(sent).requestCreatedAt) + 1, requestedAt: Number(bodyOf(sent).requestedAt) + 1,
+      deadlineAt: Number(bodyOf(sent).deadlineAt) + 1 } };
+    const ackFor = (id: string) => h.wire.since(mark).find(event => event.phase === "deliver" &&
+      event.hostId === h.natsMain.id && event.envelope.kind === "ack" && event.envelope.id === `ack:${id}`);
+    await raw.send(remapped);
+    await withLog(h.wire.until(() => !!ackFor(remapped.id), "ordinary retimed retry ACK", E2E_WAIT_MS));
+    expect(ackFor(remapped.id)).toMatchObject({ sourceMachine: BRIDGE_MACHINE, envelope: { from: { id: h.fileMain.id },
+      body: { accepted: true, messageId: first.messageId } } });
+    // Counterexample: changing actual semantics under that same command id must NOT replay success.
+    const changed: TransportEnvelope = { ...remapped, id: randomUUID(), body: { ...bodyOf(sent), message: `${token}_CHANGED` } };
+    await raw.send(changed);
+    await withLog(h.wire.until(() => !!ackFor(changed.id), "changed-payload conflict ACK", E2E_WAIT_MS));
+    expect(ackFor(changed.id)).toMatchObject({ sourceMachine: BRIDGE_MACHINE, envelope: { body: { accepted: false,
+      notRun: true, errorCode: "FABRIC_CONTROL_ID_CONFLICT" } } });
+    expect(mentions(h.fileMain, token)).toHaveLength(1);
+    expect(h.fileEvents({ topic: CONTROL, to: h.fileMain.id }).filter(event => dataOf(event).message === token)).toHaveLength(1);
   }, 60_000);
 
   it("steers a non-seat Main each way", async () => {
@@ -119,6 +146,23 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: FI
     expect(mentions(h.natsMain, toNats)).toEqual([expect.objectContaining({ deliverAs: "steer", from: expect.objectContaining({ id: h.fileMain.id }) })]);
     expect(mentions(h.fileMain, toFile)).toEqual([expect.objectContaining({ deliverAs: "steer", from: expect.objectContaining({ id: h.natsMain.id }) })]);
   }, 60_000);
+
+  it.each([["agents.steer", "steer"], ["agents.tell", "followUp"]] as const)(
+    "NATS Main -> file Main: keyed %s replays its first outcome without another consumption", async (tool, operation) => {
+      const token = `KEYED_${operation}_${randomUUID()}`, key = `keyed-${randomUUID()}`, mark = h.wire.mark();
+      const first = await withLog(h.natsMain.invoke(tool, { id: h.fileMain.id, message: token, idempotencyKey: key })) as Record<string, unknown>;
+      expect(first).toMatchObject({ acknowledged: true });
+      const again = await withLog(h.natsMain.invoke(tool, { id: h.fileMain.id, message: token, idempotencyKey: key })) as Record<string, unknown>;
+      expect(again).toMatchObject({ acknowledged: true, messageId: first.messageId });
+      const attempts = h.wire.since(mark).filter(event => event.phase === "send" && event.hostId === h.natsMain.id &&
+        event.envelope.kind === "command" && bodyOf(event).message === token);
+      expect(attempts).toHaveLength(2);
+      expect(attempts[1]!.envelope.id).not.toBe(attempts[0]!.envelope.id);
+      expect(bodyOf(attempts[1]!).commandId).toBe(bodyOf(attempts[0]!).commandId);
+      expect(attempts.every(event => event.envelope.operation === operation)).toBe(true);
+      expect(mentions(h.fileMain, token)).toHaveLength(1);
+      expect(h.fileEvents({ topic: CONTROL, to: h.fileMain.id }).filter(event => dataOf(event).message === token)).toHaveLength(1);
+    }, 60_000);
 
   it("a second verified NATS sender re-using another sender's commandId never receives that sender's outcome", async () => {
     const peer = h.natsPeer!;

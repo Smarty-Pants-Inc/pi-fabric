@@ -22,6 +22,10 @@
       "types": "./dist/runners.d.ts",
       "import": "./dist/runners.js"
     },
+    "./native-actors": {
+      "types": "./dist/native-actors.d.ts",
+      "import": "./dist/native-actors.js"
+    },
     "./durable": {
       "types": "./dist/durable.d.ts",
       "import": "./dist/durable.js"

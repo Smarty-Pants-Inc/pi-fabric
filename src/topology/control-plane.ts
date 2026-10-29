@@ -2,6 +2,7 @@ import { appendDeliveryOutcome, type DeliverySend } from "../mesh/delivery-outco
 import { diagnostics } from "../core/diagnostics.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED, FabricIdempotencyKeyReusedError } from "../mesh/control-idempotency.js";
 import type { MeshControlIncarnationFence } from "../config.js";
+import type { NativeActorIngress, NativeControlAdmission } from "../mesh/bridge-nats-ingress.js";
 import { FabricBridgeStaleError, FabricParticipantStaleError, mirroredOwnerRoutingStatus, participantLeaseGraceMs, waitForMirroredLeaseRenewal, type FabricMirrorLease, type MirrorLeaseWaitBudget } from "./host-leases.js";
 import { retryDelayMs } from "../core/retry-backoff.js";
 import { FabricPeerLeaseStaleError } from "../agents/peer-lease-stale.js";
@@ -286,6 +287,8 @@ export type FabricControlHandler = (
   from: MeshIdentity,
   signal: AbortSignal,
   verification?: MeshEvent["verification"],
+  /** Host-issued proof, never a serialized command field. */
+  nativeAdmission?: NativeControlAdmission,
 ) => Promise<FabricControlAcceptance> | FabricControlAcceptance;
 
 const controlSeenKey = (hostId: string, commandId: string): string =>
@@ -338,7 +341,8 @@ const commandFromEvent = (event: MeshEvent): FabricControlCommand | undefined =>
   // Sender diagnostics are never evidence. Derive only from the admitted envelope.
   // A sender stamp is host-set on the event; a payload-supplied one is forged and dropped.
   // Work claims belong in typed nested data, never an unknown outer command key.
-  const { sender: _forged, inboxTopic: _topic, inboxKey: _key, inboxReceipts: _receipts, key: _workKey, ...command } = data;
+  const { sender: _forged, inboxTopic: _topic, inboxKey: _key, inboxReceipts: _receipts, key: _workKey,
+    nativeAdmission: _admission, nativeContext: _context, sourceMachine: _machine, sessionId: _session, ...command } = data;
   const wakeCause = data.operation === "steer" || data.operation === "followUp"
     ? fabricWakeCause(event.from, data.operation, event.topic, event.id) : undefined;
   return withFabricWakeAdmission({ ...command, eventId: event.id,
@@ -407,6 +411,8 @@ class MirrorLeaseAdmissionRequired extends Error {
 }
 
 export interface FabricControlPlaneOptions {
+  /** Host-pinned verifier for reserved, native and quarantined actor IDs. FILE execution only. */
+  nativeActorIngress?: NativeActorIngress;
   /** Injected carrier; caller owns its lifetime. File remains the default. */
   transport?: FabricTransport;
   /** Exposed for carrier-aware callers; file-mode admission retains its existing gates. */
@@ -592,6 +598,8 @@ const relayAcknowledgementKey = (commandId: string, idempotencyKey: string): str
 
 interface ClaimedControlCommand {
   event: MeshEvent;
+  /** Process-local proof retained with this exact claimed invocation, never persisted. */
+  nativeAdmission?: NativeControlAdmission;
   claimVersion: number;
   /** A future-skew refusal must survive the shared claim's lock wait. */
   futureSkewed?: boolean;
@@ -1996,7 +2004,13 @@ export class FabricControlPlane {
     }, event => {
       if (event.topic === CONTROL_TOPIC && this.#acknowledgementsFull()) {
         const command = commandFromEvent(event);
-        if (command && command.operation !== "cancel" && !this.#ownedCommands.has(controlSeenKey(this.options.hostId, command.commandId))) {
+        // Lookup failures must escape this prefilter too: drain never commits
+        // the event, and recovery retries it before inspecting owned state.
+        if (command && command.operation !== "cancel" &&
+            (this.options.nativeActorIngress?.requiresNativeAdmission(command.targetId) ||
+              !this.#ownedCommands.has(controlSeenKey(this.options.hostId, command.commandId)))) {
+          // Do not inspect native owned-command state from this unauthenticated
+          // capacity prefilter. Its admission/duplicate handling stays below.
           this.#ackCapacityBlocked = true;
           return false; // leave this new command unread; never drop an ACK obligation
         }
@@ -2966,6 +2980,21 @@ export class FabricControlPlane {
     assertMeshConsumption(this.options.canConsumeMesh);
     const command = commandFromEvent(event);
     if (!command) return;
+    // Authenticate EVERY native delivery before owned/seen lookup, replay, cancellation,
+    // stale-owner ACKs or the shared claim. Public bridge/context labels are not proof.
+    // Refusals have no trusted return address: drop without replying or poisoning dedupe.
+    let nativeAdmission: NativeControlAdmission | undefined;
+    // Directory failures are not authentication refusals: propagate them so the
+    // reader retains this event for replay instead of silently committing a drop.
+    if (this.options.nativeActorIngress?.requiresNativeAdmission(command.targetId)) {
+      try {
+        nativeAdmission = this.options.nativeActorIngress.admitNativeControl(event);
+      } catch (error) {
+        if (error instanceof MeshConsumptionPausedError) throw error;
+        diagnostics.warn("src/topology/control-plane.ts", "[pi-fabric] Native actor control ingress refused");
+        return;
+      }
+    }
     const ownedKey = controlSeenKey(this.options.hostId, command.commandId);
     const owned = this.#ownedCommands.get(ownedKey);
     if (owned) {
@@ -3060,7 +3089,8 @@ export class FabricControlPlane {
 
     // Take custody before any post-CAS admission check: PREPARE/lease loss during
     // the await must retain this command. Its first private outcome save creates it.
-    const admitted = { event, claimVersion: 0, futureSkewed: command.requestedAt - now > this.#ackTimeoutMs };
+    const admitted: ClaimedControlCommand = { event, ...(nativeAdmission ? { nativeAdmission } : {}), claimVersion: 0,
+      futureSkewed: command.requestedAt - now > this.#ackTimeoutMs };
     this.#ownedCommands.set(key, admitted);
     await this.#runOwnedCommand(key, admitted);
   }
@@ -3210,7 +3240,9 @@ export class FabricControlPlane {
         }
         else if (this.#handler) {
           this.#warnUnfencedSenderDelivery(command, from);
-          acceptance = await this.#handler(command, from, controller.signal, verification);
+          acceptance = owned.nativeAdmission === undefined
+            ? await this.#handler(command, from, controller.signal, verification)
+            : await this.#handler(command, from, controller.signal, verification, owned.nativeAdmission);
         } else acceptance = { accepted: false, error: "Fabric owner has no control handler" };
       } catch (error) {
         if (error instanceof MeshConsumptionPausedError) throw error;

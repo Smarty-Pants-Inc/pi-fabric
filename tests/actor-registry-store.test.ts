@@ -26,6 +26,25 @@ afterEach(() => {
 });
 
 describe("ActorRegistryStore", () => {
+  // Keep: foreign persistence is a data-safety boundary. Removal uses write(), not prepare().
+  it("removal write leaves foreign legacy rows and their checkpoints opaque and byte-unchanged", async () => {
+    const { store, actorRoot, registryPath } = setup();
+    const legacy = { id: "foreign-legacy", rootId: "remote", runner: "pi", instructions: "FOREIGN-INSTRUCTIONS",
+      messages: [{ id: "legacy-message", direction: "in", message: "FOREIGN-BODY" }], future: { version: 19 } };
+    const checkpointed = { id: "foreign-checkpoint", rootId: "remote", messageHistory: { version: 1, offset: 0, bytes: 12, count: 0 } };
+    fs.mkdirSync(actorRoot, { recursive: true });
+    fs.writeFileSync(registryPath, JSON.stringify({ format: 1, actors: [legacy, checkpointed, { id: "removed", rootId: "local" }] }));
+    // The checkpoint's real path uses the same public ID-to-directory mapping as persisted actors.
+    const { createHash } = await import("node:crypto");
+    const headDir = path.join(actorRoot, createHash("sha256").update(checkpointed.id).digest("hex"), "registry");
+    fs.mkdirSync(headDir, { recursive: true });
+    const head = path.join(headDir, "messages-head.json"), before = '{"version":1,"offset":0,"bytes":24,"count":0}\n';
+    fs.writeFileSync(head, before);
+    await store.withLock(() => store.write(store.snapshot().actors.filter(row => row.id !== "removed")));
+    expect(JSON.parse(fs.readFileSync(registryPath, "utf8")).actors).toEqual([legacy, checkpointed]);
+    expect(fs.readFileSync(head, "utf8")).toBe(before);
+    expect(fs.readdirSync(actorRoot).sort()).toEqual(["actors.json", path.basename(path.dirname(headDir))].sort());
+  });
   // smarty-dev#6100 (org option B): a durable update stages and fsyncs its file before the fence, and the post-rename
   // directory barrier runs after the fence is released; under custody only the generation check and the rename.
   it("runs no fsync while holding the registry fence on a durable update, fast path and contended path", async () => {

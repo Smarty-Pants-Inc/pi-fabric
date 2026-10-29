@@ -12,7 +12,6 @@ import {
 import { deliverRootInbox } from "./topology/root-inbox-delivery.js";
 import { boundModelOutput, formatResidentOutcomePriority, modelOutputBudget } from "./output-budget.js";
 import { registerFabricPrincipalCapture, registerFabricWakeCapture, fabricHostIdentity, fabricProvenanceSupported, sendFabricMessage } from "./fabric-provenance.js";
-import { applyRunBashDefaults } from "./guards/actor-bash-timeout.js";
 import { registerFabricFixture } from "./guards/fixture-mode.js";
 import { registerJevAuth } from "./jev/auth.js";
 import { yieldsToExplicitFabric } from "./core/explicit-fabric.js";
@@ -264,6 +263,10 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // A different Fabric requested explicitly with -e (a worker's parent Fabric) wins over
   // this discovered copy; registering both makes Pi refuse to start (fabric_exec conflict).
   if (!options.managedHost && yieldsToExplicitFabric(FABRIC_EXTENSION_ENTRY_PATH)) return;
+  // Refuse a selected private native pin before the SDK can append startup metadata.
+  if (!options.managedHost && process.env.PI_FABRIC_NATIVE_OWNER_CONFIG !== undefined) {
+    (await import("./worker/native-owner-entry.js")).guardNativeOwnerRegistration();
+  }
   registerFabricPrincipalCapture(pi);
   // smarty-dev#6207: the Main names its sender; a Fabric worker child loads the same hook with -e.
   // First-use import of the standalone hook file (a stable package-local path, as the worker's -e),
@@ -1237,13 +1240,22 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // smarty-dev#774: a kill by name pattern kills other owners' processes on a shared host. Every
   // session that loads Fabric (Mains, task agents, actors) runs this, and fabric_exec's pi.bash
   // emits the same tool_call.
-  let shellGuards: Promise<[typeof import("./core/pattern-kill.js"), typeof import("./guards/foreground-wait.js")]> | undefined;
+  let shellGuards: Promise<[
+    typeof import("./core/pattern-kill.js"),
+    typeof import("./guards/foreground-wait.js"),
+    typeof import("./guards/actor-bash-timeout.js"),
+  ]> | undefined;
   pi.on("tool_call", async (event) => {
     if (event.toolName !== "bash") return undefined;
     const { command, timeout } = event.input as { command?: unknown; timeout?: unknown };
     if (typeof command !== "string") return undefined;
-    const [{ killsByPattern, PATTERN_KILL_REASON, TMP_WIPE_REASON, wipesTmp }, { foregroundWaitRefusal }] =
-      await (shellGuards ??= Promise.all([import("./core/pattern-kill.js"), import("./guards/foreground-wait.js")]));
+    const [
+      { killsByPattern, PATTERN_KILL_REASON, TMP_WIPE_REASON, wipesTmp },
+      { foregroundWaitRefusal },
+      { applyRunBashDefaults },
+    ] = await (shellGuards ??= Promise.all([
+      import("./core/pattern-kill.js"), import("./guards/foreground-wait.js"), import("./guards/actor-bash-timeout.js"),
+    ]));
     if (killsByPattern(command)) return { block: true, reason: PATTERN_KILL_REASON };
     if (wipesTmp(command)) return { block: true, reason: TMP_WIPE_REASON };
     const reason = foregroundWaitRefusal(command, typeof timeout === "number" ? timeout : undefined);

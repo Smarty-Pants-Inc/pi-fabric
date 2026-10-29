@@ -37,6 +37,7 @@ import type {
   FabricSteerPriority,
 } from "../main-agent.js";
 import type { MeshIdentity } from "../mesh/store.js";
+import type { NativeControlAdmission } from "../mesh/bridge-nats-ingress.js";
 import {
   acceptProviderParticipantControl,
   controlProviderParticipant,
@@ -200,6 +201,14 @@ const stringArray = (value: unknown): string[] | undefined =>
     ? value.filter((entry): entry is string => typeof entry === "string")
     : undefined;
 
+// Check before any whitelist reconstruction or default/model selection. Even an
+// own execution: undefined/non-enumerable marker is a refusal, not a Pi template.
+const assertPublicModelActorDefinition = (value: object & { runner?: unknown }): void => {
+  if (Object.hasOwn(value, "execution") || value.runner === "native") {
+    throw new Error("Public actor create/import/model settings do not support native actors or execution markers");
+  }
+};
+
 const actorRunBinding = (args: Record<string, unknown>): FabricActorRunBinding => ({
   ...(typeof args.model === "string" && args.model.trim()
     ? { model: args.model.trim() }
@@ -293,6 +302,7 @@ const actorRequest = (
   inheritModel = true,
   inheritedThinking?: string,
 ): FabricActorCreateRequest => {
+  assertPublicModelActorDefinition(args);
   const events = Array.isArray(args.events)
     ? args.events.filter(
         (event): event is FabricActorHostEvent => isFabricActorHostEvent(event),
@@ -502,6 +512,7 @@ export class AgentsProvider implements FabricProvider {
       manager, actorManager, mainAgent, participants, control,
       (binding, runner, context, requiredPin, role) => {
         const actor = role?.startsWith("actor:") ? this.actorManager.status(role.slice("actor:".length)) : undefined;
+        if (actor && this.#nativeActor(actor.id, actor)) throw new Error("Native actors do not support model/thinking overrides");
         const thinking = binding.thinking ?? (binding.model && actor ? this.actorManager.resolveBinding(actor.id).thinking : undefined);
         return this.#resolvePiRunBinding({ ...binding, ...(thinking ? { thinking } : {}) }, runner, context, requiredPin, role);
       },
@@ -521,6 +532,11 @@ export class AgentsProvider implements FabricProvider {
   }
 
   readonly #lifecycleScheduler: LifecycleDeliveryScheduler;
+
+  #nativeActor(id: string, actor?: FabricActorInfo, participant?: FabricParticipantInfo): boolean {
+    return this.actorManager.isNativeActor?.(id) === true || actor?.runner === "native" ||
+      (actor !== undefined && Object.hasOwn(actor, "execution")) || participant?.runner === "native";
+  }
 
   #lifecycleMessage(event: FabricLifecycleEvent): string {
     const status = event.status ? ` with status ${event.status}` : "";
@@ -957,6 +973,7 @@ export class AgentsProvider implements FabricProvider {
   ): Promise<unknown> {
     const checkCommit = (): void => throwIfExecutionExpired(context);
     checkCommit();
+    if (["create", "createActor", "import"].includes(actionName)) assertPublicModelActorDefinition(args);
     if (["run", "spawn", "handoff", "create", "createActor", "import", "export"].includes(actionName)) {
       this.#assertAgentSpawnAllowed();
     }
@@ -1476,8 +1493,15 @@ export class AgentsProvider implements FabricProvider {
         this.actorManager.validateDirectMessage(message, args.data);
         const { actor, participant } = await this.#router.resolveActorMessageTarget(id, context.signal);
         const ownsActor = actor ? this.actorManager.owns(actor.id) : false;
+        const native = this.#nativeActor(actor?.id ?? participant?.id ?? id, actor, participant);
+        if (native && ["model", "thinking", "modelReason", "opusReason", "routeClass", "binding", "bindingProvenance"].some(key => Object.hasOwn(args, key))) {
+          throw new Error("Native actors do not support model/thinking/route overrides");
+        }
+        // A public local call has no private bridge proof. Refuse before model
+        // preparation (including reserved/quarantined IDs with no loaded callback).
+        if (native && ownsActor) throw new Error("Native actor ask requires authenticated bridge admission");
         const requestedOverrides = actorRunBinding(args);
-        const overrides = ownsActor
+        const overrides = ownsActor && !native
           ? await this.#resolvePiRunBinding({ ...requestedOverrides,
             ...(requestedOverrides.model ? { thinking: requestedOverrides.thinking ?? this.actorManager.resolveBinding(actor!.id).thinking } : {}) },
             actor!.runner, context, actor!.routeClass !== undefined, `actor:${actor!.name}`)
@@ -1509,7 +1533,7 @@ export class AgentsProvider implements FabricProvider {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support remote ask`);
         }
         const ownRoot = participant.rootId === this.mainAgent.id;
-        const binding = ownRoot ? overrides : actor ? this.actorManager.resolveBinding(actor.id, overrides) : overrides;
+        const binding = native || ownRoot ? overrides : actor ? this.actorManager.resolveBinding(actor.id, overrides) : overrides;
         const needsBinding = Boolean(binding.model || binding.thinking);
         if (needsBinding && !participant.capabilities.includes("actor-bindings")) {
           throw new Error(`Fabric actor owner ${participant.ownerHostId} does not support session bindings`);
@@ -1538,7 +1562,7 @@ export class AgentsProvider implements FabricProvider {
               message,
               ...(args.data === undefined ? {} : { data: args.data }),
               ...(needsBinding ? { binding } : {}),
-              ...(ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
+              ...(!native && ownRoot ? { bindingProvenance: { kind: "owner-defaults" as const, rootId: this.mainAgent.id } } : {}),
             },
             owner.ownerIdentityId,
             {
@@ -1676,10 +1700,11 @@ export class AgentsProvider implements FabricProvider {
         const id = String(args.id);
         if (id.startsWith("session:")) return this.#setMainBinding("setModel", id, args, context);
         const model = typeof args.model === "string" ? args.model.trim() : "";
-        this.manager.assertModelAllowed(model);
         if (args.scope === "global") {
           const template = this.globalActors.resolve(id);
           if (!template) throw new Error(`Unknown global actor: ${id}`);
+          assertPublicModelActorDefinition(template);
+          this.manager.assertModelAllowed(model);
           const resolved = model
             ? await this.#resolvePiModelArgs({ model, modelReason: args.modelReason, thinking: template.thinking, modelSource: "explicit" }, context, template.runner, true, `actor:${template.name}`)
             : { model };
@@ -1687,6 +1712,10 @@ export class AgentsProvider implements FabricProvider {
           return { ...this.globalActors.update(template.id, { model: resolved.model as string, ...(typeof args.modelReason === "string" ? { modelReason: args.modelReason } : {}) }), ...modelResolutionMetadata(resolved) };
         }
         const target = await this.#resolveActorTarget(id, context.signal);
+        if (this.#nativeActor(target.actor?.id ?? target.participant?.id ?? id, target.actor, target.participant)) {
+          throw new Error("Native actors do not support model settings");
+        }
+        this.manager.assertModelAllowed(model);
         const runner = target.actor?.runner ?? target.participant!.runner ?? this.manager.config.runner;
         const role = `actor:${target.actor?.name ?? target.participant!.name}`;
         const thinking = target.actor
@@ -1729,8 +1758,14 @@ export class AgentsProvider implements FabricProvider {
         const thinking = typeof args.thinking === "string" ? args.thinking.trim() : "";
         if (thinking && !isFabricThinking(thinking)) throw new Error(`Invalid Fabric actor thinking level: ${thinking}`);
         if (args.scope === "global") {
+          const template = this.globalActors.resolve(id);
+          if (template) assertPublicModelActorDefinition(template);
           // The registry validates an empty string to absence; undefined means keep the template field.
           return this.globalActors.update(id, { thinking: thinking as NonNullable<FabricActorRequest["thinking"]> });
+        }
+        const target = await this.#resolveActorTarget(id, context.signal);
+        if (this.#nativeActor(target.actor?.id ?? target.participant?.id ?? id, target.actor, target.participant)) {
+          throw new Error("Native actors do not support thinking settings");
         }
         const resident = await this.#residentActorOwner(id, context.signal);
         if (resident) return this.#setResidentActor(resident, {
@@ -1903,10 +1938,13 @@ export class AgentsProvider implements FabricProvider {
         if (!key) throw new Error("Import requires a template id or name");
         const def = this.globalActors.resolve(key);
         if (!def) throw new Error(`Unknown global actor: ${key}`);
+        assertPublicModelActorDefinition(def);
         const as =
           typeof args.as === "string" && args.as.trim() ? args.as.trim() : undefined;
         // A token belongs to this materialization, never to the reusable template.
-        const request = { ...this.globalActors.toRequest(def, as),
+        const materialization = this.globalActors.toRequest(def, as);
+        assertPublicModelActorDefinition(materialization);
+        const request = { ...materialization,
           ...(args.slotClaim === undefined ? {} : { slotClaim: normalizeActorSlotClaim(args.slotClaim) }),
           ...(typeof args.idempotencyKey === "string" ? { idempotencyKey: args.idempotencyKey } : {}),
         };
@@ -2091,12 +2129,13 @@ export class AgentsProvider implements FabricProvider {
     from: MeshIdentity,
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
+    nativeAdmission?: NativeControlAdmission,
   ): Promise<FabricControlAcceptance> {
     if (isProviderParticipantRef(command.targetId)) {
       return acceptProviderParticipantControl(this.providerParticipants, command);
     }
     // The router retains legacy wire names only to give old senders a clear refusal.
-    return this.#router.acceptControl(command, from, signal, verification);
+    return this.#router.acceptControl(command, from, signal, verification, nativeAdmission);
   }
 
   async #resolveActorTarget(id: string, signal?: AbortSignal): Promise<{ actor?: FabricActorInfo; participant?: FabricParticipantInfo }> {

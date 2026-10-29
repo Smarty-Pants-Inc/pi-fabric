@@ -23,6 +23,8 @@ const primaryEntryPoints = [
   "src/agents/worker-protocol.ts",
   // Runner adapter registration; never reachable from the extension entry.
   "src/runners.ts",
+  // Host-only native actor registration; no extension-entry or guest edge.
+  "src/native-actors.ts",
   // Opt-in durable Pi adapter; never reachable from the extension entry.
   "src/durable.ts",
   "src/jev.ts",
@@ -100,6 +102,8 @@ const lazyEntryPoints = [
   "src/mesh/nats-auth/dispatch-cli.ts",
   // `nats-link start` loads the file <-> NATS link only when it starts (smarty-dev#15310).
   "src/mesh/bridge-nats-link.ts",
+  // Native ask claim/consume stays first-use and generation-stable in installed owners.
+  "src/mesh/bridge-nats-ingress.ts",
   "src/mesh/nats-auth/owner-cli.ts",
   // First-use host custody and participant snapshots keep stable lazy paths.
   "src/topology/host-leases.ts",
@@ -123,6 +127,7 @@ const lazyEntryPoints = [
   "src/core/model-served.ts",
   "src/core/auto-approval-classifier-impl.ts",
   "src/guards/foreground-wait.ts",
+  "src/guards/actor-bash-timeout.ts",
   "src/agents/model-route.ts",
   "src/agents/model-route-prepare.ts",
   "src/agents/per-call-route.ts",
@@ -196,6 +201,8 @@ const lazyEntryPoints = [
   "src/worker/retry-profile.ts",
   "src/worker/profile-extensions.ts",
   "src/worker/task-entry.ts",
+  // Opt-in fenced native Main adapter; delegates only after kernel custody.
+  "src/worker/native-owner-entry.ts",
   "src/worker/release-entry.ts",
   "src/worker/run-log.ts",
   "src/worker/result.ts",

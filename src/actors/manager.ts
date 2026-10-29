@@ -4,7 +4,11 @@ import { diagnostics, logDiagnostic } from "../core/diagnostics.js";
 import { copyFabricProvenance, fabricTurnProvenance, fabricWakeCause, type FabricTurnProvenance, type FabricPrincipal } from "../fabric-provenance.js";
 import { eventReceipts, workKey } from "../topology/root-inbox-shared.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import { formatAge } from "../residency/protocol.js";
+import { formatAge, residentHostId } from "../residency/protocol.js";
+import type { NativeActorBinding, NativeActorRegistration } from "./native-handler.js";
+import type { NativeControlAdmission } from "../mesh/bridge-nats-ingress.js";
+import { copyNativeBinding, hasNativeActorMarker, nativeMessageMetadata, nativeRowMatches, sameNativeBinding, snapshotNativeJson,
+  NativeActorBusyError, NativeActorUnavailableError, NativeActorUnsupportedOperationError } from "./native-execution.js";
 import { createHash, randomUUID } from "node:crypto";
 import { actorRoleStamp, normalizeFabricActorActivationIdentity } from "./activation-identity.js";
 import fs from "node:fs";
@@ -116,6 +120,8 @@ export interface ActorModelRouteInput {
 }
 
 export interface ActorMessageBindingOptions {
+  /** Host-issued capability; never a serialized control/payload/binding field. */
+  nativeAdmission?: NativeControlAdmission;
   /** Host-only admitted requester snapshot, separate from payload and bindings. */
   provenance?: FabricTurnProvenance | undefined;
   /** Per-call values layered over this session binding. */
@@ -137,6 +143,8 @@ type MeshActivationFacts = NonNullable<CoalescedMeshEvent["activation"]>;
 type DecisionMeshRecord = CoalescedMeshEvent;
 
 interface ActorQueueItem {
+  /** Volatile ask proof; intentionally absent from queue/history/archive encoders. */
+  nativeAdmission?: NativeControlAdmission;
   outcomeSend?: DeliverySend;
   /** Checkpointed before FAILED escapes: this original is never runnable again. */
   terminalFailed?: true;
@@ -228,7 +236,8 @@ interface ManagedActor extends FabricActorBatching {
   adoptedFrom?: string[];
   // The creating root's project (smarty-dev#878): only that project's agent adopts the actor.
   project?: string;
-  instructions: string;
+  instructions: string | null;
+  execution?: import("./types.js").NativeActorExecution;
   status: FabricActorStatus;
   events: FabricActorHostEvent[];
   eventsStartAt?: number;
@@ -251,7 +260,7 @@ interface ManagedActor extends FabricActorBatching {
   filteredCount?: number;
   lastFilteredAt?: number;
   residency: FabricParticipantResidency;
-  runner: FabricAgentRunner;
+  runner: FabricAgentRunner | "native";
   /** Host-derived registration module, retained for durable owner restarts. */
   runnerModule?: string;
   kernel?: FabricKernel;
@@ -1119,6 +1128,13 @@ export class ActorManager {
   readonly #slotParkedRows = new Map<string, Record<string, unknown>>();
   /** Durable no-rebirth tombstones are quarantined identities, not active input holds. */
   readonly #slotRetiredIds = new Set<string>();
+  readonly #canMaterializeNative: (() => boolean) | undefined;
+  readonly #nativeBindings = new Map<string, NativeActorBinding>();
+  readonly #nativeHandlers = new Map<string, NativeActorRegistration>();
+  /** Sticky identity reservation, including malformed/unconfigured execution markers. */
+  readonly #nativeIds = new Set<string>();
+  readonly #nativeQuarantined = new Set<string>();
+  readonly #nativeQuarantineReported = new Set<string>();
 
   constructor(
     readonly sessionId: string,
@@ -1128,6 +1144,12 @@ export class ActorManager {
     readonly agents: AgentManager,
     readonly onDeliver: (request: FabricActorDeliveryRequest) => void,
     options: {
+      /** Declarations reserve IDs in BOTH scopes; only a session durable owner executes. */
+      nativeBindings?: readonly NativeActorBinding[];
+      /** Resident-only immutable callbacks captured after module/custody admission. */
+      nativeHandlers?: readonly NativeActorRegistration[];
+      /** Trusted resident birth window ONLY; never execution, control or shared readiness authority. */
+      canMaterializeNative?: () => boolean;
       /** Staged resident successor: no business activation before launcher commitment. */
       releasePaused?: boolean;
       /** Native-only shared protected readiness barrier, supplied by ActorDirectory. */
@@ -1243,6 +1265,23 @@ export class ActorManager {
     this.#claimResidency = options.claimResidency;
     this.#beforeOperatorCleanup = options.beforeOperatorCleanup;
     this.#rootId = options.rootId ?? identity.id;
+    this.#canMaterializeNative = options.canMaterializeNative;
+    for (const input of options.nativeBindings ?? []) {
+      const binding = copyNativeBinding(input);
+      if (this.#nativeBindings.has(binding.actorId)) throw new NativeActorUnavailableError();
+      this.#nativeBindings.set(binding.actorId, binding);
+      this.#nativeIds.add(binding.actorId);
+    }
+    for (const input of options.nativeHandlers ?? []) {
+      const binding = copyNativeBinding(input.binding);
+      const declaration = this.#nativeBindings.get(binding.actorId);
+      if (!declaration || !sameNativeBinding(declaration, binding) || typeof input.handler !== "function" || this.#nativeHandlers.has(binding.actorId)) {
+        throw new NativeActorUnavailableError();
+      }
+      if (this.#actorScope === "session" && binding.rootId === this.#rootId) {
+        this.#nativeHandlers.set(binding.actorId, Object.freeze({ binding, handler: input.handler }));
+      }
+    }
     this.#project = options.project;
     this.#role = options.role;
     this.#relayParticipantSteering = options.relayParticipantSteering ?? true;
@@ -1691,6 +1730,7 @@ export class ActorManager {
   async #recordSpawnRouterStart(request: FabricActorRequest, actor: ManagedActor, admission?: SpawnRouterAdmission): Promise<void> {
     const decisionId = (request as FabricActorRequest & { spawnRouterDecisionId?: unknown }).spawnRouterDecisionId;
     if (typeof decisionId !== "string" || !decisionId) return;
+    this.#assertModelActor(actor);
     try {
       const { recordSpawnRouterStart } = await import("../agents/spawn-router.js");
       const binding = actor.resolvedBinding ?? {};
@@ -1750,6 +1790,8 @@ export class ActorManager {
     let routerStartSettled = typeof routerDecisionId !== "string" || routerDecisionId.length === 0;
     let reservedName: string | undefined;
     try {
+    // Reject BEFORE spreading/whitelist reconstruction, model defaults or any preparation.
+    if (hasNativeActorMarker(request)) throw new NativeActorUnsupportedOperationError();
     this.#assertReleaseAdmission();
     this.#refreshOwnership();
     const registryOwnerCreate = asRegistryOwner && request.residency === "durable";
@@ -1778,6 +1820,7 @@ export class ActorManager {
     request = { ...request, name }; // Capture the canonical name before any awaited preparation.
     // A predecessor whose removal is pending keeps its name until its run ends (smarty-dev#2184).
     const sameName = [...this.#actors.values()].find((actor) => actor.name === name && !actor.removal);
+    if (sameName && this.#nativeIds.has(sameName.id)) throw new NativeActorUnsupportedOperationError();
     const protectedBirth = this.#slotEnforced(request.topics ?? []);
     if (protectedBirth && !this.#persistent) throw new Error("Protected actor admission requires a persistent native registry");
     // Ordinary incumbents cannot be an exact protected retry. Reject before the
@@ -1858,6 +1901,7 @@ export class ActorManager {
     // Forwarded by the creating session (validated, fail closed) or this session's own.
     const principalScope = launchScope(undefined, request.principalScope);
     let id = randomUUID().replaceAll("-", "");
+    if (this.#nativeIds.has(id)) throw new NativeActorUnavailableError();
     const actorDirectory = path.join(this.#actorRoot, id);
     let actor: ManagedActor = {
       id,
@@ -1948,6 +1992,7 @@ export class ActorManager {
     // compensate by deleting a claim, intent, or a successfully admitted actor.
     try {
       id = admitted?.actorId ?? id;
+      if (this.#nativeIds.has(id)) throw new NativeActorUnavailableError();
       checkActive?.();
       if (!admitted?.reused) {
         if (sameName && sameName.status !== "stopped") throw new Error(`A Fabric actor named ${name} is already active (${sameName.id})`);
@@ -1992,6 +2037,136 @@ export class ActorManager {
     } finally {
       // A rejected contender never owns (and must never release) another create's key.
       if (reservedName !== undefined) this.#creationNameReservations.delete(reservedName);
+      --this.#pendingCreates;
+    }
+  }
+
+  /** Exact identity only, never name/prefix adoption or a special public create runner. */
+  isNativeActor(id: string): boolean {
+    this.#syncActorsFromRegistry();
+    return this.#nativeIds.has(id);
+  }
+
+  #nativeAuthority(id: string): boolean {
+    const binding = this.#nativeBindings.get(id);
+    return !!binding && this.#actorScope === "session" && binding.rootId === this.#rootId &&
+      this.#persistent && this.meshConfig.enabled && this.meshConfig.transport === "file" &&
+      this.#claimResidency === "durable" && this.identity.id === residentHostId(binding.rootId) &&
+      this.identity.kind === "agent" && this.#nativeHandlers.has(id);
+  }
+
+  #assertModelActor(actor: ManagedActor): asserts actor is ManagedActor & { runner: FabricAgentRunner; instructions: string } {
+    if (actor.execution || actor.runner === "native" || this.#nativeIds.has(actor.id) || actor.instructions === null) {
+      throw new NativeActorUnsupportedOperationError();
+    }
+  }
+
+  #modelRunner(actor: ManagedActor): FabricAgentRunner { this.#assertModelActor(actor); return actor.runner; }
+
+  /** Whole-generation prepass: a later ordinary duplicate cannot overwrite a native marker. */
+  #scanNativeRows(records: readonly unknown[]): void {
+    const counts = new Map<string, number>();
+    for (const value of records) {
+      const row = refRecord(value);
+      if (typeof row?.id !== "string") continue;
+      counts.set(row.id, (counts.get(row.id) ?? 0) + 1);
+      if (hasNativeActorMarker(row)) this.#nativeIds.add(row.id);
+    }
+    this.#nativeQuarantined.clear();
+    for (const value of records) {
+      const row = refRecord(value);
+      if (typeof row?.id !== "string" || !this.#nativeIds.has(row.id)) continue;
+      const binding = this.#nativeBindings.get(row.id);
+      if (counts.get(row.id) !== 1 || !binding || this.#actorScope !== "session" || !nativeRowMatches(row, binding)) {
+        this.#nativeQuarantined.add(row.id);
+      }
+    }
+    for (const actor of this.#actors.values()) {
+      if (this.#nativeIds.has(actor.id) && counts.get(actor.id) !== 1) this.#nativeQuarantined.add(actor.id);
+    }
+    for (const id of this.#nativeQuarantined) {
+      if (!this.#nativeQuarantineReported.has(id)) {
+        this.#nativeQuarantineReported.add(id);
+        diagnostics.warn("src/actors/manager.ts", `[pi-fabric] native actor execution quarantined (${ /^[a-f0-9]{32}$/.test(id) ? id : "invalid-id" }); no model fallback`);
+      }
+      const previous = this.#actors.get(id);
+      if (!previous) continue;
+      previous.abortController?.abort();
+      this.#drop(previous, this.#takeQueued(previous), "Native actor unavailable", false);
+      this.#actors.delete(id); // executing object stays in #draining until ACTUAL settlement
+      this.#locallyCreated.delete(id);
+      this.#ownership.set(id, false);
+    }
+  }
+
+  #nativeActor(binding: NativeActorBinding, row?: Record<string, unknown>): ManagedActor {
+    return {
+      id: binding.actorId, rootId: binding.rootId, name: binding.name,
+      instructions: null, execution: Object.freeze({ kind: "native", version: 1, handlerKey: binding.handlerKey }), runner: "native",
+      status: row?.status === "stopped" ? "stopped" : "idle",
+      ...(row?.status === "stopped" ? { stopReason: persistedStopReason(row) ?? "explicit" } : {}),
+      ...(row?.status === "stopped" && typeof row.stoppedAt === "number" ? { stoppedAt: row.stoppedAt } : {}),
+      ...(row?.removal && typeof refRecord(row.removal)?.requestedAt === "number"
+        ? { removal: { requestedAt: refRecord(row.removal)!.requestedAt as number } } : {}),
+      residency: "durable", events: [], topics: [], delivery: "mailbox", responseMode: "text", triggerTurn: false, coalesce: false,
+      requirements: [], latestActivationSequence: 0, sessionFile: path.join(this.#actorRoot, binding.actorId, "session.jsonl"),
+      queue: [], messages: [], draining: false,
+      createdAt: typeof row?.createdAt === "number" ? row.createdAt : Date.now(),
+      updatedAt: typeof row?.updatedAt === "number" ? row.updatedAt : Date.now(),
+    };
+  }
+
+  async ensureNativeActor(input: NativeActorBinding): Promise<FabricActorInfo> {
+    const binding = copyNativeBinding(input), configured = this.#nativeBindings.get(binding.actorId);
+    if (!configured || !sameNativeBinding(configured, binding) || !ACTOR_NAME_PATTERN.test(binding.name) || !this.#nativeAuthority(binding.actorId)) {
+      throw new NativeActorUnavailableError();
+    }
+    this.#assertReleaseAdmission();
+    if (this.#closing || !(this.#canConsumeMesh?.() === true || this.#canMaterializeNative?.() === true)) throw new NativeActorUnavailableError();
+    ++this.#pendingCreates;
+    let reserved = false;
+    try {
+      if (this.#creationNameReservations.has(binding.name)) throw new NativeActorUnavailableError();
+      this.#creationNameReservations.add(binding.name); reserved = true;
+      await ActorRegistryStore.withLocks([this.#registry, ...this.#slotNameRegistries], () => {
+        this.#assertReleaseAdmission();
+        if (this.#closing || !this.#nativeAuthority(binding.actorId) ||
+            !(this.#canConsumeMesh?.() === true || this.#canMaterializeNative?.() === true)) throw new NativeActorUnavailableError();
+        const rows = this.#registry.snapshot().actors;
+        this.#scanNativeRows(rows);
+        const matching = rows.filter(row => row.id === binding.actorId);
+        if (matching.length > 1 || (matching[0] && !nativeRowMatches(matching[0], binding))) throw new NativeActorUnavailableError();
+        for (const registry of this.#slotNameRegistries) {
+          // A second wrapper for this same path names this row legitimately. A DIFFERENT
+          // registry's same-ID row must not be adopted.
+          for (const row of registry.snapshot().actors) {
+            if (row.id === binding.actorId && !registry.sameLocation(this.#registry)) throw new NativeActorUnavailableError();
+            if (row.id !== binding.actorId && row.name === binding.name) throw new NativeActorUnavailableError();
+          }
+        }
+        if (rows.some(row => row.id !== binding.actorId && row.name === binding.name)) throw new NativeActorUnavailableError();
+        const existing = this.#actors.get(binding.actorId);
+        if (existing && (!existing.execution || existing.rootId !== binding.rootId)) throw new NativeActorUnavailableError();
+        if (!matching.length && existing) throw new NativeActorUnavailableError();
+        if (matching[0]) {
+          if (!existing) {
+            const actor = this.#nativeActor(binding, matching[0]); this.#installLazyMessages(actor, matching[0]); this.#actors.set(actor.id, actor);
+          }
+        } else {
+          const actor = this.#nativeActor(binding);
+          if (this.#canManageActor?.(actor.id) === false) throw new NativeActorUnavailableError();
+          this.#registry.write([...rows, this.#serializedActor(actor)], { durable: true });
+          this.#actors.set(actor.id, actor); this.#locallyCreated.add(actor.id); this.#ownQueueRead.add(actor.id);
+        }
+        this.#rememberLineages(this.#registry.snapshot().actors);
+        this.#ownership.set(binding.actorId, this.#ownershipDecision(binding.actorId));
+      }, "native-birth");
+      const actor = this.#actors.get(binding.actorId);
+      if (!actor || !this.#canManage(actor.id)) throw new NativeActorUnavailableError();
+      await this.#publishPresence(actor, true);
+      return this.#publicInfo(actor);
+    } finally {
+      if (reserved) this.#creationNameReservations.delete(binding.name);
       --this.#pendingCreates;
     }
   }
@@ -2160,6 +2335,7 @@ export class ActorManager {
    * the held registry prevents revokers from crossing validation and enable.
    */
   async #materializeSlot(id: string, spec: Record<string, unknown>): Promise<ManagedActor> {
+    if (hasNativeActorMarker(spec) || this.#nativeIds.has(id)) throw new NativeActorUnavailableError();
     const topics = Array.isArray(spec.topics) ? spec.topics.filter((v): v is string => typeof v === "string") : [];
     if (spec.id !== id || !/^[a-f0-9]{32}$/.test(id)) throw new Error("Invalid protected recovery ID");
     const registries = [this.#registry, ...this.#slotNameRegistries];
@@ -2479,7 +2655,9 @@ export class ActorManager {
     overrides: FabricActorRunBinding = {},
   ): FabricActorRunBinding {
     this.#syncActorsFromRegistry();
-    const { modelSource: _source, ...binding } = this.#runBinding(this.#requireActor(id), overrides);
+    const actor = this.#requireActor(id);
+    this.#assertModelActor(actor);
+    const { modelSource: _source, ...binding } = this.#runBinding(actor, overrides);
     return binding;
   }
 
@@ -2494,6 +2672,7 @@ export class ActorManager {
   ): Promise<FabricActorRunBinding> {
     this.#syncActorsFromRegistry();
     const actor = this.#requireActor(id);
+    this.#assertModelActor(actor);
     if (options.binding !== undefined && options.overrides !== undefined) {
       throw new Error("Actor activation cannot carry both overrides and a resolved binding");
     }
@@ -2521,6 +2700,7 @@ export class ActorManager {
     const next = typeof model === "string" ? model.trim() : "";
     if (scope === "session") this.#syncActorsFromRegistry();
     const actor = scope === "session" ? this.#requireActor(id) : this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
     // A passive session may bind an opaque owner key without authenticating the
     // owner's unrelated registry. Aliases and protected selectors still resolve.
     // Only the provider, which owns the alias table, may certify a key is not an
@@ -2602,6 +2782,7 @@ export class ActorManager {
     if (scope === "session") {
       this.#syncActorsFromRegistry();
       const actor = this.#requireActor(id);
+      this.#assertModelActor(actor);
       const preview = this.#publicInfo(actor, false);
       const thinking = next ?? actor.thinking;
       if (thinking) preview.thinking = thinking; else delete preview.thinking;
@@ -2615,6 +2796,7 @@ export class ActorManager {
       return this.#publicInfo(actor);
     }
     const actor = this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
     this.#assertPresenceValue(this.#presencePreview(actor, { thinking: next }));
     beforeCommit?.(actor.id);
     if (next) actor.thinking = next;
@@ -2633,6 +2815,7 @@ export class ActorManager {
    */
   async setTools(id: string, tools: string[], beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
     const next = [...new Set(tools.map((tool) => tool.trim()).filter(Boolean))];
     this.#assertPresenceValue(this.#presencePreview(actor, { tools: next }));
     beforeCommit?.(actor.id);
@@ -2645,6 +2828,7 @@ export class ActorManager {
   /** Select future activation input without replacing the actor or its journal. */
   async setInferenceContext(id: string, inferenceContext: FabricActorInferenceContext): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
     validateActorInferenceContext(inferenceContext, actor.runner);
     if (inferenceContext === undefined) throw new Error("inferenceContext is required");
     this.#assertPresenceValue(this.#presencePreview(actor, { inferenceContext }));
@@ -2656,6 +2840,7 @@ export class ActorManager {
   /** Set future runs' niceness (smarty-dev#1579); it only raises agents.nice, never lowers it. */
   async setNice(id: string, nice: number): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
     const parsed = parseAgentNice(nice);
     if (parsed === undefined) throw new Error("nice is required");
     this.#assertPresenceValue(this.#presencePreview(actor, { nice: parsed }));
@@ -2667,6 +2852,7 @@ export class ActorManager {
   /** Set or clear (null) the queue coalesce key for mesh events (smarty-dev#705). */
   async setCoalesceKey(id: string, coalesceKey: string | null): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
     this.#assertPresenceValue(this.#presencePreview(actor, { coalesceKey: coalesceKey ?? undefined }));
     if (coalesceKey === null) delete actor.coalesceKey;
     else {
@@ -2682,6 +2868,7 @@ export class ActorManager {
   /** Update batching through the same fenced configuration route as activation filters. */
   async setBatching(id: string, policy: FabricActorBatching, beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
     const batching = normalizeActorBatching(policy);
     if (!Object.keys(batching).length) throw new FabricActorBatchPolicyError("batchWindowMs, batchMax or batchMaxBytes is required");
     this.#assertPresenceValue(this.#presencePreview(actor, batching));
@@ -2701,7 +2888,9 @@ export class ActorManager {
    * telemetry resets; legacy lifetime count is kept.
    */
   async setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit?: (id: string) => void, expiresAt?: number, deadLetterReplayMaxAgeMs?: number, options: { dropQueued?: boolean } = {}): Promise<FabricActorInfo> {
-    const actorId = this.#requireOwnedActor(id).id;
+    const actor = this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
+    const actorId = actor.id;
     const previous = this.#activationFilterChains.get(actorId);
     let release!: () => void;
     const pending = new Promise<void>(resolve => { release = resolve; });
@@ -2718,6 +2907,7 @@ export class ActorManager {
   async #setActivationFilter(id: string, activationFilter: FabricActorActivationFilter | null, beforeCommit: ((id: string) => void) | undefined, expiresAt: number | undefined, deadLetterReplayMaxAgeMs: number | undefined, options: { dropQueued?: boolean }): Promise<FabricActorInfo> {
     // Recheck ownership after waiting: a reload/removal may have displaced the selected actor.
     const actor = this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
     const filter = activationFilter === null ? [] : normalizeActorActivationFilter(activationFilter);
     normalizeDeadLetterReplayMaxAgeMs(deadLetterReplayMaxAgeMs);
     if (expiresAt !== undefined && (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))) throw new Error("expiresAt must be finite epoch milliseconds");
@@ -2914,6 +3104,7 @@ export class ActorManager {
    */
   async setTopics(id: string, topics: string[]): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
     if (!Array.isArray(topics)) throw new Error("topics must be an array of strings");
     const next = [...new Set(topics)];
     for (const topic of next) {
@@ -2953,6 +3144,7 @@ export class ActorManager {
    */
   async setEvents(id: string, events: FabricActorHostEvent[]): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
     const next = [...new Set(events)];
     for (const event of next) {
       if (!HOST_EVENTS.has(event)) throw new Error(`Unsupported Fabric actor event: ${event}`);
@@ -2974,6 +3166,7 @@ export class ActorManager {
     triggerTurn: boolean,
   ): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
     const policy = resolveActorDeliveryPolicy(delivery, triggerTurn);
     this.#assertPresenceValue(this.#presencePreview(actor, policy));
     actor.delivery = policy.delivery;
@@ -3004,6 +3197,7 @@ export class ActorManager {
    */
   async resetSession(id: string, options: { beforeCommit?: (id: string) => void } = {}): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
     const running = this.#draining.get(actor.id);
     // A drain owns admission before it installs its abort controller, including
     // while a boundary presence write or launch preparation is awaiting.
@@ -3268,6 +3462,7 @@ export class ActorManager {
    */
   async setInstructions(id: string, instructions: string, beforeCommit?: (id: string) => void): Promise<FabricActorInfo> {
     const actor = this.#requireOwnedActor(id);
+    this.#assertModelActor(actor);
     if (!instructions.trim()) throw new Error("Actor instructions must not be empty");
     if (Buffer.byteLength(instructions, "utf8") > this.meshConfig.maxEventBytes) {
       throw new Error(`Actor instructions exceed ${this.meshConfig.maxEventBytes} bytes`);
@@ -3289,6 +3484,7 @@ export class ActorManager {
     this.#assertReleaseAdmission(true);
     this.validateDirectMessage(message, data);
     const actor = this.#requireOwnedActiveActor(id);
+    this.#assertModelActor(actor);
     const item = this.#enqueue(
       actor,
       "direct",
@@ -3322,6 +3518,7 @@ export class ActorManager {
     if (!this.meshConfig.enabled) {
       throw new Error("Fabric mesh is disabled; cannot steer a remote agent");
     }
+    if (this.isNativeActor(targetId)) throw new NativeActorUnsupportedOperationError();
     if (!message.trim()) throw new Error("Steering message must not be empty");
     const event = await this.mesh.publish({
       topic: "fabric.steer",
@@ -3346,6 +3543,9 @@ export class ActorManager {
     this.#assertReleaseAdmission();
     this.validateDirectMessage(message, data);
     const actor = this.#requireOwnedActiveActor(id);
+    if (actor.execution || this.#nativeIds.has(actor.id)) {
+      return this.#askNative(actor, message, data, signal, bindingOptions);
+    }
     if (signal?.aborted) {
       return Promise.reject(
         new Error(`Fabric actor ${actor.name} (${actor.id}) request cancelled`),
@@ -3408,6 +3608,36 @@ export class ActorManager {
     });
   }
 
+  async #askNative(actor: ManagedActor, message: string, data: unknown, signal: AbortSignal | undefined,
+    options: ActorMessageBindingOptions): Promise<FabricActorMessage> {
+    if (!this.#nativeAuthority(actor.id) || this.#nativeQuarantined.has(actor.id) || !actor.execution || this.#canConsumeMesh?.() !== true ||
+        options.binding !== undefined || options.overrides !== undefined || !options.nativeAdmission || signal?.aborted) throw new NativeActorUnavailableError();
+    // Snapshot synchronously before the first await; caller mutations cannot alter admitted bytes.
+    const payload = snapshotNativeJson({ message, ...(data !== undefined ? { data } : {}) }, this.mesh.maxEventBytes - ACTOR_MESSAGE_ENVELOPE_BYTES);
+    const admission = options.nativeAdmission;
+    const { claimNativeAskAdmission } = await import("../mesh/bridge-nats-ingress.js");
+    if (signal?.aborted || this.#closing) throw new NativeActorUnavailableError();
+    return new Promise<FabricActorMessage>((resolve, reject) => {
+      const item = this.#enqueue(actor, "direct", payload, { ...options, nativeAdmission: admission, resolve, reject,
+        nativeClaim: () => claimNativeAskAdmission(admission, { actorId: actor.id, message: payload.message, data: "data" in payload ? payload.data : undefined }) });
+      const onAbort = () => {
+        const at = actor.queue.indexOf(item);
+        if (at >= 0) {
+          actor.queue.splice(at, 1); this.#recordDropped(actor, item, "native ask cancelled");
+          if (!this.#inFlight.has(actor.id) && !actor.queue.length && actor.status !== "stopped") actor.status = "idle";
+        }
+        else if (this.#inFlight.get(actor.id) === item) actor.abortController?.abort();
+        // Rejection ends observation, NEVER execution custody.
+        item.reject?.(new Error("Native actor request cancelled; callback outcome may be indeterminate"));
+      };
+      const cleanup = () => signal?.removeEventListener("abort", onAbort);
+      item.resolve = value => { cleanup(); resolve(value); };
+      item.reject = error => { cleanup(); reject(error); };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    });
+  }
+
   messages(id: string, limit = 50): FabricActorMessage[] {
     this.#syncActorsFromRegistry();
     const actor = this.#requireActor(id);
@@ -3423,7 +3653,9 @@ export class ActorManager {
    */
   instructions(id: string): string {
     this.#syncActorsFromRegistry();
-    return this.#requireActor(id).instructions;
+    const actor = this.#requireActor(id);
+    this.#assertModelActor(actor);
+    return actor.instructions;
   }
 
   /**
@@ -3435,6 +3667,7 @@ export class ActorManager {
   definition(id: string): FabricActorRequest {
     this.#syncActorsFromRegistry();
     const actor = this.#requireActor(id);
+    this.#assertModelActor(actor);
     return {
       name: actor.name,
       instructions: actor.instructions,
@@ -3608,6 +3841,7 @@ export class ActorManager {
   }
 
   #observesHostEvent(actor: ManagedActor, event: FabricActorHostEvent): boolean {
+    if (actor.execution || this.#nativeIds.has(actor.id)) return false;
     if (actor.status === "stopped" || !actor.events.includes(event) || !this.#slotCurrent(actor)) return false;
     // Refreshing check: adoption grants ownership only after the fenced
     // registry write, and a cede must stop event consumption immediately —
@@ -4018,6 +4252,8 @@ export class ActorManager {
    * session-archive/. Nothing is forgotten here; a failed write throws with the actor and its work intact.
    */
   #writeStopArchive(actor: ManagedActor, running: ManagedActor, stopped: boolean, inFlightOnly = false): { stoppedQueue: FabricActorStoppedQueue; deadLetters: boolean; stoppedAt: number } | undefined {
+    // Native bodies/proofs never enter stop archives, even for an ask cancelled in flight.
+    if (actor.execution) return undefined;
     // Round 4 (pi-fabric#1572): inFlightOnly, for an explicit stop without dropQueued, archives the callerless item(s) of
     // the activation in flight and nothing else. A caller's ask is not archived: its caller hears the run's abort, as on
     // e50db08f, and requeueArchived never feeds a caller's ask again. Nothing callerless in flight: no archive at all.
@@ -4153,6 +4389,7 @@ export class ActorManager {
   }
 
   #archiveRecord(actorId: string, item: ActorQueueItem): Record<string, unknown> {
+    if (this.#nativeIds.has(actorId)) return { id: item.id, source: "direct", createdAt: item.createdAt, caller: true };
     const caller = item.resolve || item.reject ? { caller: true } : {};
     try { return { ...this.#queueRecord(actorId, item), ...caller }; } catch {
       // Never lose the item's identity, even when its payload cannot be serialized.
@@ -4174,6 +4411,7 @@ export class ActorManager {
    */
   async requeueArchived(id: string, archive: string, beforeCommit?: (id: string) => void): Promise<FabricActorRequeueResult> {
     const actor = this.#requireOwnedActiveActor(id);
+    this.#assertModelActor(actor);
     if (typeof archive !== "string" || !archive.trim()) throw new Error("requeueArchived requires archive: a stop archive path");
     // Round 3 (pi-fabric#1572): the path the stop returned still finds the archive after a removal moved it to session-archive/.
     const file = this.#locateStopArchive(path.resolve(archive), actor);
@@ -4827,7 +5065,8 @@ export class ActorManager {
     const owner = cleanup.owner;
     const requestedAt = owner?.requestedAt ?? 0;
     return { id, scope: this.#actorScope, name: owner?.name ?? id,
-      ...(owner ? { rootId: owner.rootId, residency: owner.residency } : {}), status: "stopped", runner: "pi", events: [], topics: [],
+      ...(owner ? { rootId: owner.rootId, residency: owner.residency } : {}), status: "stopped",
+      runner: this.#nativeIds.has(id) ? "native" : "pi", events: [], topics: [],
       delivery: "mailbox", responseMode: "text", triggerTurn: false, coalesce: false,
       filterSkipped: { count: 0, lastKey: null, lastTopic: null, lastAt: null },
       queued: 0, messages: 0, createdAt: requestedAt, updatedAt: requestedAt,
@@ -5349,7 +5588,14 @@ export class ActorManager {
           actor.lastError ?? `${actor.name} (${actor.id}) pending checkpoint failed`).join("; ")}`));
       }
       this.#closing = true;
-      this.#closePromise = this.#close().finally(() => this.#registry.releaseReadCache());
+      this.#closePromise = this.#close().then(() => this.#registry.releaseReadCache(), error => {
+        if (error instanceof NativeActorBusyError) {
+          this.#closePromise = undefined; // retry only after actual native settlement; retain custody/cache
+        } else {
+          this.#registry.releaseReadCache(); // ordinary failures keep the cached rejection and original cleanup
+        }
+        throw error;
+      });
       // Retention/presence joins may yield before #close reaches its owned rows.
       // Cancel current preparations now; a released model resolver must not launch
       // a worker while shutdown waits for a deferred maintenance slice. Cache the
@@ -5439,6 +5685,7 @@ export class ActorManager {
         await this.agents.close({ persistentSessionReload: this.identity.kind === "main" });
         await settleWithin([drains], this.#closeGraceMs);
       }
+      if ([...this.#draining.values()].some(actor => actor.execution && actor.abortController)) throw new NativeActorBusyError();
       // Retry every durable join before AgentManager.close. Failed sinks keep
       // their source veto on disk for the next execution owner.
       for (const actor of owned) {
@@ -5559,7 +5806,7 @@ export class ActorManager {
   #reconcileChildCompletions(completed?: ManagedActor): void {
     if (!this.#persistent || this.#closing || this.#releaseStrict) return;
     for (const actor of completed ? [completed] : this.#actors.values()) {
-      if (actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id) || !this.#slotCurrent(actor)) {
+      if (actor.execution || this.#nativeIds.has(actor.id) || actor.status === "stopped" || actor.removal || !this.#canManageCached(actor.id) || !this.#slotCurrent(actor)) {
         void this.#releaseChildCompletionStore(actor);
         continue;
       }
@@ -5662,6 +5909,8 @@ export class ActorManager {
     options: ActorMessageBindingOptions & {
       resolve?: (message: FabricActorMessage) => void;
       reject?: (error: Error) => void;
+      /** Private enqueue port supplied only by #askNative after lazy ingress load. */
+      nativeClaim?: () => void;
       coalesceKey?: string;
       /** Restored dead-letter history, including when an older replay cannot replace the primary. */
       coalesced?: readonly CoalescedMeshEvent[];
@@ -5705,6 +5954,7 @@ export class ActorManager {
     this.#assertReleaseAdmission(source === "direct");
     this.#assertSlotCurrent(actor);
     if (this.#closing) throw new Error("Fabric actor manager is closing; retry");
+    if (this.#nativeIds.has(actor.id) && this.#actors.get(actor.id) !== actor) throw new NativeActorUnavailableError();
     this.#releaseCheckpoint = undefined;
     const canManage = options.ownershipChecked
       ? this.#canManageCached(actor.id)
@@ -5719,6 +5969,15 @@ export class ActorManager {
     if (options.binding !== undefined && options.overrides !== undefined) {
       throw new Error("Actor activation cannot carry both overrides and a resolved binding");
     }
+    const native = actor.execution !== undefined || this.#nativeIds.has(actor.id);
+    if (native) {
+      if (!actor.execution || !this.#nativeAuthority(actor.id) || this.#nativeQuarantined.has(actor.id) || this.#canConsumeMesh?.() !== true ||
+          source !== "direct" || !options.resolve || !options.reject || !options.nativeAdmission || !options.nativeClaim ||
+          options.binding !== undefined || options.overrides !== undefined || options.coalesceKey !== undefined || options.archived ||
+          options.images || options.replaying || options.batchQueued) throw new NativeActorUnsupportedOperationError();
+      if (actor.queue.length >= this.meshConfig.actorQueueLimit) throw new NativeActorUnavailableError();
+      options.nativeClaim(); // genuine WeakMap proof; exactly once, BEFORE queue mutation
+    }
     const bindingMode = options.binding !== undefined ? "resolved" : "owner-defaults";
     const unresolved = this.#validatedRunBinding(options.binding ?? options.overrides ?? {});
     // A synchronous resolver (the resident owner) rejects a hidden model here, so the caller
@@ -5726,9 +5985,9 @@ export class ActorManager {
     // model again when the activation runs, and enqueue stays synchronous (smarty-dev#1830).
     // Check against current owner effort without making it a queued override.
     // Foreign resolved bindings must not borrow the owner's private defaults.
-    const ownerThinking = options.binding === undefined ? this.#runBinding(actor).thinking : undefined;
+    const ownerThinking = !native && options.binding === undefined ? this.#runBinding(actor).thinking : undefined;
     const resolving = unresolved.model ? this.#resolvedRunBindingFor(
-      actor.runner, unresolved, actor.routeClass !== undefined, false, `actor:${actor.name}`, ownerThinking, actor,
+      this.#modelRunner(actor), unresolved, actor.routeClass !== undefined, false, `actor:${actor.name}`, ownerThinking, actor,
     ) : unresolved;
     const binding = resolving instanceof Promise ? (resolving.catch(() => undefined), unresolved) : resolving;
     const sender = options.sender === null ? undefined : options.sender ?? processSender();
@@ -5841,7 +6100,8 @@ export class ActorManager {
       ...(options.outcomeSend ? { outcomeSend: options.outcomeSend } : {}),
       ...(options.provenance ? { provenance: structuredClone(options.provenance) } : {}),
       source,
-      payload: structuredClone(payload),
+      payload: native ? snapshotNativeJson(payload, this.mesh.maxEventBytes - ACTOR_MESSAGE_ENVELOPE_BYTES) : structuredClone(payload),
+      ...(native && options.nativeAdmission ? { nativeAdmission: options.nativeAdmission } : {}),
       ...(source.startsWith("mesh:") && options.coalesced?.length
         ? { coalesced: this.#restoreMeshHistory(actor, { payload, sender, provenance: options.provenance, coalesced: options.coalesced,
           activation: this.#activation(itemId, source, payload, sequence, createdAt, options.meshActivation) }) } : {}),
@@ -6227,6 +6487,7 @@ export class ActorManager {
   #ensureDrain(actor: ManagedActor): void {
     if (
       actor.draining ||
+      (this.#nativeIds.has(actor.id) && this.#canConsumeMesh?.() !== true) ||
       !this.#slotCurrent(actor) ||
       this.#drainRetries.has(actor.id) ||
       // One activation at a time per actor session, even across a registry reload that
@@ -6341,6 +6602,8 @@ export class ActorManager {
   }
 
   async #drain(actor: ManagedActor): Promise<void> {
+    if (actor.execution || this.#nativeIds.has(actor.id)) return this.#drainNative(actor);
+    this.#assertModelActor(actor);
     let retryDrain = false;
     let retryDelay = this.#preparationRetryMs;
     try {
@@ -7057,6 +7320,74 @@ export class ActorManager {
     }
   }
 
+  async #drainNative(actor: ManagedActor): Promise<void> {
+    try {
+      while (actor.queue.length && actor.status !== "stopped" && !this.#closing && !this.#releasePaused && this.#canConsumeMesh?.() === true && this.#canManage(actor.id)) {
+        const item = actor.queue.shift()!;
+        this.#inFlight.set(actor.id, item);
+        const controller = new AbortController(); actor.abortController = controller;
+        let timer: NodeJS.Timeout | undefined;
+        try {
+          actor.status = "preparing"; actor.preparing = { phase: "native-admission", startedAt: Date.now(), attempts: 0 };
+          await this.#publishDrainPresence(actor, true);
+          const registration = this.#nativeHandlers.get(actor.id), payload = refRecord(item.payload);
+          if (!registration || !actor.execution || !this.#nativeAuthority(actor.id) || this.#nativeQuarantined.has(actor.id) ||
+              this.#actors.get(actor.id) !== actor || !this.#canManage(actor.id) || this.#canConsumeMesh?.() === false ||
+              controller.signal.aborted || this.#closing || this.#releasePaused || (actor.status as string) === "stopped" ||
+              !item.resolve || !item.reject || item.source !== "direct" || !item.nativeAdmission || !payload || typeof payload.message !== "string" ||
+              actor.execution.handlerKey !== registration.binding.handlerKey) throw new NativeActorUnavailableError();
+          const { consumeNativeAskAdmission } = await import("../mesh/bridge-nats-ingress.js");
+          // No await between final ownership/cancellation checks, consuming proof and callback entry.
+          if (!this.#canManage(actor.id) || this.#canConsumeMesh?.() === false || controller.signal.aborted || this.#closing || this.#releasePaused ||
+              (actor.status as string) === "stopped" || this.#actors.get(actor.id) !== actor) throw new NativeActorUnavailableError();
+          const context = consumeNativeAskAdmission(item.nativeAdmission, { actorId: actor.id, message: payload.message, data: payload.data }, controller.signal);
+          const cancel = () => item.reject?.(new Error("Native actor request cancelled; callback outcome may be indeterminate"));
+          controller.signal.addEventListener("abort", cancel, { once: true });
+          timer = setTimeout(() => controller.abort(), Math.max(0, context.deadlineAt - Date.now())); timer.unref();
+          actor.status = "running"; delete actor.preparing; actor.updatedAt = Date.now();
+          void this.#publishPresence(actor).catch(() => undefined);
+          const request = Object.freeze({ message: payload.message, data: payload.data });
+          // CRITICAL: await the ACTUAL promise, never race it with timeout/abort. No AgentManager run exists.
+          const returned = await registration.handler(request, context);
+          controller.signal.removeEventListener("abort", cancel);
+          if (controller.signal.aborted || !this.#canManage(actor.id) || this.#canConsumeMesh?.() === false || this.#closing ||
+              (actor.status as string) === "stopped") throw new NativeActorUnavailableError();
+          const response = snapshotNativeJson(returned, this.mesh.maxEventBytes - ACTOR_MESSAGE_ENVELOPE_BYTES);
+          if (!response || typeof response !== "object" || Array.isArray(response) || !Object.hasOwn(response, "data") ||
+              (response.text !== undefined && typeof response.text !== "string") || Object.keys(response).some(key => key !== "data" && key !== "text")) {
+            throw new NativeActorUnavailableError();
+          }
+          const message: FabricActorMessage = { id: randomUUID(), actorId: actor.id, actorName: actor.name,
+            direction: "out", source: "direct", createdAt: Date.now(), data: response.data,
+            ...(response.text !== undefined ? { text: response.text } : {}) };
+          if (Buffer.byteLength(JSON.stringify(message)) > this.mesh.maxEventBytes - ACTOR_MESSAGE_ENVELOPE_BYTES) throw new NativeActorUnavailableError();
+          this.#recordMessage(this.#liveActor(actor), message); // sanitized COPY, direct message untouched
+          delete actor.lastError;
+          item.resolve?.(structuredClone(message));
+        } catch {
+          // Callback exceptions may contain request/result/secrets: only a bounded STATIC transport error escapes.
+          actor.lastError = "Native actor ask failed";
+          this.#recordMessage(this.#liveActor(actor), { id: randomUUID(), actorId: actor.id, actorName: actor.name,
+            direction: "out", source: "direct", createdAt: Date.now(), error: "Native actor ask failed" });
+          item.reject?.(new Error("Native actor ask failed; callback outcome may be indeterminate"));
+        } finally {
+          if (timer) clearTimeout(timer);
+          delete actor.abortController; delete actor.preparing; delete actor.cancelAbort; delete actor.ownershipAbort;
+          this.#inFlight.delete(actor.id);
+          actor.updatedAt = Date.now();
+          if ((actor.status as string) !== "stopped") actor.status = actor.queue.length ? "queued" : "idle";
+          if (this.#canManage(actor.id)) await this.#publishPresence(actor).catch(() => undefined);
+        }
+      }
+    } finally {
+      actor.draining = false;
+      if (this.#draining.get(actor.id) === actor) this.#draining.delete(actor.id);
+      this.#emitChange();
+      const live = this.#actors.get(actor.id);
+      if (live?.queue.length && live !== actor) queueMicrotask(() => this.#ensureDrain(live));
+    }
+  }
+
   // Only full-history actors proactively reset from their last measured model context.
   // Activation windows project history out, but a final payload refusal still gets one
   // fresh-session retry when the durable journal has history (smarty-dev#10049).
@@ -7343,6 +7674,7 @@ export class ActorManager {
     capabilityRequirements?: string[],
     capabilityDigest?: string,
   ): AgentRunRequest {
+    this.#assertModelActor(actor);
     requireActorRunner(actor.runner, actor.residency);
     const items = this.#batchItems(actor.id, item);
     // Neither a mixed batch nor collapsed history can borrow the primary sender's authority.
@@ -7402,6 +7734,7 @@ export class ActorManager {
   }
 
   #systemPrompt(actor: ManagedActor): string {
+    this.#assertModelActor(actor);
     // smarty-dev#967: "end your reply with one JSON object" invited prose before it. A Pi actor
     // replies through the fabric_reply tool, and its text is not delivered.
     const responseInstruction =
@@ -8126,7 +8459,7 @@ export class ActorManager {
     // Keep stable IDs across ownership refreshes: persistent reacquisition can replace
     // every ManagedActor object before the synchronous delivery loop enqueues work.
     const targets = [...this.#actors.values()].filter((actor) => {
-      if (actor.status === "stopped") return false;
+      if (actor.execution || this.#nativeIds.has(actor.id) || actor.status === "stopped") return false;
       const addressed = event.to === actor.id || event.to === actor.name;
       return (addressed || actor.topics.includes(event.topic)) &&
         (event.from.id !== actor.id || addressed) &&
@@ -9214,6 +9547,7 @@ export class ActorManager {
   }
 
   #recordMessage(actor: ManagedActor, message: FabricActorMessage): void {
+    if (actor.execution || this.#nativeIds.has(actor.id)) message = nativeMessageMetadata(message);
     if (message.source === "child-completion" && message.direction === "in" &&
       actor.messages.some((known) => known.id === message.id && known.direction === "in")) return;
     this.#logs.recordMessage(actor.messages, message);
@@ -9286,6 +9620,8 @@ export class ActorManager {
   }
 
   #publishNotification(request: Parameters<MeshStore["publish"]>[0], actor?: ManagedActor): Promise<void> {
+    const targetId = refRecord(request.data)?.actorId ?? refRecord(request.data)?.id;
+    if (actor?.execution || (typeof targetId === "string" && this.#nativeIds.has(targetId))) return Promise.resolve();
     return this.#notifications.enqueue(() => actor
       ? this.#withSlotPublication(actor, () => this.mesh.publish(request)) : this.mesh.publish(request));
   }
@@ -9507,6 +9843,7 @@ export class ActorManager {
       ...(actor.adoptedFrom?.length ? { adoptedFrom: actor.adoptedFrom } : {}),
       ...(actor.project ? { project: actor.project } : {}),
       instructions: actor.instructions,
+      ...(actor.execution ? { execution: actor.execution } : {}),
       status: actor.status,
       ...(actor.status === "stopped" && actor.stopReason ? { stopReason: actor.stopReason } : {}),
       ...(actor.status === "stopped" && actor.stoppedAt !== undefined ? { stoppedAt: actor.stoppedAt } : {}),
@@ -9596,7 +9933,8 @@ export class ActorManager {
               typeof (candidate as Partial<FabricActorMessage>).source === "string" &&
               typeof (candidate as Partial<FabricActorMessage>).createdAt === "number") {
             // Bounding must not mutate an inline legacy record before it is archived.
-            this.#logs.recordMessage(messages, structuredClone(candidate) as FabricActorMessage);
+            this.#logs.recordMessage(messages, actor.execution
+              ? nativeMessageMetadata(candidate as FabricActorMessage) : structuredClone(candidate) as FabricActorMessage);
           }
         }
         install(messages);
@@ -9750,8 +10088,9 @@ export class ActorManager {
         // Source selection is speculative. update validates the atomic registry
         // generation AND the ownership observation after acquisition, or retries.
         this.#rememberLineages(current);
+        this.#scanNativeRows(current);
         const owned = [...this.#actors.values()].filter(actor =>
-          !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id) &&
+          !removedIds.has(actor.id) && !this.#nativeQuarantined.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id) &&
           (actor.removal !== undefined || this.#slotCurrent(actor)));
         if (options?.requiredActor && !owned.includes(options.requiredActor)) throw new ActorRegistryOwnershipError();
         const rows = owned.map(actor => {
@@ -9878,7 +10217,9 @@ export class ActorManager {
     if (!fingerprint || fingerprint === this.#registryFingerprint) return;
     this.#registryFingerprint = fingerprint;
     // A still-live predecessor participant cannot outrank a durable custody move.
-    this.#rememberLineages(this.#registry.records());
+    const records = this.#registry.records();
+    this.#rememberLineages(records);
+    this.#scanNativeRows(records);
     const ownsAny = [...this.#actors.keys()].some((id) => this.#ownershipDecision(id));
     if (!ownsAny) {
       const previous = [...this.#actors.values()];
@@ -9992,12 +10333,25 @@ export class ActorManager {
       typeof value === "object" && value !== null && typeof (value as { id?: unknown }).id === "string"
         ? [(value as { id: string }).id] : []));
     this.#rememberLineages(records);
+    this.#scanNativeRows(records);
     for (const id of this.#settledWindows.keys()) {
       if (!this.#registryIds.has(id)) this.#clearSettledWindows(id);
     }
     for (const value of records) {
       if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
       const source = value as Record<string, unknown>;
+      if (typeof source.id === "string" && this.#nativeIds.has(source.id)) {
+        if (this.#nativeQuarantined.has(source.id) || (onlyMissing && this.#actors.has(source.id))) continue;
+        const binding = this.#nativeBindings.get(source.id);
+        if (!binding || !nativeRowMatches(source, binding)) continue;
+        const actor = this.#nativeActor(binding, source);
+        this.#installLazyMessages(actor, source);
+        this.#actors.set(actor.id, actor);
+        this.#ownQueueRead.add(actor.id); // No callerless/context/legacy queue restoration for native rows.
+        loaded.push(actor); added++;
+        continue;
+      }
+      if (hasNativeActorMarker(source)) continue;
       if (onlyMissing && typeof source.id === "string" && this.#actors.has(source.id)) continue;
       let instructions: unknown;
       try { instructions = this.#registry.instructions(source); }
@@ -10800,6 +11154,7 @@ export class ActorManager {
   // counters, which continue from the saved ones; another root's file counts its own Main, so its
   // host activations shift to judge the same against this manager's counters.
   #restoreQueue(actor: ManagedActor, parsed: unknown, foreign: boolean): void {
+    if (actor.execution || this.#nativeIds.has(actor.id)) return;
     if (!this.#persistent || typeof parsed !== "object" || parsed === null) return;
     const saved = parsed as {
       format?: unknown; items?: unknown; pendingDeliveryOutcomes?: unknown; latestActivationSequence?: unknown; mainRevision?: unknown; taskRevision?: unknown; cleanHandover?: unknown;
@@ -11127,7 +11482,7 @@ export class ActorManager {
     actor: ManagedActor,
     binding: FabricActorRunBinding,
   ): FabricActorRunBinding | Promise<FabricActorRunBinding> {
-    return this.#resolvedRunBindingFor(actor.runner, binding, actor.routeClass !== undefined, false, `actor:${actor.name}`,
+    return this.#resolvedRunBindingFor(this.#modelRunner(actor), binding, actor.routeClass !== undefined, false, `actor:${actor.name}`,
       undefined, actor);
   }
 
@@ -11162,6 +11517,7 @@ export class ActorManager {
     actor: ManagedActor,
     overrides: FabricActorRunBinding = {},
   ): FabricActorRunBinding {
+    if (actor.execution || this.#nativeIds.has(actor.id)) return {};
     const session = this.#bindings.get(actor.id);
     const call = this.#validatedRunBinding(overrides);
     const model = call.model ?? session?.model ?? actor.model;
@@ -11278,8 +11634,8 @@ export class ActorManager {
       ...(actor.sessionOrphan ? { sessionOrphan: { ...actor.sessionOrphan } } : {}),
       // The instruction text stays private; its digest lets a caller verify setInstructions
       // against a rendered role without reading the registry file (smarty-dev#918).
-      instructionsDigest: createHash("sha256").update(actor.instructions).digest("hex"),
-      instructionsLength: actor.instructions.length,
+      ...(actor.instructions !== null ? { instructionsDigest: createHash("sha256").update(actor.instructions).digest("hex"),
+        instructionsLength: actor.instructions.length } : {}),
       // Failed is a routing view, not a destructive stop: retained events and
       // explicit repair/probe asks can still run. Success clears the durable streak.
       status: this.#routingStatus(actor, blockExpired),
@@ -11289,6 +11645,7 @@ export class ActorManager {
         ...(queuePosition === undefined ? {} : { queuePosition }),
       } } : {}),
       runner: actor.runner,
+      ...(actor.execution ? { execution: actor.execution } : {}),
       ...(actor.kernel ? { kernel: actor.kernel } : {}),
       ...(actor.pythonRuntime ? { pythonRuntime: actor.pythonRuntime } : {}),
       events: [...actor.events],
@@ -11304,7 +11661,7 @@ export class ActorManager {
       ...(effective.model ? { model: effective.model } : {}),
       ...(effective.modelReason !== undefined ? { modelReason: effective.modelReason } : {}),
       ...(effective.thinking ? { thinking: effective.thinking } : {}),
-      ...(!registryView ? { binding: {
+      ...(!registryView && !actor.execution ? { binding: {
         scope: "session" as const,
         sessionId: this.sessionId,
         ...(session?.model ? { model: session.model } : {}),
@@ -11312,12 +11669,12 @@ export class ActorManager {
         ...(session?.thinking ? { thinking: session.thinking } : {}),
         ...(session ? { updatedAt: session.updatedAt } : {}),
       } } : {}),
-      projectDefaults: {
-        scope: "project",
+      ...(!actor.execution ? { projectDefaults: {
+        scope: "project" as const,
         ...(actor.model ? { model: actor.model } : {}),
         ...(actor.modelReason !== undefined ? { modelReason: actor.modelReason } : {}),
         ...(actor.thinking ? { thinking: actor.thinking } : {}),
-      },
+      } } : {}),
       ...(actor.tools ? { tools: [...actor.tools] } : {}),
       timeoutMs: actor.timeoutMs ?? this.agents.config.timeoutMs,
       ...(actor.nice !== undefined ? { nice: actor.nice } : {}),
@@ -11400,7 +11757,7 @@ export class ActorManager {
   }
 
   #ownershipDecision(id: string, fresh = true): boolean {
-    if (this.#ceded.has(id)) return false;
+    if (this.#ceded.has(id) || this.#nativeQuarantined.has(id) || (this.#nativeIds.has(id) && !this.#nativeAuthority(id))) return false;
     const actor = this.#actors.get(id);
     const lineage = this.#persistedLineages.get(id);
     // A directory opinion may precede successor publication by an entire heartbeat.
@@ -11450,6 +11807,7 @@ export class ActorManager {
   }
 
   #maybeAdoptOrphan(actor: ManagedActor): void {
+    if (actor.execution || this.#nativeIds.has(actor.id)) return;
     if (
       !this.#persistent ||
       this.#closing ||

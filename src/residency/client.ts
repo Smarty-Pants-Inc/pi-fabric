@@ -1,4 +1,5 @@
 import { snapshotTaskReturnAddress } from "../agents/task-return-address.js";
+import { copyResidentNativeActorBindings, residentNativeActorBindingsMatch } from "./native-actors.js";
 import { diagnostics } from "../core/diagnostics.js";
 import { withFabricWakeAdmission, fabricWakeCause } from "../fabric-provenance.js";
 import { randomUUID } from "node:crypto";
@@ -253,6 +254,11 @@ export class ResidencyClient {
   readonly #releaseOwners = new Set<string>();
 
   constructor(readonly options: ResidencyClientOptions) {
+    const nativeActors = copyResidentNativeActorBindings(options.config);
+    if (options.config.nativeActors !== undefined) {
+      this.options = { ...options, config: { ...options.config } };
+      Object.defineProperty(this.options.config, "nativeActors", { value: nativeActors, enumerable: true, writable: false, configurable: false });
+    }
     this.hostId = residentHostId(options.config.rootId);
     this.#configPath = path.join(options.config.residencyRoot, "config.json");
     this.#ownerPath = path.join(options.config.residencyRoot, "owner.json");
@@ -335,6 +341,7 @@ export class ResidencyClient {
   }
 
   syncPiModels(): void {
+    this.#assertNativeOwnerConfig();
     this.#refreshPiModels();
     if (fs.existsSync(this.options.config.residencyRoot)) {
       atomicWrite(this.#configPath, this.options.config);
@@ -390,6 +397,7 @@ export class ResidencyClient {
 
   async #startHost(): Promise<ResidentHostOwner> {
     if (this.#closed) throw new Error("Fabric residency client is closed");
+    this.#assertNativeOwnerConfig();
     await this.#stopStartingLauncher();
     this.#refreshPiModels();
     atomicWrite(this.#configPath, this.options.config);
@@ -1188,8 +1196,22 @@ export class ResidencyClient {
     return owner;
   }
 
+  /** Never overwrite desired pins or attach native work to an old/differently configured owner. */
+  #assertNativeOwnerConfig(): void {
+    const owner = this.#liveOwner();
+    if (!owner) return;
+    const config = this.options.config;
+    const saved = readJson<ResidentHostConfig>(this.#configPath);
+    if (!(config.nativeActors?.length || saved?.nativeActors?.length || owner.nativeActors?.length)) return;
+    if (!saved || !residentNativeActorBindingsMatch(saved, config) ||
+        !residentNativeActorBindingsMatch({ ...config, nativeActors: owner.nativeActors }, config)) {
+      throw new Error("Native resident binding/config mismatch; quiescent owner restart required, no work dispatched");
+    }
+  }
+
   #readyOwner(): ResidentHostOwner | undefined {
     const owner = this.#liveOwner();
+    if (owner) this.#assertNativeOwnerConfig();
     if (owner?.maintenanceReady === 1 &&
         readJson<{ token?: string }>(path.join(this.options.config.residencyRoot, "maintenance-ready.json"))?.token !== owner.token) return undefined;
     return owner;

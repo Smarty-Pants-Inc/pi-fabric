@@ -503,7 +503,15 @@ export interface FabricActorSessionOrphan {
     persisted?: Array<{ by: string; at: number; settledAt?: number; retiredAt?: number; retiredBy?: string }> };
 }
 
+export interface NativeActorExecution {
+  readonly kind: "native";
+  readonly version: 1;
+  readonly handlerKey: string;
+}
+
 export interface FabricActorInfo extends FabricActorBatching {
+  /** Host-only execution mode; never a portable model actor definition. */
+  execution?: NativeActorExecution;
   id: string;
   /** Only on an agents.stop({ dropQueued: true }) result that archived work (smarty-dev#16416). */
   stoppedQueue?: FabricActorStoppedQueue;
@@ -531,7 +539,7 @@ export interface FabricActorInfo extends FabricActorBatching {
   stopReason?: FabricActorStopReason;
   /** Terminal foreign session-root record, not authority to adopt it. Its own session's restart revives it. */
   sessionOrphan?: FabricActorSessionOrphan;
-  runner: FabricAgentRunner;
+  runner: FabricAgentRunner | "native";
   kernel?: FabricKernel;
   pythonRuntime?: FabricPythonRuntime;
   events: FabricActorHostEvent[];

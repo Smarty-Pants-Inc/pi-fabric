@@ -117,6 +117,25 @@ const mainLeaseFixture = async (files: boolean) => {
   return { root, meshRoot, mesh, directory, target, sessionId, participantKey, key, plane, presence, publishPresence };
 };
 
+// Keep: the real owner-side router must resolve ordinary ASK targets before the
+// empty-message refusal; malformed ordinary input must never enter actor execution.
+it("empty ordinary asks resolve the target first, refuse known actors without effects, and still accept nonempty asks", async () => {
+  const r = router(unknown);
+  vi.mocked(r.actors.ask).mockResolvedValue({ id: "ordinary-result", answer: "accepted" } as never);
+  const command = (targetId: string, message: string): FabricControlCommand => ({ version: 1, commandId: "empty-ordinary",
+    targetId, operation: "ask", replyTo: identity.id, message, requestedAt: Date.now() });
+  for (const message of ["", " \n\t "]) {
+    await expect(r.value.acceptControl(command("actor:missing", message), identity, undefined, "mesh"))
+      .resolves.toEqual({ accepted: false, error: "Unknown Fabric actor: actor:missing" });
+    await expect(r.value.acceptControl(command("actor:running", message), identity, undefined, "mesh"))
+      .resolves.toEqual({ accepted: false, error: "Fabric control message must not be empty" });
+  }
+  expect(r.actors.ask).not.toHaveBeenCalled();
+  await expect(r.value.acceptControl(command("actor:running", "  ordinary body  "), identity, undefined, "mesh"))
+    .resolves.toMatchObject({ accepted: true, messageId: "ordinary-result", result: { answer: "accepted" } });
+  expect(r.actors.ask).toHaveBeenCalledOnce(); expect(vi.mocked(r.actors.ask).mock.calls[0]![1]).toBe("ordinary body");
+});
+
 describe("dormant wake resend boundary (#774)", () => {
   it("never resends a live actor's stale-incarnation refusal: only a retained dormant route takes the one wake resend", async () => {
     const participant = { ...remote("actor:live", "idle", "actor"), residency: "durable", rootId: "session:peer",

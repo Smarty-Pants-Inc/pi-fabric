@@ -8,9 +8,10 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import * as processIdentity from "../src/residency/process-identity.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import type { FabricActorDeliveryRequest } from "../src/actors/types.js";
 
 // smarty-dev#9332: actor states that cannot act raise fabric.alarm.actor-activation (same envelope, ownerRoot routing),
-// evaluated on the existing retention sweep (retentionSweepMs, no new timer), re-alarmed once per 6 h slot.
+// evaluated on the existing retention sweep (retentionSweepMs, no new timer); repeat policy depends on alarm kind.
 const MINUTE = 60_000, HOUR = 60 * MINUTE;
 const roots: string[] = [];
 const closers: Array<() => Promise<void>> = [];
@@ -39,39 +40,101 @@ const setup = (persistent = false) => {
   const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs") });
   const identity: MeshIdentity = { id: "session:test", name: "main", kind: "main", sessionId: "test" };
-  const actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
+  const onDeliver = vi.fn<(request: FabricActorDeliveryRequest) => void | boolean | Promise<void | boolean>>();
+  let actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, onDeliver, {
     actorRoot: path.join(root, "actors"), persistent, retentionSweepMs: 20 });
   closers.push(() => agents.close(), () => actors.close());
   const alarms = (kind: string, id: string) => mesh.read({ topic: FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, limit: 200 })
     .filter(event => event.kind === kind && (event.data as { actorId?: string }).actorId === id);
-  /** A new manager on the same actor root (a host restart). */
-  const restart = async () => {
+  const hostNotices = (id: string) => onDeliver.mock.calls.map(([request]) => request).filter(request =>
+    request.actor.id === id && request.message.text?.includes("actor-stopped") === true);
+  /** A new manager on the same actor root and mesh (a host restart). */
+  const restart = async (beforeReload?: () => void) => {
     await actors.close();
-    const next = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, () => {}, {
+    beforeReload?.();
+    actors = new ActorManager("test", identity, mesh, { ...DEFAULT_FABRIC_CONFIG.mesh, actorPollMs: 20 }, agents, onDeliver, {
       actorRoot: path.join(root, "actors"), persistent, retentionSweepMs: 20 });
-    closers.push(() => next.close());
-    return next;
+    return actors;
   };
-  return { root, mesh, agents, actors, clock, alarms, restart };
+  return { root, mesh, agents, get actors() { return actors; }, clock, alarms, onDeliver, hostNotices, restart };
 };
 
 describe("actor state alarms (smarty-dev#9332)", () => {
-  it("actor-stopped: a durable actor stopped for over 10 min alarms with its reason; once per 6 h slot; not after removal", async () => {
+  it("actor-stopped: one mesh alarm and Main notice at 10m, 15m, and >6h for one unchanged stop", async () => {
     const s = setup(true);
     const actor = await s.actors.create({ name: "stopped", instructions: "Run", residency: "durable" });
     const other = await s.actors.create({ name: "running", instructions: "Run", residency: "durable" });
     await s.actors.stop(actor.id);
     await settle();
     expect(s.alarms("actor-stopped", actor.id)).toHaveLength(0);
+    expect(s.hostNotices(actor.id)).toHaveLength(0);
     s.clock.skew = 10 * MINUTE + 1_000;
     await waitFor(() => s.alarms("actor-stopped", actor.id).length === 1);
+    await settle();
+    expect(s.hostNotices(actor.id)).toHaveLength(1);
+    expect(s.hostNotices(actor.id)[0]).toMatchObject({ delivery: "followUp", triggerTurn: true,
+      message: { source: "fabric-host" } });
     expect(s.alarms("actor-stopped", actor.id)[0]).toMatchObject({ data: { actorId: actor.id, actorName: "stopped",
       ownerRoot: "session:test", reason: "stop", stopReason: "explicit", residency: "durable", stoppedForMs: expect.any(Number) } });
+    const firstSince = (s.alarms("actor-stopped", actor.id)[0]!.data as { since: number }).since;
+    const alarmKey = actorAlarmKey(actor.id, "actor-stopped");
+
+    const registryFile = path.join(s.root, "actors", "actors.json");
+    const restarted = await s.restart();
+    expect(restarted.status(actor.id).status).toBe("stopped");
+    const saved = JSON.parse(fs.readFileSync(registryFile, "utf8")) as { actors: Array<Record<string, unknown>> };
+    expect(saved.actors.find(row => row.id === actor.id)?.stoppedAt).toBe(firstSince);
+    s.clock.skew = 15 * MINUTE + 1_000;
     await settle();
-    expect(s.alarms("actor-stopped", actor.id)).toHaveLength(1); // dedupe inside the slot
+    expect(s.alarms("actor-stopped", actor.id)).toHaveLength(1);
+
+    // Delete only the temporary claim, not the actor registry or the mesh publication's dedupe receipt.
+    await s.mesh.delete({ key: alarmKey });
+    expect(s.mesh.get(alarmKey)).toBeUndefined();
+    const afterClaimRemoval = await s.restart();
+    expect(afterClaimRemoval.status(actor.id).status).toBe("stopped");
+    s.clock.skew = 6 * HOUR + 15 * MINUTE + 1_000;
+    await settle();
+    expect(s.alarms("actor-stopped", actor.id)).toHaveLength(1);
+    expect(s.hostNotices(actor.id)).toHaveLength(1);
+    // The actor registry, not a surviving mesh claim or receipt, remembers the notified episode.
+    expect(s.mesh.get(alarmKey)).toBeUndefined();
+    const notified = JSON.parse(fs.readFileSync(registryFile, "utf8")) as { actors: Array<Record<string, unknown>> };
+    expect(notified.actors.find(row => row.id === actor.id)?.stoppedAlarmSince).toBe(firstSince);
     expect(s.alarms("actor-stopped", other.id)).toHaveLength(0);
-    s.clock.skew += 6 * HOUR;
-    await waitFor(() => s.alarms("actor-stopped", actor.id).length === 2); // re-alarm in the next slot
+    expect(s.hostNotices(other.id)).toHaveLength(0);
+  }, 60_000);
+
+  it("actor-stopped: a fresh persisted stoppedAt for the same actor publishes and notifies again; removal stays terminal", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "stopped-again", instructions: "Run", residency: "durable" });
+    await s.actors.stop(actor.id);
+    s.clock.skew = 10 * MINUTE + 1_000;
+    await waitFor(() => s.alarms("actor-stopped", actor.id).length === 1);
+    await settle();
+    const firstSince = (s.alarms("actor-stopped", actor.id)[0]!.data as { since: number }).since;
+
+    // A public stop is terminal; model a new active episode through this fixture's persisted actor row,
+    // then use the public stop API to establish a distinct stoppedAt for the same actor id.
+    const registryFile = path.join(s.root, "actors", "actors.json");
+    const fresh = await s.restart(() => {
+      const registry = JSON.parse(fs.readFileSync(registryFile, "utf8")) as { actors: Array<Record<string, unknown>> };
+      const row = registry.actors.find(entry => entry.id === actor.id)!;
+      row.status = "idle";
+      delete row.stoppedAt;
+      delete row.stopReason;
+      row.updatedAt = Date.now();
+      fs.writeFileSync(registryFile, JSON.stringify(registry));
+    });
+    expect(fresh.status(actor.id).status).toBe("idle");
+    await fresh.stop(actor.id);
+    s.clock.skew += 10 * MINUTE + 1_000;
+    await waitFor(() => s.alarms("actor-stopped", actor.id).length === 2);
+    await settle();
+    const secondSince = (s.alarms("actor-stopped", actor.id)[1]!.data as { since: number }).since;
+    expect(secondSince).toBeGreaterThan(firstSince);
+    expect(s.hostNotices(actor.id)).toHaveLength(2);
+
     const alarmKey = actorAlarmKey(actor.id, "actor-stopped");
     const alarm = s.mesh.get(alarmKey);
     const sentinel = path.join(path.dirname(actor.sessionFile!), "kept-11335.txt");
@@ -79,9 +142,9 @@ describe("actor state alarms (smarty-dev#9332)", () => {
       expect(alarm).toBeDefined();
       fs.writeFileSync(sentinel, "history\n");
     }
-    const removal = await s.actors.remove(actor.id);
+    const removal = await fresh.remove(actor.id);
     if (process.platform === "linux" || process.platform === "darwin" || process.platform === "win32") {
-      expect(s.mesh.get(actorAlarmKey(actor.id, "actor-stopped"))).toBeUndefined();
+      expect(s.mesh.get(alarmKey)).toBeUndefined();
     } else {
       // smarty-dev#8090 / follow-up smarty-dev#11335: on unsupported platforms registry revocation commits,
       // but tree deletion refuses before alarm-key cleanup. Cleanup stays pending; no new alarms are eligible.
@@ -93,6 +156,62 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     s.clock.skew += 6 * HOUR;
     await settle();
     expect(s.alarms("actor-stopped", actor.id)).toHaveLength(2);
+    expect(s.hostNotices(actor.id)).toHaveLength(2);
+  }, 60_000);
+
+  it("actor-stopped: restarting past 6h keeps one mesh alarm and one Main notice for the persisted stop", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "restart-stopped", instructions: "Run", residency: "durable" });
+    await s.actors.stop(actor.id);
+    s.clock.skew = 10 * MINUTE + 1_000;
+    await waitFor(() => s.alarms("actor-stopped", actor.id).length === 1);
+    await settle();
+    const firstSince = (s.alarms("actor-stopped", actor.id)[0]!.data as { since: number }).since;
+
+    const restarted = await s.restart(() => { s.clock.skew = 6 * HOUR + 15 * MINUTE + 1_000; });
+    expect(restarted.status(actor.id).status).toBe("stopped");
+    const saved = JSON.parse(fs.readFileSync(path.join(s.root, "actors", "actors.json"), "utf8")) as {
+      actors: Array<Record<string, unknown>>;
+    };
+    expect(saved.actors.find(row => row.id === actor.id)?.stoppedAt).toBe(firstSince);
+    await settle();
+    expect(s.alarms("actor-stopped", actor.id)).toHaveLength(1);
+    expect(s.hostNotices(actor.id)).toHaveLength(1);
+  }, 60_000);
+
+  it("actor-stopped: a publish-before-delivery crash replays the episode until Main confirms, then stays silent", async () => {
+    const s = setup(true);
+    const actor = await s.actors.create({ name: "crash-stopped", instructions: "Run", residency: "durable" });
+    await s.actors.stop(actor.id);
+    const publish = s.mesh.publish.bind(s.mesh);
+    let interrupted = false;
+    const fault = vi.spyOn(s.mesh, "publish").mockImplementation(async input => {
+      const event = await publish(input);
+      if (input.kind === "actor-stopped" && !interrupted) {
+        interrupted = true;
+        throw new Error("crashed after alarm publication, before onDeliver");
+      }
+      return event;
+    });
+    let confirmed = false;
+    s.onDeliver.mockImplementation(() => confirmed);
+    s.clock.skew = 10 * MINUTE + 1_000;
+    await waitFor(() => interrupted && s.alarms("actor-stopped", actor.id).length === 1);
+    fault.mockRestore();
+    await waitFor(() => s.hostNotices(actor.id).length > 0);
+    const registryFile = path.join(s.root, "actors", "actors.json");
+    const row = () => (JSON.parse(fs.readFileSync(registryFile, "utf8")) as { actors: Array<Record<string, unknown>> })
+      .actors.find(entry => entry.id === actor.id)!;
+    expect(row().stoppedAlarmSince).toBeUndefined(); // publication and pending custody are not a Main acknowledgement
+    const firstId = s.hostNotices(actor.id)[0]!.message.id;
+    confirmed = true;
+    await waitFor(() => row().stoppedAlarmSince === row().stoppedAt);
+    expect(s.hostNotices(actor.id).every(request => request.message.id === firstId)).toBe(true);
+    const admitted = s.hostNotices(actor.id).length;
+    await s.restart(() => { s.clock.skew += 6 * HOUR; });
+    await settle();
+    expect(s.alarms("actor-stopped", actor.id)).toHaveLength(1);
+    expect(s.hostNotices(actor.id)).toHaveLength(admitted);
   }, 60_000);
 
   it("a legacy stopped actor keeps one alarm episode across idle-exit registry rewrites", async () => {

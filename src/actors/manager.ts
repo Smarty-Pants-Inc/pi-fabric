@@ -284,6 +284,8 @@ interface ManagedActor extends FabricActorBatching {
   eventsDropped?: { since: number; count: number; at: number; reason: string; runId?: string; eventRef: Record<string, string | number> };
   /** When the actor last stopped (smarty-dev#9332: the actor-stopped alarm's episode). */
   stoppedAt?: number;
+  /** Stop episode whose alarm reached Main; durable dedupe independent of mesh claim retention. */
+  stoppedAlarmSince?: number;
   validWhile?: FabricActorValidWhileSource;
   records?: FabricActorRecordsOptions;
   /** The creating principal's scope; absent for unscoped actors. */
@@ -1126,7 +1128,8 @@ export class ActorManager {
     readonly mesh: MeshStore,
     readonly meshConfig: FabricMeshConfig,
     readonly agents: AgentManager,
-    readonly onDeliver: (request: FabricActorDeliveryRequest) => void,
+    /** Legacy void/incidental returns are accepted; false/rejection means not admitted for opted-in stopped confirmation. */
+    readonly onDeliver: (request: FabricActorDeliveryRequest) => unknown,
     options: {
       /** Staged resident successor: no business activation before launcher commitment. */
       releasePaused?: boolean;
@@ -8946,7 +8949,7 @@ export class ActorManager {
    * smarty-dev#9332: actor states that cannot act raise the same owner alarm as a blocked activation
    * (fabric.alarm.actor-activation records ownerRoot; onDeliver reaches the owner's Main),
    * evaluated on the existing retention sweep, no new timer:
-   * - actor-stopped: a durable or supervisor actor stopped for over 10 min and not removed;
+   * - actor-stopped: once per stop episode, for a durable or supervisor actor stopped for over 10 min and not removed;
    * - actor-run-stuck: an in-flight run older than max(30 min, 2x the actor's p95 run time) whose run directory is
    *   missing or whose worker is gone;
    * - actor-event-dropped: re-alarmed here while its episode lasts (raised first at the drop itself).
@@ -8955,15 +8958,16 @@ export class ActorManager {
     this.#alarmOrphanOwner(actor, now);
     if (actor.status === "stopped" && !actor.removal && (actor.residency === "durable" || actor.supervisorFor)) {
       const since = actor.stoppedAt;
-      if (since !== undefined) {
+      if (since !== undefined && actor.stoppedAlarmSince !== since && now - since >= ACTOR_STOPPED_ALARM_AFTER_MS) {
         const stopKind = actor.stopReason === "host-exit" ? "relaunch" : actor.stopReason ? "stop" : actor.lastError ? "error" : "stop";
-        this.#alarmActorState(actor, "actor-stopped", since, actorAlarmSlot(now, since, ACTOR_STOPPED_ALARM_AFTER_MS), now, () => ({
+        this.#alarmActorState(actor, "actor-stopped", since, 0, now, () => ({
           actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: stopKind,
           ...(actor.stopReason ? { stopReason: actor.stopReason } : {}),
           ...(actor.lastError ? { lastErrorCode: classifyActivationFailure({ lastError: actor.lastError, error: actor.lastError }).code } : {}),
           since, stoppedForMs: now - since, residency: actor.residency, ...(actor.supervisorFor ? { supervisorFor: actor.supervisorFor } : {}) }),
           () => { const current = this.#actors.get(actor.id); return current?.status === "stopped" && !current.removal &&
-            current.stoppedAt === since; });
+            current.stoppedAt === since && current.stoppedAlarmSince !== since && !this.#closing && !this.#releaseStrict &&
+            this.#canConsumeMesh?.() !== false && this.#ownershipDecision(current.id) && this.#slotCurrent(current); });
       }
     }
     const run = actor.inFlightRun;
@@ -9053,9 +9057,21 @@ export class ActorManager {
       () => this.#actors.get(actor.id)?.eventsDropped?.since === dropped.since);
   }
 
+  /** Record confirmed Main admission for the current owned stop episode, never on a stale async actor object. */
+  #rememberStoppedAlarm(actorId: string, since: number): void {
+    const actor = this.#actors.get(actorId);
+    if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false || actor?.status !== "stopped" ||
+        actor.removal || actor.stoppedAt !== since || actor.stoppedAlarmSince === since ||
+        !this.#ownershipDecision(actor.id) || !this.#slotCurrent(actor)) return;
+    actor.stoppedAlarmSince = since;
+    // Start the existing durable save immediately: its revision also vetoes an older in-flight registry snapshot.
+    void this.#saveActors(new Set(), { durable: true, flush: true, requiredActor: actor })
+      .catch((error: unknown) => this.#retryRegistrySave(error, true));
+  }
+
   // One durable mesh claim per actor and kind gates each 6 h slot of an episode (since), across managers,
   // owner handoffs and restarts: only the manager whose compare-and-swap takes the slot publishes (smarty-dev#7782).
-  // Slots: see actorAlarmSlot.
+  // Stopped episodes use only slot 0 and retry until Main admission is confirmed; other slots: see actorAlarmSlot.
   #alarmActorState(actor: ManagedActor, kind: ActorAlarmKind, since: number, slot: number | undefined, now: number,
     describe: () => Record<string, unknown>, current: () => boolean): void {
     if (slot === undefined) return;
@@ -9063,8 +9079,11 @@ export class ActorManager {
     // A `pending` claim whose publish is overdue no longer covers its slot (smarty-dev#7905).
     const covers = (entry: MeshStateEntry | undefined): boolean => {
       const claimed = entry?.value as { since?: unknown; slot?: unknown; state?: unknown; at?: unknown } | undefined;
-      return claimed?.since === since && typeof claimed.slot === "number" && claimed.slot >= slot &&
-        !(claimed.state === "pending" && typeof claimed.at === "number" && now - claimed.at > ACTOR_BLOCK_REALARM_PUBLISH_TIMEOUT_MS);
+      if (claimed?.since !== since || typeof claimed.slot !== "number" || !(claimed.slot >= slot)) return false;
+      // Publication is not Main admission. Only a fresh pending claim serializes unconfirmed stop delivery.
+      if (kind === "actor-stopped") return claimed.state === "pending" && typeof claimed.at === "number" &&
+        now - claimed.at <= ACTOR_BLOCK_REALARM_PUBLISH_TIMEOUT_MS;
+      return !(claimed.state === "pending" && typeof claimed.at === "number" && now - claimed.at > ACTOR_BLOCK_REALARM_PUBLISH_TIMEOUT_MS);
     };
     if (covers(this.mesh.get(key))) return;
     const data = describe();
@@ -9122,14 +9141,15 @@ export class ActorManager {
         return;
       }
       // Blocked slot -1 is the early unknown-block notice, only if the live streak still has no notice.
-      // Blocked slot 0 remains allowed; other state kinds only repeat after slot 0.
+      // Blocked slot 0 remains allowed; stopped episodes notify on their sole slot. Other kinds only repeat after slot 0.
       const live = this.#actors.get(actor.id);
       const repeat = kind === "actor-activation-blocked"
         ? slot >= 0 || (slot === -1 && data.early === true && live !== undefined && !live.failureStreak?.notified)
-        : slot > 0;
-      // At-most-once Main delivery: receipt replay returns the original id, never this attempt's id.
-      // ponytail: a crash after publish but before onDeliver loses this slot's notice; the next slot re-alarms.
-      if (!orphanOwner && repeat && event.id === attemptId && current() && this.mesh.get(key)?.version === claim.version) {
+        : kind === "actor-stopped" || slot > 0;
+      // Stopped episodes retry the stable notice even on receipt replay: the host confirms Main admission.
+      // Other kinds retain at-most-once callbacks per slot; later recurring slots recover a lost notice.
+      if (!orphanOwner && repeat && (kind === "actor-stopped" || event.id === attemptId) &&
+          current() && this.mesh.get(key)?.version === claim.version) {
         const reason = actorAlarmReason(data.reason);
         const notice: FabricActorMessage = {
           id: dedupeKey, actorId: actor.id, actorName: actor.name, direction: "out",
@@ -9138,9 +9158,19 @@ export class ActorManager {
           text: `Fabric host notice: ${kind}; reason: ${reason}. Inspect it with agents.actorStatus and agents.log.`,
         };
         try {
-          this.onDeliver({ actor: this.#alarmInfo(live ?? actor), message: notice, delivery: "followUp", triggerTurn: true });
-        } catch { /* Best effort: the mesh alarm remains, and the slot is still marked published below. */ }
+          if (kind === "actor-stopped") {
+            const admitted = await this.onDeliver({ actor: this.#alarmInfo(live ?? actor), message: notice,
+              delivery: "followUp", triggerTurn: true, requireConfirmation: "main" });
+            // Synchronous legacy adapters return void on acceptance; false or rejection leaves the episode retryable.
+            if (admitted !== false && current() && this.mesh.get(key)?.version === claim.version) {
+              this.#rememberStoppedAlarm(actor.id, since);
+            }
+          } else {
+            this.onDeliver({ actor: this.#alarmInfo(live ?? actor), message: notice, delivery: "followUp", triggerTurn: true });
+          }
+        } catch { /* No stop marker without admission; the stable notice is retried on the next maintenance pass. */ }
       }
+      // Even an unconfirmed/failed callback completed this publish attempt: do not impose the pending-claim timeout.
       await this.mesh.put({ key, identity: this.identity, value: { ...claimed, state: "published" }, ifVersion: claim.version })
         .catch(() => undefined);
     })();
@@ -9510,6 +9540,8 @@ export class ActorManager {
       status: actor.status,
       ...(actor.status === "stopped" && actor.stopReason ? { stopReason: actor.stopReason } : {}),
       ...(actor.status === "stopped" && actor.stoppedAt !== undefined ? { stoppedAt: actor.stoppedAt } : {}),
+      ...(actor.status === "stopped" && actor.stoppedAlarmSince !== undefined && actor.stoppedAlarmSince === actor.stoppedAt
+        ? { stoppedAlarmSince: actor.stoppedAlarmSince } : {}),
       events: actor.events,
       ...(actor.eventsStartAt !== undefined ? { eventsStartAt: actor.eventsStartAt } : {}),
       topics: actor.topics,
@@ -9754,7 +9786,14 @@ export class ActorManager {
           !removedIds.has(actor.id) && !this.#finishCalls.has(actor.id) && this.#ownershipDecision(actor.id) &&
           (actor.removal !== undefined || this.#slotCurrent(actor)));
         if (options?.requiredActor && !owned.includes(options.requiredActor)) throw new ActorRegistryOwnershipError();
+        const currentById = new Map(current.map(row => [row.id, row]));
         const rows = owned.map(actor => {
+          const stored = currentById.get(actor.id);
+          // A stale owned object must not erase a committed marker during a metadata save. Only the same stop counts.
+          if (actor.status === "stopped" && actor.stoppedAt !== undefined && stored?.status === "stopped" &&
+              stored.stoppedAt === actor.stoppedAt && stored.stoppedAlarmSince === actor.stoppedAt) {
+            actor.stoppedAlarmSince = actor.stoppedAt;
+          }
           const row: Record<string, unknown> = { ...this.#serializedActor(actor),
             ...(actor === options?.requiredActor ? options?.filterUpdate : undefined) };
           // Only this setter's save carries the staged filter; other saves still serialize the live value.
@@ -10215,6 +10254,9 @@ export class ActorManager {
         ...(typeof record.presenceError === "string" ? { presenceError: record.presenceError } : {}),
         ...(stopReason ? { stopReason } : {}),
         ...(stoppedAt !== undefined ? { stoppedAt } : {}),
+        ...(typeof source.stoppedAlarmSince === "number" && Number.isFinite(source.stoppedAlarmSince) &&
+            source.stoppedAlarmSince >= 0 && source.stoppedAlarmSince === stoppedAt
+          ? { stoppedAlarmSince: source.stoppedAlarmSince } : {}),
         ...(status === "stopped" && record.sessionOrphan && record.sessionOrphan.oldRoot === record.rootId &&
             typeof record.sessionOrphan.oldHost === "string" && typeof record.sessionOrphan.reason === "string" &&
             Number.isFinite(record.sessionOrphan.orphanedAt) && Number.isFinite(record.sessionOrphan.lastUpdated)

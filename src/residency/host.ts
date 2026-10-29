@@ -2,7 +2,7 @@
 
 import { fabricTurnProvenance, fabricWakeCause, copyFabricWakeCause, type FabricWakeCause, type FabricPrincipal } from "../fabric-provenance.js";
 import { diagnostics } from "../core/diagnostics.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { detachedPreview } from "../core/preview.js";
 import { resolveActorInstructions, assertActorInstructionReplacement } from "../actors/instructions-file.js";
 import {
@@ -798,11 +798,16 @@ export class ResidentHost {
       this.mesh,
       config.mesh,
       this.agents,
-      ({ actor, message, delivery, triggerTurn }) => {
+      ({ actor, message, delivery, triggerTurn, requireConfirmation }) => {
         if (!message.text) return;
         const mode = delivery === "steer" ? "steer" : "followUp";
         const triggers = delivery === "nextTurn" ? false : triggerTurn;
-        this.#trackPublication(this.#queueDelivery(
+        // Only host-generated stopped alarms opt into Main confirmation. Other actor
+        // output and alarms keep their existing UUID and tracked, void publication.
+        const stableId = requireConfirmation === "main" && message.source === "fabric-host" &&
+          /^actor-alarm:[a-f0-9]{64}$/.test(message.id) && message.text.startsWith("Fabric host notice: actor-stopped;")
+          ? createHash("sha256").update(message.id).digest("hex") : undefined;
+        const publication = this.#queueDelivery(
           { id: actor.id, name: actor.name, kind: "actor" },
           message.text,
           mode,
@@ -818,7 +823,14 @@ export class ResidentHost {
           fabricWakeCause(message.source === "fabric-host" ? this.identity : { id: actor.id, name: actor.name, kind: "actor" },
             message.source === "fabric-host" ? "host-event" : "actor",
             message.source.startsWith("mesh:") || message.source.startsWith("host:") ? message.source.slice(5) : undefined, message.id),
-        ));
+          stableId,
+        );
+        if (stableId) {
+          const confirmed = publication.then(result => result === true);
+          this.#trackPublication(confirmed);
+          return confirmed;
+        }
+        this.#trackPublication(publication);
       },
       {
         // Restoration must not launch queued work until owner and readiness publication commit.
@@ -1533,8 +1545,9 @@ export class ResidentHost {
     principal?: FabricPrincipal,
     source?: ResidentDeliveryRecord["source"],
     wakeCause?: FabricWakeCause,
-  ): Promise<void> {
-    const id = randomUUID();
+    stableId?: string,
+  ): Promise<boolean | void> {
+    const id = stableId ?? randomUUID();
     const diagnostic = copyFabricWakeCause(wakeCause);
     const record = (target: string): ResidentDeliveryRecord => ({
         format: RESIDENT_HOST_FORMAT,
@@ -1555,6 +1568,35 @@ export class ResidentHost {
     // Agent completions use the fixed creating root and still persist before yielding.
     const persist = (target: string): void =>
       writeJsonAtomic(path.join(this.#deliveryOutboxPath, `${id}.json`), record(target), { durable: true });
+    if (stableId) {
+      if (typeof rootId !== "string") throw new Error("Confirmed resident delivery requires a fixed root");
+      const key = `${residentDeliveryPrefix(rootId)}${id}`;
+      const inspect = async (): Promise<{ written: boolean; confirmed: boolean }> => {
+        let written = false;
+        let confirmed = false;
+        // A retained tombstone, not an outbox write or mesh put, proves Main has
+        // synchronously journaled the notice and deleted its delivery key.
+        await this.mesh.writeBatch({ identity: this.identity, ops: [],
+          lockTiming: { operation: "resident-delivery-confirmation" },
+          prepare: view => {
+            written = view.version(key) > 0;
+            confirmed = written && view.get(key) === undefined;
+            return [];
+          } });
+        return { written, confirmed };
+      };
+      // Inspect BEFORE staging: retries must not rewrite either a pending mesh
+      // record or a consumed tombstone (including an ack-before-marker crash).
+      const before = await inspect();
+      if (before.confirmed) return true;
+      if (!before.written && !fs.existsSync(path.join(this.#deliveryOutboxPath, `${id}.json`))) persist(rootId);
+      this.#scheduleIdleCheck();
+      const flushed = await this.#retryDeliveries();
+      // The existing retry owner contains flush errors. Never turn that failed
+      // attempt into confirmation, even if Main consumes concurrently.
+      if (flushed === "retry" || flushed === "failed" || flushed === "skipped") return false;
+      return (await inspect()).confirmed;
+    }
     if (typeof rootId === "function") {
       // Serialize proof+absence and target selection with resumed-root proof
       // invalidation: resumeLineage() invalidates the proof with a shared-state delete,
@@ -1625,7 +1667,7 @@ export class ResidentHost {
       try {
         await this.mesh.put({ key, value: publish, identity: this.identity, ifVersion: 0 });
       } catch (error) {
-        // A restart after put but before unlink replays the SAME private UUID. A CAS
+        // A restart after put but before unlink replays the SAME private delivery id. A CAS
         // conflict (including a consumed tombstone) means it was handed off already.
         if (!(error instanceof Error && error.message.startsWith(`Mesh compare-and-swap failed for ${key}: expected version 0,`))) {
           if (isMeshWriteDeferred(error)) throw error; // no truncated rewrite for a refused write

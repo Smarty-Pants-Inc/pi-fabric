@@ -846,7 +846,12 @@ export class MeshArchive {
         }
       }
       const aborted = abortedStat ? this.#readJson<Record<string, string>>(`${day}/ABORTED.json`) : undefined;
-      const catalog = archiveRangeCache.get(directory, generation);
+      // A head-day digest checkpoint is atomically renamed on every publish, changing
+      // the directory generation even when most segments have not changed. Reuse its
+      // hints across those metadata changes; each segment still requires its exact
+      // device/inode/size/mtime/ctime identity below, and all snapshot fences remain.
+      const fineGeneration = sealIdentity === "missing" ? "unsealed" : generation;
+      const catalog = archiveRangeCache.get(directory, fineGeneration);
       const identities: Array<{ absolute: string; identity: string }> = [];
       const work: Array<{ absolute: string; identity: string; order: number; block: ArchiveRangeBlock }> = [];
       let candidates: ArchiveCandidate[] = [];
@@ -927,7 +932,7 @@ export class MeshArchive {
         const present = new Set(names);
         for (const name of catalog.keys()) if (!present.has(name)) catalog.delete(name);
       }
-      archiveRangeCache.set(directory, generation, catalog);
+      archiveRangeCache.set(directory, fineGeneration, catalog);
       if (topic === undefined) {
         let min = Infinity, max = -Infinity;
         for (const name of names) {

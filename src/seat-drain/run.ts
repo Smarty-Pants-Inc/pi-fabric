@@ -20,6 +20,7 @@ const HEX64 = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MAX_SEALED = 1024 * 1024;
 const MAX_JOURNAL = 64 * 1024 * 1024;
+const MAX_SOURCE_HEADER = 65536;
 const PYTHON = "/usr/bin/python3";
 const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 export const sha256 = (bytes: Buffer | string): string => createHash("sha256").update(bytes).digest("hex");
@@ -194,6 +195,27 @@ export const socketPeer = (socket: net.Socket, python = PYTHON): Promise<{ pid: 
     });
   });
 
+/** A source journal's bounded head, not its whole (potentially very large) session body. */
+const readSourceHead = (file: string, uid: number): Buffer => {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | (fs.constants.O_NONBLOCK ?? 0));
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.uid !== uid) gap("source-journal-unreadable");
+    const head = Buffer.alloc(MAX_SOURCE_HEADER);
+    let offset = 0;
+    while (offset < head.length) {
+      const read = fs.readSync(fd, head, offset, head.length - offset, offset);
+      if (read === 0) break;
+      offset += read;
+    }
+    return head.subarray(0, offset);
+  } catch (error) {
+    if (error instanceof SeamGap) throw error;
+    return gap("source-journal-unreadable");
+  } finally { if (fd !== undefined) fs.closeSync(fd); }
+};
+
 /**
  * The mesh root the seat's Main uses, from the sealed packet and the seat's Fabric config only
  * (never this process's environment): the cwd recorded in the sealed native journal's header,
@@ -201,9 +223,10 @@ export const socketPeer = (socket: net.Socket, python = PYTHON): Promise<{ pid: 
  * that cwd, else `<cwd>/.pi/fabric/mesh`. The Main's own reply must name the same real path.
  */
 export const resolveSeatMeshRoot = (journal: string, sessionId: string, uid: number): string => {
-  const head = readOwned(journal, uid, MAX_JOURNAL, undefined, "source-journal-unreadable");
+  const head = readSourceHead(journal, uid);
   const newline = head.indexOf(0x0a);
-  const header = parse(head.subarray(0, newline < 0 ? Math.min(head.length, 65536) : Math.min(newline, 65536)), "source-journal-header-invalid");
+  if (newline < 0) gap("source-journal-header-invalid");
+  const header = parse(head.subarray(0, newline), "source-journal-header-invalid");
   if (header.type !== "session" || header.id !== sessionId || typeof header.cwd !== "string" || !path.isAbsolute(header.cwd)) {
     gap("source-journal-header-invalid");
   }

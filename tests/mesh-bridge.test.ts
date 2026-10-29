@@ -1070,11 +1070,23 @@ describe("mesh bridge", () => {
         await source.publish({ topic: "fleet.work.retry.1", kind: "ask", from, to, text: "one" }),
         await source.publish({ topic: "fleet.work.retry.1", kind: "ask", from, to, text: "two" }),
       ];
+      if (op === "bridgedIds") {
+        // A destination append survived without its source checkpoint. This puts the saved
+        // mark below the real recovery horizon and must suppress replay of the first event.
+        await side.publish({ topic: "fleet.work.retry.1", kind: "ask", from, to, text: "one",
+          data: { bridge: { from: where === "local" ? "forge" : "dev1", id: sent[0]!.id } } });
+        expect(on(target, "fleet.work.retry.1")).toHaveLength(1);
+      }
       let failure: unknown;
       const running = bridge.run().catch((error: unknown) => { failure = error; });
       try {
         await waitFor(() => on(target, "fleet.work.retry.1").length === 2);
         await waitFor(() => calls >= 2);
+        if (op === "bridgedIds") {
+          expect(side.recoveryReadCost?.events).toBeGreaterThan(0);
+          expect(logs.some(line => line.startsWith(`recovery (${where === "local" ? "toLocal" : "toRemote"}): `) &&
+            line.includes("matchingIds=1") && line.includes("completed=true"))).toBe(true);
+        }
         expect(times[failAt]! - times[failAt - 1]!).toBeGreaterThanOrEqual(80);
         expect(on(target, "fleet.work.retry.1").map((event) => event.text)).toEqual(["one", "two"]);
         expect(on(target, "fleet.work.retry.1").map((event) => (event.data as { bridge: { id: string } }).bridge.id))

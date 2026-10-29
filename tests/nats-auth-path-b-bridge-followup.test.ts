@@ -293,6 +293,10 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' real fol
       expect(readHostLease(h.fileMeshRoot, h.natsMain.id)).toMatchObject({ incarnationToken: epoch,
         bridgeSupersededTokens: expect.arrayContaining([oldLease.value.incarnation]) });
       probe.stall("always");
+      const currentPresence = (await h.inspector.kv("presence").get<FabricParticipantRecord>(presenceKey))!;
+      expect(currentPresence.value.ownerIncarnation).toBe(epoch);
+      await h.inspector.kv("presence").put(presenceKey, currentPresence.owner,
+        { ...currentPresence.value, updatedAt: Date.now() }, currentPresence.revision);
       await probe.entered.wait("production outbound mirror stalled before old-incarnation replay");
       const newerBytes = fs.readFileSync(hostLeasePath(h.fileMeshRoot, h.natsMain.id), "utf8");
       await probe.local.store.delete({ key: topologyKey("hosts", h.natsMain.id) });

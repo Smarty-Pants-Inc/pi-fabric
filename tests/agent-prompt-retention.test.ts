@@ -41,6 +41,10 @@ const fixture = (agents: Partial<typeof DEFAULT_FABRIC_CONFIG.agents> = {}, expl
   vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
   vi.stubEnv("PI_FABRIC_RUN_ROOT", undefined);
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
+  // These manager custody tests exercise the legacy process exit fence, not
+  // delegated cgroup admission; keep the fixture independent of the host bus.
+  vi.stubEnv("DBUS_SESSION_BUS_ADDRESS", undefined);
+  vi.stubEnv("XDG_RUNTIME_DIR", undefined);
   for (const key of ["PI_FABRIC_BUDGET", "PI_FABRIC_BUDGET_FILE", "PI_FABRIC_BUDGET_ID"]) vi.stubEnv(key, undefined);
   const runRoot = explicitRoot ? path.join(tempRoot, "explicit-runs") : undefined;
   const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, sessionExport: false, ...agents, retainRuns: false }, {
@@ -433,6 +437,13 @@ describe("Agent prompt retention at manager close (#11663)", () => {
       const queued = await manager.spawn({ name: "queued control", task: "queued successful task", transport: "process" });
       const queuedDirectory = path.join(root, queued.id);
       recordQueuedRollback(queuedDirectory); // remains installed through afterEach
+      fs.mkdirSync(queuedDirectory, { recursive: true, mode: 0o700 });
+      const queuedTraces = new Map<string, Buffer>([
+        ["events.jsonl", Buffer.from('{"queued":"events-π"}\n')],
+        ["session.jsonl", Buffer.from('{"queued":"session-λ"}\n')],
+        ["steer.jsonl", Buffer.from('{"queued":"steer-δ"}\n')],
+      ]);
+      for (const [name, bytes] of queuedTraces) fs.writeFileSync(path.join(queuedDirectory, name), bytes);
       expect(manager.status(queued.id)).toMatchObject({ status: "queued" });
       expect(fs.existsSync(path.join(queuedDirectory, "task.txt"))).toBe(false);
       const queuedWait = manager.wait(queued.id);
@@ -450,11 +461,12 @@ describe("Agent prompt retention at manager close (#11663)", () => {
       expectWholeRun(directory, files, inode);
       expect(fs.readFileSync(retainedPath(taskPath), "utf8")).toBe(prompt);
       expect(savedStatus(taskPath)).toMatchObject({ status: "stopped", promptSha256: hash(prompt), inputSha256: hash(prompt), inputBytes: Buffer.byteLength(prompt) });
-      expect(queuedRollbackIntents).toEqual([path.join(queuedDirectory, "queued-result.json"), queuedDirectory]);
+      expect(queuedRollbackIntents).toEqual([]); // Route settlement must move the whole tree, never unlink its traces.
       expect(removalIntents).not.toContain(queuedDirectory);
       const heldQueued = heldRoot(queuedDirectory);
       expect(fs.existsSync(path.join(heldQueued, "task.txt"))).toBe(false);
       expect(savedStatus(path.join(heldQueued, "task.txt"))).toMatchObject({ status: "stopped", queuedArchiveCommitted: true });
+      for (const [name, bytes] of queuedTraces) expect(fs.readFileSync(path.join(heldQueued, name))).toEqual(bytes);
     } finally {
       launchSpy.mockRestore();
     }

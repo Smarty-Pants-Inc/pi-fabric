@@ -55,6 +55,7 @@ import type { ActorContextReseed } from "./worker/context-admission.js";
 import { readPiSessionHeader } from "./core/pi-session-header.js";
 import { savePiSettlementReceipt } from "./worker/settlement-receipt.js";
 import { syncPathNamespace } from "./core/atomic-write.js";
+import { retainPriorAttemptFile } from "./storage/retain-prior-attempt.js";
 import { finalAssistantText, readFinalAnswerReceipt, withTaskFinalAnswerLock, type FinalAnswerReceipt } from "./worker/terminal-answer.js";
 import { terminalControls, markTerminalControlForwarded, readTerminalControl, settleTerminalControl, trackTerminalControl, type TerminalControl } from "./worker/terminal-controls.js";
 import { DEFAULT_BASH_IDLE_S } from "./guards/actor-bash-timeout.js";
@@ -565,7 +566,7 @@ const main = async (): Promise<void> => {
     ));
     if (!fs.existsSync(hookPath)) throw new Error("Reply tool hook is missing");
     replyHookPath = fs.realpathSync(hookPath);
-    fs.rmSync(replyFile!, { force: true });
+    retainPriorAttemptFile(replyFile!);
     piArguments.push("-e", hookPath);
   }
   // smarty-dev#2184, #6137: every Pi actor run, and every task run with native bash, gets the bash

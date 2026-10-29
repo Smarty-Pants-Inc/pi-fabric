@@ -9,9 +9,9 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
 import { compactTerminalRunEvents } from "../src/storage/retention.js";
 
-// This exact file also runs unchanged against main 9387af87. These are main's
-// Windows tails/counts, NOT V2 expectations weakened to make Windows pass.
-// Windows V2 acceptance moves to Smarty-Pants-Inc/smarty-dev#5132.
+// The legacy Windows sweep keeps raw event bytes just like V2; no retention path
+// may replace events.jsonl with a compacted tail. Windows V2 acceptance moves to
+// Smarty-Pants-Inc/smarty-dev#5132.
 const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const roots: string[] = [];
 const now = 200_000_000;
@@ -49,12 +49,12 @@ describe("forced-win32 parity with main 9387af87 (Windows V2: smarty-dev#5132)",
     });
     const rename = vi.spyOn(fs, "renameSync");
     expect(compactTerminalRunEvents(run, { now })).toBe(false);
-    expect(reads).toBe(5); expect(rename).not.toHaveBeenCalled();
+    expect(reads).toBe(0); expect(rename).not.toHaveBeenCalled();
     expect(original(path.join(run, "events.jsonl"))).toEqual(events);
     console.info("main-parity bounded: statusReads=5, lines=20, replacements=0");
   });
 
-  it("compacts all 130 runs in one main sweep, including >64-entry trees", () => {
+  it("keeps raw events in all 130 runs in one main sweep, including >64-entry trees", () => {
     const root = fixture();
     const runs = Array.from({ length: 130 }, (_, index) => makeRun(root, `run-${index}`));
     for (let i = 0; i < 65; i++) fs.writeFileSync(path.join(runs[0]!, `oversized-event-prefix-${i}.txt`), "keep");
@@ -65,12 +65,11 @@ describe("forced-win32 parity with main 9387af87 (Windows V2: smarty-dev#5132)",
       expect(collector.due(now)).toBe(false); expect(recovered).toBe(130);
       for (const run of runs) {
         const lines = fs.readFileSync(path.join(run, "events.jsonl"), "utf8").trim().split("\n");
-        expect(lines).toHaveLength(201);
-        expect(JSON.parse(lines[0]!)).toMatchObject({ fabricTruncated: true });
-        expect(JSON.parse(lines[1]!)).toEqual({ sequence: 201 });
-        expect(JSON.parse(lines[200]!)).toEqual({ sequence: 400 });
+        expect(lines).toHaveLength(401);
+        expect(JSON.parse(lines[0]!)).toEqual({ sequence: 0 });
+        expect(JSON.parse(lines[400]!)).toEqual({ sequence: 400 });
       }
-      console.info("main-parity sweep: recovered=130, compacted=130, lines=201, first=201, last=400");
+      console.info("main-parity sweep: recovered=130, compacted=0, full-lines=401, first=0, last=400");
     } finally { collector.close(); }
   });
 

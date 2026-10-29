@@ -1068,7 +1068,7 @@ describe("resident retention config reload", () => {
       const owner = fs.readFileSync(ownerPath, "utf8");
       const run = path.join(config.residencyRoot, "runs", "reload-retention");
       fs.mkdirSync(run, { recursive: true });
-      // Stay below the 200-line tail limit so the byte-cap case tests only bytes.
+      // A large immutable raw trace is retained exactly across both sweeps.
       const log = Buffer.from((JSON.stringify({ text: "x".repeat(3000) }) + "\n").repeat(100));
       const status = JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647",
         finishedAt: Date.now() - 8 * 60 * 60 * 1000 });
@@ -1103,13 +1103,11 @@ describe("resident retention config reload", () => {
         policies.push({ ...this.retention });
         return nativeSweep.call(this, now + 60_001, ...args);
       });
-      const deadline = Date.now() + 2500;
-      while (fs.statSync(path.join(run, "events.jsonl")).size > 128 * 1024 && Date.now() < deadline) await delay(10);
-      expect(sweep).toHaveBeenCalled();
+      await vi.waitFor(() => expect(sweep).toHaveBeenCalled(), { timeout: 2500 });
       expect(sweep.mock.calls.every(call => call[2] === 5)).toBe(true);
       expect(policies).toContainEqual({ ...next.retention, retainRuns: config.agents.retainRuns });
       due.mockRestore(); sweep.mockRestore();
-      expect(fs.statSync(path.join(run, "events.jsonl")).size).toBeLessThanOrEqual(128 * 1024);
+      expect(fs.readFileSync(path.join(run, "events.jsonl"))).toEqual(log);
       expect(config.retention).toEqual(initialRetention);
       expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(status);
       expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep"}');

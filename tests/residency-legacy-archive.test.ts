@@ -2,6 +2,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { ResidentRequestRetention } from "../src/residency/retention.js";
@@ -25,6 +26,15 @@ const run = (root: string, id: string, record: Record<string, unknown> = {}) => 
   fs.writeFileSync(path.join(dir, "events.jsonl"), Buffer.from([0, 255, 10, 65, 66]), { mode: 0o600 });
   return dir;
 };
+const rawTreePaths = (root: string): Set<string> => {
+  const paths = new Set([root]);
+  for (const name of fs.readdirSync(root)) {
+    const child = path.join(root, name);
+    paths.add(child);
+    if (fs.lstatSync(child).isDirectory()) for (const nested of rawTreePaths(child)) paths.add(nested);
+  }
+  return paths;
+};
 const archiver = (root: string, options = {}) => new ResidentLegacyRunArchive(root, {}, { isRetained: () => false, ...options });
 // Native Windows exercises the real platform branch; never impersonate POSIX.
 // Main has no retirement timer/audit: assert silence and zero mutation calls.
@@ -43,11 +53,25 @@ const sweepArchive = async (archive: ResidentLegacyRunArchive, ...args: Paramete
     expect(archive.health).toEqual({ checked: 0, archived: 0, skipped: 0, error: "" });
   } finally { audit.mockRestore(); for (const probe of probes) probe.mockRestore(); }
 };
-const retiredRuns = (root: string): string[] => {
-  const day = path.join(root, "runs-retired", new Date(now).toISOString().slice(0, 10));
-  if (!fs.existsSync(day)) return [];
-  return fs.readdirSync(day).flatMap(slice => fs.readdirSync(path.join(day, slice)).map(id => path.join(day, slice, id)));
+const retiredReceipts = (root: string): Array<Record<string, any>> => {
+  const base = path.join(root, "runs-retired"), receipts: Array<Record<string, any>> = [];
+  if (!fs.existsSync(base)) return receipts;
+  const walk = (directory: string): void => {
+    const receipt = path.join(directory, "custody.json");
+    if (fs.existsSync(receipt)) {
+      const value = JSON.parse(fs.readFileSync(receipt, "utf8"));
+      if (value.state === "moved") receipts.push(value);
+      return;
+    }
+    for (const name of fs.readdirSync(directory)) {
+      const child = path.join(directory, name);
+      if (fs.lstatSync(child).isDirectory()) walk(child);
+    }
+  };
+  walk(base);
+  return receipts;
 };
+const retiredRuns = (root: string): string[] => retiredReceipts(root).map(receipt => receipt.destination);
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 describe.skipIf(process.platform === "win32")("bounded retention reference preparation (POSIX-only; Windows follow-up smarty-dev#5132)", () => {
@@ -171,7 +195,7 @@ describe.skipIf(process.platform === "win32")("bounded retention reference prepa
       // A one-run fixture guarantees history-0 is visited on every native FS,
       // unlike relying on the platform's 4096-run directory enumeration order.
       retention.sweep(now, refs, 1000);
-      expect(reads).toBe(6); expect(reads).toBeLessThanOrEqual(8);
+      expect(reads).toBe(5); expect(reads).toBeLessThanOrEqual(8);
       expect(rename.mock.calls.some(call => String(call[1]).endsWith("events.jsonl"))).toBe(false);
     } finally { retention.close(); await manager.close(); }
   });
@@ -315,12 +339,12 @@ describe.skipIf(process.platform === "win32")("bounded retention reference prepa
       expect(maxGap).toBeLessThan(15_000);
       expect(fs.readdirSync(runRoot)).toHaveLength(19_744);
       await archive.close();
-      const retired = retiredRuns(root);
+      const retired = retiredReceipts(root);
       expect(retired).toHaveLength(256);
-      for (const directory of retired) expect(fs.readFileSync(path.join(directory, "events.jsonl"))).toEqual(savedEvents);
+      for (const receipt of retired) expect(fs.readFileSync(path.join(receipt.destination, "events.jsonl"))).toEqual(savedEvents);
       // Restore needs no snapshot/decompress operation: move the SAME inodes.
       const restored = path.join(root, "restored"); fs.mkdirSync(restored);
-      for (const directory of retired) fs.renameSync(directory, path.join(restored, path.basename(directory)));
+      for (const receipt of retired) fs.renameSync(receipt.destination, path.join(restored, receipt.id));
       expect(fs.readdirSync(restored)).toHaveLength(256);
       expect(fs.existsSync(path.join(root, "archive"))).toBe(false);
     } finally { fs.readFileSync = original; fs.Dir.prototype.readSync = originalRead; clearInterval(heartbeat); histogram.disable(); await manager.close(); }
@@ -341,6 +365,34 @@ describe("rename-only legacy run retention", () => {
       expect(fs.readFileSync(path.join(directory, "events.jsonl"))).toEqual(before);
       expect(fs.existsSync(path.join(root, "runs-retired"))).toBe(false);
       expect(fs.existsSync(path.join(root, "archive-retention.json"))).toBe(false);
+    } finally { await archive.close(); }
+  });
+
+  it.skipIf(process.platform === "win32")("archives legacy run bytes with a verified per-run custody receipt and no unlink/rm", async () => {
+    const root = temporary(), directory = run(root, "receipted"), events = fs.readFileSync(path.join(directory, "events.jsonl"));
+    const status = fs.readFileSync(path.join(directory, "status.json")), identity = fs.statSync(directory),
+      rawPaths = rawTreePaths(directory), deletions: string[] = [];
+    const rmSync = fs.rmSync, unlinkSync = fs.unlinkSync, rm = fs.promises.rm, unlink = fs.promises.unlink;
+    vi.spyOn(fs, "rmSync").mockImplementation((file, options) => { deletions.push(String(file)); return rmSync(file, options); });
+    vi.spyOn(fs, "unlinkSync").mockImplementation(file => { deletions.push(String(file)); return unlinkSync(file); });
+    vi.spyOn(fs.promises, "rm").mockImplementation((file, options) => { deletions.push(String(file)); return rm(file, options); });
+    vi.spyOn(fs.promises, "unlink").mockImplementation(file => { deletions.push(String(file)); return unlink(file); });
+    const archive = archiver(root);
+    try {
+      await sweepArchive(archive, now, 32, 1000);
+      expect(archive.health).toMatchObject({ archived: 1, error: "" });
+      const receipt = retiredReceipts(root).find(value => value.source === directory);
+      expect(receipt).toBeDefined();
+      expect(receipt).toMatchObject({ state: "moved", source: directory, sourceIdentity: { dev: identity.dev, ino: identity.ino },
+        manifest: { format: 1, entries: [
+          { path: ".", type: "directory" },
+          { path: "events.jsonl", type: "file", size: events.length, sha256: createHash("sha256").update(events).digest("hex") },
+          { path: "status.json", type: "file", size: status.length, sha256: createHash("sha256").update(status).digest("hex") },
+        ] } });
+      expect(fs.statSync(receipt!.destination).ino).toBe(identity.ino);
+      expect(fs.readFileSync(path.join(receipt!.destination, "events.jsonl"))).toEqual(events);
+      expect(fs.readFileSync(path.join(receipt!.destination, "status.json"))).toEqual(status);
+      expect(deletions.filter(file => rawPaths.has(file))).toEqual([]);
     } finally { await archive.close(); }
   });
 
@@ -370,7 +422,7 @@ describe("rename-only legacy run retention", () => {
       for (const [name, bytes] of before) expect(fs.readFileSync(path.join(good, name))).toEqual(bytes);
       return;
     }
-    const moved = retiredRuns(root).find(directory => path.basename(directory) === "good")!;
+    const moved = retiredReceipts(root).find(receipt => receipt.id === "good")!.destination;
     expect(fs.statSync(moved).ino).toBe(inode);
     for (const [name, bytes] of before) expect(fs.readFileSync(path.join(moved, name))).toEqual(bytes);
     expect(fs.existsSync(path.join(root, "archive"))).toBe(false);
@@ -440,7 +492,7 @@ describe("rename-only legacy run retention", () => {
     for (const failure of ["alias", "EXDEV"]) {
       const root = temporary(), directory = run(root, "kept");
       if (failure === "alias") { const foreign = path.join(root, "foreign"); fs.mkdirSync(foreign); fs.symlinkSync(foreign, path.join(root, "runs-retired")); }
-      else vi.spyOn(fsp, "rename").mockRejectedValue(Object.assign(new Error("cross-device"), { code: "EXDEV" }));
+      else vi.spyOn(fs, "renameSync").mockImplementation(() => { throw Object.assign(new Error("cross-device"), { code: "EXDEV" }); });
       const archive = archiver(root);
       try {
         await sweepArchive(archive, now, 32, 1000); expect(archive.health.archived).toBe(0); expect(fs.existsSync(directory)).toBe(true);
@@ -452,9 +504,13 @@ describe("rename-only legacy run retention", () => {
   });
 
   it("rolls back the move when known path-based custody appears after rename", async () => {
-    const root = temporary(), directory = run(root, "race"), rename = fsp.rename;
+    const root = temporary(), directory = run(root, "race"), rename = fs.renameSync;
     let retained = false;
-    vi.spyOn(fsp, "rename").mockImplementation(async (...args: Parameters<typeof rename>) => { await rename(...args); retained = true; });
+    vi.spyOn(fs, "renameSync").mockImplementation(((...args: Parameters<typeof rename>) => {
+      const result = rename(...args);
+      if (String(args[0]) === directory) retained = true;
+      return result;
+    }) as typeof fs.renameSync);
     const archive = archiver(root, { isRetained: () => retained });
     try { await sweepArchive(archive, now, 32, 1000); expect(archive.health.archived).toBe(0); expect(fs.existsSync(directory)).toBe(true); expect(retiredRuns(root)).toEqual([]); }
     finally { await archive.close(); }
@@ -462,8 +518,11 @@ describe("rename-only legacy run retention", () => {
 
   it("retains moved bytes on partial failure and resumes with a new collector after restart", async () => {
     const root = temporary(); run(root, "one"); run(root, "two");
-    const rename = fsp.rename; let calls = 0;
-    vi.spyOn(fsp, "rename").mockImplementation(async (...args: Parameters<typeof rename>) => { if (++calls === 2) throw new Error("interrupted move"); return rename(...args); });
+    const rename = fs.renameSync; let calls = 0;
+    vi.spyOn(fs, "renameSync").mockImplementation(((...args: Parameters<typeof rename>) => {
+      if (path.dirname(String(args[0])) === path.join(root, "runs") && ++calls === 2) throw new Error("interrupted move");
+      return rename(...args);
+    }) as typeof fs.renameSync);
     const archive = archiver(root);
     try {
       await sweepArchive(archive, now, 32, 1000);

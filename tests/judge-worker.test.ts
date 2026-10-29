@@ -8,6 +8,7 @@ import { ProcessTransport } from "../src/agents/transports/process-transport.js"
 import { judge, type JudgeDependencies } from "../src/judge/runtime.js";
 import { runJudgmentAgent } from "../src/judge/agent.js";
 import { VERDICTS } from "../src/judge/contract.js";
+import { fakeManagerHeapWorker } from "./fixtures/manager-heap-probe.js";
 
 const input = () => ({ questionClass: "item-stalled", itemRef: "org/repo#1", evidenceRefs: [{ url: "https://example.test/evidence", revision: "v1", observedAt: "2026-10-01T00:00:00Z" }], evidence: { facts: { complete: true }, excerpts: ["test"] }, allowedVerdicts: [...VERDICTS], timeboxMs: 5000, budget: { maxEvaluations: 1, maxAgents: 1, maxTokens: 1000 }, requestKey: "bounded-worker-probe" });
 let root: string;
@@ -18,6 +19,8 @@ beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "judge-worker-test-"));
   fs.mkdirSync(path.join(root, "cwd"));
   vi.stubEnv("PI_FABRIC_DEPTH", "0");
+  vi.stubEnv("DBUS_SESSION_BUS_ADDRESS", undefined);
+  vi.stubEnv("XDG_RUNTIME_DIR", undefined);
   deps = { policy: { version: "probe-v1", role: "Sol", pin: { model: "openai-codex/gpt-5.6-sol", effort: "max" } }, ledger: path.join(root, "ledger/route.jsonl"),
     evaluate: async () => ({ model: "fixture", answers: { verdict: { type: "choice", choice: "stalled", confidence: .6, probabilities: { moving: .4, stalled: .6, dependency: 0, agent_decision: 0, human_decision: 0, unknown: 0 } } }, usage: { input_tokens: 1, output_tokens: 1 } }),
     agent: async (request, limits, signal) => {
@@ -64,6 +67,67 @@ describe.skipIf(!fs.existsSync("dist/worker.js"))("built judgment worker isolati
   });
 });
 describe("retained owned judgment receipts", () => {
+  it("moves successful judge run traces to custody before removing its temporary workspace", async () => {
+    let judgeRoot = "", directory = "", runId = "";
+    const raw = new Map<string, Buffer>();
+    const mkdtemp = fs.mkdtempSync;
+    vi.spyOn(fs, "mkdtempSync").mockImplementation((...args: Parameters<typeof mkdtemp>) => {
+      const value = mkdtemp(...args);
+      if (path.basename(String(args[0])).startsWith("fabric-judge-")) {
+        judgeRoot = value;
+        ownedRoots.push(value, `${value}.trace-archive`);
+      }
+      return value;
+    });
+    const spawn = AgentManager.prototype.spawn;
+    let owner!: AgentManager;
+    vi.spyOn(AgentManager.prototype, "spawn").mockImplementation(async function (this: AgentManager, ...args) {
+      owner = this;
+      const handle = await spawn.apply(this, args);
+      runId = handle.id;
+      directory = this.runDirectory(runId)!;
+      return handle;
+    });
+    vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
+      const handle = await fakeManagerHeapWorker(request);
+      const argument = (name: string): string => request.workerArguments[request.workerArguments.indexOf(name) + 1]!;
+      const runDirectory = path.dirname(argument("--status-file"));
+      for (const [name, text] of [
+        ["events.jsonl", '{"judge":"raw events π"}\\n'],
+        ["session.jsonl", '{"judge":"raw session λ"}\\n'],
+        ["steer.jsonl", '{"judge":"raw steer δ"}\\n'],
+      ] as const) fs.writeFileSync(path.join(runDirectory, name), text);
+      return handle;
+    });
+    const close = AgentManager.prototype.close;
+    vi.spyOn(AgentManager.prototype, "close").mockImplementation(async function (this: AgentManager, ...args) {
+      if (this === owner && directory) {
+        const walk = (base: string, relative = ""): void => {
+          for (const name of fs.readdirSync(base)) {
+            const file = path.join(base, name), next = path.join(relative, name);
+            if (fs.lstatSync(file).isDirectory()) walk(file, next);
+            else if (/^(?:events|session|steer|route-session)\.jsonl$/.test(name)) raw.set(next, fs.readFileSync(file));
+          }
+        };
+        walk(directory);
+      }
+      return close.apply(this, args);
+    });
+    const result = await runJudgmentAgent({ task: "trace custody probe", transport: "process" },
+      { timeoutMs: 10_000, maxTokens: 1_000 }, new AbortController().signal,
+      { piBinary: path.resolve("tests/fixtures/fake-pi-route.mjs"), workerPath: path.resolve("tests/fixtures/fake-worker.mjs") });
+    expect(result.status).toBe("completed");
+    expect(raw.size).toBeGreaterThan(0);
+    const archive = `${judgeRoot}.trace-archive`;
+    expect(fs.existsSync(judgeRoot), fs.existsSync(judgeRoot) ? fs.readdirSync(judgeRoot).join(",") : "removed").toBe(false);
+    const container = fs.readdirSync(archive).map(name => path.join(archive, name)).find(candidate => {
+      try { return JSON.parse(fs.readFileSync(path.join(candidate, "custody.json"), "utf8")).source === path.join(judgeRoot, "runs"); }
+      catch { return false; }
+    })!;
+    const heldRunRoot = JSON.parse(fs.readFileSync(path.join(container, "custody.json"), "utf8")).destination as string;
+    for (const [relative, bytes] of raw) expect(fs.readFileSync(path.join(heldRunRoot, runId, relative))).toEqual(bytes);
+  }, 30_000);
+
   it("preserves a persistently unsaved child outcome through close, fails closed, and permits recovery", async () => {
     let owner!: AgentManager;
     const spawn = AgentManager.prototype.spawn;
@@ -84,12 +148,22 @@ describe("retained owned judgment receipts", () => {
     ownedRoots.push(path.dirname(path.dirname(run)));
     expect(result).toMatchObject({ verdict: "unknown", reasonCode: "agent_cleanup_unresolved", cost: { tokens: 5 } });
     expect(attempt.error).toContain(ownedRoots[0]);
+    const archive = `${ownedRoots[0]}.trace-archive`;
+    const container = fs.readdirSync(archive).map(name => path.join(archive, name)).find(candidate => {
+      try { return JSON.parse(fs.readFileSync(path.join(candidate, "custody.json"), "utf8")).source === path.join(ownedRoots[0]!, "runs"); }
+      catch { return false; }
+    })!;
+    const heldRunRoot = JSON.parse(fs.readFileSync(path.join(container, "custody.json"), "utf8")).destination as string;
+    const heldRun = path.join(heldRunRoot, attempt.childAgentId);
+    expect(fs.realpathSync(run)).toBe(heldRun);
+    expect(heldRun.startsWith(`${ownedRoots[0]}${path.sep}`)).toBe(false);
     expect(fs.existsSync(path.join(run, "route-session.jsonl"))).toBe(true);
     expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toMatchObject({ usage: { input: 1, output: 2 } });
     expect(JSON.parse(fs.readFileSync(path.join(run, "pending-route-outcome.json"), "utf8"))).toMatchObject({ ledger: deps.ledger, record: { decisionId: result.decisionId, status: "completed", tokens: { input: 1, output: 2 } } });
     fault.mockRestore();
     await owner.cleanup(attempt.childAgentId);
-    expect(fs.existsSync(run)).toBe(false);
+    expect(fs.realpathSync(run)).toBe(heldRun);
+    expect(fs.existsSync(path.join(heldRun, "pending-route-outcome.json"))).toBe(false);
     const recovered = fs.readFileSync(deps.ledger, "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(recovered.filter(row => row.type === "outcome")).toEqual([expect.objectContaining({ decisionId: result.decisionId, tokens: expect.objectContaining({ input: 1, output: 2 }) })]);
   });

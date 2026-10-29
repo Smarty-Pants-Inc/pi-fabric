@@ -7,7 +7,7 @@ import { build } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   admitBoundScriptedInput, admitContinuation, assertRecoveryInputPermission, bindInputAdmission,
-  commitRecoveryInputDelivery, commitRecoverySession, ensureRecoveryGeneration, readRecoveryInput, readRecoverySession,
+  commitRecoveryInputDelivery, commitRecoverySession, ensureRecoveryGeneration, initializeNewRecoverySession, readRecoveryInput, readRecoverySession,
   recordInputOutcome, recordRecoveryRepair, recoveryCanonical, recoveryHash,
   releaseRecoveryInputAfterJoin, selectRecoveryInput, RecoveryAdmissionError,
   type AcceptedRecoveryInput, type InputAdmissionMainAgent, type RecoveryInputOutcomeRequest, type RecoveryAdmissionOwner,
@@ -17,6 +17,8 @@ import {
   type AcceptedRecoveryMaintenance, type MaintenanceCompletion, type MaintenanceOperation,
   type MaintenanceRecord, type MaintenanceRequest, type MaintenanceResult, type NativePlanRef, type RecoveryEpoch,
 } from "../src/recovery/maintenance-admission.js";
+
+import { seedIncompleteRecoveryHistory } from "./helpers/b5-c2-seed.js";
 
 // Keep: real fsync/rename/checksum/reopen, trusted native/B5 port boundary, data safety,
 // unknown-ACK/crash and two race orders. Native/B6 WAL evidence callbacks here are boundary
@@ -36,15 +38,20 @@ const fixture = (options: { complete?: boolean; root?: string; sessionId?: strin
   const mainAgent: InputAdmissionMainAgent = { id: `session:${sessionId}`, local: true, sessionId,
     deliverAgent: () => { throw new Error("REQUIRED admission/continuation must not submit through native Main"); } };
   let unbind: () => void;
-  const bind = () => {
-    unbind = bindInputAdmission({ root, sessionId, mainAgent, recovery: options.owner ?? {
+  const bind = (initial = false) => {
+    const recovery = options.owner ?? {
       get epoch() { return currentEpoch; }, podId: `pod-${currentEpoch.bindingId}`, bootId: currentEpoch.processIncarnationId, historyComplete: options.complete ?? true,
       assertCurrent: () => { if (!live) throw new RecoveryAdmissionError("RECOVERY_EPOCH_REVOKED", "old writer positively excluded"); },
       reconsiderInput: async () => { drives.push("drive"); if (drive) await drive(); },
-      validateRepair: ref => { expect(ref.repairReceiptSha256).toBe(D); },
-    } }); cleanups.push(unbind);
+      validateRepair: (ref: import("../src/recovery/maintenance-admission.js").RepairRef) => { expect(ref.repairReceiptSha256).toBe(D); },
+    };
+    if (initial && options.root === undefined) {
+      if (recovery.historyComplete) initializeNewRecoverySession({ mode: "NEW", root, sessionId, recovery, assertNew() {} });
+      else seedIncompleteRecoveryHistory(root, sessionId);
+    }
+    unbind = bindInputAdmission({ root, sessionId, mainAgent, recovery }); cleanups.push(unbind);
   };
-  bind();
+  bind(true);
   const api = createRecoveryMaintenanceAdapter();
   const io = () => ({ deadlineMs: Date.now() + 30_000 });
   const request = (requestId = "compact-1", operation: MaintenanceOperation = { kind: "compact", reason: "manual" }): MaintenanceRequest => ({
@@ -219,6 +226,39 @@ describe.skipIf(process.platform === "win32")("durable maintenance admission and
   });
 });
 
+// C2 RED controls deliberately use only baseline APIs and acknowledged retained input.
+describe.skipIf(process.platform === "win32")("C2 REQUIRED history loss", () => {
+  it.each(["ledger deletion", "missing root"])("C2 refuses acknowledged input loss after %s", async loss => {
+    const f = fixture();
+    expect(f.admitRound().queued).toBe(true);
+    const input = await f.select(); await f.delivery(input);
+    expect(await readRecoveryInput(f.sessionId)).toMatchObject({ complete: true, accepted: { inputId: "round-1", settlement: "open" } });
+    const file = path.join(f.root, "input-admission", "v1", "session", `${recoveryHash(f.sessionId)}.json`);
+    const retained = fs.readFileSync(file, "utf8");
+    expect(JSON.parse(retained).payload.inputs).toHaveLength(1);
+    if (loss === "ledger deletion") fs.unlinkSync(file);
+    else { fs.rmSync(f.root, { recursive: true }); f.rebind(); }
+    const after = await readRecoveryInput(f.sessionId);
+    expect(after.complete, JSON.stringify(after)).toBe(false);
+    const mkdir = vi.spyOn(fs, "mkdirSync"), rename = vi.spyOn(fs, "renameSync"), native = vi.spyOn(f.mainAgent, "deliverAgent");
+    expect(() => readRecoverySession(f.sessionId)).toThrow(expect.objectContaining({ code: "RECOVERY_HISTORY_INCOMPLETE" }));
+    refused(await f.api.read(f.key()), "RECOVERY_HISTORY_INCOMPLETE");
+    refused(await f.api.listPending(f.sessionId, 10), "RECOVERY_HISTORY_INCOMPLETE");
+    refused(await f.api.admitMaintenance(f.request()), "RECOVERY_HISTORY_INCOMPLETE");
+    expect(await recordInputOutcome(f.outcome())).toEqual({ durable: false, reason: "incomplete-history" });
+    expect(() => f.admitRound("would-recreate-revision-1")).toThrow(expect.objectContaining({ code: "RECOVERY_HISTORY_INCOMPLETE" }));
+    await expect(admitContinuation({ sessionId: f.sessionId, originalInputId: "round-1", recoveryGeneration: "not-a-new-authority", text: "resume" }))
+      .rejects.toMatchObject({ code: "RECOVERY_HISTORY_INCOMPLETE" });
+    await expect(selectRecoveryInput({ sessionId: f.sessionId, originalInputId: "round-1", epoch: f.epoch, expectedRevision: JSON.parse(retained).payload.revision }))
+      .rejects.toMatchObject({ code: "RECOVERY_HISTORY_INCOMPLETE" });
+    await expect(f.delivery(input)).rejects.toMatchObject({ code: "RECOVERY_HISTORY_INCOMPLETE" });
+    expect(mkdir).not.toHaveBeenCalled(); expect(rename).not.toHaveBeenCalled(); expect(native).not.toHaveBeenCalled(); expect(f.drives).toEqual([]);
+    expect(JSON.parse(retained).payload.inputs).toHaveLength(1);
+    expect(fs.existsSync(file)).toBe(false);
+    if (loss === "missing root") expect(fs.existsSync(f.root)).toBe(false);
+  });
+});
+
 describe.skipIf(process.platform === "win32")("one serialized input/outcome/maintenance arbiter", () => {
   it("maintenance wins first durable commit: select is non-blocking BUSY, winner release drives queued input exactly once", async () => {
     const f = fixture(); f.admitRound(); const r = f.request(); const a = take(await f.api.admitMaintenance(r));
@@ -390,7 +430,7 @@ describe.skipIf(process.platform === "win32")("bounded refusal, uncertainty and 
     }); refused(failed, "UNCERTAIN"); expect(f.snapshot().maintenance[0]!.record.state).toBe("PREPARED");
     const file = path.join(f.root, "input-admission", "v1", "session", `${recoveryHash(f.sessionId)}.json`);
     const bytes = fs.readFileSync(file, "utf8"); fs.writeFileSync(file, bytes.slice(0, -7));
-    refused(await f.api.read(f.key()), "UNCERTAIN"); expect((await readRecoveryInput(f.sessionId)).complete).toBe(false);
+    refused(await f.api.read(f.key()), "RECOVERY_HISTORY_INCOMPLETE"); expect((await readRecoveryInput(f.sessionId)).complete).toBe(false);
   });
   it("reads back rename-before-fsync unknown ACK before either dispatcher can run", async () => {
     const f = fixture(); const r = f.request(); const original = fs.renameSync;

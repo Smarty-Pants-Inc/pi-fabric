@@ -52,7 +52,7 @@ export const RECOVERY_MAINTENANCE_CODES = [
   "RECOVERY_MAINTENANCE_DEADLINE", "RECOVERY_MAINTENANCE_CANCELLED", "RECOVERY_MAINTENANCE_INTERRUPTED",
   "RECOVERY_MAINTENANCE_RETRY_EXHAUSTED", "RECOVERY_MAINTENANCE_REPAIR_REQUIRED", "RECOVERY_MAINTENANCE_UNCERTAIN",
 ] as const;
-export type MaintenanceFailureCode = typeof RECOVERY_MAINTENANCE_CODES[number] | "RECOVERY_EPOCH_REVOKED" | "RECOVERY_EXECUTION_BRANCH_REQUIRED";
+export type MaintenanceFailureCode = typeof RECOVERY_MAINTENANCE_CODES[number] | "RECOVERY_EPOCH_REVOKED" | "RECOVERY_EXECUTION_BRANCH_REQUIRED" | "RECOVERY_HISTORY_INCOMPLETE";
 export type MaintenanceRefusal = Readonly<{ ok: false; code: MaintenanceFailureCode; message: string }>;
 export type MaintenanceResult<T = MaintenanceRecord> = Readonly<{ ok: true; value: T }> | MaintenanceRefusal;
 export interface BegunMaintenance { readonly record: MaintenanceRecord; readonly token: AcceptedRecoveryMaintenance }
@@ -190,7 +190,7 @@ const result = async <T>(run: () => T | Promise<T>): Promise<MaintenanceResult<T
   catch (error) {
     if (error instanceof RecoveryMaintenanceError) return { ok: false, code: error.code, message: error.message };
     if (error instanceof RecoveryAdmissionError) {
-      const code = error.code === "RECOVERY_EPOCH_REVOKED" ? error.code : error.code === "RECOVERY_DEADLINE" ? "RECOVERY_MAINTENANCE_DEADLINE" :
+      const code = error.code === "RECOVERY_EPOCH_REVOKED" || error.code === "RECOVERY_HISTORY_INCOMPLETE" ? error.code : error.code === "RECOVERY_DEADLINE" ? "RECOVERY_MAINTENANCE_DEADLINE" :
         error.code === "RECOVERY_NOT_BOUND" ? "RECOVERY_MAINTENANCE_UNBOUND" : error.code === "RECOVERY_ABORTED" ? "RECOVERY_MAINTENANCE_CANCELLED" : "RECOVERY_MAINTENANCE_UNCERTAIN";
       return { ok: false, code, message: error.message };
     }

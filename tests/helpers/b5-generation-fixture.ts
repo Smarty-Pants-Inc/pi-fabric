@@ -2,11 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  admitBoundScriptedInput, bindInputAdmission, commitRecoveryInputDelivery, readRecoverySession,
+  admitBoundScriptedInput, bindInputAdmission, commitRecoveryInputDelivery, initializeNewRecoverySession, readRecoverySession,
   recordInputOutcome, recoveryHash, releaseRecoveryInputAfterJoin, selectRecoveryInput,
   type RecoveryAdmissionOwner,
 } from "../../src/recovery/input-admission.js";
 import { createRecoveryMaintenanceAdapter, type RepairRef } from "../../src/recovery/maintenance-admission.js";
+import { seedIncompleteRecoveryHistory } from "./b5-c2-seed.js";
 
 // B5-only trust/data-safety fixture: real ledger fsync/rename/reopen; native receipts
 // and settlement are boundary fixtures, not a native/B4/B6 producer qualification.
@@ -20,17 +21,21 @@ export function b5GenerationFixture(cleanups: Array<() => void>, complete = true
   let nativeAdmissions = 0;
   const mainAgent = { id: `session:${sessionId}`, local: true, sessionId,
     deliverAgent: (): never => { nativeAdmissions++; throw new Error("REQUIRED must not call native admission"); } };
-  const bind = () => {
+  const bind = (initial = false) => {
     const owner: RecoveryAdmissionOwner = {
       epoch: { processIncarnationId: `process-${boot}`, bindingId: `binding-${boot}`, epoch: 0 },
       podId: `pod-${boot}`, bootId: `boot-${boot}`, historyComplete: complete,
       assertCurrent() {}, reconsiderInput() {},
       validateRepair(ref) { if (ref.repairReceiptSha256 !== B5_HASH) throw new Error("No native fixture receipt"); },
     };
+    if (initial) {
+      if (complete) initializeNewRecoverySession({ mode: "NEW", root, sessionId, recovery: owner, assertNew() {} });
+      else seedIncompleteRecoveryHistory(root, sessionId);
+    }
     unbind = bindInputAdmission({ root, sessionId, mainAgent, recovery: owner });
     return owner;
   };
-  let owner = bind();
+  let owner = bind(true);
   cleanups.push(() => { unbind(); });
   const snapshot = () => readRecoverySession(sessionId);
   const admit = (inputId = "original") => admitBoundScriptedInput({ sessionId, request: {

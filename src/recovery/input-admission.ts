@@ -348,6 +348,7 @@ const bindings = new Map<string, Binding>();
 export function bindInputAdmission(options: Binding): () => void {
   validateBinding(options);
   if (bindings.has(options.sessionId)) return fail("ALREADY_BOUND", `Input admission already bound for session ${options.sessionId}`);
+  if (commitOwners.has(ledgerPath(options))) return recoveryFail("RECOVERY_REVISION_CONFLICT", "Cannot bind during session initialization/commit");
   if (options.recovery) validateRecoveryOwner(options.recovery);
   // This trusted native port may have prototype methods and a live epoch getter.
   // Do not spread/snapshot it into a stale identity; only accepted capabilities carry
@@ -556,7 +557,7 @@ const validEpoch = (epoch: unknown): epoch is RecoveryEpoch => object(epoch) && 
 const validHash = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const validTime = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 function validateRecoveryOwner(owner: RecoveryAdmissionOwner): void {
-  if (!validEpoch(owner.epoch) || !nonempty(owner.podId) || !nonempty(owner.bootId) || typeof owner.historyComplete !== "boolean" ||
+  if (!owner || (typeof owner !== "object" && typeof owner !== "function") || !validEpoch(owner.epoch) || !nonempty(owner.podId) || !nonempty(owner.bootId) || typeof owner.historyComplete !== "boolean" ||
       typeof owner.assertCurrent !== "function" || typeof owner.reconsiderInput !== "function") recoveryFail("RECOVERY_INVALID", "Malformed native recovery admission owner");
   checkOwner(owner);
 }
@@ -577,10 +578,41 @@ function checkIo(io?: RecoveryIo): void {
   if (io?.signal?.aborted) recoveryFail("RECOVERY_ABORTED", "Recovery I/O was aborted");
   if (io?.deadlineMs !== undefined && (!validTime(io.deadlineMs) || Date.now() >= io.deadlineMs)) recoveryFail("RECOVERY_DEADLINE", "Recovery I/O deadline expired");
 }
-const ledgerPath = (binding: Binding): string => path.join(base(binding.root), "session", `${hash(binding.sessionId)}.json`);
-const emptyLedger = (binding: Binding): RecoverySessionLedger => ({ version: 1, sessionId: binding.sessionId, revision: 0,
-  complete: binding.recovery!.historyComplete && files(binding.root, "receiver", binding.sessionId).length === 0,
+type RecoveryStore = Pick<Binding, "root" | "sessionId">;
+const ledgerPath = (binding: RecoveryStore): string => path.join(base(binding.root), "session", `${hash(binding.sessionId)}.json`);
+/** Only the explicit, authoritative NEW operation may construct this seal. */
+const emptyLedger = (binding: RecoveryStore): RecoverySessionLedger => ({ version: 1, sessionId: binding.sessionId, revision: 0, complete: true,
   inputs: [], outcomes: [], maintenance: [], retrySlots: [], repairs: [], recoveryGenerationPins: [], taskAborts: [], driveReceipts: [] });
+function requiredHistoryIo<T>(read: () => T): T {
+  try { return read(); }
+  catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+      return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Required session root/ledger namespace is missing or invalid");
+    }
+    throw error;
+  }
+}
+/** Read-only structural checks. Exact mount/ancestor identity remains the M2 host port's job. */
+function checkLedgerDirectories(root: string, newStore = false): void {
+  requiredHistoryIo(() => {
+    for (const dir of [path.resolve(root), path.join(root, "input-admission"), base(root), path.join(base(root), "session")]) {
+      let stat: fs.Stats;
+      try { stat = fs.lstatSync(dir); }
+      catch (error) {
+        if (newStore && dir !== path.resolve(root) && (error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      if (!stat.isDirectory() || stat.isSymbolicLink()) recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Session root/namespace must be a provisioned directory, not an alias");
+    }
+  });
+}
+function checkLedgerFile(file: string): fs.Stats {
+  return requiredHistoryIo(() => {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Required session ledger must be a regular file, not an alias");
+    return stat;
+  });
+}
 const checkedLedger = (value: unknown, sessionId: string): RecoverySessionLedger => {
   if (!object(value) || value.version !== 1 || value.sessionId !== sessionId || !Number.isSafeInteger(value.revision) || (value.revision as number) < 0 ||
       typeof value.complete !== "boolean" || !exactKeys(value, ["version", "sessionId", "revision", "complete", "inputs", "outcomes", "currentInputId", "reservation", "maintenance", "retrySlots", "repairs", "recoveryGenerationPins", "taskAborts", "driveReceipts"]) ||
@@ -670,23 +702,89 @@ const checkedLedger = (value: unknown, sessionId: string): RecoverySessionLedger
 };
 function loadLedger(binding: Binding): RecoverySessionLedger {
   requireNamespaceBarrier(notDurable);
-  const file = ledgerPath(binding);
-  let fd: number;
-  try { fd = fs.openSync(file, "r"); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyLedger(binding); throw error; }
-  let envelope: unknown;
-  try {
-    const stat = fs.fstatSync(fd);
-    if (stat.size > 64 * 1024 * 1024) recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Bounded session ledger read would truncate history");
-    const bytes = fs.readFileSync(fd, "utf8");
-    fs.fsyncSync(fd); syncPathNamespaceDurable(file, stat, notDurable);
-    try { envelope = JSON.parse(bytes); } catch { recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Corrupt session ledger JSON"); }
-  } finally { fs.closeSync(fd); }
-  if (!object(envelope) || !exactKeys(envelope, ["version", "payload", "sha256"]) || envelope.version !== 1 || !validHash(envelope.sha256) ||
-      hash(canonical(envelope.payload)) !== envelope.sha256) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Session ledger checksum conflict");
-  return checkedLedger(envelope.payload, binding.sessionId);
+  return requiredHistoryIo(() => {
+    checkLedgerDirectories(binding.root);
+    const file = ledgerPath(binding), expected = checkLedgerFile(file);
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    let envelope: unknown;
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || stat.dev !== expected.dev || stat.ino !== expected.ino || stat.size > 64 * 1024 * 1024) {
+        recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Required session ledger changed type/identity or exceeds bounded read");
+      }
+      const bytes = fs.readFileSync(fd, "utf8");
+      fs.fsyncSync(fd); syncPathNamespaceDurable(file, stat, notDurable);
+      checkLedgerDirectories(binding.root); checkLedgerFile(file);
+      try { envelope = JSON.parse(bytes); } catch { recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Corrupt session ledger JSON"); }
+    } finally { fs.closeSync(fd); }
+    if (!object(envelope) || !exactKeys(envelope, ["version", "payload", "sha256"]) || envelope.version !== 1 || !validHash(envelope.sha256) ||
+        hash(canonical(envelope.payload)) !== envelope.sha256) return recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Session ledger checksum conflict");
+    return checkedLedger(envelope.payload, binding.sessionId);
+  });
 }
 const commitOwners = new Set<string>();
+function enterCommitOwner(key: string): () => void {
+  if (commitOwners.has(key)) return recoveryFail("RECOVERY_REVISION_CONFLICT", "Reentrant session commit owner");
+  commitOwners.add(key);
+  return () => { commitOwners.delete(key); };
+}
+export interface NewRecoverySessionInitialization {
+  readonly mode: "NEW";
+  readonly sessionId: string;
+  readonly root: string;
+  readonly recovery: RecoveryAdmissionOwner;
+  /** Trusted synchronous assertion of authoritative NEW/unadmitted identity, NOT absence.
+   * Throws for REQUIRED, ambiguous, unavailable or superseded identity. */
+  assertNew(): void;
+}
+/** Provisioning only, before any binding or REQUIRED publication. Positive external
+ * single-writer exclusion is still mandatory: beforeRename is not OS no-replace CAS.
+ * A visible seal after unknown ACK is resolved by exact read/barriers, never overwrite. */
+export function initializeNewRecoverySession(request: NewRecoverySessionInitialization, io?: RecoveryIo): void {
+  if (!request || request.mode !== "NEW" || !nonempty(request.sessionId) || !nonempty(request.root) || typeof request.assertNew !== "function") {
+    return recoveryFail("RECOVERY_INVALID", "Explicit authoritative NEW initialization is required");
+  }
+  const store = { sessionId: request.sessionId, root: path.resolve(request.root) }, key = ledgerPath(store);
+  io = { deadlineMs: io?.deadlineMs ?? Date.now() + 10_000, ...(io?.signal ? { signal: io.signal } : {}) };
+  // Guard BEFORE invoking trusted reentrant authority/current callbacks.
+  const leave = enterCommitOwner(key);
+  try {
+    const assertUnbound = () => { if (bindings.has(store.sessionId)) recoveryFail("RECOVERY_CONFLICT", "Cannot initialize any bound session"); };
+    const assertAbsent = () => {
+      try { fs.lstatSync(key); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+      recoveryFail("RECOVERY_CONFLICT", "NEW initialization never overwrites any existing ledger entry");
+    };
+    const checkNew = () => {
+      checkIo(io); assertUnbound();
+      const returned: unknown = request.assertNew();
+      if (returned !== undefined) recoveryFail("RECOVERY_CONFLICT", "Authoritative NEW assertion must complete synchronously");
+      checkOwner(request.recovery); assertUnbound(); checkIo(io);
+      if (request.recovery.historyComplete !== true) recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "NEW seal requires complete native history");
+      requiredHistoryIo(() => {
+        for (const dir of [path.join(base(store.root), "receiver"), directory(store.root, "receiver", store.sessionId)]) {
+          let stat: fs.Stats;
+          try { stat = fs.lstatSync(dir); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+          if (!stat.isDirectory() || stat.isSymbolicLink()) recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "Legacy receiver namespace is not an unaliased directory");
+          if (dir === directory(store.root, "receiver", store.sessionId) && fs.readdirSync(dir).length !== 0) {
+            recoveryFail("RECOVERY_HISTORY_INCOMPLETE", "NEW seal cannot promote legacy receiver history");
+          }
+        }
+      });
+    };
+    assertUnbound(); checkIo(io); requireNamespaceBarrier(notDurable);
+    validateRecoveryOwner(request.recovery);
+    checkLedgerDirectories(store.root, true); assertAbsent(); checkNew();
+    checkLedgerDirectories(store.root, true); assertAbsent();
+    const payload = emptyLedger(store);
+    writeJsonAtomic(key, { version: 1, payload, sha256: hash(canonical(payload)) }, { durable: true, beforeRename: () => {
+      checkNew(); checkLedgerDirectories(store.root); assertAbsent();
+    } });
+    // Past file + complete namespace barriers: failure is unknown ACK, not absence.
+    checkNew(); checkLedgerDirectories(store.root); checkLedgerFile(key);
+  } finally { leave(); }
+}
 /** Internal shared short transaction used by maintenance-admission. No async callbacks:
  * every load/check/save is synchronous under the existing positively excluded writer.
  * Every operation rereads + barriers, so unknown ACK/rename visibility must reconcile
@@ -695,12 +793,10 @@ export function commitRecoverySession<T>(sessionId: string, change: (state: Reco
   io = { deadlineMs: io?.deadlineMs ?? Date.now() + 10_000, ...(io?.signal ? { signal: io.signal } : {}) };
   checkIo(io);
   const binding = bindings.get(sessionId);
-  const owner = recoveryOwner(sessionId);
-  if (!binding) return recoveryFail("RECOVERY_NOT_BOUND", "Missing bound session");
-  const key = ledgerPath(binding);
-  if (commitOwners.has(key)) return recoveryFail("RECOVERY_REVISION_CONFLICT", "Reentrant session commit owner");
-  commitOwners.add(key);
+  if (!binding?.recovery) return recoveryFail("RECOVERY_NOT_BOUND", "Missing REQUIRED bound session");
+  const key = ledgerPath(binding), leave = enterCommitOwner(key);
   try {
+    const owner = recoveryOwner(sessionId);
     const s = loadLedger(binding); checkIo(io); checkOwner(owner);
     const previous = canonical(s);
     const next = s.revision + 1;
@@ -711,12 +807,14 @@ export function commitRecoverySession<T>(sessionId: string, change: (state: Reco
     if (canonical(s) !== previous) {
       s.revision = next;
       requireNamespaceBarrier(notDurable);
-      writeJsonAtomic(key, { version: 1, payload: s, sha256: hash(canonical(s)) }, { durable: true });
+      const checkRetained = () => { checkOwner(owner); checkIo(io); checkLedgerDirectories(binding.root); checkLedgerFile(key); };
+      checkRetained();
+      writeJsonAtomic(key, { version: 1, payload: s, sha256: hash(canonical(s)) }, { durable: true, beforeRename: checkRetained });
       // A deadline/abort after the commit is unknown-ACK, not absence. A retry rereads it.
       checkOwner(owner); checkIo(io);
     }
     return output;
-  } finally { commitOwners.delete(key); }
+  } finally { leave(); }
 }
 export function readRecoverySession(sessionId: string, io?: RecoveryIo): RecoverySessionLedger {
   return commitRecoverySession(sessionId, state => snapshot(state), io);

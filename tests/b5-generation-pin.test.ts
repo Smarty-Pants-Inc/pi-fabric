@@ -249,7 +249,7 @@ describe.skipIf(process.platform === "win32")("B5 durable recovery generation pi
       await expect(admission.ensureRecoveryGeneration(f.sessionId, "original"), name).rejects.toMatchObject({ code: "RECOVERY_HISTORY_INCOMPLETE" });
       await expect(admission.admitContinuation(continuation), name).rejects.toMatchObject({ code: "RECOVERY_HISTORY_INCOMPLETE" });
       await expect(admission.recordRecoveryRepair(f.sessionId, repair), name).rejects.toMatchObject({ code: "RECOVERY_HISTORY_INCOMPLETE" });
-      expect(await f.maintenance.read({ sessionId: f.sessionId, requestId: "retry" }), name).toMatchObject({ ok: false, code: "RECOVERY_MAINTENANCE_UNCERTAIN" });
+      expect(await f.maintenance.read({ sessionId: f.sessionId, requestId: "retry" }), name).toMatchObject({ ok: false, code: "RECOVERY_HISTORY_INCOMPLETE" });
       expect(fs.readFileSync(f.ledgerFile, "utf8"), name).toBe(corrupted);
     }
     fs.writeFileSync(f.ledgerFile, bytes); expect(await admission.ensureRecoveryGeneration(f.sessionId, "original")).toBe(generation);

@@ -1,4 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { prepareScriptedInput } from "../../../src/recovery/input-admission.js";
 import type { EffectIntent, EffectOutcome, EffectSlot, JsonValue } from "../../../src/effects/contracts.js";
 import { canonicalEncode, manifestDigest, mintEffectKey } from "../../../src/effects/slots.js";
 import type { AcceptedRecoveryInput, B4EffectRecoveryProviderV1, B4RepairReceiptV1 } from "./contract.js";
@@ -8,13 +12,24 @@ export const INPUT = "original-input";
 /** Stand-in defaults only, never a B5 pin or an expected production identity. */
 export const GENERATION = `probe-generation:${randomUUID()}`;
 export const INPUT_LIFETIME_MS = 120_000;
-export function createAcceptedInput(now: () => number = Date.now): AcceptedRecoveryInput {
-  const admissionId = `probe-admission:${randomUUID()}`;
-  return {
-    sessionId: SESSION, originalInputId: INPUT, admissionId, deliveryId: admissionId,
-    kind: "initial", text: "original input", payloadSha256: createHash("sha256").update("original input").digest("hex"),
-    deadlineMs: now() + INPUT_LIFETIME_MS, consumption: { kind: "round" },
-  };
+/** Ask B5 itself for a sender's admission ID; never approximate its grammar/hash.
+ * This temporary sender outbox is not a retained receiver admission or a B5 pin. */
+export function scriptedAdmissionId(input: Pick<AcceptedRecoveryInput, "sessionId" | "originalInputId" | "text" | "deadlineMs">,
+  senderId: string): string {
+  const root = mkdtempSync(join(tmpdir(), "b4-contract-sender-"));
+  try {
+    return prepareScriptedInput({ root, from: { id: senderId, name: "Contract sender", kind: "main" },
+      targetId: `session:${input.sessionId}`, message: input.text, delivery: "followUp", triggerTurn: true,
+      data: { scriptedInput: { version: 1, inputId: input.originalInputId, sessionId: input.sessionId, deadlineAt: input.deadlineMs } },
+    }).idempotencyKey;
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
+export function createAcceptedInput(now: () => number = Date.now,
+  ids: { sessionId: string; originalInputId: string } = { sessionId: SESSION, originalInputId: INPUT }): AcceptedRecoveryInput {
+  const input = { ...ids, text: "original input", deadlineMs: now() + INPUT_LIFETIME_MS };
+  const admissionId = scriptedAdmissionId(input, `probe-sender:${randomUUID()}`);
+  return { ...input, admissionId, deliveryId: admissionId, kind: "initial",
+    payloadSha256: createHash("sha256").update(input.text).digest("hex"), consumption: { kind: "round" } };
 }
 export const accepted = createAcceptedInput();
 export const hash = (bytes: string | Uint8Array): string => createHash("sha256").update(bytes).digest("hex");
@@ -130,7 +145,12 @@ export type JoinedEntry = Readonly<{ id: string; [key: string]: unknown }>;
 export function joinedBranch(joinedLeafEntryId = "J", identity: FixtureIdentity = defaultIdentity): readonly JoinedEntry[] {
   // Deliberately non-sorted property order and UTF-8 content: exact Pi history bytes.
   const anchor = identity.executionBranchEntryId;
-  return [{ id: anchor, parentId: null, type: "message", message: { role: "user", content: identity.acceptedInput.text } },
+  // P cf3cf677: session-manager.ts:2579–2588 (entry order/ISO timestamp),
+  // agent-session.ts:5097–5101 (user text blocks/numeric message timestamp).
+  // Fixed probe time, not a claim of a native write or recovered timestamp.
+  const timestamp = "2026-10-29T00:00:00.000Z";
+  return [{ type: "message", id: anchor, parentId: null, timestamp,
+    message: { role: "user", content: [{ type: "text", text: identity.acceptedInput.text }], timestamp: Date.parse(timestamp) } },
     { id: joinedLeafEntryId, parentId: anchor, type: "message", message: { role: "assistant", content: "joined λ" } }];
 }
 export function joinedEvidence(settlements: B4RepairReceiptV1["settlements"], joinedLeafEntryId = "J",

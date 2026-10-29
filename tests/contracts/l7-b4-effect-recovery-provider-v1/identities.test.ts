@@ -8,9 +8,8 @@ import { createAcceptedInput } from "./fixtures.js";
 // native/B6 claim: this detects accidental coupling to the stand-in constants.
 describe("fake distinct harness identities / COMPONENT ONLY", () => runConformance(source => {
   const id = randomUUID();
-  const admissionId = `distinct-admission:${id}`;
-  const acceptedInput = { ...createAcceptedInput(), sessionId: `distinct-session:${id}`,
-    originalInputId: `distinct-original:${id}`, admissionId, deliveryId: admissionId };
+  const acceptedInput = createAcceptedInput(Date.now, { sessionId: `distinct-session:${id}`,
+    originalInputId: `distinct-original:${id}` });
   return createFake(source, { acceptedInput, executionBranchEntryId: `distinct-native-anchor:${id}`,
     pin: `distinct-generation:${id}` });
 }));

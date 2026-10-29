@@ -30,7 +30,11 @@ original, keyed by `(originalInputId, admissionId)`. It refuses an inconsistent
 pair, a consistent wrong pair (`admissionId = deliveryId = W` not retained for
 that original), and the right admission with a wrong delivery, each with
 `RECOVERY_CONFLICT` and no retained-state change; the valid input still repairs.
-Pair consistency alone is not admission authentication.
+W is the ID B5's `prepareScriptedInput(...).idempotencyKey` derives for a
+second sender of the same session/original input, text and deadline. Preparing
+that sender's outbox does not retain W in the receiver's admission record.
+Stand-in admissions also use B5's derivation; pair consistency, B5 grammar,
+namespace and length alone are not admission authentication.
 
 The default runs both. Real-provider failures remain ordinary failing tests,
 not skips or expected failures. The selected integration head does not yet
@@ -81,7 +85,8 @@ seeded intent is also checked against the harness observations. A native anchor
 need not equal the fake's default `"A"`. The shared repair cases check deliveryId == admissionId and observed settlement g == pin g,
 then retain all ref/view/hash/reopen/forgery/J2 assertions unconditionally.
 
-`createAcceptedInput(now)` captures a deadline 120 seconds after the harness clock;
+`createAcceptedInput(now, { sessionId, originalInputId })` derives the stand-in
+admission with B5 itself and captures a deadline 120 seconds after the harness clock;
 `FakeOptions.now` and `RealOptions.now` configure stand-in clocks. Reopen does not
 renew that deadline. Consumer P2 also checks a clock in 2031.
 `createReal(scenario, { recoveryIdentity })` accepts observations from real B5.
@@ -109,7 +114,13 @@ delivery, interruption and retained reopen, then the unmodified real B4 port.
 The verbose/JSON reporters retain per-case statuses, including ordinary REDs
 for the absent real repair methods. The 60-second runner budget does not extend
 the original-input deadline (120 seconds). Native owner/delivery are still
-`probe:native-Pi`; this is not native/B6 qualification. See round-5 `RESULT.md`
+`probe:native-Pi`; this is not native/B6 qualification. The user carrier uses Pi's
+native entry/message shape, including timestamps, and B5's delivery hash covers
+exactly its UTF-8 `JSON.stringify(entry) + "\n"` bytes (sequence 1). The source-fix
+branch/scan probe must use those same bytes and sequence; it must not manufacture
+new bytes to match a retained hash. Shape source: Pi `cf3cf677`,
+`packages/coding-agent/src/core/session-manager.ts:2579–2588` and
+`agent-session.ts:5097–5101`. See round-5 `RESULT.md`
 for the per-case comparison with v5 and the additional distinct-anchor proof.
 
 ## Consumer-owned identities (K9)
@@ -166,6 +177,14 @@ unchanged provider ABI `V1`:
   Round-6 `RESULT.md` records fake, prior mutants (including judge A1 under all
   four identity setups), and per-case real-B5 evidence on a scratch merge onto
   `dc1808ddb03fcf3fdfaf7d6059389e509efe6cd5`; no production changes or G2 claim.
+
+- v7b: B5-derived second-sender and stand-in admissions, plus native-shaped
+  user carrier (CoS carrier addendum), contract SHA-256
+  `3b6d45d79b48ed74f567a8028d9300caeaa12b89213f75a39bee8a37d7810447`.
+  Round-7 `RESULT.md` records mutant detection in fake and real-B5 identity
+  setups, the unchanged real-B5 failure map on `dc1808dd`, and the separate
+  scratch composition with B4 source fix `8c39803c`. No production change;
+  independent acceptance belongs to the CoS judge.
 
 The round-2 `PHASE1.md` (v2) and `RESULT.md` (v3), round-4 `RESULT.md` (v5),
 and round-5 `RESULT.md` (v6) record commit/hash and per-test evidence. CoS owns

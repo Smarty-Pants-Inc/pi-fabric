@@ -51,22 +51,29 @@ export const createRealB5: ConformanceFactory = async scenario => {
     expect(selected.deliveryId).toBe(selected.admissionId);
     expect(selected.deadlineMs).toBe(deadlineMs);
     const generation = await b5.ensureRecoveryGeneration(SESSION, selected.originalInputId);
-    await b5.commitRecoveryInputDelivery(selected, { entryId: "A", executionBranchEntryId: "A", seq: 1,
-      bytesSha256: hash(JSON.stringify(joinedBranch()[0]) + "\n") });
+    const deliveredIdentity = { acceptedInput: {
+      sessionId: selected.sessionId, originalInputId: selected.originalInputId, admissionId: selected.admissionId,
+      deliveryId: selected.deliveryId, text: selected.text, deadlineMs: selected.deadlineMs,
+      payloadSha256: hash(selected.text), kind: "initial" as const, consumption: { kind: "round" as const },
+    }, executionBranchEntryId: "A" };
+    // Use the same native-shaped carrier as the branch/scan probe, in native
+    // property order with exactly one LF; B5 retains the hash of these bytes.
+    const carrier = joinedBranch("J", deliveredIdentity)[0]!;
+    const rawCarrier = Buffer.from(JSON.stringify(carrier) + "\n", "utf8");
+    await b5.commitRecoveryInputDelivery(selected, { entryId: carrier.id, executionBranchEntryId: deliveredIdentity.executionBranchEntryId,
+      seq: 1, bytesSha256: hash(rawCarrier) });
     const outcome = await b5.recordInputOutcome({ sessionId: SESSION, originalInputId: INPUT, requestId: "joined-interruption",
       kind: "lifecycle-interrupt", at: now(), bootId: recovery.bootId, deadlineMs: Math.min(deadlineMs, now() + 10_000) });
     if (!outcome.durable) throw new Error(outcome.reason);
     await b5.releaseRecoveryInputAfterJoin(selected, Promise.resolve(), async () => {});
     const retained = b5.readRecoverySession(SESSION);
     const original = retained.inputs.find(input => input.admissionId === selected.admissionId)!;
-    expect(original.delivery).toBeDefined();
+    expect(original.delivery).toMatchObject({ entryId: carrier.id, executionBranchEntryId: deliveredIdentity.executionBranchEntryId,
+      seq: 1, bytesSha256: hash(rawCarrier) });
     expect(retained.recoveryGenerationPins).toContainEqual({ originalInputId: selected.originalInputId,
       admissionId: selected.admissionId, recoveryGeneration: generation });
-    identity = immutable({ acceptedInput: {
-      sessionId: selected.sessionId, originalInputId: selected.originalInputId, admissionId: selected.admissionId,
-      deliveryId: selected.deliveryId, text: selected.text, deadlineMs: selected.deadlineMs,
-      payloadSha256: hash(selected.text), kind: "initial", consumption: { kind: "round" },
-    }, executionBranchEntryId: original.delivery!.executionBranchEntryId, recoveryGeneration: generation });
+    identity = immutable({ ...deliveredIdentity,
+      executionBranchEntryId: original.delivery!.executionBranchEntryId, recoveryGeneration: generation });
     // No B4 wrappers or fake repair implementations. Only fixture accessors change.
     h = await createReal(scenario, { recoveryIdentity: () => identity });
     const reopen = h.reopen.bind(h);

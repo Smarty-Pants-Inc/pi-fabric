@@ -111,6 +111,9 @@ const denyHeldReplacement = (file: string, held: number, code?: "EPERM" | "EBUSY
   });
   // Count-bounded denial, without a 700ms real sleep or a raised work budget.
   const sleep = code === undefined ? undefined : vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
+  // Injected sharing denial asserts the fixed retry count, not elapsed work.
+  // Native denial and the separate deadline tests keep their real/driven clocks.
+  const clock = code === undefined || vi.isMockFunction(performance.now) ? undefined : vi.spyOn(performance, "now").mockReturnValue(0);
   try {
     const outcome = compactTerminalRunLog(file, "completed");
     expect(outcome).toMatchObject({ compacted: 0, beforeBytes: original.length, afterBytes: original.length });
@@ -121,7 +124,7 @@ const denyHeldReplacement = (file: string, held: number, code?: "EPERM" | "EBUSY
       // Native Windows sharing denial may exhaust the real 500ms deadline.
       expect(outcome.error ?? outcome.compactionSkipped).toMatch(/EPERM|EBUSY|EACCES|MAX_TERMINAL_LOG_WORK_MS=.*full log retained/);
     }
-  } finally { rename?.mockRestore(); sleep?.mockRestore(); }
+  } finally { rename?.mockRestore(); sleep?.mockRestore(); clock?.mockRestore(); }
   expect(fs.readFileSync(file).equals(original)).toBe(true);
   expect(fs.statSync(file, { bigint: true }).ino).toBe(identity.ino);
   expect(fs.readdirSync(path.dirname(file))).toEqual(["events.jsonl", "events.jsonl.original"]);
@@ -388,7 +391,7 @@ describe("worker run log", () => {
     });
     const syncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => { fsync(fd); synced.push(fd); });
     const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-      expect(synced).toHaveLength(2);
+      expect(synced).toHaveLength(process.platform === "win32" ? 2 : 3);
       expect(owned.size).toBe(0);
       rename(from, to);
     });
@@ -507,7 +510,7 @@ describe("worker run log", () => {
       expect(sourceFlags & (fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_APPEND)).toBe(0);
       const noFollow = fs.constants.O_NOFOLLOW ?? 0;
       expect(sourceFlags & noFollow).toBe(noFollow);
-      expect(synced).toHaveLength(2);
+      expect(synced).toHaveLength(process.platform === "win32" ? 2 : 3);
       expect(synced[0]).toBe(source);
       expect(writes.mock.calls.every(([fd]) => fd !== source)).toBe(true);
     } finally { openSpy.mockRestore(); syncSpy.mockRestore(); writes.mockRestore(); }

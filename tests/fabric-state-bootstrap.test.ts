@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -432,6 +433,47 @@ describe("FabricState lazy bootstrap", () => {
     }));
     expect(actorState.shouldEagerlyActivate(actorContext)).toBe(true);
     vi.unstubAllEnvs();
+  });
+
+  it("does not load the registry reader for an all-inline registry, but does for a sidecar candidate", async () => {
+    // Decision C: keep this real filesystem admission test because inline startup must retain its synchronous fast path.
+    // E2E (real entry scenario): extension session_start -> bootstrap -> shouldEagerlyActivate -> sidecar reader admission.
+    // Owner: fabric-store. Pass condition: the inline result is synchronous with no reader load, while a later sidecar uses the shared reader.
+    const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: true } });
+    const meshRoot = path.join(cwd, "mesh");
+    const actorRoot = path.join(meshRoot, "actors");
+    const registryPath = path.join(actorRoot, "actors.json");
+    const inline = { id: "a".repeat(32), name: "inline", instructions: "Review changes", createdAt: Date.now() };
+    const sidecarText = "Review sidecar changes";
+    const sidecar = {
+      id: "b".repeat(32), name: "sidecar", instructionsFile: createHash("sha256").update(sidecarText).digest("hex"),
+      createdAt: Date.now(),
+    };
+    fs.mkdirSync(path.join(actorRoot, sidecar.id, "registry"), { recursive: true });
+    fs.writeFileSync(path.join(actorRoot, sidecar.id, "registry", `instructions-${sidecar.instructionsFile}.txt`), sidecarText);
+    fs.mkdirSync(actorRoot, { recursive: true });
+    fs.writeFileSync(registryPath, JSON.stringify({ actors: [inline] }));
+    const readerFactory = vi.fn(async () => vi.importActual<typeof import("../src/actors/registry-payloads.js")>("../src/actors/registry-payloads.js"));
+    vi.doMock("../src/actors/registry-payloads.js", readerFactory);
+    const state = createState(runtimeHarness().loader);
+    const context = contextAt(cwd);
+    vi.stubEnv("PI_FABRIC_MESH_ROOT", meshRoot);
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    try {
+      await state.bootstrap(context);
+      expect(state.shouldEagerlyActivate(context)).toBe(true);
+      expect(readerFactory).not.toHaveBeenCalled();
+
+      fs.writeFileSync(registryPath, JSON.stringify({ actors: [sidecar] }));
+      expect(await state.shouldEagerlyActivate(context)).toBe(true);
+      expect(readerFactory).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.doUnmock("../src/actors/registry-payloads.js");
+      await state.shutdown();
+      vi.unstubAllEnvs();
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("re-arms a published Main only in its cwd, not an unrelated damaged-config session on the same mesh", async () => {

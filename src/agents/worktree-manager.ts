@@ -10,6 +10,12 @@ import { executeFile } from "./transports/process-utils.js";
 import { fabricWorktreePath } from "./worktree-paths.js";
 
 export interface CleanupRootCustody { source: string; destination: string; receipt: string; }
+export interface CleanupRootMoveGuard {
+  /** Identity that the caller judged, when the move follows a reference/inode check. */
+  expected?: { dev: number; ino: number; mtimeMs?: number };
+  /** Re-run caller-owned exit/reference/content checks immediately before the rename. */
+  beforeRename?: () => void;
+}
 
 /** A verified shadow is NOT whole-object custody or permission to consume results. */
 export interface CleanupCustodyDeferredStatus extends CleanupRootCustody {
@@ -358,11 +364,16 @@ const takeCleanupContainer = (batch: PreparedCleanupContainers, source: string, 
 /** Whole-object rename when possible; a verified EXDEV shadow always defers cleanup. */
 export const retainCleanupRoot = (
   source: string, archive: string, id: string, reason = "agent cleanup whole-root custody", batch?: PreparedCleanupContainers,
+  guard: CleanupRootMoveGuard = {},
 ): CleanupRootCustody | undefined => {
   const sourceKey = path.resolve(source), priorFailure = cleanupRootFailures.get(sourceKey);
   if (priorFailure) throw priorFailure;
   const sourceStat = fs.lstatSync(source, { throwIfNoEntry: false });
   if (!sourceStat) return undefined;
+  if (guard.expected && (sourceStat.dev !== guard.expected.dev || sourceStat.ino !== guard.expected.ino ||
+      guard.expected.mtimeMs !== undefined && sourceStat.mtimeMs !== guard.expected.mtimeMs)) {
+    throw new Error(`Cleanup root changed since judgment: ${source}`);
+  }
   // Extract link bytes without resolving the referent (live, dangling or denied).
   const rootLink = sourceStat.isSymbolicLink() ? fs.readlinkSync(source, { encoding: "buffer" }) : undefined;
   const sameRoot = (file: string): boolean => {
@@ -414,8 +425,12 @@ export const retainCleanupRoot = (
   try {
     // Revalidate created ancestors too; preflight metadata can become stale.
     archiveDevice(container);
-    // Preparation may race a replacement. Never intentionally capture it.
+    // Preparation may race a replacement. Never intentionally capture it. The
+    // caller's final reference/exit/content check runs after durable preparation
+    // and immediately before the inode recheck and single rename.
     if (!sameRoot(source)) throw new Error(`Cleanup root changed before rename: ${source}`);
+    guard.beforeRename?.();
+    if (!sameRoot(source)) throw new Error(`Cleanup root changed before guarded rename: ${source}`);
     // A fresh container's never-used child cannot clobber earlier custody.
     fs.renameSync(source, move.destination);
   } catch (error) {

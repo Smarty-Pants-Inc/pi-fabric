@@ -19,14 +19,11 @@ export function followUpState(file: string): FollowUpDeliveryState {
   return "settling";
 }
 
-/** The delivery envelope is disposable only after a final receipt. Admissions
- * and receipts remain as the cancellation/replay fence for this run. */
+/** A final receipt permits delivery-state cleanup, never prompt-byte deletion.
+ * Keep the original payload beside its admission so whole-run custody can retain it. */
 export function releaseFollowUpPayload(file: string): void {
   const state = followUpState(file);
   if (state !== "delivered" && state !== "cancelled") return;
-  const payload = path.join(path.dirname(path.dirname(file)), "deliveries", path.basename(file));
-  try { fs.unlinkSync(payload); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 }
 /** A per-message transport identity, stripped before provider context consumption.
  * Text equality is not an identity: two identical follow-ups must settle separately. */

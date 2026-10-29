@@ -152,6 +152,7 @@ import type { BudgetLedgerDetail } from "./budget-ledger.js";
 import type { BudgetLedgerState } from "./budget-ledger.js";
 import { readJsonlPage } from "../log-tail.js";
 import { ownedStat, processAlive } from "../storage/scratch.js";
+import { retainPriorAttemptFile } from "../storage/retain-prior-attempt.js";
 import {
   canRemoveManagedRunRoot,
   canRemoveTerminalRun,
@@ -3588,7 +3589,10 @@ export class AgentManager {
         }
         // smarty-dev#15878: a confirmed non-launch never used its short TMPDIR; an unknown launch keeps it above.
         if (shortTmpdir && !this.#runs.has(id) && !runTreeResourceVeto(runDirectory, 0, undefined, true, fs.existsSync(path.join(runDirectory, "status.json"))) &&
-          ownedShortTmpdir(shortTmpdir)) await removeTree(shortTmpdir).catch(() => undefined);
+          ownedShortTmpdir(shortTmpdir)) {
+          try { retainCleanupRoot(shortTmpdir, `${this.#runRoot}.trace-archive`, id, "confirmed prelaunch private TMPDIR custody"); }
+          catch { /* Failure keeps the original scratch tree. */ }
+        }
         throw error;
       }
     };
@@ -3983,8 +3987,13 @@ export class AgentManager {
           writeJsonAtomic(path.join(directory, "status.json"), { id: queued.info.id, status: queued.terminal.status, queuedArchiveCommitted: true,
             startedAt: queued.terminal.startedAt, updatedAt: queued.terminal.updatedAt, finishedAt: queued.terminal.finishedAt }, { durable: true });
           try {
-            fs.rmSync(path.join(directory, "queued-result.json"), { force: true });
-            fs.rmSync(directory, { recursive: true, force: true });
+            retainCleanupRoot(directory, `${this.#runRoot}.trace-archive`, queued.info.id, "queued prelaunch rollback custody", undefined, {
+              beforeRename: () => {
+                const persistedExit = fs.existsSync(path.join(directory, "status.json"));
+                const veto = runTreeExitVeto(directory, 0, undefined, persistedExit);
+                if (veto) throw new Error(`Queued run became unsafe before custody move: ${veto}`);
+              },
+            });
           } catch { /* Its committed terminal state is collectible later. */ }
         }
         queued.outcomeSaved = true;
@@ -5040,7 +5049,13 @@ export class AgentManager {
     const archive = `${this.#runRoot}.trace-archive`;
     if (!custody.runRetained) {
       try {
-        const moved = retainCleanupRoot(runDirectory, archive, id, "agent cleanup run directory", batch);
+        const moved = retainCleanupRoot(runDirectory, archive, id, "agent cleanup run directory", batch, {
+          beforeRename: () => {
+            const persistedExit = fs.existsSync(path.join(runDirectory, "status.json"));
+            const veto = runTreeExitVeto(runDirectory, 0, undefined, persistedExit);
+            if (veto) throw new Error(`Run became unsafe before custody move: ${veto}`);
+          },
+        });
         if (moved) custody.run = moved;
         custody.runRetained = true;
         if (custody.run && this.#cleanupDeferred.get(id)?.source === runDirectory) this.#cleanupDeferred.delete(id);
@@ -6023,7 +6038,7 @@ export class AgentManager {
             const directory = path.join(this.#runRoot, result.id);
             this.#commitArchive(directory, result, "shutdown");
             if (this.#queued.has(result.id) && !this.#queued.get(result.id)?.routeSaveFailure &&
-                !fs.existsSync(path.join(directory, "status.json")) && !runTreeExitVeto(directory)) fs.rmSync(directory, { recursive: true, force: true });
+                !fs.existsSync(path.join(directory, "status.json")) && !runTreeExitVeto(directory)) await this.#removeRunTree(directory, result.id);
           }
           break;
         }
@@ -6793,7 +6808,7 @@ export class AgentManager {
       // already accepted before PREPARE may finish without deleting new output.
       managed.lifecycleOffset = 0;
       managed.lifecycleRemainder = Buffer.alloc(0);
-      fs.rmSync(managed.lifecycleFile, { force: true });
+      retainPriorAttemptFile(managed.lifecycleFile);
       if (cancelled()) return false;
       if (this.#meshTransport?.transport === "nats") {
         presenceAttempted = true;
@@ -7577,10 +7592,7 @@ export class AgentManager {
           if (timer) clearTimeout(timer);
           if (!joined) return;
           await this.#noteUnconfirmedExit(managed);
-          if (managed.transport === transport && !managed.lostContact) {
-            fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
-            release();
-          }
+          if (managed.transport === transport && !managed.lostContact) release();
         }).catch(error => {
           if (managed.transport === transport) {
             // Eligibility is not proof. #markLost scans the same host PID/birth
@@ -7600,13 +7612,7 @@ export class AgentManager {
     managed.questions?.abort(new Error("Agent run settled"));
     delete managed.taskCustodyIndex;
     managed.hosted?.close();
-    // Images are transport inputs, not retained run artifacts. Startup retries
-    // have finished by settlement, so remove the owner-only handoff file for
-    // every terminal outcome even when retainRuns keeps the rest of the run.
-    if (managed.executionExited || (!managed.finalAnswer && managed.actorId && process.platform === "win32" &&
-        managed.transport.waitForClose && !managed.launchCancelled && !managed.transport.lostContact?.() && !managed.lostContact)) {
-      fs.rmSync(path.join(managed.runDirectory, "images.json"), { force: true });
-    }
+    // images.json is prompt input, so it remains with the run until whole-root custody.
     this.#emitLifecycle(managed, `run.${result.status}`, result.finishedAt ?? Date.now(), {
       status: result.status,
       data: {

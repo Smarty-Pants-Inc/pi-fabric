@@ -250,10 +250,8 @@ describe("AgentManager real durable parent worker", () => {
     expect(result.value).toEqual({ reply: "image probe", images: 1 });
     const directory = manager.runDirectory(result.id)!;
     const first = JSON.parse(fs.readFileSync(path.join(directory, "status.json"), "utf8")) as AgentRunRecord;
-    // Manager removes sensitive input images when consuming the first result.
-    // On Windows it removes <run>/images.json again after the first worker's
-    // native close, which may follow this result; stage the replay copy outside
-    // the manager-owned run directory so that cleanup cannot race the restart.
+    // Prompt inputs remain byte-for-byte in the run tree for later whole-root custody.
+    expect(fs.readFileSync(path.join(directory, "images.json"), "utf8")).toBe(JSON.stringify(images));
     const replayImages = path.join(cwd, "replay-images.json");
     fs.writeFileSync(replayImages, JSON.stringify(images));
     const replay = await restart(directory, first, { "schema-file": path.join(directory, "schema.json"), "images-file": replayImages, tools: "[]" });

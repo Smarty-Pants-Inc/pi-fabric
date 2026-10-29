@@ -84,42 +84,47 @@ const armSwap = async (target: string, swap: Swap): Promise<() => Record<string,
   return () => ({ target: shape(target), outside: shape(outside) });
 };
 
-interface Fixture { target: string; act: () => unknown }
+interface Fixture { target: string; act: () => unknown; runRoot?: string; custodyArchive?: string; preserveTree?: boolean }
 const FIXTURES: Record<string, () => Fixture> = {
   pruneActorRunArchives: () => {
     const runs = tmp("fabric-vr-archives-");
-    const target = run(path.join(runs, "old"));
-    return { target, act: () => pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW }) };
+    const runRoot = path.join(runs, "old");
+    const target = run(runRoot);
+    return { target, runRoot, custodyArchive: `${runs}.trace-archive`, act: () => pruneActorRunArchives({ runsDirectory: runs, retentionMs: DAY, now: NOW }) };
   },
   sweepResidentRuns: () => {
     const residency = tmp("fabric-vr-resident-");
-    const target = old(run(path.join(residency, "runs", "old")));
-    return { target, act: () => sweepResidentRuns(path.join(residency, "runs"), NOW, 10_000, { retentionMs: DAY }) };
+    const runs = path.join(residency, "runs");
+    const runRoot = path.join(runs, "old");
+    const target = old(run(runRoot));
+    return { target, runRoot, custodyArchive: `${runs}.trace-archive`, act: () => sweepResidentRuns(runs, NOW, 10_000, { retentionMs: DAY }) };
+  },
+  compactTerminalRunEvents: () => {
+    const directory = run(path.join(tmp("fabric-vr-compact-"), "old"));
+    const target = path.join(directory, "events.jsonl");
+    return { target, runRoot: directory, preserveTree: true, act: () => compactTerminalRunEvents(directory, { now: NOW, terminalRunEventsMaxBytes: 1024 }) };
   },
   "pruneClosedRunRoot (sweepTempRunRoots)": () => {
     const tempRoot = tmp("fabric-vr-closed-");
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "closed");
-    const target = run(path.join(root, "old"));
+    const runRoot = path.join(root, "old");
+    const target = run(runRoot);
     write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }));
-    return { target, act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
+    return { target, runRoot, custodyArchive: `${root}.trace-archive`, act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
   },
   "sweepTempRunRoots (orphaned root)": () => {
     const tempRoot = tmp("fabric-vr-orphan-");
     const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "orphan");
-    const target = run(path.join(root, "old"));
+    const runRoot = path.join(root, "old");
+    const target = run(runRoot);
     write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
-    return { target, act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
+    return { target, runRoot, custodyArchive: `${root}.trace-archive`, act: () => sweepTempRunRoots({ tempRoot, now: NOW + 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
   },
   removeEmptyRunRoot: () => {
     const tempRoot = tmp("fabric-vr-empty-");
     const target = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "empty");
     write(path.join(target, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, closedAt: 1 }));
     return { target, act: () => removeEmptyRunRoot(target) };
-  },
-  compactTerminalRunEvents: () => {
-    const directory = run(path.join(tmp("fabric-vr-compact-"), "old"));
-    const target = path.join(directory, "events.jsonl");
-    return { target, act: () => compactTerminalRunEvents(directory, { now: NOW, terminalRunEventsMaxBytes: 1024 }) };
   },
   // smarty-dev#16444: pruneActorSessionBackups is no longer a deleter (it moves older backups into session-archive/,
   // tests/actor-session-trace-archive.test.ts), so it left this deletion matrix.
@@ -138,6 +143,16 @@ const FIXTURES: Record<string, () => Fixture> = {
     return { target, act: () => claimMeshRetentionSweep(meshRoot, hour, 12 * hour) };
   },
 };
+const custodyTree = (archive: string, source: string): string | undefined => {
+  if (!fs.existsSync(archive)) return undefined;
+  for (const name of fs.readdirSync(archive)) {
+    try {
+      const receipt = JSON.parse(fs.readFileSync(path.join(archive, name, "custody.json"), "utf8"));
+      if (receipt.source === source && receipt.state === "moved") return receipt.destination;
+    } catch { /* not a published moved receipt */ }
+  }
+  return undefined;
+};
 // The public mesh pass is not in FIXTURES: its apply rejects at the boundary until smarty-dev#10678 (pi-fabric#1014 SEC
 // P2-1), so no helper seam can fire through it. The deleter it calls (pruneActorRunArchives) keeps the swap matrix above.
 const meshPass = () => {
@@ -154,27 +169,48 @@ const meshPass = () => {
 
 describe.skipIf(process.platform !== "linux")("verified removal: every routed retention deleter (smarty-dev#7916)", () => {
   it.each(Object.keys(FIXTURES))("%s removes its expired target when nothing changes (control)", async name => {
-    const { target, act } = FIXTURES[name]!();
-    await act();
-    expect(fs.existsSync(target) && name !== "compactTerminalRunEvents").toBe(false);
-    if (name === "compactTerminalRunEvents") expect(fs.statSync(target).size).toBeLessThan(LOG.length);
+    const fixture = FIXTURES[name]!();
+    const before = fixture.runRoot ? shape(fixture.runRoot) : undefined;
+    await fixture.act();
+    if (fixture.preserveTree) expect(shape(fixture.runRoot!)).toEqual(before);
+    else if (fixture.runRoot && fixture.custodyArchive) {
+      expect(fs.existsSync(fixture.target)).toBe(false);
+      const held = custodyTree(fixture.custodyArchive, fixture.runRoot);
+      expect(held).toBeDefined();
+      expect(shape(held!)).toEqual(before);
+    } else expect(fs.existsSync(fixture.target)).toBe(false);
   });
 
   const cases = Object.keys(FIXTURES).flatMap(name => SWAPS.map(swap => [name, swap] as const));
   it.each(cases)("%s deletes nothing after a swap to a %s between judgment and delete", async (name, swap) => {
-    const { target, act } = FIXTURES[name]!();
-    const observe = await armSwap(target, swap);
-    await act();
+    const fixture = FIXTURES[name]!();
+    const before = fixture.runRoot ? shape(fixture.runRoot) : undefined;
+    const observe = await armSwap(fixture.target, swap);
+    await fixture.act();
     const after = observe();
     for (const restore of restores.splice(0).reverse()) restore();
-    // The swapped-in object is still at the path, and the judged original (if moved away by the swap) is intact.
+    if (name === "compactTerminalRunEvents") {
+      expect(after.target).toBe(LOG);
+      expect(after.outside).toEqual({});
+      return;
+    }
+    if (fixture.runRoot && fixture.custodyArchive) {
+      // Raw-run deleters now atomically move the full root; replacement races at
+      // that boundary are covered by retention-runroot-swaps.test.ts.
+      expect(after.target, `${name} / ${swap}: source trace`).toBeNull();
+      expect(after.outside, `${name} / ${swap}: no unrequested swap`).toEqual({});
+      const held = custodyTree(fixture.custodyArchive, fixture.runRoot);
+      expect(held).toBeDefined();
+      expect(shape(held!)).toEqual(before);
+      return;
+    }
+    // Non-run deleters still use verified removal and must leave swapped-in objects intact.
     expect(after.target, `${name} / ${swap}: target path`).not.toBeNull();
     if (swap === "symlink") expect(after.target).toEqual(["link", path.join(path.dirname(String((after.target as string[])[1])), "moved")]);
     if (swap === "symlink" || swap === "replaced inode") {
       const outside = after.outside as Record<string, unknown>;
       expect(Object.values(outside).every(value => value !== null), `${name} / ${swap}: moved original`).toBe(true);
     }
-    if (name === "compactTerminalRunEvents" && swap !== "symlink") expect(fs.readFileSync(target, "utf8")).toBe(LOG);
   });
 
   it.each(Object.keys(FIXTURES))("%s deletes nothing without getuid", async name => {

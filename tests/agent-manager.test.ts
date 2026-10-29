@@ -436,9 +436,14 @@ describe("Agent prompt retention (#11663)", () => {
         oneShotRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs };
       expect(retentionStorage.sweepTempRunRoots({ ...options, now: result.finishedAt! + options.oneShotRunRetentionMs - 1 }).removedRuns).toEqual([]);
       expect(removals).toEqual([]);
+      expect(custodyMoves.filter(move => move.source === run)).toEqual([]);
       expect(retentionStorage.sweepTempRunRoots({ ...options, now: result.finishedAt! + options.oneShotRunRetentionMs + 1 }).removedRuns).toEqual([run]);
-      expect(removals).toContain(run);
-      expect(rawInventory(run)).toEqual(before); // Recorded collection intent is NOT native deletion/custody.
+      expect(removals).not.toContain(run); // Only the empty root/marker may enter a deleter.
+      const move = custodyMoves.find(move => move.source === run)!;
+      expect(move).toBeDefined();
+      expect(JSON.parse(fs.readFileSync(move.receipt, "utf8"))).toMatchObject({ source: run, state: "moved", reason: "temp run retention whole-root custody" });
+      expect(rawInventory(move.destination)).toEqual(before);
+      expect(fs.existsSync(run)).toBe(false);
     } finally { remove.mockRestore(); }
   });
 });
@@ -898,10 +903,30 @@ describe("AgentManager", () => {
       const control = await manager.run({ task: "empty expiry control", transport: "process" });
       const controlRun = manager.runDirectory(control.id)!;
       fs.mkdirSync(path.join(controlRun, "deliveries"));
+      const child = path.join(controlRun, "nested", "trace-child");
+      fs.mkdirSync(child, { recursive: true });
+      const traceBytes = new Map<string, Buffer>([
+        ["events.jsonl", Buffer.from('{"raw":"events-π"}\n')],
+        ["session.jsonl", Buffer.from('{"raw":"session-λ"}\n')],
+        ["steer.jsonl", Buffer.from('{"raw":"steer-δ"}\n')],
+        ["nested/trace-child/events.jsonl", Buffer.from('{"raw":"nested-events"}\n')],
+        ["nested/trace-child/session.jsonl", Buffer.from('{"raw":"nested-session"}\n')],
+      ]);
+      for (const [name, bytes] of traceBytes) {
+        const file = path.join(controlRun, name);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, bytes);
+      }
+      fs.writeFileSync(path.join(child, "status.json"), JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647", exitCode: 0 }));
       expect(sweep).toBeTypeOf("function");
       clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2_000);
       sweep!();
       await vi.waitFor(() => expect(fs.existsSync(controlRun)).toBe(false), { timeout: 2_000 });
+      const move = custodyMoves.find(item => item.source === controlRun);
+      expect(move).toBeDefined();
+      const receipt = JSON.parse(fs.readFileSync(move!.receipt, "utf8"));
+      expect(receipt).toMatchObject({ source: controlRun, destination: move!.destination, state: "moved" });
+      for (const [name, bytes] of traceBytes) expect(fs.readFileSync(path.join(move!.destination, name))).toEqual(bytes);
       expect(fs.existsSync(run), contents).toBe(contents !== "empty");
       if (contents !== "empty") {
         expect(manager.runDirectory(result.id)).toBe(run);
@@ -1881,9 +1906,12 @@ describe("AgentManager", () => {
 
     expect(result.status).toBe("completed");
     expect(result.text).toBe("startup retry recovered");
-    expect(
-      fs.readFileSync(path.join(manager.runDirectory(result.id)!, "startup-attempts"), "utf8"),
-    ).toBe("2");
+    const directory = manager.runDirectory(result.id)!;
+    expect(fs.readFileSync(path.join(directory, "startup-attempts"), "utf8")).toBe("2");
+    const previous = fs.readdirSync(directory).filter(name => /^lifecycle\.jsonl\.prior-[0-9a-f-]{36}$/.test(name));
+    expect(previous).toHaveLength(1);
+    expect(fs.readFileSync(path.join(directory, previous[0]!), "utf8")).toContain('"fixtureAttempt":1');
+    expect(fs.readFileSync(path.join(directory, "lifecycle.jsonl"), "utf8")).toContain('"fixtureAttempt":2');
   });
 
   it.skipIf(process.platform === "win32")("3238 pins the first Pi artifact across a startup retry when its launcher symlink moves", async () => {
@@ -3651,7 +3679,9 @@ describe("AgentManager multimodal prompts", () => {
         message: "Inspect the attached image",
         images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
       });
-      expect(fs.existsSync(path.join(manager.runDirectory(result.id)!, "images.json"))).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "images.json"), "utf8"))).toEqual([
+        { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+      ]);
     } finally {
       delete process.env.FAKE_PI_BEHAVIOR;
       delete process.env.FAKE_PI_PROMPT_LOG;

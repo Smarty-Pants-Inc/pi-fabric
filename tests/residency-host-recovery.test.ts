@@ -48,8 +48,7 @@ describe("resident recovery startup and lease fence (#3864)", () => {
       await vi.waitFor(() => expect(fs.existsSync(path.join(run, "archive-pending.json"))).toBe(false));
       expect(JSON.parse(fs.readFileSync(store.resultFile(id), "utf8"))).toMatchObject(result);
       expect(store.pending()).toHaveLength(1);
-      if (live) expect(fs.readFileSync(path.join(run, "events.jsonl"), "utf8")).toBe(events);
-      else await vi.waitFor(() => expect(fs.readFileSync(path.join(run, "events.jsonl"), "utf8").trim().split("\n")).toHaveLength(201));
+      expect(fs.readFileSync(path.join(run, "events.jsonl"), "utf8")).toBe(events);
     } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 

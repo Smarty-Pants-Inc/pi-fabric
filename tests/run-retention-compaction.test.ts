@@ -23,25 +23,18 @@ const snapshot = (run: string) => fs.readdirSync(run).sort().map(name => {
 });
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
-describe("six-hour terminal run compaction", () => {
-  it("atomically keeps the final 200 events at six hours even below the byte cap, with status/result and TTL unchanged", () => {
+describe("immutable terminal run traces", () => {
+  it("keeps the complete raw event log until whole-tree archival, with status/result and TTL unchanged", () => {
     const { root, run } = make();
     fs.utimesSync(run, 4 * HOUR / 1000, 4 * HOUR / 1000);
-    const directoryMtime = fs.statSync(run).mtimeMs;
     const status = fs.readFileSync(path.join(run, "status.json"), "utf8");
-    const inode = fs.statSync(path.join(run, "events.jsonl")).ino;
-    expect(compactTerminalRunEvents(run, { now: now - 1 })).toBe(false);
-    expect(compactTerminalRunEvents(run, { now })).toBe(true);
-    const lines = fs.readFileSync(path.join(run, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-    expect(lines[0]).toMatchObject({ fabricTruncated: true });
-    expect(lines.slice(1)).toEqual(Array.from({ length: 200 }, (_, i) => ({ sequence: i + 201 })));
-    expect(fs.statSync(path.join(run, "events.jsonl")).ino).not.toBe(inode);
-    expect(fs.statSync(run).mtimeMs).toBe(directoryMtime);
-    expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(status);
-    expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"retained result"}');
     const before = snapshot(run);
+    expect(compactTerminalRunEvents(run, { now: now - 1 })).toBe(false);
     expect(compactTerminalRunEvents(run, { now })).toBe(false);
     expect(snapshot(run)).toEqual(before);
+    expect(fs.readFileSync(path.join(run, "events.jsonl"), "utf8")).toBe(log);
+    expect(fs.readFileSync(path.join(run, "status.json"), "utf8")).toBe(status);
+    expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"retained result"}');
     expect(pruneActorRunArchives({ runsDirectory: path.join(root, "runs"), retentionMs: 7 * 24 * HOUR, now })).toEqual([]);
     expect(pruneActorRunArchives({ runsDirectory: path.join(root, "runs"), retentionMs: 7 * 24 * HOUR, now: 4 * HOUR + 7 * 24 * HOUR })).toEqual([run]);
   });
@@ -67,24 +60,20 @@ describe("six-hour terminal run compaction", () => {
     expect(changes).toEqual([]);
   });
 
-  it("compacts exactly 201 events even when bytes fit, then is idempotent", () => {
+  it("keeps 201 raw events byte-identical even when an old cap would compact them", () => {
     const { run } = make();
     const file = path.join(run, "events.jsonl");
     const events = Array.from({ length: 201 }, (_, sequence) => JSON.stringify({ sequence }) + "\n");
     fs.writeFileSync(file, events.join(""));
     const before = snapshot(run);
-    expect(compactTerminalRunEvents(run, { now, dryRun: true })).toBe(true);
+    expect(compactTerminalRunEvents(run, { now, dryRun: true })).toBe(false);
     expect(snapshot(run)).toEqual(before);
-    expect(compactTerminalRunEvents(run, { now })).toBe(true);
-    const lines = fs.readFileSync(file, "utf8").trim().split("\n");
-    expect(JSON.parse(lines[0]!)).toMatchObject({ fabricTruncated: true });
-    expect(lines.slice(1).join("\n") + "\n").toBe(events.slice(1).join(""));
-    const after = snapshot(run);
     expect(compactTerminalRunEvents(run, { now })).toBe(false);
-    expect(snapshot(run)).toEqual(after);
+    expect(fs.readFileSync(file, "utf8")).toBe(events.join(""));
+    expect(snapshot(run)).toEqual(before);
   });
 
-  it("also compacts a closed managed one-shot root before its unchanged deletion age", () => {
+  it("preserves a closed managed one-shot trace until its unchanged whole-tree archive age", () => {
     const { root, run } = make();
     const managed = path.join(root, FABRIC_RUN_ROOT_PREFIX + "closed");
     fs.mkdirSync(managed);
@@ -92,8 +81,12 @@ describe("six-hour terminal run compaction", () => {
     markRunRootActive(managed, 4 * HOUR); markRunRootClosed(managed, 4 * HOUR, true);
     const sweep = (at: number) => sweepTempRunRoots({ tempRoot: root, now: at, orphanedTempRunRetentionMs: 24 * HOUR, oneShotRunRetentionMs: 24 * HOUR });
     expect(sweep(now).removedRuns).toEqual([]);
-    expect(fs.readFileSync(path.join(managed, "old", "events.jsonl"), "utf8").trim().split("\n")).toHaveLength(201);
+    expect(fs.readFileSync(path.join(managed, "old", "events.jsonl"), "utf8")).toBe(log);
     expect(sweep(28 * HOUR).removedRuns).toEqual([path.join(managed, "old")]);
+    const archive = `${managed}.trace-archive`;
+    const receipt = JSON.parse(fs.readFileSync(path.join(archive, fs.readdirSync(archive)[0]!, "custody.json"), "utf8"));
+    expect(receipt.state).toBe("moved");
+    expect(fs.readFileSync(path.join(receipt.destination, "events.jsonl"), "utf8")).toBe(log);
   });
 
   it.each([{ status: "running" }, { status: "queued" }, { status: "unknown" }, { sessionId: undefined }, { sessionId: String(process.pid) }, { cleanupPending: true }])("leaves nonterminal/unknown/uncertain custody untouched: %j", record => {
@@ -145,9 +138,9 @@ describe("six-hour terminal run compaction", () => {
     expect(snapshot(run)).toEqual(before); expect(fs.statSync(run).mtimeMs).toBe(mtime);
   });
 
-  it("dry-run reports eligibility without changing bytes, inode or timestamps", () => {
+  it("dry-run retains raw traces without changing bytes, inode or timestamps", () => {
     const { run } = make(); const before = snapshot(run);
-    expect(compactTerminalRunEvents(run, { now, dryRun: true } as Parameters<typeof compactTerminalRunEvents>[1] & { dryRun: boolean })).toBe(true);
+    expect(compactTerminalRunEvents(run, { now, dryRun: true } as Parameters<typeof compactTerminalRunEvents>[1] & { dryRun: boolean })).toBe(false);
     expect(snapshot(run)).toEqual(before);
   });
 

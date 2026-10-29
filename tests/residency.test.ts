@@ -1714,6 +1714,7 @@ describe("durable completion receipts", () => {
 
   it("F1 preserves original completion through recovery sweep and a second host restart without a saved result", async () => {
     const state = await rootHarness("f1-recovery-completion");
+    state.config.agents.retainRuns = false; // Exercise the missing-result deletion veto, not default retention.
     const seeded = await seedCompletion(state);
     const metadata = JSON.parse(fs.readFileSync(seeded.metadataPath, "utf8"));
     // Pin the exited predecessor: a replacement host cannot resume/retry this old run.
@@ -1952,6 +1953,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
     // Real compiled launcher -> real Pi -> compiled resident host; only model inference is fake.
     // STREAM_PREVIEW supplies its own running/terminal records and full text, without fixture edits.
     const state = await rootHarness("f1-compiled-save-failure");
+    state.config.agents.retainRuns = false; // Preserve close/expiry deletion and failed-save veto coverage.
     const launches = launchLog(state.root);
     for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
     const options = { config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath };
@@ -1969,7 +1971,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
       expect(fs.existsSync(ownerPath)).toBe(false);
     };
     try {
-      expect(state.config.agents.retainRuns).toBe(false); // Keep the public default.
+      expect(state.config.agents.retainRuns).toBe(false); // Explicit deletion opt-out, not the public default.
       const handle = await client.spawnAgent({ task: "STREAM_PREVIEW", transport: "process", residency: "durable" });
       expect(launches.owned().some(({ argv }) => argv[0] === hostPath)).toBe(true);
       const run = path.join(state.config.residencyRoot, "runs", handle.id);
@@ -2040,6 +2042,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
 
   it.skipIf(process.platform !== "linux")("F1 retains a detached worker completion after SIGKILL, expiry, recovery and a second restart", { timeout: 60_000 }, async () => {
     const state = await rootHarness("f1-detached-completion");
+    state.config.agents.retainRuns = false; // Exercise expiry/recovery vetoes even when deletion is requested.
     const launches = launchLog(state.root);
     for (const [key, value] of Object.entries(launches.env)) vi.stubEnv(key, value);
     const options = { config: state.config, mesh: state.mesh, participants: state.participants, mainAgent: state.mainAgent, hostPath };
@@ -3203,6 +3206,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
   // smarty-dev#1882: the host's exit removes runs/; a later session still reads the result.
   it("returns a completed durable agent's result after its resident host exits", { timeout: 90_000 }, async () => {
     const state = await rootHarness("resident-exit-status");
+    state.config.agents.retainRuns = false; // This test specifically covers results after run deletion.
     // This case closes Main below: use a short configured dead-root window, not a live-root exit.
     state.config.mesh = { ...state.config.mesh, residentIdleExitMs: 1_000 };
     const client = new ResidencyClient({
@@ -3260,6 +3264,7 @@ describe.skipIf(!hasResidentHost || process.platform === "win32")("durable parti
 
   it("rejects tampered durable worktree metadata before destructive cleanup", { timeout: 45_000 }, async () => {
     const state = await rootHarness("resident-worktree-tamper");
+    state.config.agents.retainRuns = false; // Preserve destructive-cleanup validation coverage.
     const source = path.join(state.root, "source");
     const unrelated = path.join(state.root, "unrelated");
     initRepository(source);

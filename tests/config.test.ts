@@ -39,6 +39,25 @@ afterEach(() => {
   }
 });
 
+describe("run trace retention defaults (smarty-dev#17038)", () => {
+  it("retains runs by default in constants, normalization and loaded config", () => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+    expect(DEFAULT_FABRIC_CONFIG.agents.retainRuns).toBe(true);
+    expect(normalizeFabricConfig({}).agents.retainRuns).toBe(true);
+    expect(normalizeFabricConfig({ agents: {} }).agents.retainRuns).toBe(true);
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted: false }).agents.retainRuns).toBe(true);
+  });
+
+  it("honors an explicit retainRuns:false opt-out", () => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ agents: { retainRuns: false } }));
+    expect(normalizeFabricConfig({ agents: { retainRuns: false } }).agents.retainRuns).toBe(false);
+    expect(loadFabricConfig({ cwd, agentDir, projectTrusted: false }).agents.retainRuns).toBe(false);
+  });
+});
+
 describe("transient actor activation block cooldown (smarty-dev#6509)", () => {
   it("defaults to 10 minutes capped at 60 and bounds overrides", () => {
     expect(normalizeFabricConfig({}).actors).toMatchObject({ transientBlockCooldownMs: 600_000, transientBlockMaxMs: 3_600_000 });

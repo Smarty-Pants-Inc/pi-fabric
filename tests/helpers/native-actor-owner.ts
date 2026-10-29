@@ -899,11 +899,11 @@ finally:
     },
     async attemptRealCli(shape: NativeOwnerCliShape): Promise<NativeAuxiliaryResult & {
       ordinary?: NativeSessionPin; startedAt: number; closedAt: number;
-      selectedFile?: string; missingAtLaunch?: boolean;
+      selectedFile?: string; missingAtLaunch?: boolean | undefined;
     }> {
       const label = `real-cli-${shape}-${++auxiliarySequence}`;
       // Actual CLI defaults, not the native owner's isolated discovery override.
-      const cliEnv = { ...env, PI_CODING_AGENT_SESSION_DIR: undefined };
+      const cliEnv: Record<string, string | undefined> = { ...env, PI_CODING_AGENT_SESSION_DIR: undefined };
       const newSession = ["ordinary-new", "ordinary-new-parent-symlink", "task-new", "task-new-parent-symlink",
         "task-new-owner-host-profile", "task-new-missing-parent", "task-new-missing-pin"].includes(shape);
       let selectedFile: string | undefined, missingAtLaunch: boolean | undefined;

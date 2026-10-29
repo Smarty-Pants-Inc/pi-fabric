@@ -9,6 +9,7 @@ import { ActorDirectory } from "../src/actors/directory.js";
 import { ResidentHost } from "../src/residency/host.js";
 import type { ResidentHostConfig } from "../src/residency/protocol.js";
 import { readHostLease } from "../src/topology/host-leases.js";
+import { flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import { readParticipantFile } from "../src/topology/participant-files.js";
 
 // Every presence value carries its absolute sessionFile and logDir, so its size grows
@@ -20,6 +21,9 @@ const pathAwareLimit = (base: number, actorRoot: string, id = "0".repeat(32)): n
 
 it("isolates a real 1024-byte legacy presence failure across startup and recovery without rapid retries", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "ps-"));
+  vi.stubEnv("SMARTY_ROLE", "worktree-agent@x");
+  vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+  vi.stubEnv("PI_FABRIC_SESSION_ID", undefined);
   const bad = "b".repeat(32), good = "a".repeat(32);
   // "ok" fits the legacy 1024-byte boundary; "big" (12 topics) is ~570 path-independent
   // bytes larger, so it exceeds the path-aware limit at any TMPDIR depth.
@@ -79,9 +83,17 @@ it("isolates a real 1024-byte legacy presence failure across startup and recover
       expect(registry.records().map(r => r.id).sort()).toEqual([good, bad]); // never drop persisted actor state
       if (!recovery) host = new ResidentHost(config);
     }
-    expect(warn.mock.calls.filter(([message]) => String(message).includes("Actor presence omitted"))).toHaveLength(1);
+    await flushFabricDiagnostics();
+    const directory = path.join(root, "agent", "fabric", "diagnostics");
+    const diagnostics = fs.readdirSync(directory).filter(file => file.endsWith(".jsonl")).flatMap(file =>
+      fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)));
+    const omissions = diagnostics.filter(row => row.source === "src/actors/manager.ts" && row.message.includes("Actor presence omitted"));
+    expect(omissions).toEqual([expect.objectContaining({ level: "warning", message: expect.stringContaining(`actor ${bad}: Actor presence omitted`) })]);
+    expect(warn.mock.calls.filter(([message]) => String(message).includes("Actor presence omitted"))).toHaveLength(0);
   } finally {
-    await host.close(); eligibility.mockRestore(); warn.mockRestore(); registryWrites.mockRestore(); fs.rmSync(root, { recursive: true, force: true });
+    await host.close(); await flushFabricDiagnostics();
+    eligibility.mockRestore(); warn.mockRestore(); registryWrites.mockRestore(); vi.unstubAllEnvs();
+    fs.rmSync(root, { recursive: true, force: true });
   }
 }, 20000);
 

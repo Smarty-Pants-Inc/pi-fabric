@@ -147,6 +147,23 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: FI
     expect(mentions(h.fileMain, toFile)).toEqual([expect.objectContaining({ deliverAs: "steer", from: expect.objectContaining({ id: h.natsMain.id }) })]);
   }, 60_000);
 
+  it.each([["agents.steer", "steer"], ["agents.tell", "followUp"]] as const)(
+    "NATS Main -> file Main: keyed %s replays its first outcome without another consumption", async (tool, operation) => {
+      const token = `KEYED_${operation}_${randomUUID()}`, key = `keyed-${randomUUID()}`, mark = h.wire.mark();
+      const first = await withLog(h.natsMain.invoke(tool, { id: h.fileMain.id, message: token, idempotencyKey: key })) as Record<string, unknown>;
+      expect(first).toMatchObject({ acknowledged: true });
+      const again = await withLog(h.natsMain.invoke(tool, { id: h.fileMain.id, message: token, idempotencyKey: key })) as Record<string, unknown>;
+      expect(again).toMatchObject({ acknowledged: true, messageId: first.messageId });
+      const attempts = h.wire.since(mark).filter(event => event.phase === "send" && event.hostId === h.natsMain.id &&
+        event.envelope.kind === "command" && bodyOf(event).message === token);
+      expect(attempts).toHaveLength(2);
+      expect(attempts[1]!.envelope.id).not.toBe(attempts[0]!.envelope.id);
+      expect(bodyOf(attempts[1]!).commandId).toBe(bodyOf(attempts[0]!).commandId);
+      expect(attempts.every(event => event.envelope.operation === operation)).toBe(true);
+      expect(mentions(h.fileMain, token)).toHaveLength(1);
+      expect(h.fileEvents({ topic: CONTROL, to: h.fileMain.id }).filter(event => dataOf(event).message === token)).toHaveLength(1);
+    }, 60_000);
+
   it("a second verified NATS sender re-using another sender's commandId never receives that sender's outcome", async () => {
     const peer = h.natsPeer!;
     await waitForValue(() => liveRow(peer, h.fileMain.id), "file root routable from the NATS peer", E2E_WAIT_MS);

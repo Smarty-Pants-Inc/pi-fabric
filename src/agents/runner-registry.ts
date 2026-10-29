@@ -84,7 +84,7 @@ export interface FabricRunnerLaunchContext {
   images?: readonly ImageContent[];
   schema?: Record<string, unknown>;
   systemPrompt?: string;
-  /** Pi session file seeding the run; present only for runners declaring `handoff`. */
+  /** Session file for a persistent actor, or a seed for runners declaring `handoff`. */
   sessionFile?: string;
   /** Effective confinement; present only for runners declaring `writePolicy`. */
   writePolicy?: FabricWritePolicy;
@@ -433,6 +433,21 @@ export const requireAgentRunner = (id: unknown): FabricRunnerAdapter => {
     throw new Error(
       `Unsupported Fabric agent runner: ${JSON.stringify(id)}. Register it with registerAgentRunner() from pi-fabric/runners before use.`,
     );
+  }
+  return adapter;
+};
+
+/** Validate before actor admission or transferring creation to a resident owner. */
+export const requireActorRunner = (id: unknown, residency: "session" | "durable"): FabricWorkerRunner => {
+  const adapter = requireAgentRunner(id);
+  if (!adapter.capabilities.persistentSessions) {
+    throw new Error(`Invalid Fabric actor runner: ${adapter.id} does not declare the persistentSessions capability`);
+  }
+  if (adapter.kind !== "worker") {
+    throw new Error(`Invalid Fabric actor runner: ${adapter.id}; persistent actors need a worker runner`);
+  }
+  if (residency === "durable" && !BUILT_IN_RUNNER_IDS.has(adapter.id) && !adapter.residentModule) {
+    throw new Error(`Fabric runner ${adapter.id} declares no residentModule; durable residency needs one`);
   }
   return adapter;
 };

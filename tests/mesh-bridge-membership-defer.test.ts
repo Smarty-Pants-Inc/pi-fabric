@@ -226,6 +226,26 @@ describe("fixed1s retained membership safety wakes", () => {
     expect(f.failure()).toBeUndefined();
   });
 
+  // Keep: retained misses never enter the filter aggregate; repeated source boundaries must stay visible.
+  it("reports deduplicated membership-retained samples even without filter misses or cursor progress", async () => {
+    const f = await retainedRun();
+    await f.retain();
+    expect(f.logs.filter(line => line.startsWith("bridge miss:"))).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const reports = () => f.logs.filter(line => line.startsWith("bridge:"));
+    expect(reports()).toHaveLength(1);
+    expect(reports()[0]).toContain("0 events not addressed across");
+    expect(reports()[0]).toContain("suppressed miss samples 1");
+    await vi.advanceTimersByTimeAsync(60_000);
+    // Retries at +3, +7, +15 and +31 s dedupe; +61 s emits a fresh sample and the pending report.
+    expect(reports()).toHaveLength(2);
+    expect(reports()[1]).toContain("suppressed miss samples 4");
+    expect(f.logs.filter(line => line.startsWith("bridge miss:"))).toHaveLength(2);
+    expect(f.cursor().toLocal.after).toBe(0);
+    expect(f.delivered).toEqual([]);
+    expect(f.failure()).toBeUndefined();
+  });
+
   it.each(["presence", "lease", "completed mirror"] as const)(
     "delivers retained work immediately on %s without advancing to the safety wake", async wake => {
       const f = await retainedRun();
@@ -252,13 +272,13 @@ describe("fixed1s retained membership safety wakes", () => {
   it("counts a missed-notification safety wake only when it advances retained work", async () => {
     const f = await retainedRun();
     await f.retain();
-    expect(f.logs.some(line => /safety/i.test(line))).toBe(false);
+    expect(f.logs.some(line => line.includes("safety wakes advancing retained boundaries"))).toBe(false);
     f.recover(); // canonical authority recovers, but deliberately send no change notice
     await vi.advanceTimersByTimeAsync(1_000);
     await new Promise<void>(resolve => setImmediate(resolve)); // the drain yields after its durable checkpoint
     expect(f.delivered).toHaveLength(1);
     expect(f.cursor().toLocal.after).toBe(1);
-    expect(f.logs.some(line => /safety/i.test(line) && /\b1\b/.test(line))).toBe(true);
+    expect(f.logs.some(line => line.includes("safety wakes advancing retained boundaries 1"))).toBe(true);
     expect(f.failure()).toBeUndefined();
   });
 

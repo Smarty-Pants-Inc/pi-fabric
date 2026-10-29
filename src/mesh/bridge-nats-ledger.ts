@@ -101,12 +101,12 @@ const freeze = <T>(value: T): T => {
 };
 const cloneJson = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
-/** Ordinary control retries get fresh attempt times. Ask/cancel can mint native ingress evidence,
- * so their COMPLETE first body remains the comparison authority, even for non-native recipients.
- * Never normalize the stored body or a receipt: only compare ordinary retry attempts this way.
+/** Every control retry may have fresh attempt times, including ask/cancel. Compare all other
+ * retained fields exactly; the FIRST full body/deadline remain immutable publication and receipt
+ * authority. This normalization applies only to claim comparison, never to a stored body or receipt.
  */
 const claimBodySemantics = (input: BridgeNatsClaimInput): unknown => {
-  if (!input.resolvedBody || input.operation === "ask" || input.operation === "cancel") return input.resolvedBody;
+  if (!input.resolvedBody) return input.resolvedBody;
   const { requestCreatedAt: _created, requestedAt: _requested, deadlineAt: _deadline, ...body } = input.resolvedBody;
   return body;
 };
@@ -503,10 +503,10 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
             existing.replyTo !== input.replyTo || existing.targetId !== input.targetId || existing.operation !== input.operation) {
           return { status: "mismatch" as const, created: false as const, record: existing };
         }
-        // The wire digest pins semantic input, not per-attempt times. Ordinary retries may vary
-        // those times, but still reuse the FIRST stored body/sender/principal and original horizon.
-        // Ask/cancel keep exact body/deadline matching for native receipt repair. Never backfill a
-        // pre-upgrade claim lacking historical evidence or relax route/identity/principal checks.
+        // The wire digest pins semantic input, not per-attempt times, for EVERY operation.
+        // A duplicate reuses the FIRST full body/sender/principal/deadline and original horizon;
+        // ask/cancel projection must still validate the exact retained recipe, not this attempt.
+        // Never backfill historical evidence or relax route/identity/principal checks.
         if (existing.direction === "toFile" && existing.resolvedBody !== undefined &&
             (input.resolvedBody === undefined || canonical(claimBodySemantics(existing)) !== canonical(claimBodySemantics(input)) ||
              canonical(existing.principal ?? null) !== canonical(input.principal ?? null) ||
@@ -514,8 +514,7 @@ export class FileBridgeNatsLedger implements BridgeNatsLedger {
              // Optional Main sid/name are not credentials; the verified canonical id fixes its sid.
              (!(existing.from.kind === "main" && BRIDGE_NATS_SESSION_ID.test(existing.from.id)) &&
                existing.from.sessionId !== input.from.sessionId) || existing.ownerHostId !== input.ownerHostId ||
-             existing.ownerIdentityId !== input.ownerIdentityId || existing.ownerIncarnation !== input.ownerIncarnation ||
-             ((existing.operation === "ask" || existing.operation === "cancel") && existing.deadlineAt !== input.deadlineAt))) {
+             existing.ownerIdentityId !== input.ownerIdentityId || existing.ownerIncarnation !== input.ownerIncarnation)) {
           return { status: "mismatch" as const, created: false as const, record: existing };
         }
         return { status: "duplicate" as const, created: false as const, record: existing };

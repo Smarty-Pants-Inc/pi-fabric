@@ -1,8 +1,10 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { build } from "esbuild";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { configureFabricDiagnostics, diagnostics, DIAGNOSTICS_MAX_BYTES, fabricDiagnosticsFile, flushFabricDiagnostics, notifyDiagnostic } from "../src/core/diagnostics.js";
+import { configureFabricDiagnostics, diagnostics, DIAGNOSTICS_MAX_BYTES, fabricDiagnosticsFile, flushFabricDiagnostics, logDiagnostic, notifyDiagnostic } from "../src/core/diagnostics.js";
 import { warnUnfencedControlDelivery } from "../src/topology/control-plane.js";
 
 // Keep: the principal-pane incident is a real catch; use real files for delivery and a
@@ -94,6 +96,114 @@ describe("principal Fabric diagnostics", () => {
     expect(context.ui.notify).toHaveBeenCalledExactlyOnceWith("command feedback", "error");
   });
 
+  it.each(["org-agent@x", "project-agent@x", "worktree-agent@x", ""])("writes explicit log-only diagnostics privately for role %s", async role => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-log-only-"));
+    vi.stubEnv("SMARTY_ROLE", role);
+    vi.stubEnv("PI_CODING_AGENT_DIR", root);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    configureFabricDiagnostics("log-only-session");
+    expect(mkdir).not.toHaveBeenCalled(); // Binding does not activate the lazy sink.
+    logDiagnostic("src/internal.ts", "ignored internal warning");
+    logDiagnostic("src/internal.ts", "real failure retained privately", "error");
+    await flushFabricDiagnostics();
+    expect(records(fabricDiagnosticsFile("log-only-session"))).toEqual([
+      { at: expect.any(String), level: "warning", source: "src/internal.ts", message: "ignored internal warning" },
+      { at: expect.any(String), level: "error", source: "src/internal.ts", message: "real failure retained privately" },
+    ]);
+    expect(warn).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+    expect(stderr).not.toHaveBeenCalled();
+  });
+
+  it("binds pre-session log-only records for a principal without idle I/O", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-log-only-startup-"));
+    vi.stubEnv("SMARTY_ROLE", "org-agent@x");
+    vi.stubEnv("PI_CODING_AGENT_DIR", root);
+    vi.stubEnv("PI_FABRIC_SESSION_ID", "");
+    vi.resetModules();
+    const fresh = await import("../src/core/diagnostics.js");
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    fresh.logDiagnostic("src/internal.ts", "before session binding");
+    expect(mkdir).not.toHaveBeenCalled();
+    fresh.configureFabricDiagnostics("actual-worktree-session");
+    await fresh.flushFabricDiagnostics();
+    expect(records(fresh.fabricDiagnosticsFile("actual-worktree-session"))).toEqual([
+      expect.objectContaining({ message: "before session binding" }),
+    ]);
+  });
+
+  it.each(["project-agent@x", "worktree-agent@x", ""])("persists unbound log-only records for %s without a session id", async role => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-log-only-unbound-"));
+    vi.stubEnv("SMARTY_ROLE", role);
+    vi.stubEnv("PI_CODING_AGENT_DIR", root);
+    vi.stubEnv("PI_FABRIC_SESSION_ID", undefined);
+    vi.resetModules();
+    const mkdir = vi.spyOn(fs, "mkdirSync");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    const fresh = await import("../src/core/diagnostics.js");
+    expect(mkdir).not.toHaveBeenCalled();
+    fresh.logDiagnostic("src/internal.ts", "unbound warning retained");
+    await fresh.flushFabricDiagnostics();
+    const file = fresh.fabricDiagnosticsFile(`process-${process.pid}`);
+    expect(records(file)).toEqual([expect.objectContaining({ message: "unbound warning retained" })]);
+    fresh.configureFabricDiagnostics("later-session");
+    fresh.logDiagnostic("src/internal.ts", "bound warning retained");
+    await fresh.flushFabricDiagnostics();
+    expect(records(fresh.fabricDiagnosticsFile("later-session"))).toEqual([
+      expect.objectContaining({ message: "bound warning retained" }),
+    ]);
+    expect(records(file)).toHaveLength(1); // A late binding does not copy or relabel persisted rows.
+    expect(warn).not.toHaveBeenCalled(); expect(error).not.toHaveBeenCalled(); expect(stderr).not.toHaveBeenCalled();
+  });
+
+  // Keep: data safety at the real process boundary, including exit before the lazy import can resolve.
+  it.each([
+    ["worktree-agent@x", "unbound", false], ["worktree-agent@x", "unbound", true],
+    ["org-agent@x", "unbound", false], ["org-agent@x", "unbound", true],
+    ["worktree-agent@x", "configured", true], ["project-agent@x", "environment", true],
+    ["org-agent@x", "late-binding", false], ["org-agent@x", "late-binding", true],
+  ] as const)("retains private rows across shutdown: role=%s binding=%s immediate=%s", async (role, binding, immediate) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-diagnostics-child-"));
+    const output = await build({
+      stdin: { resolveDir: process.cwd(), contents: `
+        import { configureFabricDiagnostics, flushFabricDiagnostics, logDiagnostic } from ${JSON.stringify(path.resolve("src/core/diagnostics.ts"))};
+        if (${JSON.stringify(binding)} === "configured") configureFabricDiagnostics("actual-session");
+        logDiagnostic("src/internal.ts", "first warning");
+        logDiagnostic("src/internal.ts", "last error", "error");
+        if (${JSON.stringify(binding)} === "late-binding") configureFabricDiagnostics("actual-session");
+        if (${immediate}) process.exit(0);
+        await flushFabricDiagnostics();
+      ` },
+      bundle: true, packages: "external", platform: "node", format: "esm", write: false, logLevel: "silent",
+    });
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", output.outputFiles[0]!.text], {
+      env: { ...process.env, SMARTY_ROLE: role, PI_CODING_AGENT_DIR: root,
+        PI_FABRIC_SESSION_ID: binding === "environment" ? "actual-session" : undefined },
+      encoding: "utf8", timeout: 10_000,
+    });
+    expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); expect(child.status, child.stderr).toBe(0);
+    expect(child.stdout).toBe("");
+    // Retain the inherited filesystem guard; only its own startup banner is unrelated stderr.
+    expect(child.stderr.replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/gm, "")).toBe("");
+    const id = binding === "unbound" ? `process-${child.pid}` : "actual-session";
+    const directory = path.join(root, "fabric", "diagnostics");
+    expect(fs.readdirSync(directory)).toEqual([`${id}.jsonl`]);
+    const file = path.join(directory, `${id}.jsonl`);
+    expect(records(file)).toEqual([
+      { at: expect.any(String), level: "warning", source: "src/internal.ts", message: "first warning" },
+      { at: expect.any(String), level: "error", source: "src/internal.ts", message: "last error" },
+    ]);
+    if (process.platform !== "win32") {
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(directory).mode & 0o777).toBe(0o700);
+    }
+  });
+
   it("preserves non-principal console arguments and UI notifications without filesystem access", () => {
     vi.stubEnv("SMARTY_ROLE", "project-agent@x");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -155,6 +265,10 @@ describe("principal Fabric diagnostics", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const context = { ui: { notify: vi.fn() } };
+    expect(() => logDiagnostic("src/test.ts", "internal log-only")).not.toThrow();
+    vi.stubEnv("SMARTY_ROLE", "worktree-agent@x");
+    expect(() => logDiagnostic("src/test.ts", "non-principal log-only")).not.toThrow();
+    vi.stubEnv("SMARTY_ROLE", "org-agent@x");
     expect(() => diagnostics.warn("src/test.ts", "internal")).not.toThrow();
     expect(() => notifyDiagnostic(context, "src/test.ts", "internal", "error")).not.toThrow();
     await flushFabricDiagnostics();

@@ -21,7 +21,7 @@ import { FabricActorQueuedWorkError } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { awaitAgentCwd } from "../agents/manager.js";
-import { BUILT_IN_RUNNER_IDS, requireAgentRunner } from "../agents/runner-registry.js";
+import { BUILT_IN_RUNNER_IDS, requireAgentRunner, requireActorRunner } from "../agents/runner-registry.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
 import { executeFile, spawnDetached, resolveScriptRuntime } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
@@ -563,6 +563,8 @@ export class ResidencyClient {
 
   async createActor(request: FabricActorCreateRequest, signal?: AbortSignal, onDispatched?: () => void): Promise<FabricActorInfo> {
     const { idempotencyKey, ...creationRequest } = request;
+    const runner = request.runner ?? this.options.config.agents.runner;
+    const runnerModule = requireActorRunner(runner, "durable").residentModule;
     await this.ensureHost();
     const self = this.options.participants.self();
     const caller: ResidentActorCaller | undefined = this.options.mainAgent.local && self.kind === "root" &&
@@ -578,7 +580,8 @@ export class ResidencyClient {
       ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
       requestId: randomUUID(),
       rootId: this.options.config.rootId,
-      request: creationRequest,
+      request: { ...creationRequest, runner },
+      ...(runnerModule ? { runnerModule } : {}),
       ...(caller ? { caller } : {}),
       createdAt: Date.now(),
     }, signal, onDispatched);

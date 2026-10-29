@@ -4,13 +4,18 @@
 // the cancel's cancelCommandId is mapped like the command it cancels and stops exactly that run. The actor's
 // worker is Fabric's fixture worker (no model call); the actor manager, control planes and broker are real.
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { bridgeNatsMappedCommandId } from "../src/mesh/bridge-nats-types.js";
+import { readNativeIngressReceipt, NATIVE_INGRESS_DIRECTORY } from "../src/mesh/bridge-nats-ingress.js";
+import { controlBodyFingerprint } from "../src/mesh/control-idempotency.js";
+import type { TransportEnvelope } from "../src/transport/types.js";
 import type { FabricActorMessage } from "../src/actors/types.js";
 import type { MeshEvent } from "../src/mesh/store.js";
 import { resolveNatsBinary } from "./helpers/nats-cluster.js";
 import {
-  BRIDGE_MACHINE, createMixedHarness, E2E_WAIT_MS, linkTail, natsLinkPresent, waitForValue, type MixedHarness, type WireEvent,
+  BRIDGE_MACHINE, createMixedHarness, E2E_WAIT_MS, linkTail, NATS_MAIN_MACHINE, natsLinkPresent, waitForValue, type MixedHarness, type WireEvent,
 } from "./helpers/nats-file-mixed.js";
 
 const binary = resolveNatsBinary();
@@ -36,7 +41,7 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: v2
     expect(row.capabilities).toContain("ask");
   }, E2E_WAIT_MS + 30_000);
 
-  it("ask + answer: one activation on the file side, its exact outbound message is the v2 caller's result", async () => {
+  it("ask + answer: same-command retimed attempts replay the first actual result, never another activation or receipt deadline", async () => {
     const token = `BRIDGE_ASK_${randomUUID()}`;
     const mark = h.wire.mark();
     const before = actorMessages().length;
@@ -63,6 +68,50 @@ describe.skipIf(!binary || process.platform !== "linux" || !linked)("A' link: v2
     const ack = h.wire.since(mark).find((event) => event.phase === "deliver" && event.hostId === h.natsMain.id &&
       event.envelope.kind === "ack" && bodyOf(event).commandId === bodyOf(sent[0]!).commandId);
     expect(ack).toMatchObject({ sourceMachine: BRIDGE_MACHINE, envelope: { from: { id: h.fileMain.id }, body: { accepted: true, result } } });
+    // Public agents.ask currently chooses its own key. Re-submit its actual keyed commandId,
+    // not a second agents.ask invocation (which would intentionally generate a DIFFERENT key).
+    const original = sent[0]!.envelope, originalBody = bodyOf(sent[0]!);
+    const mapped = bridgeNatsMappedCommandId(h.linkName, "toFile", h.natsMain.id, String(originalBody.commandId));
+    const dir = path.join(h.linkConfig.stateDir, "ledger"), file = path.join(dir, NATIVE_INGRESS_DIRECTORY, `${mapped}.json`);
+    const receipt = readNativeIngressReceipt(dir, mapped), receiptBytes = fs.readFileSync(file);
+    expect(receipt).toMatchObject({ sourceEventId: original.id, deadlineAt: originalBody.deadlineAt });
+    const raw = await h.openPeer(NATS_MAIN_MACHINE, `ask-replay-${randomUUID()}`);
+    const ackFor = (id: string) => h.wire.since(mark).find(event => event.phase === "deliver" &&
+      event.hostId === h.natsMain.id && event.envelope.kind === "ack" && event.envelope.id === `ack:${id}`);
+    const response = async (envelope: TransportEnvelope): Promise<Record<string, unknown>> => {
+      await raw.send(envelope);
+      await h.wire.until(() => !!ackFor(envelope.id), `ask replay response ${envelope.id}`, E2E_WAIT_MS);
+      const delivered = ackFor(envelope.id)!;
+      // Replay/refusal is emitted by the bridge for the mirrored target; the first owner ACK above is root-authored.
+      expect(delivered).toMatchObject({ sourceMachine: BRIDGE_MACHINE, envelope: { from: { id: h.actor!.id } } });
+      return bodyOf(delivered);
+    };
+    const retry: TransportEnvelope = { ...original, id: randomUUID(), body: { ...originalBody,
+      requestCreatedAt: Number(originalBody.requestCreatedAt) + 1, requestedAt: Number(originalBody.requestedAt) + 1,
+      deadlineAt: Number(originalBody.deadlineAt) + 1 } };
+    expect(controlBodyFingerprint(retry.body, retry.principal)).toBe(controlBodyFingerprint(original.body, original.principal));
+    const replay = await response(retry);
+    expect(replay.accepted).toBe(true);
+    expect(replay.result).toEqual(result); // Actual broker-delivered cached reply, including the FIRST message id.
+    expect(replay.messageId).toBe(result.id);
+    expect(readNativeIngressReceipt(dir, mapped)).toEqual(receipt);
+    expect(fs.readFileSync(file)).toEqual(receiptBytes);
+    // Even an authorized live sender must not get its cached success for changed input/principal/epoch.
+    for (const [envelope, code] of [
+      [{ ...retry, id: randomUUID(), body: { ...originalBody, message: `${token}_CHANGED` } }, "FABRIC_CONTROL_ID_CONFLICT"],
+      [{ ...retry, id: randomUUID(), principal: { id: "test:other-principal", binding: "herdr-client" } }, "FABRIC_CONTROL_ID_CONFLICT"],
+      [{ ...retry, id: randomUUID(), body: { ...originalBody, ownerIncarnation: "different-owner-epoch" } }, "BRIDGE_NATS_CLAIM_MISMATCH"],
+    ] as const) {
+      const refused = await response(envelope);
+      expect(refused).toMatchObject({ accepted: false, notRun: true, errorCode: code });
+      expect(refused).not.toHaveProperty("result");
+      expect(fs.readFileSync(file)).toEqual(receiptBytes);
+    }
+    const afterReplay = actorMessages().slice(before);
+    expect(afterReplay.filter(message => message.direction === "in")).toHaveLength(1);
+    expect(afterReplay.filter(message => message.direction === "out")).toEqual([result]);
+    expect(h.fileEvents({ topic: CONTROL, to: h.fileMain.id }).filter(event => dataOf(event).operation === "ask" &&
+      String(dataOf(event).message).includes(token))).toEqual(appended);
   }, E2E_WAIT_MS * 2);
 
   it("cancel: aborting a v2 ask mid-run sends a mapped cancel that stops exactly that file-side run", async () => {

@@ -159,7 +159,7 @@ describe("durable bridge byte cursors (smarty-dev#2854)", () => {
     fs.writeFileSync(path.join(root, "sequence"), "8");
     const next = await store.publish({ topic: "fleet.work.test", from, to: "remote", text: "after hole" });
     expect(next.sequence).toBe(9);
-    const lookup = vi.spyOn(store, "nextEventAfter");
+    const lookup = vi.spyOn(store, "nextEventAfterAsync");
     const reconcile = vi.spyOn(side, "read");
     const page = await side.tail(head.through, head.offset);
     expect(page.events.map(event => event.id)).toEqual([next.id]);
@@ -170,6 +170,7 @@ describe("durable bridge byte cursors (smarty-dev#2854)", () => {
     lookup.mockClear();
     expect(await side.tail(page.through, page.offset)).toEqual({ events: [], through: page.through, offset: page.offset });
     expect(lookup).not.toHaveBeenCalled(); // idle polls remain byte-only
+    expect(reconcile).not.toHaveBeenCalled();
   });
 
   it("reconciles generation changes through the archive, including work removed from the live log", async () => {

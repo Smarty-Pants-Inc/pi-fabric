@@ -56,8 +56,18 @@ export const BRIDGE_LEASE_MS = MIRROR_FRESH_MS;
 const DEFAULT_PRESENCE_MS = 5_000;
 /** A retained source event revalidates after this delay; this is NOT an event/authority TTL. */
 const DEFAULT_MEMBERSHIP_RETRY_MS = 1_000;
-/** Known-elsewhere outbound misses share one bounded trailing sample, never an idle poll. */
-const UNADDRESSED_REFRESH_MS = 1_000;
+/** Outbound misses share one bounded trailing sample, never an idle poll.
+ * The hold also delays addressed events behind a miss by up to 15 s by default;
+ * that head-of-line delay is accepted (an operator override changes the bound). */
+const UNADDRESSED_REFRESH_MS = 15_000;
+
+/** Parse an integer millisecond override, clamped to 5,000–150,000 ms (below the
+ * 180,000 ms directional stall bound); malformed/unset values keep the default. */
+export const parseBridgeUnaddressedRefreshMs = (value: string | undefined): number => {
+  if (value === undefined || !/^[+-]?\d+$/.test(value.trim())) return UNADDRESSED_REFRESH_MS;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? Math.max(5_000, Math.min(150_000, parsed)) : UNADDRESSED_REFRESH_MS;
+};
 /** A missed change notification is only a safety net: its retry backs off to this bound. */
 const MEMBERSHIP_RETRY_MAX_MS = 30_000;
 /** Retry state is only an observation: re-sample after five maximum backoffs. */
@@ -559,6 +569,29 @@ const participantOf = (key: string, value: unknown, trustedBridgeVia?: string): 
   return participant;
 };
 
+/** Reserve ownership, not ancestry. Only a validated native non-root may omit its rootId;
+ * malformed claims and other links keep the conservative held-event reservation rules.
+ * Liveness is deliberately irrelevant: retained child rows never own their remote parent. */
+const reserveBridgeOwnership = (entry: MeshStateEntry, reserved: Set<string>, handoffs: BridgeHandoffScope): void => {
+  if (!isObject(entry.value)) return;
+  const value = entry.value;
+  const host = hostOf(entry.key, value);
+  const participant = participantOf(entry.key, value);
+  const nativeChild = (host !== undefined && isNativeNonRootHost(host) && entry.updatedBy.id === host.identity.id) ||
+    (participant !== undefined && remoteHostOf(participant) === undefined && participant.bridgeVia === undefined &&
+      participant.kind !== "root" && isNonRootHostId(participant.ownerHostId, participant.rootId) && participant.id !== participant.rootId &&
+      entry.updatedBy.id === participant.ownerIdentityId);
+  // Labels are minted per mesh and collide by design; they are never addresses across.
+  const fields = ["id", ...(nativeChild ? [] : ["rootId"]), "ownerHostId", "ownerIdentityId", "sessionId", "name"];
+  const ids = fields.map(field => value[field]);
+  if (isIdentity(value.identity)) ids.push(value.identity.id);
+  for (const id of ids) {
+    if (typeof id !== "string" || !id) continue;
+    // An unparseable record's own id is never waived, as in presence admission.
+    if ((!host && !participant && id === value.id) || !handoffs.waived(value, id)) reserved.add(id);
+  }
+};
+
 /** Fields from participant files that affect mirror admission; heartbeat-only updates do not. */
 const participantAuthorityStamp = (files: ReturnType<typeof participantFileSnapshot>): string | undefined => files.keys === undefined
   ? undefined
@@ -776,6 +809,11 @@ export const bridgeHandoffScope = (
 const settled = (value: Record<string, unknown>): string =>
   contentDigest({ ...value, updatedAt: undefined, expiresAt: undefined });
 
+/** Only duplicate participant scans ignore quiet activity; identity/routing fields still conflict. */
+const participantCopyDigest = (value: FabricParticipantRecord): string =>
+  contentDigest({ ...value, updatedAt: undefined, expiresAt: undefined,
+    turns: undefined, toolCalls: undefined, usage: undefined, currentTool: undefined });
+
 /**
  * A bridge side over a mesh store on this host. `peer` names the other side: it is the
  * `remoteHost` mark on mirrored records and the `bridge.from` of events it bridges in.
@@ -928,7 +966,7 @@ export class StoreBridgeSide implements BridgeSide {
   // pass the byte budget, and `through` stays at the last event it covers. One event that alone
   // passes the budget is skipped with evidence, never a stall of the cursor.
   async read(after: number, pageBytes = BRIDGE_PAGE_BYTES): Promise<BridgeRead> {
-    return this.#page(this.store.read({ after, limit: this.store.maxReadEvents }), after, pageBytes);
+    return this.#page(await this.store.readAsync({ after, limit: this.store.maxReadEvents }), after, pageBytes);
   }
 
   async latestCursor(): Promise<BridgeHead> {
@@ -947,7 +985,7 @@ export class StoreBridgeSide implements BridgeSide {
       // is harmless unless the store actually holds an event inside the gap.
       const first = page.events.find(event => event.sequence > after);
       const gap = first !== undefined && first.sequence > after + 1 &&
-        (this.store.nextEventAfter(after)?.sequence ?? Infinity) < first.sequence;
+        ((await this.store.nextEventAfterAsync(after))?.sequence ?? Infinity) < first.sequence;
       if (!gap && meshCursorGeneration(page.nextOffset) === meshCursorGeneration(offset) && page.nextOffset >= offset) {
         return this.#page(page.events, after, pageBytes, { start: offset, cursors: page.cursors ?? [], end: page.nextOffset });
       }
@@ -1194,24 +1232,22 @@ export class StoreBridgeSide implements BridgeSide {
     const leases = capturedLeases ?? readHostLeases(this.store.root);
     const handoffs = bridgeHandoffScope(handoffEntries, hostEntries, participantEntries, () => leases, now, this.peer);
     const reserved = new Set<string>(handoffs.reserved);
-    // Only a handoff in force to this link waives a (dead) native's own ids (smarty-dev#9074).
-    const reserve = (value: unknown, id: string): void => { if (!handoffs.waived(value, id)) reserved.add(id); };
     const hosts: BridgeHost[] = [];
     const nonRootHosts: BridgeHost[] = [];
     let rawDroppedCount = 0;
     const reasons = new PresenceDropReasons();
-    // Every id not mirrored by this link is reserved: natives, live or not, and other links'
-    // mirrors (security review F1/F2). Only natives are this side's presence.
+    // Reserve native ownership (live or not) and other links' claims, never a validated
+    // native child's ancestry (security review F1/F2). Only natives are this side's presence.
     for (const entry of hostEntries) {
       const mark = remoteHostOf(entry.value);
       if (mirrorLinkOf(entry.value) === this.peer) continue;
+      reserveBridgeOwnership(entry, reserved, handoffs);
       const host = presenceHostOf(entry.key, entry.value);
       if (!host) {
         if (mark === undefined) { rawDroppedCount += 1; reasons.add("topology/hosts", "malformed"); }
         if (isObject(entry.value) && typeof entry.value.id === "string") reserved.add(entry.value.id);
         continue;
       }
-      for (const id of [host.id, host.identity.id, host.rootId]) reserve(entry.value, id);
       if (mark !== undefined) continue;
       if (entry.updatedBy.id !== host.identity.id) {
         rawDroppedCount += 1; reasons.add("topology/hosts", "writer-mismatch"); continue;
@@ -1241,6 +1277,7 @@ export class StoreBridgeSide implements BridgeSide {
     for (const entry of participantEntries) {
       const mark = remoteHostOf(entry.value);
       if (mirrorLinkOf(entry.value) === this.peer) continue;
+      reserveBridgeOwnership(entry, reserved, handoffs);
       const participant = participantOf(entry.key, entry.value);
       if (!participant) {
         if (mark === undefined) { rawDroppedCount += 1; reasons.add("topology/participants", "malformed"); }
@@ -1248,15 +1285,10 @@ export class StoreBridgeSide implements BridgeSide {
         continue;
       }
       const copy = participantCopies.get(entry.key);
-      if (copy && settled(copy.record as unknown as Record<string, unknown>) !==
-        settled(participant as unknown as Record<string, unknown>)) {
+      if (copy && participantCopyDigest(copy.record) !== participantCopyDigest(participant)) {
         rawDroppedCount += 1; reasons.add("topology/participants", "conflicting-copy");
       }
       if (!copy || copy.updatedAt <= entry.updatedAt) participantCopies.set(entry.key, { record: participant, updatedAt: entry.updatedAt });
-      for (const id of [participant.id, participant.ownerIdentityId, participant.rootId]) reserve(entry.value, id);
-      if (typeof participant.name === "string" && participant.name) reserve(entry.value, participant.name);
-      // Labels are minted per mesh and collide by design; they are never addresses across.
-      if (typeof participant.sessionId === "string" && participant.sessionId) reserve(entry.value, participant.sessionId);
       const owner = live.get(participant.ownerHostId);
       if (mark === undefined && participant.kind === "root" && owner && entry.updatedBy.id === participant.ownerIdentityId &&
         owner.identity.id === participant.ownerIdentityId && owner.rootId === participant.rootId) {
@@ -1323,7 +1355,7 @@ export class StoreBridgeSide implements BridgeSide {
 
   async publishWithReceipt(event: BridgePublish, held: string[] = [], fromHub = false): Promise<BridgePublishReceipt> {
     const { sequence } = await this.publish(event, held, fromHub);
-    const appended = this.store.read({ after: sequence - 1, limit: 1 })[0];
+    const appended = (await this.store.readAsync({ after: sequence - 1, limit: 1 }))[0];
     return { sequence, ...(appended?.sequence === sequence ? { createdAt: appended.createdAt } : {}) };
   }
 
@@ -1561,11 +1593,8 @@ export class StoreBridgeSide implements BridgeSide {
     const reserved = new Set<string>(handoffs.reserved);
     for (const entries of [hostEntries, participantEntries]) {
       for (const entry of entries) {
-        if (mirrorLinkOf(entry.value) === this.peer || !isObject(entry.value)) continue;
-        const value = entry.value;
-        const ids = ["id", "rootId", "ownerHostId", "ownerIdentityId", "sessionId", "name"].map((field) => value[field]);
-        if (isIdentity(value.identity)) ids.push(value.identity.id);
-        for (const id of ids) if (typeof id === "string" && id && !handoffs.waived(value, id)) reserved.add(id);
+        if (mirrorLinkOf(entry.value) === this.peer) continue;
+        reserveBridgeOwnership(entry, reserved, handoffs);
       }
     }
     return reserved;
@@ -1575,6 +1604,7 @@ export class StoreBridgeSide implements BridgeSide {
   #fenced = false;
   #staleAdmission: BridgeStaleIncarnationError | undefined;
   #inflight: Promise<void> = Promise.resolve();
+  #leaseRenewal: Promise<void> = Promise.resolve();
   #hasCommittedPass = false;
   /** A lease effect under its host gate found newer lease authority on disk than its plan saw. */
   #leaseAuthorityAhead = false;
@@ -1601,10 +1631,49 @@ export class StoreBridgeSide implements BridgeSide {
     return run;
   }
 
+  /** Refresh only already-installed direct root leases, never membership or incarnations.
+   * A live watch may call this while a full mirror/drain is waiting. The existing per-host
+   * custody, current-row checks and exact file-version CAS still own every lease write. */
+  renewMirroredLeases(hosts: readonly BridgeHost[], observedAt: number): Promise<void> {
+    const run = this.#leaseRenewal.then(async () => {
+      if (this.#staleAdmission) throw this.#staleAdmission;
+      if (this.#fenced || !Number.isFinite(observedAt) || observedAt > this.now()) return;
+      for (const { record, expiresAt, observedAt: sourceObservedAt } of hosts) {
+        if (this.#fenced) return;
+        if (!isAdmissibleRecord("host", record) || remoteHostOf(record) !== undefined ||
+          record.id !== record.rootId || record.identity.id !== record.id ||
+          !Number.isFinite(sourceObservedAt) || !Number.isFinite(expiresAt) || expiresAt <= sourceObservedAt!) continue;
+        const until = observedAt + Math.min(BRIDGE_LEASE_MS, expiresAt - sourceObservedAt!);
+        if (until <= this.now() || this.now() - observedAt >= MIRROR_FRESH_MS) continue;
+        await withHostLeaseFileCustody(this.store, hostLeasePath(this.store.root, record.id), () => {
+          if (this.#fenced || until <= this.now()) return;
+          const entry = this.store.get(keyFor(HOST_PREFIX, record.id), { fresh: true });
+          const held = entry && mirrorLinkOf(entry.value) === this.peer ? hostOf(entry.key, entry.value) : undefined;
+          // New/changed owners belong to full reconciliation, never this lease-only path.
+          if (!held || held.remoteHost !== this.peer || held.bridgeVia !== undefined || entry!.updatedBy.id !== record.id ||
+            held.rootId !== record.rootId || !sameIdentity(held.identity, record.identity) ||
+            held.incarnationToken === undefined || held.incarnationToken !== record.incarnationToken ||
+            participantFilePresent(this.store.root, keyFor(PARTICIPANT_PREFIX, record.id)) || this.#reservedNow().has(record.id)) return;
+          const prior = readHostLeaseCurrent(this.store.root, record.id);
+          this.#applyLease({ id: record.id, rootId: held.rootId, identityId: held.identity.id, ...incarnationOf(held),
+            ...(held.bridgeSupersededTokens ? { bridgeSupersededTokens: held.bridgeSupersededTokens } : {}),
+            ...(held.bridgeSupersededTokenSeen ? { bridgeSupersededTokenSeen: held.bridgeSupersededTokenSeen } : {}),
+            updatedAt: record.updatedAt, expiresAt: until, mirrorLease: 1,
+            mirror: { remoteHost: this.peer, observedAt, sourceObservedAt: sourceObservedAt!,
+              sourceUpdatedAt: record.updatedAt, sourceExpiresAt: expiresAt,
+              ...(prior?.mirror?.bridgeProcess ? { bridgeProcess: prior.mirror.bridgeProcess } : {}) },
+          }, false, false);
+        });
+      }
+    });
+    this.#leaseRenewal = run.catch(() => undefined);
+    return run;
+  }
+
   async fence(): Promise<void> {
     this.#fenced = true;
     this.#ingressAbort.abort(new BridgeOwnershipError(`Bridge link ${this.peer} is fenced`));
-    await this.#inflight;
+    await Promise.all([this.#inflight, this.#leaseRenewal]);
   }
 
   async withdraw(): Promise<void> {
@@ -2439,7 +2508,8 @@ export class StoreBridgeSide implements BridgeSide {
     if (effectBusy && !halted()) throw effectBusy.error;
   }
 
-  #applyLease(lease: BridgeLease, replay: boolean): void {
+  // Independent watch renewals must not mutate a full mirror pass's authority-recheck latch.
+  #applyLease(lease: BridgeLease, replay: boolean, markAuthorityAhead = true): void {
     // The target lease gate is held by CommitOutbox. This fresh row/version and the staged row
     // stamp are checked after custody, never on the pre-commit snapshot.
     const key = keyFor(HOST_PREFIX, lease.id);
@@ -2471,7 +2541,7 @@ export class StoreBridgeSide implements BridgeSide {
     if (onDisk && (nativeLeaseLive(onDisk, this.now()) || (!isNonRootHostId(lease.id, lease.rootId) &&
       onDisk.incarnationToken !== undefined && onDisk.incarnationToken !== lease.incarnationToken &&
       !bridgeSupersededTokensOf(lease.bridgeSupersededTokens).includes(onDisk.incarnationToken)))) {
-      this.#leaseAuthorityAhead = true;
+      if (markAuthorityAhead) this.#leaseAuthorityAhead = true;
       return;
     }
     // Recovery must not erase newer file authority while its state row is still catching up.
@@ -2479,7 +2549,7 @@ export class StoreBridgeSide implements BridgeSide {
       // Disk history is local proof that this outbox token was superseded. An old recovery
       // effect must not restore it over newer on-disk authority.
       if (olderBridgeIncarnation(lease, bridgeSupersededTokensOf(onDisk.bridgeSupersededTokens))) {
-        this.#leaseAuthorityAhead = true;
+        if (markAuthorityAhead) this.#leaseAuthorityAhead = true;
         return;
       }
       // A pending same-token effect may predate the disk's age floor even when it still
@@ -2538,7 +2608,7 @@ export class StoreBridgeSide implements BridgeSide {
     const ids: string[] = [];
     let cursor = after;
     while (true) {
-      const page = this.store.read({ after: cursor, limit: this.store.maxReadEvents });
+      const page = await this.store.readAsync({ after: cursor, limit: this.store.maxReadEvents });
       for (const event of page) {
         const stamp = bridgeStampOf(event);
         if ((stamp?.via ?? stamp?.from) === this.peer) ids.push(stamp!.id);
@@ -3224,6 +3294,8 @@ export interface MeshBridgeOptions {
   log?: (message: string) => void;
   /** Debug lines (each event not addressed across); off when absent. */
   debug?: (message: string) => void;
+  /** Diagnostic only: static admission can distinguish an absent allowed target from a foreign one. */
+  diagnosticTargetAdmitted?: (id: string, direction: "toRemote" | "toLocal") => boolean;
   /**
    * The per-link bound on remote events that cross only through the hub factory exception
    * (default DEFAULT_FACTORY_RATE). Over it, the inbound drain stops at that event with the cursor
@@ -3513,7 +3585,12 @@ export class MeshBridge {
   #presenceSync: Promise<void> | undefined;
   /** One trailing refresh obligation; a sample begun before its latest miss cannot clear it. */
   #unaddressedRefreshAt: number | undefined;
+  #unaddressedRefreshMs = UNADDRESSED_REFRESH_MS;
   #unaddressedRefreshVersion = 0;
+  /** An unknown outbound recipient retains its source boundary until the trailing sample lands. */
+  #unaddressedSequence: number | undefined;
+  /** Only source events already present before the successful sample may trust its absence. */
+  #unaddressedSampleThrough: number | undefined;
   #staleAdmission: BridgeStaleIncarnationError | undefined;
   #stopped = false;
   #stopTask: Promise<void> | undefined;
@@ -3554,8 +3631,11 @@ export class MeshBridge {
   readonly #tailSafetyDelay: Partial<Record<Direction, number>> = {};
   readonly #membershipSequence: Partial<Record<Direction, number>> = {};
   /** Events not addressed across since the last count line (smarty-dev#9352). */
-  #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, topics: new Set<string>(), more: false };
+  #unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, suppressedMissSamples: 0,
+    topics: new Set<string>(), more: false };
   #unaddressedLoggedAt = Number.NEGATIVE_INFINITY;
+  /** Shared rolling-minute sample across directions/stages, with no timer or unbounded id cache. */
+  #missSamples: Array<{ at: number; eventId: string; direction: Direction; stage: string }> = [];
   #presenceInfoLoggedAt = Number.NEGATIVE_INFINITY;
   #legacyNoBaselineWarned = false;
   #legacyNoBaselineOverdueReported = false;
@@ -3775,11 +3855,33 @@ export class MeshBridge {
     this.#log(`${direction}: dropped idempotency conflict sequence ${event.sequence} event ${event.id} key ${key}`);
   }
 
-  /**
-   * An event neither addressed to the peer nor admitted to it: one debug line each, and a count
-   * for the INFO line (smarty-dev#9352: these drops were silent).
-   */
-  #notAddressed(direction: "toRemote" | "toLocal", event: MeshEvent): void {
+  /** Bounded INFO samples never inspect/log a message body and cannot change delivery policy. */
+  #reportMiss(direction: Direction, event: MeshEvent, rules: BridgeRules,
+    stage: "filter" | "membership-retained" | "commit", stale = false): void {
+    try {
+      const now = this.#now();
+      this.#missSamples = this.#missSamples.filter(sample => now - sample.at < UNADDRESSED_LOG_MS);
+      if (this.#missSamples.length >= 5 || this.#missSamples.some(sample =>
+        sample.eventId === event.id && sample.direction === direction && sample.stage === stage)) {
+        this.#unaddressed.suppressedMissSamples = Math.min(Number.MAX_SAFE_INTEGER, this.#unaddressed.suppressedMissSamples + 1);
+      } else {
+        const to = typeof event.to === "string" ? event.to : "(none)";
+        const local = direction === "toRemote" && rules.reservedRecipients?.has(to) && !rules.relayOrigins?.has(to);
+        const held = direction === "toRemote" ? this.options.local.holds?.(to) : rules.recipients.has(to);
+        const classification = local ? "local" : stale ? "stale" : held ? "held"
+          : this.options.local.mirrored?.(to) || this.options.diagnosticTargetAdmitted?.(to, direction) ? "stale" : "not-admitted";
+        this.#missSamples.push({ at: now, eventId: event.id, direction, stage });
+        this.#log(`bridge miss: direction=${direction} event=${JSON.stringify(event.id.slice(0, 160))} ` +
+          `recipient=${JSON.stringify(to.slice(0, 160))} classification=${classification} stage=${stage}`);
+      }
+      // Filter misses report after adding their aggregate; retained/commit misses have no such caller.
+      if (stage !== "filter") this.#reportUnaddressed();
+    } catch { /* Diagnostics must not affect cursor, admission or retry decisions. */ }
+  }
+
+  /** An unaddressed event: sampled INFO detail, existing debug detail and aggregate INFO count. */
+  #notAddressed(direction: "toRemote" | "toLocal", event: MeshEvent, rules: BridgeRules): void {
+    this.#reportMiss(direction, event, rules, "filter");
     const unaddressed = this.#unaddressed;
     unaddressed.count += 1;
     unaddressed[direction] += 1;
@@ -3800,13 +3902,14 @@ export class MeshBridge {
    */
   #reportUnaddressed(): void {
     const unaddressed = this.#unaddressed;
-    if (unaddressed.count === 0 && unaddressed.safety === 0) return;
+    if (unaddressed.count === 0 && unaddressed.safety === 0 && unaddressed.suppressedMissSamples === 0) return;
     const now = this.#now();
     if (now - this.#unaddressedLoggedAt < UNADDRESSED_LOG_MS) return;
     this.#unaddressedLoggedAt = now;
-    this.#unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, topics: new Set<string>(), more: false };
+    this.#unaddressed = { count: 0, toRemote: 0, toLocal: 0, factory: 0, safety: 0, suppressedMissSamples: 0,
+      topics: new Set<string>(), more: false };
     this.#log(`bridge: ${unaddressed.count} events not addressed across (topics: ${[...unaddressed.topics].join(", ")}${
-      unaddressed.more ? ", ..." : ""}; toRemote ${unaddressed.toRemote}, toLocal ${unaddressed.toLocal} (to factory ${unaddressed.factory})${
+      unaddressed.more ? ", ..." : ""}; toRemote ${unaddressed.toRemote}, toLocal ${unaddressed.toLocal} (to factory ${unaddressed.factory}); suppressed miss samples ${unaddressed.suppressedMissSamples}${
         unaddressed.safety > 0 ? `; safety wakes advancing retained boundaries ${unaddressed.safety}` : ""})`);
   }
 
@@ -3823,6 +3926,10 @@ export class MeshBridge {
   async start(): Promise<void> {
     if (this.#stopped) throw relayUnavailable();
     this.#ready = false;
+    this.#unaddressedRefreshMs = parseBridgeUnaddressedRefreshMs(process.env.FABRIC_BRIDGE_UNADDRESSED_REFRESH_MS);
+    if (this.#unaddressedRefreshMs !== UNADDRESSED_REFRESH_MS) {
+      this.#log(`bridge: unaddressed membership refresh ${this.#unaddressedRefreshMs} ms`);
+    }
     // Cursors recover events, not presence. A reconnect may follow lease expiry or pruning,
     // even when this instance's previous presence pass would not yet be due (#5036).
     this.#presenceAt = Number.NEGATIVE_INFINITY;
@@ -4150,16 +4257,28 @@ export class MeshBridge {
     return this.#unaddressedRefreshAt !== undefined && Date.now() >= this.#unaddressedRefreshAt;
   }
 
+  /** Only the coordinator/step boundary runs miss-triggered presence work, never an event.
+   * Join at most one pass: an older in-flight sample leaves the versioned obligation pending. */
+  async #refreshUnaddressedMembership(): Promise<void> {
+    this.#unaddressedRefreshAt = Date.now() + this.#unaddressedRefreshMs;
+    await this.syncPresence();
+  }
+
   #deferUnaddressedRefresh(): void {
     if (this.#stopped) return;
     this.#unaddressedRefreshVersion++;
     if (this.#unaddressedRefreshAt !== undefined) return;
-    this.#unaddressedRefreshAt = Date.now() + UNADDRESSED_REFRESH_MS;
+    this.#unaddressedRefreshAt = Date.now() + this.#unaddressedRefreshMs;
     this.#wake?.();
   }
 
   async #syncPresence(): Promise<void> {
     const unaddressedRefreshVersion = this.#unaddressedRefreshVersion;
+    // Capture BEFORE starting either presence read. Every successful post-miss sample can
+    // release a hold (including a joined/notification sample), so bind its own source head
+    // here, not after joining syncPresence() or after the remote snapshot has been taken.
+    const unaddressedSampleThrough = this.#unaddressedRefreshAt !== undefined
+      ? await this.options.local.latestSequence() : undefined;
     const legacyRemote = this.options.remote instanceof RemoteBridgeSide ? this.options.remote : undefined;
     const hadLegacyNoBaseline = (legacyRemote?.legacyNoBaselineCycles ?? 0) > 0;
     const syncedAt = Date.now();
@@ -4242,7 +4361,12 @@ export class MeshBridge {
     this.#presenceAt = syncedAt;
     this.#syncedPresenceVersion = presenceVersion;
     this.#syncedLeaseVersion = leaseVersion;
-    if (this.#unaddressedRefreshVersion === unaddressedRefreshVersion) this.#unaddressedRefreshAt = undefined;
+    if (this.#unaddressedRefreshVersion === unaddressedRefreshVersion) {
+      this.#unaddressedRefreshAt = undefined;
+      // A later notification/resample can finish before the release drain. It did
+      // not capture a new source bound, so keep the completed post-miss sample.
+      if (unaddressedSampleThrough !== undefined) this.#unaddressedSampleThrough = unaddressedSampleThrough;
+    }
     // Origin updates normally renew mirrors. A source with a long lease and no heartbeat
     // still needs its capped, held projection to remain live: one lease deadline, 1 s before
     // the 15 s mirror cap (transport/commit headroom), not an unconditional 5 s presence loop.
@@ -4354,7 +4478,7 @@ export class MeshBridge {
   /** One pass: presence when due, then every new event in both directions. */
   async step(): Promise<BridgeStepResult> {
     if (!this.#cursor) await this.start();
-    if (this.#unaddressedRefreshDue()) await this.#refreshMembership();
+    if (this.#unaddressedRefreshDue()) await this.#refreshUnaddressedMembership();
     else if (this.#presenceDue()) await this.syncPresence();
     if (this.#stopped) return { toRemote: 0, toLocal: 0, dropped: 0 };
     let toRemote: { forwarded: number; dropped: number };
@@ -4631,6 +4755,20 @@ export class MeshBridge {
       delete this.#membershipRetryAt[direction];
       delete this.#membershipSafetyDelay[direction];
     }
+    const unaddressedRefreshed = direction === "toRemote" && this.#unaddressedSequence !== undefined &&
+      this.#unaddressedRefreshAt === undefined;
+    const unaddressedRefreshedThrough = unaddressedRefreshed ? this.#unaddressedSampleThrough ?? -Infinity : -Infinity;
+    if (direction === "toRemote" && this.#unaddressedSequence !== undefined) {
+      if (!unaddressedRefreshed) {
+        // The coordinator owns this sample. Do not race its timer with an inline refresh
+        // or spin on an expired retry deadline while its mirror is still settling.
+        this.#membershipRetryAt[direction] = Math.max(this.#unaddressedRefreshAt ?? 0, Date.now() + this.#unaddressedRefreshMs);
+        return { forwarded, dropped };
+      }
+      this.#unaddressedSequence = undefined;
+      delete this.#membershipRetryAt[direction];
+      passRefreshed = true;
+    }
     const membershipRetryAt = this.#membershipRetryAt[direction];
     if (membershipRetryAt !== undefined) {
       const graceDue = this.#relayGraceExpired(direction);
@@ -4684,11 +4822,7 @@ export class MeshBridge {
       // Reconcile latched origin changes/expiry even on a filtered page.
       const retainedRefresh = passRefreshed && retainedBoundary !== undefined && cursor.after < retainedBoundary &&
         this.#presenceVersion === this.#syncedPresenceVersion && this.#leaseVersion === this.#syncedLeaseVersion;
-      if (direction === "toRemote" && this.#unaddressedRefreshDue()) {
-        const end = phase("membershipWaitMs");
-        try { await this.#refreshMembership(); } finally { end(); }
-        passRefreshed = true;
-      } else if (!retainedRefresh && !this.#deferPreemptivePresence() && this.#presenceDue()) {
+      if (!retainedRefresh && !this.#deferPreemptivePresence() && this.#presenceDue()) {
         const end = phase("membershipWaitMs");
         try { await this.syncPresence(); } finally { end(); }
         passRefreshed = true;
@@ -4707,16 +4841,6 @@ export class MeshBridge {
         const event = page.events[index]!;
         if (event.sequence <= cursor.after) continue;
         if (this.#stopped) return { forwarded, dropped };
-        // A suppressed miss is not permission to publish from the page's old rules. Flush
-        // before batch admission too, even if its notification is still queued or a prior
-        // sample is in flight; #refreshMembership requires a sample after the obligation.
-        if (direction === "toRemote" && this.#unaddressedRefreshAt !== undefined && !this.#refusal(event, rules, direction)) {
-          const end = phase("membershipWaitMs");
-          try { await this.#refreshMembership(); } finally { end(); }
-          passRefreshed = true;
-          rules = await authority(false);
-          if (this.#stopped) return { forwarded, dropped };
-        }
         // Publishes and the other direction's saves can also checkpoint this consumed prefix.
         if (cursor.after === this.#lastCursorAfter[direction]) {
           discardedSinceCheckpoint = 0;
@@ -4823,23 +4947,34 @@ export class MeshBridge {
         const lapsedId = reason === "sender is not a live participant of the remote" ? event.from.id
           : reason === "ack target is not bound to this link" && isObject(event.data) && typeof event.data.targetId === "string" ? event.data.targetId
           : reason === "not addressed across" && direction === "toRemote" ? event.to : undefined;
-        let coalesced = false;
-        if (!refreshed && this.#notificationMode && direction === "toRemote" && reason === "not addressed across" &&
+        if (reason === "not addressed across" && direction === "toRemote" &&
           typeof event.to === "string" && CANONICAL_ID.test(event.to) && rules.reservedRecipients?.has(event.to)) {
-          const presenceVersion = this.#presenceVersion;
-          const leaseVersion = this.#leaseVersion;
-          // Reservations in page rules may predate a handoff whose fs notification is
-          // delayed. Read current authority before proving elsewhere; absence alone (even
-          // a canonical id) is UNKNOWN and retains the immediate refresh below.
+          // A page reservation can predate a handoff whose notification is still queued.
+          // This is a local authority read, not a remote membership sample.
           rules = await authority(false);
           reason = this.#refusal(event, rules, direction);
-          if (reason === "not addressed across" && rules.reservedRecipients?.has(event.to) &&
-            presenceVersion === this.#presenceVersion && leaseVersion === this.#leaseVersion &&
-            this.#presenceVersion === this.#syncedPresenceVersion && this.#leaseVersion === this.#syncedLeaseVersion &&
-            !this.#presenceDue() && !this.#unaddressedRefreshDue() && !this.#deferPreemptivePresence() &&
-            this.options.local.mirrored?.(event.to) === false && this.options.local.holds?.(event.to) === false) {
-            this.#deferUnaddressedRefresh();
-            coalesced = true;
+        }
+        // Known mirrors keep #2761's immediate lapsed-recipient refresh. Only unknown
+        // recipients share the trailing sample; a coalesced hold must not delay renewal.
+        const coalesced = direction === "toRemote" && reason === "not addressed across" &&
+          !(lapsedId && this.options.local.mirrored?.(lapsedId));
+        if (coalesced && event.sequence > unaddressedRefreshedThrough) {
+          this.#deferUnaddressedRefresh();
+          // Current native/other-link reservations still skip as before. Unknown canonical
+          // recipients retain the existing retry boundary until a post-miss sample commits;
+          // neither the event nor the pending sample is authority to forward.
+          if (typeof event.to === "string" && CANONICAL_ID.test(event.to) &&
+            !rules.reservedRecipients?.has(event.to) && isIdentity(event.from) &&
+            (event.data === undefined || isObject(event.data)) && !this.#destinationRefusal(event, direction)) {
+            // The coalesced hold returns before the ordinary refusal path below.
+            // Report the miss here without consuming it or treating a sample as authority.
+            this.#reportMiss(direction, event, rules, "membership-retained");
+            this.#unaddressedSequence = event.sequence;
+            this.#deferMembership(direction, event);
+            this.#membershipRetryAt[direction] = this.#unaddressedRefreshAt ?? Date.now() + this.#unaddressedRefreshMs;
+            // Persist only the consumed prefix; the held event and page-end offset stay unread.
+            if (cursor.after > start) checkpoint();
+            return { forwarded, dropped };
           }
         }
         // A file notification may still be queued when a later event append is already
@@ -4851,6 +4986,7 @@ export class MeshBridge {
           reason = this.#refusal(event, rules, direction);
         }
         if (reason && this.#staleMembership(event, rules, direction, reason)) {
+          this.#reportMiss(direction, event, rules, "membership-retained", true);
           this.#deferMembership(direction, event);
           if (cursor.after > start) checkpoint();
           return { forwarded, dropped };
@@ -4896,7 +5032,7 @@ export class MeshBridge {
           if (reason !== "not addressed across") {
             dropped += 1;
             this.#log(`${direction}: dropped ${event.topic} ${event.id} from ${event.from.id}: ${reason}`);
-          } else this.#notAddressed(direction, event);
+          } else this.#notAddressed(direction, event, rules);
         } else if (this.#stopped) {
           return { forwarded, dropped };
         } else if (!seen.has(event.id)) {
@@ -4980,6 +5116,7 @@ export class MeshBridge {
               // a proven takeover still refuses, and otherwise retry from the durable cursor.
               rules = await authority(false);
               const currentReason = this.#refusal(event, rules, direction);
+              this.#reportMiss(direction, event, rules, "commit");
               if (this.#staleMembership(event, rules, direction, currentReason)) {
                 this.#deferMembership(direction, event);
                 if (cursor.after > start) checkpoint();
@@ -5207,7 +5344,7 @@ export class MeshBridge {
   /** Follow notifications until stop() or failure. No timer is armed for empty idle.
    * Timer inventory: source/held-mirror expiry and pending half-lease flush (one shot);
    * retained stale-membership safety net (1 s..30 s backoff), plus exact persisted relay grace;
-   * known-elsewhere outbound misses (one trailing sample within 1 s);
+   * outbound misses (one trailing sample per 15 s, shared by both directions);
    * actual lock/SQLite busy, including WAL notification commit settlement (100 ms..2 s);
    * WAL-cap refusal (1 s..30 s); explicitly negotiated legacy-only 250 ms polling.
    * Held-publication fence retries, RPC deadlines and stop
@@ -5292,7 +5429,7 @@ export class MeshBridge {
               await this.#reconcileSeen();
               await this.syncPresence();
             }
-          } else if (this.#unaddressedRefreshDue()) await this.#refreshMembership();
+          } else if (this.#unaddressedRefreshDue()) await this.#refreshUnaddressedMembership();
           else if (this.#presenceDue()) await this.syncPresence();
         })();
         // stop() needs a settlement fence, not a second rejection of a failed pass.

@@ -650,7 +650,8 @@ export class NatsBridgeCarrier {
       "command id reused with different input or from another reply address");
     }
     // Only a fresh credential-machine/presence/allow-gated delivery can reach this repair seam.
-    // Stored bytes (never this delivery's reconstructed event) are the projection authority.
+    // A same-key attempt may have new times; ONLY the immutable FIRST claim's bytes/deadline
+    // are projection authority. Existing-different receipts/recipes still fail before any replay.
     // Generic control permits data-only asks; they are not native RPC input. Preserve their normal
     // forwarding/refusal behavior without trying to mint native evidence for a missing message.
     if ((stored.operation === "cancel" || (stored.operation === "ask" && typeof stored.body?.message === "string")) &&
@@ -670,7 +671,7 @@ export class NatsBridgeCarrier {
       }) };
     }
     // publish, or resend (unconfirmed): present the FIRST event; the file store's receipt makes a repeat one append.
-    // Ordinary retry attempt times may differ, but never replace retained bytes or extend their deadline.
+    // Retry attempt times may differ for ANY operation, but never replace first bytes or extend their deadline.
     const retained = stored.body;
     const event: MeshEvent = {
       id: retained ? stored.sourceEventId : input.id, sequence: delivery.sequence,

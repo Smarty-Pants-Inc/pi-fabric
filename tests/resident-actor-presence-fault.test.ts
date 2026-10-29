@@ -6,18 +6,22 @@ import { ActorDirectory } from "../src/actors/directory.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import { ResidentHost } from "../src/residency/host.js";
 import type { ResidentHostConfig } from "../src/residency/protocol.js";
 import { ParticipantDirectory, type ParticipantSnapshotSource } from "../src/topology/participant-directory.js";
 import { fakeManagerHeapWorker } from "./fixtures/manager-heap-probe.js";
 
-// Keep: #17018 P2-1, the actual resident registration/ActorDirectory boundary.
-// Main's companion regression authenticates a real hard-linked terminal result;
-// here the same strict-reader error is injected while a genuine activation waits
-// for a real manager permit, so source recovery is tested without changing state.
+// Keep: the actual resident registration/ActorDirectory failure boundary.
+// The companion strict-reader regression authenticates a hard-linked terminal result;
+// here a strict-reader error cannot affect inventory while a real activation waits
+// for a manager permit. A real presence-source failure still isolates and recovers.
 // Worker execution alone is fake; no process is launched or signalled.
-it("resident presence reports a single preparing actor fault and preserves/re-admits the real directory actors", async () => {
+it("resident inventory avoids strict result reads but retains real source failures privately", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "resident-actor-presence-fault-"));
+  vi.stubEnv("SMARTY_ROLE", "worktree-agent@x");
+  vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+  vi.stubEnv("PI_FABRIC_SESSION_ID", undefined);
   const config: ResidentHostConfig = {
     format: 1, rootId: "session:resident-presence-fault", sessionId: "resident-presence-fault",
     cwd: root, projectRoot: root, meshRoot: path.join(root, "mesh"), actorRoot: path.join(root, "actors"),
@@ -72,6 +76,8 @@ it("resident presence reports a single preparing actor fault and preserves/re-ad
     outcome = activation.then(value => ({ value }), error => ({ error }));
     await queued.promise;
     expect(host.actors.status(damaged.id)).toMatchObject({ status: "waiting", preparing: { runId: activationId } });
+    expect(host.actors.listOwned(true, (_id, error) => { throw error; }).find(actor => actor.id === damaged.id))
+      .toMatchObject({ preparing: { runId: activationId, queuePosition: 1 } });
     await host.participants.refresh();
     const status = host.agents.status;
     const integrityError = Object.assign(new Error("resident preparing result is unauthenticated"), { code: "FABRIC_MISSING_RESULT" });
@@ -83,10 +89,38 @@ it("resident presence reports a single preparing actor fault and preserves/re-ad
     const reportFailure = vi.fn();
     expect([...sources.keys()].sort()).toEqual(["actors", "agents"]);
     const actorSource = sources.get("actors")!;
-    expect(actorSource(reportFailure).map(record => record.id).sort()).toEqual([healthy.id, otherScope.id].sort());
-    expect(reportFailure).toHaveBeenCalledExactlyOnceWith(integrityError, damaged.id);
+    expect(actorSource(reportFailure).map(record => record.id).sort()).toEqual([damaged.id, healthy.id, otherScope.id].sort());
+    expect(reportFailure).not.toHaveBeenCalled();
+    expect(strictReader).not.toHaveBeenCalled();
+    expect(() => host.actors.list()).toThrow(integrityError);
     expect(() => host.actors.listOwned()).toThrow(integrityError);
     expect(() => host.actors.listOwned(true)).toThrow(integrityError);
+    expect(() => host.actors.status(damaged.id)).toThrow(integrityError);
+    strictReader.mockClear();
+    await expect(host.participants.refresh()).resolves.toBeUndefined();
+    expect(strictReader).not.toHaveBeenCalled();
+    expect(host.participants.isolatedSourceFailures()).toEqual([]);
+    for (const actor of [damaged, healthy, otherScope]) expect(host.participants.get(actor.id, undefined, { fresh: true }))
+      .toMatchObject({ id: actor.id, kind: "actor", ownerHostId: host.hostId });
+    strictReader.mockRestore();
+
+    // A failed result-free queue lookup omits only actors needing that lookup,
+    // including across the project/session directory and publication batch boundary.
+    const sourceError = Object.assign(new Error("EACCES: presence inventory unavailable"), { code: "EACCES" });
+    const presenceReader = vi.spyOn(host.agents, "listForPresence").mockImplementation(() => { throw sourceError; });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    expect(actorSource(reportFailure).map(record => record.id).sort()).toEqual([healthy.id, otherScope.id].sort());
+    expect(reportFailure).toHaveBeenCalledExactlyOnceWith(sourceError, damaged.id);
+    expect(() => host.actors.listOwned(true, (_id, failure) => { throw failure; })).toThrow(sourceError);
+    const batch = host.actors.presenceBatch(true);
+    expect(batch.actorIds).not.toContain(damaged.id);
+    for (const actor of [healthy, otherScope]) {
+      const updated = await host.actors.setInstructions(actor.id, "Updated healthy instructions.");
+      expect(host.mesh.get(`actors/${config.sessionId}/${actor.id}`)?.value)
+        .toMatchObject({ id: actor.id, instructionsDigest: updated.instructionsDigest });
+    }
     await expect(host.participants.refresh()).resolves.toBeUndefined();
     expect(host.participants.isolatedSourceFailures()).toContainEqual({ source: "actors", participantId: damaged.id,
       reason: "participant snapshot source failed", since: expect.any(Number) });
@@ -94,9 +128,19 @@ it("resident presence reports a single preparing actor fault and preserves/re-ad
     expect(host.participants.get(damaged.id, undefined, { fresh: true })).toBeUndefined();
     for (const actor of [healthy, otherScope]) expect(host.participants.get(actor.id, undefined, { fresh: true }))
       .toMatchObject({ id: actor.id, kind: "actor", ownerHostId: host.hostId });
-    const reporterError = new Error("reporter unavailable");
-    expect(() => actorSource(() => { throw reporterError; })).toThrow(reporterError);
-    strictReader.mockRestore();
+    expect(host.actors.listOwned(true).map(actor => actor.id)).toContain(damaged.id);
+    expect(host.actors.status(damaged.id)).toMatchObject({ preparing: { runId: activationId, queuePosition: 1 } });
+    await flushFabricDiagnostics();
+    const directory = path.join(root, "agent", "fabric", "diagnostics");
+    const diagnostics = fs.readdirSync(directory).filter(file => file.endsWith(".jsonl")).flatMap(file =>
+      fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)));
+    for (const source of ["src/topology/participant-directory.ts", "src/actors/manager.ts"])
+      expect(diagnostics).toContainEqual(expect.objectContaining({ level: "warning", source,
+        message: expect.stringContaining(sourceError.message) }));
+    expect(warn).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+    expect(stderr).not.toHaveBeenCalled();
+    presenceReader.mockRestore();
     // Same queued actor, same id and preparing state: no fabricated fallback row
     // and no lifecycle change are needed for the next good source to return it.
     expect(host.actors.status(damaged.id)).toMatchObject({ status: "waiting", preparing: { runId: activationId } });
@@ -115,7 +159,9 @@ it("resident presence reports a single preparing actor fault and preserves/re-ad
     blockerAlive = false; blockerExit.resolve();
     await outcome;
     await host.close();
+    await flushFabricDiagnostics();
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     fs.rmSync(root, { recursive: true, force: true });
   }
 }, 30_000);

@@ -194,13 +194,14 @@ describe("KV flow-control permission defense", () => {
       close: async () => { if (!stopped) { stopped = true; wakeStatus?.(); resolveClosed(); } },
     } as unknown as ConsumerMessages;
     const consumer = {
-      info: async () => ({ name: "flow-control-consumer", num_pending: 0 }),
+      info: async () => ({ name: "flow-control-consumer", num_pending: 0,
+        config: { deliver_subject: "flow-control-inbox", idle_heartbeat: 30_000_000_000 } }),
       consume: async () => messages,
       delete: async () => true,
       isPullConsumer: () => false,
       isPushConsumer: () => true,
     };
-    const js = { consumers: { getPushConsumer: async () => consumer } } as unknown as JetStreamClient;
+    const js = { consumers: { getPushConsumer: async () => consumer, getBoundPushConsumer: async () => consumer } } as unknown as JetStreamClient;
     const bucket = {} as KV;
     const store = new NatsKvStore(bucket, { bucket: BUCKET, ttlMs: 15_000, markerTtlMs: 300_000 }, js, (callback) => {
       listener = callback;

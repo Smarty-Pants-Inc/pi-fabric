@@ -33,10 +33,21 @@ elif rest[0] == "-n" and rest[2:4] == ["get", "pod"]:
     status = {"terminated": {"exitCode": pod["terminated"]}} if pod["terminated"] is not None else ({"running": {}} if pod["running"] else {"waiting": {}})
     print(json.dumps({"metadata": {"name": pod["name"], "uid": pod["uid"]},
                       "spec": {"nodeName": pod.get("nodeName", "synthetic-node"),
-                               "containers": [{"name": "pi", "env": [{"name": "PI_FABRIC_MESH_ROOT", "value": pod["meshRoot"]}]}]},
+                               "containers": [{"name": "pi", "args": pod.get("args", []),
+                                                "env": [{"name": "PI_FABRIC_MESH_ROOT", "value": pod["meshRoot"]}] +
+                                                ([{"name": "PI_FABRIC_MESH_NATS", "value": json.dumps({"machine": pod["natsMachine"],
+                                                   "servers": ["tls://nats.synthetic.invalid:4222"]})}] if pod.get("natsMachine") else [])}]},
                       "status": {"containerStatuses": [{"name": "pi", "state": status}]}}))
 elif rest[0] == "-n" and rest[2] == "exec" and rest[7:9] == ["test", "-x"]:
     sys.exit(0 if state.get("cliPresent", True) else 1)
+elif rest[0] == "-n" and rest[2] == "exec" and "--identity" in rest:
+    # The bridge seam's read-only identity read (exec: {line, code, changeUid}).
+    identity = state["identity"]
+    print(identity["line"])
+    if identity.get("changeUid"):
+        state["pod"]["uid"] = identity["changeUid"]
+        save()
+    sys.exit(identity.get("code", 0))
 elif rest[0] == "-n" and rest[2] == "exec":
     print(state["exec"]["line"])
     if state["exec"].get("terminate"):

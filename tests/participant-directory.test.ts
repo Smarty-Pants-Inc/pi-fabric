@@ -7,6 +7,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import { MeshBackgroundRetry } from "../src/core/atomic-write.js";
+import { configureFabricDiagnostics, fabricDiagnosticsFile, flushFabricDiagnostics } from "../src/core/diagnostics.js";
 import { confirmWitnessPlatform, ParticipantDirectory } from "../src/topology/participant-directory.js";
 import { MeshLock } from "../src/mesh/mesh-lock.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
@@ -397,17 +398,19 @@ describe("#3662 ParticipantDirectory lineage liveness", () => {
 });
 describe("ParticipantDirectory.mirroredControlOwner", () => {
   const keyFor = (prefix: string, id: string) => prefix + createHash("sha256").update(id).digest("hex");
-  const setup = async () => {
+  const setup = async (localKind: MeshIdentity["kind"] = "main", localRoot = "local-root") => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-mirror-owner-"));
     roots.push(root);
     const meshRoot = path.join(root, "mesh");
     const writer = new MeshStore(meshRoot, 64 * 1024, 1_000);
     const reader = new MeshStore(meshRoot, 64 * 1024, 1_000, { readCacheMs: 60_000 });
-    const localIdentity: MeshIdentity = { id: "local-identity", name: "main", kind: "main" };
+    const localIdentity: MeshIdentity = { id: "local-identity", name: "main", kind: localKind };
     const identity: MeshIdentity = { id: "remote-identity", name: "main", kind: "main" };
     const directory = new ParticipantDirectory(reader, {
-      enabled: true, hostId: "local-host", rootId: "local-root", identity: localIdentity,
+      enabled: true, hostId: "local-host", rootId: localRoot, identity: localIdentity,
+      ...steadyLease,
     });
+    directories.push(directory);
     const participant = {
       ...rootRecord("remote-root", "remote-host", "remote-session"),
       ownerIdentityId: identity.id, remoteHost: "forge",
@@ -429,6 +432,77 @@ describe("ParticipantDirectory.mirroredControlOwner", () => {
     const read = () => directory.mirroredControlOwner(host.id, identity.id, participant.id);
     return { meshRoot, writer, reader, directory, identity, participant, host, participantKey, hostKey, putParticipant, putHost, read };
   };
+
+  // Keep reason: mirror/local-ownership trust boundary and the recorded smarty-dev#17198 catch.
+  it.each(["agent", "actor"] as const)("resolves a mirrored Main from its native %s child's inherited lineage", async (kind) => {
+    const { directory, participant, host, read } = await setup(kind, "remote-root");
+    const identity = directory.options.identity;
+    directory.registerSource(() => [{
+      ...agentRecord(identity.id, participant.id, directory.options.hostId, participant.id),
+      kind, ownerIdentityId: identity.id,
+    }]);
+    await directory.refresh(); // Publishes the child's own native participant and host, not a Main.
+    expect(directory.get(participant.id, Date.now(), { fresh: true }))
+      .toMatchObject({ id: participant.id, remoteHost: "forge", stale: false });
+    expect(directory.list({ scope: "project", kinds: ["root"], fresh: true }).map(record => record.id))
+      .toContain(participant.id);
+    expect(read()).toEqual({ remoteHost: "forge", expiresAt: host.expiresAt });
+    expect(directory.lastKnown(participant.id)).toBeUndefined(); // A live Main has no lapsed-lease result.
+  });
+
+  it.each([
+    ["agent", false], ["agent", true], ["actor", false], ["actor", true],
+  ] as const)("does not let another native %s's lineage hide a mirrored Main (expired: %s)", async (kind, expired) => {
+    const { writer, directory, participant, host, read } = await setup();
+    const identity: MeshIdentity = { id: "native-child", name: "child", kind };
+    await writer.put({
+      key: keyFor("topology/hosts/", "native-child-host"), identity,
+      value: { ...host, id: "native-child-host", identity, remoteHost: undefined,
+        expiresAt: Date.now() + (expired ? -60_000 : 120_000) },
+    });
+    expect(directory.get(participant.id, Date.now(), { fresh: true }))
+      .toMatchObject({ id: participant.id, remoteHost: "forge", stale: false });
+    expect(directory.list({ scope: "project", kinds: ["root"], fresh: true }).map(record => record.id))
+      .toContain(participant.id);
+    expect(read()).toEqual({ remoteHost: "forge", expiresAt: host.expiresAt });
+  });
+
+  it("still refuses a mirror of this process's own native Main", async () => {
+    const { directory, participant, read } = await setup("main", "remote-root");
+    directory.options.identity = { ...directory.options.identity, id: participant.id };
+    expect(read()).toBeUndefined();
+    expect(directory.get(participant.id, Date.now(), { fresh: true })).toBeUndefined();
+    expect(directory.list({ scope: "project", kinds: ["root"], fresh: true })).toEqual([]);
+  });
+
+  it.each(["id", "identity", "published"] as const)("still protects a child's actual local %s claim", async (claim) => {
+    const { writer, directory, participant, host, read } = await setup("agent", "remote-root");
+    if (claim === "published") {
+      const identity = directory.options.identity;
+      directory.registerSource(() => [{ ...rootRecord(participant.id, directory.options.hostId, "local-session"),
+        ownerIdentityId: identity.id }]);
+      await directory.refresh();
+    } else {
+      const identity: MeshIdentity = { id: claim === "identity" ? participant.id : "native-child", name: "child", kind: "agent" };
+      const id = claim === "id" ? participant.id : "native-child-host";
+      await writer.put({ key: keyFor("topology/hosts/", id), identity,
+        value: { ...host, id, identity, remoteHost: undefined } });
+    }
+    expect(read()).toBeUndefined();
+    expect(directory.get(participant.id, Date.now(), { fresh: true })?.remoteHost).not.toBe("forge");
+  });
+
+  it.each(["participant-author", "host-author", "provenance"] as const)("does not trust a forged Main from a child with matching lineage (%s)", async (forgery) => {
+    const { directory, identity, participant, putParticipant, putHost, read } = await setup("agent", "remote-root");
+    // Prove there is no collision masking a provenance failure once the regression is fixed.
+    expect(read()).toBeDefined();
+    const stranger = { ...identity, id: "stranger" };
+    if (forgery === "participant-author") await putParticipant({}, stranger);
+    else if (forgery === "host-author") await putHost({}, stranger);
+    else await putParticipant({ bridgeVia: "relay" }); // Must match the companion host's provenance.
+    expect(read()).toBeUndefined();
+    expect(directory.get(participant.id, Date.now(), { fresh: true })).toBeUndefined();
+  });
 
   it("exposes the exact public read port and retains fresh expiry knowledge from first send through lapse", async () => {
     const { directory, reader, host, putHost, read, meshRoot } = await setup();
@@ -1616,6 +1690,14 @@ describe("ParticipantDirectory", () => {
       vi.spyOn(Math, "random").mockReturnValue(0.999999);
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-directory-outage-"));
       roots.push(root);
+      vi.stubEnv("SMARTY_ROLE", "worktree-agent@x");
+      vi.stubEnv("PI_CODING_AGENT_DIR", path.join(root, "agent"));
+      configureFabricDiagnostics("directory-outage");
+      const lines = async (): Promise<string[]> => {
+        await flushFabricDiagnostics();
+        return fs.readFileSync(fabricDiagnosticsFile("directory-outage"), "utf8").trim().split("\n")
+          .map(line => JSON.parse(line).message);
+      };
       const identity: MeshIdentity = { id: "session:busy", name: "main", kind: "main", sessionId: "busy" };
       const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 1_000, { lockTimeoutMs: 100 });
       const source = vi.fn(() => [rootRecord(identity.id, identity.id, "busy")]);
@@ -1655,8 +1737,8 @@ describe("ParticipantDirectory", () => {
         hold();
         const holder = fs.readFileSync(path.join(lockPath, "owner"), "utf8");
         expect(await tick()).toBe("retry");
-        expect(warn).toHaveBeenCalledOnce();
-        expect(warn.mock.calls[0]![0]).toContain(`pid ${process.pid}`);
+        expect(await lines()).toHaveLength(1);
+        expect((await lines())[0]).toContain(`pid ${process.pid}`);
         const retry = runs.mock.contexts.at(-1) as MeshBackgroundRetry;
         const recovered = vi.spyOn(retry, "success");
         await vi.advanceTimersByTimeAsync(retry.waitMs);
@@ -1674,7 +1756,7 @@ describe("ParticipantDirectory", () => {
         expect(fs.readFileSync(path.join(lockPath, "owner"), "utf8")).toBe(holder);
 
         expect(await tick()).toBe("retry");
-        expect(warn).toHaveBeenCalledOnce(); // same live holder, same continuous outage
+        expect(await lines()).toHaveLength(1); // same live holder, same continuous outage
         expect(retry.waitMs).toBeGreaterThan(0); // second timeout retained the doubled delay
         heartbeat();
         expect(await runs.mock.results.at(-1)!.value).toBe("skipped");
@@ -1690,7 +1772,7 @@ describe("ParticipantDirectory", () => {
         expect(await tick()).toBe("retry");
         // smarty-dev#8305: a later outage inside the warning window is counted, not printed.
         // (This asserted the old once-per-outage warning, unbounded on a flapping lock.)
-        expect(warn).toHaveBeenCalledOnce();
+        expect(await lines()).toHaveLength(1);
 
         // The first real acquisition after the window prints the final summary of both
         // suppressed retries (the continuous outage's second timeout and the later outage).
@@ -1699,13 +1781,16 @@ describe("ParticipantDirectory", () => {
         expect(retry.waitMs).toBe(0);
         expect(await tick()).toBe("done");
         expect(recovered).toHaveBeenCalledTimes(2);
-        expect(warn).toHaveBeenCalledTimes(2);
-        expect(warn.mock.calls[1]![0]).toMatch(
+        expect(await lines()).toHaveLength(2);
+        expect((await lines())[1]).toMatch(
           /^\[pi-fabric\] participant heartbeat\/change refresh: mesh lock recovered \(2 similar retries suppressed in the last 6\ds\)$/);
+        expect(warn).not.toHaveBeenCalled();
       } finally {
         fs.rmSync(lockPath, { recursive: true, force: true });
         await directory.close();
+        await flushFabricDiagnostics();
         vi.restoreAllMocks();
+        vi.unstubAllEnvs();
         vi.useRealTimers();
       }
     });

@@ -305,6 +305,11 @@ describe("exact task return-address policy", () => {
     env.PI_FABRIC_TASK_ESCALATION_TARGETS = JSON.stringify([KATE]);
     const child = applyTaskReturnAddress({ ...env, PI_FABRIC_PARENT_RUN: "run" }, args);
     const address = readTaskReturnAddress(child)!;
+    // Resolving a mirrored Main from inherited lineage must not widen the launch-bound targets.
+    child.PI_FABRIC_SPAWNER_ID = KATE;
+    child.PI_FABRIC_TASK_ESCALATION_TARGETS = JSON.stringify([KATE]);
+    expect(address.spawnerId).toBe(SPAWNER);
+    expect(() => assertTaskMainTarget(address, SPAWNER)).not.toThrow();
     expect(address.escalationTargets).toEqual([ORG]);
     expect(() => assertTaskMainTarget(address, KATE)).toThrow("allowed targets:");
     expect(() => assertTaskMainTarget(address, ORG)).not.toThrow();

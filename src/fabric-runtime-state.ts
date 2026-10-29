@@ -1213,6 +1213,7 @@ export class FabricRuntimeState {
           rootId: mainAgent.id, sessionId, meshRoot, pi: this.pi, context: () => live.read(ctx => ctx),
           main: () => mainAgent, actors: () => this.#actors, agents: () => this.#agents,
           completions: () => this.#completionInbox?.drainPending(),
+          ownerIncarnation: () => participants.ownerIncarnation,
         }));
         this.#mainDrain = drain;
         void drain.start();
@@ -1640,6 +1641,7 @@ export class FabricRuntimeState {
             canManageActor,
             snapshotActorOwnership,
             canConsumeMesh: canConsumeActorMesh,
+            ...(participantView ? { waitForMeshReadyChange: (signal: AbortSignal) => participantView!.whenChanged(mainAgentId, signal) } : {}),
             isOwnResidentActor: (id) => isOwnResidentActor(transport ? actorParticipants : this.#participants!, id, mainAgentId),
             lineageAlive,
             claimResidency: "session",
@@ -1668,6 +1670,7 @@ export class FabricRuntimeState {
             canManageActor,
             snapshotActorOwnership,
             canConsumeMesh: canConsumeActorMesh,
+            ...(participantView ? { waitForMeshReadyChange: (signal: AbortSignal) => participantView!.whenChanged(mainAgentId, signal) } : {}),
             lineageAlive,
             claimResidency: "session",
             rootId: mainAgentId,

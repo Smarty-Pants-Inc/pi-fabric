@@ -1079,7 +1079,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     claude: { binary: "claude" },
     veda: { binary: "veda", backend: "agy", persona: "navigator-chat" },
     thinking: DEFAULT_FABRIC_THINKING,
-    maxConcurrent: 4,
+    maxConcurrent: 20,
     maxPerExecution: 100,
     maxDepth: 2,
     timeoutMs: DEFAULT_AGENT_TIMEOUT_MS,

@@ -784,7 +784,9 @@ export class FabricControlPlane {
       if (admission) this.#assertAdmission();
       return store.put(input);
     }
-    const results = await store.writeBatch({ identity: this.identity, ops: [{ kind: "put", ...input }], beforeCommit: () => {
+    const results = await store.writeBatch({ identity: this.identity,
+      lockTiming: { operation: admission ? "control-claim" : "control-private-seen" },
+      ops: [{ kind: "put", ...input }], beforeCommit: () => {
       if (admission) this.#assertAdmission();
       else assertMeshConsumption(this.options.canConsumeMesh);
     } });
@@ -2703,7 +2705,8 @@ export class FabricControlPlane {
 
   async #persistNatsOutcome(key: string, retained: NatsRetainedOutcome): Promise<void> {
     try {
-      await this.#seen.writeBatch({ identity: this.identity, ops: [{ kind: "put", key, ifVersion: retained.version,
+      await this.#seen.writeBatch({ identity: this.identity, lockTiming: { operation: "control-nats-private-seen" },
+        ops: [{ kind: "put", key, ifVersion: retained.version,
         value: (writtenAt: number) => {
           // Evaluated under the local lock AFTER CAS: a conflicting retry keeps the last attempted stamp.
           retained.record = { ...retained.record, carrier: "nats", writtenAt };
@@ -2772,7 +2775,8 @@ export class FabricControlPlane {
       try {
         // The ONLY claim lock is #seen's local lock. Check the lease under that lock,
         // immediately before the create, even without a supplied canConsumeMesh hook.
-        const results = await this.#seen.writeBatch({ identity: this.identity, ops: [{ kind: "put", key,
+        const results = await this.#seen.writeBatch({ identity: this.identity, lockTiming: { operation: "control-nats-private-claim" },
+          ops: [{ kind: "put", key,
           value: (writtenAt: number) => (record = { ...record!, carrier: "nats", writtenAt }), ifVersion: 0 }], beforeCommit: () => {
           this.#assertNatsSession(session);
           if (!this.#natsSenderVerified(context)) throw new MeshConsumptionPausedError();
@@ -2872,7 +2876,8 @@ export class FabricControlPlane {
           return (record?.carrier === "nats" || record?.bodyDigest !== undefined) && record.expiresAt < now && !this.#natsFlights.has(entry.key) && !this.#natsOutcomes.has(entry.key);
         });
         for (let start = 0; start < stale.length && !this.#closed && !this.#paused; start += 64) {
-          await this.#seen.writeBatch({ identity: this.identity, ops: stale.slice(start, start + 64).map(entry => ({
+          await this.#seen.writeBatch({ identity: this.identity, lockTiming: { operation: "control-nats-private-seen-cleanup" },
+            ops: stale.slice(start, start + 64).map(entry => ({
             kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })) });
         }
       })();
@@ -3371,6 +3376,7 @@ export class FabricControlPlane {
     for (let start = 0; start < stale.length; start += 64) {
       await this.#seen.writeBatch({
         identity: this.identity,
+        lockTiming: { operation: "control-private-seen-cleanup" },
         ops: stale.slice(start, start + 64).map((entry) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
       });
     }
@@ -3427,6 +3433,7 @@ export class FabricControlPlane {
     for (let start = 0; start < dead.length; start += 64) {
       await this.mesh.writeBatch({
         identity: this.identity,
+        lockTiming: { operation: "control-legacy-seen-cleanup" },
         ops: dead.slice(start, start + 64).map(({ entry }) => ({ kind: "delete" as const, key: entry.key, ifVersion: entry.version, onConflict: "skip" as const })),
       });
     }

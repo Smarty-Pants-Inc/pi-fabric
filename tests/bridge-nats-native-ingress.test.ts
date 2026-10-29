@@ -534,7 +534,7 @@ describe.skipIf(!POSIX)("native ingress: genuine durable claims, not public even
     expect(() => f.verifier().admitNativeControl(forged)).toThrow();
   });
 
-  it("retains FIRST exact toFile bytes across reopen; only fresh same-byte redelivery repairs missing projection", async () => {
+  it("retains FIRST exact toFile authority across reopen; fresh equivalent retimed claims repair but never extend it", async () => {
     const f = await fixture(), envelope = f.envelope();
     const first = eventOf(await f.deliver(envelope)), event = await f.persist(first);
     const file = path.join(f.dir, NATIVE_INGRESS_DIRECTORY, `${commandId()}.json`), bytes = fs.readFileSync(file, "utf8");
@@ -548,18 +548,40 @@ describe.skipIf(!POSIX)("native ingress: genuine durable claims, not public even
     const carrier = f.carrierFor(natsCarrierLedger(reopened, LINK));
     const sender = f.presence.natsEntries.get(natsLead.id)!;
     f.presence.natsEntries.set(natsLead.id, { ...sender, identity: { ...sender.identity, sessionId: "poisoned-on-redelivery" } });
-    const resent = eventOf(await carrier.inbound({ envelope: { ...envelope, id: "different-source-resend-id" }, sourceMachine: POD_MACHINE, sequence: 2 }));
+    const retry = { ...envelope, id: "different-source-resend-id", body: { ...envelope.body,
+      requestCreatedAt: envelope.body.requestCreatedAt + 1, requestedAt: envelope.body.requestedAt + 1,
+      deadlineAt: envelope.body.deadlineAt + 1 } };
+    const ledgerBytes = fs.readFileSync(path.join(f.dir, BRIDGE_NATS_LEDGER_FILE));
+    const resent = eventOf(await carrier.inbound({ envelope: retry, sourceMachine: POD_MACHINE, sequence: 2 }));
     expect(resent.id).toBe(first.id); // source stamp stays bound to the first claim, not the latest packet
     expect(resent.data).toEqual(first.data);
     expect(fs.readFileSync(file, "utf8")).toBe(bytes);
+    expect(reopened.lookup("toFile", commandId())).toEqual(stored);
     expect(f.verifier().admitNativeControl(event)).toBeDefined();
-    // Generic wire digest ignores these fields; complete retained evidence MUST NOT.
+    // Retimed CLAIMS reuse first bytes. Direct receipt consumers still reject changed event times.
     for (const changed of [{ deadlineAt: envelope.body.deadlineAt + 1 }, { requestedAt: envelope.body.requestedAt - 1 },
-      { requestCreatedAt: envelope.body.requestCreatedAt - 1 }, { ownerIncarnation: "altered" }]) {
-      const plan = await carrier.inbound({ envelope: { ...envelope, body: { ...envelope.body, ...changed } }, sourceMachine: POD_MACHINE, sequence: 3 });
-      expect(plan).toMatchObject({ kind: "reply", envelope: { body: { notRun: true } } });
+      { requestCreatedAt: envelope.body.requestCreatedAt - 1 }]) {
+      const plan = await carrier.inbound({ envelope: { ...envelope, id: "retimed-claim", body: { ...envelope.body, ...changed } },
+        sourceMachine: POD_MACHINE, sequence: 3 });
+      expect(eventOf(plan).data).toEqual(first.data);
+      const altered = clone(event); Object.assign(bodyOf(altered), changed);
+      altered.dedupeFingerprint = controlBodyFingerprint(altered.data, altered.principal);
+      expect(() => f.verifier().admitNativeControl(altered)).toThrow(/differs/);
       expect(fs.readFileSync(file, "utf8")).toBe(bytes);
     }
+    const changedOwner = await carrier.inbound({ envelope: { ...retry, body: { ...retry.body, ownerIncarnation: "altered" } },
+      sourceMachine: POD_MACHINE, sequence: 4 });
+    expect(changedOwner).toMatchObject({ kind: "reply", envelope: { body: { notRun: true, errorCode: "BRIDGE_NATS_CLAIM_MISMATCH" } } });
+    // A fresh verified attempt after the FIRST deadline cannot renew native execution authority.
+    f.clock.now = envelope.body.deadlineAt + 1;
+    const expiredRetry = eventOf(await carrier.inbound({ envelope: { ...retry, id: "after-first-deadline", body: { ...retry.body,
+      requestCreatedAt: f.clock.now, requestedAt: f.clock.now, deadlineAt: f.clock.now + 60_000 } },
+      sourceMachine: POD_MACHINE, sequence: 5 }));
+    expect(expiredRetry.data).toEqual(first.data);
+    expect(() => f.verifier().admitNativeControl(event)).toThrow(/expired/);
+    expect(reopened.lookup("toFile", commandId())).toEqual(stored);
+    expect(fs.readFileSync(file, "utf8")).toBe(bytes);
+    expect(fs.readFileSync(path.join(f.dir, BRIDGE_NATS_LEDGER_FILE))).toEqual(ledgerBytes);
   });
 
   it("never overwrites an existing-different receipt; failures expose neither event nor source ACK", async () => {

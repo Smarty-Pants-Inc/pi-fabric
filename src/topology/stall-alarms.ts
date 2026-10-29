@@ -172,11 +172,12 @@ const absence = async (mesh: MeshStore, identity: MeshIdentity, rootId: string, 
   const key = absentKey(rootId);
   const current = mesh.get(key, { fresh: true });
   if (live) {
-    if (current) await mesh.writeBatch({ identity, ops: [{ kind: "delete", key, ifVersion: current.version, onConflict: "skip" }] });
+    if (current) await mesh.writeBatch({ identity, lockTiming: { operation: "root-absence-clear" },
+      ops: [{ kind: "delete", key, ifVersion: current.version, onConflict: "skip" }] });
     return undefined;
   }
   if (current) return (current.value as { firstAbsentAt: number }).firstAbsentAt;
-  await mesh.writeBatch({ identity, ops: [], prepare: view => view.get(key) ? [] :
+  await mesh.writeBatch({ identity, lockTiming: { operation: "root-absence-mark" }, ops: [], prepare: view => view.get(key) ? [] :
     [{ kind: "put", key, ifVersion: view.version(key), value: { rootId, firstAbsentAt: now } }] });
   return (mesh.get(key, { fresh: true })!.value as { firstAbsentAt: number }).firstAbsentAt;
 };

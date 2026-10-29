@@ -39,19 +39,30 @@ describe("resident recovery startup and lease fence (#3864)", () => {
     const events = Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("");
     fs.writeFileSync(path.join(run, "events.jsonl"), events);
     stageRunArchive(run, { format: 1, kind: "shutdown", result, actorSessionFile: sessionFile, actorOnly: true, notify: true });
+    const read = fs.readFileSync;
+    const archiveReadsBeforeLease: string[] = [];
+    const reads = vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+      const file = String(args[0]);
+      // Status/hosted metadata may be read for ownership restoration. Pending
+      // archive recovery and trace copying must wait for the readiness lease.
+      if (file.startsWith(run + path.sep) && ["archive-pending.json", "events.jsonl"].includes(path.basename(file)) &&
+          !fs.existsSync(path.join(config.residencyRoot, "owner.json"))) archiveReadsBeforeLease.push(file);
+      return read(...args);
+    });
     try {
       await host.start();
-      // Readiness must not inspect even a pending archive. Recovery belongs to
-      // the existing streaming poll, not an eager or background startup walk.
-      expect(fs.existsSync(path.join(run, "archive-pending.json"))).toBe(true);
+      // A post-lease poll may already have recovered the archive by the time
+      // start() resolves. Assert the real readiness fence, not that scheduling race.
+      expect(archiveReadsBeforeLease).toEqual([]);
+      expect(readHostLease(config.meshRoot, host.hostId)?.expiresAt).toBeGreaterThan(Date.now());
       const store = new ActorChildCompletionStore(sessionFile);
-      await vi.waitFor(() => expect(fs.existsSync(path.join(run, "archive-pending.json"))).toBe(false));
+      await vi.waitFor(() => expect(fs.existsSync(path.join(run, "archive-pending.json"))).toBe(false), { timeout: 5_000 });
       expect(JSON.parse(fs.readFileSync(store.resultFile(id), "utf8"))).toMatchObject(result);
       expect(store.pending()).toHaveLength(1);
-      if (live) expect(fs.readFileSync(path.join(run, "events.jsonl"), "utf8")).toBe(events);
-      else await vi.waitFor(() => expect(fs.readFileSync(path.join(run, "events.jsonl"), "utf8").trim().split("\n")).toHaveLength(201));
-    } finally { await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
-  });
+      // Recovery publishes the full saved result but never shortens either live or exited traces.
+      expect(fs.readFileSync(path.join(run, "events.jsonl"))).toEqual(Buffer.from(events));
+    } finally { reads.mockRestore(); await host.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  }, 30_000);
 
   it("publishes a lease without reading a synthetic 10k-run / 8GB archive", { timeout: 30_000 }, async () => {
     const { root, config, host } = fixture();

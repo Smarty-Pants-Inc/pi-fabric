@@ -7,10 +7,11 @@ import { procStartTime, type MainDrainBindingRequest } from "../main-drain/bindi
 import { socketPeer } from "../seat-drain/run.js";
 import type { MainDrainReply } from "../main-drain/protocol.js";
 import { evaluateDrain, scanCompletions } from "../seat-drain/evaluate.js";
+import { ENTRY_ID, journalBranch, JournalBranchError } from "../seat-drain/journal-branch.js";
 import { inventorySessionPending } from "./session-pending.js";
 
 const USAGE = `Usage:
-  pi-fabric session drain <session-uuid | session:uuid> --mesh <meshRoot> --status | --probe
+  pi-fabric session drain <session-uuid | session:uuid> --mesh <meshRoot> --status | --probe | --identity [--since <entry id> [--sealed-bytes <n>]]
   pi-fabric session drain <session-uuid | session:uuid> --mesh <meshRoot> --exit --pod-uid <uid>
       --run <32 hex> --run-sha256 <64 hex> --operation-id <32 hex> --generation <32 hex> [--deadline-s <1-600>]
 
@@ -18,6 +19,10 @@ Owner-only D3 seat drain of THIS host's live Main (smarty-dev#15310), through it
 <parent>/.<mesh>.main-drain/, the mesh root's private sibling (mode 0700, the Main's own OS user). It is never
 reachable from the mesh.
   --status  observe only;  --probe  the dry-run ingress probes
+  --identity  read-only, server verified (owner record + SO_PEERCRED): the Main's session file, current leaf
+            and presence owner incarnation (the D3 bridge seam's read); with --since, the session file read
+            read-only: its last entry, whether <entry id> is on the current branch, the entries after it, the
+            file's sha256, the sha256 of its first <n> bytes and the bytes after them (at most 64 KiB, base64)
   --exit    raw-Pod resume-drain, inside the Pod: bind to the pod UID, drain (bound wait), run the
             same zero and children checks as the host seam, then ask the Main for a clean exit
 The host seat's drain and undo run through the pinned seam (fabric-seat-drain), which proves the
@@ -58,8 +63,8 @@ const verifyServer = (mesh: string, sessionId: string, uid: number, procRoot?: s
     return undefined;
   };
 
-const VALUE_FLAGS = new Set(["--mesh", "--pod-uid", "--run", "--run-sha256", "--operation-id", "--generation", "--deadline-s"]);
-const MODE_FLAGS = new Set(["--status", "--probe", "--exit", "--help"]);
+const VALUE_FLAGS = new Set(["--mesh", "--pod-uid", "--run", "--run-sha256", "--operation-id", "--generation", "--deadline-s", "--since", "--sealed-bytes"]);
+const MODE_FLAGS = new Set(["--status", "--probe", "--identity", "--exit", "--help"]);
 
 export const runSessionDrainCli = async (
   argv: string[], io: CliIo = { stdout: process.stdout, stderr: process.stderr },
@@ -83,10 +88,17 @@ export const runSessionDrainCli = async (
     if (positionals.length !== 1 || !sessionId || !UUID.test(sessionId)) throw new UsageError("Expected exactly one canonical session UUID or session:UUID");
     const mesh = values.get("--mesh");
     if (!mesh || !path.isAbsolute(mesh)) throw new UsageError("--mesh is required and must be absolute; there is no environment default");
-    if (modes.size !== 1) throw new UsageError("Choose exactly one of --status, --probe, --exit");
+    if (modes.size !== 1) throw new UsageError("Choose exactly one of --status, --probe, --identity, --exit");
     const mode = [...modes][0]!;
     const exitValues = ["--pod-uid", "--run", "--run-sha256", "--operation-id", "--generation"];
     if (mode !== "--exit" && (exitValues.some(flag => values.has(flag)) || values.has("--deadline-s"))) throw new UsageError("Binding options belong to --exit");
+    const since = values.get("--since");
+    if (since !== undefined && (mode !== "--identity" || !ENTRY_ID.test(since))) throw new UsageError("--since <entry id> belongs to --identity");
+    const sealedText = values.get("--sealed-bytes");
+    if (sealedText !== undefined && (since === undefined || !/^[0-9]{1,12}$/.test(sealedText))) {
+      throw new UsageError("--sealed-bytes <n> belongs to --identity --since");
+    }
+    const sealedBytes = sealedText === undefined ? 0 : Number(sealedText);
     const uid = io.uid ?? process.geteuid?.();
     if (uid === undefined) throw new MainDrainClientError("MAIN_DRAIN_UNSUPPORTED_PLATFORM");
     const socket = mainDrainSocket(mesh, sessionId, uid);
@@ -100,6 +112,24 @@ export const runSessionDrainCli = async (
     if (mode === "--status" || mode === "--probe") {
       const op = mode === "--status" ? "status" : "probe";
       return emit({ op, reply: await callMainDrain(socket, sessionId, op, null) }, true);
+    }
+    if (mode === "--identity") {
+      // Read-only, but its answer is evidence: the server must be this session's inbox owner (as --exit checks).
+      const reply = await callMainDrain(socket, sessionId, "status", null, 30_000, verifyServer(mesh, sessionId, uid, io.procRoot));
+      if (reply.rootId !== `session:${sessionId}`) throw new MainDrainClientError("MAIN_DRAIN_SERVER_NOT_OWNER");
+      const identity = { rootId: reply.rootId, pid: reply.pid, meshRoot: reply.meshRoot, sessionFile: reply.session?.file ?? null,
+        leafId: reply.session?.leafId ?? null, ownerIncarnation: reply.session?.ownerIncarnation ?? null };
+      // The session file itself, read-only (rule T-FIX3): never the Main's memory for what was appended.
+      let journal: Record<string, unknown> | null = null;
+      if (since !== undefined) {
+        if (identity.sessionFile === null) journal = { error: "JOURNAL_UNKNOWN" };
+        else {
+          try { journal = { ...journalBranch(identity.sessionFile, since, sealedBytes) }; }
+          catch (error) { journal = { error: error instanceof JournalBranchError ? error.code : "JOURNAL_UNREADABLE" }; }
+        }
+      }
+      return emit({ op: "identity", identity, ...(since !== undefined ? { journal } : {}) }, identity.sessionFile !== null &&
+        identity.leafId !== null && identity.ownerIncarnation !== null && (since === undefined || (journal !== null && !("error" in journal))));
     }
     const podUid = values.get("--pod-uid") ?? "";
     const run = values.get("--run") ?? "";

@@ -163,13 +163,15 @@ describe("claims: exactly once by mapped commandId", () => {
       { principal: { id: "principal:3420-test", binding: "herdr-client" } },
       // Deliberately lie about the wire digest: retained-body comparison must still catch these.
       { resolvedBody: changed }, { resolvedBody: { ...body, binding: {} } },
-      { resolvedBody: { ...body, version: 2 } }, { resolvedBody: undefined },
+      { resolvedBody: { ...body, version: 2 } },
+      // Intentional negative fixture: undefined must override the previously retained body.
+      { resolvedBody: undefined } as unknown as Partial<BridgeNatsClaimInput>,
     ];
     for (const change of changes) expect((await ledger.claim({ ...original, ...change })).status).toBe("mismatch");
     expect(fs.readFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_FILE))).toEqual(bytes);
   });
 
-  it.each(["ask", "cancel"] as const)("%s keeps exact native-capable timing and body evidence, not the ordinary retry exception", async operation => {
+  it.each(["ask", "cancel"] as const)("%s accepts attempt-only retiming but preserves first evidence and rejects meaningful changes", async operation => {
     const ledger = await ledgerAt(), input = toFile(`strict-${operation}`, MOVED, { operation,
       ...(operation === "cancel" ? { originalCancelCommandId: "original-ask",
         cancelCommandId: bridgeNatsMappedCommandId(LINK, "toFile", MOVED, "original-ask") } : {}) });
@@ -182,9 +184,21 @@ describe("claims: exactly once by mapped commandId", () => {
     for (const change of [{ requestCreatedAt: T0 + 1 }, { requestedAt: T0 + 1 }, { deadlineAt: body.deadlineAt + 1 },
       { ownerIncarnation: "different" }, { binding: {} }, { bindingProvenance: { kind: "owner-defaults", rootId: OTHER } }]) {
       const resolvedBody = { ...body, ...change };
-      expect((await ledger.claim({ ...original, resolvedBody })).status).toBe("mismatch");
+      const claim = await ledger.claim({ ...original, resolvedBody });
+      if ("requestCreatedAt" in change || "requestedAt" in change || "deadlineAt" in change) {
+        // These three rows are new attempts, NOT mutation of the retained event or receipt.
+        expect(claim.status).toBe("duplicate");
+        expect(bridgeNatsClaimAction(claim).action).toBe("resend");
+        expect(claim.record).toMatchObject({ resolvedBody: body, sourceEventId: original.sourceEventId,
+          deadlineAt: original.deadlineAt, expiresAt: original.deadlineAt + BRIDGE_NATS_HORIZON_MS });
+      } else {
+        // Owner epoch, binding and provenance remain exact, even under a dishonest unchanged digest.
+        expect(claim.status).toBe("mismatch");
+      }
     }
-    expect((await ledger.claim({ ...original, deadlineAt: original.deadlineAt + 1 })).status).toBe("mismatch");
+    const retimed = await ledger.claim({ ...original, deadlineAt: original.deadlineAt + 1 });
+    expect(retimed.status).toBe("duplicate");
+    expect(retimed.record.deadlineAt).toBe(original.deadlineAt);
     expect((await ledger.claim({ ...original, sourceEventId: "new-envelope-same-exact-body" })).status).toBe("duplicate");
     expect(fs.readFileSync(path.join(dir(), BRIDGE_NATS_LEDGER_FILE))).toEqual(bytes);
   });

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { diagnostics } from "../core/diagnostics.js";
+import { diagnostics, logDiagnostic } from "../core/diagnostics.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -783,6 +783,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   #rootRecheckPending = false;
   #transportLost = false;
   readonly #backgroundRefresh = new MeshBackgroundRetry("participant heartbeat/change refresh")
+    .diagnosticsTo(line => logDiagnostic("src/topology/participant-directory.ts", line))
     .alarmsTo(meshOutageAlarmSink(() => ({ mesh: this.mesh, from: this.options.identity })));
   readonly #notifications = new MeshBackgroundQueue("participant refusal/reap");
   readonly #sources = new Set<ParticipantSnapshotSource>();
@@ -981,16 +982,21 @@ export class ParticipantDirectory implements FabricParticipantSource {
     const lease = this.#transportLease;
     if (!lease || this.#closed || this.#transportLost) return Promise.resolve();
     if (this.#transportRenewing) return this.#transportRenewing;
-    const work = Promise.resolve().then(() => lease.renew(AbortSignal.timeout(TRANSPORT_RENEW_BUDGET_MS))).then(async value => {
+    const signal = () => AbortSignal.any([this.#leaseAbort.signal, AbortSignal.timeout(TRANSPORT_RENEW_BUDGET_MS)]);
+    const work = Promise.resolve().then(() => lease.renew(signal())).then(async value => {
       this.#transportLeaseWallDeadline = value.expiresAt - TRANSPORT_HOST_LEASE_SAFETY_MS;
       // smarty-dev#15310: a lease that expired in KV and was created again may have let another
       // machine register this root meanwhile. Re-check before admission resumes; yield if so.
-      if (lease.takeRecreated() || lease.rootRecheck) this.#rootRecheckPending = true;
-      if (this.#rootRecheckPending && lease.live()) {
+      for (let attempt = 0; attempt <= 3; attempt++) {
+        if (this.#closed) return;
+        if (lease.takeRecreated() || lease.rootRecheck) this.#rootRecheckPending = true;
+        if (!this.#rootRecheckPending || !lease.live()) break;
+        // At most three re-checks per heartbeat; leave admission closed for the next tick.
+        if (attempt === 3) return;
         const root = this.#natsPublished.get(this.options.rootId);
         const view = this.#participantView;
         if (root?.kind === "root" && view) {
-          try { await view.confirmSoleRoot(root, lease.revision); }
+          try { await view.confirmSoleRoot(root, lease.revision, signal()); }
           catch (error) {
             if ((error as { code?: unknown } | null)?.code === "FABRIC_PRESENCE_OWNED_ELSEWHERE") {
               this.#transportRecovering = false;
@@ -999,10 +1005,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
             throw error; // Otherwise admission stays suspended; the next renewal checks again.
           }
         }
+        if (this.#closed) return;
         this.#rootRecheckPending = false;
         // The re-created lease was written with rootRecheck (routes nothing); write it routable again.
+        // That write may re-create it again: loop before opening recovery/publication.
         lease.clearRootRecheck();
-        const routable = await lease.renew(AbortSignal.timeout(TRANSPORT_RENEW_BUDGET_MS));
+        const routable = await lease.renew(signal());
         this.#transportLeaseWallDeadline = routable.expiresAt - TRANSPORT_HOST_LEASE_SAFETY_MS;
       }
       if (this.#transportRecovering && lease.live()) {
@@ -1357,7 +1365,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
           dedupeKey: `participant-source:${this.options.hostId}:${this.ownerIncarnation}:${randomUUID()}`, alarmed: false };
         this.#sourceFailures.set(source, incident);
         // Dedupe by source + fixed reason, NOT changing error text or failed item.
-        diagnostics.warn("src/topology/participant-directory.ts", `[pi-fabric] isolated participant snapshot source ${incident.source} failed; omitting failed records: ${detail instanceof Error ? detail.message : String(detail)}`);
+        logDiagnostic("src/topology/participant-directory.ts", `[pi-fabric] isolated participant snapshot source ${incident.source} failed; omitting failed records: ${detail instanceof Error ? detail.message : String(detail)}`);
       }
       if (!wholeSource && failedIds.size === 1) incident.participantId = failedIds.values().next().value!;
       else delete incident.participantId;
@@ -2104,20 +2112,22 @@ export class ParticipantDirectory implements FabricParticipantSource {
     return mirroredOwnerRoutingStatus({ ...owner, remoteHost: owner.remoteHost! }, now);
   }
 
-  // A mirrored record never shadows a local target (smarty-dev#2004): it is refused when its id
-  // or root is a participant this host publishes, this host's own root or identity, or any
-  // unmirrored host's id, root or identity on this mesh.
+  // A mirrored record never shadows a local target (smarty-dev#2004): published participant IDs,
+  // own identity and native host IDs/identities are claims, even after a host lease expires.
+  // Only a Main claims its root; an agent/actor's rootId is lineage membership (smarty-dev#17198).
   // ponytail: a mirror that overwrote another local host's child agent is not detectable here;
   // that host's next heartbeat takes its key back, and the bridge never overwrites unmirrored keys.
   #collides(participant: FabricParticipantRecord, hosts: ReadonlyMap<string, FabricHostRecord>, report = true): boolean {
     if (participant.remoteHost === undefined) return false;
     const ids = new Set([participant.id, participant.rootId]);
     let collides = [...ids].some((id) =>
-      this.#localRecords.has(id) || id === this.options.rootId || id === this.options.identity.id);
+      this.#localRecords.has(id) || id === this.options.identity.id ||
+      (this.options.identity.kind === "main" && id === this.options.rootId));
     for (const host of hosts.values()) {
       if (collides) break;
       collides = host.remoteHost === undefined &&
-        (ids.has(host.id) || ids.has(host.rootId) || ids.has(host.identity.id));
+        (ids.has(host.id) || ids.has(host.identity.id) ||
+          (host.identity.kind === "main" && ids.has(host.rootId)));
     }
     if (collides && report) this.#reportCollision(participant);
     return collides;
@@ -3161,6 +3171,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
       }
       return ops;
     }, (ops) => this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
+      lockTiming: { operation: "directory-withdraw" },
       beforeCommit: () => { assertHostLeaseOwner(this.mesh.root, leaseOwner); } })));
     // A superseded incarnation owns nothing left to lapse: its successor holds the lease.
     const failed = (reason: string): void => { if (!this.#superseded) this.#withdrawalFailure(reason); };
@@ -3772,6 +3783,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
         this.mesh.root, this.options.hostId));
       let committedAt = 0;
       const results = await this.#withLeaseFence(() => this.mesh.writeBatch({ identity: this.options.identity, ops,
+        lockTiming: { operation: changed || legacyChanged ? "directory-publish" : "directory-renew" },
         beforeCommit: () => {
           assertHostLeaseOwner(this.mesh.root, this.#leaseFenceOwner());
           this.#assertRootPublishable(statePuts.get(keyFor(PARTICIPANT_PREFIX, this.options.rootId)));

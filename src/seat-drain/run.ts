@@ -71,16 +71,18 @@ export interface SeamRequest {
  * A's shared request schema (SEAT.md §3, closed keys), the phase from argv, and the contract's
  * `inputs.operationId` (32 lowercase hex). A missing or malformed operationId is a binding failure.
  */
-export const parseRequest = (bytes: Buffer, phase: string): SeamRequest => {
+export const parseRequest = (bytes: Buffer, phase: string, options: { operationId?: boolean } = {}): SeamRequest => {
   const value = parse(bytes, "request-invalid");
   const inputs = object(value.inputs) ? value.inputs : undefined;
-  if (typeof inputs?.operationId !== "string" || !HEX32.test(inputs.operationId)) gap("operation-id-invalid");
+  // The drain phases carry A's operationId (contract rev 4); the bridge phases do not.
+  const needsOperationId = options.operationId !== false;
+  if (needsOperationId && (typeof inputs?.operationId !== "string" || !HEX32.test(inputs.operationId))) gap("operation-id-invalid");
   if (Object.keys(value).sort().join(",") !== "inputs,phase,principal,run,runSha256,schema,sessionId" ||
     value.schema !== "d3-seam-request-v1" || value.phase !== phase || typeof value.run !== "string" || !HEX32.test(value.run) ||
     typeof value.runSha256 !== "string" || !HEX64.test(value.runSha256) || typeof value.sessionId !== "string" ||
     !UUID.test(value.sessionId) || typeof value.principal !== "string" || !/^[a-z0-9]{1,32}$/.test(value.principal) ||
     !object(value.inputs)) gap("request-invalid");
-  return { ...(value as unknown as SeamRequest), operationId: inputs!.operationId as string };
+  return { ...(value as unknown as SeamRequest), operationId: needsOperationId ? inputs!.operationId as string : "" };
 };
 
 export interface SealedRun {
@@ -97,12 +99,12 @@ export interface SealedRun {
  * `seat-inputs.json` hashes to the `inputs` pin journaled right after `begin`; the executor is the
  * seat's own user, whose passwd home is `seat.home`; the drain seam is pinned to fabric-v2.
  */
-export const readSealedRun = (runDir: string, request: SeamRequest, uid: number): SealedRun => {
+export const readSealedRun = (runDir: string, request: SeamRequest, uid: number, seamName: "drain" | "bridge" = "drain"): SealedRun => {
   const runBytes = readOwned(path.join(runDir, "seat-run.json"), uid, MAX_SEALED, { mode: 0o400 }, "seat-run-unreadable");
   if (sha256(runBytes) !== request.runSha256) gap("seat-run-sha256-mismatch");
   const run = parse(runBytes, "seat-run-invalid");
   const seams = object(run.seams) ? run.seams : undefined;
-  const drain = seams && object(seams.drain) ? seams.drain : undefined;
+  const drain = seams && object(seams[seamName]) ? seams[seamName] : undefined;
   const source = object(run.source) ? run.source : undefined;
   if (run.schema !== "d3-seat-run-v1" || run.run !== request.run || run.sessionId !== request.sessionId ||
     run.principal !== request.principal || drain?.owner !== "fabric-v2" || typeof source?.journal !== "string" ||

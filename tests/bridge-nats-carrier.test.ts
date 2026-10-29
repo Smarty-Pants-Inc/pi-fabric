@@ -351,7 +351,7 @@ describe("ordinary resend through the REAL durable ledger adapter (presence fixt
       expect(await carrier.inbound(delivery(retry))).toMatchObject({ kind: "settled" });
       const answer = sendOf(await carrier.outbound({ topic: "fabric.control.ack", kind: "accepted", from: fileLead, to: natsLead.id,
         data: { version: 1, commandId: mapped, targetId: fileLead.id, ownerIncarnation: "inc-file-lead", accepted: true,
-          messageId: "ordinary-first-message", bridge: { from: "ryzen1", id: "ordinary-file-ack" } } as BridgePublish["data"] }));
+          messageId: "ordinary-first-message", bridge: { from: "file-bridge", id: "ordinary-file-ack" } } as BridgePublish["data"] }));
       await carrier.settle(answer.settle!, true);
       expect(await carrier.inbound(delivery(retry))).toMatchObject({ kind: "reply", envelope: { id: "ack:ordinary-later-envelope",
         body: { accepted: true, messageId: "ordinary-first-message", bodyDigest: answer.envelope.body.bodyDigest } } });

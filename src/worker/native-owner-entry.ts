@@ -269,7 +269,7 @@ export function guardNativeOwnerRegistration(): void {
         if (arg === "--owner-host-profile") {
           // 031c consumes exactly one separate canonical absolute path. The SDK
           // still owns receiving/qualifying that profile; this is only argv shape.
-          if (ownerHostProfile || !absolute(value) || value === "/" || value.includes("@")) refused("invalid or duplicate --owner-host-profile value");
+          if (ownerHostProfile || !absolute(value!) || value === "/" || value!.includes("@")) refused("invalid or duplicate --owner-host-profile value");
           ownerHostProfile = true;
         }
         if (["--fork", "--session-id", "--export"].includes(arg)) neverNative = true;

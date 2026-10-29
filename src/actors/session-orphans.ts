@@ -62,7 +62,7 @@ const leaseOf = (meshRoot: string, id: string): FabricHostLease | undefined => {
 
 /** Missing presence is absence; an unreadable/invalid record or owner lease is NOT absence. */
 const noLiveParticipant = (mesh: MeshStore, id: string, now: number, deadOwner?: string,
-  settled?: (entry: MeshStateEntry) => boolean): boolean => {
+  settled?: (entry: MeshStateEntry) => boolean, graceMs = SESSION_ACTOR_ORPHAN_GRACE_MS): boolean => {
   const key = participantKey(id);
   const entries: MeshStateEntry[] = [];
   try {
@@ -82,13 +82,13 @@ const noLiveParticipant = (mesh: MeshStore, id: string, now: number, deadOwner?:
       const value = record(entry.value);
       if (!value || value.id !== id || typeof value.ownerHostId !== "string" ||
           typeof value.ownerIdentityId !== "string" || typeof value.rootId !== "string" ||
-          !time(entry.updatedAt) || now - entry.updatedAt < SESSION_ACTOR_ORPHAN_GRACE_MS) return false;
+          !time(entry.updatedAt) || now - entry.updatedAt < graceMs) return false;
       if (entry.updatedBy.id !== deadOwner) return false;
       // Staleness is not death authority for a different owner or bridged root.
       if (value.ownerHostId !== deadOwner || value.ownerIdentityId !== deadOwner || value.rootId !== deadOwner ||
           (value.remoteHost !== undefined && value.remoteHost !== os.hostname())) return false;
       if (value.reloadUntil !== undefined && !time(value.reloadUntil)) return false;
-      if (typeof value.reloadUntil === "number" && value.reloadUntil >= now) return false;
+      if (typeof value.reloadUntil === "number" && now - value.reloadUntil < graceMs) return false;
       const owner = leaseOf(mesh.root, value.ownerHostId);
       if (!owner) {
         // The host reaper removes long-dead leases. Only the exact Main whose
@@ -96,7 +96,8 @@ const noLiveParticipant = (mesh: MeshStore, id: string, now: number, deadOwner?:
         try { fs.statSync(hostLeasePath(mesh.root, value.ownerHostId)); return false; }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false; }
         if (value.ownerHostId !== deadOwner || value.ownerIdentityId !== deadOwner || value.rootId !== deadOwner) return false;
-      } else if (owner.identityId !== value.ownerIdentityId || owner.rootId !== value.rootId || until(owner) >= now) return false;
+      } else if (owner.identityId !== value.ownerIdentityId || owner.rootId !== value.rootId ||
+          now - Math.max(until(owner), owner.updatedAt) < graceMs) return false;
     }
     return true;
   } catch { return false; }
@@ -135,13 +136,15 @@ const rootMetadata = (mesh: MeshStore, rootId: string, lease?: FabricHostLease):
     ...(typeof participant?.role === "string" ? { role: participant.role } : {}) };
 };
 
-/** Uncached, conservative death verdict. Lease expiry alone never proves a process died. */
+/** Uncached, nonmutating death verdict. Lease expiry alone never proves a process died.
+ * Callers may require a longer absence; session-actor retirement keeps its two-minute default. */
 export const sessionActorRootGone = (
   mesh: MeshStore, rootId: string, lineageAlive?: (rootId: string) => boolean, now = Date.now(),
+  graceMs = SESSION_ACTOR_ORPHAN_GRACE_MS,
 ): SessionActorRootGone | undefined => {
   try {
     assertMeshStateReadable(mesh.root);
-    if (!time(now) || !rootId.startsWith("session:")) return undefined;
+    if (!time(now) || !Number.isFinite(graceMs) || graceMs < SESSION_ACTOR_ORPHAN_GRACE_MS || !rootId.startsWith("session:")) return undefined;
     const sessionId = rootId.slice(8);
     const lease = leaseOf(mesh.root, rootId);
     if (!lease) {
@@ -149,7 +152,7 @@ export const sessionActorRootGone = (
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined; }
     }
     if (lease && (lease.rootId !== rootId || lease.identityId !== rootId ||
-        now - Math.max(until(lease), lease.updatedAt) < SESSION_ACTOR_ORPHAN_GRACE_MS)) return undefined;
+        now - Math.max(until(lease), lease.updatedAt) < graceMs)) return undefined;
     // Native inbox records are not bridged; nevertheless historical records without
     // a host are NOT assumed local. A matching local lease writer qualifies them.
     // A fresh/replaced inbox also fences a root whose old lease still names a dead PID.
@@ -160,7 +163,7 @@ export const sessionActorRootGone = (
       if (!owner || owner.rootId !== rootId || owner.sessionId !== sessionId || owner.ownerIdentityId !== rootId ||
           !Number.isSafeInteger(owner.pid) || (owner.pid as number) <= 0 ||
           (owner.processStartedAt !== undefined && (typeof owner.processStartedAt !== "string" || !/^\d+$/.test(owner.processStartedAt))) ||
-          now - fs.statSync(ownerPath).mtimeMs < SESSION_ACTOR_ORPHAN_GRACE_MS) return undefined;
+          now - fs.statSync(ownerPath).mtimeMs < graceMs) return undefined;
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined; }
     const writer = lease?.writer;
     const ownerHost = owner?.host ?? (writer && writer.pid === owner?.pid ? writer.host : undefined);
@@ -177,7 +180,7 @@ export const sessionActorRootGone = (
       const value = record(closure?.value);
       if (value?.format === 1 && value.rootId === rootId && value.ownerHostId === rootId &&
           value.ownerIdentityId === rootId && closure?.updatedBy.id === rootId && closure.updatedBy.kind === "main" &&
-          time(value.closedAt) && now - value.closedAt >= SESSION_ACTOR_ORPHAN_GRACE_MS) {
+          time(value.closedAt) && now - value.closedAt >= graceMs) {
         reason = "Main lineage closed";
       }
     }
@@ -187,14 +190,14 @@ export const sessionActorRootGone = (
     // inbox with valid kernel start evidence and an old mtime still proves death.
     if (!reason && owner && ownerHost === os.hostname() && typeof owner.processStartedAt === "string" &&
         !residentProcessAlive(owner.pid as number, owner.processStartedAt)) reason = "Main inbox owner incarnation is dead";
-    if (!reason || !noLiveParticipant(mesh, rootId, now, rootId)) return undefined;
+    if (!reason || !noLiveParticipant(mesh, rootId, now, rootId, undefined, graceMs)) return undefined;
     const legacy = mesh.get(`sessions/${sessionId}`, { fresh: true });
     const legacyValue = record(legacy?.value);
     if (legacy && (!legacyValue || legacyValue.id !== rootId || legacyValue.sessionId !== sessionId ||
         typeof legacyValue.cwd !== "string" || !time(legacyValue.startedAt) ||
         (legacyValue.status !== "idle" && legacyValue.status !== "running") || isLiveLegacyRootEntry(legacy, now, mesh.root) ||
         legacy.updatedBy.id !== rootId || !time(legacy.updatedAt) ||
-        now - legacy.updatedAt < SESSION_ACTOR_ORPHAN_GRACE_MS)) return undefined;
+        now - legacy.updatedAt < graceMs)) return undefined;
     return { ...rootMetadata(mesh, rootId, lease), reason };
   } catch { return undefined; }
 };
@@ -487,6 +490,7 @@ export class SessionActorOrphans {
     try {
       await ActorRegistryStore.withLocks([store], () => this.mesh.leaseCustody(leases[0]!,
         () => this.mesh.leaseCustody(leases[1]!, () => this.mesh.withTryLock(() => this.mesh.writeBatch({ identity: this.identity, ops: [],
+          lockTiming: { operation: "session-orphan-settle" },
           prepare: view => {
             const ops: MeshBatchOperation[] = [];
             for (const key of [`actors/${sessionId}/${row.id}`, participantKey(row.id)]) {

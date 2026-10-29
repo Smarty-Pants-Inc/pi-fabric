@@ -50,7 +50,8 @@ const privateTemp = fs.realpathSync(isolatedTestTemp("pi-fabric-vitest-").TMPDIR
 if (!guard || !guardRoot || !inside(fs.realpathSync(guardRoot), privateTemp)) {
   throw new Error("Native owner observer tests require the existing Vitest private-temp deletion guard");
 }
-const initialOutsideCount = guard.count;
+const checkedGuard: DeletionGuard = guard;
+const initialOutsideCount = checkedGuard.count;
 const packetRoot = fs.realpathSync(fs.mkdtempSync(path.join(privateTemp, "native-owner-observer-")));
 assert(inside(fs.realpathSync(guardRoot), packetRoot), "observer traces must stay under the guarded Vitest temp root");
 const traceFile = path.join(packetRoot, "trace.jsonl");
@@ -151,7 +152,7 @@ async function unit(name: string, body: (context: UnitContext) => Promise<void>)
     trace({ event: "UNIT-FAIL", name, error: error instanceof Error ? error.stack ?? String(error) : String(error) });
   } finally {
     let attemptsBeforeFinalTurn = attempts, attemptsAfterFinalTurn = attempts, everyWatcherClosed = false;
-    let outsideCount = guard.count;
+    let outsideCount = checkedGuard.count;
     try {
       observer?.close();
       // Let close/rearm callbacks run; no reopened watcher may survive shutdown.
@@ -161,7 +162,7 @@ async function unit(name: string, body: (context: UnitContext) => Promise<void>)
       await immediate();
       attemptsAfterFinalTurn = attempts;
       everyWatcherClosed = records.every(record => record.closeCalls > 0 && record.closed);
-      outsideCount = guard.count;
+      outsideCount = checkedGuard.count;
     } finally {
       fs.watch = originalWatch;
       // Emergency test-only close. Fixture roots and traces are retained for the runner; no root is deleted here.

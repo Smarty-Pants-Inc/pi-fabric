@@ -3,6 +3,8 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { setImmediate as realImmediate } from "node:timers/promises";
+import { performance as monotonic } from "node:perf_hooks";
 import { LEGACY_ARCHIVE_DEADLINE_MS, ResidentLegacyRunArchive } from "../src/residency/legacy-run-archive.js";
 
 // B5 (#7978): no idle 250ms sweep interval. Events (root/runs entries and
@@ -28,9 +30,14 @@ const retired = (root: string): string[] => {
   return fs.readdirSync(base).flatMap(day => fs.readdirSync(path.join(base, day))
     .flatMap(slice => fs.readdirSync(path.join(base, day, slice))));
 };
-/** Real I/O turns (setImmediate is never faked here), bounded. */
-const settle = async (predicate: () => boolean, turns = 5000) => {
-  for (let i = 0; i < turns && !predicate(); i++) await new Promise(resolve => setImmediate(resolve));
+/** Real monotonic completion wait; fake Date and global timeout stubs cannot advance it. */
+const settle = async (predicate: () => boolean, { timeoutMs = 2_000 }: { timeoutMs?: number } = {}) => {
+  const deadline = monotonic.now() + timeoutMs;
+  while (!predicate()) {
+    const remaining = deadline - monotonic.now();
+    if (remaining <= 0) break;
+    await realImmediate();
+  }
   expect(predicate()).toBe(true);
 };
 /** Counts completed sweeps (including their scheduling turn). */
@@ -141,6 +148,104 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
       expect(vi.getTimerCount()).toBe(0);
       expect(fs.existsSync(path.join(root, "runs", "mystery"))).toBe(true);
     } finally { await archive.close(); }
+  });
+
+  it("a real archive read may outlast 5,000 immediate turns while the slow due check is in flight", async () => {
+    fakeTimers();
+    const timeout = vi.spyOn(globalThis, "setTimeout");
+    const root = temporary(), held = path.join(root, "runs", "held"), mystery = path.join(root, "runs", "mystery");
+    tree(held, {});
+    fs.writeFileSync(path.join(held, "unresolved-worker.json"), "{}", { mode: 0o600 });
+    tree(mystery, {});
+    fs.writeFileSync(path.join(mystery, "unknown.bin"), "x", { mode: 0o600 });
+    const statusFile = path.join(held, "status.json");
+    let releaseRead = () => {}, signalReadStarted = () => {};
+    const readGate = new Promise<void>(resolve => { releaseRead = resolve; });
+    const readStarted = new Promise<void>(resolve => { signalReadStarted = resolve; });
+    const originalRead = fsp.readFile.bind(fsp);
+    let blockStatusRead = false, released = false;
+    vi.spyOn(fsp, "readFile").mockImplementation((async (...args: Parameters<typeof fsp.readFile>) => {
+      const contents = await originalRead(...args); // Keep the archive's real filesystem read.
+      if (blockStatusRead && args[0] === statusFile) {
+        blockStatusRead = false;
+        signalReadStarted();
+        await readGate; // Hold the real read's completion at the archive boundary.
+      }
+      return contents;
+    }) as typeof fsp.readFile);
+    const release = () => { if (!released) { released = true; releaseRead(); } };
+    const archive = new ResidentLegacyRunArchive(root, {}, { isRetained: () => false });
+    const sweeps = track(archive);
+    try {
+      archive.start();
+      await settle(() => sweeps.done() >= 1 && archive.health.checked === 2 && vi.getTimerCount() === 1);
+      expect(archive.health.skipped).toBe(2);
+      expect(timeout).toHaveBeenCalledTimes(1);
+      expect(Number(timeout.mock.calls[0]![1])).toBe(LEGACY_ARCHIVE_DEADLINE_MS);
+
+      const completedBeforeRecheck = sweeps.calls();
+      blockStatusRead = true;
+      vi.advanceTimersByTime(LEGACY_ARCHIVE_DEADLINE_MS);
+      await readStarted;
+      expect(archive.health.checked).toBe(3);
+      expect(vi.getTimerCount()).toBe(0); // The due sweep has not completed or re-armed yet.
+      const fixedFakeNow = Date.now();
+      let completionReturned = false, completionError: unknown;
+      const completion = settle(() => sweeps.calls() === completedBeforeRecheck + 1 &&
+        archive.health.checked === 3 && vi.getTimerCount() === 1, { timeoutMs: 5_000 }).then(() => { completionReturned = true; }, error => {
+        completionReturned = true; completionError = error;
+      });
+      // Release only after 5,001 real event-loop immediate turns. This is the
+      // old helper's complete 5,000-turn window, independent of wall-clock speed.
+      for (let i = 0; i < 5_001; i++) await realImmediate();
+      expect(Date.now()).toBe(fixedFakeNow);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(completionReturned).toBe(false);
+      release();
+      await completion;
+      expect(completionError).toBeUndefined();
+      expect(sweeps.calls()).toBe(completedBeforeRecheck + 1);
+      expect(archive.health.checked).toBe(3);
+      expect(archive.health.skipped).toBe(3);
+      expect(timeout).toHaveBeenCalledTimes(2);
+      expect(Number(timeout.mock.calls.at(-1)![1])).toBe(LEGACY_ARCHIVE_DEADLINE_MS);
+      expect(vi.getTimerCount()).toBe(1);
+
+      fs.renameSync(path.join(held, "unresolved-worker.json"), path.join(root, "released.json"));
+      vi.advanceTimersByTime(LEGACY_ARCHIVE_DEADLINE_MS - 1);
+      await turns();
+      expect(sweeps.calls()).toBe(completedBeforeRecheck + 1);
+      expect(archive.health.checked).toBe(3);
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(1);
+      await settle(() => retired(root).includes("held"));
+      await turns(500);
+      expect(retired(root)).toEqual(["held"]);
+      expect(archive.health.checked).toBe(4);
+      expect(archive.health.archived).toBe(1);
+      expect(archive.health.error).toBe("");
+      expect(fs.existsSync(mystery)).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+      const idle = sweeps.calls();
+      await advance(3 * LEGACY_ARCHIVE_DEADLINE_MS);
+      expect(sweeps.calls()).toBe(idle);
+      expect(archive.health.checked).toBe(4);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      release();
+      await archive.close();
+    }
+  });
+
+  it("completion wait fails on a real monotonic deadline when work never arrives", async () => {
+    fakeTimers();
+    const fixedFakeNow = Date.now(), started = monotonic.now();
+    await expect(settle(() => false, { timeoutMs: 80 })).rejects.toThrow();
+    const elapsed = monotonic.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(80);
+    expect(elapsed).toBeLessThan(2_000);
+    expect(Date.now()).toBe(fixedFakeNow);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("degraded (absent runs namespace) keeps the bounded slow full-pass fallback, then goes idle once watched", async () => {
@@ -288,7 +393,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
     try {
       archive.start();
       // Exactly one due item (the evicted run) arms the only timer.
-      await settle(() => vi.getTimerCount() === 1 && archive.health.checked === 65, 50_000);
+      await settle(() => vi.getTimerCount() === 1 && archive.health.checked === 65, { timeoutMs: 5_000 });
       expect(byRun.size).toBe(65);
       const evicted = [...byRun].filter(([, watchers]) => closed.has(watchers[0]!)).map(([id]) => id);
       expect(evicted).toHaveLength(1);
@@ -296,7 +401,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
       for (let i = 0; i < 300; i++) await new Promise(resolve => setImmediate(resolve));
       expect(retired(root)).toEqual([]);
       vi.advanceTimersByTime(LEGACY_ARCHIVE_DEADLINE_MS);
-      await settle(() => retired(root).includes(evicted[0]!), 50_000);
+      await settle(() => retired(root).includes(evicted[0]!), { timeoutMs: 5_000 });
       // A targeted recheck, not a full pass over the other 64 runs.
       expect(archive.health.checked).toBe(66);
       expect(archive.health.error).toBe("");
@@ -523,7 +628,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
       runsWatchers[0]!.emit("error", new Error("watch failed"));
       vi.advanceTimersByTime(1_000); // bounded re-arm: real watch + rescan
       expect(runsWatchers).toHaveLength(2);
-      await settle(() => vi.getTimerCount() === 1 && Date.now() + Number(timeout.mock.calls.at(-1)![1]) === keptAt, 20_000);
+      await settle(() => vi.getTimerCount() === 1 && Date.now() + Number(timeout.mock.calls.at(-1)![1]) === keptAt, { timeoutMs: 2_000 });
       await turns(200);
       expect(vi.getTimerCount()).toBe(1);
       const calls = sweeps.calls();

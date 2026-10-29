@@ -16,6 +16,7 @@ import {
   type NatsInbound, type NatsOutbound, type NatsPresenceEntry,
 } from "./bridge-nats-carrier.js";
 import { NatsTopicTranslator, type NatsTopicAuthorize } from "./bridge-nats-topics.js";
+import { MeshCustodyUnrecoverableError } from "./custody-lock.js";
 import {
   BRIDGE_NATS_ACK_TOPIC, BRIDGE_NATS_CONTROL_TOPIC, bridgeNatsLinkIdentity, type BridgeNatsPort, type BridgeNatsPortDelivery,
   type BridgeNatsPresenceRecord, type BridgeNatsPresenceView, type NatsCarrierSideContract,
@@ -493,8 +494,10 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
       }
     })().catch(error => {
       if (this.#fenced || this.#listeners.size === 0) return;
-      if (error instanceof BridgeMirrorDeferredError || isMeshRetryableBusy(error)) {
+      if (error instanceof BridgeMirrorDeferredError || isMeshRetryableBusy(error) || error instanceof MeshCustodyUnrecoverableError) {
         // No new authority on failure. Retry on a bounded backoff even if the KV watch is quiet.
+        // A corrupt custody receipt also leaves the old mirror to expire; it must not stop this
+        // best-effort renewal loop or make a stale mirror look live.
         this.#log(`NATS file mirror renewal deferred: ${message(error)}`);
         this.#armFileMirrorCheck(Math.min(1_000, BRIDGE_LEASE_MS / 4));
       } else {

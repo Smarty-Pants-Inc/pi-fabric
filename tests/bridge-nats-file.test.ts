@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BridgePresence } from "../src/mesh/bridge.js";
 import { BridgeMirrorDeferredError } from "../src/mesh/bridge.js";
 import { createNatsFileLink, NatsCarrierDeferredError } from "../src/mesh/bridge-nats-file.js";
+import { MESH_CUSTODY_LOCK_NAME } from "../src/mesh/custody-lock.js";
 import { TransportUnavailableError } from "../src/transport/types.js";
 import { bridgeNatsEnvelopeId, bridgeNatsMappedCommandId } from "../src/mesh/bridge-nats-types.js";
 import { controlBodyFingerprint } from "../src/mesh/control-idempotency.js";
@@ -317,6 +318,39 @@ describe("NatsCarrierSide under MeshBridge", () => {
     expect(events("fabric.control.command")).toHaveLength(1);
     expect(again.acked).toBe(1);
   });
+
+  it("defers a real on-disk ownerless custody refusal in mirror renewal without failing link listeners", async () => {
+    const { link, port, store, logs } = await fixture();
+    const actualLeaseCustody = store.leaseCustody.bind(store);
+    const attemptedLocks: string[] = [];
+    // Wrap, but never replace, the production operation. Plant the ownerless canonical directory at the exact
+    // per-file gate it selects, so the negative-control reclaim mutation would let a real renewal proceed.
+    vi.spyOn(store, "leaseCustody").mockImplementation((async (file, operation, timeoutMs, options) => {
+      const hash = createHash("sha256").update(path.basename(file)).digest("hex");
+      const legacy = path.join(store.root, "host-lease-commits", hash);
+      const domain = fs.existsSync(legacy) ? legacy : path.join(store.root, "host-lease-commits", hash.slice(0, 16));
+      const lock = path.join(domain, MESH_CUSTODY_LOCK_NAME);
+      fs.mkdirSync(domain, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(lock, { mode: 0o700 });
+      attemptedLocks.push(lock);
+      return actualLeaseCustody(file, operation, timeoutMs, options);
+    }) as typeof store.leaseCustody);
+    const failures: Error[] = [];
+    const unwatch = link.remote.subscribeChanges(() => {}, error => failures.push(error));
+    try {
+      port.notifyPresenceChange();
+      await settle();
+      expect(attemptedLocks.length).toBeGreaterThan(0);
+      for (const lock of attemptedLocks) {
+        expect(fs.existsSync(lock)).toBe(true);
+        expect(fs.existsSync(path.join(lock, "owner"))).toBe(false);
+        expect(fs.readdirSync(lock)).toEqual([]);
+      }
+      expect(failures).toEqual([]);
+      expect(logs.some(line => line.includes("NATS file mirror renewal deferred:") && line.includes("has no valid owner pid; recovery refused"))).toBe(true);
+      await expect(link.bridge.step()).resolves.toMatchObject({ toRemote: 0 });
+    } finally { unwatch(); }
+  }, 60_000);
 
   it("N3: a task completion for the moved lead becomes one followUp from the link identity", async () => {
     const { store, port, link } = await fixture();

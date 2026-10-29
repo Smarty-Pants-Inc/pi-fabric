@@ -78,6 +78,8 @@ export interface SeamDeps {
 interface Context {
   runDir: string; request: SeamRequest; meshRoot: string; lockFd: number; uid: number; io: SeamIo; deps: SeamDeps;
   now: () => number; sleep: (ms: number) => Promise<void>; deadline: number; started: number; requestSha256: string;
+  /** Presence selects ON even when the pinned seam's owner is malformed. */
+  fencePinned?: boolean;
   /** The sealed run's `seams.fence.owner`: the owner a fence receipt must name (never a constant here). */
   fenceOwner?: string;
 }
@@ -139,7 +141,7 @@ export const main = async (argv: string[], io: SeamIo, deps: SeamDeps = {}): Pro
     const seams = sealed.run.seams as Record<string, { owner?: unknown } | undefined> | undefined;
     const fenceOwner = typeof seams?.fence?.owner === "string" && seams.fence.owner ? seams.fence.owner : undefined;
     const context: Context = { runDir, request, meshRoot: meshRoot ?? "", lockFd, uid, io, deps, now, sleep, deadline, started,
-      requestSha256: sha256(stdin), ...(fenceOwner ? { fenceOwner } : {}) };
+      requestSha256: sha256(stdin), fencePinned: Object.prototype.hasOwnProperty.call(seams, "fence"), ...(fenceOwner ? { fenceOwner } : {}) };
     if (phase === "drain") {
       if (Object.keys(request.inputs).join(",") !== "operationId") throw new SeamGap("inputs-invalid");
       if (meshRoot === undefined) return refuse(context, "inventory-incomplete", false);
@@ -479,8 +481,8 @@ const stopIntents = (context: Context): Array<{ id: string; registryRow: unknown
 
 /**
  * A's stored `drain` receipt, byte-exact under RUN/receipts/, hashing to the given value: this run, phase
- * drain, owner fabric-v2, this session. A `pass` is accepted only while RUN/receipts/fence.json is absent
- * (contract rev 4 §2, N6 iii: A rejected the pass, or died before `fence`).
+ * drain, owner fabric-v2, this session. A `pass` is accepted only before either an ON fence receipt or
+ * any journaled OFF fence stop (contract rev 4 §2, N6 iii: A rejected the pass, or died before `fence`).
  */
 const verifyDrainReceipt = (context: Context, expected: string): "pass" | "refused" => {
   const bytes = readOwned(path.join(context.runDir, "receipts", "drain.json"), context.uid, 1024 * 1024, undefined, "drain-receipt-unreadable");
@@ -490,8 +492,56 @@ const verifyDrainReceipt = (context: Context, expected: string): "pass" | "refus
   const observed = value.observed as Record<string, unknown> | undefined;
   if (value.schema !== "d3-seam-receipt-v1" || value.run !== context.request.run || value.phase !== "drain" || value.owner !== OWNER ||
     (value.result !== "refused" && value.result !== "pass") || observed?.sessionId !== context.request.sessionId) throw new SeamGap("drain-receipt-invalid");
-  if (value.result === "pass" && present(path.join(context.runDir, "receipts", "fence.json"))) throw new SeamGap("drain-pass-after-fence");
+  if (value.result === "pass" && (present(path.join(context.runDir, "receipts", "fence.json")) ||
+    readFenceJournal(context).some(offFenceDone))) throw new SeamGap("drain-pass-after-fence");
   return value.result;
+};
+
+/** A's append-only journal, with the same ownership, no-follow and size checks as the sealed-run read. */
+const readFenceJournal = (context: Context): Array<Record<string, unknown>> => {
+  const lines = readOwned(path.join(context.runDir, "seat-journal.jsonl"), context.uid, 64 * 1024 * 1024, undefined,
+    "seat-journal-unreadable").toString("utf8").split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  return lines.map(line => {
+    let row: Record<string, unknown>;
+    try {
+      const value: unknown = JSON.parse(line);
+      if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error();
+      row = value as Record<string, unknown>;
+    } catch { throw new SeamGap("fence-off-observation-invalid"); }
+    return row;
+  });
+};
+
+/** Historical OFF stops also bar undo: a later drain completion cannot erase a stopped writer. */
+const offFenceDone = (row: Record<string, unknown>): boolean =>
+  row.event === "done" && row.step === "fence" && (row.observed as Record<string, unknown> | undefined)?.mode === "off";
+
+/** ON requires its pinned receipt; OFF requires the last fence completion after the latest completed drain. */
+const verifyFence = (context: Context): void => {
+  const journal = readFenceJournal(context);
+  if (context.fencePinned) {
+    if (journal.some(offFenceDone)) throw new SeamGap("fence-off-observation-invalid");
+    verifyFenceReceipt(context);
+    return;
+  }
+  let lastDrain = -1;
+  let lastFence = -1;
+  let lastFenceActivity = -1;
+  for (const [index, row] of journal.entries()) {
+    if (row.event === "done" && row.step === "drain") lastDrain = index;
+    if (row.event === "done" && row.step === "fence") lastFence = index;
+    if (row.step === "fence" || row.phase === "fence" || row.seam === "fence") {
+      lastFenceActivity = index;
+    }
+  }
+  if (lastFence === -1) throw new SeamGap("fence-off-observation-missing");
+  const observed = journal[lastFence]!.observed as Record<string, unknown> | undefined;
+  if (lastDrain === -1 || lastFence < lastDrain || lastFenceActivity !== lastFence || observed?.mode !== "off" ||
+    observed.writerGone !== true || typeof observed.tombstoneSha256 !== "string" || !HEX64.test(observed.tombstoneSha256) ||
+    typeof observed.stoppedUnit !== "string" || observed.stoppedUnit.length === 0) {
+    throw new SeamGap("fence-off-observation-invalid");
+  }
 };
 
 /** A's stored `fence` receipt: this run, phase fence, the sealed run's fence owner, a pass (re-review finding 3). */
@@ -621,10 +671,10 @@ const drainUndo = async (context: Context): Promise<number> => {
 
 /** drain-recheck (after `fence`, v1 terminal): the session-pending inventory, filesystem only. */
 const recheck = (context: Context): number => {
-  // Lineage (stage 1 review finding 5): this operation's drain intent, its PASSING outcome and A's fence receipt.
+  // Lineage (stage 1 review finding 5): this operation's drain intent, its PASSING outcome and A's ON/OFF fence evidence.
   if (!readIntent(context)) throw new SeamGap("intent-missing");
   if (drainOutcome(context)?.result !== "pass") throw new SeamGap("drain-not-passed");
-  verifyFenceReceipt(context);
+  verifyFence(context);
   const intentSha256 = evidence(context, "fabric-v2-drain-recheck-intent.json", { schema: "fabric-v2-drain-recheck-intent-v1",
     measured: { meshRoot: context.meshRoot, startedAt: new Date().toISOString() } });
   // The in-process `pi-fabric session pending`: exit 0 is complete; exit 1 is complete:false; a throw is any other exit.

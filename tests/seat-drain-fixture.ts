@@ -80,6 +80,8 @@ const writeSealed = (file: string, value: unknown): Buffer => {
 };
 
 export const createSeat = async (options: { fenceApi?: boolean; start?: boolean;
+  /** null models A's fence-OFF packet (no seams.fence); undefined keeps the existing fence-ON default. */
+  fenceSeam?: { owner: unknown; path: string; sha256: string } | null;
   kube?: { kubeconfig: string; server: string; caSha256: string } } = {}): Promise<Seat> => {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "seat-drain-")));
   fs.chmodSync(base, 0o700);
@@ -99,7 +101,8 @@ export const createSeat = async (options: { fenceApi?: boolean; start?: boolean;
     natsSecret: "org-d3synth-nats", source: { journal, journalSha256: "0".repeat(64), journalBytes: 1, leafId: "leaf", handoffs: null },
     target: { claim: "synthetic-claim", node: "synthetic-node" },
     seams: { drain: { owner: "fabric-v2", path: "/synthetic/drain", sha256: "1".repeat(64) },
-      fence: { owner: "synthetic-fence-owner", path: "/synthetic/fence", sha256: "2".repeat(64) } },
+      ...(options.fenceSeam === null ? {} : { fence: options.fenceSeam ??
+        { owner: "synthetic-fence-owner", path: "/synthetic/fence", sha256: "2".repeat(64) } }) },
     recoveryRoot: "/synthetic/recovery", createdAt: "2026-10-25T00:00:00Z",
   });
   const runSha256 = sha(runBytes);

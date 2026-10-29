@@ -217,7 +217,13 @@ describe("Agent prompt retention (#11663)", () => {
     await manager.close();
     expect(fs.existsSync(successfulDirectory)).toBe(false);
     expect(fs.existsSync(promptPath)).toBe(true);
-    expect(fs.readdirSync(path.dirname(promptPath)).sort()).toEqual(["events.jsonl", "lifecycle.jsonl", "manager-result.json", "run-identity.json", "status.json", "task.txt"]);
+    const retainedDirectory = path.dirname(promptPath);
+    for (const name of ["events.jsonl", "lifecycle.jsonl", "manager-result.json", "run-identity.json", "status.json", "task.txt"]) {
+      expect(fs.existsSync(path.join(retainedDirectory, name)), name).toBe(true);
+    }
+    for (const name of ["schema.json", "images.json", "task.txt.provenance.json"]) {
+      expect(fs.existsSync(path.join(retainedDirectory, name)), name).toBe(false);
+    }
     expect(fs.readFileSync(lifecyclePath)).toEqual(lifecycleBytes);
     const retainedResult = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "manager-result.json"), "utf8")) as AgentRunRecord;
     expect(retainedResult).toMatchObject({ id: failedHandle.id, status: "failed" });
@@ -308,7 +314,14 @@ describe("Agent prompt retention (#11663)", () => {
     expect(createHash("sha256").update(currentBytes).digest("hex")).toBe(beforeClose.inputSha256);
     expect(Buffer.byteLength(currentBytes)).toBe(beforeClose.inputBytes);
     await manager.close();
-    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["manager-result.json", "resume-attempts", "run-identity.json", "status.json", "task.txt"]);
+    const retainedDirectory = path.dirname(taskPath);
+    for (const name of ["events.jsonl", "relaunches.jsonl", "manager-result.json", "run-identity.json", "status.json", "task.txt"]) {
+      expect(fs.existsSync(path.join(retainedDirectory, name)), name).toBe(true);
+    }
+    for (const name of ["schema.json", "images.json", "task.txt.provenance.json"]) {
+      expect(fs.existsSync(path.join(retainedDirectory, name)), name).toBe(false);
+    }
+    expect(fs.existsSync(path.join(retainedDirectory, "resume-attempts"))).toBe(true);
     expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
     const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
     expect(persisted.promptSha256).toBe(beforeClose.promptSha256);
@@ -329,7 +342,13 @@ describe("Agent prompt retention (#11663)", () => {
     const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
     fs.writeFileSync(taskPath, "tampered bytes\n", { mode: 0o600 });
     await manager.close();
-    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["events.jsonl", "manager-result.json", "run-identity.json", "status.json"]);
+    const retainedDirectory = path.dirname(taskPath);
+    for (const name of ["events.jsonl", "lifecycle.jsonl", "manager-result.json", "run-identity.json", "status.json"]) {
+      expect(fs.existsSync(path.join(retainedDirectory, name)), name).toBe(true);
+    }
+    for (const name of ["schema.json", "images.json", "task.txt.provenance.json", "task.txt"]) {
+      expect(fs.existsSync(path.join(retainedDirectory, name)), name).toBe(false);
+    }
     expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).toMatchObject({ status: "failed" });
     expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
     const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;

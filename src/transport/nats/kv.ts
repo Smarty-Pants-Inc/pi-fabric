@@ -34,6 +34,21 @@ const MACHINE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const KEY_TOKEN = /^[A-Za-z0-9_-]{1,128}$/;
 const CONFLICT_CODES = new Set([10071, 10164]);
 const WATCH_STORAGE_FALLBACK_WARNED = new Set<string>();
+const KV_OPERATION_TIMEOUT_MS = 5_000;
+const KV_WATCH_CLEANUP_TIMEOUT_MS = 1_000;
+const kvOperationSignal = (signal?: AbortSignal): AbortSignal => signal
+  ? AbortSignal.any([signal, AbortSignal.timeout(KV_OPERATION_TIMEOUT_MS)])
+  : AbortSignal.timeout(KV_OPERATION_TIMEOUT_MS);
+const abortable = <T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> => new Promise((resolve, reject) => {
+  const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+  const onAbort = (): void => { cleanup(); reject(signal.reason); };
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) { onAbort(); return; }
+  let pending: Promise<T>;
+  try { pending = operation(); }
+  catch (error) { cleanup(); reject(error); return; }
+  void pending.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+});
 
 export interface NatsKvPolicy {
   readonly bucket: string;
@@ -168,8 +183,9 @@ export class NatsKvStore implements TransportKv {
   async get<V>(key: string, signal?: AbortSignal): Promise<TransportKvEntry<V> | undefined> {
     abort(signal);
     splitKey(key);
-    const entry = await this.#bucket.get(key);
-    abort(signal);
+    const requestSignal = kvOperationSignal(signal);
+    const entry = await abortable(() => this.#bucket.get(key), requestSignal);
+    abort(requestSignal);
     return entry?.operation === "PUT" ? decode<V>(entry) : undefined;
   }
 
@@ -199,13 +215,17 @@ export class NatsKvStore implements TransportKv {
   async delete(key: string, ifRevision: number, signal?: AbortSignal): Promise<boolean> {
     abort(signal);
     this.#assertWriter(key, ifRevision, false);
+    const requestSignal = kvOperationSignal(signal);
     try {
-      await this.#bucket.delete(key, { previousSeq: ifRevision });
+      // The official KV delete API has no AbortSignal parameter; stop awaiting it
+      // when the caller's shutdown/operation budget expires. The remote CAS may win.
+      await abortable(() => this.#bucket.delete(key, { previousSeq: ifRevision }), requestSignal);
     } catch (error) {
+      if (requestSignal.aborted) throw new TransportUncertainError(key, undefined, { cause: requestSignal.reason });
       if (CONFLICT_CODES.has(apiCode(error) ?? -1)) return false;
       throw publishFailure(error, key, undefined);
     }
-    if (signal?.aborted) throw new TransportUncertainError(key, undefined, { cause: signal.reason });
+    if (requestSignal.aborted) throw new TransportUncertainError(key, undefined, { cause: requestSignal.reason });
     return true;
   }
 
@@ -462,9 +482,23 @@ export class NatsKvStore implements TransportKv {
         } finally {
           invalidate = undefined;
           endEpoch = undefined;
-          await messages?.close();
-          await Promise.all([statusTask, closedTask]);
-          queue.destroy();
+          messages?.stop();
+          let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            // A disconnected core connection can leave the SDK iterator's close/status
+            // promises pending. Stop locally, but never pin projection/transport teardown
+            // on remote consumer cleanup.
+            await Promise.race([
+              (async () => {
+                await messages?.close();
+                await Promise.all([statusTask, closedTask]);
+              })(),
+              new Promise<void>(resolve => { cleanupTimer = setTimeout(resolve, KV_WATCH_CLEANUP_TIMEOUT_MS); }),
+            ]);
+          } finally {
+            if (cleanupTimer !== undefined) clearTimeout(cleanupTimer);
+            queue.destroy();
+          }
         }
       }
     } catch (error) {

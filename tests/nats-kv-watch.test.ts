@@ -22,8 +22,8 @@ import { readParticipantFile, readParticipantFiles } from "../src/topology/parti
 import { NatsLocalProjection } from "../src/topology/nats-local-projection.js";
 import { KvParticipantDirectory } from "../src/topology/participant-view.js";
 import type { FabricKvHostLease, FabricParticipantRecord } from "../src/topology/types.js";
-import { kvWatchRetryCode, kvWatchRetryDelayMs, openNatsKv, openNatsKvForMachine, type NatsKvStore } from "../src/transport/nats/kv.js";
-import { TransportUnavailableError, type FabricTransport, type TransportBucket, type TransportKv, type TransportKvEvent } from "../src/transport/types.js";
+import { kvWatchRetryCode, kvWatchRetryDelayMs, openNatsKv, openNatsKvForMachine, NatsKvStore } from "../src/transport/nats/kv.js";
+import { TransportUncertainError, TransportUnavailableError, type FabricTransport, type TransportBucket, type TransportKv, type TransportKvEvent } from "../src/transport/types.js";
 import { ensureTransportStream, INBOX_DUPLICATE_WINDOW_MS } from "../src/transport/nats/provision.js";
 import { transportInboxStream, transportInboxStreamSubject } from "../src/transport/nats/subjects.js";
 import { createPathBHarness, resolveNatsBinary, type PathBHarness } from "./helpers/nats-cluster.js";
@@ -155,6 +155,102 @@ describe("NATS KV watch retry classification", () => {
   });
 });
 
+// Keep: an interrupted broker read must not pin participant projection reconciliation
+// or shutdown indefinitely. The official KV API has no AbortSignal parameter.
+describe("NATS KV operation deadlines", () => {
+  it("aborts a stalled KV get when its caller deadline expires", async () => {
+    const pending = new Promise<never>(() => undefined);
+    const store = new NatsKvStore({ get: () => pending } as never,
+      { bucket: "fabric_presence", ttlMs: 15_000, markerTtlMs: 300_000 }, {} as never);
+    const signal = AbortSignal.timeout(30);
+    await expect(bounded(store.get("machine-a.p.deadline", signal), "aborted KV get", 250))
+      .rejects.toMatchObject({ name: "TimeoutError" });
+  });
+
+  it("bounds a stalled KV delete and marks its result uncertain", async () => {
+    const pending = new Promise<never>(() => undefined);
+    const store = new NatsKvStore({ delete: () => pending } as never,
+      { bucket: "fabric_presence", ttlMs: 15_000, markerTtlMs: 300_000 }, {} as never).withMachine(A);
+    const signal = AbortSignal.timeout(30);
+    await expect(bounded(store.delete("machine-a.p.deadline", 1, signal), "aborted KV delete", 250))
+      .rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNCERTAIN" });
+  });
+
+  // Keep: a lost lease cannot authorize a clean withdrawal, and broker reads during close must not pin teardown.
+  it("does not wait for participant cleanup after its owner lease is lost", async () => {
+    let live = true;
+    let getCalls = 0;
+    const pendingGet = (signal?: AbortSignal): Promise<undefined> => new Promise((_, reject) => {
+      const abort = (): void => reject(signal?.reason ?? new Error("aborted"));
+      if (signal?.aborted) { abort(); return; }
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+    const kv = (bucket: TransportBucket): TransportKv => ({
+      ttlMs: bucket === "presence" ? 600_000 : 15_000,
+      get: async (_key, signal) => {
+        if (bucket !== "presence") return undefined;
+        getCalls++;
+        if (getCalls === 1) throw new TransportUnavailableError("injected read failure");
+        return pendingGet(signal);
+      },
+      put: async (key) => { throw new TransportUncertainError(key, undefined); },
+      delete: async () => false,
+      async *watch<V>(_prefix: string, signal: AbortSignal): AsyncIterable<TransportKvEvent<V>> {
+        if (signal.aborted) return;
+        yield { type: "ready" };
+        await new Promise<void>(resolve => {
+          const stop = (): void => resolve();
+          signal.addEventListener("abort", stop, { once: true });
+          if (signal.aborted) stop();
+        });
+      },
+    });
+    const transport = { kind: "nats", self: { machine: A, hostId: "lost-owner" }, kv } as unknown as FabricTransport;
+    const leaseAbort = new AbortController();
+    const directory = new KvParticipantDirectory({ transport, lease: { live: () => live, signal: leaseAbort.signal },
+      identityId: "lost-owner", rootId: "lost-owner", ownerIncarnation: "lost-one" });
+    const now = Date.now();
+    const record: FabricParticipantRecord = {
+      format: 1, id: "session:close-cleanup", rootId: "lost-owner", kind: "agent", ownerHostId: "lost-owner",
+      ownerIdentityId: "lost-owner", ownerIncarnation: "lost-one", name: "close-cleanup", status: "idle", runner: "pi",
+      transport: "host", capabilities: ["followUp"], controlProtocol: "v1", startedAt: now, updatedAt: now,
+    };
+    directory.start();
+    try {
+      await expect(directory.publishBeforeLaunch(record)).rejects.toMatchObject({ code: "FABRIC_TRANSPORT_UNAVAILABLE" });
+      await bounded((async () => { while (getCalls < 2) await wait(5); })(), "pending cleanup read", 500);
+      live = false;
+      await bounded(directory.close(), "lost-lease participant close", 1_500);
+      expect(getCalls).toBeGreaterThanOrEqual(2);
+    } finally {
+      live = false;
+      leaseAbort.abort();
+      await directory.close();
+    }
+  });
+
+  it("bounds watch cleanup when the SDK consumer close never settles", async () => {
+    const pending = new Promise<never>(() => undefined);
+    const messages = {
+      stop: () => undefined,
+      close: () => pending,
+      closed: () => pending,
+      status: () => ({ [Symbol.asyncIterator]: () => ({ next: () => pending }) }),
+    };
+    const js = { consumers: { getPushConsumer: async () => ({
+      info: async () => ({ name: "watcher", num_pending: 0 }),
+      consume: async () => messages,
+    }) } };
+    const store = new NatsKvStore({} as never,
+      { bucket: "fabric_presence", ttlMs: 15_000, markerTtlMs: 300_000 }, js as never);
+    const controller = new AbortController();
+    const iterator = store.watch("machine-a.p.cleanup", controller.signal)[Symbol.asyncIterator]();
+    expect(await bounded(iterator.next(), "watch ready")).toEqual({ done: false, value: { type: "ready" } });
+    controller.abort();
+    await expect(bounded(iterator.return!(), "bounded watch cleanup", 1_500)).resolves.toMatchObject({ done: true });
+  });
+});
+
 // Keep: terminal watch failures are a readiness/data-safety boundary and are
 // cheaper to inject deterministically here than through broker permissions/data.
 describe("participant watch terminal diagnostics", () => {
@@ -265,8 +361,11 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
   }, 30_000);
 
   afterEach(async () => {
+    console.error(`[trace-hook ${performance.now().toFixed(0)}] before directories`);
     await Promise.allSettled(recoveryDirectories.splice(0).map(directory => directory.close()));
+    console.error(`[trace-hook ${performance.now().toFixed(0)}] after directories`);
     await Promise.allSettled(recoveryTransports.splice(0).map(transport => transport.close()));
+    console.error(`[trace-hook ${performance.now().toFixed(0)}] after transports`);
     for (const mesh of recoveryMeshes.splice(0)) mesh.closeState();
     for (const root of recoveryRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
     watches.forEach(({ controller }) => controller.abort());
@@ -274,6 +373,7 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
       if (iterator.return) await bounded(iterator.return(), "watch cleanup");
     }));
     await Promise.all(connections.splice(0).map((connection) => connection.close()));
+    console.error(`[trace-hook ${performance.now().toFixed(0)}] after connections`);
   });
   afterAll(async () => { await harness?.stop(); });
 
@@ -674,7 +774,9 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
       recoveryMeshes.push(mesh);
       const transportStateDir = path.join(root, "transport-state");
       fs.mkdirSync(transportStateDir, { mode: 0o700 });
-      const transport = await openNatsTransport({ ...harness.runtimeOptions(harness.users.machineA), hostId: id });
+      // This recovery flow deliberately starts many file-store clients under scheduler load.
+      // Give initial admission enough request budget; outage reads and close remain explicitly bounded.
+      const transport = await openNatsTransport({ ...harness.runtimeOptions(harness.users.machineA), hostId: id, requestTimeoutMs: 15_000 });
       recoveryTransports.push(transport);
       if (index === retiredIndex) transport.onVerifiedReconnect?.(() => retiredReconnect.resolve());
       const leaseStore = transport.kv("leases");
@@ -711,7 +813,9 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
       directories.push(directory);
       recoveryDirectories.push(directory);
     }
-    await Promise.all(directories.map(directory => directory.start()));
+    // Keep initial lease admission from becoming a request burst; the regression
+    // is the coordinated recovery after the outage below.
+    for (const directory of directories) await directory.start();
     const waitFor = async (predicate: () => boolean, label: string, ms: number): Promise<void> => {
       const deadline = Date.now() + ms;
       while (Date.now() < deadline) { if (predicate()) return; await wait(25); }
@@ -736,6 +840,10 @@ describe.skipIf(!binary)("real authenticated NATS KV snapshot/ready/reset", () =
       server.kill("SIGTERM");
       await bounded(stopped, "NATS outage begins", 5_000);
     }
+    const stalledReadStarted = performance.now();
+    await expect(bounded(leaseStores[0]!.get(retiredLeaseKey, AbortSignal.timeout(100)),
+      "KV get abort during broker outage", 750)).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(performance.now() - stalledReadStarted).toBeLessThan(750);
     const outageStarted = performance.now();
     await wait(17_000);
     expect(performance.now() - outageStarted).toBeGreaterThanOrEqual(15_000);

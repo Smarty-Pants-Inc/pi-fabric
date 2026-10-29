@@ -976,6 +976,25 @@ const transportLeaseConflict = (error: unknown): boolean =>
  * writes are dated conservatively at request START, not delayed PubAck receipt. A suspended lease
  * may recover only by verifying the same local receipt and CASing the broker's current revision;
  * a conflicting owner or invalid local fence permanently loses this object. */
+function settleBeforeAbort(operation: Promise<unknown> | undefined, signal?: AbortSignal): Promise<boolean> {
+  if (!operation) return Promise.resolve(true);
+  if (!signal) return operation.then(() => true, () => true);
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const onAbort = (): void => finish(false);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) { onAbort(); return; }
+    void operation.then(() => finish(true), () => finish(true));
+  });
+}
+
 export class TransportHostLease {
   readonly key: string;
   readonly owner: string;
@@ -1084,9 +1103,10 @@ export class TransportHostLease {
   }
 
   /** Close local admission, settle the in-flight CAS, then durably mark clean BEFORE KV delete
-   * under the same per-receipt custody as acquisition. A crash/uncertain delete then leaves clean
-   * successor evidence, but a successor still cannot create until KV is absent. Even after loss,
-   * cleanup is CAS-only and cannot delete a successor. Callers quiesce handlers before release. */
+   * under the same per-receipt custody as acquisition. A caller budget that expires while the CAS
+   * is still pending leaves the receipt dirty for process-proof recovery rather than claiming a
+   * clean release. A crash/uncertain delete then leaves clean successor evidence, but a successor
+   * still cannot create until KV is absent. Even after loss, cleanup is CAS-only. */
   release(signal?: AbortSignal): Promise<boolean> {
     if (this.#releasing) return this.#releasing;
     this.#state = "released";
@@ -1094,7 +1114,10 @@ export class TransportHostLease {
     this.#abort.abort(this.#loss ?? this.#suspension ?? new TransportHostLeaseLostError(this.self.hostId, this.owner, "released"));
     const pending = this.#pending;
     this.#releasing = (async () => {
-      try { await pending; } catch { /* Cleanup still uses any confirmed revision from that write. */ }
+      if (!await settleBeforeAbort(pending, signal)) return false;
+      if (signal?.aborted) return false;
+      // Cleanup still uses any confirmed revision from the settled write.
+      try { await pending; } catch { /* The confirmed revision is the only one eligible for cleanup. */ }
       signal?.throwIfAborted();
       if (!this.#receipt) return false;
       return await this.#withReceiptCustody(async () => {

@@ -94,6 +94,7 @@ export interface KvPresencePublication {
 export const KV_PRESENCE_TTL_MS = 600_000;
 export const KV_LEASE_TTL_MS = 15_000;
 export const KV_PRESENCE_REFRESH_MS = 180_000;
+const KV_CLOSE_CLEANUP_TIMEOUT_MS = 1_000;
 const MACHINE_TOKEN = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const KEY_TOKEN = /^[a-f0-9]{32}$/;
 const RUNNER_TOKEN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
@@ -199,6 +200,7 @@ export class KvParticipantDirectory implements ParticipantView {
   #refreshPass: Promise<void> | undefined;
   #closing: Promise<void> | undefined;
   #flushing: Promise<void> | undefined;
+  #cleanupAbort: AbortController | undefined;
   #cleanupTimer: ReturnType<typeof setTimeout> | undefined;
   #cleanupAgain = false;
   readonly #leaseLost = (): void => this.#stop(this.options.lease.signal.reason ?? new DirectoryNotReadyError());
@@ -272,9 +274,9 @@ export class KvParticipantDirectory implements ParticipantView {
   #assertWritable(): void {
     if (!this.#started || !this.leaseLive()) throw new TransportUnavailableError("Participant owner lease is not live");
   }
-  #signal(cleanup = false): AbortSignal {
-    return cleanup ? AbortSignal.timeout(this.#timeoutMs) :
-      AbortSignal.any([this.#abort.signal, this.options.lease.signal, AbortSignal.timeout(this.#timeoutMs)]);
+  #signal(cleanup = false, timeoutMs = this.#timeoutMs): AbortSignal {
+    return cleanup ? AbortSignal.timeout(timeoutMs) :
+      AbortSignal.any([this.#abort.signal, this.options.lease.signal, AbortSignal.timeout(timeoutMs)]);
   }
   #report(error: unknown): void { try { this.options.onError?.(error); } catch { /* diagnostic only */ } }
 
@@ -761,7 +763,7 @@ export class KvParticipantDirectory implements ParticipantView {
     return pass;
   }
 
-  async #removeRevision(key: string, revision: number): Promise<boolean> {
+  async #removeRevision(key: string, revision: number, timeoutMs = this.#timeoutMs): Promise<boolean> {
     // Stop renewal even if the deletion is uncertain or a foreign revision already won.
     const owned = this.#owned.get(key);
     if (owned?.revision === revision) this.#owned.delete(key);
@@ -771,7 +773,7 @@ export class KvParticipantDirectory implements ParticipantView {
     const withdrawsPending = pending?.previous?.revision === revision;
     if (withdrawsPending) pending.withdrawn = true;
     try {
-      const deleted = await this.#presence.delete(key, revision, this.#signal(true));
+      const deleted = await this.#presence.delete(key, revision, this.#signal(true, timeoutMs));
       if (deleted && withdrawsPending && this.#pendingCleanup.get(key) === pending) {
         // A successful predecessor CAS delete also fences its delayed update.
         this.#pendingCleanup.delete(key);
@@ -830,14 +832,17 @@ export class KvParticipantDirectory implements ParticipantView {
   /** Event-driven reconnect cleanup; the parent may also call once after transport recovery.
    * Failed reads/deletes retain intent and share one jittered safety-net retry. Restore only an
    * exact, nonwithdrawn predecessor; otherwise attempt one exact-record CAS delete per pass. */
-  reconcilePendingCleanup(): Promise<void> {
+  reconcilePendingCleanup(timeoutMs = this.#timeoutMs): Promise<void> {
     if (this.#flushing) return this.#flushing;
     let retryNeeded = false;
+    const cleanupAbort = new AbortController();
+    this.#cleanupAbort = cleanupAbort;
+    const cleanupSignal = AbortSignal.any([cleanupAbort.signal, AbortSignal.timeout(timeoutMs)]);
     const flushing = Promise.all([...this.#pendingCleanup].map(([key, intent]) => this.#serial(key, async () => {
       if (this.#pendingCleanup.get(key) !== intent) return;
       const { record, previous } = intent;
       let current: TransportKvEntry<unknown> | undefined;
-      try { current = await this.#presence.get(key, this.#signal(true)); }
+      try { current = await this.#presence.get(key, cleanupSignal); }
       catch (error) { retryNeeded = true; this.#report(error); return; }
       if (!current) return; // A delayed uncertain write may still appear on the watch.
       const confirmed = previous && current.revision === previous.revision && this.#same(current, previous.record);
@@ -854,13 +859,14 @@ export class KvParticipantDirectory implements ParticipantView {
       try {
         // A delayed original CAS may win after GET. Retain the obligation until
         // deletion wins; the next pass must recheck exact owner/body/revision.
-        if (await this.#presence.delete(key, current.revision, this.#signal(true))) this.#pendingCleanup.delete(key);
+        if (await this.#presence.delete(key, current.revision, cleanupSignal)) this.#pendingCleanup.delete(key);
         else retryNeeded = true;
       } catch (error) { retryNeeded = true; this.#report(error); }
     }))).then(() => undefined);
     this.#flushing = flushing;
     void flushing.finally(() => {
       if (this.#flushing === flushing) this.#flushing = undefined;
+      if (this.#cleanupAbort === cleanupAbort) this.#cleanupAbort = undefined;
       if (retryNeeded) this.#armCleanupRetry();
       else this.#clearCleanupRetry(); // Successful absence retains late-write protection without polling.
       // A watch event during any pass (including a manual one) gets one serial follow-up.
@@ -872,15 +878,33 @@ export class KvParticipantDirectory implements ParticipantView {
   /** Stops watches/refreshes, joins in-flight writes, then CAS-withdraws only this helper's receipts. */
   close(): Promise<void> {
     if (this.#closing) return this.#closing;
+    const leaseWasLive = this.leaseLive();
+    // Cancel a pending safety-net pass before joining it; close below makes one
+    // fresh, short-budget cleanup attempt when this lease still has authority.
+    this.#cleanupAbort?.abort(new DirectoryNotReadyError());
+    const closeTimeoutMs = Math.min(this.#timeoutMs, KV_CLOSE_CLEANUP_TIMEOUT_MS);
     this.#stop(new DirectoryNotReadyError());
     this.#closing = (async () => {
-      await Promise.allSettled([...this.#watchTasks]);
-      await this.#flushing?.catch(error => this.#report(error));
-      await Promise.allSettled([...this.#writes.values()]);
-      await Promise.all([...this.#owned].map(([key, owned]) => this.#serial(key, async () => {
-        try { await this.#removeRevision(key, owned.revision); } catch (error) { this.#report(error); }
-      })));
-      await this.reconcilePendingCleanup();
+      const trace = (step: string): void => console.error(`[trace-view ${performance.now().toFixed(0)} ${this.options.identityId}] ${step}`);
+      trace("before watches"); await Promise.allSettled([...this.#watchTasks]); trace("after watches");
+      // A lost lease cannot authorize a clean withdrawal. Don't hold shutdown on KV
+      // reads that can only fail until the broker reconnects; its expired host lease
+      // already makes this presence non-routable, and TTL/recovery handles the residue.
+      if (!leaseWasLive) return;
+      const cleanup = async (): Promise<void> => {
+        trace("before flushing"); await this.#flushing?.catch(error => this.#report(error)); trace("after flushing");
+        trace("before writes"); await Promise.allSettled([...this.#writes.values()]); trace("after writes");
+        trace("before owned"); await Promise.all([...this.#owned].map(([key, owned]) => this.#serial(key, async () => {
+          try { await this.#removeRevision(key, owned.revision, closeTimeoutMs); } catch (error) { this.#report(error); }
+        }))); trace("after owned");
+        trace("before pending"); await this.reconcilePendingCleanup(closeTimeoutMs); trace("after pending");
+      };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([cleanup(), new Promise<void>(resolve => {
+          timer = setTimeout(resolve, closeTimeoutMs * 2);
+        })]);
+      } finally { if (timer !== undefined) clearTimeout(timer); }
     })();
     return this.#closing;
   }

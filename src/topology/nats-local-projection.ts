@@ -334,10 +334,11 @@ export class NatsLocalProjection {
           await this.#serializeProjectionKey(key, async () => {
             if (this.#closed || !this.options.leaseLive() || this.#pendingEntries.get(key) !== pending) return;
             const kv = pending.bucket === "presence" ? this.#presence : this.#leases;
-            const current = await kv.get<unknown>(pending.entry.key, AbortSignal.timeout(5_000));
+            const readSignal = AbortSignal.any([this.#abort.signal, AbortSignal.timeout(5_000)]);
+            const current = await kv.get<unknown>(pending.entry.key, readSignal);
             if (this.#closed || !this.options.leaseLive() || this.#pendingEntries.get(key) !== pending) return;
             if (!current) {
-              await this.#remove(pending.bucket, pending.entry.key, pending.entry.revision, markerFor(pending.entry));
+              await this.#remove(pending.bucket, pending.entry.key, pending.entry.revision, markerFor(pending.entry), readSignal);
               if (this.#pendingEntries.get(key) === pending) this.#pendingEntries.delete(key);
               return;
             }
@@ -466,12 +467,15 @@ export class NatsLocalProjection {
     if (wrote) this.#hostLeaseWrites++;
   }
 
-  async #remove(bucket: BucketKind, key: string, revision: number, expected?: NatsProjectionMarker): Promise<void> {
+  async #remove(
+    bucket: BucketKind, key: string, revision: number, expected?: NatsProjectionMarker, signal?: AbortSignal,
+  ): Promise<void> {
     // A delayed tombstone or stale snapshot may race a delete-and-recreate. KV is
     // authoritative, so confirm the current key before removing its local read model.
     this.#kvReconcileReads++;
+    const readSignal = signal ?? AbortSignal.any([this.#abort.signal, AbortSignal.timeout(5_000)]);
     const currentEntry = await (bucket === "presence" ? this.#presence : this.#leases)
-      .get<unknown>(key, AbortSignal.timeout(5_000));
+      .get<unknown>(key, readSignal);
     if (currentEntry) {
       const currentValue = bucket === "presence" ? presenceValue(currentEntry) : leaseValue(currentEntry);
       if (currentValue) {
@@ -540,7 +544,8 @@ export class NatsLocalProjection {
     this.#hostLeaseIdsByKv.delete(key);
   }
 
-  async #reconcile(bucket: BucketKind, observed: ReadonlySet<string>): Promise<void> {
+  async #reconcile(bucket: BucketKind, observed: ReadonlySet<string>, signal?: AbortSignal): Promise<void> {
+    const readSignal = signal ?? AbortSignal.any([this.#abort.signal, AbortSignal.timeout(5_000)]);
     if (bucket === "presence") {
       // Rebuild this lookup from the current local read model after each snapshot;
       // it is an index of extant projections, not a process-lifetime key history.
@@ -554,12 +559,12 @@ export class NatsLocalProjection {
         await this.#serializeProjectionKey(`presence:${marker.kvKey}`, async () => {
           this.#participantReconcileReads++;
           this.#kvReconcileReads++;
-          const current = await this.#presence.get<unknown>(marker.kvKey, AbortSignal.timeout(5_000));
+          const current = await this.#presence.get<unknown>(marker.kvKey, readSignal);
           if (current) {
             const value = presenceValue(current);
             if (value) { if (!this.#closed) await this.#put("presence", current); return; }
-            await this.#remove("presence", marker.kvKey, current.revision);
-          } else await this.#remove("presence", marker.kvKey, 0, marker);
+            await this.#remove("presence", marker.kvKey, current.revision, undefined, readSignal);
+          } else await this.#remove("presence", marker.kvKey, 0, marker, readSignal);
         });
       }
       return;
@@ -577,12 +582,12 @@ export class NatsLocalProjection {
       await this.#serializeProjectionKey(`leases:${marker.kvKey}`, async () => {
         this.#hostLeaseReconcileReads++;
         this.#kvReconcileReads++;
-        const current = await this.#leases.get<unknown>(marker.kvKey, AbortSignal.timeout(5_000));
+        const current = await this.#leases.get<unknown>(marker.kvKey, readSignal);
         if (current) {
           const value = leaseValue(current);
           if (value) { if (!this.#closed) await this.#put("leases", current); return; }
-          await this.#remove("leases", marker.kvKey, current.revision);
-        } else await this.#remove("leases", marker.kvKey, 0, marker);
+          await this.#remove("leases", marker.kvKey, current.revision, undefined, readSignal);
+        } else await this.#remove("leases", marker.kvKey, 0, marker, readSignal);
       });
     }
   }
@@ -595,7 +600,13 @@ export class NatsLocalProjection {
     await this.#resumingAfterLeaseRecovery?.catch(() => undefined);
     // Shutdown follows KV withdrawal. Re-read before cleanup because an abort can overtake
     // queued tombstones; a failed get retains the local file rather than guessing absence.
-    await Promise.all([this.#reconcile("presence", new Set()), this.#reconcile("leases", new Set())]);
+    // Shutdown cleanup is best-effort and shares one deadline across every final KV read.
+    // If the broker is unavailable, retain projections rather than holding Main teardown.
+    const cleanupSignal = AbortSignal.timeout(2_000);
+    await Promise.all([
+      this.#reconcile("presence", new Set(), cleanupSignal),
+      this.#reconcile("leases", new Set(), cleanupSignal),
+    ]);
     this.#pendingEntries.clear();
   }
 }

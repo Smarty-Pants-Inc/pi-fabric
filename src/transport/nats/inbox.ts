@@ -360,9 +360,14 @@ class RebindingKvStore implements TransportKv {
   ) { this.ttlMs = ttlMs; }
 
   async get<V>(key: string, signal?: AbortSignal): Promise<TransportKvEntry<V> | undefined> {
+    const readSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(5_000)]) : AbortSignal.timeout(5_000);
+    await this.waitForSession(readSignal);
+    if (this.closed()) throw this.unavailable();
     const store = this.current();
     if (!store) throw this.unavailable();
-    return store.get<V>(key, signal);
+    // Resolve the current store only after verified session recovery so a read never
+    // starts on a JetStream client captured from a reconnecting/replaced session.
+    return store.get<V>(key, readSignal);
   }
   async put<V>(key: string, owner: string, value: V, ifRevision: number, signal?: AbortSignal): Promise<number> {
     const store = this.current();

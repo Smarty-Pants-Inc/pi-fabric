@@ -102,6 +102,22 @@ const LEGACY_RENEWAL_PREFIXES = [HOST_PREFIX, LEGACY_SESSION_PREFIX, PARTICIPANT
 const ROOT_COLLISION_PREFIXES = [HOST_PREFIX, PARTICIPANT_PREFIX, LEGACY_SESSION_PREFIX, LEGACY_ACTOR_PREFIX] as const;
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
 const TRANSPORT_RENEW_BUDGET_MS = 5_000;
+const NATS_CLOSE_OPERATION_TIMEOUT_MS = 500;
+const settleWithin = (operation: Promise<unknown> | undefined, timeoutMs: number): Promise<boolean> => {
+  if (!operation) return Promise.resolve(true);
+  return new Promise(resolve => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (didSettle: boolean): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      resolve(didSettle);
+    };
+    timer = setTimeout(() => finish(false), timeoutMs);
+    void operation.then(() => finish(true), () => finish(true));
+  });
+};
 /**
  * Addressable across a live reload, but a failed reload stops accepting after this lease.
  * quiesce("reload") writes it once, at the start of teardown; nothing renews it until the new
@@ -2967,6 +2983,7 @@ export class ParticipantDirectory implements FabricParticipantSource {
   }
 
   async #finishCloseNats(): Promise<void> {
+    const trace = (step: string): void => console.error(`[trace-close ${performance.now().toFixed(0)} ${this.options.hostId}] ${step}`);
     // Admission closes before the view withdraws and before the lease writes its clean marker.
     this.#quiescing = true;
     this.#closed = true;
@@ -2979,15 +2996,39 @@ export class ParticipantDirectory implements FabricParticipantSource {
     if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
     this.#refreshScheduled = false;
-    await this.#refreshing?.catch(() => undefined);
-    await Promise.allSettled([...this.#natsPending.values()]);
-    await this.#transportRenewing?.catch(() => undefined);
+    trace("before refreshing"); await settleWithin(this.#refreshing, NATS_CLOSE_OPERATION_TIMEOUT_MS); trace("after refreshing");
+    trace("before pending"); await settleWithin(Promise.allSettled([...this.#natsPending.values()]), NATS_CLOSE_OPERATION_TIMEOUT_MS); trace("after pending");
+    trace("before renewing"); await settleWithin(this.#transportRenewing, NATS_CLOSE_OPERATION_TIMEOUT_MS); trace("after renewing");
     this.#transportReconnectUnsubscribe?.();
     this.#transportReconnectUnsubscribe = undefined;
-    await this.#notifications.close();
-    if (this.#participantView) await this.#participantView.close().catch(error => { this.#refreshError = error; });
-    if (this.#transportLease) await this.#transportLease.release(AbortSignal.timeout(5_000)).catch(error => { this.#refreshError = error; });
-    if (this.#localProjection) await this.#localProjection.close().catch(error => { this.#refreshError = error; });
+    trace("before notifications"); await settleWithin(this.#notifications.close(), NATS_CLOSE_OPERATION_TIMEOUT_MS); trace("after notifications");
+    if (this.#participantView) {
+      trace("before view");
+      const viewClose = this.#participantView.close().catch(error => { this.#refreshError = error; });
+      if (!await settleWithin(viewClose, NATS_CLOSE_OPERATION_TIMEOUT_MS)) {
+        this.#refreshError = new Error("Participant view close did not settle before shutdown deadline");
+      }
+      trace("after view");
+    }
+    if (this.#transportLease) {
+      trace("before release");
+      const release = this.#transportLease.release(AbortSignal.timeout(NATS_CLOSE_OPERATION_TIMEOUT_MS))
+        .catch(error => { this.#refreshError = error; });
+      if (!await settleWithin(release, NATS_CLOSE_OPERATION_TIMEOUT_MS)) {
+        // The receipt-custody lock is local and cannot be interrupted while acquiring it.
+        // Do not pin shutdown or claim a clean KV withdrawal if release misses its budget.
+        this.#refreshError = new Error("Transport host lease release did not settle before shutdown deadline; KV cleanup outcome is uncertain");
+      }
+      trace("after release");
+    }
+    if (this.#localProjection) {
+      trace("before projection");
+      const projectionClose = this.#localProjection.close().catch(error => { this.#refreshError = error; });
+      if (!await settleWithin(projectionClose, NATS_CLOSE_OPERATION_TIMEOUT_MS)) {
+        this.#refreshError = new Error("NATS local projection close did not settle before shutdown deadline");
+      }
+      trace("after projection");
+    }
     this.#natsPrelaunch.clear();
     this.#natsPending.clear();
     this.#natsPublished.clear();

@@ -418,8 +418,16 @@ export const bridgeNatsTopicIdempotencyKey = (link: string, fileEventId: string)
 // L1 -> L2: the raw NATS port (L1 provides it; L2's NatsCarrierSide consumes it)
 // ---------------------------------------------------------------------------------------------
 
+/** Bounded diagnostic labels only; never raw lease/owner/machine values or authority. */
+export type BridgeNatsPresenceFailure = "no-route" | "not-ready" | "machine-mismatch" | "identity-mismatch" |
+  "incarnation-mismatch" | "binding-mismatch" | "root-recheck" | "terminal" | "expired" | "not-live";
+
 /** One KV presence record resolved for an id: the route plus the identity from the KV record itself. */
 export interface BridgeNatsPortResolved {
+  /** Classification only: a matching, nonterminal record/lease whose only failed check is expiry. */
+  readonly leaseLapsed?: boolean;
+  readonly presenceFailure?: BridgeNatsPresenceFailure;
+  readonly remainingAuthorityMs?: number;
   /** ParticipantRoute semantics (participant-view.ts): machine from the KV key, presence + lease liveness. */
   readonly route: ParticipantRoute;
   /** From the KV presence record (id, name, kind, sessionId), never from an envelope. */
@@ -443,6 +451,9 @@ export interface BridgeNatsPortDelivery {
   readonly streamSequence: number;
   /** JetStream num_delivered. */
   readonly attempt: number;
+  /** Broker publish timestamp in ms, immutable across redelivery; never envelope.createdAt.
+   * Older adapters may omit it; an unknown redelivery then expires only if it is currently lapsed. */
+  readonly publishedAt?: number;
   /** Final ack. L2 calls it only after MeshBridge read past this delivery (durable file append) or a ledger replay. */
   ack(): Promise<void>;
   /** Never redeliver (malformed, refused). */
@@ -455,6 +466,9 @@ export interface BridgeNatsPortDelivery {
 export interface BridgeNatsPort {
   /** The bridge's credential-bound NATS machine (== allow-list natsMachine). */
   readonly machine: string;
+  /** Broker-confirmed stream sequence through which this consumer has settled all deliveries.
+   * Optional on older adapters. Failure/absence never authorizes terminal-history reclamation. */
+  ackFloor?(): Promise<number>;
   /** Current KV presence: NATS roots and actors, in MeshBridge's shape (records under the bridge machine excluded). */
   presence(): Promise<BridgePresence>;
   /** Presence change hints; failure is fatal for the link. Returns the unsubscribe. */

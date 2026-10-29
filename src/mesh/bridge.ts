@@ -53,6 +53,8 @@ const HOST_PREFIX = "topology/hosts/";
 const PARTICIPANT_PREFIX = "topology/participants/";
 /** Freshness bound for an observation from one physical bridge peer. */
 export const BRIDGE_LEASE_MS = MIRROR_FRESH_MS;
+// Two full mirror TTLs for renewal/reconciliation; never extend an event's first-lapse window.
+export const LEASE_LAPSE_DEFER_MS = 2 * BRIDGE_LEASE_MS;
 const DEFAULT_PRESENCE_MS = 5_000;
 /** A retained source event revalidates after this delay; this is NOT an event/authority TTL. */
 const DEFAULT_MEMBERSHIP_RETRY_MS = 1_000;
@@ -477,6 +479,12 @@ export interface BridgeSide {
   publishBatchWithReceipt?(events: Array<{ event: BridgePublish; held?: string[] }>): Promise<BridgePublishReceipt[]>;
   /** Whether this link holds a live mirror answering to the id (the hub side only). */
   holds?(id: string, identity?: MeshIdentity): boolean;
+  /** Hub-local only: all ownership checks pass except lease expiry. Not admission authority. */
+  leaseLapsed?(id: string, identity?: MeshIdentity): boolean;
+  /** A carrier may already hold this event for a lapse. Share its FIRST durable deadline with the append fence. */
+  retainLeaseLapse?(event: MeshEvent, startedAt?: number): number | undefined;
+  /** Hub-local only: a fenced/stale link cannot defer an ownership refusal. */
+  readonly ingressFenced?: boolean;
   /** Whether this link has a mirror record for the id, even if its lease lapsed (hub only). */
   mirrored?(id: string): boolean;
   /**
@@ -1454,7 +1462,7 @@ export class StoreBridgeSide implements BridgeSide {
    * id, name, kind and session id (pi-fabric#876 security pass, (b)).
    */
   holds(id: string, identity?: MeshIdentity): boolean {
-    if (this.#staleAdmission) return false;
+    if (this.ingressFenced) return false;
     // Inside #heldFence, after its proof: this exact (id, identity) was checked at a revision the fence
     // proved current. Set and cleared in one synchronous segment, so no other caller can see it.
     if (this.#proven.has(id) && this.#proven.get(id) === identity) return true;
@@ -1555,8 +1563,17 @@ export class StoreBridgeSide implements BridgeSide {
     return [meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR), ...leases].join("|");
   }
 
-  // The lease expiry of `id` when this link holds it now (see holds()), else 0.
-  #heldUntil(id: string, identity?: MeshIdentity): number {
+  get ingressFenced(): boolean { return this.#fenced || this.#staleAdmission !== undefined; }
+
+  leaseLapsed(id: string, identity?: MeshIdentity): boolean {
+    if (this.ingressFenced) return false;
+    const until = this.#heldUntil(id, identity, true);
+    return until > 0 && until <= this.now();
+  }
+
+  // An expired lease may classify a refusal, but still must pass EVERY ownership check.
+  // Ordinary holds()/append fences never include expired leases.
+  #heldUntil(id: string, identity?: MeshIdentity, includeExpired = false): number {
     const now = this.now();
     const hostEntry = this.store.get(keyFor(HOST_PREFIX, id), { fresh: true });
     const participantEntry = this.store.get(keyFor(PARTICIPANT_PREFIX, id), { fresh: true });
@@ -1572,7 +1589,7 @@ export class StoreBridgeSide implements BridgeSide {
     // readdir plus a stat per fleet lease, per held event, on Windows where listings are never cached).
     const lease = readHostLease(this.store.root, id);
     const until = hostLeaseExpiry(new Map<string, FabricHostLease>(lease ? [[id, lease]] : []), host);
-    if (until <= now) return 0;
+    if (!Number.isFinite(until) || until <= 0 || (!includeExpired && until <= now)) return 0;
     if (participantEntry) {
       const participant = participantOf(participantEntry.key, participantEntry.value);
       if (!participant || participant.ownerHostId !== id || participant.ownerIdentityId !== id) return 0;
@@ -3259,6 +3276,8 @@ interface DirectionCursor {
   mark: number;
   /** Optional v1 cursor extension: one retained relay boundary's local grace start. */
   relayGrace?: RelayGraceCursor;
+  /** Optional v1 extension: this inbound event's first lease-only refusal, in the hub clock. */
+  leaseLapse?: { sequence: number; id: string; startedAt: number };
 }
 
 interface CursorFile {
@@ -4064,6 +4083,12 @@ export class MeshBridge {
   }
 
   #save(): void {
+    if (this.#cursor) {
+      for (const direction of ["toRemote", "toLocal"] as const) {
+        const cursor = this.#cursor[direction];
+        if (cursor.leaseLapse && cursor.leaseLapse.sequence <= cursor.after) delete cursor.leaseLapse;
+      }
+    }
     fs.mkdirSync(path.dirname(this.options.cursorPath), { recursive: true, mode: 0o700 });
     writeJsonAtomic(this.options.cursorPath, this.#cursor, { mode: 0o600, durable: true });
     if (!this.#cursor) return;
@@ -4396,8 +4421,9 @@ export class MeshBridge {
     if (legacyRemote && (hadLegacyNoBaseline || legacyRemote.legacyNoBaselineCycles > 0)) this.#reportPresenceInfo();
   }
 
-  /** Only an expired sampled projection makes these membership failures inconclusive. */
+  /** Expired samples or an own-root lease-only lapse can retain a membership boundary. */
   #staleMembership(event: MeshEvent, rules: BridgeRules, direction: Direction, reason?: string): boolean {
+    if (direction === "toLocal" && this.options.local.ingressFenced) return false;
     if (reason !== undefined && reason !== "sender is not a live participant of the remote" &&
       reason !== "ack target is not bound to this link" && !(reason === "not addressed across" && direction === "toRemote")) return false;
     // #refusal checks routing before body shape. A missing recipient must not hide a
@@ -4410,7 +4436,38 @@ export class MeshBridge {
     // other held id. Noncanonical/missing ACK targets are structural, not a stale mirror.
     const reserved = direction === "toRemote" ? rules.reservedRecipients : rules.reserved;
     if (!ids.every(id => typeof id === "string" && CANONICAL_ID.test(id) && !reserved?.has(id))) return false;
-    return ids.some(id => (this.#sampledDeadlines.get(id as string) ?? Infinity) <= Date.now());
+    const local = this.options.local;
+    const lapsed = direction === "toLocal" && ids.some(id => local.leaseLapsed?.(id as string, id === event.from.id ? event.from : undefined)) &&
+      ids.every(id => local.holds?.(id as string, id === event.from.id ? event.from : undefined) ||
+        local.leaseLapsed?.(id as string, id === event.from.id ? event.from : undefined));
+    const cursor = this.#cursor![direction];
+    if (direction === "toLocal" && (cursor.leaseLapse?.sequence !== event.sequence || cursor.leaseLapse.id !== event.id)) {
+      // Import an earlier carrier boundary even when this layer only sees a stale projection.
+      // Otherwise initialize only a proven local lease lapse; never renew on retry/restart.
+      const startedAt = this.options.remote.retainLeaseLapse?.(event, lapsed ? Date.now() : undefined) ??
+        (lapsed ? Date.now() : undefined);
+      if (startedAt !== undefined) {
+        cursor.leaseLapse = { sequence: event.sequence, id: event.id, startedAt };
+        this.#save(); // Also persist an unchanged cursor: reconnect cannot renew this window.
+      }
+    }
+    // Once a lease lapse starts a window, stale-sample reclassification cannot evade it.
+    const deadline = this.#leaseLapseAt(direction, event);
+    if (deadline !== undefined && Date.now() >= deadline) return false;
+    return lapsed || ids.some(id => (this.#sampledDeadlines.get(id as string) ?? Infinity) <= Date.now());
+  }
+
+  #leaseLapseAt(direction: Direction, event?: MeshEvent): number | undefined {
+    if (direction !== "toLocal") return undefined;
+    const cursor = this.#cursor?.[direction], retained = cursor?.leaseLapse;
+    if (!retained || (event && (retained.sequence !== event.sequence || retained.id !== event.id)) ||
+      retained.sequence <= (cursor?.after ?? 0)) return undefined;
+    const now = Date.now();
+    // Fail closed on corrupt/future metadata or clock rollback, rather than grant a fresh window.
+    if (!Number.isSafeInteger(retained.sequence) || typeof retained.id !== "string" || !retained.id ||
+      !Number.isFinite(retained.startedAt) || retained.startedAt > now ||
+      !Number.isFinite(retained.startedAt + LEASE_LAPSE_DEFER_MS)) return now;
+    return retained.startedAt + LEASE_LAPSE_DEFER_MS;
   }
 
   #deferMembership(direction: Direction, event: MeshEvent): void {
@@ -4419,15 +4476,15 @@ export class MeshBridge {
     const current = this.#membershipSafetyDelay[direction] ?? initial;
     const delay = this.#membershipAttempt[direction] === "safety"
       ? Math.min(current * 2, MEMBERSHIP_RETRY_MAX_MS) : current;
-    this.#membershipRetryAt[direction] = Date.now() + delay;
+    this.#membershipRetryAt[direction] = Math.min(Date.now() + delay, this.#leaseLapseAt(direction, event) ?? Infinity);
     // A safety wake doubles only after it actually gets a retained pass. A grace wake and
     // sync completion preserve the current safety delay; a real wake clears it before here.
     this.#membershipSafetyDelay[direction] = delay;
     if (previous !== event.sequence) {
       this.options.debug?.(`${direction}: bridge membership pending for ${event.topic} ${event.id}; source cursor retained, nothing dropped`);
     }
-    // Expiry alone never consumes the event. The next successful source sample decides
-    // anew: stale evidence waits again; current absence or a proven foreign identity refuses.
+    // Ordinary sampled-membership expiry never consumes an event. A lease-only lapse has
+    // its own finite total window; neither a refresh nor a notification restarts that window.
     this.#membershipSequence[direction] = event.sequence;
   }
 
@@ -4771,7 +4828,7 @@ export class MeshBridge {
     }
     const membershipRetryAt = this.#membershipRetryAt[direction];
     if (membershipRetryAt !== undefined) {
-      const graceDue = this.#relayGraceExpired(direction);
+      const graceDue = this.#relayGraceExpired(direction) || Date.now() >= (this.#leaseLapseAt(direction) ?? Infinity);
       if (Date.now() < membershipRetryAt && !graceDue) return { forwarded, dropped };
       delete this.#membershipRetryAt[direction];
       // Expiration invalidates the observation, never the event: sample again before rereading

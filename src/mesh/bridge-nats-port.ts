@@ -58,7 +58,7 @@ const coded = (message: string, code: string): Error => Object.assign(new Error(
 export interface NatsBridgeInboxMessage {
   readonly subject: string;
   readonly data: Uint8Array;
-  readonly info: { readonly streamSequence: number; readonly deliveryCount: number };
+  readonly info: { readonly streamSequence: number; readonly deliveryCount: number; readonly timestampNanos?: number };
   ackAck(): Promise<boolean>;
   nak(delayMs?: number): void;
   term(reason?: string): void;
@@ -71,6 +71,8 @@ export interface NatsBridgeInboxSource {
   consume(signal: AbortSignal): AsyncIterable<NatsBridgeInboxMessage>;
   /** False while a reconnect awaits USER.INFO re-verification: settle nothing then. */
   isVerified(): boolean;
+  /** Fresh consumer ack floor; absent sources cannot prove terminal-history reclamation. */
+  ackFloor?(): Promise<number>;
 }
 
 /** BridgeNatsPortDelivery plus what the decode already proved. The port never settles it itself. */
@@ -125,6 +127,14 @@ export const natsBridgeInboxSource = (connection: NatsConnectionHandle, options:
   };
   return {
     isVerified: () => connection.isVerified(),
+    async ackFloor() {
+      if (!connection.isVerified()) throw new Error("NATS connection is not verified");
+      const info = await connection.manager.consumers.info(stream, policy.durable);
+      if (!connection.isVerified() || info.config.filter_subject !== policy.filterSubject || info.config.description !== policy.description) {
+        throw new Error("NATS bridge consumer ack floor is not verified");
+      }
+      return info.ack_floor.stream_seq;
+    },
     async *consume(signal) {
       for (let attempt = 0; !signal.aborted; attempt++) {
         if (attempt > 0) {
@@ -341,7 +351,9 @@ export class NatsBridgePort implements BridgeNatsPort {
     const kind = route && meshKind(route.kind);
     if (!route || !kind) return undefined;
     return {
-      route: { machine: route.machine, ownerHostId: route.ownerHostId, ownerIdentityId: route.ownerIdentityId,
+      leaseLapsed: route.leaseLapsed,
+      ...(route.presenceFailure ? { presenceFailure: route.presenceFailure } : {}),
+      ...(route.remainingAuthorityMs !== undefined ? { remainingAuthorityMs: route.remainingAuthorityMs } : {}),      route: { machine: route.machine, ownerHostId: route.ownerHostId, ownerIdentityId: route.ownerIdentityId,
         ownerIncarnation: route.ownerIncarnation, capabilities: [...route.capabilities], live: route.live },
       identity: { id: route.id, name: route.record.name, kind,
         ...(route.record.sessionId !== undefined ? { sessionId: route.record.sessionId } : {}) },
@@ -448,6 +460,14 @@ export class NatsBridgePort implements BridgeNatsPort {
     }
   }
 
+  /** Query only when the bounded lapse journal needs reclamation; no polling timer. */
+  async ackFloor(): Promise<number> {
+    if (!this.#inbox.isVerified() || !this.#inbox.ackFloor) throw new Error("NATS bridge consumer ack floor is unavailable");
+    const floor = await this.#inbox.ackFloor();
+    if (!this.#inbox.isVerified()) throw new Error("NATS bridge consumer ack floor is not verified");
+    return floor;
+  }
+
   /**
    * This machine's inbox, one iterator at a time, in stream order. A malformed or misaddressed
    * message is TERMed here; everything else is yielded unsettled.
@@ -475,6 +495,7 @@ export class NatsBridgePort implements BridgeNatsPort {
         yield {
           envelope: decoded.envelope, sourceMachine: decoded.sourceMachine, toHostId: decoded.envelope.to.hostId,
           streamSequence: message.info.streamSequence, attempt: message.info.deliveryCount,
+          ...(Number.isFinite(message.info.timestampNanos) ? { publishedAt: Math.floor(message.info.timestampNanos! / 1_000_000) } : {}),
           ...(decoded.bodyDigest !== undefined ? { bodyDigest: decoded.bodyDigest } : {}),
           working: () => { if (!finished && this.#inbox.isVerified()) message.working(); },
           ack: async () => {

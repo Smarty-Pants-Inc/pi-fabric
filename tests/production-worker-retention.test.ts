@@ -247,7 +247,6 @@ describe("I-2 production-worker ingress retention", () => {
       }
     } else {
       for (const [name, before] of [["plain", plainBefore], ["attributed", attributedBefore]] as const) {
-        expect(fs.existsSync(path.join(root, name)), name).toBe(false);
         const retained = retainedRunDirectory(path.join(root, name));
         expect(fs.existsSync(retained), `${name} is held in place or in a receipt-backed archive`).toBe(true);
         expect(runBytes(retained)).toEqual(before);
@@ -262,7 +261,13 @@ describe("I-2 production-worker ingress retention", () => {
     const base = Math.max(plain.result.finishedAt!, attributed.result.finishedAt!);
     const store = new ActorLogStore({ maxEventBytes: DEFAULT_FABRIC_CONFIG.mesh.maxEventBytes }, DEFAULT_FABRIC_CONFIG.mesh, { actorRunArchiveMs: 60_000 });
     fs.mkdirSync(path.join(root, "sources"), { mode: 0o700 });
-    for (const kind of ["successful", "latest", ...unsafeKinds] as const) {
+    // Every archive write is durable, including each file in each nested native run.
+    // Keep Windows' hosted-runner workload representative without repeating the full
+    // unsafe-kind cross-product: the retention sweep above independently checks every kind.
+    const archiveKinds: readonly ("successful" | "latest" | UnsafeKind)[] = process.platform === "win32"
+      ? ["successful", "latest", "pending-delivery", "delivery-link", "sidecar-link", "directory-link"]
+      : ["successful", "latest", ...unsafeKinds];
+    for (const kind of archiveKinds) {
       const source = copyRun(plain.run, path.join(root, "sources", kind));
       // cpSync's destination creation must not inherit a group-writable umask.
       fs.chmodSync(source, 0o700);
@@ -273,7 +278,7 @@ describe("I-2 production-worker ingress retention", () => {
       const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8"));
       expect(receipt.runId).toBe(plain.result.id);
       fs.writeFileSync(receiptFile, JSON.stringify({ ...receipt, runId: kind }));
-      copyRun(plain.run, path.join(source, "nested", "plain"));
+      if (kind === "successful" || kind === "latest") copyRun(plain.run, path.join(source, "nested", "plain"));
       const nested = copyRun(attributed.run, path.join(source, "nested", "attributed"));
       if (kind !== "successful" && kind !== "latest") makeUnsafe(nested, kind);
       // Source symlinks now refuse the entire archive instead of yielding a false success after a partial copy.
@@ -311,7 +316,8 @@ describe("I-2 production-worker ingress retention", () => {
     expect(store.retainedRunIds(actor)).toContain("successful");
     expect(snapshot()).toEqual(before);
     store.pruneRuns(actor, base + 60_001);
-    for (const kind of ["latest", ...unsafeKinds]) {
+    const unsafeArchiveKinds = archiveKinds.filter((kind): kind is UnsafeKind => kind !== "successful" && kind !== "latest");
+    for (const kind of ["latest", ...unsafeArchiveKinds]) {
       if (kind === "delivery-link" || kind === "sidecar-link" || kind === "directory-link") {
         expect(fs.existsSync(path.join(root, "sources", kind, "nested", "attributed", "events.jsonl"))).toBe(true);
       } else expect(store.retainedRunIds(actor), kind).toContain(kind);

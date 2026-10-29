@@ -9,7 +9,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { activeBudgetState, appendBudgetLedger, readBudgetLedger } from "../src/agents/budget-ledger.js";
-import { hasUnresolvedWorker, runTreeExitVeto } from "../src/storage/retention.js";
+import { hasUnresolvedWorker, runTreeExitVeto, RUN_ROOT_SWEEP_MARKER } from "../src/storage/retention.js";
 import { processAlive } from "../src/storage/scratch.js";
 import * as agentRemoval from "../src/agents/rm.js";
 import * as retention from "../src/storage/retention.js";
@@ -55,6 +55,18 @@ const setup = (retainRuns = true, extra: ConstructorParameters<typeof AgentManag
   managers.push(manager);
   const name = fs.readdirSync(tempRoot).find((name) => name.startsWith("pi-fabric-runs-"));
   return { manager, tempRoot, root: name ? path.join(tempRoot, name) : extra.runRoot! };
+};
+const expectCloseSweep = async (tempRoot: string, sentinel: string, ownerBytes: string): Promise<void> => {
+  if (process.platform === "win32") {
+    // runRootOwnerGone requires checked POSIX uid/process evidence (retention.ts); Windows
+    // intentionally keeps dead-owner roots. The claim proves close launched its sweep.
+    const claim = JSON.parse(fs.readFileSync(path.join(tempRoot, RUN_ROOT_SWEEP_MARKER), "utf8")) as { sweptAt?: unknown };
+    expect(claim.sweptAt).toEqual(expect.any(Number));
+    expect(fs.existsSync(sentinel)).toBe(true);
+    expect(fs.readFileSync(path.join(sentinel, ".fabric-owner.json"), "utf8")).toBe(ownerBytes);
+    return;
+  }
+  await vi.waitFor(() => expect(fs.existsSync(sentinel)).toBe(false), { timeout: 20_000 });
 };
 // Native identities and bytes, not a write-buffer hash or the custody helper's
 // claimed inventory. Rename may change ctime, so it is deliberately not compared.
@@ -300,18 +312,19 @@ describe("AgentManager close storage", () => {
     const { manager, tempRoot } = setup();
     const sentinel = path.join(tempRoot, "pi-fabric-runs-sentinel");
     fs.mkdirSync(sentinel);
-    const marker = { pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 };
-    fs.writeFileSync(path.join(sentinel, ".fabric-owner.json"), JSON.stringify(marker));
+    const ownerBytes = JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 });
+    fs.writeFileSync(path.join(sentinel, ".fabric-owner.json"), ownerBytes);
     ageRunRoot(sentinel, Date.now() - 7 * 60 * 60 * 1_000);
     const second = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 });
     managers.push(second);
     await new Promise((resolve) => setImmediate(resolve));
+    expect(fs.existsSync(path.join(tempRoot, RUN_ROOT_SWEEP_MARKER))).toBe(false);
     expect(fs.existsSync(sentinel)).toBe(true);
     const started = performance.now();
     await manager.close();
     // smarty-dev#2010: close only starts the detached sweep; it never waits for the walk.
     expect(performance.now() - started).toBeLessThan(5_000);
-    await vi.waitFor(() => expect(fs.existsSync(sentinel)).toBe(false), { timeout: 20_000 });
+    await expectCloseSweep(tempRoot, sentinel, ownerBytes);
   });
 
   it.runIf(hostedDelete)("starts the close sweep through a real JS runtime under a Bun-compiled Pi (smarty-dev#2010)", async () => {
@@ -320,7 +333,8 @@ describe("AgentManager close storage", () => {
     const { manager, tempRoot } = setup();
     const sentinel = path.join(tempRoot, "pi-fabric-runs-bundled");
     fs.mkdirSync(sentinel);
-    fs.writeFileSync(path.join(sentinel, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
+    const ownerBytes = JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 });
+    fs.writeFileSync(path.join(sentinel, ".fabric-owner.json"), ownerBytes);
     ageRunRoot(sentinel, Date.now() - 7 * 60 * 60 * 1_000);
     // process.execPath is the Pi executable itself, which cannot run sweep-main.js.
     process.execPath = "/usr/local/bin/pi";
@@ -332,7 +346,7 @@ describe("AgentManager close storage", () => {
       if (originalOverride === undefined) delete process.env.PI_FABRIC_NODE_BINARY;
       else process.env.PI_FABRIC_NODE_BINARY = originalOverride;
     }
-    await vi.waitFor(() => expect(fs.existsSync(sentinel)).toBe(false), { timeout: 20_000 });
+    await expectCloseSweep(tempRoot, sentinel, ownerBytes);
   });
 
   it.runIf(hostedDelete)("archives an explicit caller run after stopping a worker with retainRuns:false", async () => {

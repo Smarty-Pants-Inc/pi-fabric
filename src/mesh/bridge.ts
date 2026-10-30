@@ -1085,15 +1085,29 @@ export class StoreBridgeSide implements BridgeSide {
 
   subscribeChanges(changed: (kind: BridgeChange) => void, failed: (error: Error) => void): () => void {
     let active = true;
-    let queued = false;
-    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let scanTimer: ReturnType<typeof setTimeout> | undefined;
     let burst: ReturnType<typeof setImmediate> | undefined;
+    let scanning = false;
     let scanNext = false;
     let eventsNext = false;
+    let nextScanAt = 0;
+    let retryAt: number | undefined;
     let retryMs = LOCK_RETRY_MIN_MS;
     let baseline: ReturnType<typeof snapshot> | undefined;
+    type Inputs = {
+      revision: string | undefined;
+      hosts: readonly MeshStateEntry[];
+      participants: readonly MeshStateEntry[];
+      handoffs: readonly MeshStateEntry[];
+      participantFiles: readonly MeshStateEntry[];
+      leases: ReadonlyMap<string, FabricHostLease>;
+      participantStamp: string;
+      leaseStamp: string;
+    };
+    let accepted: { inputs: Inputs; value: ReturnType<typeof snapshot>; at: number; until: number;
+      liveness: LeaseLivenessWindow } | undefined;
     // File snapshots are private, copy-on-write parses: reuse their read-only entries.
-    // Other backends use detached prefix reads, reused only within one snapshot.
+    // SQLite retains detached prefix reads only after the whole observation is fenced.
     // Cache file content by object, never by version: legacy writers can reuse revision labels.
     const fileState = this.store.stateBackend === "file";
     const digests = new WeakMap<object, string>();
@@ -1102,12 +1116,12 @@ export class StoreBridgeSide implements BridgeSide {
       if (digest === undefined) { digest = contentDigest(value); digests.set(value, digest); }
       return digest;
     };
-    const snapshot = () => {
-      const leases = readHostLeases(this.store.root);
-      const hostEntries = fileState ? this.store.listAllShared(HOST_PREFIX, { fresh: true })
-        : this.store.listAll(HOST_PREFIX, { fresh: true });
-      const participantEntries = fileState ? this.store.listAllShared(PARTICIPANT_PREFIX, { fresh: true })
-        : this.store.listAll(PARTICIPANT_PREFIX, { fresh: true });
+    const snapshot = (inputs?: Inputs) => {
+      const leases = inputs?.leases ?? readHostLeases(this.store.root);
+      const hostEntries = inputs?.hosts ?? (fileState ? this.store.listAllShared(HOST_PREFIX, { fresh: true })
+        : this.store.listAll(HOST_PREFIX, { fresh: true }));
+      const participantEntries = inputs?.participants ?? (fileState ? this.store.listAllShared(PARTICIPANT_PREFIX, { fresh: true })
+        : this.store.listAll(PARTICIPANT_PREFIX, { fresh: true }));
       // Include held projection existence/content, so an external prune/lease removal repairs
       // without waiting for traffic. Exclude our renewal fields: our own mirror writes then
       // cause at most one settling pass, never a self-sustaining lease-write feedback loop.
@@ -1123,9 +1137,9 @@ export class StoreBridgeSide implements BridgeSide {
               startedAt: lease.startedAt, incarnationToken: lease.incarnationToken } : null } : {}) };
         }).sort((a, b) => a.key.localeCompare(b.key));
       const native = this.#presence(hostEntries,
-        [...participantEntries, ...readParticipantFiles(this.store.root, { maxAgeMs: 0 })],
-        fileState ? this.store.listAllShared(BRIDGE_HANDOFF_PREFIX, { fresh: true })
-          : this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true }), leases);
+        [...participantEntries, ...(inputs?.participantFiles ?? readParticipantFiles(this.store.root, { maxAgeMs: 0 }))],
+        inputs?.handoffs ?? (fileState ? this.store.listAllShared(BRIDGE_HANDOFF_PREFIX, { fresh: true })
+          : this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true })), leases);
       // Other links' mirror additions/removals must wake the hub's exporting links.
       const relays = [...hostEntries, ...participantEntries]
         .filter(entry => remoteHostOf(entry.value) !== undefined && mirrorLinkOf(entry.value) !== this.peer)
@@ -1139,29 +1153,115 @@ export class StoreBridgeSide implements BridgeSide {
     // A WAL write can be observed before the writer's COMMIT/wal-index publication. A
     // read then sees old state and may receive no later fs event. Fence the observation
     // against the pending writer, retrying actual contention only, never idle polling.
-    // smarty-dev#10391: the snapshot reads every host, participant and handoff row and the participant and
-    // lease files. Taken inside the fence, it held state.db's write lock on EVERY change notification of the
-    // mesh, for each bridge: on a busy hub each state write woke every bridge into a full scan under the lock,
-    // so the bridges' share grew with the load (the idle spin). It is taken first; the fence then only proves
-    // that no such row changed since its revision (the pending writer has committed by then) and that both
-    // file directories kept their stamps. A failed proof takes it again; the last try runs inside the fence.
-    const files = (): string => `${meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR)}|${meshDirectoryStamp(this.store.root, HOST_LEASE_DIR)}`;
+    // Reuse only accepted inputs, never an optimistic attempt that failed validation. The
+    // revision is read BEFORE the rows/feed: advancing it after the fence could skip an unseen
+    // commit (including this connection's own writes, which data_version does not detect).
+    const files = () => ({ participantStamp: meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR),
+      leaseStamp: meshDirectoryStamp(this.store.root, HOST_LEASE_DIR) });
+    const sameFiles = (inputs: Inputs): boolean => {
+      const stamps = files();
+      return stamps.participantStamp === inputs.participantStamp && stamps.leaseStamp === inputs.leaseStamp;
+    };
+    const prepare = (): NonNullable<typeof accepted> => {
+      const revision = this.store.stateRevision();
+      const stamps = files();
+      const previous = accepted?.inputs;
+      const unchanged = previous?.revision !== undefined && (previous.revision === revision ||
+        this.store.stateUnchangedSince(previous.revision, HELD_STATE_PREFIXES));
+      const entries = (prefix: string, known: readonly MeshStateEntry[] | undefined): readonly MeshStateEntry[] =>
+        known && previous?.revision !== undefined && (unchanged || this.store.stateUnchangedSince(previous.revision, [prefix]))
+          ? known : this.store.listAll(prefix, { fresh: true });
+      // Let the readers enforce directory-tick/platform freshness; leases also stat each file
+      // even when an aged directory is unchanged. Reuse arrays/maps only after a current read
+      // confirms the same cached entry objects, retaining quiet projection/hash reuse.
+      const participantFiles = (): readonly MeshStateEntry[] => {
+        const current = readParticipantFiles(this.store.root, { maxAgeMs: 0 });
+        if (!previous || previous.participantFiles.length !== current.length) return current;
+        for (let index = 0; index < current.length; index += 1) {
+          if (previous.participantFiles[index] !== current[index]) return current;
+        }
+        return previous.participantFiles;
+      };
+      const leases = (): ReadonlyMap<string, FabricHostLease> => {
+        const current = readHostLeases(this.store.root);
+        if (!previous || previous.leases.size !== current.size) return current;
+        for (const [id, lease] of current) if (previous.leases.get(id) !== lease) return current;
+        return previous.leases;
+      };
+      const inputs: Inputs = { revision, ...stamps,
+        hosts: entries(HOST_PREFIX, previous?.hosts),
+        participants: entries(PARTICIPANT_PREFIX, previous?.participants),
+        handoffs: entries(BRIDGE_HANDOFF_PREFIX, previous?.handoffs),
+        participantFiles: participantFiles(),
+        leases: leases(),
+      };
+      const at = this.now();
+      // Reused rows/files can cross an expiry without a write. Rebuild on the next hint
+      // when a live host or handoff judgment can change; idle expiry is still driven by
+      // MeshBridge's existing authority deadline, not a subscription polling timer.
+      if (accepted && previous && inputs.hosts === previous.hosts && inputs.participants === previous.participants &&
+          inputs.handoffs === previous.handoffs && inputs.participantFiles === previous.participantFiles &&
+          inputs.leases === previous.leases && at >= accepted.at && at < accepted.until &&
+          (inputs.handoffs.length === 0 || leaseLivenessUnchanged(accepted.liveness, at))) {
+        return { ...accepted, inputs };
+      }
+      const value = snapshot(inputs);
+      return { inputs, value, at,
+        until: value.native.hosts.reduce((until, host) => host.expiresAt > at ? Math.min(until, host.expiresAt) : until, Infinity),
+        liveness: leaseLivenessWindow(inputs.leases, at) };
+    };
     const capture = (): ReturnType<typeof snapshot> => {
       if (this.store.stateBackend !== "sqlite") return snapshot();
       for (let attempt = 0; attempt < HELD_FENCE_ATTEMPTS - 1; attempt += 1) {
-        const revision = this.store.stateRevision();
-        const stamps = files();
-        const value = snapshot();
+        const next = prepare();
+        // Even an unchanged-input result must cross the write fence: a pre-COMMIT WAL
+        // hint can be the last notification. Busy retries retain that unsettled work.
+        const revision = next.inputs.revision;
         if (revision !== undefined && this.store.withStateWriteFence(() =>
-          this.store.stateUnchangedSince(revision, HELD_STATE_PREFIXES) && files() === stamps)) return value;
+          this.store.stateUnchangedSince(revision, HELD_STATE_PREFIXES) && sameFiles(next.inputs))) {
+          accepted = next;
+          return next.value;
+        }
       }
-      return this.store.withStateWriteFence(snapshot);
+      const next = this.store.withStateWriteFence(() => {
+        const value = prepare();
+        if (!sameFiles(value.inputs)) throw new MeshSnapshotRetriesExhaustedError(HELD_FENCE_ATTEMPTS);
+        return value;
+      });
+      accepted = next;
+      return next.value;
+    };
+    let close: (() => void) | undefined;
+    const dispose = (): void => {
+      active = false;
+      scanNext = eventsNext = false;
+      if (scanTimer !== undefined) clearTimeout(scanTimer);
+      if (burst !== undefined) clearImmediate(burst);
+      scanTimer = burst = undefined;
+      close?.();
+    };
+    const fail = (error: Error): void => {
+      if (!active) return;
+      dispose();
+      failed(error);
+    };
+    const schedule = (): void => {
+      if (!active || scanning || !scanNext || scanTimer !== undefined) return;
+      const delay = Math.max(nextScanAt, retryAt ?? 0) - monotonicClock.now();
+      if (delay > 0) scanTimer = setTimeout(() => { scanTimer = undefined; tick(); }, delay);
+      else burst ??= setImmediate(tick);
     };
     const flush = (): void => {
-      queued = false;
-      if (!active) return;
+      if (!active || scanning || !scanNext) return;
+      if (monotonicClock.now() < Math.max(eventsNext ? 0 : nextScanAt, retryAt ?? 0)) { schedule(); return; }
+      if (scanTimer !== undefined) { clearTimeout(scanTimer); scanTimer = undefined; }
+      scanNext = false;
+      scanning = true;
+      nextScanAt = monotonicClock.now() + 250;
+      retryAt = undefined;
       try {
         const next = capture();
+        if (!active) return;
         retryMs = LOCK_RETRY_MIN_MS;
         if (!baseline || next.digest !== baseline.digest) {
           const previousExpiry = new Map(baseline?.native.hosts.map(host => [host.record.id, host.expiresAt]) ?? []);
@@ -1172,49 +1272,47 @@ export class StoreBridgeSide implements BridgeSide {
         }
       } catch (error) {
         if (isMeshRetryableBusy(error)) {
-          queued = true;
-          retryTimer = setTimeout(() => { retryTimer = undefined; flush(); }, retryMs);
+          scanNext = true;
+          retryAt = monotonicClock.now() + retryMs;
           retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
-        } else failed(error instanceof Error ? error : new Error(String(error)));
+        } else fail(error instanceof Error ? error : new Error(String(error)));
+      } finally {
+        scanning = false;
+        schedule();
       }
     };
-    // One check-phase tick per notification burst: the burst's scan (if any) first, then its event wake.
-    // A lease renewal followed by routed work arrives as one burst; classifying the lease before the
-    // directions wake lets their authority check see the pending lease and refresh it now, instead of
-    // forwarding under the old mirror and leaving the renewal to the half-lease flush.
+    // Actual work bypasses only the topology coalescing floor: classify its pending
+    // lease/presence first, then wake events even if capture met busy or latched new hints.
     const tick = (): void => {
+      if (burst !== undefined) clearImmediate(burst);
       burst = undefined;
       if (!active) return;
-      if (scanNext) { scanNext = false; flush(); }
+      if (scanNext && (eventsNext || scanTimer === undefined)) flush();
       if (eventsNext && active) { eventsNext = false; changed("events"); }
     };
-    const close = watchBridgeStore(this.store.root, (kind) => {
-      // Coalesce one notification burst into one scan. Each fs.watch callback is its own native callback
-      // (microtasks drain between them), so a microtask flush scanned once per notification. setImmediate
-      // runs after the whole poll phase has delivered its notifications; any arriving while one is queued or
-      // a busy retry waits join it, and a later burst queues at most one trailing scan. Events never scan
-      // and never wait for a busy retry: they wait at most for this tick's own scan.
-      if (kind === "events") eventsNext = true;
-      else if (queued) return;
-      else { queued = true; scanNext = true; }
-      burst ??= setImmediate(tick);
-    }, failed);
+    close = watchBridgeStore(this.store.root, (kind) => {
+      if (!active) return;
+      if (kind === "events") {
+        eventsNext = true;
+        burst ??= setImmediate(tick);
+      } else {
+        // Latch one trailing scan, including hints delivered reentrantly during capture.
+        // Never move an existing timer: a continuous stream cannot debounce-starve it.
+        scanNext = true;
+        schedule();
+      }
+    }, fail);
+    nextScanAt = monotonicClock.now() + 250;
     try { baseline = capture(); }
     catch (error) {
-      if (!isMeshRetryableBusy(error)) { close(); throw error; }
-      // Keep installed watches and let the other side subscribe. A zero-wait SQLite
-      // baseline fence can starve under sustained writes; throwing here blocks every
-      // post-link mirror and even watchdog startup. Retry actual contention as in flush.
-      queued = true;
-      retryTimer = setTimeout(() => { retryTimer = undefined; flush(); }, retryMs);
+      if (!isMeshRetryableBusy(error)) { dispose(); throw error; }
+      // A busy initial fence must not block the peer's subscription or startup.
+      scanNext = true;
+      retryAt = monotonicClock.now() + retryMs;
       retryMs = Math.min(retryMs * 2, LOCK_RETRY_MAX_MS);
     }
-    return () => {
-      active = false;
-      if (retryTimer !== undefined) clearTimeout(retryTimer);
-      if (burst !== undefined) clearImmediate(burst);
-      close();
-    };
+    schedule();
+    return dispose;
   }
 
   #presence(

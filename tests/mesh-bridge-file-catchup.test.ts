@@ -17,6 +17,11 @@ afterEach(async () => {
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 // A bounded observation window lets real fs.watch notifications reach the agent, not a mocked notifier.
 const settle = async () => { await new Promise(resolve => setTimeout(resolve, 30)); await turn(); };
+const until = async (check: () => boolean) => {
+  const deadline = performance.now() + 3_000;
+  while (!check() && performance.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+  expect(check()).toBe(true);
+};
 const key = (kind: string, id: string) => `topology/${kind}/${createHash("sha256").update(id).digest("hex")}`;
 const presence = (id: string, now: number): BridgePresence => {
   const identity: MeshIdentity = { id, name: "main", kind: "main", sessionId: id.slice(8) };
@@ -123,7 +128,7 @@ it("still detects file-backed participant edits, same-version replacements and m
   // Copy-on-read is intentionally retained on the public API.
   const participant = f.store.listAll("topology/participants/")[0]!;
   await f.store.put({ key: participant.key, identity: participant.updatedBy, value: { ...participant.value as object, status: "running" } });
-  await settle();
+  await until(() => changes.includes("presence"));
   expect(changes).toContain("presence");
   changes.length = 0;
   // A legacy writer can change content without changing any revision label. Object identity,
@@ -136,12 +141,13 @@ it("still detects file-backed participant edits, same-version replacements and m
   const replacement = path.join(f.root, "legacy.tmp");
   fs.writeFileSync(replacement, JSON.stringify(state));
   fs.renameSync(replacement, file);
-  await settle();
+  await until(() => changes.includes("presence"));
   expect(changes).toContain("presence");
+  changes.length = 0;
   await f.remote.mirror(presence("session:hub-root-00000000", f.now));
-  await settle();
+  await until(() => changes.includes("presence"));
   changes.length = 0;
   await f.remote.mirror({ hosts: [], participants: [] });
-  await settle();
+  await until(() => changes.includes("presence"));
   expect(changes).toContain("presence");
 });

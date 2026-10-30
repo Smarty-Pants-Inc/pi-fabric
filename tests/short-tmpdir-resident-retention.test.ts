@@ -19,6 +19,7 @@ const shortName = (id: string): string => `r.${createHash("sha256").update(id).d
 const roots: string[] = [];
 afterEach(() => {
   platform.v2 = true;
+  vi.restoreAllMocks();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -40,8 +41,15 @@ const fixture = (scratchEntries: number) => {
     turns: 0, toolCalls: 0, text: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
     temporaryDirectory: temporary,
   }), { mode: 0o600 });
+  const rawTrace = new Map<string, Buffer>([
+    ["events.jsonl", Buffer.from('{"raw":"events π"}\n')],
+    ["session.jsonl", Buffer.from('{"raw":"session λ"}\n')],
+    ["task.txt", Buffer.from("prompt survives whole-tree custody\n")],
+    ["reply.json", Buffer.from('{"text":"saved result survives"}')],
+  ]);
+  for (const [name, bytes] of rawTrace) fs.writeFileSync(path.join(run, name), bytes, { mode: 0o600 });
   fs.utimesSync(run, (now - 2 * DAY) / 1000, (now - 2 * DAY) / 1000);
-  return { residencyRoot, run, temporary, now };
+  return { residencyRoot, run, temporary, now, rawTrace };
 };
 const sweep = (residencyRoot: string, now: number): void => {
   const collector = new ResidentRequestRetention(residencyRoot, [], { retainRuns: false });
@@ -49,12 +57,23 @@ const sweep = (residencyRoot: string, now: number): void => {
 };
 
 describe.skipIf(process.platform === "win32")("resident run retention removes a run's short TMPDIR (pi-fabric#1554 P2-2)", () => {
-  it.each([["V2", true], ["main", false]] as const)("the %s sweep removes an expired resident run and then its short TMPDIR", (_name, v2) => {
+  it.each([["V2", true], ["main", false]] as const)("the %s sweep moves an expired resident run and short TMPDIR to byte-preserving custody", (_name, v2) => {
     platform.v2 = v2;
-    const { residencyRoot, run, temporary, now } = fixture(10);
+    const { residencyRoot, run, temporary, now, rawTrace } = fixture(10);
+    const unlink = vi.spyOn(fs, "unlinkSync");
+    const remove = vi.spyOn(fs, "rmSync");
     sweep(residencyRoot, now);
     expect(fs.existsSync(run)).toBe(false);
     expect(fs.existsSync(temporary)).toBe(false);
+    const archive = path.join(residencyRoot, "runs.trace-archive");
+    const receipts = fs.readdirSync(archive).map(name => JSON.parse(fs.readFileSync(path.join(archive, name, "custody.json"), "utf8")));
+    const runReceipt = receipts.find(row => row.source === run && row.state === "moved");
+    const tmpReceipt = receipts.find(row => row.source === temporary && row.state === "moved");
+    expect(runReceipt).toBeDefined(); expect(tmpReceipt).toBeDefined();
+    for (const [name, bytes] of rawTrace) expect(fs.readFileSync(path.join(runReceipt.destination, name))).toEqual(bytes);
+    for (let index = 0; index < 10; index++) expect(fs.readFileSync(path.join(tmpReceipt.destination, `scratch-${index}`), "utf8")).toBe("x");
+    expect(unlink.mock.calls.filter(([file]) => [...rawTrace.keys()].some(name => String(file) === path.join(run, name)))).toEqual([]);
+    expect(remove.mock.calls.filter(([file]) => String(file) === run || String(file) === temporary)).toEqual([]);
   });
 
   it.each([["V2", true], ["main", false]] as const)("the %s sweep keeps the run and its short TMPDIR when the scratch is unsafe", (_name, v2) => {

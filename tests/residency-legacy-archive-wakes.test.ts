@@ -23,10 +23,22 @@ const tree = (dir: string, record: Record<string, unknown>) => {
   fs.writeFileSync(path.join(dir, "events.jsonl"), "x\n", { mode: 0o600 });
 };
 const retired = (root: string): string[] => {
-  const base = path.join(root, "runs-retired");
-  if (!fs.existsSync(base)) return [];
-  return fs.readdirSync(base).flatMap(day => fs.readdirSync(path.join(base, day))
-    .flatMap(slice => fs.readdirSync(path.join(base, day, slice))));
+  const base = path.join(root, "runs-retired"), ids: string[] = [];
+  if (!fs.existsSync(base)) return ids;
+  const walk = (directory: string): void => {
+    const receipt = path.join(directory, "custody.json");
+    if (fs.existsSync(receipt)) {
+      const value = JSON.parse(fs.readFileSync(receipt, "utf8"));
+      if (value.state === "moved") ids.push(value.id);
+      return;
+    }
+    for (const name of fs.readdirSync(directory)) {
+      const child = path.join(directory, name);
+      if (fs.lstatSync(child).isDirectory()) walk(child);
+    }
+  };
+  walk(base);
+  return ids;
 };
 /** Real I/O turns (setImmediate is never faked here), bounded. */
 const settle = async (predicate: () => boolean, turns = 5000) => {
@@ -403,9 +415,9 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
       const before = sweep.mock.calls.length;
       watchers[0]!.emit("error", Object.assign(new Error("ENOSPC: System limit for number of file watchers reached"), { code: "ENOSPC", syscall: "watch" }));
       await settle(() => sweep.mock.calls.length === before + 1);
-      expect(warn).toHaveBeenCalledTimes(1);
-      const message = String(warn.mock.calls[0]![0]);
-      expect(message).toMatch(/inotify watch limit/);
+      const watchWarnings = () => warn.mock.calls.map(call => String(call[0])).filter(message => /inotify watch limit/.test(message));
+      expect(watchWarnings()).toHaveLength(1);
+      const message = watchWarnings()[0]!;
       expect(message).toMatch(/rescanning once and re-arming with bounded backoff/);
       expect(message).not.toMatch(/poll|no events lost/i);
       expect(timeout.mock.calls.map(call => call[1])).toContain(1_000);
@@ -417,7 +429,7 @@ describe.skipIf(process.platform === "win32")("legacy run archive wakes (B5)", (
       await settle(() => retired(root).includes("after"));
       // Second failure: no second log; backoff restarts at the base after a successful re-arm.
       watchers[1]!.emit("error", new Error("again"));
-      expect(warn).toHaveBeenCalledTimes(1);
+      expect(watchWarnings()).toHaveLength(1);
       expect(interval).not.toHaveBeenCalled();
       // Permanent failure: bounded attempts only, then silence.
       watch.mockImplementation(() => { throw Object.assign(new Error("EMFILE"), { code: "EMFILE" }); });

@@ -920,7 +920,8 @@ export class ResidencyClient {
     }
     // A proven absent tree has no descendant files left to remove (saved-result
     // cleanup). Other stat errors fail closed; every existing tree needs strict exit evidence.
-    const runDirectoryPresent = fs.lstatSync(metadata.runDirectory, { throwIfNoEntry: false }) !== undefined;
+    const runDirectoryStat = fs.lstatSync(metadata.runDirectory, { throwIfNoEntry: false });
+    const runDirectoryPresent = runDirectoryStat !== undefined;
     const exitVeto = runDirectoryPresent ? runTreeExitVeto(metadata.runDirectory, 0, undefined, true) : undefined;
     if (exitVeto) {
       throw new Error(
@@ -967,7 +968,14 @@ export class ResidencyClient {
         throwIfAborted(signal);
         if (cleanup.completed.has(source)) return;
         try {
-          const move = retainCleanupRoot(source, archive, metadata.id, `durable agent cleanup whole-root custody: ${kind}`);
+          const move = retainCleanupRoot(source, archive, metadata.id, `durable agent cleanup whole-root custody: ${kind}`, undefined,
+            source === metadata.runDirectory && runDirectoryStat ? {
+              expected: { dev: runDirectoryStat.dev, ino: runDirectoryStat.ino, mtimeMs: runDirectoryStat.mtimeMs },
+              beforeRename: () => {
+                const veto = runTreeExitVeto(source, 0, undefined, true);
+                if (veto) throw new Error(`Worker exit proof changed before resident trace custody move: ${veto}`);
+              },
+            } : {});
           if (move) custody.push(move);
           cleanup.completed.add(source); // Proven absence is not authority to adopt a later replacement.
         } catch (error) {

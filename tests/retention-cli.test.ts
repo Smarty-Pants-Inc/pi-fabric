@@ -51,18 +51,18 @@ const applyRejects = async (root: string, options: { now?: number; runRetentionM
 describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () => {
   it("lists exact bytes with a whole-tree no-op dry run under existing native fences", async () => {
     const { root, actor, host } = make(); const before = snapshot(root);
-    const plan = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true });
+    const plan = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true, runRetentionMs: 3600000 });
     expect(snapshot(root)).toEqual(before);
     expect(plan.skipped).toEqual([]);
-    expect(plan.changes).toHaveLength(3);
+    expect(plan.changes).toHaveLength(2);
     expect(plan.bytesBefore).toBeGreaterThan(plan.bytesAfter);
     expect(plan.changes.map(change => change.path).sort()).toEqual([
-      path.join(host, "runs", "terminal", "events.jsonl"),
-      path.join(actor, "runs", "archive", "events.jsonl"),
+      path.join(actor, "runs", "archive"),
       path.join(actor, "session.jsonl.20260927T150000000Z.bak"),
     ].sort());
+    expect(fs.readFileSync(path.join(host, "runs", "terminal", "events.jsonl"))).toEqual(Buffer.from(Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("")));
     expect(plan.summary.applyRefusal).toBeUndefined();
-    await applyRejects(root, { now: 7 * 3600000 });
+    await applyRejects(root, { now: 7 * 3600000, runRetentionMs: 3600000 });
     expect(fs.existsSync(path.join(actor, "session.jsonl.20260927T150000000Z.bak"))).toBe(true);
   });
 
@@ -81,14 +81,14 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
     write(file, JSON.stringify(registry));
     expect(fs.statSync(file).size).toBeGreaterThan(1024 * 1024);
     const before = snapshot(root);
-    const plan = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true });
+    const plan = await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true, runRetentionMs: 3600000 });
     expect(snapshot(root)).toEqual(before);
     expect(plan.skipped).toEqual([]);
     expect(plan.changes.map(change => change.path).sort()).toEqual([
-      path.join(host, "runs", "terminal", "events.jsonl"),
-      path.join(actor, "runs", "archive", "events.jsonl"),
+      path.join(actor, "runs", "archive"),
       path.join(actor, "session.jsonl.20260927T150000000Z.bak"),
     ].sort());
+    expect(fs.readFileSync(path.join(host, "runs", "terminal", "events.jsonl"))).toEqual(Buffer.from(Array.from({ length: 401 }, (_, sequence) => JSON.stringify({ sequence }) + "\n").join("")));
     fs.mkdirSync(`${file}.lock`);
     const locked = snapshot(root);
     expect((await sweepMeshRetention(root, { now: 7 * 3600000, dryRun: true })).skipped).toEqual([
@@ -134,6 +134,7 @@ describe.skipIf(process.platform !== "linux")("offline retained mesh sweep", () 
 
   it("a host waiting for a root's lock wins that root mid-sweep (smarty-dev#7766)", async () => {
     const { root, host } = make();
+    fs.utimesSync(path.join(host, "runs", "terminal"), 1, 1);
     const runs = snapshot(path.join(host, "runs"));
     // residentRunRetentionMs is read inside the dead root's fenced sweep, before its first deletion.
     const options = { now: 30 * 86400000, dryRun: true, runRetentionMs: 7 * 86400000, get residentRunRetentionMs() {

@@ -8,7 +8,7 @@ import { meshStateDocumentProblem } from "../mesh/state-file.js";
 import { setWindowsVerifiedRemoval, startRemovalTally, stopRemovalTally, windowsPrivate, windowsRemoveHelper, type DeleterTally } from "./verified-remove.js";
 import { sweepResidentRuns } from "../residency/retention.js";
 import { sweepResidentGenerationRecords } from "../residency/generation-retention.js";
-import { compactTerminalRunEvents, pruneActorRunArchives, pruneActorSessionBackups, registryReferences } from "./retention.js";
+import { pruneActorRunArchives, pruneActorSessionBackups, registryReferences } from "./retention.js";
 import { ownedStat, processAlive } from "./scratch.js";
 import { diagnostics } from "../core/diagnostics.js";
 
@@ -509,13 +509,6 @@ const sweep = async (meshRoot: string, options: {
       if (!rows) throw new Error("unreadable actor registry");
       return rows;
     };
-    const compactRuns = (runs: string, veto: () => boolean = gate, owner?: string) => {
-      for (const run of directories(runs)) if (!early.has(path.basename(run))) {
-        compactTerminalRunEvents(run, { ...options, dryRun, onCompact: change => changes.push(change),
-          isRetained: () => veto() || referencedNow(path.basename(run), owner),
-        });
-      }
-    };
     for (const [rootId, root] of residents) await fenced(rootId, root, veto => {
       // Always preview stale diagnostic records under the dead host's own flock fence; apply remains unreachable.
       sweepResidentGenerationRecords(root, now, veto, true, change => changes.push(change));
@@ -534,7 +527,7 @@ const sweep = async (meshRoot: string, options: {
           onCompact: change => changes.push(change),
           ...(options.residentRunRetentionMs !== undefined ? { retentionMs: options.residentRunRetentionMs } : {}),
         }));
-      } else compactRuns(path.join(root, "runs"), veto);
+      }
     });
     // With runRetentionMs the mesh-wide pass below covers these actors (and every other one).
     // Copies: checkedFresh replaces the list's contents during the sweep.
@@ -550,7 +543,6 @@ const sweep = async (meshRoot: string, options: {
               path.resolve(actor.sessionFile) !== path.join(path.resolve(registryRoot), actor.id, "session.jsonl")) continue;
           const actorRoot = path.dirname(actor.sessionFile);
           if (!ownedStat(actorRoot)?.isDirectory()) continue;
-          compactRuns(path.join(actorRoot, "runs"), veto, registryRoot);
           // Pending launch/drain/removal is not a joined writer receipt for session history.
           if (actor.inFlightRun !== undefined || actor.preparing !== undefined || !["idle", "stopped"].includes(actor.status)) continue;
           // smarty-dev#16444: archive, never delete: the older backups move into session-archive/ (nothing is freed).

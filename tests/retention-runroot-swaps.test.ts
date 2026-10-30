@@ -3,166 +3,106 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FABRIC_RUN_ROOT_PREFIX, sweepTempRunRoots } from "../src/storage/retention.js";
-import { startRemovalTally, stopRemovalTally, verifiedRemoveTestHooks } from "../src/storage/verified-remove.js";
+import { ageRunRoot } from "./helpers/age-run-root.js";
 
-// smarty-dev#7916 audit gap: the run-root deleters pruneClosedRunRoot (closed roots) and sweepTempRunRoots (orphaned
-// roots) hand their judged stat to verifiedRemove but had no per-deleter swap tests. Both are reached through the
-// public sweepTempRunRoots and told apart by their tally deleter name. No product delete ever runs: every
-// fs.unlinkSync/rmdirSync/rmSync and fs.promises.rm/unlink/rmdir call is recorded and never called through; renameSync
-// calls through only for the graveyard move (a rollback or any other rename is recorded and suppressed).
-const HOUR = 60 * 60 * 1_000;
+// Data-safety keep reason: the temp sweep now retires trees into custody, not
+// a deletion graveyard. Inject swaps AFTER metadata judgment, during its worker
+// exit check; every refusal must preserve original/replacement/outside bytes.
+const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-const DEAD_PID = 2_147_483_647; // above any pid_max: kill(pid, 0) is ESRCH, a checked dead exit
-const NOW = 100 * DAY;
+const OWNER = 2_147_483_646;
+const WORKER = 2_147_483_647;
+const NOW = Date.now();
 const roots: string[] = [];
-const real = { renameSync: fs.renameSync, fstatSync: fs.fstatSync };
-type Call = { op: string; args: string[] };
-let calls: Call[] = [];
-
+const payload = Buffer.from('{"sequence":0}\n{"torn":');
 afterEach(() => {
-  delete verifiedRemoveTestHooks.beforeOpen;
   vi.restoreAllMocks();
-  stopRemovalTally();
-  // Only this file's own mkdtemp roots, and only after every stub is restored.
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
-
-const record = (op: string) => ((...args: unknown[]) => { calls.push({ op, args: args.filter(a => typeof a === "string" || a instanceof URL || Buffer.isBuffer(a)).map(String) }); }) as never;
-const recordAsync = (op: string) => ((...args: unknown[]) => { calls.push({ op, args: args.map(String) }); return Promise.resolve(); }) as never;
-const protect = (): void => {
-  calls = [];
-  vi.spyOn(fs, "unlinkSync").mockImplementation(record("unlinkSync"));
-  vi.spyOn(fs, "rmdirSync").mockImplementation(record("rmdirSync"));
-  vi.spyOn(fs, "rmSync").mockImplementation(record("rmSync"));
-  vi.spyOn(fs.promises, "rm").mockImplementation(recordAsync("promises.rm"));
-  vi.spyOn(fs.promises, "unlink").mockImplementation(recordAsync("promises.unlink"));
-  vi.spyOn(fs.promises, "rmdir").mockImplementation(recordAsync("promises.rmdir"));
-  vi.spyOn(fs, "renameSync").mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
-    const graveyardMove = /^\/proc\/self\/fd\/\d+\/run$/.test(String(from)) && /^\/proc\/self\/fd\/\d+\/run\.[0-9a-f-]{36}$/.test(String(to));
-    calls.push({ op: graveyardMove ? "renameSync(graveyard move, called through)" : "renameSync(suppressed)", args: [String(from), String(to)] });
-    if (graveyardMove) real.renameSync(from, to);
-  }) as typeof fs.renameSync);
-};
-const deletions = (): Call[] => calls.filter(call => !call.op.startsWith("renameSync"));
-
 const shape = (file: string): unknown => {
   const stat = fs.lstatSync(file, { throwIfNoEntry: false });
   if (!stat) return null;
   if (stat.isSymbolicLink()) return ["link", fs.readlinkSync(file)];
   if (stat.isDirectory()) return Object.fromEntries(fs.readdirSync(file).sort().map(name => [name, shape(path.join(file, name))]));
-  return fs.readFileSync(file, "utf8");
+  return fs.readFileSync(file).toString("hex");
 };
-
+const rawTreePaths = (root: string): Set<string> => {
+  const paths = new Set([root]);
+  const stat = fs.lstatSync(root, { throwIfNoEntry: false });
+  if (stat?.isDirectory() && !stat.isSymbolicLink()) for (const name of fs.readdirSync(root)) {
+    for (const child of rawTreePaths(path.join(root, name))) paths.add(child);
+  }
+  return paths;
+};
 type Kind = "closed" | "orphan";
-const DELETER: Record<Kind, string> = { closed: "pruneClosedRunRoot", orphan: "sweepTempRunRoots" };
-/** An owned, closed (0700) temp root with one expired, terminal process run whose saved worker PID is dead. */
 const fixture = (kind: Kind) => {
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-runroot-swaps-"));
-  roots.push(tempRoot);
-  const root = path.join(tempRoot, `${FABRIC_RUN_ROOT_PREFIX}${kind}`);
-  const run = path.join(root, "run");
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-runroot-swaps-")); roots.push(tempRoot);
+  const root = path.join(tempRoot, `${FABRIC_RUN_ROOT_PREFIX}${kind}`), run = path.join(root, "run");
   fs.mkdirSync(run, { recursive: true, mode: 0o700 });
-  fs.chmodSync(root, 0o700); fs.chmodSync(run, 0o700);
-  fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ id: "run", status: "completed", finishedAt: 1, transport: "process", sessionId: String(DEAD_PID) }), { mode: 0o600 });
-  fs.writeFileSync(path.join(run, "events.jsonl"), '{"sequence":0}\n', { mode: 0o600 });
-  fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: DEAD_PID, startedAt: 1, heartbeatAt: 1,
+  fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ id: "run", status: "completed", finishedAt: 1, transport: "process", sessionId: String(WORKER) }), { mode: 0o600 });
+  fs.writeFileSync(path.join(run, "events.jsonl"), payload, { mode: 0o600 });
+  fs.writeFileSync(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: OWNER, startedAt: 1, heartbeatAt: 1,
     ...(kind === "closed" ? { closedAt: 1, childrenStopped: true } : { orphanedAt: 1 }) }), { mode: 0o600 });
-  // Old enough that only the judged mtime (not a fresh one) is eligible either way.
-  const old = new Date(Date.now() - 30 * DAY);
-  fs.utimesSync(run, old, old);
+  ageRunRoot(root, 1);
   const sweep = () => sweepTempRunRoots({ tempRoot, now: NOW, orphanedTempRunRetentionMs: 6 * HOUR, oneShotRunRetentionMs: DAY });
-  return { tempRoot, root, run, sweep, judged: shape(run), ino: fs.lstatSync(run).ino };
+  const deletes: string[] = [];
+  const unlink = fs.unlinkSync, rm = fs.rmSync, unlinkAsync = fs.promises.unlink, rmAsync = fs.promises.rm;
+  vi.spyOn(fs, "unlinkSync").mockImplementation(file => { deletes.push(String(file)); return unlink(file); });
+  vi.spyOn(fs, "rmSync").mockImplementation((file, options) => { deletes.push(String(file)); return rm(file, options); });
+  vi.spyOn(fs.promises, "unlink").mockImplementation(file => { deletes.push(String(file)); return unlinkAsync(file); });
+  vi.spyOn(fs.promises, "rm").mockImplementation((file, options) => { deletes.push(String(file)); return rmAsync(file, options); });
+  return { tempRoot, root, run, sweep, deletes, judged: shape(run) };
 };
+const SWAPS = ["replaced inode", "symlink", "foreign owner", "refreshed mtime"] as const;
 
-type Swap = "replaced inode" | "symlink" | "foreign owner" | "refreshed mtime";
-const SWAPS: Swap[] = ["replaced inode", "symlink", "foreign owner", "refreshed mtime"];
-const REASON: Record<Swap, RegExp> = {
-  "replaced inode": /^target inode was replaced since judgment$/,
-  // O_PATH|O_NOFOLLOW|O_DIRECTORY on a symbolic link fails ENOTDIR: refused before any open succeeds.
-  symlink: /^type changed since judgment$/,
-  "foreign owner": /^target is not owned by this user$/,
-  "refreshed mtime": /^target was modified since judgment$/,
-};
-
-describe.skipIf(process.platform !== "linux")("run-root deleters remove only the judged run (smarty-dev#7916)", () => {
-  describe.each(["closed", "orphan"] as Kind[])("%s root", (kind) => {
-    const deleter = DELETER[kind];
-
-    it(`positive control: ${deleter} removes the unchanged eligible run (recorded, never called through)`, () => {
-      const f = fixture(kind);
-      const hooked: string[] = [];
-      verifiedRemoveTestHooks.beforeOpen = (target) => { hooked.push(target); };
-      const tally = startRemovalTally();
-      protect();
+describe.skipIf(process.platform !== "linux")("run-root custody keeps the judged tree", () => {
+  describe.each(["closed", "orphan"] as Kind[])("%s root", kind => {
+    it("positive control: archives the exact eligible bytes without unlinking raw traces", () => {
+      const f = fixture(kind), rawPaths = rawTreePaths(f.root);
       const result = f.sweep();
-      vi.restoreAllMocks();
-      expect(hooked).toEqual([f.run]);
-      expect(tally[deleter]).toMatchObject({ removed: 1, refused: {} });
-      expect(Object.keys(tally)).toEqual([deleter]);
       expect(result.removedRuns).toEqual(kind === "closed" ? [f.run] : []);
-      // The recorders never deleted: the root still holds the graveyard, so it is not reported removed.
-      expect(result.removedRoots).toEqual([]);
-      const renames = calls.filter(call => call.op.startsWith("renameSync"));
-      expect(renames.map(call => call.op)).toEqual(["renameSync(graveyard move, called through)"]);
-      const unlinks = deletions().filter(call => call.op === "unlinkSync").map(call => path.basename(call.args[0]!)).sort();
-      const rmdirs = deletions().filter(call => call.op === "rmdirSync").map(call => path.basename(call.args[0]!));
-      expect(unlinks).toEqual(["events.jsonl", "status.json"]);
-      expect(rmdirs).toHaveLength(2);
-      expect(rmdirs[0]).toMatch(/^run\.[0-9a-f-]{36}$/);
-      expect(rmdirs[1]).toBe(`.retention-graveyard-${process.pid}`);
-      expect(deletions().filter(call => !["unlinkSync", "rmdirSync"].includes(call.op))).toEqual([]);
-      // Physically intact (moved into the graveyard, nothing deleted).
-      const grave = path.join(f.root, `.retention-graveyard-${process.pid}`);
-      const moved = fs.readdirSync(grave);
-      expect(moved).toEqual([rmdirs[0]]);
-      expect(shape(path.join(grave, moved[0]!))).toEqual(f.judged);
-      expect(fs.existsSync(f.run)).toBe(false);
+      expect(result.removedRoots).toEqual([f.root]);
+      const archive = `${f.root}.trace-archive`;
+      const receipts = fs.readdirSync(archive).map(name => JSON.parse(fs.readFileSync(path.join(archive, name, "custody.json"), "utf8")));
+      const receipt = receipts.find(row => row.source === f.run && row.state === "moved");
+      expect(receipt).toBeDefined(); expect(shape(receipt.destination)).toEqual(f.judged);
+      expect(fs.readFileSync(path.join(receipt.destination, "events.jsonl"))).toEqual(payload);
+      expect(f.deletes.filter(file => rawPaths.has(file)), "positive raw-run custody must not call rm or unlink").toEqual([]);
     });
-
-    it.each(SWAPS)(`${deleter}: a %s swap after judgment deletes no tree entry`, (swap) => {
-      const f = fixture(kind);
-      const aside = path.join(f.root, "..", "judged-aside");
-      const outside = path.join(f.tempRoot, "outside");
-      fs.mkdirSync(outside, { mode: 0o700 });
-      fs.writeFileSync(path.join(outside, "keep"), "outside");
-      let swapped = 0;
-      verifiedRemoveTestHooks.beforeOpen = (target) => {
-        if (target !== f.run) return;
-        swapped++;
-        if (swap === "refreshed mtime") { fs.utimesSync(f.run, new Date(), new Date()); return; }
-        if (swap === "foreign owner") {
-          vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, ...rest: unknown[]) => {
-            const stat = (real.fstatSync as (...args: unknown[]) => fs.Stats)(fd, ...rest);
-            if (stat.ino !== f.ino) return stat;
-            return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { uid: stat.uid + 1 });
-          }) as typeof fs.fstatSync);
-          return;
+    it.each(SWAPS)("a %s swap during the safety check archives/deletes no tree entry", swap => {
+      const f = fixture(kind), aside = path.join(f.tempRoot, "judged-aside"), outside = path.join(f.tempRoot, "outside");
+      fs.mkdirSync(outside, { mode: 0o700 }); fs.writeFileSync(path.join(outside, "keep"), "outside");
+      const outsideBefore = shape(outside), stat = fs.lstatSync;
+      let swapped = 0, workerChecks = 0;
+      vi.spyOn(process, "kill").mockImplementation(pid => {
+        // Recovery's first absence probe precedes the per-run inventory. Swap
+        // on the next probe, inside the safety check AFTER that judgment.
+        if (pid === WORKER && ++workerChecks === 2) {
+          swapped++;
+          if (swap === "refreshed mtime") fs.utimesSync(f.run, new Date(), new Date());
+          else if (swap === "foreign owner") {
+            vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, ...args: unknown[]) => {
+              const value = (stat as (...args: unknown[]) => fs.Stats)(file, ...args);
+              return String(file) === f.run ? Object.assign(Object.create(Object.getPrototypeOf(value)), value, { uid: value.uid + 1 }) : value;
+            }) as typeof fs.lstatSync);
+          } else {
+            fs.renameSync(f.run, aside);
+            if (swap === "symlink") fs.symlinkSync(outside, f.run);
+            else { fs.mkdirSync(f.run, { mode: 0o700 }); fs.writeFileSync(path.join(f.run, "status.json"), "fresh"); }
+          }
         }
-        // The judged tree moves aside intact (no deletion); the replacement exists before, so no inode reuse.
-        real.renameSync(f.run, aside);
-        if (swap === "symlink") { fs.symlinkSync(outside, f.run); return; }
-        fs.mkdirSync(f.run, { mode: 0o700 });
-        fs.writeFileSync(path.join(f.run, "status.json"), "fresh", { mode: 0o600 });
-      };
-      const tally = startRemovalTally();
-      const before = { outside: shape(outside), run: swap === "foreign owner" || swap === "refreshed mtime" ? f.judged : undefined };
-      protect();
+        throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      });
       const result = f.sweep();
       vi.restoreAllMocks();
-      expect(swapped).toBe(1);
-      expect(calls).toEqual([]); // no unlink/rmdir/rm/promises.rm and no rename at all
+      expect(swapped).toBeGreaterThan(0);
       expect(result).toEqual({ removedRoots: [], removedRuns: [] });
-      expect(tally[deleter]?.removed ?? 0).toBe(0);
-      const refused = Object.keys(tally[deleter]?.refused ?? {});
-      expect(refused).toHaveLength(1);
-      expect(refused[0]).toMatch(REASON[swap]);
-      expect(tally[deleter]?.graveyards).toBeUndefined();
-      // The target is at its path, untouched; no graveyard was created.
-      expect(fs.readdirSync(f.root).filter(name => name.startsWith(".retention-graveyard-"))).toEqual([]);
-      expect(shape(outside)).toEqual(before.outside);
+      expect(f.deletes).toEqual([]);
+      expect(fs.existsSync(`${f.root}.trace-archive`)).toBe(false);
+      expect(shape(outside)).toEqual(outsideBefore);
       if (swap === "symlink") expect(shape(f.run)).toEqual(["link", outside]);
-      else if (swap === "replaced inode") expect(shape(f.run)).toEqual({ "status.json": "fresh" });
-      else expect(shape(f.run)).toEqual(before.run);
+      else if (swap === "replaced inode") expect(shape(f.run)).toEqual({ "status.json": Buffer.from("fresh").toString("hex") });
+      else expect(shape(f.run)).toEqual(f.judged);
       if (swap === "symlink" || swap === "replaced inode") expect(shape(aside)).toEqual(f.judged);
     });
   });

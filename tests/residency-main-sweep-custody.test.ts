@@ -92,6 +92,7 @@ describe("off-Linux main sweep manager custody (recorded mutations only)", () =>
     const now = Date.now();
     const { root, actorRoot, owned, unrelated } = fixture(now);
     const before = snapshot(path.join(root, "runs"));
+    const unrelatedBefore = snapshot(unrelated);
     const resultsBefore = snapshot(path.join(root, "results"));
     const direct = recordDirectRemovals();
     const nativeExitChecks = vi.spyOn(process, "kill");
@@ -100,25 +101,32 @@ describe("off-Linux main sweep manager custody (recorded mutations only)", () =>
     const collector = new ResidentRequestRetention(root, [actorRoot], { retainRuns }, recover, custody);
     try {
       collector.sweep(now, new Set(), 10_000);
+      for (let retry = 0; retry < 4 && collector.due(now); retry++) collector.sweep(now, new Set(), 10_000);
       expect(collector.due(now)).toBe(false);
     } finally { collector.close(); }
 
     expect(custody.run.mock.calls.map(([id]) => id).sort()).toEqual(["owned", "unrelated"]);
     expect(recover.mock.calls.map(([run]) => run)).toEqual([unrelated]);
-    expect(recorded.compactions).toEqual(retainRuns ? [unrelated] : []);
-    expect(recorded.mutations.map(({ target, deleter }) => ({ target, deleter }))).toEqual([
-      { target: retainRuns ? path.join(unrelated, "events.jsonl") : unrelated,
-        deleter: retainRuns ? "compactTerminalRunEvents" : "residentRunRetention" },
-    ]);
-    expect(recorded.mutations[0]!.judged).toMatchObject({ ino: expect.any(Number), dev: expect.any(Number) });
+    expect(recorded.compactions).toEqual([]);
+    expect(recorded.mutations.map(({ target, deleter }) => ({ target, deleter }))).toEqual([]);
     // No safety predicate is mocked: the run passed fresh native process-absence
     // and owned tree/saved-result checks immediately before the recorded effect.
-    expect(nativeExitChecks).toHaveBeenCalledWith(Number(EXITED_PID), 0);
+    if (retainRuns) expect(nativeExitChecks).not.toHaveBeenCalled();
+    else expect(nativeExitChecks).toHaveBeenCalledWith(Number(EXITED_PID), 0);
     expect(recorded.mutations.some(({ target }) => target === owned || target.startsWith(owned + path.sep))).toBe(false);
     for (const spy of [direct.rm, direct.unlink, direct.rmdir]) {
       expect(spy.mock.calls.filter(([target]) => String(target).startsWith(path.join(root, "runs") + path.sep))).toEqual([]);
     }
-    expect(snapshot(path.join(root, "runs"))).toEqual(before);
+    if (retainRuns) expect(snapshot(path.join(root, "runs"))).toEqual(before);
+    else {
+      expect(fs.existsSync(unrelated)).toBe(false);
+      const archive = path.join(root, "runs.trace-archive");
+      const container = fs.readdirSync(archive).map(name => path.join(archive, name)).find(candidate => {
+        try { return JSON.parse(fs.readFileSync(path.join(candidate, "custody.json"), "utf8")).source === unrelated; } catch { return false; }
+      })!;
+      const destination = JSON.parse(fs.readFileSync(path.join(container, "custody.json"), "utf8")).destination as string;
+      expect(snapshot(destination)).toEqual(unrelatedBefore);
+    }
     expect(snapshot(path.join(root, "results"))).toEqual(resultsBefore);
   });
 
@@ -139,7 +147,7 @@ describe("off-Linux main sweep manager custody (recorded mutations only)", () =>
     try { collector.sweep(now, new Set(), 10_000); } finally { collector.close(); }
     expect(recover.mock.calls.map(([run]) => run)).toEqual([unrelated]);
     expect(recorded.mutations).toEqual([]);
-    expect(recorded.compactions).toEqual([unrelated]);
+    expect(recorded.compactions).toEqual([]);
     expect(snapshot(owned)).toEqual(ownedBefore);
   });
 });

@@ -4,7 +4,7 @@ import { writeJsonAtomic } from "../core/atomic-write.js";
 import { ownedStat } from "../storage/scratch.js";
 import { retentionV2Enabled } from "../storage/retention-platform.js";
 import { boundedRunTree } from "../storage/reference-scan.js";
-import { actorRunReferencedNow, canRemoveTerminalRun, removeRunTreeAndShortTmpdir, removeUnreferencedRun, runTreeExitVeto, compactTerminalRunEvents, retainedActorRunIds, type RegistryReferences, type TerminalRunEventsRetention } from "../storage/retention.js";
+import { actorRunReferencedNow, canRemoveTerminalRun, removeRunTreeAndShortTmpdir, removeUnreferencedRun, runTreeExitVeto, retainedActorRunIds, type RegistryReferences, type TerminalRunEventsRetention } from "../storage/retention.js";
 import { hasPreservedResidentResult } from "./preserved-result.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
 import { advanceResidentRequestExpiry, residentRequestGeneration, RESIDENT_REQUEST_RETENTION_MS } from "./request-expiry.js";
@@ -57,19 +57,13 @@ export const sweepResidentRuns = (
       const run = path.join(runsRoot, entry.name);
       const stat = ownedStat(run);
       if (!stat?.isDirectory()) continue;
-      if (!options.retainRuns && now - stat.mtimeMs > (options.retentionMs ?? RESIDENT_RUN_RETENTION_MS) &&
+      if (options.retainRuns !== true && now - stat.mtimeMs > (options.retentionMs ?? RESIDENT_RUN_RETENTION_MS) &&
           !runTreeExitVeto(run, 0, expired, true, options.acceptPidReuse === true) &&
           canRemoveTerminalRun(run, expired, options.acceptPidReuse === true) &&
           hasPreservedResidentResult(runsRoot, entry.name) && !expired()) {
         // A referenced candidate is kept as is; compaction would veto it on the same reference.
         const name = entry.name, bytes = options.measure?.(run) ?? 0;
         if (removeUnreferencedRun(run, stat, () => referencedNow(name), options.dryRun, "sweepResidentRuns", bytes)) { removed.push(run); options.onRemove?.(run, bytes); }
-      } else {
-        compactTerminalRunEvents(run, {
-          ...(options.terminalRunEventsAgeMs !== undefined ? { terminalRunEventsAgeMs: options.terminalRunEventsAgeMs } : {}),
-          ...(options.terminalRunEventsMaxBytes !== undefined ? { terminalRunEventsMaxBytes: options.terminalRunEventsMaxBytes } : {}),
-          ...(options.dryRun ? { dryRun: true } : {}), ...(options.onCompact ? { onCompact: options.onCompact } : {}),
-          now, expired, isRetained: () => referencedNow(path.basename(run)) });
       }
     }
   } finally { directory.closeSync(); }
@@ -144,7 +138,6 @@ const validResponse = (value: ResidentCommandResponse | undefined, id: string): 
 export class ResidentRequestRetention {
   #directory: fs.Dir | undefined;
   #index = 0;
-  #pendingRun: { entry: fs.Dirent; attempts: number } | undefined;
   #resample = false;
   #nextSample = 0;
   #scanning = false;
@@ -166,7 +159,6 @@ export class ResidentRequestRetention {
 
   close(): void {
     this.#runReferences = undefined;
-    this.#pendingRun = undefined;
     const directory = this.#directory; this.#directory = undefined;
     try { directory?.closeSync(); } catch { this.#health.unknown++; }
   }
@@ -209,10 +201,8 @@ export class ResidentRequestRetention {
           if (expired()) return;
         }
       }
-      const pending = kind === "runs" ? this.#pendingRun : undefined;
-      this.#pendingRun = undefined;
       let entry: fs.Dirent | null;
-      try { entry = pending?.entry ?? this.#directory.readSync(); }
+      try { entry = this.#directory.readSync(); }
       catch { this.#health.unknown++; this.close(); this.#index++; continue; }
       if (!entry) { this.close(); this.#index++; continue; }
       const file = path.join(directory, entry.name);
@@ -221,11 +211,6 @@ export class ResidentRequestRetention {
         const retainedRuns = this.#runReferences!.ids;
         // Incomplete reference preparation is a veto, never authority to walk
         // or discharge unknown custody. Legacy archival has its own full proof.
-        const defer = () => {
-          // Retry an unsuccessful unit on a fresh slice, but never let a
-          // permanently oversized or vetoed tree starve later IDs.
-          if ((pending?.attempts ?? 0) < 2) this.#pendingRun = { entry: entry!, attempts: (pending?.attempts ?? 0) + 1 };
-        };
         if (entry.isDirectory()) this.recoverRunArchives?.(file, expired);
         // Recovery is resumable/count-bounded, but even its no-op filesystem
         // checks can consume a whole slice on Windows. Finish this run's bounded
@@ -255,22 +240,22 @@ export class ResidentRequestRetention {
           // Same exit/result fences as the former startup sweep, now streaming
           // after the lease is up. A terminal marker alone is never exit evidence.
           const stat = ownedStat(file);
-          if (this.retention.retainRuns === false && stat && now - stat.mtimeMs > 24 * 60 * 60 * 1_000 &&
+          if (this.retention.retainRuns !== true && stat && now - stat.mtimeMs > 24 * 60 * 60 * 1_000 &&
               !runTreeExitVeto(file, 0, unitExpired, true) && canRemoveTerminalRun(file, unitExpired) &&
               hasPreservedResidentResult(directory, entry.name) &&
               boundedRunTree(file, unitExpired) && !unitExpired() &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
             // smarty-dev#7916: only the judged run inode, verified; a failure retries next scan. Then its recorded short
             // TMPDIR outside the run tree (pi-fabric#1554 P2-2), as every other run deleter does.
-            removeRunTreeAndShortTmpdir(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
+            removeRunTreeAndShortTmpdir(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; },
+              beforeRename: () => {
+                if (unitExpired() || !boundedRunTree(file, unitExpired) || runTreeExitVeto(file, 0, unitExpired, true) ||
+                    !canRemoveTerminalRun(file, unitExpired) || !hasPreservedResidentResult(directory, entry.name) ||
+                    actorReferenceFingerprint(this.actorRoots) !== fingerprint) throw new Error("Resident run custody proof changed before move");
+              } });
             continue;
           }
-          const compacted = compactTerminalRunEvents(file, { ...this.retention, now, expired: unitExpired,
-            // Another owner can publish a new latest run during a long safety
-            // walk. Recheck the registry generation immediately before replace.
-            isRetained: () => actorReferenceFingerprint(this.actorRoots) !== fingerprint || !boundedRunTree(file, unitExpired),
-          });
-          if (!compacted && expired()) { defer(); return; }
+          // Not eligible for whole-tree custody means retain every raw trace byte in place.
         }
         continue;
       }
@@ -363,20 +348,22 @@ export class ResidentRequestRetention {
           // Same exit/result fences as the former startup sweep, now streaming
           // after the lease is up. A terminal marker alone is never exit evidence.
           const stat = ownedStat(file);
-          if (this.retention.retainRuns === false && stat && now - stat.mtimeMs > 24 * 60 * 60 * 1_000 &&
+          if (this.retention.retainRuns !== true && stat && now - stat.mtimeMs > 24 * 60 * 60 * 1_000 &&
               !runTreeExitVeto(file, 0, undefined, true) && canRemoveTerminalRun(file) &&
               hasPreservedResidentResult(directory, entry.name) &&
               actorReferenceFingerprint(this.actorRoots) === fingerprint) {
             // Windows main sweep: verifiedRemove runs main's removal unchanged off Linux (smarty-dev#7858); then the
             // run's recorded short TMPDIR (pi-fabric#1554 P2-2).
-            removeRunTreeAndShortTmpdir(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; } });
+            removeRunTreeAndShortTmpdir(file, stat, { deleter: "residentRunRetention", fallback: () => { fs.rmSync(file, { recursive: true, force: true }); return true; },
+              beforeRename: () => {
+                if (runTreeExitVeto(file, 0, undefined, true) || !canRemoveTerminalRun(file) ||
+                    !hasPreservedResidentResult(directory, entry.name) || actorReferenceFingerprint(this.actorRoots) !== fingerprint) {
+                  throw new Error("Resident run custody proof changed before move");
+                }
+              } });
             continue;
           }
-          compactTerminalRunEvents(file, { ...this.retention, now,
-            // Another owner can publish a new latest run during a long safety
-            // walk. Recheck the registry generation immediately before replace.
-            isRetained: () => actorReferenceFingerprint(this.actorRoots) !== fingerprint,
-          });
+          // Windows main path follows the same keep-or-whole-tree-archive rule; never compact traces in place.
         }
         continue;
       }

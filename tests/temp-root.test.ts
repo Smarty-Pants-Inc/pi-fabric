@@ -12,6 +12,7 @@ import { boundModelOutput, OutputArtifactStore } from "../src/output-budget.js";
 import { closeScratch, createScratch, ScratchScope, SCRATCH_OWNER_FILE, sweepScratch } from "../src/storage/scratch.js";
 import { fabricDataRoot } from "../src/storage/temp-root.js";
 import { sweepTempRunRoots } from "../src/storage/retention.js";
+import { ageRunRoot } from "./helpers/age-run-root.js";
 
 const roots: string[] = [];
 const closers: Array<() => Promise<void>> = [];
@@ -115,6 +116,7 @@ describe.skipIf(process.platform === "win32")("Fabric file root override", () =>
       fs.writeFileSync(path.join(directory, ".fabric-owner.json"), JSON.stringify({ pid, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
       fs.mkdirSync(path.join(directory, "run"));
       fs.writeFileSync(path.join(directory, "run", "status.json"), JSON.stringify({ status: "completed", transport: "process", sessionId: "2147483647", finishedAt: 1 }));
+      ageRunRoot(directory, 1);
     }
     const result = sweepTempRunRoots({ tempRoot: disk, currentRoot: runRoot, now: 100_000, orphanedTempRunRetentionMs: 1000, oneShotRunRetentionMs: 1000 });
     expect(result.removedRoots).toEqual([dead]);
@@ -131,6 +133,7 @@ describe.skipIf(process.platform === "win32")("Fabric file root override", () =>
     const agents = manager();
     const dead = fs.mkdtempSync(path.join(disk, "pi-fabric-runs-"));
     fs.writeFileSync(path.join(dead, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
+    ageRunRoot(dead, 1);
     vi.stubEnv("PI_FABRIC_TMPDIR", short);
     await agents.close();
     await vi.waitFor(() => expect(fs.existsSync(dead)).toBe(false), { timeout: 20_000 });

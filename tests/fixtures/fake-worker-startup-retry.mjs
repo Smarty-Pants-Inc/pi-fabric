@@ -14,6 +14,10 @@ const marker = path.join(path.dirname(statusFile), "startup-attempts");
 const attempts = fs.existsSync(marker) ? Number(fs.readFileSync(marker, "utf8")) + 1 : 1;
 fs.writeFileSync(marker, String(attempts));
 const now = Date.now();
+if (task === "Recover startup") {
+  const lifecycleFile = args.get("lifecycle-file");
+  if (lifecycleFile) fs.writeFileSync(lifecycleFile, JSON.stringify({ fixtureAttempt: attempts }) + "\n");
+}
 const retryable = task !== "Reject startup";
 const windowRefusal = task === "window before first turn" || task === "window after work";
 let capabilityMissing = false;

@@ -137,6 +137,7 @@ describe("ResidentHost legacy retention custody wiring", () => {
       writeJson(path.join(config.residencyRoot, "responses", `${requestId}.json`), response);
       expect(acknowledgeResidentResponse(config.residencyRoot, response, response.completedAt, 3)).toBe(true);
       const before = snapshot(path.join(config.residencyRoot, "runs"));
+      const unrelatedBefore = snapshot(unrelated);
       const resultsBefore = snapshot(path.join(config.residencyRoot, "results"));
       const recover = vi.spyOn(manager, "recoverPendingArchives");
       const reference = vi.spyOn(manager, "retentionCustodyVeto");
@@ -155,19 +156,25 @@ describe("ResidentHost legacy retention custody wiring", () => {
         target: path.join(config.residencyRoot, "responses", `${requestId}.json`),
         deleter: "residentRequestCollect", judged: expect.anything(),
       });
-      expect(recorded.compactions).toEqual(retainRuns ? [unrelated] : []);
-      expect(recorded.mutations.filter(({ deleter }) => deleter !== "residentRequestCollect")).toEqual([{
-        target: retainRuns ? path.join(unrelated, "events.jsonl") : unrelated,
-        deleter: retainRuns ? "compactTerminalRunEvents" : "residentRunRetention",
-        judged: expect.objectContaining({ ino: expect.any(Number), dev: expect.any(Number) }),
-      }]);
-      expect(nativeExitChecks).toHaveBeenCalledWith(2147483647, 0);
+      expect(recorded.compactions).toEqual([]);
+      expect(recorded.mutations.filter(({ deleter }) => deleter !== "residentRequestCollect")).toEqual([]);
+      if (retainRuns) expect(nativeExitChecks).not.toHaveBeenCalled();
+      else expect(nativeExitChecks).toHaveBeenCalledWith(2147483647, 0);
       expect(recorded.mutations.some(({ target }) => target === owned || target.startsWith(owned + path.sep))).toBe(false);
       for (const spy of direct) {
         expect(spy.mock.calls.filter(([target]) => String(target).startsWith(path.join(config.residencyRoot, "runs") + path.sep))).toEqual([]);
       }
       expect(directAsync.mock.calls.filter(([target]) => String(target).startsWith(path.join(config.residencyRoot, "runs") + path.sep))).toEqual([]);
-      expect(snapshot(path.join(config.residencyRoot, "runs"))).toEqual(before);
+      if (retainRuns) expect(snapshot(path.join(config.residencyRoot, "runs"))).toEqual(before);
+      else {
+        expect(fs.existsSync(unrelated)).toBe(false);
+        const archive = path.join(config.residencyRoot, "runs.trace-archive");
+        const container = fs.readdirSync(archive).map(name => path.join(archive, name)).find(candidate => {
+          try { return JSON.parse(fs.readFileSync(path.join(candidate, "custody.json"), "utf8")).source === unrelated; } catch { return false; }
+        })!;
+        const destination = JSON.parse(fs.readFileSync(path.join(container, "custody.json"), "utf8")).destination as string;
+        expect(snapshot(destination)).toEqual(unrelatedBefore);
+      }
       expect(snapshot(path.join(config.residencyRoot, "results"))).toEqual(resultsBefore);
       expect(manager.status(result.id)).toMatchObject(result);
     } finally {

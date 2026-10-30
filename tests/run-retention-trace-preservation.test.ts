@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { readJsonlPage } from "../src/log-tail.js";
 import { ResidentRequestRetention, sweepResidentRuns } from "../src/residency/retention.js";
 import { MeshRetentionApplyDisabledError, sweepMeshRetention } from "../src/storage/retention-cli.js";
@@ -13,7 +13,15 @@ import {
 const roots: string[] = [];
 const HOUR = 3_600_000;
 const now = 10 * HOUR;
+const mockDeadPid = () => {
+  const processKill = process.kill.bind(process);
+  vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+    if (pid === 2_147_483_647 && signal === 0) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+    return processKill(pid, signal);
+  });
+};
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -25,6 +33,7 @@ describe("raw terminal run trace preservation", () => {
     "keeps a tree containing only %s as its permanent trace fence through resident and apply collection", async trace => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-attempt-retention-"));
       roots.push(root);
+      mockDeadPid();
       const aged = Date.now() - 3 * 24 * HOUR, now = Date.now();
       const bytes = Buffer.from([0, 255, 13, 10, 123, 0]);
       const runs = path.join(root, "runs"), retained = path.join(runs, "retained"), control = path.join(runs, "control");
@@ -51,13 +60,48 @@ describe("raw terminal run trace preservation", () => {
       assertRetained();
       fs.mkdirSync(control);
       fs.copyFileSync(path.join(retained, "status.json"), path.join(control, "status.json"));
-      expect(pruneActorRunArchives({ runsDirectory: runs, retentionMs: HOUR, now })).toEqual([control]);
+      expect(pruneActorRunArchives({ runsDirectory: runs, retentionMs: HOUR, now })).toEqual([]);
+      expect(fs.existsSync(control), "#1800 keeps actor run archives").toBe(true);
       assertRetained();
       // Public --apply remains disabled; do not bypass its independent safety boundary.
       await expect(sweepMeshRetention(root, { dryRun: false })).rejects.toBeInstanceOf(MeshRetentionApplyDisabledError);
       assertRetained();
     },
   );
+
+  // Judge prototype: the fence must also hold when the only attempt trace is in a nested child run.
+  it("keeps a run whose only attempt trace is in a nested child run through resident and apply collection", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-attempt-retention-nested-"));
+    roots.push(root);
+    mockDeadPid();
+    const aged = Date.now() - 3 * 24 * HOUR, now = Date.now();
+    const bytes = Buffer.from([0, 255, 13, 10, 123, 0]);
+    const trace = "lifecycle.jsonl.attempt-1-resume";
+    const runs = path.join(root, "runs"), retained = path.join(runs, "retained"), control = path.join(runs, "control");
+    const record = JSON.stringify({ status: "completed", finishedAt: aged, transport: "process", sessionId: "2147483647" });
+    const build = (run: string, fenced: boolean) => {
+      const child = path.join(run, "nested", "child");
+      fs.mkdirSync(child, { recursive: true });
+      fs.writeFileSync(path.join(child, "status.json"), record);
+      if (fenced) fs.writeFileSync(path.join(child, trace), bytes);
+      fs.writeFileSync(path.join(run, "status.json"), record);
+      for (const directory of [child, path.join(run, "nested"), run]) fs.utimesSync(directory, aged / 1000, aged / 1000);
+    };
+    const assertRetained = () => expect(fs.readFileSync(path.join(retained, "nested", "child", trace))).toEqual(bytes);
+    build(retained, true); build(control, false);
+    const collector = new ResidentRequestRetention(root, [], { retainRuns: false });
+    try { for (let slice = 0; slice < 20 && collector.due(now); slice++) collector.sweep(now, new Set(), 10_000); }
+    finally { collector.close(); }
+    expect(fs.existsSync(control), "resident sweep must actually collect the unfenced nested control").toBe(false);
+    assertRetained();
+    build(control, false);
+    expect(sweepResidentRuns(runs, now, 10_000, { retainRuns: false })).toEqual([control]);
+    assertRetained();
+    build(control, false);
+    expect(pruneActorRunArchives({ runsDirectory: runs, retentionMs: HOUR, now })).toEqual([]);
+    expect(fs.existsSync(control), "#1800 keeps actor run archives").toBe(true);
+    assertRetained();
+  });
 
   it.each(["actor", "closed root"] as const)("keeps every head byte and the paging generation through %s maintenance", kind => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-raw-trace-"));

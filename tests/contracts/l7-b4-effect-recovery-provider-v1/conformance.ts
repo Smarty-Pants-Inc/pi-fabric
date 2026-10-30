@@ -1,16 +1,42 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { canonicalEncode } from "../../../src/effects/slots.js";
 import type { B4EffectRecoveryProviderV1 } from "./contract.js";
 import { copy, hash, intent, originalResult, type ConformanceFactory, type ConformanceHarness, type Scenario } from "./fixtures.js";
+import { scriptedAdmissionId } from "./fixtures.js";
 
 /** ONE suite for consumer stand-ins and the actual B4 adapter. A factory gives
  * each case an isolated retained-state fixture; it is not a provider API.
  * Keep reason: data safety/contract boundary; no result is L7 qualification. */
 export function runConformance(provider: ConformanceFactory): void {
-  const test = (name: string, scenario: Scenario, check: (h: ConformanceHarness) => Promise<void>) => {
-    it(name, async () => { const h = await provider(scenario); try { await check(h); } finally { await h.dispose(); } });
+  const inputs = (h: Pick<ConformanceHarness, "recoveryIdentity">) => {
+    const identity = h.recoveryIdentity();
+    return {
+      value: intent("write", 0, [], false, identity),
+      predecessor: intent("predecessor", 9, [], false, identity),
+      successor: intent("successor", 0, ["predecessor"], false, identity),
+      peer: intent("peer", 0, [], true, identity),
+    };
   };
+  type Inputs = ReturnType<typeof inputs>;
+  const withScenario = async (scenario: (values: Inputs) => Scenario,
+    check: (h: ConformanceHarness, values: Inputs) => Promise<void>) => {
+    let seeded: Scenario | undefined;
+    const h = await provider(observations => (seeded = scenario(inputs(observations))));
+    try {
+      expect(seeded, "factory must resolve the scenario from independent harness observations").toBeDefined();
+      const { acceptedInput, executionBranchEntryId } = h.recoveryIdentity();
+      for (const value of seeded!.intents ?? []) {
+        expect(value.keyTuple[2]).toBe(acceptedInput.sessionId);
+        expect(value.keyTuple[3]).toBe(acceptedInput.originalInputId);
+        expect(value.acceptedInput).toEqual({ id: acceptedInput.originalInputId,
+          digest: acceptedInput.payloadSha256, nativeEntryId: executionBranchEntryId });
+      }
+      await check(h, inputs(h));
+    } finally { await h.dispose(); }
+  };
+  const test = (name: string, scenario: Parameters<typeof withScenario>[0], checks: Parameters<typeof withScenario>[1] | Parameters<typeof withScenario>[1][]) =>
+    it(name, async () => { for (const check of Array.isArray(checks) ? checks : [checks]) await withScenario(scenario, check); });
   const settle = (h: ConformanceHarness, generation = h.recoveryIdentity().recoveryGeneration) =>
     h.provider.settlePendingIntents!(h.recoveryIdentity().acceptedInput.sessionId, generation);
   const read = (h: ConformanceHarness, effect: Parameters<B4EffectRecoveryProviderV1["readToolResult"]>[0]) => h.provider.readToolResult!(effect);
@@ -23,70 +49,67 @@ export function runConformance(provider: ConformanceFactory): void {
     expect(ref).toMatchObject({ originalInputId: acceptedInput.originalInputId, recoveryGeneration, executionBranchEntryId });
     return ref;
   };
-  const value = intent();
   describe("B4EffectRecoveryProviderV1", () => {
-    test("C01 empty/clean returns empty without minting a generation or receipt", {}, async h => {
+    test("C01 empty/clean returns empty without minting a generation or receipt", () => ({}), async h => {
       const before = await h.ledgerDigest();
       expect(await settle(h)).toEqual({ settled: [], uncertain: 0 });
       expect(h.generations()).toEqual([]); expect(h.destination()).toEqual([]);
       expect(await h.ledgerDigest()).toBe(before);
     });
-    test("C02 wrong session refuses before settlement", { intents: [value] }, async h => {
+    test("C02 wrong session refuses before settlement", ({ value }) => ({ intents: [value] }), async h => {
       await expect(h.provider.settlePendingIntents!("foreign", h.recoveryIdentity().recoveryGeneration)).rejects.toMatchObject({ code: "EFFECT_SESSION_MISMATCH" });
       expect(h.destination()).toEqual([]);
     });
-    test("C03 empty generation is not replaced with a random UUID", { intents: [value] }, async h => {
+    test("C03 empty generation is not replaced with a random UUID", ({ value }) => ({ intents: [value] }), async h => {
       await expect(settle(h, " ")).rejects.toMatchObject({ code: "EFFECT_RECOVERY_GENERATION" });
       expect(h.destination()).toEqual([]); expect(h.generations()).toEqual([]);
     });
-    test("C04 settle uses original K/bytes and caller's durable generation", { intents: [value] }, async h => {
+    test("C04 settle uses original K/bytes and caller's durable generation", ({ value }) => ({ intents: [value] }), async (h, { value }) => {
       const result = await settle(h);
       expect(result.uncertain).toBe(0); expect(result.settled).toHaveLength(1);
       expect(result.settled[0]).toMatchObject({ key: value.key, toolCallId: value.tool.originalToolCallId, outcome: "committed" });
       expect(h.observedIntents()).toEqual([value]); expect(h.generations()).toEqual([h.recoveryIdentity().recoveryGeneration]);
     });
-    test("C05 terminal result survives reopen with no second sink effect or ledger write", { intents: [value] }, async h => {
+    test("C05 terminal result survives reopen with no second sink effect or ledger write", ({ value }) => ({ intents: [value] }), async (h, { value }) => {
       const first = await settle(h); const before = await h.ledgerDigest();
       await h.reopen(); expect(await settle(h)).toEqual(first);
       expect(await h.ledgerDigest()).toBe(before); expect(h.observedIntents()).toHaveLength(1);
       expect(h.destination()).toEqual([value.key]);
     });
-    test("C06 same K with changed bytes conflicts without overwrite", { intents: [value] }, async h => {
+    test("C06 same K with changed bytes conflicts without overwrite", ({ value }) => ({ intents: [value] }), async (h, { value }) => {
       const before = await h.ledgerDigest(); const changed = copy(value);
       const bytes = "changed";
       await expect(h.issue({ ...changed, payload: { encoding: "base64", bytes: Buffer.from(bytes).toString("base64"), digest: hash(bytes) } }))
         .rejects.toMatchObject({ code: "EFFECT_SLOT_CONFLICT" });
       expect(await h.ledgerDigest()).toBe(before); expect(h.destination()).toEqual([]);
     });
-    const predecessor = intent("predecessor", 9);
-    const successor = intent("successor", 0, ["predecessor"]);
-    test("C07 predecessors settle before lower-ordinal successors", { intents: [successor, predecessor] }, async h => {
+    test("C07 predecessors settle before lower-ordinal successors", ({ successor, predecessor }) => ({ intents: [successor, predecessor] }), async h => {
       expect((await settle(h)).uncertain).toBe(0);
       expect(h.observedIntents().map(item => item.slot.id)).toEqual(["predecessor", "successor"]);
     });
-    test("C08 missing predecessor holds successor without issuing it", { intents: [successor] }, async h => {
+    test("C08 missing predecessor holds successor without issuing it", ({ successor }) => ({ intents: [successor] }), async h => {
       expect((await settle(h)).uncertain).toBe(1); expect(h.destination()).toEqual([]); expect(h.observedIntents()).toEqual([]);
     });
-    test("C09 uncertain predecessor never runs its successor", { intents: [predecessor, successor], outcomes: { predecessor: "uncertain" } }, async h => {
+    test("C09 uncertain predecessor never runs its successor", ({ predecessor, successor }) => ({ intents: [predecessor, successor], outcomes: { predecessor: "uncertain" } }), async h => {
       expect((await settle(h)).uncertain).toBe(2); expect(h.destination()).toEqual([]);
     });
-    test("C10 definitive not-committed is retained, never silently retried", { intents: [value], outcomes: { write: "not-committed" } }, async h => {
+    test("C10 definitive not-committed is retained, never silently retried", ({ value }) => ({ intents: [value], outcomes: { write: "not-committed" } }), async h => {
       expect((await settle(h)).settled[0]?.outcome).toBe("not-committed");
       const count = h.observedIntents().length; await h.reopen(); await settle(h);
       expect(h.observedIntents()).toHaveLength(count); expect(h.destination()).toEqual([]);
     });
-    test("C11 lost sink ACK reconciles original key once on the destination", { intents: [value], lostAck: true }, async h => {
+    test("C11 lost sink ACK reconciles original key once on the destination", ({ value }) => ({ intents: [value], lostAck: true }), async (h, { value }) => {
       expect((await settle(h)).uncertain).toBe(1); expect(h.destination()).toEqual([value.key]);
       await h.reopen(); expect((await settle(h)).uncertain).toBe(0);
       expect(h.destination()).toEqual([value.key]); expect(h.observedIntents()).toEqual([value, value]);
     });
-    test("C12 controlled peer probe retains original body/deadline on replay", { intents: [intent("peer", 0, [], true)], committedBeforeAck: [intent("peer", 0, [], true).key] }, async h => {
-      const peer = intent("peer", 0, [], true); await settle(h); await h.reopen(); await settle(h);
+    test("C12 controlled peer probe retains original body/deadline on replay", ({ peer }) => ({ intents: [peer], committedBeforeAck: [peer.key] }), async (h, { peer }) => {
+      await settle(h); await h.reopen(); await settle(h);
       // Only a controlled sink boundary, not a real late network request or cache-expiry proof.
       expect(h.destination()).toEqual([peer.key]); expect(h.observedIntents()).toEqual([peer]);
       expect(h.observedIntents()[0]?.message?.originalDeadlineAt).toBe(peer.message!.originalDeadlineAt);
     });
-    test("C13 concurrent settlement serializes across an awaited stalled sink", { intents: [value], stallSink: true }, async h => {
+    test("C13 concurrent settlement serializes across an awaited stalled sink", ({ value }) => ({ intents: [value], stallSink: true }), async (h, { value }) => {
       const first = settle(h);
       let second: ReturnType<typeof settle> | undefined;
       try {
@@ -105,22 +128,22 @@ export function runConformance(provider: ConformanceFactory): void {
       expect(a).toEqual(b); expect(h.observedIntents()).toHaveLength(1);
       expect(h.destination()).toEqual([value.key]);
     });
-    test("C14 corrupt retained ledger cannot appear clean", { intents: [value], corrupt: true }, async h => {
+    test("C14 corrupt retained ledger cannot appear clean", ({ value }) => ({ intents: [value], corrupt: true }), async h => {
       expect((await settle(h)).uncertain).toBeGreaterThan(0); expect(h.destination()).toEqual([]);
     });
-    test("C15 uncertainty counts logical keys, not physical aliases", { intents: [value], outcomes: { write: "uncertain" }, alias: { key: value.key, toolCallId: "alias" } }, async h => {
+    test("C15 uncertainty counts logical keys, not physical aliases", ({ value }) => ({ intents: [value], outcomes: { write: "uncertain" }, alias: { key: value.key, toolCallId: "alias" } }), async h => {
       const result = await settle(h); expect(result.uncertain).toBe(1); expect(result.settled).toHaveLength(2);
     });
-    test("C16 result hash is full native JSON.stringify bytes, not canonical sorted JSON", { intents: [value] }, async h => {
+    test("C16 result hash is full native JSON.stringify bytes, not canonical sorted JSON", ({ value }) => ({ intents: [value] }), async (h, { value }) => {
       const effect = (await settle(h)).settled[0]!; const result = await read(h, effect);
       expect(JSON.stringify(result.message)).toBe(JSON.stringify(originalResult(value)));
       expect(effect.resultBytesHash).toBe(hash(JSON.stringify(originalResult(value))));
     });
-    test("C17 native result has explicit postHook=true provenance", { intents: [value] }, async h => {
+    test("C17 native result has explicit postHook=true provenance", ({ value }) => ({ intents: [value] }), async h => {
       const effect = (await settle(h)).settled[0]!;
       expect(await read(h, effect)).toMatchObject({ source: "native-entry", postHook: true, message: { timestamp: 12345 } });
     });
-    test("C18 physical aliases have their own exact result hash and identity", { intents: [value], alias: { key: value.key, toolCallId: "alias" } }, async h => {
+    test("C18 physical aliases have their own exact result hash and identity", ({ value }) => ({ intents: [value], alias: { key: value.key, toolCallId: "alias" } }), async h => {
       const effects = (await settle(h)).settled; expect(effects).toHaveLength(2);
       for (const effect of effects) {
         const result = await read(h, effect);
@@ -129,17 +152,17 @@ export function runConformance(provider: ConformanceFactory): void {
       }
       expect(effects[0]!.resultBytesHash).not.toBe(effects[1]!.resultBytesHash);
     });
-    test("C19 forged alias cannot read an original result", { intents: [value] }, async h => {
+    test("C19 forged alias cannot read an original result", ({ value }) => ({ intents: [value] }), async h => {
       const effect = (await settle(h)).settled[0]!;
       await expect(read(h, { ...effect, toolCallId: "forged" })).rejects.toMatchObject({ code: "EFFECT_CALL_ALIAS_MISMATCH" });
     });
-    test("C20 forged result hash cannot read a result", { intents: [value] }, async h => {
+    test("C20 forged result hash cannot read a result", ({ value }) => ({ intents: [value] }), async h => {
       const effect = (await settle(h)).settled[0]!;
       await expect(read(h, { ...effect, resultBytesHash: hash("forged") })).rejects.toMatchObject({ code: "EFFECT_RESULT_UNAVAILABLE" });
     });
     // C21/C22 moved to ../l7-b5-main-generation-v1/conformance.ts.
     // The B4 ABI has no B5 pin port; B5/Main owns these refusals (R3:150-152).
-    test("C23 J differs from A: host repair returns bound view and canonical receipt hash", { intents: [value] }, async h => {
+    test("C23 J differs from A: host repair returns bound view and canonical receipt hash", ({ value }) => ({ intents: [value] }), async h => {
       await settle(h); const ref = await repair(h);
       const { acceptedInput, recoveryGeneration, executionBranchEntryId } = h.recoveryIdentity();
       expect(ref).toMatchObject({ originalInputId: acceptedInput.originalInputId, recoveryGeneration, executionBranchEntryId });
@@ -161,58 +184,58 @@ export function runConformance(provider: ConformanceFactory): void {
       expect(view.protectedRangeSha256).toMatch(/^[a-f0-9]{64}$/);
       expect(ref.repairReceiptSha256).toBe(hash(canonicalEncode(view)));
     });
-    test("C24 second recovery resolves identical immutable receipt without reminting", { intents: [value] }, async h => {
+    test("C24 second recovery resolves identical immutable receipt without reminting", ({ value }) => ({ intents: [value] }), async h => {
       await settle(h); const ref = await repair(h); const view = h.provider.resolveRepair!(ref);
       await h.reopen(); expect(await repair(h)).toEqual(ref); expect(h.provider.resolveRepair!(ref)).toEqual(view);
       expect(Object.isFrozen(view)).toBe(true); expect(Object.isFrozen(view.nativeEntries)).toBe(true);
     });
-    test("C25 forged receipt hash/anchor/generation is refused synchronously", { intents: [value] }, async h => {
+    test("C25 forged receipt hash/anchor/generation is refused synchronously", ({ value }) => ({ intents: [value] }), async h => {
       await settle(h); const ref = await repair(h);
       for (const bad of [{ ...ref, repairReceiptSha256: hash("forged") }, { ...ref, executionBranchEntryId: "J" }, { ...ref, recoveryGeneration: "g2" }]) {
         expect(() => h.provider.resolveRepair!(bad)).toThrowError(expect.objectContaining({ code: "RECOVERY_MAINTENANCE_REPAIR_REQUIRED" }));
       }
     });
-    test("C26 later joined J2 refuses new repair rather than replacing receipt", { intents: [value] }, async h => {
+    test("C26 later joined J2 refuses new repair rather than replacing receipt", ({ value }) => ({ intents: [value] }), async h => {
       await settle(h); const ref = await repair(h); h.advanceJoinedLeaf();
       await expect(h.provider.repairMaintenance!(h.recoveryIdentity().acceptedInput, "J2")).rejects.toMatchObject({ code: "RECOVERY_MAINTENANCE_REPAIR_REQUIRED" });
       expect(h.provider.resolveRepair!(ref).joinedLeafEntryId).toBe("J");
     });
-    test("C27 uncertain effects cannot yield a repair receipt", { intents: [value], outcomes: { write: "uncertain" } }, async h => {
+    test("C27 uncertain effects cannot yield a repair receipt", ({ value }) => ({ intents: [value], outcomes: { write: "uncertain" } }), async h => {
       await settle(h); expect(h.provider.repairMaintenance).toBeTypeOf("function");
       await expect(h.provider.repairMaintenance!(h.recoveryIdentity().acceptedInput, "J")).rejects.toMatchObject({ code: "RECOVERY_MAINTENANCE_REPAIR_REQUIRED" });
     });
-    test("C28 file pre-state commits original bytes once; reopen preserves inode", { fileState: "pre" }, async h => {
+    test("C28 file pre-state commits original bytes once; reopen preserves inode", () => ({ fileState: "pre" }), async h => {
       expect(h.fileSnapshot().bytes).toBe("before"); expect((await settle(h)).uncertain).toBe(0);
       const post = h.fileSnapshot(); expect(post.bytes).toBe("after");
       await h.reopen(); await settle(h); expect(h.fileSnapshot()).toEqual(post);
     });
-    test("C29 file post-state lost ACK returns result without replacing inode", { fileState: "post" }, async h => {
+    test("C29 file post-state lost ACK returns result without replacing inode", () => ({ fileState: "post" }), async h => {
       const before = h.fileSnapshot(); expect((await settle(h)).uncertain).toBe(0);
       expect(h.fileSnapshot()).toEqual(before);
     });
-    test("C30 file neither pre nor post holds without mutation", { fileState: "neither" }, async h => {
+    test("C30 file neither pre nor post holds without mutation", () => ({ fileState: "neither" }), async h => {
       const before = h.fileSnapshot(); expect((await settle(h)).uncertain).toBe(1);
       expect(h.fileSnapshot()).toEqual(before);
     });
-    test("C31 fixed read/hash shell settles without mutating checked file", { shellState: "matching" }, async h => {
+    test("C31 fixed read/hash shell settles without mutating checked file", () => ({ shellState: "matching" }), async h => {
       const before = h.fileSnapshot(); expect((await settle(h)).uncertain).toBe(0);
       expect(h.fileSnapshot()).toEqual(before);
     });
-    test("C32 changed shell input holds, never labels a new observation original", { shellState: "changed" }, async h => {
+    test("C32 changed shell input holds, never labels a new observation original", () => ({ shellState: "changed" }), async h => {
       const before = h.fileSnapshot(); expect((await settle(h)).uncertain).toBe(1);
       expect(h.fileSnapshot()).toEqual(before);
     });
-    test("C33 missing receipt cannot be resolved from caller JSON", {}, async h => {
+    test("C33 missing receipt cannot be resolved from caller JSON", () => ({}), async h => {
       expect(h.provider.resolveRepair).toBeTypeOf("function");
       const { acceptedInput, recoveryGeneration, executionBranchEntryId } = h.recoveryIdentity();
       expect(() => h.provider.resolveRepair!({ originalInputId: acceptedInput.originalInputId, recoveryGeneration,
         executionBranchEntryId, repairReceiptSha256: hash("invented") })).toThrowError(expect.objectContaining({ code: "RECOVERY_MAINTENANCE_REPAIR_REQUIRED" }));
     });
-    test("C34 host repair rejects unrelated original input", { intents: [value] }, async h => {
+    test("C34 host repair rejects unrelated original input", ({ value }) => ({ intents: [value] }), async h => {
       await settle(h); expect(h.provider.repairMaintenance).toBeTypeOf("function");
       await expect(h.provider.repairMaintenance!({ ...h.recoveryIdentity().acceptedInput, originalInputId: "unrelated" }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
     });
-    test("C35 adapter-original read labels provenance without inventing a timestamp", { intents: [value], resultSource: "adapter-original" }, async h => {
+    test("C35 adapter-original read labels provenance without inventing a timestamp", ({ value }) => ({ intents: [value], resultSource: "adapter-original" }), async (h, { value }) => {
       const effect = (await settle(h)).settled[0]!;
       const result = await read(h, effect);
       expect(result.source).toBe("adapter-original");
@@ -222,5 +245,61 @@ export function runConformance(provider: ConformanceFactory): void {
       // B3 requires a boolean, and re-runs strict hooks regardless of its value.
       expect(result.postHook).toBeTypeOf("boolean");
     });
+    test("C36 host repair rejects wrong admission ID for the right original", ({ value }) => ({ intents: [value] }), [async h => {
+      await settle(h); expect(h.provider.repairMaintenance).toBeTypeOf("function");
+      const { acceptedInput } = h.recoveryIdentity();
+      const before = await h.ledgerDigest();
+      // Change only admissionId: original, delivery and all other input fields stay exact.
+      const wrong = { ...acceptedInput, admissionId: `${acceptedInput.admissionId}:wrong` };
+      await expect(h.provider.repairMaintenance!(wrong, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
+      expect(await h.ledgerDigest()).toBe(before);
+      // B5 derives a second sender's ID for this SAME original, not a malformed suffix.
+      // Preparing its outbox does not retain that admission in the original's receiver record.
+      const secondSenderAdmission = scriptedAdmissionId(acceptedInput, `c36-second-sender:${randomUUID()}`);
+      expect(secondSenderAdmission).not.toBe(acceptedInput.admissionId);
+      // Consistency alone is insufficient: neither malformed nor B5-derived pairs bypass the retained record.
+      await expect(h.provider.repairMaintenance!({ ...wrong, deliveryId: wrong.admissionId }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
+      expect(await h.ledgerDigest()).toBe(before);
+      await expect(h.provider.repairMaintenance!({ ...acceptedInput, admissionId: secondSenderAdmission, deliveryId: secondSenderAdmission }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
+      expect(await h.ledgerDigest()).toBe(before);
+      // The correct admission with a wrong delivery must also refuse (the converse inconsistent pair).
+      await expect(h.provider.repairMaintenance!({ ...acceptedInput, deliveryId: wrong.admissionId }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
+      expect(await h.ledgerDigest()).toBe(before);
+      await expect(h.provider.repairMaintenance!({ ...acceptedInput, deliveryId: secondSenderAdmission }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
+      expect(await h.ledgerDigest()).toBe(before);
+      // The refusals must not poison the valid occurrence or manufacture a receipt.
+      const ref = await repair(h);
+      expect(h.provider.resolveRepair!(ref).originalInputId).toBe(acceptedInput.originalInputId);
+    },
+    // Keep the sequence above: it catches refusal-budget and poisoning defects.
+    // Each check below gets its OWN factory call, settlement and disposal through
+    // withScenario. No earlier refusal (or valid repair) can load/latch its record.
+    ...(["admission", "malformed-pair", "b5-pair", "malformed-delivery", "b5-delivery", "foreign-pair", "foreign-delivery"] as const)
+      .map(arm => async (h: ConformanceHarness) => {
+        await settle(h); expect(h.provider.repairMaintenance).toBeTypeOf("function");
+        const { acceptedInput } = h.recoveryIdentity();
+        const before = await h.ledgerDigest();
+        const wrong = { ...acceptedInput, admissionId: `${acceptedInput.admissionId}:wrong` };
+        const secondSenderAdmission = scriptedAdmissionId(acceptedInput, `c36-second-sender:${randomUUID()}`);
+        expect(secondSenderAdmission).not.toBe(acceptedInput.admissionId);
+        // ONE foreign-form sample, used as both a pair and a delivery: no B5
+        // prefix and shorter than a B5 ID, unlike the old "<A>:wrong" suffix.
+        const foreignAdmission = "legacy-admission";
+        expect(foreignAdmission).not.toBe(acceptedInput.admissionId);
+        const wrongInputs = {
+          admission: wrong,
+          "malformed-pair": { ...wrong, deliveryId: wrong.admissionId },
+          "b5-pair": { ...acceptedInput, admissionId: secondSenderAdmission, deliveryId: secondSenderAdmission },
+          "malformed-delivery": { ...acceptedInput, deliveryId: wrong.admissionId },
+          "b5-delivery": { ...acceptedInput, deliveryId: secondSenderAdmission },
+          "foreign-pair": { ...acceptedInput, admissionId: foreignAdmission, deliveryId: foreignAdmission },
+          "foreign-delivery": { ...acceptedInput, deliveryId: foreignAdmission },
+        };
+        await expect(h.provider.repairMaintenance!(wrongInputs[arm], "J"), arm).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
+        expect(await h.ledgerDigest(), arm).toBe(before);
+        const ref = await repair(h);
+        expect(h.provider.resolveRepair!(ref).originalInputId).toBe(acceptedInput.originalInputId);
+      }),
+    ]);
   });
 }

@@ -62,7 +62,7 @@ describe("published Pi durable hosted adapter", () => {
 
   it("duplicate starts and persistent reopen attach do not duplicate submission or effects", async () => {
     const f = setup(true); let effects = 0;
-    const tool = defineTool({ name: "effect", description: "effect", parameters: Type.Object({}), execute: async () => { effects++; return { content: [{ type: "text", text: "effect done" }] }; } });
+    const tool = defineTool({ name: "effect", description: "effect", parameters: Type.Object({}), execute: async () => { effects++; return { content: [{ type: "text", text: "effect done" }], details: {} }; } });
     f.registry.install(defineExtension({ name: "tools", tools: [tool] }));
     f.faux.setResponses([fauxAssistantMessage(fauxToolCall("effect", {}), { stopReason: "toolUse" }), fauxAssistantMessage("done")]);
     const ctx = context({ tools: ["effect"] }); const runner = f.make(); const loc = runner.prepare(ctx); const a = reporter(); const b = reporter();

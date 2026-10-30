@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { RpcClient } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 
-// smarty-dev#5492 / PR #567 acceptance: a REAL Pi 1.1.0 process in RPC mode loads the BUILT Fabric
+// smarty-dev#5492 / PR #567 acceptance: a REAL Pi 1.2.0 process in RPC mode loads the BUILT Fabric
 // (dist/index.js) and a fixture extension standing in for pi-better-openai with its three tools
 // disabled. An offline deterministic openai-completions stub drives fabric_exec. No mock of Pi or
 // Fabric: the catalog, the system prompt and the refusal are read from the live session.

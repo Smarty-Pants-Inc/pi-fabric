@@ -77,7 +77,7 @@ export default function (pi: ExtensionAPI) {
     fs.appendFileSync(process.env.ASTRA_PROBE_RECEIPTS!, `${JSON.stringify({
       runId: process.env.PI_FABRIC_PARENT_RUN ?? "main", actorId: process.env.PI_FABRIC_ACTOR_ID ?? null,
       model: context.model ? `${context.model.provider}/${context.model.id}` : null,
-      sessionId: context.sessionManager.getSessionId(), prompt: event.prompt,
+      sessionId: context.sessionManager.getSessionId(), prompt: event.messageType === "user" ? event.prompt : "",
     })}\n`);
   });
 }

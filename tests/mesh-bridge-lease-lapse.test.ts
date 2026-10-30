@@ -98,6 +98,10 @@ describe("bounded own-root lease lapse", () => {
   it.each(["file", "sqlite"] as const)("retains a mid-drain lapse and its same-key retry, then delivers once (%s)", async backend => {
     const f = await fixture(backend), sent = await f.send();
     const before = f.cursor().toLocal;
+    // Linux namespace preparation creates this incidentally; Windows need not prepare it
+    // before a refused append. Seed an empty directory so the assertion tests no receipts,
+    // not the platform's lazy namespace preparation policy.
+    fs.mkdirSync(path.join(f.hub.root, "event-receipts"), { recursive: true });
     expect(await f.bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
     expect(f.attempts).toBe(2); // one refresh and retry, not an inline retry loop
     expect(f.cursor().toLocal.after).toBe(before.after);

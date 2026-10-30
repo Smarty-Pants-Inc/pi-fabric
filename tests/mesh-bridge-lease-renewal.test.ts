@@ -4,9 +4,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { StoreBridgeSide, type BridgeHost } from "../src/mesh/bridge.js";
+import { BridgeMirrorDeferredError, StoreBridgeSide, type BridgeHost } from "../src/mesh/bridge.js";
+import { MeshLockTimeoutError } from "../src/core/atomic-write.js";
+import { NatsCarrierSide } from "../src/mesh/bridge-nats-file.js";
+import type { BridgeNatsPort } from "../src/mesh/bridge-nats-types.js";
 import { MeshStore } from "../src/mesh/store.js";
-import { mirroredOwnerRoutingStatus, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
+import { hostLeasePath, mirroredOwnerRoutingStatus, readHostLease, writeHostLease } from "../src/topology/host-leases.js";
+import { FakePort, MemoryLedger } from "./helpers/bridge-nats-l2-fakes.js";
 import { writeParticipantFile } from "../src/topology/participant-files.js";
 
 const ROOT = "session:11111111-1111-4111-8111-111111111111";
@@ -14,7 +18,13 @@ const LINK = "test-link";
 const identity = { id: ROOT, name: "remote-root", kind: "main" as const };
 const key = (prefix: string) => prefix + createHash("sha256").update(ROOT).digest("hex");
 const closers: Array<() => void> = [];
-afterEach(() => { vi.restoreAllMocks(); for (const close of closers.splice(0)) close(); });
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); for (const close of closers.splice(0)) close(); });
+const barrier = () => {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+};
+const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 
 const fixture = async () => {
   let now = 1_800_000_000_000;
@@ -101,6 +111,125 @@ describe("lease-only mirror renewal", () => {
     writeHostLease(g.store.root, native);
     await g.side.renewMirroredLeases([g.host(13_000)], g.now());
     expect(g.lease()).toEqual(native);
+  });
+
+  it("skips overlapping lease-only ticks instead of queuing behind the same process's held gate", async () => {
+    const f = await fixture();
+    const entered = barrier(), release = barrier();
+    const custody = f.store.leaseCustody.bind(f.store);
+    let starts = 0, active = 0, maximum = 0;
+    vi.spyOn(f.store, "leaseCustody").mockImplementation((file, operation, ...args) => custody(file, async () => {
+      starts++;
+      maximum = Math.max(maximum, ++active);
+      try { entered.resolve(); await release.promise; return await operation(); }
+      finally { active--; }
+    }, ...args));
+    f.advance(1_000);
+    const first = f.side.renewMirroredLeases([f.host(13_000)], f.now());
+    await entered.promise;
+    const ticks: Promise<void>[] = [];
+    try {
+      for (let tick = 0; tick < 4; tick++) {
+        f.advance(1_000);
+        ticks.push(f.side.renewMirroredLeases([f.host(13_000)], f.now()));
+        expect(f.routing()).toBe("live");
+      }
+      release.resolve();
+      await Promise.all([first, ...ticks]);
+      expect({ starts, maximum, active }).toEqual({ starts: 1, maximum: 1, active: 0 });
+      f.advance(3_000); // Past the original 7 s expiry, but before the confirmed renewal's deadline.
+      expect(f.routing()).toBe("live");
+      expect(f.side.holds(ROOT)).toBe(true);
+    } finally { release.resolve(); await Promise.allSettled([first, ...ticks]); }
+  });
+
+  it("a full mirror waits for the active watch renewal before taking the same host custody", async () => {
+    const f = await fixture();
+    const entered = barrier(), release = barrier();
+    const custody = f.store.leaseCustody.bind(f.store);
+    let held = false, overlapping = 0;
+    vi.spyOn(f.store, "leaseCustody").mockImplementation((file, operation, ...args) => {
+      if (file !== hostLeasePath(f.store.root, ROOT)) return custody(file, operation, ...args);
+      if (held) overlapping++;
+      return custody(file, async () => {
+        held = true;
+        try { entered.resolve(); await release.promise; return await operation(); }
+        finally { held = false; }
+      }, ...args);
+    });
+    f.advance(1_000);
+    const renewing = f.side.renewMirroredLeases([f.host(13_000)], f.now());
+    await entered.promise;
+    f.advance(1_000);
+    let settled = false;
+    const mirroring = f.side.mirror({ hosts: [f.host(13_000)], participants: [] }, f.now())
+      .finally(() => { settled = true; });
+    void mirroring.catch(() => undefined);
+    try {
+      await turn();
+      expect(overlapping).toBe(0);
+      expect(settled).toBe(false);
+      f.advance(3_000);
+      expect(f.routing()).toBe("live");
+      release.resolve();
+      await renewing;
+      await mirroring;
+      f.advance(3_000);
+      expect(f.routing()).toBe("live");
+    } finally { release.resolve(); await Promise.allSettled([renewing, mirroring]); }
+  });
+
+  it("defers rather than queues a watch tick while a full mirror holds custody", async () => {
+    const f = await fixture();
+    const entered = barrier(), release = barrier();
+    const write = f.store.writeBatch.bind(f.store);
+    vi.spyOn(f.store, "writeBatch").mockImplementation(async (...args) => {
+      entered.resolve(); await release.promise; return write(...args);
+    });
+    f.advance(1_000);
+    const mirroring = f.side.mirror({ hosts: [f.host(13_000)], participants: [] }, f.now());
+    await entered.promise;
+    try {
+      const custody = vi.spyOn(f.store, "leaseCustody");
+      await expect(f.side.renewMirroredLeases([f.host(13_000)], f.now())).rejects.toBeInstanceOf(BridgeMirrorDeferredError);
+      expect(custody).not.toHaveBeenCalled();
+    } finally { release.resolve(); await mirroring; }
+  });
+
+  it("retries a deferred NATS watch renewal before expiry without another watch event", async () => {
+    const f = await fixture();
+    vi.useFakeTimers({ now: f.now(), toFake: ["Date", "setTimeout", "clearTimeout"] });
+    const port: BridgeNatsPort = new FakePort();
+    let changed!: () => void;
+    vi.spyOn(port, "watchPresence").mockImplementation(listener => { changed = listener; return () => undefined; });
+    vi.spyOn(port, "presence").mockImplementation(async () => ({ hosts: [f.host(13_000)], participants: [], reserved: [] }));
+    const logs: string[] = [], failures: Error[] = [];
+    const carrier = new NatsCarrierSide({ cursorPath: path.join(f.store.root, "cursor.json"), port, file: f.side, link: LINK,
+      ledger: new MemoryLedger(), authorize: () => ({ ok: true, principal: "carry" }),
+      authorizeTopic: () => ({ ok: true, principal: "none" }), now: f.now, log: line => logs.push(line) });
+    const stop = carrier.subscribeChanges(() => undefined, error => failures.push(error));
+    const custody = vi.spyOn(f.store, "leaseCustody");
+    custody.mockRejectedValueOnce(new MeshLockTimeoutError(" test renewal gate", 1, 0));
+    try {
+      f.advance(5_000);
+      changed();
+      await turn();
+      expect(logs.some(line => line.startsWith("NATS file mirror renewal deferred:"))).toBe(true);
+      expect(f.lease().mirror?.observedAt).toBe(f.now() - 5_000);
+      f.advance(999);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(custody).toHaveBeenCalledTimes(1);
+      expect(f.routing()).toBe("live");
+      f.advance(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await turn();
+      expect(f.lease().mirror?.observedAt).toBe(f.now());
+      expect(f.lease().expiresAt).toBe(f.now() + 13_000);
+      f.advance(2_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(f.routing()).toBe("live");
+      expect(failures).toEqual([]);
+    } finally { stop(); await carrier.fence(); carrier.close(); await turn(); }
   });
 
   it("does not renew after a fence, including a renewal queued just before the fence", async () => {

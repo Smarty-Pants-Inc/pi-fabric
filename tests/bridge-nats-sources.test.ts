@@ -5,7 +5,7 @@ import { JetStreamApiError, AckPolicy, DeliverPolicy, ReplayPolicy } from "@nats
 import { describe, expect, it, vi } from "vitest";
 import { natsBridgeInboxSource } from "../src/mesh/bridge-nats-port.js";
 import { natsBridgeEventSource } from "../src/mesh/bridge-nats-events.js";
-import type { NatsConnectionHandle } from "../src/transport/nats/connection.js";
+import type { NatsConnectionHandle, NatsStatusListener } from "../src/transport/nats/connection.js";
 import { hashToken } from "../src/transport/nats/subjects.js";
 
 const notFound = (): JetStreamApiError => new JetStreamApiError({ code: 404, err_code: 10014, description: "consumer not found" });
@@ -18,6 +18,8 @@ interface Fake {
   snapshot(durable: string): { config: Record<string, unknown>; state?: Record<string, unknown> } | undefined;
   push(message: unknown): void;
   end(): void;
+  status(type: "disconnect" | "reconnect"): void;
+  readonly statusListeners: number;
   verified: boolean;
 }
 
@@ -35,30 +37,36 @@ function fakeConnection(existing?: Record<string, unknown>, existingState?: Reco
       const state = states.get(durable);
       return config ? { config, ...(state ? { state } : {}) } : undefined;
     } } as unknown as Fake;
-  let callback: ((message: unknown) => void) | undefined;
-  const queue: unknown[] = [];
-  let wake: (() => void) | undefined;
-  let ended = false;
-  let resolveClosed!: (error: Error | void) => void;
-  const closed = new Promise<Error | void>(resolve => { resolveClosed = resolve; });
-  fake.push = message => { if (callback) callback(message); else { queue.push(message); wake?.(); } };
-  fake.end = () => { ended = true; wake?.(); resolveClosed(); };
-  const messages = {
-    async close() { fake.end(); },
-    closed: () => closed,
-    status: () => ({ async *[Symbol.asyncIterator]() { await closed; } }),
-    async *[Symbol.asyncIterator]() {
-      for (;;) {
-        const next = queue.shift();
-        if (next !== undefined) { yield next; continue; }
-        if (ended) return;
-        await new Promise<void>(resolve => { wake = resolve; });
-        wake = undefined;
-      }
-    },
+  const listeners = new Set<NatsStatusListener>();
+  fake.status = type => { for (const listener of listeners) listener({ type, server: "test:4222" }); };
+  Object.defineProperty(fake, "statusListeners", { get: () => listeners.size });
+  const messages = (callback?: (message: unknown) => void) => {
+    const queue: unknown[] = [];
+    let wake: (() => void) | undefined;
+    let ended = false;
+    let resolveClosed!: (error: Error | void) => void;
+    const closed = new Promise<Error | void>(resolve => { resolveClosed = resolve; });
+    fake.push = message => { if (callback) callback(message); else { queue.push(message); wake?.(); } };
+    const end = (): void => { ended = true; wake?.(); resolveClosed(); };
+    fake.end = end;
+    return {
+      async close() { end(); },
+      closed: () => closed,
+      status: () => ({ async *[Symbol.asyncIterator]() { await closed; } }),
+      async *[Symbol.asyncIterator]() {
+        for (;;) {
+          const next = queue.shift();
+          if (next !== undefined) { yield next; continue; }
+          if (ended) return;
+          await new Promise<void>(resolve => { wake = resolve; });
+          wake = undefined;
+        }
+      },
+    };
   };
   fake.connection = {
     isVerified: () => fake.verified,
+    onStatus: (listener: NatsStatusListener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     manager: { consumers: {
       async info(stream: string, durable: string) {
         const config = consumers.get(durable);
@@ -84,8 +92,7 @@ function fakeConnection(existing?: Record<string, unknown>, existingState?: Reco
       async get(stream: string, durable: string) {
         fake.gets.push({ stream, durable });
         return { async consume(options: { callback?: (message: unknown) => void }) {
-          callback = options.callback;
-          return messages;
+          return messages(options.callback);
         } };
       },
     } },
@@ -132,6 +139,42 @@ describe("natsBridgeInboxSource", () => {
     expect((await first).value).toEqual({ id: "m1" });
     abort.abort();
     expect((await iterator.next()).done).toBe(true);
+  });
+
+  // Keep: a native reconnect resets its pull before USER.INFO passes, then silently backs off.
+  it("reopens a silent inbox after verified reconnect, retaining its durable and disposing status listeners", async () => {
+    const durable = `br_${hashToken("bridge:v2")}`;
+    const config = validBridgeInboxConsumerConfig({ inactive_threshold: 604_800_000_000_000 });
+    const cursor = { delivered: { consumer_seq: 23, stream_seq: 81 }, ack_floor: { consumer_seq: 19, stream_seq: 76 } };
+    const fake = fakeConnection(config, cursor);
+    const abort = new AbortController();
+    const iterator = natsBridgeInboxSource(fake.connection, { machine: "ryzen1-bridge", link: "v2" })
+      .consume(abort.signal)[Symbol.asyncIterator]();
+    let pending = iterator.next();
+    try {
+      await vi.waitFor(() => expect(fake.gets).toHaveLength(1), { timeout: 5_000 });
+      for (let generation = 1; generation <= 2; generation++) {
+        fake.verified = false;
+        fake.status("disconnect");
+        fake.push({ id: "replayed-before-USER.INFO" });
+        // No messages or consumer statuses arrive on the old iterator, even after verification.
+        fake.verified = true;
+        fake.status("reconnect");
+        await vi.waitFor(() => expect(fake.gets).toHaveLength(generation + 1), { timeout: 2_000 });
+        expect(fake.statusListeners).toBe(1);
+        fake.push({ id: `verified-${generation}` });
+        expect((await pending).value).toEqual({ id: `verified-${generation}` });
+        pending = iterator.next();
+      }
+      expect(fake.added).toEqual([]);
+      expect(fake.updated).toEqual([]);
+      expect(fake.snapshot(durable)).toEqual({ config, state: cursor });
+    } finally {
+      abort.abort();
+      await pending;
+      await iterator.return?.();
+    }
+    expect(fake.statusListeners).toBe(0);
   });
 
   it("heals a compatible legacy durable in place without resetting its cursor or unrelated config", async () => {

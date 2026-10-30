@@ -45,6 +45,8 @@ import { isMeshRetryableBusy } from "./state-backend.js";
  */
 
 const FILE_PRESENCE_TTL_MS = 1_000;
+/** Retry only deferred watch renewals, well inside the 15 s mirror/source lease window. */
+const FILE_MIRROR_RETRY_MS = 1_000;
 const RESEND_ATTEMPTS = 3;
 const RESEND_DELAY_MS = 250;
 /** JetStream redelivers an in-hand message after its ack wait; extend well inside the shortest one. */
@@ -293,6 +295,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
   #lastMirror: { hosts: BridgePresence["hosts"]; participants: BridgePresence["participants"] } | undefined;
   #fileRenewal: Promise<void> | undefined;
   #fileRenewalPending = false;
+  #fileRenewalRetry: ReturnType<typeof setTimeout> | undefined;
   #fenced = false;
 
   constructor(options: NatsCarrierSideOptions) {
@@ -432,6 +435,11 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     return () => {
       this.#listeners.delete(listener);
       unwatch();
+      if (this.#listeners.size === 0) {
+        clearTimeout(this.#fileRenewalRetry);
+        this.#fileRenewalRetry = undefined;
+        this.#fileRenewalPending = false;
+      }
     };
   }
 
@@ -439,7 +447,7 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
    * drain. Coalesce bursts, but resample after changes during a write. Never restamp a cached
    * snapshot or change membership here: only the ordinary full sync installs/removes owners. */
   #renewFileMirror(): void {
-    if (this.#fileRenewal || this.#fenced || this.#listeners.size === 0) return;
+    if (this.#fileRenewal || this.#fileRenewalRetry || this.#fenced || this.#listeners.size === 0) return;
     this.#fileRenewal = (async () => {
       while (this.#fileRenewalPending && !this.#fenced && this.#listeners.size > 0) {
         this.#fileRenewalPending = false;
@@ -454,8 +462,14 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
     })().catch(error => {
       if (this.#fenced || this.#listeners.size === 0) return;
       if (error instanceof BridgeMirrorDeferredError || isMeshRetryableBusy(error)) {
-        // No new authority on failure. The normal sync and the next KV update may retry.
+        // Retry from a fresh source sample, not cached authority or a full watch interval.
         this.#log(`NATS file mirror renewal deferred: ${message(error)}`);
+        this.#fileRenewalRetry = setTimeout(() => {
+          this.#fileRenewalRetry = undefined;
+          this.#fileRenewalPending = true;
+          this.#renewFileMirror();
+        }, FILE_MIRROR_RETRY_MS);
+        this.#fileRenewalRetry.unref?.();
       } else {
         const failure = error instanceof Error ? error : new Error(message(error));
         for (const listener of this.#listeners) listener.failed(failure);
@@ -504,6 +518,8 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
 
   async fence(): Promise<void> {
     this.#fenced = true;
+    clearTimeout(this.#fileRenewalRetry);
+    this.#fileRenewalRetry = undefined;
     await this.#fileRenewal;
     await this.port.fence();
   }
@@ -514,6 +530,8 @@ export class NatsCarrierSide implements NatsCarrierSideContract {
 
   close(_error?: Error): void {
     this.#fenced = true;
+    clearTimeout(this.#fileRenewalRetry);
+    this.#fileRenewalRetry = undefined;
     this.#abort.abort();
     clearInterval(this.#working);
     this.#room?.();

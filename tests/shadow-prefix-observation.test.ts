@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeMeshStateMovedMarker } from "../src/mesh/backend-fence.js";
 import { MeshShadowNotReconciledError, ShadowStateBackend, STATE_BACKEND_FACTORIES,
   type DeepReadonly, type MeshBatchOperation, type MeshStateEntry, type PrefixObservation,
-  type PrefixWitness } from "../src/mesh/state-backend.js";
+  type PrefixWitness, type StateBackend } from "../src/mesh/state-backend.js";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
 
 // Keep reason: data safety and the FILE/mirror/backend/facade witness trust boundaries (#17515).
@@ -154,7 +154,8 @@ const forbidMirrorUse = (backend: ShadowStateBackend): void => {
   vi.spyOn(backend.shadow, "stateToken").mockImplementation(fail);
   vi.spyOn(backend.shadow, "stateStamp").mockImplementation(fail);
   vi.spyOn(backend.shadow, "cachedStateStamp").mockImplementation(fail);
-  vi.spyOn(backend.shadow, "observePrefix").mockImplementation(fail);
+  const mirror: StateBackend = backend.shadow;
+  if (typeof mirror.observePrefix === "function") vi.spyOn(mirror, "observePrefix").mockImplementation(fail);
   vi.spyOn(backend.shadow, "writeBatch").mockImplementation(fail);
   vi.spyOn(backend.shadow, "confirmWritable").mockImplementation(fail);
   vi.spyOn(backend, "verify").mockImplementation(fail);
@@ -175,6 +176,33 @@ afterEach(async () => {
 });
 
 describe("Shadow prefix observation: FILE authority", () => {
+  it.each(["absent", "present"] as const)("keeps FILE authoritative with the optional mirror observer %s", async mode => {
+    const { store, backend, expected } = await fixture();
+    const mirror: StateBackend = backend.shadow;
+    const original = Object.getOwnPropertyDescriptor(mirror, "observePrefix");
+    Object.defineProperty(mirror, "observePrefix", { configurable: true, writable: true,
+      value: mode === "present" ? (): never => { throw new Error("unguarded optional mirror observation"); } : undefined });
+    try {
+      if (mode === "absent") expect(mirror.observePrefix).toBeUndefined();
+      else expect(typeof mirror.observePrefix).toBe("function");
+      forbidMirrorUse(backend);
+      if (mode === "present") {
+        const observeMirror = vi.mocked(mirror.observePrefix!);
+        expect(() => observeMirror(PREFIX)).toThrow("prefix observation consulted or drove the non-authoritative mirror");
+        observeMirror.mockClear();
+      }
+      const first = snapshot(store.observePrefix(PREFIX));
+      expect(first.entries).toEqual(expected);
+      unchanged(store.observePrefix(PREFIX, first.witness));
+      if (mode === "present") expect(mirror.observePrefix).not.toHaveBeenCalled();
+    } finally {
+      // Restore the spy before removing the test-only method; afterEach must not retain it.
+      vi.restoreAllMocks();
+      if (original) Object.defineProperty(mirror, "observePrefix", original);
+      else delete mirror.observePrefix;
+    }
+  });
+
   it("cold-selects all 387 full own/foreign rows in localeCompare order before any mirror reconcile", async () => {
     const { store, backend, expected } = await fixture(387);
     expect(backend.shadow.listAll("")).toEqual([]);
@@ -548,7 +576,7 @@ describe("Shadow prefix observation: exact backend and facade lifetimes", () => 
     // wrapper's capacity, not whether FILE can prove every arbitrary namespace efficiently.
     const observeFile = vi.spyOn(backend.file, "observePrefix");
     for (let index = 0; index < 32; index += 1) {
-      observeFile.mockReturnValueOnce({ kind: "snapshot", witness: {}, entries: Object.freeze([]) });
+      observeFile.mockReturnValueOnce({ kind: "snapshot", witness: Object.freeze({}), entries: Object.freeze([]) });
       snapshot(backend.observePrefix(`config/evict-${index}/`));
     }
     expect(snapshot(backend.observePrefix(PREFIX, first.witness)).entries).toEqual(expected);

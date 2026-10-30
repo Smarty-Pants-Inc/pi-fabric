@@ -331,7 +331,8 @@ describe("NatsCarrierSide under MeshBridge", () => {
       const domain = fs.existsSync(legacy) ? legacy : path.join(store.root, "host-lease-commits", hash.slice(0, 16));
       const lock = path.join(domain, MESH_CUSTODY_LOCK_NAME);
       fs.mkdirSync(domain, { recursive: true, mode: 0o700 });
-      fs.mkdirSync(lock, { mode: 0o700 });
+      // The renewal loop retries on a bounded backoff, so plant the ownerless directory once and keep it.
+      if (!fs.existsSync(lock)) fs.mkdirSync(lock, { mode: 0o700 });
       attemptedLocks.push(lock);
       return actualLeaseCustody(file, operation, timeoutMs, options);
     }) as typeof store.leaseCustody);

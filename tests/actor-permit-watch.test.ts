@@ -24,6 +24,7 @@ const deletionCalls: string[] = [];
 const fixtures: Fixture[] = [];
 const fixtureRoots: string[] = [];
 const workers = new Map<number, Worker>();
+const pendingStopJoins: Array<() => void> = [];
 const claimedGonePid = 899_999_999;
 let nextPid = 900_000_000;
 let closing = false;
@@ -36,6 +37,7 @@ interface Worker {
   identityAlive?: boolean;
   birth?: string;
   probeError?: string;
+  livenessError?: string;
   descendants: boolean;
   debt?: string;
   record: AgentRunRecord;
@@ -127,7 +129,14 @@ beforeEach(() => {
         if (worker.alive || worker.descendants || worker.debt) throw new Error("Native custody still open");
         worker.closeJoined = true;
       },
-      isAlive: async () => !worker.contactLost && (worker.alive || worker.descendants),
+      isAlive: async () => {
+        if (worker.livenessError) {
+          const error = worker.livenessError;
+          delete worker.livenessError;
+          throw new Error(error);
+        }
+        return !worker.contactLost && (worker.alive || worker.descendants);
+      },
       stop: async () => {
         if (worker.alive || worker.descendants || worker.debt) throw new Error("Owned tree exit unconfirmed");
         await closed;
@@ -138,6 +147,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  for (const release of pendingStopJoins.splice(0)) release();
   closing = true;
   for (const worker of workers.values()) complete(worker);
   // Keep deletion probes installed until every manager has relinquished custody.
@@ -150,6 +160,12 @@ afterEach(async () => {
     await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
     await f.actors.close();
     await f.agents.close();
+    const sink = process.env.FABRIC_ACTOR_PERMIT_TRACE_SINK;
+    if (sink) {
+      const destination = path.join(sink, path.basename(f.root));
+      preserveTraces(f.root, destination);
+      fs.writeFileSync(path.join(destination, "recorded-deletions.json"), JSON.stringify(deletionCalls, null, 2), { flag: "wx" });
+    }
   }
   fixtures.length = 0;
   expect(deletionCalls.length).toBeGreaterThan(0);
@@ -157,15 +173,31 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-function fixture(): Fixture {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "actor-permit-watch-"));
+// Keep product operations inside the test's guarded TMPDIR. Export traces with
+// exclusive new-file writes only: no destination replacement/deletion, no links
+// followed, and no temporary-wrapper cleanup can remove this caller-owned sink.
+function preserveTraces(source: string, destination: string): void {
+  fs.mkdirSync(destination);
+  for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+    const from = path.join(source, entry.name), to = path.join(destination, entry.name);
+    if (entry.isDirectory()) preserveTraces(from, to);
+    else if (entry.isFile()) fs.writeFileSync(to, fs.readFileSync(from), { flag: "wx" });
+    else if (entry.isSymbolicLink()) fs.writeFileSync(`${to}.symlink-target`, fs.readlinkSync(from), { flag: "wx" });
+    else throw new Error(`Unexpected fixture trace type: ${from}`);
+  }
+}
+
+function fixture(onSettled?: (result: AgentRunRecord) => void): Fixture {
+  // Windows temp paths can use a short-name/junction spelling; the managers
+  // and deletion recorder use real paths, so keep the fixture in that namespace.
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "actor-permit-watch-")));
   fixtureRoots.push(root); // Constructors can release metadata locks before fixture() returns.
   const admission = path.join(root, "actors", "admission.json");
   const agents = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents,
     enabled: true, runner: "pi", transport: "process", maxConcurrent: 1, budgetUsd: 0,
     deniedModels: [], timeoutMs: 24 * 60 * 60_000, retainRuns: true, sessionExport: false }, {
     workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: path.join(root, "runs"),
-    meshRoot: path.join(root, "mesh"), admissionSnapshotPath: admission,
+    meshRoot: path.join(root, "mesh"), admissionSnapshotPath: admission, ...(onSettled ? { onSettled } : {}),
   });
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
   const identity: MeshIdentity = { id: "session:permit-test", name: "main", kind: "main", sessionId: "permit-test" };
@@ -200,9 +232,24 @@ function complete(worker: Worker) {
   delete worker.debt;
   delete worker.contactLost;
   delete worker.probeError;
+  delete worker.livenessError;
   worker.nativeClose();
   save(worker, { status: "completed", text: "finished", finishedAt: Date.now(), updatedAt: Date.now(), exitCode: 0 });
 }
+// Windows normally publishes a terminal actor result BEFORE waitForClose, so a
+// saved terminal file cannot induce the POSIX pre-publication stop failure. Fail
+// the running monitor's native liveness await instead, BEFORE saving terminal:
+// its real catch must arm the same recovery owner. Keep waitForClose, closed,
+// host PID proof and whole-tree liveness intact; do not pretend Windows is Linux.
+// POSIX retains the failed-stop reproducer (also covered by the native suite).
+async function failRunningMonitorOnWindows(worker: Worker, alreadyClosed = false): Promise<number> {
+  if (process.platform !== "win32") return 1; // Expected checked stops before recovery.
+  worker.livenessError = "recorded native liveness observation failed";
+  if (alreadyClosed) worker.nativeClose();
+  await eventually(() => expect(fs.existsSync(path.join(path.dirname(worker.statusFile), "unresolved-worker.json"))).toBe(true));
+  return 0; // The failed monitor/recovery owner must never stop the worker.
+}
+
 // Durable activation evidence, not an inference from permit counters: releasing
 // RUN must not acknowledge or restart the actor's still-owned native-session turn.
 const queueEvidence = (f: Fixture, actorId: string) => {
@@ -452,7 +499,192 @@ async function reconciledExactlyOnce(
 }
 
 describe("actor worker permit release (#9031)", () => {
+  it.each(["later-close", "already-closed", "historical-debt", "save-failure"] as const)(
+    "settles the exact saved actor outcome after a failed monitor, with FIFO and once-only delivery (%s)", async mode => {
+      const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
+      const stops: number[] = [];
+      vi.mocked(ProcessTransport.prototype.launch).mockImplementation(async request => {
+        const handle = await launch(request);
+        const worker = workers.get(Number(handle.sessionId))!;
+        return { ...handle, stop: async () => {
+          stops.push(worker.pid);
+          // Fulfill close BEFORE the stop rejects and the recovery owner arms.
+          // It must inspect an already-fired receipt, not depend on a new event.
+          if (mode === "already-closed") worker.nativeClose();
+          return handle.stop();
+        } };
+      });
+      const delivered: AgentRunRecord[] = [];
+      const f = fixture(result => { delivered.push(structuredClone(result)); });
+      const actor = await create(f, `saved-after-monitor-${mode}`);
+      await f.actors.tell(actor.id, "FIFO event 0");
+      const first = await launched(f, actor.id);
+      const answer = f.agents.wait(first.launch.id);
+      await f.actors.tell(actor.id, "FIFO event 1");
+      await f.actors.tell(actor.id, "FIFO event 2");
+      await eventually(() => expect(f.actors.status(actor.id).queued).toBe(2));
+      const before = queueEvidence(f, actor.id);
+      const saved = { status: "completed" as const, text: "the real saved answer", value: { exact: [7, "kept"] },
+        warnings: ["worker saved completion after slow child exit"], exitCode: null, turns: 4, toolCalls: 2,
+        finishedAt: Date.now(), updatedAt: Date.now() };
+      // POSIX fails one checked terminal stop; Windows fails a running native
+      // observation before its early-publication path can consume the result.
+      // Recovery must not issue a destructive stop in either case.
+      const checkedStops = await failRunningMonitorOnWindows(first, mode === "already-closed");
+      save(first, saved);
+      await eventually(() => expect(stops.filter(pid => pid === first.pid)).toHaveLength(checkedStops));
+      const resultFile = path.join(path.dirname(first.statusFile), "manager-result.json");
+      const unresolved = path.join(path.dirname(first.statusFile), "unresolved-worker.json");
+      await eventually(() => expect(fs.existsSync(unresolved)).toBe(true));
+      await observe();
+      expect(stops.filter(pid => pid === first.pid)).toHaveLength(checkedStops);
+      expect(fs.existsSync(resultFile)).toBe(false);
+      expect(delivered).toEqual([]);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+
+      first.alive = false;
+      first.descendants = true;
+      if (mode === "historical-debt") first.debt = "immutable historical native stop debt";
+      await observe();
+      expect(first.descendants, "recovery cannot kill a surviving descendant").toBe(true);
+      expect(stops.filter(pid => pid === first.pid)).toHaveLength(checkedStops);
+      expect(fs.existsSync(resultFile)).toBe(false);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+      expect(workers.size).toBe(1);
+
+      let failSave = mode === "save-failure";
+      const open = fs.openSync;
+      const saveAttempts: string[] = [];
+      const resultParent = fs.realpathSync(path.dirname(resultFile));
+      const writes = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
+        // Atomic publication may use the canonical run-root spelling (Windows
+        // short names/junctions, or POSIX symlinks). Match the exact file family
+        // in the same real parent, not a raw path prefix or another run's write.
+        if (typeof file === "string" && path.basename(file).startsWith(`${path.basename(resultFile)}.`) &&
+            file.endsWith(".tmp") && path.relative(resultParent, fs.realpathSync(path.dirname(file))) === "") {
+          saveAttempts.push(file);
+          if (failSave) {
+            failSave = false;
+            // Keep the retry at an unknown identity boundary until the test has
+            // inspected custody after exactly ONE failed durable write.
+            first.probeError = "EIO";
+            throw new Error("injected manager-result write failure");
+          }
+        }
+        return open(file, flags, mode);
+      });
+      try {
+        first.descendants = false;
+        first.nativeClose();
+        if (mode === "save-failure") {
+          await eventually(() => expect(saveAttempts.length).toBeGreaterThan(0));
+          expect(fs.existsSync(resultFile)).toBe(false);
+          expect(delivered).toEqual([]);
+          expect(queueEvidence(f, actor.id)).toEqual(before);
+          expect(f.actors.status(actor.id).inFlightRun?.id).toBe(first.launch.id);
+          expect(workers.size).toBe(1);
+          expect(saveAttempts).toHaveLength(1);
+          delete first.probeError;
+        }
+        await expect(answer).resolves.toMatchObject(saved);
+        expect(JSON.parse(fs.readFileSync(resultFile, "utf8"))).toMatchObject(saved);
+        expect(delivered.filter(result => result.id === first.launch.id)).toHaveLength(1);
+        expect(delivered.find(result => result.id === first.launch.id)).toMatchObject(saved);
+        expect(JSON.parse(fs.readFileSync(first.statusFile, "utf8"))).toMatchObject(saved);
+        expect(stops.filter(pid => pid === first.pid)).toHaveLength(checkedStops);
+        if (mode === "historical-debt") {
+          expect(first.debt).toBe("immutable historical native stop debt");
+          expect(fs.existsSync(unresolved)).toBe(true);
+          expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+          expect(deletionCalls).not.toContain(unresolved);
+        }
+        let previousId = first.launch.id;
+        for (let index = 1; index <= 2; index++) {
+          await eventually(() => {
+            const inFlight = f.actors.status(actor.id).inFlightRun?.id;
+            expect(inFlight).toBeDefined();
+            expect(inFlight).not.toBe(previousId);
+          });
+          const next = await launched(f, actor.id);
+          previousId = next.launch.id;
+          expect(next.launch.id).not.toBe(first.launch.id);
+          expect(next.record.task).toContain(`FIFO event ${index}`);
+          expect(workers.size).toBe(index + 1);
+          first.nativeClose(); first.nativeClose();
+          const nextAnswer = f.agents.wait(next.launch.id);
+          complete(next);
+          await expect(nextAnswer).resolves.toMatchObject({ text: "finished" });
+        }
+        await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
+        expect(delivered.map(result => result.id)).toEqual([...workers.values()].map(worker => worker.launch.id));
+        expect(f.actors.status(actor.id).queued).toBe(0);
+      } finally { failSave = false; delete first.probeError; writes.mockRestore(); }
+    }, 20_000,
+  );
+
+  it.each(["rejected-close", "unknown-tree", "pending-close"] as const)(
+    "failed-monitor recovery refuses saved completion without current native proof (%s)", async mode => {
+      const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
+      const close = joinGate();
+      let unknownTree = false;
+      let restoreClosed = () => {};
+      let firstId: string | undefined;
+      const stops: number[] = [];
+      vi.mocked(ProcessTransport.prototype.launch).mockImplementation(async request => {
+        const handle = await launch(request);
+        firstId ??= request.id;
+        if (request.id !== firstId) return handle;
+        const worker = workers.get(Number(handle.sessionId))!;
+        const transport = { ...handle, ...(mode !== "unknown-tree" ? { closed: close.promise } : {}),
+          isAlive: async () => {
+            if (unknownTree) throw new Error("whole execution probe unknown");
+            return handle.isAlive();
+          },
+          stop: async () => { stops.push(worker.pid); return handle.stop(); },
+        };
+        restoreClosed = () => { transport.closed = handle.closed!; };
+        return transport;
+      });
+      const f = fixture();
+      const actor = await create(f, `unproven-native-${mode}`);
+      await f.actors.tell(actor.id, "saved answer cannot discharge unknown native custody");
+      const first = await launched(f, actor.id);
+      await f.actors.tell(actor.id, "successor must remain queued");
+      const before = queueEvidence(f, actor.id);
+      const checkedStops = await failRunningMonitorOnWindows(first);
+      save(first, { status: "completed", text: "saved but not publishable", finishedAt: Date.now(), updatedAt: Date.now() });
+      await eventually(() => expect(stops.filter(pid => pid === first.pid)).toHaveLength(checkedStops));
+      let resolved = false;
+      const waiting = f.agents.wait(first.launch.id).then(result => { resolved = true; return result; });
+      first.alive = false;
+      first.nativeClose();
+      if (mode === "rejected-close") close.reject(new Error("captured native close rejected"));
+      if (mode === "unknown-tree") unknownTree = true;
+      try {
+        await observe();
+        expect(resolved).toBe(false);
+        expect(fs.existsSync(path.join(path.dirname(first.statusFile), "manager-result.json"))).toBe(false);
+        expect(queueEvidence(f, actor.id)).toEqual(before);
+        expect(stops.filter(pid => pid === first.pid)).toHaveLength(checkedStops);
+        expect(workers.size).toBe(1);
+      } finally {
+        unknownTree = false;
+        close.resolve();
+        // Only fixture teardown replaces the failed proof seam with the
+        // original fulfilled receipt; production cannot repair rejected close.
+        restoreClosed();
+        await waiting;
+      }
+    }, 15_000,
+  );
+
   it.each(["absent", "reused"] as const)("host-proven %s worker releases real admission and launches the next activation", async mode => {
+    if (process.platform !== "linux") {
+      // Production processStartTime has no birth proof off Linux. Do not give
+      // Windows a fabricated /proc birth just to make PID reuse prove death.
+      const birth = vi.mocked(processIdentity.processStartTime).getMockImplementation()!;
+      vi.mocked(processIdentity.processStartTime).mockImplementation(pid => workers.has(pid) ? undefined : birth(pid));
+    }
     const f = fixture();
     const actor = await create(f, "permit-owner");
     await f.actors.tell(actor.id, "lost event");
@@ -463,8 +695,22 @@ describe("actor worker permit release (#9031)", () => {
     expect(workers.size).toBe(1);
     // A worker-writable live PID cannot override the host's launch identity.
     save(first, { sessionId: String(process.pid) });
+    if (mode === "reused") {
+      first.identityAlive = true;
+      first.birth = "67890";
+      if (process.platform !== "linux") {
+        // A live numeric PID + unreadable birth cannot prove the old worker
+        // gone. Keep native custody open too: neither a changed fake birth nor
+        // the worker-written sessionId may release RUN or launch a successor.
+        await observe();
+        expect(f.agents.workerIdentity(first.launch.id)?.startTime).toBeUndefined();
+        expect(f.agents.status(first.launch.id).status).toBe("running");
+        expect(snapshot(f).held.map(held => held.runId)).toEqual([first.launch.id]);
+        expect(workers.size).toBe(1);
+        first.identityAlive = false; // ESRCH supplies the supported host proof.
+      }
+    }
     first.alive = false;
-    if (mode === "reused") { first.identityAlive = true; first.birth = "67890"; }
     first.nativeClose(); // Independently checked whole-tree/native exit, not just leader absence.
     await eventually(() => expect(f.agents.status(first.launch.id).status).toBe("failed"));
     let second!: Worker;
@@ -652,13 +898,24 @@ describe("actor worker permit release (#9031)", () => {
   it.each(["active", "abandoned", "stopped"] as const)("primary death releases only RUN while a live descendant keeps wait and the same-session drain fenced (%s actor)", async mode => {
     const launch = vi.mocked(ProcessTransport.prototype.launch).getMockImplementation()!;
     const stops: number[] = [];
+    let stopJoinReleased = false;
+    let releaseStopJoin!: () => void;
+    const stopJoin = new Promise<void>(resolve => {
+      releaseStopJoin = () => {
+        if (stopJoinReleased) return;
+        stopJoinReleased = true;
+        resolve();
+      };
+    });
+    if (mode === "stopped") pendingStopJoins.push(() => releaseStopJoin());
     vi.mocked(ProcessTransport.prototype.launch).mockImplementation(async request => {
       const handle = await launch(request);
       const worker = workers.get(Number(handle.sessionId))!;
       return { ...handle, stop: async () => {
         stops.push(worker.pid);
-        // A real owned-tree stop can kill a descendant. Record that destructive
-        // effect instead of having the fake throw and hide premature draining.
+        if (mode === "stopped") await stopJoin;
+        // Record the destructive effect of the owned-tree stop only when its
+        // controlled join is released; the other modes must never stop it.
         worker.descendants = false;
         worker.nativeClose();
         await handle.stop();
@@ -672,8 +929,11 @@ describe("actor worker permit release (#9031)", () => {
     if (mode === "stopped") {
       save(first, { turns: 3, toolCalls: 1, updatedAt: Date.now() });
       await eventually(() => expect(f.agents.status(first.launch.id)).toMatchObject({ toolCalls: 1 }));
-      await f.actors.stop(actor.id); // Abandons the progressed run, without stopping its writer.
+      first.descendants = true;
+      await f.actors.stop(actor.id); // Explicitly stops the progressed run; its native join is held below.
       expect(f.actors.status(actor.id)).toMatchObject({ status: "stopped", inFlightRun: { id: first.launch.id } });
+      await eventually(() => expect(stops).toEqual([first.pid]));
+      expect(stopJoinReleased).toBe(false);
     }
     const before = queueEvidence(f, actor.id);
     let settled = false;
@@ -683,38 +943,83 @@ describe("actor worker permit release (#9031)", () => {
     first.descendants = true;
     first.alive = false;
     first.nativeClose(); // Primary close is not the native-tree exit receipt.
-    const second = await launched(f, next.actor.id);
-    await observe();
-    expect(stops).not.toContain(first.pid);
-    expect(first.descendants).toBe(true);
-    expect(settled).toBe(false);
-    expect(f.agents.status(first.launch.id).status).toBe("running");
-    expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
-    expect(f.actors.status(actor.id).inFlightRun?.id).toBe(first.launch.id);
-    expect(queueEvidence(f, actor.id)).toEqual(before);
-    expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
-    expect(workers.size).toBe(2);
 
-    first.descendants = false; // The writer exits naturally; no manager stop drove it.
-    await expect(result).resolves.toMatchObject({ status: "failed", error: expect.stringContaining("Actor worker is proven gone") });
-    const finalActor = mode === "stopped" ? await create(f, "after-stopped-writer") : actor;
-    let finalAnswer: ReturnType<ActorManager["ask"]> | undefined;
     if (mode === "stopped") {
+      const second = await launched(f, next.actor.id);
+      await observe();
+      expect(stops).toEqual([first.pid]);
+      expect(stopJoinReleased).toBe(false);
+      expect(first.alive).toBe(false);
+      expect(first.descendants).toBe(true);
+      expect(settled).toBe(false);
+      expect(f.agents.status(first.launch.id).status).toBe("running");
+      expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+      expect(f.actors.status(actor.id).inFlightRun?.id).toBe(first.launch.id);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+      expect(workers.size).toBe(2);
+
+      // Stopping retires this actor's FIFO; other actors may use the RUN released by primary death.
+      const finalActor = await create(f, "after-stopped-writer");
+      const finalAnswer = f.actors.ask(finalActor.id, "independent event after stopped tree join");
+      let finalSettled = false;
+      void finalAnswer.then(() => { finalSettled = true; }, () => { finalSettled = true; });
+      await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+      expect(workers.size).toBe(2);
+      complete(second);
+      await expect(next.answer).resolves.toMatchObject({ text: "finished" });
+      const independent = await launched(f, finalActor.id);
+      expect(independent.launch.id).not.toBe(first.launch.id);
+      expect(workers.size).toBe(3); // The queued independent activation follows its successor exactly once.
+      complete(independent);
+      await expect(finalAnswer).resolves.toMatchObject({ text: "finished" });
+      await observe();
+      expect(snapshot(f).held).toEqual([]);
+      expect(workers.size).toBe(3);
+      expect(stops).toEqual([first.pid]);
+      expect(stopJoinReleased).toBe(false);
+      expect(first.descendants).toBe(true);
+      expect(settled).toBe(false);
+      expect(finalSettled).toBe(true);
+      expect(f.agents.status(first.launch.id).status).toBe("running");
+      expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+      expect(f.actors.status(actor.id).inFlightRun?.id).toBe(first.launch.id);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+
+      releaseStopJoin();
+      const stoppedResult = await result;
+      expect(stoppedResult).toMatchObject({ status: "stopped", error: "Agent stopped" });
+      expect(stopJoinReleased).toBe(true);
+      expect(first.descendants).toBe(false);
+      expect(f.agents.status(first.launch.id)).toMatchObject({ status: "stopped", error: "Agent stopped" });
       await eventually(() => expect(f.actors.status(actor.id).inFlightRun).toBeUndefined());
       expect(f.actors.status(actor.id).status).toBe("stopped");
-      finalAnswer = f.actors.ask(finalActor.id, "independent event after natural tree exit");
-      void finalAnswer.catch(() => undefined);
+    } else {
+      const second = await launched(f, next.actor.id);
+      await observe();
+      expect(stops).not.toContain(first.pid);
+      expect(first.descendants).toBe(true);
+      expect(settled).toBe(false);
+      expect(f.agents.status(first.launch.id).status).toBe("running");
+      expect(f.agents.retentionCustodyVeto(first.launch.id)).toBe(true);
+      expect(f.actors.status(actor.id).inFlightRun?.id).toBe(first.launch.id);
+      expect(queueEvidence(f, actor.id)).toEqual(before);
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+      expect(workers.size).toBe(2);
+
+      first.descendants = false; // Natural loss, with no destructive manager stop.
+      await expect(result).resolves.toMatchObject({ status: "failed", error: expect.stringContaining("Actor worker is proven gone") });
+      await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
+      await observe();
+      expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
+      expect(workers.size).toBe(2); // The old run cannot release RUN twice or bypass the queued successor.
+      complete(second);
+      await expect(next.answer).resolves.toMatchObject({ text: "finished" });
+      const sameSession = await launched(f, actor.id);
+      expect(sameSession.launch.id).not.toBe(first.launch.id);
+      complete(sameSession);
     }
-    await eventually(() => expect(snapshot(f).waiting).toHaveLength(1));
-    await observe();
-    expect(snapshot(f).held.map(held => held.runId)).toEqual([second.launch.id]);
-    expect(workers.size).toBe(2); // Old settlement cannot release RUN twice.
-    complete(second);
-    await expect(next.answer).resolves.toMatchObject({ text: "finished" });
-    const sameSession = await launched(f, finalActor.id);
-    expect(sameSession.launch.id).not.toBe(first.launch.id);
-    complete(sameSession);
-    if (finalAnswer) await expect(finalAnswer).resolves.toMatchObject({ text: "finished" });
     await eventually(() => expect(f.actors.inFlightCount()).toBe(0));
     expect([...workers.values()].filter(worker => worker.record.task === first.record.task)).toHaveLength(1);
   });

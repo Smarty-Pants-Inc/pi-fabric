@@ -33,7 +33,7 @@ import { discardWorkerCompletion, type CompletionRecipient } from "./completion-
 import { processStartTime } from "../residency/process-identity.js";
 import { FABRIC_ACTOR_SELF_ENV, normalizeFabricActorActivationIdentity, type FabricActorActivationIdentity } from "../actors/activation-identity.js";
 import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
-  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, goneEnodevOutcome, savedEnodevAnswer, recoverDurableActorStop, type OwnedProcess } from "./enodev-recovery.js";
+  settleGoneEnodevLaunch, settleLostEnodevRun, ownedProcess, provenGoneEnodevLaunch, goneEnodevOutcome, savedEnodevAnswer, recoverDurableActorStop, recoverStoppedActorRun, type OwnedProcess } from "./enodev-recovery.js";
 import {
   DEFAULT_FABRIC_CONFIG,
   MAX_AGENT_TIMEOUT_MS,
@@ -884,6 +884,10 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   /** Placement terminal receipt is best-effort and scheduled at most once after proven exit. */
   placementTerminalScheduled?: boolean;
   launchCancelled?: boolean;
+  /** One passive observation owner after the normal actor monitor ends without settlement. */
+  actorSettlementObserver?: Promise<void>;
+  /** Synchronous durable publication guard: routing callbacks cannot re-enter settlement. */
+  settlementSaving?: boolean;
   /** The monitor returned so the explicit stop owns terminal publication. */
   monitorYieldedToStop?: boolean;
   /** An explicit stop drain failed while the monitor still owned publication. */
@@ -3562,6 +3566,10 @@ export class AgentManager {
             this.#failCancelledObservation(managed, error);
             return;
           }
+          // Actors retain the same-session publication fence. Do not turn a
+          // saved worker outcome into a synthetic failure when its join fails.
+          // The single passive observer below owns later native proof/save retries.
+          if (managed.actorId) return;
           // Ordinary publication and execution custody are independent: a
           // failed drain resolves wait/join without releasing native custody.
           const candidate = readRecord(managed.statusFile) ?? managed.latestRecord;
@@ -3569,7 +3577,9 @@ export class AgentManager {
             ...failedRecord(managed, "failed", String(error)),
             ...(candidate ?? {}), status: "failed",
           });
-        });
+        }).finally(() => {
+          if (managed.actorId && !managed.settled && !managed.launchCancelled) return this.#observeActorSettlement(managed);
+        }).catch(() => { /* failed observation retains custody; never invent an actor outcome */ });
         const handle = this.#handleInfo(managed, "running");
         this.#emitLifecycle(managed, "run.spawned", Date.now(), { status: "running", data: {
           ...(model ? { model } : {}),
@@ -5287,6 +5297,39 @@ export class AgentManager {
 
   async stop(id: string, options: { consume?: boolean; caller?: AgentRunStopCaller } = {}): Promise<AgentRunResult> {
     return this.#stop(id, options.consume !== false, true, options.caller ?? this.#stopIntentCaller("agents.stop"));
+  }
+
+  /** Host-only exact-run stop for a terminal actor, including a previous host's
+   * checkpoint. Recovery publishes through the authenticated previous-run store;
+   * it never launches work, scans the run root, or discharges native/archive debt. */
+  async stopActorRun(id: string, actorId: string, caller: AgentRunStopCaller): Promise<AgentRunResult | undefined> {
+    const managed = this.#runs.get(id);
+    const queued = this.#queued.get(id);
+    if (managed || queued) {
+      if ((managed?.actorId ?? queued?.info.actorId) !== actorId) return undefined;
+      // Legacy actor stops abandoned their run before recording STOPPED. This
+      // explicit terminal stop supersedes abandonment, not a saved terminal loss.
+      if (managed && !managed.settled) managed.abandoned = false;
+      return this.stop(id, { consume: false, caller });
+    }
+    const previous = this.#previousRun(id);
+    if (previous) return previous.actorId === actorId ? previous : undefined;
+    if (!/^[a-f0-9]{32}$/.test(id)) return undefined;
+    const directory = path.join(this.#runRoot, id);
+    const record = readRecord(path.join(directory, "status.json"));
+    const intent = readRunStopIntent(directory, record as unknown as Record<string, unknown> | undefined);
+    const matches = (value: Record<string, unknown> | undefined): boolean =>
+      value?.id === id && value.actorId === actorId && value.transport === "process";
+    if (!matches(record as unknown as Record<string, unknown> | undefined) && !matches(intent?.recoveryRecord)) return undefined;
+    // Keep any identity-less pending-replacement snapshot: a worker checkpoint
+    // cannot replace it with the dead identity of an earlier attempt.
+    persistRunStopIntent(directory, "explicit", intent || !record ? undefined : omitRetainedTasks(record) as unknown as Record<string, unknown>, caller);
+    const result = await recoverStoppedActorRun(directory, actorId, this.#closeAbort.signal);
+    if (result) {
+      this.restorePreviousRuns([result]);
+      this.#retentionRevision++;
+    }
+    return result;
   }
 
   /** Attribute a stop initiated by the actor host before its abort signal can race settlement. */
@@ -7027,46 +7070,97 @@ export class AgentManager {
   }
 
   /** A leader's death forbids replay, but never substitutes for the whole native/tree join. */
-  async #settleGoneActorWorker(managed: ManagedAgent, record: AgentRunRecord | undefined): Promise<boolean> {
-    // An intentional stop owns its verdict even when host identity also proves death,
-    // except an actor that abandoned this run: its live descendant may finish after actor.stop,
-    // but a later primary/whole-tree exit must still settle the unresumable run as lost.
-    if (readRunStopIntent(managed.runDirectory) !== undefined && !managed.abandoned) return false;
-    // Lifecycle close/abort has no durable operator intent, but its own teardown
-    // still cannot manufacture a pre-existing actor-loss verdict.
-    if ((managed.stopRequested && managed.workerGoneBeforeStop !== managed.transport) || !this.#actorWorkerGone(managed)) return false;
-    // Preserve genuine terminal results; only missing/recoverable transport outcomes become loss.
-    // Like #retryStartup, a window refusal outranks incidental auth/transport diagnostics.
+  async #settleGoneActorWorker(managed: ManagedAgent, record: AgentRunRecord | undefined, passive = false): Promise<boolean> {
+    const transport = managed.transport;
+    const current = () => this.#runs.get(managed.id) === managed && managed.transport === transport &&
+      !managed.relaunchPending && !managed.settled;
+    // Operator/deadline teardown owns its verdict, except an abandoned actor's
+    // pre-existing loss. Re-read intent and exact host identity after every join.
+    const eligible = () => current() &&
+      (readRunStopIntent(managed.runDirectory) === undefined || managed.abandoned) &&
+      (!managed.stopRequested || managed.workerGoneBeforeStop === transport) && this.#actorWorkerGone(managed, true);
+    if (!eligible()) return false;
+    // Preserve the existing normal Windows early-publication/native-admission join.
     if (this.#fenceNativeTerminalAdmission(managed, record)) return false;
-    // Nonterminal primary loss releases only RUN, even while its tree remains live.
+    // Primary death frees RUN only, never the actor's same-session activation.
     this.#releaseProvenGone();
-    // Primary loss is not a stop request: descendants may still own the native
-    // session, including after actor abandonment. Observe their voluntary exit
-    // before joining; #drainExecution would otherwise actively kill that tree.
-    // The existing close wake/status monitor retries this bounded observation.
     try {
-      if (!managed.executionExited &&
-          await this.#transportAliveUntil(managed.transport, Date.now() + TRANSPORT_EXIT_GRACE_MS)) return true;
-      if (terminalWorkerResult(record)) return false;
-      await this.#drainExecution(managed);
+      const deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS;
+      if (await this.#transportAliveUntil(transport, deadline) || !eligible()) return true;
+      // A terminal write can arrive during the probe. Never send a saved result
+      // back through destructive drain or let historical stop debt veto fresh proof.
+      const candidate = readRecord(managed.statusFile);
+      const savedTerminal = candidate?.id === managed.id && terminalWorkerResult(candidate);
+      if (passive && !savedTerminal) return true;
+      if (savedTerminal) {
+        // Primary absence and close are individually insufficient. Unknown or
+        // rejected captured close, pending stop, and failed whole-tree probes
+        // retain custody. Check liveness again after the exact native close.
+        if (!transport.closed || !await this.#transportClosedUntil(transport, deadline) || !eligible()) return true;
+        if (managed.processStopPending || await this.#transportAliveUntil(transport, deadline) || !eligible()) return true;
+        // A generic contact-loss adapter may report false for UNKNOWN. Only
+        // explicitly historical native stop debt can accompany a fresh false
+        // whole-tree receipt; manager-side transient marks need no such veto.
+        const lost = transport.lostContact?.();
+        if (lost !== undefined && transport.stopDebt?.() !== lost) return true;
+        managed.executionExited = true;
+        if (managed.observation) delete managed.observation.failure;
+        this.#retentionRevision++;
+        // Do not clear lostContact/stopDebt or unresolved-worker.json: immutable
+        // historical retention debt is separate from this fresh execution proof.
+      } else {
+        await this.#drainExecution(managed);
+        if (!eligible()) return true;
+      }
     } catch { return true; }
     if (!managed.executionExited) return true;
     await this.#captureWorktree(managed);
-    if (managed.settled) return true;
-    // Operator/deadline intent may arrive while the loss observer joins the tree.
-    // Recheck after the last await, before publishing a synthetic loss verdict. An actor's
-    // abandoned run remains eligible for this loss settlement: it cannot be resumed.
-    if (readRunStopIntent(managed.runDirectory) !== undefined && !managed.abandoned) return false;
-    // Final publication may race the join. Do not replace a committed success (or
-    // genuine worker failure) with the earlier running/missing snapshot's loss.
+    if (!eligible()) return true;
+    // Re-read after the LAST await: status, intent and transport generation can
+    // all change while joining. Only this run's genuine worker verdict survives.
     const joined = readRecord(managed.statusFile);
+    if (joined && joined.id !== managed.id) return true;
     const result = joined && terminalWorkerResult(joined)
-      ? this.#withTransportMetadata(joined, managed) as AgentRunResult
+      ? this.#withTransportMetadata(joined, managed, false) as AgentRunResult
       : { ...failedRecord(managed, "failed", "Actor worker is proven gone; execution was lost and will not be automatically relaunched"),
         startedAt: joined?.startedAt ?? record?.startedAt ?? Date.now() };
     if (!terminalWorkerResult(joined)) writeRecord(managed.statusFile, result);
     this.#settle(managed, result);
     return true;
+  }
+
+  /** Native close wakes the sole recovery owner; the existing status cadence is
+   * a safety net for already-fired close, late tree exit and failed durable saves.
+   * Every proof is bounded. Never restart destructive monitor/stop work here. */
+  #observeActorSettlement(managed: ManagedAgent): Promise<void> {
+    if (managed.actorSettlementObserver) return managed.actorSettlementObserver;
+    const observation = (async () => {
+      let watched: AgentTransportHandle | undefined;
+      let notified = false;
+      let wake: (() => void) | undefined;
+      while (!this.#closing && !managed.settled && this.#runs.get(managed.id) === managed) {
+        if (watched !== managed.transport) {
+          const transport = watched = managed.transport;
+          void transport.closed?.then(() => {
+            if (managed.transport !== transport || managed.settled) return;
+            notified = true;
+            wake?.();
+          }, () => { /* rejected close is never proof; the safety net retains custody */ });
+        }
+        try { await this.#settleGoneActorWorker(managed, readRecord(managed.statusFile), true); }
+        catch { /* retain retry custody, including a failed manager-result write */ }
+        if (managed.settled) return;
+        if (notified) { notified = false; continue; }
+        await new Promise<void>(resolve => {
+          const timer = setTimeout(() => { wake = undefined; resolve(); }, AGENT_STATUS_POLL_INTERVAL_MS);
+          wake = () => { clearTimeout(timer); wake = undefined; notified = false; resolve(); };
+        });
+      }
+    })().finally(() => {
+      if (managed.actorSettlementObserver === observation) delete managed.actorSettlementObserver;
+    });
+    managed.actorSettlementObserver = observation;
+    return observation;
   }
 
   async #monitor(managed: ManagedAgent, timeoutMs: number, deadline = Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS): Promise<void> {
@@ -7392,7 +7486,7 @@ export class AgentManager {
   }
 
   #settle(managed: ManagedAgent, result: AgentRunResult): void {
-    if (managed.settled) return;
+    if (managed.settled || managed.settlementSaving) return;
     this.#fenceNativeTerminalAdmission(managed, result);
     if (managed.worktreeResult) result.worktreeResult = managed.worktreeResult;
     // Every terminal path (including explicit stop and lost transport) gets a
@@ -7525,6 +7619,20 @@ export class AgentManager {
         managed.nativeReleasePending = pending;
       };
     }
+    if (this.#budget) {
+      this.#settleBudgetGap(managed, result);
+      const summary = this.#budgetSummary();
+      if (summary) result.budget = summary;
+    }
+    const stopIntent = readRunStopIntent(managed.runDirectory);
+    if (stopIntent) result.stopIntent = stopIntent;
+    if (managed.actorId) {
+      // The actor's result resumes its FIFO writer. Persist and route once before
+      // releasing that lifecycle; a failed save leaves it owned for observation.
+      managed.settlementSaving = true;
+      try { if (!this.#saveSettledResult(managed, result)) return; }
+      finally { delete managed.settlementSaving; }
+    }
     if (!beginAgentSettlement(managed)) return;
     managed.questions?.abort(new Error("Agent run settled"));
     delete managed.taskCustodyIndex;
@@ -7544,11 +7652,6 @@ export class AgentManager {
       },
     });
 
-    if (this.#budget) {
-      this.#settleBudgetGap(managed, result);
-      const summary = this.#budgetSummary();
-      if (summary) result.budget = summary;
-    }
     this.#observePresence(managed, result);
     const compactResult = compactUiRecord(result);
     managed.latestRecord = compactResult;
@@ -7556,9 +7659,7 @@ export class AgentManager {
     if (result.nestedAgents) {
       managed.nestedSnapshot = result.nestedAgents.map((record) => compactUiRecord(record));
     }
-    const stopIntent = readRunStopIntent(managed.runDirectory);
-    if (stopIntent) result.stopIntent = stopIntent;
-    if (this.#saveSettledResult(managed, result)) {
+    if (managed.actorId || this.#saveSettledResult(managed, result)) {
       try {
         // A native deadline receipt can settle before worker exit. Keep its fence
         // until both terminal status and native execution custody are resolved.
@@ -7731,7 +7832,6 @@ export class AgentManager {
   }
 
   #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
-    this.#observePresence(managed, result);
     try {
       const full = this.#withTransportMetadata(result, managed, false) as AgentRunResult;
       // The worker can still rewrite status.json during native teardown. Publish
@@ -7743,6 +7843,7 @@ export class AgentManager {
       managed.resultFingerprint = fingerprint;
       delete managed.resultCollected;
       if (managed.routeOutcome || this.#onSettled) this.#stageArchive(managed.runDirectory, full, "settlement", undefined, !managed.routeOutcome);
+      this.#observePresence(managed, result);
       managed.routeOutcome?.(result);
       this.#onSettled?.(full);
       if (managed.routeOutcome || this.#onSettled) this.#commitArchive(managed.runDirectory, full);

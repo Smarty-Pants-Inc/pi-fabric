@@ -938,6 +938,8 @@ export class ActorManager {
   readonly #cancelledPredecessors = new Map<string, Set<string>>();
   /** The actor object each running drain uses, by actor id; a reload can replace the registered one. */
   readonly #draining = new Map<string, ManagedActor>();
+  /** One exact-run terminal-stop join, shared by default stop, wait and bootstrap. */
+  readonly #stoppedRunSettlements = new Map<string, Promise<void>>();
   /**
    * smarty-dev#6337: the open stuck-preparing episode per actor, notified at most once. Preparation
    * time accrues across phase transitions of one activation; an admission-permit wait pauses it.
@@ -3905,21 +3907,58 @@ export class ActorManager {
     // Persist the actor-side caller before its abort can settle the AgentManager run.
     if (actor.inFlightRun) {
       this.agents.recordStopIntent(actor.inFlightRun.id, { by: { kind: this.identity.kind, id: this.identity.id }, path });
-      // Mark abandonment before abort, so a dead worker cannot be recovered for this owner.
-      this.agents.abandon(actor.inFlightRun.id);
+      // Caller abort alone detaches work that made progress. Explicit stop owns
+      // its terminal verdict and native join even when the caller does not wait.
+      // Do not abandon it: that would classify an intentional gone-worker stop
+      // as worker loss. Removal/session-reset keep their existing deferred join.
+      if (path === "actors.stop") void this.#settleStoppedRun(actor, path);
+      else this.agents.abandon(actor.inFlightRun.id);
     }
     actor.abortController?.abort();
+  }
+
+  #settleStoppedRun(actor: ManagedActor, path: AgentRunStopPath = "actors.stop"): Promise<void> {
+    const runId = actor.inFlightRun?.id ?? actor.lastRunId;
+    if (!runId) return Promise.resolve();
+    const prior = this.#stoppedRunSettlements.get(runId);
+    if (prior) return prior;
+    const pending = this.agents.stopActorRun(runId, actor.id, {
+      by: { kind: this.identity.kind, id: this.identity.id }, path,
+    }).then(result => {
+      if (!result) return;
+      // An executing drain still owns its event ack/archive/finally. Only stale
+      // metadata without that drain may drop its in-flight pointer here.
+      let cleared = false;
+      for (const target of new Set([actor, this.#actors.get(actor.id), this.#draining.get(actor.id)])) {
+        if (target && !target.draining && target.inFlightRun?.id === runId) {
+          target.lastRunId ??= runId;
+          delete target.inFlightRun;
+          cleared = true;
+        }
+      }
+      // Drop a legacy serialized pointer too, so a watcher reload cannot put it
+      // back after this run's memoized settlement. Keep lastRunId and all files.
+      if (cleared && !this.#closing && this.#canManage(actor.id)) this.#scheduleRegistrySave(true, 1);
+      this.#emitChange();
+    });
+    this.#stoppedRunSettlements.set(runId, pending);
+    void pending.catch(error => {
+      this.#stoppedRunSettlements.delete(runId); // Existing sweep/another stop may retry, without forgetting custody.
+      diagnostics.warn("src/actors/manager.ts", `[pi-fabric] actor ${actor.id} run ${runId} stop settlement retained for retry: ${errorText(error)}`);
+    });
+    return pending;
   }
 
   async #joinStoppedRun(id: string, path: AgentRunStopPath = "actors.stop"): Promise<void> {
     const running = this.#runningActor(id);
     if (!running) return;
     this.#stopRun(running, path);
-    // A caller abort detaches a worker that made progress. Public terminal stop
-    // must explicitly end that owned worker before joining its activation.
-    if (running.inFlightRun) await this.agents.stop(running.inFlightRun.id, { caller: {
-      by: { kind: this.identity.kind, id: this.identity.id }, path,
-    } });
+    if (running.inFlightRun) {
+      if (path === "actors.stop") await this.#settleStoppedRun(running, path);
+      else await this.agents.stop(running.inFlightRun.id, { caller: {
+        by: { kind: this.identity.kind, id: this.identity.id }, path,
+      } });
+    }
     await running.drain?.catch(() => undefined);
   }
 
@@ -8971,14 +9010,14 @@ export class ActorManager {
       }
     }
     const run = actor.inFlightRun;
-    if (run && now - run.startedAt > ACTOR_RUN_STUCK_MIN_MS) {
+    if (actor.status !== "stopped" && run && now - run.startedAt > ACTOR_RUN_STUCK_MIN_MS) {
       const threshold = Math.max(ACTOR_RUN_STUCK_MIN_MS, 2 * (this.#p95RunMs(actor) ?? 0));
       const gone = now - run.startedAt > threshold ? this.#runGone(run.id) : undefined;
       if (gone) {
         this.#alarmActorState(actor, "actor-run-stuck", run.startedAt, actorAlarmSlot(now, run.startedAt, threshold), now, () => ({
           actorId: actor.id, actorName: actor.name, ownerRoot: actor.rootId, reason: gone, runId: run.id,
           since: run.startedAt, runningForMs: now - run.startedAt, thresholdMs: threshold, ...this.#runStatusHint(run.id) }),
-          () => this.#actors.get(actor.id)?.inFlightRun?.id === run.id);
+          () => { const current = this.#actors.get(actor.id); return current?.status !== "stopped" && current?.inFlightRun?.id === run.id; });
       }
     }
     const dropped = actor.eventsDropped;
@@ -9199,6 +9238,10 @@ export class ActorManager {
           if (this.#closing || this.#releaseStrict || this.#canConsumeMesh?.() === false) return;
           // Reload/removal, cede and a newly published owner all veto maintenance.
           if (this.#actors.get(actor.id) !== actor || !this.#ownershipDecision(actor.id)) continue;
+          // The first existing sweep also repairs legacy stopped checkpoints on
+          // host start. The manager owns exact-run durable recovery; no replay,
+          // raw terminal-record synthesis, new timer or per-actor root scan.
+          if (actor.status === "stopped" && !actor.removal) void this.#settleStoppedRun(actor);
           this.#realarmBlockedActivation(actor, now);
           this.#alarmActorStates(actor, now);
           this.#logs.pruneRuns(actor, now);
@@ -10262,6 +10305,11 @@ export class ActorManager {
             Number.isFinite(record.sessionOrphan.orphanedAt) && Number.isFinite(record.sessionOrphan.lastUpdated)
           ? { sessionOrphan: { ...record.sessionOrphan }, ...(typeof record.lastError === "string" ? { lastError: record.lastError } : {}) } : {}),
         ...(typeof record.lastRunId === "string" ? { lastRunId: record.lastRunId } : {}),
+        // Some older snapshots carried the stale running pointer itself. Keep
+        // it until the stopped-run recovery joins custody, never as replay work.
+        ...(status === "stopped" && typeof record.inFlightRun?.id === "string" && /^[a-f0-9]{32}$/.test(record.inFlightRun.id) &&
+          typeof record.inFlightRun.startedAt === "number" && Number.isFinite(record.inFlightRun.startedAt) && record.inFlightRun.startedAt >= 0
+          ? { inFlightRun: { id: record.inFlightRun.id, startedAt: record.inFlightRun.startedAt } } : {}),
         ...(typeof record.removal?.requestedAt === "number"
           ? {
               removal: {
@@ -10316,6 +10364,9 @@ export class ActorManager {
     // of that actor settles, its markers stay and count the start; one line per start, ops.owner from the third.
     for (const actor of firstLoads) {
       if (!claimed.has(actor.id)) continue;
+      // A stopped actor's missing activation is intentional, not lost work.
+      // Its exact last run is recovered by the first owned retention sweep.
+      if (actor.status === "stopped" && !actor.removal) continue;
       const unknown = !this.#queueStatesReadable(actor);
       let count = { starts: 0, alarm: false };
       try { count = this.agents.countUnknownEnodevStarts?.(actor.id, unknown) ?? count; } catch { /* the count only reports */ }

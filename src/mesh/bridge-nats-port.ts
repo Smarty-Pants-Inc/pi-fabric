@@ -151,6 +151,12 @@ export const natsBridgeInboxSource = (connection: NatsConnectionHandle, options:
         const stop = (): void => { if (!queue.destroyed && !queue.readableEnded) queue.push(null); };
         signal.addEventListener("abort", stop, { once: true });
         generation.signal.addEventListener("abort", stop, { once: true });
+        // The native consumer resets its pull before USER.INFO passes; the guarded API
+        // refuses that reset, leaving a silent iterator in the client's long backoff.
+        // Restart on the verified reconnect instead of relying on a consumer status.
+        const unsubscribe = connection.onStatus(status => {
+          if (status.type === "reconnect") generation.abort();
+        });
         let messages: ConsumerMessages | undefined;
         let statusTask: Promise<void> | undefined;
         try {
@@ -188,6 +194,7 @@ export const natsBridgeInboxSource = (connection: NatsConnectionHandle, options:
             if (terminal) throw terminal;
           }
         } finally {
+          unsubscribe();
           signal.removeEventListener("abort", stop);
           if (messages) await messages.close().catch(() => undefined);
           await statusTask;

@@ -15,6 +15,7 @@ export type B1MountFault =
   | "lock-fd-missing" | "generation-fd-missing" | "stale-observation"
   | "observer-unavailable" | "engine-changed" | "device-reused" | "old-replica"
   | "stale-acquisition" | "foreign-acquisition" | "attach-observation-mismatch"
+  | "stale-receiver-receipt"
   | "lock-wrong-namespace" | "generation-wrong-namespace"
   | "lock-wrong-filesystem" | "generation-wrong-filesystem" | "same-metadata-inode";
 

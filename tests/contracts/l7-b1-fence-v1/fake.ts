@@ -133,7 +133,7 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
   let actualWorkloadTaskIds: readonly string[] = volume === "required" ? [`${id}:old-task`, `${id}:old-child-task`] : [];
   let enumeratedWorkloadTaskIds = copy(actualWorkloadTaskIds);
   const enumerationFor = (): EvidenceRef => retainEvidence("fabric.b1.inventory", {
-    storage, since: volume === "required" ? anchor : newAnchor,
+    storage, operationId, acquisitionId, since: volume === "required" ? anchor : newAnchor,
     generations: actualPredecessors, podUIDs: actualPodUIDs, workloadTasks: enumeratedWorkloadTaskIds,
     quarantinedNodeNames: [...historicalNodeNames, oldReceiver.nodeName].sort(), retiredCandidatePodUIDs,
     oldReplicas: volume === "required" ? [`${id}:old-replica-1`, `${id}:old-replica-2`] : [],
@@ -407,6 +407,17 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
       case "engine-changed": m.engine = engineFor("unplanned", receiver.nodeUID); break;
       case "device-reused": m.actual = { ...m.actual, deviceLifetimeId: `${id}:reused-dev-t-new-lifetime` }; break;
       case "old-replica": m.replicas = [{ id: `${id}:old-replica-1`, startedAfterCut: false }]; break;
+      // §9 #8: receipt can name an earlier bootstrap even while the actual/pinned
+      // helper execution is current. Independent of the wrong-bootstrap topology fault.
+      case "stale-receiver-receipt": {
+        if (receiverReceipt) {
+          const { record: _record, ...prior } = receiverReceipt;
+          const stale = { ...prior, bootstrapExecutionId: `${id}:old-bootstrap` };
+          receiverReceiptPayloadBytes = canonical(stale);
+          receiverReceipt = { ...stale, record: recordFor("stale-receiver-receipt", receiverReceiptPayloadBytes, revision.toString()) };
+        }
+        break;
+      }
       case "stale-acquisition": m.acquisitionId = granted.acquisitionId; break;
       case "foreign-acquisition": m.acquisitionId = `${id}:foreign-acquisition`; break;
       case "attach-observation-mismatch": m.attachObservation = retainEvidence("fabric.b1.attach-observation", {

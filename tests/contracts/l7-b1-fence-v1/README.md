@@ -1,4 +1,4 @@
-# L7 B1 fence v1 — test-only callable contract (v2 conformance)
+# L7 B1 fence v1 — test-only callable contract (v3 conformance)
 
 This directory defines a source-tree, test-only TypeScript contract for the two
 B1 storage ports. Its common types cover both profile shapes, but the fake only
@@ -158,6 +158,42 @@ it from returned custody fields. Metadata checks compare each FD's own evidence
 and actual attach lineage. No quarantine reset is offered: quiet time, client
 reopen and receipt readback cannot erase history; §11.2 maintenance is unmodeled.
 
+## V3: each handover must establish its own fence
+
+The `handover 1/3`, `handover 2/3`, and `handover 3/3` cases each run after an
+actual successful prefix on the same volume, with fresh selected node-name
+keys. They never pre-complete the handover whose missing observations they
+are testing. Every fact and T1–T8 is independently withheld, then restored for
+a positive control. Each hold leaves no receipt/grant, and attempted S7 attach
+and mount observation still fail. These are finite model sequences, not a
+proof for arbitrarily many handovers or a claim of live fence enforcement.
+
+| Cause / design section | V3 cases and independent check |
+|---|---|
+| C1, §4.2 S1–S6 / §4.3 / §9 #1–2 | No borrowed observations; fresh facts without T1–T8; every independent fact and T item on each of three handovers. |
+| C2, §4.1 / §4.2 S7 / §5 / §8.2 | `three fresh handovers …`: distinct a, engine/process UUID, helper handle, bootstrap execution and device lifetime; new inventory/since and S2/S3 evidence bound to the new operation. Every previous helper handle is refused by the mount port. |
+| C3, §8.1.3 / §8.2–3 | Compare each new revoked predecessor with the previous receiver's **consumer-held mount reply**, including a/self/engine/n. Advance n explicitly via fixture M2. Require retired failed-candidate Pods in the next exclusion receipt. |
+| C4, §8.1.1–3/5/8 | Changed historical replay, earlier S1 revision/acquisition, old helper requests, and stale since/enumeration/restart/kill evidence are actually submitted to the ports. Bad retained coverage requires positive-drain slot transfer, not edited same-hash evidence. |
+| C5, §4.2 S5→S6 / §4.3 / §8.1.5 | Post-effect regression of **every** independent fact; T1–T7 regression while T8 holds the cut. Exact held retries (including reopen) leave the observed state unchanged. T8=false itself must hold on each handover; a true final T8 commits immediately in this synchronous model. |
+| C6, §4.2 S3→S4 / §9 #2 | Expired invocation, incomplete inventory and unreachable node cause no restart/kill/retirement effects; latch before kill, kill confirmation before retirement. |
+| C7, §4.1 / §4.2 S11 / §9 #4 | After reopen, the revoke port still refuses historical/recreated node names and the mount port still refuses each contained raw-action outcome. |
+| C8, §8.1.5 / §9 #5 / §4.2 S11 | A mounted receiver cannot be transferred as engine-less failed work; neither normal nor failed-candidate slot transfer is possible after containment. Historical readback is still evidence, never a new grant. |
+
+`stale-receiver-receipt` is a separate fixture fault: the retained receiver
+receipt names an old bootstrap execution while the actual mount and pinned
+helper execution remain current. This exercises receipt-to-actual comparison
+without relying on the earlier wrong-bootstrap check. Inventory fixture
+evidence now includes its operation and acquisition binding. The local encoding
+is still not a frozen production schema. The never-submitted gated-candidate
+case also calls the ports after reopen: that candidate has no raw key to
+quarantine, but its Pod remains in the next inventory/receipt.
+
+Assertions about effects, slot state and controller records still rely on the
+harness observation/evidence controls. Those are explicit fixture obligations,
+not independent production instrumentation. In particular, client reopen does
+not simulate a process crash or prove durable storage. Mutation evidence and
+exact tested file hashes are supplied separately by each runner.
+
 ## Suite scope and explicit non-proofs
 
 The shared suite is a deterministic, test-level exercise of the callable port
@@ -199,6 +235,6 @@ The design input is
 `/srv/scratch/paul/design-b1ports-in/design-final.md`, SHA-256
 `00f1ad54b95b18f86e99529fe9bb5201bedcc6bcac2530a9951168803e643e40`.
 It records the final designer revision after the second/final challenge and
-retains the round-2 common contract unchanged. This v2 strengthening keeps that
+retains the round-2 common contract unchanged. This v3 strengthening keeps that
 contract and the seven-file package path; it does not assert production-owner
 acceptance, schema/fixture freeze, a production verifier, or qualification.

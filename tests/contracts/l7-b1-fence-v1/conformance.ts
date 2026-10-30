@@ -624,6 +624,7 @@ export function runConformance(factory: B1HarnessFactory): void {
 
     // §4.2 S8/S10, §5/§8.2: actual acquisition/attach lineage and each independent FD.
     const mountFaults: readonly { fault: B1MountFault; code: B1ErrorCode; disposition: "refused" | "held" }[] = [
+      { fault: "stale-receiver-receipt", code: "B1_MOUNT_LINEAGE_UNKNOWN", disposition: "held" },
       { fault: "stale-acquisition", code: "B1_MOUNT_LINEAGE_UNKNOWN", disposition: "held" },
       { fault: "foreign-acquisition", code: "B1_MOUNT_LINEAGE_UNKNOWN", disposition: "held" },
       { fault: "attach-observation-mismatch", code: "B1_MOUNT_LINEAGE_UNKNOWN", disposition: "held" },
@@ -729,6 +730,452 @@ export function runConformance(factory: B1HarnessFactory): void {
         expect(await h.ports.revokeGeneration(request)).toEqual(receipt); // Historical bytes, not a new capability.
         await failure(() => h.attachReservedReceiver(), "B1_STALE_GENERATION", "refused");
         expect(h.observe()).toEqual(after);
+      });
+    }
+
+    // V3: quantify the fence over handovers, not just the initial fixture. Each
+    // negative runs on an isolated current handover after a real successful prefix.
+    // Prefix replies are consumer-held oracles, not reconstructed from observe().
+    const finishHandover = async (h: B1Harness) => {
+      const done = await complete(h);
+      expect(done.receipt).toMatchObject({ storage: done.request.storage, reservedReceiver: done.request.reservedReceiver,
+        reservedAcquisitionId: done.request.reservedAcquisitionId, revoked: done.request.predecessor.generations,
+        exitedPodUIDs: done.request.predecessor.podUIDs });
+      h.incrementCustody(); // Fixture M2: distinct n, so stale predecessor n is observable.
+      const mountRequest = h.mountRequest(), before = h.observe();
+      const mount = await h.ports.currentMountGeneration(mountRequest);
+      expect(h.observe()).toEqual(before);
+      const receiver = before.receiverReceipt;
+      if (!receiver) throw new Error("S7 must retain its own receiver receipt");
+      expect(receiver).toMatchObject({ receiver: mount.self, acquisitionId: mount.acquisitionId,
+        engine: mount.engine, bootstrapExecutionId: mount.actualMount.bootstrapExecutionId,
+        attachObservation: mount.attachObservation, revokeReceipt: done.receipt.record });
+      expect(mount).toMatchObject({ storage: done.request.storage, self: done.request.reservedReceiver,
+        acquisitionId: done.request.reservedAcquisitionId, custody: { acquisitionId: done.request.reservedAcquisitionId,
+          value: before.custodyValue, recordSha256: hash(before.custodyRecordPayloadBytes) } });
+      expect(h.readEvidence(mount.observation)).toMatchObject({ data: { challengeNonce: mountRequest.challengeNonce,
+        storage: mount.storage, self: mount.self, acquisitionId: mount.acquisitionId, actualMount: mount.actualMount,
+        custody: mount.custody, attachObservation: mount.attachObservation, nativeEpoch: { kind: "absent" },
+        lockFd: { role: "lock", inode: mount.custody.lockInode, deviceLifetimeId: mount.actualMount.deviceLifetimeId },
+        generationFd: { role: "generation", deviceLifetimeId: mount.actualMount.deviceLifetimeId } } });
+      expect(h.readEvidence(mount.attachObservation)).toMatchObject({ data: { storage: mount.storage,
+        receiver: mount.self, acquisitionId: mount.acquisitionId, engine: mount.engine, actual: mount.actualMount,
+        revokeReceiptHash: done.receipt.record.sha256, cut: done.receipt.record.resourceVersion } });
+      for (const ref of [mount.observation, mount.attachObservation]) expect(hash(encode(h.readEvidence(ref)))).toBe(ref.sha256);
+      return { ...done, mount, mountRequest, receiver };
+    };
+    const atHandover = async (h: B1Harness, number: number) => {
+      const history: Awaited<ReturnType<typeof finishHandover>>[] = [];
+      for (let i = 1; i < number; i++) {
+        history.push(await finishHandover(h));
+        h.reserveNextReceiver(freshNode(h, `handover-${i + 1}`));
+      }
+      return history;
+    };
+    const noGrantAtPorts = async (h: B1Harness): Promise<void> => {
+      withheld(h); const held = h.observe();
+      await failure(() => h.attachReservedReceiver(), "B1_TEARDOWN_INCOMPLETE", "held");
+      await failure(() => h.ports.currentMountGeneration(h.mountRequest()), "B1_MOUNT_NOT_FOUND", "refused");
+      expect(h.observe()).toEqual(held);
+    };
+    const noEffects = (h: B1Harness): void => {
+      expect(h.observe().operation).toMatchObject({ restartRevocationPersisted: false,
+        killSubmitted: false, retirementRequested: false });
+    };
+
+    for (const handover of [1, 2, 3]) {
+      const prefix = `handover ${handover}/3`;
+      test(`${prefix}: no observations borrowed from an earlier handover (§4.2 S1–S6/§9 #1–2)`, async h => {
+        await atHandover(h, handover); const request = h.revokeRequest();
+        await failure(() => h.ports.revokeGeneration(request), "B1_PREDECESSOR_SET_INCOMPLETE", "held");
+        noEffects(h); await noGrantAtPorts(h);
+        await finishHandover(h); // Positive control: this very operation can later finish.
+      });
+      test(`${prefix}: fresh facts cannot borrow earlier T1–T8 (§4.3/§9 #1)`, async h => {
+        await atHandover(h, handover);
+        for (const { fact } of factCases) h.setFact(fact, true);
+        await failure(() => h.ports.revokeGeneration(h.revokeRequest()), "B1_TEARDOWN_INCOMPLETE", "held");
+        await noGrantAtPorts(h); await finishHandover(h);
+      });
+      for (const { fact, code } of factCases) {
+        test(`${prefix}: independent ${fact} gates this handover (§4.2 S3–S6/§4.3)`, async h => {
+          await atHandover(h, handover); h.completeRetirement(); h.setFact(fact, false);
+          const request = h.revokeRequest();
+          await failure(() => h.ports.revokeGeneration(request), code, "held");
+          if (fact === "inventoryComplete" || fact === "nodeReachable") noEffects(h);
+          if (fact === "restartDisabled" || fact === "killIssued") {
+            expect(h.observe().operation?.retirementRequested).toBe(false);
+          }
+          await noGrantAtPorts(h); const held = h.observe(); h.reopen();
+          await failure(() => h.ports.revokeGeneration({ ...request, deadlineUnixMs: request.deadlineUnixMs + 1_000 }), code, "held");
+          expect(h.observe()).toEqual(held);
+          h.setFact(fact, true); await finishHandover(h);
+        });
+        test(`${prefix}: post-effect ${fact} regression rechecked before commit (§4.2 S5→S6/§8.1.5)`, async h => {
+          await atHandover(h, handover); h.completeRetirement(); h.setTeardown("T8", false);
+          const request = h.revokeRequest();
+          await failure(() => h.ports.revokeGeneration(request), "B1_TEARDOWN_INCOMPLETE", "held");
+          expect(h.observe().operation).toMatchObject({ restartRevocationPersisted: true,
+            killSubmitted: true, retirementRequested: true });
+          h.setTeardown("T8", true); h.setFact(fact, false); const regressed = h.observe();
+          await failure(() => h.ports.revokeGeneration(request), code, "held");
+          expect(h.observe()).toEqual(regressed); await noGrantAtPorts(h);
+          h.reopen();
+          await failure(() => h.ports.revokeGeneration(request), code, "held");
+          expect(h.observe()).toEqual(regressed);
+          h.setFact(fact, true); await finishHandover(h);
+        });
+      }
+      for (const item of teardownItems) {
+        test(`${prefix}: ${item} is fresh and conjunctive (§4.3/§9 #1)`, async h => {
+          await atHandover(h, handover); h.completeRetirement(); h.setTeardown(item, false);
+          const request = h.revokeRequest();
+          await failure(() => h.ports.revokeGeneration(request), "B1_TEARDOWN_INCOMPLETE", "held");
+          await noGrantAtPorts(h); const held = h.observe();
+          await failure(() => h.ports.revokeGeneration(request), "B1_TEARDOWN_INCOMPLETE", "held");
+          expect(h.observe()).toEqual(held);
+          h.setTeardown(item, true); const { receipt } = await finishHandover(h);
+          expect(receipt.teardown).toHaveLength(8);
+          for (const ref of receipt.teardown) expect(h.readEvidence(ref)).toMatchObject({ data: {
+            storage: request.storage, operationId: request.operationId, acquisitionId: request.reservedAcquisitionId,
+          } });
+        });
+      }
+      for (const item of teardownItems.filter(item => item !== "T8")) {
+        test(`${prefix}: post-effect ${item} regression invalidates the cut (§4.2 S5→S6/§4.3)`, async h => {
+          await atHandover(h, handover); h.completeRetirement(); h.setTeardown("T8", false);
+          const request = h.revokeRequest();
+          await failure(() => h.ports.revokeGeneration(request), "B1_TEARDOWN_INCOMPLETE", "held");
+          h.setTeardown("T8", true); h.setTeardown(item, false); const changed = h.observe();
+          await failure(() => h.ports.revokeGeneration(request), "B1_TEARDOWN_INCOMPLETE", "held");
+          expect(h.observe()).toEqual(changed); await noGrantAtPorts(h);
+          h.setTeardown(item, true); await finishHandover(h);
+        });
+      }
+      test(`${prefix}: deadline/inventory/node/latch/kill checks precede effects (§4.2 S3→S4/§9 #2)`, async h => {
+        await atHandover(h, handover); h.completeRetirement(); const request = h.revokeRequest();
+        await failure(() => h.ports.revokeGeneration({ ...request, deadlineUnixMs: 0 }), "B1_DEADLINE_HELD", "held");
+        noEffects(h); await noGrantAtPorts(h);
+        h.setFact("inventoryComplete", false);
+        await failure(() => h.ports.revokeGeneration(request), "B1_PREDECESSOR_SET_INCOMPLETE", "held");
+        noEffects(h); await noGrantAtPorts(h);
+        h.setFact("inventoryComplete", true); h.setFact("nodeReachable", false);
+        await failure(() => h.ports.revokeGeneration(request), "B1_NODE_UNREACHABLE", "held");
+        noEffects(h); await noGrantAtPorts(h);
+        h.setFact("nodeReachable", true); h.setFact("restartDisabled", false);
+        await failure(() => h.ports.revokeGeneration(request), "B1_RESTART_NOT_DISABLED", "held");
+        expect(h.observe().operation).toMatchObject({ restartRevocationPersisted: true, killSubmitted: false, retirementRequested: false });
+        h.setFact("restartDisabled", true); h.setFact("killIssued", false);
+        await failure(() => h.ports.revokeGeneration(request), "B1_KILL_NOT_CONFIRMED", "held");
+        expect(h.observe().operation).toMatchObject({ killSubmitted: true, retirementRequested: false });
+        h.setFact("killIssued", true); await finishHandover(h);
+      });
+
+      test(`${prefix}: changed historical replay and stale S1/a refuse at the port (§8.1.1–3)`, async h => {
+        const history = await atHandover(h, handover); h.completeRetirement();
+        const request = h.revokeRequest(), before = h.observe();
+        for (const old of history) {
+          for (const { change } of changedMembers) {
+            await failure(() => h.ports.revokeGeneration(rehash(change(old.request))), "B1_OPERATION_CONFLICT", "refused");
+            expect(h.observe()).toEqual(before);
+          }
+          await failure(() => h.ports.revokeGeneration(rehash({ ...request,
+            expectedControllerRevision: old.request.expectedControllerRevision })), "B1_STALE_GENERATION", "refused");
+          expect(h.observe()).toEqual(before);
+          await failure(() => h.ports.revokeGeneration(rehash({ ...request,
+            reservedAcquisitionId: old.mount.acquisitionId })), "B1_NOT_AUTHORIZED", "refused");
+          expect(h.observe()).toEqual(before);
+          expect(await h.ports.revokeGeneration({ ...old.request, deadlineUnixMs: 0 })).toEqual(old.receipt);
+          expect(h.observe()).toEqual(before); // Historical readback cannot re-publish its grant.
+        }
+        await finishHandover(h);
+      });
+      for (const { fault, code, disposition } of mountFaults) {
+        test(`${prefix}: actual mount ${fault} fails closed (§4.2 S8/S10/§5/§8.2/§9 #8)`, async h => {
+          await atHandover(h, handover); await finishHandover(h);
+          h.setMountFault(fault); const before = h.observe();
+          await failure(() => h.ports.currentMountGeneration(h.mountRequest()), code, disposition);
+          expect(h.observe()).toEqual(before);
+        });
+      }
+      test(`${prefix}: discovered task holds the immutable slot until positive-drain transfer (§8.1.5/§9 #2)`, async h => {
+        await atHandover(h, handover); h.completeRetirement(); h.setFact("workloadsExited", false);
+        const request = h.revokeRequest();
+        await failure(() => h.ports.revokeGeneration(request), "B1_TASKS_STILL_ALIVE", "held");
+        h.discoverWorkloadTask(); h.completeRetirement(); const changed = h.observe();
+        await failure(() => h.ports.revokeGeneration(request), "B1_PREDECESSOR_SET_INCOMPLETE", "held");
+        expect(h.observe()).toEqual(changed); await noGrantAtPorts(h);
+        await failure(() => h.ports.revokeGeneration(rehash({ ...request, operationId: `${request.operationId}:replacement` })),
+          "B1_OPERATION_CONFLICT", "refused");
+        expect(h.observe()).toEqual(changed);
+        h.retireFailedCandidateAndReserve(freshNode(h, "drained-new-task")); const transferred = h.observe(); h.reopen();
+        await failure(() => h.ports.revokeGeneration(request), "B1_STALE_GENERATION", "refused");
+        expect(h.observe()).toEqual(transferred); await finishHandover(h);
+      });
+      test(`${prefix}: mounted receiver cannot escape inventory as a failed candidate (§8.1.5/§9 #5)`, async h => {
+        await atHandover(h, handover); const { mount } = await finishHandover(h), before = h.observe();
+        await failure(() => h.retireFailedCandidateAndReserve(freshNode(h, "unsafe-slot-release")), "B1_OPERATION_CONFLICT", "refused");
+        expect(h.observe()).toEqual(before);
+        expect((await h.ports.currentMountGeneration(h.mountRequest())).acquisitionId).toBe(mount.acquisitionId);
+        h.reserveNextReceiver(freshNode(h, "safe-next"));
+        const { receipt } = await finishHandover(h);
+        expect(receipt.revoked).toHaveLength(1);
+        expect(receipt.revoked[0]).toMatchObject({ acquisitionId: mount.acquisitionId, receiver: mount.self,
+          engine: mount.engine, applicationGeneration: mount.custody.value });
+      });
+      test(`${prefix}: reopened client still refuses a historical node through revoke (§4.1/§9 #4)`, async h => {
+        const initial = h.revokeRequest().predecessor.generations[0]?.receiver;
+        if (!initial) throw new Error("Required fixture needs an initial predecessor");
+        const history = await atHandover(h, handover), current = await finishHandover(h);
+        h.reserveNextReceiver({ ...initial, nodeUID: `${initial.nodeUID}:recreated`, podUID: `${initial.podUID}:again` });
+        h.completeRetirement(); h.reopen(); const before = h.observe(), request = h.revokeRequest();
+        for (const node of [initial, ...history.map(done => done.mount.self), current.mount.self]) {
+          await failure(() => h.ports.revokeGeneration(rehash({ ...request, reservedReceiver: { ...node,
+            nodeUID: `${node.nodeUID}:recreated`, podUID: `${node.podUID}:again` } })), "B1_SAME_NODE_REUSE_UNQUALIFIED", "refused");
+          expect(h.observe()).toEqual(before);
+        }
+      });
+      for (const action of ["detach", "reattach-old", "old-write"] as const) {
+        test(`${prefix}: reopen preserves ${action} containment and closes slot transfers (§4.2 S11/§8.1.5)`, async h => {
+          await atHandover(h, handover); const { request, receipt } = await finishHandover(h);
+          h.executeRawStaleAction(action); h.reopen(); const before = h.observe();
+          await failure(() => h.ports.currentMountGeneration(h.mountRequest()), "B1_MOUNT_CHANGED", "refused");
+          expect(h.observe()).toEqual(before);
+          await failure(() => h.reserveNextReceiver(freshNode(h, "after-containment")), "B1_OPERATION_CONFLICT", "refused");
+          expect(h.observe()).toEqual(before);
+          await failure(() => h.retireFailedCandidateAndReserve(freshNode(h, "after-containment")), "B1_OPERATION_CONFLICT", "refused");
+          expect(h.observe()).toEqual(before);
+          await failure(() => h.attachReservedReceiver(), "B1_STALE_GENERATION", "refused");
+          await failure(() => h.ports.revokeGeneration(rehash({ ...request, operationId: `${request.operationId}:new` })),
+            "B1_STALE_GENERATION", "refused");
+          expect(await h.ports.revokeGeneration(request)).toEqual(receipt);
+          expect(h.observe()).toEqual(before);
+        });
+      }
+      test(`${prefix}: retired failed candidate stays in the next exclusion receipt (§8.2/§9 #4–5)`, async h => {
+        await atHandover(h, handover); h.completeRetirement(); const failed = h.revokeRequest();
+        await h.ports.revokeGeneration(failed); h.failNextReceiverAttach();
+        await failure(() => h.attachReservedReceiver(), "B1_DRIVER_OUTCOME_UNKNOWN", "held");
+        h.completeRetirement(); h.retireFailedCandidateAndReserve(freshNode(h, "after-failed-attach"));
+        const { request, receipt } = await finishHandover(h);
+        expect(receipt.exitedPodUIDs).toContain(failed.reservedReceiver.podUID);
+        expect(receipt.exitedPodUIDs).toEqual(request.predecessor.podUIDs);
+        expect(receipt.revoked.some(g => g.receiver.podUID === failed.reservedReceiver.podUID)).toBe(false);
+        h.reserveNextReceiver({ ...failed.reservedReceiver, podUID: `${failed.reservedReceiver.podUID}:again` });
+        h.completeRetirement(); h.reopen(); const before = h.observe();
+        await failure(() => h.ports.revokeGeneration(h.revokeRequest()), "B1_SAME_NODE_REUSE_UNQUALIFIED", "refused");
+        expect(h.observe()).toEqual(before);
+      });
+      test(`${prefix}: unsubmitted gated candidate consumes no raw key (§4.1/§8.2)`, async h => {
+        await atHandover(h, handover); h.completeRetirement(); const gated = h.revokeRequest();
+        await h.ports.revokeGeneration(gated); // Deliberately no S7 submission.
+        h.retireFailedCandidateAndReserve(freshNode(h, "after-gated"));
+        const next = await finishHandover(h);
+        expect(next.receipt.exitedPodUIDs).toContain(gated.reservedReceiver.podUID);
+        h.reserveNextReceiver({ ...gated.reservedReceiver, podUID: `${gated.reservedReceiver.podUID}:fresh` });
+        h.reopen(); const reused = await finishHandover(h);
+        expect(reused.mount.self.nodeName).toBe(gated.reservedReceiver.nodeName);
+      });
+      test(`${prefix}: policy and first-invocation identity checks have no effects (§8.1.2/6)`, async h => {
+        await atHandover(h, handover); h.completeRetirement(); const original = h.revokeRequest(), before = h.observe();
+        for (const [request, code] of [
+          [rehash({ ...original, requiredProfile: "r3-storage-fence" }), "B1_POLICY_UNSATISFIED"],
+          [rehash({ ...original, storage: { ...original.storage, pvcUID: "foreign-storage" } }), "B1_STORAGE_IDENTITY_MISMATCH"],
+          [rehash({ ...original, reservedReceiver: { ...original.reservedReceiver, podUID: "foreign-self" } }), "B1_NOT_AUTHORIZED"],
+          [rehash({ ...original, reservedAcquisitionId: "foreign-acquisition" }), "B1_NOT_AUTHORIZED"],
+          [rehash({ ...original, expectedControllerRevision: "0" }), "B1_STALE_GENERATION"],
+          [{ ...original, requestSha256: "0".repeat(64) }, "B1_INVALID_ARGUMENT"],
+        ] satisfies readonly (readonly [RevokeGenerationRequest, B1ErrorCode])[]) {
+          await failure(() => h.ports.revokeGeneration(request), code, "refused"); expect(h.observe()).toEqual(before);
+        }
+        const unknown = structuredClone(original);
+        Object.defineProperty(unknown, "requiredProfile", { value: "unknown", enumerable: true });
+        await failure(() => h.ports.revokeGeneration(rehash(unknown)), "B1_UNSUPPORTED_PROFILE", "refused");
+        expect(h.observe()).toEqual(before);
+        await finishHandover(h); const attached = h.observe();
+        await failure(() => h.ports.currentMountGeneration({ ...h.mountRequest(), requiredProfile: "r3-storage-fence" }),
+          "B1_POLICY_UNSATISFIED", "refused");
+        expect(h.observe()).toEqual(attached);
+      });
+      test(`${prefix}: held/completed semantic conflicts and exact replays retain bytes (§8.1.1–4/§9 #3)`, async h => {
+        await atHandover(h, handover); h.completeRetirement(); h.setFact("workloadsExited", false);
+        const request = h.revokeRequest();
+        await failure(() => h.ports.revokeGeneration(request), "B1_TASKS_STILL_ALIVE", "held");
+        const held = h.observe();
+        for (const { change } of changedMembers) {
+          await failure(() => h.ports.revokeGeneration(rehash(change(request))), "B1_OPERATION_CONFLICT", "refused");
+          expect(h.observe()).toEqual(held);
+        }
+        h.reopen();
+        await failure(() => h.ports.revokeGeneration(request), "B1_TASKS_STILL_ALIVE", "held");
+        expect(h.observe()).toEqual(held);
+        const { receipt } = await finishHandover(h), committed = h.observe();
+        const { record, ...payload } = receipt;
+        expect(hash(encode(payload))).toBe(record.sha256);
+        expect(committed.retainedReceipt?.payloadBytes).toBe(encode(payload));
+        for (const { change } of changedMembers) {
+          await failure(() => h.ports.revokeGeneration(rehash(change(request))), "B1_OPERATION_CONFLICT", "refused");
+          expect(h.observe()).toEqual(committed);
+        }
+        const pristine = structuredClone(receipt);
+        Object.defineProperty(receipt.storage, "sessionId", { value: "caller-mutated" });
+        expect(await h.ports.revokeGeneration({ ...request, deadlineUnixMs: 0 })).toEqual(pristine);
+        expect(h.observe()).toEqual(committed);
+      });
+      test(`${prefix}: lost commit ACK and reopen preserve exactly one grant (§8.1.3/§9 #3)`, async h => {
+        await atHandover(h, handover); h.completeRetirement(); h.loseNextRevokeAck(); const request = h.revokeRequest();
+        await failure(() => h.ports.revokeGeneration(request), "B1_DRIVER_OUTCOME_UNKNOWN", "held");
+        const committed = h.observe();
+        expect(committed).toMatchObject({ operation: { state: "committed" }, receiverScheduled: false, receiverMounted: false });
+        expect(committed.attachGrant).not.toBeNull(); expect(committed.retainedReceipt).not.toBeNull();
+        const oldPorts = h.ports; h.reopen();
+        await failure(() => oldPorts.revokeGeneration(request), "B1_OBSERVER_UNAVAILABLE", "held");
+        const receipt = await h.ports.revokeGeneration({ ...request, deadlineUnixMs: 0 });
+        expect(receipt.record).toEqual(committed.retainedReceipt?.record); expect(h.observe()).toEqual(committed);
+        h.attachReservedReceiver();
+        expect((await h.ports.currentMountGeneration(h.mountRequest())).acquisitionId).toBe(request.reservedAcquisitionId);
+      });
+      test(`${prefix}: post-S6 facts are rechecked at attach and mount (§4.2 S6–S11/§4.3)`, async h => {
+        await atHandover(h, handover); h.completeRetirement(); await h.ports.revokeGeneration(h.revokeRequest());
+        for (const { fact } of factCases) {
+          h.setFact(fact, false); const before = h.observe();
+          await failure(() => h.attachReservedReceiver(), "B1_UNEXPECTED_ATTACHMENT", "held");
+          expect(h.observe()).toEqual(before); h.setFact(fact, true);
+        }
+        for (const item of teardownItems) {
+          h.setTeardown(item, false); const before = h.observe();
+          await failure(() => h.attachReservedReceiver(), "B1_UNEXPECTED_ATTACHMENT", "held");
+          expect(h.observe()).toEqual(before); h.setTeardown(item, true);
+        }
+        h.setFact("newReplicasAfterCut", false); const preCut = h.observe();
+        await failure(() => h.attachReservedReceiver(), "B1_MOUNT_LINEAGE_UNKNOWN", "held");
+        expect(h.observe()).toEqual(preCut); h.setFact("newReplicasAfterCut", true);
+        h.attachReservedReceiver();
+        for (const { fact } of factCases) {
+          h.setFact(fact, false); const before = h.observe();
+          await failure(() => h.ports.currentMountGeneration(h.mountRequest()), "B1_UNEXPECTED_ATTACHMENT", "held");
+          expect(h.observe()).toEqual(before); h.setFact(fact, true);
+        }
+        for (const item of teardownItems) {
+          h.setTeardown(item, false); const before = h.observe();
+          await failure(() => h.ports.currentMountGeneration(h.mountRequest()), "B1_UNEXPECTED_ATTACHMENT", "held");
+          expect(h.observe()).toEqual(before); h.setTeardown(item, true);
+        }
+        expect((await h.ports.currentMountGeneration(h.mountRequest())).self).toEqual(h.revokeRequest().reservedReceiver);
+      });
+      test(`${prefix}: malformed calls fail closed on both ports (§8.1.6–8)`, async h => {
+        await atHandover(h, handover); h.completeRetirement(); const original = h.revokeRequest(), before = h.observe();
+        for (const value of [0, 2, "1"]) {
+          const version = structuredClone(original);
+          Object.defineProperty(version, "version", { value, enumerable: true });
+          await failure(() => h.ports.revokeGeneration(rehash(version)), "B1_INVALID_ARGUMENT", "refused");
+          expect(h.observe()).toEqual(before);
+        }
+        for (const operationId of ["", " \t"]) {
+          await failure(() => h.ports.revokeGeneration(rehash({ ...original, operationId })), "B1_INVALID_ARGUMENT", "refused");
+          expect(h.observe()).toEqual(before);
+        }
+        const deadlines = [NaN, -1, 0.5, Infinity, Number.MAX_SAFE_INTEGER + 1];
+        for (const deadlineUnixMs of deadlines) {
+          await failure(() => h.ports.revokeGeneration({ ...original, deadlineUnixMs }), "B1_INVALID_ARGUMENT", "refused");
+          expect(h.observe()).toEqual(before);
+        }
+        await finishHandover(h); const mounted = h.observe();
+        for (const value of [0, 2, "1"]) {
+          const version = h.mountRequest(); Object.defineProperty(version, "version", { value, enumerable: true });
+          await failure(() => h.ports.currentMountGeneration(version), "B1_INVALID_ARGUMENT", "refused");
+          expect(h.observe()).toEqual(mounted);
+        }
+        for (const deadlineUnixMs of deadlines) {
+          await failure(() => h.ports.currentMountGeneration({ ...h.mountRequest(), deadlineUnixMs }), "B1_INVALID_ARGUMENT", "refused");
+          expect(h.observe()).toEqual(mounted);
+        }
+        for (const challengeNonce of ["", " \t"]) {
+          await failure(() => h.ports.currentMountGeneration({ ...h.mountRequest(), challengeNonce }), "B1_INVALID_ARGUMENT", "refused");
+          expect(h.observe()).toEqual(mounted);
+        }
+        const unknown = h.mountRequest();
+        Object.defineProperty(unknown, "requiredProfile", { value: "unknown", enumerable: true });
+        await failure(() => h.ports.currentMountGeneration(unknown), "B1_UNSUPPORTED_PROFILE", "refused");
+        await failure(() => h.ports.currentMountGeneration({ ...h.mountRequest(), deadlineUnixMs: 0 }), "B1_DEADLINE_HELD", "held");
+        for (const key of ["protectedRoot", "lockRelativePath", "generationRelativePath"] as const) {
+          const request = h.mountRequest();
+          await failure(() => h.ports.currentMountGeneration({ ...request, target: { ...request.target, [key]: "foreign" } }),
+            "B1_MOUNT_NOT_FOUND", "refused"); expect(h.observe()).toEqual(mounted);
+        }
+        await failure(() => h.ports.currentMountGeneration({ ...h.mountRequest(), target: {
+          ...h.mountRequest().target, bootstrapHandle: "foreign" } }), "B1_NOT_AUTHORIZED", "refused");
+        expect(h.observe()).toEqual(mounted);
+        const value = mounted.custodyValue;
+        for (const invalid of ["", "00", "+1", "-1", "1.0", "1e3", " 1", "1\n"]) {
+          h.setCustodyValue(invalid); const corrupt = h.observe();
+          await failure(() => h.ports.currentMountGeneration(h.mountRequest()), "B1_GENERATION_INVALID", "refused");
+          expect(h.observe()).toEqual(corrupt);
+        }
+        h.setCustodyValue(value);
+        expect((await h.ports.currentMountGeneration(h.mountRequest())).custody.value).toBe(value);
+        expect(h.observe()).toEqual(mounted);
+      });
+    }
+
+    test("three fresh handovers bind a/u/bootstrap/device/evidence and revoke the real predecessor (§4.1/§4.2 S7/§8.2)", async h => {
+      const history: Awaited<ReturnType<typeof finishHandover>>[] = [];
+      for (let i = 1; i <= 3; i++) {
+        if (i > 1) h.reserveNextReceiver(freshNode(h, `fresh-lineage-${i}`));
+        const request = h.revokeRequest(), prior = history.at(-1);
+        if (prior) {
+          expect(request.predecessor.since).toEqual({ kind: "receipt", record: prior.receiver.record });
+          expect(request.predecessor.generations).toHaveLength(1);
+          expect(request.predecessor.generations[0]).toMatchObject({ acquisitionId: prior.mount.acquisitionId,
+            receiver: prior.mount.self, engine: prior.mount.engine, applicationGeneration: prior.mount.custody.value });
+        }
+        for (const ref of [request.predecessor.restartDisabled, request.predecessor.killIssued]) {
+          expect(h.readEvidence(ref)).toMatchObject({ data: { storage: request.storage, operationId: request.operationId } });
+        }
+        expect(h.readEvidence(request.predecessor.enumeration)).toMatchObject({ data: { storage: request.storage,
+          operationId: request.operationId, acquisitionId: request.reservedAcquisitionId,
+          generations: request.predecessor.generations, podUIDs: request.predecessor.podUIDs,
+          since: request.predecessor.since.record } });
+        const done = await finishHandover(h), after = h.observe();
+        if (prior) {
+          expect(done.receipt.revoked).toHaveLength(1);
+          expect(done.receipt.revoked[0]).toMatchObject({ acquisitionId: prior.mount.acquisitionId,
+            receiver: prior.mount.self, engine: prior.mount.engine, applicationGeneration: prior.mount.custody.value });
+        }
+        for (const old of history) {
+          expect(done.mount.acquisitionId).not.toBe(old.mount.acquisitionId);
+          expect(done.mount.engine).not.toEqual(old.mount.engine);
+          expect(done.mount.engine.processUUID).not.toBe(old.mount.engine.processUUID);
+          expect(done.mountRequest.target.bootstrapHandle).not.toBe(old.mountRequest.target.bootstrapHandle);
+          expect(done.mount.actualMount.bootstrapExecutionId).not.toBe(old.mount.actualMount.bootstrapExecutionId);
+          expect(done.mount.actualMount.deviceLifetimeId).not.toBe(old.mount.actualMount.deviceLifetimeId);
+          for (const key of ["enumeration", "restartDisabled", "killIssued"] as const) {
+            expect(request.predecessor[key]).not.toEqual(old.request.predecessor[key]);
+          }
+          await failure(() => h.ports.currentMountGeneration({ ...old.mountRequest,
+            challengeNonce: h.mountRequest().challengeNonce }), "B1_NOT_AUTHORIZED", "refused");
+          expect(h.observe()).toEqual(after);
+        }
+        history.push(done);
+      }
+    });
+
+    // An old but genuine S1/S2/S3 record is not current coverage. Once that bad
+    // request is retained, repair requires §8.1.5's positive-drain slot transfer.
+    for (const member of ["since", "enumeration", "restartDisabled", "killIssued"] as const) {
+      test(`three later handovers reject stale ${member} evidence at revoke (§4.2 S1–S3/§8.1.5)`, async h => {
+        let prior = await finishHandover(h);
+        for (let i = 2; i <= 4; i++) {
+          h.reserveNextReceiver(freshNode(h, `stale-evidence-${i}`)); h.completeRetirement();
+          const request = h.revokeRequest();
+          const stale = rehash({ ...request, predecessor: { ...request.predecessor, [member]: prior.request.predecessor[member] } });
+          await failure(() => h.ports.revokeGeneration(stale), "B1_PREDECESSOR_SET_INCOMPLETE", "held");
+          noEffects(h); await noGrantAtPorts(h); const held = h.observe();
+          await failure(() => h.ports.revokeGeneration(request), "B1_OPERATION_CONFLICT", "refused");
+          expect(h.observe()).toEqual(held);
+          h.retireFailedCandidateAndReserve(freshNode(h, `drained-evidence-${i}`));
+          prior = await finishHandover(h);
+        }
       });
     }
 

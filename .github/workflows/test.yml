@@ -2,7 +2,7 @@ name: Test
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'fs/hotfix-1706-pkg']
   pull_request:
     branches: [main, 'refactor/sd-6477-**', 'feat/sd-6477-**']
 

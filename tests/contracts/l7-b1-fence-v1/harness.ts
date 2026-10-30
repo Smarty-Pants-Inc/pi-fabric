@@ -1,6 +1,7 @@
 import type {
   B1StoragePorts, ControllerRecordRef, CurrentMountGenerationRequest, EvidenceRef,
-  GenerationRef, ReceiverIdentity, ReceiverReceipt, RevokeGenerationRequest,
+  GenerationRef, ReceiverIdentity, ReceiverReceipt, RevokeGenerationRequest, StorageIdentity,
+  ActualMountTarget, EngineIncarnation, MountGeneration,
 } from "./contract.js";
 
 /** TEST CONTROLS, not additional B1 ports or an authority/serialized evidence ABI. */
@@ -78,12 +79,68 @@ export interface B1Observation {
   readonly storageSnapshot: string;
 }
 
+/** Fixture-local authenticated observer inputs. These are NOT a proposed production
+ * evidence schema or another port. Required members make field enumeration exhaustive;
+ * conformance walks every object/array member rather than maintaining a field allow-list. */
+export interface B1EvidenceBinding { storage: StorageIdentity; operationId: string }
+export interface B1InventoryInput extends B1EvidenceBinding {
+  acquisitionId: string;
+  since: ControllerRecordRef;
+  generations: readonly GenerationRef[];
+  podUIDs: readonly string[];
+  workloadTasks: readonly string[];
+  quarantinedNodeNames: readonly string[];
+  retiredCandidatePodUIDs: readonly string[];
+  oldReplicas: readonly string[];
+}
+export interface B1FdInput {
+  role: "lock" | "generation";
+  mountId: string; namespaceInode: string; deviceLifetimeId: string; filesystemUUID: string; inode: string;
+}
+export interface B1MountedInput {
+  storage: StorageIdentity; self: ReceiverIdentity; target: ActualMountTarget;
+  acquisitionId: string; engine: EngineIncarnation; actual: MountGeneration["actualMount"];
+  lock: B1FdInput | undefined; generation: B1FdInput | undefined;
+  lineageKnown: boolean; observerAvailable: boolean; observerFresh: boolean;
+  replicas: readonly { id: string; startedAfterCut: boolean }[];
+  attachObservation: EvidenceRef;
+}
+export interface B1TeardownInput extends B1EvidenceBinding {
+  item: B1TeardownItem;
+  acquisitionId: string;
+  cut: string;
+  retiredGenerations: readonly GenerationRef[];
+  exitedPodUIDs: readonly string[];
+  oldReplicasExited: boolean;
+  oldPathRetired: boolean;
+  oldIoDrained: boolean;
+}
+export interface B1FenceInputs {
+  inventory: B1InventoryInput;
+  restart: B1EvidenceBinding;
+  kill: B1EvidenceBinding;
+  factBindings: Record<B1Fact, { operationId: string; acquisitionId: string }>;
+  teardownBindings: Record<B1TeardownItem, { operationId: string; acquisitionId: string }>;
+  workloadTasks: readonly string[];
+  /** Read-only B1 data, NOT an M2 high-water authority. Any canonical counter is observable. */
+  custodyValue: string;
+  teardown: readonly B1TeardownInput[];
+  receiverReceipt: ReceiverReceipt | null;
+  mount: B1MountedInput | null;
+}
+
 export interface B1Harness {
   readonly ports: B1StoragePorts;
   revokeRequest(): RevokeGenerationRequest;
   /** Allocates a fresh CALLER challenge, not an expected-engine assertion. */
   mountRequest(): CurrentMountGenerationRequest;
   observe(): B1Observation;
+  /** Detached observer-input snapshot, only for field-level negative controls. */
+  fenceInputs(): B1FenceInputs;
+  /** Replace ONE observer-input member, not a port result or private assertion.
+   * Evidence payloads are retained under a fresh fixture-authenticated reference so
+   * the test exercises semantic binding, not merely a broken SHA-256. */
+  injectFenceField(path: readonly string[], value: unknown): void;
   setFact(fact: B1Fact, value: boolean): void;
   setTeardown(item: B1TeardownItem, value: boolean): void;
   /** Adds a real model task without rewriting the immutable request's coverage. */

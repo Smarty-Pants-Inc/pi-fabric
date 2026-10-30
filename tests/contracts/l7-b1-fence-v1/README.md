@@ -1,4 +1,4 @@
-# L7 B1 fence v1 — test-only callable contract (v3 conformance)
+# L7 B1 fence v1 — test-only callable contract (v4 generated conformance)
 
 This directory defines a source-tree, test-only TypeScript contract for the two
 B1 storage ports. Its common types cover both profile shapes, but the fake only
@@ -23,7 +23,7 @@ const fakeFactory: B1HarnessFactory = {
   name: "test-only B1 observed-profile fake",
   create: () => createTestOnlyFakeHarness(),
 };
-runConformance(fakeFactory);
+await runConformance(fakeFactory);
 
 it("lets a consumer call the two-port surface", async () => {
   const harness = createTestOnlyFakeHarness();
@@ -44,8 +44,10 @@ it("lets a consumer call the two-port surface", async () => {
 });
 ```
 
-`runConformance` registers the shared Vitest cases for the supplied
-`{ name, create }` factory. Each case should receive an isolated harness and
+`await runConformance` registers the shared Vitest cases for the supplied
+`{ name, create }` factory. Await it at test-module scope: registration first uses
+one disposable harness to enumerate the typed input shapes, then closes it.
+Each case should receive an isolated harness and
 close it in `finally`. Its fixed consumer surface is `ports`, `revokeRequest()`,
 `mountRequest()`, `observe()`, and `close()`. The harness also exposes typed
 TEST-ONLY fixture/controller, fault, reopen, and evidence controls, including
@@ -162,9 +164,10 @@ reopen and receipt readback cannot erase history; §11.2 maintenance is unmodele
 
 The `handover 1/3`, `handover 2/3`, and `handover 3/3` cases each run after an
 actual successful prefix on the same volume, with fresh selected node-name
-keys. They never pre-complete the handover whose missing observations they
-are testing. Every fact and T1–T8 is independently withheld, then restored for
-a positive control. Each hold leaves no receipt/grant, and attempted S7 attach
+keys. These older cases pre-complete retirement and then withhold a fact or
+T item; that checks conjunction/regression, not freshness of that observation.
+The V4 fresh-observation table below separately avoids pre-completion. Each
+older case restores its missing observation for a positive control. Each hold leaves no receipt/grant, and attempted S7 attach
 and mount observation still fail. These are finite model sequences, not a
 proof for arbitrarily many handovers or a claim of live fence enforcement.
 
@@ -193,6 +196,80 @@ harness observation/evidence controls. Those are explicit fixture obligations,
 not independent production instrumentation. In particular, client reopen does
 not simulate a process crash or prove durable storage. Mutation evidence and
 exact tested file hashes are supplied separately by each runner.
+
+## V4: enumerate the field class, not a named-mutant list
+
+The `generated N={1,2,3} path={normal,failed-transfer,reopen}` table crosses
+**every materialized input field** with every handover and entry path:
+
+- `fenceFieldPaths` recursively enumerates the actual typed
+  `RevokeGenerationRequest`, `CurrentMountGenerationRequest` and
+  `B1FenceInputs` snapshots. It visits object members, array membership and
+  array-element fields. `*` expands over **all** current array elements. Each
+  changed semantic request/ref gets a fresh harness/operation, so a conflict left
+  by the first bad request cannot masquerade as refusal of a later element.
+  Read-only mount faults and source observations outside the semantic request
+  can reuse a held operation only after restoring the injected field. An empty
+  primitive collection's element row tests an added member at the collection
+  boundary, not a fictitious existing element. Required input interfaces and an
+  independent TypeScript compiler-API field audit keep the shape complete: the
+  observed-B/candidate-test type expansion must equal the generated field table.
+- Each row submits one previous operation's field at a time, independently
+  rehashing a changed request. Inventory/restart/kill payload faults are retained
+  under fresh test-only references, so those negatives exercise semantic binding,
+  not just a damaged digest. Other rows change fixture-local observer or controller
+  source fields directly; this is not a production record-integrity decoder.
+  `injectFenceField` never changes a returned port result, and every row verifies
+  that its source injection actually took effect.
+- For handovers 2 and 3 the earlier evidence comes from an actual successful
+  prefix on the **same** volume. The initial fixture has no modeled H0 revoke
+  invocation; its H0 sample comes from the genuine disposable registration
+  fixture instead. This is not mislabeled as same-volume history.
+- The failed-transfer path commits a candidate, refuses normal transfer before
+  attachment, actually submits/fails its S7 attach, refuses undrained transfer,
+  then positively retires it. The *next* operation gets the whole field/gate
+  table. The old receipt is read back unchanged after transfer and the new
+  anchor/retired Pod history are checked. Reopen occurs **before the first
+  invocation** of the target operation, rather than only on an already held call.
+- Fact keys and T1–T8 are enumerated from their complete typed observations.
+  A separate generated row sets only the **other** observations, without first
+  calling `completeRetirement`. This distinguishes a freshly missing latch,
+  kill, workload exit or T item from an earlier handover's carried `true`.
+  The same treatment runs after a failed-candidate transfer and after reopen.
+- Every entry/ordinal also tests wrong predecessor generations **alone**,
+  dropped predecessor Pods **alone**, a higher nonmatching S1 revision, and an
+  expired retry at both an early and a post-effect hold. The expired retry must
+  preserve the **entire** observed state, not merely leave the grant absent.
+  Positive controls check current inventory history, engine/self node binding,
+  predecessor ticket identity, and teardown cut/generation/Pod bindings.
+
+There is an important non-vacuity rule: **the previous value is not necessarily
+invalid**. Same-volume storage identity, schema constants, unchanged predecessor
+fields after a failed candidate, and recyclable names can legitimately be equal
+to the current value. Such rows record/assert equality and inject an unequal
+value instead; they do not claim to have refused the unchanged value. A live
+previous deadline remains a valid invocation budget, and an H0 fixture's
+never-issued nonce is fresh in a different fixture. These get explicit expired
+or empty-value negatives. Likewise B1 observes any canonical actual custody n;
+rollback/high-water refusal belongs to M2, so this table checks noncanonical n
+rather than inventing an M2 check in the mount port. Mutation evidence must
+report these equal/allowed-value cases as equivalences, not as stale-evidence
+kills. This is a necessary semantic distinction, not an untested stale field.
+
+The input table includes full T1–T8 evidence payloads (item/storage/op/a/cut,
+retired generations, exited Pods and old-path observations), and the complete
+controller receiver receipt, including its envelope and candidate-test assurance.
+Thus field enumeration is not limited to the three request evidence references.
+The bounded journal's planned cut is reservation revision + five once-only
+transitions; this is fixture arithmetic, not a proposed production cut algorithm.
+
+The fake's additional input bindings and continuously pinned mount/replica/receipt
+comparisons are bounded fixture checks. They are **not** authentication of real
+helper journals, a production evidence decoder, or newly frozen evidence schemas.
+The optional `include(name)` registrar option is for focused mutation runs; the
+package's own test passes no filter and runs the entire table. Run-specific
+field manifests, mutation edits, per-context equivalence proofs, positive-control
+results, test counts and exact-byte hashes belong in the handoff artifacts.
 
 ## Suite scope and explicit non-proofs
 
@@ -235,6 +312,6 @@ The design input is
 `/srv/scratch/paul/design-b1ports-in/design-final.md`, SHA-256
 `00f1ad54b95b18f86e99529fe9bb5201bedcc6bcac2530a9951168803e643e40`.
 It records the final designer revision after the second/final challenge and
-retains the round-2 common contract unchanged. This v3 strengthening keeps that
+retains the round-2 common contract unchanged. This v4 strengthening keeps that
 contract and the seven-file package path; it does not assert production-owner
 acceptance, schema/fixture freeze, a production verifier, or qualification.

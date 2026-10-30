@@ -7,7 +7,7 @@ import type {
   RevokeGenerationRequest, RevokeReceipt, StorageIdentity,
 } from "./contract.js";
 import type {
-  B1Fact, B1Harness, B1MountFault, B1Observation, B1Scenario, B1TeardownItem,
+  B1Fact, B1Harness, B1MountFault, B1Observation, B1Scenario, B1TeardownItem, B1FenceInputs,
 } from "./harness.js";
 
 const copy = <T>(value: T): T => structuredClone(value);
@@ -106,6 +106,7 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
   const evidence = new Map<string, { ref: EvidenceRef; payloadBytes: string; payload: unknown }>();
   // Bounded helper-memory replies only, not protected/controller storage or reopen durability.
   const mountReplies = new Map<string, { ref: EvidenceRef; payload: unknown }>();
+  const challengeAcquisitions = new Map<string, string>();
   // Distinct test-only context, never a controller/helper authentication implementation.
   const retainEvidence = (kind: string, data: unknown): EvidenceRef => {
     const payload = { version: 1, kind, trustDomain: "test-only", data: copy(data) };
@@ -141,6 +142,21 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
   let enumeration = enumerationFor();
   let restartRef = retainEvidence("test-only.restart-observation", { storage, operationId });
   let killRef = retainEvidence("test-only.kill-observation", { storage, operationId });
+  const evidenceData = <T>(ref: EvidenceRef): T => copy((evidence.get(ref.uri)?.payload as { data: T }).data);
+  let expectedInventory = evidenceData<B1FenceInputs["inventory"]>(enumeration);
+  let observerInventory = copy(expectedInventory);
+  let observerRestart = { storage: copy(storage), operationId }, observerKill = copy(observerRestart);
+  const binding = () => ({ operationId, acquisitionId });
+  let factBindings = Object.fromEntries(factKeys.map(key => [key, binding()])) as B1FenceInputs["factBindings"];
+  let teardownBindings = Object.fromEntries(teardownItems.map(key => [key, binding()])) as B1FenceInputs["teardownBindings"];
+  const expectedTeardown = (): B1FenceInputs["teardown"] => teardownItems.map(item => ({
+    item, storage: copy(storage), operationId, acquisitionId,
+    // In this bounded journal: reserve + latch + kill + retire + commit, once each.
+    cut: (BigInt(reservationRevision) + 5n).toString(),
+    retiredGenerations: copy(actualPredecessors), exitedPodUIDs: copy(actualPodUIDs),
+    oldReplicasExited: true, oldPathRetired: true, oldIoDrained: true,
+  }));
+  let observerTeardown = expectedTeardown();
   const plan = retainEvidence("fabric.b1.qualification", { profile: "b1-v1-observed", state: "candidate-test",
     limitation: "in-memory fixture only; no installed platform or real verifier" });
   const assurance: Assurance = { profile: "b1-v1-observed", staleDriverOperations: "not-prevented",
@@ -159,7 +175,10 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
   let actualAttachment: B1Observation["actualAttachment"] = volume === "required" ? "predecessor" : "none";
   let receiverScheduled = false, mounted: ModelMount | undefined, contained = false;
   let candidateAttachSubmitted = false, failNextAttach = false;
+  let pinnedActual: ModelMount["actual"] | undefined;
+  let pinnedReplicas: ModelMount["replicas"] | undefined;
   let receiverReceipt: ReceiverReceipt | null = null, receiverReceiptPayloadBytes: string | null = null;
+  let pinnedReceiverReceipt: ReceiverReceipt | null = null;
   let custodyValue = scenario.custodyValue ?? "9007199254740993";
   let applicationBytes = "test-only acknowledged prefix\n", loseAck = false, closed = false;
   const progress = (): void => { revision += 1n; };
@@ -193,6 +212,15 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
     const expected = inventory();
     if (!facts.inventoryComplete || !same(req.predecessor, expected)) {
       fail("B1_PREDECESSOR_SET_INCOMPLETE", "held", "Request is not the independently retained complete predecessor inventory");
+    }
+    if (!same(observerInventory, expectedInventory)) {
+      fail(
+        "B1_PREDECESSOR_SET_INCOMPLETE", "held", "Observer inventory is not the retained current coverage");
+    }
+    if (factKeys.some(key => !same(factBindings[key], binding()))
+      || teardownItems.some(key => !same(teardownBindings[key], binding()))) {
+      fail(
+        "B1_TEARDOWN_INCOMPLETE", "held", "Gate observations belong to another operation/acquisition");
     }
     // A new task cannot be covered by editing a boolean or the hashed request (§8.1.5).
     if (!same(actualWorkloadTaskIds, enumeratedWorkloadTaskIds)) {
@@ -254,8 +282,12 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
     assertInventory(req);
     if (!facts.nodeReachable) fail("B1_NODE_UNREACHABLE", "held", "Independent node observation is unavailable");
     if (!operation.restartRevocationPersisted) { operation.restartRevocationPersisted = true; progress(); }
+    if (!same(observerRestart, { storage, operationId })) fail(
+      "B1_RESTART_NOT_DISABLED", "held", "Restart observation is not current/storage-bound");
     if (!facts.restartDisabled) fail("B1_RESTART_NOT_DISABLED", "held", "Caller restart reference cannot create observed restart suppression");
     if (!operation.killSubmitted) { operation.killSubmitted = true; progress(); }
+    if (!same(observerKill, { storage, operationId })) fail(
+      "B1_KILL_NOT_CONFIRMED", "held", "Kill observation is not current/storage-bound");
     if (!facts.killIssued) fail("B1_KILL_NOT_CONFIRMED", "held", "Independent pinned-containment kill acknowledgement missing");
     if (!operation.retirementRequested) { operation.retirementRequested = true; progress(); }
     if (!facts.driverOutcomeKnown) fail("B1_DRIVER_OUTCOME_UNKNOWN", "held", "Submitted driver work has unknown terminal outcome");
@@ -265,6 +297,10 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
     if (!facts.workloadsExited) fail("B1_TASKS_STILL_ALIVE", "held", "Kill submission is not actual workload/descendant exit");
     if (!facts.coverageContinuous || teardownItems.some(item => !teardown[item])) {
       fail("B1_TEARDOWN_INCOMPLETE", "held", "T1–T8 and continuous coverage are conjunctive");
+    }
+    if (!same(observerTeardown, expectedTeardown())) {
+      fail(
+        "B1_TEARDOWN_INCOMPLETE", "held", "T1–T8 evidence must bind this cut and exact retired generations/Pods");
     }
     const cut = (revision + 1n).toString();
     const teardownRefs = teardownItems.map(item => retainEvidence("fabric.b1.teardown", {
@@ -311,6 +347,10 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
       || receiverReceipt.bootstrapExecutionId !== m.actual.bootstrapExecutionId) {
       fail("B1_MOUNT_LINEAGE_UNKNOWN", "held", "Missing actual attach/acquisition/receiver-receipt lineage");
     }
+    if (!same(receiverReceipt, pinnedReceiverReceipt)) {
+      fail(
+        "B1_MOUNT_LINEAGE_UNKNOWN", "held", "Receiver receipt differs from the retained current controller payload/envelope");
+    }
     if (!retirementStillComplete()) fail("B1_UNEXPECTED_ATTACHMENT", "held", "Independent retirement/coverage facts changed after S6");
     if (!same(m.engine, engine) || m.actual.deviceLifetimeId !== `${id}:receiver-device-lifetime`) {
       fail("B1_MOUNT_CHANGED", "refused", "Recycled device name or changed engine does not preserve incarnation");
@@ -318,9 +358,19 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
     if (!m.replicas.length || m.replicas.some(replica => !replica.startedAfterCut)) {
       fail("B1_MOUNT_LINEAGE_UNKNOWN", "held", "Actual successor connections include an old/pre-cut replica");
     }
+    if ((m.lock && m.lock.role !== "lock") || (m.generation && m.generation.role !== "generation")) {
+      fail(
+        "B1_METADATA_OFF_VOLUME", "refused", "The independently opened metadata FD has the wrong role");
+    }
     if (!m.lock || !m.generation || !fdOnMount(m.lock, m) || !fdOnMount(m.generation, m)
       || m.lock.inode === m.generation.inode) {
       fail("B1_METADATA_OFF_VOLUME", "refused", "Each independently opened metadata FD must bind to the exact root mount");
+    }
+    if (!same({ ...m.actual, bootstrapExecutionId: pinnedActual?.bootstrapExecutionId,
+      deviceLifetimeId: pinnedActual?.deviceLifetimeId }, pinnedActual)
+      || !same(m.replicas.map(replica => replica.id), pinnedReplicas?.map(replica => replica.id))) {
+      fail(
+        "B1_MOUNT_CHANGED", "refused", "Actual mount/replica lifetimes differ from the continuously pinned attach observation");
     }
     const value = canonicalCounter(custodyValue).toString();
     const custody = { value, acquisitionId, recordSha256: sha256(canonical({ storage, acquisitionId, value })),
@@ -335,9 +385,15 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
     if (!mountReplies.has(observation.uri) && mountReplies.size >= 128) {
       fail("B1_OBSERVER_UNAVAILABLE", "held", "Bounded test-only helper reply memory is full");
     }
+    const usedAcquisition = challengeAcquisitions.get(req.challengeNonce);
+    if (usedAcquisition !== undefined && usedAcquisition !== acquisitionId) {
+      fail(
+        "B1_INVALID_ARGUMENT", "refused", "A caller challenge cannot be reused across acquisitions");
+    }
     const prior = mountReplies.get(observation.uri);
     if (prior && !same(prior.ref, observation)) fail("B1_INVALID_ARGUMENT", "refused", "Caller must use a fresh challenge for changed observations");
     mountReplies.set(observation.uri, { ref: observation, payload: observationPayload });
+    challengeAcquisitions.set(req.challengeNonce, acquisitionId);
     return { version: 1, challengeNonce: req.challengeNonce, storage: copy(m.storage), self: copy(m.self),
       acquisitionId: m.acquisitionId, engine: copy(m.engine), actualMount: copy(m.actual), custody,
       assurance: copy(assurance), observation, attachObservation: copy(m.attachObservation) };
@@ -375,6 +431,7 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
       mountId: actual.mountId, namespaceInode: actual.mountNamespaceInode,
       deviceLifetimeId: actual.deviceLifetimeId, filesystemUUID: storage.filesystemUUID });
     const replicas = [{ id: `${id}:new-replica-1`, startedAfterCut: true }, { id: `${id}:new-replica-2`, startedAfterCut: true }];
+    pinnedActual = copy(actual); pinnedReplicas = copy(replicas);
     const attachObservation = retainEvidence("fabric.b1.attach-observation", { storage, receiver, acquisitionId,
       revokeReceiptHash: operation.receipt.record.sha256, cut: operation.receipt.record.resourceVersion,
       engine, actual, replicas, nativeEpoch: { kind: "absent" } });
@@ -387,6 +444,7 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
       attachObservation: copy(mounted.attachObservation), assurance: copy(assurance) };
     receiverReceiptPayloadBytes = canonical(receiverPayload);
     receiverReceipt = { ...receiverPayload, record: recordFor("receiver-receipt", receiverReceiptPayloadBytes, (revision + 1n).toString()) };
+    pinnedReceiverReceipt = copy(receiverReceipt);
     actualAttachment = "receiver"; receiverScheduled = true; progress();
   };
   const mountFault = (fault: B1MountFault): void => {
@@ -474,6 +532,13 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
     enumeratedWorkloadTaskIds = copy(actualWorkloadTaskIds); enumeration = enumerationFor();
     restartRef = retainEvidence("test-only.restart-observation", { storage, operationId });
     killRef = retainEvidence("test-only.kill-observation", { storage, operationId });
+    expectedInventory = evidenceData<B1FenceInputs["inventory"]>(enumeration);
+    observerInventory = copy(expectedInventory);
+    observerRestart = { storage: copy(storage), operationId }; observerKill = copy(observerRestart);
+    factBindings = Object.fromEntries(factKeys.map(key => [key, binding()])) as B1FenceInputs["factBindings"];
+    teardownBindings = Object.fromEntries(teardownItems.map(key => [key, binding()])) as B1FenceInputs["teardownBindings"];
+    pinnedActual = undefined; pinnedReplicas = undefined; pinnedReceiverReceipt = null;
+    observerTeardown = expectedTeardown();
   };
   const observe = (): B1Observation => {
     const operationView = operation ? { operationId: operation.operationId, requestSha256: operation.requestSha256,
@@ -495,6 +560,38 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
       ...mounted, lock: mounted.lock ?? null, generation: mounted.generation ?? null,
     } : null, volume }) });
   };
+  const fenceInputs = (): B1FenceInputs => copy({ inventory: observerInventory, restart: observerRestart,
+    kill: observerKill, factBindings, teardownBindings, workloadTasks: actualWorkloadTaskIds,
+    custodyValue, teardown: observerTeardown, receiverReceipt, mount: mounted ?? null });
+  const injectFenceField = (path: readonly string[], value: unknown): void => {
+    assertLive();
+    if (!path.length) throw new Error("An observer field path is required");
+    const inputs = fenceInputs();
+    let parent: unknown = inputs;
+    for (const key of path.slice(0, -1)) {
+      if (!parent || typeof parent !== "object" || !(key in parent)) throw new Error(`Unknown observer path ${path.join(".")}`);
+      parent = (parent as Record<string, unknown>)[key];
+    }
+    const key = path.at(-1);
+    if (!key || !parent || typeof parent !== "object" || !(key in parent)) throw new Error(`Unknown observer field ${path.join(".")}`);
+    (parent as Record<string, unknown>)[key] = copy(value);
+    switch (path[0]) {
+      case "inventory": observerInventory = inputs.inventory;
+        enumeration = retainEvidence("fabric.b1.inventory", observerInventory); break;
+      case "restart": observerRestart = inputs.restart;
+        restartRef = retainEvidence("test-only.restart-observation", observerRestart); break;
+      case "kill": observerKill = inputs.kill;
+        killRef = retainEvidence("test-only.kill-observation", observerKill); break;
+      case "factBindings": factBindings = inputs.factBindings; break;
+      case "teardownBindings": teardownBindings = inputs.teardownBindings; break;
+      case "workloadTasks": actualWorkloadTaskIds = inputs.workloadTasks; break;
+      case "custodyValue": custodyValue = inputs.custodyValue; break;
+      case "teardown": observerTeardown = inputs.teardown; break;
+      case "receiverReceipt": receiverReceipt = inputs.receiverReceipt; break;
+      case "mount": mounted = inputs.mount ?? undefined; break;
+      default: throw new Error(`Unknown observer domain ${path[0]}`);
+    }
+  };
   return {
     get ports() { return ports; },
     revokeRequest() {
@@ -506,7 +603,7 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
     },
     mountRequest() { assertLive(); return { version: 1, target: copy(target), challengeNonce: `test-only-challenge-${randomUUID()}`,
       requiredProfile: "b1-v1-observed", deadlineUnixMs: Date.now() + 60_000 }; },
-    observe,
+    observe, fenceInputs, injectFenceField,
     setFact(key, value) { assertLive(); facts[key] = value; },
     setTeardown(item, value) { assertLive(); teardown[item] = value; },
     discoverWorkloadTask() {
@@ -526,6 +623,8 @@ export function createTestOnlyFakeHarness(scenario: B1Scenario = {}): B1Harness 
       volume = sealed ? "sealed-new" : "unsealed-new"; actualPredecessors = []; actualPodUIDs = [];
       actualWorkloadTaskIds = []; enumeratedWorkloadTaskIds = [];
       enumeration = enumerationFor(); actualAttachment = "none";
+      expectedInventory = evidenceData<B1FenceInputs["inventory"]>(enumeration); observerInventory = copy(expectedInventory);
+      observerTeardown = expectedTeardown();
     },
     attachReservedReceiver: attach,
     failNextReceiverAttach() { assertLive(); failNextAttach = true; },

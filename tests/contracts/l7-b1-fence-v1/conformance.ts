@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import type { B1ErrorCode, ReceiverIdentity, RevokeGenerationRequest } from "./contract.js";
+import type { B1ErrorCode, CurrentMountGenerationRequest, ReceiverIdentity, RevokeGenerationRequest } from "./contract.js";
 import type { B1Fact, B1Harness, B1HarnessFactory, B1MountFault, B1TeardownItem } from "./harness.js";
 
 // Independent consumer-side fixture encoding. Not imported from the implementation.
@@ -52,8 +52,71 @@ const complete = async (h: B1Harness) => {
 
 /** Callable shared observed-B cases. Each case owns a fresh harness and finally closes it.
  * Keep: data safety and the B1 trust boundary. No real verifier/cluster/crash acceptance. */
-export function runConformance(factory: B1HarnessFactory): void {
+export type B1FieldPath = readonly string[];
+/** Enumerate the materialized typed request/evidence shape, including collection
+ * membership AND every member field. No selected-field allow-list. Array indexes
+ * become '*' and are expanded against ALL elements of each actual handover. */
+export function fenceFieldPaths(value: unknown, path: B1FieldPath = []): B1FieldPath[] {
+  if (Array.isArray(value)) {
+    const children = value.flatMap((entry: unknown) => fenceFieldPaths(entry, [...path, "*"]));
+    return [path, ...new Map((children.length ? children : [[...path, "*"]]).map(p => [p.join("."), p])).values()];
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.entries(value).flatMap(([key, child]) => fenceFieldPaths(child, [...path, key]));
+  }
+  return [path];
+}
+export function fenceFieldValue(value: unknown, path: B1FieldPath): unknown {
+  for (const key of path) {
+    if (value === null || typeof value !== "object") return undefined;
+    value = (value as Record<string, unknown>)[key];
+  }
+  return value;
+}
+function concreteFields(value: unknown, path: B1FieldPath, prefix: B1FieldPath = []): B1FieldPath[] {
+  const [head, ...tail] = path;
+  if (head === undefined) return [prefix];
+  if (head === "*") {
+    if (!Array.isArray(value)) return [];
+    // No fictitious absent element: verify an empty primitive collection's
+    // membership with an added member. The compiler-API audit checks the shape.
+    if (!value.length && !tail.length) return [prefix];
+    return value.flatMap((entry: unknown, i: number) => concreteFields(entry, tail, [...prefix, String(i)]));
+  }
+  return concreteFields(fenceFieldValue(value, [head]), tail, [...prefix, head]);
+}
+function replaceField<T>(value: T, path: B1FieldPath, replacement: unknown): T {
+  const result = structuredClone(value), parent = fenceFieldValue(result, path.slice(0, -1));
+  const key = path.at(-1);
+  if (!key || !parent || typeof parent !== "object") throw new Error(`Missing generated field ${path.join(".")}`);
+  (parent as Record<string, unknown>)[key] = structuredClone(replacement);
+  return result;
+}
+/** Equal previous values (schema constants / same-volume identity / recyclable
+ * names) are valid: not a stale-evidence negative. Exercise a wrong value instead;
+ * the equality is an executable equivalence proof, never a claimed stale kill. */
+function wrongField(value: unknown): unknown {
+  if (Array.isArray(value)) return value.length ? [] : ["test-only-unretained-member"];
+  if (typeof value === "boolean") return !value;
+  if (typeof value === "number") return 0;
+  if (typeof value === "string") return value === "" ? "test-only-wrong" : "";
+  return "test-only-wrong";
+}
+
+export async function runConformance(factory: B1HarnessFactory,
+  options: { readonly include?: (name: string) => boolean } = {}): Promise<void> {
+  // Registration enumerates real typed values. No source parser, fake import,
+  // private-state access, hand-maintained field list or test-side result mutation.
+  const schemaHarness = await factory.create();
+  let fieldShapes: { request: RevokeGenerationRequest; mountRequest: CurrentMountGenerationRequest;
+    inputs: ReturnType<B1Harness["fenceInputs"]> };
+  try {
+    await complete(schemaHarness);
+    fieldShapes = { request: schemaHarness.revokeRequest(), mountRequest: schemaHarness.mountRequest(),
+      inputs: schemaHarness.fenceInputs() };
+  } finally { schemaHarness.close(); }
   const test = (name: string, run: (h: B1Harness) => void | Promise<void>): void => {
+    if (options.include && !options.include(name)) return;
     it(name, async () => {
       const harness = await factory.create();
       try { await run(harness); } finally { harness.close(); }
@@ -738,6 +801,11 @@ export function runConformance(factory: B1HarnessFactory): void {
     // Prefix replies are consumer-held oracles, not reconstructed from observe().
     const finishHandover = async (h: B1Harness) => {
       const done = await complete(h);
+      for (const ref of done.receipt.teardown) expect(h.readEvidence(ref)).toMatchObject({ data: {
+        cut: done.receipt.record.resourceVersion, retiredGenerations: done.receipt.revoked,
+        exitedPodUIDs: done.receipt.exitedPodUIDs, storage: done.request.storage,
+        operationId: done.request.operationId, acquisitionId: done.request.reservedAcquisitionId,
+      } });
       expect(done.receipt).toMatchObject({ storage: done.request.storage, reservedReceiver: done.request.reservedReceiver,
         reservedAcquisitionId: done.request.reservedAcquisitionId, revoked: done.request.predecessor.generations,
         exitedPodUIDs: done.request.predecessor.podUIDs });
@@ -750,6 +818,7 @@ export function runConformance(factory: B1HarnessFactory): void {
       expect(receiver).toMatchObject({ receiver: mount.self, acquisitionId: mount.acquisitionId,
         engine: mount.engine, bootstrapExecutionId: mount.actualMount.bootstrapExecutionId,
         attachObservation: mount.attachObservation, revokeReceipt: done.receipt.record });
+      expect(mount.engine.nodeUID).toBe(mount.self.nodeUID);
       expect(mount).toMatchObject({ storage: done.request.storage, self: done.request.reservedReceiver,
         acquisitionId: done.request.reservedAcquisitionId, custody: { acquisitionId: done.request.reservedAcquisitionId,
           value: before.custodyValue, recordSha256: hash(before.custodyRecordPayloadBytes) } });
@@ -1176,6 +1245,193 @@ export function runConformance(factory: B1HarnessFactory): void {
           h.retireFailedCandidateAndReserve(freshNode(h, `drained-evidence-${i}`));
           prior = await finishHandover(h);
         }
+      });
+    }
+
+    // V4: generated field table, crossed with every handover and entry path.
+    // The registration snapshot supplies SHAPE only. All oracle values below come
+    // from the consumer's previous replies/current request and public controls.
+    const snapshots = (h: B1Harness, mountRequest: CurrentMountGenerationRequest) => ({
+      request: h.revokeRequest(), mountRequest, inputs: h.fenceInputs(),
+    });
+    type EntryPath = "normal" | "failed-transfer" | "reopen";
+    const prepareFields = async (h: B1Harness, number: number, entry: EntryPath) => {
+      let previous: ReturnType<typeof snapshots> | undefined;
+      for (let i = 1; i < number; i++) {
+        const done = await finishHandover(h); previous = snapshots(h, done.mountRequest);
+        h.reserveNextReceiver(freshNode(h, `generated-${i + 1}`));
+      }
+      if (!previous) {
+        // The initial fixture's real predecessor has no modeled revoke invocation.
+        // The genuine, already-closed registration fixture supplies H0 values;
+        // it is NOT counted as a same-volume earlier successful handover.
+        previous = structuredClone(fieldShapes);
+      }
+      if (entry === "failed-transfer") {
+        h.completeRetirement(); const failedRequest = h.revokeRequest();
+        const failedReceipt = await h.ports.revokeGeneration(failedRequest);
+        const beforeAttach = h.observe();
+        await failure(() => h.reserveNextReceiver(freshNode(h, "never-attached-normal-transfer")), "B1_OPERATION_CONFLICT", "refused");
+        expect(h.observe()).toEqual(beforeAttach);
+        h.failNextReceiverAttach();
+        await failure(() => h.attachReservedReceiver(), "B1_DRIVER_OUTCOME_UNKNOWN", "held");
+        const beforeDrain = h.observe();
+        await failure(() => h.retireFailedCandidateAndReserve(freshNode(h, "undrained-transfer")), "B1_OPERATION_CONFLICT", "refused");
+        expect(h.observe()).toEqual(beforeDrain);
+        h.completeRetirement();
+        const failedInputs = h.fenceInputs();
+        h.retireFailedCandidateAndReserve(freshNode(h, "generated-after-failure"));
+        const transferred = h.observe();
+        expect(h.revokeRequest().predecessor.since).toEqual({ kind: "receipt", record: failedReceipt.record });
+        expect(await h.ports.revokeGeneration({ ...failedRequest, deadlineUnixMs: 0 })).toEqual(failedReceipt);
+        expect(h.observe()).toEqual(transferred);
+        previous = { request: failedRequest, mountRequest: previous.mountRequest,
+          inputs: { ...failedInputs, mount: previous.inputs.mount, receiverReceipt: previous.inputs.receiverReceipt } };
+      }
+      if (entry === "reopen") h.reopen(); // Before the FIRST invocation of this operation.
+      return previous;
+    };
+    const refusal = async (h: B1Harness, call: () => Promise<unknown>, mount = false) => {
+      const request = h.revokeRequest(), before = h.observe();
+      let error: unknown;
+      try { await call(); } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(Error);
+      expect(error).toMatchObject({ code: expect.stringMatching(/^B1_/),
+        disposition: expect.stringMatching(/^(refused|held)$/), evidence: [request.predecessor.enumeration] });
+      if (h.observe().operation) expect(error).toMatchObject({ operationId: request.operationId,
+        durableState: { resourceVersion: h.observe().controllerRevision } });
+      if (mount) expect(h.observe()).toEqual(before);
+      else expect(h.observe()).toMatchObject({ attachGrant: null, retainedReceipt: null,
+        receiverScheduled: false, receiverMounted: false });
+    };
+    const domains = Object.keys(fieldShapes) as (keyof typeof fieldShapes)[];
+    for (const number of [1, 2, 3]) for (const entry of ["normal", "failed-transfer", "reopen"] as const) {
+      const prefix = `generated N=${number} path=${entry}`;
+      for (const domain of domains) for (const path of fenceFieldPaths(fieldShapes[domain])) {
+        const label = `${domain}.${path.join(".")}`;
+        test(`${prefix} field=${label}: previous evidence or unequal-value negative`, async h => {
+          const firstPrevious = await prepareFields(h, number, entry);
+          const isMount = domain === "mountRequest" || (domain === "inputs" && ["mount", "custodyValue", "receiverReceipt"].includes(path[0] ?? ""));
+          if (isMount) await finishHandover(h); else h.completeRetirement();
+          const firstCurrent = snapshots(h, h.mountRequest());
+          const fields = concreteFields(firstCurrent[domain], path);
+          // A changed semantic request/ref needs a fresh operation per element:
+          // its retained conflict must not masquerade as a field-level refusal.
+          // Read-only mount faults and source observations outside the semantic
+          // request are restored and can reuse the same held operation safely.
+          const needsFresh = domain === "request" || (domain === "inputs" && ["inventory", "restart", "kill"].includes(path[0] ?? ""));
+          for (let index = 0; index < fields.length; index++) {
+            const fresh = index !== 0 && needsFresh;
+            const live = fresh ? await factory.create() : h;
+            try {
+              const previous = fresh ? await prepareFields(live, number, entry) : firstPrevious;
+              if (fresh) { if (isMount) await finishHandover(live); else live.completeRetirement(); }
+              const current = fresh ? snapshots(live, live.mountRequest()) : firstCurrent;
+              const concrete = concreteFields(current[domain], path)[index];
+              if (!concrete) throw new Error("Generated collection shape changed unexpectedly");
+              const value = fenceFieldValue(current[domain], concrete);
+              const oldValue = fenceFieldValue(previous[domain], concrete);
+              const equal = oldValue !== undefined && encode(value) === encode(oldValue);
+              let replacement = oldValue !== undefined && !equal ? oldValue : wrongField(value);
+              // An older, still-live deadline is permitted, and a never-issued
+              // foreign nonce is fresh. Neither is stale authority by itself.
+              if (concrete.at(-1) === "deadlineUnixMs") replacement = 0;
+              // Counter rollback/high-water is an M2 concern. B1 must report a
+              // canonical actual value, not reject an otherwise canonical old n.
+              if (domain === "inputs" && concrete[0] === "custodyValue") replacement = "";
+              if (domain === "mountRequest" && concrete[0] === "challengeNonce" && number === 1) replacement = "";
+              if (equal) expect(oldValue).toEqual(value); // Explicit equal-value equivalence.
+              if (domain === "request") {
+                let changed = replaceField(current.request, concrete, replacement);
+                if (concrete[0] !== "requestSha256") changed = rehash(changed);
+                await refusal(live, () => live.ports.revokeGeneration(changed));
+              } else if (domain === "mountRequest") {
+                const changed = replaceField(current.mountRequest, concrete, replacement);
+                await refusal(live, () => live.ports.currentMountGeneration(changed), true);
+              } else {
+                live.injectFenceField(concrete, replacement);
+                expect(fenceFieldValue(live.fenceInputs(), concrete)).toEqual(replacement);
+                await refusal(live, () => isMount ? live.ports.currentMountGeneration(live.mountRequest())
+                  : live.ports.revokeGeneration(live.revokeRequest()), isMount);
+                if (!needsFresh) live.injectFenceField(concrete, value);
+              }
+            } finally { if (live !== h) live.close(); }
+          }
+        });
+      }
+      for (const fact of Object.keys(schemaHarness.observe().facts) as B1Fact[]) {
+        test(`${prefix} fresh-fact=${fact}: withhold only this observation, never completeRetirement first`, async h => {
+          await prepareFields(h, number, entry);
+          for (const key of Object.keys(h.observe().facts) as B1Fact[]) if (key !== fact) h.setFact(key, true);
+          for (const item of Object.keys(h.observe().teardown) as B1TeardownItem[]) h.setTeardown(item, true);
+          const resetFalse = ["inventoryComplete", "restartDisabled", "killIssued", "workloadsExited",
+            "oldPathRetired", "oldReplicasExited", "oldIoDrained"].includes(fact);
+          if (!resetFalse) h.setFact(fact, false);
+          // The decisive assertion is the port refusal below, not a reset-flag assertion.
+          if (fact === "newReplicasAfterCut") {
+            await h.ports.revokeGeneration(h.revokeRequest());
+            await failure(() => h.attachReservedReceiver(), "B1_MOUNT_LINEAGE_UNKNOWN", "held");
+          } else {
+            const code = factCases.find(item => item.fact === fact)?.code;
+            if (!code) throw new Error(`Missing typed failure expectation for ${fact}`);
+            await failure(() => h.ports.revokeGeneration(h.revokeRequest()), code, "held");
+            withheld(h);
+            if (fact === "inventoryComplete" || fact === "nodeReachable") noEffects(h);
+            if (fact === "restartDisabled") expect(h.observe().operation).toMatchObject({ killSubmitted: false, retirementRequested: false });
+            if (fact === "killIssued") expect(h.observe().operation?.retirementRequested).toBe(false);
+          }
+        });
+      }
+      for (const item of Object.keys(schemaHarness.observe().teardown) as B1TeardownItem[]) {
+        test(`${prefix} fresh-teardown=${item}: all other items and T8 observed, this item NOT carried`, async h => {
+          await prepareFields(h, number, entry);
+          for (const key of Object.keys(h.observe().facts) as B1Fact[]) h.setFact(key, true);
+          for (const other of Object.keys(h.observe().teardown) as B1TeardownItem[]) if (other !== item) h.setTeardown(other, true);
+          // Require refusal through the port even if a broken fixture carried true.
+          await failure(() => h.ports.revokeGeneration(h.revokeRequest()), "B1_TEARDOWN_INCOMPLETE", "held"); withheld(h);
+        });
+      }
+      test(`${prefix}: wrong predecessor generations ALONE refuse before effects`, async h => {
+        const previous = await prepareFields(h, number, entry); h.completeRetirement(); const request = h.revokeRequest();
+        const generations = previous.request.predecessor.generations;
+        const wrong = encode(generations) !== encode(request.predecessor.generations) ? generations : [];
+        await failure(() => h.ports.revokeGeneration(rehash({ ...request,
+          predecessor: { ...request.predecessor, generations: wrong } })), "B1_PREDECESSOR_SET_INCOMPLETE", "held");
+        noEffects(h); withheld(h);
+      });
+      test(`${prefix}: dropped predecessor Pods ALONE refuse before effects`, async h => {
+        await prepareFields(h, number, entry); h.completeRetirement(); const request = h.revokeRequest();
+        await failure(() => h.ports.revokeGeneration(rehash({ ...request,
+          predecessor: { ...request.predecessor, podUIDs: [] } })), "B1_PREDECESSOR_SET_INCOMPLETE", "held");
+        noEffects(h); withheld(h);
+      });
+      test(`${prefix}: higher nonmatching S1 revision refuses without state change`, async h => {
+        await prepareFields(h, number, entry); h.completeRetirement(); const request = h.revokeRequest(), before = h.observe();
+        await failure(() => h.ports.revokeGeneration(rehash({ ...request,
+          expectedControllerRevision: (BigInt(request.expectedControllerRevision) + 1n).toString() })), "B1_STALE_GENERATION", "refused");
+        expect(h.observe()).toEqual(before);
+      });
+      for (const gate of ["restartDisabled", "workloadsExited"] as const) {
+        test(`${prefix}: expired retry of held ${gate} refuses and leaves ALL state unchanged`, async h => {
+          await prepareFields(h, number, entry); h.completeRetirement(); h.setFact(gate, false);
+          const request = h.revokeRequest();
+          await failure(() => h.ports.revokeGeneration(request), gate === "restartDisabled" ? "B1_RESTART_NOT_DISABLED" : "B1_TASKS_STILL_ALIVE", "held");
+          h.setFact(gate, true); const before = h.observe();
+          await failure(() => h.ports.revokeGeneration({ ...request, deadlineUnixMs: 0 }), "B1_DEADLINE_HELD", "held");
+          expect(h.observe()).toEqual(before); withheld(h);
+          expect((await h.ports.revokeGeneration(request)).operationId).toBe(request.operationId);
+        });
+      }
+      test(`${prefix}: complete current evidence is a positive control with exact inventory history`, async h => {
+        const previous = await prepareFields(h, number, entry);
+        const request = h.revokeRequest(), before = h.observe();
+        expect(h.readEvidence(request.predecessor.enumeration)).toMatchObject({ data: {
+          quarantinedNodeNames: before.quarantinedNodeNames, retiredCandidatePodUIDs: before.retiredCandidatePodUIDs,
+          generations: request.predecessor.generations, podUIDs: request.predecessor.podUIDs,
+          workloadTasks: before.actualWorkloadTaskIds, operationId: request.operationId,
+        } });
+        const done = await finishHandover(h);
+        if (entry !== "failed-transfer") expect(done.receipt.revoked[0]?.ticketId).not.toBe(previous.request.predecessor.generations[0]?.ticketId);
       });
     }
 

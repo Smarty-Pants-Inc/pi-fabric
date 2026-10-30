@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActorManager, FABRIC_ACTOR_ACTIVATION_ALARM_TOPIC, actorAlarmKey } from "../src/actors/manager.js";
 import { AgentManager } from "../src/agents/manager.js";
@@ -9,6 +10,7 @@ import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 import * as processIdentity from "../src/residency/process-identity.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
 import type { FabricActorDeliveryRequest } from "../src/actors/types.js";
+import { processIsAlive } from "../src/agents/transports/process-utils.js";
 
 // smarty-dev#9332: actor states that cannot act raise fabric.alarm.actor-activation (same envelope, ownerRoot routing),
 // evaluated on the existing retention sweep (retentionSweepMs, no new timer); repeat policy depends on alarm kind.
@@ -22,9 +24,9 @@ afterEach(async () => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 }, 60_000);
 const waitFor = async (predicate: () => boolean, timeoutMs = 15_000): Promise<void> => {
-  const until = Date.now() + timeoutMs;
+  const until = performance.now() + timeoutMs;
   while (!predicate()) {
-    if (Date.now() > until) throw new Error("Timed out");
+    if (performance.now() > until) throw new Error("Timed out");
     await new Promise(resolve => setTimeout(resolve, 20));
   }
 };
@@ -32,8 +34,8 @@ const settle = () => new Promise(resolve => setTimeout(resolve, 250)); // about 
 
 const setup = (persistent = false) => {
   const realNow = Date.now.bind(Date);
-  const clock = { skew: 0 };
-  vi.spyOn(Date, "now").mockImplementation(() => realNow() + clock.skew);
+  const clock = { skew: 0, now: undefined as number | undefined };
+  vi.spyOn(Date, "now").mockImplementation(() => clock.now ?? realNow() + clock.skew);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-actor-alarms-"));
   roots.push(root);
   const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100);
@@ -56,7 +58,7 @@ const setup = (persistent = false) => {
       actorRoot: path.join(root, "actors"), persistent, retentionSweepMs: 20 });
     return actors;
   };
-  return { root, mesh, agents, get actors() { return actors; }, clock, alarms, onDeliver, hostNotices, restart };
+  return { root, mesh, agents, get actors() { return actors; }, clock, alarms, onDeliver, hostNotices, restart, deliveries: onDeliver };
 };
 
 describe("actor state alarms (smarty-dev#9332)", () => {
@@ -305,11 +307,13 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     expect(s.alarms("actor-activation-blocked", actor.id)[1]!.data).toMatchObject({ repeat: true });
   }, 60_000);
 
-  // actor-run-stuck (pi-fabric#944 round 1): liveness only from this host's own record of the launched worker (pid plus
-  // /proc start time at spawn), never from the worker-writable status.json; anything unproven fails toward the alarm.
+  // Keep: #1695's real false-alarm catch and the data-safety boundary. Missing directory/status/host verification
+  // still warn after 30 min, but NEVER prove death or admit NEXT/retry. Worker-gone/reused also need exact native
+  // exit proof older than 5 s and unfinished work; worker-writable status is only an untrusted hint (OPTION 1).
   // Two real hanging runs: "stuck" gets the fault, "live" stays healthy (the counterexample, never alarmed).
   const stuckFixture = async () => {
     const s = setup();
+    const launches = vi.spyOn(ProcessTransport.prototype, "launch");
     const stuck = await s.actors.create({ name: "stuck", instructions: "Run", coalesce: false });
     const live = await s.actors.create({ name: "live", instructions: "Run", coalesce: false });
     await s.actors.tell(stuck.id, "HANG_WITH_PROGRESS stuck");
@@ -321,30 +325,53 @@ describe("actor state alarms (smarty-dev#9332)", () => {
       fs.existsSync(path.join(s.agents.runDirectory(s.actors.status(live.id).inFlightRun!.id)!, "status.json")));
     const owned = s.agents.workerIdentity(runId)!;
     expect(owned).toMatchObject({ pid: expect.any(Number), open: true });
+    await s.actors.tell(stuck.id, "NEXT must stay queued");
     const stuckAlarms = () => s.alarms("actor-run-stuck", stuck.id);
+    const expectNoLossOrNext = () => {
+      expect(s.actors.status(stuck.id)).toMatchObject({ status: "running", queued: 1, inFlightRun: { id: runId } });
+      expect(s.agents.actorRunUnfinished(runId, stuck.id)).toBe(true);
+      expect(s.agents.actorRunLost(runId)).toBe(false);
+      expect(processIsAlive(owned.pid)).toBe(true);
+      expect(launches).toHaveBeenCalledTimes(2); // only the two originals: no NEXT or retry
+    };
     const teardown = async () => {
-      // A run that did work detaches on an actor stop (fake-worker HANG_WITH_PROGRESS): end the runs themselves.
+      // Stop actor admission BEFORE ending its worker, so teardown cannot itself admit the queued NEXT.
       for (const id of [stuck.id, live.id]) {
         const inFlight = s.actors.status(id).inFlightRun?.id;
-        if (inFlight) await s.agents.stop(inFlight).catch(() => undefined);
         await s.actors.stop(id).catch(() => undefined);
+        if (inFlight) await s.agents.stop(inFlight).catch(() => undefined);
       }
     };
     /** Past the threshold, the stuck run alarms once with `reason`; the healthy run never does. */
-    const expectAlarm = async (reason: string) => {
+    const expectAlarm = async (reason: string, thresholdMs = 30 * MINUTE) => {
       s.clock.skew = 29 * MINUTE;
       await settle();
       expect(stuckAlarms()).toHaveLength(0);
+      expectNoLossOrNext();
       s.clock.skew = 31 * MINUTE;
       await waitFor(() => stuckAlarms().length === 1);
       const data = stuckAlarms()[0]!.data as Record<string, unknown>;
-      expect(data).toMatchObject({ runId, reason, ownerRoot: "session:test", thresholdMs: 30 * MINUTE });
+      expect(data).toMatchObject({ runId, reason, ownerRoot: "session:test", thresholdMs });
       await settle();
       expect(stuckAlarms()).toHaveLength(1);
       expect(s.alarms("actor-run-stuck", live.id)).toHaveLength(0);
+      expectNoLossOrNext();
       return data;
     };
-    return { s, runId, directory, owned, teardown, expectAlarm, stuckAlarms };
+    return { s, stuck, runId, directory, owned, teardown, expectAlarm, stuckAlarms, expectNoLossOrNext };
+  };
+  // The identity mock changes only the warning's reason. Supply the SEPARATE exact run/actor native evidence
+  // explicitly; it becomes available at 31 min, so the short fallback then owns slot 0 (15 s runtime threshold).
+  // Its real live transport still forbids any synthetic loss, which expectNoLossOrNext checks.
+  const mockNativeProof = (f: Awaited<ReturnType<typeof stuckFixture>>) => {
+    const observeExit = f.s.agents.actorWorkerExit.bind(f.s.agents);
+    let exitedAt: number | undefined;
+    return vi.spyOn(f.s.agents, "actorWorkerExit").mockImplementation((runId, actorId) => {
+      if (runId !== f.runId || actorId !== f.stuck.id) return observeExit(runId, actorId);
+      if (f.s.clock.skew < 31 * MINUTE) return undefined;
+      exitedAt ??= Date.now() - 5_001;
+      return { exitedAt, unfinished: true };
+    });
   };
   // The dead worker of (a), and (c)'s live process with a different start time: real processes, not invented pids.
   const deadPid = async (): Promise<number> => {
@@ -353,6 +380,140 @@ describe("actor state alarms (smarty-dev#9332)", () => {
     await new Promise(resolve => child.once("exit", resolve));
     return child.pid!;
   };
+
+  const holdWarning = (s: ReturnType<typeof setup>, actorId: string, boundary: "claim" | "publish") => {
+    const key = actorAlarmKey(actorId, "actor-run-stuck");
+    let reached = false;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    closers.push(async () => { release(); });
+    if (boundary === "claim") {
+      const writeBatch = s.mesh.writeBatch.bind(s.mesh);
+      vi.spyOn(s.mesh, "writeBatch").mockImplementation(async request => {
+        const results = await writeBatch(request);
+        if (!reached && results.some(result => result.key === key && result.applied)) {
+          reached = true;
+          await gate;
+        }
+        return results;
+      });
+    } else {
+      const publish = s.mesh.publish.bind(s.mesh);
+      vi.spyOn(s.mesh, "publish").mockImplementation(async input => {
+        const event = await publish(input);
+        if (!reached && input.kind === "actor-run-stuck" && (input.data as { actorId?: string })?.actorId === actorId) {
+          reached = true;
+          await gate;
+        }
+        return event;
+      });
+    }
+    return { reached: () => reached, release };
+  };
+
+  it.each([undefined, 0, 5_000])("worker-gone/reused identity alone cannot alarm or advance work without old exact native proof (exit age %s)", async age => {
+    const f = await stuckFixture();
+    const pid = await deadPid();
+    const real = f.s.agents.workerIdentity.bind(f.s.agents);
+    let identity = { pid, startTime: "1", open: true };
+    vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => id === f.runId ? identity : real(id));
+    f.s.clock.now = Date.now() + 31 * MINUTE; // freeze the strict 0/5000 ms boundary, not just the run's age
+    const observeExit = f.s.agents.actorWorkerExit.bind(f.s.agents);
+    vi.spyOn(f.s.agents, "actorWorkerExit").mockImplementation((runId, actorId) =>
+      runId === f.runId && actorId === f.stuck.id
+        ? age === undefined ? undefined : { exitedAt: Date.now() - age, unfinished: true }
+        : observeExit(runId, actorId));
+    try {
+      await settle();
+      expect(f.stuckAlarms()).toHaveLength(0);
+      f.expectNoLossOrNext();
+      if (process.platform === "linux") {
+        identity = { pid: process.pid, startTime: "1", open: true }; // positively live PID, wrong kernel birth
+        await settle();
+        expect(f.stuckAlarms()).toHaveLength(0);
+        f.expectNoLossOrNext();
+      }
+    } finally {
+      f.s.clock.now = undefined;
+      f.s.clock.skew = 0;
+      vi.mocked(f.s.agents.actorWorkerExit).mockRestore();
+      vi.mocked(f.s.agents.workerIdentity).mockRestore();
+      await f.teardown();
+    }
+  }, 60_000);
+
+  it.each(["claim", "publish"] as const)("a genuine completion suppresses a pending unverified warning after %s, even with the SAME in-flight run id", async boundary => {
+    const s = setup();
+    const actor = await s.actors.create({ name: "warning-completes", instructions: "Respond.", coalesce: false });
+    const finish = path.join(s.root, "finish-original");
+    const launches = vi.spyOn(ProcessTransport.prototype, "launch");
+    const run = s.agents.run.bind(s.agents);
+    let completed: Awaited<ReturnType<typeof run>> | undefined;
+    let releaseRun!: () => void;
+    const runGate = new Promise<void>(resolve => { releaseRun = resolve; });
+    closers.push(async () => { fs.writeFileSync(finish, "finish"); releaseRun(); });
+    vi.spyOn(s.agents, "run").mockImplementation(async (...args) => {
+      const result = await run(...args);
+      if (!completed) { completed = result; await runGate; }
+      return result;
+    });
+    await s.actors.tell(actor.id, "complete only on release", { fakeWorkerFinishGate: finish });
+    await waitFor(() => !!s.actors.status(actor.id).inFlightRun && fs.existsSync(`${finish}.entered`));
+    const runId = s.actors.status(actor.id).inFlightRun!.id;
+    const owned = s.agents.workerIdentity(runId)!;
+    expect(owned.open).toBe(true);
+    const workerIdentity = s.agents.workerIdentity.bind(s.agents);
+    vi.spyOn(s.agents, "workerIdentity").mockImplementation(id => id === runId ? undefined : workerIdentity(id));
+    // Keep native reconciliation out of this WARNING interleaving, including after real success.
+    const observeExit = s.agents.actorWorkerExit.bind(s.agents);
+    vi.spyOn(s.agents, "actorWorkerExit").mockImplementation((id, actorId) =>
+      id === runId && actorId === actor.id ? undefined : observeExit(id, actorId));
+    await s.actors.tell(actor.id, "NEXT after real completion");
+    const held = holdWarning(s, actor.id, boundary);
+    s.clock.skew = 31 * MINUTE;
+    await waitFor(held.reached);
+    const alarms = () => s.alarms("actor-run-stuck", actor.id);
+    expect(s.agents.actorRunUnfinished(runId, actor.id)).toBe(true);
+    expect(processIsAlive(owned.pid)).toBe(true);
+    expect(s.actors.status(actor.id)).toMatchObject({ queued: 1, inFlightRun: { id: runId } });
+    expect(launches).toHaveBeenCalledTimes(1);
+    expect(s.agents.actorRunLost(runId)).toBe(false);
+    if (boundary === "publish") expect(alarms()[0]!.data).toMatchObject({ reason: "worker-unverified", thresholdMs: 30 * MINUTE });
+
+    fs.writeFileSync(finish, "finish"); // the actual worker writes its completed result, not a forged status
+    await waitFor(() => completed?.id === runId);
+    expect(completed!.status).toBe("completed");
+    expect(s.agents.actorRunUnfinished(runId, actor.id)).toBe(false);
+    expect(s.actors.status(actor.id)).toMatchObject({ queued: 1, inFlightRun: { id: runId } });
+    held.release();
+    await settle();
+    // An event already committed before success is not retracted; its stale Main wake MUST be suppressed.
+    expect(alarms()).toHaveLength(boundary === "publish" ? 1 : 0);
+    expect(s.deliveries.mock.calls.filter(([request]) => request.triggerTurn && request.message.text?.includes("actor-run-stuck"))).toHaveLength(0);
+    expect(launches).toHaveBeenCalledTimes(1);
+    expect(s.agents.actorRunLost(runId)).toBe(false);
+    releaseRun();
+    await waitFor(() => launches.mock.calls.length === 2 && s.actors.status(actor.id).status === "idle");
+    expect(launches).toHaveBeenCalledTimes(2); // exactly one NEXT, never a replay
+  }, 60_000);
+
+  it("strict owner release suppresses a claimed unknown warning without stopping its live run or admitting NEXT", async () => {
+    const f = await stuckFixture();
+    const real = f.s.agents.workerIdentity.bind(f.s.agents);
+    vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => id === f.runId ? undefined : real(id));
+    const held = holdWarning(f.s, f.stuck.id, "claim");
+    try {
+      f.s.clock.skew = 31 * MINUTE;
+      await waitFor(held.reached);
+      f.expectNoLossOrNext();
+      f.s.actors.pauseForRelease({ strict: true });
+      held.release();
+      await settle();
+      expect(f.stuckAlarms()).toHaveLength(0);
+      expect(f.s.deliveries.mock.calls.filter(([request]) => request.triggerTurn && request.message.text?.includes("actor-run-stuck"))).toHaveLength(0);
+      f.expectNoLossOrNext();
+    } finally { held.release(); vi.mocked(f.s.agents.workerIdentity).mockRestore(); await f.teardown(); }
+  }, 60_000);
 
   it("actor-run-stuck (d): a missing run directory alarms with the generic run-dir-missing reason and no path", async () => {
     const f = await stuckFixture();
@@ -366,15 +527,16 @@ describe("actor state alarms (smarty-dev#9332)", () => {
   it("actor-run-stuck (a): a forged running status.json does not hide a dead owned worker", async () => {
     const f = await stuckFixture();
     const pid = await deadPid();
-    // The host's record names a worker that has exited; the status file claims it is running.
+    // The legacy identity mock alone is NOT native death authority; pair it with exact native proof.
+    const nativeProof = mockNativeProof(f);
     const real = f.s.agents.workerIdentity.bind(f.s.agents);
     vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => id === f.runId ? { pid, startTime: "1", open: true } : real(id));
     const status = JSON.parse(fs.readFileSync(path.join(f.directory, "status.json"), "utf8"));
     fs.writeFileSync(path.join(f.directory, "status.json"), JSON.stringify({ ...status, status: "running", sessionId: String(process.pid) }));
     try {
-      const data = await f.expectAlarm("worker-gone");
+      const data = await f.expectAlarm("worker-gone", 15_000);
       expect(data.workerStatusHint).toEqual({ untrusted: true, status: "running" });
-    } finally { vi.mocked(f.s.agents.workerIdentity).mockRestore(); await f.teardown(); }
+    } finally { nativeProof.mockRestore(); vi.mocked(f.s.agents.workerIdentity).mockRestore(); await f.teardown(); }
   }, 60_000);
 
   it("actor-run-stuck (b): a malformed status.json past the threshold alarms as worker-unverified", async () => {
@@ -388,9 +550,11 @@ describe("actor state alarms (smarty-dev#9332)", () => {
   it.skipIf(process.platform !== "linux")("actor-run-stuck (c): a live pid whose start time is not the recorded one (pid reuse) alarms", async () => {
     const f = await stuckFixture();
     // This process is alive, but it is not the worker the host launched: its start time differs.
+    const nativeProof = mockNativeProof(f);
     const real = f.s.agents.workerIdentity.bind(f.s.agents);
     vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => id === f.runId ? { pid: process.pid, startTime: "1", open: true } : real(id));
-    try { await f.expectAlarm("worker-pid-reused"); } finally { vi.mocked(f.s.agents.workerIdentity).mockRestore(); await f.teardown(); }
+    try { await f.expectAlarm("worker-pid-reused", 15_000); }
+    finally { nativeProof.mockRestore(); vi.mocked(f.s.agents.workerIdentity).mockRestore(); await f.teardown(); }
   }, 60_000);
 
   it("actor-run-stuck: an absent status record inside the startup window gives no alarm; past the threshold it alarms", async () => {
@@ -418,7 +582,8 @@ describe("actor state alarms (smarty-dev#9332)", () => {
         return id === f.runId && identity ? { ...identity, open: false } : identity; // the handle closed, the pid still alive
       });
       await waitFor(() => f.stuckAlarms().length === 1);
-      expect(f.stuckAlarms()[0]!.data).toMatchObject({ reason: "worker-unverified", runId: f.runId });
+      expect(f.stuckAlarms()[0]!.data).toMatchObject({ reason: "worker-unverified", runId: f.runId, thresholdMs: 30 * MINUTE });
+      f.expectNoLossOrNext();
       vi.mocked(f.s.agents.workerIdentity).mockRestore();
     } finally { await f.teardown(); }
   }, 60_000);
@@ -533,14 +698,15 @@ describe("actor state alarms (smarty-dev#9332)", () => {
   // smarty-dev#10067 P2-3: the worker-written status is allowlisted.
   it("an unknown worker status value becomes unknown in the alarm hint", async () => {
     const f = await stuckFixture();
+    const nativeProof = mockNativeProof(f);
     const real = f.s.agents.workerIdentity.bind(f.s.agents);
     vi.spyOn(f.s.agents, "workerIdentity").mockImplementation(id => id === f.runId ? { pid: 2147483647, startTime: "1", open: true } : real(id));
     const status = JSON.parse(fs.readFileSync(path.join(f.directory, "status.json"), "utf8"));
     fs.writeFileSync(path.join(f.directory, "status.json"), JSON.stringify({ ...status, status: "ok /home/paul/x Bearer y" }));
     try {
-      const data = await f.expectAlarm("worker-gone");
+      const data = await f.expectAlarm("worker-gone", 15_000);
       expect(data.workerStatusHint).toEqual({ untrusted: true, status: "unknown" });
-    } finally { vi.mocked(f.s.agents.workerIdentity).mockRestore(); await f.teardown(); }
+    } finally { nativeProof.mockRestore(); vi.mocked(f.s.agents.workerIdentity).mockRestore(); await f.teardown(); }
   }, 60_000);
 
   // smarty-dev#8903: the publish is idempotent per slot, so a crash between it and the `published` mark sends one alarm.

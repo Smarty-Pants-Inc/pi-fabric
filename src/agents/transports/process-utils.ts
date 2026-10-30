@@ -3,10 +3,10 @@ import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { AgentTransportLaunch } from "../types.js";
+import type { AgentNativeExitDiagnostic, AgentTransportLaunch } from "../types.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { terminateWindowsTree } from "../../child-process-tree.js";
-import { spawnDetached as spawnDetachedLegacy } from "./process-utils-legacy.js";
+import { observeProcessCgroup, spawnDetached as spawnDetachedLegacy } from "./process-utils-legacy.js";
 import { randomBytes } from "node:crypto";
 import {
   TASK_SCOPE_ENVIRONMENT, TASK_SCOPE_PREFIX, TaskScopeAdmissionError, assertMemoryMaxBytes, stopTaskCgroup, taskCgroupPids, taskScopeProperties, taskScopeShim, verifiedTaskMemoryMax,
@@ -310,7 +310,7 @@ export const spawnDetached = async (
   /** Ordinary workers need time to run their five-second execution-child cleanup. */
   termGraceMs = STOP_TERM_MS,
   executionCustodian = false,
-): Promise<{ pid: number; closed: Promise<void>; primaryExit?: Promise<void>; treeClosed?: Promise<void>; cgroup?: string; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
+): Promise<{ pid: number; closed: Promise<void>; primaryExit?: Promise<void>; nativeExit?(): AgentNativeExitDiagnostic | undefined; treeClosed?: Promise<void>; cgroup?: string; stop(): Promise<void>; isAlive(): Promise<boolean>; lostContact(): string | undefined; stopDebt?(): string | undefined; forcedCleanupCount?(): number; remainingDescendantCount?(): number; waitForClose(): Promise<void> }> => {
   // No PR observer or timer is created on the unscoped/unsupported path.
   const scopedLinux = Boolean(scope && process.platform === "linux");
   if (!scopedLinux) {
@@ -404,17 +404,23 @@ export const spawnDetached = async (
     return spawnDetached(workerPath, workerArguments, cwd, authority, environment, undefined, termGraceMs, executionCustodian);
   }
   const pid = child.pid;
+  let birth: LinuxGroupMember | undefined;
+  let birthUnknown = false;
+  try { birth = process.platform === "linux" ? linuxGroupMember(pid) : undefined; } catch { birthUnknown = true; }
+  let cgroupObservation = observeProcessCgroup(pid, birth?.started);
+  let nativeExit: AgentNativeExitDiagnostic | undefined;
   // Exit is latched: after the worker/group empties its numeric id is not identity.
   let exited = false;
   let force: ReturnType<typeof setTimeout> | undefined;
-  child.once("exit", () => { exited = true; clearTimeout(force); });
+  child.once("exit", (code, signal) => {
+    nativeExit = Object.freeze({ scope: "primary", pid, ...(birth ? { processStartTime: birth.started } : {}),
+      code, signal, exitedAt: Date.now(), cgroup: cgroupObservation });
+    exited = true; clearTimeout(force);
+  });
   let nativeClosed = false;
   const closed = new Promise<void>((resolve) => child.once("close", () => { nativeClosed = true; exited = true; clearTimeout(force); resolve(); }));
   const forcedDescendants = new Set<string>();
   const workerExited = new Promise<void>(resolve => child.once("exit", () => resolve()));
-  // Capture a scope-start failure for the typed capped admission refusal, never for replay.
-  let exitStatus: { code: number | null; signal: NodeJS.Signals | null } | undefined;
-  child.once("exit", (code, signal) => { exitStatus = { code, signal }; });
   let stopping: Promise<void> | undefined;
   let lost: string | undefined;
   const unconfirmed = (reason: string): void => {
@@ -444,9 +450,6 @@ export const spawnDetached = async (
       }
     } else if (message.type === "fabric-execution-settled") executionPending = false;
   });
-  let birth: LinuxGroupMember | undefined;
-  let birthUnknown = false;
-  try { birth = process.platform === "linux" ? linuxGroupMember(pid) : undefined; } catch { birthUnknown = true; }
   // Share the original birth anchor with sampled cleanup. A second observation
   // must not adopt a replacement process when the captured worker was absent.
   const ownedTree = treeOwner ? { processes: new Map<number, import("../../residency/launcher-owner.js").OwnedProcess>(
@@ -771,6 +774,8 @@ export const spawnDetached = async (
   const handle = {
     pid,
     closed,
+    primaryExit: workerExited,
+    nativeExit: () => nativeExit,
     lostContact: () => lost,
     stopDebt: () => stopFailed ? undefined : lost,
     forcedCleanupCount: () => forcedDescendants.size,
@@ -920,7 +925,12 @@ export const spawnDetached = async (
   if (scope && marker) {
     // Only a verified arm may publish event custody. Validation failure keeps
     // this same worker on checked legacy monitoring, without replay or receipt.
-    const admittedHandle = async () => await armTreeObservation() ? { ...handle, treeClosed: treeClosed! } : handle;
+    const admittedHandle = async () => {
+      // systemd may migrate the captured PID after spawn. Observe membership
+      // again at admission, independently of whether a kill boundary is proven.
+      if (!nativeExit) cgroupObservation = observeProcessCgroup(pid, birth?.started);
+      return await armTreeObservation() ? { ...handle, treeClosed: treeClosed! } : handle;
+    };
     try {
       let admissionFailureReason = "scope admission timed out before an authenticated marker";
       const admitted = await (async (): Promise<boolean> => {
@@ -975,6 +985,7 @@ export const spawnDetached = async (
         }
       })();
       if (admitted && !capped) return await admittedHandle();
+      if (admitted && !nativeExit) cgroupObservation = observeProcessCgroup(pid, birth?.started);
       if (admitted && await armTreeObservation() && boundary && gate?.writable) {
         // Proven owned v2 leaf with the configured cap: install the task-local
         // systemd-run wrapper, then release the shim to export and exec.
@@ -1022,8 +1033,8 @@ export const spawnDetached = async (
         // The gate was never released: no worker ran. systemd-run launched (it had a pid), so
         // the executable was present: ANY exit status, diagnostic, signal, receipt mismatch or
         // timeout fails closed. Uncapped replay is reserved for a proven missing executable.
-        throw new TaskScopeAdmissionError(scopeUnit!, cappedRefusal ?? (exitStatus
-          ? `scope exited before release (code ${exitStatus.code}, signal ${exitStatus.signal})` : "scope admission timed out"));
+        throw new TaskScopeAdmissionError(scopeUnit!, cappedRefusal ?? (nativeExit
+          ? `scope exited before release (code ${nativeExit.code}, signal ${nativeExit.signal})` : "scope admission timed out"));
       }
       // Report the stop only when the authorized uncapped fallback will proceed;
       // capped refusals and revoked launches already surface their own errors.

@@ -13,6 +13,7 @@ import type { FabricHostLease } from "../src/topology/host-leases.js";
 
 const observation = vi.hoisted(() => ({
   full: false,
+  windowsStamps: false,
   measure: false,
   listingSites: [] as string[][],
   notify: new Map<string, Set<(kind: BridgeChange) => void>>(),
@@ -32,6 +33,19 @@ vi.mock("../src/topology/host-leases.js", async importOriginal => {
       ? actual.readHostLeases(root) : actual.readHostLeasesFor(root, ids) };
 });
 
+// Exercise the real Windows metadata-only directory-stamp implementation on Linux too.
+// Scope the platform override to this synchronous function, never to stores or custody.
+vi.mock("../src/topology/publication-generation.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/topology/publication-generation.js")>();
+  return { ...actual, meshDirectoryStamp: (root: string, name: string) => {
+    if (!observation.windowsStamps) return actual.meshDirectoryStamp(root, name);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "win32" });
+    try { return actual.meshDirectoryStamp(root, name); }
+    finally { Object.defineProperty(process, "platform", platform); }
+  } };
+});
+
 const { MeshBridge, StoreBridgeSide } = await import("../src/mesh/bridge.js");
 const { MeshStore } = await import("../src/mesh/store.js");
 const { hostLeasePath, readHostLease, readHostLeases, writeHostLease } = await import("../src/topology/host-leases.js");
@@ -45,6 +59,7 @@ afterEach(() => {
   vi.mocked(readHostLeases).mockClear();
   observation.notify.clear();
   observation.full = false;
+  observation.windowsStamps = false;
   observation.measure = false;
   observation.listingSites.length = 0;
   // Preserve owned fixture files, including displaced versions, as test evidence.
@@ -154,8 +169,9 @@ describe("real StoreBridgeSide keyed lease consumers", () => {
     await f.compare([], false, false);
   });
 
-  it("classifies real notification snapshots identically without listing after each renewal", async () => {
+  it.each([false, true])("classifies real notification snapshots identically without listing after each renewal (Windows stamps=%s)", async windowsStamps => {
     const f = await fixture();
+    observation.windowsStamps = windowsStamps;
     const oracle: BridgeChange[] = [], keyed: BridgeChange[] = [], failures: Error[] = [];
     const beforeBaseline = f.listings();
     closers.push(f.side.subscribeChanges(kind => keyed.push(kind), error => failures.push(error)));

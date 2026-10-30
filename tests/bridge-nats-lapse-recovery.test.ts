@@ -151,15 +151,21 @@ describe("NATS carrier bounded lapse recovery", () => {
 
   it.each(["before-write", "after-rename"])("retains the same first timestamp after a %s failure", async mode => {
     const f = await fixture(); f.lapse(); const d = await f.deliver("write-failure", 1);
-    const realWrite = atomic.writeJsonAtomic, realSync = fs.fsyncSync;
-    const fault = mode === "before-write" ? vi.spyOn(atomic, "writeJsonAtomic").mockImplementation((file, value, options) => {
-      if (file === f.lapsePath) throw Object.assign(new Error("injected pre-write fault"), { code: "ENOSPC" });
-      return realWrite(file, value, options);
-    }) : vi.spyOn(fs, "fsyncSync").mockImplementation(fd => {
-      if (fs.fstatSync(fd).isDirectory()) throw Object.assign(new Error("injected directory barrier fault"), { code: "EIO" });
-      return realSync(fd);
+    const realWrite = atomic.writeJsonAtomic;
+    const fault = vi.spyOn(atomic, "writeJsonAtomic").mockImplementation((file, value, options) => {
+      if (file !== f.lapsePath) return realWrite(file, value, options);
+      if (mode === "before-write") throw Object.assign(new Error("injected pre-write fault"), { code: "ENOSPC" });
+      // The post-rename hook is invoked on every platform; Windows has no directory
+      // fsync to intercept. Still perform the real write, rename and namespace barrier.
+      return realWrite(file, value, { ...options, syncDirectory: directory => {
+        (options?.syncDirectory ?? atomic.syncDirectoryChain)(directory);
+        throw Object.assign(new Error("injected post-rename barrier fault"), { code: "EIO" });
+      } });
     });
-    await expect(f.link.remote.read(0)).rejects.toMatchObject({ code: mode === "before-write" ? "ENOSPC" : "EIO" });
+    // The link wraps a non-transient fault in BridgeLinkError (deferTransient); the injected code is kept on its cause.
+    const failure = await f.link.remote.read(0).then(() => undefined, (error: unknown) => error as { code?: unknown; cause?: { code?: unknown } });
+    expect(failure?.code ?? failure?.cause?.code).toBe(mode === "before-write" ? "ENOSPC" : "EIO");
+    if (mode === "after-rename") expect(f.saved()[0]!.startedAt).toBe(f.initial);
     fault.mockRestore(); expect(d.acked).toBe(0); expect(d.termed).toEqual([]);
     f.advance(WINDOW); await expect(f.link.remote.read(0)).resolves.toMatchObject({ events: [] });
     expect(f.saved()[0]!.startedAt).toBe(f.initial); expect(d.termed).toHaveLength(1);

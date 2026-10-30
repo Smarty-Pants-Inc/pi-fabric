@@ -415,7 +415,11 @@ export interface BridgeRead {
 
 export interface BridgeHead { through: number; offset?: number }
 
-export interface BridgePublishReceipt { sequence: number; createdAt?: number }
+export interface BridgePublishReceipt {
+  sequence: number; createdAt?: number;
+  /** Durably consumed as an event refusal, not a successful destination delivery. */
+  kind?: "refused";
+}
 
 export interface BridgePublish {
   principal?: FabricPrincipal | undefined;
@@ -454,7 +458,7 @@ export interface BridgeSide {
   /** Hub-local only: a structurally attributable projection whose authority is stale; never routing authority. */
   relayStaleOrigin?(id: string): string | undefined;
   /** Publish a bridged event; with `held`, only if this link holds each of those ids at commit. */
-  publish(event: BridgePublish, held?: string[]): Promise<{ sequence: number }>;
+  publish(event: BridgePublish, held?: string[]): Promise<BridgePublishReceipt>;
   /** Internal append receipt with the destination timestamp; older BridgeSide implementations may omit it. */
   publishWithReceipt?(event: BridgePublish, held?: string[]): Promise<BridgePublishReceipt>;
   /** Hub-local only: persist a payload-free successful relay receipt under the sender fence. */
@@ -1098,13 +1102,14 @@ export class StoreBridgeSide implements BridgeSide {
       if (digest === undefined) { digest = contentDigest(value); digests.set(value, digest); }
       return digest;
     };
-    const snapshot = () => {
+    const snapshot = (beforeFiles?: (hosts: readonly MeshStateEntry[], handoffs: readonly MeshStateEntry[]) => void) => {
       const hostEntries = fileState ? this.store.listAllShared(HOST_PREFIX, { fresh: true })
         : this.store.listAll(HOST_PREFIX, { fresh: true });
       const participantEntries = fileState ? this.store.listAllShared(PARTICIPANT_PREFIX, { fresh: true })
         : this.store.listAll(PARTICIPANT_PREFIX, { fresh: true });
       const handoffEntries = fileState ? this.store.listAllShared(BRIDGE_HANDOFF_PREFIX, { fresh: true })
         : this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true });
+      beforeFiles?.(hostEntries, handoffEntries);
       const leases = this.#presenceLeases(hostEntries, handoffEntries);
       // Include held projection existence/content, so an external prune/lease removal repairs
       // without waiting for traffic. Exclude our renewal fields: our own mirror writes then
@@ -1139,15 +1144,25 @@ export class StoreBridgeSide implements BridgeSide {
     // lease files. Taken inside the fence, it held state.db's write lock on EVERY change notification of the
     // mesh, for each bridge: on a busy hub each state write woke every bridge into a full scan under the lock,
     // so the bridges' share grew with the load (the idle spin). It is taken first; the fence then only proves
-    // that no such row changed since its revision (the pending writer has committed by then) and that both
-    // file directories kept their stamps. A failed proof takes it again; the last try runs inside the fence.
-    const files = (): string => `${meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR)}|${meshDirectoryStamp(this.store.root, HOST_LEASE_DIR)}`;
+    // that no such row changed since its revision (the pending writer has committed by then) and that the
+    // consulted files kept their stamps. A failed proof takes it again; the last try runs inside the fence.
     const capture = (): ReturnType<typeof snapshot> => {
       if (this.store.stateBackend !== "sqlite") return snapshot();
       for (let attempt = 0; attempt < HELD_FENCE_ATTEMPTS - 1; attempt += 1) {
         const revision = this.store.stateRevision();
-        const stamps = files();
-        const value = snapshot();
+        let files!: () => string;
+        let stamps!: string;
+        const value = snapshot((hosts, handoffs) => {
+          // Reuse this capture's prefix reads, then stamp BEFORE reading its files. The
+          // state revision proves the consulted host set stayed unchanged. Only handoffs
+          // need orphan lease authority; directory stamps would list all leases on Windows.
+          const ids = hosts.flatMap(entry => {
+            const host = presenceHostOf(entry.key, entry.value);
+            return host ? [host.id] : [];
+          });
+          files = () => this.#heldFiles(ids, handoffs.length > 0);
+          stamps = files();
+        });
         if (revision !== undefined && this.store.withStateWriteFence(() =>
           this.store.stateUnchangedSince(revision, HELD_STATE_PREFIXES) && files() === stamps)) return value;
       }
@@ -1634,7 +1649,8 @@ export class StoreBridgeSide implements BridgeSide {
   #fenced = false;
   #staleAdmission: BridgeStaleIncarnationError | undefined;
   #inflight: Promise<void> = Promise.resolve();
-  #leaseRenewal: Promise<void> = Promise.resolve();
+  #leaseRenewal: Promise<void> | undefined;
+  #mirrorsPending = 0;
   #hasCommittedPass = false;
   /** A lease effect under its host gate found newer lease authority on disk than its plan saw. */
   #leaseAuthorityAhead = false;
@@ -1648,7 +1664,14 @@ export class StoreBridgeSide implements BridgeSide {
     if (this.#staleAdmission) return Promise.reject(this.#staleAdmission);
     if (this.#fenced) return Promise.resolve();
     // Only the forced-command agent sets fromHub for its trusted hub's mirror RPC.
-    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt, fromHub)).catch((error: unknown) => {
+    this.#mirrorsPending++;
+    const run = this.#inflight.then(() => {
+      // Watch renewals and full reconciliation share host custody. Join only real work:
+      // the idle path must not add an await(undefined) or async-wrapper scheduling turn.
+      const mirror = () => this.#mirror(presence, false, observedAt, fromHub);
+      return this.#leaseRenewal ? this.#leaseRenewal.then(mirror) : mirror();
+    }).then(() => { this.#mirrorsPending--; }, (error: unknown) => {
+      this.#mirrorsPending--;
       if (error instanceof BridgeStaleIncarnationError) {
         // This instance never acquired the newer incarnation. Fence queued writes and keep
         // cleanup from withdrawing its predecessor's persisted authority after the refusal.
@@ -1662,10 +1685,13 @@ export class StoreBridgeSide implements BridgeSide {
   }
 
   /** Refresh only already-installed direct root leases, never membership or incarnations.
-   * A live watch may call this while a full mirror/drain is waiting. The existing per-host
-   * custody, current-row checks and exact file-version CAS still own every lease write. */
+   * Watch ticks run independently of drains, but defer to full mirrors sharing their custody.
+   * Current-row checks and exact file-version CAS still own every lease write. */
   renewMirroredLeases(hosts: readonly BridgeHost[], observedAt: number): Promise<void> {
-    const run = this.#leaseRenewal.then(async () => {
+    // Skip overlapping ticks: queued samples spend their authority waiting behind a lock.
+    if (this.#leaseRenewal) return Promise.resolve();
+    if (!this.#fenced && this.#mirrorsPending > 0) return Promise.reject(new BridgeMirrorDeferredError(false, 0));
+    const run = Promise.resolve().then(async () => {
       if (this.#staleAdmission) throw this.#staleAdmission;
       if (this.#fenced || !Number.isFinite(observedAt) || observedAt > this.now()) return;
       for (const { record, expiresAt, observedAt: sourceObservedAt } of hosts) {
@@ -1695,7 +1721,7 @@ export class StoreBridgeSide implements BridgeSide {
           }, false, false);
         });
       }
-    });
+    }).finally(() => { this.#leaseRenewal = undefined; });
     this.#leaseRenewal = run.catch(() => undefined);
     return run;
   }
@@ -2657,6 +2683,11 @@ export class StoreBridgeSide implements BridgeSide {
     }
   }
 
+}
+
+/** An unsafe side/link failure must never be mistaken for a permanent event refusal by message text. */
+export class BridgeLinkError extends Error {
+  override readonly name = "BridgeLinkError";
 }
 
 /** An event refused at commit: its sender or target is no longer bound to this link. */
@@ -4244,13 +4275,11 @@ export class MeshBridge {
     let pending: T | Promise<T>;
     try { pending = work(); }
     catch (error) { settled("rejected"); throw error; }
-    return Promise.resolve(pending).then(value => {
-      settled("fulfilled");
-      return value;
-    }, error => {
-      settled("rejected");
-      throw error;
-    });
+    const promise = Promise.resolve(pending);
+    // Observe settlement, do not wrap it: diagnostics must not insert an extra microtask
+    // between membership refresh and command publication/checkpointing (PR #1648).
+    void promise.then(() => settled("fulfilled"), () => settled("rejected"));
+    return promise;
   }
 
   /** Mirror each side's live roots into the other; concurrent callers share one pass. */
@@ -5098,7 +5127,8 @@ export class MeshBridge {
             seen.add(event.id);
             cursor.mark = Math.max(cursor.mark, published.sequence);
             cursor.after = event.sequence;
-            forwarded += 1;
+            if (published.kind === "refused") dropped += 1;
+            else forwarded += 1;
             checkpoint();
             this.#clearStallOnProgress(direction);
             // Only this newly inserted ID is covered by the checkpoint; recovery IDs stay.
@@ -5559,6 +5589,6 @@ const allBridgedIds = async (side: BridgeSide, after: number): Promise<Set<strin
 };
 
 const isPermanent = (error: unknown): boolean =>
-  !isIdempotencyKeyReused(error) && !isMeshIncarnationPending(error) && !isMeshSnapshotRetriesExhausted(error) &&
+  !(error instanceof BridgeLinkError || error instanceof BridgeMirrorDeferredError) && !isIdempotencyKeyReused(error) && !isMeshIncarnationPending(error) && !isMeshSnapshotRetriesExhausted(error) &&
   !isMeshLockTimeout(error) && (error instanceof BridgeOwnershipError ||
     error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message));

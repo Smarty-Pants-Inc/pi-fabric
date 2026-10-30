@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { readJsonlPage } from "../src/log-tail.js";
+import { ResidentRequestRetention, sweepResidentRuns } from "../src/residency/retention.js";
+import { MeshRetentionApplyDisabledError, sweepMeshRetention } from "../src/storage/retention-cli.js";
 import {
   FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed,
   pruneActorRunArchives, sweepTempRunRoots,
@@ -18,6 +20,45 @@ afterEach(() => {
 // Data safety: exercise real retention entry points and the same paged file reader
 // used by agents.logs, not an internal compaction mock or a source-text assertion.
 describe("raw terminal run trace preservation", () => {
+  it.each(["status.json.attempt-2-startup-retry", "lifecycle.jsonl.attempt-2-startup-retry-3",
+    "status.json.attempt-1-resume-1", "lifecycle.jsonl.attempt-1-resume"])(
+    "keeps a tree containing only %s as its permanent trace fence through resident and apply collection", async trace => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-attempt-retention-"));
+      roots.push(root);
+      const aged = Date.now() - 3 * 24 * HOUR, now = Date.now();
+      const bytes = Buffer.from([0, 255, 13, 10, 123, 0]);
+      const runs = path.join(root, "runs"), retained = path.join(runs, "retained"), control = path.join(runs, "control");
+      for (const run of [retained, control]) {
+        fs.mkdirSync(run, { recursive: true });
+        fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ status: "completed", finishedAt: aged,
+          transport: "process", sessionId: "2147483647" }));
+      }
+      fs.writeFileSync(path.join(retained, trace), bytes);
+      const assertRetained = () => expect(fs.readFileSync(path.join(retained, trace))).toEqual(bytes);
+      const ageRuns = () => { for (const run of [retained, control]) fs.utimesSync(run, aged / 1000, aged / 1000); };
+      ageRuns();
+      const collector = new ResidentRequestRetention(root, [], { retainRuns: false });
+      try { for (let slice = 0; slice < 20 && collector.due(now); slice++) collector.sweep(now, new Set(), 10_000); }
+      finally { collector.close(); }
+      expect(fs.existsSync(control), "resident sweep must actually collect the unfenced control").toBe(false);
+      assertRetained();
+
+      // Exercise both collection entry points used by the operator's apply path.
+      fs.mkdirSync(control);
+      fs.copyFileSync(path.join(retained, "status.json"), path.join(control, "status.json"));
+      ageRuns();
+      expect(sweepResidentRuns(runs, now, 10_000, { retainRuns: false })).toEqual([control]);
+      assertRetained();
+      fs.mkdirSync(control);
+      fs.copyFileSync(path.join(retained, "status.json"), path.join(control, "status.json"));
+      expect(pruneActorRunArchives({ runsDirectory: runs, retentionMs: HOUR, now })).toEqual([control]);
+      assertRetained();
+      // Public --apply remains disabled; do not bypass its independent safety boundary.
+      await expect(sweepMeshRetention(root, { dryRun: false })).rejects.toBeInstanceOf(MeshRetentionApplyDisabledError);
+      assertRetained();
+    },
+  );
+
   it.each(["actor", "closed root"] as const)("keeps every head byte and the paging generation through %s maintenance", kind => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-raw-trace-"));
     roots.push(root);

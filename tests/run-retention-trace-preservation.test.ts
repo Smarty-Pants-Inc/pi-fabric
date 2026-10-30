@@ -59,6 +59,38 @@ describe("raw terminal run trace preservation", () => {
     },
   );
 
+  // Judge prototype: the fence must also hold when the only attempt trace is in a nested child run.
+  it("keeps a run whose only attempt trace is in a nested child run through resident and apply collection", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-attempt-retention-nested-"));
+    roots.push(root);
+    const aged = Date.now() - 3 * 24 * HOUR, now = Date.now();
+    const bytes = Buffer.from([0, 255, 13, 10, 123, 0]);
+    const trace = "lifecycle.jsonl.attempt-1-resume";
+    const runs = path.join(root, "runs"), retained = path.join(runs, "retained"), control = path.join(runs, "control");
+    const record = JSON.stringify({ status: "completed", finishedAt: aged, transport: "process", sessionId: "2147483647" });
+    const build = (run: string, fenced: boolean) => {
+      const child = path.join(run, "nested", "child");
+      fs.mkdirSync(child, { recursive: true });
+      fs.writeFileSync(path.join(child, "status.json"), record);
+      if (fenced) fs.writeFileSync(path.join(child, trace), bytes);
+      fs.writeFileSync(path.join(run, "status.json"), record);
+      for (const directory of [child, path.join(run, "nested"), run]) fs.utimesSync(directory, aged / 1000, aged / 1000);
+    };
+    const assertRetained = () => expect(fs.readFileSync(path.join(retained, "nested", "child", trace))).toEqual(bytes);
+    build(retained, true); build(control, false);
+    const collector = new ResidentRequestRetention(root, [], { retainRuns: false });
+    try { for (let slice = 0; slice < 20 && collector.due(now); slice++) collector.sweep(now, new Set(), 10_000); }
+    finally { collector.close(); }
+    expect(fs.existsSync(control), "resident sweep must actually collect the unfenced nested control").toBe(false);
+    assertRetained();
+    build(control, false);
+    expect(sweepResidentRuns(runs, now, 10_000, { retainRuns: false })).toEqual([control]);
+    assertRetained();
+    build(control, false);
+    expect(pruneActorRunArchives({ runsDirectory: runs, retentionMs: HOUR, now })).toEqual([control]);
+    assertRetained();
+  });
+
   it.each(["actor", "closed root"] as const)("keeps every head byte and the paging generation through %s maintenance", kind => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-raw-trace-"));
     roots.push(root);

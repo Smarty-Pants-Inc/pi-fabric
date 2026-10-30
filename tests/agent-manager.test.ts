@@ -1939,36 +1939,46 @@ describe("AgentManager", () => {
     } finally { archive.mockRestore(); launch.mockRestore(); }
   }, 30_000);
 
-  it("leaves the live status trace untouched and aborts when preserving it fails", async () => {
+  // Judge prototype: the rename-failure fence, on startup-retry AND resume (F2's new early preserve).
+  it.each(["startup-retry", "resume"] as const)("leaves the live status trace untouched and aborts when preserving it fails on %s", async recovery => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-attempt-trace-error-"));
     roots.push(root);
     const originalLaunch = ProcessTransport.prototype.launch;
     const originalRename = fs.renameSync.bind(fs);
-    let launches = 0, statusFile: string | undefined;
+    const workerStatusEvidence = path.join(root, "worker-status.bytes");
+    let launches = 0, statusFile: string | undefined, taskFile: string | undefined, taskBytes: Buffer | undefined;
     let originalStatus: Buffer | undefined;
     const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
       launches++;
       statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      taskFile = request.workerArguments[request.workerArguments.indexOf("--task-file") + 1]!;
+      if (recovery === "resume") request.workerArguments.push("--status-evidence", workerStatusEvidence);
       return originalLaunch.call(this, request);
     });
     const rename = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
       if (String(source) === statusFile && String(destination).includes(".attempt-")) {
-        originalStatus = fs.readFileSync(statusFile!);
+        originalStatus ??= fs.readFileSync(statusFile!);
+        taskBytes ??= taskFile ? fs.readFileSync(taskFile) : undefined;
         throw Object.assign(new Error("trace rename denied"), { code: "EIO" });
       }
       return originalRename(source, destination);
     });
     try {
       const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
-        workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root,
+        workerPath: path.resolve(recovery === "resume" ? "tests/fixtures/fake-worker.mjs" : "tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root,
       });
       managers.push(manager);
-      const result = await manager.run({ task: "Preserve trace before startup retry", transport: "process" });
-      expect(result.status).toBe("failed");
+      const result = await manager.run({ task: recovery === "resume" ? "RESUME_AFTER_STOP" : "Preserve trace before startup retry", transport: "process" });
+      if (recovery === "startup-retry") expect(result.status).toBe("failed");
       expect(result.error).toContain("relaunch failed: trace rename denied");
       expect(launches).toBe(1);
       expect(statusFile).toBeDefined(); expect(originalStatus).toBeDefined();
       expect(fs.readFileSync(statusFile!)).toEqual(originalStatus);
+      if (recovery === "resume") {
+        // The live record is still the worker's own publication: no continuation identity rewrite, no task rewrite.
+        expect(fs.readFileSync(statusFile!)).toEqual(fs.readFileSync(workerStatusEvidence));
+        expect(fs.readFileSync(taskFile!)).toEqual(taskBytes);
+      }
     } finally { rename.mockRestore(); launch.mockRestore(); }
   }, 30_000);
 

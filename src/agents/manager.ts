@@ -856,6 +856,12 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   processStopPending?: boolean;
   /** Primary loss captured before the first stop, never populated by stop's own teardown. */
   workerGoneBeforeStop?: AgentTransportHandle;
+  /** Host-proven actor loss is terminal input custody, even before its drain resumes. */
+  actorRunLost?: true;
+  /** Actor queue custody must commit before a synthetic loss becomes observable. */
+  onActorRunLost?: (() => boolean) | undefined;
+  /** One fallback join of the exact current actor execution; never a replacement launch. */
+  actorReconcile?: Promise<AgentRunResult | undefined>;
   /** Windows settlement retains native admission until captured close and any stop join. */
   nativeReleasePending?: Promise<void>;
   /** Native-close settlement owns RUN release until joined or host-reconciled. */
@@ -1295,11 +1301,13 @@ const readNestedAgents = (runDirectory: string, depth = 0): AgentRunRecord[] => 
 };
 
 const summarizeRunLog = (runDirectory: string, lines: number): string => {
-  const page = readJsonlPage(path.join(runDirectory, "events.jsonl"), lines);
+  // Read the byte-bounded tail, then count useful activity, not host diagnostics.
+  // A diagnostic-only tail must not displace the worker's last useful events.
+  const page = readJsonlPage(path.join(runDirectory, "events.jsonl"), Number.MAX_SAFE_INTEGER);
   const summary: string[] = [];
   for (const entry of page.lines) {
     const parsed = entry.parsed as Record<string, unknown> | undefined;
-    if (!parsed || typeof parsed.type !== "string") continue;
+    if (!parsed || typeof parsed.type !== "string" || parsed.type === "run.native_exit") continue;
     const rawDetail =
       typeof parsed.error === "string"
         ? parsed.error
@@ -1317,7 +1325,7 @@ const summarizeRunLog = (runDirectory: string, lines: number): string => {
       .slice(0, MAX_LOG_DETAIL_CHARS);
     summary.push(detail ? `${type}: ${detail}` : type);
   }
-  return summary.join(" | ").slice(-MAX_LOG_SUMMARY_CHARS);
+  return summary.slice(-lines).join(" | ").slice(-MAX_LOG_SUMMARY_CHARS);
 };
 
 const writeRecord = (filePath: string, record: AgentRunRecord): void => {
@@ -2360,7 +2368,7 @@ export class AgentManager {
    * beforeCommit is a separate resident-host mutation fence, checked after model preparation.
    * callerReturnAddress is a validated resident caller snapshot, never a task request field.
    */
-  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, routerAdmission?: SpawnRouterAdmission): Promise<AgentHandleInfo> {
+  spawn(request: AgentRunRequest, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, routerAdmission?: SpawnRouterAdmission, onActorRunLost?: () => boolean): Promise<AgentHandleInfo> {
     // Only a native argument may carry caller authority. Task-supplied fields are ignored.
     routerAdmission = routerAdmission && { ...routerAdmission,
       targetRootId: this.#mainAgentId ?? routerAdmission.targetRootId,
@@ -2387,7 +2395,7 @@ export class AgentManager {
       try {
         while (this.#releasePaused && !probe) await this.#waitForRelease(signal);
         if (this.#closing) throw new Error("Fabric agent manager is closing");
-        return await this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, returnAddress, routerStart);
+        return await this.#spawn(request, signal, authorize, beforeCommit, onOutputPrincipalDowngrade, onLaunched, preparation, returnAddress, routerStart, onActorRunLost);
       } catch (error) {
         if (!routerStart.settled) {
           routerStart.settled = true;
@@ -2414,6 +2422,73 @@ export class AgentManager {
     // pid may already name another process. A handle with no close notification is indeterminate: not open.
     const open = managed.transport.closed !== undefined && !identity.closed && !managed.settled && managed.executionExited !== true && managed.transport.lostContact?.() === undefined;
     return { pid: identity.pid, startTime: identity.startTime, open };
+  }
+
+  /** Host-only work classification; undefined is unknown, never native death or session-release authority. */
+  actorRunUnfinished(runId: string, actorId: string): boolean | undefined {
+    const managed = this.#runs.get(runId);
+    if (managed?.actorId !== actorId || managed.relaunchPending) return undefined;
+    return !managed.settled && !terminalWorkerResult(readRecord(managed.statusFile));
+  }
+
+  /** Exact host-held transport exit plus native PID/birth proof, never a log/status timestamp.
+   * Terminal classification is separate: its stranded continuation can still need reconciliation. */
+  actorWorkerExit(runId: string, actorId: string): { exitedAt: number; unfinished: boolean } | undefined {
+    const managed = this.#runs.get(runId);
+    if (managed?.actorId !== actorId || managed.relaunchPending || !this.#actorWorkerGone(managed)) return undefined;
+    const exit = managed.transport.nativeExit?.();
+    if (!exit || !Number.isFinite(exit.exitedAt)) return undefined;
+    return { exitedAt: exit.exitedAt, unfinished: this.actorRunUnfinished(runId, actorId) === true };
+  }
+
+  /** A dead actor's indeterminate activation must never be redriven or parked for replay. */
+  actorRunLost(runId: string): boolean { return this.#runs.get(runId)?.actorRunLost === true; }
+
+  /**
+   * Safety net for a blocked monitor/run continuation (#17191). Reuse the exact
+   * native execution owner: primary death permits observation, NOT session reuse.
+   * A surviving descendant or an unconfirmed close keeps the actor fenced.
+   */
+  reconcileActorRun(runId: string, actorId: string): Promise<AgentRunResult | undefined> {
+    const managed = this.#runs.get(runId);
+    if (!managed || managed.actorId !== actorId || managed.relaunchPending || managed.launchCancelled ||
+        !this.#actorWorkerGone(managed)) return Promise.resolve(undefined);
+    if (managed.actorReconcile) return managed.actorReconcile;
+    const transport = managed.transport;
+    const pending = Promise.resolve().then(async () => {
+      if (managed.transport !== transport || managed.relaunchPending) return undefined;
+      // Passive observation first: #drainExecution actively stops its tree.
+      // Never use that stop to manufacture room for a concurrent session writer.
+      if (!managed.executionExited &&
+          await this.#transportAliveUntil(transport, Date.now() + TRANSPORT_EXIT_GRACE_MS)) return undefined;
+      if (managed.transport !== transport || managed.relaunchPending) return undefined;
+      const record = readRecord(managed.statusFile);
+      const observingLoss = await this.#settleGoneActorWorker(managed, record);
+      // The helper can still be passively observing descendants/uncertainty.
+      // That is not permission to escalate their tree from this fallback.
+      if (observingLoss && !managed.settled) return undefined;
+      // Genuine worker terminal results (including Windows' native-close path)
+      // still need the same stop/close/tree join as the normal monitor.
+      if (!managed.settled) {
+        await this.#drainExecution(managed);
+        if (managed.transport !== transport || managed.relaunchPending || !managed.executionExited) return undefined;
+        await this.#captureWorktree(managed);
+        if (!managed.settled) {
+          const joined = readRecord(managed.statusFile);
+          if (!terminalWorkerResult(joined)) return undefined;
+          this.#settle(managed, this.#withTransportMetadata(joined!, managed) as AgentRunResult);
+        }
+      }
+      if (!managed.executionExited) await this.#drainExecution(managed);
+      await managed.processStop;
+      await managed.nativeReleasePending;
+      // Logical settlement alone cannot lift same-session/native custody.
+      if (!managed.executionExited || managed.processStopPending || managed.lostContact || transport.lostContact?.() !== undefined) return undefined;
+      return this.#settledResult(managed);
+    }).catch(() => undefined);
+    managed.actorReconcile = pending;
+    void pending.then(() => { if (managed.actorReconcile === pending) delete managed.actorReconcile; });
+    return pending;
   }
 
   async #launchTransport(adapter: AgentTransportAdapter, request: AgentTransportLaunch, probe = false): Promise<AgentTransportHandle> {
@@ -2446,6 +2521,23 @@ export class AgentManager {
       const transport = await pending;
       // Includes launches that race close, before a ManagedAgent can own them.
       this.#unregisteredTransports.add(transport);
+      // Retain each generation's host-native primary exit before monitor/close
+      // continuations can archive it. This is diagnostic only: neither this
+      // event nor its cgroup observation grants native/tree custody release.
+      let nativeExitRecorded = false;
+      const retainNativeExit = (): void => {
+        if (nativeExitRecorded) return;
+        try {
+          const exit = transport.nativeExit?.();
+          if (!exit) return;
+          nativeExitRecorded = true;
+          fs.appendFileSync(path.join(this.#runRoot, request.id, "events.jsonl"),
+            JSON.stringify({ type: "run.native_exit", ts: exit.exitedAt, id: request.id, ...exit }) + "\n", { mode: 0o600 });
+        } catch { /* Best-effort diagnostics never block execution or settlement. */ }
+      };
+      void transport.primaryExit?.then(retainNativeExit, () => undefined);
+      void transport.closed?.then(retainNativeExit, () => undefined);
+      retainNativeExit(); // an adapter may return an already-exited handle
       // The launched worker's identity, from this host's own spawn (never the worker's status file): its pid and
       // kernel start time, read now, while this process still holds the unreaped child (smarty-dev#9332).
       const pid = transport.kind === "process" ? Number(transport.sessionId) : NaN;
@@ -2536,7 +2628,7 @@ export class AgentManager {
     return true;
   }
 
-  async #spawn(request: AgentRunRequest & AgentModelSelection, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, routerStart?: { settled: boolean; admission?: SpawnRouterAdmission | undefined }): Promise<AgentHandleInfo> {
+  async #spawn(request: AgentRunRequest & AgentModelSelection, signal?: AbortSignal, authorize?: () => boolean, beforeCommit?: (id: string) => void, onOutputPrincipalDowngrade?: () => void, onLaunched?: (handle: AgentHandleInfo) => void, preparation?: AgentLaunchPreparationOptions, callerReturnAddress?: TaskReturnAddress, routerStart?: { settled: boolean; admission?: SpawnRouterAdmission | undefined }, onActorRunLost?: () => boolean): Promise<AgentHandleInfo> {
     if (!this.config.enabled) throw new Error("Agents are disabled in Fabric configuration");
     if (this.#currentDepth >= this.config.maxDepth) {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
@@ -3477,6 +3569,7 @@ export class AgentManager {
           ...(this.#fabricSessionId ? { fabricSessionId: this.#fabricSessionId } : {}),
           outputPrincipal: copyFabricPrincipal(request.provenance?.principal),
           onOutputPrincipalDowngrade,
+          onActorRunLost,
           runner,
           runnerAdapter,
           ...(kernel ? { kernel } : {}),
@@ -4313,6 +4406,7 @@ export class AgentManager {
     onOutputPrincipalDowngrade?: () => void,
     onQueued?: (handle: AgentHandleInfo) => void,
     preparation?: AgentLaunchPreparationOptions,
+    onActorRunLost?: () => boolean,
   ): Promise<AgentRunResult> {
     while (this.#releasePaused && !request.residentStartupProbe) await this.#waitForRelease(signal);
     if (request.actorId && request.activationId && !signal?.aborted && (!authorize || authorize())) {
@@ -4321,7 +4415,8 @@ export class AgentManager {
     }
     const recovered = this.#recoverEnodevRun(request, signal, authorize);
     if (recovered) return recovered;
-    const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned, preparation);
+    const handle = await this.spawn(request, signal, authorize, undefined, onOutputPrincipalDowngrade, onSpawned, preparation,
+      undefined, undefined, onActorRunLost);
     const queued = this.#queued.get(handle.id);
     if (queued && !queued.terminal && !queued.preparing) onQueued?.(this.#queuedInfo(queued));
     // The actor drain's own run is a same-session execution fence, including
@@ -7064,7 +7159,15 @@ export class AgentManager {
       ? this.#withTransportMetadata(joined, managed) as AgentRunResult
       : { ...failedRecord(managed, "failed", "Actor worker is proven gone; execution was lost and will not be automatically relaunched"),
         startedAt: joined?.startedAt ?? record?.startedAt ?? Date.now() };
-    if (!terminalWorkerResult(joined)) writeRecord(managed.statusFile, result);
+    if (!terminalWorkerResult(joined)) {
+      // Synchronous host checkpoint, before status/result publication on BOTH
+      // the monitor and fallback paths. A failed barrier leaves the same joined
+      // execution pending for the next observation; never publish then fence.
+      try { if (managed.onActorRunLost?.() === false) return true; }
+      catch { return true; }
+      managed.actorRunLost = true;
+      writeRecord(managed.statusFile, result);
+    }
     this.#settle(managed, result);
     return true;
   }
@@ -7307,6 +7410,9 @@ export class AgentManager {
         const alive = managed.actorId
           ? await managed.transport.isAlive()
           : await this.#transportAliveUntil(managed.transport, finishingDeadline ?? deadline);
+        // A fallback may have joined and settled this exact execution while a
+        // liveness RPC was blocked. Its late continuation owns no second verdict.
+        if (managed.settled) return;
         if (!alive) {
           firstObservedDeadAt ??= livenessCheckedAt;
           if (livenessCheckedAt - firstObservedDeadAt >= TRANSPORT_EXIT_GRACE_MS) {

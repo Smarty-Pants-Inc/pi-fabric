@@ -1098,13 +1098,14 @@ export class StoreBridgeSide implements BridgeSide {
       if (digest === undefined) { digest = contentDigest(value); digests.set(value, digest); }
       return digest;
     };
-    const snapshot = () => {
+    const snapshot = (beforeFiles?: (hosts: readonly MeshStateEntry[], handoffs: readonly MeshStateEntry[]) => void) => {
       const hostEntries = fileState ? this.store.listAllShared(HOST_PREFIX, { fresh: true })
         : this.store.listAll(HOST_PREFIX, { fresh: true });
       const participantEntries = fileState ? this.store.listAllShared(PARTICIPANT_PREFIX, { fresh: true })
         : this.store.listAll(PARTICIPANT_PREFIX, { fresh: true });
       const handoffEntries = fileState ? this.store.listAllShared(BRIDGE_HANDOFF_PREFIX, { fresh: true })
         : this.store.listAll(BRIDGE_HANDOFF_PREFIX, { fresh: true });
+      beforeFiles?.(hostEntries, handoffEntries);
       const leases = this.#presenceLeases(hostEntries, handoffEntries);
       // Include held projection existence/content, so an external prune/lease removal repairs
       // without waiting for traffic. Exclude our renewal fields: our own mirror writes then
@@ -1139,15 +1140,25 @@ export class StoreBridgeSide implements BridgeSide {
     // lease files. Taken inside the fence, it held state.db's write lock on EVERY change notification of the
     // mesh, for each bridge: on a busy hub each state write woke every bridge into a full scan under the lock,
     // so the bridges' share grew with the load (the idle spin). It is taken first; the fence then only proves
-    // that no such row changed since its revision (the pending writer has committed by then) and that both
-    // file directories kept their stamps. A failed proof takes it again; the last try runs inside the fence.
-    const files = (): string => `${meshDirectoryStamp(this.store.root, PARTICIPANT_FILE_DIR)}|${meshDirectoryStamp(this.store.root, HOST_LEASE_DIR)}`;
+    // that no such row changed since its revision (the pending writer has committed by then) and that the
+    // consulted files kept their stamps. A failed proof takes it again; the last try runs inside the fence.
     const capture = (): ReturnType<typeof snapshot> => {
       if (this.store.stateBackend !== "sqlite") return snapshot();
       for (let attempt = 0; attempt < HELD_FENCE_ATTEMPTS - 1; attempt += 1) {
         const revision = this.store.stateRevision();
-        const stamps = files();
-        const value = snapshot();
+        let files!: () => string;
+        let stamps!: string;
+        const value = snapshot((hosts, handoffs) => {
+          // Reuse this capture's prefix reads, then stamp BEFORE reading its files. The
+          // state revision proves the consulted host set stayed unchanged. Only handoffs
+          // need orphan lease authority; directory stamps would list all leases on Windows.
+          const ids = hosts.flatMap(entry => {
+            const host = presenceHostOf(entry.key, entry.value);
+            return host ? [host.id] : [];
+          });
+          files = () => this.#heldFiles(ids, handoffs.length > 0);
+          stamps = files();
+        });
         if (revision !== undefined && this.store.withStateWriteFence(() =>
           this.store.stateUnchangedSince(revision, HELD_STATE_PREFIXES) && files() === stamps)) return value;
       }
@@ -1650,12 +1661,13 @@ export class StoreBridgeSide implements BridgeSide {
     if (this.#fenced) return Promise.resolve();
     // Only the forced-command agent sets fromHub for its trusted hub's mirror RPC.
     this.#mirrorsPending++;
-    const run = this.#inflight.then(async () => {
-      // Watch renewals and full reconciliation share host custody. Join the already-active
-      // renewal, while new watch ticks defer rather than contend with this pass in our pid.
-      await this.#leaseRenewal;
-      await this.#mirror(presence, false, observedAt, fromHub);
-    }).catch((error: unknown) => {
+    const run = this.#inflight.then(() => {
+      // Watch renewals and full reconciliation share host custody. Join only real work:
+      // the idle path must not add an await(undefined) or async-wrapper scheduling turn.
+      const mirror = () => this.#mirror(presence, false, observedAt, fromHub);
+      return this.#leaseRenewal ? this.#leaseRenewal.then(mirror) : mirror();
+    }).then(() => { this.#mirrorsPending--; }, (error: unknown) => {
+      this.#mirrorsPending--;
       if (error instanceof BridgeStaleIncarnationError) {
         // This instance never acquired the newer incarnation. Fence queued writes and keep
         // cleanup from withdrawing its predecessor's persisted authority after the refusal.
@@ -1663,7 +1675,7 @@ export class StoreBridgeSide implements BridgeSide {
         this.#fenced = true;
       }
       throw error;
-    }).finally(() => { this.#mirrorsPending--; });
+    });
     this.#inflight = run.catch(() => undefined);
     return run;
   }
@@ -4254,13 +4266,11 @@ export class MeshBridge {
     let pending: T | Promise<T>;
     try { pending = work(); }
     catch (error) { settled("rejected"); throw error; }
-    return Promise.resolve(pending).then(value => {
-      settled("fulfilled");
-      return value;
-    }, error => {
-      settled("rejected");
-      throw error;
-    });
+    const promise = Promise.resolve(pending);
+    // Observe settlement, do not wrap it: diagnostics must not insert an extra microtask
+    // between membership refresh and command publication/checkpointing (PR #1648).
+    void promise.then(() => settled("fulfilled"), () => settled("rejected"));
+    return promise;
   }
 
   /** Mirror each side's live roots into the other; concurrent callers share one pass. */

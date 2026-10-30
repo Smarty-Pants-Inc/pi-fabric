@@ -10,6 +10,14 @@ import {
   type TransportKv, type TransportOwner, type TransportSent,
 } from "./types.js";
 import { fabricPathBProbeEpochNs, hasFabricPathBProbeObserver, recordFabricPathBProbe } from "./probe-hooks.js";
+import type { NativeRecoveryCustodyReader } from "../core/session-receipts.js";
+import { resolveNativeMainSuccessor } from "../topology/stall-alarms.js";
+
+export interface NativeFileCommandRoute {
+  readNativeCustody: NativeRecoveryCustodyReader;
+  ownerIdentityId: string;
+  ownerIncarnation: string;
+}
 
 const CONTROL_TOPIC = "fabric.control.command";
 const ACK_TOPIC = "fabric.control.ack";
@@ -24,8 +32,39 @@ export class FileControlReader {
   #offset = 0;
   #lastSequence = 0;
   #inHand = new Set<number>();
+  #nativeCommandRoute: NativeFileCommandRoute | undefined;
   constructor(readonly mesh: MeshStore, readonly hostId: string) {}
   get lastSequence(): number { return this.#lastSequence; }
+
+  /** Host-only native accessor and exact activation, never a wildcard filter callback. */
+  setNativeCommandRoute(route: NativeFileCommandRoute | undefined): void {
+    this.#nativeCommandRoute = route ? { ...route } : undefined;
+  }
+
+  #accepts(event: MeshEvent): boolean {
+    if (isControl(event, this.hostId)) return true;
+    const route = this.#nativeCommandRoute, body = event.data;
+    if (!route || event.topic !== CONTROL_TOPIC || (event.kind !== "steer" && event.kind !== "followUp") ||
+        (event.verification !== "mesh" && event.verification !== "bridge") ||
+        !body || typeof body !== "object" || Array.isArray(body) ||
+        !("targetId" in body) || typeof body.targetId !== "string" || !body.targetId.startsWith("session:") ||
+        event.to !== body.targetId || !("operation" in body) || body.operation !== event.kind ||
+        !("ownerIncarnation" in body) || body.ownerIncarnation !== route.ownerIncarnation ||
+        route.ownerIdentityId !== this.hostId) return false;
+    let outgoingNative = false, uncertain = false;
+    const successor = resolveNativeMainSuccessor(this.mesh.root, body.targetId, scope => {
+      try {
+        const custody = route.readNativeCustody(scope);
+        outgoingNative ||= custody.status === "validated" && custody.transfers.some(edge =>
+          `session:${edge.source.sessionId}` === body.targetId);
+        uncertain ||= custody.status === "hold";
+        return custody;
+      } catch (error) { uncertain = true; throw error; }
+    });
+    if (!successor && (outgoingNative || uncertain)) throw new Error(`Native FILE routing HOLD for ${body.targetId}`);
+    return successor?.rootId === this.hostId && successor.bindings.length > 0 &&
+      successor.bindings.every(binding => binding.phase === "received");
+  }
 
   async drain(
     accept: (event: MeshEvent) => Promise<void> | void,
@@ -41,7 +80,7 @@ export class FileControlReader {
       for (const event of tail.events) {
         if (paused() || canConsume?.() === false) return false;
         if (event.sequence <= this.#lastSequence) continue;
-        if (isControl(event, this.hostId)) {
+        if (this.#accepts(event)) {
           if (beforeEvent?.(event) === false) return false;
           this.#inHand.add(event.sequence);
           try {
@@ -66,7 +105,7 @@ export class FileControlReader {
     for (;;) {
       const tail = this.mesh.tail(offset, 100);
       for (const event of tail.events) {
-        if (event.sequence > this.#lastSequence && isControl(event, this.hostId) && !this.#inHand.has(event.sequence)) pending++;
+        if (event.sequence > this.#lastSequence && this.#accepts(event) && !this.#inHand.has(event.sequence)) pending++;
       }
       if (tail.events.length < 100 || tail.nextOffset === offset) break;
       offset = tail.nextOffset;

@@ -10,7 +10,9 @@ import type { AgentManager } from "../agents/manager.js";
 import { DEFAULT_FOLLOW_UP_DEADLINE_MS } from "../agents/follow-up-delivery.js";
 import type { ActorManager } from "../actors/manager.js";
 import type { FabricActorInfo, FabricActorRunBinding } from "../actors/types.js";
-import { assertSteerPriority, type FabricSteerPriority, type FabricAgentMessageResult, type FabricMainAgentTarget } from "../main-agent.js";
+import { assertSteerPriority, type FabricSteerPriority, type FabricAgentMessageResult, type FabricMainAgentTarget, type FabricMainAgentDeliveryRequest } from "../main-agent.js";
+import type { NativeRecoveryCustodyReader } from "../core/session-receipts.js";
+import { resolveNativeMainSuccessor } from "../topology/stall-alarms.js";
 import type { MeshIdentity } from "../mesh/store.js";
 import type { FabricInvocationContext } from "../protocol.js";
 import { controlOwnerIncarnation, warnUnfencedControlDelivery, controlActorBindingOptions, FabricControlStaleIncarnationError, type FabricControlPlane, type FabricControlCommand, type FabricControlAcceptance } from "../topology/control-plane.js";
@@ -181,8 +183,27 @@ const sandboxMainSettledAfterStop = async (context: ExtensionContext, signal?: A
   }
 };
 
+export interface NativeMainRecipientAuthorization {
+  targetId: string;
+  operation: "steer" | "followUp";
+  from: MeshIdentity;
+  verification?: "mesh" | "bridge" | undefined;
+  principal?: FabricPrincipal | undefined;
+  priority?: FabricSteerPriority | undefined;
+  triggerTurn?: boolean | undefined;
+  data?: unknown;
+}
+
+/** Host-only retained S policy and current T admission; never reconstructed from wire data. */
+export interface NativeMainMessageRouting {
+  readNativeCustody: NativeRecoveryCustodyReader;
+  authorizeOriginalRecipient(request: NativeMainRecipientAuthorization): void;
+  deliverAgent(originalTargetId: string, request: FabricMainAgentDeliveryRequest): FabricAgentMessageResult;
+}
+
 export class AgentMessageRouter {
   readonly #taskReturnAddress = readTaskReturnAddress();
+  #nativeRouting: NativeMainMessageRouting | undefined;
   /** Preserve authenticated machine/owner/epoch across asynchronous actor resolution. */
   readonly #presenceRoutes = new WeakMap<FabricParticipantInfo, ParticipantRoute>();
   #legacyDeliveryCount = 0;
@@ -205,6 +226,39 @@ export class AgentMessageRouter {
     readonly spawner = boundAgentSpawner(),
   ) {
     this.control?.onVerifiedReconnect?.(() => { this.#lastVerifiedReconnectAt = Date.now(); });
+  }
+
+  setNativeRecoveryRouting(routing: NativeMainMessageRouting | undefined): void {
+    this.#nativeRouting = routing ? { ...routing } : undefined;
+  }
+
+  /** Authorize S before consulting native continuity. Unknown native custody never falls back. */
+  #nativeMessageTarget(request: NativeMainRecipientAuthorization, outgoing = false): string | undefined {
+    const routing = this.#nativeRouting;
+    if (!routing || !request.targetId.startsWith("session:") ||
+        (request.operation !== "steer" && request.operation !== "followUp")) return undefined;
+    if (outgoing) assertTaskMainTarget(this.#taskReturnAddress, request.targetId);
+    const authorized = routing.authorizeOriginalRecipient(request);
+    if (authorized !== undefined) throw new Error("Original-recipient authorization must complete synchronously");
+    const root = this.actorManager.mesh?.root ?? this.residency?.options.config.meshRoot;
+    if (!root) throw new FabricRouteAuthorityError(request.targetId);
+    let outgoingNative = false, uncertain = false;
+    const successor = resolveNativeMainSuccessor(root, request.targetId, scope => {
+      try {
+        const custody = routing.readNativeCustody(scope);
+        outgoingNative ||= custody.status === "validated" && custody.transfers.some(edge =>
+          `session:${edge.source.sessionId}` === request.targetId);
+        uncertain ||= custody.status === "hold";
+        return custody;
+      } catch (error) { uncertain = true; throw error; }
+    });
+    if (!successor) {
+      if (outgoingNative || uncertain) throw new FabricRouteAuthorityError(request.targetId);
+      return undefined;
+    }
+    if (successor.rootId === request.targetId || successor.bindings.length === 0 ||
+        successor.bindings.some(binding => binding.phase !== "received")) throw new FabricRouteAuthorityError(request.targetId);
+    return successor.rootId;
   }
 
   get #nats(): boolean { return this.control?.transportKind === "nats"; }
@@ -648,13 +702,18 @@ export class AgentMessageRouter {
     options = { ...options, wakeCause: copyFabricWakeCause(options.wakeCause), idempotencyKey: options.idempotencyKey ?? randomUUID(), principal: context ? invocationFabricPrincipal(context) : undefined };
     // Task-local `main` remains its immutable immediate return address.
     if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
-    const provenLocal = this.isProcessOwnedTarget(id);
     let result: FabricAgentMessageResult;
     try {
+      const effective = this.#nativeMessageTarget({ targetId: id, operation: kind,
+        from: options.from ?? this.actorManager.identity, verification: "mesh", principal: options.principal,
+        priority: options.priority, triggerTurn: options.triggerTurn, data }, true);
+      const target = effective ?? id;
+      const originalTargetId = effective ? id : undefined;
+      const provenLocal = this.isProcessOwnedTarget(target);
       result = provenLocal
-        ? await this.#route(id, message, data, kind, context, options, true)
-        : await this.#withDurableRecovery(id, recovering =>
-          this.#withDirectory((authority, budget) => this.#route(id, message, data, kind, context, options, false, !recovering, authority, budget), id, !recovering, context?.signal));
+        ? await this.#route(target, message, data, kind, context, options, true, true, undefined, undefined, originalTargetId)
+        : await this.#withDurableRecovery(target, recovering =>
+          this.#withDirectory((authority, budget) => this.#route(target, message, data, kind, context, options, false, !recovering, authority, budget, originalTargetId), target, !recovering, context?.signal));
     } catch (error) {
       context?.signal?.throwIfAborted();
       const reason = error instanceof Error ? error.message : String(error);
@@ -778,8 +837,14 @@ export class AgentMessageRouter {
     recoverLease = true,
     authority?: FabricParticipantInfo,
     budget?: RouterWaitBudget,
+    originalTargetId?: string,
   ): Promise<FabricAgentMessageResult> {
     context?.signal?.throwIfAborted();
+    if (originalTargetId && this.#nativeMessageTarget({ targetId: originalTargetId, operation: kind,
+      from: options.from ?? this.actorManager.identity, verification: "mesh", principal: options.principal,
+      priority: options.priority, triggerTurn: options.triggerTurn, data }, true) !== id) {
+      throw new FabricRouteAuthorityError(originalTargetId);
+    }
     const provenance = fabricTurnProvenance(options.from ?? this.actorManager.identity, kind, "mesh", options.principal);
     // In a task child, main is the immutable immediate return address, not a role lookup.
     if (id.trim() === "main" && this.#taskReturnAddress?.spawnerId) id = this.#taskReturnAddress.spawnerId;
@@ -797,7 +862,7 @@ export class AgentMessageRouter {
     // Project members include peer roots, not just this host's Main and actors.
     // Resolve their current owner through the same capability/control path.
     if (isMain || remoteRoot?.kind === "root") {
-      assertTaskMainTarget(this.#taskReturnAddress, isMain ? this.mainAgent.id : remoteRoot!.id);
+      assertTaskMainTarget(this.#taskReturnAddress, originalTargetId ?? (isMain ? this.mainAgent.id : remoteRoot!.id));
       if (remoteRoot?.interactive === false) throw new FabricParticipantNonInteractiveError(remoteRoot.id);
       if (isMain && this.mainAgent.local) {
         // Local delivery needs no remote authority snapshot, but print/JSON Main is never interactive.
@@ -810,20 +875,24 @@ export class AgentMessageRouter {
           kind: "agent",
           name: "Main",
         });
-        return this.mainAgent.deliverAgent(copyFabricWakeAdmission(options, {
+        const request: FabricMainAgentDeliveryRequest = copyFabricWakeAdmission(options, {
           from: options.from ?? this.actorManager.identity,
           verification: "mesh", // In-process registered producer, not a received command.
           principal: options.principal,
           ...(options.wakeCause ? { wakeCause: options.wakeCause } : {}),
           message,
           delivery: kind,
-          outcomeSend: { eventId: options.idempotencyKey!, to: this.mainAgent.id, from: (options.from ?? this.actorManager.identity).id, mode: kind },
+          outcomeSend: { eventId: options.idempotencyKey!, to: originalTargetId ?? this.mainAgent.id, from: (options.from ?? this.actorManager.identity).id, mode: kind },
+          ...(originalTargetId ? { deliveryId: options.idempotencyKey } : {}),
           ...(options.priority ? { priority: options.priority } : {}),
           ...(typeof options.triggerTurn === "boolean"
             ? { triggerTurn: options.triggerTurn }
             : {}),
           ...(data === undefined ? {} : { data }),
-        }));
+        });
+        return originalTargetId
+          ? this.#nativeRouting!.deliverAgent(originalTargetId, request)
+          : this.mainAgent.deliverAgent(request);
       }
       let participant = remoteRoot ?? this.#rootRouteSnapshot(this.mainAgent.id, authority);
       if (!participant) {
@@ -842,6 +911,9 @@ export class AgentMessageRouter {
       if (participant.interactive === false) throw new FabricParticipantNonInteractiveError(participant.id);
       if (!participant.capabilities.includes(kind)) throw unsupported(participant, kind);
       const ownerIncarnation = controlOwnerIncarnation(participant);
+      if (originalTargetId && (ownerIncarnation === undefined || participant.controlProtocol === "legacy")) {
+        throw new FabricRouteAuthorityError(originalTargetId);
+      }
       if (ownerIncarnation === undefined && (!this.control || participant.controlProtocol === "legacy")) {
         if (this.#nats) throw new FabricRouteAuthorityError(participant.id);
         if (options.priority) throw new Error("interrupt priority requires the Fabric Main control protocol");
@@ -854,7 +926,7 @@ export class AgentMessageRouter {
       this.#validatePresence(participant, budget, kind);
       return this.control.request(
         participant.ownerHostId,
-        participant.id,
+        originalTargetId ?? participant.id,
         kind,
         {
           principal: options.principal,
@@ -1076,12 +1148,26 @@ export class AgentMessageRouter {
     signal?: AbortSignal,
     verification?: "mesh" | "bridge",
   ): Promise<FabricControlAcceptance> {
+    let nativeTarget: string | undefined;
     try {
       assertSteerPriority(command.priority, command.operation);
-      if (command.priority && !(this.mainAgent.local && this.mainAgent.matches(command.targetId))) {
+      if (command.operation === "steer" || command.operation === "followUp") {
+        nativeTarget = this.#nativeMessageTarget({ targetId: command.targetId, operation: command.operation,
+          from, verification, principal: verification === "mesh" || verification === "bridge" ? command.principal : undefined,
+          priority: command.priority,
+          triggerTurn: command.triggerTurn, data: command.data });
+        if (nativeTarget && (!this.mainAgent.local || nativeTarget !== this.mainAgent.id)) {
+          throw new FabricRouteAuthorityError(command.targetId);
+        }
+      }
+      if (command.priority && !(this.mainAgent.local && (this.mainAgent.matches(command.targetId) || nativeTarget === this.mainAgent.id))) {
         throw new Error("interrupt priority is supported only for a Main target");
       }
-    } catch (error) { return { accepted: false, error: error instanceof Error ? error.message : String(error) }; }
+    } catch (error) {
+      const errorCode = interruptErrorCode(error);
+      return { accepted: false, error: error instanceof Error ? error.message : String(error),
+        ...(errorCode ? { errorCode, notRun: true as const } : {}) };
+    }
     if (command.operation === "setModel" || command.operation === "setThinking") {
       return { accepted: false, error: "remote Main model changes are not supported yet; see smarty-dev#4153" };
     }
@@ -1167,13 +1253,13 @@ export class AgentMessageRouter {
         };
       }
     }
-    if (this.mainAgent.local && this.mainAgent.matches(command.targetId)) {
+    if (this.mainAgent.local && (this.mainAgent.matches(command.targetId) || nativeTarget === this.mainAgent.id)) {
       if (this.#localMainNonInteractive()) {
         return { accepted: false, error: new FabricParticipantNonInteractiveError(this.mainAgent.id).message };
       }
       let result: FabricAgentMessageResult;
       try {
-        result = this.mainAgent.deliverAgent(copyFabricWakeAdmission(command, {
+        const request: FabricMainAgentDeliveryRequest = copyFabricWakeAdmission(command, {
         from,
         ...(verification === undefined ? {} : { verification }),
         principal: provenance?.principal,
@@ -1185,12 +1271,15 @@ export class AgentMessageRouter {
         ...(command.inboxTopic === undefined ? {} : { inboxTopic: command.inboxTopic }),
         ...(command.inboxKey === undefined ? {} : { inboxKey: command.inboxKey }),
         ...(command.inboxReceipts === undefined ? {} : { inboxReceipts: command.inboxReceipts }),
-        outcomeSend: { eventId: command.eventId ?? command.commandId, to: this.mainAgent.id, from: from.id, mode: command.operation },
+        outcomeSend: { eventId: command.eventId ?? command.commandId, to: nativeTarget ? command.targetId : this.mainAgent.id, from: from.id, mode: command.operation },
         ...(typeof command.triggerTurn === "boolean"
           ? { triggerTurn: command.triggerTurn }
           : {}),
         ...(command.data === undefined ? {} : { data: command.data }),
-        }));
+        });
+        result = nativeTarget
+          ? this.#nativeRouting!.deliverAgent(command.targetId, request)
+          : this.mainAgent.deliverAgent(request);
       } catch (error) {
         // Admission refusals retain their typed code across verified mesh/bridge ACKs; a draining Main's too (smarty-dev#15310 N7).
         const errorCode = interruptErrorCode(error) ?? (error instanceof FabricMainDrainingError ? error.code : undefined);

@@ -39,6 +39,7 @@ const copyArchiveFile = (held: PrivateDirectory, file: string, source: string): 
     throw new Error(`Archive entry ${file} exists and is not our regular file`);
   }
 };
+const supersededAttemptTrace = /^(?:status\.json|lifecycle\.jsonl)\.attempt-\d+-(?:startup-retry|resume)(?:-\d+)?$/;
 
 /** Idempotent retries of partial nested copies use the same no-follow, durable entry protocol as the root. */
 const copyArchiveTree = (source: string, directory: string, anchor: string, depth = 0): void => {
@@ -158,7 +159,9 @@ export class ActorLogStore {
         }
         // Every present entry must succeed. Missing optional files are not refusals; unreadable files, symlinks,
         // unsafe destination entries and I/O failures are. Never discharge custody after a best-effort copy.
-        for (const file of ["events.jsonl", "session.jsonl", "steer.jsonl", "lifecycle.jsonl", "route-session.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl"]) {
+        const files = ["events.jsonl", "session.jsonl", "steer.jsonl", "lifecycle.jsonl", "route-session.jsonl", "status.json", "reply.json", "task.txt", "relaunches.jsonl",
+          ...fs.readdirSync(runDirectory).filter(file => supersededAttemptTrace.test(file))];
+        for (const file of files) {
           const src = path.join(runDirectory, file);
           if (fs.lstatSync(src, { throwIfNoEntry: false })) copyArchiveFile(held, file, src);
         }

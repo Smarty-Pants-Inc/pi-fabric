@@ -234,6 +234,10 @@ describe("configured detached temp sweep", () => {
   it("keeps full raw logs regardless of the old compaction cap, then archives at expiry", async () => {
     const tempRoot = temp();
     const { root, run, log } = seed(tempRoot, Date.now() - 7 * HOUR);
+    const supersededStatus = Buffer.from([0, 255, 13, 10, 123, 0]);
+    const supersededLifecycle = Buffer.from("raw lifecycle trace π\n", "utf8");
+    fs.writeFileSync(path.join(run, "status.json.attempt-2-startup-retry-1"), supersededStatus);
+    fs.writeFileSync(path.join(run, "lifecycle.jsonl.attempt-1-resume"), supersededLifecycle);
     const request = { tempRoot, orphanedTempRunRetentionMs: 48 * HOUR, oneShotRunRetentionMs: 48 * HOUR,
       terminalRunEventsAgeMs: 24 * HOUR, terminalRunEventsMaxBytes: 1024 };
     const invoke = async () => {
@@ -258,6 +262,8 @@ describe("configured detached temp sweep", () => {
     const archive = `${root}.trace-archive`;
     const receipt = JSON.parse(fs.readFileSync(path.join(archive, fs.readdirSync(archive)[0]!, "custody.json"), "utf8"));
     expect(fs.readFileSync(path.join(receipt.destination, "events.jsonl"), "utf8")).toBe(log);
+    expect(fs.readFileSync(path.join(receipt.destination, "status.json.attempt-2-startup-retry-1"))).toEqual(supersededStatus);
+    expect(fs.readFileSync(path.join(receipt.destination, "lifecycle.jsonl.attempt-1-resume"))).toEqual(supersededLifecycle);
     // Keep the serialized request type part of this entry-point regression.
     const typed: TempRunSweepRequest = request; expect(typed.tempRoot).toBe(tempRoot);
   });

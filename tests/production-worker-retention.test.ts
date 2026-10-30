@@ -140,8 +140,18 @@ const makeUnsafe = (run: string, kind: UnsafeKind) => {
   if (kind === "unknown-directory") fs.mkdirSync(path.join(run, "other-deliveries"));
 };
 
-// Copy the entire emitted tree, including native session and delivery artifacts.
+// Copy an emitted run tree; nested archive fixtures below retain only the bytes
+// needed for production identity, attribution, delivery safety and byte checks.
 const copyRun = (source: string, destination: string) => { fs.cpSync(source, destination, { recursive: true }); return destination; };
+const trimNestedRun = (directory: string) => {
+  // Keep the production identity, event bytes, attributed task bytes and the
+  // delivery boundary; unrelated native session artifacts add durable copies
+  // without strengthening this nested-archive retention proof.
+  const retained = new Set(["deliveries", "events.jsonl", "status.json", "task.txt", "task.txt.provenance.json"]);
+  for (const entry of fs.readdirSync(directory)) {
+    if (!retained.has(entry)) fs.rmSync(path.join(directory, entry), { recursive: true, force: true });
+  }
+};
 const runBytes = (directory: string): Array<[string, string]> => {
   const rows: Array<[string, string]> = [];
   const walk = (current: string): void => {
@@ -261,12 +271,11 @@ describe("I-2 production-worker ingress retention", () => {
     const base = Math.max(plain.result.finishedAt!, attributed.result.finishedAt!);
     const store = new ActorLogStore({ maxEventBytes: DEFAULT_FABRIC_CONFIG.mesh.maxEventBytes }, DEFAULT_FABRIC_CONFIG.mesh, { actorRunArchiveMs: 60_000 });
     fs.mkdirSync(path.join(root, "sources"), { mode: 0o700 });
-    // Every archive write is durable, including each file in each nested native run.
-    // Keep Windows' hosted-runner workload representative without repeating the full
-    // unsafe-kind cross-product: the retention sweep above independently checks every kind.
-    const archiveKinds: readonly ("successful" | "latest" | UnsafeKind)[] = process.platform === "win32"
-      ? ["successful", "latest", "pending-delivery", "delivery-link", "sidecar-link", "directory-link"]
-      : ["successful", "latest", ...unsafeKinds];
+    // Every archive write is durable, including each file in each nested run.
+    // Keep successful/latest, pending-delivery and each refusal boundary; the
+    // retention sweep above independently checks the full unsafe-kind cross-product.
+    const archiveKinds: readonly ("successful" | "latest" | UnsafeKind)[] =
+      ["successful", "latest", "pending-delivery", "delivery-link", "sidecar-link", "directory-link"];
     for (const kind of archiveKinds) {
       const source = copyRun(plain.run, path.join(root, "sources", kind));
       // cpSync's destination creation must not inherit a group-writable umask.
@@ -278,8 +287,12 @@ describe("I-2 production-worker ingress retention", () => {
       const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8"));
       expect(receipt.runId).toBe(plain.result.id);
       fs.writeFileSync(receiptFile, JSON.stringify({ ...receipt, runId: kind }));
-      if (kind === "successful" || kind === "latest") copyRun(plain.run, path.join(source, "nested", "plain"));
+      if (kind === "successful" || kind === "latest") {
+        const nestedPlain = copyRun(plain.run, path.join(source, "nested", "plain"));
+        trimNestedRun(nestedPlain);
+      }
       const nested = copyRun(attributed.run, path.join(source, "nested", "attributed"));
+      trimNestedRun(nested);
       if (kind !== "successful" && kind !== "latest") makeUnsafe(nested, kind);
       // Source symlinks now refuse the entire archive instead of yielding a false success after a partial copy.
       if (kind === "delivery-link" || kind === "sidecar-link" || kind === "directory-link") {

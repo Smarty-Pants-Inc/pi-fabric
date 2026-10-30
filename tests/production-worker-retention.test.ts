@@ -339,5 +339,5 @@ describe("I-2 production-worker ingress retention", () => {
     expect(snapshot()).toEqual(before);
     store.pruneRuns(actor, base + 120_001);
     expect(snapshot()).toEqual(before);
-  }, 90000);
+  }, process.platform === "win32" ? 420_000 : 90_000); // Hosted Windows ran the larger fixture in 309-359 s; the trimmed one is estimated at 117-136 s.
 });

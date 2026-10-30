@@ -38,7 +38,14 @@ namespace and length alone are not admission authentication. C36 also refuses
 v7's consistent malformed pair and right-admission/malformed-delivery input
 (`"<A>:wrong"`, where A is the retained admission ID), next to the B5-derived
 checks. Each refusal immediately checks the unchanged ledger digest; unfamiliar
-ID forms must not bypass the retained admission lookup.
+ID forms must not bypass the retained admission lookup. V7d additionally runs
+each of those five wrong inputs on its own fresh provider/harness, followed by
+its valid repair/resolve check. The original sequence stays too, preserving
+refusal-budget and poisoning coverage. One foreign-form sample, `legacy-admission`
+(no B5 prefix, shorter than a B5 ID), is refused both as a consistent pair and as
+a delivery with the right admission, on separate fresh harnesses with the same
+code/digest/valid-repair checks. All of this stays inside C36: no new case number,
+no title/order change, and no earlier refusal can hide an isolated arm.
 
 The default runs both. Real-provider failures remain ordinary failing tests,
 not skips or expected failures. The selected integration head does not yet
@@ -146,7 +153,10 @@ await h.dispose();
 no retained-state controls are needed. `advanceJoinedLeaf(nextId)` supports any
 consumer leaf ID. Defaults preserve existing fixture-only consumers. Main must
 still execute its own B5 generation checks; this fake deliberately will not
-perform those checks for it.
+perform those checks for it. K9's `consumer.test.ts` fixture derives its admission
+with B5's `prepareScriptedInput` through `scriptedAdmissionId`; it no longer uses
+the non-B5 literal `s4-admission`. This is still sender-derived stand-in data,
+not a retained receiver admission.
 
 The fake is an **in-memory component stand-in**, not a durable producer, genuine
 repair receipt, installed native host or B1 witness. Reopen in fake tests retains
@@ -195,6 +205,14 @@ unchanged provider ABI `V1`:
   `304fe8563e079ceec2982dff076bafdd44663445dbada460db1f6ac148226b3b`.
   Round-7c `RESULT.md` records builder evidence. No other case or production change;
   independent acceptance remains with the CoS judge.
+
+- v7d: fresh-harness isolation for every C36 wrong input, one foreign-form
+  sample in pair/delivery positions, and a B5-derived K9 consumer admission,
+  contract SHA-256
+  `6eb2cae5c68a47e79ab3167b57c06f90a8de776c8d157e77f0972839a2d7ea82`.
+  The original C36 sequence and all five refusal/digest pairs remain. Round-7d
+  `RESULT.md` records builder evidence, not independent acceptance. No production
+  change; still 34 cases with unchanged titles and order.
 
 The round-2 `PHASE1.md` (v2) and `RESULT.md` (v3), round-4 `RESULT.md` (v5),
 and round-5 `RESULT.md` (v6) record commit/hash and per-test evidence. CoS owns

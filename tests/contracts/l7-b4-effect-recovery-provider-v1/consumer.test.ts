@@ -2,13 +2,15 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import type { AcceptedRecoveryInput, B4EffectRecoveryProviderV1 } from "./contract.js";
 import { createFake, createFakeProvider } from "./fake.js";
-import { accepted, GENERATION, INPUT_LIFETIME_MS, intent, type FixtureIdentity } from "./fixtures.js";
+import { accepted, GENERATION, INPUT_LIFETIME_MS, intent, scriptedAdmissionId, type FixtureIdentity } from "./fixtures.js";
 
+const ownOffer = { sessionId: "s4-consumer-session", originalInputId: "s4-original", text: "consumer text λ",
+  deadlineMs: Date.now() + INPUT_LIFETIME_MS };
+const ownAdmissionId = scriptedAdmissionId(ownOffer, "s4-consumer-sender");
 const ownInput: AcceptedRecoveryInput = {
-  sessionId: "s4-consumer-session", originalInputId: "s4-original", admissionId: "s4-admission",
-  deliveryId: "s4-admission", kind: "recovery", text: "consumer text λ",
-  payloadSha256: createHash("sha256").update("consumer text λ").digest("hex"),
-  deadlineMs: Date.now() + INPUT_LIFETIME_MS, consumption: { kind: "effect-read", effectKey: "consumer-effect" },
+  ...ownOffer, admissionId: ownAdmissionId, deliveryId: ownAdmissionId, kind: "recovery",
+  payloadSha256: createHash("sha256").update(ownOffer.text).digest("hex"),
+  consumption: { kind: "effect-read", effectKey: "consumer-effect" },
 };
 const identity: FixtureIdentity = { acceptedInput: ownInput, executionBranchEntryId: "s4-anchor" };
 const options = { sessionId: ownInput.sessionId, ...identity, joinedLeafEntryId: "s4-joined", pin: "s4-retained-generation" };

@@ -19,24 +19,24 @@ export function runConformance(provider: ConformanceFactory): void {
     };
   };
   type Inputs = ReturnType<typeof inputs>;
-  const test = (name: string, scenario: (values: Inputs) => Scenario,
+  const withScenario = async (scenario: (values: Inputs) => Scenario,
     check: (h: ConformanceHarness, values: Inputs) => Promise<void>) => {
-    it(name, async () => {
-      let seeded: Scenario | undefined;
-      const h = await provider(observations => (seeded = scenario(inputs(observations))));
-      try {
-        expect(seeded, "factory must resolve the scenario from independent harness observations").toBeDefined();
-        const { acceptedInput, executionBranchEntryId } = h.recoveryIdentity();
-        for (const value of seeded!.intents ?? []) {
-          expect(value.keyTuple[2]).toBe(acceptedInput.sessionId);
-          expect(value.keyTuple[3]).toBe(acceptedInput.originalInputId);
-          expect(value.acceptedInput).toEqual({ id: acceptedInput.originalInputId,
-            digest: acceptedInput.payloadSha256, nativeEntryId: executionBranchEntryId });
-        }
-        await check(h, inputs(h));
-      } finally { await h.dispose(); }
-    });
+    let seeded: Scenario | undefined;
+    const h = await provider(observations => (seeded = scenario(inputs(observations))));
+    try {
+      expect(seeded, "factory must resolve the scenario from independent harness observations").toBeDefined();
+      const { acceptedInput, executionBranchEntryId } = h.recoveryIdentity();
+      for (const value of seeded!.intents ?? []) {
+        expect(value.keyTuple[2]).toBe(acceptedInput.sessionId);
+        expect(value.keyTuple[3]).toBe(acceptedInput.originalInputId);
+        expect(value.acceptedInput).toEqual({ id: acceptedInput.originalInputId,
+          digest: acceptedInput.payloadSha256, nativeEntryId: executionBranchEntryId });
+      }
+      await check(h, inputs(h));
+    } finally { await h.dispose(); }
   };
+  const test = (name: string, scenario: Parameters<typeof withScenario>[0], checks: Parameters<typeof withScenario>[1] | Parameters<typeof withScenario>[1][]) =>
+    it(name, async () => { for (const check of Array.isArray(checks) ? checks : [checks]) await withScenario(scenario, check); });
   const settle = (h: ConformanceHarness, generation = h.recoveryIdentity().recoveryGeneration) =>
     h.provider.settlePendingIntents!(h.recoveryIdentity().acceptedInput.sessionId, generation);
   const read = (h: ConformanceHarness, effect: Parameters<B4EffectRecoveryProviderV1["readToolResult"]>[0]) => h.provider.readToolResult!(effect);
@@ -245,7 +245,7 @@ export function runConformance(provider: ConformanceFactory): void {
       // B3 requires a boolean, and re-runs strict hooks regardless of its value.
       expect(result.postHook).toBeTypeOf("boolean");
     });
-    test("C36 host repair rejects wrong admission ID for the right original", ({ value }) => ({ intents: [value] }), async h => {
+    test("C36 host repair rejects wrong admission ID for the right original", ({ value }) => ({ intents: [value] }), [async h => {
       await settle(h); expect(h.provider.repairMaintenance).toBeTypeOf("function");
       const { acceptedInput } = h.recoveryIdentity();
       const before = await h.ledgerDigest();
@@ -270,6 +270,36 @@ export function runConformance(provider: ConformanceFactory): void {
       // The refusals must not poison the valid occurrence or manufacture a receipt.
       const ref = await repair(h);
       expect(h.provider.resolveRepair!(ref).originalInputId).toBe(acceptedInput.originalInputId);
-    });
+    },
+    // Keep the sequence above: it catches refusal-budget and poisoning defects.
+    // Each check below gets its OWN factory call, settlement and disposal through
+    // withScenario. No earlier refusal (or valid repair) can load/latch its record.
+    ...(["admission", "malformed-pair", "b5-pair", "malformed-delivery", "b5-delivery", "foreign-pair", "foreign-delivery"] as const)
+      .map(arm => async (h: ConformanceHarness) => {
+        await settle(h); expect(h.provider.repairMaintenance).toBeTypeOf("function");
+        const { acceptedInput } = h.recoveryIdentity();
+        const before = await h.ledgerDigest();
+        const wrong = { ...acceptedInput, admissionId: `${acceptedInput.admissionId}:wrong` };
+        const secondSenderAdmission = scriptedAdmissionId(acceptedInput, `c36-second-sender:${randomUUID()}`);
+        expect(secondSenderAdmission).not.toBe(acceptedInput.admissionId);
+        // ONE foreign-form sample, used as both a pair and a delivery: no B5
+        // prefix and shorter than a B5 ID, unlike the old "<A>:wrong" suffix.
+        const foreignAdmission = "legacy-admission";
+        expect(foreignAdmission).not.toBe(acceptedInput.admissionId);
+        const wrongInputs = {
+          admission: wrong,
+          "malformed-pair": { ...wrong, deliveryId: wrong.admissionId },
+          "b5-pair": { ...acceptedInput, admissionId: secondSenderAdmission, deliveryId: secondSenderAdmission },
+          "malformed-delivery": { ...acceptedInput, deliveryId: wrong.admissionId },
+          "b5-delivery": { ...acceptedInput, deliveryId: secondSenderAdmission },
+          "foreign-pair": { ...acceptedInput, admissionId: foreignAdmission, deliveryId: foreignAdmission },
+          "foreign-delivery": { ...acceptedInput, deliveryId: foreignAdmission },
+        };
+        await expect(h.provider.repairMaintenance!(wrongInputs[arm], "J"), arm).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
+        expect(await h.ledgerDigest(), arm).toBe(before);
+        const ref = await repair(h);
+        expect(h.provider.resolveRepair!(ref).originalInputId).toBe(acceptedInput.originalInputId);
+      }),
+    ]);
   });
 }

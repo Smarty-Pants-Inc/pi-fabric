@@ -1873,6 +1873,115 @@ describe("AgentManager", () => {
     }, 30_000,
   );
 
+  it.each(["startup-retry", "resume"] as const)("keeps prior status and lifecycle bytes under collision-safe names on %s", async recovery => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-attempt-traces-"));
+    roots.push(root);
+    const attempt = recovery === "resume" ? 1 : 2;
+    const originalLaunch = ProcessTransport.prototype.launch;
+    const movedBytes = new Map<string, Buffer>();
+    const movedTargets = new Map<string, string>();
+    const workerStatusEvidence = path.join(root, "worker-status.bytes");
+    let firstInput: { inputSha256: string; inputBytes: number } | undefined;
+    let statusFile: string | undefined, lifecycleFile: string | undefined, launchCount = 0;
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      const argument = (name: string) => request.workerArguments[request.workerArguments.indexOf(name) + 1]!;
+      statusFile = argument("--status-file"); lifecycleFile = argument("--lifecycle-file");
+      const index = ++launchCount;
+      if (index === 1) {
+        firstInput = { inputSha256: argument("--input-sha256"), inputBytes: Number(argument("--input-bytes")) };
+        if (recovery === "resume") request.workerArguments.push("--status-evidence", workerStatusEvidence);
+        fs.writeFileSync(lifecycleFile, Buffer.from([0, 255, 13, 10, 123, 0]));
+        fs.writeFileSync(`${statusFile}.attempt-${attempt}-${recovery}`, "pre-existing archive entry");
+      } else {
+        const evidenceIndex = request.workerArguments.indexOf("--status-evidence");
+        if (evidenceIndex >= 0) request.workerArguments.splice(evidenceIndex, 2);
+        expect(fs.existsSync(statusFile)).toBe(false);
+        expect(fs.existsSync(lifecycleFile)).toBe(false);
+        fs.writeFileSync(lifecycleFile, Buffer.from("fresh replacement lifecycle\n"));
+      }
+      return originalLaunch.call(this, request);
+    });
+    const rename = fs.renameSync.bind(fs);
+    const archive = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      const file = String(source);
+      if ((file === statusFile || file === lifecycleFile) && !movedBytes.has(file)) {
+        movedBytes.set(file, fs.readFileSync(file));
+        movedTargets.set(file, String(destination));
+      }
+      return rename(source, destination);
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve(recovery === "resume" ? "tests/fixtures/fake-worker.mjs" : "tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: recovery === "resume" ? "RESUME_AFTER_STOP" : "Recover startup with preserved traces", transport: "process" });
+      expect(result).toMatchObject({ status: "completed", text: recovery === "resume" ? "resumed attempt 2" : "startup retry recovered" });
+      expect(launchCount).toBe(2);
+      expect(statusFile).toBeDefined(); expect(lifecycleFile).toBeDefined();
+      const statusArchive = movedTargets.get(statusFile!);
+      const lifecycleArchive = movedTargets.get(lifecycleFile!);
+      expect(statusArchive).toBe(`${statusFile}.attempt-${attempt}-${recovery}-1`);
+      expect(lifecycleArchive).toBe(`${lifecycleFile}.attempt-${attempt}-${recovery}`);
+      expect(fs.readFileSync(statusArchive!)).toEqual(movedBytes.get(statusFile!));
+      if (recovery === "resume") {
+        // Data safety: compare against the worker's publication, not a later manager rewrite.
+        expect(fs.readFileSync(statusArchive!)).toEqual(fs.readFileSync(workerStatusEvidence));
+        expect(JSON.parse(fs.readFileSync(statusArchive!, "utf8"))).toMatchObject(firstInput!);
+        expect(JSON.parse(fs.readFileSync(statusFile!, "utf8")).inputSha256).not.toBe(firstInput!.inputSha256);
+      }
+      expect(fs.readFileSync(lifecycleArchive!)).toEqual(movedBytes.get(lifecycleFile!));
+      expect(fs.readFileSync(`${statusFile}.attempt-${attempt}-${recovery}`, "utf8")).toBe("pre-existing archive entry");
+      const freshStatus = fs.readFileSync(statusFile!);
+      expect(JSON.parse(freshStatus.toString("utf8"))).toMatchObject({ status: "completed", text: result.text });
+      expect(freshStatus).not.toEqual(movedBytes.get(statusFile!));
+      expect(fs.readFileSync(lifecycleFile!)).toEqual(Buffer.from("fresh replacement lifecycle\n"));
+    } finally { archive.mockRestore(); launch.mockRestore(); }
+  }, 30_000);
+
+  // Judge prototype: the rename-failure fence, on startup-retry AND resume (F2's new early preserve).
+  it.each(["startup-retry", "resume"] as const)("leaves the live status trace untouched and aborts when preserving it fails on %s", async recovery => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-attempt-trace-error-"));
+    roots.push(root);
+    const originalLaunch = ProcessTransport.prototype.launch;
+    const originalRename = fs.renameSync.bind(fs);
+    const workerStatusEvidence = path.join(root, "worker-status.bytes");
+    let launches = 0, statusFile: string | undefined, taskFile: string | undefined, taskBytes: Buffer | undefined;
+    let originalStatus: Buffer | undefined;
+    const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
+      launches++;
+      statusFile = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
+      taskFile = request.workerArguments[request.workerArguments.indexOf("--task-file") + 1]!;
+      if (recovery === "resume") request.workerArguments.push("--status-evidence", workerStatusEvidence);
+      return originalLaunch.call(this, request);
+    });
+    const rename = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (String(source) === statusFile && String(destination).includes(".attempt-")) {
+        originalStatus ??= fs.readFileSync(statusFile!);
+        taskBytes ??= taskFile ? fs.readFileSync(taskFile) : undefined;
+        throw Object.assign(new Error("trace rename denied"), { code: "EIO" });
+      }
+      return originalRename(source, destination);
+    });
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+        workerPath: path.resolve(recovery === "resume" ? "tests/fixtures/fake-worker.mjs" : "tests/fixtures/fake-worker-startup-retry.mjs"), runRoot: root,
+      });
+      managers.push(manager);
+      const result = await manager.run({ task: recovery === "resume" ? "RESUME_AFTER_STOP" : "Preserve trace before startup retry", transport: "process" });
+      if (recovery === "startup-retry") expect(result.status).toBe("failed");
+      expect(result.error).toContain("relaunch failed: trace rename denied");
+      expect(launches).toBe(1);
+      expect(statusFile).toBeDefined(); expect(originalStatus).toBeDefined();
+      expect(fs.readFileSync(statusFile!)).toEqual(originalStatus);
+      if (recovery === "resume") {
+        // The live record is still the worker's own publication: no continuation identity rewrite, no task rewrite.
+        expect(fs.readFileSync(statusFile!)).toEqual(fs.readFileSync(workerStatusEvidence));
+        expect(fs.readFileSync(taskFile!)).toEqual(taskBytes);
+      }
+    } finally { rename.mockRestore(); launch.mockRestore(); }
+  }, 30_000);
+
   it("retries a Pi child that fails before its first turn", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);

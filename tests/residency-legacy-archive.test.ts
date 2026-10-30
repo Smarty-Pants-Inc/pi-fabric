@@ -348,6 +348,8 @@ describe("rename-only legacy run retention", () => {
   it("rejects young/nonterminal/unknown/pending/nested/live-identity runs and retains every file byte-for-byte", async () => {
     const root = temporary();
     const good = run(root, "good"); run(root, "failed", { status: "failed" }); run(root, "stopped", { status: "stopped" });
+    fs.writeFileSync(path.join(good, "status.json.attempt-2-startup-retry-1"), Buffer.from([0, 255, 13, 10]));
+    fs.writeFileSync(path.join(good, "lifecycle.jsonl.attempt-1-resume"), Buffer.from("lifecycle trace π\n"));
     const rejected = ["running", "young", "no-finish", "pid", "pending", "unknown", "nested", "link", "unresolved"];
     run(root, "running", { status: "running" }); run(root, "young", { finishedAt: now - 1000 }); run(root, "no-finish", { finishedAt: null });
     run(root, "pid", { sessionId: String(process.pid) });

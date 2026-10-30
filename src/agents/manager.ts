@@ -838,6 +838,8 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   lastRetriedTransportFailure?: AgentRunResult;
   /** Set when a relaunch failed; the run settles with it, not the attempt it replaced. */
   relaunchFailure?: AgentRunRecord;
+  /** A failed status-trace rename must not let terminal publication overwrite its still-live raw file. */
+  statusTraceRenameFailed?: boolean;
   /** A retry launch owns custody until its exact replacement handle is installed. */
   relaunchPending?: Promise<boolean>;
   /** Terminal results do not discharge execution custody or admission permits. */
@@ -6679,6 +6681,7 @@ export class AgentManager {
   ): Promise<boolean> {
     let presenceAttempted = false;
     let nativeLaunchReturned = false;
+    let statusTraceRenameFailed = false;
     try {
       const policyRole = managed.actorName ? `actor:${managed.actorName}` : "task";
       const cancelled = () => this.#actorWorkerGone(managed) || managed.settled || this.#closing || managed.stopRequested || managed.abandoned || Date.now() >= deadline;
@@ -6711,6 +6714,22 @@ export class AgentManager {
           delete managed.model;
         }
       }
+      const attemptKind = resume ? "resume" : "startup-retry";
+      const attemptNumber = resume ? managed.resumeAttempts : managed.startupAttempts;
+      const supersedeTrace = (file: string): void => {
+        for (let collision = 0; ; collision++) {
+          const target = `${file}.attempt-${attemptNumber}-${attemptKind}${collision ? `-${collision}` : ""}`;
+          try { fs.lstatSync(target); continue; }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+          try { fs.renameSync(file, target); return; }
+          catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT") return;
+            if (code === "EEXIST" || code === "ENOTEMPTY") continue;
+            throw error;
+          }
+        }
+      };
       if (resume) {
         // A continuation rewrites the run's input in place. The prompt metadata
         // stays bound to the original spawn brief; it is never recomputed from
@@ -6718,6 +6737,9 @@ export class AgentManager {
         const currentInput = promptMetadata(resume.task, managed.promptPath ?? path.join(managed.runDirectory, "task.txt"));
         managed.inputSha256 = currentInput.inputSha256;
         managed.inputBytes = currentInput.inputBytes;
+        // Preserve the previous worker's bytes before publishing the continuation's identity.
+        try { supersedeTrace(managed.statusFile); }
+        catch (error) { statusTraceRenameFailed = true; throw error; }
         // Publish the new input identity before replacing the bytes. A host death
         // between these writes leaves a detectable mismatch, never a false match.
         writeRecord(managed.statusFile, this.#withTransportMetadata(record, managed, false));
@@ -6762,7 +6784,7 @@ export class AgentManager {
         path.join(managed.runDirectory, "relaunches.jsonl"),
         `${JSON.stringify({
           at: Date.now(),
-          kind: resume ? "resume" : "startup-retry",
+          kind: attemptKind,
           startupAttempts: managed.startupAttempts,
           resumeAttempts: managed.resumeAttempts,
           previousStatus: record.status,
@@ -6780,7 +6802,7 @@ export class AgentManager {
       if (this.#meshRoot) discardWorkerCompletion(this.#meshRoot, managed.id);
 
       if (managed.runner === "pi") {
-        // status.json must be removed to fence the new attempt from the old
+        // status.json must be absent to fence the new attempt from the old
         // terminal verdict. Hand off its native-session joins separately, after
         // confirmed exit so the previous worker's final observations are included.
         const ids = [record, managed.latestRecord, readRecord(managed.statusFile)]
@@ -6792,12 +6814,13 @@ export class AgentManager {
         }
       }
 
-      fs.rmSync(managed.statusFile, { force: true });
+      try { supersedeTrace(managed.statusFile); }
+      catch (error) { statusTraceRenameFailed = true; throw error; }
       // Reset the superseded journal before launching its replacement. A launch
       // already accepted before PREPARE may finish without deleting new output.
       managed.lifecycleOffset = 0;
       managed.lifecycleRemainder = Buffer.alloc(0);
-      fs.rmSync(managed.lifecycleFile, { force: true });
+      supersedeTrace(managed.lifecycleFile);
       if (cancelled()) return false;
       if (this.#meshTransport?.transport === "nats") {
         presenceAttempted = true;
@@ -6839,6 +6862,7 @@ export class AgentManager {
       this.#unregisteredTransports.delete(transport);
       // A later launch succeeded: an earlier relaunch failure no longer describes this run.
       delete managed.relaunchFailure;
+      delete managed.statusTraceRenameFailed;
       if (managed.settled || this.#closing || managed.stopRequested || managed.abandoned) {
         // A stop (or an abandonment, #2184 8b) landed while the relaunch was in flight.
         // Release the child we just started so it cannot outlive the monitor and the
@@ -6887,7 +6911,8 @@ export class AgentManager {
         toolCalls: Math.max(record.toolCalls, managed.observedProgress.toolCalls),
         error: `${record.error ?? "Agent run failed"} · relaunch failed: ${retryError}`,
       }, managed, false);
-      writeRecord(managed.statusFile, failed);
+      managed.statusTraceRenameFailed = statusTraceRenameFailed;
+      if (!statusTraceRenameFailed) writeRecord(managed.statusFile, failed);
       managed.latestRecord = compactUiRecord(failed);
       managed.relaunchFailure = failed;
       return false;
@@ -7139,7 +7164,7 @@ export class AgentManager {
       ? this.#withTransportMetadata(joined, managed) as AgentRunResult
       : { ...failedRecord(managed, "failed", "Actor worker is proven gone; execution was lost and will not be automatically relaunched"),
         startedAt: joined?.startedAt ?? record?.startedAt ?? Date.now() };
-    if (!terminalWorkerResult(joined)) writeRecord(managed.statusFile, result);
+    if (!managed.statusTraceRenameFailed && !terminalWorkerResult(joined)) writeRecord(managed.statusFile, result);
     this.#settle(managed, result);
     return true;
   }
@@ -7441,7 +7466,7 @@ export class AgentManager {
             if (managed.transport !== watchedTransport) continue;
             await this.#noteUnconfirmedExit(managed);
             const settled = (managed.relaunchFailure ?? failed) as AgentRunResult;
-            writeRecord(managed.statusFile, settled);
+            if (!managed.statusTraceRenameFailed) writeRecord(managed.statusFile, settled);
             await this.#captureWorktree(managed);
             this.#settle(managed, settled);
             return;
@@ -7531,9 +7556,9 @@ export class AgentManager {
       // Supervisor-only attribution must not mutate the last retained result
       // when archival fails. Persist only a changed outcome or cleanup warning.
       const current = readRecord(managed.statusFile);
-      if (!current || current.status !== result.status || result.errorCode === "CUSTODY_UNCONFIRMED") {
+      if (!managed.statusTraceRenameFailed && (!current || current.status !== result.status || result.errorCode === "CUSTODY_UNCONFIRMED")) {
         writeRecord(managed.statusFile, result);
-      } else if (forcedCleanup > 0) {
+      } else if (!managed.statusTraceRenameFailed && current && forcedCleanup > 0) {
         writeRecord(managed.statusFile, { ...current, warnings: result.warnings ?? [] });
       }
     }
@@ -7633,7 +7658,7 @@ export class AgentManager {
     }
     const stopIntent = readRunStopIntent(managed.runDirectory);
     if (stopIntent) result.stopIntent = stopIntent;
-    if (this.#saveSettledResult(managed, result)) {
+    if (this.#saveSettledResult(managed, result) && !managed.statusTraceRenameFailed) {
       try {
         // A native deadline receipt can settle before worker exit. Keep its fence
         // until both terminal status and native execution custody are resolved.

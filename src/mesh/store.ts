@@ -13,6 +13,7 @@ import type { MeshReadOptions, MeshStateEntry, MeshBatchResult, MeshBatchView } 
 import { createStateBackend, isMeshStateWalCap, type MeshStateBackendKind, type StateBackend, type StateBackendBatchInput,
   type StateBackendDiagnostics, type StateChangeExceptions } from "./state-backend.js";
 import { EventLog, type MeshEvent, type MeshIdentity, type MeshPublishInput, type MeshTailResult } from "./event-log.js";
+import type { RecoveryReader } from "./recovery-reader.js";
 import { closeResidentWakeRetryCursor, indexResidentDeliveries, type WakeSubscription } from "../residency/wake-index.js";
 import { writeFileAtomic } from "../core/atomic-write.js";
 import type { FabricMessageSender } from "../protocol.js";
@@ -858,6 +859,11 @@ export class MeshStore {
   /** Async archive catch-up; live/recent reads retain read()'s behavior. */
   readAsync(input: { after?: number; topic?: string; to?: string; limit?: number } = {}): Promise<MeshEvent[]> {
     return this.#events.readAsync(input);
+  }
+
+  /** Internal recovery reader; each bridge side owns its own continuation and cancellation. */
+  createRecoveryReader(project: (event: MeshEvent) => string | undefined, signal: AbortSignal): RecoveryReader {
+    return this.#events.createRecoveryReader(project, signal);
   }
 
   /**

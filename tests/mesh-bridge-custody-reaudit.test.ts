@@ -499,3 +499,154 @@ describe("the CLI's readiness barrier backs off a retryable first pass (hosted m
     } finally { vi.useRealTimers(); }
   });
 });
+
+// pi-fabric#1724, review blocker 1: exercise real start/recovery/presence, not a mocked start().
+// The original CLI custody regression above remains the operator-visible reason-line proof.
+describe("startup recovery budgets do not replace the last busy refusal", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const recoveringStartup = async (options: {
+    budgetMs?: number;
+    mark?: "at" | "beyond";
+    clock?: () => number;
+    log?: (line: string) => void;
+  } = {}) => {
+    const hub = store("file"), far = store("file");
+    const now = Date.now();
+    const nativeHost = { ...host, incarnationToken: host.incarnationToken!,
+      startedAt: now - 2_000, updatedAt: now, expiresAt: now + 120_000 };
+    await far.put({ key: hostKey(identity.id), identity, value: nativeHost });
+    writeHostLease(far.root, { id: identity.id, rootId: identity.id, identityId: identity.id,
+      incarnationToken: nativeHost.incarnationToken, startedAt: nativeHost.startedAt, updatedAt: now, expiresAt: nativeHost.expiresAt });
+    writeParticipantFile(far.root, { key: key("topology/participants/", identity.id), version: 1, updatedAt: now,
+      updatedBy: identity, value: { ...participant, startedAt: nativeHost.startedAt, updatedAt: now } });
+    const local = new StoreBridgeSide(hub, "far"), remote = new StoreBridgeSide(far, "hub");
+    const original = await far.publish({ topic: "fleet.work.startup.1", kind: "ask", from: identity,
+      to: "factory", text: "recovered once" });
+    // An append survived before the source checkpoint. Recovery must retain this real ID.
+    const recovered = await local.publish({ topic: original.topic, kind: original.kind, from: identity,
+      to: "factory", text: "recovered once", data: { bridge: { from: "far", id: original.id } } });
+    const cursorPath = path.join(path.dirname(hub.root), "cursor.json");
+    const saved = JSON.stringify({ format: 1, local: "hub", remote: "far",
+      toRemote: { after: recovered.sequence, mark: original.sequence + (options.mark === "beyond" ? 1 : 0) },
+      toLocal: { after: 0, mark: options.mark === undefined ? 0 : recovered.sequence + (options.mark === "beyond" ? 1 : 0) } });
+    fs.writeFileSync(cursorPath, saved);
+    const logs: string[] = [];
+    const bridge = new MeshBridge({ localName: "hub", remoteName: "far", local, remote, cursorPath,
+      ...(options.budgetMs === undefined ? {} : { startDeadlineMs: options.budgetMs }),
+      ...(options.clock ? { clock: options.clock } : {}),
+      log: line => { logs.push(line); options.log?.(line); } });
+    return { bridge, local, remote, hub, logs, original, cursorPath, saved };
+  };
+
+  it.each(["busy", "success"] as const)("a real final attempt at the deadline can end in %s after recovering an uncheckpointed ID", async outcome => {
+    let now = 0;
+    const b = await recoveringStartup({ clock: () => now, log: line => {
+      // Model the retry waking at its deadline without faking the native reader's I/O or clock.
+      if (line.startsWith("start:")) now = 3_000;
+    } });
+    const first = new MeshLockTimeoutError(" first custody gate", 1, 0);
+    const last = new MeshLockTimeoutError(" final custody gate", 1, 0);
+    const mirror = b.local.mirror.bind(b.local);
+    const attempts: number[] = [];
+    vi.spyOn(b.local, "mirror").mockImplementation(async (...args) => {
+      attempts.push(now);
+      if (attempts.length === 1) throw first;
+      if (outcome === "busy") throw last;
+      return mirror(...args);
+    });
+    const read = vi.spyOn(b.local, "bridgedIds");
+    try {
+      const error = await b.bridge.startWithBackoff(3_000).then(() => undefined, (failure: unknown) => failure);
+      expect(attempts).toEqual([0, 3_000]);
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(b.local.recoveryReadCost?.events).toBe(1);
+      expect(b.logs.filter(line => line.startsWith("recovery (toLocal): ") &&
+        line.includes("matchingIds=1") && line.includes("completed=true"))).toHaveLength(2);
+      if (outcome === "busy") {
+        expect(error).toBeInstanceOf(BridgeStartDeadlineError);
+        expect(error).toMatchObject({ waitedMs: 3_000, deadlineMs: 3_000, attempts: 2 });
+        expect((error as BridgeStartDeadlineError).lastError).toBe(last);
+        expect((error as Error).message).toMatch(/last: mesh lock timeout: .*final custody gate/);
+        expect(readHostLeaseCurrent(b.hub.root, identity.id)).toBeUndefined();
+        expect(fs.readFileSync(b.cursorPath, "utf8")).toBe(b.saved);
+      } else {
+        expect(error).toBeUndefined();
+        expect(readHostLeaseCurrent(b.hub.root, identity.id)).toMatchObject({ id: identity.id,
+          incarnationToken: host.incarnationToken });
+        // Readiness includes real custody; the recovered ID then prevents a duplicate append.
+        expect(await b.bridge.step()).toMatchObject({ toLocal: 0, dropped: 0 });
+        const received = b.hub.read({ after: 0, limit: 100 }).filter(event => event.topic === b.original.topic);
+        expect(received).toHaveLength(1);
+        expect(received[0]).toMatchObject({ data: { bridge: { id: b.original.id } } });
+        expect(JSON.parse(fs.readFileSync(b.cursorPath, "utf8")).toLocal.after).toBe(b.original.sequence);
+      }
+    } finally { await b.bridge.stop(); }
+  });
+
+  it.each([0, 20])("still enforces a finite %i ms per-attempt budget when real recovery remains", async budgetMs => {
+    const b = await recoveringStartup({ budgetMs });
+    const read = b.local.bridgedIds.bind(b.local);
+    vi.spyOn(b.local, "bridgedIds").mockImplementation(async after => {
+      const page = await read(after);
+      await new Promise(resolve => setTimeout(resolve, 25));
+      return page;
+    });
+    const presenceRead = vi.spyOn(b.local, "presence");
+    try {
+      await expect(b.bridge.startWithBackoff(300)).rejects.toThrow(`Bridge recovery exceeded ${budgetMs} ms startup budget`);
+      expect(presenceRead).not.toHaveBeenCalled();
+      expect(readHostLeaseCurrent(b.hub.root, identity.id)).toBeUndefined();
+      expect(fs.readFileSync(b.cursorPath, "utf8")).toBe(b.saved);
+      expect(b.logs.join("\n")).toMatch(/recovery \(toLocal\): .*completed=false cancelled=true/);
+      expect(b.logs.some(line => line.startsWith("start:"))).toBe(false);
+    } finally { await b.bridge.stop(); }
+  });
+
+  it("caps real recovery by the caller's start bound even without an options.startDeadlineMs (the CLI path)", async () => {
+    const b = await recoveringStartup();
+    expect(b.bridge.options.startDeadlineMs).toBeUndefined();
+    const read = b.local.bridgedIds.bind(b.local);
+    vi.spyOn(b.local, "bridgedIds").mockImplementation(async after => {
+      const page = await read(after);
+      await new Promise(resolve => setTimeout(resolve, 25));
+      return page;
+    });
+    const presenceRead = vi.spyOn(b.local, "presence");
+    try {
+      await expect(b.bridge.startWithBackoff(20)).rejects.toThrow("Bridge recovery exceeded 20 ms startup budget");
+      expect(presenceRead).not.toHaveBeenCalled();
+      expect(readHostLeaseCurrent(b.hub.root, identity.id)).toBeUndefined();
+      expect(fs.readFileSync(b.cursorPath, "utf8")).toBe(b.saved);
+    } finally { await b.bridge.stop(); }
+  });
+
+  it.each(["at", "beyond"] as const)("allows zero-budget no-op recovery with marks %s the real horizons, then installs presence", async mark => {
+    const b = await recoveringStartup({ budgetMs: 0, mark });
+    const localRead = vi.spyOn(b.local, "bridgedIds"), remoteRead = vi.spyOn(b.remote, "bridgedIds");
+    try {
+      await b.bridge.start(0);
+      expect(localRead).not.toHaveBeenCalled();
+      expect(remoteRead).not.toHaveBeenCalled();
+      expect(readHostLeaseCurrent(b.hub.root, identity.id)).toMatchObject({ id: identity.id,
+        incarnationToken: host.incarnationToken });
+      expect(fs.readFileSync(b.cursorPath, "utf8")).toBe(b.saved);
+    } finally { await b.bridge.stop(); }
+  });
+
+  it("still cancels a zero-budget no-op while its horizon read is in flight", async () => {
+    const b = await recoveringStartup({ budgetMs: 0, mark: "at" });
+    const head = b.local.latestCursor.bind(b.local);
+    vi.spyOn(b.local, "latestCursor").mockImplementation(async () => {
+      await b.bridge.stop();
+      return head();
+    });
+    const presenceRead = vi.spyOn(b.local, "presence");
+    try {
+      await expect(b.bridge.start(0)).rejects.toThrow(/cancelled|fenced/);
+      expect(presenceRead).not.toHaveBeenCalled();
+      expect(readHostLeaseCurrent(b.hub.root, identity.id)).toBeUndefined();
+      expect(fs.readFileSync(b.cursorPath, "utf8")).toBe(b.saved);
+    } finally { await b.bridge.stop(); }
+  });
+});

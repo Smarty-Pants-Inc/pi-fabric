@@ -27,6 +27,8 @@ function writeStatus(text) {
       routeClassSource: args.get("route-class-source"),
       ...(args.has("protected") ? { protected: args.get("protected") === "true" } : {}) });
   }
+  // Optional independent byte receipt for attempt-preservation tests, outside the run tree.
+  if (args.has("status-evidence")) fs.writeFileSync(args.get("status-evidence"), text);
   const temporary = `${statusFile}.${process.pid}.${++statusWrites}.tmp`;
   fs.writeFileSync(temporary, text);
   for (let attempt = 0; ; attempt++) {
@@ -154,6 +156,8 @@ if (task.includes("HANG_WITH_PROGRESS")) {
     cwd: args.get("cwd"),
     startedAt: Date.now(),
     updatedAt: Date.now(),
+    inputSha256: args.get("input-sha256"),
+    inputBytes: Number(args.get("input-bytes")),
     turns: carryOver?.turns ?? 0,
     toolCalls: carryOver?.toolCalls ?? 0,
     text: "",

@@ -6714,6 +6714,22 @@ export class AgentManager {
           delete managed.model;
         }
       }
+      const attemptKind = resume ? "resume" : "startup-retry";
+      const attemptNumber = resume ? managed.resumeAttempts : managed.startupAttempts;
+      const supersedeTrace = (file: string): void => {
+        for (let collision = 0; ; collision++) {
+          const target = `${file}.attempt-${attemptNumber}-${attemptKind}${collision ? `-${collision}` : ""}`;
+          try { fs.lstatSync(target); continue; }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+          try { fs.renameSync(file, target); return; }
+          catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT") return;
+            if (code === "EEXIST" || code === "ENOTEMPTY") continue;
+            throw error;
+          }
+        }
+      };
       if (resume) {
         // A continuation rewrites the run's input in place. The prompt metadata
         // stays bound to the original spawn brief; it is never recomputed from
@@ -6721,6 +6737,9 @@ export class AgentManager {
         const currentInput = promptMetadata(resume.task, managed.promptPath ?? path.join(managed.runDirectory, "task.txt"));
         managed.inputSha256 = currentInput.inputSha256;
         managed.inputBytes = currentInput.inputBytes;
+        // Preserve the previous worker's bytes before publishing the continuation's identity.
+        try { supersedeTrace(managed.statusFile); }
+        catch (error) { statusTraceRenameFailed = true; throw error; }
         // Publish the new input identity before replacing the bytes. A host death
         // between these writes leaves a detectable mismatch, never a false match.
         writeRecord(managed.statusFile, this.#withTransportMetadata(record, managed, false));
@@ -6761,8 +6780,6 @@ export class AgentManager {
       }
       // Keep an append-only record of every relaunch; the status and lifecycle
       // files below are replaced by the new attempt.
-      const attemptKind = resume ? "resume" : "startup-retry";
-      const attemptNumber = resume ? managed.resumeAttempts : managed.startupAttempts;
       fs.appendFileSync(
         path.join(managed.runDirectory, "relaunches.jsonl"),
         `${JSON.stringify({
@@ -6797,20 +6814,6 @@ export class AgentManager {
         }
       }
 
-      const supersedeTrace = (file: string): void => {
-        for (let collision = 0; ; collision++) {
-          const target = `${file}.attempt-${attemptNumber}-${attemptKind}${collision ? `-${collision}` : ""}`;
-          try { fs.lstatSync(target); continue; }
-          catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-          try { fs.renameSync(file, target); return; }
-          catch (error) {
-            const code = (error as NodeJS.ErrnoException).code;
-            if (code === "ENOENT") return;
-            if (code === "EEXIST" || code === "ENOTEMPTY") continue;
-            throw error;
-          }
-        }
-      };
       try { supersedeTrace(managed.statusFile); }
       catch (error) { statusTraceRenameFailed = true; throw error; }
       // Reset the superseded journal before launching its replacement. A launch

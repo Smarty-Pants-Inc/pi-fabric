@@ -192,6 +192,8 @@ const runTreeVeto = (
     // Keep the whole tree (including nested runs), not just its compacted reader view.
     // Resource/worktree cleanup remains independent of trace retention.
     if (preserveOriginal && fs.existsSync(path.join(directory, "events.jsonl.original"))) return "original run log is retained";
+    // Superseded attempt traces, like original logs, may be archived but never deleted.
+    if (preserveOriginal && fs.readdirSync(directory).some(name => /^(?:status\.json|lifecycle\.jsonl)\.attempt-\d+-(?:startup-retry|resume)(?:-\d+)?$/.test(name))) return "superseded attempt trace is retained";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";
     if (preserveArchives && fs.existsSync(path.join(directory, "archive-pending.json"))) return "terminal result archive is pending";
     if (expired()) return "worker exit is unconfirmed: run-tree inspection was incomplete";

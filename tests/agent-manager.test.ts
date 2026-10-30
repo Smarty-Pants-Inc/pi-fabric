@@ -1880,15 +1880,21 @@ describe("AgentManager", () => {
     const originalLaunch = ProcessTransport.prototype.launch;
     const movedBytes = new Map<string, Buffer>();
     const movedTargets = new Map<string, string>();
+    const workerStatusEvidence = path.join(root, "worker-status.bytes");
+    let firstInput: { inputSha256: string; inputBytes: number } | undefined;
     let statusFile: string | undefined, lifecycleFile: string | undefined, launchCount = 0;
     const launch = vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async function (this: ProcessTransport, request) {
       const argument = (name: string) => request.workerArguments[request.workerArguments.indexOf(name) + 1]!;
       statusFile = argument("--status-file"); lifecycleFile = argument("--lifecycle-file");
       const index = ++launchCount;
       if (index === 1) {
+        firstInput = { inputSha256: argument("--input-sha256"), inputBytes: Number(argument("--input-bytes")) };
+        if (recovery === "resume") request.workerArguments.push("--status-evidence", workerStatusEvidence);
         fs.writeFileSync(lifecycleFile, Buffer.from([0, 255, 13, 10, 123, 0]));
         fs.writeFileSync(`${statusFile}.attempt-${attempt}-${recovery}`, "pre-existing archive entry");
       } else {
+        const evidenceIndex = request.workerArguments.indexOf("--status-evidence");
+        if (evidenceIndex >= 0) request.workerArguments.splice(evidenceIndex, 2);
         expect(fs.existsSync(statusFile)).toBe(false);
         expect(fs.existsSync(lifecycleFile)).toBe(false);
         fs.writeFileSync(lifecycleFile, Buffer.from("fresh replacement lifecycle\n"));
@@ -1898,7 +1904,7 @@ describe("AgentManager", () => {
     const rename = fs.renameSync.bind(fs);
     const archive = vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
       const file = String(source);
-      if (file === statusFile || file === lifecycleFile) {
+      if ((file === statusFile || file === lifecycleFile) && !movedBytes.has(file)) {
         movedBytes.set(file, fs.readFileSync(file));
         movedTargets.set(file, String(destination));
       }
@@ -1918,6 +1924,12 @@ describe("AgentManager", () => {
       expect(statusArchive).toBe(`${statusFile}.attempt-${attempt}-${recovery}-1`);
       expect(lifecycleArchive).toBe(`${lifecycleFile}.attempt-${attempt}-${recovery}`);
       expect(fs.readFileSync(statusArchive!)).toEqual(movedBytes.get(statusFile!));
+      if (recovery === "resume") {
+        // Data safety: compare against the worker's publication, not a later manager rewrite.
+        expect(fs.readFileSync(statusArchive!)).toEqual(fs.readFileSync(workerStatusEvidence));
+        expect(JSON.parse(fs.readFileSync(statusArchive!, "utf8"))).toMatchObject(firstInput!);
+        expect(JSON.parse(fs.readFileSync(statusFile!, "utf8")).inputSha256).not.toBe(firstInput!.inputSha256);
+      }
       expect(fs.readFileSync(lifecycleArchive!)).toEqual(movedBytes.get(lifecycleFile!));
       expect(fs.readFileSync(`${statusFile}.attempt-${attempt}-${recovery}`, "utf8")).toBe("pre-existing archive entry");
       const freshStatus = fs.readFileSync(statusFile!);

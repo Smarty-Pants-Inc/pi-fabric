@@ -29,7 +29,7 @@ import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { readFileRetrying, renameAtomic, syncDirectoryChain, trackTemporary, writeJsonAtomic } from "../core/atomic-write.js";
-import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
+import { completionRecipientFromRun, discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { FABRIC_ACTOR_SELF_ENV, normalizeFabricActorActivationIdentity, type FabricActorActivationIdentity } from "../actors/activation-identity.js";
 import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
@@ -3926,7 +3926,8 @@ export class AgentManager {
     managed.latestRecord = compactUiRecord(recovered);
     managed.latestUiRecord = managed.latestRecord;
     if (managed.background && !this.#closing && this.config.notifyOnComplete && this.#onBackgroundComplete) {
-      try { this.#onBackgroundComplete(this.#withTransportMetadata(recovered, managed) as AgentRunResult); } catch { /* best effort */ }
+      try { this.#onBackgroundComplete(this.#withTransportMetadata(recovered, managed) as AgentRunResult,
+        this.#admittedCompletionRecipient(managed)); } catch { /* best effort */ }
     }
     return true;
   }
@@ -7549,6 +7550,9 @@ export class AgentManager {
       const summary = this.#budgetSummary();
       if (summary) result.budget = summary;
     }
+    // Every terminal path publishes the same transport-bound paths, including
+    // supervisor outcomes that did not arrive through the ordinary monitor.
+    result = this.#withTransportMetadata(result, managed) as AgentRunResult;
     this.#observePresence(managed, result);
     const compactResult = compactUiRecord(result);
     managed.latestRecord = compactResult;
@@ -7730,6 +7734,12 @@ export class AgentManager {
     if (children) yield* visitChildren(root, 0); else yield* visit(root, 0);
   }
 
+  /** Completion custody belongs to the caller's admitted run, not the worker's log location. */
+  #admittedCompletionRecipient(managed: ManagedAgent): CompletionRecipient | undefined {
+    return this.#meshRoot && !managed.actorId
+      ? completionRecipientFromRun(this.#meshRoot, managed.runDirectory) : undefined;
+  }
+
   #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
     this.#observePresence(managed, result);
     try {
@@ -7742,9 +7752,10 @@ export class AgentManager {
       managed.settledResultFile = resultFile;
       managed.resultFingerprint = fingerprint;
       delete managed.resultCollected;
-      if (managed.routeOutcome || this.#onSettled) this.#stageArchive(managed.runDirectory, full, "settlement", undefined, !managed.routeOutcome);
+      const admittedRecipient = managed.routeOutcome || this.#onSettled ? this.#admittedCompletionRecipient(managed) : undefined;
+      if (managed.routeOutcome || this.#onSettled) this.#stageArchive(managed.runDirectory, full, "settlement", admittedRecipient, !managed.routeOutcome);
       managed.routeOutcome?.(result);
-      this.#onSettled?.(full);
+      this.#onSettled?.(full, admittedRecipient);
       if (managed.routeOutcome || this.#onSettled) this.#commitArchive(managed.runDirectory, full);
       else if (this.#onStoppedAtClose && !this.#closing) commitRunArchive(managed.runDirectory);
       if (managed.settlementSaveFailure) this.#retentionRevision++;
@@ -7840,7 +7851,7 @@ export class AgentManager {
     ) {
       managed.completionNotified = true;
       try {
-        this.#onBackgroundComplete(result);
+        this.#onBackgroundComplete(result, this.#admittedCompletionRecipient(managed));
       } catch { /* completion callback must not break the manager */ }
     }
   }
@@ -8349,6 +8360,9 @@ export class AgentManager {
     const nestedAgents = reconcileNestedAgents(observedNested.length > 0 ? observedNested : record.nestedAgents ?? [], record);
     const budget = this.#budgetSummary();
     const { logFile: _logFile, nestedAgents: _nestedAgents, ...safeRecord } = record;
+    // Only the manager-owned transport can identify remote execution. Worker
+    // placement/session fields cannot opt a local run out of canonical paths.
+    const remote = managed.transport.kind === "process" && managed.transport.sessionId === `placement:${managed.id}`;
     const model = record.model ?? managed.model;
     const thinking = record.thinking ?? managed.thinking;
     const runnerSessionId = record.runnerSessionId ?? managed.runnerSessionId;
@@ -8373,7 +8387,7 @@ export class AgentManager {
         ? { promptRetentionDropped: true } : {}),
       ...((managed.promptRetentionMismatch || record.promptRetentionMismatch)
         ? { promptRetentionMismatch: true } : {}),
-      cwd: managed.cwd,
+      cwd: remote ? record.cwd : managed.cwd,
       ...(managed.launch.placementAdmission ? {
         placementRunId: managed.launch.placementAdmission.placementRunId,
         placementKind: managed.launch.placementAdmission.placementKind,
@@ -8386,7 +8400,7 @@ export class AgentManager {
       ...(managed.transport.cgroup ? { cgroup: managed.transport.cgroup } : {}),
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
       ...(managed.temporaryDirectory ? { temporaryDirectory: managed.temporaryDirectory } : {}),
-      logFile: path.join(managed.runDirectory, "events.jsonl"),
+      logFile: remote && record.logFile ? record.logFile : path.join(managed.runDirectory, "events.jsonl"),
       ...(nestedAgents.length > 0 ? { nestedAgents } : {}),
       ...(budget ? { budget } : {}),
       ...(model ? { model } : {}),

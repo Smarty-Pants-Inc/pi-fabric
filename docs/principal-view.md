@@ -46,7 +46,7 @@ The newest installed runtime on the lane is `623f57905b902feafdaeb6b5aeed9812faf
 | Animated state, voice, inbox widget | Existing Pi/extensions retained, not reimplemented | Native loader/status + installed extensions |
 | Editor/multiline keys/history | Native and unchanged | Native |
 
-## Smallest proposed change to Smarty-Pants-Inc/pi (not applied here)
+## Smallest proposed change to Pi (not applied here)
 
 Add a **per-UI display-only setter**, analogous to `setEditorComponent`, so Fabric does not need to patch transcript internals:
 

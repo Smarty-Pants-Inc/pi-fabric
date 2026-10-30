@@ -1,6 +1,6 @@
 # Records: the org's durable record on its Node
 
-`records.*` is the record layer of [smarty-dev#754](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/754)
+`records.*` is the record layer of [smarty-dev#754](../REFERENCES.md#source-21)
 ("the record on the Smarty Node, GitHub as an adapter"). Issues, statuses, decisions, asks, answers, results and
 handoffs are **records**: append-only rows in the org's own PostgreSQL database, never updated or deleted. An edit is
 a new record that `supersedes` the old one. The mesh carries each record live ("commit, then nudge"); PostgreSQL
@@ -98,7 +98,7 @@ The service (`/etc/<org>-records/service.json`, written by the install script) h
   "database": { "host": "/run/smarty-pants-records-pg", "port": 5433, "database": "records", "user": "records_service" },
   "migration": { "host": "/run/smarty-pants-records-pg", "port": 5433, "database": "records", "user": "postgres" },
   "roles": { "importer": ["importer:github"], "mirror": [] },
-  "mirror": { "enabled": false, "repos": ["Smarty-Pants-Inc/smarty-dev"] },
+  "mirror": { "enabled": false, "repos": ["example-org/smarty-dev"] },
   "admission": {
     "targets": [
       { "name": "m4max", "command": ["wal-g", "--config", "/etc/wal-g/m4max.yaml", "wal-verify", "integrity", "--json"] },
@@ -122,15 +122,15 @@ The service (`/etc/<org>-records/service.json`, written by the install script) h
 
 ```ts
 const receipt = await records.append({
-  ref: "Smarty-Pants-Inc/smarty-dev#754", kind: "status", key: "record-layer:status:1",
+  ref: "example-org/smarty-dev#754", kind: "status", key: "record-layer:status:1",
   text: "Building the record layer", data: { state: "in progress", eta: "~08:00Z PR" },
 });
-// { id, sequence, origin, topic: "record/Smarty-Pants-Inc/smarty-dev/754", ref, key, createdAt }
+// { id, sequence, origin, topic: "record/example-org/smarty-dev/754", ref, key, createdAt }
 
 let cursor = 0; // your saved processing cursor
 const page = await records.read({ after: cursor, limit: 100 });   // { records, next, frontier, origin }
-const { state, history, next } = await records.get({ ref: "Smarty-Pants-Inc/smarty-dev#754" });
-const board = await records.list({ repo: "Smarty-Pants-Inc/smarty-dev", open: true });
+const { state, history, next } = await records.get({ ref: "example-org/smarty-dev#754" });
+const board = await records.list({ repo: "example-org/smarty-dev", open: true });
 const health = await records.status();
 ```
 

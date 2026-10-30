@@ -55,7 +55,7 @@ interface FabricAction {
   effect?: FabricActionEffect;
 }
 interface FabricAgentRequest {
-  /** Opaque ledger ask URI (1-512 UTF-8 bytes, no controls/newlines); omitted inherits. */
+  /** Whole opaque Ask-ID value (1-512 UTF-8 bytes, no controls/newlines); omitted inherits byte-for-byte. */
   askId?: string;
   /** Explicit run-history class; does not opt a non-auto task into routing. */
   routeClass?: string;

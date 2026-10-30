@@ -120,8 +120,8 @@ describe("host process task placement", () => {
     expect(JSON.parse(fs.readFileSync(path.join(f.results, result.id, "poll-argv.json"), "utf8"))).toEqual([]);
   });
   it.each([
-    { ambient: "opaque-parent", askId: undefined, expected: "opaque-parent", askIdState: "inherited" },
-    { ambient: "opaque-parent", askId: "child override", expected: "child override", askIdState: "explicit" },
+    { ambient: ' [ "Parent Org", "opaque-parent" ] ', askId: undefined, expected: ' [ "Parent Org", "opaque-parent" ] ', askIdState: "inherited" },
+    { ambient: '["Parent Org","opaque-parent"]', askId: '["Smarty-Pants-Inc","org-feed://principal/Paul/block/12-abc"]', expected: '["Smarty-Pants-Inc","org-feed://principal/Paul/block/12-abc"]', askIdState: "explicit" },
     { ambient: "unrelated launcher ask", askId: undefined, expected: null, askIdState: "missing" },
   ])("carries $askIdState askId into the placement launcher and its raw status", async ({ ambient, askId, expected, askIdState }) => {
     vi.stubEnv("PI_FABRIC_ASK_ID", ambient);

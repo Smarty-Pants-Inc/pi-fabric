@@ -4,7 +4,7 @@ export interface AgentAskIdentity {
   askIdState: "explicit" | "inherited" | "missing";
 }
 
-/** Validate only the carrier, never the URI's meaning; do not trim or rewrite it. */
+/** Validate only the whole Ask-ID carrier; never parse, trim, or rewrite it. */
 export const normalizeAgentAskId = (value: unknown): string | undefined => {
   if (value === undefined) return undefined;
   if (typeof value !== "string" || !value.length || Buffer.byteLength(value, "utf8") > 512 || /[\p{Cc}\u2028\u2029]/u.test(value)) {
@@ -21,4 +21,4 @@ export const resolveAgentAskIdentity = (value: unknown, parent: string | null | 
 };
 
 export const taskWithAskId = (task: string, askId: string | null): string =>
-  askId === null ? task : `Ask-ID: ["Smarty-Pants-Inc",${JSON.stringify(askId)}]\n${task}`;
+  askId === null ? task : `Ask-ID: ${askId}\n${task}`;

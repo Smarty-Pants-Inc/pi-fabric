@@ -99,8 +99,8 @@ describe("agent input declarations", () => {
   it("exposes optional askId on native spawn and the typed guest request/receipt", () => {
     const schema = AGENTS_ACTION_DESCRIPTORS.find(entry => entry.name === "spawn")!.inputSchema;
     expect((schema as { properties: Record<string, unknown> }).properties.askId).toMatchObject({ type: "string", minLength: 1, maxLength: 512 });
-    expect(Value.Check(schema, { task: "x", askId: "opaque ledger value" })).toBe(true);
-    expect(typeCheckFabricCode('const h = await agents.spawn({task:"x",askId:"opaque"}); const id: string | null | undefined = h.askId; const state: "explicit" | "inherited" | "missing" | undefined = h.askIdState;', GUEST_TYPE_DECLARATIONS, true).errors).toEqual([]);
+    expect(Value.Check(schema, { task: "x", askId: '["Smarty-Pants-Inc","org-feed://principal/Paul/block/12-abc"]' })).toBe(true);
+    expect(typeCheckFabricCode(`const h = await agents.spawn({task:"x",askId:'["Smarty-Pants-Inc","org-feed://principal/Paul/block/12-abc"]'}); const id: string | null | undefined = h.askId; const state: "explicit" | "inherited" | "missing" | undefined = h.askIdState;`, GUEST_TYPE_DECLARATIONS, true).errors).toEqual([]);
   });
 
   it("exports the same typed error and accepts requires in guest spawn/run programs", () => {

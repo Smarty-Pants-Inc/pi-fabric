@@ -98,7 +98,7 @@ export interface AgentSpawner {
 }
 
 export interface AgentRunRequest {
-  /** Opaque ledger ask URI, copied exactly; omitted inherits the spawning task's value. */
+  /** Whole opaque Ask-ID value, copied byte-for-byte; omitted inherits the spawning task's value. */
   askId?: string;
   /** Host-only caller snapshot for resident forwarding; null means no parent ask. */
   inheritedAskId?: string | null;

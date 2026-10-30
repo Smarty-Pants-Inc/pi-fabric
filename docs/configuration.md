@@ -15,7 +15,7 @@ Authority-relaxing host settings belong in **`/etc/smarty/fabric-policy.json`**,
 
 Fabric honours the file only when `lstat` identifies a regular file owned by uid **0**, with no group/world write bits. Every directory from its parent through the filesystem root must likewise be root-owned, non-group/world-writable and a real directory, not a symlink. The reader opens with `O_NOFOLLOW`, verifies ownership/mode and matching device/inode with `fstat`, reads exactly that descriptor's initial size, then repeats `fstat`. A full read and identical size, device/inode, mtime/ctime, ownership and mode are required before parsing JSON. Symlinks, unsafe ownership/modes/ancestry, open races, short or metadata-changing reads, unreadable files and malformed/non-object JSON or invalid consumed authority-field schemas fail strict with one warning per process naming the path and failure reason. Recognized objects must be objects, Landlock mode must be `off`/`enforce`, kill-switch/escape values must be booleans, model lists must contain strings, and processSlice must be a slice name. **Publish policy updates by atomic rename** of a complete root-owned file in the trusted directory, never by rewriting the active inode in place. Fabric never creates, migrates or rewrites this root file.
 
-Landlock `enforce` applies to the Fabric Bash route only. Actor/task launchers, process transports and trusted executor runtimes are not Landlock-enforced; non-Bash enforcement is tracked in [smarty-dev#7935](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7935). Reserved `PI_FABRIC_LANDLOCK_*` environment controls are scrubbed at unrelated child-launch boundaries; scrubbing is not confinement.
+Landlock `enforce` applies to the Fabric Bash route only. Actor/task launchers, process transports and trusted executor runtimes are not Landlock-enforced; non-Bash enforcement is tracked in [smarty-dev#7935](../REFERENCES.md#source-7). Reserved `PI_FABRIC_LANDLOCK_*` environment controls are scrubbed at unrelated child-launch boundaries; scrubbing is not confinement.
 
 Only these keys are consumed from root policy; other settings remain in the ordinary configuration files:
 
@@ -39,7 +39,7 @@ Only these keys are consumed from root policy; other settings remain in the ordi
 - `agents.deniedModels`: root policy provides the baseline deny list. The agent-dir list is **unioned** with it; clearing the agent-dir list cannot remove a root deny. Root may remove its own denies, but any remaining agent-dir deny still tightens the result.
 - `agents.modelPolicy.requireReason`: defaults to `["gpt-6-astra", "opus", "claude"]`. Root policy may replace/relax this baseline (including `[]`); the agent-dir list is **unioned** with the root/default baseline and can only add requirements. Workspace lists remain ignored. The root file consumes this rollback list only; `fallbackModel` and `fallbackThinking` remain profile/agent-dir settings.
 - `agents.modelPolicy.fallbackModel` is an optional host/profile selector for indirect model resolution; it has no package default. Indirect resolution prefers a configured non-protected `agents.model`, then this host/profile fallback. `agents.modelPolicy.fallbackThinking` defaults to `"high"`. If the configured fallback is absent or unavailable, resolution continues through the inherited model when permitted and otherwise refuses with `agents.modelPolicy.fallbackModel` named. Fleet profile installation uses `~/.local/share/smarty-dev/pi-agent/fabric.json` with `fallbackModel: "cliproxyapi/gpt-6-luna"` and `fallbackThinking: "high"`; a non-fleet profile may not have that provider installed, so provisioning must verify the selector on each target host.
-- Claude/Opus exceptions require host-owned admission from the fixed `/etc/smarty/model-exceptions.json`; no `fabric.json`, environment, agent directory, workspace or user config can redirect it. The v1 document is `{ "version": 1, "grants": [{ "id", "issue", "reason_url", "role", "lane", "host", "model", "thinking", "granted_by", "granted_at", "expires_at", "status" }] }` (field names shown; see the [complete JSON example and operator request flow](agents.md#explicit-model-exceptions-3134)). Every field is required. `role` is `task`, `actor:<name>` or `lane`; `status` is `active` or `revoked`. ONE active, unexpired grant must match the canonical issue in `modelReason`, ROOT-bound worktree lane, short host, exact role and exact resolved canonical model, with actual effective thinking at or below the ceiling. No prefixes or alternate provenance models match. The lane comes only from a host callback reading the bound ROOT participant's cwd basename; missing binding is `lane-mismatch`, never a manager/request cwd fallback. Bare `#N` means `Smarty-Pants-Inc/smarty-dev#N`; `repo#N`, full `Smarty-Pants-Inc/repo#N` and that organization's GitHub issue URLs normalize to the same issue. Provision only through `smarty-rootops`: root-owned regular file, at most 1 MiB, normally mode `0644`, no group/world write, and every parent through `/` root-owned and not group/world writable. The reader uses `O_NOFOLLOW`, fd `fstat`, bounded/stable reads. Missing files grant nothing (`file-unavailable`); unsafe metadata/symlinks or unsupported ownership platforms give `untrusted-source`. Duplicate ids, any malformed entry, unknown version/status, invalid ISO date-time or non-increasing timestamps invalidate the whole file (`malformed`). TTL over 72 hours gives `expiry-too-long`; expiration gives `expired` without any sweep, and revocation gives `revoked`. All refusals use `FABRIC_MODEL_EXCEPTION_DENIED` before worker launch. Leads/Main are unaffected. Each admitted launch appends one immutable-grant audit record with grant id, issue, lane, short host, role, model, effective thinking, run id and time; inherited-switch audit compatibility remains. The band file is only an untrusted meter, never authority.
+- Claude/Opus exceptions require host-owned admission from the fixed `/etc/smarty/model-exceptions.json`; no `fabric.json`, environment, agent directory, workspace or user config can redirect it. The v1 document is `{ "version": 1, "grants": [{ "id", "issue", "reason_url", "role", "lane", "host", "model", "thinking", "granted_by", "granted_at", "expires_at", "status" }] }` (field names shown; see the [complete JSON example and operator request flow](agents.md#explicit-model-exceptions-3134)). Every field is required. `role` is `task`, `actor:<name>` or `lane`; `status` is `active` or `revoked`. ONE active, unexpired grant must match the canonical issue in `modelReason`, ROOT-bound worktree lane, short host, exact role and exact resolved canonical model, with actual effective thinking at or below the ceiling. No prefixes or alternate provenance models match. The lane comes only from a host callback reading the bound ROOT participant's cwd basename; missing binding is `lane-mismatch`, never a manager/request cwd fallback. The fixed model-exception owner comes from [`config/model-exception-owner.json`](../config/model-exception-owner.json), not an Ask-ID. Bare `#N` means `<policy-owner>/smarty-dev#N`; `repo#N`, full `<policy-owner>/repo#N` and that organization's GitHub issue URLs normalize to the same issue. Provision only through `smarty-rootops`: root-owned regular file, at most 1 MiB, normally mode `0644`, no group/world write, and every parent through `/` root-owned and not group/world writable. The reader uses `O_NOFOLLOW`, fd `fstat`, bounded/stable reads. Missing files grant nothing (`file-unavailable`); unsafe metadata/symlinks or unsupported ownership platforms give `untrusted-source`. Duplicate ids, any malformed entry, unknown version/status, invalid ISO date-time or non-increasing timestamps invalidate the whole file (`malformed`). TTL over 72 hours gives `expiry-too-long`; expiration gives `expired` without any sweep, and revocation gives `revoked`. All refusals use `FABRIC_MODEL_EXCEPTION_DENIED` before worker launch. Leads/Main are unaffected. Each admitted launch appends one immutable-grant audit record with grant id, issue, lane, short host, role, model, effective thinking, run id and time; inherited-switch audit compatibility remains. The band file is only an untrusted meter, never authority.
 
 **Fail-safe behavior:** missing policy preserves the built-in `off` baseline and grants no authority relaxations. Any other unprovable policy fails strict: Landlock `enforce`, `disabled: false`, no `allowEscape`, and no root authority relaxations. Its once-per-process warning names `/etc/smarty/fabric-policy.json` and the failure reason. Agent deny/reason additions and other tightening settings still apply. Already-loaded enforcement remains enforced; live rereads of invalid/unreadable/unstable policy also tighten an already-loaded `off` baseline and revoke kill-switch/escape grants. A later missing policy uses defaults again, without weakening session tightening.
 
@@ -1045,7 +1045,7 @@ Each live actor publishes a presence record in the shared mesh state. When a ses
 call override → session binding → project default → Fabric default
 ```
 
-`mesh.controlIncarnationFence` is a **host-only** setting in the host's `fabric.json`: `"warn"` (default) or `"enforce"`. Project configuration cannot override it. In `"warn"`, an older sender that omits an upgraded destination's advertised `ownerIncarnation` can still deliver controls and messages, subject to the existing identity, target, bridge-link, lease, deadline and deduplication checks. The receiving owner emits a counted warning naming the sender at most once per sender per hour. An explicit wrong or stale incarnation is refused in **both** modes. In `"enforce"`, omission is also refused with `FABRIC_CONTROL_STALE_INCARNATION`. Keep `"warn"` while installs roll host by host: advertising an epoch alone does not make an old sender epoch-aware. **Flip to `"enforce"` only after every host runs a release containing this PR**, including Main and resident senders; see [the rollout cutover rule (smarty-dev#7514)](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7514). Reload the Main or restart the resident after changing this captured setting.
+`mesh.controlIncarnationFence` is a **host-only** setting in the host's `fabric.json`: `"warn"` (default) or `"enforce"`. Project configuration cannot override it. In `"warn"`, an older sender that omits an upgraded destination's advertised `ownerIncarnation` can still deliver controls and messages, subject to the existing identity, target, bridge-link, lease, deadline and deduplication checks. The receiving owner emits a counted warning naming the sender at most once per sender per hour. An explicit wrong or stale incarnation is refused in **both** modes. In `"enforce"`, omission is also refused with `FABRIC_CONTROL_STALE_INCARNATION`. Keep `"warn"` while installs roll host by host: advertising an epoch alone does not make an old sender epoch-aware. **Flip to `"enforce"` only after every host runs a release containing this PR**, including Main and resident senders; see [the rollout cutover rule (smarty-dev#7514)](../REFERENCES.md#source-5). Reload the Main or restart the resident after changing this captured setting.
 
 `mesh.bridgeControlTimeoutMs` (default 30000, range 30000–300000) is the admission window for control commands to a validated participant mirrored from another host. It covers outbound bridge queueing; senders also allow up to 15 seconds for the acknowledgement's return leg. A longer explicit request timeout wins. Mirrored steer/followUp waits are bounded from admission even during a mesh-lock wait; lease renewal cannot extend them. ASK, bridge and explicitly bounded requests retain their timeout policy. Native steer/followUp commands with a validated fresh owner lease have a 60-second admission/ACK window plus the existing (up to 15-second) return-leg grace. While a message is pending, the sender polls only the captured owner's lease file; an owner more than the routing grace overdue produces retryable `FABRIC_PARTICIPANT_STALE`, not an acknowledgement timeout.
 
@@ -1153,22 +1153,21 @@ with the keys below, added to the existing complete NATS configuration (TLS,
 credentials, machine inventory and custody/liveness policy remain required):
 
 ```json
-{ "mesh": { "nats": { "events": true, "org": "smarty-pants-inc", "provision": false } } }
+{ "mesh": { "nats": { "events": true, "org": "example-org", "provision": false } } }
 ```
 
-`mesh.nats.org` is a GitHub login slug, required when events are enabled. The
-active values are `smarty-pants-inc` and `versehq` (Playful's login is `versehq`,
-not `playful`). Values are 1–63 lowercase letters, digits or hyphens, starting
+`mesh.nats.org` is a GitHub login slug, required when events are enabled. Supply
+your organization's actual GitHub login, not its display name; `example-org`
+below is only a placeholder. Values are 1–63 lowercase letters, digits or hyphens, starting
 with a letter or digit; `sys` is reserved. Stream names uppercase the slug and
 replace hyphens with `_`. `mesh.nats.provision` **defaults to false**;
 both flags must be booleans. FILE transport keeps them off. In NATS mode the
 existing `PI_FABRIC_MESH_NATS` replacement snapshot supplies these keys when
 present.
 
-**Two streams, no overlap:** `FABRIC_EV_SMARTY_PANTS_INC` owns only
-`fabric.ev.smarty-pants-inc.>`; `GITHUB_SMARTY_PANTS_INC` is the existing
-fabric-store stream for `github.smarty-pants-inc.>`. The equivalent names for
-`versehq` are `FABRIC_EV_VERSEHQ` and `GITHUB_VERSEHQ`. Fabric-store creates the
+**Two streams, no overlap:** for `example-org`, `FABRIC_EV_EXAMPLE_ORG` owns only
+`fabric.ev.example-org.>`; `GITHUB_EXAMPLE_ORG` is the existing
+fabric-store stream for `github.example-org.>`. Fabric-store creates the
 event stream with admin credentials: Limits retention, DiscardNew, 2 GiB max,
 File storage, one replica, no age expiry, and a two-minute duplicate window.
 Runtime provisioning verifies this exact existing policy; runtime credentials do
@@ -1190,8 +1189,8 @@ reopening or changing topics does not reset the cursor.
 
 | Purpose | Subject |
 |---|---|
-| Fabric topic `fleet.work` in org `smarty-pants-inc` | `fabric.ev.smarty-pants-inc.fleet.work` |
-| Actor wake for `<actorId>` | `fabric.ev.smarty-pants-inc.wake.<actorId>` |
+| Fabric topic `fleet.work` in org `example-org` | `fabric.ev.example-org.fleet.work` |
+| Actor wake for `<actorId>` | `fabric.ev.example-org.wake.<actorId>` |
 | Raw GitHub ingress fact (separate factory authority) | `github.<org>.<repo>.<event>.<action>.<n>` |
 | GitHub review projection | `github.<org>.<repo>.pulls.shard<K>of<N>` |
 
@@ -1212,7 +1211,7 @@ Mail services can publish through the plain-Node CLI:
 ```sh
 pi-fabric events publish --topic mail.inbound --id <message-id> --data-file ./event.json \
   --creds /run/fabric/nats/user.creds --ca /etc/fabric/nats/ca.pem \
-  --servers tls://nats.example:4222 --org smarty-pants-inc
+  --servers tls://nats.example:4222 --org example-org
 ```
 
 Provide exactly one of `--data` or `--data-file`; JSON input is limited to 1 MiB.
@@ -1228,7 +1227,7 @@ same logical event.
 rights: a holder can read either stream and create/delete another actor's
 consumer, and can forge events on `fabric.ev.<org>.>`. Filters and actor names
 are conventions, not authorization boundaries; `mesh.nats.org` is not signed
-identity. [smarty-dev#15355](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/15355)
+identity. [smarty-dev#15355](../REFERENCES.md#source-8)
 tracks this gap. Per-actor signed tags and authorization hardening are deferred.
 
 ## Records

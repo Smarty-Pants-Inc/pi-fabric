@@ -8,8 +8,8 @@ import { normalizeAgentRunRequest } from "../src/agents/request.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { diagnostics } from "../src/core/diagnostics.js";
 
-const ask = "org-feed://principal/Paul/block/17-" + "a".repeat(64);
-const override = "pi-session://principal/session-1/entry/entry-2";
+const ask = '["Smarty-Pants-Inc","org-feed://principal/Paul/block/12-abc"]';
+const override = ' [ "Other Org", "pi-session://principal/session-1/entry/é\\u002d2" ] ';
 const defaults = { runner: "pi" as const, timeoutMs: 10_000 };
 const managers: AgentManager[] = [];
 const roots: string[] = [];
@@ -43,7 +43,7 @@ describe("opaque agent askId", () => {
     const receipt = await manager.spawn({ task, askId: ask, transport: "process" });
     expect(await manager.wait(receipt.id)).toMatchObject({ status: "failed", askId: ask, askIdState: "explicit" });
     const bytes = fs.readFileSync(receipt.promptPath!, "utf8");
-    const marker = `Ask-ID: ["Smarty-Pants-Inc","${ask}"]\n`;
+    const marker = `Ask-ID: ${ask}\n`;
     expect(bytes.startsWith(marker)).toBe(true);
     expect(bytes.match(/Ask-ID:/g)).toHaveLength(1);
     expect(receipt.promptSha256).toBe(createHash("sha256").update(marker + task).digest("hex"));
@@ -74,8 +74,9 @@ describe("opaque agent askId", () => {
     expect(result).toMatchObject(identity);
     expect(JSON.parse(result.text).askId).toBe(expected); // Actual worker -> Pi process boundary.
     const bytes = fs.readFileSync(receipt.promptPath!, "utf8");
-    const marker = expected === null ? "" : `Ask-ID: ["Smarty-Pants-Inc","${expected}"]\n`;
+    const marker = expected === null ? "" : `Ask-ID: ${expected}\n`;
     expect(bytes).toBe(marker + "exact brief π\n");
+    if (expected !== null) expect(bytes.split("\n")[0]).toBe("Ask-ID: " + expected);
     expect(receipt.promptSha256).toBe(createHash("sha256").update(bytes).digest("hex"));
     expect(receipt.promptBytes).toBe(Buffer.byteLength(bytes));
     if (expected !== null) expect(receipt.promptSha256).not.toBe(createHash("sha256").update("exact brief π\n").digest("hex"));

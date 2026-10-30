@@ -517,10 +517,10 @@ describe("resident actor spawn router attribution", () => {
 
 describe("resident askId custody", () => {
   it.each([
-    { parent: undefined, askId: "org-feed://principal/Paul/block/1-opaque", state: "explicit" },
+    { parent: undefined, askId: '["Smarty-Pants-Inc","org-feed://principal/Paul/block/12-abc"]', state: "explicit" },
     { parent: undefined, askId: undefined, state: "missing" },
-    { parent: "pi-session://principal/parent/entry/ask", askId: undefined, state: "inherited" },
-    { parent: "pi-session://principal/parent/entry/ask", askId: "opaque child override", state: "explicit" },
+    { parent: ' [ "Parent Org", "pi-session://principal/parent/entry/ask" ] ', askId: undefined, state: "inherited" },
+    { parent: '["Parent Org","pi-session://principal/parent/entry/ask"]', askId: '["Child Org","opaque child override"]', state: "explicit" },
   ])("preserves $state at the client -> resident host boundary", async ({ parent, askId, state }) => {
     vi.stubEnv("PI_FABRIC_ASK_ID", "unrelated resident host ask");
     const { root, config, host } = fixture();
@@ -546,7 +546,8 @@ describe("resident askId custody", () => {
       expect(await host.agents.wait(handle.id)).toMatchObject(expected);
       expect(await client.waitAgent(handle.id, AbortSignal.timeout(5_000))).toMatchObject(expected);
       const bytes = fs.readFileSync(handle.promptPath!, "utf8");
-      expect(bytes).toBe((expected.askId === null ? "" : `Ask-ID: ["Smarty-Pants-Inc","${expected.askId}"]\n`) + "retained resident brief");
+      expect(bytes).toBe((expected.askId === null ? "" : `Ask-ID: ${expected.askId}\n`) + "retained resident brief");
+      if (expected.askId !== null) expect(bytes.split("\n")[0]).toBe("Ask-ID: " + expected.askId);
       expect(handle.promptSha256).toBe(createHash("sha256").update(bytes).digest("hex"));
       expect(JSON.parse(fs.readFileSync(residentResultPath(config.residencyRoot, handle.id), "utf8"))).toMatchObject(expected);
     } finally {

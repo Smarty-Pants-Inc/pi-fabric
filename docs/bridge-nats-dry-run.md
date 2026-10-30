@@ -138,6 +138,31 @@ systemctl --user start smarty-nats-link@v2.service
 `mirrors` should equal the dry run's live `nats` rows and `problems` should be empty; `status` reports any
 mirror the allow-list does not name as a problem.
 
+## Event refusals are not link failures
+
+A malformed or unauthorized outbound command, ACK or translated topic is a **per-event refusal**.
+The link records `{kind: "refused", reason, code?}` on the existing ledger's `toNats` event-level
+`seen` receipt, keyed by the source event id. This is not an owner's ACK and does not settle a command.
+Only after the receipt is fsync'd does publication resolve as refused and MeshBridge checkpoint past
+that event. The next event can cross; a refused event is counted as dropped, never as delivered.
+The link logs `toNats: refused <topic> <event id>: <reason>` once on the first decision. A restart
+reuses the receipt without retrying or re-logging the event, including a replay before the cursor
+checkpoint. Receipts use the ledger's existing 24-hour horizon and compaction; keep the ledger as
+well as the cursor during a restart or seat move. If a refusal receipt cannot be persisted, the
+source cursor stays put and the link retries with its existing backoff.
+
+This includes an ACK with no boolean `accepted`, and a relay/infrastructure refusal ACK: the latter
+has an `accepted` field but is deliberately not an **owner** outcome. Such an ACK must not acquire
+owner authority just to pass the carrier. Verified command senders still receive the existing
+best-effort, deduped `notRun` refusal ACK when the carrier can safely construct one.
+
+A **link-level safety failure still stops the link**: a fenced port (`FABRIC_BRIDGE_NATS_FENCED`),
+invalid port identity/envelope binding (`FABRIC_TRANSPORT_INVALID`), denied credentials/permissions
+(`FABRIC_TRANSPORT_DENIED`), terminal inbox/watch failures, or a foreign link identity at mirror time.
+These are not `NatsCarrierRefusal` and cannot be downgraded to event drops by a message containing
+“not allowed”. Transient transport outages, uncertain PubAcks and recognized retryable presence gaps retain
+the event and retry; they are neither permanent event refusals nor link safety failures.
+
 ## Rollback
 
 The link changes only three things: KV presence and lease records under its own machine, mirror records

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -36,6 +37,7 @@ const setup = (retainRuns: boolean) => {
   return { root, agents };
 };
 const originalBytes = (run: string) => fs.readFileSync(path.join(run, "events.jsonl.original"));
+const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 
 describe("settlement and cleanup with a retained original", () => {
   it("releases an offline durable handle but keeps the original run log", async () => {
@@ -125,8 +127,22 @@ describe("settlement and cleanup with a retained original", () => {
     const run = agents.runDirectory(result.id)!;
     roots.push(path.dirname(run));
     const bytes = originalBytes(run);
+    const childRunRoot = path.join(run, "nested");
+    const childManager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: true, model: "fixture/model" }, {
+      workerPath: path.resolve("tests/fixtures/retained-original-worker.mjs"), runRoot: childRunRoot,
+    });
+    const child = await childManager.run({ task: "synthetic nested child", transport: "process" });
+    expect(child.status).toBe("completed");
+    const childDirectory = childManager.runDirectory(child.id)!;
+    const childOriginal = originalBytes(childDirectory);
+    const childSha = sha256(childOriginal);
+    expect(childOriginal.length).toBeGreaterThan(8 * 1024);
+    await childManager.close();
     await agents.close();
     expect(originalBytes(run)).toEqual(bytes);
+    expect(sha256(fs.readFileSync(path.join(childDirectory, "events.jsonl.original")))).toBe(childSha);
+    expect(fs.readFileSync(path.join(childDirectory, "events.jsonl.original"))).toEqual(childOriginal);
+    expect(JSON.parse(fs.readFileSync(path.join(run, "status.json"), "utf8"))).toMatchObject({ status: "failed" });
   });
 
   it.each([false, true])("releases completed actor handles and slot custody with retained raw bytes (retainRuns=%s)", async retainRuns => {

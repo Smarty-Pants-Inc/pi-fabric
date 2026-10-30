@@ -939,6 +939,17 @@ const pathAbsentNoFollow = (file: string): boolean => {
   catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
 };
 
+const subtreeHasRetainedOriginal = (entry: string): boolean => {
+  try {
+    const stat = fs.lstatSync(entry);
+    if (stat.isFile()) return path.basename(entry) === "events.jsonl.original";
+    if (!stat.isDirectory()) return false;
+    return fs.readdirSync(entry).some(child => subtreeHasRetainedOriginal(path.join(entry, child)));
+  } catch {
+    return true;
+  }
+};
+
 const readRecord = (filePath: string): AgentRunRecord | undefined => {
   try {
     const parsed: unknown = JSON.parse(readFileRetrying(filePath));
@@ -7291,8 +7302,9 @@ export class AgentManager {
     if (keepResult && resultFile) managed.resultFingerprint = writePrivateJsonAtomic(resultFile, omitRetainedTasks(record));
     writeJsonAtomic(managed.statusFile, omitRetainedTasks(compactUiRecord(this.#withTransportMetadata(record, managed, false))), { space: 2 });
     for (const entry of fs.readdirSync(managed.runDirectory)) {
-      if (entry === "status.json" || entry === "events.jsonl.original" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult)) continue;
-      await removeTree(path.join(managed.runDirectory, entry));
+      const entryPath = path.join(managed.runDirectory, entry);
+      if (entry === "status.json" || entry === "events.jsonl.original" || (entry === "task.txt" && currentMatches) || (entry === MANAGER_RESULT_FILE && keepResult) || subtreeHasRetainedOriginal(entryPath)) continue;
+      await removeTree(entryPath);
     }
     // Once an unsuccessful run has a retained status, never fall back to deleting its
     // whole tree. Any cleanup error propagates to the close custody fence.

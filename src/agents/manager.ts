@@ -936,6 +936,37 @@ interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
   usageEmitted: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
 }
 
+/** Launch-captured host identity; only successful native close sets the latch. */
+interface WorkerIdentity {
+  pid: number;
+  startTime: string | undefined;
+  closed: boolean;
+}
+
+/** Exact-handle stop facts, never inferred from a manager lost-contact string. */
+interface TerminalScopeStop {
+  closed: Promise<void>;
+  treeClosed: Promise<void>;
+  sampledStopSucceeded: boolean;
+  stopRejected: boolean;
+  receiptRejected: boolean;
+  terminalAttempted: boolean;
+  managerProofFailed: boolean;
+  phase?: { open: boolean };
+}
+
+/** Provisional eligibility only; primary death is re-proved after ordinary stop. */
+interface TerminalScopeAuthorization {
+  managed: ManagedAgent;
+  id: string;
+  transport: AgentTransportHandle;
+  ownProcess: OwnedProcess;
+  identity: WorkerIdentity;
+  result: Readonly<AgentRunRecord>;
+  cleanup: () => void;
+  stop: TerminalScopeStop;
+}
+
 // Construct outside spawn/preparation: deferred native custody must not keep
 // the request-bearing launch context alive through a shared lexical context.
 const createAdmissionRelease = (managed: ManagedAgent, release: () => void): (() => void) =>
@@ -1014,6 +1045,11 @@ const terminalWorkerResult = (candidate: AgentRunRecord | undefined): boolean =>
     (candidate.status === "completed" || candidate.errorCode === "CONTEXT_OVERFLOW" ||
       /Context exceeds window:/i.test(candidate.error ?? "") ||
       (!recoverableStop(candidate) && !transportExitedWithoutResult(candidate.error) && !retryablePiStartupError(candidate.error)));
+
+/** Only this run's genuine completed/failed verdict can authorize actor-scope cleanup. */
+const genuineActorWorkerResult = (candidate: AgentRunRecord | undefined, id: string): candidate is AgentRunRecord & { status: "completed" | "failed" } =>
+  candidate !== undefined && candidate.id === id &&
+    (candidate.status === "completed" || candidate.status === "failed") && terminalWorkerResult(candidate);
 
 const MAX_RESUME_NOTE_CHARS = 2_000;
 
@@ -2401,7 +2437,8 @@ export class AgentManager {
     return pending;
   }
 
-  readonly #workerIdentities = new WeakMap<AgentTransportHandle, { pid: number; startTime: string | undefined; closed: boolean }>();
+  readonly #workerIdentities = new WeakMap<AgentTransportHandle, WorkerIdentity>();
+  readonly #terminalScopeStops = new WeakMap<AgentTransportHandle, TerminalScopeStop>();
 
   /** The current worker of a live run, as this host launched it: pid and kernel start time (undefined when it could
    * not be read, e.g. off Linux), and whether this host still holds its transport open (not settled, not exited,
@@ -2454,6 +2491,19 @@ export class AgentManager {
         this.#workerIdentities.set(transport, identity);
         // Registered first, at launch: it runs before any monitor reaction to the close. A rejection proves nothing.
         void transport.closed?.then(() => { identity.closed = true; }, () => undefined);
+        if (process.platform === "linux" && transport.terminalScopeCleanup && transport.treeClosed &&
+            transport.closed && transport.cgroup === undefined) {
+          const stop: TerminalScopeStop = { closed: transport.closed, treeClosed: transport.treeClosed,
+            sampledStopSucceeded: false, stopRejected: false, receiptRejected: false,
+            terminalAttempted: false, managerProofFailed: false };
+          this.#terminalScopeStops.set(transport, stop);
+          const rejected = (): void => {
+            stop.receiptRejected = true;
+            if (stop.phase) stop.phase.open = false;
+          };
+          void transport.closed.then(undefined, rejected);
+          void transport.treeClosed.then(undefined, rejected);
+        }
       }
       return transport;
     } finally {
@@ -3564,11 +3614,17 @@ export class AgentManager {
           }
           // Ordinary publication and execution custody are independent: a
           // failed drain resolves wait/join without releasing native custody.
-          const candidate = readRecord(managed.statusFile) ?? managed.latestRecord;
-          this.#settle(managed, {
-            ...failedRecord(managed, "failed", String(error)),
-            ...(candidate ?? {}), status: "failed",
-          });
+          const snapshot = readRecord(managed.statusFile) ?? managed.latestRecord;
+          const candidate = managed.actorId && snapshot?.id !== managed.id ? undefined : snapshot;
+          const workerResult = genuineActorWorkerResult(candidate, managed.id) ? candidate : undefined;
+          const result: AgentRunResult = managed.actorId && workerResult
+            ? this.#withTransportMetadata(workerResult, managed) as AgentRunResult
+            : { ...failedRecord(managed, "failed", String(error)), ...(candidate ?? {}), status: "failed" };
+          if (managed.actorId && !managed.executionExited) {
+            this.#continueRejectedActorMonitor(managed, result, workerResult);
+            return;
+          }
+          this.#settle(managed, result);
         });
         const handle = this.#handleInfo(managed, "running");
         this.#emitLifecycle(managed, "run.spawned", Date.now(), { status: "running", data: {
@@ -6183,12 +6239,21 @@ export class AgentManager {
 
   /** Publish the join before calling stop: a settled result and worker absence
    * cannot erase the outstanding Windows tree-helper obligation. */
-  #stopManagedTransport(managed: ManagedAgent): Promise<void> {
+  #stopManagedTransport(managed: ManagedAgent, authorization?: TerminalScopeAuthorization): Promise<void> {
     if (managed.transport.kind !== "process") return managed.transport.stop();
     // A stop can synchronously report native debt/close before the monitor
     // observes terminal status. Claim its normal terminal join before that work.
     this.#fenceNativeTerminalAdmission(managed);
-    if (managed.processStop) return managed.processStop;
+    if (managed.processStop) return managed.processStop; // never upgrade an existing generic owner
+    const transport = managed.transport;
+    const scopeStop = this.#terminalScopeStops.get(transport);
+    if (authorization && scopeStop && scopeStop === authorization.stop &&
+        (scopeStop.sampledStopSucceeded || scopeStop.stopRejected)) {
+      // A rejected old owner may have dropped its processStop promise. That
+      // does not license terminal processing to run ordinary TERM again.
+      return Promise.reject(new Error(`Agent ${managed.id} prior stop did not retain a checked join; custody retained`));
+    }
+    const phase = authorization && this.#beginTerminalScopePhase(authorization);
     managed.processStopPending = true;
     let resolve!: () => void;
     let reject!: (error: unknown) => void;
@@ -6197,16 +6262,27 @@ export class AgentManager {
     void (async () => {
       const deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7;
       try {
-        await managed.transport.stop();
+        if (scopeStop) {
+          try { await transport.stop(); scopeStop.sampledStopSucceeded = true; }
+          catch (error) { scopeStop.stopRejected = true; throw error; }
+        } else await managed.transport.stop();
         // A stop acknowledgement is not the captured native-close receipt.
         // Use the same deadline: do not add a second grace after native timeout.
         const remaining = deadline - Date.now();
-        if (managed.transport.closed && remaining > 0) {
+        if (authorization && phase) {
+          // N3: a legitimate sampled stop can exceed seven seconds. Its already
+          // positive captured close still counts while this phase remains open.
+          if (!authorization.identity.closed && transport.closed && remaining > 0) {
+            if (!await this.#transportClosedUntil(transport, deadline)) phase.open = false;
+          }
+          this.#terminalScopeCleanup(authorization, phase);
+        } else if (managed.transport.closed && remaining > 0) {
           let timer: ReturnType<typeof setTimeout> | undefined;
           try {
             await Promise.race([managed.transport.closed, new Promise<void>(done => { timer = setTimeout(done, remaining); })]);
           } finally { if (timer) clearTimeout(timer); }
         }
+        if (phase) phase.open = false; // conclude before any proof failure/markLost
         // Joining a hook after proven exit must not erase a later failed
         // release observation. That marker is a separate retention obligation.
         if (!managed.executionExited) await this.#noteUnconfirmedExit(managed, false, true);
@@ -6218,6 +6294,7 @@ export class AgentManager {
         this.#retentionRevision++;
         resolve();
       } catch (error) {
+        if (phase) phase.open = false;
         this.#markLost(managed, error instanceof Error ? error.message : String(error));
         managed.processStopPending = false;
         this.#retentionRevision++;
@@ -6238,11 +6315,22 @@ export class AgentManager {
       return;
     }
     const lost = uncheckedExternalExit(managed.transport) ? "external transport has no checked exit contract" : managed.transport.lostContact?.();
+    const scopeStop = this.#terminalScopeStops.get(managed.transport);
     const deadline = Date.now() + TRANSPORT_EXIT_GRACE_MS * 7;
-    const alive = lost === undefined && !exitObserved && await this.#transportAliveUntil(managed.transport, deadline).catch(() => true);
-    const nativeClosed = lost === undefined && !alive && await this.#transportClosedUntil(managed.transport, deadline);
+    let probeFailed = false;
+    const alive = lost === undefined && !exitObserved && await this.#transportAliveUntil(managed.transport, deadline).catch(() => { probeFailed = true; return true; });
+    // This capability's mutation acknowledgment cannot certify execution before
+    // BOTH original receipts. Reuse the existing bounded join, never a new budget.
+    const nativeClosed = lost === undefined && !alive && await this.#transportClosedUntil(scopeStop
+      ? { ...managed.transport, closed: Promise.all([scopeStop.closed, scopeStop.treeClosed]).then(() => undefined) }
+      : managed.transport, deadline);
     // A stale release checkpoint must not certify, release, or mark a resumed worker lost.
     check?.();
+    if (scopeStop && (scopeStop.receiptRejected || managed.transport.lostContact?.() !== undefined ||
+        managed.transport.stopDebt?.() !== undefined)) {
+      this.#markLost(managed, managed.transport.lostContact?.() ?? managed.transport.stopDebt?.() ?? "captured scope/native exit receipt rejected");
+      return;
+    }
     if (lost === undefined && !alive && nativeClosed) {
       managed.executionExited = true;
       if (managed.observation) delete managed.observation.failure;
@@ -6256,7 +6344,12 @@ export class AgentManager {
       delete managed.executionRelease;
       return;
     }
-    this.#markLost(managed, lost ?? "the worker did not confirm its exit after it was stopped");
+    // Only a successful checked alive observation after ordinary stop/native
+    // close can distinguish manager-only scope uncertainty from rejected debt.
+    const scopeProofOnly = stopJoined && lost === undefined && alive && !probeFailed &&
+      scopeStop?.sampledStopSucceeded === true && !scopeStop.stopRejected && !scopeStop.receiptRejected &&
+      this.#workerIdentities.get(managed.transport)?.closed === true && managed.transport.stopDebt?.() === undefined;
+    this.#markLost(managed, lost ?? "the worker did not confirm its exit after it was stopped", scopeProofOnly);
   }
 
   #hasNativeStopDebt(managed: ManagedAgent): boolean {
@@ -6266,11 +6359,19 @@ export class AgentManager {
       (!managed.actorId || process.platform === "win32");
   }
 
-  async #drainExecution(managed: ManagedAgent): Promise<void> {
+  async #drainExecution(managed: ManagedAgent, authorization?: TerminalScopeAuthorization): Promise<void> {
     // Capture the existing bounded drain before joining stop: otherwise two
     // callers can each spend a grace when the first drain expires during join.
-    if (managed.executionDrain) return managed.executionDrain;
-    if (managed.processStop) await managed.processStop;
+    if (managed.executionDrain) {
+      const draining = managed.executionDrain;
+      if (!authorization) return draining;
+      try { await draining; }
+      catch (error) { if (!this.#canRejoinTerminalScope(authorization)) throw error; }
+    }
+    if (managed.processStop) {
+      try { await managed.processStop; }
+      catch (error) { if (!authorization || !this.#canRejoinTerminalScope(authorization)) throw error; }
+    }
     if (managed.executionExited) {
       if (!managed.processStopPending && managed.lostContact === undefined && managed.transport.lostContact?.() === undefined) {
         this.#releaseHeldPermit(managed);
@@ -6278,7 +6379,19 @@ export class AgentManager {
       return;
     }
     if (managed.executionDrain) return managed.executionDrain;
-    const pending = (async () => {
+    const rejoin = authorization && this.#canRejoinTerminalScope(authorization)
+      ? this.#beginTerminalScopePhase(authorization) : undefined;
+    const drain = async (): Promise<void> => {
+      // Re-read the current original handle's launch-held fact after awaits:
+      // rejection forbids another TERM, not an independent checked exit join.
+      const rejectedScopeStop = (): boolean =>
+        this.#terminalScopeStops.get(managed.transport)?.stopRejected === true;
+      if (authorization && rejoin) {
+        // The old generic owner is concluded. Never reset processStop or repeat
+        // TERM: consume one terminal phase, then join the original checked proof.
+        this.#terminalScopeCleanup(authorization, rejoin);
+        await this.#noteUnconfirmedExit(managed, false, true);
+      }
       // Receipt-bound publication precedes native discard ACKs. Give the worker
       // its EOF drain before a destructive transport stop (especially Windows).
       if (managed.finalAnswer) await this.#waitForTransportExit(managed, Date.now() + TRANSPORT_EXIT_GRACE_MS * 5);
@@ -6288,11 +6401,11 @@ export class AgentManager {
       // join against the generic RPC grace: its escalation can start at the
       // grace boundary, and the captured child must still be reaped afterwards.
       if (managed.transport.stopDebt && managed.transport.waitForClose &&
-          (managed.transport.cgroup !== undefined || managed.transport.lostContact?.() === undefined)) {
+          (managed.transport.cgroup !== undefined || managed.transport.lostContact?.() === undefined) && !rejectedScopeStop()) {
         // A capped scope must still join its actual subtree after a prior watcher
         // failure. Do not let immutable observation debt swallow a typed PID stop
         // failure or substitute logical stop for the live boundary's teardown.
-        try { await this.#stopManagedTransport(managed); }
+        try { await this.#stopManagedTransport(managed, authorization); }
         catch (error) {
           // smarty-dev#8257: keep core's typed capped-cgroup stop failure (and its code) visible at agents.stop.
           if ((error as { name?: unknown } | null)?.name === "TaskCgroupStopUnconfirmedError") throw error;
@@ -6300,10 +6413,13 @@ export class AgentManager {
         }
       }
       const transport = managed.transport.kind === "process"
-        ? { ...managed.transport, stop: () => this.#stopManagedTransport(managed) }
+        ? { ...managed.transport, stop: () => rejectedScopeStop()
+          ? Promise.reject(new Error(`Agent ${managed.id} prior stop rejected; custody retained`))
+          : this.#stopManagedTransport(managed, authorization) }
         : managed.transport;
       if (transport.lostContact?.() !== undefined || !await this.#stopUnregisteredTransport(transport)) {
-        this.#markLost(managed, managed.transport.lostContact?.() ?? "worker execution exit unconfirmed; custody retained");
+        this.#markLost(managed, managed.transport.lostContact?.() ?? "worker execution exit unconfirmed; custody retained",
+          this.#terminalScopeStops.get(managed.transport)?.managerProofFailed === true);
         // An exact bounded native stop receipt can end the logical attempt, but
         // #settle preserves explicit stopped/timed_out only, never success,
         // while holding the execution permit and persisted uncertainty fence.
@@ -6320,12 +6436,27 @@ export class AgentManager {
         managed.executionRelease?.();
       }
       delete managed.executionRelease;
-    })();
+    };
+    // Publish the fresh terminal rejoin before its synchronous capability can
+    // re-enter. Absent-capability and ordinary drains keep their original order.
+    const pending = rejoin ? Promise.resolve().then(drain) : drain();
     managed.executionDrain = pending;
-    try { await pending; } finally { delete managed.executionDrain; }
+    try { await pending; } finally {
+      if (rejoin) rejoin.open = false;
+      delete managed.executionDrain;
+    }
   }
 
-  #markLost(managed: ManagedAgent, reason: string): void {
+  #markLost(managed: ManagedAgent, reason: string, scopeProofOnly = false): void {
+    // Any contemporaneous failure revokes an open terminal phase. Only the
+    // exact checked populated-scope failure may later qualify for one rejoin.
+    const scopeStop = this.#terminalScopeStops.get(managed.transport);
+    if (scopeStop) {
+      if (scopeStop.phase) scopeStop.phase.open = false;
+      scopeStop.managerProofFailed = scopeProofOnly && scopeStop.sampledStopSucceeded &&
+        !scopeStop.stopRejected && !scopeStop.receiptRejected && managed.transport.lostContact?.() === undefined &&
+        managed.transport.stopDebt?.() === undefined;
+    }
     // A manager-side failure must not erase a normal terminal join's ownership.
     this.#fenceNativeTerminalAdmission(managed);
     managed.lostContact = reason;
@@ -6992,6 +7123,61 @@ export class AgentManager {
     this.#terminalNoticeOutbox.route(managed.runDirectory);
   }
 
+  #terminalScopeCurrent(authorization: TerminalScopeAuthorization): boolean {
+    const { managed, id, transport, ownProcess, identity, result, cleanup, stop } = authorization;
+    return process.platform === "linux" && this.#runs.get(id) === managed && managed.id === id &&
+      managed.transport === transport && managed.ownProcess === ownProcess &&
+      this.#workerIdentities.get(transport) === identity && this.#terminalScopeStops.get(transport) === stop &&
+      ownProcess.pid === identity.pid && !!identity.startTime?.trim() && ownProcess.started === identity.startTime &&
+      transport.kind === "process" && transport.cgroup === undefined && transport.terminalScopeCleanup === cleanup &&
+      transport.closed === stop.closed && transport.treeClosed === stop.treeClosed &&
+      !!managed.actorId && !managed.hosted && !managed.settled &&
+      !managed.executionExited && !managed.relaunchPending && !managed.relaunchFailure && !managed.launchCancelled &&
+      !managed.stopRequested && !managed.explicitStopRequested && !managed.abandoned && !managed.abortSignal?.aborted &&
+      !this.#closing && readRunStopIntent(managed.runDirectory) === undefined &&
+      (!managed.lostContact || stop.managerProofFailed) && !stop.stopRejected && !stop.receiptRejected &&
+      transport.lostContact?.() === undefined && transport.stopDebt?.() === undefined &&
+      genuineActorWorkerResult(result, id);
+  }
+
+  #terminalScopeAuthorization(managed: ManagedAgent, record: AgentRunRecord): TerminalScopeAuthorization | undefined {
+    const transport = managed.transport;
+    const stop = this.#terminalScopeStops.get(transport);
+    const identity = this.#workerIdentities.get(transport);
+    const ownProcess = managed.ownProcess;
+    if (!transport.terminalScopeCleanup || !stop || stop.terminalAttempted || !identity || !ownProcess ||
+        !genuineActorWorkerResult(record, managed.id)) return undefined;
+    const authorization: TerminalScopeAuthorization = { managed, id: managed.id, transport, ownProcess, identity,
+      result: Object.freeze({ ...record }), cleanup: transport.terminalScopeCleanup, stop };
+    return this.#terminalScopeCurrent(authorization) ? authorization : undefined;
+  }
+
+  #beginTerminalScopePhase(authorization: TerminalScopeAuthorization): { open: boolean } | undefined {
+    if (authorization.stop.terminalAttempted || !this.#terminalScopeCurrent(authorization)) return undefined;
+    authorization.stop.terminalAttempted = true; // consume before any await or failure
+    return authorization.stop.phase = { open: true };
+  }
+
+  #canRejoinTerminalScope(authorization: TerminalScopeAuthorization): boolean {
+    const { managed, stop, identity } = authorization;
+    return !managed.executionDrain && !managed.processStopPending && !stop.terminalAttempted &&
+      stop.sampledStopSucceeded && identity.closed && stop.managerProofFailed && this.#terminalScopeCurrent(authorization);
+  }
+
+  #terminalScopeCleanup(authorization: TerminalScopeAuthorization, phase: { open: boolean }): void {
+    if (!phase.open || authorization.stop.phase !== phase) return;
+    phase.open = false; // no late receipt or synchronous re-entry can initiate another mutation
+    if (!authorization.stop.sampledStopSucceeded || !authorization.identity.closed ||
+        !this.#terminalScopeCurrent(authorization)) return;
+    const candidate = readRecord(authorization.managed.statusFile);
+    if (!genuineActorWorkerResult(candidate, authorization.id) || candidate.status !== authorization.result.status ||
+        candidate.error !== authorization.result.error || candidate.errorCode !== authorization.result.errorCode) return;
+    // Host-captured primary may have been alive at the terminal snapshot and
+    // died during cooperative stop. ESRCH/positive birth change only; EPERM is unknown.
+    if (!this.#actorWorkerGone(authorization.managed, true) || !this.#terminalScopeCurrent(authorization)) return;
+    authorization.cleanup(); // exact ORIGINAL handle, not the spread checked-join adapter; never proof
+  }
+
   #actorWorkerGone(managed: ManagedAgent, recheck = false): boolean {
     if (!managed.actorId || managed.hosted || managed.transport.kind !== "process" || !managed.ownProcess) return false;
     // ownProcess is absent throughout replacement creation, and stays absent
@@ -7035,9 +7221,12 @@ export class AgentManager {
     // Lifecycle close/abort has no durable operator intent, but its own teardown
     // still cannot manufacture a pre-existing actor-loss verdict.
     if ((managed.stopRequested && managed.workerGoneBeforeStop !== managed.transport) || !this.#actorWorkerGone(managed)) return false;
-    // Preserve genuine terminal results; only missing/recoverable transport outcomes become loss.
-    // Like #retryStartup, a window refusal outranks incidental auth/transport diagnostics.
-    if (this.#fenceNativeTerminalAdmission(managed, record)) return false;
+    // A matching genuine completed/failed verdict may clean its remaining owned
+    // scope through the normal bounded drain; the verdict itself is not exit proof.
+    if (genuineActorWorkerResult(record, managed.id)) {
+      this.#fenceNativeTerminalAdmission(managed, record);
+      return false;
+    }
     // Nonterminal primary loss releases only RUN, even while its tree remains live.
     this.#releaseProvenGone();
     // Primary loss is not a stop request: descendants may still own the native
@@ -7067,6 +7256,37 @@ export class AgentManager {
     if (!terminalWorkerResult(joined)) writeRecord(managed.statusFile, result);
     this.#settle(managed, result);
     return true;
+  }
+
+  /** A rejected monitor leaves one exact exit-receipt continuation, never another monitor. */
+  #continueRejectedActorMonitor(managed: ManagedAgent, result: AgentRunResult, workerResult: AgentRunRecord | undefined): void {
+    const transport = managed.transport;
+    const ownProcess = managed.ownProcess;
+    const identity = this.#workerIdentities.get(transport);
+    if (!managed.actorId || transport.kind !== "process" || !transport.closed ||
+        !ownProcess || ownProcess.pid !== identity?.pid) return;
+    const current = (): boolean => this.#runs.get(managed.id) === managed && managed.transport === transport &&
+      managed.ownProcess === ownProcess && !managed.relaunchPending && !managed.launchCancelled && !managed.settled;
+    const check = (): void => {
+      if (!current()) throw new Error("Actor exit receipt belongs to an inactive attempt");
+    };
+    void Promise.all([transport.closed, ...(transport.treeClosed ? [transport.treeClosed] : [])]).then(async () => {
+      if (!current()) return;
+      await managed.executionDrain?.catch(() => undefined);
+      check();
+      await managed.processStop;
+      check();
+      // Full native+tree proof does not depend on the failed liveness observer.
+      // Native-close-only adapters still owe their successful checked tree probe.
+      await this.#noteUnconfirmedExit(managed, transport.treeClosed !== undefined, false, check);
+      if (!current() || !managed.executionExited) return;
+      this.#releaseHeldPermit(managed);
+      await this.#captureWorktree(managed);
+      if (!current()) return;
+      const candidate = workerResult ?? readRecord(managed.statusFile);
+      this.#settle(managed, genuineActorWorkerResult(candidate, managed.id)
+        ? this.#withTransportMetadata(candidate, managed) as AgentRunResult : result);
+    }).catch(() => { /* Failed/stale receipts or stop joins retain the existing custody fence. */ });
   }
 
   async #monitor(managed: ManagedAgent, timeoutMs: number, deadline = Date.now() + timeoutMs + TRANSPORT_EXIT_GRACE_MS): Promise<void> {
@@ -7174,6 +7394,9 @@ export class AgentManager {
           await delay(AGENT_STATUS_POLL_INTERVAL_MS);
           continue;
         }
+        // Capture only here, after retry/replacement guards and before natural
+        // exit observation. Generic drains and rejected-monitor callbacks get no authority.
+        const terminalScope = this.#terminalScopeAuthorization(managed, record);
         // Terminal publication may precede a worker's final native-session flush.
         // Give normal process exit a bounded observation window before stop():
         // on Windows SIGTERM is destructive, not a cooperative flush request.
@@ -7210,7 +7433,7 @@ export class AgentManager {
             if (!managed.executionExited) await this.#noteUnconfirmedExit(managed);
           }
         }
-        if (!(managed.actorId && nativeWindowsClose)) await this.#drainExecution(managed);
+        if (!(managed.actorId && nativeWindowsClose)) await this.#drainExecution(managed, terminalScope);
         await this.#captureWorktree(managed);
         this.#settle(managed, this.#withTransportMetadata(managed.relaunchFailure ?? record, managed) as AgentRunResult);
         return;

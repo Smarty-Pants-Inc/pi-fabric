@@ -19,12 +19,21 @@ vi.mock("node:child_process", async importOriginal => {
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
+const fixtureFds = new Map<number, { dev: number; ino: number }>();
+const retainFixtureFd = (fd: number): number => { fixtureFds.set(fd, fs.fstatSync(fd)); return fd; };
 afterEach(async () => {
   // Restore spies while their fake-clock originals are still installed; doing
   // this after useRealTimers would reinstall a detached fake setTimeout.
   vi.restoreAllMocks();
   vi.useRealTimers();
   vi.unstubAllEnvs();
+  for (const [fd, identity] of fixtureFds) {
+    try {
+      const held = fs.fstatSync(fd);
+      if (held.dev === identity.dev && held.ino === identity.ino) fs.closeSync(fd);
+    } catch { /* already closed; never close a recycled foreign descriptor */ }
+  }
+  fixtureFds.clear();
   for (const manager of managers.splice(0)) await manager.close().catch(() => undefined);
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
   vi.mocked(spawn).mockReset();
@@ -386,7 +395,19 @@ describe.skipIf(process.platform !== "linux")("event-driven scope admission mark
 });
 
 type ReceiptFailure = "missing" | "mismatched" | "mismatched-receipt" | "wrong-slice" | "v1-only" | "hybrid" | "unowned" | "open" | "read" | "watcher-arm" | "watcher-arm-async" | "identity-during-arm" | "read-after-arm" | "wrapper" | "gate";
-async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated = "1", failure?: ReceiptFailure, viaTransport = false, capped = false) {
+type TreeOptions = {
+  unsampled?: boolean;
+  externalGroup?: boolean;
+  executionPending?: boolean;
+  killFailure?: "ENOENT" | "EACCES" | "EIO";
+  diagnosticFailure?: boolean;
+  logFailure?: boolean;
+  nativeCloseDeferred?: boolean;
+  comm?: string;
+};
+// Optional structural seam keeps HEAD RED behavioral, not a missing-method error.
+type TerminalScopeHandle = { terminalScopeCleanup?: () => void };
+async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated = "1", failure?: ReceiptFailure, viaTransport = false, capped = false, options: TreeOptions = {}) {
   vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
   const directory = root();
   const workerPath = path.join(directory, "worker.mjs");
@@ -398,15 +419,22 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
   let scopeEvents: string | undefined;
   let scopeDirectory: string | undefined;
   let liveCgroup: string | undefined;
-  let populated = initialPopulated;
   let scopeRemoved: string | undefined;
-  // Capped counterprobes hold real descriptors, not synthetic fd numbers.
+  // All scoped counterprobes hold real test-owned descriptors. No real cgroup
+  // mount file is opened or mutated by this recorded fixture.
   const leaf = path.join(directory, "leaf");
-  if (capped) {
+  let heldLeaf = leaf;
+  const logFile = path.join(directory, "events.jsonl");
+  const commFile = path.join(directory, "daemon.comm");
+  fs.writeFileSync(commFile, options.comm ?? "fixture-op-daemon\n");
+  fs.writeFileSync(logFile, "");
+  if (scoped) {
     fs.mkdirSync(leaf);
     fs.writeFileSync(path.join(leaf, "memory.max"), String(1024 ** 3));
     fs.writeFileSync(path.join(leaf, "memory.swap.max"), "0");
     fs.writeFileSync(path.join(leaf, "cgroup.events"), `populated ${initialPopulated}\nfrozen 0\n`);
+    fs.writeFileSync(path.join(leaf, "cgroup.procs"), `${descendant}\n`);
+    if (options.killFailure !== "ENOENT") fs.writeFileSync(path.join(leaf, "cgroup.kill"), "");
   }
   const nativeMkdir = fs.mkdirSync.bind(fs);
   if (failure === "wrapper") vi.spyOn(fs, "mkdirSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
@@ -414,12 +442,17 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
     return nativeMkdir(file, options as never);
   }) as typeof fs.mkdirSync);
   let boundaryFd: number | undefined;
-  let eventsFd = 700_000_010;
+  let eventsFd: number | undefined;
+  const controlFds = new Set<number>();
+  const diagnosticFds = new Map<number, "comm" | "procs">();
+  const diagnosticReads: Array<{ kind: "comm" | "procs"; length: number }> = [];
+  const writes: Array<{ fd: number; dev: number; ino: number; log: string }> = [];
   const order: string[] = [];
+  const isEvents = (file: unknown): boolean => String(file) === scopeEvents || /\/proc\/self\/fd\/\d+\/cgroup\.events$/.test(String(file));
   const watcher = Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
   const admissionWatcher = Object.assign(new EventEmitter(), { close: vi.fn() }) as unknown as fs.FSWatcher;
   if (scoped) vi.spyOn(fs, "watch").mockImplementation((...args: Parameters<typeof fs.watch>) => {
-    if (String(args[0]) !== scopeEvents) return admissionWatcher;
+    if (!isEvents(args[0])) return admissionWatcher;
     order.push("watch");
     if (failure === "watcher-arm") throw new Error("watcher arm failed");
     const listener = args.at(-1);
@@ -429,69 +462,98 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
   });
   const stat = (member: number) => {
     const fields = Array<string>(20).fill("0");
-    fields[0] = "S"; fields[1] = member === pid ? "1" : String(pid);
-    fields[2] = String(pid); fields[19] = String(member);
+    fields[0] = "S";
+    // Already reparented, dead foreign group leader, never birth-admitted.
+    fields[1] = member === pid || options.unsampled ? "1" : String(pid);
+    fields[2] = String(member === descendant && options.unsampled ? pid + 90 : pid);
+    fields[19] = String(member);
     return `${member} (worker) ${fields.join(" ")}`;
   };
   const nativeRead = fs.readFileSync.bind(fs);
-  vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+  vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, readOptions?: unknown) => {
     if (String(file) === `/proc/${pid}/cgroup`) {
       if (failure === "missing") throw Object.assign(new Error("missing cgroup receipt"), { code: "ENOENT" });
       return liveCgroup;
     }
+    if (String(file) === `/proc/${descendant}/comm`) {
+      if (options.diagnosticFailure) throw Object.assign(new Error("comm denied"), { code: "EACCES" });
+      return options.comm ?? "fixture-op-daemon\n";
+    }
+    if (String(file).endsWith("/cgroup.procs") && options.diagnosticFailure) throw new Error("diagnostic read failed");
     if (String(file) === `/proc/${pid}/stat` && primaryAlive) return stat(pid);
     if (String(file) === `/proc/${descendant}/stat` && descendantAlive) return stat(descendant);
     if ([`/proc/${pid}/stat`, `/proc/${descendant}/stat`].includes(String(file))) {
       throw Object.assign(new Error("gone"), { code: "ENOENT" });
     }
-    return nativeRead(file, options as never);
+    return nativeRead(file, readOptions as never);
   }) as typeof fs.readFileSync);
   const nativeLstat = fs.lstatSync.bind(fs);
   let directoryChecks = 0;
   vi.spyOn(fs, "lstatSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
     if (String(file) === scopeDirectory) {
       const unowned = failure === "unowned" || (failure === "identity-during-arm" && ++directoryChecks > 1);
-      if (capped) {
-        const stat = nativeLstat(leaf);
-        if (unowned) stat.uid = process.getuid!() + 1;
-        return stat;
-      }
-      return { uid: process.getuid!() + (unowned ? 1 : 0), isDirectory: () => true };
+      const stat = nativeLstat(leaf);
+      if (unowned) stat.uid = process.getuid!() + 1;
+      return stat;
     }
     return nativeLstat(file, options as never);
   }) as typeof fs.lstatSync);
   const nativeStatfs = fs.statfsSync.bind(fs);
   vi.spyOn(fs, "statfsSync").mockImplementation(((file: fs.PathLike, options?: unknown) => {
-    if (String(file) === scopeDirectory) return { type: 0x63677270 };
+    if (String(file) === scopeDirectory || /^\/proc\/self\/fd\/\d+$/.test(String(file))) return { type: 0x63677270 };
     return nativeStatfs(file, options as never);
   }) as typeof fs.statfsSync);
   const nativeOpen = fs.openSync.bind(fs);
   const opened = vi.spyOn(fs, "openSync").mockImplementation((file, flags, mode) => {
-    if (capped && String(file) === scopeDirectory) {
-      boundaryFd = nativeOpen(leaf, flags, mode);
+    if (/^\/proc\/\d+\/(cmdline|environ)$/.test(String(file))) throw new Error("sensitive diagnostic read forbidden");
+    const comm = /^\/proc\/\d+\/comm$/.test(String(file));
+    const procs = String(file).endsWith("/cgroup.procs");
+    if (comm || procs) {
+      if (options.diagnosticFailure) throw Object.assign(new Error("diagnostic denied"), { code: "EACCES" });
+      const fd = retainFixtureFd(nativeOpen(comm ? commFile : file, flags, mode));
+      diagnosticFds.set(fd, comm ? "comm" : "procs");
+      return fd;
+    }
+    if (String(file) === scopeDirectory) {
+      boundaryFd = retainFixtureFd(nativeOpen(leaf, flags, mode));
       return boundaryFd;
     }
-    if (String(file) !== scopeEvents) return nativeOpen(file, flags, mode);
+    if (String(file).endsWith("/cgroup.kill")) {
+      if (options.killFailure === "EACCES") throw Object.assign(new Error("kill denied"), { code: "EACCES" });
+      expect(String(file)).toMatch(/^\/proc\/self\/fd\/\d+\/cgroup\.kill$/);
+      const fd = retainFixtureFd(nativeOpen(file, flags, mode));
+      controlFds.add(fd);
+      return fd;
+    }
+    if (!isEvents(file)) return nativeOpen(file, flags, mode);
     order.push("open");
     if (failure === "open") throw new Error("cannot open events");
-    if (capped) eventsFd = nativeOpen(path.join(leaf, "cgroup.events"), flags, mode);
+    eventsFd = retainFixtureFd(nativeOpen(String(file) === scopeEvents ? path.join(leaf, "cgroup.events") : file, flags, mode));
+    closeEvents.mockClear(); // marker opens may have used the same numeric fd
     return eventsFd;
   });
   const nativeReadSync = fs.readSync.bind(fs);
   let eventReads = 0;
   const readEvents = vi.spyOn(fs, "readSync").mockImplementation(((...args: unknown[]) => {
+    const diagnostic = diagnosticFds.get(Number(args[0]));
+    if (diagnostic) {
+      const length = typeof args[3] === "number" ? args[3]
+        : (args[2] as { length?: number } | undefined)?.length ?? (args[1] as Buffer).byteLength;
+      expect(length).toBeLessThanOrEqual(diagnostic === "comm" ? 64 : 16 * 1024);
+      diagnosticReads.push({ kind: diagnostic, length });
+    }
     if (args[0] !== eventsFd) return (nativeReadSync as (...values: unknown[]) => number)(...args);
     order.push("read");
     if (failure === "read" || (failure === "read-after-arm" && ++eventReads > 1)) throw new Error("events unreadable");
     if (scopeRemoved) throw Object.assign(new Error(`${scopeRemoved}: read failed`), { code: scopeRemoved });
-    if (capped) return (nativeReadSync as (...values: unknown[]) => number)(...args);
-    const text = `populated ${populated}\nfrozen 0\n`;
-    (args[1] as Buffer).write(text);
-    return Buffer.byteLength(text);
+    return (nativeReadSync as (...values: unknown[]) => number)(...args);
   }) as typeof fs.readSync);
   const nativeClose = fs.closeSync.bind(fs);
   const closeEvents = vi.spyOn(fs, "closeSync").mockImplementation(fd => {
-    if (fd === eventsFd) { order.push("close"); if (!capped) return; }
+    if (fd === eventsFd) order.push("close");
+    controlFds.delete(fd);
+    diagnosticFds.delete(fd);
+    fixtureFds.delete(fd);
     nativeClose(fd);
   });
   const nativeReaddir = fs.readdirSync.bind(fs);
@@ -499,16 +561,45 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
     if (String(file) === "/proc") return [...(primaryAlive ? [String(pid)] : []), ...(descendantAlive ? [String(descendant)] : [])];
     return nativeReaddir(file, options as never);
   }) as typeof fs.readdirSync);
-  const kill = vi.spyOn(process, "kill").mockImplementation((_pid, signal) => {
+  const kill = vi.spyOn(process, "kill").mockImplementation((target, signal) => {
+    const hits = (member: number, group: number): boolean => target > 0 ? target === member : target === -group;
     if (signal === "SIGTERM" || signal === "SIGKILL") {
-      descendantAlive = false;
-      if (capped && primaryAlive) {
+      order.push(`${signal}:${target}`);
+      if (hits(descendant, options.unsampled ? pid + 90 : pid)) descendantAlive = false;
+      if (primaryAlive && hits(pid, pid)) {
         primaryAlive = false;
-        child.emit("exit", 0); child.emit("close", 0);
+        child.emit("exit", 0);
+        if (!options.nativeCloseDeferred) { child.emit("close", 0); order.push("native-close"); }
       }
     }
-    return true;
+    return true; // zero signal only probes
   });
+  const nativeWrite = fs.writeSync.bind(fs);
+  vi.spyOn(fs, "writeSync").mockImplementation(((fd: number, ...args: unknown[]) => {
+    if (!controlFds.has(fd)) return (nativeWrite as (...values: unknown[]) => number)(fd, ...args);
+    if (options.killFailure === "EIO") throw Object.assign(new Error("kill write failed"), { code: "EIO" });
+    const result = (nativeWrite as (...values: unknown[]) => number)(fd, ...args);
+    expect(String(args[0])).toBe("1");
+    const identity = fs.fstatSync(fd);
+    writes.push({ fd, dev: identity.dev, ino: identity.ino, log: nativeRead(logFile, "utf8") });
+    order.push("scope-write");
+    // Successful held-object write emits membership evidence, never tree proof.
+    const original = fs.statSync(path.join(heldLeaf, "cgroup.kill"));
+    if (identity.dev === original.dev && identity.ino === original.ino) {
+      if (!options.externalGroup) descendantAlive = false;
+      fs.writeFileSync(path.join(heldLeaf, "cgroup.events"), "populated 0\nfrozen 0\n");
+      watcher.emit("change");
+    }
+    return result;
+  }) as typeof fs.writeSync);
+  const nativeAppend = fs.appendFileSync.bind(fs);
+  vi.spyOn(fs, "appendFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+    if (String(file) === logFile) {
+      order.push("host-log");
+      if (options.logFailure) throw new Error("event sink unavailable");
+    }
+    return (nativeAppend as (...values: unknown[]) => void)(file, ...args);
+  }) as typeof fs.appendFileSync);
   const gate = Object.assign(new EventEmitter(), { writable: failure !== "gate", end: vi.fn(), destroy: vi.fn() });
   const child = Object.assign(new EventEmitter(), { pid, unref: vi.fn(), channel: {}, stdio: [null, null, null, null, gate] });
   vi.mocked(spawn).mockClear();
@@ -536,19 +627,30 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
     vi.stubEnv("PATH", `${directory}${path.delimiter}${process.env.PATH ?? ""}`);
   }
   const transport = viaTransport ? await new ProcessTransport("fixture.slice").launch({
-    id: "receipt-fixture", name: "receipt-fixture", cwd: directory, workerPath, workerArguments: [], onUnconfirmedExit: unconfirmed,
+    id: "receipt-fixture", name: "receipt-fixture", cwd: directory, workerPath,
+    workerArguments: ["--id", "receipt-fixture", "--actor-id", "receipt-actor", "--log-file", logFile], onUnconfirmedExit: unconfirmed,
   }) : undefined;
   const handle = transport ? { ...transport, pid: Number(transport.sessionId), closed: transport.closed!, waitForClose: transport.waitForClose!, lostContact: transport.lostContact! }
     : await spawnDetached(workerPath, [], directory, { onUnconfirmedExit: unconfirmed }, undefined, scope, termGraceMs, true);
-  expect(await handle.isAlive()).toBe(true); // retain the descendant's birth before reparenting
+  if (options.executionPending) child.emit("message", { type: "fabric-execution-custody" });
+  if (!options.unsampled) expect(await handle.isAlive()).toBe(true); // sampled default regression mode
   census.mockClear(); kill.mockClear();
   const timeout = vi.spyOn(globalThis, "setTimeout");
   return {
     handle, transport, census, kill, timeout, unconfirmed, watcher, admissionWatcher, opened, readEvents, closeEvents, order,
+    pid, descendant, directory, leaf, logFile, writes, diagnosticReads,
+    alive: () => descendantAlive,
+    cleanup: () => (handle as typeof handle & TerminalScopeHandle).terminalScopeCleanup?.(),
     boundaryFd: () => boundaryFd,
+    eventsFd: () => eventsFd,
+    replacePath: () => {
+      heldLeaf = path.join(directory, "retired-leaf");
+      fs.renameSync(leaf, heldLeaf);
+      fs.mkdirSync(leaf);
+      fs.writeFileSync(path.join(leaf, "cgroup.kill"), "sibling-sentinel");
+    },
     emptyScope: () => {
-      populated = "0";
-      if (capped) fs.writeFileSync(path.join(leaf, "cgroup.events"), "populated 0\nfrozen 0\n");
+      if (scoped) fs.writeFileSync(path.join(heldLeaf, "cgroup.events"), "populated 0\nfrozen 0\n");
       watcher.emit("change");
     },
     // systemd collects an empty scope (processSlice): the retained events fd then reads ENODEV.
@@ -557,11 +659,213 @@ async function fixtureTree(termGraceMs = 7_000, scoped = false, initialPopulated
     close: async () => {
       primaryAlive = false;
       child.emit("exit", 0); child.emit("close", 0);
+      order.push("native-close");
       await tick();
     },
     scans: () => census.mock.calls.filter(([file]) => String(file) === "/proc").length,
   };
 }
+
+// Keep: native identity trust boundary and the recorded #16970 unsampled-daemon
+// failure. All process controls are recorded; only test-temp files have real FDs.
+describe.skipIf(process.platform !== "linux")("P2 terminal scope", () => {
+  it("T2 target-aware signals never adopt or clear an already-reparented dead-leader daemon", async () => {
+    const f = await fixtureTree(7_000, true, "1", undefined, true, false, { unsampled: true });
+    expect(f.census).not.toHaveBeenCalled();
+    f.kill(f.pid + 50, "SIGTERM");
+    f.kill(-f.pid, "SIGKILL");
+    f.kill(f.descendant, 0);
+    expect(f.alive()).toBe(true);
+    await f.close();
+    await f.handle.stop();
+    expect(f.alive()).toBe(true); // RED precondition: ordinary stop cannot reach it
+    expect(f.kill.mock.calls.some(([target, signal]) => signal !== 0 && (target === f.descendant || target === -(f.pid + 90)))).toBe(false);
+    let closed = false;
+    void f.handle.treeClosed!.then(() => { closed = true; });
+    await tick();
+    expect(closed).toBe(false);
+    f.cleanup();
+    expect(f.writes, "T2 missing held-object cleanup: unsampled survivor remains after ordinary stop").toHaveLength(1);
+    expect(f.alive()).toBe(false);
+    await expect(f.handle.treeClosed).resolves.toBeUndefined();
+    expect(f.transport).not.toHaveProperty("cgroup"); // never the capped shortcut
+    f.cleanup();
+    expect(f.writes).toHaveLength(1);
+  });
+
+  it("T10 records fixture daemon pid and comm on the actual host --log-file sink BEFORE write", async () => {
+    const f = await fixtureTree(7_000, true, "1", undefined, true, false, { unsampled: true, comm: "fixture-op-daemon\n\u001b[31m" });
+    await f.handle.stop(); // cooperative TERM closes primary; scope stays populated
+    await expect(f.handle.closed).resolves.toBeUndefined();
+    expect(f.alive()).toBe(true);
+    f.cleanup();
+    const records = fs.readFileSync(f.logFile, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+    const cleanup = records.filter(record => record.type === "scope.cleanup");
+    expect(cleanup, "T10 missing typed scope.cleanup record in host-selected worker log").toHaveLength(1);
+    expect(cleanup[0]).toMatchObject({ id: "receipt-fixture", ts: expect.any(Number), note: "shared per-user services may be interrupted", members: expect.arrayContaining([expect.objectContaining({ pid: f.descendant, comm: expect.stringContaining("fixture-op-daemon") })]) });
+    expect(f.writes).toHaveLength(1);
+    expect(f.writes[0]!.log).toContain('"type":"scope.cleanup"');
+    expect(f.writes[0]!.log).not.toContain("\u001b");
+    expect(f.order.indexOf("native-close")).toBeLessThan(f.order.indexOf("scope-write"));
+    expect(f.order.indexOf("host-log")).toBeLessThan(f.order.indexOf("scope-write"));
+    await expect(f.handle.treeClosed).resolves.toBeUndefined();
+  });
+
+  it("T7 same-path replacement cleans only the retained object and leaves sibling sentinel intact", async () => {
+    const f = await fixtureTree(7_000, true, "1", undefined, true, false, { unsampled: true });
+    await f.close(); await f.handle.stop();
+    const original = fs.statSync(path.join(f.leaf, "cgroup.kill"));
+    f.replacePath();
+    f.cleanup();
+    expect(f.writes, "T7 missing cleanup of original held scope object").toHaveLength(1);
+    expect(f.writes[0]).toMatchObject({ dev: original.dev, ino: original.ino });
+    expect(fs.readFileSync(path.join(f.leaf, "cgroup.kill"), "utf8")).toBe("sibling-sentinel");
+    await expect(f.handle.treeClosed).resolves.toBeUndefined();
+  });
+
+  it.each(["dev", "ino"] as const)("T7 refuses retained-directory %s mismatch immediately before write", async field => {
+    const f = await fixtureTree(7_000, true, "1", undefined, true, false, { unsampled: true });
+    await f.close(); await f.handle.stop();
+    const originalFstat = fs.fstatSync.bind(fs);
+    const mismatch = vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, ...args: unknown[]) => {
+      const stat = (originalFstat as (...values: unknown[]) => fs.Stats)(fd, ...args);
+      if (fd === f.boundaryFd() && f.order.includes("host-log")) stat[field] += 1;
+      return stat;
+    }) as typeof fs.fstatSync);
+    try { f.cleanup(); } catch { /* refusal may throw or retire */ }
+    expect(f.writes).toHaveLength(0);
+    expect(f.alive()).toBe(true);
+    mismatch.mockRestore();
+    f.depart(); f.emptyScope();
+    await expect(f.handle.treeClosed).resolves.toBeUndefined();
+  });
+
+  it("T7 stale callback cannot write or close a reused directory FD", async () => {
+    const f = await fixtureTree(7_000, true, "1", undefined, true, false, { unsampled: true });
+    await f.close(); await f.handle.stop();
+    const fd = f.boundaryFd();
+    const foreign = path.join(f.directory, "foreign");
+    fs.mkdirSync(foreign); fs.writeFileSync(path.join(foreign, "cgroup.kill"), "foreign-sentinel");
+    if (fd !== undefined) fs.closeSync(fd);
+    const replacement = fs.openSync(foreign, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    try {
+      if (fd !== undefined) expect(replacement).toBe(fd); // real allocator reuse
+      try { f.cleanup(); } catch { /* refused identity */ }
+      expect(f.writes).toHaveLength(0);
+      expect(fs.fstatSync(replacement).ino).toBe(fs.statSync(foreign).ino);
+      expect(fs.readFileSync(path.join(foreign, "cgroup.kill"), "utf8")).toBe("foreign-sentinel");
+      f.depart(); f.emptyScope(); await tick();
+      expect(fs.fstatSync(replacement).isDirectory()).toBe(true);
+    } finally { fs.closeSync(replacement); }
+  });
+
+  it("T7 removed scope retires capability and closes each owned descriptor once", async () => {
+    const baseline = fs.readdirSync("/proc/self/fd").length;
+    const f = await fixtureTree(7_000, true, "1", undefined, true, false, { unsampled: true });
+    await f.close(); f.depart();
+    f.closeEvents.mockClear();
+    const directoryFd = f.boundaryFd();
+    const eventsFd = f.eventsFd();
+    f.removeScope();
+    await expect(f.handle.treeClosed).resolves.toBeUndefined();
+    f.cleanup(); f.watcher.emit("change"); f.cleanup();
+    expect(f.writes).toHaveLength(0);
+    expect(f.watcher.close).toHaveBeenCalledOnce();
+    expect(f.closeEvents.mock.calls.filter(([fd]) => fd === eventsFd)).toHaveLength(1);
+    if (directoryFd !== undefined) expect(f.closeEvents.mock.calls.filter(([fd]) => fd === directoryFd)).toHaveLength(1);
+    expect(fs.readdirSync("/proc/self/fd").length).toBe(baseline);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["ENOENT", "EACCES", "EIO"] as const)("T9 %s cgroup.kill failure has no PID/name fallback or fabricated proof", async killFailure => {
+    const f = await fixtureTree(7_000, true, "1", undefined, true, false, { unsampled: true, killFailure });
+    await f.close(); await f.handle.stop(); f.kill.mockClear();
+    for (let i = 0; i < 2; i++) { try { f.cleanup(); } catch { /* expected failed one-shot */ } }
+    expect(f.writes).toHaveLength(0);
+    expect(f.kill).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledOnce(); // no systemctl or launch replay
+    expect(f.alive()).toBe(true);
+    let settled = false;
+    void f.handle.treeClosed!.then(() => { settled = true; });
+    await tick(); expect(settled).toBe(false);
+    f.depart(); f.emptyScope(); await expect(f.handle.treeClosed).resolves.toBeUndefined();
+  });
+
+  it("T8 watcher debt revokes authority even if the physical scope later empties", async () => {
+    const f = await fixtureTree(7_000, true, "1", undefined, true, false, { unsampled: true });
+    const error = new Error("owned watcher debt");
+    f.watcher.emit("error", error);
+    await expect(f.handle.treeClosed).rejects.toBe(error);
+    await f.close(); await f.handle.stop();
+    try { f.cleanup(); } catch { /* revoked */ }
+    expect(f.writes).toHaveLength(0);
+    expect(f.alive()).toBe(true);
+    f.depart(); f.emptyScope();
+    await expect(f.handle.treeClosed).rejects.toBe(error);
+    expect(f.handle.lostContact()).toContain("Owned scope watcher failed");
+  });
+
+  it("T8 native-close timeout debt cannot authorize cleanup after a delayed close", async () => {
+    const f = await fixtureTree(7_000, true, "1", undefined, true, false, { unsampled: true, nativeCloseDeferred: true });
+    const stopping = f.handle.stop();
+    await vi.advanceTimersByTimeAsync(20_000);
+    await stopping;
+    expect(f.handle.stopDebt?.()).toContain("did not confirm");
+    try { f.cleanup(); } catch { /* positive native close is absent */ }
+    expect(f.writes).toHaveLength(0);
+    await f.close();
+    try { f.cleanup(); } catch { /* immutable native debt remains */ }
+    expect(f.writes).toHaveLength(0);
+    expect(f.alive()).toBe(true);
+    const debt = f.handle.stopDebt?.();
+    f.depart(); f.emptyScope(); await tick();
+    expect(f.handle.stopDebt?.()).toBe(debt);
+  });
+
+  it("T10 bounds observed root inventory, names and serialized host record without reading argv/env", async () => {
+    const f = await fixtureTree(7_000, true, "1", undefined, true, false, { unsampled: true, comm: `fixture-op-daemon-${"x".repeat(200)}` });
+    fs.writeFileSync(path.join(f.leaf, "cgroup.procs"), Array.from({ length: 90 }, (_, i) => String(f.descendant + i)).join("\n"));
+    await f.close(); await f.handle.stop(); f.cleanup();
+    const lines = fs.readFileSync(f.logFile, "utf8").trim().split("\n").filter(Boolean);
+    const line = lines.find(line => JSON.parse(line).type === "scope.cleanup");
+    expect(line, "bounded inventory still requires the real host log record").toBeDefined();
+    expect(Buffer.byteLength(line!)).toBeLessThanOrEqual(8 * 1024);
+    const entry = JSON.parse(line!);
+    expect(entry.members.length).toBeGreaterThan(0);
+    expect(entry.members.length).toBeLessThanOrEqual(64);
+    expect(f.diagnosticReads.filter(read => read.kind === "procs")).toHaveLength(1);
+    expect(f.diagnosticReads.filter(read => read.kind === "comm").length).toBeLessThanOrEqual(64);
+    expect(entry.members.every((member: { comm: string }) => Buffer.byteLength(member.comm) <= 64)).toBe(true);
+    expect(f.opened.mock.calls.some(([file]) => /\/(cmdline|environ)$/.test(String(file)))).toBe(false);
+    expect(f.writes).toHaveLength(1);
+    await expect(f.handle.treeClosed).resolves.toBeUndefined();
+  });
+
+  it.each(["outside group", "uncertain handoff"] as const)("T10 scope-empty cannot erase %s custody", async mode => {
+    const f = await fixtureTree(7_000, true, "1", undefined, true, false, mode === "outside group" ? { externalGroup: true } : { unsampled: true, executionPending: true });
+    await f.close();
+    f.cleanup();
+    f.emptyScope(); // even positive scope emptiness is NOT the uncapped tree proof
+    let settled = false;
+    void f.handle.treeClosed!.then(() => { settled = true; }, () => { settled = true; });
+    await tick(); expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await expect(f.handle.treeClosed).rejects.toBeInstanceOf(ProcessTreeCustodyUnconfirmedError);
+    expect(f.handle.stopDebt?.()).toContain("custody unconfirmed");
+    const writes = f.writes.length;
+    try { f.cleanup(); } catch { /* retired receipt */ }
+    expect(f.writes).toHaveLength(writes);
+  });
+
+  it.each(["diagnostic", "log"] as const)("T10 %s failure never vetoes held-object cleanup", async failed => {
+    const f = await fixtureTree(7_000, true, "1", undefined, true, false, { unsampled: true, diagnosticFailure: failed === "diagnostic", logFailure: failed === "log" });
+    await f.close(); await f.handle.stop();
+    f.cleanup();
+    expect(f.writes, "diagnostic/log errors must not veto cleanup").toHaveLength(1);
+    expect(f.alive()).toBe(false);
+    await expect(f.handle.treeClosed).resolves.toBeUndefined();
+  });
+});
 
 describe.skipIf(process.platform !== "linux")("verified cgroup-v2 receipt admission", () => {
   it.each(["missing", "mismatched", "mismatched-receipt", "wrong-slice", "v1-only", "hybrid", "unowned", "open", "read", "watcher-arm", "watcher-arm-async", "identity-during-arm", "read-after-arm"] as const)("falls back to legacy monitoring for %s", async failure => {
@@ -584,7 +888,7 @@ describe.skipIf(process.platform !== "linux")("verified cgroup-v2 receipt admiss
     expect(await f.handle.isAlive()).toBe(false);
     expect(f.handle.lostContact()).toBeUndefined();
     expect(vi.getTimerCount()).toBe(0);
-    if (["read", "watcher-arm", "watcher-arm-async", "identity-during-arm", "read-after-arm"].includes(failure)) expect(f.closeEvents.mock.calls.filter(([fd]) => fd === 700_000_010)).toHaveLength(1);
+    if (["read", "watcher-arm", "watcher-arm-async", "identity-during-arm", "read-after-arm"].includes(failure)) expect(f.closeEvents.mock.calls.filter(([fd]) => fd === f.eventsFd())).toHaveLength(1);
   });
 
   it("publishes event custody only after opening, arming and validating our owned v2 scope", async () => {
@@ -593,13 +897,13 @@ describe.skipIf(process.platform !== "linux")("verified cgroup-v2 receipt admiss
     expect(f.handle.treeClosed).toBeInstanceOf(Promise);
     expect(f.order.slice(0, 3)).toEqual(["open", "watch", "read"]);
     expect(f.admissionWatcher.close).toHaveBeenCalledOnce();
-    expect(f.readEvents.mock.calls.filter(([fd]) => fd === 700_000_010).every(call => (call as unknown[])[4] === 0)).toBe(true);
+    expect(f.readEvents.mock.calls.filter(([fd]) => fd === f.eventsFd()).every(call => (call as unknown[])[4] === 0)).toBe(true);
     await f.close();
     expect(f.scans()).toBe(0);
     f.depart(); f.emptyScope();
     await expect(f.handle.treeClosed).resolves.toBeUndefined();
     expect(f.watcher.close).toHaveBeenCalledOnce();
-    expect(f.closeEvents.mock.calls.filter(([fd]) => fd === 700_000_010)).toHaveLength(1);
+    expect(f.closeEvents.mock.calls.filter(([fd]) => fd === f.eventsFd())).toHaveLength(1);
     expect(await f.handle.isAlive()).toBe(false);
   });
 

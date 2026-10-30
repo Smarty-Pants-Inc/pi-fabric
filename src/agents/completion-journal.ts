@@ -661,8 +661,10 @@ export class CompletionJournal {
   /** admittedRecipient is host-only queue metadata, never a field supplied by a worker/guest. */
   save(result: AgentRunResult, admittedRecipient?: CompletionRecipient): void {
     if (result.actorId) return;
-    const admitted = result.logFile
-      ? completionRecipientFromRun(this.meshRoot, path.dirname(result.logFile)) : admittedRecipient;
+    // A supplied second argument is the host's admission decision, including
+    // explicit absence. Only legacy one-argument callers use the log locator.
+    const admitted = arguments.length >= 2 ? admittedRecipient : (result.logFile
+      ? completionRecipientFromRun(this.meshRoot, path.dirname(result.logFile)) : undefined);
     // A live-name source cannot safely reconstruct a missing admission address,
     // even when a queued task terminated before its launch manifest existed.
     // Legacy fixed-address journals retain their original immutable fallback.

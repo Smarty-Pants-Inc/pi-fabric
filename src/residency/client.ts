@@ -703,7 +703,8 @@ export class ResidencyClient {
     // No manifest and no host binding means no authorized recipient. This is a
     // deliberate prelaunch refusal, not a transient storage failure to retry.
     if (!result.logFile && !admittedRecipient && typeof this.#completions.recipientSource === "function") return;
-    this.#completions.save(result, admittedRecipient);
+    if (arguments.length >= 2) this.#completions.save(result, admittedRecipient);
+    else this.#completions.save(result);
     this.#wakeDelivery();
   }
 

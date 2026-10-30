@@ -16,7 +16,8 @@ import { taskAgentEnvironment, withoutTaskBoundary } from "../task-environment.j
 import { configureTaskGitReadOnlyEnvironment } from "../task-git-credential.js";
 import { applyTaskReturnAddress } from "../task-return-address.js";
 import type { AgentPlacementConfig } from "../placement-config.js";
-import { agentPlacementProbe, liveAgentPlacement } from "../placement-config.js";
+import { agentPlacementProbe } from "../placement-config.js";
+import { liveAgentPlacement } from "./placement-policy.js";
 import { normalizeAgentCapabilityTokens } from "../../host-compatibility.js";
 import { assertAgentRequiredInputsExist, normalizeAgentRequires } from "../input-validation.js";
 import { isInside, readWritePolicy } from "../write-guard.js";
@@ -333,19 +334,29 @@ export class ProcessTransport implements AgentTransportAdapter {
     if (placement) {
       const preflightDeadline = Date.now() + Math.min(placement.commandTimeoutMs, 5_000);
       const capabilities = normalizeAgentCapabilityTokens(placement.capabilities, "agents.placement.capabilities")!;
-      const unmet = (needs ?? []).filter(need => !capabilities.includes(need));
+      // Only the installed fleet helper can prove GitHub on the selected host
+      // dynamically. This defers admission, not safety: preflight requires its
+      // version handshake and relay read before any launcher can run. Generic
+      // launchers (even with a picker) retain host-owned flat capabilities.
+      const fleetGithub = needs?.includes("github") && placement.default === "remote"
+        && (await import("./placement.js")).usesFleetPlacementHelper(placement, request.cwd);
+      const unmet = (needs ?? []).filter(need => !capabilities.includes(need) && !(fleetGithub && need === "github"));
       let reason = request.needs?.includes("local") ? "reserved need: local pins to the Main host"
         : placement.default === "local" ? "placement default is local"
         : unmet.length ? `unmet needs: ${unmet.join(", ")}` : request.placementLocalReason;
       if (!reason) reason = agentPlacementProbe(placement, request.cwd).reason;
+      const separator = placement.command.indexOf("--");
+      const stagesSource = placement.command.slice(0, separator < 0 ? undefined : separator)
+        .some((entry, index, options) => entry === "--src" && options[index + 1] === "{cwd}");
       if (!reason) {
         const { placementLocalPathReason } = await import("./placement.js");
-        reason = placementLocalPathReason(request.cwd, placement);
+        reason = placementLocalPathReason(request.cwd, placement, stagesSource);
       }
-      // --src ships the Main's workspace, unlike --cwd which names a target-local
-      // lane. Require the launcher's tracked/unignored manifest branch; home,
-      // non-Git and ignored roots must never enter its recursive-copy branch.
-      if (!reason && placement.command.some((entry, index) => entry === "--src" && placement.command[index + 1] === "{cwd}")) {
+      // --src ships the Main's workspace without a shared mount, unlike --cwd
+      // which names a target-local lane. After the scratch/state fences, require
+      // the launcher's tracked/unignored manifest branch; home, non-Git and
+      // ignored roots must never enter its recursive-copy branch.
+      if (!reason && stagesSource) {
         try {
           const cwd = fs.realpathSync(request.cwd);
           if (cwd === path.parse(cwd).root || cwd === fs.realpathSync(os.homedir())) throw new Error("home or root source");
@@ -371,8 +382,7 @@ export class ProcessTransport implements AgentTransportAdapter {
       if (!reason) {
         const { launchPlacedTask, selectFleetPlacement } = await import("./placement.js");
         const selection = await selectFleetPlacement(placement, request.cwd, request.signal, preflightDeadline);
-        if (selection && "localReason" in selection) reason = selection.localReason;
-        else return launchPlacedTask(request, placement, preflightDeadline, selection?.host);
+        return launchPlacedTask(request, placement, preflightDeadline, selection?.host);
       }
       const args = new Map<string, string>();
       for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);

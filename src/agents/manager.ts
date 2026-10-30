@@ -29,7 +29,7 @@ import { fileURLToPath } from "node:url";
 import { assertFabricModelAllowed, FabricModelDeniedError } from "../core/model-policy.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { readFileRetrying, renameAtomic, syncDirectoryChain, trackTemporary, writeJsonAtomic } from "../core/atomic-write.js";
-import { discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
+import { completionRecipientFromRun, discardWorkerCompletion, type CompletionRecipient } from "./completion-journal.js";
 import { processStartTime } from "../residency/process-identity.js";
 import { FABRIC_ACTOR_SELF_ENV, normalizeFabricActorActivationIdentity, type FabricActorActivationIdentity } from "../actors/activation-identity.js";
 import { countUnknownEnodevStarts, enodevDelivered, enodevUnresolvedRuns, noteEnodevDelivered, peekEnodevRun, settleEnodevRun,
@@ -3926,7 +3926,8 @@ export class AgentManager {
     managed.latestRecord = compactUiRecord(recovered);
     managed.latestUiRecord = managed.latestRecord;
     if (managed.background && !this.#closing && this.config.notifyOnComplete && this.#onBackgroundComplete) {
-      try { this.#onBackgroundComplete(this.#withTransportMetadata(recovered, managed) as AgentRunResult); } catch { /* best effort */ }
+      try { this.#onBackgroundComplete(this.#withTransportMetadata(recovered, managed) as AgentRunResult,
+        this.#admittedCompletionRecipient(managed)); } catch { /* best effort */ }
     }
     return true;
   }
@@ -7549,6 +7550,9 @@ export class AgentManager {
       const summary = this.#budgetSummary();
       if (summary) result.budget = summary;
     }
+    // Every terminal path publishes the same transport-bound paths, including
+    // supervisor outcomes that did not arrive through the ordinary monitor.
+    result = this.#withTransportMetadata(result, managed) as AgentRunResult;
     this.#observePresence(managed, result);
     const compactResult = compactUiRecord(result);
     managed.latestRecord = compactResult;
@@ -7580,8 +7584,12 @@ export class AgentManager {
 
   #stageArchive(directory: string, result: AgentRunResult, kind: PendingRunArchive["kind"], recipient?: CompletionRecipient, actorOnly = true): void {
     const actorSessionFile = process.env.PI_FABRIC_ACTOR_SESSION_FILE;
-    stageRunArchive(directory, { format: 1, kind, result, routePending: !actorOnly, ...(recipient ? { recipient } : {}),
-      ...(actorSessionFile && result.spawner?.kind === "actor" ? { actorSessionFile, notify: this.config.notifyOnComplete, actorOnly } : {}) });
+    // JSON drops undefined; retain the distinction between recorded absence and legacy omission.
+    const archive: PendingRunArchive & { completionRecipientRecorded: true } = {
+      format: 1, kind, result, routePending: !actorOnly, completionRecipientRecorded: true, ...(recipient ? { recipient } : {}),
+      ...(actorSessionFile && result.spawner?.kind === "actor" ? { actorSessionFile, notify: this.config.notifyOnComplete, actorOnly } : {}),
+    };
+    stageRunArchive(directory, archive);
     if (actorSessionFile && result.spawner?.kind === "actor") new ActorChildCompletionStore(actorSessionFile).trackArchiveSource(result.id, directory);
   }
 
@@ -7628,7 +7636,7 @@ export class AgentManager {
             if (archive.actorSessionFile && archive.actorOnly && archive.result.spawner?.kind === "actor") {
               new ActorChildCompletionStore(archive.actorSessionFile).enqueue(archive.result, archive.result.spawner, archive.notify);
             } else if (archive.kind === "shutdown" && this.#onStoppedAtClose) this.#onStoppedAtClose([archive.result]);
-            else if (archive.kind === "settlement" && this.#onSettled) this.#onSettled(archive.result, archive.recipient);
+            else if (archive.kind === "settlement" && this.#onSettled) this.#onSettled(archive.result, this.#archivedCompletionRecipient(directory, archive));
             else continue;
             commitRunArchive(directory, archive.kind);
             // Replaying an old result is not new worker activity. Removing its
@@ -7707,7 +7715,7 @@ export class AgentManager {
               if (archive.actorSessionFile && archive.actorOnly && archive.result.spawner?.kind === "actor") {
                 new ActorChildCompletionStore(archive.actorSessionFile).enqueue(archive.result, archive.result.spawner, archive.notify);
               } else if (archive.kind === "shutdown" && manager.#onStoppedAtClose) manager.#onStoppedAtClose([archive.result]);
-              else if (archive.kind === "settlement" && manager.#onSettled) manager.#onSettled(archive.result, archive.recipient);
+              else if (archive.kind === "settlement" && manager.#onSettled) manager.#onSettled(archive.result, manager.#archivedCompletionRecipient(directory, archive));
               else continue;
               if (!unchanged()) break;
               commitRunArchive(directory, archive.kind);
@@ -7730,6 +7738,20 @@ export class AgentManager {
     if (children) yield* visitChildren(root, 0); else yield* visit(root, 0);
   }
 
+  /** Untagged recipientless archives retain legacy lookup, but only in the caller-owned source directory. */
+  #archivedCompletionRecipient(directory: string, archive: PendingRunArchive): CompletionRecipient | undefined {
+    if (Object.prototype.hasOwnProperty.call(archive, "recipient") ||
+        ("completionRecipientRecorded" in archive && archive.completionRecipientRecorded === true)) return archive.recipient;
+    return this.#meshRoot && !archive.result.actorId
+      ? completionRecipientFromRun(this.#meshRoot, directory) : undefined;
+  }
+
+  /** Completion custody belongs to the caller's admitted run, not the worker's log location. */
+  #admittedCompletionRecipient(managed: ManagedAgent): CompletionRecipient | undefined {
+    return this.#meshRoot && !managed.actorId
+      ? completionRecipientFromRun(this.#meshRoot, managed.runDirectory) : undefined;
+  }
+
   #saveSettledResult(managed: ManagedAgent, result: AgentRunResult): boolean {
     this.#observePresence(managed, result);
     try {
@@ -7742,9 +7764,10 @@ export class AgentManager {
       managed.settledResultFile = resultFile;
       managed.resultFingerprint = fingerprint;
       delete managed.resultCollected;
-      if (managed.routeOutcome || this.#onSettled) this.#stageArchive(managed.runDirectory, full, "settlement", undefined, !managed.routeOutcome);
+      const admittedRecipient = managed.routeOutcome || this.#onSettled ? this.#admittedCompletionRecipient(managed) : undefined;
+      if (managed.routeOutcome || this.#onSettled) this.#stageArchive(managed.runDirectory, full, "settlement", admittedRecipient, !managed.routeOutcome);
       managed.routeOutcome?.(result);
-      this.#onSettled?.(full);
+      this.#onSettled?.(full, admittedRecipient);
       if (managed.routeOutcome || this.#onSettled) this.#commitArchive(managed.runDirectory, full);
       else if (this.#onStoppedAtClose && !this.#closing) commitRunArchive(managed.runDirectory);
       if (managed.settlementSaveFailure) this.#retentionRevision++;
@@ -7840,7 +7863,7 @@ export class AgentManager {
     ) {
       managed.completionNotified = true;
       try {
-        this.#onBackgroundComplete(result);
+        this.#onBackgroundComplete(result, this.#admittedCompletionRecipient(managed));
       } catch { /* completion callback must not break the manager */ }
     }
   }
@@ -8349,6 +8372,9 @@ export class AgentManager {
     const nestedAgents = reconcileNestedAgents(observedNested.length > 0 ? observedNested : record.nestedAgents ?? [], record);
     const budget = this.#budgetSummary();
     const { logFile: _logFile, nestedAgents: _nestedAgents, ...safeRecord } = record;
+    // Only the manager-owned transport can identify remote execution. Worker
+    // placement/session fields cannot opt a local run out of canonical paths.
+    const remote = managed.transport.kind === "process" && managed.transport.sessionId === `placement:${managed.id}`;
     const model = record.model ?? managed.model;
     const thinking = record.thinking ?? managed.thinking;
     const runnerSessionId = record.runnerSessionId ?? managed.runnerSessionId;
@@ -8373,7 +8399,7 @@ export class AgentManager {
         ? { promptRetentionDropped: true } : {}),
       ...((managed.promptRetentionMismatch || record.promptRetentionMismatch)
         ? { promptRetentionMismatch: true } : {}),
-      cwd: managed.cwd,
+      cwd: remote ? record.cwd : managed.cwd,
       ...(managed.launch.placementAdmission ? {
         placementRunId: managed.launch.placementAdmission.placementRunId,
         placementKind: managed.launch.placementAdmission.placementKind,
@@ -8386,7 +8412,7 @@ export class AgentManager {
       ...(managed.transport.cgroup ? { cgroup: managed.transport.cgroup } : {}),
       ...(managed.residency === "durable" ? { residency: "durable" as const } : {}),
       ...(managed.temporaryDirectory ? { temporaryDirectory: managed.temporaryDirectory } : {}),
-      logFile: path.join(managed.runDirectory, "events.jsonl"),
+      logFile: remote && record.logFile ? record.logFile : path.join(managed.runDirectory, "events.jsonl"),
       ...(nestedAgents.length > 0 ? { nestedAgents } : {}),
       ...(budget ? { budget } : {}),
       ...(model ? { model } : {}),

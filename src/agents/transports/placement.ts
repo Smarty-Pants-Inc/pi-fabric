@@ -6,11 +6,29 @@ import { writeJsonAtomic } from "../../core/atomic-write.js";
 import { executeFile } from "./process-utils.js";
 import { assertTransportLaunchAllowed } from "./launch-authority.js";
 import { taskAgentEnvironment } from "../task-environment.js";
-import { normalizeAgentRequires, RequiredInputMissingError } from "../input-validation.js";
+import { AgentInputError, normalizeAgentRequires, RequiredInputMissingError } from "../input-validation.js";
 import { preflightFleetPlacement } from "./placement-preflight.js";
-export { placementLocalPathReason, selectFleetPlacement } from "./placement-preflight.js";
+import { nativePlacementReceipt, writePlacementSessionExport, writePlacementWorkerPacket } from "./placement-worker.js";
+export { placementLocalPathReason, selectFleetPlacement, usesFleetPlacementHelper } from "./placement-preflight.js";
 
-interface Receipt { rc: number | string; text: string; stderr?: string }
+interface Receipt {
+  rc: number | string;
+  text: string;
+  stderr?: string;
+  worker?: AgentRunRecord;
+  sessionExport?: { base64: string; sha256: string };
+}
+
+/** Only the agreed factory pre-dispatch receipt makes exit 3 known-unlaunched.
+ * A missing/mismatched acceptance, arbitrary exit 3 or SSH error stays unknown.
+ */
+const placementUnavailable = (error: unknown): string | undefined => {
+  const value = error as { code?: unknown; stdout?: unknown; stderr?: unknown; killed?: unknown; signal?: unknown };
+  if (value.code !== 3 && value.code !== "3" || value.killed || value.signal) return undefined;
+  const output = [value.stdout, value.stderr].filter((part): part is string => typeof part === "string").join("\n");
+  if (/^RYZEN2_TASK_ACCEPTED\b/mu.test(output)) return undefined;
+  return output.split(/\r?\n/u).find(line => /^PLACEMENT_UNAVAILABLE: .+; no task started$/u.test(line));
+};
 
 /** The fleet launcher returns rc=3 and a concrete PREFLIGHT_REFUSED receipt when a --require path is absent on target. */
 const requiredInputRefusal = (error: unknown, requires: readonly string[] | undefined): string | undefined => {
@@ -26,20 +44,33 @@ const render = (template: string, values: Record<string, string>): string => tem
   if (values[key] === undefined) throw new Error(`Placement placeholder unavailable: ${key}`);
   return values[key]!;
 });
-const receipt = (input: unknown): Receipt | undefined => {
+const receipt = (input: unknown, native?: { id: string; host: string }): Receipt | undefined => {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("Invalid placement result receipt");
   const value = input as Record<string, unknown>;
   if (value.rc === null) return undefined;
   if (!(typeof value.rc === "number" && Number.isSafeInteger(value.rc) || typeof value.rc === "string" && value.rc.trim()) || typeof value.text !== "string" || value.stderr !== undefined && typeof value.stderr !== "string") {
     throw new Error("Placement receipt requires terminal rc and result text");
   }
-  return value as unknown as Receipt;
+  if (native && !((typeof value.rc === "number" || typeof value.rc === "string" && /^-?\d+$/u.test(value.rc))
+    && Number.isSafeInteger(Number(value.rc)) && Number(value.rc) >= 0 && Number(value.rc) <= 255)) {
+    throw new Error("Native placement requires a numeric terminal exit rc in 0..255");
+  }
+  const result = { ...value, ...(native ? nativePlacementReceipt(value, native.id, native.host) : {}) } as unknown as Receipt;
+  if (native && result.worker?.status === "completed" && Number(result.rc) !== 0) {
+    throw new Error("Native placement completed record conflicts with receiver exit rc");
+  }
+  return result;
 };
 
 /** One-shot task protocol. rc is a native-exit receipt, NOT the existence of result.md.
  * No timers/processes survive outside manager-owned launch/isAlive/stop operations.
  */
 export const launchPlacedTask = async (request: AgentTransportLaunch, config: AgentPlacementConfig, preflightDeadline?: number, selectedHost?: string): Promise<AgentTransportHandle> => {
+  const native = config.workerProtocol === "fabric-v1";
+  if (config.workerProtocol !== undefined && !native || native && !config.resultCommand) {
+    throw new AgentInputError("placement", "Native placement requires workerProtocol fabric-v1 and resultCommand; no task started");
+  }
+  request = { ...request, workerArguments: [...request.workerArguments] };
   const requires = normalizeAgentRequires(request.requires);
   const args = new Map<string, string>();
   for (let i = 0; i < request.workerArguments.length; i += 2) args.set(request.workerArguments[i]!, request.workerArguments[i + 1]!);
@@ -48,7 +79,8 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
     if (!value) throw new Error(`Placement requires ${flag}`);
     return value;
   };
-  const task = fs.readFileSync(required("--task-file"), "utf8");
+  const taskBytes = fs.readFileSync(required("--task-file"));
+  const task = taskBytes.toString("utf8");
   const statusFile = required("--status-file");
   const logFile = required("--log-file");
   const timeoutMs = Number(required("--timeout-ms"));
@@ -107,11 +139,11 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
     writeJsonAtomic(statusFile, { ...base, status, text, updatedAt: now,
       ...(terminal ? { finishedAt: now } : {}), ...(error ? { error } : {}),
       ...(rc !== undefined ? { exitCode: rc } : {}), ...(stderr ? { stderr } : {}),
-      warnings: ["Remote one-shot placement: no streaming, controls, tool telemetry, or usage accounting.", ...(debt ? [debt] : [])],
+      warnings: [native ? "Remote native placement: no streaming or interactive controls." : "Remote one-shot placement: no streaming, controls, tool telemetry, or usage accounting.", ...(debt ? [debt] : [])],
     });
   };
   const readReceipt = async (limit: number): Promise<Receipt | undefined> => {
-    if (config.resultCommand) return receipt(JSON.parse((await command(config.resultCommand, limit)).stdout));
+    if (config.resultCommand) return receipt(JSON.parse((await command(config.resultCommand, limit)).stdout), native ? { id: request.id, host: values.host! } : undefined);
     const directory = values.resultDir!;
     let rc: string;
     try { rc = fs.readFileSync(path.join(directory, "rc"), "utf8").trim(); }
@@ -125,11 +157,27 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
     return receipt({ rc, text, ...(stderr !== undefined ? { stderr } : {}) });
   };
   const consume = (result: Receipt, forced?: "stopped" | "timed_out") => {
+    const rc = /^-?\d+$/.test(String(result.rc)) ? Number(result.rc) : undefined;
+    let status: AgentRunRecord["status"];
+    if (native) {
+      // The receiver's rc is exit evidence; the actual worker record is the
+      // result authority (including failed validation despite a zero exit).
+      if (!result.worker) throw new Error("Native placement worker record missing");
+      writePlacementSessionExport(result, args.get("--session-export-file") || undefined, result.worker.status);
+      status = result.worker.status;
+      writeJsonAtomic(statusFile, { ...result.worker,
+        // The worker's own exitCode/stderr describe its native runner; the
+        // envelope rc describes the outer receiver-owned worker process.
+        ...(result.worker.exitCode === undefined && rc !== undefined ? { exitCode: rc } : {}),
+        ...(result.worker.stderr === undefined && result.stderr !== undefined ? { stderr: result.stderr } : {}),
+      });
+      terminal = true;
+    } else {
+      status = rc === 0 ? "completed" : forced ?? (rc === 124 || /timeout/i.test(String(result.rc)) ? "timed_out" : "failed");
+      save(status, result.text, status === "completed" ? undefined : `Remote task ${status} (rc=${result.rc})`, rc, result.stderr);
+    }
     exited = true;
     debt = undefined;
-    const rc = /^-?\d+$/.test(String(result.rc)) ? Number(result.rc) : undefined;
-    const status = rc === 0 ? "completed" : forced ?? (rc === 124 || /timeout/i.test(String(result.rc)) ? "timed_out" : "failed");
-    save(status, result.text, status === "completed" ? undefined : `Remote task ${status} (rc=${result.rc})`, rc, result.stderr);
     audit("placement.result", { host: values.host, status, rc: result.rc });
   };
   const stop = (status: "stopped" | "timed_out" = "stopped"): Promise<void> => {
@@ -181,12 +229,22 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
   // prove that nothing ran remotely: retain custody and never spawn locally.
   ensurePlacementLive();
   assertTransportLaunchAllowed(request);
+  const packetFile = native ? path.join(path.dirname(statusFile), "placement-worker.json") : undefined;
+  if (packetFile) {
+    try { writePlacementWorkerPacket(request, packetFile, taskBytes); }
+    catch (error) { throw new AgentInputError("placement", `Native placement packet preparation failed: ${String(error)}; no task started`); }
+  }
   request.onWritePolicyDisposition?.("remote");
   try {
     let output: string;
-    try { output = (await command(config.command, config.commandTimeoutMs, request.signal, (requires ?? []).flatMap(file => ["--require", file]), true)).stdout; }
+    try { output = (await command(config.command, config.commandTimeoutMs, request.signal, [
+      ...(requires ?? []).flatMap(file => ["--require", file]),
+      ...(packetFile ? ["--worker-packet", packetFile] : []),
+    ], true)).stdout; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw Object.assign(error as Error, { launchOutcome: "unlaunched" });
+      const unavailable = placementUnavailable(error);
+      if (unavailable) throw new AgentInputError("placement", `placement unavailable; no task started; ${unavailable}`);
       const missing = requiredInputRefusal(error, requires);
       if (missing !== undefined) {
         const index = requires?.indexOf(missing);
@@ -212,7 +270,7 @@ export const launchPlacedTask = async (request: AgentTransportLaunch, config: Ag
       throw new Error(`Placement SSH alias unavailable for accepted host: ${values.host}`);
     }
     if (config.resultDirectory) values.resultDir = render(config.resultDirectory, values);
-    writeJsonAtomic(path.join(path.dirname(statusFile), "placement.json"), { id: request.id, host: values.host, output, deadline, ...(values.resultDir ? { resultDirectory: values.resultDir } : {}) });
+    writeJsonAtomic(path.join(path.dirname(statusFile), "placement.json"), { id: request.id, host: values.host, output, deadline, ...(native ? { workerProtocol: config.workerProtocol, workerPacket: packetFile } : {}), ...(values.resultDir ? { resultDirectory: values.resultDir } : {}) });
     audit("placement.remote", { host: values.host, needs: request.needs ?? [], deadline });
     save("running");
     return handle;

@@ -15,7 +15,9 @@ import { HerdrTransport } from "../src/agents/transports/herdr-transport.js";
 import * as processUtils from "../src/agents/transports/process-utils.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import type { AgentTransportLaunch } from "../src/agents/types.js";
-import { liveAgentPlacement, probeAgentPlacement } from "../src/agents/placement-config.js";
+import { probeAgentPlacement } from "../src/agents/placement-config.js";
+import { liveAgentPlacement } from "../src/agents/transports/placement-policy.js";
+import { diagnostics } from "../src/core/diagnostics.js";
 import type { InheritedSessionPin } from "../src/agents/session-pins.js";
 
 const roots: string[] = [], managers: AgentManager[] = [];
@@ -263,6 +265,7 @@ describe("host process task placement", () => {
     expect(read()?.default).toBe("local");
     const local = read();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const diagnostic = vi.spyOn(diagnostics, "warn");
     for (const invalid of ['{"agents":', JSON.stringify({ agents: { placement: { ...f.raw, command: [] } } })]) {
       fs.writeFileSync(file, invalid);
       expect(read()).toBe(local);
@@ -270,6 +273,8 @@ describe("host process task placement", () => {
       expect(fs.readFileSync(file, "utf8")).toBe(invalid);
     }
     expect(warn).toHaveBeenCalledTimes(2);
+    expect(diagnostic).toHaveBeenCalledTimes(2);
+    expect(diagnostic.mock.calls.every(([source]) => source === "src/agents/transports/placement-policy.ts")).toBe(true);
     fs.writeFileSync(file, JSON.stringify({ agents: { placement: f.raw } }));
     expect(read()?.default).toBe("remote");
     fs.writeFileSync(file, "{}");
@@ -300,13 +305,28 @@ describe("host process task placement", () => {
     expect(result).toMatchObject({status:"completed",text:`REMOTE: ${task}`,exitCode:0});
     expect(JSON.parse(fs.readFileSync(path.join(f.results,h.id,"argv.json"),"utf8"))).toEqual(["--host","auto","--minutes","1","--cwd",f.root,"--model","test/model","--thinking","high","--",task]);
   });
-  it("ships a Git source cwd with --src rather than the target-only --cwd flag", async () => {
-    const f=fixture(); execFileSync("git",["init","--quiet",f.root]);
-    f.config.placement.command=f.config.placement.command.map(entry=>entry==="--cwd"?"--src":entry);
-    const result=await f.manager.run({task:"source packet",transport:"process",model:"test/model",thinking:"high"});
-    expect(result).toMatchObject({status:"completed",text:"REMOTE: source packet"});
-    const argv=JSON.parse(fs.readFileSync(path.join(f.results,result.id,"argv.json"),"utf8"));
-    expect(argv).toEqual(["--host","auto","--minutes","1","--src",f.root,"--model","test/model","--thinking","high","--","source packet"]);
+  it.each(["root", "subdirectory"])("ships an unshared Git %s cwd with --src and preserves target-only inputs", async kind => {
+    const f = fixture(); execFileSync("git", ["init", "--quiet", f.root]);
+    const cwd = kind === "root" ? f.root : path.join(f.root, "package");
+    fs.mkdirSync(cwd, { recursive: true });
+    fs.writeFileSync(path.join(cwd, "source.txt"), "portable source");
+    delete f.config.placement.sharedMounts;
+    f.config.placement.command = f.config.placement.command.map(entry => entry === "--cwd" ? "--src" : entry);
+    const required = path.join(f.root, "target-only", "input.dat");
+    expect(fs.existsSync(required)).toBe(false);
+    const result = await f.manager.run({ task: "source packet", cwd, transport: "process", model: "test/model", thinking: "high", requires: [required] });
+    expect(result).toMatchObject({ status: "completed", text: "REMOTE: source packet", cwd });
+    const argv = JSON.parse(fs.readFileSync(path.join(f.results, result.id, "argv.json"), "utf8"));
+    expect(argv).toEqual(["--host", "auto", "--minutes", "1", "--src", cwd, "--model", "test/model", "--thinking", "high", "--require", required, "--", "source packet"]);
+  });
+  it.each(["--cwd", "prompt-only --src"])("does not grant source portability to an unshared Git cwd via %s", async kind => {
+    const f = fixture(); execFileSync("git", ["init", "--quiet", f.root]);
+    delete f.config.placement.sharedMounts;
+    if (kind === "prompt-only --src") f.config.placement.command.push("--src", "{cwd}");
+    const result = await f.manager.run({ task: "stay local", transport: "process" });
+    expect(result.text).toBe("LOCAL");
+    expect(fs.readFileSync(path.join(f.manager.runDirectory(result.id)!, "events.jsonl"), "utf8")).toContain("caller-local cwd");
+    expect(fs.existsSync(f.results)).toBe(false);
   });
   it("resolves Ryzen 3 polling and cancellation through the configured forge alias", async () => {
     const f=fixture(true);
@@ -399,9 +419,23 @@ describe("host process task placement", () => {
     await expect(f.manager.spawn({task:"x",transport:"process"})).rejects.toThrow("ENOENT");
     expect(fs.existsSync(f.results)).toBe(false);
   });
-  it.each(["home","non-git"])("keeps an unshippable %s --src cwd local", async kind => {
-    const f=fixture(); f.config.placement.command=f.config.placement.command.map(entry=>entry==="--cwd"?"--src":entry);
-    if(kind==="home") vi.stubEnv("HOME",f.root);
+  it("keeps a filesystem-root --src cwd local without invoking the launcher", async () => {
+    const f = fixture(); delete f.config.placement.sharedMounts;
+    f.config.placement.command = f.config.placement.command.map(entry => entry === "--cwd" ? "--src" : entry);
+    const request = { ...launch(f, "stay local"), cwd: path.parse(f.root).root, workerPath: path.join(f.root, "local.mjs") };
+    const handle = await new ProcessTransport(undefined, f.config.placement).launch(request);
+    await handle.waitForClose?.();
+    expect(JSON.parse(fs.readFileSync(path.join(f.root, "direct/status.json"), "utf8")).text).toBe("LOCAL");
+    expect(fs.readFileSync(path.join(f.root, "direct/events.jsonl"), "utf8")).toContain('"reason":"cwd-not-shippable"');
+    expect(fs.existsSync(f.results)).toBe(false);
+  });
+  it.each(["home","non-git"])("keeps an unshippable %s --src cwd local without a shared mount", async kind => {
+    const f=fixture(); delete f.config.placement.sharedMounts;
+    f.config.placement.command=f.config.placement.command.map(entry=>entry==="--cwd"?"--src":entry);
+    if(kind==="home") {
+      execFileSync("git", ["init", "--quiet", f.root]);
+      vi.spyOn(os, "homedir").mockReturnValue(f.root);
+    }
     const h=await f.manager.spawn({task:"x",transport:"process"});
     expect((await f.manager.wait(h.id)).text).toBe("LOCAL");
     expect(fs.readFileSync(path.join(f.manager.runDirectory(h.id)!,"events.jsonl"),"utf8")).toContain('"reason":"cwd-not-shippable"');
@@ -414,6 +448,7 @@ describe("host process task placement", () => {
     const privateFile = path.join(cwd, "private-fixture.txt"); fs.writeFileSync(privateFile, "NONSECRET PRIVATE FIXTURE");
     expect(execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8" }).trim()).toBe("true");
     expect(() => execFileSync("git", ["-C", cwd, "check-ignore", "-q", "--", cwd])).not.toThrow();
+    delete f.config.placement.sharedMounts;
     f.config.placement.command = f.config.placement.command.map(entry => entry === "--cwd" ? "--src" : entry);
     const result = await f.manager.run({ task: "must remain local", cwd, transport: "process" });
     expect(result).toMatchObject({ status: "completed", text: "LOCAL", cwd });
@@ -430,7 +465,7 @@ describe("host process task placement", () => {
     { code: "ENOENT", stdout: "", stderr: "" },
     {},
   ])("keeps failed or indeterminate ignore checks local (%j)", async failure => {
-    const f = fixture();
+    const f = fixture(); delete f.config.placement.sharedMounts;
     f.config.placement.command = f.config.placement.command.map(entry => entry === "--cwd" ? "--src" : entry);
     const query = vi.spyOn(processUtils, "executeFile").mockResolvedValueOnce({ stdout: "true\n", stderr: "" }).mockRejectedValueOnce(Object.assign(new Error("ignore check failed"), failure));
     const result = await f.manager.run({ task: "must remain local", transport: "process" });

@@ -52,7 +52,7 @@ const openSqlite = async (root: string): Promise<SqliteStateStore> => {
   return store;
 };
 
-const fileStore = (root: string): MeshStore => new MeshStore(root, 64 * 1024, 1_000);
+const fileStore = (root: string): MeshStore => new MeshStore(root, 64 * 1024, 1_000, { stateBackend: "file" });
 
 /** A file-backend root with entries, nested values and CAS tombstones. */
 const seedFileRoot = async (root: string, count = 30): Promise<MeshStore> => {

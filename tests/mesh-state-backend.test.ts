@@ -87,7 +87,7 @@ describe("state backend selection", () => {
   });
 
   it("parses mesh.stateBackend with the environment override", () => {
-    expect(normalizeFabricConfig({}).mesh.stateBackend).toBe("file");
+    expect(normalizeFabricConfig({}).mesh.stateBackend).toBeUndefined();
     expect(normalizeFabricConfig({ mesh: { stateBackend: "shadow" } }).mesh.stateBackend).toBe("shadow");
     expect(() => normalizeFabricConfig({ mesh: { stateBackend: "postgres" } })).toThrow(/mesh.stateBackend/);
     vi.stubEnv("PI_FABRIC_MESH_STATE_BACKEND", "sqlite");

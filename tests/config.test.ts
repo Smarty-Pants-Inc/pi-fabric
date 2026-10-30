@@ -410,11 +410,70 @@ it("refuses an unknown PI_FABRIC_MESH_STATE_BACKEND, never falling back to the f
     process.env.PI_FABRIC_MESH_STATE_BACKEND = " ";
     expect(normalizeFabricConfig({ mesh: { stateBackend: "sqlite" } }).mesh.stateBackend).toBe("sqlite");
     delete process.env.PI_FABRIC_MESH_STATE_BACKEND;
-    expect(normalizeFabricConfig({}).mesh.stateBackend).toBe("file");
+    expect(normalizeFabricConfig({}).mesh.stateBackend).toBeUndefined();
   } finally {
     if (inherited === undefined) delete process.env.PI_FABRIC_MESH_STATE_BACKEND;
     else process.env.PI_FABRIC_MESH_STATE_BACKEND = inherited;
   }
+});
+
+describe("mesh backend configuration provenance", () => {
+  const withoutBackendEnv = <T>(run: () => T): T => {
+    const inherited = process.env.PI_FABRIC_MESH_STATE_BACKEND;
+    delete process.env.PI_FABRIC_MESH_STATE_BACKEND;
+    try { return run(); }
+    finally {
+      if (inherited === undefined) delete process.env.PI_FABRIC_MESH_STATE_BACKEND;
+      else process.env.PI_FABRIC_MESH_STATE_BACKEND = inherited;
+    }
+  };
+
+  it("leaves the default and every merged loader unset when no layer names a backend", () => withoutBackendEnv(() => {
+    const cwd = temporaryDirectory(), agentDir = temporaryDirectory();
+    const options = { cwd, agentDir, projectTrusted: true };
+    const configs = [DEFAULT_FABRIC_CONFIG, normalizeFabricConfig({}), normalizeFabricConfig(DEFAULT_FABRIC_CONFIG as unknown as Record<string, unknown>),
+      loadFabricConfig(options), loadGlobalFabricConfig(agentDir),
+      loadFabricConfigForScope(options, "global"), loadFabricConfigForScope(options, "project")];
+    for (const config of configs) {
+      expect(config.mesh.stateBackend).toBeUndefined();
+      expect(Object.hasOwn(config.mesh, "stateBackend")).toBe(false);
+    }
+    process.env.PI_FABRIC_MESH_STATE_BACKEND = " \t ";
+    expect(Object.hasOwn(normalizeFabricConfig({}).mesh, "stateBackend")).toBe(false);
+    expect(loadFabricConfig(options).mesh.stateBackend).toBeUndefined();
+  }));
+
+  it.each(["file", "shadow", "sqlite", "nats"] as const)("retains explicit %s and lets only a nonblank environment override it", backend => withoutBackendEnv(() => {
+    const explicit = normalizeFabricConfig({ mesh: { stateBackend: backend } });
+    expect(explicit.mesh.stateBackend).toBe(backend);
+    expect(Object.hasOwn(explicit.mesh, "stateBackend")).toBe(true);
+    process.env.PI_FABRIC_MESH_STATE_BACKEND = " ";
+    expect(normalizeFabricConfig({ mesh: { stateBackend: backend } }).mesh.stateBackend).toBe(backend);
+    process.env.PI_FABRIC_MESH_STATE_BACKEND = ` ${backend.toUpperCase()} `;
+    expect(normalizeFabricConfig({}).mesh.stateBackend).toBe(backend);
+    expect(normalizeFabricConfig({ mesh: { stateBackend: backend === "file" ? "sqlite" : "file" } }).mesh.stateBackend).toBe(backend);
+  }));
+
+  it("retains persisted host and trusted project selections through merging", () => withoutBackendEnv(() => {
+    const cwd = temporaryDirectory(), agentDir = temporaryDirectory();
+    const options = { cwd, agentDir, projectTrusted: true };
+    fs.writeFileSync(path.join(agentDir, "fabric.json"), JSON.stringify({ mesh: { stateBackend: "file" } }));
+    expect(loadGlobalFabricConfig(agentDir).mesh.stateBackend).toBe("file");
+    expect(loadFabricConfig(options).mesh.stateBackend).toBe("file");
+    fs.mkdirSync(path.join(cwd, ".pi"));
+    fs.writeFileSync(path.join(cwd, ".pi", "fabric.json"), JSON.stringify({ mesh: { stateBackend: "sqlite" } }));
+    expect(loadFabricConfig(options).mesh.stateBackend).toBe("sqlite");
+    expect(loadFabricConfigForScope(options, "global").mesh.stateBackend).toBe("file");
+    expect(loadFabricConfigForScope(options, "project").mesh.stateBackend).toBe("sqlite");
+    expect(loadFabricConfig({ ...options, projectTrusted: false }).mesh.stateBackend).toBe("file");
+    process.env.PI_FABRIC_MESH_STATE_BACKEND = " SHADOW ";
+    expect(loadGlobalFabricConfig(agentDir).mesh.stateBackend).toBe("shadow");
+    expect(loadFabricConfig(options).mesh.stateBackend).toBe("shadow");
+  }));
+
+  it.each([null, "", " SQLITE ", false, 1])("refuses invalid configured backend %s instead of treating it as omitted", stateBackend => withoutBackendEnv(() => {
+    expect(() => normalizeFabricConfig({ mesh: { stateBackend } })).toThrow(/mesh.stateBackend/);
+  }));
 });
 
 describe("executor.powershell opt-in (smarty-dev#9826)", () => {

@@ -48,15 +48,14 @@ const treeBytes = (root: string): Record<string, Buffer> => {
 
 const residentConfig = (root: string): ResidentHostConfig => {
   const meshRoot = path.join(root, "mesh"), rootId = "session:offline-backend-root";
-  const { stateBackend: _omitted, ...legacyMesh } = DEFAULT_FABRIC_CONFIG.mesh;
   return {
     format: 1, rootId, sessionId: "offline-backend-session", cwd: root, projectRoot: root,
     meshRoot, actorRoot: path.join(root, "actors"), residencyRoot: residentRoot(meshRoot, rootId),
     fullCodeMode: true,
     agents: { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: true },
-    // Old on-disk configs genuinely omit this now-required field; do not normalize it into a default.
-    mesh: { ...legacyMesh, actorScope: "session", actorPollMs: 30,
-      residentIdleExitMs: 60 * 60_000 } as ResidentHostConfig["mesh"],
+    // Omitted backend settings stay omitted; the store factory selects this root's backend.
+    mesh: { ...DEFAULT_FABRIC_CONFIG.mesh, actorScope: "session", actorPollMs: 30,
+      residentIdleExitMs: 60 * 60_000 },
     retention: { ...DEFAULT_FABRIC_CONFIG.retention, legacyRunArchiveEnabled: false,
       orphanedTempRunMs: Number.MAX_SAFE_INTEGER, oneShotRunMs: Number.MAX_SAFE_INTEGER,
       actorRunArchiveMs: Number.MAX_SAFE_INTEGER, terminalRunEventsAgeMs: Number.MAX_SAFE_INTEGER },

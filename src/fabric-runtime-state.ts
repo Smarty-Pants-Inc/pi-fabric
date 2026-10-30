@@ -1016,7 +1016,8 @@ export class FabricRuntimeState {
           ((natsMode ? directoryAgents : this.#agents)?.runningCount() ?? 0) > 0 ||
           ((natsMode ? directoryActors : this.#actors)?.inFlightCount() ?? 0) > 0,
         lockProtocol: this.#config.mesh.lockProtocol,
-        stateBackend: this.#config.mesh.stateBackend,
+        // Normalized omission stays unset so each root selects its own backend in the factory.
+        ...(this.#config.mesh.stateBackend !== undefined ? { stateBackend: this.#config.mesh.stateBackend } : {}),
         ...(this.#disposableMeshWrites ? { writeSignal: this.#disposableMeshWrites.signal } : {}),
       },
     );

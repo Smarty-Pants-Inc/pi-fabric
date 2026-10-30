@@ -330,14 +330,15 @@ async function publishUnhosted(root: string, config: ResidentHostConfig, outage:
     durationMs: Math.max(0, Date.now() - outage.since), topic: RESIDENT_UNHOSTED_TOPIC, ...data }));
   try {
     // Alarm-time only: neither MeshStore nor its transitive closure belongs in launcher startup.
-    const { MeshStore, meshAlarmRecipient, meshStateBackendFromMarker } = await import("../mesh.js");
+    const { MeshStore, meshAlarmRecipient } = await import("../mesh.js");
     // Preserve canonical session-target validation, with no ambient env fallback of either kind.
     if (!meshAlarmRecipient({ SMARTY_LEAD_SESSION: config.rootId })) {
       unhostedDiagnostic(root, "invalid root session alarm sink; stderr only"); return;
     }
     if (state === "recovered" && !recoveryCurrent()) return;
     const mesh = new MeshStore(config.meshRoot, config.mesh?.maxEventBytes ?? 64 * 1024, config.mesh?.maxReadEvents ?? 100,
-      { lockProtocol: config.mesh?.lockProtocol, stateBackend: meshStateBackendFromMarker(config.meshRoot, config.mesh?.stateBackend),
+      { lockProtocol: config.mesh?.lockProtocol,
+        ...(config.mesh?.stateBackend !== undefined ? { stateBackend: config.mesh.stateBackend } : {}),
         canWakeResidents: () => false, lockTimeoutMs: 1_000 });
     try {
       // Diagnostic only: hostId is correlation, NOT sender authentication (smarty-dev#9641).

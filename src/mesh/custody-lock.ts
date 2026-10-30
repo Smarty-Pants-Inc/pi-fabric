@@ -1,13 +1,13 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { diagnostics } from "../core/diagnostics.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { FOREIGN_LOCK, pinFenceLock, releaseFenceLock } from "./fence-lock.js";
 import { verifiedRemove } from "../storage/verified-remove.js";
+import { diagnostics } from "../core/diagnostics.js";
 import {
   alarmForeignHolder, MeshLockForeignHolderError, MeshLockTimeoutError, ownProcessIncarnation, processIncarnation, validProcessIncarnation,
-  readPhysicalHostIdentity, readPhysicalMachineId, validBootId, type StaleLockNote,
+  readPhysicalHostIdentity, readPhysicalMachineId, renderRecoveryCommand, validBootId, type StaleLockNote,
 } from "../core/atomic-write.js";
 
 /**
@@ -26,7 +26,8 @@ import {
  */
 export const MESH_CUSTODY_LOCK_NAME = "custody.lock";
 const CUSTODY_LOCK_TIMEOUT_MS = 10_000;
-// Same conservative 30s staleness bound as mesh/exclusive locks; age alone NEVER proves death.
+// Same conservative 30s staleness bound used for dead-owner checks; it is not used to reclaim
+// ownerless directories because no observation can prove an uninterrupted ownerless interval.
 export const CUSTODY_LOCK_STALE_MS = 30_000;
 
 /** Not a contention timeout: callers must surface this refusal, not silently retry/skip it. */
@@ -57,6 +58,41 @@ export interface MeshCustodyStore {
 
 const errorCode = (error: unknown): string | undefined =>
   error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : undefined;
+
+const CUSTODY_RELEASE_GUARD_PREFIX = `.${MESH_CUSTODY_LOCK_NAME}.releasing.`;
+const custodyAlarmedLocks = new Set<string>();
+
+/** A sibling receipt lets the operator distinguish a crashed release from a live holder paused after owner unlink. */
+const createCustodyReleaseGuard = (lock: string, record: string, token: string): { file: string; directory: fs.Stats } | undefined => {
+  let fd: number | undefined;
+  const file = path.join(path.dirname(lock), `${CUSTODY_RELEASE_GUARD_PREFIX}${token}`);
+  try {
+    const directory = fs.lstatSync(lock);
+    if (!directory.isDirectory() || fs.readFileSync(path.join(lock, "owner"), "utf8") !== record) return undefined;
+    let namespace: string | null = null;
+    if (process.platform === "linux") {
+      namespace = fs.readlinkSync("/proc/self/ns/pid");
+      if (!/^pid:\[\d+\]$/.test(namespace)) return undefined;
+    }
+    const receipt = `${JSON.stringify({ format: 1, pid: process.pid, namespace, dev: String(directory.dev), ino: String(directory.ino), token })}\n`;
+    fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1) throw new Error("release receipt is not a private regular file");
+    fs.fchmodSync(fd, 0o600);
+    fs.writeSync(fd, receipt);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = undefined;
+    return { file, directory };
+  } catch {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* best effort */ } }
+    try { fs.unlinkSync(file); } catch { /* no partial receipt is trusted */ }
+    return undefined;
+  }
+};
+
+const removeCustodyReleaseGuard = (guard: { file: string }): void => {
+  try { fs.unlinkSync(guard.file); } catch { /* a stale receipt is harmless; owner-bearing locks still refuse */ }
+};
 
 const processAlive = (pid: number): boolean => {
   try { process.kill(pid, 0); return true; }
@@ -146,7 +182,12 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
       if (await clearDeadCustodyLock(lock, readOwner, deadline, started, options.hostQualified, blocked, options.lockProtocol ?? 1)) continue;
     } catch (error) {
       if (error instanceof MeshCustodyUnrecoverableError) {
-        try { diagnostics.warn("src/mesh/custody-lock.ts", `[pi-fabric] ALARM ${error.kind}: ${error.message}`); } catch { /* alarm never masks refusal */ }
+        if (!custodyAlarmedLocks.has(error.lock)) {
+          custodyAlarmedLocks.add(error.lock);
+          const recovery = renderRecoveryCommand(["fabric-mesh-backend", "lock-recover", "--root", path.dirname(error.lock), "--lock", "custody", "--ownerless"]);
+          const alarm = `[pi-fabric] ALARM ${error.kind}: ${error.message} (code ${error.code}); recover a confirmed dead release with: ${recovery}\n`;
+          try { diagnostics.warn("src/mesh/custody-lock.ts", alarm.trimEnd()); } catch { /* alarm never masks refusal */ }
+        }
       }
       throw error;
     }
@@ -195,13 +236,29 @@ export const acquireMeshCustodyLock = async (root: string, timeoutMs = CUSTODY_L
     if (ours) releaseByName();
     throw new MeshLockTimeoutError(` (custody lock ${lock} could not be pinned or was reclaimed before entry)`, attempts, maxGapMs);
   }
-  // The pinned release closes its fd, so it runs once; main's release may be called again after a failure.
+  // A sibling receipt is written before unlinking owner. If a process dies or pauses in the unlink/rmdir seam,
+  // ownerless recovery can prove whether that exact releaser is still alive in this PID namespace.
   let done = false;
   return () => {
     if (pin !== undefined) {
       if (done) return;
+      const guard = createCustodyReleaseGuard(lock, record, pathToken);
+      if (!guard) return; // Fail closed: leave our owner receipt in place if release cannot be witnessed.
       done = true;
-      releaseFenceLock(lock, record, {}, pin);
+      let result: ReturnType<typeof releaseFenceLock> | undefined;
+      try { result = releaseFenceLock(lock, record, {}, pin); }
+      catch { /* a release callback must never leak an unhandled filesystem error */ }
+      let removeGuard = result?.released === true;
+      try {
+        const current = fs.lstatSync(lock, { throwIfNoEntry: false });
+        if (!current?.isDirectory() || current.dev !== guard.directory.dev || current.ino !== guard.directory.ino) removeGuard = true;
+        else {
+          const owner = readOwner();
+          const entries = fs.readdirSync(lock);
+          removeGuard = owner !== undefined || entries.length !== 0;
+        }
+      } catch { /* an ambiguous observation keeps the liveness receipt */ }
+      if (removeGuard) removeCustodyReleaseGuard(guard);
       return;
     }
     releaseByName();
@@ -219,7 +276,15 @@ const clearDeadCustodyLock = async (lock: string, readOwner: () => string | unde
     const stat = fs.lstatSync(lock);
     if (!stat.isDirectory()) return false;
     const owner = readOwner();
-    const fields = owner?.split("\n") ?? [];
+    if (owner === undefined) {
+      // Fail closed. The owner may have been created and removed between reads (or by an older
+      // release), so neither inode metadata nor an observation timer proves a continuous ownerless
+      // generation. Confirm the same still-ownerless directory before surfacing operator recovery.
+      const current = fs.lstatSync(lock);
+      if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino || readOwner() !== undefined) return false;
+      throw new MeshCustodyUnrecoverableError(lock);
+    }
+    const fields = owner.split("\n");
     const [token, pidText, createdText, recordedStart] = fields;
     const pid = Number(pidText);
     if (hostQualified && (!pidText?.trim() || !Number.isSafeInteger(pid) || pid <= 0)) {

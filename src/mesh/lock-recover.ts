@@ -26,6 +26,8 @@ export class MeshLockRecoverRefusedError extends Error {
   }
 }
 
+export const OWNERLESS_CUSTODY_RECOVERY_GRACE_MS = 2_000;
+
 export interface MeshLockRecoverOptions {
   lock: "mesh" | "custody";
   /** The holder's token (the owner record's first line): recovery never acts on any other holder. */
@@ -111,6 +113,12 @@ export interface LockRecoverAudit {
   verdict: PidNamespaceVerdict; operator: { uid: number | null; user: string; pid: number; ppid: number; parentExecutable: string; host: string };
 }
 
+export interface OwnerlessCustodyRecoveryResult {
+  recovered: true; mode: "ownerless"; lock: string; graceMs: number; holderPid: number;
+  audit: { at: string; root: string; lock: string; mode: "ownerless"; releasePid: number; releaseNamespace: string; releaseToken: string;
+    operator: ReturnType<typeof operator> };
+}
+
 /**
  * The parent process's EXECUTABLE path: who ran the recovery (Linux /proc/<ppid>/exe; elsewhere unknown, never
  * guessed). Never its command line: arguments can carry secrets (pi-fabric#923 round 4).
@@ -128,6 +136,107 @@ const operator = (): LockRecoverAudit["operator"] => {
 
 const alive = (pid: number): boolean => {
   try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+};
+
+interface CustodyReleaseReceipt { format: 1; pid: number; namespace: string; dev: string; ino: string; token: string }
+interface OwnerlessObservation { stat: fs.Stats; receipt: CustodyReleaseReceipt; guardFile: string; guardBytes: string; guardStat: fs.Stats }
+const OWNERLESS_GUARD_PREFIX = ".custody.lock.releasing.";
+const wait = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+const sameStat = (left: fs.Stats, right: fs.Stats): boolean => left.dev === right.dev && left.ino === right.ino &&
+  left.ctimeMs === right.ctimeMs && left.mtimeMs === right.mtimeMs;
+const ownerlessRefused = (message: string): never => { throw new MeshLockRecoverRefusedError(message); };
+const ownPidNamespaceReceipt = (): string => {
+  if (process.platform !== "linux") return ownerlessRefused("ownerless custody recovery requires a verifiable Linux PID namespace");
+  let namespace: string;
+  try { namespace = fs.readlinkSync("/proc/self/ns/pid"); }
+  catch { return ownerlessRefused("the operator PID namespace cannot be verified; nothing was recovered"); }
+  if (!/^pid:\[\d+\]$/.test(namespace)) return ownerlessRefused("the operator PID namespace is malformed; nothing was recovered");
+  return namespace;
+};
+const inspectOwnerless = (root: string, lock: string, expected?: OwnerlessObservation): OwnerlessObservation => {
+  const stat = fs.lstatSync(lock, { throwIfNoEntry: false });
+  if (!stat?.isDirectory()) return ownerlessRefused(`${lock} is not an ownerless custody directory`);
+  if (expected && !sameStat(stat, expected.stat)) return ownerlessRefused(`${lock} changed during the ownerless recovery grace; nothing was recovered`);
+  let names: string[];
+  try { names = fs.readdirSync(lock); }
+  catch { return ownerlessRefused(`${lock} could not be read; nothing was recovered`); }
+  let ownerExists = false;
+  try { fs.lstatSync(path.join(lock, "owner")); ownerExists = true; } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return ownerlessRefused(`${lock}/owner could not be checked; nothing was recovered`);
+  }
+  if (ownerExists || names.length !== 0) return ownerlessRefused(`${lock} is not still empty and ownerless; nothing was recovered`);
+
+  const matches = fs.readdirSync(root).filter(name => name.startsWith(OWNERLESS_GUARD_PREFIX));
+  const valid: OwnerlessObservation[] = [];
+  for (const name of matches) {
+    const guardFile = path.join(root, name);
+    let guardStat: fs.Stats;
+    let guardBytes: string;
+    try {
+      guardStat = fs.lstatSync(guardFile);
+      if (!guardStat.isFile() || guardStat.nlink !== 1 || (guardStat.mode & 0o777) !== 0o600 ||
+        (typeof process.getuid === "function" && guardStat.uid !== process.getuid()) || guardStat.size > 4096) {
+        return ownerlessRefused(`${guardFile} is not a safe release receipt; nothing was recovered`);
+      }
+      guardBytes = fs.readFileSync(guardFile, "utf8");
+    } catch { return ownerlessRefused(`${guardFile} could not be safely read; nothing was recovered`); }
+    let receipt: CustodyReleaseReceipt;
+    try { receipt = JSON.parse(guardBytes) as CustodyReleaseReceipt; }
+    catch { return ownerlessRefused(`${guardFile} is malformed; nothing was recovered`); }
+    const token = name.slice(OWNERLESS_GUARD_PREFIX.length);
+    if (!receipt || receipt.format !== 1 || !Number.isSafeInteger(receipt.pid) || receipt.pid <= 0 ||
+      typeof receipt.namespace !== "string" || !/^pid:\[\d+\]$/.test(receipt.namespace) ||
+      typeof receipt.dev !== "string" || typeof receipt.ino !== "string" || receipt.token !== token || !/^[0-9a-f]{8}$/.test(token)) {
+      return ownerlessRefused(`${guardFile} has an invalid release receipt; nothing was recovered`);
+    }
+    if (receipt.dev === String(stat.dev) && receipt.ino === String(stat.ino)) {
+      valid.push({ stat, receipt, guardFile, guardBytes, guardStat });
+    }
+  }
+  if (valid.length !== 1) return ownerlessRefused(`${lock} has no unique matching release receipt; its holder cannot be proven dead`);
+  const observation = valid[0]!;
+  if (expected && (observation.guardFile !== expected.guardFile || observation.guardBytes !== expected.guardBytes ||
+    observation.guardStat.dev !== expected.guardStat.dev || observation.guardStat.ino !== expected.guardStat.ino ||
+    observation.guardStat.ctimeMs !== expected.guardStat.ctimeMs || observation.guardStat.mtimeMs !== expected.guardStat.mtimeMs)) {
+    return ownerlessRefused(`${lock} release receipt changed during the grace; nothing was recovered`);
+  }
+  return observation;
+};
+const refuseIfReleaseHolderLive = (receipt: CustodyReleaseReceipt): void => {
+  const namespace = ownPidNamespaceReceipt();
+  if (receipt.namespace !== namespace) ownerlessRefused("the release holder is in another or unproven PID namespace; run recovery there");
+  if (alive(receipt.pid)) ownerlessRefused(`release holder pid ${receipt.pid} is still live; nothing was recovered`);
+};
+
+/** Recover only a dead release witnessed by our sibling receipt; unknown ownerless directories remain fail-closed. */
+export const recoverOwnerlessCustodyLock = async (root: string): Promise<OwnerlessCustodyRecoveryResult> => {
+  const lock = path.join(root, MESH_CUSTODY_LOCK_NAME);
+  const ownNamespace = ownPidNamespaceReceipt();
+  const first = inspectOwnerless(root, lock);
+  if (first.receipt.namespace !== ownNamespace) ownerlessRefused("the release holder is in another or unproven PID namespace; run recovery there");
+  refuseIfReleaseHolderLive(first.receipt);
+  await wait(OWNERLESS_CUSTODY_RECOVERY_GRACE_MS);
+  const afterGrace = inspectOwnerless(root, lock, first);
+  refuseIfReleaseHolderLive(afterGrace.receipt);
+
+  const audit = { at: new Date().toISOString(), root, lock, mode: "ownerless" as const, releasePid: afterGrace.receipt.pid,
+    releaseNamespace: afterGrace.receipt.namespace, releaseToken: afterGrace.receipt.token, operator: operator() };
+  appendAudit(path.join(root, "lock-recoveries.jsonl"), `${JSON.stringify(audit)}\n`, AUDIT_MAX_BYTES);
+  // Revalidate after the audit I/O. Atomic rmdir is deliberate: unlike rename-by-name, it fails if a new holder's
+  // complete owner receipt replaced this directory after our last identity check.
+  const final = inspectOwnerless(root, lock, first);
+  refuseIfReleaseHolderLive(final.receipt);
+  try { fs.rmdirSync(lock); }
+  catch (error) {
+    throw new MeshLockRecoverRefusedError(`${lock} could not be atomically removed (${(error as NodeJS.ErrnoException).code ?? "filesystem error"}); nothing else was removed`);
+  }
+  try {
+    const current = fs.lstatSync(final.guardFile);
+    if (current.isFile() && current.dev === final.guardStat.dev && current.ino === final.guardStat.ino &&
+      fs.readFileSync(final.guardFile, "utf8") === final.guardBytes) fs.unlinkSync(final.guardFile);
+  } catch { /* recovery already succeeded; an orphan receipt is safe and retained for audit */ }
+  return { recovered: true, mode: "ownerless", lock, graceMs: OWNERLESS_CUSTODY_RECOVERY_GRACE_MS,
+    holderPid: final.receipt.pid, audit };
 };
 
 /** The holder's namespace line, or null for a legacy record; undefined when the record is not a lock record. */

@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { censusSync as writerCensusSync, type CensusWriter } from "./writer-census.js";
-import { MeshLockRecoverRefusedError, recoverMeshLock } from "./lock-recover.js";
+import { MeshLockRecoverRefusedError, recoverMeshLock, recoverOwnerlessCustodyLock } from "./lock-recover.js";
 import { abortMeshRollback, cutoverMeshState, describeCensusAdvisory, importMeshState, meshBackendStatus, MeshBackendFenceError,
   MeshBackendRefusedError, rollbackMeshState, type MeshBackendAlarm, type MeshBackendOptions, type MeshBackendStatus,
   type MeshCensusAdvisory, type MeshCensusWriter, type MeshWriterCensus } from "./backend-migration.js";
@@ -23,6 +23,7 @@ const USAGE = `Usage: fabric-mesh-backend <census|import|status|cutover|rollback
        fabric-mesh-backend reader-proof --root DIR --backend file|sqlite [--name fabric...] [--reader-version V] [--json]
        fabric-mesh-backend reader-proof --root DIR --name NAME --proof-file FILE [--json]
        fabric-mesh-backend lock-recover --root DIR --lock mesh|custody --holder TOKEN [--unsafe-holder-stopped] [--json]
+       fabric-mesh-backend lock-recover --root DIR --lock custody --ownerless [--json]
 
   census          the ADVISORY writer census (writer-census.ts): the processes it attributed (mode,
                   release) and the evidence it could not. Informational; always exit 0 when it ran.
@@ -45,6 +46,9 @@ const USAGE = `Usage: fabric-mesh-backend <census|import|status|cutover|rollback
                   earlier-boot inference. Run it inside the holder's namespace when you can.
                   --unsafe-holder-stopped recovers on YOUR word that the holder is stopped; if it still runs, its
                   release can remove its successor's lock and two writers can run.
+                  --ownerless is custody-only: waits two seconds, verifies the same empty directory and its release
+                  receipt, and removes it only after that receipt's PID is dead in this PID namespace. Unknown,
+                  unreceipted, live, or foreign-namespace ownerless directories are refused; no automatic reclaim.
 
 Readiness gate (smarty-dev#7815, docs/mesh-backend.md): import and cutover refuse (exit 3) unless
 every REQUIRED reader holds a valid proof of sqlite for this switch, made within 24 h by its installed
@@ -105,7 +109,7 @@ interface Options {
   acceptUnready: string[]; requireReaders: InstalledReader[]; name?: string; backend?: ReaderBackend; readerVersion?: string; proofFile?: string;
   /** smarty-dev#9404: import a fresh scratch copy of this state.json, gate skipped; `root` is then unset until made. */
   scratchProofFrom?: string; scratchParent?: string;
-  lock?: "mesh" | "custody"; holder?: string; unsafeHolderStopped?: boolean;
+  lock?: "mesh" | "custody"; holder?: string; unsafeHolderStopped?: boolean; ownerless?: boolean;
 }
 
 class UsageError extends Error {}
@@ -128,11 +132,13 @@ const parseArgs = (argv: string[]): Options | "help" => {
   let lock: "mesh" | "custody" | undefined;
   let holder: string | undefined;
   let unsafeHolderStopped = false;
+  let ownerless = false;
   const requireReaders: InstalledReader[] = [];
   for (let index = 0; index < rest.length; index++) {
     const flag = rest[index]!;
     if (flag === "--json") { json = true; continue; }
     if (flag === "--unsafe-holder-stopped") { unsafeHolderStopped = true; continue; }
+    if (flag === "--ownerless") { ownerless = true; continue; }
     const value = rest[++index];
     if (value === undefined || value.startsWith("--")) throw new UsageError(`Missing value for ${flag}`);
     if (flag === "--root" || flag === "--mesh") root = value;
@@ -171,7 +177,7 @@ const parseArgs = (argv: string[]): Options | "help" => {
     }
     else throw new UsageError(`Bad argument: ${flag}`);
   }
-  if (command !== "lock-recover" && (lock || holder || unsafeHolderStopped)) throw new UsageError("--lock, --holder and --unsafe-holder-stopped are for lock-recover");
+  if (command !== "lock-recover" && (lock || holder || unsafeHolderStopped || ownerless)) throw new UsageError("--lock, --holder, --unsafe-holder-stopped and --ownerless are for lock-recover");
   if (scratchProofFrom !== undefined || scratchParent !== undefined) {
     if (command !== "import" || scratchProofFrom === undefined || root !== undefined || acceptUnready.length > 0 || requireReaders.length > 0) {
       throw new UsageError("--scratch-proof-from STATE_JSON [--scratch-parent DIR] is for import only, without --root, --accept-unready or --require-reader");
@@ -184,12 +190,16 @@ const parseArgs = (argv: string[]): Options | "help" => {
   if (command === "reader-proof" && (proofFile ? !name || backend : !backend)) {
     throw new UsageError("reader-proof needs --backend file|sqlite, or --name NAME --proof-file FILE");
   }
-  if (command === "lock-recover" && (!lock || !holder)) throw new UsageError("lock-recover needs --lock mesh|custody and --holder TOKEN");
+  if (command === "lock-recover" && (!lock || (ownerless ? lock !== "custody" || holder !== undefined || unsafeHolderStopped : !holder))) {
+    throw new UsageError(ownerless ? "--ownerless needs --lock custody and cannot be combined with --holder or --unsafe-holder-stopped"
+      : "lock-recover needs --lock mesh|custody and --holder TOKEN");
+  }
   return { command: command as Command, root: path.resolve(root), json, lockProtocol, acceptUnready, requireReaders,
     ...(proofFile === undefined ? {} : { proofFile }),
     ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }), ...(name === undefined ? {} : { name }),
     ...(backend === undefined ? {} : { backend }), ...(readerVersion === undefined ? {} : { readerVersion }),
-    ...(lock === undefined ? {} : { lock }), ...(holder === undefined ? {} : { holder }), ...(unsafeHolderStopped ? { unsafeHolderStopped } : {}) };
+    ...(lock === undefined ? {} : { lock }), ...(holder === undefined ? {} : { holder }), ...(unsafeHolderStopped ? { unsafeHolderStopped } : {}),
+    ...(ownerless ? { ownerless } : {}) };
 };
 
 const formatStatus = (status: MeshBackendStatus): string => {
@@ -583,12 +593,15 @@ export const main = async (argv: string[], io: {
     if (options.command === "lock-recover") {
       // Not under the migration fence: it recovers one of the fence's own locks. Never runs the census either.
       try {
-        const recovered = await recoverMeshLock(options.root, { lock: options.lock!, holder: options.holder!,
-          ...(options.unsafeHolderStopped ? { unsafeHolderStopped: true } : {}) });
+        const recovered = options.ownerless
+          ? await recoverOwnerlessCustodyLock(options.root)
+          : await recoverMeshLock(options.root, { lock: options.lock!, holder: options.holder!,
+            ...(options.unsafeHolderStopped ? { unsafeHolderStopped: true } : {}) });
         // pi-fabric#923: every recovery prints its audit line (who, from where); the unsafe one is an ALARM.
-        warn(`fabric-mesh-backend: ${recovered.warning ? `ALARM ${recovered.warning}` : `recovered ${recovered.lock}`}; audit ${JSON.stringify(recovered.audit)}\n`);
+        warn(`fabric-mesh-backend: ${"warning" in recovered && recovered.warning ? `ALARM ${recovered.warning}` : `recovered ${recovered.lock}`}; audit ${JSON.stringify(recovered.audit)}\n`);
         write(`${options.json ? JSON.stringify({ command: "lock-recover", ok: true, ...recovered }, null, 2)
-          : `lock-recover done (${recovered.mode}): ${recovered.lock} -> ${recovered.fence}`}\n`);
+          : recovered.mode === "ownerless" ? `lock-recover done (ownerless): ${recovered.lock} removed after ${recovered.graceMs} ms grace`
+            : `lock-recover done (${recovered.mode}): ${recovered.lock} -> ${recovered.fence}`}\n`);
         return 0;
       } catch (error) {
         if (!(error instanceof MeshLockRecoverRefusedError)) throw error;

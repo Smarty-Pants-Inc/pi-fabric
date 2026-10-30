@@ -91,11 +91,16 @@ export class FakePort implements BridgeNatsPort {
   #sequence = 0;
   #stream = 0;
   readonly #queue: FakeDelivery[] = [];
+  readonly #presenceWatchers = new Set<() => void>();
   #wake: (() => void) | undefined;
   closed = false;
 
   async presence(): Promise<BridgePresence> { return this.natsPresence; }
-  watchPresence(_changed: () => void, _failed: (error: Error) => void): () => void { return () => undefined; }
+  watchPresence(changed: () => void, _failed: (error: Error) => void): () => void {
+    this.#presenceWatchers.add(changed);
+    return () => { this.#presenceWatchers.delete(changed); };
+  }
+  notifyPresenceChange(): void { for (const changed of this.#presenceWatchers) changed(); }
   resolve(id: string): BridgeNatsPortResolved | undefined { return this.routes.get(id); }
   /** KV records as L1 lists them: one per resolved route, machine from the (fake) KV key. */
   presenceView(): BridgeNatsPresenceView {

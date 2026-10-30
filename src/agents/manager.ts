@@ -6860,6 +6860,16 @@ export class AgentManager {
       // need its identity, not a second full answer while custody is pending.
       receipt.text = "";
       const schemaIndex = managed.launch.workerArguments.indexOf("--schema-file");
+      // Only the immutable receipt supplies final prose, never an older worker
+      // text snapshot. Blank text requires a deliberate tool reply, which still
+      // must pass schema validation below; preserve existing worker failures.
+      if (record.status === "completed" && !record.text.trim() &&
+          !(schemaIndex >= 0 && managed.launch.workerArguments.includes("--reply-tool") &&
+            record.replyVia === "tool" && record.value !== undefined)) {
+        record.status = "failed";
+        record.errorCode = "NO_FINAL_TEXT";
+        record.error = "Agent ended without final answer text. Request an explicit final answer; for structured output, require a schema-validated fabric_reply tool result.";
+      }
       if (schemaIndex >= 0 && record.status === "completed") {
         if (managed.launch.workerArguments.includes("--reply-tool") &&
             (record.replyVia !== "tool" || record.value === undefined)) {

@@ -317,6 +317,13 @@ export interface AgentRunRecord {
   toolCalls: number;
   /** Durable ordinary-task answer boundary; native execution custody is separate. */
   finalAnswerReceipt?: { id: string; recordedAt: number };
+  /** Content-free evidence for the latest assistant; absent stop means unknown/in flight. */
+  lastAssistantStopReason?: string | undefined;
+  lastAssistantBlockCounts?: Record<string, number>;
+  /** UTF-8 bytes in joined text blocks, never thinking or tool arguments. */
+  lastAssistantTextBytes?: number;
+  /** Explicit native settlement outcome; undefined for legacy omitted outcomes. */
+  settleOutcome?: string | undefined;
   /** Assistant output; a non-completed run may contain partial, non-authoritative prose. */
   text: string;
   /** Last nonempty, fully streamed Pi assistant message, including tool-turn prose. */
@@ -329,7 +336,7 @@ export interface AgentRunRecord {
   error?: string;
   /** Machine-readable terminal cause; failure publication is not an exit receipt.
    * CONTEXT_OVERFLOW is set only from a structured overflow signal, never free error text. */
-  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED" | "CONTEXT_OVERFLOW" | "CUSTODY_UNCONFIRMED";
+  errorCode?: "RUNAWAY_TOOL_CALL_STREAM" | "PROCESS_LIVENESS_WATCH_FAILED" | "PROCESS_TREE_CUSTODY_UNCONFIRMED" | "CONTEXT_OVERFLOW" | "CUSTODY_UNCONFIRMED" | "NO_FINAL_TEXT" | "NON_FINAL_STOP_REASON" | "UNRESOLVED_TOOL_CALLS";
   executionCustody?: { state: "unconfirmed"; descendantsMayRemain: number; reason: string };
   /** Run diagnostics, including partial-report retention; warnings never override status. */
   warnings?: string[];

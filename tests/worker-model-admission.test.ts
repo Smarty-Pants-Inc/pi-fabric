@@ -37,15 +37,35 @@ describe.skipIf(!fs.existsSync(workerPath))("real worker model admission", () =>
     const logFile = path.join(directory, "runs", result.id, "events.jsonl");
     const events = fs.readFileSync(logFile, "utf8").trim().split("\n").map(line => JSON.parse(line));
     const frames = events.filter(event => event.type === "fake_received").map(event => event.frame);
-    return { manager, result, frames };
+    return { manager, result, frames, events };
   };
 
   it("overrides startup MRU and remembered reasoning before sending any task", async () => {
-    const { result, frames, manager } = await run("success");
+    const { result, frames, manager, events } = await run("success");
     expect(result).toMatchObject({ status: "completed", model: requested, requestedModel: requested, thinking: "high" });
     expect(frames.map(frame => frame.type)).toEqual(["get_state", "set_model", "set_thinking_level", "get_state", "prompt"]);
     expect(frames[1]).toMatchObject({ provider: "openai-codex", modelId: "gpt-5.6-sol" });
     expect(manager.listForUi()[0]).toMatchObject({ model: requested, thinking: "high" });
+
+    const agentStarts = events.filter(event => event.type === "agent_start");
+    const assistantAnswers = events.filter(event => event.type === "message_end" && event.message?.role === "assistant");
+    expect(agentStarts).toHaveLength(1);
+    expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
+    expect(events.filter(event => event.type === "agent_settled")).toHaveLength(1);
+    expect(assistantAnswers).toEqual([
+      expect.objectContaining({
+        type: "message_end",
+        message: expect.objectContaining({
+          role: "assistant",
+          provider: "openai-codex",
+          model: "gpt-5.6-sol",
+          content: [{ type: "text", text: "correct model ran" }],
+          stopReason: "stop",
+          usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0 },
+        }),
+      }),
+    ]);
+    expect(events.indexOf(agentStarts[0]!)).toBeLessThan(events.indexOf(assistantAnswers[0]!));
   });
 
   it.each(["reject", "reswitch", "malformed", "exit", "timeout", "startup-timeout"])("never sends work when admission fails: %s", async scenario => {
@@ -62,10 +82,19 @@ describe.skipIf(!fs.existsSync(workerPath))("real worker model admission", () =>
   }, 40_000);
 
   it("reports actual model drift through the result and UI, without erasing the failure", async () => {
-    const { result, manager } = await run("drift");
+    const { result, manager, events } = await run("drift");
     expect(result).toMatchObject({ status: "failed", model: "runinfra/glm-5-3-flash", requestedModel: requested });
     expect(result.error).toContain("terminating child");
     expect(manager.listForUi()[0]).toMatchObject({ status: "failed", model: "runinfra/glm-5-3-flash" });
+
+    const agentStartIndices = events.flatMap((event, index) => event.type === "agent_start" ? [index] : []);
+    const assistantMessageEndIndex = events.findIndex(event =>
+      event.type === "message_end" && event.message?.role === "assistant",
+    );
+    expect(agentStartIndices).toHaveLength(2);
+    expect(assistantMessageEndIndex).toBeGreaterThanOrEqual(0);
+    expect(agentStartIndices[0]!).toBeLessThan(assistantMessageEndIndex);
+    expect(agentStartIndices[1]!).toBeGreaterThan(assistantMessageEndIndex);
   });
 
   it("supports an exact bare model ID without using the startup default", async () => {

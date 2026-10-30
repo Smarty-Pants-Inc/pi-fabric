@@ -1601,6 +1601,76 @@ describe("resident host ownership", () => {
     } finally { await recovering.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 
+  it.skipIf(process.platform !== "linux").each(["dead", "reused-pid"] as const)(
+    "L8 restore re-establishes the copied fence after a %s owner without replacing the actor", async incarnation => {
+      const { root, config, host } = fixture();
+      let recovering: ResidentHost | undefined;
+      try {
+        await host.start();
+        const actor = await host.actors.create({ name: "original-before-restore", instructions: "Keep my identity", residency: "durable" });
+        const owner = JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "owner.json"), "utf8"));
+        const checkpoint = path.join(root, "checkpoint");
+        fs.cpSync(config.residencyRoot, checkpoint, { recursive: true });
+        await host.close();
+        fs.rmSync(config.residencyRoot, { recursive: true });
+        fs.cpSync(checkpoint, config.residencyRoot, { recursive: true });
+        const stale = { ...owner, pid: incarnation === "dead" ? 2147483647 : process.pid,
+          processStartTime: incarnation === "dead" ? "1" : String(BigInt(processStartTime(process.pid)!) + 1n) };
+        for (const name of ["owner.json", "host.lock"]) fs.writeFileSync(path.join(config.residencyRoot, name), JSON.stringify(stale));
+        const lock = path.join(config.residencyRoot, "host.lock");
+        const copied = fs.statSync(lock);
+        const oldFence = JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "host-fence.json"), "utf8"));
+        expect(`${copied.dev}:${copied.ino}`).not.toBe(`${oldFence.dev}:${oldFence.ino}`);
+        recovering = new ResidentHost(config);
+        await recovering.start();
+        expect(recovering.actors.listOwned().map(row => row.id)).toEqual([actor.id]);
+        expect(recovering.actors.status(actor.id).sessionFile).toBe(actor.sessionFile);
+        expect(fs.statSync(lock).ino).toBe(copied.ino);
+        expect(JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "host-fence.json"), "utf8")))
+          .toMatchObject({ format: 1, dev: String(copied.dev), ino: String(copied.ino) });
+      } finally { await host.close(); await recovering?.close(); fs.rmSync(root, { recursive: true, force: true }); }
+    },
+  );
+
+  it.skipIf(process.platform !== "linux").each(["live", "unknown-birth", "missing-birth", "different-tokens"] as const)(
+    "L8 copied fence preserves %s ownership evidence without overwriting it", async evidence => {
+      const { root, config, host } = fixture();
+      let recovering: ResidentHost | undefined;
+      let unreadable: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        await host.start();
+        const owner = JSON.parse(fs.readFileSync(path.join(config.residencyRoot, "owner.json"), "utf8"));
+        const checkpoint = path.join(root, "checkpoint");
+        fs.cpSync(config.residencyRoot, checkpoint, { recursive: true });
+        await host.close();
+        fs.rmSync(config.residencyRoot, { recursive: true });
+        fs.cpSync(checkpoint, config.residencyRoot, { recursive: true });
+        for (const name of ["owner.json", "host.lock"]) {
+          const record = { ...owner, pid: process.pid, processStartTime: processStartTime(process.pid) };
+          if (evidence === "missing-birth") delete record.processStartTime;
+          if (evidence === "different-tokens") {
+            record.processStartTime = "0";
+            record.token = name;
+          }
+          fs.writeFileSync(path.join(config.residencyRoot, name), JSON.stringify(record));
+        }
+        const files = ["owner.json", "host.lock", "host-fence.json"];
+        const before = files.map(name => fs.readFileSync(path.join(config.residencyRoot, name), "utf8"));
+        if (evidence === "unknown-birth") {
+          const read = fs.readFileSync.bind(fs);
+          unreadable = vi.spyOn(fs, "readFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, options?: unknown) => {
+            if (String(file) === `/proc/${process.pid}/stat`) throw Object.assign(new Error("EIO"), { code: "EIO" });
+            return read(file, options as never);
+          }) as typeof fs.readFileSync);
+        }
+        recovering = new ResidentHost(config);
+        await expect(recovering.start()).rejects.toThrow(/legacy|uncertain|drain/);
+        expect(recovering.actors).toBeUndefined();
+        expect(files.map(name => fs.readFileSync(path.join(config.residencyRoot, name), "utf8"))).toEqual(before);
+      } finally { unreadable?.mockRestore(); await host.close(); await recovering?.close(); fs.rmSync(root, { recursive: true, force: true }); }
+    },
+  );
+
   it.skipIf(process.platform !== "linux")("R2 SIGKILL releases host ownership without replacing its lock file", async () => {
     const { root, config, host: successor } = fixture();
     const lock = path.join(config.residencyRoot, "host.lock");

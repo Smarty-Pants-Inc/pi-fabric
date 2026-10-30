@@ -82,6 +82,34 @@ This is alarm-only: actor ownership, queue bytes and ordinary owner-pinned outpu
 are unchanged. Dual org + chief-of-staff delivery, any-mesh-host detection,
 adoption and owner-incarnation/depth-growth dedupe remain outside this increment.
 
+## Restoring a checkpoint
+
+A file backup preserves actor definitions, queues and history, not live processes
+or kernel locks. On Linux, the original Main's normal startup reconciles its
+runtime generation even when the restored owner is dead. Main initialization
+awaits own-root durable-work recovery and usable ask/control publication in its
+own participant directory before the first ordinary `agents.ask`. Recovery and
+publication share the existing bounded host-start budget, including retries of
+a retained predecessor's NATS lease conflict. If startup or publication fails,
+Main logs the recovery diagnostic and still activates Fabric; only the unavailable
+actor remains unavailable. The resident recovery watchdog continues retrying in
+the background. The host loads the original registry;
+retained quiescing presence or the same resident host ID does not prove that a
+replacement incarnation has published. Empty/dormant roots stay lazy, intentional
+idle exits stay stopped, and genuine live owners are attached to normally. Recovery
+does not create replacement actors or treat a copied `owner.json` as evidence of
+a live host.
+
+Copying `host.lock` changes its device/inode identity. While holding both startup
+locks, recovery can rebind a valid prior `host-fence.json` to that copied inode
+only when the retained diagnostics agree on a token and every recorded PID/start
+incarnation is provably gone. A reused PID with a different start time is stale;
+a live or unreadable incarnation, missing birth evidence, conflicting tokens, or
+an unproven legacy fence is not permission to take ownership. A genuine live
+owner is attached to normally. No manual owner/lock deletion or actor recreation
+is part of this recovery path. Retained task bytes do not imply that a killed
+process continued executing.
+
 ## Dormant actors and delivery-owned wake (#6782 / #7299)
 
 A durable actor with no in-flight activation, queued/overflow/parked/dead-letter

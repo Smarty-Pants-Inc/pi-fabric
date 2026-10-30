@@ -241,6 +241,7 @@ export class ResidencyClient {
     }));
   #closed = false;
   #startingHost: Promise<ResidentHostOwner> | undefined;
+  #startingHostDeadline = Infinity;
   #startupLauncher: Awaited<ReturnType<typeof spawnDetached>> | undefined;
   #nextWatchdogAt = 0;
   #watchdogFailures = 0;
@@ -297,6 +298,62 @@ export class ResidencyClient {
     // Every runtime activation, including manual native /reload, reconciles
     // a live owner. This never starts an empty root or loads an optional engine.
     void this.reconcileRelease().catch((error) => this.#deferRelease(error));
+  }
+
+  /** Call immediately after start(), before exposing ordinary actor asks. */
+  async waitForStartupRecovery(): Promise<void> {
+    const { config, mainAgent, participants } = this.options;
+    if (this.#closed) throw new Error("Fabric residency client is closed");
+    if (!mainAgent.local || mainAgent.id !== config.rootId || !kernelFenceAvailable()) return;
+    const self = participants.self();
+    if (self.kind !== "root" || self.id !== config.rootId || self.sessionId !== config.sessionId) return;
+    const existing = this.#liveOwner();
+    // Preserve the watchdog's intentional-stop and launcher-custody exclusions.
+    if (!existing && (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(config.residencyRoot))) ||
+        readResidentIdleExit(config.residencyRoot, config.rootId))) return;
+    const actorIds = new Set<string>();
+    if (!this.#durableWork(actorIds)) return; // Empty/dormant roots stay lazy.
+    // The deterministic hostId survives replacement. Capture even stale rows:
+    // neither their presence nor their old ask capability proves new publication.
+    const predecessors = config.mesh.transport === "nats" && actorIds.size
+      ? new Map(participants.list({ scope: "lineage", kinds: ["actor"], includeStale: true, fresh: true })
+        .filter(actor => actorIds.has(actor.id) && actor.rootId === config.rootId && actor.ownerHostId === this.hostId)
+        .map(actor => [actor.id, actor.ownerIncarnation]))
+      : undefined;
+    const deadline = Date.now() + startupBudgetMs(this.options.startupTimeoutMs ?? HOST_READY_TIMEOUT_MS);
+    let owner: ResidentHostOwner;
+    while (true) {
+      try {
+        owner = await this.ensureHost(deadline); // Joins the watchdog's exact attempt.
+        break;
+      } catch (error) {
+        // A dead predecessor's broker lease can outlive its process for one TTL.
+        // Each failed attempt is already stopped by ensureHost; retry only this
+        // pre-readiness conflict, under the SAME startup/publication deadline.
+        if (config.mesh.transport !== "nats" || !(error instanceof Error) ||
+            !error.message.startsWith(`Fabric resident host failed to start: Fabric transport host ${this.hostId}: lease `) ||
+            !error.message.endsWith(" lost (conflict)") || this.#closed ||
+            Date.now() + WATCHDOG_INTERVAL_MS >= deadline) throw error;
+        await delay(WATCHDOG_INTERVAL_MS);
+        if (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(config.residencyRoot))) ||
+            readResidentIdleExit(config.residencyRoot, config.rootId)) throw error;
+      }
+    }
+    while (true) {
+      if (this.#closed) throw new Error("Fabric residency client is closed");
+      if (this.#readyOwner()?.token !== owner.token) throw new Error("Fabric resident owner changed during startup recovery publication");
+      const pending = [...actorIds].filter(id => {
+        const actor = participants.get(id, undefined, { fresh: true });
+        return !(actor?.kind === "actor" && actor.rootId === config.rootId &&
+          actor.ownerHostId === this.hostId && actor.ownerIdentityId === this.hostId &&
+          actor.residency === "durable" && !actor.stale && actor.controlProtocol === "v1" &&
+          actor.capabilities.includes("ask") && (!predecessors ||
+            !!actor.ownerIncarnation && (owner.token === existing?.token || actor.ownerIncarnation !== predecessors.get(id))));
+      });
+      if (!pending.length) return;
+      if (Date.now() >= deadline) throw new Error(`Timed out publishing ask-capable durable Fabric actors from ${this.hostId}: ${pending.join(", ")}`);
+      await delay(STATUS_POLL_MS);
+    }
   }
 
   async close(): Promise<void> {
@@ -368,13 +425,19 @@ export class ResidencyClient {
     }
   }
 
-  async ensureHost(): Promise<ResidentHostOwner> {
-    if (this.#startingHost) return this.#startingHost;
+  /** An absolute caller deadline may shorten, never extend, the shared attempt. */
+  async ensureHost(startupDeadline = Infinity): Promise<ResidentHostOwner> {
+    if (this.#startingHost) {
+      this.#startingHostDeadline = Math.min(this.#startingHostDeadline, startupDeadline);
+      return this.#startingHost;
+    }
+    this.#startingHostDeadline = startupDeadline;
     const starting = this.#startHost();
     this.#startingHost = starting;
     try { return await starting; }
     finally {
       this.#startingHost = undefined;
+      this.#startingHostDeadline = Infinity;
       // Startup settlement is an owner event: reclassify (own child / adopted / backoff).
       this.#armWatches();
       this.#wakeWatchdog();
@@ -401,7 +464,7 @@ export class ResidencyClient {
     const releaseDeadline = Date.now() + HANDOVER_WAIT_MS;
     while (handoverActive(readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot)))) {
       const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
-      if (this.#closed || state?.phase === "blocked" || Date.now() >= releaseDeadline) {
+      if (this.#closed || state?.phase === "blocked" || Date.now() >= Math.min(releaseDeadline, this.#startingHostDeadline)) {
         throw new Error("Resident release transaction is in launcher custody; do not start a duplicate");
       }
       await delay(STATUS_POLL_MS);
@@ -413,12 +476,13 @@ export class ResidencyClient {
       if (this.#closed) throw new Error("Fabric residency client is closed");
       const followed = this.#readyOwner();
       if (followed) return followed;
-      if (Date.now() >= attachDeadline) throw new Error("Timed out waiting for Fabric resident host maintenance readiness");
+      if (Date.now() >= Math.min(attachDeadline, this.#startingHostDeadline)) throw new Error("Timed out waiting for Fabric resident host maintenance readiness");
       await delay(STATUS_POLL_MS);
     }
     // Recheck after the attachment wait: the old launcher may have entered
     // destructive watchdog custody while we still saw its live owner.
     assertNoWatchdogCustody(this.options.config.residencyRoot);
+    if (Date.now() >= this.#startingHostDeadline) throw new Error("Timed out waiting for Fabric resident startup recovery");
     // This explicit business startup, not a launcher recovery loop, revokes the idle stop.
     fs.rmSync(residentIdleExitPath(this.options.config.residencyRoot), { force: true });
     const launchToken = randomUUID();
@@ -466,7 +530,7 @@ export class ResidencyClient {
         started = true;
         deadline = Date.now() + budget;
       }
-      if (Date.now() >= deadline) break;
+      if (Date.now() >= Math.min(deadline, this.#startingHostDeadline)) break;
       await delay(STATUS_POLL_MS);
     }
     // Work must not outlive its owner: end the launcher this call spawned (its
@@ -495,7 +559,10 @@ export class ResidencyClient {
     const state = readHandoverJson<ResidentHandoverState>(handoverPath(this.options.config.residencyRoot));
     // A new runtime must invalidate the old nonce even after A exited or while
     // B is staged. Business readiness is not the Main generation boundary.
-    if (!owner && !handoverActive(state)) return;
+    // Restored residency files retain a previous (possibly closed) Main nonce
+    // even when no host survived. Re-arm this runtime's generation without
+    // starting an empty root or treating the old nonce as current authority.
+    if (!owner && !handoverActive(state) && !fs.existsSync(this.options.config.residencyRoot)) return;
     const self = this.options.participants.self();
     if (self.kind !== "root" || self.id !== this.options.config.rootId || self.sessionId !== this.options.config.sessionId) throw new ResidentActorAuthorizationError();
     const releaseRoot = path.resolve(path.dirname(this.#hostPath), "../..");
@@ -1449,7 +1516,7 @@ export class ResidencyClient {
     this.#watchRearm.unref();
   }
 
-  #durableWork(): string | undefined {
+  #durableWork(actorIds?: Set<string>): string | undefined {
     const work: string[] = [];
     const config = this.options.config;
     const actorRoots = [config.actorRoot, config.sessionActorRoot ??
@@ -1459,6 +1526,7 @@ export class ResidencyClient {
       for (const actor of registry?.actors ?? []) {
         if (actor.rootId === config.rootId && actor.residency === "durable" && actor.status !== "stopped" && actor.status !== "dormant") {
           work.push(`actor:${root}:${actor.id}:${actor.status}`);
+          if (typeof actor.id === "string") actorIds?.add(actor.id);
         }
       }
     }

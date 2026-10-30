@@ -3246,7 +3246,20 @@ export class ResidentHost {
       const provenance = readJson<{ format: number; dev: string; ino: string }>(provenancePath);
       const established = provenance?.format === 1 && provenance.dev === String(locked.dev) && provenance.ino === String(locked.ino);
       if (!established) {
-        if (!created || !sameInode(created) || fs.existsSync(provenancePath) || fs.existsSync(this.#ownerPath)) {
+        // A file restore preserves protocol bytes, not device/inode identity or
+        // kernel locks. Under both startup locks, rebind a copied protocol fence
+        // only after every retained owner incarnation is provably gone. Missing
+        // birth/token evidence and live/unknown owners still require a drain;
+        // unproven legacy inodes retain their existing refusal below.
+        const retained = records.filter((record): record is ResidentHostOwner => !!record);
+        const restored = process.platform === "linux" && provenance?.format === 1 &&
+          typeof provenance.dev === "string" && /^\d+$/.test(provenance.dev) &&
+          typeof provenance.ino === "string" && /^\d+$/.test(provenance.ino) && retained.length > 0 &&
+          retained.every(record => Number.isSafeInteger(record.pid) && record.pid > 0 &&
+            typeof record.processStartTime === "string" && /^\d+$/.test(record.processStartTime) &&
+            typeof record.token === "string" && record.token.length > 0 && record.token === retained[0]!.token &&
+            !residentProcessAlive(record.pid, record.processStartTime));
+        if (!restored && (!created || !sameInode(created) || fs.existsSync(provenancePath) || fs.existsSync(this.#ownerPath))) {
           throw new Error("Fabric resident host has a legacy or uncertain startup record; verify rollout/rollback drain before removing it");
         }
         // Bind provenance to the immutable flock inode, not the mutable PID diagnostic.

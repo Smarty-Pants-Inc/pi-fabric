@@ -7,7 +7,7 @@ import type { TransportDelivery, TransportEnvelope } from "../transport/types.js
 import type { BridgePublish } from "./bridge.js";
 import {
   BRIDGE_NATS_ACK_TOPIC, BRIDGE_NATS_CONTROL_TOPIC, BRIDGE_NATS_HORIZON_MS, BRIDGE_NATS_MACHINE, bridgeNatsAckEnvelopeId,
-  bridgeNatsEnvelopeId, bridgeNatsMappedCommandId, BRIDGE_NATS_REFUSAL, type BridgeNatsDirection, type BridgeNatsPortDelivery,
+  bridgeNatsEnvelopeId, bridgeNatsMappedCommandId, BRIDGE_NATS_REFUSAL, type BridgeNatsDirection, type BridgeNatsEventRefusal, type BridgeNatsPortDelivery,
   type BridgeNatsPortResolved, type BridgeNatsPresenceFailure,
 } from "./bridge-nats-types.js";
 import { controlBodyFingerprint, FABRIC_IDEMPOTENCY_KEY_REUSED } from "./control-idempotency.js";
@@ -176,6 +176,9 @@ export interface NatsCarrierOutcome {
  * create-only and returns what is stored: the new record (created), or the earlier one unchanged.
  */
 export interface NatsCarrierLedger {
+  /** Event-level refusal receipts survive a restart, independently of command claims and cursor checkpoints. */
+  refusal(eventId: string): BridgeNatsEventRefusal | undefined;
+  refuse(eventId: string, refusal: BridgeNatsEventRefusal): Promise<void>;
   claim(record: NatsCarrierRecord): Promise<NatsCarrierClaim>;
   lookup(direction: NatsCarrierDirection, destinationCommandId: string): Promise<NatsCarrierRecord | undefined>;
   /** Records the owner's outcome. The record stays to its expiry so replays and conflicts still resolve. */
@@ -212,7 +215,7 @@ export class NatsCarrierUnavailable extends Error {
   constructor(readonly targetId: string) { super(`NATS route for ${targetId} is unavailable; the event waits for presence`); }
 }
 
-/** Thrown for a permanent refusal. "not allowed" makes MeshBridge drop and log the event, never retry it. */
+/** A permanent EVENT refusal only. NatsCarrierSide durably records and consumes it; never use for link/port safety failures. */
 export class NatsCarrierRefusal extends Error {
   override readonly name = "NatsCarrierRefusal";
   constructor(readonly reason: string, readonly code?: string, readonly answer?: NatsCarrierFileAnswer) {

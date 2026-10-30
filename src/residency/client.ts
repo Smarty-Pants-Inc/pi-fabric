@@ -18,6 +18,7 @@ import { readFileRetrying, writeJsonAtomic } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorCreateRequest, FabricActorRequeueResult } from "../actors/types.js";
 import { FabricActorQueuedWorkError } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
+import { normalizeAgentAskId } from "../agents/ask-id.js";
 import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { awaitAgentCwd } from "../agents/manager.js";
 import { BUILT_IN_RUNNER_IDS, requireAgentRunner, requireActorRunner } from "../agents/runner-registry.js";
@@ -199,6 +200,7 @@ export class ResidencyClient {
   readonly #responsesPath: string;
   readonly #agentsPath: string;
   readonly #inheritedToolAllowlist = readChildToolAllowlist();
+  readonly #inheritedAskId = normalizeAgentAskId(process.env.PI_FABRIC_ASK_ID) ?? null;
   readonly #spawnPolicy = snapshotTaskReturnAddress(undefined, undefined, undefined);
   readonly #deliveryPrefix: string;
   readonly #hostPath: string;
@@ -654,7 +656,8 @@ export class ResidencyClient {
     };
     assertResidentTaskCaller(caller, self, this.options.config.rootId);
     // Explicit keys are checked against the loaded owner before dispatch.
-    const { idempotencyKey, ...spawnRequest } = request;
+    normalizeAgentAskId(request.askId);
+    const { idempotencyKey, ...spawnRequest } = { ...request, inheritedAskId: this.#inheritedAskId };
     const resolvedRequest = spawnRequest.cwd === undefined
       ? spawnRequest
       : { ...spawnRequest, cwd: await awaitAgentCwd(this.options.config.cwd, spawnRequest.cwd, signal) };
@@ -1098,6 +1101,7 @@ export class ResidencyClient {
       id: handle.id,
       name: handle.name,
       task: "",
+      ...(handle.askIdState ? { askId: handle.askId ?? null, askIdState: handle.askIdState } : {}),
       status: "failed",
       ...(handle.routeClass !== undefined ? { routeClass: handle.routeClass } : {}),
       ...(handle.routeClassSource !== undefined ? { routeClassSource: handle.routeClassSource } : {}),

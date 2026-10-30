@@ -55,6 +55,8 @@ interface FabricAction {
   effect?: FabricActionEffect;
 }
 interface FabricAgentRequest {
+  /** Whole opaque Ask-ID value (1-512 UTF-8 bytes, no controls/newlines); omitted inherits byte-for-byte. */
+  askId?: string;
   /** Explicit run-history class; does not opt a non-auto task into routing. */
   routeClass?: string;
   /** Trusted protection snapshot; omitted remains unknown. */
@@ -319,6 +321,8 @@ interface FabricTargetTerminalNotice {
   sender?: { id: string; kind: "main" | "actor" | "agent" | "remote"; name?: string; verified: "mesh" | "bridge" };
 }
 interface FabricAgentHandle {
+  askId?: string | null;
+  askIdState?: "explicit" | "inherited" | "missing";
   /** A model-chosen tiny shortening was ignored; use >=300000ms for lane/audit timeboxes. */
   timeoutNote?: { code: "AGENT_TIMEOUT_BELOW_SHORTENING_FLOOR"; requestedTimeoutMs: number; effectiveTimeoutMs: number; minimumTimeoutMs: number };
   /** Policy switch/audit diagnostics; warnings never override the run status. */

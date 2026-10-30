@@ -2,7 +2,7 @@
 
 ## Scope
 
-Windows: unchanged from main in this PR; follow-up Smarty-Pants-Inc/smarty-dev#5132.
+Windows: unchanged from main in this PR; follow-up smarty-dev#5132.
 
 All PR #481 behavior changes below are POSIX-only, controlled by the shared
 `retentionV2Enabled()` platform gate. Windows uses main 9387af87's original
@@ -144,7 +144,7 @@ not enable retention V2 there. Main's native event compaction and acknowledged
 request expiry remain cross-platform and unchanged on Windows. No legacy run is automatically
 deleted on any platform.
 
-Follow-up: Smarty-Pants-Inc/smarty-dev#5132 (owner fabric-v2). It tracks the
+Follow-up: smarty-dev#5132 (owner fabric-v2). It tracks the
 actor-specific bounded custody index and the entire Windows V2 half: ownership/
 privacy evidence, polling/recovery bounds, tail compaction and native Windows
 retention verification. Local simulation does not substitute for native CI.

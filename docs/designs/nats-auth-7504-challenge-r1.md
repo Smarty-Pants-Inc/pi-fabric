@@ -149,8 +149,8 @@ of G-9/T14, lead decides), O-7 (scope of the named security pass, lead decides).
 
 The records above are unchanged. Basis: the full texts of two #958 reviews (staged copy) and the lead's decisions on
 them, which match all four findings: Astra,
-https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6152830182 (P1), and security,
-https://github.com/Smarty-Pants-Inc/pi-fabric/pull/958#issuecomment-6152848625 (`SECURITY_REVIEW: FAIL`; P1, P1,
+[review comment](../../REFERENCES.md#source-9) (P1), and security,
+[security comment](../../REFERENCES.md#source-10) (`SECURITY_REVIEW: FAIL`; P1, P1,
 P2). This record adds no finding and claims no review pass. Design note: "Round 2 answers" and section 10.
 
 - **B1 ADOPT (Astra P1).** Normal maintainer `STREAM.UPDATE` could add an expiry to `<CUS>`, and an open engine

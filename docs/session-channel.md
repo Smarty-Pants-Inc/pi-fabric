@@ -38,10 +38,10 @@ Requests use:
 fabric.svc.<org>.<host-token>.<session-token>.<service>.<operation>
 ```
 
-Events use the same prefix ending in `.events`. Host and session tokens are the first 32 lowercase hexadecimal characters of SHA-256 over the UTF-8 host ID and session ID. For example, the fixture vector for org `smarty-pants-inc`, host ID `session-channel-host`, session ID `11111111-2222-4333-8444-555555555555`, and service `smarty-code-ordinary` is:
+Events use the same prefix ending in `.events`. Host and session tokens are the first 32 lowercase hexadecimal characters of SHA-256 over the UTF-8 host ID and session ID. For example, an example vector for org `example-org`, host ID `session-channel-host`, session ID `11111111-2222-4333-8444-555555555555`, and service `smarty-code-ordinary` is:
 
 ```
-fabric.svc.smarty-pants-inc.e8f6226427beb35d340fd1f431ce5441.cf4c4732fd3b8f8a55b60871950a2f22.smarty-code-ordinary.snapshot
+fabric.svc.example-org.e8f6226427beb35d340fd1f431ce5441.cf4c4732fd3b8f8a55b60871950a2f22.smarty-code-ordinary.snapshot
 ```
 
 A request carries JSON in its body, a UUID in `Fabric-Request-Id`, and `Fabric-Caller` as the exact JSON object `{"id":"<caller>"}`. The reply is JSON `{ "status": number, "body": unknown }`. The request budget is 256 KiB. The 1 MiB reply budget applies to the complete encoded `{status, body}` object.

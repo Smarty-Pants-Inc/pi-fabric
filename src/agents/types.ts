@@ -1,3 +1,4 @@
+import type { AgentAskIdentity } from "./ask-id.js";
 import type { ModelRouteDecision } from "./model-route.js";
 import type { FabricTurnProvenance } from "../fabric-provenance.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
@@ -97,6 +98,10 @@ export interface AgentSpawner {
 }
 
 export interface AgentRunRequest {
+  /** Whole opaque Ask-ID value, copied byte-for-byte; omitted inherits the spawning task's value. */
+  askId?: string;
+  /** Host-only caller snapshot for resident forwarding; null means no parent ask. */
+  inheritedAskId?: string | null;
   /** Host-only: the actor queue item this run serves (smarty-dev#8935 recovery of an ENODEV-unconfirmed run). */
   activationId?: string;
   /** Explicit history class; routing still requires a separately prepared decision. */
@@ -243,7 +248,7 @@ export interface AgentTimeoutIgnoredNote {
   minimumTimeoutMs: number;
 }
 
-export interface AgentRunRecord {
+export interface AgentRunRecord extends Partial<AgentAskIdentity> {
   /** A tiny explicit shortening was ignored to protect real work. */
   timeoutNote?: AgentTimeoutIgnoredNote;
   /** Manager-owned durable intent distinguishing operator/deadline stops from worker checkpoints.
@@ -410,7 +415,7 @@ export interface AgentPresenceInfo extends Pick<AgentRunRecord,
   "turns" | "toolCalls" | "usage" | "currentTool" |
   "placementRunId" | "placementKind" | "placementHost" | "expectedSeconds"> {}
 
-export interface AgentHandleInfo {
+export interface AgentHandleInfo extends Partial<AgentAskIdentity> {
   /** Presentation-only result read failure; never changes the lifecycle status or supplies a result. */
   error?: string;
   /** A tiny explicit shortening was ignored to protect real work. */
@@ -470,7 +475,7 @@ export interface AgentHandleInfo {
   worktree?: string;
 }
 
-export interface AgentWorkerOptions {
+export interface AgentWorkerOptions extends Partial<AgentAskIdentity> {
   /** Host-issued policy notices retained in every worker status record. */
   modelPolicyWarnings?: string[];
   /** Spawn-selected Fabric package root, retained in the durable run record. */

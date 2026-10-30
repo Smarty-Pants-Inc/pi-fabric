@@ -108,11 +108,11 @@ confirms the actor mesh monitor is caught up. An unconsumed event or new request
 cancels sleep. `config.json`, registry/session files, `wake-routes.json` and
 cursors survive; `owner.json` and the live processes do not.
 
-This is the dormancy-only split of [PR #704](https://github.com/Smarty-Pants-Inc/pi-fabric/pull/704).
+This is the dormancy-only split of [PR #704](../REFERENCES.md#source-22).
 The existing **50 ms request poll**, **100 ms V2 request-maintenance interval**,
 retention overlay and collector behavior are unchanged. The idle request-polling
 and maintenance-timer rework is separate
-[smarty-dev#7885](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/7885).
+[smarty-dev#7885](../REFERENCES.md#source-23).
 Actor changes/final drain settlement, agent settlement, delivery-outbox drain and
 actor presence-publication completion drive dormancy eligibility. Each event's
 check commits eligible dormancy directly after proving native wake support and

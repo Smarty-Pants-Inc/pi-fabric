@@ -239,7 +239,7 @@ const reportInboxExpiry = async (pi: ExtensionAPI, inbox: RootInboxBatch | undef
 // session id starts a turn at once; alias-addressed shadows keep the 60 s steer grace.
 // The idle wake needs a Pi that queues a triggered message behind a live prompt preflight;
 // otherwise a wake can start a run that makes a prompt in its preflight fail (#107 review F2).
-// Pi declares it on the extension API (pi.hostCapabilities, Smarty-Pants-Inc/pi#74 and #76), not through
+// Pi declares it on the extension API (pi.hostCapabilities, pi#74 and #76), not through
 // a module export: Fabric ships its own copy of the Pi package, whose export describes that copy.
 // An older Pi lacks it, and the wake stays off. Tests inject the capability under the global
 // symbol below, since their Pi predates it.

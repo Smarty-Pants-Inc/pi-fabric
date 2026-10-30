@@ -7,6 +7,8 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import * as atomicWrite from "../src/core/atomic-write.js";
+import * as processIdentity from "../src/residency/process-identity.js";
 import { MainAgentController, type FabricMainAgentDeliveryRequest } from "../src/main-agent.js";
 import { closeMainInbox, reopenMainInbox } from "../src/main-drain/gate.js";
 import { AgentMessageRouter } from "../src/providers/agents-message-router.js";
@@ -513,7 +515,8 @@ describe("native recovery recipient-scoped root inbox handoff", () => {
 
 // Keep: original-recipient authorization and ACK trust boundaries; real FILE/router/Main
 // admission and no-loss cursor behavior (#17478). Custody is injected, not native/broker proof.
-describe("native recovery actual-source message routing", () => {
+// Positive native receiver registration requires real Linux /proc start ticks and boot identity.
+describe.skipIf(process.platform !== "linux")("native recovery actual-source message routing", () => {
   const setup = async (multiHop = false) => {
     const root = rootDirectory(), mesh = new MeshStore(path.join(root, "mesh"), 65536, 1000);
     const sourceManager = SessionManager.create(root, path.join(root, "source"));
@@ -969,6 +972,244 @@ describe("native recovery actual-source message routing", () => {
       expect(f.delivered[0]!.request).toMatchObject({ deliveryId: command.body.commandId, outcomeSend: { to: f.S } });
       expect(f.sent[0]!.details.deliveryId).toBe(command.body.commandId);
     } finally { await f.close(); }
+  });
+});
+
+describe("native recovery unknown-birth HOLD and ordinary FILE control", () => {
+  const setupRuntime = async (root: string, mesh: MeshStore, targetManager: SessionManager,
+    target: { sessionId: string; sessionFile: string }, reader: NativeRecoveryCustodyReader) => {
+    const T = `session:${target.sessionId}`, A = "session:sender";
+    const identity = (id: string) => ({ id, name: id, kind: "main" as const });
+    const directory = new ParticipantDirectory(mesh, { enabled: true, hostId: T, rootId: T, identity: identity(T),
+      reapDeadHosts: false, heartbeatMs: 60_000, leaseMs: 120_000 });
+    directory.registerSource(() => [{ format: 1, id: T, rootId: T, kind: "root", ownerHostId: T, ownerIdentityId: T,
+      name: "portable-main", status: "idle", runner: "pi", transport: "host", capabilities: ["steer", "followUp", "fabric"],
+      sessionId: target.sessionId, cwd: root, startedAt: 1, updatedAt: Date.now(), controlProtocol: "v1", interactive: true }]);
+    await directory.refresh();
+    directory.setNativeRecoveryReader(reader);
+
+    const sent: Array<{ details: Record<string, unknown> }> = [];
+    const pi = { on() {}, sendMessage(message: { details: Record<string, unknown> }) { sent.push(message); } } as unknown as ExtensionAPI;
+    const main = new MainAgentController(pi, T, true, root, target.sessionId, true, undefined, { isSupervisor: () => false });
+    const context = { isIdle: () => true, hasPendingMessages: () => false, sessionManager: targetManager } as unknown as ExtensionContext;
+    const journal = path.join(mesh.root, "main-followups", "portable-routing.json");
+    main.attachFollowUpDrain(context, 60_000, journal, 600, undefined, reader);
+
+    const planes: FabricControlPlane[] = [];
+    const plane = (id: string, options: Partial<ConstructorParameters<typeof FabricControlPlane>[2]> = {}) => {
+      const result = new FabricControlPlane(new MeshStore(mesh.root, 65536, 1000), identity(id), {
+        enabled: true, hostId: id, readNativeCustody: reader, acknowledgementTimeoutMs: 1000, pollMs: 20, ...options });
+      planes.push(result);
+      return result;
+    };
+    const receiver = plane(T, { ownerIncarnation: directory.ownerIncarnation, controlIncarnationFence: "enforce" });
+    const sender = plane(A, { captureOwnerLease: directory.captureControlOwnerLease.bind(directory) });
+    const unknownManager: any = {
+      status(id: string) { throw new Error(`Unknown Fabric agent: ${id}`); },
+      stop(id: string) { throw new Error(`Unknown Fabric agent: ${id}`); },
+    };
+    const actors = (id: string): any => ({ identity: identity(id), mesh: { root: mesh.root }, owns: () => false,
+      status(id: string) { throw new Error(`Unknown Fabric actor: ${id}`); }, validateDirectMessage() {},
+      tell() { throw new Error("unexpected actor tell"); }, ask() { throw new Error("unexpected ask"); }, stop() {},
+      steerRemote() { throw new Error("unexpected unfenced fallback"); }, resolveBinding: (binding: any) => binding,
+      resolveActivationBinding: async () => ({}) });
+    const sourcePort: any = { get: directory.get.bind(directory), list: directory.list.bind(directory), scheduleRefresh() {},
+      lastKnown: directory.lastKnown.bind(directory), routingUnavailable: directory.routingUnavailable.bind(directory) };
+    const localMain = (id: string): any => ({ id, local: true, interactive: true, matches: (value: string) => value === id,
+      deliverAgent() { throw new Error("sender must use the real control plane"); } });
+    const taskRouter = (allowed: string, id: string, control: FabricControlPlane, host: any = localMain(id)) => {
+      const before = { ...process.env };
+      Object.assign(process.env, { PI_FABRIC_TASK_PROCESS_CHILD: "1", PI_FABRIC_PARENT_RUN: "portable-routing-fixture",
+        PI_FABRIC_SPAWNER_ID: allowed, PI_FABRIC_MAIN_AGENT_ID: allowed,
+        PI_FABRIC_SPAWNER_CHAIN: "[]", PI_FABRIC_TASK_ESCALATION_TARGETS: "[]" });
+      delete process.env.PI_FABRIC_ACTOR_ID;
+      try { return new AgentMessageRouter(unknownManager, actors(id), host, sourcePort, control, binding => binding); }
+      finally {
+        for (const key of Object.keys(process.env)) if (!(key in before)) delete process.env[key];
+        Object.assign(process.env, before);
+      }
+    };
+    const nativeAliases: Array<{ originalTargetId: string; request: FabricMainAgentDeliveryRequest }> = [];
+    const install = (router: AgentMessageRouter, side: string) => router.setNativeRecoveryRouting({
+      readNativeCustody: reader,
+      authorizeOriginalRecipient(request) {
+        if (request.targetId !== T) throw new Error(`${side} authorized an unexpected recipient ${request.targetId}`);
+      },
+      deliverAgent(originalTargetId, request) {
+        nativeAliases.push({ originalTargetId, request });
+        throw new Error("ordinary current Main delivery must not use a native alias");
+      },
+    });
+    const receiveRouter = taskRouter("session:unrelated-spawner", T, receiver, main);
+    const sendRouter = taskRouter(T, A, sender);
+    install(receiveRouter, "receiver");
+    install(sendRouter, "sender");
+    return { T, A, identity, directory, main, sent, receiver, sender, receiveRouter, sendRouter, nativeAliases,
+      async close() {
+        reopenMainInbox(T);
+        await Promise.all(planes.map(control => control.close()));
+        main.closeFollowUpDrain();
+        await directory.close();
+      } };
+  };
+
+  it("retains a sealed RECEIVED source and HOLDs old-address FILE selection when birth is unknown", async () => {
+    const root = fs.realpathSync(rootDirectory()), mesh = new MeshStore(path.join(root, "mesh"), 65536, 1000);
+    const sourceManager = SessionManager.create(root, path.join(root, "source"));
+    const targetManager = SessionManager.create(root, path.join(root, "target"));
+    sourceManager.appendMessage(fauxAssistantMessage("source persisted"));
+    targetManager.appendMessage(fauxAssistantMessage("target persisted"));
+    const source = { sessionId: sourceManager.getSessionId(), sessionFile: fs.realpathSync(sourceManager.getSessionFile()!) };
+    const target = { sessionId: targetManager.getSessionId(), sessionFile: fs.realpathSync(targetManager.getSessionFile()!) };
+    const identity = (id: string) => ({ id, name: id, kind: "main" as const });
+    const S = `session:${source.sessionId}`, T = `session:${target.sessionId}`, A = "session:sender";
+    const transfer: NativeRecoveryTransfer = { version: 1, operationId: "unknown-birth-route", preparedDigest: "a".repeat(64),
+      preparedEntryId: "prepared", receivedEntryId: "received", source, target, phase: "received", occurrences: [] };
+    const custodyReads: Array<{ sessionId: string; sessionFile: string }> = [];
+    const reader: NativeRecoveryCustodyReader = scope => {
+      custodyReads.push({ ...scope });
+      return { status: "validated", transfers: [transfer] };
+    };
+    const processStartMock = vi.spyOn(processIdentity, "processStartTime").mockReturnValue(undefined);
+    const bootIdentityMock = vi.spyOn(atomicWrite, "readPhysicalHostIdentity").mockReturnValue(undefined);
+    try {
+      registerMainInbox(mesh.root, identity(S), source.sessionId, source.sessionFile);
+      registerMainInbox(mesh.root, identity(T), target.sessionId, target.sessionFile);
+      await expect(reconcileNativeMainInboxCustody(mesh, target, reader))
+        .rejects.toThrow("Missing exact native Main registration");
+    } finally {
+      bootIdentityMock.mockRestore();
+      processStartMock.mockRestore();
+    }
+
+    const diskJson = (file: string): Record<string, any> => JSON.parse(fs.readFileSync(file, "utf8"));
+    const mailbox = path.join(mesh.root, "main-followups");
+    const sourceOwnerFile = path.join(mailbox, `${encodeURIComponent(source.sessionId)}.owner.json`);
+    const sourceOwner = diskJson(sourceOwnerFile);
+    const sourceSuccessorFile = path.join(mailbox, "successors", `${createHash("sha256").update(S).digest("hex")}.json`);
+    const sourceSuccessor = diskJson(sourceSuccessorFile);
+    expect(sourceOwner.processStartedAt).toBeUndefined();
+    expect(sourceOwner.processBootId).toBeUndefined();
+    expect(sourceOwner).toMatchObject({ retired: true, nativeRecovery: {
+      version: 1, operationId: transfer.operationId, preparedDigest: transfer.preparedDigest,
+      preparedEntryId: transfer.preparedEntryId, receivedEntryId: transfer.receivedEntryId,
+      phase: "received", source, target,
+    } });
+    expect(sourceSuccessor).toMatchObject({ oldRoot: S, activationId: sourceOwner.activationId });
+    expect(sourceSuccessor).not.toHaveProperty("newRoot");
+    expect(sourceSuccessor).not.toHaveProperty("nativeRecovery");
+    expect(custodyReads).toContainEqual(target);
+    expect(() => resolveNativeMainSuccessor(mesh.root, S, reader))
+      .toThrow(/Native Main recovery has no committed successor locator/);
+
+    const runtime = await setupRuntime(root, mesh, targetManager, target, reader);
+    const mainDelivery = vi.spyOn(runtime.main, "deliverAgent");
+    try {
+      const priorSequence = mesh.latestSequence();
+      const commandId = "unknown-birth-held-command";
+      const event = await mesh.publish({ topic: "fabric.control.command", kind: "followUp", to: S, from: identity(A),
+        data: { version: 1, commandId, targetId: S, operation: "followUp", replyTo: A, requestedAt: Date.now(),
+          ownerIncarnation: runtime.receiver.incarnation, message: "must remain held" } });
+      expect(event.sequence).toBeGreaterThan(priorSequence);
+      const fileReader = new FileControlReader(mesh, T);
+      fileReader.setNativeCommandRoute({ readNativeCustody: reader, ownerIdentityId: T, ownerIncarnation: runtime.receiver.incarnation });
+      const selected: string[] = [];
+      await expect(fileReader.drain(candidate => { selected.push(candidate.id); }, () => false))
+        .rejects.toThrow(/Native Main recovery has no committed successor locator/);
+      expect(selected).toEqual([]);
+      expect(fileReader.lastSequence).toBeLessThan(event.sequence);
+      expect(mesh.read({ topic: "fabric.control.ack", limit: 1000 })
+        .some((ack: any) => ack.data?.commandId === commandId)).toBe(false);
+      expect(mainDelivery).not.toHaveBeenCalled();
+      expect(runtime.sent).toEqual([]);
+      expect(runtime.nativeAliases).toEqual([]);
+      expect(diskJson(sourceOwnerFile).nativeRecovery).toMatchObject({ operationId: transfer.operationId, phase: "received" });
+      expect(diskJson(sourceSuccessorFile)).not.toHaveProperty("newRoot");
+      expect(reader(source)).toEqual({ status: "validated", transfers: [transfer] });
+    } finally {
+      mainDelivery.mockRestore();
+      await runtime.close();
+      reopenMainInbox(S);
+    }
+  });
+
+  it("delivers an ordinary current Main FILE followUp with unknown birth and no native alias", async () => {
+    const root = fs.realpathSync(rootDirectory()), mesh = new MeshStore(path.join(root, "mesh"), 65536, 1000);
+    const targetManager = SessionManager.create(root, path.join(root, "target"));
+    targetManager.appendMessage(fauxAssistantMessage("ordinary target persisted"));
+    const target = { sessionId: targetManager.getSessionId(), sessionFile: fs.realpathSync(targetManager.getSessionFile()!) };
+    const identity = (id: string) => ({ id, name: id, kind: "main" as const });
+    const T = `session:${target.sessionId}`;
+    const nativeScopes: Array<{ sessionId: string; sessionFile: string }> = [];
+    const reader: NativeRecoveryCustodyReader = scope => {
+      nativeScopes.push({ ...scope });
+      if (scope.sessionId !== target.sessionId || scope.sessionFile !== target.sessionFile) {
+        throw new Error("ordinary control queried non-ordinary native custody");
+      }
+      return { status: "none" };
+    };
+    const processStartMock = vi.spyOn(processIdentity, "processStartTime").mockReturnValue(undefined);
+    const bootIdentityMock = vi.spyOn(atomicWrite, "readPhysicalHostIdentity").mockReturnValue(undefined);
+    try {
+      registerMainInbox(mesh.root, identity(T), target.sessionId, target.sessionFile);
+    } finally {
+      bootIdentityMock.mockRestore();
+      processStartMock.mockRestore();
+    }
+    const owner = JSON.parse(fs.readFileSync(path.join(mesh.root, "main-followups", `${encodeURIComponent(target.sessionId)}.owner.json`), "utf8"));
+    expect(owner.processStartedAt).toBeUndefined();
+    expect(owner.processBootId).toBeUndefined();
+
+    const runtime = await setupRuntime(root, mesh, targetManager, target, reader);
+    const mainDelivery = vi.spyOn(runtime.main, "deliverAgent");
+    try {
+      expect(resolveNativeMainSuccessor(mesh.root, T, reader)).toBeUndefined();
+      expect(runtime.directory.resolveNativeMessageTarget(T, "followUp")).toBeUndefined();
+      expect(runtime.directory.get(T)?.id).toBe(T);
+      expect(runtime.directory.resolveNativeMessageTarget(T, "followUp")).toBeUndefined();
+      expect(nativeScopes.length).toBeGreaterThan(0);
+      expect(nativeScopes.every(scope => scope.sessionId === target.sessionId && scope.sessionFile === target.sessionFile)).toBe(true);
+
+      runtime.receiver.start((...args) => runtime.receiveRouter.acceptControl(...args));
+      runtime.sender.start(() => ({ accepted: false }));
+      const options = { idempotencyKey: "ordinary-current-main-stable" };
+      const first = await runtime.sendRouter.routeMessage(T, "ordinary FILE followUp", { exact: true }, "followUp", undefined, options);
+      const duplicate = await runtime.sendRouter.routeMessage(T, "ordinary FILE followUp", { exact: true }, "followUp", undefined, options);
+      expect(first.acknowledged).toBe(true);
+      expect(duplicate.acknowledged).toBe(true);
+
+      const commands: any[] = mesh.read({ topic: "fabric.control.command", limit: 1000 })
+        .filter((event: any) => event.data?.targetId === T && event.data?.operation === "followUp" &&
+          event.data?.message === "ordinary FILE followUp");
+      expect(commands.length).toBeGreaterThan(0);
+      expect(mainDelivery).toHaveBeenCalledTimes(1);
+      const request = mainDelivery.mock.calls[0]![0];
+      const command = commands.find(event => event.id === request.inboxEventId)!;
+      expect(command).toBeDefined();
+      expect(commands.every(event => event.to === T && event.data.commandId === command.data.commandId &&
+        event.data.targetId === T && event.data.ownerIncarnation === runtime.receiver.incarnation)).toBe(true);
+      expect(command.to).toBe(T);
+      expect(command.data.targetId).toBe(T);
+      expect(command.data.ownerIncarnation).toBe(runtime.receiver.incarnation);
+      expect(command.data.data).toEqual({ exact: true });
+      expect(request).toMatchObject({ deliveryId: command.data.commandId, inboxEventId: command.id,
+        outcomeSend: { eventId: command.id, to: T, from: runtime.A, mode: "followUp" }, data: { exact: true } });
+      expect(runtime.sent).toHaveLength(1);
+      expect(runtime.sent[0]!.details).toMatchObject({ deliveryId: command.data.commandId, inboxEventId: command.id });
+      const acknowledgements: any[] = mesh.read({ topic: "fabric.control.ack", limit: 1000 })
+        .filter((event: any) => event.data?.commandId === command.data.commandId);
+      expect(acknowledgements.length).toBeGreaterThan(0);
+      expect(acknowledgements.every((ack: any) => ack.to === runtime.A && ack.from.id === T &&
+        ack.data?.targetId === T && ack.data?.commandId === command.data.commandId && ack.data?.accepted === true)).toBe(true);
+      expect(runtime.nativeAliases).toEqual([]);
+      expect(runtime.directory.resolveNativeMessageTarget(T, "followUp")).toBeUndefined();
+      const successorFile = path.join(mesh.root, "main-followups", "successors", `${createHash("sha256").update(T).digest("hex")}.json`);
+      expect(JSON.parse(fs.readFileSync(successorFile, "utf8"))).not.toHaveProperty("nativeRecovery");
+      expect(JSON.parse(fs.readFileSync(successorFile, "utf8"))).not.toHaveProperty("newRoot");
+    } finally {
+      mainDelivery.mockRestore();
+      await runtime.close();
+    }
   });
 });
 

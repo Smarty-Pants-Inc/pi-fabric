@@ -1,5 +1,6 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
 import { diagnostics } from "../core/diagnostics.js";
+import { normalizeAgentAskId, resolveAgentAskIdentity, taskWithAskId, type AgentAskIdentity } from "./ask-id.js";
 import { detachedPreview } from "../core/preview.js";
 import { copyFabricPrincipal, copyFabricProvenance, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -289,7 +290,7 @@ const childEnvironmentForLaunch = (
   };
 };
 
-type AgentPromptMetadata = {
+type AgentPromptMetadata = Partial<AgentAskIdentity> & {
   promptSha256: string;
   promptBytes: number;
   promptPath: string;
@@ -775,7 +776,7 @@ interface AgentResultObservation {
   listeners: Set<{ resolve(result: AgentRunResult): void; reject(error: unknown): void }>;
 }
 
-interface ManagedAgent extends AgentLifecycleState<AgentRunResult> {
+interface ManagedAgent extends AgentLifecycleState<AgentRunResult>, Partial<AgentAskIdentity> {
   observation?: AgentResultObservation;
   timeoutNote?: AgentRunRecord["timeoutNote"];
   runRoute: AgentRunRouteMetadata;
@@ -1358,6 +1359,7 @@ const failedRecord = (
     id: managed.id,
     name: managed.name,
     task: managed.task,
+    ...(managed.askIdState ? { askId: managed.askId ?? null, askIdState: managed.askIdState } : {}),
     ...(managed.promptSha256 ? { promptSha256: managed.promptSha256 } : {}),
     ...(managed.promptBytes !== undefined ? { promptBytes: managed.promptBytes } : {}),
     ...(managed.promptPath ? { promptPath: managed.promptPath } : {}),
@@ -1467,6 +1469,7 @@ export class AgentManager {
   readonly #kernel: () => FabricKernel;
   readonly #pythonRuntime: () => FabricPythonRuntime;
   readonly #mainAgentId: string | undefined;
+  readonly #inheritedAskId = normalizeAgentAskId(process.env.PI_FABRIC_ASK_ID) ?? null;
   readonly #spawner: AgentSpawner | undefined;
   readonly #spawnerName: () => string | undefined;
   readonly #fabricSessionId: string | undefined;
@@ -2542,6 +2545,9 @@ export class AgentManager {
       throw new Error(`Fabric agent depth limit reached (${this.config.maxDepth})`);
     }
     assertAgentTask(request);
+    const askIdentity = resolveAgentAskIdentity(request.askId, request.inheritedAskId === undefined ? this.#inheritedAskId : request.inheritedAskId);
+    if (askIdentity.askIdState === "missing") diagnostics.warn("src/agents/manager.ts", "[pi-fabric] Agent spawn askId MISSING; no Ask-ID marker will be retained");
+    const task = taskWithAskId(request.task, askIdentity.askId);
     const timeoutNote = request.actorId ? undefined : ignoredTimeoutNote(this.config.timeoutMs, request.timeoutMs);
     const needs = normalizeAgentCapabilityTokens(request.needs);
     const requires = normalizeAgentRequires(request.requires);
@@ -2841,7 +2847,7 @@ export class AgentManager {
     this.#semaphore.admit(this.#currentDepth + 1);
     const id = randomUUID().replaceAll("-", "");
     const name = safeName(request.name ?? request.task.split("\n", 1)[0] ?? "Fabric agent");
-    const prompt = promptMetadata(request.task, path.join(this.#runRoot, id, "task.txt"));
+    const prompt = { ...promptMetadata(task, path.join(this.#runRoot, id, "task.txt")), ...askIdentity };
     const callerSignal = signal;
     let placementAdmission: AgentPlacementAdmission | undefined;
     const assertAuthorized = (): true => {
@@ -2951,7 +2957,7 @@ export class AgentManager {
       const imagesFile = request.images && request.images.length > 0
         ? path.join(runDirectory, "images.json")
         : undefined;
-      writePrivateFileAtomic(taskFile, Buffer.from(request.task, "utf8"));
+      writePrivateFileAtomic(taskFile, Buffer.from(task, "utf8"));
       if (request.provenance) writePrivateFileAtomic(taskFile + ".provenance.json", Buffer.from(JSON.stringify(request.provenance), "utf8"));
       if (imagesFile) {
         fs.writeFileSync(imagesFile, JSON.stringify(request.images), {
@@ -3170,7 +3176,7 @@ export class AgentManager {
         const launchContext: FabricRunnerLaunchContext = {
           id,
           name,
-          task: request.task,
+          task,
           cwd: agentCwd,
           runDirectory,
           residency,
@@ -3201,7 +3207,7 @@ export class AgentManager {
           // This is the allocated admission, not a launched-worker receipt. Gate
           // runner adapters too: an external adapter must not launch before KV.
           await this.#publishTaskBeforeLaunch({
-            ...runRoute, id, name, task: request.task, ...prompt, status: "queued",
+            ...runRoute, id, name, task, ...prompt, status: "queued",
             runner, transport: hostedAdapter ? "hosted" : adapter.kind, cwd: agentCwd,
             residency, recursive, startedAt: now, updatedAt: now,
             turns: 0, toolCalls: 0, text: "",
@@ -3274,6 +3280,8 @@ export class AgentManager {
           ...(pythonRuntime ? ["--python-runtime", pythonRuntime] : []),
           "--task-file",
           taskFile,
+          "--ask-id-state", askIdentity.askIdState,
+          ...(askIdentity.askId !== null ? ["--ask-id", askIdentity.askId] : []),
           "--prompt-sha256",
           prompt.promptSha256,
           "--prompt-bytes",
@@ -3696,7 +3704,7 @@ export class AgentManager {
       ...(request.capabilityRequirements ? { capabilityRequirements: [...request.capabilityRequirements] } : {}),
       ...(request.capabilityDigest ? { capabilityDigest: request.capabilityDigest } : {}),
       ...(request.runnerSessionId ? { runnerSessionId: request.runnerSessionId } : {}),
-    }, request.task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome, completionRecipient, routerStartState.settled ? undefined : async () => {
+    }, task, start, authorize ? callerSignal : undefined, routeDispatch?.outcome, completionRecipient, routerStartState.settled ? undefined : async () => {
       if (!routerStartState.settled) {
         routerStartState.settled = true;
         await this.#recordSpawnRouterStartFailed(request, routerStartState.admission);
@@ -4163,6 +4171,7 @@ export class AgentManager {
       id: record.id,
       name: record.name,
       task: record.task,
+      ...(record.askIdState ? { askId: record.askId ?? null, askIdState: record.askIdState } : {}),
       ...(record.timeoutNote ? { timeoutNote: record.timeoutNote } : {}),
       ...(record.promptSha256 ? { promptSha256: record.promptSha256 } : {}),
       ...(record.promptBytes !== undefined ? { promptBytes: record.promptBytes } : {}),
@@ -6640,13 +6649,14 @@ export class AgentManager {
         // A continuation rewrites the run's input in place. The prompt metadata
         // stays bound to the original spawn brief; it is never recomputed from
         // this same-run continuation (smarty-dev#11663).
-        const currentInput = promptMetadata(resume.task, managed.promptPath ?? path.join(managed.runDirectory, "task.txt"));
+        const input = taskWithAskId(resume.task, managed.askId ?? null);
+        const currentInput = promptMetadata(input, managed.promptPath ?? path.join(managed.runDirectory, "task.txt"));
         managed.inputSha256 = currentInput.inputSha256;
         managed.inputBytes = currentInput.inputBytes;
         // Publish the new input identity before replacing the bytes. A host death
         // between these writes leaves a detectable mismatch, never a false match.
         writeRecord(managed.statusFile, this.#withTransportMetadata(record, managed, false));
-        writePrivateFileAtomic(path.join(managed.runDirectory, "task.txt"), Buffer.from(resume.task, "utf8"));
+        writePrivateFileAtomic(path.join(managed.runDirectory, "task.txt"), Buffer.from(input, "utf8"));
         setWorkerArgument(managed.launch.workerArguments, "input-sha256", currentInput.inputSha256);
         setWorkerArgument(managed.launch.workerArguments, "input-bytes", String(currentInput.inputBytes));
         setWorkerArgument(
@@ -8262,6 +8272,7 @@ export class AgentManager {
       ...(managed.modelPolicyWarnings?.length ? { warnings: [...managed.modelPolicyWarnings] } : {}),
       id: managed.id,
       name: managed.name,
+      ...(managed.askIdState ? { askId: managed.askId ?? null, askIdState: managed.askIdState } : {}),
       ...(managed.promptSha256 ? { promptSha256: managed.promptSha256 } : {}),
       ...(managed.promptBytes !== undefined ? { promptBytes: managed.promptBytes } : {}),
       ...(managed.promptPath ? { promptPath: managed.promptPath } : {}),
@@ -8354,6 +8365,7 @@ export class AgentManager {
     const runnerSessionId = record.runnerSessionId ?? managed.runnerSessionId;
     return {
       ...safeRecord,
+      ...(managed.askIdState ? { askId: managed.askId ?? null, askIdState: managed.askIdState } : {}),
       ...(managed.timeoutNote ? { timeoutNote: managed.timeoutNote } : {}),
       ...(managed.finalAnswer ? { finalAnswerReceipt: { id: managed.finalAnswer.id, recordedAt: managed.finalAnswer.recordedAt } } : {}),
       ...managed.runRoute,

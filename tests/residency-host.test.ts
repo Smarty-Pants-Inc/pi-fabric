@@ -515,6 +515,47 @@ describe("resident actor spawn router attribution", () => {
   });
 });
 
+describe("resident askId custody", () => {
+  it.each([
+    { parent: undefined, askId: "org-feed://principal/Paul/block/1-opaque", state: "explicit" },
+    { parent: undefined, askId: undefined, state: "missing" },
+    { parent: "pi-session://principal/parent/entry/ask", askId: undefined, state: "inherited" },
+    { parent: "pi-session://principal/parent/entry/ask", askId: "opaque child override", state: "explicit" },
+  ])("preserves $state at the client -> resident host boundary", async ({ parent, askId, state }) => {
+    vi.stubEnv("PI_FABRIC_ASK_ID", "unrelated resident host ask");
+    const { root, config, host } = fixture();
+    config.workerPath = path.resolve("tests/fixtures/fake-worker.mjs");
+    config.agents = { ...config.agents, retainRuns: true, budgetUsd: 0, sessionExport: false };
+    config.piModels = { available: [{ provider: "fixture", id: "visible" }], aliases: {}, defaultModel: "fixture/visible" };
+    const mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+    const participants = new ParticipantDirectory(mesh, { enabled: true, hostId: config.rootId, rootId: config.rootId,
+      identity: { id: config.rootId, name: "Main", kind: "main", sessionId: config.sessionId } });
+    participants.registerSource(() => [{ format: 1, id: config.rootId, rootId: config.rootId, kind: "root", name: "Main",
+      status: "idle", ownerHostId: config.rootId, ownerIdentityId: config.rootId, sessionId: config.sessionId,
+      runner: "pi", transport: "host", capabilities: ["fabric"], controlProtocol: "v1", startedAt: Date.now(), updatedAt: Date.now() }]);
+    let client: ResidencyClient | undefined;
+    try {
+      await participants.start(); await host.start();
+      vi.stubEnv("PI_FABRIC_ASK_ID", parent);
+      client = new ResidencyClient({ config, mesh, participants, mainAgent: { local: false } as FabricMainAgentTarget });
+      vi.stubEnv("PI_FABRIC_ASK_ID", "unrelated resident host ask"); // Both sides retain their own caller snapshots.
+      const handle = await client.spawnAgent({ task: "retained resident brief", transport: "process", residency: "durable",
+        ...(askId === undefined ? {} : { askId }) }, AbortSignal.timeout(5_000));
+      const expected = { askId: askId ?? parent ?? null, askIdState: state };
+      expect(handle).toMatchObject(expected);
+      expect(await host.agents.wait(handle.id)).toMatchObject(expected);
+      expect(await client.waitAgent(handle.id, AbortSignal.timeout(5_000))).toMatchObject(expected);
+      const bytes = fs.readFileSync(handle.promptPath!, "utf8");
+      expect(bytes).toBe((expected.askId === null ? "" : `Ask-ID: ["Smarty-Pants-Inc","${expected.askId}"]\n`) + "retained resident brief");
+      expect(handle.promptSha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+      expect(JSON.parse(fs.readFileSync(residentResultPath(config.residencyRoot, handle.id), "utf8"))).toMatchObject(expected);
+    } finally {
+      await client?.close(); await host.close(); await participants.close(); mesh.closeState(); vi.unstubAllEnvs();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+});
+
 describe("resident default cwd attribution", () => {
   it("attributes omitted durable cwd from a Main subdir while refusing an explicit cwd change", async () => {
     const { root, config, host } = fixture({}, true);

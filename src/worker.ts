@@ -753,6 +753,7 @@ const main = async (): Promise<void> => {
       // A child Fabric intersects its own thinking.bounds with these.
       ...(options.thinkingBounds ? { PI_FABRIC_THINKING_BOUNDS: options.thinkingBounds } : {}),
       PI_FABRIC_AGENT_NAME: options.name,
+      PI_FABRIC_ASK_ID: options.askId ?? undefined,
       ...(options.spawner ? {
         PI_FABRIC_SPAWNER_ID: options.spawner.id,
         PI_FABRIC_SPAWNER_KIND: options.spawner.kind,

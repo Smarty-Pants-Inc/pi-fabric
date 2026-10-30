@@ -24,6 +24,12 @@ You can give `fabric_exec` optional `agentBudget` and `tokenBudget` limits. Conf
 
 ## Agents
 
+### Ask provenance
+
+`agents.spawn({ task, askId })` accepts an opaque ledger ask URI: a non-empty string of at most 512 UTF-8 bytes, without newlines or control characters. Fabric never interprets, trims, or rewrites it. Omitted `askId` inherits the spawning task's value unchanged; an explicit child value wins. Records and spawn receipts carry `askId` plus `askIdState` (`explicit`, `inherited`, or `missing`). With no value or parent value, Fabric emits a WARN and records `askId: null`, `askIdState: "missing"`; it never invents one.
+
+For a present value, the retained `task.txt` begins with exactly `Ask-ID: ["Smarty-Pants-Inc","<URI>"]` before the brief is hashed. Missing values add no marker. Process workers and placement launchers receive the exact value through `PI_FABRIC_ASK_ID`; custom launchers must preserve it across their host boundary. Durable residency snapshots the caller's value, not the resident host's.
+
 ### Interrupt-priority steer
 
 For a time-critical HOLD to an interactive Main, use:

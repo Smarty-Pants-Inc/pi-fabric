@@ -1,4 +1,5 @@
 import type { AgentRunCarryOver, AgentWorkerOptions } from "../agents/types.js";
+import { normalizeAgentAskId } from "../agents/ask-id.js";
 
 const argumentMap = (argv: readonly string[]): Map<string, string> => {
   const result = new Map<string, string>();
@@ -73,6 +74,9 @@ export const parseWorkerOptions = (
     }
     modelPolicyWarnings = warnings;
   }
+  const askId = normalizeAgentAskId(args.get("ask-id"));
+  const askIdState = optional(args, "ask-id-state");
+  if (askIdState !== undefined && askIdState !== "explicit" && askIdState !== "inherited" && askIdState !== "missing") throw new Error("Invalid worker askIdState");
   const promptSha256 = optional(args, "prompt-sha256");
   const promptBytesSource = optional(args, "prompt-bytes");
   const promptPath = optional(args, "prompt-path");
@@ -243,6 +247,7 @@ export const parseWorkerOptions = (
     ...(kernel ? { kernel, pythonRuntime } : {}),
     name: required(args, "name"),
     taskFile: required(args, "task-file"),
+    ...(askIdState ? { askId: askId ?? null, askIdState } : {}),
     ...(promptSha256 ? { promptSha256 } : {}),
     ...(promptBytes !== undefined ? { promptBytes } : {}),
     ...(promptPath ? { promptPath } : {}),

@@ -8,6 +8,7 @@ import { AgentManager } from "../src/agents/manager.js";
 import { normalizeAgentRunRequest } from "../src/agents/request.js";
 import { AgentInputError, RequiredInputMissingError } from "../src/agents/input-validation.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
+import { launchPlacedTask } from "../src/agents/transports/placement.js";
 import { TmuxTransport } from "../src/agents/transports/tmux-transport.js";
 import { ScreenTransport } from "../src/agents/transports/screen-transport.js";
 import { LocaltermTransport } from "../src/agents/transports/localterm-transport.js";
@@ -30,6 +31,7 @@ const [mode, root, id, ...argv] = process.argv.slice(2);
 const dir = path.join(root, id); fs.mkdirSync(dir, {recursive:true});
 if (mode === 'launch') {
  fs.writeFileSync(path.join(dir,'argv.json'), JSON.stringify(argv));
+ fs.writeFileSync(path.join(dir,'ask-id.json'), JSON.stringify(process.env.PI_FABRIC_ASK_ID ?? null));
  const task = argv.at(-1);
  if (task === 'require-refused') {
   const required = argv[argv.indexOf('--require') + 1];
@@ -116,6 +118,22 @@ describe("host process task placement", () => {
     expect(result).toMatchObject({ status: "completed", text: "REMOTE: inputs" });
     expect(JSON.parse(fs.readFileSync(path.join(f.results, result.id, "argv.json"), "utf8"))).toEqual(["--host", "auto", "--minutes", "1", "--cwd", f.root, "--model", "test/model", "--thinking", "high", "--require", requires[0], "--require", requires[1], "--", "inputs"]);
     expect(JSON.parse(fs.readFileSync(path.join(f.results, result.id, "poll-argv.json"), "utf8"))).toEqual([]);
+  });
+  it.each([
+    { ambient: "opaque-parent", askId: undefined, expected: "opaque-parent", askIdState: "inherited" },
+    { ambient: "opaque-parent", askId: "child override", expected: "child override", askIdState: "explicit" },
+    { ambient: "unrelated launcher ask", askId: undefined, expected: null, askIdState: "missing" },
+  ])("carries $askIdState askId into the placement launcher and its raw status", async ({ ambient, askId, expected, askIdState }) => {
+    vi.stubEnv("PI_FABRIC_ASK_ID", ambient);
+    const f = fixture();
+    const request = launch(f, "placed provenance");
+    request.workerArguments.push("--ask-id-state", askIdState, ...(expected === null ? [] : ["--ask-id", askId ?? expected]));
+    const handle = await launchPlacedTask(request, f.config.placement);
+    try {
+      expect(await handle.isAlive()).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(f.results, request.id, "ask-id.json"), "utf8"))).toBe(expected);
+      expect(JSON.parse(fs.readFileSync(path.join(f.root, "direct/status.json"), "utf8"))).toMatchObject({ status: "completed", askId: expected, askIdState });
+    } finally { await handle.stop(); }
   });
   it("matches NFKC and Unicode-White_Space canonicalized compound capabilities and needs", async () => {
     const f = fixture();

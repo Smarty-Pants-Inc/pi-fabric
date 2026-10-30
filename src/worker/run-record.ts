@@ -63,6 +63,7 @@ export const createRunningRecord = (
   name: options.name,
   ...(options.spawner ? { spawner: options.spawner } : {}),
   task,
+  ...(options.askIdState ? { askId: options.askId ?? null, askIdState: options.askIdState } : {}),
   ...(options.promptSha256 ? { promptSha256: options.promptSha256 } : {}),
   ...(options.promptBytes !== undefined ? { promptBytes: options.promptBytes } : {}),
   ...(options.promptPath ? { promptPath: options.promptPath } : {}),

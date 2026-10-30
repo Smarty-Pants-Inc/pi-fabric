@@ -299,7 +299,9 @@ describe("notification-driven bridge (smarty-dev#7299 A5)", () => {
     const program = path.join(f.root, "queued-hello.mjs");
     buildSync({ stdin: { contents: source, resolveDir: process.cwd() }, outfile: program, bundle: true, platform: "node", format: "esm", packages: "external" });
     const child = spawnSync(process.execPath, [program], { encoding: "utf8", timeout: 3_000 });
-    expect({ error: child.error?.message, status: child.status, stderr: child.stderr }).toEqual({ error: undefined, status: 0, stderr: "" });
+    // The local deletion guard announces itself before native product code; retain every other stderr byte.
+    const stderr = child.stderr.replace(/^hosted-only \(outside-temp deletion reporting\): push and let CI run it\r?\n/, "");
+    expect({ error: child.error?.message, status: child.status, stderr }).toEqual({ error: undefined, status: 0, stderr: "" });
     expect(JSON.parse(child.stdout.trim())).toEqual({ installed: 0, active: 0 });
   });
 

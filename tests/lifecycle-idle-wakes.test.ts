@@ -4,8 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LifecycleBroker } from "../src/lifecycle/broker.js";
-import { FABRIC_PARTICIPANT_LIFECYCLE_TOPIC, type FabricLifecycleEvent } from "../src/lifecycle/types.js";
+import { FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX, FABRIC_PARTICIPANT_LIFECYCLE_TOPIC,
+  type FabricLifecycleEvent, type FabricLifecycleSubscription } from "../src/lifecycle/types.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
+import { ParticipantDirectory } from "../src/topology/participant-directory.js";
 import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topology/types.js";
 
 // pi-fabric#7978: the broker drained on a pollMs interval forever. It now drains at start, on
@@ -13,6 +15,7 @@ import type { FabricParticipantInfo, FabricParticipantSource } from "../src/topo
 
 const roots: string[] = [];
 const brokers: LifecycleBroker[] = [];
+const directories: ParticipantDirectory[] = [];
 const restores: Array<() => void> = [];
 
 const target: MeshIdentity = { id: "session:target", name: "main", kind: "main", sessionId: "target" };
@@ -65,6 +68,7 @@ const realDelay = (ms: number) => new Promise((resolve) => setTimeout(resolve, m
 afterEach(async () => {
   vi.useRealTimers();
   await Promise.all(brokers.splice(0).map((broker) => broker.close()));
+  await Promise.all(directories.splice(0).map((directory) => directory.close()));
   for (const restore of restores.splice(0)) restore();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -96,6 +100,173 @@ describe("LifecycleBroker wakes", () => {
     expect(delivered).toEqual([]);                                     // nothing polls
     fake.root(mesh.root).callback("change", "events.jsonl");
     await vi.waitFor(() => expect(delivered.map((event) => event.occurredAt)).toEqual([2]), { timeout: 2_000, interval: 10 });
+  });
+
+  it("ignores fleet presence and sidecar noise before metadata work, then reads canonical events on a real event hint", async () => {
+    const fake = fakeWatch();
+    const delivered: FabricLifecycleEvent[] = [];
+    const { mesh, broker, settle } = await setup((event) => { delivered.push(event); });
+    for (const directory of ["participants", "host-leases"]) fs.mkdirSync(path.join(mesh.root, directory), { recursive: true });
+    broker.start();
+    await flush();
+    const drains = vi.spyOn(mesh, "listAll"), reads = vi.spyOn(mesh, "read"), stats = vi.spyOn(fs, "statSync");
+    restores.push(() => { drains.mockRestore(); reads.mockRestore(); stats.mockRestore(); });
+    for (let index = 0; index < 1_371; index++) {
+      fake.root(mesh.root).callback("change", "bridge-cursor.json");
+      fake.root(mesh.root).callback("rename", "state.json.123.tmp");
+      for (const directory of ["participants", "host-leases"]) {
+        fake.root(path.join(mesh.root, directory)).callback("change", `${index}.json`);
+      }
+    }
+    await flush();
+    expect(stats.mock.calls.length).toBe(0);
+    expect(drains.mock.calls.length).toBe(0);
+    expect(reads.mock.calls.length).toBe(0);
+    await settle(12);
+    fake.root(mesh.root).callback("change", "events.jsonl");
+    await flush();
+    expect(delivered.map(event => event.occurredAt)).toEqual([12]);
+    expect(reads).toHaveBeenCalled();
+  });
+
+  it.each(["state.json", "state.db", "state.db-wal", "state.db-journal"])("drains a changed subscription and pending events on %s hints", async name => {
+    const fake = fakeWatch();
+    const delivered: FabricLifecycleEvent[] = [];
+    const { mesh, broker, settle } = await setup(event => { delivered.push(event); });
+    broker.start();
+    await flush();
+    await settle(13);
+    const entry = mesh.listAll(FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX)[0]!;
+    await mesh.put({ key: entry.key, identity: target, ifVersion: entry.version,
+      value: { ...(entry.value as FabricLifecycleSubscription), triggerTurn: true } });
+    fake.root(mesh.root).callback("change", name);
+    await flush();
+    expect(delivered.map(event => event.occurredAt)).toEqual([13]);
+  });
+
+  it("a restored subscription waits for receiver publication, then delivers on presence alone without waking for permanently foreign targets", async () => {
+    const fake = fakeWatch();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-lifecycle-bootstrap-")); roots.push(root);
+    const mesh = new MeshStore(path.join(root, "mesh"), 64 * 1024, 100, { stateBackend: "file" });
+    const directory = (identity: MeshIdentity) => {
+      const value = new ParticipantDirectory(mesh, { enabled: true, hostId: identity.id, rootId: identity.id,
+        identity, heartbeatMs: 60_000, leaseMs: 60_000 });
+      directories.push(value);
+      value.registerSource(() => [value.root({ id: identity.id, name: "Main", kind: "main", status: "idle",
+        runner: "pi", transport: "host", updatedAt: 1, pendingMessages: false, local: true })]);
+      return value;
+    };
+    const sender = directory(sourceIdentity), receiver = directory(target);
+    await sender.refresh();
+    const saved = (id: string, from: string, to: string): FabricLifecycleSubscription => ({
+      format: 1, id, from, to, events: ["pi.agent_settled"], delivery: "followUp", triggerTurn: false,
+      once: false, afterSequence: 0, createdAt: 1, updatedAt: 1, createdBy: target,
+    });
+    await mesh.writeBatch({ identity: target, ops: [
+      { kind: "put", key: FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + "restored", value: saved("restored", source.id, target.id) },
+      { kind: "put", key: FABRIC_LIFECYCLE_SUBSCRIPTION_PREFIX + "foreign", value: saved("foreign", target.id, source.id) },
+    ] });
+    const event = await mesh.publish({ topic: FABRIC_PARTICIPANT_LIFECYCLE_TOPIC, kind: "pi.agent_settled",
+      from: sourceIdentity, data: { version: 1, event: "pi.agent_settled", source, occurredAt: 17 } });
+    const delivered: FabricLifecycleEvent[] = [];
+    const broker = new LifecycleBroker(mesh, target, receiver, { enabled: true, pollMs: 20, maxReadEvents: 100 },
+      (_subscription, event) => { delivered.push(event); });
+    brokers.push(broker);
+    expect(receiver.publishes(target.id)).toBe(false);
+    broker.start();
+    await flush();
+    expect(delivered).toEqual([]);
+
+    // Startup can finish before a failed initial publication recovers. No new event or subscription follows.
+    await receiver.refresh();
+    expect([receiver.publishes(target.id), receiver.publishes(source.id)]).toEqual([true, false]);
+    fake.root(path.join(mesh.root, "participants")).callback("change", "target.json");
+    await flush();
+    expect(delivered.map(entry => entry.id)).toEqual([event.id]);
+
+    // The remaining foreign target must not turn fleet heartbeats into directory/stat/event work.
+    const drains = vi.spyOn(mesh, "listAll"), reads = vi.spyOn(mesh, "read"), stats = vi.spyOn(fs, "statSync");
+    const lists = vi.spyOn(receiver, "list"), gets = vi.spyOn(receiver, "get");
+    restores.push(() => { drains.mockRestore(); reads.mockRestore(); stats.mockRestore(); lists.mockRestore(); gets.mockRestore(); });
+    for (let index = 0; index < 1_371; index++) {
+      fake.root(path.join(mesh.root, "participants")).callback("change", `${index}.json`);
+      fake.root(path.join(mesh.root, "host-leases")).callback("change", `${index}.json`);
+    }
+    await flush();
+    expect(stats).not.toHaveBeenCalled();
+    expect(drains).not.toHaveBeenCalled();
+    expect(reads).not.toHaveBeenCalled();
+    expect(lists).not.toHaveBeenCalled();
+    expect(gets).not.toHaveBeenCalled();
+    expect(delivered.map(entry => entry.id)).toEqual([event.id]);
+  });
+
+  it("keeps presence wakes for an event waiting on its local target to become live", async () => {
+    const fake = fakeWatch();
+    const delivered: FabricLifecycleEvent[] = [];
+    const { mesh, broker, settle } = await setup(event => { delivered.push(event); });
+    fs.mkdirSync(path.join(mesh.root, "participants"), { recursive: true });
+    const local = broker.participants.get(target.id)!;
+    local.stale = true;
+    await settle(14);
+    broker.start();
+    await flush();
+    expect(delivered).toEqual([]);
+    local.stale = false;
+    fake.root(path.join(mesh.root, "participants")).callback("change", "target.json");
+    await flush();
+    expect(delivered.map(event => event.occurredAt)).toEqual([14]);
+    const drains = vi.spyOn(mesh, "listAll");
+    restores.push(() => drains.mockRestore());
+    fake.root(path.join(mesh.root, "participants")).callback("change", "target.json");
+    await flush();
+    expect(drains).not.toHaveBeenCalled();
+  });
+
+  it("does not lose a presence change while another subscription is delivering against an older directory view", async () => {
+    const fake = fakeWatch();
+    const delivered: string[] = [];
+    const later = { ...record(target, true), id: "session:later", rootId: "session:later", stale: false };
+    const { mesh, broker, settle } = await setup(() => {});
+    fs.mkdirSync(path.join(mesh.root, "participants"), { recursive: true });
+    const records = [...broker.participants.list(), later];
+    const list = vi.spyOn(broker.participants, "list").mockImplementation(() => structuredClone(records));
+    const get = vi.spyOn(broker.participants, "get").mockImplementation(id => records.find(entry => entry.id === id));
+    restores.push(() => { list.mockRestore(); get.mockRestore(); });
+    await broker.subscribe({ from: source.id, events: ["pi.agent_settled"], to: later.id, delivery: "followUp", triggerTurn: false });
+    // Whichever subscription is listed first can deliver; the other is stale in this drain's snapshot.
+    const subscriptions = broker.list();
+    const first = records.find(entry => entry.id === subscriptions[0]!.to)!;
+    const second = records.find(entry => entry.id === subscriptions[1]!.to)!;
+    second.stale = true;
+    const deliver = vi.spyOn(broker, "deliver").mockImplementation(subscription => {
+      delivered.push(subscription.to);
+      if (subscription.to === first.id) {
+        second.stale = false;
+        fake.root(path.join(mesh.root, "participants")).callback("change", "second.json");
+      }
+    });
+    restores.push(() => deliver.mockRestore());
+    await settle(16);
+    broker.start();
+    await flush();
+    expect(delivered).toEqual([first.id, second.id]);
+  });
+
+  it("keeps presence wakes while the consumption gate is holding dirty work", async () => {
+    const fake = fakeWatch();
+    const delivered: FabricLifecycleEvent[] = [];
+    const { mesh, broker, settle } = await setup(event => { delivered.push(event); });
+    let canConsume = false;
+    broker.options.canConsumeMesh = () => canConsume;
+    await settle(15);
+    broker.start();
+    await flush();
+    expect(delivered).toEqual([]);
+    canConsume = true;
+    fake.root(mesh.root).callback("change", "host-leases");
+    await flush();
+    expect(delivered.map(event => event.occurredAt)).toEqual([15]);
   });
 
   it("answers a watcher error with one rescan and a one-shot re-arm, not a poll", async () => {

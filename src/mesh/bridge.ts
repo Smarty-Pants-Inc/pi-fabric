@@ -415,7 +415,11 @@ export interface BridgeRead {
 
 export interface BridgeHead { through: number; offset?: number }
 
-export interface BridgePublishReceipt { sequence: number; createdAt?: number }
+export interface BridgePublishReceipt {
+  sequence: number; createdAt?: number;
+  /** Durably consumed as an event refusal, not a successful destination delivery. */
+  kind?: "refused";
+}
 
 export interface BridgePublish {
   principal?: FabricPrincipal | undefined;
@@ -454,7 +458,7 @@ export interface BridgeSide {
   /** Hub-local only: a structurally attributable projection whose authority is stale; never routing authority. */
   relayStaleOrigin?(id: string): string | undefined;
   /** Publish a bridged event; with `held`, only if this link holds each of those ids at commit. */
-  publish(event: BridgePublish, held?: string[]): Promise<{ sequence: number }>;
+  publish(event: BridgePublish, held?: string[]): Promise<BridgePublishReceipt>;
   /** Internal append receipt with the destination timestamp; older BridgeSide implementations may omit it. */
   publishWithReceipt?(event: BridgePublish, held?: string[]): Promise<BridgePublishReceipt>;
   /** Hub-local only: persist a payload-free successful relay receipt under the sender fence. */
@@ -2657,6 +2661,11 @@ export class StoreBridgeSide implements BridgeSide {
     }
   }
 
+}
+
+/** An unsafe side/link failure must never be mistaken for a permanent event refusal by message text. */
+export class BridgeLinkError extends Error {
+  override readonly name = "BridgeLinkError";
 }
 
 /** An event refused at commit: its sender or target is no longer bound to this link. */
@@ -5098,7 +5107,8 @@ export class MeshBridge {
             seen.add(event.id);
             cursor.mark = Math.max(cursor.mark, published.sequence);
             cursor.after = event.sequence;
-            forwarded += 1;
+            if (published.kind === "refused") dropped += 1;
+            else forwarded += 1;
             checkpoint();
             this.#clearStallOnProgress(direction);
             // Only this newly inserted ID is covered by the checkpoint; recovery IDs stay.
@@ -5559,6 +5569,6 @@ const allBridgedIds = async (side: BridgeSide, after: number): Promise<Set<strin
 };
 
 const isPermanent = (error: unknown): boolean =>
-  !isIdempotencyKeyReused(error) && !isMeshIncarnationPending(error) && !isMeshSnapshotRetriesExhausted(error) &&
+  !(error instanceof BridgeLinkError || error instanceof BridgeMirrorDeferredError) && !isIdempotencyKeyReused(error) && !isMeshIncarnationPending(error) && !isMeshSnapshotRetriesExhausted(error) &&
   !isMeshLockTimeout(error) && (error instanceof BridgeOwnershipError ||
     error instanceof Error && /exceeds|not allowed|no bridge stamp|no recipient|no sender|Invalid mesh topic/i.test(error.message));

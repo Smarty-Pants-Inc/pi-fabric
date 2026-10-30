@@ -33,6 +33,8 @@ import { isMeshIncarnationPending, isMeshSnapshotRetriesExhausted, isMeshLockTim
   MESH_STATE_WAL_CAP_CODE, isMeshStateWalCap } from "../core/atomic-write.js";
 import type { LockTimingContext } from "./commit-stats.js";
 import type { MeshIdentity } from "./event-log.js";
+import { bindPrefixObservation, PrefixObservationCache, type PrefixObservation, type PrefixWitness } from "./prefix-observation.js";
+export type { DeepReadonly, PrefixEntries, PrefixObservation, PrefixWitness } from "./prefix-observation.js";
 import { isMeshStateBackendKind, MESH_STATE_BACKEND_KIND_LIST, type MeshStateBackendKind } from "./state-backend-kinds.js";
 import type { MeshStoreContext } from "./mesh-lock.js";
 import { preparedNatsStateBackend } from "./state-backend-nats.js";
@@ -224,6 +226,13 @@ export interface StateBackend {
   list(prefix?: string, limit?: number, options?: MeshReadOptions): MeshStateEntry[];
   listAll(prefix?: string, options?: MeshReadOptions): MeshStateEntry[];
   listAllShared(prefix?: string, options?: MeshReadOptions): readonly Readonly<MeshStateEntry>[];
+  /**
+   * OPTIONAL complete immutable selection, or proof the previous selection is unchanged. UNKNOWN
+   * (including an absent method) means exactly the caller's existing listAll, never known-empty.
+   * Handles bind this backend/open-store/epoch/prefix and are invalidated on reset/close/eviction.
+   * Errors retain listAll's canonical path and single busy budget. No write lock or network work.
+   */
+  observePrefix?(prefix: string, previous?: PrefixWitness): PrefixObservation;
   /** An opaque token for the state reads return now; pass it as `snapshot` to read that state again. */
   stateToken(options?: MeshReadOptions): object;
   stateStamp(): string | undefined;
@@ -1053,6 +1062,8 @@ export class ShadowStateBackend implements StateBackend {
   readonly kind = "shadow" as const;
   readonly #file: StateFile;
   readonly #shadow: SqliteStateBackend;
+  readonly #prefixObservations = new PrefixObservationCache<PrefixWitness>();
+  #prefixObservationClosed = false;
   readonly #budgetMs: number;
   readonly #pending = new Set<string>();
   #full = true;
@@ -1118,6 +1129,15 @@ export class ShadowStateBackend implements StateBackend {
   listAllShared(prefix?: string, options?: MeshReadOptions): readonly Readonly<MeshStateEntry>[] {
     return this.#file.listAllShared(prefix, options);
   }
+
+  observePrefix(prefix: string, previous?: PrefixWitness): PrefixObservation {
+    // Legacy FILE reads remain available after close; this Shadow's optional proof authority does not.
+    if (this.#prefixObservationClosed) return { kind: "unknown", reason: "shadow-prefix-observation-closed" };
+    const authority: StateBackend = this.#file;
+    return bindPrefixObservation(this.#prefixObservations, prefix, previous,
+      (handle) => authority.observePrefix?.(prefix, handle) ?? { kind: "unknown", reason: "file-prefix-observation-unsupported" });
+  }
+
   stateToken(options?: MeshReadOptions): object { return this.#file.stateToken(options); }
   stateStamp(): string | undefined { return this.#file.stateStamp(); }
   cachedStateStamp(fresh?: boolean, revalidateGeneration?: boolean): string | undefined {
@@ -1158,7 +1178,10 @@ export class ShadowStateBackend implements StateBackend {
   // state.json is the authority; the shadow database is a copy rebuilt from it, so only the file syncs.
   sync(budgetMs: number): Promise<void> { return this.#file.sync(budgetMs); }
 
-  dropCache(): void { this.#file.dropCache(); }
+  dropCache(): void {
+    this.#prefixObservations.clear();
+    this.#file.dropCache();
+  }
 
   diagnostics(): StateBackendDiagnostics {
     return {
@@ -1169,6 +1192,8 @@ export class ShadowStateBackend implements StateBackend {
   }
 
   close(): void {
+    this.#prefixObservationClosed = true;
+    this.#prefixObservations.clear();
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
     this.#disabled ??= "closed";

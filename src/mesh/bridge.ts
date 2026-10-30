@@ -1634,7 +1634,8 @@ export class StoreBridgeSide implements BridgeSide {
   #fenced = false;
   #staleAdmission: BridgeStaleIncarnationError | undefined;
   #inflight: Promise<void> = Promise.resolve();
-  #leaseRenewal: Promise<void> = Promise.resolve();
+  #leaseRenewal: Promise<void> | undefined;
+  #mirrorsPending = 0;
   #hasCommittedPass = false;
   /** A lease effect under its host gate found newer lease authority on disk than its plan saw. */
   #leaseAuthorityAhead = false;
@@ -1648,7 +1649,13 @@ export class StoreBridgeSide implements BridgeSide {
     if (this.#staleAdmission) return Promise.reject(this.#staleAdmission);
     if (this.#fenced) return Promise.resolve();
     // Only the forced-command agent sets fromHub for its trusted hub's mirror RPC.
-    const run = this.#inflight.then(() => this.#mirror(presence, false, observedAt, fromHub)).catch((error: unknown) => {
+    this.#mirrorsPending++;
+    const run = this.#inflight.then(async () => {
+      // Watch renewals and full reconciliation share host custody. Join the already-active
+      // renewal, while new watch ticks defer rather than contend with this pass in our pid.
+      await this.#leaseRenewal;
+      await this.#mirror(presence, false, observedAt, fromHub);
+    }).catch((error: unknown) => {
       if (error instanceof BridgeStaleIncarnationError) {
         // This instance never acquired the newer incarnation. Fence queued writes and keep
         // cleanup from withdrawing its predecessor's persisted authority after the refusal.
@@ -1656,16 +1663,19 @@ export class StoreBridgeSide implements BridgeSide {
         this.#fenced = true;
       }
       throw error;
-    });
+    }).finally(() => { this.#mirrorsPending--; });
     this.#inflight = run.catch(() => undefined);
     return run;
   }
 
   /** Refresh only already-installed direct root leases, never membership or incarnations.
-   * A live watch may call this while a full mirror/drain is waiting. The existing per-host
-   * custody, current-row checks and exact file-version CAS still own every lease write. */
+   * Watch ticks run independently of drains, but defer to full mirrors sharing their custody.
+   * Current-row checks and exact file-version CAS still own every lease write. */
   renewMirroredLeases(hosts: readonly BridgeHost[], observedAt: number): Promise<void> {
-    const run = this.#leaseRenewal.then(async () => {
+    // Skip overlapping ticks: queued samples spend their authority waiting behind a lock.
+    if (this.#leaseRenewal) return Promise.resolve();
+    if (!this.#fenced && this.#mirrorsPending > 0) return Promise.reject(new BridgeMirrorDeferredError(false, 0));
+    const run = Promise.resolve().then(async () => {
       if (this.#staleAdmission) throw this.#staleAdmission;
       if (this.#fenced || !Number.isFinite(observedAt) || observedAt > this.now()) return;
       for (const { record, expiresAt, observedAt: sourceObservedAt } of hosts) {
@@ -1695,7 +1705,7 @@ export class StoreBridgeSide implements BridgeSide {
           }, false, false);
         });
       }
-    });
+    }).finally(() => { this.#leaseRenewal = undefined; });
     this.#leaseRenewal = run.catch(() => undefined);
     return run;
   }

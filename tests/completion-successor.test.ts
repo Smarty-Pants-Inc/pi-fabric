@@ -9,6 +9,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { AgentCompletionInbox } from "../src/agents/completion-inbox.js";
 import * as atomicWrite from "../src/core/atomic-write.js";
 import { CompletionJournal, completionConsumed, consumeCompletion, pendingCompletions, saveCompletion, saveWorkerCompletion, type CompletionRecipient } from "../src/agents/completion-journal.js";
+import { ARCHIVE_PENDING_FILE, stageRunArchive } from "../src/agents/archive-custody.js";
 import type { AgentRunResult, AgentHandleInfo } from "../src/agents/types.js";
 import { AgentManager } from "../src/agents/manager.js";
 import { ProcessTransport } from "../src/agents/transports/process-transport.js";
@@ -305,6 +306,69 @@ describe("round 5 spawn-time completion authority", () => {
     expect(envelopes.find(value => value.result.id === queued.id)?.recipient.name).toBe("probe-lane");
     const manifest = JSON.parse(fs.readFileSync(path.join(manager.runDirectory(queued.id)!, "completion-recipient.json"), "utf8"));
     expect(manifest.recipient.name).toBe("probe-lane");
+  });
+
+  it.each(["incremental", "main"] as const)("CA-006 D2 replays recipientless legacy archives through the %s recovery path", branch => {
+    const h = harness(); const owner = h.client("A", 100);
+    const dynamic = new ResidencyClient({ ...owner.client.options, mainName: () => "todayMain" }); clients.push(dynamic);
+    const admitted = { ...h.recipient, name: "probe-lane" };
+    const result = { ...h.result, logFile: path.join(h.root, "runs", h.result.id, "events.jsonl") };
+    const runDirectory = path.dirname(result.logFile!);
+    fs.mkdirSync(runDirectory, { recursive: true });
+    fs.writeFileSync(path.join(runDirectory, "completion-recipient.json"), JSON.stringify({ meshRoot: h.meshRoot, recipient: admitted }));
+    stageRunArchive(runDirectory, { format: 1, kind: "settlement", result });
+    const pendingFile = path.join(runDirectory, ARCHIVE_PENDING_FILE);
+    const archived = JSON.parse(fs.readFileSync(pendingFile, "utf8"));
+    expect(archived.pending.settlement).not.toHaveProperty("recipient");
+    const onSettled = vi.fn((outcome: AgentRunResult, admittedRecipient?: CompletionRecipient) => {
+      dynamic.enqueueCompletion(outcome, admittedRecipient);
+    });
+    const manager = new AgentManager(h.root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, {
+      runRoot: path.join(h.root, "runs"), meshRoot: h.meshRoot, onSettled,
+    });
+    managers.push(manager);
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: branch === "main" ? "win32" : "linux" });
+      expect(manager.recoverPendingArchives(runDirectory)).toBe(1);
+    } finally { Object.defineProperty(process, "platform", platform); }
+    expect(onSettled).toHaveBeenCalledOnce();
+    expect(onSettled.mock.calls[0]).toHaveLength(2);
+    expect(onSettled.mock.calls[0]![1]).toEqual(admitted);
+    expect(pendingCompletions(h.meshRoot, h.root)).toEqual([{ format: 1, recipient: admitted, result }]);
+    expect(fs.existsSync(pendingFile)).toBe(false);
+  });
+
+  it("CA-006 D2 keeps an explicit archived recipient authoritative over a foreign result locator", () => {
+    const h = harness(); const owner = h.client("A", 100);
+    const dynamic = new ResidencyClient({ ...owner.client.options, mainName: () => "todayMain" }); clients.push(dynamic);
+    const admitted = { ...h.recipient, name: "probe-lane" };
+    const runDirectory = path.join(h.root, "runs", h.result.id); fs.mkdirSync(runDirectory, { recursive: true });
+    const callerManifest = path.join(runDirectory, "completion-recipient.json");
+    fs.writeFileSync(callerManifest, JSON.stringify({ meshRoot: h.meshRoot, recipient: { ...admitted, name: "caller-manifest" } }));
+    const foreignRun = path.join(h.root, "foreign-run"); fs.mkdirSync(foreignRun);
+    const foreignManifest = path.join(foreignRun, "completion-recipient.json");
+    fs.writeFileSync(foreignManifest, JSON.stringify({ meshRoot: h.meshRoot, recipient: {
+      ...h.recipient, rootId: "session:foreign", sessionId: "foreign", name: "foreign-lane", startedAt: 200,
+    } }));
+    const result = { ...h.result, logFile: path.join(foreignRun, "events.jsonl") };
+    stageRunArchive(runDirectory, { format: 1, kind: "settlement", result, recipient: admitted });
+    const onSettled = vi.fn((outcome: AgentRunResult, admittedRecipient?: CompletionRecipient) => {
+      dynamic.enqueueCompletion(outcome, admittedRecipient);
+    });
+    const manager = new AgentManager(h.root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0 }, {
+      runRoot: path.join(h.root, "runs"), meshRoot: h.meshRoot, onSettled,
+    });
+    managers.push(manager);
+    const read = vi.spyOn(fs, "readFileSync");
+    try {
+      expect(manager.recoverPendingArchives(runDirectory)).toBe(1);
+      expect(onSettled.mock.calls[0]).toHaveLength(2);
+      expect(onSettled.mock.calls[0]![1]).toEqual(admitted);
+      expect(pendingCompletions(h.meshRoot, h.root)).toEqual([{ format: 1, recipient: admitted, result }]);
+      expect(read.mock.calls.filter(([target]) => [callerManifest, foreignManifest].includes(String(target)))).toEqual([]);
+      expect(fs.existsSync(path.join(runDirectory, ARCHIVE_PENDING_FILE))).toBe(false);
+    } finally { read.mockRestore(); }
   });
 
   // Keep: CA-006's real queued-spawn catch crosses the caller-owned admission /

@@ -7584,8 +7584,12 @@ export class AgentManager {
 
   #stageArchive(directory: string, result: AgentRunResult, kind: PendingRunArchive["kind"], recipient?: CompletionRecipient, actorOnly = true): void {
     const actorSessionFile = process.env.PI_FABRIC_ACTOR_SESSION_FILE;
-    stageRunArchive(directory, { format: 1, kind, result, routePending: !actorOnly, ...(recipient ? { recipient } : {}),
-      ...(actorSessionFile && result.spawner?.kind === "actor" ? { actorSessionFile, notify: this.config.notifyOnComplete, actorOnly } : {}) });
+    // JSON drops undefined; retain the distinction between recorded absence and legacy omission.
+    const archive: PendingRunArchive & { completionRecipientRecorded: true } = {
+      format: 1, kind, result, routePending: !actorOnly, completionRecipientRecorded: true, ...(recipient ? { recipient } : {}),
+      ...(actorSessionFile && result.spawner?.kind === "actor" ? { actorSessionFile, notify: this.config.notifyOnComplete, actorOnly } : {}),
+    };
+    stageRunArchive(directory, archive);
     if (actorSessionFile && result.spawner?.kind === "actor") new ActorChildCompletionStore(actorSessionFile).trackArchiveSource(result.id, directory);
   }
 
@@ -7632,7 +7636,7 @@ export class AgentManager {
             if (archive.actorSessionFile && archive.actorOnly && archive.result.spawner?.kind === "actor") {
               new ActorChildCompletionStore(archive.actorSessionFile).enqueue(archive.result, archive.result.spawner, archive.notify);
             } else if (archive.kind === "shutdown" && this.#onStoppedAtClose) this.#onStoppedAtClose([archive.result]);
-            else if (archive.kind === "settlement" && this.#onSettled) this.#onSettled(archive.result, archive.recipient);
+            else if (archive.kind === "settlement" && this.#onSettled) this.#onSettled(archive.result, this.#archivedCompletionRecipient(directory, archive));
             else continue;
             commitRunArchive(directory, archive.kind);
             // Replaying an old result is not new worker activity. Removing its
@@ -7711,7 +7715,7 @@ export class AgentManager {
               if (archive.actorSessionFile && archive.actorOnly && archive.result.spawner?.kind === "actor") {
                 new ActorChildCompletionStore(archive.actorSessionFile).enqueue(archive.result, archive.result.spawner, archive.notify);
               } else if (archive.kind === "shutdown" && manager.#onStoppedAtClose) manager.#onStoppedAtClose([archive.result]);
-              else if (archive.kind === "settlement" && manager.#onSettled) manager.#onSettled(archive.result, archive.recipient);
+              else if (archive.kind === "settlement" && manager.#onSettled) manager.#onSettled(archive.result, manager.#archivedCompletionRecipient(directory, archive));
               else continue;
               if (!unchanged()) break;
               commitRunArchive(directory, archive.kind);
@@ -7732,6 +7736,14 @@ export class AgentManager {
       yield* visitChildren(path.join(directory, "nested"), depth + 1);
     }
     if (children) yield* visitChildren(root, 0); else yield* visit(root, 0);
+  }
+
+  /** Untagged recipientless archives retain legacy lookup, but only in the caller-owned source directory. */
+  #archivedCompletionRecipient(directory: string, archive: PendingRunArchive): CompletionRecipient | undefined {
+    if (Object.prototype.hasOwnProperty.call(archive, "recipient") ||
+        ("completionRecipientRecorded" in archive && archive.completionRecipientRecorded === true)) return archive.recipient;
+    return this.#meshRoot && !archive.result.actorId
+      ? completionRecipientFromRun(this.#meshRoot, directory) : undefined;
   }
 
   /** Completion custody belongs to the caller's admitted run, not the worker's log location. */

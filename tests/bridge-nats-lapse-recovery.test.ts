@@ -162,7 +162,9 @@ describe("NATS carrier bounded lapse recovery", () => {
         throw Object.assign(new Error("injected post-rename barrier fault"), { code: "EIO" });
       } });
     });
-    await expect(f.link.remote.read(0)).rejects.toMatchObject({ code: mode === "before-write" ? "ENOSPC" : "EIO" });
+    // The link wraps a non-transient fault in BridgeLinkError (deferTransient); the injected code is kept on its cause.
+    const fault = await f.link.remote.read(0).then(() => undefined, (error: unknown) => error as { code?: unknown; cause?: { code?: unknown } });
+    expect(fault?.code ?? fault?.cause?.code).toBe(mode === "before-write" ? "ENOSPC" : "EIO");
     if (mode === "after-rename") expect(f.saved()[0]!.startedAt).toBe(f.initial);
     fault.mockRestore(); expect(d.acked).toBe(0); expect(d.termed).toEqual([]);
     f.advance(WINDOW); await expect(f.link.remote.read(0)).resolves.toMatchObject({ events: [] });

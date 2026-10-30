@@ -17,6 +17,8 @@ import {
 } from "../src/agents/manager.js";
 import { markUnresolvedWorker } from "../src/storage/retention.js";
 import * as retentionStorage from "../src/storage/retention.js";
+import * as verifiedRemoval from "../src/storage/verified-remove.js";
+import * as windowsCommand from "../src/storage/windows-powershell-command.js";
 import { writeJsonAtomic } from "../src/core/atomic-write.js";
 import {
   clearOwnedBudgetEnv,
@@ -31,6 +33,90 @@ import { fakeManagerHeapWorker } from "./fixtures/manager-heap-probe.js";
 const ProductionAgentManager = AgentManager;
 const managers: AgentManager[] = [];
 const roots: string[] = [];
+const retainedFixtureRoots = new Set<string>();
+const custodyMoves = vi.hoisted(() => [] as Array<{ source: string; destination: string; receipt: string }>);
+vi.mock("../src/agents/worktree-manager.js", async original => {
+  const actual = await original<typeof import("../src/agents/worktree-manager.js")>();
+  return { ...actual, retainCleanupRoot: (...args: Parameters<typeof actual.retainCleanupRoot>) => {
+    if ([...retainedFixtureRoots].some(root => args[0] === root || args[0].startsWith(`${root}${path.sep}`))) retainedFixtureRoots.add(args[1]);
+    const moved = actual.retainCleanupRoot(...args);
+    if (moved) custodyMoves.push(moved);
+    return moved;
+  } };
+});
+const digest = (bytes: string | Buffer): string => createHash("sha256").update(bytes).digest("hex");
+type RawEntry = { name: string; kind: "directory" | "file"; dev: string; ino: string; bytes?: Buffer };
+const rawInventory = (root: string): RawEntry[] => {
+  const entries: RawEntry[] = [];
+  let bytes = 0;
+  const walk = (name: string): void => {
+    const file = path.join(root, name), stat = fs.lstatSync(file, { bigint: true });
+    if (entries.length >= 5_000 || stat.isSymbolicLink() || (!stat.isDirectory() && (!stat.isFile() || stat.nlink !== 1n))) throw new Error("Unsupported custody fixture entry");
+    const row: RawEntry = { name, kind: stat.isDirectory() ? "directory" : "file", dev: String(stat.dev), ino: String(stat.ino) };
+    if (stat.isFile()) {
+      if ((bytes += Number(stat.size)) > 96 * 1024 * 1024) throw new Error("Custody fixture byte bound exceeded");
+      row.bytes = fs.readFileSync(file);
+    }
+    entries.push(row);
+    if (stat.isDirectory()) for (const child of fs.readdirSync(file).sort()) walk(path.join(name, child));
+  };
+  walk(""); return entries;
+};
+const seedCustodyTrace = (root: string): RawEntry[] => {
+  for (const [name, bytes] of [
+    ["session.NdJsOn.backup", Buffer.from('raw π\n{"torn":')],
+    ["logs/stderr.log", Buffer.from("stderr\u0000tail")],
+    ["tmp/opaque.bin", Buffer.from([0, 255, 13, 10])],
+  ] as const) {
+    fs.mkdirSync(path.dirname(path.join(root, name)), { recursive: true });
+    fs.writeFileSync(path.join(root, name), bytes);
+  }
+  return rawInventory(root);
+};
+const expectWholeCustody = (source: string, before: RawEntry[], id: string): string => {
+  const moves = custodyMoves.filter(move => move.source === source);
+  expect(moves).toHaveLength(1);
+  const move = moves[0]!;
+  const prepared = JSON.parse(fs.readFileSync(path.join(path.dirname(move.receipt), "custody.prepared.json"), "utf8"));
+  const final = JSON.parse(fs.readFileSync(move.receipt, "utf8"));
+  expect(prepared).toMatchObject({ format: 1, source, destination: move.destination, id, reason: "agent cleanup run directory", state: "prepared", time: expect.any(Number) });
+  expect(final).toEqual({ ...prepared, state: "moved", time: expect.any(Number) });
+  expect(final.time).toBeGreaterThanOrEqual(prepared.time);
+  expect(path.relative(source, move.destination).startsWith(`..${path.sep}`)).toBe(true);
+  for (let ancestor = move.destination; ; ancestor = path.dirname(ancestor)) {
+    expect(fs.existsSync(path.join(ancestor, ".git"))).toBe(false);
+    if (path.dirname(ancestor) === ancestor) break;
+  }
+  expect(rawInventory(move.destination)).toEqual(before);
+  expect(fs.existsSync(source)).toBe(false);
+  retainedFixtureRoots.add(path.dirname(move.receipt));
+  // Native descriptor read-back/tail on the actual renamed object. Descriptors
+  // are opened AFTER this positive move, so Windows open-handle rename policy
+  // is not assumed; the POSIX across-rename control lives in short-child-tmpdir.
+  const trace = before.find(row => row.name === "session.NdJsOn.backup")!;
+  const fd = fs.openSync(path.join(move.destination, trace.name), "a");
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    expect([String(opened.dev), String(opened.ino)]).toEqual([trace.dev, trace.ino]);
+    fs.writeSync(fd, "\nheld FD tail π");
+  } finally { fs.closeSync(fd); }
+  expect(fs.readFileSync(path.join(move.destination, trace.name))).toEqual(Buffer.concat([trace.bytes!, Buffer.from("\nheld FD tail π")]));
+  return move.destination;
+};
+const exportCustodyFixtures = (): void => {
+  const evidence = process.env.PI_TEST_CUSTODY_EVIDENCE_DIR;
+  if (!evidence) return;
+  fs.mkdirSync(evidence, { recursive: true });
+  const content = (root: string) => rawInventory(root).map(({ name, kind, bytes }) => ({ name, kind, ...(bytes ? { bytes: bytes.length, sha256: digest(bytes) } : {}) }));
+  for (const source of retainedFixtureRoots) {
+    if (!fs.existsSync(source)) continue;
+    const before = content(source), destination = fs.mkdtempSync(path.join(evidence, "manager-"));
+    fs.cpSync(source, path.join(destination, "tree"), { recursive: true, dereference: false });
+    expect(content(source)).toEqual(before);
+    expect(content(path.join(destination, "tree"))).toEqual(before);
+    fs.writeFileSync(path.join(destination, "export.json"), JSON.stringify({ source, destination: path.join(destination, "tree"), method: "COPY with independent SHA256 readback; not inode custody", entries: before }));
+  }
+};
 // Private legacy-control fixture: only #11864 is listed; #1 remains unlisted.
 const legacyExceptionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-agent-manager-exceptions-"));
 const boundRootRecord = Object.freeze({ cwd: legacyExceptionRoot });
@@ -158,7 +244,12 @@ afterEach(async () => {
   restoreAdmissionFixture?.();
   // ponytail: on Windows a just-exited child can still hold its cwd (EBUSY on rmdir);
   // Node retries EBUSY/ENOTEMPTY/EPERM with backoff when maxRetries is set (smarty-dev#883).
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  exportCustodyFixtures();
+  for (const root of roots.splice(0)) {
+    if (!retainedFixtureRoots.has(root)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+  retainedFixtureRoots.clear();
+  custodyMoves.splice(0);
 });
 
 const expectUnconfirmedClose = async (manager: AgentManager) => {
@@ -168,6 +259,7 @@ const expectUnconfirmedClose = async (manager: AgentManager) => {
 describe("Agent prompt retention (#11663)", () => {
   const managedFixture = (prefix: string) => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); roots.push(tempRoot);
+    retainedFixtureRoots.add(tempRoot);
     // Retention belongs to managed OS-temp roots, not explicit caller roots.
     vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
     vi.stubEnv("PI_FABRIC_TMPDIR", undefined);
@@ -180,7 +272,7 @@ describe("Agent prompt retention (#11663)", () => {
   };
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
-  it("keeps a failed prompt and metadata across manager close while successful trees are removed", async () => {
+  it("archives whole failed and completed trees across manager close without rewriting prompt or outcome bytes", async () => {
     const manager = managedFixture("pi-fabric-prompt-retention-");
     const prompt = "FAIL_DIRECTIVE\nprivate brief with exact bytes: π\n";
     const failedHandle = await manager.spawn({ task: prompt, transport: "process" });
@@ -211,29 +303,30 @@ describe("Agent prompt retention (#11663)", () => {
       expect(fs.statSync(path.dirname(promptPath)).mode & 0o777).toBe(0o700);
     }
     const successfulDirectory = manager.runDirectory(successfulHandle.id)!;
+    const failedDirectory = path.dirname(promptPath);
+    const failedRaw = seedCustodyTrace(failedDirectory), completedRaw = seedCustodyTrace(successfulDirectory);
     await manager.close();
-    expect(fs.existsSync(successfulDirectory)).toBe(false);
-    expect(fs.existsSync(promptPath)).toBe(true);
-    expect(fs.readdirSync(path.dirname(promptPath)).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
-    const retainedResult = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "manager-result.json"), "utf8")) as AgentRunRecord;
-    expect(retainedResult).toMatchObject({ id: failedHandle.id, status: "failed" });
-    expect(retainedResult).not.toHaveProperty("task");
-    const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(promptPath), "status.json"), "utf8")) as AgentRunRecord;
+    const failedHeld = expectWholeCustody(failedDirectory, failedRaw, failedHandle.id);
+    const completedHeld = expectWholeCustody(successfulDirectory, completedRaw, successfulHandle.id);
+    expect(fs.readFileSync(path.join(completedHeld, "task.txt"), "utf8")).toBe("successful task");
+    const retainedResult = JSON.parse(fs.readFileSync(path.join(failedHeld, "manager-result.json"), "utf8")) as AgentRunRecord;
+    expect(retainedResult).toMatchObject({ id: failedHandle.id, status: "failed", task: prompt });
+    const persisted = JSON.parse(fs.readFileSync(path.join(failedHeld, "status.json"), "utf8")) as AgentRunRecord;
     expect(persisted).toMatchObject({
       status: "failed",
       promptSha256: failedStatus.promptSha256,
       promptBytes: failedStatus.promptBytes,
       promptPath,
-      inputSha256: createHash("sha256").update(fs.readFileSync(promptPath)).digest("hex"),
-      inputBytes: fs.readFileSync(promptPath).byteLength,
+      inputSha256: digest(prompt),
+      inputBytes: Buffer.byteLength(prompt),
+      task: prompt,
     });
-    expect(persisted).not.toHaveProperty("task");
     const afterClose = manager.status(failedHandle.id) as AgentRunRecord;
-    expect(afterClose.promptSha256).toBe(failedStatus.promptSha256);
-    expect(createHash("sha256").update(fs.readFileSync(afterClose.promptPath!)).digest("hex")).toBe(afterClose.inputSha256);
+    expect(afterClose).toMatchObject({ status: "failed", task: "", text: "", promptSha256: failedStatus.promptSha256, inputSha256: digest(prompt) });
+    expect(manager.readLog(failedHandle.id).status?.task).toBe("");
   });
 
-  it("retains a failed continuation under its current digest while preserving the original metadata", async () => {
+  it("archives the whole failed continuation with current input bytes and original prompt metadata", async () => {
     const manager = managedFixture("pi-fabric-prompt-continuation-");
     const original = "RESUME_FAIL_AFTER_STOP\noriginal brief π\n";
     const handle = await manager.spawn({ task: original, transport: "process" });
@@ -246,41 +339,48 @@ describe("Agent prompt retention (#11663)", () => {
     const currentBytes = fs.readFileSync(taskPath);
     expect(createHash("sha256").update(currentBytes).digest("hex")).toBe(beforeClose.inputSha256);
     expect(Buffer.byteLength(currentBytes)).toBe(beforeClose.inputBytes);
+    const before = seedCustodyTrace(path.dirname(taskPath));
     await manager.close();
-    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["manager-result.json", "status.json", "task.txt"]);
-    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
-    const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
+    const held = expectWholeCustody(path.dirname(taskPath), before, handle.id);
+    const rawResult = JSON.parse(fs.readFileSync(path.join(held, "manager-result.json"), "utf8"));
+    expect(rawResult).toMatchObject({ id: handle.id, status: "failed", task: currentBytes.toString("utf8"), promptSha256: beforeClose.promptSha256, inputSha256: beforeClose.inputSha256 });
+    const persisted = JSON.parse(fs.readFileSync(path.join(held, "status.json"), "utf8")) as AgentRunRecord;
     expect(persisted.promptSha256).toBe(beforeClose.promptSha256);
     expect(persisted.promptBytes).toBe(beforeClose.promptBytes);
     expect(persisted.inputSha256).toBe(beforeClose.inputSha256);
     expect(persisted.inputBytes).toBe(beforeClose.inputBytes);
     expect(persisted.promptPath).toBe(taskPath);
     expect(persisted.status).toBe("failed");
-    expect(persisted).not.toHaveProperty("task");
-    expect(fs.readFileSync(taskPath)).toEqual(currentBytes);
+    expect(persisted.task).toBe(currentBytes.toString("utf8"));
+    expect(fs.readFileSync(path.join(held, "task.txt"))).toEqual(currentBytes);
     expect(persisted.promptRetentionDropped).toBeUndefined();
+    expect(manager.status(handle.id)).toMatchObject({ status: "failed", task: "", text: "", promptSha256: beforeClose.promptSha256, inputSha256: beforeClose.inputSha256 });
   });
 
-  it("drops a tampered task file but retains a mismatch status record", async () => {
+  it("archives tampered task bytes unchanged without replacing the authenticated failed outcome", async () => {
     const manager = managedFixture("pi-fabric-prompt-tamper-");
     const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\noriginal bytes\n", transport: "process" });
     await manager.wait(handle.id);
-    const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
+    const authenticated = manager.status(handle.id) as AgentRunRecord;
+    const taskPath = authenticated.promptPath!;
     fs.writeFileSync(taskPath, "tampered bytes\n", { mode: 0o600 });
+    const before = seedCustodyTrace(path.dirname(taskPath));
     await manager.close();
-    expect(fs.readdirSync(path.dirname(taskPath)).sort()).toEqual(["manager-result.json", "status.json"]);
-    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).toMatchObject({ status: "failed" });
-    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "manager-result.json"), "utf8"))).not.toHaveProperty("task");
-    const persisted = JSON.parse(fs.readFileSync(path.join(path.dirname(taskPath), "status.json"), "utf8")) as AgentRunRecord;
-    expect(persisted.promptRetentionDropped).toBe(true);
-    expect(persisted.promptRetentionMismatch).toBe(true);
-    expect(persisted.inputSha256).toBeDefined();
-    expect(persisted.status).toBe("failed");
-    expect(persisted).not.toHaveProperty("task");
+    const held = expectWholeCustody(path.dirname(taskPath), before, handle.id);
+    expect(fs.readFileSync(path.join(held, "task.txt"), "utf8")).toBe("tampered bytes\n");
+    for (const name of ["status.json", "manager-result.json"]) {
+      const persisted = JSON.parse(fs.readFileSync(path.join(held, name), "utf8")) as AgentRunRecord;
+      expect(persisted).toMatchObject({ id: handle.id, status: "failed", task: "FAIL_DIRECTIVE\noriginal bytes\n", inputSha256: authenticated.inputSha256 });
+      expect(persisted.inputSha256).not.toBe(digest("tampered bytes\n"));
+      expect(persisted.promptRetentionDropped).toBeUndefined();
+      expect(persisted.promptRetentionMismatch).toBeUndefined();
+    }
+    expect(manager.status(handle.id)).toMatchObject({ status: "failed", task: "", text: "", inputSha256: authenticated.inputSha256 });
   });
 
-  it("marks a managed root closed for the configured one-shot sweep age", async () => {
+  it("archives a collectible managed failed run before removing only its empty owner root", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-prompt-sweep-")); roots.push(tempRoot);
+    retainedFixtureRoots.add(tempRoot);
     // Match agent-manager-close's private OS-temp fixture; an explicit override
     // requires a safe Windows volume ancestor, which CI's D:\ does not prove.
     const tmpdir = vi.spyOn(os, "tmpdir").mockReturnValue(tempRoot);
@@ -296,9 +396,12 @@ describe("Agent prompt retention (#11663)", () => {
       const taskPath = (manager.status(handle.id) as AgentRunRecord).promptPath!;
       const runRoot = path.dirname(path.dirname(taskPath));
       expect(path.dirname(runRoot)).toBe(tempRoot);
+      const before = seedCustodyTrace(path.dirname(taskPath));
+      expect(JSON.parse(fs.readFileSync(path.join(runRoot, ".fabric-owner.json"), "utf8")).closedAt).toBeUndefined();
       await manager.close();
-      const owner = JSON.parse(fs.readFileSync(path.join(runRoot, ".fabric-owner.json"), "utf8")) as { closedAt?: number };
-      expect(owner.closedAt).toBeTypeOf("number");
+      const held = expectWholeCustody(path.dirname(taskPath), before, handle.id);
+      const heldBeforeSweep = rawInventory(held);
+      expect(fs.existsSync(runRoot)).toBe(false);
       const sweepOptions = {
         tempRoot,
         orphanedTempRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.orphanedTempRunMs,
@@ -310,8 +413,38 @@ describe("Agent prompt retention (#11663)", () => {
       const swept = retentionStorage.sweepTempRunRoots({ ...sweepOptions,
         now: result.finishedAt! + DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs + 1,
       });
-      expect(swept.removedRuns).toContain(path.dirname(taskPath));
+      expect(swept).toEqual({ removedRuns: [], removedRoots: [] });
+      expect(rawInventory(held)).toEqual(heldBeforeSweep);
     } finally { tmpdir.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it("marks a retained managed root closed and admits it only after the configured one-shot age", async () => {
+    const manager = managedFixture("pi-fabric-prompt-retained-age-");
+    manager.config.retainRuns = true; // Separate positive control; M4 above stays retainRuns:false.
+    const handle = await manager.spawn({ task: "FAIL_DIRECTIVE\nretained age control\n", transport: "process" });
+    const result = await manager.wait(handle.id);
+    const run = manager.runDirectory(handle.id)!;
+    const before = rawInventory(run);
+    await manager.close();
+    const runRoot = path.dirname(run);
+    const owner = JSON.parse(fs.readFileSync(path.join(runRoot, ".fabric-owner.json"), "utf8"));
+    expect(owner).toMatchObject({ closedAt: expect.any(Number), childrenStopped: true });
+    const removals: string[] = [];
+    const remove = vi.spyOn(verifiedRemoval, "verifiedRemove").mockImplementation(target => { removals.push(target); return { removed: true, bytes: 0 }; });
+    try {
+      const options = { tempRoot: path.dirname(runRoot), orphanedTempRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.orphanedTempRunMs,
+        oneShotRunRetentionMs: DEFAULT_FABRIC_CONFIG.retention.oneShotRunMs };
+      expect(retentionStorage.sweepTempRunRoots({ ...options, now: result.finishedAt! + options.oneShotRunRetentionMs - 1 }).removedRuns).toEqual([]);
+      expect(removals).toEqual([]);
+      expect(custodyMoves.filter(move => move.source === run)).toEqual([]);
+      expect(retentionStorage.sweepTempRunRoots({ ...options, now: result.finishedAt! + options.oneShotRunRetentionMs + 1 }).removedRuns).toEqual([run]);
+      expect(removals).not.toContain(run); // Only the empty root/marker may enter a deleter.
+      const move = custodyMoves.find(move => move.source === run)!;
+      expect(move).toBeDefined();
+      expect(JSON.parse(fs.readFileSync(move.receipt, "utf8"))).toMatchObject({ source: run, state: "moved", reason: "temp run retention whole-root custody" });
+      expect(rawInventory(move.destination)).toEqual(before);
+      expect(fs.existsSync(run)).toBe(false);
+    } finally { remove.mockRestore(); }
   });
 });
 
@@ -2441,9 +2574,20 @@ describe("AgentManager", () => {
     (["clean", "uncertain", "failed-result"] as const).map(outcome => ({ platform, outcome })),
   ))("keeps stop settlement separate from joined process custody ($outcome, $platform)", async ({ outcome, platform }) => {
     const nativePlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    // NONNATIVE settlement contract only: fake win32 on POSIX must not launch
+    // PowerShell. Keep the actual helper, rename, bytes and receipts; substitute
+    // only its security-command builder with an owned POSIX subprocess probe.
+    // Actual Windows retains the independent native DACL implementation.
+    const securityBoundary = platform === "win32" && nativePlatform.value !== "win32"
+      ? vi.spyOn(windowsCommand, "windowsSecurityPowerShell").mockImplementation((_source, env) => ({
+        file: process.execPath,
+        args: ["-e", "const fs=require('node:fs');const p=process.env.PI_FABRIC_CLEANUP_CONTAINER;fs.chmodSync(p,0o700);const s=fs.lstatSync(p);if(!s.isDirectory()||s.isSymbolicLink()||s.uid!==process.getuid()||(s.mode&511)!==448)throw Error('nonnative fixture boundary refused')"],
+        env: { ...(env ?? process.env) },
+      })) : undefined;
     if (platform === "win32") Object.defineProperty(process, "platform", { ...nativePlatform, value: "win32" });
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
+    retainedFixtureRoots.add(root);
     const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, retainRuns: false }, {
       workerPath: path.resolve("tests/fixtures/fake-worker.mjs"), runRoot: root,
     });
@@ -2528,7 +2672,12 @@ describe("AgentManager", () => {
       expect(JSON.parse(fs.readFileSync(statusFile, "utf8")).sessionId).toBe(sessionId);
       expect(() => process.kill(Number(sessionId), 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
       if (outcome === "failed-result") expect((await manager.wait(handle.id)).error).toBe("real worker failure");
+      const directory = manager.runDirectory(handle.id)!;
+      retainedFixtureRoots.add(root);
+      const before = seedCustodyTrace(directory);
       expect(await manager.cleanup(handle.id)).toEqual({ cleaned: true });
+      expectWholeCustody(directory, before, handle.id);
+      if (securityBoundary) expect(securityBoundary).toHaveBeenCalled();
     } finally {
       releaseHelper(); releaseWorker();
       child.kill("SIGTERM");
@@ -2543,6 +2692,7 @@ describe("AgentManager", () => {
           if (index !== -1) managers.splice(index, 1);
         }
         launch.mockRestore();
+        securityBoundary?.mockRestore();
         Object.defineProperty(process, "platform", nativePlatform);
       }
     }

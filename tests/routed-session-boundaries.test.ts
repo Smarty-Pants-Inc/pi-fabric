@@ -12,6 +12,7 @@ import { decideModelRoute } from "../src/agents/model-route.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { processStartTime } from "../src/residency/process-identity.js";
 import { FABRIC_RUN_ROOT_PREFIX, markRunRootActive, markRunRootClosed, runTreeExitVeto, sweepTempRunRoots } from "../src/storage/retention.js";
+import { ageRunRoot } from "./helpers/age-run-root.js";
 
 const decision = (model = "test/sol") => decideModelRoute({ routeClass: "bounded-lookup", protected: true,
   pin: { model, effort: "high" }, candidates: [], parentSessionId: "parent" }, async () => { throw new Error("excluded"); });
@@ -42,7 +43,20 @@ describe("R3 routed session boundaries", () => {
       expect(launch).not.toHaveBeenCalled();
       const rows = fs.readFileSync(path.join(root, "agent/fabric/model-routing.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
       expect(rows).toHaveLength(2); expect(rows[1]).toMatchObject({ type: "outcome", decisionId: route.decisionId, childSessionId: rows[0].childSessionId, status: "failed", admittedModel: null });
-      expect(git(repo, "worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(1);
+      // Rollback archives the never-launched tree; Git registration/branch debt is intentional.
+      const receipts = fs.readdirSync(root, { recursive: true }).map(String)
+        .filter(name => path.basename(name) === "custody.json")
+        .map(name => ({ container: path.dirname(path.join(root, name)), ...JSON.parse(fs.readFileSync(path.join(root, name), "utf8")) }))
+        .filter(row => row.source.startsWith(path.join(repo, ".pi", "fabric", "worktrees") + path.sep));
+      expect(receipts).toHaveLength(1);
+      const receipt = receipts[0]!;
+      expect(receipt).toMatchObject({ id: rows[0].childSessionId, state: "moved", reason: expect.any(String), time: expect.any(Number) });
+      expect(JSON.parse(fs.readFileSync(path.join(receipt.container, "custody.prepared.json"), "utf8"))).toMatchObject({ state: "prepared", source: receipt.source, destination: receipt.destination, id: receipt.id });
+      if (process.platform !== "win32") expect(fs.statSync(receipt.container).mode & 0o777).toBe(0o700);
+      expect(fs.existsSync(receipt.source)).toBe(false);
+      expect(fs.readFileSync(path.join(receipt.destination, "tracked.txt"), "utf8")).toBe("committed-worktree");
+      expect(git(repo, "worktree", "list", "--porcelain").match(/^worktree /gm)).toHaveLength(2);
+      expect(git(repo, "branch", "--list", "pi-fabric/*")).toContain("pi-fabric/");
     } finally { await manager.close(); vi.restoreAllMocks(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); }
   });
   it.each(["immediate", "queued", "startup-retry", "resume"])("I-1 binds every %s launch to final worktree with the same child ID", async mode => {
@@ -181,10 +195,14 @@ describe("R3 routed session boundaries", () => {
       }
       if (state === "closed") markRunRootClosed(runRoot, 1, true);
       else fs.writeFileSync(path.join(runRoot, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
+      ageRunRoot(runRoot, 1);
       const sweep = (now: number) => sweepTempRunRoots({ tempRoot, now, orphanedTempRunRetentionMs: 100, oneShotRunRetentionMs: 200 });
       expect(sweep(99).removedRuns).toEqual([]); expect(fs.existsSync(path.join(runRoot, "successful"))).toBe(true);
       sweep(202);
-      expect(fs.existsSync(path.join(runRoot, "successful"))).toBe(false);
+      // An unclosed root needs a complete, owned idle inventory first. This
+      // mixed root's link makes that proof incomplete, so even its otherwise
+      // safe run stays. Clean dead-root collection has separate positive controls.
+      expect(fs.existsSync(path.join(runRoot, "successful"))).toBe(state === "orphan");
       for (const kind of ["pending", "live", "link", "unknown", "unresolved"]) expect(fs.existsSync(path.join(runRoot, kind))).toBe(true);
     } finally { fs.rmSync(tempRoot, { recursive: true, force: true }); }
   });

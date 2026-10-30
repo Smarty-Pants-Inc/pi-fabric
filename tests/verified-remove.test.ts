@@ -3,18 +3,16 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  claimMeshRetentionSweep, compactTerminalRunEvents, FABRIC_RUN_ROOT_PREFIX, pruneActorRunArchives, pruneActorSessionBackups,
-  removeEmptyRunRoot, sweepTempRunRoots,
+  claimMeshRetentionSweep, FABRIC_RUN_ROOT_PREFIX, pruneActorRunArchives, pruneActorSessionBackups,
+  removeEmptyRunRoot,
 } from "../src/storage/retention.js";
 import { sweepResidentRuns } from "../src/residency/retention.js";
 import { closeScratch, createScratch, sweepScratch } from "../src/storage/scratch.js";
 import { MeshRetentionApplyDisabledError, sweepMeshRetention } from "../src/storage/retention-cli.js";
 
-// smarty-dev#7916 acceptance: for each routed deleter, a swap between the judgment and the delete (file to symlink,
-// a replaced inode, a foreign owner, a refreshed mtime) deletes nothing; no getuid deletes nothing; a future-dated
-// backup name never costs the newest backup. The file runs unchanged on main for the RED evidence: there the swap is
-// triggered by main's own removal call (rmSync/unlinkSync/renameSync/promises.rm on the target), on the head by the
-// helper's seam right before its first open. Either way the swap lands after the judgment and before the delete.
+// smarty-dev#7916 acceptance: for each actual verified deleter, a swap between judgment and deletion deletes nothing;
+// no getuid deletes nothing; a future-dated backup name never costs the newest backup. Temp-run retention is no longer
+// a deleter: its whole-root path is covered by retention-runroot-swaps.test.ts and retention-dead-owner.test.ts.
 const DAY = 24 * 60 * 60 * 1_000;
 const NOW = Date.now();
 const DEAD = "2147483647";
@@ -96,31 +94,13 @@ const FIXTURES: Record<string, () => Fixture> = {
     const target = old(run(path.join(residency, "runs", "old")));
     return { target, act: () => sweepResidentRuns(path.join(residency, "runs"), NOW, 10_000, { retentionMs: DAY }) };
   },
-  "pruneClosedRunRoot (sweepTempRunRoots)": () => {
-    const tempRoot = tmp("fabric-vr-closed-");
-    const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "closed");
-    const target = run(path.join(root, "old"));
-    write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, closedAt: 1, childrenStopped: true }));
-    return { target, act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
-  },
-  "sweepTempRunRoots (orphaned root)": () => {
-    const tempRoot = tmp("fabric-vr-orphan-");
-    const root = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "orphan");
-    const target = run(path.join(root, "old"));
-    write(path.join(root, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
-    return { target, act: () => sweepTempRunRoots({ tempRoot, now: 100 * DAY, orphanedTempRunRetentionMs: 6 * 3600_000, oneShotRunRetentionMs: DAY }) };
-  },
   removeEmptyRunRoot: () => {
     const tempRoot = tmp("fabric-vr-empty-");
     const target = path.join(tempRoot, FABRIC_RUN_ROOT_PREFIX + "empty");
     write(path.join(target, ".fabric-owner.json"), JSON.stringify({ pid: Number(DEAD), startedAt: 1, heartbeatAt: 1, closedAt: 1 }));
     return { target, act: () => removeEmptyRunRoot(target) };
   },
-  compactTerminalRunEvents: () => {
-    const directory = run(path.join(tmp("fabric-vr-compact-"), "old"));
-    const target = path.join(directory, "events.jsonl");
-    return { target, act: () => compactTerminalRunEvents(directory, { now: NOW, terminalRunEventsMaxBytes: 1024 }) };
-  },
+  // Terminal event compaction is now a no-op, covered by run-retention-trace-preservation.test.ts.
   // smarty-dev#16444: pruneActorSessionBackups is no longer a deleter (it moves older backups into session-archive/,
   // tests/actor-session-trace-archive.test.ts), so it left this deletion matrix.
   sweepScratch: () => {
@@ -156,8 +136,7 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
   it.each(Object.keys(FIXTURES))("%s removes its expired target when nothing changes (control)", async name => {
     const { target, act } = FIXTURES[name]!();
     await act();
-    expect(fs.existsSync(target) && name !== "compactTerminalRunEvents").toBe(false);
-    if (name === "compactTerminalRunEvents") expect(fs.statSync(target).size).toBeLessThan(LOG.length);
+    expect(fs.existsSync(target)).toBe(false);
   });
 
   const cases = Object.keys(FIXTURES).flatMap(name => SWAPS.map(swap => [name, swap] as const));
@@ -174,7 +153,6 @@ describe.skipIf(process.platform !== "linux")("verified removal: every routed re
       const outside = after.outside as Record<string, unknown>;
       expect(Object.values(outside).every(value => value !== null), `${name} / ${swap}: moved original`).toBe(true);
     }
-    if (name === "compactTerminalRunEvents" && swap !== "symlink") expect(fs.readFileSync(target, "utf8")).toBe(LOG);
   });
 
   it.each(Object.keys(FIXTURES))("%s deletes nothing without getuid", async name => {

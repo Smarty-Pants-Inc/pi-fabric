@@ -14,8 +14,8 @@ const recorded = vi.hoisted(() => ({
 }));
 vi.mock("../src/storage/verified-remove.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../src/storage/verified-remove.js")>(),
-  // Never call proceed, fallback or the real remover: record both run removal
-  // and real event compaction at their final mutation boundary.
+  // Never call proceed, fallback or the real remover: record run removal
+  // at its final mutation boundary; event compaction must never reach it.
   verifiedRemove: (target: string, judged: unknown, options: { deleter: string }) => {
     recorded.mutations.push({ target, judged, deleter: options.deleter });
     return { removed: false, reason: "recorded only (test)" };
@@ -106,14 +106,16 @@ describe("off-Linux main sweep manager custody (recorded mutations only)", () =>
     expect(custody.run.mock.calls.map(([id]) => id).sort()).toEqual(["owned", "unrelated"]);
     expect(recover.mock.calls.map(([run]) => run)).toEqual([unrelated]);
     expect(recorded.compactions).toEqual(retainRuns ? [unrelated] : []);
-    expect(recorded.mutations.map(({ target, deleter }) => ({ target, deleter }))).toEqual([
-      { target: retainRuns ? path.join(unrelated, "events.jsonl") : unrelated,
-        deleter: retainRuns ? "compactTerminalRunEvents" : "residentRunRetention" },
-    ]);
-    expect(recorded.mutations[0]!.judged).toMatchObject({ ino: expect.any(Number), dev: expect.any(Number) });
-    // No safety predicate is mocked: the run passed fresh native process-absence
-    // and owned tree/saved-result checks immediately before the recorded effect.
-    expect(nativeExitChecks).toHaveBeenCalledWith(Number(EXITED_PID), 0);
+    // retainRuns=false still proves the custody veto against a real eligible removal.
+    // retainRuns=true visits/recoveries progress, but preserving traces has no mutation.
+    expect(recorded.mutations).toEqual(retainRuns ? [] : [{
+      target: unrelated, deleter: "residentRunRetention",
+      judged: expect.objectContaining({ ino: expect.any(Number), dev: expect.any(Number) }),
+    }]);
+    // The removal case must still pass fresh native absence and owned
+    // tree/saved-result checks. No exit proof is needed for an inert compaction.
+    if (retainRuns) expect(nativeExitChecks).not.toHaveBeenCalled();
+    else expect(nativeExitChecks).toHaveBeenCalledWith(Number(EXITED_PID), 0);
     expect(recorded.mutations.some(({ target }) => target === owned || target.startsWith(owned + path.sep))).toBe(false);
     for (const spy of [direct.rm, direct.unlink, direct.rmdir]) {
       expect(spy.mock.calls.filter(([target]) => String(target).startsWith(path.join(root, "runs") + path.sep))).toEqual([]);

@@ -35,18 +35,28 @@ const createManager = (runRoot: string, retainRuns = true,
   managers.push(manager);
   return manager;
 };
+const custodyMoves = vi.hoisted(() => [] as Array<{ source: string; destination: string; receipt: string }>);
+vi.mock("../src/agents/worktree-manager.js", async original => {
+  const actual = await original<typeof import("../src/agents/worktree-manager.js")>();
+  return { ...actual, retainCleanupRoot: (...args: Parameters<typeof actual.retainCleanupRoot>) => {
+    const move = actual.retainCleanupRoot(...args);
+    if (move) custodyMoves.push(move);
+    return move;
+  } };
+});
 const recordRunCollection = (directory: string) => {
   const resultFile = path.join(directory, "manager-result.json"), statusFile = path.join(directory, "status.json");
-  vi.mocked(fs.promises.rm).mockImplementation(async file => {
-    recordRemoval(file);
-    if (String(file) === directory) {
-      // Model whole-tree removal at the manager's actual removal boundary.
-      // The existing lstat/read/exists observations see absence; bytes stay put.
-      recordedMissing.add(resultFile);
-      recordedMissing.add(statusFile);
-    }
-  });
-  return { resultFile, statusFile };
+  const original = fs.readFileSync(resultFile), inode = fs.statSync(directory).ino;
+  return { resultFile, statusFile, heldResult: () => {
+    const move = custodyMoves.find(move => move.source === directory)!;
+    expect(move).toBeDefined();
+    expect(JSON.parse(fs.readFileSync(move.receipt, "utf8"))).toMatchObject({ source: directory, destination: move.destination, state: "moved" });
+    expect(JSON.parse(fs.readFileSync(path.join(path.dirname(move.receipt), "custody.prepared.json"), "utf8"))).toMatchObject({ source: directory, destination: move.destination, state: "prepared" });
+    expect(fs.statSync(move.destination).ino).toBe(inode);
+    const file = path.join(move.destination, "manager-result.json");
+    expect(fs.readFileSync(file)).toEqual(original);
+    return file;
+  } };
 };
 const refuses = async (manager: AgentManager, id: string) => {
   // Observe both public paths before asserting, so the RED run proves that both
@@ -449,7 +459,7 @@ describe("authenticated manager terminal results", () => {
     expect(await manager.stop(result.id)).toMatchObject(result);
   });
 
-  it("never adopts same-ID worker outcome fields after UI eviction and recorded close collection", async () => {
+  it("never adopts same-ID worker outcome fields after UI eviction and receipt-backed close archival", async () => {
     vi.spyOn(ProcessTransport.prototype, "launch").mockImplementation(async request => {
       const handle = await fakeManagerHeapWorker(request, 64_000, true);
       const file = request.workerArguments[request.workerArguments.indexOf("--status-file") + 1]!;
@@ -464,7 +474,7 @@ describe("authenticated manager terminal results", () => {
     expect(genuine.status).toBe("failed");
     expect(genuine.error).toMatch(/Structured agent output was invalid/);
     const directory = path.join(runRoot, genuine.id);
-    const { resultFile, statusFile } = recordRunCollection(directory);
+    const { resultFile, statusFile, heldResult } = recordRunCollection(directory);
     // Public runs exceed the byte cap with large previews, evicting the old
     // snapshot before close without private-field inspection or 241 tiny runs.
     for (let index = 0; index < 20; index++) {
@@ -473,9 +483,10 @@ describe("authenticated manager terminal results", () => {
     expect(manager.listForUi().some(record => record.id === genuine.id)).toBe(false);
     expect(fs.existsSync(resultFile)).toBe(true);
     await manager.close();
-    expect(deletionRequests).toContain(directory);
+    expect(deletionRequests).not.toContain(directory);
     expect(fs.existsSync(resultFile)).toBe(false);
-    expect(filesystem.existsSync(resultFile)).toBe(true); // No real deletion occurred.
+    const held = heldResult();
+    fs.mkdirSync(directory);
     writeJsonAtomic(statusFile, { ...genuine, status: "completed", text: "FORGED answer", task: "FORGED task",
       value: { forged: true }, partialText: "FORGED partial", lastCompleteText: "FORGED complete",
       nestedAgents: [heapRunResult("forged-child", 64)], error: "FORGED error", exitCode: 0,
@@ -497,8 +508,10 @@ describe("authenticated manager terminal results", () => {
       expect(result.warnings).toEqual([expect.stringMatching(/manager's bounded terminal summary, not the exact result/)]);
       expect(JSON.stringify(result)).not.toContain("FORGED");
     }
-    // Recorded collection permits only absence, never a recreated foreign file.
+    // Canonical replacement has no authority; mutation of the held original fails closed.
     writeJsonAtomic(resultFile, { ...genuine, status: "completed", text: "FORGED recreated result" });
+    expect(manager.status(genuine.id).status).toBe("failed");
+    writeJsonAtomic(held, { ...genuine, status: "completed", text: "FORGED held result" });
     await refuses(manager, genuine.id);
   });
 
@@ -515,7 +528,7 @@ describe("authenticated manager terminal results", () => {
     });
     const runRoot = root(), manager = createManager(runRoot, false);
     const genuine = await manager.run({ task: "ordinary collected failure", transport: "process", extensions: false });
-    const { resultFile } = recordRunCollection(path.join(runRoot, genuine.id));
+    const { resultFile, heldResult } = recordRunCollection(path.join(runRoot, genuine.id));
     // Before collection authentication preserves the exact full outcome, including
     // diagnostics larger than the summary bound and the original nested tree.
     const uncollected = manager.status(genuine.id) as AgentRunRecord, uncollectedWait = await manager.wait(genuine.id);
@@ -527,7 +540,7 @@ describe("authenticated manager terminal results", () => {
     }
     await manager.close();
     expect(fs.existsSync(resultFile)).toBe(false);
-    expect(filesystem.existsSync(resultFile)).toBe(true);
+    heldResult();
     const status = manager.status(genuine.id) as AgentRunRecord, waited = await manager.wait(genuine.id);
     for (const result of [status, waited]) {
       expect(result).toMatchObject({ id: genuine.id, status: "failed", name: genuine.name, runner: genuine.runner,

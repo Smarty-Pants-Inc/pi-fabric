@@ -58,8 +58,8 @@ describe("resident terminal event retention", () => {
     });
     const rename = vi.spyOn(fs, "renameSync");
     expect(compactTerminalRunEvents(run, { now })).toBe(false);
-    // Windows keeps main's five proof reads; optimization is in smarty-dev#5132.
-    expect(reads).toBe(process.platform === "win32" ? 5 : 1);
+    // Disabled compaction performs no proof reads on any platform.
+    expect(reads).toBe(0);
     expect(rename).not.toHaveBeenCalled();
   });
 
@@ -86,7 +86,7 @@ describe("resident terminal event retention", () => {
       policy.terminalRunEventsMaxBytes = 128 * 1024;
       collector.resample();
       for (let i = 0; i < 20 && collector.due(now + 60_001); i++) collector.sweep(now + 60_001, new Set(), 5);
-      expect(fs.statSync(path.join(run, "events.jsonl")).size).toBeLessThanOrEqual(128 * 1024);
+      expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(events)).toBe(true);
       for (const [i, name] of ["status.json", "reply.json"].entries()) expect(fs.readFileSync(path.join(run, name))).toEqual(before[i]);
     } finally { collector.close(); }
   });
@@ -110,8 +110,7 @@ describe("resident terminal event retention", () => {
       for (let i = 0; i < 20 && collector.due(now); i++) collector.sweep(now, new Set(), 5);
       expect(recover).toHaveBeenCalled();
       const events = fs.readFileSync(path.join(run, "events.jsonl"));
-      if (change === "none") expect(events.length).toBeLessThanOrEqual(128 * 1024);
-      else expect(events).toEqual(log);
+      expect(events.equals(log)).toBe(true);
       expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep reply"}');
     } finally { collector.close(); }
   });
@@ -168,10 +167,10 @@ describe("resident terminal event retention", () => {
         expect(fs.readFileSync(path.join(run, name)).equals(before), `${run}/${name} must remain byte-identical`).toBe(true);
       }
     }
-    expect(fs.statSync(path.join(exited, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+    expect(fs.readFileSync(path.join(exited, "events.jsonl")).equals(log)).toBe(true);
   });
 
-  it("uses the existing streaming sweep to bound terminal residency runs, preserving results, latest references and idempotency", () => {
+  it("uses the existing streaming sweep without dropping terminal trace bytes, preserving results, references and idempotency", () => {
     const dir = root();
     const actorRoot = path.join(dir, "actor-registry");
     write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
@@ -187,12 +186,7 @@ describe("resident terminal event retention", () => {
     retention.sweep(now, new Set(["*", "held"]), 10000);
     const bounded = compacted.map(run => fs.readFileSync(path.join(run, "events.jsonl")));
     for (const [index, run] of compacted.entries()) {
-      const tail = bounded[index]!;
-      expect(tail.length).toBeLessThanOrEqual(128 * 1024);
-      expect(JSON.parse(tail.subarray(0, tail.indexOf(0x0a)).toString())).toMatchObject({ fabricTruncated: true });
-      const events = tail.subarray(tail.indexOf(0x0a) + 1);
-      expect(events.equals(log.subarray(log.length - events.length))).toBe(true);
-      expect(JSON.parse(events.toString().trim().split("\n").at(-1)!)).toMatchObject({ sequence: 14999 });
+      expect(bounded[index]!.equals(log)).toBe(true);
       expect(fs.readFileSync(path.join(run, "status.json"))).toEqual(statuses[index]);
       expect(fs.readFileSync(path.join(run, "reply.json"), "utf8")).toBe('{"text":"keep reply"}');
     }
@@ -205,7 +199,7 @@ describe("resident terminal event retention", () => {
     retention.close();
   });
 
-  it("also bounds explicitly retained runs at fenced startup and protects persisted lastRunId from cleanup", () => {
+  it("preserves explicitly retained traces at fenced startup and protects persisted lastRunId from cleanup", () => {
     const dir = root(); const actorRoot = path.join(dir, "actor-registry");
     write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
     const old = make(dir, "old", "completed");
@@ -213,7 +207,7 @@ describe("resident terminal event retention", () => {
     for (const run of [old, latest]) fs.utimesSync(run, day / 1000, day / 1000);
     const runs = path.join(dir, "runs");
     expect(sweepResidentRuns(runs, now, 10000, { actorRoots: [actorRoot], retainRuns: true })).toEqual([]);
-    expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+    expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
     expect(fs.existsSync(path.join(old, "status.json"))).toBe(true);
     expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
     fs.utimesSync(old, day / 1000, day / 1000);
@@ -221,7 +215,7 @@ describe("resident terminal event retention", () => {
     expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
   });
 
-  it.each(["startup", "streaming"])("compacts with a valid registry above 1 MiB at %s, preserving its latest run", (phase) => {
+  it.each(["startup", "streaming"])("preserves all raw traces with a valid registry above 1 MiB at %s", (phase) => {
     const dir = root(); const actorRoot = path.join(dir, "actor-registry");
     write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest", instructions: "normal actor",
       messages: Array.from({ length: 100 }, () => ({ text: "x".repeat(12_000) })) }] });
@@ -234,7 +228,7 @@ describe("resident terminal event retention", () => {
       const collector = new ResidentRequestRetention(dir, [actorRoot]);
       try { collector.sweep(now, new Set(), 10000); } finally { collector.close(); }
     }
-    expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+    expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
     expect(fs.readFileSync(path.join(latest, "events.jsonl")).equals(log)).toBe(true);
     expect(fs.readFileSync(path.join(actorRoot, "actors.json")).equals(registry)).toBe(true);
   });
@@ -266,7 +260,7 @@ describe("resident terminal event retention", () => {
       for (let slice = 0; slice < 100 && collector.due(now); slice++) collector.sweep(now, new Set(["live"]), 5);
       // Even consistently slow safety reads complete a count-bounded unit.
       // A deadline alone must not restart the same fresh proof forever.
-      expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+      expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
       for (const run of [latest, live, worker]) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
       expect(registryReads).toBeGreaterThan(0);
     } finally { collector.close(); }
@@ -279,7 +273,7 @@ describe("resident terminal event retention", () => {
     try {
       for (let i = 0; i < 100 && collector.due(now); i++) collector.sweep(now, new Set(), 5);
       expect(fs.readFileSync(path.join(large, "events.jsonl")).equals(log)).toBe(true);
-      expect(fs.statSync(path.join(small, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+      expect(fs.readFileSync(path.join(small, "events.jsonl")).equals(log)).toBe(true);
     } finally { collector.close(); }
   });
 
@@ -311,7 +305,7 @@ describe("resident terminal event retention", () => {
     } finally { collector.close(); }
   });
 
-  it("vetoes a new latest-run reference published during a long compaction safety walk", () => {
+  it("avoids the compaction safety walk entirely when raw traces cannot be rewritten", () => {
     const dir = root(); const actorRoot = path.join(dir, "actor-registry");
     write(actorRoot, ".", "actors", { actors: [] });
     const old = make(dir, "old", "completed");
@@ -327,17 +321,17 @@ describe("resident terminal event retention", () => {
     const collector = new ResidentRequestRetention(dir, [actorRoot]);
     try {
       collector.sweep(now, new Set(), 5);
-      expect(changed).toBe(true);
+      expect(changed).toBe(false); // No compaction safety walk is needed without mutation.
       expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
     } finally { collector.close(); }
   });
 
-  it("eventually compacts via ResidentHost's actual 5-ms polling path after an over-budget registry read", async () => {
+  it("preserves every raw trace through ResidentHost's actual 5-ms polling path after an over-budget registry read", async () => {
     const dir = root(); const actorRoot = path.join(dir, "actor-registry");
     const old = make(dir, "old", "completed"); const latest = make(dir, "latest", "failed");
     const held = make(dir, "held", "completed"); const worker = make(dir, "worker", "completed");
     write(worker, ".", "status", { status: "completed", finishedAt: day, transport: "process", sessionId: String(process.pid) });
-    // Protect fixtures from startup, so only the production poll can compact old.
+    // Protect fixtures from startup, then exercise production polling with old unreferenced.
     write(actorRoot, ".", "actors", { actors: ["old", "latest", "held"].map(id => ({ id, lastRunId: id })) });
     const config: ResidentHostConfig = {
       format: 1, rootId: "session:retention", sessionId: "retention", cwd: dir, projectRoot: dir,
@@ -361,10 +355,10 @@ describe("resident terminal event retention", () => {
       vi.spyOn(host.agents, "retentionReferences").mockReturnValue(new Set(["held"]));
       write(actorRoot, ".", "actors", { actors: [{ id: "actor", lastRunId: "latest" }] });
       const deadline = Date.now() + 2000;
-      while (fs.statSync(path.join(old, "events.jsonl")).size > 256 * 1024 && Date.now() < deadline) {
+      while (slices.mock.calls.length <= 1 && Date.now() < deadline) {
         await new Promise(resolve => setTimeout(resolve, 10));
       }
-      expect(fs.statSync(path.join(old, "events.jsonl")).size).toBeLessThanOrEqual(256 * 1024);
+      expect(fs.readFileSync(path.join(old, "events.jsonl")).equals(log)).toBe(true);
       for (const run of [latest, held, worker]) expect(fs.readFileSync(path.join(run, "events.jsonl")).equals(log)).toBe(true);
       expect(registryReads).toBeGreaterThan(0);
       expect(slices.mock.calls.length).toBeGreaterThan(1);

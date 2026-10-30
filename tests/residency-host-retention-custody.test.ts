@@ -156,12 +156,16 @@ describe("ResidentHost legacy retention custody wiring", () => {
         deleter: "residentRequestCollect", judged: expect.anything(),
       });
       expect(recorded.compactions).toEqual(retainRuns ? [unrelated] : []);
-      expect(recorded.mutations.filter(({ deleter }) => deleter !== "residentRequestCollect")).toEqual([{
-        target: retainRuns ? path.join(unrelated, "events.jsonl") : unrelated,
-        deleter: retainRuns ? "compactTerminalRunEvents" : "residentRunRetention",
+      // Collection still proves custody when retainRuns=false; when true, archive
+      // recovery and acknowledged-exchange collection progress without log mutation.
+      expect(recorded.mutations.filter(({ deleter }) => deleter !== "residentRequestCollect")).toEqual(retainRuns ? [] : [{
+        target: unrelated, deleter: "residentRunRetention",
         judged: expect.objectContaining({ ino: expect.any(Number), dev: expect.any(Number) }),
       }]);
-      expect(nativeExitChecks).toHaveBeenCalledWith(2147483647, 0);
+      // No exit proof is needed for an inert compaction. The removal case
+      // must still obtain fresh native absence evidence; no safety mock.
+      if (retainRuns) expect(nativeExitChecks).not.toHaveBeenCalled();
+      else expect(nativeExitChecks).toHaveBeenCalledWith(2147483647, 0);
       expect(recorded.mutations.some(({ target }) => target === owned || target.startsWith(owned + path.sep))).toBe(false);
       for (const spy of direct) {
         expect(spy.mock.calls.filter(([target]) => String(target).startsWith(path.join(config.residencyRoot, "runs") + path.sep))).toEqual([]);

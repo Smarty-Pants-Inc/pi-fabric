@@ -9,6 +9,7 @@ import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import { FabricShellJobStore } from "../src/core/shell-jobs.js";
 import { MeshStore } from "../src/mesh/store.js";
 import { boundModelOutput } from "../src/output-budget.js";
+import { ageRunRoot } from "./helpers/age-run-root.js";
 
 const roots: string[] = [];
 const closers: Array<() => Promise<void>> = [];
@@ -61,6 +62,8 @@ it.skipIf(process.platform === "win32")("reclaims an abandoned disk-root owner t
   const { disk, agents } = setup();
   const abandoned = fs.mkdtempSync(path.join(disk, "pi-fabric-runs-"));
   fs.writeFileSync(path.join(abandoned, ".fabric-owner.json"), JSON.stringify({ pid: 2147483647, startedAt: 1, heartbeatAt: 1, orphanedAt: 1 }));
+  expect(fs.readdirSync(abandoned)).toEqual([".fabric-owner.json"]); // Only the empty owner marker is eligible for removal.
+  ageRunRoot(abandoned, Date.now() - 7 * 60 * 60 * 1_000); // Exceed orphan grace; root metadata is part of idle age.
   await agents.close();
   await vi.waitFor(() => expect(fs.existsSync(abandoned)).toBe(false), { timeout: 20_000 });
 }, 30_000);

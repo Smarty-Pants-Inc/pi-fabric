@@ -130,12 +130,44 @@ export const writePolicyDenial = (
   return `Fabric write policy refuses ${toolName} outside writable roots; ${scope}${actorHint}`;
 };
 
+const privateTempRoots = (directories: (string | undefined)[]): string[] => {
+  const uid = process.getuid?.();
+  if (uid === undefined) return [];
+  let systemTemp: string | undefined;
+  try { systemTemp = fs.realpathSync("/tmp"); } catch { /* missing system temp means no special exclusion needed */ }
+  const roots = new Set<string>();
+  for (const directory of directories) {
+    if (!directory || !path.isAbsolute(directory)) continue;
+    try {
+      const real = fs.realpathSync(directory);
+      if (real === path.resolve("/tmp") || real === systemTemp) continue;
+      const stat = fs.statSync(real);
+      if (stat.isDirectory() && stat.uid === uid && (stat.mode & 0o777) === 0o700) roots.add(real);
+    } catch {
+      // Missing, inaccessible, or non-directory temp roots add no authority.
+    }
+  }
+  return [...roots];
+};
+
 /** Child-side guard loaded by the worker with -e only when a policy is set. */
 export default function fabricWriteGuard(pi: ExtensionAPI): void {
+  const extensionTmpDir = process.env.TMPDIR;
   const policy = readWritePolicy();
   if (!policy) return;
   pi.on("tool_call", (event, context) => {
-    const reason = writePolicyDenial(policy, event.toolName, event.input, context.cwd);
+    let effectivePolicy = policy;
+    if (!policy.readOnly && policy.shell === "unconfined" && WRITE_TOOLS.has(event.toolName)) {
+      // An unconfined shell can already write its own private TMPDIR; allowing native write there only fixes refusals of that same session scratch.
+      effectivePolicy = {
+        ...policy,
+        writableRoots: [...new Set([
+          ...policy.writableRoots,
+          ...privateTempRoots([process.env.TMPDIR, extensionTmpDir]),
+        ])],
+      };
+    }
+    const reason = writePolicyDenial(effectivePolicy, event.toolName, event.input, context.cwd);
     return reason ? { block: true, reason } : undefined;
   });
 }

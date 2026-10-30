@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agents/manager.js";
 import { normalizeAgentRunRequest } from "../src/agents/request.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
-import { diagnostics } from "../src/core/diagnostics.js";
+import * as diagnostics from "../src/core/diagnostics.js";
 
 const ask = '["Smarty-Pants-Inc","org-feed://principal/Paul/block/12-abc"]';
 const override = ' [ "Other Org", "pi-session://principal/session-1/entry/é\\u002d2" ] ';
@@ -60,7 +60,7 @@ describe("opaque agent askId", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-ask-id-")); roots.push(root);
     vi.stubEnv("PI_FABRIC_ASK_ID", parent); vi.stubEnv("PI_FABRIC_DEPTH", "0");
     vi.stubEnv("FAKE_PI_BEHAVIOR", "child-contract");
-    const warn = vi.spyOn(diagnostics, "warn");
+    const warn = vi.spyOn(diagnostics, "logDiagnostic");
     const manager = new AgentManager(root, { ...DEFAULT_FABRIC_CONFIG.agents, budgetUsd: 0, retainRuns: true,
       sessionExport: false, timeoutMs: 10_000 }, { workerPath: path.resolve("dist/worker.js"),
       piBinary: path.resolve("tests/fixtures/fake-pi.mjs"), runRoot: path.join(root, "runs") });

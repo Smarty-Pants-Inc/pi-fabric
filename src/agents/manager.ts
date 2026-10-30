@@ -1,5 +1,5 @@
 import { childProcessEnvironment } from "../core/atomic-write.js";
-import { diagnostics } from "../core/diagnostics.js";
+import { diagnostics, logDiagnostic } from "../core/diagnostics.js";
 import { normalizeAgentAskId, resolveAgentAskIdentity, taskWithAskId, type AgentAskIdentity } from "./ask-id.js";
 import { detachedPreview } from "../core/preview.js";
 import { copyFabricPrincipal, copyFabricProvenance, type FabricPrincipal, type FabricTurnProvenance } from "../fabric-provenance.js";
@@ -2546,7 +2546,7 @@ export class AgentManager {
     }
     assertAgentTask(request);
     const askIdentity = resolveAgentAskIdentity(request.askId, request.inheritedAskId === undefined ? this.#inheritedAskId : request.inheritedAskId);
-    if (askIdentity.askIdState === "missing") diagnostics.warn("src/agents/manager.ts", "[pi-fabric] Agent spawn askId MISSING; no Ask-ID marker will be retained");
+    if (askIdentity.askIdState === "missing") logDiagnostic("src/agents/manager.ts", "[pi-fabric] Agent spawn askId MISSING; no Ask-ID marker will be retained");
     const task = taskWithAskId(request.task, askIdentity.askId);
     const timeoutNote = request.actorId ? undefined : ignoredTimeoutNote(this.config.timeoutMs, request.timeoutMs);
     const needs = normalizeAgentCapabilityTokens(request.needs);

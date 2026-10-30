@@ -34,7 +34,11 @@ W is the ID B5's `prepareScriptedInput(...).idempotencyKey` derives for a
 second sender of the same session/original input, text and deadline. Preparing
 that sender's outbox does not retain W in the receiver's admission record.
 Stand-in admissions also use B5's derivation; pair consistency, B5 grammar,
-namespace and length alone are not admission authentication.
+namespace and length alone are not admission authentication. C36 also refuses
+v7's consistent malformed pair and right-admission/malformed-delivery input
+(`"<A>:wrong"`, where A is the retained admission ID), next to the B5-derived
+checks. Each refusal immediately checks the unchanged ledger digest; unfamiliar
+ID forms must not bypass the retained admission lookup.
 
 The default runs both. Real-provider failures remain ordinary failing tests,
 not skips or expected failures. The selected integration head does not yet
@@ -185,6 +189,12 @@ unchanged provider ABI `V1`:
   setups, the unchanged real-B5 failure map on `dc1808dd`, and the separate
   scratch composition with B4 source fix `8c39803c`. No production change;
   independent acceptance belongs to the CoS judge.
+
+- v7c: restores both malformed-ID C36 checks alongside the B5-derived checks,
+  each with its ledger-digest assertion (R7 cause C3), contract SHA-256
+  `304fe8563e079ceec2982dff076bafdd44663445dbada460db1f6ac148226b3b`.
+  Round-7c `RESULT.md` records builder evidence. No other case or production change;
+  independent acceptance remains with the CoS judge.
 
 The round-2 `PHASE1.md` (v2) and `RESULT.md` (v3), round-4 `RESULT.md` (v5),
 and round-5 `RESULT.md` (v6) record commit/hash and per-test evidence. CoS owns

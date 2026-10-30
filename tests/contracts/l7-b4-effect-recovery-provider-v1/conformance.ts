@@ -257,10 +257,14 @@ export function runConformance(provider: ConformanceFactory): void {
       // Preparing its outbox does not retain that admission in the original's receiver record.
       const secondSenderAdmission = scriptedAdmissionId(acceptedInput, `c36-second-sender:${randomUUID()}`);
       expect(secondSenderAdmission).not.toBe(acceptedInput.admissionId);
-      // Consistency alone is insufficient: this pair names no retained B5 admission of this original.
+      // Consistency alone is insufficient: neither malformed nor B5-derived pairs bypass the retained record.
+      await expect(h.provider.repairMaintenance!({ ...wrong, deliveryId: wrong.admissionId }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
+      expect(await h.ledgerDigest()).toBe(before);
       await expect(h.provider.repairMaintenance!({ ...acceptedInput, admissionId: secondSenderAdmission, deliveryId: secondSenderAdmission }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
       expect(await h.ledgerDigest()).toBe(before);
       // The correct admission with a wrong delivery must also refuse (the converse inconsistent pair).
+      await expect(h.provider.repairMaintenance!({ ...acceptedInput, deliveryId: wrong.admissionId }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
+      expect(await h.ledgerDigest()).toBe(before);
       await expect(h.provider.repairMaintenance!({ ...acceptedInput, deliveryId: secondSenderAdmission }, "J")).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" });
       expect(await h.ledgerDigest()).toBe(before);
       // The refusals must not poison the valid occurrence or manufacture a receipt.

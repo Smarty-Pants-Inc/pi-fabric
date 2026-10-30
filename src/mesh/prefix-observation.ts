@@ -58,16 +58,24 @@ const integer = (value: unknown): value is number => typeof value === "number" &
 export const validPrefixSnapshot = (value: unknown, prefix: string): value is PrefixEntries => {
   if (!Array.isArray(value) || !Object.isFrozen(value)) return false;
   const seen = new Set<object>();
-  const frozenJson = (node: unknown): boolean => {
-    if (node === null || typeof node === "string" || typeof node === "boolean") return true;
-    if (typeof node === "number") return Number.isFinite(node);
+  // Valid JSON can be deeper than a recursive validator's call stack. Keep the graph
+  // walk iterative, including descriptor checks, without invoking backend getters.
+  const pending: unknown[] = [value];
+  while (pending.length) {
+    const node = pending.pop();
+    if (node === null || typeof node === "string" || typeof node === "boolean") continue;
+    if (typeof node === "number") {
+      if (!Number.isFinite(node)) return false;
+      continue;
+    }
     if (typeof node !== "object" || !Object.isFrozen(node) || seen.has(node)) return false;
     if (!Array.isArray(node) && Object.getPrototypeOf(node) !== Object.prototype && Object.getPrototypeOf(node) !== null) return false;
-    seen.add(node);
-    const descriptors = Object.getOwnPropertyDescriptors(node);
-    return Object.values(descriptors).every(descriptor => "value" in descriptor && frozenJson(descriptor.value));
-  };
-  if (!frozenJson(value)) return false;
+    seen.add(node); // Reject both cycles and shared aliases, as JSON decoding produces neither.
+    for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(node))) {
+      if (!("value" in descriptor)) return false;
+      pending.push(descriptor.value);
+    }
+  }
   let last: string | undefined;
   for (const entry of value) {
     if (!object(entry) || typeof entry.key !== "string" || !entry.key.startsWith(prefix) ||

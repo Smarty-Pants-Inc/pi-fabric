@@ -16,7 +16,7 @@ import { delay, errorCode, type MeshLock, type MeshStoreContext } from "./mesh-l
 import { assertFileStateWritable, isMeshStateMovedMarker, isMeshStateNatsMarker, meshStateMovedError, meshStateMovedToNatsError, readMeshStateMovedMarker,
   type MeshStateMovedMarker, type MeshStateNatsMarker } from "./backend-fence.js";
 import type { MeshIdentity } from "./event-log.js";
-import type { MeshStateFileRead, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
+import type { DeepReadonly, MeshStateFileRead, PrefixObservation, PrefixWitness, StateBackend, StateBackendBatchInput, StateBackendDiagnostics } from "./state-backend.js";
 
 // Keyed mesh state on state.json (smarty-dev#6477 L0): reads, encoding, prepared and committed
 // writes, revisions, tombstones, namespaces, the read signal and write snapshots.
@@ -272,6 +272,17 @@ const closeQuietly = (descriptor: number | undefined): void => {
   }
 };
 const SELECTION_MEMO_PREFIXES = 32;
+// Optional unrelated-change proofs must stay small: framing/removal rescans and
+// copies whole canonical tables. Decline to a complete snapshot before that work
+// can amplify with churn. The byte estimate charges eight full UTF-16 text passes
+// per changed key plus initial framing, across BOTH captured canonical documents;
+// canonical I/O/hash and journal I/O/parse/hash remain separate, nonzero work.
+const PREFIX_PROOF_MAX_CHANGED_KEYS = 8;
+const PREFIX_PROOF_MAX_WORK_BYTES = 64 * 1024 * 1024;
+// Aggregate retained canonical text, not a total heap cap: selection graphs remain
+// separately bounded by 32 prefixes. Charge at least two bytes per code unit, so
+// one document at the default 32 MiB file cap fits, even for ASCII in UTF-16.
+const PREFIX_PROOF_MAX_RETAINED_TEXT_BYTES = 64 * 1024 * 1024;
 const keyNamespace = (key: string): string | undefined => {
   const second = key.indexOf("/", key.indexOf("/") + 1);
   return key.indexOf("/") < 0 || second < 0 ? undefined : key.slice(0, second + 1);
@@ -596,6 +607,102 @@ export class MeshBatchConflictError extends Error {
   }
 }
 
+interface PrefixReadPoint {
+  identity: string;
+  stamp: string;
+  generation: string;
+  hash: string;
+  serialized: string;
+  journalHash: string | undefined;
+  cursor: JournalCursor | undefined;
+}
+// Find an object-valued DIRECT member in canonical JSON without enumerating or
+// decoding its other members. This is byte framing, not a second state decoder:
+// unknown/noncanonical layouts simply decline the optional equality proof.
+const canonicalObjectMember = (text: string, key: string): { start: number; value: number; end: number } | undefined => {
+  const needle = `${JSON.stringify(key)}:`;
+  let depth = 0, inString = false, escaped = false;
+  let found: { start: number; value: number; end: number } | undefined;
+  for (let index = 0; index < text.length; index++) {
+    const character = text[index]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') {
+      if (depth === 1 && text.startsWith(needle, index)) {
+        if (found || (text[index - 1] !== "{" && text[index - 1] !== ",")) return undefined;
+        const value = index + needle.length;
+        if (text[value] !== "{") return undefined;
+        let nested = 0, quoted = false, escape = false, end = value;
+        for (; end < text.length; end++) {
+          const next = text[end]!;
+          if (quoted) {
+            if (escape) escape = false;
+            else if (next === "\\") escape = true;
+            else if (next === '"') quoted = false;
+          } else if (next === '"') quoted = true;
+          else if (next === "{" || next === "[") nested++;
+          else if ((next === "}" || next === "]") && --nested === 0) break;
+        }
+        if (end >= text.length || (text[end + 1] !== "," && text[end + 1] !== "}")) return undefined;
+        found = { start: index, value, end: end + 1 };
+      }
+      inString = true;
+    } else if (character === "{" || character === "[") depth++;
+    else if (character === "}" || character === "]") depth--;
+  }
+  return found;
+};
+
+// Remove ONLY journal-named, non-prefix members from two captured canonical entry
+// tables, then compare all remaining bytes. This independently closes the journal's
+// coarse-ctime hole: an untracked in-place edit followed by a protocol commit cannot
+// hide a prefix change even if the predecessor's entire physical tuple repeats.
+// The caller bounds changed keys AND aggregate text work before entering either
+// table's framing/removal loop. This is not a walk of selected entries.
+const canonicalEntriesExcept = (serialized: string, omitted: ReadonlySet<string>): string | undefined => {
+  const entries = canonicalObjectMember(serialized, "entries");
+  if (!entries) return undefined;
+  const metadata: unknown = JSON.parse(`${serialized.slice(0, entries.value)}{}${serialized.slice(entries.end)}`);
+  if (!isMeshStateFile(metadata)) return undefined;
+  let table = serialized.slice(entries.value, entries.end);
+  for (const key of omitted) {
+    const member = canonicalObjectMember(table, key);
+    if (!member) continue;
+    const entry: unknown = JSON.parse(table.slice(member.value, member.end));
+    if (typeof entry !== "object" || entry === null || !Object.hasOwn(entry, "value") ||
+        meshStateDocumentProblem({ format: 1, entries: { [key]: entry } }) !== undefined) return undefined;
+    let start = member.start, end = member.end;
+    if (table[end] === ",") end++;
+    else if (table[start - 1] === ",") start--;
+    table = table.slice(0, start) + table.slice(end);
+  }
+  return table;
+};
+
+interface FilePrefixSelection {
+  witness: PrefixWitness;
+  point: PrefixReadPoint;
+  entries: readonly DeepReadonly<MeshStateEntry>[];
+}
+
+// Only the observation's privately decoded JSON graph is frozen. Legacy caches and
+// listAll/listAllShared keep their existing ownership and mutability contracts.
+const freezePrefixSelection = (entries: MeshStateEntry[]): readonly DeepReadonly<MeshStateEntry>[] => {
+  const pending: object[] = [entries];
+  while (pending.length) {
+    const value = pending.pop()!;
+    for (const child of Object.values(value)) {
+      if (typeof child === "object" && child !== null) pending.push(child);
+    }
+    Object.freeze(value);
+  }
+  return entries as readonly DeepReadonly<MeshStateEntry>[];
+};
+
 interface ParsedStateSnapshot {
   device: number; inode: number; size: number; modifiedAt: number; stamp: string; parsedAt: number; state: MeshStateFile;
   generation: string | undefined;
@@ -693,6 +800,9 @@ export class StateFile implements StateBackend {
   #stateCache: ParsedStateSnapshot | undefined;
   #canonicalHeader: { identity: string; generation: string | undefined; journalHash: string | undefined } | undefined;
   #lastPreparedSweep = -Infinity;
+  // One registered handle/owned sequence per prefix, never caller-authored authority.
+  readonly #prefixSelections = new Map<string, FilePrefixSelection>();
+  #prefixObservationsClosed = false;
 
   constructor(context: MeshStoreContext, options: StateFileOptions) {
     const { root, maxEventBytes } = context;
@@ -759,6 +869,7 @@ export class StateFile implements StateBackend {
   /** A failed locked operation means this store's view is behind (see MeshLock.withLock). */
   dropCache(): void {
     this.#stateCache = undefined;
+    this.#prefixSelections.clear();
   }
 
   /** The reuse window of reads (MeshStoreOptions.readCacheMs), for readers of files beside the state. */
@@ -798,6 +909,180 @@ export class StateFile implements StateBackend {
   /** Internal project-state scan for host-managed indexes that must reconcile every key. */
   listAll(prefix = "", options: MeshReadOptions = {}): MeshStateEntry[] {
     return this.#select(prefix, options).map((entry) => jsonClone(entry));
+  }
+
+  /**
+   * Exact, synchronous prefix observation, independent of the legacy TTL and tolerant
+   * parsed cache. Hash canonical bytes on EVERY observation: physical metadata alone
+   * cannot rule out same-tick in-place edits (even nanosecond ctime can be coarse).
+   * Hits save selection traversal/decode/sort/clone/freeze, not canonical byte I/O/hash.
+   * The existing payload-bound journal can prove a small unrelated commit with bounded
+   * canonical-table framing/copy work. No signal digest or UUID alone proves equality.
+   */
+  observePrefix(prefix: string, previous?: PrefixWitness): PrefixObservation {
+    if (prefix) this.#validateKey(prefix);
+    if (this.#prefixObservationsClosed) return { kind: "unknown", reason: "file observation lifetime closed" };
+    const unknown = (reason: string): PrefixObservation => {
+      this.#prefixSelections.delete(prefix);
+      return { kind: "unknown", reason };
+    };
+    // Capture the journal end BEFORE the canonical read, as the ordinary read gate does.
+    const cursor = journalCursorOf(this.root);
+    let serialized: string;
+    let before: string;
+    let physical: string | undefined;
+    try {
+      const stat = fs.statSync(this.#statePath);
+      if (stat.size > this.#maxStateBytes) throw new Error(`state exceeds ${this.#maxStateBytes} bytes`);
+      before = stampOf(stat);
+      physical = stateReadIdentity(this.#statePath, this.#maxStateBytes);
+      serialized = readFileRetrying(this.#statePath);
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return unknown("canonical file absent");
+      this.#prefixSelections.delete(prefix);
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to read Fabric mesh state: ${message}`);
+    }
+    // Do not turn a canonical moved-marker error into optional-proof uncertainty.
+    const generation = STATE_HEADER.exec(serialized)?.[1];
+    if (!generation || physical === undefined) {
+      let parsed: unknown;
+      try { parsed = JSON.parse(serialized); } catch { return unknown("unproven canonical document"); }
+      if (isMeshStateMovedMarker(parsed) || isMeshStateNatsMarker(parsed)) {
+        this.#prefixSelections.clear();
+        throw isMeshStateNatsMarker(parsed) ? meshStateMovedToNatsError(this.#statePath, parsed) : meshStateMovedError(this.#statePath, parsed);
+      }
+      return unknown(physical === undefined ? "canonical physical identity unavailable" : "legacy canonical header");
+    }
+    if (stateReadIdentity(this.#statePath, this.#maxStateBytes) !== physical || statStamp(this.#statePath) !== before) {
+      return unknown("canonical replacement during observation");
+    }
+    const point: PrefixReadPoint = {
+      identity: physical, stamp: before, generation,
+      hash: createHash("sha256").update(serialized).digest("hex"), serialized,
+      journalHash: /^\{"readGeneration":"[0-9a-f-]{36}","readJournalHash":"([0-9a-f]{64})"/.exec(serialized)?.[1],
+      cursor,
+    };
+    const saved = this.#prefixSelections.get(prefix);
+    let uncertainJournal = false;
+    if (saved && saved.witness === previous) {
+      if (saved.point.hash === point.hash) return this.#rememberPrefix(prefix, point, saved.entries, true);
+      const unchanged = this.#prefixJournalUnchanged(prefix, saved.point, point, serialized);
+      uncertainJournal = unchanged === undefined;
+      if (unchanged) return this.#rememberPrefix(prefix, point, saved.entries, true);
+    }
+    let parsed: unknown;
+    try { parsed = JSON.parse(serialized); } catch { return unknown("invalid canonical JSON"); }
+    if (isMeshStateMovedMarker(parsed) || isMeshStateNatsMarker(parsed)) {
+      this.#prefixSelections.clear();
+      throw isMeshStateNatsMarker(parsed) ? meshStateMovedToNatsError(this.#statePath, parsed) : meshStateMovedError(this.#statePath, parsed);
+    }
+    if (uncertainJournal) return unknown("invalid optional prefix journal proof");
+    // The tolerant reader's empty/recovered/partial documents have no negative authority.
+    if (meshStateDocumentProblem(parsed) !== undefined || !isMeshStateFile(parsed)) return unknown("unproven canonical entries");
+    const all = Object.values(parsed.entries);
+    if (all.some(entry => !Object.hasOwn(entry, "value"))) return unknown("incomplete canonical entry");
+    const entries = all.filter(entry => entry.key.startsWith(prefix))
+      .sort((left, right) => left.key.localeCompare(right.key));
+    return this.#rememberPrefix(prefix, point, freezePrefixSelection(entries), false);
+  }
+
+  #rememberPrefix(prefix: string, point: PrefixReadPoint, entries: readonly DeepReadonly<MeshStateEntry>[], unchanged: boolean): PrefixObservation {
+    const witness: PrefixWitness = Object.freeze({});
+    this.#prefixSelections.delete(prefix);
+    const textBytes = 2 * point.serialized.length;
+    // Oversized documents may be returned once, but their witness is deliberately
+    // unregistered: a future call must take a new complete snapshot. Do not evict
+    // other prefixes to make room for something that cannot fit on its own.
+    if (textBytes <= PREFIX_PROOF_MAX_RETAINED_TEXT_BYTES) {
+      // Derive from <=32 live records, so replacement/UNKNOWN/error/reset/close
+      // cannot leave an independent byte counter stale or negative.
+      let retainedBytes = textBytes;
+      for (const saved of this.#prefixSelections.values()) retainedBytes += 2 * saved.point.serialized.length;
+      while (this.#prefixSelections.size >= SELECTION_MEMO_PREFIXES || retainedBytes > PREFIX_PROOF_MAX_RETAINED_TEXT_BYTES) {
+        const oldest = this.#prefixSelections.keys().next().value!;
+        retainedBytes -= 2 * this.#prefixSelections.get(oldest)!.point.serialized.length;
+        this.#prefixSelections.delete(oldest);
+      }
+      this.#prefixSelections.set(prefix, { witness, point, entries });
+    }
+    return unchanged ? { kind: "unchanged", witness } : { kind: "snapshot", witness, entries };
+  }
+
+  // Read the EXISTING format-2 journal, but inspect change keys rather than replaying
+  // it into a spread/copy of all entries. The canonical chain head commits every body;
+  // the terminal payload hash is checked against the canonical bytes captured above,
+  // not an unbound sidecar checksum/namespace hint or a repeatable physical label.
+  // false: no complete usable history / changed prefix => a canonical snapshot.
+  // undefined: corrupt optional proof => UNKNOWN, never a tolerant empty snapshot.
+  #prefixJournalUnchanged(prefix: string, previous: PrefixReadPoint, current: PrefixReadPoint, serialized: string): boolean | undefined {
+    if (!current.journalHash || previous.generation === current.generation) return false;
+    let descriptor: number | undefined;
+    try {
+      descriptor = fs.openSync(path.join(this.root, "state.read-journal.jsonl"), "r");
+      const stat = fs.fstatSync(descriptor);
+      // Same bounded history/record limits as read-journal.ts; no new disk protocol.
+      if (stat.size > 2 * 1024 * 1024) return false;
+      const inode = `${stat.dev}:${stat.ino}`;
+      const cursor = previous.cursor;
+      const offset = cursor?.inode === inode && cursor.offset <= stat.size ? cursor.offset : 0;
+      if (offset === stat.size) return false;
+      const buffer = Buffer.allocUnsafe(stat.size - offset);
+      if (fs.readSync(descriptor, buffer, 0, buffer.length, offset) !== buffer.length) return undefined;
+      const text = buffer.toString("utf8");
+      if (!text.endsWith("\n")) return undefined;
+      const record = (value: unknown): value is Record<string, unknown> =>
+        typeof value === "object" && value !== null && !Array.isArray(value);
+      const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
+      let generation = previous.generation, hash = previous.journalHash;
+      let identity: unknown = previous.identity, stamp: unknown = previous.stamp;
+      let started = false, changed = false, consumed = 0;
+      const changedKeys = new Set<string>();
+      for (const line of text.slice(0, -1).split("\n")) {
+        const bytes = Buffer.byteLength(line);
+        if (bytes > 256 * 1024) return undefined;
+        consumed += bytes + 1;
+        const row: unknown = JSON.parse(line);
+        if (!record(row) || !record(row.delta) || row.checksum !== digest(JSON.stringify(row.delta))) return undefined;
+        const delta = row.delta;
+        if (delta.previous !== generation) {
+          if (!started) continue;
+          return false;
+        }
+        const { identity: nextIdentity, stamp: nextStamp, ...body } = delta;
+        if (delta.format !== 2 || delta.previousHash !== (hash ?? null) || delta.previousIdentity !== identity ||
+            delta.previousStamp !== stamp || typeof delta.generation !== "string" || !GENERATION.test(delta.generation) ||
+            !record(delta.entries)) return false;
+        started = true;
+        for (const key of Object.keys(delta.entries)) {
+          if (key.startsWith(prefix)) changed = true;
+          if (!changedKeys.has(key)) {
+            if (changedKeys.size >= PREFIX_PROOF_MAX_CHANGED_KEYS) return false;
+            changedKeys.add(key);
+          }
+        }
+        generation = delta.generation;
+        hash = digest(JSON.stringify(body));
+        identity = nextIdentity; stamp = nextStamp;
+        if (generation !== current.generation) continue;
+        if (hash !== current.journalHash || identity !== current.identity || stamp !== current.stamp) return false;
+        const header = `{"readGeneration":"${generation}","readJournalHash":"${hash}"`;
+        if (!serialized.startsWith(header) || delta.canonicalPayloadHash !==
+            digest(`{"readGeneration":"${generation}"${serialized.slice(header.length)}`)) return undefined;
+        const after = fs.fstatSync(descriptor);
+        if (after.ino !== stat.ino || after.size < stat.size) return undefined;
+        current.cursor = { inode, offset: offset + consumed };
+        if (changed) return false;
+        const proofTextBytes = 2 * (previous.serialized.length + serialized.length);
+        if (proofTextBytes > PREFIX_PROOF_MAX_WORK_BYTES / (8 * (changedKeys.size + 1))) return false;
+        const before = canonicalEntriesExcept(previous.serialized, changedKeys);
+        const afterEntries = canonicalEntriesExcept(serialized, changedKeys);
+        return before === undefined || afterEntries === undefined ? undefined : before === afterEntries;
+      }
+      return false;
+    } catch (error) {
+      return errorCode(error) === "ENOENT" ? false : undefined;
+    } finally { closeQuietly(descriptor); }
   }
 
   /**
@@ -1509,8 +1794,11 @@ export class StateFile implements StateBackend {
     return { kind: "file", ...(this.fallback ? { fallback: this.fallback } : {}) };
   }
 
-  /** Nothing to release: state.json is opened per operation. */
-  close(): void {}
+  /** Legacy file operations remain usable; only borrowed observation authority retires. */
+  close(): void {
+    this.#prefixObservationsClosed = true;
+    this.#prefixSelections.clear();
+  }
 
   /**
    * Changes whenever the shared state file does, from its metadata alone: a poll can test it

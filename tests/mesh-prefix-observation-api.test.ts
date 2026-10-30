@@ -4,8 +4,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { STATE_BACKEND_FACTORIES, type StateBackend, type MeshStateBackendKind } from "../src/mesh/state-backend.js";
 import type { MeshStateEntry } from "../src/mesh/state-file.js";
-import { bindPrefixObservation, freezePrefixEntries, PrefixObservationCache,
-  type PrefixObservation, type PrefixWitness } from "../src/mesh/prefix-observation.js";
+import { bindPrefixObservation, freezePrefixEntries, PrefixObservationCache, validPrefixSnapshot,
+  type PrefixEntries, type PrefixObservation, type PrefixWitness } from "../src/mesh/prefix-observation.js";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
 
 // Keep: data-safety/trust boundary. Exercise the actual facade and runtime normalization without
@@ -165,6 +165,130 @@ describe("standalone optional prefix API (no SQLite internals)", () => {
     expect(caught).toBe(fault);
     expect(scan).toHaveBeenCalledExactlyOnceWith(prefix, {});
     expect(observe).toHaveBeenCalledTimes(1);
+  });
+});
+
+// F03: the real FILE writer accepted a 3,000-object / 27,080-byte value, but the old
+// validator overflowed in Shadow and both native facades (retained external probe).
+// This portable test isolates the actual facade/validator boundary, NOT native FILE observation.
+// Fixture construction, freezing and integrity checks must not consume the JS call stack.
+const frozenSequence = (value: unknown): PrefixEntries => {
+  const sequence = [{ ...entry(prefix + "a-deep"), value }, entry(prefix + "z-shallow")];
+  const pending: unknown[] = [sequence];
+  while (pending.length) {
+    const node = pending.pop();
+    if (node === null || typeof node !== "object") continue;
+    pending.push(...Object.values(node));
+    Object.freeze(node);
+  }
+  return sequence;
+};
+const leafText = '{"marker":"F03-leaf","escaped":"\\\"\\\\\\n","finite":1.25,"flag":true,"absent":null}';
+const deepSequence = (shape: "object" | "array", depth: number) => {
+  const text = shape === "object" ? '{"next":'.repeat(depth) + leafText + "}".repeat(depth)
+    : "[".repeat(depth) + leafText + "]".repeat(depth);
+  expect(Buffer.byteLength(text)).toBeLessThan(64 * 1024);
+  return frozenSequence(JSON.parse(text));
+};
+
+describe("F03: stack-safe optional snapshot validation", () => {
+  it.each([
+    { shape: "object", depth: 32 }, { shape: "object", depth: 3000 },
+    { shape: "array", depth: 32 }, { shape: "array", depth: 3000 },
+  ] as const)("preserves the complete $shape snapshot at depth $depth and its paired hit", ({ shape, depth }) => {
+    const sequence = deepSequence(shape, depth), token = witness(), state = backend();
+    const observe = vi.fn<NonNullable<StateBackend["observePrefix"]>>()
+      .mockReturnValueOnce({ kind: "snapshot", witness: token, entries: sequence })
+      .mockReturnValueOnce({ kind: "unchanged", witness: token });
+    state.observePrefix = observe;
+    const scan = vi.spyOn(state, "listAll"), mesh = facade(state);
+    const first = snapshot(mesh.observePrefix(prefix));
+    expect(first.entries).toBe(sequence);
+    expect(first.entries.length).toBe(2);
+    expect(Object.isFrozen(first.entries)).toBe(true);
+    for (const [index, key] of [prefix + "a-deep", prefix + "z-shallow"].entries()) {
+      const row = first.entries[index]!;
+      expect(row.key).toBe(key);
+      expect(row.version).toBe(1);
+      expect(row.updatedAt).toBe(1);
+      expect(row.updatedBy).toEqual(identity);
+      expect(Object.isFrozen(row)).toBe(true);
+      expect(Object.isFrozen(row.updatedBy)).toBe(true);
+    }
+    let cursor: unknown = first.entries[0]!.value;
+    for (let index = 0; index < depth; index++) {
+      expect(Object.isFrozen(cursor)).toBe(true);
+      if (shape === "array") {
+        if (!Array.isArray(cursor)) throw new Error(`missing array at ${index}`);
+        expect(cursor.length).toBe(1);
+        cursor = cursor[0];
+      } else {
+        expect(Object.keys(cursor as object)).toEqual(["next"]);
+        cursor = (cursor as { next: unknown }).next;
+      }
+    }
+    expect(Object.isFrozen(cursor)).toBe(true);
+    expect(cursor).toEqual({ marker: "F03-leaf", escaped: '"\\\n', finite: 1.25, flag: true, absent: null });
+    expect(first.entries[1]!.value).toEqual(entry().value);
+    const hit = mesh.observePrefix(prefix, first.witness);
+    expect(hit.kind).toBe("unchanged");
+    expect(observe.mock.calls).toEqual([[prefix, undefined], [prefix, token]]);
+    expect(scan).not.toHaveBeenCalled();
+  });
+
+  it("keeps finite primitives, frozen arrays and plain/null-prototype JSON objects valid", () => {
+    const nullPrototype = Object.assign(Object.create(null) as Record<string, unknown>, {
+      escaped: '"\\\n', nested: [null, true, false, "", -0, 1.25, Number.MAX_VALUE],
+    });
+    expect(validPrefixSnapshot(frozenSequence({ plain: nullPrototype }), prefix)).toBe(true);
+    for (const value of [null, true, false, "", -0, 1.25, Number.MAX_VALUE]) {
+      expect(validPrefixSnapshot(frozenSequence(value), prefix)).toBe(true);
+    }
+  });
+
+  it("rejects malformed graphs without getters, lost entries or a silent empty fallback", () => {
+    const getter = vi.fn(() => { throw new Error("must not invoke snapshot getter"); });
+    const accessor = Object.freeze(Object.defineProperty({}, "hidden", { get: getter }));
+    const cycle: { next?: unknown } = {};
+    cycle.next = cycle;
+    Object.freeze(cycle);
+    const shared = Object.freeze({ marker: "shared" });
+    let deepBad: unknown = Object.freeze({ next: Infinity });
+    for (let index = 0; index < 3000; index++) deepBad = Object.freeze({ next: deepBad });
+    const malformed: unknown[] = [undefined, NaN, Infinity, -Infinity, 1n, Symbol("not-json"), () => 1,
+      { mutable: true }, Object.freeze({ nested: [] }), Object.freeze(new Date(0)),
+      Object.freeze(Object.create({ inherited: true })), accessor, cycle,
+      Object.freeze({ left: shared, right: shared }), Object.freeze([shared, shared]), deepBad];
+    const state = backend(), token = witness(), observe = vi.fn<NonNullable<StateBackend["observePrefix"]>>();
+    state.observePrefix = observe;
+    const scan = vi.spyOn(state, "listAll"), mesh = facade(state);
+    for (const value of malformed) {
+      const sequence = Object.freeze([Object.freeze({ ...entry(), updatedBy: Object.freeze({ ...identity }), value })]);
+      observe.mockReturnValueOnce({ kind: "snapshot", witness: token, entries: sequence });
+      scan.mockClear();
+      expect(mesh.observePrefix(prefix)).toEqual({ kind: "unknown", reason: "malformed-backend-snapshot" });
+      expect(scan).not.toHaveBeenCalled();
+      // Exactly today's caller fallback, never a strengthened read or a certified empty result.
+      const selected = mesh.listAll(prefix);
+      expect(selected).toEqual([entry()]);
+      expect(scan).toHaveBeenCalledExactlyOnceWith(prefix, {});
+    }
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it("retains frozen-container, metadata, prefix and ordering checks", () => {
+    const good = frozenSequence(null);
+    const row = good[0]!;
+    const malformed: unknown[] = [[], [row], Object.freeze([{ ...row }]),
+      Object.freeze([Object.freeze({ ...row, updatedBy: { ...identity } })]),
+      ...[0, -1, 1.25, NaN, Infinity].map(version => Object.freeze([Object.freeze({ ...row, version })])),
+      Object.freeze([Object.freeze({ ...row, updatedAt: -1 })]),
+      Object.freeze([Object.freeze({ ...row, key: "other/a" })]),
+      Object.freeze([Object.freeze({ ...row, updatedBy: Object.freeze({ ...identity, kind: "unknown" }) })]),
+      Object.freeze([Object.freeze({ ...row, updatedBy: Object.freeze({ ...identity, sessionId: 1 }) })]),
+      Object.freeze([Object.freeze({ ...row, updatedBy: Object.freeze({ ...identity, verified: "other" }) })]),
+      Object.freeze([good[1], good[0]]), Object.freeze([row, row])];
+    for (const sequence of malformed) expect(validPrefixSnapshot(sequence, prefix)).toBe(false);
   });
 });
 

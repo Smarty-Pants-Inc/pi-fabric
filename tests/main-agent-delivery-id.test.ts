@@ -13,9 +13,16 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { FOLLOW_UP_LIMITS, MainAgentController } from "../src/main-agent.js";
+import { FOLLOW_UP_LIMITS, MainAgentController, type HeldAgentMessage } from "../src/main-agent.js";
+import type { FabricInterruptAuthority } from "../src/interrupt-authority.js";
+import { nativeRecoveryCarrierCustody, nativeRecoveryCarrierIdentities, readNativeRecoveryCustody } from "../src/core/native-recovery.js";
+import type { NativeRecoveryCustodyReader, NativeRecoveryCustodyResult, NativeRecoveryTransfer,
+  NativeRecoverySessionRef } from "../src/core/session-receipts.js";
 import * as deliveryOutcomes from "../src/mesh/delivery-outcomes.js";
 import * as atomicWrite from "../src/core/atomic-write.js";
+import {
+  adoptRootInboxReceiptIssuer, retainRootInboxReceiptIssuer, rootInboxReceiptIssuer,
+} from "../src/topology/root-inbox-shared.js";
 
 // Review round 2 on pi-fabric#160 (finding 1, security S1): Pi's sendMessage returns void and may
 // only queue the message (streaming, prompt preflight, a settle), or fail asynchronously. A
@@ -69,6 +76,49 @@ const journalPath = () => {
   roots.push(dir);
   return path.join(dir, "main-followups", "root.json");
 };
+
+// Keep: process-object receipt authority and manager/session isolation are trust boundaries.
+describe("native receipt issuer registry isolation", () => {
+  it("rejects copied issuers/capabilities and preserves historical identity across exact claims", () => {
+    const source = {}, target = {}, next = {};
+    const issuer = rootInboxReceiptIssuer(source, "source");
+    expect(() => retainRootInboxReceiptIssuer({ ...issuer })).toThrow("Unknown root inbox receipt issuer");
+    const authority = retainRootInboxReceiptIssuer(issuer);
+    for (const copy of [{ ...authority }, structuredClone(authority)]) {
+      expect(() => adoptRootInboxReceiptIssuer(target, "target", copy)).toThrow();
+    }
+    expect(() => adoptRootInboxReceiptIssuer(target, "", authority)).toThrow();
+    expect(adoptRootInboxReceiptIssuer(target, "target", authority)).toBe(issuer);
+    expect(adoptRootInboxReceiptIssuer(target, "target", authority)).toBe(issuer);
+    expect(() => adoptRootInboxReceiptIssuer(target, "other", authority)).toThrow();
+    expect(() => adoptRootInboxReceiptIssuer({}, "target", authority)).toThrow();
+    expect(rootInboxReceiptIssuer(target, "target")).toBe(issuer);
+    expect(rootInboxReceiptIssuer(target, "target", true)).toBe(issuer);
+    expect(adoptRootInboxReceiptIssuer(next, "next", retainRootInboxReceiptIssuer(issuer))).toBe(issuer);
+    expect(issuer.sessionId).toBe("source");
+    // An issuer used as a manager key must not become another issuer's provenance.
+    const separate = rootInboxReceiptIssuer(issuer, "separate");
+    expect(separate).not.toBe(issuer);
+    expect(rootInboxReceiptIssuer(next, "next")).toBe(issuer);
+  });
+
+  it("keeps ordinary new sessions, reloads and managers independent of native bindings", () => {
+    const manager = {}, target = {};
+    const issuer = rootInboxReceiptIssuer(manager, "source");
+    issuer.queued.set("pending", 3); issuer.turn = 4;
+    expect(rootInboxReceiptIssuer(manager, "source", true)).toBe(issuer);
+    adoptRootInboxReceiptIssuer(target, "target", retainRootInboxReceiptIssuer(issuer));
+    expect(rootInboxReceiptIssuer({}, "target", true)).not.toBe(issuer);
+    const ordinary = rootInboxReceiptIssuer(target, "ordinary", true);
+    expect(ordinary).not.toBe(issuer);
+    expect(ordinary.queued.size).toBe(0);
+    expect(rootInboxReceiptIssuer(target, "target")).not.toBe(issuer);
+    expect(rootInboxReceiptIssuer(manager, "source")).not.toBe(issuer);
+    expect(issuer.queued.get("pending")).toBe(3);
+    expect(issuer.turn).toBe(4);
+    expect(issuer.sessionId).toBe("source");
+  });
+});
 
 describe("Main delivery outcome evidence", () => {
   const outcomes = (journal: string) => {
@@ -642,6 +692,424 @@ describe("Main admits a delivery id durably, once", () => {
       expect(fresh.deliverAgent({ from: actor, message: "m2000", delivery: "steer", deliveryId: "rec-2000" })).toMatchObject({ duplicate: true });
       expect(second.sent).toHaveLength(0);
     } finally { synced.mockRestore(); }
+  });
+});
+
+// Data-safety / trust-boundary regressions for C4 (#17478). These inject the N-validated
+// projection, NOT a made-up native file format; real native pair validation is N/I's check.
+describe("Main native recovery custody is not a delivery receipt", () => {
+  const sourceId = "11111111-1111-4111-8111-111111111111";
+  const targetId = "22222222-2222-4222-8222-222222222222";
+  const fixture = () => {
+    const sourceJournal = journalPath();
+    const directory = path.dirname(sourceJournal);
+    const source: NativeRecoverySessionRef = { sessionId: sourceId, sessionFile: path.join(directory, "source.jsonl") };
+    const target: NativeRecoverySessionRef = { sessionId: targetId, sessionFile: path.join(directory, "target.jsonl") };
+    fs.mkdirSync(directory, { recursive: true });
+    const header = (ref: NativeRecoverySessionRef) => `${JSON.stringify({ type: "session", version: 3, id: ref.sessionId })}\n`;
+    fs.writeFileSync(source.sessionFile, header(source));
+    fs.writeFileSync(target.sessionFile, header(target));
+    let transfer: NativeRecoveryTransfer = { version: 1, operationId: "operation-1", preparedDigest: "a".repeat(64),
+      preparedEntryId: "prepared-1", source, target, phase: "prepared", occurrences: [] };
+    let view: NativeRecoveryCustodyResult = { status: "validated", transfers: [transfer] };
+    let failed = false;
+    const reader: NativeRecoveryCustodyReader = vi.fn(() => { if (failed) throw new Error("native barrier failed"); return view; });
+    const context = (ref = target, idle = true) => ({ ...busy([], idle), sessionManager: {
+      getEntries: () => [], getSessionId: () => ref.sessionId, getSessionFile: () => ref.sessionFile, isPersisted: () => true,
+    } }) as unknown as ExtensionContext;
+    const received = () => {
+      const prepared = transfer;
+      transfer = { ...transfer, phase: "received", receivedEntryId: "received-1" };
+      if (view.status === "validated") view = { status: "validated", transfers: view.transfers.map(edge => edge === prepared ? transfer : edge) };
+    };
+    const original = (id = "original-1", deliveryId = "delivery-1"): HeldAgentMessage & { deliveryId: string } => ({
+      id, from: actor, message: "identical content", sentAt: 1_000, deliveryId, handed: true,
+      deliverAs: "nextTurn", triggerTurn: false, deliveryReason: "operator-halt",
+      outcomeSend: { eventId: `event:${id}`, to: `session:${sourceId}`, from: actor.id, mode: "followUp" },
+    });
+    const native = (items: HeldAgentMessage[]) => ({ customType: "pi-fabric-agent-message", details: items.length === 1 ? items[0] : {
+      ...items[0], id: "batch-carrier", items,
+    } });
+    const seed = (journal: string, items: HeldAgentMessage[]) => fs.writeFileSync(journal, JSON.stringify({ version: 1, items }));
+    const rows = (journal = sourceJournal): HeldAgentMessage[] => JSON.parse(fs.readFileSync(journal, "utf8")).items;
+    const outcomes = () => {
+      const directory = path.join(path.dirname(path.dirname(sourceJournal)), "delivery-outcomes");
+      return fs.existsSync(directory) ? fs.readdirSync(directory).flatMap(file =>
+        fs.readFileSync(path.join(directory, file), "utf8").trim().split("\n").map(line => JSON.parse(line))) : [];
+    };
+    const attach = (ref = target, journal = path.join(directory, "target.json"), idle = true, flushMs = 60_000,
+      authority: FabricInterruptAuthority = {}) => {
+      const h = fakePi(); const ctx = context(ref, idle);
+      const main = new MainAgentController(h.pi, `session:${ref.sessionId}`, true, "/tmp/project", ref.sessionId, true, undefined, authority);
+      main.attachFollowUpDrain(ctx, flushMs, journal, 600, undefined, reader);
+      return { ...h, ctx, main, journal };
+    };
+    return { sourceJournal, source, target, get transfer() { return transfer; }, reader, context, header, original, native, seed, rows, outcomes, received, attach,
+      setView: (next: NativeRecoveryCustodyResult) => { view = next; }, fail: (value: boolean) => { failed = value; } };
+  };
+
+  it("preserves original-root interrupt authority and actual abort while T owns delivery and its journal", () => {
+    const f = fixture(); f.received();
+    const target = f.attach(f.target, undefined, false); const abort = vi.fn(); target.ctx.abort = abort;
+    const originalId = `session:${f.source.sessionId}`;
+    const from = { id: originalId, name: "original-root", kind: "main" as const };
+    const request = { from, verification: "mesh" as const, message: "HOLD", delivery: "steer" as const, priority: "interrupt" as const,
+      deliveryId: "future-to-original", outcomeSend: { eventId: "future-event", to: originalId, from: from.id, mode: "steer" as const } };
+    try {
+      target.emit("tool_execution_start", { toolCallId: "running-tool" }, target.ctx);
+      expect(() => target.main.deliverAgent(request)).toThrow(/not authorized to interrupt/);
+      expect(abort).not.toHaveBeenCalled();
+      const receipt = target.main.deliverNativeRecoveryAgent(originalId, request);
+      expect(receipt).toMatchObject({ routed: "main", reason: "interrupt pending settlement", triggered: false });
+      expect(target.main.id).toBe(`session:${f.target.sessionId}`);
+      expect(abort).toHaveBeenCalledTimes(1);
+      expect(target.sent).toEqual([]);
+      expect(f.rows(target.journal)).toMatchObject([{ id: receipt.messageId, from, deliveryId: request.deliveryId, outcomeSend: request.outcomeSend }]);
+      expect(fs.existsSync(f.sourceJournal)).toBe(false);
+      target.emit("agent_settled", { outcome: "aborted" }, target.ctx);
+      expect(target.sent).toHaveLength(1);
+      expect(target.sent[0]!.options).toMatchObject({ deliverAs: "steer", triggerTurn: true });
+      expect(target.sent[0]!.message.details).toMatchObject({ id: receipt.messageId, from, deliveryId: request.deliveryId });
+    } finally { target.main.closeFollowUpDrain(); }
+  });
+
+  it("asks the retained supervisor check about original S, never substitutes T recipient authority", () => {
+    const f = fixture(); f.received(); const originalId = `session:${f.source.sessionId}`;
+    const isSupervisor = vi.fn((_sender: unknown, recipientId: string) => recipientId === originalId);
+    const target = f.attach(f.target, undefined, false, 60_000, { isSupervisor });
+    const abort = vi.fn(); target.ctx.abort = abort;
+    const request = { from: actor, verification: "mesh" as const, message: "HOLD", delivery: "steer" as const, priority: "interrupt" as const };
+    try {
+      target.emit("tool_execution_start", { toolCallId: "running-tool" }, target.ctx);
+      expect(() => target.main.deliverAgent(request)).toThrow(/not authorized to interrupt/);
+      isSupervisor.mockClear();
+      target.main.deliverNativeRecoveryAgent(originalId, request);
+      expect(isSupervisor).toHaveBeenCalledExactlyOnceWith(actor, originalId);
+      expect(abort).toHaveBeenCalledTimes(1);
+    } finally { target.main.closeFollowUpDrain(); }
+  });
+
+  it.each(["prepared", "unrelated", "sealed-source", "reader-error"] as const)("rejects native recipient routing with %s custody before interrupt effects", failure => {
+    const f = fixture(); if (failure !== "prepared") f.received();
+    const target = f.attach(f.target, undefined, false); const abort = vi.fn(); target.ctx.abort = abort;
+    let originalId = `session:${f.source.sessionId}`;
+    if (failure === "unrelated") originalId = "session:00000000-0000-4000-8000-000000000099";
+    if (failure === "reader-error") f.fail(true);
+    if (failure === "sealed-source") {
+      const { receivedEntryId: _received, ...binding } = f.transfer;
+      const outgoing: NativeRecoveryTransfer = { ...binding, phase: "prepared", operationId: "operation-2", preparedEntryId: "prepared-2",
+        preparedDigest: "b".repeat(64), source: f.target, target: { sessionId: "next", sessionFile: path.join(path.dirname(f.target.sessionFile), "next.jsonl") }, occurrences: [] };
+      f.setView({ status: "validated", transfers: [f.transfer, outgoing] });
+    }
+    try {
+      target.emit("tool_execution_start", { toolCallId: "running-tool" }, target.ctx);
+      expect(() => target.main.deliverNativeRecoveryAgent(originalId, { from: { id: originalId, name: "source", kind: "main" },
+        verification: "mesh", delivery: "steer", priority: "interrupt", message: "not admitted", deliveryId: "not-admitted" })).toThrow();
+      expect(abort).not.toHaveBeenCalled(); expect(target.sent).toEqual([]);
+      expect(fs.existsSync(target.journal) ? f.rows(target.journal) : []).toEqual([]);
+    } finally { target.main.closeFollowUpDrain(); }
+  });
+
+  it("keeps current T inbox gates authoritative after original S's received chain validates", () => {
+    const f = fixture(); f.received(); const target = f.attach(f.target, undefined, false);
+    const abort = vi.fn(); target.ctx.abort = abort;
+    target.main.attachFollowUpDrain(target.ctx, 60_000, target.journal, 600, { owns: () => true, active: () => false }, f.reader);
+    try {
+      const originalId = `session:${f.source.sessionId}`;
+      target.emit("tool_execution_start", { toolCallId: "running-tool" }, target.ctx);
+      expect(() => target.main.deliverNativeRecoveryAgent(originalId, { from: { id: originalId, name: "source", kind: "main" },
+        verification: "mesh", delivery: "steer", priority: "interrupt", message: "HOLD" })).toThrow(/rotated/);
+      expect(abort).not.toHaveBeenCalled(); expect(target.sent).toEqual([]);
+    } finally { target.main.closeFollowUpDrain(); }
+  });
+
+  it.each([0, 60_000])("installs custody before drain (%i), reserving PREPARED, adopting RECEIVED, retiring only appended", flushMs => {
+    const f = fixture(); const item = f.original();
+    f.transfer.occurrences = [{ ordinal: 0, state: "pending", customMessage: f.native([item]) }];
+    f.seed(f.sourceJournal, [item]);
+    const source = f.attach(f.source, f.sourceJournal, true, flushMs);
+    const target = f.attach(f.target, undefined, true, flushMs);
+    try {
+      expect(source.sent).toEqual([]);
+      expect(f.rows()).toEqual([item]);
+      expect(() => target.main.receiveInboxItem(item)).toThrow(/PREPARED/);
+      const retry = { from: actor, message: item.message, delivery: "followUp" as const, deliveryId: item.deliveryId };
+      expect(() => target.main.deliverAgent(retry)).toThrow(/PREPARED/);
+      expect(fs.existsSync(`${target.journal}.delivered`)).toBe(false);
+      expect(f.outcomes()).toEqual([]);
+      f.received();
+      target.main.receiveInboxItem(item);
+      target.main.receiveInboxItem(item);
+      expect(f.rows(target.journal)).toEqual([item]);
+      for (let i = 0; i < 2; i++) {
+        expect(target.main.deliverAgent(retry)).toMatchObject({ duplicate: true, triggered: false, messageId: item.id });
+        target.emit("agent_before_settle", boundary([]), target.ctx);
+        target.main.confirmInbox();
+      }
+      expect(target.sent).toEqual([]);
+      expect(f.rows(target.journal)).toEqual([item]);
+      expect(f.outcomes()).toEqual([]);
+      expect(fs.existsSync(`${target.journal}.delivered`)).toBe(false);
+      f.transfer.occurrences = [{ ...f.transfer.occurrences[0]!, state: "appended" }];
+      target.main.confirmInbox(); source.main.confirmInbox();
+      expect(fs.existsSync(target.journal)).toBe(false);
+      expect(fs.existsSync(f.sourceJournal)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(`${target.journal}.delivered`, "utf8")).ids).toEqual([item.deliveryId]);
+      expect(f.outcomes()).toEqual([{ ...item.outcomeSend, outcome: "delivered",
+        reason: "delivered, not triggered: recipient is halted by its operator", at: expect.any(Number) }]);
+      expect(target.sent).toEqual([]);
+      expect(source.sent).toEqual([]);
+    } finally { source.main.closeFollowUpDrain(); target.main.closeFollowUpDrain(); }
+  });
+
+  it("revalidates a live held batch before handing or rendering it, without inventing handed evidence", () => {
+    const f = fixture(); f.setView({ status: "none" });
+    const source = f.attach(f.source, f.sourceJournal, false);
+    try {
+      source.main.deliverAgent({ from: actor, message: "held before native settlement", delivery: "followUp", deliveryId: "live-held" });
+      const original = f.rows()[0]!;
+      expect(original.handed).toBeUndefined();
+      f.transfer.occurrences = [{ ordinal: 0, state: "pending", customMessage: f.native([original]) }];
+      f.setView({ status: "validated", transfers: [f.transfer] });
+      source.emit("agent_before_settle", boundary([]), source.ctx);
+      expect(source.sent).toEqual([]);
+      expect(f.rows()).toEqual([original]);
+      expect(source.main.drainSnapshot()).toMatchObject({ held: 0, handed: 1 }); // Awaiting native, not a new Pi send.
+      expect(f.outcomes()).toEqual([]);
+      expect(fs.existsSync(`${f.sourceJournal}.delivered`)).toBe(false);
+    } finally { source.main.closeFollowUpDrain(); }
+  });
+
+  it("dedupes a restored original absent from the Main journal, but preserves a distinct ID with identical text", () => {
+    const f = fixture(); const item = f.original(); f.received();
+    f.transfer.occurrences = [{ ordinal: 0, state: "pending", customMessage: f.native([item]) }];
+    const target = f.attach();
+    try {
+      expect(target.main.deliverAgent({ from: actor, message: item.message, delivery: "followUp", deliveryId: item.deliveryId }))
+        .toMatchObject({ duplicate: true, triggered: false, messageId: item.id });
+      expect(fs.existsSync(target.journal)).toBe(false); // Native custody, not a fabricated C payload/receipt.
+      expect(target.sent).toEqual([]);
+      target.main.deliverAgent({ from: actor, message: item.message, delivery: "nextTurn", triggerTurn: false, deliveryId: "distinct-delivery" });
+      expect(target.sent).toHaveLength(1);
+      expect(target.sent[0]!.message.details.deliveryId).toBe("distinct-delivery");
+      expect(target.sent[0]!.options).toEqual({ deliverAs: "nextTurn", triggerTurn: false });
+      expect(f.outcomes()).toEqual([]);
+    } finally { target.main.closeFollowUpDrain(); }
+  });
+
+  it("adopts a restored child with no delivery ID and no Main row by exact original carrier identity", () => {
+    const f = fixture(); f.received(); const { deliveryId: _deliveryId, ...item } = f.original("unindexed-child");
+    f.transfer.occurrences = [{ ordinal: 0, state: "pending", customMessage: f.native([item]) }];
+    const target = f.attach();
+    try {
+      target.main.receiveInboxItem(item); target.main.receiveInboxItem(item);
+      expect(f.rows(target.journal)).toEqual([JSON.parse(JSON.stringify(item))]);
+      expect(f.rows(target.journal)[0]!.deliveryId).toBeUndefined(); // Do not invent inbox:<id> in the native original.
+      expect(target.sent).toEqual([]); expect(f.outcomes()).toEqual([]);
+      f.transfer.occurrences = [{ ...f.transfer.occurrences[0]!, state: "handled" }];
+      target.main.confirmInbox();
+      expect(fs.existsSync(target.journal)).toBe(false);
+      target.main.receiveInboxItem(item); // Repeated route delivery stays consumed, without sending.
+      expect(target.sent).toEqual([]);
+      expect(f.outcomes().map(row => row.outcome)).toEqual(["delivered"]);
+    } finally { target.main.closeFollowUpDrain(); }
+  });
+
+  it("retains mixed batch child, chain and delivery identities without resending native children or suppressing Fabric-only neighbors", () => {
+    const f = fixture(); f.received();
+    const a = { ...f.original("child-A", "delivery-A"), chain: "chain-A", generation: 2, supersedes: ["delivery-old-A"] };
+    const { deliveryId: _deliveryId, ...bOriginal } = f.original("child-B");
+    const b = { ...bOriginal, inboxReceipts: ["opaque-event-receipt"], inboxEventId: "root-event-B" };
+    const { handed: _handed, deliverAs: _deliverAs, triggerTurn: _triggerTurn, ...c } = f.original("child-C", "delivery-C");
+    f.transfer.occurrences = [{ ordinal: 7, state: "pending", customMessage: f.native([a, b]) }];
+    const journal = path.join(path.dirname(f.sourceJournal), "mixed.json"); f.seed(journal, [a, b, c]);
+    const target = f.attach(f.target, journal);
+    try {
+      expect(target.sent.map(sent => sent.message.details.id)).toEqual([c.id]);
+      expect(f.rows(journal).filter(item => item.id !== c.id)).toEqual([a, JSON.parse(JSON.stringify(b))]);
+      for (const deliveryId of ["delivery-A", "delivery-old-A"]) {
+        expect(target.main.deliverAgent({ from: actor, message: "same", delivery: "steer", deliveryId }))
+          .toMatchObject({ duplicate: true, triggered: false, messageId: a.id });
+      }
+      target.main.receiveInboxItem(b); // No deliveryId: exact original carrier prevents fallback admission.
+      expect(target.sent).toHaveLength(1);
+      expect(nativeRecoveryCarrierIdentities(f.transfer.occurrences[0]!.customMessage)).toEqual({
+        carrierIds: ["batch-carrier", "chain-A", "child-A", "child-B"],
+        deliveryIds: ["delivery-A", "delivery-old-A"], inboxIds: ["root-event-B", "opaque-event-receipt"],
+      });
+      f.transfer.occurrences = [{ ...f.transfer.occurrences[0]!, state: "handled" }];
+      target.main.confirmInbox();
+      expect(f.rows(journal).map(item => item.id)).toEqual([c.id]);
+      expect(f.outcomes().map(row => row.eventId)).toEqual(["event:child-A", "event:child-B"]);
+      expect(target.sent).toHaveLength(1);
+    } finally { target.main.closeFollowUpDrain(); }
+  });
+
+  it("keeps two distinct native occurrence IDs even when text and work key are equal", () => {
+    const f = fixture(); f.received();
+    const a = { ...f.original("same-A", "D-A"), data: { coalesceKey: "same-work" } };
+    const b = { ...f.original("same-B", "D-B"), data: { coalesceKey: "same-work" } };
+    f.transfer.occurrences = [a, b].map((item, ordinal) => ({ ordinal, state: "pending", customMessage: f.native([item]) }));
+    const target = f.attach();
+    try {
+      for (const item of [a, b]) target.main.receiveInboxItem(item);
+      expect(f.rows(target.journal).map(item => item.id)).toEqual([a.id, b.id]);
+      f.transfer.occurrences = [{ ...f.transfer.occurrences[0]!, state: "appended" }, f.transfer.occurrences[1]!];
+      target.main.confirmInbox();
+      expect(f.rows(target.journal).map(item => item.id)).toEqual([b.id]);
+      expect(f.outcomes().map(row => row.eventId)).toEqual(["event:same-A"]);
+      expect(target.sent).toEqual([]);
+    } finally { target.main.closeFollowUpDrain(); }
+  });
+
+  it("SAFE: excludes source-durable history even with a stale source Main journal", () => {
+    const f = fixture(); f.received(); const item = f.original();
+    f.seed(f.sourceJournal, [item]);
+    fs.appendFileSync(f.source.sessionFile, `${JSON.stringify({ type: "custom_message", ...f.native([item]) })}\n`);
+    expect(f.transfer.occurrences).toEqual([]); // N's settled pending projection excludes history.
+    const source = f.attach(f.source, f.sourceJournal); const target = f.attach();
+    try {
+      expect(fs.existsSync(f.sourceJournal)).toBe(false);
+      expect(source.sent).toEqual([]); expect(target.sent).toEqual([]);
+      expect(fs.existsSync(target.journal)).toBe(false);
+      expect(f.outcomes().map(row => row.outcome)).toEqual(["delivered"]);
+      expect(() => source.main.deliverAgent({ from: actor, message: "new", delivery: "steer" })).toThrow(/sealed/);
+    } finally { source.main.closeFollowUpDrain(); target.main.closeFollowUpDrain(); }
+  });
+
+  it.each(["reader-error", "reader-hold", "ambiguous", "duplicate-ordinal", "wrong-scope"] as const)(
+    "holds original payload and outcome through restart with %s", failure => {
+      const f = fixture(); f.received(); const item = f.original();
+      f.transfer.occurrences = [{ ordinal: 0, state: "pending", customMessage: f.native([item]) }];
+      const journal = path.join(path.dirname(f.sourceJournal), "held.json"); f.seed(journal, [item]);
+      if (failure === "reader-error") f.fail(true);
+      if (failure === "reader-hold") f.setView({ status: "hold", reason: "uncertain canonical header" });
+      if (failure === "ambiguous") f.transfer.occurrences = [{ ...f.transfer.occurrences[0]!, state: "ambiguous" }];
+      if (failure === "duplicate-ordinal") f.transfer.occurrences = [f.transfer.occurrences[0]!, f.transfer.occurrences[0]!];
+      if (failure === "wrong-scope") f.transfer.target = { ...f.target, sessionFile: path.join(path.dirname(journal), "other.jsonl") };
+      // A stale plain custom-message is not allowed to override uncertain native custody.
+      fs.appendFileSync(f.target.sessionFile, `${JSON.stringify({ type: "custom_message", ...f.native([item]) })}\n`);
+      for (let restart = 0; restart < 2; restart++) {
+        const target = f.attach(f.target, journal);
+        try {
+          target.emit("turn_end", boundary([]), target.ctx);
+          target.emit("agent_before_settle", boundary([]), target.ctx);
+          target.main.confirmInbox();
+          expect(() => target.main.deliverAgent({ from: actor, message: item.message, delivery: "steer", deliveryId: item.deliveryId })).toThrow();
+          expect(f.rows(journal)).toEqual([item]);
+          expect(target.sent).toEqual([]); expect(f.outcomes()).toEqual([]);
+          expect(fs.existsSync(`${journal}.delivered`)).toBe(false);
+        } finally { target.main.closeFollowUpDrain(); }
+      }
+    },
+  );
+
+  it.each(["wrong-header", "changed-session", "changed-path"] as const)("does not consume on %s native-original receipts", wrong => {
+    const f = fixture(); f.received(); const item = f.original();
+    f.transfer.occurrences = [{ ordinal: 0, state: "pending", customMessage: f.native([item]) }];
+    const journal = path.join(path.dirname(f.sourceJournal), "stale.json"); f.seed(journal, [item]);
+    const target = f.attach(f.target, journal);
+    try {
+      if (wrong === "wrong-header") fs.writeFileSync(f.target.sessionFile, `${f.header(f.source)}${JSON.stringify({ type: "custom_message", ...f.native([item]) })}\n`);
+      if (wrong === "changed-session") target.ctx.sessionManager.getSessionId = () => f.source.sessionId;
+      if (wrong === "changed-path") target.ctx.sessionManager.getSessionFile = () => f.source.sessionFile;
+      target.main.confirmInbox(); target.emit("turn_end", boundary([]), target.ctx);
+      expect(f.rows(journal)).toEqual([item]);
+      expect(target.sent).toEqual([]); expect(f.outcomes()).toEqual([]);
+    } finally { target.main.closeFollowUpDrain(); }
+  });
+
+  it("does not use a wrong source header as the SAFE consumed-history proof", () => {
+    const f = fixture(); f.received(); const item = f.original();
+    f.seed(f.sourceJournal, [item]);
+    fs.writeFileSync(f.source.sessionFile, `${f.header(f.target)}${JSON.stringify({ type: "custom_message", ...f.native([item]) })}\n`);
+    const source = f.attach(f.source, f.sourceJournal);
+    try {
+      source.main.confirmInbox(); source.emit("agent_before_settle", boundary([]), source.ctx);
+      expect(f.rows()).toEqual([item]); expect(f.outcomes()).toEqual([]); expect(source.sent).toEqual([]);
+    } finally { source.main.closeFollowUpDrain(); }
+  });
+
+  it("keeps native-consumed payload when outcome persistence fails, then retries bookkeeping without native/Fabric replay", () => {
+    const f = fixture(); f.received(); const item = f.original();
+    f.transfer.occurrences = [{ ordinal: 0, state: "handled", customMessage: f.native([item]) }];
+    const journal = path.join(path.dirname(f.sourceJournal), "outcome-failure.json"); f.seed(journal, [item]);
+    const append = vi.spyOn(deliveryOutcomes, "appendDeliveryOutcome").mockImplementation(() => { throw new Error("outcome storage unavailable"); });
+    const target = f.attach(f.target, journal);
+    try {
+      target.main.confirmInbox(); target.emit("agent_before_settle", boundary([]), target.ctx);
+      expect(f.rows(journal)).toEqual([item]); expect(target.sent).toEqual([]);
+      expect(fs.existsSync(`${journal}.delivered`)).toBe(false);
+    } finally { target.main.closeFollowUpDrain(); append.mockRestore(); }
+    const restarted = f.attach(f.target, journal);
+    try {
+      restarted.main.confirmInbox();
+      expect(fs.existsSync(journal)).toBe(false); expect(restarted.sent).toEqual([]);
+      expect(f.outcomes().map(row => row.outcome)).toEqual(["delivered"]);
+    } finally { restarted.main.closeFollowUpDrain(); }
+  });
+
+  it.each(["torn-json", "unknown-version", "malformed-carrier"] as const)("preserves %s Main bookkeeping instead of overwriting it during recovery", corruption => {
+    const f = fixture(); f.received(); const item = f.original();
+    f.transfer.occurrences = [{ ordinal: 0, state: "pending", customMessage: f.native([item]) }];
+    const journal = path.join(path.dirname(f.sourceJournal), "unreadable.json");
+    const bytes = corruption === "torn-json" ? '{"version":1,"items":[' : corruption === "unknown-version"
+      ? JSON.stringify({ version: 9, items: [item] }) : JSON.stringify({ version: 1, items: [{ ...item, sentAt: null }] });
+    fs.writeFileSync(journal, bytes);
+    const target = f.attach(f.target, journal);
+    try {
+      target.main.confirmInbox(); target.emit("agent_before_settle", boundary([]), target.ctx);
+      expect(() => target.main.deliverAgent({ from: actor, message: item.message, delivery: "steer", deliveryId: item.deliveryId })).toThrow(/journal/);
+      expect(() => target.main.receiveInboxItem(item)).toThrow(/journal/);
+      expect(fs.readFileSync(journal, "utf8")).toBe(bytes);
+      expect(target.sent).toEqual([]); expect(f.outcomes()).toEqual([]);
+    } finally { target.main.closeFollowUpDrain(); }
+    expect(fs.readFileSync(journal, "utf8")).toBe(bytes);
+  });
+
+  it("retains the original journal across consumed-index failure and recovers without another send", () => {
+    const f = fixture(); f.received(); const item = f.original();
+    f.transfer.occurrences = [{ ordinal: 0, state: "handled", customMessage: f.native([item]) }];
+    const journal = path.join(path.dirname(f.sourceJournal), "index-failure.json"); f.seed(journal, [item]);
+    const rename = fs.renameSync;
+    const fault = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to) === `${journal}.delivered`) throw new Error("index commit failed");
+      return rename(from, to);
+    });
+    const target = f.attach(f.target, journal);
+    try {
+      target.main.confirmInbox();
+      expect(f.rows(journal)).toEqual([item]); expect(target.sent).toEqual([]);
+    } finally { target.main.closeFollowUpDrain(); fault.mockRestore(); }
+    const restarted = f.attach(f.target, journal);
+    try {
+      restarted.main.confirmInbox();
+      expect(fs.existsSync(journal)).toBe(false); expect(restarted.sent).toEqual([]);
+      expect(f.outcomes().map(row => row.outcome)).toEqual(["delivered"]);
+    } finally { restarted.main.closeFollowUpDrain(); }
+  });
+
+  it("checks complete predecessor chains, child identity conflicts and opaque root inbox membership", () => {
+    const f = fixture(); f.received(); const item = f.original();
+    f.transfer.occurrences = [{ ordinal: 1, state: "pending", customMessage: f.native([item]) }];
+    const next = { sessionId: "33333333-3333-4333-8333-333333333333", sessionFile: path.join(path.dirname(f.sourceJournal), "next.jsonl") };
+    const second: NativeRecoveryTransfer = { ...f.transfer, operationId: "operation-2", source: f.target, target: next,
+      phase: "received", preparedEntryId: "prepared-2", receivedEntryId: "received-2", preparedDigest: "b".repeat(64),
+      occurrences: [{ ordinal: 0, state: "handled", customMessage: f.native([item]) },
+        { ordinal: 1, state: "pending", customMessage: { customType: "pi-fabric-inbox", details: {
+          ids: ["root-event"], receipts: ["opaque-receipt"], nonce: "not-authority",
+        } } }] };
+    f.setView({ status: "validated", transfers: [f.transfer, second] });
+    const view = readNativeRecoveryCustody(next, f.reader);
+    expect(nativeRecoveryCarrierCustody(view, { deliveryId: item.deliveryId })).toMatchObject({ status: "consumed", transfer: second });
+    expect(nativeRecoveryCarrierCustody(view, { inboxId: "root-event" }).status).toBe("received");
+    expect(nativeRecoveryCarrierCustody(view, { inboxId: "not-authority" }).status).toBe("none");
+    second.occurrences = [...second.occurrences, { ...second.occurrences[0]!, ordinal: 2 }];
+    expect(nativeRecoveryCarrierCustody(readNativeRecoveryCustody(next, f.reader), { carrierId: item.id }).status).toBe("hold");
+    second.source = f.source;
+    expect(readNativeRecoveryCustody(next, f.reader).status).toBe("hold");
+    second.source = f.target; second.target = f.source;
+    expect(readNativeRecoveryCustody(f.source, f.reader).status).toBe("hold");
   });
 });
 
